@@ -57,14 +57,18 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 		return Decision{DeniedBy: name, Reason: "removed by " + name}, nil
 	}
 
-	principals := s.principalsFor(r.Tenant, p, len(a.publicRoles(a.giving(p, r.Type))) > 0)
+	principals := s.principalsFor(r.Tenant, p, a.publicGives(p, r.Type))
 	if !explain {
 		held, err := a.heldBindings(ctx, a.db, r.Tenant, principals, r.path())
 		if err != nil {
 			return Decision{}, err
 		}
+		roles, err := a.book(ctx, a.db, r.Tenant, roleIDs(held))
+		if err != nil {
+			return Decision{}, err
+		}
 		for _, b := range held {
-			if a.gives(b.Principal, b.Role, p, r.Type) {
+			if gives(roles, b.Principal, b.Role, p, r.Type) {
 				return Decision{Allowed: true}, nil
 			}
 		}
@@ -75,9 +79,13 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 	if err != nil {
 		return Decision{}, err
 	}
+	roles, err := a.book(ctx, a.db, r.Tenant, grantRoleIDs(grants))
+	if err != nil {
+		return Decision{}, err
+	}
 	d := Decision{Reason: "no grant gives it"}
 	for _, g := range grants {
-		if a.gives(g.Principal, g.Role, p, r.Type) {
+		if gives(roles, g.Principal, g.Role, p, r.Type) {
 			d.Grants = append(d.Grants, g)
 		}
 	}
@@ -88,9 +96,9 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 }
 
 // gives reports whether a grant of a role to a principal gives p on a resource type. A role
-// that is no longer in the catalog gives nothing.
-func (a *Authorizer) gives(to Principal, id Role, p Permission, resourceType string) bool {
-	def, ok := a.roles[id]
+// that no longer exists gives nothing.
+func gives(roles book, to Principal, id Role, p Permission, resourceType string) bool {
+	def, ok := roles.role(id)
 	return ok && def.GrantableOn(resourceType) && def.Gives(p) && to.carries(def, p)
 }
 
@@ -106,9 +114,13 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 	if err != nil {
 		return nil, err
 	}
+	roles, err := a.book(ctx, a.db, r.Tenant, roleIDs(held))
+	if err != nil {
+		return nil, err
+	}
 	var candidates []Permission
 	for _, b := range held {
-		if def, ok := a.roles[b.Role]; ok && def.GrantableOn(r.Type) {
+		if def, ok := roles.role(b.Role); ok && def.GrantableOn(r.Type) {
 			for _, p := range def.Permissions {
 				if b.Principal.carries(def, p) {
 					candidates = append(candidates, p)
@@ -144,18 +156,15 @@ func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]P
 	if err != nil || name != "" {
 		return nil, err
 	}
-	roles := a.giving(p, r.Type)
-	if len(roles) == 0 {
-		return nil, nil
-	}
+	roles, custom := a.giving(p, r.Type), a.customGives(p, r.Type)
 	rows, err := a.db.Query(ctx, `
 		SELECT DISTINCT principal_kind, principal_id FROM rbac_grants
-		WHERE tenant = $1 AND scope = ANY($2::text[]) AND role = ANY($3::text[])
+		WHERE tenant = $1 AND scope = ANY($2::text[]) AND role = ANY(`+givingSQL("$3", "$1", "$7", "$8", false, custom)+`)
 		  AND (expires_at IS NULL OR expires_at > $4) AND (NOT $5 OR principal_kind <> ALL($6::text[]))
-		  AND (principal_kind <> $7 OR role = ANY($8::text[]))
+		  AND (principal_kind <> $10 OR role = ANY(`+givingSQL("$9", "$1", "$7", "$8", true, custom)+`))
 		ORDER BY principal_kind, principal_id`,
 		r.Tenant, r.path(), roles, a.cfg.Now(), p.managesAccess(), []string{string(Tenant), string(Public)},
-		string(Public), a.publicRoles(roles))
+		string(p), r.Type, a.publicRoles(roles), string(Public))
 	if err != nil {
 		return nil, err
 	}
@@ -167,8 +176,10 @@ func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]P
 	if err != nil {
 		return nil, err
 	}
-	// A kind the host no longer declares can't act, so its grants give nothing.
-	return slices.DeleteFunc(found, func(p Principal) bool { return !a.known(r.Tenant, p) }), nil
+	// A kind the host no longer declares can't act, so its grants give nothing; nor does a grant
+	// to the public where no public role can give p, as checks read it.
+	public := a.publicGives(p, r.Type)
+	return slices.DeleteFunc(found, func(h Principal) bool { return !a.known(r.Tenant, h) || h.Kind == Public && !public }), nil
 }
 
 // Reach is where a subject may do something: every resource of the type in the tenant, or
@@ -185,18 +196,18 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 	if err != nil || removed {
 		return Reach{}, err
 	}
-	publicRoles := a.publicRoles(roles)
-	principals := s.principalsFor(tenant, p, len(publicRoles) > 0)
-	if len(roles) == 0 || len(principals) == 0 {
+	principals := s.principalsFor(tenant, p, a.publicGives(p, resourceType))
+	if len(principals) == 0 {
 		return Reach{}, nil
 	}
+	custom := a.customGives(p, resourceType)
 	rows, err := a.db.Query(ctx, `
 		SELECT DISTINCT scope FROM rbac_grants
-		WHERE tenant = $1 AND principal = ANY($2::text[]) AND role = ANY($3::text[])
+		WHERE tenant = $1 AND principal = ANY($2::text[]) AND role = ANY(`+givingSQL("$3", "$1", "$8", "$9", false, custom)+`)
 		  AND (expires_at IS NULL OR expires_at > $4) AND split_part(scope, ':', 1) = ANY($5::text[])
-		  AND (principal <> $6 OR role = ANY($7::text[]))
+		  AND (principal <> $6 OR role = ANY(`+givingSQL("$7", "$1", "$8", "$9", true, custom)+`))
 		ORDER BY scope`,
-		tenant, principals, roles, a.cfg.Now(), a.reaching(resourceType), publicKey, publicRoles)
+		tenant, principals, roles, a.cfg.Now(), a.reaching(resourceType), publicKey, a.publicRoles(roles), string(p), resourceType)
 	if err != nil {
 		return Reach{}, err
 	}
@@ -214,8 +225,8 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 	return reach, nil
 }
 
-// searchable returns the roles that give p on a resource type, and whether a constraint
-// removes p there.
+// searchable returns the built-in roles that give p on a resource type, and whether a
+// constraint removes p there.
 func (a *Authorizer) searchable(ctx context.Context, s Subject, p Permission, tenant, resourceType string) (roles []string, removed bool, err error) {
 	if tenant == "" || !validName(resourceType) {
 		return nil, false, fmt.Errorf("%w: a search needs a tenant and a resource type", ErrInvalid)
@@ -257,15 +268,15 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	if cols.Tenant == "" || cols.Path == "" || firstArg < 1 {
 		return Predicate{}, fmt.Errorf("%w: Filter needs the tenant and path columns and a first argument", ErrInvalid)
 	}
-	roles, _, err := a.searchable(ctx, s, p, tenant, resourceType)
+	roles, removed, err := a.searchable(ctx, s, p, tenant, resourceType)
 	if err != nil {
 		return Predicate{}, err
 	}
-	publicRoles := a.publicRoles(roles)
-	principals := s.principalsFor(tenant, p, len(publicRoles) > 0)
-	if len(roles) == 0 || len(principals) == 0 {
+	principals := s.principalsFor(tenant, p, a.publicGives(p, resourceType))
+	if removed || len(principals) == 0 {
 		return Predicate{SQL: "FALSE"}, nil
 	}
+	custom := a.customGives(p, resourceType)
 	arg := func(i int) string { return fmt.Sprintf("$%d", firstArg+i) }
 	// The grants' tenant is an argument of its own: the host's tenant column needn't be text,
 	// and one argument can't take two types. A tenant-wide grant's scope is the tenant's key,
@@ -273,11 +284,12 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	// it. The keys take the default collation so that index applies.
 	return Predicate{
 		SQL: fmt.Sprintf(`(%s = %s AND %s && ARRAY(SELECT g.scope COLLATE "default" FROM rbac_grants g
-			WHERE g.tenant = %s::text AND g.principal = ANY(%s::text[]) AND g.role = ANY(%s::text[])
+			WHERE g.tenant = %s::text AND g.principal = ANY(%s::text[]) AND g.role = ANY(%s)
 			  AND (g.expires_at IS NULL OR g.expires_at > %s) AND split_part(g.scope, ':', 1) = ANY(%s::text[])
-			  AND (g.principal <> %s::text OR g.role = ANY(%s::text[]))))`,
-			cols.Tenant, arg(0), cols.Path, arg(1), arg(2), arg(3), arg(4), arg(5), arg(6), arg(7)),
-		Args: []any{tenant, tenant, principals, roles, a.cfg.Now(), a.reaching(resourceType), publicKey, publicRoles},
+			  AND (g.principal <> %s::text OR g.role = ANY(%s))))`,
+			cols.Tenant, arg(0), cols.Path, arg(1), arg(2), givingSQL(arg(3), arg(1), arg(8), arg(9), false, custom), arg(4), arg(5), arg(6),
+			givingSQL(arg(7), arg(1), arg(8), arg(9), true, custom)),
+		Args: []any{tenant, tenant, principals, roles, a.cfg.Now(), a.reaching(resourceType), publicKey, a.publicRoles(roles), string(p), resourceType},
 	}, nil
 }
 

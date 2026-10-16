@@ -74,30 +74,41 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 	if name != "" {
 		return &DeniedError{Permission: manage, Scope: scope, Reason: "removed by " + name}
 	}
-	if err := a.mayChange(ctx, a.db, actor, on, grants, revokes); err != nil {
+	au, err := a.mayChange(ctx, a.db, actor, on, grants, revokes)
+	if err != nil {
 		return err
 	}
-	if err := a.validate(ctx, on.Tenant, scope, grants, revokes); err != nil {
+	if err := a.validate(ctx, au.roles, on.Tenant, scope, grants, revokes); err != nil {
 		return err
 	}
-	return a.inTx(ctx, on.Tenant, actor.Principal, func(tx pgx.Tx) (granted, revoked []Grant, err error) {
+	return a.inTx(ctx, on.Tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
 		// One change to a scope at a time, so two changes can't deadlock on its rows.
 		var principals []string
 		for _, b := range slices.Concat(grants, revokes) {
 			principals = append(principals, b.Principal.key())
 		}
 		if err := lock(ctx, tx, on.Tenant, []string{scope.Key()}, principals); err != nil {
-			return nil, nil, err
+			return ChangeEvent{}, err
 		}
-		// Decided again in the transaction, so the actor's access is read as the change is made.
-		if err := a.mayChange(ctx, tx, actor, on, grants, revokes); err != nil {
-			return nil, nil, err
+		// Decided again in the transaction, so the actor's access and the roles are read as the
+		// change is made: a custom role deleted or redefined since is granted only as it is now.
+		au, err := a.mayChange(ctx, tx, actor, on, grants, revokes)
+		if err != nil {
+			return ChangeEvent{}, err
 		}
-		if revoked, err = a.revoke(ctx, tx, on.Tenant, scope, revokes); err != nil {
-			return nil, nil, err
+		var bad []error
+		for _, b := range grants {
+			bad = append(bad, a.checkBinding(au.roles, on.Tenant, scope, b, a.cfg.Now())...)
 		}
-		granted, err = a.upsert(ctx, tx, on.Tenant, actor.Principal, scopeGrants(scope, grants))
-		return granted, revoked, err
+		if err := errors.Join(bad...); err != nil {
+			return ChangeEvent{}, err
+		}
+		revoked, err := a.revoke(ctx, tx, on.Tenant, scope, revokes)
+		if err != nil {
+			return ChangeEvent{}, err
+		}
+		granted, err := a.upsert(ctx, tx, on.Tenant, actor.Principal, scopeGrants(scope, grants))
+		return ChangeEvent{Granted: granted, Revoked: revoked}, err
 	})
 }
 
@@ -165,15 +176,22 @@ func (a *Authorizer) Import(ctx context.Context, tenant string, grants []Grant) 
 	for i := range grants {
 		grants[i].ExpiresAt = stored(grants[i].ExpiresAt)
 	}
-	var errs []error
-	for _, g := range grants {
-		if !g.Scope.in(tenant) {
-			errs = append(errs, &InvalidError{Binding: g.Binding, Reason: fmt.Sprintf("scope %q is not valid", g.Scope.Key())})
-			continue
+	check := func(q DB) error {
+		roles, err := a.book(ctx, q, tenant, grantRoleIDs(grants))
+		if err != nil {
+			return err
 		}
-		errs = append(errs, a.checkBinding(tenant, g.Scope, g.Binding, a.cfg.Now())...)
+		var errs []error
+		for _, g := range grants {
+			if !g.Scope.in(tenant) {
+				errs = append(errs, &InvalidError{Binding: g.Binding, Reason: fmt.Sprintf("scope %q is not valid", g.Scope.Key())})
+				continue
+			}
+			errs = append(errs, a.checkBinding(roles, tenant, g.Scope, g.Binding, a.cfg.Now())...)
+		}
+		return errors.Join(errs...)
 	}
-	if err := errors.Join(errs...); err != nil {
+	if err := check(a.db); err != nil {
 		return err
 	}
 	scopes, principals := map[string]bool{}, map[string]bool{}
@@ -181,7 +199,7 @@ func (a *Authorizer) Import(ctx context.Context, tenant string, grants []Grant) 
 		scopes[g.Scope.Key()] = true
 		principals[g.Principal.key()] = true
 	}
-	return a.inTx(ctx, tenant, Principal{}, func(tx pgx.Tx) ([]Grant, []Grant, error) {
+	return a.inTx(ctx, tenant, Principal{}, func(tx pgx.Tx) (ChangeEvent, error) {
 		var err error
 		if len(scopes)+len(principals) > maxLocks {
 			err = lockTenant(ctx, tx, tenant)
@@ -189,10 +207,14 @@ func (a *Authorizer) Import(ctx context.Context, tenant string, grants []Grant) 
 			err = lock(ctx, tx, tenant, slices.Collect(maps.Keys(scopes)), slices.Collect(maps.Keys(principals)))
 		}
 		if err != nil {
-			return nil, nil, err
+			return ChangeEvent{}, err
+		}
+		// Again under the locks, so a custom role deleted since isn't granted.
+		if err := check(tx); err != nil {
+			return ChangeEvent{}, err
 		}
 		granted, err := a.upsert(ctx, tx, tenant, Principal{}, grants)
-		return granted, nil, err
+		return ChangeEvent{Granted: granted}, err
 	})
 }
 
@@ -224,7 +246,8 @@ func dedupe(c Change) (grants, revokes []Binding) {
 	return grants, revokes
 }
 
-func (a *Authorizer) validate(ctx context.Context, tenant string, scope Scope, grants, revokes []Binding) error {
+// validate checks the bindings against the roles mayChange read.
+func (a *Authorizer) validate(ctx context.Context, roles book, tenant string, scope Scope, grants, revokes []Binding) error {
 	var errs []error
 	now := a.cfg.Now()
 	// A change often gives one principal several roles; the host is asked about each once.
@@ -241,7 +264,7 @@ func (a *Authorizer) validate(ctx context.Context, tenant string, scope Scope, g
 		return err == nil, nil
 	}
 	for _, b := range grants {
-		bad := a.checkBinding(tenant, scope, b, now)
+		bad := a.checkBinding(roles, tenant, scope, b, now)
 		// The public is asked about too, so a host can refuse public access.
 		if len(bad) == 0 && b.Principal.Kind != Tenant {
 			ok, err := inTenant(b.Principal)
@@ -268,13 +291,13 @@ func (a *Authorizer) validate(ctx context.Context, tenant string, scope Scope, g
 }
 
 // checkBinding returns why a binding can't be granted on a scope in a tenant.
-func (a *Authorizer) checkBinding(tenant string, scope Scope, b Binding, now time.Time) []error {
+func (a *Authorizer) checkBinding(roles book, tenant string, scope Scope, b Binding, now time.Time) []error {
 	var errs []error
 	bad := func(reason string) { errs = append(errs, &InvalidError{Binding: b, Reason: reason}) }
 	if !a.known(tenant, b.Principal) {
 		bad("the principal is not valid")
 	}
-	def, ok := a.roles[b.Role]
+	def, ok := roles.role(b.Role)
 	switch {
 	case !ok:
 		bad("no such role")
@@ -291,10 +314,21 @@ func (a *Authorizer) checkBinding(tenant string, scope Scope, b Binding, now tim
 	return errs
 }
 
-// authority is an actor's grants on a resource's path.
+// authority is an actor's grants on a resource's path, and the roles to read them by.
 type authority struct {
-	a    *Authorizer
-	held []Binding
+	held  []Binding
+	roles book
+	// defining is a custom role DefineRole checks: the roles a check names resolve to it, but the
+	// actor's own grants of it give what it gives now.
+	defining *RoleDefinition
+}
+
+// named resolves a role a check names, as granted or listed rather than held.
+func (au authority) named(id Role) (RoleDefinition, bool) {
+	if au.defining != nil && au.defining.ID == id {
+		return *au.defining, true
+	}
+	return au.roles.role(id)
 }
 
 // power is what an actor may change on scopes of a type: any role it holds everything of, and
@@ -306,13 +340,22 @@ type power struct {
 
 func (p power) none() bool { return !p.any && len(p.listed) == 0 }
 
-// authorityOn reads the actor's grants on a resource's path.
-func (a *Authorizer) authorityOn(ctx context.Context, q DB, actor Subject, on Resource) (authority, error) {
+// authorityOn reads the actor's grants on a resource's path, and the roles they and the call
+// name. With a custom role among them it reads all the tenant's, which a role's GrantableRoles
+// can name.
+func (a *Authorizer) authorityOn(ctx context.Context, q DB, actor Subject, on Resource, roles []Role) (authority, error) {
 	held, err := a.heldBindings(ctx, q, on.Tenant, actor.principals(on.Tenant), on.path())
 	if err != nil {
 		return authority{}, err
 	}
-	return authority{a: a, held: held}, nil
+	if !slices.ContainsFunc(append(roleIDs(held), roles...), isCustom) {
+		return authority{held: held, roles: book{builtin: a.roles}}, nil
+	}
+	custom, err := a.customRoles(ctx, q, on.Tenant)
+	if err != nil {
+		return authority{}, err
+	}
+	return authority{held: held, roles: a.bookOf(custom)}, nil
 }
 
 // over is what the actor's grants let it change on scopes of a type.
@@ -320,10 +363,10 @@ func (au authority) over(scopeType string) power {
 	pw := power{listed: map[Role]bool{}}
 	manage := GrantPermission(scopeType)
 	for _, g := range au.held {
-		if !au.a.gives(g.Principal, g.Role, manage, scopeType) {
+		if !gives(au.roles, g.Principal, g.Role, manage, scopeType) {
 			continue
 		}
-		def := au.a.roles[g.Role]
+		def, _ := au.roles.role(g.Role)
 		if len(def.GrantableRoles) == 0 {
 			pw.any = true
 		}
@@ -336,7 +379,7 @@ func (au authority) over(scopeType string) power {
 
 // holds reports whether the actor holds p for resources of a type.
 func (au authority) holds(p Permission, resourceType string) bool {
-	return slices.ContainsFunc(au.held, func(g Binding) bool { return au.a.gives(g.Principal, g.Role, p, resourceType) })
+	return slices.ContainsFunc(au.held, func(g Binding) bool { return gives(au.roles, g.Principal, g.Role, p, resourceType) })
 }
 
 // mayGrant reports whether the actor may grant def on a scope of a type, and if not, a
@@ -395,7 +438,7 @@ func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string,
 			continue
 		}
 		for _, id := range def.GrantableRoles {
-			listed, known := a.roles[id]
+			listed, known := au.named(id)
 			if !known {
 				return p, false
 			}
@@ -412,17 +455,17 @@ func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string,
 }
 
 // mayChange checks the actor's own access on the scope against the change, once Apply has
-// checked the constraints.
-func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Resource, grants, revokes []Binding) error {
+// checked the constraints, and returns what it read.
+func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Resource, grants, revokes []Binding) (authority, error) {
 	scope := on.Scope()
 	manage := GrantPermission(scope.Type)
-	au, err := a.authorityOn(ctx, q, actor, on)
+	au, err := a.authorityOn(ctx, q, actor, on, roleIDs(grants))
 	if err != nil {
-		return err
+		return authority{}, err
 	}
 	pw := au.over(scope.Type)
 	if pw.none() {
-		return &DeniedError{Permission: manage, Scope: scope, Reason: "the actor may not change access here"}
+		return authority{}, &DeniedError{Permission: manage, Scope: scope, Reason: "the actor may not change access here"}
 	}
 	var errs []error
 	for _, b := range revokes {
@@ -431,7 +474,7 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 		}
 	}
 	for _, b := range grants {
-		def, known := a.roles[b.Role]
+		def, known := au.roles.role(b.Role)
 		if !known || !a.grantableOn(def, scope.Type) {
 			// validate reports it as invalid rather than as an escalation.
 			continue
@@ -444,11 +487,11 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 			errs = append(errs, &DeniedError{Permission: p, Scope: scope, Reason: reason})
 		}
 	}
-	return errors.Join(errs...)
+	return au, errors.Join(errs...)
 }
 
-// Grantable lists the roles the subject may grant on r, in catalog order, for an access screen
-// to offer.
+// Grantable lists the roles the subject may grant on r, built-in ones in catalog order and then
+// the tenant's custom ones, for an access screen to offer.
 func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]RoleDefinition, error) {
 	if err := a.check(r); err != nil {
 		return nil, err
@@ -460,22 +503,28 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 	if err != nil || name != "" {
 		return nil, err
 	}
-	au, err := a.authorityOn(ctx, a.db, s, r)
-	if err != nil || au.over(r.Type).none() {
+	held, err := a.heldBindings(ctx, a.db, r.Tenant, s.principals(r.Tenant), r.path())
+	if err != nil || len(held) == 0 {
 		return nil, err
+	}
+	// Every custom role, read once: the candidates, and those their GrantableRoles name.
+	custom, err := a.customRoles(ctx, a.db, r.Tenant)
+	if err != nil {
+		return nil, err
+	}
+	au := authority{held: held, roles: a.bookOf(custom)}
+	if au.over(r.Type).none() {
+		return nil, nil
 	}
 	var roles []RoleDefinition
 	// Everything checked for a role the actor may grant holds, so later roles needn't check it
 	// again. A refused role's checks are dropped: some passed only while it was in progress.
 	proven := map[string]bool{}
-	for _, def := range a.cfg.Catalog {
-		if !a.grantableOn(def, r.Type) {
-			continue
-		}
+	for _, def := range a.rolesIn(r.Type, custom) {
 		seen := maps.Clone(proven)
 		if _, ok := a.mayGrant(au, r.Type, def, seen); ok {
 			proven = seen
-			roles = append(roles, def.clone())
+			roles = append(roles, def)
 		}
 	}
 	return roles, nil
@@ -494,19 +543,20 @@ func scopeGrants(scope Scope, bindings []Binding) []Grant {
 }
 
 // inTx runs fn in a transaction and hands what it changed to Config.OnChange there.
-func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, fn func(pgx.Tx) (granted, revoked []Grant, err error)) error {
+func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, fn func(pgx.Tx) (ChangeEvent, error)) error {
 	return pgx.BeginFunc(ctx, a.db, func(tx pgx.Tx) error {
-		granted, revoked, err := fn(tx)
+		e, err := fn(tx)
 		if err != nil {
 			return err
 		}
-		return a.report(ctx, tx, ChangeEvent{Tenant: tenant, Actor: actor, Granted: granted, Revoked: revoked})
+		e.Tenant, e.Actor = tenant, actor
+		return a.report(ctx, tx, e)
 	})
 }
 
 // report hands a change to Config.OnChange in its transaction, unless it changed nothing.
 func (a *Authorizer) report(ctx context.Context, tx pgx.Tx, e ChangeEvent) error {
-	if a.cfg.OnChange == nil || len(e.Granted)+len(e.Revoked) == 0 {
+	if a.cfg.OnChange == nil || e.empty() {
 		return nil
 	}
 	return a.cfg.OnChange(ctx, tx, e)
@@ -620,7 +670,7 @@ func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) (
 // DeleteScope removes every grant on a scope, as when the resource or container is deleted. It
 // waits for a change to the scope in progress, so a grant that change makes is removed too.
 func (a *Authorizer) DeleteScope(ctx context.Context, tenant string, s Scope) error {
-	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, []string{s.Key()}, nil) }, "scope = $2", s.Key())
+	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, []string{s.Key()}, nil) }, false, "scope = $2", s.Key())
 }
 
 // DeletePrincipal removes every grant to a principal, as when an identity or group is deleted,
@@ -629,7 +679,7 @@ func (a *Authorizer) DeletePrincipal(ctx context.Context, tenant string, p Princ
 	if !p.wellFormed(tenant) {
 		return fmt.Errorf("%w: principal %q is not valid", ErrInvalid, p.key())
 	}
-	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, nil, []string{p.key()}) }, "principal = $2", p.key())
+	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, nil, []string{p.key()}) }, false, "principal = $2", p.key())
 }
 
 // DeletePrincipalEverywhere removes every grant to an identity or group in every tenant, as
@@ -678,21 +728,34 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, p Principal)
 	}
 }
 
-// DeleteTenant removes every grant in a tenant.
+// DeleteTenant removes every grant and custom role in a tenant, so a tenant created later with
+// its id starts with neither.
 func (a *Authorizer) DeleteTenant(ctx context.Context, tenant string) error {
-	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lockTenant(ctx, tx, tenant) }, "TRUE")
+	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lockTenant(ctx, tx, tenant) }, true, "TRUE")
 }
 
-func (a *Authorizer) delete(ctx context.Context, tenant string, lock func(pgx.Tx) error, where string, args ...any) error {
+// delete removes the grants in a tenant that where picks, and with roles, its custom roles.
+func (a *Authorizer) delete(ctx context.Context, tenant string, lock func(pgx.Tx) error, roles bool, where string, args ...any) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
-	return a.inTx(ctx, tenant, Principal{}, func(tx pgx.Tx) ([]Grant, []Grant, error) {
+	return a.inTx(ctx, tenant, Principal{}, func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lock(tx); err != nil {
-			return nil, nil, err
+			return ChangeEvent{}, err
 		}
-		revoked, err := a.remove(ctx, tx, tenant, where, args...)
-		return nil, revoked, err
+		var e ChangeEvent
+		if roles {
+			rows, err := tx.Query(ctx, `DELETE FROM rbac_roles WHERE tenant = $1 RETURNING id`, tenant)
+			if err != nil {
+				return ChangeEvent{}, err
+			}
+			if e.DeletedRoles, err = pgx.CollectRows(rows, pgx.RowTo[Role]); err != nil {
+				return ChangeEvent{}, err
+			}
+		}
+		var err error
+		e.Revoked, err = a.remove(ctx, tx, tenant, where, args...)
+		return e, err
 	})
 }
 

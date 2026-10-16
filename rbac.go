@@ -1,8 +1,9 @@
 // Package rbac is role-based access control on PostgreSQL: Core RBAC with scoped role
-// assignments. A role is a set of permissions; a grant gives one role to a principal (a user,
-// another kind of identity such as a service account, a group, every member of a tenant, or
-// the public) on a resource, a container above resources or the whole tenant, and applies to
-// everything under that scope.
+// assignments. A role is a set of permissions, built into the host's catalog or defined by a
+// tenant ([Authorizer.DefineRole]); a grant gives one role to a principal (a user, another kind
+// of identity such as a service account, a group, every member of a tenant, or the public) on a
+// resource, a container above resources or the whole tenant, and applies to everything under
+// that scope.
 //
 // The host keeps identities, groups, resources and their hierarchy and passes them in: a
 // [Subject] is an identity, the groups it is in and the tenants it is a member of, or no one,
@@ -127,7 +128,8 @@ func (p Principal) carries(role RoleDefinition, perm Permission) bool {
 	return p.Kind != Public || role.Public
 }
 
-// publicRoles keeps the roles marked Public, the only ones a grant to the public gives.
+// publicRoles keeps the built-in roles marked Public, the only built-in ones a grant to the
+// public gives.
 func (a *Authorizer) publicRoles(roles []string) []string {
 	var public []string
 	for _, id := range roles {
@@ -168,10 +170,17 @@ func (a *Authorizer) subject(s Subject) error {
 
 // principalsFor is the keys of the subject's principals whose grants in a tenant can give p: a
 // grant to a tenant's members or the public never gives a permission to change grants,
-// whatever its role gives now or later. public is whether a role marked Public gives p, the
-// only way a grant to the public can, so an anonymous subject reads no grants without one.
+// whatever its role gives now or later. public is whether a public role can give p
+// (Authorizer.publicGives), so an anonymous subject reads no grants without one.
 func (s Subject) principalsFor(tenant string, p Permission, public bool) []string {
 	return s.keys(tenant, public && !p.managesAccess(), !p.managesAccess())
+}
+
+// publicGives reports whether a grant to the public can give p on a resource type: only a
+// public role's can, built in or custom, and those give only what a role that isn't
+// privileged gives there.
+func (a *Authorizer) publicGives(p Permission, resourceType string) bool {
+	return a.unprivileged[permissionOn{p, resourceType}]
 }
 
 // principals is the keys of every principal the subject is in a tenant.
@@ -288,13 +297,21 @@ type Change struct {
 }
 
 // ChangeEvent is what a committed change did: only the grants that were added, updated or
-// removed.
+// removed, and the custom roles defined or deleted.
 type ChangeEvent struct {
 	Tenant string
-	// Actor is who made the change through Apply; zero for Import and the deletes.
+	// Actor is who made the change; zero for Import and the deletes of scopes, principals and
+	// tenants.
 	Actor   Principal
 	Granted []Grant
 	Revoked []Grant
+	// Roles are custom roles created or replaced, as they are now.
+	Roles        []RoleDefinition
+	DeletedRoles []Role
+}
+
+func (e ChangeEvent) empty() bool {
+	return len(e.Granted)+len(e.Revoked)+len(e.Roles)+len(e.DeletedRoles) == 0
 }
 
 // Constraint removes a permission on a type of resource in a tenant, for everyone, such as a
@@ -376,6 +393,18 @@ type Authorizer struct {
 	// containerTypes are the containers' types, sorted.
 	containerTypes []string
 	kinds          map[PrincipalKind]bool
+	// permissions and types are what the built-in roles give and are for: all a custom role
+	// may use. unprivileged are the permissions, each with a type, that a role that isn't
+	// privileged gives there: all a public role may give.
+	permissions  map[Permission]bool
+	types        map[string]bool
+	unprivileged map[permissionOn]bool
+}
+
+// permissionOn is a permission on a type of resource.
+type permissionOn struct {
+	p Permission
+	t string
 }
 
 // New checks the configuration and returns an Authorizer that runs its queries on db.
@@ -424,16 +453,30 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	types := slices.Sorted(maps.Keys(containers))
-	return &Authorizer{db: db, cfg: cfg, roles: roles, containers: containers, containerTypes: types, kinds: kinds}, nil
+	perms, resourceTypes, unprivileged := map[Permission]bool{}, map[string]bool{}, map[permissionOn]bool{}
+	for _, r := range catalog {
+		for _, t := range r.ResourceTypes {
+			resourceTypes[t] = true
+			for _, p := range r.Permissions {
+				perms[p] = true
+				if !r.Privileged {
+					unprivileged[permissionOn{p, t}] = true
+				}
+			}
+		}
+	}
+	return &Authorizer{
+		db: db, cfg: cfg, roles: roles, containers: containers, containerTypes: slices.Sorted(maps.Keys(containers)),
+		kinds: kinds, permissions: perms, types: resourceTypes, unprivileged: unprivileged,
+	}, nil
 }
 
 // WithTx returns an Authorizer that runs on tx, so its changes commit or roll back with the
 // host's own writes. Changes need tx at READ COMMITTED, PostgreSQL's default, and fail in a
 // stricter one, whose snapshot can predate the locks they wait for. Their locks last until tx
 // ends, so two transactions that change the same scopes or principals in opposite orders can
-// deadlock, as with any row locks: PostgreSQL fails one, to be retried. DeleteTenant locks the
-// whole tenant.
+// deadlock, as with any row locks: PostgreSQL fails one, to be retried. DeleteTenant,
+// DefineRole and DeleteRole lock the whole tenant.
 func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 	b := *a
 	b.db = tx

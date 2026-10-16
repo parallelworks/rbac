@@ -35,6 +35,7 @@ var catalog = []rbac.RoleDefinition{
 	{ID: "cluster.login", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}},
 	{ID: "workspace.admin", Permissions: []rbac.Permission{"workspace:view", "workspace:grant"}, ResourceTypes: []string{"workspace"}},
 	{ID: "tenant.admin", Permissions: []rbac.Permission{"tenant:view", "tenant:grant"}, ResourceTypes: []string{"tenant"}},
+	{ID: "tenant.roles", Permissions: []rbac.Permission{rbac.DefineRoles}, ResourceTypes: []string{"tenant"}},
 }
 
 // A cluster in workspace w1 of org o1. setup grants "owner" its admin role, as a host does
@@ -159,6 +160,9 @@ func TestNewRejectsBadConfiguration(t *testing.T) {
 		}), ValidatePrincipal: ok},
 		"grantable roles without a grant permission": {Catalog: append(slices.Clone(catalog), rbac.RoleDefinition{
 			ID: "r", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.login"},
+		}), ValidatePrincipal: ok},
+		"a built-in role named like a custom one": {Catalog: append(slices.Clone(catalog), rbac.RoleDefinition{
+			ID: "custom.r", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"},
 		}), ValidatePrincipal: ok},
 		"a public privileged role": {Catalog: []rbac.RoleDefinition{{
 			ID: "r", Permissions: []rbac.Permission{root}, ResourceTypes: []string{"cluster"}, Privileged: true, Public: true,
@@ -809,6 +813,17 @@ func TestHooksCanUseTheBusyPool(t *testing.T) {
 	b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}
 	if err := authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
 		t.Fatalf("a hook on the pool the change runs on: %v", err)
+	}
+	tenant := rbac.TenantRoot("t1")
+	if err := authz.Import(ctx, "t1", []rbac.Grant{grant(tenant, "tenant.roles", rbac.User, "owner"), grant(tenant, "cluster.login", rbac.User, "owner")}); err != nil {
+		t.Fatal(err)
+	}
+	r := rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	if err := authz.DefineRole(ctx, user("owner"), "t1", r); err != nil {
+		t.Fatalf("a hook on the pool a role's definition runs on: %v", err)
+	}
+	if err := authz.DeleteRole(ctx, user("owner"), "t1", r.ID); err != nil {
+		t.Fatalf("a hook on the pool a role's deletion runs on: %v", err)
 	}
 }
 
@@ -1551,24 +1566,8 @@ func TestRolesListingEachOtherAreDecidedOnce(t *testing.T) {
 	// Each role is checked once per grant: along every order they reach each other in, this
 	// would take hours.
 	got, err := h.authz.Grantable(t.Context(), user("owner"), cluster)
-	if err != nil || len(got) != len(catalog)+len(ids)-2 {
+	if err != nil || len(got) != len(h.authz.Roles("cluster")) {
 		t.Fatalf("Grantable = %d roles, %v", len(got), err)
-	}
-}
-
-func TestGrantableDropsWhatARefusedRolesChecksAssumed(t *testing.T) {
-	// Deciding first passes second only while first is being checked, then fails on root.
-	first := rbac.RoleDefinition{ID: "cluster.first", Permissions: []rbac.Permission{view, grantC, root}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.second"}}
-	second := rbac.RoleDefinition{ID: "cluster.second", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.first"}}
-	share := rbac.RoleDefinition{ID: "cluster.share", Permissions: []rbac.Permission{view, login, grantC}, ResourceTypes: []string{"cluster"}}
-	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), first, second, share) })
-	h.seed(t, grant(cluster.Scope(), "cluster.share", rbac.User, "sharer"))
-	got, err := h.authz.Grantable(t.Context(), user("sharer"), cluster)
-	if err != nil || slices.ContainsFunc(got, func(r rbac.RoleDefinition) bool { return r.ID == "cluster.second" }) {
-		t.Fatalf("Grantable offers a role whose holders could grant root: %v, %v", got, err)
-	}
-	if !slices.ContainsFunc(got, func(r rbac.RoleDefinition) bool { return r.ID == "cluster.share" }) {
-		t.Fatalf("Grantable = %v", got)
 	}
 }
 
@@ -1591,6 +1590,538 @@ func TestDeletePrincipalEverywhereAcrossManyTenants(t *testing.T) {
 	}
 	if len(h.events) != tenants {
 		t.Fatalf("%d changes, want one per tenant", len(h.events))
+	}
+}
+
+// roleAdmin is a tenant admin who may define roles and holds every cluster permission.
+func roleAdmin(t *testing.T, h *harness) rbac.Subject {
+	t.Helper()
+	root := rbac.TenantRoot("t1")
+	h.seed(t,
+		grant(root, "tenant.roles", rbac.User, "admin"),
+		grant(root, "tenant.admin", rbac.User, "admin"),
+		grant(root, "cluster.admin", rbac.User, "admin"),
+	)
+	return user("admin")
+}
+
+func TestCustomRoles(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	resources := hostTable(t, h)
+	admin := roleAdmin(t, h)
+	operator := rbac.RoleDefinition{ID: "custom.operator", Name: "Operator", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
+	h.events = nil
+	if err := h.authz.DefineRole(ctx, admin, "t1", operator); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.events) != 1 || len(h.events[0].Roles) != 1 || h.events[0].Roles[0].ID != operator.ID || h.events[0].Actor != admin.Principal {
+		t.Fatalf("events = %+v", h.events)
+	}
+	if err := h.authz.DefineRole(ctx, admin, "t1", operator); err != nil || len(h.events) != 1 {
+		t.Fatalf("defining a role again as it is reported a change: %+v, %v", h.events, err)
+	}
+	if err := h.authz.Apply(ctx, admin, cluster, rbac.Change{Grant: []rbac.Binding{{Role: operator.ID, Principal: rbac.Principal{Kind: rbac.User, ID: "op"}}}}); err != nil {
+		t.Fatalf("granting a custom role: %v", err)
+	}
+	h.seed(t, grant(rbac.Scope{Type: "org", ID: "o1"}, operator.ID, rbac.User, "op"))
+	op := user("op")
+	if !allowed(t, h, op, login, cluster) || allowed(t, h, op, root, cluster) {
+		t.Fatal("a custom role should give what it lists and nothing more")
+	}
+	for _, p := range []rbac.Permission{login, root} {
+		listingsAgree(t, h, resources, op, p)
+	}
+	if perms, err := h.authz.Permissions(ctx, op, cluster); err != nil || !slices.Equal(perms, []rbac.Permission{login, view}) {
+		t.Errorf("Permissions = %v, %v", perms, err)
+	}
+	if holders, err := h.authz.Holders(ctx, cluster, login); err != nil || !slices.Contains(holders, op.Principal) {
+		t.Errorf("Holders = %v, %v", holders, err)
+	}
+	if d, err := h.authz.Explain(ctx, op, login, cluster); err != nil || !d.Allowed || d.Grants[0].Role != operator.ID {
+		t.Errorf("Explain = %+v, %v", d, err)
+	}
+
+	// Replacing it changes what its grants give.
+	operator.Permissions = append(operator.Permissions, root)
+	if err := h.authz.DefineRole(ctx, admin, "t1", operator); err != nil {
+		t.Fatal(err)
+	}
+	if !allowed(t, h, op, root, cluster) {
+		t.Fatal("a replaced role's grants should give what it gives now")
+	}
+	listingsAgree(t, h, resources, op, root)
+
+	roles, err := h.authz.RolesIn(ctx, "t1", "cluster")
+	if err != nil || len(roles) != 4 || roles[3].ID != operator.ID || !slices.Contains(roles[3].Permissions, root) {
+		t.Fatalf("RolesIn = %+v, %v", roles, err)
+	}
+	if !roles[3].Privileged {
+		t.Fatal("a custom role giving root, which only privileged roles give, should be privileged")
+	}
+	if grantable, err := h.authz.Grantable(ctx, admin, cluster); err != nil || !slices.ContainsFunc(grantable, func(r rbac.RoleDefinition) bool { return r.ID == operator.ID }) {
+		t.Fatalf("Grantable = %+v, %v", grantable, err)
+	}
+	if err := h.authz.Import(ctx, "t2", []rbac.Grant{grant(rbac.TenantRoot("t2"), operator.ID, rbac.User, "op")}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("granting a custom role in a tenant that doesn't define it: %v", err)
+	}
+
+	h.events = nil
+	if err := h.authz.DeleteRole(ctx, admin, "t1", operator.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.events) != 1 || len(h.events[0].Revoked) != 2 || !slices.Equal(h.events[0].DeletedRoles, []rbac.Role{operator.ID}) {
+		t.Fatalf("events = %+v", h.events)
+	}
+	if allowed(t, h, op, login, cluster) {
+		t.Fatal("a deleted role's grants should be gone")
+	}
+	if custom, err := h.authz.CustomRoles(ctx, "t1"); err != nil || len(custom) != 0 {
+		t.Fatalf("CustomRoles = %+v, %v", custom, err)
+	}
+
+	if err := h.authz.DefineRole(ctx, admin, "t1", operator); err != nil {
+		t.Fatal(err)
+	}
+	h.events = nil
+	if err := h.authz.DeleteTenant(ctx, "t1"); err != nil {
+		t.Fatal(err)
+	}
+	if custom, err := h.authz.CustomRoles(ctx, "t1"); err != nil || len(custom) != 0 {
+		t.Fatalf("a deleted tenant's custom roles: %+v, %v", custom, err)
+	}
+	if len(h.events) != 1 || !slices.Equal(h.events[0].DeletedRoles, []rbac.Role{operator.ID}) {
+		t.Fatalf("events = %+v", h.events)
+	}
+}
+
+func TestDefiningARoleChecksTheActor(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	tenant := rbac.TenantRoot("t1")
+	h.seed(t,
+		grant(tenant, "tenant.roles", rbac.User, "limited"),
+		grant(tenant, "cluster.login", rbac.User, "limited"),
+		grant(tenant, "cluster.admin", rbac.User, "no-roles"),
+	)
+	sudo := rbac.RoleDefinition{ID: "custom.sudo", Permissions: []rbac.Permission{view, login, root}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.DefineRole(ctx, user("limited"), "t1", sudo); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("defining a role with permissions the actor doesn't hold: %v", err)
+	}
+	if err := h.authz.DefineRole(ctx, user("no-roles"), "t1", sudo); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("defining a role without tenant:define-roles: %v", err)
+	}
+	if err := h.authz.DefineRole(ctx, rbac.Subject{}, "t1", sudo); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("an anonymous subject defining a role: %v", err)
+	}
+	for name, r := range map[string]rbac.RoleDefinition{
+		"no prefix":                 {ID: "sudo", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}},
+		"an unknown permission":     {ID: "custom.fly", Permissions: []rbac.Permission{"cluster:fly"}, ResourceTypes: []string{"cluster"}},
+		"an unknown type":           {ID: "custom.rocket", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"rocket"}},
+		"public and privileged":     {ID: "custom.p", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true, Privileged: true},
+		"an unknown grantable role": {ID: "custom.g", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"custom.nope"}},
+		"public root-level control": {ID: "custom.root", Permissions: []rbac.Permission{root}, ResourceTypes: []string{"cluster"}, Public: true},
+		"grantable roles without a grant permission": {
+			ID: "custom.d", Permissions: []rbac.Permission{rbac.DefineRoles}, ResourceTypes: []string{"tenant"}, GrantableRoles: []rbac.Role{"cluster.login"},
+		},
+	} {
+		if err := h.authz.DefineRole(ctx, admin, "t1", r); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	for _, p := range []rbac.Principal{rbac.TenantMembers("t1"), {Kind: rbac.Public}} {
+		if err := h.authz.Import(ctx, "t1", []rbac.Grant{{Scope: tenant, Binding: rbac.Binding{Role: "tenant.roles", Principal: p}}}); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("letting %s define roles: %v", p.Kind, err)
+		}
+	}
+	if err := h.authz.DeleteRole(ctx, user("limited"), "t1", "cluster.admin"); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("deleting a built-in role: %v", err)
+	}
+
+	// Who may only hand a role out can't redefine it with more than it holds.
+	viewer := rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	lister := rbac.RoleDefinition{ID: "custom.lister", Permissions: []rbac.Permission{"tenant:grant"}, ResourceTypes: []string{"tenant"}, GrantableRoles: []rbac.Role{viewer.ID}}
+	for _, r := range []rbac.RoleDefinition{viewer, lister} {
+		if err := h.authz.DefineRole(ctx, admin, "t1", r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.seed(t, grant(tenant, lister.ID, rbac.User, "helper"), grant(tenant, "tenant.roles", rbac.User, "helper"))
+	wider := viewer
+	wider.Permissions = []rbac.Permission{view, root}
+	if err := h.authz.DefineRole(ctx, user("helper"), "t1", wider); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("redefining a role the actor may only hand out: %v", err)
+	}
+	// Nor can one who holds a role widen it, or what it hands out.
+	h.seed(t, grant(tenant, viewer.ID, rbac.User, "helper"))
+	if err := h.authz.DefineRole(ctx, user("helper"), "t1", wider); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("widening a role the actor holds: %v", err)
+	}
+	more := lister
+	more.GrantableRoles = []rbac.Role{"cluster.admin"}
+	if err := h.authz.DefineRole(ctx, user("helper"), "t1", more); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("widening what a role the actor holds hands out: %v", err)
+	}
+	if err := h.authz.DeleteRole(ctx, admin, "t1", viewer.ID); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("deleting a role another lists: %v", err)
+	}
+
+	// A custom role that hands out narrower ones.
+	access := rbac.RoleDefinition{ID: "custom.access", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.login"}}
+	if err := h.authz.DefineRole(ctx, admin, "t1", access); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), access.ID, rbac.User, "manager"))
+	b := func(role rbac.Role) rbac.Binding {
+		return rbac.Binding{Role: role, Principal: rbac.Principal{Kind: rbac.User, ID: "x"}}
+	}
+	if err := h.authz.Apply(ctx, user("manager"), cluster, rbac.Change{Grant: []rbac.Binding{b("cluster.login")}}); err != nil {
+		t.Fatalf("a custom role's grantable role: %v", err)
+	}
+	if err := h.authz.Apply(ctx, user("manager"), cluster, rbac.Change{Grant: []rbac.Binding{b("cluster.sudo")}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("a role a custom role doesn't list: %v", err)
+	}
+}
+
+func TestDefiningRolesRespectsConstraints(t *testing.T) {
+	h := setup(t, constrain("roles are managed elsewhere", rbac.DefineRoles))
+	admin := roleAdmin(t, h)
+	r := rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.DefineRole(t.Context(), admin, "t1", r); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("defining a role a constraint forbids: %v", err)
+	}
+}
+
+func TestPublicCustomRoles(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	resources := hostTable(t, h)
+	admin := roleAdmin(t, h)
+	viewer := rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
+	if err := h.authz.DefineRole(ctx, admin, "t1", viewer); err != nil {
+		t.Fatal(err)
+	}
+	tenant := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}
+	if err := h.authz.Apply(ctx, admin, tenant, rbac.Change{Grant: []rbac.Binding{{Role: viewer.ID, Principal: rbac.Principal{Kind: rbac.Public}}}}); err != nil {
+		t.Fatal(err)
+	}
+	anonymous := rbac.Subject{}
+	if !allowed(t, h, anonymous, view, cluster) {
+		t.Fatal("a public custom role should reach anonymous subjects")
+	}
+	listingsAgree(t, h, resources, anonymous, view)
+	viewer.Public = false
+	if err := h.authz.DefineRole(ctx, admin, "t1", viewer); err != nil {
+		t.Fatal(err)
+	}
+	if allowed(t, h, anonymous, view, cluster) {
+		t.Fatal("a grant to the public should give nothing once its custom role isn't public")
+	}
+	listingsAgree(t, h, resources, anonymous, view)
+	if holders, err := h.authz.Holders(ctx, cluster, view); err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.Public}) {
+		t.Fatalf("Holders = %v, %v", holders, err)
+	}
+}
+
+func TestDeleteRoleRemovesAGrantMadeWhileItWaits(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	operator := rbac.RoleDefinition{ID: "custom.operator", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.DefineRole(ctx, admin, "t1", operator); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	b := rbac.Binding{Role: operator.ID, Principal: rbac.Principal{Kind: rbac.User, ID: "op"}}
+	if err := h.authz.WithTx(tx).Apply(ctx, admin, cluster, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- h.authz.DeleteRole(ctx, admin, "t1", operator.ID) }()
+	for waiting := false; !waiting; {
+		select {
+		case err := <-done:
+			done <- err
+			waiting = true
+		default:
+			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+				WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE '%/rbac/%')`).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{b.Principal}}); err != nil || len(got) != 0 {
+		t.Fatalf("a grant made while its role was deleted outlived it: %+v, %v", got, err)
+	}
+}
+
+func TestApplyRefusesARoleChangedWhileItWaits(t *testing.T) {
+	operator := rbac.RoleDefinition{ID: "custom.operator", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
+	moved := operator
+	moved.Permissions, moved.ResourceTypes = []rbac.Permission{"tenant:view"}, []string{"tenant"}
+	for name, change := range map[string]func(ctx context.Context, a *rbac.Authorizer, admin rbac.Subject) error{
+		"deleted": func(ctx context.Context, a *rbac.Authorizer, admin rbac.Subject) error {
+			return a.DeleteRole(ctx, admin, "t1", operator.ID)
+		},
+		"no longer for clusters": func(ctx context.Context, a *rbac.Authorizer, admin rbac.Subject) error {
+			return a.DefineRole(ctx, admin, "t1", moved)
+		},
+	} {
+		t.Run(name, func(t *testing.T) { applyWhileTheRoleChanges(t, operator, change) })
+	}
+}
+
+func applyWhileTheRoleChanges(t *testing.T, operator rbac.RoleDefinition, change func(context.Context, *rbac.Authorizer, rbac.Subject) error) {
+	t.Helper()
+	h := setup(t)
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	if err := h.authz.DefineRole(ctx, admin, "t1", operator); err != nil {
+		t.Fatal(err)
+	}
+	// The host changes the role in its transaction, which holds the tenant until it commits.
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := change(ctx, h.authz.WithTx(tx), admin); err != nil {
+		t.Fatal(err)
+	}
+	b := rbac.Binding{Role: operator.ID, Principal: rbac.Principal{Kind: rbac.User, ID: "op"}}
+	done := make(chan error, 1)
+	go func() { done <- h.authz.Apply(ctx, admin, cluster, rbac.Change{Grant: []rbac.Binding{b}}) }()
+	for waiting := false; !waiting; {
+		select {
+		case err := <-done:
+			t.Fatalf("Apply didn't wait for the role's change: %v", err)
+		default:
+			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+				WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE '%/rbac/%')`).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("granting a role changed while the change waited: %v", err)
+	}
+	if got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{b.Principal}}); err != nil || len(got) != 0 {
+		t.Fatalf("Grants = %+v, %v", got, err)
+	}
+}
+
+func TestRedefiningAListedRoleNeedsThePowerToGrantIt(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	tenant := rbac.TenantRoot("t1")
+	// May define roles and holds root on every cluster, but may change no grants.
+	h.seed(t, grant(tenant, "tenant.roles", rbac.User, "definer"), grant(tenant, "cluster.sudo", rbac.User, "definer"))
+	definer := user("definer")
+	// Clusters can't take it yet, so listing it for clusters needs no power over it.
+	later := rbac.RoleDefinition{ID: "custom.later", Permissions: []rbac.Permission{rbac.DefineRoles}, ResourceTypes: []string{"tenant"}}
+	if err := h.authz.DefineRole(ctx, definer, "t1", later); err != nil {
+		t.Fatal(err)
+	}
+	lister := rbac.RoleDefinition{ID: "custom.lister", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{later.ID}}
+	if err := h.authz.DefineRole(ctx, admin, "t1", lister); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), lister.ID, rbac.User, "manager"))
+	sudo := later
+	sudo.Permissions, sudo.ResourceTypes = []rbac.Permission{view, login, root}, []string{"cluster"}
+	if err := h.authz.DefineRole(ctx, definer, "t1", sudo); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("letting a role's holders grant root without the power to grant it: %v", err)
+	}
+	if err := h.authz.Apply(ctx, user("manager"), cluster, rbac.Change{Grant: []rbac.Binding{{Role: later.ID, Principal: rbac.Principal{Kind: rbac.User, ID: "manager"}}}}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("granting the listed role on a cluster: %v", err)
+	}
+	if err := h.authz.DefineRole(ctx, admin, "t1", sudo); err != nil {
+		t.Fatalf("redefining a listed role with the power to grant it: %v", err)
+	}
+}
+
+func TestPublicCustomRolesGiveOnlyWhatUnprivilegedRolesGiveOnEachType(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog),
+			rbac.RoleDefinition{ID: "files.reader", Permissions: []rbac.Permission{"data:read"}, ResourceTypes: []string{"bucket"}},
+			rbac.RoleDefinition{ID: "secrets.admin", Permissions: []rbac.Permission{"data:read"}, ResourceTypes: []string{"secret"}, Privileged: true},
+		)
+	})
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	h.seed(t, grant(rbac.TenantRoot("t1"), "secrets.admin", rbac.User, "admin"))
+	secrets := rbac.RoleDefinition{ID: "custom.secrets", Permissions: []rbac.Permission{"data:read"}, ResourceTypes: []string{"secret"}, Public: true}
+	if err := h.authz.DefineRole(ctx, admin, "t1", secrets); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a public role giving what only a privileged role gives on its type: %v", err)
+	}
+	secrets.Public = false
+	if err := h.authz.DefineRole(ctx, admin, "t1", secrets); err != nil {
+		t.Fatal(err)
+	}
+	if roles, err := h.authz.CustomRoles(ctx, "t1"); err != nil || len(roles) != 1 || !roles[0].Privileged {
+		t.Fatalf("a role giving what only a privileged role gives on its type should be privileged: %+v, %v", roles, err)
+	}
+}
+
+func TestCustomRolesFollowTheCatalog(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	resources := hostTable(t, h)
+	admin := roleAdmin(t, h)
+	op := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view, login, root}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.DefineRole(ctx, admin, "t1", op); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(rbac.Scope{Type: "org", ID: "o1"}, op.ID, rbac.User, "op"))
+	// The host deploys a catalog that no longer gives root.
+	without := slices.Clone(catalog)
+	for i, r := range without {
+		without[i].Permissions = slices.DeleteFunc(slices.Clone(r.Permissions), func(p rbac.Permission) bool { return p == root })
+	}
+	later, err := rbac.New(h.pool, rbac.Config{
+		Catalog: without, ContainerTypes: []string{"org", "workspace"},
+		ValidatePrincipal: func(context.Context, rbac.DB, string, rbac.Principal) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := later.Authorize(ctx, user("op"), root, cluster); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("a custom role giving a permission the catalog dropped: %v", err)
+	}
+	if reach, err := later.Reachable(ctx, user("op"), root, "t1", "cluster"); err != nil || reach.All || len(reach.Scopes) > 0 {
+		t.Fatalf("Reachable = %+v, %v", reach, err)
+	}
+	pred, err := later.Filter(ctx, user("op"), root, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM clusters WHERE `+pred.SQL, pred.Args...).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("Filter kept %d clusters, %v", n, err)
+	}
+	if holders, err := later.Holders(ctx, resources[0], root); err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.User, ID: "op"}) {
+		t.Fatalf("Holders = %v, %v", holders, err)
+	}
+	if roles, err := later.CustomRoles(ctx, "t1"); err != nil || len(roles) != 1 || slices.Contains(roles[0].Permissions, root) {
+		t.Fatalf("CustomRoles = %+v, %v", roles, err)
+	}
+	if err := later.Authorize(ctx, user("op"), login, cluster); err != nil {
+		t.Fatalf("what the catalog still has: %v", err)
+	}
+}
+
+func TestDefiningRolesIsCanonicalBoundedAndMarksPrivilege(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	r := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{login, view, view}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.DefineRole(ctx, admin, "t1", r); err != nil {
+		t.Fatal(err)
+	}
+	h.events = nil
+	r.Permissions = []rbac.Permission{view, login}
+	if err := h.authz.DefineRole(ctx, admin, "t1", r); err != nil || len(h.events) != 0 {
+		t.Fatalf("the same role reordered changed it: %+v, %v", h.events, err)
+	}
+	lister := rbac.RoleDefinition{ID: "custom.lister", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.sudo"}}
+	if err := h.authz.DefineRole(ctx, admin, "t1", lister); err != nil {
+		t.Fatal(err)
+	}
+	if roles, err := h.authz.CustomRoles(ctx, "t1"); err != nil || len(roles) != 2 || !roles[0].Privileged || roles[1].Privileged {
+		t.Fatalf("a role handing out sudo should be privileged, one giving login and view not: %+v, %v", roles, err)
+	}
+	// Handing out a privileged custom role is privileged too, though workspace:grant isn't.
+	h.seed(t, grant(rbac.TenantRoot("t1"), "workspace.admin", rbac.User, "admin"))
+	rooted := rbac.RoleDefinition{ID: "custom.rooted", Permissions: []rbac.Permission{root}, ResourceTypes: []string{"cluster"}}
+	relay := rbac.RoleDefinition{ID: "custom.relay", Permissions: []rbac.Permission{"workspace:grant"}, ResourceTypes: []string{"workspace"}, GrantableRoles: []rbac.Role{rooted.ID}}
+	for _, d := range []rbac.RoleDefinition{rooted, relay} {
+		if err := h.authz.DefineRole(ctx, admin, "t1", d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if roles, err := h.authz.CustomRoles(ctx, "t1"); err != nil || roles[len(roles)-2].ID != relay.ID || !roles[len(roles)-2].Privileged {
+		t.Fatalf("a role handing out a privileged custom role should be privileged: %+v, %v", roles, err)
+	}
+	fill := func(from, to int) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+			SELECT 't1', 'custom.filler' || i, '{cluster:view}', '{cluster}' FROM generate_series($1::int, $2::int) AS i`, from, to); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fill(1, 65)
+	many := rbac.RoleDefinition{ID: "custom.many", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"}}
+	for i := range 65 {
+		many.GrantableRoles = append(many.GrantableRoles, rbac.Role(fmt.Sprintf("custom.filler%d", i+1)))
+	}
+	if err := h.authz.DefineRole(ctx, admin, "t1", many); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a role listing 65 roles: %v", err)
+	}
+	fill(66, 296)
+	extra := rbac.RoleDefinition{ID: "custom.extra", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.DefineRole(ctx, admin, "t1", extra); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a tenant's 301st custom role: %v", err)
+	}
+	if err := h.authz.DefineRole(ctx, admin, "t1", r); err != nil {
+		t.Fatalf("redefining a role in a full tenant: %v", err)
+	}
+}
+
+func TestDeletingARoleRespectsConstraints(t *testing.T) {
+	stop := false
+	h := setup(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "managed elsewhere", Deny: func(_ context.Context, _ rbac.DB, _, _ string, p rbac.Permission) (bool, error) {
+			return stop && p == grantC, nil
+		}}}
+	})
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	op := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.DefineRole(ctx, admin, "t1", op); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), op.ID, rbac.User, "op"))
+	stop = true
+	if err := h.authz.DeleteRole(ctx, admin, "t1", op.ID); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("deleting a role revokes grants a constraint keeps: %v", err)
+	}
+	stop = false
+	if err := h.authz.DeleteRole(ctx, admin, "t1", op.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.DeleteRole(ctx, admin, "t1", op.ID); err != nil {
+		t.Fatalf("deleting a role that doesn't exist: %v", err)
+	}
+}
+
+func TestGrantableDropsWhatARefusedRolesChecksAssumed(t *testing.T) {
+	// Deciding first passes second only while first is being checked, then fails on root.
+	first := rbac.RoleDefinition{ID: "cluster.first", Permissions: []rbac.Permission{view, grantC, root}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.second"}}
+	second := rbac.RoleDefinition{ID: "cluster.second", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.first"}}
+	share := rbac.RoleDefinition{ID: "cluster.share", Permissions: []rbac.Permission{view, login, grantC}, ResourceTypes: []string{"cluster"}}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), first, second, share) })
+	h.seed(t, grant(cluster.Scope(), "cluster.share", rbac.User, "sharer"))
+	got, err := h.authz.Grantable(t.Context(), user("sharer"), cluster)
+	if err != nil || slices.ContainsFunc(got, func(r rbac.RoleDefinition) bool { return r.ID == "cluster.second" }) {
+		t.Fatalf("Grantable offers a role whose holders could grant root: %v, %v", got, err)
+	}
+	if !slices.ContainsFunc(got, func(r rbac.RoleDefinition) bool { return r.ID == "cluster.share" }) {
+		t.Fatalf("Grantable = %v", got)
 	}
 }
 

@@ -62,8 +62,12 @@ func validName(s string) bool { return typeName.MatchString(s) }
 // underscores.
 func (p Permission) Valid() bool { return permissionName.MatchString(string(p)) }
 
-// managesAccess reports whether p is a permission to change grants.
-func (p Permission) managesAccess() bool {
+// managesAccess reports whether p is a permission to change access: grants, or the roles they
+// give.
+func (p Permission) managesAccess() bool { return p.changesGrants() || p == DefineRoles }
+
+// changesGrants reports whether p is `<type>:grant`, the only permission GrantableRoles limit.
+func (p Permission) changesGrants() bool {
 	_, verb := p.parts()
 	return verb == "grant"
 }
@@ -73,41 +77,48 @@ func (p Permission) parts() (resourceType, verb string) {
 	return resourceType, verb
 }
 
+// shape returns what is wrong with a role definition alone: its permissions, types and flags.
+func shape(r RoleDefinition) []error {
+	var errs []error
+	if len(r.Permissions) == 0 {
+		errs = append(errs, errors.New("gives no permissions"))
+	}
+	for _, p := range r.Permissions {
+		if !p.Valid() {
+			errs = append(errs, fmt.Errorf("permission %q is not `type:verb`", p))
+		}
+	}
+	if len(r.ResourceTypes) == 0 {
+		errs = append(errs, errors.New("can be granted on no resource type"))
+	}
+	for _, t := range r.ResourceTypes {
+		if !validName(t) {
+			errs = append(errs, fmt.Errorf("resource type %q is not valid", t))
+		}
+	}
+	if r.Public && (r.Privileged || r.managesAccess()) {
+		errs = append(errs, errors.New("a privileged role or one that changes access can't be public"))
+	}
+	if len(r.GrantableRoles) > 0 && !slices.ContainsFunc(r.Permissions, Permission.changesGrants) {
+		errs = append(errs, errors.New("lists grantable roles but gives no `:grant` permission"))
+	}
+	return errs
+}
+
 // index checks a catalog and returns its roles by id, each its own copy.
 func index(catalog []RoleDefinition) (map[Role]RoleDefinition, error) {
 	var errs []error
 	roles := make(map[Role]RoleDefinition, len(catalog))
 	for _, r := range catalog {
-		bad := func(format string, args ...any) {
-			errs = append(errs, fmt.Errorf("rbac: role %q: "+format, append([]any{r.ID}, args...)...))
-		}
-		if !roleID.MatchString(string(r.ID)) {
-			bad("id must be lowercase letters, digits, dots, hyphens and underscores")
+		bad := func(err error) { errs = append(errs, fmt.Errorf("rbac: role %q: %w", r.ID, err)) }
+		if !roleID.MatchString(string(r.ID)) || isCustom(r.ID) {
+			bad(fmt.Errorf("id must be lowercase letters, digits, dots, hyphens and underscores, not starting %q", CustomPrefix))
 		}
 		if _, dup := roles[r.ID]; dup {
-			bad("listed twice")
+			bad(errors.New("listed twice"))
 		}
-		if len(r.Permissions) == 0 {
-			bad("gives no permissions")
-		}
-		for _, p := range r.Permissions {
-			if !p.Valid() {
-				bad("permission %q is not `type:verb`", p)
-			}
-		}
-		if len(r.ResourceTypes) == 0 {
-			bad("can be granted on no resource type")
-		}
-		for _, t := range r.ResourceTypes {
-			if !validName(t) {
-				bad("resource type %q is not valid", t)
-			}
-		}
-		if r.Public && (r.Privileged || r.managesAccess()) {
-			bad("a privileged role or one that changes access can't be public")
-		}
-		if len(r.GrantableRoles) > 0 && !r.managesAccess() {
-			bad("lists grantable roles but gives no `:grant` permission")
+		for _, err := range shape(r) {
+			bad(err)
 		}
 		roles[r.ID] = r.clone()
 	}
@@ -124,7 +135,7 @@ func index(catalog []RoleDefinition) (map[Role]RoleDefinition, error) {
 	return roles, nil
 }
 
-// Role returns a built-in role by id.
+// Role returns a built-in role by id; RolesIn and CustomRoles read a tenant's own.
 func (a *Authorizer) Role(id Role) (RoleDefinition, bool) {
 	r, ok := a.roles[id]
 	if !ok {
