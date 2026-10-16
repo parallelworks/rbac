@@ -176,7 +176,8 @@ func (a *Authorizer) checkCustom(r RoleDefinition) error {
 		errs = append(errs, fmt.Errorf("a name is at most %d characters and a description %d", maxName, maxDescription))
 	}
 	// PostgreSQL refuses text that isn't UTF-8 or holds a NUL, as an error that isn't ErrInvalid.
-	if !utf8.ValidString(r.Name+r.Description) || strings.ContainsRune(r.Name+r.Description, 0) {
+	// Each is checked alone: a character split between them is valid only once joined.
+	if !utf8.ValidString(r.Name) || !utf8.ValidString(r.Description) || strings.ContainsRune(r.Name+r.Description, 0) {
 		errs = append(errs, errors.New("a name and a description are UTF-8 text without NUL"))
 	}
 	if len(errs) > 0 {
@@ -211,8 +212,9 @@ func canonical(r RoleDefinition) RoleDefinition {
 // another custom role lists needs the power to grant it as defined wherever that one lists it.
 // Replacing one so that its grants give something else changes them, so a constraint that stops
 // changes to grants where it can be granted stops it, as it stops DeleteRole. A role another
-// change redefined, created or deleted while this one waited for the tenant is refused, to be
-// tried again: the constraints were asked about it as it was.
+// change redefined or created while this one waited for the tenant is refused, to be tried
+// again: the constraints were asked about it as it was. One deleted meanwhile is created, as
+// its grants went with it.
 func (a *Authorizer) DefineRole(ctx context.Context, actor Subject, tenant string, r RoleDefinition) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -263,8 +265,15 @@ func (a *Authorizer) DefineRole(ctx context.Context, actor Subject, tenant strin
 		}
 		// Privileged as the roles that give its permissions on its types are, or as a role it
 		// hands out is, so a host that confirms privileged grants asks about one that gives or
-		// hands out root however it was defined. What it was is no part of what it is.
-		r.Privileged = a.privileged(r) || a.handsOutPrivilege(r, au.roles.custom)
+		// hands out root however it was defined. Derived as a read derives it, with r in place
+		// of what it was, which is no part of what it is.
+		tenantRoles := []RoleDefinition{r}
+		for id, def := range au.roles.custom {
+			if id != r.ID {
+				tenantRoles = append(tenantRoles, def)
+			}
+		}
+		r.Privileged = handingOut(a.current(tenantRoles))[0].Privileged
 		others := len(au.roles.custom)
 		if ok {
 			others--
@@ -387,10 +396,10 @@ func (a *Authorizer) changesStopped(ctx context.Context, tenant string, roleType
 	return nil
 }
 
-// changedMeanwhile refuses a change to a role that another change redefined, created or
-// deleted after the constraints, which run before the transaction, were asked about it.
+// changedMeanwhile refuses a change to a role that another change redefined or created after
+// the constraints, which run before the transaction, were asked about it.
 func changedMeanwhile(id Role) error {
-	return fmt.Errorf("rbac: role %q changed while this change waited for it; try again", id)
+	return fmt.Errorf("%w: role %q changed while this change waited for it; try again", ErrConflict, id)
 }
 
 // sameAccess reports whether two definitions of a role give the same through its grants.
@@ -524,43 +533,17 @@ func handingOut(roles []RoleDefinition) []RoleDefinition {
 	return roles
 }
 
-// handsOutPrivilege reports whether r lists a privileged role, directly or through the custom
-// roles it lists, read from what they give rather than their flags: a flag can stand for what r
-// was, as a role that lists r back was marked by it.
-func (a *Authorizer) handsOutPrivilege(r RoleDefinition, custom map[Role]RoleDefinition) bool {
-	seen := map[Role]bool{r.ID: true}
-	next := slices.Clone(r.GrantableRoles)
-	for len(next) > 0 {
-		id := next[len(next)-1]
-		next = next[:len(next)-1]
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		if def, ok := a.roles[id]; ok {
-			if def.Privileged {
-				return true
-			}
-		} else if def, ok := custom[id]; ok {
-			if a.privileged(def) {
-				return true
-			}
-			next = append(next, def.GrantableRoles...)
-		}
-	}
-	return false
-}
-
 // current reads stored definitions as the catalog has them now, so a catalog change binds
 // custom roles defined before it: they give only permissions and types the catalog still has,
 // are public only while every permission they give is one an unprivileged role gives, and are
-// privileged when they give or list what privileged roles do.
+// privileged when they give or list what privileged roles do. The stored flag counts for
+// nothing: it can stand for what a role it lists was, or for a catalog since changed.
 func (a *Authorizer) current(roles []RoleDefinition) []RoleDefinition {
 	for i, r := range roles {
 		r.Permissions = slices.DeleteFunc(r.Permissions, func(p Permission) bool { return !a.permissions[p] })
 		r.ResourceTypes = slices.DeleteFunc(r.ResourceTypes, func(t string) bool { return !a.types[t] })
 		r.Public = r.Public && !a.privileged(r) && !r.managesAccess()
-		r.Privileged = r.Privileged || a.privileged(r) || a.listsPrivileged(r)
+		r.Privileged = a.privileged(r) || a.listsPrivileged(r)
 		roles[i] = r
 	}
 	return roles
