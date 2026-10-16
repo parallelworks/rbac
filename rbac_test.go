@@ -813,6 +813,15 @@ func TestSubjectsAreAnonymousOrOneIdentity(t *testing.T) {
 		if _, err := h.authz.Reachable(t.Context(), s, login, "t1", "cluster"); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("%s: Reachable %v", name, err)
 		}
+		if _, err := h.authz.Filter(t.Context(), s, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s: Filter %v", name, err)
+		}
+		if _, err := h.authz.Permissions(t.Context(), s, cluster); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s: Permissions %v", name, err)
+		}
+		if _, err := h.authz.Explain(t.Context(), s, login, cluster); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s: Explain %v", name, err)
+		}
 		if err := h.authz.Apply(t.Context(), s, cluster, rbac.Change{}); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("%s: Apply of no change %v", name, err)
 		}
@@ -1290,6 +1299,23 @@ func TestMachineIdentities(t *testing.T) {
 	}
 	if reach, err := h.authz.Reachable(ctx, impostor, root, "t1", "cluster"); err != nil || reach.Owned {
 		t.Fatalf("Reachable = %+v, %v", reach, err)
+	}
+	if err := h.authz.Apply(ctx, impostor, cluster, rbac.Change{Grant: []rbac.Binding{u}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("a service account with the owner's id changed the cluster's grants: %v", err)
+	}
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE owned (tenant text NOT NULL, owner text NOT NULL, path text[] NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO owned VALUES ('t1', $1, $2)`, cluster.Owner, h.path(t, cluster)); err != nil {
+		t.Fatal(err)
+	}
+	pred, err := h.authz.Filter(ctx, impostor, root, "t1", "cluster", rbac.Columns{Tenant: "tenant", Owner: "owner", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM owned WHERE `+pred.SQL, pred.Args...).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("Filter keeps the owner's cluster for a service account with the owner's id: %d, %v", n, err)
 	}
 
 	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.Tenant, "t1"))

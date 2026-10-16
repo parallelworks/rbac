@@ -64,8 +64,9 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 		return Decision{Allowed: true, Owner: true}, nil
 	}
 
+	principals := s.principalsFor(r.Tenant, p, len(a.publicRoles(a.giving(p, r.Type))) > 0)
 	if !explain {
-		held, err := a.heldBindings(ctx, a.db, r.Tenant, s.principalsFor(r.Tenant, p), r.path())
+		held, err := a.heldBindings(ctx, a.db, r.Tenant, principals, r.path())
 		if err != nil {
 			return Decision{}, err
 		}
@@ -77,7 +78,7 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 		return Decision{Reason: "no grant gives it"}, nil
 	}
 
-	grants, err := a.heldGrants(ctx, a.db, r.Tenant, s.principalsFor(r.Tenant, p), r.path())
+	grants, err := a.heldGrants(ctx, a.db, r.Tenant, principals, r.path())
 	if err != nil {
 		return Decision{}, err
 	}
@@ -97,7 +98,7 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 // that is no longer in the catalog gives nothing.
 func (a *Authorizer) gives(to Principal, id Role, p Permission, resourceType string) bool {
 	def, ok := a.roles[id]
-	return ok && def.GrantableOn(resourceType) && def.Gives(p) && a.carries(to, id, p)
+	return ok && def.GrantableOn(resourceType) && def.Gives(p) && to.carries(def, p)
 }
 
 // Permissions lists what the subject may do to r, sorted: the AuthZEN action search.
@@ -122,7 +123,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 		for _, b := range held {
 			if def, ok := a.roles[b.Role]; ok && def.GrantableOn(r.Type) {
 				for _, p := range def.Permissions {
-					if a.carries(b.Principal, b.Role, p) {
+					if b.Principal.carries(def, p) {
 						candidates = append(candidates, p)
 					}
 				}
@@ -209,7 +210,8 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 		return Reach{}, err
 	}
 	reach := Reach{Owned: s.user(tenant) != "" && a.ownerHolds(resourceType, p)}
-	principals := s.principalsFor(tenant, p)
+	publicRoles := a.publicRoles(roles)
+	principals := s.principalsFor(tenant, p, len(publicRoles) > 0)
 	if len(roles) == 0 || len(principals) == 0 {
 		return reach, nil
 	}
@@ -219,8 +221,7 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 		  AND (expires_at IS NULL OR expires_at > $4) AND split_part(scope, ':', 1) = ANY($5::text[])
 		  AND (principal <> $6 OR role = ANY($7::text[]))
 		ORDER BY scope`,
-		tenant, principals, roles, a.cfg.Now(), a.reaching(resourceType),
-		Principal{Kind: Public}.key(), a.publicRoles(roles))
+		tenant, principals, roles, a.cfg.Now(), a.reaching(resourceType), publicKey, publicRoles)
 	if err != nil {
 		return Reach{}, err
 	}
@@ -286,7 +287,8 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	if err != nil {
 		return Predicate{}, err
 	}
-	principals := s.principalsFor(tenant, p)
+	publicRoles := a.publicRoles(roles)
+	principals := s.principalsFor(tenant, p, len(publicRoles) > 0)
 	granted := len(roles) > 0 && len(principals) > 0
 	user := s.user(tenant)
 	owner := cols.Owner != "" && user != "" && !removed && a.ownerHolds(resourceType, p)
@@ -306,8 +308,7 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 		// text, and one argument can't take two types.
 		tenantArg, principalsArg, rolesArg, nowArg, typesArg := arg(len(args)), arg(len(args)+1), arg(len(args)+2), arg(len(args)+3), arg(len(args)+4)
 		publicArg, publicRolesArg := arg(len(args)+5), arg(len(args)+6)
-		args = append(args, tenant, principals, roles, a.cfg.Now(), a.reaching(resourceType),
-			Principal{Kind: Public}.key(), a.publicRoles(roles))
+		args = append(args, tenant, principals, roles, a.cfg.Now(), a.reaching(resourceType), publicKey, publicRoles)
 		// A tenant-wide grant's scope is the tenant's key, which every path holds, so one
 		// overlap covers every scope and the host's GIN index serves it. The keys take the
 		// default collation so that index applies.
