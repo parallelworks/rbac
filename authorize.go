@@ -13,7 +13,8 @@ import (
 // Decision is why a check came out as it did.
 type Decision struct {
 	Allowed bool
-	// Owner is set when the subject owns the resource, which gives every permission on it.
+	// Owner is set when the subject owns the resource, which gives every permission on it but
+	// changing the grants on a container or the tenant.
 	Owner bool
 	// Grants are the subject's grants that give the permission.
 	Grants []Grant
@@ -43,7 +44,7 @@ func (a *Authorizer) Explain(ctx context.Context, s Subject, p Permission, r Res
 }
 
 func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Resource, explain bool) (Decision, error) {
-	if err := r.validate(); err != nil {
+	if err := a.check(r); err != nil {
 		return Decision{}, err
 	}
 	if !p.Valid() {
@@ -59,7 +60,7 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 	if name != "" {
 		return Decision{DeniedBy: name, Reason: "removed by " + name}, nil
 	}
-	if s.User != "" && s.User == r.Owner {
+	if s.User != "" && s.User == r.Owner && a.ownerHolds(r.Type, p) {
 		return Decision{Allowed: true, Owner: true}, nil
 	}
 
@@ -101,16 +102,19 @@ func (a *Authorizer) gives(id Role, p Permission, resourceType string) bool {
 
 // Permissions lists what the subject may do to r, sorted: the AuthZEN action search.
 func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]Permission, error) {
-	if err := r.validate(); err != nil {
+	if err := a.check(r); err != nil {
 		return nil, err
 	}
 	if s.Tenant != r.Tenant {
 		return nil, nil
 	}
 	var candidates []Permission
-	if s.User != "" && s.User == r.Owner {
-		candidates = a.permissionsOn(r.Type)
-	} else {
+	owner := s.User != "" && s.User == r.Owner
+	if owner {
+		candidates = slices.DeleteFunc(a.permissionsOn(r.Type), func(p Permission) bool { return !a.ownerHolds(r.Type, p) })
+	}
+	// A container's owner holds its grant permission only through grants.
+	if !owner || a.contains(r.Type) {
 		roles, err := a.heldRoles(ctx, a.db, r.Tenant, s.principals(), r.Path())
 		if err != nil {
 			return nil, err
@@ -139,7 +143,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 // Holders lists who may do p to r: its owner, and the users, groups and everyone holding a
 // role that gives it there. The AuthZEN subject search; the host expands groups to people.
 func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]Principal, error) {
-	if err := r.validate(); err != nil {
+	if err := a.check(r); err != nil {
 		return nil, err
 	}
 	if !p.Valid() {
@@ -150,7 +154,7 @@ func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]P
 		return nil, err
 	}
 	var holders []Principal
-	if r.Owner != "" {
+	if r.Owner != "" && a.ownerHolds(r.Type, p) {
 		holders = append(holders, Principal{Kind: User, ID: r.Owner})
 	}
 	roles := a.giving(p, r.Type)
@@ -199,7 +203,7 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, res
 	if err != nil || removed {
 		return Reach{}, err
 	}
-	reach := Reach{Owned: s.User != ""}
+	reach := Reach{Owned: s.User != "" && a.ownerHolds(resourceType, p)}
 	if len(roles) == 0 {
 		return reach, nil
 	}
@@ -272,7 +276,7 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, resour
 		return Predicate{}, err
 	}
 	granted := len(roles) > 0
-	owner := cols.Owner != "" && s.User != "" && !removed
+	owner := cols.Owner != "" && s.User != "" && !removed && a.ownerHolds(resourceType, p)
 	if !granted && !owner {
 		return Predicate{SQL: "FALSE"}, nil
 	}
