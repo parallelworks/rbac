@@ -12,8 +12,8 @@
 // grants with escalation checks ([Authorizer.Apply]). Nothing is owned: a host gives whoever
 // creates a resource a role on it ([Authorizer.Import]).
 //
-// A check reads the grants as they are: there is no cache. Read a resource's ancestors and a
-// subject's groups no earlier than the content they protect.
+// A check reads the grants as they are: only compiled conditions are cached. Read a resource's
+// ancestors and attributes and a subject's groups no earlier than the content they protect.
 package rbac
 
 import (
@@ -152,6 +152,8 @@ type Subject struct {
 	Groups    []string
 	// Tenants are the tenants it is a member of, where grants to the tenant's members reach it.
 	Tenants []string
+	// Attributes are what conditions read as subject.attributes, such as a department.
+	Attributes map[string]any
 }
 
 // subject checks that s is anonymous, or an identity of a kind that acts.
@@ -213,6 +215,9 @@ type Resource struct {
 	Type      string
 	ID        string
 	Ancestors []Scope
+	// Attributes are what conditions read as resource.attributes, such as its labels: read them
+	// from where the resource is stored, as its path, never from request input.
+	Attributes map[string]any
 }
 
 // Scope is the scope the resource itself is.
@@ -271,12 +276,14 @@ func (r Resource) path() []string {
 	return keys
 }
 
-// Binding is one role for one principal, optionally until a time.
+// Binding is one role for one principal, optionally until a time or under a condition.
 type Binding struct {
 	Role      Role
 	Principal Principal
 	// ExpiresAt ends it; zero never does.
 	ExpiresAt time.Time
+	// Condition limits it to the requests its expression allows; the zero Condition is none.
+	Condition Condition
 }
 
 // Grant is a binding on a scope, as stored.
@@ -406,6 +413,7 @@ type Authorizer struct {
 	// `permission type`, of permissions that don't change access: all a public role gives as
 	// Authorizer.current reads it.
 	catalogPermissions, catalogTypes, publicPairs []string
+	conds                                         *conditions
 }
 
 // permissionOn is a permission on a type of resource.
@@ -483,10 +491,15 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 	}
 	slices.Sort(permList)
 	slices.Sort(pairs)
+	conds, err := newConditions()
+	if err != nil {
+		return nil, err
+	}
 	return &Authorizer{
 		db: db, cfg: cfg, roles: roles, containers: containers, containerTypes: slices.Sorted(maps.Keys(containers)),
 		kinds: kinds, permissions: perms, types: resourceTypes, unprivileged: unprivileged,
 		catalogPermissions: permList, catalogTypes: slices.Sorted(maps.Keys(resourceTypes)), publicPairs: pairs,
+		conds: conds,
 	}, nil
 }
 

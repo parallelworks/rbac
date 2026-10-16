@@ -37,6 +37,10 @@ func (e *InvalidError) Is(target error) bool { return target == ErrInvalid }
 //     there, for every type the grant reaches, and may revoke any. A role's power to change
 //     grants is part of what it gives: one with GrantableRoles needs the power to grant each
 //     its holders could, and one without, the unlimited power to change grants on its type;
+//   - a conditional power to change grants holds only where its condition does, and what the
+//     actor hands on, permissions and power alike, it holds unconditionally or under the
+//     condition the grant has: a role a conditional grant lists is granted only under its
+//     condition;
 //   - a role that gives a `:grant` permission or DefineRoles can't be granted to a tenant's
 //     members or the public, and only a role marked Public can be granted to the public.
 //
@@ -173,15 +177,16 @@ func (a *Authorizer) Import(ctx context.Context, tenant string, grants []Grant) 
 		return nil
 	}
 	grants = slices.Clone(grants)
+	var conditions []error
 	for i := range grants {
 		grants[i].ExpiresAt = stored(grants[i].ExpiresAt)
+		conditions = append(conditions, a.checkCondition(grants[i].Binding)...)
 	}
-	check := func(q DB) error {
-		roles, err := a.book(ctx, q, tenant, grantRoleIDs(grants))
+	check := func(q DB, errs ...error) error {
+		roles, err := a.book(ctx, q, tenant, roleIDs(grants))
 		if err != nil {
 			return err
 		}
-		var errs []error
 		for _, g := range grants {
 			if !g.Scope.in(tenant) {
 				errs = append(errs, &InvalidError{Binding: g.Binding, Reason: fmt.Sprintf("scope %q is not valid", g.Scope.Key())})
@@ -191,7 +196,7 @@ func (a *Authorizer) Import(ctx context.Context, tenant string, grants []Grant) 
 		}
 		return errors.Join(errs...)
 	}
-	if err := check(a.db); err != nil {
+	if err := check(a.db, conditions...); err != nil {
 		return err
 	}
 	scopes, principals := map[string]bool{}, map[string]bool{}
@@ -264,7 +269,7 @@ func (a *Authorizer) validate(ctx context.Context, roles book, tenant string, sc
 		return err == nil, nil
 	}
 	for _, b := range grants {
-		bad := a.checkBinding(roles, tenant, scope, b, now)
+		bad := append(a.checkBinding(roles, tenant, scope, b, now), a.checkCondition(b)...)
 		// The public is asked about too, so a host can refuse public access.
 		if len(bad) == 0 && b.Principal.Kind != Tenant {
 			ok, err := inTenant(b.Principal)
@@ -314,10 +319,36 @@ func (a *Authorizer) checkBinding(roles book, tenant string, scope Scope, b Bind
 	return errs
 }
 
+// checkCondition returns why a binding's condition can't be stored. It reads nothing stored, so a
+// change checks it once, before its transaction: compiling a condition can take milliseconds,
+// which a change of many shouldn't spend holding its locks.
+func (a *Authorizer) checkCondition(b Binding) []error {
+	var errs []error
+	bad := func(reason string) { errs = append(errs, &InvalidError{Binding: b, Reason: reason}) }
+	c := b.Condition
+	switch {
+	case !validText(c.Title + c.Description + c.Expression):
+		bad("a condition is UTF-8 text without NUL")
+	case c.Expression != "":
+		if _, err := a.conds.compile(c.Expression); err != nil {
+			bad(err.Error())
+		}
+	case c != Condition{}:
+		// Stored, it would read as a condition on a grant that has none.
+		bad("a condition with a title or description has an expression")
+	}
+	if len(c.Title) > maxName || len(c.Description) > maxDescription {
+		bad(fmt.Sprintf("a condition's title is at most %d bytes and its description %d", maxName, maxDescription))
+	}
+	return errs
+}
+
 // authority is an actor's grants on a resource's path, and the roles to read them by.
 type authority struct {
-	held  []Binding
+	held  []holding
 	roles book
+	// allows reports whether a grant's condition holds for the request, with an action.
+	allows func(h holding, action Permission) bool
 	// defining is a custom role DefineRole checks: the roles a check names resolve to it, but the
 	// actor's own grants of it give what it gives now.
 	defining *RoleDefinition
@@ -334,11 +365,19 @@ func (au authority) named(id Role) (RoleDefinition, bool) {
 // power is what an actor may change on scopes of a type: any role it holds everything of, and
 // revoke any, or only the listed roles, without holding them.
 type power struct {
-	any    bool
-	listed map[Role]bool
+	any bool
+	// listed are the conditions of the grants that list each role, empty for none: a role listed
+	// only by a conditional grant is the actor's to grant only under that condition, as a role
+	// held only under one is, or a grant could drop it.
+	listed map[Role][]string
 }
 
 func (p power) none() bool { return !p.any && len(p.listed) == 0 }
+
+// lists reports whether the power lets the actor grant r with condition.
+func (p power) lists(r Role, condition string) bool {
+	return slices.ContainsFunc(p.listed[r], func(c string) bool { return c == "" || c == condition })
+}
 
 // authorityOn reads the actor's grants on a resource's path, and the roles they and the call
 // name. With a custom role among them it reads all the tenant's, which a role's GrantableRoles
@@ -348,22 +387,51 @@ func (a *Authorizer) authorityOn(ctx context.Context, q DB, actor Subject, on Re
 	if err != nil {
 		return authority{}, err
 	}
-	if !slices.ContainsFunc(append(roleIDs(held), roles...), isCustom) {
-		return authority{held: held, roles: book{builtin: a.roles}}, nil
+	b := book{builtin: a.roles}
+	if slices.ContainsFunc(append(roleIDs(held), roles...), isCustom) {
+		custom, err := a.customRoles(ctx, q, on.Tenant)
+		if err != nil {
+			return authority{}, err
+		}
+		b = a.bookOf(custom)
 	}
-	custom, err := a.customRoles(ctx, q, on.Tenant)
-	if err != nil {
-		return authority{}, err
-	}
-	return authority{held: held, roles: a.bookOf(custom)}, nil
+	return a.authorityOf(ctx, q, actor, on, held, b)
 }
 
-// over is what the actor's grants let it change on scopes of a type.
+// authorityOf is the authority of held grants, reading their conditions.
+func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Resource, held []holding, b book) (authority, error) {
+	if err := a.conditionsOf(ctx, q, on.Tenant, held); err != nil {
+		return authority{}, err
+	}
+	vars, spend := a.vars(ctx, actor, "", on), newBudget()
+	return authority{held: held, roles: b, allows: func(h holding, action Permission) bool {
+		if !h.conditional {
+			return true
+		}
+		v := maps.Clone(vars)
+		v["action"] = string(action)
+		return a.conds.holds(spend, h.Condition.Expression, v)
+	}}, nil
+}
+
+// over is what the actor's grants let it change on scopes of a type in this request: a
+// conditional grant gives its power only where its condition holds for the change.
 func (au authority) over(scopeType string) power {
-	pw := power{listed: map[Role]bool{}}
+	manage := GrantPermission(scopeType)
+	return au.power(scopeType, func(g holding) bool { return au.allows(g, manage) })
+}
+
+// under is the power the actor may hand on with condition, as holds counts permissions: a power
+// held under a condition can't be handed on without it.
+func (au authority) under(scopeType, condition string) power {
+	return au.power(scopeType, func(g holding) bool { return g.under(condition) })
+}
+
+func (au authority) power(scopeType string, counts func(holding) bool) power {
+	pw := power{listed: map[Role][]string{}}
 	manage := GrantPermission(scopeType)
 	for _, g := range au.held {
-		if !gives(au.roles, g.Principal, g.Role, manage, scopeType) {
+		if !gives(au.roles, g.Principal, g.Role, manage, scopeType) || !counts(g) {
 			continue
 		}
 		def, _ := au.roles.role(g.Role)
@@ -371,24 +439,39 @@ func (au authority) over(scopeType string) power {
 			pw.any = true
 		}
 		for _, r := range def.GrantableRoles {
-			pw.listed[r] = true
+			pw.listed[r] = append(pw.listed[r], g.Condition.Expression)
 		}
 	}
 	return pw
 }
 
-// holds reports whether the actor holds p for resources of a type.
-func (au authority) holds(p Permission, resourceType string) bool {
-	return slices.ContainsFunc(au.held, func(g Binding) bool { return gives(au.roles, g.Principal, g.Role, p, resourceType) })
+// under reports whether a grant gives what it gives under condition: unconditionally, or under
+// the same condition, so a grant can't drop one its granter is bound by.
+func (h holding) under(condition string) bool {
+	return !h.conditional || h.Condition.Expression == condition
 }
 
-// mayGrant reports whether the actor may grant def on a scope of a type, and if not, a
-// permission it lacks: its power there lists def, or lets it grant any role and it holds
-// everything def gives. seen is holdsRole's: fresh for each grant decided, or what grants
-// already allowed proved.
-func (a *Authorizer) mayGrant(au authority, scopeType string, def RoleDefinition, seen map[string]bool) (Permission, bool) {
-	pw := au.over(scopeType)
-	if pw.listed[def.ID] {
+// holds reports whether the actor holds p for resources of a type, to hand it on with condition.
+func (au authority) holds(p Permission, resourceType, condition string) bool {
+	return slices.ContainsFunc(au.held, func(g holding) bool {
+		return gives(au.roles, g.Principal, g.Role, p, resourceType) && g.under(condition)
+	})
+}
+
+// may reports whether the actor may do p, on resources of a type, in this request.
+func (au authority) may(p Permission, resourceType string) bool {
+	return slices.ContainsFunc(au.held, func(g holding) bool {
+		return gives(au.roles, g.Principal, g.Role, p, resourceType) && au.allows(g, p)
+	})
+}
+
+// mayGrant reports whether the actor may grant def on a scope of a type, with condition, and if
+// not, a permission it lacks: its power there, pw, lists def, or lets it grant any role and it
+// holds everything def gives. pw is over for a grant the actor makes, and under for one a grant
+// it makes would let others make. seen is holdsRole's: fresh for each grant decided, or what
+// grants already allowed proved.
+func (a *Authorizer) mayGrant(au authority, pw power, scopeType string, def RoleDefinition, condition string, seen map[string]bool) (Permission, bool) {
+	if pw.lists(def.ID, condition) {
 		return "", true
 	}
 	if !pw.any {
@@ -400,7 +483,7 @@ func (a *Authorizer) mayGrant(au authority, scopeType string, def RoleDefinition
 	if a.contains(scopeType) {
 		types = def.ResourceTypes
 	}
-	return a.holdsRole(au, def, types, seen)
+	return a.holdsRole(au, def, types, condition, seen)
 }
 
 // holdsRole reports whether the actor holds everything def gives for each of types, and if
@@ -413,8 +496,8 @@ func (a *Authorizer) mayGrant(au authority, scopeType string, def RoleDefinition
 // this grant. Each is checked once: the grant needs every check to pass, so checking one again,
 // as for a role that lists itself or one that lists it back, adds nothing. Without it, roles
 // listing each other would be checked along every order they can be reached in.
-func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string, seen map[string]bool) (Permission, bool) {
-	key := string(def.ID) + " " + strings.Join(types, ",")
+func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string, condition string, seen map[string]bool) (Permission, bool) {
+	key := string(def.ID) + " " + strings.Join(types, ",") + " " + condition
 	if seen[key] {
 		return "", true
 	}
@@ -425,14 +508,16 @@ func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string,
 		// permission like any other.
 		if verb != "grant" || !slices.Contains(types, t) {
 			for _, rt := range types {
-				if !au.holds(p, rt) {
+				if !au.holds(p, rt, condition) {
 					return p, false
 				}
 			}
 			continue
 		}
+		// The holders' power holds under the condition the grant has, so the actor's must too.
+		pw := au.under(t, condition)
 		if len(def.GrantableRoles) == 0 {
-			if !au.over(t).any {
+			if !pw.any {
 				return p, false
 			}
 			continue
@@ -446,7 +531,8 @@ func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string,
 			if !a.grantableOn(listed, t) {
 				continue
 			}
-			if missing, ok := a.mayGrant(au, t, listed, seen); !ok {
+			// Its holders may grant it under the grant's condition, or with any if it has none.
+			if missing, ok := a.mayGrant(au, pw, t, listed, condition, seen); !ok {
 				return missing, false
 			}
 		}
@@ -469,7 +555,7 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 	}
 	var errs []error
 	for _, b := range revokes {
-		if !pw.any && !pw.listed[b.Role] {
+		if !pw.any && len(pw.listed[b.Role]) == 0 {
 			errs = append(errs, &DeniedError{Permission: manage, Scope: scope, Reason: fmt.Sprintf("the actor may not revoke %s here", b.Role)})
 		}
 	}
@@ -479,9 +565,12 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 			// validate reports it as invalid rather than as an escalation.
 			continue
 		}
-		if p, ok := a.mayGrant(au, scope.Type, def, map[string]bool{}); !ok {
+		if p, ok := a.mayGrant(au, pw, scope.Type, def, b.Condition.Expression, map[string]bool{}); !ok {
 			reason := fmt.Sprintf("the actor can't grant %s without holding %s here", b.Role, p)
-			if !pw.any {
+			switch {
+			case !pw.any && len(pw.listed[b.Role]) > 0:
+				reason = fmt.Sprintf("the actor may grant %s here only under the condition of a grant that lists it", b.Role)
+			case !pw.any:
 				reason = fmt.Sprintf("the actor may not grant %s here", b.Role)
 			}
 			errs = append(errs, &DeniedError{Permission: p, Scope: scope, Reason: reason})
@@ -512,8 +601,12 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 	if err != nil {
 		return nil, err
 	}
-	au := authority{held: held, roles: a.bookOf(custom)}
-	if au.over(r.Type).none() {
+	au, err := a.authorityOf(ctx, a.db, s, r, held, a.bookOf(custom))
+	if err != nil {
+		return nil, err
+	}
+	pw := au.over(r.Type)
+	if pw.none() {
 		return nil, nil
 	}
 	var roles []RoleDefinition
@@ -522,7 +615,7 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 	proven := map[string]bool{}
 	for _, def := range a.rolesIn(r.Type, custom) {
 		seen := maps.Clone(proven)
-		if _, ok := a.mayGrant(au, r.Type, def, seen); ok {
+		if _, ok := a.mayGrant(au, pw, r.Type, def, "", seen); ok {
 			proven = seen
 			roles = append(roles, def)
 		}
@@ -563,7 +656,7 @@ func (a *Authorizer) report(ctx context.Context, tx pgx.Tx, e ChangeEvent) error
 }
 
 // upsert stores grants in one statement, sorted so concurrent changes lock rows in the same
-// order, and returns those it added or whose expiry it changed. Of repeated grants it stores
+// order, and returns those it added or whose expiry or condition it changed. Of repeated grants it stores
 // the last, since one statement can't change a row twice. An expired grant that is still
 // stored gave nothing, so granting it again records the new actor and time.
 func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, grants []Grant) ([]Grant, error) {
@@ -581,21 +674,29 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 	n := len(grants)
 	scopeTypes, scopeIDs, kinds, ids, roles := make([]string, n), make([]string, n), make([]string, n), make([]string, n), make([]string, n)
 	expires := make([]pgtype.Timestamptz, n)
+	titles, descriptions, conditions := make([]string, n), make([]string, n), make([]string, n)
 	for i, g := range grants {
 		scopeTypes[i], scopeIDs[i] = g.Scope.Type, g.Scope.ID
 		kinds[i], ids[i], roles[i] = string(g.Principal.Kind), g.Principal.ID, string(g.Role)
 		expires[i] = pgtype.Timestamptz{Time: g.ExpiresAt, Valid: !g.ExpiresAt.IsZero()}
+		titles[i], descriptions[i], conditions[i] = g.Condition.Title, g.Condition.Description, g.Condition.Expression
 	}
+	// A grant again with another expiry or condition replaces them.
 	rows, err := tx.Query(ctx, `
-		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at, created_by)
-		SELECT $1, st, si, pk, pi, r, e, $8
-		FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::timestamptz[]) AS t(st, si, pk, pi, r, e)
+		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at, created_by,
+		  condition_title, condition_description, condition)
+		SELECT $1, st, si, pk, pi, r, e, $8, ct, cd, c
+		FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::timestamptz[], $10::text[], $11::text[], $12::text[])
+		  AS t(st, si, pk, pi, r, e, ct, cd, c)
 		ON CONFLICT ON CONSTRAINT rbac_grants_key DO UPDATE SET expires_at = EXCLUDED.expires_at,
+		  condition_title = EXCLUDED.condition_title, condition_description = EXCLUDED.condition_description,
+		  condition = EXCLUDED.condition,
 		  created_by = CASE WHEN rbac_grants.expires_at <= $9 THEN EXCLUDED.created_by ELSE rbac_grants.created_by END,
 		  created_at = CASE WHEN rbac_grants.expires_at <= $9 THEN EXCLUDED.created_at ELSE rbac_grants.created_at END
-		WHERE rbac_grants.expires_at IS DISTINCT FROM EXCLUDED.expires_at
+		WHERE (rbac_grants.expires_at, rbac_grants.condition_title, rbac_grants.condition_description, rbac_grants.condition)
+		  IS DISTINCT FROM (EXCLUDED.expires_at, EXCLUDED.condition_title, EXCLUDED.condition_description, EXCLUDED.condition)
 		RETURNING `+grantColumns,
-		tenant, scopeTypes, scopeIDs, kinds, ids, roles, expires, actorKey(actor), a.cfg.Now())
+		tenant, scopeTypes, scopeIDs, kinds, ids, roles, expires, actorKey(actor), a.cfg.Now(), titles, descriptions, conditions)
 	if err != nil {
 		return nil, err
 	}

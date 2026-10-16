@@ -77,18 +77,13 @@ func (a *Authorizer) bookOf(custom []RoleDefinition) book {
 	return b
 }
 
-func roleIDs(bindings []Binding) []Role {
+func (b Binding) role() Role { return b.Role }
+
+// roleIDs are the roles of bindings, grants or holdings.
+func roleIDs[T interface{ role() Role }](bindings []T) []Role {
 	ids := make([]Role, len(bindings))
 	for i, b := range bindings {
-		ids[i] = b.Role
-	}
-	return ids
-}
-
-func grantRoleIDs(grants []Grant) []Role {
-	ids := make([]Role, len(grants))
-	for i, g := range grants {
-		ids[i] = g.Role
+		ids[i] = b.role()
 	}
 	return ids
 }
@@ -175,9 +170,8 @@ func (a *Authorizer) checkCustom(r RoleDefinition) error {
 	if utf8.RuneCountInString(r.Name) > maxName || utf8.RuneCountInString(r.Description) > maxDescription {
 		errs = append(errs, fmt.Errorf("a name is at most %d characters and a description %d", maxName, maxDescription))
 	}
-	// PostgreSQL refuses text that isn't UTF-8 or holds a NUL, as an error that isn't ErrInvalid.
 	// Each is checked alone: a character split between them is valid only once joined.
-	if !utf8.ValidString(r.Name) || !utf8.ValidString(r.Description) || strings.ContainsRune(r.Name+r.Description, 0) {
+	if !validText(r.Name) || !validText(r.Description) {
 		errs = append(errs, errors.New("a name and a description are UTF-8 text without NUL"))
 	}
 	if len(errs) > 0 {
@@ -185,6 +179,10 @@ func (a *Authorizer) checkCustom(r RoleDefinition) error {
 	}
 	return nil
 }
+
+// validText reports whether PostgreSQL stores s: it refuses text that isn't UTF-8 or holds a NUL,
+// as an error that isn't ErrInvalid.
+func validText(s string) bool { return utf8.ValidString(s) && !strings.ContainsRune(s, 0) }
 
 // canonical is a copy of r with its lists sorted and without repeats, so a definition reordered
 // is the same one.
@@ -206,7 +204,8 @@ func canonical(r RoleDefinition) RoleDefinition {
 // role, directly or through the roles it lists, whatever r.Privileged says, so a role read and
 // saved back keeps no flag it no longer earns.
 //
-// The actor needs DefineRoles on the tenant, not removed by a constraint, and every permission
+// The actor needs DefineRoles on the tenant, not removed by a constraint (a condition on that
+// right reads the tenant as a resource with no attributes), and every permission
 // the role gives there, for each type it is for, as granting it on the tenant would need. Each
 // of its GrantableRoles must be a role the actor may grant on the tenant. Replacing a role
 // another custom role lists needs the power to grant it as defined wherever that one lists it.
@@ -441,7 +440,7 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 	if err != nil {
 		return authority{}, err
 	}
-	if !au.holds(DefineRoles, TenantScope) {
+	if !au.may(DefineRoles, TenantScope) {
 		return authority{}, &DeniedError{Permission: DefineRoles, Scope: scope, Reason: "the actor may not define roles here"}
 	}
 	if r == nil {
@@ -456,12 +455,12 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 		}
 	}
 	seen := map[string]bool{}
-	if p, ok := a.holdsRole(au, *r, r.ResourceTypes, seen); !ok {
+	if p, ok := a.holdsRole(au, *r, r.ResourceTypes, "", seen); !ok {
 		return authority{}, &DeniedError{Permission: p, Scope: scope, Reason: fmt.Sprintf("the actor can't define %s without holding %s here", r.ID, p)}
 	}
 	// A role that lists r lets its holders grant r as it will be wherever it can be granted, a
 	// power its definer never had to have if r gave less or couldn't be granted there: the
-	// actor must have it.
+	// actor must have it, unconditionally, as those holders may.
 	for _, id := range slices.Sorted(maps.Keys(au.roles.custom)) {
 		lister := au.roles.custom[id]
 		if id == r.ID || !slices.Contains(lister.GrantableRoles, r.ID) {
@@ -472,7 +471,7 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 			if !p.changesGrants() || !a.grantableOn(*r, t) {
 				continue
 			}
-			if missing, ok := a.mayGrant(au, t, *r, seen); !ok {
+			if missing, ok := a.mayGrant(au, au.under(t, ""), t, *r, "", seen); !ok {
 				return authority{}, &DeniedError{Permission: missing, Scope: scope, Reason: fmt.Sprintf("the actor can't define %s, which %s lists, without the power to grant it on a %s", r.ID, id, t)}
 			}
 		}
