@@ -4,16 +4,20 @@ CREATE TABLE rbac_grants (
     tenant         text        COLLATE "C" NOT NULL CHECK (tenant <> ''),
     scope_type     text        COLLATE "C" NOT NULL CHECK (scope_type ~ '^[a-z][a-z0-9_-]*$'),
     scope_id       text        COLLATE "C" NOT NULL,
-    principal_kind text        COLLATE "C" NOT NULL CHECK (principal_kind IN ('user', 'group', 'everyone')),
+    -- The host declares its kinds besides user, group, tenant and public.
+    principal_kind text        COLLATE "C" NOT NULL CHECK (principal_kind ~ '^[a-z][a-z0-9_-]*$'),
     principal_id   text        COLLATE "C" NOT NULL,
     role           text        COLLATE "C" NOT NULL,
     expires_at     timestamptz,
+    -- The actor's principal as `kind:id`; empty for a grant Import stored.
     created_by     text        NOT NULL DEFAULT '',
     created_at     timestamptz NOT NULL DEFAULT now(),
     -- Keys as `type:id`; a type can't contain ':', so they are unambiguous.
     scope          text        COLLATE "C" GENERATED ALWAYS AS (scope_type || ':' || scope_id) STORED,
     principal      text        COLLATE "C" GENERATED ALWAYS AS (principal_kind || ':' || principal_id) STORED,
-    CHECK ((principal_kind = 'everyone') = (principal_id = '')),
+    -- The public has no id, and a tenant's members have the tenant's.
+    CHECK ((principal_kind = 'public') = (principal_id = '')),
+    CHECK (principal_kind <> 'tenant' OR principal_id = tenant),
     -- The tenant's own scope has the tenant's id.
     CHECK (scope_id <> '' AND (scope_type <> 'tenant' OR scope_id = tenant)),
     -- Checks are an index-only scan on this: principals and scopes as arrays, expiry included.
