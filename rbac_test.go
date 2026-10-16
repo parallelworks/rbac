@@ -3238,3 +3238,209 @@ func TestSettingADenyIsChecked(t *testing.T) {
 		t.Fatalf("a scope's 101st deny: %v", err)
 	}
 }
+
+func TestNotesOnGrants(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}, Note: "INC-42: debugging the scheduler"}
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
+		t.Fatal(err)
+	}
+	h.events = nil
+	b.Note = "INC-43"
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.events) != 1 || h.events[0].Granted[0].Note != "INC-43" {
+		t.Fatalf("a new note should be reported: %+v", h.events)
+	}
+	if got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{b.Principal}}); err != nil || len(got) != 1 || got[0].Note != "INC-43" {
+		t.Fatalf("Grants = %+v, %v", got, err)
+	}
+	for _, note := range []string{strings.Repeat("n", 2049), "a\x00b", "\xff"} {
+		bad := b
+		bad.Note = note
+		if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{bad}}); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("a note %q: %v", note[:min(len(note), 8)], err)
+		}
+	}
+}
+
+func TestEligibleGrants(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	oncall := rbac.Eligibility{
+		Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.Group, ID: "oncall"}, MaxDuration: time.Hour,
+		Requires: `request.attributes.mfa == true`, Note: "on call",
+	}
+	h.events = nil
+	if err := h.authz.SetEligible(ctx, user("owner"), cluster, oncall); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.events) != 1 || len(h.events[0].Eligible) != 1 || h.events[0].Eligible[0].MaxDuration != time.Hour {
+		t.Fatalf("events = %+v", h.events)
+	}
+	pager := user("pager", "oncall")
+	if allowed(t, h, pager, root, cluster) {
+		t.Fatal("an eligibility should give nothing until activated")
+	}
+	mfa := rbac.WithRequest(ctx, map[string]any{"mfa": true})
+	for name, err := range map[string]error{
+		"no justification": func() error {
+			_, err := h.authz.Activate(mfa, pager, cluster, "cluster.sudo", 30*time.Minute, "")
+			return err
+		}(),
+		"longer than it may": func() error {
+			_, err := h.authz.Activate(mfa, pager, cluster, "cluster.sudo", 2*time.Hour, "x")
+			return err
+		}(),
+		"without what it requires": func() error {
+			_, err := h.authz.Activate(ctx, pager, cluster, "cluster.sudo", 30*time.Minute, "x")
+			return err
+		}(),
+		"not eligible": func() error {
+			_, err := h.authz.Activate(mfa, user("other"), cluster, "cluster.sudo", 30*time.Minute, "x")
+			return err
+		}(),
+		"another role": func() error {
+			_, err := h.authz.Activate(mfa, pager, cluster, "cluster.admin", 30*time.Minute, "x")
+			return err
+		}(),
+	} {
+		if err == nil {
+			t.Errorf("%s: activated", name)
+		}
+	}
+	h.events = nil
+	g, err := h.authz.Activate(mfa, pager, cluster, "cluster.sudo", 30*time.Minute, "INC-7: disk full")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.Principal != pager.Principal || g.Note != "INC-7: disk full" || !g.ExpiresAt.Equal(h.now.Add(30*time.Minute)) {
+		t.Fatalf("activated %+v", g)
+	}
+	if len(h.events) != 1 || len(h.events[0].Activated) != 1 || h.events[0].Actor != pager.Principal {
+		t.Fatalf("events = %+v", h.events)
+	}
+	if !allowed(t, h, pager, root, cluster) {
+		t.Fatal("an activated role should give its permissions")
+	}
+	// Activating again for less keeps the longer grant; for more, extends it.
+	if g, err := h.authz.Activate(mfa, pager, cluster, "cluster.sudo", 10*time.Minute, "again"); err != nil || !g.ExpiresAt.Equal(h.now.Add(30*time.Minute)) {
+		t.Fatalf("a shorter activation: %+v, %v", g, err)
+	}
+	if g, err := h.authz.Activate(mfa, pager, cluster, "cluster.sudo", 45*time.Minute, "longer"); err != nil || !g.ExpiresAt.Equal(h.now.Add(45*time.Minute)) {
+		t.Fatalf("a longer activation: %+v, %v", g, err)
+	}
+	h.now = h.now.Add(46 * time.Minute)
+	if allowed(t, h, pager, root, cluster) {
+		t.Fatal("an activation should end")
+	}
+	if got, err := h.authz.Eligibilities(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}}); err != nil || len(got) != 1 || got[0].Note != "on call" {
+		t.Fatalf("Eligibilities = %+v, %v", got, err)
+	}
+	if err := h.authz.RevokeEligible(ctx, user("nobody"), cluster, "cluster.sudo", oncall.Principal); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("ending an eligibility without the power to revoke the role: %v", err)
+	}
+	if err := h.authz.RevokeEligible(ctx, user("owner"), cluster, "cluster.sudo", oncall.Principal); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.authz.Activate(mfa, pager, cluster, "cluster.sudo", 30*time.Minute, "x"); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("activating a revoked eligibility: %v", err)
+	}
+}
+
+func TestSettingAnEligibilityIsChecked(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	e := rbac.Eligibility{Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: time.Hour}
+	if err := h.authz.SetEligible(ctx, user("nobody"), cluster, e); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("without the power to grant the role: %v", err)
+	}
+	for name, bad := range map[string]rbac.Eligibility{
+		"the tenant's members":        {Role: e.Role, Principal: rbac.TenantMembers("t1"), MaxDuration: time.Hour},
+		"the public":                  {Role: e.Role, Principal: rbac.Principal{Kind: rbac.Public}, MaxDuration: time.Hour},
+		"no duration":                 {Role: e.Role, Principal: e.Principal},
+		"longer than a year":          {Role: e.Role, Principal: e.Principal, MaxDuration: 400 * 24 * time.Hour},
+		"a role the scope can't take": {Role: "workspace.admin", Principal: e.Principal, MaxDuration: time.Hour},
+		"a broken requirement":        {Role: e.Role, Principal: e.Principal, MaxDuration: time.Hour, Requires: "1 +"},
+	} {
+		if err := h.authz.SetEligible(ctx, user("owner"), cluster, bad); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	// A role held under a condition isn't replaced by activating it.
+	h.seed(t, rbac.Grant{Scope: cluster.Scope(), Binding: conditional("cluster.sudo", "x", "true")})
+	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.authz.Activate(ctx, user("x"), cluster, "cluster.sudo", time.Minute, "x"); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("activating over a conditional grant: %v", err)
+	}
+}
+
+func TestActivatingRespectsConstraints(t *testing.T) {
+	stop := false
+	h := setup(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "frozen", Deny: func(_ context.Context, _ rbac.DB, _, _ string, p rbac.Permission) (bool, error) {
+			return stop && p == grantC, nil
+		}}}
+	})
+	ctx := t.Context()
+	e := rbac.Eligibility{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: time.Hour}
+	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
+		t.Fatal(err)
+	}
+	stop = true
+	if _, err := h.authz.Activate(ctx, user("x"), cluster, "cluster.login", time.Minute, "x"); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("activating under a freeze on grant changes: %v", err)
+	}
+}
+
+func TestEligibilitiesGoWithWhatTheyName(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	e := rbac.Eligibility{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: time.Hour}
+	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.DeletePrincipalEverywhere(ctx, e.Principal); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := h.authz.Eligibilities(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{e.Principal}}); err != nil || len(got) != 0 {
+		t.Fatalf("after deleting the principal everywhere: %+v, %v", got, err)
+	}
+	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.DeleteScope(ctx, "t1", cluster.Scope()); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := h.authz.Eligibilities(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}}); err != nil || len(got) != 0 {
+		t.Fatalf("after deleting the scope: %+v, %v", got, err)
+	}
+	h.seed(t, grant(cluster.Scope(), "cluster.admin", rbac.User, "owner"))
+	e.ExpiresAt = h.now.Add(time.Hour)
+	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
+		t.Fatal(err)
+	}
+	h.now = h.now.Add(2 * time.Hour)
+	if n, err := h.authz.DeleteExpired(ctx); err != nil || n != 1 {
+		t.Fatalf("DeleteExpired = %d, %v", n, err)
+	}
+}
+
+func TestAnEligibilityCantHandOutMoreThanItsSetterHolds(t *testing.T) {
+	share := rbac.RoleDefinition{ID: "cluster.share", Permissions: []rbac.Permission{view, login, grantC}, ResourceTypes: []string{"cluster"}}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), share) })
+	h.seed(t, grant(cluster.Scope(), "cluster.share", rbac.User, "sharer"))
+	sudo := rbac.Eligibility{Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: time.Hour}
+	if err := h.authz.SetEligible(t.Context(), user("sharer"), cluster, sudo); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("making someone eligible for a role the setter couldn't grant: %v", err)
+	}
+	loginOnly := sudo
+	loginOnly.Role = "cluster.login"
+	if err := h.authz.SetEligible(t.Context(), user("sharer"), cluster, loginOnly); err != nil {
+		t.Fatalf("making someone eligible for a role the setter could grant: %v", err)
+	}
+}

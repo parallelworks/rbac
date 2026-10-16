@@ -604,7 +604,7 @@ func (a *Authorizer) heldGrants(ctx context.Context, q DB, tenant string, princi
 }
 
 const grantColumns = `scope_type, scope_id, principal_kind, principal_id, role, expires_at, created_by, created_at,
-	condition_title, condition_description, condition`
+	condition_title, condition_description, condition, note`
 
 func collectGrants(rows pgx.Rows) ([]Grant, error) {
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Grant, error) {
@@ -612,7 +612,7 @@ func collectGrants(rows pgx.Rows) ([]Grant, error) {
 		var expires *time.Time
 		var createdBy string
 		err := row.Scan(&g.Scope.Type, &g.Scope.ID, &g.Principal.Kind, &g.Principal.ID, &g.Role,
-			&expires, &createdBy, &g.CreatedAt, &g.Condition.Title, &g.Condition.Description, &g.Condition.Expression)
+			&expires, &createdBy, &g.CreatedAt, &g.Condition.Title, &g.Condition.Description, &g.Condition.Expression, &g.Note)
 		if expires != nil {
 			g.ExpiresAt = *expires
 		}

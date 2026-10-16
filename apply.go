@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -317,8 +318,14 @@ func (a *Authorizer) checkBinding(roles book, tenant string, scope Scope, b Bind
 	if !b.ExpiresAt.IsZero() && !b.ExpiresAt.After(now) {
 		bad("already expired")
 	}
+	if utf8.RuneCountInString(b.Note) > maxNote || !validText(b.Note) {
+		bad(fmt.Sprintf("a note is text of at most %d characters", maxNote))
+	}
 	return errs
 }
+
+// maxNote bounds a note, on a grant or an eligibility.
+const maxNote = 2048
 
 // checkCondition returns why a binding's condition can't be stored. It reads nothing stored, so a
 // change checks it once, before its transaction: compiling a condition can take milliseconds,
@@ -718,29 +725,30 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 	n := len(grants)
 	scopeTypes, scopeIDs, kinds, ids, roles := make([]string, n), make([]string, n), make([]string, n), make([]string, n), make([]string, n)
 	expires := make([]pgtype.Timestamptz, n)
-	titles, descriptions, conditions := make([]string, n), make([]string, n), make([]string, n)
+	titles, descriptions, conditions, notes := make([]string, n), make([]string, n), make([]string, n), make([]string, n)
 	for i, g := range grants {
 		scopeTypes[i], scopeIDs[i] = g.Scope.Type, g.Scope.ID
 		kinds[i], ids[i], roles[i] = string(g.Principal.Kind), g.Principal.ID, string(g.Role)
 		expires[i] = pgtype.Timestamptz{Time: g.ExpiresAt, Valid: !g.ExpiresAt.IsZero()}
 		titles[i], descriptions[i], conditions[i] = g.Condition.Title, g.Condition.Description, g.Condition.Expression
+		notes[i] = g.Note
 	}
-	// A grant again with another expiry or condition replaces them.
+	// A grant again with another expiry, condition or note replaces them.
 	rows, err := tx.Query(ctx, `
 		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at, created_by,
-		  condition_title, condition_description, condition)
-		SELECT $1, st, si, pk, pi, r, e, $8, ct, cd, c
-		FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::timestamptz[], $10::text[], $11::text[], $12::text[])
-		  AS t(st, si, pk, pi, r, e, ct, cd, c)
+		  condition_title, condition_description, condition, note)
+		SELECT $1, st, si, pk, pi, r, e, $8, ct, cd, c, n
+		FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::timestamptz[], $10::text[], $11::text[], $12::text[], $13::text[])
+		  AS t(st, si, pk, pi, r, e, ct, cd, c, n)
 		ON CONFLICT ON CONSTRAINT rbac_grants_key DO UPDATE SET expires_at = EXCLUDED.expires_at,
 		  condition_title = EXCLUDED.condition_title, condition_description = EXCLUDED.condition_description,
-		  condition = EXCLUDED.condition,
+		  condition = EXCLUDED.condition, note = EXCLUDED.note,
 		  created_by = CASE WHEN rbac_grants.expires_at <= $9 THEN EXCLUDED.created_by ELSE rbac_grants.created_by END,
 		  created_at = CASE WHEN rbac_grants.expires_at <= $9 THEN EXCLUDED.created_at ELSE rbac_grants.created_at END
-		WHERE (rbac_grants.expires_at, rbac_grants.condition_title, rbac_grants.condition_description, rbac_grants.condition)
-		  IS DISTINCT FROM (EXCLUDED.expires_at, EXCLUDED.condition_title, EXCLUDED.condition_description, EXCLUDED.condition)
+		WHERE (rbac_grants.expires_at, rbac_grants.condition_title, rbac_grants.condition_description, rbac_grants.condition, rbac_grants.note)
+		  IS DISTINCT FROM (EXCLUDED.expires_at, EXCLUDED.condition_title, EXCLUDED.condition_description, EXCLUDED.condition, EXCLUDED.note)
 		RETURNING `+grantColumns,
-		tenant, scopeTypes, scopeIDs, kinds, ids, roles, expires, actorKey(actor), a.cfg.Now(), titles, descriptions, conditions)
+		tenant, scopeTypes, scopeIDs, kinds, ids, roles, expires, actorKey(actor), a.cfg.Now(), titles, descriptions, conditions, notes)
 	if err != nil {
 		return nil, err
 	}
@@ -816,7 +824,8 @@ func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) (
 // deleted. It waits for a change to the scope in progress, so a grant that change makes is
 // removed too.
 func (a *Authorizer) DeleteScope(ctx context.Context, tenant string, s Scope) error {
-	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, []string{s.Key()}, nil) }, false, "scope = $2", "scope = $2", s.Key())
+	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, []string{s.Key()}, nil) },
+		deletion{denies: "scope = $2", where: "scope = $2"}, s.Key())
 }
 
 // DeletePrincipal removes every grant to a principal, as when an identity or group is deleted,
@@ -825,7 +834,8 @@ func (a *Authorizer) DeletePrincipal(ctx context.Context, tenant string, p Princ
 	if !p.wellFormed(tenant) {
 		return fmt.Errorf("%w: principal %q is not valid", ErrInvalid, p.key())
 	}
-	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, nil, []string{p.key()}) }, false, "", "principal = $2", p.key())
+	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, nil, []string{p.key()}) },
+		deletion{where: "principal = $2"}, p.key())
 }
 
 // DeletePrincipalEverywhere removes every grant to an identity or group in every tenant, as
@@ -844,7 +854,8 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, p Principal)
 	for {
 		var n int
 		err := pgx.BeginFunc(ctx, a.db, func(tx pgx.Tx) error {
-			rows, err := tx.Query(ctx, `SELECT DISTINCT tenant FROM rbac_grants WHERE principal = $1 ORDER BY tenant LIMIT $2`, p.key(), batch)
+			rows, err := tx.Query(ctx, `SELECT tenant FROM rbac_grants WHERE principal = $1
+				UNION SELECT tenant FROM rbac_eligibilities WHERE principal = $1 ORDER BY tenant LIMIT $2`, p.key(), batch)
 			if err != nil {
 				return err
 			}
@@ -862,7 +873,11 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, p Principal)
 				if err != nil {
 					return err
 				}
-				if err := a.report(ctx, tx, ChangeEvent{Tenant: t, Revoked: revoked}); err != nil {
+				ended, err := a.removeEligible(ctx, tx, t, "principal = $2", p.key())
+				if err != nil {
+					return err
+				}
+				if err := a.report(ctx, tx, ChangeEvent{Tenant: t, Revoked: revoked, Ineligible: ended}); err != nil {
 					return err
 				}
 			}
@@ -877,20 +892,32 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, p Principal)
 // DeleteTenant removes every grant, custom role and deny in a tenant, so a tenant created later
 // with its id starts with none.
 func (a *Authorizer) DeleteTenant(ctx context.Context, tenant string) error {
-	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lockTenant(ctx, tx, tenant) }, true, "TRUE", "TRUE")
+	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lockTenant(ctx, tx, tenant) },
+		deletion{roles: true, denies: "TRUE", where: "TRUE"})
 }
 
-// delete removes the grants in a tenant that where picks, with roles its custom roles, and the
-// denies that denies picks, none when it is empty; both read args from $2.
-func (a *Authorizer) delete(ctx context.Context, tenant string, lock func(pgx.Tx) error, roles bool, denies, where string, args ...any) error {
+// deletion is what a delete removes in a tenant: grants and eligibilities where picks, denies
+// where denies does (none when it is empty), and with roles its custom roles. Both read args
+// from $2.
+type deletion struct {
+	roles         bool
+	denies, where string
+}
+
+func (a *Authorizer) delete(ctx context.Context, tenant string, lock func(pgx.Tx) error, del deletion, args ...any) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
+	roles, denies, where := del.roles, del.denies, del.where
 	return a.inTx(ctx, tenant, Principal{}, func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lock(tx); err != nil {
 			return ChangeEvent{}, err
 		}
 		var e ChangeEvent
+		var err error
+		if e.Ineligible, err = a.removeEligible(ctx, tx, tenant, where, args...); err != nil {
+			return ChangeEvent{}, err
+		}
 		if roles {
 			rows, err := tx.Query(ctx, `DELETE FROM rbac_roles WHERE tenant = $1 RETURNING id`, tenant)
 			if err != nil {
@@ -917,10 +944,19 @@ func (a *Authorizer) delete(ctx context.Context, tenant string, lock func(pgx.Tx
 				}
 			}
 		}
-		var err error
 		e.Revoked, err = a.remove(ctx, tx, tenant, where, args...)
 		return e, err
 	})
+}
+
+// removeEligible deletes the eligibilities in a tenant that where picks, and returns them.
+func (a *Authorizer) removeEligible(ctx context.Context, tx pgx.Tx, tenant, where string, args ...any) ([]Eligibility, error) {
+	rows, err := tx.Query(ctx, `DELETE FROM rbac_eligibilities WHERE tenant = $1 AND `+where+` RETURNING `+eligibilityColumns,
+		append([]any{tenant}, args...)...)
+	if err != nil {
+		return nil, err
+	}
+	return collectEligibilities(rows)
 }
 
 // remove deletes the grants in a tenant that where picks, and returns them for OnChange.
@@ -946,5 +982,11 @@ func (a *Authorizer) DeleteExpired(ctx context.Context) (int64, error) {
 	tag, err := a.db.Exec(ctx, `
 		DELETE FROM rbac_grants WHERE id IN (
 			SELECT id FROM rbac_grants WHERE expires_at <= $1 FOR UPDATE SKIP LOCKED)`, a.cfg.Now())
-	return tag.RowsAffected(), err
+	if err != nil {
+		return 0, err
+	}
+	ended, err := a.db.Exec(ctx, `
+		DELETE FROM rbac_eligibilities WHERE id IN (
+			SELECT id FROM rbac_eligibilities WHERE expires_at <= $1 FOR UPDATE SKIP LOCKED)`, a.cfg.Now())
+	return tag.RowsAffected() + ended.RowsAffected(), err
 }
