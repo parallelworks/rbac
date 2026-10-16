@@ -88,6 +88,15 @@ func setup(t *testing.T, mutate ...func(*rbac.Config)) *harness {
 	return h
 }
 
+func (h *harness) path(t *testing.T, r rbac.Resource) []string {
+	t.Helper()
+	p, err := h.authz.Path(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
 // constrain configures a constraint that removes p everywhere.
 func constrain(name string, p rbac.Permission) func(*rbac.Config) {
 	return func(c *rbac.Config) {
@@ -229,6 +238,10 @@ func TestMalformedInputIsAnErrorNotAnAllow(t *testing.T) {
 	if err := h.authz.Authorize(t.Context(), user("owner"), "login", cluster); !errors.Is(err, rbac.ErrInvalid) {
 		t.Errorf("a malformed permission: %v", err)
 	}
+	tenant := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1", Ancestors: []rbac.Scope{{Type: "workspace", ID: "w1"}}}
+	if err := h.authz.Authorize(t.Context(), user("u"), "tenant:grant", tenant); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("the tenant under a workspace: %v", err)
+	}
 }
 
 // The host's resources, for Filter: each with its Path.
@@ -250,7 +263,7 @@ func hostTable(t *testing.T, h *harness) []rbac.Resource {
 		{{Type: "org", ID: "o2"}},
 	} {
 		r := rbac.Resource{Tenant: "t1", Type: "cluster", ID: fmt.Sprintf("c%d", i), Owner: fmt.Sprintf("owner%d", i), Ancestors: chain}
-		if _, err := h.pool.Exec(ctx, `INSERT INTO clusters VALUES ($1, $2, $3, $4)`, r.Tenant, r.ID, r.Owner, r.Path()); err != nil {
+		if _, err := h.pool.Exec(ctx, `INSERT INTO clusters VALUES ($1, $2, $3, $4)`, r.Tenant, r.ID, r.Owner, h.path(t, r)); err != nil {
 			t.Fatal(err)
 		}
 		resources = append(resources, r)
@@ -321,7 +334,7 @@ func listingsAgree(t *testing.T, h *harness, resources []rbac.Resource, s rbac.S
 	var reached []string
 	for _, r := range resources {
 		in := reach.All || (reach.Owned && r.Owner == s.User) || slices.ContainsFunc(reach.Scopes, func(sc rbac.Scope) bool {
-			return slices.Contains(r.Path(), sc.Key())
+			return slices.Contains(h.path(t, r), sc.Key())
 		})
 		if in {
 			reached = append(reached, r.ID)
@@ -339,7 +352,7 @@ func TestFilterOnATenantColumnThatIsNotText(t *testing.T) {
 	if _, err := h.pool.Exec(ctx, `CREATE TABLE things (tenant uuid NOT NULL, id text NOT NULL, path text[] NOT NULL)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.pool.Exec(ctx, `INSERT INTO things VALUES ($1, $2, $3)`, r.Tenant, r.ID, r.Path()); err != nil {
+	if _, err := h.pool.Exec(ctx, `INSERT INTO things VALUES ($1, $2, $3)`, r.Tenant, r.ID, h.path(t, r)); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.authz.Import(ctx, r.Tenant, []rbac.Grant{grant(r.Scope(), "cluster.login", rbac.User, "u")}); err != nil {
@@ -492,6 +505,21 @@ func TestApplyChecksTheActorBeforePrincipals(t *testing.T) {
 	err := h.authz.Apply(t.Context(), user("nobody"), cluster, rbac.Change{Grant: []rbac.Binding{b}})
 	if !errors.Is(err, rbac.ErrDenied) || errors.Is(err, rbac.ErrInvalid) || asked != 0 {
 		t.Fatalf("a refused actor got %v after %d principal lookups", err, asked)
+	}
+}
+
+func TestApplyAsksAboutEachPrincipalOnce(t *testing.T) {
+	asked := 0
+	h := setup(t, func(c *rbac.Config) {
+		c.ValidatePrincipal = func(context.Context, rbac.DB, string, rbac.Principal) error {
+			asked++
+			return nil
+		}
+	})
+	p := rbac.Principal{Kind: rbac.User, ID: "u"}
+	c := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: p}, {Role: "cluster.sudo", Principal: p}}}
+	if err := h.authz.Apply(t.Context(), user("owner"), cluster, c); err != nil || asked != 1 {
+		t.Fatalf("Apply = %v after %d principal lookups", err, asked)
 	}
 }
 
@@ -833,6 +861,207 @@ func TestConcurrentChangesToAScopeAllCommit(t *testing.T) {
 				}
 			}
 		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
+func TestDeleteScopeRemovesAGrantMadeWhileItWaits(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}
+	if err := h.authz.WithTx(tx).Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- h.authz.DeleteScope(ctx, "t1", cluster.Scope()) }()
+	// Commit only once DeleteScope has either finished or is waiting on the scope's lock.
+	for waiting := false; !waiting; {
+		select {
+		case err := <-done:
+			done <- err
+			waiting = true
+		default:
+			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+				WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE '%/rbac/%')`).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if allowed(t, h, user("u"), login, cluster) {
+		t.Fatal("a grant made while its scope was deleted outlived the delete")
+	}
+}
+
+func TestMigrateRunsBeforeTheApplication(t *testing.T) {
+	pool := pgdbtest.Open(t, urlEnv, "")
+	if err := rbac.Migrate(t.Context(), pool, nil); err != nil {
+		t.Fatalf("rbac's tables before the schema exists: %v", err)
+	}
+	if err := pgdb.Migrate(t.Context(), pool, pgdb.Migrations{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSearchesKeepToContainersAboveAResource(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), rbac.RoleDefinition{
+			ID: "job.view", Permissions: []rbac.Permission{"job:view"}, ResourceTypes: []string{"cluster", "job"},
+		})
+	})
+	ctx := t.Context()
+	job := rbac.Resource{Tenant: "t1", Type: "job", ID: "j1", Ancestors: []rbac.Scope{cluster.Scope()}}
+	if _, err := h.authz.Path(job); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a path under a resource that isn't a container: %v", err)
+	}
+	// A host that builds paths itself lists the job under its cluster anyway.
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE jobs (tenant text NOT NULL, path text[] NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO jobs VALUES ('t1', ARRAY['job:j1', 'cluster:c1', 'tenant:t1'])`); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), "job.view", rbac.User, "friend"))
+
+	pred, err := h.authz.Filter(ctx, user("friend"), "job:view", "job", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE `+pred.SQL, pred.Args...).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("Filter keeps a job through a grant on the cluster above it")
+	}
+	reach, err := h.authz.Reachable(ctx, user("friend"), "job:view", "job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reach.All || len(reach.Scopes) > 0 {
+		t.Errorf("Reachable reaches jobs through a grant on a cluster: %+v", reach)
+	}
+}
+
+func TestEveryoneNeverGivesAGrantPermission(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	// As if a role granted to everyone gained cluster:grant in a later catalog.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'workspace', 'w1', 'everyone', '', 'cluster.admin')`); err != nil {
+		t.Fatal(err)
+	}
+	anyone := user("anyone")
+	if !allowed(t, h, anyone, root, cluster) {
+		t.Fatal("the grant still gives its other permissions")
+	}
+	if allowed(t, h, anyone, grantC, cluster) {
+		t.Error("Authorize: everyone holds cluster:grant")
+	}
+	if d, err := h.authz.Explain(ctx, anyone, grantC, cluster); err != nil || d.Allowed {
+		t.Errorf("Explain: %+v, %v", d, err)
+	}
+	perms, err := h.authz.Permissions(ctx, anyone, cluster)
+	if err != nil || slices.Contains(perms, grantC) {
+		t.Errorf("Permissions: %v, %v", perms, err)
+	}
+	holders, err := h.authz.Holders(ctx, cluster, grantC)
+	if err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.Everyone}) {
+		t.Errorf("Holders: %v, %v", holders, err)
+	}
+	reach, err := h.authz.Reachable(ctx, anyone, grantC, "cluster")
+	if err != nil || reach.All || len(reach.Scopes) > 0 {
+		t.Errorf("Reachable: %+v, %v", reach, err)
+	}
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE cs (tenant text NOT NULL, path text[] NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO cs VALUES ('t1', $1)`, h.path(t, cluster)); err != nil {
+		t.Fatal(err)
+	}
+	for p, want := range map[rbac.Permission]int{root: 1, grantC: 0} {
+		pred, err := h.authz.Filter(ctx, anyone, p, "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var n int
+		if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM cs WHERE `+pred.SQL, pred.Args...).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != want {
+			t.Errorf("Filter %s: %d clusters, want %d", p, n, want)
+		}
+	}
+	b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}}
+	if err := h.authz.Apply(ctx, anyone, cluster, rbac.Change{Revoke: []rbac.Binding{b}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("Apply: %v", err)
+	}
+}
+
+func TestConcurrentChangesAcrossScopesAllCommit(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) { c.OnChange = nil })
+	ctx := t.Context()
+	bind := func(id string) rbac.Binding {
+		return rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: id}}
+	}
+	ws := rbac.Scope{Type: "workspace", ID: "w1"}
+	var wg sync.WaitGroup
+	errs := make(chan error, 64)
+	run := func(change func(i int) error) {
+		wg.Go(func() {
+			for i := range 8 {
+				if err := change(i); err != nil {
+					errs <- err
+					return
+				}
+			}
+		})
+	}
+	for w := range 4 {
+		run(func(i int) error {
+			c := rbac.Change{Grant: []rbac.Binding{bind("a")}, Revoke: []rbac.Binding{bind("b")}}
+			if (w+i)%2 == 0 {
+				c.Grant, c.Revoke = c.Revoke, c.Grant
+			}
+			return h.authz.Apply(ctx, user("owner"), cluster, c)
+		})
+	}
+	for range 2 {
+		run(func(int) error {
+			return h.authz.Import(ctx, "t1", []rbac.Grant{
+				grant(cluster.Scope(), "cluster.login", rbac.User, "a"),
+				grant(cluster.Scope(), "cluster.login", rbac.User, "b"),
+				grant(ws, "cluster.login", rbac.User, "a"),
+			})
+		})
+	}
+	// One principal's roles, revoked and granted in turn, against deleting the principal.
+	sudo := rbac.Binding{Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.User, ID: "a"}}
+	for w := range 2 {
+		run(func(i int) error {
+			c := rbac.Change{Grant: []rbac.Binding{sudo}, Revoke: []rbac.Binding{bind("a")}}
+			if (w+i)%2 == 0 {
+				c.Grant, c.Revoke = c.Revoke, c.Grant
+			}
+			return h.authz.Apply(ctx, user("owner"), cluster, c)
+		})
+	}
+	for range 2 {
+		run(func(int) error { return h.authz.DeletePrincipal(ctx, "t1", rbac.Principal{Kind: rbac.User, ID: "a"}) })
 	}
 	wg.Wait()
 	close(errs)

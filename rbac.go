@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -94,6 +95,16 @@ type Subject struct {
 	Groups []string
 }
 
+// principalsFor is the subject's principals whose grants can give p: a grant to everyone never
+// gives a permission to change grants, whatever its role gives now or later.
+func (s Subject) principalsFor(p Permission) []string {
+	keys := s.principals()
+	if p.managesAccess() {
+		keys = slices.DeleteFunc(keys, func(k string) bool { return k == Principal{Kind: Everyone}.key() })
+	}
+	return keys
+}
+
 func (s Subject) principals() []string {
 	keys := make([]string, 0, len(s.Groups)+2)
 	if s.User != "" {
@@ -151,14 +162,25 @@ func (r Resource) validate() error {
 		if !a.in(r.Tenant) {
 			return fmt.Errorf("%w: ancestor %q is not a valid scope", ErrInvalid, a.Key())
 		}
+		// The tenant is above everything: a grant on a scope listed above it would reach it.
+		if r.Type == TenantScope && a.Type != TenantScope {
+			return fmt.Errorf("%w: the tenant has no ancestor %q", ErrInvalid, a.Key())
+		}
 	}
 	return nil
 }
 
 // Path is the keys of every scope whose grants apply to the resource: its own, every
 // container's above it and the tenant's. Filter matches it against a host column holding the
-// same keys, so store exactly this.
-func (r Resource) Path() []string {
+// same keys, so store exactly this, and keep it current when the resource moves.
+func (a *Authorizer) Path(r Resource) ([]string, error) {
+	if err := a.check(r); err != nil {
+		return nil, err
+	}
+	return r.path(), nil
+}
+
+func (r Resource) path() []string {
 	keys := make([]string, 0, len(r.Ancestors)+2)
 	for _, s := range append(append([]Scope{r.Scope()}, r.Ancestors...), TenantRoot(r.Tenant)) {
 		if k := s.Key(); !slices.Contains(keys, k) {
@@ -202,8 +224,11 @@ type ChangeEvent struct {
 }
 
 // Constraint removes a permission on a type of resource in a tenant, for everyone, owners
-// included, such as a policy forbidding root access. On `<type>:grant` it stops changes on
-// scopes of that type, not grants on a container that reach the type.
+// included, such as a policy forbidding root access. On `<type>:grant` it stops changes,
+// grants and revokes alike, on scopes of that type, not grants on a container that reach the
+// type, as a deny on one type's grant permission does in cloud IAM. To keep anyone from having
+// a permission, remove that permission itself. Deny is called for each permission a call
+// considers, so keep it cheap.
 type Constraint struct {
 	Name string
 	// Deny gets q, what the call runs on, to read the host's policy in the same transaction.
@@ -255,7 +280,8 @@ type Config struct {
 	// principal outside the tenant must never be stored.
 	ValidatePrincipal func(ctx context.Context, q DB, tenant string, p Principal) error
 	Constraints       []Constraint
-	// OnChange runs in the transaction of every change; an error rolls the change back.
+	// OnChange runs in the transaction of every change but DeleteExpired, whose grants already
+	// gave nothing; an error rolls the change back.
 	OnChange func(ctx context.Context, tx pgx.Tx, e ChangeEvent) error
 	// Now is the clock that grant expiry is compared with; time.Now when nil.
 	Now func() time.Time
@@ -267,6 +293,8 @@ type Authorizer struct {
 	cfg        Config
 	roles      map[Role]RoleDefinition
 	containers map[string]bool
+	// containerTypes are the containers' types, sorted.
+	containerTypes []string
 }
 
 // New checks the configuration and returns an Authorizer that runs its queries on db.
@@ -308,7 +336,8 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	return &Authorizer{db: db, cfg: cfg, roles: roles, containers: containers}, nil
+	types := slices.Sorted(maps.Keys(containers))
+	return &Authorizer{db: db, cfg: cfg, roles: roles, containers: containers, containerTypes: types}, nil
 }
 
 // WithTx returns an Authorizer that runs on tx, so its changes commit or roll back with the
