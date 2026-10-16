@@ -349,6 +349,9 @@ type authority struct {
 	roles book
 	// allows reports whether a grant's condition holds for the request, with an action.
 	allows func(h holding, action Permission) bool
+	// denied reports whether a deny on the path removes p from the actor in the request: what
+	// it denies the actor doesn't hold, so can't use or hand on.
+	denied func(p Permission) bool
 	// defining is a custom role DefineRole checks: the roles a check names resolve to it, but the
 	// actor's own grants of it give what it gives now.
 	defining *RoleDefinition
@@ -403,15 +406,31 @@ func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Re
 	if err := a.conditionsOf(ctx, q, on.Tenant, held); err != nil {
 		return authority{}, err
 	}
+	ds, err := a.deniesOn(ctx, q, on.Tenant, actor.principals(on.Tenant), on.path(), "")
+	if err != nil {
+		return authority{}, err
+	}
 	vars, spend := a.vars(ctx, actor, "", on), newBudget()
-	return authority{held: held, roles: b, allows: func(h holding, action Permission) bool {
-		if !h.conditional {
-			return true
-		}
+	with := func(action Permission) map[string]any {
 		v := maps.Clone(vars)
 		v["action"] = string(action)
-		return a.conds.holds(spend, h.Condition.Expression, v)
-	}}, nil
+		return v
+	}
+	denied := map[Permission]bool{}
+	return authority{
+		held: held, roles: b,
+		allows: func(h holding, action Permission) bool {
+			return !h.conditional || a.conds.holds(spend, h.Condition.Expression, with(action))
+		},
+		denied: func(p Permission) bool {
+			if d, ok := denied[p]; ok {
+				return d
+			}
+			_, d := a.deniedBy(ds, p, spend, with(p))
+			denied[p] = d
+			return d
+		},
+	}, nil
 }
 
 // over is what the actor's grants let it change on scopes of a type in this request: a
@@ -430,6 +449,9 @@ func (au authority) under(scopeType, condition string) power {
 func (au authority) power(scopeType string, counts func(holding) bool) power {
 	pw := power{listed: map[Role][]string{}}
 	manage := GrantPermission(scopeType)
+	if au.denied(manage) {
+		return pw
+	}
 	for _, g := range au.held {
 		if !gives(au.roles, g.Principal, g.Role, manage, scopeType) || !counts(g) {
 			continue
@@ -453,14 +475,14 @@ func (h holding) under(condition string) bool {
 
 // holds reports whether the actor holds p for resources of a type, to hand it on with condition.
 func (au authority) holds(p Permission, resourceType, condition string) bool {
-	return slices.ContainsFunc(au.held, func(g holding) bool {
+	return !au.denied(p) && slices.ContainsFunc(au.held, func(g holding) bool {
 		return gives(au.roles, g.Principal, g.Role, p, resourceType) && g.under(condition)
 	})
 }
 
 // may reports whether the actor may do p, on resources of a type, in this request.
 func (au authority) may(p Permission, resourceType string) bool {
-	return slices.ContainsFunc(au.held, func(g holding) bool {
+	return !au.denied(p) && slices.ContainsFunc(au.held, func(g holding) bool {
 		return gives(au.roles, g.Principal, g.Role, p, resourceType) && au.allows(g, p)
 	})
 }
@@ -768,10 +790,11 @@ func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) (
 	return collectGrants(rows)
 }
 
-// DeleteScope removes every grant on a scope, as when the resource or container is deleted. It
-// waits for a change to the scope in progress, so a grant that change makes is removed too.
+// DeleteScope removes every grant and deny on a scope, as when the resource or container is
+// deleted. It waits for a change to the scope in progress, so a grant that change makes is
+// removed too.
 func (a *Authorizer) DeleteScope(ctx context.Context, tenant string, s Scope) error {
-	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, []string{s.Key()}, nil) }, false, "scope = $2", s.Key())
+	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, []string{s.Key()}, nil) }, false, "scope = $2", "scope = $2", s.Key())
 }
 
 // DeletePrincipal removes every grant to a principal, as when an identity or group is deleted,
@@ -780,7 +803,7 @@ func (a *Authorizer) DeletePrincipal(ctx context.Context, tenant string, p Princ
 	if !p.wellFormed(tenant) {
 		return fmt.Errorf("%w: principal %q is not valid", ErrInvalid, p.key())
 	}
-	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, nil, []string{p.key()}) }, false, "principal = $2", p.key())
+	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, nil, []string{p.key()}) }, false, "", "principal = $2", p.key())
 }
 
 // DeletePrincipalEverywhere removes every grant to an identity or group in every tenant, as
@@ -829,14 +852,14 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, p Principal)
 	}
 }
 
-// DeleteTenant removes every grant and custom role in a tenant, so a tenant created later with
-// its id starts with neither.
+// DeleteTenant removes every grant, custom role and deny in a tenant, so a tenant created later
+// with its id starts with none.
 func (a *Authorizer) DeleteTenant(ctx context.Context, tenant string) error {
-	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lockTenant(ctx, tx, tenant) }, true, "TRUE")
+	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lockTenant(ctx, tx, tenant) }, true, "TRUE", "TRUE")
 }
 
 // delete removes the grants in a tenant that where picks, and with roles, its custom roles.
-func (a *Authorizer) delete(ctx context.Context, tenant string, lock func(pgx.Tx) error, roles bool, where string, args ...any) error {
+func (a *Authorizer) delete(ctx context.Context, tenant string, lock func(pgx.Tx) error, roles bool, denies, where string, args ...any) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -851,6 +874,16 @@ func (a *Authorizer) delete(ctx context.Context, tenant string, lock func(pgx.Tx
 				return ChangeEvent{}, err
 			}
 			if e.DeletedRoles, err = pgx.CollectRows(rows, pgx.RowTo[Role]); err != nil {
+				return ChangeEvent{}, err
+			}
+		}
+		if denies != "" {
+			rows, err := tx.Query(ctx, `DELETE FROM rbac_denies WHERE tenant = $1 AND `+denies+` RETURNING `+denyColumns,
+				append([]any{tenant}, args...)...)
+			if err != nil {
+				return ChangeEvent{}, err
+			}
+			if e.DeletedDenies, err = collectDenies(rows); err != nil {
 				return ChangeEvent{}, err
 			}
 		}

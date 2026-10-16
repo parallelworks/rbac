@@ -340,8 +340,15 @@ func patternSize(re *syntax.Regexp) uint64 {
 // holds evaluates a condition on a request, spending from b; one that fails, or that b can't
 // pay for, is false.
 func (c *conditions) holds(b *budget, expr string, vars map[string]any) bool {
+	held, _ := c.decide(b, expr, vars)
+	return held
+}
+
+// decide evaluates a condition on a request, spending from b, and reports whether it held and
+// whether it could be evaluated at all, as a deny fails closed where it couldn't.
+func (c *conditions) decide(b *budget, expr string, vars map[string]any) (held, evaluated bool) {
 	if b.left == 0 {
-		return false
+		return false, false
 	}
 	// A check pays to compile each condition once, whether or not it is cached, so what it decides
 	// doesn't depend on what the cache holds: other tenants' conditions can evict this one's.
@@ -350,11 +357,11 @@ func (c *conditions) holds(b *budget, expr string, vars map[string]any) bool {
 		b.spend(uint64(len(expr)) * compilePerByte)
 	}
 	if b.left == 0 {
-		return false
+		return false, false
 	}
 	prg, err := c.compile(expr)
 	if err != nil {
-		return false
+		return false, false
 	}
 	left := b.left
 	out, details, err := prg.Eval(vars)
@@ -365,10 +372,10 @@ func (c *conditions) holds(b *budget, expr string, vars map[string]any) bool {
 	b.spend(cost)
 	// One that cost more than was left is past the budget too.
 	if err != nil || cost > left {
-		return false
+		return false, false
 	}
 	ok, isBool := out.Value().(bool)
-	return isBool && ok
+	return isBool && ok, isBool
 }
 
 type requestKey struct{}
