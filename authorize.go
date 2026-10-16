@@ -13,8 +13,8 @@ import (
 // Decision is why a check came out as it did.
 type Decision struct {
 	Allowed bool
-	// Owner is set when the subject owns the resource, which gives every permission on it but
-	// changing the grants on a container or the tenant.
+	// Owner is set when the subject owns the resource, which gives every permission a role gives
+	// on its type but changing the grants on a container or the tenant.
 	Owner bool
 	// Grants are the subject's grants that give the permission.
 	Grants []Grant
