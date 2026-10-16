@@ -399,8 +399,10 @@ type Authorizer struct {
 	permissions  map[Permission]bool
 	types        map[string]bool
 	unprivileged map[permissionOn]bool
-	// The same, sorted, as searches pass them to SQL: the pairs as `permission type`.
-	catalogPermissions, catalogTypes, unprivilegedPairs []string
+	// The same, sorted, as searches pass them to SQL. publicPairs are the unprivileged pairs, as
+	// `permission type`, of permissions that don't change access: all a public role gives as
+	// Authorizer.current reads it.
+	catalogPermissions, catalogTypes, publicPairs []string
 }
 
 // permissionOn is a permission on a type of resource.
@@ -472,14 +474,16 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 		permList = append(permList, string(p))
 	}
 	for k := range unprivileged {
-		pairs = append(pairs, string(k.p)+" "+k.t)
+		if !k.p.managesAccess() {
+			pairs = append(pairs, string(k.p)+" "+k.t)
+		}
 	}
 	slices.Sort(permList)
 	slices.Sort(pairs)
 	return &Authorizer{
 		db: db, cfg: cfg, roles: roles, containers: containers, containerTypes: slices.Sorted(maps.Keys(containers)),
 		kinds: kinds, permissions: perms, types: resourceTypes, unprivileged: unprivileged,
-		catalogPermissions: permList, catalogTypes: slices.Sorted(maps.Keys(resourceTypes)), unprivilegedPairs: pairs,
+		catalogPermissions: permList, catalogTypes: slices.Sorted(maps.Keys(resourceTypes)), publicPairs: pairs,
 	}, nil
 }
 
