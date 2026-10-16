@@ -333,6 +333,9 @@ var (
 	// ErrInvalid is matched by malformed input: an unknown role, a principal outside the
 	// tenant, a scope a role can't be granted on.
 	ErrInvalid = errors.New("rbac: invalid")
+	// ErrConflict is matched by a change refused because another changed what it rests on while
+	// it waited: try it again.
+	ErrConflict = errors.New("rbac: conflict")
 )
 
 // DeniedError is a refusal, with why.

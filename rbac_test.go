@@ -2261,6 +2261,12 @@ func TestDefiningARoleDerivesPrivilegeAndChecksTheActorFirst(t *testing.T) {
 			t.Fatalf("a name %q: %v", name, err)
 		}
 	}
+	// A character split between the name and the description is valid only joined.
+	split := plain
+	split.Name, split.Description = "\xe4\xb8", "\xad"
+	if err := h.authz.DefineRole(ctx, admin, "t1", split); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a character split between name and description: %v", err)
+	}
 	// Refused for who it is, not for what it asked: it learns nothing of the catalog.
 	guess := rbac.RoleDefinition{ID: "custom.guess", Permissions: []rbac.Permission{"cluster:fly"}, ResourceTypes: []string{"cluster"}}
 	if err := h.authz.DefineRole(ctx, user("nobody"), "t1", guess); !errors.Is(err, rbac.ErrDenied) || errors.Is(err, rbac.ErrInvalid) {
@@ -2337,10 +2343,10 @@ func TestARoleHandingOutOneThatBecomesPrivilegedIsPrivileged(t *testing.T) {
 	if got := privileged(); !slices.Equal(got, []bool{true, true}) {
 		t.Fatalf("a role handing out one that became privileged: %v", got)
 	}
-	// Once neither gives it, redefining each in turn clears both: they mark each other no more.
-	b.Permissions = plain
-	define(b)
+	// a, defined again while b is privileged, is stored privileged. Once b gives nothing
+	// privileged, a read clears both, whatever their stored flags say.
 	define(a)
+	b.Permissions = plain
 	define(b)
 	if got := privileged(); !slices.Equal(got, []bool{false, false}) {
 		t.Fatalf("roles listing each other, neither privileged: %v", got)
@@ -2383,7 +2389,7 @@ func TestDefiningARoleCreatedWhileItWaitsAsksTheConstraintsAgain(t *testing.T) {
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-done; err == nil || allowed(t, h, user("op"), login, cluster) {
+	if err := <-done; !errors.Is(err, rbac.ErrConflict) || allowed(t, h, user("op"), login, cluster) {
 		t.Fatalf("replacing a role created while the change waited, past the constraint: %v", err)
 	}
 	if err := h.authz.DefineRole(ctx, admin, "t1", wider); !errors.Is(err, rbac.ErrDenied) {
