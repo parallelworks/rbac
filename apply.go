@@ -32,8 +32,10 @@ func (e *InvalidError) Is(target error) bool { return target == ErrInvalid }
 //     constraint may remove it;
 //   - through a role with GrantableRoles, the actor may grant and revoke only those roles, and
 //     needn't hold their permissions;
-//   - through any other role, the actor may grant a role only by holding every permission it
-//     gives there, for every type the grant reaches, and may revoke any;
+//   - through any other role, the actor may grant a role only by holding everything it gives
+//     there, for every type the grant reaches, and may revoke any. A role's power to change
+//     grants is part of what it gives: one with GrantableRoles needs the power to grant each,
+//     and one without, the unlimited power to change grants on its type;
 //   - a role that gives a `:grant` permission can't be granted to a tenant's members or the
 //     public, and only a role marked Public can be granted to the public.
 //
@@ -266,61 +268,113 @@ func (a *Authorizer) checkBinding(tenant string, scope Scope, b Binding, now tim
 	return errs
 }
 
-// authority is what an actor's grants let it change on a scope.
+// authority is an actor's grants on a resource's path, and how to read their roles.
 type authority struct {
-	// any is whether it may grant any role whose permissions it holds, and revoke any.
-	any bool
-	// listed are the roles it may grant and revoke without holding them.
-	listed map[Role]bool
-	held   []Binding
+	held []Binding
+	role func(Role) (RoleDefinition, bool)
 }
 
-func (au authority) none() bool { return !au.any && len(au.listed) == 0 }
+// power is what an actor may change on scopes of a type: any role it holds everything of, and
+// revoke any, or only the listed roles, without holding them.
+type power struct {
+	any    bool
+	listed map[Role]bool
+}
 
-// authorityOn reads the actor's grants on a resource's path and what they let it change there.
+func (p power) none() bool { return !p.any && len(p.listed) == 0 }
+
+// authorityOn reads the actor's grants on a resource's path.
 func (a *Authorizer) authorityOn(ctx context.Context, q DB, actor Subject, on Resource) (authority, error) {
 	held, err := a.heldBindings(ctx, q, on.Tenant, actor.principals(on.Tenant), on.path())
 	if err != nil {
 		return authority{}, err
 	}
-	au := authority{listed: map[Role]bool{}, held: held}
-	manage := GrantPermission(on.Type)
-	for _, g := range held {
-		def, known := a.roles[g.Role]
-		if !known || !def.Gives(manage) || !def.GrantableOn(on.Type) || !g.Principal.carries(def, manage) {
+	return authority{held: held, role: func(id Role) (RoleDefinition, bool) {
+		r, ok := a.roles[id]
+		return r, ok
+	}}, nil
+}
+
+// over is what the actor's grants let it change on scopes of a type.
+func (au authority) over(scopeType string) power {
+	pw := power{listed: map[Role]bool{}}
+	manage := GrantPermission(scopeType)
+	for _, g := range au.held {
+		def, known := au.role(g.Role)
+		if !known || !def.Gives(manage) || !def.GrantableOn(scopeType) || !g.Principal.carries(def, manage) {
 			continue
 		}
 		if len(def.GrantableRoles) == 0 {
-			au.any = true
+			pw.any = true
 		}
 		for _, r := range def.GrantableRoles {
-			au.listed[r] = true
+			pw.listed[r] = true
 		}
 	}
-	return au, nil
+	return pw
 }
 
-// missing reports whether the actor may grant def on scopeType, and if not, a permission it
-// lacks.
-func (a *Authorizer) missing(au authority, scopeType string, def RoleDefinition) (Permission, bool) {
-	if au.listed[def.ID] {
+// holds reports whether the actor holds p for resources of a type.
+func (au authority) holds(p Permission, resourceType string) bool {
+	return slices.ContainsFunc(au.held, func(g Binding) bool {
+		def, known := au.role(g.Role)
+		return known && def.Gives(p) && def.GrantableOn(resourceType) && g.Principal.carries(def, p)
+	})
+}
+
+// mayGrant reports whether the actor may grant def on a scope of a type, and if not, a
+// permission it lacks: its power there lists def, or lets it grant any role and it holds
+// everything def gives.
+func (a *Authorizer) mayGrant(au authority, scopeType string, def RoleDefinition, seen map[Role]bool) (Permission, bool) {
+	pw := au.over(scopeType)
+	if pw.listed[def.ID] {
 		return "", true
 	}
-	if !au.any {
+	if !pw.any {
 		return GrantPermission(scopeType), false
 	}
-	// On a container or the tenant the grant reaches every type the role is for, so the actor
-	// must hold each permission for each of them; on a resource, for its own type.
+	// On a container or the tenant the grant reaches every type the role is for; on a resource,
+	// its own type.
 	types := []string{scopeType}
 	if a.contains(scopeType) {
 		types = def.ResourceTypes
 	}
+	return a.holdsRole(au, def, types, seen)
+}
+
+// holdsRole reports whether the actor holds everything def gives for each of types, and if
+// not, a permission it lacks. A permission to change grants on a type gives a power there: to
+// grant any role, or the listed ones. The actor must have as much, or a grant could hand on
+// more than it has: an unlimited one itself, or the power to grant each listed role. seen are
+// the roles being checked, so a role that lists itself is checked once.
+func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string, seen map[Role]bool) (Permission, bool) {
+	if seen[def.ID] {
+		return "", true
+	}
+	seen[def.ID] = true
+	defer delete(seen, def.ID)
 	for _, p := range def.Permissions {
-		for _, t := range types {
-			if !slices.ContainsFunc(au.held, func(g Binding) bool {
-				held, known := a.roles[g.Role]
-				return known && held.Gives(p) && held.GrantableOn(t) && g.Principal.carries(held, p)
-			}) {
+		t, verb := p.parts()
+		if verb != "grant" {
+			for _, rt := range types {
+				if !au.holds(p, rt) {
+					return p, false
+				}
+			}
+			continue
+		}
+		if len(def.GrantableRoles) == 0 {
+			if !au.over(t).any {
+				return p, false
+			}
+			continue
+		}
+		for _, id := range def.GrantableRoles {
+			listed, known := au.role(id)
+			if !known {
+				return p, false
+			}
+			if _, ok := a.mayGrant(au, t, listed, seen); !ok {
 				return p, false
 			}
 		}
@@ -337,24 +391,25 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 	if err != nil {
 		return err
 	}
-	if au.none() {
+	pw := au.over(scope.Type)
+	if pw.none() {
 		return &DeniedError{Permission: manage, Scope: scope, Reason: "the actor may not change access here"}
 	}
 	var errs []error
 	for _, b := range revokes {
-		if !au.any && !au.listed[b.Role] {
+		if !pw.any && !pw.listed[b.Role] {
 			errs = append(errs, &DeniedError{Permission: manage, Scope: scope, Reason: fmt.Sprintf("the actor may not revoke %s here", b.Role)})
 		}
 	}
 	for _, b := range grants {
-		def, known := a.roles[b.Role]
+		def, known := au.role(b.Role)
 		if !known || !a.grantableOn(def, scope.Type) {
 			// validate reports it as invalid rather than as an escalation.
 			continue
 		}
-		if p, ok := a.missing(au, scope.Type, def); !ok {
+		if p, ok := a.mayGrant(au, scope.Type, def, map[Role]bool{}); !ok {
 			reason := fmt.Sprintf("the actor can't grant %s without holding %s here", b.Role, p)
-			if !au.any {
+			if !pw.any {
 				reason = fmt.Sprintf("the actor may not grant %s here", b.Role)
 			}
 			errs = append(errs, &DeniedError{Permission: p, Scope: scope, Reason: reason})
@@ -377,12 +432,12 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 		return nil, err
 	}
 	au, err := a.authorityOn(ctx, a.db, s, r)
-	if err != nil || au.none() {
+	if err != nil || au.over(r.Type).none() {
 		return nil, err
 	}
 	var roles []RoleDefinition
 	for _, def := range a.cfg.Catalog {
-		if _, ok := a.missing(au, r.Type, def); ok && a.grantableOn(def, r.Type) {
+		if _, ok := a.mayGrant(au, r.Type, def, map[Role]bool{}); ok && a.grantableOn(def, r.Type) {
 			roles = append(roles, def.clone())
 		}
 	}
