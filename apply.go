@@ -34,8 +34,12 @@ func (e *InvalidError) Is(target error) bool { return target == ErrInvalid }
 //   - to grant a role, the actor must hold every permission it gives there, or own the
 //     resource;
 //   - a grant the actor makes expires no later than the actor's own access it rests on;
-//   - a role that gives a `:grant` permission can't be granted to everyone;
+//   - a role that gives a `:grant` permission can't be granted to a tenant's members or the
+//     public, and only a role marked Public can be granted to the public;
 //   - revoking needs only `<on's type>:grant`.
+//
+// The actor is a member of the scope's tenant: anonymous subjects and other tenants' members
+// change nothing.
 //
 // Bindings are checked only once the actor may make the change, so a refused actor learns
 // nothing about principals. Every invalid binding is reported at once, joined; an error from
@@ -51,9 +55,12 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 	if len(grants)+len(revokes) == 0 {
 		return nil
 	}
+	if err := a.subject(actor); err != nil {
+		return err
+	}
 	manage := GrantPermission(scope.Type)
-	if actor.Tenant != on.Tenant {
-		return &DeniedError{Permission: manage, Scope: scope, Reason: "the scope is in another tenant"}
+	if !actor.member(on.Tenant) {
+		return &DeniedError{Permission: manage, Scope: scope, Reason: "the actor isn't a member of the scope's tenant"}
 	}
 	// The hooks run outside the transaction: one that queries the pool while the transaction
 	// holds a connection can wait forever on a busy pool.
@@ -70,7 +77,7 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 	if err := a.validate(ctx, on.Tenant, scope, grants, revokes); err != nil {
 		return err
 	}
-	return a.inTx(ctx, on.Tenant, actor.User, func(tx pgx.Tx) (granted, revoked []Grant, err error) {
+	return a.inTx(ctx, on.Tenant, actor.Principal, func(tx pgx.Tx) (granted, revoked []Grant, err error) {
 		// One change to a scope at a time, so two changes can't deadlock on its rows.
 		var principals []string
 		for _, b := range slices.Concat(grants, revokes) {
@@ -86,7 +93,7 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 		if revoked, err = a.revoke(ctx, tx, on.Tenant, scope, revokes); err != nil {
 			return nil, nil, err
 		}
-		granted, err = a.upsert(ctx, tx, on.Tenant, actor.User, scopeGrants(scope, grants))
+		granted, err = a.upsert(ctx, tx, on.Tenant, actor.Principal, scopeGrants(scope, grants))
 		return granted, revoked, err
 	})
 }
@@ -139,7 +146,7 @@ func (a *Authorizer) Import(ctx context.Context, tenant string, grants []Grant) 
 			errs = append(errs, &InvalidError{Binding: g.Binding, Reason: fmt.Sprintf("scope %q is not valid", g.Scope.Key())})
 			continue
 		}
-		errs = append(errs, a.checkBinding(g.Scope, g.Binding, a.cfg.Now())...)
+		errs = append(errs, a.checkBinding(tenant, g.Scope, g.Binding, a.cfg.Now())...)
 	}
 	if err := errors.Join(errs...); err != nil {
 		return err
@@ -149,7 +156,7 @@ func (a *Authorizer) Import(ctx context.Context, tenant string, grants []Grant) 
 		scopes[g.Scope.Key()] = true
 		principals[g.Principal.key()] = true
 	}
-	return a.inTx(ctx, tenant, "", func(tx pgx.Tx) ([]Grant, []Grant, error) {
+	return a.inTx(ctx, tenant, Principal{}, func(tx pgx.Tx) ([]Grant, []Grant, error) {
 		var err error
 		if len(scopes)+len(principals) > maxLocks {
 			err = lockTenant(ctx, tx, tenant)
@@ -159,7 +166,7 @@ func (a *Authorizer) Import(ctx context.Context, tenant string, grants []Grant) 
 		if err != nil {
 			return nil, nil, err
 		}
-		granted, err := a.upsert(ctx, tx, tenant, "", grants)
+		granted, err := a.upsert(ctx, tx, tenant, Principal{}, grants)
 		return granted, nil, err
 	})
 }
@@ -209,8 +216,9 @@ func (a *Authorizer) validate(ctx context.Context, tenant string, scope Scope, g
 		return err == nil, nil
 	}
 	for _, b := range grants {
-		bad := a.checkBinding(scope, b, now)
-		if len(bad) == 0 && b.Principal.Kind != Everyone {
+		bad := a.checkBinding(tenant, scope, b, now)
+		// The public is asked about too, so a host can refuse public access.
+		if len(bad) == 0 && b.Principal.Kind != Tenant {
 			ok, err := inTenant(b.Principal)
 			if err != nil {
 				return err
@@ -222,19 +230,19 @@ func (a *Authorizer) validate(ctx context.Context, tenant string, scope Scope, g
 		errs = append(errs, bad...)
 	}
 	for _, b := range revokes {
-		// A role no longer in the catalog can still be revoked.
-		if !b.Principal.valid() {
+		// A role no longer in the catalog, or a kind no longer declared, can still be revoked.
+		if !b.Principal.wellFormed(tenant) {
 			errs = append(errs, &InvalidError{Binding: b, Reason: "the principal is not valid"})
 		}
 	}
 	return errors.Join(errs...)
 }
 
-// checkBinding returns why a binding can't be granted on a scope.
-func (a *Authorizer) checkBinding(scope Scope, b Binding, now time.Time) []error {
+// checkBinding returns why a binding can't be granted on a scope in a tenant.
+func (a *Authorizer) checkBinding(tenant string, scope Scope, b Binding, now time.Time) []error {
 	var errs []error
 	bad := func(reason string) { errs = append(errs, &InvalidError{Binding: b, Reason: reason}) }
-	if !b.Principal.valid() {
+	if !a.known(tenant, b.Principal) {
 		bad("the principal is not valid")
 	}
 	def, ok := a.roles[b.Role]
@@ -243,8 +251,10 @@ func (a *Authorizer) checkBinding(scope Scope, b Binding, now time.Time) []error
 		bad("no such role")
 	case !a.grantableOn(def, scope.Type):
 		bad(fmt.Sprintf("can't be granted on a %s", scope.Type))
-	case b.Principal.Kind == Everyone && def.managesAccess():
-		bad("a role that changes access can't be granted to everyone")
+	case b.Principal.broad() && def.managesAccess():
+		bad("a role that changes access can't be granted to a tenant's members or the public")
+	case b.Principal.Kind == Public && !def.Public:
+		bad("the role can't be granted to the public")
 	}
 	if !b.ExpiresAt.IsZero() && !b.ExpiresAt.After(now) {
 		bad("already expired")
@@ -257,10 +267,10 @@ func (a *Authorizer) checkBinding(scope Scope, b Binding, now time.Time) []error
 func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Resource, grants []Binding) error {
 	scope := on.Scope()
 	manage := GrantPermission(scope.Type)
-	if actor.User != "" && actor.User == on.Owner && a.ownerHolds(scope.Type, manage) {
+	if actor.owns(on) && a.ownerHolds(scope.Type, manage) {
 		return nil
 	}
-	held, err := a.heldBindings(ctx, q, on.Tenant, actor.principals(), on.path())
+	held, err := a.heldBindings(ctx, q, on.Tenant, actor.principals(on.Tenant), on.path())
 	if err != nil {
 		return err
 	}
@@ -364,7 +374,7 @@ func scopeGrants(scope Scope, bindings []Binding) []Grant {
 }
 
 // inTx runs fn in a transaction and hands what it changed to Config.OnChange there.
-func (a *Authorizer) inTx(ctx context.Context, tenant, actor string, fn func(pgx.Tx) (granted, revoked []Grant, err error)) error {
+func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, fn func(pgx.Tx) (granted, revoked []Grant, err error)) error {
 	return pgx.BeginFunc(ctx, a.db, func(tx pgx.Tx) error {
 		granted, revoked, err := fn(tx)
 		if err != nil {
@@ -381,7 +391,7 @@ func (a *Authorizer) inTx(ctx context.Context, tenant, actor string, fn func(pgx
 // order, and returns those it added or whose expiry it changed. Of repeated grants it stores
 // the last, since one statement can't change a row twice. An expired grant that is still
 // stored gave nothing, so granting it again records the new actor and time.
-func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant, actor string, grants []Grant) ([]Grant, error) {
+func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, grants []Grant) ([]Grant, error) {
 	if len(grants) == 0 {
 		return nil, nil
 	}
@@ -410,7 +420,7 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant, actor string
 		  created_at = CASE WHEN rbac_grants.expires_at <= $9 THEN EXCLUDED.created_at ELSE rbac_grants.created_at END
 		WHERE rbac_grants.expires_at IS DISTINCT FROM EXCLUDED.expires_at
 		RETURNING `+grantColumns,
-		tenant, scopeTypes, scopeIDs, kinds, ids, roles, expires, actor, a.cfg.Now())
+		tenant, scopeTypes, scopeIDs, kinds, ids, roles, expires, actorKey(actor), a.cfg.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -484,8 +494,12 @@ func (a *Authorizer) DeleteScope(ctx context.Context, tenant string, s Scope) er
 	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, []string{s.Key()}, nil) }, "scope = $2", s.Key())
 }
 
-// DeletePrincipal removes every grant to a user or group, as when it is deleted.
+// DeletePrincipal removes every grant to a principal, as when an identity or group is deleted,
+// or every grant to the public, as when a tenant stops allowing public access.
 func (a *Authorizer) DeletePrincipal(ctx context.Context, tenant string, p Principal) error {
+	if !p.wellFormed(tenant) {
+		return fmt.Errorf("%w: principal %q is not valid", ErrInvalid, p.key())
+	}
 	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, nil, []string{p.key()}) }, "principal = $2", p.key())
 }
 
@@ -500,7 +514,7 @@ func (a *Authorizer) delete(ctx context.Context, tenant string, lock func(pgx.Tx
 	}
 	query := `DELETE FROM rbac_grants WHERE tenant = $1 AND ` + where
 	args = append([]any{tenant}, args...)
-	return a.inTx(ctx, tenant, "", func(tx pgx.Tx) ([]Grant, []Grant, error) {
+	return a.inTx(ctx, tenant, Principal{}, func(tx pgx.Tx) ([]Grant, []Grant, error) {
 		if err := lock(tx); err != nil {
 			return nil, nil, err
 		}

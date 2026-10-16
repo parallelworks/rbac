@@ -19,6 +19,9 @@ type RoleDefinition struct {
 	ResourceTypes []string
 	// Privileged marks administrative or root-level control, which a host may ask to confirm.
 	Privileged bool
+	// Public lets the role be granted to the public, anyone signed in or not. A privileged role
+	// or one that changes access can't be.
+	Public bool
 }
 
 // Gives reports whether the role gives p.
@@ -92,6 +95,9 @@ func index(catalog []RoleDefinition) (map[Role]RoleDefinition, error) {
 			if !validName(t) {
 				bad("resource type %q is not valid", t)
 			}
+		}
+		if r.Public && (r.Privileged || r.managesAccess()) {
+			bad("a privileged role or one that changes access can't be public")
 		}
 		roles[r.ID] = r.clone()
 	}

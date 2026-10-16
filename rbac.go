@@ -1,11 +1,12 @@
 // Package rbac is role-based access control on PostgreSQL: Core RBAC with scoped role
-// assignments. A role is a set of permissions; a grant gives one role to a user, a group or
-// everyone in a tenant, on a resource, a container above resources or the whole tenant, and
-// applies to everything under that scope.
+// assignments. A role is a set of permissions; a grant gives one role to a principal (a user,
+// another kind of identity such as a service account, a group, every member of a tenant, or
+// the public) on a resource, a container above resources or the whole tenant, and applies to
+// everything under that scope.
 //
-// The host keeps users, groups, resources and their hierarchy and passes them in: a [Subject]
-// is a user and every group they are in, and a [Resource] carries its owner and its
-// ancestors. The package keeps the grants, decides ([Authorizer.Authorize]), lists
+// The host keeps identities, groups, resources and their hierarchy and passes them in: a
+// [Subject] is an identity and every group it is in, or no one, and a [Resource] carries its
+// owner and its ancestors. The package keeps the grants, decides ([Authorizer.Authorize]), lists
 // ([Authorizer.Filter], [Authorizer.Reachable]) and changes grants with escalation checks
 // ([Authorizer.Apply]).
 //
@@ -61,67 +62,123 @@ func (s Scope) in(tenant string) bool {
 // PrincipalKind is who a role can be granted to.
 type PrincipalKind string
 
-// The kinds of principal.
+// The kinds of principal every host has. A host declares its other kinds of identity, such as
+// service accounts, in Config.PrincipalKinds.
 const (
 	User  PrincipalKind = "user"
 	Group PrincipalKind = "group"
-	// Everyone is every user in the tenant, those who join later included; its id is empty.
-	Everyone PrincipalKind = "everyone"
+	// Tenant is every member of a tenant, of every kind, those who join later included; its id
+	// is the tenant's (TenantMembers).
+	Tenant PrincipalKind = "tenant"
+	// Public is anyone, signed in or not, members of other tenants included; its id is empty.
+	Public PrincipalKind = "public"
 )
 
-// Principal is who a role is granted to. Everyone's ID is empty.
+// Principal is who a role is granted to.
 type Principal struct {
 	Kind PrincipalKind
 	ID   string
 }
 
+// TenantMembers is the principal that is every member of a tenant.
+func TenantMembers(tenant string) Principal { return Principal{Kind: Tenant, ID: tenant} }
+
 func (p Principal) key() string { return string(p.Kind) + ":" + p.ID }
 
-// canHold reports whether a grant to p can give perm: a grant to everyone never gives a
-// permission to change grants, whatever its role gives now or later.
-func (p Principal) canHold(perm Permission) bool { return p.Kind != Everyone || !perm.managesAccess() }
+// broad reports whether p is principals nobody named one by one: a tenant's members or the
+// public.
+func (p Principal) broad() bool { return p.Kind == Tenant || p.Kind == Public }
 
-func (p Principal) valid() bool {
+// canHold reports whether a grant to p can give perm: a grant to a tenant's members or the
+// public never gives a permission to change grants, whatever its role gives now or later.
+func (p Principal) canHold(perm Permission) bool { return !p.broad() || !perm.managesAccess() }
+
+// wellFormed reports whether p could hold grants in a tenant, whether or not its kind is
+// declared, as a revoke needs.
+func (p Principal) wellFormed(tenant string) bool {
 	switch p.Kind {
-	case Everyone:
+	case Public:
 		return p.ID == ""
+	case Tenant:
+		return p.ID == tenant
 	case User, Group:
 		return p.ID != ""
 	}
-	return false
+	return validName(string(p.Kind)) && p.ID != ""
 }
 
-// Subject is who is asking: a user in a tenant and every group they are in there, nested
+// known reports whether p can be granted roles in a tenant: well formed, and of a kind every
+// host has or the host declared.
+func (a *Authorizer) known(tenant string, p Principal) bool {
+	return p.wellFormed(tenant) && (p.Kind == Group || p.broad() || a.acts(p.Kind))
+}
+
+// acts reports whether a kind of principal can be a Subject: a user or a declared kind.
+func (a *Authorizer) acts(k PrincipalKind) bool { return k == User || a.kinds[k] }
+
+// Subject is who is asking: an identity in a tenant and every group it is in there, nested
 // groups included. Build it from the authenticated session, never from request input.
+//
+// The zero Subject is anonymous, someone not signed in, and holds only what is granted to the
+// public. So does a member of another tenant.
 type Subject struct {
 	Tenant string
-	User   string
-	Groups []string
+	// Principal is a user, or a kind in Config.PrincipalKinds.
+	Principal Principal
+	Groups    []string
 }
 
-// principalsFor is the subject's principals whose grants can give p: a grant to everyone never
-// gives a permission to change grants, whatever its role gives now or later.
-func (s Subject) principalsFor(p Permission) []string {
-	keys := s.principals()
-	if p.managesAccess() {
-		keys = slices.DeleteFunc(keys, func(k string) bool { return k == Principal{Kind: Everyone}.key() })
+// subject checks that s is anonymous, or an identity of a kind that acts, in a tenant.
+func (a *Authorizer) subject(s Subject) error {
+	if s.Tenant == "" && s.Principal == (Principal{}) && len(s.Groups) == 0 {
+		return nil
 	}
-	return keys
+	if s.Tenant == "" || !a.acts(s.Principal.Kind) || s.Principal.ID == "" {
+		return fmt.Errorf("%w: a subject is anonymous or a user or declared kind in a tenant", ErrInvalid)
+	}
+	return nil
 }
 
-func (s Subject) principals() []string {
-	keys := make([]string, 0, len(s.Groups)+2)
-	if s.User != "" {
-		keys = append(keys, Principal{User, s.User}.key())
+// member reports whether s is one of a tenant's members.
+func (s Subject) member(tenant string) bool { return s.Tenant == tenant && s.Principal.ID != "" }
+
+// user is the subject's id when it is a user in a tenant, the only kind that owns resources.
+func (s Subject) user(tenant string) string {
+	if s.member(tenant) && s.Principal.Kind == User {
+		return s.Principal.ID
 	}
+	return ""
+}
+
+// owns reports whether s owns r.
+func (s Subject) owns(r Resource) bool { return r.Owner != "" && s.user(r.Tenant) == r.Owner }
+
+// principalsFor is the keys of the subject's principals whose grants in a tenant can give p: a
+// grant to a tenant's members or the public never gives a permission to change grants,
+// whatever its role gives now or later.
+func (s Subject) principalsFor(tenant string, p Permission) []string {
+	return s.keys(tenant, !p.managesAccess())
+}
+
+// principals is the keys of every principal the subject is in a tenant.
+func (s Subject) principals(tenant string) []string { return s.keys(tenant, true) }
+
+func (s Subject) keys(tenant string, broad bool) []string {
+	var keys []string
+	if broad {
+		keys = append(keys, Principal{Kind: Public}.key())
+	}
+	if !s.member(tenant) {
+		return keys
+	}
+	keys = append(keys, s.Principal.key())
 	for _, g := range s.Groups {
 		if g != "" {
 			keys = append(keys, Principal{Group, g}.key())
 		}
 	}
-	// Everyone is every user in the tenant, so a subject with no user isn't one of them.
-	if s.User != "" {
-		keys = append(keys, Principal{Kind: Everyone}.key())
+	if broad {
+		keys = append(keys, TenantMembers(tenant).key())
 	}
 	return keys
 }
@@ -130,9 +187,10 @@ func (s Subject) principals() []string {
 // nearest first. The tenant is implied. For the tenant itself, Type is TenantScope and ID is
 // the tenant.
 type Resource struct {
-	Tenant    string
-	Type      string
-	ID        string
+	Tenant string
+	Type   string
+	ID     string
+	// Owner is the id of the user who owns it; other kinds of identity own nothing.
 	Owner     string
 	Ancestors []Scope
 }
@@ -206,8 +264,9 @@ type Binding struct {
 type Grant struct {
 	Scope Scope
 	Binding
-	// CreatedBy and CreatedAt are set on grants read back.
-	CreatedBy string
+	// CreatedBy and CreatedAt are set on grants read back. CreatedBy is zero for a grant Import
+	// stored.
+	CreatedBy Principal
 	CreatedAt time.Time
 }
 
@@ -221,8 +280,9 @@ type Change struct {
 // ChangeEvent is what a committed change did: only the grants that were added, updated or
 // removed.
 type ChangeEvent struct {
-	Tenant  string
-	Actor   string
+	Tenant string
+	// Actor is who made the change through Apply; zero for Import and the deletes.
+	Actor   Principal
 	Granted []Grant
 	Revoked []Grant
 }
@@ -278,10 +338,15 @@ type Config struct {
 	// ContainerTypes are scope types that hold resources, such as a workspace. Any role can
 	// be granted on one, and applies to the resources under it.
 	ContainerTypes []string
-	// ValidatePrincipal returns an error matching ErrInvalid when the user or group doesn't
-	// belong to the tenant; any other error fails the change. q is what the change runs on, so
-	// under WithTx it sees a member added earlier in the transaction. Required: a grant to a
-	// principal outside the tenant must never be stored.
+	// PrincipalKinds are the kinds of identity besides users that act and are granted roles,
+	// such as service accounts. Groups, a tenant's members and the public need no declaring.
+	PrincipalKinds []PrincipalKind
+	// ValidatePrincipal returns an error matching ErrInvalid when a principal can't be granted
+	// roles in the tenant: an identity or group outside it, or the public where the host
+	// doesn't allow public access. It is asked about every principal but the tenant's members;
+	// any other error fails the change. q is what the change runs on, so under WithTx it sees a
+	// member added earlier in the transaction. Required: a grant to a principal outside the
+	// tenant must never be stored.
 	ValidatePrincipal func(ctx context.Context, q DB, tenant string, p Principal) error
 	Constraints       []Constraint
 	// OnChange runs in the transaction of every change but DeleteExpired, whose grants already
@@ -299,6 +364,7 @@ type Authorizer struct {
 	containers map[string]bool
 	// containerTypes are the containers' types, sorted.
 	containerTypes []string
+	kinds          map[PrincipalKind]bool
 }
 
 // New checks the configuration and returns an Authorizer that runs its queries on db.
@@ -328,6 +394,13 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 		}
 		containers[t] = true
 	}
+	kinds := map[PrincipalKind]bool{}
+	for _, k := range cfg.PrincipalKinds {
+		if !validName(string(k)) || slices.Contains([]PrincipalKind{User, Group, Tenant, Public}, k) {
+			return nil, fmt.Errorf("rbac: principal kind %q is not valid", k)
+		}
+		kinds[k] = true
+	}
 	for _, c := range cfg.Constraints {
 		// denied reports a removal by the constraint's name, so one without a name would never deny.
 		if c.Name == "" {
@@ -341,7 +414,7 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 		cfg.Now = time.Now
 	}
 	types := slices.Sorted(maps.Keys(containers))
-	return &Authorizer{db: db, cfg: cfg, roles: roles, containers: containers, containerTypes: types}, nil
+	return &Authorizer{db: db, cfg: cfg, roles: roles, containers: containers, containerTypes: types, kinds: kinds}, nil
 }
 
 // WithTx returns an Authorizer that runs on tx, so its changes commit or roll back with the
@@ -371,4 +444,17 @@ func (a *Authorizer) denied(ctx context.Context, tenant, resourceType string, p 
 func parseScope(key string) Scope {
 	t, id, _ := strings.Cut(key, ":")
 	return Scope{Type: t, ID: id}
+}
+
+func parsePrincipal(key string) Principal {
+	k, id, _ := strings.Cut(key, ":")
+	return Principal{Kind: PrincipalKind(k), ID: id}
+}
+
+// actorKey is who made a grant as created_by stores it: empty for no one, as Import.
+func actorKey(p Principal) string {
+	if p == (Principal{}) {
+		return ""
+	}
+	return p.key()
 }

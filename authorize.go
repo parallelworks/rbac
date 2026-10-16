@@ -50,8 +50,8 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 	if !p.Valid() {
 		return Decision{}, fmt.Errorf("%w: permission %q is not `type:verb`", ErrInvalid, p)
 	}
-	if s.Tenant != r.Tenant {
-		return Decision{Reason: "the resource is in another tenant"}, nil
+	if err := a.subject(s); err != nil {
+		return Decision{}, err
 	}
 	name, err := a.denied(ctx, r.Tenant, r.Type, p)
 	if err != nil {
@@ -60,12 +60,12 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 	if name != "" {
 		return Decision{DeniedBy: name, Reason: "removed by " + name}, nil
 	}
-	if s.User != "" && s.User == r.Owner && a.ownerHolds(r.Type, p) {
+	if s.owns(r) && a.ownerHolds(r.Type, p) {
 		return Decision{Allowed: true, Owner: true}, nil
 	}
 
 	if !explain {
-		held, err := a.heldBindings(ctx, a.db, r.Tenant, s.principalsFor(p), r.path())
+		held, err := a.heldBindings(ctx, a.db, r.Tenant, s.principalsFor(r.Tenant, p), r.path())
 		if err != nil {
 			return Decision{}, err
 		}
@@ -77,7 +77,7 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 		return Decision{Reason: "no grant gives it"}, nil
 	}
 
-	grants, err := a.heldGrants(ctx, a.db, r.Tenant, s.principalsFor(p), r.path())
+	grants, err := a.heldGrants(ctx, a.db, r.Tenant, s.principalsFor(r.Tenant, p), r.path())
 	if err != nil {
 		return Decision{}, err
 	}
@@ -105,17 +105,17 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 	if err := a.check(r); err != nil {
 		return nil, err
 	}
-	if s.Tenant != r.Tenant {
-		return nil, nil
+	if err := a.subject(s); err != nil {
+		return nil, err
 	}
 	var candidates []Permission
-	owner := s.User != "" && s.User == r.Owner
+	owner := s.owns(r)
 	if owner {
 		candidates = slices.DeleteFunc(a.permissionsOn(r.Type), func(p Permission) bool { return !a.ownerHolds(r.Type, p) })
 	}
 	// A container's owner holds its grant permission only through grants.
 	if !owner || a.contains(r.Type) {
-		held, err := a.heldBindings(ctx, a.db, r.Tenant, s.principals(), r.path())
+		held, err := a.heldBindings(ctx, a.db, r.Tenant, s.principals(r.Tenant), r.path())
 		if err != nil {
 			return nil, err
 		}
@@ -144,8 +144,9 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 	return perms, nil
 }
 
-// Holders lists who may do p to r: its owner, and the users, groups and everyone holding a
-// role that gives it there. The AuthZEN subject search; the host expands groups to people.
+// Holders lists who may do p to r: its owner, and every principal holding a role that gives it
+// there, the tenant's members and the public included. The AuthZEN subject search; the host
+// expands groups to their members.
 func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]Principal, error) {
 	if err := a.check(r); err != nil {
 		return nil, err
@@ -168,9 +169,9 @@ func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]P
 	rows, err := a.db.Query(ctx, `
 		SELECT DISTINCT principal_kind, principal_id FROM rbac_grants
 		WHERE tenant = $1 AND scope = ANY($2::text[]) AND role = ANY($3::text[])
-		  AND (expires_at IS NULL OR expires_at > $4) AND (principal_kind <> 'everyone' OR NOT $5)
+		  AND (expires_at IS NULL OR expires_at > $4) AND (NOT $5 OR principal_kind <> ALL($6::text[]))
 		ORDER BY principal_kind, principal_id`,
-		r.Tenant, r.path(), roles, a.cfg.Now(), p.managesAccess())
+		r.Tenant, r.path(), roles, a.cfg.Now(), p.managesAccess(), []string{string(Tenant), string(Public)})
 	if err != nil {
 		return nil, err
 	}
@@ -197,14 +198,14 @@ type Reach struct {
 	Owned bool
 }
 
-// Reachable says where the subject may do p to resources of a type, for hosts that list from
-// a store other than this PostgreSQL. Hosts on the same database use Filter.
-func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, resourceType string) (Reach, error) {
-	roles, removed, err := a.searchable(ctx, s, p, resourceType)
+// Reachable says where the subject may do p to resources of a type in a tenant, for hosts that
+// list from a store other than this PostgreSQL. Hosts on the same database use Filter.
+func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, tenant, resourceType string) (Reach, error) {
+	roles, removed, err := a.searchable(ctx, s, p, tenant, resourceType)
 	if err != nil || removed {
 		return Reach{}, err
 	}
-	reach := Reach{Owned: s.User != "" && a.ownerHolds(resourceType, p)}
+	reach := Reach{Owned: s.user(tenant) != "" && a.ownerHolds(resourceType, p)}
 	if len(roles) == 0 {
 		return reach, nil
 	}
@@ -213,7 +214,7 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, res
 		WHERE tenant = $1 AND principal = ANY($2::text[]) AND role = ANY($3::text[])
 		  AND (expires_at IS NULL OR expires_at > $4) AND split_part(scope, ':', 1) = ANY($5::text[])
 		ORDER BY scope`,
-		s.Tenant, s.principalsFor(p), roles, a.cfg.Now(), a.reaching(resourceType))
+		tenant, s.principalsFor(tenant, p), roles, a.cfg.Now(), a.reaching(resourceType))
 	if err != nil {
 		return Reach{}, err
 	}
@@ -222,7 +223,7 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, res
 		return Reach{}, err
 	}
 	for _, k := range keys {
-		if k == TenantRoot(s.Tenant).Key() {
+		if k == TenantRoot(tenant).Key() {
 			return Reach{All: true, Owned: reach.Owned}, nil
 		}
 		reach.Scopes = append(reach.Scopes, parseScope(k))
@@ -232,14 +233,17 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, res
 
 // searchable returns the roles that give p on a resource type, and whether a constraint
 // removes p there, from owners too.
-func (a *Authorizer) searchable(ctx context.Context, s Subject, p Permission, resourceType string) (roles []string, removed bool, err error) {
-	if s.Tenant == "" || !validName(resourceType) {
+func (a *Authorizer) searchable(ctx context.Context, s Subject, p Permission, tenant, resourceType string) (roles []string, removed bool, err error) {
+	if tenant == "" || !validName(resourceType) {
 		return nil, false, fmt.Errorf("%w: a search needs a tenant and a resource type", ErrInvalid)
 	}
 	if !p.Valid() {
 		return nil, false, fmt.Errorf("%w: permission %q is not `type:verb`", ErrInvalid, p)
 	}
-	name, err := a.denied(ctx, s.Tenant, resourceType, p)
+	if err := a.subject(s); err != nil {
+		return nil, false, err
+	}
+	name, err := a.denied(ctx, tenant, resourceType, p)
 	if err != nil || name != "" {
 		return nil, name != "", err
 	}
@@ -263,44 +267,45 @@ type Predicate struct {
 	Args []any
 }
 
-// Filter returns a condition for the host's own query that keeps the resources of a type the
-// subject may do p to. It reads the grants in the same statement as the rows, so sorting and
-// pagination work and nothing changes between deciding and reading. The host's query must
-// reach this package's tables (they are in the pool's schema), and column names are trusted
-// host code; every value is an argument.
-func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, resourceType string, cols Columns, firstArg int) (Predicate, error) {
+// Filter returns a condition for the host's own query that keeps the resources of a type in a
+// tenant the subject may do p to. It reads the grants in the same statement as the rows, so
+// sorting and pagination work and nothing changes between deciding and reading. The host's
+// query must reach this package's tables (they are in the pool's schema), and column names are
+// trusted host code; every value is an argument.
+func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant, resourceType string, cols Columns, firstArg int) (Predicate, error) {
 	if cols.Tenant == "" || cols.Path == "" || firstArg < 1 {
 		return Predicate{}, fmt.Errorf("%w: Filter needs the tenant and path columns and a first argument", ErrInvalid)
 	}
-	roles, removed, err := a.searchable(ctx, s, p, resourceType)
+	roles, removed, err := a.searchable(ctx, s, p, tenant, resourceType)
 	if err != nil {
 		return Predicate{}, err
 	}
 	granted := len(roles) > 0
-	owner := cols.Owner != "" && s.User != "" && !removed && a.ownerHolds(resourceType, p)
+	user := s.user(tenant)
+	owner := cols.Owner != "" && user != "" && !removed && a.ownerHolds(resourceType, p)
 	if !granted && !owner {
 		return Predicate{SQL: "FALSE"}, nil
 	}
 
 	arg := func(i int) string { return fmt.Sprintf("$%d", firstArg+i) }
-	args := []any{s.Tenant}
+	args := []any{tenant}
 	var ors []string
 	if owner {
 		ors = append(ors, fmt.Sprintf("%s = %s", cols.Owner, arg(len(args))))
-		args = append(args, s.User)
+		args = append(args, user)
 	}
 	if granted {
 		// The grants' tenant is an argument of its own: the host's tenant column needn't be
 		// text, and one argument can't take two types.
-		tenant, principals, rolesArg, now, types := arg(len(args)), arg(len(args)+1), arg(len(args)+2), arg(len(args)+3), arg(len(args)+4)
-		args = append(args, s.Tenant, s.principalsFor(p), roles, a.cfg.Now(), a.reaching(resourceType))
+		tenantArg, principalsArg, rolesArg, nowArg, typesArg := arg(len(args)), arg(len(args)+1), arg(len(args)+2), arg(len(args)+3), arg(len(args)+4)
+		args = append(args, tenant, s.principalsFor(tenant, p), roles, a.cfg.Now(), a.reaching(resourceType))
 		// A tenant-wide grant's scope is the tenant's key, which every path holds, so one
 		// overlap covers every scope and the host's GIN index serves it. The keys take the
 		// default collation so that index applies.
 		ors = append(ors, fmt.Sprintf(`%s && ARRAY(SELECT g.scope COLLATE "default" FROM rbac_grants g
 			WHERE g.tenant = %s::text AND g.principal = ANY(%s::text[]) AND g.role = ANY(%s::text[])
 			  AND (g.expires_at IS NULL OR g.expires_at > %s) AND split_part(g.scope, ':', 1) = ANY(%s::text[]))`,
-			cols.Path, tenant, principals, rolesArg, now, types))
+			cols.Path, tenantArg, principalsArg, rolesArg, nowArg, typesArg))
 	}
 	return Predicate{
 		SQL:  fmt.Sprintf("(%s = %s AND (%s))", cols.Tenant, arg(0), strings.Join(ors, " OR ")),
@@ -324,8 +329,7 @@ func (a *Authorizer) heldBindings(ctx context.Context, q DB, tenant string, prin
 		var principal string
 		var expires *time.Time
 		err := row.Scan(&principal, &b.Role, &expires)
-		kind, id, _ := strings.Cut(principal, ":")
-		b.Principal = Principal{Kind: PrincipalKind(kind), ID: id}
+		b.Principal = parsePrincipal(principal)
 		if expires != nil {
 			b.ExpiresAt = *expires
 		}
@@ -353,11 +357,13 @@ func collectGrants(rows pgx.Rows) ([]Grant, error) {
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Grant, error) {
 		var g Grant
 		var expires *time.Time
+		var createdBy string
 		err := row.Scan(&g.Scope.Type, &g.Scope.ID, &g.Principal.Kind, &g.Principal.ID, &g.Role,
-			&expires, &g.CreatedBy, &g.CreatedAt)
+			&expires, &createdBy, &g.CreatedAt)
 		if expires != nil {
 			g.ExpiresAt = *expires
 		}
+		g.CreatedBy = parsePrincipal(createdBy)
 		return g, err
 	})
 }
