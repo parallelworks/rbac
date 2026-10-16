@@ -77,6 +77,10 @@ type Principal struct {
 
 func (p Principal) key() string { return string(p.Kind) + ":" + p.ID }
 
+// canHold reports whether a grant to p can give perm: a grant to everyone never gives a
+// permission to change grants, whatever its role gives now or later.
+func (p Principal) canHold(perm Permission) bool { return p.Kind != Everyone || !perm.managesAccess() }
+
 func (p Principal) valid() bool {
 	switch p.Kind {
 	case Everyone:
@@ -341,7 +345,9 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 }
 
 // WithTx returns an Authorizer that runs on tx, so its changes commit or roll back with the
-// host's own writes.
+// host's own writes. Their locks last until tx ends, so two transactions that change the same
+// scopes or principals in opposite orders can deadlock, as with any row locks: PostgreSQL fails
+// one, to be retried. DeleteTenant locks the whole tenant.
 func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 	b := *a
 	b.db = tx

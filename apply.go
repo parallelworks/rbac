@@ -72,7 +72,11 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 	}
 	return a.inTx(ctx, on.Tenant, actor.User, func(tx pgx.Tx) (granted, revoked []Grant, err error) {
 		// One change to a scope at a time, so two changes can't deadlock on its rows.
-		if err := lockScopes(ctx, tx, on.Tenant, scope.Key()); err != nil {
+		var principals []string
+		for _, b := range slices.Concat(grants, revokes) {
+			principals = append(principals, b.Principal.key())
+		}
+		if err := lock(ctx, tx, on.Tenant, []string{scope.Key()}, principals); err != nil {
 			return nil, nil, err
 		}
 		// Decided again in the transaction, so the actor's access is read as the change is made.
@@ -87,22 +91,25 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 	})
 }
 
-// Changes take their tenant's lock, shared by changes to some of its scopes, which then lock
-// each scope in order, and held alone by changes across a principal or the whole tenant. So
-// two changes to the same rows run in turn and never deadlock. The locks last until the
-// transaction ends. Advisory locks span the database, so the keys name the schema: another
-// application's grants are in a schema of their own.
+// A change takes its tenant's lock shared, then the lock of each scope and of each principal
+// whose grants it changes, in order; deleting a tenant takes the tenant's lock alone. So two
+// changes to the same rows run in turn, and one call never deadlocks with another. The locks
+// last until the transaction ends. Advisory locks span the database, so the keys name the
+// schema: another application's grants are in a schema of their own.
 const lockKey = `hashtextextended(current_schema() || '/rbac/' || $1, 0)`
 
-// maxScopeLocks is how many scopes an Import locks one by one; a larger one locks the tenant,
-// rather than fill PostgreSQL's lock table.
-const maxScopeLocks = 64
+// maxLocks is how many scopes and principals an Import locks one by one; a larger one locks
+// the tenant, rather than fill PostgreSQL's lock table.
+const maxLocks = 64
 
-func lockScopes(ctx context.Context, tx pgx.Tx, tenant string, scopes ...string) error {
+func lock(ctx context.Context, tx pgx.Tx, tenant string, scopes, principals []string) error {
 	b := &pgx.Batch{}
 	b.Queue(`SELECT pg_advisory_xact_lock_shared(`+lockKey+`)`, "tenant/"+tenant)
-	for _, s := range slices.Sorted(slices.Values(scopes)) {
+	for _, s := range slices.Compact(slices.Sorted(slices.Values(scopes))) {
 		b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, "scope/"+tenant+"/"+s)
+	}
+	for _, p := range slices.Compact(slices.Sorted(slices.Values(principals))) {
+		b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, "principal/"+tenant+"/"+p)
 	}
 	return tx.SendBatch(ctx, b).Close()
 }
@@ -119,6 +126,13 @@ func (a *Authorizer) Import(ctx context.Context, tenant string, grants []Grant) 
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
+	if len(grants) == 0 {
+		return nil
+	}
+	grants = slices.Clone(grants)
+	for i := range grants {
+		grants[i].ExpiresAt = stored(grants[i].ExpiresAt)
+	}
 	var errs []error
 	for _, g := range grants {
 		if !g.Scope.in(tenant) {
@@ -130,16 +144,17 @@ func (a *Authorizer) Import(ctx context.Context, tenant string, grants []Grant) 
 	if err := errors.Join(errs...); err != nil {
 		return err
 	}
-	scopes := map[string]bool{}
+	scopes, principals := map[string]bool{}, map[string]bool{}
 	for _, g := range grants {
 		scopes[g.Scope.Key()] = true
+		principals[g.Principal.key()] = true
 	}
 	return a.inTx(ctx, tenant, "", func(tx pgx.Tx) ([]Grant, []Grant, error) {
 		var err error
-		if len(scopes) > maxScopeLocks {
+		if len(scopes)+len(principals) > maxLocks {
 			err = lockTenant(ctx, tx, tenant)
 		} else {
-			err = lockScopes(ctx, tx, tenant, slices.Collect(maps.Keys(scopes))...)
+			err = lock(ctx, tx, tenant, slices.Collect(maps.Keys(scopes)), slices.Collect(maps.Keys(principals)))
 		}
 		if err != nil {
 			return nil, nil, err
@@ -161,6 +176,7 @@ func dedupe(c Change) (grants, revokes []Binding) {
 		k := id{b.Role, b.Principal}
 		if !granted[k] {
 			granted[k] = true
+			b.ExpiresAt = stored(b.ExpiresAt)
 			grants = append(grants, b)
 		}
 	}
@@ -254,8 +270,7 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 		var until time.Time
 		for _, g := range held {
 			def, known := a.roles[g.Role]
-			if !known || !def.Gives(p) || !slices.ContainsFunc(types, def.GrantableOn) ||
-				g.Principal.Kind == Everyone && p.managesAccess() {
+			if !known || !def.Gives(p) || !slices.ContainsFunc(types, def.GrantableOn) || !g.Principal.canHold(p) {
 				continue
 			}
 			ok = true
@@ -324,6 +339,10 @@ func holdsEach(holds func(Permission, []string) (bool, time.Time), p Permission,
 	}
 	return len(types) > 0, until
 }
+
+// stored is an expiry as PostgreSQL keeps it, to the microsecond, so a grant ending when the
+// actor's own access does compares equal to it rather than nanoseconds later.
+func stored(t time.Time) time.Time { return t.Truncate(time.Microsecond) }
 
 // earliest is the earlier of two ends, where zero is never.
 func earliest(a, b time.Time) time.Time {
@@ -462,12 +481,12 @@ func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) (
 // DeleteScope removes every grant on a scope, as when the resource or container is deleted. It
 // waits for a change to the scope in progress, so a grant that change makes is removed too.
 func (a *Authorizer) DeleteScope(ctx context.Context, tenant string, s Scope) error {
-	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lockScopes(ctx, tx, tenant, s.Key()) }, "scope = $2", s.Key())
+	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, []string{s.Key()}, nil) }, "scope = $2", s.Key())
 }
 
 // DeletePrincipal removes every grant to a user or group, as when it is deleted.
 func (a *Authorizer) DeletePrincipal(ctx context.Context, tenant string, p Principal) error {
-	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lockTenant(ctx, tx, tenant) }, "principal = $2", p.key())
+	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, nil, []string{p.key()}) }, "principal = $2", p.key())
 }
 
 // DeleteTenant removes every grant in a tenant.

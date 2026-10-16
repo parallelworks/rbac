@@ -122,7 +122,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 		for _, b := range held {
 			if def, ok := a.roles[b.Role]; ok && def.GrantableOn(r.Type) {
 				for _, p := range def.Permissions {
-					if b.Principal.Kind != Everyone || !p.managesAccess() {
+					if b.Principal.canHold(p) {
 						candidates = append(candidates, p)
 					}
 				}
@@ -182,12 +182,9 @@ func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]P
 	if err != nil {
 		return nil, err
 	}
-	for _, p := range found {
-		if !slices.Contains(holders, p) {
-			holders = append(holders, p)
-		}
-	}
-	return holders, nil
+	// found is distinct, so only the owner can be listed twice.
+	found = slices.DeleteFunc(found, func(p Principal) bool { return slices.Contains(holders, p) })
+	return append(holders, found...), nil
 }
 
 // Reach is where a subject may do something: every resource of the type in the tenant, or
