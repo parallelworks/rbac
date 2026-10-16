@@ -183,18 +183,25 @@ func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]P
 }
 
 // Reach is where a subject may do something: every resource of the type in the tenant, or
-// those whose Path holds one of Scopes. Resources the subject owns are the host's to add.
+// those whose Path holds one of Scopes.
 type Reach struct {
 	All    bool
 	Scopes []Scope
+	// Owned is whether the resources the subject owns are reachable too, which the host adds.
+	// It is false when a constraint removes the permission, since that binds owners as well.
+	Owned bool
 }
 
 // Reachable says where the subject may do p to resources of a type, for hosts that list from
 // a store other than this PostgreSQL. Hosts on the same database use Filter.
 func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, resourceType string) (Reach, error) {
-	roles, ok, err := a.searchable(ctx, s, p, resourceType)
-	if err != nil || !ok {
+	roles, removed, err := a.searchable(ctx, s, p, resourceType)
+	if err != nil || removed {
 		return Reach{}, err
+	}
+	reach := Reach{Owned: s.User != ""}
+	if len(roles) == 0 {
+		return reach, nil
 	}
 	rows, err := a.db.Query(ctx, `
 		SELECT DISTINCT scope FROM rbac_grants
@@ -209,18 +216,18 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, res
 	if err != nil {
 		return Reach{}, err
 	}
-	var reach Reach
 	for _, k := range keys {
 		if k == TenantRoot(s.Tenant).Key() {
-			return Reach{All: true}, nil
+			return Reach{All: true, Owned: reach.Owned}, nil
 		}
 		reach.Scopes = append(reach.Scopes, parseScope(k))
 	}
 	return reach, nil
 }
 
-// searchable returns the roles that give p on a resource type, or false when nothing can.
-func (a *Authorizer) searchable(ctx context.Context, s Subject, p Permission, resourceType string) ([]string, bool, error) {
+// searchable returns the roles that give p on a resource type, and whether a constraint
+// removes p there, from owners too.
+func (a *Authorizer) searchable(ctx context.Context, s Subject, p Permission, resourceType string) (roles []string, removed bool, err error) {
 	if s.Tenant == "" || !validName(resourceType) {
 		return nil, false, fmt.Errorf("%w: a search needs a tenant and a resource type", ErrInvalid)
 	}
@@ -229,10 +236,9 @@ func (a *Authorizer) searchable(ctx context.Context, s Subject, p Permission, re
 	}
 	name, err := a.denied(ctx, s.Tenant, resourceType, p)
 	if err != nil || name != "" {
-		return nil, false, err
+		return nil, name != "", err
 	}
-	roles := a.giving(p, resourceType)
-	return roles, len(roles) > 0, nil
+	return a.giving(p, resourceType), false, nil
 }
 
 // Columns names the host's columns that Filter reads.
@@ -261,15 +267,12 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, resour
 	if cols.Tenant == "" || cols.Path == "" || firstArg < 1 {
 		return Predicate{}, fmt.Errorf("%w: Filter needs the tenant and path columns and a first argument", ErrInvalid)
 	}
-	roles, granted, err := a.searchable(ctx, s, p, resourceType)
+	roles, removed, err := a.searchable(ctx, s, p, resourceType)
 	if err != nil {
 		return Predicate{}, err
 	}
-	name, err := a.denied(ctx, s.Tenant, resourceType, p)
-	if err != nil {
-		return Predicate{}, err
-	}
-	owner := cols.Owner != "" && s.User != "" && name == ""
+	granted := len(roles) > 0
+	owner := cols.Owner != "" && s.User != "" && !removed
 	if !granted && !owner {
 		return Predicate{SQL: "FALSE"}, nil
 	}
@@ -282,14 +285,16 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, resour
 		args = append(args, s.User)
 	}
 	if granted {
-		principals, rolesArg, now := arg(len(args)), arg(len(args)+1), arg(len(args)+2)
-		args = append(args, s.principals(), roles, a.cfg.Now())
+		// The grants' tenant is an argument of its own: the host's tenant column needn't be
+		// text, and one argument can't take two types.
+		tenant, principals, rolesArg, now := arg(len(args)), arg(len(args)+1), arg(len(args)+2), arg(len(args)+3)
+		args = append(args, s.Tenant, s.principals(), roles, a.cfg.Now())
 		// A tenant-wide grant's scope is the tenant's key, which every path holds, so one
 		// overlap covers every scope and the host's GIN index serves it. The keys take the
 		// default collation so that index applies.
 		ors = append(ors, fmt.Sprintf(`%s && ARRAY(SELECT g.scope COLLATE "default" FROM rbac_grants g
-			WHERE g.tenant = %s AND g.principal = ANY(%s::text[]) AND g.role = ANY(%s::text[])
-			  AND (g.expires_at IS NULL OR g.expires_at > %s))`, cols.Path, arg(0), principals, rolesArg, now))
+			WHERE g.tenant = %s::text AND g.principal = ANY(%s::text[]) AND g.role = ANY(%s::text[])
+			  AND (g.expires_at IS NULL OR g.expires_at > %s))`, cols.Path, tenant, principals, rolesArg, now))
 	}
 	return Predicate{
 		SQL:  fmt.Sprintf("(%s = %s AND (%s))", cols.Tenant, arg(0), strings.Join(ors, " OR ")),

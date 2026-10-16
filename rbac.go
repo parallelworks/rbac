@@ -104,7 +104,11 @@ func (s Subject) principals() []string {
 			keys = append(keys, Principal{Group, g}.key())
 		}
 	}
-	return append(keys, Principal{Kind: Everyone}.key())
+	// Everyone is every user in the tenant, so a subject with no user isn't one of them.
+	if s.User != "" {
+		keys = append(keys, Principal{Kind: Everyone}.key())
+	}
+	return keys
 }
 
 // Resource is what is asked about: its type and id, its owner, and every container above it,
@@ -227,8 +231,9 @@ type Config struct {
 	// ContainerTypes are scope types that hold resources, such as a workspace. Any role can
 	// be granted on one, and applies to the resources under it.
 	ContainerTypes []string
-	// ValidatePrincipal returns an error unless the user or group belongs to the tenant.
-	// Required: a grant to a principal outside the tenant must never be stored.
+	// ValidatePrincipal returns an error matching ErrInvalid when the user or group doesn't
+	// belong to the tenant; any other error fails the change. Required: a grant to a principal
+	// outside the tenant must never be stored.
 	ValidatePrincipal func(ctx context.Context, tenant string, p Principal) error
 	Constraints       []Constraint
 	// OnChange runs in the transaction of every change; an error rolls the change back.
@@ -257,6 +262,13 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The listings read the catalog in order: from the copies, so that a caller changing its
+	// slice after New can't make them disagree with checks.
+	catalog := make([]RoleDefinition, len(cfg.Catalog))
+	for i, r := range cfg.Catalog {
+		catalog[i] = roles[r.ID]
+	}
+	cfg.Catalog = catalog
 	containers := map[string]bool{}
 	for _, t := range cfg.ContainerTypes {
 		if !validName(t) || t == TenantScope {

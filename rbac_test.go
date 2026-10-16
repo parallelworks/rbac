@@ -19,6 +19,8 @@ import (
 
 const urlEnv = "FOUNDATION_TEST_DATABASE_URL"
 
+var errLookup = errors.New("membership lookup failed")
+
 const (
 	view   rbac.Permission = "cluster:view"
 	login  rbac.Permission = "cluster:login"
@@ -60,8 +62,11 @@ func setup(t *testing.T, mutate ...func(*rbac.Config)) *harness {
 		Catalog:        catalog,
 		ContainerTypes: []string{"org", "workspace"},
 		ValidatePrincipal: func(_ context.Context, tenant string, p rbac.Principal) error {
-			if strings.HasPrefix(p.ID, "outsider") {
-				return errors.New("not a member")
+			switch {
+			case strings.HasPrefix(p.ID, "outsider"):
+				return fmt.Errorf("%w: not a member", rbac.ErrInvalid)
+			case p.ID == "unreachable":
+				return errLookup
 			}
 			return nil
 		},
@@ -80,6 +85,15 @@ func setup(t *testing.T, mutate ...func(*rbac.Config)) *harness {
 	}
 	h.authz = authz
 	return h
+}
+
+// constrain configures a constraint that removes p everywhere.
+func constrain(name string, p rbac.Permission) func(*rbac.Config) {
+	return func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: name, Deny: func(_ context.Context, _, _ string, q rbac.Permission) (bool, error) {
+			return q == p, nil
+		}}}
+	}
 }
 
 func (h *harness) seed(t *testing.T, grants ...rbac.Grant) {
@@ -178,11 +192,7 @@ func TestEveryoneAndExpiry(t *testing.T) {
 }
 
 func TestConstraintsBindOwnersAndExplain(t *testing.T) {
-	h := setup(t, func(c *rbac.Config) {
-		c.Constraints = []rbac.Constraint{{Name: "no root", Deny: func(_ context.Context, _, _ string, p rbac.Permission) (bool, error) {
-			return p == root, nil
-		}}}
-	})
+	h := setup(t, constrain("no root", root))
 	h.seed(t, grant(cluster.Scope(), "cluster.sudo", rbac.User, "u"))
 	if allowed(t, h, user("owner"), root, cluster) || allowed(t, h, user("u"), root, cluster) {
 		t.Fatal("a constraint should remove root from the owner and grants alike")
@@ -259,45 +269,89 @@ func TestFilterAndReachableAgreeWithAuthorize(t *testing.T) {
 	)
 	for _, s := range []rbac.Subject{user("u1", "g1"), user("u2"), user("all"), user("owner3"), user("nobody")} {
 		for _, p := range []rbac.Permission{login, root} {
-			pred, err := h.authz.Filter(t.Context(), s, p, "cluster", rbac.Columns{Tenant: "tenant", Owner: "owner", Path: "path"}, 1)
-			if err != nil {
-				t.Fatal(err)
-			}
-			rows, err := h.pool.Query(t.Context(), "SELECT id FROM clusters WHERE "+pred.SQL+" ORDER BY id", pred.Args...)
-			if err != nil {
-				t.Fatalf("%s: %v", pred.SQL, err)
-			}
-			got, err := pgx.CollectRows(rows, pgx.RowTo[string])
-			if err != nil {
-				t.Fatal(err)
-			}
-			var want []string
-			for _, r := range resources {
-				if allowed(t, h, s, p, r) {
-					want = append(want, r.ID)
-				}
-			}
-			if !slices.Equal(got, want) {
-				t.Errorf("%s %s: Filter %v, Authorize %v", s.User, p, got, want)
-			}
-
-			reach, err := h.authz.Reachable(t.Context(), s, p, "cluster")
-			if err != nil {
-				t.Fatal(err)
-			}
-			var reached []string
-			for _, r := range resources {
-				in := reach.All || r.Owner == s.User || slices.ContainsFunc(reach.Scopes, func(sc rbac.Scope) bool {
-					return slices.Contains(r.Path(), sc.Key())
-				})
-				if in {
-					reached = append(reached, r.ID)
-				}
-			}
-			if !slices.Equal(reached, want) {
-				t.Errorf("%s %s: Reachable %v, Authorize %v", s.User, p, reached, want)
-			}
+			listingsAgree(t, h, resources, s, p)
 		}
+	}
+}
+
+func TestListingsApplyConstraintsToOwners(t *testing.T) {
+	h := setup(t, constrain("no root", root))
+	resources := hostTable(t, h)
+	h.seed(t, grant(rbac.Scope{Type: "org", ID: "o2"}, "cluster.sudo", rbac.User, "u2"))
+	for _, s := range []rbac.Subject{user("owner3"), user("u2")} {
+		for _, p := range []rbac.Permission{login, root} {
+			listingsAgree(t, h, resources, s, p)
+		}
+	}
+}
+
+// listingsAgree checks Filter and Reachable against Authorize, resource by resource.
+func listingsAgree(t *testing.T, h *harness, resources []rbac.Resource, s rbac.Subject, p rbac.Permission) {
+	t.Helper()
+	pred, err := h.authz.Filter(t.Context(), s, p, "cluster", rbac.Columns{Tenant: "tenant", Owner: "owner", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := h.pool.Query(t.Context(), "SELECT id FROM clusters WHERE "+pred.SQL+" ORDER BY id", pred.Args...)
+	if err != nil {
+		t.Fatalf("%s: %v", pred.SQL, err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want []string
+	for _, r := range resources {
+		if allowed(t, h, s, p, r) {
+			want = append(want, r.ID)
+		}
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("%s %s: Filter %v, Authorize %v", s.User, p, got, want)
+	}
+
+	reach, err := h.authz.Reachable(t.Context(), s, p, "cluster")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reached []string
+	for _, r := range resources {
+		in := reach.All || (reach.Owned && r.Owner == s.User) || slices.ContainsFunc(reach.Scopes, func(sc rbac.Scope) bool {
+			return slices.Contains(r.Path(), sc.Key())
+		})
+		if in {
+			reached = append(reached, r.ID)
+		}
+	}
+	if !slices.Equal(reached, want) {
+		t.Errorf("%s %s: Reachable %v, Authorize %v", s.User, p, reached, want)
+	}
+}
+
+func TestFilterOnATenantColumnThatIsNotText(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	r := rbac.Resource{Tenant: "6f1c1d0e-8f43-4b8e-9a35-1d2a3f4b5c6d", Type: "cluster", ID: "c"}
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE things (tenant uuid NOT NULL, id text NOT NULL, path text[] NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO things VALUES ($1, $2, $3)`, r.Tenant, r.ID, r.Path()); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.Import(ctx, r.Tenant, []rbac.Grant{grant(r.Scope(), "cluster.login", rbac.User, "u")}); err != nil {
+		t.Fatal(err)
+	}
+	pred, err := h.authz.Filter(ctx, rbac.Subject{Tenant: r.Tenant, User: "u"}, login, "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := h.pool.Query(ctx, "SELECT id FROM things WHERE "+pred.SQL, pred.Args...)
+	if err != nil {
+		t.Fatalf("%s: %v", pred.SQL, err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil || !slices.Equal(got, []string{"c"}) {
+		t.Fatalf("Filter on a uuid tenant column = %v, %v", got, err)
 	}
 }
 
@@ -412,6 +466,61 @@ func TestApplyValidatesEveryBinding(t *testing.T) {
 	}
 }
 
+func TestApplyChecksTheActorBeforePrincipals(t *testing.T) {
+	asked := 0
+	h := setup(t, func(c *rbac.Config) {
+		c.ValidatePrincipal = func(context.Context, string, rbac.Principal) error {
+			asked++
+			return errors.New("not a member")
+		}
+	})
+	b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "someone"}}
+	err := h.authz.Apply(t.Context(), user("nobody"), cluster, rbac.Change{Grant: []rbac.Binding{b}})
+	if !errors.Is(err, rbac.ErrDenied) || errors.Is(err, rbac.ErrInvalid) || asked != 0 {
+		t.Fatalf("a refused actor got %v after %d principal lookups", err, asked)
+	}
+}
+
+func TestApplyRespectsConstraints(t *testing.T) {
+	h := setup(t, constrain("managed elsewhere", grantC))
+	h.seed(t, grant(cluster.Scope(), "cluster.admin", rbac.User, "admin"))
+	b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}
+	for _, actor := range []string{"admin", "owner"} {
+		if err := h.authz.Apply(t.Context(), user(actor), cluster, rbac.Change{Grant: []rbac.Binding{b}}); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("%s changed access that a constraint removes: %v", actor, err)
+		}
+	}
+}
+
+func TestImportKeepsTheLastOfRepeatedGrants(t *testing.T) {
+	h := setup(t)
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	later := g
+	later.ExpiresAt = h.now.Add(time.Hour)
+	h.seed(t, g, later)
+	got, err := h.authz.Grants(t.Context(), "t1", rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}})
+	if err != nil || len(got) != 1 || !got[0].ExpiresAt.Equal(later.ExpiresAt) {
+		t.Fatalf("Grants = %+v, %v", got, err)
+	}
+}
+
+func TestNewCopiesTheCatalog(t *testing.T) {
+	roles := slices.Clone(catalog)
+	h := setup(t, func(c *rbac.Config) { c.Catalog = roles })
+	roles[2].Permissions = append(slices.Clone(roles[2].Permissions), root)
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	reach, err := h.authz.Reachable(t.Context(), user("u"), root, "cluster")
+	if err != nil || len(reach.Scopes) != 0 {
+		t.Fatalf("changing the catalog after New reached %+v, %v", reach, err)
+	}
+	if got := h.authz.Roles("cluster"); len(got) != 3 || slices.Contains(got[2].Permissions, root) {
+		t.Fatalf("Roles(cluster) = %+v", got)
+	}
+	if got := h.authz.Roles("workspace"); len(got) != len(catalog) {
+		t.Fatalf("every role can be granted on a container, Roles(workspace) = %d", len(got))
+	}
+}
+
 func TestApplyIsIdempotentAndReportsOnlyChanges(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -514,5 +623,41 @@ func TestMigrateIsRepeatable(t *testing.T) {
 	h := setup(t)
 	if err := rbac.Migrate(t.Context(), h.pool, nil); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestContainerOwnersCantGrantBelowThem(t *testing.T) {
+	h := setup(t)
+	owned := workspace
+	owned.Owner = "ws-owner"
+	if !allowed(t, h, user("ws-owner"), "workspace:view", owned) {
+		t.Fatal("an owner holds every permission on what they own")
+	}
+	self := rbac.Binding{Role: "cluster.admin", Principal: rbac.Principal{Kind: rbac.User, ID: "ws-owner"}}
+	if err := h.authz.Apply(t.Context(), user("ws-owner"), owned, rbac.Change{Grant: []rbac.Binding{self}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("owning a workspace mustn't grant the clusters in it: %v", err)
+	}
+	if allowed(t, h, user("ws-owner"), root, cluster) {
+		t.Fatal("the workspace's owner gained root on a cluster in it")
+	}
+}
+
+func TestAFailedPrincipalLookupFailsTheChange(t *testing.T) {
+	h := setup(t)
+	b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "unreachable"}}
+	err := h.authz.Apply(t.Context(), user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{b}})
+	if !errors.Is(err, errLookup) || errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a lookup failure should fail the change as it is, not as invalid input: %v", err)
+	}
+}
+
+func TestEveryoneIsOnlyUsers(t *testing.T) {
+	h := setup(t)
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.Everyone, ""))
+	if allowed(t, h, rbac.Subject{Tenant: "t1", Groups: []string{"service"}}, login, cluster) {
+		t.Fatal("a subject with no user isn't one of everyone")
+	}
+	if !allowed(t, h, user("u"), login, cluster) {
+		t.Fatal("a user is one of everyone")
 	}
 }
