@@ -35,8 +35,8 @@ func (e *InvalidError) Is(target error) bool { return target == ErrInvalid }
 //     needn't hold their permissions;
 //   - through any other role, the actor may grant a role only by holding everything it gives
 //     there, for every type the grant reaches, and may revoke any. A role's power to change
-//     grants is part of what it gives: one with GrantableRoles needs the power to grant each,
-//     and one without, the unlimited power to change grants on its type;
+//     grants is part of what it gives: one with GrantableRoles needs the power to grant each
+//     its holders could, and one without, the unlimited power to change grants on its type;
 //   - a role that gives a `:grant` permission can't be granted to a tenant's members or the
 //     public, and only a role marked Public can be granted to the public.
 //
@@ -114,6 +114,7 @@ const maxLocks = 64
 
 func lock(ctx context.Context, tx pgx.Tx, tenant string, scopes, principals []string) error {
 	b := &pgx.Batch{}
+	b.Queue(`SELECT current_setting('transaction_isolation')`)
 	b.Queue(`SELECT pg_advisory_xact_lock_shared(`+lockKey+`)`, "tenant/"+tenant)
 	for _, s := range slices.Compact(slices.Sorted(slices.Values(scopes))) {
 		b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, "scope/"+tenant+"/"+s)
@@ -121,12 +122,32 @@ func lock(ctx context.Context, tx pgx.Tx, tenant string, scopes, principals []st
 	for _, p := range slices.Compact(slices.Sorted(slices.Values(principals))) {
 		b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, "principal/"+tenant+"/"+p)
 	}
-	return tx.SendBatch(ctx, b).Close()
+	return locked(tx.SendBatch(ctx, b))
 }
 
 func lockTenant(ctx context.Context, tx pgx.Tx, tenant string) error {
-	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(`+lockKey+`)`, "tenant/"+tenant)
-	return err
+	b := &pgx.Batch{}
+	b.Queue(`SELECT current_setting('transaction_isolation')`)
+	b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, "tenant/"+tenant)
+	return locked(tx.SendBatch(ctx, b))
+}
+
+// locked reads a lock batch, whose first query is the transaction's isolation, and refuses a
+// change stricter than READ COMMITTED: its snapshot can predate the locks, so its checks could
+// read grants as they were before a change the locks waited for.
+func locked(br pgx.BatchResults) error {
+	var level string
+	if err := br.QueryRow().Scan(&level); err != nil {
+		_ = br.Close()
+		return err
+	}
+	if err := br.Close(); err != nil {
+		return err
+	}
+	if level != "read committed" {
+		return fmt.Errorf("rbac: a change runs at READ COMMITTED, not %s", strings.ToUpper(level))
+	}
+	return nil
 }
 
 // Import stores grants without the actor checks Apply makes, for migrations, seeding and the
@@ -320,7 +341,8 @@ func (au authority) holds(p Permission, resourceType string) bool {
 
 // mayGrant reports whether the actor may grant def on a scope of a type, and if not, a
 // permission it lacks: its power there lists def, or lets it grant any role and it holds
-// everything def gives. seen is holdsRole's, fresh for each grant decided.
+// everything def gives. seen is holdsRole's: fresh for each grant decided, or what grants
+// already allowed proved.
 func (a *Authorizer) mayGrant(au authority, scopeType string, def RoleDefinition, seen map[string]bool) (Permission, bool) {
 	pw := au.over(scopeType)
 	if pw.listed[def.ID] {
@@ -356,7 +378,9 @@ func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string,
 	seen[key] = true
 	for _, p := range def.Permissions {
 		t, verb := p.parts()
-		if verb != "grant" {
+		// Where the grant doesn't reach scopes of t, its t:grant changes no grants there: it is a
+		// permission like any other.
+		if verb != "grant" || !slices.Contains(types, t) {
 			for _, rt := range types {
 				if !au.holds(p, rt) {
 					return p, false
@@ -441,11 +465,16 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 		return nil, err
 	}
 	var roles []RoleDefinition
+	// Everything checked for a role the actor may grant holds, so later roles needn't check it
+	// again. A refused role's checks are dropped: some passed only while it was in progress.
+	proven := map[string]bool{}
 	for _, def := range a.cfg.Catalog {
 		if !a.grantableOn(def, r.Type) {
 			continue
 		}
-		if _, ok := a.mayGrant(au, r.Type, def, map[string]bool{}); ok {
+		seen := maps.Clone(proven)
+		if _, ok := a.mayGrant(au, r.Type, def, seen); ok {
+			proven = seen
 			roles = append(roles, def.clone())
 		}
 	}
@@ -471,11 +500,16 @@ func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, f
 		if err != nil {
 			return err
 		}
-		if a.cfg.OnChange == nil || len(granted)+len(revoked) == 0 {
-			return nil
-		}
-		return a.cfg.OnChange(ctx, tx, ChangeEvent{Tenant: tenant, Actor: actor, Granted: granted, Revoked: revoked})
+		return a.report(ctx, tx, ChangeEvent{Tenant: tenant, Actor: actor, Granted: granted, Revoked: revoked})
 	})
+}
+
+// report hands a change to Config.OnChange in its transaction, unless it changed nothing.
+func (a *Authorizer) report(ctx context.Context, tx pgx.Tx, e ChangeEvent) error {
+	if a.cfg.OnChange == nil || len(e.Granted)+len(e.Revoked) == 0 {
+		return nil
+	}
+	return a.cfg.OnChange(ctx, tx, e)
 }
 
 // upsert stores grants in one statement, sorted so concurrent changes lock rows in the same
@@ -625,7 +659,14 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, p Principal)
 			n = len(tenants)
 			// In tenant order, so two of these for one principal never deadlock.
 			for _, t := range tenants {
-				if err := a.WithTx(tx).DeletePrincipal(ctx, t, p); err != nil {
+				if err := lock(ctx, tx, t, nil, []string{p.key()}); err != nil {
+					return err
+				}
+				revoked, err := a.remove(ctx, tx, t, "principal = $2", p.key())
+				if err != nil {
+					return err
+				}
+				if err := a.report(ctx, tx, ChangeEvent{Tenant: t, Revoked: revoked}); err != nil {
 					return err
 				}
 			}
@@ -646,24 +687,29 @@ func (a *Authorizer) delete(ctx context.Context, tenant string, lock func(pgx.Tx
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
-	query := `DELETE FROM rbac_grants WHERE tenant = $1 AND ` + where
-	args = append([]any{tenant}, args...)
 	return a.inTx(ctx, tenant, Principal{}, func(tx pgx.Tx) ([]Grant, []Grant, error) {
 		if err := lock(tx); err != nil {
 			return nil, nil, err
 		}
-		// Only OnChange reads what was removed, which for a whole tenant can be every grant it has.
-		if a.cfg.OnChange == nil {
-			_, err := tx.Exec(ctx, query, args...)
-			return nil, nil, err
-		}
-		rows, err := tx.Query(ctx, query+` RETURNING `+grantColumns, args...)
-		if err != nil {
-			return nil, nil, err
-		}
-		revoked, err := collectGrants(rows)
+		revoked, err := a.remove(ctx, tx, tenant, where, args...)
 		return nil, revoked, err
 	})
+}
+
+// remove deletes the grants in a tenant that where picks, and returns them for OnChange.
+func (a *Authorizer) remove(ctx context.Context, tx pgx.Tx, tenant, where string, args ...any) ([]Grant, error) {
+	query := `DELETE FROM rbac_grants WHERE tenant = $1 AND ` + where
+	args = append([]any{tenant}, args...)
+	// Only OnChange reads what was removed, which for a whole tenant can be every grant it has.
+	if a.cfg.OnChange == nil {
+		_, err := tx.Exec(ctx, query, args...)
+		return nil, err
+	}
+	rows, err := tx.Query(ctx, query+` RETURNING `+grantColumns, args...)
+	if err != nil {
+		return nil, err
+	}
+	return collectGrants(rows)
 }
 
 // DeleteExpired removes grants that have expired, which no longer give anything, and returns

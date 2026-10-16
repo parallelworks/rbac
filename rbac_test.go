@@ -1556,6 +1556,22 @@ func TestRolesListingEachOtherAreDecidedOnce(t *testing.T) {
 	}
 }
 
+func TestGrantableDropsWhatARefusedRolesChecksAssumed(t *testing.T) {
+	// Deciding first passes second only while first is being checked, then fails on root.
+	first := rbac.RoleDefinition{ID: "cluster.first", Permissions: []rbac.Permission{view, grantC, root}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.second"}}
+	second := rbac.RoleDefinition{ID: "cluster.second", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.first"}}
+	share := rbac.RoleDefinition{ID: "cluster.share", Permissions: []rbac.Permission{view, login, grantC}, ResourceTypes: []string{"cluster"}}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), first, second, share) })
+	h.seed(t, grant(cluster.Scope(), "cluster.share", rbac.User, "sharer"))
+	got, err := h.authz.Grantable(t.Context(), user("sharer"), cluster)
+	if err != nil || slices.ContainsFunc(got, func(r rbac.RoleDefinition) bool { return r.ID == "cluster.second" }) {
+		t.Fatalf("Grantable offers a role whose holders could grant root: %v, %v", got, err)
+	}
+	if !slices.ContainsFunc(got, func(r rbac.RoleDefinition) bool { return r.ID == "cluster.share" }) {
+		t.Fatalf("Grantable = %v", got)
+	}
+}
+
 func TestDeletePrincipalEverywhereAcrossManyTenants(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -1575,5 +1591,45 @@ func TestDeletePrincipalEverywhereAcrossManyTenants(t *testing.T) {
 	}
 	if len(h.events) != tenants {
 		t.Fatalf("%d changes, want one per tenant", len(h.events))
+	}
+}
+
+func TestChangesNeedReadCommitted(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}
+	tx, err := h.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	authz := h.authz.WithTx(tx)
+	for name, change := range map[string]func() error{
+		"Apply":       func() error { return authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{b}}) },
+		"Import":      func() error { return authz.Import(ctx, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: b}}) },
+		"DeleteScope": func() error { return authz.DeleteScope(ctx, "t1", cluster.Scope()) },
+	} {
+		if err := change(); err == nil || !strings.Contains(err.Error(), "READ COMMITTED") {
+			t.Errorf("%s in a REPEATABLE READ transaction: %v", name, err)
+		}
+	}
+}
+
+func TestAGrantPermissionIsAPowerOnlyWhereTheGrantReachesItsType(t *testing.T) {
+	both := rbac.RoleDefinition{ID: "both", Permissions: []rbac.Permission{view, grantC, "workspace:grant"}, ResourceTypes: []string{"cluster", "workspace"}}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), both) })
+	ctx := t.Context()
+	h.seed(t,
+		grant(workspace.Scope(), "workspace.admin", rbac.User, "owner"),
+		grant(cluster.Scope(), "both", rbac.User, "holder"),
+	)
+	b := rbac.Binding{Role: "both", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}}
+	// On a cluster, workspace:grant changes no grants: the grantee holds it there as a plain
+	// permission, which the owner, who holds it only for workspaces, doesn't.
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("granting a plain permission the actor holds only for another type: %v", err)
+	}
+	if err := h.authz.Apply(ctx, user("holder"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
+		t.Fatalf("granting a role the actor holds on the same cluster: %v", err)
 	}
 }
