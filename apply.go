@@ -29,17 +29,16 @@ func (e *InvalidError) Is(target error) bool { return target == ErrInvalid }
 // Apply changes the grants on one scope, on, in one transaction, as actor:
 //
 //   - the actor needs `<on's type>:grant` there (through on, an ancestor or the tenant), and no
-//     constraint may remove it. The owner of a resource needs no grant, but the owner of a
-//     container doesn't count: a grant there reaches resources they don't own;
-//   - to grant a role, the actor must hold every permission it gives there, or own the
-//     resource;
-//   - a grant the actor makes expires no later than the actor's own access it rests on;
+//     constraint may remove it;
+//   - through a role with GrantableRoles, the actor may grant and revoke only those roles, and
+//     needn't hold their permissions;
+//   - through any other role, the actor may grant a role only by holding every permission it
+//     gives there, for every type the grant reaches, and may revoke any;
 //   - a role that gives a `:grant` permission can't be granted to a tenant's members or the
-//     public, and only a role marked Public can be granted to the public;
-//   - revoking needs only `<on's type>:grant`.
+//     public, and only a role marked Public can be granted to the public.
 //
-// The actor is a member of the scope's tenant: anonymous subjects and other tenants' members
-// change nothing.
+// Anonymous subjects change nothing. A grant outlives the actor's own access: revoking that
+// access leaves the grants the actor made, as in cloud IAM.
 //
 // Bindings are checked only once the actor may make the change, so a refused actor learns
 // nothing about principals. Every invalid binding is reported at once, joined; an error from
@@ -59,8 +58,8 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 		return nil
 	}
 	manage := GrantPermission(scope.Type)
-	if !actor.member(on.Tenant) {
-		return &DeniedError{Permission: manage, Scope: scope, Reason: "the actor isn't a member of the scope's tenant"}
+	if actor.Principal == (Principal{}) {
+		return &DeniedError{Permission: manage, Scope: scope, Reason: "an anonymous subject changes nothing"}
 	}
 	// The hooks run outside the transaction: one that queries the pool while the transaction
 	// holds a connection can wait forever on a busy pool.
@@ -71,7 +70,7 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 	if name != "" {
 		return &DeniedError{Permission: manage, Scope: scope, Reason: "removed by " + name}
 	}
-	if err := a.mayChange(ctx, a.db, actor, on, grants); err != nil {
+	if err := a.mayChange(ctx, a.db, actor, on, grants, revokes); err != nil {
 		return err
 	}
 	if err := a.validate(ctx, on.Tenant, scope, grants, revokes); err != nil {
@@ -87,7 +86,7 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 			return nil, nil, err
 		}
 		// Decided again in the transaction, so the actor's access is read as the change is made.
-		if err := a.mayChange(ctx, tx, actor, on, grants); err != nil {
+		if err := a.mayChange(ctx, tx, actor, on, grants, revokes); err != nil {
 			return nil, nil, err
 		}
 		if revoked, err = a.revoke(ctx, tx, on.Tenant, scope, revokes); err != nil {
@@ -127,8 +126,9 @@ func lockTenant(ctx context.Context, tx pgx.Tx, tenant string) error {
 }
 
 // Import stores grants without the actor checks Apply makes, for migrations, seeding and the
-// host's own grants, such as a role for whoever creates a container. Each grant is still
-// validated, except that principals aren't asked about.
+// host's own grants: give whoever creates a resource or container a role on it, in the same
+// transaction through WithTx. Each grant is still validated, except that principals aren't
+// asked about.
 func (a *Authorizer) Import(ctx context.Context, tenant string, grants []Grant) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -266,108 +266,132 @@ func (a *Authorizer) checkBinding(tenant string, scope Scope, b Binding, now tim
 	return errs
 }
 
+// authority is what an actor's grants let it change on a scope.
+type authority struct {
+	// any is whether it may grant any role whose permissions it holds, and revoke any.
+	any bool
+	// listed are the roles it may grant and revoke without holding them.
+	listed map[Role]bool
+	held   []Binding
+}
+
+func (au authority) none() bool { return !au.any && len(au.listed) == 0 }
+
+// authorityOn reads the actor's grants on a resource's path and what they let it change there.
+func (a *Authorizer) authorityOn(ctx context.Context, q DB, actor Subject, on Resource) (authority, error) {
+	held, err := a.heldBindings(ctx, q, on.Tenant, actor.principals(on.Tenant), on.path())
+	if err != nil {
+		return authority{}, err
+	}
+	au := authority{listed: map[Role]bool{}, held: held}
+	manage := GrantPermission(on.Type)
+	for _, g := range held {
+		def, known := a.roles[g.Role]
+		if !known || !def.Gives(manage) || !def.GrantableOn(on.Type) || !g.Principal.carries(def, manage) {
+			continue
+		}
+		if len(def.GrantableRoles) == 0 {
+			au.any = true
+		}
+		for _, r := range def.GrantableRoles {
+			au.listed[r] = true
+		}
+	}
+	return au, nil
+}
+
+// missing reports whether the actor may grant def on scopeType, and if not, a permission it
+// lacks.
+func (a *Authorizer) missing(au authority, scopeType string, def RoleDefinition) (Permission, bool) {
+	if au.listed[def.ID] {
+		return "", true
+	}
+	if !au.any {
+		return GrantPermission(scopeType), false
+	}
+	// On a container or the tenant the grant reaches every type the role is for, so the actor
+	// must hold each permission for each of them; on a resource, for its own type.
+	types := []string{scopeType}
+	if a.contains(scopeType) {
+		types = def.ResourceTypes
+	}
+	for _, p := range def.Permissions {
+		for _, t := range types {
+			if !slices.ContainsFunc(au.held, func(g Binding) bool {
+				held, known := a.roles[g.Role]
+				return known && held.Gives(p) && held.GrantableOn(t) && g.Principal.carries(held, p)
+			}) {
+				return p, false
+			}
+		}
+	}
+	return "", true
+}
+
 // mayChange checks the actor's own access on the scope against the change, once Apply has
 // checked the constraints.
-func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Resource, grants []Binding) error {
+func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Resource, grants, revokes []Binding) error {
 	scope := on.Scope()
 	manage := GrantPermission(scope.Type)
-	if actor.owns(on) && a.ownerHolds(scope.Type, manage) {
-		return nil
-	}
-	held, err := a.heldBindings(ctx, q, on.Tenant, actor.principals(on.Tenant), on.path())
+	au, err := a.authorityOn(ctx, q, actor, on)
 	if err != nil {
 		return err
 	}
-	// holds reports whether the actor holds p for one of types, and until when (zero: always).
-	holds := func(p Permission, types []string) (bool, time.Time) {
-		ok, forever := false, false
-		var until time.Time
-		for _, g := range held {
-			def, known := a.roles[g.Role]
-			if !known || !def.Gives(p) || !slices.ContainsFunc(types, def.GrantableOn) || !g.Principal.carries(def, p) {
-				continue
-			}
-			ok = true
-			if g.ExpiresAt.IsZero() {
-				forever = true
-			} else if g.ExpiresAt.After(until) {
-				until = g.ExpiresAt
-			}
-		}
-		if forever {
-			until = time.Time{}
-		}
-		return ok, until
-	}
-
-	ok, limit := holds(manage, []string{scope.Type})
-	if !ok {
+	if au.none() {
 		return &DeniedError{Permission: manage, Scope: scope, Reason: "the actor may not change access here"}
 	}
 	var errs []error
-bindings:
+	for _, b := range revokes {
+		if !au.any && !au.listed[b.Role] {
+			errs = append(errs, &DeniedError{Permission: manage, Scope: scope, Reason: fmt.Sprintf("the actor may not revoke %s here", b.Role)})
+		}
+	}
 	for _, b := range grants {
 		def, known := a.roles[b.Role]
 		if !known || !a.grantableOn(def, scope.Type) {
 			// validate reports it as invalid rather than as an escalation.
 			continue
 		}
-		until := limit
-		for _, p := range def.Permissions {
-			// On a container or the tenant the grant reaches every type the role is for, so the
-			// actor must hold p for each of them; on a resource, for its own type.
-			types := []string{scope.Type}
-			if a.contains(scope.Type) {
-				types = def.ResourceTypes
+		if p, ok := a.missing(au, scope.Type, def); !ok {
+			reason := fmt.Sprintf("the actor can't grant %s without holding %s here", b.Role, p)
+			if !au.any {
+				reason = fmt.Sprintf("the actor may not grant %s here", b.Role)
 			}
-			ok, end := holdsEach(holds, p, types)
-			if !ok {
-				errs = append(errs, &DeniedError{
-					Permission: p, Scope: scope,
-					Reason: fmt.Sprintf("the actor can't grant %s without holding %s here", b.Role, p),
-				})
-				continue bindings
-			}
-			until = earliest(until, end)
-		}
-		if !until.IsZero() && (b.ExpiresAt.IsZero() || b.ExpiresAt.After(until)) {
-			errs = append(errs, &DeniedError{
-				Permission: manage, Scope: scope,
-				Reason: fmt.Sprintf("a grant of %s must expire by %s, when the actor's own access does", b.Role, until.UTC().Format(time.RFC3339)),
-			})
+			errs = append(errs, &DeniedError{Permission: p, Scope: scope, Reason: reason})
 		}
 	}
 	return errors.Join(errs...)
 }
 
-// holdsEach reports whether holds is true for p on every one of types, and until the earliest
-// of their ends.
-func holdsEach(holds func(Permission, []string) (bool, time.Time), p Permission, types []string) (bool, time.Time) {
-	var until time.Time
-	for _, t := range types {
-		ok, end := holds(p, []string{t})
-		if !ok {
-			return false, time.Time{}
+// Grantable lists the roles the subject may grant on r, in catalog order, for an access screen
+// to offer.
+func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]RoleDefinition, error) {
+	if err := a.check(r); err != nil {
+		return nil, err
+	}
+	if err := a.subject(s); err != nil {
+		return nil, err
+	}
+	name, err := a.denied(ctx, r.Tenant, r.Type, GrantPermission(r.Type))
+	if err != nil || name != "" {
+		return nil, err
+	}
+	au, err := a.authorityOn(ctx, a.db, s, r)
+	if err != nil || au.none() {
+		return nil, err
+	}
+	var roles []RoleDefinition
+	for _, def := range a.cfg.Catalog {
+		if _, ok := a.missing(au, r.Type, def); ok && a.grantableOn(def, r.Type) {
+			roles = append(roles, def.clone())
 		}
-		until = earliest(until, end)
 	}
-	return len(types) > 0, until
+	return roles, nil
 }
 
-// stored is an expiry as PostgreSQL keeps it, to the microsecond, so a grant ending when the
-// actor's own access does compares equal to it rather than nanoseconds later.
+// stored is an expiry as PostgreSQL keeps it, to the microsecond, so a change reports the
+// expiry it stored.
 func stored(t time.Time) time.Time { return t.Truncate(time.Microsecond) }
-
-// earliest is the earlier of two ends, where zero is never.
-func earliest(a, b time.Time) time.Time {
-	switch {
-	case a.IsZero():
-		return b
-	case b.IsZero() || a.Before(b):
-		return a
-	}
-	return b
-}
 
 func scopeGrants(scope Scope, bindings []Binding) []Grant {
 	grants := make([]Grant, len(bindings))
@@ -509,6 +533,32 @@ func (a *Authorizer) DeletePrincipal(ctx context.Context, tenant string, p Princ
 		return fmt.Errorf("%w: principal %q is not valid", ErrInvalid, p.key())
 	}
 	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, nil, []string{p.key()}) }, "principal = $2", p.key())
+}
+
+// DeletePrincipalEverywhere removes every grant to an identity or group in every tenant, as
+// when it is deleted. Delete it from the host first, so Config.ValidatePrincipal refuses new
+// grants to it. Each tenant's removals reach Config.OnChange as a change of their own.
+func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, p Principal) error {
+	if p.broad() || !p.wellFormed("") {
+		return fmt.Errorf("%w: principal %q is not an identity or group", ErrInvalid, p.key())
+	}
+	return pgx.BeginFunc(ctx, a.db, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT DISTINCT tenant FROM rbac_grants WHERE principal = $1 ORDER BY tenant`, p.key())
+		if err != nil {
+			return err
+		}
+		tenants, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return err
+		}
+		// In tenant order, so two of these for one principal never deadlock.
+		for _, t := range tenants {
+			if err := a.WithTx(tx).DeletePrincipal(ctx, t, p); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // DeleteTenant removes every grant in a tenant.

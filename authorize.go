@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -13,9 +12,6 @@ import (
 // Decision is why a check came out as it did.
 type Decision struct {
 	Allowed bool
-	// Owner is set when the subject owns the resource, which gives every permission a role gives
-	// on its type but changing the grants on a container or the tenant.
-	Owner bool
 	// Grants are the subject's grants that give the permission.
 	Grants []Grant
 	// DeniedBy names the constraint that removed the permission.
@@ -37,8 +33,8 @@ func (a *Authorizer) Authorize(ctx context.Context, s Subject, p Permission, r R
 	return nil
 }
 
-// Explain decides as Authorize does and says why: the grants that give the permission,
-// ownership, or what denied it.
+// Explain decides as Authorize does and says why: the grants that give the permission, or what
+// denied it.
 func (a *Authorizer) Explain(ctx context.Context, s Subject, p Permission, r Resource) (Decision, error) {
 	return a.decide(ctx, s, p, r, true)
 }
@@ -59,9 +55,6 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 	}
 	if name != "" {
 		return Decision{DeniedBy: name, Reason: "removed by " + name}, nil
-	}
-	if s.owns(r) && a.ownerHolds(r.Type, p) {
-		return Decision{Allowed: true, Owner: true}, nil
 	}
 
 	principals := s.principalsFor(r.Tenant, p, len(a.publicRoles(a.giving(p, r.Type))) > 0)
@@ -109,23 +102,16 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 	if err := a.subject(s); err != nil {
 		return nil, err
 	}
-	var candidates []Permission
-	owner := s.owns(r)
-	if owner {
-		candidates = slices.DeleteFunc(a.permissionsOn(r.Type), func(p Permission) bool { return !a.ownerHolds(r.Type, p) })
+	held, err := a.heldBindings(ctx, a.db, r.Tenant, s.principals(r.Tenant), r.path())
+	if err != nil {
+		return nil, err
 	}
-	// A container's owner holds its grant permission only through grants.
-	if !owner || a.contains(r.Type) {
-		held, err := a.heldBindings(ctx, a.db, r.Tenant, s.principals(r.Tenant), r.path())
-		if err != nil {
-			return nil, err
-		}
-		for _, b := range held {
-			if def, ok := a.roles[b.Role]; ok && def.GrantableOn(r.Type) {
-				for _, p := range def.Permissions {
-					if b.Principal.carries(def, p) {
-						candidates = append(candidates, p)
-					}
+	var candidates []Permission
+	for _, b := range held {
+		if def, ok := a.roles[b.Role]; ok && def.GrantableOn(r.Type) {
+			for _, p := range def.Permissions {
+				if b.Principal.carries(def, p) {
+					candidates = append(candidates, p)
 				}
 			}
 		}
@@ -145,9 +131,8 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 	return perms, nil
 }
 
-// Holders lists who may do p to r: its owner, and every principal holding a role that gives it
-// there, the tenant's members and the public included. The AuthZEN subject search; the host
-// expands groups to their members.
+// Holders lists every principal holding a role that gives p on r, the tenant's members and the
+// public included. The AuthZEN subject search; the host expands groups to their members.
 func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]Principal, error) {
 	if err := a.check(r); err != nil {
 		return nil, err
@@ -159,13 +144,9 @@ func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]P
 	if err != nil || name != "" {
 		return nil, err
 	}
-	var holders []Principal
-	if r.Owner != "" && a.ownerHolds(r.Type, p) {
-		holders = append(holders, Principal{Kind: User, ID: r.Owner})
-	}
 	roles := a.giving(p, r.Type)
 	if len(roles) == 0 {
-		return holders, nil
+		return nil, nil
 	}
 	rows, err := a.db.Query(ctx, `
 		SELECT DISTINCT principal_kind, principal_id FROM rbac_grants
@@ -186,10 +167,8 @@ func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]P
 	if err != nil {
 		return nil, err
 	}
-	// found is distinct, so only the owner can be listed twice. A kind the host no longer
-	// declares can't act, so its grants give nothing.
-	found = slices.DeleteFunc(found, func(p Principal) bool { return !a.known(r.Tenant, p) || slices.Contains(holders, p) })
-	return append(holders, found...), nil
+	// A kind the host no longer declares can't act, so its grants give nothing.
+	return slices.DeleteFunc(found, func(p Principal) bool { return !a.known(r.Tenant, p) }), nil
 }
 
 // Reach is where a subject may do something: every resource of the type in the tenant, or
@@ -197,9 +176,6 @@ func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]P
 type Reach struct {
 	All    bool
 	Scopes []Scope
-	// Owned is whether the resources the subject owns are reachable too, which the host adds.
-	// It is false when a constraint removes the permission, since that binds owners as well.
-	Owned bool
 }
 
 // Reachable says where the subject may do p to resources of a type in a tenant, for hosts that
@@ -209,11 +185,10 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 	if err != nil || removed {
 		return Reach{}, err
 	}
-	reach := Reach{Owned: s.user(tenant) != "" && a.ownerHolds(resourceType, p)}
 	publicRoles := a.publicRoles(roles)
 	principals := s.principalsFor(tenant, p, len(publicRoles) > 0)
 	if len(roles) == 0 || len(principals) == 0 {
-		return reach, nil
+		return Reach{}, nil
 	}
 	rows, err := a.db.Query(ctx, `
 		SELECT DISTINCT scope FROM rbac_grants
@@ -229,9 +204,10 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 	if err != nil {
 		return Reach{}, err
 	}
+	var reach Reach
 	for _, k := range keys {
 		if k == TenantRoot(tenant).Key() {
-			return Reach{All: true, Owned: reach.Owned}, nil
+			return Reach{All: true}, nil
 		}
 		reach.Scopes = append(reach.Scopes, parseScope(k))
 	}
@@ -239,7 +215,7 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 }
 
 // searchable returns the roles that give p on a resource type, and whether a constraint
-// removes p there, from owners too.
+// removes p there.
 func (a *Authorizer) searchable(ctx context.Context, s Subject, p Permission, tenant, resourceType string) (roles []string, removed bool, err error) {
 	if tenant == "" || !validName(resourceType) {
 		return nil, false, fmt.Errorf("%w: a search needs a tenant and a resource type", ErrInvalid)
@@ -261,8 +237,6 @@ func (a *Authorizer) searchable(ctx context.Context, s Subject, p Permission, te
 type Columns struct {
 	// Tenant is the resource's tenant.
 	Tenant string
-	// Owner is the resource's owner; empty when resources have none.
-	Owner string
 	// Path is a text[] holding the resource's Authorizer.Path, with a GIN index.
 	Path string
 }
@@ -283,44 +257,27 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	if cols.Tenant == "" || cols.Path == "" || firstArg < 1 {
 		return Predicate{}, fmt.Errorf("%w: Filter needs the tenant and path columns and a first argument", ErrInvalid)
 	}
-	roles, removed, err := a.searchable(ctx, s, p, tenant, resourceType)
+	roles, _, err := a.searchable(ctx, s, p, tenant, resourceType)
 	if err != nil {
 		return Predicate{}, err
 	}
 	publicRoles := a.publicRoles(roles)
 	principals := s.principalsFor(tenant, p, len(publicRoles) > 0)
-	granted := len(roles) > 0 && len(principals) > 0
-	user := s.user(tenant)
-	owner := cols.Owner != "" && user != "" && !removed && a.ownerHolds(resourceType, p)
-	if !granted && !owner {
+	if len(roles) == 0 || len(principals) == 0 {
 		return Predicate{SQL: "FALSE"}, nil
 	}
-
 	arg := func(i int) string { return fmt.Sprintf("$%d", firstArg+i) }
-	args := []any{tenant}
-	var ors []string
-	if owner {
-		ors = append(ors, fmt.Sprintf("%s = %s", cols.Owner, arg(len(args))))
-		args = append(args, user)
-	}
-	if granted {
-		// The grants' tenant is an argument of its own: the host's tenant column needn't be
-		// text, and one argument can't take two types.
-		tenantArg, principalsArg, rolesArg, nowArg, typesArg := arg(len(args)), arg(len(args)+1), arg(len(args)+2), arg(len(args)+3), arg(len(args)+4)
-		publicArg, publicRolesArg := arg(len(args)+5), arg(len(args)+6)
-		args = append(args, tenant, principals, roles, a.cfg.Now(), a.reaching(resourceType), publicKey, publicRoles)
-		// A tenant-wide grant's scope is the tenant's key, which every path holds, so one
-		// overlap covers every scope and the host's GIN index serves it. The keys take the
-		// default collation so that index applies.
-		ors = append(ors, fmt.Sprintf(`%s && ARRAY(SELECT g.scope COLLATE "default" FROM rbac_grants g
+	// The grants' tenant is an argument of its own: the host's tenant column needn't be text,
+	// and one argument can't take two types. A tenant-wide grant's scope is the tenant's key,
+	// which every path holds, so one overlap covers every scope and the host's GIN index serves
+	// it. The keys take the default collation so that index applies.
+	return Predicate{
+		SQL: fmt.Sprintf(`(%s = %s AND %s && ARRAY(SELECT g.scope COLLATE "default" FROM rbac_grants g
 			WHERE g.tenant = %s::text AND g.principal = ANY(%s::text[]) AND g.role = ANY(%s::text[])
 			  AND (g.expires_at IS NULL OR g.expires_at > %s) AND split_part(g.scope, ':', 1) = ANY(%s::text[])
-			  AND (g.principal <> %s::text OR g.role = ANY(%s::text[])))`,
-			cols.Path, tenantArg, principalsArg, rolesArg, nowArg, typesArg, publicArg, publicRolesArg))
-	}
-	return Predicate{
-		SQL:  fmt.Sprintf("(%s = %s AND (%s))", cols.Tenant, arg(0), strings.Join(ors, " OR ")),
-		Args: args,
+			  AND (g.principal <> %s::text OR g.role = ANY(%s::text[]))))`,
+			cols.Tenant, arg(0), cols.Path, arg(1), arg(2), arg(3), arg(4), arg(5), arg(6), arg(7)),
+		Args: []any{tenant, tenant, principals, roles, a.cfg.Now(), a.reaching(resourceType), publicKey, publicRoles},
 	}, nil
 }
 

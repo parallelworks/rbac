@@ -23,6 +23,11 @@ type RoleDefinition struct {
 	// or one that changes access can't be. A grant to the public gives nothing once its role
 	// is no longer Public.
 	Public bool
+	// GrantableRoles, when set, are the only roles the role's `:grant` permissions let its
+	// holders grant and revoke, and they need not hold those roles' permissions, so a role can
+	// hand out narrower ones. When empty, its holders may grant any role whose permissions they
+	// hold, and revoke any.
+	GrantableRoles []Role
 }
 
 // Gives reports whether the role gives p.
@@ -36,6 +41,7 @@ func (r RoleDefinition) GrantableOn(resourceType string) bool {
 func (r RoleDefinition) clone() RoleDefinition {
 	r.Permissions = slices.Clone(r.Permissions)
 	r.ResourceTypes = slices.Clone(r.ResourceTypes)
+	r.GrantableRoles = slices.Clone(r.GrantableRoles)
 	return r
 }
 
@@ -100,7 +106,17 @@ func index(catalog []RoleDefinition) (map[Role]RoleDefinition, error) {
 		if r.Public && (r.Privileged || r.managesAccess()) {
 			bad("a privileged role or one that changes access can't be public")
 		}
+		if len(r.GrantableRoles) > 0 && !r.managesAccess() {
+			bad("lists grantable roles but gives no `:grant` permission")
+		}
 		roles[r.ID] = r.clone()
+	}
+	for _, r := range catalog {
+		for _, g := range r.GrantableRoles {
+			if _, ok := roles[g]; !ok {
+				errs = append(errs, fmt.Errorf("rbac: role %q: grantable role %q is not in the catalog", r.ID, g))
+			}
+		}
 	}
 	if len(errs) > 0 {
 		return nil, errors.Join(errs...)
@@ -143,18 +159,6 @@ func (a *Authorizer) contains(scopeType string) bool {
 	return scopeType == TenantScope || a.containers[scopeType]
 }
 
-// ownerHolds reports whether owning a resource of a type gives p: every permission a role
-// gives on the type, except changing the grants on a container or the tenant, which reach
-// what its owner doesn't own.
-func (a *Authorizer) ownerHolds(resourceType string, p Permission) bool {
-	if a.contains(resourceType) && p == GrantPermission(resourceType) {
-		return false
-	}
-	return slices.ContainsFunc(a.cfg.Catalog, func(r RoleDefinition) bool {
-		return r.GrantableOn(resourceType) && r.Gives(p)
-	})
-}
-
 // grantableOn reports whether a role can be granted on a scope type: one of its own resource
 // types, a container type, or the tenant.
 func (a *Authorizer) grantableOn(r RoleDefinition, scopeType string) bool {
@@ -170,21 +174,4 @@ func (a *Authorizer) giving(p Permission, resourceType string) []string {
 		}
 	}
 	return ids
-}
-
-// permissionsOn lists every permission some role gives on a resource type: what its owner
-// holds.
-func (a *Authorizer) permissionsOn(resourceType string) []Permission {
-	var all []Permission
-	for _, r := range a.cfg.Catalog {
-		if !r.GrantableOn(resourceType) {
-			continue
-		}
-		for _, p := range r.Permissions {
-			if !slices.Contains(all, p) {
-				all = append(all, p)
-			}
-		}
-	}
-	return all
 }
