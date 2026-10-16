@@ -39,7 +39,7 @@ func (e *InvalidError) Is(target error) bool { return target == ErrInvalid }
 // Bindings are checked only once the actor may make the change, so a refused actor learns
 // nothing about principals. Every invalid binding is reported at once, joined; an error from
 // Config.ValidatePrincipal that isn't ErrInvalid fails the change as it is. Constraints and
-// Config.ValidatePrincipal run before the transaction, so they may use the same pool;
+// Config.ValidatePrincipal run before the transaction, on what the Authorizer runs on;
 // Config.OnChange runs in it with the grants that changed.
 func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Change) error {
 	if err := a.check(on); err != nil {
@@ -86,8 +86,9 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 	})
 }
 
-// Import stores grants without the actor checks Apply makes, for migrations and seeding. Each
-// grant is still validated, except that principals aren't asked about.
+// Import stores grants without the actor checks Apply makes, for migrations, seeding and the
+// host's own grants, such as a role for whoever creates a container. Each grant is still
+// validated, except that principals aren't asked about.
 func (a *Authorizer) Import(ctx context.Context, tenant string, grants []Grant) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -142,7 +143,7 @@ func (a *Authorizer) validate(ctx context.Context, tenant string, scope Scope, g
 	for _, b := range grants {
 		bad := a.checkBinding(scope, b, now)
 		if len(bad) == 0 && b.Principal.Kind != Everyone {
-			if err := a.cfg.ValidatePrincipal(ctx, tenant, b.Principal); err != nil {
+			if err := a.cfg.ValidatePrincipal(ctx, a.db, tenant, b.Principal); err != nil {
 				if !errors.Is(err, ErrInvalid) {
 					return err
 				}
@@ -224,7 +225,7 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 bindings:
 	for _, b := range grants {
 		def, known := a.roles[b.Role]
-		if !known {
+		if !known || !a.grantableOn(def, scope.Type) {
 			// validate reports it as invalid rather than as an escalation.
 			continue
 		}
@@ -236,7 +237,7 @@ bindings:
 			if a.contains(scope.Type) {
 				types = def.ResourceTypes
 			}
-			ok, held := holdsEach(holds, p, types)
+			ok, end := holdsEach(holds, p, types)
 			if !ok {
 				errs = append(errs, &DeniedError{
 					Permission: p, Scope: scope,
@@ -244,7 +245,7 @@ bindings:
 				})
 				continue bindings
 			}
-			until = earliest(until, held)
+			until = earliest(until, end)
 		}
 		if !until.IsZero() && (b.ExpiresAt.IsZero() || b.ExpiresAt.After(until)) {
 			errs = append(errs, &DeniedError{
@@ -261,11 +262,11 @@ bindings:
 func holdsEach(holds func(Permission, []string) (bool, time.Time), p Permission, types []string) (bool, time.Time) {
 	var until time.Time
 	for _, t := range types {
-		ok, held := holds(p, []string{t})
+		ok, end := holds(p, []string{t})
 		if !ok {
 			return false, time.Time{}
 		}
-		until = earliest(until, held)
+		until = earliest(until, end)
 	}
 	return len(types) > 0, until
 }

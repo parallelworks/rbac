@@ -202,10 +202,12 @@ type ChangeEvent struct {
 }
 
 // Constraint removes a permission on a type of resource in a tenant, for everyone, owners
-// included, such as a policy forbidding root access.
+// included, such as a policy forbidding root access. On `<type>:grant` it stops changes on
+// scopes of that type, not grants on a container that reach the type.
 type Constraint struct {
 	Name string
-	Deny func(ctx context.Context, tenant, resourceType string, p Permission) (bool, error)
+	// Deny gets q, what the call runs on, to read the host's policy in the same transaction.
+	Deny func(ctx context.Context, q DB, tenant, resourceType string, p Permission) (bool, error)
 }
 
 var (
@@ -231,7 +233,8 @@ func (e *DeniedError) Error() string {
 // Is makes a DeniedError match ErrDenied.
 func (e *DeniedError) Is(target error) bool { return target == ErrDenied }
 
-// DB is what the package runs its queries on: a *pgxpool.Pool, a *pgx.Conn or a pgx.Tx.
+// DB is what the package runs its queries on, and hands to the hooks: a *pgxpool.Pool, a
+// *pgx.Conn or a pgx.Tx.
 type DB interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
@@ -247,9 +250,10 @@ type Config struct {
 	// be granted on one, and applies to the resources under it.
 	ContainerTypes []string
 	// ValidatePrincipal returns an error matching ErrInvalid when the user or group doesn't
-	// belong to the tenant; any other error fails the change. Required: a grant to a principal
-	// outside the tenant must never be stored.
-	ValidatePrincipal func(ctx context.Context, tenant string, p Principal) error
+	// belong to the tenant; any other error fails the change. q is what the change runs on, so
+	// under WithTx it sees a member added earlier in the transaction. Required: a grant to a
+	// principal outside the tenant must never be stored.
+	ValidatePrincipal func(ctx context.Context, q DB, tenant string, p Principal) error
 	Constraints       []Constraint
 	// OnChange runs in the transaction of every change; an error rolls the change back.
 	OnChange func(ctx context.Context, tx pgx.Tx, e ChangeEvent) error
@@ -293,6 +297,10 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 		containers[t] = true
 	}
 	for _, c := range cfg.Constraints {
+		// denied reports a removal by the constraint's name, so one without a name would never deny.
+		if c.Name == "" {
+			return nil, errors.New("rbac: a constraint has no Name")
+		}
 		if c.Deny == nil {
 			return nil, fmt.Errorf("rbac: constraint %q has no Deny", c.Name)
 		}
@@ -314,7 +322,7 @@ func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 // denied returns the name of the first constraint that removes the permission, or "".
 func (a *Authorizer) denied(ctx context.Context, tenant, resourceType string, p Permission) (string, error) {
 	for _, c := range a.cfg.Constraints {
-		deny, err := c.Deny(ctx, tenant, resourceType, p)
+		deny, err := c.Deny(ctx, a.db, tenant, resourceType, p)
 		if err != nil {
 			return "", err
 		}

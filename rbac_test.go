@@ -62,7 +62,7 @@ func setup(t *testing.T, mutate ...func(*rbac.Config)) *harness {
 	cfg := rbac.Config{
 		Catalog:        catalog,
 		ContainerTypes: []string{"org", "workspace"},
-		ValidatePrincipal: func(_ context.Context, tenant string, p rbac.Principal) error {
+		ValidatePrincipal: func(_ context.Context, _ rbac.DB, tenant string, p rbac.Principal) error {
 			switch {
 			case strings.HasPrefix(p.ID, "outsider"):
 				return fmt.Errorf("%w: not a member", rbac.ErrInvalid)
@@ -91,7 +91,7 @@ func setup(t *testing.T, mutate ...func(*rbac.Config)) *harness {
 // constrain configures a constraint that removes p everywhere.
 func constrain(name string, p rbac.Permission) func(*rbac.Config) {
 	return func(c *rbac.Config) {
-		c.Constraints = []rbac.Constraint{{Name: name, Deny: func(_ context.Context, _, _ string, q rbac.Permission) (bool, error) {
+		c.Constraints = []rbac.Constraint{{Name: name, Deny: func(_ context.Context, _ rbac.DB, _, _ string, q rbac.Permission) (bool, error) {
 			return q == p, nil
 		}}}
 	}
@@ -122,13 +122,16 @@ func allowed(t *testing.T, h *harness, s rbac.Subject, p rbac.Permission, r rbac
 }
 
 func TestNewRejectsBadConfiguration(t *testing.T) {
-	ok := func(context.Context, string, rbac.Principal) error { return nil }
+	ok := func(context.Context, rbac.DB, string, rbac.Principal) error { return nil }
 	for name, cfg := range map[string]rbac.Config{
 		"no principal check": {Catalog: catalog},
 		"duplicate role":     {Catalog: append(slices.Clone(catalog), catalog[0]), ValidatePrincipal: ok},
 		"bad permission":     {Catalog: []rbac.RoleDefinition{{ID: "r", Permissions: []rbac.Permission{"login"}, ResourceTypes: []string{"cluster"}}}, ValidatePrincipal: ok},
 		"no permissions":     {Catalog: []rbac.RoleDefinition{{ID: "r", ResourceTypes: []string{"cluster"}}}, ValidatePrincipal: ok},
 		"bad container":      {Catalog: catalog, ContainerTypes: []string{"tenant"}, ValidatePrincipal: ok},
+		"unnamed constraint": {Catalog: catalog, ValidatePrincipal: ok, Constraints: []rbac.Constraint{{
+			Deny: func(context.Context, rbac.DB, string, string, rbac.Permission) (bool, error) { return true, nil },
+		}}},
 	} {
 		if _, err := rbac.New(&pgxpool.Pool{}, cfg); err == nil {
 			t.Errorf("%s: New accepted it", name)
@@ -467,10 +470,20 @@ func TestApplyValidatesEveryBinding(t *testing.T) {
 	}
 }
 
+func TestApplyReportsARoleTheScopeCantTakeAsInvalid(t *testing.T) {
+	h := setup(t)
+	h.seed(t, grant(cluster.Scope(), "cluster.admin", rbac.User, "admin"))
+	b := rbac.Binding{Role: "workspace.admin", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}
+	err := h.authz.Apply(t.Context(), user("admin"), cluster, rbac.Change{Grant: []rbac.Binding{b}})
+	if !errors.Is(err, rbac.ErrInvalid) || errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("a role a cluster can't take: %v", err)
+	}
+}
+
 func TestApplyChecksTheActorBeforePrincipals(t *testing.T) {
 	asked := 0
 	h := setup(t, func(c *rbac.Config) {
-		c.ValidatePrincipal = func(context.Context, string, rbac.Principal) error {
+		c.ValidatePrincipal = func(context.Context, rbac.DB, string, rbac.Principal) error {
 			asked++
 			return errors.New("not a member")
 		}
@@ -582,6 +595,37 @@ func TestWithTxCommitsWithTheHost(t *testing.T) {
 	}
 }
 
+func TestHooksSeeTheHostsTransaction(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.ValidatePrincipal = func(ctx context.Context, q rbac.DB, _ string, p rbac.Principal) error {
+			var member bool
+			if err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM members WHERE id = $1)`, p.ID).Scan(&member); err != nil {
+				return err
+			}
+			if !member {
+				return rbac.ErrInvalid
+			}
+			return nil
+		}
+	})
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE members (id text PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `INSERT INTO members VALUES ('new')`); err != nil {
+		t.Fatal(err)
+	}
+	b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "new"}}
+	if err := h.authz.WithTx(tx).Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
+		t.Fatalf("granting a member added earlier in the transaction: %v", err)
+	}
+}
+
 func TestGrantsAndDeletes(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -676,8 +720,8 @@ func TestHooksCanUseTheBusyPool(t *testing.T) {
 	authz, err := rbac.New(pool, rbac.Config{
 		Catalog:           catalog,
 		ContainerTypes:    []string{"org", "workspace"},
-		ValidatePrincipal: func(ctx context.Context, _ string, _ rbac.Principal) error { return query(ctx) },
-		Constraints: []rbac.Constraint{{Name: "lookup", Deny: func(ctx context.Context, _, _ string, _ rbac.Permission) (bool, error) {
+		ValidatePrincipal: func(ctx context.Context, _ rbac.DB, _ string, _ rbac.Principal) error { return query(ctx) },
+		Constraints: []rbac.Constraint{{Name: "lookup", Deny: func(ctx context.Context, _ rbac.DB, _, _ string, _ rbac.Permission) (bool, error) {
 			return false, query(ctx)
 		}}},
 	})

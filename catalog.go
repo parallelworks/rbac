@@ -131,7 +131,9 @@ func (a *Authorizer) ownerHolds(resourceType string, p Permission) bool {
 	if a.contains(resourceType) && p == GrantPermission(resourceType) {
 		return false
 	}
-	return slices.Contains(a.permissionsOn(resourceType), p)
+	return slices.ContainsFunc(a.cfg.Catalog, func(r RoleDefinition) bool {
+		return r.GrantableOn(resourceType) && r.Gives(p)
+	})
 }
 
 // grantableOn reports whether a role can be granted on a scope type: one of its own resource
