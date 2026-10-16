@@ -62,9 +62,12 @@ func validName(s string) bool { return typeName.MatchString(s) }
 // underscores.
 func (p Permission) Valid() bool { return permissionName.MatchString(string(p)) }
 
-// managesAccess reports whether p is a permission to change access: grants, or the roles they
-// give.
-func (p Permission) managesAccess() bool { return p.changesGrants() || p == DefineRoles }
+// managesAccess reports whether p is a permission to change access: grants, the roles they
+// give, or the denies above them.
+func (p Permission) managesAccess() bool {
+	_, verb := p.parts()
+	return p.changesGrants() || p == DefineRoles || verb == "deny"
+}
 
 // changesGrants reports whether p is `<type>:grant`, the only permission GrantableRoles limit.
 func (p Permission) changesGrants() bool {

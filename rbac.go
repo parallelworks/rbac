@@ -9,8 +9,9 @@
 // [Subject] is an identity, the groups it is in and the tenants it is a member of, or no one,
 // and a [Resource] carries its ancestors. The package keeps the grants, decides
 // ([Authorizer.Authorize]), lists ([Authorizer.Filter], [Authorizer.Reachable]) and changes
-// grants with escalation checks ([Authorizer.Apply]). Nothing is owned: a host gives whoever
-// creates a resource a role on it ([Authorizer.Import]).
+// grants with escalation checks ([Authorizer.Apply]), under deny policies above every grant
+// ([Authorizer.SetDeny]). Nothing is owned: a host gives whoever creates a resource a role on
+// it ([Authorizer.Import]).
 //
 // A check reads the grants as they are: only compiled conditions are cached. Read a resource's
 // ancestors and attributes and a subject's groups no earlier than the content they protect.
@@ -315,10 +316,13 @@ type ChangeEvent struct {
 	// Roles are custom roles created or replaced, as they are now.
 	Roles        []RoleDefinition
 	DeletedRoles []Role
+	// Denies are deny policies created or replaced, as they are now.
+	Denies        []Deny
+	DeletedDenies []Deny
 }
 
 func (e ChangeEvent) empty() bool {
-	return len(e.Granted)+len(e.Revoked)+len(e.Roles)+len(e.DeletedRoles) == 0
+	return len(e.Granted)+len(e.Revoked)+len(e.Roles)+len(e.DeletedRoles)+len(e.Denies)+len(e.DeletedDenies) == 0
 }
 
 // Constraint removes a permission on a type of resource in a tenant, for everyone, such as a
