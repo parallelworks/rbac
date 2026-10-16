@@ -85,6 +85,8 @@ func TenantMembers(tenant string) Principal { return Principal{Kind: Tenant, ID:
 
 func (p Principal) key() string { return string(p.Kind) + ":" + p.ID }
 
+var publicKey = Principal{Kind: Public}.key()
+
 // broad reports whether p is principals nobody named one by one: a tenant's members or the
 // public.
 func (p Principal) broad() bool { return p.Kind == Tenant || p.Kind == Public }
@@ -115,11 +117,11 @@ func (a *Authorizer) acts(k PrincipalKind) bool { return k == User || a.kinds[k]
 // carries reports whether a grant of a role to p can give perm, whatever the role gives now or
 // later: a grant to a tenant's members or the public never gives a permission to change grants,
 // and one to the public gives only while its role is marked Public.
-func (a *Authorizer) carries(p Principal, role Role, perm Permission) bool {
+func (p Principal) carries(role RoleDefinition, perm Permission) bool {
 	if p.broad() && perm.managesAccess() {
 		return false
 	}
-	return p.Kind != Public || a.roles[role].Public
+	return p.Kind != Public || role.Public
 }
 
 // publicRoles keeps the roles marked Public, the only ones a grant to the public gives.
@@ -172,18 +174,20 @@ func (s Subject) owns(r Resource) bool { return r.Owner != "" && s.user(r.Tenant
 
 // principalsFor is the keys of the subject's principals whose grants in a tenant can give p: a
 // grant to a tenant's members or the public never gives a permission to change grants,
-// whatever its role gives now or later.
-func (s Subject) principalsFor(tenant string, p Permission) []string {
-	return s.keys(tenant, !p.managesAccess())
+// whatever its role gives now or later. public is whether a role marked Public gives p, the
+// only way a grant to the public can, so a subject outside the tenant reads no grants without
+// one.
+func (s Subject) principalsFor(tenant string, p Permission, public bool) []string {
+	return s.keys(tenant, public && !p.managesAccess(), !p.managesAccess())
 }
 
 // principals is the keys of every principal the subject is in a tenant.
-func (s Subject) principals(tenant string) []string { return s.keys(tenant, true) }
+func (s Subject) principals(tenant string) []string { return s.keys(tenant, true, true) }
 
-func (s Subject) keys(tenant string, broad bool) []string {
+func (s Subject) keys(tenant string, public, members bool) []string {
 	var keys []string
-	if broad {
-		keys = append(keys, Principal{Kind: Public}.key())
+	if public {
+		keys = append(keys, publicKey)
 	}
 	if !s.member(tenant) {
 		return keys
@@ -194,7 +198,7 @@ func (s Subject) keys(tenant string, broad bool) []string {
 			keys = append(keys, Principal{Group, g}.key())
 		}
 	}
-	if broad {
+	if members {
 		keys = append(keys, TenantMembers(tenant).key())
 	}
 	return keys

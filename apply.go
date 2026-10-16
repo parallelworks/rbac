@@ -284,7 +284,7 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 		var until time.Time
 		for _, g := range held {
 			def, known := a.roles[g.Role]
-			if !known || !def.Gives(p) || !slices.ContainsFunc(types, def.GrantableOn) || !a.carries(g.Principal, g.Role, p) {
+			if !known || !def.Gives(p) || !slices.ContainsFunc(types, def.GrantableOn) || !g.Principal.carries(def, p) {
 				continue
 			}
 			ok = true
@@ -459,7 +459,11 @@ type GrantFilter struct {
 }
 
 // Grants lists the grants in force that match the filter: who has access to a resource and
-// through which ancestor, or what a principal holds (RBAC's assigned roles).
+// through which ancestor, or what a principal holds (RBAC's assigned roles). It lists them as
+// stored, so they can be revoked, even those that give less than their role or nothing: one to
+// a tenant's members or the public gives no `:grant` permission, and one of a role no longer in
+// the catalog, to a kind no longer declared, or to the public of a role no longer Public gives
+// nothing.
 func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) ([]Grant, error) {
 	if tenant == "" || len(f.Scopes)+len(f.Principals) == 0 {
 		return nil, fmt.Errorf("%w: Grants needs a tenant and scopes or principals", ErrInvalid)
