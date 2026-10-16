@@ -1473,3 +1473,48 @@ func TestIdentitiesFromOtherTenants(t *testing.T) {
 		}
 	}
 }
+
+func TestGrantingARoleNeedsItsPowerToChangeGrants(t *testing.T) {
+	share := rbac.RoleDefinition{ID: "cluster.share", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}}
+	helpdesk := rbac.RoleDefinition{ID: "cluster.helpdesk", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.sudo"}}
+	access := rbac.RoleDefinition{ID: "cluster.access", Permissions: []rbac.Permission{view, login, root, grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.login"}}
+	relay := rbac.RoleDefinition{ID: "cluster.relay", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.relay", "cluster.login"}}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), share, helpdesk, access, relay) })
+	ctx := t.Context()
+	h.seed(t,
+		grant(cluster.Scope(), "cluster.share", rbac.User, "sharer"),
+		grant(cluster.Scope(), "cluster.login", rbac.User, "sharer"),
+		grant(workspace.Scope(), "workspace.admin", rbac.User, "m"),
+		grant(workspace.Scope(), "cluster.access", rbac.User, "m"),
+	)
+	self := func(id string, role rbac.Role) rbac.Change {
+		return rbac.Change{Grant: []rbac.Binding{{Role: role, Principal: rbac.Principal{Kind: rbac.User, ID: id}}}}
+	}
+
+	// Holding what a role lists isn't holding what its holders may grant through it.
+	if err := h.authz.Apply(ctx, user("sharer"), cluster, self("sharer", "cluster.helpdesk")); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("granting a role that lets its holders grant sudo, without root: %v", err)
+	}
+	// A grant permission limited to some roles isn't the unlimited one a role without a list gives.
+	if err := h.authz.Apply(ctx, user("m"), workspace, self("m", "cluster.admin")); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("turning a limited grant permission into an unlimited one: %v", err)
+	}
+	creator := rbac.Binding{Role: "cluster.admin", Principal: rbac.Principal{Kind: rbac.User, ID: "owner"}}
+	if err := h.authz.Apply(ctx, user("m"), cluster, rbac.Change{Revoke: []rbac.Binding{creator}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("a limited manager revoking a role it doesn't list: %v", err)
+	}
+	// A role listing itself and roles the actor may grant needs nothing more: its holders pass
+	// on only what it gives.
+	if err := h.authz.Apply(ctx, user("sharer"), cluster, self("x", "cluster.relay")); err != nil {
+		t.Fatalf("granting a role that lists itself: %v", err)
+	}
+	if err := h.authz.Apply(ctx, user("x"), cluster, self("y", "cluster.relay")); err != nil {
+		t.Fatalf("a holder passing the role on: %v", err)
+	}
+	if err := h.authz.Apply(ctx, user("x"), cluster, self("y", "cluster.sudo")); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("a holder granting a role it doesn't list: %v", err)
+	}
+	if got, err := h.authz.Grantable(ctx, user("sharer"), cluster); err != nil || slices.ContainsFunc(got, func(r rbac.RoleDefinition) bool { return r.ID == "cluster.helpdesk" }) {
+		t.Fatalf("Grantable offers a role whose listed roles the actor can't grant: %v, %v", got, err)
+	}
+}
