@@ -37,8 +37,8 @@ func (e *InvalidError) Is(target error) bool { return target == ErrInvalid }
 //     there, for every type the grant reaches, and may revoke any. A role's power to change
 //     grants is part of what it gives: one with GrantableRoles needs the power to grant each
 //     its holders could, and one without, the unlimited power to change grants on its type;
-//   - a role that gives a `:grant` permission can't be granted to a tenant's members or the
-//     public, and only a role marked Public can be granted to the public.
+//   - a role that gives a `:grant` permission or DefineRoles can't be granted to a tenant's
+//     members or the public, and only a role marked Public can be granted to the public.
 //
 // Anonymous subjects change nothing. A grant outlives the actor's own access: revoking that
 // access leaves the grants the actor made, as in cloud IAM, so a time-limited power to change

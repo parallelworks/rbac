@@ -19,6 +19,8 @@ const CustomPrefix = "custom."
 const (
 	maxCustomRoles    = 300
 	maxGrantableRoles = 64
+	maxName           = 128
+	maxDescription    = 2048
 )
 
 // DefineRoles is the permission to create, replace and delete a tenant's custom roles, held on
@@ -108,18 +110,35 @@ func collectRoles(rows pgx.Rows) ([]RoleDefinition, error) {
 	})
 }
 
+// publicSQL names the array arguments that Authorizer.publicArgs fills.
+type publicSQL struct{ perms, types, pairs string }
+
 // givingSQL is SQL for the ids of the roles that give perm on a resource type in a tenant: the
 // built-in ones in the array argument builtin, and with custom the tenant's custom ones, read in
-// the same statement. With public, only roles marked Public.
-func givingSQL(builtin, tenant, perm, resourceType string, public, custom bool) string {
+// the same statement. With public, only custom roles public as Authorizer.current reads them:
+// marked Public, and of the permissions and types the catalog has, giving each only where a role
+// that isn't privileged gives it, so a catalog change reaches searches as it reaches checks.
+func givingSQL(builtin, tenant, perm, resourceType string, custom bool, public *publicSQL) string {
 	only := ""
-	if public {
-		only = " AND cr.public"
+	if public != nil {
+		only = fmt.Sprintf(` AND cr.public AND NOT EXISTS (SELECT FROM unnest(cr.permissions) cp, unnest(cr.resource_types) ct
+		WHERE cp = ANY(%s::text[]) AND ct = ANY(%s::text[]) AND cp || ' ' || ct <> ALL(%s::text[]))`, public.perms, public.types, public.pairs)
 	}
 	// Without custom the subquery stays, constant false, so the statement's arguments are the
 	// same and PostgreSQL plans it away.
 	return fmt.Sprintf(`(%s::text[] || ARRAY(SELECT cr.id FROM rbac_roles cr WHERE %t AND cr.tenant = %s::text
 		AND %s::text = ANY(cr.permissions) AND %s::text = ANY(cr.resource_types)%s))`, builtin, custom, tenant, perm, resourceType, only)
+}
+
+// publicArgs are the arguments of givingSQL's public check: the catalog's permissions, its types
+// and the pairs of them publicGives. They are NULL where the check can't matter, so a search
+// doesn't send them: with no custom role in it, or where no grant to the public gives p, as
+// Filter and Reachable then read none and Holders drops the public.
+func (a *Authorizer) publicArgs(p Permission, resourceType string, custom bool) []any {
+	if !custom || !a.publicGives(p, resourceType) {
+		return []any{nil, nil, nil}
+	}
+	return []any{a.catalogPermissions, a.catalogTypes, a.unprivilegedPairs}
 }
 
 // checkCustom returns why a custom role's definition is malformed: its id, and permissions and
@@ -151,6 +170,9 @@ func (a *Authorizer) checkCustom(r RoleDefinition) error {
 	if len(r.GrantableRoles) > maxGrantableRoles {
 		errs = append(errs, fmt.Errorf("lists more than %d grantable roles", maxGrantableRoles))
 	}
+	if len(r.Name) > maxName || len(r.Description) > maxDescription {
+		errs = append(errs, fmt.Errorf("a name is at most %d bytes and a description %d", maxName, maxDescription))
+	}
 	if len(errs) > 0 {
 		return fmt.Errorf("%w: role %q: %w", ErrInvalid, r.ID, errors.Join(errs...))
 	}
@@ -173,12 +195,15 @@ func canonical(r RoleDefinition) RoleDefinition {
 // DefineRole creates a custom role in a tenant, or replaces one, as actor; grants of a replaced
 // role give what it gives now. Its id starts with CustomPrefix, and it gives only permissions
 // some built-in role gives, on types some built-in role is for. It is Privileged when it gives
-// a permission on a type only privileged built-in roles give it on.
+// a permission on a type only privileged built-in roles give it on, or lists a privileged role,
+// whatever r.Privileged says, so a role read and saved back keeps no flag it no longer earns.
 //
 // The actor needs DefineRoles on the tenant, not removed by a constraint, and every permission
 // the role gives there, for each type it is for, as granting it on the tenant would need. Each
 // of its GrantableRoles must be a role the actor may grant on the tenant. Replacing a role
 // another custom role lists needs the power to grant it as defined wherever that one lists it.
+// Replacing one so that its grants give something else changes them, so a constraint that stops
+// changes to grants where it can be granted stops it, as it stops DeleteRole.
 func (a *Authorizer) DefineRole(ctx context.Context, actor Subject, tenant string, r RoleDefinition) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -186,25 +211,25 @@ func (a *Authorizer) DefineRole(ctx context.Context, actor Subject, tenant strin
 	if err := a.subject(actor); err != nil {
 		return err
 	}
+	root := Resource{Tenant: tenant, Type: TenantScope, ID: tenant}
+	// Whether the actor may define roles at all, before the definition, so a refused actor
+	// learns nothing of the catalog from what is invalid.
+	if _, err := a.mayDefineRoles(ctx, actor, root, nil); err != nil {
+		return err
+	}
 	r = canonical(r)
 	if err := a.checkCustom(r); err != nil {
 		return err
 	}
-	// Privileged as the roles that give its permissions on its types are, or as a role it lists
-	// is, so a host that confirms privileged grants asks about one that gives or hands out root
-	// however it was defined.
-	listed, err := a.book(ctx, a.db, tenant, r.GrantableRoles)
+	// Checked in full before the transaction too, so a refused actor never locks the tenant.
+	au, err := a.mayDefineRoles(ctx, actor, root, &r)
 	if err != nil {
 		return err
 	}
-	r.Privileged = r.Privileged || a.privileged(r) || slices.ContainsFunc(r.GrantableRoles, func(id Role) bool {
-		def, ok := listed.role(id)
-		return ok && def.Privileged
-	})
-	root := Resource{Tenant: tenant, Type: TenantScope, ID: tenant}
-	// Checked in full before the transaction too, so a refused actor never locks the tenant.
-	if err := a.mayDefineRoles(ctx, actor, root, &r); err != nil {
-		return err
+	if old, ok := au.roles.custom[r.ID]; ok && !sameAccess(old, r) {
+		if err := a.changesStopped(ctx, tenant, old, fmt.Sprintf("changing what %s's grants give", r.ID)); err != nil {
+			return err
+		}
 	}
 	return a.inTx(ctx, tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
 		// Alone in the tenant, so a change in progress checks and commits against one
@@ -212,9 +237,18 @@ func (a *Authorizer) DefineRole(ctx context.Context, actor Subject, tenant strin
 		if err := lockTenant(ctx, tx, tenant); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.mayDefine(ctx, tx, actor, root, &r); err != nil {
+		au, err := a.mayDefine(ctx, tx, actor, root, &r)
+		if err != nil {
 			return ChangeEvent{}, err
 		}
+		// Privileged as the roles that give its permissions on its types are, or as a role it
+		// lists is, read as the checks read them, so a host that confirms privileged grants asks
+		// about one that gives or hands out root however it was defined. Listing itself counts
+		// for nothing: what it was is no part of what it is.
+		r.Privileged = a.privileged(r) || slices.ContainsFunc(r.GrantableRoles, func(id Role) bool {
+			def, ok := au.roles.role(id)
+			return id != r.ID && ok && def.Privileged
+		})
 		var others int
 		if err := tx.QueryRow(ctx, `SELECT count(*) FROM rbac_roles WHERE tenant = $1 AND id <> $2`, tenant, r.ID).Scan(&others); err != nil {
 			return ChangeEvent{}, err
@@ -261,7 +295,7 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		return err
 	}
 	root := Resource{Tenant: tenant, Type: TenantScope, ID: tenant}
-	if err := a.mayDefineRoles(ctx, actor, root, nil); err != nil {
+	if _, err := a.mayDefineRoles(ctx, actor, root, nil); err != nil {
 		return err
 	}
 	// Deleting it revokes its grants, so a constraint that stops changes to grants where it can
@@ -271,21 +305,15 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		return err
 	}
 	if def, ok := roles.role(id); ok {
-		for _, t := range slices.Concat(def.ResourceTypes, a.containerTypes, []string{TenantScope}) {
-			name, err := a.denied(ctx, tenant, t, GrantPermission(t))
-			if err != nil {
-				return err
-			}
-			if name != "" {
-				return &DeniedError{Permission: GrantPermission(t), Scope: root.Scope(), Reason: fmt.Sprintf("removed by %s, which stops revoking %s", name, id)}
-			}
+		if err := a.changesStopped(ctx, tenant, def, "revoking "+string(id)); err != nil {
+			return err
 		}
 	}
 	return a.inTx(ctx, tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lockTenant(ctx, tx, tenant); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.mayDefine(ctx, tx, actor, root, nil); err != nil {
+		if _, err := a.mayDefine(ctx, tx, actor, root, nil); err != nil {
 			return ChangeEvent{}, err
 		}
 		rows, err := tx.Query(ctx, `SELECT id FROM rbac_roles WHERE tenant = $1 AND id <> $2 AND $2 = ANY(grantable_roles) ORDER BY id`, tenant, id)
@@ -302,8 +330,8 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		// Only OnChange reads what was removed, which can be every grant of a widely held role.
 		var revoked []Grant
 		if a.cfg.OnChange == nil {
-			_, err = tx.Exec(ctx, `DELETE FROM rbac_grants WHERE tenant = $1 AND role = $2`, tenant, id)
-		} else if rows, err = tx.Query(ctx, `DELETE FROM rbac_grants WHERE tenant = $1 AND role = $2 RETURNING `+grantColumns, tenant, id); err == nil {
+			_, err = tx.Exec(ctx, `DELETE FROM rbac_grants WHERE tenant = $1 AND role = $2 AND role LIKE 'custom.%'`, tenant, id)
+		} else if rows, err = tx.Query(ctx, `DELETE FROM rbac_grants WHERE tenant = $1 AND role = $2 AND role LIKE 'custom.%' RETURNING `+grantColumns, tenant, id); err == nil {
 			revoked, err = collectGrants(rows)
 		}
 		if err != nil {
@@ -317,28 +345,52 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 	})
 }
 
-// mayDefineRoles checks, before the transaction, that actor may define a tenant's roles. The
-// constraints run here only, as in Apply: a hook that queries the pool while the transaction
-// holds a connection can wait forever on a busy pool.
-func (a *Authorizer) mayDefineRoles(ctx context.Context, actor Subject, root Resource, r *RoleDefinition) error {
+// changesStopped returns why a constraint stops changing every grant of a custom role: one that
+// stops changes to grants on a type of scope it can be granted on.
+func (a *Authorizer) changesStopped(ctx context.Context, tenant string, def RoleDefinition, change string) error {
+	types := slices.Concat(def.ResourceTypes, a.containerTypes, []string{TenantScope})
+	slices.Sort(types)
+	for _, t := range slices.Compact(types) {
+		name, err := a.denied(ctx, tenant, t, GrantPermission(t))
+		if err != nil {
+			return err
+		}
+		if name != "" {
+			return &DeniedError{Permission: GrantPermission(t), Scope: TenantRoot(tenant), Reason: fmt.Sprintf("removed by %s, which stops %s", name, change)}
+		}
+	}
+	return nil
+}
+
+// sameAccess reports whether two definitions of a role give the same through its grants.
+func sameAccess(x, y RoleDefinition) bool {
+	return x.Public == y.Public && slices.Equal(x.Permissions, y.Permissions) &&
+		slices.Equal(x.ResourceTypes, y.ResourceTypes) && slices.Equal(x.GrantableRoles, y.GrantableRoles)
+}
+
+// mayDefineRoles checks, before the transaction, that actor may define a tenant's roles, and
+// returns what it read. The constraints run here only, as in Apply: a hook that queries the pool
+// while the transaction holds a connection can wait forever on a busy pool.
+func (a *Authorizer) mayDefineRoles(ctx context.Context, actor Subject, root Resource, r *RoleDefinition) (authority, error) {
 	scope := root.Scope()
 	if actor.Principal == (Principal{}) {
-		return &DeniedError{Permission: DefineRoles, Scope: scope, Reason: "an anonymous subject changes nothing"}
+		return authority{}, &DeniedError{Permission: DefineRoles, Scope: scope, Reason: "an anonymous subject changes nothing"}
 	}
 	name, err := a.denied(ctx, root.Tenant, TenantScope, DefineRoles)
 	if err != nil {
-		return err
+		return authority{}, err
 	}
 	if name != "" {
-		return &DeniedError{Permission: DefineRoles, Scope: scope, Reason: "removed by " + name}
+		return authority{}, &DeniedError{Permission: DefineRoles, Scope: scope, Reason: "removed by " + name}
 	}
 	return a.mayDefine(ctx, a.db, actor, root, r)
 }
 
 // mayDefine checks that actor holds DefineRoles on the tenant, and with r, that it may define r:
 // that it holds everything r gives across the tenant, as granting r there would need, with no
-// role it may merely hand out standing in, since defining r changes what its grants give.
-func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Resource, r *RoleDefinition) error {
+// role it may merely hand out standing in, since defining r changes what its grants give. It
+// returns what it read; with r, every custom role of the tenant.
+func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Resource, r *RoleDefinition) (authority, error) {
 	scope := root.Scope()
 	var ids []Role
 	if r != nil {
@@ -346,25 +398,25 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 	}
 	au, err := a.authorityOn(ctx, q, actor, root, ids)
 	if err != nil {
-		return err
+		return authority{}, err
 	}
 	if !au.holds(DefineRoles, TenantScope) {
-		return &DeniedError{Permission: DefineRoles, Scope: scope, Reason: "the actor may not define roles here"}
+		return authority{}, &DeniedError{Permission: DefineRoles, Scope: scope, Reason: "the actor may not define roles here"}
 	}
 	if r == nil {
-		return nil
+		return au, nil
 	}
 	// A role r lists is read as it will be, so one that lists itself is read as defined, while
 	// the actor's own grants of r give what r gives now: holding r is no license to widen it.
 	au.defining = r
 	for _, id := range r.GrantableRoles {
 		if _, known := au.named(id); !known {
-			return fmt.Errorf("%w: role %q: grantable role %q doesn't exist", ErrInvalid, r.ID, id)
+			return authority{}, fmt.Errorf("%w: role %q: grantable role %q doesn't exist", ErrInvalid, r.ID, id)
 		}
 	}
 	seen := map[string]bool{}
 	if p, ok := a.holdsRole(au, *r, r.ResourceTypes, seen); !ok {
-		return &DeniedError{Permission: p, Scope: scope, Reason: fmt.Sprintf("the actor can't define %s without holding %s here", r.ID, p)}
+		return authority{}, &DeniedError{Permission: p, Scope: scope, Reason: fmt.Sprintf("the actor can't define %s without holding %s here", r.ID, p)}
 	}
 	// A role that lists r lets its holders grant r as it will be wherever it can be granted, a
 	// power its definer never had to have if r gave less or couldn't be granted there: the
@@ -380,11 +432,11 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 				continue
 			}
 			if missing, ok := a.mayGrant(au, t, *r, seen); !ok {
-				return &DeniedError{Permission: missing, Scope: scope, Reason: fmt.Sprintf("the actor can't define %s, which %s lists, without the power to grant it on a %s", r.ID, id, t)}
+				return authority{}, &DeniedError{Permission: missing, Scope: scope, Reason: fmt.Sprintf("the actor can't define %s, which %s lists, without the power to grant it on a %s", r.ID, id, t)}
 			}
 		}
 	}
-	return nil
+	return au, nil
 }
 
 // privileged reports whether a custom role gives a permission on a type that only privileged

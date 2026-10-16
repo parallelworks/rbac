@@ -2025,6 +2025,62 @@ func TestCustomRolesFollowTheCatalog(t *testing.T) {
 	}
 }
 
+func TestPublicCustomRolesFollowTheCatalog(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	resources := hostTable(t, h)
+	admin := roleAdmin(t, h)
+	pub := rbac.RoleDefinition{ID: "custom.pub", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}, Public: true}
+	if err := h.authz.DefineRole(ctx, admin, "t1", pub); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(rbac.TenantRoot("t1"), pub.ID, rbac.Public, ""))
+	// The host deploys a catalog where only privileged roles give login, while one that isn't
+	// still gives view: the role is no longer public, though view on its own could be.
+	later := slices.Clone(catalog)
+	for i := range later {
+		later[i].Privileged = later[i].Privileged || later[i].ID == "cluster.login"
+	}
+	later = append(later, rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}})
+	authz, err := rbac.New(h.pool, rbac.Config{
+		Catalog: later, ContainerTypes: []string{"org", "workspace"},
+		ValidatePrincipal: func(context.Context, rbac.DB, string, rbac.Principal) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.authz = authz
+	anonymous := rbac.Subject{}
+	if allowed(t, h, anonymous, view, cluster) {
+		t.Fatal("a grant to the public should give nothing once its role is no longer public")
+	}
+	listingsAgree(t, h, resources, anonymous, view)
+	if holders, err := h.authz.Holders(ctx, cluster, view); err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.Public}) {
+		t.Fatalf("Holders = %v, %v", holders, err)
+	}
+}
+
+func TestARoleListingItselfIsPrivilegedOnlyForWhatItIs(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), rbac.RoleDefinition{
+			ID: "workspace.owner", Permissions: []rbac.Permission{"workspace:view", "workspace:grant", "workspace:delete"}, ResourceTypes: []string{"workspace"}, Privileged: true,
+		})
+	})
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	h.seed(t, grant(rbac.TenantRoot("t1"), "workspace.owner", rbac.User, "admin"))
+	r := rbac.RoleDefinition{ID: "custom.self", ResourceTypes: []string{"workspace"}, GrantableRoles: []rbac.Role{"custom.self"}}
+	for _, perms := range [][]rbac.Permission{{"workspace:view", "workspace:grant", "workspace:delete"}, {"workspace:view", "workspace:grant"}} {
+		r.Permissions = perms
+		if err := h.authz.DefineRole(ctx, admin, "t1", r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if roles, err := h.authz.CustomRoles(ctx, "t1"); err != nil || len(roles) != 1 || roles[0].Privileged {
+		t.Fatalf("a role listing itself should stop being privileged with what made it so: %+v, %v", roles, err)
+	}
+}
+
 func TestDefiningRolesIsCanonicalBoundedAndMarksPrivilege(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -2100,6 +2156,16 @@ func TestDeletingARoleRespectsConstraints(t *testing.T) {
 	if err := h.authz.DeleteRole(ctx, admin, "t1", op.ID); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("deleting a role revokes grants a constraint keeps: %v", err)
 	}
+	gutted := op
+	gutted.Permissions, gutted.ResourceTypes = []rbac.Permission{"tenant:view"}, []string{"tenant"}
+	if err := h.authz.DefineRole(ctx, admin, "t1", gutted); !errors.Is(err, rbac.ErrDenied) || !allowed(t, h, user("op"), view, cluster) {
+		t.Fatalf("redefining a role changes grants a constraint keeps: %v", err)
+	}
+	renamed := op
+	renamed.Name = "Operator"
+	if err := h.authz.DefineRole(ctx, admin, "t1", renamed); err != nil {
+		t.Fatalf("renaming a role changes no grant: %v", err)
+	}
 	stop = false
 	if err := h.authz.DeleteRole(ctx, admin, "t1", op.ID); err != nil {
 		t.Fatal(err)
@@ -2162,5 +2228,28 @@ func TestAGrantPermissionIsAPowerOnlyWhereTheGrantReachesItsType(t *testing.T) {
 	}
 	if err := h.authz.Apply(ctx, user("holder"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
 		t.Fatalf("granting a role the actor holds on the same cluster: %v", err)
+	}
+}
+
+func TestDefiningARoleDerivesPrivilegeAndChecksTheActorFirst(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	plain := rbac.RoleDefinition{ID: "custom.plain", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Privileged: true}
+	if err := h.authz.DefineRole(ctx, admin, "t1", plain); err != nil {
+		t.Fatal(err)
+	}
+	if roles, err := h.authz.CustomRoles(ctx, "t1"); err != nil || len(roles) != 1 || roles[0].Privileged {
+		t.Fatalf("a role giving only what unprivileged roles give should not be privileged: %+v, %v", roles, err)
+	}
+	long := plain
+	long.Name = strings.Repeat("n", 129)
+	if err := h.authz.DefineRole(ctx, admin, "t1", long); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a name past its limit: %v", err)
+	}
+	// Refused for who it is, not for what it asked: it learns nothing of the catalog.
+	guess := rbac.RoleDefinition{ID: "custom.guess", Permissions: []rbac.Permission{"cluster:fly"}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.DefineRole(ctx, user("nobody"), "t1", guess); !errors.Is(err, rbac.ErrDenied) || errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("an actor who may not define roles probing the catalog: %v", err)
 	}
 }
