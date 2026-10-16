@@ -63,12 +63,18 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 		if err != nil {
 			return Decision{}, err
 		}
-		roles, err := a.book(ctx, a.db, r.Tenant, roleIDs(held))
-		if err != nil {
+		// A built-in role's grant decides without reading custom roles.
+		roles := book{builtin: a.roles}
+		for _, b := range held {
+			if gives(roles, b.Principal, b.Role, p, r.Type) {
+				return Decision{Allowed: true}, nil
+			}
+		}
+		if roles, err = a.book(ctx, a.db, r.Tenant, roleIDs(held)); err != nil {
 			return Decision{}, err
 		}
 		for _, b := range held {
-			if gives(roles, b.Principal, b.Role, p, r.Type) {
+			if isCustom(b.Role) && gives(roles, b.Principal, b.Role, p, r.Type) {
 				return Decision{Allowed: true}, nil
 			}
 		}
@@ -157,14 +163,20 @@ func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]P
 		return nil, err
 	}
 	roles, custom := a.giving(p, r.Type), a.customGives(p, r.Type)
+	if len(roles) == 0 && !custom {
+		return nil, nil
+	}
+	args := append([]any{
+		r.Tenant, r.path(), roles, a.cfg.Now(), p.managesAccess(),
+		[]string{string(Tenant), string(Public)},
+		string(p), r.Type, a.publicRoles(roles), string(Public),
+	}, a.publicArgs(p, r.Type, custom)...)
 	rows, err := a.db.Query(ctx, `
 		SELECT DISTINCT principal_kind, principal_id FROM rbac_grants
-		WHERE tenant = $1 AND scope = ANY($2::text[]) AND role = ANY(`+givingSQL("$3", "$1", "$7", "$8", false, custom)+`)
+		WHERE tenant = $1 AND scope = ANY($2::text[]) AND role = ANY(`+givingSQL("$3", "$1", "$7", "$8", custom, nil)+`)
 		  AND (expires_at IS NULL OR expires_at > $4) AND (NOT $5 OR principal_kind <> ALL($6::text[]))
-		  AND (principal_kind <> $10 OR role = ANY(`+givingSQL("$9", "$1", "$7", "$8", true, custom)+`))
-		ORDER BY principal_kind, principal_id`,
-		r.Tenant, r.path(), roles, a.cfg.Now(), p.managesAccess(), []string{string(Tenant), string(Public)},
-		string(p), r.Type, a.publicRoles(roles), string(Public))
+		  AND (principal_kind <> $10 OR role = ANY(`+givingSQL("$9", "$1", "$7", "$8", custom, &publicSQL{"$11", "$12", "$13"})+`))
+		ORDER BY principal_kind, principal_id`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -197,17 +209,20 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 		return Reach{}, err
 	}
 	principals := s.principalsFor(tenant, p, a.publicGives(p, resourceType))
-	if len(principals) == 0 {
+	custom := a.customGives(p, resourceType)
+	if len(principals) == 0 || len(roles) == 0 && !custom {
 		return Reach{}, nil
 	}
-	custom := a.customGives(p, resourceType)
+	args := append([]any{
+		tenant, principals, roles, a.cfg.Now(), a.reaching(resourceType), publicKey, a.publicRoles(roles),
+		string(p), resourceType,
+	}, a.publicArgs(p, resourceType, custom)...)
 	rows, err := a.db.Query(ctx, `
 		SELECT DISTINCT scope FROM rbac_grants
-		WHERE tenant = $1 AND principal = ANY($2::text[]) AND role = ANY(`+givingSQL("$3", "$1", "$8", "$9", false, custom)+`)
+		WHERE tenant = $1 AND principal = ANY($2::text[]) AND role = ANY(`+givingSQL("$3", "$1", "$8", "$9", custom, nil)+`)
 		  AND (expires_at IS NULL OR expires_at > $4) AND split_part(scope, ':', 1) = ANY($5::text[])
-		  AND (principal <> $6 OR role = ANY(`+givingSQL("$7", "$1", "$8", "$9", true, custom)+`))
-		ORDER BY scope`,
-		tenant, principals, roles, a.cfg.Now(), a.reaching(resourceType), publicKey, a.publicRoles(roles), string(p), resourceType)
+		  AND (principal <> $6 OR role = ANY(`+givingSQL("$7", "$1", "$8", "$9", custom, &publicSQL{"$10", "$11", "$12"})+`))
+		ORDER BY scope`, args...)
 	if err != nil {
 		return Reach{}, err
 	}
@@ -273,10 +288,10 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 		return Predicate{}, err
 	}
 	principals := s.principalsFor(tenant, p, a.publicGives(p, resourceType))
-	if removed || len(principals) == 0 {
+	custom := a.customGives(p, resourceType)
+	if removed || len(principals) == 0 || len(roles) == 0 && !custom {
 		return Predicate{SQL: "FALSE"}, nil
 	}
-	custom := a.customGives(p, resourceType)
 	arg := func(i int) string { return fmt.Sprintf("$%d", firstArg+i) }
 	// The grants' tenant is an argument of its own: the host's tenant column needn't be text,
 	// and one argument can't take two types. A tenant-wide grant's scope is the tenant's key,
@@ -287,9 +302,12 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 			WHERE g.tenant = %s::text AND g.principal = ANY(%s::text[]) AND g.role = ANY(%s)
 			  AND (g.expires_at IS NULL OR g.expires_at > %s) AND split_part(g.scope, ':', 1) = ANY(%s::text[])
 			  AND (g.principal <> %s::text OR g.role = ANY(%s))))`,
-			cols.Tenant, arg(0), cols.Path, arg(1), arg(2), givingSQL(arg(3), arg(1), arg(8), arg(9), false, custom), arg(4), arg(5), arg(6),
-			givingSQL(arg(7), arg(1), arg(8), arg(9), true, custom)),
-		Args: []any{tenant, tenant, principals, roles, a.cfg.Now(), a.reaching(resourceType), publicKey, a.publicRoles(roles), string(p), resourceType},
+			cols.Tenant, arg(0), cols.Path, arg(1), arg(2), givingSQL(arg(3), arg(1), arg(8), arg(9), custom, nil), arg(4), arg(5), arg(6),
+			givingSQL(arg(7), arg(1), arg(8), arg(9), custom, &publicSQL{arg(10), arg(11), arg(12)})),
+		Args: append([]any{
+			tenant, tenant, principals, roles, a.cfg.Now(), a.reaching(resourceType), publicKey, a.publicRoles(roles),
+			string(p), resourceType,
+		}, a.publicArgs(p, resourceType, custom)...),
 	}, nil
 }
 
