@@ -1,8 +1,10 @@
 package rbac
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 
@@ -63,37 +65,62 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 		if err != nil {
 			return Decision{}, err
 		}
-		// A built-in role's grant decides without reading custom roles.
-		roles := book{builtin: a.roles}
-		for _, b := range held {
-			if gives(roles, b.Principal, b.Role, p, r.Type) {
+		// A built-in role's unconditional grant decides without reading custom roles or conditions.
+		builtin := book{builtin: a.roles}
+		for _, h := range held {
+			if !h.conditional && gives(builtin, h.Principal, h.Role, p, r.Type) {
 				return Decision{Allowed: true}, nil
 			}
 		}
-		if roles, err = a.book(ctx, a.db, r.Tenant, roleIDs(held)); err != nil {
+		roles, err := a.book(ctx, a.db, r.Tenant, roleIDs(held))
+		if err != nil {
 			return Decision{}, err
 		}
-		for _, b := range held {
-			if isCustom(b.Role) && gives(roles, b.Principal, b.Role, p, r.Type) {
+		var conditional []holding
+		for _, h := range held {
+			if !gives(roles, h.Principal, h.Role, p, r.Type) {
+				continue
+			}
+			if !h.conditional {
+				return Decision{Allowed: true}, nil
+			}
+			conditional = append(conditional, h)
+		}
+		if len(conditional) == 0 {
+			return Decision{Reason: "no grant gives it"}, nil
+		}
+		// Only now, with no unconditional grant to allow, are conditions read and evaluated.
+		if err := a.conditionsOf(ctx, a.db, r.Tenant, conditional); err != nil {
+			return Decision{}, err
+		}
+		vars, spend := a.vars(ctx, s, p, r), newBudget()
+		for _, h := range conditional {
+			if a.conds.holds(spend, h.Condition.Expression, vars) {
 				return Decision{Allowed: true}, nil
 			}
 		}
-		return Decision{Reason: "no grant gives it"}, nil
+		return Decision{Reason: "no condition of a grant that gives it holds"}, nil
 	}
 
 	grants, err := a.heldGrants(ctx, a.db, r.Tenant, principals, r.path())
 	if err != nil {
 		return Decision{}, err
 	}
-	roles, err := a.book(ctx, a.db, r.Tenant, grantRoleIDs(grants))
+	roles, err := a.book(ctx, a.db, r.Tenant, roleIDs(grants))
 	if err != nil {
 		return Decision{}, err
 	}
 	d := Decision{Reason: "no grant gives it"}
+	vars, spend := a.vars(ctx, s, p, r), newBudget()
 	for _, g := range grants {
-		if gives(roles, g.Principal, g.Role, p, r.Type) {
-			d.Grants = append(d.Grants, g)
+		if !gives(roles, g.Principal, g.Role, p, r.Type) {
+			continue
 		}
+		if g.Condition.Expression != "" && !a.conds.holds(spend, g.Condition.Expression, vars) {
+			d.Reason = "no condition of a grant that gives it holds"
+			continue
+		}
+		d.Grants = append(d.Grants, g)
 	}
 	if len(d.Grants) > 0 {
 		d.Allowed, d.Reason = true, ""
@@ -124,25 +151,62 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 	if err != nil {
 		return nil, err
 	}
-	var candidates []Permission
-	for _, b := range held {
-		if def, ok := roles.role(b.Role); ok && def.GrantableOn(r.Type) {
+	given := map[Permission]bool{}
+	var conditional []holding
+	for _, h := range held {
+		def, ok := roles.role(h.Role)
+		switch {
+		case !ok || !def.GrantableOn(r.Type):
+		case h.conditional:
+			conditional = append(conditional, h)
+		default:
 			for _, p := range def.Permissions {
-				if b.Principal.carries(def, p) {
-					candidates = append(candidates, p)
-				}
+				given[p] = given[p] || h.Principal.carries(def, p)
 			}
 		}
 	}
-	slices.Sort(candidates)
-	candidates = slices.Compact(candidates)
-	perms := candidates[:0]
-	for _, p := range candidates {
+	// What a constraint removes is settled first, so no budget is spent on conditions for it.
+	removed := map[Permission]bool{}
+	isRemoved := func(p Permission) (bool, error) {
+		if r, ok := removed[p]; ok {
+			return r, nil
+		}
 		name, err := a.denied(ctx, r.Tenant, r.Type, p)
+		removed[p] = name != ""
+		return name != "", err
+	}
+	// Conditions are evaluated only for what no unconditional grant gives, as checks do.
+	if err := a.conditionsOf(ctx, a.db, r.Tenant, conditional); err != nil {
+		return nil, err
+	}
+	vars, spend := a.vars(ctx, s, "", r), newBudget()
+	for _, h := range conditional {
+		def, _ := roles.role(h.Role)
+		for _, p := range def.Permissions {
+			if given[p] || !h.Principal.carries(def, p) {
+				continue
+			}
+			if gone, err := isRemoved(p); err != nil || gone {
+				if err != nil {
+					return nil, err
+				}
+				continue
+			}
+			// A condition reads the action, so it is evaluated for each permission.
+			vars["action"] = string(p)
+			given[p] = a.conds.holds(spend, h.Condition.Expression, vars)
+		}
+	}
+	var perms []Permission
+	for _, p := range slices.Sorted(maps.Keys(given)) {
+		if !given[p] {
+			continue
+		}
+		gone, err := isRemoved(p)
 		if err != nil {
 			return nil, err
 		}
-		if name == "" {
+		if !gone {
 			perms = append(perms, p)
 		}
 	}
@@ -150,7 +214,9 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 }
 
 // Holders lists every principal holding a role that gives p on r, the tenant's members and the
-// public included. The AuthZEN subject search; the host expands groups to their members.
+// public included. The AuthZEN subject search; the host expands groups to their members. It
+// counts only unconditional grants: whether a conditional one allows depends on the request,
+// and Grants lists them with their conditions.
 func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]Principal, error) {
 	if err := a.check(r); err != nil {
 		return nil, err
@@ -174,7 +240,7 @@ func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]P
 	rows, err := a.db.Query(ctx, `
 		SELECT DISTINCT principal_kind, principal_id FROM rbac_grants
 		WHERE tenant = $1 AND scope = ANY($2::text[]) AND role = ANY(`+givingSQL("$3", "$1", "$7", "$8", custom, nil)+`)
-		  AND (expires_at IS NULL OR expires_at > $4) AND (NOT $5 OR principal_kind <> ALL($6::text[]))
+		  AND (expires_at IS NULL OR expires_at > $4) AND NOT conditional AND (NOT $5 OR principal_kind <> ALL($6::text[]))
 		  AND (principal_kind <> $10 OR role = ANY(`+givingSQL("$9", "$1", "$7", "$8", custom, &publicSQL{"$11", "$12", "$13"})+`))
 		ORDER BY principal_kind, principal_id`, args...)
 	if err != nil {
@@ -199,6 +265,10 @@ func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]P
 type Reach struct {
 	All    bool
 	Scopes []Scope
+	// Conditional are the scopes only conditional grants reach, which a search can't evaluate:
+	// a resource whose path holds one is reachable where Authorize allows it, so check those one
+	// by one.
+	Conditional []Scope
 }
 
 // Reachable says where the subject may do p to resources of a type in a tenant, for hosts that
@@ -218,24 +288,32 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 		string(p), resourceType,
 	}, a.publicArgs(p, resourceType, custom)...)
 	rows, err := a.db.Query(ctx, `
-		SELECT DISTINCT scope FROM rbac_grants
+		SELECT scope, bool_and(conditional) FROM rbac_grants
 		WHERE tenant = $1 AND principal = ANY($2::text[]) AND role = ANY(`+givingSQL("$3", "$1", "$8", "$9", custom, nil)+`)
 		  AND (expires_at IS NULL OR expires_at > $4) AND split_part(scope, ':', 1) = ANY($5::text[])
 		  AND (principal <> $6 OR role = ANY(`+givingSQL("$7", "$1", "$8", "$9", custom, &publicSQL{"$10", "$11", "$12"})+`))
-		ORDER BY scope`, args...)
-	if err != nil {
-		return Reach{}, err
-	}
-	keys, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		GROUP BY scope ORDER BY scope`, args...)
 	if err != nil {
 		return Reach{}, err
 	}
 	var reach Reach
-	for _, k := range keys {
-		if k == TenantRoot(tenant).Key() {
-			return Reach{All: true}, nil
+	var key string
+	var conditional bool
+	if _, err := pgx.ForEachRow(rows, []any{&key, &conditional}, func() error {
+		switch {
+		case conditional:
+			reach.Conditional = append(reach.Conditional, parseScope(key))
+		case key == TenantRoot(tenant).Key():
+			reach.All = true
+		default:
+			reach.Scopes = append(reach.Scopes, parseScope(key))
 		}
-		reach.Scopes = append(reach.Scopes, parseScope(k))
+		return nil
+	}); err != nil {
+		return Reach{}, err
+	}
+	if reach.All {
+		return Reach{All: true}, nil
 	}
 	return reach, nil
 }
@@ -278,7 +356,8 @@ type Predicate struct {
 // tenant the subject may do p to. It reads the grants in the same statement as the rows, so
 // sorting and pagination work and nothing changes between deciding and reading. The host's
 // query must reach this package's tables (they are in the pool's schema), and column names are
-// trusted host code; every value is an argument.
+// trusted host code; every value is an argument. It counts only unconditional grants:
+// Reachable's Conditional names the scopes conditional ones reach.
 func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant, resourceType string, cols Columns, firstArg int) (Predicate, error) {
 	if cols.Tenant == "" || cols.Path == "" || firstArg < 1 {
 		return Predicate{}, fmt.Errorf("%w: Filter needs the tenant and path columns and a first argument", ErrInvalid)
@@ -300,7 +379,7 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	return Predicate{
 		SQL: fmt.Sprintf(`(%s = %s AND %s && ARRAY(SELECT g.scope COLLATE "default" FROM rbac_grants g
 			WHERE g.tenant = %s::text AND g.principal = ANY(%s::text[]) AND g.role = ANY(%s)
-			  AND (g.expires_at IS NULL OR g.expires_at > %s) AND split_part(g.scope, ':', 1) = ANY(%s::text[])
+			  AND (g.expires_at IS NULL OR g.expires_at > %s) AND NOT g.conditional AND split_part(g.scope, ':', 1) = ANY(%s::text[])
 			  AND (g.principal <> %s::text OR g.role = ANY(%s))))`,
 			cols.Tenant, arg(0), cols.Path, arg(1), arg(2), givingSQL(arg(3), arg(1), arg(8), arg(9), custom, nil), arg(4), arg(5), arg(6),
 			givingSQL(arg(7), arg(1), arg(8), arg(9), custom, &publicSQL{arg(10), arg(11), arg(12)})),
@@ -311,34 +390,84 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	}, nil
 }
 
-// heldBindings returns the bindings held by any of principals on any of scopes, not expired:
+// holding is a grant as a check reads it from the key index: whether it has a condition, not
+// the condition, which conditionsOf reads when a check needs it.
+type holding struct {
+	Binding
+	scope       string
+	conditional bool
+}
+
+// heldBindings returns the grants held by any of principals on any of scopes, not expired:
 // only what the key index holds, so it is an index-only scan.
-func (a *Authorizer) heldBindings(ctx context.Context, q DB, tenant string, principals, scopes []string) ([]Binding, error) {
+func (a *Authorizer) heldBindings(ctx context.Context, q DB, tenant string, principals, scopes []string) ([]holding, error) {
 	if len(principals) == 0 {
 		return nil, nil
 	}
 	rows, err := q.Query(ctx, `
-		SELECT principal, role, expires_at FROM rbac_grants
+		SELECT principal, scope, role, expires_at, conditional FROM rbac_grants
 		WHERE tenant = $1 AND principal = ANY($2::text[]) AND scope = ANY($3::text[])
-		  AND (expires_at IS NULL OR expires_at > $4)`,
+		  AND (expires_at IS NULL OR expires_at > $4)
+		ORDER BY principal, scope, role`,
 		tenant, principals, scopes, a.cfg.Now())
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Binding, error) {
-		var b Binding
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (holding, error) {
+		var h holding
 		var principal string
 		var expires *time.Time
-		err := row.Scan(&principal, &b.Role, &expires)
-		b.Principal = parsePrincipal(principal)
+		err := row.Scan(&principal, &h.scope, &h.Role, &expires, &h.conditional)
+		h.Principal = parsePrincipal(principal)
 		if expires != nil {
-			b.ExpiresAt = *expires
+			h.ExpiresAt = *expires
 		}
-		return b, err
+		return h, err
 	})
 }
 
-// heldGrants returns the grants held by any of principals on any of scopes, not expired.
+// conditionsOf reads the conditions of the conditional grants among held, in place.
+func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held []holding) error {
+	var principals, scopes, roles []string
+	for _, h := range held {
+		if h.conditional {
+			principals, scopes, roles = append(principals, h.Principal.key()), append(scopes, h.scope), append(roles, string(h.Role))
+		}
+	}
+	if len(principals) == 0 {
+		return nil
+	}
+	// Only the expression: a check reads nothing else of a condition.
+	rows, err := q.Query(ctx, `
+		SELECT principal, scope, role, condition FROM rbac_grants
+		WHERE tenant = $1 AND (principal, scope, role) IN (SELECT * FROM unnest($2::text[], $3::text[], $4::text[]))`,
+		tenant, principals, scopes, roles)
+	if err != nil {
+		return err
+	}
+	type key struct{ principal, scope, role string }
+	found := map[key]string{}
+	var k key
+	var expr string
+	_, err = pgx.ForEachRow(rows, []any{&k.principal, &k.scope, &k.role, &expr}, func() error {
+		found[k] = expr
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for i, h := range held {
+		if h.conditional {
+			// One gone since is read as a condition nothing meets.
+			held[i].Condition.Expression = cmp.Or(found[key{h.Principal.key(), h.scope, string(h.Role)}], "false")
+		}
+	}
+	return nil
+}
+
+// heldGrants returns the grants held by any of principals on any of scopes, not expired, in the
+// order heldBindings reads them: Explain spends on their conditions in the order Authorize does,
+// so a budget runs out where it does for Authorize.
 func (a *Authorizer) heldGrants(ctx context.Context, q DB, tenant string, principals, scopes []string) ([]Grant, error) {
 	if len(principals) == 0 {
 		return nil, nil
@@ -347,7 +476,7 @@ func (a *Authorizer) heldGrants(ctx context.Context, q DB, tenant string, princi
 		SELECT `+grantColumns+` FROM rbac_grants
 		WHERE tenant = $1 AND principal = ANY($2::text[]) AND scope = ANY($3::text[])
 		  AND (expires_at IS NULL OR expires_at > $4)
-		ORDER BY scope, principal, role`,
+		ORDER BY principal, scope, role`,
 		tenant, principals, scopes, a.cfg.Now())
 	if err != nil {
 		return nil, err
@@ -355,7 +484,8 @@ func (a *Authorizer) heldGrants(ctx context.Context, q DB, tenant string, princi
 	return collectGrants(rows)
 }
 
-const grantColumns = `scope_type, scope_id, principal_kind, principal_id, role, expires_at, created_by, created_at`
+const grantColumns = `scope_type, scope_id, principal_kind, principal_id, role, expires_at, created_by, created_at,
+	condition_title, condition_description, condition`
 
 func collectGrants(rows pgx.Rows) ([]Grant, error) {
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Grant, error) {
@@ -363,7 +493,7 @@ func collectGrants(rows pgx.Rows) ([]Grant, error) {
 		var expires *time.Time
 		var createdBy string
 		err := row.Scan(&g.Scope.Type, &g.Scope.ID, &g.Principal.Kind, &g.Principal.ID, &g.Role,
-			&expires, &createdBy, &g.CreatedAt)
+			&expires, &createdBy, &g.CreatedAt, &g.Condition.Title, &g.Condition.Description, &g.Condition.Expression)
 		if expires != nil {
 			g.ExpiresAt = *expires
 		}

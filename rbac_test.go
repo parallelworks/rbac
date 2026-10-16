@@ -2420,3 +2420,454 @@ func TestPublicCustomRolesThatChangeAccessGiveNothingInSearches(t *testing.T) {
 		t.Fatalf("Holders = %v, %v", holders, err)
 	}
 }
+
+func conditional(role rbac.Role, id, expr string) rbac.Binding {
+	return rbac.Binding{Role: role, Principal: rbac.Principal{Kind: rbac.User, ID: id}, Condition: rbac.Condition{Title: "t", Expression: expr}}
+}
+
+func TestConditions(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	dev := cluster
+	dev.Attributes = map[string]any{"env": "dev"}
+	prod := cluster
+	prod.Attributes = map[string]any{"env": "prod"}
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{
+		conditional("cluster.login", "c", `resource.attributes.env == "dev"`),
+		conditional("cluster.login", "late", `request.time < timestamp("2026-01-01T13:00:00Z")`),
+		conditional("cluster.login", "mfa", `request.attributes.mfa == true`),
+		conditional("cluster.login", "ops", `subject.attributes.dept == "ops"`),
+		conditional("cluster.login", "viewer", `action == "cluster:view"`),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		ctx  context.Context
+		s    rbac.Subject
+		p    rbac.Permission
+		r    rbac.Resource
+		want bool
+	}{
+		{"a resource attribute that holds", ctx, user("c"), login, dev, true},
+		{"one that doesn't", ctx, user("c"), login, prod, false},
+		{"one the host didn't pass", ctx, user("c"), login, cluster, false},
+		{"before a time", ctx, user("late"), login, cluster, true},
+		{"a request attribute", rbac.WithRequest(ctx, map[string]any{"mfa": true}), user("mfa"), login, cluster, true},
+		{"without it", ctx, user("mfa"), login, cluster, false},
+		{"a subject attribute", ctx, rbac.Subject{Principal: rbac.Principal{Kind: rbac.User, ID: "ops"}, Tenants: []string{"t1"}, Attributes: map[string]any{"dept": "ops"}}, login, cluster, true},
+		{"the action it names", ctx, user("viewer"), view, cluster, true},
+		{"another action", ctx, user("viewer"), login, cluster, false},
+	}
+	for _, c := range cases {
+		err := h.authz.Authorize(c.ctx, c.s, c.p, c.r)
+		if err != nil && !errors.Is(err, rbac.ErrDenied) {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got := err == nil; got != c.want {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+		}
+		d, err := h.authz.Explain(c.ctx, c.s, c.p, c.r)
+		if err != nil || d.Allowed != c.want || (c.want && d.Grants[0].Condition.Expression == "") {
+			t.Errorf("%s: Explain = %+v, %v", c.name, d, err)
+		}
+	}
+	h.now = h.now.Add(2 * time.Hour)
+	if allowed(t, h, user("late"), login, cluster) {
+		t.Error("a condition on the time should stop holding")
+	}
+	if perms, err := h.authz.Permissions(ctx, user("viewer"), cluster); err != nil || !slices.Equal(perms, []rbac.Permission{view}) {
+		t.Errorf("Permissions = %v, %v", perms, err)
+	}
+	// An unconditional grant beside a conditional one allows on its own: on the workspace, since
+	// one on the cluster would replace it.
+	h.seed(t, grant(rbac.Scope{Type: "workspace", ID: "w1"}, "cluster.login", rbac.User, "c"))
+	if !allowed(t, h, user("c"), login, prod) {
+		t.Error("an unconditional grant should allow whatever its neighbor's condition says")
+	}
+}
+
+func TestConditionsAreCheckedWhenGranted(t *testing.T) {
+	h := setup(t)
+	long := strings.Repeat("true && ", 600) + "true"
+	for name, expr := range map[string]string{
+		"a syntax error":          `resource.attributes.env ==`,
+		"not a bool":              `1 + 1`,
+		"too long":                long,
+		"an unknown variable":     `user.name == "x"`,
+		"a pattern too large":     `resource.id.matches("` + strings.Repeat(`[a-z]{1000}`, 2) + `")`,
+		"a long literal repeated": `resource.id.matches("(?:` + strings.Repeat("a", 400) + `){9}")`,
+		"a pattern not literal":   `resource.id.matches("[a-z]{1000}" + "")`,
+		"a pattern that's wrong":  `matches(resource.id, "(")`,
+	} {
+		err := h.authz.Apply(t.Context(), user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{conditional("cluster.login", "x", expr)}})
+		if !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	titled := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, Condition: rbac.Condition{Title: "t"}}
+	if err := h.authz.Apply(t.Context(), user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{titled}}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("a title without an expression: %v", err)
+	}
+	titledLong := conditional("cluster.login", "x", "true")
+	titledLong.Condition.Title = strings.Repeat("t", 129)
+	described := conditional("cluster.login", "x", "true")
+	described.Condition.Description = strings.Repeat("d", 2049)
+	for _, b := range []rbac.Binding{titledLong, described} {
+		if err := h.authz.Import(t.Context(), "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: b}}); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("a title or description too long: %v", err)
+		}
+	}
+	if err := h.authz.Apply(t.Context(), user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{conditional("cluster.login", "x", `resource.id.matches("^c[0-9]{1,3}$")`)}}); err != nil {
+		t.Fatalf("a small pattern: %v", err)
+	}
+	if !allowed(t, h, user("x"), login, cluster) {
+		t.Error("a small pattern that matches should allow")
+	}
+}
+
+func TestAConditionTooCostlyIsFalse(t *testing.T) {
+	h := setup(t)
+	var xs []string
+	for i := range 200 {
+		xs = append(xs, fmt.Sprint(i))
+	}
+	list := "[" + strings.Join(xs, ",") + "]"
+	expr := list + ".all(x, " + list + ".all(y, true))"
+	if err := h.authz.Apply(t.Context(), user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{conditional("cluster.login", "x", expr)}}); err != nil {
+		t.Fatal(err)
+	}
+	if allowed(t, h, user("x"), login, cluster) {
+		t.Fatal("a condition past its cost limit should be false")
+	}
+	// Comparing values counts what they hold, not only how many there are.
+	labels := map[string]any{"env": "dev"}
+	for i := range 20000 {
+		labels[fmt.Sprint("k", i)] = fmt.Sprint(i)
+	}
+	large := cluster
+	large.Attributes = map[string]any{"nested": []any{labels}, "labels": labels}
+	h.seed(t,
+		rbac.Grant{Scope: cluster.Scope(), Binding: conditional("cluster.login", "compares", `resource.attributes.nested == resource.attributes.nested`)},
+		rbac.Grant{Scope: cluster.Scope(), Binding: conditional("cluster.login", "finds", `"env" in resource.attributes.labels && resource.attributes.labels.env == "dev"`)},
+	)
+	if allowed(t, h, user("compares"), login, large) {
+		t.Error("comparing large nested values should be past the cost limit")
+	}
+	if !allowed(t, h, user("finds"), login, large) {
+		t.Error("finding a key in a large map should cost no more than the key")
+	}
+}
+
+func TestSearchesLeaveConditionalGrantsToTheHost(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	resources := hostTable(t, h)
+	// Unconditional on workspace w1, beside a conditional one, and conditional on org o2.
+	h.seed(t,
+		grant(rbac.Scope{Type: "workspace", ID: "w1"}, "cluster.login", rbac.User, "both"),
+		rbac.Grant{Scope: rbac.Scope{Type: "workspace", ID: "w1"}, Binding: conditional("cluster.sudo", "both", "true")},
+		rbac.Grant{Scope: rbac.Scope{Type: "org", ID: "o2"}, Binding: conditional("cluster.login", "both", "true")},
+	)
+	reach, err := h.authz.Reachable(ctx, user("both"), login, "t1", "cluster")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(reach.Scopes, []rbac.Scope{{Type: "workspace", ID: "w1"}}) || !slices.Equal(reach.Conditional, []rbac.Scope{{Type: "org", ID: "o2"}}) {
+		t.Fatalf("Reachable = %+v", reach)
+	}
+	pred, err := h.authz.Filter(ctx, user("both"), login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := h.pool.Query(ctx, "SELECT id FROM clusters WHERE "+pred.SQL+" ORDER BY id", pred.Args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Every row Filter keeps, Authorize allows; the conditional ones Authorize allows too.
+	for _, r := range resources {
+		if slices.Contains(got, r.ID) && !allowed(t, h, user("both"), login, r) {
+			t.Errorf("Filter kept %s, which Authorize refuses", r.ID)
+		}
+	}
+	if !slices.Equal(got, []string{"c0"}) {
+		t.Errorf("Filter kept %v, want only the unconditionally reached c0", got)
+	}
+	if holders, err := h.authz.Holders(ctx, resources[2], login); err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.User, ID: "both"}) {
+		t.Errorf("Holders = %v, %v", holders, err)
+	}
+	if !allowed(t, h, user("both"), login, resources[2]) {
+		t.Error("Authorize should allow through the conditional grant")
+	}
+}
+
+func TestConditionalGrantsInChanges(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	mfa := `request.attributes.mfa == true`
+	h.seed(t, rbac.Grant{Scope: cluster.Scope(), Binding: conditional("cluster.admin", "admin", mfa)})
+	b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}}
+	if err := h.authz.Apply(ctx, user("admin"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("changing access through a condition that doesn't hold: %v", err)
+	}
+	withMFA := rbac.WithRequest(ctx, map[string]any{"mfa": true})
+	// Held only under a condition, a permission can't be handed on without it.
+	if err := h.authz.Apply(withMFA, user("admin"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("dropping the condition the actor holds a role under: %v", err)
+	}
+	same := b
+	same.Condition = rbac.Condition{Expression: mfa}
+	// Its power to change grants holds only where its condition does.
+	if err := h.authz.Apply(ctx, user("admin"), cluster, rbac.Change{Grant: []rbac.Binding{same}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("changing access through a condition that doesn't hold now: %v", err)
+	}
+	if err := h.authz.Apply(withMFA, user("admin"), cluster, rbac.Change{Grant: []rbac.Binding{same}}); err != nil {
+		t.Fatalf("handing on a permission under the same condition: %v", err)
+	}
+	h.events = nil
+	other := same
+	other.Condition = rbac.Condition{Title: "office", Expression: `request.attributes.office == true`}
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{other}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.events) != 1 || h.events[0].Granted[0].Condition != other.Condition {
+		t.Fatalf("a new condition should replace the old and be reported: %+v", h.events)
+	}
+	if got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{b.Principal}}); err != nil || len(got) != 1 || got[0].Condition != other.Condition {
+		t.Fatalf("Grants = %+v, %v", got, err)
+	}
+}
+
+func TestAConditionalPowerIsHandedOnOnlyUnderItsCondition(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	mfa := `request.attributes.mfa == true`
+	withMFA := rbac.WithRequest(ctx, map[string]any{"mfa": true})
+	admin := roleAdmin(t, h)
+	lister := rbac.RoleDefinition{ID: "custom.lister", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.login"}}
+	granter := rbac.RoleDefinition{ID: "custom.granter", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"}}
+	for _, r := range []rbac.RoleDefinition{lister, granter} {
+		if err := h.authz.DefineRole(ctx, admin, "t1", r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The power to change grants only with a second factor; everything else cluster.admin gives,
+	// without one.
+	h.seed(t,
+		rbac.Grant{Scope: cluster.Scope(), Binding: conditional("cluster.admin", "p", mfa)},
+		grant(cluster.Scope(), "cluster.sudo", rbac.User, "p"),
+		rbac.Grant{Scope: cluster.Scope(), Binding: conditional(lister.ID, "p", mfa)},
+		grant(rbac.TenantRoot("t1"), "tenant.roles", rbac.User, "definer"),
+		rbac.Grant{Scope: rbac.TenantRoot("t1"), Binding: conditional("cluster.admin", "definer", mfa)},
+	)
+	for _, role := range []rbac.Role{"cluster.admin", lister.ID, granter.ID} {
+		self := rbac.Binding{Role: role, Principal: rbac.Principal{Kind: rbac.User, ID: "p"}}
+		if err := h.authz.Apply(withMFA, user("p"), cluster, rbac.Change{Grant: []rbac.Binding{self}}); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("granting %s without the condition of the power it gives: %v", role, err)
+		}
+		self.Condition = rbac.Condition{Expression: mfa}
+		self.Principal.ID = "x"
+		if err := h.authz.Apply(withMFA, user("p"), cluster, rbac.Change{Grant: []rbac.Binding{self}}); err != nil {
+			t.Errorf("granting %s under the condition of the power it gives: %v", role, err)
+		}
+	}
+	wider := granter
+	wider.ID = "custom.wider"
+	if err := h.authz.DefineRole(withMFA, user("definer"), "t1", wider); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("defining a role that gives a power held only under a condition: %v", err)
+	}
+}
+
+func TestARoleAConditionalGrantListsIsGrantedOnlyUnderItsCondition(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	mfa := `request.attributes.mfa == true`
+	withMFA := rbac.WithRequest(ctx, map[string]any{"mfa": true})
+	lister := rbac.RoleDefinition{ID: "custom.lister", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"custom.lister", "cluster.sudo"}}
+	if err := h.authz.DefineRole(ctx, roleAdmin(t, h), "t1", lister); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, rbac.Grant{Scope: cluster.Scope(), Binding: conditional(lister.ID, "p", mfa)})
+	// With a second factor once, p would otherwise grant itself sudo, or the lister, without one.
+	for _, role := range []rbac.Role{"cluster.sudo", lister.ID} {
+		self := rbac.Binding{Role: role, Principal: rbac.Principal{Kind: rbac.User, ID: "p"}}
+		if err := h.authz.Apply(withMFA, user("p"), cluster, rbac.Change{Grant: []rbac.Binding{self}}); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("granting %s through a conditional listing without its condition: %v", role, err)
+		}
+		other := rbac.Binding{Role: role, Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, Condition: rbac.Condition{Expression: mfa}}
+		if err := h.authz.Apply(withMFA, user("p"), cluster, rbac.Change{Grant: []rbac.Binding{other}}); err != nil {
+			t.Errorf("granting %s through a conditional listing under its condition: %v", role, err)
+		}
+	}
+	if allowed(t, h, user("p"), root, cluster) {
+		t.Error("p should hold root only through a grant it may not make")
+	}
+	if roles, err := h.authz.Grantable(withMFA, user("p"), cluster); err != nil || len(roles) != 0 {
+		t.Errorf("Grantable offers only what the actor may grant unconditionally: %v, %v", roles, err)
+	}
+	revoke := rbac.Binding{Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}}
+	if err := h.authz.Apply(withMFA, user("p"), cluster, rbac.Change{Revoke: []rbac.Binding{revoke}}); err != nil {
+		t.Errorf("revoking a role a conditional grant lists while its condition holds: %v", err)
+	}
+}
+
+func TestAConditionalRightToDefineRolesHoldsOnlyUnderItsCondition(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	tenant := rbac.TenantRoot("t1")
+	h.seed(t,
+		rbac.Grant{Scope: tenant, Binding: conditional("tenant.roles", "definer", `request.attributes.mfa == true`)},
+		grant(tenant, "cluster.admin", rbac.User, "definer"),
+	)
+	r := rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.DefineRole(ctx, user("definer"), "t1", r); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("defining a role without the condition the right to holds under: %v", err)
+	}
+	if err := h.authz.DefineRole(rbac.WithRequest(ctx, map[string]any{"mfa": true}), user("definer"), "t1", r); err != nil {
+		t.Fatalf("defining a role with it: %v", err)
+	}
+}
+
+func TestACheckSpendsABoundedBudgetOnConditions(t *testing.T) {
+	h := setup(t)
+	var xs []string
+	for i := range 90 {
+		xs = append(xs, fmt.Sprint(i))
+	}
+	list := "[" + strings.Join(xs, ",") + "]"
+	costly := list + ".all(x, " + list + ".all(y, x >= 0)) && false"
+	var groups []string
+	var grants []rbac.Grant
+	for i := range 20 {
+		g := fmt.Sprintf("g%02d", i)
+		groups = append(groups, g)
+		expr := costly
+		if i == 19 {
+			expr = "true"
+		}
+		grants = append(grants, rbac.Grant{Scope: cluster.Scope(), Binding: rbac.Binding{
+			Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.Group, ID: g}, Condition: rbac.Condition{Expression: expr},
+		}})
+	}
+	h.seed(t, grants...)
+	if !allowed(t, h, user("one", "g19"), login, cluster) {
+		t.Fatal("a condition that holds should allow")
+	}
+	// Spent on the grants before it, the check never reaches the one that holds.
+	if allowed(t, h, user("many", groups...), login, cluster) {
+		t.Fatal("a check should stop spending on conditions past its budget")
+	}
+}
+
+func TestExplainSpendsTheBudgetAsAuthorizeDoes(t *testing.T) {
+	var xs []string
+	for i := range 90 {
+		xs = append(xs, fmt.Sprint(i))
+	}
+	list := "[" + strings.Join(xs, ",") + "]"
+	costly := list + ".all(x, " + list + ".all(y, x >= 0)) && false"
+	workspace := rbac.Scope{Type: "workspace", ID: "w1"}
+	// The grant that holds is read first in one order of scopes and principals, and last in the
+	// other.
+	for _, holds := range []int{0, 19} {
+		h := setup(t)
+		var groups []string
+		var grants []rbac.Grant
+		for i := range 20 {
+			g := fmt.Sprintf("g%02d", i)
+			groups = append(groups, g)
+			scope, expr := cluster.Scope(), costly
+			if i == holds {
+				expr = "true"
+			}
+			if (i == holds) == (holds == 0) {
+				scope = workspace
+			}
+			grants = append(grants, rbac.Grant{Scope: scope, Binding: rbac.Binding{
+				Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.Group, ID: g}, Condition: rbac.Condition{Expression: expr},
+			}})
+		}
+		h.seed(t, grants...)
+		s := user("many", groups...)
+		d, err := h.authz.Explain(t.Context(), s, login, cluster)
+		if a := allowed(t, h, s, login, cluster); err != nil || d.Allowed != a {
+			t.Errorf("the grant that holds read as %d: Authorize = %v, Explain = %+v, %v", holds, a, d, err)
+		}
+	}
+}
+
+func TestACheckDecidesAsItWouldWhateverIsCompiled(t *testing.T) {
+	h := setup(t)
+	var xs []string
+	for i := range 400 {
+		xs = append(xs, fmt.Sprint(i))
+	}
+	list := "[" + strings.Join(xs, ",") + "]"
+	var groups []string
+	var grants []rbac.Grant
+	for i := range 21 {
+		g := fmt.Sprintf("g%02d", i)
+		groups = append(groups, g)
+		expr := fmt.Sprintf(`%s.all(x, x >= 0) && %d == 0`, list, i+1)
+		if i == 20 {
+			expr = "true"
+		}
+		grants = append(grants, rbac.Grant{Scope: cluster.Scope(), Binding: rbac.Binding{
+			Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.Group, ID: g}, Condition: rbac.Condition{Expression: expr},
+		}})
+	}
+	// Storing them compiled them for h.authz; another Authorizer compiles them as it checks.
+	h.seed(t, grants...)
+	fresh, err := rbac.New(h.pool, rbac.Config{
+		Catalog: catalog, ContainerTypes: []string{"org", "workspace"},
+		ValidatePrincipal: func(context.Context, rbac.DB, string, rbac.Principal) error { return nil },
+		Now:               func() time.Time { return h.now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := user("many", groups...)
+	compiled := allowed(t, h, s, login, cluster)
+	for i := range 2 {
+		err := fresh.Authorize(t.Context(), s, login, cluster)
+		if err != nil && !errors.Is(err, rbac.ErrDenied) {
+			t.Fatal(err)
+		}
+		if (err == nil) != compiled {
+			t.Errorf("check %d with nothing compiled: %v, with everything compiled: %v", i, err == nil, compiled)
+		}
+	}
+}
+
+func TestAMatchCostsWhatItsPatternCompilesTo(t *testing.T) {
+	h := setup(t)
+	// A short pattern that compiles to about a thousand instructions, matched against a long string.
+	expr := `!"` + strings.Repeat("a", 1900) + `".matches(".{498}b")`
+	if err := h.authz.Apply(t.Context(), user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{conditional("cluster.login", "x", expr)}}); err != nil {
+		t.Fatal(err)
+	}
+	if allowed(t, h, user("x"), login, cluster) {
+		t.Error("a match past the cost limit should be false")
+	}
+}
+
+func TestAConditionIsTextPostgreSQLStores(t *testing.T) {
+	h := setup(t)
+	for _, c := range []rbac.Condition{
+		{Title: "a\x00b", Expression: "true"},
+		{Description: "\xff", Expression: "true"},
+		{Expression: `"` + "\xff" + `" != ""`},
+	} {
+		b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, Condition: c}
+		if err := h.authz.Apply(t.Context(), user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("Apply(%q) = %v", c, err)
+		}
+		if err := h.authz.Import(t.Context(), "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: b}}); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("Import(%q) = %v", c, err)
+		}
+	}
+}
