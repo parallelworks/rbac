@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 
@@ -71,7 +72,7 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 	}
 	return a.inTx(ctx, on.Tenant, actor.User, func(tx pgx.Tx) (granted, revoked []Grant, err error) {
 		// One change to a scope at a time, so two changes can't deadlock on its rows.
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "rbac/"+on.Tenant+"/"+scope.Key()); err != nil {
+		if err := lockScopes(ctx, tx, on.Tenant, scope.Key()); err != nil {
 			return nil, nil, err
 		}
 		// Decided again in the transaction, so the actor's access is read as the change is made.
@@ -84,6 +85,31 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 		granted, err = a.upsert(ctx, tx, on.Tenant, actor.User, scopeGrants(scope, grants))
 		return granted, revoked, err
 	})
+}
+
+// Changes take their tenant's lock, shared by changes to some of its scopes, which then lock
+// each scope in order, and held alone by changes across a principal or the whole tenant. So
+// two changes to the same rows run in turn and never deadlock. The locks last until the
+// transaction ends. Advisory locks span the database, so the keys name the schema: another
+// application's grants are in a schema of their own.
+const lockKey = `hashtextextended(current_schema() || '/rbac/' || $1, 0)`
+
+// maxScopeLocks is how many scopes an Import locks one by one; a larger one locks the tenant,
+// rather than fill PostgreSQL's lock table.
+const maxScopeLocks = 64
+
+func lockScopes(ctx context.Context, tx pgx.Tx, tenant string, scopes ...string) error {
+	b := &pgx.Batch{}
+	b.Queue(`SELECT pg_advisory_xact_lock_shared(`+lockKey+`)`, "tenant/"+tenant)
+	for _, s := range slices.Sorted(slices.Values(scopes)) {
+		b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, "scope/"+tenant+"/"+s)
+	}
+	return tx.SendBatch(ctx, b).Close()
+}
+
+func lockTenant(ctx context.Context, tx pgx.Tx, tenant string) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(`+lockKey+`)`, "tenant/"+tenant)
+	return err
 }
 
 // Import stores grants without the actor checks Apply makes, for migrations, seeding and the
@@ -104,7 +130,20 @@ func (a *Authorizer) Import(ctx context.Context, tenant string, grants []Grant) 
 	if err := errors.Join(errs...); err != nil {
 		return err
 	}
+	scopes := map[string]bool{}
+	for _, g := range grants {
+		scopes[g.Scope.Key()] = true
+	}
 	return a.inTx(ctx, tenant, "", func(tx pgx.Tx) ([]Grant, []Grant, error) {
+		var err error
+		if len(scopes) > maxScopeLocks {
+			err = lockTenant(ctx, tx, tenant)
+		} else {
+			err = lockScopes(ctx, tx, tenant, slices.Collect(maps.Keys(scopes))...)
+		}
+		if err != nil {
+			return nil, nil, err
+		}
 		granted, err := a.upsert(ctx, tx, tenant, "", grants)
 		return granted, nil, err
 	})
@@ -140,13 +179,27 @@ func dedupe(c Change) (grants, revokes []Binding) {
 func (a *Authorizer) validate(ctx context.Context, tenant string, scope Scope, grants, revokes []Binding) error {
 	var errs []error
 	now := a.cfg.Now()
+	// A change often gives one principal several roles; the host is asked about each once.
+	member := map[Principal]bool{}
+	inTenant := func(p Principal) (bool, error) {
+		if ok, asked := member[p]; asked {
+			return ok, nil
+		}
+		err := a.cfg.ValidatePrincipal(ctx, a.db, tenant, p)
+		if err != nil && !errors.Is(err, ErrInvalid) {
+			return false, err
+		}
+		member[p] = err == nil
+		return err == nil, nil
+	}
 	for _, b := range grants {
 		bad := a.checkBinding(scope, b, now)
 		if len(bad) == 0 && b.Principal.Kind != Everyone {
-			if err := a.cfg.ValidatePrincipal(ctx, a.db, tenant, b.Principal); err != nil {
-				if !errors.Is(err, ErrInvalid) {
-					return err
-				}
+			ok, err := inTenant(b.Principal)
+			if err != nil {
+				return err
+			}
+			if !ok {
 				bad = append(bad, &InvalidError{Binding: b, Reason: "not in the tenant"})
 			}
 		}
@@ -191,7 +244,7 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 	if actor.User != "" && actor.User == on.Owner && a.ownerHolds(scope.Type, manage) {
 		return nil
 	}
-	held, err := a.heldGrants(ctx, q, on.Tenant, actor.principals(), on.Path())
+	held, err := a.heldBindings(ctx, q, on.Tenant, actor.principals(), on.path())
 	if err != nil {
 		return err
 	}
@@ -201,7 +254,8 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 		var until time.Time
 		for _, g := range held {
 			def, known := a.roles[g.Role]
-			if !known || !def.Gives(p) || !slices.ContainsFunc(types, def.GrantableOn) {
+			if !known || !def.Gives(p) || !slices.ContainsFunc(types, def.GrantableOn) ||
+				g.Principal.Kind == Everyone && p.managesAccess() {
 				continue
 			}
 			ok = true
@@ -405,33 +459,37 @@ func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) (
 	return collectGrants(rows)
 }
 
-// DeleteScope removes every grant on a scope, as when the resource or container is deleted.
+// DeleteScope removes every grant on a scope, as when the resource or container is deleted. It
+// waits for a change to the scope in progress, so a grant that change makes is removed too.
 func (a *Authorizer) DeleteScope(ctx context.Context, tenant string, s Scope) error {
-	return a.delete(ctx, tenant, "scope = $2", s.Key())
+	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lockScopes(ctx, tx, tenant, s.Key()) }, "scope = $2", s.Key())
 }
 
 // DeletePrincipal removes every grant to a user or group, as when it is deleted.
 func (a *Authorizer) DeletePrincipal(ctx context.Context, tenant string, p Principal) error {
-	return a.delete(ctx, tenant, "principal = $2", p.key())
+	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lockTenant(ctx, tx, tenant) }, "principal = $2", p.key())
 }
 
 // DeleteTenant removes every grant in a tenant.
 func (a *Authorizer) DeleteTenant(ctx context.Context, tenant string) error {
-	return a.delete(ctx, tenant, "TRUE")
+	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lockTenant(ctx, tx, tenant) }, "TRUE")
 }
 
-func (a *Authorizer) delete(ctx context.Context, tenant, where string, args ...any) error {
+func (a *Authorizer) delete(ctx context.Context, tenant string, lock func(pgx.Tx) error, where string, args ...any) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
 	query := `DELETE FROM rbac_grants WHERE tenant = $1 AND ` + where
 	args = append([]any{tenant}, args...)
-	// Only OnChange reads what was removed, which for a whole tenant can be every grant it has.
-	if a.cfg.OnChange == nil {
-		_, err := a.db.Exec(ctx, query, args...)
-		return err
-	}
 	return a.inTx(ctx, tenant, "", func(tx pgx.Tx) ([]Grant, []Grant, error) {
+		if err := lock(tx); err != nil {
+			return nil, nil, err
+		}
+		// Only OnChange reads what was removed, which for a whole tenant can be every grant it has.
+		if a.cfg.OnChange == nil {
+			_, err := tx.Exec(ctx, query, args...)
+			return nil, nil, err
+		}
 		rows, err := tx.Query(ctx, query+` RETURNING `+grantColumns, args...)
 		if err != nil {
 			return nil, nil, err
@@ -442,8 +500,11 @@ func (a *Authorizer) delete(ctx context.Context, tenant, where string, args ...a
 }
 
 // DeleteExpired removes grants that have expired, which no longer give anything, and returns
-// how many.
+// how many. It passes over grants a change is holding, rather than wait on it, so the next run
+// removes those.
 func (a *Authorizer) DeleteExpired(ctx context.Context) (int64, error) {
-	tag, err := a.db.Exec(ctx, `DELETE FROM rbac_grants WHERE expires_at <= $1`, a.cfg.Now())
+	tag, err := a.db.Exec(ctx, `
+		DELETE FROM rbac_grants WHERE id IN (
+			SELECT id FROM rbac_grants WHERE expires_at <= $1 FOR UPDATE SKIP LOCKED)`, a.cfg.Now())
 	return tag.RowsAffected(), err
 }

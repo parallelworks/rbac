@@ -37,10 +37,7 @@ func (r RoleDefinition) clone() RoleDefinition {
 
 // managesAccess reports whether the role gives any permission to change grants.
 func (r RoleDefinition) managesAccess() bool {
-	return slices.ContainsFunc(r.Permissions, func(p Permission) bool {
-		_, verb := p.parts()
-		return verb == "grant"
-	})
+	return slices.ContainsFunc(r.Permissions, Permission.managesAccess)
 }
 
 var (
@@ -54,6 +51,12 @@ func validName(s string) bool { return typeName.MatchString(s) }
 // Valid reports whether p is `type:verb` in lowercase letters, digits, hyphens and
 // underscores.
 func (p Permission) Valid() bool { return permissionName.MatchString(string(p)) }
+
+// managesAccess reports whether p is a permission to change grants.
+func (p Permission) managesAccess() bool {
+	_, verb := p.parts()
+	return verb == "grant"
+}
 
 func (p Permission) parts() (resourceType, verb string) {
 	resourceType, verb, _ = strings.Cut(string(p), ":")
@@ -117,6 +120,15 @@ func (a *Authorizer) Roles(scopeType string) []RoleDefinition {
 		}
 	}
 	return roles
+}
+
+// reaching lists the scope types whose grants can reach a resource of a type: the tenant, the
+// containers and the type itself. Searches keep to them, so a grant on another resource that a
+// host's stored path lists above this one gives nothing, as it does in a check.
+func (a *Authorizer) reaching(resourceType string) []string {
+	types := append([]string{TenantScope, resourceType}, a.containerTypes...)
+	slices.Sort(types)
+	return slices.Compact(types)
 }
 
 // contains reports whether a scope type holds resources: a container type or the tenant.

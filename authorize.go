@@ -65,19 +65,19 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 	}
 
 	if !explain {
-		roles, err := a.heldRoles(ctx, a.db, r.Tenant, s.principals(), r.Path())
+		held, err := a.heldBindings(ctx, a.db, r.Tenant, s.principalsFor(p), r.path())
 		if err != nil {
 			return Decision{}, err
 		}
-		for _, id := range roles {
-			if a.gives(id, p, r.Type) {
+		for _, b := range held {
+			if a.gives(b.Role, p, r.Type) {
 				return Decision{Allowed: true}, nil
 			}
 		}
 		return Decision{Reason: "no grant gives it"}, nil
 	}
 
-	grants, err := a.heldGrants(ctx, a.db, r.Tenant, s.principals(), r.Path())
+	grants, err := a.heldGrants(ctx, a.db, r.Tenant, s.principalsFor(p), r.path())
 	if err != nil {
 		return Decision{}, err
 	}
@@ -115,13 +115,17 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 	}
 	// A container's owner holds its grant permission only through grants.
 	if !owner || a.contains(r.Type) {
-		roles, err := a.heldRoles(ctx, a.db, r.Tenant, s.principals(), r.Path())
+		held, err := a.heldBindings(ctx, a.db, r.Tenant, s.principals(), r.path())
 		if err != nil {
 			return nil, err
 		}
-		for _, id := range roles {
-			if def, ok := a.roles[id]; ok && def.GrantableOn(r.Type) {
-				candidates = append(candidates, def.Permissions...)
+		for _, b := range held {
+			if def, ok := a.roles[b.Role]; ok && def.GrantableOn(r.Type) {
+				for _, p := range def.Permissions {
+					if b.Principal.Kind != Everyone || !p.managesAccess() {
+						candidates = append(candidates, p)
+					}
+				}
 			}
 		}
 	}
@@ -164,9 +168,9 @@ func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]P
 	rows, err := a.db.Query(ctx, `
 		SELECT DISTINCT principal_kind, principal_id FROM rbac_grants
 		WHERE tenant = $1 AND scope = ANY($2::text[]) AND role = ANY($3::text[])
-		  AND (expires_at IS NULL OR expires_at > $4)
+		  AND (expires_at IS NULL OR expires_at > $4) AND (principal_kind <> 'everyone' OR NOT $5)
 		ORDER BY principal_kind, principal_id`,
-		r.Tenant, r.Path(), roles, a.cfg.Now())
+		r.Tenant, r.path(), roles, a.cfg.Now(), p.managesAccess())
 	if err != nil {
 		return nil, err
 	}
@@ -187,7 +191,7 @@ func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]P
 }
 
 // Reach is where a subject may do something: every resource of the type in the tenant, or
-// those whose Path holds one of Scopes.
+// those whose path (Authorizer.Path) holds one of Scopes.
 type Reach struct {
 	All    bool
 	Scopes []Scope
@@ -210,9 +214,9 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, res
 	rows, err := a.db.Query(ctx, `
 		SELECT DISTINCT scope FROM rbac_grants
 		WHERE tenant = $1 AND principal = ANY($2::text[]) AND role = ANY($3::text[])
-		  AND (expires_at IS NULL OR expires_at > $4)
+		  AND (expires_at IS NULL OR expires_at > $4) AND split_part(scope, ':', 1) = ANY($5::text[])
 		ORDER BY scope`,
-		s.Tenant, s.principals(), roles, a.cfg.Now())
+		s.Tenant, s.principalsFor(p), roles, a.cfg.Now(), a.reaching(resourceType))
 	if err != nil {
 		return Reach{}, err
 	}
@@ -251,7 +255,7 @@ type Columns struct {
 	Tenant string
 	// Owner is the resource's owner; empty when resources have none.
 	Owner string
-	// Path is a text[] holding the resource's Resource.Path, with a GIN index.
+	// Path is a text[] holding the resource's Authorizer.Path, with a GIN index.
 	Path string
 }
 
@@ -291,14 +295,15 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, resour
 	if granted {
 		// The grants' tenant is an argument of its own: the host's tenant column needn't be
 		// text, and one argument can't take two types.
-		tenant, principals, rolesArg, now := arg(len(args)), arg(len(args)+1), arg(len(args)+2), arg(len(args)+3)
-		args = append(args, s.Tenant, s.principals(), roles, a.cfg.Now())
+		tenant, principals, rolesArg, now, types := arg(len(args)), arg(len(args)+1), arg(len(args)+2), arg(len(args)+3), arg(len(args)+4)
+		args = append(args, s.Tenant, s.principalsFor(p), roles, a.cfg.Now(), a.reaching(resourceType))
 		// A tenant-wide grant's scope is the tenant's key, which every path holds, so one
 		// overlap covers every scope and the host's GIN index serves it. The keys take the
 		// default collation so that index applies.
 		ors = append(ors, fmt.Sprintf(`%s && ARRAY(SELECT g.scope COLLATE "default" FROM rbac_grants g
 			WHERE g.tenant = %s::text AND g.principal = ANY(%s::text[]) AND g.role = ANY(%s::text[])
-			  AND (g.expires_at IS NULL OR g.expires_at > %s))`, cols.Path, tenant, principals, rolesArg, now))
+			  AND (g.expires_at IS NULL OR g.expires_at > %s) AND split_part(g.scope, ':', 1) = ANY(%s::text[]))`,
+			cols.Path, tenant, principals, rolesArg, now, types))
 	}
 	return Predicate{
 		SQL:  fmt.Sprintf("(%s = %s AND (%s))", cols.Tenant, arg(0), strings.Join(ors, " OR ")),
@@ -306,17 +311,29 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, resour
 	}, nil
 }
 
-// heldRoles returns the roles held by any of principals on any of scopes, not expired.
-func (a *Authorizer) heldRoles(ctx context.Context, q DB, tenant string, principals, scopes []string) ([]Role, error) {
+// heldBindings returns the bindings held by any of principals on any of scopes, not expired:
+// only what the key index holds, so it is an index-only scan.
+func (a *Authorizer) heldBindings(ctx context.Context, q DB, tenant string, principals, scopes []string) ([]Binding, error) {
 	rows, err := q.Query(ctx, `
-		SELECT DISTINCT role FROM rbac_grants
+		SELECT principal, role, expires_at FROM rbac_grants
 		WHERE tenant = $1 AND principal = ANY($2::text[]) AND scope = ANY($3::text[])
 		  AND (expires_at IS NULL OR expires_at > $4)`,
 		tenant, principals, scopes, a.cfg.Now())
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, pgx.RowTo[Role])
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Binding, error) {
+		var b Binding
+		var principal string
+		var expires *time.Time
+		err := row.Scan(&principal, &b.Role, &expires)
+		kind, id, _ := strings.Cut(principal, ":")
+		b.Principal = Principal{Kind: PrincipalKind(kind), ID: id}
+		if expires != nil {
+			b.ExpiresAt = *expires
+		}
+		return b, err
+	})
 }
 
 // heldGrants returns the grants held by any of principals on any of scopes, not expired.

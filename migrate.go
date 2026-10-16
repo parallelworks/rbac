@@ -14,10 +14,11 @@ import (
 //go:embed migrations/*.sql
 var migrations embed.FS
 
-// Migrate creates or upgrades the package's tables in the pool's schema, which must exist
-// (pgdb.Migrate creates it). The tables are prefixed rbac_ and their migrations are recorded
-// in their own version table, beside the application's. It is safe to call from several
-// replicas at once, and never runs by itself.
+// Migrate creates or upgrades the package's tables in the pool's schema, creating the schema
+// if needed, so it can run before the application's migrations when they refer to the tables.
+// The tables are prefixed rbac_ and their migrations are recorded in their own version table,
+// beside the application's. It is safe to call from several replicas at once, and never runs
+// by itself.
 func Migrate(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger) error {
 	fsys, err := fs.Sub(migrations, "migrations")
 	if err != nil {
