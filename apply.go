@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -40,7 +41,8 @@ func (e *InvalidError) Is(target error) bool { return target == ErrInvalid }
 //     public, and only a role marked Public can be granted to the public.
 //
 // Anonymous subjects change nothing. A grant outlives the actor's own access: revoking that
-// access leaves the grants the actor made, as in cloud IAM.
+// access leaves the grants the actor made, as in cloud IAM, so a time-limited power to change
+// grants can make lasting ones, to the actor too. Time-limit roles that can't change grants.
 //
 // Bindings are checked only once the actor may make the change, so a refused actor learns
 // nothing about principals. Every invalid binding is reported at once, joined; an error from
@@ -268,10 +270,10 @@ func (a *Authorizer) checkBinding(tenant string, scope Scope, b Binding, now tim
 	return errs
 }
 
-// authority is an actor's grants on a resource's path, and how to read their roles.
+// authority is an actor's grants on a resource's path.
 type authority struct {
+	a    *Authorizer
 	held []Binding
-	role func(Role) (RoleDefinition, bool)
 }
 
 // power is what an actor may change on scopes of a type: any role it holds everything of, and
@@ -289,10 +291,7 @@ func (a *Authorizer) authorityOn(ctx context.Context, q DB, actor Subject, on Re
 	if err != nil {
 		return authority{}, err
 	}
-	return authority{held: held, role: func(id Role) (RoleDefinition, bool) {
-		r, ok := a.roles[id]
-		return r, ok
-	}}, nil
+	return authority{a: a, held: held}, nil
 }
 
 // over is what the actor's grants let it change on scopes of a type.
@@ -300,10 +299,10 @@ func (au authority) over(scopeType string) power {
 	pw := power{listed: map[Role]bool{}}
 	manage := GrantPermission(scopeType)
 	for _, g := range au.held {
-		def, known := au.role(g.Role)
-		if !known || !def.Gives(manage) || !def.GrantableOn(scopeType) || !g.Principal.carries(def, manage) {
+		if !au.a.gives(g.Principal, g.Role, manage, scopeType) {
 			continue
 		}
+		def := au.a.roles[g.Role]
 		if len(def.GrantableRoles) == 0 {
 			pw.any = true
 		}
@@ -316,16 +315,13 @@ func (au authority) over(scopeType string) power {
 
 // holds reports whether the actor holds p for resources of a type.
 func (au authority) holds(p Permission, resourceType string) bool {
-	return slices.ContainsFunc(au.held, func(g Binding) bool {
-		def, known := au.role(g.Role)
-		return known && def.Gives(p) && def.GrantableOn(resourceType) && g.Principal.carries(def, p)
-	})
+	return slices.ContainsFunc(au.held, func(g Binding) bool { return au.a.gives(g.Principal, g.Role, p, resourceType) })
 }
 
 // mayGrant reports whether the actor may grant def on a scope of a type, and if not, a
 // permission it lacks: its power there lists def, or lets it grant any role and it holds
-// everything def gives.
-func (a *Authorizer) mayGrant(au authority, scopeType string, def RoleDefinition, seen map[Role]bool) (Permission, bool) {
+// everything def gives. seen is holdsRole's, fresh for each grant decided.
+func (a *Authorizer) mayGrant(au authority, scopeType string, def RoleDefinition, seen map[string]bool) (Permission, bool) {
 	pw := au.over(scopeType)
 	if pw.listed[def.ID] {
 		return "", true
@@ -345,14 +341,19 @@ func (a *Authorizer) mayGrant(au authority, scopeType string, def RoleDefinition
 // holdsRole reports whether the actor holds everything def gives for each of types, and if
 // not, a permission it lacks. A permission to change grants on a type gives a power there: to
 // grant any role, or the listed ones. The actor must have as much, or a grant could hand on
-// more than it has: an unlimited one itself, or the power to grant each listed role. seen are
-// the roles being checked, so a role that lists itself is checked once.
-func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string, seen map[Role]bool) (Permission, bool) {
-	if seen[def.ID] {
+// more than it has: an unlimited one itself, or the power to grant each listed role that can
+// be granted there.
+//
+// seen are the roles, with the types their grant reaches, already checked or being checked for
+// this grant. Each is checked once: the grant needs every check to pass, so checking one again,
+// as for a role that lists itself or one that lists it back, adds nothing. Without it, roles
+// listing each other would be checked along every order they can be reached in.
+func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string, seen map[string]bool) (Permission, bool) {
+	key := string(def.ID) + " " + strings.Join(types, ",")
+	if seen[key] {
 		return "", true
 	}
-	seen[def.ID] = true
-	defer delete(seen, def.ID)
+	seen[key] = true
 	for _, p := range def.Permissions {
 		t, verb := p.parts()
 		if verb != "grant" {
@@ -370,12 +371,16 @@ func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string,
 			continue
 		}
 		for _, id := range def.GrantableRoles {
-			listed, known := au.role(id)
+			listed, known := a.roles[id]
 			if !known {
 				return p, false
 			}
-			if _, ok := a.mayGrant(au, t, listed, seen); !ok {
-				return p, false
+			// Its holders can't grant a role on a scope that can't take it.
+			if !a.grantableOn(listed, t) {
+				continue
+			}
+			if missing, ok := a.mayGrant(au, t, listed, seen); !ok {
+				return missing, false
 			}
 		}
 	}
@@ -402,12 +407,12 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 		}
 	}
 	for _, b := range grants {
-		def, known := au.role(b.Role)
+		def, known := a.roles[b.Role]
 		if !known || !a.grantableOn(def, scope.Type) {
 			// validate reports it as invalid rather than as an escalation.
 			continue
 		}
-		if p, ok := a.mayGrant(au, scope.Type, def, map[Role]bool{}); !ok {
+		if p, ok := a.mayGrant(au, scope.Type, def, map[string]bool{}); !ok {
 			reason := fmt.Sprintf("the actor can't grant %s without holding %s here", b.Role, p)
 			if !pw.any {
 				reason = fmt.Sprintf("the actor may not grant %s here", b.Role)
@@ -437,7 +442,10 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 	}
 	var roles []RoleDefinition
 	for _, def := range a.cfg.Catalog {
-		if _, ok := a.mayGrant(au, r.Type, def, map[Role]bool{}); ok && a.grantableOn(def, r.Type) {
+		if !a.grantableOn(def, r.Type) {
+			continue
+		}
+		if _, ok := a.mayGrant(au, r.Type, def, map[string]bool{}); ok {
 			roles = append(roles, def.clone())
 		}
 	}
@@ -593,27 +601,40 @@ func (a *Authorizer) DeletePrincipal(ctx context.Context, tenant string, p Princ
 // DeletePrincipalEverywhere removes every grant to an identity or group in every tenant, as
 // when it is deleted. Delete it from the host first, so Config.ValidatePrincipal refuses new
 // grants to it. Each tenant's removals reach Config.OnChange as a change of their own.
+//
+// Each tenant's removal takes two locks, so it removes a batch of tenants per transaction, to
+// keep a principal in many tenants from filling PostgreSQL's lock table: on an error, the
+// batches before it stay removed, and calling it again removes the rest. Under WithTx every
+// batch is in the host's transaction, and its locks last until that ends.
 func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, p Principal) error {
 	if p.broad() || !p.wellFormed("") {
 		return fmt.Errorf("%w: principal %q is not an identity or group", ErrInvalid, p.key())
 	}
-	return pgx.BeginFunc(ctx, a.db, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT DISTINCT tenant FROM rbac_grants WHERE principal = $1 ORDER BY tenant`, p.key())
-		if err != nil {
-			return err
-		}
-		tenants, err := pgx.CollectRows(rows, pgx.RowTo[string])
-		if err != nil {
-			return err
-		}
-		// In tenant order, so two of these for one principal never deadlock.
-		for _, t := range tenants {
-			if err := a.WithTx(tx).DeletePrincipal(ctx, t, p); err != nil {
+	const batch = maxLocks / 2
+	for {
+		var n int
+		err := pgx.BeginFunc(ctx, a.db, func(tx pgx.Tx) error {
+			rows, err := tx.Query(ctx, `SELECT DISTINCT tenant FROM rbac_grants WHERE principal = $1 ORDER BY tenant LIMIT $2`, p.key(), batch)
+			if err != nil {
 				return err
 			}
+			tenants, err := pgx.CollectRows(rows, pgx.RowTo[string])
+			if err != nil {
+				return err
+			}
+			n = len(tenants)
+			// In tenant order, so two of these for one principal never deadlock.
+			for _, t := range tenants {
+				if err := a.WithTx(tx).DeletePrincipal(ctx, t, p); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil || n < batch {
+			return err
 		}
-		return nil
-	})
+	}
 }
 
 // DeleteTenant removes every grant in a tenant.

@@ -1491,8 +1491,10 @@ func TestGrantingARoleNeedsItsPowerToChangeGrants(t *testing.T) {
 		return rbac.Change{Grant: []rbac.Binding{{Role: role, Principal: rbac.Principal{Kind: rbac.User, ID: id}}}}
 	}
 
-	// Holding what a role lists isn't holding what its holders may grant through it.
-	if err := h.authz.Apply(ctx, user("sharer"), cluster, self("sharer", "cluster.helpdesk")); !errors.Is(err, rbac.ErrDenied) {
+	// Holding what a role lists isn't holding what its holders may grant through it, and the
+	// refusal names what the actor lacks.
+	var denied *rbac.DeniedError
+	if err := h.authz.Apply(ctx, user("sharer"), cluster, self("sharer", "cluster.helpdesk")); !errors.As(err, &denied) || denied.Permission != root {
 		t.Fatalf("granting a role that lets its holders grant sudo, without root: %v", err)
 	}
 	// A grant permission limited to some roles isn't the unlimited one a role without a list gives.
@@ -1516,5 +1518,62 @@ func TestGrantingARoleNeedsItsPowerToChangeGrants(t *testing.T) {
 	}
 	if got, err := h.authz.Grantable(ctx, user("sharer"), cluster); err != nil || slices.ContainsFunc(got, func(r rbac.RoleDefinition) bool { return r.ID == "cluster.helpdesk" }) {
 		t.Fatalf("Grantable offers a role whose listed roles the actor can't grant: %v, %v", got, err)
+	}
+}
+
+func TestAListedRoleCountsOnlyWhereItCanBeGranted(t *testing.T) {
+	viewer := rbac.RoleDefinition{ID: "workspace.viewer", Permissions: []rbac.Permission{"workspace:view"}, ResourceTypes: []string{"workspace"}}
+	// Its cluster:grant can't hand out the workspace role it lists: a cluster can't take it.
+	manager := rbac.RoleDefinition{
+		ID: "manager", Permissions: []rbac.Permission{"workspace:grant", grantC}, ResourceTypes: []string{"workspace", "cluster"},
+		GrantableRoles: []rbac.Role{"workspace.viewer"},
+	}
+	clusters := rbac.RoleDefinition{ID: "cluster.share", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), viewer, manager, clusters) })
+	org := rbac.Scope{Type: "org", ID: "o1"}
+	h.seed(t, grant(org, "workspace.admin", rbac.User, "a"), grant(org, "cluster.share", rbac.User, "a"))
+	b := rbac.Binding{Role: "manager", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}}
+	if err := h.authz.Apply(t.Context(), user("a"), workspace, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
+		t.Fatalf("granting a role whose listed role only workspaces take: %v", err)
+	}
+}
+
+func TestRolesListingEachOtherAreDecidedOnce(t *testing.T) {
+	var ids []rbac.Role
+	for i := range 12 {
+		ids = append(ids, rbac.Role(fmt.Sprintf("cluster.team%d", i)))
+	}
+	var team []rbac.RoleDefinition
+	for _, id := range ids {
+		team = append(team, rbac.RoleDefinition{ID: id, Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: ids})
+	}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), team...) })
+	// Each role is checked once per grant: along every order they reach each other in, this
+	// would take hours.
+	got, err := h.authz.Grantable(t.Context(), user("owner"), cluster)
+	if err != nil || len(got) != len(catalog)+len(ids)-2 {
+		t.Fatalf("Grantable = %d roles, %v", len(got), err)
+	}
+}
+
+func TestDeletePrincipalEverywhereAcrossManyTenants(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	support := rbac.Principal{Kind: rbac.Group, ID: "support"}
+	const tenants = 70
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		SELECT 'x' || g, 'tenant', 'x' || g, 'group', 'support', 'cluster.login' FROM generate_series(1, $1::int) g`, tenants); err != nil {
+		t.Fatal(err)
+	}
+	h.events = nil
+	if err := h.authz.DeletePrincipalEverywhere(ctx, support); err != nil {
+		t.Fatal(err)
+	}
+	var left int
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM rbac_grants WHERE principal = 'group:support'`).Scan(&left); err != nil || left != 0 {
+		t.Fatalf("%d grants left, %v", left, err)
+	}
+	if len(h.events) != tenants {
+		t.Fatalf("%d changes, want one per tenant", len(h.events))
 	}
 }
