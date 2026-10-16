@@ -2,10 +2,10 @@
 CREATE TABLE rbac_grants (
     id             bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant         text        COLLATE "C" NOT NULL CHECK (tenant <> ''),
-    scope_type     text        COLLATE "C" NOT NULL CHECK (scope_type ~ '^[a-z][a-z0-9_-]*$'),
+    scope_type     text        COLLATE "C" NOT NULL CHECK (scope_type ~ '^[a-z][a-z0-9_-]{0,62}$'),
     scope_id       text        COLLATE "C" NOT NULL,
     -- The host declares its kinds besides user, group, tenant and public.
-    principal_kind text        COLLATE "C" NOT NULL CHECK (principal_kind ~ '^[a-z][a-z0-9_-]*$'),
+    principal_kind text        COLLATE "C" NOT NULL CHECK (principal_kind ~ '^[a-z][a-z0-9_-]{0,62}$'),
     principal_id   text        COLLATE "C" NOT NULL,
     role           text        COLLATE "C" NOT NULL,
     expires_at     timestamptz,

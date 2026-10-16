@@ -70,7 +70,7 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 			return Decision{}, err
 		}
 		for _, b := range held {
-			if a.gives(b.Role, p, r.Type) {
+			if a.gives(b.Principal, b.Role, p, r.Type) {
 				return Decision{Allowed: true}, nil
 			}
 		}
@@ -83,7 +83,7 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 	}
 	d := Decision{Reason: "no grant gives it"}
 	for _, g := range grants {
-		if a.gives(g.Role, p, r.Type) {
+		if a.gives(g.Principal, g.Role, p, r.Type) {
 			d.Grants = append(d.Grants, g)
 		}
 	}
@@ -93,11 +93,11 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 	return d, nil
 }
 
-// gives reports whether a role gives p on a resource type. A role that is no longer in the
-// catalog gives nothing.
-func (a *Authorizer) gives(id Role, p Permission, resourceType string) bool {
+// gives reports whether a grant of a role to a principal gives p on a resource type. A role
+// that is no longer in the catalog gives nothing.
+func (a *Authorizer) gives(to Principal, id Role, p Permission, resourceType string) bool {
 	def, ok := a.roles[id]
-	return ok && def.GrantableOn(resourceType) && def.Gives(p)
+	return ok && def.GrantableOn(resourceType) && def.Gives(p) && a.carries(to, id, p)
 }
 
 // Permissions lists what the subject may do to r, sorted: the AuthZEN action search.
@@ -122,7 +122,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 		for _, b := range held {
 			if def, ok := a.roles[b.Role]; ok && def.GrantableOn(r.Type) {
 				for _, p := range def.Permissions {
-					if b.Principal.canHold(p) {
+					if a.carries(b.Principal, b.Role, p) {
 						candidates = append(candidates, p)
 					}
 				}
@@ -170,8 +170,10 @@ func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]P
 		SELECT DISTINCT principal_kind, principal_id FROM rbac_grants
 		WHERE tenant = $1 AND scope = ANY($2::text[]) AND role = ANY($3::text[])
 		  AND (expires_at IS NULL OR expires_at > $4) AND (NOT $5 OR principal_kind <> ALL($6::text[]))
+		  AND (principal_kind <> $7 OR role = ANY($8::text[]))
 		ORDER BY principal_kind, principal_id`,
-		r.Tenant, r.path(), roles, a.cfg.Now(), p.managesAccess(), []string{string(Tenant), string(Public)})
+		r.Tenant, r.path(), roles, a.cfg.Now(), p.managesAccess(), []string{string(Tenant), string(Public)},
+		string(Public), a.publicRoles(roles))
 	if err != nil {
 		return nil, err
 	}
@@ -183,8 +185,9 @@ func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]P
 	if err != nil {
 		return nil, err
 	}
-	// found is distinct, so only the owner can be listed twice.
-	found = slices.DeleteFunc(found, func(p Principal) bool { return slices.Contains(holders, p) })
+	// found is distinct, so only the owner can be listed twice. A kind the host no longer
+	// declares can't act, so its grants give nothing.
+	found = slices.DeleteFunc(found, func(p Principal) bool { return !a.known(r.Tenant, p) || slices.Contains(holders, p) })
 	return append(holders, found...), nil
 }
 
@@ -206,15 +209,18 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 		return Reach{}, err
 	}
 	reach := Reach{Owned: s.user(tenant) != "" && a.ownerHolds(resourceType, p)}
-	if len(roles) == 0 {
+	principals := s.principalsFor(tenant, p)
+	if len(roles) == 0 || len(principals) == 0 {
 		return reach, nil
 	}
 	rows, err := a.db.Query(ctx, `
 		SELECT DISTINCT scope FROM rbac_grants
 		WHERE tenant = $1 AND principal = ANY($2::text[]) AND role = ANY($3::text[])
 		  AND (expires_at IS NULL OR expires_at > $4) AND split_part(scope, ':', 1) = ANY($5::text[])
+		  AND (principal <> $6 OR role = ANY($7::text[]))
 		ORDER BY scope`,
-		tenant, s.principalsFor(tenant, p), roles, a.cfg.Now(), a.reaching(resourceType))
+		tenant, principals, roles, a.cfg.Now(), a.reaching(resourceType),
+		Principal{Kind: Public}.key(), a.publicRoles(roles))
 	if err != nil {
 		return Reach{}, err
 	}
@@ -280,7 +286,8 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	if err != nil {
 		return Predicate{}, err
 	}
-	granted := len(roles) > 0
+	principals := s.principalsFor(tenant, p)
+	granted := len(roles) > 0 && len(principals) > 0
 	user := s.user(tenant)
 	owner := cols.Owner != "" && user != "" && !removed && a.ownerHolds(resourceType, p)
 	if !granted && !owner {
@@ -298,14 +305,17 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 		// The grants' tenant is an argument of its own: the host's tenant column needn't be
 		// text, and one argument can't take two types.
 		tenantArg, principalsArg, rolesArg, nowArg, typesArg := arg(len(args)), arg(len(args)+1), arg(len(args)+2), arg(len(args)+3), arg(len(args)+4)
-		args = append(args, tenant, s.principalsFor(tenant, p), roles, a.cfg.Now(), a.reaching(resourceType))
+		publicArg, publicRolesArg := arg(len(args)+5), arg(len(args)+6)
+		args = append(args, tenant, principals, roles, a.cfg.Now(), a.reaching(resourceType),
+			Principal{Kind: Public}.key(), a.publicRoles(roles))
 		// A tenant-wide grant's scope is the tenant's key, which every path holds, so one
 		// overlap covers every scope and the host's GIN index serves it. The keys take the
 		// default collation so that index applies.
 		ors = append(ors, fmt.Sprintf(`%s && ARRAY(SELECT g.scope COLLATE "default" FROM rbac_grants g
 			WHERE g.tenant = %s::text AND g.principal = ANY(%s::text[]) AND g.role = ANY(%s::text[])
-			  AND (g.expires_at IS NULL OR g.expires_at > %s) AND split_part(g.scope, ':', 1) = ANY(%s::text[]))`,
-			cols.Path, tenantArg, principalsArg, rolesArg, nowArg, typesArg))
+			  AND (g.expires_at IS NULL OR g.expires_at > %s) AND split_part(g.scope, ':', 1) = ANY(%s::text[])
+			  AND (g.principal <> %s::text OR g.role = ANY(%s::text[])))`,
+			cols.Path, tenantArg, principalsArg, rolesArg, nowArg, typesArg, publicArg, publicRolesArg))
 	}
 	return Predicate{
 		SQL:  fmt.Sprintf("(%s = %s AND (%s))", cols.Tenant, arg(0), strings.Join(ors, " OR ")),
@@ -316,6 +326,9 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 // heldBindings returns the bindings held by any of principals on any of scopes, not expired:
 // only what the key index holds, so it is an index-only scan.
 func (a *Authorizer) heldBindings(ctx context.Context, q DB, tenant string, principals, scopes []string) ([]Binding, error) {
+	if len(principals) == 0 {
+		return nil, nil
+	}
 	rows, err := q.Query(ctx, `
 		SELECT principal, role, expires_at FROM rbac_grants
 		WHERE tenant = $1 AND principal = ANY($2::text[]) AND scope = ANY($3::text[])
@@ -339,6 +352,9 @@ func (a *Authorizer) heldBindings(ctx context.Context, q DB, tenant string, prin
 
 // heldGrants returns the grants held by any of principals on any of scopes, not expired.
 func (a *Authorizer) heldGrants(ctx context.Context, q DB, tenant string, principals, scopes []string) ([]Grant, error) {
+	if len(principals) == 0 {
+		return nil, nil
+	}
 	rows, err := q.Query(ctx, `
 		SELECT `+grantColumns+` FROM rbac_grants
 		WHERE tenant = $1 AND principal = ANY($2::text[]) AND scope = ANY($3::text[])

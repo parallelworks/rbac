@@ -20,7 +20,8 @@ type RoleDefinition struct {
 	// Privileged marks administrative or root-level control, which a host may ask to confirm.
 	Privileged bool
 	// Public lets the role be granted to the public, anyone signed in or not. A privileged role
-	// or one that changes access can't be.
+	// or one that changes access can't be. A grant to the public gives nothing once its role
+	// is no longer Public.
 	Public bool
 }
 
