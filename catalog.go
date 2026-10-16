@@ -107,21 +107,27 @@ func (a *Authorizer) Role(id Role) (RoleDefinition, bool) {
 	return r.clone(), true
 }
 
-// Roles lists the roles that can be granted on a resource type, in catalog order.
-func (a *Authorizer) Roles(resourceType string) []RoleDefinition {
+// Roles lists the roles that can be granted on a scope type, in catalog order: on a container
+// type or the tenant, every role.
+func (a *Authorizer) Roles(scopeType string) []RoleDefinition {
 	var roles []RoleDefinition
 	for _, r := range a.cfg.Catalog {
-		if r.GrantableOn(resourceType) {
-			roles = append(roles, a.roles[r.ID].clone())
+		if a.grantableOn(r, scopeType) {
+			roles = append(roles, r.clone())
 		}
 	}
 	return roles
 }
 
+// contains reports whether a scope type holds resources: a container type or the tenant.
+func (a *Authorizer) contains(scopeType string) bool {
+	return scopeType == TenantScope || a.containers[scopeType]
+}
+
 // grantableOn reports whether a role can be granted on a scope type: one of its own resource
 // types, a container type, or the tenant.
 func (a *Authorizer) grantableOn(r RoleDefinition, scopeType string) bool {
-	return scopeType == TenantScope || a.containers[scopeType] || r.GrantableOn(scopeType)
+	return a.contains(scopeType) || r.GrantableOn(scopeType)
 }
 
 // giving lists the ids of the roles that give p on a resource type.

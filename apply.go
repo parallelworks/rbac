@@ -27,15 +27,19 @@ func (e *InvalidError) Is(target error) bool { return target == ErrInvalid }
 
 // Apply changes the grants on one scope, on, in one transaction, as actor:
 //
-//   - the actor needs `<on's type>:grant` there (through on, an ancestor or the tenant), or
-//     owns it;
-//   - to grant a role, the actor must hold every permission it gives there, or own it;
+//   - the actor needs `<on's type>:grant` there (through on, an ancestor or the tenant), and no
+//     constraint may remove it. The owner of a resource needs no grant, but the owner of a
+//     container doesn't count: a grant there reaches resources they don't own;
+//   - to grant a role, the actor must hold every permission it gives there, or own the
+//     resource;
 //   - a grant the actor makes expires no later than the actor's own access it rests on;
 //   - a role that gives a `:grant` permission can't be granted to everyone;
 //   - revoking needs only `<on's type>:grant`.
 //
-// Every invalid binding is reported at once, joined. Config.OnChange runs in the transaction
-// with the grants that changed.
+// Bindings are checked only once the actor may make the change, so a refused actor learns
+// nothing about principals. Every invalid binding is reported at once, joined; an error from
+// Config.ValidatePrincipal that isn't ErrInvalid fails the change as it is. Config.OnChange
+// runs in the transaction with the grants that changed.
 func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Change) error {
 	if err := on.validate(); err != nil {
 		return err
@@ -48,12 +52,13 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 	if actor.Tenant != on.Tenant {
 		return &DeniedError{Permission: GrantPermission(scope.Type), Scope: scope, Reason: "the scope is in another tenant"}
 	}
-	if err := a.validate(ctx, on.Tenant, scope, grants, revokes); err != nil {
-		return err
-	}
 	return a.inTx(ctx, on.Tenant, actor.User, func(tx pgx.Tx) (granted, revoked []Grant, err error) {
-		// Decided in the transaction, so the actor's access is read as the change is made.
+		// Decided in the transaction, so the actor's access is read as the change is made, and
+		// before principals are looked up, so a refused actor learns nothing about them.
 		if err := a.mayChange(ctx, tx, actor, on, grants); err != nil {
+			return nil, nil, err
+		}
+		if err := a.validate(ctx, on.Tenant, scope, grants, revokes); err != nil {
 			return nil, nil, err
 		}
 		if revoked, err = a.revoke(ctx, tx, on.Tenant, scope, revokes); err != nil {
@@ -87,7 +92,8 @@ func (a *Authorizer) Import(ctx context.Context, tenant string, grants []Grant) 
 	})
 }
 
-// dedupe drops repeated bindings and bindings revoked and granted at once (granted wins).
+// dedupe drops repeated bindings, keeping the last of each grant, and bindings revoked and
+// granted at once (granted wins). What is left keeps the order given, as errors report it.
 func dedupe(c Change) (grants, revokes []Binding) {
 	type id struct {
 		role Role
@@ -101,6 +107,7 @@ func dedupe(c Change) (grants, revokes []Binding) {
 			grants = append(grants, b)
 		}
 	}
+	slices.Reverse(grants)
 	revoked := map[id]bool{}
 	for _, b := range c.Revoke {
 		k := id{b.Role, b.Principal}
@@ -119,7 +126,10 @@ func (a *Authorizer) validate(ctx context.Context, tenant string, scope Scope, g
 		bad := a.checkBinding(scope, b, now)
 		if len(bad) == 0 && b.Principal.Kind != Everyone {
 			if err := a.cfg.ValidatePrincipal(ctx, tenant, b.Principal); err != nil {
-				bad = append(bad, &InvalidError{Binding: b, Reason: "not in the tenant: " + err.Error()})
+				if !errors.Is(err, ErrInvalid) {
+					return err
+				}
+				bad = append(bad, &InvalidError{Binding: b, Reason: "not in the tenant"})
 			}
 		}
 		errs = append(errs, bad...)
@@ -158,7 +168,17 @@ func (a *Authorizer) checkBinding(scope Scope, b Binding, now time.Time) []error
 // mayChange checks the actor's own access on the scope against the change.
 func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Resource, grants []Binding) error {
 	scope := on.Scope()
-	if actor.User != "" && actor.User == on.Owner {
+	manage := GrantPermission(scope.Type)
+	name, err := a.denied(ctx, on.Tenant, scope.Type, manage)
+	if err != nil {
+		return err
+	}
+	if name != "" {
+		return &DeniedError{Permission: manage, Scope: scope, Reason: "removed by " + name}
+	}
+	// Owning a resource gives every permission on it, but a grant on a container or the tenant
+	// reaches everything under it, which its owner doesn't own; changing those takes grants.
+	if actor.User != "" && actor.User == on.Owner && !a.contains(scope.Type) {
 		return nil
 	}
 	held, err := a.heldGrants(ctx, q, on.Tenant, actor.principals(), on.Path())
@@ -187,14 +207,17 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 		return ok, until
 	}
 
-	manage := GrantPermission(scope.Type)
 	ok, limit := holds(manage, []string{scope.Type})
 	if !ok {
 		return &DeniedError{Permission: manage, Scope: scope, Reason: "the actor may not change access here"}
 	}
 	var errs []error
 	for _, b := range grants {
-		def := a.roles[b.Role]
+		def, known := a.roles[b.Role]
+		if !known {
+			// validate reports it as invalid rather than as an escalation.
+			continue
+		}
 		until := limit
 		for _, p := range def.Permissions {
 			ok, held := holds(p, def.ResourceTypes)
@@ -251,16 +274,20 @@ func (a *Authorizer) inTx(ctx context.Context, tenant, actor string, fn func(pgx
 }
 
 // upsert stores grants in one statement, sorted so concurrent changes lock rows in the same
-// order, and returns those it added or whose expiry it changed.
+// order, and returns those it added or whose expiry it changed. Of repeated grants it stores
+// the last, since one statement can't change a row twice.
 func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant, actor string, grants []Grant) ([]Grant, error) {
 	if len(grants) == 0 {
 		return nil, nil
 	}
-	grants = slices.Clone(grants)
-	slices.SortFunc(grants, func(x, y Grant) int {
+	byKey := func(x, y Grant) int {
 		return cmp.Or(cmp.Compare(x.Principal.key(), y.Principal.key()),
 			cmp.Compare(x.Scope.Key(), y.Scope.Key()), cmp.Compare(x.Role, y.Role))
-	})
+	}
+	grants = slices.Clone(grants)
+	slices.Reverse(grants)
+	slices.SortStableFunc(grants, byKey)
+	grants = slices.CompactFunc(grants, func(x, y Grant) bool { return byKey(x, y) == 0 })
 	n := len(grants)
 	scopeTypes, scopeIDs, kinds, ids, roles := make([]string, n), make([]string, n), make([]string, n), make([]string, n), make([]string, n)
 	expires := make([]pgtype.Timestamptz, n)
