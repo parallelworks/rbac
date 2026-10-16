@@ -813,6 +813,9 @@ func TestSubjectsAreAnonymousOrOneIdentity(t *testing.T) {
 		if _, err := h.authz.Reachable(t.Context(), s, login, "t1", "cluster"); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("%s: Reachable %v", name, err)
 		}
+		if err := h.authz.Apply(t.Context(), s, cluster, rbac.Change{}); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s: Apply of no change %v", name, err)
+		}
 	}
 	if !allowed(t, h, user("u"), login, cluster) {
 		t.Fatal("a user is one of the tenant's members")
@@ -996,8 +999,14 @@ func TestTenantMembersAndThePublicNeverGetAGrantPermission(t *testing.T) {
 				t.Fatal(err)
 			}
 			member := user("member")
-			if !allowed(t, h, member, root, cluster) {
-				t.Fatal("the grant still gives its other permissions")
+			// A role that gives cluster:grant can't be public, so a grant of it to the public
+			// gives nothing at all.
+			others := 0
+			if p.Kind == rbac.Tenant {
+				others = 1
+			}
+			if allowed(t, h, member, root, cluster) != (others == 1) {
+				t.Fatal("the grant's other permissions")
 			}
 			if allowed(t, h, member, grantC, cluster) {
 				t.Error("Authorize: cluster:grant")
@@ -1023,7 +1032,7 @@ func TestTenantMembersAndThePublicNeverGetAGrantPermission(t *testing.T) {
 			if _, err := h.pool.Exec(ctx, `INSERT INTO cs VALUES ('t1', $1)`, h.path(t, cluster)); err != nil {
 				t.Fatal(err)
 			}
-			for perm, want := range map[rbac.Permission]int{root: 1, grantC: 0} {
+			for perm, want := range map[rbac.Permission]int{root: others, grantC: 0} {
 				pred, err := h.authz.Filter(ctx, member, perm, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
 				if err != nil {
 					t.Fatal(err)
@@ -1172,6 +1181,7 @@ func TestPublicAccess(t *testing.T) {
 			t.Errorf("%s: Permissions = %v, %v", name, perms, err)
 		}
 		listingsAgree(t, h, resources, s, view)
+		listingsAgree(t, h, resources, s, grantC)
 	}
 	if d, err := h.authz.Explain(ctx, anonymous, view, cluster); err != nil || len(d.Grants) != 1 || d.Grants[0].Principal != public {
 		t.Errorf("Explain = %+v, %v", d, err)
@@ -1191,6 +1201,41 @@ func TestPublicAccess(t *testing.T) {
 	}
 	if allowed(t, h, anonymous, view, cluster) {
 		t.Fatal("deleting the public's grants should end public access")
+	}
+}
+
+func TestAPublicGrantGivesOnlyWhileItsRoleIsPublic(t *testing.T) {
+	viewer := rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), viewer) })
+	ctx := t.Context()
+	resources := hostTable(t, h)
+	public := rbac.Principal{Kind: rbac.Public}
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.viewer", rbac.Public, ""))
+
+	// As if a later catalog made the role privileged, which a public role can't be.
+	viewer.Public, viewer.Privileged, viewer.Permissions = false, true, []rbac.Permission{view, root}
+	later, err := rbac.New(h.pool, rbac.Config{
+		Catalog: append(slices.Clone(catalog), viewer), ContainerTypes: []string{"org", "workspace"},
+		ValidatePrincipal: func(context.Context, rbac.DB, string, rbac.Principal) error { return nil },
+		Now:               func() time.Time { return h.now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.authz = later
+	for name, s := range map[string]rbac.Subject{"anonymous": {}, "a member": user("nobody")} {
+		if allowed(t, h, s, view, cluster) || allowed(t, h, s, root, cluster) {
+			t.Errorf("%s: a grant to the public of a role no longer public gives", name)
+		}
+		if perms, err := h.authz.Permissions(ctx, s, cluster); err != nil || len(perms) != 0 {
+			t.Errorf("%s: Permissions = %v, %v", name, perms, err)
+		}
+		for _, p := range []rbac.Permission{view, root} {
+			listingsAgree(t, h, resources, s, p)
+		}
+	}
+	if holders, err := h.authz.Holders(ctx, cluster, root); err != nil || slices.Contains(holders, public) {
+		t.Errorf("Holders = %v, %v", holders, err)
 	}
 }
 
@@ -1264,6 +1309,9 @@ func TestMachineIdentities(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if holders, err := undeclared.Holders(ctx, cluster, root); err != nil || slices.Contains(holders, ci.Principal) {
+		t.Fatalf("Holders lists a kind no longer declared: %v, %v", holders, err)
+	}
 	revoke := rbac.Change{Revoke: []rbac.Binding{{Role: "cluster.admin", Principal: ci.Principal}}}
 	if err := undeclared.Apply(ctx, user("owner"), cluster, revoke); err != nil {
 		t.Fatalf("revoking a kind no longer declared: %v", err)
@@ -1276,7 +1324,12 @@ func TestMachineIdentities(t *testing.T) {
 func TestTheTableRefusesMalformedPrincipals(t *testing.T) {
 	h := setup(t)
 	for _, p := range []rbac.Principal{
-		{Kind: rbac.Public, ID: "x"}, {Kind: rbac.Tenant, ID: "t2"}, {Kind: rbac.Tenant}, {Kind: rbac.User}, {Kind: "Service Account", ID: "x"},
+		{Kind: rbac.Public, ID: "x"},
+		{Kind: rbac.Tenant, ID: "t2"},
+		{Kind: rbac.Tenant},
+		{Kind: rbac.User},
+		{Kind: "Service Account", ID: "x"},
+		{Kind: rbac.PrincipalKind(strings.Repeat("k", 64)), ID: "x"},
 	} {
 		if _, err := h.pool.Exec(t.Context(), `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
 			VALUES ('t1', 'cluster', 'c1', $1, $2, 'cluster.login')`, p.Kind, p.ID); err == nil {

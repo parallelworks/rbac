@@ -89,10 +89,6 @@ func (p Principal) key() string { return string(p.Kind) + ":" + p.ID }
 // public.
 func (p Principal) broad() bool { return p.Kind == Tenant || p.Kind == Public }
 
-// canHold reports whether a grant to p can give perm: a grant to a tenant's members or the
-// public never gives a permission to change grants, whatever its role gives now or later.
-func (p Principal) canHold(perm Permission) bool { return !p.broad() || !perm.managesAccess() }
-
 // wellFormed reports whether p could hold grants in a tenant, whether or not its kind is
 // declared, as a revoke needs.
 func (p Principal) wellFormed(tenant string) bool {
@@ -115,6 +111,27 @@ func (a *Authorizer) known(tenant string, p Principal) bool {
 
 // acts reports whether a kind of principal can be a Subject: a user or a declared kind.
 func (a *Authorizer) acts(k PrincipalKind) bool { return k == User || a.kinds[k] }
+
+// carries reports whether a grant of a role to p can give perm, whatever the role gives now or
+// later: a grant to a tenant's members or the public never gives a permission to change grants,
+// and one to the public gives only while its role is marked Public.
+func (a *Authorizer) carries(p Principal, role Role, perm Permission) bool {
+	if p.broad() && perm.managesAccess() {
+		return false
+	}
+	return p.Kind != Public || a.roles[role].Public
+}
+
+// publicRoles keeps the roles marked Public, the only ones a grant to the public gives.
+func (a *Authorizer) publicRoles(roles []string) []string {
+	var public []string
+	for _, id := range roles {
+		if a.roles[Role(id)].Public {
+			public = append(public, id)
+		}
+	}
+	return public
+}
 
 // Subject is who is asking: an identity in a tenant and every group it is in there, nested
 // groups included. Build it from the authenticated session, never from request input.

@@ -50,13 +50,13 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 	if err := a.check(on); err != nil {
 		return err
 	}
+	if err := a.subject(actor); err != nil {
+		return err
+	}
 	scope := on.Scope()
 	grants, revokes := dedupe(c)
 	if len(grants)+len(revokes) == 0 {
 		return nil
-	}
-	if err := a.subject(actor); err != nil {
-		return err
 	}
 	manage := GrantPermission(scope.Type)
 	if !actor.member(on.Tenant) {
@@ -224,7 +224,11 @@ func (a *Authorizer) validate(ctx context.Context, tenant string, scope Scope, g
 				return err
 			}
 			if !ok {
-				bad = append(bad, &InvalidError{Binding: b, Reason: "not in the tenant"})
+				reason := "not in the tenant"
+				if b.Principal.Kind == Public {
+					reason = "the tenant doesn't allow public access"
+				}
+				bad = append(bad, &InvalidError{Binding: b, Reason: reason})
 			}
 		}
 		errs = append(errs, bad...)
@@ -280,7 +284,7 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 		var until time.Time
 		for _, g := range held {
 			def, known := a.roles[g.Role]
-			if !known || !def.Gives(p) || !slices.ContainsFunc(types, def.GrantableOn) || !g.Principal.canHold(p) {
+			if !known || !def.Gives(p) || !slices.ContainsFunc(types, def.GrantableOn) || !a.carries(g.Principal, g.Role, p) {
 				continue
 			}
 			ok = true
@@ -455,7 +459,7 @@ type GrantFilter struct {
 }
 
 // Grants lists the grants in force that match the filter: who has access to a resource and
-// through which ancestor, or what a user or group holds (RBAC's assigned roles).
+// through which ancestor, or what a principal holds (RBAC's assigned roles).
 func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) ([]Grant, error) {
 	if tenant == "" || len(f.Scopes)+len(f.Principals) == 0 {
 		return nil, fmt.Errorf("%w: Grants needs a tenant and scopes or principals", ErrInvalid)
