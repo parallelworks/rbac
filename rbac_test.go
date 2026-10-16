@@ -440,7 +440,8 @@ func TestApplyPreventsEscalation(t *testing.T) {
 func TestApplyCapsExpiryAtTheActorsOwn(t *testing.T) {
 	h := setup(t)
 	temp := grant(rbac.Scope{Type: "workspace", ID: "w1"}, "workspace.admin", rbac.User, "temp")
-	temp.ExpiresAt = h.now.Add(time.Hour)
+	// Finer than PostgreSQL keeps it.
+	temp.ExpiresAt = h.now.Add(time.Hour + 500*time.Nanosecond)
 	h.seed(t, temp, grant(rbac.Scope{Type: "org", ID: "o1"}, "cluster.login", rbac.User, "temp"))
 	ctx := t.Context()
 	forever := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.Group, ID: "friends"}}
@@ -451,6 +452,11 @@ func TestApplyCapsExpiryAtTheActorsOwn(t *testing.T) {
 	within.ExpiresAt = h.now.Add(30 * time.Minute)
 	if err := h.authz.Apply(ctx, user("temp"), workspace, rbac.Change{Grant: []rbac.Binding{within}}); err != nil {
 		t.Fatalf("a grant within the actor's access: %v", err)
+	}
+	until := forever
+	until.ExpiresAt = temp.ExpiresAt
+	if err := h.authz.Apply(ctx, user("temp"), workspace, rbac.Change{Grant: []rbac.Binding{until}}); err != nil {
+		t.Fatalf("a grant ending when the actor's access does: %v", err)
 	}
 }
 
@@ -548,8 +554,10 @@ func TestImportKeepsTheLastOfRepeatedGrants(t *testing.T) {
 
 func TestNewCopiesTheCatalog(t *testing.T) {
 	roles := slices.Clone(catalog)
+	roles[2].Permissions = slices.Clone(roles[2].Permissions)
 	h := setup(t, func(c *rbac.Config) { c.Catalog = roles })
-	roles[2].Permissions = append(slices.Clone(roles[2].Permissions), root)
+	// In place, as a caller sharing the slice would.
+	roles[2].Permissions[0] = root
 	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
 	reach, err := h.authz.Reachable(t.Context(), user("u"), root, "cluster")
 	if err != nil || len(reach.Scopes) != 0 {
@@ -1067,5 +1075,40 @@ func TestConcurrentChangesAcrossScopesAllCommit(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		t.Error(err)
+	}
+}
+
+func TestHostTransactionsDeletingAPrincipalDontDeadlock(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) { c.OnChange = nil })
+	ctx := t.Context()
+	other := cluster
+	other.ID = "c2"
+	gone := rbac.Principal{Kind: rbac.User, ID: "gone"}
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "gone"))
+	// Each transaction changes its own cluster, then both delete the same user.
+	var applied, wg sync.WaitGroup
+	applied.Add(2)
+	errs := make(chan error, 2)
+	for i, r := range []rbac.Resource{cluster, other} {
+		wg.Go(func() {
+			errs <- pgx.BeginFunc(ctx, h.pool, func(tx pgx.Tx) error {
+				authz := h.authz.WithTx(tx)
+				b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: fmt.Sprintf("u%d", i)}}
+				err := authz.Apply(ctx, user("owner"), r, rbac.Change{Grant: []rbac.Binding{b}})
+				applied.Done()
+				if err != nil {
+					return err
+				}
+				applied.Wait()
+				return authz.DeletePrincipal(ctx, "t1", gone)
+			})
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Error(err)
+		}
 	}
 }
