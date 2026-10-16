@@ -27,8 +27,9 @@ CREATE TABLE rbac_grants (
 -- Who has access to a scope, and deleting a scope's grants.
 CREATE INDEX rbac_grants_scope ON rbac_grants (tenant, scope);
 
--- What an identity or group holds in every tenant, and deleting it everywhere.
-CREATE INDEX rbac_grants_principal ON rbac_grants (principal);
+-- What an identity or group holds in every tenant, and deleting it everywhere: its tenants in
+-- order, from the index alone.
+CREATE INDEX rbac_grants_principal ON rbac_grants (principal, tenant);
 
 -- DeleteExpired, across tenants, without reading the grants that never expire.
 CREATE INDEX rbac_grants_expires ON rbac_grants (expires_at) WHERE expires_at IS NOT NULL;

@@ -297,12 +297,12 @@ type ChangeEvent struct {
 	Revoked []Grant
 }
 
-// Constraint removes a permission on a type of resource in a tenant, for everyone, owners
-// included, such as a policy forbidding root access. On `<type>:grant` it stops changes,
-// grants and revokes alike, on scopes of that type, not grants on a container that reach the
-// type, as a deny on one type's grant permission does in cloud IAM. To keep anyone from having
-// a permission, remove that permission itself. Deny is called for each permission a call
-// considers, so keep it cheap.
+// Constraint removes a permission on a type of resource in a tenant, for everyone, such as a
+// policy forbidding root access. On `<type>:grant` it stops changes, grants and revokes alike,
+// on scopes of that type, not grants on a container that reach the type, as a deny on one
+// type's grant permission does in cloud IAM. To keep anyone from having a permission, remove
+// that permission itself. Deny is called for each permission a call considers, so keep it
+// cheap.
 type Constraint struct {
 	Name string
 	// Deny gets q, what the call runs on, to read the host's policy in the same transaction.
