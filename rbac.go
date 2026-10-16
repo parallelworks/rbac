@@ -288,6 +288,9 @@ type Binding struct {
 	ExpiresAt time.Time
 	// Condition limits it to the requests its expression allows; the zero Condition is none.
 	Condition Condition
+	// Note says why it was made, such as the request or ticket behind it; an activated grant's
+	// is its justification.
+	Note string
 }
 
 // Grant is a binding on a scope, as stored.
@@ -322,10 +325,16 @@ type ChangeEvent struct {
 	// Denies are deny policies created or replaced, as they are now.
 	Denies        []Deny
 	DeletedDenies []Deny
+	// Eligible are eligibilities set, as they are now; Ineligible, those ended.
+	Eligible   []Eligibility
+	Ineligible []Eligibility
+	// Activated are grants an Activate made or extended, the actor activating them.
+	Activated []Grant
 }
 
 func (e ChangeEvent) empty() bool {
-	return len(e.Granted)+len(e.Revoked)+len(e.Roles)+len(e.DeletedRoles)+len(e.Denies)+len(e.DeletedDenies) == 0
+	return len(e.Granted)+len(e.Revoked)+len(e.Roles)+len(e.DeletedRoles)+len(e.Denies)+len(e.DeletedDenies)+
+		len(e.Eligible)+len(e.Ineligible)+len(e.Activated) == 0
 }
 
 // Constraint removes a permission on a type of resource in a tenant, for everyone, such as a

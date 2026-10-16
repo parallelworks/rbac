@@ -389,11 +389,15 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		if err != nil {
 			return ChangeEvent{}, err
 		}
+		ended, err := a.removeEligible(ctx, tx, tenant, "role = $2", id)
+		if err != nil {
+			return ChangeEvent{}, err
+		}
 		tag, err := tx.Exec(ctx, `DELETE FROM rbac_roles WHERE tenant = $1 AND id = $2`, tenant, id)
 		if err != nil || tag.RowsAffected() == 0 {
-			return ChangeEvent{Revoked: revoked}, err
+			return ChangeEvent{Revoked: revoked, Ineligible: ended}, err
 		}
-		return ChangeEvent{Revoked: revoked, DeletedRoles: []Role{id}}, nil
+		return ChangeEvent{Revoked: revoked, Ineligible: ended, DeletedRoles: []Role{id}}, nil
 	})
 }
 
