@@ -125,6 +125,21 @@ type Resource struct {
 // Scope is the scope the resource itself is.
 func (r Resource) Scope() Scope { return Scope{Type: r.Type, ID: r.ID} }
 
+// check validates a resource, and that every ancestor is a container: owning a resource lets
+// its owner change its grants, so a resource that other resources sit under must be declared
+// a container, whose owner can't.
+func (a *Authorizer) check(r Resource) error {
+	if err := r.validate(); err != nil {
+		return err
+	}
+	for _, s := range r.Ancestors {
+		if s.Type != TenantScope && !a.containers[s.Type] {
+			return fmt.Errorf("%w: ancestor %q is not of a container type", ErrInvalid, s.Key())
+		}
+	}
+	return nil
+}
+
 func (r Resource) validate() error {
 	if r.Tenant == "" {
 		return fmt.Errorf("%w: resource has no tenant", ErrInvalid)
@@ -263,12 +278,13 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 		return nil, err
 	}
 	// The listings read the catalog in order: from the copies, so that a caller changing its
-	// slice after New can't make them disagree with checks.
+	// slices after New can't make them disagree with checks or clear a Deny checked here.
 	catalog := make([]RoleDefinition, len(cfg.Catalog))
 	for i, r := range cfg.Catalog {
 		catalog[i] = roles[r.ID]
 	}
 	cfg.Catalog = catalog
+	cfg.Constraints = slices.Clone(cfg.Constraints)
 	containers := map[string]bool{}
 	for _, t := range cfg.ContainerTypes {
 		if !validName(t) || t == TenantScope {

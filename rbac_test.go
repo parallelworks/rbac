@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -633,6 +634,15 @@ func TestContainerOwnersCantGrantBelowThem(t *testing.T) {
 	if !allowed(t, h, user("ws-owner"), "workspace:view", owned) {
 		t.Fatal("an owner holds every permission on what they own")
 	}
+	if allowed(t, h, user("ws-owner"), "workspace:grant", owned) {
+		t.Fatal("Authorize should agree with Apply that a container's owner can't change its grants")
+	}
+	if perms, err := h.authz.Permissions(t.Context(), user("ws-owner"), owned); err != nil || slices.Contains(perms, "workspace:grant") {
+		t.Fatalf("Permissions = %v, %v", perms, err)
+	}
+	if holders, err := h.authz.Holders(t.Context(), owned, "workspace:grant"); err != nil || len(holders) != 0 {
+		t.Fatalf("Holders(workspace:grant) = %v, %v", holders, err)
+	}
 	self := rbac.Binding{Role: "cluster.admin", Principal: rbac.Principal{Kind: rbac.User, ID: "ws-owner"}}
 	if err := h.authz.Apply(t.Context(), user("ws-owner"), owned, rbac.Change{Grant: []rbac.Binding{self}}); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("owning a workspace mustn't grant the clusters in it: %v", err)
@@ -651,6 +661,53 @@ func TestAFailedPrincipalLookupFailsTheChange(t *testing.T) {
 	}
 }
 
+func TestHooksCanUseTheBusyPool(t *testing.T) {
+	pool := pgdbtest.Open(t, urlEnv, "pool_max_conns=1")
+	if err := pgdb.Migrate(t.Context(), pool, pgdb.Migrations{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rbac.Migrate(t.Context(), pool, nil); err != nil {
+		t.Fatal(err)
+	}
+	query := func(ctx context.Context) error {
+		var one int
+		return pool.QueryRow(ctx, "SELECT 1").Scan(&one)
+	}
+	authz, err := rbac.New(pool, rbac.Config{
+		Catalog:           catalog,
+		ContainerTypes:    []string{"org", "workspace"},
+		ValidatePrincipal: func(ctx context.Context, _ string, _ rbac.Principal) error { return query(ctx) },
+		Constraints: []rbac.Constraint{{Name: "lookup", Deny: func(ctx context.Context, _, _ string, _ rbac.Permission) (bool, error) {
+			return false, query(ctx)
+		}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}
+	if err := authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
+		t.Fatalf("a hook on the pool the change runs on: %v", err)
+	}
+}
+
+func TestReGrantingAnExpiredGrantRecordsTheNewActor(t *testing.T) {
+	h := setup(t)
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	g.ExpiresAt = h.now.Add(time.Hour)
+	h.seed(t, g)
+	h.now = h.now.Add(2 * time.Hour)
+	b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}
+	if err := h.authz.Apply(t.Context(), user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := h.authz.Grants(t.Context(), "t1", rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}})
+	if err != nil || len(got) != 1 || got[0].CreatedBy != "owner" {
+		t.Fatalf("Grants = %+v, %v", got, err)
+	}
+}
+
 func TestEveryoneIsOnlyUsers(t *testing.T) {
 	h := setup(t)
 	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.Everyone, ""))
@@ -659,5 +716,83 @@ func TestEveryoneIsOnlyUsers(t *testing.T) {
 	}
 	if !allowed(t, h, user("u"), login, cluster) {
 		t.Fatal("a user is one of everyone")
+	}
+}
+
+func TestAncestorsMustBeContainers(t *testing.T) {
+	h := setup(t)
+	job := rbac.Resource{Tenant: "t1", Type: "job", ID: "j1", Ancestors: []rbac.Scope{cluster.Scope()}}
+	if err := h.authz.Authorize(t.Context(), user("owner"), "job:view", job); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a resource under a non-container: %v", err)
+	}
+}
+
+func TestEscalationCoversEveryTypeAGrantReaches(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), rbac.RoleDefinition{
+			ID: "multi.view", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster", "job"},
+		})
+	})
+	h.seed(t,
+		grant(rbac.Scope{Type: "workspace", ID: "w1"}, "workspace.admin", rbac.User, "m"),
+		grant(rbac.Scope{Type: "org", ID: "o1"}, "cluster.admin", rbac.User, "m"),
+	)
+	b := rbac.Binding{Role: "multi.view", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}}
+	// On the workspace the grant reaches jobs too, where m holds nothing.
+	if err := h.authz.Apply(t.Context(), user("m"), workspace, rbac.Change{Grant: []rbac.Binding{b}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("granting a role for types the actor doesn't hold: %v", err)
+	}
+	// On one cluster it reaches only that cluster, where m holds cluster:view.
+	if err := h.authz.Apply(t.Context(), user("m"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
+		t.Fatalf("granting on a resource the actor holds it on: %v", err)
+	}
+}
+
+func TestOwnersHoldTheCatalogsPermissions(t *testing.T) {
+	h := setup(t)
+	if !allowed(t, h, user("owner"), root, cluster) {
+		t.Fatal("an owner holds every permission a role gives on the type")
+	}
+	for _, p := range []rbac.Permission{"cluster:delete", "workspace:view"} {
+		if allowed(t, h, user("owner"), p, cluster) {
+			t.Errorf("an owner holds %s, which no role gives on clusters", p)
+		}
+	}
+}
+
+func TestConcurrentChangesToAScopeAllCommit(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) { c.OnChange = nil })
+	bind := func(id string) rbac.Binding {
+		return rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: id}}
+	}
+	ids := []string{"a", "b", "c", "d"}
+	var wg sync.WaitGroup
+	errs := make(chan error, 64)
+	for w := range 8 {
+		wg.Go(func() {
+			for i := range 8 {
+				var c rbac.Change
+				for j, id := range ids {
+					if (w+i+j)%2 == 0 {
+						c.Grant = append(c.Grant, bind(id))
+					} else {
+						c.Revoke = append(c.Revoke, bind(id))
+					}
+				}
+				if w%2 == 1 {
+					slices.Reverse(c.Grant)
+					slices.Reverse(c.Revoke)
+				}
+				if err := h.authz.Apply(t.Context(), user("owner"), cluster, c); err != nil {
+					errs <- err
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
 	}
 }

@@ -124,6 +124,16 @@ func (a *Authorizer) contains(scopeType string) bool {
 	return scopeType == TenantScope || a.containers[scopeType]
 }
 
+// ownerHolds reports whether owning a resource of a type gives p: every permission a role
+// gives on the type, except changing the grants on a container or the tenant, which reach
+// what its owner doesn't own.
+func (a *Authorizer) ownerHolds(resourceType string, p Permission) bool {
+	if a.contains(resourceType) && p == GrantPermission(resourceType) {
+		return false
+	}
+	return slices.Contains(a.permissionsOn(resourceType), p)
+}
+
 // grantableOn reports whether a role can be granted on a scope type: one of its own resource
 // types, a container type, or the tenant.
 func (a *Authorizer) grantableOn(r RoleDefinition, scopeType string) bool {

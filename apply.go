@@ -38,10 +38,11 @@ func (e *InvalidError) Is(target error) bool { return target == ErrInvalid }
 //
 // Bindings are checked only once the actor may make the change, so a refused actor learns
 // nothing about principals. Every invalid binding is reported at once, joined; an error from
-// Config.ValidatePrincipal that isn't ErrInvalid fails the change as it is. Config.OnChange
-// runs in the transaction with the grants that changed.
+// Config.ValidatePrincipal that isn't ErrInvalid fails the change as it is. Constraints and
+// Config.ValidatePrincipal run before the transaction, so they may use the same pool;
+// Config.OnChange runs in it with the grants that changed.
 func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Change) error {
-	if err := on.validate(); err != nil {
+	if err := a.check(on); err != nil {
 		return err
 	}
 	scope := on.Scope()
@@ -49,16 +50,32 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 	if len(grants)+len(revokes) == 0 {
 		return nil
 	}
+	manage := GrantPermission(scope.Type)
 	if actor.Tenant != on.Tenant {
-		return &DeniedError{Permission: GrantPermission(scope.Type), Scope: scope, Reason: "the scope is in another tenant"}
+		return &DeniedError{Permission: manage, Scope: scope, Reason: "the scope is in another tenant"}
+	}
+	// The hooks run outside the transaction: one that queries the pool while the transaction
+	// holds a connection can wait forever on a busy pool.
+	name, err := a.denied(ctx, on.Tenant, scope.Type, manage)
+	if err != nil {
+		return err
+	}
+	if name != "" {
+		return &DeniedError{Permission: manage, Scope: scope, Reason: "removed by " + name}
+	}
+	if err := a.mayChange(ctx, a.db, actor, on, grants); err != nil {
+		return err
+	}
+	if err := a.validate(ctx, on.Tenant, scope, grants, revokes); err != nil {
+		return err
 	}
 	return a.inTx(ctx, on.Tenant, actor.User, func(tx pgx.Tx) (granted, revoked []Grant, err error) {
-		// Decided in the transaction, so the actor's access is read as the change is made, and
-		// before principals are looked up, so a refused actor learns nothing about them.
-		if err := a.mayChange(ctx, tx, actor, on, grants); err != nil {
+		// One change to a scope at a time, so two changes can't deadlock on its rows.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "rbac/"+on.Tenant+"/"+scope.Key()); err != nil {
 			return nil, nil, err
 		}
-		if err := a.validate(ctx, on.Tenant, scope, grants, revokes); err != nil {
+		// Decided again in the transaction, so the actor's access is read as the change is made.
+		if err := a.mayChange(ctx, tx, actor, on, grants); err != nil {
 			return nil, nil, err
 		}
 		if revoked, err = a.revoke(ctx, tx, on.Tenant, scope, revokes); err != nil {
@@ -165,20 +182,12 @@ func (a *Authorizer) checkBinding(scope Scope, b Binding, now time.Time) []error
 	return errs
 }
 
-// mayChange checks the actor's own access on the scope against the change.
+// mayChange checks the actor's own access on the scope against the change, once Apply has
+// checked the constraints.
 func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Resource, grants []Binding) error {
 	scope := on.Scope()
 	manage := GrantPermission(scope.Type)
-	name, err := a.denied(ctx, on.Tenant, scope.Type, manage)
-	if err != nil {
-		return err
-	}
-	if name != "" {
-		return &DeniedError{Permission: manage, Scope: scope, Reason: "removed by " + name}
-	}
-	// Owning a resource gives every permission on it, but a grant on a container or the tenant
-	// reaches everything under it, which its owner doesn't own; changing those takes grants.
-	if actor.User != "" && actor.User == on.Owner && !a.contains(scope.Type) {
+	if actor.User != "" && actor.User == on.Owner && a.ownerHolds(scope.Type, manage) {
 		return nil
 	}
 	held, err := a.heldGrants(ctx, q, on.Tenant, actor.principals(), on.Path())
@@ -212,6 +221,7 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 		return &DeniedError{Permission: manage, Scope: scope, Reason: "the actor may not change access here"}
 	}
 	var errs []error
+bindings:
 	for _, b := range grants {
 		def, known := a.roles[b.Role]
 		if !known {
@@ -220,13 +230,19 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 		}
 		until := limit
 		for _, p := range def.Permissions {
-			ok, held := holds(p, def.ResourceTypes)
+			// On a container or the tenant the grant reaches every type the role is for, so the
+			// actor must hold p for each of them; on a resource, for its own type.
+			types := []string{scope.Type}
+			if a.contains(scope.Type) {
+				types = def.ResourceTypes
+			}
+			ok, held := holdsEach(holds, p, types)
 			if !ok {
 				errs = append(errs, &DeniedError{
 					Permission: p, Scope: scope,
 					Reason: fmt.Sprintf("the actor can't grant %s without holding %s here", b.Role, p),
 				})
-				break
+				continue bindings
 			}
 			until = earliest(until, held)
 		}
@@ -238,6 +254,20 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// holdsEach reports whether holds is true for p on every one of types, and until the earliest
+// of their ends.
+func holdsEach(holds func(Permission, []string) (bool, time.Time), p Permission, types []string) (bool, time.Time) {
+	var until time.Time
+	for _, t := range types {
+		ok, held := holds(p, []string{t})
+		if !ok {
+			return false, time.Time{}
+		}
+		until = earliest(until, held)
+	}
+	return len(types) > 0, until
 }
 
 // earliest is the earlier of two ends, where zero is never.
@@ -275,7 +305,8 @@ func (a *Authorizer) inTx(ctx context.Context, tenant, actor string, fn func(pgx
 
 // upsert stores grants in one statement, sorted so concurrent changes lock rows in the same
 // order, and returns those it added or whose expiry it changed. Of repeated grants it stores
-// the last, since one statement can't change a row twice.
+// the last, since one statement can't change a row twice. An expired grant that is still
+// stored gave nothing, so granting it again records the new actor and time.
 func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant, actor string, grants []Grant) ([]Grant, error) {
 	if len(grants) == 0 {
 		return nil, nil
@@ -300,10 +331,12 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant, actor string
 		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at, created_by)
 		SELECT $1, st, si, pk, pi, r, e, $8
 		FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::timestamptz[]) AS t(st, si, pk, pi, r, e)
-		ON CONFLICT ON CONSTRAINT rbac_grants_key DO UPDATE SET expires_at = EXCLUDED.expires_at
+		ON CONFLICT ON CONSTRAINT rbac_grants_key DO UPDATE SET expires_at = EXCLUDED.expires_at,
+		  created_by = CASE WHEN rbac_grants.expires_at <= $9 THEN EXCLUDED.created_by ELSE rbac_grants.created_by END,
+		  created_at = CASE WHEN rbac_grants.expires_at <= $9 THEN EXCLUDED.created_at ELSE rbac_grants.created_at END
 		WHERE rbac_grants.expires_at IS DISTINCT FROM EXCLUDED.expires_at
 		RETURNING `+grantColumns,
-		tenant, scopeTypes, scopeIDs, kinds, ids, roles, expires, actor)
+		tenant, scopeTypes, scopeIDs, kinds, ids, roles, expires, actor, a.cfg.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -383,15 +416,22 @@ func (a *Authorizer) DeletePrincipal(ctx context.Context, tenant string, p Princ
 
 // DeleteTenant removes every grant in a tenant.
 func (a *Authorizer) DeleteTenant(ctx context.Context, tenant string) error {
-	return a.delete(ctx, tenant, "$2::text IS NOT NULL", "")
+	return a.delete(ctx, tenant, "TRUE")
 }
 
-func (a *Authorizer) delete(ctx context.Context, tenant, where string, arg string) error {
+func (a *Authorizer) delete(ctx context.Context, tenant, where string, args ...any) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
+	query := `DELETE FROM rbac_grants WHERE tenant = $1 AND ` + where
+	args = append([]any{tenant}, args...)
+	// Only OnChange reads what was removed, which for a whole tenant can be every grant it has.
+	if a.cfg.OnChange == nil {
+		_, err := a.db.Exec(ctx, query, args...)
+		return err
+	}
 	return a.inTx(ctx, tenant, "", func(tx pgx.Tx) ([]Grant, []Grant, error) {
-		rows, err := tx.Query(ctx, `DELETE FROM rbac_grants WHERE tenant = $1 AND `+where+` RETURNING `+grantColumns, tenant, arg)
+		rows, err := tx.Query(ctx, query+` RETURNING `+grantColumns, args...)
 		if err != nil {
 			return nil, nil, err
 		}
