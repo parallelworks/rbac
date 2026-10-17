@@ -430,9 +430,10 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 
 // WithTx returns an Authorizer that runs on tx, so its changes commit or roll back with the
 // host's own writes. Changes need tx at READ COMMITTED, PostgreSQL's default, and fail in a
-// stricter one, whose snapshot can predate the locks they wait for. Their locks last until tx ends, so two transactions that change the same
-// scopes or principals in opposite orders can deadlock, as with any row locks: PostgreSQL fails
-// one, to be retried. DeleteTenant locks the whole tenant.
+// stricter one, whose snapshot can predate the locks they wait for. Their locks last until tx
+// ends, so two transactions that change the same scopes or principals in opposite orders can
+// deadlock, as with any row locks: PostgreSQL fails one, to be retried. DeleteTenant locks the
+// whole tenant.
 func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 	b := *a
 	b.db = tx
