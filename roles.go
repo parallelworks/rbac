@@ -379,17 +379,13 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		if len(listing) > 0 {
 			return ChangeEvent{}, fmt.Errorf("%w: role %q is a grantable role of %s", ErrInvalid, id, strings.Join(listing, ", "))
 		}
-		// Only OnChange reads what was removed, which can be every grant of a widely held role.
-		var revoked []Grant
-		if a.cfg.OnChange == nil {
-			_, err = tx.Exec(ctx, `DELETE FROM rbac_grants WHERE tenant = $1 AND role = $2 AND role LIKE 'custom.%'`, tenant, id)
-		} else if rows, err = tx.Query(ctx, `DELETE FROM rbac_grants WHERE tenant = $1 AND role = $2 AND role LIKE 'custom.%' RETURNING `+grantColumns, tenant, id); err == nil {
-			revoked, err = collectGrants(rows)
-		}
+		// The LIKE matches the partial indexes on custom roles' grants and eligibilities.
+		const ofRole = "role = $2 AND role LIKE 'custom.%'"
+		revoked, err := a.remove(ctx, tx, tenant, ofRole, id)
 		if err != nil {
 			return ChangeEvent{}, err
 		}
-		ended, err := a.removeEligible(ctx, tx, tenant, "role = $2 AND role LIKE 'custom.%'", id)
+		ended, err := a.removeEligible(ctx, tx, tenant, ofRole, id)
 		if err != nil {
 			return ChangeEvent{}, err
 		}
