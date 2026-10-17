@@ -957,20 +957,8 @@ func (a *Authorizer) delete(ctx context.Context, tenant string, lock func(pgx.Tx
 			}
 		}
 		if del.denies != "" {
-			query, args := `DELETE FROM rbac_denies WHERE tenant = $1 AND `+del.denies, append([]any{tenant}, args...)
-			// Only OnChange reads what was removed, as for grants.
-			if a.cfg.OnChange == nil {
-				if _, err := tx.Exec(ctx, query, args...); err != nil {
-					return ChangeEvent{}, err
-				}
-			} else {
-				rows, err := tx.Query(ctx, query+` RETURNING `+denyColumns, args...)
-				if err != nil {
-					return ChangeEvent{}, err
-				}
-				if e.DeletedDenies, err = collectDenies(rows); err != nil {
-					return ChangeEvent{}, err
-				}
+			if e.DeletedDenies, err = removed(ctx, a, tx, "rbac_denies", denyColumns, collectDenies, tenant, del.denies, args...); err != nil {
+				return ChangeEvent{}, err
 			}
 		}
 		e.Revoked, err = a.remove(ctx, tx, tenant, del.where, args...)
