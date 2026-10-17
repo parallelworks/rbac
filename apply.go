@@ -67,18 +67,8 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 	if len(grants)+len(revokes) == 0 {
 		return nil
 	}
-	manage := GrantPermission(scope.Type)
-	if actor.Principal == (Principal{}) {
-		return &DeniedError{Permission: manage, Scope: scope, Reason: "an anonymous subject changes nothing"}
-	}
-	// The hooks run outside the transaction: one that queries the pool while the transaction
-	// holds a connection can wait forever on a busy pool.
-	name, err := a.denied(ctx, on.Tenant, scope.Type, manage)
-	if err != nil {
+	if err := a.changing(ctx, actor.Principal, on); err != nil {
 		return err
-	}
-	if name != "" {
-		return &DeniedError{Permission: manage, Scope: scope, Reason: "removed by " + name}
 	}
 	au, err := a.mayChange(ctx, a.db, actor, on, grants, revokes)
 	if err != nil {
@@ -116,6 +106,24 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 		granted, err := a.upsert(ctx, tx, on.Tenant, actor.Principal, scopeGrants(scope, grants))
 		return ChangeEvent{Granted: granted, Revoked: revoked}, err
 	})
+}
+
+// changing refuses a change to grants on a scope by an anonymous actor, or one a constraint on
+// `<type>:grant` stops. The constraints run outside the transaction: one that queries the pool
+// while the transaction holds a connection can wait forever on a busy pool.
+func (a *Authorizer) changing(ctx context.Context, actor Principal, on Resource) error {
+	manage := GrantPermission(on.Type)
+	if actor == (Principal{}) {
+		return &DeniedError{Permission: manage, Scope: on.Scope(), Reason: "an anonymous subject changes nothing"}
+	}
+	name, err := a.denied(ctx, on.Tenant, on.Type, manage)
+	if err != nil {
+		return err
+	}
+	if name != "" {
+		return &DeniedError{Permission: manage, Scope: on.Scope(), Reason: "removed by " + name}
+	}
+	return nil
 }
 
 // A change takes its tenant's lock shared, then the lock of each scope and of each principal
@@ -318,14 +326,16 @@ func (a *Authorizer) checkBinding(roles book, tenant string, scope Scope, b Bind
 	if !b.ExpiresAt.IsZero() && !b.ExpiresAt.After(now) {
 		bad("already expired")
 	}
-	if utf8.RuneCountInString(b.Note) > maxNote || !validText(b.Note) {
+	if !validNote(b.Note) {
 		bad(fmt.Sprintf("a note is text of at most %d characters", maxNote))
 	}
 	return errs
 }
 
-// maxNote bounds a note, on a grant or an eligibility.
+// maxNote bounds a note, on a grant or an eligibility, and an activation's justification.
 const maxNote = 2048
+
+func validNote(s string) bool { return utf8.RuneCountInString(s) <= maxNote && validText(s) }
 
 // checkCondition returns why a binding's condition can't be stored. It reads nothing stored, so a
 // change checks it once, before its transaction: compiling a condition can take milliseconds,
@@ -707,7 +717,7 @@ func (a *Authorizer) report(ctx context.Context, tx pgx.Tx, e ChangeEvent) error
 }
 
 // upsert stores grants in one statement, sorted so concurrent changes lock rows in the same
-// order, and returns those it added or whose expiry or condition it changed. Of repeated grants it stores
+// order, and returns those it added or whose expiry, condition or note it changed. Of repeated grants it stores
 // the last, since one statement can't change a row twice. An expired grant that is still
 // stored gave nothing, so granting it again records the new actor and time.
 func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, grants []Grant) ([]Grant, error) {
@@ -776,10 +786,28 @@ func (a *Authorizer) revoke(ctx context.Context, tx pgx.Tx, tenant string, scope
 	return collectGrants(rows)
 }
 
-// GrantFilter picks grants by scope, by principal, or both; at least one is required.
+// GrantFilter picks grants or eligibilities by scope, by principal, or both; at least one is
+// required.
 type GrantFilter struct {
 	Scopes     []Scope
 	Principals []Principal
+}
+
+// sql is the condition picking what the filter matches, on $2 and $3, and their arguments: a
+// statement of its own for each shape, so each plans for the index it can use.
+func (f GrantFilter) sql() (where string, scopes, principals []string) {
+	scopes = make([]string, len(f.Scopes))
+	for i, s := range f.Scopes {
+		scopes[i] = s.Key()
+	}
+	principals = keysOf(f.Principals)
+	switch {
+	case len(principals) == 0:
+		return "scope = ANY($2::text[]) AND $3::text[] IS NULL", scopes, nil
+	case len(scopes) == 0:
+		return "$2::text[] IS NULL AND principal = ANY($3::text[])", nil, principals
+	}
+	return "scope = ANY($2::text[]) AND principal = ANY($3::text[])", scopes, principals
 }
 
 // Grants lists the grants in force that match the filter: who has access to a resource and
@@ -792,23 +820,7 @@ func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) (
 	if tenant == "" || len(f.Scopes)+len(f.Principals) == 0 {
 		return nil, fmt.Errorf("%w: Grants needs a tenant and scopes or principals", ErrInvalid)
 	}
-	scopes := make([]string, len(f.Scopes))
-	for i, s := range f.Scopes {
-		scopes[i] = s.Key()
-	}
-	principals := make([]string, len(f.Principals))
-	for i, p := range f.Principals {
-		principals[i] = p.key()
-	}
-	where := "scope = ANY($2::text[]) AND principal = ANY($3::text[])"
-	switch {
-	case len(principals) == 0:
-		where = "scope = ANY($2::text[]) AND $3::text[] IS NULL"
-		principals = nil
-	case len(scopes) == 0:
-		where = "$2::text[] IS NULL AND principal = ANY($3::text[])"
-		scopes = nil
-	}
+	where, scopes, principals := f.sql()
 	rows, err := a.db.Query(ctx, `
 		SELECT `+grantColumns+` FROM rbac_grants
 		WHERE tenant = $1 AND `+where+` AND (expires_at IS NULL OR expires_at > $4)
@@ -820,7 +832,7 @@ func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) (
 	return collectGrants(rows)
 }
 
-// DeleteScope removes every grant and deny on a scope, as when the resource or container is
+// DeleteScope removes every grant, eligibility and deny on a scope, as when the resource or container is
 // deleted. It waits for a change to the scope in progress, so a grant that change makes is
 // removed too.
 func (a *Authorizer) DeleteScope(ctx context.Context, tenant string, s Scope) error {
@@ -828,7 +840,7 @@ func (a *Authorizer) DeleteScope(ctx context.Context, tenant string, s Scope) er
 		deletion{denies: "scope = $2", where: "scope = $2"}, s.Key())
 }
 
-// DeletePrincipal removes every grant to a principal, as when an identity or group is deleted,
+// DeletePrincipal removes every grant and eligibility of a principal, as when an identity or group is deleted,
 // or every grant to the public, as when a tenant stops allowing public access.
 func (a *Authorizer) DeletePrincipal(ctx context.Context, tenant string, p Principal) error {
 	if !p.wellFormed(tenant) {
@@ -838,9 +850,9 @@ func (a *Authorizer) DeletePrincipal(ctx context.Context, tenant string, p Princ
 		deletion{where: "principal = $2"}, p.key())
 }
 
-// DeletePrincipalEverywhere removes every grant to an identity or group in every tenant, as
-// when it is deleted. Delete it from the host first, so Config.ValidatePrincipal refuses new
-// grants to it. Each tenant's removals reach Config.OnChange as a change of their own.
+// DeletePrincipalEverywhere removes every grant and eligibility of an identity or group in every
+// tenant, as when it is deleted. Delete it from the host first, so Config.ValidatePrincipal
+// refuses new grants to it. Each tenant's removals reach Config.OnChange as a change of their own.
 //
 // Each tenant's removal takes two locks, so it removes a batch of tenants per transaction, to
 // keep a principal in many tenants from filling PostgreSQL's lock table: on an error, the
@@ -889,7 +901,7 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, p Principal)
 	}
 }
 
-// DeleteTenant removes every grant, custom role and deny in a tenant, so a tenant created later
+// DeleteTenant removes every grant, eligibility, custom role and deny in a tenant, so a tenant created later
 // with its id starts with none.
 func (a *Authorizer) DeleteTenant(ctx context.Context, tenant string) error {
 	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lockTenant(ctx, tx, tenant) },
@@ -904,6 +916,7 @@ type deletion struct {
 	denies, where string
 }
 
+// delete removes what del picks in a tenant, once lock holds.
 func (a *Authorizer) delete(ctx context.Context, tenant string, lock func(pgx.Tx) error, del deletion, args ...any) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -949,34 +962,36 @@ func (a *Authorizer) delete(ctx context.Context, tenant string, lock func(pgx.Tx
 	})
 }
 
-// removeEligible deletes the eligibilities in a tenant that where picks, and returns them.
+// removeEligible deletes the eligibilities in a tenant that where picks, and returns them for
+// OnChange.
 func (a *Authorizer) removeEligible(ctx context.Context, tx pgx.Tx, tenant, where string, args ...any) ([]Eligibility, error) {
-	rows, err := tx.Query(ctx, `DELETE FROM rbac_eligibilities WHERE tenant = $1 AND `+where+` RETURNING `+eligibilityColumns,
-		append([]any{tenant}, args...)...)
-	if err != nil {
-		return nil, err
-	}
-	return collectEligibilities(rows)
+	return removed(ctx, a, tx, "rbac_eligibilities", eligibilityColumns, collectEligibilities, tenant, where, args...)
 }
 
 // remove deletes the grants in a tenant that where picks, and returns them for OnChange.
 func (a *Authorizer) remove(ctx context.Context, tx pgx.Tx, tenant, where string, args ...any) ([]Grant, error) {
-	query := `DELETE FROM rbac_grants WHERE tenant = $1 AND ` + where
+	return removed(ctx, a, tx, "rbac_grants", grantColumns, collectGrants, tenant, where, args...)
+}
+
+func removed[T any](ctx context.Context, a *Authorizer, tx pgx.Tx, table, columns string, collect func(pgx.Rows) ([]T, error),
+	tenant, where string, args ...any,
+) ([]T, error) {
+	query := `DELETE FROM ` + table + ` WHERE tenant = $1 AND ` + where
 	args = append([]any{tenant}, args...)
-	// Only OnChange reads what was removed, which for a whole tenant can be every grant it has.
+	// Only OnChange reads what was removed, which for a whole tenant can be every row it has.
 	if a.cfg.OnChange == nil {
 		_, err := tx.Exec(ctx, query, args...)
 		return nil, err
 	}
-	rows, err := tx.Query(ctx, query+` RETURNING `+grantColumns, args...)
+	rows, err := tx.Query(ctx, query+` RETURNING `+columns, args...)
 	if err != nil {
 		return nil, err
 	}
-	return collectGrants(rows)
+	return collect(rows)
 }
 
-// DeleteExpired removes grants that have expired, which no longer give anything, and returns
-// how many. It passes over grants a change is holding, rather than wait on it, so the next run
+// DeleteExpired removes grants and eligibilities that have expired, which no longer give or
+// allow anything, and returns how many. It passes over grants a change is holding, rather than wait on it, so the next run
 // removes those.
 func (a *Authorizer) DeleteExpired(ctx context.Context) (int64, error) {
 	tag, err := a.db.Exec(ctx, `

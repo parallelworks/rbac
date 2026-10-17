@@ -311,7 +311,8 @@ type Change struct {
 }
 
 // ChangeEvent is what a committed change did: only the grants that were added, updated or
-// removed, the custom roles defined or deleted, and the deny policies set or deleted.
+// removed, the custom roles defined or deleted, the deny policies set or deleted, and the
+// eligibilities set or ended.
 type ChangeEvent struct {
 	Tenant string
 	// Actor is who made the change; zero for Import and the deletes of scopes, principals and
@@ -328,13 +329,13 @@ type ChangeEvent struct {
 	// Eligible are eligibilities set, as they are now; Ineligible, those ended.
 	Eligible   []Eligibility
 	Ineligible []Eligibility
-	// Activated are grants an Activate made or extended, the actor activating them.
-	Activated []Grant
+	// Activated says the actor activated Granted for themselves, on an eligibility (Activate).
+	Activated bool
 }
 
 func (e ChangeEvent) empty() bool {
 	return len(e.Granted)+len(e.Revoked)+len(e.Roles)+len(e.DeletedRoles)+len(e.Denies)+len(e.DeletedDenies)+
-		len(e.Eligible)+len(e.Ineligible)+len(e.Activated) == 0
+		len(e.Eligible)+len(e.Ineligible) == 0
 }
 
 // Constraint removes a permission on a type of resource in a tenant, for everyone, such as a

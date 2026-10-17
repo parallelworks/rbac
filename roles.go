@@ -316,11 +316,11 @@ func (a *Authorizer) DefineRole(ctx context.Context, actor Subject, tenant strin
 	})
 }
 
-// DeleteRole deletes a tenant's custom role and every grant of it, as actor, who needs
-// DefineRoles on the tenant. It refuses a role another custom role lists in GrantableRoles:
-// redefine that one first, or a role later defined with the id would be handed out through it.
-// Deleting a role that doesn't exist does nothing; one changed while the deletion waited for the
-// tenant is refused, as in DefineRole.
+// DeleteRole deletes a tenant's custom role and every grant and eligibility of it, as actor, who
+// needs DefineRoles on the tenant. It refuses a role another custom role lists in
+// GrantableRoles: redefine that one first, or a role later defined with the id would be handed
+// out through it. Deleting a role that doesn't exist does nothing; one changed while the
+// deletion waited for the tenant is refused, as in DefineRole.
 func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant string, id Role) error {
 	if tenant == "" || !isCustom(id) {
 		return fmt.Errorf("%w: only a tenant's custom role can be deleted", ErrInvalid)
