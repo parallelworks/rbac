@@ -1,0 +1,28 @@
+name: release-please
+
+# Keeps a release PR open from the conventional-commit titles. Merging it tags
+# the module (vX.Y.Z).
+on:
+  push:
+    branches: [canary]
+
+concurrency:
+  group: release-please
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # tag releases
+      pull-requests: write # open and update the release PR
+      issues: write # create the release labels
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          config-file: .github/release-please-config.json
+          manifest-file: .github/.release-please-manifest.json
+          target-branch: canary

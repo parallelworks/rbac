@@ -1,0 +1,18 @@
+version: 2
+# The cooldown holds back a release until it is a week old, so a compromised
+# version is usually caught and yanked before it is proposed here.
+updates:
+  - package-ecosystem: gomod
+    directories: ["/", "/tools"]
+    schedule: { interval: weekly }
+    cooldown: { default-days: 7 }
+    commit-message: { prefix: "build(deps)" }
+    groups:
+      go: { patterns: ["*"] }
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    cooldown: { default-days: 7 }
+    commit-message: { prefix: "ci(deps)" }
+    groups:
+      actions: { patterns: ["*"] }
