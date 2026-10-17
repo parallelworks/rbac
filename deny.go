@@ -37,13 +37,6 @@ type Deny struct {
 // DenyPermission is the permission to set and delete the deny policies on scopes of a type.
 func DenyPermission(scopeType string) Permission { return Permission(scopeType + ":deny") }
 
-// A scope holds at most maxDenies, each naming at most maxDenied principals and permissions,
-// so the denies a check reads stay bounded.
-const (
-	maxDenies = 100
-	maxDenied = 256
-)
-
 var denyID = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
 
 // undeniable reports whether no deny can remove p: the permission to set and delete denies,
@@ -148,19 +141,19 @@ func (a *Authorizer) checkDeny(tenant string, d Deny) error {
 	if !denyID.MatchString(d.ID) {
 		bad("id %q is lowercase letters, digits, dots, hyphens and underscores", d.ID)
 	}
-	if utf8.RuneCountInString(d.Name) > maxName || !validText(d.Name) {
-		bad("a name is valid text of at most %d characters", maxName)
+	if utf8.RuneCountInString(d.Name) > MaxName || !validText(d.Name) {
+		bad("a name is valid text of at most %d characters", MaxName)
 	}
-	if len(d.Principals) == 0 || len(d.Principals) > maxDenied || len(d.Exempt) > maxDenied {
-		bad("it names 1 to %d principals and exempts at most %d", maxDenied, maxDenied)
+	if len(d.Principals) == 0 || len(d.Principals) > MaxDenyEntries || len(d.Exempt) > MaxDenyEntries {
+		bad("it names 1 to %d principals and exempts at most %d", MaxDenyEntries, MaxDenyEntries)
 	}
 	for _, p := range slices.Concat(d.Principals, d.Exempt) {
 		if !p.wellFormed(tenant) {
 			bad("principal %q is not valid", p.key())
 		}
 	}
-	if len(d.Permissions) == 0 || len(d.Permissions) > maxDenied {
-		bad("it denies 1 to %d permissions", maxDenied)
+	if len(d.Permissions) == 0 || len(d.Permissions) > MaxDenyEntries {
+		bad("it denies 1 to %d permissions", MaxDenyEntries)
 	}
 	for _, p := range d.Permissions {
 		t, verb := p.parts()
@@ -213,8 +206,8 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 			on.Tenant, d.Scope.Key(), d.ID).Scan(&others); err != nil {
 			return ChangeEvent{}, err
 		}
-		if others >= maxDenies {
-			return ChangeEvent{}, fmt.Errorf("%w: a scope has at most %d denies", ErrInvalid, maxDenies)
+		if others >= MaxDenies {
+			return ChangeEvent{}, fmt.Errorf("%w: a scope has at most %d denies", ErrInvalid, MaxDenies)
 		}
 		rows, err := tx.Query(ctx, `
 			INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, name, principals, exempt, permissions,

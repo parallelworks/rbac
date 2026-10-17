@@ -653,6 +653,51 @@ func TestConstraintsSeeWhoAndWhere(t *testing.T) {
 	}
 }
 
+func TestChangesAreBounded(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	many := func(n int) []rbac.Binding {
+		bs := make([]rbac.Binding, n)
+		for i := range bs {
+			bs[i] = rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: fmt.Sprintf("u%d", i)}}
+		}
+		return bs
+	}
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: many(rbac.MaxBindings), Revoke: many(1)}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a change past the limit: %v", err)
+	}
+	imports := make([]rbac.Grant, rbac.MaxBindings+1)
+	for i, b := range many(len(imports)) {
+		imports[i] = rbac.Grant{Scope: cluster.Scope(), Binding: b}
+	}
+	if err := h.authz.Import(ctx, host, "t1", imports); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("an import past the limit: %v", err)
+	}
+	// A change to more principals than it locks one by one locks the tenant instead, rather than
+	// fill the lock table every session shares.
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := h.authz.WithTx(tx).Apply(ctx, user("owner"), cluster, rbac.Change{Grant: many(200)}); err != nil {
+		t.Fatal(err)
+	}
+	var locks int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()`).Scan(&locks); err != nil {
+		t.Fatal(err)
+	}
+	if locks > 2 {
+		t.Fatalf("a change to 200 principals holds %d advisory locks", locks)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if holders, err := h.authz.Holders(ctx, cluster, login); err != nil || len(holders) != 201 {
+		t.Fatalf("Holders = %d, %v", len(holders), err)
+	}
+}
+
 func TestTrustedWritesNameTheirActor(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()

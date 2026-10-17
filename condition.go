@@ -44,14 +44,12 @@ type Condition struct {
 	Expression  string
 }
 
-// maxExpression, maxCost and maxPattern bound a condition, so one can't make checks slow.
-// maxPattern bounds its patterns together, by about how many instructions they compile to: a
-// program compiles them when it is built, which no cost counts, and a short pattern can compile
-// to a large program.
+// maxCost and maxPattern bound a condition, so one can't make checks slow. maxPattern bounds its
+// patterns together, by about how many instructions they compile to: a program compiles them when
+// it is built, which no cost counts, and a short pattern can compile to a large program.
 const (
-	maxExpression = 2048
-	maxCost       = 10000
-	maxPattern    = 1000
+	maxCost    = 10000
+	maxPattern = 1000
 	// maxCached bounds the programs kept by the length of their expressions: a program is up to
 	// about a hundred times its expression's length, so a count alone would let long conditions
 	// hold gigabytes.
@@ -114,8 +112,8 @@ func (c *conditions) compile(expr string) (cel.Program, error) {
 }
 
 func (c *conditions) build(expr string) (cel.Program, error) {
-	if len(expr) > maxExpression {
-		return nil, fmt.Errorf("%w: longer than %d characters", errCondition, maxExpression)
+	if len(expr) > MaxExpression {
+		return nil, fmt.Errorf("%w: longer than %d bytes", errCondition, MaxExpression)
 	}
 	checked, iss := c.env.Compile(expr)
 	if iss.Err() != nil {

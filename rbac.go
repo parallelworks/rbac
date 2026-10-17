@@ -407,6 +407,32 @@ func conflicted(err error) error {
 	return err
 }
 
+// Limits on what is stored and what one call takes, so that what a check, a search or a change
+// reads stays bounded. Input past one is refused as invalid; a host can check against them first.
+// Lengths are in characters, but an expression's, in bytes.
+const (
+	// MaxBindings is how many bindings one Apply, grants and revokes together, or one Import takes.
+	MaxBindings = 1000
+	// MaxDenies is how many deny policies a scope holds, and MaxDenyEntries how many principals,
+	// exemptions or permissions one names.
+	MaxDenies      = 100
+	MaxDenyEntries = 256
+	// MaxCustomRoles is how many custom roles a tenant has, and MaxGrantableRoles how many roles one
+	// role lists.
+	MaxCustomRoles    = 300
+	MaxGrantableRoles = 64
+	// MaxApprovers is how many approvers an eligibility names.
+	MaxApprovers = 16
+	// MaxActivation is the longest an eligibility lets an activation last.
+	MaxActivation = 366 * 24 * time.Hour
+	// MaxName bounds names and titles; MaxDescription, descriptions; MaxNote, notes and
+	// justifications; MaxExpression, a condition's or a requirement's expression.
+	MaxName        = 128
+	MaxDescription = 2048
+	MaxNote        = 2048
+	MaxExpression  = 2048
+)
+
 // DeniedError is a refusal, with why.
 type DeniedError struct {
 	Permission Permission

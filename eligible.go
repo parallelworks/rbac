@@ -42,11 +42,6 @@ type Eligibility struct {
 	CreatedAt time.Time
 }
 
-const maxActivation = 366 * 24 * time.Hour
-
-// MaxApprovers bounds an eligibility's approvers.
-const MaxApprovers = 16
-
 func (e Eligibility) binding() Binding {
 	return Binding{Role: e.Role, Principal: e.Principal, ExpiresAt: e.ExpiresAt, Note: e.Note}
 }
@@ -57,8 +52,8 @@ func (a *Authorizer) checkEligibility(e Eligibility) error {
 	if e.Principal.broad() {
 		errs = append(errs, errors.New("a tenant's members and the public activate nothing"))
 	}
-	if e.MaxDuration < time.Second || e.MaxDuration > maxActivation {
-		errs = append(errs, fmt.Errorf("an activation lasts a second or more and at most %s", maxActivation))
+	if e.MaxDuration < time.Second || e.MaxDuration > MaxActivation {
+		errs = append(errs, fmt.Errorf("an activation lasts a second or more and at most %s", MaxActivation))
 	}
 	if len(e.Approvers) > MaxApprovers {
 		errs = append(errs, fmt.Errorf("an eligibility has at most %d approvers", MaxApprovers))
@@ -180,8 +175,8 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 		return Grant{}, err
 	}
 	// Bounded before eligible rounds it up to seconds, which near the largest Duration overflows.
-	if d := act.Duration; d <= 0 || d > maxActivation || act.Justification == "" || !validNote(act.Justification) {
-		return Grant{}, &InvalidError{Binding: b, Reason: fmt.Sprintf("an activation lasts more than nothing and at most %s, and has a justification of at most %d characters", maxActivation, maxNote)}
+	if d := act.Duration; d <= 0 || d > MaxActivation || act.Justification == "" || !validNote(act.Justification) {
+		return Grant{}, &InvalidError{Binding: b, Reason: fmt.Sprintf("an activation lasts more than nothing and at most %s, and has a justification of at most %d characters", MaxActivation, MaxNote)}
 	}
 	b.ExpiresAt = stored(a.cfg.Now().Add(act.Duration))
 	roles, _, err := a.eligible(ctx, a.db, s, on, act, b.ExpiresAt)

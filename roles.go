@@ -15,15 +15,6 @@ import (
 // CustomPrefix starts every custom role's id, so none can be a built-in role's.
 const CustomPrefix = "custom."
 
-// A tenant has at most maxCustomRoles custom roles, each listing at most maxGrantableRoles, so
-// the roles a change reads and the delegation it checks stay bounded.
-const (
-	maxCustomRoles    = 300
-	maxGrantableRoles = 64
-	maxName           = 128
-	maxDescription    = 2048
-)
-
 // DefineRoles is the permission to create, replace and delete a tenant's custom roles, held on
 // the tenant.
 const DefineRoles Permission = "tenant:define-roles"
@@ -164,11 +155,11 @@ func (a *Authorizer) checkCustom(r RoleDefinition) error {
 			errs = append(errs, fmt.Errorf("resource type %q is not one any built-in role is for", t))
 		}
 	}
-	if len(r.GrantableRoles) > maxGrantableRoles {
-		errs = append(errs, fmt.Errorf("lists more than %d grantable roles", maxGrantableRoles))
+	if len(r.GrantableRoles) > MaxGrantableRoles {
+		errs = append(errs, fmt.Errorf("lists more than %d grantable roles", MaxGrantableRoles))
 	}
-	if utf8.RuneCountInString(r.Name) > maxName || utf8.RuneCountInString(r.Description) > maxDescription {
-		errs = append(errs, fmt.Errorf("a name is at most %d characters and a description %d", maxName, maxDescription))
+	if utf8.RuneCountInString(r.Name) > MaxName || utf8.RuneCountInString(r.Description) > MaxDescription {
+		errs = append(errs, fmt.Errorf("a name is at most %d characters and a description %d", MaxName, MaxDescription))
 	}
 	// Each is checked alone: a character split between them is valid only once joined.
 	if !validText(r.Name) || !validText(r.Description) {
@@ -286,8 +277,8 @@ func (a *Authorizer) DefineRole(ctx context.Context, actor Subject, tenant strin
 		if ok {
 			others--
 		}
-		if others >= maxCustomRoles {
-			return ChangeEvent{}, fmt.Errorf("%w: a tenant has at most %d custom roles", ErrInvalid, maxCustomRoles)
+		if others >= MaxCustomRoles {
+			return ChangeEvent{}, fmt.Errorf("%w: a tenant has at most %d custom roles", ErrInvalid, MaxCustomRoles)
 		}
 		perms := make([]string, len(r.Permissions))
 		for i, p := range r.Permissions {
