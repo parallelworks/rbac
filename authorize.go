@@ -461,26 +461,39 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	}
 	arg := func(i int) string { return fmt.Sprintf("$%d", firstArg+i) }
 	perm, wildcard := matchable(p)
-	// The grants' tenant is an argument of its own: the host's tenant column needn't be text,
-	// and one argument can't take two types. A tenant-wide grant's scope is the tenant's key,
-	// which every path holds, so one overlap covers every scope and the host's GIN index serves
-	// it. The keys take the default collation so that index applies.
-	return Predicate{
-		SQL: fmt.Sprintf(`(%s = %s AND %s && ARRAY(SELECT g.scope COLLATE "default" FROM rbac_grants g
+	// The subject's grants on scopes of the types matched, in the default collation, as the host's
+	// path column has it, so its GIN index applies.
+	grants := func(types string) string {
+		return fmt.Sprintf(`SELECT g.scope COLLATE "default" FROM rbac_grants g
 			WHERE g.tenant = %s::text AND g.principal = ANY(%s::text[]) AND g.role = ANY(%s)
-			  AND (g.expires_at IS NULL OR g.expires_at > %s) AND NOT g.conditional AND split_part(g.scope, ':', 1) = ANY(%s::text[])
-			  AND (g.principal <> %s::text OR g.role = ANY(%s)))
+			  AND (g.expires_at IS NULL OR g.expires_at > %s) AND NOT g.conditional AND split_part(g.scope, ':', 1) = %s
+			  AND (g.principal <> %s::text OR g.role = ANY(%s))`,
+			arg(1), arg(2), givingSQL(arg(3), arg(1), arg(8), arg(9), custom, nil), arg(4), types, arg(6),
+			givingSQL(arg(7), arg(1), arg(8), arg(9), custom, &publicSQL{arg(10), arg(11), arg(12)}))
+	}
+	// The grants' tenant is an argument of its own: the host's tenant column needn't be text,
+	// and one argument can't take two types. Containers' grants, and the tenant's, whose key
+	// every path holds, overlap the path, which the host's GIN index serves; they are few. A
+	// subject can hold thousands on resources of the type, such as one on each it created: each
+	// reaches only its resource, whose key is its path's first, so they are looked up in a hash of
+	// them, where an overlap would compare each with every key of every row.
+	above := a.reaching(resourceType)
+	reached := fmt.Sprintf(`%s && ARRAY(%s)`, cols.Path, grants(fmt.Sprintf("ANY(%s::text[])", arg(5))))
+	if !a.containers[resourceType] {
+		above = slices.DeleteFunc(above, func(t string) bool { return t == resourceType })
+		reached = fmt.Sprintf(`((%s)[1] IN (%s) OR %s)`, cols.Path, grants(arg(9)+"::text"), reached)
+	}
+	return Predicate{
+		SQL: fmt.Sprintf(`(%s = %s AND %s
 			AND NOT %s && ARRAY(SELECT d.scope COLLATE "default" FROM rbac_denies d
 			WHERE d.tenant = %s::text AND d.scope_type = ANY(%s::text[])
 			  AND d.principals && %s::text[] AND NOT d.exempt && %s::text[]
 			  AND (%s::text = ANY(d.permissions) OR %s::text = ANY(d.permissions))))`,
-			cols.Tenant, arg(0), cols.Path, arg(1), arg(2), givingSQL(arg(3), arg(1), arg(8), arg(9), custom, nil), arg(4), arg(5), arg(6),
-			givingSQL(arg(7), arg(1), arg(8), arg(9), custom, &publicSQL{arg(10), arg(11), arg(12)}),
-			cols.Path, arg(1), arg(5), arg(13), arg(13), arg(14), arg(15)),
+			cols.Tenant, arg(0), reached, cols.Path, arg(1), arg(16), arg(13), arg(13), arg(14), arg(15)),
 		Args: append(append([]any{
-			tenant, tenant, principals, roles, a.cfg.Now(), a.reaching(resourceType), publicKey, a.publicRoles(roles),
+			tenant, tenant, principals, roles, a.cfg.Now(), above, publicKey, a.publicRoles(roles),
 			string(p), resourceType,
-		}, a.publicArgs(p, resourceType, custom)...), s.principals(tenant), perm, wildcard),
+		}, a.publicArgs(p, resourceType, custom)...), s.principals(tenant), perm, wildcard, a.reaching(resourceType)),
 	}, nil
 }
 

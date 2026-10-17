@@ -336,6 +336,54 @@ func TestFilterAndReachableAgreeWithAuthorize(t *testing.T) {
 	}
 }
 
+func TestListingsKeepToDeniesOnTheResourceItself(t *testing.T) {
+	guard := rbac.RoleDefinition{ID: "cluster.guard", Permissions: []rbac.Permission{rbac.DenyPermission("cluster")}, ResourceTypes: []string{"cluster"}}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), guard) })
+	resources := hostTable(t, h)
+	h.seed(t, grant(rbac.Scope{Type: "org", ID: "o1"}, "cluster.login", rbac.User, "u"),
+		grant(resources[0].Scope(), "cluster.guard", rbac.User, "guard"))
+	d := rbac.Deny{ID: "d", Principals: []rbac.Principal{{Kind: rbac.User, ID: "u"}}, Permissions: []rbac.Permission{login}}
+	if err := h.authz.SetDeny(t.Context(), user("guard"), resources[0], d); err != nil {
+		t.Fatal(err)
+	}
+	listingsAgree(t, h, resources, user("u"), login)
+	if allowed(t, h, user("u"), login, resources[0]) || !allowed(t, h, user("u"), login, resources[1]) {
+		t.Fatal("the deny should remove access to its own cluster only")
+	}
+}
+
+func TestListingContainersUnderOthersOfTheirType(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE spaces (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	outer := rbac.Resource{Tenant: "t1", Type: "workspace", ID: "w1", Ancestors: []rbac.Scope{{Type: "org", ID: "o1"}}}
+	inner := rbac.Resource{Tenant: "t1", Type: "workspace", ID: "w9", Ancestors: []rbac.Scope{outer.Scope(), {Type: "org", ID: "o1"}}}
+	other := rbac.Resource{Tenant: "t1", Type: "workspace", ID: "w5", Ancestors: []rbac.Scope{{Type: "org", ID: "o1"}}}
+	for _, r := range []rbac.Resource{outer, inner, other} {
+		if _, err := h.pool.Exec(ctx, `INSERT INTO spaces VALUES ($1, $2, $3)`, r.Tenant, r.ID, h.path(t, r)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.seed(t, grant(outer.Scope(), "workspace.admin", rbac.User, "lead"))
+	pred, err := h.authz.Filter(ctx, user("lead"), "workspace:view", "t1", "workspace", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := h.pool.Query(ctx, "SELECT id FROM spaces WHERE "+pred.SQL+" ORDER BY id", pred.Args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil || !slices.Equal(ids, []string{"w1", "w9"}) {
+		t.Fatalf("a grant on a workspace should list it and the workspace under it: %v, %v", ids, err)
+	}
+	if !allowed(t, h, user("lead"), "workspace:view", inner) {
+		t.Fatal("Authorize should agree")
+	}
+}
+
 func TestListingsApplyConstraints(t *testing.T) {
 	h := setup(t, constrain("no root", root))
 	resources := hostTable(t, h)
@@ -650,6 +698,50 @@ func TestConstraintsSeeWhoAndWhere(t *testing.T) {
 	}
 	if holders, err := h.authz.Holders(ctx, inProd, root); err != nil || len(holders) > 0 {
 		t.Fatalf("Holders can't see each holder, so a constraint on some removes all: %v, %v", holders, err)
+	}
+}
+
+func TestFilterScalesWithResourceGrants(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE fleet (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO fleet SELECT 't1', 'c' || i, ARRAY['cluster:c' || i, 'workspace:w' || (i % 50), 'org:o1', 'tenant:t1']
+		FROM generate_series(1, 20000) i`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `CREATE INDEX ON fleet USING gin (path); ANALYZE fleet`); err != nil {
+		t.Fatal(err)
+	}
+	// A subject holding a grant on every tenth cluster, as on everything it created.
+	for batch := range 2 {
+		var grants []rbac.Grant
+		for i := range 1000 {
+			id := fmt.Sprintf("c%d", (batch*1000+i+1)*10)
+			grants = append(grants, grant(rbac.Scope{Type: "cluster", ID: id}, "cluster.login", rbac.User, "creator"))
+		}
+		h.seed(t, grants...)
+	}
+	pred, err := h.authz.Filter(ctx, user("creator"), login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := h.pool.QueryRow(ctx, "SELECT count(*) FROM fleet WHERE "+pred.SQL, pred.Args...).Scan(&n); err != nil || n != 2000 {
+		t.Fatalf("Filter found %d, %v", n, err)
+	}
+	rows, err := h.pool.Query(ctx, "EXPLAIN SELECT id FROM fleet WHERE "+pred.SQL+" ORDER BY id LIMIT 50", pred.Args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Each row's own key is looked up in a hash of the subject's grants, not compared with each.
+	if text := strings.Join(plan, "\n"); !strings.Contains(text, "hashed SubPlan") {
+		t.Fatalf("Filter's plan for a subject with many resource grants:\n%s", text)
 	}
 }
 
