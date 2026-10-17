@@ -806,8 +806,9 @@ func TestHooksCanUseTheBusyPool(t *testing.T) {
 		var one int
 		return pool.QueryRow(ctx, "SELECT 1").Scan(&one)
 	}
+	guard := rbac.RoleDefinition{ID: "guard", Permissions: []rbac.Permission{rbac.DenyPermission("cluster")}, ResourceTypes: []string{"cluster"}}
 	authz, err := rbac.New(pool, rbac.Config{
-		Catalog:           catalog,
+		Catalog:           append(slices.Clone(catalog), guard),
 		ContainerTypes:    []string{"org", "workspace"},
 		ValidatePrincipal: func(ctx context.Context, _ rbac.DB, _ string, _ rbac.Principal) error { return query(ctx) },
 		Constraints: []rbac.Constraint{{Name: "lookup", Deny: func(ctx context.Context, _ rbac.DB, _, _ string, _ rbac.Permission) (bool, error) {
@@ -833,6 +834,16 @@ func TestHooksCanUseTheBusyPool(t *testing.T) {
 	}
 	if err := authz.DeleteRole(ctx, user("owner"), "t1", r.ID); err != nil {
 		t.Fatalf("a hook on the pool a role's deletion runs on: %v", err)
+	}
+	if err := authz.Import(ctx, "t1", []rbac.Grant{grant(tenant, "guard", rbac.User, "owner")}); err != nil {
+		t.Fatal(err)
+	}
+	d := rbac.Deny{ID: "d", Permissions: []rbac.Permission{root}, Principals: []rbac.Principal{{Kind: rbac.Public}}}
+	if err := authz.SetDeny(ctx, user("owner"), cluster, d); err != nil {
+		t.Fatalf("a hook on the pool a deny is set on: %v", err)
+	}
+	if err := authz.DeleteDeny(ctx, user("owner"), cluster, d.ID); err != nil {
+		t.Fatalf("a hook on the pool a deny is deleted on: %v", err)
 	}
 }
 
@@ -2914,6 +2925,11 @@ func TestDenies(t *testing.T) {
 	if len(h.events) != 1 || len(h.events[0].Denies) != 1 || h.events[0].Denies[0].ID != "no-root" {
 		t.Fatalf("events = %+v", h.events)
 	}
+	reordered := d
+	reordered.Principals = []rbac.Principal{d.Principals[1], d.Principals[0], d.Principals[1]}
+	if err := h.authz.SetDeny(ctx, guardian, workspace, reordered); err != nil || len(h.events) != 1 {
+		t.Fatalf("setting a deny again, reordered: %v, events = %+v", err, h.events)
+	}
 	if allowed(t, h, contractor, root, cluster) || allowed(t, h, user("named"), root, cluster) {
 		t.Fatal("a deny should remove what it lists from whom it names, whatever their grants give")
 	}
@@ -2971,10 +2987,13 @@ func TestAConditionalDenyFailsClosed(t *testing.T) {
 	ctx := t.Context()
 	d := rbac.Deny{
 		ID: "vpn", Permissions: []rbac.Permission{login}, Principals: []rbac.Principal{rbac.TenantMembers("t1")},
-		Condition: rbac.Condition{Expression: `request.attributes.vpn != true`},
+		Condition: rbac.Condition{Title: "VPN only", Expression: `request.attributes.vpn != true`},
 	}
 	if err := h.authz.SetDeny(ctx, guardian, workspace, d); err != nil {
 		t.Fatal(err)
+	}
+	if got, err := h.authz.Denies(ctx, "t1", []rbac.Scope{workspace.Scope()}); err != nil || len(got) != 1 || got[0].Condition != d.Condition {
+		t.Fatalf("a deny's condition read back: %+v, %v", got, err)
 	}
 	check := func(attrs map[string]any) bool {
 		t.Helper()
@@ -3024,6 +3043,83 @@ func TestDeniesBindChanges(t *testing.T) {
 	}
 }
 
+func TestAConditionalDenyBindsWhatAContainerHandsOn(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	h.seed(t, grant(workspace.Scope(), "workspace.admin", rbac.User, "x"), grant(workspace.Scope(), "cluster.sudo", rbac.User, "x"))
+	tenant := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}
+	x := rbac.Principal{Kind: rbac.User, ID: "x"}
+	for _, d := range []rbac.Deny{
+		{ID: "on-clusters", Permissions: []rbac.Permission{root}, Principals: []rbac.Principal{x}, Condition: rbac.Condition{Expression: `resource.type == "cluster"`}},
+		{ID: "off-vpn", Permissions: []rbac.Permission{login}, Principals: []rbac.Principal{x}, Condition: rbac.Condition{Expression: `request.attributes.vpn != true`}},
+	} {
+		if err := h.authz.SetDeny(ctx, guardian, tenant, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b := func(role rbac.Role) rbac.Change {
+		return rbac.Change{Grant: []rbac.Binding{{Role: role, Principal: rbac.Principal{Kind: rbac.User, ID: "y"}}}}
+	}
+	vpn := rbac.WithRequest(ctx, map[string]any{"vpn": true})
+	// On a workspace the deny reads no cluster, but the grant reaches its clusters.
+	if err := h.authz.Apply(vpn, user("x"), workspace, b("cluster.sudo")); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("handing on through a container what a deny reading the resource removes: %v", err)
+	}
+	// One that reads only the request is decided for it.
+	if err := h.authz.Apply(ctx, user("x"), workspace, b("cluster.login")); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("handing on off the VPN what a deny removes off it: %v", err)
+	}
+	if err := h.authz.Apply(vpn, user("x"), workspace, b("cluster.login")); err != nil {
+		t.Fatalf("handing on on the VPN what a deny removes only off it: %v", err)
+	}
+}
+
+func TestADenyOnChangingGrantsStopsRedefiningRoles(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	tenant := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}
+	h.seed(t, grant(tenant.Scope(), "tenant.roles", rbac.User, "x"), grant(tenant.Scope(), "cluster.sudo", rbac.User, "x"))
+	r := rbac.RoleDefinition{ID: "custom.view", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.DefineRole(ctx, user("x"), "t1", r); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), r.ID, rbac.User, "y"))
+	if err := h.authz.SetDeny(ctx, guardian, tenant, rbac.Deny{ID: "freeze", Permissions: []rbac.Permission{grantC}, Principals: []rbac.Principal{{Kind: rbac.User, ID: "x"}}}); err != nil {
+		t.Fatal(err)
+	}
+	wider := r
+	wider.Permissions = []rbac.Permission{view, root}
+	if err := h.authz.DefineRole(ctx, user("x"), "t1", wider); !errors.Is(err, rbac.ErrDenied) || allowed(t, h, user("y"), root, cluster) {
+		t.Fatalf("changing what a role's grants give, denied changing them: %v", err)
+	}
+	if err := h.authz.DeleteRole(ctx, user("x"), "t1", r.ID); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("revoking a role's grants, denied changing them: %v", err)
+	}
+	other := rbac.RoleDefinition{ID: "custom.other", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.DefineRole(ctx, user("x"), "t1", other); err != nil {
+		t.Fatalf("defining a role no grant has yet: %v", err)
+	}
+}
+
+func TestExplainNamesTheDenyAuthorizeDoes(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	d := func(id string) rbac.Deny {
+		return rbac.Deny{ID: id, Permissions: []rbac.Permission{root}, Principals: []rbac.Principal{{Kind: rbac.Public}}}
+	}
+	if err := h.authz.SetDeny(ctx, guardian, rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}, d("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.SetDeny(ctx, guardian, cluster, d("z")); err != nil {
+		t.Fatal(err)
+	}
+	err := h.authz.Authorize(ctx, user("owner"), root, cluster)
+	dec, xerr := h.authz.Explain(ctx, user("owner"), root, cluster)
+	if xerr != nil || err == nil || !strings.HasSuffix(err.Error(), dec.Reason) {
+		t.Fatalf("Authorize: %v; Explain: %+v, %v", err, dec, xerr)
+	}
+}
+
 func TestSettingADenyIsChecked(t *testing.T) {
 	h, guardian := guarded(t)
 	ctx := t.Context()
@@ -3040,6 +3136,7 @@ func TestSettingADenyIsChecked(t *testing.T) {
 		"a malformed permission": {ID: "d", Permissions: []rbac.Permission{"root"}, Principals: d.Principals},
 		"a malformed principal":  {ID: "d", Permissions: d.Permissions, Principals: []rbac.Principal{{Kind: rbac.User}}},
 		"a broken condition":     {ID: "d", Permissions: d.Permissions, Principals: d.Principals, Condition: rbac.Condition{Expression: "1 +"}},
+		"a condition with a NUL": {ID: "d", Permissions: d.Permissions, Principals: d.Principals, Condition: rbac.Condition{Expression: "request.attributes.x == \"a\x00b\""}},
 	} {
 		if err := h.authz.SetDeny(ctx, guardian, cluster, bad); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("%s: %v", name, err)

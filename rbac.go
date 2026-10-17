@@ -31,7 +31,9 @@ import (
 )
 
 // Permission is one thing that can be done to one type of resource, `type:verb`, such as
-// `cluster:login`. `<type>:grant` is the permission to change grants on a scope of that type.
+// `cluster:login`. `<type>:grant` is the permission to change grants on a scope of that type,
+// and `<type>:deny` to set its deny policies (DenyPermission): every permission with either
+// verb changes access, so a grant to a tenant's members or the public never gives it.
 type Permission string
 
 // GrantPermission is the permission to change grants on scopes of a type.

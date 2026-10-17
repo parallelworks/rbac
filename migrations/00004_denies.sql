@@ -12,6 +12,8 @@ CREATE TABLE rbac_denies (
     exempt      text[]      COLLATE "C" NOT NULL DEFAULT '{}' CHECK (cardinality(exempt) <= 256),
     -- `type:verb`, or `type:*` for every permission on a type.
     permissions text[]      COLLATE "C" NOT NULL CHECK (cardinality(permissions) BETWEEN 1 AND 256),
+    condition_title       text NOT NULL DEFAULT '' CHECK (length(condition_title) <= 128),
+    condition_description text NOT NULL DEFAULT '' CHECK (length(condition_description) <= 2048),
     condition   text        NOT NULL DEFAULT '' CHECK (length(condition) <= 4096),
     created_by  text        NOT NULL DEFAULT '',
     created_at  timestamptz NOT NULL DEFAULT now(),

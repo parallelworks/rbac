@@ -185,11 +185,26 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 		removed[p] = name != ""
 		return name != "", err
 	}
+	ds, err := a.deniesOn(ctx, a.db, r.Tenant, s.principals(r.Tenant), r.path(), "")
+	if err != nil {
+		return nil, err
+	}
+	vars, spend := a.vars(ctx, s, "", r), newBudget()
+	// A deny is settled before a grant's condition, as checks settle it.
+	denied := map[Permission]bool{}
+	isDenied := func(p Permission) bool {
+		if d, ok := denied[p]; ok {
+			return d
+		}
+		vars["action"] = string(p)
+		_, d := a.deniedBy(ds, p, spend, vars)
+		denied[p] = d
+		return d
+	}
 	// Conditions are evaluated only for what no unconditional grant gives, as checks do.
 	if err := a.conditionsOf(ctx, a.db, r.Tenant, conditional); err != nil {
 		return nil, err
 	}
-	vars, spend := a.vars(ctx, s, "", r), newBudget()
 	for _, h := range conditional {
 		def, _ := roles.role(h.Role)
 		for _, p := range def.Permissions {
@@ -202,29 +217,24 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 				}
 				continue
 			}
+			if isDenied(p) {
+				continue
+			}
 			// A condition reads the action, so it is evaluated for each permission.
 			vars["action"] = string(p)
 			given[p] = a.conds.holds(spend, h.Condition.Expression, vars)
 		}
-	}
-	ds, err := a.deniesOn(ctx, a.db, r.Tenant, s.principals(r.Tenant), r.path(), "")
-	if err != nil {
-		return nil, err
 	}
 	var perms []Permission
 	for _, p := range slices.Sorted(maps.Keys(given)) {
 		if !given[p] {
 			continue
 		}
-		vars["action"] = string(p)
-		if _, ok := a.deniedBy(ds, p, spend, vars); ok {
-			continue
-		}
 		gone, err := isRemoved(p)
 		if err != nil {
 			return nil, err
 		}
-		if !gone {
+		if !gone && !isDenied(p) {
 			perms = append(perms, p)
 		}
 	}
@@ -495,7 +505,6 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, prin
 	if len(principals) == 0 {
 		return nil, nil, nil
 	}
-	t, _ := p.parts()
 	rows, err := q.Query(ctx, `
 		SELECT false, principal, scope, role, expires_at, conditional, NULL::text[], ''
 		FROM rbac_grants
@@ -507,7 +516,7 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, prin
 		WHERE tenant = $1 AND scope = ANY($3::text[]) AND principals && $5::text[] AND NOT exempt && $5::text[]
 		  AND ($6 = ANY(permissions) OR $7 = ANY(permissions))
 		ORDER BY 1, 2, 3, 4`,
-		tenant, principals, scopes, a.cfg.Now(), keys, string(p), t+":*")
+		tenant, principals, scopes, a.cfg.Now(), keys, string(p), wildcard(p))
 	if err != nil {
 		return nil, nil, err
 	}

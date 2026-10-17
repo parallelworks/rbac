@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -51,8 +52,7 @@ func wildcard(p Permission) string {
 
 // denies reports whether a permission a deny lists covers p.
 func denies(listed []Permission, p Permission) bool {
-	t, _ := p.parts()
-	return slices.Contains(listed, p) || slices.Contains(listed, Permission(t+":*"))
+	return slices.Contains(listed, p) || slices.Contains(listed, Permission(wildcard(p)))
 }
 
 // denial is a deny as a check reads it.
@@ -90,14 +90,14 @@ func (a *Authorizer) deniesOn(ctx context.Context, q DB, tenant string, keys, sc
 	if keys != nil && len(keys) == 0 {
 		return nil, nil
 	}
-	t, _ := p.parts()
+	// In the order a check reads them, so Explain names the deny Authorize does.
 	rows, err := q.Query(ctx, `
 		SELECT id, name, scope, permissions, principals, exempt, condition FROM rbac_denies
 		WHERE tenant = $1 AND scope = ANY($2::text[])
 		  AND ($3::text[] IS NULL OR principals && $3::text[] AND NOT exempt && $3::text[])
 		  AND ($4 = '' OR $4 = ANY(permissions) OR $5 = ANY(permissions))
-		ORDER BY scope, id`,
-		tenant, scopes, keys, string(p), t+":*")
+		ORDER BY id, scope`,
+		tenant, scopes, keys, string(p), wildcard(p))
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +133,7 @@ func (a *Authorizer) checkDeny(tenant string, d Deny) error {
 	if !denyID.MatchString(d.ID) {
 		bad("id %q is lowercase letters, digits, dots, hyphens and underscores", d.ID)
 	}
-	if utf8.RuneCountInString(d.Name) > maxName || !utf8.ValidString(d.Name) || slices.Contains([]byte(d.Name), 0) {
+	if utf8.RuneCountInString(d.Name) > maxName || !validText(d.Name) {
 		bad("a name is valid text of at most %d characters", maxName)
 	}
 	if len(d.Principals) == 0 || len(d.Principals) > maxDenied || len(d.Exempt) > maxDenied {
@@ -153,12 +153,8 @@ func (a *Authorizer) checkDeny(tenant string, d Deny) error {
 			bad("permission %q is not `type:verb` or `type:*`", p)
 		}
 	}
-	if d.Condition.Expression != "" {
-		if _, err := a.conds.compile(d.Condition.Expression); err != nil {
-			errs = append(errs, err)
-		}
-	} else if d.Condition != (Condition{}) {
-		bad("a condition with a title or description has an expression")
+	for _, fault := range a.conditionFaults(d.Condition) {
+		bad("%s", fault)
 	}
 	if len(errs) > 0 {
 		return fmt.Errorf("%w: deny %q: %w", ErrInvalid, d.ID, errors.Join(errs...))
@@ -178,17 +174,18 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 		return err
 	}
 	d.Scope = on.Scope()
-	if err := a.mayDeny(ctx, a.db, actor, on); err != nil {
+	if err := a.mayDeny(ctx, actor, on); err != nil {
 		return err
 	}
 	if err := a.checkDeny(on.Tenant, d); err != nil {
 		return err
 	}
+	d = canonicalDeny(d)
 	return a.inTx(ctx, on.Tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lock(ctx, tx, on.Tenant, []string{d.Scope.Key()}, nil); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.mayDeny(ctx, tx, actor, on); err != nil {
+		if err := a.holdsDeny(ctx, tx, actor, on); err != nil {
 			return ChangeEvent{}, err
 		}
 		var others int
@@ -200,16 +197,20 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 			return ChangeEvent{}, fmt.Errorf("%w: a scope has at most %d denies", ErrInvalid, maxDenies)
 		}
 		rows, err := tx.Query(ctx, `
-			INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, name, principals, exempt, permissions, condition, created_by)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, name, principals, exempt, permissions,
+			  condition_title, condition_description, condition, created_by)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 			ON CONFLICT (tenant, scope_type, scope_id, id) DO UPDATE SET name = EXCLUDED.name,
 			  principals = EXCLUDED.principals, exempt = EXCLUDED.exempt, permissions = EXCLUDED.permissions,
+			  condition_title = EXCLUDED.condition_title, condition_description = EXCLUDED.condition_description,
 			  condition = EXCLUDED.condition
-			WHERE (rbac_denies.name, rbac_denies.principals, rbac_denies.exempt, rbac_denies.permissions, rbac_denies.condition)
-			  IS DISTINCT FROM (EXCLUDED.name, EXCLUDED.principals, EXCLUDED.exempt, EXCLUDED.permissions, EXCLUDED.condition)
+			WHERE (rbac_denies.name, rbac_denies.principals, rbac_denies.exempt, rbac_denies.permissions,
+			  rbac_denies.condition_title, rbac_denies.condition_description, rbac_denies.condition)
+			  IS DISTINCT FROM (EXCLUDED.name, EXCLUDED.principals, EXCLUDED.exempt, EXCLUDED.permissions,
+			  EXCLUDED.condition_title, EXCLUDED.condition_description, EXCLUDED.condition)
 			RETURNING `+denyColumns,
-			on.Tenant, d.Scope.Type, d.Scope.ID, d.ID, d.Name, keysOf(d.Principals), keysOf(d.Exempt),
-			permissionStrings(d.Permissions), d.Condition.Expression, actorKey(actor.Principal))
+			on.Tenant, d.Scope.Type, d.Scope.ID, d.ID, d.Name, keysOf(d.Principals), keysOf(d.Exempt), permissionStrings(d.Permissions),
+			d.Condition.Title, d.Condition.Description, d.Condition.Expression, actorKey(actor.Principal))
 		if err != nil {
 			return ChangeEvent{}, err
 		}
@@ -227,14 +228,14 @@ func (a *Authorizer) DeleteDeny(ctx context.Context, actor Subject, on Resource,
 	if err := a.subject(actor); err != nil {
 		return err
 	}
-	if err := a.mayDeny(ctx, a.db, actor, on); err != nil {
+	if err := a.mayDeny(ctx, actor, on); err != nil {
 		return err
 	}
 	return a.inTx(ctx, on.Tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lock(ctx, tx, on.Tenant, []string{on.Scope().Key()}, nil); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.mayDeny(ctx, tx, actor, on); err != nil {
+		if err := a.holdsDeny(ctx, tx, actor, on); err != nil {
 			return ChangeEvent{}, err
 		}
 		rows, err := tx.Query(ctx, `DELETE FROM rbac_denies WHERE tenant = $1 AND scope = $2 AND id = $3 RETURNING `+denyColumns,
@@ -247,9 +248,10 @@ func (a *Authorizer) DeleteDeny(ctx context.Context, actor Subject, on Resource,
 	})
 }
 
-// mayDeny checks that actor may set and delete the denies on a scope. A deny can remove that
-// permission too, from the actor among others.
-func (a *Authorizer) mayDeny(ctx context.Context, q DB, actor Subject, on Resource) error {
+// mayDeny checks, before the transaction, that actor may set and delete the denies on a scope.
+// The constraints run here only, as in Apply: a hook that queries the pool while the
+// transaction holds a connection can wait forever on a busy pool.
+func (a *Authorizer) mayDeny(ctx context.Context, actor Subject, on Resource) error {
 	perm := DenyPermission(on.Type)
 	if actor.Principal == (Principal{}) {
 		return &DeniedError{Permission: perm, Scope: on.Scope(), Reason: "an anonymous subject changes nothing"}
@@ -261,6 +263,13 @@ func (a *Authorizer) mayDeny(ctx context.Context, q DB, actor Subject, on Resour
 	if name != "" {
 		return &DeniedError{Permission: perm, Scope: on.Scope(), Reason: "removed by " + name}
 	}
+	return a.holdsDeny(ctx, a.db, actor, on)
+}
+
+// holdsDeny checks, on q, that actor holds DenyPermission(on's type) on a scope. A deny can
+// remove that permission too, from the actor among others.
+func (a *Authorizer) holdsDeny(ctx context.Context, q DB, actor Subject, on Resource) error {
+	perm := DenyPermission(on.Type)
 	au, err := a.authorityOn(ctx, q, actor, on, nil)
 	if err != nil {
 		return err
@@ -287,14 +296,16 @@ func (a *Authorizer) Denies(ctx context.Context, tenant string, scopes []Scope) 
 	return collectDenies(rows)
 }
 
-const denyColumns = `scope_type, scope_id, id, name, principals, exempt, permissions, condition, created_by, created_at`
+const denyColumns = `scope_type, scope_id, id, name, principals, exempt, permissions,
+	condition_title, condition_description, condition, created_by, created_at`
 
 func collectDenies(rows pgx.Rows) ([]Deny, error) {
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Deny, error) {
 		var d Deny
 		var principals, exempt, perms []string
 		var createdBy string
-		err := row.Scan(&d.Scope.Type, &d.Scope.ID, &d.ID, &d.Name, &principals, &exempt, &perms, &d.Condition.Expression, &createdBy, &d.CreatedAt)
+		err := row.Scan(&d.Scope.Type, &d.Scope.ID, &d.ID, &d.Name, &principals, &exempt, &perms,
+			&d.Condition.Title, &d.Condition.Description, &d.Condition.Expression, &createdBy, &d.CreatedAt)
 		for _, k := range principals {
 			d.Principals = append(d.Principals, parsePrincipal(k))
 		}
@@ -307,6 +318,17 @@ func collectDenies(rows pgx.Rows) ([]Deny, error) {
 		d.CreatedBy = parsePrincipal(createdBy)
 		return d, err
 	})
+}
+
+// canonicalDeny is a copy of d with its lists sorted and without repeats, so a deny reordered is
+// the same one.
+func canonicalDeny(d Deny) Deny {
+	byKey := func(x, y Principal) int { return strings.Compare(x.key(), y.key()) }
+	for _, ps := range []*[]Principal{&d.Principals, &d.Exempt} {
+		*ps = slices.CompactFunc(slices.SortedFunc(slices.Values(*ps), byKey), func(x, y Principal) bool { return x == y })
+	}
+	d.Permissions = slices.Compact(slices.Sorted(slices.Values(d.Permissions)))
+	return d
 }
 
 func keysOf(ps []Principal) []string {

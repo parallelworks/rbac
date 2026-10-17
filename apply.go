@@ -324,10 +324,19 @@ func (a *Authorizer) checkBinding(roles book, tenant string, scope Scope, b Bind
 // which a change of many shouldn't spend holding its locks.
 func (a *Authorizer) checkCondition(b Binding) []error {
 	var errs []error
-	bad := func(reason string) { errs = append(errs, &InvalidError{Binding: b, Reason: reason}) }
-	c := b.Condition
+	for _, reason := range a.conditionFaults(b.Condition) {
+		errs = append(errs, &InvalidError{Binding: b, Reason: reason})
+	}
+	return errs
+}
+
+// conditionFaults returns why a condition, of a grant or a deny, can't be stored.
+func (a *Authorizer) conditionFaults(c Condition) []string {
+	var faults []string
+	bad := func(reason string) { faults = append(faults, reason) }
 	switch {
-	case !validText(c.Title + c.Description + c.Expression):
+	// Each alone: a character split between two is valid only once they are joined.
+	case !validText(c.Title) || !validText(c.Description) || !validText(c.Expression):
 		bad("a condition is UTF-8 text without NUL")
 	case c.Expression != "":
 		if _, err := a.conds.compile(c.Expression); err != nil {
@@ -340,7 +349,7 @@ func (a *Authorizer) checkCondition(b Binding) []error {
 	if len(c.Title) > maxName || len(c.Description) > maxDescription {
 		bad(fmt.Sprintf("a condition's title is at most %d bytes and its description %d", maxName, maxDescription))
 	}
-	return errs
+	return faults
 }
 
 // authority is an actor's grants on a resource's path, and the roles to read them by.
@@ -349,9 +358,11 @@ type authority struct {
 	roles book
 	// allows reports whether a grant's condition holds for the request, with an action.
 	allows func(h holding, action Permission) bool
-	// denied reports whether a deny on the path removes p from the actor in the request: what
-	// it denies the actor doesn't hold, so can't use or hand on.
-	denied func(p Permission) bool
+	// denied reports whether a deny on the path removes p from the actor in the request, on the
+	// scope itself. handsOn is the same for what the actor hands on, which through a container or
+	// the tenant reaches other resources: a deny whose condition reads the resource can't be
+	// evaluated for them, so it denies. What a deny removes the actor can't use or hand on.
+	denied, handsOn func(p Permission) bool
 	// defining is a custom role DefineRole checks: the roles a check names resolve to it, but the
 	// actor's own grants of it give what it gives now.
 	defining *RoleDefinition
@@ -411,25 +422,33 @@ func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Re
 		return authority{}, err
 	}
 	vars, spend := a.vars(ctx, actor, "", on), newBudget()
-	with := func(action Permission) map[string]any {
+	with := func(vars map[string]any, action Permission) map[string]any {
 		v := maps.Clone(vars)
 		v["action"] = string(action)
 		return v
 	}
-	denied := map[Permission]bool{}
-	return authority{
-		held: held, roles: b,
-		allows: func(h holding, action Permission) bool {
-			return !h.conditional || a.conds.holds(spend, h.Condition.Expression, with(action))
-		},
-		denied: func(p Permission) bool {
+	reached := vars
+	if a.contains(on.Type) {
+		reached = maps.Clone(vars)
+		delete(reached, "resource")
+	}
+	deny := func(vars map[string]any) func(Permission) bool {
+		denied := map[Permission]bool{}
+		return func(p Permission) bool {
 			if d, ok := denied[p]; ok {
 				return d
 			}
-			_, d := a.deniedBy(ds, p, spend, with(p))
+			_, d := a.deniedBy(ds, p, spend, with(vars, p))
 			denied[p] = d
 			return d
+		}
+	}
+	return authority{
+		held: held, roles: b,
+		allows: func(h holding, action Permission) bool {
+			return !h.conditional || a.conds.holds(spend, h.Condition.Expression, with(vars, action))
 		},
+		denied: deny(vars), handsOn: deny(reached),
 	}, nil
 }
 
@@ -437,19 +456,19 @@ func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Re
 // conditional grant gives its power only where its condition holds for the change.
 func (au authority) over(scopeType string) power {
 	manage := GrantPermission(scopeType)
-	return au.power(scopeType, func(g holding) bool { return au.allows(g, manage) })
+	return au.power(scopeType, au.denied, func(g holding) bool { return au.allows(g, manage) })
 }
 
 // under is the power the actor may hand on with condition, as holds counts permissions: a power
 // held under a condition can't be handed on without it.
 func (au authority) under(scopeType, condition string) power {
-	return au.power(scopeType, func(g holding) bool { return g.under(condition) })
+	return au.power(scopeType, au.handsOn, func(g holding) bool { return g.under(condition) })
 }
 
-func (au authority) power(scopeType string, counts func(holding) bool) power {
+func (au authority) power(scopeType string, denied func(Permission) bool, counts func(holding) bool) power {
 	pw := power{listed: map[Role][]string{}}
 	manage := GrantPermission(scopeType)
-	if au.denied(manage) {
+	if denied(manage) {
 		return pw
 	}
 	for _, g := range au.held {
@@ -475,7 +494,7 @@ func (h holding) under(condition string) bool {
 
 // holds reports whether the actor holds p for resources of a type, to hand it on with condition.
 func (au authority) holds(p Permission, resourceType, condition string) bool {
-	return !au.denied(p) && slices.ContainsFunc(au.held, func(g holding) bool {
+	return !au.handsOn(p) && slices.ContainsFunc(au.held, func(g holding) bool {
 		return gives(au.roles, g.Principal, g.Role, p, resourceType) && g.under(condition)
 	})
 }
@@ -858,7 +877,8 @@ func (a *Authorizer) DeleteTenant(ctx context.Context, tenant string) error {
 	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lockTenant(ctx, tx, tenant) }, true, "TRUE", "TRUE")
 }
 
-// delete removes the grants in a tenant that where picks, and with roles, its custom roles.
+// delete removes the grants in a tenant that where picks, with roles its custom roles, and the
+// denies that denies picks, none when it is empty; both read args from $2.
 func (a *Authorizer) delete(ctx context.Context, tenant string, lock func(pgx.Tx) error, roles bool, denies, where string, args ...any) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -878,13 +898,20 @@ func (a *Authorizer) delete(ctx context.Context, tenant string, lock func(pgx.Tx
 			}
 		}
 		if denies != "" {
-			rows, err := tx.Query(ctx, `DELETE FROM rbac_denies WHERE tenant = $1 AND `+denies+` RETURNING `+denyColumns,
-				append([]any{tenant}, args...)...)
-			if err != nil {
-				return ChangeEvent{}, err
-			}
-			if e.DeletedDenies, err = collectDenies(rows); err != nil {
-				return ChangeEvent{}, err
+			query, args := `DELETE FROM rbac_denies WHERE tenant = $1 AND `+denies, append([]any{tenant}, args...)
+			// Only OnChange reads what was removed, as for grants.
+			if a.cfg.OnChange == nil {
+				if _, err := tx.Exec(ctx, query, args...); err != nil {
+					return ChangeEvent{}, err
+				}
+			} else {
+				rows, err := tx.Query(ctx, query+` RETURNING `+denyColumns, args...)
+				if err != nil {
+					return ChangeEvent{}, err
+				}
+				if e.DeletedDenies, err = collectDenies(rows); err != nil {
+					return ChangeEvent{}, err
+				}
 			}
 		}
 		var err error
