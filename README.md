@@ -100,7 +100,7 @@ another store. Both search one tenant, and count only unconditional grants:
   `Approvers` approves. `Activate` gives the activator a grant of its own from
   `rbac.SourceActivation`, beside any it holds, with its justification and approver. It holds
   one activation of a role on a scope, recording the request its end rests on: activating again
-  until later replaces it, one ending no sooner changes nothing, and once it has ended, activating
+  until later replaces it, one ending no later changes nothing, and once it has ended, activating
   again makes a new grant. `Deactivate` ends it early.
 - **Host policy:** `Config.ValidateGrant` is asked about every grant with the role, the principal,
   the actor and how it is made, so the host decides who may hold what: members only, no

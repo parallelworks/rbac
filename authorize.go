@@ -637,17 +637,19 @@ const grantColumns = `id::text, scope_type, scope_id, principal_kind, principal_
 	condition_title, condition_description, condition, note, approved_by, created_by, created_at, updated_by, updated_at`
 
 func collectGrants(rows pgx.Rows) ([]Grant, error) {
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Grant, error) {
-		var g Grant
-		var expires *time.Time
-		var approvedBy, createdBy, updatedBy string
-		err := row.Scan(&g.ID, &g.Scope.Type, &g.Scope.ID, &g.Principal.Kind, &g.Principal.ID, &g.Role, &g.Source, &expires,
-			&g.Condition.Title, &g.Condition.Description, &g.Condition.Expression, &g.Note,
-			&approvedBy, &createdBy, &g.CreatedAt, &updatedBy, &g.UpdatedAt)
-		if expires != nil {
-			g.ExpiresAt = *expires
-		}
-		g.ApprovedBy, g.CreatedBy, g.UpdatedBy = parsePrincipal(approvedBy), parsePrincipal(createdBy), parsePrincipal(updatedBy)
-		return g, err
-	})
+	return pgx.CollectRows(rows, scanGrant)
+}
+
+func scanGrant(row pgx.CollectableRow) (Grant, error) {
+	var g Grant
+	var expires *time.Time
+	var approvedBy, createdBy, updatedBy string
+	err := row.Scan(&g.ID, &g.Scope.Type, &g.Scope.ID, &g.Principal.Kind, &g.Principal.ID, &g.Role, &g.Source, &expires,
+		&g.Condition.Title, &g.Condition.Description, &g.Condition.Expression, &g.Note,
+		&approvedBy, &createdBy, &g.CreatedAt, &updatedBy, &g.UpdatedAt)
+	if expires != nil {
+		g.ExpiresAt = *expires
+	}
+	g.ApprovedBy, g.CreatedBy, g.UpdatedBy = parsePrincipal(approvedBy), parsePrincipal(createdBy), parsePrincipal(updatedBy)
+	return g, err
 }

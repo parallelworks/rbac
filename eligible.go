@@ -154,7 +154,7 @@ type Activation struct {
 // allows: a grant of its own from SourceActivation, beside any grant s holds, lasting
 // act.Duration, with act.Justification as its note. s holds one activation of a role on a scope,
 // which records the request its end rests on: activating again until later replaces it with this
-// request, its justification and approver; one that would end no sooner changes nothing and
+// request, its justification and approver; one that would end no later changes nothing and
 // returns the activation as it is, reporting nothing; and once it has ended, activating again
 // makes a new grant, with a new ID. It needs no permission to change grants, the
 // eligibility being the authority, but a constraint that stops changes to grants on the scope's
@@ -227,12 +227,15 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 			return ChangeEvent{}, err
 		}
 		if len(granted) == 0 {
-			held, err := a.WithTx(tx).Grants(ctx, on.Tenant, GrantFilter{Scopes: []Scope{scope}, Principals: []Principal{s.Principal}})
+			// By its key, not through Grants, which reads the clock again and could find it ended since.
+			rows, err := tx.Query(ctx, `SELECT `+grantColumns+` FROM rbac_grants
+				WHERE tenant = $1 AND principal = $2 AND scope = $3 AND role = $4 AND source = $5`,
+				on.Tenant, s.Principal.key(), scope.Key(), act.Role, SourceActivation)
 			if err != nil {
 				return ChangeEvent{}, err
 			}
-			activated = held[slices.IndexFunc(held, func(g Grant) bool { return g.Role == act.Role && g.Source == SourceActivation })]
-			return ChangeEvent{}, nil
+			activated, err = pgx.CollectExactlyOneRow(rows, scanGrant)
+			return ChangeEvent{}, err
 		}
 		if err := a.bounded(ctx, tx, on.Tenant, granted); err != nil {
 			return ChangeEvent{}, err
