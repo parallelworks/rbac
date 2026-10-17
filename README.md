@@ -44,9 +44,10 @@ if err := authz.Authorize(ctx, subject, "cluster:login", cluster); err != nil {
 ## Grants
 
 - **One grant, or several:** a grant is one role to one principal on one scope, from one source,
-  until one time, under one condition. Granting the same again changes only its note; one that
-  differs in any of these stands beside the others, so granting never narrows what a principal
-  holds. Each has an `ID`, who made it and when, and who last changed its note.
+  until one time, under one condition. Granting the same again changes only its note and its
+  condition's title and description; one that differs in any of these stands beside the others,
+  so granting never narrows what a principal holds. Each has an `ID`, who made it and when, and
+  who last changed it.
 - **Changes:** `Apply` grants and revokes on one scope in one transaction. A revoke removes a
   role's grants to a principal from a source, or with an `ID` one grant; revoking and granting a
   role at once replaces its grants, keeping those granted again as they are.
@@ -96,8 +97,8 @@ another store. Both search one tenant, and count only unconditional grants:
   activate a role on a scope for up to a maximum duration and no later than the eligibility ends,
   perhaps only where a condition holds, such as a second factor, and perhaps only once one of its
   `Approvers` approves. `Activate` gives the activator a grant of its own from
-  `rbac.SourceActivation`, beside any it holds, with its justification and approver;
-  `Deactivate` ends it early.
+  `rbac.SourceActivation`, beside any it holds, with its justification and approver; activating
+  again extends it rather than adding another, and `Deactivate` ends it early.
 - **Host policy:** `Config.ValidateGrant` is asked about every grant with the role, the principal,
   the actor and how it is made, so the host decides who may hold what: members only, no
   privileged roles for service accounts or guests. `Config.Constraints` remove permissions above

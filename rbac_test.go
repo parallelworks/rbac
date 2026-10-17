@@ -748,6 +748,25 @@ func TestFilterScalesWithResourceGrants(t *testing.T) {
 	if text := strings.Join(plan, "\n"); !strings.Contains(text, "hashed SubPlan") {
 		t.Fatalf("Filter's plan for a subject with many resource grants:\n%s", text)
 	}
+	// A subject with a few still finds its rows through the GIN index, rather than read them all.
+	h.seed(t, grant(rbac.Scope{Type: "cluster", ID: "c7"}, "cluster.login", rbac.User, "few"))
+	pred, err = h.authz.Filter(ctx, user("few"), login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.pool.QueryRow(ctx, "SELECT count(*) FROM fleet WHERE "+pred.SQL, pred.Args...).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("Filter found %d, %v", n, err)
+	}
+	rows, err = h.pool.Query(ctx, "EXPLAIN SELECT count(*) FROM fleet WHERE "+pred.SQL, pred.Args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
+		t.Fatal(err)
+	}
+	if text := strings.Join(plan, "\n"); !strings.Contains(text, "Bitmap Index Scan") {
+		t.Fatalf("Filter's plan for a subject with one resource grant:\n%s", text)
+	}
 }
 
 func TestConditionsReadWhatIsDeclared(t *testing.T) {
@@ -1353,26 +1372,32 @@ func TestDeleteScopeRemovesAGrantMadeWhileItWaits(t *testing.T) {
 }
 
 func TestMigratingAtOnce(t *testing.T) {
-	pool := pgtest.Open(t, "")
-	errs := make(chan error, 2)
-	for range 2 {
-		go func() { errs <- rbac.Migrate(t.Context(), pool) }()
-	}
-	for range 2 {
-		if err := <-errs; err != nil {
-			t.Fatalf("two replicas migrating one schema at once: %v", err)
-		}
-	}
-	var versions int
-	if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM rbac_migrations`).Scan(&versions); err != nil {
-		t.Fatal(err)
-	}
 	files, err := fs.Glob(rbac.Migrations(), "*.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if versions != len(files) {
-		t.Fatalf("recorded %d migrations, want %d", versions, len(files))
+	// Where transactions default to SERIALIZABLE too, whose snapshot predates the lock a replica
+	// waits for. A few rounds each, so the replicas overlap.
+	for _, params := range []string{"", "default_transaction_isolation=serializable"} {
+		for range 3 {
+			pool := pgtest.Open(t, params)
+			errs := make(chan error, 2)
+			for range 2 {
+				go func() { errs <- rbac.Migrate(t.Context(), pool) }()
+			}
+			for range 2 {
+				if err := <-errs; err != nil {
+					t.Fatalf("two replicas migrating one schema at once (%q): %v", params, err)
+				}
+			}
+			var versions int
+			if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM rbac_migrations`).Scan(&versions); err != nil {
+				t.Fatal(err)
+			}
+			if versions != len(files) {
+				t.Fatalf("recorded %d migrations, want %d", versions, len(files))
+			}
+		}
 	}
 }
 
@@ -3764,22 +3789,29 @@ func TestEligibleGrants(t *testing.T) {
 	if !allowed(t, h, pager, root, cluster) {
 		t.Fatal("an activated role should give its permissions")
 	}
-	// Each activation is a grant of its own: a shorter one leaves the longer, and each ends.
+	// Activating again keeps one activation: a shorter one leaves its end, a longer one extends it,
+	// and each records its justification.
 	if g, err := h.authz.Activate(mfa, pager, cluster, rbac.Activation{Role: "cluster.sudo", Duration: 10 * time.Minute, Justification: "again"}); err != nil ||
-		!g.ExpiresAt.Equal(h.now.Add(10*time.Minute)) || g.Note != "again" {
+		!g.ExpiresAt.Equal(h.now.Add(30*time.Minute)) || g.Note != "again" {
 		t.Fatalf("a shorter activation: %+v, %v", g, err)
 	}
-	if got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{pager.Principal}}); err != nil || len(got) != 2 {
-		t.Fatalf("two activations: %+v, %v", got, err)
+	if g, err := h.authz.Activate(mfa, pager, cluster, rbac.Activation{Role: "cluster.sudo", Duration: 45 * time.Minute, Justification: "longer"}); err != nil ||
+		!g.ExpiresAt.Equal(h.now.Add(45*time.Minute)) || g.Note != "longer" {
+		t.Fatalf("a longer activation: %+v, %v", g, err)
 	}
-	h.now = h.now.Add(20 * time.Minute)
-	if !allowed(t, h, pager, root, cluster) {
-		t.Fatal("the longer activation should outlast the shorter")
+	if got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{pager.Principal}}); err != nil || len(got) != 1 {
+		t.Fatalf("activating again should add no grant: %+v, %v", got, err)
 	}
-	h.now = h.now.Add(11 * time.Minute)
+	h.now = h.now.Add(46 * time.Minute)
 	if allowed(t, h, pager, root, cluster) {
 		t.Fatal("an activation should end")
 	}
+	// Once it has ended, activating again sets it anew, still one row.
+	if g, err := h.authz.Activate(mfa, pager, cluster, rbac.Activation{Role: "cluster.sudo", Duration: 5 * time.Minute, Justification: "anew"}); err != nil ||
+		!g.ExpiresAt.Equal(h.now.Add(5*time.Minute)) {
+		t.Fatalf("activating once ended: %+v, %v", g, err)
+	}
+	h.now = h.now.Add(6 * time.Minute)
 	if got, err := h.authz.Eligibilities(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}}); err != nil || len(got) != 1 || got[0].Note != "on call" {
 		t.Fatalf("Eligibilities = %+v, %v", got, err)
 	}
@@ -3821,9 +3853,10 @@ func TestSettingAnEligibilityIsChecked(t *testing.T) {
 		}
 	}
 	for name, approvers := range map[string][]rbac.Principal{
-		"too many approvers":  approvers(rbac.MaxApprovers + 1),
-		"the public approves": {{Kind: rbac.Public}},
-		"a nameless approver": {{Kind: rbac.Group}},
+		"too many approvers":          approvers(rbac.MaxApprovers + 1),
+		"the public approves":         {{Kind: rbac.Public}},
+		"a nameless approver":         {{Kind: rbac.Group}},
+		"an undeclared kind approves": {{Kind: "robot", ID: "r"}},
 	} {
 		bad := e
 		bad.Approvers = approvers
@@ -3883,6 +3916,12 @@ func TestActivationsNeedTheirApprovers(t *testing.T) {
 	if allowed(t, h, user("x"), root, cluster) {
 		t.Fatal("an unapproved activation should give nothing")
 	}
+	// An approver is a subject like any other: one of a kind the host doesn't declare can't act.
+	undeclared := ask
+	undeclared.Approver = rbac.Subject{Principal: rbac.Principal{Kind: "robot", ID: "r"}, Groups: []string{"leads"}}
+	if _, err := h.authz.Activate(ctx, user("x"), cluster, undeclared); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("an approver of an undeclared kind: %v", err)
+	}
 	ask.Approver = user("lead", "leads")
 	g, err := h.authz.Activate(ctx, user("x"), cluster, ask)
 	if err != nil {
@@ -3927,7 +3966,7 @@ func TestDeactivating(t *testing.T) {
 	if err := h.authz.Deactivate(ctx, user("x"), cluster, "cluster.login"); err != nil {
 		t.Fatal(err)
 	}
-	if len(h.events) != 1 || len(h.events[0].Revoked) != 2 || h.events[0].Actor != user("x").Principal {
+	if len(h.events) != 1 || len(h.events[0].Revoked) != 1 || h.events[0].Actor != user("x").Principal {
 		t.Fatalf("events = %+v", h.events)
 	}
 	got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{e.Principal}})
@@ -4040,6 +4079,10 @@ func TestGrantsAddUp(t *testing.T) {
 	apply(rbac.Change{Revoke: []rbac.Binding{standing}, Grant: []rbac.Binding{untilLater}})
 	if got := held(); len(got) != 2 || slices.ContainsFunc(got, func(g rbac.Grant) bool { return g.Source == "" && g.ExpiresAt.IsZero() }) {
 		t.Fatalf("a grant with another expiry isn't spared: %+v", got)
+	}
+	activated := rbac.Grant{Scope: cluster.Scope(), Binding: rbac.Binding{Role: "cluster.login", Principal: standing.Principal, Source: rbac.SourceActivation}}
+	if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{activated}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("importing an activation: %v", err)
 	}
 	for name, bad := range map[string]rbac.Binding{
 		"the activation source":   {Role: "cluster.login", Principal: standing.Principal, Source: rbac.SourceActivation},

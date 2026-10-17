@@ -339,12 +339,15 @@ func collectDenies(rows pgx.Rows) ([]Deny, error) {
 // canonicalDeny is a copy of d with its lists sorted and without repeats, so a deny reordered is
 // the same one.
 func canonicalDeny(d Deny) Deny {
-	byKey := func(x, y Principal) int { return strings.Compare(x.key(), y.key()) }
-	for _, ps := range []*[]Principal{&d.Principals, &d.Exempt} {
-		*ps = slices.CompactFunc(slices.SortedFunc(slices.Values(*ps), byKey), func(x, y Principal) bool { return x == y })
-	}
+	d.Principals, d.Exempt = canonicalPrincipals(d.Principals), canonicalPrincipals(d.Exempt)
 	d.Permissions = slices.Compact(slices.Sorted(slices.Values(d.Permissions)))
 	return d
+}
+
+// canonicalPrincipals is a copy of ps sorted by key and without repeats.
+func canonicalPrincipals(ps []Principal) []Principal {
+	byKey := func(x, y Principal) int { return strings.Compare(x.key(), y.key()) }
+	return slices.CompactFunc(slices.SortedFunc(slices.Values(ps), byKey), func(x, y Principal) bool { return x == y })
 }
 
 func keysOf(ps []Principal) []string {

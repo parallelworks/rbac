@@ -472,16 +472,23 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 			givingSQL(arg(7), arg(1), arg(8), arg(9), custom, &publicSQL{arg(10), arg(11), arg(12)}))
 	}
 	// The grants' tenant is an argument of its own: the host's tenant column needn't be text,
-	// and one argument can't take two types. Containers' grants, and the tenant's, whose key
-	// every path holds, overlap the path, which the host's GIN index serves; they are few. A
-	// subject can hold thousands on resources of the type, such as one on each it created: each
-	// reaches only its resource, whose key is its path's first, so they are looked up in a hash of
-	// them, where an overlap would compare each with every key of every row.
+	// and one argument can't take two types. The grants overlap the path, which the host's GIN
+	// index serves. A subject can hold thousands on resources of the type, such as one on each it
+	// created, where an overlap would compare each with every key of every row: each reaches only
+	// its resource, whose key is its path's first, so then they are looked up in a hash of them,
+	// and only containers' and the tenant's overlap. That form can't use the GIN index, so a
+	// subject with few keeps the overlap.
 	above := a.reaching(resourceType)
 	reached := fmt.Sprintf(`%s && ARRAY(%s)`, cols.Path, grants(fmt.Sprintf("ANY(%s::text[])", arg(5))))
 	if !a.containers[resourceType] {
-		above = slices.DeleteFunc(above, func(t string) bool { return t == resourceType })
-		reached = fmt.Sprintf(`((%s)[1] IN (%s) OR %s)`, cols.Path, grants(arg(9)+"::text"), reached)
+		many, err := a.manyResourceGrants(ctx, tenant, principals, resourceType)
+		if err != nil {
+			return Predicate{}, err
+		}
+		if many {
+			above = slices.DeleteFunc(above, func(t string) bool { return t == resourceType })
+			reached = fmt.Sprintf(`((%s)[1] IN (%s) OR %s)`, cols.Path, grants(arg(9)+"::text"), reached)
+		}
 	}
 	return Predicate{
 		SQL: fmt.Sprintf(`(%s = %s AND %s
@@ -495,6 +502,21 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 			string(p), resourceType,
 		}, a.publicArgs(p, resourceType, custom)...), s.principals(tenant), perm, wildcard, a.reaching(resourceType)),
 	}, nil
+}
+
+// maxOverlap is how many grants on resources of a type Filter overlaps with each row's path:
+// about where comparing each with every key of a row costs as much as a lookup in a hash.
+const maxOverlap = 8
+
+// manyResourceGrants reports whether principals hold more than maxOverlap unconditional grants in
+// force on resources of a type, of any role: it only picks the form of Filter's condition.
+func (a *Authorizer) manyResourceGrants(ctx context.Context, tenant string, principals []string, resourceType string) (bool, error) {
+	var n int
+	err := a.db.QueryRow(ctx, `SELECT count(*) FROM (SELECT FROM rbac_grants
+		WHERE tenant = $1 AND principal = ANY($2::text[]) AND split_part(scope, ':', 1) = $3 AND NOT conditional
+		  AND (expires_at IS NULL OR expires_at > $4) LIMIT $5) g`,
+		tenant, principals, resourceType, a.cfg.Now(), maxOverlap+1).Scan(&n)
+	return n > maxOverlap, err
 }
 
 // holding is a grant as a check reads it from the key index: whether it has a condition, not

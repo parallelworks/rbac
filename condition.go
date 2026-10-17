@@ -80,11 +80,14 @@ func (b *budget) spend(cost uint64) { b.left -= min(cost, b.left) }
 type conditions struct {
 	env *cel.Env
 	// typed checks a condition against the declared attributes when it is stored; nil when none
-	// are declared.
+	// are declared. typedOK are the expressions it passed, bounded as the programs are, so a change
+	// storing one condition many times checks it once.
 	typed    *cel.Env
 	mu       sync.RWMutex
 	programs map[string]cel.Program
 	cached   int
+	typedOK  map[string]bool
+	typedLen int
 }
 
 func newConditions(attrs Attributes) (*conditions, error) {
@@ -102,7 +105,7 @@ func newConditions(attrs Attributes) (*conditions, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &conditions{env: env, typed: typed, programs: map[string]cel.Program{}}, nil
+	return &conditions{env: env, typed: typed, programs: map[string]cel.Program{}, typedOK: map[string]bool{}}, nil
 }
 
 // check returns why an expression can't be stored as a condition: it doesn't compile, or reads
@@ -111,12 +114,31 @@ func (c *conditions) check(expr string) error {
 	if _, err := c.compile(expr); err != nil || c.typed == nil {
 		return err
 	}
+	c.mu.RLock()
+	ok := c.typedOK[expr]
+	c.mu.RUnlock()
+	if ok {
+		return nil
+	}
 	checked, iss := c.typed.Compile(expr)
 	if iss.Err() != nil {
 		return fmt.Errorf("%w: %w", errCondition, iss.Err())
 	}
 	if checked.OutputType() != cel.BoolType {
 		return fmt.Errorf("%w: is %s, not a bool", errCondition, checked.OutputType())
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k := range c.typedOK {
+		if c.typedLen+len(expr) <= maxCached {
+			break
+		}
+		delete(c.typedOK, k)
+		c.typedLen -= len(k)
+	}
+	if !c.typedOK[expr] {
+		c.typedOK[expr] = true
+		c.typedLen += len(expr)
 	}
 	return nil
 }

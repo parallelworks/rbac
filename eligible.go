@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -59,7 +58,8 @@ func (a *Authorizer) checkEligibility(e Eligibility) error {
 		errs = append(errs, fmt.Errorf("an eligibility has at most %d approvers", MaxApprovers))
 	}
 	for _, p := range e.Approvers {
-		if p.broad() || !p.wellFormed("") {
+		// Of a kind that acts, or no Subject could ever approve as it.
+		if p.broad() || !a.known("", p) {
 			errs = append(errs, fmt.Errorf("approver %q is not an identity or group", p.key()))
 		}
 	}
@@ -88,9 +88,7 @@ func (a *Authorizer) SetEligibility(ctx context.Context, actor Subject, on Resou
 		return err
 	}
 	e.Scope, e.ExpiresAt = on.Scope(), stored(e.ExpiresAt)
-	e.Approvers = slices.CompactFunc(slices.SortedFunc(slices.Values(e.Approvers), func(x, y Principal) int {
-		return strings.Compare(x.key(), y.key())
-	}), func(x, y Principal) bool { return x == y })
+	e.Approvers = canonicalPrincipals(e.Approvers)
 	check := func() error { return a.checkEligibility(e) }
 	return a.change(ctx, actor, on, ViaEligibility, []Binding{e.binding()}, nil, check, func(tx pgx.Tx) (ChangeEvent, error) {
 		// An expired eligibility that is still stored allowed nothing, so setting it again records
@@ -154,7 +152,9 @@ type Activation struct {
 
 // Activate gives s a role on a scope, on, as an eligibility of s's or of a group of s's there
 // allows: a grant of its own from SourceActivation, beside any grant s holds, lasting
-// act.Duration, with act.Justification as its note. It needs no permission to change grants, the
+// act.Duration, with act.Justification as its note. s holds one activation of a role on a scope:
+// activating again extends it when it would end later, and records the new justification and
+// approver, so repeated activations add no rows. It needs no permission to change grants, the
 // eligibility being the authority, but a constraint that stops changes to grants on the scope's
 // type stops it, and Config.ValidateGrant is asked about it, as about any grant. Where the
 // eligibility names approvers, the host's approval flow activates for s once one approves,
@@ -200,16 +200,22 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 		if err := errors.Join(a.checkBinding(roles, on.Tenant, scope, b, a.cfg.Now())...); err != nil {
 			return ChangeEvent{}, err
 		}
-		// Activated again until the same instant, it is the same grant, with this justification.
+		// One activation of a role on a scope, extended, or set again once it has ended: only Activate
+		// grants from SourceActivation, under this principal's lock, so there is never a second.
 		rows, err := tx.Query(ctx, `
-			INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at,
-			  note, approved_by, created_by, updated_by)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
-			ON CONFLICT (tenant, principal, scope, role, source, coalesce(expires_at, 'infinity'), length(condition), hashtextextended(condition, 0))
-			DO UPDATE SET note = EXCLUDED.note, approved_by = EXCLUDED.approved_by, updated_by = EXCLUDED.updated_by, updated_at = now()
-			RETURNING `+grantColumns,
+			WITH extended AS (
+			  UPDATE rbac_grants SET expires_at = CASE WHEN expires_at > $12 THEN greatest(expires_at, $8) ELSE $8 END,
+			    note = $9, approved_by = $10, updated_by = $11, updated_at = now()
+			  WHERE tenant = $1 AND scope = $2 || ':' || $3 AND principal = $4 || ':' || $5 AND role = $6 AND source = $7
+			  RETURNING `+grantColumns+`),
+			activated AS (
+			  INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at,
+			    note, approved_by, created_by, updated_by)
+			  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11 WHERE NOT EXISTS (SELECT FROM extended)
+			  RETURNING `+grantColumns+`)
+			SELECT * FROM extended UNION ALL SELECT * FROM activated`,
 			on.Tenant, scope.Type, scope.ID, s.Principal.Kind, s.Principal.ID, act.Role, SourceActivation, b.ExpiresAt,
-			b.Note, actorKey(approver), s.Principal.key())
+			b.Note, actorKey(approver), s.Principal.key(), a.cfg.Now())
 		if err != nil {
 			return ChangeEvent{}, err
 		}

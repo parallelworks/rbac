@@ -114,13 +114,7 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, via
 		for _, b := range slices.Concat(grants, revokes) {
 			principals[b.Principal.key()] = true
 		}
-		var err error
-		if len(principals) >= maxLocks {
-			err = lockTenant(ctx, tx, on.Tenant)
-		} else {
-			err = lock(ctx, tx, on.Tenant, []string{scope.Key()}, slices.Collect(maps.Keys(principals)))
-		}
-		if err != nil {
+		if err := lockAll(ctx, tx, on.Tenant, []string{scope.Key()}, slices.Collect(maps.Keys(principals))); err != nil {
 			return ChangeEvent{}, err
 		}
 		// Decided again in the transaction, so the actor's access and the roles are read as the
@@ -182,6 +176,14 @@ func lock(ctx context.Context, tx pgx.Tx, tenant string, scopes, principals []st
 	return locked(tx.SendBatch(ctx, b))
 }
 
+// lockAll locks scopes and principals one by one, or past maxLocks the tenant.
+func lockAll(ctx context.Context, tx pgx.Tx, tenant string, scopes, principals []string) error {
+	if len(scopes)+len(principals) > maxLocks {
+		return lockTenant(ctx, tx, tenant)
+	}
+	return lock(ctx, tx, tenant, scopes, principals)
+}
+
 func lockTenant(ctx context.Context, tx pgx.Tx, tenant string) error {
 	b := &pgx.Batch{}
 	b.Queue(`SELECT current_setting('transaction_isolation')`)
@@ -230,11 +232,14 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 	for i := range grants {
 		grants[i].ExpiresAt = stored(grants[i].ExpiresAt)
 		conditions = append(conditions, a.checkCondition(grants[i].Binding)...)
+		if grants[i].Source == SourceActivation {
+			conditions = append(conditions, &InvalidError{Binding: grants[i].Binding, Reason: "only Activate grants from " + SourceActivation})
+		}
 	}
-	check := func(q DB, errs ...error) error {
+	check := func(q DB, errs ...error) (book, error) {
 		roles, err := a.book(ctx, q, tenant, roleIDs(grants))
 		if err != nil {
-			return err
+			return book{}, err
 		}
 		for _, g := range grants {
 			if !g.Scope.in(tenant) {
@@ -243,12 +248,9 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 			}
 			errs = append(errs, a.checkBinding(roles, tenant, g.Scope, g.Binding, a.cfg.Now())...)
 		}
-		return errors.Join(errs...)
+		return roles, errors.Join(errs...)
 	}
-	if err := check(a.db, conditions...); err != nil {
-		return err
-	}
-	roles, err := a.book(ctx, a.db, tenant, roleIDs(grants))
+	roles, err := check(a.db, conditions...)
 	if err != nil {
 		return err
 	}
@@ -269,17 +271,11 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 		principals[g.Principal.key()] = true
 	}
 	return a.inTx(ctx, tenant, actor, func(tx pgx.Tx) (ChangeEvent, error) {
-		var err error
-		if len(scopes)+len(principals) > maxLocks {
-			err = lockTenant(ctx, tx, tenant)
-		} else {
-			err = lock(ctx, tx, tenant, slices.Collect(maps.Keys(scopes)), slices.Collect(maps.Keys(principals)))
-		}
-		if err != nil {
+		if err := lockAll(ctx, tx, tenant, slices.Collect(maps.Keys(scopes)), slices.Collect(maps.Keys(principals))); err != nil {
 			return ChangeEvent{}, err
 		}
 		// Again under the locks, so a custom role deleted since isn't granted.
-		if err := check(tx); err != nil {
+		if _, err := check(tx); err != nil {
 			return ChangeEvent{}, err
 		}
 		granted, err := a.upsert(ctx, tx, tenant, actor, grants)
@@ -786,18 +782,22 @@ func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, f
 	})
 }
 
-// begin runs fn in a transaction of its own at READ COMMITTED, whatever the database's default,
-// as a change's checks must read what committed before it took its locks; under WithTx, in a
-// savepoint of the host's transaction, whose isolation the locks check. PostgreSQL refusing it
-// for a race matches ErrConflict.
 func (a *Authorizer) begin(ctx context.Context, fn func(pgx.Tx) error) error {
+	return begin(ctx, a.db, fn)
+}
+
+// begin runs fn in a transaction of its own at READ COMMITTED, whatever the database's default,
+// as a change's checks must read what committed before it took its locks; on a pgx.Tx, as under
+// WithTx, in a savepoint of that transaction, whose isolation the locks check. PostgreSQL
+// refusing it for a race matches ErrConflict.
+func begin(ctx context.Context, db DB, fn func(pgx.Tx) error) error {
 	var err error
-	if db, ok := a.db.(interface {
+	if conn, ok := db.(interface {
 		BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
 	}); ok {
-		err = pgx.BeginTxFunc(ctx, db, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, fn)
+		err = pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, fn)
 	} else {
-		err = pgx.BeginFunc(ctx, a.db, fn)
+		err = pgx.BeginFunc(ctx, db, fn)
 	}
 	return conflicted(err)
 }

@@ -31,7 +31,9 @@ func Migrations() fs.FS {
 // what is pending in one transaction, is safe to call from several replicas at once, and never
 // runs by itself.
 func Migrate(ctx context.Context, db DB) error {
-	return pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+	// At READ COMMITTED, so a replica that waited for the lock reads the versions another applied
+	// meanwhile: a stricter snapshot, taken before the lock, would apply them again.
+	return begin(ctx, db, func(tx pgx.Tx) error {
 		var schema *string
 		if err := tx.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
 			return err
@@ -52,7 +54,8 @@ func Migrate(ctx context.Context, db DB) error {
 		if err := tx.QueryRow(ctx, `SELECT coalesce(max(version), 0) FROM rbac_migrations`).Scan(&applied); err != nil {
 			return err
 		}
-		names, err := fs.Glob(Migrations(), "*.sql")
+		fsys := Migrations()
+		names, err := fs.Glob(fsys, "*.sql")
 		if err != nil {
 			return err
 		}
@@ -65,7 +68,7 @@ func Migrate(ctx context.Context, db DB) error {
 			if version <= applied {
 				continue
 			}
-			sql, err := fs.ReadFile(Migrations(), name)
+			sql, err := fs.ReadFile(fsys, name)
 			if err != nil {
 				return err
 			}
