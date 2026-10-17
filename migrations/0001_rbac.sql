@@ -1,6 +1,6 @@
 -- Role grants: one role to one principal on a resource, a container or the tenant.
 CREATE TABLE rbac_grants (
-    id                    bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id                    uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant                text        COLLATE "C" NOT NULL CHECK (tenant <> ''),
     scope_type            text        COLLATE "C" NOT NULL CHECK (scope_type ~ '^[a-z][a-z0-9_-]{0,62}$'),
     scope_id              text        COLLATE "C" NOT NULL,
@@ -8,16 +8,23 @@ CREATE TABLE rbac_grants (
     principal_kind        text        COLLATE "C" NOT NULL CHECK (principal_kind ~ '^[a-z][a-z0-9_-]{0,62}$'),
     principal_id          text        COLLATE "C" NOT NULL,
     role                  text        COLLATE "C" NOT NULL,
+    -- Where it comes from: empty when made directly, `activation` when activated from an
+    -- eligibility, or a name the host gives the grants it manages.
+    source                text        COLLATE "C" NOT NULL DEFAULT '' CHECK (source ~ '^([a-z][a-z0-9._:/-]{0,62})?$'),
     expires_at            timestamptz,
     -- A grant's condition, in CEL; empty for none.
     condition_title       text        NOT NULL DEFAULT '' CHECK (length(condition_title) <= 128),
     condition_description text        NOT NULL DEFAULT '' CHECK (length(condition_description) <= 2048),
-    condition             text        NOT NULL DEFAULT '' CHECK (length(condition) <= 2048),
+    condition             text        COLLATE "C" NOT NULL DEFAULT '' CHECK (length(condition) <= 2048),
     -- Why a grant was made; an activated grant's justification.
     note                  text        NOT NULL DEFAULT '' CHECK (length(note) <= 2048),
-    -- The actor's principal as `kind:id`; empty for a grant Import stored.
+    -- Principals as `kind:id`: who approved an activation that needed it, empty for none; who made
+    -- the grant, and who last changed its note.
+    approved_by           text        NOT NULL DEFAULT '',
     created_by            text        NOT NULL DEFAULT '',
     created_at            timestamptz NOT NULL DEFAULT now(),
+    updated_by            text        NOT NULL DEFAULT '',
+    updated_at            timestamptz NOT NULL DEFAULT now(),
     -- Keys as `type:id`; a type can't contain ':', so they are unambiguous.
     scope                 text        COLLATE "C" GENERATED ALWAYS AS (scope_type || ':' || scope_id) STORED,
     principal             text        COLLATE "C" GENERATED ALWAYS AS (principal_kind || ':' || principal_id) STORED,
@@ -26,11 +33,18 @@ CREATE TABLE rbac_grants (
     CHECK ((principal_kind = 'public') = (principal_id = '')),
     CHECK (principal_kind <> 'tenant' OR principal_id = tenant),
     -- The tenant's own scope has the tenant's id.
-    CHECK (scope_id <> '' AND (scope_type <> 'tenant' OR scope_id = tenant)),
-    -- Checks are an index-only scan on this: principals and scopes as arrays, with expiry, and
-    -- whether a grant has a condition, which a check reads only when no unconditional grant allows.
-    CONSTRAINT rbac_grants_key UNIQUE (tenant, principal, scope, role) INCLUDE (expires_at, conditional)
+    CHECK (scope_id <> '' AND (scope_type <> 'tenant' OR scope_id = tenant))
 );
+
+-- A grant is one role to one principal on one scope, from one source, until one time, under one
+-- condition: granting the same again changes only its note, and a grant that differs in any of
+-- these is another beside it, so granting never narrows what a principal holds. The condition
+-- counts by its length and hash, as an index entry can't hold a long one. Checks are an
+-- index-only scan on this: principals and scopes as arrays, with expiry, and whether a grant has
+-- a condition, which a check reads by id only when no unconditional grant allows.
+CREATE UNIQUE INDEX rbac_grants_key ON rbac_grants
+    (tenant, principal, scope, role, source, coalesce(expires_at, 'infinity'), length(condition), hashtextextended(condition, 0))
+    INCLUDE (id, expires_at, conditional);
 
 -- Who has access to a scope, and deleting a scope's grants.
 CREATE INDEX rbac_grants_scope ON rbac_grants (tenant, scope);
@@ -106,6 +120,8 @@ CREATE TABLE rbac_eligibilities (
     expires_at     timestamptz,
     -- What activating needs, in CEL; empty for nothing more.
     requires       text        NOT NULL DEFAULT '' CHECK (length(requires) <= 2048),
+    -- Who approves each activation, identities or groups as `kind:id`; empty for no one.
+    approvers      text[]      COLLATE "C" NOT NULL DEFAULT '{}' CHECK (cardinality(approvers) <= 16),
     note           text        NOT NULL DEFAULT '' CHECK (length(note) <= 2048),
     created_by     text        NOT NULL DEFAULT '',
     created_at     timestamptz NOT NULL DEFAULT now(),

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -12,10 +14,10 @@ import (
 
 // Eligibility lets a principal activate a role on a scope when it needs it, for a while, rather
 // than hold it standing: just-in-time access. Activating gives the identity that activates a
-// grant until MaxDuration from then at most, and no later than the eligibility ends, with its
-// justification as the grant's note; one eligible through a group activates for itself. An
-// approval before activating is the host's: on approval, it can grant with Import. An activated
-// role that changes grants lets its holder make lasting grants, to itself too, as any
+// grant of its own, from SourceActivation, until MaxDuration from then at most and no later than
+// the eligibility ends, with its justification as the grant's note; one eligible through a group
+// activates for itself. With Approvers, each activation needs one of them to approve it. An
+// activated role that changes grants lets its holder make lasting grants, to itself too, as any
 // time-limited one does: make eligible roles that can't change grants.
 type Eligibility struct {
 	Scope     Scope
@@ -31,13 +33,19 @@ type Eligibility struct {
 	// `<type>:grant`, such as a second factor (`request.attributes.mfa == true`); empty for
 	// nothing more.
 	Requires string
-	Note     string
+	// Approvers are who approves each activation, identities or groups, at most MaxApprovers; none
+	// when empty. One of them other than the one activating is Activation.Approver.
+	Approvers []Principal
+	Note      string
 	// CreatedBy and CreatedAt are set on eligibilities read back.
 	CreatedBy Principal
 	CreatedAt time.Time
 }
 
 const maxActivation = 366 * 24 * time.Hour
+
+// MaxApprovers bounds an eligibility's approvers.
+const MaxApprovers = 16
 
 func (e Eligibility) binding() Binding {
 	return Binding{Role: e.Role, Principal: e.Principal, ExpiresAt: e.ExpiresAt, Note: e.Note}
@@ -51,6 +59,14 @@ func (a *Authorizer) checkEligibility(e Eligibility) error {
 	}
 	if e.MaxDuration < time.Second || e.MaxDuration > maxActivation {
 		errs = append(errs, fmt.Errorf("an activation lasts a second or more and at most %s", maxActivation))
+	}
+	if len(e.Approvers) > MaxApprovers {
+		errs = append(errs, fmt.Errorf("an eligibility has at most %d approvers", MaxApprovers))
+	}
+	for _, p := range e.Approvers {
+		if p.broad() || !p.wellFormed("") {
+			errs = append(errs, fmt.Errorf("approver %q is not an identity or group", p.key()))
+		}
 	}
 	switch {
 	case !validText(e.Requires):
@@ -77,23 +93,28 @@ func (a *Authorizer) SetEligible(ctx context.Context, actor Subject, on Resource
 		return err
 	}
 	e.Scope, e.ExpiresAt = on.Scope(), stored(e.ExpiresAt)
+	e.Approvers = slices.CompactFunc(slices.SortedFunc(slices.Values(e.Approvers), func(x, y Principal) int {
+		return strings.Compare(x.key(), y.key())
+	}), func(x, y Principal) bool { return x == y })
 	check := func() error { return a.checkEligibility(e) }
 	return a.change(ctx, actor, on, []Binding{e.binding()}, nil, check, func(tx pgx.Tx) (ChangeEvent, error) {
 		// An expired eligibility that is still stored allowed nothing, so setting it again records
 		// the new actor and time.
 		rows, err := tx.Query(ctx, `
 			INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds,
-			  expires_at, requires, note, created_by)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			  expires_at, requires, approvers, note, created_by)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 			ON CONFLICT ON CONSTRAINT rbac_eligibilities_key DO UPDATE SET max_seconds = EXCLUDED.max_seconds,
-			  expires_at = EXCLUDED.expires_at, requires = EXCLUDED.requires, note = EXCLUDED.note,
-			  created_by = CASE WHEN rbac_eligibilities.expires_at <= $12 THEN EXCLUDED.created_by ELSE rbac_eligibilities.created_by END,
-			  created_at = CASE WHEN rbac_eligibilities.expires_at <= $12 THEN EXCLUDED.created_at ELSE rbac_eligibilities.created_at END
-			WHERE (rbac_eligibilities.max_seconds, rbac_eligibilities.expires_at, rbac_eligibilities.requires, rbac_eligibilities.note)
-			  IS DISTINCT FROM (EXCLUDED.max_seconds, EXCLUDED.expires_at, EXCLUDED.requires, EXCLUDED.note)
+			  expires_at = EXCLUDED.expires_at, requires = EXCLUDED.requires, approvers = EXCLUDED.approvers, note = EXCLUDED.note,
+			  created_by = CASE WHEN rbac_eligibilities.expires_at <= $13 THEN EXCLUDED.created_by ELSE rbac_eligibilities.created_by END,
+			  created_at = CASE WHEN rbac_eligibilities.expires_at <= $13 THEN EXCLUDED.created_at ELSE rbac_eligibilities.created_at END
+			WHERE (rbac_eligibilities.max_seconds, rbac_eligibilities.expires_at, rbac_eligibilities.requires,
+			  rbac_eligibilities.approvers, rbac_eligibilities.note)
+			  IS DISTINCT FROM (EXCLUDED.max_seconds, EXCLUDED.expires_at, EXCLUDED.requires, EXCLUDED.approvers, EXCLUDED.note)
 			RETURNING `+eligibilityColumns,
 			on.Tenant, e.Scope.Type, e.Scope.ID, e.Principal.Kind, e.Principal.ID, e.Role, int64(e.MaxDuration/time.Second),
-			pgtype.Timestamptz{Time: e.ExpiresAt, Valid: !e.ExpiresAt.IsZero()}, e.Requires, e.Note, actorKey(actor.Principal), a.cfg.Now())
+			pgtype.Timestamptz{Time: e.ExpiresAt, Valid: !e.ExpiresAt.IsZero()}, e.Requires, keysOf(e.Approvers), e.Note,
+			actorKey(actor.Principal), a.cfg.Now())
 		if err != nil {
 			return ChangeEvent{}, err
 		}
@@ -123,31 +144,47 @@ func (a *Authorizer) RevokeEligible(ctx context.Context, actor Subject, on Resou
 	})
 }
 
-// Activate gives s a role on a scope, on, for d, as an eligibility of s's or of a group of s's
-// there allows, one lasting d or longer and in force until then, with justification as the
-// grant's note. It needs no permission to change grants: the eligibility is the authority. A
-// constraint that stops changes to grants on the scope's type stops activating, and
-// Config.ValidatePrincipal is asked about s, as for any grant. A grant of the role s already
-// holds there is kept when it lasts as long or longer; one under a condition is never replaced,
-// so activating refuses.
-func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, role Role, d time.Duration, justification string) (Grant, error) {
+// Activation is what activating a role asks for (Authorizer.Activate).
+type Activation struct {
+	Role Role
+	// Duration is how long it lasts: at most the eligibility's MaxDuration, ending no later than the
+	// eligibility does.
+	Duration time.Duration
+	// Justification says why; it is the grant's note.
+	Justification string
+	// Approver approved it, where the eligibility names Approvers: one of them other than the one
+	// activating, as the host's approval flow has them when they approve. Zero when there are none.
+	Approver Subject
+}
+
+// Activate gives s a role on a scope, on, as an eligibility of s's or of a group of s's there
+// allows: a grant of its own from SourceActivation, beside any grant s holds, lasting
+// act.Duration, with act.Justification as its note. It needs no permission to change grants, the
+// eligibility being the authority, but a constraint that stops changes to grants on the scope's
+// type stops it, and Config.ValidatePrincipal is asked about s, as for any grant. Where the
+// eligibility names approvers, the host's approval flow activates for s once one approves,
+// passing act.Approver and, in ctx, the request s made (WithRequest), which Requires reads.
+func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act Activation) (Grant, error) {
 	if err := a.check(on); err != nil {
 		return Grant{}, err
 	}
 	if err := a.subject(s); err != nil {
 		return Grant{}, err
 	}
+	if err := a.subject(act.Approver); err != nil {
+		return Grant{}, err
+	}
 	scope := on.Scope()
-	b := Binding{Role: role, Principal: s.Principal, Note: justification}
+	b := Binding{Role: act.Role, Principal: s.Principal, Source: SourceActivation, Note: act.Justification}
 	if err := a.changing(ctx, s.Principal, on); err != nil {
 		return Grant{}, err
 	}
 	// Bounded before eligible rounds it up to seconds, which near the largest Duration overflows.
-	if d <= 0 || d > maxActivation || justification == "" || !validNote(justification) {
+	if d := act.Duration; d <= 0 || d > maxActivation || act.Justification == "" || !validNote(act.Justification) {
 		return Grant{}, &InvalidError{Binding: b, Reason: fmt.Sprintf("an activation lasts more than nothing and at most %s, and has a justification of at most %d characters", maxActivation, maxNote)}
 	}
-	b.ExpiresAt = stored(a.cfg.Now().Add(d))
-	roles, err := a.eligible(ctx, a.db, s, on, role, d, b.ExpiresAt)
+	b.ExpiresAt = stored(a.cfg.Now().Add(act.Duration))
+	roles, _, err := a.eligible(ctx, a.db, s, on, act, b.ExpiresAt)
 	if err != nil {
 		return Grant{}, err
 	}
@@ -160,36 +197,33 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, role 
 			return ChangeEvent{}, err
 		}
 		// Again under the locks, so an eligibility revoked meanwhile activates nothing.
-		b.ExpiresAt = stored(a.cfg.Now().Add(d))
-		roles, err := a.eligible(ctx, tx, s, on, role, d, b.ExpiresAt)
+		b.ExpiresAt = stored(a.cfg.Now().Add(act.Duration))
+		roles, approver, err := a.eligible(ctx, tx, s, on, act, b.ExpiresAt)
 		if err != nil {
 			return ChangeEvent{}, err
 		}
 		if err := errors.Join(a.checkBinding(roles, on.Tenant, scope, b, a.cfg.Now())...); err != nil {
 			return ChangeEvent{}, err
 		}
-		held, err := a.WithTx(tx).Grants(ctx, on.Tenant, GrantFilter{Scopes: []Scope{scope}, Principals: []Principal{s.Principal}})
+		// Activated again until the same instant, it is the same grant, with this justification.
+		rows, err := tx.Query(ctx, `
+			INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at,
+			  note, approved_by, created_by, updated_by)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
+			ON CONFLICT (tenant, principal, scope, role, source, coalesce(expires_at, 'infinity'), length(condition), hashtextextended(condition, 0))
+			DO UPDATE SET note = EXCLUDED.note, approved_by = EXCLUDED.approved_by, updated_by = EXCLUDED.updated_by, updated_at = now()
+			RETURNING `+grantColumns,
+			on.Tenant, scope.Type, scope.ID, s.Principal.Kind, s.Principal.ID, act.Role, SourceActivation, b.ExpiresAt,
+			b.Note, actorKey(approver), s.Principal.key())
 		if err != nil {
 			return ChangeEvent{}, err
 		}
-		for _, g := range held {
-			if g.Role != role {
-				continue
-			}
-			if g.Condition.Expression != "" {
-				return ChangeEvent{}, &InvalidError{Binding: b, Reason: "the role is held here under a condition, which activating would drop"}
-			}
-			if g.ExpiresAt.IsZero() || !g.ExpiresAt.Before(b.ExpiresAt) {
-				activated = g
-				return ChangeEvent{}, nil
-			}
-		}
-		granted, err := a.upsert(ctx, tx, on.Tenant, s.Principal, scopeGrants(scope, []Binding{b}))
-		if err != nil || len(granted) == 0 {
+		granted, err := collectGrants(rows)
+		if err != nil {
 			return ChangeEvent{}, err
 		}
 		activated = granted[0]
-		return ChangeEvent{Granted: granted, Activated: true}, nil
+		return ChangeEvent{Granted: granted}, nil
 	})
 	if err != nil {
 		return Grant{}, err
@@ -197,31 +231,82 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, role 
 	return activated, nil
 }
 
-// eligible checks that s may activate role on on for d, until, and returns the roles it read:
-// an eligibility of s's identity or of one of its groups there, lasting d or longer and in force
-// until then, whose requirement holds in the request, failing closed.
-func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource, role Role, d time.Duration, until time.Time) (book, error) {
+// Deactivate ends s's activations of a role on a scope, on, early, as when the work is done. It
+// needs no permission, and no constraint stops it: s gives up only access it activated.
+func (a *Authorizer) Deactivate(ctx context.Context, s Subject, on Resource, role Role) error {
+	if err := a.check(on); err != nil {
+		return err
+	}
+	if err := a.subject(s); err != nil {
+		return err
+	}
+	if s.Principal == (Principal{}) {
+		return nil
+	}
+	scope := on.Scope()
+	return a.inTx(ctx, on.Tenant, s.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
+		if err := lock(ctx, tx, on.Tenant, []string{scope.Key()}, []string{s.Principal.key()}); err != nil {
+			return ChangeEvent{}, err
+		}
+		ended, err := a.remove(ctx, tx, on.Tenant, "scope = $2 AND principal = $3 AND role = $4 AND source = $5",
+			scope.Key(), s.Principal.key(), role, SourceActivation)
+		return ChangeEvent{Revoked: ended}, err
+	})
+}
+
+// eligible checks that s may activate act.Role on on until until, and returns the roles it read
+// and who approved: an eligibility of s's identity or of one of its groups there, lasting
+// act.Duration or longer and in force until then, whose requirement holds in the request, failing
+// closed, and whose approvers, if it names any, include act.Approver, who isn't s. approved is
+// zero when the eligibility allowing it names none.
+func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource, act Activation, until time.Time) (roles book, approved Principal, err error) {
 	scope, manage := on.Scope(), GrantPermission(on.Type)
+	// Those needing no approval first, so an approver passed where none is needed isn't recorded.
 	rows, err := q.Query(ctx, `
-		SELECT requires FROM rbac_eligibilities
+		SELECT requires, approvers FROM rbac_eligibilities
 		WHERE tenant = $1 AND scope = $2 AND role = $3 AND principal = ANY($4::text[]) AND max_seconds >= $5
 		  AND (expires_at IS NULL OR expires_at > $6 AND expires_at >= $7)
-		ORDER BY requires`,
-		on.Tenant, scope.Key(), role, s.keys(on.Tenant, false, false), seconds(d), a.cfg.Now(), until)
+		ORDER BY cardinality(approvers), requires`,
+		on.Tenant, scope.Key(), act.Role, s.keys(on.Tenant, false, false), seconds(act.Duration), a.cfg.Now(), until)
 	if err != nil {
-		return book{}, err
+		return book{}, Principal{}, err
 	}
-	requires, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	type eligibility struct {
+		requires  string
+		approvers []string
+	}
+	found, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (eligibility, error) {
+		var e eligibility
+		return e, row.Scan(&e.requires, &e.approvers)
+	})
 	if err != nil {
-		return book{}, err
+		return book{}, Principal{}, err
 	}
+	reason := fmt.Sprintf("not eligible to activate %s here for %s", act.Role, act.Duration)
 	vars, spend := a.vars(ctx, s, manage, on), newBudget()
-	for _, r := range requires {
-		if r == "" || a.conds.holds(spend, r, vars) {
-			return a.book(ctx, q, on.Tenant, []Role{role})
+	for _, e := range found {
+		if len(e.approvers) > 0 && !approves(act.Approver, s, e.approvers) {
+			reason = fmt.Sprintf("activating %s here needs one of its approvers to approve", act.Role)
+			continue
+		}
+		if e.requires == "" || a.conds.holds(spend, e.requires, vars) {
+			if len(e.approvers) > 0 {
+				approved = act.Approver.Principal
+			}
+			roles, err := a.book(ctx, q, on.Tenant, []Role{act.Role})
+			return roles, approved, err
 		}
 	}
-	return book{}, &DeniedError{Permission: manage, Scope: scope, Reason: fmt.Sprintf("not eligible to activate %s here for %s", role, d)}
+	return book{}, Principal{}, &DeniedError{Permission: manage, Scope: scope, Reason: reason}
+}
+
+// approves reports whether approver is among an eligibility's approvers, by identity or group, and
+// isn't s, who can't approve its own activation.
+func approves(approver, s Subject, approvers []string) bool {
+	if approver.Principal == (Principal{}) || approver.Principal == s.Principal {
+		return false
+	}
+	return slices.ContainsFunc(approver.keys("", false, false), func(k string) bool { return slices.Contains(approvers, k) })
 }
 
 // seconds is d in whole seconds, rounded up.
@@ -250,8 +335,8 @@ func (a *Authorizer) Eligibilities(ctx context.Context, tenant string, f GrantFi
 	return collectEligibilities(rows)
 }
 
-const eligibilityColumns = `scope_type, scope_id, principal_kind, principal_id, role, max_seconds, expires_at, requires, note,
-	created_by, created_at`
+const eligibilityColumns = `scope_type, scope_id, principal_kind, principal_id, role, max_seconds, expires_at, requires, approvers,
+	note, created_by, created_at`
 
 func collectEligibilities(rows pgx.Rows) ([]Eligibility, error) {
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Eligibility, error) {
@@ -259,8 +344,12 @@ func collectEligibilities(rows pgx.Rows) ([]Eligibility, error) {
 		var seconds int64
 		var expires *time.Time
 		var createdBy string
+		var approvers []string
 		err := row.Scan(&e.Scope.Type, &e.Scope.ID, &e.Principal.Kind, &e.Principal.ID, &e.Role, &seconds, &expires,
-			&e.Requires, &e.Note, &createdBy, &e.CreatedAt)
+			&e.Requires, &approvers, &e.Note, &createdBy, &e.CreatedAt)
+		for _, k := range approvers {
+			e.Approvers = append(e.Approvers, parsePrincipal(k))
+		}
 		e.MaxDuration = time.Duration(seconds) * time.Second
 		if expires != nil {
 			e.ExpiresAt = *expires

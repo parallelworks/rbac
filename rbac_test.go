@@ -585,11 +585,12 @@ func TestApplyRespectsConstraints(t *testing.T) {
 func TestImportKeepsTheLastOfRepeatedGrants(t *testing.T) {
 	h := setup(t)
 	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
-	later := g
+	again, later := g, g
+	again.Note = "the last"
 	later.ExpiresAt = h.now.Add(time.Hour)
-	h.seed(t, g, later)
+	h.seed(t, g, again, later)
 	got, err := h.authz.Grants(t.Context(), "t1", rbac.GrantFilter{Principals: []rbac.Principal{g.Principal}})
-	if err != nil || len(got) != 1 || !got[0].ExpiresAt.Equal(later.ExpiresAt) {
+	if err != nil || len(got) != 2 || got[0].Note != "the last" || !got[1].ExpiresAt.Equal(later.ExpiresAt) {
 		t.Fatalf("Grants = %+v, %v", got, err)
 	}
 }
@@ -2720,9 +2721,12 @@ func TestConditionalGrantsInChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(h.events) != 1 || h.events[0].Granted[0].Condition != other.Condition {
-		t.Fatalf("a new condition should replace the old and be reported: %+v", h.events)
+		t.Fatalf("a grant under another condition should be reported: %+v", h.events)
 	}
-	if got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{b.Principal}}); err != nil || len(got) != 1 || got[0].Condition != other.Condition {
+	// It is another grant, beside the first.
+	if got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{b.Principal}}); err != nil || len(got) != 2 ||
+		!slices.ContainsFunc(got, func(g rbac.Grant) bool { return g.Condition == other.Condition }) ||
+		!slices.ContainsFunc(got, func(g rbac.Grant) bool { return g.Condition == same.Condition }) {
 		t.Fatalf("Grants = %+v, %v", got, err)
 	}
 }
@@ -3376,7 +3380,7 @@ func TestEligibleGrants(t *testing.T) {
 			mfa, user("outsider", "oncall"), cluster, "cluster.sudo", 30 * time.Minute, "x", rbac.ErrInvalid,
 		},
 	} {
-		if _, err := h.authz.Activate(c.ctx, c.s, c.on, c.role, c.d, c.why); !errors.Is(err, c.want) {
+		if _, err := h.authz.Activate(c.ctx, c.s, c.on, rbac.Activation{Role: c.role, Duration: c.d, Justification: c.why}); !errors.Is(err, c.want) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
@@ -3384,27 +3388,36 @@ func TestEligibleGrants(t *testing.T) {
 		t.Fatalf("refused activations should store nothing: %+v, %v", got, err)
 	}
 	h.events = nil
-	g, err := h.authz.Activate(mfa, pager, cluster, "cluster.sudo", 30*time.Minute, "INC-7: disk full")
+	g, err := h.authz.Activate(mfa, pager, cluster, rbac.Activation{Role: "cluster.sudo", Duration: 30 * time.Minute, Justification: "INC-7: disk full"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if g.Principal != pager.Principal || g.Note != "INC-7: disk full" || !g.ExpiresAt.Equal(h.now.Add(30*time.Minute)) {
 		t.Fatalf("activated %+v", g)
 	}
-	if len(h.events) != 1 || len(h.events[0].Granted) != 1 || !h.events[0].Activated || h.events[0].Actor != pager.Principal {
+	if g.Source != rbac.SourceActivation || g.ID == "" || g.CreatedBy != pager.Principal {
+		t.Fatalf("an activation is a grant of its own, made by whoever activated: %+v", g)
+	}
+	if len(h.events) != 1 || len(h.events[0].Granted) != 1 || h.events[0].Granted[0].Source != rbac.SourceActivation ||
+		h.events[0].Actor != pager.Principal {
 		t.Fatalf("events = %+v", h.events)
 	}
 	if !allowed(t, h, pager, root, cluster) {
 		t.Fatal("an activated role should give its permissions")
 	}
-	// Activating again for less keeps the longer grant; for more, extends it.
-	if g, err := h.authz.Activate(mfa, pager, cluster, "cluster.sudo", 10*time.Minute, "again"); err != nil || !g.ExpiresAt.Equal(h.now.Add(30*time.Minute)) {
+	// Each activation is a grant of its own: a shorter one leaves the longer, and each ends.
+	if g, err := h.authz.Activate(mfa, pager, cluster, rbac.Activation{Role: "cluster.sudo", Duration: 10 * time.Minute, Justification: "again"}); err != nil ||
+		!g.ExpiresAt.Equal(h.now.Add(10*time.Minute)) || g.Note != "again" {
 		t.Fatalf("a shorter activation: %+v, %v", g, err)
 	}
-	if g, err := h.authz.Activate(mfa, pager, cluster, "cluster.sudo", 45*time.Minute, "longer"); err != nil || !g.ExpiresAt.Equal(h.now.Add(45*time.Minute)) {
-		t.Fatalf("a longer activation: %+v, %v", g, err)
+	if got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{pager.Principal}}); err != nil || len(got) != 2 {
+		t.Fatalf("two activations: %+v, %v", got, err)
 	}
-	h.now = h.now.Add(46 * time.Minute)
+	h.now = h.now.Add(20 * time.Minute)
+	if !allowed(t, h, pager, root, cluster) {
+		t.Fatal("the longer activation should outlast the shorter")
+	}
+	h.now = h.now.Add(11 * time.Minute)
 	if allowed(t, h, pager, root, cluster) {
 		t.Fatal("an activation should end")
 	}
@@ -3420,7 +3433,7 @@ func TestEligibleGrants(t *testing.T) {
 	if err := h.authz.RevokeEligible(ctx, user("owner"), cluster, "cluster.sudo", oncall.Principal); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.authz.Activate(mfa, pager, cluster, "cluster.sudo", 30*time.Minute, "x"); !errors.Is(err, rbac.ErrDenied) {
+	if _, err := h.authz.Activate(mfa, pager, cluster, rbac.Activation{Role: "cluster.sudo", Duration: 30 * time.Minute, Justification: "x"}); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("activating a revoked eligibility: %v", err)
 	}
 }
@@ -3448,13 +3461,235 @@ func TestSettingAnEligibilityIsChecked(t *testing.T) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
-	// A role held under a condition isn't replaced by activating it.
-	h.seed(t, rbac.Grant{Scope: cluster.Scope(), Binding: conditional("cluster.sudo", "x", "true")})
+	for name, approvers := range map[string][]rbac.Principal{
+		"too many approvers":  approvers(rbac.MaxApprovers + 1),
+		"the public approves": {{Kind: rbac.Public}},
+		"a nameless approver": {{Kind: rbac.Group}},
+	} {
+		bad := e
+		bad.Approvers = approvers
+		if err := h.authz.SetEligible(ctx, user("owner"), cluster, bad); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	// A role held under a condition is activated beside it, and the conditional grant stays.
+	h.seed(t, rbac.Grant{Scope: cluster.Scope(), Binding: conditional("cluster.sudo", "x", "false")})
 	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.authz.Activate(ctx, user("x"), cluster, "cluster.sudo", time.Minute, "x"); !errors.Is(err, rbac.ErrInvalid) {
-		t.Fatalf("activating over a conditional grant: %v", err)
+	if _, err := h.authz.Activate(ctx, user("x"), cluster, rbac.Activation{Role: "cluster.sudo", Duration: time.Minute, Justification: "x"}); err != nil {
+		t.Fatalf("activating beside a conditional grant: %v", err)
+	}
+	if !allowed(t, h, user("x"), root, cluster) {
+		t.Fatal("the activation should give the role where the condition doesn't")
+	}
+	got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{e.Principal}})
+	if err != nil || len(got) != 2 || !slices.ContainsFunc(got, func(g rbac.Grant) bool { return g.Condition.Expression == "false" }) {
+		t.Fatalf("the conditional grant should stay: %+v, %v", got, err)
+	}
+}
+
+// approvers is n different approvers.
+func approvers(n int) []rbac.Principal {
+	ps := make([]rbac.Principal, n)
+	for i := range ps {
+		ps[i] = rbac.Principal{Kind: rbac.User, ID: fmt.Sprintf("a%d", i)}
+	}
+	return ps
+}
+
+func TestActivationsNeedTheirApprovers(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	e := rbac.Eligibility{
+		Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: time.Hour,
+		Approvers: []rbac.Principal{{Kind: rbac.Group, ID: "leads"}, {Kind: rbac.User, ID: "x"}},
+	}
+	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
+		t.Fatal(err)
+	}
+	ask := rbac.Activation{Role: "cluster.sudo", Duration: time.Minute, Justification: "INC-9"}
+	for name, approver := range map[string]rbac.Subject{
+		"no approver":           {},
+		"approving their own":   user("x", "leads"),
+		"not among approvers":   user("peer", "devs"),
+		"an approver's ex-team": user("lead"),
+	} {
+		withApprover := ask
+		withApprover.Approver = approver
+		if _, err := h.authz.Activate(ctx, user("x"), cluster, withApprover); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if allowed(t, h, user("x"), root, cluster) {
+		t.Fatal("an unapproved activation should give nothing")
+	}
+	ask.Approver = user("lead", "leads")
+	g, err := h.authz.Activate(ctx, user("x"), cluster, ask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.ApprovedBy != (rbac.Principal{Kind: rbac.User, ID: "lead"}) || g.CreatedBy != (rbac.Principal{Kind: rbac.User, ID: "x"}) {
+		t.Fatalf("an approved activation records its approver and activator: %+v", g)
+	}
+	if got, err := h.authz.Eligibilities(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}}); err != nil || len(got) != 1 || len(got[0].Approvers) != 2 {
+		t.Fatalf("Eligibilities = %+v, %v", got, err)
+	}
+	// Where an eligibility needs no approval, an approver passed anyway isn't recorded, though
+	// another for the role would need theirs.
+	free := rbac.Eligibility{Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.Group, ID: "sre"}, MaxDuration: time.Hour}
+	if err := h.authz.SetEligible(ctx, user("owner"), cluster, free); err != nil {
+		t.Fatal(err)
+	}
+	ask.Duration = 2 * time.Minute
+	if g, err := h.authz.Activate(ctx, user("x", "sre"), cluster, ask); err != nil || g.ApprovedBy != (rbac.Principal{}) {
+		t.Fatalf("an activation needing no approval: %+v, %v", g, err)
+	}
+}
+
+func TestDeactivating(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	e := rbac.Eligibility{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: time.Hour}
+	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "x"), grant(workspace.Scope(), "cluster.login", rbac.User, "y"))
+	for range 2 {
+		if _, err := h.authz.Activate(ctx, user("x"), cluster, rbac.Activation{Role: "cluster.login", Duration: time.Minute, Justification: "x"}); err != nil {
+			t.Fatal(err)
+		}
+		h.now = h.now.Add(time.Second)
+	}
+	if err := h.authz.Deactivate(ctx, user("y"), cluster, "cluster.login"); err != nil {
+		t.Fatal(err)
+	}
+	h.events = nil
+	if err := h.authz.Deactivate(ctx, user("x"), cluster, "cluster.login"); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.events) != 1 || len(h.events[0].Revoked) != 2 || h.events[0].Actor != user("x").Principal {
+		t.Fatalf("events = %+v", h.events)
+	}
+	got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{e.Principal}})
+	if err != nil || len(got) != 1 || got[0].Source != "" {
+		t.Fatalf("deactivating should end only the activations: %+v, %v", got, err)
+	}
+	if err := h.authz.Deactivate(ctx, rbac.Subject{}, cluster, "cluster.login"); err != nil {
+		t.Fatalf("deactivating as no one: %v", err)
+	}
+}
+
+func TestGrantsAddUp(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	scope := []rbac.Scope{cluster.Scope()}
+	held := func() []rbac.Grant {
+		t.Helper()
+		got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Scopes: scope, Principals: []rbac.Principal{{Kind: rbac.User, ID: "u"}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	apply := func(c rbac.Change) {
+		t.Helper()
+		if err := h.authz.Apply(ctx, user("owner"), cluster, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	standing := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}
+	untilSoon := standing
+	untilSoon.ExpiresAt = h.now.Add(time.Hour)
+	apply(rbac.Change{Grant: []rbac.Binding{standing}})
+	apply(rbac.Change{Grant: []rbac.Binding{untilSoon}})
+	if got := held(); len(got) != 2 {
+		t.Fatalf("a grant with an expiry should stand beside the one without: %+v", got)
+	}
+	h.now = h.now.Add(2 * time.Hour)
+	if !allowed(t, h, user("u"), login, cluster) {
+		t.Fatal("granting until a time shouldn't narrow a standing grant")
+	}
+	// The same grant again changes its note and who last changed it, not its id.
+	first := held()[0]
+	again := standing
+	again.Note = "ticket 12"
+	if err := h.authz.Apply(ctx, user("admin2"), cluster, rbac.Change{Grant: []rbac.Binding{again}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("someone without the power to grant: %v", err)
+	}
+	h.seed(t, grant(cluster.Scope(), "cluster.admin", rbac.User, "admin2"))
+	h.events = nil
+	if err := h.authz.Apply(ctx, user("admin2"), cluster, rbac.Change{Grant: []rbac.Binding{again}}); err != nil {
+		t.Fatal(err)
+	}
+	got := held()
+	if len(got) != 1 || got[0].ID != first.ID || got[0].Note != "ticket 12" || got[0].UpdatedBy != user("admin2").Principal ||
+		got[0].CreatedBy != first.CreatedBy {
+		t.Fatalf("the same grant again: %+v, was %+v", got, first)
+	}
+	if len(h.events) != 1 || len(h.events[0].Granted) != 1 {
+		t.Fatalf("a new note is a change: %+v", h.events)
+	}
+	// Two conditions are two grants, each allowing where it holds: replacing the role's grants with
+	// them ends the unconditional one.
+	a, b := standing, standing
+	a.Condition.Expression, b.Condition.Expression = `request.attributes.vpn == true`, `request.attributes.office == true`
+	apply(rbac.Change{Revoke: []rbac.Binding{standing}, Grant: []rbac.Binding{a, b}})
+	for _, attr := range []string{"vpn", "office"} {
+		if err := h.authz.Authorize(rbac.WithRequest(ctx, map[string]any{attr: true}), user("u"), login, cluster); err != nil {
+			t.Errorf("each conditional grant should allow where its own condition holds (%s): %v", attr, err)
+		}
+	}
+	if got := held(); len(got) != 2 || slices.ContainsFunc(got, func(g rbac.Grant) bool { return g.Condition.Expression == "" }) {
+		t.Fatalf("a change replacing a role with conditional grants should end the unconditional one: %+v", got)
+	}
+	// A source of its own is another grant.
+	synced := standing
+	synced.Source = "sync/directory"
+	apply(rbac.Change{Grant: []rbac.Binding{synced}})
+	if got := held(); len(got) != 3 {
+		t.Fatalf("a source should be a grant of its own: %+v", got)
+	}
+	// Revoking a role from a source removes its grants from that source, whatever their condition.
+	apply(rbac.Change{Revoke: []rbac.Binding{standing}})
+	if got := held(); len(got) != 1 || got[0].Source != synced.Source {
+		t.Fatalf("after revoking the direct grants: %+v", got)
+	}
+	// An id picks one grant; with another source or role it revokes nothing.
+	apply(rbac.Change{Grant: []rbac.Binding{standing, a}})
+	byID := held()
+	victim := byID[slices.IndexFunc(byID, func(g rbac.Grant) bool { return g.Condition.Expression == a.Condition.Expression })]
+	wrongRole := victim.Binding
+	wrongRole.Role = "cluster.admin"
+	apply(rbac.Change{Revoke: []rbac.Binding{wrongRole}})
+	if got := held(); len(got) != 3 {
+		t.Fatalf("an id with another role should revoke nothing: %+v", got)
+	}
+	apply(rbac.Change{Revoke: []rbac.Binding{victim.Binding}})
+	if got := held(); len(got) != 2 || slices.ContainsFunc(got, func(g rbac.Grant) bool { return g.ID == victim.ID }) {
+		t.Fatalf("revoking by id: %+v", got)
+	}
+	// Revoking and granting at once replaces the role's grants, keeping one granted again as it is.
+	kept := held()[slices.IndexFunc(held(), func(g rbac.Grant) bool { return g.Source == "" })]
+	untilLater := standing
+	untilLater.ExpiresAt = h.now.Add(time.Hour)
+	apply(rbac.Change{Revoke: []rbac.Binding{standing}, Grant: []rbac.Binding{standing, untilLater}})
+	got = held()
+	if len(got) != 3 || !slices.ContainsFunc(got, func(g rbac.Grant) bool { return g.ID == kept.ID }) {
+		t.Fatalf("a grant granted again in a replacing change should keep its id: %+v", got)
+	}
+	apply(rbac.Change{Revoke: []rbac.Binding{standing}, Grant: []rbac.Binding{untilLater}})
+	if got := held(); len(got) != 2 || slices.ContainsFunc(got, func(g rbac.Grant) bool { return g.Source == "" && g.ExpiresAt.IsZero() }) {
+		t.Fatalf("a grant with another expiry isn't spared: %+v", got)
+	}
+	for name, bad := range map[string]rbac.Binding{
+		"the activation source":   {Role: "cluster.login", Principal: standing.Principal, Source: rbac.SourceActivation},
+		"a source with uppercase": {Role: "cluster.login", Principal: standing.Principal, Source: "Sync"},
+		"a source too long":       {Role: "cluster.login", Principal: standing.Principal, Source: "s" + strings.Repeat("x", 63)},
+	} {
+		if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{bad}}); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s: %v", name, err)
+		}
 	}
 }
 
@@ -3471,7 +3706,7 @@ func TestActivatingRespectsConstraints(t *testing.T) {
 		t.Fatal(err)
 	}
 	stop = true
-	if _, err := h.authz.Activate(ctx, user("x"), cluster, "cluster.login", time.Minute, "x"); !errors.Is(err, rbac.ErrDenied) {
+	if _, err := h.authz.Activate(ctx, user("x"), cluster, rbac.Activation{Role: "cluster.login", Duration: time.Minute, Justification: "x"}); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("activating under a freeze on grant changes: %v", err)
 	}
 }
@@ -3544,10 +3779,10 @@ func TestAnActivationEndsByItsEligibility(t *testing.T) {
 	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.authz.Activate(ctx, user("x"), cluster, "cluster.sudo", 300*24*time.Hour, "x"); !errors.Is(err, rbac.ErrDenied) {
+	if _, err := h.authz.Activate(ctx, user("x"), cluster, rbac.Activation{Role: "cluster.sudo", Duration: 300 * 24 * time.Hour, Justification: "x"}); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("activating past the eligibility's end: %v", err)
 	}
-	if g, err := h.authz.Activate(ctx, user("x"), cluster, "cluster.sudo", 10*time.Minute, "x"); err != nil || !g.ExpiresAt.Equal(e.ExpiresAt) {
+	if g, err := h.authz.Activate(ctx, user("x"), cluster, rbac.Activation{Role: "cluster.sudo", Duration: 10 * time.Minute, Justification: "x"}); err != nil || !g.ExpiresAt.Equal(e.ExpiresAt) {
 		t.Fatalf("activating until the eligibility's end: %+v, %v", g, err)
 	}
 }
@@ -3576,7 +3811,7 @@ func TestDeletingARoleEndsItsEligibilities(t *testing.T) {
 	if err := h.authz.DefineRole(ctx, admin, "t1", operator); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.authz.Activate(ctx, user("x"), cluster, operator.ID, time.Minute, "x"); !errors.Is(err, rbac.ErrDenied) {
+	if _, err := h.authz.Activate(ctx, user("x"), cluster, rbac.Activation{Role: operator.ID, Duration: time.Minute, Justification: "x"}); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("activating a role deleted and defined again: %v", err)
 	}
 }

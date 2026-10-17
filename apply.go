@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -67,8 +68,13 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 	if len(grants)+len(revokes) == 0 {
 		return nil
 	}
+	for _, b := range grants {
+		if b.Source == SourceActivation {
+			return &InvalidError{Binding: b, Reason: "only Activate grants from " + SourceActivation}
+		}
+	}
 	return a.change(ctx, actor, on, grants, revokes, nil, func(tx pgx.Tx) (ChangeEvent, error) {
-		revoked, err := a.revoke(ctx, tx, on.Tenant, scope, revokes)
+		revoked, err := a.revoke(ctx, tx, on.Tenant, scope, revokes, grants)
 		if err != nil {
 			return ChangeEvent{}, err
 		}
@@ -250,32 +256,49 @@ func (a *Authorizer) Import(ctx context.Context, tenant string, grants []Grant) 
 	})
 }
 
-// dedupe drops repeated bindings, keeping the last of each grant, and bindings revoked and
-// granted at once (granted wins). What is left keeps the order given, as errors report it.
+// dedupe drops repeated bindings: of grants that are one grant, it keeps the last, whose note is
+// the one stored. What is left keeps the order given, as errors report it.
 func dedupe(c Change) (grants, revokes []Binding) {
-	type id struct {
-		role Role
-		p    Principal
-	}
-	granted := map[id]bool{}
+	granted := map[grantKey]bool{}
 	for _, b := range slices.Backward(c.Grant) {
-		k := id{b.Role, b.Principal}
-		if !granted[k] {
+		b.ExpiresAt = stored(b.ExpiresAt)
+		if k := keyOf(b); !granted[k] {
 			granted[k] = true
-			b.ExpiresAt = stored(b.ExpiresAt)
 			grants = append(grants, b)
 		}
 	}
 	slices.Reverse(grants)
-	revoked := map[id]bool{}
+	type revoke struct {
+		role       Role
+		p          Principal
+		source, id string
+	}
+	revoked := map[revoke]bool{}
 	for _, b := range c.Revoke {
-		k := id{b.Role, b.Principal}
-		if !granted[k] && !revoked[k] {
+		if k := (revoke{b.Role, b.Principal, b.Source, b.ID}); !revoked[k] {
 			revoked[k] = true
 			revokes = append(revokes, b)
 		}
 	}
 	return grants, revokes
+}
+
+// grantKey is what makes a grant on a scope one grant: its role, principal, source, expiry and
+// condition.
+type grantKey struct {
+	role      Role
+	p         Principal
+	source    string
+	expires   int64
+	condition string
+}
+
+func keyOf(b Binding) grantKey {
+	var expires int64
+	if !b.ExpiresAt.IsZero() {
+		expires = b.ExpiresAt.UnixMicro()
+	}
+	return grantKey{b.Role, b.Principal, b.Source, expires, b.Condition.Expression}
 }
 
 // validate checks the bindings against the roles mayChange read.
@@ -346,8 +369,15 @@ func (a *Authorizer) checkBinding(roles book, tenant string, scope Scope, b Bind
 	if !validNote(b.Note) {
 		bad(fmt.Sprintf("a note is text of at most %d characters", maxNote))
 	}
+	if !validSource(b.Source) {
+		bad("a source is lowercase letters, digits and . _ : / -, starting with a letter, of at most 63")
+	}
 	return errs
 }
+
+var sourceName = regexp.MustCompile(`^([a-z][a-z0-9._:/-]{0,62})?$`)
+
+func validSource(s string) bool { return sourceName.MatchString(s) }
 
 // maxNote bounds a note, on a grant or an eligibility, and an activation's justification.
 const maxNote = 2048
@@ -750,16 +780,16 @@ func (a *Authorizer) report(ctx context.Context, tx pgx.Tx, e ChangeEvent) error
 }
 
 // upsert stores grants in one statement, sorted so concurrent changes lock rows in the same
-// order, and returns those it added or whose expiry, condition or note it changed. Of repeated grants it stores
-// the last, since one statement can't change a row twice. An expired grant that is still
-// stored gave nothing, so granting it again records the new actor and time.
+// order, and returns those it added or whose note it changed. Of grants that are one grant it
+// stores the last, since one statement can't change a row twice.
 func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, grants []Grant) ([]Grant, error) {
 	if len(grants) == 0 {
 		return nil, nil
 	}
 	byKey := func(x, y Grant) int {
-		return cmp.Or(cmp.Compare(x.Principal.key(), y.Principal.key()),
-			cmp.Compare(x.Scope.Key(), y.Scope.Key()), cmp.Compare(x.Role, y.Role))
+		return cmp.Or(cmp.Compare(x.Principal.key(), y.Principal.key()), cmp.Compare(x.Scope.Key(), y.Scope.Key()),
+			cmp.Compare(x.Role, y.Role), cmp.Compare(x.Source, y.Source), x.ExpiresAt.Compare(y.ExpiresAt),
+			cmp.Compare(x.Condition.Expression, y.Condition.Expression))
 	}
 	grants = slices.Clone(grants)
 	slices.Reverse(grants)
@@ -767,52 +797,68 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 	grants = slices.CompactFunc(grants, func(x, y Grant) bool { return byKey(x, y) == 0 })
 	n := len(grants)
 	scopeTypes, scopeIDs, kinds, ids, roles := make([]string, n), make([]string, n), make([]string, n), make([]string, n), make([]string, n)
-	expires := make([]pgtype.Timestamptz, n)
+	sources, expires := make([]string, n), make([]pgtype.Timestamptz, n)
 	titles, descriptions, conditions, notes := make([]string, n), make([]string, n), make([]string, n), make([]string, n)
 	for i, g := range grants {
 		scopeTypes[i], scopeIDs[i] = g.Scope.Type, g.Scope.ID
 		kinds[i], ids[i], roles[i] = string(g.Principal.Kind), g.Principal.ID, string(g.Role)
-		expires[i] = pgtype.Timestamptz{Time: g.ExpiresAt, Valid: !g.ExpiresAt.IsZero()}
+		sources[i], expires[i] = g.Source, pgtype.Timestamptz{Time: g.ExpiresAt, Valid: !g.ExpiresAt.IsZero()}
 		titles[i], descriptions[i], conditions[i] = g.Condition.Title, g.Condition.Description, g.Condition.Expression
 		notes[i] = g.Note
 	}
-	// A grant again with another expiry, condition or note replaces them.
+	// The same grant again changes only its note and its condition's title and description. The
+	// condition's length and hash pick it, and its text must match, so a hash shared by two
+	// conditions changes neither.
 	rows, err := tx.Query(ctx, `
-		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at, created_by,
-		  condition_title, condition_description, condition, note)
-		SELECT $1, st, si, pk, pi, r, e, $8, ct, cd, c, n
-		FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::timestamptz[], $10::text[], $11::text[], $12::text[], $13::text[])
-		  AS t(st, si, pk, pi, r, e, ct, cd, c, n)
-		ON CONFLICT ON CONSTRAINT rbac_grants_key DO UPDATE SET expires_at = EXCLUDED.expires_at,
-		  condition_title = EXCLUDED.condition_title, condition_description = EXCLUDED.condition_description,
-		  condition = EXCLUDED.condition, note = EXCLUDED.note,
-		  created_by = CASE WHEN rbac_grants.expires_at <= $9 THEN EXCLUDED.created_by ELSE rbac_grants.created_by END,
-		  created_at = CASE WHEN rbac_grants.expires_at <= $9 THEN EXCLUDED.created_at ELSE rbac_grants.created_at END
-		WHERE (rbac_grants.expires_at, rbac_grants.condition_title, rbac_grants.condition_description, rbac_grants.condition, rbac_grants.note)
-		  IS DISTINCT FROM (EXCLUDED.expires_at, EXCLUDED.condition_title, EXCLUDED.condition_description, EXCLUDED.condition, EXCLUDED.note)
+		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at,
+		  condition_title, condition_description, condition, note, created_by, updated_by)
+		SELECT $1, st, si, pk, pi, r, src, e, ct, cd, c, n, $9, $9
+		FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::timestamptz[],
+		  $10::text[], $11::text[], $12::text[], $13::text[])
+		  AS t(st, si, pk, pi, r, src, e, ct, cd, c, n)
+		ON CONFLICT (tenant, principal, scope, role, source, coalesce(expires_at, 'infinity'), length(condition), hashtextextended(condition, 0))
+		DO UPDATE SET condition_title = EXCLUDED.condition_title, condition_description = EXCLUDED.condition_description,
+		  note = EXCLUDED.note, updated_by = EXCLUDED.updated_by, updated_at = now()
+		WHERE rbac_grants.condition = EXCLUDED.condition
+		  AND (rbac_grants.condition_title, rbac_grants.condition_description, rbac_grants.note)
+		  IS DISTINCT FROM (EXCLUDED.condition_title, EXCLUDED.condition_description, EXCLUDED.note)
 		RETURNING `+grantColumns,
-		tenant, scopeTypes, scopeIDs, kinds, ids, roles, expires, actorKey(actor), a.cfg.Now(), titles, descriptions, conditions, notes)
+		tenant, scopeTypes, scopeIDs, kinds, ids, roles, sources, expires, actorKey(actor), titles, descriptions, conditions, notes)
 	if err != nil {
 		return nil, err
 	}
 	return collectGrants(rows)
 }
 
-// revoke deletes bindings from a scope and returns the grants it removed.
-func (a *Authorizer) revoke(ctx context.Context, tx pgx.Tx, tenant string, scope Scope, bindings []Binding) ([]Grant, error) {
+// revoke deletes from a scope the grants bindings name, each by its role, principal and source,
+// or by its id, sparing those kept, which the change grants again, and returns those it removed.
+func (a *Authorizer) revoke(ctx context.Context, tx pgx.Tx, tenant string, scope Scope, bindings, kept []Binding) ([]Grant, error) {
 	if len(bindings) == 0 {
 		return nil, nil
 	}
-	principals, roles := make([]string, len(bindings)), make([]string, len(bindings))
+	n := len(bindings)
+	principals, roles, sources, ids := make([]string, n), make([]string, n), make([]string, n), make([]string, n)
 	for i, b := range bindings {
-		principals[i], roles[i] = b.Principal.key(), string(b.Role)
+		principals[i], roles[i], sources[i], ids[i] = b.Principal.key(), string(b.Role), b.Source, b.ID
+	}
+	m := len(kept)
+	keptPrincipals, keptRoles, keptSources, keptConditions := make([]string, m), make([]string, m), make([]string, m), make([]string, m)
+	keptExpires := make([]pgtype.Timestamptz, m)
+	for i, b := range kept {
+		keptPrincipals[i], keptRoles[i], keptSources[i] = b.Principal.key(), string(b.Role), b.Source
+		keptExpires[i], keptConditions[i] = pgtype.Timestamptz{Time: b.ExpiresAt, Valid: !b.ExpiresAt.IsZero()}, b.Condition.Expression
 	}
 	rows, err := tx.Query(ctx, `
-		DELETE FROM rbac_grants
+		DELETE FROM rbac_grants g
 		WHERE tenant = $1 AND scope = $2
-		  AND (principal, role) IN (SELECT * FROM unnest($3::text[], $4::text[]))
+		  AND EXISTS (SELECT FROM unnest($3::text[], $4::text[], $5::text[], $6::text[]) AS r(principal, role, source, id)
+		    WHERE r.principal = g.principal AND r.role = g.role AND (r.id = '' AND r.source = g.source OR r.id = g.id::text))
+		  AND NOT EXISTS (SELECT FROM unnest($7::text[], $8::text[], $9::text[], $10::timestamptz[], $11::text[])
+		    AS k(principal, role, source, expires_at, condition)
+		    WHERE k.principal = g.principal AND k.role = g.role AND k.source = g.source
+		      AND k.expires_at IS NOT DISTINCT FROM g.expires_at AND k.condition = g.condition)
 		RETURNING `+grantColumns,
-		tenant, scope.Key(), principals, roles)
+		tenant, scope.Key(), principals, roles, sources, ids, keptPrincipals, keptRoles, keptSources, keptExpires, keptConditions)
 	if err != nil {
 		return nil, err
 	}
@@ -857,7 +903,7 @@ func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) (
 	rows, err := a.db.Query(ctx, `
 		SELECT `+grantColumns+` FROM rbac_grants
 		WHERE tenant = $1 AND `+where+` AND (expires_at IS NULL OR expires_at > $4)
-		ORDER BY scope, principal, role`,
+		ORDER BY scope, principal, role, source, expires_at NULLS FIRST, condition, id`,
 		tenant, scopes, principals, a.cfg.Now())
 	if err != nil {
 		return nil, err
