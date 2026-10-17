@@ -210,10 +210,10 @@ func canonical(r RoleDefinition) RoleDefinition {
 // of its GrantableRoles must be a role the actor may grant on the tenant. Replacing a role
 // another custom role lists needs the power to grant it as defined wherever that one lists it.
 // Replacing one so that its grants give something else changes them, so a constraint that stops
-// changes to grants where it can be granted stops it, as it stops DeleteRole. A role another
-// change redefined or created while this one waited for the tenant is refused, to be tried
-// again: the constraints were asked about it as it was. One deleted meanwhile is created, as
-// its grants went with it.
+// changes to grants where it can be granted, or a deny that removes the actor's power to change
+// them there, stops it, as it stops DeleteRole. A role another change redefined or created while
+// this one waited for the tenant is refused, to be tried again: the constraints were asked about
+// it as it was. One deleted meanwhile is created, as its grants went with it.
 func (a *Authorizer) DefineRole(ctx context.Context, actor Subject, tenant string, r RoleDefinition) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -224,7 +224,7 @@ func (a *Authorizer) DefineRole(ctx context.Context, actor Subject, tenant strin
 	root := Resource{Tenant: tenant, Type: TenantScope, ID: tenant}
 	// Whether the actor may define roles at all, before the definition, so a refused actor
 	// learns nothing of the catalog from what is invalid.
-	if err := a.mayDefineRoles(ctx, actor, root); err != nil {
+	if _, err := a.mayDefineRoles(ctx, actor, root); err != nil {
 		return err
 	}
 	r = canonical(r)
@@ -247,6 +247,9 @@ func (a *Authorizer) DefineRole(ctx context.Context, actor Subject, tenant strin
 		if err := a.changesStopped(ctx, tenant, types, fmt.Sprintf("changing what %s's grants give", r.ID)); err != nil {
 			return err
 		}
+		if err := a.changesDenied(au, tenant, types, fmt.Sprintf("changing what %s's grants give", r.ID)); err != nil {
+			return err
+		}
 	}
 	return a.inTx(ctx, tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
 		// Alone in the tenant, so a change in progress checks and commits against one
@@ -261,6 +264,12 @@ func (a *Authorizer) DefineRole(ctx context.Context, actor Subject, tenant strin
 		old, ok := au.roles.custom[r.ID]
 		if ok && !sameAccess(old, r) && (!existed || !sameAccess(old, checked)) {
 			return ChangeEvent{}, changedMeanwhile(r.ID)
+		}
+		// Again on the denies read under the lock, which a deny set meanwhile is among.
+		if ok && !sameAccess(old, r) {
+			if err := a.changesDenied(au, tenant, slices.Concat(old.ResourceTypes, r.ResourceTypes), fmt.Sprintf("changing what %s's grants give", r.ID)); err != nil {
+				return ChangeEvent{}, err
+			}
 		}
 		// Privileged as the roles that give its permissions on its types are, or as a role it
 		// hands out is, so a host that confirms privileged grants asks about one that gives or
@@ -320,11 +329,12 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		return err
 	}
 	root := Resource{Tenant: tenant, Type: TenantScope, ID: tenant}
-	if err := a.mayDefineRoles(ctx, actor, root); err != nil {
+	au, err := a.mayDefineRoles(ctx, actor, root)
+	if err != nil {
 		return err
 	}
-	// Deleting it revokes its grants, so a constraint that stops changes to grants where it can
-	// be granted stops deleting it, as it would revoking one by one.
+	// Deleting it revokes its grants, so a constraint or deny that stops changes to grants where it
+	// can be granted stops deleting it, as it would revoking one by one.
 	roles, err := a.book(ctx, a.db, tenant, []Role{id})
 	if err != nil {
 		return err
@@ -334,12 +344,16 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		if err := a.changesStopped(ctx, tenant, checked.ResourceTypes, "revoking "+string(id)); err != nil {
 			return err
 		}
+		if err := a.changesDenied(au, tenant, checked.ResourceTypes, "revoking "+string(id)); err != nil {
+			return err
+		}
 	}
 	return a.inTx(ctx, tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lockTenant(ctx, tx, tenant); err != nil {
 			return ChangeEvent{}, err
 		}
-		if _, err := a.mayDefine(ctx, tx, actor, root, nil); err != nil {
+		au, err := a.mayDefine(ctx, tx, actor, root, nil)
+		if err != nil {
 			return ChangeEvent{}, err
 		}
 		roles, err := a.book(ctx, tx, tenant, []Role{id})
@@ -348,6 +362,11 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		}
 		if def, ok := roles.role(id); ok && (!existed || !sameAccess(def, checked)) {
 			return ChangeEvent{}, changedMeanwhile(id)
+		}
+		if existed {
+			if err := a.changesDenied(au, tenant, checked.ResourceTypes, "revoking "+string(id)); err != nil {
+				return ChangeEvent{}, err
+			}
 		}
 		rows, err := tx.Query(ctx, `SELECT id FROM rbac_roles WHERE tenant = $1 AND id <> $2 AND $2 = ANY(grantable_roles) ORDER BY id`, tenant, id)
 		if err != nil {
@@ -381,9 +400,7 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 // changesStopped returns why a constraint stops changing every grant of a custom role: one that
 // stops changes to grants on scopes of one of the role's types, a container or the tenant.
 func (a *Authorizer) changesStopped(ctx context.Context, tenant string, roleTypes []string, change string) error {
-	types := slices.Concat(roleTypes, a.containerTypes, []string{TenantScope})
-	slices.Sort(types)
-	for _, t := range slices.Compact(types) {
+	for _, t := range a.grantedOn(roleTypes) {
 		name, err := a.denied(ctx, tenant, t, GrantPermission(t))
 		if err != nil {
 			return err
@@ -393,6 +410,26 @@ func (a *Authorizer) changesStopped(ctx context.Context, tenant string, roleType
 		}
 	}
 	return nil
+}
+
+// changesDenied returns why a deny stops the actor changing every grant of a custom role, as
+// changesStopped does for a constraint: one that removes its power to change grants on scopes of
+// one of the role's types, a container or the tenant.
+func (a *Authorizer) changesDenied(au authority, tenant string, roleTypes []string, change string) error {
+	for _, t := range a.grantedOn(roleTypes) {
+		if au.handsOn(GrantPermission(t)) {
+			return &DeniedError{Permission: GrantPermission(t), Scope: TenantRoot(tenant), Reason: "removed by a deny, which stops " + change}
+		}
+	}
+	return nil
+}
+
+// grantedOn lists the scope types a custom role's grants can be on: its types, the containers
+// and the tenant.
+func (a *Authorizer) grantedOn(roleTypes []string) []string {
+	types := slices.Concat(roleTypes, a.containerTypes, []string{TenantScope})
+	slices.Sort(types)
+	return slices.Compact(types)
 }
 
 // changedMeanwhile refuses a change to a role that another change redefined or created after
@@ -410,20 +447,19 @@ func sameAccess(x, y RoleDefinition) bool {
 // mayDefineRoles checks, before the transaction, that actor may define a tenant's roles. The
 // constraints run here only, as in Apply: a hook that queries the pool while the transaction
 // holds a connection can wait forever on a busy pool.
-func (a *Authorizer) mayDefineRoles(ctx context.Context, actor Subject, root Resource) error {
+func (a *Authorizer) mayDefineRoles(ctx context.Context, actor Subject, root Resource) (authority, error) {
 	scope := root.Scope()
 	if actor.Principal == (Principal{}) {
-		return &DeniedError{Permission: DefineRoles, Scope: scope, Reason: "an anonymous subject changes nothing"}
+		return authority{}, &DeniedError{Permission: DefineRoles, Scope: scope, Reason: "an anonymous subject changes nothing"}
 	}
 	name, err := a.denied(ctx, root.Tenant, TenantScope, DefineRoles)
 	if err != nil {
-		return err
+		return authority{}, err
 	}
 	if name != "" {
-		return &DeniedError{Permission: DefineRoles, Scope: scope, Reason: "removed by " + name}
+		return authority{}, &DeniedError{Permission: DefineRoles, Scope: scope, Reason: "removed by " + name}
 	}
-	_, err = a.mayDefine(ctx, a.db, actor, root, nil)
-	return err
+	return a.mayDefine(ctx, a.db, actor, root, nil)
 }
 
 // mayDefine checks that actor holds DefineRoles on the tenant, and with r, that it may define r:
