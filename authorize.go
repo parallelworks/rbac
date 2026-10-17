@@ -505,16 +505,16 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, prin
 		perm, wildcard = matchable(p)
 	}
 	rows, err := q.Query(ctx, `
-		SELECT false, principal, scope, role, expires_at, conditional, NULL::text[], ''
+		SELECT false, id::text, principal, scope, role, expires_at, conditional, NULL::text[], ''
 		FROM rbac_grants
 		WHERE tenant = $1 AND principal = ANY($2::text[]) AND scope = ANY($3::text[])
 		  AND (expires_at IS NULL OR expires_at > $4)
 		UNION ALL
-		SELECT true, id, scope, '', NULL, condition <> '', permissions, condition
+		SELECT true, id, id, scope, '', NULL, condition <> '', permissions, condition
 		FROM rbac_denies
 		WHERE tenant = $1 AND scope = ANY($3::text[]) AND principals && $5::text[] AND NOT exempt && $5::text[]
 		  AND ($6 = '' OR $6 = ANY(permissions) OR $7 = ANY(permissions))
-		ORDER BY 1, 2, 3, 4`,
+		ORDER BY 1, 3, 4, 5, 2`, // grants by principal, scope, role and id; denies by id and scope, as deniesOn
 		tenant, principals, scopes, a.cfg.Now(), keys, perm, wildcard)
 	if err != nil {
 		return nil, nil, err
@@ -522,20 +522,20 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, prin
 	var held []holding
 	var ds []denial
 	var isDeny bool
-	var first, scope, third, condition string
+	var id, principal, scope, role, condition string
 	var expires *time.Time
 	var conditional bool
 	var perms []string
-	_, err = pgx.ForEachRow(rows, []any{&isDeny, &first, &scope, &third, &expires, &conditional, &perms, &condition}, func() error {
+	_, err = pgx.ForEachRow(rows, []any{&isDeny, &id, &principal, &scope, &role, &expires, &conditional, &perms, &condition}, func() error {
 		if isDeny {
-			d := denial{id: first, scope: scope, condition: condition}
+			d := denial{id: id, scope: scope, condition: condition}
 			for _, x := range perms {
 				d.permissions = append(d.permissions, Permission(x))
 			}
 			ds = append(ds, d)
 			return nil
 		}
-		h := holding{Binding: Binding{Principal: parsePrincipal(first), Role: Role(third)}, scope: scope, conditional: conditional}
+		h := holding{Binding: Binding{ID: id, Principal: parsePrincipal(principal), Role: Role(role)}, scope: scope, conditional: conditional}
 		if expires != nil {
 			h.ExpiresAt = *expires
 		}
@@ -547,29 +547,24 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, prin
 
 // conditionsOf reads the conditions of the conditional grants among held, in place.
 func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held []holding) error {
-	var principals, scopes, roles []string
+	var ids []string
 	for _, h := range held {
 		if h.conditional {
-			principals, scopes, roles = append(principals, h.Principal.key()), append(scopes, h.scope), append(roles, string(h.Role))
+			ids = append(ids, h.ID)
 		}
 	}
-	if len(principals) == 0 {
+	if len(ids) == 0 {
 		return nil
 	}
 	// Only the expression: a check reads nothing else of a condition.
-	rows, err := q.Query(ctx, `
-		SELECT principal, scope, role, condition FROM rbac_grants
-		WHERE tenant = $1 AND (principal, scope, role) IN (SELECT * FROM unnest($2::text[], $3::text[], $4::text[]))`,
-		tenant, principals, scopes, roles)
+	rows, err := q.Query(ctx, `SELECT id::text, condition FROM rbac_grants WHERE id = ANY($1::uuid[]) AND tenant = $2`, ids, tenant)
 	if err != nil {
 		return err
 	}
-	type key struct{ principal, scope, role string }
-	found := map[key]string{}
-	var k key
-	var expr string
-	_, err = pgx.ForEachRow(rows, []any{&k.principal, &k.scope, &k.role, &expr}, func() error {
-		found[k] = expr
+	found := map[string]string{}
+	var id, expr string
+	_, err = pgx.ForEachRow(rows, []any{&id, &expr}, func() error {
+		found[id] = expr
 		return nil
 	})
 	if err != nil {
@@ -578,7 +573,7 @@ func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held
 	for i, h := range held {
 		if h.conditional {
 			// One gone since is read as a condition nothing meets.
-			held[i].Condition.Expression = cmp.Or(found[key{h.Principal.key(), h.scope, string(h.Role)}], "false")
+			held[i].Condition.Expression = cmp.Or(found[h.ID], "false")
 		}
 	}
 	return nil
@@ -595,7 +590,7 @@ func (a *Authorizer) heldGrants(ctx context.Context, q DB, tenant string, princi
 		SELECT `+grantColumns+` FROM rbac_grants
 		WHERE tenant = $1 AND principal = ANY($2::text[]) AND scope = ANY($3::text[])
 		  AND (expires_at IS NULL OR expires_at > $4)
-		ORDER BY principal, scope, role`,
+		ORDER BY principal, scope, role, id`,
 		tenant, principals, scopes, a.cfg.Now())
 	if err != nil {
 		return nil, err
@@ -603,20 +598,21 @@ func (a *Authorizer) heldGrants(ctx context.Context, q DB, tenant string, princi
 	return collectGrants(rows)
 }
 
-const grantColumns = `scope_type, scope_id, principal_kind, principal_id, role, expires_at, created_by, created_at,
-	condition_title, condition_description, condition, note`
+const grantColumns = `id::text, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at,
+	condition_title, condition_description, condition, note, approved_by, created_by, created_at, updated_by, updated_at`
 
 func collectGrants(rows pgx.Rows) ([]Grant, error) {
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Grant, error) {
 		var g Grant
 		var expires *time.Time
-		var createdBy string
-		err := row.Scan(&g.Scope.Type, &g.Scope.ID, &g.Principal.Kind, &g.Principal.ID, &g.Role,
-			&expires, &createdBy, &g.CreatedAt, &g.Condition.Title, &g.Condition.Description, &g.Condition.Expression, &g.Note)
+		var approvedBy, createdBy, updatedBy string
+		err := row.Scan(&g.ID, &g.Scope.Type, &g.Scope.ID, &g.Principal.Kind, &g.Principal.ID, &g.Role, &g.Source, &expires,
+			&g.Condition.Title, &g.Condition.Description, &g.Condition.Expression, &g.Note,
+			&approvedBy, &createdBy, &g.CreatedAt, &updatedBy, &g.UpdatedAt)
 		if expires != nil {
 			g.ExpiresAt = *expires
 		}
-		g.CreatedBy = parsePrincipal(createdBy)
+		g.ApprovedBy, g.CreatedBy, g.UpdatedBy = parsePrincipal(approvedBy), parsePrincipal(createdBy), parsePrincipal(updatedBy)
 		return g, err
 	})
 }

@@ -282,8 +282,15 @@ func (r Resource) path() []string {
 
 // Binding is one role for one principal, optionally until a time or under a condition.
 type Binding struct {
+	// ID is a stored grant's, set on grants read back. In Change.Revoke it picks that one grant.
+	ID        string
 	Role      Role
 	Principal Principal
+	// Source is where a grant comes from: empty when made directly, SourceActivation when
+	// activated from an eligibility, or a name the host gives the grants it manages, such as
+	// those it syncs from a directory, so that it revokes only its own. A source is lowercase
+	// letters, digits and . _ : / -, starting with a letter.
+	Source string
 	// ExpiresAt ends it; zero never does.
 	ExpiresAt time.Time
 	// Condition limits it to the requests its expression allows; the zero Condition is none.
@@ -293,26 +300,41 @@ type Binding struct {
 	Note string
 }
 
+// SourceActivation is the source of a grant activated from an eligibility (Authorizer.Activate).
+const SourceActivation = "activation"
+
 // Grant is a binding on a scope, as stored.
 type Grant struct {
 	Scope Scope
 	Binding
-	// CreatedBy and CreatedAt are set on grants read back. CreatedBy is zero for a grant Import
-	// stored.
+	// ApprovedBy approved an activated grant whose eligibility needed approval; zero otherwise.
+	ApprovedBy Principal
+	// CreatedBy and CreatedAt are who made the grant and when, and UpdatedBy and UpdatedAt who last
+	// changed its note or its condition's title or description; they are set on grants read back.
+	// CreatedBy is zero for a grant Import stored.
 	CreatedBy Principal
 	CreatedAt time.Time
+	UpdatedBy Principal
+	UpdatedAt time.Time
 }
 
-// Change grants and revokes bindings on one scope. Revokes apply first, so a binding both
-// revoked and granted ends up granted.
+// Change grants and revokes bindings on one scope.
+//
+// A grant is one role to one principal from one source, until one time, under one condition, as
+// in cloud IAM: granting the same again changes only its note and its condition's title and
+// description, and a grant that differs in any of these is another, beside it, so granting never
+// narrows what a principal holds. A revoke removes every grant of its role to its principal from
+// its source, whatever their expiry and condition, or with an ID that one grant. Revokes apply
+// first, sparing grants the change makes again, so revoking and granting a role at once replaces
+// its grants with those granted.
 type Change struct {
 	Grant  []Binding
 	Revoke []Binding
 }
 
-// ChangeEvent is what a committed change did: only the grants that were added, updated or
-// removed, the custom roles defined or deleted, the deny policies set or deleted, and the
-// eligibilities set or ended.
+// ChangeEvent is what a committed change did: only the grants that were added, whose note
+// changed, or removed (an activation is a grant from SourceActivation), the custom roles defined
+// or deleted, the deny policies set or deleted, and the eligibilities set or ended.
 type ChangeEvent struct {
 	Tenant string
 	// Actor is who made the change; zero for Import and the deletes of scopes, principals and
@@ -329,8 +351,6 @@ type ChangeEvent struct {
 	// Eligible are eligibilities set, as they are now; Ineligible, those ended.
 	Eligible   []Eligibility
 	Ineligible []Eligibility
-	// Activated says the actor activated Granted for themselves, on an eligibility (Activate).
-	Activated bool
 }
 
 func (e ChangeEvent) empty() bool {
