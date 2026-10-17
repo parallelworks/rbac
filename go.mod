@@ -11,6 +11,7 @@ godebug fips140=only
 require (
 	cel.dev/cel-go v0.32.0
 	github.com/jackc/pgx/v5 v5.11.0
+	google.golang.org/protobuf v1.36.12
 )
 
 require (
@@ -27,5 +28,4 @@ require (
 	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20240826202546-f6391c0de4c7 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240826202546-f6391c0de4c7 // indirect
-	google.golang.org/protobuf v1.36.10 // indirect
 )

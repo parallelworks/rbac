@@ -78,24 +78,47 @@ func (b *budget) spend(cost uint64) { b.left -= min(cost, b.left) }
 
 // conditions compiles conditions once and keeps the programs, bounded.
 type conditions struct {
-	env      *cel.Env
+	env *cel.Env
+	// typed checks a condition against the declared attributes when it is stored; nil when none
+	// are declared.
+	typed    *cel.Env
 	mu       sync.RWMutex
 	programs map[string]cel.Program
 	cached   int
 }
 
-func newConditions() (*conditions, error) {
-	attrs := cel.MapType(cel.StringType, cel.DynType)
+func newConditions(attrs Attributes) (*conditions, error) {
+	typed, err := typing(attrs)
+	if err != nil {
+		return nil, err
+	}
+	untyped := cel.MapType(cel.StringType, cel.DynType)
 	env, err := cel.NewEnv(
-		cel.Variable("subject", attrs),
-		cel.Variable("resource", attrs),
-		cel.Variable("request", attrs),
+		cel.Variable("subject", untyped),
+		cel.Variable("resource", untyped),
+		cel.Variable("request", untyped),
 		cel.Variable("action", cel.StringType),
 	)
 	if err != nil {
 		return nil, err
 	}
-	return &conditions{env: env, programs: map[string]cel.Program{}}, nil
+	return &conditions{env: env, typed: typed, programs: map[string]cel.Program{}}, nil
+}
+
+// check returns why an expression can't be stored as a condition: it doesn't compile, or reads
+// an attribute it doesn't declare, or as another type.
+func (c *conditions) check(expr string) error {
+	if _, err := c.compile(expr); err != nil || c.typed == nil {
+		return err
+	}
+	checked, iss := c.typed.Compile(expr)
+	if iss.Err() != nil {
+		return fmt.Errorf("%w: %w", errCondition, iss.Err())
+	}
+	if checked.OutputType() != cel.BoolType {
+		return fmt.Errorf("%w: is %s, not a bool", errCondition, checked.OutputType())
+	}
+	return nil
 }
 
 var errCondition = errors.New("rbac: condition")
