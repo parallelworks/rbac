@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"slices"
 	"strings"
 	"sync"
@@ -13,12 +14,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/parallelworks/foundation/pgdb"
-	"github.com/parallelworks/foundation/pgdb/pgdbtest"
-	"github.com/parallelworks/foundation/rbac"
+	"github.com/parallelworks/rbac"
+	"github.com/parallelworks/rbac/internal/pgtest"
 )
-
-const urlEnv = "FOUNDATION_TEST_DATABASE_URL"
 
 var errLookup = errors.New("membership lookup failed")
 
@@ -56,8 +54,8 @@ type harness struct {
 
 func setup(t *testing.T, mutate ...func(*rbac.Config)) *harness {
 	t.Helper()
-	pool := pgdbtest.Migrated(t, urlEnv, pgdb.Migrations{})
-	if err := rbac.Migrate(t.Context(), pool, nil); err != nil {
+	pool := pgtest.Open(t, "")
+	if err := rbac.Migrate(t.Context(), pool); err != nil {
 		t.Fatal(err)
 	}
 	h := &harness{pool: pool, now: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}
@@ -741,7 +739,7 @@ func TestGrantsAndDeletes(t *testing.T) {
 
 func TestMigrateIsRepeatable(t *testing.T) {
 	h := setup(t)
-	if err := rbac.Migrate(t.Context(), h.pool, nil); err != nil {
+	if err := rbac.Migrate(t.Context(), h.pool); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -790,11 +788,8 @@ func TestAFailedPrincipalLookupFailsTheChange(t *testing.T) {
 }
 
 func TestHooksCanUseTheBusyPool(t *testing.T) {
-	pool := pgdbtest.Open(t, urlEnv, "pool_max_conns=1")
-	if err := pgdb.Migrate(t.Context(), pool, pgdb.Migrations{}); err != nil {
-		t.Fatal(err)
-	}
-	if err := rbac.Migrate(t.Context(), pool, nil); err != nil {
+	pool := pgtest.Open(t, "pool_max_conns=1")
+	if err := rbac.Migrate(t.Context(), pool); err != nil {
 		t.Fatal(err)
 	}
 	creator(t, pool)
@@ -1001,13 +996,27 @@ func TestDeleteScopeRemovesAGrantMadeWhileItWaits(t *testing.T) {
 	}
 }
 
-func TestMigrateRunsBeforeTheApplication(t *testing.T) {
-	pool := pgdbtest.Open(t, urlEnv, "")
-	if err := rbac.Migrate(t.Context(), pool, nil); err != nil {
-		t.Fatalf("rbac's tables before the schema exists: %v", err)
+func TestMigratingAtOnce(t *testing.T) {
+	pool := pgtest.Open(t, "")
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() { errs <- rbac.Migrate(t.Context(), pool) }()
 	}
-	if err := pgdb.Migrate(t.Context(), pool, pgdb.Migrations{}); err != nil {
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("two replicas migrating one schema at once: %v", err)
+		}
+	}
+	var versions int
+	if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM rbac_migrations`).Scan(&versions); err != nil {
 		t.Fatal(err)
+	}
+	files, err := fs.Glob(rbac.Migrations(), "*.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if versions != len(files) {
+		t.Fatalf("recorded %d migrations, want %d", versions, len(files))
 	}
 }
 
