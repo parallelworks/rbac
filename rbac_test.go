@@ -377,13 +377,9 @@ func listingsAgree(t *testing.T, h *harness, resources []rbac.Resource, s rbac.S
 		holds := func(scopes []rbac.Scope) bool {
 			return slices.ContainsFunc(scopes, func(sc rbac.Scope) bool { return slices.Contains(h.path(t, r), sc.Key()) })
 		}
-		var in bool
-		switch {
-		case holds(reach.Except):
-		case holds(reach.Conditional):
+		in := !holds(reach.Except) && (reach.All || holds(reach.Scopes) || holds(reach.Conditional))
+		if in && (holds(reach.Conditional) || holds(reach.ConditionalExcept)) {
 			in = allowed(t, h, s, p, r)
-		default:
-			in = reach.All || holds(reach.Scopes)
 		}
 		if in {
 			reached = append(reached, r.ID)
@@ -2968,6 +2964,7 @@ func TestDenies(t *testing.T) {
 	if reach, err := h.authz.Reachable(ctx, user("owner"), view, "t1", "cluster"); err != nil || reach.All || len(reach.Scopes) > 0 {
 		t.Fatalf("Reachable under a tenant-wide deny = %+v, %v", reach, err)
 	}
+	listingsAgree(t, h, resources, user("owner"), view)
 	if err := h.authz.DeleteDeny(ctx, guardian, tenant, "freeze"); err != nil {
 		t.Fatal(err)
 	}
@@ -3013,8 +3010,90 @@ func TestAConditionalDenyFailsClosed(t *testing.T) {
 		t.Fatal("a deny whose condition doesn't hold should leave access")
 	}
 	reach, err := h.authz.Reachable(ctx, user("owner"), login, "t1", "cluster")
-	if err != nil || !slices.Contains(reach.Conditional, workspace.Scope()) || slices.Contains(reach.Except, workspace.Scope()) {
+	if err != nil || !slices.Equal(reach.ConditionalExcept, []rbac.Scope{workspace.Scope()}) || len(reach.Conditional) > 0 || len(reach.Except) > 0 {
 		t.Fatalf("Reachable = %+v, %v", reach, err)
+	}
+	// Someone the deny names but nothing reaches has nothing to check one by one.
+	if reach, err := h.authz.Reachable(ctx, user("nobody"), login, "t1", "cluster"); err != nil || reach.All || len(reach.Scopes)+len(reach.Conditional) > 0 {
+		t.Fatalf("Reachable without grants = %+v, %v", reach, err)
+	}
+	resources := hostTable(t, h)
+	for _, s := range []rbac.Subject{user("owner"), user("nobody")} {
+		listingsAgree(t, h, resources, s, login)
+	}
+}
+
+func TestNoDenyLocksOutAGuardAbove(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	resources := hostTable(t, h)
+	h.seed(t, grant(workspace.Scope(), "guard", rbac.User, "local"))
+	lockout := rbac.Deny{
+		ID: "lockout", Permissions: []rbac.Permission{"workspace:*", "cluster:*"},
+		Principals: []rbac.Principal{rbac.TenantMembers("t1")},
+	}
+	if err := h.authz.SetDeny(ctx, user("local"), workspace, lockout); err != nil {
+		t.Fatal(err)
+	}
+	if allowed(t, h, user("owner"), view, cluster) {
+		t.Fatal("a deny of cluster:* should remove the cluster's permissions")
+	}
+	for _, r := range []rbac.Resource{workspace, cluster} {
+		if !allowed(t, h, guardian, rbac.DenyPermission(r.Type), r) {
+			t.Fatalf("a type's wildcard removed %s from the guardian", rbac.DenyPermission(r.Type))
+		}
+	}
+	if perms, err := h.authz.Permissions(ctx, guardian, workspace); err != nil || !slices.Contains(perms, rbac.DenyPermission("workspace")) {
+		t.Fatalf("Permissions = %v, %v", perms, err)
+	}
+	if holders, err := h.authz.Holders(ctx, workspace, rbac.DenyPermission("workspace")); err != nil || !slices.Contains(holders, guardian.Principal) {
+		t.Fatalf("Holders = %v, %v", holders, err)
+	}
+	listingsAgree(t, h, resources, guardian, rbac.DenyPermission("cluster"))
+	listingsAgree(t, h, resources, user("owner"), view)
+	if reach, err := h.authz.Reachable(ctx, guardian, rbac.DenyPermission("workspace"), "t1", "workspace"); err != nil || !reach.All || len(reach.Except) > 0 {
+		t.Fatalf("Reachable = %+v, %v", reach, err)
+	}
+	if err := h.authz.DeleteDeny(ctx, guardian, workspace, "lockout"); err != nil {
+		t.Fatalf("the guardian above lifting a deny set below: %v", err)
+	}
+	if !allowed(t, h, user("owner"), view, cluster) {
+		t.Fatal("a lifted deny should end")
+	}
+}
+
+func TestADenyRecordsWhoChangedIt(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "guard", rbac.User, "second"))
+	d := rbac.Deny{ID: "no-root", Permissions: []rbac.Permission{root}, Principals: []rbac.Principal{{Kind: rbac.Public}}}
+	if err := h.authz.SetDeny(ctx, guardian, cluster, d); err != nil {
+		t.Fatal(err)
+	}
+	read := func() rbac.Deny {
+		t.Helper()
+		got, err := h.authz.Denies(ctx, "t1", []rbac.Scope{cluster.Scope()})
+		if err != nil || len(got) != 1 {
+			t.Fatalf("Denies = %+v, %v", got, err)
+		}
+		return got[0]
+	}
+	if got := read(); got.CreatedBy != guardian.Principal || got.UpdatedBy != guardian.Principal {
+		t.Fatalf("a new deny: %+v", got)
+	}
+	// Setting it again unchanged is not a change.
+	if err := h.authz.SetDeny(ctx, user("second"), cluster, d); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(); got.UpdatedBy != guardian.Principal {
+		t.Fatalf("an unchanged deny: %+v", got)
+	}
+	d.Name = "No root"
+	if err := h.authz.SetDeny(ctx, user("second"), cluster, d); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(); got.CreatedBy != guardian.Principal || got.UpdatedBy != (rbac.Principal{Kind: rbac.User, ID: "second"}) || got.UpdatedAt.Before(got.CreatedAt) {
+		t.Fatalf("a changed deny: %+v", got)
 	}
 }
 
@@ -3137,6 +3216,7 @@ func TestSettingADenyIsChecked(t *testing.T) {
 		"a malformed principal":  {ID: "d", Permissions: d.Permissions, Principals: []rbac.Principal{{Kind: rbac.User}}},
 		"a broken condition":     {ID: "d", Permissions: d.Permissions, Principals: d.Principals, Condition: rbac.Condition{Expression: "1 +"}},
 		"a condition with a NUL": {ID: "d", Permissions: d.Permissions, Principals: d.Principals, Condition: rbac.Condition{Expression: "request.attributes.x == \"a\x00b\""}},
+		"the deny permission":    {ID: "d", Permissions: []rbac.Permission{rbac.DenyPermission("cluster")}, Principals: d.Principals},
 	} {
 		if err := h.authz.SetDeny(ctx, guardian, cluster, bad); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("%s: %v", name, err)

@@ -17,6 +17,8 @@ CREATE TABLE rbac_denies (
     condition   text        NOT NULL DEFAULT '' CHECK (length(condition) <= 4096),
     created_by  text        NOT NULL DEFAULT '',
     created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_by  text        NOT NULL DEFAULT '',
+    updated_at  timestamptz NOT NULL DEFAULT now(),
     scope       text        COLLATE "C" GENERATED ALWAYS AS (scope_type || ':' || scope_id) STORED,
     PRIMARY KEY (tenant, scope_type, scope_id, id)
 );
