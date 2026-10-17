@@ -867,38 +867,47 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 	if err != nil {
 		return nil, err
 	}
-	// Counted once they are stored, under the change's locks, those it didn't touch included.
-	var scope, principal, role string
-	err = tx.QueryRow(ctx, `
+	if err := a.bounded(ctx, tx, tenant, granted); err != nil {
+		return nil, err
+	}
+	return granted, nil
+}
+
+// bounded refuses grants just stored that leave a principal holding their role on their scope
+// more than MaxGrantsPerRole times. It counts under the change's locks, once they are stored, the
+// grants in force the change didn't touch included, activations too: so no write passes the
+// bound, and one that adds nothing never finds it passed.
+func (a *Authorizer) bounded(ctx context.Context, tx pgx.Tx, tenant string, stored []Grant) error {
+	if len(stored) == 0 {
+		return nil
+	}
+	n := len(stored)
+	scopes, principals, roles := make([]string, n), make([]string, n), make([]string, n)
+	for i, g := range stored {
+		scopes[i], principals[i], roles[i] = g.Scope.Key(), g.Principal.key(), string(g.Role)
+	}
+	rows, err := tx.Query(ctx, `
 		SELECT scope, principal, role FROM rbac_grants
 		WHERE tenant = $1 AND (scope, principal, role) IN (SELECT * FROM unnest($2::text[], $3::text[], $4::text[]))
 		  AND (expires_at IS NULL OR expires_at > $5)
-		GROUP BY scope, principal, role HAVING count(*) > $6 LIMIT 1`,
-		tenant, scopeKeys(grants), keysOfGrants(grants), roles, a.cfg.Now(), MaxGrantsPerRole).Scan(&scope, &principal, &role)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		return granted, nil
-	case err != nil:
-		return nil, err
+		GROUP BY scope, principal, role HAVING count(*) > $6
+		ORDER BY scope, principal, role`,
+		tenant, scopes, principals, roles, a.cfg.Now(), MaxGrantsPerRole)
+	if err != nil {
+		return err
 	}
-	return nil, fmt.Errorf("%w: %s holds %s on %s at most %d times, by source, expiry and condition",
-		ErrInvalid, principal, role, scope, MaxGrantsPerRole)
-}
-
-func scopeKeys(grants []Grant) []string {
-	keys := make([]string, len(grants))
-	for i, g := range grants {
-		keys[i] = g.Scope.Key()
+	over, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (error, error) {
+		var scope, principal, role string
+		if err := row.Scan(&scope, &principal, &role); err != nil {
+			return nil, err
+		}
+		return fmt.Errorf("%w: %s holds %s on %s at most %d times, by source, expiry and condition",
+			ErrInvalid, principal, role, scope, MaxGrantsPerRole), nil
+	})
+	if err != nil {
+		return err
 	}
-	return keys
-}
-
-func keysOfGrants(grants []Grant) []string {
-	keys := make([]string, len(grants))
-	for i, g := range grants {
-		keys[i] = g.Principal.key()
-	}
-	return keys
+	return errors.Join(over...)
 }
 
 // revoke deletes from a scope the grants bindings name, each by its role, principal and source,

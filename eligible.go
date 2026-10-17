@@ -152,9 +152,11 @@ type Activation struct {
 
 // Activate gives s a role on a scope, on, as an eligibility of s's or of a group of s's there
 // allows: a grant of its own from SourceActivation, beside any grant s holds, lasting
-// act.Duration, with act.Justification as its note. s holds one activation of a role on a scope:
-// activating again extends it when it would end later, and records the new justification and any
-// new approver, so repeated activations add no rows. It needs no permission to change grants, the
+// act.Duration, with act.Justification as its note. s holds one activation of a role on a scope,
+// which records the request its end rests on: activating again until later replaces it with this
+// request, its justification and approver; one that would end no sooner changes nothing and
+// returns the activation as it is, reporting nothing; and once it has ended, activating again
+// makes a new grant, with a new ID. It needs no permission to change grants, the
 // eligibility being the authority, but a constraint that stops changes to grants on the scope's
 // type stops it, and Config.ValidateGrant is asked about it, as about any grant. Where the
 // eligibility names approvers, the host's approval flow activates for s once one approves,
@@ -200,19 +202,20 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 		if err := errors.Join(a.checkBinding(roles, on.Tenant, scope, b, a.cfg.Now())...); err != nil {
 			return ChangeEvent{}, err
 		}
-		// The table keeps one activation of a role on a scope: activating again extends it, or sets it
-		// anew, as of now, once it has ended. One it doesn't extend keeps the approval its end rests on,
-		// unless this one was approved too.
+		// The table keeps one activation of a role on a scope, which always records the request its
+		// end rests on: activating again until later replaces it with this request, its justification
+		// and its approver; set anew once it has ended, it is a new grant, with a new id; and one that
+		// ends no later changes nothing, so is reported as nothing.
 		rows, err := tx.Query(ctx, `
 			INSERT INTO rbac_grants AS g (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at,
 			  note, approved_by, created_by, updated_by)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
 			ON CONFLICT (tenant, principal, scope, role) WHERE source = 'activation' DO UPDATE SET
-			  expires_at = CASE WHEN g.expires_at > $12 THEN greatest(g.expires_at, EXCLUDED.expires_at) ELSE EXCLUDED.expires_at END,
-			  approved_by = CASE WHEN g.expires_at > $12 AND g.expires_at >= EXCLUDED.expires_at AND EXCLUDED.approved_by = ''
-			    THEN g.approved_by ELSE EXCLUDED.approved_by END,
+			  id = CASE WHEN g.expires_at > $12 THEN g.id ELSE gen_random_uuid() END,
 			  created_at = CASE WHEN g.expires_at > $12 THEN g.created_at ELSE now() END,
-			  note = EXCLUDED.note, updated_by = EXCLUDED.updated_by, updated_at = now()
+			  expires_at = EXCLUDED.expires_at, note = EXCLUDED.note, approved_by = EXCLUDED.approved_by,
+			  updated_by = EXCLUDED.updated_by, updated_at = now()
+			WHERE g.expires_at <= $12 OR g.expires_at < EXCLUDED.expires_at
 			RETURNING `+grantColumns,
 			on.Tenant, scope.Type, scope.ID, s.Principal.Kind, s.Principal.ID, act.Role, SourceActivation, b.ExpiresAt,
 			b.Note, actorKey(approver), s.Principal.key(), a.cfg.Now())
@@ -221,6 +224,17 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 		}
 		granted, err := collectGrants(rows)
 		if err != nil {
+			return ChangeEvent{}, err
+		}
+		if len(granted) == 0 {
+			held, err := a.WithTx(tx).Grants(ctx, on.Tenant, GrantFilter{Scopes: []Scope{scope}, Principals: []Principal{s.Principal}})
+			if err != nil {
+				return ChangeEvent{}, err
+			}
+			activated = held[slices.IndexFunc(held, func(g Grant) bool { return g.Role == act.Role && g.Source == SourceActivation })]
+			return ChangeEvent{}, nil
+		}
+		if err := a.bounded(ctx, tx, on.Tenant, granted); err != nil {
 			return ChangeEvent{}, err
 		}
 		activated = granted[0]

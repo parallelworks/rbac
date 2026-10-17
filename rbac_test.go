@@ -923,8 +923,21 @@ func TestAPrincipalHoldsARoleABoundedNumberOfTimes(t *testing.T) {
 	if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: until(rbac.MaxGrantsPerRole, 1)[0]}}); !errors.Is(err, rbac.ErrInvalid) {
 		t.Fatalf("an import past the limit: %v", err)
 	}
+	e := rbac.Eligibility{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}, MaxDuration: time.Hour}
+	if err := h.authz.SetEligibility(ctx, user("owner"), cluster, e); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.authz.Activate(ctx, user("u"), cluster, rbac.Activation{Role: "cluster.login", Duration: time.Minute, Justification: "x"}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("an activation past the limit: %v", err)
+	}
 	if got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{{Kind: rbac.User, ID: "u"}}}); err != nil || len(got) != rbac.MaxGrantsPerRole {
 		t.Fatalf("Grants = %d, %v", len(got), err)
+	}
+	// Granting one held again stays possible at the limit.
+	again := until(0, 1)[0]
+	again.Note = "renewed"
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{again}}); err != nil {
+		t.Fatalf("a new note at the limit: %v", err)
 	}
 	// Grants that have ended don't count.
 	h.now = h.now.Add(time.Duration(rbac.MaxGrantsPerRole) * time.Hour)
@@ -3839,11 +3852,12 @@ func TestEligibleGrants(t *testing.T) {
 	if !allowed(t, h, pager, root, cluster) {
 		t.Fatal("an activated role should give its permissions")
 	}
-	// Activating again keeps one activation: a shorter one leaves its end, a longer one extends it,
-	// and each records its justification.
+	// Activating again keeps one activation, recording the request its end rests on: a shorter one
+	// changes nothing and reports nothing, and a longer one replaces it.
+	h.events = nil
 	if g, err := h.authz.Activate(mfa, pager, cluster, rbac.Activation{Role: "cluster.sudo", Duration: 10 * time.Minute, Justification: "again"}); err != nil ||
-		!g.ExpiresAt.Equal(h.now.Add(30*time.Minute)) || g.Note != "again" {
-		t.Fatalf("a shorter activation: %+v, %v", g, err)
+		!g.ExpiresAt.Equal(h.now.Add(30*time.Minute)) || g.Note != "INC-7: disk full" || len(h.events) != 0 {
+		t.Fatalf("a shorter activation: %+v, %v, events %+v", g, err, h.events)
 	}
 	if g, err := h.authz.Activate(mfa, pager, cluster, rbac.Activation{Role: "cluster.sudo", Duration: 45 * time.Minute, Justification: "longer"}); err != nil ||
 		!g.ExpiresAt.Equal(h.now.Add(45*time.Minute)) || g.Note != "longer" {
@@ -3856,11 +3870,17 @@ func TestEligibleGrants(t *testing.T) {
 	if allowed(t, h, pager, root, cluster) {
 		t.Fatal("an activation should end")
 	}
-	// Once it has ended, activating again sets it anew, as of now, still one row.
+	// Once it has ended, activating again makes a new grant, with a new id, still one row.
 	first := g
 	if g, err := h.authz.Activate(mfa, pager, cluster, rbac.Activation{Role: "cluster.sudo", Duration: 5 * time.Minute, Justification: "anew"}); err != nil ||
-		!g.ExpiresAt.Equal(h.now.Add(5*time.Minute)) || g.ID != first.ID || !g.CreatedAt.After(first.CreatedAt) {
+		!g.ExpiresAt.Equal(h.now.Add(5*time.Minute)) || g.ID == first.ID || !g.CreatedAt.After(first.CreatedAt) {
 		t.Fatalf("activating once ended: %+v, %v", g, err)
+	}
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Revoke: []rbac.Binding{first.Binding}}); err != nil {
+		t.Fatal(err)
+	}
+	if !allowed(t, h, pager, root, cluster) {
+		t.Fatal("revoking the ended activation by its id shouldn't end the new one")
 	}
 	h.now = h.now.Add(6 * time.Minute)
 	if got, err := h.authz.Eligibilities(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}}); err != nil || len(got) != 1 || got[0].Note != "on call" {
@@ -3990,12 +4010,13 @@ func TestActivationsNeedTheirApprovers(t *testing.T) {
 	if err := h.authz.SetEligibility(ctx, user("owner"), cluster, free); err != nil {
 		t.Fatal(err)
 	}
-	// One that doesn't extend the approved activation keeps the approval its end rests on.
+	// One that doesn't extend the approved activation leaves it as approved, its justification too.
 	shorter := rbac.Activation{Role: "cluster.sudo", Duration: 30 * time.Second, Justification: "INC-9 again"}
 	if g, err := h.authz.Activate(ctx, user("x", "sre"), cluster, shorter); err != nil ||
-		g.ApprovedBy != ask.Approver.Principal || !g.ExpiresAt.Equal(h.now.Add(time.Minute)) {
+		g.ApprovedBy != ask.Approver.Principal || g.Note != "INC-9" || !g.ExpiresAt.Equal(h.now.Add(time.Minute)) {
 		t.Fatalf("an unapproved activation that doesn't extend an approved one: %+v, %v", g, err)
 	}
+	// One that does rests its end on its own request, which needed no approval.
 	ask.Duration = 2 * time.Minute
 	if g, err := h.authz.Activate(ctx, user("x", "sre"), cluster, ask); err != nil || g.ApprovedBy != (rbac.Principal{}) {
 		t.Fatalf("an activation needing no approval: %+v, %v", g, err)
