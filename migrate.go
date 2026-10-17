@@ -29,7 +29,9 @@ func Migrations() fs.FS {
 // Migrate creates or upgrades the package's tables, prefixed rbac_, in the current schema: the
 // first in the search_path that exists. It records what it applied in rbac_migrations, applies
 // what is pending in one transaction, is safe to call from several replicas at once, and never
-// runs by itself.
+// runs by itself. On a host's transaction it runs at that transaction's isolation, which must be
+// READ COMMITTED for replicas to migrate at once: a stricter one reads the versions from before
+// it waited for another.
 func Migrate(ctx context.Context, db DB) error {
 	// At READ COMMITTED, so a replica that waited for the lock reads the versions another applied
 	// meanwhile: a stricter snapshot, taken before the lock, would apply them again.

@@ -904,6 +904,35 @@ func TestChangesAreBounded(t *testing.T) {
 	}
 }
 
+func TestAPrincipalHoldsARoleABoundedNumberOfTimes(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	until := func(from, n int) []rbac.Binding {
+		bs := make([]rbac.Binding, n)
+		for i := range bs {
+			bs[i] = rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}, ExpiresAt: h.now.Add(time.Duration(from+i+1) * time.Hour)}
+		}
+		return bs
+	}
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: until(0, rbac.MaxGrantsPerRole)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: until(rbac.MaxGrantsPerRole, 1)}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a grant past the limit: %v", err)
+	}
+	if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: until(rbac.MaxGrantsPerRole, 1)[0]}}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("an import past the limit: %v", err)
+	}
+	if got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{{Kind: rbac.User, ID: "u"}}}); err != nil || len(got) != rbac.MaxGrantsPerRole {
+		t.Fatalf("Grants = %d, %v", len(got), err)
+	}
+	// Grants that have ended don't count.
+	h.now = h.now.Add(time.Duration(rbac.MaxGrantsPerRole) * time.Hour)
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: until(0, 1)}); err != nil {
+		t.Fatalf("a grant once the others ended: %v", err)
+	}
+}
+
 func TestTrustedWritesNameTheirActor(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -1119,6 +1148,16 @@ func TestMigrateIsRepeatable(t *testing.T) {
 	}
 }
 
+func TestMigrateNeedsASchema(t *testing.T) {
+	pool := pgtest.Open(t, "pool_max_conns=1")
+	if _, err := pool.Exec(t.Context(), `SET search_path = rbac_no_such_schema`); err != nil {
+		t.Fatal(err)
+	}
+	if err := rbac.Migrate(t.Context(), pool); err == nil || !strings.Contains(err.Error(), "no schema in the search_path") {
+		t.Fatalf("migrating where the search_path names no schema that exists: %v", err)
+	}
+}
+
 func TestCreatorsGetARoleInTheHostsTransaction(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -1213,7 +1252,7 @@ func TestHooksCanUseTheBusyPool(t *testing.T) {
 	}
 }
 
-func TestReGrantingAnExpiredGrantRecordsTheNewActor(t *testing.T) {
+func TestAGrantBesideAnExpiredOneRecordsItsOwnActor(t *testing.T) {
 	h := setup(t)
 	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
 	g.ExpiresAt = h.now.Add(time.Hour)
@@ -1838,6 +1877,17 @@ func TestTheTableRefusesMalformedPrincipals(t *testing.T) {
 	}
 	if err := h.authz.DeletePrincipal(t.Context(), host, "t1", rbac.Principal{}); !errors.Is(err, rbac.ErrInvalid) {
 		t.Errorf("DeletePrincipal of no one: %v", err)
+	}
+}
+
+func TestTheTableKeepsOneActivation(t *testing.T) {
+	h := setup(t)
+	for i := range 2 {
+		_, err := h.pool.Exec(t.Context(), `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at)
+			VALUES ('t1', 'cluster', 'c1', 'user', 'x', 'cluster.sudo', $1, $2)`, rbac.SourceActivation, h.now.Add(time.Duration(i+1)*time.Hour))
+		if (err == nil) != (i == 0) {
+			t.Fatalf("activation %d of one role on one scope: %v", i+1, err)
+		}
 	}
 }
 
@@ -3806,9 +3856,10 @@ func TestEligibleGrants(t *testing.T) {
 	if allowed(t, h, pager, root, cluster) {
 		t.Fatal("an activation should end")
 	}
-	// Once it has ended, activating again sets it anew, still one row.
+	// Once it has ended, activating again sets it anew, as of now, still one row.
+	first := g
 	if g, err := h.authz.Activate(mfa, pager, cluster, rbac.Activation{Role: "cluster.sudo", Duration: 5 * time.Minute, Justification: "anew"}); err != nil ||
-		!g.ExpiresAt.Equal(h.now.Add(5*time.Minute)) {
+		!g.ExpiresAt.Equal(h.now.Add(5*time.Minute)) || g.ID != first.ID || !g.CreatedAt.After(first.CreatedAt) {
 		t.Fatalf("activating once ended: %+v, %v", g, err)
 	}
 	h.now = h.now.Add(6 * time.Minute)
@@ -3939,6 +3990,12 @@ func TestActivationsNeedTheirApprovers(t *testing.T) {
 	if err := h.authz.SetEligibility(ctx, user("owner"), cluster, free); err != nil {
 		t.Fatal(err)
 	}
+	// One that doesn't extend the approved activation keeps the approval its end rests on.
+	shorter := rbac.Activation{Role: "cluster.sudo", Duration: 30 * time.Second, Justification: "INC-9 again"}
+	if g, err := h.authz.Activate(ctx, user("x", "sre"), cluster, shorter); err != nil ||
+		g.ApprovedBy != ask.Approver.Principal || !g.ExpiresAt.Equal(h.now.Add(time.Minute)) {
+		t.Fatalf("an unapproved activation that doesn't extend an approved one: %+v, %v", g, err)
+	}
 	ask.Duration = 2 * time.Minute
 	if g, err := h.authz.Activate(ctx, user("x", "sre"), cluster, ask); err != nil || g.ApprovedBy != (rbac.Principal{}) {
 		t.Fatalf("an activation needing no approval: %+v, %v", g, err)
@@ -4062,6 +4119,10 @@ func TestGrantsAddUp(t *testing.T) {
 	apply(rbac.Change{Revoke: []rbac.Binding{wrongRole}})
 	if got := held(); len(got) != 3 {
 		t.Fatalf("an id with another role should revoke nothing: %+v", got)
+	}
+	idOnly := rbac.Binding{ID: victim.ID, Principal: victim.Principal}
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Revoke: []rbac.Binding{idOnly}}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a revoke by id without its role, which would revoke nothing: %v", err)
 	}
 	apply(rbac.Change{Revoke: []rbac.Binding{victim.Binding}})
 	if got := held(); len(got) != 2 || slices.ContainsFunc(got, func(g rbac.Grant) bool { return g.ID == victim.ID }) {

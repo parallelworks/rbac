@@ -46,6 +46,10 @@ CREATE UNIQUE INDEX rbac_grants_key ON rbac_grants
     (tenant, principal, scope, role, source, coalesce(expires_at, 'infinity'), length(condition), hashtextextended(condition, 0))
     INCLUDE (id, expires_at, conditional);
 
+-- A principal holds one activation of a role on a scope, which activating again extends, so an
+-- eligible principal can't add rows without bound.
+CREATE UNIQUE INDEX rbac_grants_activation ON rbac_grants (tenant, principal, scope, role) WHERE source = 'activation';
+
 -- Who has access to a scope, and deleting a scope's grants.
 CREATE INDEX rbac_grants_scope ON rbac_grants (tenant, scope);
 

@@ -213,7 +213,8 @@ func locked(br pgx.BatchResults) error {
 // seeding, restores and the host's own grants: give whoever creates a resource or container a
 // role on it, in the same transaction through WithTx. actor is who the grants are recorded as
 // made by, such as the creator or the host's own service account. Each grant is still
-// validated, and Config.ValidateGrant asked about it, via ViaImport.
+// validated, and Config.ValidateGrant asked about it, via ViaImport. Grants from
+// SourceActivation are refused, as only Activate makes them: a restore leaves them out.
 func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string, grants []Grant) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -348,6 +349,10 @@ func (a *Authorizer) validate(ctx context.Context, roles book, actor Subject, vi
 		// A role no longer in the catalog, or a kind no longer declared, can still be revoked.
 		if !b.Principal.wellFormed(tenant) {
 			errs = append(errs, &InvalidError{Binding: b, Reason: "the principal is not valid"})
+		}
+		// No grant has no role, so a revoke without one, as by ID alone, would revoke nothing.
+		if b.Role == "" {
+			errs = append(errs, &InvalidError{Binding: b, Reason: "a revoke names its role, by ID too"})
 		}
 	}
 	return errors.Join(errs...)
@@ -858,7 +863,42 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 	if err != nil {
 		return nil, err
 	}
-	return collectGrants(rows)
+	granted, err := collectGrants(rows)
+	if err != nil {
+		return nil, err
+	}
+	// Counted once they are stored, under the change's locks, those it didn't touch included.
+	var scope, principal, role string
+	err = tx.QueryRow(ctx, `
+		SELECT scope, principal, role FROM rbac_grants
+		WHERE tenant = $1 AND (scope, principal, role) IN (SELECT * FROM unnest($2::text[], $3::text[], $4::text[]))
+		  AND (expires_at IS NULL OR expires_at > $5)
+		GROUP BY scope, principal, role HAVING count(*) > $6 LIMIT 1`,
+		tenant, scopeKeys(grants), keysOfGrants(grants), roles, a.cfg.Now(), MaxGrantsPerRole).Scan(&scope, &principal, &role)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return granted, nil
+	case err != nil:
+		return nil, err
+	}
+	return nil, fmt.Errorf("%w: %s holds %s on %s at most %d times, by source, expiry and condition",
+		ErrInvalid, principal, role, scope, MaxGrantsPerRole)
+}
+
+func scopeKeys(grants []Grant) []string {
+	keys := make([]string, len(grants))
+	for i, g := range grants {
+		keys[i] = g.Scope.Key()
+	}
+	return keys
+}
+
+func keysOfGrants(grants []Grant) []string {
+	keys := make([]string, len(grants))
+	for i, g := range grants {
+		keys[i] = g.Principal.key()
+	}
+	return keys
 }
 
 // revoke deletes from a scope the grants bindings name, each by its role, principal and source,

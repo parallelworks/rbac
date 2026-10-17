@@ -141,9 +141,9 @@ permission, so an error shown to a user shows no policy; its fields say why.
   resource or account inherits the grants of the one before it. Delete a resource's grants with
   `DeleteScope` in the transaction that deletes it, for each scope under it too, and rewrite the
   stored paths below a container when it moves.
-- **Limits:** a change takes at most `rbac.MaxBindings` bindings; a scope holds at most
-  `rbac.MaxDenies` denies; a tenant has at most `rbac.MaxCustomRoles` custom roles. The others
-  are exported beside them.
+- **Limits:** a change takes at most `rbac.MaxBindings` bindings; a principal holds a role on a
+  scope at most `rbac.MaxGrantsPerRole` times; a scope holds at most `rbac.MaxDenies` denies; a
+  tenant has at most `rbac.MaxCustomRoles` custom roles. The others are exported beside them.
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them, to run on a
   schedule.
 

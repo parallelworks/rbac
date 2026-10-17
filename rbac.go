@@ -287,7 +287,8 @@ func (r Resource) path() []string {
 
 // Binding is one role for one principal, optionally until a time or under a condition.
 type Binding struct {
-	// ID is a stored grant's, set on grants read back. In Change.Revoke it picks that one grant.
+	// ID is a stored grant's, set on grants read back. In Change.Revoke, with the grant's role and
+	// principal, it picks that one grant.
 	ID        string
 	Role      Role
 	Principal Principal
@@ -337,9 +338,10 @@ type Change struct {
 }
 
 // ChangeEvent is what a committed change did: only the grants that were added, whose note or
-// condition's title or description changed, or removed (an activation is a grant from
-// SourceActivation), the custom roles defined or deleted, the deny policies set or deleted, and
-// the eligibilities set or ended.
+// condition's title or description changed, or removed, the custom roles defined or deleted, the
+// deny policies set or deleted, and the eligibilities set or ended. An activation is a grant from
+// SourceActivation, reported for every request, one that changes nothing included, so an audit
+// sees each justification.
 type ChangeEvent struct {
 	Tenant string
 	// Actor is who made the change: for Import and the deletes, the actor they name.
@@ -416,8 +418,11 @@ func conflicted(err error) error {
 // reads stays bounded. Input past one is refused as invalid; a host can check against them first.
 // Lengths are in characters, but an expression's, in bytes.
 const (
-	// MaxBindings is how many bindings one Apply, grants and revokes together, or one Import takes.
-	MaxBindings = 1000
+	// MaxBindings is how many bindings one Apply, grants and revokes together, or one Import takes,
+	// and MaxGrantsPerRole how many grants in force of one role a principal holds on one scope,
+	// differing by source, expiry or condition, as cloud IAM bounds bindings of one role.
+	MaxBindings      = 1000
+	MaxGrantsPerRole = 20
 	// MaxDenies is how many deny policies a scope holds, and MaxDenyEntries how many principals,
 	// exemptions or permissions one names.
 	MaxDenies      = 100
