@@ -35,8 +35,9 @@ import (
 // included: past it, what still needs one is refused.
 //
 // Searches (Filter, Reachable, Holders) can't evaluate one: they count only unconditional
-// grants, and Reach.Conditional names the scopes conditional grants may reach, whose resources
-// a host checks one by one.
+// grants, Filter and Holders count a conditional deny as denying, and Reach.Conditional and
+// Reach.ConditionalExcept name the scopes conditional grants may reach and conditional denies
+// cover, whose resources a host checks one by one.
 type Condition struct {
 	Title       string
 	Description string
