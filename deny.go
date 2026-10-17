@@ -276,7 +276,7 @@ func (a *Authorizer) mayDeny(ctx context.Context, actor Subject, on Resource) er
 	if actor.Principal == (Principal{}) {
 		return &DeniedError{Permission: perm, Scope: on.Scope(), Reason: "an anonymous subject changes nothing"}
 	}
-	name, err := a.denied(ctx, on.Tenant, on.Type, perm)
+	name, err := a.denied(ctx, ConstraintInput{Tenant: on.Tenant, ResourceType: on.Type, Permission: perm, Subject: &actor, Resource: &on})
 	if err != nil {
 		return err
 	}

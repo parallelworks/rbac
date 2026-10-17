@@ -244,7 +244,7 @@ func (a *Authorizer) DefineRole(ctx context.Context, actor Subject, tenant strin
 		// Its grants are on scopes of the types it is for, and on those it was for before and is
 		// for again, whose grants it brings back.
 		types := slices.Concat(checked.ResourceTypes, r.ResourceTypes)
-		if err := a.changesStopped(ctx, tenant, types, fmt.Sprintf("changing what %s's grants give", r.ID)); err != nil {
+		if err := a.changesStopped(ctx, actor, tenant, types, fmt.Sprintf("changing what %s's grants give", r.ID)); err != nil {
 			return err
 		}
 		if err := a.changesDenied(au, tenant, types, fmt.Sprintf("changing what %s's grants give", r.ID)); err != nil {
@@ -341,7 +341,7 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 	}
 	checked, existed := roles.role(id)
 	if existed {
-		if err := a.changesStopped(ctx, tenant, checked.ResourceTypes, "revoking "+string(id)); err != nil {
+		if err := a.changesStopped(ctx, actor, tenant, checked.ResourceTypes, "revoking "+string(id)); err != nil {
 			return err
 		}
 		if err := a.changesDenied(au, tenant, checked.ResourceTypes, "revoking "+string(id)); err != nil {
@@ -399,9 +399,9 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 
 // changesStopped returns why a constraint stops changing every grant of a custom role: one that
 // stops changes to grants on scopes of one of the role's types, a container or the tenant.
-func (a *Authorizer) changesStopped(ctx context.Context, tenant string, roleTypes []string, change string) error {
+func (a *Authorizer) changesStopped(ctx context.Context, actor Subject, tenant string, roleTypes []string, change string) error {
 	for _, t := range a.grantedOn(roleTypes) {
-		name, err := a.denied(ctx, tenant, t, GrantPermission(t))
+		name, err := a.denied(ctx, ConstraintInput{Tenant: tenant, ResourceType: t, Permission: GrantPermission(t), Subject: &actor})
 		if err != nil {
 			return err
 		}
@@ -452,7 +452,7 @@ func (a *Authorizer) mayDefineRoles(ctx context.Context, actor Subject, root Res
 	if actor.Principal == (Principal{}) {
 		return authority{}, &DeniedError{Permission: DefineRoles, Scope: scope, Reason: "an anonymous subject changes nothing"}
 	}
-	name, err := a.denied(ctx, root.Tenant, TenantScope, DefineRoles)
+	name, err := a.denied(ctx, ConstraintInput{Tenant: root.Tenant, ResourceType: TenantScope, Permission: DefineRoles, Subject: &actor, Resource: &root})
 	if err != nil {
 		return authority{}, err
 	}

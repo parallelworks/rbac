@@ -81,8 +81,8 @@ const (
 )
 
 // Principal is who a role is granted to. An identity's or a group's id names it in every
-// tenant, so a tenant can grant a role to one from another, where Config.ValidatePrincipal
-// allows it.
+// tenant, so a tenant can grant a role to one from another, where Config.ValidateGrant allows
+// it.
 type Principal struct {
 	Kind PrincipalKind
 	ID   string
@@ -337,8 +337,7 @@ type Change struct {
 // or deleted, the deny policies set or deleted, and the eligibilities set or ended.
 type ChangeEvent struct {
 	Tenant string
-	// Actor is who made the change; zero for Import and the deletes of scopes, principals and
-	// tenants.
+	// Actor is who made the change: for Import and the deletes, the actor they name.
 	Actor   Principal
 	Granted []Grant
 	Revoked []Grant
@@ -358,16 +357,31 @@ func (e ChangeEvent) empty() bool {
 		len(e.Eligible)+len(e.Ineligible) == 0
 }
 
-// Constraint removes a permission on a type of resource in a tenant, for everyone, such as a
-// policy forbidding root access. On `<type>:grant` it stops changes, grants and revokes alike,
-// on scopes of that type, not grants on a container that reach the type, as a deny on one
-// type's grant permission does in cloud IAM. To keep anyone from having a permission, remove
-// that permission itself. Deny is called for each permission a call considers, so keep it
-// cheap.
+// Constraint removes permissions as the host's own policy, above anything a tenant grants or
+// denies, such as forbidding root access, freezing changes under a container, or keeping
+// service accounts from one. On `<type>:grant` it stops changes, grants and revokes alike, on
+// scopes of that type, not grants on a container that reach the type, as a deny on one type's
+// grant permission does in cloud IAM. To keep anyone from having a permission, remove that
+// permission itself. Deny is called for each permission a call considers, so keep it cheap.
 type Constraint struct {
 	Name string
-	// Deny gets q, what the call runs on, to read the host's policy in the same transaction.
-	Deny func(ctx context.Context, q DB, tenant, resourceType string, p Permission) (bool, error)
+	// Deny reports whether the constraint removes in.Permission. q is what the call runs on, to
+	// read the host's policy in the same transaction.
+	Deny func(ctx context.Context, q DB, in ConstraintInput) (bool, error)
+}
+
+// ConstraintInput is what a constraint is asked about. Searches ask once for every resource of a
+// type, and Holders once for every holder: where Resource or Subject is nil, answer true if the
+// constraint removes the permission for any, so that a search never keeps what a check refuses.
+type ConstraintInput struct {
+	Tenant       string
+	ResourceType string
+	Permission   Permission
+	// Subject is who asks, or who changes access; nil in Holders.
+	Subject *Subject
+	// Resource is what is asked about, with its ancestors and attributes; nil in Filter and
+	// Reachable, and in DefineRole and DeleteRole, which change grants on every scope of a type.
+	Resource *Resource
 }
 
 var (
@@ -426,15 +440,16 @@ type Config struct {
 	// PrincipalKinds are the kinds of identity besides users that act and are granted roles,
 	// such as service accounts. Groups, a tenant's members and the public need no declaring.
 	PrincipalKinds []PrincipalKind
-	// ValidatePrincipal returns an error matching ErrInvalid when a principal can't be granted
-	// roles in the tenant: an identity or group the host doesn't let in, such as one from
-	// another tenant, or the public where the host doesn't allow public access. It is asked
-	// about every principal but the tenant's members; any other error fails the change. q is
-	// what the change runs on, so under WithTx it sees a member added earlier in the
-	// transaction. Required: a grant to a principal the tenant doesn't let in must never be
-	// stored.
-	ValidatePrincipal func(ctx context.Context, q DB, tenant string, p Principal) error
-	Constraints       []Constraint
+	// ValidateGrant returns an error matching ErrInvalid when a grant can't be made: to an
+	// identity or group the tenant doesn't let in, such as one from another tenant; to the public
+	// where the host doesn't allow public access; of a role a principal's kind may not hold, such
+	// as a privileged one for a guest; or one this actor may not give this principal. It is asked
+	// about every grant Apply, Import and Activate make, and every eligibility SetEligible sets,
+	// once each is otherwise valid; any other error fails the change. q is what the change runs
+	// on, so under WithTx it sees a member added earlier in the transaction. Required: a grant
+	// to a principal the tenant doesn't let in must never be stored.
+	ValidateGrant func(ctx context.Context, q DB, in GrantInput) error
+	Constraints   []Constraint
 	// OnChange runs in the transaction of every change but DeleteExpired, whose grants already
 	// gave nothing; an error rolls the change back.
 	OnChange func(ctx context.Context, tx pgx.Tx, e ChangeEvent) error
@@ -475,8 +490,8 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 	if db == nil {
 		return nil, errors.New("rbac: nil DB")
 	}
-	if cfg.ValidatePrincipal == nil {
-		return nil, errors.New("rbac: Config.ValidatePrincipal is required")
+	if cfg.ValidateGrant == nil {
+		return nil, errors.New("rbac: Config.ValidateGrant is required")
 	}
 	roles, err := index(cfg.Catalog)
 	if err != nil {
@@ -563,10 +578,36 @@ func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 	return &b
 }
 
-// denied returns the name of the first constraint that removes the permission, or "".
-func (a *Authorizer) denied(ctx context.Context, tenant, resourceType string, p Permission) (string, error) {
+// GrantInput is a grant Config.ValidateGrant is asked about.
+type GrantInput struct {
+	Tenant  string
+	Scope   Scope
+	Binding Binding
+	// Role is what the grant gives: the role as defined now.
+	Role RoleDefinition
+	// Actor is who makes it: the subject changing grants, setting an eligibility or activating, or
+	// Import's actor.
+	Actor Subject
+	// Via is how it is made.
+	Via Via
+}
+
+// Via is how a grant is made.
+type Via string
+
+// The ways a grant is made: by Apply, Import or Activate, or as an eligibility SetEligible
+// sets, which is the grant activating it would make.
+const (
+	ViaApply       Via = "apply"
+	ViaImport      Via = "import"
+	ViaEligibility Via = "eligibility"
+	ViaActivation  Via = "activation"
+)
+
+// denied returns the name of the first constraint that removes in.Permission, or "".
+func (a *Authorizer) denied(ctx context.Context, in ConstraintInput) (string, error) {
 	for _, c := range a.cfg.Constraints {
-		deny, err := c.Deny(ctx, a.db, tenant, resourceType, p)
+		deny, err := c.Deny(ctx, a.db, in)
 		if err != nil {
 			return "", err
 		}
