@@ -316,7 +316,6 @@ type Grant struct {
 	ApprovedBy Principal
 	// CreatedBy and CreatedAt are who made the grant and when, and UpdatedBy and UpdatedAt who last
 	// changed its note or its condition's title or description; they are set on grants read back.
-	// CreatedBy is zero for a grant Import stored.
 	CreatedBy Principal
 	CreatedAt time.Time
 	UpdatedBy Principal
