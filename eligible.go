@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"time"
-	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -15,7 +14,9 @@ import (
 // than hold it standing: just-in-time access. Activating gives the identity that activates a
 // grant until MaxDuration from then at most, with its justification as the grant's note; one
 // eligible through a group activates for itself. An approval before activating is the host's:
-// on approval, it can grant with Import.
+// on approval, it can grant with Import. An activated role that changes grants lets its holder
+// make lasting grants, to itself too, as any time-limited one does: make eligible roles that
+// can't change grants.
 type Eligibility struct {
 	Scope     Scope
 	Role      Role
@@ -48,7 +49,10 @@ func (a *Authorizer) checkEligibility(e Eligibility) error {
 	if e.MaxDuration < time.Second || e.MaxDuration > maxActivation {
 		errs = append(errs, fmt.Errorf("an activation lasts a second or more and at most %s", maxActivation))
 	}
-	if e.Requires != "" {
+	switch {
+	case !validText(e.Requires):
+		errs = append(errs, errors.New("a requirement is UTF-8 text without NUL"))
+	case e.Requires != "":
 		if _, err := a.conds.compile(e.Requires); err != nil {
 			errs = append(errs, err)
 		}
@@ -71,16 +75,8 @@ func (a *Authorizer) SetEligible(ctx context.Context, actor Subject, on Resource
 	}
 	e.Scope, e.ExpiresAt = on.Scope(), stored(e.ExpiresAt)
 	b := e.binding()
-	manage := GrantPermission(on.Type)
-	if actor.Principal == (Principal{}) {
-		return &DeniedError{Permission: manage, Scope: e.Scope, Reason: "an anonymous subject changes nothing"}
-	}
-	name, err := a.denied(ctx, on.Tenant, on.Type, manage)
-	if err != nil {
+	if err := a.changing(ctx, actor.Principal, on); err != nil {
 		return err
-	}
-	if name != "" {
-		return &DeniedError{Permission: manage, Scope: e.Scope, Reason: "removed by " + name}
 	}
 	au, err := a.mayChange(ctx, a.db, actor, on, []Binding{b}, nil)
 	if err != nil {
@@ -103,17 +99,21 @@ func (a *Authorizer) SetEligible(ctx context.Context, actor Subject, on Resource
 		if err := errors.Join(a.checkBinding(au.roles, on.Tenant, e.Scope, b, a.cfg.Now())...); err != nil {
 			return ChangeEvent{}, err
 		}
+		// An expired eligibility that is still stored allowed nothing, so setting it again records
+		// the new actor and time.
 		rows, err := tx.Query(ctx, `
 			INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds,
 			  expires_at, requires, note, created_by)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 			ON CONFLICT ON CONSTRAINT rbac_eligibilities_key DO UPDATE SET max_seconds = EXCLUDED.max_seconds,
-			  expires_at = EXCLUDED.expires_at, requires = EXCLUDED.requires, note = EXCLUDED.note
+			  expires_at = EXCLUDED.expires_at, requires = EXCLUDED.requires, note = EXCLUDED.note,
+			  created_by = CASE WHEN rbac_eligibilities.expires_at <= $12 THEN EXCLUDED.created_by ELSE rbac_eligibilities.created_by END,
+			  created_at = CASE WHEN rbac_eligibilities.expires_at <= $12 THEN EXCLUDED.created_at ELSE rbac_eligibilities.created_at END
 			WHERE (rbac_eligibilities.max_seconds, rbac_eligibilities.expires_at, rbac_eligibilities.requires, rbac_eligibilities.note)
 			  IS DISTINCT FROM (EXCLUDED.max_seconds, EXCLUDED.expires_at, EXCLUDED.requires, EXCLUDED.note)
 			RETURNING `+eligibilityColumns,
 			on.Tenant, e.Scope.Type, e.Scope.ID, e.Principal.Kind, e.Principal.ID, e.Role, int64(e.MaxDuration/time.Second),
-			pgtype.Timestamptz{Time: e.ExpiresAt, Valid: !e.ExpiresAt.IsZero()}, e.Requires, e.Note, actorKey(actor.Principal))
+			pgtype.Timestamptz{Time: e.ExpiresAt, Valid: !e.ExpiresAt.IsZero()}, e.Requires, e.Note, actorKey(actor.Principal), a.cfg.Now())
 		if err != nil {
 			return ChangeEvent{}, err
 		}
@@ -131,19 +131,16 @@ func (a *Authorizer) RevokeEligible(ctx context.Context, actor Subject, on Resou
 	if err := a.subject(actor); err != nil {
 		return err
 	}
-	scope, manage := on.Scope(), GrantPermission(on.Type)
-	if actor.Principal == (Principal{}) {
-		return &DeniedError{Permission: manage, Scope: scope, Reason: "an anonymous subject changes nothing"}
+	scope := on.Scope()
+	if err := a.changing(ctx, actor.Principal, on); err != nil {
+		return err
 	}
-	name, err := a.denied(ctx, on.Tenant, on.Type, manage)
+	revoke := []Binding{{Role: role, Principal: p}}
+	au, err := a.mayChange(ctx, a.db, actor, on, nil, revoke)
 	if err != nil {
 		return err
 	}
-	if name != "" {
-		return &DeniedError{Permission: manage, Scope: scope, Reason: "removed by " + name}
-	}
-	revoke := []Binding{{Role: role, Principal: p}}
-	if _, err := a.mayChange(ctx, a.db, actor, on, nil, revoke); err != nil {
+	if err := a.validate(ctx, au.roles, on.Tenant, scope, nil, revoke); err != nil {
 		return err
 	}
 	return a.inTx(ctx, on.Tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
@@ -166,8 +163,9 @@ func (a *Authorizer) RevokeEligible(ctx context.Context, actor Subject, on Resou
 // Activate gives s a role on a scope, on, for d, as an eligibility of s's or of a group of s's
 // there allows, with justification as the grant's note. It needs no permission to change grants:
 // the eligibility is the authority. A constraint that stops changes to grants on the scope's
-// type stops activating. A grant of the role s already holds there is kept when it lasts as long
-// or longer; one under a condition is never replaced, so activating refuses.
+// type stops activating, and Config.ValidatePrincipal is asked about s, as for any grant. A
+// grant of the role s already holds there is kept when it lasts as long or longer; one under a
+// condition is never replaced, so activating refuses.
 func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, role Role, d time.Duration, justification string) (Grant, error) {
 	if err := a.check(on); err != nil {
 		return Grant{}, err
@@ -175,22 +173,21 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, role 
 	if err := a.subject(s); err != nil {
 		return Grant{}, err
 	}
-	scope, manage := on.Scope(), GrantPermission(on.Type)
+	scope := on.Scope()
 	b := Binding{Role: role, Principal: s.Principal, Note: justification}
-	switch {
-	case s.Principal == (Principal{}):
-		return Grant{}, &DeniedError{Permission: manage, Scope: scope, Reason: "an anonymous subject activates nothing"}
-	case d <= 0 || justification == "" || utf8.RuneCountInString(justification) > maxNote || !validText(justification):
-		return Grant{}, &InvalidError{Binding: b, Reason: fmt.Sprintf("an activation lasts more than nothing and has a justification of at most %d characters", maxNote)}
+	if err := a.changing(ctx, s.Principal, on); err != nil {
+		return Grant{}, err
 	}
-	name, err := a.denied(ctx, on.Tenant, on.Type, manage)
+	// Bounded before eligible rounds it up to seconds, which near the largest Duration overflows.
+	if d <= 0 || d > maxActivation || justification == "" || !validNote(justification) {
+		return Grant{}, &InvalidError{Binding: b, Reason: fmt.Sprintf("an activation lasts more than nothing and at most %s, and has a justification of at most %d characters", maxActivation, maxNote)}
+	}
+	roles, err := a.eligible(ctx, a.db, s, on, role, d)
 	if err != nil {
 		return Grant{}, err
 	}
-	if name != "" {
-		return Grant{}, &DeniedError{Permission: manage, Scope: scope, Reason: "removed by " + name}
-	}
-	if _, err := a.eligible(ctx, a.db, s, on, role, d); err != nil {
+	b.ExpiresAt = stored(a.cfg.Now().Add(d))
+	if err := a.validate(ctx, roles, on.Tenant, scope, []Binding{b}, nil); err != nil {
 		return Grant{}, err
 	}
 	var activated Grant
@@ -228,9 +225,12 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, role 
 			return ChangeEvent{}, err
 		}
 		activated = granted[0]
-		return ChangeEvent{Activated: granted}, nil
+		return ChangeEvent{Granted: granted, Activated: true}, nil
 	})
-	return activated, err
+	if err != nil {
+		return Grant{}, err
+	}
+	return activated, nil
 }
 
 // eligible checks that s may activate role on on for d, and returns the roles it read: an
@@ -249,7 +249,7 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 		WHERE tenant = $1 AND scope = $2 AND role = $3 AND principal = ANY($4::text[]) AND max_seconds >= $5
 		  AND (expires_at IS NULL OR expires_at > $6)
 		ORDER BY requires`,
-		on.Tenant, scope.Key(), role, keys, int64((d+time.Second-1)/time.Second), a.cfg.Now())
+		on.Tenant, scope.Key(), role, keys, seconds(d), a.cfg.Now())
 	if err != nil {
 		return book{}, err
 	}
@@ -266,21 +266,26 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 	return book{}, &DeniedError{Permission: manage, Scope: scope, Reason: fmt.Sprintf("not eligible to activate %s here for %s", role, d)}
 }
 
+// seconds is d in whole seconds, rounded up.
+func seconds(d time.Duration) int64 {
+	s := int64(d / time.Second)
+	if d%time.Second > 0 {
+		s++
+	}
+	return s
+}
+
 // Eligibilities lists the eligibilities that match the filter, as stored, expired ones aside.
 func (a *Authorizer) Eligibilities(ctx context.Context, tenant string, f GrantFilter) ([]Eligibility, error) {
 	if tenant == "" || len(f.Scopes)+len(f.Principals) == 0 {
 		return nil, fmt.Errorf("%w: Eligibilities needs a tenant and scopes or principals", ErrInvalid)
 	}
-	scopes := make([]string, len(f.Scopes))
-	for i, s := range f.Scopes {
-		scopes[i] = s.Key()
-	}
+	where, scopes, principals := f.sql()
 	rows, err := a.db.Query(ctx, `
 		SELECT `+eligibilityColumns+` FROM rbac_eligibilities
-		WHERE tenant = $1 AND (cardinality($2::text[]) = 0 OR scope = ANY($2::text[]))
-		  AND (cardinality($3::text[]) = 0 OR principal = ANY($3::text[])) AND (expires_at IS NULL OR expires_at > $4)
+		WHERE tenant = $1 AND `+where+` AND (expires_at IS NULL OR expires_at > $4)
 		ORDER BY scope, principal, role`,
-		tenant, scopes, keysOf(f.Principals), a.cfg.Now())
+		tenant, scopes, principals, a.cfg.Now())
 	if err != nil {
 		return nil, err
 	}
