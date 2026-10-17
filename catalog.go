@@ -138,8 +138,8 @@ func index(catalog []RoleDefinition) (map[Role]RoleDefinition, error) {
 	return roles, nil
 }
 
-// Role returns a built-in role by id; RolesIn and CustomRoles read a tenant's own.
-func (a *Authorizer) Role(id Role) (RoleDefinition, bool) {
+// BuiltinRole returns a built-in role by id; Roles and CustomRoles read a tenant's own.
+func (a *Authorizer) BuiltinRole(id Role) (RoleDefinition, bool) {
 	r, ok := a.roles[id]
 	if !ok {
 		return RoleDefinition{}, false
@@ -147,9 +147,9 @@ func (a *Authorizer) Role(id Role) (RoleDefinition, bool) {
 	return r.clone(), true
 }
 
-// Roles lists the roles that can be granted on a scope type, in catalog order: on a container
-// type or the tenant, every role.
-func (a *Authorizer) Roles(scopeType string) []RoleDefinition {
+// BuiltinRoles lists the built-in roles that can be granted on a scope type, in catalog order: on
+// a container type or the tenant, every role.
+func (a *Authorizer) BuiltinRoles(scopeType string) []RoleDefinition {
 	var roles []RoleDefinition
 	for _, r := range a.cfg.Catalog {
 		if a.grantableOn(r, scopeType) {

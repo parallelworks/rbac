@@ -188,7 +188,7 @@ func canonical(r RoleDefinition) RoleDefinition {
 	return r
 }
 
-// DefineRole creates a custom role in a tenant, or replaces one, as actor; grants of a replaced
+// SetRole creates a custom role in a tenant, or replaces one, as actor; grants of a replaced
 // role give what it gives now. Its id starts with CustomPrefix, and it gives only permissions
 // some built-in role gives, on types some built-in role is for. It is Privileged when it gives
 // a permission on a type only privileged built-in roles give it on, or hands out a privileged
@@ -205,7 +205,7 @@ func canonical(r RoleDefinition) RoleDefinition {
 // them there, stops it, as it stops DeleteRole. A role another change redefined or created while
 // this one waited for the tenant is refused, to be tried again: the constraints were asked about
 // it as it was. One deleted meanwhile is created, as its grants went with it.
-func (a *Authorizer) DefineRole(ctx context.Context, actor Subject, tenant string, r RoleDefinition) error {
+func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, r RoleDefinition) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -311,7 +311,7 @@ func (a *Authorizer) DefineRole(ctx context.Context, actor Subject, tenant strin
 // needs DefineRoles on the tenant. It refuses a role another custom role lists in
 // GrantableRoles: redefine that one first, or a role later defined with the id would be handed
 // out through it. Deleting a role that doesn't exist does nothing; one changed while the
-// deletion waited for the tenant is refused, as in DefineRole.
+// deletion waited for the tenant is refused, as in SetRole.
 func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant string, id Role) error {
 	if tenant == "" || !isCustom(id) {
 		return fmt.Errorf("%w: only a tenant's custom role can be deleted", ErrInvalid)
@@ -587,9 +587,9 @@ func (a *Authorizer) listsPrivileged(r RoleDefinition) bool {
 	return slices.ContainsFunc(r.GrantableRoles, func(id Role) bool { return a.roles[id].Privileged })
 }
 
-// RolesIn lists the roles that can be granted on a scope type in a tenant: the built-in ones in
+// Roles lists the roles that can be granted on a scope type in a tenant: the built-in ones in
 // catalog order, then the tenant's custom ones by id.
-func (a *Authorizer) RolesIn(ctx context.Context, tenant, scopeType string) ([]RoleDefinition, error) {
+func (a *Authorizer) Roles(ctx context.Context, tenant, scopeType string) ([]RoleDefinition, error) {
 	custom, err := a.CustomRoles(ctx, tenant)
 	if err != nil {
 		return nil, err
@@ -598,7 +598,7 @@ func (a *Authorizer) RolesIn(ctx context.Context, tenant, scopeType string) ([]R
 }
 
 func (a *Authorizer) rolesIn(scopeType string, custom []RoleDefinition) []RoleDefinition {
-	roles := a.Roles(scopeType)
+	roles := a.BuiltinRoles(scopeType)
 	for _, r := range custom {
 		if a.grantableOn(r, scopeType) {
 			roles = append(roles, r)

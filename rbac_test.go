@@ -163,6 +163,8 @@ func TestNewRejectsBadConfiguration(t *testing.T) {
 		"bad container":         {Catalog: catalog, ContainerTypes: []string{"tenant"}, ValidateGrant: ok},
 		"a kind every host has": {Catalog: catalog, PrincipalKinds: []rbac.PrincipalKind{rbac.Group}, ValidateGrant: ok},
 		"a malformed kind":      {Catalog: catalog, PrincipalKinds: []rbac.PrincipalKind{"Service Account"}, ValidateGrant: ok},
+		"a reserved kind":       {Catalog: catalog, PrincipalKinds: []rbac.PrincipalKind{"authenticated"}, ValidateGrant: ok},
+		"the package's prefix":  {Catalog: catalog, PrincipalKinds: []rbac.PrincipalKind{"rbac_robot"}, ValidateGrant: ok},
 		"a public admin role": {Catalog: []rbac.RoleDefinition{{
 			ID: "r", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}, Public: true,
 		}}, ValidateGrant: ok},
@@ -235,7 +237,7 @@ func TestAuthorizeThroughEveryScope(t *testing.T) {
 
 func TestTenantMembersAndExpiry(t *testing.T) {
 	h := setup(t)
-	g := grant(rbac.TenantRoot("t1"), "cluster.login", rbac.Tenant, "t1")
+	g := grant(rbac.TenantRoot("t1"), "cluster.login", rbac.Members, "t1")
 	g.ExpiresAt = h.now.Add(time.Hour)
 	h.seed(t, g)
 	if !allowed(t, h, user("anyone"), login, cluster) {
@@ -481,9 +483,9 @@ func TestHolders(t *testing.T) {
 	h.seed(t,
 		grant(rbac.Scope{Type: "workspace", ID: "w1"}, "cluster.sudo", rbac.Group, "admins"),
 		grant(cluster.Scope(), "cluster.login", rbac.User, "u"),
-		grant(rbac.TenantRoot("t1"), "cluster.login", rbac.Tenant, "t1"),
+		grant(rbac.TenantRoot("t1"), "cluster.login", rbac.Members, "t1"),
 	)
-	got, err := h.authz.Holders(t.Context(), cluster, root)
+	got, err := h.authz.Holders(t.Context(), root, cluster)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -491,7 +493,7 @@ func TestHolders(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Errorf("Holders(root) = %v, want %v", got, want)
 	}
-	got, err = h.authz.Holders(t.Context(), cluster, login)
+	got, err = h.authz.Holders(t.Context(), login, cluster)
 	if err != nil || len(got) != 4 {
 		t.Errorf("Holders(login) = %v, %v", got, err)
 	}
@@ -645,7 +647,7 @@ func TestTheHostIsAskedAboutEachGrant(t *testing.T) {
 			return h.authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: sudo}})
 		},
 		rbac.ViaEligibility: func() error {
-			return h.authz.SetEligible(ctx, user("owner"), cluster, rbac.Eligibility{Role: sudo.Role, Principal: bot, MaxDuration: time.Hour})
+			return h.authz.SetEligibility(ctx, user("owner"), cluster, rbac.Eligibility{Role: sudo.Role, Principal: bot, MaxDuration: time.Hour})
 		},
 	} {
 		asked = nil
@@ -657,7 +659,7 @@ func TestTheHostIsAskedAboutEachGrant(t *testing.T) {
 	}
 	// Activating is asked about too, as the grant it makes.
 	e := rbac.Eligibility{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: time.Hour}
-	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
+	if err := h.authz.SetEligibility(ctx, user("owner"), cluster, e); err != nil {
 		t.Fatal(err)
 	}
 	asked = nil
@@ -699,7 +701,7 @@ func TestConstraintsSeeWhoAndWhere(t *testing.T) {
 	if reach, err := h.authz.Reachable(ctx, user("sre", "sre"), root, "t1", "cluster"); err != nil || reach.All || len(reach.Scopes) > 0 {
 		t.Fatalf("a search can't see the resource, so a constraint on some removes it from all: %+v, %v", reach, err)
 	}
-	if holders, err := h.authz.Holders(ctx, inProd, root); err != nil || len(holders) > 0 {
+	if holders, err := h.authz.Holders(ctx, root, inProd); err != nil || len(holders) > 0 {
 		t.Fatalf("Holders can't see each holder, so a constraint on some removes all: %v, %v", holders, err)
 	}
 }
@@ -805,7 +807,7 @@ func TestConditionsReadWhatIsDeclared(t *testing.T) {
 		Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: time.Hour,
 		Requires: `request.attributes.mfaa == true`,
 	}
-	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); !errors.Is(err, rbac.ErrInvalid) {
+	if err := h.authz.SetEligibility(ctx, user("owner"), cluster, e); !errors.Is(err, rbac.ErrInvalid) {
 		t.Errorf("a requirement reading an undeclared attribute: %v", err)
 	}
 }
@@ -878,7 +880,7 @@ func TestChangesAreBounded(t *testing.T) {
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if holders, err := h.authz.Holders(ctx, cluster, login); err != nil || len(holders) != 201 {
+	if holders, err := h.authz.Holders(ctx, login, cluster); err != nil || len(holders) != 201 {
 		t.Fatalf("Holders = %d, %v", len(holders), err)
 	}
 }
@@ -953,10 +955,10 @@ func TestNewCopiesTheCatalog(t *testing.T) {
 	if err != nil || len(reach.Scopes) != 0 {
 		t.Fatalf("changing the catalog after New reached %+v, %v", reach, err)
 	}
-	if got := h.authz.Roles("cluster"); len(got) != 3 || slices.Contains(got[2].Permissions, root) {
+	if got := h.authz.BuiltinRoles("cluster"); len(got) != 3 || slices.Contains(got[2].Permissions, root) {
 		t.Fatalf("Roles(cluster) = %+v", got)
 	}
-	if got := h.authz.Roles("workspace"); len(got) != len(catalog) {
+	if got := h.authz.BuiltinRoles("workspace"); len(got) != len(catalog) {
 		t.Fatalf("every role can be granted on a container, Roles(workspace) = %d", len(got))
 	}
 }
@@ -1174,7 +1176,7 @@ func TestHooksCanUseTheBusyPool(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
-	if err := authz.DefineRole(ctx, user("owner"), "t1", r); err != nil {
+	if err := authz.SetRole(ctx, user("owner"), "t1", r); err != nil {
 		t.Fatalf("a hook on the pool a role's definition runs on: %v", err)
 	}
 	if err := authz.DeleteRole(ctx, user("owner"), "t1", r.ID); err != nil {
@@ -1210,7 +1212,7 @@ func TestReGrantingAnExpiredGrantRecordsTheNewActor(t *testing.T) {
 
 func TestSubjectsAreAnonymousOrOneIdentity(t *testing.T) {
 	h := setup(t)
-	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.Tenant, "t1"))
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.Members, "t1"))
 	for name, s := range map[string]rbac.Subject{
 		"groups and no identity":   {Groups: []string{"service"}},
 		"a tenant and no identity": {Tenants: []string{"t1"}},
@@ -1428,7 +1430,7 @@ func TestTenantMembersAndThePublicNeverGetAGrantPermission(t *testing.T) {
 			// A role that gives cluster:grant can't be public, so a grant of it to the public
 			// gives nothing at all.
 			others := 0
-			if p.Kind == rbac.Tenant {
+			if p.Kind == rbac.Members {
 				others = 1
 			}
 			if allowed(t, h, member, root, cluster) != (others == 1) {
@@ -1444,7 +1446,7 @@ func TestTenantMembersAndThePublicNeverGetAGrantPermission(t *testing.T) {
 			if err != nil || slices.Contains(perms, grantC) {
 				t.Errorf("Permissions: %v, %v", perms, err)
 			}
-			holders, err := h.authz.Holders(ctx, cluster, grantC)
+			holders, err := h.authz.Holders(ctx, grantC, cluster)
 			if err != nil || slices.Contains(holders, p) {
 				t.Errorf("Holders: %v, %v", holders, err)
 			}
@@ -1609,7 +1611,7 @@ func TestDeadlockedHostTransactionsConflict(t *testing.T) {
 				}
 				applied.Wait()
 				role := rbac.RoleDefinition{ID: rbac.Role(fmt.Sprintf("custom.r%d", i)), Permissions: []rbac.Permission{login}, ResourceTypes: []string{"cluster"}}
-				return authz.DefineRole(ctx, user("owner"), "t1", role)
+				return authz.SetRole(ctx, user("owner"), "t1", role)
 			})
 		})
 	}
@@ -1667,7 +1669,7 @@ func TestPublicAccess(t *testing.T) {
 	if d, err := h.authz.Explain(ctx, anonymous, view, cluster); err != nil || len(d.Grants) != 1 || d.Grants[0].Principal != public {
 		t.Errorf("Explain = %+v, %v", d, err)
 	}
-	if holders, err := h.authz.Holders(ctx, cluster, view); err != nil || !slices.Contains(holders, public) {
+	if holders, err := h.authz.Holders(ctx, view, cluster); err != nil || !slices.Contains(holders, public) {
 		t.Errorf("Holders = %v, %v", holders, err)
 	}
 	b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}}
@@ -1715,7 +1717,7 @@ func TestAPublicGrantGivesOnlyWhileItsRoleIsPublic(t *testing.T) {
 			listingsAgree(t, h, resources, s, p)
 		}
 	}
-	if holders, err := h.authz.Holders(ctx, cluster, root); err != nil || slices.Contains(holders, public) {
+	if holders, err := h.authz.Holders(ctx, root, cluster); err != nil || slices.Contains(holders, public) {
 		t.Errorf("Holders = %v, %v", holders, err)
 	}
 }
@@ -1765,7 +1767,7 @@ func TestMachineIdentities(t *testing.T) {
 		t.Fatalf("Grants = %+v, %v", got, err)
 	}
 
-	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.Tenant, "t1"))
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.Members, "t1"))
 	if !allowed(t, h, rbac.Subject{Principal: rbac.Principal{Kind: machine, ID: "bot"}, Tenants: []string{"t1"}}, login, cluster) {
 		t.Fatal("a service account is one of the tenant's members")
 	}
@@ -1782,7 +1784,7 @@ func TestMachineIdentities(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if holders, err := undeclared.Holders(ctx, cluster, root); err != nil || slices.Contains(holders, ci.Principal) {
+	if holders, err := undeclared.Holders(ctx, root, cluster); err != nil || slices.Contains(holders, ci.Principal) {
 		t.Fatalf("Holders lists a kind no longer declared: %v, %v", holders, err)
 	}
 	revoke := rbac.Change{Revoke: []rbac.Binding{{Role: "cluster.admin", Principal: ci.Principal}}}
@@ -1798,8 +1800,8 @@ func TestTheTableRefusesMalformedPrincipals(t *testing.T) {
 	h := setup(t)
 	for _, p := range []rbac.Principal{
 		{Kind: rbac.Public, ID: "x"},
-		{Kind: rbac.Tenant, ID: "t2"},
-		{Kind: rbac.Tenant},
+		{Kind: rbac.Members, ID: "t2"},
+		{Kind: rbac.Members},
 		{Kind: rbac.User},
 		{Kind: "Service Account", ID: "x"},
 		{Kind: rbac.PrincipalKind(strings.Repeat("k", 64)), ID: "x"},
@@ -1879,7 +1881,7 @@ func TestIdentitiesFromOtherTenants(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
 	partner := rbac.Subject{Principal: rbac.Principal{Kind: rbac.User, ID: "partner"}, Groups: []string{"partners"}, Tenants: []string{"t2"}}
-	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.sudo", rbac.Tenant, "t1"))
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.sudo", rbac.Members, "t1"))
 	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{
 		{Role: "cluster.login", Principal: partner.Principal},
 	}}); err != nil {
@@ -2003,7 +2005,7 @@ func TestRolesListingEachOtherAreDecidedOnce(t *testing.T) {
 	// Each role is checked once per grant: along every order they reach each other in, this
 	// would take hours.
 	got, err := h.authz.Grantable(t.Context(), user("owner"), cluster)
-	if err != nil || len(got) != len(h.authz.Roles("cluster")) {
+	if err != nil || len(got) != len(h.authz.BuiltinRoles("cluster")) {
 		t.Fatalf("Grantable = %d roles, %v", len(got), err)
 	}
 }
@@ -2049,13 +2051,13 @@ func TestCustomRoles(t *testing.T) {
 	admin := roleAdmin(t, h)
 	operator := rbac.RoleDefinition{ID: "custom.operator", Name: "Operator", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
 	h.events = nil
-	if err := h.authz.DefineRole(ctx, admin, "t1", operator); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", operator); err != nil {
 		t.Fatal(err)
 	}
 	if len(h.events) != 1 || len(h.events[0].Roles) != 1 || h.events[0].Roles[0].ID != operator.ID || h.events[0].Actor != admin.Principal {
 		t.Fatalf("events = %+v", h.events)
 	}
-	if err := h.authz.DefineRole(ctx, admin, "t1", operator); err != nil || len(h.events) != 1 {
+	if err := h.authz.SetRole(ctx, admin, "t1", operator); err != nil || len(h.events) != 1 {
 		t.Fatalf("defining a role again as it is reported a change: %+v, %v", h.events, err)
 	}
 	if err := h.authz.Apply(ctx, admin, cluster, rbac.Change{Grant: []rbac.Binding{{Role: operator.ID, Principal: rbac.Principal{Kind: rbac.User, ID: "op"}}}}); err != nil {
@@ -2072,7 +2074,7 @@ func TestCustomRoles(t *testing.T) {
 	if perms, err := h.authz.Permissions(ctx, op, cluster); err != nil || !slices.Equal(perms, []rbac.Permission{login, view}) {
 		t.Errorf("Permissions = %v, %v", perms, err)
 	}
-	if holders, err := h.authz.Holders(ctx, cluster, login); err != nil || !slices.Contains(holders, op.Principal) {
+	if holders, err := h.authz.Holders(ctx, login, cluster); err != nil || !slices.Contains(holders, op.Principal) {
 		t.Errorf("Holders = %v, %v", holders, err)
 	}
 	if d, err := h.authz.Explain(ctx, op, login, cluster); err != nil || !d.Allowed || d.Grants[0].Role != operator.ID {
@@ -2081,7 +2083,7 @@ func TestCustomRoles(t *testing.T) {
 
 	// Replacing it changes what its grants give.
 	operator.Permissions = append(operator.Permissions, root)
-	if err := h.authz.DefineRole(ctx, admin, "t1", operator); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", operator); err != nil {
 		t.Fatal(err)
 	}
 	if !allowed(t, h, op, root, cluster) {
@@ -2089,9 +2091,9 @@ func TestCustomRoles(t *testing.T) {
 	}
 	listingsAgree(t, h, resources, op, root)
 
-	roles, err := h.authz.RolesIn(ctx, "t1", "cluster")
+	roles, err := h.authz.Roles(ctx, "t1", "cluster")
 	if err != nil || len(roles) != 4 || roles[3].ID != operator.ID || !slices.Contains(roles[3].Permissions, root) {
-		t.Fatalf("RolesIn = %+v, %v", roles, err)
+		t.Fatalf("Roles = %+v, %v", roles, err)
 	}
 	if !roles[3].Privileged {
 		t.Fatal("a custom role giving root, which only privileged roles give, should be privileged")
@@ -2117,7 +2119,7 @@ func TestCustomRoles(t *testing.T) {
 		t.Fatalf("CustomRoles = %+v, %v", custom, err)
 	}
 
-	if err := h.authz.DefineRole(ctx, admin, "t1", operator); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", operator); err != nil {
 		t.Fatal(err)
 	}
 	h.events = nil
@@ -2143,13 +2145,13 @@ func TestDefiningARoleChecksTheActor(t *testing.T) {
 		grant(tenant, "cluster.admin", rbac.User, "no-roles"),
 	)
 	sudo := rbac.RoleDefinition{ID: "custom.sudo", Permissions: []rbac.Permission{view, login, root}, ResourceTypes: []string{"cluster"}}
-	if err := h.authz.DefineRole(ctx, user("limited"), "t1", sudo); !errors.Is(err, rbac.ErrDenied) {
+	if err := h.authz.SetRole(ctx, user("limited"), "t1", sudo); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("defining a role with permissions the actor doesn't hold: %v", err)
 	}
-	if err := h.authz.DefineRole(ctx, user("no-roles"), "t1", sudo); !errors.Is(err, rbac.ErrDenied) {
+	if err := h.authz.SetRole(ctx, user("no-roles"), "t1", sudo); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("defining a role without tenant:define-roles: %v", err)
 	}
-	if err := h.authz.DefineRole(ctx, rbac.Subject{}, "t1", sudo); !errors.Is(err, rbac.ErrDenied) {
+	if err := h.authz.SetRole(ctx, rbac.Subject{}, "t1", sudo); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("an anonymous subject defining a role: %v", err)
 	}
 	for name, r := range map[string]rbac.RoleDefinition{
@@ -2162,7 +2164,7 @@ func TestDefiningARoleChecksTheActor(t *testing.T) {
 			ID: "custom.d", Permissions: []rbac.Permission{rbac.DefineRoles}, ResourceTypes: []string{"tenant"}, GrantableRoles: []rbac.Role{"cluster.login"},
 		},
 	} {
-		if err := h.authz.DefineRole(ctx, admin, "t1", r); !errors.Is(err, rbac.ErrInvalid) {
+		if err := h.authz.SetRole(ctx, admin, "t1", r); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
@@ -2179,24 +2181,24 @@ func TestDefiningARoleChecksTheActor(t *testing.T) {
 	viewer := rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
 	lister := rbac.RoleDefinition{ID: "custom.lister", Permissions: []rbac.Permission{"tenant:grant"}, ResourceTypes: []string{"tenant"}, GrantableRoles: []rbac.Role{viewer.ID}}
 	for _, r := range []rbac.RoleDefinition{viewer, lister} {
-		if err := h.authz.DefineRole(ctx, admin, "t1", r); err != nil {
+		if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
 			t.Fatal(err)
 		}
 	}
 	h.seed(t, grant(tenant, lister.ID, rbac.User, "helper"), grant(tenant, "tenant.roles", rbac.User, "helper"))
 	wider := viewer
 	wider.Permissions = []rbac.Permission{view, root}
-	if err := h.authz.DefineRole(ctx, user("helper"), "t1", wider); !errors.Is(err, rbac.ErrDenied) {
+	if err := h.authz.SetRole(ctx, user("helper"), "t1", wider); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("redefining a role the actor may only hand out: %v", err)
 	}
 	// Nor can one who holds a role widen it, or what it hands out.
 	h.seed(t, grant(tenant, viewer.ID, rbac.User, "helper"))
-	if err := h.authz.DefineRole(ctx, user("helper"), "t1", wider); !errors.Is(err, rbac.ErrDenied) {
+	if err := h.authz.SetRole(ctx, user("helper"), "t1", wider); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("widening a role the actor holds: %v", err)
 	}
 	more := lister
 	more.GrantableRoles = []rbac.Role{"cluster.admin"}
-	if err := h.authz.DefineRole(ctx, user("helper"), "t1", more); !errors.Is(err, rbac.ErrDenied) {
+	if err := h.authz.SetRole(ctx, user("helper"), "t1", more); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("widening what a role the actor holds hands out: %v", err)
 	}
 	if err := h.authz.DeleteRole(ctx, admin, "t1", viewer.ID); !errors.Is(err, rbac.ErrInvalid) {
@@ -2205,7 +2207,7 @@ func TestDefiningARoleChecksTheActor(t *testing.T) {
 
 	// A custom role that hands out narrower ones.
 	access := rbac.RoleDefinition{ID: "custom.access", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.login"}}
-	if err := h.authz.DefineRole(ctx, admin, "t1", access); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", access); err != nil {
 		t.Fatal(err)
 	}
 	h.seed(t, grant(cluster.Scope(), access.ID, rbac.User, "manager"))
@@ -2224,7 +2226,7 @@ func TestDefiningRolesRespectsConstraints(t *testing.T) {
 	h := setup(t, constrain("roles are managed elsewhere", rbac.DefineRoles))
 	admin := roleAdmin(t, h)
 	r := rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
-	if err := h.authz.DefineRole(t.Context(), admin, "t1", r); !errors.Is(err, rbac.ErrDenied) {
+	if err := h.authz.SetRole(t.Context(), admin, "t1", r); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("defining a role a constraint forbids: %v", err)
 	}
 }
@@ -2235,7 +2237,7 @@ func TestPublicCustomRoles(t *testing.T) {
 	resources := hostTable(t, h)
 	admin := roleAdmin(t, h)
 	viewer := rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
-	if err := h.authz.DefineRole(ctx, admin, "t1", viewer); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", viewer); err != nil {
 		t.Fatal(err)
 	}
 	tenant := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}
@@ -2248,14 +2250,14 @@ func TestPublicCustomRoles(t *testing.T) {
 	}
 	listingsAgree(t, h, resources, anonymous, view)
 	viewer.Public = false
-	if err := h.authz.DefineRole(ctx, admin, "t1", viewer); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", viewer); err != nil {
 		t.Fatal(err)
 	}
 	if allowed(t, h, anonymous, view, cluster) {
 		t.Fatal("a grant to the public should give nothing once its custom role isn't public")
 	}
 	listingsAgree(t, h, resources, anonymous, view)
-	if holders, err := h.authz.Holders(ctx, cluster, view); err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.Public}) {
+	if holders, err := h.authz.Holders(ctx, view, cluster); err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.Public}) {
 		t.Fatalf("Holders = %v, %v", holders, err)
 	}
 }
@@ -2265,7 +2267,7 @@ func TestDeleteRoleRemovesAGrantMadeWhileItWaits(t *testing.T) {
 	ctx := t.Context()
 	admin := roleAdmin(t, h)
 	operator := rbac.RoleDefinition{ID: "custom.operator", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
-	if err := h.authz.DefineRole(ctx, admin, "t1", operator); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", operator); err != nil {
 		t.Fatal(err)
 	}
 	tx, err := h.pool.Begin(ctx)
@@ -2311,7 +2313,7 @@ func TestApplyRefusesARoleChangedWhileItWaits(t *testing.T) {
 			return a.DeleteRole(ctx, admin, "t1", operator.ID)
 		},
 		"no longer for clusters": func(ctx context.Context, a *rbac.Authorizer, admin rbac.Subject) error {
-			return a.DefineRole(ctx, admin, "t1", moved)
+			return a.SetRole(ctx, admin, "t1", moved)
 		},
 	} {
 		t.Run(name, func(t *testing.T) { applyWhileTheRoleChanges(t, operator, change) })
@@ -2323,7 +2325,7 @@ func applyWhileTheRoleChanges(t *testing.T, operator rbac.RoleDefinition, change
 	h := setup(t)
 	ctx := t.Context()
 	admin := roleAdmin(t, h)
-	if err := h.authz.DefineRole(ctx, admin, "t1", operator); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", operator); err != nil {
 		t.Fatal(err)
 	}
 	// The host changes the role in its transaction, which holds the tenant until it commits.
@@ -2370,23 +2372,23 @@ func TestRedefiningAListedRoleNeedsThePowerToGrantIt(t *testing.T) {
 	definer := user("definer")
 	// Clusters can't take it yet, so listing it for clusters needs no power over it.
 	later := rbac.RoleDefinition{ID: "custom.later", Permissions: []rbac.Permission{rbac.DefineRoles}, ResourceTypes: []string{"tenant"}}
-	if err := h.authz.DefineRole(ctx, definer, "t1", later); err != nil {
+	if err := h.authz.SetRole(ctx, definer, "t1", later); err != nil {
 		t.Fatal(err)
 	}
 	lister := rbac.RoleDefinition{ID: "custom.lister", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{later.ID}}
-	if err := h.authz.DefineRole(ctx, admin, "t1", lister); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", lister); err != nil {
 		t.Fatal(err)
 	}
 	h.seed(t, grant(cluster.Scope(), lister.ID, rbac.User, "manager"))
 	sudo := later
 	sudo.Permissions, sudo.ResourceTypes = []rbac.Permission{view, login, root}, []string{"cluster"}
-	if err := h.authz.DefineRole(ctx, definer, "t1", sudo); !errors.Is(err, rbac.ErrDenied) {
+	if err := h.authz.SetRole(ctx, definer, "t1", sudo); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("letting a role's holders grant root without the power to grant it: %v", err)
 	}
 	if err := h.authz.Apply(ctx, user("manager"), cluster, rbac.Change{Grant: []rbac.Binding{{Role: later.ID, Principal: rbac.Principal{Kind: rbac.User, ID: "manager"}}}}); !errors.Is(err, rbac.ErrInvalid) {
 		t.Fatalf("granting the listed role on a cluster: %v", err)
 	}
-	if err := h.authz.DefineRole(ctx, admin, "t1", sudo); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", sudo); err != nil {
 		t.Fatalf("redefining a listed role with the power to grant it: %v", err)
 	}
 }
@@ -2402,11 +2404,11 @@ func TestPublicCustomRolesGiveOnlyWhatUnprivilegedRolesGiveOnEachType(t *testing
 	admin := roleAdmin(t, h)
 	h.seed(t, grant(rbac.TenantRoot("t1"), "secrets.admin", rbac.User, "admin"))
 	secrets := rbac.RoleDefinition{ID: "custom.secrets", Permissions: []rbac.Permission{"data:read"}, ResourceTypes: []string{"secret"}, Public: true}
-	if err := h.authz.DefineRole(ctx, admin, "t1", secrets); !errors.Is(err, rbac.ErrInvalid) {
+	if err := h.authz.SetRole(ctx, admin, "t1", secrets); !errors.Is(err, rbac.ErrInvalid) {
 		t.Fatalf("a public role giving what only a privileged role gives on its type: %v", err)
 	}
 	secrets.Public = false
-	if err := h.authz.DefineRole(ctx, admin, "t1", secrets); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", secrets); err != nil {
 		t.Fatal(err)
 	}
 	if roles, err := h.authz.CustomRoles(ctx, "t1"); err != nil || len(roles) != 1 || !roles[0].Privileged {
@@ -2420,7 +2422,7 @@ func TestCustomRolesFollowTheCatalog(t *testing.T) {
 	resources := hostTable(t, h)
 	admin := roleAdmin(t, h)
 	op := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view, login, root}, ResourceTypes: []string{"cluster"}}
-	if err := h.authz.DefineRole(ctx, admin, "t1", op); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", op); err != nil {
 		t.Fatal(err)
 	}
 	h.seed(t, grant(rbac.Scope{Type: "org", ID: "o1"}, op.ID, rbac.User, "op"))
@@ -2450,7 +2452,7 @@ func TestCustomRolesFollowTheCatalog(t *testing.T) {
 	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM clusters WHERE `+pred.SQL, pred.Args...).Scan(&n); err != nil || n != 0 {
 		t.Fatalf("Filter kept %d clusters, %v", n, err)
 	}
-	if holders, err := later.Holders(ctx, resources[0], root); err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.User, ID: "op"}) {
+	if holders, err := later.Holders(ctx, root, resources[0]); err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.User, ID: "op"}) {
 		t.Fatalf("Holders = %v, %v", holders, err)
 	}
 	if roles, err := later.CustomRoles(ctx, "t1"); err != nil || len(roles) != 1 || slices.Contains(roles[0].Permissions, root) {
@@ -2467,7 +2469,7 @@ func TestPublicCustomRolesFollowTheCatalog(t *testing.T) {
 	resources := hostTable(t, h)
 	admin := roleAdmin(t, h)
 	pub := rbac.RoleDefinition{ID: "custom.pub", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}, Public: true}
-	if err := h.authz.DefineRole(ctx, admin, "t1", pub); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", pub); err != nil {
 		t.Fatal(err)
 	}
 	h.seed(t, grant(rbac.TenantRoot("t1"), pub.ID, rbac.Public, ""))
@@ -2491,7 +2493,7 @@ func TestPublicCustomRolesFollowTheCatalog(t *testing.T) {
 		t.Fatal("a grant to the public should give nothing once its role is no longer public")
 	}
 	listingsAgree(t, h, resources, anonymous, view)
-	if holders, err := h.authz.Holders(ctx, cluster, view); err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.Public}) {
+	if holders, err := h.authz.Holders(ctx, view, cluster); err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.Public}) {
 		t.Fatalf("Holders = %v, %v", holders, err)
 	}
 }
@@ -2508,7 +2510,7 @@ func TestARoleListingItselfIsPrivilegedOnlyForWhatItIs(t *testing.T) {
 	r := rbac.RoleDefinition{ID: "custom.self", ResourceTypes: []string{"workspace"}, GrantableRoles: []rbac.Role{"custom.self"}}
 	for _, perms := range [][]rbac.Permission{{"workspace:view", "workspace:grant", "workspace:delete"}, {"workspace:view", "workspace:grant"}} {
 		r.Permissions = perms
-		if err := h.authz.DefineRole(ctx, admin, "t1", r); err != nil {
+		if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -2522,16 +2524,16 @@ func TestDefiningRolesIsCanonicalBoundedAndMarksPrivilege(t *testing.T) {
 	ctx := t.Context()
 	admin := roleAdmin(t, h)
 	r := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{login, view, view}, ResourceTypes: []string{"cluster"}}
-	if err := h.authz.DefineRole(ctx, admin, "t1", r); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
 		t.Fatal(err)
 	}
 	h.events = nil
 	r.Permissions = []rbac.Permission{view, login}
-	if err := h.authz.DefineRole(ctx, admin, "t1", r); err != nil || len(h.events) != 0 {
+	if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil || len(h.events) != 0 {
 		t.Fatalf("the same role reordered changed it: %+v, %v", h.events, err)
 	}
 	lister := rbac.RoleDefinition{ID: "custom.lister", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.sudo"}}
-	if err := h.authz.DefineRole(ctx, admin, "t1", lister); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", lister); err != nil {
 		t.Fatal(err)
 	}
 	if roles, err := h.authz.CustomRoles(ctx, "t1"); err != nil || len(roles) != 2 || !roles[0].Privileged || roles[1].Privileged {
@@ -2542,7 +2544,7 @@ func TestDefiningRolesIsCanonicalBoundedAndMarksPrivilege(t *testing.T) {
 	rooted := rbac.RoleDefinition{ID: "custom.rooted", Permissions: []rbac.Permission{root}, ResourceTypes: []string{"cluster"}}
 	relay := rbac.RoleDefinition{ID: "custom.relay", Permissions: []rbac.Permission{"workspace:grant"}, ResourceTypes: []string{"workspace"}, GrantableRoles: []rbac.Role{rooted.ID}}
 	for _, d := range []rbac.RoleDefinition{rooted, relay} {
-		if err := h.authz.DefineRole(ctx, admin, "t1", d); err != nil {
+		if err := h.authz.SetRole(ctx, admin, "t1", d); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -2561,15 +2563,15 @@ func TestDefiningRolesIsCanonicalBoundedAndMarksPrivilege(t *testing.T) {
 	for i := range 65 {
 		many.GrantableRoles = append(many.GrantableRoles, rbac.Role(fmt.Sprintf("custom.filler%d", i+1)))
 	}
-	if err := h.authz.DefineRole(ctx, admin, "t1", many); !errors.Is(err, rbac.ErrInvalid) {
+	if err := h.authz.SetRole(ctx, admin, "t1", many); !errors.Is(err, rbac.ErrInvalid) {
 		t.Fatalf("a role listing 65 roles: %v", err)
 	}
 	fill(66, 296)
 	extra := rbac.RoleDefinition{ID: "custom.extra", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
-	if err := h.authz.DefineRole(ctx, admin, "t1", extra); !errors.Is(err, rbac.ErrInvalid) {
+	if err := h.authz.SetRole(ctx, admin, "t1", extra); !errors.Is(err, rbac.ErrInvalid) {
 		t.Fatalf("a tenant's 301st custom role: %v", err)
 	}
-	if err := h.authz.DefineRole(ctx, admin, "t1", r); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
 		t.Fatalf("redefining a role in a full tenant: %v", err)
 	}
 }
@@ -2585,7 +2587,7 @@ func TestDeletingARoleRespectsConstraints(t *testing.T) {
 	ctx := t.Context()
 	admin := roleAdmin(t, h)
 	op := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
-	if err := h.authz.DefineRole(ctx, admin, "t1", op); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", op); err != nil {
 		t.Fatal(err)
 	}
 	h.seed(t, grant(cluster.Scope(), op.ID, rbac.User, "op"))
@@ -2595,12 +2597,12 @@ func TestDeletingARoleRespectsConstraints(t *testing.T) {
 	}
 	gutted := op
 	gutted.Permissions, gutted.ResourceTypes = []rbac.Permission{"tenant:view"}, []string{"tenant"}
-	if err := h.authz.DefineRole(ctx, admin, "t1", gutted); !errors.Is(err, rbac.ErrDenied) || !allowed(t, h, user("op"), view, cluster) {
+	if err := h.authz.SetRole(ctx, admin, "t1", gutted); !errors.Is(err, rbac.ErrDenied) || !allowed(t, h, user("op"), view, cluster) {
 		t.Fatalf("redefining a role changes grants a constraint keeps: %v", err)
 	}
 	renamed := op
 	renamed.Name = "Operator"
-	if err := h.authz.DefineRole(ctx, admin, "t1", renamed); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", renamed); err != nil {
 		t.Fatalf("renaming a role changes no grant: %v", err)
 	}
 	stop = false
@@ -2673,7 +2675,7 @@ func TestDefiningARoleDerivesPrivilegeAndChecksTheActorFirst(t *testing.T) {
 	ctx := t.Context()
 	admin := roleAdmin(t, h)
 	plain := rbac.RoleDefinition{ID: "custom.plain", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Privileged: true}
-	if err := h.authz.DefineRole(ctx, admin, "t1", plain); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", plain); err != nil {
 		t.Fatal(err)
 	}
 	if roles, err := h.authz.CustomRoles(ctx, "t1"); err != nil || len(roles) != 1 || roles[0].Privileged {
@@ -2682,32 +2684,32 @@ func TestDefiningARoleDerivesPrivilegeAndChecksTheActorFirst(t *testing.T) {
 	// Public and marked privileged, though nothing it gives is: the flag is derived.
 	public := plain
 	public.ID, public.Public = "custom.public", true
-	if err := h.authz.DefineRole(ctx, admin, "t1", public); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", public); err != nil {
 		t.Fatalf("a public role marked privileged that gives nothing privileged: %v", err)
 	}
 	// Characters, not bytes, as the table counts them.
 	named := plain
 	named.ID, named.Name = "custom.named", strings.Repeat("역", 128)
-	if err := h.authz.DefineRole(ctx, admin, "t1", named); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", named); err != nil {
 		t.Fatalf("a name of 128 characters: %v", err)
 	}
 	// Past its limit, or text PostgreSQL refuses.
 	for _, name := range []string{strings.Repeat("n", 129), "a\x00b", "\xff"} {
 		bad := plain
 		bad.Name = name
-		if err := h.authz.DefineRole(ctx, admin, "t1", bad); !errors.Is(err, rbac.ErrInvalid) {
+		if err := h.authz.SetRole(ctx, admin, "t1", bad); !errors.Is(err, rbac.ErrInvalid) {
 			t.Fatalf("a name %q: %v", name, err)
 		}
 	}
 	// A character split between the name and the description is valid only joined.
 	split := plain
 	split.Name, split.Description = "\xe4\xb8", "\xad"
-	if err := h.authz.DefineRole(ctx, admin, "t1", split); !errors.Is(err, rbac.ErrInvalid) {
+	if err := h.authz.SetRole(ctx, admin, "t1", split); !errors.Is(err, rbac.ErrInvalid) {
 		t.Fatalf("a character split between name and description: %v", err)
 	}
 	// Refused for who it is, not for what it asked: it learns nothing of the catalog.
 	guess := rbac.RoleDefinition{ID: "custom.guess", Permissions: []rbac.Permission{"cluster:fly"}, ResourceTypes: []string{"cluster"}}
-	if err := h.authz.DefineRole(ctx, user("nobody"), "t1", guess); !errors.Is(err, rbac.ErrDenied) || errors.Is(err, rbac.ErrInvalid) {
+	if err := h.authz.SetRole(ctx, user("nobody"), "t1", guess); !errors.Is(err, rbac.ErrDenied) || errors.Is(err, rbac.ErrInvalid) {
 		t.Fatalf("an actor who may not define roles probing the catalog: %v", err)
 	}
 }
@@ -2725,19 +2727,19 @@ func TestRedefiningARoleForATypeAgainRespectsConstraints(t *testing.T) {
 	admin := roleAdmin(t, h)
 	h.seed(t, grant(rbac.TenantRoot("t1"), "bucket.reader", rbac.User, "admin"))
 	reader := rbac.RoleDefinition{ID: "custom.reader", Permissions: []rbac.Permission{"bucket:read"}, ResourceTypes: []string{"bucket", "cluster"}}
-	if err := h.authz.DefineRole(ctx, admin, "t1", reader); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", reader); err != nil {
 		t.Fatal(err)
 	}
 	bucket := rbac.Resource{Tenant: "t1", Type: "bucket", ID: "b1"}
 	h.seed(t, grant(bucket.Scope(), reader.ID, rbac.User, "u"))
 	narrowed := reader
 	narrowed.ResourceTypes = []string{"cluster"}
-	if err := h.authz.DefineRole(ctx, admin, "t1", narrowed); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", narrowed); err != nil {
 		t.Fatal(err)
 	}
 	stop = true
 	// Its grant on the bucket gives nothing now, and would give again.
-	if err := h.authz.DefineRole(ctx, admin, "t1", reader); !errors.Is(err, rbac.ErrDenied) || allowed(t, h, user("u"), "bucket:read", bucket) {
+	if err := h.authz.SetRole(ctx, admin, "t1", reader); !errors.Is(err, rbac.ErrDenied) || allowed(t, h, user("u"), "bucket:read", bucket) {
 		t.Fatalf("bringing back grants on a type a constraint keeps: %v", err)
 	}
 }
@@ -2770,7 +2772,7 @@ func TestARoleHandingOutOneThatBecomesPrivilegedIsPrivileged(t *testing.T) {
 	}
 	define := func(d rbac.RoleDefinition) {
 		t.Helper()
-		if err := h.authz.DefineRole(ctx, admin, "t1", d); err != nil {
+		if err := h.authz.SetRole(ctx, admin, "t1", d); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -2804,7 +2806,7 @@ func TestDefiningARoleCreatedWhileItWaitsAsksTheConstraintsAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if err := h.authz.WithTx(tx).DefineRole(ctx, admin, "t1", op); err != nil {
+	if err := h.authz.WithTx(tx).SetRole(ctx, admin, "t1", op); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.authz.WithTx(tx).Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), op.ID, rbac.User, "op")}); err != nil {
@@ -2813,11 +2815,11 @@ func TestDefiningARoleCreatedWhileItWaitsAsksTheConstraintsAgain(t *testing.T) {
 	wider := op
 	wider.Permissions = []rbac.Permission{view, login}
 	done := make(chan error, 1)
-	go func() { done <- h.authz.DefineRole(ctx, admin, "t1", wider) }()
+	go func() { done <- h.authz.SetRole(ctx, admin, "t1", wider) }()
 	for waiting := false; !waiting; {
 		select {
 		case err := <-done:
-			t.Fatalf("DefineRole didn't wait for the host: %v", err)
+			t.Fatalf("SetRole didn't wait for the host: %v", err)
 		default:
 			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
 				WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE '%/rbac/%')`).Scan(&waiting); err != nil {
@@ -2831,7 +2833,7 @@ func TestDefiningARoleCreatedWhileItWaitsAsksTheConstraintsAgain(t *testing.T) {
 	if err := <-done; !errors.Is(err, rbac.ErrConflict) || allowed(t, h, user("op"), login, cluster) {
 		t.Fatalf("replacing a role created while the change waited, past the constraint: %v", err)
 	}
-	if err := h.authz.DefineRole(ctx, admin, "t1", wider); !errors.Is(err, rbac.ErrDenied) {
+	if err := h.authz.SetRole(ctx, admin, "t1", wider); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("asked again, the constraint stops it: %v", err)
 	}
 }
@@ -2841,7 +2843,7 @@ func TestPublicCustomRolesThatChangeAccessGiveNothingInSearches(t *testing.T) {
 	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), share) })
 	ctx := t.Context()
 	resources := hostTable(t, h)
-	// Stored by the host, past DefineRole, which refuses a public role that changes access.
+	// Stored by the host, past SetRole, which refuses a public role that changes access.
 	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, public)
 		VALUES ('t1', 'custom.open', '{cluster:view,cluster:grant}', '{cluster}', true)`); err != nil {
 		t.Fatal(err)
@@ -2855,7 +2857,7 @@ func TestPublicCustomRolesThatChangeAccessGiveNothingInSearches(t *testing.T) {
 		t.Fatal("a public grant of a role that changes access should give nothing")
 	}
 	listingsAgree(t, h, resources, anonymous, view)
-	if holders, err := h.authz.Holders(ctx, cluster, view); err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.Public}) {
+	if holders, err := h.authz.Holders(ctx, view, cluster); err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.Public}) {
 		t.Fatalf("Holders = %v, %v", holders, err)
 	}
 }
@@ -3036,7 +3038,7 @@ func TestSearchesLeaveConditionalGrantsToTheHost(t *testing.T) {
 	if !slices.Equal(got, []string{"c0"}) {
 		t.Errorf("Filter kept %v, want only the unconditionally reached c0", got)
 	}
-	if holders, err := h.authz.Holders(ctx, resources[2], login); err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.User, ID: "both"}) {
+	if holders, err := h.authz.Holders(ctx, login, resources[2]); err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.User, ID: "both"}) {
 		t.Errorf("Holders = %v, %v", holders, err)
 	}
 	if !allowed(t, h, user("both"), login, resources[2]) {
@@ -3093,7 +3095,7 @@ func TestAConditionalPowerIsHandedOnOnlyUnderItsCondition(t *testing.T) {
 	lister := rbac.RoleDefinition{ID: "custom.lister", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.login"}}
 	granter := rbac.RoleDefinition{ID: "custom.granter", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"}}
 	for _, r := range []rbac.RoleDefinition{lister, granter} {
-		if err := h.authz.DefineRole(ctx, admin, "t1", r); err != nil {
+		if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -3119,7 +3121,7 @@ func TestAConditionalPowerIsHandedOnOnlyUnderItsCondition(t *testing.T) {
 	}
 	wider := granter
 	wider.ID = "custom.wider"
-	if err := h.authz.DefineRole(withMFA, user("definer"), "t1", wider); !errors.Is(err, rbac.ErrDenied) {
+	if err := h.authz.SetRole(withMFA, user("definer"), "t1", wider); !errors.Is(err, rbac.ErrDenied) {
 		t.Errorf("defining a role that gives a power held only under a condition: %v", err)
 	}
 }
@@ -3130,7 +3132,7 @@ func TestARoleAConditionalGrantListsIsGrantedOnlyUnderItsCondition(t *testing.T)
 	mfa := `request.attributes.mfa == true`
 	withMFA := rbac.WithRequest(ctx, map[string]any{"mfa": true})
 	lister := rbac.RoleDefinition{ID: "custom.lister", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"custom.lister", "cluster.sudo"}}
-	if err := h.authz.DefineRole(ctx, roleAdmin(t, h), "t1", lister); err != nil {
+	if err := h.authz.SetRole(ctx, roleAdmin(t, h), "t1", lister); err != nil {
 		t.Fatal(err)
 	}
 	h.seed(t, rbac.Grant{Scope: cluster.Scope(), Binding: conditional(lister.ID, "p", mfa)})
@@ -3166,10 +3168,10 @@ func TestAConditionalRightToDefineRolesHoldsOnlyUnderItsCondition(t *testing.T) 
 		grant(tenant, "cluster.admin", rbac.User, "definer"),
 	)
 	r := rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
-	if err := h.authz.DefineRole(ctx, user("definer"), "t1", r); !errors.Is(err, rbac.ErrDenied) {
+	if err := h.authz.SetRole(ctx, user("definer"), "t1", r); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("defining a role without the condition the right to holds under: %v", err)
 	}
-	if err := h.authz.DefineRole(rbac.WithRequest(ctx, map[string]any{"mfa": true}), user("definer"), "t1", r); err != nil {
+	if err := h.authz.SetRole(rbac.WithRequest(ctx, map[string]any{"mfa": true}), user("definer"), "t1", r); err != nil {
 		t.Fatalf("defining a role with it: %v", err)
 	}
 }
@@ -3364,7 +3366,7 @@ func TestDenies(t *testing.T) {
 	if perms, err := h.authz.Permissions(ctx, contractor, cluster); err != nil || !slices.Equal(perms, []rbac.Permission{login, view}) {
 		t.Fatalf("Permissions = %v, %v", perms, err)
 	}
-	if holders, err := h.authz.Holders(ctx, cluster, root); err != nil || slices.ContainsFunc(holders, func(p rbac.Principal) bool { return p.ID == "named" || p.ID == "contractors" }) {
+	if holders, err := h.authz.Holders(ctx, root, cluster); err != nil || slices.ContainsFunc(holders, func(p rbac.Principal) bool { return p.ID == "named" || p.ID == "contractors" }) {
 		t.Fatalf("Holders = %v, %v", holders, err)
 	}
 	for _, s := range []rbac.Subject{contractor, lead, user("named")} {
@@ -3472,7 +3474,7 @@ func TestNoDenyLocksOutAGuardAbove(t *testing.T) {
 	if perms, err := h.authz.Permissions(ctx, guardian, workspace); err != nil || !slices.Contains(perms, rbac.DenyPermission("workspace")) {
 		t.Fatalf("Permissions = %v, %v", perms, err)
 	}
-	if holders, err := h.authz.Holders(ctx, workspace, rbac.DenyPermission("workspace")); err != nil || !slices.Contains(holders, guardian.Principal) {
+	if holders, err := h.authz.Holders(ctx, rbac.DenyPermission("workspace"), workspace); err != nil || !slices.Contains(holders, guardian.Principal) {
 		t.Fatalf("Holders = %v, %v", holders, err)
 	}
 	listingsAgree(t, h, resources, guardian, rbac.DenyPermission("cluster"))
@@ -3585,7 +3587,7 @@ func TestADenyOnChangingGrantsStopsRedefiningRoles(t *testing.T) {
 	tenant := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}
 	h.seed(t, grant(tenant.Scope(), "tenant.roles", rbac.User, "x"), grant(tenant.Scope(), "cluster.sudo", rbac.User, "x"))
 	r := rbac.RoleDefinition{ID: "custom.view", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
-	if err := h.authz.DefineRole(ctx, user("x"), "t1", r); err != nil {
+	if err := h.authz.SetRole(ctx, user("x"), "t1", r); err != nil {
 		t.Fatal(err)
 	}
 	h.seed(t, grant(cluster.Scope(), r.ID, rbac.User, "y"))
@@ -3594,14 +3596,14 @@ func TestADenyOnChangingGrantsStopsRedefiningRoles(t *testing.T) {
 	}
 	wider := r
 	wider.Permissions = []rbac.Permission{view, root}
-	if err := h.authz.DefineRole(ctx, user("x"), "t1", wider); !errors.Is(err, rbac.ErrDenied) || allowed(t, h, user("y"), root, cluster) {
+	if err := h.authz.SetRole(ctx, user("x"), "t1", wider); !errors.Is(err, rbac.ErrDenied) || allowed(t, h, user("y"), root, cluster) {
 		t.Fatalf("changing what a role's grants give, denied changing them: %v", err)
 	}
 	if err := h.authz.DeleteRole(ctx, user("x"), "t1", r.ID); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("revoking a role's grants, denied changing them: %v", err)
 	}
 	other := rbac.RoleDefinition{ID: "custom.other", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
-	if err := h.authz.DefineRole(ctx, user("x"), "t1", other); err != nil {
+	if err := h.authz.SetRole(ctx, user("x"), "t1", other); err != nil {
 		t.Fatalf("defining a role no grant has yet: %v", err)
 	}
 }
@@ -3622,8 +3624,12 @@ func TestExplainNamesTheDenyAuthorizeDoes(t *testing.T) {
 	for _, s := range []rbac.Subject{user("owner"), {}} {
 		err := h.authz.Authorize(ctx, s, root, cluster)
 		dec, xerr := h.authz.Explain(ctx, s, root, cluster)
-		if xerr != nil || err == nil || !strings.HasSuffix(err.Error(), dec.Reason) {
+		var denied *rbac.DeniedError
+		if xerr != nil || !errors.As(err, &denied) || denied.Reason != dec.Reason {
 			t.Fatalf("%v: Authorize: %v; Explain: %+v, %v", s.Principal, err, dec, xerr)
+		}
+		if strings.Contains(err.Error(), "deny") || strings.Contains(err.Error(), "tenant:t1") {
+			t.Fatalf("a refusal's message should name no policy: %v", err)
 		}
 	}
 }
@@ -3700,7 +3706,7 @@ func TestEligibleGrants(t *testing.T) {
 		Requires: `request.attributes.mfa == true`, Note: "on call",
 	}
 	h.events = nil
-	if err := h.authz.SetEligible(ctx, user("owner"), cluster, oncall); err != nil {
+	if err := h.authz.SetEligibility(ctx, user("owner"), cluster, oncall); err != nil {
 		t.Fatal(err)
 	}
 	if len(h.events) != 1 || len(h.events[0].Eligible) != 1 || h.events[0].Eligible[0].MaxDuration != time.Hour {
@@ -3777,13 +3783,13 @@ func TestEligibleGrants(t *testing.T) {
 	if got, err := h.authz.Eligibilities(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}}); err != nil || len(got) != 1 || got[0].Note != "on call" {
 		t.Fatalf("Eligibilities = %+v, %v", got, err)
 	}
-	if err := h.authz.RevokeEligible(ctx, user("nobody"), cluster, "cluster.sudo", oncall.Principal); !errors.Is(err, rbac.ErrDenied) {
+	if err := h.authz.DeleteEligibility(ctx, user("nobody"), cluster, "cluster.sudo", oncall.Principal); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("ending an eligibility without the power to revoke the role: %v", err)
 	}
-	if err := h.authz.RevokeEligible(ctx, user("owner"), cluster, "cluster.sudo", rbac.Principal{Kind: rbac.Group}); !errors.Is(err, rbac.ErrInvalid) {
+	if err := h.authz.DeleteEligibility(ctx, user("owner"), cluster, "cluster.sudo", rbac.Principal{Kind: rbac.Group}); !errors.Is(err, rbac.ErrInvalid) {
 		t.Fatalf("ending a malformed principal's eligibility: %v", err)
 	}
-	if err := h.authz.RevokeEligible(ctx, user("owner"), cluster, "cluster.sudo", oncall.Principal); err != nil {
+	if err := h.authz.DeleteEligibility(ctx, user("owner"), cluster, "cluster.sudo", oncall.Principal); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.authz.Activate(mfa, pager, cluster, rbac.Activation{Role: "cluster.sudo", Duration: 30 * time.Minute, Justification: "x"}); !errors.Is(err, rbac.ErrDenied) {
@@ -3795,7 +3801,7 @@ func TestSettingAnEligibilityIsChecked(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
 	e := rbac.Eligibility{Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: time.Hour}
-	if err := h.authz.SetEligible(ctx, user("nobody"), cluster, e); !errors.Is(err, rbac.ErrDenied) {
+	if err := h.authz.SetEligibility(ctx, user("nobody"), cluster, e); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("without the power to grant the role: %v", err)
 	}
 	for name, bad := range map[string]rbac.Eligibility{
@@ -3810,7 +3816,7 @@ func TestSettingAnEligibilityIsChecked(t *testing.T) {
 			Role: e.Role, Principal: e.Principal, MaxDuration: time.Hour, Requires: "request.attributes.x == \"\xff\"",
 		},
 	} {
-		if err := h.authz.SetEligible(ctx, user("owner"), cluster, bad); !errors.Is(err, rbac.ErrInvalid) {
+		if err := h.authz.SetEligibility(ctx, user("owner"), cluster, bad); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
@@ -3821,13 +3827,13 @@ func TestSettingAnEligibilityIsChecked(t *testing.T) {
 	} {
 		bad := e
 		bad.Approvers = approvers
-		if err := h.authz.SetEligible(ctx, user("owner"), cluster, bad); !errors.Is(err, rbac.ErrInvalid) {
+		if err := h.authz.SetEligibility(ctx, user("owner"), cluster, bad); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
 	// A role held under a condition is activated beside it, and the conditional grant stays.
 	h.seed(t, rbac.Grant{Scope: cluster.Scope(), Binding: conditional("cluster.sudo", "x", "false")})
-	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
+	if err := h.authz.SetEligibility(ctx, user("owner"), cluster, e); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.authz.Activate(ctx, user("x"), cluster, rbac.Activation{Role: "cluster.sudo", Duration: time.Minute, Justification: "x"}); err != nil {
@@ -3858,7 +3864,7 @@ func TestActivationsNeedTheirApprovers(t *testing.T) {
 		Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: time.Hour,
 		Approvers: []rbac.Principal{{Kind: rbac.Group, ID: "leads"}, {Kind: rbac.User, ID: "x"}},
 	}
-	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
+	if err := h.authz.SetEligibility(ctx, user("owner"), cluster, e); err != nil {
 		t.Fatal(err)
 	}
 	ask := rbac.Activation{Role: "cluster.sudo", Duration: time.Minute, Justification: "INC-9"}
@@ -3891,7 +3897,7 @@ func TestActivationsNeedTheirApprovers(t *testing.T) {
 	// Where an eligibility needs no approval, an approver passed anyway isn't recorded, though
 	// another for the role would need theirs.
 	free := rbac.Eligibility{Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.Group, ID: "sre"}, MaxDuration: time.Hour}
-	if err := h.authz.SetEligible(ctx, user("owner"), cluster, free); err != nil {
+	if err := h.authz.SetEligibility(ctx, user("owner"), cluster, free); err != nil {
 		t.Fatal(err)
 	}
 	ask.Duration = 2 * time.Minute
@@ -3904,7 +3910,7 @@ func TestDeactivating(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
 	e := rbac.Eligibility{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: time.Hour}
-	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
+	if err := h.authz.SetEligibility(ctx, user("owner"), cluster, e); err != nil {
 		t.Fatal(err)
 	}
 	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "x"), grant(workspace.Scope(), "cluster.login", rbac.User, "y"))
@@ -4056,7 +4062,7 @@ func TestActivatingRespectsConstraints(t *testing.T) {
 	})
 	ctx := t.Context()
 	e := rbac.Eligibility{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: time.Hour}
-	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
+	if err := h.authz.SetEligibility(ctx, user("owner"), cluster, e); err != nil {
 		t.Fatal(err)
 	}
 	stop = true
@@ -4069,7 +4075,7 @@ func TestEligibilitiesGoWithWhatTheyName(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
 	e := rbac.Eligibility{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: time.Hour}
-	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
+	if err := h.authz.SetEligibility(ctx, user("owner"), cluster, e); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.authz.DeletePrincipalEverywhere(ctx, host, e.Principal); err != nil {
@@ -4078,7 +4084,7 @@ func TestEligibilitiesGoWithWhatTheyName(t *testing.T) {
 	if got, err := h.authz.Eligibilities(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{e.Principal}}); err != nil || len(got) != 0 {
 		t.Fatalf("after deleting the principal everywhere: %+v, %v", got, err)
 	}
-	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
+	if err := h.authz.SetEligibility(ctx, user("owner"), cluster, e); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.authz.DeleteScope(ctx, host, "t1", cluster.Scope()); err != nil {
@@ -4089,13 +4095,13 @@ func TestEligibilitiesGoWithWhatTheyName(t *testing.T) {
 	}
 	h.seed(t, grant(cluster.Scope(), "cluster.admin", rbac.User, "owner"), grant(cluster.Scope(), "cluster.admin", rbac.User, "owner2"))
 	e.ExpiresAt = h.now.Add(time.Hour)
-	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
+	if err := h.authz.SetEligibility(ctx, user("owner"), cluster, e); err != nil {
 		t.Fatal(err)
 	}
 	h.now = h.now.Add(2 * time.Hour)
 	// Set again once expired, it is as new: who set it, and when.
 	e.ExpiresAt = h.now.Add(time.Hour)
-	if err := h.authz.SetEligible(ctx, user("owner2"), cluster, e); err != nil {
+	if err := h.authz.SetEligibility(ctx, user("owner2"), cluster, e); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := h.authz.Eligibilities(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{e.Principal}}); err != nil ||
@@ -4113,12 +4119,12 @@ func TestAnEligibilityCantHandOutMoreThanItsSetterHolds(t *testing.T) {
 	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), share) })
 	h.seed(t, grant(cluster.Scope(), "cluster.share", rbac.User, "sharer"))
 	sudo := rbac.Eligibility{Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: time.Hour}
-	if err := h.authz.SetEligible(t.Context(), user("sharer"), cluster, sudo); !errors.Is(err, rbac.ErrDenied) {
+	if err := h.authz.SetEligibility(t.Context(), user("sharer"), cluster, sudo); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("making someone eligible for a role the setter couldn't grant: %v", err)
 	}
 	loginOnly := sudo
 	loginOnly.Role = "cluster.login"
-	if err := h.authz.SetEligible(t.Context(), user("sharer"), cluster, loginOnly); err != nil {
+	if err := h.authz.SetEligibility(t.Context(), user("sharer"), cluster, loginOnly); err != nil {
 		t.Fatalf("making someone eligible for a role the setter could grant: %v", err)
 	}
 }
@@ -4130,7 +4136,7 @@ func TestAnActivationEndsByItsEligibility(t *testing.T) {
 		Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: 366 * 24 * time.Hour,
 		ExpiresAt: h.now.Add(10 * time.Minute),
 	}
-	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
+	if err := h.authz.SetEligibility(ctx, user("owner"), cluster, e); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.authz.Activate(ctx, user("x"), cluster, rbac.Activation{Role: "cluster.sudo", Duration: 300 * 24 * time.Hour, Justification: "x"}); !errors.Is(err, rbac.ErrDenied) {
@@ -4146,11 +4152,11 @@ func TestDeletingARoleEndsItsEligibilities(t *testing.T) {
 	ctx := t.Context()
 	admin := roleAdmin(t, h)
 	operator := rbac.RoleDefinition{ID: "custom.operator", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
-	if err := h.authz.DefineRole(ctx, admin, "t1", operator); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", operator); err != nil {
 		t.Fatal(err)
 	}
 	e := rbac.Eligibility{Role: operator.ID, Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: time.Hour}
-	if err := h.authz.SetEligible(ctx, admin, cluster, e); err != nil {
+	if err := h.authz.SetEligibility(ctx, admin, cluster, e); err != nil {
 		t.Fatal(err)
 	}
 	h.events = nil
@@ -4162,7 +4168,7 @@ func TestDeletingARoleEndsItsEligibilities(t *testing.T) {
 	}
 	// Defined again with its id, a role isn't activated through an eligibility for the one deleted.
 	operator.Permissions = append(operator.Permissions, root)
-	if err := h.authz.DefineRole(ctx, admin, "t1", operator); err != nil {
+	if err := h.authz.SetRole(ctx, admin, "t1", operator); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.authz.Activate(ctx, user("x"), cluster, rbac.Activation{Role: operator.ID, Duration: time.Minute, Justification: "x"}); !errors.Is(err, rbac.ErrDenied) {

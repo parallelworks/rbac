@@ -459,7 +459,7 @@ type authority struct {
 	// the tenant reaches other resources: a deny whose condition reads the resource can't be
 	// evaluated for them, so it denies. What a deny removes the actor can't use or hand on.
 	denied, handsOn func(p Permission) bool
-	// defining is a custom role DefineRole checks: the roles a check names resolve to it, but the
+	// defining is a custom role SetRole checks: the roles a check names resolve to it, but the
 	// actor's own grants of it give what it gives now.
 	defining *RoleDefinition
 }

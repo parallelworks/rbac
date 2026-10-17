@@ -258,7 +258,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 // conditional denies included; a deny naming a group's member or an identity among the tenant's
 // members can't be seen through the group or the tenant, so with denies on the path check each
 // person with Authorize.
-func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]Principal, error) {
+func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]Principal, error) {
 	if err := a.check(r); err != nil {
 		return nil, err
 	}
@@ -275,7 +275,7 @@ func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]P
 	}
 	args := append([]any{
 		r.Tenant, r.path(), roles, a.cfg.Now(), p.managesAccess(),
-		[]string{string(Tenant), string(Public)},
+		[]string{string(Members), string(Public)},
 		string(p), r.Type, a.publicRoles(roles), string(Public),
 	}, a.publicArgs(p, r.Type, custom)...)
 	rows, err := a.db.Query(ctx, `

@@ -1,6 +1,6 @@
 // Package rbac is role-based access control on PostgreSQL: Core RBAC with scoped role
 // assignments. A role is a set of permissions, built into the host's catalog or defined by a
-// tenant ([Authorizer.DefineRole]); a grant gives one role to a principal (a user, another kind
+// tenant ([Authorizer.SetRole]); a grant gives one role to a principal (a user, another kind
 // of identity such as a service account, a group, every member of a tenant, or the public) on a
 // resource, a container above resources or the whole tenant, and applies to everything under
 // that scope.
@@ -73,12 +73,16 @@ type PrincipalKind string
 const (
 	User  PrincipalKind = "user"
 	Group PrincipalKind = "group"
-	// Tenant is every member of a tenant, of every kind, those who join later included; its id
+	// Members is every member of a tenant, of every kind, those who join later included; its id
 	// is the tenant's (TenantMembers).
-	Tenant PrincipalKind = "tenant"
+	Members PrincipalKind = "members"
 	// Public is anyone, signed in or not; its id is empty.
 	Public PrincipalKind = "public"
 )
+
+// reservedKinds, and kinds starting rbac, are kinds of principal a later release may add, such as
+// every signed-in identity, so a host can't declare one.
+var reservedKinds = []PrincipalKind{"anonymous", "authenticated", "domain", "everyone", "role", "set"}
 
 // Principal is who a role is granted to. An identity's or a group's id names it in every
 // tenant, so a tenant can grant a role to one from another, where Config.ValidateGrant allows
@@ -89,7 +93,7 @@ type Principal struct {
 }
 
 // TenantMembers is the principal that is every member of a tenant.
-func TenantMembers(tenant string) Principal { return Principal{Kind: Tenant, ID: tenant} }
+func TenantMembers(tenant string) Principal { return Principal{Kind: Members, ID: tenant} }
 
 func (p Principal) key() string { return string(p.Kind) + ":" + p.ID }
 
@@ -97,7 +101,7 @@ var publicKey = Principal{Kind: Public}.key()
 
 // broad reports whether p is principals nobody named one by one: a tenant's members or the
 // public.
-func (p Principal) broad() bool { return p.Kind == Tenant || p.Kind == Public }
+func (p Principal) broad() bool { return p.Kind == Members || p.Kind == Public }
 
 // wellFormed reports whether p could hold grants in a tenant, whether or not its kind is
 // declared, as a revoke needs.
@@ -105,7 +109,7 @@ func (p Principal) wellFormed(tenant string) bool {
 	switch p.Kind {
 	case Public:
 		return p.ID == ""
-	case Tenant:
+	case Members:
 		return p.ID == tenant
 	case User, Group:
 		return p.ID != ""
@@ -381,7 +385,7 @@ type ConstraintInput struct {
 	// Subject is who asks, or who changes access; nil in Holders.
 	Subject *Subject
 	// Resource is what is asked about, with its ancestors and attributes; nil in Filter and
-	// Reachable, and in DefineRole and DeleteRole, which change grants on every scope of a type.
+	// Reachable, and in SetRole and DeleteRole, which change grants on every scope of a type.
 	Resource *Resource
 }
 
@@ -434,16 +438,15 @@ const (
 	MaxExpression  = 2048
 )
 
-// DeniedError is a refusal, with why.
+// DeniedError is a refusal, with why. Its message names only the permission, so a host that
+// shows an error shows none of its policy; log Scope and Reason, or use Explain.
 type DeniedError struct {
 	Permission Permission
 	Scope      Scope
 	Reason     string
 }
 
-func (e *DeniedError) Error() string {
-	return fmt.Sprintf("rbac: %s on %s denied: %s", e.Permission, e.Scope.Key(), e.Reason)
-}
+func (e *DeniedError) Error() string { return fmt.Sprintf("rbac: %s denied", e.Permission) }
 
 // Is makes a DeniedError match ErrDenied.
 func (e *DeniedError) Is(target error) bool { return target == ErrDenied }
@@ -465,13 +468,14 @@ type Config struct {
 	// be granted on one, and applies to the resources under it.
 	ContainerTypes []string
 	// PrincipalKinds are the kinds of identity besides users that act and are granted roles,
-	// such as service accounts. Groups, a tenant's members and the public need no declaring.
+	// such as service accounts. Groups, a tenant's members and the public need no declaring, and
+	// a few names are reserved for kinds a later release may add.
 	PrincipalKinds []PrincipalKind
 	// ValidateGrant returns an error matching ErrInvalid when a grant can't be made: to an
 	// identity or group the tenant doesn't let in, such as one from another tenant; to the public
 	// where the host doesn't allow public access; of a role a principal's kind may not hold, such
 	// as a privileged one for a guest; or one this actor may not give this principal. It is asked
-	// about every grant Apply, Import and Activate make, and every eligibility SetEligible sets,
+	// about every grant Apply, Import and Activate make, and every eligibility SetEligibility sets,
 	// once each is otherwise valid; any other error fails the change. q is what the change runs
 	// on, so under WithTx it sees a member added earlier in the transaction. Required: a grant
 	// to a principal the tenant doesn't let in must never be stored.
@@ -547,7 +551,8 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 	}
 	kinds := map[PrincipalKind]bool{}
 	for _, k := range cfg.PrincipalKinds {
-		if !validName(string(k)) || slices.Contains([]PrincipalKind{User, Group, Tenant, Public}, k) {
+		if !validName(string(k)) || slices.Contains([]PrincipalKind{User, Group, Members, Public}, k) ||
+			slices.Contains(reservedKinds, k) || strings.HasPrefix(string(k), "rbac") {
 			return nil, fmt.Errorf("rbac: principal kind %q is not valid", k)
 		}
 		kinds[k] = true
@@ -607,7 +612,7 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 // stricter one, whose snapshot can predate the locks they wait for. Their locks last until tx
 // ends, so two transactions that change the same scopes or principals in opposite orders can
 // deadlock, as with any row locks: PostgreSQL fails one, to be retried. DeleteTenant,
-// DefineRole and DeleteRole lock the whole tenant.
+// SetRole and DeleteRole lock the whole tenant.
 func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 	b := *a
 	b.db = tx
@@ -631,7 +636,7 @@ type GrantInput struct {
 // Via is how a grant is made.
 type Via string
 
-// The ways a grant is made: by Apply, Import or Activate, or as an eligibility SetEligible
+// The ways a grant is made: by Apply, Import or Activate, or as an eligibility SetEligibility
 // sets, which is the grant activating it would make.
 const (
 	ViaApply       Via = "apply"
