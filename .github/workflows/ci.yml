@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read # checkout
+    services:
+      postgres:
+        image: postgres:18@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
+        env:
+          POSTGRES_DB: rbac_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        id: setup-go
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Locate Go caches
+        id: go-paths
+        run: |
+          echo "build=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+          echo "modules=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+      # setup-go restores only an exact key, so a dependency bump would start lint
+      # and tests from nothing. A prefix match reuses most of the last build; Go
+      # trims stale builds itself, and each Go release starts a fresh cache.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: go-cache
+        with:
+          path: |
+            ${{ steps.go-paths.outputs.build }}
+            ${{ steps.go-paths.outputs.modules }}
+          key: go-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum', 'tools/go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-
+      - name: Verify go.mod is tidy
+        run: make tidy-check
+      - name: Lint
+        run: make lint
+      - name: Check dependencies for known vulnerabilities
+        run: make vulncheck
+      - name: Test
+        env:
+          # go.mod also sets fips140=only; the environment makes the mode explicit
+          # so that a future go.mod edit cannot silently drop it.
+          GODEBUG: fips140=only
+          RBAC_TEST_DATABASE_URL: postgres://postgres@localhost:5432/rbac_test?sslmode=disable
+        run: make test
+      # Only main saves: PRs can read main's caches, while caches saved by PRs
+      # are visible to no other branch and crowd main's out of the quota.
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.event_name == 'push' && steps.go-cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ${{ steps.go-paths.outputs.build }}
+            ${{ steps.go-paths.outputs.modules }}
+          key: ${{ steps.go-cache.outputs.cache-primary-key }}
+
+  # Audits the workflows themselves: unpinned actions, template injection,
+  # excessive permissions, cache poisoning in release jobs.
+  actions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read # checkout
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+        with:
+          # Fail the job on findings instead of uploading SARIF, which would
+          # need security-events: write.
+          advanced-security: false

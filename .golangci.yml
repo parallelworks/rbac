@@ -1,0 +1,90 @@
+version: "2"
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose
+    - contextcheck
+    - copyloopvar
+    - depguard
+    - errname
+    - errorlint
+    - exhaustive
+    - forbidigo
+    - forcetypeassert
+    - gocritic
+    - gosec
+    - intrange
+    - misspell
+    - nilerr
+    - noctx
+    - nolintlint
+    - predeclared
+    - revive
+    - sloglint
+    - thelper
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - wastedassign
+  settings:
+    depguard:
+      rules:
+        main:
+          deny:
+            # x/crypto is outside the validated Go Cryptographic Module, and
+            # fips140=only does not guard its own implementations. If a
+            # subpackage is truly needed (e.g. x/crypto/ssh key parsing),
+            # allow that one package here, with a reason.
+            - pkg: golang.org/x/crypto
+              desc: "FIPS 140-3: use the standard library crypto/* packages"
+            - pkg: github.com/pkg/errors
+              desc: "use the standard library errors and fmt.Errorf %w"
+            - pkg: math/rand$
+              desc: "use math/rand/v2, or crypto/rand for anything security-sensitive"
+    exhaustive:
+      default-signifies-exhaustive: true
+    forbidigo:
+      analyze-types: true
+      forbid:
+        # Only main creates root contexts; everything else receives one.
+        # Tests use t.Context(), which is cancelled when the test ends.
+        - pattern: ^context\.(Background|TODO)$
+          msg: "accept a context.Context parameter (tests: use t.Context())"
+    gosec:
+      excludes:
+        - G104 # covered by errcheck
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment # micro-optimization; hurts readability
+        - shadow # flags the idiomatic `if err := ...; err != nil`
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    revive:
+      rules:
+        - name: exported
+        - name: package-comments
+    sloglint:
+      context: scope
+    staticcheck:
+      checks: ["all"]
+  exclusions:
+    presets:
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters: [gosec, noctx]
+      - path: (^|/)main\.go$
+        text: context\.(Background|TODO)
+        linters: [forbidigo]
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/parallelworks/rbac
