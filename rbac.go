@@ -260,9 +260,10 @@ func (r Resource) validate() error {
 	return nil
 }
 
-// Path is the keys of every scope whose grants apply to the resource: its own, every
+// Path is the keys of every scope whose grants apply to the resource: its own first, then every
 // container's above it and the tenant's. Filter matches it against a host column holding the
-// same keys, so store exactly this, and keep it current when the resource moves.
+// same keys, so store exactly this, in this order, and keep it current when the resource or a
+// container above it moves.
 func (a *Authorizer) Path(r Resource) ([]string, error) {
 	if err := a.check(r); err != nil {
 		return nil, err
