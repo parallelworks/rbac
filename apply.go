@@ -30,19 +30,20 @@ func (e *InvalidError) Is(target error) bool { return target == ErrInvalid }
 // Apply changes the grants on one scope, on, in one transaction, as actor:
 //
 //   - the actor needs `<on's type>:grant` there (through on, an ancestor or the tenant), and no
-//     constraint may remove it;
+//     constraint, nor deny on the path, may remove it;
 //   - through a role with GrantableRoles, the actor may grant and revoke only those roles, and
 //     needn't hold their permissions;
 //   - through any other role, the actor may grant a role only by holding everything it gives
-//     there, for every type the grant reaches, and may revoke any. A role's power to change
-//     grants is part of what it gives: one with GrantableRoles needs the power to grant each
-//     its holders could, and one without, the unlimited power to change grants on its type;
+//     there, none of it removed by a deny on the path, for every type the grant reaches, and
+//     may revoke any. A role's power to change grants is part of what it gives: one with
+//     GrantableRoles needs the power to grant each its holders could, and one without, the
+//     unlimited power to change grants on its type;
 //   - a conditional power to change grants holds only where its condition does, and what the
 //     actor hands on, permissions and power alike, it holds unconditionally or under the
 //     condition the grant has: a role a conditional grant lists is granted only under its
 //     condition;
-//   - a role that gives a `:grant` permission or DefineRoles can't be granted to a tenant's
-//     members or the public, and only a role marked Public can be granted to the public.
+//   - a role that gives a `:grant` or `:deny` permission or DefineRoles can't be granted to a
+//     tenant's members or the public, and only a role marked Public can be granted to the public.
 //
 // Anonymous subjects change nothing. A grant outlives the actor's own access: revoking that
 // access leaves the grants the actor made, as in cloud IAM, so a time-limited power to change
@@ -397,7 +398,8 @@ func (p power) lists(r Role, condition string) bool {
 // name. With a custom role among them it reads all the tenant's, which a role's GrantableRoles
 // can name.
 func (a *Authorizer) authorityOn(ctx context.Context, q DB, actor Subject, on Resource, roles []Role) (authority, error) {
-	held, err := a.heldBindings(ctx, q, on.Tenant, actor.principals(on.Tenant), on.path())
+	keys := actor.principals(on.Tenant)
+	held, ds, err := a.heldOrDenied(ctx, q, on.Tenant, keys, keys, on.path(), "")
 	if err != nil {
 		return authority{}, err
 	}
@@ -409,16 +411,13 @@ func (a *Authorizer) authorityOn(ctx context.Context, q DB, actor Subject, on Re
 		}
 		b = a.bookOf(custom)
 	}
-	return a.authorityOf(ctx, q, actor, on, held, b)
+	return a.authorityOf(ctx, q, actor, on, held, ds, b)
 }
 
-// authorityOf is the authority of held grants, reading their conditions.
-func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Resource, held []holding, b book) (authority, error) {
+// authorityOf is the authority of held grants under the denies on the path, reading the
+// grants' conditions.
+func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Resource, held []holding, ds []denial, b book) (authority, error) {
 	if err := a.conditionsOf(ctx, q, on.Tenant, held); err != nil {
-		return authority{}, err
-	}
-	ds, err := a.deniesOn(ctx, q, on.Tenant, actor.principals(on.Tenant), on.path(), "")
-	if err != nil {
 		return authority{}, err
 	}
 	vars, spend := a.vars(ctx, actor, "", on), newBudget()
@@ -426,11 +425,6 @@ func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Re
 		v := maps.Clone(vars)
 		v["action"] = string(action)
 		return v
-	}
-	reached := vars
-	if a.contains(on.Type) {
-		reached = maps.Clone(vars)
-		delete(reached, "resource")
 	}
 	deny := func(vars map[string]any) func(Permission) bool {
 		denied := map[Permission]bool{}
@@ -443,12 +437,20 @@ func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Re
 			return d
 		}
 	}
+	// On a resource, what the actor hands on reaches only it, as what it does there does.
+	denied := deny(vars)
+	handsOn := denied
+	if a.contains(on.Type) {
+		reached := maps.Clone(vars)
+		delete(reached, "resource")
+		handsOn = deny(reached)
+	}
 	return authority{
 		held: held, roles: b,
 		allows: func(h holding, action Permission) bool {
 			return !h.conditional || a.conds.holds(spend, h.Condition.Expression, with(vars, action))
 		},
-		denied: deny(vars), handsOn: deny(reached),
+		denied: denied, handsOn: handsOn,
 	}, nil
 }
 
@@ -633,7 +635,8 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 	if err != nil || name != "" {
 		return nil, err
 	}
-	held, err := a.heldBindings(ctx, a.db, r.Tenant, s.principals(r.Tenant), r.path())
+	keys := s.principals(r.Tenant)
+	held, ds, err := a.heldOrDenied(ctx, a.db, r.Tenant, keys, keys, r.path(), "")
 	if err != nil || len(held) == 0 {
 		return nil, err
 	}
@@ -642,7 +645,7 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 	if err != nil {
 		return nil, err
 	}
-	au, err := a.authorityOf(ctx, a.db, s, r, held, a.bookOf(custom))
+	au, err := a.authorityOf(ctx, a.db, s, r, held, ds, a.bookOf(custom))
 	if err != nil {
 		return nil, err
 	}

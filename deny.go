@@ -71,7 +71,7 @@ func denies(listed []Permission, p Permission) bool {
 
 // denial is a deny as a check reads it.
 type denial struct {
-	id, name, scope    string
+	id, scope          string
 	permissions        []Permission
 	principals, exempt []string
 	condition          string
@@ -99,21 +99,18 @@ func (a *Authorizer) applies(d denial, spend *budget, vars map[string]any) bool 
 }
 
 // deniesOn reads the denies on scopes that name one of keys, and none it exempts, or name
-// anyone when keys is nil, listing p, or any permission when p is empty.
+// anyone when keys is nil, listing p.
 func (a *Authorizer) deniesOn(ctx context.Context, q DB, tenant string, keys, scopes []string, p Permission) ([]denial, error) {
 	if keys != nil && len(keys) == 0 {
 		return nil, nil
 	}
-	var perm, wildcard string
-	if p != "" {
-		perm, wildcard = matchable(p)
-	}
+	perm, wildcard := matchable(p)
 	// In the order a check reads them, so Explain names the deny Authorize does.
 	rows, err := q.Query(ctx, `
-		SELECT id, name, scope, permissions, principals, exempt, condition FROM rbac_denies
+		SELECT id, scope, permissions, principals, exempt, condition FROM rbac_denies
 		WHERE tenant = $1 AND scope = ANY($2::text[])
 		  AND ($3::text[] IS NULL OR principals && $3::text[] AND NOT exempt && $3::text[])
-		  AND ($4 = '' OR $4 = ANY(permissions) OR $5 = ANY(permissions))
+		  AND ($4 = ANY(permissions) OR $5 = ANY(permissions))
 		ORDER BY id, scope`,
 		tenant, scopes, keys, perm, wildcard)
 	if err != nil {
@@ -122,7 +119,7 @@ func (a *Authorizer) deniesOn(ctx context.Context, q DB, tenant string, keys, sc
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (denial, error) {
 		var d denial
 		var perms []string
-		err := row.Scan(&d.id, &d.name, &d.scope, &perms, &d.principals, &d.exempt, &d.condition)
+		err := row.Scan(&d.id, &d.scope, &perms, &d.principals, &d.exempt, &d.condition)
 		for _, x := range perms {
 			d.permissions = append(d.permissions, Permission(x))
 		}
@@ -186,7 +183,9 @@ func (a *Authorizer) checkDeny(tenant string, d Deny) error {
 // SetDeny creates or replaces a deny policy on a scope, on, as actor, who needs
 // DenyPermission(on's type) there (through on, an ancestor or the tenant), not removed by a
 // constraint. A deny only takes access away, so setting one needs no more than that; one can
-// deny its setter too.
+// deny its setter too. Whoever holds that permission on the scope, those the deny names
+// included, can replace or delete it, so to bind one who holds it there, set the deny on a
+// scope above where it doesn't.
 func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d Deny) error {
 	if err := a.check(on); err != nil {
 		return err

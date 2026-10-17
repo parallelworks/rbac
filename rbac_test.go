@@ -3014,7 +3014,7 @@ func TestAConditionalDenyFailsClosed(t *testing.T) {
 		t.Fatalf("Reachable = %+v, %v", reach, err)
 	}
 	// Someone the deny names but nothing reaches has nothing to check one by one.
-	if reach, err := h.authz.Reachable(ctx, user("nobody"), login, "t1", "cluster"); err != nil || reach.All || len(reach.Scopes)+len(reach.Conditional) > 0 {
+	if reach, err := h.authz.Reachable(ctx, user("nobody"), login, "t1", "cluster"); err != nil || reach.All || len(reach.Scopes)+len(reach.Conditional)+len(reach.ConditionalExcept) > 0 {
 		t.Fatalf("Reachable without grants = %+v, %v", reach, err)
 	}
 	resources := hostTable(t, h)
@@ -3192,10 +3192,13 @@ func TestExplainNamesTheDenyAuthorizeDoes(t *testing.T) {
 	if err := h.authz.SetDeny(ctx, guardian, cluster, d("z")); err != nil {
 		t.Fatal(err)
 	}
-	err := h.authz.Authorize(ctx, user("owner"), root, cluster)
-	dec, xerr := h.authz.Explain(ctx, user("owner"), root, cluster)
-	if xerr != nil || err == nil || !strings.HasSuffix(err.Error(), dec.Reason) {
-		t.Fatalf("Authorize: %v; Explain: %+v, %v", err, dec, xerr)
+	// The anonymous subject too, whom no grant can give root.
+	for _, s := range []rbac.Subject{user("owner"), {}} {
+		err := h.authz.Authorize(ctx, s, root, cluster)
+		dec, xerr := h.authz.Explain(ctx, s, root, cluster)
+		if xerr != nil || err == nil || !strings.HasSuffix(err.Error(), dec.Reason) {
+			t.Fatalf("%v: Authorize: %v; Explain: %+v, %v", s.Principal, err, dec, xerr)
+		}
 	}
 }
 

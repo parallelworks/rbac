@@ -308,7 +308,7 @@ type Change struct {
 }
 
 // ChangeEvent is what a committed change did: only the grants that were added, updated or
-// removed, and the custom roles defined or deleted.
+// removed, the custom roles defined or deleted, and the deny policies set or deleted.
 type ChangeEvent struct {
 	Tenant string
 	// Actor is who made the change; zero for Import and the deletes of scopes, principals and
