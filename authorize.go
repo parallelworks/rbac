@@ -301,16 +301,20 @@ func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]P
 }
 
 // Reach is where a subject may do something. A resource, by its path (Authorizer.Path), is
-// reachable when its path holds none of Except and, if it holds one of Conditional, Authorize
-// allows it; otherwise when All, or its path holds one of Scopes.
+// reachable when its path holds none of Except; All is set or its path holds one of Scopes or
+// Conditional; and, if its path holds one of Conditional or ConditionalExcept, Authorize allows
+// it.
 type Reach struct {
 	All    bool
 	Scopes []Scope
-	// Conditional are the scopes only conditional grants reach, or a conditional deny covers,
-	// which a search can't evaluate: check the resources under them one by one.
+	// Conditional are the scopes only conditional grants reach, which a search can't evaluate:
+	// check the resources under them one by one.
 	Conditional []Scope
 	// Except are the scopes a deny covers: nothing under them is reachable.
 	Except []Scope
+	// ConditionalExcept are the scopes a conditional deny covers: a resource under one that is
+	// otherwise reachable is checked on its own.
+	ConditionalExcept []Scope
 }
 
 // Reachable says where the subject may do p to resources of a type in a tenant, for hosts that
@@ -356,12 +360,13 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 	}
 	// Denies on scopes a resource of the type can have on its path: those of the type, the
 	// containers and the tenant.
+	perm, wildcard := matchable(p)
 	rows, err = a.db.Query(ctx, `
 		SELECT scope, bool_or(condition = '') FROM rbac_denies
 		WHERE tenant = $1 AND split_part(scope, ':', 1) = ANY($2::text[])
 		  AND principals && $3::text[] AND NOT exempt && $3::text[] AND ($4 = ANY(permissions) OR $5 = ANY(permissions))
 		GROUP BY scope ORDER BY scope`,
-		tenant, a.reaching(resourceType), s.principals(tenant), string(p), wildcard(p))
+		tenant, a.reaching(resourceType), s.principals(tenant), perm, wildcard)
 	if err != nil {
 		return Reach{}, err
 	}
@@ -370,7 +375,7 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 		if always {
 			reach.Except = append(reach.Except, parseScope(key))
 		} else {
-			reach.Conditional = append(reach.Conditional, parseScope(key))
+			reach.ConditionalExcept = append(reach.ConditionalExcept, parseScope(key))
 		}
 		return nil
 	}); err != nil {
@@ -380,7 +385,7 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 		return Reach{}, nil
 	}
 	if reach.All {
-		reach.Scopes = nil
+		reach.Scopes, reach.Conditional = nil, nil
 	}
 	return reach, nil
 }
@@ -425,7 +430,8 @@ type Predicate struct {
 // query must reach this package's tables (they are in the pool's schema), and column names are
 // trusted host code; every value is an argument. It counts only unconditional grants, and leaves
 // out every resource a deny covers, conditional ones included, so it never keeps one Authorize
-// refuses: Reachable's Conditional names the scopes where that may be too strict.
+// refuses: Reachable's Conditional and ConditionalExcept name the scopes where that may be too
+// strict.
 func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant, resourceType string, cols Columns, firstArg int) (Predicate, error) {
 	if cols.Tenant == "" || cols.Path == "" || firstArg < 1 {
 		return Predicate{}, fmt.Errorf("%w: Filter needs the tenant and path columns and a first argument", ErrInvalid)
@@ -440,6 +446,7 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 		return Predicate{SQL: "FALSE"}, nil
 	}
 	arg := func(i int) string { return fmt.Sprintf("$%d", firstArg+i) }
+	perm, wildcard := matchable(p)
 	// The grants' tenant is an argument of its own: the host's tenant column needn't be text,
 	// and one argument can't take two types. A tenant-wide grant's scope is the tenant's key,
 	// which every path holds, so one overlap covers every scope and the host's GIN index serves
@@ -455,11 +462,11 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 			  AND (%s::text = ANY(d.permissions) OR %s::text = ANY(d.permissions))))`,
 			cols.Tenant, arg(0), cols.Path, arg(1), arg(2), givingSQL(arg(3), arg(1), arg(8), arg(9), custom, nil), arg(4), arg(5), arg(6),
 			givingSQL(arg(7), arg(1), arg(8), arg(9), custom, &publicSQL{arg(10), arg(11), arg(12)}),
-			cols.Path, arg(1), arg(5), arg(13), arg(13), arg(8), arg(14)),
+			cols.Path, arg(1), arg(5), arg(13), arg(13), arg(14), arg(15)),
 		Args: append(append([]any{
 			tenant, tenant, principals, roles, a.cfg.Now(), a.reaching(resourceType), publicKey, a.publicRoles(roles),
 			string(p), resourceType,
-		}, a.publicArgs(p, resourceType, custom)...), s.principals(tenant), wildcard(p)),
+		}, a.publicArgs(p, resourceType, custom)...), s.principals(tenant), perm, wildcard),
 	}, nil
 }
 
@@ -505,6 +512,7 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, prin
 	if len(principals) == 0 {
 		return nil, nil, nil
 	}
+	perm, wildcard := matchable(p)
 	rows, err := q.Query(ctx, `
 		SELECT false, principal, scope, role, expires_at, conditional, NULL::text[], ''
 		FROM rbac_grants
@@ -516,7 +524,7 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, prin
 		WHERE tenant = $1 AND scope = ANY($3::text[]) AND principals && $5::text[] AND NOT exempt && $5::text[]
 		  AND ($6 = ANY(permissions) OR $7 = ANY(permissions))
 		ORDER BY 1, 2, 3, 4`,
-		tenant, principals, scopes, a.cfg.Now(), keys, string(p), wildcard(p))
+		tenant, principals, scopes, a.cfg.Now(), keys, perm, wildcard)
 	if err != nil {
 		return nil, nil, err
 	}
