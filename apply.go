@@ -68,6 +68,9 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 	if len(grants)+len(revokes) == 0 {
 		return nil
 	}
+	if len(grants)+len(revokes) > MaxBindings {
+		return fmt.Errorf("%w: a change grants and revokes at most %d bindings", ErrInvalid, MaxBindings)
+	}
 	for _, b := range grants {
 		if b.Source == SourceActivation {
 			return &InvalidError{Binding: b, Reason: "only Activate grants from " + SourceActivation}
@@ -107,11 +110,17 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, via
 	}
 	return a.inTx(ctx, on.Tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
 		// One change to a scope at a time, so two changes can't deadlock on its rows.
-		var principals []string
+		principals := map[string]bool{}
 		for _, b := range slices.Concat(grants, revokes) {
-			principals = append(principals, b.Principal.key())
+			principals[b.Principal.key()] = true
 		}
-		if err := lock(ctx, tx, on.Tenant, []string{scope.Key()}, principals); err != nil {
+		var err error
+		if len(principals) >= maxLocks {
+			err = lockTenant(ctx, tx, on.Tenant)
+		} else {
+			err = lock(ctx, tx, on.Tenant, []string{scope.Key()}, slices.Collect(maps.Keys(principals)))
+		}
+		if err != nil {
 			return ChangeEvent{}, err
 		}
 		// Decided again in the transaction, so the actor's access and the roles are read as the
@@ -156,8 +165,8 @@ func (a *Authorizer) changing(ctx context.Context, actor Subject, on Resource) e
 // schema: another application's grants are in a schema of their own.
 const lockKey = `hashtextextended(current_schema() || '/rbac/' || $1, 0)`
 
-// maxLocks is how many scopes and principals an Import locks one by one; a larger one locks
-// the tenant, rather than fill PostgreSQL's lock table.
+// maxLocks is how many scopes and principals a change locks one by one; a larger one locks the
+// tenant, rather than fill PostgreSQL's lock table, which every session shares.
 const maxLocks = 64
 
 func lock(ctx context.Context, tx pgx.Tx, tenant string, scopes, principals []string) error {
@@ -212,6 +221,9 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 	}
 	if len(grants) == 0 {
 		return nil
+	}
+	if len(grants) > MaxBindings {
+		return fmt.Errorf("%w: an import stores at most %d grants", ErrInvalid, MaxBindings)
 	}
 	grants = slices.Clone(grants)
 	var conditions []error
@@ -389,7 +401,7 @@ func (a *Authorizer) checkBinding(roles book, tenant string, scope Scope, b Bind
 		bad("already expired")
 	}
 	if !validNote(b.Note) {
-		bad(fmt.Sprintf("a note is text of at most %d characters", maxNote))
+		bad(fmt.Sprintf("a note is text of at most %d characters", MaxNote))
 	}
 	if !validSource(b.Source) {
 		bad("a source is lowercase letters, digits and . _ : / -, starting with a letter, of at most 63")
@@ -401,10 +413,7 @@ var sourceName = regexp.MustCompile(`^([a-z][a-z0-9._:/-]{0,62})?$`)
 
 func validSource(s string) bool { return sourceName.MatchString(s) }
 
-// maxNote bounds a note, on a grant or an eligibility, and an activation's justification.
-const maxNote = 2048
-
-func validNote(s string) bool { return utf8.RuneCountInString(s) <= maxNote && validText(s) }
+func validNote(s string) bool { return utf8.RuneCountInString(s) <= MaxNote && validText(s) }
 
 // checkCondition returns why a binding's condition can't be stored. It reads nothing stored, so a
 // change checks it once, before its transaction: compiling a condition can take milliseconds,
@@ -433,8 +442,8 @@ func (a *Authorizer) conditionFaults(c Condition) []string {
 		// Stored, it would read as a condition on a grant that has none.
 		bad("a condition with a title or description has an expression")
 	}
-	if len(c.Title) > maxName || len(c.Description) > maxDescription {
-		bad(fmt.Sprintf("a condition's title is at most %d bytes and its description %d", maxName, maxDescription))
+	if utf8.RuneCountInString(c.Title) > MaxName || utf8.RuneCountInString(c.Description) > MaxDescription {
+		bad(fmt.Sprintf("a condition's title is at most %d characters and its description %d", MaxName, MaxDescription))
 	}
 	return faults
 }
