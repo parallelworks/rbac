@@ -4,7 +4,7 @@ CREATE TABLE rbac_grants (
     tenant                text        COLLATE "C" NOT NULL CHECK (tenant <> ''),
     scope_type            text        COLLATE "C" NOT NULL CHECK (scope_type ~ '^[a-z][a-z0-9_-]{0,62}$'),
     scope_id              text        COLLATE "C" NOT NULL,
-    -- The host declares its kinds besides user, group, tenant and public.
+    -- The host declares its kinds besides user, group, members and public.
     principal_kind        text        COLLATE "C" NOT NULL CHECK (principal_kind ~ '^[a-z][a-z0-9_-]{0,62}$'),
     principal_id          text        COLLATE "C" NOT NULL,
     role                  text        COLLATE "C" NOT NULL,
@@ -31,7 +31,7 @@ CREATE TABLE rbac_grants (
     conditional           boolean     GENERATED ALWAYS AS (condition <> '') STORED,
     -- The public has no id, and a tenant's members have the tenant's.
     CHECK ((principal_kind = 'public') = (principal_id = '')),
-    CHECK (principal_kind <> 'tenant' OR principal_id = tenant),
+    CHECK (principal_kind <> 'members' OR principal_id = tenant),
     -- The tenant's own scope has the tenant's id.
     CHECK (scope_id <> '' AND (scope_type <> 'tenant' OR scope_id = tenant))
 );
@@ -85,7 +85,7 @@ CREATE TABLE rbac_denies (
     scope_id              text        COLLATE "C" NOT NULL CHECK (scope_id <> '' AND (scope_type <> 'tenant' OR scope_id = tenant)),
     id                    text        COLLATE "C" NOT NULL CHECK (id ~ '^[a-z0-9][a-z0-9._-]{0,127}$'),
     name                  text        NOT NULL DEFAULT '' CHECK (length(name) <= 128),
-    -- Principals as `kind:id`; `public:` is everyone, `tenant:<id>` every member.
+    -- Principals as `kind:id`; `public:` is everyone, `members:<tenant>` every member.
     principals            text[]      COLLATE "C" NOT NULL CHECK (cardinality(principals) BETWEEN 1 AND 256),
     exempt                text[]      COLLATE "C" NOT NULL DEFAULT '{}' CHECK (cardinality(exempt) <= 256),
     -- `type:verb`, or `type:*` for every permission on a type.
@@ -112,7 +112,7 @@ CREATE TABLE rbac_eligibilities (
     scope_id       text        COLLATE "C" NOT NULL CHECK (scope_id <> '' AND (scope_type <> 'tenant' OR scope_id = tenant)),
     -- An identity or a group: the tenant's members and the public activate nothing.
     principal_kind text        COLLATE "C" NOT NULL CHECK (principal_kind ~ '^[a-z][a-z0-9_-]{0,62}$'
-                                                        AND principal_kind NOT IN ('tenant', 'public')),
+                                                        AND principal_kind NOT IN ('members', 'public')),
     principal_id   text        COLLATE "C" NOT NULL CHECK (principal_id <> ''),
     role           text        COLLATE "C" NOT NULL,
     -- The longest activation, at most a year.

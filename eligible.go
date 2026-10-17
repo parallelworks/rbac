@@ -77,10 +77,10 @@ func (a *Authorizer) checkEligibility(e Eligibility) error {
 	return nil
 }
 
-// SetEligible makes a principal eligible to activate a role on a scope, on, or changes how, as
+// SetEligibility makes a principal eligible to activate a role on a scope, on, or changes how, as
 // actor, who needs what granting the role there unconditionally would: an eligibility is a grant
 // to come.
-func (a *Authorizer) SetEligible(ctx context.Context, actor Subject, on Resource, e Eligibility) error {
+func (a *Authorizer) SetEligibility(ctx context.Context, actor Subject, on Resource, e Eligibility) error {
 	if err := a.check(on); err != nil {
 		return err
 	}
@@ -118,9 +118,9 @@ func (a *Authorizer) SetEligible(ctx context.Context, actor Subject, on Resource
 	})
 }
 
-// RevokeEligible ends a principal's eligibility to activate a role on a scope, as actor, who
+// DeleteEligibility ends a principal's eligibility to activate a role on a scope, as actor, who
 // needs what revoking the role there would. Grants activated from it keep their own ends.
-func (a *Authorizer) RevokeEligible(ctx context.Context, actor Subject, on Resource, role Role, p Principal) error {
+func (a *Authorizer) DeleteEligibility(ctx context.Context, actor Subject, on Resource, role Role, p Principal) error {
 	if err := a.check(on); err != nil {
 		return err
 	}
