@@ -715,7 +715,7 @@ func scopeGrants(scope Scope, bindings []Binding) []Grant {
 
 // inTx runs fn in a transaction and hands what it changed to Config.OnChange there.
 func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, fn func(pgx.Tx) (ChangeEvent, error)) error {
-	return pgx.BeginFunc(ctx, a.db, func(tx pgx.Tx) error {
+	return a.begin(ctx, func(tx pgx.Tx) error {
 		e, err := fn(tx)
 		if err != nil {
 			return err
@@ -723,6 +723,22 @@ func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, f
 		e.Tenant, e.Actor = tenant, actor
 		return a.report(ctx, tx, e)
 	})
+}
+
+// begin runs fn in a transaction of its own at READ COMMITTED, whatever the database's default,
+// as a change's checks must read what committed before it took its locks; under WithTx, in a
+// savepoint of the host's transaction, whose isolation the locks check. PostgreSQL refusing it
+// for a race matches ErrConflict.
+func (a *Authorizer) begin(ctx context.Context, fn func(pgx.Tx) error) error {
+	var err error
+	if db, ok := a.db.(interface {
+		BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
+	}); ok {
+		err = pgx.BeginTxFunc(ctx, db, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, fn)
+	} else {
+		err = pgx.BeginFunc(ctx, a.db, fn)
+	}
+	return conflicted(err)
 }
 
 // report hands a change to Config.OnChange in its transaction, unless it changed nothing.
@@ -882,7 +898,7 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, p Principal)
 	const batch = maxLocks / 2
 	for {
 		var n int
-		err := pgx.BeginFunc(ctx, a.db, func(tx pgx.Tx) error {
+		err := a.begin(ctx, func(tx pgx.Tx) error {
 			rows, err := tx.Query(ctx, `SELECT tenant FROM rbac_grants WHERE principal = $1
 				UNION SELECT tenant FROM rbac_eligibilities WHERE principal = $1 ORDER BY tenant LIMIT $2`, p.key(), batch)
 			if err != nil {

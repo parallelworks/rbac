@@ -358,9 +358,20 @@ var (
 	// tenant, a scope a role can't be granted on.
 	ErrInvalid = errors.New("rbac: invalid")
 	// ErrConflict is matched by a change refused because another changed what it rests on while
-	// it waited: try it again.
+	// it waited, or that PostgreSQL refused for a race, as a deadlock between host transactions:
+	// try it again.
 	ErrConflict = errors.New("rbac: conflict")
 )
+
+// conflicted makes PostgreSQL's refusals for a race match ErrConflict, keeping the error: a
+// serialization failure, a deadlock, or a lock it couldn't take.
+func conflicted(err error) error {
+	var pg *pgconn.PgError
+	if errors.As(err, &pg) && !errors.Is(err, ErrConflict) && (pg.Code == "40001" || pg.Code == "40P01" || pg.Code == "55P03") {
+		return fmt.Errorf("%w: %w", ErrConflict, err)
+	}
+	return err
+}
 
 // DeniedError is a refusal, with why.
 type DeniedError struct {
