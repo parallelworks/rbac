@@ -287,8 +287,7 @@ func (a *Authorizer) mayDeny(ctx context.Context, actor Subject, on Resource) er
 	return a.holdsDeny(ctx, a.db, actor, on)
 }
 
-// holdsDeny checks, on q, that actor holds DenyPermission(on's type) on a scope. A deny can
-// remove that permission too, from the actor among others.
+// holdsDeny checks, on q, that actor holds DenyPermission(on's type) on a scope.
 func (a *Authorizer) holdsDeny(ctx context.Context, q DB, actor Subject, on Resource) error {
 	perm := DenyPermission(on.Type)
 	au, err := a.authorityOn(ctx, q, actor, on, nil)
