@@ -54,7 +54,12 @@ type harness struct {
 
 func setup(t *testing.T, mutate ...func(*rbac.Config)) *harness {
 	t.Helper()
-	pool := pgtest.Open(t, "")
+	return setupOn(t, pgtest.Open(t, ""), mutate...)
+}
+
+// setupOn is setup on a pool of the test's own.
+func setupOn(t *testing.T, pool *pgxpool.Pool, mutate ...func(*rbac.Config)) *harness {
+	t.Helper()
 	if err := rbac.Migrate(t.Context(), pool); err != nil {
 		t.Fatal(err)
 	}
@@ -1215,6 +1220,61 @@ func TestHostTransactionsDeletingAPrincipalDontDeadlock(t *testing.T) {
 		if err != nil {
 			t.Error(err)
 		}
+	}
+}
+
+func TestChangesOnASerializableDatabase(t *testing.T) {
+	h := setupOn(t, pgtest.Open(t, "default_transaction_isolation=serializable"))
+	b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}
+	if err := h.authz.Apply(t.Context(), user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
+		t.Fatalf("a change where transactions default to SERIALIZABLE: %v", err)
+	}
+	if !allowed(t, h, user("u"), login, cluster) {
+		t.Fatal("the grant should be stored")
+	}
+}
+
+func TestDeadlockedHostTransactionsConflict(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) { c.OnChange = nil })
+	ctx := t.Context()
+	other := cluster
+	other.ID = "c2"
+	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.roles", rbac.User, "owner"), grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "owner"),
+		grant(other.Scope(), "cluster.admin", rbac.User, "owner"))
+	// Each changes a cluster, holding its tenant's lock shared, then defines a role, which takes
+	// it alone: each waits on the other, and PostgreSQL fails one.
+	var applied, wg sync.WaitGroup
+	applied.Add(2)
+	errs := make(chan error, 2)
+	for i, r := range []rbac.Resource{cluster, other} {
+		wg.Go(func() {
+			errs <- pgx.BeginFunc(ctx, h.pool, func(tx pgx.Tx) error {
+				authz := h.authz.WithTx(tx)
+				b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: fmt.Sprintf("u%d", i)}}
+				err := authz.Apply(ctx, user("owner"), r, rbac.Change{Grant: []rbac.Binding{b}})
+				applied.Done()
+				if err != nil {
+					return err
+				}
+				applied.Wait()
+				role := rbac.RoleDefinition{ID: rbac.Role(fmt.Sprintf("custom.r%d", i)), Permissions: []rbac.Permission{login}, ResourceTypes: []string{"cluster"}}
+				return authz.DefineRole(ctx, user("owner"), "t1", role)
+			})
+		})
+	}
+	wg.Wait()
+	close(errs)
+	var conflicts int
+	for err := range errs {
+		switch {
+		case errors.Is(err, rbac.ErrConflict):
+			conflicts++
+		case err != nil:
+			t.Errorf("a deadlock should match ErrConflict: %v", err)
+		}
+	}
+	if conflicts != 1 {
+		t.Fatalf("%d transactions refused for the deadlock, want 1", conflicts)
 	}
 }
 
