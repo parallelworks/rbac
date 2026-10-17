@@ -389,7 +389,7 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		if err != nil {
 			return ChangeEvent{}, err
 		}
-		ended, err := a.removeEligible(ctx, tx, tenant, "role = $2", id)
+		ended, err := a.removeEligible(ctx, tx, tenant, "role = $2 AND role LIKE 'custom.%'", id)
 		if err != nil {
 			return ChangeEvent{}, err
 		}

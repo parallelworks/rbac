@@ -67,12 +67,34 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 	if len(grants)+len(revokes) == 0 {
 		return nil
 	}
+	return a.change(ctx, actor, on, grants, revokes, nil, func(tx pgx.Tx) (ChangeEvent, error) {
+		revoked, err := a.revoke(ctx, tx, on.Tenant, scope, revokes)
+		if err != nil {
+			return ChangeEvent{}, err
+		}
+		granted, err := a.upsert(ctx, tx, on.Tenant, actor.Principal, scopeGrants(scope, grants))
+		return ChangeEvent{Granted: granted, Revoked: revoked}, err
+	})
+}
+
+// change makes a change to the grants on one scope as actor, or to eligibilities, which are
+// grants to come, with Apply's checks before its transaction and again under its locks, and
+// then write. check is what else the change needs, run once the actor may make it.
+func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, grants, revokes []Binding,
+	check func() error, write func(pgx.Tx) (ChangeEvent, error),
+) error {
+	scope := on.Scope()
 	if err := a.changing(ctx, actor.Principal, on); err != nil {
 		return err
 	}
 	au, err := a.mayChange(ctx, a.db, actor, on, grants, revokes)
 	if err != nil {
 		return err
+	}
+	if check != nil {
+		if err := check(); err != nil {
+			return err
+		}
 	}
 	if err := a.validate(ctx, au.roles, on.Tenant, scope, grants, revokes); err != nil {
 		return err
@@ -99,12 +121,7 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 		if err := errors.Join(bad...); err != nil {
 			return ChangeEvent{}, err
 		}
-		revoked, err := a.revoke(ctx, tx, on.Tenant, scope, revokes)
-		if err != nil {
-			return ChangeEvent{}, err
-		}
-		granted, err := a.upsert(ctx, tx, on.Tenant, actor.Principal, scopeGrants(scope, grants))
-		return ChangeEvent{Granted: granted, Revoked: revoked}, err
+		return write(tx)
 	})
 }
 
@@ -921,17 +938,16 @@ func (a *Authorizer) delete(ctx context.Context, tenant string, lock func(pgx.Tx
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
-	roles, denies, where := del.roles, del.denies, del.where
 	return a.inTx(ctx, tenant, Principal{}, func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lock(tx); err != nil {
 			return ChangeEvent{}, err
 		}
 		var e ChangeEvent
 		var err error
-		if e.Ineligible, err = a.removeEligible(ctx, tx, tenant, where, args...); err != nil {
+		if e.Ineligible, err = a.removeEligible(ctx, tx, tenant, del.where, args...); err != nil {
 			return ChangeEvent{}, err
 		}
-		if roles {
+		if del.roles {
 			rows, err := tx.Query(ctx, `DELETE FROM rbac_roles WHERE tenant = $1 RETURNING id`, tenant)
 			if err != nil {
 				return ChangeEvent{}, err
@@ -940,8 +956,8 @@ func (a *Authorizer) delete(ctx context.Context, tenant string, lock func(pgx.Tx
 				return ChangeEvent{}, err
 			}
 		}
-		if denies != "" {
-			query, args := `DELETE FROM rbac_denies WHERE tenant = $1 AND `+denies, append([]any{tenant}, args...)
+		if del.denies != "" {
+			query, args := `DELETE FROM rbac_denies WHERE tenant = $1 AND `+del.denies, append([]any{tenant}, args...)
 			// Only OnChange reads what was removed, as for grants.
 			if a.cfg.OnChange == nil {
 				if _, err := tx.Exec(ctx, query, args...); err != nil {
@@ -957,7 +973,7 @@ func (a *Authorizer) delete(ctx context.Context, tenant string, lock func(pgx.Tx
 				}
 			}
 		}
-		e.Revoked, err = a.remove(ctx, tx, tenant, where, args...)
+		e.Revoked, err = a.remove(ctx, tx, tenant, del.where, args...)
 		return e, err
 	})
 }
@@ -991,8 +1007,8 @@ func removed[T any](ctx context.Context, a *Authorizer, tx pgx.Tx, table, column
 }
 
 // DeleteExpired removes grants and eligibilities that have expired, which no longer give or
-// allow anything, and returns how many. It passes over grants a change is holding, rather than wait on it, so the next run
-// removes those.
+// allow anything, and returns how many. It passes over those a change is holding, rather than
+// wait on it, so the next run removes them.
 func (a *Authorizer) DeleteExpired(ctx context.Context) (int64, error) {
 	tag, err := a.db.Exec(ctx, `
 		DELETE FROM rbac_grants WHERE id IN (
