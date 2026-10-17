@@ -97,7 +97,7 @@ func (a *Authorizer) SetEligible(ctx context.Context, actor Subject, on Resource
 		return strings.Compare(x.key(), y.key())
 	}), func(x, y Principal) bool { return x == y })
 	check := func() error { return a.checkEligibility(e) }
-	return a.change(ctx, actor, on, []Binding{e.binding()}, nil, check, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.change(ctx, actor, on, ViaEligibility, []Binding{e.binding()}, nil, check, func(tx pgx.Tx) (ChangeEvent, error) {
 		// An expired eligibility that is still stored allowed nothing, so setting it again records
 		// the new actor and time.
 		rows, err := tx.Query(ctx, `
@@ -133,7 +133,7 @@ func (a *Authorizer) RevokeEligible(ctx context.Context, actor Subject, on Resou
 		return err
 	}
 	scope := on.Scope()
-	return a.change(ctx, actor, on, nil, []Binding{{Role: role, Principal: p}}, nil, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.change(ctx, actor, on, ViaEligibility, nil, []Binding{{Role: role, Principal: p}}, nil, func(tx pgx.Tx) (ChangeEvent, error) {
 		rows, err := tx.Query(ctx, `DELETE FROM rbac_eligibilities WHERE tenant = $1 AND scope = $2 AND principal = $3 AND role = $4
 			RETURNING `+eligibilityColumns, on.Tenant, scope.Key(), p.key(), role)
 		if err != nil {
@@ -161,7 +161,7 @@ type Activation struct {
 // allows: a grant of its own from SourceActivation, beside any grant s holds, lasting
 // act.Duration, with act.Justification as its note. It needs no permission to change grants, the
 // eligibility being the authority, but a constraint that stops changes to grants on the scope's
-// type stops it, and Config.ValidatePrincipal is asked about s, as for any grant. Where the
+// type stops it, and Config.ValidateGrant is asked about it, as about any grant. Where the
 // eligibility names approvers, the host's approval flow activates for s once one approves,
 // passing act.Approver and, in ctx, the request s made (WithRequest), which Requires reads.
 func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act Activation) (Grant, error) {
@@ -176,7 +176,7 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 	}
 	scope := on.Scope()
 	b := Binding{Role: act.Role, Principal: s.Principal, Source: SourceActivation, Note: act.Justification}
-	if err := a.changing(ctx, s.Principal, on); err != nil {
+	if err := a.changing(ctx, s, on); err != nil {
 		return Grant{}, err
 	}
 	// Bounded before eligible rounds it up to seconds, which near the largest Duration overflows.
@@ -188,7 +188,7 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 	if err != nil {
 		return Grant{}, err
 	}
-	if err := a.validate(ctx, roles, on.Tenant, scope, []Binding{b}, nil); err != nil {
+	if err := a.validate(ctx, roles, s, ViaActivation, on.Tenant, scope, []Binding{b}, nil); err != nil {
 		return Grant{}, err
 	}
 	var activated Grant

@@ -67,7 +67,8 @@ func setupOn(t *testing.T, pool *pgxpool.Pool, mutate ...func(*rbac.Config)) *ha
 	cfg := rbac.Config{
 		Catalog:        catalog,
 		ContainerTypes: []string{"org", "workspace"},
-		ValidatePrincipal: func(_ context.Context, _ rbac.DB, tenant string, p rbac.Principal) error {
+		ValidateGrant: func(_ context.Context, _ rbac.DB, in rbac.GrantInput) error {
+			p := in.Binding.Principal
 			switch {
 			case strings.HasPrefix(p.ID, "outsider"):
 				return fmt.Errorf("%w: not a member", rbac.ErrInvalid)
@@ -115,7 +116,8 @@ func (h *harness) path(t *testing.T, r rbac.Resource) []string {
 // constrain configures a constraint that removes p everywhere.
 func constrain(name string, p rbac.Permission) func(*rbac.Config) {
 	return func(c *rbac.Config) {
-		c.Constraints = []rbac.Constraint{{Name: name, Deny: func(_ context.Context, _ rbac.DB, _, _ string, q rbac.Permission) (bool, error) {
+		c.Constraints = []rbac.Constraint{{Name: name, Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			q := in.Permission
 			return q == p, nil
 		}}}
 	}
@@ -123,7 +125,7 @@ func constrain(name string, p rbac.Permission) func(*rbac.Config) {
 
 func (h *harness) seed(t *testing.T, grants ...rbac.Grant) {
 	t.Helper()
-	if err := h.authz.Import(t.Context(), "t1", grants); err != nil {
+	if err := h.authz.Import(t.Context(), host, "t1", grants); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -131,6 +133,9 @@ func (h *harness) seed(t *testing.T, grants ...rbac.Grant) {
 func grant(scope rbac.Scope, role rbac.Role, kind rbac.PrincipalKind, id string) rbac.Grant {
 	return rbac.Grant{Scope: scope, Binding: rbac.Binding{Role: role, Principal: rbac.Principal{Kind: kind, ID: id}}}
 }
+
+// host is who the host's own writes, Import and the deletes, are made as.
+var host = rbac.Principal{Kind: rbac.User, ID: "host"}
 
 func user(id string, groups ...string) rbac.Subject {
 	return rbac.Subject{Principal: rbac.Principal{Kind: rbac.User, ID: id}, Groups: groups, Tenants: []string{"t1"}}
@@ -146,32 +151,32 @@ func allowed(t *testing.T, h *harness, s rbac.Subject, p rbac.Permission, r rbac
 }
 
 func TestNewRejectsBadConfiguration(t *testing.T) {
-	ok := func(context.Context, rbac.DB, string, rbac.Principal) error { return nil }
+	ok := func(context.Context, rbac.DB, rbac.GrantInput) error { return nil }
 	for name, cfg := range map[string]rbac.Config{
 		"no principal check":    {Catalog: catalog},
-		"duplicate role":        {Catalog: append(slices.Clone(catalog), catalog[0]), ValidatePrincipal: ok},
-		"bad permission":        {Catalog: []rbac.RoleDefinition{{ID: "r", Permissions: []rbac.Permission{"login"}, ResourceTypes: []string{"cluster"}}}, ValidatePrincipal: ok},
-		"no permissions":        {Catalog: []rbac.RoleDefinition{{ID: "r", ResourceTypes: []string{"cluster"}}}, ValidatePrincipal: ok},
-		"bad container":         {Catalog: catalog, ContainerTypes: []string{"tenant"}, ValidatePrincipal: ok},
-		"a kind every host has": {Catalog: catalog, PrincipalKinds: []rbac.PrincipalKind{rbac.Group}, ValidatePrincipal: ok},
-		"a malformed kind":      {Catalog: catalog, PrincipalKinds: []rbac.PrincipalKind{"Service Account"}, ValidatePrincipal: ok},
+		"duplicate role":        {Catalog: append(slices.Clone(catalog), catalog[0]), ValidateGrant: ok},
+		"bad permission":        {Catalog: []rbac.RoleDefinition{{ID: "r", Permissions: []rbac.Permission{"login"}, ResourceTypes: []string{"cluster"}}}, ValidateGrant: ok},
+		"no permissions":        {Catalog: []rbac.RoleDefinition{{ID: "r", ResourceTypes: []string{"cluster"}}}, ValidateGrant: ok},
+		"bad container":         {Catalog: catalog, ContainerTypes: []string{"tenant"}, ValidateGrant: ok},
+		"a kind every host has": {Catalog: catalog, PrincipalKinds: []rbac.PrincipalKind{rbac.Group}, ValidateGrant: ok},
+		"a malformed kind":      {Catalog: catalog, PrincipalKinds: []rbac.PrincipalKind{"Service Account"}, ValidateGrant: ok},
 		"a public admin role": {Catalog: []rbac.RoleDefinition{{
 			ID: "r", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}, Public: true,
-		}}, ValidatePrincipal: ok},
+		}}, ValidateGrant: ok},
 		"a grantable role not in the catalog": {Catalog: append(slices.Clone(catalog), rbac.RoleDefinition{
 			ID: "r", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"nope"},
-		}), ValidatePrincipal: ok},
+		}), ValidateGrant: ok},
 		"grantable roles without a grant permission": {Catalog: append(slices.Clone(catalog), rbac.RoleDefinition{
 			ID: "r", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.login"},
-		}), ValidatePrincipal: ok},
+		}), ValidateGrant: ok},
 		"a built-in role named like a custom one": {Catalog: append(slices.Clone(catalog), rbac.RoleDefinition{
 			ID: "custom.r", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"},
-		}), ValidatePrincipal: ok},
+		}), ValidateGrant: ok},
 		"a public privileged role": {Catalog: []rbac.RoleDefinition{{
 			ID: "r", Permissions: []rbac.Permission{root}, ResourceTypes: []string{"cluster"}, Privileged: true, Public: true,
-		}}, ValidatePrincipal: ok},
-		"unnamed constraint": {Catalog: catalog, ValidatePrincipal: ok, Constraints: []rbac.Constraint{{
-			Deny: func(context.Context, rbac.DB, string, string, rbac.Permission) (bool, error) { return true, nil },
+		}}, ValidateGrant: ok},
+		"unnamed constraint": {Catalog: catalog, ValidateGrant: ok, Constraints: []rbac.Constraint{{
+			Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) { return true, nil },
 		}}},
 	} {
 		if _, err := rbac.New(&pgxpool.Pool{}, cfg); err == nil {
@@ -192,7 +197,7 @@ func TestAuthorizeThroughEveryScope(t *testing.T) {
 		grant(rbac.Scope{Type: "org", ID: "o1"}, "workspace.admin", rbac.User, "ws-admin"),
 	)
 	// The same scopes, in another tenant.
-	if err := h.authz.Import(t.Context(), "t2", []rbac.Grant{
+	if err := h.authz.Import(t.Context(), host, "t2", []rbac.Grant{
 		grant(cluster.Scope(), "cluster.login", rbac.User, "elsewhere-tenant"),
 		grant(rbac.TenantRoot("t2"), "cluster.login", rbac.User, "elsewhere-tenant"),
 	}); err != nil {
@@ -403,7 +408,7 @@ func TestFilterOnATenantColumnThatIsNotText(t *testing.T) {
 	if _, err := h.pool.Exec(ctx, `INSERT INTO things VALUES ($1, $2, $3)`, r.Tenant, r.ID, h.path(t, r)); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.authz.Import(ctx, r.Tenant, []rbac.Grant{grant(r.Scope(), "cluster.login", rbac.User, "u")}); err != nil {
+	if err := h.authz.Import(ctx, host, r.Tenant, []rbac.Grant{grant(r.Scope(), "cluster.login", rbac.User, "u")}); err != nil {
 		t.Fatal(err)
 	}
 	pred, err := h.authz.Filter(ctx, rbac.Subject{Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}, login, r.Tenant, "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
@@ -544,7 +549,7 @@ func TestApplyReportsARoleTheScopeCantTakeAsInvalid(t *testing.T) {
 func TestApplyChecksTheActorBeforePrincipals(t *testing.T) {
 	asked := 0
 	h := setup(t, func(c *rbac.Config) {
-		c.ValidatePrincipal = func(context.Context, rbac.DB, string, rbac.Principal) error {
+		c.ValidateGrant = func(context.Context, rbac.DB, rbac.GrantInput) error {
 			asked++
 			return errors.New("not a member")
 		}
@@ -556,18 +561,130 @@ func TestApplyChecksTheActorBeforePrincipals(t *testing.T) {
 	}
 }
 
-func TestApplyAsksAboutEachPrincipalOnce(t *testing.T) {
-	asked := 0
+func TestTheHostIsAskedAboutEachGrant(t *testing.T) {
+	var asked []rbac.GrantInput
+	robot := rbac.PrincipalKind("service_account")
 	h := setup(t, func(c *rbac.Config) {
-		c.ValidatePrincipal = func(context.Context, rbac.DB, string, rbac.Principal) error {
-			asked++
+		c.PrincipalKinds = []rbac.PrincipalKind{robot}
+		c.ValidateGrant = func(_ context.Context, _ rbac.DB, in rbac.GrantInput) error {
+			asked = append(asked, in)
+			// A host's policy: service accounts hold no privileged role.
+			if in.Binding.Principal.Kind == robot && in.Role.Privileged {
+				return fmt.Errorf("%w: service accounts hold no privileged role", rbac.ErrInvalid)
+			}
 			return nil
 		}
 	})
-	p := rbac.Principal{Kind: rbac.User, ID: "u"}
-	c := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: p}, {Role: "cluster.sudo", Principal: p}}}
-	if err := h.authz.Apply(t.Context(), user("owner"), cluster, c); err != nil || asked != 1 {
-		t.Fatalf("Apply = %v after %d principal lookups", err, asked)
+	ctx := t.Context()
+	bot := rbac.Principal{Kind: robot, ID: "ci"}
+	login := rbac.Binding{Role: "cluster.login", Principal: bot}
+	sudo := rbac.Binding{Role: "cluster.sudo", Principal: bot}
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{login, sudo}}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a privileged role for a service account: %v", err)
+	}
+	if len(asked) != 2 || asked[1].Role.ID != "cluster.sudo" || !asked[1].Role.Privileged || asked[1].Actor.Principal != user("owner").Principal ||
+		asked[1].Via != rbac.ViaApply || asked[1].Scope != cluster.Scope() || asked[1].Tenant != "t1" {
+		t.Fatalf("asked = %+v", asked)
+	}
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{login}}); err != nil {
+		t.Fatal(err)
+	}
+	for via, try := range map[rbac.Via]func() error{
+		rbac.ViaImport: func() error {
+			return h.authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: sudo}})
+		},
+		rbac.ViaEligibility: func() error {
+			return h.authz.SetEligible(ctx, user("owner"), cluster, rbac.Eligibility{Role: sudo.Role, Principal: bot, MaxDuration: time.Hour})
+		},
+	} {
+		asked = nil
+		if err := try(); !errors.Is(err, rbac.ErrInvalid) || len(asked) != 1 || asked[0].Via != via {
+			t.Errorf("%s: %v, asked %+v", via, err, asked)
+		} else if via == rbac.ViaImport && asked[0].Actor.Principal != host {
+			t.Errorf("Import's actor: %+v", asked[0])
+		}
+	}
+	// Activating is asked about too, as the grant it makes.
+	e := rbac.Eligibility{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: time.Hour}
+	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
+		t.Fatal(err)
+	}
+	asked = nil
+	if _, err := h.authz.Activate(ctx, user("x"), cluster, rbac.Activation{Role: e.Role, Duration: time.Minute, Justification: "x"}); err != nil ||
+		len(asked) != 1 || asked[0].Via != rbac.ViaActivation || asked[0].Binding.Source != rbac.SourceActivation {
+		t.Fatalf("activating: %v, asked %+v", err, asked)
+	}
+}
+
+func TestConstraintsSeeWhoAndWhere(t *testing.T) {
+	prod := rbac.Scope{Type: "workspace", ID: "prod"}
+	// No root under prod but for the SRE group; a search, which can't see the resource, finds none.
+	h := setup(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "prod root", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if in.Permission != root {
+				return false, nil
+			}
+			if in.Resource == nil || in.Subject == nil {
+				return true, nil
+			}
+			return slices.Contains(in.Resource.Ancestors, prod) && !slices.Contains(in.Subject.Groups, "sre"), nil
+		}}}
+	})
+	ctx := t.Context()
+	inProd := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "p1", Ancestors: []rbac.Scope{prod, {Type: "org", ID: "o1"}}}
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.sudo", rbac.User, "dev"), grant(rbac.TenantRoot("t1"), "cluster.sudo", rbac.User, "sre"))
+	if err := h.authz.Authorize(ctx, user("dev"), root, cluster); err != nil {
+		t.Fatalf("root outside prod: %v", err)
+	}
+	if err := h.authz.Authorize(ctx, user("dev"), root, inProd); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("root in prod outside the SRE group: %v", err)
+	}
+	if err := h.authz.Authorize(ctx, user("sre", "sre"), root, inProd); err != nil {
+		t.Fatalf("root in prod for the SRE group: %v", err)
+	}
+	if d, err := h.authz.Explain(ctx, user("dev"), root, inProd); err != nil || d.DeniedBy != "prod root" {
+		t.Fatalf("Explain = %+v, %v", d, err)
+	}
+	if reach, err := h.authz.Reachable(ctx, user("sre", "sre"), root, "t1", "cluster"); err != nil || reach.All || len(reach.Scopes) > 0 {
+		t.Fatalf("a search can't see the resource, so a constraint on some removes it from all: %+v, %v", reach, err)
+	}
+	if holders, err := h.authz.Holders(ctx, inProd, root); err != nil || len(holders) > 0 {
+		t.Fatalf("Holders can't see each holder, so a constraint on some removes all: %v, %v", holders, err)
+	}
+}
+
+func TestTrustedWritesNameTheirActor(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	for name, actor := range map[string]rbac.Principal{
+		"no one":             {},
+		"a group":            {Kind: rbac.Group, ID: "g"},
+		"the public":         {Kind: rbac.Public},
+		"an undeclared kind": {Kind: "robot", ID: "r"},
+	} {
+		if err := h.authz.Import(ctx, actor, "t1", []rbac.Grant{g}); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("Import as %s: %v", name, err)
+		}
+		if err := h.authz.DeleteScope(ctx, actor, "t1", cluster.Scope()); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("DeleteScope as %s: %v", name, err)
+		}
+		if err := h.authz.DeletePrincipalEverywhere(ctx, actor, g.Principal); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("DeletePrincipalEverywhere as %s: %v", name, err)
+		}
+	}
+	h.events = nil
+	h.seed(t, g)
+	got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{g.Principal}})
+	if err != nil || len(got) != 1 || got[0].CreatedBy != host || len(h.events) != 1 || h.events[0].Actor != host {
+		t.Fatalf("an imported grant should name its actor: %+v, %+v, %v", got, h.events, err)
+	}
+	h.events = nil
+	if err := h.authz.DeletePrincipal(ctx, host, "t1", g.Principal); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.events) != 1 || h.events[0].Actor != host || len(h.events[0].Revoked) != 1 {
+		t.Fatalf("a delete should name its actor: %+v", h.events)
 	}
 }
 
@@ -676,7 +793,8 @@ func TestWithTxCommitsWithTheHost(t *testing.T) {
 
 func TestHooksSeeTheHostsTransaction(t *testing.T) {
 	h := setup(t, func(c *rbac.Config) {
-		c.ValidatePrincipal = func(ctx context.Context, q rbac.DB, _ string, p rbac.Principal) error {
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			p := in.Binding.Principal
 			var member bool
 			if err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM members WHERE id = $1)`, p.ID).Scan(&member); err != nil {
 				return err
@@ -726,16 +844,16 @@ func TestGrantsAndDeletes(t *testing.T) {
 	}
 
 	h.events = nil
-	if err := h.authz.DeletePrincipal(ctx, "t1", rbac.Principal{Kind: rbac.Group, ID: "g"}); err != nil {
+	if err := h.authz.DeletePrincipal(ctx, host, "t1", rbac.Principal{Kind: rbac.Group, ID: "g"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.authz.DeleteScope(ctx, "t1", cluster.Scope()); err != nil {
+	if err := h.authz.DeleteScope(ctx, host, "t1", cluster.Scope()); err != nil {
 		t.Fatal(err)
 	}
 	if len(h.events) != 2 || len(h.events[0].Revoked) != 1 || len(h.events[1].Revoked) != 2 {
 		t.Fatalf("deletes should report what they removed: %+v", h.events)
 	}
-	if err := h.authz.DeleteTenant(ctx, "t1"); err != nil {
+	if err := h.authz.DeleteTenant(ctx, host, "t1"); err != nil {
 		t.Fatal(err)
 	}
 	if allowed(t, h, user("v"), login, cluster) {
@@ -765,7 +883,7 @@ func TestCreatorsGetARoleInTheHostsTransaction(t *testing.T) {
 		grant(ws.Scope(), "workspace.admin", rbac.User, "maker"),
 		grant(ws.Scope(), "cluster.login", rbac.User, "maker"),
 	}
-	if err := authz.Import(ctx, "t1", creator); err != nil {
+	if err := authz.Import(ctx, host, "t1", creator); err != nil {
 		t.Fatal(err)
 	}
 	b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "friend"}}
@@ -805,10 +923,10 @@ func TestHooksCanUseTheBusyPool(t *testing.T) {
 	}
 	guard := rbac.RoleDefinition{ID: "guard", Permissions: []rbac.Permission{rbac.DenyPermission("cluster")}, ResourceTypes: []string{"cluster"}}
 	authz, err := rbac.New(pool, rbac.Config{
-		Catalog:           append(slices.Clone(catalog), guard),
-		ContainerTypes:    []string{"org", "workspace"},
-		ValidatePrincipal: func(ctx context.Context, _ rbac.DB, _ string, _ rbac.Principal) error { return query(ctx) },
-		Constraints: []rbac.Constraint{{Name: "lookup", Deny: func(ctx context.Context, _ rbac.DB, _, _ string, _ rbac.Permission) (bool, error) {
+		Catalog:        append(slices.Clone(catalog), guard),
+		ContainerTypes: []string{"org", "workspace"},
+		ValidateGrant:  func(ctx context.Context, _ rbac.DB, _ rbac.GrantInput) error { return query(ctx) },
+		Constraints: []rbac.Constraint{{Name: "lookup", Deny: func(ctx context.Context, _ rbac.DB, _ rbac.ConstraintInput) (bool, error) {
 			return false, query(ctx)
 		}}},
 	})
@@ -822,7 +940,7 @@ func TestHooksCanUseTheBusyPool(t *testing.T) {
 		t.Fatalf("a hook on the pool the change runs on: %v", err)
 	}
 	tenant := rbac.TenantRoot("t1")
-	if err := authz.Import(ctx, "t1", []rbac.Grant{grant(tenant, "tenant.roles", rbac.User, "owner"), grant(tenant, "cluster.login", rbac.User, "owner")}); err != nil {
+	if err := authz.Import(ctx, host, "t1", []rbac.Grant{grant(tenant, "tenant.roles", rbac.User, "owner"), grant(tenant, "cluster.login", rbac.User, "owner")}); err != nil {
 		t.Fatal(err)
 	}
 	r := rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
@@ -832,7 +950,7 @@ func TestHooksCanUseTheBusyPool(t *testing.T) {
 	if err := authz.DeleteRole(ctx, user("owner"), "t1", r.ID); err != nil {
 		t.Fatalf("a hook on the pool a role's deletion runs on: %v", err)
 	}
-	if err := authz.Import(ctx, "t1", []rbac.Grant{grant(tenant, "guard", rbac.User, "owner")}); err != nil {
+	if err := authz.Import(ctx, host, "t1", []rbac.Grant{grant(tenant, "guard", rbac.User, "owner")}); err != nil {
 		t.Fatal(err)
 	}
 	d := rbac.Deny{ID: "d", Permissions: []rbac.Permission{root}, Principals: []rbac.Principal{{Kind: rbac.Public}}}
@@ -977,7 +1095,7 @@ func TestDeleteScopeRemovesAGrantMadeWhileItWaits(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
-	go func() { done <- h.authz.DeleteScope(ctx, "t1", cluster.Scope()) }()
+	go func() { done <- h.authz.DeleteScope(ctx, host, "t1", cluster.Scope()) }()
 	// Commit only once DeleteScope has either finished or is waiting on the scope's lock.
 	for waiting := false; !waiting; {
 		select {
@@ -1161,7 +1279,7 @@ func TestConcurrentChangesAcrossScopesAllCommit(t *testing.T) {
 	}
 	for range 2 {
 		run(func(int) error {
-			return h.authz.Import(ctx, "t1", []rbac.Grant{
+			return h.authz.Import(ctx, host, "t1", []rbac.Grant{
 				grant(cluster.Scope(), "cluster.login", rbac.User, "a"),
 				grant(cluster.Scope(), "cluster.login", rbac.User, "b"),
 				grant(ws, "cluster.login", rbac.User, "a"),
@@ -1180,7 +1298,9 @@ func TestConcurrentChangesAcrossScopesAllCommit(t *testing.T) {
 		})
 	}
 	for range 2 {
-		run(func(int) error { return h.authz.DeletePrincipal(ctx, "t1", rbac.Principal{Kind: rbac.User, ID: "a"}) })
+		run(func(int) error {
+			return h.authz.DeletePrincipal(ctx, host, "t1", rbac.Principal{Kind: rbac.User, ID: "a"})
+		})
 	}
 	wg.Wait()
 	close(errs)
@@ -1211,7 +1331,7 @@ func TestHostTransactionsDeletingAPrincipalDontDeadlock(t *testing.T) {
 					return err
 				}
 				applied.Wait()
-				return authz.DeletePrincipal(ctx, "t1", gone)
+				return authz.DeletePrincipal(ctx, host, "t1", gone)
 			})
 		})
 	}
@@ -1295,7 +1415,7 @@ func TestPublicAccess(t *testing.T) {
 	if err := h.authz.Apply(ctx, user("admin"), workspace, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: public}}}); !errors.Is(err, rbac.ErrInvalid) {
 		t.Fatalf("granting a role not marked public to the public: %v", err)
 	}
-	if err := h.authz.Import(ctx, "t1", []rbac.Grant{grant(workspace.Scope(), "cluster.login", rbac.Public, "")}); !errors.Is(err, rbac.ErrInvalid) {
+	if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{grant(workspace.Scope(), "cluster.login", rbac.Public, "")}); !errors.Is(err, rbac.ErrInvalid) {
 		t.Fatalf("importing a role not marked public for the public: %v", err)
 	}
 
@@ -1327,7 +1447,7 @@ func TestPublicAccess(t *testing.T) {
 		}
 	}
 
-	if err := h.authz.DeletePrincipal(ctx, "t1", public); err != nil {
+	if err := h.authz.DeletePrincipal(ctx, host, "t1", public); err != nil {
 		t.Fatal(err)
 	}
 	if allowed(t, h, anonymous, view, cluster) {
@@ -1347,8 +1467,8 @@ func TestAPublicGrantGivesOnlyWhileItsRoleIsPublic(t *testing.T) {
 	viewer.Public, viewer.Privileged, viewer.Permissions = false, true, []rbac.Permission{view, root}
 	later, err := rbac.New(h.pool, rbac.Config{
 		Catalog: append(slices.Clone(catalog), viewer), ContainerTypes: []string{"org", "workspace"},
-		ValidatePrincipal: func(context.Context, rbac.DB, string, rbac.Principal) error { return nil },
-		Now:               func() time.Time { return h.now },
+		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+		Now:           func() time.Time { return h.now },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1374,7 +1494,8 @@ func TestHostsCanRefusePublicAccess(t *testing.T) {
 	viewer := rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
 	h := setup(t, func(c *rbac.Config) {
 		c.Catalog = append(slices.Clone(c.Catalog), viewer)
-		c.ValidatePrincipal = func(_ context.Context, _ rbac.DB, _ string, p rbac.Principal) error {
+		c.ValidateGrant = func(_ context.Context, _ rbac.DB, in rbac.GrantInput) error {
+			p := in.Binding.Principal
 			if p.Kind == rbac.Public {
 				return fmt.Errorf("%w: public access is off", rbac.ErrInvalid)
 			}
@@ -1426,7 +1547,7 @@ func TestMachineIdentities(t *testing.T) {
 	// A kind the host stops declaring can still be revoked.
 	undeclared, err := rbac.New(h.pool, rbac.Config{
 		Catalog: catalog, ContainerTypes: []string{"org", "workspace"},
-		ValidatePrincipal: func(context.Context, rbac.DB, string, rbac.Principal) error { return nil },
+		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1458,7 +1579,7 @@ func TestTheTableRefusesMalformedPrincipals(t *testing.T) {
 			t.Errorf("stored a grant to %+v", p)
 		}
 	}
-	if err := h.authz.DeletePrincipal(t.Context(), "t1", rbac.Principal{}); !errors.Is(err, rbac.ErrInvalid) {
+	if err := h.authz.DeletePrincipal(t.Context(), host, "t1", rbac.Principal{}); !errors.Is(err, rbac.ErrInvalid) {
 		t.Errorf("DeletePrincipal of no one: %v", err)
 	}
 }
@@ -1553,11 +1674,11 @@ func TestIdentitiesFromOtherTenants(t *testing.T) {
 		t.Fatalf("an identity the host doesn't let in: %v", err)
 	}
 
-	if err := h.authz.Import(ctx, "t2", []rbac.Grant{grant(rbac.TenantRoot("t2"), "cluster.login", rbac.User, "partner")}); err != nil {
+	if err := h.authz.Import(ctx, host, "t2", []rbac.Grant{grant(rbac.TenantRoot("t2"), "cluster.login", rbac.User, "partner")}); err != nil {
 		t.Fatal(err)
 	}
 	h.events = nil
-	if err := h.authz.DeletePrincipalEverywhere(ctx, partner.Principal); err != nil {
+	if err := h.authz.DeletePrincipalEverywhere(ctx, host, partner.Principal); err != nil {
 		t.Fatal(err)
 	}
 	if len(h.events) != 2 || h.events[0].Tenant != "t1" || h.events[1].Tenant != "t2" {
@@ -1569,7 +1690,7 @@ func TestIdentitiesFromOtherTenants(t *testing.T) {
 		}
 	}
 	for _, p := range []rbac.Principal{rbac.TenantMembers("t1"), {Kind: rbac.Public}, {}} {
-		if err := h.authz.DeletePrincipalEverywhere(ctx, p); !errors.Is(err, rbac.ErrInvalid) {
+		if err := h.authz.DeletePrincipalEverywhere(ctx, host, p); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("DeletePrincipalEverywhere(%+v): %v", p, err)
 		}
 	}
@@ -1667,7 +1788,7 @@ func TestDeletePrincipalEverywhereAcrossManyTenants(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.events = nil
-	if err := h.authz.DeletePrincipalEverywhere(ctx, support); err != nil {
+	if err := h.authz.DeletePrincipalEverywhere(ctx, host, support); err != nil {
 		t.Fatal(err)
 	}
 	var left int
@@ -1748,7 +1869,7 @@ func TestCustomRoles(t *testing.T) {
 	if grantable, err := h.authz.Grantable(ctx, admin, cluster); err != nil || !slices.ContainsFunc(grantable, func(r rbac.RoleDefinition) bool { return r.ID == operator.ID }) {
 		t.Fatalf("Grantable = %+v, %v", grantable, err)
 	}
-	if err := h.authz.Import(ctx, "t2", []rbac.Grant{grant(rbac.TenantRoot("t2"), operator.ID, rbac.User, "op")}); !errors.Is(err, rbac.ErrInvalid) {
+	if err := h.authz.Import(ctx, host, "t2", []rbac.Grant{grant(rbac.TenantRoot("t2"), operator.ID, rbac.User, "op")}); !errors.Is(err, rbac.ErrInvalid) {
 		t.Fatalf("granting a custom role in a tenant that doesn't define it: %v", err)
 	}
 
@@ -1770,7 +1891,7 @@ func TestCustomRoles(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.events = nil
-	if err := h.authz.DeleteTenant(ctx, "t1"); err != nil {
+	if err := h.authz.DeleteTenant(ctx, host, "t1"); err != nil {
 		t.Fatal(err)
 	}
 	if custom, err := h.authz.CustomRoles(ctx, "t1"); err != nil || len(custom) != 0 {
@@ -1816,7 +1937,7 @@ func TestDefiningARoleChecksTheActor(t *testing.T) {
 		}
 	}
 	for _, p := range []rbac.Principal{rbac.TenantMembers("t1"), {Kind: rbac.Public}} {
-		if err := h.authz.Import(ctx, "t1", []rbac.Grant{{Scope: tenant, Binding: rbac.Binding{Role: "tenant.roles", Principal: p}}}); !errors.Is(err, rbac.ErrInvalid) {
+		if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: tenant, Binding: rbac.Binding{Role: "tenant.roles", Principal: p}}}); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("letting %s define roles: %v", p.Kind, err)
 		}
 	}
@@ -2080,7 +2201,7 @@ func TestCustomRolesFollowTheCatalog(t *testing.T) {
 	}
 	later, err := rbac.New(h.pool, rbac.Config{
 		Catalog: without, ContainerTypes: []string{"org", "workspace"},
-		ValidatePrincipal: func(context.Context, rbac.DB, string, rbac.Principal) error { return nil },
+		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2129,7 +2250,7 @@ func TestPublicCustomRolesFollowTheCatalog(t *testing.T) {
 	later = append(later, rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}})
 	authz, err := rbac.New(h.pool, rbac.Config{
 		Catalog: later, ContainerTypes: []string{"org", "workspace"},
-		ValidatePrincipal: func(context.Context, rbac.DB, string, rbac.Principal) error { return nil },
+		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2226,7 +2347,8 @@ func TestDefiningRolesIsCanonicalBoundedAndMarksPrivilege(t *testing.T) {
 func TestDeletingARoleRespectsConstraints(t *testing.T) {
 	stop := false
 	h := setup(t, func(c *rbac.Config) {
-		c.Constraints = []rbac.Constraint{{Name: "managed elsewhere", Deny: func(_ context.Context, _ rbac.DB, _, _ string, p rbac.Permission) (bool, error) {
+		c.Constraints = []rbac.Constraint{{Name: "managed elsewhere", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			p := in.Permission
 			return stop && p == grantC, nil
 		}}}
 	})
@@ -2288,8 +2410,8 @@ func TestChangesNeedReadCommitted(t *testing.T) {
 	authz := h.authz.WithTx(tx)
 	for name, change := range map[string]func() error{
 		"Apply":       func() error { return authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{b}}) },
-		"Import":      func() error { return authz.Import(ctx, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: b}}) },
-		"DeleteScope": func() error { return authz.DeleteScope(ctx, "t1", cluster.Scope()) },
+		"Import":      func() error { return authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: b}}) },
+		"DeleteScope": func() error { return authz.DeleteScope(ctx, host, "t1", cluster.Scope()) },
 	} {
 		if err := change(); err == nil || !strings.Contains(err.Error(), "READ COMMITTED") {
 			t.Errorf("%s in a REPEATABLE READ transaction: %v", name, err)
@@ -2364,7 +2486,8 @@ func TestRedefiningARoleForATypeAgainRespectsConstraints(t *testing.T) {
 	stop := false
 	h := setup(t, func(c *rbac.Config) {
 		c.Catalog = append(slices.Clone(c.Catalog), rbac.RoleDefinition{ID: "bucket.reader", Permissions: []rbac.Permission{"bucket:read"}, ResourceTypes: []string{"bucket", "cluster"}})
-		c.Constraints = []rbac.Constraint{{Name: "managed elsewhere", Deny: func(_ context.Context, _ rbac.DB, _, _ string, p rbac.Permission) (bool, error) {
+		c.Constraints = []rbac.Constraint{{Name: "managed elsewhere", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			p := in.Permission
 			return stop && p == "bucket:grant", nil
 		}}}
 	})
@@ -2454,7 +2577,7 @@ func TestDefiningARoleCreatedWhileItWaitsAsksTheConstraintsAgain(t *testing.T) {
 	if err := h.authz.WithTx(tx).DefineRole(ctx, admin, "t1", op); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.authz.WithTx(tx).Import(ctx, "t1", []rbac.Grant{grant(cluster.Scope(), op.ID, rbac.User, "op")}); err != nil {
+	if err := h.authz.WithTx(tx).Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), op.ID, rbac.User, "op")}); err != nil {
 		t.Fatal(err)
 	}
 	wider := op
@@ -2600,7 +2723,7 @@ func TestConditionsAreCheckedWhenGranted(t *testing.T) {
 	described := conditional("cluster.login", "x", "true")
 	described.Condition.Description = strings.Repeat("d", 2049)
 	for _, b := range []rbac.Binding{titledLong, described} {
-		if err := h.authz.Import(t.Context(), "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: b}}); !errors.Is(err, rbac.ErrInvalid) {
+		if err := h.authz.Import(t.Context(), host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: b}}); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("a title or description too long: %v", err)
 		}
 	}
@@ -2913,8 +3036,8 @@ func TestACheckDecidesAsItWouldWhateverIsCompiled(t *testing.T) {
 	h.seed(t, grants...)
 	fresh, err := rbac.New(h.pool, rbac.Config{
 		Catalog: catalog, ContainerTypes: []string{"org", "workspace"},
-		ValidatePrincipal: func(context.Context, rbac.DB, string, rbac.Principal) error { return nil },
-		Now:               func() time.Time { return h.now },
+		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+		Now:           func() time.Time { return h.now },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2955,7 +3078,7 @@ func TestAConditionIsTextPostgreSQLStores(t *testing.T) {
 		if err := h.authz.Apply(t.Context(), user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("Apply(%q) = %v", c, err)
 		}
-		if err := h.authz.Import(t.Context(), "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: b}}); !errors.Is(err, rbac.ErrInvalid) {
+		if err := h.authz.Import(t.Context(), host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: b}}); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("Import(%q) = %v", c, err)
 		}
 	}
@@ -3044,7 +3167,7 @@ func TestDenies(t *testing.T) {
 	if !allowed(t, h, user("owner"), view, cluster) {
 		t.Fatal("deleting a deny should end it")
 	}
-	if err := h.authz.DeleteScope(ctx, "t1", workspace.Scope()); err != nil {
+	if err := h.authz.DeleteScope(ctx, host, "t1", workspace.Scope()); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := h.authz.Denies(ctx, "t1", []rbac.Scope{workspace.Scope()}); err != nil || len(got) != 0 {
@@ -3299,7 +3422,7 @@ func TestSettingADenyIsChecked(t *testing.T) {
 		}
 	}
 	for _, p := range []rbac.Principal{rbac.TenantMembers("t1"), {Kind: rbac.Public}} {
-		if err := h.authz.Import(ctx, "t1", []rbac.Grant{{Scope: rbac.TenantRoot("t1"), Binding: rbac.Binding{Role: "guard", Principal: p}}}); !errors.Is(err, rbac.ErrInvalid) {
+		if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: rbac.TenantRoot("t1"), Binding: rbac.Binding{Role: "guard", Principal: p}}}); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("letting %s set denies: %v", p.Kind, err)
 		}
 	}
@@ -3696,7 +3819,8 @@ func TestGrantsAddUp(t *testing.T) {
 func TestActivatingRespectsConstraints(t *testing.T) {
 	stop := false
 	h := setup(t, func(c *rbac.Config) {
-		c.Constraints = []rbac.Constraint{{Name: "frozen", Deny: func(_ context.Context, _ rbac.DB, _, _ string, p rbac.Permission) (bool, error) {
+		c.Constraints = []rbac.Constraint{{Name: "frozen", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			p := in.Permission
 			return stop && p == grantC, nil
 		}}}
 	})
@@ -3718,7 +3842,7 @@ func TestEligibilitiesGoWithWhatTheyName(t *testing.T) {
 	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.authz.DeletePrincipalEverywhere(ctx, e.Principal); err != nil {
+	if err := h.authz.DeletePrincipalEverywhere(ctx, host, e.Principal); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := h.authz.Eligibilities(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{e.Principal}}); err != nil || len(got) != 0 {
@@ -3727,7 +3851,7 @@ func TestEligibilitiesGoWithWhatTheyName(t *testing.T) {
 	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.authz.DeleteScope(ctx, "t1", cluster.Scope()); err != nil {
+	if err := h.authz.DeleteScope(ctx, host, "t1", cluster.Scope()); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := h.authz.Eligibilities(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}}); err != nil || len(got) != 0 {

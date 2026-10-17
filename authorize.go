@@ -51,7 +51,7 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 	if err := a.subject(s); err != nil {
 		return Decision{}, err
 	}
-	name, err := a.denied(ctx, r.Tenant, r.Type, p)
+	name, err := a.denied(ctx, ConstraintInput{Tenant: r.Tenant, ResourceType: r.Type, Permission: p, Subject: &s, Resource: &r})
 	if err != nil {
 		return Decision{}, err
 	}
@@ -195,7 +195,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 		if r, ok := removed[p]; ok {
 			return r, nil
 		}
-		name, err := a.denied(ctx, r.Tenant, r.Type, p)
+		name, err := a.denied(ctx, ConstraintInput{Tenant: r.Tenant, ResourceType: r.Type, Permission: p, Subject: &s, Resource: &r})
 		removed[p] = name != ""
 		return name != "", err
 	}
@@ -265,7 +265,7 @@ func (a *Authorizer) Holders(ctx context.Context, r Resource, p Permission) ([]P
 	if !p.Valid() {
 		return nil, fmt.Errorf("%w: permission %q is not `type:verb`", ErrInvalid, p)
 	}
-	name, err := a.denied(ctx, r.Tenant, r.Type, p)
+	name, err := a.denied(ctx, ConstraintInput{Tenant: r.Tenant, ResourceType: r.Type, Permission: p, Resource: &r})
 	if err != nil || name != "" {
 		return nil, err
 	}
@@ -416,7 +416,7 @@ func (a *Authorizer) searchable(ctx context.Context, s Subject, p Permission, te
 	if err := a.subject(s); err != nil {
 		return nil, false, err
 	}
-	name, err := a.denied(ctx, tenant, resourceType, p)
+	name, err := a.denied(ctx, ConstraintInput{Tenant: tenant, ResourceType: resourceType, Permission: p, Subject: &s})
 	if err != nil || name != "" {
 		return nil, name != "", err
 	}

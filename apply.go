@@ -53,8 +53,8 @@ func (e *InvalidError) Is(target error) bool { return target == ErrInvalid }
 //
 // Bindings are checked only once the actor may make the change, so a refused actor learns
 // nothing about principals. Every invalid binding is reported at once, joined; an error from
-// Config.ValidatePrincipal that isn't ErrInvalid fails the change as it is. Constraints and
-// Config.ValidatePrincipal run before the transaction, on what the Authorizer runs on;
+// Config.ValidateGrant that isn't ErrInvalid fails the change as it is. Constraints and
+// Config.ValidateGrant run before the transaction, on what the Authorizer runs on;
 // Config.OnChange runs in it with the grants that changed.
 func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Change) error {
 	if err := a.check(on); err != nil {
@@ -73,7 +73,7 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 			return &InvalidError{Binding: b, Reason: "only Activate grants from " + SourceActivation}
 		}
 	}
-	return a.change(ctx, actor, on, grants, revokes, nil, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.change(ctx, actor, on, ViaApply, grants, revokes, nil, func(tx pgx.Tx) (ChangeEvent, error) {
 		revoked, err := a.revoke(ctx, tx, on.Tenant, scope, revokes, grants)
 		if err != nil {
 			return ChangeEvent{}, err
@@ -86,11 +86,11 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 // change makes a change to the grants on one scope as actor, or to eligibilities, which are
 // grants to come, with Apply's checks before its transaction and again under its locks, and
 // then write. check is what else the change needs, run once the actor may make it.
-func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, grants, revokes []Binding,
+func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, via Via, grants, revokes []Binding,
 	check func() error, write func(pgx.Tx) (ChangeEvent, error),
 ) error {
 	scope := on.Scope()
-	if err := a.changing(ctx, actor.Principal, on); err != nil {
+	if err := a.changing(ctx, actor, on); err != nil {
 		return err
 	}
 	au, err := a.mayChange(ctx, a.db, actor, on, grants, revokes)
@@ -102,7 +102,7 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, gra
 			return err
 		}
 	}
-	if err := a.validate(ctx, au.roles, on.Tenant, scope, grants, revokes); err != nil {
+	if err := a.validate(ctx, au.roles, actor, via, on.Tenant, scope, grants, revokes); err != nil {
 		return err
 	}
 	return a.inTx(ctx, on.Tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
@@ -134,12 +134,12 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, gra
 // changing refuses a change to grants on a scope by an anonymous actor, or one a constraint on
 // `<type>:grant` stops. The constraints run outside the transaction: one that queries the pool
 // while the transaction holds a connection can wait forever on a busy pool.
-func (a *Authorizer) changing(ctx context.Context, actor Principal, on Resource) error {
+func (a *Authorizer) changing(ctx context.Context, actor Subject, on Resource) error {
 	manage := GrantPermission(on.Type)
-	if actor == (Principal{}) {
+	if actor.Principal == (Principal{}) {
 		return &DeniedError{Permission: manage, Scope: on.Scope(), Reason: "an anonymous subject changes nothing"}
 	}
-	name, err := a.denied(ctx, on.Tenant, on.Type, manage)
+	name, err := a.denied(ctx, ConstraintInput{Tenant: on.Tenant, ResourceType: on.Type, Permission: manage, Subject: &actor, Resource: &on})
 	if err != nil {
 		return err
 	}
@@ -198,13 +198,17 @@ func locked(br pgx.BatchResults) error {
 	return nil
 }
 
-// Import stores grants without the actor checks Apply makes, for migrations, seeding and the
-// host's own grants: give whoever creates a resource or container a role on it, in the same
-// transaction through WithTx. Each grant is still validated, except that principals aren't
-// asked about.
-func (a *Authorizer) Import(ctx context.Context, tenant string, grants []Grant) error {
+// Import stores grants as actor without the checks Apply makes of an actor, for migrations,
+// seeding, restores and the host's own grants: give whoever creates a resource or container a
+// role on it, in the same transaction through WithTx. actor is who the grants are recorded as
+// made by, such as the creator or the host's own service account. Each grant is still
+// validated, and Config.ValidateGrant asked about it, via ViaImport.
+func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string, grants []Grant) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
+	}
+	if err := a.identity(actor); err != nil {
+		return err
 	}
 	if len(grants) == 0 {
 		return nil
@@ -232,12 +236,27 @@ func (a *Authorizer) Import(ctx context.Context, tenant string, grants []Grant) 
 	if err := check(a.db, conditions...); err != nil {
 		return err
 	}
+	roles, err := a.book(ctx, a.db, tenant, roleIDs(grants))
+	if err != nil {
+		return err
+	}
+	var refused []error
+	for _, g := range grants {
+		bad, err := a.allowed(ctx, roles, Subject{Principal: actor}, ViaImport, tenant, g.Scope, g.Binding)
+		if err != nil {
+			return err
+		}
+		refused = append(refused, bad...)
+	}
+	if err := errors.Join(refused...); err != nil {
+		return err
+	}
 	scopes, principals := map[string]bool{}, map[string]bool{}
 	for _, g := range grants {
 		scopes[g.Scope.Key()] = true
 		principals[g.Principal.key()] = true
 	}
-	return a.inTx(ctx, tenant, Principal{}, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTx(ctx, tenant, actor, func(tx pgx.Tx) (ChangeEvent, error) {
 		var err error
 		if len(scopes)+len(principals) > maxLocks {
 			err = lockTenant(ctx, tx, tenant)
@@ -251,7 +270,7 @@ func (a *Authorizer) Import(ctx context.Context, tenant string, grants []Grant) 
 		if err := check(tx); err != nil {
 			return ChangeEvent{}, err
 		}
-		granted, err := a.upsert(ctx, tx, tenant, Principal{}, grants)
+		granted, err := a.upsert(ctx, tx, tenant, actor, grants)
 		return ChangeEvent{Granted: granted}, err
 	})
 }
@@ -301,38 +320,19 @@ func keyOf(b Binding) grantKey {
 	return grantKey{b.Role, b.Principal, b.Source, expires, b.Condition.Expression}
 }
 
-// validate checks the bindings against the roles mayChange read.
-func (a *Authorizer) validate(ctx context.Context, roles book, tenant string, scope Scope, grants, revokes []Binding) error {
+// validate checks the bindings against the roles mayChange read, and asks the host about each
+// grant otherwise valid.
+func (a *Authorizer) validate(ctx context.Context, roles book, actor Subject, via Via, tenant string, scope Scope, grants, revokes []Binding) error {
 	var errs []error
 	now := a.cfg.Now()
-	// A change often gives one principal several roles; the host is asked about each once.
-	member := map[Principal]bool{}
-	inTenant := func(p Principal) (bool, error) {
-		if ok, asked := member[p]; asked {
-			return ok, nil
-		}
-		err := a.cfg.ValidatePrincipal(ctx, a.db, tenant, p)
-		if err != nil && !errors.Is(err, ErrInvalid) {
-			return false, err
-		}
-		member[p] = err == nil
-		return err == nil, nil
-	}
 	for _, b := range grants {
 		bad := append(a.checkBinding(roles, tenant, scope, b, now), a.checkCondition(b)...)
-		// The public is asked about too, so a host can refuse public access.
-		if len(bad) == 0 && b.Principal.Kind != Tenant {
-			ok, err := inTenant(b.Principal)
+		if len(bad) == 0 {
+			refused, err := a.allowed(ctx, roles, actor, via, tenant, scope, b)
 			if err != nil {
 				return err
 			}
-			if !ok {
-				reason := "not in the tenant"
-				if b.Principal.Kind == Public {
-					reason = "the tenant doesn't allow public access"
-				}
-				bad = append(bad, &InvalidError{Binding: b, Reason: reason})
-			}
+			bad = refused
 		}
 		errs = append(errs, bad...)
 	}
@@ -343,6 +343,28 @@ func (a *Authorizer) validate(ctx context.Context, roles book, tenant string, sc
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// allowed asks Config.ValidateGrant about a grant, and returns why it refused, or the error that
+// fails the change.
+func (a *Authorizer) allowed(ctx context.Context, roles book, actor Subject, via Via, tenant string, scope Scope, b Binding) ([]error, error) {
+	role, _ := roles.role(b.Role)
+	err := a.cfg.ValidateGrant(ctx, a.db, GrantInput{Tenant: tenant, Scope: scope, Binding: b, Role: role.clone(), Actor: actor, Via: via})
+	switch {
+	case err == nil:
+		return nil, nil
+	case errors.Is(err, ErrInvalid):
+		return []error{&InvalidError{Binding: b, Reason: err.Error()}}, nil
+	}
+	return nil, err
+}
+
+// identity checks that an actor a call names is an identity: a user or a declared kind.
+func (a *Authorizer) identity(actor Principal) error {
+	if !a.acts(actor.Kind) || actor.ID == "" {
+		return fmt.Errorf("%w: the actor %q is not a user or declared kind", ErrInvalid, actor.key())
+	}
+	return nil
 }
 
 // checkBinding returns why a binding can't be granted on a scope in a tenant.
@@ -695,7 +717,7 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 	if err := a.subject(s); err != nil {
 		return nil, err
 	}
-	name, err := a.denied(ctx, r.Tenant, r.Type, GrantPermission(r.Type))
+	name, err := a.denied(ctx, ConstraintInput{Tenant: r.Tenant, ResourceType: r.Type, Permission: GrantPermission(r.Type), Subject: &s, Resource: &r})
 	if err != nil || name != "" {
 		return nil, err
 	}
@@ -911,35 +933,40 @@ func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) (
 	return collectGrants(rows)
 }
 
-// DeleteScope removes every grant, eligibility and deny on a scope, as when the resource or container is
-// deleted. It waits for a change to the scope in progress, so a grant that change makes is
-// removed too.
-func (a *Authorizer) DeleteScope(ctx context.Context, tenant string, s Scope) error {
-	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, []string{s.Key()}, nil) },
+// DeleteScope removes every grant, eligibility and deny on a scope, as actor, as when the
+// resource or container is deleted: call it in the transaction that deletes it, through WithTx,
+// and for each scope under it. It waits for a change to the scope in progress, so a grant that
+// change makes is removed too.
+func (a *Authorizer) DeleteScope(ctx context.Context, actor Principal, tenant string, s Scope) error {
+	return a.delete(ctx, actor, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, []string{s.Key()}, nil) },
 		deletion{denies: "scope = $2", where: "scope = $2"}, s.Key())
 }
 
-// DeletePrincipal removes every grant and eligibility of a principal, as when an identity or group is deleted,
-// or every grant to the public, as when a tenant stops allowing public access.
-func (a *Authorizer) DeletePrincipal(ctx context.Context, tenant string, p Principal) error {
+// DeletePrincipal removes every grant and eligibility of a principal in a tenant, as actor, as
+// when an identity or group leaves it, or every grant to the public, as when a tenant stops
+// allowing public access.
+func (a *Authorizer) DeletePrincipal(ctx context.Context, actor Principal, tenant string, p Principal) error {
 	if !p.wellFormed(tenant) {
 		return fmt.Errorf("%w: principal %q is not valid", ErrInvalid, p.key())
 	}
-	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, nil, []string{p.key()}) },
+	return a.delete(ctx, actor, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, nil, []string{p.key()}) },
 		deletion{where: "principal = $2"}, p.key())
 }
 
 // DeletePrincipalEverywhere removes every grant and eligibility of an identity or group in every
-// tenant, as when it is deleted. Delete it from the host first, so Config.ValidatePrincipal
+// tenant, as actor, as when it is deleted. Delete it from the host first, so Config.ValidateGrant
 // refuses new grants to it. Each tenant's removals reach Config.OnChange as a change of their own.
 //
 // Each tenant's removal takes two locks, so it removes a batch of tenants per transaction, to
 // keep a principal in many tenants from filling PostgreSQL's lock table: on an error, the
 // batches before it stay removed, and calling it again removes the rest. Under WithTx every
 // batch is in the host's transaction, and its locks last until that ends.
-func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, p Principal) error {
+func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Principal) error {
 	if p.broad() || !p.wellFormed("") {
 		return fmt.Errorf("%w: principal %q is not an identity or group", ErrInvalid, p.key())
+	}
+	if err := a.identity(actor); err != nil {
+		return err
 	}
 	const batch = maxLocks / 2
 	for {
@@ -968,7 +995,7 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, p Principal)
 				if err != nil {
 					return err
 				}
-				if err := a.report(ctx, tx, ChangeEvent{Tenant: t, Revoked: revoked, Ineligible: ended}); err != nil {
+				if err := a.report(ctx, tx, ChangeEvent{Tenant: t, Actor: actor, Revoked: revoked, Ineligible: ended}); err != nil {
 					return err
 				}
 			}
@@ -980,10 +1007,10 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, p Principal)
 	}
 }
 
-// DeleteTenant removes every grant, eligibility, custom role and deny in a tenant, so a tenant created later
-// with its id starts with none.
-func (a *Authorizer) DeleteTenant(ctx context.Context, tenant string) error {
-	return a.delete(ctx, tenant, func(tx pgx.Tx) error { return lockTenant(ctx, tx, tenant) },
+// DeleteTenant removes every grant, eligibility, custom role and deny in a tenant, as actor, so a
+// tenant created later with its id starts with none.
+func (a *Authorizer) DeleteTenant(ctx context.Context, actor Principal, tenant string) error {
+	return a.delete(ctx, actor, tenant, func(tx pgx.Tx) error { return lockTenant(ctx, tx, tenant) },
 		deletion{roles: true, denies: "TRUE", where: "TRUE"})
 }
 
@@ -995,12 +1022,15 @@ type deletion struct {
 	denies, where string
 }
 
-// delete removes what del picks in a tenant, once lock holds.
-func (a *Authorizer) delete(ctx context.Context, tenant string, lock func(pgx.Tx) error, del deletion, args ...any) error {
+// delete removes what del picks in a tenant as actor, once lock holds.
+func (a *Authorizer) delete(ctx context.Context, actor Principal, tenant string, lock func(pgx.Tx) error, del deletion, args ...any) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
-	return a.inTx(ctx, tenant, Principal{}, func(tx pgx.Tx) (ChangeEvent, error) {
+	if err := a.identity(actor); err != nil {
+		return err
+	}
+	return a.inTx(ctx, tenant, actor, func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lock(tx); err != nil {
 			return ChangeEvent{}, err
 		}
