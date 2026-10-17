@@ -67,7 +67,7 @@ func (a *Authorizer) checkEligibility(e Eligibility) error {
 	case !validText(e.Requires):
 		errs = append(errs, errors.New("a requirement is UTF-8 text without NUL"))
 	case e.Requires != "":
-		if _, err := a.conds.compile(e.Requires); err != nil {
+		if err := a.conds.check(e.Requires); err != nil {
 			errs = append(errs, err)
 		}
 	}

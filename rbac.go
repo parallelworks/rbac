@@ -477,6 +477,9 @@ type Config struct {
 	// to a principal the tenant doesn't let in must never be stored.
 	ValidateGrant func(ctx context.Context, q DB, in GrantInput) error
 	Constraints   []Constraint
+	// Attributes declares the attributes conditions read, so one misnamed or of another type is
+	// refused when a condition is stored; undeclared, any is read.
+	Attributes Attributes
 	// OnChange runs in the transaction of every change but DeleteExpired, whose grants already
 	// gave nothing; an error rolls the change back.
 	OnChange func(ctx context.Context, tx pgx.Tx, e ChangeEvent) error
@@ -496,9 +499,12 @@ type Authorizer struct {
 	// permissions and types are what the built-in roles give and are for: all a custom role
 	// may use. unprivileged are the permissions, each with a type, that a role that isn't
 	// privileged gives there: all a public role may give.
-	permissions  map[Permission]bool
-	types        map[string]bool
-	unprivileged map[permissionOn]bool
+	permissions map[Permission]bool
+	types       map[string]bool
+	// permissionTypes are the types the built-in roles' permissions are for, which a deny's
+	// `type:*` may name.
+	permissionTypes map[string]bool
+	unprivileged    map[permissionOn]bool
 	// The same, sorted, as searches pass them to SQL. publicPairs are the unprivileged pairs, as
 	// `permission type`, of permissions that don't change access: all a public role gives as
 	// Authorizer.current reads it.
@@ -571,8 +577,11 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 		}
 	}
 	var permList, pairs []string
+	permissionTypes := map[string]bool{}
 	for p := range perms {
 		permList = append(permList, string(p))
+		t, _ := p.parts()
+		permissionTypes[t] = true
 	}
 	for k := range unprivileged {
 		if !k.p.managesAccess() {
@@ -581,13 +590,13 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 	}
 	slices.Sort(permList)
 	slices.Sort(pairs)
-	conds, err := newConditions()
+	conds, err := newConditions(cfg.Attributes)
 	if err != nil {
 		return nil, err
 	}
 	return &Authorizer{
 		db: db, cfg: cfg, roles: roles, containers: containers, containerTypes: slices.Sorted(maps.Keys(containers)),
-		kinds: kinds, permissions: perms, types: resourceTypes, unprivileged: unprivileged,
+		kinds: kinds, permissions: perms, types: resourceTypes, permissionTypes: permissionTypes, unprivileged: unprivileged,
 		catalogPermissions: permList, catalogTypes: slices.Sorted(maps.Keys(resourceTypes)), publicPairs: pairs,
 		conds: conds,
 	}, nil

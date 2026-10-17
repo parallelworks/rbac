@@ -20,6 +20,9 @@ import (
 
 var errLookup = errors.New("membership lookup failed")
 
+// guardRole sets denies on clusters.
+var guardRole = rbac.RoleDefinition{ID: "guard", Permissions: []rbac.Permission{rbac.DenyPermission("cluster")}, ResourceTypes: []string{"cluster"}}
+
 const (
 	view   rbac.Permission = "cluster:view"
 	login  rbac.Permission = "cluster:login"
@@ -742,6 +745,96 @@ func TestFilterScalesWithResourceGrants(t *testing.T) {
 	// Each row's own key is looked up in a hash of the subject's grants, not compared with each.
 	if text := strings.Join(plan, "\n"); !strings.Contains(text, "hashed SubPlan") {
 		t.Fatalf("Filter's plan for a subject with many resource grants:\n%s", text)
+	}
+}
+
+func TestConditionsReadWhatIsDeclared(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), guardRole)
+		c.Attributes = rbac.Attributes{
+			Resource: map[string]rbac.AttributeType{"env": rbac.AttrString, "size": rbac.AttrInt, "labels": rbac.AttrStringMap, "tags": rbac.AttrStrings},
+			Request:  map[string]rbac.AttributeType{"mfa": rbac.AttrBool, "at": rbac.AttrTimestamp, "age": rbac.AttrDuration, "score": rbac.AttrDouble},
+		}
+	})
+	ctx := t.Context()
+	b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}
+	for _, expr := range []string{
+		`resource.attributes.env == "dev"`,
+		`has(resource.attributes.env) && resource.attributes.size > 2`,
+		`resource.attributes.labels["team"] == "core" && "gpu" in resource.attributes.tags`,
+		`request.attributes.mfa && request.attributes.at < request.time + request.attributes.age && request.attributes.score > 0.5`,
+		// Subject attributes aren't declared, so any is read.
+		`subject.attributes.department == "eng" && resource.type == "cluster" && action == "cluster:login"`,
+	} {
+		ok := b
+		ok.Condition.Expression = expr
+		if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{ok}}); err != nil {
+			t.Errorf("%s: %v", expr, err)
+		}
+	}
+	for _, expr := range []string{
+		`resource.attributes.envv == "dev"`,
+		`resource.attributes.size == "big"`,
+		`resource.attributes["env"] == "dev"`,
+		`resource.lables == "dev"`,
+		`request.attributes.mfa == "yes"`,
+		`request.attributes.ip == "10.0.0.1"`,
+	} {
+		bad := b
+		bad.Condition.Expression = expr
+		if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{bad}}); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s: %v", expr, err)
+		}
+	}
+	// Declared, an attribute is still read from the request as passed.
+	dev := cluster
+	dev.Attributes = map[string]any{"env": "dev"}
+	if !allowed(t, h, user("u"), login, dev) || allowed(t, h, user("u"), login, cluster) {
+		t.Fatal("a declared attribute should decide as passed, and one not passed fail")
+	}
+	// Denies and requirements are checked alike.
+	guarded := rbac.Deny{
+		ID: "d", Principals: []rbac.Principal{{Kind: rbac.Public}}, Permissions: []rbac.Permission{root},
+		Condition: rbac.Condition{Expression: `resource.attributes.enviroment == "prod"`},
+	}
+	h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "owner"))
+	if err := h.authz.SetDeny(ctx, user("owner"), cluster, guarded); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("a deny reading an undeclared attribute: %v", err)
+	}
+	e := rbac.Eligibility{
+		Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: time.Hour,
+		Requires: `request.attributes.mfaa == true`,
+	}
+	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("a requirement reading an undeclared attribute: %v", err)
+	}
+}
+
+func TestNewRejectsBadAttributes(t *testing.T) {
+	h := setup(t)
+	for name, attrs := range map[string]rbac.Attributes{
+		"a name with a dash": {Resource: map[string]rbac.AttributeType{"cost-center": rbac.AttrString}},
+		"a reserved word":    {Request: map[string]rbac.AttributeType{"in": rbac.AttrBool}},
+		"an unknown type":    {Subject: map[string]rbac.AttributeType{"level": "integer"}},
+	} {
+		if _, err := rbac.New(h.pool, rbac.Config{Catalog: catalog, ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil }, Attributes: attrs}); err == nil {
+			t.Errorf("%s: no error", name)
+		}
+	}
+}
+
+func TestDeniesNameWhatTheCatalogHas(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), guardRole) })
+	h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "owner"))
+	for _, p := range []rbac.Permission{"cluster:logn", "clustr:*", "bucket:read"} {
+		d := rbac.Deny{ID: "d", Principals: []rbac.Principal{{Kind: rbac.Public}}, Permissions: []rbac.Permission{p}}
+		if err := h.authz.SetDeny(t.Context(), user("owner"), cluster, d); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("a deny of %s: %v", p, err)
+		}
+	}
+	d := rbac.Deny{ID: "d", Principals: []rbac.Principal{{Kind: rbac.Public}}, Permissions: []rbac.Permission{"cluster:*", "workspace:view"}}
+	if err := h.authz.SetDeny(t.Context(), user("owner"), cluster, d); err != nil {
+		t.Fatal(err)
 	}
 }
 

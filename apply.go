@@ -435,7 +435,7 @@ func (a *Authorizer) conditionFaults(c Condition) []string {
 	case !validText(c.Title) || !validText(c.Description) || !validText(c.Expression):
 		bad("a condition is UTF-8 text without NUL")
 	case c.Expression != "":
-		if _, err := a.conds.compile(c.Expression); err != nil {
+		if err := a.conds.check(c.Expression); err != nil {
 			bad(err.Error())
 		}
 	case c != Condition{}:

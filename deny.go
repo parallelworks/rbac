@@ -162,6 +162,10 @@ func (a *Authorizer) checkDeny(tenant string, d Deny) error {
 			bad("permission %q is not `type:verb` or `type:*`", p)
 		case undeniable(p):
 			bad("permission %q sets denies, which no deny removes, so a guard above can always lift one", p)
+		case verb == "*" && !a.permissionTypes[t]:
+			bad("permission %q is for a type no built-in role's permissions are", p)
+		case verb != "*" && !a.permissions[p]:
+			bad("permission %q is not one any built-in role gives", p)
 		}
 	}
 	for _, fault := range a.conditionFaults(d.Condition) {
