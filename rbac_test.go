@@ -3464,3 +3464,50 @@ func TestAnEligibilityCantHandOutMoreThanItsSetterHolds(t *testing.T) {
 		t.Fatalf("making someone eligible for a role the setter could grant: %v", err)
 	}
 }
+
+func TestAnActivationEndsByItsEligibility(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	e := rbac.Eligibility{
+		Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: 366 * 24 * time.Hour,
+		ExpiresAt: h.now.Add(10 * time.Minute),
+	}
+	if err := h.authz.SetEligible(ctx, user("owner"), cluster, e); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.authz.Activate(ctx, user("x"), cluster, "cluster.sudo", 300*24*time.Hour, "x"); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("activating past the eligibility's end: %v", err)
+	}
+	if g, err := h.authz.Activate(ctx, user("x"), cluster, "cluster.sudo", 10*time.Minute, "x"); err != nil || !g.ExpiresAt.Equal(e.ExpiresAt) {
+		t.Fatalf("activating until the eligibility's end: %+v, %v", g, err)
+	}
+}
+
+func TestDeletingARoleEndsItsEligibilities(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	operator := rbac.RoleDefinition{ID: "custom.operator", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.DefineRole(ctx, admin, "t1", operator); err != nil {
+		t.Fatal(err)
+	}
+	e := rbac.Eligibility{Role: operator.ID, Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: time.Hour}
+	if err := h.authz.SetEligible(ctx, admin, cluster, e); err != nil {
+		t.Fatal(err)
+	}
+	h.events = nil
+	if err := h.authz.DeleteRole(ctx, admin, "t1", operator.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.events) != 1 || len(h.events[0].Ineligible) != 1 {
+		t.Fatalf("events = %+v", h.events)
+	}
+	// Defined again with its id, a role isn't activated through an eligibility for the one deleted.
+	operator.Permissions = append(operator.Permissions, root)
+	if err := h.authz.DefineRole(ctx, admin, "t1", operator); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.authz.Activate(ctx, user("x"), cluster, operator.ID, time.Minute, "x"); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("activating a role deleted and defined again: %v", err)
+	}
+}

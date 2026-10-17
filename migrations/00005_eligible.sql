@@ -32,6 +32,9 @@ CREATE INDEX rbac_eligibilities_scope ON rbac_eligibilities (tenant, scope);
 CREATE INDEX rbac_eligibilities_principal ON rbac_eligibilities (principal, tenant);
 -- DeleteExpired, without reading the eligibilities that never expire.
 CREATE INDEX rbac_eligibilities_expires ON rbac_eligibilities (expires_at) WHERE expires_at IS NOT NULL;
+-- Deleting a custom role, which locks its tenant, finds its eligibilities without reading the
+-- tenant's every one.
+CREATE INDEX rbac_eligibilities_custom_role ON rbac_eligibilities (tenant, role) WHERE role LIKE 'custom.%';
 
 -- +goose Down
 DROP TABLE rbac_eligibilities;
