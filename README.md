@@ -166,7 +166,8 @@ became, when, and the database role that wrote it. Triggers write it, so a write
 the package is recorded too. Nothing updates, deletes or truncates it, and the package's tables
 can be deleted from but not truncated. `History` reads it in order, to export it to storage of
 the host's own: a transaction that commits after a later one is read after it, never skipped,
-and a record can be read twice, so dedupe on `Record.ID`. Any transaction still running in the
+and a record can be read twice, so dedupe on `Record.ID` and `RecordedAt`: a restore can give
+another record the ID of one it lost. Any transaction still running in the
 database cluster, in any of its databases, holds `History` back until it ends. `History` reads the
 primary, and fails on a replica. A failover or a recovery to a point in time starts a new
 generation (`Cursor.Generation`), and a restore that starts none, as from a disk snapshot, loses
@@ -178,7 +179,8 @@ its transactions anew.
 
 A role that owns a table can change it whatever its triggers say, and a schema's owner can drop
 any table in it. So that the application's database role can't rewrite history or write around
-it, that role is no superuser, nor a member of `pg_write_all_data`, and:
+it, that role is no superuser, nor a member of `pg_write_all_data` or `pg_create_subscription`,
+through which it could write `rbac_history` itself; and:
 
 1. `Migrate` runs as an administrator's role the application's isn't a member of, with only the
    package's schema in its search_path, so that role owns the package's tables: their owner can

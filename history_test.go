@@ -1,6 +1,7 @@
 package rbac_test
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"slices"
@@ -312,5 +313,63 @@ func TestHistoryRefusesACursorItCantFollow(t *testing.T) {
 	}
 	if _, _, err := h.authz.History(ctx, rbac.Cursor{}, rbac.MaxHistory+1); !errors.Is(err, rbac.ErrInvalid) {
 		t.Fatalf("too many: %v", err)
+	}
+}
+
+// A pool's connections can reach different servers, as an old primary and the new one after a
+// failover: History checks the cursor on the server it reads, which here doesn't hold its record.
+func TestHistoryChecksTheCursorWhereItReads(t *testing.T) {
+	h, other := setup(t), setup(t)
+	var cursor rbac.Cursor
+	drain(t, h, &cursor, 1)
+	authz, err := rbac.New(servers{DB: other.pool, alone: h.pool}, rbac.Config{
+		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _, err := authz.History(t.Context(), cursor, 10); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("History = %+v, %v", got, err)
+	}
+}
+
+// servers runs a query of one row outside a transaction on alone, and everything else on DB.
+type servers struct {
+	rbac.DB
+	alone rbac.DB
+}
+
+func (s servers) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	return s.alone.QueryRow(ctx, sql, args...)
+}
+
+func TestHistoryRecordsAReplicasWrites(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	// A session in replica mode, as a subscription's apply worker is, fires only triggers enabled
+	// always.
+	if err := pgx.BeginFunc(ctx, h.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SET LOCAL session_replication_role = replica`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			VALUES ('t1', 'cluster', 'c1', 'user', 'replicated', 'cluster.login')`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM rbac_history WHERE principal = 'user:replicated' AND op = 'create'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("recorded %d, %v", n, err)
+	}
+	// Nor does replica mode let history be changed.
+	if err := pgx.BeginFunc(ctx, h.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SET LOCAL session_replication_role = replica`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM rbac_history`)
+		return err
+	}); err == nil {
+		t.Fatal("deleted history in replica mode")
 	}
 }

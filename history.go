@@ -61,7 +61,8 @@ const MaxHistory = 10000
 // later one is read after it, never skipped. Transaction ids are the database cluster's, so a
 // transaction running anywhere in it, in any database, holds the read back until it ends: a long
 // one, or a prepared transaction left open, delays the export. A record can be read twice, as when
-// a host retries a read whose result it lost: dedupe on ID.
+// a host retries a read whose result it lost: dedupe on ID and RecordedAt, since a restore can
+// give another record the ID of one it lost.
 //
 // It reads the primary, and fails on a replica, which can't tell which timeline it follows until
 // long after a failover. A failover or a recovery to a point in time starts a new generation, and
@@ -75,48 +76,54 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 	if limit < 1 || limit > MaxHistory {
 		return nil, after, fmt.Errorf("%w: a read of history takes from 1 to %d records", ErrInvalid, MaxHistory)
 	}
-	// The timeline WAL is written on, which promotion changes at once; the last checkpoint's
-	// changes only once the next completes, minutes later.
 	var generation string
-	var held bool
-	if err := a.db.QueryRow(ctx, `SELECT s.system_identifier::text || '/' || left(pg_walfile_name(pg_current_wal_lsn()), 8),
-		  EXISTS (SELECT 1 FROM rbac_history WHERE txid = $1::xid8 AND id = $2 AND recorded_at = $3)
-		FROM pg_control_system() s`, after.TxID, after.ID, after.RecordedAt).Scan(&generation, &held); err != nil {
-		return nil, after, err
-	}
-	if after != (Cursor{}) && after.Generation != generation {
-		return nil, after, fmt.Errorf("%w: the cursor is another generation's, as before a failover: export this one from the start", ErrInvalid)
-	}
-	if (after.TxID != 0 || after.ID != 0) && !held {
-		return nil, after, fmt.Errorf("%w: the database no longer holds the cursor's last record, as after a restore: export it again from the start", ErrInvalid)
-	}
-	after.Generation = generation
-	rows, err := a.db.Query(ctx, `
-		SELECT id, txid, recorded_at, effective_at, tenant, entity, key, op, coalesce(principal, ''), coalesce(role, ''),
-		  coalesce(scope, ''), coalesce(group_id, ''), expires_at, before, after, actor, on_behalf_of, how, request, reason, db_user
-		FROM rbac_history
-		WHERE (txid, id) > ($1::xid8, $2) AND txid < pg_snapshot_xmin(pg_current_snapshot())
-		ORDER BY txid, id LIMIT $3`, after.TxID, after.ID, limit)
-	if err != nil {
-		return nil, after, err
-	}
-	records, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Record, error) {
-		var r Record
-		var principal, role, scope, actor, onBehalfOf string
-		var expires *time.Time
-		var before, afterRow []byte
-		err := row.Scan(&r.ID, &r.TxID, &r.RecordedAt, &r.EffectiveAt, &r.Tenant, &r.Entity, &r.Key, &r.Op, &principal, &role,
-			&scope, &r.Group, &expires, &before, &afterRow, &actor, &onBehalfOf, &r.How, &r.Request, &r.Reason, &r.DBUser)
-		if expires != nil {
-			r.ExpiresAt = *expires
+	var records []Record
+	// On one connection, so the cursor is checked on the server it reads: a pool's connections can
+	// reach both an old primary and the new one.
+	err := a.begin(ctx, func(tx pgx.Tx) error {
+		// The timeline WAL is written on, which promotion changes at once; the last checkpoint's
+		// changes only once the next completes, minutes later.
+		var held bool
+		if err := tx.QueryRow(ctx, `SELECT s.system_identifier::text || '/' || left(pg_walfile_name(pg_current_wal_lsn()), 8),
+			  EXISTS (SELECT 1 FROM rbac_history WHERE txid = $1::xid8 AND id = $2 AND recorded_at = $3)
+			FROM pg_control_system() s`, after.TxID, after.ID, after.RecordedAt).Scan(&generation, &held); err != nil {
+			return err
 		}
-		r.Principal, r.Scope, r.Actor, r.OnBehalfOf = parsePrincipal(principal), parseScope(scope), parsePrincipal(actor), parsePrincipal(onBehalfOf)
-		r.Role, r.Before, r.After = Role(role), before, afterRow
-		return r, err
+		if after != (Cursor{}) && after.Generation != generation {
+			return fmt.Errorf("%w: the cursor is another generation's, as before a failover: export this one from the start", ErrInvalid)
+		}
+		if (after.TxID != 0 || after.ID != 0) && !held {
+			return fmt.Errorf("%w: the database no longer holds the cursor's last record, as after a restore: export it again from the start", ErrInvalid)
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT id, txid, recorded_at, effective_at, tenant, entity, key, op, coalesce(principal, ''), coalesce(role, ''),
+			  coalesce(scope, ''), coalesce(group_id, ''), expires_at, before, after, actor, on_behalf_of, how, request, reason, db_user
+			FROM rbac_history
+			WHERE (txid, id) > ($1::xid8, $2) AND txid < pg_snapshot_xmin(pg_current_snapshot())
+			ORDER BY txid, id LIMIT $3`, after.TxID, after.ID, limit)
+		if err != nil {
+			return err
+		}
+		records, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (Record, error) {
+			var r Record
+			var principal, role, scope, actor, onBehalfOf string
+			var expires *time.Time
+			var before, afterRow []byte
+			err := row.Scan(&r.ID, &r.TxID, &r.RecordedAt, &r.EffectiveAt, &r.Tenant, &r.Entity, &r.Key, &r.Op, &principal, &role,
+				&scope, &r.Group, &expires, &before, &afterRow, &actor, &onBehalfOf, &r.How, &r.Request, &r.Reason, &r.DBUser)
+			if expires != nil {
+				r.ExpiresAt = *expires
+			}
+			r.Principal, r.Scope, r.Actor, r.OnBehalfOf = parsePrincipal(principal), parseScope(scope), parsePrincipal(actor), parsePrincipal(onBehalfOf)
+			r.Role, r.Before, r.After = Role(role), before, afterRow
+			return r, err
+		})
+		return err
 	})
 	if err != nil {
 		return nil, after, err
 	}
+	after.Generation = generation
 	if len(records) == 0 {
 		return nil, after, nil
 	}

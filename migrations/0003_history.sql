@@ -130,6 +130,16 @@ CREATE TRIGGER rbac_memberships_no_truncate BEFORE TRUNCATE ON rbac_memberships 
 CREATE TRIGGER rbac_groups_no_truncate BEFORE TRUNCATE ON rbac_groups FOR EACH STATEMENT EXECUTE FUNCTION rbac_no_truncate();
 CREATE TRIGGER rbac_members_no_truncate BEFORE TRUNCATE ON rbac_members FOR EACH STATEMENT EXECUTE FUNCTION rbac_no_truncate();
 
+-- In every session, a replica's included: one that sets session_replication_role to replica, as
+-- a subscription's apply worker does, would otherwise write the tables unrecorded.
+ALTER TABLE rbac_grants ENABLE ALWAYS TRIGGER rbac_grants_history, ENABLE ALWAYS TRIGGER rbac_grants_no_truncate;
+ALTER TABLE rbac_roles ENABLE ALWAYS TRIGGER rbac_roles_history, ENABLE ALWAYS TRIGGER rbac_roles_no_truncate;
+ALTER TABLE rbac_denies ENABLE ALWAYS TRIGGER rbac_denies_history, ENABLE ALWAYS TRIGGER rbac_denies_no_truncate;
+ALTER TABLE rbac_eligibilities ENABLE ALWAYS TRIGGER rbac_eligibilities_history, ENABLE ALWAYS TRIGGER rbac_eligibilities_no_truncate;
+ALTER TABLE rbac_memberships ENABLE ALWAYS TRIGGER rbac_memberships_history, ENABLE ALWAYS TRIGGER rbac_memberships_no_truncate;
+ALTER TABLE rbac_groups ENABLE ALWAYS TRIGGER rbac_groups_history, ENABLE ALWAYS TRIGGER rbac_groups_no_truncate;
+ALTER TABLE rbac_members ENABLE ALWAYS TRIGGER rbac_members_history, ENABLE ALWAYS TRIGGER rbac_members_no_truncate;
+
 -- History is appended to, never changed or removed.
 CREATE FUNCTION rbac_history_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -139,3 +149,4 @@ CREATE TRIGGER rbac_history_append_only BEFORE UPDATE OR DELETE ON rbac_history
     FOR EACH ROW EXECUTE FUNCTION rbac_history_append_only();
 CREATE TRIGGER rbac_history_no_truncate BEFORE TRUNCATE ON rbac_history
     FOR EACH STATEMENT EXECUTE FUNCTION rbac_history_append_only();
+ALTER TABLE rbac_history ENABLE ALWAYS TRIGGER rbac_history_append_only, ENABLE ALWAYS TRIGGER rbac_history_no_truncate;
