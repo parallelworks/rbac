@@ -199,7 +199,8 @@ var all = broad{public: true, members: true}
 // tenant at now, given as SQL for its key (empty for the anonymous), the tenant and the time. They
 // are the public; and while the identity is a member or guest of the tenant, not suspended, the
 // identity, the groups it is in, through those they are in, and unless it is a guest the tenant's
-// members. A group is counted once, so membership nested in a cycle stops.
+// members. A group is counted once, so membership nested in a cycle stops. It defines bound(k)
+// too, the keys a deny binds or exempts it by (bound).
 func keysSQL(tenant, identity, now string) string {
 	return fmt.Sprintf(`membership AS (
 		SELECT guest FROM rbac_memberships WHERE tenant = %[1]s AND principal = %[2]s AND NOT suspended
@@ -215,14 +216,30 @@ func keysSQL(tenant, identity, now string) string {
 		UNION ALL SELECT %[2]s COLLATE "C" FROM membership
 		UNION ALL SELECT ('members:' || %[1]s) COLLATE "C" FROM membership WHERE NOT guest
 		UNION ALL SELECT 'group:' || id FROM groups
+	), bound(k) AS (
+		SELECT k FROM keys UNION SELECT %[2]s COLLATE "C" WHERE %[2]s <> ''
 	)`, tenant, identity, now)
+}
+
+// bound is the keys a deny binds or exempts s by: its keys, and its identity even where it isn't a
+// member or guest, as a grant to the public still reaches it there.
+func bound(keys []string, s Subject) []string {
+	if k := s.identityKey(); k != "" && !slices.Contains(keys, k) {
+		return append(slices.Clone(keys), k)
+	}
+	return keys
 }
 
 // countedKeys is SQL selecting, sorted, the keys keysSQL defines whose grants a read counts: the
 // broad ones only where public and members, SQL for booleans, are true. Sorted, a lookup of them
 // in the key index takes half as long.
 func countedKeys(public, members string) string {
-	return fmt.Sprintf(`SELECT k FROM keys WHERE (k <> 'public:' OR %s) AND (k NOT LIKE 'members:%%' OR %s) ORDER BY k`, public, members)
+	return `SELECT k FROM keys WHERE ` + counted(public, members) + ` ORDER BY k`
+}
+
+// counted is SQL for whether keys' k is one whose grants a read counts, as countedKeys says.
+func counted(public, members string) string {
+	return fmt.Sprintf(`(k <> 'public:' OR %s) AND (k NOT LIKE 'members:%%' OR %s)`, public, members)
 }
 
 // keysOf reads the principal keys s is in a tenant, sorted, as keysSQL defines them.

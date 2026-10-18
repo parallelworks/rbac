@@ -128,8 +128,9 @@ another store. Both search one tenant, and count only unconditional grants:
 - **Groups:** a group is its tenant's (`SetGroup`, `ImportGroups`), and `group:<id>` names it only
   there. Its members are identities that are members or guests of the tenant, and other groups of
   the tenant, at most `rbac.MaxGroupDepth` deep (`ImportMembers`), each from a source, perhaps
-  until a time. A check, a list and a deny resolve an identity's groups through those they are in,
-  in the same statement as its grants.
+  until a time. Every check, list and deny reads an identity's groups, through those they are in,
+  as they are stored now: `Authorize` and `Filter` in the same statement as its grants and denies.
+  A suspended identity is bound as one outside the tenant is: by a deny naming it or the public.
 - **Public access:** the zero `Subject` is anonymous and holds only what is granted to the public.
   Only a role marked `Public` can be granted to the public, and a grant to the public gives
   nothing once its role no longer is.

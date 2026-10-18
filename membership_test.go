@@ -1021,3 +1021,155 @@ func TestEndingMembershipsNeverDeadlocksWithDeleteExpired(t *testing.T) {
 		})
 	}
 }
+
+func TestOnlyMembersAndGuestsHoldAnything(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	resources := hostTable(t, h)
+	u := identity("u")
+	h.seed(t,
+		grant(cluster.Scope(), "cluster.login", rbac.User, "u"),
+		grant(cluster.Scope(), "cluster.sudo", rbac.Members, "t1"),
+	)
+	s := rbac.Subject{Principal: u}
+	check := func(what string, wantLogin, wantRoot bool) {
+		t.Helper()
+		if got := allowed(t, h, s, login, cluster); got != wantLogin {
+			t.Errorf("%s: login %v, want %v", what, got, wantLogin)
+		}
+		if got := allowed(t, h, s, root, cluster); got != wantRoot {
+			t.Errorf("%s: root %v, want %v", what, got, wantRoot)
+		}
+		listingsAgree(t, h, resources, s, login)
+		listingsAgree(t, h, resources, s, root)
+	}
+	// A grant to an identity outside the tenant is stored, and gives nothing until it joins.
+	check("not a member", false, false)
+	if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: u, Guest: true}}); err != nil {
+		t.Fatal(err)
+	}
+	check("a guest", true, false)
+	if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: u, ExpiresAt: h.now.Add(time.Hour)}}); err != nil {
+		t.Fatal(err)
+	}
+	check("a member", true, true)
+	if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: u, Suspended: true}}); err != nil {
+		t.Fatal(err)
+	}
+	check("suspended", false, false)
+	if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: u, ExpiresAt: h.now.Add(time.Hour)}}); err != nil {
+		t.Fatal(err)
+	}
+	h.now = h.now.Add(2 * time.Hour)
+	check("a membership expired", false, false)
+	// Nor does anything it holds let it change access.
+	if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("x")}}}); err != nil {
+		t.Fatalf("the owner, a member: %v", err)
+	}
+	h.seed(t, grant(cluster.Scope(), "cluster.admin", rbac.User, "outside"))
+	if err := h.authz.Apply(ctx, rbac.Subject{Principal: identity("outside")}, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("x")}}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("an admin outside the tenant: %v", err)
+	}
+}
+
+func TestGroupsGiveTheirGrantsToTheirMembers(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	resources := hostTable(t, h)
+	h.join(t, "u", "v")
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "oncall"}, {ID: "sre"}, {ID: "contractors"}}); err != nil {
+		t.Fatal(err)
+	}
+	// u is on call, and on-call is in sre until three hours from now; v is a contractor until an
+	// hour from now.
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{
+		{Group: "oncall", Principal: identity("u")},
+		{Group: "sre", Principal: groupOf("oncall"), ExpiresAt: h.now.Add(3 * time.Hour)},
+		{Group: "contractors", Principal: identity("v"), ExpiresAt: h.now.Add(time.Hour)},
+		{Group: "sre", Principal: identity("v")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(workspace.Scope(), "cluster.sudo", rbac.Group, "sre"))
+	u, v := rbac.Subject{Principal: identity("u")}, rbac.Subject{Principal: identity("v")}
+	if !allowed(t, h, u, root, cluster) || !allowed(t, h, v, root, cluster) {
+		t.Fatal("a grant to a group should reach its members, through the groups in it")
+	}
+	// A deny on a group binds its members, as the package knows them.
+	if err := h.authz.SetDeny(ctx, guardian, cluster, rbac.Deny{ID: "no-contractor-root", Principals: []rbac.Principal{groupOf("contractors")}, Permissions: []rbac.Permission{root}}); err != nil {
+		t.Fatal(err)
+	}
+	if !allowed(t, h, u, root, cluster) || allowed(t, h, v, root, cluster) {
+		t.Fatal("a deny on a group should bind its members and no one else")
+	}
+	for _, s := range []rbac.Subject{u, v} {
+		listingsAgree(t, h, resources, s, root)
+	}
+	// Once v's place in the group ends, the deny no longer binds it.
+	h.now = h.now.Add(2 * time.Hour)
+	if !allowed(t, h, v, root, cluster) {
+		t.Fatal("a membership that ended should bind nothing")
+	}
+	// The package's own groups are what count.
+	if d, err := h.authz.Explain(ctx, u, root, cluster); err != nil || !d.Allowed || d.Grants[0].Principal != groupOf("sre") {
+		t.Fatalf("Explain = %+v, %v", d, err)
+	}
+	// A suspended member's groups give it nothing.
+	if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("u"), Suspended: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if allowed(t, h, u, root, cluster) {
+		t.Fatal("a suspended member's groups should give it nothing")
+	}
+	listingsAgree(t, h, resources, u, root)
+	h.join(t, "u")
+	// Once on-call's place in sre ends, sre's grant no longer reaches on-call's members.
+	h.now = h.now.Add(2 * time.Hour)
+	if allowed(t, h, u, root, cluster) {
+		t.Fatal("a group whose place in another ended should give its members nothing through it")
+	}
+	listingsAgree(t, h, resources, u, root)
+}
+
+func TestAGroupIsOnlyItsTenants(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	// Two tenants each with a group named admins; mallory is in t2's.
+	if err := h.authz.SetMemberships(ctx, host, "t2", []rbac.Membership{{Principal: identity("mallory")}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.ImportGroups(ctx, host, "t2", []rbac.GroupDefinition{{ID: "admins"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t2", []rbac.Member{{Group: "admins", Principal: identity("mallory")}}); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), "cluster.sudo", rbac.Group, "admins"))
+	if allowed(t, h, rbac.Subject{Principal: identity("mallory")}, root, cluster) {
+		t.Fatal("a member of another tenant's group named alike holds what this tenant's group does")
+	}
+	// Even as a guest here.
+	if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("mallory"), Guest: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if allowed(t, h, rbac.Subject{Principal: identity("mallory")}, root, cluster) {
+		t.Fatal("a guest in another tenant's group named alike holds what this tenant's group does")
+	}
+	// Nor is a group in another tenant's group: t2's on-call is in its admins, and t1's isn't.
+	if err := h.authz.ImportGroups(ctx, host, "t2", []rbac.GroupDefinition{{ID: "oncall"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t2", []rbac.Member{{Group: "admins", Principal: groupOf("oncall")}}); err != nil {
+		t.Fatal(err)
+	}
+	h.join(t, "u")
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "oncall"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "oncall", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	if allowed(t, h, rbac.Subject{Principal: identity("u")}, root, cluster) {
+		t.Fatal("a group in another tenant's group named alike holds what this tenant's group does")
+	}
+}

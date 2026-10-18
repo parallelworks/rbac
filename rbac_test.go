@@ -2487,6 +2487,32 @@ func TestPublicAccess(t *testing.T) {
 	}
 }
 
+func TestADenyBindsAnIdentityThatIsntAMember(t *testing.T) {
+	viewer := rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), viewer, guardRole) })
+	ctx := t.Context()
+	resources := hostTable(t, h)
+	// Everyone signed in may view, and a deny on one cluster names one who isn't a member.
+	o1 := rbac.Scope{Type: "org", ID: "o1"}
+	signedIn := grant(o1, "cluster.viewer", rbac.Public, "")
+	signedIn.Condition = rbac.Condition{Expression: `subject.id != ""`}
+	h.seed(t, signedIn, grant(resources[0].Scope(), "guard", rbac.User, "guardian"))
+	stranger := rbac.Subject{Principal: rbac.Principal{Kind: rbac.User, ID: "stranger"}}
+	d := rbac.Deny{ID: "d", Principals: []rbac.Principal{stranger.Principal}, Permissions: []rbac.Permission{view}}
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), resources[0], d); err != nil {
+		t.Fatal(err)
+	}
+	if allowed(t, h, stranger, view, resources[0]) || !allowed(t, h, stranger, view, resources[1]) {
+		t.Fatal("a deny naming an identity should bind it, member or not")
+	}
+	if dec, err := h.authz.Explain(ctx, stranger, view, resources[0]); err != nil || dec.DeniedBy == "" {
+		t.Fatalf("Explain = %+v, %v", dec, err)
+	}
+	// Where anyone may view, signed in or not, the lists keep to the deny too.
+	h.seed(t, grant(o1, "cluster.viewer", rbac.Public, ""))
+	listingsAgree(t, h, resources, stranger, view)
+}
+
 func TestAPublicGrantGivesOnlyWhileItsRoleIsPublic(t *testing.T) {
 	viewer := rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
 	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), viewer) })
@@ -5101,8 +5127,8 @@ func TestExplainNamesTheDenyAuthorizeDoes(t *testing.T) {
 	if err := h.authz.SetDeny(ctx, guardian, cluster, d("z")); err != nil {
 		t.Fatal(err)
 	}
-	// The anonymous subject too, whom no grant can give root.
-	for _, s := range []rbac.Subject{h.as(t, "owner"), {}} {
+	// The anonymous subject too, whom no grant can give root, and an identity that isn't a member.
+	for _, s := range []rbac.Subject{h.as(t, "owner"), {}, {Principal: rbac.Principal{Kind: rbac.User, ID: "stranger"}}} {
 		err := h.authz.Authorize(ctx, s, root, cluster)
 		dec, xerr := h.authz.Explain(ctx, s, root, cluster)
 		var denied *rbac.DeniedError
