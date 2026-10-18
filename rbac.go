@@ -368,7 +368,10 @@ func (e ChangeEvent) empty() bool {
 // service accounts from one. On `<type>:grant` it stops changes, grants and revokes alike, on
 // scopes of that type, not grants on a container that reach the type, as a deny on one type's
 // grant permission does in cloud IAM. To keep anyone from having a permission, remove that
-// permission itself. Deny is called for each permission a call considers, so keep it cheap.
+// permission itself. What it removes from an actor the actor can't hand on either, as with a
+// deny: a grant, an eligibility or a custom role giving it, or the power to grant it, but for a
+// role a role it holds lists in GrantableRoles, which it grants without holding. Deny is called
+// for each permission a call considers, so keep it cheap.
 type Constraint struct {
 	Name string
 	// Deny reports whether the constraint removes in.Permission. q is what the call runs on, to
@@ -385,8 +388,13 @@ type ConstraintInput struct {
 	Permission   Permission
 	// Subject is who asks, or who changes access; nil in Holders.
 	Subject *Subject
-	// Resource is what is asked about, with its ancestors and attributes; nil in Filter and
-	// Reachable, and in SetRole and DeleteRole, which change grants on every scope of a type.
+	// Resource is what is asked about, with its ancestors and attributes; for what a change hands
+	// on, the scope it is on, whose type is a container's or the tenant's where what it hands on
+	// reaches the resources of ResourceType under it. There, answer true if the constraint removes
+	// the permission on any of them: one that tells them apart by id or attributes sees only the
+	// scope, and would let the actor hand on what it can't use on them. It is nil in Filter and
+	// Reachable, and in SetRole and DeleteRole, which change grants on every scope of a type, but
+	// for what SetRole's role gives, asked about the tenant.
 	Resource *Resource
 }
 
