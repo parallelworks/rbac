@@ -20,6 +20,9 @@ import (
 type InvalidError struct {
 	Binding Binding
 	Reason  string
+	// Err is the host's refusal, from Config.ValidateGrant, which the InvalidError wraps so that
+	// errors.Is and errors.As find the host's own errors in it; nil for the package's own.
+	Err error
 }
 
 func (e *InvalidError) Error() string {
@@ -28,6 +31,8 @@ func (e *InvalidError) Error() string {
 
 // Is makes an InvalidError match ErrInvalid.
 func (e *InvalidError) Is(target error) bool { return target == ErrInvalid }
+
+func (e *InvalidError) Unwrap() error { return e.Err }
 
 // Apply changes the grants on one scope, on, in one transaction, as actor:
 //
@@ -368,7 +373,9 @@ func (a *Authorizer) allowed(ctx context.Context, roles book, actor Subject, via
 	case err == nil:
 		return nil, nil
 	case errors.Is(err, ErrInvalid):
-		return []error{&InvalidError{Binding: b, Reason: err.Error()}}, nil
+		// The host's message, less the ErrInvalid it wraps, which the InvalidError already says.
+		reason := strings.TrimPrefix(strings.TrimPrefix(err.Error(), ErrInvalid.Error()), ": ")
+		return []error{&InvalidError{Binding: b, Reason: cmp.Or(reason, "refused by the host"), Err: err}}, nil
 	}
 	return nil, err
 }

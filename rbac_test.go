@@ -589,6 +589,48 @@ func TestApplyValidatesEveryBinding(t *testing.T) {
 	}
 }
 
+// refusal is a host's own error type for a grant it refuses, as a host maps to a response.
+type refusal struct{ code string }
+
+func (r *refusal) Error() string { return "refused: " + r.code }
+
+func TestAHostsRefusalKeepsItsError(t *testing.T) {
+	errNotMember := errors.New("not a member of the tenant")
+	h := setup(t, func(c *rbac.Config) {
+		c.ValidateGrant = func(_ context.Context, _ rbac.DB, in rbac.GrantInput) error {
+			switch in.Binding.Principal.ID {
+			case "outsider":
+				return fmt.Errorf("%w: %w", rbac.ErrInvalid, errNotMember)
+			case "guest":
+				return fmt.Errorf("%w: %w", rbac.ErrInvalid, &refusal{code: "guest_role"})
+			case "plain":
+				return rbac.ErrInvalid
+			}
+			return nil
+		}
+	})
+	apply := func(id string) error {
+		return h.authz.Apply(t.Context(), user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{
+			{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: id}},
+		}})
+	}
+	err := apply("outsider")
+	var ie *rbac.InvalidError
+	if !errors.Is(err, errNotMember) || !errors.Is(err, rbac.ErrInvalid) || !errors.As(err, &ie) || ie.Binding.Principal.ID != "outsider" {
+		t.Fatalf("a refusal wrapping the host's error: %v", err)
+	}
+	if want := "rbac: cluster.login for user:outsider: not a member of the tenant"; err.Error() != want {
+		t.Errorf("message %q, want %q", err, want)
+	}
+	var r *refusal
+	if err := apply("guest"); !errors.As(err, &r) || r.code != "guest_role" {
+		t.Fatalf("a refusal of the host's own type: %v", err)
+	}
+	if err := apply("plain"); !errors.Is(err, rbac.ErrInvalid) || err.Error() != "rbac: cluster.login for user:plain: refused by the host" {
+		t.Fatalf("a refusal that is ErrInvalid alone: %v", err)
+	}
+}
+
 func TestApplyReportsARoleTheScopeCantTakeAsInvalid(t *testing.T) {
 	h := setup(t)
 	h.seed(t, grant(cluster.Scope(), "cluster.admin", rbac.User, "admin"))
