@@ -229,7 +229,7 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 	}
 	d = canonicalDeny(d)
 	groups := groupKeys(slices.Concat(d.Principals, d.Exempt))
-	return a.inTx(ctx, on.Tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTx(ctx, on.Tenant, actor.Principal, "SetDeny", func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lockAll(ctx, tx, on.Tenant, []string{d.Scope.Key()}, groups); err != nil {
 			return ChangeEvent{}, err
 		}
@@ -296,7 +296,7 @@ func (a *Authorizer) DeleteDeny(ctx context.Context, actor Subject, on Resource,
 	if err := a.mayDeny(ctx, actor, on); err != nil {
 		return err
 	}
-	return a.inTx(ctx, on.Tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTx(ctx, on.Tenant, actor.Principal, "DeleteDeny", func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lock(ctx, tx, on.Tenant, []string{on.Scope().Key()}, nil); err != nil {
 			return ChangeEvent{}, err
 		}

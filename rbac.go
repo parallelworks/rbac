@@ -611,7 +611,8 @@ type Config struct {
 	// refused when a condition is stored; undeclared, any is read.
 	Attributes Attributes
 	// OnChange runs in the transaction of every change but DeleteExpired, whose grants already
-	// gave nothing; an error rolls the change back.
+	// gave nothing, once the change is written; an error rolls the change back. History records
+	// what it writes as the host's, not as the change's.
 	OnChange func(ctx context.Context, tx pgx.Tx, e ChangeEvent) error
 	// Now is the clock that grant expiry is compared with; time.Now when nil.
 	Now func() time.Time

@@ -90,7 +90,7 @@ func (a *Authorizer) SetEligibility(ctx context.Context, actor Subject, on Resou
 	e.Scope, e.ExpiresAt = on.Scope(), stored(e.ExpiresAt)
 	e.Approvers = canonicalPrincipals(e.Approvers)
 	check := func() error { return a.checkEligibility(e) }
-	return a.change(ctx, actor, on, ViaEligibility, []Binding{e.binding()}, nil, e.Approvers, check, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.change(ctx, actor, on, "SetEligibility", ViaEligibility, []Binding{e.binding()}, nil, e.Approvers, check, func(tx pgx.Tx) (ChangeEvent, error) {
 		// An expired eligibility that is still stored allowed nothing, so setting it again records
 		// the new actor and time.
 		rows, err := tx.Query(ctx, `
@@ -126,7 +126,7 @@ func (a *Authorizer) DeleteEligibility(ctx context.Context, actor Subject, on Re
 		return err
 	}
 	scope := on.Scope()
-	return a.change(ctx, actor, on, ViaEligibility, nil, []Binding{{Role: role, Principal: p}}, nil, nil, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.change(ctx, actor, on, "DeleteEligibility", ViaEligibility, nil, []Binding{{Role: role, Principal: p}}, nil, nil, func(tx pgx.Tx) (ChangeEvent, error) {
 		rows, err := tx.Query(ctx, `DELETE FROM rbac_eligibilities WHERE tenant = $1 AND scope = $2 AND principal = $3 AND role = $4
 			RETURNING `+eligibilityColumns, on.Tenant, scope.Key(), p.key(), role)
 		if err != nil {
@@ -192,7 +192,7 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 		return Grant{}, err
 	}
 	var activated Grant
-	err = a.inTx(ctx, on.Tenant, s.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
+	err = a.inTx(ctx, on.Tenant, s.Principal, "Activate", func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lock(ctx, tx, on.Tenant, []string{scope.Key()}, []string{s.Principal.key()}); err != nil {
 			return ChangeEvent{}, err
 		}
@@ -215,14 +215,16 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 		// The table keeps one activation of a role on a scope, which always records the request its
 		// end rests on: activating again until later replaces it with this request, its justification
 		// and its approver; set anew once it has ended, it is a new grant, with a new id; and one that
-		// ends no later changes nothing, so is reported as nothing.
+		// ends no later changes nothing, so is reported as nothing. Ended is by the database's clock
+		// too, which history dates the old one's expiry by: by Config.Now alone, which can run ahead
+		// of it, the old one would be recorded as revoked by s.
 		rows, err := tx.Query(ctx, `
 			INSERT INTO rbac_grants AS g (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at,
 			  note, approved_by, created_by, updated_by)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
 			ON CONFLICT (tenant, principal, scope, role) WHERE source = 'activation' DO UPDATE SET
-			  id = CASE WHEN g.expires_at > $12 THEN g.id ELSE gen_random_uuid() END,
-			  created_at = CASE WHEN g.expires_at > $12 THEN g.created_at ELSE now() END,
+			  id = CASE WHEN g.expires_at > least($12, statement_timestamp()) THEN g.id ELSE gen_random_uuid() END,
+			  created_at = CASE WHEN g.expires_at > least($12, statement_timestamp()) THEN g.created_at ELSE now() END,
 			  expires_at = EXCLUDED.expires_at, note = EXCLUDED.note, approved_by = EXCLUDED.approved_by,
 			  updated_by = EXCLUDED.updated_by, updated_at = now()
 			WHERE g.expires_at <= $12 OR g.expires_at < EXCLUDED.expires_at
@@ -272,7 +274,7 @@ func (a *Authorizer) Deactivate(ctx context.Context, s Subject, on Resource, rol
 		return nil
 	}
 	scope := on.Scope()
-	return a.inTx(ctx, on.Tenant, s.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTx(ctx, on.Tenant, s.Principal, "Deactivate", func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lock(ctx, tx, on.Tenant, []string{scope.Key()}, []string{s.Principal.key()}); err != nil {
 			return ChangeEvent{}, err
 		}

@@ -84,7 +84,7 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 			return &InvalidError{Binding: b, Reason: "only Activate grants from " + SourceActivation}
 		}
 	}
-	return a.change(ctx, actor, on, ViaApply, grants, revokes, nil, nil, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.change(ctx, actor, on, "Apply", ViaApply, grants, revokes, nil, nil, func(tx pgx.Tx) (ChangeEvent, error) {
 		revoked, err := a.revoke(ctx, tx, on.Tenant, scope, revokes, grants)
 		if err != nil {
 			return ChangeEvent{}, err
@@ -112,9 +112,10 @@ func ownedRevoke(b Binding) error {
 
 // change makes a change to the grants on one scope as actor, or to eligibilities, which are
 // grants to come, with Apply's checks before its transaction and again under its locks, and
-// then write. named are the principals it names besides its bindings', such as an eligibility's
-// approvers. check is what else the change needs, run once the actor may make it.
-func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, via Via, grants, revokes []Binding,
+// then write. how is the call that makes it, named are the principals it names besides its
+// bindings', such as an eligibility's approvers, and check is what else the change needs, run
+// once the actor may make it.
+func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, how string, via Via, grants, revokes []Binding,
 	named []Principal, check func() error, write func(pgx.Tx) (ChangeEvent, error),
 ) error {
 	scope := on.Scope()
@@ -134,7 +135,7 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, via
 	if err := a.validate(ctx, au.roles, actor, via, on.Tenant, scope, grants, revokes); err != nil {
 		return err
 	}
-	return a.inTx(ctx, on.Tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTx(ctx, on.Tenant, actor.Principal, how, func(tx pgx.Tx) (ChangeEvent, error) {
 		// One change to a scope at a time, so two changes can't deadlock on its rows.
 		principals := map[string]bool{}
 		for _, b := range slices.Concat(grants, revokes) {
@@ -322,7 +323,7 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 		principals[g.Principal.key()] = true
 		named[i], on[i] = g.Principal, g.Scope
 	}
-	return a.inTx(ctx, tenant, actor, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTx(ctx, tenant, actor, "Import", func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lockAll(ctx, tx, tenant, slices.Collect(maps.Keys(scopes)), slices.Collect(maps.Keys(principals))); err != nil {
 			return ChangeEvent{}, err
 		}
@@ -982,11 +983,19 @@ func scopeGrants(scope Scope, bindings []Binding) []Grant {
 	return grants
 }
 
-// inTx runs fn in a transaction and hands what it changed to Config.OnChange there.
-func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, fn func(pgx.Tx) (ChangeEvent, error)) error {
+// inTx runs fn in a transaction, recording what it writes in history as actor's change made by
+// how, the call that makes it, and hands what it changed to Config.OnChange there.
+func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, how string, fn func(pgx.Tx) (ChangeEvent, error)) error {
 	return a.begin(ctx, func(tx pgx.Tx) error {
+		done, err := a.recording(ctx, tx, actor, how, "")
+		if err != nil {
+			return err
+		}
 		e, err := fn(tx)
 		if err != nil {
+			return err
+		}
+		if err := done(); err != nil {
 			return err
 		}
 		e.Tenant, e.Actor = tenant, actor
@@ -999,19 +1008,48 @@ func (a *Authorizer) begin(ctx context.Context, fn func(pgx.Tx) error) error {
 }
 
 // begin runs fn in a transaction of its own at READ COMMITTED, whatever the database's default,
-// as a change's checks must read what committed before it took its locks; on a pgx.Tx, as under
-// WithTx, in a savepoint of that transaction, whose isolation the locks check. PostgreSQL
-// refusing it for a race matches ErrConflict.
+// as a change's checks must read what committed before it took its locks; on any other DB, as a
+// pgx.Tx under WithTx, in a savepoint of that DB's transaction, whose isolation the locks check.
+// PostgreSQL refusing it for a race matches ErrConflict.
 func begin(ctx context.Context, db DB, fn func(pgx.Tx) error) error {
 	var err error
-	if conn, ok := db.(interface {
-		BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
-	}); ok {
+	if conn, ok := db.(ownTx); ok {
 		err = pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, fn)
 	} else {
-		err = pgx.BeginFunc(ctx, db, fn)
+		err = savepoint(ctx, db, fn)
 	}
 	return conflicted(err)
+}
+
+// ownTx is a DB that begin runs fn in a transaction of its own on, as a pool or a connection.
+type ownTx interface {
+	BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
+}
+
+// savepointEnd is how long a savepoint's release or rollback may take once its ctx is done.
+var savepointEnd = 10 * time.Second
+
+// savepoint runs fn in a savepoint, which it releases or rolls back even once ctx is done: pgx
+// sends nothing on a done ctx, which would leave the savepoint open, and the host's transaction
+// holding what a failed change wrote and its context for history, to commit with its own writes.
+func savepoint(ctx context.Context, db DB, fn func(pgx.Tx) error) error {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	// Bounded, as a done ctx's deadline no longer is, so a dead connection can't hold it for good;
+	// from when fn returns, or a change that took as long would leave it open.
+	end := func(f func(context.Context) error) error {
+		c, cancel := context.WithTimeout(context.WithoutCancel(ctx), savepointEnd)
+		defer cancel()
+		return f(c)
+	}
+	// After the release, a no-op.
+	defer func() { _ = end(tx.Rollback) }()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return end(tx.Commit)
 }
 
 // report hands a change to Config.OnChange in its transaction, unless it changed nothing.
@@ -1249,7 +1287,7 @@ func (a *Authorizer) DeleteGrants(ctx context.Context, actor Principal, tenant s
 	for i, s := range scopes {
 		keys[i] = s.Key()
 	}
-	return a.inTx(ctx, tenant, actor, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTx(ctx, tenant, actor, "DeleteGrants", func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lockAll(ctx, tx, tenant, keys, slices.Collect(maps.Keys(principals))); err != nil {
 			return ChangeEvent{}, err
 		}
@@ -1278,7 +1316,7 @@ func (a *Authorizer) DeleteGrants(ctx context.Context, actor Principal, tenant s
 
 // DeleteScope removes every grant, eligibility and deny on a scope, as DeleteScopes does.
 func (a *Authorizer) DeleteScope(ctx context.Context, actor Principal, tenant string, s Scope) error {
-	return a.DeleteScopes(ctx, actor, tenant, []Scope{s})
+	return a.deleteScopes(ctx, actor, tenant, "DeleteScope", []Scope{s})
 }
 
 // DeleteScopes removes every grant, eligibility and deny on scopes, as actor, as when resources
@@ -1291,6 +1329,10 @@ func (a *Authorizer) DeleteScope(ctx context.Context, actor Principal, tenant st
 // transaction would hold a lock for each, which PostgreSQL keeps in one table every session
 // shares: a few thousand can fill it.
 func (a *Authorizer) DeleteScopes(ctx context.Context, actor Principal, tenant string, scopes []Scope) error {
+	return a.deleteScopes(ctx, actor, tenant, "DeleteScopes", scopes)
+}
+
+func (a *Authorizer) deleteScopes(ctx context.Context, actor Principal, tenant, how string, scopes []Scope) error {
 	keys := make([]string, len(scopes))
 	for i, s := range scopes {
 		if !s.in(tenant) {
@@ -1302,7 +1344,7 @@ func (a *Authorizer) DeleteScopes(ctx context.Context, actor Principal, tenant s
 	// maxLocks once, or a few scopes would lock the whole tenant.
 	slices.Sort(keys)
 	keys = slices.Compact(keys)
-	return a.delete(ctx, actor, tenant, func(tx pgx.Tx) error { return lockAll(ctx, tx, tenant, keys, nil) },
+	return a.delete(ctx, actor, tenant, how, func(tx pgx.Tx) error { return lockAll(ctx, tx, tenant, keys, nil) },
 		deletion{denies: "scope = ANY($2::text[])", where: "scope = ANY($2::text[])"}, keys)
 }
 
@@ -1313,7 +1355,7 @@ func (a *Authorizer) DeletePrincipal(ctx context.Context, actor Principal, tenan
 	if !p.wellFormed(tenant) {
 		return fmt.Errorf("%w: principal %q is not valid", ErrInvalid, p.key())
 	}
-	return a.delete(ctx, actor, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, nil, []string{p.key()}) },
+	return a.delete(ctx, actor, tenant, "DeletePrincipal", func(tx pgx.Tx) error { return lock(ctx, tx, tenant, nil, []string{p.key()}) },
 		deletion{where: "principal = $2", members: "principal = $2"}, p.key())
 }
 
@@ -1339,6 +1381,10 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Pri
 	for {
 		var n int
 		err := a.begin(ctx, func(tx pgx.Tx) error {
+			done, err := a.recording(ctx, tx, actor, "DeletePrincipalEverywhere", "")
+			if err != nil {
+				return err
+			}
 			rows, err := tx.Query(ctx, `SELECT tenant FROM rbac_grants WHERE principal = $1
 				UNION SELECT tenant FROM rbac_eligibilities WHERE principal = $1
 				UNION SELECT tenant FROM rbac_memberships WHERE principal = $1
@@ -1351,6 +1397,7 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Pri
 				return err
 			}
 			n = len(tenants)
+			events := make([]ChangeEvent, 0, n)
 			// In tenant order, so two of these for one principal never deadlock.
 			for _, t := range tenants {
 				if err := lock(ctx, tx, t, nil, []string{p.key()}); err != nil {
@@ -1373,10 +1420,16 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Pri
 				if err != nil {
 					return err
 				}
-				if err := a.report(ctx, tx, ChangeEvent{
+				events = append(events, ChangeEvent{
 					Tenant: t, Actor: actor, Revoked: revoked, Ineligible: ended,
 					Left: left, EndedMemberships: memberships,
-				}); err != nil {
+				})
+			}
+			if err := done(); err != nil {
+				return err
+			}
+			for _, e := range events {
+				if err := a.report(ctx, tx, e); err != nil {
 					return err
 				}
 			}
@@ -1391,7 +1444,7 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Pri
 // DeleteTenant removes every grant, eligibility, custom role, deny, membership and group in a
 // tenant, as actor, so a tenant created later with its id starts with none.
 func (a *Authorizer) DeleteTenant(ctx context.Context, actor Principal, tenant string) error {
-	return a.delete(ctx, actor, tenant, func(tx pgx.Tx) error { return lockTenant(ctx, tx, tenant) },
+	return a.delete(ctx, actor, tenant, "DeleteTenant", func(tx pgx.Tx) error { return lockTenant(ctx, tx, tenant) },
 		deletion{roles: true, groups: true, denies: "TRUE", where: "TRUE", members: "TRUE"})
 }
 
@@ -1404,15 +1457,15 @@ type deletion struct {
 	denies, where, members string
 }
 
-// delete removes what del picks in a tenant as actor, once lock holds.
-func (a *Authorizer) delete(ctx context.Context, actor Principal, tenant string, lock func(pgx.Tx) error, del deletion, args ...any) error {
+// delete removes what del picks in a tenant as actor, by how, once lock holds.
+func (a *Authorizer) delete(ctx context.Context, actor Principal, tenant, how string, lock func(pgx.Tx) error, del deletion, args ...any) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
 	if err := a.identity(actor); err != nil {
 		return err
 	}
-	return a.inTx(ctx, tenant, actor, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTx(ctx, tenant, actor, how, func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lock(tx); err != nil {
 			return ChangeEvent{}, err
 		}
@@ -1484,45 +1537,61 @@ func removed[T any](ctx context.Context, a *Authorizer, tx pgx.Tx, table, column
 }
 
 // DeleteExpired removes grants, eligibilities, group members and tenant memberships that have
-// expired, which no longer give or allow anything, and returns how many. It passes over those a
-// change is holding, rather than wait on it, so the next run removes them. A race PostgreSQL
-// refuses matches ErrConflict.
+// expired, which no longer give or allow anything, and returns how many: those expired by
+// Config.Now and by the database's clock both, so history records each as an expiry. It passes
+// over those a change is holding, rather than wait on it, so the next run removes them. A race
+// PostgreSQL refuses matches ErrConflict.
 func (a *Authorizer) DeleteExpired(ctx context.Context) (int64, error) {
 	n, err := a.deleteExpired(ctx)
 	return n, conflicted(err)
 }
 
 func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
-	tag, err := a.db.Exec(ctx, `
-		DELETE FROM rbac_grants WHERE id IN (
-			SELECT id FROM rbac_grants WHERE expires_at <= $1 FOR UPDATE SKIP LOCKED)`, a.cfg.Now())
-	if err != nil {
-		return 0, err
+	// Each in a transaction of its own, which history records as expiries no one made.
+	expire := func(sql string) (int64, error) {
+		var n int64
+		err := a.begin(ctx, func(tx pgx.Tx) error {
+			done, err := a.recording(ctx, tx, Principal{}, "DeleteExpired", "expire")
+			if err != nil {
+				return err
+			}
+			if err := tx.QueryRow(ctx, sql, a.cfg.Now()).Scan(&n); err != nil {
+				return err
+			}
+			return done()
+		})
+		return n, err
 	}
-	ended, err := a.db.Exec(ctx, `
-		DELETE FROM rbac_eligibilities WHERE id IN (
-			SELECT id FROM rbac_eligibilities WHERE expires_at <= $1 FOR UPDATE SKIP LOCKED)`, a.cfg.Now())
-	if err != nil {
-		return 0, err
-	}
-	members, err := a.db.Exec(ctx, `
-		DELETE FROM rbac_members WHERE (tenant, group_id, principal, source) IN (
-			SELECT tenant, group_id, principal, source FROM rbac_members WHERE expires_at <= $1 FOR UPDATE SKIP LOCKED)`, a.cfg.Now())
-	if err != nil {
-		return 0, err
-	}
-	// An identity whose membership ended leaves the tenant's groups with it, as one that leaves
-	// the tenant does, so joining again gives back none of the groups it was in. Its own grants
-	// and eligibilities stay, as they do for an identity granted roles in a tenant it isn't in.
-	var memberships int64
-	err = a.db.QueryRow(ctx, `
-		WITH ended AS (
+	var total int64
+	// By the database's clock too, which history records an expiry by: a row expired by Config.Now
+	// alone, which can run ahead of it, would be recorded as deleted.
+	for _, sql := range []string{
+		`WITH d AS (DELETE FROM rbac_grants WHERE id IN (
+			SELECT id FROM rbac_grants WHERE expires_at <= least($1, statement_timestamp()) FOR UPDATE SKIP LOCKED) RETURNING 1)
+		SELECT count(*) FROM d`,
+		`WITH d AS (DELETE FROM rbac_eligibilities WHERE id IN (
+			SELECT id FROM rbac_eligibilities WHERE expires_at <= least($1, statement_timestamp()) FOR UPDATE SKIP LOCKED) RETURNING 1)
+		SELECT count(*) FROM d`,
+		`WITH d AS (DELETE FROM rbac_members WHERE (tenant, group_id, principal, source) IN (
+			SELECT tenant, group_id, principal, source FROM rbac_members WHERE expires_at <= least($1, statement_timestamp()) FOR UPDATE SKIP LOCKED) RETURNING 1)
+		SELECT count(*) FROM d`,
+		// An identity whose membership ended leaves the tenant's groups with it, as one that leaves
+		// the tenant does, so joining again gives back none of the groups it was in. Its own grants
+		// and eligibilities stay, as they do for an identity granted roles in a tenant it isn't in.
+		`WITH ended AS (
 		  DELETE FROM rbac_memberships WHERE (tenant, principal) IN (
-		    SELECT tenant, principal FROM rbac_memberships WHERE expires_at <= $1 FOR UPDATE SKIP LOCKED)
+		    SELECT tenant, principal FROM rbac_memberships WHERE expires_at <= least($1, statement_timestamp()) FOR UPDATE SKIP LOCKED)
 		  RETURNING tenant, principal
 		), left_groups AS (
 		  DELETE FROM rbac_members m USING ended e WHERE m.tenant = e.tenant AND m.principal = e.principal RETURNING 1
 		)
-		SELECT (SELECT count(*) FROM ended) + (SELECT count(*) FROM left_groups)`, a.cfg.Now()).Scan(&memberships)
-	return tag.RowsAffected() + ended.RowsAffected() + members.RowsAffected() + memberships, err
+		SELECT (SELECT count(*) FROM ended) + (SELECT count(*) FROM left_groups)`,
+	} {
+		n, err := expire(sql)
+		if err != nil {
+			return total, err
+		}
+		total += n
+	}
+	return total, nil
 }

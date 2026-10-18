@@ -179,7 +179,7 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 		expires[i] = pgtype.Timestamptz{Time: m.ExpiresAt, Valid: !m.ExpiresAt.IsZero()}
 		keys[i] = m.Principal.key()
 	}
-	return a.inTx(ctx, tenant, actor, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTx(ctx, tenant, actor, "SetMemberships", func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lockAll(ctx, tx, tenant, nil, keys); err != nil {
 			return ChangeEvent{}, err
 		}
@@ -300,7 +300,7 @@ func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string,
 	if a.owned[g.Source] {
 		return fmt.Errorf("%w: group %q: only the host makes groups from %s, through ImportGroups", ErrInvalid, g.ID, g.Source)
 	}
-	return a.inTx(ctx, tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTx(ctx, tenant, actor.Principal, "SetGroup", func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lock(ctx, tx, tenant, []string{groupKey(g.ID)}, nil); err != nil {
 			return ChangeEvent{}, err
 		}
@@ -344,7 +344,7 @@ func (a *Authorizer) ImportGroups(ctx context.Context, actor Principal, tenant s
 	for i, g := range set {
 		keys[i] = groupKey(g.ID)
 	}
-	return a.inTx(ctx, tenant, actor, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTx(ctx, tenant, actor, "ImportGroups", func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lockAll(ctx, tx, tenant, keys, nil); err != nil {
 			return ChangeEvent{}, err
 		}
@@ -426,7 +426,7 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 	if err := a.mayManageGroups(ctx, a.db, actor, root, managing(privileged), true); err != nil {
 		return err
 	}
-	return a.inTx(ctx, tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTx(ctx, tenant, actor.Principal, "DeleteGroup", func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lock(ctx, tx, tenant, []string{groupKey(id), nestingKey}, []string{groupPrincipal(id).key()}); err != nil {
 			return ChangeEvent{}, err
 		}
@@ -518,7 +518,7 @@ func (a *Authorizer) DeleteGroups(ctx context.Context, actor Principal, tenant s
 		scopes = append(scopes, groupKey(id))
 		principals[i] = groupPrincipal(id).key()
 	}
-	return a.inTx(ctx, tenant, actor, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTx(ctx, tenant, actor, "DeleteGroups", func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lockAll(ctx, tx, tenant, scopes, principals); err != nil {
 			return ChangeEvent{}, err
 		}
@@ -722,7 +722,7 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 	}
 	scopes, principals := memberLocks(set)
 	principals = append(principals, joinedLocks(joined)...)
-	return a.inTx(ctx, tenant, actor, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTx(ctx, tenant, actor, "ImportMembers", func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lockAll(ctx, tx, tenant, scopes, principals); err != nil {
 			return ChangeEvent{}, err
 		}
@@ -931,7 +931,7 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 	}
 	scopes, principals := memberLocks(slices.Concat(set, remove))
 	principals = append(principals, joinedLocks(joined)...)
-	return a.inTx(ctx, tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTx(ctx, tenant, actor.Principal, "ChangeMembers", func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lockAll(ctx, tx, tenant, scopes, principals); err != nil {
 			return ChangeEvent{}, err
 		}
@@ -1217,7 +1217,7 @@ func (a *Authorizer) DeleteMembers(ctx context.Context, actor Principal, tenant 
 		return fmt.Errorf("%w: a deletion names at most %d members", ErrInvalid, MaxBindings)
 	}
 	scopes, principals := memberLocks(members)
-	return a.inTx(ctx, tenant, actor, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTx(ctx, tenant, actor, "DeleteMembers", func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lockAll(ctx, tx, tenant, scopes, principals); err != nil {
 			return ChangeEvent{}, err
 		}
