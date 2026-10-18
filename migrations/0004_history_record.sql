@@ -1,6 +1,8 @@
 -- An expiry is a row that had expired by the statement that deletes it. The transaction's start,
 -- which 0003 read, can be long before it, as under a host's transaction, and earlier than the
 -- clock DeleteExpired picks expired rows by, so a row that expired since was recorded as deleted.
+-- And an update that changes a row's key, as a write around the package can, is recorded as the
+-- end of the row under its old key and its start under the new.
 CREATE OR REPLACE FUNCTION rbac_record() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
 <<rbac_record>>
 DECLARE
@@ -13,19 +15,31 @@ DECLARE
     op     text  := CASE TG_OP WHEN 'INSERT' THEN 'create' WHEN 'UPDATE' THEN 'update'
                    WHEN 'DELETE' THEN CASE WHEN change->>'op' = 'expire' AND (was->>'expires_at')::timestamptz <= statement_timestamp()
                      THEN 'expire' ELSE 'delete' END END;
-    entity text;
-    key    text;
+    entity text  := CASE TG_TABLE_NAME WHEN 'rbac_grants' THEN 'grant' WHEN 'rbac_roles' THEN 'role'
+                   WHEN 'rbac_denies' THEN 'deny' WHEN 'rbac_eligibilities' THEN 'eligibility'
+                   WHEN 'rbac_memberships' THEN 'membership' WHEN 'rbac_groups' THEN 'group' WHEN 'rbac_members' THEN 'member' END;
+    key    text  := CASE entity WHEN 'deny' THEN (r->>'scope') || ' ' || (r->>'id') WHEN 'membership' THEN r->>'principal'
+                   WHEN 'member' THEN pg_catalog.jsonb_build_array(r->>'group_id', r->>'principal', r->>'source')::text
+                   ELSE r->>'id' END;
+    was_key text := CASE entity WHEN 'deny' THEN (was->>'scope') || ' ' || (was->>'id') WHEN 'membership' THEN was->>'principal'
+                   WHEN 'member' THEN pg_catalog.jsonb_build_array(was->>'group_id', was->>'principal', was->>'source')::text
+                   ELSE was->>'id' END;
 BEGIN
-    CASE TG_TABLE_NAME
-    WHEN 'rbac_grants' THEN entity := 'grant'; key := r->>'id';
-    WHEN 'rbac_roles' THEN entity := 'role'; key := r->>'id';
-    WHEN 'rbac_denies' THEN entity := 'deny'; key := (r->>'scope') || ' ' || (r->>'id');
-    WHEN 'rbac_eligibilities' THEN entity := 'eligibility'; key := r->>'id';
-    WHEN 'rbac_memberships' THEN entity := 'membership'; key := r->>'principal';
-    WHEN 'rbac_groups' THEN entity := 'group'; key := r->>'id';
-    WHEN 'rbac_members' THEN entity := 'member';
-      key := pg_catalog.jsonb_build_array(r->>'group_id', r->>'principal', r->>'source')::text;
-    END CASE;
+    -- An update that moves a row to another key or tenant ends it under the old one, which would
+    -- otherwise read as live for good, and starts it under the new.
+    IF TG_OP = 'UPDATE' AND (was_key IS DISTINCT FROM key OR was->>'tenant' IS DISTINCT FROM is_now->>'tenant') THEN
+        INSERT INTO rbac_history (effective_at, tenant, entity, key, op, principal, role, scope, group_id, expires_at,
+          before, after, actor, on_behalf_of, how, request, reason)
+        VALUES (now(), was->>'tenant', entity, was_key, 'delete', was->>'principal',
+          CASE entity WHEN 'role' THEN was->>'id' ELSE was->>'role' END,
+          was->>'scope',
+          CASE entity WHEN 'group' THEN was->>'id' WHEN 'member' THEN was->>'group_id' END,
+          (was->>'expires_at')::timestamptz, was, NULL,
+          coalesce(change->>'actor', ''), coalesce(change->>'on_behalf_of', ''), coalesce(change->>'how', ''),
+          coalesce(change->>'request', ''), coalesce(change->>'reason', ''));
+        op := 'create';
+        was := NULL;
+    END IF;
     INSERT INTO rbac_history (effective_at, tenant, entity, key, op, principal, role, scope, group_id, expires_at,
       before, after, actor, on_behalf_of, how, request, reason)
     VALUES (

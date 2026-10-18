@@ -782,3 +782,26 @@ func TestAnExpiryAheadOfTheDatabasesClockIsRecordedAsOne(t *testing.T) {
 		t.Fatalf("recorded %+v", got)
 	}
 }
+
+func TestAnUpdateThatMovesARowIsRecordedAsItsEndAndStart(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.as(t, "u", "ops")
+	var last int64
+	recordedSince(t, h, &last)
+	// By hand: no change of the package's moves a row to another key.
+	if _, err := h.pool.Exec(ctx, `UPDATE rbac_members SET source = 'sync' WHERE principal = 'user:u'`); err != nil {
+		t.Fatal(err)
+	}
+	got := recordedSince(t, h, &last)
+	if len(got) != 2 || got[0].op != "delete" || got[1].op != "create" {
+		t.Fatalf("recorded %+v", got)
+	}
+	rows, err := h.pool.Query(ctx, `SELECT key FROM rbac_history WHERE entity = 'member' AND id > $1 - 2 ORDER BY id`, last)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keys, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || len(keys) != 2 || keys[0] == keys[1] {
+		t.Fatalf("keys = %v, %v", keys, err)
+	}
+}
