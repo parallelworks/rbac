@@ -238,12 +238,12 @@ func canonical(r RoleDefinition) RoleDefinition {
 // this one waited for the tenant is refused, to be tried again: the constraints were asked about
 // it as it was. One deleted meanwhile is created, as its grants went with it.
 //
-// Redefining a role so that its grants give more, or so that a role handing it out becomes
-// privileged, changes what grants already made give: Config.ValidateGrant is asked about each of
-// their grants and eligibilities in force that gives anything as the roles will be
-// (ViaRedefinition), and refusing any refuses the redefinition, as granting the role so would be
-// refused. Narrowing a role asks about none. One made while this waited for the tenant refuses it
-// too, to be tried again, as the host wasn't asked about it.
+// Redefining a role so that its grants give more, or so that it becomes privileged, changes what
+// grants already made give: Config.ValidateGrant is asked about each of its grants and
+// eligibilities in force that gives anything as the role will be (ViaRedefinition), and refusing
+// any refuses the redefinition, as granting the role so would be refused. Narrowing a role asks
+// about none. One made while this waited for the tenant refuses it too, to be tried again, as the
+// host wasn't asked about it.
 func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, r RoleDefinition) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)

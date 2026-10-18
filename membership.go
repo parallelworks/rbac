@@ -409,8 +409,8 @@ func privilegedGroup(ctx context.Context, q DB, tenant, id string) (exists, priv
 // hold, so it refuses a group that, or a group it is in, holds grants or eligibilities in force,
 // which revoking first shows, that a deny names or exempts, or that approves an eligibility's
 // activations: deleting one never changes access as a side effect. It refuses one from a source
-// the host owns, or with members, a place in a group or grants on it from one. Deleting a group
-// that doesn't exist does nothing.
+// the host owns, in a group from one, or with members, a place in a group or grants on it from
+// one. Deleting a group that doesn't exist does nothing.
 func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id string) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -473,6 +473,8 @@ func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string
 		  EXISTS (SELECT FROM rbac_denies, reached WHERE tenant = $1 AND (principals && keys OR exempt && keys)),
 		  EXISTS (SELECT FROM rbac_eligibilities, reached WHERE tenant = $1 AND approvers && keys AND (expires_at IS NULL OR expires_at > $3)),
 		  EXISTS (SELECT FROM rbac_members WHERE tenant = $1 AND (group_id = $4 OR principal = $2) AND source = ANY($5::text[]))
+		    OR EXISTS (SELECT FROM rbac_members m JOIN rbac_groups g ON g.tenant = m.tenant AND g.id = m.group_id
+		      WHERE m.tenant = $1 AND m.principal = $2 AND g.source = ANY($5::text[]))
 		    OR EXISTS (SELECT FROM rbac_grants WHERE tenant = $1 AND scope = $6 AND source = ANY($5::text[])
 		      AND (expires_at IS NULL OR expires_at > $3))`,
 		tenant, groupPrincipal(id).key(), a.cfg.Now(), id, slices.Sorted(maps.Keys(a.owned)), groupKey(id)).Scan(&held, &denied, &approves, &owned); err != nil {
@@ -486,7 +488,7 @@ func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string
 	case approves:
 		return fmt.Errorf("%w: an eligibility names group %q, or a group it is in, as an approver: change it first", ErrInvalid, id)
 	case owned:
-		return fmt.Errorf("%w: group %q has members, a place in a group or grants on it from a source only the host changes", ErrInvalid, id)
+		return fmt.Errorf("%w: group %q is in a group of the host's, or has members, a place in a group or grants on it from a source only the host changes", ErrInvalid, id)
 	}
 	return nil
 }
@@ -590,13 +592,13 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 	return e, err
 }
 
-// notOwnedGroups refuses changing groups from a source the host owns, which only it changes.
-func (a *Authorizer) notOwnedGroups(ctx context.Context, tx pgx.Tx, tenant string, ids []string) error {
+// notOwnedGroups refuses, on q, changing groups from a source the host owns, which only it changes.
+func (a *Authorizer) notOwnedGroups(ctx context.Context, q DB, tenant string, ids []string) error {
 	if len(a.owned) == 0 {
 		return nil
 	}
 	var id, source string
-	err := tx.QueryRow(ctx, `SELECT id, source FROM rbac_groups WHERE tenant = $1 AND id = ANY($2::text[]) AND source = ANY($3::text[])
+	err := q.QueryRow(ctx, `SELECT id, source FROM rbac_groups WHERE tenant = $1 AND id = ANY($2::text[]) AND source = ANY($3::text[])
 		ORDER BY id LIMIT 1`, tenant, ids, slices.Sorted(maps.Keys(a.owned))).Scan(&id, &source)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
@@ -911,6 +913,10 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 		return err
 	}
 	if err := a.mayChangeMembers(ctx, a.db, actor, tenant, groups, privileged, true); err != nil {
+		return err
+	}
+	// Refused before the host is asked about what the members would gain, and again under the locks.
+	if err := a.notOwnedGroups(ctx, a.db, tenant, groups); err != nil {
 		return err
 	}
 	for _, m := range set {

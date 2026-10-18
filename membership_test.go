@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/rbac"
@@ -380,7 +381,7 @@ func TestDeleteGroupLeavesAccessAndTheHostsMembersAsTheyAre(t *testing.T) {
 	groupManager, owner := h.as(t, "groups"), h.as(t, "owner")
 	h.join(t, "u")
 	h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "owner"))
-	for _, id := range []string{"denied", "exempt", "synced", "nested", "managed", "expired"} {
+	for _, id := range []string{"denied", "exempt", "synced", "nested", "placed", "managed", "expired"} {
 		if err := h.authz.SetGroup(ctx, groupManager, "t1", rbac.GroupDefinition{ID: id}); err != nil {
 			t.Fatal(err)
 		}
@@ -388,9 +389,11 @@ func TestDeleteGroupLeavesAccessAndTheHostsMembersAsTheyAre(t *testing.T) {
 	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "engineering", Source: "directory"}}); err != nil {
 		t.Fatal(err)
 	}
+	// A place in the host's group is the host's to change, from whatever source.
 	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{
 		{Group: "synced", Principal: identity("u"), Source: "directory"},
 		{Group: "engineering", Principal: groupOf("nested"), Source: "directory"},
+		{Group: "engineering", Principal: groupOf("placed")},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -402,7 +405,7 @@ func TestDeleteGroupLeavesAccessAndTheHostsMembersAsTheyAre(t *testing.T) {
 	managed := grant(rbac.Scope{Type: rbac.GroupScope, ID: "managed"}, "group.owner", rbac.User, "lead")
 	managed.Source = "directory"
 	h.seed(t, managed)
-	for _, id := range []string{"denied", "exempt", "synced", "nested", "managed"} {
+	for _, id := range []string{"denied", "exempt", "synced", "nested", "placed", "managed"} {
 		if err := h.authz.DeleteGroup(ctx, groupManager, "t1", id); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("deleting %s: %v", id, err)
 		}
@@ -1837,17 +1840,128 @@ func TestImportingMembersAsksAboutWhatAPrivilegedGroupHolds(t *testing.T) {
 }
 
 func TestTheHostsGroupsMembersOnlyItChanges(t *testing.T) {
+	var asked []rbac.GrantInput
 	h := grouped(t, func(c *rbac.Config) {
 		c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
 		c.Sources = []string{"directory"}
+		c.ValidateGrant = func(_ context.Context, _ rbac.DB, in rbac.GrantInput) error {
+			if in.Via == rbac.ViaMembership {
+				asked = append(asked, in)
+			}
+			return nil
+		}
 	})
 	ctx := t.Context()
-	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "synced", Source: "directory"}}); err != nil {
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{
+		{ID: "synced", Source: "directory"}, {ID: "synced-admins", Source: "directory", Privileged: true},
+	}); err != nil {
 		t.Fatal(err)
 	}
-	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "lead"))
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "lead"), grant(cluster.Scope(), "cluster.sudo", rbac.Group, "synced-admins"))
 	h.join(t, "u")
 	if err := h.authz.ChangeMembers(ctx, h.as(t, "lead"), "t1", []rbac.Member{{Group: "synced", Principal: identity("u")}}, nil); !errors.Is(err, rbac.ErrInvalid) {
 		t.Fatalf("adding a member to the host's group: %v", err)
+	}
+	// Refused before the host is asked about what the member would gain.
+	add := []rbac.Member{{Group: "synced-admins", Principal: identity("u")}}
+	if err := h.authz.ChangeMembers(ctx, h.as(t, "privileged"), "t1", add, nil); !errors.Is(err, rbac.ErrInvalid) || len(asked) != 0 {
+		t.Fatalf("adding a member to the host's privileged group: %v, asked %+v", err, asked)
+	}
+}
+
+// A change to members waits for a transaction changing a group it adds an identity to, and is
+// refused for what that commits: a privileged grant to it the host wasn't asked about, the group
+// made again as privileged, or the group taken by the host, whose members ImportMembers changes.
+func TestChangingMembersWaitsForTheGroupsItChanges(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		privileged bool
+		meanwhile  func(context.Context, *rbac.Authorizer) error
+		want       error
+	}{
+		{"a privileged grant to it", true, func(ctx context.Context, a *rbac.Authorizer) error {
+			return a.Import(ctx, host, "t1", []rbac.Grant{grant(rbac.Scope{Type: "org", ID: "o1"}, "cluster.admin", rbac.Group, "g")})
+		}, rbac.ErrConflict},
+		{"made again privileged", false, func(ctx context.Context, a *rbac.Authorizer) error {
+			if err := a.DeleteGroups(ctx, host, "t1", []string{"g"}); err != nil {
+				return err
+			}
+			if err := a.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "g", Privileged: true}}); err != nil {
+				return err
+			}
+			return a.Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.sudo", rbac.Group, "g")})
+		}, rbac.ErrConflict},
+		{"taken by the host", false, func(ctx context.Context, a *rbac.Authorizer) error {
+			return a.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "g", Source: "directory"}})
+		}, rbac.ErrInvalid},
+	} {
+		for name, add := range map[string]func(context.Context, *rbac.Authorizer, rbac.Subject, []rbac.Member) error{
+			"ChangeMembers": func(ctx context.Context, a *rbac.Authorizer, actor rbac.Subject, ms []rbac.Member) error {
+				return a.ChangeMembers(ctx, actor, "t1", ms, nil)
+			},
+			"ImportMembers": func(ctx context.Context, a *rbac.Authorizer, _ rbac.Subject, ms []rbac.Member) error {
+				return a.ImportMembers(ctx, host, "t1", ms)
+			},
+		} {
+			// The host changes its own groups' members.
+			if name == "ImportMembers" && errors.Is(c.want, rbac.ErrInvalid) {
+				continue
+			}
+			t.Run(c.name+"/"+name, func(t *testing.T) {
+				h := grouped(t, func(cfg *rbac.Config) {
+					cfg.Catalog = append(slices.Clone(cfg.Catalog), groupMembers)
+					cfg.Sources = []string{"directory"}
+				})
+				ctx := t.Context()
+				if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "g", Privileged: c.privileged}}); err != nil {
+					t.Fatal(err)
+				}
+				h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "privileged"))
+				h.join(t, "u")
+				actor := h.as(t, "privileged")
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				if err := c.meanwhile(ctx, h.authz.WithTx(tx)); err != nil {
+					t.Fatal(err)
+				}
+				done := make(chan error, 1)
+				go func() { done <- add(ctx, h.authz, actor, []rbac.Member{{Group: "g", Principal: identity("u")}}) }()
+				commitOnceWaitedOn(t, h, tx, done)
+				if err := <-done; !errors.Is(err, c.want) {
+					t.Fatalf("adding a member while %s: %v", c.name, err)
+				}
+				if got, err := h.authz.Members(ctx, "t1", "g"); err != nil || len(got) != 0 {
+					t.Fatalf("Members = %+v, %v", got, err)
+				}
+			})
+		}
+	}
+}
+
+// commitOnceWaitedOn commits tx once the change reporting to done waits on it, or has finished.
+func commitOnceWaitedOn(t *testing.T, h *harness, tx pgx.Tx, done chan error) {
+	t.Helper()
+	ctx := t.Context()
+	var pid int32
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	for waiting := false; !waiting; {
+		select {
+		case err := <-done:
+			done <- err
+			waiting = true
+		default:
+			// By the transaction it waits on, as other sessions on the server may wait on locks of their own.
+			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
