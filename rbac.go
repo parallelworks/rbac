@@ -725,7 +725,10 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 			}
 		}
 	}
-	var permList, pairs []string
+	var permList []string
+	// Empty, not nil, which pgx sends as NULL: `<> ALL(NULL)` is never true, so without an
+	// unprivileged pair, searches would read no custom role as privileged.
+	pairs := []string{}
 	permissionTypes := map[string]bool{}
 	for p := range perms {
 		permList = append(permList, string(p))
@@ -733,9 +736,7 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 		permissionTypes[t] = true
 	}
 	for k := range unprivileged {
-		if !k.p.managesAccess() {
-			pairs = append(pairs, string(k.p)+" "+k.t)
-		}
+		pairs = append(pairs, string(k.p)+" "+k.t)
 	}
 	slices.Sort(permList)
 	slices.Sort(pairs)

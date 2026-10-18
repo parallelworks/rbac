@@ -2276,7 +2276,6 @@ func TestTenantMembersAndThePublicNeverGetAGrantPermission(t *testing.T) {
 			member := h.as(t, "member")
 			// A role that gives cluster:grant is privileged and can't be public, so a grant of it to
 			// either gives nothing at all.
-			others := 0
 			if allowed(t, h, member, root, cluster) {
 				t.Fatal("the grant's other permissions")
 			}
@@ -2304,7 +2303,7 @@ func TestTenantMembersAndThePublicNeverGetAGrantPermission(t *testing.T) {
 			if _, err := h.pool.Exec(ctx, `INSERT INTO cs VALUES ('t1', $1)`, h.path(t, cluster)); err != nil {
 				t.Fatal(err)
 			}
-			for perm, want := range map[rbac.Permission]int{root: others, grantC: 0} {
+			for _, perm := range []rbac.Permission{root, grantC} {
 				pred, err := h.authz.Filter(ctx, member, perm, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
 				if err != nil {
 					t.Fatal(err)
@@ -2313,8 +2312,8 @@ func TestTenantMembersAndThePublicNeverGetAGrantPermission(t *testing.T) {
 				if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM cs WHERE `+pred.SQL, pred.Args...).Scan(&n); err != nil {
 					t.Fatal(err)
 				}
-				if n != want {
-					t.Errorf("Filter %s: %d clusters, want %d", perm, n, want)
+				if n != 0 {
+					t.Errorf("Filter %s: %d clusters, want none", perm, n)
 				}
 			}
 			b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}}

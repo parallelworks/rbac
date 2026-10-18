@@ -806,8 +806,9 @@ func (a *Authorizer) join(ctx context.Context, tx pgx.Tx, tenant string, actor P
 // ManagePrivilegedGroups on the tenant, removals included, and never to add the actor itself; a
 // constraint on either stops them. Config.ValidateGrant is asked about each grant and eligibility
 // of a privileged role a privileged group holds, for each identity added to it (ViaMembership), as
-// that identity's. Members from a source the host owns only the host changes, and what
-// ImportMembers refuses, this does.
+// that identity's. Removing someone from a group a deny names, or adding them to one it exempts,
+// lifts that deny for them, whatever it removes. Members from a source the host owns only the host
+// changes, and what ImportMembers refuses, this does.
 func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant string, add, remove []Member) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -846,21 +847,28 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 	if err := a.mayChangeMembers(ctx, a.db, actor, tenant, groups, privileged, true); err != nil {
 		return err
 	}
+	// The privileged groups an identity joins, whose holdings it gains.
+	joining := map[string]bool{}
 	for _, m := range set {
-		if privileged[m.Group] && m.Principal == actor.Principal {
+		if !privileged[m.Group] {
+			continue
+		}
+		if m.Principal == actor.Principal {
 			return &DeniedError{Permission: ManagePrivilegedGroups, Scope: TenantRoot(tenant), Reason: "no one adds themselves to a privileged group"}
 		}
+		if m.Principal.Kind != Group {
+			joining[m.Group] = true
+		}
 	}
-	asked, err := a.askMemberships(ctx, actor, tenant, set, privileged)
+	joined := slices.Sorted(maps.Keys(joining))
+	asked, err := a.askMemberships(ctx, actor, tenant, set, joined)
 	if err != nil {
 		return err
 	}
 	scopes, principals := memberLocks(slices.Concat(set, remove))
 	// Grants to a privileged group take its lock, so none is made while the members it gains are.
-	for g, p := range privileged {
-		if p {
-			principals = append(principals, groupPrincipal(g).key())
-		}
+	for _, g := range joined {
+		principals = append(principals, groupPrincipal(g).key())
 	}
 	return a.inTx(ctx, tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lockAll(ctx, tx, tenant, scopes, principals); err != nil {
@@ -876,13 +884,13 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 		if err := a.mayChangeMembers(ctx, tx, actor, tenant, groups, privileged, false); err != nil {
 			return ChangeEvent{}, err
 		}
-		gains, err := a.privilegedHeld(ctx, tx, tenant, privileged)
+		gains, err := a.privilegedHeld(ctx, tx, tenant, joined)
 		if err != nil {
 			return ChangeEvent{}, err
 		}
 		for _, g := range gains {
-			if was, ok := asked[g.key()]; (!ok || widens(was, g.role)) && slices.ContainsFunc(set, g.gainedBy) {
-				return ChangeEvent{}, fmt.Errorf("%w: what group %q holds changed while this change waited for it; try again", ErrConflict, g.group)
+			if was, ok := asked[g.key()]; !ok || widens(was, g.role) {
+				return ChangeEvent{}, fmt.Errorf("%w: what group %q holds changed while this change waited for it; try again", ErrConflict, g.binding.Principal.ID)
 			}
 		}
 		var e ChangeEvent
@@ -923,7 +931,7 @@ func privilegedGroups(ctx context.Context, q DB, tenant string, ids []string) (m
 func (a *Authorizer) mayChangeMembers(ctx context.Context, q DB, actor Subject, tenant string, groups []string, privileged map[string]bool, constraints bool) error {
 	checked := false
 	for _, g := range groups {
-		if p, ok := privileged[g]; ok && p {
+		if privileged[g] {
 			if !checked {
 				if err := a.mayManageGroups(ctx, q, actor, Resource{Tenant: tenant, Type: TenantScope, ID: tenant}, ManagePrivilegedGroups, constraints); err != nil {
 					return err
@@ -939,30 +947,15 @@ func (a *Authorizer) mayChangeMembers(ctx context.Context, q DB, actor Subject, 
 	return nil
 }
 
-// gain is a grant or eligibility of a privileged role a privileged group holds, which an identity
-// joining it gains.
-type gain struct {
-	group    string
-	scope    Scope
-	binding  Binding
-	role     RoleDefinition
-	eligible bool
+// gainedBy reports whether an identity m adds gains v, a privileged group's grant or eligibility.
+func (v revalidation) gainedBy(m Member) bool {
+	return m.Group == v.binding.Principal.ID && m.Principal.Kind != Group
 }
 
-func (g gain) key() string {
-	if g.eligible {
-		return "eligibility " + g.scope.Key() + " " + g.group + " " + string(g.binding.Role)
-	}
-	return "grant " + g.binding.ID
-}
-
-// gainedBy reports whether an identity m adds gains g.
-func (g gain) gainedBy(m Member) bool { return m.Group == g.group && m.Principal.Kind != Group }
-
-// as is g as the grant or eligibility of m, as the host is asked about it: until the sooner of its
+// as is v as the grant or eligibility of m, as the host is asked about it: until the sooner of its
 // end and m's.
-func (g gain) as(m Member) Binding {
-	b := g.binding
+func (v revalidation) as(m Member) Binding {
+	b := v.binding
 	b.ID, b.Principal = "", m.Principal
 	if !m.ExpiresAt.IsZero() && (b.ExpiresAt.IsZero() || m.ExpiresAt.Before(b.ExpiresAt)) {
 		b.ExpiresAt = m.ExpiresAt
@@ -971,16 +964,14 @@ func (g gain) as(m Member) Binding {
 }
 
 // privilegedHeld reads, on q, the grants and eligibilities in force of a privileged role that the
-// privileged groups among privileged hold.
-func (a *Authorizer) privilegedHeld(ctx context.Context, q DB, tenant string, privileged map[string]bool) ([]gain, error) {
-	var keys []string
-	for g, p := range privileged {
-		if p {
-			keys = append(keys, groupPrincipal(g).key())
-		}
-	}
-	if len(keys) == 0 {
+// privileged groups joined hold, which an identity joining one gains.
+func (a *Authorizer) privilegedHeld(ctx context.Context, q DB, tenant string, joined []string) ([]revalidation, error) {
+	if len(joined) == 0 {
 		return nil, nil
+	}
+	keys := make([]string, len(joined))
+	for i, g := range joined {
+		keys[i] = groupPrincipal(g).key()
 	}
 	now := a.cfg.Now()
 	rows, err := q.Query(ctx, `SELECT `+grantColumns+` FROM rbac_grants
@@ -1009,34 +1000,35 @@ func (a *Authorizer) privilegedHeld(ctx context.Context, q DB, tenant string, pr
 	for _, e := range eligible {
 		ids = append(ids, e.Role)
 	}
-	roles, err := a.tenantBook(ctx, q, tenant, ids)
+	roles, err := a.book(ctx, q, tenant, ids)
 	if err != nil {
 		return nil, err
 	}
-	var gains []gain
-	add := func(scope Scope, b Binding, eligible bool) {
+	var gains []revalidation
+	add := func(scope Scope, b Binding) {
 		if def, ok := roles.role(b.Role); ok && def.Privileged {
-			gains = append(gains, gain{group: b.Principal.ID, scope: scope, binding: b, role: def, eligible: eligible})
+			gains = append(gains, revalidation{scope: scope, binding: b, role: def})
 		}
 	}
 	for _, g := range grants {
-		add(g.Scope, g.Binding, false)
+		add(g.Scope, g.Binding)
 	}
 	for _, e := range eligible {
-		add(e.Scope, e.binding(), true)
+		add(e.Scope, e.binding())
 	}
 	return gains, nil
 }
 
 // askMemberships asks Config.ValidateGrant, before ChangeMembers' transaction, about each
 // privileged grant and eligibility each identity set adds to a privileged group gains, and returns
-// those it asked about, with the role as it asked.
-func (a *Authorizer) askMemberships(ctx context.Context, actor Subject, tenant string, set []Member, privileged map[string]bool) (map[string]RoleDefinition, error) {
-	gains, err := a.privilegedHeld(ctx, a.db, tenant, privileged)
+// those it asked about, with the role as it asked: by what the host was asked, so one changed in
+// place meanwhile, as an eligibility extended, is asked about again.
+func (a *Authorizer) askMemberships(ctx context.Context, actor Subject, tenant string, set []Member, joined []string) (map[revalidated]RoleDefinition, error) {
+	gains, err := a.privilegedHeld(ctx, a.db, tenant, joined)
 	if err != nil {
 		return nil, err
 	}
-	asked := map[string]RoleDefinition{}
+	asked := map[revalidated]RoleDefinition{}
 	var refused []error
 	for _, g := range gains {
 		roles := book{builtin: a.roles, custom: map[Role]RoleDefinition{g.role.ID: g.role}}
@@ -1245,17 +1237,15 @@ func strongHold(ctx context.Context, q DB, tenant string, roles book, bs []Bindi
 		}
 	}
 	if len(byGroup) > 0 {
-		rows, err := q.Query(ctx, `SELECT g FROM unnest($2::text[]) AS g
-			WHERE NOT EXISTS (SELECT FROM rbac_groups WHERE tenant = $1 AND id = g AND privileged) ORDER BY g`,
-			tenant, slices.Sorted(maps.Keys(byGroup)))
+		ids := slices.Sorted(maps.Keys(byGroup))
+		privileged, err := privilegedGroups(ctx, q, tenant, ids)
 		if err != nil {
 			return err
 		}
-		ordinary, err := pgx.CollectRows(rows, pgx.RowTo[string])
-		if err != nil {
-			return err
-		}
-		for _, g := range ordinary {
+		for _, g := range ids {
+			if privileged[g] {
+				continue
+			}
 			for _, b := range byGroup[g] {
 				errs = append(errs, refuse(b))
 			}

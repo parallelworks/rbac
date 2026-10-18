@@ -1572,6 +1572,9 @@ func TestChangingMembers(t *testing.T) {
 	if err := h.authz.ChangeMembers(ctx, lead, "t1", owned, nil); !errors.Is(err, rbac.ErrInvalid) {
 		t.Errorf("a member from the host's source: %v", err)
 	}
+	if err := h.authz.ChangeMembers(ctx, lead, "t1", in("devs", identity("u")), slices.Repeat(in("devs", identity("v")), rbac.MaxBindings)); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("too many members: %v", err)
+	}
 	if asked != nil {
 		t.Fatalf("asked = %+v", asked)
 	}
@@ -1688,5 +1691,111 @@ func TestChangingMembersOfAGroupMadeAgainMeanwhileIsTriedAgain(t *testing.T) {
 	}
 	if got, err := h.authz.Members(ctx, "t1", "devs"); err != nil || len(got) != 0 {
 		t.Fatalf("Members = %+v, %v", got, err)
+	}
+}
+
+func TestAnEligibilityChangedWhileMembersAreAskedAboutIsTriedAgain(t *testing.T) {
+	var h *harness
+	var meanwhile func(ctx context.Context) error
+	h = grouped(t, func(c *rbac.Config) {
+		c.ValidateGrant = func(ctx context.Context, _ rbac.DB, in rbac.GrantInput) error {
+			if do := meanwhile; do != nil && in.Via == rbac.ViaMembership {
+				meanwhile = nil
+				return do(ctx)
+			}
+			return nil
+		}
+	})
+	ctx := t.Context()
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "admins", Privileged: true}}); err != nil {
+		t.Fatal(err)
+	}
+	owner := h.as(t, "owner")
+	e := rbac.Eligibility{Role: "cluster.sudo", Principal: groupOf("admins"), MaxDuration: time.Hour, ExpiresAt: h.now.Add(time.Hour)}
+	if err := h.authz.SetEligibility(ctx, owner, cluster, e); err != nil {
+		t.Fatal(err)
+	}
+	h.join(t, "u")
+	// Made to never end while the host was asked about it ending in an hour.
+	meanwhile = func(ctx context.Context) error {
+		forever := e
+		forever.ExpiresAt = time.Time{}
+		return h.authz.SetEligibility(ctx, owner, cluster, forever)
+	}
+	add := []rbac.Member{{Group: "admins", Principal: identity("u")}}
+	if err := h.authz.ChangeMembers(ctx, h.as(t, "privileged"), "t1", add, nil); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("an eligibility extended while the host was asked: %v", err)
+	}
+	if err := h.authz.ChangeMembers(ctx, h.as(t, "privileged"), "t1", add, nil); err != nil {
+		t.Fatalf("tried again: %v", err)
+	}
+}
+
+func TestSearchesReadCustomRolesPrivilegedWhereEveryBuiltInRoleIs(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = slices.Clone(c.Catalog)
+		for i := range c.Catalog {
+			c.Catalog[i].Privileged = true
+		}
+	})
+	ctx := t.Context()
+	resources := hostTable(t, h)
+	// As a catalog change that makes every role privileged leaves it.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.view', '{cluster:view}', '{cluster}');
+		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'tenant', 't1', 'members', 't1', 'custom.view')`); err != nil {
+		t.Fatal(err)
+	}
+	member := h.as(t, "member")
+	listingsAgree(t, h, resources, member, view)
+	if holders, err := h.authz.Holders(ctx, view, resources[0]); err != nil || slices.Contains(holderPrincipals(holders), rbac.TenantMembers("t1")) {
+		t.Errorf("Holders = %+v, %v", holders, err)
+	}
+}
+
+func TestWideningAPrivilegedRoleAsksNothingOfGrantsThatGiveNothing(t *testing.T) {
+	var asked []rbac.GrantInput
+	h := grouped(t, func(c *rbac.Config) {
+		c.ValidateGrant = func(_ context.Context, _ rbac.DB, in rbac.GrantInput) error {
+			asked = append(asked, in)
+			if in.Binding.Principal.Kind == rbac.Members || in.Binding.Principal.Kind == rbac.Group {
+				return fmt.Errorf("%w: not through a group or the members", rbac.ErrInvalid)
+			}
+			return nil
+		}
+	})
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "devs"}}); err != nil {
+		t.Fatal(err)
+	}
+	// Privileged, as it gives root, and held by the members and an ordinary group, as a catalog
+	// change would leave it: through them it gives nothing.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.op', '{cluster:view,cluster:root}', '{cluster}');
+		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES
+		  ('t1', 'cluster', 'c1', 'members', 't1', 'custom.op'), ('t1', 'cluster', 'c1', 'group', 'devs', 'custom.op')`); err != nil {
+		t.Fatal(err)
+	}
+	asked = nil
+	widened := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view, login, root}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(ctx, admin, "t1", widened); err != nil || len(asked) != 0 {
+		t.Fatalf("widening a role only grants that give nothing hold: %v, asked %+v", err, asked)
+	}
+}
+
+func TestAPrivilegedRoleForTheMembersIsRefusedBeforeTheHostIsAsked(t *testing.T) {
+	var asked []rbac.GrantInput
+	h := setup(t, func(c *rbac.Config) {
+		c.ValidateGrant = func(_ context.Context, _ rbac.DB, in rbac.GrantInput) error {
+			asked = append(asked, in)
+			return nil
+		}
+	})
+	ctx := t.Context()
+	sudo := rbac.Binding{Role: "cluster.sudo", Principal: rbac.TenantMembers("t1")}
+	if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{sudo}}); !errors.Is(err, rbac.ErrInvalid) || len(asked) != 0 {
+		t.Fatalf("Apply: %v, asked %+v", err, asked)
+	}
+	if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: sudo}}); !errors.Is(err, rbac.ErrInvalid) || len(asked) != 0 {
+		t.Fatalf("Import: %v, asked %+v", err, asked)
 	}
 }

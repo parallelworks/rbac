@@ -294,7 +294,7 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 	if err != nil {
 		return Principal{}, err
 	}
-	roles, err := a.tenantBook(ctx, q, on.Tenant, []Role{act.Role})
+	roles, err := a.book(ctx, q, on.Tenant, []Role{act.Role})
 	if err != nil {
 		return Principal{}, err
 	}

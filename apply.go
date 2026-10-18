@@ -493,6 +493,8 @@ func (a *Authorizer) checkBinding(roles book, tenant string, scope Scope, b Bind
 		bad("a role that changes access can't be granted to a tenant's members or the public")
 	case b.Principal.Kind == Public && !def.Public:
 		bad("the role can't be granted to the public")
+	case b.Principal.Kind == Members && def.Privileged:
+		bad("a privileged role is held only by identities and privileged groups")
 	}
 	if !b.ExpiresAt.IsZero() && !b.ExpiresAt.After(now) {
 		bad("already expired")

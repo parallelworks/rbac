@@ -140,7 +140,10 @@ another store. Both search one tenant, and count only unconditional grants:
   are identities, changed only with `rbac.ManagePrivilegedGroups` on the tenant and never by an
   actor for itself, and `ValidateGrant` is asked about each privileged grant a new member gains
   (`rbac.ViaMembership`). An ordinary group's members change with `rbac.GroupMembers` on it
-  (`ChangeMembers`).
+  (`ChangeMembers`). A deny binds through ordinary groups too: removing someone from a group it
+  names, or adding them to one it exempts, lifts it for them, whatever it removes, so a deny that
+  must hold against those who change members names and exempts only identities and privileged
+  groups.
 - **Public access:** the zero `Subject` is anonymous and holds only what is granted to the public.
   Only a role marked `Public` can be granted to the public, and a grant to the public gives
   nothing once its role no longer is.

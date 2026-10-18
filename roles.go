@@ -37,8 +37,7 @@ func (b book) role(id Role) (RoleDefinition, bool) {
 func isCustom(id Role) bool { return strings.HasPrefix(string(id), CustomPrefix) }
 
 // book reads, on q, the definitions of the custom roles among ids in a tenant. Without one
-// among them it reads nothing. A role it reads is privileged by what it gives and the built-in
-// roles it lists, not the custom ones, so where the flag counts, read with tenantBook.
+// among them it reads nothing.
 func (a *Authorizer) book(ctx context.Context, q DB, tenant string, ids []Role) (book, error) {
 	b := book{builtin: a.roles}
 	var want []string
@@ -504,8 +503,8 @@ func widens(was, now RoleDefinition) bool {
 	return givesMore(was, now) || now.Privileged && !was.Privileged
 }
 
-// revalidation is a grant or eligibility of a role a redefinition widens, which the host is asked
-// about again as the role will be.
+// revalidation is a grant or eligibility the host is asked about again: of a role a redefinition
+// widens, as the role will be, or a privileged group's that an identity joining it gains.
 type revalidation struct {
 	scope   Scope
 	binding Binding
@@ -551,11 +550,31 @@ func (a *Authorizer) revalidations(ctx context.Context, q DB, tenant string, wid
 	if err != nil {
 		return nil, err
 	}
+	var groups []string
+	held := func(b Binding) {
+		if b.Principal.Kind == Group && widened[b.Role].Privileged {
+			groups = append(groups, b.Principal.ID)
+		}
+	}
+	for _, g := range grants {
+		held(g.Binding)
+	}
+	for _, e := range eligible {
+		held(e.binding())
+	}
+	var privileged map[string]bool
+	if len(groups) > 0 {
+		if privileged, err = privilegedGroups(ctx, q, tenant, groups); err != nil {
+			return nil, err
+		}
+	}
 	need := make([]revalidation, 0, len(grants)+len(eligible))
 	add := func(scope Scope, b Binding) {
 		def := widened[b.Role]
 		gives := slices.ContainsFunc(def.Permissions, func(p Permission) bool { return b.Principal.carries(def, p) })
-		if gives && a.known(tenant, b.Principal) && a.grantableOn(def, scope.Type) {
+		// A privileged role gives nothing through the tenant's members or a group that isn't privileged.
+		weak := def.Privileged && (b.Principal.broad() || b.Principal.Kind == Group && !privileged[b.Principal.ID])
+		if gives && !weak && a.known(tenant, b.Principal) && a.grantableOn(def, scope.Type) {
 			need = append(need, revalidation{scope: scope, binding: b, role: def})
 		}
 	}
