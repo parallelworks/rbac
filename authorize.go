@@ -428,15 +428,15 @@ func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]H
 	if err != nil || !r.Labels.asks() {
 		return holders, err
 	}
-	return a.labelled(ctx, r, holders)
+	return a.labeled(ctx, r, holders)
 }
 
-// labelled keeps of holders those whose holding satisfies r's label whatever the request: one
+// labeled keeps of holders those whose holding satisfies r's label whatever the request: one
 // that satisfies it only with the values a condition decided, which a read without the request
 // can't settle, is marked MaybeDenied, as the members and the public are, whose people hold
 // apart; and one that doesn't even then is left out. Each identity's holding is read after the
 // list, as its constraints run as for any read.
-func (a *Authorizer) labelled(ctx context.Context, r Resource, holders []Holder) ([]Holder, error) {
+func (a *Authorizer) labeled(ctx context.Context, r Resource, holders []Holder) ([]Holder, error) {
 	kept := holders[:0]
 	for _, h := range holders {
 		if h.Principal.broad() {
@@ -859,7 +859,7 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	if cols.Tenant == "" || cols.Path == "" || firstArg < 1 {
 		return Predicate{}, fmt.Errorf("%w: Filter needs the tenant and path columns and a first argument", ErrInvalid)
 	}
-	// Without the column, labelled rows would be kept that Authorize refuses.
+	// Without the column, labeled rows would be kept that Authorize refuses.
 	if len(a.labels) > 0 && cols.Labels == "" {
 		return Predicate{}, fmt.Errorf("%w: with labels declared, Filter needs the label column: '{}'::text[] for resources that carry none", ErrInvalid)
 	}

@@ -197,7 +197,7 @@ func (a *Authorizer) checkDeny(tenant string, d Deny) error {
 		// Checks read a subject's label values on the tenant, so a deny of one on a scope under it
 		// would be stored and bind no one.
 		if _, value := a.labels[t]; value && d.Scope.Type != TenantScope {
-			bad("permission %q is a label value, which is held on the tenant, so it is denied there alone", p)
+			bad("permission %q is a label value or a power to release, which is held on the tenant, so it is denied there alone", p)
 		}
 	}
 	for _, fault := range a.conditionFaults(d.Condition) {
@@ -339,7 +339,7 @@ func (a *Authorizer) mayDeny(ctx context.Context, actor Subject, on Resource) er
 	if name != "" {
 		return &DeniedError{Permission: perm, Scope: on.Scope(), Reason: "removed by " + name}
 	}
-	// Who can't see a labelled scope sets no deny on it, nor lifts one, which would widen access.
+	// Who can't see a labeled scope sets no deny on it, nor lifts one, which would widen access.
 	if dim, err := a.unsatisfied(ctx, actor, on); err != nil || dim != "" {
 		if err != nil {
 			return err
