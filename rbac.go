@@ -880,9 +880,7 @@ func actorKey(p Principal) string {
 // pool while it holds a connection. A transaction that fails to commit answers nothing, as a
 // failed read does.
 func snapshot[T any](ctx context.Context, a *Authorizer, read func(*Authorizer) (T, error)) (T, error) {
-	conn, ok := a.db.(interface {
-		BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
-	})
+	conn, ok := a.db.(ownTx)
 	if !ok {
 		return read(a)
 	}

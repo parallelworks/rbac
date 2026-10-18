@@ -48,9 +48,7 @@ func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read
 		return fmt.Errorf("%w: a read as of a time is read as of one time", ErrInvalid)
 	}
 	var tx pgx.Tx
-	if conn, ok := a.db.(interface {
-		BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
-	}); ok {
+	if conn, ok := a.db.(ownTx); ok {
 		tx, err = conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	} else {
 		tx, err = a.db.Begin(ctx)
