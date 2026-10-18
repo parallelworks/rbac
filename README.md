@@ -187,6 +187,21 @@ A change refused, as `ErrDenied` or `ErrInvalid`, writes nothing, so history doe
 failed attempt on a connection of the host's own, which keeps it when a host transaction the
 change was made in (`WithTx`) rolls back.
 
+`Export(ctx, from, limit, signer)` reads as `History` does and chains what it reads onto `from`,
+a `Checkpoint`: a SHA-256 hash chain over every record of the generation in order, signed by the
+host's `crypto.Signer`, such as a key in a key management service. Keep the records and each
+checkpoint where they can't be rewritten, as write-once storage. `VerifyChain` then shows that the
+records between two checkpoints are those history held, none dropped, changed or reordered, which
+a database's superuser couldn't forge past the last checkpoint stored. A checkpoint vouches for
+the records before it, not after: an audit verifies a generation from its `Genesis` to the latest
+checkpoint kept, and checks that checkpoint's `At` is as recent as the host exports, since
+`Export` signs one on every call, even one that reads nothing, so records dropped from the end
+leave the latest checkpoint old. A generation exported from the start again, as after `History`
+refuses a cursor, is chained anew: compare it with the last export, whose records are what
+history held up to its last checkpoint, since a superuser who deletes a cursor's record makes
+`History` refuse it. Keep the records so they read back as they were: times to the microsecond,
+and each row as JSON text, not parsed into a store's own form, which can reorder its keys.
+
 `AsOf(ctx, tenant, at, read)` reads a tenant as it was at a time, from its history: every check,
 list and search the read makes answers as it would have then, with the catalog as it is now, as
 for an access review of a past date. A change counts from when its transaction began, and none
