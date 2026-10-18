@@ -824,3 +824,20 @@ func actorKey(p Principal) string {
 	}
 	return p.key()
 }
+
+// snapshot runs read on an Authorizer that reads one snapshot of the database, as a read made of
+// several statements needs, so a change committing between them can't leave it describing a state
+// that never was: on a pool, a REPEATABLE READ, READ ONLY transaction of its own; under WithTx, the
+// host's transaction, at its isolation. Constraints run before it, as their hooks may query the
+// pool while it holds a connection.
+func (a *Authorizer) snapshot(ctx context.Context, read func(*Authorizer) error) error {
+	conn, ok := a.db.(interface {
+		BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
+	})
+	if !ok {
+		return read(a)
+	}
+	return pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
+		return read(a.WithTx(tx))
+	})
+}

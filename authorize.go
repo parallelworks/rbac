@@ -118,6 +118,19 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 		return Decision{Reason: unmet(spend)}, nil
 	}
 
+	// Explain reads in several statements, so in one snapshot, as Authorize reads in one.
+	var d Decision
+	err = a.snapshot(ctx, func(a *Authorizer) error {
+		var err error
+		d, err = a.explain(ctx, s, p, r, counts)
+		return err
+	})
+	return d, err
+}
+
+// explain is Explain's decision once no constraint removes p: every grant that allows it, or why
+// none does.
+func (a *Authorizer) explain(ctx context.Context, s Subject, p Permission, r Resource, counts broad) (Decision, error) {
 	vars, spend := a.vars(ctx, s, p, r), newBudget()
 	keys, err := a.keysOf(ctx, a.db, r.Tenant, s)
 	if err != nil {
@@ -345,12 +358,23 @@ func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]H
 	if err != nil || name != "" {
 		return nil, err
 	}
+	var holders []Holder
+	err = a.snapshot(ctx, func(a *Authorizer) error {
+		var err error
+		holders, err = a.holders(ctx, p, r)
+		return err
+	})
+	return holders, err
+}
+
+// holders is Holders' list once no constraint removes p.
+func (a *Authorizer) holders(ctx context.Context, p Permission, r Resource) ([]Holder, error) {
 	roles, custom := a.giving(p, r.Type), a.customGives(p, r.Type)
 	if len(roles) == 0 && !custom {
 		return nil, nil
 	}
-	// One time for every statement, so a grant, a membership or a group's member ending between
-	// them can't leave a holder that no single moment had.
+	// One time for every statement, as one snapshot, so a grant, a membership or a group's member
+	// ending between them can't leave a holder that no single moment had.
 	now := a.cfg.Now()
 	args := append([]any{
 		r.Tenant, r.path(), roles, now, p.managesAccess(),
@@ -595,6 +619,18 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 	if len(roles) == 0 && !custom {
 		return Reach{}, nil
 	}
+	var reach Reach
+	err = a.snapshot(ctx, func(a *Authorizer) error {
+		var err error
+		reach, err = a.reachable(ctx, s, p, tenant, resourceType, roles, custom)
+		return err
+	})
+	return reach, err
+}
+
+// reachable is Reachable's answer once no constraint removes p, for the built-in roles that give
+// it, and custom ones too where custom.
+func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, tenant, resourceType string, roles []string, custom bool) (Reach, error) {
 	keys, err := a.keysOf(ctx, a.db, tenant, s)
 	if err != nil {
 		return Reach{}, err

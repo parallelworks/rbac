@@ -60,9 +60,11 @@ var workspace = rbac.Resource{Tenant: "t1", Type: "workspace", ID: "w1", Ancesto
 
 type harness struct {
 	// ctx is the test's, which the helpers that write around the hooks use.
-	ctx    context.Context
-	pool   *pgxpool.Pool
-	authz  *rbac.Authorizer
+	ctx   context.Context
+	pool  *pgxpool.Pool
+	authz *rbac.Authorizer
+	// cfg is what authz was made with, to make another on a database of a test's own.
+	cfg    rbac.Config
 	now    time.Time
 	events []rbac.ChangeEvent
 }
@@ -105,7 +107,7 @@ func setupOn(t *testing.T, pool *pgxpool.Pool, mutate ...func(*rbac.Config)) *ha
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.authz = authz
+	h.authz, h.cfg = authz, cfg
 	creator(t, pool)
 	return h
 }
@@ -5788,5 +5790,117 @@ func TestDeletingARoleEndsItsEligibilities(t *testing.T) {
 	}
 	if _, err := h.authz.Activate(ctx, h.as(t, "x"), cluster, rbac.Activation{Role: operator.ID, Duration: time.Minute, Justification: "x"}); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("activating a role deleted and defined again: %v", err)
+	}
+}
+
+// racing is a pool on which change commits just before the first statement that reads denies, as
+// another session's change would commit between two of a read's statements.
+type racing struct {
+	*pgxpool.Pool
+	change func()
+}
+
+func (r *racing) race(sql string) {
+	if do := r.change; do != nil && strings.Contains(sql, "rbac_denies") {
+		r.change = nil
+		do()
+	}
+}
+
+func (r *racing) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	r.race(sql)
+	return r.Pool.Query(ctx, sql, args...)
+}
+
+func (r *racing) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	r.race(sql)
+	return r.Pool.QueryRow(ctx, sql, args...)
+}
+
+func (r *racing) BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error) {
+	tx, err := r.Pool.BeginTx(ctx, opts)
+	return &racingTx{Tx: tx, r: r}, err
+}
+
+type racingTx struct {
+	pgx.Tx
+	r *racing
+}
+
+func (tx *racingTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	tx.r.race(sql)
+	return tx.Tx.Query(ctx, sql, args...)
+}
+
+func (tx *racingTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	tx.r.race(sql)
+	return tx.Tx.QueryRow(ctx, sql, args...)
+}
+
+func TestAReadOfSeveralStatementsReadsOneSnapshot(t *testing.T) {
+	// Each starts as before, and the change makes it as after, so a read that mixed the two would
+	// answer what neither was.
+	for _, c := range []struct {
+		name          string
+		before, after string
+		read          func(t *testing.T, a *rbac.Authorizer, u rbac.Subject)
+	}{{
+		// Allowed through ops before; after, u isn't in ops, which a deny now names.
+		name:   "Explain",
+		before: `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'cluster', 'c1', 'group', 'ops', 'cluster.login')`,
+		after: `DELETE FROM rbac_members WHERE principal = 'user:u';
+			INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions) VALUES ('t1', 'cluster', 'c1', 'd', '{group:ops}', '{cluster:login}')`,
+		read: func(t *testing.T, a *rbac.Authorizer, u rbac.Subject) {
+			t.Helper()
+			if d, err := a.Explain(t.Context(), u, login, cluster); err != nil || !d.Allowed {
+				t.Errorf("Explain = %+v, %v", d, err)
+			}
+		},
+	}, {
+		// Granted and denied before; after, neither.
+		name: "Reachable",
+		before: `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'cluster.login');
+			INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions) VALUES ('t1', 'cluster', 'c1', 'd', '{user:u}', '{cluster:login}')`,
+		after: `DELETE FROM rbac_grants WHERE principal = 'user:u'; DELETE FROM rbac_denies`,
+		read: func(t *testing.T, a *rbac.Authorizer, u rbac.Subject) {
+			t.Helper()
+			if reach, err := a.Reachable(t.Context(), u, login, "t1", "cluster"); err != nil || len(reach.Except) == 0 {
+				t.Errorf("Reachable = %+v, %v", reach, err)
+			}
+		},
+	}, {
+		// In ops, granted, and in contractors, denied, before; after, in neither.
+		name: "Holders",
+		before: `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'cluster', 'c1', 'group', 'ops', 'cluster.login');
+			INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions) VALUES ('t1', 'cluster', 'c1', 'd', '{group:contractors}', '{cluster:login}')`,
+		after: `DELETE FROM rbac_members WHERE principal = 'user:u'`,
+		read: func(t *testing.T, a *rbac.Authorizer, u rbac.Subject) {
+			t.Helper()
+			if holders, err := a.Holders(t.Context(), login, cluster); err != nil || slices.Contains(holderPrincipals(holders), u.Principal) {
+				t.Errorf("Holders = %+v, %v", holders, err)
+			}
+		},
+	}} {
+		t.Run(c.name, func(t *testing.T) {
+			h := setup(t)
+			u := h.as(t, "u", "ops", "contractors")
+			if _, err := h.pool.Exec(t.Context(), c.before); err != nil {
+				t.Fatal(err)
+			}
+			db := &racing{Pool: h.pool}
+			db.change = func() {
+				if _, err := h.pool.Exec(t.Context(), c.after); err != nil {
+					t.Error(err)
+				}
+			}
+			a, err := rbac.New(db, h.cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.read(t, a, u)
+			if db.change != nil {
+				t.Fatal("the read never read denies")
+			}
+		})
 	}
 }
