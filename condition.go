@@ -8,6 +8,7 @@ import (
 	"maps"
 	"regexp"
 	"regexp/syntax"
+	"slices"
 	"strings"
 	"sync"
 
@@ -33,11 +34,11 @@ import (
 // A grant with one gives its role only where the expression is true. An expression that fails,
 // as one reading an attribute the host didn't pass does, is false. The zero Condition is none,
 // and one with a title or description has an expression. A pattern it matches is a string
-// literal, of bounded size. A check spends a bounded budget on its grants' conditions and another
-// on its denies', compiling them included: past it, a grant's condition is false and a deny's
-// applies, so what still needs one is refused. A check evaluates the cheapest first, so what it
-// decides doesn't rest on ids, and SetDeny bounds a scope's conditional denies together so that a
-// check always evaluates them whole.
+// literal, of bounded size. A check spends a bounded budget on its grants' conditions and another,
+// for each scope on its path, on its denies', compiling them included: past it, a grant's
+// condition is false and a deny's applies, so what still needs one is refused. A check evaluates
+// the cheapest first, so what it decides doesn't rest on ids, and SetDeny bounds a scope's
+// conditional denies together so that a check always evaluates them whole.
 //
 // Searches (Filter, Reachable, Holders) can't evaluate one: they count only unconditional
 // grants, Filter and Holders count a conditional deny as denying, and Reach.Conditional and
@@ -61,30 +62,38 @@ const (
 	maxCached = 256 << 10
 	// zoneCost is what reading a time in a named zone costs: it loads the zone each time.
 	zoneCost = 100
-	// maxCheckCost is what one check, listing or change may spend on conditions, compiling
-	// included, so many conditional grants on one path can't make it slow: once it is spent, no
-	// further condition holds, and what needs one is refused.
+	// maxCheckCost is what one check, listing or change may spend on its grants' conditions,
+	// compiling included, so many conditional grants on one path can't make it slow: once it is
+	// spent, no further condition holds, and what needs one is refused.
 	maxCheckCost = 8 * maxCost
-	// maxDenyCost is what one check may spend on its denies' conditions, apart from what it spends
-	// on its grants', so neither leaves the other nothing. A scope's conditional denies cost at most
-	// maxCheckCost together (SetDeny), so a path with as many on four scopes is evaluated whole.
-	maxDenyCost = 4 * maxCheckCost
 	// compilePerByte is what compiling a condition costs for each byte of it: compiling one
 	// takes about as long as evaluating eight units of cost for each.
 	compilePerByte = 8
 )
 
-// budget is what is left for a check to spend on conditions, and the conditions it has paid to
-// compile.
+// budget is what is left for a check to spend on conditions, the conditions it has paid to
+// compile, and what those it evaluated decided, for each action: one condition decides the same
+// for a request, so a check pays to evaluate it once however many grants or denies have it.
 type budget struct {
 	left     uint64
 	compiled map[string]bool
+	decided  map[string]decision
 }
 
-func newBudget() *budget { return &budget{left: maxCheckCost, compiled: map[string]bool{}} }
+// decision is what evaluating a condition decided.
+type decision struct{ held, evaluated bool }
 
-// newDenyBudget is a check's budget for its denies' conditions.
-func newDenyBudget() *budget { return &budget{left: maxDenyCost, compiled: map[string]bool{}} }
+func newBudget() *budget { return budgetOf(maxCheckCost) }
+
+// newDenyBudget is a check's budget for the denies' conditions on a path of scopes, apart from
+// what it spends on its grants', so neither leaves the other nothing: a scope's conditional denies
+// cost at most maxCheckCost together (SetDeny), so a check may spend that much for each scope of
+// its path, and evaluates them whole however deep it is.
+func newDenyBudget(path []string) *budget { return budgetOf(uint64(len(path)) * maxCheckCost) }
+
+func budgetOf(left uint64) *budget {
+	return &budget{left: left, compiled: map[string]bool{}, decided: map[string]decision{}}
+}
 
 // worstCost is the most a condition can cost a check: compiling it, and evaluating it to its bound.
 func worstCost(expr string) uint64 { return uint64(len(expr))*compilePerByte + maxCost }
@@ -92,6 +101,11 @@ func worstCost(expr string) uint64 { return uint64(len(expr))*compilePerByte + m
 // cheaper orders conditions by what compiling them costs, then by their text, as the same
 // condition decides the same: a check evaluating them in this order decides whatever their ids.
 func cheaper(x, y string) int { return cmp.Or(cmp.Compare(len(x), len(y)), strings.Compare(x, y)) }
+
+// cheapestFirst sorts held grants in the order checks evaluate their conditions.
+func cheapestFirst(held []holding) {
+	slices.SortStableFunc(held, func(x, y holding) int { return cheaper(x.Condition.Expression, y.Condition.Expression) })
+}
 
 func (b *budget) spend(cost uint64) { b.left -= min(cost, b.left) }
 
@@ -410,6 +424,13 @@ func (c *conditions) holds(b *budget, expr string, vars map[string]any) bool {
 // decide evaluates a condition on a request, spending from b, and reports whether it held and
 // whether it could be evaluated at all, as a deny fails closed where it couldn't.
 func (c *conditions) decide(b *budget, expr string, vars map[string]any) (held, evaluated bool) {
+	// The action is all that a budget's requests differ in.
+	action, _ := vars["action"].(string)
+	key := action + "\x00" + expr
+	if d, ok := b.decided[key]; ok {
+		return d.held, d.evaluated
+	}
+	defer func() { b.decided[key] = decision{held, evaluated} }()
 	if b.left == 0 {
 		return false, false
 	}

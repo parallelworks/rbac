@@ -72,8 +72,8 @@ type denial struct {
 	principals, exempt []string
 	condition          string
 	// unevaluated is set on a deny that removed a permission because its condition couldn't be
-	// evaluated, failing closed.
-	unevaluated bool
+	// evaluated, failing closed, and spent where that was because the check's budget ran out.
+	unevaluated, spent bool
 }
 
 // names reports whether d removes access from a holder Holders lists: one it names, or every
@@ -133,7 +133,7 @@ func (a *Authorizer) deniedBy(ds []denial, p Permission, spend *budget, vars map
 	for _, d := range conditional {
 		held, evaluated := a.conds.decide(spend, d.condition, vars)
 		if held || !evaluated {
-			d.unevaluated = !evaluated
+			d.unevaluated, d.spent = !evaluated, !evaluated && spend.left == 0
 			return d, true
 		}
 	}
@@ -144,8 +144,11 @@ func (d denial) String() string { return "deny " + d.id + " on " + d.scope }
 
 // removal is why d removed a permission, for Decision.Reason.
 func (d denial) removal() string {
-	if d.unevaluated {
-		return "removed by " + d.String() + ", whose condition couldn't be evaluated, as within the check's budget"
+	switch {
+	case d.spent:
+		return "removed by " + d.String() + ", whose condition couldn't be evaluated within the check's budget"
+	case d.unevaluated:
+		return "removed by " + d.String() + ", whose condition couldn't be evaluated"
 	}
 	return "removed by " + d.String()
 }
@@ -214,10 +217,9 @@ func (a *Authorizer) checkDeny(tenant string, d Deny) error {
 // DenyPermission(on's type) there (through on, an ancestor or the tenant), not removed by a
 // constraint. A deny only takes access away, so setting one needs no more than that; one can
 // deny its setter too. A scope's conditional denies are bounded together by what a check may spend
-// on conditions, so that one always evaluates them: about seven short ones, or three of the
-// longest. Whoever holds that permission on the scope, those the deny names
-// included, can replace or delete it, so to bind one who holds it there, set the deny on a
-// scope above where it doesn't.
+// on conditions, so that one always evaluates them: about seven short distinct conditions, or
+// three of the longest, however many denies share them. Whoever holds that permission on the scope, those the deny names included, can replace
+// or delete it, so to bind one who holds it there, set the deny on a scope above where it doesn't.
 func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d Deny) error {
 	if err := a.check(on); err != nil {
 		return err
@@ -253,8 +255,9 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 		// Past this, a check's budget could run out before it evaluated them, and the rest would
 		// deny everyone they name, whatever their conditions say.
 		if d.Condition.Expression != "" {
-			cost := worstCost(d.Condition.Expression)
-			for _, c := range conditions {
+			// Each condition once, as a check evaluates it once.
+			var cost uint64
+			for _, c := range slices.Compact(slices.Sorted(slices.Values(append(conditions, d.Condition.Expression)))) {
 				cost += worstCost(c)
 			}
 			if cost > maxCheckCost {

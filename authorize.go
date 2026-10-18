@@ -73,7 +73,7 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 		if len(ds) > 0 {
 			vars = a.vars(ctx, s, p, r)
 			// A deny decides first, as it binds every grant.
-			if d, ok := a.deniedBy(ds, p, newDenyBudget(), vars); ok {
+			if d, ok := a.deniedBy(ds, p, newDenyBudget(r.path()), vars); ok {
 				return Decision{DeniedBy: d.String(), Reason: d.removal()}, nil
 			}
 		}
@@ -109,7 +109,7 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 			vars = a.vars(ctx, s, p, r)
 		}
 		spend := newBudget()
-		slices.SortStableFunc(conditional, func(x, y holding) int { return cheaper(x.Condition.Expression, y.Condition.Expression) })
+		cheapestFirst(conditional)
 		for _, h := range conditional {
 			if a.conds.holds(spend, h.Condition.Expression, vars) {
 				return Decision{Allowed: true}, nil
@@ -125,7 +125,7 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 		if err != nil {
 			return Decision{}, err
 		}
-		if d, ok := a.deniedBy(ds, p, newDenyBudget(), vars); ok {
+		if d, ok := a.deniedBy(ds, p, newDenyBudget(r.path()), vars); ok {
 			return Decision{DeniedBy: d.String(), Reason: d.removal()}, nil
 		}
 	}
@@ -243,7 +243,14 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 		removed[p] = name != ""
 		return name != "", err
 	}
-	vars, spend, denySpend := a.vars(ctx, s, "", r), newBudget(), newDenyBudget()
+	// Each permission is decided as Authorize would decide it, on budgets of its own.
+	vars, spends := a.vars(ctx, s, "", r), map[Permission]*budget{}
+	spendOn := func(p Permission) *budget {
+		if spends[p] == nil {
+			spends[p] = newBudget()
+		}
+		return spends[p]
+	}
 	// A deny is settled before a grant's condition, as checks settle it.
 	denied := map[Permission]bool{}
 	isDenied := func(p Permission) bool {
@@ -251,7 +258,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 			return d
 		}
 		vars["action"] = string(p)
-		_, d := a.deniedBy(ds, p, denySpend, vars)
+		_, d := a.deniedBy(ds, p, newDenyBudget(r.path()), vars)
 		denied[p] = d
 		return d
 	}
@@ -260,7 +267,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 	if err := a.conditionsOf(ctx, a.db, r.Tenant, conditional); err != nil {
 		return nil, err
 	}
-	slices.SortStableFunc(conditional, func(x, y holding) int { return cheaper(x.Condition.Expression, y.Condition.Expression) })
+	cheapestFirst(conditional)
 	for _, h := range conditional {
 		def, _ := roles.role(h.Role)
 		for _, p := range def.Permissions {
@@ -278,7 +285,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 			}
 			// A condition reads the action, so it is evaluated for each permission.
 			vars["action"] = string(p)
-			given[p] = a.conds.holds(spend, h.Condition.Expression, vars)
+			given[p] = a.conds.holds(spendOn(p), h.Condition.Expression, vars)
 		}
 	}
 	var perms []Permission
