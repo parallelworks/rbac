@@ -23,7 +23,8 @@ type Decision struct {
 }
 
 // Authorize returns nil when the subject may do p to r, and otherwise an error matching
-// ErrDenied (or ErrInvalid for malformed input). Any error means no.
+// ErrDenied, or ErrInvalid for malformed input, as a permission no built-in role gives or a
+// resource type none is for, which can only be a mistake. Any error means no.
 func (a *Authorizer) Authorize(ctx context.Context, s Subject, p Permission, r Resource) error {
 	d, err := a.decide(ctx, s, p, r, false)
 	if err != nil {
@@ -45,8 +46,8 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 	if err := a.check(r); err != nil {
 		return Decision{}, err
 	}
-	if !p.Valid() {
-		return Decision{}, fmt.Errorf("%w: permission %q is not `type:verb`", ErrInvalid, p)
+	if err := a.askable(p, r.Type); err != nil {
+		return Decision{}, err
 	}
 	if err := a.subject(s); err != nil {
 		return Decision{}, err
@@ -149,6 +150,22 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 		d.Allowed, d.Reason = true, ""
 	}
 	return d, nil
+}
+
+// askable returns why no role, built in or custom, could ever give p on a resource type: p is
+// malformed, or a permission no built-in role gives, or no built-in role is for the type, as a
+// custom role gives only what they give, on their types. Such a question is a typo, not a
+// refusal, so it is invalid, as SetRole and SetDeny find it.
+func (a *Authorizer) askable(p Permission, resourceType string) error {
+	switch {
+	case !p.Valid():
+		return fmt.Errorf("%w: permission %q is not `type:verb`", ErrInvalid, p)
+	case !a.permissions[p]:
+		return fmt.Errorf("%w: permission %q is not one any built-in role gives", ErrInvalid, p)
+	case !a.types[resourceType]:
+		return fmt.Errorf("%w: resource type %q is not one any built-in role is for", ErrInvalid, resourceType)
+	}
+	return nil
 }
 
 // gives reports whether a grant of a role to a principal gives p on a resource type. A role
@@ -262,8 +279,8 @@ func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]P
 	if err := a.check(r); err != nil {
 		return nil, err
 	}
-	if !p.Valid() {
-		return nil, fmt.Errorf("%w: permission %q is not `type:verb`", ErrInvalid, p)
+	if err := a.askable(p, r.Type); err != nil {
+		return nil, err
 	}
 	name, err := a.denied(ctx, ConstraintInput{Tenant: r.Tenant, ResourceType: r.Type, Permission: p, Resource: &r})
 	if err != nil || name != "" {
@@ -410,8 +427,8 @@ func (a *Authorizer) searchable(ctx context.Context, s Subject, p Permission, te
 	if tenant == "" || !validName(resourceType) {
 		return nil, false, fmt.Errorf("%w: a search needs a tenant and a resource type", ErrInvalid)
 	}
-	if !p.Valid() {
-		return nil, false, fmt.Errorf("%w: permission %q is not `type:verb`", ErrInvalid, p)
+	if err := a.askable(p, resourceType); err != nil {
+		return nil, false, err
 	}
 	if err := a.subject(s); err != nil {
 		return nil, false, err

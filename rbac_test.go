@@ -499,6 +499,43 @@ func TestHolders(t *testing.T) {
 	}
 }
 
+func TestAMisspelledPermissionOrTypeIsInvalid(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	misspelled := cluster
+	misspelled.Type = "clutser"
+	cols := rbac.Columns{Tenant: "tenant", Path: "path"}
+	for name, ask := range map[string]func() error{
+		"a permission": func() error { return h.authz.Authorize(ctx, user("owner"), "cluster:lgoin", cluster) },
+		"a type":       func() error { return h.authz.Authorize(ctx, user("owner"), login, misspelled) },
+		"Explain":      func() error { _, err := h.authz.Explain(ctx, user("owner"), "cluster:lgoin", cluster); return err },
+		"Holders":      func() error { _, err := h.authz.Holders(ctx, login, misspelled); return err },
+		"Reachable": func() error {
+			_, err := h.authz.Reachable(ctx, user("owner"), "cluster:lgoin", "t1", "cluster")
+			return err
+		},
+		"Filter": func() error {
+			_, err := h.authz.Filter(ctx, user("owner"), login, "t1", "clutser", cols, 1)
+			return err
+		},
+		"the anonymous": func() error { return h.authz.Authorize(ctx, rbac.Subject{}, "cluster:lgoin", cluster) },
+	} {
+		if err := ask(); !errors.Is(err, rbac.ErrInvalid) || errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("%s misspelled: %v", name, err)
+		}
+	}
+	// A permission no built-in role gives on a type can still be asked about there: a custom role
+	// may give it, as it gives any permission the catalog has, on any type it has.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+		VALUES ('t1', 'custom.ws-login', '{cluster:login}', '{workspace}')`); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(workspace.Scope(), "custom.ws-login", rbac.User, "u"))
+	if !allowed(t, h, user("u"), login, workspace) {
+		t.Fatal("a permission a custom role gives on a type no built-in role gives it on")
+	}
+}
+
 func TestApplyPreventsEscalation(t *testing.T) {
 	h := setup(t)
 	h.seed(t,
@@ -2579,22 +2616,22 @@ func TestCustomRolesFollowTheCatalog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := later.Authorize(ctx, user("op"), root, cluster); !errors.Is(err, rbac.ErrDenied) {
-		t.Fatalf("a custom role giving a permission the catalog dropped: %v", err)
+	// Asking about a permission the catalog no longer has is a mistake, refused as one asking about
+	// a misspelled one is, rather than an answer.
+	if err := later.Authorize(ctx, user("op"), root, cluster); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a permission the catalog dropped: %v", err)
 	}
-	if reach, err := later.Reachable(ctx, user("op"), root, "t1", "cluster"); err != nil || reach.All || len(reach.Scopes) > 0 {
-		t.Fatalf("Reachable = %+v, %v", reach, err)
+	if _, err := later.Reachable(ctx, user("op"), root, "t1", "cluster"); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("Reachable: %v", err)
 	}
-	pred, err := later.Filter(ctx, user("op"), root, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := later.Filter(ctx, user("op"), root, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("Filter: %v", err)
 	}
-	var n int
-	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM clusters WHERE `+pred.SQL, pred.Args...).Scan(&n); err != nil || n != 0 {
-		t.Fatalf("Filter kept %d clusters, %v", n, err)
+	if _, err := later.Holders(ctx, root, resources[0]); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("Holders: %v", err)
 	}
-	if holders, err := later.Holders(ctx, root, resources[0]); err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.User, ID: "op"}) {
-		t.Fatalf("Holders = %v, %v", holders, err)
+	if perms, err := later.Permissions(ctx, user("op"), cluster); err != nil || slices.Contains(perms, root) {
+		t.Fatalf("a custom role giving a permission the catalog dropped: Permissions = %v, %v", perms, err)
 	}
 	if roles, err := later.CustomRoles(ctx, "t1"); err != nil || len(roles) != 1 || slices.Contains(roles[0].Permissions, root) {
 		t.Fatalf("CustomRoles = %+v, %v", roles, err)
