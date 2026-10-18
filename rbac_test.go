@@ -5904,3 +5904,62 @@ func TestAReadOfSeveralStatementsReadsOneSnapshot(t *testing.T) {
 		})
 	}
 }
+
+// uncommitting is a pool whose transactions fail to commit, as one whose context ends after its
+// last statement does.
+type uncommitting struct{ *pgxpool.Pool }
+
+var errCommit = errors.New("commit failed")
+
+func (u uncommitting) BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error) {
+	tx, err := u.Pool.BeginTx(ctx, opts)
+	return uncommittedTx{tx}, err
+}
+
+type uncommittedTx struct{ pgx.Tx }
+
+func (uncommittedTx) Commit(context.Context) error { return errCommit }
+
+func TestAReadWhoseSnapshotFailsToCommitAnswersNothing(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	u := h.as(t, "u")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	a, err := rbac.New(uncommitting{h.pool}, h.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, err := a.Explain(ctx, u, login, cluster); !errors.Is(err, errCommit) || d.Allowed || len(d.Grants) > 0 {
+		t.Errorf("Explain = %+v, %v", d, err)
+	}
+	if reach, err := a.Reachable(ctx, u, login, "t1", "cluster"); !errors.Is(err, errCommit) || reach.All || len(reach.Scopes) > 0 {
+		t.Errorf("Reachable = %+v, %v", reach, err)
+	}
+	if holders, err := a.Holders(ctx, login, cluster); !errors.Is(err, errCommit) || len(holders) > 0 {
+		t.Errorf("Holders = %+v, %v", holders, err)
+	}
+}
+
+func TestReadsUnderWithTxSeeTheHostsTransaction(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	u := h.as(t, "u")
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	authz := h.authz.WithTx(tx)
+	if err := authz.Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "u")}); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := authz.Explain(ctx, u, login, cluster); err != nil || !d.Allowed {
+		t.Errorf("Explain = %+v, %v", d, err)
+	}
+	if reach, err := authz.Reachable(ctx, u, login, "t1", "cluster"); err != nil || !slices.Contains(reach.Scopes, cluster.Scope()) {
+		t.Errorf("Reachable = %+v, %v", reach, err)
+	}
+	if holders, err := authz.Holders(ctx, login, cluster); err != nil || !slices.Contains(holderPrincipals(holders), u.Principal) {
+		t.Errorf("Holders = %+v, %v", holders, err)
+	}
+}

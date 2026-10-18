@@ -118,14 +118,9 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 		return Decision{Reason: unmet(spend)}, nil
 	}
 
-	// Explain reads in several statements, so in one snapshot, as Authorize reads in one.
-	var d Decision
-	err = a.snapshot(ctx, func(a *Authorizer) error {
-		var err error
-		d, err = a.explain(ctx, s, p, r, counts)
-		return err
-	})
-	return d, err
+	// Explain reads the subject's groups apart from its grants and denies, so in one snapshot, as
+	// Authorize reads them in one statement.
+	return snapshot(ctx, a, func(a *Authorizer) (Decision, error) { return a.explain(ctx, s, p, r, counts) })
 }
 
 // explain is Explain's decision once no constraint removes p: every grant that allows it, or why
@@ -358,21 +353,16 @@ func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]H
 	if err != nil || name != "" {
 		return nil, err
 	}
-	var holders []Holder
-	err = a.snapshot(ctx, func(a *Authorizer) error {
-		var err error
-		holders, err = a.holders(ctx, p, r)
-		return err
-	})
-	return holders, err
-}
-
-// holders is Holders' list once no constraint removes p.
-func (a *Authorizer) holders(ctx context.Context, p Permission, r Resource) ([]Holder, error) {
 	roles, custom := a.giving(p, r.Type), a.customGives(p, r.Type)
 	if len(roles) == 0 && !custom {
 		return nil, nil
 	}
+	return snapshot(ctx, a, func(a *Authorizer) ([]Holder, error) { return a.holders(ctx, p, r, roles, custom) })
+}
+
+// holders is Holders' list once no constraint removes p, for the built-in roles that give it, and
+// custom ones too where custom.
+func (a *Authorizer) holders(ctx context.Context, p Permission, r Resource, roles []string, custom bool) ([]Holder, error) {
 	// One time for every statement, as one snapshot, so a grant, a membership or a group's member
 	// ending between them can't leave a holder that no single moment had.
 	now := a.cfg.Now()
@@ -619,13 +609,9 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 	if len(roles) == 0 && !custom {
 		return Reach{}, nil
 	}
-	var reach Reach
-	err = a.snapshot(ctx, func(a *Authorizer) error {
-		var err error
-		reach, err = a.reachable(ctx, s, p, tenant, resourceType, roles, custom)
-		return err
+	return snapshot(ctx, a, func(a *Authorizer) (Reach, error) {
+		return a.reachable(ctx, s, p, tenant, resourceType, roles, custom)
 	})
-	return reach, err
 }
 
 // reachable is Reachable's answer once no constraint removes p, for the built-in roles that give
