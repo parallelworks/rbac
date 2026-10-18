@@ -1,8 +1,9 @@
 -- An expiry is a row that had expired by the statement that deletes it. The transaction's start,
 -- which 0003 read, can be long before it, as under a host's transaction, and earlier than the
 -- clock DeleteExpired picks expired rows by, so a row that expired since was recorded as deleted.
--- And an update that changes a row's key, as a write around the package can, is recorded as the
--- end of the row under its old key and its start under the new.
+-- And an update that changes a row's key, as Activate does to an activation that has ended and a
+-- write around the package can, is recorded as the end of the row under its old key, its expiry
+-- if it had expired, and its start under the new.
 CREATE OR REPLACE FUNCTION rbac_record() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
 <<rbac_record>>
 DECLARE
@@ -24,13 +25,22 @@ DECLARE
     was_key text := CASE entity WHEN 'deny' THEN (was->>'scope') || ' ' || (was->>'id') WHEN 'membership' THEN was->>'principal'
                    WHEN 'member' THEN pg_catalog.jsonb_build_array(was->>'group_id', was->>'principal', was->>'source')::text
                    ELSE was->>'id' END;
+    ended  boolean;
 BEGIN
     -- An update that moves a row to another key or tenant ends it under the old one, which would
     -- otherwise read as live for good, and starts it under the new.
     IF TG_OP = 'UPDATE' AND (was_key IS DISTINCT FROM key OR was->>'tenant' IS DISTINCT FROM is_now->>'tenant') THEN
+        -- An update revokes nothing, so a row it moves that had expired ended with its expiry, as an
+        -- activation Activate makes anew did, rather than by the change that moved it.
+        ended := (was->>'expires_at')::timestamptz <= statement_timestamp();
         INSERT INTO rbac_history (effective_at, tenant, entity, key, op, principal, role, scope, group_id, expires_at,
           before, after, actor, on_behalf_of, how, request, reason)
-        VALUES (now(), was->>'tenant', entity, was_key, 'delete', was->>'principal',
+        VALUES (
+          CASE WHEN ended THEN greatest((was->>'expires_at')::timestamptz,
+              (SELECT max(h.effective_at) FROM rbac_history h
+               WHERE h.tenant = was->>'tenant' AND h.entity = rbac_record.entity AND h.key = was_key))
+            ELSE now() END,
+          was->>'tenant', entity, was_key, CASE WHEN ended THEN 'expire' ELSE 'delete' END, was->>'principal',
           CASE entity WHEN 'role' THEN was->>'id' ELSE was->>'role' END,
           was->>'scope',
           CASE entity WHEN 'group' THEN was->>'id' WHEN 'member' THEN was->>'group_id' END,

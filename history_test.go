@@ -789,7 +789,7 @@ func TestAnUpdateThatMovesARowIsRecordedAsItsEndAndStart(t *testing.T) {
 	h.as(t, "u", "ops")
 	var last int64
 	recordedSince(t, h, &last)
-	// By hand: no change of the package's moves a row to another key.
+	// By hand, as a write around the package can: Activate moves only an activation that ended.
 	if _, err := h.pool.Exec(ctx, `UPDATE rbac_members SET source = 'sync' WHERE principal = 'user:u'`); err != nil {
 		t.Fatal(err)
 	}
@@ -803,5 +803,76 @@ func TestAnUpdateThatMovesARowIsRecordedAsItsEndAndStart(t *testing.T) {
 	}
 	if keys, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || len(keys) != 2 || keys[0] == keys[1] {
 		t.Fatalf("keys = %v, %v", keys, err)
+	}
+}
+
+// Activating again once an activation has ended moves its grant to a new id: the ended one is
+// recorded as the expiry it was, when it expired, not as a revoke by whoever activated again.
+func TestAnActivationMadeAnewRecordsTheEndedOneAsItsExpiry(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	owner, u := h.as(t, "owner"), h.as(t, "u")
+	if err := h.authz.SetEligibility(ctx, owner, cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: u.Principal, MaxDuration: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	// On the database's clock, which dates an expiry no earlier than the change before it, so the
+	// activation ends after it is made, and ends by both clocks before it is made anew.
+	h.now = time.Now()
+	activate := rbac.Activation{Role: "cluster.sudo", Duration: 250 * time.Millisecond, Justification: "INC-1"}
+	first, err := h.authz.Activate(ctx, u, cluster, activate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `SELECT pg_sleep(extract(epoch FROM $1 - clock_timestamp()))`, first.ExpiresAt); err != nil {
+		t.Fatal(err)
+	}
+	h.now = first.ExpiresAt
+	again, err := h.authz.Activate(ctx, u, cluster, activate)
+	if err != nil || again.ID == first.ID {
+		t.Fatalf("activated anew %+v, %v", again, err)
+	}
+	rows, err := h.pool.Query(ctx, `SELECT key || ' ' || op FROM rbac_history WHERE entity = 'grant' AND key IN ($1, $2) ORDER BY id`,
+		first.ID, again.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if want := []string{first.ID + " create", first.ID + " expire", again.ID + " create"}; err != nil || !slices.Equal(got, want) {
+		t.Fatalf("recorded %v, %v, want %v", got, err, want)
+	}
+	var expired time.Time
+	if err := h.pool.QueryRow(ctx, `SELECT effective_at FROM rbac_history WHERE entity = 'grant' AND key = $1 AND op = 'expire'`,
+		first.ID).Scan(&expired); err != nil || !expired.Equal(first.ExpiresAt) {
+		t.Fatalf("expired at %v, %v, want %v", expired, err, first.ExpiresAt)
+	}
+}
+
+// The host's clock can run ahead of the database's, which history records an expiry by: an
+// activation ended by Config.Now alone is extended, not made anew, so the one before isn't recorded
+// as revoked by whoever activated again.
+func TestAnActivationEndedAheadOfTheDatabasesClockIsExtended(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	owner, u := h.as(t, "owner"), h.as(t, "u")
+	if err := h.authz.SetEligibility(ctx, owner, cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: u.Principal, MaxDuration: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	h.now = time.Now().Add(time.Hour)
+	activate := rbac.Activation{Role: "cluster.sudo", Duration: time.Minute, Justification: "INC-1"}
+	first, err := h.authz.Activate(ctx, u, cluster, activate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.now = h.now.Add(2 * time.Minute)
+	again, err := h.authz.Activate(ctx, u, cluster, activate)
+	if err != nil || again.ID != first.ID {
+		t.Fatalf("activated %+v, %v, want %s extended", again, err, first.ID)
+	}
+	rows, err := h.pool.Query(ctx, `SELECT op FROM rbac_history WHERE entity = 'grant' AND key = $1 ORDER BY id`, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || !slices.Equal(got, []string{"create", "update"}) {
+		t.Fatalf("recorded %v, %v", got, err)
 	}
 }
