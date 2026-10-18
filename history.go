@@ -162,8 +162,9 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 	var generation string
 	var records []Record
 	// On one connection, so the cursor is checked on the server it reads: a pool's connections can
-	// reach both an old primary and the new one.
-	err := a.begin(ctx, func(tx pgx.Tx) error {
+	// reach both an old primary and the new one. Not a.begin, which refuses changes as of a time:
+	// this only reads.
+	err := begin(ctx, a.db, func(tx pgx.Tx) error {
 		// The timeline WAL is written on, which promotion changes at once; the last checkpoint's
 		// changes only once the next completes, minutes later.
 		var held bool

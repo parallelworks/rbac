@@ -620,8 +620,10 @@ type Config struct {
 
 // Authorizer decides and changes grants, on the tables Migrate creates.
 type Authorizer struct {
-	db         DB
-	cfg        Config
+	db  DB
+	cfg Config
+	// asOf is set on an Authorizer AsOf gave, which reads the past and changes nothing.
+	asOf       bool
 	roles      map[Role]RoleDefinition
 	containers map[string]bool
 	// containerTypes are the containers' types, sorted.
@@ -796,6 +798,11 @@ func vocabulary(declared []Permission, given map[Permission]bool, roleTypes map[
 // in several statements, on tx at its isolation: at READ COMMITTED each reads a snapshot of its
 // own, so a change committing between them can mix two states.
 func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
+	// One AsOf gave reads its own transaction, whose views are the past: on another, it would read
+	// the tables as they are now.
+	if a.asOf {
+		return a
+	}
 	b := *a
 	b.db = tx
 	return &b
@@ -873,9 +880,7 @@ func actorKey(p Principal) string {
 // pool while it holds a connection. A transaction that fails to commit answers nothing, as a
 // failed read does.
 func snapshot[T any](ctx context.Context, a *Authorizer, read func(*Authorizer) (T, error)) (T, error) {
-	conn, ok := a.db.(interface {
-		BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
-	})
+	conn, ok := a.db.(ownTx)
 	if !ok {
 		return read(a)
 	}
