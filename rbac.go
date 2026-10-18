@@ -492,7 +492,9 @@ type Config struct {
 	// catalog leaving one out, as one an operator configures may, refuses it like any permission
 	// no grant gives. A check or search of a permission not among them, or of a resource type none
 	// of them nor any built-in role is for, is refused as invalid, as a typo, and New refuses a
-	// built-in role giving one. Empty, they are what the built-in roles give.
+	// built-in role giving one: they include what the package checks for the host that the
+	// built-in roles give, `:grant` and `:deny` permissions and DefineRoles. Empty, they are what
+	// the built-in roles give.
 	Permissions []Permission
 	// Attributes declares the attributes conditions read, so one misnamed or of another type is
 	// refused when a condition is stored; undeclared, any is read.

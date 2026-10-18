@@ -39,6 +39,16 @@ var catalog = []rbac.RoleDefinition{
 	{ID: "tenant.roles", Permissions: []rbac.Permission{rbac.DefineRoles}, ResourceTypes: []string{"tenant"}},
 }
 
+// declaring is what a host declares it checks (Config.Permissions): more, and everything roles
+// give.
+func declaring(roles []rbac.RoleDefinition, more ...rbac.Permission) []rbac.Permission {
+	ps := slices.Clone(more)
+	for _, r := range roles {
+		ps = append(ps, r.Permissions...)
+	}
+	return ps
+}
+
 // A cluster in workspace w1 of org o1. setup grants "owner" its admin role, as a host does
 // for whoever creates one.
 var cluster = rbac.Resource{
@@ -183,6 +193,9 @@ func TestNewRejectsBadConfiguration(t *testing.T) {
 		"unnamed constraint": {Catalog: catalog, ValidateGrant: ok, Constraints: []rbac.Constraint{{
 			Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) { return true, nil },
 		}}},
+		// A built-in role naming a permission the host never checks is a typo in the catalog.
+		"a built-in role giving a permission not declared": {Catalog: catalog, Permissions: []rbac.Permission{view, login, root}, ValidateGrant: ok},
+		"a malformed declared permission":                  {Catalog: catalog, Permissions: declaring(catalog, "login"), ValidateGrant: ok},
 	} {
 		if _, err := rbac.New(&pgxpool.Pool{}, cfg); err == nil {
 			t.Errorf("%s: New accepted it", name)
@@ -504,6 +517,7 @@ func TestAMisspelledPermissionOrTypeIsInvalid(t *testing.T) {
 	ctx := t.Context()
 	misspelled := cluster
 	misspelled.Type = "clutser"
+	u := rbac.Principal{Kind: rbac.User, ID: "u"}
 	cols := rbac.Columns{Tenant: "tenant", Path: "path"}
 	for name, ask := range map[string]func() error{
 		"a permission":         func() error { return h.authz.Authorize(ctx, user("owner"), "cluster:lgoin", cluster) },
@@ -531,6 +545,23 @@ func TestAMisspelledPermissionOrTypeIsInvalid(t *testing.T) {
 		"a type Permissions": func() error { _, err := h.authz.Permissions(ctx, user("owner"), misspelled); return err },
 		"a type Grantable":   func() error { _, err := h.authz.Grantable(ctx, user("owner"), misspelled); return err },
 		"the anonymous":      func() error { return h.authz.Authorize(ctx, rbac.Subject{}, "cluster:lgoin", cluster) },
+		"a type Apply": func() error {
+			return h.authz.Apply(ctx, user("owner"), misspelled, rbac.Change{Revoke: []rbac.Binding{{Role: "cluster.login", Principal: u}}})
+		},
+		"a type SetDeny": func() error {
+			return h.authz.SetDeny(ctx, user("owner"), misspelled, rbac.Deny{ID: "d", Principals: []rbac.Principal{u}, Permissions: []rbac.Permission{login}})
+		},
+		"a type DeleteDeny": func() error { return h.authz.DeleteDeny(ctx, user("owner"), misspelled, "d") },
+		"a type SetEligibility": func() error {
+			return h.authz.SetEligibility(ctx, user("owner"), misspelled, rbac.Eligibility{Role: "cluster.login", Principal: u})
+		},
+		"a type DeleteEligibility": func() error {
+			return h.authz.DeleteEligibility(ctx, user("owner"), misspelled, "cluster.login", u)
+		},
+		"a type Activate": func() error {
+			_, err := h.authz.Activate(ctx, user("u"), misspelled, rbac.Activation{Role: "cluster.login", Duration: time.Hour, Justification: "on call"})
+			return err
+		},
 	} {
 		if err := ask(); !errors.Is(err, rbac.ErrInvalid) || errors.Is(err, rbac.ErrDenied) {
 			t.Errorf("%s misspelled: %v", name, err)
@@ -553,18 +584,8 @@ func TestAMisspelledPermissionOrTypeIsInvalid(t *testing.T) {
 }
 
 func TestTheHostDeclaresThePermissionsItChecks(t *testing.T) {
-	ok := func(context.Context, rbac.DB, rbac.GrantInput) error { return nil }
-	// A built-in role naming a permission the host never checks is a typo in the catalog.
-	if _, err := rbac.New(&pgxpool.Pool{}, rbac.Config{Catalog: catalog, Permissions: []rbac.Permission{view, login, root}, ValidateGrant: ok}); err == nil {
-		t.Fatal("New accepted a built-in role giving a permission the host doesn't check")
-	}
-	if _, err := rbac.New(&pgxpool.Pool{}, rbac.Config{Catalog: catalog, Permissions: []rbac.Permission{"login"}, ValidateGrant: ok}); err == nil {
-		t.Fatal("New accepted a malformed permission")
-	}
 	// The host checks storage:mount, which its catalog, configured by an operator, leaves out.
-	h := setup(t, func(c *rbac.Config) {
-		c.Permissions = []rbac.Permission{view, login, root, grantC, "workspace:view", "workspace:grant", "tenant:view", "tenant:grant", rbac.DefineRoles, "storage:mount"}
-	})
+	h := setup(t, func(c *rbac.Config) { c.Permissions = declaring(c.Catalog, "storage:mount") })
 	ctx := t.Context()
 	storage := rbac.Resource{Tenant: "t1", Type: "storage", ID: "s1", Ancestors: cluster.Ancestors}
 	if err := h.authz.Authorize(ctx, user("owner"), "storage:mount", storage); !errors.Is(err, rbac.ErrDenied) || errors.Is(err, rbac.ErrInvalid) {
@@ -2656,12 +2677,8 @@ func TestCustomRolesFollowTheCatalog(t *testing.T) {
 		without[i].Permissions = slices.DeleteFunc(slices.Clone(r.Permissions), func(p rbac.Permission) bool { return p == root })
 	}
 	// It still checks root, which no role gives now.
-	checks := []rbac.Permission{root}
-	for _, r := range without {
-		checks = append(checks, r.Permissions...)
-	}
 	later, err := rbac.New(h.pool, rbac.Config{
-		Catalog: without, ContainerTypes: []string{"org", "workspace"}, Permissions: checks,
+		Catalog: without, ContainerTypes: []string{"org", "workspace"}, Permissions: declaring(without, root),
 		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
 	})
 	if err != nil {

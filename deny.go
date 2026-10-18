@@ -265,10 +265,14 @@ func (a *Authorizer) DeleteDeny(ctx context.Context, actor Subject, on Resource,
 	})
 }
 
-// mayDeny checks, before the transaction, that actor may set and delete the denies on a scope.
-// The constraints run here only, as in Apply: a hook that queries the pool while the
-// transaction holds a connection can wait forever on a busy pool.
+// mayDeny checks, before the transaction, that actor may set and delete the denies on a scope,
+// one of a type the host has, as changing does for grants. The constraints run here only, as in
+// Apply: a hook that queries the pool while the transaction holds a connection can wait forever
+// on a busy pool.
 func (a *Authorizer) mayDeny(ctx context.Context, actor Subject, on Resource) error {
+	if err := a.scopeOf(on); err != nil {
+		return err
+	}
 	perm := DenyPermission(on.Type)
 	if actor.Principal == (Principal{}) {
 		return &DeniedError{Permission: perm, Scope: on.Scope(), Reason: "an anonymous subject changes nothing"}

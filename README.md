@@ -145,9 +145,10 @@ permission, so an error shown to a user shows no policy; its fields say why.
   `DeleteScope` in the transaction that deletes it, for each scope under it too, and rewrite the
   stored paths below a container when it moves.
 - **Permissions:** a check or search of a permission, or a resource type, the host doesn't have
-  is refused as `rbac.ErrInvalid`, as a typo, not denied. They are what the catalog's roles give
-  and are for, or with `Config.Permissions` every permission the host checks, which a catalog an
-  operator configures can leave out of every role: then it is denied like any other.
+  is refused as `rbac.ErrInvalid`, as a typo, not denied, as is a change on a scope of such a
+  type. They are what the catalog's roles give and are for, or with `Config.Permissions` every
+  permission the host checks, which a catalog an operator configures can leave out of every role:
+  then it is denied like any other.
 - **Limits:** a change takes at most `rbac.MaxBindings` bindings; a principal holds a role on a
   scope at most `rbac.MaxGrantsPerRole` times; a scope holds at most `rbac.MaxDenies` denies; a
   tenant has at most `rbac.MaxCustomRoles` custom roles. The others are exported beside them.
