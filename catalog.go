@@ -17,7 +17,9 @@ type RoleDefinition struct {
 	// ResourceTypes are the types it can be granted on, besides containers and the tenant. A
 	// grant on a container or the tenant applies to the resources of these types under it.
 	ResourceTypes []string
-	// Privileged marks administrative or root-level control, which a host may ask to confirm.
+	// Privileged marks administrative or root-level control, which a host may ask to confirm. A
+	// role that changes access, granting, denying, defining roles or managing groups, is
+	// privileged whatever this says, as account management is privileged (NIST SP 800-53 AC-2(7)).
 	Privileged bool
 	// Public lets the role be granted to the public, anyone signed in or not. A privileged role
 	// or one that changes access can't be. A grant to the public gives nothing once its role
@@ -123,7 +125,9 @@ func index(catalog []RoleDefinition) (map[Role]RoleDefinition, error) {
 		for _, err := range shape(r) {
 			bad(err)
 		}
-		roles[r.ID] = r.clone()
+		r = r.clone()
+		r.Privileged = r.Privileged || r.managesAccess()
+		roles[r.ID] = r
 	}
 	for _, r := range catalog {
 		for _, g := range r.GrantableRoles {

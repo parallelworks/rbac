@@ -640,8 +640,10 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 	// The listings read the catalog in order: from the copies, so that a caller changing its
 	// slices after New can't make them disagree with checks or clear a Deny checked here.
 	catalog := make([]RoleDefinition, len(cfg.Catalog))
+	declared := make(map[Role]bool, len(cfg.Catalog))
 	for i, r := range cfg.Catalog {
 		catalog[i] = roles[r.ID]
+		declared[r.ID] = r.Privileged
 	}
 	cfg.Catalog = catalog
 	cfg.Constraints = slices.Clone(cfg.Constraints)
@@ -685,7 +687,9 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 			resourceTypes[t] = true
 			for _, p := range r.Permissions {
 				perms[p] = true
-				if !r.Privileged {
+				// A role privileged only because it changes access leaves its other permissions as
+				// they were.
+				if !declared[r.ID] && !p.managesAccess() {
 					unprivileged[permissionOn{p, t}] = true
 				}
 			}

@@ -61,8 +61,8 @@ func (a *Authorizer) book(ctx context.Context, q DB, tenant string, ids []Role) 
 	return a.bookOf(a.current(roles)), nil
 }
 
-// tenantBook resolves ids with every custom role of the tenant when one is among them, so each
-// is privileged when a role it lists is, directly or through others (handingOut).
+// tenantBook resolves ids with every custom role of the tenant when one is among them, as a
+// role's GrantableRoles can name any.
 func (a *Authorizer) tenantBook(ctx context.Context, q DB, tenant string, ids []Role) (book, error) {
 	if !slices.ContainsFunc(ids, isCustom) {
 		return book{builtin: a.roles}, nil
@@ -206,9 +206,9 @@ func canonical(r RoleDefinition) RoleDefinition {
 // SetRole creates a custom role in a tenant, or replaces one, as actor; grants of a replaced
 // role give what it gives now. Its id starts with CustomPrefix, and it gives only permissions
 // some built-in role gives, on types some built-in role is for. It is Privileged when it gives
-// a permission on a type only privileged built-in roles give it on, or hands out a privileged
-// role, directly or through the roles it lists, whatever r.Privileged says, so a role read and
-// saved back keeps no flag it no longer earns.
+// a permission on a type only privileged built-in roles give it on, or changes access, as one
+// listing grantable roles does, whatever r.Privileged says, so a role read and saved back keeps
+// no flag it no longer earns.
 //
 // The actor needs DefineRoles on the tenant, not removed by a constraint (a condition on that
 // right reads the tenant as a resource with no attributes), and every permission
@@ -290,12 +290,11 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 				return ChangeEvent{}, err
 			}
 		}
-		// Privileged as the roles that give its permissions on its types are, or as a role it
-		// hands out is, so a host that confirms privileged grants asks about one that gives or
-		// hands out root however it was defined. Derived as a read derives it, with r in place
-		// of what it was, which is no part of what it is.
+		// Privileged as the roles that give its permissions on its types are, or as changing
+		// access is, so a host that confirms privileged grants asks about one that gives root
+		// however it was defined. Derived as a read derives it.
 		after, widened := a.redefining(au.roles.custom, r)
-		r.Privileged = after[r.ID].Privileged
+		r.Privileged = after.Privileged
 		// The grants it widens are the ones the host was asked about, of the roles as it was asked
 		// about them, or one was made or a role redefined meanwhile.
 		need, err := a.revalidations(ctx, tx, tenant, widened)
@@ -437,26 +436,15 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 	})
 }
 
-// redefining returns the tenant's custom roles as they will be once r replaces its definition
-// among custom, as read, and those whose grants give more then: r, when it gives more than it
-// gave, and each role that hands it out and becomes privileged with it. Copies, as current trims
-// them.
-func (a *Authorizer) redefining(custom map[Role]RoleDefinition, r RoleDefinition) (after, widened map[Role]RoleDefinition) {
-	roles := []RoleDefinition{r.clone()}
-	for id, def := range custom {
-		if id != r.ID {
-			roles = append(roles, def.clone())
-		}
+// redefining returns r as checks will read it once it replaces its definition among custom, as
+// read, and, when its grants will give more than they gave, r as the one role that widens. A
+// copy, as current trims it.
+func (a *Authorizer) redefining(custom map[Role]RoleDefinition, r RoleDefinition) (after RoleDefinition, widened map[Role]RoleDefinition) {
+	after = a.current([]RoleDefinition{r.clone()})[0]
+	if widens(custom[r.ID], after) {
+		return after, map[Role]RoleDefinition{r.ID: after}
 	}
-	after, widened = map[Role]RoleDefinition{}, map[Role]RoleDefinition{}
-	for _, def := range handingOut(a.current(roles)) {
-		after[def.ID] = def
-		was := custom[def.ID]
-		if def.Privileged && !was.Privileged || def.ID == r.ID && givesMore(was, def) {
-			widened[def.ID] = def
-		}
-	}
-	return after, widened
+	return after, nil
 }
 
 // givesMore reports whether grants of a role defined as now give anything they didn't as was, so
@@ -488,7 +476,7 @@ func redefinedSince(asked, now book, roles []Role) error {
 }
 
 // widens reports whether grants of a role defined as now give more than the host was asked about
-// as was: what it gives, or newly privileged, as through a role it lists.
+// as was: what it gives, or newly privileged, as a catalog change can make it.
 func widens(was, now RoleDefinition) bool {
 	return givesMore(was, now) || now.Privileged && !was.Privileged
 }
@@ -736,46 +724,21 @@ func (a *Authorizer) customRoles(ctx context.Context, q DB, tenant string) ([]Ro
 		return nil, err
 	}
 	roles, err := collectRoles(rows)
-	return handingOut(a.current(roles)), err
-}
-
-// handingOut marks privileged each role that lists a privileged one, directly or through others,
-// however that one became so: redefined since the lister was, or by a catalog change.
-func handingOut(roles []RoleDefinition) []RoleDefinition {
-	listers := map[Role][]int{}
-	var next []Role
-	for i, r := range roles {
-		for _, id := range r.GrantableRoles {
-			listers[id] = append(listers[id], i)
-		}
-		if r.Privileged {
-			next = append(next, r.ID)
-		}
-	}
-	for len(next) > 0 {
-		id := next[len(next)-1]
-		next = next[:len(next)-1]
-		for _, i := range listers[id] {
-			if !roles[i].Privileged {
-				roles[i].Privileged = true
-				next = append(next, roles[i].ID)
-			}
-		}
-	}
-	return roles
+	return a.current(roles), err
 }
 
 // current reads stored definitions as the catalog has them now, so a catalog change binds
 // custom roles defined before it: they give only permissions and types the catalog still has,
 // are public only while every permission they give is one an unprivileged role gives, and are
-// privileged when they give or list what privileged roles do. The stored flag counts for
-// nothing: it can stand for what a role it lists was, or for a catalog since changed.
+// privileged when they give what only privileged roles do, or change access, as every role that
+// lists grantable roles does. The stored flag counts for nothing: it can stand for a catalog
+// since changed.
 func (a *Authorizer) current(roles []RoleDefinition) []RoleDefinition {
 	for i, r := range roles {
 		r.Permissions = slices.DeleteFunc(r.Permissions, func(p Permission) bool { return !a.permissions[p] })
 		r.ResourceTypes = slices.DeleteFunc(r.ResourceTypes, func(t string) bool { return !a.types[t] })
 		r.Public = r.Public && !a.privileged(r) && !r.managesAccess()
-		r.Privileged = a.privileged(r) || a.listsPrivileged(r)
+		r.Privileged = a.privileged(r) || r.managesAccess()
 		roles[i] = r
 	}
 	return roles
@@ -785,12 +748,6 @@ func (a *Authorizer) current(roles []RoleDefinition) []RoleDefinition {
 // and a type the catalog has, so a search skips custom roles for any other.
 func (a *Authorizer) customGives(p Permission, resourceType string) bool {
 	return a.permissions[p] && a.types[resourceType]
-}
-
-// listsPrivileged reports whether r lists a privileged built-in role. A custom one it lists
-// counts where every custom role of the tenant is read (handingOut).
-func (a *Authorizer) listsPrivileged(r RoleDefinition) bool {
-	return slices.ContainsFunc(r.GrantableRoles, func(id Role) bool { return a.roles[id].Privileged })
 }
 
 // Roles lists the roles that can be granted on a scope type in a tenant: the built-in ones in
