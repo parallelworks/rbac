@@ -237,8 +237,8 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 			conditions = append(conditions, &InvalidError{Binding: grants[i].Binding, Reason: "only Activate grants from " + SourceActivation})
 		}
 	}
-	check := func(q DB, errs ...error) (book, error) {
-		roles, err := a.book(ctx, q, tenant, roleIDs(grants))
+	check := func(read func(context.Context, DB, string, []Role) (book, error), q DB, errs ...error) (book, error) {
+		roles, err := read(ctx, q, tenant, roleIDs(grants))
 		if err != nil {
 			return book{}, err
 		}
@@ -251,7 +251,7 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 		}
 		return roles, errors.Join(errs...)
 	}
-	roles, err := check(a.db, conditions...)
+	roles, err := check(a.tenantBook, a.db, conditions...)
 	if err != nil {
 		return err
 	}
@@ -275,8 +275,9 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 		if err := lockAll(ctx, tx, tenant, slices.Collect(maps.Keys(scopes)), slices.Collect(maps.Keys(principals))); err != nil {
 			return ChangeEvent{}, err
 		}
-		// Again under the locks, so a custom role deleted since isn't granted.
-		if _, err := check(tx); err != nil {
+		// Again under the locks, so a custom role deleted since isn't granted. Only ValidateGrant,
+		// asked above, reads the flag, so the roles named are enough.
+		if _, err := check(a.book, tx); err != nil {
 			return ChangeEvent{}, err
 		}
 		granted, err := a.upsert(ctx, tx, tenant, actor, grants)
@@ -499,13 +500,9 @@ func (a *Authorizer) authorityOn(ctx context.Context, q DB, actor Subject, on Re
 	if err != nil {
 		return authority{}, err
 	}
-	b := book{builtin: a.roles}
-	if slices.ContainsFunc(append(roleIDs(held), roles...), isCustom) {
-		custom, err := a.customRoles(ctx, q, on.Tenant)
-		if err != nil {
-			return authority{}, err
-		}
-		b = a.bookOf(custom)
+	b, err := a.tenantBook(ctx, q, on.Tenant, append(roleIDs(held), roles...))
+	if err != nil {
+		return authority{}, err
 	}
 	return a.authorityOf(ctx, q, actor, on, held, ds, b)
 }

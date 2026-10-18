@@ -36,7 +36,8 @@ func (b book) role(id Role) (RoleDefinition, bool) {
 func isCustom(id Role) bool { return strings.HasPrefix(string(id), CustomPrefix) }
 
 // book reads, on q, the definitions of the custom roles among ids in a tenant. Without one
-// among them it reads nothing.
+// among them it reads nothing. A role it reads is privileged by what it gives and the built-in
+// roles it lists, not the custom ones, so where the flag counts, read with tenantBook.
 func (a *Authorizer) book(ctx context.Context, q DB, tenant string, ids []Role) (book, error) {
 	b := book{builtin: a.roles}
 	var want []string
@@ -57,6 +58,19 @@ func (a *Authorizer) book(ctx context.Context, q DB, tenant string, ids []Role) 
 		return book{}, err
 	}
 	return a.bookOf(a.current(roles)), nil
+}
+
+// tenantBook resolves ids with every custom role of the tenant when one is among them, so each
+// is privileged when a role it lists is, directly or through others (handingOut).
+func (a *Authorizer) tenantBook(ctx context.Context, q DB, tenant string, ids []Role) (book, error) {
+	if !slices.ContainsFunc(ids, isCustom) {
+		return book{builtin: a.roles}, nil
+	}
+	custom, err := a.customRoles(ctx, q, tenant)
+	if err != nil {
+		return book{}, err
+	}
+	return a.bookOf(custom), nil
 }
 
 // bookOf resolves the built-in roles and the custom ones given.

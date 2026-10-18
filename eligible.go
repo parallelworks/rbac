@@ -181,7 +181,10 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 		return Grant{}, &InvalidError{Binding: b, Reason: fmt.Sprintf("an activation lasts more than nothing and at most %s, and has a justification of at most %d characters", MaxActivation, MaxNote)}
 	}
 	b.ExpiresAt = stored(a.cfg.Now().Add(act.Duration))
-	roles, _, err := a.eligible(ctx, a.db, s, on, act, b.ExpiresAt)
+	if _, err := a.eligible(ctx, a.db, s, on, act, b.ExpiresAt); err != nil {
+		return Grant{}, err
+	}
+	roles, err := a.tenantBook(ctx, a.db, on.Tenant, []Role{act.Role})
 	if err != nil {
 		return Grant{}, err
 	}
@@ -195,7 +198,12 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 		}
 		// Again under the locks, so an eligibility revoked meanwhile activates nothing.
 		b.ExpiresAt = stored(a.cfg.Now().Add(act.Duration))
-		roles, approver, err := a.eligible(ctx, tx, s, on, act, b.ExpiresAt)
+		approver, err := a.eligible(ctx, tx, s, on, act, b.ExpiresAt)
+		if err != nil {
+			return ChangeEvent{}, err
+		}
+		// Only ValidateGrant, asked above, reads the flag, so the role named is enough.
+		roles, err := a.book(ctx, tx, on.Tenant, []Role{act.Role})
 		if err != nil {
 			return ChangeEvent{}, err
 		}
@@ -272,12 +280,12 @@ func (a *Authorizer) Deactivate(ctx context.Context, s Subject, on Resource, rol
 	})
 }
 
-// eligible checks that s may activate act.Role on on until until, and returns the roles it read
-// and who approved: an eligibility of s's identity or of one of its groups there, lasting
-// act.Duration or longer and in force until then, whose requirement holds in the request, failing
-// closed, and whose approvers, if it names any, include act.Approver, who isn't s. approved is
-// zero when the eligibility allowing it names none.
-func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource, act Activation, until time.Time) (roles book, approved Principal, err error) {
+// eligible checks that s may activate act.Role on on until until, and returns who approved: an
+// eligibility of s's identity or of one of its groups there, lasting act.Duration or longer and
+// in force until then, whose requirement holds in the request, failing closed, and whose
+// approvers, if it names any, include act.Approver, who isn't s. approved is zero when the
+// eligibility allowing it names none.
+func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource, act Activation, until time.Time) (approved Principal, err error) {
 	scope, manage := on.Scope(), GrantPermission(on.Type)
 	// Those needing no approval first, so an approver passed where none is needed isn't recorded.
 	rows, err := q.Query(ctx, `
@@ -287,7 +295,7 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 		ORDER BY cardinality(approvers), requires`,
 		on.Tenant, scope.Key(), act.Role, s.keys(on.Tenant, false, false), seconds(act.Duration), a.cfg.Now(), until)
 	if err != nil {
-		return book{}, Principal{}, err
+		return Principal{}, err
 	}
 	type eligibility struct {
 		requires  string
@@ -298,7 +306,7 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 		return e, row.Scan(&e.requires, &e.approvers)
 	})
 	if err != nil {
-		return book{}, Principal{}, err
+		return Principal{}, err
 	}
 	reason := fmt.Sprintf("not eligible to activate %s here for %s", act.Role, act.Duration)
 	vars, spend := a.vars(ctx, s, manage, on), newBudget()
@@ -309,13 +317,12 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 		}
 		if e.requires == "" || a.conds.holds(spend, e.requires, vars) {
 			if len(e.approvers) > 0 {
-				approved = act.Approver.Principal
+				return act.Approver.Principal, nil
 			}
-			roles, err := a.book(ctx, q, on.Tenant, []Role{act.Role})
-			return roles, approved, err
+			return Principal{}, nil
 		}
 	}
-	return book{}, Principal{}, &DeniedError{Permission: manage, Scope: scope, Reason: reason}
+	return Principal{}, &DeniedError{Permission: manage, Scope: scope, Reason: reason}
 }
 
 // approves reports whether approver is among an eligibility's approvers, by identity or group, and
