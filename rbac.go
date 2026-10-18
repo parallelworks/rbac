@@ -480,9 +480,11 @@ type Config struct {
 	// where the host doesn't allow public access; of a role a principal's kind may not hold, such
 	// as a privileged one for a guest; or one this actor may not give this principal. It is asked
 	// about every grant Apply, Import and Activate make, and every eligibility SetEligibility sets,
-	// once each is otherwise valid; any other error fails the change. q is what the change runs
-	// on, so under WithTx it sees a member added earlier in the transaction. Required: a grant
-	// to a principal the tenant doesn't let in must never be stored.
+	// once each is otherwise valid; the change's InvalidError for it wraps the error, so
+	// errors.Is and errors.As find the host's own in it. Any other error fails the change as it
+	// is. q is what the change runs on, so under WithTx it sees a member added earlier in the
+	// transaction. Required: a grant to a principal the tenant doesn't let in must never be
+	// stored.
 	ValidateGrant func(ctx context.Context, q DB, in GrantInput) error
 	Constraints   []Constraint
 	// Attributes declares the attributes conditions read, so one misnamed or of another type is

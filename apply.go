@@ -20,6 +20,9 @@ import (
 type InvalidError struct {
 	Binding Binding
 	Reason  string
+	// Err is the host's refusal, from Config.ValidateGrant, which the InvalidError wraps so that
+	// errors.Is and errors.As find the host's own errors in it; nil for the package's own.
+	Err error
 }
 
 func (e *InvalidError) Error() string {
@@ -28,6 +31,8 @@ func (e *InvalidError) Error() string {
 
 // Is makes an InvalidError match ErrInvalid.
 func (e *InvalidError) Is(target error) bool { return target == ErrInvalid }
+
+func (e *InvalidError) Unwrap() error { return e.Err }
 
 // Apply changes the grants on one scope, on, in one transaction, as actor:
 //
@@ -368,9 +373,25 @@ func (a *Authorizer) allowed(ctx context.Context, roles book, actor Subject, via
 	case err == nil:
 		return nil, nil
 	case errors.Is(err, ErrInvalid):
-		return []error{&InvalidError{Binding: b, Reason: err.Error()}}, nil
+		return []error{&InvalidError{Binding: b, Reason: hostReason(err), Err: err}}, nil
 	}
 	return nil, err
+}
+
+// hostReason is the host's message for a grant it refused, less the ErrInvalid it wraps, which
+// the InvalidError already says, whether before, after or joined; or the reason of an InvalidError
+// of its own, which would otherwise name the binding twice.
+func hostReason(err error) string {
+	var own *InvalidError
+	if errors.As(err, &own) {
+		return cmp.Or(own.Reason, "refused by the host")
+	}
+	invalid := ErrInvalid.Error()
+	msg := strings.TrimSuffix(strings.TrimSuffix(err.Error(), ": "+invalid), "\n"+invalid)
+	if rest, ok := strings.CutPrefix(msg, invalid); ok && (rest == "" || rest[0] == ':' || rest[0] == '\n') {
+		msg = strings.TrimLeft(rest, ": \n")
+	}
+	return cmp.Or(msg, "refused by the host")
 }
 
 // identity checks that an actor a call names is an identity: a user or a declared kind.
