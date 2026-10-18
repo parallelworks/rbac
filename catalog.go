@@ -180,7 +180,17 @@ func (a *Authorizer) contains(scopeType string) bool {
 // grantableOn reports whether a role can be granted on a scope type: one of its own resource
 // types, a container type, or the tenant.
 func (a *Authorizer) grantableOn(r RoleDefinition, scopeType string) bool {
-	return a.contains(scopeType) || r.GrantableOn(scopeType)
+	// Label values are held on the tenant alone: granted on a container, they would give nothing.
+	return a.contains(scopeType) && !a.givesLabels(r) || r.GrantableOn(scopeType)
+}
+
+// givesLabels reports whether a role gives a label value.
+func (a *Authorizer) givesLabels(r RoleDefinition) bool {
+	return slices.ContainsFunc(r.Permissions, func(p Permission) bool {
+		t, _ := p.parts()
+		_, ok := a.labels[t]
+		return ok
+	})
 }
 
 // giving lists the ids of the roles that give p on a resource type.

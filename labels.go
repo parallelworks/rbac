@@ -146,8 +146,10 @@ func (a *Authorizer) checkLabel(l Label) error {
 }
 
 // Holding is the label values a subject holds in a tenant, by dimension, which its Satisfies
-// checks a label against without reading the database: a feed checks each data point with it,
-// and reads the holding again as the subject's grants change.
+// checks a label against without reading the database: a feed checks each data point with it.
+// It is what was held as it was read, in that request: a value also ends with no change to
+// report, as a grant, a membership or a place in a group expires or a condition stops holding, so
+// a feed reads it again as often as it may lag behind access ending, not only on changes.
 type Holding struct {
 	tenant string
 	dims   map[string]labelDimension

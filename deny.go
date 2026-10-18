@@ -194,6 +194,11 @@ func (a *Authorizer) checkDeny(tenant string, d Deny) error {
 		case verb != "*" && !a.permissions[p]:
 			bad("permission %q is not one any built-in role gives", p)
 		}
+		// Checks read a subject's label values on the tenant, so a deny of one on a scope under it
+		// would be stored and bind no one.
+		if _, value := a.labels[t]; value && d.Scope.Type != TenantScope {
+			bad("permission %q is a label value, which is held on the tenant, so it is denied there alone", p)
+		}
 	}
 	for _, fault := range a.conditionFaults(d.Condition) {
 		bad("%s", fault)

@@ -256,6 +256,35 @@ func TestALabelValueAConditionalDenyTakesIsMarked(t *testing.T) {
 // tenantGuard sets denies on the tenant, as on label values.
 var tenantGuard = rbac.RoleDefinition{ID: "tenant.guard", Permissions: []rbac.Permission{rbac.DenyPermission(rbac.TenantScope)}, ResourceTypes: []string{rbac.TenantScope}}
 
+// Checks read a subject's label values on the tenant, so a deny of one under it would bind no one.
+func TestALabelValueIsDeniedOnTheTenantAlone(t *testing.T) {
+	workspaceGuard := rbac.RoleDefinition{ID: "workspace.guard", Permissions: []rbac.Permission{rbac.DenyPermission("workspace")}, ResourceTypes: []string{"workspace"}}
+	h := labelled(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), tenantGuard, workspaceGuard) })
+	ctx := t.Context()
+	owner := h.as(t, "owner")
+	h.hold(t, "owner", "level:high")
+	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.guard", rbac.User, "guardian"), grant(rbac.TenantRoot("t1"), "workspace.guard", rbac.User, "guardian"))
+	guardian := h.as(t, "guardian")
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	for _, p := range []rbac.Permission{"level:high", "level:*"} {
+		d := rbac.Deny{ID: "cap", Principals: []rbac.Principal{owner.Principal}, Permissions: []rbac.Permission{p}}
+		if err := h.authz.SetDeny(ctx, guardian, workspace, d); !errors.Is(err, rbac.ErrInvalid) {
+			t.Fatalf("a deny of %s on the workspace above the cluster: %v", p, err)
+		}
+	}
+	if !allowed(t, h, owner, view, secret) {
+		t.Fatal("the owner holds the level")
+	}
+	tenant := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}
+	if err := h.authz.SetDeny(ctx, guardian, tenant, rbac.Deny{ID: "cap", Principals: []rbac.Principal{owner.Principal}, Permissions: []rbac.Permission{"level:high"}}); err != nil {
+		t.Fatal(err)
+	}
+	if allowed(t, h, owner, view, secret) {
+		t.Fatal("a deny of the value on the tenant binds")
+	}
+}
+
 func TestFilterKeepsWhatTheLabelAllows(t *testing.T) {
 	h := labelled(t)
 	ctx := t.Context()
@@ -495,5 +524,24 @@ func TestFilterNeedsTheLabelColumnWhereLabelsAreDeclared(t *testing.T) {
 	holding, err := h.authz.Holding(t.Context(), "t1", s)
 	if err != nil || holding.Tenant() != "t1" {
 		t.Fatalf("Holding = %+v, %v", holding, err)
+	}
+}
+
+func TestALabelValueIsGrantedOnTheTenantAlone(t *testing.T) {
+	h := labelled(t)
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.admin", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "workspace.admin", rbac.User, "admin"),
+		grant(rbac.TenantRoot("t1"), "rel.gbr", rbac.User, "admin"))
+	admin := h.as(t, "admin")
+	// Granted on a workspace, a value would give nothing, so it isn't offered or taken there.
+	if err := h.authz.Apply(ctx, admin, workspace, rbac.Change{Grant: []rbac.Binding{{Role: "rel.gbr", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}}}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a value granted on a workspace: %v", err)
+	}
+	roles, err := h.authz.Roles(ctx, "t1", "workspace")
+	if err != nil || slices.ContainsFunc(roles, func(r rbac.RoleDefinition) bool { return r.ID == "rel.gbr" }) {
+		t.Fatalf("Roles on a workspace = %v, %v", roles, err)
+	}
+	if err := h.authz.Apply(ctx, admin, rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}, rbac.Change{Grant: []rbac.Binding{{Role: "rel.gbr", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}}}); err != nil {
+		t.Fatalf("a value granted on the tenant: %v", err)
 	}
 }

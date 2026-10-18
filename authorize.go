@@ -686,8 +686,8 @@ func insideSQL(tenant, groups, now string) string {
 
 // Reach is where a subject may do something. A resource, by its path (Authorizer.Path), is
 // reachable when its path holds none of Except; All is set or its path holds one of Scopes or
-// Conditional; and, if its path holds one of Conditional or ConditionalExcept, Authorize allows
-// it.
+// Conditional; Labels satisfies its label (Resource.Labels); and, if its path holds one of
+// Conditional or ConditionalExcept, Authorize allows it.
 type Reach struct {
 	All    bool
 	Scopes []Scope
@@ -835,8 +835,8 @@ type Columns struct {
 	// Labels is a text[] holding the resource's label as `dimension:value` values, never NULL: '{}'
 	// for none. With a GIN index in the default collation, in which the test compares them, it
 	// serves the label's test, which keeps only the rows the subject's holding satisfies. With
-	// labels declared it is needed, so a forgotten one keeps no labelled row: pass '{}'::text[]
-	// for a type whose resources carry no label.
+	// labels declared it is needed, so Filter refuses a call without it as invalid: pass
+	// '{}'::text[] for a type whose resources carry no label.
 	Labels string
 }
 

@@ -22,8 +22,9 @@ var asOfEntities = []struct{ table, entity string }{
 
 // AsOf runs read on an Authorizer that reads a tenant as it was at a time, from its history: who
 // held what, who was in which group, what was denied, and what custom roles gave. Its checks,
-// lists and searches answer as they would have then, with the catalog as it is now, and find
-// nothing in another tenant. A change made on it is refused, as no actor's attempt, which
+// lists and searches answer as they would have then, with the catalog and the label dimensions as
+// they are now, and find nothing in another tenant. A resource's label, as its path, is what the
+// host passes: pass it as it was then. A change made on it is refused, as no actor's attempt, which
 // Config.OnRefused isn't told of, and its reads see no change made since, but for History, which
 // reads the whole record as it does outside. A change counts from when its transaction began, so
 // what a time reads can still change until every transaction that began before it has ended.

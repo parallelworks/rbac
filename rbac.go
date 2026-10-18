@@ -308,7 +308,8 @@ type Resource struct {
 	// resource is stored, as its path, never from request input.
 	Attributes map[string]any
 	// Labels is its label, which a subject's holding must satisfy, whatever its grants give, for
-	// a check to allow anything (Config.Labels). Store it with the resource, as its path.
+	// a check to allow anything (Config.Labels). Store it with the resource, as its path. A check
+	// reads the resource's own, not its ancestors': label what a labelled container holds too.
 	Labels Label
 }
 
@@ -486,8 +487,10 @@ type ConstraintInput struct {
 	Tenant       string
 	ResourceType string
 	Permission   Permission
-	// Subject is who asks, or who changes access; nil in Holders. Authorizer.GroupsOf reads the
-	// groups it is in.
+	// Subject is who asks, or who changes access; nil in Holders, but for the label values of a
+	// holder of a labelled resource, where it is the holder without the attributes Holders doesn't
+	// know: answer true there if the constraint removes the value from that principal with any.
+	// Authorizer.GroupsOf reads the groups it is in.
 	Subject *Subject
 	// Resource is what is asked about, with its ancestors and attributes; for what a change hands
 	// on, the scope it is on, whose type is a container's or the tenant's where what it hands on
@@ -623,7 +626,9 @@ type Config struct {
 	// subject's grants and its values in two statements, so changes committing between them can
 	// meet in an answer no single moment gave. Holders reads each holder's values, one after
 	// another. A deny of an Ordered value takes that value alone: to cap a level, deny it and every
-	// value above.
+	// value above. Values are held on the tenant, so they are denied there: SetDeny refuses a deny
+	// of one on any other scope, which would bind no one. The conditions of a value's grants and
+	// denies read the tenant as their resource, never the labelled one.
 	Labels []LabelDimension
 	// OnChange runs in the transaction of every change but DeleteExpired, whose grants already
 	// gave nothing, once the change is written; an error rolls the change back. History records
