@@ -142,8 +142,9 @@ permission, so an error shown to a user shows no policy; its fields say why.
   subjects passed with it.
 - **Ids:** an id names its identity, group or resource for good. Never reuse one, or a new
   resource or account inherits the grants of the one before it. Delete a resource's grants with
-  `DeleteScope` in the transaction that deletes it, for each scope under it too, and rewrite the
-  stored paths below a container when it moves.
+  `DeleteScopes` in the transaction that deletes it, in one call with every scope under it too,
+  which holds a bounded number of locks however many it removes, and rewrite the stored paths
+  below a container when it moves.
 - **Permissions:** a check or search of a permission, or a resource type, the host doesn't have
   is refused as `rbac.ErrInvalid`, as a typo, not denied, as is a change on a scope of such a
   type. They are what the catalog's roles give and are for, or with `Config.Permissions` every
