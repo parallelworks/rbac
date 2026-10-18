@@ -136,9 +136,25 @@ func constrain(name string, p rbac.Permission) func(*rbac.Config) {
 	}
 }
 
+// seed grants in t1, making the groups granted to first.
 func (h *harness) seed(t *testing.T, grants ...rbac.Grant) {
 	t.Helper()
+	var groups []string
+	for _, g := range grants {
+		if g.Principal.Kind == rbac.Group {
+			groups = append(groups, g.Principal.ID)
+		}
+	}
+	h.groups(t, groups...)
 	if err := h.authz.Import(t.Context(), host, "t1", grants); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// groups makes groups in t1 that don't exist yet.
+func (h *harness) groups(t *testing.T, ids ...string) {
+	t.Helper()
+	if _, err := h.pool.Exec(t.Context(), `INSERT INTO rbac_groups (tenant, id) SELECT 't1', unnest($1::text[]) ON CONFLICT DO NOTHING`, ids); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -878,6 +894,7 @@ func TestAGrantOutlivesTheActorsAccess(t *testing.T) {
 	access := grant(rbac.Scope{Type: "org", ID: "o1"}, "cluster.login", rbac.User, "temp")
 	access.ExpiresAt = temp.ExpiresAt
 	h.seed(t, temp, access)
+	h.groups(t, "friends")
 	forever := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.Group, ID: "friends"}}
 	if err := h.authz.Apply(t.Context(), user("temp"), workspace, rbac.Change{Grant: []rbac.Binding{forever}}); err != nil {
 		t.Fatalf("access for an hour granting for good: %v", err)
@@ -2643,6 +2660,7 @@ func TestIdentitiesFromOtherTenants(t *testing.T) {
 	if allowed(t, h, partner, root, cluster) {
 		t.Fatal("another tenant's member is one of this tenant's members")
 	}
+	h.groups(t, "partners")
 	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{
 		{Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.Group, ID: "partners"}},
 	}}); err != nil {
@@ -2763,10 +2781,10 @@ func TestRolesListingEachOtherAreDecidedOnce(t *testing.T) {
 func TestDeletePrincipalEverywhereAcrossManyTenants(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
-	support := rbac.Principal{Kind: rbac.Group, ID: "support"}
+	support := rbac.Principal{Kind: rbac.User, ID: "support"}
 	const tenants = 70
 	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
-		SELECT 'x' || g, 'tenant', 'x' || g, 'group', 'support', 'cluster.login' FROM generate_series(1, $1::int) g`, tenants); err != nil {
+		SELECT 'x' || g, 'tenant', 'x' || g, 'user', 'support', 'cluster.login' FROM generate_series(1, $1::int) g`, tenants); err != nil {
 		t.Fatal(err)
 	}
 	h.events = nil
@@ -2774,11 +2792,15 @@ func TestDeletePrincipalEverywhereAcrossManyTenants(t *testing.T) {
 		t.Fatal(err)
 	}
 	var left int
-	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM rbac_grants WHERE principal = 'group:support'`).Scan(&left); err != nil || left != 0 {
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM rbac_grants WHERE principal = 'user:support'`).Scan(&left); err != nil || left != 0 {
 		t.Fatalf("%d grants left, %v", left, err)
 	}
 	if len(h.events) != tenants {
 		t.Fatalf("%d changes, want one per tenant", len(h.events))
+	}
+	// A group is its tenant's, so another with its id elsewhere isn't it.
+	if err := h.authz.DeletePrincipalEverywhere(ctx, host, rbac.Principal{Kind: rbac.Group, ID: "support"}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("deleting a group everywhere: %v", err)
 	}
 }
 
@@ -3735,6 +3757,7 @@ func TestAGrantAskedAboutBeforeItsRoleIsRedefinedIsTriedAgain(t *testing.T) {
 		}
 	})
 	ctx := t.Context()
+	h.groups(t, "bots")
 	admin = roleAdmin(t, h)
 	h.seed(t, grant(rbac.TenantRoot("t1"), "workspace.admin", rbac.User, "admin"))
 	for _, r := range []rbac.RoleDefinition{op, lead} {
@@ -5159,6 +5182,7 @@ func TestEligibleGrants(t *testing.T) {
 		Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.Group, ID: "oncall"}, MaxDuration: time.Hour,
 		Requires: `request.attributes.mfa == true`, Note: "on call",
 	}
+	h.groups(t, "oncall")
 	h.events = nil
 	if err := h.authz.SetEligibility(ctx, user("owner"), cluster, oncall); err != nil {
 		t.Fatal(err)
@@ -5334,6 +5358,7 @@ func TestActivationsNeedTheirApprovers(t *testing.T) {
 		Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: time.Hour,
 		Approvers: []rbac.Principal{{Kind: rbac.Group, ID: "leads"}, {Kind: rbac.User, ID: "x"}},
 	}
+	h.groups(t, "leads", "sre")
 	if err := h.authz.SetEligibility(ctx, user("owner"), cluster, e); err != nil {
 		t.Fatal(err)
 	}

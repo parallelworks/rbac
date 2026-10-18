@@ -84,9 +84,9 @@ const (
 // every signed-in identity, so a host can't declare one.
 var reservedKinds = []PrincipalKind{"anonymous", "authenticated", "domain", "everyone", "role", "set"}
 
-// Principal is who a role is granted to. An identity's or a group's id names it in every
-// tenant, so a tenant can grant a role to one from another, where Config.ValidateGrant allows
-// it.
+// Principal is who a role is granted to. An identity's id names it in every tenant, so a tenant
+// can grant a role to one from another, where Config.ValidateGrant allows it; a group's names it
+// only in its tenant.
 type Principal struct {
 	Kind PrincipalKind
 	ID   string
@@ -341,8 +341,9 @@ type Change struct {
 
 // ChangeEvent is what a committed change did: only the grants that were added, whose note or
 // condition's title or description changed, or removed, the custom roles defined or deleted, the
-// deny policies set or deleted, and the eligibilities set or ended. An activation is a grant from
-// SourceActivation: one that moves no end later changes nothing, so isn't reported.
+// deny policies set or deleted, the eligibilities set or ended, the tenant memberships set or
+// ended, the groups set or deleted, and the members who joined or left groups. An activation is a
+// grant from SourceActivation: one that moves no end later changes nothing, so isn't reported.
 type ChangeEvent struct {
 	Tenant string
 	// Actor is who made the change: for Import and the deletes, the actor they name.
@@ -358,11 +359,21 @@ type ChangeEvent struct {
 	// Eligible are eligibilities set, as they are now; Ineligible, those ended.
 	Eligible   []Eligibility
 	Ineligible []Eligibility
+	// Memberships are tenant memberships set, as they are now; EndedMemberships, those ended.
+	Memberships      []Membership
+	EndedMemberships []Membership
+	// Groups are groups created or replaced, as they are now; DeletedGroups, those deleted.
+	Groups        []GroupDefinition
+	DeletedGroups []GroupDefinition
+	// Joined are members added to groups or changed, as they are now; Left, those removed.
+	Joined []Member
+	Left   []Member
 }
 
 func (e ChangeEvent) empty() bool {
 	return len(e.Granted)+len(e.Revoked)+len(e.Roles)+len(e.DeletedRoles)+len(e.Denies)+len(e.DeletedDenies)+
-		len(e.Eligible)+len(e.Ineligible) == 0
+		len(e.Eligible)+len(e.Ineligible)+len(e.Memberships)+len(e.EndedMemberships)+len(e.Groups)+len(e.DeletedGroups)+
+		len(e.Joined)+len(e.Left) == 0
 }
 
 // Constraint removes permissions as the host's own policy, above anything a tenant grants or
@@ -504,8 +515,8 @@ type Config struct {
 	// no grant gives. A check or search of a permission not among them, or of a resource type none
 	// of them nor any built-in role is for, is refused as invalid, as a typo, and New refuses a
 	// built-in role giving one: they include what the package checks for the host that the
-	// built-in roles give, `:grant` and `:deny` permissions and DefineRoles. Empty, they are what
-	// the built-in roles give.
+	// built-in roles give, `:grant` and `:deny` permissions, DefineRoles, ManageGroups and
+	// ManagePrivilegedGroups. Empty, they are what the built-in roles give.
 	Permissions []Permission
 	// Sources are the sources the host owns, such as the one it syncs grants from a directory
 	// from: Apply refuses to grant or revoke from one, by ID too, and DeleteRole to delete a role
@@ -584,7 +595,7 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 	cfg.Constraints = slices.Clone(cfg.Constraints)
 	containers := map[string]bool{}
 	for _, t := range cfg.ContainerTypes {
-		if !validName(t) || t == TenantScope {
+		if !validName(t) || t == TenantScope || t == GroupScope {
 			return nil, fmt.Errorf("rbac: container type %q is not valid", t)
 		}
 		containers[t] = true

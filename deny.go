@@ -222,7 +222,8 @@ func (a *Authorizer) checkDeny(tenant string, d Deny) error {
 // on conditions, so that one always evaluates them: about seven short distinct conditions, or
 // three of the longest, however many denies share them. Whoever holds that permission on the
 // scope, those the deny names included, can replace or delete it, so to bind one who holds it
-// there, set the deny on a scope above where it doesn't.
+// there, set the deny on a scope above where it doesn't. The groups it names or exempts, and a
+// group it is on, are the tenant's.
 func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d Deny) error {
 	if err := a.check(on); err != nil {
 		return err
@@ -238,8 +239,12 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 		return err
 	}
 	d = canonicalDeny(d)
+	groups := groupKeys(slices.Concat(d.Principals, d.Exempt))
 	return a.inTx(ctx, on.Tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
-		if err := lock(ctx, tx, on.Tenant, []string{d.Scope.Key()}, nil); err != nil {
+		if err := lockAll(ctx, tx, on.Tenant, []string{d.Scope.Key()}, groups); err != nil {
+			return ChangeEvent{}, err
+		}
+		if err := groupsExist(ctx, tx, on.Tenant, slices.Concat(groups, groupScopes([]Scope{d.Scope}))); err != nil {
 			return ChangeEvent{}, err
 		}
 		if err := a.holdsDeny(ctx, tx, actor, on); err != nil {
