@@ -159,6 +159,19 @@ own grants and its groups', and the tenant's members and the public as one holde
 those that hold only under a condition or that a deny may bind. A `DeniedError`'s message names
 only the permission, so an error shown to a user shows no policy; its fields say why.
 
+## History
+
+Every change to the package's tables is recorded in `rbac_history`: the row as it was and as it
+became, when, and the database role that wrote it. Triggers write it, so a write that bypasses
+the package is recorded too. Nothing updates, deletes or truncates it, and the package's tables
+can be deleted from but not truncated. `History` reads it in order, to export it to storage of
+the host's own: a transaction that commits after a later one is read after it, never skipped,
+and a record can be read twice, so dedupe on `Record.ID`.
+
+A role that owns a table can change it whatever its triggers say. So the application's database
+role can't rewrite history, transfer `rbac_history` and the function `rbac_record` to a role of
+their own after migrating, and leave the application `SELECT` on `rbac_history`.
+
 ## Running it
 
 - **Tables:** `rbac.Migrate` creates them, prefixed `rbac_`, in the connection's current schema,
