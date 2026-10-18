@@ -1799,3 +1799,55 @@ func TestAPrivilegedRoleForTheMembersIsRefusedBeforeTheHostIsAsked(t *testing.T)
 		t.Fatalf("Import: %v, asked %+v", err, asked)
 	}
 }
+
+func TestImportingMembersAsksAboutWhatAPrivilegedGroupHolds(t *testing.T) {
+	var asked []rbac.GrantInput
+	h := grouped(t, func(c *rbac.Config) {
+		c.ValidateGrant = func(_ context.Context, _ rbac.DB, in rbac.GrantInput) error {
+			if in.Via != rbac.ViaMembership {
+				return nil
+			}
+			asked = append(asked, in)
+			if in.Binding.Principal.Kind == "service_account" {
+				return fmt.Errorf("%w: service accounts hold no privileged role", rbac.ErrInvalid)
+			}
+			return nil
+		}
+	})
+	ctx := t.Context()
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "admins", Privileged: true}}); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), "cluster.sudo", rbac.Group, "admins"))
+	bot := h.member(t, rbac.Principal{Kind: "service_account", ID: "ci"})
+	h.join(t, "u")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "admins", Principal: bot.Principal}}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("importing a service account into a group holding a privileged role: %v", err)
+	}
+	if got, err := h.authz.Members(ctx, "t1", "admins"); err != nil || len(got) != 0 {
+		t.Fatalf("Members = %+v, %v", got, err)
+	}
+	asked = nil
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "admins", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(asked) != 1 || asked[0].Binding.Principal != identity("u") || asked[0].Actor.Principal != host || asked[0].Binding.Role != "cluster.sudo" {
+		t.Fatalf("asked = %+v", asked)
+	}
+}
+
+func TestTheHostsGroupsMembersOnlyItChanges(t *testing.T) {
+	h := grouped(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
+		c.Sources = []string{"directory"}
+	})
+	ctx := t.Context()
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "synced", Source: "directory"}}); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "lead"))
+	h.join(t, "u")
+	if err := h.authz.ChangeMembers(ctx, h.as(t, "lead"), "t1", []rbac.Member{{Group: "synced", Principal: identity("u")}}, nil); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("adding a member to the host's group: %v", err)
+	}
+}

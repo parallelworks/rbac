@@ -821,8 +821,8 @@ type Via string
 // sets, which is the grant activating it would make. ViaRedefinition is a grant or eligibility
 // that exists, which SetRole redefining its custom role makes give more: an eligibility's binding
 // is the grant activating it would make, as with ViaEligibility, and has no ID. ViaMembership is a
-// privileged group's grant or eligibility of a privileged role that an identity ChangeMembers adds
-// to it gains, its binding naming the identity, with no ID, and ending when the sooner of it and
+// privileged group's grant or eligibility of a privileged role that an identity ChangeMembers or
+// ImportMembers adds to it gains, its binding naming the identity, with no ID, and ending when the sooner of it and
 // the membership does.
 const (
 	ViaApply        Via = "apply"

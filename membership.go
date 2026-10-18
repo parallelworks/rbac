@@ -688,7 +688,9 @@ func (a *Authorizer) checkMember(m Member, now time.Time) error {
 // ImportMembers adds members to a tenant's groups, from their sources, or changes their expiry or
 // note, as actor: the host's own write, as for a directory it syncs from. A member identity is a
 // member or guest of the tenant, and a member group exists; nesting a group can't make one contain
-// itself, nor a chain of more than MaxGroupDepth groups.
+// itself, nor a chain of more than MaxGroupDepth groups. Config.ValidateGrant is asked about each
+// privileged grant and eligibility of a privileged group for each identity added to it, as with
+// ChangeMembers.
 func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant string, members []Member) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -706,14 +708,82 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 	if err != nil {
 		return err
 	}
+	groups := memberGroups(set)
+	privileged, err := privilegedGroups(ctx, a.db, tenant, groups)
+	if err != nil {
+		return err
+	}
+	joined := joining(set, privileged)
+	asked, err := a.askMemberships(ctx, Subject{Principal: actor}, tenant, set, joined)
+	if err != nil {
+		return err
+	}
 	scopes, principals := memberLocks(set)
+	principals = append(principals, joinedLocks(joined)...)
 	return a.inTx(ctx, tenant, actor, func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lockAll(ctx, tx, tenant, scopes, principals); err != nil {
+			return ChangeEvent{}, err
+		}
+		if err := a.stillAsked(ctx, tx, tenant, groups, privileged, joined, asked); err != nil {
 			return ChangeEvent{}, err
 		}
 		joined, err := a.join(ctx, tx, tenant, actor, set)
 		return ChangeEvent{Joined: joined}, err
 	})
+}
+
+// memberGroups returns the groups members join, sorted, each once.
+func memberGroups(members []Member) []string {
+	ids := map[string]bool{}
+	for _, m := range members {
+		ids[m.Group] = true
+	}
+	return slices.Sorted(maps.Keys(ids))
+}
+
+// joining returns the privileged groups an identity in set joins, whose privileged holdings it
+// gains, sorted.
+func joining(set []Member, privileged map[string]bool) []string {
+	ids := map[string]bool{}
+	for _, m := range set {
+		if privileged[m.Group] && m.Principal.Kind != Group {
+			ids[m.Group] = true
+		}
+	}
+	return slices.Sorted(maps.Keys(ids))
+}
+
+// joinedLocks are the principal locks of the privileged groups joined: a grant to one takes its
+// lock, so none is made while the members it gains are.
+func joinedLocks(joined []string) []string {
+	keys := make([]string, len(joined))
+	for i, g := range joined {
+		keys[i] = groupPrincipal(g).key()
+	}
+	return keys
+}
+
+// stillAsked refuses, under a change's locks, a change to members whose groups, or the privileged
+// holdings of the privileged groups identities join, changed since the host was asked about them
+// before its transaction.
+func (a *Authorizer) stillAsked(ctx context.Context, tx pgx.Tx, tenant string, groups []string, privileged map[string]bool, joined []string, asked map[revalidated]RoleDefinition) error {
+	now, err := privilegedGroups(ctx, tx, tenant, groups)
+	if err != nil {
+		return err
+	}
+	if !maps.Equal(now, privileged) {
+		return fmt.Errorf("%w: a group changed while this change waited for it; try again", ErrConflict)
+	}
+	gains, err := a.privilegedHeld(ctx, tx, tenant, joined)
+	if err != nil {
+		return err
+	}
+	for _, g := range gains {
+		if was, ok := asked[g.key()]; !ok || widens(was, g.role) {
+			return fmt.Errorf("%w: what group %q holds changed while this change waited for it; try again", ErrConflict, g.binding.Principal.ID)
+		}
+	}
+	return nil
 }
 
 // memberSet checks members to add and returns them sorted, each group, principal and source once,
@@ -807,8 +877,8 @@ func (a *Authorizer) join(ctx context.Context, tx pgx.Tx, tenant string, actor P
 // constraint on either stops them. Config.ValidateGrant is asked about each grant and eligibility
 // of a privileged role a privileged group holds, for each identity added to it (ViaMembership), as
 // that identity's. Removing someone from a group a deny names, or adding them to one it exempts,
-// lifts that deny for them, whatever it removes. Members from a source the host owns only the host
-// changes, and what ImportMembers refuses, this does.
+// lifts that deny for them, whatever it removes. Members from a source the host owns, and the
+// members of a group from one, only the host changes, and what ImportMembers refuses, this does.
 func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant string, add, remove []Member) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -835,11 +905,7 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 	if err := errors.Join(owned...); err != nil {
 		return err
 	}
-	ids := map[string]bool{}
-	for _, m := range slices.Concat(set, remove) {
-		ids[m.Group] = true
-	}
-	groups := slices.Sorted(maps.Keys(ids))
+	groups := memberGroups(slices.Concat(set, remove))
 	privileged, err := privilegedGroups(ctx, a.db, tenant, groups)
 	if err != nil {
 		return err
@@ -847,51 +913,31 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 	if err := a.mayChangeMembers(ctx, a.db, actor, tenant, groups, privileged, true); err != nil {
 		return err
 	}
-	// The privileged groups an identity joins, whose holdings it gains.
-	joining := map[string]bool{}
 	for _, m := range set {
-		if !privileged[m.Group] {
-			continue
-		}
-		if m.Principal == actor.Principal {
+		if privileged[m.Group] && m.Principal == actor.Principal {
 			return &DeniedError{Permission: ManagePrivilegedGroups, Scope: TenantRoot(tenant), Reason: "no one adds themselves to a privileged group"}
 		}
-		if m.Principal.Kind != Group {
-			joining[m.Group] = true
-		}
 	}
-	joined := slices.Sorted(maps.Keys(joining))
+	joined := joining(set, privileged)
 	asked, err := a.askMemberships(ctx, actor, tenant, set, joined)
 	if err != nil {
 		return err
 	}
 	scopes, principals := memberLocks(slices.Concat(set, remove))
-	// Grants to a privileged group take its lock, so none is made while the members it gains are.
-	for _, g := range joined {
-		principals = append(principals, groupPrincipal(g).key())
-	}
+	principals = append(principals, joinedLocks(joined)...)
 	return a.inTx(ctx, tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lockAll(ctx, tx, tenant, scopes, principals); err != nil {
 			return ChangeEvent{}, err
 		}
-		now, err := privilegedGroups(ctx, tx, tenant, groups)
-		if err != nil {
+		if err := a.stillAsked(ctx, tx, tenant, groups, privileged, joined, asked); err != nil {
 			return ChangeEvent{}, err
 		}
-		if !maps.Equal(now, privileged) {
-			return ChangeEvent{}, fmt.Errorf("%w: a group changed while this change waited for it; try again", ErrConflict)
+		// The host's groups only the host changes, members and all.
+		if err := a.notOwnedGroups(ctx, tx, tenant, groups); err != nil {
+			return ChangeEvent{}, err
 		}
 		if err := a.mayChangeMembers(ctx, tx, actor, tenant, groups, privileged, false); err != nil {
 			return ChangeEvent{}, err
-		}
-		gains, err := a.privilegedHeld(ctx, tx, tenant, joined)
-		if err != nil {
-			return ChangeEvent{}, err
-		}
-		for _, g := range gains {
-			if was, ok := asked[g.key()]; !ok || widens(was, g.role) {
-				return ChangeEvent{}, fmt.Errorf("%w: what group %q holds changed while this change waited for it; try again", ErrConflict, g.binding.Principal.ID)
-			}
 		}
 		var e ChangeEvent
 		if len(remove) > 0 {
