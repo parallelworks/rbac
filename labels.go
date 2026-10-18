@@ -90,9 +90,10 @@ func indexLabels(dims []LabelDimension, catalog []RoleDefinition) (map[string]la
 			if !p.Valid() {
 				return nil, fmt.Errorf("rbac: label dimension %q: value %q is not a permission's verb", d.Name, v)
 			}
-			// No deny takes a `:deny` permission, and a `:grant` one is a power over grants.
-			if p.managesAccess() {
-				return nil, fmt.Errorf("rbac: label dimension %q: value %q is a verb that changes access", d.Name, v)
+			// No deny takes a `:deny` permission, a `:grant` one is a power over grants, and
+			// `:release` is the power to release data in the dimension.
+			if p.managesAccess() || v == releaseVerb {
+				return nil, fmt.Errorf("rbac: label dimension %q: value %q is a verb that changes access or releases data", d.Name, v)
 			}
 			if _, dup := ld.rank[v]; dup {
 				return nil, fmt.Errorf("rbac: label dimension %q: value %q is declared twice", d.Name, v)
@@ -109,7 +110,13 @@ func indexLabels(dims []LabelDimension, catalog []RoleDefinition) (map[string]la
 			if !ok {
 				continue
 			}
-			if _, ok := ld.rank[v]; !ok {
+			_, value := ld.rank[v]
+			switch {
+			case v == releaseVerb && !r.Privileged:
+				// Held through an ordinary group or by a tenant's members, it would let anyone who
+				// can add to one release data.
+				return nil, fmt.Errorf("rbac: role %q gives %q, the power to release data, so it is Privileged", r.ID, p)
+			case !value && v != releaseVerb:
 				return nil, fmt.Errorf("rbac: role %q gives %q, which isn't a value label dimension %q declares", r.ID, p, t)
 			}
 			gives = true
@@ -145,8 +152,9 @@ func (a *Authorizer) checkLabel(l Label) error {
 	return nil
 }
 
-// Holding is the label values a subject holds in a tenant, by dimension, which its Satisfies
-// checks a label against without reading the database: a feed checks each data point with it.
+// Holding is the label values a subject holds in a tenant, by dimension, and the dimensions it may
+// release data in, which its Satisfies, MayWrite and MayRelease check labels against without
+// reading the database: a feed checks each data point with it.
 // It is what was held as it was read, in that request: a value also ends with no change to
 // report, as a grant, a membership or a place in a group expires or a condition stops holding, so
 // a feed reads it again as often as it may lag behind access ending, not only on changes.
@@ -154,7 +162,16 @@ type Holding struct {
 	tenant string
 	dims   map[string]labelDimension
 	values map[string]map[string]bool
+	// releases are the dimensions it may release data in.
+	releases map[string]bool
 }
+
+// ReleasePermission is the permission, held on the tenant, to release data to a looser label in a
+// dimension (Holding.MayRelease). No value is named release, and a role that gives it is
+// Privileged.
+func ReleasePermission(dimension string) Permission { return Permission(dimension + ":" + releaseVerb) }
+
+const releaseVerb = "release"
 
 // Tenant is the tenant whose values these are: check only its data points with the holding.
 func (h Holding) Tenant() string { return h.tenant }
@@ -216,13 +233,18 @@ func (h Holding) satisfies(dim string, want []string) bool {
 
 // changed is a copy of the holding with ps held too, or with held false, without them.
 func (h Holding) changed(ps map[Permission]bool, held bool) Holding {
-	c := Holding{dims: h.dims, values: map[string]map[string]bool{}}
+	c := Holding{tenant: h.tenant, dims: h.dims, values: map[string]map[string]bool{}, releases: maps.Clone(h.releases)}
 	for dim, vs := range h.values {
 		c.values[dim] = maps.Clone(vs)
 	}
 	for p := range ps {
 		dim, v := p.parts()
 		switch {
+		case v == releaseVerb:
+			if c.releases == nil {
+				c.releases = map[string]bool{}
+			}
+			c.releases[dim] = held
 		case !held:
 			delete(c.values[dim], v)
 		case c.values[dim] == nil:
@@ -254,15 +276,20 @@ func (a *Authorizer) holding(ctx context.Context, tenant string, s Subject) (Hol
 	if len(a.labels) == 0 {
 		return h, nil, nil
 	}
-	// Only the values, so neither the constraints nor the conditions of the tenant's other
-	// permissions are asked about.
+	// Only the values and the powers to release, so neither the constraints nor the conditions of
+	// the tenant's other permissions are asked about.
 	value := func(p Permission) bool { t, _ := p.parts(); _, ok := a.labels[t]; return ok }
 	perms, byCondition, err := a.permissionsOf(ctx, s, Resource{Tenant: tenant, Type: TenantScope, ID: tenant}, value)
 	if err != nil {
 		return Holding{}, nil, err
 	}
+	h.releases = map[string]bool{}
 	for _, p := range perms {
 		t, v := p.parts()
+		if v == releaseVerb {
+			h.releases[t] = true
+			continue
+		}
 		if h.values[t] == nil {
 			h.values[t] = map[string]bool{}
 		}
@@ -323,3 +350,66 @@ func (h Holding) labelColumn(col string, arg func(int) string, first int) (strin
 	args[0], args[1] = declared, refused
 	return "(" + strings.Join(clauses, " AND ") + ")", args
 }
+
+// declares reports whether the holding's Authorizer declares every dimension and value a label
+// has, as checkLabel checks.
+func (h Holding) declares(l Label) bool {
+	for dim, vs := range l {
+		ld, ok := h.dims[dim]
+		if !ok || slices.ContainsFunc(vs, func(v string) bool { _, ok := ld.rank[v]; return !ok }) {
+			return false
+		}
+	}
+	return true
+}
+
+// dominates reports whether, in a dimension the holding's Authorizer declares, values to are at
+// least as restrictive as from: in an Ordered dimension as high, in an AllOf one every value from
+// has, and in an AnyOf one releasable to no one from isn't.
+func (h Holding) dominates(dim string, to, from []string) bool {
+	ld := h.dims[dim]
+	switch ld.rule {
+	case Ordered:
+		top := func(vs []string) int {
+			r := -1
+			for _, v := range vs {
+				r = max(r, ld.rank[v])
+			}
+			return r
+		}
+		return top(to) >= top(from)
+	case AllOf:
+		return subset(from, to)
+	case AnyOf:
+		return len(from) == 0 || len(to) > 0 && subset(to, from)
+	}
+	return false
+}
+
+// flows reports whether data read under from may be written under to, by a holding that
+// satisfies from: to is a label the holding's Authorizer declares, and in every dimension it is at
+// least as restrictive, or, with release, one the holding may release data in.
+func (h Holding) flows(from, to Label, release bool) bool {
+	if !h.Satisfies(from) || !h.declares(to) {
+		return false
+	}
+	for dim := range h.dims {
+		if !h.dominates(dim, to[dim], from[dim]) && (!release || !h.releases[dim]) {
+			return false
+		}
+	}
+	return true
+}
+
+// MayWrite reports whether data read under a label from may be written under to: the holding
+// satisfies from, and to is at least as restrictive in every dimension, so data doesn't move to a
+// looser label without a release (MayRelease). It may write under a label it doesn't satisfy.
+// Data from several sources is written under a label MayWrite allows from each.
+func (h Holding) MayWrite(from, to Label) bool { return h.flows(from, to, false) }
+
+// MayRelease reports whether data read under a label from may be released to a looser one, to:
+// the holding satisfies from, and in every dimension to loosens, the holding has that dimension's
+// power to release, `dimension:release` on the tenant. In an Ordered dimension it can release to
+// any lower value, in an AllOf one drop any value, and in an AnyOf one release to any value, or to
+// everyone with none.
+func (h Holding) MayRelease(from, to Label) bool { return h.flows(from, to, true) }

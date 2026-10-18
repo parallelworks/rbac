@@ -98,6 +98,15 @@ another store. Both search one tenant, and count only unconditional grants:
   `SetDeny` and `DeleteDeny` its denies; `Explain` names the dimension that failed. `Filter`
   tests a `text[]` label column (`Columns.Labels`), `Reachable` returns the holding, and `Holding`
   with `Satisfies` checks data points in a feed without reading the database.
+- **Writing labelled data:** data read under one label is written under another only if
+  `Holding.MayWrite` allows it: the writer satisfies the label it read, and the new one is at
+  least as restrictive in every dimension (a level as high, every compartment kept, partners
+  narrowed or kept), so data never moves to a looser label by being copied. Data from several
+  sources takes a label `MayWrite` allows from each. Loosening a label is a release:
+  `Holding.MayRelease` allows it in the dimensions whose power to release the subject holds
+  (`ReleasePermission(dimension)` on the tenant), for data it can read. A role giving it is
+  `Privileged`, so only identities and privileged groups hold it, and no value is named
+  `release`.
 - **Conditions:** a grant can carry a CEL expression over the subject's, the resource's and the
   request's attributes (`Subject.Attributes`, `Resource.Attributes`, `rbac.WithRequest`), the time
   and the action. It gives its role only where the expression holds; one that fails is false.

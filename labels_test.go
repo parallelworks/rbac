@@ -481,6 +481,15 @@ func TestLabelsAreDeclared(t *testing.T) {
 		"a value that is a power to change grants": func(c *rbac.Config) {
 			c.Labels = append(slices.Clone(c.Labels), rbac.LabelDimension{Name: "zone", Rule: rbac.AllOf, Values: []string{"grant"}})
 		},
+		"a value named for the power to release": func(c *rbac.Config) {
+			c.Labels = append(slices.Clone(c.Labels), rbac.LabelDimension{Name: "zone", Rule: rbac.Ordered, Values: []string{"release"}})
+		},
+		"an unprivileged role giving the power to release": func(c *rbac.Config) {
+			c.Catalog = append(slices.Clone(c.Catalog), rbac.RoleDefinition{ID: "bad", Permissions: []rbac.Permission{rbac.ReleasePermission("rel")}, ResourceTypes: []string{rbac.TenantScope}})
+		},
+		"a role giving the power to release on a cluster": func(c *rbac.Config) {
+			c.Catalog = append(slices.Clone(c.Catalog), rbac.RoleDefinition{ID: "bad", Permissions: []rbac.Permission{rbac.ReleasePermission("rel")}, ResourceTypes: []string{"cluster"}, Privileged: true})
+		},
 	} {
 		cfg := h.cfg
 		mutate(&cfg)
@@ -543,5 +552,127 @@ func TestALabelValueIsGrantedOnTheTenantAlone(t *testing.T) {
 	}
 	if err := h.authz.Apply(ctx, admin, rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}, rbac.Change{Grant: []rbac.Binding{{Role: "rel.gbr", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}}}); err != nil {
 		t.Fatalf("a value granted on the tenant: %v", err)
+	}
+}
+
+func TestMayWriteKeepsDataUnderALabelAsRestrictive(t *testing.T) {
+	h := labelled(t)
+	pilot := h.as(t, "pilot")
+	h.hold(t, "pilot", "level:mid", "comp:alpha", "rel:gbr")
+	holding, err := h.authz.Holding(t.Context(), "t1", pilot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		from, to rbac.Label
+		want     bool
+	}{
+		{rbac.Label{}, rbac.Label{}, true},
+		{rbac.Label{}, rbac.Label{"level": {}}, true},
+		{rbac.Label{"level": {"mid"}}, rbac.Label{"level": {"mid"}}, true},
+		{rbac.Label{"level": {"low", "mid"}}, rbac.Label{"level": {"mid"}}, true},
+		{rbac.Label{"level": {"mid"}}, rbac.Label{"level": {"high"}}, true},
+		{rbac.Label{"level": {"mid"}}, rbac.Label{"level": {"low"}}, false},
+		{rbac.Label{"level": {"mid"}}, rbac.Label{}, false},
+		{rbac.Label{"level": {"high"}}, rbac.Label{"level": {"high"}}, false},
+		{rbac.Label{"comp": {"alpha"}}, rbac.Label{"comp": {"alpha", "bravo"}}, true},
+		{rbac.Label{"comp": {"alpha"}}, rbac.Label{"comp": {"bravo"}}, false},
+		{rbac.Label{"comp": {"alpha"}}, rbac.Label{"level": {"high"}}, false},
+		{rbac.Label{"rel": {"gbr", "usa"}}, rbac.Label{"rel": {"gbr"}}, true},
+		{rbac.Label{}, rbac.Label{"rel": {"usa"}}, true},
+		{rbac.Label{"rel": {"gbr"}}, rbac.Label{"rel": {"gbr", "fra"}}, false},
+		{rbac.Label{"rel": {"gbr"}}, rbac.Label{"rel": {"fra"}}, false},
+		{rbac.Label{"rel": {"gbr"}}, rbac.Label{"rel": {}}, false},
+		{rbac.Label{}, rbac.Label{"level": {"top"}}, false},
+		{rbac.Label{}, rbac.Label{"zone": {"red"}}, false},
+		{rbac.Label{}, rbac.Label{"zone": {}}, false},
+	} {
+		if got := holding.MayWrite(c.from, c.to); got != c.want {
+			t.Errorf("MayWrite(%v, %v) = %v", c.from, c.to, got)
+		}
+	}
+}
+
+// releasing has a privileged role for the tenant giving each dimension's power to release.
+func releasing(c *rbac.Config) {
+	for _, d := range labelDimensions {
+		c.Catalog = append(c.Catalog, rbac.RoleDefinition{
+			ID: rbac.Role(d.Name + ".release"), Permissions: []rbac.Permission{rbac.ReleasePermission(d.Name)}, ResourceTypes: []string{rbac.TenantScope}, Privileged: true,
+		})
+	}
+}
+
+func TestMayReleaseNeedsTheDimensionsPowerToRelease(t *testing.T) {
+	h := labelled(t, releasing)
+	ctx := t.Context()
+	officer := h.as(t, "officer")
+	h.hold(t, "officer", "level:mid", "comp:alpha", "rel:gbr", "level:release")
+	holding, err := h.authz.Holding(ctx, "t1", officer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := holding.Values(); !slices.Equal(got, []rbac.Permission{"comp:alpha", "level:mid", "rel:gbr"}) {
+		t.Fatalf("Values = %v", got)
+	}
+	for _, c := range []struct {
+		from, to rbac.Label
+		want     bool
+	}{
+		{rbac.Label{"level": {"mid"}}, rbac.Label{"level": {"low"}}, true},
+		{rbac.Label{"level": {"mid"}}, rbac.Label{}, true},
+		{rbac.Label{"level": {"low"}}, rbac.Label{"level": {"mid"}}, true},
+		{rbac.Label{"level": {"high"}}, rbac.Label{"level": {"low"}}, false},
+		{rbac.Label{"level": {"mid"}}, rbac.Label{"level": {"top"}}, false},
+		{rbac.Label{"level": {"mid"}, "rel": {"gbr"}}, rbac.Label{"level": {"low"}, "rel": {"gbr"}}, true},
+		{rbac.Label{"level": {"mid"}, "rel": {"gbr"}}, rbac.Label{"level": {"low"}}, false},
+		{rbac.Label{"comp": {"alpha"}}, rbac.Label{}, false},
+		{rbac.Label{"rel": {"gbr"}}, rbac.Label{"rel": {"gbr", "fra"}}, false},
+	} {
+		if got := holding.MayRelease(c.from, c.to); got != c.want {
+			t.Errorf("MayRelease(%v, %v) = %v", c.from, c.to, got)
+		}
+		// Writing never releases.
+		if holding.MayWrite(c.from, c.to) && !c.want {
+			t.Errorf("MayWrite(%v, %v)", c.from, c.to)
+		}
+	}
+	if holding.MayWrite(rbac.Label{"level": {"mid"}}, rbac.Label{"level": {"low"}}) {
+		t.Error("MayWrite released")
+	}
+
+	h.hold(t, "officer", "rel:release", "comp:release")
+	if holding, err = h.authz.Holding(ctx, "t1", officer); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ from, to rbac.Label }{
+		{rbac.Label{"rel": {"gbr"}}, rbac.Label{"rel": {"gbr", "fra"}}},
+		{rbac.Label{"rel": {"gbr"}}, rbac.Label{"rel": {"usa"}}},
+		{rbac.Label{"rel": {"gbr"}}, rbac.Label{}},
+		{rbac.Label{"comp": {"alpha"}}, rbac.Label{}},
+		{rbac.Label{"level": {"mid"}, "comp": {"alpha"}, "rel": {"gbr"}}, rbac.Label{"comp": {"bravo"}}},
+	} {
+		if !holding.MayRelease(c.from, c.to) {
+			t.Errorf("MayRelease(%v, %v)", c.from, c.to)
+		}
+	}
+	if holding.MayRelease(rbac.Label{"comp": {"bravo"}}, rbac.Label{}) {
+		t.Error("released data it can't read")
+	}
+}
+
+func TestAPowerToReleaseHeldUnderAConditionIsNoValue(t *testing.T) {
+	h := labelled(t, releasing)
+	owner := h.as(t, "owner")
+	g := grant(rbac.TenantRoot("t1"), "level.release", rbac.User, "owner")
+	g.Condition = rbac.Condition{Expression: `request.attributes.mission == true`}
+	h.seed(t, g)
+	low := cluster
+	low.Labels = rbac.Label{"level": {"low"}}
+	holders, err := h.authz.Holders(t.Context(), view, low)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.ContainsFunc(holders, func(x rbac.Holder) bool { return x.Principal == owner.Principal }) {
+		t.Fatalf("Holders = %+v", holders)
 	}
 }
