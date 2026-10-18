@@ -798,6 +798,11 @@ func vocabulary(declared []Permission, given map[Permission]bool, roleTypes map[
 // in several statements, on tx at its isolation: at READ COMMITTED each reads a snapshot of its
 // own, so a change committing between them can mix two states.
 func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
+	// One AsOf gave reads its own transaction, whose views are the past: on another, it would read
+	// the tables as they are now.
+	if a.asOf {
+		return a
+	}
 	b := *a
 	b.db = tx
 	return &b

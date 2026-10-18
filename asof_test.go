@@ -91,12 +91,22 @@ func TestAsOfChangesNothing(t *testing.T) {
 	ctx := t.Context()
 	owner := h.as(t, "owner")
 	at := dbNow(t, h)
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "later"))
 	if err := h.authz.AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
 		if err := a.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}}}); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("Apply as of a time: %v", err)
 		}
 		if _, err := a.DeleteExpired(ctx); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("DeleteExpired as of a time: %v", err)
+		}
+		// On another transaction it still reads the past, not the grant made since.
+		other, err := h.pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = other.Rollback(ctx) }()
+		if got, err := a.WithTx(other).Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{{Kind: rbac.User, ID: "later"}}}); err != nil || len(got) != 0 {
+			t.Errorf("Grants on another transaction = %+v, %v", got, err)
 		}
 		if err := a.AsOf(ctx, "t1", at, func(*rbac.Authorizer) error { return nil }); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("AsOf as of a time: %v", err)

@@ -34,6 +34,9 @@ var errAsOf = errors.New("rbac: as of")
 // reads them as they are now. A Filter condition reads as of the time only in a query on the
 // transaction read runs in: under WithTx, the host's, before read returns.
 //
+// WithTx on the Authorizer read is given returns it as it is, reading the past on its own
+// transaction.
+//
 // It reads in one transaction, or a savepoint of the host's under WithTx, in which temporary
 // views named as the package's tables stand in for them, and rolls it back: it needs a
 // transaction that may write, on a primary, as a role that may create temporary tables. A
