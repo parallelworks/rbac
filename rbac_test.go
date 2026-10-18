@@ -605,6 +605,12 @@ func TestAHostsRefusalKeepsItsError(t *testing.T) {
 				return fmt.Errorf("%w: %w", rbac.ErrInvalid, &refusal{code: "guest_role"})
 			case "plain":
 				return rbac.ErrInvalid
+			case "after":
+				return fmt.Errorf("not a member of the tenant: %w", rbac.ErrInvalid)
+			case "joined":
+				return errors.Join(rbac.ErrInvalid, errNotMember)
+			case "own":
+				return &rbac.InvalidError{Binding: in.Binding, Reason: "not a member of the tenant"}
 			}
 			return nil
 		}
@@ -628,6 +634,11 @@ func TestAHostsRefusalKeepsItsError(t *testing.T) {
 	}
 	if err := apply("plain"); !errors.Is(err, rbac.ErrInvalid) || err.Error() != "rbac: cluster.login for user:plain: refused by the host" {
 		t.Fatalf("a refusal that is ErrInvalid alone: %v", err)
+	}
+	for _, id := range []string{"after", "joined", "own"} {
+		if err, want := apply(id), "rbac: cluster.login for user:"+id+": not a member of the tenant"; !errors.Is(err, rbac.ErrInvalid) || err.Error() != want {
+			t.Errorf("a refusal %s: %q, want %q", id, err, want)
+		}
 	}
 }
 
