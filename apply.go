@@ -672,8 +672,7 @@ func (p power) lists(r Role, condition string) bool {
 // name. With a custom role among them it reads all the tenant's, which a role's GrantableRoles
 // can name.
 func (a *Authorizer) authorityOn(ctx context.Context, q DB, actor Subject, on Resource, roles []Role) (authority, error) {
-	keys := actor.principals(on.Tenant)
-	held, ds, err := a.heldOrDenied(ctx, q, on.Tenant, keys, keys, on.path(), "")
+	held, ds, err := a.heldOrDenied(ctx, q, on.Tenant, actor, all, on.path(), "")
 	if err != nil {
 		return authority{}, err
 	}
@@ -924,8 +923,7 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 	if cs.removes(GrantPermission(r.Type), r.Type) {
 		return nil, cs.failed()
 	}
-	keys := s.principals(r.Tenant)
-	held, ds, err := a.heldOrDenied(ctx, a.db, r.Tenant, keys, keys, r.path(), "")
+	held, ds, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), "")
 	if err != nil || len(held) == 0 {
 		return nil, err
 	}

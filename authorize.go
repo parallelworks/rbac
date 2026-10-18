@@ -61,9 +61,9 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 		return Decision{DeniedBy: name, Reason: "removed by " + name}, nil
 	}
 
-	principals := s.principalsFor(r.Tenant, p, a.publicGives(p, r.Type))
+	counts := a.counting(p, r.Type)
 	if !explain {
-		held, ds, err := a.heldOrDenied(ctx, a.db, r.Tenant, principals, s.principals(r.Tenant), r.path(), p)
+		held, ds, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, counts, r.path(), p)
 		if err != nil {
 			return Decision{}, err
 		}
@@ -119,9 +119,14 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 	}
 
 	vars, spend := a.vars(ctx, s, p, r), newBudget()
+	keys, err := a.keysOf(ctx, a.db, r.Tenant, s)
+	if err != nil {
+		return Decision{}, err
+	}
+	principals := countedOf(keys, counts)
 	// As Authorize, which reads no deny for a subject none of whose grants can give p.
 	if len(principals) > 0 {
-		ds, err := a.deniesOn(ctx, a.db, r.Tenant, s.principals(r.Tenant), r.path(), p)
+		ds, err := a.deniesOn(ctx, a.db, r.Tenant, bound(keys, s), r.path(), p)
 		if err != nil {
 			return Decision{}, err
 		}
@@ -210,8 +215,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 	if err := a.subject(s); err != nil {
 		return nil, err
 	}
-	keys := s.principals(r.Tenant)
-	held, ds, err := a.heldOrDenied(ctx, a.db, r.Tenant, keys, keys, r.path(), "")
+	held, ds, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), "")
 	if err != nil {
 		return nil, err
 	}
@@ -305,7 +309,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 }
 
 // Holders lists every principal holding a role that gives p on r, the tenant's members and the
-// public included. The AuthZEN subject search; the host expands groups to their members. It
+// public included. The AuthZEN subject search; Members lists a group's members. It
 // counts only unconditional grants: whether a conditional one allows depends on the request,
 // and Grants lists them with their conditions. It leaves out holders a deny on the path names,
 // conditional denies included; a deny naming a group's member or an identity among the tenant's
@@ -387,9 +391,16 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 	if err != nil || removed {
 		return Reach{}, err
 	}
-	principals := s.principalsFor(tenant, p, a.publicGives(p, resourceType))
 	custom := a.customGives(p, resourceType)
-	if len(principals) == 0 || len(roles) == 0 && !custom {
+	if len(roles) == 0 && !custom {
+		return Reach{}, nil
+	}
+	keys, err := a.keysOf(ctx, a.db, tenant, s)
+	if err != nil {
+		return Reach{}, err
+	}
+	principals := countedOf(keys, a.counting(p, resourceType))
+	if len(principals) == 0 {
 		return Reach{}, nil
 	}
 	reaching := a.reaching(resourceType)
@@ -434,7 +445,7 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 		WHERE tenant = $1 AND scope_type = ANY($2::text[])
 		  AND principals && $3::text[] AND NOT exempt && $3::text[] AND ($4 = ANY(permissions) OR $5 = ANY(permissions))
 		GROUP BY scope ORDER BY scope`,
-		tenant, reaching, s.principals(tenant), perm, wildcard)
+		tenant, reaching, bound(keys, s), perm, wildcard)
 	if err != nil {
 		return Reach{}, err
 	}
@@ -508,21 +519,26 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	if err != nil {
 		return Predicate{}, err
 	}
-	principals := s.principalsFor(tenant, p, a.publicGives(p, resourceType))
+	counts := a.counting(p, resourceType)
 	custom := a.customGives(p, resourceType)
-	if removed || len(principals) == 0 || len(roles) == 0 && !custom {
+	if removed || s.Principal == (Principal{}) && !counts.public || len(roles) == 0 && !custom {
 		return Predicate{SQL: "FALSE"}, nil
 	}
 	arg := func(i int) string { return fmt.Sprintf("$%d", firstArg+i) }
 	perm, wildcard := matchable(p)
+	// The subject's principals, read in the statement as its grants and denies are, so a list
+	// reads its membership, its groups and what they hold in one snapshot.
+	keys := func(of string) string {
+		return "ARRAY(WITH RECURSIVE " + keysSQL(arg(1)+"::text", arg(2)+"::text", arg(4)) + " " + of + ")"
+	}
 	// The subject's grants on the scopes `of` keeps, in the default collation, as the host's
 	// path column has it, so its GIN index applies.
 	grants := func(of string) string {
 		return fmt.Sprintf(`SELECT g.scope COLLATE "default" FROM rbac_grants g
-			WHERE g.tenant = %s::text AND g.principal = ANY(%s::text[]) AND g.role = ANY(%s)
+			WHERE g.tenant = %s::text AND g.principal = ANY(%s) AND g.role = ANY(%s)
 			  AND (g.expires_at IS NULL OR g.expires_at > %s) AND NOT g.conditional AND %s
 			  AND (g.principal <> %s::text OR g.role = ANY(%s))`,
-			arg(1), arg(2), givingSQL(arg(3), arg(1), arg(8), arg(9), custom, nil), arg(4), of, arg(6),
+			arg(1), keys(countedKeys(arg(13), arg(17))), givingSQL(arg(3), arg(1), arg(8), arg(9), custom, nil), arg(4), of, arg(6),
 			givingSQL(arg(7), arg(1), arg(8), arg(9), custom, &publicSQL{arg(10), arg(11), arg(12)}))
 	}
 	// The grants' tenant is an argument of its own: the host's tenant column needn't be text,
@@ -535,7 +551,7 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	above := a.reaching(resourceType)
 	var byKey string
 	if !a.contains(resourceType) {
-		many, err := a.manyResourceGrants(ctx, tenant, principals, resourceType)
+		many, err := a.manyResourceGrants(ctx, tenant, s, counts, resourceType)
 		if err != nil {
 			return Predicate{}, err
 		}
@@ -549,13 +565,13 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 		SQL: fmt.Sprintf(`(%s = %s AND %s
 			AND NOT %s && ARRAY(SELECT d.scope COLLATE "default" FROM rbac_denies d
 			WHERE d.tenant = %s::text AND d.scope_type = ANY(%s::text[])
-			  AND d.principals && %s::text[] AND NOT d.exempt && %s::text[]
-			  AND (%s::text = ANY(d.permissions) OR %s::text = ANY(d.permissions))))`,
-			cols.Tenant, arg(0), reached, cols.Path, arg(1), arg(16), arg(13), arg(13), arg(14), arg(15)),
+			  AND d.principals && %[7]s AND NOT d.exempt && %[7]s
+			  AND (%[8]s::text = ANY(d.permissions) OR %[9]s::text = ANY(d.permissions))))`,
+			cols.Tenant, arg(0), reached, cols.Path, arg(1), arg(16), keys("SELECT k FROM bound"), arg(14), arg(15)),
 		Args: append(append([]any{
-			tenant, tenant, principals, roles, a.cfg.Now(), above, publicKey, a.publicRoles(roles),
+			tenant, tenant, s.identityKey(), roles, a.cfg.Now(), above, publicKey, a.publicRoles(roles),
 			string(p), resourceType,
-		}, a.publicArgs(p, resourceType, custom)...), s.principals(tenant), perm, wildcard, a.reaching(resourceType)),
+		}, a.publicArgs(p, resourceType, custom)...), counts.public, perm, wildcard, a.reaching(resourceType), counts.members),
 	}, nil
 }
 
@@ -580,14 +596,16 @@ func ofType(col, t string) string {
 // about where comparing each with every key of a row costs as much as a lookup in a hash.
 const maxOverlap = 8
 
-// manyResourceGrants reports whether principals hold more than maxOverlap unconditional grants in
-// force on resources of a type, of any role: it only picks the form of Filter's condition.
-func (a *Authorizer) manyResourceGrants(ctx context.Context, tenant string, principals []string, resourceType string) (bool, error) {
+// manyResourceGrants reports whether s's principals hold more than maxOverlap unconditional grants
+// in force on resources of a type, of any role, counting broad ones as counts says: it only picks
+// the form of Filter's condition.
+func (a *Authorizer) manyResourceGrants(ctx context.Context, tenant string, s Subject, counts broad, resourceType string) (bool, error) {
 	var n int
-	err := a.db.QueryRow(ctx, `SELECT count(*) FROM (SELECT FROM rbac_grants
-		WHERE tenant = $1 AND principal = ANY($2::text[]) AND `+ofType("scope", "$3::text")+` AND NOT conditional
+	err := a.db.QueryRow(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$4")+`
+		SELECT count(*) FROM (SELECT FROM rbac_grants
+		WHERE tenant = $1 AND principal = ANY(ARRAY(`+countedKeys("$6", "$7")+`)) AND `+ofType("scope", "$3::text")+` AND NOT conditional
 		  AND (expires_at IS NULL OR expires_at > $4) LIMIT $5) g`,
-		tenant, principals, resourceType, a.cfg.Now(), maxOverlap+1).Scan(&n)
+		tenant, s.identityKey(), resourceType, a.cfg.Now(), maxOverlap+1, counts.public, counts.members).Scan(&n)
 	return n > maxOverlap, err
 }
 
@@ -599,12 +617,15 @@ type holding struct {
 	conditional bool
 }
 
-// heldOrDenied returns the grants held by any of principals on any of scopes, not expired, and
-// the denies deniesOn reads for keys and p, or any permission when p is empty, in one statement,
-// so a check is one round trip. The grants' part reads only what the key index holds, so it is
-// an index-only scan.
-func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, principals, keys, scopes []string, p Permission) ([]holding, []denial, error) {
-	if len(principals) == 0 {
+// heldOrDenied returns the grants on any of scopes, not expired, held by s's principals in a
+// tenant, counting broad ones as counts says, and the denies deniesOn reads for all its principals
+// and p, or any permission when p is empty, in one statement that reads its membership and groups
+// too, so a check is one round trip. The grants' part reads only what the key index holds, so it
+// is an index-only scan. Like Explain, it reads no deny for a subject none of whose grants count,
+// such as one that isn't a member or guest of the tenant.
+func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Subject, counts broad, scopes []string, p Permission) ([]holding, []denial, error) {
+	// The anonymous are the public alone.
+	if s.Principal == (Principal{}) && !counts.public {
 		return nil, nil, nil
 	}
 	var perm, wildcard string
@@ -612,17 +633,18 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, prin
 		perm, wildcard = matchable(p)
 	}
 	rows, err := q.Query(ctx, `
+		WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$4")+`
 		SELECT false, id::text, principal, scope, role, expires_at, conditional, NULL::text[], ''
 		FROM rbac_grants
-		WHERE tenant = $1 AND principal = ANY($2::text[]) AND scope = ANY($3::text[])
+		WHERE tenant = $1 AND principal = ANY(ARRAY(`+countedKeys("$7", "$8")+`)) AND scope = ANY($3::text[])
 		  AND (expires_at IS NULL OR expires_at > $4)
 		UNION ALL
 		SELECT true, id, id, scope, '', NULL, condition <> '', permissions, condition
 		FROM rbac_denies
-		WHERE tenant = $1 AND scope = ANY($3::text[]) AND principals && $5::text[] AND NOT exempt && $5::text[]
-		  AND ($6 = '' OR $6 = ANY(permissions) OR $7 = ANY(permissions))
+		WHERE tenant = $1 AND scope = ANY($3::text[]) AND principals && ARRAY(SELECT k FROM bound) AND NOT exempt && ARRAY(SELECT k FROM bound)
+		  AND ($5 = '' OR $5 = ANY(permissions) OR $6 = ANY(permissions)) AND EXISTS (SELECT FROM keys WHERE `+counted("$7", "$8")+`)
 		ORDER BY 1, 3, 4, 5, 2`, // grants by principal, scope, role and id; denies by id and scope, as deniesOn
-		tenant, principals, scopes, a.cfg.Now(), keys, perm, wildcard)
+		tenant, s.identityKey(), scopes, a.cfg.Now(), perm, wildcard, counts.public, counts.members)
 	if err != nil {
 		return nil, nil, err
 	}

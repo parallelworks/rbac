@@ -289,13 +289,21 @@ func (a *Authorizer) Deactivate(ctx context.Context, s Subject, on Resource, rol
 // eligibility allowing it names none.
 func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource, act Activation, until time.Time) (approved Principal, err error) {
 	scope, manage := on.Scope(), GrantPermission(on.Type)
+	keys, err := a.keysOf(ctx, q, on.Tenant, s)
+	if err != nil {
+		return Principal{}, err
+	}
+	approvers, err := a.keysOf(ctx, q, on.Tenant, act.Approver)
+	if err != nil {
+		return Principal{}, err
+	}
 	// Those needing no approval first, so an approver passed where none is needed isn't recorded.
 	rows, err := q.Query(ctx, `
 		SELECT requires, approvers FROM rbac_eligibilities
 		WHERE tenant = $1 AND scope = $2 AND role = $3 AND principal = ANY($4::text[]) AND max_seconds >= $5
 		  AND (expires_at IS NULL OR expires_at > $6 AND expires_at >= $7)
 		ORDER BY cardinality(approvers), requires`,
-		on.Tenant, scope.Key(), act.Role, s.keys(on.Tenant, false, false), seconds(act.Duration), a.cfg.Now(), until)
+		on.Tenant, scope.Key(), act.Role, countedOf(keys, broad{}), seconds(act.Duration), a.cfg.Now(), until)
 	if err != nil {
 		return Principal{}, err
 	}
@@ -313,7 +321,7 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 	reason := fmt.Sprintf("not eligible to activate %s here for %s", act.Role, act.Duration)
 	vars, spend := a.vars(ctx, s, manage, on), newBudget()
 	for _, e := range found {
-		if len(e.approvers) > 0 && !approves(act.Approver, s, e.approvers) {
+		if len(e.approvers) > 0 && !approves(act.Approver, s, countedOf(approvers, broad{}), e.approvers) {
 			reason = fmt.Sprintf("activating %s here needs one of its approvers to approve", act.Role)
 			continue
 		}
@@ -327,13 +335,14 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 	return Principal{}, &DeniedError{Permission: manage, Scope: scope, Reason: reason}
 }
 
-// approves reports whether approver is among an eligibility's approvers, by identity or group, and
-// isn't s, who can't approve its own activation.
-func approves(approver, s Subject, approvers []string) bool {
+// approves reports whether approver, by one of its keys in the tenant, its identity or a group it
+// is in there, is among an eligibility's approvers, and isn't s, who can't approve its own
+// activation.
+func approves(approver, s Subject, keys, approvers []string) bool {
 	if approver.Principal == (Principal{}) || approver.Principal == s.Principal {
 		return false
 	}
-	return slices.ContainsFunc(approver.keys("", false, false), func(k string) bool { return slices.Contains(approvers, k) })
+	return slices.ContainsFunc(keys, func(k string) bool { return slices.Contains(approvers, k) })
 }
 
 // seconds is d in whole seconds, rounded up.

@@ -19,10 +19,11 @@ everything under it: a resource, a container above resources (any depth, any nam
 tenant. A principal is a user, another kind of identity the application declares (a service
 account), a group, every member of the tenant, or the public, signed in or not.
 
-The application keeps identities, groups, resources and their hierarchy, and passes them in: a
-`Subject` is an identity with its groups and tenants, and a `Resource` carries its ancestors. The
-package keeps only grants and its own policies, so nothing it holds goes stale when someone
-leaves a group or a resource moves.
+The application keeps identities, resources and their hierarchy, and passes them in: a `Subject`
+is the identity asking, and a `Resource` carries its ancestors. The package keeps the grants and
+its own policies, and which identities are members or guests of each tenant and in each of its
+groups, so a check, a list and an access review all read membership from one place, and
+nothing it holds goes stale when a resource moves.
 
 ```go
 authz, err := rbac.New(pool, rbac.Config{
@@ -33,7 +34,7 @@ authz, err := rbac.New(pool, rbac.Config{
 	OnChange:       audit.Record,    // runs in the change's transaction
 })
 
-subject := rbac.Subject{Principal: rbac.Principal{Kind: rbac.User, ID: userID}, Groups: groupIDs, Tenants: []string{tenant}}
+subject := rbac.Subject{Principal: rbac.Principal{Kind: rbac.User, ID: userID}}
 cluster := rbac.Resource{Tenant: tenant, Type: "cluster", ID: id,
 	Ancestors: []rbac.Scope{{Type: "workspace", ID: ws}, {Type: "org", ID: org}}}
 if err := authz.Authorize(ctx, subject, "cluster:login", cluster); err != nil {
@@ -119,10 +120,17 @@ another store. Both search one tenant, and count only unconditional grants:
 
 ## Principals
 
-- **Identities across tenants:** an identity's or group's id names it in every tenant, so a tenant
-  can grant a role to one from another where `ValidateGrant` allows it; `Subject.Tenants` decides
-  only which tenants' members it is. `DeletePrincipalEverywhere` removes a deleted identity's
-  grants.
+- **Members and guests:** an identity holds what it is granted in a tenant only while it is a
+  member or guest of it (`SetMemberships`), and nothing while its membership is suspended. A guest,
+  such as one from another tenant, holds what it is granted there and nothing granted to the
+  tenant's members. Leaving a tenant (`DeletePrincipal`) removes what the identity held there;
+  `DeletePrincipalEverywhere` removes a deleted identity from every tenant.
+- **Groups:** a group is its tenant's (`SetGroup`, `ImportGroups`), and `group:<id>` names it only
+  there. Its members are identities that are members or guests of the tenant, and other groups of
+  the tenant, at most `rbac.MaxGroupDepth` deep (`ImportMembers`), each from a source, perhaps
+  until a time. Every check, list and deny reads an identity's groups, through those they are in,
+  as they are stored now: `Authorize` and `Filter` in the same statement as its grants and denies.
+  A suspended identity is bound as one outside the tenant is: by a deny naming it or the public.
 - **Public access:** the zero `Subject` is anonymous and holds only what is granted to the public.
   Only a role marked `Public` can be granted to the public, and a grant to the public gives
   nothing once its role no longer is.
@@ -144,11 +152,10 @@ permission, so an error shown to a user shows no policy; its fields say why.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
   between host transactions, matches `rbac.ErrConflict`: try it again.
-- **What the host passes:** a check reads grants as they are; only compiled conditions are cached.
-  Read a resource's ancestors and attributes and a subject's groups from where they are stored,
+- **What the host passes:** a check reads grants, memberships and groups as they are; only compiled
+  conditions are cached. Read a resource's ancestors and attributes from where they are stored,
   never from request input, no earlier than the content they protect, and from the primary. A
-  deny is only as complete as the groups and ancestors passed: one naming a group binds only
-  subjects passed with it.
+  deny is only as complete as the ancestors passed.
 - **Ids:** an id names its identity, group or resource for good. Never reuse one, or a new
   resource or account inherits the grants of the one before it. Delete a resource's grants with
   `DeleteScopes` in the transaction that deletes it, in one call with every scope under it too,

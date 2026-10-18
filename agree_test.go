@@ -136,16 +136,23 @@ func newWorld(t *testing.T, seed uint64, conditional bool) world {
 		}
 	}
 	for _, u := range users {
-		s := rbac.Subject{Principal: rbac.Principal{Kind: rbac.User, ID: u}}
+		var in []string
 		for _, g := range groups {
 			if pick(3) == 0 {
-				s.Groups = append(s.Groups, g)
+				in = append(in, g)
 			}
 		}
-		// Most are the tenant's members; one in four is a guest from another.
-		s.Tenants = []string{"t1"}
-		if pick(4) == 0 {
-			s.Tenants = []string{"t2"}
+		s := h.as(t, u, in...)
+		// Most are the tenant's members; some are guests, and some are only another tenant's.
+		switch pick(6) {
+		case 0:
+			if _, err := h.pool.Exec(ctx, `UPDATE rbac_memberships SET guest = true WHERE tenant = 't1' AND principal = $1`, "user:"+u); err != nil {
+				t.Fatal(err)
+			}
+		case 1:
+			if _, err := h.pool.Exec(ctx, `UPDATE rbac_memberships SET tenant = 't2' WHERE tenant = 't1' AND principal = $1`, "user:"+u); err != nil {
+				t.Fatal(err)
+			}
 		}
 		w.subjects = append(w.subjects, s)
 	}
