@@ -481,10 +481,11 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 	if r != nil {
 		ids = append([]Role{r.ID}, r.GrantableRoles...)
 	}
-	au, err := a.authorityOn(ctx, q, actor, root, ids, cs)
+	au, err := a.authorityOn(ctx, q, actor, root, ids)
 	if err != nil {
 		return authority{}, err
 	}
+	au.constrained = cs
 	if !au.may(DefineRoles, TenantScope) {
 		return authority{}, &DeniedError{Permission: DefineRoles, Scope: scope, Reason: "the actor may not define roles here"}
 	}
@@ -501,7 +502,11 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 	}
 	seen := map[string]bool{}
 	if p, ok := a.holdsRole(au, *r, r.ResourceTypes, "", seen); !ok {
-		return authority{}, cmp.Or(cs.failed(), error(&DeniedError{Permission: p, Scope: scope, Reason: fmt.Sprintf("the actor can't define %s without holding %s here", r.ID, p)}))
+		reason := fmt.Sprintf("the actor can't define %s without holding %s here", r.ID, p)
+		if name := cs.removedBy(p); name != "" {
+			reason = fmt.Sprintf("the actor can't define %s while %s removes %s from it", r.ID, name, p)
+		}
+		return authority{}, cmp.Or(cs.failed(), error(&DeniedError{Permission: p, Scope: scope, Reason: reason}))
 	}
 	// A role that lists r lets its holders grant r as it will be wherever it can be granted, a
 	// power its definer never had to have if r gave less or couldn't be granted there: the

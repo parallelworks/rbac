@@ -506,21 +506,24 @@ type constrained struct {
 	actor Subject
 	on    Resource
 	asked map[permissionOn]bool
-	err   error
+	// by names the constraint that removed each permission, for a refusal to say.
+	by  map[Permission]string
+	err error
 	// sealed is set in the transaction, where a permission not asked about before is one the change
 	// came to need since, as for a role redefined meanwhile: missed refuses it, to be tried again.
 	sealed, missed bool
 }
 
 func (a *Authorizer) constrain(ctx context.Context, actor Subject, on Resource) *constrained {
-	return &constrained{a: a, ctx: ctx, actor: actor, on: on, asked: map[permissionOn]bool{}}
+	return &constrained{a: a, ctx: ctx, actor: actor, on: on, asked: map[permissionOn]bool{}, by: map[Permission]string{}}
 }
 
 func (c *constrained) seal() { c.sealed = true }
 
 // removes reports whether a constraint removes p on resources of a type from the actor, failing
-// closed. On a resource the actor hands on only there, so the constraints are asked about it;
-// through a container or the tenant, about every resource of the type under it, as nil.
+// closed. The constraints are asked about the scope the change is on, a container or the tenant
+// too, as a deny on that scope's path binds what the actor hands on there: a constraint that
+// tells one container from another, as a freeze does, binds only where it removes p.
 func (c *constrained) removes(p Permission, resourceType string) bool {
 	if c == nil {
 		return true
@@ -533,16 +536,27 @@ func (c *constrained) removes(p Permission, resourceType string) bool {
 		c.missed = true
 		return true
 	}
-	in := ConstraintInput{Tenant: c.on.Tenant, ResourceType: resourceType, Permission: p, Subject: &c.actor}
-	if c.on.Type == resourceType && !c.a.contains(resourceType) {
-		in.Resource = &c.on
+	// The call fails with the error anyway, so a slow or failing hook isn't asked again.
+	if c.err != nil {
+		return true
 	}
-	name, err := c.a.denied(c.ctx, in)
-	if err != nil && c.err == nil {
+	name, err := c.a.denied(c.ctx, ConstraintInput{Tenant: c.on.Tenant, ResourceType: resourceType, Permission: p, Subject: &c.actor, Resource: &c.on})
+	if err != nil {
 		c.err = err
+	}
+	if name != "" {
+		c.by[p] = name
 	}
 	c.asked[k] = name != "" || err != nil
 	return c.asked[k]
+}
+
+// removedBy names the constraint that removed p from the actor, or "".
+func (c *constrained) removedBy(p Permission) string {
+	if c == nil {
+		return ""
+	}
+	return c.by[p]
 }
 
 // failed returns what asking the constraints failed with, or a conflict where the transaction
@@ -554,7 +568,7 @@ func (c *constrained) failed() error {
 	case c.err != nil:
 		return c.err
 	case c.missed:
-		return fmt.Errorf("%w: the roles changed while this change waited for them; try again", ErrConflict)
+		return fmt.Errorf("%w: what this change hands on changed while it waited; try again", ErrConflict)
 	}
 	return nil
 }
@@ -586,8 +600,8 @@ func (p power) lists(r Role, condition string) bool {
 
 // authorityOn reads the actor's grants on a resource's path, and the roles they and the call
 // name. With a custom role among them it reads all the tenant's, which a role's GrantableRoles
-// can name. cs is what the constraints remove from it, for what it hands on.
-func (a *Authorizer) authorityOn(ctx context.Context, q DB, actor Subject, on Resource, roles []Role, cs *constrained) (authority, error) {
+// can name.
+func (a *Authorizer) authorityOn(ctx context.Context, q DB, actor Subject, on Resource, roles []Role) (authority, error) {
 	keys := actor.principals(on.Tenant)
 	held, ds, err := a.heldOrDenied(ctx, q, on.Tenant, keys, keys, on.path(), "")
 	if err != nil {
@@ -597,12 +611,12 @@ func (a *Authorizer) authorityOn(ctx context.Context, q DB, actor Subject, on Re
 	if err != nil {
 		return authority{}, err
 	}
-	return a.authorityOf(ctx, q, actor, on, held, ds, b, cs)
+	return a.authorityOf(ctx, q, actor, on, held, ds, b)
 }
 
 // authorityOf is the authority of held grants under the denies on the path, reading the
 // grants' conditions.
-func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Resource, held []holding, ds []denial, b book, cs *constrained) (authority, error) {
+func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Resource, held []holding, ds []denial, b book) (authority, error) {
 	if err := a.conditionsOf(ctx, q, on.Tenant, held); err != nil {
 		return authority{}, err
 	}
@@ -636,7 +650,7 @@ func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Re
 		allows: func(h holding, action Permission) bool {
 			return !h.conditional || a.conds.holds(spend, h.Condition.Expression, with(vars, action))
 		},
-		denied: denied, handsOn: handsOn, constrained: cs,
+		denied: denied, handsOn: handsOn,
 	}, nil
 }
 
@@ -684,9 +698,9 @@ func (h holding) under(condition string) bool {
 // holds reports whether the actor holds p for resources of a type, to hand it on with condition:
 // neither a deny nor a constraint removes it.
 func (au authority) holds(p Permission, resourceType, condition string) bool {
-	return !au.handsOn(p) && !au.constrained.removes(p, resourceType) && slices.ContainsFunc(au.held, func(g holding) bool {
+	return !au.handsOn(p) && slices.ContainsFunc(au.held, func(g holding) bool {
 		return gives(au.roles, g.Principal, g.Role, p, resourceType) && g.under(condition)
-	})
+	}) && !au.constrained.removes(p, resourceType)
 }
 
 // may reports whether the actor may do p, on resources of a type, in this request.
@@ -777,10 +791,11 @@ func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string,
 func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Resource, grants, revokes []Binding, cs *constrained) (authority, error) {
 	scope := on.Scope()
 	manage := GrantPermission(scope.Type)
-	au, err := a.authorityOn(ctx, q, actor, on, roleIDs(grants), cs)
+	au, err := a.authorityOn(ctx, q, actor, on, roleIDs(grants))
 	if err != nil {
 		return authority{}, err
 	}
+	au.constrained = cs
 	pw := au.over(scope.Type)
 	if pw.none() {
 		return authority{}, &DeniedError{Permission: manage, Scope: scope, Reason: "the actor may not change access here"}
@@ -804,6 +819,8 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 				reason = fmt.Sprintf("the actor may grant %s here only under the condition of a grant that lists it", b.Role)
 			case !pw.any:
 				reason = fmt.Sprintf("the actor may not grant %s here", b.Role)
+			case cs.removedBy(p) != "":
+				reason = fmt.Sprintf("the actor can't grant %s while %s removes %s from it", b.Role, cs.removedBy(p), p)
 			}
 			errs = append(errs, &DeniedError{Permission: p, Scope: scope, Reason: reason})
 		}
@@ -840,11 +857,12 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 	if err != nil {
 		return nil, err
 	}
-	cs := a.constrain(ctx, s, r)
-	au, err := a.authorityOf(ctx, a.db, s, r, held, ds, a.bookOf(custom), cs)
+	au, err := a.authorityOf(ctx, a.db, s, r, held, ds, a.bookOf(custom))
 	if err != nil {
 		return nil, err
 	}
+	cs := a.constrain(ctx, s, r)
+	au.constrained = cs
 	pw := au.over(r.Type)
 	if pw.none() {
 		return nil, nil
