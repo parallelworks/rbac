@@ -3,6 +3,7 @@ package rbac
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 	"unicode/utf8"
@@ -213,4 +214,26 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 	}
 	last := records[len(records)-1]
 	return records, Cursor{Generation: generation, TxID: last.TxID, ID: last.ID, RecordedAt: last.RecordedAt}, nil
+}
+
+// Refusal is a change refused, as Config.OnRefused is told of it.
+type Refusal struct {
+	Tenant string
+	Actor  Principal
+	// How is the call refused, as Record.How names a change's.
+	How   string
+	Audit Audit
+	// Err is why: it matches ErrDenied or ErrInvalid.
+	Err error
+	At  time.Time
+}
+
+// refused tells Config.OnRefused of a change *err refused as ErrDenied or ErrInvalid, as actor's in
+// a tenant by how.
+func (a *Authorizer) refused(ctx context.Context, err *error, tenant string, actor Principal, how string) {
+	if a.cfg.OnRefused == nil || *err == nil || !errors.Is(*err, ErrDenied) && !errors.Is(*err, ErrInvalid) {
+		return
+	}
+	audit, _ := ctx.Value(auditKey{}).(Audit)
+	a.cfg.OnRefused(ctx, Refusal{Tenant: tenant, Actor: actor, How: how, Audit: audit, Err: *err, At: a.cfg.Now()})
 }

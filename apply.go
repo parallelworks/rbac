@@ -64,7 +64,8 @@ func (e *InvalidError) Unwrap() error { return e.Err }
 // Config.ValidateGrant that isn't ErrInvalid fails the change as it is. Constraints and
 // Config.ValidateGrant run before the transaction, on what the Authorizer runs on;
 // Config.OnChange runs in it with the grants that changed.
-func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Change) error {
+func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Change) (err error) {
+	defer a.refused(ctx, &err, on.Tenant, actor.Principal, "Apply")
 	if err := a.check(on); err != nil {
 		return err
 	}
@@ -265,7 +266,8 @@ func locked(br pgx.BatchResults) error {
 // made by, such as the creator or the host's own service account. Each grant is still
 // validated, and Config.ValidateGrant asked about it, via ViaImport. Grants from
 // SourceActivation are refused, as only Activate makes them: a restore leaves them out.
-func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string, grants []Grant) error {
+func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string, grants []Grant) (err error) {
+	defer a.refused(ctx, &err, tenant, actor, "Import")
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -1258,7 +1260,8 @@ func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) (
 // role, principal and source, every grant of the role to the principal from the source there, or
 // with an ID that one grant. actor is who they are recorded as revoked by. It locks their scopes
 // and principals until the transaction ends, or past 64 the tenant, as Import does.
-func (a *Authorizer) DeleteGrants(ctx context.Context, actor Principal, tenant string, grants []Grant) error {
+func (a *Authorizer) DeleteGrants(ctx context.Context, actor Principal, tenant string, grants []Grant) (err error) {
+	defer a.refused(ctx, &err, tenant, actor, "DeleteGrants")
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -1318,7 +1321,8 @@ func (a *Authorizer) DeleteGrants(ctx context.Context, actor Principal, tenant s
 }
 
 // DeleteScope removes every grant, eligibility and deny on a scope, as DeleteScopes does.
-func (a *Authorizer) DeleteScope(ctx context.Context, actor Principal, tenant string, s Scope) error {
+func (a *Authorizer) DeleteScope(ctx context.Context, actor Principal, tenant string, s Scope) (err error) {
+	defer a.refused(ctx, &err, tenant, actor, "DeleteScope")
 	return a.deleteScopes(ctx, actor, tenant, "DeleteScope", []Scope{s})
 }
 
@@ -1331,7 +1335,8 @@ func (a *Authorizer) DeleteScope(ctx context.Context, actor Principal, tenant st
 // holds a bounded number of locks however many scopes it removes. A call for each scope in one
 // transaction would hold a lock for each, which PostgreSQL keeps in one table every session
 // shares: a few thousand can fill it.
-func (a *Authorizer) DeleteScopes(ctx context.Context, actor Principal, tenant string, scopes []Scope) error {
+func (a *Authorizer) DeleteScopes(ctx context.Context, actor Principal, tenant string, scopes []Scope) (err error) {
+	defer a.refused(ctx, &err, tenant, actor, "DeleteScopes")
 	return a.deleteScopes(ctx, actor, tenant, "DeleteScopes", scopes)
 }
 
@@ -1354,7 +1359,8 @@ func (a *Authorizer) deleteScopes(ctx context.Context, actor Principal, tenant, 
 // DeletePrincipal removes every grant and eligibility of a principal in a tenant, as actor, with
 // its places in groups and an identity's membership, as when it leaves the tenant; or every grant
 // to the public, as when a tenant stops allowing public access.
-func (a *Authorizer) DeletePrincipal(ctx context.Context, actor Principal, tenant string, p Principal) error {
+func (a *Authorizer) DeletePrincipal(ctx context.Context, actor Principal, tenant string, p Principal) (err error) {
+	defer a.refused(ctx, &err, tenant, actor, "DeletePrincipal")
 	if !p.wellFormed(tenant) {
 		return fmt.Errorf("%w: principal %q is not valid", ErrInvalid, p.key())
 	}
@@ -1372,7 +1378,8 @@ func (a *Authorizer) DeletePrincipal(ctx context.Context, actor Principal, tenan
 // keep a principal in many tenants from filling PostgreSQL's lock table: on an error, the
 // batches before it stay removed, and calling it again removes the rest. Under WithTx every
 // batch is in the host's transaction, and its locks last until that ends.
-func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Principal) error {
+func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Principal) (err error) {
+	defer a.refused(ctx, &err, "", actor, "DeletePrincipalEverywhere")
 	// A group is its tenant's alone: one with its id elsewhere is another.
 	if p.broad() || p.Kind == Group || !p.wellFormed("") {
 		return fmt.Errorf("%w: principal %q is not an identity", ErrInvalid, p.key())
@@ -1446,7 +1453,8 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Pri
 
 // DeleteTenant removes every grant, eligibility, custom role, deny, membership and group in a
 // tenant, as actor, so a tenant created later with its id starts with none.
-func (a *Authorizer) DeleteTenant(ctx context.Context, actor Principal, tenant string) error {
+func (a *Authorizer) DeleteTenant(ctx context.Context, actor Principal, tenant string) (err error) {
+	defer a.refused(ctx, &err, tenant, actor, "DeleteTenant")
 	return a.delete(ctx, actor, tenant, "DeleteTenant", func(tx pgx.Tx) error { return lockTenant(ctx, tx, tenant) },
 		deletion{roles: true, groups: true, denies: "TRUE", where: "TRUE", members: "TRUE"})
 }
@@ -1544,11 +1552,12 @@ func removed[T any](ctx context.Context, a *Authorizer, tx pgx.Tx, table, column
 // Config.Now and by the database's clock both, so history records each as an expiry. It passes
 // over those a change is holding, rather than wait on it, so the next run removes them. A race
 // PostgreSQL refuses matches ErrConflict.
-func (a *Authorizer) DeleteExpired(ctx context.Context) (int64, error) {
+func (a *Authorizer) DeleteExpired(ctx context.Context) (n int64, err error) {
+	defer a.refused(ctx, &err, "", Principal{}, "DeleteExpired")
 	if err := a.writable(); err != nil {
 		return 0, err
 	}
-	n, err := a.deleteExpired(ctx)
+	n, err = a.deleteExpired(ctx)
 	return n, conflicted(err)
 }
 

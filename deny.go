@@ -213,7 +213,8 @@ func (a *Authorizer) checkDeny(tenant string, d Deny) error {
 // scope, those the deny names included, can replace or delete it, so to bind one who holds it
 // there, set the deny on a scope above where it doesn't. The groups it names or exempts, and a
 // group it is on, are the tenant's.
-func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d Deny) error {
+func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d Deny) (err error) {
+	defer a.refused(ctx, &err, on.Tenant, actor.Principal, "SetDeny")
 	if err := a.check(on); err != nil {
 		return err
 	}
@@ -286,7 +287,8 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 
 // DeleteDeny deletes a deny policy from a scope, as actor, who needs DenyPermission(on's type)
 // there. Deleting one that doesn't exist does nothing.
-func (a *Authorizer) DeleteDeny(ctx context.Context, actor Subject, on Resource, id string) error {
+func (a *Authorizer) DeleteDeny(ctx context.Context, actor Subject, on Resource, id string) (err error) {
+	defer a.refused(ctx, &err, on.Tenant, actor.Principal, "DeleteDeny")
 	if err := a.check(on); err != nil {
 		return err
 	}

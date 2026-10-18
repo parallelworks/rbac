@@ -181,6 +181,10 @@ holds, and history is exported again from the start, kept apart from the last ex
 history with physical backups and replicas; a logical dump restored into another cluster numbers
 its transactions anew.
 
+A change refused, as `ErrDenied` or `ErrInvalid`, writes nothing, so history doesn't record it:
+`Config.OnRefused` is told of each, with its actor, the call and the host's audit, to record the
+failed attempt on a connection of the host's own.
+
 `AsOf(ctx, tenant, at, read)` reads a tenant as it was at a time, from its history: every check,
 list and search the read makes answers as it would have then, with the catalog as it is now, as
 for an access review of a past date. A change counts from when its transaction began, and none
