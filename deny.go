@@ -18,8 +18,9 @@ import (
 // an identity, a group, a tenant's members or the public (everyone, signed in or not); those
 // Exempt names, identities or groups, keep their access. A deny naming the public may exempt the
 // tenant's members, to bind only those who aren't; the public itself is never exempt, as that
-// would exempt everyone. Permissions are `type:verb`, or `type:*` for every permission on a type.
-// With a Condition it denies only where the expression holds, or can't be evaluated.
+// would exempt everyone, nor is a principal it names. Permissions are `type:verb`, or `type:*`
+// for every permission on a type. With a Condition it denies only where the expression holds, or
+// can't be evaluated.
 type Deny struct {
 	// ID names it on its scope, in lowercase letters, digits, dots, hyphens and underscores.
 	ID          string
@@ -154,15 +155,20 @@ func (a *Authorizer) checkDeny(tenant string, d Deny) error {
 			bad("principal %q is not valid", p.key())
 		}
 	}
+	// A set, so lists past the limit cost no more than one pass each.
+	named := make(map[Principal]bool, len(d.Principals))
+	for _, p := range d.Principals {
+		named[p] = true
+	}
 	// Every subject is the public, and every member a tenant's members, so exempting either where
 	// it doesn't narrow the deny would exempt everyone it names, and it would bind no one.
 	for _, p := range d.Exempt {
 		switch {
 		case p.Kind == Public:
 			bad("exempting the public exempts everyone")
-		case p.Kind == Members && !slices.Contains(d.Principals, Principal{Kind: Public}):
+		case p.Kind == Members && !named[Principal{Kind: Public}]:
 			bad("only a deny naming the public may exempt the tenant's members")
-		case slices.Contains(d.Principals, p):
+		case named[p]:
 			bad("principal %q is both named and exempt", p.key())
 		}
 	}

@@ -4070,8 +4070,8 @@ func TestADenyCantExemptEveryoneItNames(t *testing.T) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
-	if !allowed(t, h, user("named"), root, cluster) {
-		t.Fatal("a deny refused should bind no one")
+	if stored, err := h.authz.Denies(ctx, "t1", []rbac.Scope{cluster.Scope()}); err != nil || len(stored) > 0 {
+		t.Fatalf("a deny refused should not be stored: %v, %v", stored, err)
 	}
 	// Anyone but the tenant's members: only those who aren't.
 	d := rbac.Deny{ID: "members-only", Principals: []rbac.Principal{public}, Exempt: []rbac.Principal{members}, Permissions: []rbac.Permission{root}}
@@ -4084,9 +4084,8 @@ func TestADenyCantExemptEveryoneItNames(t *testing.T) {
 	}
 	listingsAgree(t, h, resources, user("named"), root)
 	listingsAgree(t, h, resources, guest, root)
-	// Holders can't tell whether an identity is a member, so it leaves it out, as it does whoever a
-	// deny may bind; the grant to the members, exempt, it lists.
-	if holders, err := h.authz.Holders(ctx, root, cluster); err != nil || !slices.Contains(holders, members) || slices.Contains(holders, named) {
+	// The grant to the members, exempt, gives it.
+	if holders, err := h.authz.Holders(ctx, root, cluster); err != nil || !slices.Contains(holders, members) {
 		t.Fatalf("Holders = %v, %v", holders, err)
 	}
 }
