@@ -81,7 +81,7 @@ func (a *Authorizer) recording(ctx context.Context, tx pgx.Tx, actor Principal, 
 	}
 	// In a transaction of its own that hands nothing to OnChange, nothing writes after the change,
 	// so the setting ends with it.
-	if _, hosts := a.db.(pgx.Tx); !hosts && a.cfg.OnChange == nil {
+	if _, own := a.db.(ownTx); own && a.cfg.OnChange == nil {
 		return func() error { return nil }, nil
 	}
 	return func() error {

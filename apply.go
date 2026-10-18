@@ -1008,14 +1008,12 @@ func (a *Authorizer) begin(ctx context.Context, fn func(pgx.Tx) error) error {
 }
 
 // begin runs fn in a transaction of its own at READ COMMITTED, whatever the database's default,
-// as a change's checks must read what committed before it took its locks; on a pgx.Tx, as under
-// WithTx, in a savepoint of that transaction, whose isolation the locks check. PostgreSQL
-// refusing it for a race matches ErrConflict.
+// as a change's checks must read what committed before it took its locks; on any other DB, as a
+// pgx.Tx under WithTx, in a savepoint of that DB's transaction, whose isolation the locks check.
+// PostgreSQL refusing it for a race matches ErrConflict.
 func begin(ctx context.Context, db DB, fn func(pgx.Tx) error) error {
 	var err error
-	if conn, ok := db.(interface {
-		BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
-	}); ok {
+	if conn, ok := db.(ownTx); ok {
 		err = pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, fn)
 	} else {
 		err = savepoint(ctx, db, fn)
@@ -1023,8 +1021,13 @@ func begin(ctx context.Context, db DB, fn func(pgx.Tx) error) error {
 	return conflicted(err)
 }
 
+// ownTx is a DB that begin runs fn in a transaction of its own on, as a pool or a connection.
+type ownTx interface {
+	BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
+}
+
 // savepointEnd is how long a savepoint's release or rollback may take once its ctx is done.
-const savepointEnd = 10 * time.Second
+var savepointEnd = 10 * time.Second
 
 // savepoint runs fn in a savepoint, which it releases or rolls back even once ctx is done: pgx
 // sends nothing on a done ctx, which would leave the savepoint open, and the host's transaction
@@ -1034,15 +1037,19 @@ func savepoint(ctx context.Context, db DB, fn func(pgx.Tx) error) error {
 	if err != nil {
 		return err
 	}
-	// Bounded, as a done ctx's deadline no longer is, so a dead connection can't hold it for good.
-	end, cancel := context.WithTimeout(context.WithoutCancel(ctx), savepointEnd)
-	defer cancel()
+	// Bounded, as a done ctx's deadline no longer is, so a dead connection can't hold it for good;
+	// from when fn returns, or a change that took as long would leave it open.
+	end := func(f func(context.Context) error) error {
+		c, cancel := context.WithTimeout(context.WithoutCancel(ctx), savepointEnd)
+		defer cancel()
+		return f(c)
+	}
 	// After the release, a no-op.
-	defer func() { _ = tx.Rollback(end) }()
+	defer func() { _ = end(tx.Rollback) }()
 	if err := fn(tx); err != nil {
 		return err
 	}
-	return tx.Commit(end)
+	return end(tx.Commit)
 }
 
 // report hands a change to Config.OnChange in its transaction, unless it changed nothing.
@@ -1530,9 +1537,10 @@ func removed[T any](ctx context.Context, a *Authorizer, tx pgx.Tx, table, column
 }
 
 // DeleteExpired removes grants, eligibilities, group members and tenant memberships that have
-// expired, which no longer give or allow anything, and returns how many. It passes over those a
-// change is holding, rather than wait on it, so the next run removes them. A race PostgreSQL
-// refuses matches ErrConflict.
+// expired, which no longer give or allow anything, and returns how many: those expired by
+// Config.Now and by the database's clock both, so history records each as an expiry. It passes
+// over those a change is holding, rather than wait on it, so the next run removes them. A race
+// PostgreSQL refuses matches ErrConflict.
 func (a *Authorizer) DeleteExpired(ctx context.Context) (int64, error) {
 	n, err := a.deleteExpired(ctx)
 	return n, conflicted(err)
@@ -1555,22 +1563,24 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 		return n, err
 	}
 	var total int64
+	// By the database's clock too, which history records an expiry by: a row expired by Config.Now
+	// alone, which can run ahead of it, would be recorded as deleted.
 	for _, sql := range []string{
 		`WITH d AS (DELETE FROM rbac_grants WHERE id IN (
-			SELECT id FROM rbac_grants WHERE expires_at <= $1 FOR UPDATE SKIP LOCKED) RETURNING 1)
+			SELECT id FROM rbac_grants WHERE expires_at <= least($1, statement_timestamp()) FOR UPDATE SKIP LOCKED) RETURNING 1)
 		SELECT count(*) FROM d`,
 		`WITH d AS (DELETE FROM rbac_eligibilities WHERE id IN (
-			SELECT id FROM rbac_eligibilities WHERE expires_at <= $1 FOR UPDATE SKIP LOCKED) RETURNING 1)
+			SELECT id FROM rbac_eligibilities WHERE expires_at <= least($1, statement_timestamp()) FOR UPDATE SKIP LOCKED) RETURNING 1)
 		SELECT count(*) FROM d`,
 		`WITH d AS (DELETE FROM rbac_members WHERE (tenant, group_id, principal, source) IN (
-			SELECT tenant, group_id, principal, source FROM rbac_members WHERE expires_at <= $1 FOR UPDATE SKIP LOCKED) RETURNING 1)
+			SELECT tenant, group_id, principal, source FROM rbac_members WHERE expires_at <= least($1, statement_timestamp()) FOR UPDATE SKIP LOCKED) RETURNING 1)
 		SELECT count(*) FROM d`,
 		// An identity whose membership ended leaves the tenant's groups with it, as one that leaves
 		// the tenant does, so joining again gives back none of the groups it was in. Its own grants
 		// and eligibilities stay, as they do for an identity granted roles in a tenant it isn't in.
 		`WITH ended AS (
 		  DELETE FROM rbac_memberships WHERE (tenant, principal) IN (
-		    SELECT tenant, principal FROM rbac_memberships WHERE expires_at <= $1 FOR UPDATE SKIP LOCKED)
+		    SELECT tenant, principal FROM rbac_memberships WHERE expires_at <= least($1, statement_timestamp()) FOR UPDATE SKIP LOCKED)
 		  RETURNING tenant, principal
 		), left_groups AS (
 		  DELETE FROM rbac_members m USING ended e WHERE m.tenant = e.tenant AND m.principal = e.principal RETURNING 1

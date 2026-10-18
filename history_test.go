@@ -670,3 +670,115 @@ func TestAnExpiryInAnOlderTransactionIsRecordedAsOne(t *testing.T) {
 		t.Fatalf("op = %q, %v", op, err)
 	}
 }
+
+// A change under WithTx that runs past a savepoint's bound still ends its savepoint: the bound
+// runs from when the change is done, so a slow one neither fails once written nor leaves its
+// writes in the host's transaction once refused.
+func TestASlowChangeUnderWithTxEndsItsSavepoint(t *testing.T) {
+	rbac.SetSavepointEnd(t, 200*time.Millisecond)
+	errRefused := errors.New("refused")
+	var refuse bool
+	h := setup(t, func(c *rbac.Config) {
+		c.OnChange = func(context.Context, pgx.Tx, rbac.ChangeEvent) error {
+			time.Sleep(400 * time.Millisecond)
+			if refuse {
+				return errRefused
+			}
+			return nil
+		}
+	})
+	ctx := t.Context()
+	for _, id := range []string{"kept", "refused"} {
+		refuse = id == "refused"
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = h.authz.WithTx(tx).Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, id)})
+		if want := map[bool]error{true: errRefused}[refuse]; !errors.Is(err, want) {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("%s: %v", id, err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := h.pool.Query(ctx, `SELECT principal_id FROM rbac_grants WHERE principal_id IN ('kept', 'refused')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || !slices.Equal(held, []string{"kept"}) {
+		t.Fatalf("held %v, %v", held, err)
+	}
+}
+
+// hostTx is a host's own handle on its transaction, as one that traces its queries is: a DB, but
+// not a pgx.Tx.
+type hostTx struct{ tx pgx.Tx }
+
+func (h hostTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	return h.tx.Exec(ctx, sql, args...)
+}
+
+func (h hostTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	return h.tx.Query(ctx, sql, args...)
+}
+
+func (h hostTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	return h.tx.QueryRow(ctx, sql, args...)
+}
+
+func (h hostTx) Begin(ctx context.Context) (pgx.Tx, error) { return h.tx.Begin(ctx) }
+
+// A change on a DB that begins only savepoints, though not a pgx.Tx, ends its context with it, so
+// the host's own writes after it aren't recorded as the change's.
+func TestAChangeInAHostsTransactionEndsItsContext(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) { c.OnChange = nil })
+	ctx := t.Context()
+	var last int64
+	recordedSince(t, h, &last)
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	authz, err := rbac.New(hostTx{tx}, h.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := authz.Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "u")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'by-hand', 'cluster.login')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := recordedSince(t, h, &last); len(got) != 2 || got[0] != (recorded{actor: "user:host", how: "Import", op: "create"}) ||
+		got[1] != (recorded{op: "create"}) {
+		t.Fatalf("recorded %+v", got)
+	}
+}
+
+// The host's clock can run ahead of the database's, which history records an expiry by: what
+// DeleteExpired removes has expired by both, so it is recorded as an expiry.
+func TestAnExpiryAheadOfTheDatabasesClockIsRecordedAsOne(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.now = time.Now().Add(time.Hour)
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'past', 'cluster.login', clock_timestamp() - interval '1 second'),
+		  ('t1', 'cluster', 'c1', 'user', 'soon', 'cluster.login', clock_timestamp() + interval '30 minutes')`); err != nil {
+		t.Fatal(err)
+	}
+	var last int64
+	recordedSince(t, h, &last)
+	if _, err := h.authz.DeleteExpired(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := recordedSince(t, h, &last); len(got) != 1 || got[0] != (recorded{how: "DeleteExpired", op: "expire"}) {
+		t.Fatalf("recorded %+v", got)
+	}
+}
