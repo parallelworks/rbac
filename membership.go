@@ -138,7 +138,8 @@ func (a *Authorizer) checkMembership(m Membership, now time.Time) error {
 // SetMemberships makes identities members or guests of a tenant, or changes how, as actor: the
 // host's own write, without the checks a change by a tenant's admins has, as Import is for grants.
 // It reports the memberships it set or changed. An identity whose membership had ended joins again
-// in none of the groups it was in, whether or not DeleteExpired has run since.
+// in none of the groups it was in, whether or not DeleteExpired has run since, as a membership
+// made by actor now.
 func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant string, ms []Membership) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -194,11 +195,13 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 			FROM unnest($2::text[], $3::text[], $4::bool[], $5::bool[], $6::text[], $7::timestamptz[], $8::text[]) AS t(k, i, g, s, src, e, n)
 			ON CONFLICT (tenant, principal) DO UPDATE SET guest = EXCLUDED.guest, suspended = EXCLUDED.suspended,
 			  source = EXCLUDED.source, expires_at = EXCLUDED.expires_at, note = EXCLUDED.note,
+			  created_by = CASE WHEN m.expires_at <= $10 THEN EXCLUDED.created_by ELSE m.created_by END,
+			  created_at = CASE WHEN m.expires_at <= $10 THEN EXCLUDED.created_at ELSE m.created_at END,
 			  updated_by = EXCLUDED.updated_by, updated_at = now()
 			WHERE (m.guest, m.suspended, m.source, m.expires_at, m.note)
 			  IS DISTINCT FROM (EXCLUDED.guest, EXCLUDED.suspended, EXCLUDED.source, EXCLUDED.expires_at, EXCLUDED.note)
 			RETURNING `+membershipColumns,
-			tenant, kinds, ids, guests, suspended, sources, expires, notes, actorKey(actor))
+			tenant, kinds, ids, guests, suspended, sources, expires, notes, actorKey(actor), a.cfg.Now())
 		if err != nil {
 			return ChangeEvent{}, err
 		}
@@ -503,6 +506,8 @@ func (a *Authorizer) DeleteGroups(ctx context.Context, actor Principal, tenant s
 	if len(ids) == 0 {
 		return nil
 	}
+	// nestingKey too, as DeleteGroup takes it: two removals at once would each take their groups out
+	// of the denies and approvers the other left, and an eligibility both approve could keep none.
 	scopes, principals := []string{nestingKey}, make([]string, len(ids))
 	for i, id := range ids {
 		scopes = append(scopes, groupKey(id))

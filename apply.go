@@ -197,9 +197,10 @@ func (a *Authorizer) changing(actor Subject, on Resource, cs *constrained) error
 
 // A change takes its tenant's lock shared, then the lock of each scope and of each principal
 // whose grants it changes, in order; deleting a tenant takes the tenant's lock alone. So two
-// changes to the same rows run in turn. A host's delete that also changes rows it doesn't lock,
-// as DeleteGroups changes denies and eligibilities on other scopes, can still deadlock with
-// another change: PostgreSQL ends one, which matches ErrConflict. The locks last until the
+// changes to the same rows run in turn. A change that also changes rows it doesn't lock, as
+// deleting groups changes denies and eligibilities on other scopes and SetMemberships removes an
+// ended membership's places in groups, can still deadlock with another change: PostgreSQL ends
+// one, which matches ErrConflict. The locks last until the
 // transaction ends. Advisory locks span the database, so the keys name the
 // schema: another application's grants are in a schema of their own.
 const lockKey = `hashtextextended(current_schema() || '/rbac/' || $1, 0)`
