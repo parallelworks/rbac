@@ -70,12 +70,11 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 		// What conditions read is built only for a check that reads one, so one a grant decides
 		// builds none of it.
 		var vars map[string]any
-		var spend *budget
 		if len(ds) > 0 {
-			vars, spend = a.vars(ctx, s, p, r), newBudget()
+			vars = a.vars(ctx, s, p, r)
 			// A deny decides first, as it binds every grant.
-			if d, ok := a.deniedBy(ds, p, spend, vars); ok {
-				return Decision{DeniedBy: d.String(), Reason: "removed by " + d.String()}, nil
+			if d, ok := a.deniedBy(ds, p, newDenyBudget(r.path()), vars); ok {
+				return Decision{DeniedBy: d.String(), Reason: d.removal()}, nil
 			}
 		}
 		// A built-in role's unconditional grant decides without reading custom roles or conditions.
@@ -107,14 +106,16 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 			return Decision{}, err
 		}
 		if vars == nil {
-			vars, spend = a.vars(ctx, s, p, r), newBudget()
+			vars = a.vars(ctx, s, p, r)
 		}
+		spend := newBudget()
+		cheapestFirst(conditional, holding.expression)
 		for _, h := range conditional {
 			if a.conds.holds(spend, h.Condition.Expression, vars) {
 				return Decision{Allowed: true}, nil
 			}
 		}
-		return Decision{Reason: "no condition of a grant that gives it holds"}, nil
+		return Decision{Reason: unmet(spend)}, nil
 	}
 
 	vars, spend := a.vars(ctx, s, p, r), newBudget()
@@ -124,8 +125,8 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 		if err != nil {
 			return Decision{}, err
 		}
-		if d, ok := a.deniedBy(ds, p, spend, vars); ok {
-			return Decision{DeniedBy: d.String(), Reason: "removed by " + d.String()}, nil
+		if d, ok := a.deniedBy(ds, p, newDenyBudget(r.path()), vars); ok {
+			return Decision{DeniedBy: d.String(), Reason: d.removal()}, nil
 		}
 	}
 	grants, err := a.heldGrants(ctx, a.db, r.Tenant, principals, r.path())
@@ -137,12 +138,17 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 		return Decision{}, err
 	}
 	d := Decision{Reason: "no grant gives it"}
+	grants = slices.DeleteFunc(grants, func(g Grant) bool { return !gives(roles, g.Principal, g.Role, p, r.Type) })
+	// Evaluated in the order Authorize evaluates them, so a budget runs out where it does for it.
+	byCost := slices.Clone(grants)
+	cheapestFirst(byCost, Grant.expression)
+	held := map[string]bool{}
+	for _, g := range byCost {
+		held[g.ID] = g.Condition.Expression == "" || a.conds.holds(spend, g.Condition.Expression, vars)
+	}
 	for _, g := range grants {
-		if !gives(roles, g.Principal, g.Role, p, r.Type) {
-			continue
-		}
-		if g.Condition.Expression != "" && !a.conds.holds(spend, g.Condition.Expression, vars) {
-			d.Reason = "no condition of a grant that gives it holds"
+		if !held[g.ID] {
+			d.Reason = unmet(spend)
 			continue
 		}
 		d.Grants = append(d.Grants, g)
@@ -176,6 +182,14 @@ func (a *Authorizer) scopeOf(r Resource) error {
 		return fmt.Errorf("%w: resource type %q is not one the host checks", ErrInvalid, r.Type)
 	}
 	return nil
+}
+
+// unmet is why no conditional grant allowed, given what is left of the check's budget.
+func unmet(spend *budget) string {
+	if spend.exhausted {
+		return "the conditions of the grants that give it cost more than a check may spend"
+	}
+	return "no condition of a grant that gives it holds"
 }
 
 // gives reports whether a grant of a role to a principal gives p on a resource type. A role
@@ -229,7 +243,14 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 		removed[p] = name != ""
 		return name != "", err
 	}
-	vars, spend := a.vars(ctx, s, "", r), newBudget()
+	// Each permission is decided as Authorize would decide it, on budgets of its own.
+	vars, spends := a.vars(ctx, s, "", r), map[Permission]*budget{}
+	spendOn := func(p Permission) *budget {
+		if spends[p] == nil {
+			spends[p] = newBudget()
+		}
+		return spends[p]
+	}
 	// A deny is settled before a grant's condition, as checks settle it.
 	denied := map[Permission]bool{}
 	isDenied := func(p Permission) bool {
@@ -237,14 +258,16 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 			return d
 		}
 		vars["action"] = string(p)
-		_, d := a.deniedBy(ds, p, spend, vars)
+		_, d := a.deniedBy(ds, p, newDenyBudget(r.path()), vars)
 		denied[p] = d
 		return d
 	}
-	// Conditions are evaluated only for what no unconditional grant gives, as checks do.
+	// Conditions are evaluated only for what no unconditional grant gives, as checks do, the
+	// cheapest first.
 	if err := a.conditionsOf(ctx, a.db, r.Tenant, conditional); err != nil {
 		return nil, err
 	}
+	cheapestFirst(conditional, holding.expression)
 	for _, h := range conditional {
 		def, _ := roles.role(h.Role)
 		for _, p := range def.Permissions {
@@ -262,7 +285,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 			}
 			// A condition reads the action, so it is evaluated for each permission.
 			vars["action"] = string(p)
-			given[p] = a.conds.holds(spend, h.Condition.Expression, vars)
+			given[p] = a.conds.holds(spendOn(p), h.Condition.Expression, vars)
 		}
 	}
 	var perms []Permission
@@ -664,8 +687,8 @@ func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held
 }
 
 // heldGrants returns the grants held by any of principals on any of scopes, not expired, in the
-// order heldOrDenied reads them: Explain spends on their conditions in the order Authorize does,
-// so a budget runs out where it does for Authorize.
+// order heldOrDenied reads them, so Explain lists them in a stable order: it spends on their
+// conditions cheapest first, as Authorize does.
 func (a *Authorizer) heldGrants(ctx context.Context, q DB, tenant string, principals, scopes []string) ([]Grant, error) {
 	if len(principals) == 0 {
 		return nil, nil

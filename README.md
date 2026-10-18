@@ -91,7 +91,9 @@ another store. Both search one tenant, and count only unconditional grants:
   and the action. It gives its role only where the expression holds; one that fails is false.
   `Config.Attributes` declares the attributes and their types, so a condition reading one
   misnamed, or as another type, is refused when stored. Cost is bounded per condition and per
-  check. To hand a permission on, the actor holds it unconditionally or under the same condition.
+  check, and a check evaluates the cheapest first, so what it decides doesn't rest on ids; a
+  scope's conditional denies are bounded together, so a check always evaluates them. To hand a
+  permission on, the actor holds it unconditionally or under the same condition.
 - **Deny policies:** `SetDeny` puts a deny on a scope: under it, it removes permissions
   (`type:verb`, or `type:*` for a type's every one) from the principals it names, those it exempts
   aside, whatever their grants give. It exempts identities and groups, or from a deny naming the

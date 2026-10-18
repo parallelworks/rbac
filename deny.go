@@ -71,6 +71,9 @@ type denial struct {
 	permissions        []Permission
 	principals, exempt []string
 	condition          string
+	// unevaluated is set on a deny that removed a permission because its condition couldn't be
+	// evaluated, failing closed, and spent where that was because the check's budget ran out.
+	unevaluated, spent bool
 }
 
 // names reports whether d removes access from a holder Holders lists: one it names, or every
@@ -82,16 +85,6 @@ func (d denial) names(tenant string, h Principal) bool {
 	}
 	return slices.Contains(d.principals, h.key()) || slices.Contains(d.principals, publicKey) ||
 		h.Kind != Public && slices.Contains(d.principals, TenantMembers(tenant).key())
-}
-
-// applies reports whether a deny removes p for this request: always, or where its condition
-// holds or can't be evaluated, failing closed.
-func (a *Authorizer) applies(d denial, spend *budget, vars map[string]any) bool {
-	if d.condition == "" {
-		return true
-	}
-	held, evaluated := a.conds.decide(spend, d.condition, vars)
-	return held || !evaluated
 }
 
 // deniesOn reads the denies on scopes that name one of keys, and none it exempts, or name
@@ -123,19 +116,44 @@ func (a *Authorizer) deniesOn(ctx context.Context, q DB, tenant string, keys, sc
 	})
 }
 
-// deniedBy returns the first deny that removes p for this request, unconditional ones first.
+// deniedBy returns the first deny that removes p for this request: an unconditional one, or one
+// whose condition holds or can't be evaluated, failing closed, the cheapest first.
 func (a *Authorizer) deniedBy(ds []denial, p Permission, spend *budget, vars map[string]any) (denial, bool) {
-	for _, conditional := range []bool{false, true} {
-		for _, d := range ds {
-			if (d.condition != "") == conditional && denies(d.permissions, p) && a.applies(d, spend, vars) {
-				return d, true
-			}
+	var conditional []denial
+	for _, d := range ds {
+		switch {
+		case !denies(d.permissions, p):
+		case d.condition == "":
+			return d, true
+		default:
+			conditional = append(conditional, d)
+		}
+	}
+	cheapestFirst(conditional, denial.expression)
+	for _, d := range conditional {
+		held, evaluated := a.conds.decide(spend, d.condition, vars)
+		if held || !evaluated {
+			d.unevaluated, d.spent = !evaluated, !evaluated && spend.exhausted
+			return d, true
 		}
 	}
 	return denial{}, false
 }
 
+func (d denial) expression() string { return d.condition }
+
 func (d denial) String() string { return "deny " + d.id + " on " + d.scope }
+
+// removal is why d removed a permission, for Decision.Reason.
+func (d denial) removal() string {
+	switch {
+	case d.spent:
+		return "removed by " + d.String() + ", whose condition couldn't be evaluated within the check's budget"
+	case d.unevaluated:
+		return "removed by " + d.String() + ", whose condition couldn't be evaluated"
+	}
+	return "removed by " + d.String()
+}
 
 // checkDeny returns why a deny is malformed.
 func (a *Authorizer) checkDeny(tenant string, d Deny) error {
@@ -200,9 +218,11 @@ func (a *Authorizer) checkDeny(tenant string, d Deny) error {
 // SetDeny creates or replaces a deny policy on a scope, on, as actor, who needs
 // DenyPermission(on's type) there (through on, an ancestor or the tenant), not removed by a
 // constraint. A deny only takes access away, so setting one needs no more than that; one can
-// deny its setter too. Whoever holds that permission on the scope, those the deny names
-// included, can replace or delete it, so to bind one who holds it there, set the deny on a
-// scope above where it doesn't.
+// deny its setter too. A scope's conditional denies are bounded together by what a check may spend
+// on conditions, so that one always evaluates them: about seven short distinct conditions, or
+// three of the longest, however many denies share them. Whoever holds that permission on the
+// scope, those the deny names included, can replace or delete it, so to bind one who holds it
+// there, set the deny on a scope above where it doesn't.
 func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d Deny) error {
 	if err := a.check(on); err != nil {
 		return err
@@ -226,12 +246,26 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 			return ChangeEvent{}, err
 		}
 		var others int
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM rbac_denies WHERE tenant = $1 AND scope = $2 AND id <> $3`,
-			on.Tenant, d.Scope.Key(), d.ID).Scan(&others); err != nil {
+		var conditions []string
+		if err := tx.QueryRow(ctx, `SELECT count(*), coalesce(array_agg(condition) FILTER (WHERE condition <> ''), '{}')
+			FROM rbac_denies WHERE tenant = $1 AND scope = $2 AND id <> $3`,
+			on.Tenant, d.Scope.Key(), d.ID).Scan(&others, &conditions); err != nil {
 			return ChangeEvent{}, err
 		}
 		if others >= MaxDenies {
 			return ChangeEvent{}, fmt.Errorf("%w: a scope has at most %d denies", ErrInvalid, MaxDenies)
+		}
+		// Past this, a check's budget could run out before it evaluated them, and the rest would
+		// deny everyone they name, whatever their conditions say.
+		if d.Condition.Expression != "" {
+			// Each condition once, as a check evaluates it once.
+			var cost uint64
+			for _, c := range slices.Compact(slices.Sorted(slices.Values(append(conditions, d.Condition.Expression)))) {
+				cost += worstCost(c)
+			}
+			if cost > maxCheckCost {
+				return ChangeEvent{}, fmt.Errorf("%w: a scope's conditional denies cost more together than a check may spend evaluating them", ErrInvalid)
+			}
 		}
 		rows, err := tx.Query(ctx, `
 			INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, name, principals, exempt, permissions,

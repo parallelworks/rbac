@@ -671,6 +671,10 @@ func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Re
 		return authority{}, err
 	}
 	vars, spend := a.vars(ctx, actor, "", on), newBudget()
+	// The cheapest conditions first, as callers evaluate them in this order, so what a budget run
+	// out decides doesn't rest on ids.
+	held = slices.Clone(held)
+	cheapestFirst(held, holding.expression)
 	with := func(vars map[string]any, action Permission) map[string]any {
 		v := maps.Clone(vars)
 		v["action"] = string(action)
@@ -682,7 +686,8 @@ func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Re
 			if d, ok := denied[p]; ok {
 				return d
 			}
-			_, d := a.deniedBy(ds, p, spend, with(vars, p))
+			// On a budget of its own, as a check of p would be.
+			_, d := a.deniedBy(ds, p, newDenyBudget(on.path()), with(vars, p))
 			denied[p] = d
 			return d
 		}
