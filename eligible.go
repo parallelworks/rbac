@@ -202,12 +202,14 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 		if err != nil {
 			return ChangeEvent{}, err
 		}
-		// Only ValidateGrant, asked above, reads the flag, so the role named is enough.
-		roles, err := a.book(ctx, tx, on.Tenant, []Role{act.Role})
+		now, err := a.tenantBook(ctx, tx, on.Tenant, []Role{act.Role})
 		if err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := errors.Join(a.checkBinding(roles, on.Tenant, scope, b, a.cfg.Now())...); err != nil {
+		if err := errors.Join(a.checkBinding(now, on.Tenant, scope, b, a.cfg.Now())...); err != nil {
+			return ChangeEvent{}, err
+		}
+		if err := redefinedSince(roles, now, []Role{act.Role}); err != nil {
 			return ChangeEvent{}, err
 		}
 		// The table keeps one activation of a role on a scope, which always records the request its

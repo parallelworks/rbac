@@ -127,15 +127,18 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, via
 		// change is made: a custom role deleted or redefined since is granted only as it is now.
 		// The constraints aren't asked again, as hooks run outside it.
 		cs.seal()
-		au, err := a.mayChange(ctx, tx, actor, on, grants, revokes, cs)
+		now, err := a.mayChange(ctx, tx, actor, on, grants, revokes, cs)
 		if err != nil {
 			return ChangeEvent{}, err
 		}
 		var bad []error
 		for _, b := range grants {
-			bad = append(bad, a.checkBinding(au.roles, on.Tenant, scope, b, a.cfg.Now())...)
+			bad = append(bad, a.checkBinding(now.roles, on.Tenant, scope, b, a.cfg.Now())...)
 		}
 		if err := errors.Join(bad...); err != nil {
+			return ChangeEvent{}, err
+		}
+		if err := redefinedSince(au.roles, now.roles, roleIDs(grants)); err != nil {
 			return ChangeEvent{}, err
 		}
 		return write(tx)
@@ -284,9 +287,13 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 		if err := lockAll(ctx, tx, tenant, slices.Collect(maps.Keys(scopes)), slices.Collect(maps.Keys(principals))); err != nil {
 			return ChangeEvent{}, err
 		}
-		// Again under the locks, so a custom role deleted since isn't granted. Only ValidateGrant,
-		// asked above, reads the flag, so the roles named are enough.
-		if _, err := check(a.book, tx); err != nil {
+		// Again under the locks, so a custom role deleted since isn't granted, nor one redefined
+		// since the host was asked about it.
+		now, err := check(a.tenantBook, tx)
+		if err != nil {
+			return ChangeEvent{}, err
+		}
+		if err := redefinedSince(roles, now, roleIDs(grants)); err != nil {
 			return ChangeEvent{}, err
 		}
 		granted, err := a.upsert(ctx, tx, tenant, actor, grants)
