@@ -40,10 +40,12 @@ import (
 // the cheapest first, so what it decides doesn't rest on ids, and SetDeny bounds a scope's
 // conditional denies together so that a check always evaluates them whole.
 //
-// Searches (Filter, Reachable, Holders) can't evaluate one: they count only unconditional
-// grants, Filter and Holders count a conditional deny as denying, and Reach.Conditional and
+// Searches (Filter, Reachable, Holders) can't evaluate one: Filter and Reachable count only
+// unconditional grants, Filter counts a conditional deny as denying, and Reach.Conditional and
 // Reach.ConditionalExcept name the scopes conditional grants may reach and conditional denies
-// cover, whose resources a host checks one by one.
+// cover, whose resources a host checks one by one. Holders lists those who hold only under a
+// condition, or whom a conditional deny may bind, and marks them (Holder.Conditional,
+// Holder.MaybeDenied).
 type Condition struct {
 	Title       string
 	Description string

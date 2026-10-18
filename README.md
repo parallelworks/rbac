@@ -129,7 +129,9 @@ another store. Both search one tenant, and count only unconditional grants:
   there. Its members are identities that are members or guests of the tenant, and other groups of
   the tenant, at most `rbac.MaxGroupDepth` deep (`ImportMembers`), each from a source, perhaps
   until a time. Every check, list and deny reads an identity's groups, through those they are in,
-  as they are stored now: `Authorize` and `Filter` in the same statement as its grants and denies.
+  as they are stored now: `Authorize` and `Filter` in the same statement as its grants and denies,
+  and `Explain`, `Reachable` and `Holders` in one snapshot of the database, but under `WithTx` at
+  READ COMMITTED, where each statement reads its own.
   A suspended identity is bound as one outside the tenant is: by a deny naming it or the public.
 - **Public access:** the zero `Subject` is anonymous and holds only what is granted to the public.
   Only a role marked `Public` can be granted to the public, and a grant to the public gives
@@ -141,8 +143,10 @@ another store. Both search one tenant, and count only unconditional grants:
 ## Why
 
 `Explain` names the grants that allow, or the deny or constraint that denied; `Permissions` lists
-what a subject may do; `Holders` lists who may. A `DeniedError`'s message names only the
-permission, so an error shown to a user shows no policy; its fields say why.
+what a subject may do; `Holders` lists who may, for an access review: each identity, through its
+own grants and its groups', and the tenant's members and the public as one holder each, marking
+those that hold only under a condition or that a deny may bind. A `DeniedError`'s message names
+only the permission, so an error shown to a user shows no policy; its fields say why.
 
 ## Running it
 

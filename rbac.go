@@ -756,7 +756,9 @@ func vocabulary(declared []Permission, given map[Permission]bool, roleTypes map[
 // SetRole and DeleteRole lock the whole tenant, as does a change, Import, DeleteGrants or
 // DeleteScopes that would otherwise lock more than 64 scopes and principals. Make such a call the
 // first change in tx: after another, it waits for every change in the tenant while holding locks
-// they may wait for, and PostgreSQL fails one as a deadlock.
+// they may wait for, and PostgreSQL fails one as a deadlock. Explain, Reachable and Holders read
+// in several statements, on tx at its isolation: at READ COMMITTED each reads a snapshot of its
+// own, so a change committing between them can mix two states.
 func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 	b := *a
 	b.db = tx
@@ -823,4 +825,30 @@ func actorKey(p Principal) string {
 		return ""
 	}
 	return p.key()
+}
+
+// snapshot runs read on an Authorizer that reads one snapshot of the database, as a read made of
+// several statements needs, so a change committing between them can't leave it describing a state
+// that never was: on a pool, a REPEATABLE READ, READ ONLY transaction of its own; under WithTx, the
+// host's transaction, at its isolation. Constraints run before it, as their hooks may query the
+// pool while it holds a connection. A transaction that fails to commit answers nothing, as a
+// failed read does.
+func snapshot[T any](ctx context.Context, a *Authorizer, read func(*Authorizer) (T, error)) (T, error) {
+	conn, ok := a.db.(interface {
+		BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
+	})
+	if !ok {
+		return read(a)
+	}
+	var v T
+	err := pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
+		var err error
+		v, err = read(a.WithTx(tx))
+		return err
+	})
+	if err != nil {
+		var none T
+		return none, err
+	}
+	return v, nil
 }
