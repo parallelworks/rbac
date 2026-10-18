@@ -42,8 +42,11 @@ type Record struct {
 
 // Cursor is where a read of history stopped. The zero Cursor is its start.
 type Cursor struct {
-	TxID uint64
-	ID   int64
+	// Generation names the database the records were read from, by its system and timeline, which
+	// failing over to a replica or recovering to a point in time changes.
+	Generation string
+	TxID       uint64
+	ID         int64
 }
 
 // MaxHistory is the most records one History call reads.
@@ -52,21 +55,28 @@ const MaxHistory = 10000
 // History reads up to limit records after a cursor, and the cursor after them, to export history
 // to storage of the host's own. It orders records by the transaction that wrote them and reads
 // only those of transactions older than any still running, so a transaction that commits after a
-// later one is read after it, never skipped. A record can be read twice, as when a host retries a
-// read whose result it lost: dedupe on ID. History restored into another database starts its
-// transactions over, below the cursor; History refuses the cursor then, and is read again from the
-// start.
+// later one is read after it, never skipped. Transaction ids are the database cluster's, so a
+// transaction running anywhere in it, in any database, holds the read back until it ends: a long
+// one, or a prepared transaction left open, delays the export. A record can be read twice, as when
+// a host retries a read whose result it lost: dedupe on ID. A failover or a recovery to a point in
+// time starts a new generation, which can use again ids and transactions the last one used past
+// what it kept: History refuses a cursor from another generation, and the new one is exported
+// from the start, its records kept apart from the last's. A logical dump restored into another
+// cluster numbers its transactions anew, which a cursor can't follow: move history with physical
+// backups and replicas.
 func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Record, Cursor, error) {
 	if limit < 1 || limit > MaxHistory {
 		return nil, after, fmt.Errorf("%w: a read of history takes from 1 to %d records", ErrInvalid, MaxHistory)
 	}
-	var next uint64
-	if err := a.db.QueryRow(ctx, `SELECT pg_snapshot_xmax(pg_current_snapshot())`).Scan(&next); err != nil {
+	var generation string
+	if err := a.db.QueryRow(ctx, `SELECT s.system_identifier::text || '/' || c.timeline_id::text
+		FROM pg_control_system() s, pg_control_checkpoint() c`).Scan(&generation); err != nil {
 		return nil, after, err
 	}
-	if after.TxID >= next {
-		return nil, after, fmt.Errorf("%w: the cursor is past this database's transactions, as after a restore from another: read history again from the start", ErrInvalid)
+	if after != (Cursor{}) && after.Generation != generation {
+		return nil, after, fmt.Errorf("%w: the cursor is another generation's, as before a failover: export this one from the start", ErrInvalid)
 	}
+	after.Generation = generation
 	rows, err := a.db.Query(ctx, `
 		SELECT id, txid, recorded_at, effective_at, tenant, entity, key, op, coalesce(principal, ''), coalesce(role, ''),
 		  coalesce(scope, ''), coalesce(group_id, ''), expires_at, before, after, actor, on_behalf_of, how, request, reason, db_user
@@ -83,27 +93,19 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 		var before, afterRow []byte
 		err := row.Scan(&r.ID, &r.TxID, &r.RecordedAt, &r.EffectiveAt, &r.Tenant, &r.Entity, &r.Key, &r.Op, &principal, &role,
 			&scope, &r.Group, &expires, &before, &afterRow, &actor, &onBehalfOf, &r.How, &r.Request, &r.Reason, &r.DBUser)
-		if principal != "" {
-			r.Principal = parsePrincipal(principal)
-		}
-		if scope != "" {
-			r.Scope = parseScope(scope)
-		}
-		if actor != "" {
-			r.Actor = parsePrincipal(actor)
-		}
-		if onBehalfOf != "" {
-			r.OnBehalfOf = parsePrincipal(onBehalfOf)
-		}
 		if expires != nil {
 			r.ExpiresAt = *expires
 		}
+		r.Principal, r.Scope, r.Actor, r.OnBehalfOf = parsePrincipal(principal), parseScope(scope), parsePrincipal(actor), parsePrincipal(onBehalfOf)
 		r.Role, r.Before, r.After = Role(role), before, afterRow
 		return r, err
 	})
-	if err != nil || len(records) == 0 {
-		return records, after, err
+	if err != nil {
+		return nil, after, err
+	}
+	if len(records) == 0 {
+		return nil, after, nil
 	}
 	last := records[len(records)-1]
-	return records, Cursor{TxID: last.TxID, ID: last.ID}, nil
+	return records, Cursor{Generation: generation, TxID: last.TxID, ID: last.ID}, nil
 }

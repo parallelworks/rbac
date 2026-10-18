@@ -13,7 +13,8 @@ CREATE TABLE rbac_history (
     entity       text        COLLATE "C" NOT NULL
                              CHECK (entity IN ('grant', 'role', 'deny', 'eligibility', 'membership', 'group', 'member')),
     -- The entity's key in its tenant: a grant's or eligibility's id, a role's or group's id, a deny's
-    -- scope and id, a membership's principal, a member's group, principal and source.
+    -- scope and id, a membership's principal, a member's group, principal and source as a JSON array,
+    -- since a group's id and a principal's can both hold spaces.
     key          text        COLLATE "C" NOT NULL,
     op           text        COLLATE "C" NOT NULL CHECK (op IN ('create', 'update', 'delete', 'expire', 'baseline')),
     principal    text        COLLATE "C",
@@ -52,8 +53,10 @@ DECLARE
     is_now jsonb := CASE WHEN TG_OP = 'DELETE' THEN NULL ELSE to_jsonb(NEW) END;
     r      jsonb := coalesce(is_now, was);
     change jsonb := coalesce(nullif(current_setting('rbac.change', true), '')::jsonb, '{}');
+    -- The context says only whether a delete is an expiry, so whoever sets it can't record a
+    -- delete as anything else.
     op     text  := CASE TG_OP WHEN 'INSERT' THEN 'create' WHEN 'UPDATE' THEN 'update'
-                   ELSE coalesce(change->>'op', 'delete') END;
+                   WHEN 'DELETE' THEN CASE change->>'op' WHEN 'expire' THEN 'expire' ELSE 'delete' END END;
     entity text;
     key    text;
 BEGIN
@@ -64,7 +67,7 @@ BEGIN
     WHEN 'rbac_eligibilities' THEN entity := 'eligibility'; key := r->>'id';
     WHEN 'rbac_memberships' THEN entity := 'membership'; key := r->>'principal';
     WHEN 'rbac_groups' THEN entity := 'group'; key := r->>'id';
-    WHEN 'rbac_members' THEN entity := 'member'; key := (r->>'group_id') || ' ' || (r->>'principal') || ' ' || (r->>'source');
+    WHEN 'rbac_members' THEN entity := 'member'; key := jsonb_build_array(r->>'group_id', r->>'principal', r->>'source')::text;
     END CASE;
     INSERT INTO rbac_history (effective_at, tenant, entity, key, op, principal, role, scope, group_id, expires_at,
       before, after, actor, on_behalf_of, how, request, reason)
@@ -86,6 +89,9 @@ END $$;
 DO $$ BEGIN
     EXECUTE format('ALTER FUNCTION rbac_record() SET search_path = %I, pg_temp', current_schema());
 END $$;
+-- Only its triggers call it: anyone else could attach it to a table of their own, named as one of
+-- the package's in pg_temp, and record what they like as its owner.
+REVOKE EXECUTE ON FUNCTION rbac_record() FROM PUBLIC;
 
 CREATE TRIGGER rbac_grants_history AFTER INSERT OR UPDATE OR DELETE ON rbac_grants
     FOR EACH ROW EXECUTE FUNCTION rbac_record();

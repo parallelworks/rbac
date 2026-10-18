@@ -166,12 +166,23 @@ became, when, and the database role that wrote it. Triggers write it, so a write
 the package is recorded too. Nothing updates, deletes or truncates it, and the package's tables
 can be deleted from but not truncated. `History` reads it in order, to export it to storage of
 the host's own: a transaction that commits after a later one is read after it, never skipped,
-and a record can be read twice, so dedupe on `Record.ID`.
+and a record can be read twice, so dedupe on `Record.ID`. Any transaction still running in the
+database cluster, in any of its databases, holds `History` back until it ends. A failover or a
+recovery to a point in time starts a new generation (`Cursor.Generation`), which can number again
+what the last one numbered past what it kept: `History` refuses the old cursor, and the new
+generation is exported from the start and kept apart. Move history with physical backups and
+replicas; a logical dump restored into another cluster numbers its transactions anew.
 
-A role that owns a table can change it whatever its triggers say. So the application's database
-role can't rewrite history, transfer `rbac_history` and the function `rbac_record` to a role of
-their own after migrating, and leave the application `SELECT` on `rbac_history`. A later
-migration that changes them runs as their owner.
+A role that owns a table can change it whatever its triggers say, and a schema's owner can drop
+any table in it. So the application's database role can't rewrite history, transfer
+`rbac_history` and the function `rbac_record` after migrating to a role of their own, which the
+application's role isn't a member of, and leave the application `SELECT` on `rbac_history`. Grant
+that role `USAGE` on the schema, since every write to the package's tables runs `rbac_record` as
+it, and keep the schema from being the application's role's, as `public` is when that role owns
+the database. The owner of the package's tables can disable the triggers that record them too,
+so a write is sure to be recorded only when the role that makes it doesn't own them. One
+migration can change both, so run `Migrate` as an administrator's role with both owners' rights,
+never as the application's.
 
 ## Running it
 
