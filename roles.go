@@ -286,7 +286,7 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 	if err != nil {
 		return err
 	}
-	return a.inTx(ctx, tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTx(ctx, tenant, actor.Principal, "SetRole", func(tx pgx.Tx) (ChangeEvent, error) {
 		// Alone in the tenant, so a change in progress checks and commits against one
 		// definition of the role.
 		if err := lockTenant(ctx, tx, tenant); err != nil {
@@ -395,7 +395,7 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 			return err
 		}
 	}
-	return a.inTx(ctx, tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTx(ctx, tenant, actor.Principal, "DeleteRole", func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lockTenant(ctx, tx, tenant); err != nil {
 			return ChangeEvent{}, err
 		}

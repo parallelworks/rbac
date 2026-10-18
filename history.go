@@ -5,9 +5,79 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 )
+
+// Audit is what a change records in its history beside its actor and how it was made: on whose
+// behalf it was made, and the host's request and reason. WithAudit attaches it to the changes
+// made with a context.
+type Audit struct {
+	// OnBehalfOf is the identity the actor acts for, such as the person a service account serves.
+	OnBehalfOf Principal
+	// Request is the host's id for the request, which finds it in the host's own logs.
+	Request string
+	// Reason is why it was made, such as the ticket behind it.
+	Reason string
+}
+
+// MaxRequest is the most characters an Audit's Request holds; its Reason holds MaxNote.
+const MaxRequest = 256
+
+type auditKey struct{}
+
+// WithAudit returns ctx carrying what the changes made with it record in their history.
+func WithAudit(ctx context.Context, a Audit) context.Context {
+	return context.WithValue(ctx, auditKey{}, a)
+}
+
+// checkAudit returns why what ctx carries for history can't be recorded.
+func (a *Authorizer) checkAudit(ctx context.Context) error {
+	audit, _ := ctx.Value(auditKey{}).(Audit)
+	switch {
+	case audit.OnBehalfOf != (Principal{}) && (!a.acts(audit.OnBehalfOf.Kind) || audit.OnBehalfOf.ID == ""):
+		return fmt.Errorf("%w: a change is made on behalf of an identity, a user or a declared kind", ErrInvalid)
+	case utf8.RuneCountInString(audit.Request) > MaxRequest || !validText(audit.Request):
+		return fmt.Errorf("%w: a request id is text of at most %d characters", ErrInvalid, MaxRequest)
+	case !validNote(audit.Reason):
+		return fmt.Errorf("%w: a reason is text of at most %d characters", ErrInvalid, MaxNote)
+	}
+	return nil
+}
+
+// changeContext is what rbac_record writes into history with each row a change writes.
+type changeContext struct {
+	Actor      string `json:"actor,omitempty"`
+	OnBehalfOf string `json:"on_behalf_of,omitempty"`
+	How        string `json:"how,omitempty"`
+	Request    string `json:"request,omitempty"`
+	Reason     string `json:"reason,omitempty"`
+	// Op is "expire" for rows DeleteExpired removes; otherwise the trigger reads it from the write.
+	Op string `json:"op,omitempty"`
+}
+
+// recording sets, for the rest of tx, the context its writes record in history: actor's change,
+// made by how, the name of the call that makes it, with what ctx carries for history. done clears
+// it, so a host's own writes later in its transaction, under WithTx, aren't recorded as this one's.
+func recording(ctx context.Context, tx pgx.Tx, actor Principal, how, op string) (done func() error, err error) {
+	audit, _ := ctx.Value(auditKey{}).(Audit)
+	c := changeContext{Actor: actorKey(actor), How: how, Request: audit.Request, Reason: audit.Reason, Op: op}
+	if audit.OnBehalfOf != (Principal{}) {
+		c.OnBehalfOf = audit.OnBehalfOf.key()
+	}
+	b, err := json.Marshal(c)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.change', $1, true)`, string(b)); err != nil {
+		return nil, err
+	}
+	return func() error {
+		_, err := tx.Exec(ctx, `SELECT set_config('rbac.change', '', true)`)
+		return err
+	}, nil
+}
 
 // Record is one change to a row the package keeps, as its history recorded it.
 type Record struct {
@@ -32,6 +102,8 @@ type Record struct {
 	Before, After json.RawMessage
 	// Actor is who made it through the package, by How, the call that made it; zero for a write
 	// that bypassed the package, which DBUser, the database role whose session wrote it, names.
+	// Actor, OnBehalfOf, How, Request and Reason are what the writing session said; DBUser is what
+	// the database knows.
 	Actor      Principal
 	OnBehalfOf Principal
 	How        string

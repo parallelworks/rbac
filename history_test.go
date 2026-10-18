@@ -373,3 +373,178 @@ func TestHistoryRecordsAReplicasWrites(t *testing.T) {
 		t.Fatal("deleted history in replica mode")
 	}
 }
+
+// recorded is a change's context as history recorded it.
+type recorded struct{ actor, onBehalfOf, how, request, reason, op string }
+
+// recordedSince reads the records after *last directly, in id order, and moves *last past them:
+// each change has committed, and History would wait on transactions other sessions hold open.
+func recordedSince(t *testing.T, h *harness, last *int64) []recorded {
+	t.Helper()
+	rows, err := h.pool.Query(t.Context(), `SELECT id, actor, on_behalf_of, how, request, reason, op FROM rbac_history
+		WHERE id > $1 ORDER BY id`, *last)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []recorded
+	var r recorded
+	if _, err := pgx.ForEachRow(rows, []any{last, &r.actor, &r.onBehalfOf, &r.how, &r.request, &r.reason, &r.op}, func() error {
+		got = append(got, r)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+func TestHistoryRecordsWhoMadeEachChangeAndHow(t *testing.T) {
+	h := grouped(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), guardRole, groupMembers)
+		c.PrincipalKinds = []rbac.PrincipalKind{"service_account"}
+	})
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "owner"), grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "groups"))
+	owner, groups, u := h.as(t, "owner"), h.as(t, "groups"), h.as(t, "u")
+	h.join(t, "v", "w")
+	// One that expired before the clock, which DeleteExpired removes, and grants in t2, w's of which
+	// DeletePrincipalEverywhere removes and the rest DeleteTenant.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+		VALUES ('t1', 'workspace', 'w1', 'user', 'gone', 'cluster.login', $1)`, h.now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.Import(ctx, host, "t2", []rbac.Grant{
+		grant(rbac.TenantRoot("t2"), "cluster.login", rbac.User, "w"), grant(rbac.TenantRoot("t2"), "cluster.login", rbac.User, "y"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var last int64
+	recordedSince(t, h, &last)
+	boss := identity("boss")
+	login := rbac.Binding{Role: "cluster.login", Principal: identity("v")}
+	custom := rbac.RoleDefinition{ID: "custom.view", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	sudo := rbac.Eligibility{Role: "cluster.sudo", Principal: u.Principal, MaxDuration: time.Hour}
+	for _, step := range []struct {
+		how   string
+		actor rbac.Principal
+		do    func(ctx context.Context) error
+	}{
+		{"SetMemberships", host, func(ctx context.Context) error {
+			return h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("x")}})
+		}},
+		{"ImportGroups", host, func(ctx context.Context) error {
+			return h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "ops"}})
+		}},
+		{"SetGroup", groups.Principal, func(ctx context.Context) error {
+			return h.authz.SetGroup(ctx, groups, "t1", rbac.GroupDefinition{ID: "devs"})
+		}},
+		{"ImportMembers", host, func(ctx context.Context) error {
+			return h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "ops", Principal: identity("v")}})
+		}},
+		{"ChangeMembers", groups.Principal, func(ctx context.Context) error {
+			return h.authz.ChangeMembers(ctx, groups, "t1", []rbac.Member{{Group: "devs", Principal: identity("v")}}, nil)
+		}},
+		{"DeleteMembers", host, func(ctx context.Context) error {
+			return h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "ops", Principal: identity("v")}})
+		}},
+		{"Apply", owner.Principal, func(ctx context.Context) error {
+			return h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{login}})
+		}},
+		{"Import", host, func(ctx context.Context) error {
+			return h.authz.Import(ctx, host, "t1", []rbac.Grant{grant(workspace.Scope(), "cluster.login", rbac.User, "v")})
+		}},
+		{"DeleteGrants", host, func(ctx context.Context) error {
+			return h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(workspace.Scope(), "cluster.login", rbac.User, "v")})
+		}},
+		{"SetRole", admin.Principal, func(ctx context.Context) error { return h.authz.SetRole(ctx, admin, "t1", custom) }},
+		{"DeleteRole", admin.Principal, func(ctx context.Context) error { return h.authz.DeleteRole(ctx, admin, "t1", custom.ID) }},
+		{"SetDeny", owner.Principal, func(ctx context.Context) error {
+			return h.authz.SetDeny(ctx, owner, cluster, rbac.Deny{ID: "d", Principals: []rbac.Principal{identity("x")}, Permissions: []rbac.Permission{root}})
+		}},
+		{"DeleteDeny", owner.Principal, func(ctx context.Context) error { return h.authz.DeleteDeny(ctx, owner, cluster, "d") }},
+		{"SetEligibility", owner.Principal, func(ctx context.Context) error { return h.authz.SetEligibility(ctx, owner, cluster, sudo) }},
+		{"Activate", u.Principal, func(ctx context.Context) error {
+			_, err := h.authz.Activate(ctx, u, cluster, rbac.Activation{Role: "cluster.sudo", Duration: time.Minute, Justification: "INC-1"})
+			return err
+		}},
+		{"Deactivate", u.Principal, func(ctx context.Context) error { return h.authz.Deactivate(ctx, u, cluster, "cluster.sudo") }},
+		{"DeleteEligibility", owner.Principal, func(ctx context.Context) error {
+			return h.authz.DeleteEligibility(ctx, owner, cluster, "cluster.sudo", u.Principal)
+		}},
+		{"DeleteGroup", groups.Principal, func(ctx context.Context) error { return h.authz.DeleteGroup(ctx, groups, "t1", "devs") }},
+		{"DeleteGroups", host, func(ctx context.Context) error { return h.authz.DeleteGroups(ctx, host, "t1", []string{"ops"}) }},
+		{"DeleteScopes", host, func(ctx context.Context) error {
+			return h.authz.DeleteScopes(ctx, host, "t1", []rbac.Scope{cluster.Scope()})
+		}},
+		{"DeletePrincipal", host, func(ctx context.Context) error { return h.authz.DeletePrincipal(ctx, host, "t1", identity("x")) }},
+		{"DeletePrincipalEverywhere", host, func(ctx context.Context) error {
+			return h.authz.DeletePrincipalEverywhere(ctx, host, identity("w"))
+		}},
+		{"DeleteTenant", host, func(ctx context.Context) error { return h.authz.DeleteTenant(ctx, host, "t2") }},
+	} {
+		audit := rbac.Audit{OnBehalfOf: boss, Request: "req-" + step.how, Reason: "because"}
+		if err := step.do(rbac.WithAudit(ctx, audit)); err != nil {
+			t.Fatalf("%s: %v", step.how, err)
+		}
+		got := recordedSince(t, h, &last)
+		if len(got) == 0 {
+			t.Errorf("%s recorded nothing", step.how)
+		}
+		want := recorded{actor: "user:" + step.actor.ID, onBehalfOf: "user:boss", how: step.how, request: audit.Request, reason: "because"}
+		for _, r := range got {
+			if r.op = ""; r != want {
+				t.Errorf("%s recorded %+v, want %+v", step.how, r, want)
+			}
+		}
+	}
+	// An expiry is no one's, and is recorded as one.
+	if _, err := h.authz.DeleteExpired(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := recordedSince(t, h, &last); len(got) != 1 || got[0] != (recorded{how: "DeleteExpired", op: "expire"}) {
+		t.Fatalf("DeleteExpired recorded %+v", got)
+	}
+}
+
+func TestAHostsOwnWritesAreNotRecordedAsAChangesUnderWithTx(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	var last int64
+	recordedSince(t, h, &last)
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := h.authz.WithTx(tx).Import(rbac.WithAudit(ctx, rbac.Audit{Request: "req-1"}), host, "t1",
+		[]rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "u")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'by-hand', 'cluster.login')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := recordedSince(t, h, &last)
+	if len(got) != 2 || got[0].how != "Import" || got[0].request != "req-1" || got[1] != (recorded{op: "create"}) {
+		t.Fatalf("recorded %+v", got)
+	}
+}
+
+func TestAChangeRefusesWhatItCantRecord(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	g := []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "u")}
+	for name, a := range map[string]rbac.Audit{
+		"on behalf of a group": {OnBehalfOf: rbac.Principal{Kind: rbac.Group, ID: "ops"}},
+		"a long request":       {Request: strings.Repeat("r", rbac.MaxRequest+1)},
+		"a long reason":        {Reason: strings.Repeat("r", rbac.MaxNote+1)},
+		"a NUL":                {Request: "a\x00b"},
+	} {
+		if err := h.authz.Import(rbac.WithAudit(ctx, a), host, "t1", g); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}

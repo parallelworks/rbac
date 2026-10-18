@@ -162,8 +162,12 @@ only the permission, so an error shown to a user shows no policy; its fields say
 ## History
 
 Every change to the package's tables is recorded in `rbac_history`: the row as it was and as it
-became, when, and the database role that wrote it. Triggers write it, so a write that bypasses
-the package is recorded too. Nothing updates, deletes or truncates it, and the package's tables
+became, when, and the database role that wrote it. A change through the package records its
+actor and the call that made it (`Record.How`), and what the host attaches with `rbac.WithAudit`:
+on whose behalf it was made, the request and the reason. An expiry `DeleteExpired` removes is
+recorded as one, made by no one. Triggers write it, so a write that bypasses the package is
+recorded too, as no one's. That context is what the session that wrote it says; the database role
+is what the database knows. Nothing updates, deletes or truncates it, and the package's tables
 can be deleted from but not truncated. `History` reads it in order, to export it to storage of
 the host's own: a transaction that commits after a later one is read after it, never skipped,
 and a record can be read twice, so dedupe on `Record.ID` and `RecordedAt`: a restore can give
