@@ -1,6 +1,7 @@
 package rbac_test
 
 import (
+	"context"
 	"errors"
 	"slices"
 	"testing"
@@ -165,6 +166,44 @@ func TestAsOfRefusesASearchPathThatReadsTheTablesFirst(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAsOfRefusesCachedHistoryIds(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `ALTER TABLE rbac_history ALTER COLUMN id SET CACHE 2`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.AsOf(ctx, "t1", dbNow(t, h), func(*rbac.Authorizer) error { return nil }); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("AsOf with history's ids cached: %v", err)
+	}
+}
+
+func TestAsOfRollsBackOnceItsContextIsDone(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	at := dbNow(t, h)
+	if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_grants WHERE principal = 'user:u'`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// The read ends as its context does, before AsOf rolls back its savepoint.
+	readCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if err := h.authz.WithTx(tx).AsOf(readCtx, "t1", at, func(*rbac.Authorizer) error {
+		cancel()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := h.authz.WithTx(tx).Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{{Kind: rbac.User, ID: "u"}}}); err != nil || len(got) != 0 {
+		t.Errorf("after AsOf, the host's transaction reads u's grants as %+v, %v", got, err)
 	}
 }
 

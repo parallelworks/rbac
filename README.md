@@ -184,7 +184,8 @@ its transactions anew.
 `AsOf(ctx, tenant, at, read)` reads a tenant as it was at a time, from its history: every check,
 list and search the read makes answers as it would have then, with the catalog as it is now, as
 for an access review of a past date. A change counts from when its transaction began, and none
-can be made through it.
+can be made through it. It orders a row's changes by their ids in `rbac_history`, which sessions
+take out of order once that table's id sequence caches more than one, so `AsOf` refuses that.
 
 A role that owns a table can change it whatever its triggers say, and a schema's owner can drop
 any table in it. So that the application's database role can't rewrite history or write around
@@ -201,8 +202,11 @@ through which it could write `rbac_history` itself; and:
    as it, and `CREATE` there to be given them, unless a superuser gives them.
 3. The application's role has `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the package's tables
    but `rbac_history` and `rbac_migrations`, and on any a later migration adds, and only `SELECT`
-   on `rbac_history`. Never `TRIGGER`, which `ALL` includes: a trigger runs its function as
-   whoever writes the table, and one on `rbac_history` can drop each record, as history's owner.
+   on `rbac_history`, with no `UPDATE` on its id sequence, which a grant on all the schema's
+   sequences can give: `setval` could number a change below the one before it, and `AsOf` would
+   read the row as it was before the change. Never `TRIGGER`, which `ALL` includes: a trigger
+   runs its function as whoever writes the table, and one on `rbac_history` can drop each record,
+   as history's owner.
 4. The schema isn't the application's role's, as `public` is when that role owns the database,
    and that role can't create in it, as every role can in `public` before PostgreSQL 15:
    `Migrate` calls functions by name, and an overload made there would run in its place, as the
