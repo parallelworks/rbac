@@ -5,16 +5,17 @@
 // resource, a container above resources or the whole tenant, and applies to everything under
 // that scope.
 //
-// The host keeps identities, groups, resources and their hierarchy and passes them in: a
-// [Subject] is an identity, the groups it is in and the tenants it is a member of, or no one,
-// and a [Resource] carries its ancestors. The package keeps the grants, decides
+// The host keeps identities, resources and their hierarchy and passes them in: a [Subject] is the
+// identity asking, or no one, and a [Resource] carries its ancestors. The package keeps the
+// identities that are members or guests of each tenant and in each of its groups
+// ([Authorizer.SetMemberships], [Authorizer.ImportMembers]), and the grants, decides
 // ([Authorizer.Authorize]), lists ([Authorizer.Filter], [Authorizer.Reachable]) and changes
 // grants with escalation checks ([Authorizer.Apply]), under deny policies above every grant
 // ([Authorizer.SetDeny]). Nothing is owned: a host gives whoever creates a resource a role on
 // it ([Authorizer.Import]).
 //
-// A check reads the grants as they are: only compiled conditions are cached. Read a resource's
-// ancestors and attributes and a subject's groups no earlier than the content they protect.
+// A check reads the grants, memberships and groups as they are: only compiled conditions are
+// cached. Read a resource's ancestors and attributes no earlier than the content they protect.
 package rbac
 
 import (
@@ -73,8 +74,8 @@ type PrincipalKind string
 const (
 	User  PrincipalKind = "user"
 	Group PrincipalKind = "group"
-	// Members is every member of a tenant, of every kind, those who join later included; its id
-	// is the tenant's (TenantMembers).
+	// Members is every member of a tenant, of every kind, those who join later included, and none
+	// of its guests; its id is the tenant's (TenantMembers).
 	Members PrincipalKind = "members"
 	// Public is anyone, signed in or not; its id is empty.
 	Public PrincipalKind = "public"
@@ -84,9 +85,9 @@ const (
 // every signed-in identity, so a host can't declare one.
 var reservedKinds = []PrincipalKind{"anonymous", "authenticated", "domain", "everyone", "role", "set"}
 
-// Principal is who a role is granted to. An identity's id names it in every tenant, so a tenant
-// can grant a role to one from another, where Config.ValidateGrant allows it; a group's names it
-// only in its tenant.
+// Principal is who a role is granted to. An identity's id names it in every tenant, and it holds
+// what a tenant grants it while it is a member or guest there; a group's names it only in its
+// tenant.
 type Principal struct {
 	Kind PrincipalKind
 	ID   string
@@ -148,42 +149,98 @@ func (a *Authorizer) publicRoles(roles []string) []string {
 	return public
 }
 
-// Subject is who is asking: an identity, every group it is in, nested groups included, and
-// every tenant it is a member of. Build it from the authenticated session, never from request
-// input.
+// Subject is who is asking: an identity, built from the authenticated session, never from
+// request input. The package knows the rest: whether it is a member or guest of the tenant asked
+// about, and the groups it is in there (SetMemberships, ImportMembers). An identity holds nothing
+// in a tenant it isn't a member or guest of, nor while its membership is suspended, but what is
+// granted to the public.
 //
 // The zero Subject is anonymous, someone not signed in, and holds only what is granted to the
 // public.
 type Subject struct {
 	// Principal is a user, or a kind in Config.PrincipalKinds.
 	Principal Principal
-	Groups    []string
-	// Tenants are the tenants it is a member of, where grants to the tenant's members reach it.
-	Tenants []string
 	// Attributes are what conditions read as subject.attributes, such as a department.
 	Attributes map[string]any
 }
 
 // subject checks that s is anonymous, or an identity of a kind that acts.
 func (a *Authorizer) subject(s Subject) error {
-	if s.Principal == (Principal{}) {
-		if len(s.Groups)+len(s.Tenants) > 0 {
-			return fmt.Errorf("%w: an anonymous subject is in no group or tenant", ErrInvalid)
-		}
-		return nil
-	}
-	if !a.acts(s.Principal.Kind) || s.Principal.ID == "" || slices.Contains(s.Tenants, "") {
+	if s.Principal != (Principal{}) && (!a.acts(s.Principal.Kind) || s.Principal.ID == "") {
 		return fmt.Errorf("%w: a subject is anonymous, or a user or declared kind", ErrInvalid)
 	}
 	return nil
 }
 
-// principalsFor is the keys of the subject's principals whose grants in a tenant can give p: a
-// grant to a tenant's members or the public never gives a permission to change grants,
-// whatever its role gives now or later. public is whether a public role can give p
-// (Authorizer.publicGives), so an anonymous subject reads no grants without one.
-func (s Subject) principalsFor(tenant string, p Permission, public bool) []string {
-	return s.keys(tenant, public && !p.managesAccess(), !p.managesAccess())
+// identityKey is the subject's key, as membership is read by: empty for the anonymous, which no
+// membership has.
+func (s Subject) identityKey() string {
+	if s.Principal == (Principal{}) {
+		return ""
+	}
+	return s.Principal.key()
+}
+
+// broad is whose grants to broad principals a read counts: the public's, and the tenant's
+// members'. A grant to either never gives a permission to change grants, whatever its role
+// gives now or later, and one to the public gives only what a public role can (publicGives).
+type broad struct{ public, members bool }
+
+// counting is which broad grants can give p on a resource type.
+func (a *Authorizer) counting(p Permission, resourceType string) broad {
+	return broad{public: a.publicGives(p, resourceType) && !p.managesAccess(), members: !p.managesAccess()}
+}
+
+// all counts every broad grant, as a read of what a subject may do, whatever the permission,
+// filters later.
+var all = broad{public: true, members: true}
+
+// keysSQL is SQL defining, in a WITH RECURSIVE, keys(k): the principal keys an identity is in a
+// tenant at now, given as SQL for its key (empty for the anonymous), the tenant and the time. They
+// are the public; and while the identity is a member or guest of the tenant, not suspended, the
+// identity, the groups it is in, through those they are in, and unless it is a guest the tenant's
+// members. A group is counted once, so membership nested in a cycle stops.
+func keysSQL(tenant, identity, now string) string {
+	return fmt.Sprintf(`membership AS (
+		SELECT guest FROM rbac_memberships WHERE tenant = %[1]s AND principal = %[2]s AND NOT suspended
+		  AND (expires_at IS NULL OR expires_at > %[3]s)
+	), groups(id) AS (
+		SELECT group_id FROM rbac_members WHERE tenant = %[1]s AND principal = %[2]s
+		  AND (expires_at IS NULL OR expires_at > %[3]s) AND EXISTS (SELECT FROM membership)
+		UNION
+		SELECT m.group_id FROM rbac_members m JOIN groups g ON m.principal = 'group:' || g.id
+		WHERE m.tenant = %[1]s AND (m.expires_at IS NULL OR m.expires_at > %[3]s)
+	), keys(k) AS (
+		SELECT 'public:' COLLATE "C"
+		UNION ALL SELECT %[2]s COLLATE "C" FROM membership
+		UNION ALL SELECT ('members:' || %[1]s) COLLATE "C" FROM membership WHERE NOT guest
+		UNION ALL SELECT 'group:' || id FROM groups
+	)`, tenant, identity, now)
+}
+
+// countedKeys is SQL selecting, sorted, the keys keysSQL defines whose grants a read counts: the
+// broad ones only where public and members, SQL for booleans, are true. Sorted, a lookup of them
+// in the key index takes half as long.
+func countedKeys(public, members string) string {
+	return fmt.Sprintf(`SELECT k FROM keys WHERE (k <> 'public:' OR %s) AND (k NOT LIKE 'members:%%' OR %s) ORDER BY k`, public, members)
+}
+
+// keysOf reads the principal keys s is in a tenant, sorted, as keysSQL defines them.
+func (a *Authorizer) keysOf(ctx context.Context, q DB, tenant string, s Subject) ([]string, error) {
+	rows, err := q.Query(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+` SELECT k FROM keys ORDER BY k`,
+		tenant, s.identityKey(), a.cfg.Now())
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
+// countedOf keeps the keys whose grants a read counts.
+func countedOf(keys []string, b broad) []string {
+	return slices.DeleteFunc(slices.Clone(keys), func(k string) bool {
+		kind, _, _ := strings.Cut(k, ":")
+		return kind == string(Public) && !b.public || kind == string(Members) && !b.members
+	})
 }
 
 // publicGives reports whether a grant to the public can give p on a resource type: only a
@@ -191,29 +248,6 @@ func (s Subject) principalsFor(tenant string, p Permission, public bool) []strin
 // privileged gives there.
 func (a *Authorizer) publicGives(p Permission, resourceType string) bool {
 	return a.unprivileged[permissionOn{p, resourceType}]
-}
-
-// principals is the keys of every principal the subject is in a tenant.
-func (s Subject) principals(tenant string) []string { return s.keys(tenant, true, true) }
-
-func (s Subject) keys(tenant string, public, members bool) []string {
-	var keys []string
-	if public {
-		keys = append(keys, publicKey)
-	}
-	if s.Principal.ID == "" {
-		return keys
-	}
-	keys = append(keys, s.Principal.key())
-	for _, g := range s.Groups {
-		if g != "" {
-			keys = append(keys, Principal{Group, g}.key())
-		}
-	}
-	if members && slices.Contains(s.Tenants, tenant) {
-		keys = append(keys, TenantMembers(tenant).key())
-	}
-	return keys
 }
 
 // Resource is what is asked about: its type and id, and every container above it, nearest
@@ -399,7 +433,8 @@ type ConstraintInput struct {
 	Tenant       string
 	ResourceType string
 	Permission   Permission
-	// Subject is who asks, or who changes access; nil in Holders.
+	// Subject is who asks, or who changes access; nil in Holders. Authorizer.GroupsOf reads the
+	// groups it is in.
 	Subject *Subject
 	// Resource is what is asked about, with its ancestors and attributes; for what a change hands
 	// on, the scope it is on, whose type is a container's or the tenant's where what it hands on
