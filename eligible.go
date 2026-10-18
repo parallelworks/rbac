@@ -311,7 +311,7 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 			if len(e.approvers) > 0 {
 				approved = act.Approver.Principal
 			}
-			roles, err := a.book(ctx, q, on.Tenant, []Role{act.Role})
+			roles, err := a.tenantBook(ctx, q, on.Tenant, []Role{act.Role})
 			return roles, approved, err
 		}
 	}

@@ -2882,6 +2882,51 @@ func TestARoleHandingOutOneThatBecomesPrivilegedIsPrivileged(t *testing.T) {
 	}
 }
 
+func TestARoleHandingOutAPrivilegedOneIsPrivilegedHoweverItIsGranted(t *testing.T) {
+	seen := map[rbac.Via]bool{}
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), rbac.RoleDefinition{
+			ID: "workspace.owner", Permissions: []rbac.Permission{"workspace:view", "workspace:grant", "workspace:delete"}, ResourceTypes: []string{"workspace"}, Privileged: true,
+		})
+		c.ValidateGrant = func(_ context.Context, _ rbac.DB, in rbac.GrantInput) error {
+			if in.Role.ID == "custom.a" {
+				seen[in.Via] = in.Role.Privileged
+			}
+			return nil
+		}
+	})
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	h.seed(t, grant(rbac.TenantRoot("t1"), "workspace.owner", rbac.User, "admin"))
+	ws := []string{"workspace"}
+	// a gives nothing privileged itself, but hands out b, which does.
+	b := rbac.RoleDefinition{ID: "custom.b", Permissions: []rbac.Permission{"workspace:view", "workspace:delete"}, ResourceTypes: ws}
+	a := rbac.RoleDefinition{ID: "custom.a", Permissions: []rbac.Permission{"workspace:grant"}, ResourceTypes: ws, GrantableRoles: []rbac.Role{b.ID}}
+	for _, d := range []rbac.RoleDefinition{b, a} {
+		if err := h.authz.SetRole(ctx, admin, "t1", d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	x := rbac.Principal{Kind: rbac.User, ID: "x"}
+	if err := h.authz.Apply(ctx, admin, workspace, rbac.Change{Grant: []rbac.Binding{{Role: a.ID, Principal: rbac.Principal{Kind: rbac.User, ID: "y"}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.SetEligibility(ctx, admin, workspace, rbac.Eligibility{Role: a.ID, Principal: x, MaxDuration: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.authz.Activate(ctx, user("x"), workspace, rbac.Activation{Role: a.ID, Duration: time.Minute, Justification: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{grant(workspace.Scope(), a.ID, rbac.User, "z")}); err != nil {
+		t.Fatal(err)
+	}
+	for _, via := range []rbac.Via{rbac.ViaApply, rbac.ViaEligibility, rbac.ViaActivation, rbac.ViaImport} {
+		if privileged, asked := seen[via]; !asked || !privileged {
+			t.Errorf("%s: asked %t, privileged %t", via, asked, privileged)
+		}
+	}
+}
+
 func TestDefiningARoleCreatedWhileItWaitsAsksTheConstraintsAgain(t *testing.T) {
 	h := setup(t, constrain("managed elsewhere", grantC))
 	ctx := t.Context()

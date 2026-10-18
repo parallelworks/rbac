@@ -238,7 +238,7 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 		}
 	}
 	check := func(q DB, errs ...error) (book, error) {
-		roles, err := a.book(ctx, q, tenant, roleIDs(grants))
+		roles, err := a.tenantBook(ctx, q, tenant, roleIDs(grants))
 		if err != nil {
 			return book{}, err
 		}
@@ -499,13 +499,9 @@ func (a *Authorizer) authorityOn(ctx context.Context, q DB, actor Subject, on Re
 	if err != nil {
 		return authority{}, err
 	}
-	b := book{builtin: a.roles}
-	if slices.ContainsFunc(append(roleIDs(held), roles...), isCustom) {
-		custom, err := a.customRoles(ctx, q, on.Tenant)
-		if err != nil {
-			return authority{}, err
-		}
-		b = a.bookOf(custom)
+	b, err := a.tenantBook(ctx, q, on.Tenant, append(roleIDs(held), roles...))
+	if err != nil {
+		return authority{}, err
 	}
 	return a.authorityOf(ctx, q, actor, on, held, ds, b)
 }
