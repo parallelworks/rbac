@@ -109,7 +109,7 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 			vars = a.vars(ctx, s, p, r)
 		}
 		spend := newBudget()
-		cheapestFirst(conditional)
+		cheapestFirst(conditional, holding.expression)
 		for _, h := range conditional {
 			if a.conds.holds(spend, h.Condition.Expression, vars) {
 				return Decision{Allowed: true}, nil
@@ -141,7 +141,7 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 	grants = slices.DeleteFunc(grants, func(g Grant) bool { return !gives(roles, g.Principal, g.Role, p, r.Type) })
 	// Evaluated in the order Authorize evaluates them, so a budget runs out where it does for it.
 	byCost := slices.Clone(grants)
-	slices.SortStableFunc(byCost, func(x, y Grant) int { return cheaper(x.Condition.Expression, y.Condition.Expression) })
+	cheapestFirst(byCost, Grant.expression)
 	held := map[string]bool{}
 	for _, g := range byCost {
 		held[g.ID] = g.Condition.Expression == "" || a.conds.holds(spend, g.Condition.Expression, vars)
@@ -186,7 +186,7 @@ func (a *Authorizer) scopeOf(r Resource) error {
 
 // unmet is why no conditional grant allowed, given what is left of the check's budget.
 func unmet(spend *budget) string {
-	if spend.left == 0 {
+	if spend.exhausted {
 		return "the conditions of the grants that give it cost more than a check may spend"
 	}
 	return "no condition of a grant that gives it holds"
@@ -267,7 +267,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 	if err := a.conditionsOf(ctx, a.db, r.Tenant, conditional); err != nil {
 		return nil, err
 	}
-	cheapestFirst(conditional)
+	cheapestFirst(conditional, holding.expression)
 	for _, h := range conditional {
 		def, _ := roles.role(h.Role)
 		for _, p := range def.Permissions {
@@ -687,8 +687,8 @@ func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held
 }
 
 // heldGrants returns the grants held by any of principals on any of scopes, not expired, in the
-// order heldOrDenied reads them: Explain spends on their conditions in the order Authorize does,
-// so a budget runs out where it does for Authorize.
+// order heldOrDenied reads them, so Explain lists them in a stable order: it spends on their
+// conditions cheapest first, as Authorize does.
 func (a *Authorizer) heldGrants(ctx context.Context, q DB, tenant string, principals, scopes []string) ([]Grant, error) {
 	if len(principals) == 0 {
 		return nil, nil

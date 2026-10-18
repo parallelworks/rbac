@@ -674,7 +674,7 @@ func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Re
 	// The cheapest conditions first, as callers evaluate them in this order, so what a budget run
 	// out decides doesn't rest on ids.
 	held = slices.Clone(held)
-	cheapestFirst(held)
+	cheapestFirst(held, holding.expression)
 	with := func(vars map[string]any, action Permission) map[string]any {
 		v := maps.Clone(vars)
 		v["action"] = string(action)

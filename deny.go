@@ -129,16 +129,18 @@ func (a *Authorizer) deniedBy(ds []denial, p Permission, spend *budget, vars map
 			conditional = append(conditional, d)
 		}
 	}
-	slices.SortStableFunc(conditional, func(x, y denial) int { return cheaper(x.condition, y.condition) })
+	cheapestFirst(conditional, denial.expression)
 	for _, d := range conditional {
 		held, evaluated := a.conds.decide(spend, d.condition, vars)
 		if held || !evaluated {
-			d.unevaluated, d.spent = !evaluated, !evaluated && spend.left == 0
+			d.unevaluated, d.spent = !evaluated, !evaluated && spend.exhausted
 			return d, true
 		}
 	}
 	return denial{}, false
 }
+
+func (d denial) expression() string { return d.condition }
 
 func (d denial) String() string { return "deny " + d.id + " on " + d.scope }
 
@@ -218,8 +220,9 @@ func (a *Authorizer) checkDeny(tenant string, d Deny) error {
 // constraint. A deny only takes access away, so setting one needs no more than that; one can
 // deny its setter too. A scope's conditional denies are bounded together by what a check may spend
 // on conditions, so that one always evaluates them: about seven short distinct conditions, or
-// three of the longest, however many denies share them. Whoever holds that permission on the scope, those the deny names included, can replace
-// or delete it, so to bind one who holds it there, set the deny on a scope above where it doesn't.
+// three of the longest, however many denies share them. Whoever holds that permission on the
+// scope, those the deny names included, can replace or delete it, so to bind one who holds it
+// there, set the deny on a scope above where it doesn't.
 func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d Deny) error {
 	if err := a.check(on); err != nil {
 		return err

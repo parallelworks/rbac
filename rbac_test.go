@@ -4446,6 +4446,18 @@ func TestAPathsConditionalDeniesAreEvaluatedWhole(t *testing.T) {
 	if d, err := h.authz.Explain(ctx, user("u"), login, cluster); err != nil || d.Allowed || !strings.Contains(d.Reason, "couldn't be evaluated") || strings.Contains(d.Reason, "budget") {
 		t.Fatalf("Explain = %+v, %v", d, err)
 	}
+	// Denies stored before their scope was bounded can cost more than a check may spend: the one
+	// it can't pay for denies, and Explain says the budget decided.
+	for i := range 20 {
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions, condition)
+			VALUES ('t1', 'cluster', 'c1', $1, $2, $3, $4)`,
+			fmt.Sprint("old", i), []string{string(rbac.Members) + ":t1"}, []string{string(login)}, longFalse(20+i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if d, err := h.authz.Explain(ctx, user("owner"), login, cluster); err != nil || d.Allowed || !strings.Contains(d.Reason, "within the check's budget") {
+		t.Fatalf("Explain = %+v, %v", d, err)
+	}
 }
 
 func TestADeepPathsConditionalDeniesAreEvaluatedWhole(t *testing.T) {
@@ -4513,6 +4525,27 @@ func TestEachPermissionIsDecidedOnItsOwnBudgets(t *testing.T) {
 	// And handing each on.
 	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.admin", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}}}); err != nil {
 		t.Fatalf("handing on what the denies leave: %v", err)
+	}
+	// And on a budget of its own for its grants' conditions: four costly ones that don't hold and,
+	// costliest, one that does, which one budget for both permissions the role gives never reaches.
+	var ys []string
+	for i := range 90 {
+		ys = append(ys, fmt.Sprint(i))
+	}
+	long := "[" + strings.Join(ys, ",") + "]"
+	costly := func(i int) string { return fmt.Sprintf("%s.all(x, %s.all(y, x >= -%d)) && false", long, long, i) }
+	grants := []rbac.Grant{{Scope: cluster.Scope(), Binding: conditional("cluster.login", "c", "true || "+costly(0))}}
+	for i := range 4 {
+		grants = append(grants, rbac.Grant{Scope: cluster.Scope(), Binding: conditional("cluster.login", "c", costly(i+1))})
+	}
+	h.seed(t, grants...)
+	for _, p := range []rbac.Permission{login, view} {
+		if !allowed(t, h, user("c"), p, cluster) {
+			t.Fatalf("a condition that holds should allow %s", p)
+		}
+	}
+	if perms, err := h.authz.Permissions(ctx, user("c"), cluster); err != nil || !slices.Equal(perms, []rbac.Permission{login, view}) {
+		t.Fatalf("Permissions under conditions = %v, %v", perms, err)
 	}
 }
 

@@ -62,9 +62,10 @@ const (
 	maxCached = 256 << 10
 	// zoneCost is what reading a time in a named zone costs: it loads the zone each time.
 	zoneCost = 100
-	// maxCheckCost is what one check, listing or change may spend on its grants' conditions,
-	// compiling included, so many conditional grants on one path can't make it slow: once it is
-	// spent, no further condition holds, and what needs one is refused.
+	// maxCheckCost is what one check may spend on its grants' conditions, compiling included, and a
+	// listing or a change on each permission it decides, so many conditional grants on one path
+	// can't make it slow: once it is spent, no further condition holds, and what needs one is
+	// refused.
 	maxCheckCost = 8 * maxCost
 	// compilePerByte is what compiling a condition costs for each byte of it: compiling one
 	// takes about as long as evaluating eight units of cost for each.
@@ -75,9 +76,12 @@ const (
 // compile, and what those it evaluated decided, for each action: one condition decides the same
 // for a request, so a check pays to evaluate it once however many grants or denies have it.
 type budget struct {
-	left     uint64
-	compiled map[string]bool
-	decided  map[string]decision
+	left uint64
+	// exhausted is set once a condition couldn't be paid for: left reaching 0 doesn't say so, as
+	// one evaluated can spend exactly what was left.
+	exhausted bool
+	compiled  map[string]bool
+	decided   map[string]decision
 }
 
 // decision is what evaluating a condition decided.
@@ -98,14 +102,17 @@ func budgetOf(left uint64) *budget {
 // worstCost is the most a condition can cost a check: compiling it, and evaluating it to its bound.
 func worstCost(expr string) uint64 { return uint64(len(expr))*compilePerByte + maxCost }
 
-// cheaper orders conditions by what compiling them costs, then by their text, as the same
-// condition decides the same: a check evaluating them in this order decides whatever their ids.
-func cheaper(x, y string) int { return cmp.Or(cmp.Compare(len(x), len(y)), strings.Compare(x, y)) }
-
-// cheapestFirst sorts held grants in the order checks evaluate their conditions.
-func cheapestFirst(held []holding) {
-	slices.SortStableFunc(held, func(x, y holding) int { return cheaper(x.Condition.Expression, y.Condition.Expression) })
+// cheapestFirst sorts xs in the order checks evaluate their conditions, which expression reads: by
+// what compiling them costs, then by their text, as the same condition decides the same, so a
+// check evaluating them in this order decides whatever their ids.
+func cheapestFirst[T any](xs []T, expression func(T) string) {
+	slices.SortStableFunc(xs, func(x, y T) int {
+		ex, ey := expression(x), expression(y)
+		return cmp.Or(cmp.Compare(len(ex), len(ey)), strings.Compare(ex, ey))
+	})
 }
+
+func (b Binding) expression() string { return b.Condition.Expression }
 
 func (b *budget) spend(cost uint64) { b.left -= min(cost, b.left) }
 
@@ -432,6 +439,7 @@ func (c *conditions) decide(b *budget, expr string, vars map[string]any) (held, 
 	}
 	defer func() { b.decided[key] = decision{held, evaluated} }()
 	if b.left == 0 {
+		b.exhausted = true
 		return false, false
 	}
 	// A check pays to compile each condition once, whether or not it is cached, so what it decides
@@ -441,6 +449,7 @@ func (c *conditions) decide(b *budget, expr string, vars map[string]any) (held, 
 		b.spend(uint64(len(expr)) * compilePerByte)
 	}
 	if b.left == 0 {
+		b.exhausted = true
 		return false, false
 	}
 	prg, err := c.compile(expr)
@@ -455,6 +464,9 @@ func (c *conditions) decide(b *budget, expr string, vars map[string]any) (held, 
 	}
 	b.spend(cost)
 	// One that cost more than was left is past the budget too.
+	if cost > left {
+		b.exhausted = true
+	}
 	if err != nil || cost > left {
 		return false, false
 	}
