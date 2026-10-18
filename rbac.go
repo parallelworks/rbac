@@ -620,8 +620,10 @@ type Config struct {
 
 // Authorizer decides and changes grants, on the tables Migrate creates.
 type Authorizer struct {
-	db         DB
-	cfg        Config
+	db  DB
+	cfg Config
+	// asOf is set on an Authorizer AsOf gave, which reads the past and changes nothing.
+	asOf       bool
 	roles      map[Role]RoleDefinition
 	containers map[string]bool
 	// containerTypes are the containers' types, sorted.

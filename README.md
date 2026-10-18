@@ -181,6 +181,11 @@ holds, and history is exported again from the start, kept apart from the last ex
 history with physical backups and replicas; a logical dump restored into another cluster numbers
 its transactions anew.
 
+`AsOf(ctx, tenant, at, read)` reads a tenant as it was at a time, from its history: every check,
+list and search the read makes answers as it would have then, with the catalog as it is now, as
+for an access review of a past date. A change counts from when its transaction began, and none
+can be made through it.
+
 A role that owns a table can change it whatever its triggers say, and a schema's owner can drop
 any table in it. So that the application's database role can't rewrite history or write around
 it, that role is no superuser, nor a member of `pg_write_all_data` or `pg_create_subscription`,

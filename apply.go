@@ -1004,6 +1004,9 @@ func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, h
 }
 
 func (a *Authorizer) begin(ctx context.Context, fn func(pgx.Tx) error) error {
+	if err := a.writable(); err != nil {
+		return err
+	}
 	return begin(ctx, a.db, fn)
 }
 
@@ -1542,6 +1545,9 @@ func removed[T any](ctx context.Context, a *Authorizer, tx pgx.Tx, table, column
 // over those a change is holding, rather than wait on it, so the next run removes them. A race
 // PostgreSQL refuses matches ErrConflict.
 func (a *Authorizer) DeleteExpired(ctx context.Context) (int64, error) {
+	if err := a.writable(); err != nil {
+		return 0, err
+	}
 	n, err := a.deleteExpired(ctx)
 	return n, conflicted(err)
 }
