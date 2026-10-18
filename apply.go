@@ -383,7 +383,8 @@ func (a *Authorizer) validate(ctx context.Context, roles book, actor Subject, vi
 	}
 	for _, b := range revokes {
 		errs = append(errs, checkRevoke(tenant, b)...)
-		if a.owned[b.Source] {
+		// One by ID matches a grant from any source, so Apply checks the grant it removes instead.
+		if b.ID == "" && a.owned[b.Source] {
 			errs = append(errs, ownedRevoke(b))
 		}
 	}
@@ -1053,17 +1054,24 @@ func (a *Authorizer) bounded(ctx context.Context, tx pgx.Tx, tenant string, stor
 		return nil
 	}
 	n := len(stored)
-	scopes, principals, roles := make([]string, n), make([]string, n), make([]string, n)
+	scopes, principals, roles, buckets := make([]string, n), make([]string, n), make([]string, n), make([]string, n)
 	for i, g := range stored {
 		scopes[i], principals[i], roles[i] = g.Scope.Key(), g.Principal.key(), string(g.Role)
+		if a.owned[g.Source] {
+			buckets[i] = g.Source
+		}
 	}
+	// Grants from each source the host owns count apart from the rest, so a tenant's admins can't
+	// fill the bound to keep the host's own from being made, nor the host fill theirs.
 	rows, err := tx.Query(ctx, `
-		SELECT scope, principal, role FROM rbac_grants
-		WHERE tenant = $1 AND (scope, principal, role) IN (SELECT * FROM unnest($2::text[], $3::text[], $4::text[]))
-		  AND (expires_at IS NULL OR expires_at > $5)
-		GROUP BY scope, principal, role HAVING count(*) > $6
+		SELECT scope, principal, role FROM (
+		  SELECT scope, principal, role, CASE WHEN source = ANY($7::text[]) THEN source ELSE '' END AS bucket FROM rbac_grants
+		  WHERE tenant = $1 AND (scope, principal, role) IN (SELECT * FROM unnest($2::text[], $3::text[], $4::text[]))
+		    AND (expires_at IS NULL OR expires_at > $5)) g
+		WHERE (scope, principal, role, bucket) IN (SELECT * FROM unnest($2::text[], $3::text[], $4::text[], $8::text[]))
+		GROUP BY scope, principal, role, bucket HAVING count(*) > $6
 		ORDER BY scope, principal, role`,
-		tenant, scopes, principals, roles, a.cfg.Now(), MaxGrantsPerRole)
+		tenant, scopes, principals, roles, a.cfg.Now(), MaxGrantsPerRole, slices.Sorted(maps.Keys(a.owned)), buckets)
 	if err != nil {
 		return err
 	}
@@ -1172,7 +1180,8 @@ func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) (
 // host's own counterpart of Import, for the grants it manages, such as those from a source it owns
 // (Config.Sources), which Apply can't change. Each names its scope and, as Change.Revoke does, its
 // role, principal and source, every grant of the role to the principal from the source there, or
-// with an ID that one grant. actor is who they are recorded as revoked by.
+// with an ID that one grant. actor is who they are recorded as revoked by. It locks their scopes
+// and principals until the transaction ends, or past 64 the tenant, as Import does.
 func (a *Authorizer) DeleteGrants(ctx context.Context, actor Principal, tenant string, grants []Grant) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)

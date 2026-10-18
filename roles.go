@@ -407,15 +407,19 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		}
 		// The LIKE matches the partial indexes on custom roles' grants and eligibilities.
 		const ofRole = "role = $2 AND role LIKE 'custom.%'"
-		// Deleting it would revoke the host's own grants of it, which only the host removes.
-		var source string
-		err = tx.QueryRow(ctx, `SELECT source FROM rbac_grants WHERE tenant = $1 AND `+ofRole+` AND source = ANY($3::text[]) LIMIT 1`,
-			tenant, id, slices.Sorted(maps.Keys(a.owned))).Scan(&source)
-		switch {
-		case err == nil:
-			return ChangeEvent{}, fmt.Errorf("%w: role %q is granted from %s, whose grants only the host removes (DeleteGrants)", ErrInvalid, id, source)
-		case !errors.Is(err, pgx.ErrNoRows):
-			return ChangeEvent{}, err
+		// Deleting it would revoke the host's own grants of it, which only the host removes. Expired
+		// ones give nothing and Grants doesn't list them, so the host has none to remove.
+		if len(a.owned) > 0 {
+			var source string
+			err = tx.QueryRow(ctx, `SELECT source FROM rbac_grants WHERE tenant = $1 AND `+ofRole+` AND source = ANY($3::text[])
+				AND (expires_at IS NULL OR expires_at > $4) LIMIT 1`,
+				tenant, id, slices.Sorted(maps.Keys(a.owned)), a.cfg.Now()).Scan(&source)
+			switch {
+			case err == nil:
+				return ChangeEvent{}, fmt.Errorf("%w: role %q is granted from %s, whose grants only the host removes (DeleteGrants)", ErrInvalid, id, source)
+			case !errors.Is(err, pgx.ErrNoRows):
+				return ChangeEvent{}, err
+			}
 		}
 		revoked, err := a.remove(ctx, tx, tenant, ofRole, id)
 		if err != nil {

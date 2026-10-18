@@ -430,7 +430,8 @@ func conflicted(err error) error {
 const (
 	// MaxBindings is how many bindings one Apply, grants and revokes together, or one Import takes,
 	// and MaxGrantsPerRole how many grants in force of one role a principal holds on one scope,
-	// differing by source, expiry or condition, as cloud IAM bounds bindings of one role.
+	// differing by source, expiry or condition, as cloud IAM bounds bindings of one role: those from
+	// each source the host owns (Config.Sources) counted apart.
 	MaxBindings      = 1000
 	MaxGrantsPerRole = 20
 	// MaxDenies is how many deny policies a scope holds, and MaxDenyEntries how many principals,
@@ -507,9 +508,11 @@ type Config struct {
 	// the built-in roles give.
 	Permissions []Permission
 	// Sources are the sources the host owns, such as the one it syncs grants from a directory
-	// from: Apply refuses to grant or revoke from one, by ID too, so a tenant's admins can neither
-	// forge the host's grants nor remove them behind its back. The host makes and removes them
-	// with Import and DeleteGrants.
+	// from: Apply refuses to grant or revoke from one, by ID too, and DeleteRole to delete a role
+	// granted from one, so a tenant's admins can neither forge the host's grants nor remove them
+	// behind its back. The host makes and removes them with Import and DeleteGrants. A custom role
+	// the host grants stays the tenant's to define: redefining it changes what the host's grants
+	// give, as it does any grant of it, asking the host about those it widens.
 	Sources []string
 	// Attributes declares the attributes conditions read, so one misnamed or of another type is
 	// refused when a condition is stored; undeclared, any is read.
@@ -687,10 +690,10 @@ func vocabulary(declared []Permission, given map[Permission]bool, roleTypes map[
 // stricter one, whose snapshot can predate the locks they wait for. Their locks last until tx
 // ends, so two transactions that change the same scopes or principals in opposite orders can
 // deadlock, as with any row locks: PostgreSQL fails one, to be retried. DeleteTenant,
-// SetRole and DeleteRole lock the whole tenant, as does a change, Import or DeleteScopes that
-// would otherwise lock more than 64 scopes and principals. Make such a call the first change in
-// tx: after another, it waits for every change in the tenant while holding locks they may wait
-// for, and PostgreSQL fails one as a deadlock.
+// SetRole and DeleteRole lock the whole tenant, as does a change, Import, DeleteGrants or
+// DeleteScopes that would otherwise lock more than 64 scopes and principals. Make such a call the
+// first change in tx: after another, it waits for every change in the tenant while holding locks
+// they may wait for, and PostgreSQL fails one as a deadlock.
 func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 	b := *a
 	b.db = tx

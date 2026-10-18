@@ -1046,6 +1046,27 @@ func TestOnlyTheHostChangesTheSourcesItOwns(t *testing.T) {
 	}
 }
 
+func TestAnAdminCantFillTheBoundBeforeTheHostsGrants(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) { c.Sources = []string{"directory"} })
+	ctx := t.Context()
+	u := rbac.Principal{Kind: rbac.User, ID: "u"}
+	var fill []rbac.Binding
+	for i := range rbac.MaxGrantsPerRole {
+		fill = append(fill, rbac.Binding{Role: "cluster.login", Principal: u, ExpiresAt: h.now.Add(time.Duration(i+1) * time.Hour)})
+	}
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: fill}); err != nil {
+		t.Fatal(err)
+	}
+	more := rbac.Binding{Role: "cluster.login", Principal: u, ExpiresAt: h.now.Add(48 * time.Hour)}
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{more}}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("the admin's grant past the bound: %v", err)
+	}
+	synced := rbac.Grant{Scope: cluster.Scope(), Binding: rbac.Binding{Role: "cluster.login", Principal: u, Source: "directory"}}
+	if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{synced}); err != nil {
+		t.Fatalf("the host's grant beside an admin's filled bound: %v", err)
+	}
+}
+
 func TestDeletingARoleTheHostGrantsIsRefused(t *testing.T) {
 	h := setup(t, func(c *rbac.Config) { c.Sources = []string{"directory"} })
 	ctx := t.Context()
@@ -1067,6 +1088,17 @@ func TestDeletingARoleTheHostGrantsIsRefused(t *testing.T) {
 	}
 	if err := h.authz.DeleteRole(ctx, admin, "t1", op.ID); err != nil {
 		t.Fatalf("deleting it once the host removed its grants: %v", err)
+	}
+	// One the host granted only until a time that has passed gives nothing, and Grants lists none
+	// for the host to remove.
+	if err := h.authz.SetRole(ctx, admin, "t1", op); err != nil {
+		t.Fatal(err)
+	}
+	synced.ExpiresAt = h.now.Add(time.Hour)
+	h.seed(t, synced)
+	h.now = h.now.Add(2 * time.Hour)
+	if err := h.authz.DeleteRole(ctx, admin, "t1", op.ID); err != nil {
+		t.Fatalf("deleting a role the host granted only until a time that has passed: %v", err)
 	}
 }
 
