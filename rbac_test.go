@@ -4340,9 +4340,10 @@ func TestACheckSpendsABoundedBudgetOnConditions(t *testing.T) {
 	for i := range 20 {
 		g := fmt.Sprintf("g%02d", i)
 		groups = append(groups, g)
+		// The one that holds costs the most to compile, so it is evaluated last.
 		expr := costly
 		if i == 19 {
-			expr = "true"
+			expr = "true || " + costly
 		}
 		grants = append(grants, rbac.Grant{Scope: cluster.Scope(), Binding: rbac.Binding{
 			Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.Group, ID: g}, Condition: rbac.Condition{Expression: expr},
@@ -4352,9 +4353,108 @@ func TestACheckSpendsABoundedBudgetOnConditions(t *testing.T) {
 	if !allowed(t, h, user("one", "g19"), login, cluster) {
 		t.Fatal("a condition that holds should allow")
 	}
-	// Spent on the grants before it, the check never reaches the one that holds.
+	// Spent on the grants before it, the check never reaches the one that holds, and says so.
+	if d, err := h.authz.Explain(t.Context(), user("many", groups...), login, cluster); err != nil || d.Allowed || !strings.Contains(d.Reason, "cost more than a check may spend") {
+		t.Fatalf("Explain = %+v, %v", d, err)
+	}
 	if allowed(t, h, user("many", groups...), login, cluster) {
 		t.Fatal("a check should stop spending on conditions past its budget")
+	}
+}
+
+// longFalse is a condition close to MaxExpression bytes that is false for every subject but those
+// named contractor-i-*.
+func longFalse(i int) string {
+	var b strings.Builder
+	b.WriteString("subject.id in [")
+	for j := 0; ; j++ {
+		item := fmt.Sprintf("%q,", fmt.Sprintf("contractor-%d-%04d", i, j))
+		if b.Len()+len(item)+1 > rbac.MaxExpression-8 {
+			break
+		}
+		b.WriteString(item)
+	}
+	return strings.TrimSuffix(b.String(), ",") + "]"
+}
+
+func TestAPathsConditionalDeniesAreEvaluatedWhole(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"), grant(cluster.Scope(), "cluster.login", rbac.Members, "t1"))
+	deny := func(on rbac.Resource, id string, i int) error {
+		return h.authz.SetDeny(ctx, guardian, on, rbac.Deny{
+			ID: id, Principals: []rbac.Principal{rbac.TenantMembers("t1")},
+			Permissions: []rbac.Permission{login}, Condition: rbac.Condition{Expression: longFalse(i)},
+		})
+	}
+	// Three of the longest fit a scope; a fourth could leave a check's budget short of them, so it
+	// is refused rather than stored to deny everyone they name.
+	for i := range 3 {
+		// Each its own, as a check pays to compile each distinct condition once.
+		for j, on := range []rbac.Resource{cluster, workspace} {
+			if err := deny(on, fmt.Sprint("d", i), 10*j+i); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := deny(cluster, "d3", 3); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a scope's fourth long conditional deny: %v", err)
+	}
+	if err := deny(cluster, "d2", 4); err != nil {
+		t.Fatalf("replacing one of them: %v", err)
+	}
+	// Six on the cluster's path, false for these subjects, which a check evaluates whole.
+	for _, s := range []rbac.Subject{user("owner"), user("u")} {
+		if !allowed(t, h, s, login, cluster) {
+			t.Fatalf("%s denied by conditions that don't hold for it", s.Principal.ID)
+		}
+	}
+	if !allowed(t, h, user("contractor-1-0007"), view, cluster) || allowed(t, h, user("contractor-1-0007"), login, cluster) {
+		t.Fatal("a deny should bind whom its condition names")
+	}
+	// A deny whose condition can't be evaluated denies, and Explain says why.
+	if err := h.authz.SetDeny(ctx, guardian, cluster, rbac.Deny{
+		ID: "mfa", Principals: []rbac.Principal{{Kind: rbac.User, ID: "u"}},
+		Permissions: []rbac.Permission{login}, Condition: rbac.Condition{Expression: "request.attributes.mfa != true"},
+	}); err == nil {
+		t.Fatal("a scope's conditional denies past the bound should be refused")
+	}
+	if err := h.authz.SetDeny(ctx, guardian, workspace, rbac.Deny{
+		ID: "d0", Principals: []rbac.Principal{{Kind: rbac.User, ID: "u"}},
+		Permissions: []rbac.Permission{login}, Condition: rbac.Condition{Expression: "request.attributes.mfa != true"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := h.authz.Explain(ctx, user("u"), login, cluster); err != nil || d.Allowed || !strings.Contains(d.Reason, "couldn't be evaluated") {
+		t.Fatalf("Explain = %+v, %v", d, err)
+	}
+}
+
+func TestConditionalGrantsDecideWhateverTheirIDs(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	var xs []string
+	for i := range 90 {
+		xs = append(xs, fmt.Sprint(i))
+	}
+	list := "[" + strings.Join(xs, ",") + "]"
+	var grants []rbac.Grant
+	for i := range 19 {
+		grants = append(grants, rbac.Grant{Scope: cluster.Scope(), Binding: conditional("cluster.login", "u", fmt.Sprintf("%s.all(x, %s.all(y, x >= -%d)) && false", list, list, i))})
+	}
+	grants = append(grants, rbac.Grant{Scope: cluster.Scope(), Binding: conditional("cluster.login", "u", "true")})
+	h.seed(t, grants...)
+	// The grant that holds read first by id, then last: the cheapest is evaluated first either way.
+	for _, id := range []string{"00000000-0000-0000-0000-000000000000", "ffffffff-ffff-ffff-ffff-ffffffffffff"} {
+		if _, err := h.pool.Exec(ctx, `UPDATE rbac_grants SET id = $1 WHERE principal = 'user:u' AND condition = 'true'`, id); err != nil {
+			t.Fatal(err)
+		}
+		if !allowed(t, h, user("u"), login, cluster) {
+			t.Fatalf("with the grant that holds at %s, denied", id)
+		}
+		if perms, err := h.authz.Permissions(ctx, user("u"), cluster); err != nil || !slices.Contains(perms, login) {
+			t.Fatalf("Permissions = %v, %v", perms, err)
+		}
 	}
 }
 
@@ -4377,7 +4477,7 @@ func TestExplainSpendsTheBudgetAsAuthorizeDoes(t *testing.T) {
 			groups = append(groups, g)
 			scope, expr := cluster.Scope(), costly
 			if i == holds {
-				expr = "true"
+				expr = "true || " + costly
 			}
 			if (i == holds) == (holds == 0) {
 				scope = workspace

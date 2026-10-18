@@ -670,7 +670,11 @@ func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Re
 	if err := a.conditionsOf(ctx, q, on.Tenant, held); err != nil {
 		return authority{}, err
 	}
-	vars, spend := a.vars(ctx, actor, "", on), newBudget()
+	vars, spend, denySpend := a.vars(ctx, actor, "", on), newBudget(), newDenyBudget()
+	// The cheapest conditions first, as callers evaluate them in this order, so what a budget run
+	// out decides doesn't rest on ids.
+	held = slices.Clone(held)
+	slices.SortStableFunc(held, func(x, y holding) int { return cheaper(x.Condition.Expression, y.Condition.Expression) })
 	with := func(vars map[string]any, action Permission) map[string]any {
 		v := maps.Clone(vars)
 		v["action"] = string(action)
@@ -682,7 +686,7 @@ func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Re
 			if d, ok := denied[p]; ok {
 				return d
 			}
-			_, d := a.deniedBy(ds, p, spend, with(vars, p))
+			_, d := a.deniedBy(ds, p, denySpend, with(vars, p))
 			denied[p] = d
 			return d
 		}

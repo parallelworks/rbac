@@ -1,12 +1,14 @@
 package rbac
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"maps"
 	"regexp"
 	"regexp/syntax"
+	"strings"
 	"sync"
 
 	"cel.dev/cel-go/cel"
@@ -31,8 +33,11 @@ import (
 // A grant with one gives its role only where the expression is true. An expression that fails,
 // as one reading an attribute the host didn't pass does, is false. The zero Condition is none,
 // and one with a title or description has an expression. A pattern it matches is a string
-// literal, of bounded size. A check spends a bounded budget on conditions, compiling them
-// included: past it, what still needs one is refused.
+// literal, of bounded size. A check spends a bounded budget on its grants' conditions and another
+// on its denies', compiling them included: past it, a grant's condition is false and a deny's
+// applies, so what still needs one is refused. A check evaluates the cheapest first, so what it
+// decides doesn't rest on ids, and SetDeny bounds a scope's conditional denies together so that a
+// check always evaluates them whole.
 //
 // Searches (Filter, Reachable, Holders) can't evaluate one: they count only unconditional
 // grants, Filter and Holders count a conditional deny as denying, and Reach.Conditional and
@@ -60,6 +65,10 @@ const (
 	// included, so many conditional grants on one path can't make it slow: once it is spent, no
 	// further condition holds, and what needs one is refused.
 	maxCheckCost = 8 * maxCost
+	// maxDenyCost is what one check may spend on its denies' conditions, apart from what it spends
+	// on its grants', so neither leaves the other nothing. A scope's conditional denies cost at most
+	// maxCheckCost together (SetDeny), so a path with as many on four scopes is evaluated whole.
+	maxDenyCost = 4 * maxCheckCost
 	// compilePerByte is what compiling a condition costs for each byte of it: compiling one
 	// takes about as long as evaluating eight units of cost for each.
 	compilePerByte = 8
@@ -73,6 +82,16 @@ type budget struct {
 }
 
 func newBudget() *budget { return &budget{left: maxCheckCost, compiled: map[string]bool{}} }
+
+// newDenyBudget is a check's budget for its denies' conditions.
+func newDenyBudget() *budget { return &budget{left: maxDenyCost, compiled: map[string]bool{}} }
+
+// worstCost is the most a condition can cost a check: compiling it, and evaluating it to its bound.
+func worstCost(expr string) uint64 { return uint64(len(expr))*compilePerByte + maxCost }
+
+// cheaper orders conditions by what compiling them costs, then by their text, as the same
+// condition decides the same: a check evaluating them in this order decides whatever their ids.
+func cheaper(x, y string) int { return cmp.Or(cmp.Compare(len(x), len(y)), strings.Compare(x, y)) }
 
 func (b *budget) spend(cost uint64) { b.left -= min(cost, b.left) }
 
