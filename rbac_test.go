@@ -423,49 +423,72 @@ func TestListingsApplyConstraints(t *testing.T) {
 // listingsAgree checks Filter and Reachable against Authorize, resource by resource.
 func listingsAgree(t *testing.T, h *harness, resources []rbac.Resource, s rbac.Subject, p rbac.Permission) {
 	t.Helper()
+	want := allowedOf(t, h, resources, s, p)
+	if got := listed(t, h, s, p); !slices.Equal(got, want) {
+		t.Errorf("%v %s: Filter %v, Authorize %v", s.Principal, p, got, want)
+	}
+	if reached, _ := reachedBy(t, h, resources, s, p); !slices.Equal(reached, want) {
+		t.Errorf("%v %s: Reachable %v, Authorize %v", s.Principal, p, reached, want)
+	}
+}
+
+// allowedOf is the ids of the resources Authorize lets s do p to, in order.
+func allowedOf(t *testing.T, h *harness, resources []rbac.Resource, s rbac.Subject, p rbac.Permission) []string {
+	t.Helper()
+	var ids []string
+	for _, r := range resources {
+		if allowed(t, h, s, p, r) {
+			ids = append(ids, r.ID)
+		}
+	}
+	return ids
+}
+
+// listed is the ids of the rows of the clusters table that Filter keeps for s and p, in order.
+func listed(t *testing.T, h *harness, s rbac.Subject, p rbac.Permission) []string {
+	t.Helper()
 	pred, err := h.authz.Filter(t.Context(), s, p, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err := h.pool.Query(t.Context(), "SELECT id FROM clusters WHERE "+pred.SQL+" ORDER BY id", pred.Args...)
+	// Another tenant's rows are named with their tenant, so one Filter keeps shows even where t1
+	// has a cluster of the same id.
+	rows, err := h.pool.Query(t.Context(), `SELECT CASE tenant WHEN 't1' THEN id ELSE tenant || '/' || id END
+		FROM clusters WHERE `+pred.SQL+` ORDER BY 1`, pred.Args...)
 	if err != nil {
 		t.Fatalf("%s: %v", pred.SQL, err)
 	}
-	got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
 	if err != nil {
 		t.Fatal(err)
 	}
-	var want []string
-	for _, r := range resources {
-		if allowed(t, h, s, p, r) {
-			want = append(want, r.ID)
-		}
-	}
-	if !slices.Equal(got, want) {
-		t.Errorf("%v %s: Filter %v, Authorize %v", s.Principal, p, got, want)
-	}
+	return ids
+}
 
+// reachedBy is the ids of the resources a host listing by Reachable shows, reading Reach as it
+// says a host does, and of those it shows without checking them with Authorize.
+func reachedBy(t *testing.T, h *harness, resources []rbac.Resource, s rbac.Subject, p rbac.Permission) (reached, unchecked []string) {
+	t.Helper()
 	reach, err := h.authz.Reachable(t.Context(), s, p, "t1", "cluster")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var reached []string
 	for _, r := range resources {
-		// As Reach says a host reads it.
+		path := h.path(t, r)
 		holds := func(scopes []rbac.Scope) bool {
-			return slices.ContainsFunc(scopes, func(sc rbac.Scope) bool { return slices.Contains(h.path(t, r), sc.Key()) })
+			return slices.ContainsFunc(scopes, func(sc rbac.Scope) bool { return slices.Contains(path, sc.Key()) })
 		}
 		in := !holds(reach.Except) && (reach.All || holds(reach.Scopes) || holds(reach.Conditional))
 		if in && (holds(reach.Conditional) || holds(reach.ConditionalExcept)) {
 			in = allowed(t, h, s, p, r)
+		} else if in {
+			unchecked = append(unchecked, r.ID)
 		}
 		if in {
 			reached = append(reached, r.ID)
 		}
 	}
-	if !slices.Equal(reached, want) {
-		t.Errorf("%v %s: Reachable %v, Authorize %v", s.Principal, p, reached, want)
-	}
+	return reached, unchecked
 }
 
 func TestFilterOnATenantColumnThatIsNotText(t *testing.T) {
