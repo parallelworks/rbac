@@ -190,6 +190,10 @@ func TestNewRejectsBadConfiguration(t *testing.T) {
 		"a public privileged role": {Catalog: []rbac.RoleDefinition{{
 			ID: "r", Permissions: []rbac.Permission{root}, ResourceTypes: []string{"cluster"}, Privileged: true, Public: true,
 		}}, ValidateGrant: ok},
+		"the activation source": {Catalog: catalog, ValidateGrant: ok, Sources: []string{rbac.SourceActivation}},
+		"a reserved source":     {Catalog: catalog, ValidateGrant: ok, Sources: []string{"rbac.sync"}},
+		"a malformed source":    {Catalog: catalog, ValidateGrant: ok, Sources: []string{"Directory"}},
+		"no source":             {Catalog: catalog, ValidateGrant: ok, Sources: []string{""}},
 		"unnamed constraint": {Catalog: catalog, ValidateGrant: ok, Constraints: []rbac.Constraint{{
 			Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) { return true, nil },
 		}}},
@@ -940,6 +944,183 @@ func TestAHostsRefusalKeepsItsError(t *testing.T) {
 		if err, want := apply(id), "rbac: cluster.login for user:"+id+": not a member of the tenant"; !errors.Is(err, rbac.ErrInvalid) || err.Error() != want {
 			t.Errorf("a refusal %s: %q, want %q", id, err, want)
 		}
+	}
+}
+
+func TestOnlyTheHostChangesTheSourcesItOwns(t *testing.T) {
+	var asked []rbac.GrantInput
+	h := setup(t, func(c *rbac.Config) {
+		c.Sources = []string{"directory"}
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			asked = append(asked, in)
+			return validate(ctx, q, in)
+		}
+	})
+	ctx := t.Context()
+	u := rbac.Principal{Kind: rbac.User, ID: "u"}
+	synced := rbac.Binding{Role: "cluster.login", Principal: u, Source: "directory"}
+	h.seed(t, rbac.Grant{Scope: cluster.Scope(), Binding: synced})
+	stored, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{u}})
+	if err != nil || len(stored) != 1 {
+		t.Fatalf("Grants = %+v, %v", stored, err)
+	}
+	asked = nil
+	// The tenant's owner may change access on the cluster, but not the host's own grants.
+	forged := rbac.Binding{Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.User, ID: "v"}, Source: "directory"}
+	for name, c := range map[string]rbac.Change{
+		"granting from it":      {Grant: []rbac.Binding{forged}},
+		"revoking from it":      {Revoke: []rbac.Binding{synced}},
+		"revoking none from it": {Revoke: []rbac.Binding{{Role: synced.Role, Principal: forged.Principal, Source: "directory"}}},
+		"revoking one by ID":    {Revoke: []rbac.Binding{{ID: stored[0].ID, Role: synced.Role, Principal: u}}},
+		"a reserved source":     {Grant: []rbac.Binding{{Role: "cluster.login", Principal: u, Source: "rbac.sync"}}},
+	} {
+		if err := h.authz.Apply(ctx, user("owner"), cluster, c); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	// One who may not change access is refused as such, learning nothing of the host's sources.
+	if err := h.authz.Apply(ctx, user("nobody"), cluster, rbac.Change{Grant: []rbac.Binding{forged}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("granting from it without the power to: %v", err)
+	}
+	// A revoke by ID that names another principal matches no grant, so it isn't refused.
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Revoke: []rbac.Binding{{ID: stored[0].ID, Role: synced.Role, Principal: forged.Principal}}}); err != nil {
+		t.Errorf("revoking by ID with another principal: %v", err)
+	}
+	if !allowed(t, h, user("u"), login, cluster) || allowed(t, h, user("v"), view, cluster) || len(asked) != 0 {
+		t.Fatalf("the host's grant should stand and no other be made, asked %+v", asked)
+	}
+	if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: rbac.Binding{Role: "cluster.login", Principal: u, Source: "rbac.sync"}}}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("importing from a reserved source: %v", err)
+	}
+	// Grants from other sources change as before.
+	mine := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "w"}, Source: "tickets"}
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{mine}}); err != nil {
+		t.Fatal(err)
+	}
+	theirs, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{mine.Principal}})
+	if err != nil || len(theirs) != 1 {
+		t.Fatalf("Grants = %+v, %v", theirs, err)
+	}
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Revoke: []rbac.Binding{{ID: theirs[0].ID, Role: mine.Role, Principal: mine.Principal}}}); err != nil {
+		t.Fatalf("revoking by ID a grant from another source: %v", err)
+	}
+	if allowed(t, h, user("w"), login, cluster) {
+		t.Fatal("the revoke by ID should have removed the grant")
+	}
+	// The host removes its own, by source and by ID.
+	h.events = nil
+	if err := h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: synced}}); err != nil {
+		t.Fatal(err)
+	}
+	if allowed(t, h, user("u"), login, cluster) || len(h.events) != 1 || len(h.events[0].Revoked) != 1 || h.events[0].Actor != host {
+		t.Fatalf("DeleteGrants left the grant or reported %+v", h.events)
+	}
+	h.seed(t, rbac.Grant{Scope: cluster.Scope(), Binding: synced})
+	again, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{u}})
+	if err != nil || len(again) != 1 {
+		t.Fatalf("Grants = %+v, %v", again, err)
+	}
+	byID := rbac.Grant{Scope: cluster.Scope(), Binding: rbac.Binding{ID: again[0].ID, Role: synced.Role, Principal: u}}
+	if err := h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{byID}); err != nil || allowed(t, h, user("u"), login, cluster) {
+		t.Fatalf("DeleteGrants by ID: %v", err)
+	}
+	for name, g := range map[string]rbac.Grant{
+		"another tenant's scope": {Scope: rbac.TenantRoot("t2"), Binding: synced},
+		"no role":                {Scope: cluster.Scope(), Binding: rbac.Binding{Principal: u, Source: "directory"}},
+		"a malformed principal":  {Scope: cluster.Scope(), Binding: rbac.Binding{Role: synced.Role, Principal: rbac.Principal{Kind: rbac.User}, Source: "directory"}},
+	} {
+		if err := h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{g}); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("DeleteGrants %s: %v", name, err)
+		}
+	}
+	one := []rbac.Grant{{Scope: cluster.Scope(), Binding: synced}}
+	for name, err := range map[string]error{
+		"no tenant":       h.authz.DeleteGrants(ctx, host, "", one),
+		"a group actor":   h.authz.DeleteGrants(ctx, rbac.Principal{Kind: rbac.Group, ID: "g"}, "t1", one),
+		"too many grants": h.authz.DeleteGrants(ctx, host, "t1", slices.Repeat(one, rbac.MaxBindings+1)),
+	} {
+		if !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("DeleteGrants with %s: %v", name, err)
+		}
+	}
+}
+
+func TestAnAdminCantFillTheBoundBeforeTheHostsGrants(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) { c.Sources = []string{"directory"} })
+	ctx := t.Context()
+	u := rbac.Principal{Kind: rbac.User, ID: "u"}
+	var fill []rbac.Binding
+	for i := range rbac.MaxGrantsPerRole {
+		fill = append(fill, rbac.Binding{Role: "cluster.login", Principal: u, ExpiresAt: h.now.Add(time.Duration(i+1) * time.Hour)})
+	}
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: fill}); err != nil {
+		t.Fatal(err)
+	}
+	more := rbac.Binding{Role: "cluster.login", Principal: u, ExpiresAt: h.now.Add(48 * time.Hour)}
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{more}}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("the admin's grant past the bound: %v", err)
+	}
+	synced := rbac.Grant{Scope: cluster.Scope(), Binding: rbac.Binding{Role: "cluster.login", Principal: u, Source: "directory"}}
+	if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{synced}); err != nil {
+		t.Fatalf("the host's grant beside an admin's filled bound: %v", err)
+	}
+}
+
+func TestDeletingARoleTheHostGrantsIsRefused(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) { c.Sources = []string{"directory"} })
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	op := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(ctx, admin, "t1", op); err != nil {
+		t.Fatal(err)
+	}
+	synced := rbac.Grant{Scope: cluster.Scope(), Binding: rbac.Binding{Role: op.ID, Principal: rbac.Principal{Kind: rbac.User, ID: "u"}, Source: "directory"}}
+	h.seed(t, synced)
+	if err := h.authz.DeleteRole(ctx, admin, "t1", op.ID); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("deleting a role the host grants: %v", err)
+	}
+	if !allowed(t, h, user("u"), login, cluster) {
+		t.Fatal("a refused deletion revoked the host's grant")
+	}
+	if err := h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{synced}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.DeleteRole(ctx, admin, "t1", op.ID); err != nil {
+		t.Fatalf("deleting it once the host removed its grants: %v", err)
+	}
+	// One the host granted only until a time that has passed gives nothing, and Grants lists none
+	// for the host to remove.
+	if err := h.authz.SetRole(ctx, admin, "t1", op); err != nil {
+		t.Fatal(err)
+	}
+	synced.ExpiresAt = h.now.Add(time.Hour)
+	h.seed(t, synced)
+	h.now = h.now.Add(2 * time.Hour)
+	if err := h.authz.DeleteRole(ctx, admin, "t1", op.ID); err != nil {
+		t.Fatalf("deleting a role the host granted only until a time that has passed: %v", err)
+	}
+}
+
+func TestDeleteGrantsAcrossScopes(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	scopes := []rbac.Scope{cluster.Scope(), {Type: "workspace", ID: "w1"}, {Type: "org", ID: "o1"}}
+	var grants []rbac.Grant
+	for _, s := range scopes {
+		grants = append(grants, rbac.Grant{Scope: s, Binding: rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}, Source: "directory"}})
+	}
+	h.seed(t, grants...)
+	h.events = nil
+	if err := h.authz.DeleteGrants(ctx, host, "t1", grants); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.events) != 1 || len(h.events[0].Revoked) != len(scopes) {
+		t.Fatalf("events = %+v", h.events)
+	}
+	left, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{{Kind: rbac.User, ID: "u"}}})
+	if err != nil || len(left) != 0 {
+		t.Fatalf("Grants = %+v, %v", left, err)
 	}
 }
 

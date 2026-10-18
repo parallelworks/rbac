@@ -294,8 +294,10 @@ type Binding struct {
 	Principal Principal
 	// Source is where a grant comes from: empty when made directly, SourceActivation when
 	// activated from an eligibility, or a name the host gives the grants it manages, such as
-	// those it syncs from a directory, so that it revokes only its own. A source is lowercase
-	// letters, digits and . _ : / -, starting with a letter.
+	// those it syncs from a directory, so that it revokes only its own. A source the host owns
+	// (Config.Sources) only it changes, through Import and DeleteGrants. A source is lowercase
+	// letters, digits and . _ : / -, starting with a letter, and one starting rbac is reserved for
+	// the package.
 	Source string
 	// ExpiresAt ends it; zero never does.
 	ExpiresAt time.Time
@@ -428,7 +430,8 @@ func conflicted(err error) error {
 const (
 	// MaxBindings is how many bindings one Apply, grants and revokes together, or one Import takes,
 	// and MaxGrantsPerRole how many grants in force of one role a principal holds on one scope,
-	// differing by source, expiry or condition, as cloud IAM bounds bindings of one role.
+	// differing by source, expiry or condition, as cloud IAM bounds bindings of one role: those from
+	// each source the host owns (Config.Sources) counted apart.
 	MaxBindings      = 1000
 	MaxGrantsPerRole = 20
 	// MaxDenies is how many deny policies a scope holds, and MaxDenyEntries how many principals,
@@ -504,6 +507,13 @@ type Config struct {
 	// built-in roles give, `:grant` and `:deny` permissions and DefineRoles. Empty, they are what
 	// the built-in roles give.
 	Permissions []Permission
+	// Sources are the sources the host owns, such as the one it syncs grants from a directory
+	// from: Apply refuses to grant or revoke from one, by ID too, and DeleteRole to delete a role
+	// granted from one, so a tenant's admins can neither forge the host's grants nor remove them
+	// behind its back. The host makes and removes them with Import and DeleteGrants. A custom role
+	// the host grants stays the tenant's to define: redefining it changes what the host's grants
+	// give, as it does any grant of it, asking the host about those it widens.
+	Sources []string
 	// Attributes declares the attributes conditions read, so one misnamed or of another type is
 	// refused when a condition is stored; undeclared, any is read.
 	Attributes Attributes
@@ -523,6 +533,8 @@ type Authorizer struct {
 	// containerTypes are the containers' types, sorted.
 	containerTypes []string
 	kinds          map[PrincipalKind]bool
+	// owned are the sources the host owns (Config.Sources).
+	owned map[string]bool
 	// permissions and types are what the built-in roles give and are for: all a custom role
 	// may use. unprivileged are the permissions, each with a type, that a role that isn't
 	// privileged gives there: all a public role may give.
@@ -594,6 +606,13 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 			return nil, fmt.Errorf("rbac: constraint %q has no Deny", c.Name)
 		}
 	}
+	owned := map[string]bool{}
+	for _, src := range cfg.Sources {
+		if src == "" || src == SourceActivation || !validSource(src) || reservedSource(src) {
+			return nil, fmt.Errorf("rbac: source %q is not one the host can own", src)
+		}
+		owned[src] = true
+	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
@@ -633,7 +652,7 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 	}
 	return &Authorizer{
 		db: db, cfg: cfg, roles: roles, containers: containers, containerTypes: slices.Sorted(maps.Keys(containers)),
-		kinds: kinds, permissions: perms, types: resourceTypes, permissionTypes: permissionTypes, unprivileged: unprivileged,
+		kinds: kinds, owned: owned, permissions: perms, types: resourceTypes, permissionTypes: permissionTypes, unprivileged: unprivileged,
 		catalogPermissions: permList, catalogTypes: slices.Sorted(maps.Keys(resourceTypes)), publicPairs: pairs,
 		checked: checked, checkedTypes: checkedTypes, conds: conds,
 	}, nil
@@ -671,10 +690,10 @@ func vocabulary(declared []Permission, given map[Permission]bool, roleTypes map[
 // stricter one, whose snapshot can predate the locks they wait for. Their locks last until tx
 // ends, so two transactions that change the same scopes or principals in opposite orders can
 // deadlock, as with any row locks: PostgreSQL fails one, to be retried. DeleteTenant,
-// SetRole and DeleteRole lock the whole tenant, as does a change, Import or DeleteScopes that
-// would otherwise lock more than 64 scopes and principals. Make such a call the first change in
-// tx: after another, it waits for every change in the tenant while holding locks they may wait
-// for, and PostgreSQL fails one as a deadlock.
+// SetRole and DeleteRole lock the whole tenant, as does a change, Import, DeleteGrants or
+// DeleteScopes that would otherwise lock more than 64 scopes and principals. Make such a call the
+// first change in tx: after another, it waits for every change in the tenant while holding locks
+// they may wait for, and PostgreSQL fails one as a deadlock.
 func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 	b := *a
 	b.db = tx

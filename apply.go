@@ -86,9 +86,25 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 		if err != nil {
 			return ChangeEvent{}, err
 		}
+		// A revoke by ID removes a grant from any source: refusing one from a source the host owns
+		// rolls the removal back.
+		var owned []error
+		for _, g := range revoked {
+			if a.owned[g.Source] {
+				owned = append(owned, ownedRevoke(g.Binding))
+			}
+		}
+		if err := errors.Join(owned...); err != nil {
+			return ChangeEvent{}, err
+		}
 		granted, err := a.upsert(ctx, tx, on.Tenant, actor.Principal, scopeGrants(scope, grants))
 		return ChangeEvent{Granted: granted, Revoked: revoked}, err
 	})
+}
+
+// ownedRevoke refuses revoking a grant from a source the host owns, which only DeleteGrants removes.
+func ownedRevoke(b Binding) error {
+	return &InvalidError{Binding: b, Reason: "only the host revokes from " + b.Source + ", through DeleteGrants"}
 }
 
 // change makes a change to the grants on one scope as actor, or to eligibilities, which are
@@ -353,6 +369,9 @@ func (a *Authorizer) validate(ctx context.Context, roles book, actor Subject, vi
 	now := a.cfg.Now()
 	for _, b := range grants {
 		bad := append(a.checkBinding(roles, tenant, scope, b, now), a.checkCondition(b)...)
+		if a.owned[b.Source] {
+			bad = append(bad, &InvalidError{Binding: b, Reason: "only the host grants from " + b.Source + ", through Import"})
+		}
 		if len(bad) == 0 {
 			refused, err := a.allowed(ctx, roles, actor, via, tenant, scope, b)
 			if err != nil {
@@ -363,16 +382,27 @@ func (a *Authorizer) validate(ctx context.Context, roles book, actor Subject, vi
 		errs = append(errs, bad...)
 	}
 	for _, b := range revokes {
-		// A role no longer in the catalog, or a kind no longer declared, can still be revoked.
-		if !b.Principal.wellFormed(tenant) {
-			errs = append(errs, &InvalidError{Binding: b, Reason: "the principal is not valid"})
-		}
-		// No grant has no role, so a revoke without one, as by ID alone, would revoke nothing.
-		if b.Role == "" {
-			errs = append(errs, &InvalidError{Binding: b, Reason: "a revoke names its role, by ID too"})
+		errs = append(errs, checkRevoke(tenant, b)...)
+		// One by ID matches a grant from any source, so Apply checks the grant it removes instead.
+		if b.ID == "" && a.owned[b.Source] {
+			errs = append(errs, ownedRevoke(b))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// checkRevoke returns why a revoke can't name a grant in a tenant. A role no longer in the
+// catalog, or a kind no longer declared, can still be revoked.
+func checkRevoke(tenant string, b Binding) []error {
+	var errs []error
+	if !b.Principal.wellFormed(tenant) {
+		errs = append(errs, &InvalidError{Binding: b, Reason: "the principal is not valid"})
+	}
+	// No grant has no role, so a revoke without one, as by ID alone, would revoke nothing.
+	if b.Role == "" {
+		errs = append(errs, &InvalidError{Binding: b, Reason: "a revoke names its role, by ID too"})
+	}
+	return errs
 }
 
 // allowed asks Config.ValidateGrant about a grant, and returns why it refused, or the error that
@@ -437,8 +467,11 @@ func (a *Authorizer) checkBinding(roles book, tenant string, scope Scope, b Bind
 	if !validNote(b.Note) {
 		bad(fmt.Sprintf("a note is text of at most %d characters", MaxNote))
 	}
-	if !validSource(b.Source) {
+	switch {
+	case !validSource(b.Source):
 		bad("a source is lowercase letters, digits and . _ : / -, starting with a letter, of at most 63")
+	case reservedSource(b.Source):
+		bad("a source starting rbac is reserved for the package")
 	}
 	return errs
 }
@@ -446,6 +479,9 @@ func (a *Authorizer) checkBinding(roles book, tenant string, scope Scope, b Bind
 var sourceName = regexp.MustCompile(`^([a-z][a-z0-9._:/-]{0,62})?$`)
 
 func validSource(s string) bool { return sourceName.MatchString(s) }
+
+// reservedSource reports whether a source is one a later release may name for grants of its own.
+func reservedSource(s string) bool { return strings.HasPrefix(s, "rbac") }
 
 func validNote(s string) bool { return utf8.RuneCountInString(s) <= MaxNote && validText(s) }
 
@@ -1018,17 +1054,24 @@ func (a *Authorizer) bounded(ctx context.Context, tx pgx.Tx, tenant string, stor
 		return nil
 	}
 	n := len(stored)
-	scopes, principals, roles := make([]string, n), make([]string, n), make([]string, n)
+	scopes, principals, roles, buckets := make([]string, n), make([]string, n), make([]string, n), make([]string, n)
 	for i, g := range stored {
 		scopes[i], principals[i], roles[i] = g.Scope.Key(), g.Principal.key(), string(g.Role)
+		if a.owned[g.Source] {
+			buckets[i] = g.Source
+		}
 	}
+	// Grants from each source the host owns count apart from the rest, so a tenant's admins can't
+	// fill the bound to keep the host's own from being made, nor the host fill theirs.
 	rows, err := tx.Query(ctx, `
-		SELECT scope, principal, role FROM rbac_grants
-		WHERE tenant = $1 AND (scope, principal, role) IN (SELECT * FROM unnest($2::text[], $3::text[], $4::text[]))
-		  AND (expires_at IS NULL OR expires_at > $5)
-		GROUP BY scope, principal, role HAVING count(*) > $6
+		SELECT scope, principal, role FROM (
+		  SELECT scope, principal, role, CASE WHEN source = ANY($7::text[]) THEN source ELSE '' END AS bucket FROM rbac_grants
+		  WHERE tenant = $1 AND (scope, principal, role) IN (SELECT * FROM unnest($2::text[], $3::text[], $4::text[]))
+		    AND (expires_at IS NULL OR expires_at > $5)) g
+		WHERE (scope, principal, role, bucket) IN (SELECT * FROM unnest($2::text[], $3::text[], $4::text[], $8::text[]))
+		GROUP BY scope, principal, role, bucket HAVING count(*) > $6
 		ORDER BY scope, principal, role`,
-		tenant, scopes, principals, roles, a.cfg.Now(), MaxGrantsPerRole)
+		tenant, scopes, principals, roles, a.cfg.Now(), MaxGrantsPerRole, slices.Sorted(maps.Keys(a.owned)), buckets)
 	if err != nil {
 		return err
 	}
@@ -1052,6 +1095,26 @@ func (a *Authorizer) revoke(ctx context.Context, tx pgx.Tx, tenant string, scope
 	if len(bindings) == 0 {
 		return nil, nil
 	}
+	rows, err := tx.Query(ctx, revoking, revokeArgs(tenant, scope, bindings, kept)...)
+	if err != nil {
+		return nil, err
+	}
+	return collectGrants(rows)
+}
+
+const revoking = `
+	DELETE FROM rbac_grants g
+	WHERE tenant = $1 AND scope = $2
+	  AND EXISTS (SELECT FROM unnest($3::text[], $4::text[], $5::text[], $6::text[]) AS r(principal, role, source, id)
+	    WHERE r.principal = g.principal AND r.role = g.role AND (r.id = '' AND r.source = g.source OR r.id = g.id::text))
+	  AND NOT EXISTS (SELECT FROM unnest($7::text[], $8::text[], $9::text[], $10::timestamptz[], $11::text[])
+	    AS k(principal, role, source, expires_at, condition)
+	    WHERE k.principal = g.principal AND k.role = g.role AND k.source = g.source
+	      AND k.expires_at IS NOT DISTINCT FROM g.expires_at AND k.condition = g.condition)
+	RETURNING ` + grantColumns
+
+// revokeArgs are revoking's arguments.
+func revokeArgs(tenant string, scope Scope, bindings, kept []Binding) []any {
 	n := len(bindings)
 	principals, roles, sources, ids := make([]string, n), make([]string, n), make([]string, n), make([]string, n)
 	for i, b := range bindings {
@@ -1064,21 +1127,7 @@ func (a *Authorizer) revoke(ctx context.Context, tx pgx.Tx, tenant string, scope
 		keptPrincipals[i], keptRoles[i], keptSources[i] = b.Principal.key(), string(b.Role), b.Source
 		keptExpires[i], keptConditions[i] = pgtype.Timestamptz{Time: b.ExpiresAt, Valid: !b.ExpiresAt.IsZero()}, b.Condition.Expression
 	}
-	rows, err := tx.Query(ctx, `
-		DELETE FROM rbac_grants g
-		WHERE tenant = $1 AND scope = $2
-		  AND EXISTS (SELECT FROM unnest($3::text[], $4::text[], $5::text[], $6::text[]) AS r(principal, role, source, id)
-		    WHERE r.principal = g.principal AND r.role = g.role AND (r.id = '' AND r.source = g.source OR r.id = g.id::text))
-		  AND NOT EXISTS (SELECT FROM unnest($7::text[], $8::text[], $9::text[], $10::timestamptz[], $11::text[])
-		    AS k(principal, role, source, expires_at, condition)
-		    WHERE k.principal = g.principal AND k.role = g.role AND k.source = g.source
-		      AND k.expires_at IS NOT DISTINCT FROM g.expires_at AND k.condition = g.condition)
-		RETURNING `+grantColumns,
-		tenant, scope.Key(), principals, roles, sources, ids, keptPrincipals, keptRoles, keptSources, keptExpires, keptConditions)
-	if err != nil {
-		return nil, err
-	}
-	return collectGrants(rows)
+	return []any{tenant, scope.Key(), principals, roles, sources, ids, keptPrincipals, keptRoles, keptSources, keptExpires, keptConditions}
 }
 
 // GrantFilter picks grants or eligibilities by scope, by principal, or both; at least one is
@@ -1125,6 +1174,71 @@ func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) (
 		return nil, err
 	}
 	return collectGrants(rows)
+}
+
+// DeleteGrants revokes grants in a tenant as actor without the checks Apply makes of an actor: the
+// host's own counterpart of Import, for the grants it manages, such as those from a source it owns
+// (Config.Sources), which Apply can't change. Each names its scope and, as Change.Revoke does, its
+// role, principal and source, every grant of the role to the principal from the source there, or
+// with an ID that one grant. actor is who they are recorded as revoked by. It locks their scopes
+// and principals until the transaction ends, or past 64 the tenant, as Import does.
+func (a *Authorizer) DeleteGrants(ctx context.Context, actor Principal, tenant string, grants []Grant) error {
+	if tenant == "" {
+		return fmt.Errorf("%w: no tenant", ErrInvalid)
+	}
+	if err := a.identity(actor); err != nil {
+		return err
+	}
+	if len(grants) == 0 {
+		return nil
+	}
+	if len(grants) > MaxBindings {
+		return fmt.Errorf("%w: a deletion names at most %d grants", ErrInvalid, MaxBindings)
+	}
+	byScope, principals := map[Scope][]Binding{}, map[string]bool{}
+	var errs []error
+	for _, g := range grants {
+		if !g.Scope.in(tenant) {
+			errs = append(errs, &InvalidError{Binding: g.Binding, Reason: fmt.Sprintf("scope %q is not valid", g.Scope.Key())})
+			continue
+		}
+		errs = append(errs, checkRevoke(tenant, g.Binding)...)
+		byScope[g.Scope] = append(byScope[g.Scope], g.Binding)
+		principals[g.Principal.key()] = true
+	}
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	scopes := slices.SortedFunc(maps.Keys(byScope), func(x, y Scope) int { return strings.Compare(x.Key(), y.Key()) })
+	keys := make([]string, len(scopes))
+	for i, s := range scopes {
+		keys[i] = s.Key()
+	}
+	return a.inTx(ctx, tenant, actor, func(tx pgx.Tx) (ChangeEvent, error) {
+		if err := lockAll(ctx, tx, tenant, keys, slices.Collect(maps.Keys(principals))); err != nil {
+			return ChangeEvent{}, err
+		}
+		// One round trip for every scope, rather than one each while the locks are held.
+		b := &pgx.Batch{}
+		for _, s := range scopes {
+			b.Queue(revoking, revokeArgs(tenant, s, byScope[s], nil)...)
+		}
+		br := tx.SendBatch(ctx, b)
+		var e ChangeEvent
+		for range scopes {
+			rows, err := br.Query()
+			if err == nil {
+				var revoked []Grant
+				revoked, err = collectGrants(rows)
+				e.Revoked = append(e.Revoked, revoked...)
+			}
+			if err != nil {
+				_ = br.Close()
+				return ChangeEvent{}, err
+			}
+		}
+		return e, br.Close()
+	})
 }
 
 // DeleteScope removes every grant, eligibility and deny on a scope, as DeleteScopes does.
