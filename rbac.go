@@ -358,11 +358,21 @@ type ChangeEvent struct {
 	// Eligible are eligibilities set, as they are now; Ineligible, those ended.
 	Eligible   []Eligibility
 	Ineligible []Eligibility
+	// Memberships are tenant memberships set, as they are now; EndedMemberships, those ended.
+	Memberships      []Membership
+	EndedMemberships []Membership
+	// Groups are groups created or replaced, as they are now; DeletedGroups, those deleted.
+	Groups        []GroupDefinition
+	DeletedGroups []GroupDefinition
+	// Joined are members added to groups or changed, as they are now; Left, those removed.
+	Joined []Member
+	Left   []Member
 }
 
 func (e ChangeEvent) empty() bool {
 	return len(e.Granted)+len(e.Revoked)+len(e.Roles)+len(e.DeletedRoles)+len(e.Denies)+len(e.DeletedDenies)+
-		len(e.Eligible)+len(e.Ineligible) == 0
+		len(e.Eligible)+len(e.Ineligible)+len(e.Memberships)+len(e.EndedMemberships)+len(e.Groups)+len(e.DeletedGroups)+
+		len(e.Joined)+len(e.Left) == 0
 }
 
 // Constraint removes permissions as the host's own policy, above anything a tenant grants or
@@ -584,7 +594,7 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 	cfg.Constraints = slices.Clone(cfg.Constraints)
 	containers := map[string]bool{}
 	for _, t := range cfg.ContainerTypes {
-		if !validName(t) || t == TenantScope {
+		if !validName(t) || t == TenantScope || t == GroupScope {
 			return nil, fmt.Errorf("rbac: container type %q is not valid", t)
 		}
 		containers[t] = true

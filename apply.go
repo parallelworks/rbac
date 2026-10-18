@@ -1276,15 +1276,15 @@ func (a *Authorizer) DeleteScopes(ctx context.Context, actor Principal, tenant s
 		deletion{denies: "scope = ANY($2::text[])", where: "scope = ANY($2::text[])"}, keys)
 }
 
-// DeletePrincipal removes every grant and eligibility of a principal in a tenant, as actor, as
-// when an identity or group leaves it, or every grant to the public, as when a tenant stops
-// allowing public access.
+// DeletePrincipal removes every grant and eligibility of a principal in a tenant, as actor, and of
+// an identity its membership and its places in groups, as when it leaves the tenant; or every
+// grant to the public, as when a tenant stops allowing public access.
 func (a *Authorizer) DeletePrincipal(ctx context.Context, actor Principal, tenant string, p Principal) error {
 	if !p.wellFormed(tenant) {
 		return fmt.Errorf("%w: principal %q is not valid", ErrInvalid, p.key())
 	}
 	return a.delete(ctx, actor, tenant, func(tx pgx.Tx) error { return lock(ctx, tx, tenant, nil, []string{p.key()}) },
-		deletion{where: "principal = $2"}, p.key())
+		deletion{where: "principal = $2", members: "principal = $2"}, p.key())
 }
 
 // DeletePrincipalEverywhere removes every grant and eligibility of an identity or group in every
@@ -1307,7 +1307,9 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Pri
 		var n int
 		err := a.begin(ctx, func(tx pgx.Tx) error {
 			rows, err := tx.Query(ctx, `SELECT tenant FROM rbac_grants WHERE principal = $1
-				UNION SELECT tenant FROM rbac_eligibilities WHERE principal = $1 ORDER BY tenant LIMIT $2`, p.key(), batch)
+				UNION SELECT tenant FROM rbac_eligibilities WHERE principal = $1
+				UNION SELECT tenant FROM rbac_memberships WHERE principal = $1
+				UNION SELECT tenant FROM rbac_members WHERE principal = $1 ORDER BY tenant LIMIT $2`, p.key(), batch)
 			if err != nil {
 				return err
 			}
@@ -1329,7 +1331,18 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Pri
 				if err != nil {
 					return err
 				}
-				if err := a.report(ctx, tx, ChangeEvent{Tenant: t, Actor: actor, Revoked: revoked, Ineligible: ended}); err != nil {
+				left, err := removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, t, "principal = $2", p.key())
+				if err != nil {
+					return err
+				}
+				memberships, err := removed(ctx, a, tx, "rbac_memberships", membershipColumns, collectMemberships, t, "principal = $2", p.key())
+				if err != nil {
+					return err
+				}
+				if err := a.report(ctx, tx, ChangeEvent{
+					Tenant: t, Actor: actor, Revoked: revoked, Ineligible: ended,
+					Left: left, EndedMemberships: memberships,
+				}); err != nil {
 					return err
 				}
 			}
@@ -1341,19 +1354,20 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Pri
 	}
 }
 
-// DeleteTenant removes every grant, eligibility, custom role and deny in a tenant, as actor, so a
-// tenant created later with its id starts with none.
+// DeleteTenant removes every grant, eligibility, custom role, deny, membership and group in a
+// tenant, as actor, so a tenant created later with its id starts with none.
 func (a *Authorizer) DeleteTenant(ctx context.Context, actor Principal, tenant string) error {
 	return a.delete(ctx, actor, tenant, func(tx pgx.Tx) error { return lockTenant(ctx, tx, tenant) },
-		deletion{roles: true, denies: "TRUE", where: "TRUE"})
+		deletion{roles: true, groups: true, denies: "TRUE", where: "TRUE", members: "TRUE"})
 }
 
 // deletion is what a delete removes in a tenant: grants and eligibilities where picks, denies
-// where denies does (none when it is empty), and with roles its custom roles. Both read args
+// where denies does, and memberships of the tenant and of its groups where members does (none
+// where either is empty); with roles its custom roles, and with groups its groups. Each reads args
 // from $2.
 type deletion struct {
-	roles         bool
-	denies, where string
+	roles, groups          bool
+	denies, where, members string
 }
 
 // delete removes what del picks in a tenant as actor, once lock holds.
@@ -1384,6 +1398,23 @@ func (a *Authorizer) delete(ctx context.Context, actor Principal, tenant string,
 		}
 		if del.denies != "" {
 			if e.DeletedDenies, err = removed(ctx, a, tx, "rbac_denies", denyColumns, collectDenies, tenant, del.denies, args...); err != nil {
+				return ChangeEvent{}, err
+			}
+		}
+		if del.members != "" {
+			if e.Left, err = removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant, del.members, args...); err != nil {
+				return ChangeEvent{}, err
+			}
+			if e.EndedMemberships, err = removed(ctx, a, tx, "rbac_memberships", membershipColumns, collectMemberships, tenant, del.members, args...); err != nil {
+				return ChangeEvent{}, err
+			}
+		}
+		if del.groups {
+			rows, err := tx.Query(ctx, `DELETE FROM rbac_groups WHERE tenant = $1 RETURNING `+groupColumns, tenant)
+			if err != nil {
+				return ChangeEvent{}, err
+			}
+			if e.DeletedGroups, err = collectGroups(rows); err != nil {
 				return ChangeEvent{}, err
 			}
 		}
@@ -1433,5 +1464,17 @@ func (a *Authorizer) DeleteExpired(ctx context.Context) (int64, error) {
 	ended, err := a.db.Exec(ctx, `
 		DELETE FROM rbac_eligibilities WHERE id IN (
 			SELECT id FROM rbac_eligibilities WHERE expires_at <= $1 FOR UPDATE SKIP LOCKED)`, a.cfg.Now())
-	return tag.RowsAffected() + ended.RowsAffected(), err
+	if err != nil {
+		return 0, err
+	}
+	members, err := a.db.Exec(ctx, `
+		DELETE FROM rbac_members WHERE (tenant, group_id, principal, source) IN (
+			SELECT tenant, group_id, principal, source FROM rbac_members WHERE expires_at <= $1 FOR UPDATE SKIP LOCKED)`, a.cfg.Now())
+	if err != nil {
+		return 0, err
+	}
+	memberships, err := a.db.Exec(ctx, `
+		DELETE FROM rbac_memberships WHERE (tenant, principal) IN (
+			SELECT tenant, principal FROM rbac_memberships WHERE expires_at <= $1 FOR UPDATE SKIP LOCKED)`, a.cfg.Now())
+	return tag.RowsAffected() + ended.RowsAffected() + members.RowsAffected() + memberships.RowsAffected(), err
 }
