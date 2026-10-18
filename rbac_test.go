@@ -1580,6 +1580,59 @@ func TestDeleteScopeRemovesAGrantMadeWhileItWaits(t *testing.T) {
 	}
 }
 
+func TestDeleteScopesHoldsBoundedLocks(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	scopes := make([]rbac.Scope, 200)
+	var grants []rbac.Grant
+	for i := range scopes {
+		scopes[i] = rbac.Scope{Type: "cluster", ID: fmt.Sprintf("x%d", i)}
+		grants = append(grants, grant(scopes[i], "cluster.login", rbac.User, "u"))
+	}
+	h.seed(t, grants...)
+	locks := func(tx pgx.Tx) int {
+		var n int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'advisory'`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	for _, n := range []int{3, len(scopes)} {
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.events = nil
+		// As a host deleting a workspace and everything under it, in the transaction that deletes them.
+		if err := h.authz.WithTx(tx).DeleteScopes(ctx, host, "t1", scopes[:n]); err != nil {
+			t.Fatal(err)
+		}
+		// One lock for each scope and the tenant's shared, or past 64 the tenant's alone, held to the end.
+		want := n + 1
+		if n > 64 {
+			want = 1
+		}
+		if got := locks(tx); got != want {
+			t.Errorf("deleting %d scopes holds %d locks, want %d", n, got, want)
+		}
+		if len(h.events) != 1 || len(h.events[0].Revoked) != n {
+			t.Errorf("deleting %d scopes reported %+v", n, h.events)
+		}
+		if err := tx.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.authz.DeleteScopes(ctx, host, "t1", scopes); err != nil {
+		t.Fatal(err)
+	}
+	if gs, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{{Kind: rbac.User, ID: "u"}}}); err != nil || len(gs) != 0 {
+		t.Fatalf("grants left: %v, %v", gs, err)
+	}
+	if err := h.authz.DeleteScopes(ctx, host, "t1", []rbac.Scope{rbac.TenantRoot("t2")}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("another tenant's scope: %v", err)
+	}
+}
+
 func TestMigratingAtOnce(t *testing.T) {
 	files, err := fs.Glob(rbac.Migrations(), "*.sql")
 	if err != nil {

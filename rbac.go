@@ -663,7 +663,8 @@ func vocabulary(declared []Permission, given map[Permission]bool, roleTypes map[
 // stricter one, whose snapshot can predate the locks they wait for. Their locks last until tx
 // ends, so two transactions that change the same scopes or principals in opposite orders can
 // deadlock, as with any row locks: PostgreSQL fails one, to be retried. DeleteTenant,
-// SetRole and DeleteRole lock the whole tenant.
+// SetRole and DeleteRole lock the whole tenant, as does a change, Import or DeleteScopes that
+// would otherwise lock more than 64 scopes and principals.
 func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 	b := *a
 	b.db = tx
