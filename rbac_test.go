@@ -140,16 +140,32 @@ func constrain(name string, p rbac.Permission) func(*rbac.Config) {
 	}
 }
 
-// seed grants in t1, making the groups granted to first.
+// seed grants in t1, making the groups granted to first: privileged where a role granted them is.
 func (h *harness) seed(t *testing.T, grants ...rbac.Grant) {
 	t.Helper()
-	var groups []string
+	custom, err := h.authz.CustomRoles(t.Context(), "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	privileged := func(id rbac.Role) bool {
+		if r, ok := h.authz.BuiltinRole(id); ok {
+			return r.Privileged
+		}
+		i := slices.IndexFunc(custom, func(r rbac.RoleDefinition) bool { return r.ID == id })
+		return i >= 0 && custom[i].Privileged
+	}
+	var groups, strong []string
 	for _, g := range grants {
-		if g.Principal.Kind == rbac.Group {
+		switch {
+		case g.Principal.Kind != rbac.Group:
+		case privileged(g.Role):
+			strong = append(strong, g.Principal.ID)
+		default:
 			groups = append(groups, g.Principal.ID)
 		}
 	}
 	h.groups(t, groups...)
+	h.privileged(t, strong...)
 	if err := h.authz.Import(t.Context(), host, "t1", grants); err != nil {
 		t.Fatal(err)
 	}
@@ -159,6 +175,15 @@ func (h *harness) seed(t *testing.T, grants ...rbac.Grant) {
 func (h *harness) groups(t *testing.T, ids ...string) {
 	t.Helper()
 	if _, err := h.pool.Exec(t.Context(), `INSERT INTO rbac_groups (tenant, id) SELECT 't1', unnest($1::text[]) ON CONFLICT DO NOTHING`, ids); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// privileged makes groups in t1 privileged, as a test's setup, which only making them does after.
+func (h *harness) privileged(t *testing.T, ids ...string) {
+	t.Helper()
+	if _, err := h.pool.Exec(t.Context(), `INSERT INTO rbac_groups (tenant, id, privileged) SELECT DISTINCT 't1', unnest($1::text[]), true
+		ON CONFLICT (tenant, id) DO UPDATE SET privileged = true`, ids); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -2249,13 +2274,9 @@ func TestTenantMembersAndThePublicNeverGetAGrantPermission(t *testing.T) {
 				t.Fatal(err)
 			}
 			member := h.as(t, "member")
-			// A role that gives cluster:grant can't be public, so a grant of it to the public
-			// gives nothing at all.
-			others := 0
-			if p.Kind == rbac.Members {
-				others = 1
-			}
-			if allowed(t, h, member, root, cluster) != (others == 1) {
+			// A role that gives cluster:grant is privileged and can't be public, so a grant of it to
+			// either gives nothing at all.
+			if allowed(t, h, member, root, cluster) {
 				t.Fatal("the grant's other permissions")
 			}
 			if allowed(t, h, member, grantC, cluster) {
@@ -2282,7 +2303,7 @@ func TestTenantMembersAndThePublicNeverGetAGrantPermission(t *testing.T) {
 			if _, err := h.pool.Exec(ctx, `INSERT INTO cs VALUES ('t1', $1)`, h.path(t, cluster)); err != nil {
 				t.Fatal(err)
 			}
-			for perm, want := range map[rbac.Permission]int{root: others, grantC: 0} {
+			for _, perm := range []rbac.Permission{root, grantC} {
 				pred, err := h.authz.Filter(ctx, member, perm, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
 				if err != nil {
 					t.Fatal(err)
@@ -2291,8 +2312,8 @@ func TestTenantMembersAndThePublicNeverGetAGrantPermission(t *testing.T) {
 				if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM cs WHERE `+pred.SQL, pred.Args...).Scan(&n); err != nil {
 					t.Fatal(err)
 				}
-				if n != want {
-					t.Errorf("Filter %s: %d clusters, want %d", perm, n, want)
+				if n != 0 {
+					t.Errorf("Filter %s: %d clusters, want none", perm, n)
 				}
 			}
 			b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}}
@@ -2744,7 +2765,10 @@ func TestIdentitiesFromOtherTenants(t *testing.T) {
 	ctx := t.Context()
 	// A guest, such as from another tenant, in this one's group of partners.
 	partner := h.guest(t, "partner", "partners")
-	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.sudo", rbac.Members, "t1"))
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.Members, "t1"))
+	if allowed(t, h, partner, login, cluster) {
+		t.Fatal("another tenant's member is one of this tenant's members")
+	}
 	if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{
 		{Role: "cluster.login", Principal: partner.Principal},
 	}}); err != nil {
@@ -2753,10 +2777,7 @@ func TestIdentitiesFromOtherTenants(t *testing.T) {
 	if !allowed(t, h, partner, login, cluster) {
 		t.Fatal("a grant to another tenant's member should reach it")
 	}
-	if allowed(t, h, partner, root, cluster) {
-		t.Fatal("another tenant's member is one of this tenant's members")
-	}
-	h.groups(t, "partners")
+	h.privileged(t, "partners")
 	if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{
 		{Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.Group, ID: "partners"}},
 	}}); err != nil {
@@ -3382,27 +3403,6 @@ func TestPublicCustomRolesFollowTheCatalog(t *testing.T) {
 	}
 }
 
-func TestARoleListingItselfIsPrivilegedOnlyForWhatItIs(t *testing.T) {
-	h := setup(t, func(c *rbac.Config) {
-		c.Catalog = append(slices.Clone(c.Catalog), rbac.RoleDefinition{
-			ID: "workspace.owner", Permissions: []rbac.Permission{"workspace:view", "workspace:grant", "workspace:delete"}, ResourceTypes: []string{"workspace"}, Privileged: true,
-		})
-	})
-	ctx := t.Context()
-	admin := roleAdmin(t, h)
-	h.seed(t, grant(rbac.TenantRoot("t1"), "workspace.owner", rbac.User, "admin"))
-	r := rbac.RoleDefinition{ID: "custom.self", ResourceTypes: []string{"workspace"}, GrantableRoles: []rbac.Role{"custom.self"}}
-	for _, perms := range [][]rbac.Permission{{"workspace:view", "workspace:grant", "workspace:delete"}, {"workspace:view", "workspace:grant"}} {
-		r.Permissions = perms
-		if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if roles, err := h.authz.CustomRoles(ctx, "t1"); err != nil || len(roles) != 1 || roles[0].Privileged {
-		t.Fatalf("a role listing itself should stop being privileged with what made it so: %+v, %v", roles, err)
-	}
-}
-
 func TestDefiningRolesIsCanonicalBoundedAndMarksPrivilege(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -3630,53 +3630,45 @@ func TestRedefiningARoleForATypeAgainRespectsConstraints(t *testing.T) {
 	}
 }
 
-func TestARoleHandingOutOneThatBecomesPrivilegedIsPrivileged(t *testing.T) {
+func TestARoleThatChangesAccessIsPrivileged(t *testing.T) {
+	var asked []rbac.GrantInput
 	h := setup(t, func(c *rbac.Config) {
-		c.Catalog = append(slices.Clone(c.Catalog), rbac.RoleDefinition{
-			ID: "workspace.owner", Permissions: []rbac.Permission{"workspace:view", "workspace:grant", "workspace:delete"}, ResourceTypes: []string{"workspace"}, Privileged: true,
-		})
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			asked = append(asked, in)
+			return validate(ctx, q, in)
+		}
 	})
 	ctx := t.Context()
 	admin := roleAdmin(t, h)
-	h.seed(t, grant(rbac.TenantRoot("t1"), "workspace.owner", rbac.User, "admin"))
-	ws := []string{"workspace"}
-	plain := []rbac.Permission{"workspace:view", "workspace:grant"}
-	owner := []rbac.Permission{"workspace:view", "workspace:grant", "workspace:delete"}
-	b := rbac.RoleDefinition{ID: "custom.b", Permissions: plain, ResourceTypes: ws}
-	a := rbac.RoleDefinition{ID: "custom.a", Permissions: []rbac.Permission{"workspace:grant"}, ResourceTypes: ws, GrantableRoles: []rbac.Role{b.ID}}
-	privileged := func() []bool {
-		t.Helper()
-		roles, err := h.authz.CustomRoles(ctx, "t1")
-		if err != nil {
-			t.Fatal(err)
+	h.seed(t, grant(rbac.TenantRoot("t1"), "workspace.admin", rbac.User, "admin"))
+	// workspace.admin, though the catalog doesn't mark it, changes grants, as tenant.roles defines
+	// roles: managing access is privileged.
+	for _, id := range []rbac.Role{"workspace.admin", "tenant.roles"} {
+		if r, ok := h.authz.BuiltinRole(id); !ok || !r.Privileged {
+			t.Errorf("%s: %+v", id, r)
 		}
-		var flags []bool
-		for _, r := range roles {
-			flags = append(flags, r.Privileged)
-		}
-		return flags
 	}
-	define := func(d rbac.RoleDefinition) {
-		t.Helper()
-		if err := h.authz.SetRole(ctx, admin, "t1", d); err != nil {
+	lead := rbac.RoleDefinition{
+		ID: "custom.lead", Permissions: []rbac.Permission{"workspace:view", "workspace:grant"}, ResourceTypes: []string{"workspace"},
+		GrantableRoles: []rbac.Role{"custom.viewer"},
+	}
+	viewer := rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{"workspace:view"}, ResourceTypes: []string{"workspace"}}
+	for _, r := range []rbac.RoleDefinition{viewer, lead} {
+		if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
 			t.Fatal(err)
 		}
 	}
-	define(b)
-	define(a)
-	// b, which a lists, comes to give what only a privileged role gives, and lists a back.
-	b.Permissions, b.GrantableRoles = owner, []rbac.Role{a.ID}
-	define(b)
-	if got := privileged(); !slices.Equal(got, []bool{true, true}) {
-		t.Fatalf("a role handing out one that became privileged: %v", got)
+	roles, err := h.authz.CustomRoles(ctx, "t1")
+	if err != nil || len(roles) != 2 || !roles[0].Privileged || roles[1].Privileged {
+		t.Fatalf("CustomRoles = %+v, %v", roles, err)
 	}
-	// a, defined again while b is privileged, is stored privileged. Once b gives nothing
-	// privileged, a read clears both, whatever their stored flags say.
-	define(a)
-	b.Permissions = plain
-	define(b)
-	if got := privileged(); !slices.Equal(got, []bool{false, false}) {
-		t.Fatalf("roles listing each other, neither privileged: %v", got)
+	asked = nil
+	if err := h.authz.Apply(ctx, admin, workspace, rbac.Change{Grant: []rbac.Binding{{Role: lead.ID, Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(asked) != 1 || !asked[0].Role.Privileged {
+		t.Fatalf("asked = %+v", asked)
 	}
 }
 
@@ -3706,13 +3698,8 @@ func TestRedefiningARoleAsksTheHostAboutItsGrants(t *testing.T) {
 	admin := roleAdmin(t, h)
 	bot := h.member(t, rbac.Principal{Kind: robot, ID: "ci"})
 	op := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
-	// Hands op out on workspaces, and gives nothing privileged while op doesn't.
-	lead := rbac.RoleDefinition{ID: "custom.lead", Permissions: []rbac.Permission{"workspace:view", "workspace:grant"}, ResourceTypes: []string{"workspace"}, GrantableRoles: []rbac.Role{op.ID}}
-	h.seed(t, grant(rbac.TenantRoot("t1"), "workspace.admin", rbac.User, "admin"))
-	for _, r := range []rbac.RoleDefinition{op, lead} {
-		if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
-			t.Fatal(err)
-		}
+	if err := h.authz.SetRole(ctx, admin, "t1", op); err != nil {
+		t.Fatal(err)
 	}
 	if err := h.authz.Apply(ctx, admin, cluster, rbac.Change{Grant: []rbac.Binding{{Role: op.ID, Principal: bot.Principal}, {Role: op.ID, Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}}}); err != nil {
 		t.Fatal(err)
@@ -3745,22 +3732,7 @@ func TestRedefiningARoleAsksTheHostAboutItsGrants(t *testing.T) {
 	if err := h.authz.SetRole(ctx, admin, "t1", renamed); err != nil || len(asked) != 0 {
 		t.Fatalf("renaming: %v, asked %+v", err, asked)
 	}
-	// A role that hands op out becomes privileged once op gives root: granted to the service
-	// account, that refuses it too.
 	if err := h.authz.Apply(ctx, admin, cluster, rbac.Change{Revoke: []rbac.Binding{{Role: op.ID, Principal: bot.Principal}}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.authz.Apply(ctx, admin, workspace, rbac.Change{Grant: []rbac.Binding{{Role: lead.ID, Principal: bot.Principal}}}); err != nil {
-		t.Fatal(err)
-	}
-	asked = nil
-	if err := h.authz.SetRole(ctx, admin, "t1", widened); !errors.As(err, &ie) || ie.Binding.Role != lead.ID {
-		t.Fatalf("widening a role one a service account holds hands out: %v", err)
-	}
-	if !slices.ContainsFunc(asked, func(in rbac.GrantInput) bool { return in.Binding.Role == lead.ID && in.Role.Privileged }) {
-		t.Fatalf("asked = %+v", asked)
-	}
-	if err := h.authz.Apply(ctx, admin, workspace, rbac.Change{Revoke: []rbac.Binding{{Role: lead.ID, Principal: bot.Principal}}}); err != nil {
 		t.Fatal(err)
 	}
 	// A grant made while the redefinition waits wasn't asked about, so it refuses the redefinition,
@@ -3778,19 +3750,6 @@ func TestRedefiningARoleAsksTheHostAboutItsGrants(t *testing.T) {
 	}
 	if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_grants WHERE principal = 'service_account:ci'`); err != nil {
 		t.Fatal(err)
-	}
-	// So does a role handing op out redefined meanwhile: the host was asked about its grants as it
-	// was, not as it now is.
-	if err := h.authz.Apply(ctx, admin, workspace, rbac.Change{Grant: []rbac.Binding{{Role: lead.ID, Principal: rbac.Principal{Kind: rbac.User, ID: "l"}}}}); err != nil {
-		t.Fatal(err)
-	}
-	meanwhile = func(ctx context.Context, _ rbac.DB) error {
-		more := lead
-		more.GrantableRoles = []rbac.Role{op.ID, "cluster.login"}
-		return h.authz.SetRole(ctx, admin, "t1", more)
-	}
-	if err := h.authz.SetRole(ctx, admin, "t1", widened); !errors.Is(err, rbac.ErrConflict) {
-		t.Fatalf("a role handing it out redefined meanwhile: %v", err)
 	}
 	if err := h.authz.SetRole(ctx, admin, "t1", widened); err != nil {
 		t.Fatalf("widening a role only those the host lets hold root hold: %v", err)
@@ -3837,8 +3796,6 @@ func TestAGrantAskedAboutBeforeItsRoleIsRedefinedIsTriedAgain(t *testing.T) {
 	// widened to give root before its transaction: as another change would commit meanwhile.
 	var widenOn rbac.Via
 	op := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
-	// Hands op out, so it becomes privileged once op gives root.
-	lead := rbac.RoleDefinition{ID: "custom.lead", Permissions: []rbac.Permission{"workspace:view", "workspace:grant"}, ResourceTypes: []string{"workspace"}, GrantableRoles: []rbac.Role{op.ID}}
 	h = setup(t, func(c *rbac.Config) {
 		c.PrincipalKinds = []rbac.PrincipalKind{robot}
 		c.ValidateGrant = func(ctx context.Context, _ rbac.DB, in rbac.GrantInput) error {
@@ -3855,53 +3812,41 @@ func TestAGrantAskedAboutBeforeItsRoleIsRedefinedIsTriedAgain(t *testing.T) {
 		}
 	})
 	ctx := t.Context()
-	h.groups(t, "bots")
+	h.privileged(t, "bots")
 	admin = roleAdmin(t, h)
-	h.seed(t, grant(rbac.TenantRoot("t1"), "workspace.admin", rbac.User, "admin"))
-	for _, r := range []rbac.RoleDefinition{op, lead} {
-		if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
-			t.Fatal(err)
-		}
-	}
 	// Eligible through a group, which the host lets hold a privileged role, so redefining isn't
 	// refused for the eligibility; activating, the service account is.
 	bot := h.member(t, rbac.Principal{Kind: robot, ID: "ci"}, "bots")
-	// op itself, and lead, whose own definition doesn't change but which becomes privileged.
-	for _, granted := range []struct {
-		role rbac.Role
-		on   rbac.Resource
-	}{{op.ID, cluster}, {lead.ID, workspace}} {
-		b := rbac.Binding{Role: granted.role, Principal: bot.Principal}
-		for _, via := range []rbac.Via{rbac.ViaApply, rbac.ViaImport, rbac.ViaActivation} {
-			if err := h.authz.SetRole(ctx, admin, "t1", op); err != nil {
+	b := rbac.Binding{Role: op.ID, Principal: bot.Principal}
+	for _, via := range []rbac.Via{rbac.ViaApply, rbac.ViaImport, rbac.ViaActivation} {
+		if err := h.authz.SetRole(ctx, admin, "t1", op); err != nil {
+			t.Fatal(err)
+		}
+		if via == rbac.ViaActivation {
+			if err := h.authz.SetEligibility(ctx, admin, cluster, rbac.Eligibility{Role: op.ID, Principal: rbac.Principal{Kind: rbac.Group, ID: "bots"}, MaxDuration: time.Hour}); err != nil {
 				t.Fatal(err)
 			}
-			if via == rbac.ViaActivation {
-				if err := h.authz.SetEligibility(ctx, admin, granted.on, rbac.Eligibility{Role: granted.role, Principal: rbac.Principal{Kind: rbac.Group, ID: "bots"}, MaxDuration: time.Hour}); err != nil {
-					t.Fatal(err)
-				}
+		}
+		grantOne := func() error {
+			switch via {
+			case rbac.ViaApply:
+				return h.authz.Apply(ctx, admin, cluster, rbac.Change{Grant: []rbac.Binding{b}})
+			case rbac.ViaImport:
+				return h.authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: b}})
+			default:
+				_, err := h.authz.Activate(ctx, bot, cluster, rbac.Activation{Role: op.ID, Duration: time.Hour, Justification: "deploy"})
+				return err
 			}
-			grantOne := func() error {
-				switch via {
-				case rbac.ViaApply:
-					return h.authz.Apply(ctx, admin, granted.on, rbac.Change{Grant: []rbac.Binding{b}})
-				case rbac.ViaImport:
-					return h.authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: granted.on.Scope(), Binding: b}})
-				default:
-					_, err := h.authz.Activate(ctx, bot, granted.on, rbac.Activation{Role: granted.role, Duration: time.Hour, Justification: "deploy"})
-					return err
-				}
-			}
-			widenOn = via
-			if err := grantOne(); !errors.Is(err, rbac.ErrConflict) {
-				t.Fatalf("%s of %s once widened since the host was asked: %v", via, granted.role, err)
-			}
-			if held, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{bot.Principal}}); err != nil || len(held) > 0 {
-				t.Fatalf("%s of %s stored a grant the host was never asked about as it gives: %v, %+v", via, granted.role, err, held)
-			}
-			if err := grantOne(); !errors.Is(err, rbac.ErrInvalid) {
-				t.Fatalf("%s of %s tried again: %v", via, granted.role, err)
-			}
+		}
+		widenOn = via
+		if err := grantOne(); !errors.Is(err, rbac.ErrConflict) {
+			t.Fatalf("%s of %s once widened since the host was asked: %v", via, op.ID, err)
+		}
+		if held, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{bot.Principal}}); err != nil || len(held) > 0 {
+			t.Fatalf("%s of %s stored a grant the host was never asked about as it gives: %v, %+v", via, op.ID, err, held)
+		}
+		if err := grantOne(); !errors.Is(err, rbac.ErrInvalid) {
+			t.Fatalf("%s of %s tried again: %v", via, op.ID, err)
 		}
 	}
 }
@@ -5211,8 +5156,8 @@ func TestADenyCantExemptEveryoneItNames(t *testing.T) {
 	resources := hostTable(t, h)
 	named := rbac.Principal{Kind: rbac.User, ID: "named"}
 	h.seed(t,
-		grant(cluster.Scope(), "cluster.sudo", rbac.User, "named"),
-		grant(cluster.Scope(), "cluster.sudo", rbac.Members, "t1"),
+		grant(cluster.Scope(), "cluster.login", rbac.User, "named"),
+		grant(cluster.Scope(), "cluster.login", rbac.Members, "t1"),
 	)
 	public, members := rbac.Principal{Kind: rbac.Public}, rbac.TenantMembers("t1")
 	// Every subject is the public and every member the tenant's members, so these would bind no one.
@@ -5223,7 +5168,7 @@ func TestADenyCantExemptEveryoneItNames(t *testing.T) {
 		"members exempt from itself":           {Principals: []rbac.Principal{members}, Exempt: []rbac.Principal{members}},
 		"one both named and exempt":            {Principals: []rbac.Principal{named}, Exempt: []rbac.Principal{named}},
 	} {
-		d.ID, d.Permissions = "no-root", []rbac.Permission{root}
+		d.ID, d.Permissions = "no-login", []rbac.Permission{login}
 		if err := h.authz.SetDeny(ctx, guardian, cluster, d); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("%s: %v", name, err)
 		}
@@ -5232,19 +5177,19 @@ func TestADenyCantExemptEveryoneItNames(t *testing.T) {
 		t.Fatalf("a deny refused should not be stored: %v, %v", stored, err)
 	}
 	// Anyone but the tenant's members: only those who aren't.
-	d := rbac.Deny{ID: "members-only", Principals: []rbac.Principal{public}, Exempt: []rbac.Principal{members}, Permissions: []rbac.Permission{root}}
+	d := rbac.Deny{ID: "members-only", Principals: []rbac.Principal{public}, Exempt: []rbac.Principal{members}, Permissions: []rbac.Permission{login}}
 	if err := h.authz.SetDeny(ctx, guardian, cluster, d); err != nil {
 		t.Fatal(err)
 	}
-	h.seed(t, grant(cluster.Scope(), "cluster.sudo", rbac.User, "visitor"))
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "visitor"))
 	guest := h.guest(t, "visitor")
-	if !allowed(t, h, h.as(t, "named"), root, cluster) || allowed(t, h, guest, root, cluster) {
+	if !allowed(t, h, h.as(t, "named"), login, cluster) || allowed(t, h, guest, login, cluster) {
 		t.Fatal("a deny on the public exempting members should bind only those who aren't members")
 	}
-	listingsAgree(t, h, resources, h.as(t, "named"), root)
-	listingsAgree(t, h, resources, guest, root)
+	listingsAgree(t, h, resources, h.as(t, "named"), login)
+	listingsAgree(t, h, resources, guest, login)
 	// The grant to the members, exempt, gives it.
-	if holders, err := h.authz.Holders(ctx, root, cluster); err != nil || !slices.Contains(holderPrincipals(holders), members) {
+	if holders, err := h.authz.Holders(ctx, login, cluster); err != nil || !slices.Contains(holderPrincipals(holders), members) {
 		t.Fatalf("Holders = %v, %v", holders, err)
 	}
 }
@@ -5283,7 +5228,7 @@ func TestEligibleGrants(t *testing.T) {
 		Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.Group, ID: "oncall"}, MaxDuration: time.Hour,
 		Requires: `request.attributes.mfa == true`, Note: "on call",
 	}
-	h.groups(t, "oncall")
+	h.privileged(t, "oncall")
 	h.events = nil
 	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, oncall); err != nil {
 		t.Fatal(err)
@@ -5459,7 +5404,8 @@ func TestActivationsNeedTheirApprovers(t *testing.T) {
 		Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: time.Hour,
 		Approvers: []rbac.Principal{{Kind: rbac.Group, ID: "leads"}, {Kind: rbac.User, ID: "x"}},
 	}
-	h.groups(t, "leads", "sre")
+	h.groups(t, "leads")
+	h.privileged(t, "sre")
 	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, e); err != nil {
 		t.Fatal(err)
 	}

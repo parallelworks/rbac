@@ -137,6 +137,18 @@ func (p Principal) carries(role RoleDefinition, perm Permission) bool {
 	return p.Kind != Public || role.Public
 }
 
+// privilegedRoles keeps the privileged built-in roles, which a grant gives through only an
+// identity or a privileged group.
+func (a *Authorizer) privilegedRoles(roles []string) []string {
+	var privileged []string
+	for _, id := range roles {
+		if a.roles[Role(id)].Privileged {
+			privileged = append(privileged, id)
+		}
+	}
+	return privileged
+}
+
 // publicRoles keeps the built-in roles marked Public, the only built-in ones a grant to the
 // public gives.
 func (a *Authorizer) publicRoles(roles []string) []string {
@@ -200,7 +212,8 @@ var all = broad{public: true, members: true}
 // are the public; and while the identity is a member or guest of the tenant, not suspended, the
 // identity, the groups it is in, through those they are in, and unless it is a guest the tenant's
 // members. A group is counted once, so membership nested in a cycle stops. It defines bound(k)
-// too, the keys a deny binds or exempts it by (bound).
+// too, the keys a deny binds or exempts it by (bound), and strong(k), those of its keys through
+// which a privileged role gives anything: the identity and its privileged groups.
 func keysSQL(tenant, identity, now string) string {
 	return fmt.Sprintf(`membership AS (
 		SELECT guest FROM rbac_memberships WHERE tenant = %[1]s AND principal = %[2]s AND NOT suspended
@@ -218,8 +231,15 @@ func keysSQL(tenant, identity, now string) string {
 		UNION ALL SELECT 'group:' || id FROM groups
 	), bound(k) AS (
 		SELECT k FROM keys UNION SELECT %[2]s COLLATE "C" WHERE %[2]s <> ''
+	), strong(k) AS (
+		SELECT %[2]s COLLATE "C" FROM membership
+		UNION ALL SELECT 'group:' || g.id FROM groups g JOIN rbac_groups pg ON pg.tenant = %[1]s AND pg.id = g.id
+		WHERE pg.privileged
 	)`, tenant, identity, now)
 }
+
+// strongKeys is SQL selecting the strong keys keysSQL defines.
+const strongKeys = `SELECT k FROM strong`
 
 // bound is the keys a deny binds or exempts s by: its keys, and its identity even where it isn't a
 // member or guest, as a grant to the public still reaches it there.
@@ -242,14 +262,24 @@ func counted(public, members string) string {
 	return fmt.Sprintf(`(k <> 'public:' OR %s) AND (k NOT LIKE 'members:%%' OR %s)`, public, members)
 }
 
-// keysOf reads the principal keys s is in a tenant, sorted, as keysSQL defines them.
-func (a *Authorizer) keysOf(ctx context.Context, q DB, tenant string, s Subject) ([]string, error) {
-	rows, err := q.Query(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+` SELECT k FROM keys ORDER BY k`,
-		tenant, s.identityKey(), a.cfg.Now())
+// keysOf reads the principal keys s is in a tenant, sorted, as keysSQL defines them, and those of
+// them that are strong.
+func (a *Authorizer) keysOf(ctx context.Context, q DB, tenant string, s Subject) (keys, strong []string, err error) {
+	rows, err := q.Query(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`
+		SELECT k, k IN (`+strongKeys+`) FROM keys ORDER BY k`, tenant, s.identityKey(), a.cfg.Now())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return pgx.CollectRows(rows, pgx.RowTo[string])
+	var k string
+	var isStrong bool
+	_, err = pgx.ForEachRow(rows, []any{&k, &isStrong}, func() error {
+		keys = append(keys, k)
+		if isStrong {
+			strong = append(strong, k)
+		}
+		return nil
+	})
+	return keys, strong, err
 }
 
 // countedOf keeps the keys whose grants a read counts.
@@ -567,8 +597,8 @@ type Config struct {
 	// no grant gives. A check or search of a permission not among them, or of a resource type none
 	// of them nor any built-in role is for, is refused as invalid, as a typo, and New refuses a
 	// built-in role giving one: they include what the package checks for the host that the
-	// built-in roles give, `:grant` and `:deny` permissions, DefineRoles, ManageGroups and
-	// ManagePrivilegedGroups. Empty, they are what the built-in roles give.
+	// built-in roles give, `:grant` and `:deny` permissions, DefineRoles, ManageGroups,
+	// ManagePrivilegedGroups and GroupMembers. Empty, they are what the built-in roles give.
 	Permissions []Permission
 	// Sources are the sources the host owns, such as the one it syncs grants from a directory
 	// from: Apply refuses to grant or revoke from one, by ID too, and DeleteRole to delete a role
@@ -640,8 +670,10 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 	// The listings read the catalog in order: from the copies, so that a caller changing its
 	// slices after New can't make them disagree with checks or clear a Deny checked here.
 	catalog := make([]RoleDefinition, len(cfg.Catalog))
+	declared := make(map[Role]bool, len(cfg.Catalog))
 	for i, r := range cfg.Catalog {
 		catalog[i] = roles[r.ID]
+		declared[r.ID] = r.Privileged
 	}
 	cfg.Catalog = catalog
 	cfg.Constraints = slices.Clone(cfg.Constraints)
@@ -685,13 +717,18 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 			resourceTypes[t] = true
 			for _, p := range r.Permissions {
 				perms[p] = true
-				if !r.Privileged {
+				// A role privileged only because it changes access leaves its other permissions as
+				// they were.
+				if !declared[r.ID] && !p.managesAccess() {
 					unprivileged[permissionOn{p, t}] = true
 				}
 			}
 		}
 	}
-	var permList, pairs []string
+	var permList []string
+	// Empty, not nil, which pgx sends as NULL: `<> ALL(NULL)` is never true, so without an
+	// unprivileged pair, searches would read no custom role as privileged.
+	pairs := []string{}
 	permissionTypes := map[string]bool{}
 	for p := range perms {
 		permList = append(permList, string(p))
@@ -699,9 +736,7 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 		permissionTypes[t] = true
 	}
 	for k := range unprivileged {
-		if !k.p.managesAccess() {
-			pairs = append(pairs, string(k.p)+" "+k.t)
-		}
+		pairs = append(pairs, string(k.p)+" "+k.t)
 	}
 	slices.Sort(permList)
 	slices.Sort(pairs)
@@ -784,15 +819,18 @@ type Via string
 
 // The ways a grant is made: by Apply, Import or Activate, or as an eligibility SetEligibility
 // sets, which is the grant activating it would make. ViaRedefinition is a grant or eligibility
-// that exists, which SetRole redefining a custom role makes give more, its own or one handing it
-// out: an eligibility's binding is the grant activating it would make, as with ViaEligibility,
-// and has no ID.
+// that exists, which SetRole redefining its custom role makes give more: an eligibility's binding
+// is the grant activating it would make, as with ViaEligibility, and has no ID. ViaMembership is a
+// privileged group's grant or eligibility of a privileged role that an identity ChangeMembers or
+// ImportMembers adds to it gains, its binding naming the identity, with no ID, and ending when the
+// sooner of it and the membership does.
 const (
 	ViaApply        Via = "apply"
 	ViaImport       Via = "import"
 	ViaEligibility  Via = "eligibility"
 	ViaActivation   Via = "activation"
 	ViaRedefinition Via = "redefinition"
+	ViaMembership   Via = "membership"
 )
 
 // denied returns the name of the first constraint that removes in.Permission, or "".

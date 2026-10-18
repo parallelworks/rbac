@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/parallelworks/rbac"
 )
 
@@ -50,6 +52,7 @@ func newWorld(t *testing.T, seed uint64, conditional bool) world {
 	users := []string{"u0", "u1", "u2", "u3", "u4", "u5"}
 	groups := []string{"g0", "g1", "g2", "g3"}
 	h.groups(t, groups...)
+	h.privileged(t, "g0", "g1")
 	var grants []rbac.Grant
 	for i := range 20 {
 		ancestors := spaces[pick(len(spaces))]
@@ -115,10 +118,27 @@ func newWorld(t *testing.T, seed uint64, conditional bool) world {
 		}
 		grants = append(grants, g)
 	}
+	// A privileged role granted to the tenant's members or an ordinary group is refused, but one a
+	// catalog change made privileged stays stored, giving nothing: written directly, as it would be.
+	strong := func(g rbac.Grant) bool {
+		privileged := g.Role == "custom.root" || g.Role == "cluster.sudo" || g.Role == "cluster.admin"
+		return !privileged || g.Principal.Kind == rbac.User || g.Principal == rbac.Principal{Kind: rbac.Group, ID: "g0"} ||
+			g.Principal == rbac.Principal{Kind: rbac.Group, ID: "g1"}
+	}
+	for _, g := range grants {
+		if strong(g) {
+			continue
+		}
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at, condition)
+			VALUES ('t1', $1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING`, g.Scope.Type, g.Scope.ID, g.Principal.Kind, g.Principal.ID, g.Role,
+			pgtype.Timestamptz{Time: g.ExpiresAt, Valid: !g.ExpiresAt.IsZero()}, g.Condition.Expression); err != nil {
+			t.Fatal(err)
+		}
+	}
 	// Expired grants are stored as the clock passes them: import them before it does.
 	now := h.now
 	h.now = now.Add(-2 * time.Hour)
-	h.seed(t, grants...)
+	h.seed(t, slices.DeleteFunc(grants, func(g rbac.Grant) bool { return !strong(g) })...)
 	h.now = now
 	for i := range 4 {
 		d := rbac.Deny{ID: fmt.Sprint("d", i), Principals: []rbac.Principal{principal()}, Permissions: []rbac.Permission{[]rbac.Permission{login, root, "cluster:*"}[pick(3)]}}
