@@ -183,14 +183,20 @@ func TestAsOfRefusesASearchPathThatReadsTheTablesFirst(t *testing.T) {
 	}
 }
 
+// AsOf and a prune, which keeps each row's last version by its id, refuse ids a cache can take out
+// of order.
 func TestAsOfRefusesCachedHistoryIds(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
+	through := exported(t, h)
 	if _, err := h.pool.Exec(ctx, `ALTER TABLE rbac_history ALTER COLUMN id SET CACHE 2`); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.authz.AsOf(ctx, "t1", dbNow(t, h), func(*rbac.Authorizer) error { return nil }); !errors.Is(err, rbac.ErrInvalid) {
 		t.Errorf("AsOf with history's ids cached: %v", err)
+	}
+	if _, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h), through); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("PruneHistory with history's ids cached: %v", err)
 	}
 }
 

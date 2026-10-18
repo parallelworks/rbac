@@ -12,3 +12,11 @@ func SetSavepointEnd(t *testing.T, d time.Duration) {
 	savepointEnd = d
 	t.Cleanup(func() { savepointEnd = old })
 }
+
+// SetMaxPrune bounds what one PruneHistory deletes to n until t ends.
+func SetMaxPrune(t *testing.T, n int) {
+	t.Helper()
+	old := maxPrune
+	maxPrune = n
+	t.Cleanup(func() { maxPrune = old })
+}
