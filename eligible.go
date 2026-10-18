@@ -173,7 +173,7 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 	}
 	scope := on.Scope()
 	b := Binding{Role: act.Role, Principal: s.Principal, Source: SourceActivation, Note: act.Justification}
-	if err := a.changing(ctx, s, on); err != nil {
+	if err := a.changing(s, on, a.constrain(ctx, s, on)); err != nil {
 		return Grant{}, err
 	}
 	// Bounded before eligible rounds it up to seconds, which near the largest Duration overflows.

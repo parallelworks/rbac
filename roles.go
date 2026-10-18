@@ -502,10 +502,7 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 	}
 	seen := map[string]bool{}
 	if p, ok := a.holdsRole(au, *r, r.ResourceTypes, "", seen); !ok {
-		reason := fmt.Sprintf("the actor can't define %s without holding %s here", r.ID, p)
-		if name := cs.removedBy(p); name != "" {
-			reason = fmt.Sprintf("the actor can't define %s while %s removes %s from it", r.ID, name, p)
-		}
+		reason := cs.refusal("define "+string(r.ID), p, fmt.Sprintf("the actor can't define %s without holding %s here", r.ID, p))
 		return authority{}, cmp.Or(cs.failed(), error(&DeniedError{Permission: p, Scope: scope, Reason: reason}))
 	}
 	// A role that lists r lets its holders grant r as it will be wherever it can be granted, a
@@ -522,7 +519,8 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 				continue
 			}
 			if missing, ok := a.mayGrant(au, au.under(t, ""), t, *r, "", seen); !ok {
-				return authority{}, cmp.Or(cs.failed(), error(&DeniedError{Permission: missing, Scope: scope, Reason: fmt.Sprintf("the actor can't define %s, which %s lists, without the power to grant it on a %s", r.ID, id, t)}))
+				reason := cs.refusal("define "+string(r.ID), missing, fmt.Sprintf("the actor can't define %s, which %s lists, without the power to grant it on a %s", r.ID, id, t))
+				return authority{}, cmp.Or(cs.failed(), error(&DeniedError{Permission: missing, Scope: scope, Reason: reason}))
 			}
 		}
 	}

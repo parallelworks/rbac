@@ -712,7 +712,8 @@ func TestConstraintsBindWhatAnActorHandsOn(t *testing.T) {
 	}
 	// Defining a role hands on what it gives, to every holder of it.
 	withRoot := rbac.RoleDefinition{ID: "custom.root", Permissions: []rbac.Permission{view, root}, ResourceTypes: []string{"cluster"}}
-	if err := h.authz.SetRole(ctx, bot, "t1", withRoot); !errors.Is(err, rbac.ErrDenied) {
+	var denied *rbac.DeniedError
+	if err := h.authz.SetRole(ctx, bot, "t1", withRoot); !errors.As(err, &denied) || !strings.Contains(denied.Reason, "no root for service accounts") {
 		t.Fatalf("defining a role giving root: %v", err)
 	}
 	op := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}

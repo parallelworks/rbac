@@ -98,10 +98,10 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, via
 	check func() error, write func(pgx.Tx) (ChangeEvent, error),
 ) error {
 	scope := on.Scope()
-	if err := a.changing(ctx, actor, on); err != nil {
+	cs := a.constrain(ctx, actor, on)
+	if err := a.changing(actor, on, cs); err != nil {
 		return err
 	}
-	cs := a.constrain(ctx, actor, on)
 	au, err := a.mayChange(ctx, a.db, actor, on, grants, revokes, cs)
 	if err != nil {
 		return err
@@ -145,8 +145,9 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, via
 // changing refuses a change to grants on a scope of a type the host doesn't have, as a typo no
 // actor could hold `<type>:grant` on, by an anonymous actor, or one a constraint on
 // `<type>:grant` stops. The constraints run outside the transaction: one that queries the pool
-// while the transaction holds a connection can wait forever on a busy pool.
-func (a *Authorizer) changing(ctx context.Context, actor Subject, on Resource) error {
+// while the transaction holds a connection can wait forever on a busy pool. Asked through cs, so
+// handing on that power on the same scope reads the answer rather than asking again.
+func (a *Authorizer) changing(actor Subject, on Resource, cs *constrained) error {
 	if err := a.scopeOf(on); err != nil {
 		return err
 	}
@@ -154,12 +155,8 @@ func (a *Authorizer) changing(ctx context.Context, actor Subject, on Resource) e
 	if actor.Principal == (Principal{}) {
 		return &DeniedError{Permission: manage, Scope: on.Scope(), Reason: "an anonymous subject changes nothing"}
 	}
-	name, err := a.denied(ctx, ConstraintInput{Tenant: on.Tenant, ResourceType: on.Type, Permission: manage, Subject: &actor, Resource: &on})
-	if err != nil {
-		return err
-	}
-	if name != "" {
-		return &DeniedError{Permission: manage, Scope: on.Scope(), Reason: "removed by " + name}
+	if cs.removes(manage, on.Type) {
+		return cmp.Or(cs.failed(), error(&DeniedError{Permission: manage, Scope: on.Scope(), Reason: "removed by " + cs.removedBy(manage)}))
 	}
 	return nil
 }
@@ -540,7 +537,9 @@ func (c *constrained) removes(p Permission, resourceType string) bool {
 	if c.err != nil {
 		return true
 	}
-	name, err := c.a.denied(c.ctx, ConstraintInput{Tenant: c.on.Tenant, ResourceType: resourceType, Permission: p, Subject: &c.actor, Resource: &c.on})
+	// Copies, so a hook that changes what it is asked about can't change what later ones are.
+	actor, on := c.actor, c.on
+	name, err := c.a.denied(c.ctx, ConstraintInput{Tenant: on.Tenant, ResourceType: resourceType, Permission: p, Subject: &actor, Resource: &on})
 	if err != nil {
 		c.err = err
 	}
@@ -557,6 +556,14 @@ func (c *constrained) removedBy(p Permission) string {
 		return ""
 	}
 	return c.by[p]
+}
+
+// refusal is why the actor can't do what, lacking p: the constraint that removed p, or otherwise.
+func (c *constrained) refusal(what string, p Permission, otherwise string) string {
+	if name := c.removedBy(p); name != "" {
+		return fmt.Sprintf("the actor can't %s while %s removes %s from it", what, name, p)
+	}
+	return otherwise
 }
 
 // failed returns what asking the constraints failed with, or a conflict where the transaction
@@ -664,8 +671,12 @@ func (au authority) over(scopeType string) power {
 // under is the power the actor may hand on with condition, as holds counts permissions: a power
 // held under a condition can't be handed on without it, nor one a constraint removes.
 func (au authority) under(scopeType, condition string) power {
-	removed := func(p Permission) bool { return au.handsOn(p) || au.constrained.removes(p, scopeType) }
-	return au.power(scopeType, removed, func(g holding) bool { return g.under(condition) })
+	pw := au.power(scopeType, au.handsOn, func(g holding) bool { return g.under(condition) })
+	// Asked only of a power the actor holds, as each ask calls the hooks.
+	if !pw.none() && au.constrained.removes(GrantPermission(scopeType), scopeType) {
+		return power{listed: map[Role][]string{}}
+	}
+	return pw
 }
 
 func (au authority) power(scopeType string, denied func(Permission) bool, counts func(holding) bool) power {
@@ -813,14 +824,12 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 			continue
 		}
 		if p, ok := a.mayGrant(au, pw, scope.Type, def, b.Condition.Expression, map[string]bool{}); !ok {
-			reason := fmt.Sprintf("the actor can't grant %s without holding %s here", b.Role, p)
+			reason := cs.refusal("grant "+string(b.Role), p, fmt.Sprintf("the actor can't grant %s without holding %s here", b.Role, p))
 			switch {
 			case !pw.any && len(pw.listed[b.Role]) > 0:
 				reason = fmt.Sprintf("the actor may grant %s here only under the condition of a grant that lists it", b.Role)
 			case !pw.any:
 				reason = fmt.Sprintf("the actor may not grant %s here", b.Role)
-			case cs.removedBy(p) != "":
-				reason = fmt.Sprintf("the actor can't grant %s while %s removes %s from it", b.Role, cs.removedBy(p), p)
 			}
 			errs = append(errs, &DeniedError{Permission: p, Scope: scope, Reason: reason})
 		}
@@ -843,9 +852,9 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 	if err := a.subject(s); err != nil {
 		return nil, err
 	}
-	name, err := a.denied(ctx, ConstraintInput{Tenant: r.Tenant, ResourceType: r.Type, Permission: GrantPermission(r.Type), Subject: &s, Resource: &r})
-	if err != nil || name != "" {
-		return nil, err
+	cs := a.constrain(ctx, s, r)
+	if cs.removes(GrantPermission(r.Type), r.Type) {
+		return nil, cs.failed()
 	}
 	keys := s.principals(r.Tenant)
 	held, ds, err := a.heldOrDenied(ctx, a.db, r.Tenant, keys, keys, r.path(), "")
@@ -861,7 +870,6 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 	if err != nil {
 		return nil, err
 	}
-	cs := a.constrain(ctx, s, r)
 	au.constrained = cs
 	pw := au.over(r.Type)
 	if pw.none() {
