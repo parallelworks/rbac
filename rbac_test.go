@@ -39,6 +39,16 @@ var catalog = []rbac.RoleDefinition{
 	{ID: "tenant.roles", Permissions: []rbac.Permission{rbac.DefineRoles}, ResourceTypes: []string{"tenant"}},
 }
 
+// declaring is what a host declares it checks (Config.Permissions): more, and everything roles
+// give.
+func declaring(roles []rbac.RoleDefinition, more ...rbac.Permission) []rbac.Permission {
+	ps := slices.Clone(more)
+	for _, r := range roles {
+		ps = append(ps, r.Permissions...)
+	}
+	return ps
+}
+
 // A cluster in workspace w1 of org o1. setup grants "owner" its admin role, as a host does
 // for whoever creates one.
 var cluster = rbac.Resource{
@@ -183,6 +193,9 @@ func TestNewRejectsBadConfiguration(t *testing.T) {
 		"unnamed constraint": {Catalog: catalog, ValidateGrant: ok, Constraints: []rbac.Constraint{{
 			Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) { return true, nil },
 		}}},
+		// A built-in role naming a permission the host never checks is a typo in the catalog.
+		"a built-in role giving a permission not declared": {Catalog: catalog, Permissions: []rbac.Permission{view, login, root}, ValidateGrant: ok},
+		"a malformed declared permission":                  {Catalog: catalog, Permissions: declaring(catalog, "login"), ValidateGrant: ok},
 	} {
 		if _, err := rbac.New(&pgxpool.Pool{}, cfg); err == nil {
 			t.Errorf("%s: New accepted it", name)
@@ -496,6 +509,97 @@ func TestHolders(t *testing.T) {
 	got, err = h.authz.Holders(t.Context(), login, cluster)
 	if err != nil || len(got) != 4 {
 		t.Errorf("Holders(login) = %v, %v", got, err)
+	}
+}
+
+func TestAMisspelledPermissionOrTypeIsInvalid(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	misspelled := cluster
+	misspelled.Type = "clutser"
+	u := rbac.Principal{Kind: rbac.User, ID: "u"}
+	cols := rbac.Columns{Tenant: "tenant", Path: "path"}
+	for name, ask := range map[string]func() error{
+		"a permission":         func() error { return h.authz.Authorize(ctx, user("owner"), "cluster:lgoin", cluster) },
+		"a type":               func() error { return h.authz.Authorize(ctx, user("owner"), login, misspelled) },
+		"a permission Explain": func() error { _, err := h.authz.Explain(ctx, user("owner"), "cluster:lgoin", cluster); return err },
+		"a type Explain":       func() error { _, err := h.authz.Explain(ctx, user("owner"), login, misspelled); return err },
+		"a permission Holders": func() error { _, err := h.authz.Holders(ctx, "cluster:lgoin", cluster); return err },
+		"a type Holders":       func() error { _, err := h.authz.Holders(ctx, login, misspelled); return err },
+		"a permission Reachable": func() error {
+			_, err := h.authz.Reachable(ctx, user("owner"), "cluster:lgoin", "t1", "cluster")
+			return err
+		},
+		"a type Reachable": func() error {
+			_, err := h.authz.Reachable(ctx, user("owner"), login, "t1", "clutser")
+			return err
+		},
+		"a permission Filter": func() error {
+			_, err := h.authz.Filter(ctx, user("owner"), "cluster:lgoin", "t1", "cluster", cols, 1)
+			return err
+		},
+		"a type Filter": func() error {
+			_, err := h.authz.Filter(ctx, user("owner"), login, "t1", "clutser", cols, 1)
+			return err
+		},
+		"a type Permissions": func() error { _, err := h.authz.Permissions(ctx, user("owner"), misspelled); return err },
+		"a type Grantable":   func() error { _, err := h.authz.Grantable(ctx, user("owner"), misspelled); return err },
+		"the anonymous":      func() error { return h.authz.Authorize(ctx, rbac.Subject{}, "cluster:lgoin", cluster) },
+		"a type Apply": func() error {
+			return h.authz.Apply(ctx, user("owner"), misspelled, rbac.Change{Revoke: []rbac.Binding{{Role: "cluster.login", Principal: u}}})
+		},
+		"a type SetDeny": func() error {
+			return h.authz.SetDeny(ctx, user("owner"), misspelled, rbac.Deny{ID: "d", Principals: []rbac.Principal{u}, Permissions: []rbac.Permission{login}})
+		},
+		"a type DeleteDeny": func() error { return h.authz.DeleteDeny(ctx, user("owner"), misspelled, "d") },
+		"a type SetEligibility": func() error {
+			return h.authz.SetEligibility(ctx, user("owner"), misspelled, rbac.Eligibility{Role: "cluster.login", Principal: u})
+		},
+		"a type DeleteEligibility": func() error {
+			return h.authz.DeleteEligibility(ctx, user("owner"), misspelled, "cluster.login", u)
+		},
+		"a type Activate": func() error {
+			_, err := h.authz.Activate(ctx, user("u"), misspelled, rbac.Activation{Role: "cluster.login", Duration: time.Hour, Justification: "on call"})
+			return err
+		},
+	} {
+		if err := ask(); !errors.Is(err, rbac.ErrInvalid) || errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("%s misspelled: %v", name, err)
+		}
+	}
+	// A permission no built-in role gives on a type can still be asked about there: a custom role
+	// may give it, as it gives any permission the catalog has, on any type it has.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+		VALUES ('t1', 'custom.ws-login', '{cluster:login}', '{workspace}')`); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(workspace.Scope(), "custom.ws-login", rbac.User, "u"))
+	if !allowed(t, h, user("u"), login, workspace) {
+		t.Fatal("a permission a custom role gives on a type no built-in role gives it on")
+	}
+	// What a container is can be asked even where no role is for its type.
+	if perms, err := h.authz.Permissions(ctx, user("owner"), rbac.Resource{Tenant: "t1", Type: "org", ID: "o1"}); err != nil || len(perms) != 0 {
+		t.Fatalf("Permissions on a container no role is for = %v, %v", perms, err)
+	}
+}
+
+func TestTheHostDeclaresThePermissionsItChecks(t *testing.T) {
+	// The host checks storage:mount, which its catalog, configured by an operator, leaves out.
+	h := setup(t, func(c *rbac.Config) { c.Permissions = declaring(c.Catalog, "storage:mount") })
+	ctx := t.Context()
+	storage := rbac.Resource{Tenant: "t1", Type: "storage", ID: "s1", Ancestors: cluster.Ancestors}
+	if err := h.authz.Authorize(ctx, user("owner"), "storage:mount", storage); !errors.Is(err, rbac.ErrDenied) || errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a permission the host checks that no role gives: %v", err)
+	}
+	pred, err := h.authz.Filter(ctx, user("owner"), "storage:mount", "t1", "storage", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil || pred.SQL != "FALSE" {
+		t.Fatalf("Filter = %+v, %v", pred, err)
+	}
+	if holders, err := h.authz.Holders(ctx, "storage:mount", storage); err != nil || len(holders) != 0 {
+		t.Fatalf("Holders = %v, %v", holders, err)
+	}
+	if err := h.authz.Authorize(ctx, user("owner"), "storage:mnt", storage); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a permission the host doesn't check: %v", err)
 	}
 }
 
@@ -2572,8 +2676,9 @@ func TestCustomRolesFollowTheCatalog(t *testing.T) {
 	for i, r := range without {
 		without[i].Permissions = slices.DeleteFunc(slices.Clone(r.Permissions), func(p rbac.Permission) bool { return p == root })
 	}
+	// It still checks root, which no role gives now.
 	later, err := rbac.New(h.pool, rbac.Config{
-		Catalog: without, ContainerTypes: []string{"org", "workspace"},
+		Catalog: without, ContainerTypes: []string{"org", "workspace"}, Permissions: declaring(without, root),
 		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
 	})
 	if err != nil {
@@ -2595,6 +2700,21 @@ func TestCustomRolesFollowTheCatalog(t *testing.T) {
 	}
 	if holders, err := later.Holders(ctx, root, resources[0]); err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.User, ID: "op"}) {
 		t.Fatalf("Holders = %v, %v", holders, err)
+	}
+	if perms, err := later.Permissions(ctx, user("op"), cluster); err != nil || slices.Contains(perms, root) {
+		t.Fatalf("Permissions = %v, %v", perms, err)
+	}
+	// A host that doesn't say what it checks checks what the catalog gives, so asking about root is
+	// a mistake, as asking about a misspelled permission is.
+	undeclared, err := rbac.New(h.pool, rbac.Config{
+		Catalog: without, ContainerTypes: []string{"org", "workspace"},
+		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := undeclared.Authorize(ctx, user("op"), root, cluster); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a permission the catalog dropped and the host doesn't declare: %v", err)
 	}
 	if roles, err := later.CustomRoles(ctx, "t1"); err != nil || len(roles) != 1 || slices.Contains(roles[0].Permissions, root) {
 		t.Fatalf("CustomRoles = %+v, %v", roles, err)

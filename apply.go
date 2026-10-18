@@ -139,10 +139,14 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, via
 	})
 }
 
-// changing refuses a change to grants on a scope by an anonymous actor, or one a constraint on
+// changing refuses a change to grants on a scope of a type the host doesn't have, as a typo no
+// actor could hold `<type>:grant` on, by an anonymous actor, or one a constraint on
 // `<type>:grant` stops. The constraints run outside the transaction: one that queries the pool
 // while the transaction holds a connection can wait forever on a busy pool.
 func (a *Authorizer) changing(ctx context.Context, actor Subject, on Resource) error {
+	if err := a.scopeOf(on); err != nil {
+		return err
+	}
 	manage := GrantPermission(on.Type)
 	if actor.Principal == (Principal{}) {
 		return &DeniedError{Permission: manage, Scope: on.Scope(), Reason: "an anonymous subject changes nothing"}
@@ -740,6 +744,9 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 // the tenant's custom ones, for an access screen to offer.
 func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]RoleDefinition, error) {
 	if err := a.check(r); err != nil {
+		return nil, err
+	}
+	if err := a.scopeOf(r); err != nil {
 		return nil, err
 	}
 	if err := a.subject(s); err != nil {
