@@ -7,8 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/parallelworks/rbac"
 )
 
@@ -41,17 +39,17 @@ func newWorld(t *testing.T, seed uint64, conditional bool) world {
 	if _, err := h.pool.Exec(ctx, `CREATE TABLE clusters (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL)`); err != nil {
 		t.Fatal(err)
 	}
+	users := []string{"u0", "u1", "u2", "u3", "u4", "u5"}
+	groups := []string{"g0", "g1", "g2", "g3"}
+	var grants []rbac.Grant
 	for i := range 20 {
-		var ancestors []rbac.Scope
-		switch k := pick(5); {
-		case k == 0:
+		ancestors := spaces[pick(len(spaces))]
+		if pick(5) == 0 {
 			ancestors = []rbac.Scope{orgs[pick(len(orgs))]}
-		case k > 0:
-			ancestors = spaces[pick(len(spaces))]
 		}
 		env := []string{"dev", "prod"}[pick(2)]
 		for _, tenant := range []string{"t1", "t2"} {
-			r := rbac.Resource{Tenant: tenant, Type: "cluster", ID: fmt.Sprint("c", i), Ancestors: ancestors, Attributes: map[string]any{"env": env}}
+			r := rbac.Resource{Tenant: tenant, Type: "cluster", ID: fmt.Sprintf("c%02d", i), Ancestors: ancestors, Attributes: map[string]any{"env": env}}
 			if _, err := h.pool.Exec(ctx, `INSERT INTO clusters VALUES ($1, $2, $3)`, r.Tenant, r.ID, h.path(t, r)); err != nil {
 				t.Fatal(err)
 			}
@@ -59,14 +57,17 @@ func newWorld(t *testing.T, seed uint64, conditional bool) world {
 				w.clusters = append(w.clusters, r)
 			}
 		}
+		// Most are u0's, who holds the admin role a host gives creators on each: more grants on
+		// clusters than Filter overlaps with a path, so it also takes the form that looks them up.
+		if pick(3) > 0 {
+			grants = append(grants, grant(w.clusters[i].Scope(), "cluster.admin", rbac.User, users[0]))
+		}
 	}
-	// Custom roles: one narrower than a built-in role, one that gives root alone.
+	// Custom roles: one narrower than a built-in role, one that gives root without login.
 	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES
 		('t1', 'custom.view', '{cluster:view}', '{cluster}'), ('t1', 'custom.root', '{cluster:view,cluster:root}', '{cluster}')`); err != nil {
 		t.Fatal(err)
 	}
-	users := []string{"u0", "u1", "u2", "u3", "u4", "u5"}
-	groups := []string{"g0", "g1", "g2", "g3"}
 	principal := func() rbac.Principal {
 		switch k := pick(10); {
 		case k < 5:
@@ -88,7 +89,6 @@ func newWorld(t *testing.T, seed uint64, conditional bool) world {
 		return rbac.TenantRoot("t1")
 	}
 	roles := []rbac.Role{"cluster.login", "cluster.sudo", "cluster.admin", "custom.view", "custom.root"}
-	var grants []rbac.Grant
 	for range 30 {
 		g := rbac.Grant{Scope: scope(), Binding: rbac.Binding{Role: roles[pick(len(roles))], Principal: principal()}}
 		// The tenant's members can't hold a role that changes access.
@@ -122,9 +122,13 @@ func newWorld(t *testing.T, seed uint64, conditional bool) world {
 		if conditional && pick(2) == 0 {
 			d.Condition = rbac.Condition{Expression: []string{`resource.attributes.env == "prod"`, `request.attributes.mfa != true`}[pick(2)]}
 		}
-		on := rbac.Resource{Tenant: "t1", Type: "workspace", ID: spaces[i][0].ID, Ancestors: spaces[i][1:]}
-		if pick(3) == 0 {
-			on = rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}
+		on := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}
+		switch pick(4) {
+		case 0:
+			on = w.clusters[pick(len(w.clusters))]
+		case 1, 2:
+			space := spaces[pick(len(spaces))]
+			on = rbac.Resource{Tenant: "t1", Type: "workspace", ID: space[0].ID, Ancestors: space[1:]}
 		}
 		if err := h.authz.SetDeny(ctx, guardian, on, d); err != nil {
 			t.Fatal(err)
@@ -138,8 +142,9 @@ func newWorld(t *testing.T, seed uint64, conditional bool) world {
 			}
 		}
 		// Most are the tenant's members; one in four is a guest from another.
-		if pick(4) > 0 {
-			s.Tenants = []string{"t1"}
+		s.Tenants = []string{"t1"}
+		if pick(4) == 0 {
+			s.Tenants = []string{"t2"}
 		}
 		w.subjects = append(w.subjects, s)
 	}
@@ -148,40 +153,25 @@ func newWorld(t *testing.T, seed uint64, conditional bool) world {
 }
 
 // TestListingsAgreeWithChecksInRandomTenants builds tenants at random and checks, for every subject
-// and permission, that Filter lists exactly what Authorize allows, or with conditions involved
-// never more, and that Reachable, read as a host reads it, agrees with Authorize.
+// and permission, that Reachable, read as a host reads it, agrees with Authorize, asking for
+// checks only where a condition is, and that Filter lists what Authorize allows, leaving out only
+// what Reachable says to check.
 func TestListingsAgreeWithChecksInRandomTenants(t *testing.T) {
 	for seed := range uint64(12) {
 		t.Run(fmt.Sprint("seed", seed), func(t *testing.T) {
 			w := newWorld(t, seed, seed%2 == 1)
-			ctx := t.Context()
 			for _, s := range w.subjects {
-				for _, p := range []rbac.Permission{view, root} {
-					var want []string
-					for _, r := range w.clusters {
-						if allowed(t, w.h, s, p, r) {
-							want = append(want, r.ID)
-						}
-					}
-					pred, err := w.h.authz.Filter(ctx, s, p, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
-					if err != nil {
-						t.Fatal(err)
-					}
-					rows, err := w.h.pool.Query(ctx, "SELECT id FROM clusters WHERE "+pred.SQL, pred.Args...)
-					if err != nil {
-						t.Fatalf("%s: %v", pred.SQL, err)
-					}
-					got, err := pgx.CollectRows(rows, pgx.RowTo[string])
-					if err != nil {
-						t.Fatal(err)
-					}
-					slices.SortFunc(got, byNumber)
-					extra := slices.DeleteFunc(slices.Clone(got), func(id string) bool { return slices.Contains(want, id) })
-					if len(extra) > 0 || !w.conditional && !slices.Equal(got, want) {
-						t.Errorf("%+v %s: Filter %v, Authorize %v", s, p, got, want)
-					}
-					if reached := w.reached(t, s, p); !slices.Equal(reached, want) {
+				for _, p := range []rbac.Permission{view, login, root} {
+					want := allowedOf(t, w.h, w.clusters, s, p)
+					reached, unchecked := reachedBy(t, w.h, w.clusters, s, p)
+					if !slices.Equal(reached, want) {
 						t.Errorf("%+v %s: Reachable %v, Authorize %v", s, p, reached, want)
+					}
+					if !w.conditional && !slices.Equal(unchecked, reached) {
+						t.Errorf("%+v %s: Reachable checks some of %v, unchecked %v, with no conditions", s, p, reached, unchecked)
+					}
+					if got := listed(t, w.h, s, p); !within(got, want) || !within(unchecked, got) {
+						t.Errorf("%+v %s: Filter %v, Authorize %v, Reachable unchecked %v", s, p, got, want, unchecked)
 					}
 				}
 			}
@@ -189,35 +179,7 @@ func TestListingsAgreeWithChecksInRandomTenants(t *testing.T) {
 	}
 }
 
-// reached is what a host listing by Reachable shows: the clusters its scopes reach, checking each
-// it says to check.
-func (w world) reached(t *testing.T, s rbac.Subject, p rbac.Permission) []string {
-	t.Helper()
-	reach, err := w.h.authz.Reachable(t.Context(), s, p, "t1", "cluster")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var reached []string
-	for _, r := range w.clusters {
-		path := w.h.path(t, r)
-		holds := func(scopes []rbac.Scope) bool {
-			return slices.ContainsFunc(scopes, func(sc rbac.Scope) bool { return slices.Contains(path, sc.Key()) })
-		}
-		in := !holds(reach.Except) && (reach.All || holds(reach.Scopes) || holds(reach.Conditional))
-		if in && (holds(reach.Conditional) || holds(reach.ConditionalExcept)) {
-			in = allowed(t, w.h, s, p, r)
-		}
-		if in {
-			reached = append(reached, r.ID)
-		}
-	}
-	return reached
-}
-
-// byNumber orders cluster ids c0, c1, … c19 as the world made them.
-func byNumber(x, y string) int {
-	var i, j int
-	_, _ = fmt.Sscanf(x, "c%d", &i)
-	_, _ = fmt.Sscanf(y, "c%d", &j)
-	return i - j
+// within reports whether every one of xs is in ys.
+func within(xs, ys []string) bool {
+	return !slices.ContainsFunc(xs, func(x string) bool { return !slices.Contains(ys, x) })
 }
