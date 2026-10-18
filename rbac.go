@@ -664,7 +664,9 @@ func vocabulary(declared []Permission, given map[Permission]bool, roleTypes map[
 // ends, so two transactions that change the same scopes or principals in opposite orders can
 // deadlock, as with any row locks: PostgreSQL fails one, to be retried. DeleteTenant,
 // SetRole and DeleteRole lock the whole tenant, as does a change, Import or DeleteScopes that
-// would otherwise lock more than 64 scopes and principals.
+// would otherwise lock more than 64 scopes and principals. Make such a call the first change in
+// tx: after another, it waits for every change in the tenant while holding locks they may wait
+// for, and PostgreSQL fails one as a deadlock.
 func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 	b := *a
 	b.db = tx

@@ -1543,40 +1543,49 @@ func TestConcurrentChangesToAScopeAllCommit(t *testing.T) {
 }
 
 func TestDeleteScopeRemovesAGrantMadeWhileItWaits(t *testing.T) {
-	h := setup(t)
-	ctx := t.Context()
-	tx, err := h.pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}
-	if err := h.authz.WithTx(tx).Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- h.authz.DeleteScope(ctx, host, "t1", cluster.Scope()) }()
-	// Commit only once DeleteScope has either finished or is waiting on the scope's lock.
-	for waiting := false; !waiting; {
-		select {
-		case err := <-done:
-			done <- err
-			waiting = true
-		default:
-			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
-				WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE '%/rbac/%')`).Scan(&waiting); err != nil {
+	// With 64 other scopes, the delete waits on the tenant's lock rather than the scope's.
+	for _, others := range []int{0, 64} {
+		t.Run(fmt.Sprint(others), func(t *testing.T) {
+			h := setup(t)
+			ctx := t.Context()
+			scopes := []rbac.Scope{cluster.Scope()}
+			for i := range others {
+				scopes = append(scopes, rbac.Scope{Type: "cluster", ID: fmt.Sprintf("x%d", i)})
+			}
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
 				t.Fatal(err)
 			}
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	if allowed(t, h, user("u"), login, cluster) {
-		t.Fatal("a grant made while its scope was deleted outlived the delete")
+			defer func() { _ = tx.Rollback(ctx) }()
+			b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}
+			if err := h.authz.WithTx(tx).Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- h.authz.DeleteScopes(ctx, host, "t1", scopes) }()
+			// Commit only once DeleteScopes has either finished or is waiting on a lock.
+			for waiting := false; !waiting; {
+				select {
+				case err := <-done:
+					done <- err
+					waiting = true
+				default:
+					if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+						WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE '%/rbac/%')`).Scan(&waiting); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if allowed(t, h, user("u"), login, cluster) {
+				t.Fatal("a grant made while its scope was deleted outlived the delete")
+			}
+		})
 	}
 }
 
@@ -1597,26 +1606,31 @@ func TestDeleteScopesHoldsBoundedLocks(t *testing.T) {
 		}
 		return n
 	}
-	for _, n := range []int{3, len(scopes)} {
+	for _, c := range []struct {
+		scopes         []rbac.Scope
+		locks, revoked int
+	}{
+		// One lock for each scope and the tenant's shared, or past 64 the tenant's alone, held to the end.
+		{scopes[:3], 4, 3},
+		// A scope listed again, as on the paths of resources under one container, is locked once.
+		{slices.Repeat(scopes[:3], 30), 4, 3},
+		{scopes, 1, len(scopes)},
+	} {
 		tx, err := h.pool.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer func() { _ = tx.Rollback(ctx) }()
 		h.events = nil
 		// As a host deleting a workspace and everything under it, in the transaction that deletes them.
-		if err := h.authz.WithTx(tx).DeleteScopes(ctx, host, "t1", scopes[:n]); err != nil {
+		if err := h.authz.WithTx(tx).DeleteScopes(ctx, host, "t1", c.scopes); err != nil {
 			t.Fatal(err)
 		}
-		// One lock for each scope and the tenant's shared, or past 64 the tenant's alone, held to the end.
-		want := n + 1
-		if n > 64 {
-			want = 1
+		if got := locks(tx); got != c.locks {
+			t.Errorf("deleting %d scopes holds %d locks, want %d", len(c.scopes), got, c.locks)
 		}
-		if got := locks(tx); got != want {
-			t.Errorf("deleting %d scopes holds %d locks, want %d", n, got, want)
-		}
-		if len(h.events) != 1 || len(h.events[0].Revoked) != n {
-			t.Errorf("deleting %d scopes reported %+v", n, h.events)
+		if len(h.events) != 1 || len(h.events[0].Revoked) != c.revoked {
+			t.Errorf("deleting %d scopes reported %+v", len(c.scopes), h.events)
 		}
 		if err := tx.Rollback(ctx); err != nil {
 			t.Fatal(err)
@@ -1630,6 +1644,9 @@ func TestDeleteScopesHoldsBoundedLocks(t *testing.T) {
 	}
 	if err := h.authz.DeleteScopes(ctx, host, "t1", []rbac.Scope{rbac.TenantRoot("t2")}); !errors.Is(err, rbac.ErrInvalid) {
 		t.Fatalf("another tenant's scope: %v", err)
+	}
+	if err := h.authz.DeleteScopes(ctx, rbac.Principal{}, "t1", nil); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("no scopes as no one: %v", err)
 	}
 }
 

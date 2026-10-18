@@ -1026,8 +1026,8 @@ func (a *Authorizer) DeleteScope(ctx context.Context, actor Principal, tenant st
 // with every scope the deletion removes, a container's and those under it. It waits for changes
 // to the scopes in progress, so a grant one makes is removed too.
 //
-// It locks each scope until the transaction ends, or past maxLocks the tenant, so one call holds
-// a bounded number of locks however many scopes it removes. A call for each scope in one
+// It locks each scope until the transaction ends, or past 64 scopes the tenant, so one call
+// holds a bounded number of locks however many scopes it removes. A call for each scope in one
 // transaction would hold a lock for each, which PostgreSQL keeps in one table every session
 // shares: a few thousand can fill it.
 func (a *Authorizer) DeleteScopes(ctx context.Context, actor Principal, tenant string, scopes []Scope) error {
@@ -1038,9 +1038,10 @@ func (a *Authorizer) DeleteScopes(ctx context.Context, actor Principal, tenant s
 		}
 		keys[i] = s.Key()
 	}
-	if len(keys) == 0 {
-		return nil
-	}
+	// A scope listed twice, as on the paths of resources under one container, counts toward
+	// maxLocks once, or a few scopes would lock the whole tenant.
+	slices.Sort(keys)
+	keys = slices.Compact(keys)
 	return a.delete(ctx, actor, tenant, func(tx pgx.Tx) error { return lockAll(ctx, tx, tenant, keys, nil) },
 		deletion{denies: "scope = ANY($2::text[])", where: "scope = ANY($2::text[])"}, keys)
 }
