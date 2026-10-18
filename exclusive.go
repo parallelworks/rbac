@@ -1,0 +1,130 @@
+package rbac
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// exclusive reports whether a dimension is Exclusive, so changes check that none lets an identity
+// hold two of its values.
+func (a *Authorizer) exclusive() bool {
+	for _, ld := range a.labels {
+		if ld.exclusive {
+			return true
+		}
+	}
+	return false
+}
+
+// lockExclusive takes a tenant's lock on exclusive values, before a change's other locks, so two
+// changes that each give an identity one of a dimension's values run in turn, and the second's
+// check reads the first.
+func lockExclusive(ctx context.Context, tx pgx.Tx, tenant string) error {
+	b := &pgx.Batch{}
+	b.Queue(`SELECT current_setting('transaction_isolation')`)
+	b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, "exclusive/"+tenant)
+	return locked(tx.SendBatch(ctx, b))
+}
+
+// exclusiveValues returns, by role, the values of exclusive dimensions each of roles gives.
+func (a *Authorizer) exclusiveValues(roles []RoleDefinition) map[Role][]Permission {
+	gives := map[Role][]Permission{}
+	for _, r := range roles {
+		for _, p := range r.Permissions {
+			t, v := p.parts()
+			if _, value := a.labels[t].rank[v]; value && a.labels[t].exclusive {
+				gives[r.ID] = append(gives[r.ID], p)
+			}
+		}
+	}
+	return gives
+}
+
+// excludes refuses a change, e, that leaves an identity it reaches able to hold two values of an
+// exclusive dimension, through any grant or eligibility on the tenant, whatever its condition:
+// those whose grants, eligibilities, memberships or places in groups it set, and those holding a
+// custom role it redefined. Denies don't count, so lifting one is no change to check.
+func (a *Authorizer) excludes(ctx context.Context, tx pgx.Tx, tenant string, e ChangeEvent) error {
+	if len(e.Granted)+len(e.Eligible)+len(e.Roles)+len(e.Memberships)+len(e.Joined) == 0 {
+		return nil
+	}
+	custom, err := a.customRoles(ctx, tx, tenant)
+	if err != nil {
+		return err
+	}
+	gives := a.exclusiveValues(slices.Concat(a.cfg.Catalog, custom))
+	// Empty, never nil, which pgx would send as NULL.
+	seeds, redefined := []string{}, []string{}
+	for _, g := range e.Granted {
+		if gives[g.Role] != nil {
+			seeds = append(seeds, g.Principal.key())
+		}
+	}
+	for _, el := range e.Eligible {
+		if gives[el.Role] != nil {
+			seeds = append(seeds, el.Principal.key())
+		}
+	}
+	for _, r := range e.Roles {
+		if gives[r.ID] != nil {
+			redefined = append(redefined, string(r.ID))
+		}
+	}
+	for _, m := range e.Memberships {
+		seeds = append(seeds, m.Principal.key())
+	}
+	for _, m := range e.Joined {
+		seeds = append(seeds, m.Principal.key())
+	}
+	if len(seeds)+len(redefined) == 0 {
+		return nil
+	}
+	roles, values := []string{}, []string{}
+	for r, ps := range gives {
+		for _, p := range ps {
+			roles, values = append(roles, string(r)), append(values, string(p))
+		}
+	}
+	now := a.cfg.Now()
+	// Each identity reached is read up to its keys as checks read them, and the anonymous, which
+	// holds what the public does, where the public is reached.
+	var who, dim string
+	err = tx.QueryRow(ctx, `
+		WITH RECURSIVE seeds(k) AS (
+		  SELECT unnest($2::text[]) COLLATE "C"
+		  UNION SELECT principal FROM rbac_grants WHERE tenant = $1 AND role = ANY($3::text[])
+		  UNION SELECT principal FROM rbac_eligibilities WHERE tenant = $1 AND role = ANY($3::text[])
+		), `+insideSQL("$1", `ARRAY(SELECT substr(k, 7) FROM seeds WHERE k LIKE 'group:%')`, "$4")+`,
+		targets(identity) AS (
+		  SELECT k FROM seeds WHERE k NOT LIKE 'group:%' AND k NOT LIKE 'members:%' AND k <> 'public:'
+		  UNION SELECT principal FROM inside
+		  UNION SELECT principal FROM rbac_memberships WHERE tenant = $1
+		    AND EXISTS (SELECT FROM seeds WHERE k IN ('members:' || $1, 'public:'))
+		  UNION SELECT '' WHERE EXISTS (SELECT FROM seeds WHERE k = 'public:')
+		), held(identity, value) AS (
+		  SELECT t.identity, v.value FROM targets t
+		  CROSS JOIN LATERAL (WITH RECURSIVE `+keysSQL("$1::text", "t.identity", "$4")+` SELECT k FROM keys) ks
+		  JOIN (
+		    SELECT principal, role FROM rbac_grants WHERE tenant = $1 AND scope_type = 'tenant' AND (expires_at IS NULL OR expires_at > $4)
+		    UNION ALL
+		    SELECT principal, role FROM rbac_eligibilities WHERE tenant = $1 AND scope_type = 'tenant' AND (expires_at IS NULL OR expires_at > $4)
+		  ) g ON g.principal = ks.k
+		  JOIN unnest($5::text[], $6::text[]) AS v(role, value) ON v.role = g.role
+		)
+		SELECT identity, split_part(value, ':', 1) FROM held
+		GROUP BY 1, 2 HAVING count(DISTINCT value) > 1 ORDER BY 1, 2 LIMIT 1`,
+		tenant, seeds, redefined, now, roles, values).Scan(&who, &dim)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil
+	case err != nil:
+		return err
+	case who == "":
+		who = "the public"
+	}
+	return fmt.Errorf("%w: the change would let %s hold two values of %s, whose values are exclusive", ErrInvalid, who, dim)
+}

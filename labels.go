@@ -29,6 +29,11 @@ type LabelDimension struct {
 	Name   string
 	Rule   LabelRule
 	Values []string
+	// Exclusive values are held one at a time, as parties with a conflict of interest are: a
+	// change that would let an identity hold two is refused, and a subject whose grants could give
+	// it two, under any condition, holds none. An Ordered dimension's higher values include the
+	// lower, so it isn't exclusive.
+	Exclusive bool
 }
 
 // Label is a resource's label, or a data point's: by dimension, its values. A dimension it has no
@@ -64,8 +69,9 @@ func (a *Authorizer) unsatisfied(ctx context.Context, s Subject, r Resource) (st
 
 // labelDimension is a dimension as checks read it: each value's rank, lowest 0.
 type labelDimension struct {
-	rule LabelRule
-	rank map[string]int
+	rule      LabelRule
+	rank      map[string]int
+	exclusive bool
 }
 
 // declares reports whether the dimension declares every value of vs.
@@ -85,11 +91,13 @@ func indexLabels(dims []LabelDimension, catalog []RoleDefinition) (map[string]la
 			return nil, fmt.Errorf("rbac: label dimension %q has no rule", d.Name)
 		case len(d.Values) == 0:
 			return nil, fmt.Errorf("rbac: label dimension %q has no values", d.Name)
+		case d.Exclusive && d.Rule == Ordered:
+			return nil, fmt.Errorf("rbac: label dimension %q is Ordered, so its values aren't exclusive", d.Name)
 		}
 		if _, dup := index[d.Name]; dup {
 			return nil, fmt.Errorf("rbac: label dimension %q is declared twice", d.Name)
 		}
-		ld := labelDimension{rule: d.Rule, rank: map[string]int{}}
+		ld := labelDimension{rule: d.Rule, rank: map[string]int{}, exclusive: d.Exclusive}
 		for i, v := range d.Values {
 			p := Permission(d.Name + ":" + v)
 			if !p.Valid() {
@@ -168,6 +176,8 @@ type Holding struct {
 	dims     map[string]labelDimension
 	values   map[string]map[string]bool
 	releases map[string]bool
+	// excluded are the exclusive dimensions it holds no value of, as its grants could give it two.
+	excluded map[string]bool
 }
 
 // ReleasePermission is the permission, held on the tenant, to release data to a looser label in a
@@ -245,7 +255,7 @@ func (h Holding) satisfies(dim string, want []string) bool {
 
 // changed is a copy of the holding with ps held too, or with held false, without them.
 func (h Holding) changed(ps map[Permission]bool, held bool) Holding {
-	c := Holding{tenant: h.tenant, dims: h.dims, values: map[string]map[string]bool{}, releases: map[string]bool{}}
+	c := Holding{tenant: h.tenant, dims: h.dims, values: map[string]map[string]bool{}, releases: map[string]bool{}, excluded: h.excluded}
 	maps.Copy(c.releases, h.releases)
 	for dim, vs := range h.values {
 		c.values[dim] = maps.Clone(vs)
@@ -255,6 +265,7 @@ func (h Holding) changed(ps map[Permission]bool, held bool) Holding {
 		switch {
 		case v == releaseVerb:
 			c.releases[dim] = held
+		case c.excluded[dim]:
 		case !held:
 			delete(c.values[dim], v)
 		case c.values[dim] == nil:
@@ -282,7 +293,7 @@ func (a *Authorizer) Holding(ctx context.Context, tenant string, s Subject) (Hol
 // holding is Holding, and the values a condition decided, a grant's or a deny's, which a read
 // without the request, as Holders, can't settle.
 func (a *Authorizer) holding(ctx context.Context, tenant string, s Subject) (Holding, map[Permission]bool, error) {
-	h := Holding{tenant: tenant, dims: a.labels, values: map[string]map[string]bool{}, releases: map[string]bool{}}
+	h := Holding{tenant: tenant, dims: a.labels, values: map[string]map[string]bool{}, releases: map[string]bool{}, excluded: map[string]bool{}}
 	if len(a.labels) == 0 {
 		return h, nil, nil
 	}
@@ -293,10 +304,27 @@ func (a *Authorizer) holding(ctx context.Context, tenant string, s Subject) (Hol
 	if err != nil {
 		return Holding{}, nil, err
 	}
+	// An exclusive dimension's values are counted as any request could give them, so whether one
+	// is held never turns on a condition giving another.
+	could := map[string]map[string]bool{}
+	for _, p := range slices.Concat(perms, slices.Collect(maps.Keys(byCondition))) {
+		if t, v := p.parts(); v != releaseVerb && a.labels[t].exclusive {
+			if could[t] == nil {
+				could[t] = map[string]bool{}
+			}
+			could[t][v] = true
+		}
+	}
+	for t, vs := range could {
+		h.excluded[t] = len(vs) > 1
+	}
 	for _, p := range perms {
 		t, v := p.parts()
-		if v == releaseVerb {
+		switch {
+		case v == releaseVerb:
 			h.releases[t] = true
+			continue
+		case h.excluded[t]:
 			continue
 		}
 		if h.values[t] == nil {

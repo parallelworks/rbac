@@ -108,6 +108,15 @@ another store. Both search one tenant, and count only unconditional grants:
   (`ReleasePermission(dimension)` on the tenant), for data it can read. A role giving it is
   `Privileged`, so only identities and privileged groups hold it, and no value is named
   `release`.
+- **Exclusive values:** a dimension marked `Exclusive` names parties with a conflict of interest,
+  whose values are held one at a time. A change that would let an identity hold two, through any
+  grant or eligibility on the tenant and under any condition, directly, through its groups, or as
+  one of the tenant's members or the public, is refused with `ErrInvalid`; denies don't count.
+  Where a dimension is exclusive, a tenant's changes run in turn, so two can't each give one value.
+  The check reads every identity a change reaches, so a grant to the tenant's members or the public
+  reads every member. A subject whose grants could give it two anyway, as after a catalog change,
+  holds none of them, whatever the request. An `Ordered` dimension's higher values include the
+  lower, so it isn't exclusive.
 - **Conditions:** a grant can carry a CEL expression over the subject's, the resource's and the
   request's attributes (`Subject.Attributes`, `Resource.Attributes`, `rbac.WithRequest`), the time
   and the action. It gives its role only where the expression holds; one that fails is false.

@@ -993,9 +993,16 @@ func scopeGrants(scope Scope, bindings []Binding) []Grant {
 }
 
 // inTx runs fn in a transaction, recording what it writes in history as actor's change made by
-// how, the call that makes it, and hands what it changed to Config.OnChange there.
+// how, the call that makes it, and hands what it changed to Config.OnChange there. Where a
+// dimension is Exclusive, it refuses a change that lets an identity hold two of its values.
 func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, how string, fn func(pgx.Tx) (ChangeEvent, error)) error {
 	return a.begin(ctx, func(tx pgx.Tx) error {
+		exclusive := a.exclusive()
+		if exclusive {
+			if err := lockExclusive(ctx, tx, tenant); err != nil {
+				return err
+			}
+		}
 		done, err := a.recording(ctx, tx, actor, how, "")
 		if err != nil {
 			return err
@@ -1003,6 +1010,11 @@ func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, h
 		e, err := fn(tx)
 		if err != nil {
 			return err
+		}
+		if exclusive {
+			if err := a.excludes(ctx, tx, tenant, e); err != nil {
+				return err
+			}
 		}
 		if err := done(); err != nil {
 			return err
