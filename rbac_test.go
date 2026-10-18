@@ -2763,10 +2763,10 @@ func TestRolesListingEachOtherAreDecidedOnce(t *testing.T) {
 func TestDeletePrincipalEverywhereAcrossManyTenants(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
-	support := rbac.Principal{Kind: rbac.Group, ID: "support"}
+	support := rbac.Principal{Kind: rbac.User, ID: "support"}
 	const tenants = 70
 	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
-		SELECT 'x' || g, 'tenant', 'x' || g, 'group', 'support', 'cluster.login' FROM generate_series(1, $1::int) g`, tenants); err != nil {
+		SELECT 'x' || g, 'tenant', 'x' || g, 'user', 'support', 'cluster.login' FROM generate_series(1, $1::int) g`, tenants); err != nil {
 		t.Fatal(err)
 	}
 	h.events = nil
@@ -2774,11 +2774,15 @@ func TestDeletePrincipalEverywhereAcrossManyTenants(t *testing.T) {
 		t.Fatal(err)
 	}
 	var left int
-	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM rbac_grants WHERE principal = 'group:support'`).Scan(&left); err != nil || left != 0 {
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM rbac_grants WHERE principal = 'user:support'`).Scan(&left); err != nil || left != 0 {
 		t.Fatalf("%d grants left, %v", left, err)
 	}
 	if len(h.events) != tenants {
 		t.Fatalf("%d changes, want one per tenant", len(h.events))
+	}
+	// A group is its tenant's, so another with its id elsewhere isn't it.
+	if err := h.authz.DeletePrincipalEverywhere(ctx, host, rbac.Principal{Kind: rbac.Group, ID: "support"}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("deleting a group everywhere: %v", err)
 	}
 }
 

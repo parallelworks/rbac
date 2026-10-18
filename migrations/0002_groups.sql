@@ -33,6 +33,9 @@ CREATE TABLE rbac_groups (
     description text        NOT NULL DEFAULT '' CHECK (length(description) <= 2048),
     -- Empty when made directly, or the host's, such as a directory it syncs from.
     source      text        COLLATE "C" NOT NULL DEFAULT '' CHECK (source ~ '^([a-z][a-z0-9._:/-]{0,62})?$'),
+    -- Set when it is created, and never after: only a privileged group holds a privileged role,
+    -- and only identities are its members.
+    privileged  boolean     NOT NULL DEFAULT false,
     created_by  text        NOT NULL DEFAULT '',
     created_at  timestamptz NOT NULL DEFAULT now(),
     updated_by  text        NOT NULL DEFAULT '',
@@ -62,5 +65,7 @@ CREATE TABLE rbac_members (
 
 -- A check resolves an identity's groups, and the groups they are in, from this alone.
 CREATE INDEX rbac_members_principal ON rbac_members (tenant, principal) INCLUDE (group_id, expires_at);
+-- An identity's or group's tenants, and removing it from every one, without reading every tenant's.
+CREATE INDEX rbac_members_tenants ON rbac_members (principal, tenant);
 -- DeleteExpired, without reading the memberships that never expire.
 CREATE INDEX rbac_members_expires ON rbac_members (expires_at) WHERE expires_at IS NOT NULL;

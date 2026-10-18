@@ -341,8 +341,9 @@ type Change struct {
 
 // ChangeEvent is what a committed change did: only the grants that were added, whose note or
 // condition's title or description changed, or removed, the custom roles defined or deleted, the
-// deny policies set or deleted, and the eligibilities set or ended. An activation is a grant from
-// SourceActivation: one that moves no end later changes nothing, so isn't reported.
+// deny policies set or deleted, the eligibilities set or ended, the tenant memberships set or
+// ended, the groups set or deleted, and the members who joined or left groups. An activation is a
+// grant from SourceActivation: one that moves no end later changes nothing, so isn't reported.
 type ChangeEvent struct {
 	Tenant string
 	// Actor is who made the change: for Import and the deletes, the actor they name.

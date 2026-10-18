@@ -1,6 +1,7 @@
 package rbac
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -15,8 +16,12 @@ import (
 )
 
 // ManageGroups is the permission to create, replace and delete a tenant's groups, held on the
-// tenant.
-const ManageGroups Permission = "tenant:groups"
+// tenant; ManagePrivilegedGroups the same for its privileged groups (GroupDefinition.Privileged).
+// Both change access, as the members of a group hold what it is granted.
+const (
+	ManageGroups           Permission = "tenant:groups"
+	ManagePrivilegedGroups Permission = "tenant:privileged-groups"
+)
 
 // GroupScope is the type of the scope a group is, which a host's catalog gives roles on, as on any
 // scope: groups are directly under the tenant.
@@ -59,6 +64,11 @@ type GroupDefinition struct {
 	// Source is who keeps it: empty, or the host's (Config.Sources), whose groups only the host
 	// changes.
 	Source string
+	// Privileged marks a group that may hold privileged roles, which no other group may. It is set
+	// when the group is created and never after, needs ManagePrivilegedGroups, and its members are
+	// identities, never groups, so privileged access reaches no one through nesting: a group
+	// made privileged later would make its members privileged unreviewed.
+	Privileged bool
 	// CreatedBy, CreatedAt, UpdatedBy and UpdatedAt are set on groups read back.
 	CreatedBy Principal
 	CreatedAt time.Time
@@ -259,7 +269,8 @@ func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string,
 		return err
 	}
 	root := Resource{Tenant: tenant, Type: TenantScope, ID: tenant}
-	if err := a.mayManageGroups(ctx, a.db, actor, root, true); err != nil {
+	perm := managing(g.Privileged)
+	if err := a.mayManageGroups(ctx, a.db, actor, root, perm, true); err != nil {
 		return err
 	}
 	if err := checkGroup(g); err != nil {
@@ -272,7 +283,7 @@ func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string,
 		if err := lock(ctx, tx, tenant, []string{groupKey(g.ID)}, nil); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.mayManageGroups(ctx, tx, actor, root, false); err != nil {
+		if err := a.mayManageGroups(ctx, tx, actor, root, perm, false); err != nil {
 			return ChangeEvent{}, err
 		}
 		if err := a.notOwnedGroups(ctx, tx, tenant, []string{g.ID}); err != nil {
@@ -325,27 +336,59 @@ func (a *Authorizer) ImportGroups(ctx context.Context, actor Principal, tenant s
 func upsertGroups(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, groups []GroupDefinition) ([]GroupDefinition, error) {
 	n := len(groups)
 	ids, names, descriptions, sources := make([]string, n), make([]string, n), make([]string, n), make([]string, n)
+	privileged := make([]bool, n)
 	for i, g := range groups {
-		ids[i], names[i], descriptions[i], sources[i] = g.ID, g.Name, g.Description, g.Source
+		ids[i], names[i], descriptions[i], sources[i], privileged[i] = g.ID, g.Name, g.Description, g.Source, g.Privileged
 	}
-	rows, err := tx.Query(ctx, `
-		INSERT INTO rbac_groups AS g (tenant, id, name, description, source, created_by, updated_by)
-		SELECT $1, i, n, d, s, $6, $6 FROM unnest($2::text[], $3::text[], $4::text[], $5::text[]) AS t(i, n, d, s)
+	rows, err := tx.Query(ctx, `SELECT g.id FROM rbac_groups g JOIN unnest($2::text[], $3::bool[]) AS t(i, p) ON g.id = t.i
+		WHERE g.tenant = $1 AND g.privileged <> t.p ORDER BY g.id`, tenant, ids, privileged)
+	if err != nil {
+		return nil, err
+	}
+	flipped, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, err
+	}
+	if len(flipped) > 0 {
+		return nil, fmt.Errorf("%w: group %q: whether a group is privileged is set when it is created", ErrInvalid, flipped[0])
+	}
+	rows, err = tx.Query(ctx, `
+		INSERT INTO rbac_groups AS g (tenant, id, name, description, source, privileged, created_by, updated_by)
+		SELECT $1, i, n, d, s, p, $7, $7 FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::bool[]) AS t(i, n, d, s, p)
 		ON CONFLICT (tenant, id) DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description,
 		  source = EXCLUDED.source, updated_by = EXCLUDED.updated_by, updated_at = now()
 		WHERE (g.name, g.description, g.source) IS DISTINCT FROM (EXCLUDED.name, EXCLUDED.description, EXCLUDED.source)
 		RETURNING `+groupColumns,
-		tenant, ids, names, descriptions, sources, actorKey(actor))
+		tenant, ids, names, descriptions, sources, privileged, actorKey(actor))
 	if err != nil {
 		return nil, err
 	}
 	return collectGroups(rows)
 }
 
+// managing is the permission that manages a group, privileged or not.
+func managing(privileged bool) Permission {
+	if privileged {
+		return ManagePrivilegedGroups
+	}
+	return ManageGroups
+}
+
+// privilegedGroup reads, on q, whether a tenant's group is privileged: not when it doesn't exist.
+func privilegedGroup(ctx context.Context, q DB, tenant, id string) (bool, error) {
+	var privileged bool
+	err := q.QueryRow(ctx, `SELECT privileged FROM rbac_groups WHERE tenant = $1 AND id = $2`, tenant, id).Scan(&privileged)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return privileged, err
+}
+
 // DeleteGroup deletes a tenant's group, as actor, who needs ManageGroups on the tenant, and with it
 // its members and its place in other groups. It refuses a group that holds grants or
-// eligibilities, which revoking first shows, and one from a source the host owns. Deleting a group
-// that doesn't exist does nothing.
+// eligibilities in force, which revoking first shows, or that a deny names or exempts, so deleting
+// one never changes access as a side effect; and one from a source the host owns, or with members
+// or a place in a group from one. Deleting a group that doesn't exist does nothing.
 func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id string) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -354,30 +397,56 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 		return err
 	}
 	root := Resource{Tenant: tenant, Type: TenantScope, ID: tenant}
-	if err := a.mayManageGroups(ctx, a.db, actor, root, true); err != nil {
+	privileged, err := privilegedGroup(ctx, a.db, tenant, id)
+	if err != nil {
+		return err
+	}
+	if err := a.mayManageGroups(ctx, a.db, actor, root, managing(privileged), true); err != nil {
 		return err
 	}
 	return a.inTx(ctx, tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lock(ctx, tx, tenant, []string{groupKey(id), nestingKey}, []string{groupPrincipal(id).key()}); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.mayManageGroups(ctx, tx, actor, root, false); err != nil {
+		// Deleted and made again otherwise meanwhile, it isn't the group the constraints were asked about.
+		if now, err := privilegedGroup(ctx, tx, tenant, id); err != nil || now != privileged {
+			return ChangeEvent{}, cmp.Or(err, fmt.Errorf("%w: group %q changed while this change waited for it; try again", ErrConflict, id))
+		}
+		if err := a.mayManageGroups(ctx, tx, actor, root, managing(privileged), false); err != nil {
 			return ChangeEvent{}, err
 		}
 		if err := a.notOwnedGroups(ctx, tx, tenant, []string{id}); err != nil {
 			return ChangeEvent{}, err
 		}
-		var held bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT FROM rbac_grants WHERE tenant = $1 AND principal = $2)
-			OR EXISTS (SELECT FROM rbac_eligibilities WHERE tenant = $1 AND principal = $2)`,
-			tenant, groupPrincipal(id).key()).Scan(&held); err != nil {
+		if err := a.deletable(ctx, tx, tenant, id); err != nil {
 			return ChangeEvent{}, err
-		}
-		if held {
-			return ChangeEvent{}, fmt.Errorf("%w: group %q holds grants or eligibilities: revoke them first", ErrInvalid, id)
 		}
 		return a.removeGroups(ctx, tx, tenant, []string{id})
 	})
+}
+
+// deletable refuses deleting a group an actor asks to delete when that would change access or what
+// the host keeps. Expired grants and eligibilities give nothing, and Grants doesn't list them to
+// revoke, so they go with it.
+func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string) error {
+	var held, denied, owned bool
+	if err := tx.QueryRow(ctx, `SELECT
+		  EXISTS (SELECT FROM rbac_grants WHERE tenant = $1 AND principal = $2 AND (expires_at IS NULL OR expires_at > $3))
+		    OR EXISTS (SELECT FROM rbac_eligibilities WHERE tenant = $1 AND principal = $2 AND (expires_at IS NULL OR expires_at > $3)),
+		  EXISTS (SELECT FROM rbac_denies WHERE tenant = $1 AND ($2 = ANY(principals) OR $2 = ANY(exempt))),
+		  EXISTS (SELECT FROM rbac_members WHERE tenant = $1 AND (group_id = $4 OR principal = $2) AND source = ANY($5::text[]))`,
+		tenant, groupPrincipal(id).key(), a.cfg.Now(), id, slices.Sorted(maps.Keys(a.owned))).Scan(&held, &denied, &owned); err != nil {
+		return err
+	}
+	switch {
+	case held:
+		return fmt.Errorf("%w: group %q holds grants or eligibilities: revoke them first", ErrInvalid, id)
+	case denied:
+		return fmt.Errorf("%w: a deny names or exempts group %q: change it first", ErrInvalid, id)
+	case owned:
+		return fmt.Errorf("%w: group %q has members or a place in a group from a source only the host changes", ErrInvalid, id)
+	}
+	return nil
 }
 
 // DeleteGroups deletes a tenant's groups, as actor: the host's own write, as for a directory it
@@ -406,38 +475,36 @@ func (a *Authorizer) DeleteGroups(ctx context.Context, actor Principal, tenant s
 		if err := lockAll(ctx, tx, tenant, scopes, principals); err != nil {
 			return ChangeEvent{}, err
 		}
-		revoked, err := a.remove(ctx, tx, tenant, "principal = ANY($2::text[])", principals)
-		if err != nil {
-			return ChangeEvent{}, err
-		}
-		ended, err := a.removeEligible(ctx, tx, tenant, "principal = ANY($2::text[])", principals)
-		if err != nil {
-			return ChangeEvent{}, err
-		}
-		e, err := a.removeGroups(ctx, tx, tenant, ids)
-		e.Revoked, e.Ineligible = revoked, ended
-		return e, err
+		return a.removeGroups(ctx, tx, tenant, ids)
 	})
 }
 
-// removeGroups deletes groups with the members they have and their places in other groups, and
-// returns what it removed for OnChange.
+// removeGroups deletes groups with their grants and eligibilities, the members they have and their
+// places in other groups, and returns what it removed for OnChange.
 func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string, ids []string) (ChangeEvent, error) {
 	var e ChangeEvent
-	principals := make([]string, len(ids))
+	principals, scopes := make([]string, len(ids)), make([]string, len(ids))
 	for i, id := range ids {
-		principals[i] = groupPrincipal(id).key()
+		principals[i], scopes[i] = groupPrincipal(id).key(), groupKey(id)
 	}
+	// The group's grants, and those on the group, as its managers', which would pass to a group
+	// made later with its id.
+	const ofGroups = "(principal = ANY($2::text[]) OR scope = ANY($3::text[]))"
 	var err error
+	if e.Revoked, err = a.remove(ctx, tx, tenant, ofGroups, principals, scopes); err != nil {
+		return ChangeEvent{}, err
+	}
+	if e.Ineligible, err = a.removeEligible(ctx, tx, tenant, ofGroups, principals, scopes); err != nil {
+		return ChangeEvent{}, err
+	}
+	if e.DeletedDenies, err = removed(ctx, a, tx, "rbac_denies", denyColumns, collectDenies, tenant, "scope = ANY($2::text[])", scopes); err != nil {
+		return ChangeEvent{}, err
+	}
 	if e.Left, err = removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant,
 		"(group_id = ANY($2::text[]) OR principal = ANY($3::text[]))", ids, principals); err != nil {
 		return ChangeEvent{}, err
 	}
-	rows, err := tx.Query(ctx, `DELETE FROM rbac_groups WHERE tenant = $1 AND id = ANY($2::text[]) RETURNING `+groupColumns, tenant, ids)
-	if err != nil {
-		return ChangeEvent{}, err
-	}
-	e.DeletedGroups, err = collectGroups(rows)
+	e.DeletedGroups, err = removed(ctx, a, tx, "rbac_groups", groupColumns, collectGroups, tenant, "id = ANY($2::text[])", ids)
 	return e, err
 }
 
@@ -460,26 +527,26 @@ func (a *Authorizer) notOwnedGroups(ctx context.Context, tx pgx.Tx, tenant strin
 
 // mayManageGroups checks that actor may create and delete a tenant's groups: before the change's
 // transaction, with the constraints, and again in it, on q.
-func (a *Authorizer) mayManageGroups(ctx context.Context, q DB, actor Subject, root Resource, constraints bool) error {
+func (a *Authorizer) mayManageGroups(ctx context.Context, q DB, actor Subject, root Resource, perm Permission, constraints bool) error {
 	scope := root.Scope()
 	if actor.Principal == (Principal{}) {
-		return &DeniedError{Permission: ManageGroups, Scope: scope, Reason: "an anonymous subject changes nothing"}
+		return &DeniedError{Permission: perm, Scope: scope, Reason: "an anonymous subject changes nothing"}
 	}
 	if constraints {
-		name, err := a.denied(ctx, ConstraintInput{Tenant: root.Tenant, ResourceType: TenantScope, Permission: ManageGroups, Subject: &actor, Resource: &root})
+		name, err := a.denied(ctx, ConstraintInput{Tenant: root.Tenant, ResourceType: TenantScope, Permission: perm, Subject: &actor, Resource: &root})
 		if err != nil {
 			return err
 		}
 		if name != "" {
-			return &DeniedError{Permission: ManageGroups, Scope: scope, Reason: "removed by " + name}
+			return &DeniedError{Permission: perm, Scope: scope, Reason: "removed by " + name}
 		}
 	}
 	au, err := a.authorityOn(ctx, q, actor, root, nil)
 	if err != nil {
 		return err
 	}
-	if !au.may(ManageGroups, TenantScope) {
-		return &DeniedError{Permission: ManageGroups, Scope: scope, Reason: "the actor may not manage groups here"}
+	if !au.may(perm, TenantScope) {
+		return &DeniedError{Permission: perm, Scope: scope, Reason: "the actor may not manage these groups here"}
 	}
 	return nil
 }
@@ -493,13 +560,13 @@ func (a *Authorizer) Groups(ctx context.Context, tenant string) ([]GroupDefiniti
 	return collectGroups(rows)
 }
 
-const groupColumns = `id, name, description, source, created_by, created_at, updated_by, updated_at`
+const groupColumns = `id, name, description, source, privileged, created_by, created_at, updated_by, updated_at`
 
 func collectGroups(rows pgx.Rows) ([]GroupDefinition, error) {
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (GroupDefinition, error) {
 		var g GroupDefinition
 		var createdBy, updatedBy string
-		err := row.Scan(&g.ID, &g.Name, &g.Description, &g.Source, &createdBy, &g.CreatedAt, &updatedBy, &g.UpdatedAt)
+		err := row.Scan(&g.ID, &g.Name, &g.Description, &g.Source, &g.Privileged, &createdBy, &g.CreatedAt, &updatedBy, &g.UpdatedAt)
 		g.CreatedBy, g.UpdatedBy = parsePrincipal(createdBy), parsePrincipal(updatedBy)
 		return g, err
 	})
@@ -578,19 +645,21 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 	set := slices.SortedFunc(maps.Values(byKey), func(x, y Member) int {
 		return strings.Compare(x.Group+"\x00"+x.Principal.key()+"\x00"+x.Source, y.Group+"\x00"+y.Principal.key()+"\x00"+y.Source)
 	})
-	groups, identities, nested := map[string]bool{}, map[string]bool{}, false
+	groups, identities := map[string]bool{}, map[string]bool{}
 	scopes, principals := map[string]bool{}, map[string]bool{}
+	var nested []Member
 	for _, m := range set {
 		groups[m.Group] = true
 		scopes[groupKey(m.Group)] = true
 		principals[m.Principal.key()] = true
 		if m.Principal.Kind == Group {
-			groups[m.Principal.ID], nested = true, true
+			groups[m.Principal.ID] = true
+			nested = append(nested, m)
 		} else {
 			identities[m.Principal.key()] = true
 		}
 	}
-	if nested {
+	if len(nested) > 0 {
 		scopes[nestingKey] = true
 	}
 	return a.inTx(ctx, tenant, actor, func(tx pgx.Tx) (ChangeEvent, error) {
@@ -598,6 +667,9 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 			return ChangeEvent{}, err
 		}
 		if err := a.membersCanJoin(ctx, tx, tenant, slices.Sorted(maps.Keys(groups)), slices.Sorted(maps.Keys(identities))); err != nil {
+			return ChangeEvent{}, err
+		}
+		if err := privilegedTakeNoGroups(ctx, tx, tenant, nested); err != nil {
 			return ChangeEvent{}, err
 		}
 		n := len(set)
@@ -623,17 +695,33 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 		if err != nil {
 			return ChangeEvent{}, err
 		}
-		if nested {
-			for _, m := range set {
-				if m.Principal.Kind == Group {
-					if err := a.nestable(ctx, tx, tenant, m.Group, m.Principal.ID); err != nil {
-						return ChangeEvent{}, err
-					}
-				}
-			}
+		if err := a.nestable(ctx, tx, tenant, nested); err != nil {
+			return ChangeEvent{}, err
 		}
 		return ChangeEvent{Joined: joined}, nil
 	})
+}
+
+// privilegedTakeNoGroups refuses nesting a group in a privileged one, whose members are identities
+// only, so privileged access reaches no one through a group's members.
+func privilegedTakeNoGroups(ctx context.Context, tx pgx.Tx, tenant string, nested []Member) error {
+	if len(nested) == 0 {
+		return nil
+	}
+	outer := make([]string, len(nested))
+	for i, m := range nested {
+		outer[i] = m.Group
+	}
+	var id string
+	err := tx.QueryRow(ctx, `SELECT id FROM rbac_groups WHERE tenant = $1 AND id = ANY($2::text[]) AND privileged ORDER BY id LIMIT 1`,
+		tenant, outer).Scan(&id)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil
+	case err != nil:
+		return err
+	}
+	return fmt.Errorf("%w: group %q is privileged, so its members are identities, not groups", ErrInvalid, id)
 }
 
 // membersCanJoin refuses members of groups that don't exist, or identities that aren't members or
@@ -664,37 +752,55 @@ func (a *Authorizer) membersCanJoin(ctx context.Context, tx pgx.Tx, tenant strin
 	return errors.Join(errs...)
 }
 
-// nestable refuses group inner in group outer, as stored, when it makes a group contain itself, or
-// a chain of more than MaxGroupDepth groups: the groups under inner, inner and outer, and those
-// outer is in. It reads at most MaxGroupDepth levels each way, which a chain that long or a cycle
-// passes.
-func (a *Authorizer) nestable(ctx context.Context, tx pgx.Tx, tenant, outer, inner string) error {
-	var below, above int
-	var cycle bool
-	err := tx.QueryRow(ctx, `
-		WITH RECURSIVE down(id, depth) AS (
-		  SELECT $3::text COLLATE "C", 0
-		  UNION
-		  SELECT m.principal_id, d.depth + 1 FROM rbac_members m JOIN down d ON m.group_id = d.id
-		  WHERE m.tenant = $1 AND m.principal_kind = 'group' AND (m.expires_at IS NULL OR m.expires_at > $4) AND d.depth <= $5
-		), up(id, depth) AS (
-		  SELECT $2::text COLLATE "C", 0
-		  UNION
-		  SELECT m.group_id, u.depth + 1 FROM rbac_members m JOIN up u ON m.principal = 'group:' || u.id
-		  WHERE m.tenant = $1 AND (m.expires_at IS NULL OR m.expires_at > $4) AND u.depth <= $5
-		)
-		SELECT (SELECT max(depth) FROM down), (SELECT max(depth) FROM up), EXISTS (SELECT FROM down WHERE id = $2)`,
-		tenant, outer, inner, a.cfg.Now(), MaxGroupDepth).Scan(&below, &above, &cycle)
-	switch {
-	case err != nil:
-		return err
-	case cycle:
-		return fmt.Errorf("%w: group %q in %q would make a group contain itself", ErrInvalid, inner, outer)
-	case below+above+2 > MaxGroupDepth:
-		return fmt.Errorf("%w: group %q in %q would make a chain of more than %d groups", ErrInvalid, inner, outer, MaxGroupDepth)
+// nestable refuses each group nested in another, as stored, that makes a group contain itself, or a
+// chain of more than MaxGroupDepth groups: the groups under the inner one, it and the outer, and
+// those the outer is in. It reads at most MaxGroupDepth levels each way, which a chain that long or
+// a cycle passes, for every nesting in one round trip.
+func (a *Authorizer) nestable(ctx context.Context, tx pgx.Tx, tenant string, nested []Member) error {
+	if len(nested) == 0 {
+		return nil
 	}
-	return nil
+	now := a.cfg.Now()
+	b := &pgx.Batch{}
+	for _, m := range nested {
+		b.Queue(nestingDepths, tenant, m.Group, m.Principal.ID, now, MaxGroupDepth)
+	}
+	br := tx.SendBatch(ctx, b)
+	for _, m := range nested {
+		var below, above int
+		var cycle bool
+		err := br.QueryRow().Scan(&below, &above, &cycle)
+		outer, inner := m.Group, m.Principal.ID
+		switch {
+		case err != nil:
+		case cycle:
+			err = fmt.Errorf("%w: group %q in %q would make a group contain itself", ErrInvalid, inner, outer)
+		case below+above+2 > MaxGroupDepth:
+			err = fmt.Errorf("%w: group %q in %q would make a chain of more than %d groups", ErrInvalid, inner, outer, MaxGroupDepth)
+		}
+		if err != nil {
+			_ = br.Close()
+			return err
+		}
+	}
+	return br.Close()
 }
+
+// nestingDepths walks down from a group, $3, by the principal of its members, so the walk reads only
+// the tenant's nested groups from rbac_members_principal rather than every member of each group.
+const nestingDepths = `
+	WITH RECURSIVE down(id, depth) AS (
+	  SELECT $3::text COLLATE "C", 0
+	  UNION
+	  SELECT m.principal_id, d.depth + 1 FROM rbac_members m JOIN down d ON m.group_id = d.id
+	  WHERE m.tenant = $1 AND m.principal LIKE 'group:%' AND (m.expires_at IS NULL OR m.expires_at > $4) AND d.depth <= $5
+	), up(id, depth) AS (
+	  SELECT $2::text COLLATE "C", 0
+	  UNION
+	  SELECT m.group_id, u.depth + 1 FROM rbac_members m JOIN up u ON m.principal = 'group:' || u.id
+	  WHERE m.tenant = $1 AND (m.expires_at IS NULL OR m.expires_at > $4) AND u.depth <= $5
+	)
+	SELECT (SELECT max(depth) FROM down), (SELECT max(depth) FROM up), EXISTS (SELECT FROM down WHERE id = $2)`
 
 // DeleteMembers removes members from a tenant's groups, each by its group, principal and source,
 // as actor: the host's own write, as for a directory it syncs from.

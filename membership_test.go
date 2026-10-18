@@ -18,11 +18,16 @@ import (
 func grouped(t *testing.T, mutate ...func(*rbac.Config)) *harness {
 	t.Helper()
 	groups := rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}
+	privileged := rbac.RoleDefinition{
+		ID: "tenant.privileged-groups", Permissions: []rbac.Permission{rbac.ManageGroups, rbac.ManagePrivilegedGroups},
+		ResourceTypes: []string{rbac.TenantScope}, Privileged: true,
+	}
 	h := setup(t, append([]func(*rbac.Config){func(c *rbac.Config) {
-		c.Catalog = append(slices.Clone(c.Catalog), groups)
+		c.Catalog = append(slices.Clone(c.Catalog), groups, privileged)
 		c.PrincipalKinds = []rbac.PrincipalKind{"service_account"}
 	}}, mutate...)...)
-	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "groups"))
+	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "groups"),
+		grant(rbac.TenantRoot("t1"), "tenant.privileged-groups", rbac.User, "privileged"))
 	return h
 }
 
@@ -154,7 +159,7 @@ func TestManagingGroups(t *testing.T) {
 	for name, g := range map[string]rbac.GroupDefinition{
 		"no id":             {},
 		"a NUL":             {ID: "a\x00b"},
-		"a long name":       {ID: "g", Name: string(make([]byte, 200))},
+		"a long name":       {ID: "g", Name: strings.Repeat("n", rbac.MaxName+1)},
 		"a reserved source": {ID: "g", Source: "rbac.sync"},
 	} {
 		if err := h.authz.SetGroup(ctx, user("groups"), "t1", g); !errors.Is(err, rbac.ErrInvalid) {
@@ -209,6 +214,13 @@ func TestGroupMembers(t *testing.T) {
 	if members, err := h.authz.Members(ctx, "t1", "c"); err != nil || len(members) != 1 || members[0].Note != "on call" {
 		t.Fatalf("Members(c) = %+v, %v", members, err)
 	}
+	// Another tenant's group and member are no group or member of this one.
+	if err := h.authz.ImportGroups(ctx, host, "t2", []rbac.GroupDefinition{{ID: "t2-group"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.SetMemberships(ctx, host, "t2", []rbac.Membership{{Principal: identity("stranger")}}); err != nil {
+		t.Fatal(err)
+	}
 	for name, m := range map[string]rbac.Member{
 		"to a group that doesn't exist":      {Group: "nope", Principal: identity("u")},
 		"of a group that doesn't exist":      {Group: "a", Principal: groupOf("nope")},
@@ -230,6 +242,9 @@ func TestGroupMembers(t *testing.T) {
 	h.now = h.now.Add(2 * time.Hour)
 	if of, err := h.authz.GroupsOf(ctx, "t1", identity("v")); err != nil || len(of) != 0 {
 		t.Fatalf("GroupsOf(v) after it expired = %v, %v", of, err)
+	}
+	if n, err := h.authz.DeleteExpired(ctx); err != nil || n != 1 {
+		t.Fatalf("DeleteExpired = %d, %v", n, err)
 	}
 	h.events = nil
 	if err := h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "a", Principal: identity("u"), Source: "directory"}}); err != nil {
@@ -346,9 +361,171 @@ func TestDeletingGroupsRemovesTheirGrants(t *testing.T) {
 	}
 }
 
+func TestDeleteGroupLeavesAccessAndTheHostsMembersAsTheyAre(t *testing.T) {
+	h := grouped(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), guardRole)
+		c.Sources = []string{"directory"}
+	})
+	ctx := t.Context()
+	h.join(t, "u")
+	h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "owner"))
+	for _, id := range []string{"denied", "exempt", "synced", "nested", "expired"} {
+		if err := h.authz.SetGroup(ctx, user("groups"), "t1", rbac.GroupDefinition{ID: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "engineering", Source: "directory"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{
+		{Group: "synced", Principal: identity("u"), Source: "directory"},
+		{Group: "engineering", Principal: groupOf("nested"), Source: "directory"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	d := rbac.Deny{ID: "d", Principals: []rbac.Principal{groupOf("denied")}, Exempt: []rbac.Principal{groupOf("exempt")}, Permissions: []rbac.Permission{login}}
+	if err := h.authz.SetDeny(ctx, user("owner"), cluster, d); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"denied", "exempt", "synced", "nested"} {
+		if err := h.authz.DeleteGroup(ctx, user("groups"), "t1", id); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("deleting %s: %v", id, err)
+		}
+	}
+	// A grant that has expired gives nothing, and goes with its group.
+	expiring := grant(cluster.Scope(), "cluster.login", rbac.Group, "expired")
+	expiring.ExpiresAt = h.now.Add(time.Hour)
+	h.seed(t, expiring)
+	h.now = h.now.Add(2 * time.Hour)
+	h.events = nil
+	if err := h.authz.DeleteGroup(ctx, user("groups"), "t1", "expired"); err != nil {
+		t.Fatalf("deleting a group whose grant expired: %v", err)
+	}
+	if len(h.events) != 1 || len(h.events[0].DeletedGroups) != 1 || len(h.events[0].Revoked) != 1 {
+		t.Fatalf("events = %+v", h.events)
+	}
+}
+
+func TestAConstraintStopsManagingGroups(t *testing.T) {
+	h := grouped(t, constrain("frozen", rbac.ManageGroups))
+	ctx := t.Context()
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "ops"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.SetGroup(ctx, user("groups"), "t1", rbac.GroupDefinition{ID: "ops", Name: "Operations"}); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("SetGroup: %v", err)
+	}
+	if err := h.authz.DeleteGroup(ctx, user("groups"), "t1", "ops"); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("DeleteGroup: %v", err)
+	}
+}
+
 func TestNewRefusesAContainerNamedGroup(t *testing.T) {
 	ok := func(context.Context, rbac.DB, rbac.GrantInput) error { return nil }
 	if _, err := rbac.New(&pgxpool.Pool{}, rbac.Config{Catalog: catalog, ContainerTypes: []string{rbac.GroupScope}, ValidateGrant: ok}); err == nil {
 		t.Fatal("New accepted a container type named as groups are")
+	}
+}
+
+func TestPrivilegedGroups(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	admins := rbac.GroupDefinition{ID: "admins", Privileged: true}
+	// Making one needs ManagePrivilegedGroups, not ManageGroups alone.
+	if err := h.authz.SetGroup(ctx, user("groups"), "t1", admins); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("a privileged group by an admin of ordinary groups: %v", err)
+	}
+	if err := h.authz.SetGroup(ctx, user("privileged"), "t1", admins); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.SetGroup(ctx, user("groups"), "t1", rbac.GroupDefinition{ID: "devs"}); err != nil {
+		t.Fatal(err)
+	}
+	// Whether a group is privileged is set when it is made, and never after.
+	for name, change := range map[string]func() error{
+		"unmarking one": func() error {
+			return h.authz.SetGroup(ctx, user("privileged"), "t1", rbac.GroupDefinition{ID: "admins"})
+		},
+		"marking one": func() error {
+			return h.authz.SetGroup(ctx, user("privileged"), "t1", rbac.GroupDefinition{ID: "devs", Privileged: true})
+		},
+		"importing it again": func() error { return h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "admins"}}) },
+	} {
+		if err := change(); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if groups, err := h.authz.Groups(ctx, "t1"); err != nil || len(groups) != 2 || !groups[0].Privileged || groups[1].Privileged {
+		t.Fatalf("Groups = %+v, %v", groups, err)
+	}
+	// Its members are identities: no group passes privileged access in.
+	h.join(t, "u")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "admins", Principal: groupOf("devs")}}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a group in a privileged one: %v", err)
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "admins", Principal: identity("u")}, {Group: "devs", Principal: groupOf("admins")}}); err != nil {
+		t.Fatalf("an identity in a privileged group, and that group in an ordinary one: %v", err)
+	}
+	// Deleting one needs what making one does.
+	if err := h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "admins", Principal: identity("u")}, {Group: "devs", Principal: groupOf("admins")}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.DeleteGroup(ctx, user("groups"), "t1", "admins"); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("deleting a privileged group as an admin of ordinary groups: %v", err)
+	}
+	if err := h.authz.DeleteGroup(ctx, user("privileged"), "t1", "admins"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagingGroupsChangesAccess(t *testing.T) {
+	h := grouped(t)
+	// Whoever is in a group holds what it is granted, so managing groups is never everyone's.
+	if err := h.authz.Import(t.Context(), host, "t1", []rbac.Grant{grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.Members, "t1")}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("managing groups for the tenant's members: %v", err)
+	}
+}
+
+func TestAMembershipThatEndsLeavesTheTenantsGroups(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("u"), ExpiresAt: h.now.Add(time.Hour)}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "a"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "a", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	h.now = h.now.Add(2 * time.Hour)
+	if n, err := h.authz.DeleteExpired(ctx); err != nil || n != 2 {
+		t.Fatalf("DeleteExpired = %d, %v", n, err)
+	}
+	// Joining again gives back none of the groups it was in.
+	if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	if of, err := h.authz.GroupsOf(ctx, "t1", identity("u")); err != nil || len(of) != 0 {
+		t.Fatalf("GroupsOf after the membership ended = %v, %v", of, err)
+	}
+}
+
+func TestDeletingAGroupDeletesGrantsOnIt(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "ops"}}); err != nil {
+		t.Fatal(err)
+	}
+	// A grant on the group, as to who manages it, which a group made later with its id mustn't inherit.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'group', 'ops', 'user', 'lead', 'cluster.login')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.DeleteGroups(ctx, host, "t1", []string{"ops"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{{Type: rbac.GroupScope, ID: "ops"}}}); err != nil || len(got) != 0 {
+		t.Fatalf("grants on a deleted group = %+v, %v", got, err)
 	}
 }
