@@ -140,7 +140,6 @@ func constrain(name string, p rbac.Permission) func(*rbac.Config) {
 	}
 }
 
-// seed grants in t1, making the groups granted to first.
 // seed grants in t1, making the groups granted to first: privileged where a role granted them is.
 func (h *harness) seed(t *testing.T, grants ...rbac.Grant) {
 	t.Helper()

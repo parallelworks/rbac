@@ -597,8 +597,8 @@ type Config struct {
 	// no grant gives. A check or search of a permission not among them, or of a resource type none
 	// of them nor any built-in role is for, is refused as invalid, as a typo, and New refuses a
 	// built-in role giving one: they include what the package checks for the host that the
-	// built-in roles give, `:grant` and `:deny` permissions, DefineRoles, ManageGroups and
-	// ManagePrivilegedGroups. Empty, they are what the built-in roles give.
+	// built-in roles give, `:grant` and `:deny` permissions, DefineRoles, ManageGroups,
+	// ManagePrivilegedGroups and GroupMembers. Empty, they are what the built-in roles give.
 	Permissions []Permission
 	// Sources are the sources the host owns, such as the one it syncs grants from a directory
 	// from: Apply refuses to grant or revoke from one, by ID too, and DeleteRole to delete a role
@@ -818,15 +818,18 @@ type Via string
 
 // The ways a grant is made: by Apply, Import or Activate, or as an eligibility SetEligibility
 // sets, which is the grant activating it would make. ViaRedefinition is a grant or eligibility
-// that exists, which SetRole redefining a custom role makes give more, its own or one handing it
-// out: an eligibility's binding is the grant activating it would make, as with ViaEligibility,
-// and has no ID.
+// that exists, which SetRole redefining its custom role makes give more: an eligibility's binding
+// is the grant activating it would make, as with ViaEligibility, and has no ID. ViaMembership is a
+// privileged group's grant or eligibility of a privileged role that an identity ChangeMembers adds
+// to it gains, its binding naming the identity, with no ID, and ending when the sooner of it and
+// the membership does.
 const (
 	ViaApply        Via = "apply"
 	ViaImport       Via = "import"
 	ViaEligibility  Via = "eligibility"
 	ViaActivation   Via = "activation"
 	ViaRedefinition Via = "redefinition"
+	ViaMembership   Via = "membership"
 )
 
 // denied returns the name of the first constraint that removes in.Permission, or "".

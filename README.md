@@ -85,8 +85,8 @@ another store. Both search one tenant, and count only unconditional grants:
   asks `ValidateGrant` about each grant and eligibility it widens, as the role will be, and the
   host refusing one refuses the redefinition. `DeleteRole` removes one with its grants;
   `Roles` lists the built-in and custom roles a scope type takes. Custom roles follow the
-  catalog: one gives only what the catalog still has, and is privileged when it gives or hands out
-  what privileged roles do.
+  catalog: one gives only what the catalog still has, and is privileged when it gives what only
+  privileged roles do, or changes access.
 - **Conditions:** a grant can carry a CEL expression over the subject's, the resource's and the
   request's attributes (`Subject.Attributes`, `Resource.Attributes`, `rbac.WithRequest`), the time
   and the action. It gives its role only where the expression holds; one that fails is false.
@@ -133,12 +133,20 @@ another store. Both search one tenant, and count only unconditional grants:
   and `Explain`, `Reachable` and `Holders` in one snapshot of the database, but under `WithTx` at
   READ COMMITTED, where each statement reads its own.
   A suspended identity is bound as one outside the tenant is: by a deny naming it or the public.
+- **Privileged groups:** a role the catalog marks `Privileged`, or one that changes access, is
+  privileged, and only identities and privileged groups (`GroupDefinition.Privileged`, set when one
+  is made) hold it: granting one to the tenant's members or an ordinary group is refused, and a
+  check gives nothing of one through them, as after a catalog change. A privileged group's members
+  are identities, changed only with `rbac.ManagePrivilegedGroups` on the tenant and never by an
+  actor for itself, and `ValidateGrant` is asked about each privileged grant a new member gains
+  (`rbac.ViaMembership`). An ordinary group's members change with `rbac.GroupMembers` on it
+  (`ChangeMembers`).
 - **Public access:** the zero `Subject` is anonymous and holds only what is granted to the public.
   Only a role marked `Public` can be granted to the public, and a grant to the public gives
   nothing once its role no longer is.
 - **Broad grants:** a grant to a tenant's members (`rbac.TenantMembers`) or the public never gives
-  a `<type>:grant` or `<type>:deny` permission or `rbac.DefineRoles`, so changing access always
-  takes a named identity or group.
+  a privileged role, nor any permission that changes access, so changing access always takes a
+  named identity or a privileged group.
 
 ## Why
 

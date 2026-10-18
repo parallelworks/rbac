@@ -15,11 +15,14 @@ import (
 )
 
 // ManageGroups is the permission to create, replace and delete a tenant's groups, held on the
-// tenant; ManagePrivilegedGroups the same for its privileged groups (GroupDefinition.Privileged).
-// Both change access, as the members of a group hold what it is granted.
+// tenant; ManagePrivilegedGroups the same for its privileged groups (GroupDefinition.Privileged),
+// and to change their members. GroupMembers is the permission to change the members of a group
+// that isn't privileged, held on its scope or the tenant. All change access, as the members of a
+// group hold what it is granted.
 const (
 	ManageGroups           Permission = "tenant:groups"
 	ManagePrivilegedGroups Permission = "tenant:privileged-groups"
+	GroupMembers           Permission = "group:members"
 )
 
 // GroupScope is the type of the scope a group is, which a host's catalog gives roles on, as on any
@@ -612,7 +615,7 @@ func (a *Authorizer) mayManageGroups(ctx context.Context, q DB, actor Subject, r
 		return &DeniedError{Permission: perm, Scope: scope, Reason: "an anonymous subject changes nothing"}
 	}
 	if constraints {
-		name, err := a.denied(ctx, ConstraintInput{Tenant: root.Tenant, ResourceType: TenantScope, Permission: perm, Subject: &actor, Resource: &root})
+		name, err := a.denied(ctx, ConstraintInput{Tenant: root.Tenant, ResourceType: root.Type, Permission: perm, Subject: &actor, Resource: &root})
 		if err != nil {
 			return err
 		}
@@ -624,7 +627,7 @@ func (a *Authorizer) mayManageGroups(ctx context.Context, q DB, actor Subject, r
 	if err != nil {
 		return err
 	}
-	if !au.may(perm, TenantScope) {
+	if !au.may(perm, root.Type) {
 		return &DeniedError{Permission: perm, Scope: scope, Reason: "the actor may not manage these groups here"}
 	}
 	return nil
@@ -699,6 +702,23 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 	if len(members) > MaxBindings {
 		return fmt.Errorf("%w: an import stores at most %d members", ErrInvalid, MaxBindings)
 	}
+	set, err := a.memberSet(members)
+	if err != nil {
+		return err
+	}
+	scopes, principals := memberLocks(set)
+	return a.inTx(ctx, tenant, actor, func(tx pgx.Tx) (ChangeEvent, error) {
+		if err := lockAll(ctx, tx, tenant, scopes, principals); err != nil {
+			return ChangeEvent{}, err
+		}
+		joined, err := a.join(ctx, tx, tenant, actor, set)
+		return ChangeEvent{Joined: joined}, err
+	})
+}
+
+// memberSet checks members to add and returns them sorted, each group, principal and source once,
+// the last given.
+func (a *Authorizer) memberSet(members []Member) ([]Member, error) {
 	now := a.cfg.Now()
 	type key struct {
 		group, principal, source string
@@ -711,18 +731,35 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 		byKey[key{m.Group, m.Principal.key(), m.Source}] = m
 	}
 	if err := errors.Join(errs...); err != nil {
-		return err
+		return nil, err
 	}
-	set := slices.SortedFunc(maps.Values(byKey), func(x, y Member) int {
+	return slices.SortedFunc(maps.Values(byKey), func(x, y Member) int {
 		return strings.Compare(x.Group+"\x00"+x.Principal.key()+"\x00"+x.Source, y.Group+"\x00"+y.Principal.key()+"\x00"+y.Source)
-	})
+	}), nil
+}
+
+// memberLocks returns the scope and principal locks a change to members takes: each group's, the
+// nesting lock when one nests groups, and each member's.
+func memberLocks(members []Member) (scopes, principals []string) {
+	ss, ps := map[string]bool{}, map[string]bool{}
+	for _, m := range members {
+		ss[groupKey(m.Group)] = true
+		ps[m.Principal.key()] = true
+		if m.Principal.Kind == Group {
+			ss[nestingKey] = true
+		}
+	}
+	return slices.Sorted(maps.Keys(ss)), slices.Sorted(maps.Keys(ps))
+}
+
+// join stores members memberSet checked, under the change's locks, and returns those it added or
+// changed: refusing an identity that isn't a member or guest of the tenant, a group that doesn't
+// exist, a group in a privileged one, and nesting that makes a cycle or too long a chain.
+func (a *Authorizer) join(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, set []Member) ([]Member, error) {
 	groups, identities := map[string]bool{}, map[string]bool{}
-	scopes, principals := map[string]bool{}, map[string]bool{}
 	var nested []Member
 	for _, m := range set {
 		groups[m.Group] = true
-		scopes[groupKey(m.Group)] = true
-		principals[m.Principal.key()] = true
 		if m.Principal.Kind == Group {
 			groups[m.Principal.ID] = true
 			nested = append(nested, m)
@@ -730,47 +767,292 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 			identities[m.Principal.key()] = true
 		}
 	}
-	if len(nested) > 0 {
-		scopes[nestingKey] = true
+	if err := a.membersCanJoin(ctx, tx, tenant, slices.Sorted(maps.Keys(groups)), slices.Sorted(maps.Keys(identities))); err != nil {
+		return nil, err
 	}
-	return a.inTx(ctx, tenant, actor, func(tx pgx.Tx) (ChangeEvent, error) {
-		if err := lockAll(ctx, tx, tenant, slices.Collect(maps.Keys(scopes)), slices.Collect(maps.Keys(principals))); err != nil {
+	if err := privilegedTakeNoGroups(ctx, tx, tenant, nested); err != nil {
+		return nil, err
+	}
+	n := len(set)
+	ids, kinds, pids, sources, notes := make([]string, n), make([]string, n), make([]string, n), make([]string, n), make([]string, n)
+	expires := make([]pgtype.Timestamptz, n)
+	for i, m := range set {
+		ids[i], kinds[i], pids[i], sources[i], notes[i] = m.Group, string(m.Principal.Kind), m.Principal.ID, m.Source, m.Note
+		expires[i] = pgtype.Timestamptz{Time: m.ExpiresAt, Valid: !m.ExpiresAt.IsZero()}
+	}
+	rows, err := tx.Query(ctx, `
+		INSERT INTO rbac_members AS m (tenant, group_id, principal_kind, principal_id, source, expires_at, note, created_by, updated_by)
+		SELECT $1, g, k, i, s, e, n, $8, $8 FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::timestamptz[], $7::text[])
+		  AS t(g, k, i, s, e, n)
+		ON CONFLICT (tenant, group_id, principal, source) DO UPDATE SET expires_at = EXCLUDED.expires_at, note = EXCLUDED.note,
+		  updated_by = EXCLUDED.updated_by, updated_at = now()
+		WHERE (m.expires_at, m.note) IS DISTINCT FROM (EXCLUDED.expires_at, EXCLUDED.note)
+		RETURNING `+memberColumns,
+		tenant, ids, kinds, pids, sources, expires, notes, actorKey(actor))
+	if err != nil {
+		return nil, err
+	}
+	joined, err := collectMembers(rows)
+	if err != nil {
+		return nil, err
+	}
+	return joined, a.nestable(ctx, tx, tenant, nested)
+}
+
+// ChangeMembers adds members to a tenant's groups, or changes their expiry or note, and removes
+// others, each by its group, principal and source, as actor, in one transaction. Whoever is in a
+// group holds what it holds and is bound by the denies naming it, so the members of one that isn't
+// privileged change with GroupMembers on its scope, and a privileged one's only with
+// ManagePrivilegedGroups on the tenant, removals included, and never to add the actor itself; a
+// constraint on either stops them. Config.ValidateGrant is asked about each grant and eligibility
+// of a privileged role a privileged group holds, for each identity added to it (ViaMembership), as
+// that identity's. Members from a source the host owns only the host changes, and what
+// ImportMembers refuses, this does.
+func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant string, add, remove []Member) error {
+	if tenant == "" {
+		return fmt.Errorf("%w: no tenant", ErrInvalid)
+	}
+	if err := a.subject(actor); err != nil {
+		return err
+	}
+	if len(add)+len(remove) == 0 {
+		return nil
+	}
+	if len(add)+len(remove) > MaxBindings {
+		return fmt.Errorf("%w: a change names at most %d members", ErrInvalid, MaxBindings)
+	}
+	set, err := a.memberSet(add)
+	if err != nil {
+		return err
+	}
+	var owned []error
+	for _, m := range slices.Concat(set, remove) {
+		if a.owned[m.Source] {
+			owned = append(owned, fmt.Errorf("%w: %s in group %q is from %s, which only the host changes", ErrInvalid, m.Principal.key(), m.Group, m.Source))
+		}
+	}
+	if err := errors.Join(owned...); err != nil {
+		return err
+	}
+	ids := map[string]bool{}
+	for _, m := range slices.Concat(set, remove) {
+		ids[m.Group] = true
+	}
+	groups := slices.Sorted(maps.Keys(ids))
+	privileged, err := privilegedGroups(ctx, a.db, tenant, groups)
+	if err != nil {
+		return err
+	}
+	if err := a.mayChangeMembers(ctx, a.db, actor, tenant, groups, privileged, true); err != nil {
+		return err
+	}
+	for _, m := range set {
+		if privileged[m.Group] && m.Principal == actor.Principal {
+			return &DeniedError{Permission: ManagePrivilegedGroups, Scope: TenantRoot(tenant), Reason: "no one adds themselves to a privileged group"}
+		}
+	}
+	asked, err := a.askMemberships(ctx, actor, tenant, set, privileged)
+	if err != nil {
+		return err
+	}
+	scopes, principals := memberLocks(slices.Concat(set, remove))
+	// Grants to a privileged group take its lock, so none is made while the members it gains are.
+	for g, p := range privileged {
+		if p {
+			principals = append(principals, groupPrincipal(g).key())
+		}
+	}
+	return a.inTx(ctx, tenant, actor.Principal, func(tx pgx.Tx) (ChangeEvent, error) {
+		if err := lockAll(ctx, tx, tenant, scopes, principals); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.membersCanJoin(ctx, tx, tenant, slices.Sorted(maps.Keys(groups)), slices.Sorted(maps.Keys(identities))); err != nil {
-			return ChangeEvent{}, err
-		}
-		if err := privilegedTakeNoGroups(ctx, tx, tenant, nested); err != nil {
-			return ChangeEvent{}, err
-		}
-		n := len(set)
-		ids, kinds, pids, sources, notes := make([]string, n), make([]string, n), make([]string, n), make([]string, n), make([]string, n)
-		expires := make([]pgtype.Timestamptz, n)
-		for i, m := range set {
-			ids[i], kinds[i], pids[i], sources[i], notes[i] = m.Group, string(m.Principal.Kind), m.Principal.ID, m.Source, m.Note
-			expires[i] = pgtype.Timestamptz{Time: m.ExpiresAt, Valid: !m.ExpiresAt.IsZero()}
-		}
-		rows, err := tx.Query(ctx, `
-			INSERT INTO rbac_members AS m (tenant, group_id, principal_kind, principal_id, source, expires_at, note, created_by, updated_by)
-			SELECT $1, g, k, i, s, e, n, $8, $8 FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::timestamptz[], $7::text[])
-			  AS t(g, k, i, s, e, n)
-			ON CONFLICT (tenant, group_id, principal, source) DO UPDATE SET expires_at = EXCLUDED.expires_at, note = EXCLUDED.note,
-			  updated_by = EXCLUDED.updated_by, updated_at = now()
-			WHERE (m.expires_at, m.note) IS DISTINCT FROM (EXCLUDED.expires_at, EXCLUDED.note)
-			RETURNING `+memberColumns,
-			tenant, ids, kinds, pids, sources, expires, notes, actorKey(actor))
+		now, err := privilegedGroups(ctx, tx, tenant, groups)
 		if err != nil {
 			return ChangeEvent{}, err
 		}
-		joined, err := collectMembers(rows)
+		if !maps.Equal(now, privileged) {
+			return ChangeEvent{}, fmt.Errorf("%w: a group changed while this change waited for it; try again", ErrConflict)
+		}
+		if err := a.mayChangeMembers(ctx, tx, actor, tenant, groups, privileged, false); err != nil {
+			return ChangeEvent{}, err
+		}
+		gains, err := a.privilegedHeld(ctx, tx, tenant, privileged)
 		if err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.nestable(ctx, tx, tenant, nested); err != nil {
-			return ChangeEvent{}, err
+		for _, g := range gains {
+			if was, ok := asked[g.key()]; (!ok || widens(was, g.role)) && slices.ContainsFunc(set, g.gainedBy) {
+				return ChangeEvent{}, fmt.Errorf("%w: what group %q holds changed while this change waited for it; try again", ErrConflict, g.group)
+			}
 		}
-		return ChangeEvent{Joined: joined}, nil
+		var e ChangeEvent
+		if len(remove) > 0 {
+			if e.Left, err = a.leave(ctx, tx, tenant, remove); err != nil {
+				return ChangeEvent{}, err
+			}
+		}
+		if len(set) > 0 {
+			if e.Joined, err = a.join(ctx, tx, tenant, actor.Principal, set); err != nil {
+				return ChangeEvent{}, err
+			}
+		}
+		return e, nil
 	})
+}
+
+// privilegedGroups reads, on q, which of a tenant's groups exist, and whether each is privileged.
+func privilegedGroups(ctx context.Context, q DB, tenant string, ids []string) (map[string]bool, error) {
+	rows, err := q.Query(ctx, `SELECT id, privileged FROM rbac_groups WHERE tenant = $1 AND id = ANY($2::text[])`, tenant, ids)
+	if err != nil {
+		return nil, err
+	}
+	found := map[string]bool{}
+	var id string
+	var privileged bool
+	_, err = pgx.ForEachRow(rows, []any{&id, &privileged}, func() error {
+		found[id] = privileged
+		return nil
+	})
+	return found, err
+}
+
+// mayChangeMembers checks, on q, that actor may change the members of groups: ManagePrivilegedGroups
+// on the tenant for a privileged one, GroupMembers on its scope for any other, or one that doesn't
+// exist, which has none to change. Constraints are asked only with constraints, before the
+// transaction.
+func (a *Authorizer) mayChangeMembers(ctx context.Context, q DB, actor Subject, tenant string, groups []string, privileged map[string]bool, constraints bool) error {
+	checked := false
+	for _, g := range groups {
+		if p, ok := privileged[g]; ok && p {
+			if !checked {
+				if err := a.mayManageGroups(ctx, q, actor, Resource{Tenant: tenant, Type: TenantScope, ID: tenant}, ManagePrivilegedGroups, constraints); err != nil {
+					return err
+				}
+				checked = true
+			}
+			continue
+		}
+		if err := a.mayManageGroups(ctx, q, actor, Resource{Tenant: tenant, Type: GroupScope, ID: g}, GroupMembers, constraints); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// gain is a grant or eligibility of a privileged role a privileged group holds, which an identity
+// joining it gains.
+type gain struct {
+	group    string
+	scope    Scope
+	binding  Binding
+	role     RoleDefinition
+	eligible bool
+}
+
+func (g gain) key() string {
+	if g.eligible {
+		return "eligibility " + g.scope.Key() + " " + g.group + " " + string(g.binding.Role)
+	}
+	return "grant " + g.binding.ID
+}
+
+// gainedBy reports whether an identity m adds gains g.
+func (g gain) gainedBy(m Member) bool { return m.Group == g.group && m.Principal.Kind != Group }
+
+// as is g as the grant or eligibility of m, as the host is asked about it: until the sooner of its
+// end and m's.
+func (g gain) as(m Member) Binding {
+	b := g.binding
+	b.ID, b.Principal = "", m.Principal
+	if !m.ExpiresAt.IsZero() && (b.ExpiresAt.IsZero() || m.ExpiresAt.Before(b.ExpiresAt)) {
+		b.ExpiresAt = m.ExpiresAt
+	}
+	return b
+}
+
+// privilegedHeld reads, on q, the grants and eligibilities in force of a privileged role that the
+// privileged groups among privileged hold.
+func (a *Authorizer) privilegedHeld(ctx context.Context, q DB, tenant string, privileged map[string]bool) ([]gain, error) {
+	var keys []string
+	for g, p := range privileged {
+		if p {
+			keys = append(keys, groupPrincipal(g).key())
+		}
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	now := a.cfg.Now()
+	rows, err := q.Query(ctx, `SELECT `+grantColumns+` FROM rbac_grants
+		WHERE tenant = $1 AND principal = ANY($2::text[]) AND (expires_at IS NULL OR expires_at > $3) ORDER BY id`, tenant, keys, now)
+	if err != nil {
+		return nil, err
+	}
+	grants, err := collectGrants(rows)
+	if err != nil {
+		return nil, err
+	}
+	rows, err = q.Query(ctx, `SELECT `+eligibilityColumns+` FROM rbac_eligibilities
+		WHERE tenant = $1 AND principal = ANY($2::text[]) AND (expires_at IS NULL OR expires_at > $3) ORDER BY scope, principal, role`,
+		tenant, keys, now)
+	if err != nil {
+		return nil, err
+	}
+	eligible, err := collectEligibilities(rows)
+	if err != nil {
+		return nil, err
+	}
+	var ids []Role
+	for _, g := range grants {
+		ids = append(ids, g.Role)
+	}
+	for _, e := range eligible {
+		ids = append(ids, e.Role)
+	}
+	roles, err := a.tenantBook(ctx, q, tenant, ids)
+	if err != nil {
+		return nil, err
+	}
+	var gains []gain
+	add := func(scope Scope, b Binding, eligible bool) {
+		if def, ok := roles.role(b.Role); ok && def.Privileged {
+			gains = append(gains, gain{group: b.Principal.ID, scope: scope, binding: b, role: def, eligible: eligible})
+		}
+	}
+	for _, g := range grants {
+		add(g.Scope, g.Binding, false)
+	}
+	for _, e := range eligible {
+		add(e.Scope, e.binding(), true)
+	}
+	return gains, nil
+}
+
+// askMemberships asks Config.ValidateGrant, before ChangeMembers' transaction, about each
+// privileged grant and eligibility each identity set adds to a privileged group gains, and returns
+// those it asked about, with the role as it asked.
+func (a *Authorizer) askMemberships(ctx context.Context, actor Subject, tenant string, set []Member, privileged map[string]bool) (map[string]RoleDefinition, error) {
+	gains, err := a.privilegedHeld(ctx, a.db, tenant, privileged)
+	if err != nil {
+		return nil, err
+	}
+	asked := map[string]RoleDefinition{}
+	var refused []error
+	for _, g := range gains {
+		roles := book{builtin: a.roles, custom: map[Role]RoleDefinition{g.role.ID: g.role}}
+		for _, m := range set {
+			if !g.gainedBy(m) {
+				continue
+			}
+			bad, err := a.allowed(ctx, roles, actor, ViaMembership, tenant, g.scope, g.as(m))
+			if err != nil {
+				return nil, err
+			}
+			refused = append(refused, bad...)
+		}
+		asked[g.key()] = g.role
+	}
+	return asked, errors.Join(refused...)
 }
 
 // privilegedTakeNoGroups refuses nesting a group in a privileged one, whose members are identities
@@ -890,22 +1172,25 @@ func (a *Authorizer) DeleteMembers(ctx context.Context, actor Principal, tenant 
 	if len(members) > MaxBindings {
 		return fmt.Errorf("%w: a deletion names at most %d members", ErrInvalid, MaxBindings)
 	}
-	n := len(members)
-	groups, principals, sources := make([]string, n), make([]string, n), make([]string, n)
-	scopes, keys := map[string]bool{}, map[string]bool{}
-	for i, m := range members {
-		groups[i], principals[i], sources[i] = m.Group, m.Principal.key(), m.Source
-		scopes[groupKey(m.Group)] = true
-		keys[m.Principal.key()] = true
-	}
+	scopes, principals := memberLocks(members)
 	return a.inTx(ctx, tenant, actor, func(tx pgx.Tx) (ChangeEvent, error) {
-		if err := lockAll(ctx, tx, tenant, slices.Collect(maps.Keys(scopes)), slices.Collect(maps.Keys(keys))); err != nil {
+		if err := lockAll(ctx, tx, tenant, scopes, principals); err != nil {
 			return ChangeEvent{}, err
 		}
-		left, err := removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant,
-			"(group_id, principal, source) IN (SELECT * FROM unnest($2::text[], $3::text[], $4::text[]))", groups, principals, sources)
+		left, err := a.leave(ctx, tx, tenant, members)
 		return ChangeEvent{Left: left}, err
 	})
+}
+
+// leave removes members, each by its group, principal and source, under the change's locks.
+func (a *Authorizer) leave(ctx context.Context, tx pgx.Tx, tenant string, members []Member) ([]Member, error) {
+	n := len(members)
+	groups, principals, sources := make([]string, n), make([]string, n), make([]string, n)
+	for i, m := range members {
+		groups[i], principals[i], sources[i] = m.Group, m.Principal.key(), m.Source
+	}
+	return removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant,
+		"(group_id, principal, source) IN (SELECT * FROM unnest($2::text[], $3::text[], $4::text[]))", groups, principals, sources)
 }
 
 // Members lists a group's members in force, as stored: identities and groups, not the members of
