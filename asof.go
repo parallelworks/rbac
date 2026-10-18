@@ -30,7 +30,9 @@ var asOfEntities = []struct{ table, entity string }{
 // Hooks run as for any read, and a constraint that reads the package's tables through the DB it
 // is given reads them as of the time too; one that reads the host's reads them as they are now.
 // A Filter condition reads as of the time only in a query on the transaction read runs in: under
-// WithTx, the host's, before read returns.
+// WithTx, the host's, before read returns. It refuses a time earlier than any PruneHistory's
+// before, since the prune removed versions such a time would read, and fails once read returns
+// if such a prune committed while it ran.
 //
 // WithTx on the Authorizer read is given returns it as it is, reading the past on its own
 // transaction.
@@ -67,11 +69,12 @@ func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read
 	return a.readAsOf(ctx, tx, tenant, at, read)
 }
 
-// readAsOf runs read on tx, with history standing in for the package's tables.
-func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at time.Time, read func(*Authorizer) error) error {
+// historySchema returns the schema tx reads history in, refusing it where history's ids can't
+// order a row's changes.
+func historySchema(ctx context.Context, tx pgx.Tx) (string, error) {
 	var schema string
 	if err := tx.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
-		return err
+		return "", err
 	}
 	// A cached sequence hands each session a block of ids of its own, so a change made after
 	// another can take the lower id.
@@ -79,10 +82,22 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	if err := tx.QueryRow(ctx, `SELECT s.seqcache = 1 FROM pg_catalog.pg_sequence s
 		WHERE s.seqrelid = pg_catalog.pg_get_serial_sequence(pg_catalog.quote_ident($1) || '.rbac_history', 'id')::regclass`,
 		schema).Scan(&ordered); err != nil {
-		return err
+		return "", err
 	}
 	if !ordered {
-		return fmt.Errorf("%w: the sequence numbering %s.rbac_history caches ids, so they can't order a row's changes", ErrInvalid, schema)
+		return "", fmt.Errorf("%w: the sequence numbering %s.rbac_history caches ids, so they can't order a row's changes", ErrInvalid, schema)
+	}
+	return schema, nil
+}
+
+// readAsOf runs read on tx, with history standing in for the package's tables.
+func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at time.Time, read func(*Authorizer) error) error {
+	schema, err := historySchema(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if err := unpruned(ctx, tx, schema, at); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.as_of_tenant', $1, true), set_config('rbac.as_of', $2::timestamptz::text, true)`,
 		tenant, at); err != nil {
@@ -126,7 +141,31 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	// A change is refused before its transaction, so the host is never asked about one that can't
 	// be made.
 	b.cfg.ValidateGrant = func(context.Context, DB, GrantInput) error { return b.writable() }
-	return read(&b)
+	if err := read(&b); err != nil {
+		return err
+	}
+	// At READ COMMITTED, as a host's transaction under WithTx is, each of read's queries reads what
+	// has committed by then, so one after a prune that committed since the check read what it
+	// removed. Checked once ctx is done too, as read's answers stand only if this passes.
+	c, cancel := context.WithTimeout(context.WithoutCancel(ctx), savepointEnd)
+	defer cancel()
+	return unpruned(c, tx, schema, at)
+}
+
+// unpruned refuses at, on tx, once a prune has run past it: of each row a prune keeps only its
+// last version as of the prune's time, which an earlier time would read as the row's version
+// then, or as no row.
+func unpruned(ctx context.Context, tx pgx.Tx, schema string, at time.Time) error {
+	var pruned bool
+	if err := tx.QueryRow(ctx, fmt.Sprintf(`SELECT coalesce($1::timestamptz < max((h.after->>'before')::timestamptz), false)
+		FROM %s.rbac_history h WHERE h.tenant = '' AND h.entity = 'history' AND h.op = 'prune'`, pgx.Identifier{schema}.Sanitize()),
+		at).Scan(&pruned); err != nil {
+		return err
+	}
+	if pruned {
+		return fmt.Errorf("%w: history was pruned past the time, so it can't be read as of then", ErrInvalid)
+	}
+	return nil
 }
 
 // writable refuses a change on an Authorizer AsOf gave, which reads the past.

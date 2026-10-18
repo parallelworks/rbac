@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"maps"
 	"slices"
 	"strings"
 	"testing"
@@ -234,18 +235,7 @@ func TestHistoryIsWrittenByItsTriggersAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	var schema string
-	if err := tx.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
-		t.Fatal(err)
-	}
-	// A role made and dropped with tx, as roles are the cluster's.
-	writer := pgx.Identifier{"rbac_test_" + strings.ToLower(rand.Text())}.Sanitize()
-	if _, err := tx.Exec(ctx, `CREATE ROLE `+writer); err != nil {
-		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "42501" {
-			t.Skip("the test database's role can't create roles")
-		}
-		t.Fatal(err)
-	}
+	writer, schema := role(t, tx)
 	for _, sql := range []string{
 		`GRANT USAGE ON SCHEMA ` + pgx.Identifier{schema}.Sanitize() + ` TO ` + writer,
 		`GRANT INSERT ON rbac_grants TO ` + writer,
@@ -263,6 +253,23 @@ func TestHistoryIsWrittenByItsTriggersAlone(t *testing.T) {
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM `+pgx.Identifier{schema, "rbac_history"}.Sanitize()+` WHERE principal = 'user:writer'`).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("recorded %d, %v", n, err)
 	}
+}
+
+// role makes a role with tx, dropped with it, as roles are the cluster's, and returns it, quoted,
+// and tx's schema.
+func role(t *testing.T, tx pgx.Tx) (name, schema string) {
+	t.Helper()
+	if err := tx.QueryRow(t.Context(), `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	name = pgx.Identifier{"rbac_test_" + strings.ToLower(rand.Text())}.Sanitize()
+	if _, err := tx.Exec(t.Context(), `CREATE ROLE `+name); err != nil {
+		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "42501" {
+			t.Skip("the test database's role can't create roles")
+		}
+		t.Fatal(err)
+	}
+	return name, schema
 }
 
 func TestHistoryKeysTellMembersApart(t *testing.T) {
@@ -977,5 +984,321 @@ func TestAChangeAsOfATimeIsNotReportedRefused(t *testing.T) {
 	}
 	if len(refused) != 0 {
 		t.Fatalf("reported %+v", refused)
+	}
+}
+
+// cursorAt is a cursor at the record query finds, as an export that read up to it. Not one History
+// gives, which a transaction running anywhere in the cluster holds back.
+func cursorAt(t *testing.T, h *harness, query string, args ...any) rbac.Cursor {
+	t.Helper()
+	_, c, err := h.authz.History(t.Context(), rbac.Cursor{}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.pool.QueryRow(t.Context(), query, args...).Scan(&c.TxID, &c.ID, &c.RecordedAt); err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// exported is a cursor at the last record history holds now, as an export that read it all.
+func exported(t *testing.T, h *harness) rbac.Cursor {
+	t.Helper()
+	return cursorAt(t, h, `SELECT txid, id, recorded_at FROM rbac_history ORDER BY txid DESC, id DESC LIMIT 1`)
+}
+
+// notesAt is the note of each grant on the cluster in t1 as of at, by its principal's id.
+func notesAt(t *testing.T, h *harness, at time.Time) (map[string]string, error) {
+	t.Helper()
+	ctx := t.Context()
+	got := map[string]string{}
+	err := h.authz.AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+		grants, err := a.Grants(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}})
+		for _, g := range grants {
+			got[g.Principal.ID] = g.Note
+		}
+		return err
+	})
+	return got, err
+}
+
+func TestPruningHistoryKeepsWhatAsOfReads(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.as(t, "u")
+	h.as(t, "d")
+	start := dbNow(t, h)
+	const insert = `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, note)
+		VALUES ('t1', 'cluster', 'c1', 'user', $1, 'cluster.login', $2)`
+	for _, q := range []struct{ sql, arg string }{
+		{insert, "u"},
+		{`UPDATE rbac_grants SET note = 'second' WHERE principal = 'user:u'`, ""},
+		{insert, "d"},
+		{`DELETE FROM rbac_grants WHERE principal = 'user:d'`, ""},
+	} {
+		args := []any{}
+		if q.arg != "" {
+			args = []any{q.arg, "first"}
+		}
+		if _, err := h.pool.Exec(ctx, q.sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	then := dbNow(t, h)
+	if _, err := h.pool.Exec(ctx, `UPDATE rbac_grants SET note = 'third' WHERE principal = 'user:u'`); err != nil {
+		t.Fatal(err)
+	}
+	notes := func(at time.Time) map[string]string {
+		t.Helper()
+		got, err := notesAt(t, h, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	notes(start)
+	before, now := notes(then), notes(dbNow(t, h))
+	through := exported(t, h)
+	// Only what an export read past goes: nothing at or past the cursor.
+	first := cursorAt(t, h, `SELECT txid, id, recorded_at FROM rbac_history ORDER BY txid, id LIMIT 1`)
+	if n, err := rbac.PruneHistory(ctx, h.pool, then, first); err != nil || n != 0 {
+		t.Fatalf("pruning through the first record: %d, %v", n, err)
+	}
+	// u's first version, which its second superseded before then, and d, whose delete ended it.
+	if n, err := rbac.PruneHistory(ctx, h.pool, then, through); err != nil || n != 3 {
+		t.Fatalf("PruneHistory = %d, %v", n, err)
+	}
+	if got := notes(then); !maps.Equal(got, before) || got["u"] != "second" || got["d"] != "" {
+		t.Errorf("as of then: %v, before pruning %v", got, before)
+	}
+	if got := notes(dbNow(t, h)); !maps.Equal(got, now) || got["u"] != "third" {
+		t.Errorf("as of now: %v, before pruning %v", got, now)
+	}
+	// Before then, u held no grant, which history no longer says.
+	if got, err := notesAt(t, h, start); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("as of before the prune's time: %v, %v", got, err)
+	}
+	// The export goes on from its cursor, and reads both prunes, each with what it deleted.
+	cursor := through
+	for i, r := range drain(t, h, &cursor, 2) {
+		deleted := []string{`"deleted": 0`, `"deleted": 3`}[i]
+		if r.Entity != "history" || r.Op != "prune" || r.How != "PruneHistory" || !strings.Contains(string(r.After), deleted) ||
+			r.Key != then.UTC().Format("2006-01-02T15:04:05.000000Z") {
+			t.Errorf("prune %d: %+v", i, r)
+		}
+	}
+	// A prune needs an export's cursor, of this generation, and a time that has passed: AsOf would
+	// refuse the present until one to come.
+	if _, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h).Add(time.Hour), through); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("a prune of history up to a time to come: %v", err)
+	}
+	if _, err := rbac.PruneHistory(ctx, h.pool, then, rbac.Cursor{}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("a prune with no cursor: %v", err)
+	}
+	other := through
+	other.Generation = "1/1"
+	if _, err := rbac.PruneHistory(ctx, h.pool, then, other); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("a prune through another generation's cursor: %v", err)
+	}
+}
+
+// A row's end, its last version at the time, stays while a version before it does, which would
+// otherwise be the last AsOf finds: one the export hasn't read, or one dated after the time but
+// written first, by a transaction that began after the end's.
+func TestPruningHistoryKeepsAnEndWhileAVersionBeforeItStays(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	for _, id := range []string{"early", "late", "mark"} {
+		h.as(t, id)
+	}
+	const insert = `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'c1', 'user', $1, 'cluster.login')`
+	// The revoke takes its transaction's id first, and early's grant begins before then but takes
+	// its id after the record the export read to.
+	revoke, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = revoke.Rollback(ctx) }()
+	if _, err := revoke.Exec(ctx, `SELECT pg_current_xact_id()`); err != nil {
+		t.Fatal(err)
+	}
+	early, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = early.Rollback(ctx) }()
+	then := dbNow(t, h)
+	for _, id := range []string{"late", "mark"} {
+		if _, err := h.pool.Exec(ctx, insert, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := early.Exec(ctx, insert, "early"); err != nil {
+		t.Fatal(err)
+	}
+	if err := early.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := revoke.Exec(ctx, `DELETE FROM rbac_grants WHERE principal IN ('user:early', 'user:late')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := revoke.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now := dbNow(t, h)
+	want, err := notesAt(t, h, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := want["mark"]; !ok || len(want) == 0 {
+		t.Fatalf("as of now: %v", want)
+	}
+	through := cursorAt(t, h, `SELECT txid, id, recorded_at FROM rbac_history WHERE entity = 'grant' AND principal = 'user:mark'`)
+	if _, err := rbac.PruneHistory(ctx, h.pool, then, through); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := notesAt(t, h, now); err != nil || !maps.Equal(got, want) {
+		t.Errorf("as of now: %v, %v, before pruning %v", got, err, want)
+	}
+}
+
+// Under a host's transaction, history is append only again for what the host writes after a prune.
+func TestPruningHistoryOnAHostsTransaction(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.as(t, "u")
+	through := exported(t, h)
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := rbac.PruneHistory(ctx, tx, dbNow(t, h), through); err != nil {
+		t.Fatal(err)
+	}
+	_, err = tx.Exec(ctx, `DELETE FROM rbac_history WHERE id = (SELECT min(id) FROM rbac_history)`)
+	if pgErr := (*pgconn.PgError)(nil); !errors.As(err, &pgErr) || pgErr.Code != "42501" {
+		t.Fatalf("a delete from history after the prune: %v", err)
+	}
+}
+
+// Under a host's transaction, at READ COMMITTED, each of read's queries reads what has committed
+// by then: a prune past the time that commits while read runs fails it.
+func TestAsOfFailsOnAPruneWhileItReads(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.as(t, "d")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'd', 'cluster.login')`); err != nil {
+		t.Fatal(err)
+	}
+	then := dbNow(t, h)
+	if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_grants WHERE principal = 'user:d'`); err != nil {
+		t.Fatal(err)
+	}
+	through, now := exported(t, h), dbNow(t, h)
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var held []bool
+	err = h.authz.WithTx(tx).AsOf(ctx, "t1", then, func(a *rbac.Authorizer) error {
+		for range 2 {
+			grants, err := a.Grants(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}})
+			if err != nil {
+				return err
+			}
+			held = append(held, slices.ContainsFunc(grants, func(g rbac.Grant) bool { return g.Principal.ID == "d" }))
+			if len(held) == 1 {
+				if _, err := rbac.PruneHistory(ctx, h.pool, now, through); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+	if !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("AsOf while a prune past its time commits: %v, held %v", err, held)
+	}
+}
+
+// Any session can set what PruneHistory sets, so it lets a delete through only for a role with the
+// rights of history's owner, which can disable the trigger anyway: one granted DELETE alone isn't.
+func TestHistoryIsPrunedOnlyWithItsOwnersRights(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.as(t, "u")
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	deleter, schema := role(t, tx)
+	for _, sql := range []string{
+		`GRANT USAGE ON SCHEMA ` + pgx.Identifier{schema}.Sanitize() + ` TO ` + deleter,
+		`GRANT DELETE ON rbac_history TO ` + deleter,
+		`SET LOCAL ROLE ` + deleter,
+		`SELECT set_config('rbac.prune', 'on', true)`,
+	} {
+		if _, err := tx.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	_, err = tx.Exec(ctx, `DELETE FROM rbac_history`)
+	if pgErr := (*pgconn.PgError)(nil); !errors.As(err, &pgErr) || pgErr.Code != "42501" {
+		t.Fatalf("a delete from history by a role granted DELETE: %v", err)
+	}
+}
+
+func TestPruningHistoryInBatchesKeepsWhatAsOfReadsBetweenThem(t *testing.T) {
+	rbac.SetMaxPrune(t, 1)
+	h := setup(t)
+	ctx := t.Context()
+	h.as(t, "u")
+	h.as(t, "d")
+	const insert = `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, note)
+		VALUES ('t1', 'cluster', 'c1', 'user', $1, 'cluster.login', 'first')`
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{insert, []any{"u"}},
+		{`UPDATE rbac_grants SET note = 'second' WHERE principal = 'user:u'`, nil},
+		{insert, []any{"d"}},
+		{`DELETE FROM rbac_grants WHERE principal = 'user:d'`, nil},
+	} {
+		if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	then := dbNow(t, h)
+	// A change since, so the export's cursor is past every record the prune may take.
+	if _, err := h.pool.Exec(ctx, `UPDATE rbac_grants SET note = 'third' WHERE principal = 'user:u'`); err != nil {
+		t.Fatal(err)
+	}
+	through := exported(t, h)
+	want, err := notesAt(t, h, then)
+	if err != nil || !maps.Equal(want, map[string]string{"u": "second", "owner": ""}) {
+		t.Fatalf("as of then = %v, %v", want, err)
+	}
+	// One record a call, oldest first: d's grant before its revoke, which still reads as its end.
+	total := 0
+	for range 10 {
+		n, err := rbac.PruneHistory(ctx, h.pool, then, through)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := notesAt(t, h, then); err != nil || !maps.Equal(got, want) {
+			t.Fatalf("after %d pruned: as of then %v, %v", total+int(n), got, err)
+		}
+		if n == 0 {
+			break
+		}
+		total += int(n)
+	}
+	if total != 3 {
+		t.Fatalf("pruned %d", total)
 	}
 }

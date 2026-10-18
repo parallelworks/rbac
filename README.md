@@ -167,15 +167,16 @@ actor and the call that made it (`Record.How`), and what the host attaches with 
 on whose behalf it was made, the request and the reason. An expiry `DeleteExpired` removes is
 recorded as one, made by no one. Triggers write it, so a write that bypasses the package is
 recorded too, as no one's. That context is what the session that wrote it says; the database role
-is what the database knows. Nothing updates, deletes or truncates it, and the package's tables
-can be deleted from but not truncated. `History` reads it in order, to export it to storage of
-the host's own: a transaction that commits after a later one is read after it, never skipped,
-and a record can be read twice, so dedupe on `Record.ID` and `RecordedAt`: a restore can give
-another record the ID of one it lost. Any transaction still running in the
-database cluster, in any of its databases, holds `History` back until it ends. `History` reads the
-primary, and fails on a replica. A failover or a recovery to a point in time starts a new
-generation (`Cursor.Generation`), and a restore that starts none, as from a disk snapshot, loses
-what came after it: either can number again what the last one numbered past what it kept.
+is what the database knows. Nothing updates or truncates it, only `PruneHistory` deletes from it,
+and the package's tables can be deleted from but not truncated. `History` reads it in order, to
+export it to storage of the host's own: a transaction that commits after a later one is read
+after it, never skipped, and a record can be read twice, so dedupe on `Record.ID` and
+`RecordedAt`: a restore can give another record the ID of one it lost. Any transaction still
+running in the database cluster, in any of its databases, holds `History` back until it ends.
+`History` reads the primary, and fails on a replica. A failover or a recovery to a point in time
+starts a new generation (`Cursor.Generation`), and a restore that starts none, as from a disk
+snapshot, loses what came after it: either can number again what the last one numbered past
+what it kept.
 `History` refuses a cursor from another generation, or whose last record the database no longer
 holds, and history is exported again from the start, kept apart from the last export. Move
 history with physical backups and replicas; a logical dump restored into another cluster numbers
@@ -192,6 +193,14 @@ for an access review of a past date. A change counts from when its transaction b
 can be made through it: one tried is no actor's attempt, and `Config.OnRefused` isn't told of
 it. It orders a row's changes by their ids in `rbac_history`, which sessions take out of order
 once that table's id sequence caches more than one, so `AsOf` refuses that.
+
+`rbac.PruneHistory(ctx, db, before, through)` deletes what an export has read past (`through`,
+its cursor) and later records supersede: of each row, the last version at or before `before`
+stays, so `AsOf` answers as it did for any time from then on, and refuses an earlier one, and a
+row that had ended by then goes, once no version before its end stays. One call deletes at most
+`rbac.MaxPrune` records: call it again while it deletes as many. The prune is recorded in history. Run it on a connection of the
+administrator's role below, which has the rights of history's owner, as the application's hasn't,
+and keep what the host's audit retention requires: the federal floor is at least a year.
 
 A role that owns a table can change it whatever its triggers say, and a schema's owner can drop
 any table in it. So that the application's database role can't rewrite history or write around
