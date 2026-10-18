@@ -52,8 +52,8 @@ func (e *InvalidError) Unwrap() error { return e.Err }
 //   - a role that gives a `:grant` or `:deny` permission, DefineRoles, ManageGroups or
 //     ManagePrivilegedGroups can't be granted to a tenant's members or the public, and only a role
 //     marked Public can be granted to the public;
-//   - a group granted a role is one of the tenant's: what a grant to one that doesn't exist named
-//     would pass to a group made later with its id.
+//   - a group granted a role, or one a role is granted on, is one of the tenant's: what a grant
+//     naming one that doesn't exist gave would pass to a group made later with its id.
 //
 // Anonymous subjects change nothing. A grant outlives the actor's own access: revoking that
 // access leaves the grants the actor made, as in cloud IAM, so a time-limited power to change
@@ -147,7 +147,11 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, via
 		if err := lockAll(ctx, tx, on.Tenant, []string{scope.Key()}, slices.Collect(maps.Keys(principals))); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := groupsExist(ctx, tx, on.Tenant, groups); err != nil {
+		exist := groups
+		if len(grants) > 0 {
+			exist = slices.Concat(groups, groupScopes([]Scope{scope}))
+		}
+		if err := groupsExist(ctx, tx, on.Tenant, exist); err != nil {
 			return ChangeEvent{}, err
 		}
 		// Decided again in the transaction, so the actor's access and the roles are read as the
@@ -193,8 +197,10 @@ func (a *Authorizer) changing(actor Subject, on Resource, cs *constrained) error
 
 // A change takes its tenant's lock shared, then the lock of each scope and of each principal
 // whose grants it changes, in order; deleting a tenant takes the tenant's lock alone. So two
-// changes to the same rows run in turn, and one call never deadlocks with another. The locks
-// last until the transaction ends. Advisory locks span the database, so the keys name the
+// changes to the same rows run in turn. A host's delete that also changes rows it doesn't lock,
+// as DeleteGroups changes denies and eligibilities on other scopes, can still deadlock with
+// another change: PostgreSQL ends one, which matches ErrConflict. The locks last until the
+// transaction ends. Advisory locks span the database, so the keys name the
 // schema: another application's grants are in a schema of their own.
 const lockKey = `hashtextextended(current_schema() || '/rbac/' || $1, 0)`
 
@@ -306,17 +312,17 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 		return err
 	}
 	scopes, principals := map[string]bool{}, map[string]bool{}
-	named := make([]Principal, len(grants))
+	named, on := make([]Principal, len(grants)), make([]Scope, len(grants))
 	for i, g := range grants {
 		scopes[g.Scope.Key()] = true
 		principals[g.Principal.key()] = true
-		named[i] = g.Principal
+		named[i], on[i] = g.Principal, g.Scope
 	}
 	return a.inTx(ctx, tenant, actor, func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lockAll(ctx, tx, tenant, slices.Collect(maps.Keys(scopes)), slices.Collect(maps.Keys(principals))); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := groupsExist(ctx, tx, tenant, groupKeys(named)); err != nil {
+		if err := groupsExist(ctx, tx, tenant, slices.Concat(groupKeys(named), groupScopes(on))); err != nil {
 			return ChangeEvent{}, err
 		}
 		// Again under the locks, so a custom role deleted since isn't granted, nor one redefined
@@ -1347,11 +1353,12 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Pri
 				if err != nil {
 					return err
 				}
-				left, err := removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, t, "principal = $2", p.key())
+				// The membership before the groups it reaches, as delete removes them.
+				memberships, err := removed(ctx, a, tx, "rbac_memberships", membershipColumns, collectMemberships, t, "principal = $2", p.key())
 				if err != nil {
 					return err
 				}
-				memberships, err := removed(ctx, a, tx, "rbac_memberships", membershipColumns, collectMemberships, t, "principal = $2", p.key())
+				left, err := removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, t, "principal = $2", p.key())
 				if err != nil {
 					return err
 				}
@@ -1418,10 +1425,12 @@ func (a *Authorizer) delete(ctx context.Context, actor Principal, tenant string,
 			}
 		}
 		if del.members != "" {
-			if e.Left, err = removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant, del.members, args...); err != nil {
+			// Memberships before the members they reach, as DeleteExpired takes them, so the two never
+			// deadlock.
+			if e.EndedMemberships, err = removed(ctx, a, tx, "rbac_memberships", membershipColumns, collectMemberships, tenant, del.members, args...); err != nil {
 				return ChangeEvent{}, err
 			}
-			if e.EndedMemberships, err = removed(ctx, a, tx, "rbac_memberships", membershipColumns, collectMemberships, tenant, del.members, args...); err != nil {
+			if e.Left, err = removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant, del.members, args...); err != nil {
 				return ChangeEvent{}, err
 			}
 		}
@@ -1465,8 +1474,14 @@ func removed[T any](ctx context.Context, a *Authorizer, tx pgx.Tx, table, column
 
 // DeleteExpired removes grants, eligibilities, group members and tenant memberships that have
 // expired, which no longer give or allow anything, and returns how many. It passes over those a
-// change is holding, rather than wait on it, so the next run removes them.
+// change is holding, rather than wait on it, so the next run removes them. A race PostgreSQL
+// refuses matches ErrConflict.
 func (a *Authorizer) DeleteExpired(ctx context.Context) (int64, error) {
+	n, err := a.deleteExpired(ctx)
+	return n, conflicted(err)
+}
+
+func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 	tag, err := a.db.Exec(ctx, `
 		DELETE FROM rbac_grants WHERE id IN (
 			SELECT id FROM rbac_grants WHERE expires_at <= $1 FOR UPDATE SKIP LOCKED)`, a.cfg.Now())

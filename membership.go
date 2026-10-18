@@ -137,7 +137,8 @@ func (a *Authorizer) checkMembership(m Membership, now time.Time) error {
 
 // SetMemberships makes identities members or guests of a tenant, or changes how, as actor: the
 // host's own write, without the checks a change by a tenant's admins has, as Import is for grants.
-// It reports the memberships it set or changed.
+// It reports the memberships it set or changed. An identity whose membership had ended joins again
+// in none of the groups it was in, whether or not DeleteExpired has run since.
 func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant string, ms []Membership) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -178,6 +179,14 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 		if err := lockAll(ctx, tx, tenant, nil, keys); err != nil {
 			return ChangeEvent{}, err
 		}
+		// An ended membership's groups go, as DeleteExpired would remove them, each membership held
+		// before its members as there, so the two never deadlock.
+		left, err := removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant, `principal IN (
+			SELECT principal FROM rbac_memberships WHERE tenant = $1 AND principal = ANY($2::text[]) AND expires_at <= $3 FOR UPDATE)`,
+			keys, a.cfg.Now())
+		if err != nil {
+			return ChangeEvent{}, err
+		}
 		rows, err := tx.Query(ctx, `
 			INSERT INTO rbac_memberships AS m (tenant, principal_kind, principal_id, guest, suspended, source, expires_at, note,
 			  created_by, updated_by)
@@ -194,7 +203,7 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 			return ChangeEvent{}, err
 		}
 		changed, err := collectMemberships(rows)
-		return ChangeEvent{Memberships: changed}, err
+		return ChangeEvent{Memberships: changed, Left: left}, err
 	})
 }
 
@@ -390,10 +399,12 @@ func privilegedGroup(ctx context.Context, q DB, tenant, id string) (exists, priv
 }
 
 // DeleteGroup deletes a tenant's group, as actor, who needs ManageGroups on the tenant, and with it
-// its members and its place in other groups. It refuses a group that holds grants or
-// eligibilities in force, which revoking first shows, that a deny names or exempts, or that
-// approves an eligibility's activations, so deleting one never changes access as a side effect; and one from a source the host owns, or with members,
-// a place in a group or grants on it from one. Deleting a group that doesn't exist does nothing.
+// its members and its place in other groups. Its members hold what it and the groups it is in
+// hold, so it refuses a group that, or a group it is in, holds grants or eligibilities in force,
+// which revoking first shows, that a deny names or exempts, or that approves an eligibility's
+// activations: deleting one never changes access as a side effect. It refuses one from a source
+// the host owns, or with members, a place in a group or grants on it from one. Deleting a group
+// that doesn't exist does nothing.
 func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id string) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -438,16 +449,23 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 	})
 }
 
-// deletable refuses deleting a group an actor asks to delete when that would change access or what
-// the host keeps. Expired grants and eligibilities give nothing, and Grants doesn't list them to
-// revoke, so they go with it.
+// deletable refuses deleting a group an actor asks to delete when that would change access, its
+// members' through the groups it is in too, or what the host keeps. Expired grants, eligibilities
+// and places in groups give nothing, and Grants doesn't list them to revoke, so they go with it.
 func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string) error {
 	var held, denied, approves, owned bool
-	if err := tx.QueryRow(ctx, `SELECT
-		  EXISTS (SELECT FROM rbac_grants WHERE tenant = $1 AND principal = $2 AND (expires_at IS NULL OR expires_at > $3))
-		    OR EXISTS (SELECT FROM rbac_eligibilities WHERE tenant = $1 AND principal = $2 AND (expires_at IS NULL OR expires_at > $3)),
-		  EXISTS (SELECT FROM rbac_denies WHERE tenant = $1 AND ($2 = ANY(principals) OR $2 = ANY(exempt))),
-		  EXISTS (SELECT FROM rbac_eligibilities WHERE tenant = $1 AND $2 = ANY(approvers) AND (expires_at IS NULL OR expires_at > $3)),
+	if err := tx.QueryRow(ctx, `
+		WITH RECURSIVE up(id) AS (
+		  SELECT $4::text COLLATE "C"
+		  UNION
+		  SELECT m.group_id FROM rbac_members m JOIN up u ON m.principal = 'group:' || u.id
+		  WHERE m.tenant = $1 AND (m.expires_at IS NULL OR m.expires_at > $3)
+		), reached AS (SELECT array_agg('group:' || id) AS keys FROM up)
+		SELECT
+		  EXISTS (SELECT FROM rbac_grants, reached WHERE tenant = $1 AND principal = ANY(keys) AND (expires_at IS NULL OR expires_at > $3))
+		    OR EXISTS (SELECT FROM rbac_eligibilities, reached WHERE tenant = $1 AND principal = ANY(keys) AND (expires_at IS NULL OR expires_at > $3)),
+		  EXISTS (SELECT FROM rbac_denies, reached WHERE tenant = $1 AND (principals && keys OR exempt && keys)),
+		  EXISTS (SELECT FROM rbac_eligibilities, reached WHERE tenant = $1 AND approvers && keys AND (expires_at IS NULL OR expires_at > $3)),
 		  EXISTS (SELECT FROM rbac_members WHERE tenant = $1 AND (group_id = $4 OR principal = $2) AND source = ANY($5::text[]))
 		    OR EXISTS (SELECT FROM rbac_grants WHERE tenant = $1 AND scope = $6 AND source = ANY($5::text[])
 		      AND (expires_at IS NULL OR expires_at > $3))`,
@@ -456,11 +474,11 @@ func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string
 	}
 	switch {
 	case held:
-		return fmt.Errorf("%w: group %q holds grants or eligibilities: revoke them first", ErrInvalid, id)
+		return fmt.Errorf("%w: group %q, or a group it is in, holds grants or eligibilities: revoke them first", ErrInvalid, id)
 	case denied:
-		return fmt.Errorf("%w: a deny names or exempts group %q: change it first", ErrInvalid, id)
+		return fmt.Errorf("%w: a deny names or exempts group %q, or a group it is in: change it first", ErrInvalid, id)
 	case approves:
-		return fmt.Errorf("%w: an eligibility names group %q as an approver: change it first", ErrInvalid, id)
+		return fmt.Errorf("%w: an eligibility names group %q, or a group it is in, as an approver: change it first", ErrInvalid, id)
 	case owned:
 		return fmt.Errorf("%w: group %q has members, a place in a group or grants on it from a source only the host changes", ErrInvalid, id)
 	}
@@ -937,8 +955,21 @@ func bindingPrincipals(bs []Binding) []Principal {
 	return ps
 }
 
+// groupScopes returns the keys of the group scopes among scopes, which are the groups' keys as
+// principals too.
+func groupScopes(scopes []Scope) []string {
+	var keys []string
+	for _, s := range scopes {
+		if s.Type == GroupScope {
+			keys = append(keys, s.Key())
+		}
+	}
+	return keys
+}
+
 // groupsExist refuses a change naming, by key, a group the tenant doesn't have, read under the
-// change's locks on them: what it names would pass to a group made later with that id.
+// change's locks on them: what it names, or makes on one's scope, would pass to a group made later
+// with that id.
 func groupsExist(ctx context.Context, q DB, tenant string, keys []string) error {
 	if len(keys) == 0 {
 		return nil

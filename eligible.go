@@ -79,7 +79,7 @@ func (a *Authorizer) checkEligibility(e Eligibility) error {
 
 // SetEligibility makes a principal eligible to activate a role on a scope, on, or changes how, as
 // actor, who needs what granting the role there unconditionally would: an eligibility is a grant
-// to come. The groups it names, eligible or approving, are the tenant's.
+// to come. The groups it names, eligible or approving, and a group it is on, are the tenant's.
 func (a *Authorizer) SetEligibility(ctx context.Context, actor Subject, on Resource, e Eligibility) error {
 	if err := a.check(on); err != nil {
 		return err
