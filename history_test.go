@@ -122,24 +122,32 @@ func TestHistoryRecordsADeleteAsOne(t *testing.T) {
 	ctx := t.Context()
 	var cursor rbac.Cursor
 	drain(t, h, &cursor, 1)
-	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
-		VALUES ('t1', 'cluster', 'c1', 'user', 'create', 'cluster.login'), ('t1', 'cluster', 'c1', 'user', 'expire', 'cluster.login')`); err != nil {
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'create', 'cluster.login', NULL),
+		  ('t1', 'cluster', 'c1', 'user', 'early', 'cluster.login', now() + interval '1 hour'),
+		  ('t1', 'cluster', 'c1', 'user', 'expired', 'cluster.login', now() - interval '1 hour')`); err != nil {
 		t.Fatal(err)
 	}
-	for _, op := range []string{"create", "expire"} {
+	// Whoever sets the context can call a delete an expiry, which only one of a row that expired is.
+	for id, op := range map[string]string{"create": "create", "early": "expire", "expired": "expire"} {
 		if err := pgx.BeginFunc(ctx, h.pool, func(tx pgx.Tx) error {
 			if _, err := tx.Exec(ctx, `SELECT set_config('rbac.change', json_build_object('op', $1::text)::text, true)`, op); err != nil {
 				return err
 			}
-			_, err := tx.Exec(ctx, `DELETE FROM rbac_grants WHERE principal_id = $1`, op)
+			_, err := tx.Exec(ctx, `DELETE FROM rbac_grants WHERE principal_id = $1`, id)
 			return err
 		}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	got := drain(t, h, &cursor, 4)
-	if got[2].Op != "delete" || got[3].Op != "expire" {
-		t.Fatalf("History = %+v", got[2:])
+	got := drain(t, h, &cursor, 6)
+	ops := map[string]rbac.Record{}
+	for _, r := range got[3:] {
+		ops[r.Principal.ID] = r
+	}
+	if ops["create"].Op != "delete" || ops["early"].Op != "delete" || ops["expired"].Op != "expire" ||
+		!ops["expired"].EffectiveAt.Equal(ops["expired"].ExpiresAt) {
+		t.Fatalf("History = %+v", got[3:])
 	}
 }
 

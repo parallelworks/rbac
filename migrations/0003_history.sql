@@ -53,10 +53,11 @@ DECLARE
     is_now jsonb := CASE WHEN TG_OP = 'DELETE' THEN NULL ELSE to_jsonb(NEW) END;
     r      jsonb := coalesce(is_now, was);
     change jsonb := coalesce(nullif(current_setting('rbac.change', true), '')::jsonb, '{}');
-    -- The context says only whether a delete is an expiry, so whoever sets it can't record a
-    -- delete as anything else.
+    -- The context says only whether a delete is an expiry, and only a row that has expired is one,
+    -- so whoever sets it can't record a revoke as anything else.
     op     text  := CASE TG_OP WHEN 'INSERT' THEN 'create' WHEN 'UPDATE' THEN 'update'
-                   WHEN 'DELETE' THEN CASE change->>'op' WHEN 'expire' THEN 'expire' ELSE 'delete' END END;
+                   WHEN 'DELETE' THEN CASE WHEN change->>'op' = 'expire' AND (was->>'expires_at')::timestamptz <= now()
+                     THEN 'expire' ELSE 'delete' END END;
     entity text;
     key    text;
 BEGIN
@@ -72,8 +73,8 @@ BEGIN
     INSERT INTO rbac_history (effective_at, tenant, entity, key, op, principal, role, scope, group_id, expires_at,
       before, after, actor, on_behalf_of, how, request, reason)
     VALUES (
-      -- An expiry took effect when it expired; a row removed with an expired membership, now.
-      CASE WHEN op = 'expire' THEN least(coalesce((r->>'expires_at')::timestamptz, now()), now()) ELSE now() END,
+      -- An expiry took effect when it expired.
+      CASE WHEN op = 'expire' THEN (r->>'expires_at')::timestamptz ELSE now() END,
       r->>'tenant', entity, key, op, r->>'principal',
       CASE entity WHEN 'role' THEN r->>'id' ELSE r->>'role' END,
       r->>'scope',
