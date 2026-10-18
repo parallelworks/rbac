@@ -615,8 +615,11 @@ type Config struct {
 	// what it writes as the host's, not as the change's.
 	OnChange func(ctx context.Context, tx pgx.Tx, e ChangeEvent) error
 	// OnRefused is told of every change refused as ErrDenied or ErrInvalid, as an attempt that
-	// failed, which history doesn't record, as nothing of it is written. It runs on no
-	// transaction of the change's: record it on a connection of the host's own.
+	// failed, which history doesn't record, as nothing of it is written; but not of one on an
+	// Authorizer AsOf gave, which refuses every change. It runs with the call's ctx before the
+	// call returns, once the change's transaction has ended: under WithTx, its savepoint, in the
+	// host's transaction, which is still open, with its locks. Record it on a connection of the
+	// host's own, which the host's transaction rolling back leaves.
 	OnRefused func(ctx context.Context, r Refusal)
 	// Now is the clock that grant expiry is compared with; time.Now when nil.
 	Now func() time.Time

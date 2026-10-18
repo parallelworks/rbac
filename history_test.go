@@ -944,7 +944,38 @@ func TestEveryRefusedChangeIsReported(t *testing.T) {
 		t.Fatalf("reported %+v", refused)
 	}
 	refused = nil
-	if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, grant); err != nil || len(refused) != 0 {
+	owner := h.as(t, "owner")
+	if err := h.authz.Apply(ctx, owner, cluster, grant); err != nil || len(refused) != 0 {
 		t.Fatalf("a change made: %v, reported %+v", err, refused)
+	}
+	// Nor is one that failed for another reason, as the host's lookup failing.
+	unreachable := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "unreachable"}}}}
+	if err := h.authz.Apply(ctx, owner, cluster, unreachable); !errors.Is(err, errLookup) || len(refused) != 0 {
+		t.Fatalf("a change failed: %v, reported %+v", err, refused)
+	}
+}
+
+func TestAChangeAsOfATimeIsNotReportedRefused(t *testing.T) {
+	var refused []rbac.Refusal
+	h := setup(t, func(c *rbac.Config) {
+		c.OnRefused = func(_ context.Context, r rbac.Refusal) { refused = append(refused, r) }
+	})
+	ctx := t.Context()
+	owner, actor := h.as(t, "owner"), h.as(t, "actor")
+	grant := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: actor.Principal}}}
+	// Refused as reading the past, whether the actor could make it then or not: no actor's attempt.
+	if err := h.authz.AsOf(ctx, "t1", dbNow(t, h), func(a *rbac.Authorizer) error {
+		if err := a.Apply(ctx, owner, cluster, grant); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("Apply by the owner: %v", err)
+		}
+		if err := a.Apply(ctx, actor, cluster, grant); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("Apply by another: %v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(refused) != 0 {
+		t.Fatalf("reported %+v", refused)
 	}
 }

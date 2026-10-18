@@ -216,22 +216,28 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 	return records, Cursor{Generation: generation, TxID: last.TxID, ID: last.ID, RecordedAt: last.RecordedAt}, nil
 }
 
-// Refusal is a change refused, as Config.OnRefused is told of it.
+// Refusal is a change refused, as Config.OnRefused is told of it. Its fields are what the call was
+// given, which one refused as ErrInvalid may have refused as malformed, such as text with a NUL.
 type Refusal struct {
+	// Tenant is empty for DeletePrincipalEverywhere and DeleteExpired, which change every tenant.
 	Tenant string
-	Actor  Principal
+	// Actor is zero for DeleteExpired, which no one makes.
+	Actor Principal
 	// How is the call refused, as Record.How names a change's.
 	How   string
 	Audit Audit
 	// Err is why: it matches ErrDenied or ErrInvalid.
 	Err error
-	At  time.Time
+	// At is when, by Config.Now.
+	At time.Time
 }
 
 // refused tells Config.OnRefused of a change *err refused as ErrDenied or ErrInvalid, as actor's in
 // a tenant by how.
 func (a *Authorizer) refused(ctx context.Context, err *error, tenant string, actor Principal, how string) {
-	if a.cfg.OnRefused == nil || *err == nil || !errors.Is(*err, ErrDenied) && !errors.Is(*err, ErrInvalid) {
+	// One AsOf gave refuses every change, which is no actor's attempt: what it checked first, it
+	// checked against the past, and its clock is the time it reads.
+	if a.cfg.OnRefused == nil || a.asOf || *err == nil || !errors.Is(*err, ErrDenied) && !errors.Is(*err, ErrInvalid) {
 		return
 	}
 	audit, _ := ctx.Value(auditKey{}).(Audit)

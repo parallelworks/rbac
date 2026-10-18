@@ -23,13 +23,14 @@ var asOfEntities = []struct{ table, entity string }{
 // AsOf runs read on an Authorizer that reads a tenant as it was at a time, from its history: who
 // held what, who was in which group, what was denied, and what custom roles gave. Its checks,
 // lists and searches answer as they would have then, with the catalog as it is now, and find
-// nothing in another tenant. A change made on it is refused, and its reads see no change made
-// since, but for History, which reads the whole record as it does outside. A change counts from
-// when its transaction began, so what a time reads can still change until every transaction that
-// began before it has ended. Hooks run as for any read, and a constraint that reads the package's
-// tables through the DB it is given reads them as of the time too; one that reads the host's
-// reads them as they are now. A Filter condition reads as of the time only in a query on the
-// transaction read runs in: under WithTx, the host's, before read returns.
+// nothing in another tenant. A change made on it is refused, as no actor's attempt, which
+// Config.OnRefused isn't told of, and its reads see no change made since, but for History, which
+// reads the whole record as it does outside. A change counts from when its transaction began, so
+// what a time reads can still change until every transaction that began before it has ended.
+// Hooks run as for any read, and a constraint that reads the package's tables through the DB it
+// is given reads them as of the time too; one that reads the host's reads them as they are now.
+// A Filter condition reads as of the time only in a query on the transaction read runs in: under
+// WithTx, the host's, before read returns.
 //
 // WithTx on the Authorizer read is given returns it as it is, reading the past on its own
 // transaction.
