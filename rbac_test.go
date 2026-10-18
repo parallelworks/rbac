@@ -2622,7 +2622,10 @@ func TestMachineIdentities(t *testing.T) {
 	if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{robot}}); !errors.Is(err, rbac.ErrInvalid) {
 		t.Fatalf("granting an undeclared kind: %v", err)
 	}
-	// A kind the host stops declaring can still be revoked.
+	// A kind the host stops declaring can still be revoked, and holds nothing, its own grants nor
+	// its groups'.
+	h.member(t, ci.Principal, "bots")
+	h.seed(t, grant(cluster.Scope(), "cluster.sudo", rbac.Group, "bots"))
 	undeclared, err := rbac.New(h.pool, rbac.Config{
 		Catalog: catalog, ContainerTypes: []string{"org", "workspace"},
 		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
@@ -4894,7 +4897,8 @@ func TestDenies(t *testing.T) {
 	if perms, err := h.authz.Permissions(ctx, contractor, cluster); err != nil || !slices.Equal(perms, []rbac.Permission{login, view}) {
 		t.Fatalf("Permissions = %v, %v", perms, err)
 	}
-	if holders, err := h.authz.Holders(ctx, root, cluster); err != nil || slices.ContainsFunc(holderPrincipals(holders), func(p rbac.Principal) bool { return p.ID == "named" || p.ID == "contractors" }) {
+	if holders, err := h.authz.Holders(ctx, root, cluster); err != nil || slices.ContainsFunc(holderPrincipals(holders), func(p rbac.Principal) bool { return p.ID == "named" || p.ID == "c" }) ||
+		!slices.Contains(holderPrincipals(holders), lead.Principal) {
 		t.Fatalf("Holders = %v, %v", holders, err)
 	}
 	for _, s := range []rbac.Subject{contractor, lead, h.as(t, "named")} {

@@ -1,6 +1,7 @@
 package rbac_test
 
 import (
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"slices"
@@ -10,15 +11,16 @@ import (
 	"github.com/parallelworks/rbac"
 )
 
-// world is a tenant built at random: containers, clusters under them, grants, custom roles and
-// denies, with clusters of the same ids in another tenant.
+// world is a tenant built at random: containers, clusters under them, grants, custom roles,
+// groups in groups and denies, with clusters of the same ids in another tenant.
 type world struct {
 	h           *harness
 	clusters    []rbac.Resource
 	subjects    []rbac.Subject
 	conditional bool
-	// guests are the users who are guests of t1, and outside those who are only another tenant's.
-	guests, outside map[string]bool
+	// guests are the users who are guests of t1, outside those who are only another tenant's, and
+	// inactive those whose membership of t1 is suspended or ended.
+	guests, outside, inactive map[string]bool
 }
 
 func newWorld(t *testing.T, seed uint64, conditional bool) world {
@@ -26,8 +28,12 @@ func newWorld(t *testing.T, seed uint64, conditional bool) world {
 	rng := rand.New(rand.NewPCG(seed, seed))
 	h, guardian := guarded(t)
 	ctx := t.Context()
-	w := world{h: h, conditional: conditional, guests: map[string]bool{}, outside: map[string]bool{}}
+	w := world{h: h, conditional: conditional, guests: map[string]bool{}, outside: map[string]bool{}, inactive: map[string]bool{}}
 	pick := func(n int) int { return rng.IntN(n) }
+	// Groups in groups, denies on the public and exempt groups, and suspended and ended memberships
+	// are picked apart, so the rest of each seed's tenant stays as it was.
+	extra := rand.New(rand.NewPCG(seed, seed+1))
+	more := func(n int) int { return extra.IntN(n) }
 	orgs := []rbac.Scope{{Type: "org", ID: "o1"}, {Type: "org", ID: "o2"}, {Type: "org", ID: "o3"}}
 	// Workspaces under orgs, and a few under other workspaces.
 	var spaces [][]rbac.Scope
@@ -125,6 +131,17 @@ func newWorld(t *testing.T, seed uint64, conditional bool) world {
 		if conditional && pick(2) == 0 {
 			d.Condition = rbac.Condition{Expression: []string{`resource.attributes.env == "prod"`, `request.attributes.mfa != true`}[pick(2)]}
 		}
+		exempt := groupOf(groups[more(len(groups))])
+		switch more(6) {
+		case 0:
+			d.Principals, d.Exempt = []rbac.Principal{{Kind: rbac.Public}}, []rbac.Principal{rbac.TenantMembers("t1")}
+		case 1:
+			d.Principals, d.Exempt = []rbac.Principal{{Kind: rbac.Public}}, []rbac.Principal{exempt}
+		case 2:
+			if d.Principals[0] != exempt {
+				d.Exempt = append(d.Exempt, exempt)
+			}
+		}
 		on := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}
 		switch pick(4) {
 		case 0:
@@ -158,7 +175,46 @@ func newWorld(t *testing.T, seed uint64, conditional bool) world {
 			}
 			w.outside[u] = true
 		}
+		ended := h.now.Add(-time.Hour)
+		switch more(6) {
+		case 0:
+			if _, err := h.pool.Exec(ctx, `UPDATE rbac_memberships SET suspended = true WHERE tenant = 't1' AND principal = $1`, "user:"+u); err != nil {
+				t.Fatal(err)
+			}
+			w.inactive[u] = true
+		case 1:
+			if _, err := h.pool.Exec(ctx, `UPDATE rbac_memberships SET expires_at = $2 WHERE tenant = 't1' AND principal = $1`, "user:"+u, ended); err != nil {
+				t.Fatal(err)
+			}
+			w.inactive[u] = true
+		case 2:
+			if _, err := h.pool.Exec(ctx, `UPDATE rbac_members SET expires_at = $2 WHERE tenant = 't1' AND principal = $1
+				AND group_id = (SELECT min(group_id) FROM rbac_members WHERE tenant = 't1' AND principal = $1)`, "user:"+u, ended); err != nil {
+				t.Fatal(err)
+			}
+		}
 		w.subjects = append(w.subjects, s)
+	}
+	// Groups in others, a cycle or a chain too long aside, some of them ended.
+	for _, outer := range groups {
+		for _, inner := range groups {
+			if inner == outer || more(4) > 0 {
+				continue
+			}
+			err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: outer, Principal: groupOf(inner)}})
+			switch {
+			case errors.Is(err, rbac.ErrInvalid):
+				continue
+			case err != nil:
+				t.Fatal(err)
+			}
+			if more(4) == 0 {
+				if _, err := h.pool.Exec(ctx, `UPDATE rbac_members SET expires_at = $3 WHERE tenant = 't1' AND group_id = $1 AND principal = $2`,
+					outer, "group:"+inner, h.now.Add(-time.Hour)); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
 	}
 	w.subjects = append(w.subjects, rbac.Subject{})
 	return w
@@ -196,9 +252,18 @@ func TestListingsAgreeWithChecksInRandomTenants(t *testing.T) {
 	}
 }
 
+// member reports whether s is one of t1's members: an identity, not a guest, suspended or gone.
+func (w world) member(s rbac.Subject) bool {
+	id := s.Principal.ID
+	return s.Principal != (rbac.Principal{}) && !w.guests[id] && !w.outside[id] && !w.inactive[id]
+}
+
 // holdersAgree checks Holders against Authorize for every subject: each holder it lists for sure,
-// not under a condition nor perhaps denied, Authorize allows, and each subject Authorize allows
-// it lists, as itself, among the tenant's members or as the public.
+// not under a condition nor perhaps denied, Authorize allows, every member where it is the
+// tenant's members and everyone where it is the public, and each subject Authorize allows it
+// lists, as itself where its own grants or its groups' allow, with them, or else among the
+// tenant's members or as the public. Without conditions, it marks no identity, so a mark can't
+// hide one it gets wrong.
 func (w world) holdersAgree(t *testing.T, p rbac.Permission, r rbac.Resource) {
 	t.Helper()
 	holders, err := w.h.authz.Holders(t.Context(), p, r)
@@ -208,20 +273,47 @@ func (w world) holdersAgree(t *testing.T, p rbac.Permission, r rbac.Resource) {
 	listed := map[rbac.Principal]rbac.Holder{}
 	for _, h := range holders {
 		listed[h.Principal] = h
-		if !h.Conditional && !h.MaybeDenied && h.Principal.Kind != rbac.Members && h.Principal.Kind != rbac.Public && !allowed(t, w.h, rbac.Subject{Principal: h.Principal}, p, r) {
-			t.Errorf("%s on %s: Holders lists %+v, whom Authorize refuses", p, r.ID, h)
+		broad := h.Principal.Kind == rbac.Members || h.Principal.Kind == rbac.Public
+		if !w.conditional && (h.Conditional || h.MaybeDenied && !broad) {
+			t.Errorf("%s on %s: Holders marks %+v in a tenant without conditions", p, r.ID, h)
+		}
+		if h.Conditional || h.MaybeDenied {
+			continue
+		}
+		if !broad {
+			if !allowed(t, w.h, rbac.Subject{Principal: h.Principal}, p, r) {
+				t.Errorf("%s on %s: Holders lists %+v, whom Authorize refuses", p, r.ID, h)
+			}
+			continue
+		}
+		for _, s := range w.subjects {
+			if (h.Principal.Kind == rbac.Public || w.member(s)) && !allowed(t, w.h, s, p, r) {
+				t.Errorf("%s on %s: Holders lists %+v, but Authorize refuses %v", p, r.ID, h, s.Principal)
+			}
 		}
 	}
 	for _, s := range w.subjects {
 		if !allowed(t, w.h, s, p, r) {
 			continue
 		}
-		_, itself := listed[s.Principal]
+		holder, itself := listed[s.Principal]
 		_, members := listed[rbac.TenantMembers("t1")]
 		_, public := listed[rbac.Principal{Kind: rbac.Public}]
-		member := s.Principal != (rbac.Principal{}) && !w.guests[s.Principal.ID] && !w.outside[s.Principal.ID]
-		if covered := itself || members && member || public; !covered {
+		if covered := itself || members && w.member(s) || public; !covered {
 			t.Errorf("%s on %s: Authorize allows %v, whom Holders leaves out: %+v", p, r.ID, s.Principal, holders)
+		}
+		d, err := w.h.authz.Explain(t.Context(), s, p, r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, g := range d.Grants {
+			switch {
+			case g.Principal.Kind == rbac.Members || g.Principal.Kind == rbac.Public:
+			case !slices.Contains(holder.Grants, g.ID):
+				t.Errorf("%s on %s: Authorize allows %v through grant %+v, which Holders doesn't list as its: %+v", p, r.ID, s.Principal, g, holders)
+			case g.Principal.Kind == rbac.Group && !slices.Contains(holder.Groups, g.Principal.ID):
+				t.Errorf("%s on %s: Authorize allows %v through group %s, which Holders doesn't name: %+v", p, r.ID, s.Principal, g.Principal.ID, holder)
+			}
 		}
 	}
 }

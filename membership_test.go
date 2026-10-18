@@ -1264,3 +1264,108 @@ func TestHoldersReadGroupsAsChecksDo(t *testing.T) {
 		t.Fatalf("Holders(login) with a deny on the members = %+v", holders)
 	}
 }
+
+func TestHoldersReadNestedAndEndedMemberships(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	// sre holds root, and on-call and former are in it; contractors are in banned, which a deny
+	// names. v is on call; z is on call and a contractor; q is on call and was banned; e was in sre;
+	// f is in former, which was in sre; and m, granted root, was a member of the tenant.
+	h.as(t, "v", "oncall")
+	h.as(t, "z", "oncall", "contractors")
+	h.as(t, "q", "oncall", "banned")
+	h.as(t, "e", "sre")
+	h.as(t, "f", "former")
+	h.as(t, "m")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{
+		{Group: "sre", Principal: groupOf("oncall")},
+		{Group: "sre", Principal: groupOf("former")},
+		{Group: "banned", Principal: groupOf("contractors")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ended := h.now.Add(-time.Hour)
+	for _, q := range []string{
+		`UPDATE rbac_members SET expires_at = $1 WHERE tenant = 't1' AND (group_id, principal) IN (('banned', 'user:q'), ('sre', 'user:e'), ('sre', 'group:former'))`,
+		`UPDATE rbac_memberships SET expires_at = $1 WHERE tenant = 't1' AND principal = 'user:m'`,
+	} {
+		if _, err := h.pool.Exec(ctx, q, ended); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.seed(t, grant(workspace.Scope(), "cluster.sudo", rbac.Group, "sre"), grant(cluster.Scope(), "cluster.sudo", rbac.User, "m"))
+	if err := h.authz.SetDeny(ctx, guardian, cluster, rbac.Deny{ID: "banned", Principals: []rbac.Principal{groupOf("banned")}, Permissions: []rbac.Permission{root}}); err != nil {
+		t.Fatal(err)
+	}
+	holders, err := h.authz.Holders(ctx, root, cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := holderPrincipals(holders)
+	if !slices.Equal(listed, []rbac.Principal{identity("q"), identity("v")}) {
+		t.Fatalf("Holders(root) = %+v", holders)
+	}
+	for _, id := range []string{"e", "f", "m", "q", "v", "z"} {
+		if allowed(t, h, rbac.Subject{Principal: identity(id)}, root, cluster) != slices.Contains(listed, identity(id)) {
+			t.Errorf("Holders(root) = %+v, which Authorize doesn't agree with for %s", holders, id)
+		}
+	}
+}
+
+func TestHoldersReadDeniesOnTheMembersAndThePublic(t *testing.T) {
+	viewer := rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
+	guard := rbac.RoleDefinition{ID: "guard", Permissions: []rbac.Permission{rbac.DenyPermission("cluster")}, ResourceTypes: []string{"cluster"}}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), viewer, guard) })
+	ctx := t.Context()
+	h.seed(t,
+		grant(cluster.Scope(), "guard", rbac.User, "guardian"),
+		grant(cluster.Scope(), "cluster.login", rbac.Members, "t1"),
+		grant(cluster.Scope(), "cluster.viewer", rbac.Public, ""),
+	)
+	guardian, member, guest := h.as(t, "guardian"), h.as(t, "m"), h.guest(t, "g")
+	members, public := rbac.TenantMembers("t1"), rbac.Principal{Kind: rbac.Public}
+	for _, c := range []struct {
+		name                     string
+		named, exempt            []rbac.Principal
+		listed, marked           []rbac.Principal
+		member, guest, anonymous bool
+	}{
+		// Everyone, the members among them.
+		{name: "public", named: []rbac.Principal{public}},
+		// Those who aren't members: the public perhaps, and the members not at all.
+		{
+			name: "public but the members", named: []rbac.Principal{public}, exempt: []rbac.Principal{members},
+			listed: []rbac.Principal{members, public}, marked: []rbac.Principal{public}, member: true,
+		},
+		// The members, who are some of the public.
+		{
+			name: "members", named: []rbac.Principal{members},
+			listed: []rbac.Principal{public}, marked: []rbac.Principal{public}, guest: true, anonymous: true,
+		},
+	} {
+		if err := h.authz.SetDeny(ctx, guardian, cluster, rbac.Deny{ID: "d", Principals: c.named, Exempt: c.exempt, Permissions: []rbac.Permission{view}}); err != nil {
+			t.Fatal(err)
+		}
+		holders, err := h.authz.Holders(ctx, view, cluster)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var listed, marked []rbac.Principal
+		for _, holder := range holders {
+			if holder.Principal.Kind == rbac.Members || holder.Principal.Kind == rbac.Public {
+				listed = append(listed, holder.Principal)
+				if holder.MaybeDenied {
+					marked = append(marked, holder.Principal)
+				}
+			}
+		}
+		if !slices.Equal(listed, c.listed) || !slices.Equal(marked, c.marked) {
+			t.Errorf("a deny on %s: Holders(view) = %+v", c.name, holders)
+		}
+		for i, s := range []rbac.Subject{member, guest, {}} {
+			if want := []bool{c.member, c.guest, c.anonymous}[i]; allowed(t, h, s, view, cluster) != want {
+				t.Errorf("a deny on %s: Authorize(%v) isn't %t", c.name, s.Principal, want)
+			}
+		}
+	}
+}
