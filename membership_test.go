@@ -31,6 +31,9 @@ func grouped(t *testing.T, mutate ...func(*rbac.Config)) *harness {
 	return h
 }
 
+// groupOwner manages a group, on its scope.
+var groupOwner = rbac.RoleDefinition{ID: "group.owner", Permissions: []rbac.Permission{"group:manage"}, ResourceTypes: []string{rbac.GroupScope}}
+
 func identity(id string) rbac.Principal { return rbac.Principal{Kind: rbac.User, ID: id} }
 
 func groupOf(id string) rbac.Principal { return rbac.Principal{Kind: rbac.Group, ID: id} }
@@ -352,9 +355,11 @@ func TestDeletingGroupsRemovesTheirGrants(t *testing.T) {
 	if err := h.authz.DeleteGroups(ctx, host, "t1", []string{"a"}); err != nil {
 		t.Fatal(err)
 	}
-	e := h.events[0]
-	if len(h.events) != 1 || len(e.DeletedGroups) != 1 || len(e.Revoked) != 1 || len(e.Ineligible) != 1 || len(e.Left) != 2 {
+	if len(h.events) != 1 {
 		t.Fatalf("events = %+v", h.events)
+	}
+	if e := h.events[0]; len(e.DeletedGroups) != 1 || len(e.Revoked) != 1 || len(e.Ineligible) != 1 || len(e.Left) != 2 {
+		t.Fatalf("event = %+v", e)
 	}
 	if members, err := h.authz.Members(ctx, "t1", "b"); err != nil || len(members) != 0 {
 		t.Fatalf("a deleted group is still in another: %+v, %v", members, err)
@@ -363,13 +368,13 @@ func TestDeletingGroupsRemovesTheirGrants(t *testing.T) {
 
 func TestDeleteGroupLeavesAccessAndTheHostsMembersAsTheyAre(t *testing.T) {
 	h := grouped(t, func(c *rbac.Config) {
-		c.Catalog = append(slices.Clone(c.Catalog), guardRole)
+		c.Catalog = append(slices.Clone(c.Catalog), guardRole, groupOwner)
 		c.Sources = []string{"directory"}
 	})
 	ctx := t.Context()
 	h.join(t, "u")
 	h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "owner"))
-	for _, id := range []string{"denied", "exempt", "synced", "nested", "expired"} {
+	for _, id := range []string{"denied", "exempt", "synced", "nested", "managed", "expired"} {
 		if err := h.authz.SetGroup(ctx, user("groups"), "t1", rbac.GroupDefinition{ID: id}); err != nil {
 			t.Fatal(err)
 		}
@@ -387,10 +392,22 @@ func TestDeleteGroupLeavesAccessAndTheHostsMembersAsTheyAre(t *testing.T) {
 	if err := h.authz.SetDeny(ctx, user("owner"), cluster, d); err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []string{"denied", "exempt", "synced", "nested"} {
+	// Who manages a group, as the host grants it, is the host's to change.
+	managed := grant(rbac.Scope{Type: rbac.GroupScope, ID: "managed"}, "group.owner", rbac.User, "lead")
+	managed.Source = "directory"
+	h.seed(t, managed)
+	for _, id := range []string{"denied", "exempt", "synced", "nested", "managed"} {
 		if err := h.authz.DeleteGroup(ctx, user("groups"), "t1", id); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("deleting %s: %v", id, err)
 		}
+	}
+	// Deleting a group that doesn't exist leaves the grants on its scope.
+	h.seed(t, grant(rbac.Scope{Type: rbac.GroupScope, ID: "missing"}, "group.owner", rbac.User, "lead"))
+	if err := h.authz.DeleteGroup(ctx, user("groups"), "t1", "missing"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{{Type: rbac.GroupScope, ID: "missing"}}}); err != nil || len(got) != 1 {
+		t.Fatalf("grants on a group that doesn't exist after deleting it = %+v, %v", got, err)
 	}
 	// A grant that has expired gives nothing, and goes with its group.
 	expiring := grant(cluster.Scope(), "cluster.login", rbac.Group, "expired")
@@ -499,6 +516,13 @@ func TestAMembershipThatEndsLeavesTheTenantsGroups(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.now = h.now.Add(2 * time.Hour)
+	// It is in no group once the membership ends, before DeleteExpired removes what it was in.
+	if of, err := h.authz.GroupsOf(ctx, "t1", identity("u")); err != nil || len(of) != 0 {
+		t.Fatalf("GroupsOf once the membership ended = %v, %v", of, err)
+	}
+	if members, err := h.authz.Members(ctx, "t1", "a"); err != nil || len(members) != 0 {
+		t.Fatalf("Members once the membership ended = %+v, %v", members, err)
+	}
 	if n, err := h.authz.DeleteExpired(ctx); err != nil || n != 2 {
 		t.Fatalf("DeleteExpired = %d, %v", n, err)
 	}
@@ -508,6 +532,195 @@ func TestAMembershipThatEndsLeavesTheTenantsGroups(t *testing.T) {
 	}
 	if of, err := h.authz.GroupsOf(ctx, "t1", identity("u")); err != nil || len(of) != 0 {
 		t.Fatalf("GroupsOf after the membership ended = %v, %v", of, err)
+	}
+}
+
+func TestDeleteExpiredPassesOverAMembershipAChangeJoinsGroupsWith(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("u"), ExpiresAt: h.now.Add(time.Hour)}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "a"}}); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := h.authz.WithTx(tx).ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "a", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	// The membership ends while the change joining u to a is still open, so DeleteExpired can't
+	// see what it joins: it waits for the next run, rather than leave u in a.
+	h.now = h.now.Add(2 * time.Hour)
+	if n, err := h.authz.DeleteExpired(ctx); err != nil || n != 0 {
+		t.Fatalf("DeleteExpired during the change = %d, %v", n, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := h.authz.DeleteExpired(ctx); err != nil || n != 2 {
+		t.Fatalf("DeleteExpired after it = %d, %v", n, err)
+	}
+	var left int
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM rbac_members`).Scan(&left); err != nil || left != 0 {
+		t.Fatalf("%d members left, %v", left, err)
+	}
+}
+
+func TestDeletingGroupsTakesThemOutOfDenies(t *testing.T) {
+	h := grouped(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), guardRole) })
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "owner"))
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "ops"}, {ID: "oncall"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []rbac.Deny{
+		{ID: "all-but-ops", Principals: []rbac.Principal{rbac.TenantMembers("t1"), groupOf("oncall")}, Exempt: []rbac.Principal{groupOf("ops")}, Permissions: []rbac.Permission{login}},
+		{ID: "oncall", Principals: []rbac.Principal{groupOf("oncall")}, Permissions: []rbac.Permission{login}},
+	} {
+		if err := h.authz.SetDeny(ctx, user("owner"), cluster, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.events = nil
+	if err := h.authz.DeleteGroups(ctx, host, "t1", []string{"ops", "oncall"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.events) != 1 || len(h.events[0].Denies) != 1 || len(h.events[0].DeletedDenies) != 1 {
+		t.Fatalf("events = %+v", h.events)
+	}
+	// A group made again with ops's id is exempt from nothing, and one with oncall's denied nothing.
+	ds, err := h.authz.Denies(ctx, "t1", []rbac.Scope{cluster.Scope()})
+	if err != nil || len(ds) != 1 || len(ds[0].Exempt) != 0 || !slices.Equal(ds[0].Principals, []rbac.Principal{rbac.TenantMembers("t1")}) {
+		t.Fatalf("Denies = %+v, %v", ds, err)
+	}
+}
+
+func TestAChangeNamesOnlyGroupsThatExist(t *testing.T) {
+	h := grouped(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), guardRole) })
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "owner"))
+	none := groupOf("none")
+	for name, change := range map[string]func() error{
+		"apply": func() error {
+			return h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: none}}})
+		},
+		"import": func() error {
+			return h.authz.Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.Group, "none")})
+		},
+		"eligibility": func() error {
+			return h.authz.SetEligibility(ctx, user("owner"), cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: none, MaxDuration: time.Hour})
+		},
+		"approver": func() error {
+			return h.authz.SetEligibility(ctx, user("owner"), cluster, rbac.Eligibility{
+				Role: "cluster.sudo", Principal: identity("u"), MaxDuration: time.Hour, Approvers: []rbac.Principal{none},
+			})
+		},
+		"deny": func() error {
+			return h.authz.SetDeny(ctx, user("owner"), cluster, rbac.Deny{ID: "d", Principals: []rbac.Principal{none}, Permissions: []rbac.Permission{login}})
+		},
+		"exempt": func() error {
+			return h.authz.SetDeny(ctx, user("owner"), cluster, rbac.Deny{
+				ID: "d", Principals: []rbac.Principal{rbac.TenantMembers("t1")}, Exempt: []rbac.Principal{none}, Permissions: []rbac.Permission{login},
+			})
+		},
+	} {
+		if err := change(); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s naming a group that doesn't exist: %v", name, err)
+		}
+	}
+	// What a group made later with its id would inherit, there is none of.
+	if got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{none}}); err != nil || len(got) != 0 {
+		t.Fatalf("Grants = %+v, %v", got, err)
+	}
+	// Revoking needs no group.
+	if err := h.authz.Apply(ctx, user("owner"), cluster, rbac.Change{Revoke: []rbac.Binding{{Role: "cluster.login", Principal: none}}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeletingGroupsTakesThemOutOfApprovers(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "leads"}, {ID: "sre"}}); err != nil {
+		t.Fatal(err)
+	}
+	shared := rbac.Eligibility{Role: "cluster.sudo", Principal: identity("a"), MaxDuration: time.Hour, Approvers: []rbac.Principal{groupOf("leads"), identity("boss")}}
+	only := rbac.Eligibility{Role: "cluster.sudo", Principal: identity("b"), MaxDuration: time.Hour, Approvers: []rbac.Principal{groupOf("leads"), groupOf("sre")}}
+	for _, e := range []rbac.Eligibility{shared, only} {
+		if err := h.authz.SetEligibility(ctx, user("owner"), cluster, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.authz.DeleteGroup(ctx, user("groups"), "t1", "leads"); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("deleting a group that approves activations: %v", err)
+	}
+	h.events = nil
+	if err := h.authz.DeleteGroups(ctx, host, "t1", []string{"leads", "sre"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.events) != 1 || len(h.events[0].Eligible) != 1 || len(h.events[0].Ineligible) != 1 {
+		t.Fatalf("events = %+v", h.events)
+	}
+	// One only the groups approved would activate without approval: it goes rather than do so.
+	got, err := h.authz.Eligibilities(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}})
+	if err != nil || len(got) != 1 || got[0].Principal != identity("a") || !slices.Equal(got[0].Approvers, []rbac.Principal{identity("boss")}) {
+		t.Fatalf("Eligibilities = %+v, %v", got, err)
+	}
+}
+
+func TestAChangeNamingAGroupWaitsForItsDeletion(t *testing.T) {
+	for name, change := range map[string]func(ctx context.Context, a *rbac.Authorizer) error{
+		"deny": func(ctx context.Context, a *rbac.Authorizer) error {
+			return a.SetDeny(ctx, user("owner"), cluster, rbac.Deny{
+				ID: "d", Principals: []rbac.Principal{rbac.TenantMembers("t1")}, Exempt: []rbac.Principal{groupOf("ops")}, Permissions: []rbac.Permission{login},
+			})
+		},
+		"approver": func(ctx context.Context, a *rbac.Authorizer) error {
+			return a.SetEligibility(ctx, user("owner"), cluster, rbac.Eligibility{
+				Role: "cluster.sudo", Principal: identity("u"), MaxDuration: time.Hour, Approvers: []rbac.Principal{groupOf("ops")},
+			})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := grouped(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), guardRole) })
+			ctx := t.Context()
+			h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "owner"))
+			if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "ops"}}); err != nil {
+				t.Fatal(err)
+			}
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			if err := h.authz.WithTx(tx).DeleteGroups(ctx, host, "t1", []string{"ops"}); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- change(ctx, h.authz) }()
+			for waiting := false; !waiting; {
+				select {
+				case err := <-done:
+					done <- err
+					waiting = true
+				default:
+					if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+						WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE '%/rbac/%')`).Scan(&waiting); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-done; !errors.Is(err, rbac.ErrInvalid) {
+				t.Fatalf("naming a group deleted meanwhile: %v", err)
+			}
+		})
 	}
 }
 

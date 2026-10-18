@@ -79,7 +79,7 @@ func (a *Authorizer) checkEligibility(e Eligibility) error {
 
 // SetEligibility makes a principal eligible to activate a role on a scope, on, or changes how, as
 // actor, who needs what granting the role there unconditionally would: an eligibility is a grant
-// to come.
+// to come. The groups it names, eligible or approving, are the tenant's.
 func (a *Authorizer) SetEligibility(ctx context.Context, actor Subject, on Resource, e Eligibility) error {
 	if err := a.check(on); err != nil {
 		return err
@@ -90,7 +90,7 @@ func (a *Authorizer) SetEligibility(ctx context.Context, actor Subject, on Resou
 	e.Scope, e.ExpiresAt = on.Scope(), stored(e.ExpiresAt)
 	e.Approvers = canonicalPrincipals(e.Approvers)
 	check := func() error { return a.checkEligibility(e) }
-	return a.change(ctx, actor, on, ViaEligibility, []Binding{e.binding()}, nil, check, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.change(ctx, actor, on, ViaEligibility, []Binding{e.binding()}, nil, e.Approvers, check, func(tx pgx.Tx) (ChangeEvent, error) {
 		// An expired eligibility that is still stored allowed nothing, so setting it again records
 		// the new actor and time.
 		rows, err := tx.Query(ctx, `
@@ -126,7 +126,7 @@ func (a *Authorizer) DeleteEligibility(ctx context.Context, actor Subject, on Re
 		return err
 	}
 	scope := on.Scope()
-	return a.change(ctx, actor, on, ViaEligibility, nil, []Binding{{Role: role, Principal: p}}, nil, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.change(ctx, actor, on, ViaEligibility, nil, []Binding{{Role: role, Principal: p}}, nil, nil, func(tx pgx.Tx) (ChangeEvent, error) {
 		rows, err := tx.Query(ctx, `DELETE FROM rbac_eligibilities WHERE tenant = $1 AND scope = $2 AND principal = $3 AND role = $4
 			RETURNING `+eligibilityColumns, on.Tenant, scope.Key(), p.key(), role)
 		if err != nil {

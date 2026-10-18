@@ -1,7 +1,6 @@
 package rbac
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -108,21 +107,28 @@ func checkSource(s string) string {
 	return ""
 }
 
+// checkKept returns why a membership's or member's source, expiry and note can't be stored at now.
+func checkKept(source string, expires time.Time, note string, now time.Time) []string {
+	var errs []string
+	if reason := checkSource(source); reason != "" {
+		errs = append(errs, reason)
+	}
+	if !expires.IsZero() && !expires.After(now) {
+		errs = append(errs, "already expired")
+	}
+	if !validNote(note) {
+		errs = append(errs, fmt.Sprintf("a note is text of at most %d characters", MaxNote))
+	}
+	return errs
+}
+
 // checkMembership returns why a membership can't be stored at now.
 func (a *Authorizer) checkMembership(m Membership, now time.Time) error {
 	var errs []string
 	if !a.acts(m.Principal.Kind) || m.Principal.ID == "" {
 		errs = append(errs, "only an identity, a user or a declared kind, is a member of a tenant")
 	}
-	if reason := checkSource(m.Source); reason != "" {
-		errs = append(errs, reason)
-	}
-	if !m.ExpiresAt.IsZero() && !m.ExpiresAt.After(now) {
-		errs = append(errs, "already expired")
-	}
-	if !validNote(m.Note) {
-		errs = append(errs, fmt.Sprintf("a note is text of at most %d characters", MaxNote))
-	}
+	errs = append(errs, checkKept(m.Source, m.ExpiresAt, m.Note, now)...)
 	if len(errs) > 0 {
 		return fmt.Errorf("%w: membership of %s: %s", ErrInvalid, m.Principal.key(), strings.Join(errs, "; "))
 	}
@@ -374,21 +380,20 @@ func managing(privileged bool) Permission {
 	return ManageGroups
 }
 
-// privilegedGroup reads, on q, whether a tenant's group is privileged: not when it doesn't exist.
-func privilegedGroup(ctx context.Context, q DB, tenant, id string) (bool, error) {
-	var privileged bool
-	err := q.QueryRow(ctx, `SELECT privileged FROM rbac_groups WHERE tenant = $1 AND id = $2`, tenant, id).Scan(&privileged)
+// privilegedGroup reads, on q, whether a tenant's group exists and whether it is privileged.
+func privilegedGroup(ctx context.Context, q DB, tenant, id string) (exists, privileged bool, err error) {
+	err = q.QueryRow(ctx, `SELECT privileged FROM rbac_groups WHERE tenant = $1 AND id = $2`, tenant, id).Scan(&privileged)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
+		return false, false, nil
 	}
-	return privileged, err
+	return err == nil, privileged, err
 }
 
 // DeleteGroup deletes a tenant's group, as actor, who needs ManageGroups on the tenant, and with it
 // its members and its place in other groups. It refuses a group that holds grants or
-// eligibilities in force, which revoking first shows, or that a deny names or exempts, so deleting
-// one never changes access as a side effect; and one from a source the host owns, or with members
-// or a place in a group from one. Deleting a group that doesn't exist does nothing.
+// eligibilities in force, which revoking first shows, that a deny names or exempts, or that
+// approves an eligibility's activations, so deleting one never changes access as a side effect; and one from a source the host owns, or with members,
+// a place in a group or grants on it from one. Deleting a group that doesn't exist does nothing.
 func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id string) error {
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -397,7 +402,7 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 		return err
 	}
 	root := Resource{Tenant: tenant, Type: TenantScope, ID: tenant}
-	privileged, err := privilegedGroup(ctx, a.db, tenant, id)
+	_, privileged, err := privilegedGroup(ctx, a.db, tenant, id)
 	if err != nil {
 		return err
 	}
@@ -408,12 +413,20 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 		if err := lock(ctx, tx, tenant, []string{groupKey(id), nestingKey}, []string{groupPrincipal(id).key()}); err != nil {
 			return ChangeEvent{}, err
 		}
+		exists, now, err := privilegedGroup(ctx, tx, tenant, id)
+		switch {
+		case err != nil:
+			return ChangeEvent{}, err
 		// Deleted and made again otherwise meanwhile, it isn't the group the constraints were asked about.
-		if now, err := privilegedGroup(ctx, tx, tenant, id); err != nil || now != privileged {
-			return ChangeEvent{}, cmp.Or(err, fmt.Errorf("%w: group %q changed while this change waited for it; try again", ErrConflict, id))
+		case exists && now != privileged:
+			return ChangeEvent{}, fmt.Errorf("%w: group %q changed while this change waited for it; try again", ErrConflict, id)
 		}
 		if err := a.mayManageGroups(ctx, tx, actor, root, managing(privileged), false); err != nil {
 			return ChangeEvent{}, err
+		}
+		// Without a group, the grants and denies on its scope are no group's to remove.
+		if !exists {
+			return ChangeEvent{}, nil
 		}
 		if err := a.notOwnedGroups(ctx, tx, tenant, []string{id}); err != nil {
 			return ChangeEvent{}, err
@@ -421,7 +434,7 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 		if err := a.deletable(ctx, tx, tenant, id); err != nil {
 			return ChangeEvent{}, err
 		}
-		return a.removeGroups(ctx, tx, tenant, []string{id})
+		return a.removeGroups(ctx, tx, tenant, actor.Principal, []string{id})
 	})
 }
 
@@ -429,13 +442,16 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 // the host keeps. Expired grants and eligibilities give nothing, and Grants doesn't list them to
 // revoke, so they go with it.
 func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string) error {
-	var held, denied, owned bool
+	var held, denied, approves, owned bool
 	if err := tx.QueryRow(ctx, `SELECT
 		  EXISTS (SELECT FROM rbac_grants WHERE tenant = $1 AND principal = $2 AND (expires_at IS NULL OR expires_at > $3))
 		    OR EXISTS (SELECT FROM rbac_eligibilities WHERE tenant = $1 AND principal = $2 AND (expires_at IS NULL OR expires_at > $3)),
 		  EXISTS (SELECT FROM rbac_denies WHERE tenant = $1 AND ($2 = ANY(principals) OR $2 = ANY(exempt))),
-		  EXISTS (SELECT FROM rbac_members WHERE tenant = $1 AND (group_id = $4 OR principal = $2) AND source = ANY($5::text[]))`,
-		tenant, groupPrincipal(id).key(), a.cfg.Now(), id, slices.Sorted(maps.Keys(a.owned))).Scan(&held, &denied, &owned); err != nil {
+		  EXISTS (SELECT FROM rbac_eligibilities WHERE tenant = $1 AND $2 = ANY(approvers) AND (expires_at IS NULL OR expires_at > $3)),
+		  EXISTS (SELECT FROM rbac_members WHERE tenant = $1 AND (group_id = $4 OR principal = $2) AND source = ANY($5::text[]))
+		    OR EXISTS (SELECT FROM rbac_grants WHERE tenant = $1 AND scope = $6 AND source = ANY($5::text[])
+		      AND (expires_at IS NULL OR expires_at > $3))`,
+		tenant, groupPrincipal(id).key(), a.cfg.Now(), id, slices.Sorted(maps.Keys(a.owned)), groupKey(id)).Scan(&held, &denied, &approves, &owned); err != nil {
 		return err
 	}
 	switch {
@@ -443,15 +459,18 @@ func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string
 		return fmt.Errorf("%w: group %q holds grants or eligibilities: revoke them first", ErrInvalid, id)
 	case denied:
 		return fmt.Errorf("%w: a deny names or exempts group %q: change it first", ErrInvalid, id)
+	case approves:
+		return fmt.Errorf("%w: an eligibility names group %q as an approver: change it first", ErrInvalid, id)
 	case owned:
-		return fmt.Errorf("%w: group %q has members or a place in a group from a source only the host changes", ErrInvalid, id)
+		return fmt.Errorf("%w: group %q has members, a place in a group or grants on it from a source only the host changes", ErrInvalid, id)
 	}
 	return nil
 }
 
 // DeleteGroups deletes a tenant's groups, as actor: the host's own write, as for a directory it
-// syncs from. With each go its members, its place in other groups, and its grants and
-// eligibilities.
+// syncs from. With each go its members, its place in other groups, its grants and eligibilities,
+// and its place in denies and among approvers: an eligibility only the groups approve goes too,
+// rather than activate without approval.
 func (a *Authorizer) DeleteGroups(ctx context.Context, actor Principal, tenant string, ids []string) error {
 	if len(ids) > MaxBindings {
 		return fmt.Errorf("%w: a deletion names at most %d groups", ErrInvalid, MaxBindings)
@@ -475,13 +494,13 @@ func (a *Authorizer) DeleteGroups(ctx context.Context, actor Principal, tenant s
 		if err := lockAll(ctx, tx, tenant, scopes, principals); err != nil {
 			return ChangeEvent{}, err
 		}
-		return a.removeGroups(ctx, tx, tenant, ids)
+		return a.removeGroups(ctx, tx, tenant, actor, ids)
 	})
 }
 
-// removeGroups deletes groups with their grants and eligibilities, the members they have and their
-// places in other groups, and returns what it removed for OnChange.
-func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string, ids []string) (ChangeEvent, error) {
+// removeGroups deletes groups with their grants and eligibilities, the members they have, their
+// places in other groups, in denies and among approvers, and returns what it changed for OnChange.
+func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, ids []string) (ChangeEvent, error) {
 	var e ChangeEvent
 	principals, scopes := make([]string, len(ids)), make([]string, len(ids))
 	for i, id := range ids {
@@ -498,6 +517,43 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 		return ChangeEvent{}, err
 	}
 	if e.DeletedDenies, err = removed(ctx, a, tx, "rbac_denies", denyColumns, collectDenies, tenant, "scope = ANY($2::text[])", scopes); err != nil {
+		return ChangeEvent{}, err
+	}
+	// A deny that names or exempts the groups would name or exempt a group made later with one's
+	// id: one naming only them denies no one, and goes.
+	unnamed, err := removed(ctx, a, tx, "rbac_denies", denyColumns, collectDenies, tenant, "principals <@ $2::text[]", principals)
+	if err != nil {
+		return ChangeEvent{}, err
+	}
+	e.DeletedDenies = append(e.DeletedDenies, unnamed...)
+	rows, err := tx.Query(ctx, `UPDATE rbac_denies SET
+		  principals = array(SELECT k FROM unnest(principals) WITH ORDINALITY AS t(k, i) WHERE k <> ALL($2::text[]) ORDER BY i),
+		  exempt = array(SELECT k FROM unnest(exempt) WITH ORDINALITY AS t(k, i) WHERE k <> ALL($2::text[]) ORDER BY i),
+		  updated_by = $3, updated_at = now()
+		WHERE tenant = $1 AND (principals && $2::text[] OR exempt && $2::text[])
+		RETURNING `+denyColumns, tenant, principals, actorKey(actor))
+	if err != nil {
+		return ChangeEvent{}, err
+	}
+	if e.Denies, err = collectDenies(rows); err != nil {
+		return ChangeEvent{}, err
+	}
+	// An eligibility only the groups approve would need no approval without them, so it goes; the
+	// others no longer name them.
+	unapproved, err := removed(ctx, a, tx, "rbac_eligibilities", eligibilityColumns, collectEligibilities, tenant,
+		"approvers <> '{}' AND approvers <@ $2::text[]", principals)
+	if err != nil {
+		return ChangeEvent{}, err
+	}
+	e.Ineligible = append(e.Ineligible, unapproved...)
+	rows, err = tx.Query(ctx, `UPDATE rbac_eligibilities SET
+		  approvers = array(SELECT k FROM unnest(approvers) WITH ORDINALITY AS t(k, i) WHERE k <> ALL($2::text[]) ORDER BY i)
+		WHERE tenant = $1 AND approvers && $2::text[]
+		RETURNING `+eligibilityColumns, tenant, principals)
+	if err != nil {
+		return ChangeEvent{}, err
+	}
+	if e.Eligible, err = collectEligibilities(rows); err != nil {
 		return ChangeEvent{}, err
 	}
 	if e.Left, err = removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant,
@@ -596,15 +652,7 @@ func (a *Authorizer) checkMember(m Member, now time.Time) error {
 	case p.Kind != Group && (!a.acts(p.Kind) || p.ID == ""):
 		errs = append(errs, "a member is an identity, a user or a declared kind, or a group")
 	}
-	if reason := checkSource(m.Source); reason != "" {
-		errs = append(errs, reason)
-	}
-	if !m.ExpiresAt.IsZero() && !m.ExpiresAt.After(now) {
-		errs = append(errs, "already expired")
-	}
-	if !validNote(m.Note) {
-		errs = append(errs, fmt.Sprintf("a note is text of at most %d characters", MaxNote))
-	}
+	errs = append(errs, checkKept(m.Source, m.ExpiresAt, m.Note, now)...)
 	if len(errs) > 0 {
 		return fmt.Errorf("%w: %s in group %q: %s", ErrInvalid, m.Principal.key(), m.Group, strings.Join(errs, "; "))
 	}
@@ -725,13 +773,15 @@ func privilegedTakeNoGroups(ctx context.Context, tx pgx.Tx, tenant string, neste
 }
 
 // membersCanJoin refuses members of groups that don't exist, or identities that aren't members or
-// guests of the tenant, read under the change's locks.
+// guests of the tenant, read under the change's locks. It holds the memberships until the change
+// ends, so DeleteExpired passes over one expiring meanwhile, rather than end it without seeing
+// the groups this change joins.
 func (a *Authorizer) membersCanJoin(ctx context.Context, tx pgx.Tx, tenant string, groups, identities []string) error {
 	rows, err := tx.Query(ctx, `
 		SELECT 'group ' || g FROM unnest($2::text[]) AS g WHERE NOT EXISTS (SELECT FROM rbac_groups WHERE tenant = $1 AND id = g)
 		UNION ALL
 		SELECT 'identity ' || p FROM unnest($3::text[]) AS p WHERE NOT EXISTS (
-		  SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = p AND (expires_at IS NULL OR expires_at > $4))
+		  SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = p AND (expires_at IS NULL OR expires_at > $4) FOR KEY SHARE)
 		ORDER BY 1`, tenant, groups, identities, a.cfg.Now())
 	if err != nil {
 		return err
@@ -792,7 +842,7 @@ const nestingDepths = `
 	WITH RECURSIVE down(id, depth) AS (
 	  SELECT $3::text COLLATE "C", 0
 	  UNION
-	  SELECT m.principal_id, d.depth + 1 FROM rbac_members m JOIN down d ON m.group_id = d.id
+	  SELECT substr(m.principal, length('group:') + 1), d.depth + 1 FROM rbac_members m JOIN down d ON m.group_id = d.id
 	  WHERE m.tenant = $1 AND m.principal LIKE 'group:%' AND (m.expires_at IS NULL OR m.expires_at > $4) AND d.depth <= $5
 	), up(id, depth) AS (
 	  SELECT $2::text COLLATE "C", 0
@@ -836,10 +886,11 @@ func (a *Authorizer) DeleteMembers(ctx context.Context, actor Principal, tenant 
 }
 
 // Members lists a group's members in force, as stored: identities and groups, not the members of
-// the groups in it.
+// the groups in it. An identity whose membership of the tenant ended is in none of its groups.
 func (a *Authorizer) Members(ctx context.Context, tenant, group string) ([]Member, error) {
-	rows, err := a.db.Query(ctx, `SELECT `+memberColumns+` FROM rbac_members
+	rows, err := a.db.Query(ctx, `SELECT `+memberColumns+` FROM rbac_members m
 		WHERE tenant = $1 AND group_id = $2 AND (expires_at IS NULL OR expires_at > $3)
+		  AND (principal_kind = 'group' OR `+inTenant("m.principal", "$1", "$3")+`)
 		ORDER BY principal, source`, tenant, group, a.cfg.Now())
 	if err != nil {
 		return nil, err
@@ -848,20 +899,68 @@ func (a *Authorizer) Members(ctx context.Context, tenant, group string) ([]Membe
 }
 
 // GroupsOf lists the groups a principal is in in a tenant, by id: those it is a member of, and
-// those they are in, to the top, as memberships are in force now.
+// those they are in, to the top, as memberships are in force now. An identity whose membership of
+// the tenant ended is in none.
 func (a *Authorizer) GroupsOf(ctx context.Context, tenant string, p Principal) ([]string, error) {
 	rows, err := a.db.Query(ctx, `
 		WITH RECURSIVE g(id) AS (
 		  SELECT group_id FROM rbac_members WHERE tenant = $1 AND principal = $2 AND (expires_at IS NULL OR expires_at > $3)
+		    AND ($4 OR `+inTenant("$2", "$1", "$3")+`)
 		  UNION
 		  SELECT m.group_id FROM rbac_members m JOIN g ON m.principal = 'group:' || g.id
 		  WHERE m.tenant = $1 AND (m.expires_at IS NULL OR m.expires_at > $3)
 		)
-		SELECT id FROM g ORDER BY id`, tenant, p.key(), a.cfg.Now())
+		SELECT id FROM g ORDER BY id`, tenant, p.key(), a.cfg.Now(), p.Kind == Group)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
+// groupKeys returns the keys of the groups among principals, sorted, each once.
+func groupKeys(principals []Principal) []string {
+	var keys []string
+	for _, p := range principals {
+		if p.Kind == Group {
+			keys = append(keys, p.key())
+		}
+	}
+	slices.Sort(keys)
+	return slices.Compact(keys)
+}
+
+func bindingPrincipals(bs []Binding) []Principal {
+	ps := make([]Principal, len(bs))
+	for i, b := range bs {
+		ps[i] = b.Principal
+	}
+	return ps
+}
+
+// groupsExist refuses a change naming, by key, a group the tenant doesn't have, read under the
+// change's locks on them: what it names would pass to a group made later with that id.
+func groupsExist(ctx context.Context, q DB, tenant string, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	var missing string
+	err := q.QueryRow(ctx, `SELECT k FROM unnest($2::text[]) AS k
+		WHERE NOT EXISTS (SELECT FROM rbac_groups WHERE tenant = $1 AND id = substr(k, length('group:') + 1))
+		ORDER BY k LIMIT 1`, tenant, keys).Scan(&missing)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil
+	case err != nil:
+		return err
+	}
+	return fmt.Errorf("%w: tenant %q has no %s", ErrInvalid, tenant, missing)
+}
+
+// inTenant is SQL for whether an identity, by the SQL for its key, is a member or guest of a tenant
+// at now: until DeleteExpired removes them, an ended membership's groups are still stored.
+func inTenant(principal, tenant, now string) string {
+	return `EXISTS (SELECT FROM rbac_memberships ms WHERE ms.tenant = ` + tenant + ` AND ms.principal = ` + principal +
+		` AND (ms.expires_at IS NULL OR ms.expires_at > ` + now + `))`
 }
 
 const memberColumns = `group_id, principal_kind, principal_id, source, expires_at, note, created_by, created_at, updated_by, updated_at`

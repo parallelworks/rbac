@@ -84,9 +84,9 @@ const (
 // every signed-in identity, so a host can't declare one.
 var reservedKinds = []PrincipalKind{"anonymous", "authenticated", "domain", "everyone", "role", "set"}
 
-// Principal is who a role is granted to. An identity's or a group's id names it in every
-// tenant, so a tenant can grant a role to one from another, where Config.ValidateGrant allows
-// it.
+// Principal is who a role is granted to. An identity's id names it in every tenant, so a tenant
+// can grant a role to one from another, where Config.ValidateGrant allows it; a group's names it
+// only in its tenant.
 type Principal struct {
 	Kind PrincipalKind
 	ID   string
@@ -515,8 +515,8 @@ type Config struct {
 	// no grant gives. A check or search of a permission not among them, or of a resource type none
 	// of them nor any built-in role is for, is refused as invalid, as a typo, and New refuses a
 	// built-in role giving one: they include what the package checks for the host that the
-	// built-in roles give, `:grant` and `:deny` permissions and DefineRoles. Empty, they are what
-	// the built-in roles give.
+	// built-in roles give, `:grant` and `:deny` permissions, DefineRoles, ManageGroups and
+	// ManagePrivilegedGroups. Empty, they are what the built-in roles give.
 	Permissions []Permission
 	// Sources are the sources the host owns, such as the one it syncs grants from a directory
 	// from: Apply refuses to grant or revoke from one, by ID too, and DeleteRole to delete a role

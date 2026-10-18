@@ -45,7 +45,7 @@ func (r RoleDefinition) clone() RoleDefinition {
 	return r
 }
 
-// managesAccess reports whether the role gives any permission to change grants.
+// managesAccess reports whether the role gives any permission to change access.
 func (r RoleDefinition) managesAccess() bool {
 	return slices.ContainsFunc(r.Permissions, Permission.managesAccess)
 }

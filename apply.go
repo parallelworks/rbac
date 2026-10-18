@@ -49,8 +49,11 @@ func (e *InvalidError) Unwrap() error { return e.Err }
 //     actor hands on, permissions and power alike, it holds unconditionally or under the
 //     condition the grant has: a role a conditional grant lists is granted only under its
 //     condition;
-//   - a role that gives a `:grant` or `:deny` permission or DefineRoles can't be granted to a
-//     tenant's members or the public, and only a role marked Public can be granted to the public.
+//   - a role that gives a `:grant` or `:deny` permission, DefineRoles, ManageGroups or
+//     ManagePrivilegedGroups can't be granted to a tenant's members or the public, and only a role
+//     marked Public can be granted to the public;
+//   - a group granted a role is one of the tenant's: what a grant to one that doesn't exist named
+//     would pass to a group made later with its id.
 //
 // Anonymous subjects change nothing. A grant outlives the actor's own access: revoking that
 // access leaves the grants the actor made, as in cloud IAM, so a time-limited power to change
@@ -81,7 +84,7 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 			return &InvalidError{Binding: b, Reason: "only Activate grants from " + SourceActivation}
 		}
 	}
-	return a.change(ctx, actor, on, ViaApply, grants, revokes, nil, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.change(ctx, actor, on, ViaApply, grants, revokes, nil, nil, func(tx pgx.Tx) (ChangeEvent, error) {
 		revoked, err := a.revoke(ctx, tx, on.Tenant, scope, revokes, grants)
 		if err != nil {
 			return ChangeEvent{}, err
@@ -109,9 +112,10 @@ func ownedRevoke(b Binding) error {
 
 // change makes a change to the grants on one scope as actor, or to eligibilities, which are
 // grants to come, with Apply's checks before its transaction and again under its locks, and
-// then write. check is what else the change needs, run once the actor may make it.
+// then write. named are the principals it names besides its bindings', such as an eligibility's
+// approvers. check is what else the change needs, run once the actor may make it.
 func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, via Via, grants, revokes []Binding,
-	check func() error, write func(pgx.Tx) (ChangeEvent, error),
+	named []Principal, check func() error, write func(pgx.Tx) (ChangeEvent, error),
 ) error {
 	scope := on.Scope()
 	cs := a.constrain(ctx, actor, on)
@@ -136,7 +140,14 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, via
 		for _, b := range slices.Concat(grants, revokes) {
 			principals[b.Principal.key()] = true
 		}
+		groups := groupKeys(slices.Concat(bindingPrincipals(grants), named))
+		for _, k := range groups {
+			principals[k] = true
+		}
 		if err := lockAll(ctx, tx, on.Tenant, []string{scope.Key()}, slices.Collect(maps.Keys(principals))); err != nil {
+			return ChangeEvent{}, err
+		}
+		if err := groupsExist(ctx, tx, on.Tenant, groups); err != nil {
 			return ChangeEvent{}, err
 		}
 		// Decided again in the transaction, so the actor's access and the roles are read as the
@@ -295,12 +306,17 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 		return err
 	}
 	scopes, principals := map[string]bool{}, map[string]bool{}
-	for _, g := range grants {
+	named := make([]Principal, len(grants))
+	for i, g := range grants {
 		scopes[g.Scope.Key()] = true
 		principals[g.Principal.key()] = true
+		named[i] = g.Principal
 	}
 	return a.inTx(ctx, tenant, actor, func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lockAll(ctx, tx, tenant, slices.Collect(maps.Keys(scopes)), slices.Collect(maps.Keys(principals))); err != nil {
+			return ChangeEvent{}, err
+		}
+		if err := groupsExist(ctx, tx, tenant, groupKeys(named)); err != nil {
 			return ChangeEvent{}, err
 		}
 		// Again under the locks, so a custom role deleted since isn't granted, nor one redefined
@@ -1286,8 +1302,9 @@ func (a *Authorizer) DeletePrincipal(ctx context.Context, actor Principal, tenan
 
 // DeletePrincipalEverywhere removes every grant and eligibility of an identity in every tenant,
 // with its memberships and places in groups, as actor, as when it is deleted. A group is its
-// tenant's alone: DeleteGroups removes one. Delete it from the host first, so Config.ValidateGrant refuses new grants to it. Each
-// tenant's removals reach Config.OnChange as a change of their own.
+// tenant's alone: DeleteGroups removes one. Delete it from the host first, so
+// Config.ValidateGrant refuses new grants to it. Each tenant's removals reach Config.OnChange as a
+// change of their own.
 //
 // Each tenant's removal takes two locks, so it removes a batch of tenants per transaction, to
 // keep a principal in many tenants from filling PostgreSQL's lock table: on an error, the
@@ -1469,7 +1486,8 @@ func (a *Authorizer) DeleteExpired(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	// An identity whose membership ended leaves the tenant's groups with it, as one that leaves
-	// the tenant does, so joining again gives back nothing it held.
+	// the tenant does, so joining again gives back none of the groups it was in. Its own grants
+	// and eligibilities stay, as they do for an identity granted roles in a tenant it isn't in.
 	var memberships int64
 	err = a.db.QueryRow(ctx, `
 		WITH ended AS (
