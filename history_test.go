@@ -476,6 +476,7 @@ func TestHistoryRecordsWhoMadeEachChangeAndHow(t *testing.T) {
 		{"DeleteScopes", host, func(ctx context.Context) error {
 			return h.authz.DeleteScopes(ctx, host, "t1", []rbac.Scope{cluster.Scope()})
 		}},
+		{"DeleteScope", host, func(ctx context.Context) error { return h.authz.DeleteScope(ctx, host, "t1", rbac.TenantRoot("t1")) }},
 		{"DeletePrincipal", host, func(ctx context.Context) error { return h.authz.DeletePrincipal(ctx, host, "t1", identity("x")) }},
 		{"DeletePrincipalEverywhere", host, func(ctx context.Context) error {
 			return h.authz.DeletePrincipalEverywhere(ctx, host, identity("w"))
@@ -539,12 +540,133 @@ func TestAChangeRefusesWhatItCantRecord(t *testing.T) {
 	g := []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "u")}
 	for name, a := range map[string]rbac.Audit{
 		"on behalf of a group": {OnBehalfOf: rbac.Principal{Kind: rbac.Group, ID: "ops"}},
-		"a long request":       {Request: strings.Repeat("r", rbac.MaxRequest+1)},
-		"a long reason":        {Reason: strings.Repeat("r", rbac.MaxNote+1)},
-		"a NUL":                {Request: "a\x00b"},
+		// JSON would record it as someone else, with U+FFFD for the byte.
+		"on behalf of an id that isn't UTF-8": {OnBehalfOf: identity("a\xffb")},
+		"a long request":                      {Request: strings.Repeat("r", rbac.MaxRequest+1)},
+		"a long reason":                       {Reason: strings.Repeat("r", rbac.MaxNote+1)},
+		"a NUL":                               {Request: "a\x00b"},
 	} {
 		if err := h.authz.Import(rbac.WithAudit(ctx, a), host, "t1", g); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("%s: %v", name, err)
 		}
+		if _, err := h.authz.DeleteExpired(rbac.WithAudit(ctx, a)); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("DeleteExpired, %s: %v", name, err)
+		}
+	}
+	// DeleteGrants stores nothing that names its actor, so history alone would take it, as someone else.
+	if err := h.authz.DeleteGrants(ctx, identity("h\xff"), "t1", g); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("an actor whose id isn't UTF-8: %v", err)
+	}
+}
+
+// What OnChange writes is its host's: through the package, as the call it makes; by hand, as no
+// one's. Neither is recorded as the change it is told of, and a call it makes ends no context
+// that change still writes with.
+func TestHistoryRecordsOnChangesWritesAsItsOwn(t *testing.T) {
+	var h *harness
+	h = setup(t, func(c *rbac.Config) {
+		c.OnChange = func(ctx context.Context, tx pgx.Tx, e rbac.ChangeEvent) error {
+			switch e.Tenant {
+			case "t1":
+				_, err := tx.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+					VALUES ('t1', 'cluster', 'c1', 'user', 'by-hook', 'cluster.login')`)
+				return err
+			case "t2":
+				return h.authz.WithTx(tx).Import(ctx, host, "t9", []rbac.Grant{grant(rbac.TenantRoot("t9"), "cluster.login", rbac.User, "z")})
+			}
+			return nil
+		}
+	})
+	ctx := t.Context()
+	// w's grants in t2 and t3, which DeletePrincipalEverywhere removes in one transaction, telling
+	// OnChange of t2's first.
+	for _, tenant := range []string{"t2", "t3"} {
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			VALUES ($1, 'cluster', 'c1', 'user', 'w', 'cluster.login')`, tenant); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var last int64
+	recordedSince(t, h, &last)
+	if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "u")}); err != nil {
+		t.Fatal(err)
+	}
+	if got := recordedSince(t, h, &last); len(got) != 2 || got[0] != (recorded{actor: "user:host", how: "Import", op: "create"}) ||
+		got[1] != (recorded{op: "create"}) {
+		t.Errorf("Import recorded %+v", got)
+	}
+	if err := h.authz.DeletePrincipalEverywhere(ctx, host, identity("w")); err != nil {
+		t.Fatal(err)
+	}
+	removal := recorded{actor: "user:host", how: "DeletePrincipalEverywhere", op: "delete"}
+	if got := recordedSince(t, h, &last); len(got) != 3 || got[0] != removal || got[1] != removal ||
+		got[2] != (recorded{actor: "user:host", how: "Import", op: "create"}) {
+		t.Errorf("DeletePrincipalEverywhere recorded %+v", got)
+	}
+}
+
+// A change that fails under WithTx leaves nothing in the host's transaction, though its context is
+// done: neither what it wrote nor its context for history, which would record the host's own
+// writes as the change's.
+func TestAFailedChangeLeavesNothingInTheHostsTransaction(t *testing.T) {
+	var cancel context.CancelFunc
+	h := setup(t, func(c *rbac.Config) {
+		c.OnChange = func(context.Context, pgx.Tx, rbac.ChangeEvent) error {
+			cancel()
+			return context.Canceled
+		}
+	})
+	ctx := t.Context()
+	var last int64
+	recordedSince(t, h, &last)
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	call, c := context.WithCancel(ctx)
+	cancel = c
+	if err := h.authz.WithTx(tx).Import(call, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "u")}); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'by-hand', 'cluster.login')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := recordedSince(t, h, &last); len(got) != 1 || got[0] != (recorded{op: "create"}) {
+		t.Fatalf("recorded %+v", got)
+	}
+}
+
+func TestAnExpiryInAnOlderTransactionIsRecordedAsOne(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// A host's transaction begun before the grant expires, which DeleteExpired, under it, removes.
+	if _, err := tx.Exec(ctx, `SELECT 1`); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if _, err := tx.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'brief', 'cluster.login', clock_timestamp())`); err != nil {
+		t.Fatal(err)
+	}
+	h.now = time.Now().Add(time.Second)
+	if _, err := h.authz.WithTx(tx).DeleteExpired(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var op string
+	if err := h.pool.QueryRow(ctx, `SELECT op FROM rbac_history WHERE principal = 'user:brief' AND after IS NULL`).Scan(&op); err != nil || op != "expire" {
+		t.Fatalf("op = %q, %v", op, err)
 	}
 }

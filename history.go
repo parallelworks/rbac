@@ -32,12 +32,14 @@ func WithAudit(ctx context.Context, a Audit) context.Context {
 	return context.WithValue(ctx, auditKey{}, a)
 }
 
-// checkAudit returns why what ctx carries for history can't be recorded.
-func (a *Authorizer) checkAudit(ctx context.Context) error {
-	audit, _ := ctx.Value(auditKey{}).(Audit)
+// checkAudit returns why history can't record a change by actor with audit as they are: JSON
+// would carry invalid UTF-8 as another character, and the trigger fails on a NUL.
+func (a *Authorizer) checkAudit(actor Principal, audit Audit) error {
 	switch {
-	case audit.OnBehalfOf != (Principal{}) && (!a.acts(audit.OnBehalfOf.Kind) || audit.OnBehalfOf.ID == ""):
-		return fmt.Errorf("%w: a change is made on behalf of an identity, a user or a declared kind", ErrInvalid)
+	case !validText(actor.ID):
+		return fmt.Errorf("%w: the actor's id is text without NUL", ErrInvalid)
+	case audit.OnBehalfOf != (Principal{}) && (!a.acts(audit.OnBehalfOf.Kind) || audit.OnBehalfOf.ID == "" || !validText(audit.OnBehalfOf.ID)):
+		return fmt.Errorf("%w: a change is made on behalf of an identity, a user or a declared kind, whose id is text without NUL", ErrInvalid)
 	case utf8.RuneCountInString(audit.Request) > MaxRequest || !validText(audit.Request):
 		return fmt.Errorf("%w: a request id is text of at most %d characters", ErrInvalid, MaxRequest)
 	case !validNote(audit.Reason):
@@ -59,9 +61,13 @@ type changeContext struct {
 
 // recording sets, for the rest of tx, the context its writes record in history: actor's change,
 // made by how, the name of the call that makes it, with what ctx carries for history. done clears
-// it, so a host's own writes later in its transaction, under WithTx, aren't recorded as this one's.
-func recording(ctx context.Context, tx pgx.Tx, actor Principal, how, op string) (done func() error, err error) {
+// it, so the writes that follow, OnChange's and the host's own under WithTx, aren't recorded as
+// this change's.
+func (a *Authorizer) recording(ctx context.Context, tx pgx.Tx, actor Principal, how, op string) (done func() error, err error) {
 	audit, _ := ctx.Value(auditKey{}).(Audit)
+	if err := a.checkAudit(actor, audit); err != nil {
+		return nil, err
+	}
 	c := changeContext{Actor: actorKey(actor), How: how, Request: audit.Request, Reason: audit.Reason, Op: op}
 	if audit.OnBehalfOf != (Principal{}) {
 		c.OnBehalfOf = audit.OnBehalfOf.key()
@@ -72,6 +78,11 @@ func recording(ctx context.Context, tx pgx.Tx, actor Principal, how, op string) 
 	}
 	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.change', $1, true)`, string(b)); err != nil {
 		return nil, err
+	}
+	// In a transaction of its own that hands nothing to OnChange, nothing writes after the change,
+	// so the setting ends with it.
+	if _, hosts := a.db.(pgx.Tx); !hosts && a.cfg.OnChange == nil {
+		return func() error { return nil }, nil
 	}
 	return func() error {
 		_, err := tx.Exec(ctx, `SELECT set_config('rbac.change', '', true)`)

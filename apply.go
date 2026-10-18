@@ -986,11 +986,8 @@ func scopeGrants(scope Scope, bindings []Binding) []Grant {
 // inTx runs fn in a transaction, recording what it writes in history as actor's change made by
 // how, the call that makes it, and hands what it changed to Config.OnChange there.
 func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, how string, fn func(pgx.Tx) (ChangeEvent, error)) error {
-	if err := a.checkAudit(ctx); err != nil {
-		return err
-	}
 	return a.begin(ctx, func(tx pgx.Tx) error {
-		done, err := recording(ctx, tx, actor, how, "")
+		done, err := a.recording(ctx, tx, actor, how, "")
 		if err != nil {
 			return err
 		}
@@ -998,11 +995,11 @@ func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, h
 		if err != nil {
 			return err
 		}
-		e.Tenant, e.Actor = tenant, actor
-		if err := a.report(ctx, tx, e); err != nil {
+		if err := done(); err != nil {
 			return err
 		}
-		return done()
+		e.Tenant, e.Actor = tenant, actor
+		return a.report(ctx, tx, e)
 	})
 }
 
@@ -1021,9 +1018,31 @@ func begin(ctx context.Context, db DB, fn func(pgx.Tx) error) error {
 	}); ok {
 		err = pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, fn)
 	} else {
-		err = pgx.BeginFunc(ctx, db, fn)
+		err = savepoint(ctx, db, fn)
 	}
 	return conflicted(err)
+}
+
+// savepointEnd is how long a savepoint's release or rollback may take once its ctx is done.
+const savepointEnd = 10 * time.Second
+
+// savepoint runs fn in a savepoint, which it releases or rolls back even once ctx is done: pgx
+// sends nothing on a done ctx, which would leave the savepoint open, and the host's transaction
+// holding what a failed change wrote and its context for history, to commit with its own writes.
+func savepoint(ctx context.Context, db DB, fn func(pgx.Tx) error) error {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	// Bounded, as a done ctx's deadline no longer is, so a dead connection can't hold it for good.
+	end, cancel := context.WithTimeout(context.WithoutCancel(ctx), savepointEnd)
+	defer cancel()
+	// After the release, a no-op.
+	defer func() { _ = tx.Rollback(end) }()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(end)
 }
 
 // report hands a change to Config.OnChange in its transaction, unless it changed nothing.
@@ -1290,7 +1309,7 @@ func (a *Authorizer) DeleteGrants(ctx context.Context, actor Principal, tenant s
 
 // DeleteScope removes every grant, eligibility and deny on a scope, as DeleteScopes does.
 func (a *Authorizer) DeleteScope(ctx context.Context, actor Principal, tenant string, s Scope) error {
-	return a.DeleteScopes(ctx, actor, tenant, []Scope{s})
+	return a.deleteScopes(ctx, actor, tenant, "DeleteScope", []Scope{s})
 }
 
 // DeleteScopes removes every grant, eligibility and deny on scopes, as actor, as when resources
@@ -1303,6 +1322,10 @@ func (a *Authorizer) DeleteScope(ctx context.Context, actor Principal, tenant st
 // transaction would hold a lock for each, which PostgreSQL keeps in one table every session
 // shares: a few thousand can fill it.
 func (a *Authorizer) DeleteScopes(ctx context.Context, actor Principal, tenant string, scopes []Scope) error {
+	return a.deleteScopes(ctx, actor, tenant, "DeleteScopes", scopes)
+}
+
+func (a *Authorizer) deleteScopes(ctx context.Context, actor Principal, tenant, how string, scopes []Scope) error {
 	keys := make([]string, len(scopes))
 	for i, s := range scopes {
 		if !s.in(tenant) {
@@ -1314,7 +1337,7 @@ func (a *Authorizer) DeleteScopes(ctx context.Context, actor Principal, tenant s
 	// maxLocks once, or a few scopes would lock the whole tenant.
 	slices.Sort(keys)
 	keys = slices.Compact(keys)
-	return a.delete(ctx, actor, tenant, "DeleteScopes", func(tx pgx.Tx) error { return lockAll(ctx, tx, tenant, keys, nil) },
+	return a.delete(ctx, actor, tenant, how, func(tx pgx.Tx) error { return lockAll(ctx, tx, tenant, keys, nil) },
 		deletion{denies: "scope = ANY($2::text[])", where: "scope = ANY($2::text[])"}, keys)
 }
 
@@ -1347,14 +1370,11 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Pri
 	if err := a.identity(actor); err != nil {
 		return err
 	}
-	if err := a.checkAudit(ctx); err != nil {
-		return err
-	}
 	const batch = maxLocks / 2
 	for {
 		var n int
 		err := a.begin(ctx, func(tx pgx.Tx) error {
-			done, err := recording(ctx, tx, actor, "DeletePrincipalEverywhere", "")
+			done, err := a.recording(ctx, tx, actor, "DeletePrincipalEverywhere", "")
 			if err != nil {
 				return err
 			}
@@ -1370,6 +1390,7 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Pri
 				return err
 			}
 			n = len(tenants)
+			events := make([]ChangeEvent, 0, n)
 			// In tenant order, so two of these for one principal never deadlock.
 			for _, t := range tenants {
 				if err := lock(ctx, tx, t, nil, []string{p.key()}); err != nil {
@@ -1392,14 +1413,20 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Pri
 				if err != nil {
 					return err
 				}
-				if err := a.report(ctx, tx, ChangeEvent{
+				events = append(events, ChangeEvent{
 					Tenant: t, Actor: actor, Revoked: revoked, Ineligible: ended,
 					Left: left, EndedMemberships: memberships,
-				}); err != nil {
+				})
+			}
+			if err := done(); err != nil {
+				return err
+			}
+			for _, e := range events {
+				if err := a.report(ctx, tx, e); err != nil {
 					return err
 				}
 			}
-			return done()
+			return nil
 		})
 		if err != nil || n < batch {
 			return err
@@ -1516,7 +1543,7 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 	expire := func(sql string) (int64, error) {
 		var n int64
 		err := a.begin(ctx, func(tx pgx.Tx) error {
-			done, err := recording(ctx, tx, Principal{}, "DeleteExpired", "expire")
+			done, err := a.recording(ctx, tx, Principal{}, "DeleteExpired", "expire")
 			if err != nil {
 				return err
 			}
