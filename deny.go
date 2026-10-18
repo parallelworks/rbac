@@ -16,8 +16,11 @@ import (
 // Deny is a deny policy: on its scope and everything under it, it removes permissions from
 // principals, whatever their grants give, as a guardrail above roles. A principal it names is
 // an identity, a group, a tenant's members or the public (everyone, signed in or not); those
-// Exempt names keep their access. Permissions are `type:verb`, or `type:*` for every permission
-// on a type. With a Condition it denies only where the expression holds, or can't be evaluated.
+// Exempt names, identities or groups, keep their access. A deny naming the public may exempt the
+// tenant's members, to bind only those who aren't; the public itself is never exempt, as that
+// would exempt everyone, nor is a principal it names. Permissions are `type:verb`, or `type:*`
+// for every permission on a type. With a Condition it denies only where the expression holds, or
+// can't be evaluated.
 type Deny struct {
 	// ID names it on its scope, in lowercase letters, digits, dots, hyphens and underscores.
 	ID          string
@@ -150,6 +153,23 @@ func (a *Authorizer) checkDeny(tenant string, d Deny) error {
 	for _, p := range slices.Concat(d.Principals, d.Exempt) {
 		if !p.wellFormed(tenant) {
 			bad("principal %q is not valid", p.key())
+		}
+	}
+	// A set, so lists past the limit cost no more than one pass each.
+	named := make(map[Principal]bool, len(d.Principals))
+	for _, p := range d.Principals {
+		named[p] = true
+	}
+	// Every subject is the public, and every member a tenant's members, so exempting either where
+	// it doesn't narrow the deny would exempt everyone it names, and it would bind no one.
+	for _, p := range d.Exempt {
+		switch {
+		case p.Kind == Public:
+			bad("exempting the public exempts everyone")
+		case p.Kind == Members && !named[Principal{Kind: Public}]:
+			bad("only a deny naming the public may exempt the tenant's members")
+		case named[p]:
+			bad("principal %q is both named and exempt", p.key())
 		}
 	}
 	if len(d.Permissions) == 0 || len(d.Permissions) > MaxDenyEntries {

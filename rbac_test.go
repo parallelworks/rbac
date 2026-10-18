@@ -4047,6 +4047,49 @@ func TestSettingADenyIsChecked(t *testing.T) {
 	}
 }
 
+func TestADenyCantExemptEveryoneItNames(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	resources := hostTable(t, h)
+	named := rbac.Principal{Kind: rbac.User, ID: "named"}
+	h.seed(t,
+		grant(cluster.Scope(), "cluster.sudo", rbac.User, "named"),
+		grant(cluster.Scope(), "cluster.sudo", rbac.Members, "t1"),
+	)
+	public, members := rbac.Principal{Kind: rbac.Public}, rbac.TenantMembers("t1")
+	// Every subject is the public and every member the tenant's members, so these would bind no one.
+	for name, d := range map[string]rbac.Deny{
+		"the public exempt":                    {Principals: []rbac.Principal{named}, Exempt: []rbac.Principal{public}},
+		"the public exempt from itself":        {Principals: []rbac.Principal{public}, Exempt: []rbac.Principal{public}},
+		"members exempt from a deny on others": {Principals: []rbac.Principal{named}, Exempt: []rbac.Principal{members}},
+		"members exempt from itself":           {Principals: []rbac.Principal{members}, Exempt: []rbac.Principal{members}},
+		"one both named and exempt":            {Principals: []rbac.Principal{named}, Exempt: []rbac.Principal{named}},
+	} {
+		d.ID, d.Permissions = "no-root", []rbac.Permission{root}
+		if err := h.authz.SetDeny(ctx, guardian, cluster, d); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if stored, err := h.authz.Denies(ctx, "t1", []rbac.Scope{cluster.Scope()}); err != nil || len(stored) > 0 {
+		t.Fatalf("a deny refused should not be stored: %v, %v", stored, err)
+	}
+	// Anyone but the tenant's members: only those who aren't.
+	d := rbac.Deny{ID: "members-only", Principals: []rbac.Principal{public}, Exempt: []rbac.Principal{members}, Permissions: []rbac.Permission{root}}
+	if err := h.authz.SetDeny(ctx, guardian, cluster, d); err != nil {
+		t.Fatal(err)
+	}
+	guest := rbac.Subject{Principal: named}
+	if !allowed(t, h, user("named"), root, cluster) || allowed(t, h, guest, root, cluster) {
+		t.Fatal("a deny on the public exempting members should bind only those who aren't members")
+	}
+	listingsAgree(t, h, resources, user("named"), root)
+	listingsAgree(t, h, resources, guest, root)
+	// The grant to the members, exempt, gives it.
+	if holders, err := h.authz.Holders(ctx, root, cluster); err != nil || !slices.Contains(holders, members) {
+		t.Fatalf("Holders = %v, %v", holders, err)
+	}
+}
+
 func TestNotesOnGrants(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
