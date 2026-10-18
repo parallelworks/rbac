@@ -90,7 +90,9 @@ another store. Both search one tenant, and count only unconditional grants:
   check. To hand a permission on, the actor holds it unconditionally or under the same condition.
 - **Deny policies:** `SetDeny` puts a deny on a scope: under it, it removes permissions
   (`type:verb`, or `type:*` for a type's every one) from the principals it names, those it exempts
-  aside, whatever their grants give. A conditional one denies where its condition holds or can't
+  aside, whatever their grants give. It exempts identities and groups, or from a deny naming the
+  public the tenant's members, to bind only those who aren't; never the public, which would
+  exempt everyone. A conditional one denies where its condition holds or can't
   be evaluated. Setting one needs `rbac.DenyPermission(type)` there, which no deny removes, so
   whoever holds it on a scope above can always lift a deny set below. `Filter`, `Reachable` and
   `Holders` honor denies.
