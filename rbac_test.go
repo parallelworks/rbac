@@ -582,19 +582,34 @@ func TestHolders(t *testing.T) {
 		grant(rbac.Scope{Type: "workspace", ID: "w1"}, "cluster.sudo", rbac.Group, "admins"),
 		grant(cluster.Scope(), "cluster.login", rbac.User, "u"),
 		grant(rbac.TenantRoot("t1"), "cluster.login", rbac.Members, "t1"),
+		grant(cluster.Scope(), "cluster.sudo", rbac.User, "stranger"),
 	)
+	// a is in admins, and owner and u are members; stranger, granted root, isn't in the tenant.
+	h.as(t, "a", "admins")
+	h.as(t, "owner")
+	h.as(t, "u")
 	got, err := h.authz.Holders(t.Context(), root, cluster)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []rbac.Principal{{Kind: rbac.Group, ID: "admins"}, {Kind: rbac.User, ID: "owner"}}
-	if !slices.Equal(got, want) {
-		t.Errorf("Holders(root) = %v, want %v", got, want)
+	want := []rbac.Principal{{Kind: rbac.User, ID: "a"}, {Kind: rbac.User, ID: "owner"}}
+	if !slices.Equal(holderPrincipals(got), want) || !slices.Equal(got[0].Groups, []string{"admins"}) || len(got[0].Grants) != 1 || got[1].Groups != nil {
+		t.Errorf("Holders(root) = %+v, want %v", got, want)
 	}
 	got, err = h.authz.Holders(t.Context(), login, cluster)
-	if err != nil || len(got) != 4 {
-		t.Errorf("Holders(login) = %v, %v", got, err)
+	want = []rbac.Principal{rbac.TenantMembers("t1"), {Kind: rbac.User, ID: "a"}, {Kind: rbac.User, ID: "owner"}, {Kind: rbac.User, ID: "u"}}
+	if err != nil || !slices.Equal(holderPrincipals(got), want) {
+		t.Errorf("Holders(login) = %+v, %v", got, err)
 	}
+}
+
+// holderPrincipals is who Holders lists.
+func holderPrincipals(holders []rbac.Holder) []rbac.Principal {
+	ps := make([]rbac.Principal, len(holders))
+	for i, h := range holders {
+		ps[i] = h.Principal
+	}
+	return ps
 }
 
 func TestAMisspelledPermissionOrTypeIsInvalid(t *testing.T) {
@@ -1553,6 +1568,11 @@ func TestChangesAreBounded(t *testing.T) {
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
+	// Holders lists those that are members, the owner and the 200 once they join.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_memberships (tenant, principal_kind, principal_id)
+		SELECT 't1', 'user', 'u' || i FROM generate_series(0, 199) AS i`); err != nil {
+		t.Fatal(err)
+	}
 	if holders, err := h.authz.Holders(ctx, login, cluster); err != nil || len(holders) != 201 {
 		t.Fatalf("Holders = %d, %v", len(holders), err)
 	}
@@ -2247,7 +2267,7 @@ func TestTenantMembersAndThePublicNeverGetAGrantPermission(t *testing.T) {
 				t.Errorf("Permissions: %v, %v", perms, err)
 			}
 			holders, err := h.authz.Holders(ctx, grantC, cluster)
-			if err != nil || slices.Contains(holders, p) {
+			if err != nil || slices.Contains(holderPrincipals(holders), p) {
 				t.Errorf("Holders: %v, %v", holders, err)
 			}
 			reach, err := h.authz.Reachable(ctx, member, grantC, "t1", "cluster")
@@ -2469,7 +2489,7 @@ func TestPublicAccess(t *testing.T) {
 	if d, err := h.authz.Explain(ctx, anonymous, view, cluster); err != nil || len(d.Grants) != 1 || d.Grants[0].Principal != public {
 		t.Errorf("Explain = %+v, %v", d, err)
 	}
-	if holders, err := h.authz.Holders(ctx, view, cluster); err != nil || !slices.Contains(holders, public) {
+	if holders, err := h.authz.Holders(ctx, view, cluster); err != nil || !slices.Contains(holderPrincipals(holders), public) {
 		t.Errorf("Holders = %v, %v", holders, err)
 	}
 	b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}}
@@ -2543,7 +2563,7 @@ func TestAPublicGrantGivesOnlyWhileItsRoleIsPublic(t *testing.T) {
 			listingsAgree(t, h, resources, s, p)
 		}
 	}
-	if holders, err := h.authz.Holders(ctx, root, cluster); err != nil || slices.Contains(holders, public) {
+	if holders, err := h.authz.Holders(ctx, root, cluster); err != nil || slices.Contains(holderPrincipals(holders), public) {
 		t.Errorf("Holders = %v, %v", holders, err)
 	}
 }
@@ -2610,7 +2630,7 @@ func TestMachineIdentities(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if holders, err := undeclared.Holders(ctx, root, cluster); err != nil || slices.Contains(holders, ci.Principal) {
+	if holders, err := undeclared.Holders(ctx, root, cluster); err != nil || slices.Contains(holderPrincipals(holders), ci.Principal) {
 		t.Fatalf("Holders lists a kind no longer declared: %v, %v", holders, err)
 	}
 	revoke := rbac.Change{Revoke: []rbac.Binding{{Role: "cluster.admin", Principal: ci.Principal}}}
@@ -2917,7 +2937,7 @@ func TestCustomRoles(t *testing.T) {
 	if perms, err := h.authz.Permissions(ctx, op, cluster); err != nil || !slices.Equal(perms, []rbac.Permission{login, view}) {
 		t.Errorf("Permissions = %v, %v", perms, err)
 	}
-	if holders, err := h.authz.Holders(ctx, login, cluster); err != nil || !slices.Contains(holders, op.Principal) {
+	if holders, err := h.authz.Holders(ctx, login, cluster); err != nil || !slices.Contains(holderPrincipals(holders), op.Principal) {
 		t.Errorf("Holders = %v, %v", holders, err)
 	}
 	if d, err := h.authz.Explain(ctx, op, login, cluster); err != nil || !d.Allowed || d.Grants[0].Role != operator.ID {
@@ -3100,7 +3120,7 @@ func TestPublicCustomRoles(t *testing.T) {
 		t.Fatal("a grant to the public should give nothing once its custom role isn't public")
 	}
 	listingsAgree(t, h, resources, anonymous, view)
-	if holders, err := h.authz.Holders(ctx, view, cluster); err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.Public}) {
+	if holders, err := h.authz.Holders(ctx, view, cluster); err != nil || slices.Contains(holderPrincipals(holders), rbac.Principal{Kind: rbac.Public}) {
 		t.Fatalf("Holders = %v, %v", holders, err)
 	}
 }
@@ -3296,7 +3316,7 @@ func TestCustomRolesFollowTheCatalog(t *testing.T) {
 	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM clusters WHERE `+pred.SQL, pred.Args...).Scan(&n); err != nil || n != 0 {
 		t.Fatalf("Filter kept %d clusters, %v", n, err)
 	}
-	if holders, err := later.Holders(ctx, root, resources[0]); err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.User, ID: "op"}) {
+	if holders, err := later.Holders(ctx, root, resources[0]); err != nil || slices.Contains(holderPrincipals(holders), rbac.Principal{Kind: rbac.User, ID: "op"}) {
 		t.Fatalf("Holders = %v, %v", holders, err)
 	}
 	if perms, err := later.Permissions(ctx, h.as(t, "op"), cluster); err != nil || slices.Contains(perms, root) {
@@ -3352,7 +3372,7 @@ func TestPublicCustomRolesFollowTheCatalog(t *testing.T) {
 		t.Fatal("a grant to the public should give nothing once its role is no longer public")
 	}
 	listingsAgree(t, h, resources, anonymous, view)
-	if holders, err := h.authz.Holders(ctx, view, cluster); err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.Public}) {
+	if holders, err := h.authz.Holders(ctx, view, cluster); err != nil || slices.Contains(holderPrincipals(holders), rbac.Principal{Kind: rbac.Public}) {
 		t.Fatalf("Holders = %v, %v", holders, err)
 	}
 }
@@ -4127,7 +4147,7 @@ func TestPublicCustomRolesThatChangeAccessGiveNothingInSearches(t *testing.T) {
 		t.Fatal("a public grant of a role that changes access should give nothing")
 	}
 	listingsAgree(t, h, resources, anonymous, view)
-	if holders, err := h.authz.Holders(ctx, view, cluster); err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.Public}) {
+	if holders, err := h.authz.Holders(ctx, view, cluster); err != nil || slices.Contains(holderPrincipals(holders), rbac.Principal{Kind: rbac.Public}) {
 		t.Fatalf("Holders = %v, %v", holders, err)
 	}
 }
@@ -4308,8 +4328,9 @@ func TestSearchesLeaveConditionalGrantsToTheHost(t *testing.T) {
 	if !slices.Equal(got, []string{"c0"}) {
 		t.Errorf("Filter kept %v, want only the unconditionally reached c0", got)
 	}
-	if holders, err := h.authz.Holders(ctx, login, resources[2]); err != nil || slices.Contains(holders, rbac.Principal{Kind: rbac.User, ID: "both"}) {
-		t.Errorf("Holders = %v, %v", holders, err)
+	// Holders lists it, marked as holding only under a condition.
+	if holders, err := h.authz.Holders(ctx, login, resources[2]); err != nil || len(holders) != 1 || holders[0].Principal.ID != "both" || !holders[0].Conditional {
+		t.Errorf("Holders = %+v, %v", holders, err)
 	}
 	if !allowed(t, h, h.as(t, "both"), login, resources[2]) {
 		t.Error("Authorize should allow through the conditional grant")
@@ -4873,7 +4894,7 @@ func TestDenies(t *testing.T) {
 	if perms, err := h.authz.Permissions(ctx, contractor, cluster); err != nil || !slices.Equal(perms, []rbac.Permission{login, view}) {
 		t.Fatalf("Permissions = %v, %v", perms, err)
 	}
-	if holders, err := h.authz.Holders(ctx, root, cluster); err != nil || slices.ContainsFunc(holders, func(p rbac.Principal) bool { return p.ID == "named" || p.ID == "contractors" }) {
+	if holders, err := h.authz.Holders(ctx, root, cluster); err != nil || slices.ContainsFunc(holderPrincipals(holders), func(p rbac.Principal) bool { return p.ID == "named" || p.ID == "contractors" }) {
 		t.Fatalf("Holders = %v, %v", holders, err)
 	}
 	for _, s := range []rbac.Subject{contractor, lead, h.as(t, "named")} {
@@ -4981,7 +5002,7 @@ func TestNoDenyLocksOutAGuardAbove(t *testing.T) {
 	if perms, err := h.authz.Permissions(ctx, guardian, workspace); err != nil || !slices.Contains(perms, rbac.DenyPermission("workspace")) {
 		t.Fatalf("Permissions = %v, %v", perms, err)
 	}
-	if holders, err := h.authz.Holders(ctx, rbac.DenyPermission("workspace"), workspace); err != nil || !slices.Contains(holders, guardian.Principal) {
+	if holders, err := h.authz.Holders(ctx, rbac.DenyPermission("workspace"), workspace); err != nil || !slices.Contains(holderPrincipals(holders), guardian.Principal) {
 		t.Fatalf("Holders = %v, %v", holders, err)
 	}
 	listingsAgree(t, h, resources, guardian, rbac.DenyPermission("cluster"))
@@ -5217,7 +5238,7 @@ func TestADenyCantExemptEveryoneItNames(t *testing.T) {
 	listingsAgree(t, h, resources, h.as(t, "named"), root)
 	listingsAgree(t, h, resources, guest, root)
 	// The grant to the members, exempt, gives it.
-	if holders, err := h.authz.Holders(ctx, root, cluster); err != nil || !slices.Contains(holders, members) {
+	if holders, err := h.authz.Holders(ctx, root, cluster); err != nil || !slices.Contains(holderPrincipals(holders), members) {
 		t.Fatalf("Holders = %v, %v", holders, err)
 	}
 }

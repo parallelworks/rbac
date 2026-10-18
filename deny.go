@@ -76,17 +76,6 @@ type denial struct {
 	unevaluated, spent bool
 }
 
-// names reports whether d removes access from a holder Holders lists: one it names, or every
-// one when it names the public, every member when it names a tenant's members, and none it
-// exempts. A group's members aren't known here.
-func (d denial) names(tenant string, h Principal) bool {
-	if slices.Contains(d.exempt, h.key()) {
-		return false
-	}
-	return slices.Contains(d.principals, h.key()) || slices.Contains(d.principals, publicKey) ||
-		h.Kind != Public && slices.Contains(d.principals, TenantMembers(tenant).key())
-}
-
 // deniesOn reads the denies on scopes that name one of keys, and none it exempts, or name
 // anyone when keys is nil, listing p.
 func (a *Authorizer) deniesOn(ctx context.Context, q DB, tenant string, keys, scopes []string, p Permission) ([]denial, error) {

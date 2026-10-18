@@ -308,14 +308,33 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 	return perms, nil
 }
 
-// Holders lists every principal holding a role that gives p on r, the tenant's members and the
-// public included. The AuthZEN subject search; Members lists a group's members. It
-// counts only unconditional grants: whether a conditional one allows depends on the request,
-// and Grants lists them with their conditions. It leaves out holders a deny on the path names,
-// conditional denies included; a deny naming a group's member or an identity among the tenant's
-// members can't be seen through the group or the tenant, so with denies on the path check each
-// person with Authorize.
-func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]Principal, error) {
+// Holder is one who may do p to r, as Holders finds it.
+type Holder struct {
+	// Principal is an identity that is a member or guest of the tenant, or the tenant's members or
+	// the public, each as one holder rather than every one of them.
+	Principal Principal
+	// Grants are the ids of the grants that give it p: an identity's own and its groups', and the
+	// members' or the public's theirs.
+	Grants []string
+	// Groups are the groups whose grants give an identity p, by id: those granted, which it is in
+	// directly or through others.
+	Groups []string
+	// Conditional is set when every grant giving it p has a condition, so whether it may depends on
+	// the request.
+	Conditional bool
+	// MaybeDenied is set when a deny on the path may bind it: one whose condition depends on the
+	// request, or for the members or the public one that binds some of them.
+	MaybeDenied bool
+}
+
+// Holders lists who may do p to r, the AuthZEN subject search, for an access review: every
+// identity a member or guest of the tenant, not suspended, that a grant on r's path gives p, its own
+// or through its groups', and the tenant's members and the public where grants to them give it. It
+// counts conditional grants and marks them, and leaves out a holder a deny on the path binds,
+// marking one that a deny may bind: it reads the groups a deny names, and whom it exempts, as
+// checks do. An identity's record counts its own grants and its groups', not the members' or the
+// public's, which are records of their own.
+func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]Holder, error) {
 	if err := a.check(r); err != nil {
 		return nil, err
 	}
@@ -336,35 +355,185 @@ func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]P
 		string(p), r.Type, a.publicRoles(roles), string(Public),
 	}, a.publicArgs(p, r.Type, custom)...)
 	rows, err := a.db.Query(ctx, `
-		SELECT DISTINCT principal_kind, principal_id FROM rbac_grants
+		SELECT id::text, principal_kind, principal_id, conditional FROM rbac_grants
 		WHERE tenant = $1 AND scope = ANY($2::text[]) AND role = ANY(`+givingSQL("$3", "$1", "$7", "$8", custom, nil)+`)
-		  AND (expires_at IS NULL OR expires_at > $4) AND NOT conditional AND (NOT $5 OR principal_kind <> ALL($6::text[]))
+		  AND (expires_at IS NULL OR expires_at > $4) AND (NOT $5 OR principal_kind <> ALL($6::text[]))
 		  AND (principal_kind <> $10 OR role = ANY(`+givingSQL("$9", "$1", "$7", "$8", custom, &publicSQL{"$11", "$12", "$13"})+`))
-		ORDER BY principal_kind, principal_id`, args...)
+		ORDER BY principal_kind, principal_id, id`, args...)
 	if err != nil {
 		return nil, err
 	}
-	found, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Principal, error) {
-		var p Principal
-		err := row.Scan(&p.Kind, &p.ID)
-		return p, err
+	type held struct {
+		id          string
+		p           Principal
+		conditional bool
+	}
+	grants, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (held, error) {
+		var g held
+		err := row.Scan(&g.id, &g.p.Kind, &g.p.ID, &g.conditional)
+		return g, err
 	})
 	if err != nil {
 		return nil, err
 	}
-	// Every deny on the path for p, conditional ones counted as denying, as Holders can't read
-	// the request they depend on.
-	ds, err := a.deniesOn(ctx, a.db, r.Tenant, nil, r.path(), p)
+	// A kind the host no longer declares can't act, so its grants give nothing; nor does a grant to
+	// the public where no public role can give p, as checks read it.
+	public := a.publicGives(p, r.Type)
+	byKey := map[string]*Holder{}
+	holder := func(p Principal) *Holder {
+		if byKey[p.key()] == nil {
+			byKey[p.key()] = &Holder{Principal: p, Conditional: true}
+		}
+		return byKey[p.key()]
+	}
+	add := func(h *Holder, g held) {
+		if !slices.Contains(h.Grants, g.id) {
+			h.Grants = append(h.Grants, g.id)
+		}
+		h.Conditional = h.Conditional && g.conditional
+	}
+	var groups, identities []string
+	byGroup := map[string][]held{}
+	for _, g := range grants {
+		switch {
+		case !a.known(r.Tenant, g.p) || g.p.Kind == Public && !public:
+		case g.p.Kind == Group:
+			if byGroup[g.p.ID] == nil {
+				groups = append(groups, g.p.ID)
+			}
+			byGroup[g.p.ID] = append(byGroup[g.p.ID], g)
+		case g.p.broad():
+			add(holder(g.p), g)
+		default:
+			identities = append(identities, g.p.key())
+		}
+	}
+	// The identities in the groups granted, through those nested in them, and those granted
+	// directly, that are members or guests of the tenant now.
+	rows, err = a.db.Query(ctx, `
+		WITH RECURSIVE down(root, id) AS (
+		  SELECT g, g COLLATE "C" FROM unnest($2::text[]) AS g
+		  UNION
+		  SELECT d.root, m.principal_id FROM rbac_members m JOIN down d ON m.group_id = d.id
+		  WHERE m.tenant = $1 AND m.principal LIKE 'group:%' AND (m.expires_at IS NULL OR m.expires_at > $3)
+		), reached(root, principal) AS (
+		  SELECT d.root, m.principal FROM down d JOIN rbac_members m ON m.tenant = $1 AND m.group_id = d.id
+		  WHERE m.principal NOT LIKE 'group:%' AND (m.expires_at IS NULL OR m.expires_at > $3)
+		  UNION
+		  SELECT '', p FROM unnest($4::text[]) AS p
+		)
+		SELECT r.root, r.principal, s.guest FROM reached r JOIN rbac_memberships s ON s.tenant = $1 AND s.principal = r.principal
+		WHERE NOT s.suspended AND (s.expires_at IS NULL OR s.expires_at > $3)
+		ORDER BY r.principal, r.root`, r.Tenant, groups, a.cfg.Now(), identities)
 	if err != nil {
 		return nil, err
 	}
-	// A kind the host no longer declares can't act, so its grants give nothing; nor does a grant
-	// to the public where no public role can give p, as checks read it.
-	public := a.publicGives(p, r.Type)
-	return slices.DeleteFunc(found, func(h Principal) bool {
-		return !a.known(r.Tenant, h) || h.Kind == Public && !public ||
-			slices.ContainsFunc(ds, func(d denial) bool { return d.names(r.Tenant, h) })
-	}), nil
+	direct := map[string][]held{}
+	for _, g := range grants {
+		direct[g.p.key()] = append(direct[g.p.key()], g)
+	}
+	guests := map[string]bool{}
+	var root, key string
+	var guest bool
+	if _, err := pgx.ForEachRow(rows, []any{&root, &key, &guest}, func() error {
+		h := holder(parsePrincipal(key))
+		guests[key] = guest
+		if root == "" {
+			for _, g := range direct[key] {
+				add(h, g)
+			}
+			return nil
+		}
+		if !slices.Contains(h.Groups, root) {
+			h.Groups = append(h.Groups, root)
+		}
+		for _, g := range byGroup[root] {
+			add(h, g)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	if err := a.boundByDenies(ctx, p, r, byKey, guests); err != nil {
+		return nil, err
+	}
+	found := slices.SortedFunc(maps.Values(byKey), func(x, y *Holder) int { return strings.Compare(x.Principal.key(), y.Principal.key()) })
+	holders := make([]Holder, 0, len(found))
+	for _, h := range found {
+		if h != nil {
+			slices.Sort(h.Groups)
+			holders = append(holders, *h)
+		}
+	}
+	return holders, nil
+}
+
+// boundByDenies drops from holders those a deny on r's path binds whatever the request, and marks
+// those one may bind. It reads each identity's groups, as checks do; guests are the identities
+// that are no tenant member.
+func (a *Authorizer) boundByDenies(ctx context.Context, p Permission, r Resource, holders map[string]*Holder, guests map[string]bool) error {
+	ds, err := a.deniesOn(ctx, a.db, r.Tenant, nil, r.path(), p)
+	if err != nil || len(ds) == 0 {
+		return err
+	}
+	var identities []string
+	for k, h := range holders {
+		if !h.Principal.broad() {
+			identities = append(identities, k)
+		}
+	}
+	rows, err := a.db.Query(ctx, `
+		WITH RECURSIVE up(principal, id) AS (
+		  SELECT principal, group_id FROM rbac_members WHERE tenant = $1 AND principal = ANY($2::text[]) AND (expires_at IS NULL OR expires_at > $3)
+		  UNION
+		  SELECT u.principal, m.group_id FROM rbac_members m JOIN up u ON m.principal = 'group:' || u.id
+		  WHERE m.tenant = $1 AND (m.expires_at IS NULL OR m.expires_at > $3)
+		)
+		SELECT principal, 'group:' || id FROM up`, r.Tenant, identities, a.cfg.Now())
+	if err != nil {
+		return err
+	}
+	keys := map[string][]string{}
+	for _, k := range identities {
+		keys[k] = []string{k, publicKey}
+		if !guests[k] {
+			keys[k] = append(keys[k], TenantMembers(r.Tenant).key())
+		}
+	}
+	var principal, group string
+	if _, err := pgx.ForEachRow(rows, []any{&principal, &group}, func() error {
+		keys[principal] = append(keys[principal], group)
+		return nil
+	}); err != nil {
+		return err
+	}
+	members, everyone := TenantMembers(r.Tenant).key(), publicKey
+	for k, h := range holders {
+		for _, d := range ds {
+			var binds, whole bool
+			switch k {
+			case members, everyone:
+				// All of them where the deny names them, or the public, and exempts none; none where
+				// it exempts them; otherwise perhaps some.
+				binds = !slices.Contains(d.exempt, k)
+				whole = (slices.Contains(d.principals, k) || slices.Contains(d.principals, everyone)) && len(d.exempt) == 0
+			default:
+				binds = slices.ContainsFunc(keys[k], func(x string) bool { return slices.Contains(d.principals, x) }) &&
+					!slices.ContainsFunc(keys[k], func(x string) bool { return slices.Contains(d.exempt, x) })
+				whole = binds
+			}
+			switch {
+			case binds && whole && d.condition == "":
+				delete(holders, k)
+			case binds:
+				h.MaybeDenied = true
+			}
+			if holders[k] == nil {
+				break
+			}
+		}
+	}
+	return nil
 }
 
 // Reach is where a subject may do something. A resource, by its path (Authorizer.Path), is

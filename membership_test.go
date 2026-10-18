@@ -1173,3 +1173,94 @@ func TestAGroupIsOnlyItsTenants(t *testing.T) {
 		t.Fatal("a group in another tenant's group named alike holds what this tenant's group does")
 	}
 }
+
+func TestHoldersReadGroupsAsChecksDo(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	// The owner holds root on the cluster; u holds root itself and is a contractor; v is on call,
+	// and on-call is in sre, which holds root; w, also on call, is exempt as a lead; x is a guest;
+	// y is suspended.
+	h.as(t, "owner")
+	h.as(t, "u", "contractors")
+	h.as(t, "v", "oncall")
+	h.as(t, "w", "oncall", "leads")
+	h.guest(t, "x")
+	h.as(t, "y", "sre")
+	if _, err := h.pool.Exec(ctx, `UPDATE rbac_memberships SET suspended = true WHERE principal = 'user:y'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "sre", Principal: groupOf("oncall")}}); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t,
+		grant(cluster.Scope(), "cluster.sudo", rbac.User, "u"),
+		grant(workspace.Scope(), "cluster.sudo", rbac.Group, "sre"),
+		grant(cluster.Scope(), "cluster.sudo", rbac.User, "x"),
+		grant(cluster.Scope(), "cluster.login", rbac.Members, "t1"),
+	)
+	byID := func(holders []rbac.Holder) map[string]rbac.Holder {
+		m := map[string]rbac.Holder{}
+		for _, h := range holders {
+			m[h.Principal.ID] = h
+		}
+		return m
+	}
+	holders, err := h.authz.Holders(ctx, root, cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := byID(holders)
+	if len(got) != 5 || !slices.Equal(got["v"].Groups, []string{"sre"}) || got["u"].Groups != nil || got["y"].Principal.ID != "" {
+		t.Fatalf("Holders(root) = %+v", holders)
+	}
+	// A deny on a group binds its members, as checks read them, and spares those it exempts.
+	if err := h.authz.SetDeny(ctx, guardian, cluster, rbac.Deny{
+		ID: "no-root", Principals: []rbac.Principal{groupOf("contractors"), groupOf("oncall")},
+		Exempt: []rbac.Principal{groupOf("leads")}, Permissions: []rbac.Permission{root},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	holders, err = h.authz.Holders(ctx, root, cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(holderPrincipals(holders), []rbac.Principal{identity("owner"), identity("w"), identity("x")}) {
+		t.Fatalf("Holders(root) with a deny on groups = %+v", holders)
+	}
+	for _, holder := range holders {
+		if !allowed(t, h, rbac.Subject{Principal: holder.Principal}, root, cluster) {
+			t.Errorf("Holders lists %s, whom Authorize refuses", holder.Principal.ID)
+		}
+	}
+	for _, id := range []string{"u", "v", "y"} {
+		if allowed(t, h, rbac.Subject{Principal: identity(id)}, root, cluster) {
+			t.Errorf("Authorize allows %s, whom Holders leaves out", id)
+		}
+	}
+	// A deny whose condition reads the request may bind; one naming some of the members binds some.
+	if err := h.authz.SetDeny(ctx, guardian, cluster, rbac.Deny{
+		ID: "mfa", Principals: []rbac.Principal{identity("w"), identity("owner")},
+		Permissions: []rbac.Permission{login}, Condition: rbac.Condition{Expression: "request.attributes.mfa != true"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	holders, err = h.authz.Holders(ctx, login, cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = byID(holders)
+	if !got["owner"].MaybeDenied || !got["w"].MaybeDenied || got["x"].MaybeDenied || !got["t1"].MaybeDenied || got["t1"].Principal != rbac.TenantMembers("t1") {
+		t.Fatalf("Holders(login) = %+v", holders)
+	}
+	// The members are one holder, which a deny on them all removes; a guest isn't among them.
+	if err := h.authz.SetDeny(ctx, guardian, cluster, rbac.Deny{ID: "no-login", Principals: []rbac.Principal{rbac.TenantMembers("t1")}, Permissions: []rbac.Permission{login}}); err != nil {
+		t.Fatal(err)
+	}
+	holders, err = h.authz.Holders(ctx, login, cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(holderPrincipals(holders), []rbac.Principal{identity("x")}) {
+		t.Fatalf("Holders(login) with a deny on the members = %+v", holders)
+	}
+}
