@@ -37,7 +37,7 @@ func (e *InvalidError) Unwrap() error { return e.Err }
 // Apply changes the grants on one scope, on, in one transaction, as actor:
 //
 //   - the actor needs `<on's type>:grant` there (through on, an ancestor or the tenant), and no
-//     constraint, nor deny on the path, may remove it;
+//     constraint, nor deny on the path, may remove it, nor on's label (Resource.Labels) refuse it;
 //   - through a role with GrantableRoles, the actor may grant and revoke only those roles, and
 //     needn't hold their permissions;
 //   - through any other role, the actor may grant a role only by holding everything it gives
@@ -123,6 +123,10 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, how
 	cs := a.constrain(ctx, actor, on)
 	if err := a.changing(actor, on, cs); err != nil {
 		return err
+	}
+	// The power to change grants is a permission on the scope, which its label takes too.
+	if dim, err := a.unsatisfied(ctx, actor, on); err != nil || dim != "" {
+		return cmp.Or(err, error(&DeniedError{Permission: GrantPermission(on.Type), Scope: scope, Reason: labelRefusal(dim)}))
 	}
 	au, err := a.mayChange(ctx, a.db, actor, on, grants, revokes, cs)
 	if err != nil {
@@ -932,6 +936,9 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 		return nil, err
 	}
 	if err := a.subject(s); err != nil {
+		return nil, err
+	}
+	if dim, err := a.unsatisfied(ctx, s, r); err != nil || dim != "" {
 		return nil, err
 	}
 	cs := a.constrain(ctx, s, r)

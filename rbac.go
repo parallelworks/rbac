@@ -304,9 +304,13 @@ type Resource struct {
 	Type      string
 	ID        string
 	Ancestors []Scope
-	// Attributes are what conditions read as resource.attributes, such as its labels: read them
-	// from where the resource is stored, as its path, never from request input.
+	// Attributes are what conditions read as resource.attributes: read them from where the
+	// resource is stored, as its path, never from request input.
 	Attributes map[string]any
+	// Labels is its label, which a subject's holding must satisfy, whatever its grants give, for
+	// a check to allow anything (Config.Labels). Store it with the resource, as its path. A check
+	// reads the resource's own, not its ancestors': label what a labelled container holds too.
+	Labels Label
 }
 
 // Scope is the scope the resource itself is.
@@ -316,6 +320,9 @@ func (r Resource) Scope() Scope { return Scope{Type: r.Type, ID: r.ID} }
 // grants on containers, the tenant and the resource's own type, and checks must agree.
 func (a *Authorizer) check(r Resource) error {
 	if err := r.validate(); err != nil {
+		return err
+	}
+	if err := a.checkLabel(r.Labels); err != nil {
 		return err
 	}
 	for _, s := range r.Ancestors {
@@ -480,8 +487,10 @@ type ConstraintInput struct {
 	Tenant       string
 	ResourceType string
 	Permission   Permission
-	// Subject is who asks, or who changes access; nil in Holders. Authorizer.GroupsOf reads the
-	// groups it is in.
+	// Subject is who asks, or who changes access; nil in Holders, but for the label values of a
+	// holder of a labelled resource, where it is the holder without the attributes Holders doesn't
+	// know: answer true there if the constraint removes the value from that principal with any.
+	// Authorizer.GroupsOf reads the groups it is in.
 	Subject *Subject
 	// Resource is what is asked about, with its ancestors and attributes; for what a change hands
 	// on, the scope it is on, whose type is a container's or the tenant's where what it hands on
@@ -610,6 +619,17 @@ type Config struct {
 	// Attributes declares the attributes conditions read, so one misnamed or of another type is
 	// refused when a condition is stored; undeclared, any is read.
 	Attributes Attributes
+	// Labels declares the dimensions of the labels on data (Resource.Labels): a mandatory layer
+	// above every grant. A subject holds a dimension's values as permissions, `dimension:value`,
+	// which roles for the tenant give, and a check allows anything of a labelled resource only
+	// when what it holds satisfies the label. None, nothing is labelled. A check reads the
+	// subject's grants and its values in two statements, so changes committing between them can
+	// meet in an answer no single moment gave. Holders reads each holder's values, one after
+	// another. A deny of an Ordered value takes that value alone: to cap a level, deny it and every
+	// value above. Values are held on the tenant, so they are denied there: SetDeny refuses a deny
+	// of one on any other scope, which would bind no one. The conditions of a value's grants and
+	// denies read the tenant as their resource, never the labelled one.
+	Labels []LabelDimension
 	// OnChange runs in the transaction of every change but DeleteExpired, whose grants already
 	// gave nothing, once the change is written; an error rolls the change back. History records
 	// what it writes as the host's, not as the change's.
@@ -657,6 +677,8 @@ type Authorizer struct {
 	// Authorizer.current reads it.
 	catalogPermissions, catalogTypes, publicPairs []string
 	conds                                         *conditions
+	// labels are the label dimensions (Config.Labels), by name.
+	labels map[string]labelDimension
 }
 
 // permissionOn is a permission on a type of resource.
@@ -674,6 +696,10 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 		return nil, errors.New("rbac: Config.ValidateGrant is required")
 	}
 	roles, err := index(cfg.Catalog)
+	if err != nil {
+		return nil, err
+	}
+	labels, err := indexLabels(cfg.Labels, cfg.Catalog)
 	if err != nil {
 		return nil, err
 	}
@@ -762,7 +788,7 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 		db: db, cfg: cfg, roles: roles, containers: containers, containerTypes: slices.Sorted(maps.Keys(containers)),
 		kinds: kinds, owned: owned, permissions: perms, types: resourceTypes, permissionTypes: permissionTypes, unprivileged: unprivileged,
 		catalogPermissions: permList, catalogTypes: slices.Sorted(maps.Keys(resourceTypes)), publicPairs: pairs,
-		checked: checked, checkedTypes: checkedTypes, conds: conds,
+		checked: checked, checkedTypes: checkedTypes, conds: conds, labels: labels,
 	}, nil
 }
 
