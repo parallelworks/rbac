@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/parallelworks/rbac"
+	"github.com/parallelworks/rbac/internal/pgtest"
 )
 
 // dbNow is the database's clock, which history dates changes by.
@@ -100,6 +101,10 @@ func TestAsOfChangesNothing(t *testing.T) {
 		if err := a.AsOf(ctx, "t1", at, func(*rbac.Authorizer) error { return nil }); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("AsOf as of a time: %v", err)
 		}
+		// History is a read, which changes nothing.
+		if _, _, err := a.History(ctx, rbac.Cursor{}, 1); err != nil {
+			t.Errorf("History as of a time: %v", err)
+		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -150,5 +155,154 @@ func TestAsOfRefusesASearchPathThatReadsTheTablesFirst(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAsOfRebuildsEveryTableAsItIs(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	h.as(t, "u", "sre")
+	h.as(t, "v", "devs")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"), grant(workspace.Scope(), "cluster.login", rbac.Group, "devs"))
+	for _, q := range []string{
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at, condition, note)
+		 VALUES ('t1', 'cluster', 'c1', 'user', 'v', 'cluster.login', now() + interval '1 day', 'request.time > timestamp("2020-01-01T00:00:00Z")', 'n')`,
+		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles) VALUES ('t1', 'custom.x', '{cluster:view}', '{cluster}', '{cluster.login}')`,
+		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+		 VALUES ('t1', 'cluster', 'c1', 'user', 'v', 'cluster.sudo', 3600, '{user:u}')`,
+		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, source, expires_at) VALUES ('t1', 'devs', 'group', 'sre', 'sync', now() + interval '1 hour')`,
+		`UPDATE rbac_memberships SET suspended = true, note = 'x' WHERE principal = 'user:v'`,
+		`DELETE FROM rbac_grants WHERE principal = 'user:u'`,
+		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t2', 'user', 'u')`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t2', 'cluster', 'c1', 'user', 'u', 'cluster.login')`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.authz.SetDeny(ctx, guardian, cluster, rbac.Deny{ID: "d", Principals: []rbac.Principal{{Kind: rbac.User, ID: "v"}}, Permissions: []rbac.Permission{root}}); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	rows, err := tx.Query(ctx, `SELECT quote_ident(current_schema()), relname::text FROM pg_class
+		WHERE relnamespace = current_schema()::regnamespace AND relkind = 'r' AND relname NOT IN ('rbac_history', 'rbac_migrations') ORDER BY 2`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type table struct{ Schema, Name string }
+	tables, err := pgx.CollectRows(rows, pgx.RowToStructByPos[table])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.WithTx(tx).AsOf(ctx, "t1", dbNow(t, h), func(*rbac.Authorizer) error {
+		for _, tb := range tables {
+			// The tenant's rows, each whole, generated columns included, in columns of the table's
+			// names, types and collations, in its order.
+			var missing, extra, columns int
+			if err := tx.QueryRow(ctx, `SELECT
+				  (SELECT count(*) FROM (SELECT * FROM `+tb.Schema+`.`+tb.Name+` WHERE tenant = 't1' EXCEPT ALL SELECT * FROM `+tb.Name+`) x),
+				  (SELECT count(*) FROM (SELECT * FROM `+tb.Name+` EXCEPT ALL SELECT * FROM `+tb.Schema+`.`+tb.Name+` WHERE tenant = 't1') x),
+				  (SELECT count(*) FROM (
+				    SELECT attnum, attname, atttypid, atttypmod, attcollation FROM pg_attribute WHERE attrelid = $1::regclass AND attnum > 0 AND NOT attisdropped
+				    EXCEPT SELECT attnum, attname, atttypid, atttypmod, attcollation FROM pg_attribute WHERE attrelid = to_regclass('pg_temp.' || $2)) x)`,
+				tb.Schema+"."+tb.Name, tb.Name).Scan(&missing, &extra, &columns); err != nil {
+				return err
+			}
+			if missing != 0 || extra != 0 || columns != 0 {
+				t.Errorf("%s as of now: %d rows missing, %d extra, %d columns differ", tb.Name, missing, extra, columns)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAsOfOrdersARowsChangesAsTheyWereMade(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.as(t, "m")
+	// Each transaction begins before another's change, which it then undoes: one revokes a grant
+	// made after it began, and one makes again a membership ended after it began.
+	var txs []pgx.Tx
+	for range 2 {
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		txs = append(txs, tx)
+	}
+	revoke, rejoin := txs[0], txs[1]
+	var id string
+	if err := h.pool.QueryRow(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'w', 'cluster.login') RETURNING id::text`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := revoke.Exec(ctx, `DELETE FROM rbac_grants WHERE id = $1`, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_memberships WHERE principal = 'user:m'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rejoin.Exec(ctx, `INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'm')`); err != nil {
+		t.Fatal(err)
+	}
+	for _, tx := range txs {
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.authz.AsOf(ctx, "t1", dbNow(t, h), func(a *rbac.Authorizer) error {
+		grants, err := a.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{{Kind: rbac.User, ID: "w"}}})
+		if err != nil || len(grants) != 0 {
+			t.Errorf("as of now, w holds %+v, %v", grants, err)
+		}
+		ms, err := a.Memberships(ctx, "t1", []rbac.Principal{{Kind: rbac.User, ID: "m"}})
+		if err != nil || len(ms) != 1 {
+			t.Errorf("as of now, m's memberships are %+v, %v", ms, err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAsOfReadsPastAStatementTheSessionPrepared(t *testing.T) {
+	h := setupOn(t, pgtest.Open(t, "pool_max_conns=1"))
+	ctx := t.Context()
+	// A temporary table gives the session its temporary schema for good.
+	if _, err := h.pool.Exec(ctx, `CREATE TEMP TABLE scratch (x int)`); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	held := func(a *rbac.Authorizer) int {
+		got, err := a.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{{Kind: rbac.User, ID: "u"}}})
+		if err != nil {
+			t.Error(err)
+		}
+		return len(got)
+	}
+	if n := held(h.authz); n != 1 {
+		t.Fatalf("u holds %d grants", n)
+	}
+	at := dbNow(t, h)
+	if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_grants WHERE principal = 'user:u'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+		if n := held(a); n != 1 {
+			t.Errorf("as of before the revoke, u holds %d grants", n)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if n := held(h.authz); n != 0 {
+		t.Errorf("after AsOf, u holds %d grants", n)
 	}
 }
