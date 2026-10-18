@@ -1304,6 +1304,40 @@ func TestFilterScalesWithResourceGrants(t *testing.T) {
 	}
 }
 
+// The tenant's grants are on the one scope a row of it has, so with no container types there is
+// nothing above it for Filter to overlap, however many grants the subject holds there.
+func TestFilterListsTheTenantWithoutContainers(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) { c.ContainerTypes = nil })
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE tenants (tenant text NOT NULL, path text[] NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	root := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO tenants VALUES ($1, $2)`, root.Tenant, h.path(t, root)); err != nil {
+		t.Fatal(err)
+	}
+	var groups []string
+	var grants []rbac.Grant
+	for i := range 9 {
+		g := fmt.Sprintf("g%d", i)
+		groups = append(groups, g)
+		grants = append(grants, grant(rbac.TenantRoot("t1"), "tenant.admin", rbac.Group, g))
+	}
+	h.seed(t, grants...)
+	s := user("u", groups...)
+	pred, err := h.authz.Filter(ctx, s, "tenant:view", "t1", rbac.TenantScope, rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := h.pool.QueryRow(ctx, "SELECT count(*) FROM tenants WHERE "+pred.SQL, pred.Args...).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("Filter found %d, %v", n, err)
+	}
+	if !allowed(t, h, s, "tenant:view", root) {
+		t.Fatal("Authorize should agree")
+	}
+}
+
 func TestConditionsReadWhatIsDeclared(t *testing.T) {
 	h := setup(t, func(c *rbac.Config) {
 		c.Catalog = append(slices.Clone(c.Catalog), guardRole)
