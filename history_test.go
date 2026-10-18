@@ -122,10 +122,11 @@ func TestHistoryRecordsADeleteAsOne(t *testing.T) {
 	ctx := t.Context()
 	var cursor rbac.Cursor
 	drain(t, h, &cursor, 1)
+	// `expired` expires after it is made, as its statement runs, and before it is deleted.
 	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
 		VALUES ('t1', 'cluster', 'c1', 'user', 'create', 'cluster.login', NULL),
 		  ('t1', 'cluster', 'c1', 'user', 'early', 'cluster.login', now() + interval '1 hour'),
-		  ('t1', 'cluster', 'c1', 'user', 'expired', 'cluster.login', now() - interval '1 hour')`); err != nil {
+		  ('t1', 'cluster', 'c1', 'user', 'expired', 'cluster.login', clock_timestamp())`); err != nil {
 		t.Fatal(err)
 	}
 	// Whoever sets the context can call a delete an expiry, which only one of a row that expired is.
@@ -148,6 +149,72 @@ func TestHistoryRecordsADeleteAsOne(t *testing.T) {
 	if ops["create"].Op != "delete" || ops["early"].Op != "delete" || ops["expired"].Op != "expire" ||
 		!ops["expired"].EffectiveAt.Equal(ops["expired"].ExpiresAt) {
 		t.Fatalf("History = %+v", got[3:])
+	}
+}
+
+// An expiry is dated when its row expired, but never before the row's last change, which can have
+// moved its expiry back to before it: the grant was held until then.
+func TestHistoryDatesNoExpiryBeforeItsRowsLastChange(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	var cursor rbac.Cursor
+	drain(t, h, &cursor, 1)
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'standing', 'cluster.login')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := pgx.BeginFunc(ctx, h.pool, func(tx pgx.Tx) error {
+		for _, sql := range []string{
+			`UPDATE rbac_grants SET expires_at = '2000-01-01' WHERE principal_id = 'standing'`,
+			`SELECT set_config('rbac.change', '{"op": "expire"}', true)`,
+			`DELETE FROM rbac_grants WHERE principal_id = 'standing'`,
+		} {
+			if _, err := tx.Exec(ctx, sql); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got := drain(t, h, &cursor, 3)
+	if got[2].Op != "expire" || !got[2].EffectiveAt.Equal(got[1].EffectiveAt) {
+		t.Fatalf("History = %+v", got)
+	}
+}
+
+// rbac_record runs as its owner, so an overload of what it calls, made in its schema by any role
+// that may create there, can't stand in for pg_catalog's.
+func TestHistoryRecordsRowsWhateverItsSchemaHolds(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	for _, sql := range []string{
+		`CREATE FUNCTION to_jsonb(rbac_grants) RETURNS jsonb LANGUAGE sql
+			AS $$ SELECT pg_catalog.to_jsonb($1) || '{"principal": "user:forged"}' $$`,
+		`CREATE FUNCTION jsonb_build_array(text, text, text) RETURNS jsonb LANGUAGE sql AS $$ SELECT '["forged"]'::jsonb $$`,
+	} {
+		if _, err := h.pool.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A connection of its own, which hasn't planned rbac_record before the overloads were made.
+	conn, err := pgx.ConnectConfig(ctx, h.pool.Config().ConnConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	for _, sql := range []string{
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'cluster', 'c1', 'user', 'real', 'cluster.login')`,
+		`INSERT INTO rbac_groups (tenant, id) VALUES ('t1', 'g')`,
+		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'g', 'user', 'real')`,
+	} {
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	var forged int
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM rbac_history WHERE principal = 'user:forged' OR key LIKE '%forged%'`).Scan(&forged); err != nil || forged != 0 {
+		t.Fatalf("recorded %d forged, %v", forged, err)
 	}
 }
 
@@ -216,22 +283,32 @@ func TestHistoryKeysTellMembersApart(t *testing.T) {
 	}
 }
 
-func TestHistoryRefusesACursorFromAnotherGeneration(t *testing.T) {
+func TestHistoryRefusesACursorItCantFollow(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
-	_, cursor, err := h.authz.History(ctx, rbac.Cursor{}, 1)
-	if err != nil || cursor.Generation == "" {
-		t.Fatalf("History = %+v, %v", cursor, err)
+	var cursor rbac.Cursor
+	drain(t, h, &cursor, 1)
+	if cursor.Generation == "" || cursor.RecordedAt.IsZero() {
+		t.Fatalf("cursor = %+v", cursor)
 	}
-	// Read on with the cursor it gave, and refused one another generation gave, as before a
-	// failover, which may number records past what this one kept anew.
-	if _, _, err := h.authz.History(ctx, cursor, 1); err != nil {
-		t.Fatal(err)
+	// Read on with the cursor it gave, or one a read that found nothing gave.
+	for _, c := range []rbac.Cursor{cursor, {Generation: cursor.Generation}} {
+		if _, _, err := h.authz.History(ctx, c, 1); err != nil {
+			t.Fatalf("%+v: %v", c, err)
+		}
 	}
+	// Refused one another generation gave, as before a failover, and one whose last record this
+	// database doesn't hold, as after a restore that started no generation: either may number
+	// records past what this one kept anew.
 	old := cursor
 	old.Generation = "1/1"
 	if _, _, err := h.authz.History(ctx, old, 1); !errors.Is(err, rbac.ErrInvalid) {
 		t.Fatalf("a cursor of another generation: %v", err)
+	}
+	lost := cursor
+	lost.RecordedAt = lost.RecordedAt.Add(time.Microsecond)
+	if _, _, err := h.authz.History(ctx, lost, 1); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a cursor of a record the database doesn't hold: %v", err)
 	}
 	if _, _, err := h.authz.History(ctx, rbac.Cursor{}, rbac.MaxHistory+1); !errors.Is(err, rbac.ErrInvalid) {
 		t.Fatalf("too many: %v", err)

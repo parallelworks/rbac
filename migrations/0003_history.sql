@@ -46,11 +46,13 @@ CREATE INDEX rbac_history_role ON rbac_history (tenant, role, scope, effective_a
 
 -- Records a change to a row, with the change's context the package sets for its transaction
 -- (rbac.change). A definer's rights, so a role that may write the package's tables but not
--- history still records what it writes.
+-- history still records what it writes. Its polymorphic calls name pg_catalog's: an overload in
+-- this schema taking the row's own type would be chosen before them, and run as its owner.
 CREATE FUNCTION rbac_record() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+<<rbac_record>>
 DECLARE
-    was    jsonb := CASE WHEN TG_OP = 'INSERT' THEN NULL ELSE to_jsonb(OLD) END;
-    is_now jsonb := CASE WHEN TG_OP = 'DELETE' THEN NULL ELSE to_jsonb(NEW) END;
+    was    jsonb := CASE WHEN TG_OP = 'INSERT' THEN NULL ELSE pg_catalog.to_jsonb(OLD) END;
+    is_now jsonb := CASE WHEN TG_OP = 'DELETE' THEN NULL ELSE pg_catalog.to_jsonb(NEW) END;
     r      jsonb := coalesce(is_now, was);
     change jsonb := coalesce(nullif(current_setting('rbac.change', true), '')::jsonb, '{}');
     -- The context says only whether a delete is an expiry, and only a row that has expired is one,
@@ -68,13 +70,18 @@ BEGIN
     WHEN 'rbac_eligibilities' THEN entity := 'eligibility'; key := r->>'id';
     WHEN 'rbac_memberships' THEN entity := 'membership'; key := r->>'principal';
     WHEN 'rbac_groups' THEN entity := 'group'; key := r->>'id';
-    WHEN 'rbac_members' THEN entity := 'member'; key := jsonb_build_array(r->>'group_id', r->>'principal', r->>'source')::text;
+    WHEN 'rbac_members' THEN entity := 'member';
+      key := pg_catalog.jsonb_build_array(r->>'group_id', r->>'principal', r->>'source')::text;
     END CASE;
     INSERT INTO rbac_history (effective_at, tenant, entity, key, op, principal, role, scope, group_id, expires_at,
       before, after, actor, on_behalf_of, how, request, reason)
     VALUES (
-      -- An expiry took effect when it expired.
-      CASE WHEN op = 'expire' THEN (r->>'expires_at')::timestamptz ELSE now() END,
+      -- An expiry took effect when it expired, but no earlier than the entity's last change, which
+      -- can have moved its expiry back to before then.
+      CASE WHEN op = 'expire' THEN greatest((r->>'expires_at')::timestamptz,
+          (SELECT max(h.effective_at) FROM rbac_history h
+           WHERE h.tenant = r->>'tenant' AND h.entity = rbac_record.entity AND h.key = rbac_record.key))
+        ELSE now() END,
       r->>'tenant', entity, key, op, r->>'principal',
       CASE entity WHEN 'role' THEN r->>'id' ELSE r->>'role' END,
       r->>'scope',
