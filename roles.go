@@ -1,6 +1,7 @@
 package rbac
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -239,8 +240,9 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 		return err
 	}
 	// Checked in full before the transaction too, so a refused actor never locks the tenant. The
-	// constraints on defining roles ran above.
-	au, err := a.mayDefine(ctx, a.db, actor, root, &r)
+	// constraints on defining roles ran above; those on what the role gives run here, once.
+	cs := a.constrain(ctx, actor, root)
+	au, err := a.mayDefine(ctx, a.db, actor, root, &r, cs)
 	if err != nil {
 		return err
 	}
@@ -262,7 +264,8 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 		if err := lockTenant(ctx, tx, tenant); err != nil {
 			return ChangeEvent{}, err
 		}
-		au, err := a.mayDefine(ctx, tx, actor, root, &r)
+		cs.seal()
+		au, err := a.mayDefine(ctx, tx, actor, root, &r, cs)
 		if err != nil {
 			return ChangeEvent{}, err
 		}
@@ -357,7 +360,7 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		if err := lockTenant(ctx, tx, tenant); err != nil {
 			return ChangeEvent{}, err
 		}
-		au, err := a.mayDefine(ctx, tx, actor, root, nil)
+		au, err := a.mayDefine(ctx, tx, actor, root, nil, nil)
 		if err != nil {
 			return ChangeEvent{}, err
 		}
@@ -464,20 +467,21 @@ func (a *Authorizer) mayDefineRoles(ctx context.Context, actor Subject, root Res
 	if name != "" {
 		return authority{}, &DeniedError{Permission: DefineRoles, Scope: scope, Reason: "removed by " + name}
 	}
-	return a.mayDefine(ctx, a.db, actor, root, nil)
+	return a.mayDefine(ctx, a.db, actor, root, nil, nil)
 }
 
 // mayDefine checks that actor holds DefineRoles on the tenant, and with r, that it may define r:
 // that it holds everything r gives across the tenant, as granting r there would need, with no
-// role it may merely hand out standing in, since defining r changes what its grants give. It
-// returns what it read; with r, every custom role of the tenant.
-func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Resource, r *RoleDefinition) (authority, error) {
+// role it may merely hand out standing in, since defining r changes what its grants give, and
+// none of it removed by a constraint (cs). It returns what it read; with r, every custom role of
+// the tenant.
+func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Resource, r *RoleDefinition, cs *constrained) (authority, error) {
 	scope := root.Scope()
 	var ids []Role
 	if r != nil {
 		ids = append([]Role{r.ID}, r.GrantableRoles...)
 	}
-	au, err := a.authorityOn(ctx, q, actor, root, ids)
+	au, err := a.authorityOn(ctx, q, actor, root, ids, cs)
 	if err != nil {
 		return authority{}, err
 	}
@@ -497,7 +501,7 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 	}
 	seen := map[string]bool{}
 	if p, ok := a.holdsRole(au, *r, r.ResourceTypes, "", seen); !ok {
-		return authority{}, &DeniedError{Permission: p, Scope: scope, Reason: fmt.Sprintf("the actor can't define %s without holding %s here", r.ID, p)}
+		return authority{}, cmp.Or(cs.failed(), error(&DeniedError{Permission: p, Scope: scope, Reason: fmt.Sprintf("the actor can't define %s without holding %s here", r.ID, p)}))
 	}
 	// A role that lists r lets its holders grant r as it will be wherever it can be granted, a
 	// power its definer never had to have if r gave less or couldn't be granted there: the
@@ -513,9 +517,12 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 				continue
 			}
 			if missing, ok := a.mayGrant(au, au.under(t, ""), t, *r, "", seen); !ok {
-				return authority{}, &DeniedError{Permission: missing, Scope: scope, Reason: fmt.Sprintf("the actor can't define %s, which %s lists, without the power to grant it on a %s", r.ID, id, t)}
+				return authority{}, cmp.Or(cs.failed(), error(&DeniedError{Permission: missing, Scope: scope, Reason: fmt.Sprintf("the actor can't define %s, which %s lists, without the power to grant it on a %s", r.ID, id, t)}))
 			}
 		}
+	}
+	if err := cs.failed(); err != nil {
+		return authority{}, err
 	}
 	return au, nil
 }

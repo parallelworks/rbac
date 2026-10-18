@@ -108,7 +108,7 @@ another store. Both search one tenant, and count only unconditional grants:
   the actor and how it is made, so the host decides who may hold what: members only, no
   privileged roles for service accounts or guests. `Config.Constraints` remove permissions above
   anything a tenant grants or denies, seeing the subject and the resource, such as freezing
-  changes under a container.
+  changes under a container. What one removes from an actor the actor can't hand on.
 
 ## Principals
 

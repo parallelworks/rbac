@@ -647,6 +647,98 @@ func TestApplyPreventsEscalation(t *testing.T) {
 	}
 }
 
+func TestConstraintsBindWhatAnActorHandsOn(t *testing.T) {
+	robot := rbac.PrincipalKind("service_account")
+	var asked []rbac.ConstraintInput
+	var redefine bool
+	h := setup(t, func(c *rbac.Config) {
+		c.PrincipalKinds = []rbac.PrincipalKind{robot}
+		c.Constraints = []rbac.Constraint{{Name: "no root for service accounts", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if in.Subject != nil && in.Subject.Principal.Kind == robot {
+				asked = append(asked, in)
+			}
+			return in.Permission == root && (in.Subject == nil || in.Subject.Principal.Kind == robot), nil
+		}}}
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			// As another change would, between the checks before the change's transaction and in it.
+			if redefine {
+				if _, err := q.Exec(ctx, `UPDATE rbac_roles SET permissions = '{cluster:view,cluster:login,cluster:root}' WHERE id = 'custom.op'`); err != nil {
+					return err
+				}
+			}
+			return validate(ctx, q, in)
+		}
+	})
+	ctx := t.Context()
+	bot := rbac.Subject{Principal: rbac.Principal{Kind: robot, ID: "ci"}, Tenants: []string{"t1"}}
+	h.seed(t,
+		grant(rbac.TenantRoot("t1"), "cluster.admin", robot, "ci"),
+		grant(rbac.TenantRoot("t1"), "tenant.roles", robot, "ci"),
+		grant(rbac.TenantRoot("t1"), "workspace.admin", robot, "ci"),
+		grant(rbac.TenantRoot("t1"), "cluster.admin", rbac.User, "admin"),
+		grant(rbac.TenantRoot("t1"), "tenant.roles", rbac.User, "admin"),
+	)
+	u := rbac.Principal{Kind: rbac.User, ID: "u"}
+	if allowed(t, h, bot, root, cluster) {
+		t.Fatal("the constraint should keep root from the service account")
+	}
+	// What it may not use it may not hand on, on the cluster or through the workspace above it.
+	for _, on := range []rbac.Resource{cluster, workspace} {
+		asked = nil
+		err := h.authz.Apply(ctx, bot, on, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: u}}})
+		var denied *rbac.DeniedError
+		if !errors.As(err, &denied) || denied.Permission != root {
+			t.Fatalf("handing on root on a %s: %v", on.Type, err)
+		}
+		i := slices.IndexFunc(asked, func(in rbac.ConstraintInput) bool { return in.Permission == root })
+		if i < 0 || asked[i].ResourceType != "cluster" || (asked[i].Resource != nil) != (on.Type == "cluster") {
+			t.Fatalf("on a %s the constraint was asked %+v", on.Type, asked)
+		}
+	}
+	if err := h.authz.SetEligibility(ctx, bot, cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: u, MaxDuration: time.Hour}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("making another eligible for root: %v", err)
+	}
+	if allowed(t, h, user("u"), root, cluster) {
+		t.Fatal("a refused grant gave root")
+	}
+	if err := h.authz.Apply(ctx, bot, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: u}}}); err != nil {
+		t.Fatalf("handing on what the constraint leaves: %v", err)
+	}
+	roles, err := h.authz.Grantable(ctx, bot, cluster)
+	if err != nil || slices.ContainsFunc(roles, func(r rbac.RoleDefinition) bool { return slices.Contains(r.Permissions, root) }) ||
+		!slices.ContainsFunc(roles, func(r rbac.RoleDefinition) bool { return r.ID == "cluster.login" }) {
+		t.Fatalf("Grantable = %v, %v", roles, err)
+	}
+	// Defining a role hands on what it gives, to every holder of it.
+	withRoot := rbac.RoleDefinition{ID: "custom.root", Permissions: []rbac.Permission{view, root}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(ctx, bot, "t1", withRoot); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("defining a role giving root: %v", err)
+	}
+	op := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(ctx, bot, "t1", op); err != nil {
+		t.Fatalf("defining a role giving what the constraint leaves: %v", err)
+	}
+	// A role redefined to give root once the constraints were asked is refused in the transaction,
+	// to be tried again, rather than granted unasked; tried again, the constraint refuses it.
+	redefine = true
+	grantOp := rbac.Change{Grant: []rbac.Binding{{Role: op.ID, Principal: u}}}
+	if err := h.authz.Apply(ctx, bot, cluster, grantOp); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("a role redefined while the change waited: %v", err)
+	}
+	redefine = false
+	if err := h.authz.Apply(ctx, bot, cluster, grantOp); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("tried again: %v", err)
+	}
+	if allowed(t, h, user("u"), root, cluster) {
+		t.Fatal("a refused grant gave root")
+	}
+	// Those the constraint doesn't bind hand on as before.
+	if err := h.authz.Apply(ctx, user("admin"), cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: u}}}); err != nil {
+		t.Fatalf("an admin the constraint doesn't bind: %v", err)
+	}
+}
+
 func TestAGrantOutlivesTheActorsAccess(t *testing.T) {
 	h := setup(t)
 	temp := grant(rbac.Scope{Type: "workspace", ID: "w1"}, "workspace.admin", rbac.User, "temp")
