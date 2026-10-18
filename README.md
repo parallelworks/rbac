@@ -53,7 +53,9 @@ if err := authz.Authorize(ctx, subject, "cluster:login", cluster); err != nil {
   revoking and granting a role at once replaces its grants, keeping those granted again as they
   are.
 - **Sources:** a host that manages some grants itself, such as those it syncs from a directory,
-  grants them from a `Source` of its own and revokes only those.
+  grants them from a `Source` of its own and revokes only those. Listed in `Config.Sources`, only
+  the host changes them: `Apply` refuses to grant or revoke from one, and the host writes them with
+  `Import` and removes them with `DeleteGrants`.
 - **Who may:** the actor needs `<type>:grant` on the scope. Through a role with `GrantableRoles` it
   may grant and revoke only those roles, without holding them; through any other, it may grant a
   role whose every permission it holds, for every type the grant reaches, and revoke any. A

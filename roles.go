@@ -344,7 +344,8 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 // DeleteRole deletes a tenant's custom role and every grant and eligibility of it, as actor, who
 // needs DefineRoles on the tenant. It refuses a role another custom role lists in
 // GrantableRoles: redefine that one first, or a role later defined with the id would be handed
-// out through it. Deleting a role that doesn't exist does nothing; one changed while the
+// out through it. It refuses a role granted from a source the host owns (Config.Sources), whose
+// grants only the host removes. Deleting a role that doesn't exist does nothing; one changed while the
 // deletion waited for the tenant is refused, as in SetRole.
 func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant string, id Role) error {
 	if tenant == "" || !isCustom(id) {
@@ -406,6 +407,16 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		}
 		// The LIKE matches the partial indexes on custom roles' grants and eligibilities.
 		const ofRole = "role = $2 AND role LIKE 'custom.%'"
+		// Deleting it would revoke the host's own grants of it, which only the host removes.
+		var source string
+		err = tx.QueryRow(ctx, `SELECT source FROM rbac_grants WHERE tenant = $1 AND `+ofRole+` AND source = ANY($3::text[]) LIMIT 1`,
+			tenant, id, slices.Sorted(maps.Keys(a.owned))).Scan(&source)
+		switch {
+		case err == nil:
+			return ChangeEvent{}, fmt.Errorf("%w: role %q is granted from %s, whose grants only the host removes (DeleteGrants)", ErrInvalid, id, source)
+		case !errors.Is(err, pgx.ErrNoRows):
+			return ChangeEvent{}, err
+		}
 		revoked, err := a.remove(ctx, tx, tenant, ofRole, id)
 		if err != nil {
 			return ChangeEvent{}, err

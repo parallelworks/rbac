@@ -294,8 +294,10 @@ type Binding struct {
 	Principal Principal
 	// Source is where a grant comes from: empty when made directly, SourceActivation when
 	// activated from an eligibility, or a name the host gives the grants it manages, such as
-	// those it syncs from a directory, so that it revokes only its own. A source is lowercase
-	// letters, digits and . _ : / -, starting with a letter.
+	// those it syncs from a directory, so that it revokes only its own. A source the host owns
+	// (Config.Sources) only it changes, through Import and DeleteGrants. A source is lowercase
+	// letters, digits and . _ : / -, starting with a letter, and one starting rbac is reserved for
+	// the package.
 	Source string
 	// ExpiresAt ends it; zero never does.
 	ExpiresAt time.Time
@@ -504,6 +506,11 @@ type Config struct {
 	// built-in roles give, `:grant` and `:deny` permissions and DefineRoles. Empty, they are what
 	// the built-in roles give.
 	Permissions []Permission
+	// Sources are the sources the host owns, such as the one it syncs grants from a directory
+	// from: Apply refuses to grant or revoke from one, by ID too, so a tenant's admins can neither
+	// forge the host's grants nor remove them behind its back. The host makes and removes them
+	// with Import and DeleteGrants.
+	Sources []string
 	// Attributes declares the attributes conditions read, so one misnamed or of another type is
 	// refused when a condition is stored; undeclared, any is read.
 	Attributes Attributes
@@ -523,6 +530,8 @@ type Authorizer struct {
 	// containerTypes are the containers' types, sorted.
 	containerTypes []string
 	kinds          map[PrincipalKind]bool
+	// owned are the sources the host owns (Config.Sources).
+	owned map[string]bool
 	// permissions and types are what the built-in roles give and are for: all a custom role
 	// may use. unprivileged are the permissions, each with a type, that a role that isn't
 	// privileged gives there: all a public role may give.
@@ -594,6 +603,13 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 			return nil, fmt.Errorf("rbac: constraint %q has no Deny", c.Name)
 		}
 	}
+	owned := map[string]bool{}
+	for _, src := range cfg.Sources {
+		if src == "" || src == SourceActivation || !validSource(src) || reservedSource(src) {
+			return nil, fmt.Errorf("rbac: source %q is not one the host can own", src)
+		}
+		owned[src] = true
+	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
@@ -633,7 +649,7 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 	}
 	return &Authorizer{
 		db: db, cfg: cfg, roles: roles, containers: containers, containerTypes: slices.Sorted(maps.Keys(containers)),
-		kinds: kinds, permissions: perms, types: resourceTypes, permissionTypes: permissionTypes, unprivileged: unprivileged,
+		kinds: kinds, owned: owned, permissions: perms, types: resourceTypes, permissionTypes: permissionTypes, unprivileged: unprivileged,
 		catalogPermissions: permList, catalogTypes: slices.Sorted(maps.Keys(resourceTypes)), publicPairs: pairs,
 		checked: checked, checkedTypes: checkedTypes, conds: conds,
 	}, nil
