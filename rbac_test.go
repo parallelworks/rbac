@@ -141,15 +141,32 @@ func constrain(name string, p rbac.Permission) func(*rbac.Config) {
 }
 
 // seed grants in t1, making the groups granted to first.
+// seed grants in t1, making the groups granted to first: privileged where a role granted them is.
 func (h *harness) seed(t *testing.T, grants ...rbac.Grant) {
 	t.Helper()
-	var groups []string
+	custom, err := h.authz.CustomRoles(t.Context(), "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	privileged := func(id rbac.Role) bool {
+		if r, ok := h.authz.BuiltinRole(id); ok {
+			return r.Privileged
+		}
+		i := slices.IndexFunc(custom, func(r rbac.RoleDefinition) bool { return r.ID == id })
+		return i >= 0 && custom[i].Privileged
+	}
+	var groups, strong []string
 	for _, g := range grants {
-		if g.Principal.Kind == rbac.Group {
+		switch {
+		case g.Principal.Kind != rbac.Group:
+		case privileged(g.Role):
+			strong = append(strong, g.Principal.ID)
+		default:
 			groups = append(groups, g.Principal.ID)
 		}
 	}
 	h.groups(t, groups...)
+	h.privileged(t, strong...)
 	if err := h.authz.Import(t.Context(), host, "t1", grants); err != nil {
 		t.Fatal(err)
 	}
@@ -159,6 +176,15 @@ func (h *harness) seed(t *testing.T, grants ...rbac.Grant) {
 func (h *harness) groups(t *testing.T, ids ...string) {
 	t.Helper()
 	if _, err := h.pool.Exec(t.Context(), `INSERT INTO rbac_groups (tenant, id) SELECT 't1', unnest($1::text[]) ON CONFLICT DO NOTHING`, ids); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// privileged makes groups in t1 privileged, as a test's setup, which only making them does after.
+func (h *harness) privileged(t *testing.T, ids ...string) {
+	t.Helper()
+	if _, err := h.pool.Exec(t.Context(), `INSERT INTO rbac_groups (tenant, id, privileged) SELECT DISTINCT 't1', unnest($1::text[]), true
+		ON CONFLICT (tenant, id) DO UPDATE SET privileged = true`, ids); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -2249,13 +2275,10 @@ func TestTenantMembersAndThePublicNeverGetAGrantPermission(t *testing.T) {
 				t.Fatal(err)
 			}
 			member := h.as(t, "member")
-			// A role that gives cluster:grant can't be public, so a grant of it to the public
-			// gives nothing at all.
+			// A role that gives cluster:grant is privileged and can't be public, so a grant of it to
+			// either gives nothing at all.
 			others := 0
-			if p.Kind == rbac.Members {
-				others = 1
-			}
-			if allowed(t, h, member, root, cluster) != (others == 1) {
+			if allowed(t, h, member, root, cluster) {
 				t.Fatal("the grant's other permissions")
 			}
 			if allowed(t, h, member, grantC, cluster) {
@@ -2744,7 +2767,10 @@ func TestIdentitiesFromOtherTenants(t *testing.T) {
 	ctx := t.Context()
 	// A guest, such as from another tenant, in this one's group of partners.
 	partner := h.guest(t, "partner", "partners")
-	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.sudo", rbac.Members, "t1"))
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.Members, "t1"))
+	if allowed(t, h, partner, login, cluster) {
+		t.Fatal("another tenant's member is one of this tenant's members")
+	}
 	if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{
 		{Role: "cluster.login", Principal: partner.Principal},
 	}}); err != nil {
@@ -2753,10 +2779,7 @@ func TestIdentitiesFromOtherTenants(t *testing.T) {
 	if !allowed(t, h, partner, login, cluster) {
 		t.Fatal("a grant to another tenant's member should reach it")
 	}
-	if allowed(t, h, partner, root, cluster) {
-		t.Fatal("another tenant's member is one of this tenant's members")
-	}
-	h.groups(t, "partners")
+	h.privileged(t, "partners")
 	if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{
 		{Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.Group, ID: "partners"}},
 	}}); err != nil {
@@ -3791,7 +3814,7 @@ func TestAGrantAskedAboutBeforeItsRoleIsRedefinedIsTriedAgain(t *testing.T) {
 		}
 	})
 	ctx := t.Context()
-	h.groups(t, "bots")
+	h.privileged(t, "bots")
 	admin = roleAdmin(t, h)
 	// Eligible through a group, which the host lets hold a privileged role, so redefining isn't
 	// refused for the eligibility; activating, the service account is.
@@ -5135,8 +5158,8 @@ func TestADenyCantExemptEveryoneItNames(t *testing.T) {
 	resources := hostTable(t, h)
 	named := rbac.Principal{Kind: rbac.User, ID: "named"}
 	h.seed(t,
-		grant(cluster.Scope(), "cluster.sudo", rbac.User, "named"),
-		grant(cluster.Scope(), "cluster.sudo", rbac.Members, "t1"),
+		grant(cluster.Scope(), "cluster.login", rbac.User, "named"),
+		grant(cluster.Scope(), "cluster.login", rbac.Members, "t1"),
 	)
 	public, members := rbac.Principal{Kind: rbac.Public}, rbac.TenantMembers("t1")
 	// Every subject is the public and every member the tenant's members, so these would bind no one.
@@ -5147,7 +5170,7 @@ func TestADenyCantExemptEveryoneItNames(t *testing.T) {
 		"members exempt from itself":           {Principals: []rbac.Principal{members}, Exempt: []rbac.Principal{members}},
 		"one both named and exempt":            {Principals: []rbac.Principal{named}, Exempt: []rbac.Principal{named}},
 	} {
-		d.ID, d.Permissions = "no-root", []rbac.Permission{root}
+		d.ID, d.Permissions = "no-login", []rbac.Permission{login}
 		if err := h.authz.SetDeny(ctx, guardian, cluster, d); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("%s: %v", name, err)
 		}
@@ -5156,19 +5179,19 @@ func TestADenyCantExemptEveryoneItNames(t *testing.T) {
 		t.Fatalf("a deny refused should not be stored: %v, %v", stored, err)
 	}
 	// Anyone but the tenant's members: only those who aren't.
-	d := rbac.Deny{ID: "members-only", Principals: []rbac.Principal{public}, Exempt: []rbac.Principal{members}, Permissions: []rbac.Permission{root}}
+	d := rbac.Deny{ID: "members-only", Principals: []rbac.Principal{public}, Exempt: []rbac.Principal{members}, Permissions: []rbac.Permission{login}}
 	if err := h.authz.SetDeny(ctx, guardian, cluster, d); err != nil {
 		t.Fatal(err)
 	}
-	h.seed(t, grant(cluster.Scope(), "cluster.sudo", rbac.User, "visitor"))
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "visitor"))
 	guest := h.guest(t, "visitor")
-	if !allowed(t, h, h.as(t, "named"), root, cluster) || allowed(t, h, guest, root, cluster) {
+	if !allowed(t, h, h.as(t, "named"), login, cluster) || allowed(t, h, guest, login, cluster) {
 		t.Fatal("a deny on the public exempting members should bind only those who aren't members")
 	}
-	listingsAgree(t, h, resources, h.as(t, "named"), root)
-	listingsAgree(t, h, resources, guest, root)
+	listingsAgree(t, h, resources, h.as(t, "named"), login)
+	listingsAgree(t, h, resources, guest, login)
 	// The grant to the members, exempt, gives it.
-	if holders, err := h.authz.Holders(ctx, root, cluster); err != nil || !slices.Contains(holderPrincipals(holders), members) {
+	if holders, err := h.authz.Holders(ctx, login, cluster); err != nil || !slices.Contains(holderPrincipals(holders), members) {
 		t.Fatalf("Holders = %v, %v", holders, err)
 	}
 }
@@ -5207,7 +5230,7 @@ func TestEligibleGrants(t *testing.T) {
 		Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.Group, ID: "oncall"}, MaxDuration: time.Hour,
 		Requires: `request.attributes.mfa == true`, Note: "on call",
 	}
-	h.groups(t, "oncall")
+	h.privileged(t, "oncall")
 	h.events = nil
 	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, oncall); err != nil {
 		t.Fatal(err)
@@ -5383,7 +5406,8 @@ func TestActivationsNeedTheirApprovers(t *testing.T) {
 		Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.User, ID: "x"}, MaxDuration: time.Hour,
 		Approvers: []rbac.Principal{{Kind: rbac.Group, ID: "leads"}, {Kind: rbac.User, ID: "x"}},
 	}
-	h.groups(t, "leads", "sre")
+	h.groups(t, "leads")
+	h.privileged(t, "sre")
 	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, e); err != nil {
 		t.Fatal(err)
 	}

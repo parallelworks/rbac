@@ -346,7 +346,7 @@ func TestDeletingGroupsRemovesTheirGrants(t *testing.T) {
 	h := grouped(t)
 	ctx := t.Context()
 	h.join(t, "u")
-	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "a"}, {ID: "b"}}); err != nil {
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "a", Privileged: true}, {ID: "b"}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "a", Principal: identity("u")}, {Group: "b", Principal: groupOf("a")}}); err != nil {
@@ -1027,21 +1027,25 @@ func TestOnlyMembersAndGuestsHoldAnything(t *testing.T) {
 	ctx := t.Context()
 	resources := hostTable(t, h)
 	u := identity("u")
+	// u's own grant gives view, and the members' login too.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.view', '{cluster:view}', '{cluster}')`); err != nil {
+		t.Fatal(err)
+	}
 	h.seed(t,
-		grant(cluster.Scope(), "cluster.login", rbac.User, "u"),
-		grant(cluster.Scope(), "cluster.sudo", rbac.Members, "t1"),
+		grant(cluster.Scope(), "custom.view", rbac.User, "u"),
+		grant(cluster.Scope(), "cluster.login", rbac.Members, "t1"),
 	)
 	s := rbac.Subject{Principal: u}
-	check := func(what string, wantLogin, wantRoot bool) {
+	check := func(what string, wantView, wantLogin bool) {
 		t.Helper()
+		if got := allowed(t, h, s, view, cluster); got != wantView {
+			t.Errorf("%s: view %v, want %v", what, got, wantView)
+		}
 		if got := allowed(t, h, s, login, cluster); got != wantLogin {
 			t.Errorf("%s: login %v, want %v", what, got, wantLogin)
 		}
-		if got := allowed(t, h, s, root, cluster); got != wantRoot {
-			t.Errorf("%s: root %v, want %v", what, got, wantRoot)
-		}
+		listingsAgree(t, h, resources, s, view)
 		listingsAgree(t, h, resources, s, login)
-		listingsAgree(t, h, resources, s, root)
 	}
 	// A grant to an identity outside the tenant is stored, and gives nothing until it joins.
 	check("not a member", false, false)
@@ -1367,5 +1371,143 @@ func TestHoldersReadDeniesOnTheMembersAndThePublic(t *testing.T) {
 				t.Errorf("a deny on %s: Authorize(%v) isn't %t", c.name, s.Principal, want)
 			}
 		}
+	}
+}
+
+func TestPrivilegedRolesAreHeldOnlyByIdentitiesAndPrivilegedGroups(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "devs"}, {ID: "admins", Privileged: true}}); err != nil {
+		t.Fatal(err)
+	}
+	owner := h.as(t, "owner")
+	sudo := func(p rbac.Principal) rbac.Binding { return rbac.Binding{Role: "cluster.sudo", Principal: p} }
+	for name, change := range map[string]func(rbac.Principal) error{
+		"apply": func(p rbac.Principal) error {
+			return h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{sudo(p)}})
+		},
+		"import": func(p rbac.Principal) error {
+			return h.authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: sudo(p)}})
+		},
+		"eligibility": func(p rbac.Principal) error {
+			return h.authz.SetEligibility(ctx, owner, cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: p, MaxDuration: time.Hour})
+		},
+	} {
+		for _, p := range []rbac.Principal{groupOf("devs"), rbac.TenantMembers("t1")} {
+			if err := change(p); !errors.Is(err, rbac.ErrInvalid) {
+				t.Errorf("%s of a privileged role to %v: %v", name, p, err)
+			}
+		}
+		for _, p := range []rbac.Principal{groupOf("admins"), identity("u")} {
+			if err := change(p); err != nil {
+				t.Errorf("%s of a privileged role to %v: %v", name, p, err)
+			}
+		}
+	}
+	// What isn't privileged any group holds.
+	if err := h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: groupOf("devs")}}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAPrivilegedRoleGivesNothingThroughTheMembersOrAnOrdinaryGroup(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	resources := hostTable(t, h)
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "devs"}, {ID: "admins", Privileged: true}}); err != nil {
+		t.Fatal(err)
+	}
+	// As a catalog change that makes a role privileged leaves them: refused now, but stored.
+	for _, p := range []rbac.Principal{groupOf("devs"), rbac.TenantMembers("t1")} {
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			VALUES ('t1', 'workspace', 'w1', $1, $2, 'cluster.admin')`, p.Kind, p.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+		VALUES ('t1', 'cluster', 'c1', 'group', 'devs', 'cluster.sudo', 3600)`); err != nil {
+		t.Fatal(err)
+	}
+	dev := h.as(t, "dev", "devs")
+	for _, p := range []rbac.Permission{view, root, grantC} {
+		if allowed(t, h, dev, p, cluster) {
+			t.Errorf("%s through an ordinary group and the members", p)
+		}
+		listingsAgree(t, h, resources, dev, p)
+		if d, err := h.authz.Explain(ctx, dev, p, cluster); err != nil || d.Allowed {
+			t.Errorf("Explain %s = %+v, %v", p, d, err)
+		}
+	}
+	if perms, err := h.authz.Permissions(ctx, dev, cluster); err != nil || len(perms) != 0 {
+		t.Errorf("Permissions = %v, %v", perms, err)
+	}
+	if holders, err := h.authz.Holders(ctx, root, cluster); err != nil || slices.Contains(holderPrincipals(holders), identity("dev")) ||
+		slices.Contains(holderPrincipals(holders), rbac.TenantMembers("t1")) {
+		t.Errorf("Holders = %+v, %v", holders, err)
+	}
+	if err := h.authz.Apply(ctx, dev, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("x")}}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("granting through an ordinary group's privileged role: %v", err)
+	}
+	if _, err := h.authz.Activate(ctx, dev, cluster, rbac.Activation{Role: "cluster.sudo", Duration: time.Minute, Justification: "INC-1"}); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("activating through an ordinary group's eligibility for a privileged role: %v", err)
+	}
+	// Through a privileged group, the same grant gives what it gives.
+	if _, err := h.pool.Exec(ctx, `UPDATE rbac_grants SET principal_id = 'admins' WHERE principal_kind = 'group'`); err != nil {
+		t.Fatal(err)
+	}
+	admin := h.as(t, "dev", "admins")
+	if !allowed(t, h, admin, root, cluster) {
+		t.Error("root through a privileged group")
+	}
+	listingsAgree(t, h, resources, admin, root)
+}
+
+func TestARoleBecomesPrivilegedOnlyWhereIdentitiesAndPrivilegedGroupsHoldIt(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "devs"}, {ID: "admins", Privileged: true}}); err != nil {
+		t.Fatal(err)
+	}
+	op := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(ctx, admin, "t1", op); err != nil {
+		t.Fatal(err)
+	}
+	widened := op
+	widened.Permissions = []rbac.Permission{view, login, root}
+	for _, holder := range []struct {
+		name string
+		hold func() error
+	}{
+		{"an ordinary group's grant", func() error {
+			return h.authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: rbac.Binding{Role: op.ID, Principal: groupOf("devs")}}})
+		}},
+		{"the members' grant", func() error {
+			return h.authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: rbac.Binding{Role: op.ID, Principal: rbac.TenantMembers("t1")}}})
+		}},
+		{"an ordinary group's eligibility", func() error {
+			return h.authz.SetEligibility(ctx, admin, cluster, rbac.Eligibility{Role: op.ID, Principal: groupOf("devs"), MaxDuration: time.Hour})
+		}},
+	} {
+		if err := holder.hold(); err != nil {
+			t.Fatal(err)
+		}
+		// Giving root makes it privileged, which they would hold nothing of.
+		if err := h.authz.SetRole(ctx, admin, "t1", widened); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("making a role privileged that %s holds: %v", holder.name, err)
+		}
+		if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_grants WHERE role = 'custom.op'; DELETE FROM rbac_eligibilities WHERE role = 'custom.op'`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// An identity and a privileged group may hold it.
+	if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{
+		{Scope: cluster.Scope(), Binding: rbac.Binding{Role: op.ID, Principal: identity("u")}},
+		{Scope: cluster.Scope(), Binding: rbac.Binding{Role: op.ID, Principal: groupOf("admins")}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.SetRole(ctx, admin, "t1", widened); err != nil {
+		t.Fatalf("making a role privileged that only an identity and a privileged group hold: %v", err)
 	}
 }

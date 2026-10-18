@@ -80,7 +80,7 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 		// A built-in role's unconditional grant decides without reading custom roles or conditions.
 		builtin := book{builtin: a.roles}
 		for _, h := range held {
-			if !h.conditional && gives(builtin, h.Principal, h.Role, p, r.Type) {
+			if !h.conditional && gives(builtin, h, p, r.Type) {
 				return Decision{Allowed: true}, nil
 			}
 		}
@@ -90,7 +90,7 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 		}
 		var conditional []holding
 		for _, h := range held {
-			if !gives(roles, h.Principal, h.Role, p, r.Type) {
+			if !gives(roles, h, p, r.Type) {
 				continue
 			}
 			if !h.conditional {
@@ -127,7 +127,7 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 // none does.
 func (a *Authorizer) explain(ctx context.Context, s Subject, p Permission, r Resource, counts broad) (Decision, error) {
 	vars, spend := a.vars(ctx, s, p, r), newBudget()
-	keys, err := a.keysOf(ctx, a.db, r.Tenant, s)
+	keys, strong, err := a.keysOf(ctx, a.db, r.Tenant, s)
 	if err != nil {
 		return Decision{}, err
 	}
@@ -151,7 +151,9 @@ func (a *Authorizer) explain(ctx context.Context, s Subject, p Permission, r Res
 		return Decision{}, err
 	}
 	d := Decision{Reason: "no grant gives it"}
-	grants = slices.DeleteFunc(grants, func(g Grant) bool { return !gives(roles, g.Principal, g.Role, p, r.Type) })
+	grants = slices.DeleteFunc(grants, func(g Grant) bool {
+		return !gives(roles, holding{Binding: g.Binding, strong: slices.Contains(strong, g.Principal.key())}, p, r.Type)
+	})
 	// Evaluated in the order Authorize evaluates them, so a budget runs out where it does for it.
 	byCost := slices.Clone(grants)
 	cheapestFirst(byCost, Grant.expression)
@@ -205,11 +207,18 @@ func unmet(spend *budget) string {
 	return "no condition of a grant that gives it holds"
 }
 
-// gives reports whether a grant of a role to a principal gives p on a resource type. A role
-// that no longer exists gives nothing.
-func gives(roles book, to Principal, id Role, p Permission, resourceType string) bool {
-	def, ok := roles.role(id)
-	return ok && def.GrantableOn(resourceType) && def.Gives(p) && to.carries(def, p)
+// gives reports whether a grant held as h gives p on a resource type. A role that no longer
+// exists gives nothing.
+func gives(roles book, h holding, p Permission, resourceType string) bool {
+	def, ok := roles.role(h.Role)
+	return ok && def.GrantableOn(resourceType) && def.Gives(p) && h.carries(def, p)
+}
+
+// carries reports whether a grant held as h gives p, which def gives: as its principal carries
+// it, and for a privileged role only through a strong key, so a catalog change that makes a role
+// privileged reaches what ordinary groups and the tenant's members hold.
+func (h holding) carries(def RoleDefinition, p Permission) bool {
+	return h.Principal.carries(def, p) && (h.strong || !def.Privileged)
 }
 
 // Permissions lists what the subject may do to r, sorted: the AuthZEN action search.
@@ -241,7 +250,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 			conditional = append(conditional, h)
 		default:
 			for _, p := range def.Permissions {
-				given[p] = given[p] || h.Principal.carries(def, p)
+				given[p] = given[p] || h.carries(def, p)
 			}
 		}
 	}
@@ -283,7 +292,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 	for _, h := range conditional {
 		def, _ := roles.role(h.Role)
 		for _, p := range def.Permissions {
-			if given[p] || !h.Principal.carries(def, p) {
+			if given[p] || !h.carries(def, p) {
 				continue
 			}
 			if gone, err := isRemoved(p); err != nil || gone {
@@ -366,16 +375,20 @@ func (a *Authorizer) holders(ctx context.Context, p Permission, r Resource, role
 	// One time for every statement, as one snapshot, so a grant, a membership or a group's member
 	// ending between them can't leave a holder that no single moment had.
 	now := a.cfg.Now()
-	args := append([]any{
+	args := append(append([]any{
 		r.Tenant, r.path(), roles, now, p.managesAccess(),
 		[]string{string(Members), string(Public)},
 		string(p), r.Type, a.publicRoles(roles), string(Public),
-	}, a.publicArgs(p, r.Type, custom)...)
+	}, a.publicArgs(p, r.Type, custom)...), append([]any{a.privilegedRoles(roles), string(Group)}, a.catalogArgs(custom)...)...)
+	// A privileged role gives only through an identity or a privileged group.
 	rows, err := a.db.Query(ctx, `
 		SELECT id::text, principal_kind, principal_id, conditional FROM rbac_grants
-		WHERE tenant = $1 AND scope = ANY($2::text[]) AND role = ANY(`+givingSQL("$3", "$1", "$7", "$8", custom, nil)+`)
+		WHERE tenant = $1 AND scope = ANY($2::text[]) AND role = ANY(`+givingSQL("$3", "$1", "$7", "$8", custom, "")+`)
 		  AND (expires_at IS NULL OR expires_at > $4) AND (NOT $5 OR principal_kind <> ALL($6::text[]))
-		  AND (principal_kind <> $10 OR role = ANY(`+givingSQL("$9", "$1", "$7", "$8", custom, &publicSQL{"$11", "$12", "$13"})+`))
+		  AND (principal_kind <> $10 OR role = ANY(`+givingSQL("$9", "$1", "$7", "$8", custom, publicOnly(catalogSQL{"$11", "$12", "$13"}))+`))
+		  AND (principal_kind <> ALL($6::text[]) AND principal_kind <> $15
+		    OR principal_kind = $15 AND EXISTS (SELECT FROM rbac_groups pg WHERE pg.tenant = $1 AND pg.id = principal_id AND pg.privileged)
+		    OR role <> ALL(`+givingSQL("$14", "$1", "$7", "$8", custom, privilegedOnly(catalogSQL{"$16", "$17", "$18"}))+`))
 		ORDER BY principal_kind, principal_id, id`, args...)
 	if err != nil {
 		return nil, err
@@ -617,7 +630,7 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 // reachable is Reachable's answer once no constraint removes p, for the built-in roles that give
 // it, and custom ones too where custom.
 func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, tenant, resourceType string, roles []string, custom bool) (Reach, error) {
-	keys, err := a.keysOf(ctx, a.db, tenant, s)
+	keys, strong, err := a.keysOf(ctx, a.db, tenant, s)
 	if err != nil {
 		return Reach{}, err
 	}
@@ -626,15 +639,16 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 		return Reach{}, nil
 	}
 	reaching := a.reaching(resourceType)
-	args := append([]any{
+	args := append(append([]any{
 		tenant, principals, roles, a.cfg.Now(), reaching, publicKey, a.publicRoles(roles),
 		string(p), resourceType,
-	}, a.publicArgs(p, resourceType, custom)...)
+	}, a.publicArgs(p, resourceType, custom)...), append([]any{strong, a.privilegedRoles(roles)}, a.catalogArgs(custom)...)...)
 	rows, err := a.db.Query(ctx, `
 		SELECT scope, bool_and(conditional) FROM rbac_grants
-		WHERE tenant = $1 AND principal = ANY($2::text[]) AND role = ANY(`+givingSQL("$3", "$1", "$8", "$9", custom, nil)+`)
+		WHERE tenant = $1 AND principal = ANY($2::text[]) AND role = ANY(`+givingSQL("$3", "$1", "$8", "$9", custom, "")+`)
 		  AND (expires_at IS NULL OR expires_at > $4) AND `+ofTypes("scope", "$5", len(reaching))+`
-		  AND (principal <> $6 OR role = ANY(`+givingSQL("$7", "$1", "$8", "$9", custom, &publicSQL{"$10", "$11", "$12"})+`))
+		  AND (principal <> $6 OR role = ANY(`+givingSQL("$7", "$1", "$8", "$9", custom, publicOnly(catalogSQL{"$10", "$11", "$12"}))+`))
+		  AND (principal = ANY($13::text[]) OR role <> ALL(`+givingSQL("$14", "$1", "$8", "$9", custom, privilegedOnly(catalogSQL{"$15", "$16", "$17"}))+`))
 		GROUP BY scope ORDER BY scope`, args...)
 	if err != nil {
 		return Reach{}, err
@@ -753,15 +767,18 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	keys := func(of string) string {
 		return "ARRAY(WITH RECURSIVE " + keysSQL(arg(1)+"::text", arg(2)+"::text", arg(4)) + " " + of + ")"
 	}
+	strong := "ARRAY(WITH RECURSIVE " + keysSQL(arg(1)+"::text", arg(2)+"::text", arg(4)) + " " + strongKeys + ")"
 	// The subject's grants on the scopes `of` keeps, in the default collation, as the host's
 	// path column has it, so its GIN index applies.
 	grants := func(of string) string {
 		return fmt.Sprintf(`SELECT g.scope COLLATE "default" FROM rbac_grants g
 			WHERE g.tenant = %s::text AND g.principal = ANY(%s) AND g.role = ANY(%s)
 			  AND (g.expires_at IS NULL OR g.expires_at > %s) AND NOT g.conditional AND %s
-			  AND (g.principal <> %s::text OR g.role = ANY(%s))`,
-			arg(1), keys(countedKeys(arg(13), arg(17))), givingSQL(arg(3), arg(1), arg(8), arg(9), custom, nil), arg(4), of, arg(6),
-			givingSQL(arg(7), arg(1), arg(8), arg(9), custom, &publicSQL{arg(10), arg(11), arg(12)}))
+			  AND (g.principal <> %s::text OR g.role = ANY(%s))
+			  AND (g.principal = ANY(%s) OR g.role <> ALL(%s))`,
+			arg(1), keys(countedKeys(arg(13), arg(17))), givingSQL(arg(3), arg(1), arg(8), arg(9), custom, ""), arg(4), of, arg(6),
+			givingSQL(arg(7), arg(1), arg(8), arg(9), custom, publicOnly(catalogSQL{arg(10), arg(11), arg(12)})),
+			strong, givingSQL(arg(18), arg(1), arg(8), arg(9), custom, privilegedOnly(catalogSQL{arg(19), arg(20), arg(21)})))
 	}
 	// The grants' tenant is an argument of its own: the host's tenant column needn't be text,
 	// and one argument can't take two types. The grants overlap the path, which the host's GIN
@@ -793,7 +810,9 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 		Args: append(append([]any{
 			tenant, tenant, s.identityKey(), roles, a.cfg.Now(), above, publicKey, a.publicRoles(roles),
 			string(p), resourceType,
-		}, a.publicArgs(p, resourceType, custom)...), counts.public, perm, wildcard, a.reaching(resourceType), counts.members),
+		}, a.publicArgs(p, resourceType, custom)...), append([]any{
+			counts.public, perm, wildcard, a.reaching(resourceType), counts.members, a.privilegedRoles(roles),
+		}, a.catalogArgs(custom)...)...),
 	}, nil
 }
 
@@ -837,6 +856,8 @@ type holding struct {
 	Binding
 	scope       string
 	conditional bool
+	// strong is set when it is held through the identity or a privileged group.
+	strong bool
 }
 
 // heldOrDenied returns the grants on any of scopes, not expired, held by s's principals in a
@@ -856,12 +877,13 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Su
 	}
 	rows, err := q.Query(ctx, `
 		WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$4")+`
-		SELECT false, id::text, principal, scope, role, expires_at, conditional, NULL::text[], ''
+		SELECT false, id::text, principal, scope, role, expires_at, conditional, NULL::text[], '',
+		  principal = ANY(ARRAY(`+strongKeys+`))
 		FROM rbac_grants
 		WHERE tenant = $1 AND principal = ANY(ARRAY(`+countedKeys("$7", "$8")+`)) AND scope = ANY($3::text[])
 		  AND (expires_at IS NULL OR expires_at > $4)
 		UNION ALL
-		SELECT true, id, id, scope, '', NULL, condition <> '', permissions, condition
+		SELECT true, id, id, scope, '', NULL, condition <> '', permissions, condition, false
 		FROM rbac_denies
 		WHERE tenant = $1 AND scope = ANY($3::text[]) AND principals && ARRAY(SELECT k FROM bound) AND NOT exempt && ARRAY(SELECT k FROM bound)
 		  AND ($5 = '' OR $5 = ANY(permissions) OR $6 = ANY(permissions)) AND EXISTS (SELECT FROM keys WHERE `+counted("$7", "$8")+`)
@@ -875,9 +897,9 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Su
 	var isDeny bool
 	var id, principal, scope, role, condition string
 	var expires *time.Time
-	var conditional bool
+	var conditional, strong bool
 	var perms []string
-	_, err = pgx.ForEachRow(rows, []any{&isDeny, &id, &principal, &scope, &role, &expires, &conditional, &perms, &condition}, func() error {
+	_, err = pgx.ForEachRow(rows, []any{&isDeny, &id, &principal, &scope, &role, &expires, &conditional, &perms, &condition, &strong}, func() error {
 		if isDeny {
 			d := denial{id: id, scope: scope, condition: condition}
 			for _, x := range perms {
@@ -886,7 +908,7 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Su
 			ds = append(ds, d)
 			return nil
 		}
-		h := holding{Binding: Binding{ID: id, Principal: parsePrincipal(principal), Role: Role(role)}, scope: scope, conditional: conditional}
+		h := holding{Binding: Binding{ID: id, Principal: parsePrincipal(principal), Role: Role(role)}, scope: scope, conditional: conditional, strong: strong}
 		if expires != nil {
 			h.ExpiresAt = *expires
 		}

@@ -940,6 +940,70 @@ func (a *Authorizer) GroupsOf(ctx context.Context, tenant string, p Principal) (
 	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
+// strongHold refuses granting, or making eligible, a privileged role to the tenant's members or a
+// group that isn't privileged, through which it gives nothing: read under the change's locks on
+// the groups, whose mark never changes.
+func strongHold(ctx context.Context, q DB, tenant string, roles book, bs []Binding) error {
+	refuse := func(b Binding) error {
+		return &InvalidError{Binding: b, Reason: fmt.Sprintf("%s is privileged, and a privileged role is held only by identities and privileged groups", b.Role)}
+	}
+	var errs []error
+	byGroup := map[string][]Binding{}
+	for _, b := range bs {
+		def, ok := roles.role(b.Role)
+		switch {
+		case !ok || !def.Privileged:
+		case b.Principal.broad():
+			errs = append(errs, refuse(b))
+		case b.Principal.Kind == Group:
+			byGroup[b.Principal.ID] = append(byGroup[b.Principal.ID], b)
+		}
+	}
+	if len(byGroup) > 0 {
+		rows, err := q.Query(ctx, `SELECT g FROM unnest($2::text[]) AS g
+			WHERE NOT EXISTS (SELECT FROM rbac_groups WHERE tenant = $1 AND id = g AND privileged) ORDER BY g`,
+			tenant, slices.Sorted(maps.Keys(byGroup)))
+		if err != nil {
+			return err
+		}
+		ordinary, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return err
+		}
+		for _, g := range ordinary {
+			for _, b := range byGroup[g] {
+				errs = append(errs, refuse(b))
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// heldStrongly refuses making a custom role privileged while the tenant's members or a group that
+// isn't privileged hold it, granted or eligible, through which it would then give nothing.
+func heldStrongly(ctx context.Context, q DB, tenant string, role Role, now time.Time) error {
+	var who string
+	// The LIKE matches the partial indexes on custom roles' grants and eligibilities.
+	err := q.QueryRow(ctx, `
+		SELECT principal FROM (
+		  SELECT principal, principal_kind, principal_id FROM rbac_grants
+		  WHERE tenant = $1 AND role = $2 AND role LIKE 'custom.%' AND (expires_at IS NULL OR expires_at > $3)
+		  UNION ALL
+		  SELECT principal, principal_kind, principal_id FROM rbac_eligibilities
+		  WHERE tenant = $1 AND role = $2 AND role LIKE 'custom.%' AND (expires_at IS NULL OR expires_at > $3)
+		) h
+		WHERE principal_kind = 'members' OR principal_kind = 'group'
+		  AND NOT EXISTS (SELECT FROM rbac_groups WHERE tenant = $1 AND id = h.principal_id AND privileged)
+		ORDER BY principal LIMIT 1`, tenant, string(role), now).Scan(&who)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil
+	case err != nil:
+		return err
+	}
+	return fmt.Errorf("%w: %s would be privileged, and %s holds it: a privileged role is held only by identities and privileged groups, so revoke it first", ErrInvalid, role, who)
+}
+
 // groupKeys returns the keys of the groups among principals, sorted, each once.
 func groupKeys(principals []Principal) []string {
 	var keys []string

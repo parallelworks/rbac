@@ -172,6 +172,9 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, via
 		if err := redefinedSince(au.roles, now.roles, roleIDs(grants)); err != nil {
 			return ChangeEvent{}, err
 		}
+		if err := strongHold(ctx, tx, on.Tenant, now.roles, grants); err != nil {
+			return ChangeEvent{}, err
+		}
 		return write(tx)
 	})
 }
@@ -333,6 +336,13 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 			return ChangeEvent{}, err
 		}
 		if err := redefinedSince(roles, now, roleIDs(grants)); err != nil {
+			return ChangeEvent{}, err
+		}
+		bindings := make([]Binding, len(grants))
+		for i, g := range grants {
+			bindings[i] = g.Binding
+		}
+		if err := strongHold(ctx, tx, tenant, now, bindings); err != nil {
 			return ChangeEvent{}, err
 		}
 		granted, err := a.upsert(ctx, tx, tenant, actor, grants)
@@ -753,7 +763,7 @@ func (au authority) power(scopeType string, denied func(Permission) bool, counts
 		return pw
 	}
 	for _, g := range au.held {
-		if !gives(au.roles, g.Principal, g.Role, manage, scopeType) || !counts(g) {
+		if !gives(au.roles, g, manage, scopeType) || !counts(g) {
 			continue
 		}
 		def, _ := au.roles.role(g.Role)
@@ -777,14 +787,14 @@ func (h holding) under(condition string) bool {
 // neither a deny nor a constraint removes it.
 func (au authority) holds(p Permission, resourceType, condition string) bool {
 	return !au.handsOn(p) && slices.ContainsFunc(au.held, func(g holding) bool {
-		return gives(au.roles, g.Principal, g.Role, p, resourceType) && g.under(condition)
+		return gives(au.roles, g, p, resourceType) && g.under(condition)
 	}) && !au.constrained.removes(p, resourceType)
 }
 
 // may reports whether the actor may do p, on resources of a type, in this request.
 func (au authority) may(p Permission, resourceType string) bool {
 	return !au.denied(p) && slices.ContainsFunc(au.held, func(g holding) bool {
-		return gives(au.roles, g.Principal, g.Role, p, resourceType) && au.allows(g, p)
+		return gives(au.roles, g, p, resourceType) && au.allows(g, p)
 	})
 }
 

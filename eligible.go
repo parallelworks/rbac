@@ -286,14 +286,22 @@ func (a *Authorizer) Deactivate(ctx context.Context, s Subject, on Resource, rol
 // eligibility of s's identity or of one of its groups there, lasting act.Duration or longer and
 // in force until then, whose requirement holds in the request, failing closed, and whose
 // approvers, if it names any, include act.Approver, who isn't s. approved is zero when the
-// eligibility allowing it names none.
+// eligibility allowing it names none. A privileged role's counts only through s's identity or a
+// privileged group, as its grants do.
 func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource, act Activation, until time.Time) (approved Principal, err error) {
 	scope, manage := on.Scope(), GrantPermission(on.Type)
-	keys, err := a.keysOf(ctx, q, on.Tenant, s)
+	keys, strong, err := a.keysOf(ctx, q, on.Tenant, s)
 	if err != nil {
 		return Principal{}, err
 	}
-	approvers, err := a.keysOf(ctx, q, on.Tenant, act.Approver)
+	roles, err := a.tenantBook(ctx, q, on.Tenant, []Role{act.Role})
+	if err != nil {
+		return Principal{}, err
+	}
+	if def, _ := roles.role(act.Role); def.Privileged {
+		keys = strong
+	}
+	approvers, _, err := a.keysOf(ctx, q, on.Tenant, act.Approver)
 	if err != nil {
 		return Principal{}, err
 	}

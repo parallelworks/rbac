@@ -112,25 +112,35 @@ func collectRoles(rows pgx.Rows) ([]RoleDefinition, error) {
 	})
 }
 
-// publicSQL names the array arguments that Authorizer.publicArgs fills.
-type publicSQL struct{ perms, types, pairs string }
+// catalogSQL names the array arguments that Authorizer.publicArgs and Authorizer.catalogArgs fill:
+// the catalog's permissions, its types and the pairs of them a role that isn't privileged gives.
+type catalogSQL struct{ perms, types, pairs string }
 
 // givingSQL is SQL for the ids of the roles that give perm on a resource type in a tenant: the
 // built-in ones in the array argument builtin, and with custom the tenant's custom ones, read in
-// the same statement. With public, only custom roles public as Authorizer.current reads them:
-// marked Public, and of the permissions and types the catalog has, giving none that changes
-// access and each only where a role that isn't privileged gives it, so a catalog change reaches
-// searches as it reaches checks.
-func givingSQL(builtin, tenant, perm, resourceType string, custom bool, public *publicSQL) string {
-	only := ""
-	if public != nil {
-		only = fmt.Sprintf(` AND cr.public AND NOT EXISTS (SELECT FROM unnest(cr.permissions) cp, unnest(cr.resource_types) ct
-		WHERE cp = ANY(%s::text[]) AND ct = ANY(%s::text[]) AND cp || ' ' || ct <> ALL(%s::text[]))`, public.perms, public.types, public.pairs)
-	}
+// the same statement, of them only those only keeps, if any (publicOnly, privilegedOnly), so a
+// catalog change reaches searches as it reaches checks.
+func givingSQL(builtin, tenant, perm, resourceType string, custom bool, only string) string {
 	// Without custom the subquery stays, constant false, so the statement's arguments are the
 	// same and PostgreSQL plans it away.
 	return fmt.Sprintf(`(%s::text[] || ARRAY(SELECT cr.id FROM rbac_roles cr WHERE %t AND cr.tenant = %s::text
 		AND %s::text = ANY(cr.permissions) AND %s::text = ANY(cr.resource_types)%s))`, builtin, custom, tenant, perm, resourceType, only)
+}
+
+// publicOnly keeps the custom roles public as Authorizer.current reads them: marked Public, and of
+// the permissions and types the catalog has, giving none that changes access and each only where
+// a role that isn't privileged gives it.
+func publicOnly(c catalogSQL) string {
+	return fmt.Sprintf(` AND cr.public AND NOT EXISTS (SELECT FROM unnest(cr.permissions) cp, unnest(cr.resource_types) ct
+		WHERE cp = ANY(%s::text[]) AND ct = ANY(%s::text[]) AND cp || ' ' || ct <> ALL(%s::text[]))`, c.perms, c.types, c.pairs)
+}
+
+// privilegedOnly keeps the custom roles privileged as Authorizer.current reads them: of the
+// permissions and types the catalog has, giving one where only privileged roles give it, as every
+// permission that changes access is.
+func privilegedOnly(c catalogSQL) string {
+	return fmt.Sprintf(` AND EXISTS (SELECT FROM unnest(cr.permissions) cp, unnest(cr.resource_types) ct
+		WHERE cp = ANY(%s::text[]) AND ct = ANY(%s::text[]) AND cp || ' ' || ct <> ALL(%s::text[]))`, c.perms, c.types, c.pairs)
 }
 
 // publicArgs are the arguments of givingSQL's public check: the catalog's permissions, its types
@@ -138,7 +148,15 @@ func givingSQL(builtin, tenant, perm, resourceType string, custom bool, public *
 // search doesn't send them: with no custom role in it, or where no grant to the public gives p,
 // as Filter and Reachable then read none and Holders drops the public.
 func (a *Authorizer) publicArgs(p Permission, resourceType string, custom bool) []any {
-	if !custom || !a.publicGives(p, resourceType) {
+	if !a.publicGives(p, resourceType) {
+		return []any{nil, nil, nil}
+	}
+	return a.catalogArgs(custom)
+}
+
+// catalogArgs are the arguments of privilegedOnly, NULL without custom, where it can't matter.
+func (a *Authorizer) catalogArgs(custom bool) []any {
+	if !custom {
 		return []any{nil, nil, nil}
 	}
 	return []any{a.catalogPermissions, a.catalogTypes, a.publicPairs}
@@ -295,6 +313,11 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 		// however it was defined. Derived as a read derives it.
 		after, widened := a.redefining(au.roles.custom, r)
 		r.Privileged = after.Privileged
+		if was := au.roles.custom[r.ID]; r.Privileged && !was.Privileged {
+			if err := heldStrongly(ctx, tx, tenant, r.ID, a.cfg.Now()); err != nil {
+				return ChangeEvent{}, err
+			}
+		}
 		// The grants it widens are the ones the host was asked about, of the roles as it was asked
 		// about them, or one was made or a role redefined meanwhile.
 		need, err := a.revalidations(ctx, tx, tenant, widened)
