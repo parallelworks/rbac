@@ -88,14 +88,25 @@ func TestAsOfReadsATenantAsItWas(t *testing.T) {
 }
 
 func TestAsOfChangesNothing(t *testing.T) {
-	h := setup(t)
+	asked := 0
+	h := setup(t, func(c *rbac.Config) {
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			asked++
+			return validate(ctx, q, in)
+		}
+	})
 	ctx := t.Context()
 	owner := h.as(t, "owner")
 	at := dbNow(t, h)
 	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "later"))
+	asked = 0
 	if err := h.authz.AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
 		if err := a.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}}}); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("Apply as of a time: %v", err)
+		}
+		if asked != 0 {
+			t.Errorf("the host was asked about a change as of a time %d times", asked)
 		}
 		if _, err := a.DeleteExpired(ctx); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("DeleteExpired as of a time: %v", err)
@@ -122,6 +133,9 @@ func TestAsOfChangesNothing(t *testing.T) {
 	}
 	if got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{{Kind: rbac.User, ID: "u"}}}); err != nil || len(got) != 0 {
 		t.Fatalf("Grants = %+v, %v", got, err)
+	}
+	if err := h.authz.AsOf(ctx, "", at, func(*rbac.Authorizer) error { return nil }); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("AsOf with no tenant: %v", err)
 	}
 }
 

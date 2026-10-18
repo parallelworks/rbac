@@ -124,6 +124,9 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	b := *a
 	b.db, b.asOf = tx, true
 	b.cfg.Now = func() time.Time { return at }
+	// A change is refused before its transaction, so the host is never asked about one that can't
+	// be made.
+	b.cfg.ValidateGrant = func(context.Context, DB, GrantInput) error { return b.writable() }
 	return read(&b)
 }
 
