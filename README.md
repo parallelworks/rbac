@@ -78,7 +78,9 @@ another store. Both search one tenant, and count only unconditional grants:
 
 - **Custom roles:** a tenant defines its own with `SetRole`, ids starting `custom.`, from the
   permissions and types the built-in roles use. Defining one needs `rbac.DefineRoles` on the
-  tenant and everything the role gives across it. `DeleteRole` removes one with its grants;
+  tenant and everything the role gives across it. Redefining one so that its grants give more
+  asks `ValidateGrant` about each grant and eligibility it widens, as the role will be, and the
+  host refusing one refuses the redefinition. `DeleteRole` removes one with its grants;
   `Roles` lists the built-in and custom roles a scope type takes. Custom roles follow the
   catalog: one gives only what the catalog still has, and is privileged when it gives or hands out
   what privileged roles do.

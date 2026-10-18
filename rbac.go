@@ -488,12 +488,12 @@ type Config struct {
 	// identity or group the tenant doesn't let in, such as one from another tenant; to the public
 	// where the host doesn't allow public access; of a role a principal's kind may not hold, such
 	// as a privileged one for a guest; or one this actor may not give this principal. It is asked
-	// about every grant Apply, Import and Activate make, and every eligibility SetEligibility sets,
-	// once each is otherwise valid; the change's InvalidError for it wraps the error, so
-	// errors.Is and errors.As find the host's own in it. Any other error fails the change as it
-	// is. q is what the change runs on, so under WithTx it sees a member added earlier in the
-	// transaction. Required: a grant to a principal the tenant doesn't let in must never be
-	// stored.
+	// about every grant Apply, Import and Activate make, every eligibility SetEligibility sets, and
+	// every grant and eligibility that SetRole redefining a custom role makes give more, once each
+	// is otherwise valid; the change's InvalidError for it wraps the error, so errors.Is and
+	// errors.As find the host's own in it. Any other error fails the change as it is. q is what
+	// the change runs on, so under WithTx it sees a member added earlier in the transaction.
+	// Required: a grant to a principal the tenant doesn't let in must never be stored.
 	ValidateGrant func(ctx context.Context, q DB, in GrantInput) error
 	Constraints   []Constraint
 	// Permissions are every permission the host checks, whether or not a role gives it, so that a
@@ -686,10 +686,10 @@ type GrantInput struct {
 	Tenant  string
 	Scope   Scope
 	Binding Binding
-	// Role is what the grant gives: the role as defined now.
+	// Role is what the grant gives: the role as defined now, or with ViaRedefinition, as it will be.
 	Role RoleDefinition
-	// Actor is who makes it: the subject changing grants, setting an eligibility or activating, or
-	// Import's actor.
+	// Actor is who makes it: the subject changing grants, setting an eligibility, activating or
+	// redefining the role, or Import's actor.
 	Actor Subject
 	// Via is how it is made.
 	Via Via
@@ -699,12 +699,16 @@ type GrantInput struct {
 type Via string
 
 // The ways a grant is made: by Apply, Import or Activate, or as an eligibility SetEligibility
-// sets, which is the grant activating it would make.
+// sets, which is the grant activating it would make. ViaRedefinition is a grant or eligibility
+// that exists, which SetRole redefining a custom role makes give more, its own or one handing it
+// out: an eligibility's binding is the grant activating it would make, as with ViaEligibility,
+// and has no ID.
 const (
-	ViaApply       Via = "apply"
-	ViaImport      Via = "import"
-	ViaEligibility Via = "eligibility"
-	ViaActivation  Via = "activation"
+	ViaApply        Via = "apply"
+	ViaImport       Via = "import"
+	ViaEligibility  Via = "eligibility"
+	ViaActivation   Via = "activation"
+	ViaRedefinition Via = "redefinition"
 )
 
 // denied returns the name of the first constraint that removes in.Permission, or "".

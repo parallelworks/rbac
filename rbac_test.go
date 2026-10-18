@@ -3322,6 +3322,369 @@ func TestARoleHandingOutOneThatBecomesPrivilegedIsPrivileged(t *testing.T) {
 	}
 }
 
+func TestRedefiningARoleAsksTheHostAboutItsGrants(t *testing.T) {
+	robot := rbac.PrincipalKind("service_account")
+	var asked []rbac.GrantInput
+	var meanwhile func(ctx context.Context, q rbac.DB) error
+	h := setup(t, func(c *rbac.Config) {
+		c.PrincipalKinds = []rbac.PrincipalKind{robot}
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			asked = append(asked, in)
+			if meanwhile != nil {
+				do := meanwhile
+				meanwhile = nil
+				if err := do(ctx, q); err != nil {
+					return err
+				}
+			}
+			// A host's policy: service accounts and the public hold no privileged role.
+			if (in.Binding.Principal.Kind == robot || in.Binding.Principal.Kind == rbac.Public) && in.Role.Privileged {
+				return fmt.Errorf("%w: service accounts and the public hold no privileged role", rbac.ErrInvalid)
+			}
+			return nil
+		}
+	})
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	bot := rbac.Subject{Principal: rbac.Principal{Kind: robot, ID: "ci"}, Tenants: []string{"t1"}}
+	op := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
+	// Hands op out on workspaces, and gives nothing privileged while op doesn't.
+	lead := rbac.RoleDefinition{ID: "custom.lead", Permissions: []rbac.Permission{"workspace:view", "workspace:grant"}, ResourceTypes: []string{"workspace"}, GrantableRoles: []rbac.Role{op.ID}}
+	h.seed(t, grant(rbac.TenantRoot("t1"), "workspace.admin", rbac.User, "admin"))
+	for _, r := range []rbac.RoleDefinition{op, lead} {
+		if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.authz.Apply(ctx, admin, cluster, rbac.Change{Grant: []rbac.Binding{{Role: op.ID, Principal: bot.Principal}, {Role: op.ID, Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.SetEligibility(ctx, admin, cluster, rbac.Eligibility{Role: op.ID, Principal: rbac.Principal{Kind: rbac.User, ID: "e"}, MaxDuration: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	// Giving root through op would give it to the service account, which the host refuses.
+	asked = nil
+	widened := op
+	widened.Permissions = []rbac.Permission{view, login, root}
+	err := h.authz.SetRole(ctx, admin, "t1", widened)
+	var ie *rbac.InvalidError
+	if !errors.As(err, &ie) || ie.Binding.Principal != bot.Principal {
+		t.Fatalf("widening a role a service account holds to give root: %v", err)
+	}
+	if allowed(t, h, bot, root, cluster) {
+		t.Fatal("a refused redefinition gave root")
+	}
+	// Each grant and the eligibility, as the role will be.
+	if len(asked) != 3 || slices.ContainsFunc(asked, func(in rbac.GrantInput) bool {
+		return in.Via != rbac.ViaRedefinition || !in.Role.Privileged || !slices.Contains(in.Role.Permissions, root) || in.Actor.Principal != admin.Principal
+	}) {
+		t.Fatalf("asked = %+v", asked)
+	}
+	// Renaming it gives nothing more, so asks about nothing.
+	asked = nil
+	renamed := op
+	renamed.Name = "Operator"
+	if err := h.authz.SetRole(ctx, admin, "t1", renamed); err != nil || len(asked) != 0 {
+		t.Fatalf("renaming: %v, asked %+v", err, asked)
+	}
+	// A role that hands op out becomes privileged once op gives root: granted to the service
+	// account, that refuses it too.
+	if err := h.authz.Apply(ctx, admin, cluster, rbac.Change{Revoke: []rbac.Binding{{Role: op.ID, Principal: bot.Principal}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.Apply(ctx, admin, workspace, rbac.Change{Grant: []rbac.Binding{{Role: lead.ID, Principal: bot.Principal}}}); err != nil {
+		t.Fatal(err)
+	}
+	asked = nil
+	if err := h.authz.SetRole(ctx, admin, "t1", widened); !errors.As(err, &ie) || ie.Binding.Role != lead.ID {
+		t.Fatalf("widening a role one a service account holds hands out: %v", err)
+	}
+	if !slices.ContainsFunc(asked, func(in rbac.GrantInput) bool { return in.Binding.Role == lead.ID && in.Role.Privileged }) {
+		t.Fatalf("asked = %+v", asked)
+	}
+	if err := h.authz.Apply(ctx, admin, workspace, rbac.Change{Revoke: []rbac.Binding{{Role: lead.ID, Principal: bot.Principal}}}); err != nil {
+		t.Fatal(err)
+	}
+	// A grant made while the redefinition waits wasn't asked about, so it refuses the redefinition,
+	// to be tried again.
+	meanwhile = func(ctx context.Context, q rbac.DB) error {
+		_, err := q.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			VALUES ('t1', 'cluster', 'c1', 'service_account', 'ci', 'custom.op')`)
+		return err
+	}
+	if err := h.authz.SetRole(ctx, admin, "t1", widened); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("a grant made meanwhile: %v", err)
+	}
+	if err := h.authz.SetRole(ctx, admin, "t1", widened); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("tried again: %v", err)
+	}
+	if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_grants WHERE principal = 'service_account:ci'`); err != nil {
+		t.Fatal(err)
+	}
+	// So does a role handing op out redefined meanwhile: the host was asked about its grants as it
+	// was, not as it now is.
+	if err := h.authz.Apply(ctx, admin, workspace, rbac.Change{Grant: []rbac.Binding{{Role: lead.ID, Principal: rbac.Principal{Kind: rbac.User, ID: "l"}}}}); err != nil {
+		t.Fatal(err)
+	}
+	meanwhile = func(ctx context.Context, _ rbac.DB) error {
+		more := lead
+		more.GrantableRoles = []rbac.Role{op.ID, "cluster.login"}
+		return h.authz.SetRole(ctx, admin, "t1", more)
+	}
+	if err := h.authz.SetRole(ctx, admin, "t1", widened); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("a role handing it out redefined meanwhile: %v", err)
+	}
+	if err := h.authz.SetRole(ctx, admin, "t1", widened); err != nil {
+		t.Fatalf("widening a role only those the host lets hold root hold: %v", err)
+	}
+	if !allowed(t, h, user("u"), root, cluster) {
+		t.Fatal("the redefinition should give what it gives")
+	}
+	// Narrowing it gives nothing more, so asks about nothing, even a grant the host would refuse
+	// now, such as one made before its policy.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'c1', 'service_account', 'ci', 'custom.op')`); err != nil {
+		t.Fatal(err)
+	}
+	asked = nil
+	narrowed := widened
+	narrowed.Permissions = []rbac.Permission{view, root}
+	if err := h.authz.SetRole(ctx, admin, "t1", narrowed); err != nil || len(asked) != 0 {
+		t.Fatalf("narrowing: %v, asked %+v", err, asked)
+	}
+	// A grant to the public gives nothing once its role isn't public, so making a public role
+	// privileged asks nothing about it.
+	pub := rbac.RoleDefinition{ID: "custom.pub", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
+	if err := h.authz.SetRole(ctx, admin, "t1", pub); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.Apply(ctx, admin, cluster, rbac.Change{Grant: []rbac.Binding{{Role: pub.ID, Principal: rbac.Principal{Kind: rbac.Public}}}}); err != nil {
+		t.Fatal(err)
+	}
+	asked = nil
+	pub.Public, pub.Permissions = false, []rbac.Permission{view, root}
+	if err := h.authz.SetRole(ctx, admin, "t1", pub); err != nil || len(asked) != 0 {
+		t.Fatalf("making a public role privileged: %v, asked %+v", err, asked)
+	}
+	if allowed(t, h, rbac.Subject{}, view, cluster) {
+		t.Fatal("a grant to the public of a role no longer public gave access")
+	}
+}
+
+func TestAGrantAskedAboutBeforeItsRoleIsRedefinedIsTriedAgain(t *testing.T) {
+	robot := rbac.PrincipalKind("service_account")
+	var h *harness
+	var admin rbac.Subject
+	// widenOn is how the grant is made that, once the host was asked about it, finds its role
+	// widened to give root before its transaction: as another change would commit meanwhile.
+	var widenOn rbac.Via
+	op := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
+	// Hands op out, so it becomes privileged once op gives root.
+	lead := rbac.RoleDefinition{ID: "custom.lead", Permissions: []rbac.Permission{"workspace:view", "workspace:grant"}, ResourceTypes: []string{"workspace"}, GrantableRoles: []rbac.Role{op.ID}}
+	h = setup(t, func(c *rbac.Config) {
+		c.PrincipalKinds = []rbac.PrincipalKind{robot}
+		c.ValidateGrant = func(ctx context.Context, _ rbac.DB, in rbac.GrantInput) error {
+			if in.Binding.Principal.Kind == robot && in.Role.Privileged {
+				return fmt.Errorf("%w: service accounts hold no privileged role", rbac.ErrInvalid)
+			}
+			if in.Via == widenOn {
+				widenOn = ""
+				widened := op
+				widened.Permissions = []rbac.Permission{view, login, root}
+				return h.authz.SetRole(ctx, admin, "t1", widened)
+			}
+			return nil
+		}
+	})
+	ctx := t.Context()
+	admin = roleAdmin(t, h)
+	h.seed(t, grant(rbac.TenantRoot("t1"), "workspace.admin", rbac.User, "admin"))
+	for _, r := range []rbac.RoleDefinition{op, lead} {
+		if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Eligible through a group, which the host lets hold a privileged role, so redefining isn't
+	// refused for the eligibility; activating, the service account is.
+	bot := rbac.Subject{Principal: rbac.Principal{Kind: robot, ID: "ci"}, Groups: []string{"bots"}, Tenants: []string{"t1"}}
+	// op itself, and lead, whose own definition doesn't change but which becomes privileged.
+	for _, granted := range []struct {
+		role rbac.Role
+		on   rbac.Resource
+	}{{op.ID, cluster}, {lead.ID, workspace}} {
+		b := rbac.Binding{Role: granted.role, Principal: bot.Principal}
+		for _, via := range []rbac.Via{rbac.ViaApply, rbac.ViaImport, rbac.ViaActivation} {
+			if err := h.authz.SetRole(ctx, admin, "t1", op); err != nil {
+				t.Fatal(err)
+			}
+			if via == rbac.ViaActivation {
+				if err := h.authz.SetEligibility(ctx, admin, granted.on, rbac.Eligibility{Role: granted.role, Principal: rbac.Principal{Kind: rbac.Group, ID: "bots"}, MaxDuration: time.Hour}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			grantOne := func() error {
+				switch via {
+				case rbac.ViaApply:
+					return h.authz.Apply(ctx, admin, granted.on, rbac.Change{Grant: []rbac.Binding{b}})
+				case rbac.ViaImport:
+					return h.authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: granted.on.Scope(), Binding: b}})
+				default:
+					_, err := h.authz.Activate(ctx, bot, granted.on, rbac.Activation{Role: granted.role, Duration: time.Hour, Justification: "deploy"})
+					return err
+				}
+			}
+			widenOn = via
+			if err := grantOne(); !errors.Is(err, rbac.ErrConflict) {
+				t.Fatalf("%s of %s once widened since the host was asked: %v", via, granted.role, err)
+			}
+			if held, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{bot.Principal}}); err != nil || len(held) > 0 {
+				t.Fatalf("%s of %s stored a grant the host was never asked about as it gives: %v, %+v", via, granted.role, err, held)
+			}
+			if err := grantOne(); !errors.Is(err, rbac.ErrInvalid) {
+				t.Fatalf("%s of %s tried again: %v", via, granted.role, err)
+			}
+		}
+	}
+}
+
+func TestRedefiningARoleAsksAboutEachWayItsGrantsGiveMore(t *testing.T) {
+	var asked []rbac.GrantInput
+	var meanwhile func(ctx context.Context) error
+	h := setup(t, func(c *rbac.Config) {
+		// Gives view on workspaces too, so a custom role giving it can be for both types.
+		c.Catalog = append(slices.Clone(c.Catalog), rbac.RoleDefinition{ID: "multi.view", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster", "workspace"}})
+		c.ValidateGrant = func(ctx context.Context, _ rbac.DB, in rbac.GrantInput) error {
+			asked = append(asked, in)
+			if meanwhile != nil {
+				do := meanwhile
+				meanwhile = nil
+				return do(ctx)
+			}
+			return nil
+		}
+	})
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	tenant := rbac.TenantRoot("t1")
+	h.seed(t, grant(tenant, "multi.view", rbac.User, "admin"), grant(tenant, "workspace.admin", rbac.User, "admin"))
+	// set defines r and returns whom the host was asked about.
+	set := func(r rbac.RoleDefinition) []rbac.Principal {
+		t.Helper()
+		asked = nil
+		if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
+			t.Fatalf("%s: %v", r.ID, err)
+		}
+		var whom []rbac.Principal
+		for _, in := range asked {
+			whom = append(whom, in.Binding.Principal)
+		}
+		return whom
+	}
+	give := func(on rbac.Resource, b rbac.Binding) {
+		t.Helper()
+		if err := h.authz.Apply(ctx, admin, on, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := func(what string, got []rbac.Principal, want ...rbac.Principal) {
+		t.Helper()
+		if !slices.Equal(got, want) {
+			t.Fatalf("%s asked about %+v, not %+v", what, got, want)
+		}
+	}
+	u := rbac.Principal{Kind: rbac.User, ID: "u"}
+
+	// More types: a grant on a workspace reaches the role's new type there.
+	op := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	set(op)
+	give(workspace, rbac.Binding{Role: op.ID, Principal: u})
+	op.ResourceTypes = []string{"cluster", "workspace"}
+	want("adding a type", set(op), u)
+	op.ResourceTypes = []string{"cluster"}
+	want("dropping a type", set(op))
+
+	// More permissions, asking about none of the grants that give nothing: one expired, and one to
+	// a kind the host doesn't declare.
+	brief := rbac.Principal{Kind: rbac.User, ID: "brief"}
+	give(cluster, rbac.Binding{Role: op.ID, Principal: brief, ExpiresAt: h.now.Add(time.Hour)})
+	h.now = h.now.Add(2 * time.Hour)
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'c1', 'gone', 'x', 'custom.op')`); err != nil {
+		t.Fatal(err)
+	}
+	op.Permissions = []rbac.Permission{view, login}
+	// A grant whose note changes while the redefinition waits isn't the one the host was asked about.
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.Apply(ctx, admin, workspace, rbac.Change{Grant: []rbac.Binding{{Role: op.ID, Principal: u, Note: "ticket"}}})
+	}
+	if err := h.authz.SetRole(ctx, admin, "t1", op); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("a grant's note changed meanwhile: %v", err)
+	}
+	want("adding a permission", set(op), u)
+
+	// Public: a grant to the public gives once its role is public again.
+	pub := rbac.RoleDefinition{ID: "custom.pub", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
+	set(pub)
+	give(cluster, rbac.Binding{Role: pub.ID, Principal: rbac.Principal{Kind: rbac.Public}})
+	pub.Public = false
+	want("making a role private", set(pub))
+	pub.Public = true
+	want("making a role public", set(pub), rbac.Principal{Kind: rbac.Public})
+
+	// A grant on a cluster gives nothing once its role isn't for clusters, so widening it asks
+	// nothing about that grant.
+	ws := rbac.RoleDefinition{ID: "custom.ws", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster", "workspace"}}
+	set(ws)
+	give(cluster, rbac.Binding{Role: ws.ID, Principal: rbac.Principal{Kind: rbac.User, ID: "v"}})
+	ws.ResourceTypes = []string{"workspace"}
+	set(ws)
+	ws.Public = true
+	want("widening a role not for the grant's scope", set(ws))
+
+	// Grantable roles: listing another, or none, which lets holders grant any role they hold.
+	g := rbac.Principal{Kind: rbac.User, ID: "g"}
+	granter := rbac.RoleDefinition{ID: "custom.granter", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.login"}}
+	set(granter)
+	give(cluster, rbac.Binding{Role: granter.ID, Principal: g})
+	granter.GrantableRoles = []rbac.Role{"cluster.login", op.ID}
+	want("listing another role", set(granter), g)
+	granter.GrantableRoles = []rbac.Role{"cluster.login"}
+	want("listing fewer roles", set(granter))
+	granter.GrantableRoles = nil
+	want("listing none", set(granter), g)
+}
+
+func TestARoleRenamedOrNarrowedWhileAGrantWaitsIsGranted(t *testing.T) {
+	op := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
+	var h *harness
+	var admin rbac.Subject
+	var meanwhile *rbac.RoleDefinition
+	h = setup(t, func(c *rbac.Config) {
+		c.ValidateGrant = func(ctx context.Context, _ rbac.DB, in rbac.GrantInput) error {
+			if r := meanwhile; r != nil && in.Via == rbac.ViaApply {
+				meanwhile = nil
+				return h.authz.SetRole(ctx, admin, "t1", *r)
+			}
+			return nil
+		}
+	})
+	ctx := t.Context()
+	admin = roleAdmin(t, h)
+	if err := h.authz.SetRole(ctx, admin, "t1", op); err != nil {
+		t.Fatal(err)
+	}
+	renamed, narrowed := op, op
+	renamed.Name = "Operator"
+	narrowed.Permissions = []rbac.Permission{view}
+	for i, r := range []rbac.RoleDefinition{renamed, narrowed} {
+		meanwhile = &r
+		b := rbac.Binding{Role: op.ID, Principal: rbac.Principal{Kind: rbac.User, ID: fmt.Sprint("u", i)}}
+		if err := h.authz.Apply(ctx, admin, cluster, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
+			t.Fatalf("granting a role %s meanwhile, which gives no more: %v", []string{"renamed", "narrowed"}[i], err)
+		}
+	}
+}
+
 func TestARoleHandingOutAPrivilegedOneIsPrivilegedHoweverItIsGranted(t *testing.T) {
 	seen := map[rbac.Via]bool{}
 	h := setup(t, func(c *rbac.Config) {
