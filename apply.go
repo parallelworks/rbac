@@ -742,6 +742,9 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 	if err := a.check(r); err != nil {
 		return nil, err
 	}
+	if err := a.scopeOf(r); err != nil {
+		return nil, err
+	}
 	if err := a.subject(s); err != nil {
 		return nil, err
 	}

@@ -23,8 +23,8 @@ type Decision struct {
 }
 
 // Authorize returns nil when the subject may do p to r, and otherwise an error matching
-// ErrDenied, or ErrInvalid for malformed input, as a permission no built-in role gives or a
-// resource type none is for, which can only be a mistake. Any error means no.
+// ErrDenied, or ErrInvalid for malformed input, such as a permission or resource type the host
+// doesn't check (Config.Permissions), which can only be a mistake. Any error means no.
 func (a *Authorizer) Authorize(ctx context.Context, s Subject, p Permission, r Resource) error {
 	d, err := a.decide(ctx, s, p, r, false)
 	if err != nil {
@@ -152,18 +152,27 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 	return d, nil
 }
 
-// askable returns why no role, built in or custom, could ever give p on a resource type: p is
-// malformed, or a permission no built-in role gives, or no built-in role is for the type, as a
-// custom role gives only what they give, on their types. Such a question is a typo, not a
-// refusal, so it is invalid, as SetRole and SetDeny find it.
+// askable returns why p on a resource type isn't something the host checks (Config.Permissions):
+// p is malformed or not a permission it has, or the type isn't one a built-in role or one of its
+// permissions is for. Such a question is a typo, not a refusal, so it is invalid, as SetRole and
+// SetDeny find one in a role or a deny.
 func (a *Authorizer) askable(p Permission, resourceType string) error {
 	switch {
 	case !p.Valid():
 		return fmt.Errorf("%w: permission %q is not `type:verb`", ErrInvalid, p)
-	case !a.permissions[p]:
-		return fmt.Errorf("%w: permission %q is not one any built-in role gives", ErrInvalid, p)
-	case !a.types[resourceType]:
-		return fmt.Errorf("%w: resource type %q is not one any built-in role is for", ErrInvalid, resourceType)
+	case !a.checked[p]:
+		return fmt.Errorf("%w: permission %q is not one the host checks", ErrInvalid, p)
+	case !a.checkedTypes[resourceType]:
+		return fmt.Errorf("%w: resource type %q is not one the host checks", ErrInvalid, resourceType)
+	}
+	return nil
+}
+
+// scopeOf returns why r's type is no scope the host has: not a resource type a check may name, a
+// container's or the tenant's, so nothing could be done to it or granted on it.
+func (a *Authorizer) scopeOf(r Resource) error {
+	if !a.checkedTypes[r.Type] && !a.contains(r.Type) {
+		return fmt.Errorf("%w: resource type %q is not one the host checks", ErrInvalid, r.Type)
 	}
 	return nil
 }
@@ -178,6 +187,9 @@ func gives(roles book, to Principal, id Role, p Permission, resourceType string)
 // Permissions lists what the subject may do to r, sorted: the AuthZEN action search.
 func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]Permission, error) {
 	if err := a.check(r); err != nil {
+		return nil, err
+	}
+	if err := a.scopeOf(r); err != nil {
 		return nil, err
 	}
 	if err := a.subject(s); err != nil {

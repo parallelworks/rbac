@@ -395,7 +395,8 @@ var (
 	// may not make.
 	ErrDenied = errors.New("rbac: denied")
 	// ErrInvalid is matched by malformed input: an unknown role, a principal outside the
-	// tenant, a scope a role can't be granted on.
+	// tenant, a scope a role can't be granted on, a check of a permission or resource type the
+	// host doesn't have (Config.Permissions).
 	ErrInvalid = errors.New("rbac: invalid")
 	// ErrConflict is matched by a change refused because another changed what it rests on while
 	// it waited, or that PostgreSQL refused for a race, as a deadlock between host transactions:
@@ -487,6 +488,12 @@ type Config struct {
 	// stored.
 	ValidateGrant func(ctx context.Context, q DB, in GrantInput) error
 	Constraints   []Constraint
+	// Permissions are every permission the host checks, whether or not a role gives it, so that a
+	// catalog leaving one out, as one an operator configures may, refuses it like any permission
+	// no grant gives. A check or search of a permission not among them, or of a resource type none
+	// of them nor any built-in role is for, is refused as invalid, as a typo, and New refuses a
+	// built-in role giving one. Empty, they are what the built-in roles give.
+	Permissions []Permission
 	// Attributes declares the attributes conditions read, so one misnamed or of another type is
 	// refused when a condition is stored; undeclared, any is read.
 	Attributes Attributes
@@ -515,6 +522,11 @@ type Authorizer struct {
 	// `type:*` may name.
 	permissionTypes map[string]bool
 	unprivileged    map[permissionOn]bool
+	// checked are the permissions the host checks (Config.Permissions), and checkedTypes the
+	// resource types a check may name: those the built-in roles are for and those checked
+	// permissions are for.
+	checked      map[Permission]bool
+	checkedTypes map[string]bool
 	// The same, sorted, as searches pass them to SQL. publicPairs are the unprivileged pairs, as
 	// `permission type`, of permissions that don't change access: all a public role gives as
 	// Authorizer.current reads it.
@@ -601,6 +613,10 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 	}
 	slices.Sort(permList)
 	slices.Sort(pairs)
+	checked, checkedTypes, err := vocabulary(cfg.Permissions, perms, resourceTypes)
+	if err != nil {
+		return nil, err
+	}
 	conds, err := newConditions(cfg.Attributes)
 	if err != nil {
 		return nil, err
@@ -609,8 +625,35 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 		db: db, cfg: cfg, roles: roles, containers: containers, containerTypes: slices.Sorted(maps.Keys(containers)),
 		kinds: kinds, permissions: perms, types: resourceTypes, permissionTypes: permissionTypes, unprivileged: unprivileged,
 		catalogPermissions: permList, catalogTypes: slices.Sorted(maps.Keys(resourceTypes)), publicPairs: pairs,
-		conds: conds,
+		checked: checked, checkedTypes: checkedTypes, conds: conds,
 	}, nil
+}
+
+// vocabulary returns the permissions a host checks, declared or else what the built-in roles
+// give, and the resource types a check may name, given what the built-in roles give and are for.
+// It refuses a built-in role giving a permission the host declares it never checks.
+func vocabulary(declared []Permission, given map[Permission]bool, roleTypes map[string]bool) (map[Permission]bool, map[string]bool, error) {
+	checked := maps.Clone(given)
+	if len(declared) > 0 {
+		checked = map[Permission]bool{}
+		for _, p := range declared {
+			if !p.Valid() {
+				return nil, nil, fmt.Errorf("rbac: permission %q is not `type:verb`", p)
+			}
+			checked[p] = true
+		}
+		for _, p := range slices.Sorted(maps.Keys(given)) {
+			if !checked[p] {
+				return nil, nil, fmt.Errorf("rbac: a built-in role gives %q, which Config.Permissions doesn't list", p)
+			}
+		}
+	}
+	types := maps.Clone(roleTypes)
+	for p := range checked {
+		t, _ := p.parts()
+		types[t] = true
+	}
+	return checked, types, nil
 }
 
 // WithTx returns an Authorizer that runs on tx, so its changes commit or roll back with the
