@@ -244,7 +244,8 @@ func canonical(r RoleDefinition) RoleDefinition {
 // any refuses the redefinition, as granting the role so would be refused. Narrowing a role asks
 // about none. One made while this waited for the tenant refuses it too, to be tried again, as the
 // host wasn't asked about it.
-func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, r RoleDefinition) error {
+func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, r RoleDefinition) (err error) {
+	defer a.refused(ctx, &err, tenant, actor.Principal, "SetRole")
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -368,7 +369,8 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 // out through it. It refuses a role granted from a source the host owns (Config.Sources), whose
 // grants only the host removes. Deleting a role that doesn't exist does nothing; one changed while the
 // deletion waited for the tenant is refused, as in SetRole.
-func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant string, id Role) error {
+func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant string, id Role) (err error) {
+	defer a.refused(ctx, &err, tenant, actor.Principal, "DeleteRole")
 	if tenant == "" || !isCustom(id) {
 		return fmt.Errorf("%w: only a tenant's custom role can be deleted", ErrInvalid)
 	}

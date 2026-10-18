@@ -876,3 +876,106 @@ func TestAnActivationEndedAheadOfTheDatabasesClockIsExtended(t *testing.T) {
 		t.Fatalf("recorded %v, %v", got, err)
 	}
 }
+
+func TestEveryRefusedChangeIsReported(t *testing.T) {
+	var refused []rbac.Refusal
+	h := setup(t, func(c *rbac.Config) {
+		c.OnRefused = func(_ context.Context, r rbac.Refusal) { refused = append(refused, r) }
+	})
+	ctx := rbac.WithAudit(t.Context(), rbac.Audit{Request: "req-1"})
+	actor := h.as(t, "actor")
+	none := rbac.Resource{}
+	// Each refused as invalid, for want of a tenant or a resource.
+	for _, c := range []struct {
+		how string
+		do  func() error
+	}{
+		{"Apply", func() error { return h.authz.Apply(ctx, actor, none, rbac.Change{}) }},
+		{"Import", func() error { return h.authz.Import(ctx, host, "", nil) }},
+		{"DeleteGrants", func() error { return h.authz.DeleteGrants(ctx, host, "", nil) }},
+		{"DeleteScope", func() error { return h.authz.DeleteScope(ctx, host, "", cluster.Scope()) }},
+		{"DeleteScopes", func() error { return h.authz.DeleteScopes(ctx, host, "", []rbac.Scope{cluster.Scope()}) }},
+		{"DeletePrincipal", func() error { return h.authz.DeletePrincipal(ctx, host, "", actor.Principal) }},
+		{"DeletePrincipalEverywhere", func() error {
+			return h.authz.DeletePrincipalEverywhere(ctx, host, rbac.TenantMembers("t1"))
+		}},
+		{"DeleteTenant", func() error { return h.authz.DeleteTenant(ctx, host, "") }},
+		{"DeleteExpired", func() error {
+			_, err := h.authz.DeleteExpired(rbac.WithAudit(ctx, rbac.Audit{OnBehalfOf: rbac.TenantMembers("t1")}))
+			return err
+		}},
+		{"SetMemberships", func() error { return h.authz.SetMemberships(ctx, host, "", nil) }},
+		{"SetGroup", func() error { return h.authz.SetGroup(ctx, actor, "", rbac.GroupDefinition{}) }},
+		{"ImportGroups", func() error { return h.authz.ImportGroups(ctx, host, "", nil) }},
+		{"DeleteGroup", func() error { return h.authz.DeleteGroup(ctx, actor, "", "g") }},
+		{"DeleteGroups", func() error { return h.authz.DeleteGroups(ctx, host, "", []string{"g"}) }},
+		{"ImportMembers", func() error { return h.authz.ImportMembers(ctx, host, "", nil) }},
+		{"ChangeMembers", func() error { return h.authz.ChangeMembers(ctx, actor, "", nil, nil) }},
+		{"DeleteMembers", func() error { return h.authz.DeleteMembers(ctx, host, "", nil) }},
+		{"SetRole", func() error { return h.authz.SetRole(ctx, actor, "", rbac.RoleDefinition{}) }},
+		{"DeleteRole", func() error { return h.authz.DeleteRole(ctx, actor, "", "custom.x") }},
+		{"SetDeny", func() error { return h.authz.SetDeny(ctx, actor, none, rbac.Deny{}) }},
+		{"DeleteDeny", func() error { return h.authz.DeleteDeny(ctx, actor, none, "d") }},
+		{"SetEligibility", func() error { return h.authz.SetEligibility(ctx, actor, none, rbac.Eligibility{}) }},
+		{"DeleteEligibility", func() error { return h.authz.DeleteEligibility(ctx, actor, none, "cluster.sudo", actor.Principal) }},
+		{"Activate", func() error {
+			_, err := h.authz.Activate(ctx, actor, none, rbac.Activation{})
+			return err
+		}},
+		{"Deactivate", func() error { return h.authz.Deactivate(ctx, actor, none, "cluster.sudo") }},
+	} {
+		refused = nil
+		if err := c.do(); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s: %v", c.how, err)
+			continue
+		}
+		if len(refused) != 1 || refused[0].How != c.how || !errors.Is(refused[0].Err, rbac.ErrInvalid) || refused[0].At.IsZero() {
+			t.Errorf("%s reported %+v", c.how, refused)
+		}
+	}
+	// One denied is too, with its actor and the host's audit; one made isn't.
+	refused = nil
+	grant := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: actor.Principal}}}
+	if err := h.authz.Apply(ctx, actor, cluster, grant); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatal(err)
+	}
+	if len(refused) != 1 || refused[0].Actor != actor.Principal || refused[0].Tenant != "t1" || refused[0].Audit.Request != "req-1" ||
+		!errors.Is(refused[0].Err, rbac.ErrDenied) {
+		t.Fatalf("reported %+v", refused)
+	}
+	refused = nil
+	owner := h.as(t, "owner")
+	if err := h.authz.Apply(ctx, owner, cluster, grant); err != nil || len(refused) != 0 {
+		t.Fatalf("a change made: %v, reported %+v", err, refused)
+	}
+	// Nor is one that failed for another reason, as the host's lookup failing.
+	unreachable := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "unreachable"}}}}
+	if err := h.authz.Apply(ctx, owner, cluster, unreachable); !errors.Is(err, errLookup) || len(refused) != 0 {
+		t.Fatalf("a change failed: %v, reported %+v", err, refused)
+	}
+}
+
+func TestAChangeAsOfATimeIsNotReportedRefused(t *testing.T) {
+	var refused []rbac.Refusal
+	h := setup(t, func(c *rbac.Config) {
+		c.OnRefused = func(_ context.Context, r rbac.Refusal) { refused = append(refused, r) }
+	})
+	ctx := t.Context()
+	owner, actor := h.as(t, "owner"), h.as(t, "actor")
+	grant := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: actor.Principal}}}
+	// Refused as reading the past, whether the actor could make it then or not: no actor's attempt.
+	if err := h.authz.AsOf(ctx, "t1", dbNow(t, h), func(a *rbac.Authorizer) error {
+		if err := a.Apply(ctx, owner, cluster, grant); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("Apply by the owner: %v", err)
+		}
+		if err := a.Apply(ctx, actor, cluster, grant); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("Apply by another: %v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(refused) != 0 {
+		t.Fatalf("reported %+v", refused)
+	}
+}

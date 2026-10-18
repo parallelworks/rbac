@@ -181,11 +181,17 @@ holds, and history is exported again from the start, kept apart from the last ex
 history with physical backups and replicas; a logical dump restored into another cluster numbers
 its transactions anew.
 
+A change refused, as `ErrDenied` or `ErrInvalid`, writes nothing, so history doesn't record it:
+`Config.OnRefused` is told of each, with its actor, the call and the host's audit, to record the
+failed attempt on a connection of the host's own, which keeps it when a host transaction the
+change was made in (`WithTx`) rolls back.
+
 `AsOf(ctx, tenant, at, read)` reads a tenant as it was at a time, from its history: every check,
 list and search the read makes answers as it would have then, with the catalog as it is now, as
 for an access review of a past date. A change counts from when its transaction began, and none
-can be made through it. It orders a row's changes by their ids in `rbac_history`, which sessions
-take out of order once that table's id sequence caches more than one, so `AsOf` refuses that.
+can be made through it: one tried is no actor's attempt, and `Config.OnRefused` isn't told of
+it. It orders a row's changes by their ids in `rbac_history`, which sessions take out of order
+once that table's id sequence caches more than one, so `AsOf` refuses that.
 
 A role that owns a table can change it whatever its triggers say, and a schema's owner can drop
 any table in it. So that the application's database role can't rewrite history or write around

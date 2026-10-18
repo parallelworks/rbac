@@ -143,7 +143,8 @@ func (a *Authorizer) checkMembership(m Membership, now time.Time) error {
 // It reports the memberships it set or changed. An identity whose membership had ended joins again
 // in none of the groups it was in, whether or not DeleteExpired has run since, as a membership
 // made by actor now.
-func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant string, ms []Membership) error {
+func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant string, ms []Membership) (err error) {
+	defer a.refused(ctx, &err, tenant, actor, "SetMemberships")
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -282,7 +283,8 @@ func checkGroup(g GroupDefinition) error {
 // SetGroup creates a group in a tenant, or renames or redescribes one, as actor, who needs
 // ManageGroups on the tenant, not removed by a constraint. A group from a source the host owns
 // (Config.Sources) only the host changes, with ImportGroups.
-func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string, g GroupDefinition) error {
+func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string, g GroupDefinition) (err error) {
+	defer a.refused(ctx, &err, tenant, actor.Principal, "SetGroup")
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -317,7 +319,8 @@ func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string,
 
 // ImportGroups creates groups in a tenant or replaces them, as actor: the host's own write, as for
 // a directory it syncs from, without the checks SetGroup makes of an actor.
-func (a *Authorizer) ImportGroups(ctx context.Context, actor Principal, tenant string, groups []GroupDefinition) error {
+func (a *Authorizer) ImportGroups(ctx context.Context, actor Principal, tenant string, groups []GroupDefinition) (err error) {
+	defer a.refused(ctx, &err, tenant, actor, "ImportGroups")
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -411,7 +414,8 @@ func privilegedGroup(ctx context.Context, q DB, tenant, id string) (exists, priv
 // activations: deleting one never changes access as a side effect. It refuses one from a source
 // the host owns, in a group from one, or with members, a place in a group or grants on it from
 // one. Deleting a group that doesn't exist does nothing.
-func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id string) error {
+func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id string) (err error) {
+	defer a.refused(ctx, &err, tenant, actor.Principal, "DeleteGroup")
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -497,7 +501,8 @@ func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string
 // syncs from. With each go its members, its place in other groups, its grants and eligibilities,
 // and its place in denies and among approvers: an eligibility only the groups approve goes too,
 // rather than activate without approval.
-func (a *Authorizer) DeleteGroups(ctx context.Context, actor Principal, tenant string, ids []string) error {
+func (a *Authorizer) DeleteGroups(ctx context.Context, actor Principal, tenant string, ids []string) (err error) {
+	defer a.refused(ctx, &err, tenant, actor, "DeleteGroups")
 	if len(ids) > MaxBindings {
 		return fmt.Errorf("%w: a deletion names at most %d groups", ErrInvalid, MaxBindings)
 	}
@@ -693,7 +698,8 @@ func (a *Authorizer) checkMember(m Member, now time.Time) error {
 // itself, nor a chain of more than MaxGroupDepth groups. Config.ValidateGrant is asked about each
 // privileged grant and eligibility of a privileged group for each identity added to it, as with
 // ChangeMembers.
-func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant string, members []Member) error {
+func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant string, members []Member) (err error) {
+	defer a.refused(ctx, &err, tenant, actor, "ImportMembers")
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -881,7 +887,8 @@ func (a *Authorizer) join(ctx context.Context, tx pgx.Tx, tenant string, actor P
 // that identity's. Removing someone from a group a deny names, or adding them to one it exempts,
 // lifts that deny for them, whatever it removes. Members from a source the host owns, and the
 // members of a group from one, only the host changes, and what ImportMembers refuses, this does.
-func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant string, add, remove []Member) error {
+func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant string, add, remove []Member) (err error) {
+	defer a.refused(ctx, &err, tenant, actor.Principal, "ChangeMembers")
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -1203,7 +1210,8 @@ const nestingDepths = `
 
 // DeleteMembers removes members from a tenant's groups, each by its group, principal and source,
 // as actor: the host's own write, as for a directory it syncs from.
-func (a *Authorizer) DeleteMembers(ctx context.Context, actor Principal, tenant string, members []Member) error {
+func (a *Authorizer) DeleteMembers(ctx context.Context, actor Principal, tenant string, members []Member) (err error) {
+	defer a.refused(ctx, &err, tenant, actor, "DeleteMembers")
 	if tenant == "" {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}

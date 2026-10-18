@@ -80,7 +80,8 @@ func (a *Authorizer) checkEligibility(e Eligibility) error {
 // SetEligibility makes a principal eligible to activate a role on a scope, on, or changes how, as
 // actor, who needs what granting the role there unconditionally would: an eligibility is a grant
 // to come. The groups it names, eligible or approving, and a group it is on, are the tenant's.
-func (a *Authorizer) SetEligibility(ctx context.Context, actor Subject, on Resource, e Eligibility) error {
+func (a *Authorizer) SetEligibility(ctx context.Context, actor Subject, on Resource, e Eligibility) (err error) {
+	defer a.refused(ctx, &err, on.Tenant, actor.Principal, "SetEligibility")
 	if err := a.check(on); err != nil {
 		return err
 	}
@@ -118,7 +119,8 @@ func (a *Authorizer) SetEligibility(ctx context.Context, actor Subject, on Resou
 
 // DeleteEligibility ends a principal's eligibility to activate a role on a scope, as actor, who
 // needs what revoking the role there would. Grants activated from it keep their own ends.
-func (a *Authorizer) DeleteEligibility(ctx context.Context, actor Subject, on Resource, role Role, p Principal) error {
+func (a *Authorizer) DeleteEligibility(ctx context.Context, actor Subject, on Resource, role Role, p Principal) (err error) {
+	defer a.refused(ctx, &err, on.Tenant, actor.Principal, "DeleteEligibility")
 	if err := a.check(on); err != nil {
 		return err
 	}
@@ -161,7 +163,8 @@ type Activation struct {
 // type stops it, and Config.ValidateGrant is asked about it, as about any grant. Where the
 // eligibility names approvers, the host's approval flow activates for s once one approves,
 // passing act.Approver and, in ctx, the request s made (WithRequest), which Requires reads.
-func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act Activation) (Grant, error) {
+func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act Activation) (g Grant, err error) {
+	defer a.refused(ctx, &err, on.Tenant, s.Principal, "Activate")
 	if err := a.check(on); err != nil {
 		return Grant{}, err
 	}
@@ -263,7 +266,8 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 
 // Deactivate ends s's activations of a role on a scope, on, early, as when the work is done. It
 // needs no permission, and no constraint stops it: s gives up only access it activated.
-func (a *Authorizer) Deactivate(ctx context.Context, s Subject, on Resource, role Role) error {
+func (a *Authorizer) Deactivate(ctx context.Context, s Subject, on Resource, role Role) (err error) {
+	defer a.refused(ctx, &err, on.Tenant, s.Principal, "Deactivate")
 	if err := a.check(on); err != nil {
 		return err
 	}
