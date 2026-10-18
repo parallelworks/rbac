@@ -170,7 +170,8 @@ and a record can be read twice, so dedupe on `Record.ID`.
 
 A role that owns a table can change it whatever its triggers say. So the application's database
 role can't rewrite history, transfer `rbac_history` and the function `rbac_record` to a role of
-their own after migrating, and leave the application `SELECT` on `rbac_history`.
+their own after migrating, and leave the application `SELECT` on `rbac_history`. A later
+migration that changes them runs as their owner.
 
 ## Running it
 
