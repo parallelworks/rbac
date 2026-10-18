@@ -334,6 +334,13 @@ func (a *Authorizer) mayDeny(ctx context.Context, actor Subject, on Resource) er
 	if name != "" {
 		return &DeniedError{Permission: perm, Scope: on.Scope(), Reason: "removed by " + name}
 	}
+	// Who can't see a labelled scope sets no deny on it, nor lifts one, which would widen access.
+	if dim, err := a.unsatisfied(ctx, actor, on); err != nil || dim != "" {
+		if err != nil {
+			return err
+		}
+		return &DeniedError{Permission: perm, Scope: on.Scope(), Reason: labelRefusal(dim)}
+	}
 	return a.holdsDeny(ctx, a.db, actor, on)
 }
 

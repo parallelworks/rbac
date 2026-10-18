@@ -87,6 +87,16 @@ another store. Both search one tenant, and count only unconditional grants:
   `Roles` lists the built-in and custom roles a scope type takes. Custom roles follow the
   catalog: one gives only what the catalog still has, and is privileged when it gives what only
   privileged roles do, or changes access.
+- **Labels on data:** a mandatory layer above every grant. A host declares label dimensions
+  (`Config.Labels`), each `Ordered` (a level), `AllOf` (compartments) or `AnyOf` (releasable to
+  these partners), and a resource carries its label (`Resource.Labels`), stored with it as its
+  path is. A subject holds a dimension's values as permissions, `dimension:value`, which roles for
+  the tenant give, so groups, eligibilities, expiry, conditions and history all apply to them.
+  `Authorize`, `Explain`, `Permissions`, `Holders` and `Grantable` allow nothing of a labelled
+  resource unless what the subject holds satisfies the label, whatever its grants give, and nor
+  do `Apply` and `SetEligibility` change its grants; `Explain` names the dimension that failed. `Filter` tests a `text[]` label column (`Columns.Labels`), `Reachable`
+  returns the holding, and `Holding` with `Satisfies` checks data points in a feed without reading
+  the database.
 - **Conditions:** a grant can carry a CEL expression over the subject's, the resource's and the
   request's attributes (`Subject.Attributes`, `Resource.Attributes`, `rbac.WithRequest`), the time
   and the action. It gives its role only where the expression holds; one that fails is false.
