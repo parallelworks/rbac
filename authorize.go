@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -368,14 +369,15 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 	if len(principals) == 0 || len(roles) == 0 && !custom {
 		return Reach{}, nil
 	}
+	reaching := a.reaching(resourceType)
 	args := append([]any{
-		tenant, principals, roles, a.cfg.Now(), a.reaching(resourceType), publicKey, a.publicRoles(roles),
+		tenant, principals, roles, a.cfg.Now(), reaching, publicKey, a.publicRoles(roles),
 		string(p), resourceType,
 	}, a.publicArgs(p, resourceType, custom)...)
 	rows, err := a.db.Query(ctx, `
 		SELECT scope, bool_and(conditional) FROM rbac_grants
 		WHERE tenant = $1 AND principal = ANY($2::text[]) AND role = ANY(`+givingSQL("$3", "$1", "$8", "$9", custom, nil)+`)
-		  AND (expires_at IS NULL OR expires_at > $4) AND split_part(scope, ':', 1) = ANY($5::text[])
+		  AND (expires_at IS NULL OR expires_at > $4) AND `+ofTypes("scope", "$5", len(reaching))+`
 		  AND (principal <> $6 OR role = ANY(`+givingSQL("$7", "$1", "$8", "$9", custom, &publicSQL{"$10", "$11", "$12"})+`))
 		GROUP BY scope ORDER BY scope`, args...)
 	if err != nil {
@@ -409,7 +411,7 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 		WHERE tenant = $1 AND scope_type = ANY($2::text[])
 		  AND principals && $3::text[] AND NOT exempt && $3::text[] AND ($4 = ANY(permissions) OR $5 = ANY(permissions))
 		GROUP BY scope ORDER BY scope`,
-		tenant, a.reaching(resourceType), s.principals(tenant), perm, wildcard)
+		tenant, reaching, s.principals(tenant), perm, wildcard)
 	if err != nil {
 		return Reach{}, err
 	}
@@ -490,14 +492,14 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	}
 	arg := func(i int) string { return fmt.Sprintf("$%d", firstArg+i) }
 	perm, wildcard := matchable(p)
-	// The subject's grants on scopes of the types matched, in the default collation, as the host's
+	// The subject's grants on the scopes `of` keeps, in the default collation, as the host's
 	// path column has it, so its GIN index applies.
-	grants := func(types string) string {
+	grants := func(of string) string {
 		return fmt.Sprintf(`SELECT g.scope COLLATE "default" FROM rbac_grants g
 			WHERE g.tenant = %s::text AND g.principal = ANY(%s::text[]) AND g.role = ANY(%s)
-			  AND (g.expires_at IS NULL OR g.expires_at > %s) AND NOT g.conditional AND split_part(g.scope, ':', 1) = %s
+			  AND (g.expires_at IS NULL OR g.expires_at > %s) AND NOT g.conditional AND %s
 			  AND (g.principal <> %s::text OR g.role = ANY(%s))`,
-			arg(1), arg(2), givingSQL(arg(3), arg(1), arg(8), arg(9), custom, nil), arg(4), types, arg(6),
+			arg(1), arg(2), givingSQL(arg(3), arg(1), arg(8), arg(9), custom, nil), arg(4), of, arg(6),
 			givingSQL(arg(7), arg(1), arg(8), arg(9), custom, &publicSQL{arg(10), arg(11), arg(12)}))
 	}
 	// The grants' tenant is an argument of its own: the host's tenant column needn't be text,
@@ -508,17 +510,18 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	// and only containers' and the tenant's overlap. That form can't use the GIN index, so a
 	// subject with few keeps the overlap.
 	above := a.reaching(resourceType)
-	reached := fmt.Sprintf(`%s && ARRAY(%s)`, cols.Path, grants(fmt.Sprintf("ANY(%s::text[])", arg(5))))
-	if !a.containers[resourceType] {
+	var byKey string
+	if !a.contains(resourceType) {
 		many, err := a.manyResourceGrants(ctx, tenant, principals, resourceType)
 		if err != nil {
 			return Predicate{}, err
 		}
 		if many {
 			above = slices.DeleteFunc(above, func(t string) bool { return t == resourceType })
-			reached = fmt.Sprintf(`((%s)[1] IN (%s) OR %s)`, cols.Path, grants(arg(9)+"::text"), reached)
+			byKey = fmt.Sprintf(`(%s)[1] IN (%s) OR `, cols.Path, grants(ofType("g.scope", arg(9)+"::text")))
 		}
 	}
+	reached := fmt.Sprintf(`(%s%s && ARRAY(%s))`, byKey, cols.Path, grants(ofTypes("g.scope", arg(5), len(above))))
 	return Predicate{
 		SQL: fmt.Sprintf(`(%s = %s AND %s
 			AND NOT %s && ARRAY(SELECT d.scope COLLATE "default" FROM rbac_denies d
@@ -533,6 +536,23 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	}, nil
 }
 
+// ofTypes is SQL keeping the rows whose scope, col, is of one of the n types in the array argument
+// types.
+func ofTypes(col, types string, n int) string {
+	ranges := make([]string, n)
+	for i := range n {
+		ranges[i] = ofType(col, fmt.Sprintf("(%s::text[])[%d]", types, i+1))
+	}
+	return "(" + strings.Join(ranges, " OR ") + ")"
+}
+
+// ofType is SQL keeping the rows whose scope, col, is of the type t. A scope is `type:id`, and in
+// the C collation the scopes of a type sort from `type:` to just before `type;`, so a btree on the
+// scope reads only them, as one on split_part couldn't.
+func ofType(col, t string) string {
+	return fmt.Sprintf("(%s >= (%s || ':') AND %s < (%s || ';'))", col, t, col, t)
+}
+
 // maxOverlap is how many grants on resources of a type Filter overlaps with each row's path:
 // about where comparing each with every key of a row costs as much as a lookup in a hash.
 const maxOverlap = 8
@@ -542,7 +562,7 @@ const maxOverlap = 8
 func (a *Authorizer) manyResourceGrants(ctx context.Context, tenant string, principals []string, resourceType string) (bool, error) {
 	var n int
 	err := a.db.QueryRow(ctx, `SELECT count(*) FROM (SELECT FROM rbac_grants
-		WHERE tenant = $1 AND principal = ANY($2::text[]) AND split_part(scope, ':', 1) = $3 AND NOT conditional
+		WHERE tenant = $1 AND principal = ANY($2::text[]) AND `+ofType("scope", "$3::text")+` AND NOT conditional
 		  AND (expires_at IS NULL OR expires_at > $4) LIMIT $5) g`,
 		tenant, principals, resourceType, a.cfg.Now(), maxOverlap+1).Scan(&n)
 	return n > maxOverlap, err
