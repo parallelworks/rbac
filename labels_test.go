@@ -23,8 +23,8 @@ var labelDimensions = []rbac.LabelDimension{
 	{Name: "rel", Rule: rbac.AnyOf, Values: []string{"usa", "gbr", "fra"}},
 }
 
-// labelled is setup with the label dimensions, and a role for the tenant giving each value.
-func labelled(t *testing.T, mutate ...func(*rbac.Config)) *harness {
+// labeled is setup with the label dimensions, and a role for the tenant giving each value.
+func labeled(t *testing.T, mutate ...func(*rbac.Config)) *harness {
 	t.Helper()
 	return setup(t, append([]func(*rbac.Config){func(c *rbac.Config) {
 		c.Labels = labelDimensions
@@ -50,7 +50,7 @@ func (h *harness) hold(t *testing.T, id string, values ...string) {
 }
 
 func TestAHoldingSatisfiesALabelByItsDimensionsRules(t *testing.T) {
-	h := labelled(t)
+	h := labeled(t)
 	pilot := h.as(t, "pilot")
 	h.hold(t, "pilot", "level:mid", "comp:alpha", "rel:gbr")
 	holding, err := h.authz.Holding(t.Context(), "t1", pilot)
@@ -104,7 +104,7 @@ func TestAHoldingSatisfiesALabelByItsDimensionsRules(t *testing.T) {
 }
 
 func TestALabelIsCheckedAboveEveryGrant(t *testing.T) {
-	h := labelled(t)
+	h := labeled(t)
 	ctx := t.Context()
 	owner := h.as(t, "owner")
 	secret := cluster
@@ -146,7 +146,7 @@ func TestALabelIsCheckedAboveEveryGrant(t *testing.T) {
 }
 
 func TestALabelIsCheckedAboveThePowerToChangeGrants(t *testing.T) {
-	h := labelled(t)
+	h := labeled(t)
 	ctx := t.Context()
 	owner := h.as(t, "owner")
 	h.as(t, "pilot")
@@ -173,7 +173,7 @@ func TestALabelIsCheckedAboveThePowerToChangeGrants(t *testing.T) {
 }
 
 func TestALabelValueHeldUnderAConditionHoldsWhereItHolds(t *testing.T) {
-	h := labelled(t)
+	h := labeled(t)
 	ctx := t.Context()
 	owner := h.as(t, "owner")
 	g := grant(rbac.TenantRoot("t1"), "rel.gbr", rbac.User, "owner")
@@ -201,7 +201,7 @@ func TestALabelValueHeldUnderAConditionHoldsWhereItHolds(t *testing.T) {
 }
 
 func TestALabelValueAConditionalDenyTakesIsMarked(t *testing.T) {
-	h := labelled(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), tenantGuard) })
+	h := labeled(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), tenantGuard) })
 	ctx := t.Context()
 	owner := h.as(t, "owner")
 	h.hold(t, "owner", "rel:gbr")
@@ -259,7 +259,7 @@ var tenantGuard = rbac.RoleDefinition{ID: "tenant.guard", Permissions: []rbac.Pe
 // Checks read a subject's label values on the tenant, so a deny of one under it would bind no one.
 func TestALabelValueIsDeniedOnTheTenantAlone(t *testing.T) {
 	workspaceGuard := rbac.RoleDefinition{ID: "workspace.guard", Permissions: []rbac.Permission{rbac.DenyPermission("workspace")}, ResourceTypes: []string{"workspace"}}
-	h := labelled(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), tenantGuard, workspaceGuard) })
+	h := labeled(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), tenantGuard, workspaceGuard) })
 	ctx := t.Context()
 	owner := h.as(t, "owner")
 	h.hold(t, "owner", "level:high")
@@ -286,7 +286,7 @@ func TestALabelValueIsDeniedOnTheTenantAlone(t *testing.T) {
 }
 
 func TestFilterKeepsWhatTheLabelAllows(t *testing.T) {
-	h := labelled(t)
+	h := labeled(t)
 	ctx := t.Context()
 	if _, err := h.pool.Exec(ctx, `CREATE TABLE points (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL, labels text[] NOT NULL)`); err != nil {
 		t.Fatal(err)
@@ -372,7 +372,7 @@ func listPoints(t *testing.T, h *harness, where string, args ...any) []string {
 // A label column in a collation that isn't deterministic compares values the package tells apart
 // as equal: Filter compares them as Satisfies does, byte for byte.
 func TestFilterTellsLabelValuesApartInAnyCollation(t *testing.T) {
-	h := labelled(t, func(c *rbac.Config) {
+	h := labeled(t, func(c *rbac.Config) {
 		c.Labels = append(slices.Clone(c.Labels), rbac.LabelDimension{Name: "team", Rule: rbac.AnyOf, Values: []string{"ab", "a-b"}})
 		c.Catalog = append(slices.Clone(c.Catalog),
 			rbac.RoleDefinition{ID: "team.ab", Permissions: []rbac.Permission{"team:ab"}, ResourceTypes: []string{rbac.TenantScope}},
@@ -451,7 +451,7 @@ func TestFilterTestsALabelColumnWithNoDimensions(t *testing.T) {
 }
 
 func TestLabelsAreDeclared(t *testing.T) {
-	h := labelled(t)
+	h := labeled(t)
 	owner := h.as(t, "owner")
 	for name, l := range map[string]rbac.Label{
 		"an undeclared dimension": {"zone": {"red"}},
@@ -499,8 +499,8 @@ func TestLabelsAreDeclared(t *testing.T) {
 	}
 }
 
-func TestWhoCantSeeALabelledScopeSetsNoDenyOnIt(t *testing.T) {
-	h := labelled(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), guardRole) })
+func TestWhoCantSeeALabeledScopeSetsNoDenyOnIt(t *testing.T) {
+	h := labeled(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), guardRole) })
 	ctx := t.Context()
 	h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "guardian"))
 	guardian := h.as(t, "guardian")
@@ -525,7 +525,7 @@ func TestWhoCantSeeALabelledScopeSetsNoDenyOnIt(t *testing.T) {
 }
 
 func TestFilterNeedsTheLabelColumnWhereLabelsAreDeclared(t *testing.T) {
-	h := labelled(t)
+	h := labeled(t)
 	s := h.as(t, "u")
 	if _, err := h.authz.Filter(t.Context(), s, view, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1); !errors.Is(err, rbac.ErrInvalid) {
 		t.Fatalf("Filter without the label column: %v", err)
@@ -537,7 +537,7 @@ func TestFilterNeedsTheLabelColumnWhereLabelsAreDeclared(t *testing.T) {
 }
 
 func TestALabelValueIsGrantedOnTheTenantAlone(t *testing.T) {
-	h := labelled(t)
+	h := labeled(t)
 	ctx := t.Context()
 	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.admin", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "workspace.admin", rbac.User, "admin"),
 		grant(rbac.TenantRoot("t1"), "rel.gbr", rbac.User, "admin"))
@@ -556,7 +556,7 @@ func TestALabelValueIsGrantedOnTheTenantAlone(t *testing.T) {
 }
 
 func TestMayWriteKeepsDataUnderALabelAsRestrictive(t *testing.T) {
-	h := labelled(t)
+	h := labeled(t)
 	pilot := h.as(t, "pilot")
 	h.hold(t, "pilot", "level:mid", "comp:alpha", "rel:gbr")
 	holding, err := h.authz.Holding(t.Context(), "t1", pilot)
@@ -603,7 +603,7 @@ func releasing(c *rbac.Config) {
 }
 
 func TestMayReleaseNeedsTheDimensionsPowerToRelease(t *testing.T) {
-	h := labelled(t, releasing)
+	h := labeled(t, releasing)
 	ctx := t.Context()
 	officer := h.as(t, "officer")
 	h.hold(t, "officer", "level:mid", "comp:alpha", "rel:gbr", "level:release")
@@ -661,7 +661,7 @@ func TestMayReleaseNeedsTheDimensionsPowerToRelease(t *testing.T) {
 }
 
 func TestAPowerToReleaseHeldUnderAConditionIsNoValue(t *testing.T) {
-	h := labelled(t, releasing)
+	h := labeled(t, releasing)
 	owner := h.as(t, "owner")
 	g := grant(rbac.TenantRoot("t1"), "level.release", rbac.User, "owner")
 	g.Condition = rbac.Condition{Expression: `request.attributes.mission == true`}
@@ -674,5 +674,20 @@ func TestAPowerToReleaseHeldUnderAConditionIsNoValue(t *testing.T) {
 	}
 	if slices.ContainsFunc(holders, func(x rbac.Holder) bool { return x.Principal == owner.Principal }) {
 		t.Fatalf("Holders = %+v", holders)
+	}
+
+	// With a level, the label is what decides, and the condition the power to release.
+	h.hold(t, "owner", "level:mid")
+	if holders, err = h.authz.Holders(t.Context(), view, low); err != nil || !slices.Contains(holderPrincipals(holders), owner.Principal) {
+		t.Fatalf("Holders with a level = %+v, %v", holders, err)
+	}
+	for mission, want := range map[bool]bool{false: false, true: true} {
+		holding, err := h.authz.Holding(rbac.WithRequest(t.Context(), map[string]any{"mission": mission}), "t1", owner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := holding.MayRelease(rbac.Label{"level": {"mid"}}, rbac.Label{"level": {"low"}}); got != want {
+			t.Errorf("MayRelease on a mission %v = %v", mission, got)
+		}
 	}
 }
