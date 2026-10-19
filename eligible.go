@@ -191,12 +191,19 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 	if err != nil {
 		return Grant{}, err
 	}
+	stand, err := a.standing(ctx, a.db, on.Tenant, []Principal{s.Principal})
+	if err != nil {
+		return Grant{}, err
+	}
 	if err := a.validate(ctx, roles, s, ViaActivation, on.Tenant, scope, []Binding{b}, nil); err != nil {
 		return Grant{}, err
 	}
 	var activated Grant
 	err = a.inTx(ctx, on.Tenant, s.Principal, "Activate", func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lock(ctx, tx, on.Tenant, []string{scope.Key()}, []string{s.Principal.key()}); err != nil {
+			return ChangeEvent{}, err
+		}
+		if err := a.stillStanding(ctx, tx, on.Tenant, []Principal{s.Principal}, stand); err != nil {
 			return ChangeEvent{}, err
 		}
 		// Again under the locks, so an eligibility revoked meanwhile activates nothing.
@@ -296,11 +303,13 @@ func (a *Authorizer) Deactivate(ctx context.Context, s Subject, on Resource, rol
 // groups, as its grants do, never through the tenant's members.
 func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource, act Activation, until time.Time) (approved Principal, err error) {
 	scope, manage := on.Scope(), GrantPermission(on.Type)
-	keys, err := a.keysOf(ctx, q, on.Tenant, s)
+	// As s will be when the activation ends, so none outlasts the place in a group, or the
+	// membership, that makes s eligible.
+	keys, _, err := a.keysAt(ctx, q, on.Tenant, s, until)
 	if err != nil {
 		return Principal{}, err
 	}
-	approvers, err := a.keysOf(ctx, q, on.Tenant, act.Approver)
+	approvers, _, err := a.keysOf(ctx, q, on.Tenant, act.Approver)
 	if err != nil {
 		return Principal{}, err
 	}

@@ -83,7 +83,8 @@ another store. Both search one tenant, and count only unconditional grants:
   permissions and types the built-in roles use. Defining one needs `rbac.DefineRoles` on the
   tenant and everything the role gives across it. Redefining one so that its grants give more
   asks `ValidateGrant` about each grant and eligibility it widens, as the role will be, and the
-  host refusing one refuses the redefinition. `DeleteRole` removes one with its grants;
+  host refusing one refuses the redefinition; an actor a label of a scope its grants are on
+  refuses can neither redefine nor delete it. `DeleteRole` removes one with its grants;
   `Roles` lists the built-in and custom roles a scope type takes. Custom roles follow the
   catalog: one gives only what the catalog still has, and is privileged when it gives what only
   privileged roles do, or changes access.
@@ -128,7 +129,9 @@ another store. Both search one tenant, and count only unconditional grants:
   misnamed, or as another type, is refused when stored. Cost is bounded per condition and per
   check, and a check evaluates the cheapest first, so what it decides doesn't rest on ids; a
   scope's conditional denies are bounded together, so a check always evaluates them. To hand a
-  permission on, the actor holds it unconditionally or under the same condition.
+  permission on, the actor holds it unconditionally or under the same condition, one that doesn't
+  read the subject: that one decides for each holder, so the actor's holding says nothing of
+  another's.
 - **Deny policies:** `SetDeny` puts a deny on a scope: under it, it removes permissions
   (`type:verb`, or `type:*` for a type's every one) from the principals it names, those it exempts
   aside, whatever their grants give. It exempts identities and groups, or from a deny naming the
@@ -138,7 +141,8 @@ another store. Both search one tenant, and count only unconditional grants:
   whoever holds it on a scope above can always lift a deny set below. `Filter`, `Reachable` and
   `Holders` honor denies.
 - **Just-in-time access:** `SetEligibility` lets a principal, an identity or a group's members,
-  activate a role on a scope for up to a maximum duration and no later than the eligibility ends,
+  activate a role on a scope for up to a maximum duration and no later than the eligibility, the
+  activator's membership of the tenant, or its place in the group that makes it eligible ends,
   perhaps only where a condition holds, such as a second factor, and perhaps only once one of its
   `Approvers` approves. `Activate` gives the activator a grant of its own from
   `rbac.SourceActivation`, beside any it holds, with its justification and approver. It holds
@@ -150,7 +154,10 @@ another store. Both search one tenant, and count only unconditional grants:
   privileged roles for service accounts or guests. `Config.Constraints` remove permissions above
   anything a tenant grants or denies, seeing the subject and the resource, such as freezing
   changes under a container. What one removes from an actor the actor can't hand on, but for a
-  role a role it holds lists in `GrantableRoles`, which it grants without holding.
+  role a role it holds lists in `GrantableRoles`, which it grants without holding. The host is
+  asked before a change takes its locks, so a change is tried again (`rbac.ErrConflict`) when the
+  memberships its answers rest on, of an identity it grants to or of a group's members, changed
+  in between.
 
 ## Principals
 
@@ -166,9 +173,12 @@ another store. Both search one tenant, and count only unconditional grants:
   as they are stored now: `Authorize` and `Filter` in the same statement as its grants and denies,
   and `Explain`, `Reachable` and `Holders` in one snapshot of the database, but under `WithTx` at
   READ COMMITTED, where each statement reads its own.
-  A suspended identity is bound as one outside the tenant is: by a deny naming it or the public.
+  A suspended identity holds only what the public does, and stays bound by a deny naming its
+  groups or the tenant's members, though no group of its exempts it from one: suspending it lifts
+  nothing. When the host takes a group over (`ImportGroups` from one of `Config.Sources`), the
+  members a tenant put in it, from no source of the host's, leave it.
 - **Changing members is granting:** a group's members hold what it and the groups it is in hold,
-  so `ChangeMembers`, with `rbac.GroupMembers` on the group, checks a change to its members as the
+  so `ChangeMembers`, with `rbac.GroupMembers` on the group and its label, checks a change to its members as the
   changes to access it makes, each as `Apply` or `SetDeny` checks one on its scope. An added member
   gains the group's grants and eligibilities, which the actor must be able to grant it, and
   `ValidateGrant` is asked about each as the member's (`rbac.ViaMembership`); it approves what the

@@ -218,11 +218,14 @@ var all = broad{public: true, members: true}
 // tenant at now, given as SQL for its key (empty for the anonymous), the tenant and the time. They
 // are the public; and while the identity is a member or guest of the tenant, not suspended, the
 // identity, the groups it is in, through those they are in, and unless it is a guest the tenant's
-// members. A group is counted once, so membership nested in a cycle stops. It defines bound(k)
-// too, the keys a deny binds or exempts it by (bound).
+// members. A group is counted once, so membership nested in a cycle stops. It defines exempted(k)
+// too, the keys a deny exempts it by: its keys, and its identity even where it isn't a member or
+// guest, as a grant to the public still reaches it there; and bound(k), the keys a deny binds it
+// by: those, and while its membership is suspended, the groups and the tenant's members it would
+// be in, so suspending it, which gives it only the public's grants, lifts no deny from it.
 func keysSQL(tenant, identity, now string) string {
 	return fmt.Sprintf(`membership AS (
-		SELECT guest FROM rbac_memberships WHERE tenant = %[1]s AND principal = %[2]s AND NOT suspended
+		SELECT guest, suspended FROM rbac_memberships WHERE tenant = %[1]s AND principal = %[2]s
 		  AND (expires_at IS NULL OR expires_at > %[3]s)
 	), groups(id) AS (
 		SELECT group_id FROM rbac_members WHERE tenant = %[1]s AND principal = %[2]s
@@ -232,17 +235,21 @@ func keysSQL(tenant, identity, now string) string {
 		WHERE m.tenant = %[1]s AND (m.expires_at IS NULL OR m.expires_at > %[3]s)
 	), keys(k) AS (
 		SELECT 'public:' COLLATE "C"
-		UNION ALL SELECT %[2]s COLLATE "C" FROM membership
-		UNION ALL SELECT ('members:' || %[1]s) COLLATE "C" FROM membership WHERE NOT guest
-		UNION ALL SELECT 'group:' || id FROM groups
-	), bound(k) AS (
+		UNION ALL SELECT %[2]s COLLATE "C" FROM membership WHERE NOT suspended
+		UNION ALL SELECT ('members:' || %[1]s) COLLATE "C" FROM membership WHERE NOT guest AND NOT suspended
+		UNION ALL SELECT 'group:' || id FROM groups WHERE EXISTS (SELECT FROM membership WHERE NOT suspended)
+	), exempted(k) AS (
 		SELECT k FROM keys UNION SELECT %[2]s COLLATE "C" WHERE %[2]s <> ''
+	), bound(k) AS (
+		SELECT k FROM exempted
+		UNION SELECT ('members:' || %[1]s) COLLATE "C" FROM membership WHERE NOT guest
+		UNION SELECT 'group:' || id FROM groups
 	)`, tenant, identity, now)
 }
 
-// bound is the keys a deny binds or exempts s by: its keys, and its identity even where it isn't a
+// exempting is the keys a deny exempts s by: its keys, and its identity even where it isn't a
 // member or guest, as a grant to the public still reaches it there.
-func bound(keys []string, s Subject) []string {
+func exempting(keys []string, s Subject) []string {
 	if k := s.identityKey(); k != "" && !slices.Contains(keys, k) {
 		return append(slices.Clone(keys), k)
 	}
@@ -261,14 +268,29 @@ func counted(public, members string) string {
 	return fmt.Sprintf(`(k <> 'public:' OR %s) AND (k NOT LIKE 'members:%%' OR %s)`, public, members)
 }
 
-// keysOf reads the principal keys s is in a tenant, sorted, as keysSQL defines them.
-func (a *Authorizer) keysOf(ctx context.Context, q DB, tenant string, s Subject) ([]string, error) {
+// keysOf reads the principal keys s is in a tenant, and those a deny binds it by, each sorted, as
+// keysSQL defines them.
+func (a *Authorizer) keysOf(ctx context.Context, q DB, tenant string, s Subject) (keys, binding []string, err error) {
+	return a.keysAt(ctx, q, tenant, s, a.cfg.Now())
+}
+
+// keysAt is keysOf at a time.
+func (a *Authorizer) keysAt(ctx context.Context, q DB, tenant string, s Subject, at time.Time) (keys, binding []string, err error) {
 	rows, err := q.Query(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`
-		SELECT k FROM keys ORDER BY k`, tenant, s.identityKey(), a.cfg.Now())
+		SELECT k, k IN (SELECT k FROM keys) FROM bound ORDER BY k`, tenant, s.identityKey(), at)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return pgx.CollectRows(rows, pgx.RowTo[string])
+	var k string
+	var in bool
+	_, err = pgx.ForEachRow(rows, []any{&k, &in}, func() error {
+		if in {
+			keys = append(keys, k)
+		}
+		binding = append(binding, k)
+		return nil
+	})
+	return keys, binding, err
 }
 
 // countedOf keeps the keys whose grants a read counts.
