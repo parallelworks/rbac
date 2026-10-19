@@ -631,3 +631,40 @@ func pagesRead(ctx context.Context, t *testing.T, tx pgx.Tx, table string) int64
 	}
 	return n
 }
+
+// The public's grants on the tenant are read with the custom roles they name, as of one moment, as
+// a check reads them, for whether their exclusive values leave it none.
+func TestThePublicsValuesAreReadWithTheirCustomRolesAsOfOneMoment(t *testing.T) {
+	h := labeled(t, banks)
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, public)
+		VALUES ('t1', 'custom.x', '{bank:a}', '{tenant}', true), ('t1', 'custom.y', '{comp:alpha}', '{tenant}', true)`); err != nil {
+		t.Fatal(err)
+	}
+	root := rbac.TenantRoot("t1")
+	h.seed(t, grant(root, "custom.x", rbac.Public, ""), grant(root, "custom.y", rbac.Public, ""))
+	// Once they are read, x's grant is revoked, and then y gives another value of bank: at no
+	// moment does the public hold two.
+	once := false
+	rbac.SetReadingRoles(t, func() {
+		if once {
+			return
+		}
+		once = true
+		for _, q := range []string{
+			`DELETE FROM rbac_grants WHERE role = 'custom.x'`,
+			`UPDATE rbac_roles SET permissions = '{bank:b}' WHERE id = 'custom.y'`,
+		} {
+			if _, err := h.pool.Exec(ctx, q); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	holders, err := h.authz.Holders(ctx, "bank:a", tenantT1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(holderPrincipals(holders), []rbac.Principal{{Kind: rbac.Public}}) {
+		t.Fatalf("Holders = %+v: the public's values were read from two moments", holders)
+	}
+}

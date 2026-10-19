@@ -97,18 +97,24 @@ const roleColumns = `id, name, description, permissions, resource_types, privile
 
 func collectRoles(rows pgx.Rows) ([]RoleDefinition, error) {
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (RoleDefinition, error) {
-		var r RoleDefinition
+		var id, name, description string
 		var perms, types, grantable []string
-		err := row.Scan(&r.ID, &r.Name, &r.Description, &perms, &types, &r.Privileged, &r.Public, &grantable)
-		for _, p := range perms {
-			r.Permissions = append(r.Permissions, Permission(p))
-		}
-		r.ResourceTypes = types
-		for _, g := range grantable {
-			r.GrantableRoles = append(r.GrantableRoles, Role(g))
-		}
-		return r, err
+		var privileged, public bool
+		err := row.Scan(&id, &name, &description, &perms, &types, &privileged, &public, &grantable)
+		return roleFrom(id, name, description, perms, types, privileged, public, grantable), err
 	})
+}
+
+// roleFrom is a custom role as its row holds it.
+func roleFrom(id, name, description string, perms, types []string, privileged, public bool, grantable []string) RoleDefinition {
+	r := RoleDefinition{ID: Role(id), Name: name, Description: description, ResourceTypes: types, Privileged: privileged, Public: public}
+	for _, p := range perms {
+		r.Permissions = append(r.Permissions, Permission(p))
+	}
+	for _, g := range grantable {
+		r.GrantableRoles = append(r.GrantableRoles, Role(g))
+	}
+	return r
 }
 
 // catalogSQL names the array arguments that Authorizer.publicArgs and Authorizer.catalogArgs fill:
