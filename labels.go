@@ -310,7 +310,7 @@ func (h Holding) changed(ps map[Permission]bool, held bool) Holding {
 // Holding returns the label values s holds in a tenant: those its grants give it on the tenant,
 // decided as Permissions decides them, with ctx's request for their conditions.
 func (a *Authorizer) Holding(ctx context.Context, tenant string, s Subject) (Holding, error) {
-	if tenant == "" {
+	if !validID(tenant) {
 		return Holding{}, fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
 	if err := a.subject(s); err != nil {
@@ -320,8 +320,9 @@ func (a *Authorizer) Holding(ctx context.Context, tenant string, s Subject) (Hol
 	return h, err
 }
 
-// holding is Holding, and the values a condition decided, a grant's or a deny's, which a read
-// without the request, as Holders, can't settle.
+// holding is Holding, and the values a condition decided, a grant's or a deny's, or a constraint
+// asked without the request's attributes, which a read without the request, as Holders, can't
+// settle.
 func (a *Authorizer) holding(ctx context.Context, tenant string, s Subject) (Holding, map[Permission]bool, error) {
 	h := Holding{tenant: tenant, dims: a.labels, values: map[string]map[string]bool{}, releases: map[string]bool{}, excluded: map[string]bool{}}
 	if len(a.labels) == 0 {

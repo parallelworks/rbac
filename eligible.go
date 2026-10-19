@@ -176,6 +176,9 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 	}
 	scope := on.Scope()
 	b := Binding{Role: act.Role, Principal: s.Principal, Source: SourceActivation, Note: act.Justification}
+	if !validText(string(act.Role)) {
+		return Grant{}, &InvalidError{Binding: b, Reason: "the role is not text without NUL"}
+	}
 	if err := a.changing(s, on, a.constrain(ctx, s, on)); err != nil {
 		return Grant{}, err
 	}
@@ -281,6 +284,9 @@ func (a *Authorizer) Deactivate(ctx context.Context, s Subject, on Resource, rol
 	if err := a.subject(s); err != nil {
 		return err
 	}
+	if !validText(string(role)) {
+		return fmt.Errorf("%w: role %q is not text without NUL", ErrInvalid, role)
+	}
 	if s.Principal == (Principal{}) {
 		return nil
 	}
@@ -372,8 +378,8 @@ func seconds(d time.Duration) int64 {
 
 // Eligibilities lists the eligibilities that match the filter, as stored, expired ones aside.
 func (a *Authorizer) Eligibilities(ctx context.Context, tenant string, f GrantFilter) ([]Eligibility, error) {
-	if tenant == "" || len(f.Scopes)+len(f.Principals) == 0 {
-		return nil, fmt.Errorf("%w: Eligibilities needs a tenant and scopes or principals", ErrInvalid)
+	if !validID(tenant) || !f.valid(tenant) {
+		return nil, fmt.Errorf("%w: Eligibilities needs a tenant and valid scopes or principals", ErrInvalid)
 	}
 	where, scopes, principals := f.sql()
 	rows, err := a.db.Query(ctx, `

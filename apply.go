@@ -201,9 +201,12 @@ func (a *Authorizer) stand(ctx context.Context, q DB, tenant string, principals 
 	var identities, groups []string
 	for _, p := range principals {
 		switch {
+		// Neither the broad nor one whose id is no id is anyone's member: a change refuses the
+		// latter.
+		case p.broad() || !validID(p.ID):
 		case p.Kind == Group:
 			groups = append(groups, p.ID)
-		case !p.broad():
+		default:
 			identities = append(identities, p.key())
 		}
 	}
@@ -350,7 +353,7 @@ func locked(br pgx.BatchResults) error {
 // SourceActivation are refused, as only Activate makes them: a restore leaves them out.
 func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string, grants []Grant) (err error) {
 	defer a.refused(ctx, &err, tenant, actor, "Import")
-	if tenant == "" {
+	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
 	if err := a.identity(actor); err != nil {
@@ -524,6 +527,9 @@ func checkRevoke(tenant string, b Binding) []error {
 	if b.Role == "" {
 		errs = append(errs, &InvalidError{Binding: b, Reason: "a revoke names its role, by ID too"})
 	}
+	if !validText(string(b.Role)) || !validText(b.Source) || !validText(b.ID) {
+		errs = append(errs, &InvalidError{Binding: b, Reason: "a revoke's role, source and ID are text without NUL"})
+	}
 	return errs
 }
 
@@ -559,8 +565,8 @@ func hostReason(err error) string {
 
 // identity checks that an actor a call names is an identity: a user or a declared kind.
 func (a *Authorizer) identity(actor Principal) error {
-	if !a.acts(actor.Kind) || actor.ID == "" {
-		return fmt.Errorf("%w: the actor %q is not a user or declared kind", ErrInvalid, actor.key())
+	if !a.acts(actor.Kind) || !validID(actor.ID) {
+		return fmt.Errorf("%w: the actor is not a user or declared kind with an id of text without NUL of at most %d bytes", ErrInvalid, MaxID)
 	}
 	return nil
 }
@@ -773,7 +779,7 @@ func (p power) lists(r Role, condition string) bool {
 // name. With a custom role among them it reads all the tenant's, which a role's GrantableRoles
 // can name.
 func (a *Authorizer) authorityOn(ctx context.Context, q DB, actor Subject, on Resource, roles []Role) (authority, error) {
-	held, ds, err := a.heldOrDenied(ctx, q, on.Tenant, actor, all, on.path(), "")
+	held, ds, _, err := a.heldOrDenied(ctx, q, on.Tenant, actor, all, on.path(), "", noRoles)
 	if err != nil {
 		return authority{}, err
 	}
@@ -1046,19 +1052,19 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 	if cs.removes(GrantPermission(r.Type), r.Type) {
 		return nil, cs.failed()
 	}
-	held, ds, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), "")
+	// Every custom role, read once: the candidates, and those their GrantableRoles name. In the
+	// statement that reads the grants, as a check reads them: read apart, a grant revoked and its
+	// role widened meanwhile could offer what no moment would.
+	held, ds, b, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), "", tenantRoles)
 	if err != nil || len(held) == 0 {
 		return nil, err
 	}
-	// Every custom role, read once: the candidates, and those their GrantableRoles name.
-	custom, err := a.customRoles(ctx, a.db, r.Tenant)
+	readingRoles()
+	au, err := a.authorityOf(ctx, a.db, s, r, held, ds, b)
 	if err != nil {
 		return nil, err
 	}
-	au, err := a.authorityOf(ctx, a.db, s, r, held, ds, a.bookOf(custom))
-	if err != nil {
-		return nil, err
-	}
+	custom := slices.SortedFunc(maps.Values(b.custom), func(x, y RoleDefinition) int { return strings.Compare(string(x.ID), string(y.ID)) })
 	au.constrained = cs
 	pw := au.over(r.Type)
 	if pw.none() {
@@ -1347,6 +1353,14 @@ type GrantFilter struct {
 	Principals []Principal
 }
 
+// valid reports whether the filter picks something, by scopes and principals that could be
+// stored in a tenant.
+func (f GrantFilter) valid(tenant string) bool {
+	return len(f.Scopes)+len(f.Principals) > 0 &&
+		!slices.ContainsFunc(f.Scopes, func(s Scope) bool { return !s.valid() }) &&
+		!slices.ContainsFunc(f.Principals, func(p Principal) bool { return !p.wellFormed(tenant) })
+}
+
 // sql is the condition picking what the filter matches, on $2 and $3, and their arguments: a
 // statement of its own for each shape, so each plans for the index it can use.
 func (f GrantFilter) sql() (where string, scopes, principals []string) {
@@ -1371,8 +1385,8 @@ func (f GrantFilter) sql() (where string, scopes, principals []string) {
 // the catalog, to a kind no longer declared, or to the public of a role no longer Public gives
 // nothing.
 func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) ([]Grant, error) {
-	if tenant == "" || len(f.Scopes)+len(f.Principals) == 0 {
-		return nil, fmt.Errorf("%w: Grants needs a tenant and scopes or principals", ErrInvalid)
+	if !validID(tenant) || !f.valid(tenant) {
+		return nil, fmt.Errorf("%w: Grants needs a tenant and valid scopes or principals", ErrInvalid)
 	}
 	where, scopes, principals := f.sql()
 	rows, err := a.db.Query(ctx, `
@@ -1394,7 +1408,7 @@ func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) (
 // and principals until the transaction ends, or past 64 the tenant, as Import does.
 func (a *Authorizer) DeleteGrants(ctx context.Context, actor Principal, tenant string, grants []Grant) (err error) {
 	defer a.refused(ctx, &err, tenant, actor, "DeleteGrants")
-	if tenant == "" {
+	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
 	if err := a.identity(actor); err != nil {
@@ -1602,7 +1616,7 @@ type deletion struct {
 
 // delete removes what del picks in a tenant as actor, by how, once lock holds.
 func (a *Authorizer) delete(ctx context.Context, actor Principal, tenant, how string, lock func(pgx.Tx) error, del deletion, args ...any) error {
-	if tenant == "" {
+	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
 	if err := a.identity(actor); err != nil {

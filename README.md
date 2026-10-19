@@ -70,12 +70,13 @@ if err := authz.Authorize(ctx, subject, "cluster:login", cluster); err != nil {
 
 Store each resource's `authz.Path(resource)`, its own key first and then its containers' and the
 tenant's, in a `text[]` column with a GIN index. `Filter` returns a condition for the host's own
-query, which reads the grants in the same statement as the rows, so sorting and pagination work
-and nothing changes between deciding and reading. A subject's grants on resources of the listed
-type are looked up by each row's own key, so one holding a grant on everything it created lists
-as fast as one holding a few. `Reachable` returns the same as scopes, for resources kept in
-another store. Both search one tenant, and count only unconditional grants:
-`Reach.Conditional` names the scopes conditional ones reach, to check one by one.
+query, which reads the grants in the same statement as the rows, so sorting and pagination work and
+nothing changes between deciding and reading. It compares the tenant and keys byte for byte, as
+`Authorize` does, whatever the columns' collation, in which their indexes still serve. A subject's
+grants on resources of the listed type are looked up by each row's own key, so one holding a grant
+on everything it created lists as fast as one holding a few. `Reachable` returns the same as
+scopes, for resources kept in another store. Both search one tenant, and count only unconditional
+grants: `Reach.Conditional` names the scopes conditional ones reach, to check one by one.
 
 ## Policies
 
@@ -204,10 +205,10 @@ another store. Both search one tenant, and count only unconditional grants:
 ## Why
 
 `Explain` names the grants that allow, or the deny or constraint that denied; `Permissions` lists
-what a subject may do; `Holders` lists who may, for an access review: each identity, through its
-own grants and its groups', and the tenant's members and the public as one holder each, marking
-those that hold only under a condition or that a deny may bind. A `DeniedError`'s message names
-only the permission, so an error shown to a user shows no policy; its fields say why.
+what a subject may do; `Holders` lists who may, for an access review: each identity, through its own
+grants and its groups', and the tenant's members and the public as one holder each, marking those
+that hold only under a condition or that a deny or constraint may bind. A `DeniedError`'s message
+names only the permission, so an error shown to a user shows no policy; its fields say why.
 
 ## History
 
@@ -322,8 +323,9 @@ through which it could write `rbac_history` itself; and:
   permission the host checks, which a catalog an operator configures can leave out of every role:
   then it is denied like any other.
 - **Limits:** a change takes at most `rbac.MaxBindings` bindings; a principal holds a role on a
-  scope at most `rbac.MaxGrantsPerRole` times; a scope holds at most `rbac.MaxDenies` denies; a
-  tenant has at most `rbac.MaxCustomRoles` custom roles. The others are exported beside them.
+  scope at most `rbac.MaxGrantsPerRole` times, from each source the host owns apart; a scope holds
+  at most `rbac.MaxDenies` denies; a tenant has at most `rbac.MaxCustomRoles` custom roles; an id
+  is at most `rbac.MaxID` bytes. The others are exported beside them.
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
   to run on a schedule.
 

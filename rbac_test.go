@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -584,6 +585,106 @@ func TestFilterOnATenantColumnThatIsNotText(t *testing.T) {
 	got, err := pgx.CollectRows(rows, pgx.RowTo[string])
 	if err != nil || !slices.Equal(got, []string{"c"}) {
 		t.Fatalf("Filter on a uuid tenant column = %v, %v", got, err)
+	}
+}
+
+// A host's columns in a collation that isn't deterministic compare keys and tenants the package
+// tells apart as equal: Filter compares them as Authorize does, byte for byte.
+func TestFilterTellsKeysAndTenantsApartInAnyCollation(t *testing.T) {
+	// Few grants on clusters are compared with the path, and many by its first key.
+	for _, n := range []int{1, 9} {
+		t.Run(fmt.Sprintf("%d cluster grants", n), func(t *testing.T) {
+			h, guardian := guarded(t)
+			ctx := t.Context()
+			for _, q := range []string{
+				`CREATE COLLATION loose (provider = icu, locale = 'und-u-ks-level2', deterministic = false)`,
+				`CREATE TABLE clusters (tenant text COLLATE loose NOT NULL, id text NOT NULL, path text[] COLLATE loose NOT NULL)`,
+			} {
+				if _, err := h.pool.Exec(ctx, q); err != nil {
+					t.Fatal(err)
+				}
+			}
+			w1 := []rbac.Scope{{Type: "workspace", ID: "w1"}, {Type: "org", ID: "o1"}}
+			w2 := []rbac.Scope{{Type: "workspace", ID: "w2"}, {Type: "org", ID: "o1"}}
+			grants := []rbac.Grant{grant(w1[0], "cluster.login", rbac.User, "u")}
+			for i := range n {
+				grants = append(grants, grant(rbac.Scope{Type: "cluster", ID: fmt.Sprintf("c%d", i+1)}, "cluster.login", rbac.User, "u"))
+			}
+			h.seed(t, grants...)
+			u := h.as(t, "u")
+			// u is granted c1 and denied d1, which C1 and D1 aren't.
+			resources := []rbac.Resource{
+				{Tenant: "t1", Type: "cluster", ID: "C1", Ancestors: w2},
+				{Tenant: "t1", Type: "cluster", ID: "D1", Ancestors: w1},
+				{Tenant: "t1", Type: "cluster", ID: "c1", Ancestors: w2},
+				{Tenant: "t1", Type: "cluster", ID: "d1", Ancestors: w1},
+			}
+			if err := h.authz.SetDeny(ctx, guardian, resources[3], rbac.Deny{ID: "d", Principals: []rbac.Principal{u.Principal}, Permissions: []rbac.Permission{login}}); err != nil {
+				t.Fatal(err)
+			}
+			// And a tenant that differs from t1 only in case.
+			for _, r := range append(slices.Clone(resources), rbac.Resource{Tenant: "T1", Type: "cluster", ID: "x", Ancestors: w1}) {
+				if _, err := h.pool.Exec(ctx, `INSERT INTO clusters VALUES ($1, $2, $3)`, r.Tenant, r.ID, h.path(t, r)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := allowedOf(t, h, resources, u, login); !slices.Equal(got, []string{"D1", "c1"}) {
+				t.Fatalf("Authorize allowed %v", got)
+			}
+			pred, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rows, err := h.pool.Query(ctx, `SELECT tenant || '/' || id COLLATE "C" FROM clusters WHERE `+pred.SQL+` ORDER BY 1`, pred.Args...)
+			if err != nil {
+				t.Fatalf("%s: %v", pred.SQL, err)
+			}
+			got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := []string{"t1/D1", "t1/c1"}; !slices.Equal(got, want) {
+				t.Errorf("Filter kept %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+// A path column's GIN index is in its collation, which Filter compares keys in too, as byte for
+// byte, so the index serves whatever it is.
+func TestFilterReadsThePathIndexInItsCollation(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	for _, q := range []string{
+		`CREATE TABLE fleet (tenant text COLLATE "C" NOT NULL, id text NOT NULL, path text[] COLLATE "C" NOT NULL)`,
+		`INSERT INTO fleet SELECT 't1', 'c' || i, ARRAY['cluster:c' || i, 'workspace:w' || (i % 50), 'org:o1', 'tenant:t1']
+			FROM generate_series(1, 20000) i`,
+		`CREATE INDEX ON fleet USING gin (path)`,
+		`ANALYZE fleet`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.seed(t, grant(rbac.Scope{Type: "cluster", ID: "c7"}, "cluster.login", rbac.User, "few"))
+	pred, err := h.authz.Filter(ctx, h.as(t, "few"), login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := h.pool.QueryRow(ctx, "SELECT count(*) FROM fleet WHERE "+pred.SQL, pred.Args...).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("Filter found %d, %v", n, err)
+	}
+	rows, err := h.pool.Query(ctx, "EXPLAIN SELECT count(*) FROM fleet WHERE "+pred.SQL, pred.Args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text := strings.Join(plan, "\n"); !strings.Contains(text, "Bitmap Index Scan") {
+		t.Fatalf("Filter's plan on a path column in the C collation:\n%s", text)
 	}
 }
 
@@ -1348,8 +1449,10 @@ func TestConstraintsSeeWhoAndWhere(t *testing.T) {
 	if reach, err := h.authz.Reachable(ctx, h.as(t, "sre", "sre"), root, "t1", "cluster"); err != nil || reach.All || len(reach.Scopes) > 0 {
 		t.Fatalf("a search can't see the resource, so a constraint on some removes it from all: %+v, %v", reach, err)
 	}
-	if holders, err := h.authz.Holders(ctx, root, inProd); err != nil || len(holders) > 0 {
-		t.Fatalf("Holders can't see each holder, so a constraint on some removes all: %v, %v", holders, err)
+	// Holders asks it again about each holder, and marks the one it may remove root from.
+	holders, err := h.authz.Holders(ctx, root, inProd)
+	if err != nil || !slices.Equal(holderPrincipals(holders), []rbac.Principal{identity("dev"), identity("sre")}) || !holders[0].MaybeDenied || holders[1].MaybeDenied {
+		t.Fatalf("Holders asks a constraint on some about each holder: %+v, %v", holders, err)
 	}
 }
 
@@ -2982,7 +3085,10 @@ func TestCustomRoles(t *testing.T) {
 	if !roles[3].Privileged {
 		t.Fatal("a custom role giving root, which only privileged roles give, should be privileged")
 	}
-	if grantable, err := h.authz.Grantable(ctx, admin, cluster); err != nil || !slices.ContainsFunc(grantable, func(r rbac.RoleDefinition) bool { return r.ID == operator.ID }) {
+	// As Roles lists it, its name too, for an access screen to show.
+	if grantable, err := h.authz.Grantable(ctx, admin, cluster); err != nil || !slices.ContainsFunc(grantable, func(r rbac.RoleDefinition) bool {
+		return r.ID == operator.ID && r.Name == operator.Name
+	}) {
 		t.Fatalf("Grantable = %+v, %v", grantable, err)
 	}
 	if err := h.authz.Import(ctx, host, "t2", []rbac.Grant{grant(rbac.TenantRoot("t2"), operator.ID, rbac.User, "op")}); !errors.Is(err, rbac.ErrInvalid) {
@@ -5902,5 +6008,183 @@ func TestReadsUnderWithTxSeeTheHostsTransaction(t *testing.T) {
 	}
 	if holders, err := authz.Holders(ctx, login, cluster); err != nil || !slices.Contains(holderPrincipals(holders), u.Principal) {
 		t.Errorf("Holders = %+v, %v", holders, err)
+	}
+}
+
+func TestAnIDThatIsNoTextIsInvalid(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	owner := h.as(t, "owner")
+	long := strings.Repeat("x", rbac.MaxID+1)
+	for _, id := range []string{"c\x00", "c\xff", long} {
+		r := cluster
+		r.ID = id
+		if err := h.authz.Authorize(ctx, owner, view, r); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("a resource id %q: %v", id[:min(len(id), 8)], err)
+		}
+		if err := h.authz.Authorize(ctx, rbac.Subject{Principal: identity(id)}, view, cluster); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("a subject id %q: %v", id[:min(len(id), 8)], err)
+		}
+		if err := h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity(id)}}}); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("a grant to %q: %v", id[:min(len(id), 8)], err)
+		}
+		if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity(id)}}); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("a membership of %q: %v", id[:min(len(id), 8)], err)
+		}
+		if _, err := h.authz.Memberships(ctx, id, nil); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("a tenant %q: %v", id[:min(len(id), 8)], err)
+		}
+		// Reads and removals by an id are refused too, rather than reach PostgreSQL.
+		scope, p := rbac.Scope{Type: "cluster", ID: id}, identity(id)
+		member := rbac.Member{Group: "g", Principal: p}
+		for name, err := range map[string]error{
+			"Grants":        second(h.authz.Grants(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{scope}})),
+			"Eligibilities": second(h.authz.Eligibilities(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{p}})),
+			"Denies":        second(h.authz.Denies(ctx, "t1", []rbac.Scope{scope})),
+			"Memberships":   second(h.authz.Memberships(ctx, "t1", []rbac.Principal{p})),
+			"MembershipsOf": second(h.authz.MembershipsOf(ctx, p)),
+			"Groups":        second(h.authz.Groups(ctx, id)),
+			"Members":       second(h.authz.Members(ctx, id, "g")),
+			"GroupsOf":      second(h.authz.GroupsOf(ctx, "t1", p)),
+			"CustomRoles":   second(h.authz.CustomRoles(ctx, id)),
+			"DeleteGroups":  h.authz.DeleteGroups(ctx, host, "t1", []string{id}),
+			"DeleteMembers": h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{member}),
+			"ChangeMembers": h.authz.ChangeMembers(ctx, owner, "t1", nil, []rbac.Member{member}),
+			"OnBehalfOf": h.authz.SetMemberships(rbac.WithAudit(ctx, rbac.Audit{OnBehalfOf: p}), host, "t1",
+				[]rbac.Membership{{Principal: identity("someone")}}),
+		} {
+			if !errors.Is(err, rbac.ErrInvalid) {
+				t.Errorf("%s by %q: %v", name, id[:min(len(id), 8)], err)
+			}
+		}
+	}
+	// As is a role, a source, a grant's ID, a deny's id or a kind a call names by.
+	for _, id := range []string{"c\x00", "c\xff"} {
+		role, u := rbac.Role("custom."+id), identity("u")
+		for name, err := range map[string]error{
+			"Apply's revoke":         h.authz.Apply(ctx, owner, cluster, rbac.Change{Revoke: []rbac.Binding{{Role: role, Principal: u}}}),
+			"DeleteGrants by source": h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: rbac.Binding{Role: "cluster.login", Principal: u, Source: id}}}),
+			"DeleteGrants by ID":     h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: rbac.Binding{ID: id, Role: "cluster.login", Principal: u}}}),
+			"DeleteEligibility":      h.authz.DeleteEligibility(ctx, owner, cluster, role, u),
+			"Activate":               second(h.authz.Activate(ctx, owner, cluster, rbac.Activation{Role: role, Duration: time.Minute, Justification: "work"})),
+			"Deactivate":             h.authz.Deactivate(ctx, owner, cluster, role),
+			"DeleteRole":             h.authz.DeleteRole(ctx, owner, "t1", role),
+			"DeleteDeny":             h.authz.DeleteDeny(ctx, owner, cluster, id),
+			"MembershipsOf":          second(h.authz.MembershipsOf(ctx, rbac.Principal{Kind: rbac.PrincipalKind(id), ID: "u"})),
+		} {
+			if !errors.Is(err, rbac.ErrInvalid) {
+				t.Errorf("%s by %q: %v", name, id, err)
+			}
+		}
+	}
+	// A constraint can ask about the anonymous, who are in no group and no tenant.
+	if groups, err := h.authz.GroupsOf(ctx, "t1", rbac.Principal{}); err != nil || len(groups) > 0 {
+		t.Errorf("GroupsOf the anonymous = %v, %v", groups, err)
+	}
+	if ms, err := h.authz.MembershipsOf(ctx, rbac.Principal{}); err != nil || len(ms) > 0 {
+		t.Errorf("MembershipsOf the anonymous = %v, %v", ms, err)
+	}
+	if ms, err := h.authz.Memberships(ctx, "t1", []rbac.Principal{{}}); err != nil || len(ms) > 0 {
+		t.Errorf("Memberships of the anonymous = %v, %v", ms, err)
+	}
+}
+
+// second is the error of a call that returns a value too.
+func second[T any](_ T, err error) error { return err }
+
+func TestHoldersAsksAConstraintOnTheSubjectAboutEachHolder(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.PrincipalKinds = []rbac.PrincipalKind{"service_account"}
+		// As the docs say: removed where the subject could be one, so where it is nil too.
+		c.Constraints = []rbac.Constraint{{Name: "no login for machines", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			return in.Permission == login && (in.Subject == nil || in.Subject.Principal.Kind == "service_account"), nil
+		}}}
+	})
+	ctx := t.Context()
+	owner := h.as(t, "owner")
+	ci := rbac.Principal{Kind: "service_account", ID: "ci"}
+	h.member(t, ci)
+	h.seed(t, grant(cluster.Scope(), "cluster.login", ci.Kind, ci.ID), grant(cluster.Scope(), "cluster.login", rbac.Members, "t1"))
+	holders, err := h.authz.Holders(ctx, login, cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Asked without the request's attributes, a constraint answers for any, so the machine may be
+	// refused, not must be, as may some of the members, and the owner can't be.
+	maybe := map[rbac.Principal]bool{}
+	for _, h := range holders {
+		maybe[h.Principal] = h.MaybeDenied
+	}
+	if want := map[rbac.Principal]bool{ci: true, rbac.TenantMembers("t1"): true, owner.Principal: false}; !maps.Equal(maybe, want) {
+		t.Fatalf("Holders = %+v", holders)
+	}
+}
+
+func TestACheckReadsAGrantAndItsCustomRoleAsOfOneMoment(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	op := rbac.RoleDefinition{ID: "custom.operator", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(ctx, admin, "t1", op); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), op.ID, rbac.User, "op"))
+	operator := h.as(t, "op")
+	// Between the reads, its grant is revoked and then its role widened, which no grant then asks of.
+	once := false
+	rbac.SetReadingRoles(t, func() {
+		if once {
+			return
+		}
+		once = true
+		if err := h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), op.ID, rbac.User, "op")}); err != nil {
+			t.Error(err)
+		}
+		widened := op
+		widened.Permissions = []rbac.Permission{view, login, root}
+		if err := h.authz.SetRole(ctx, admin, "t1", widened); err != nil {
+			t.Error(err)
+		}
+	})
+	if allowed(t, h, operator, root, cluster) {
+		t.Fatal("a revoked grant gave what its role was widened to after")
+	}
+}
+
+// Grantable reads the actor's grants and the custom roles in one statement, as a check reads a
+// grant with its role.
+func TestGrantableReadsAGrantAndItsCustomRoleAsOfOneMoment(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	lead := rbac.RoleDefinition{ID: "custom.lead", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.login"}}
+	if err := h.authz.SetRole(ctx, admin, "t1", lead); err != nil {
+		t.Fatal(err)
+	}
+	held := grant(cluster.Scope(), lead.ID, rbac.User, "lead")
+	h.seed(t, held)
+	actor := h.as(t, "lead")
+	// Once its grants are read, its grant is revoked and then its role widened.
+	once := false
+	rbac.SetReadingRoles(t, func() {
+		if once {
+			return
+		}
+		once = true
+		if err := h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{held}); err != nil {
+			t.Error(err)
+		}
+		widened := lead
+		widened.GrantableRoles = []rbac.Role{"cluster.login", "cluster.sudo"}
+		if err := h.authz.SetRole(ctx, admin, "t1", widened); err != nil {
+			t.Error(err)
+		}
+	})
+	roles, err := h.authz.Grantable(ctx, actor, cluster)
+	if err != nil || !once {
+		t.Fatal(err)
+	}
+	if slices.ContainsFunc(roles, func(r rbac.RoleDefinition) bool { return r.ID == "cluster.sudo" }) {
+		t.Fatalf("Grantable = %+v: a revoked grant offered what its role was widened to list after", roles)
 	}
 }

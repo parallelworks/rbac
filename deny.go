@@ -297,6 +297,9 @@ func (a *Authorizer) DeleteDeny(ctx context.Context, actor Subject, on Resource,
 	if err := a.check(on); err != nil {
 		return err
 	}
+	if !validText(id) {
+		return fmt.Errorf("%w: deny %q is not text without NUL", ErrInvalid, id)
+	}
 	if err := a.subject(actor); err != nil {
 		return err
 	}
@@ -364,8 +367,8 @@ func (a *Authorizer) holdsDeny(ctx context.Context, q DB, actor Subject, on Reso
 
 // Denies lists the deny policies on scopes in a tenant, as stored.
 func (a *Authorizer) Denies(ctx context.Context, tenant string, scopes []Scope) ([]Deny, error) {
-	if tenant == "" || len(scopes) == 0 {
-		return nil, fmt.Errorf("%w: Denies needs a tenant and scopes", ErrInvalid)
+	if !validID(tenant) || len(scopes) == 0 || slices.ContainsFunc(scopes, func(s Scope) bool { return !s.valid() }) {
+		return nil, fmt.Errorf("%w: Denies needs a tenant and valid scopes", ErrInvalid)
 	}
 	keys := make([]string, len(scopes))
 	for i, s := range scopes {
