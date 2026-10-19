@@ -1682,8 +1682,10 @@ func removed[T any](ctx context.Context, a *Authorizer, tx pgx.Tx, table, column
 // DeleteExpired removes grants, eligibilities, group members and tenant memberships that have
 // expired, which no longer give or allow anything, and returns how many: those expired by
 // Config.Now and by the database's clock both, so history records each as an expiry. It passes
-// over those a change is holding, rather than wait on it, so the next run removes them. A race
-// PostgreSQL refuses matches ErrConflict.
+// over those a change is holding, rather than wait on it, so the next run removes them. It
+// removes a batch at a time, on a pool each in a transaction of its own, so none holds many
+// locks, and on an error those it removed before stay removed. A race PostgreSQL refuses matches
+// ErrConflict.
 func (a *Authorizer) DeleteExpired(ctx context.Context) (n int64, err error) {
 	defer a.refused(ctx, &err, "", Principal{}, "DeleteExpired")
 	if err := a.writable(); err != nil {
@@ -1693,11 +1695,18 @@ func (a *Authorizer) DeleteExpired(ctx context.Context) (n int64, err error) {
 	return n, conflicted(err)
 }
 
+// expiryBatch is the most rows of a table one of DeleteExpired's transactions picks, so none
+// holds the locks of, or records, an unbounded number; but for the places in groups of the
+// identities whose memberships it ends, which go with them, however many groups each is in.
+var expiryBatch = 1000
+
 func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
-	// Each in a transaction of its own, which history records as expiries no one made.
-	expire := func(sql string) (int64, error) {
-		var n int64
-		err := a.begin(ctx, func(tx pgx.Tx) error {
+	// As of one time, so rows expiring meanwhile can't keep it deleting.
+	now := a.cfg.Now()
+	// Each batch in a transaction of its own, which history records as expiries no one made. A
+	// statement returns how many of its table's rows it deleted, and how many in all.
+	expire := func(sql string) (n, all int64, err error) {
+		err = a.begin(ctx, func(tx pgx.Tx) error {
 			// It takes no lock, but as a change it reads what committed before it, which only
 			// READ COMMITTED reads: an older snapshot would leave an ended member's newer places.
 			b := &pgx.Batch{}
@@ -1709,43 +1718,49 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 			if err != nil {
 				return err
 			}
-			if err := tx.QueryRow(ctx, sql, a.cfg.Now()).Scan(&n); err != nil {
+			if err := tx.QueryRow(ctx, sql, now, expiryBatch).Scan(&n, &all); err != nil {
 				return err
 			}
 			return done()
 		})
-		return n, err
+		return n, all, err
 	}
 	var total int64
 	// By the database's clock too, which history records an expiry by: a row expired by Config.Now
 	// alone, which can run ahead of it, would be recorded as deleted.
 	for _, sql := range []string{
 		`WITH d AS (DELETE FROM rbac_grants WHERE id IN (
-			SELECT id FROM rbac_grants WHERE expires_at <= least($1, statement_timestamp()) FOR UPDATE SKIP LOCKED) RETURNING 1)
-		SELECT count(*) FROM d`,
+			SELECT id FROM rbac_grants WHERE expires_at <= least($1, statement_timestamp()) LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING 1)
+		SELECT count(*), count(*) FROM d`,
 		`WITH d AS (DELETE FROM rbac_eligibilities WHERE id IN (
-			SELECT id FROM rbac_eligibilities WHERE expires_at <= least($1, statement_timestamp()) FOR UPDATE SKIP LOCKED) RETURNING 1)
-		SELECT count(*) FROM d`,
+			SELECT id FROM rbac_eligibilities WHERE expires_at <= least($1, statement_timestamp()) LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING 1)
+		SELECT count(*), count(*) FROM d`,
 		`WITH d AS (DELETE FROM rbac_members WHERE (tenant, group_id, principal, source) IN (
-			SELECT tenant, group_id, principal, source FROM rbac_members WHERE expires_at <= least($1, statement_timestamp()) FOR UPDATE SKIP LOCKED) RETURNING 1)
-		SELECT count(*) FROM d`,
+			SELECT tenant, group_id, principal, source FROM rbac_members WHERE expires_at <= least($1, statement_timestamp()) LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING 1)
+		SELECT count(*), count(*) FROM d`,
 		// An identity whose membership ended leaves the tenant's groups with it, as one that leaves
 		// the tenant does, so joining again gives back none of the groups it was in. Its own grants
 		// and eligibilities stay, as they do for an identity granted roles in a tenant it isn't in.
 		`WITH ended AS (
 		  DELETE FROM rbac_memberships WHERE (tenant, principal) IN (
-		    SELECT tenant, principal FROM rbac_memberships WHERE expires_at <= least($1, statement_timestamp()) FOR UPDATE SKIP LOCKED)
+		    SELECT tenant, principal FROM rbac_memberships WHERE expires_at <= least($1, statement_timestamp()) LIMIT $2 FOR UPDATE SKIP LOCKED)
 		  RETURNING tenant, principal
 		), left_groups AS (
 		  DELETE FROM rbac_members m USING ended e WHERE m.tenant = e.tenant AND m.principal = e.principal RETURNING 1
 		)
-		SELECT (SELECT count(*) FROM ended) + (SELECT count(*) FROM left_groups)`,
+		SELECT (SELECT count(*) FROM ended), (SELECT count(*) FROM ended) + (SELECT count(*) FROM left_groups)`,
 	} {
-		n, err := expire(sql)
-		if err != nil {
-			return total, err
+		for {
+			// A batch that failed, even once its statement ran, removed nothing.
+			n, all, err := expire(sql)
+			if err != nil {
+				return total, err
+			}
+			total += all
+			if n < int64(expiryBatch) {
+				break
+			}
 		}
-		total += n
 	}
 	return total, nil
 }

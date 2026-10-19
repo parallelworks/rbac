@@ -549,3 +549,85 @@ func TestHoldersLeaveOutTheMembersWhoseGrantsGiveTwoExclusiveValues(t *testing.T
 		t.Fatalf("Holders of bank:a = %+v, %v", holders, err)
 	}
 }
+
+// A change reads the values the identities it reaches hold, however many others in the tenant
+// hold one.
+func TestAChangeReadsOnlyTheValuesOfWhomItReaches(t *testing.T) {
+	h := labeled(t, banks)
+	ctx := t.Context()
+	others := func(n int) {
+		t.Helper()
+		for _, q := range []string{
+			`CREATE TEMP TABLE others AS SELECT gen_random_uuid()::text AS id FROM generate_series(1, $1)`,
+			`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) SELECT 't1', 'user', id FROM others`,
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) SELECT 't1', 'tenant', 't1', 'user', id, 'bank.b' FROM others`,
+			`DROP TABLE others`,
+			`ANALYZE`,
+		} {
+			args := []any{n}
+			if !strings.Contains(q, "$1") {
+				args = nil
+			}
+			if _, err := h.pool.Exec(ctx, q, args...); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	h.as(t, "ann")
+	// The pages of the grants and their indexes giving ann a value reads.
+	read := func() int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		start := pagesRead(ctx, t, tx, "rbac_grants")
+		if err := h.authz.WithTx(tx).Import(ctx, host, "t1", []rbac.Grant{grant(rbac.TenantRoot("t1"), "bank.a", rbac.User, "ann")}); err != nil {
+			t.Fatal(err)
+		}
+		return pagesRead(ctx, t, tx, "rbac_grants") - start
+	}
+	// Ten times as many others deepen the indexes, which a change reads a few pages more of, but
+	// reading their values would take ten times the pages.
+	others(500)
+	few := read()
+	others(4500)
+	if many := read(); many > few*3/2 {
+		t.Fatalf("a grant of a value read %d pages of grants, and %d once 4500 more held one", few, many)
+	}
+}
+
+// The check of a change's exclusive values runs without JIT, but leaves the host's transaction
+// its own setting.
+func TestAChangeLeavesTheHostItsJITSetting(t *testing.T) {
+	h := labeled(t, banks)
+	ctx := t.Context()
+	h.as(t, "ann")
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL jit = on`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.WithTx(tx).Import(ctx, host, "t1", []rbac.Grant{grant(rbac.TenantRoot("t1"), "bank.a", rbac.User, "ann")}); err != nil {
+		t.Fatal(err)
+	}
+	var jit string
+	if err := tx.QueryRow(ctx, `SELECT current_setting('jit')`).Scan(&jit); err != nil || jit != "on" {
+		t.Fatalf("jit = %q, %v", jit, err)
+	}
+}
+
+// pagesRead is how many pages of table and its indexes tx has read.
+func pagesRead(ctx context.Context, t *testing.T, tx pgx.Tx, table string) int64 {
+	t.Helper()
+	var n int64
+	if err := tx.QueryRow(ctx, `SELECT sum(pg_stat_get_xact_blocks_fetched(oid)) FROM pg_class
+		WHERE oid = $1::regclass OR oid IN (SELECT indexrelid FROM pg_index WHERE indrelid = $1::regclass)`, table).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}

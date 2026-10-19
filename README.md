@@ -317,8 +317,8 @@ through which it could write `rbac_history` itself; and:
 - **Limits:** a change takes at most `rbac.MaxBindings` bindings; a principal holds a role on a
   scope at most `rbac.MaxGrantsPerRole` times; a scope holds at most `rbac.MaxDenies` denies; a
   tenant has at most `rbac.MaxCustomRoles` custom roles. The others are exported beside them.
-- **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them, to run on a
-  schedule.
+- **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
+  to run on a schedule.
 
 ## Development
 

@@ -20,3 +20,12 @@ func SetMaxPrune(t *testing.T, n int) {
 	maxPrune = n
 	t.Cleanup(func() { maxPrune = old })
 }
+
+// SetExpiryBatch bounds what one of DeleteExpired's transactions deletes from a table to n until t
+// ends.
+func SetExpiryBatch(t *testing.T, n int) {
+	t.Helper()
+	old := expiryBatch
+	expiryBatch = n
+	t.Cleanup(func() { expiryBatch = old })
+}
