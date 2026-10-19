@@ -584,7 +584,9 @@ func TestAChangesAuthorityIsReadWithItsCustomRolesAsOfOneMoment(t *testing.T) {
 			return
 		}
 		once = true
-		h.seed(t, grant(cluster.Scope(), "custom.b", rbac.User, "lead"))
+		if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "custom.b", rbac.User, "lead")}); err != nil {
+			t.Error(err)
+		}
 		if _, err := h.pool.Exec(ctx, `UPDATE rbac_roles SET permissions = $1 WHERE id = 'custom.a'`, []string{string(view)}); err != nil {
 			t.Error(err)
 		}
