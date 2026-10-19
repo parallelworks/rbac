@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 	"unicode"
 
 	"cel.dev/cel-go/cel"
@@ -26,14 +27,39 @@ import (
 // undeclared, read as any value under any name. Declared, they are read as fields, such as
 // `resource.attributes.env`, and named as identifiers.
 //
-// Declaring changes only what is refused when stored: a condition reading an attribute a request
-// doesn't carry, or carries as another type, is still false when it runs, and a deny's applies.
+// A condition reading an attribute a request doesn't carry, or carries declared as another type
+// than the Go value it passes, or as nil, is false when it runs, and a deny's applies: a declared
+// attribute passed so fails whatever reads it, comparing it with `!=` included. An undeclared
+// kind's are read as passed, and CEL compares values of different types as unequal.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
 
 // AttributeType is a declared attribute's type.
 type AttributeType string
+
+// takes reports whether v is the Go value a host passes for an attribute of type t.
+func (t AttributeType) takes(v any) bool {
+	switch v.(type) {
+	case string:
+		return t == AttrString
+	case int, int64:
+		return t == AttrInt
+	case float64:
+		return t == AttrDouble
+	case bool:
+		return t == AttrBool
+	case time.Time:
+		return t == AttrTimestamp
+	case time.Duration:
+		return t == AttrDuration
+	case []string:
+		return t == AttrStrings
+	case map[string]string:
+		return t == AttrStringMap
+	}
+	return false
+}
 
 // The types an attribute can be declared as, with the Go value a host passes for each.
 const (
@@ -174,6 +200,7 @@ func typing(attrs Attributes) (*cel.Env, error) {
 		return nil, fmt.Errorf("rbac: declaring attributes: %w", err)
 	}
 	return cel.NewEnv(
+		cel.ParserRecursionLimit(maxDepth),
 		cel.TypeDescs(desc),
 		cel.Variable("subject", cel.ObjectType("rbac.Subject")),
 		cel.Variable("resource", cel.ObjectType("rbac.Resource")),
