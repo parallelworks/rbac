@@ -195,6 +195,29 @@ type standing struct {
 	by map[string][]string
 }
 
+// standSQL is stand's statement: tenant $1, identities' keys $2, groups' ids $3, now $4. Groups
+// are read in it, as a group can have many members; an end as seconds since the epoch, which read
+// the same whatever the session's time zone. The planner can't tell how many the groups reach, so
+// the memberships are read by the keys they reach, as one array, into one object each is looked
+// up in: joined on the key alone, a change would read every membership in the tenant to find a
+// few; a lookup for each would cost it as if it read them all, past JIT's thresholds; and joined
+// to the memberships the array finds, which the planner counts as ten, a nested loop would compare
+// each member with every one of them. With no group named, the groups' members are planned out:
+// the planner would cost them by the tenant's largest groups, past JIT's thresholds in a large
+// tenant.
+var standSQL = `
+	WITH RECURSIVE ` + insideSQL("$3", "$4") + `, of(root, principal) AS (
+	  SELECT 'group:' || root, principal FROM inside WHERE $3::text[] IS NOT NULL
+	  UNION SELECT p, p FROM unnest($2::text[]) AS p
+	), held(m) AS (
+	  SELECT jsonb_object_agg(principal, guest::text || ' ' || suspended::text || ' ' ||
+	    coalesce(extract(epoch FROM expires_at)::text, ''))
+	  FROM rbac_memberships WHERE tenant = $1 AND principal = ANY(ARRAY(SELECT principal FROM of))
+	)
+	SELECT o.root, array_agg(o.principal || '=' || coalesce((SELECT m FROM held) ->> o.principal, '') ORDER BY o.principal)
+	FROM of o
+	GROUP BY o.root`
+
 // stand reads the standing of principals in a tenant on q.
 func (a *Authorizer) stand(ctx context.Context, q DB, tenant string, principals []Principal) (standing, error) {
 	s := standing{principals: principals}
@@ -213,17 +236,7 @@ func (a *Authorizer) stand(ctx context.Context, q DB, tenant string, principals 
 	if len(identities)+len(groups) == 0 {
 		return s, nil
 	}
-	// Joined in the statement, as a group can have many members; an end as seconds since the epoch,
-	// which read the same whatever the session's time zone.
-	rows, err := q.Query(ctx, `
-		WITH RECURSIVE `+insideSQL("$3", "$4")+`, of(root, principal) AS (
-		  SELECT 'group:' || root, principal FROM inside
-		  UNION SELECT p, p FROM unnest($2::text[]) AS p
-		)
-		SELECT o.root, array_agg(o.principal || '=' || coalesce(m.guest::text || ' ' || m.suspended::text || ' ' ||
-		  coalesce(extract(epoch FROM m.expires_at)::text, ''), '') ORDER BY o.principal)
-		FROM of o LEFT JOIN rbac_memberships m ON m.tenant = $1 AND m.principal = o.principal
-		GROUP BY o.root`, tenant, identities, groups, a.cfg.Now())
+	rows, err := q.Query(ctx, standSQL, tenant, identities, groups, a.cfg.Now())
 	if err != nil {
 		return standing{}, err
 	}

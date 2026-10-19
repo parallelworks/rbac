@@ -197,6 +197,22 @@ func (h *harness) guest(t *testing.T, id string, groups ...string) rbac.Subject 
 	return s
 }
 
+// manyMembers makes n users of random ids members of t1, and in the same statement writes then,
+// which reads their ids from others(id), as a pool's statements can each run on a connection of
+// their own; then it analyzes the tables they were written to, those named and the memberships.
+func manyMembers(t *testing.T, h *harness, n int, then string, tables ...string) {
+	t.Helper()
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `WITH others AS (SELECT gen_random_uuid()::text AS id FROM generate_series(1, $1)),
+		memberships AS (INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) SELECT 't1', 'user', id FROM others)
+		`+then, n); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `ANALYZE `+strings.Join(append([]string{"rbac_memberships"}, tables...), ", ")); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // member is p as a member of t1 in exactly the groups named, as as is for a user.
 func (h *harness) member(t *testing.T, p rbac.Principal, groups ...string) rbac.Subject {
 	t.Helper()

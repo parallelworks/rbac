@@ -38,3 +38,6 @@ func SetReadingRoles(t *testing.T, f func()) {
 	readingRoles = f
 	t.Cleanup(func() { readingRoles = old })
 }
+
+// StandSQL is the statement a change reads the standing of its principals with.
+var StandSQL = standSQL
