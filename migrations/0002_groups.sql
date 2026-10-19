@@ -33,9 +33,6 @@ CREATE TABLE rbac_groups (
     description text        NOT NULL DEFAULT '' CHECK (length(description) <= 2048),
     -- Empty when made directly, or the host's, such as a directory it syncs from.
     source      text        COLLATE "C" NOT NULL DEFAULT '' CHECK (source ~ '^([a-z][a-z0-9._:/-]{0,62})?$'),
-    -- Set when it is created, and never after: only a privileged group holds a privileged role,
-    -- and only identities are its members.
-    privileged  boolean     NOT NULL DEFAULT false,
     created_by  text        NOT NULL DEFAULT '',
     created_at  timestamptz NOT NULL DEFAULT now(),
     updated_by  text        NOT NULL DEFAULT '',

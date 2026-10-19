@@ -52,7 +52,7 @@ func newWorld(t *testing.T, seed uint64, conditional bool) world {
 	users := []string{"u0", "u1", "u2", "u3", "u4", "u5"}
 	groups := []string{"g0", "g1", "g2", "g3"}
 	h.groups(t, groups...)
-	h.privileged(t, "g0", "g1")
+	h.groups(t, "g0", "g1")
 	var grants []rbac.Grant
 	for i := range 20 {
 		ancestors := spaces[pick(len(spaces))]

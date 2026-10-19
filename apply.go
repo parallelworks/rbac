@@ -120,15 +120,7 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, how
 	named []Principal, check func() error, write func(pgx.Tx) (ChangeEvent, error),
 ) error {
 	scope := on.Scope()
-	cs := a.constrain(ctx, actor, on)
-	if err := a.changing(actor, on, cs); err != nil {
-		return err
-	}
-	// The power to change grants is a permission on the scope, which its label takes too.
-	if dim, err := a.unsatisfied(ctx, actor, on); err != nil || dim != "" {
-		return cmp.Or(err, error(&DeniedError{Permission: GrantPermission(on.Type), Scope: scope, Reason: labelRefusal(dim)}))
-	}
-	au, err := a.mayChange(ctx, a.db, actor, on, grants, revokes, cs)
+	au, cs, err := a.mayChangeGrants(ctx, actor, on, grants, revokes)
 	if err != nil {
 		return err
 	}
@@ -178,11 +170,24 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, how
 		if err := redefinedSince(au.roles, now.roles, roleIDs(grants)); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := strongHold(ctx, tx, on.Tenant, now.roles, grants); err != nil {
-			return ChangeEvent{}, err
-		}
 		return write(tx)
 	})
+}
+
+// mayChangeGrants checks, before a change's transaction, that actor may make grants and revokes on on: it
+// holds the power to change grants there, which on's label takes too, not stopped by a constraint,
+// and may hand each on. It returns that authority and the constraints it asked, which the
+// transaction reads back rather than ask again.
+func (a *Authorizer) mayChangeGrants(ctx context.Context, actor Subject, on Resource, grants, revokes []Binding) (authority, *constrained, error) {
+	cs := a.constrain(ctx, actor, on)
+	if err := a.changing(actor, on, cs); err != nil {
+		return authority{}, nil, err
+	}
+	if dim, err := a.unsatisfied(ctx, actor, on); err != nil || dim != "" {
+		return authority{}, nil, cmp.Or(err, error(&DeniedError{Permission: GrantPermission(on.Type), Scope: on.Scope(), Reason: labelRefusal(dim)}))
+	}
+	au, err := a.mayChange(ctx, a.db, actor, on, grants, revokes, cs)
+	return au, cs, err
 }
 
 // changing refuses a change to grants on a scope of a type the host doesn't have, as a typo no
@@ -345,13 +350,6 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 		if err := redefinedSince(roles, now, roleIDs(grants)); err != nil {
 			return ChangeEvent{}, err
 		}
-		bindings := make([]Binding, len(grants))
-		for i, g := range grants {
-			bindings[i] = g.Binding
-		}
-		if err := strongHold(ctx, tx, tenant, now, bindings); err != nil {
-			return ChangeEvent{}, err
-		}
 		granted, err := a.upsert(ctx, tx, tenant, actor, grants)
 		return ChangeEvent{Granted: granted}, err
 	})
@@ -501,7 +499,7 @@ func (a *Authorizer) checkBinding(roles book, tenant string, scope Scope, b Bind
 	case b.Principal.Kind == Public && !def.Public:
 		bad("the role can't be granted to the public")
 	case b.Principal.Kind == Members && def.Privileged:
-		bad("a privileged role is held only by identities and privileged groups")
+		bad("a privileged role is never granted to the tenant's members")
 	}
 	if !b.ExpiresAt.IsZero() && !b.ExpiresAt.After(now) {
 		bad("already expired")

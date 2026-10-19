@@ -322,7 +322,7 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 		after, widened := a.redefining(au.roles.custom, r)
 		r.Privileged = after.Privileged
 		if was := au.roles.custom[r.ID]; r.Privileged && !was.Privileged {
-			if err := heldStrongly(ctx, tx, tenant, r.ID, a.cfg.Now()); err != nil {
+			if err := heldByMembers(ctx, tx, tenant, r.ID, a.cfg.Now()); err != nil {
 				return ChangeEvent{}, err
 			}
 		}
@@ -514,7 +514,7 @@ func widens(was, now RoleDefinition) bool {
 }
 
 // revalidation is a grant or eligibility the host is asked about again: of a role a redefinition
-// widens, as the role will be, or a privileged group's that an identity joining it gains.
+// widens, as the role will be, or a group's that a member joining it, or a group in it, gains.
 type revalidation struct {
 	scope   Scope
 	binding Binding
@@ -560,30 +560,12 @@ func (a *Authorizer) revalidations(ctx context.Context, q DB, tenant string, wid
 	if err != nil {
 		return nil, err
 	}
-	var groups []string
-	held := func(b Binding) {
-		if b.Principal.Kind == Group && widened[b.Role].Privileged {
-			groups = append(groups, b.Principal.ID)
-		}
-	}
-	for _, g := range grants {
-		held(g.Binding)
-	}
-	for _, e := range eligible {
-		held(e.binding())
-	}
-	var privileged map[string]bool
-	if len(groups) > 0 {
-		if privileged, err = privilegedGroups(ctx, q, tenant, groups); err != nil {
-			return nil, err
-		}
-	}
 	need := make([]revalidation, 0, len(grants)+len(eligible))
 	add := func(scope Scope, b Binding) {
 		def := widened[b.Role]
 		gives := slices.ContainsFunc(def.Permissions, func(p Permission) bool { return b.Principal.carries(def, p) })
-		// A privileged role gives nothing through the tenant's members or a group that isn't privileged.
-		weak := def.Privileged && (b.Principal.broad() || b.Principal.Kind == Group && !privileged[b.Principal.ID])
+		// A privileged role gives nothing through the tenant's members or the public.
+		weak := def.Privileged && b.Principal.broad()
 		if gives && !weak && a.known(tenant, b.Principal) && a.grantableOn(def, scope.Type) {
 			need = append(need, revalidation{scope: scope, binding: b, role: def})
 		}

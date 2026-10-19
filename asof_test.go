@@ -27,7 +27,7 @@ func TestAsOfReadsATenantAsItWas(t *testing.T) {
 	h, guardian := guarded(t)
 	ctx := t.Context()
 	u, v := h.as(t, "u", "sre"), h.as(t, "v")
-	h.privileged(t, "sre")
+	h.groups(t, "sre")
 	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"), grant(cluster.Scope(), "cluster.sudo", rbac.Group, "sre"))
 	// x's login expires between the two times.
 	x := h.as(t, "x")

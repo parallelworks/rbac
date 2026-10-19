@@ -68,7 +68,7 @@ func (p Permission) Valid() bool { return permissionName.MatchString(string(p)) 
 // give, the denies above them, or the groups they reach through.
 func (p Permission) managesAccess() bool {
 	_, verb := p.parts()
-	return p.changesGrants() || p == DefineRoles || p == ManageGroups || p == ManagePrivilegedGroups || p == GroupMembers || verb == "deny"
+	return p.changesGrants() || p == DefineRoles || p == ManageGroups || p == GroupMembers || verb == "deny"
 }
 
 // changesGrants reports whether p is `<type>:grant`, the only permission GrantableRoles limit.
