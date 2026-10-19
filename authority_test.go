@@ -598,3 +598,132 @@ func TestAChangesAuthorityIsReadWithItsCustomRolesAsOfOneMoment(t *testing.T) {
 		t.Fatal("the change read its authority without reaching the hook")
 	}
 }
+
+// What a change rests on is read by the memberships it names, however many others the tenant has
+// in its groups.
+func TestAChangeReadsTheStandingOfOnlyWhomItNames(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.groups(t, "g1", "g2")
+	others := func(n int) {
+		t.Helper()
+		manyMembers(t, h, n, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+			SELECT 't1', 'g' || (1 + (random() < 0.5)::int), 'user', id FROM others`, "rbac_members")
+	}
+	h.as(t, "ann")
+	// The pages of memberships and their indexes granting ann a role reads.
+	read := func() int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		start := pagesRead(ctx, t, tx, "rbac_memberships")
+		if err := h.authz.WithTx(tx).Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "ann")}); err != nil {
+			t.Fatal(err)
+		}
+		return pagesRead(ctx, t, tx, "rbac_memberships") - start
+	}
+	// Ten times as many others deepen the indexes, which a change reads a few pages more of, but
+	// reading every membership would take ten times the pages.
+	others(500)
+	few := read()
+	others(4500)
+	if many := read(); many > few*3/2 {
+		t.Fatalf("granting ann a role read %d pages of memberships, and %d once 4500 more were members of groups", few, many)
+	}
+}
+
+// What a change rests on is costed by what it reads, however large the tenant's groups: costed as
+// if it read every member, its statement would be compiled each time, which takes longer than
+// reading what it names.
+func TestAChangeReadsTheStandingOfWhomItNamesWithoutJIT(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.groups(t, "everyone")
+	everyone := func(n int) {
+		t.Helper()
+		manyMembers(t, h, n, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+			SELECT 't1', 'everyone', 'user', id FROM others`, "rbac_members")
+	}
+	// Each kind a change doesn't name is sent as NULL, as stand sends it.
+	cost := func(identities, groups []string) float64 {
+		t.Helper()
+		var plan []struct {
+			Plan struct {
+				Cost float64 `json:"Total Cost"`
+			}
+		}
+		if err := h.pool.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+rbac.StandSQL, "t1", identities, groups, h.now).Scan(&plan); err != nil {
+			t.Fatal(err)
+		}
+		return plan[0].Plan.Cost
+	}
+	one := []string{"user:u1"}
+	everyone(1500)
+	few := cost(one, nil)
+	everyone(13500)
+	for _, named := range []struct{ identities, groups []string }{{one, nil}, {nil, []string{"everyone"}}} {
+		// PostgreSQL's default jit_above_cost.
+		if c := cost(named.identities, named.groups); c >= 100000 {
+			t.Fatalf("reading the standing of %+v is costed at %.0f, past JIT's threshold", named, c)
+		}
+	}
+	// One identity's is costed alike in a tenant ten times as large: costed by its groups, it would
+	// pass JIT's threshold once they are large enough.
+	if many := cost(one, nil); many > few*3/2 {
+		t.Fatalf("reading the standing of one identity is costed at %.0f, and %.0f once 13500 more were members of a group", few, many)
+	}
+}
+
+// What a change rests on is read in rows as many as whom it names, whichever plan PostgreSQL
+// picks: it costs the memberships a change reaches as ten, so where sorting is dear, as at a
+// small work_mem or in a large tenant, and under the generic plan a cached statement moves to, a
+// join would compare each member with every membership found, which takes seconds for a group of
+// 20,000, under the change's locks.
+func TestAChangeReadsTheStandingOfALargeGroupInRowsAsMany(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.groups(t, "g1", "g2")
+	const n = 2000
+	manyMembers(t, h, 2*n, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+		SELECT 't1', 'g' || (1 + row_number() OVER () % 2), 'user', id FROM others`, "rbac_members")
+	conn, err := h.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `SET work_mem = '64kB'; PREPARE stand AS `+rbac.StandSQL); err != nil {
+		t.Fatal(err)
+	}
+	// Each loop's rows, with those its filters removed, as a nested loop can compare each member
+	// with every membership in a filter and pass on one.
+	type node struct {
+		Rows       float64 `json:"Actual Rows"`
+		Filtered   float64 `json:"Rows Removed by Filter"`
+		JoinFilter float64 `json:"Rows Removed by Join Filter"`
+		Loops      float64 `json:"Actual Loops"`
+		Plans      []node
+	}
+	var rows func(node) float64
+	rows = func(p node) float64 {
+		sum := (p.Rows + p.Filtered + p.JoinFilter) * p.Loops
+		for _, c := range p.Plans {
+			sum += rows(c)
+		}
+		return sum
+	}
+	for _, mode := range []string{"force_custom_plan", "force_generic_plan"} {
+		var plan []struct{ Plan node }
+		if _, err := conn.Exec(ctx, `SET plan_cache_mode = `+mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.QueryRow(ctx, `EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE stand('t1', NULL, '{g1}', now())`).Scan(&plan); err != nil {
+			t.Fatal(err)
+		}
+		if r := rows(plan[0].Plan); r > 50*n {
+			t.Fatalf("reading the standing of a group of %d under %s passed %.0f rows through its plan", n, mode, r)
+		}
+	}
+}

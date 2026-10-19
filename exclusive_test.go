@@ -557,21 +557,8 @@ func TestAChangeReadsOnlyTheValuesOfWhomItReaches(t *testing.T) {
 	ctx := t.Context()
 	others := func(n int) {
 		t.Helper()
-		for _, q := range []string{
-			`CREATE TEMP TABLE others AS SELECT gen_random_uuid()::text AS id FROM generate_series(1, $1)`,
-			`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) SELECT 't1', 'user', id FROM others`,
-			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) SELECT 't1', 'tenant', 't1', 'user', id, 'bank.b' FROM others`,
-			`DROP TABLE others`,
-			`ANALYZE`,
-		} {
-			args := []any{n}
-			if !strings.Contains(q, "$1") {
-				args = nil
-			}
-			if _, err := h.pool.Exec(ctx, q, args...); err != nil {
-				t.Fatal(err)
-			}
-		}
+		manyMembers(t, h, n, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'tenant', 't1', 'user', id, 'bank.b' FROM others`, "rbac_grants")
 	}
 	h.as(t, "ann")
 	// The pages of the grants and their indexes giving ann a value reads.
