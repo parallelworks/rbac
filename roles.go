@@ -254,7 +254,7 @@ func canonical(r RoleDefinition) RoleDefinition {
 // host wasn't asked about it.
 func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, r RoleDefinition) (err error) {
 	defer a.refused(ctx, &err, tenant, actor.Principal, "SetRole")
-	if tenant == "" {
+	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
 	if err := a.subject(actor); err != nil {
@@ -391,7 +391,7 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 // deletion waited for the tenant is refused, as in SetRole.
 func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant string, id Role) (err error) {
 	defer a.refused(ctx, &err, tenant, actor.Principal, "DeleteRole")
-	if tenant == "" || !isCustom(id) {
+	if !validID(tenant) || !isCustom(id) || !validText(string(id)) {
 		return fmt.Errorf("%w: only a tenant's custom role can be deleted", ErrInvalid)
 	}
 	if err := a.subject(actor); err != nil {
@@ -842,6 +842,9 @@ func (a *Authorizer) privileged(r RoleDefinition) bool {
 
 // CustomRoles lists a tenant's custom roles, by id.
 func (a *Authorizer) CustomRoles(ctx context.Context, tenant string) ([]RoleDefinition, error) {
+	if !validID(tenant) {
+		return nil, fmt.Errorf("%w: no tenant", ErrInvalid)
+	}
 	return a.customRoles(ctx, a.db, tenant)
 }
 

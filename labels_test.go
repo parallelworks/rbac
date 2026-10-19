@@ -710,3 +710,63 @@ func TestACustomRoleGivingALabelValueIsForTheTenantAlone(t *testing.T) {
 		t.Fatalf("for the tenant: %v", err)
 	}
 }
+
+// A label value a custom role gives is read with the grant of the role, as of one moment, as a
+// check reads what its grants give.
+func TestALabelValueIsReadWithItsCustomRoleAsOfOneMoment(t *testing.T) {
+	h := labeled(t)
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	h.hold(t, "admin", "comp:alpha", "comp:bravo")
+	cleared := rbac.RoleDefinition{ID: "custom.cleared", Permissions: []rbac.Permission{"comp:alpha"}, ResourceTypes: []string{rbac.TenantScope}}
+	if err := h.authz.SetRole(ctx, admin, "t1", cleared); err != nil {
+		t.Fatal(err)
+	}
+	held := grant(rbac.TenantRoot("t1"), cleared.ID, rbac.User, "op")
+	h.seed(t, held)
+	operator := h.as(t, "op")
+	// Once the values are read, its grant is revoked and then its role widened.
+	once := false
+	rbac.SetReadingRoles(t, func() {
+		if once {
+			return
+		}
+		once = true
+		if err := h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{held}); err != nil {
+			t.Error(err)
+		}
+		widened := cleared
+		widened.Permissions = []rbac.Permission{"comp:alpha", "comp:bravo"}
+		if err := h.authz.SetRole(ctx, admin, "t1", widened); err != nil {
+			t.Error(err)
+		}
+	})
+	values, err := h.authz.Permissions(ctx, operator, tenantT1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(values, []rbac.Permission{"comp:alpha"}) {
+		t.Fatalf("held %v: a revoked grant gave a value its role was widened to after", values)
+	}
+}
+
+// A constraint asked about a holder without the request's attributes answers for any, so Holders
+// marks one whose label value it may remove, as it marks one it may remove the permission from.
+func TestHoldersMarksAHolderAConstraintMayRemoveALabelValueFrom(t *testing.T) {
+	h := labeled(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "high with a second factor", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			return in.Permission == "level:high" && (in.Subject == nil || in.Subject.Attributes["mfa"] != true), nil
+		}}}
+	})
+	owner := h.as(t, "owner")
+	h.hold(t, "owner", "level:high")
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	if !allowed(t, h, rbac.Subject{Principal: owner.Principal, Attributes: map[string]any{"mfa": true}}, view, secret) || allowed(t, h, owner, view, secret) {
+		t.Fatal("the constraint decides the value by the subject's second factor")
+	}
+	holders, err := h.authz.Holders(t.Context(), view, secret)
+	if err != nil || len(holders) != 1 || holders[0].Principal != owner.Principal || !holders[0].MaybeDenied {
+		t.Fatalf("Holders = %+v, %v", holders, err)
+	}
+}

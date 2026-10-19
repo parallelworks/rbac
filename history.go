@@ -40,8 +40,8 @@ func (a *Authorizer) checkAudit(actor Principal, audit Audit) error {
 	switch {
 	case !validText(actor.ID):
 		return fmt.Errorf("%w: the actor's id is text without NUL", ErrInvalid)
-	case audit.OnBehalfOf != (Principal{}) && (!a.acts(audit.OnBehalfOf.Kind) || audit.OnBehalfOf.ID == "" || !validText(audit.OnBehalfOf.ID)):
-		return fmt.Errorf("%w: a change is made on behalf of an identity, a user or a declared kind, whose id is text without NUL", ErrInvalid)
+	case audit.OnBehalfOf != (Principal{}) && (!a.acts(audit.OnBehalfOf.Kind) || !validID(audit.OnBehalfOf.ID)):
+		return fmt.Errorf("%w: a change is made on behalf of an identity, a user or a declared kind, whose id is text without NUL of at most %d bytes", ErrInvalid, MaxID)
 	case utf8.RuneCountInString(audit.Request) > MaxRequest || !validText(audit.Request):
 		return fmt.Errorf("%w: a request id is text of at most %d characters", ErrInvalid, MaxRequest)
 	case !validNote(audit.Reason):

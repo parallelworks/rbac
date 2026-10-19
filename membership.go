@@ -138,7 +138,7 @@ func checkKept(source string, expires time.Time, note string, now time.Time) []s
 // checkMembership returns why a membership can't be stored at now.
 func (a *Authorizer) checkMembership(m Membership, now time.Time) error {
 	var errs []string
-	if !a.acts(m.Principal.Kind) || m.Principal.ID == "" {
+	if !a.acts(m.Principal.Kind) || !validID(m.Principal.ID) {
 		errs = append(errs, "only an identity, a user or a declared kind, is a member of a tenant")
 	}
 	errs = append(errs, checkKept(m.Source, m.ExpiresAt, m.Note, now)...)
@@ -157,7 +157,7 @@ func (a *Authorizer) checkMembership(m Membership, now time.Time) error {
 // it makes it a guest or lifts its suspension.
 func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant string, ms []Membership) (err error) {
 	defer a.refused(ctx, &err, tenant, actor, "SetMemberships")
-	if tenant == "" {
+	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
 	if err := a.identity(actor); err != nil {
@@ -229,8 +229,9 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 // Memberships lists a tenant's memberships in force, by principal: of those principals, or with
 // none, all.
 func (a *Authorizer) Memberships(ctx context.Context, tenant string, principals []Principal) ([]Membership, error) {
-	if tenant == "" {
-		return nil, fmt.Errorf("%w: Memberships needs a tenant", ErrInvalid)
+	// The zero principal, the anonymous subject's, which a constraint may ask about, has none.
+	if !validID(tenant) || slices.ContainsFunc(principals, func(p Principal) bool { return p != (Principal{}) && !p.wellFormed(tenant) }) {
+		return nil, fmt.Errorf("%w: Memberships needs a tenant and valid principals", ErrInvalid)
 	}
 	var keys []string
 	if len(principals) > 0 {
@@ -247,6 +248,13 @@ func (a *Authorizer) Memberships(ctx context.Context, tenant string, principals 
 
 // MembershipsOf lists an identity's memberships in force in every tenant, by tenant.
 func (a *Authorizer) MembershipsOf(ctx context.Context, p Principal) ([]Membership, error) {
+	// The zero principal, the anonymous subject's, which a constraint may ask about, has none.
+	if p == (Principal{}) {
+		return nil, nil
+	}
+	if !validName(string(p.Kind)) || !validID(p.ID) {
+		return nil, fmt.Errorf("%w: MembershipsOf needs a kind and an id of text without NUL of at most %d bytes", ErrInvalid, MaxID)
+	}
 	rows, err := a.db.Query(ctx, `SELECT `+membershipColumns+` FROM rbac_memberships
 		WHERE principal = $1 AND (expires_at IS NULL OR expires_at > $2) ORDER BY tenant`, p.key(), a.cfg.Now())
 	if err != nil {
@@ -297,7 +305,7 @@ func checkGroup(g GroupDefinition) error {
 // (Config.Sources) only the host changes, with ImportGroups.
 func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string, g GroupDefinition) (err error) {
 	defer a.refused(ctx, &err, tenant, actor.Principal, "SetGroup")
-	if tenant == "" {
+	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
 	if err := a.subject(actor); err != nil {
@@ -334,7 +342,7 @@ func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string,
 // host's, which ChangeEvent.Left reports.
 func (a *Authorizer) ImportGroups(ctx context.Context, actor Principal, tenant string, groups []GroupDefinition) (err error) {
 	defer a.refused(ctx, &err, tenant, actor, "ImportGroups")
-	if tenant == "" {
+	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
 	if err := a.identity(actor); err != nil {
@@ -431,8 +439,8 @@ func upsertGroups(ctx context.Context, tx pgx.Tx, tenant string, actor Principal
 // one. Deleting a group that doesn't exist does nothing.
 func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id string) (err error) {
 	defer a.refused(ctx, &err, tenant, actor.Principal, "DeleteGroup")
-	if tenant == "" {
-		return fmt.Errorf("%w: no tenant", ErrInvalid)
+	if !validID(tenant) || !validGroupID(id) {
+		return fmt.Errorf("%w: DeleteGroup needs a tenant and a valid group", ErrInvalid)
 	}
 	if err := a.subject(actor); err != nil {
 		return err
@@ -513,8 +521,8 @@ func (a *Authorizer) DeleteGroups(ctx context.Context, actor Principal, tenant s
 	if len(ids) > MaxBindings {
 		return fmt.Errorf("%w: a deletion names at most %d groups", ErrInvalid, MaxBindings)
 	}
-	if tenant == "" {
-		return fmt.Errorf("%w: no tenant", ErrInvalid)
+	if !validID(tenant) || slices.ContainsFunc(ids, func(id string) bool { return !validGroupID(id) }) {
+		return fmt.Errorf("%w: DeleteGroups needs a tenant and valid groups", ErrInvalid)
 	}
 	if err := a.identity(actor); err != nil {
 		return err
@@ -649,6 +657,9 @@ func (a *Authorizer) mayManageGroups(ctx context.Context, q DB, actor Subject, r
 
 // Groups lists a tenant's groups, by id.
 func (a *Authorizer) Groups(ctx context.Context, tenant string) ([]GroupDefinition, error) {
+	if !validID(tenant) {
+		return nil, fmt.Errorf("%w: no tenant", ErrInvalid)
+	}
 	rows, err := a.db.Query(ctx, `SELECT `+groupColumns+` FROM rbac_groups WHERE tenant = $1 ORDER BY id`, tenant)
 	if err != nil {
 		return nil, err
@@ -689,12 +700,32 @@ func (a *Authorizer) checkMember(m Member, now time.Time) error {
 		errs = append(errs, "the member group is not valid")
 	case p.Kind == Group && p.ID == m.Group:
 		errs = append(errs, "a group can't be in itself")
-	case p.Kind != Group && (!a.acts(p.Kind) || p.ID == ""):
+	case p.Kind != Group && (!a.acts(p.Kind) || !validID(p.ID)):
 		errs = append(errs, "a member is an identity, a user or a declared kind, or a group")
 	}
 	errs = append(errs, checkKept(m.Source, m.ExpiresAt, m.Note, now)...)
 	if len(errs) > 0 {
 		return fmt.Errorf("%w: %s in group %q: %s", ErrInvalid, m.Principal.key(), m.Group, strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// keyed reports whether m names a member as one could be stored, by its group, principal and
+// source, as a removal names it: of any kind, as one the host no longer declares is still removed.
+func (m Member) keyed() bool {
+	if !validGroupID(m.Group) || !validSource(m.Source) {
+		return false
+	}
+	if m.Principal.Kind == Group {
+		return validGroupID(m.Principal.ID)
+	}
+	return validName(string(m.Principal.Kind)) && validID(m.Principal.ID)
+}
+
+// keyedAll returns why not every member is keyed.
+func keyedAll(members []Member) error {
+	if i := slices.IndexFunc(members, func(m Member) bool { return !m.keyed() }); i >= 0 {
+		return fmt.Errorf("%w: %q in group %q is not a valid member", ErrInvalid, members[i].Principal.key(), members[i].Group)
 	}
 	return nil
 }
@@ -706,7 +737,7 @@ func (a *Authorizer) checkMember(m Member, now time.Time) error {
 // grant and eligibility a member gains, as with ChangeMembers.
 func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant string, members []Member) (err error) {
 	defer a.refused(ctx, &err, tenant, actor, "ImportMembers")
-	if tenant == "" {
+	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
 	if err := a.identity(actor); err != nil {
@@ -846,7 +877,7 @@ func (a *Authorizer) join(ctx context.Context, tx pgx.Tx, tenant string, actor P
 // ImportMembers refuses, this does.
 func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant string, add, remove []Member) (err error) {
 	defer a.refused(ctx, &err, tenant, actor.Principal, "ChangeMembers")
-	if tenant == "" {
+	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
 	if err := a.subject(actor); err != nil {
@@ -857,6 +888,9 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 	}
 	if len(add)+len(remove) > MaxBindings {
 		return fmt.Errorf("%w: a change names at most %d members", ErrInvalid, MaxBindings)
+	}
+	if err := keyedAll(remove); err != nil {
+		return err
 	}
 	set, err := a.memberSet(add)
 	if err != nil {
@@ -1478,7 +1512,7 @@ const nestingDepths = `
 // as actor: the host's own write, as for a directory it syncs from.
 func (a *Authorizer) DeleteMembers(ctx context.Context, actor Principal, tenant string, members []Member) (err error) {
 	defer a.refused(ctx, &err, tenant, actor, "DeleteMembers")
-	if tenant == "" {
+	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
 	if err := a.identity(actor); err != nil {
@@ -1489,6 +1523,9 @@ func (a *Authorizer) DeleteMembers(ctx context.Context, actor Principal, tenant 
 	}
 	if len(members) > MaxBindings {
 		return fmt.Errorf("%w: a deletion names at most %d members", ErrInvalid, MaxBindings)
+	}
+	if err := keyedAll(members); err != nil {
+		return err
 	}
 	scopes, principals := memberLocks(members)
 	return a.inTx(ctx, tenant, actor, "DeleteMembers", func(tx pgx.Tx) (ChangeEvent, error) {
@@ -1514,6 +1551,9 @@ func (a *Authorizer) leave(ctx context.Context, tx pgx.Tx, tenant string, member
 // Members lists a group's members in force, as stored: identities and groups, not the members of
 // the groups in it. An identity whose membership of the tenant ended is in none of its groups.
 func (a *Authorizer) Members(ctx context.Context, tenant, group string) ([]Member, error) {
+	if !validID(tenant) || !validGroupID(group) {
+		return nil, fmt.Errorf("%w: Members needs a tenant and a valid group", ErrInvalid)
+	}
 	rows, err := a.db.Query(ctx, `SELECT `+memberColumns+` FROM rbac_members m
 		WHERE tenant = $1 AND group_id = $2 AND (expires_at IS NULL OR expires_at > $3)
 		  AND (principal_kind = 'group' OR `+inTenant("m.principal", "$1", "$3")+`)
@@ -1528,6 +1568,10 @@ func (a *Authorizer) Members(ctx context.Context, tenant, group string) ([]Membe
 // those they are in, to the top, as memberships are in force now. An identity whose membership of
 // the tenant ended is in none.
 func (a *Authorizer) GroupsOf(ctx context.Context, tenant string, p Principal) ([]string, error) {
+	// The zero principal, the anonymous subject's, which a constraint may ask about, is in none.
+	if !validID(tenant) || p != (Principal{}) && !p.wellFormed(tenant) {
+		return nil, fmt.Errorf("%w: GroupsOf needs a tenant and a valid principal", ErrInvalid)
+	}
 	rows, err := a.db.Query(ctx, `
 		WITH RECURSIVE g(id) AS (
 		  SELECT group_id FROM rbac_members WHERE tenant = $1 AND principal = $2 AND (expires_at IS NULL OR expires_at > $3)

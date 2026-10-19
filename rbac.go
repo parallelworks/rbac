@@ -59,7 +59,15 @@ func TenantRoot(tenant string) Scope { return Scope{Type: TenantScope, ID: tenan
 // Key is the scope as `type:id`, the form grants store it in and a host's ancestor paths use.
 func (s Scope) Key() string { return s.Type + ":" + s.ID }
 
-func (s Scope) valid() bool { return validName(s.Type) && s.ID != "" }
+func (s Scope) valid() bool { return validName(s.Type) && validID(s.ID) }
+
+// MaxID is the longest a tenant's, a scope's or a principal's id is, in bytes, so that keys of
+// them fit the database's indexes.
+const MaxID = 512
+
+// validID reports whether s can be a tenant's, a scope's or a principal's id: text without NUL, of
+// 1 to MaxID bytes, as the database stores it.
+func validID(s string) bool { return s != "" && len(s) <= MaxID && validText(s) }
 
 // in reports whether the scope can hold grants in a tenant: a tenant scope only as its own.
 func (s Scope) in(tenant string) bool {
@@ -120,9 +128,9 @@ func (p Principal) wellFormed(tenant string) bool {
 	case Members:
 		return p.ID == tenant
 	case User, Group:
-		return p.ID != ""
+		return validID(p.ID)
 	}
-	return validName(string(p.Kind)) && p.ID != ""
+	return validName(string(p.Kind)) && validID(p.ID)
 }
 
 // known reports whether p can be granted roles in a tenant: well formed, and of a kind every
@@ -185,7 +193,7 @@ type Subject struct {
 
 // subject checks that s is anonymous, or an identity of a kind that acts.
 func (a *Authorizer) subject(s Subject) error {
-	if s.Principal != (Principal{}) && (!a.acts(s.Principal.Kind) || s.Principal.ID == "") {
+	if s.Principal != (Principal{}) && (!a.acts(s.Principal.Kind) || !validID(s.Principal.ID)) {
 		return fmt.Errorf("%w: a subject is anonymous, or a user or declared kind", ErrInvalid)
 	}
 	return nil
@@ -345,8 +353,8 @@ func (a *Authorizer) check(r Resource) error {
 }
 
 func (r Resource) validate() error {
-	if r.Tenant == "" {
-		return fmt.Errorf("%w: resource has no tenant", ErrInvalid)
+	if !validID(r.Tenant) {
+		return fmt.Errorf("%w: resource has no tenant, or not one of text without NUL of at most %d bytes", ErrInvalid, MaxID)
 	}
 	if !r.Scope().in(r.Tenant) {
 		return fmt.Errorf("%w: resource %q is not a valid type and id", ErrInvalid, r.Scope().Key())
@@ -492,15 +500,17 @@ type Constraint struct {
 }
 
 // ConstraintInput is what a constraint is asked about. Searches ask once for every resource of a
-// type, and Holders once for every holder: where Resource or Subject is nil, answer true if the
-// constraint removes the permission for any, so that a search never keeps what a check refuses.
+// type, and Holders first once for every holder: where Resource or Subject is nil, answer true if
+// the constraint removes the permission for any, so that a search never keeps what a check
+// refuses. Holders then asks again about each identity it lists, which it marks MaybeDenied where
+// the constraint answers true.
 type ConstraintInput struct {
 	Tenant       string
 	ResourceType string
 	Permission   Permission
-	// Subject is who asks, or who changes access; nil in Holders, but for the label values of a
-	// holder of a labeled resource, where it is the holder without the attributes Holders doesn't
-	// know: answer true there if the constraint removes the value from that principal with any.
+	// Subject is who asks, or who changes access; nil in Holders' first ask, and then each holder
+	// without the attributes Holders doesn't know, as for the label values of a holder of a
+	// labeled resource: answer true there if the constraint removes it from that principal with any.
 	// Authorizer.GroupsOf reads the groups it is in.
 	Subject *Subject
 	// Resource is what is asked about, with its ancestors and attributes; for what a change hands

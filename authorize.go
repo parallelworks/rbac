@@ -95,64 +95,64 @@ func (a *Authorizer) decideGrants(ctx context.Context, s Subject, p Permission, 
 
 	counts := a.counting(p, r.Type)
 	if !explain {
-		held, ds, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, counts, r.path(), p)
-		if err != nil {
-			return Decision{}, err
-		}
-		// What conditions read is built only for a check that reads one, so one a grant decides
-		// builds none of it.
-		var vars map[string]any
-		if len(ds) > 0 {
-			vars = a.vars(ctx, s, p, r)
-			// A deny decides first, as it binds every grant.
-			if d, ok := a.deniedBy(ds, p, newDenyBudget(r.path()), vars); ok {
-				return Decision{DeniedBy: d.String(), Reason: d.removal()}, nil
-			}
-		}
-		// A built-in role's unconditional grant decides without reading custom roles or conditions.
-		builtin := book{builtin: a.roles}
-		for _, h := range held {
-			if !h.conditional && gives(builtin, h, p, r.Type) {
-				return Decision{Allowed: true}, nil
-			}
-		}
-		roles, err := a.book(ctx, a.db, r.Tenant, roleIDs(held))
-		if err != nil {
-			return Decision{}, err
-		}
-		var conditional []holding
-		for _, h := range held {
-			if !gives(roles, h, p, r.Type) {
-				continue
-			}
-			if !h.conditional {
-				return Decision{Allowed: true}, nil
-			}
-			conditional = append(conditional, h)
-		}
-		if len(conditional) == 0 {
-			return Decision{Reason: "no grant gives it"}, nil
-		}
-		// Only now, with no unconditional grant to allow, are conditions read and evaluated.
-		if err := a.conditionsOf(ctx, a.db, r.Tenant, conditional); err != nil {
-			return Decision{}, err
-		}
-		if vars == nil {
-			vars = a.vars(ctx, s, p, r)
-		}
-		spend := newBudget()
-		cheapestFirst(conditional, holding.expression)
-		for _, h := range conditional {
-			if a.conds.holds(spend, h.Condition.Expression, vars) {
-				return Decision{Allowed: true}, nil
-			}
-		}
-		return Decision{Reason: unmet(spend)}, nil
+		return a.decideHeld(ctx, s, p, r, counts)
 	}
 
 	// Explain reads the subject's groups apart from its grants and denies, so in one snapshot, as
 	// Authorize reads them in one statement.
 	return snapshot(ctx, a, func(a *Authorizer) (Decision, error) { return a.explain(ctx, s, p, r, counts) })
+}
+
+// readingRoles runs once a read has read a subject's grants and the custom roles with them, as a
+// test's change that commits there.
+var readingRoles = func() {}
+
+// decideHeld is Authorize's decision once no constraint removes p, from s's grants and denies and
+// the custom roles they name, read in one statement.
+func (a *Authorizer) decideHeld(ctx context.Context, s Subject, p Permission, r Resource, counts broad) (Decision, error) {
+	held, ds, roles, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, counts, r.path(), p, namedRoles)
+	if err != nil {
+		return Decision{}, err
+	}
+	readingRoles()
+	// What conditions read is built only for a check that reads one, so one a grant decides
+	// builds none of it.
+	var vars map[string]any
+	if len(ds) > 0 {
+		vars = a.vars(ctx, s, p, r)
+		// A deny decides first, as it binds every grant.
+		if d, ok := a.deniedBy(ds, p, newDenyBudget(r.path()), vars); ok {
+			return Decision{DeniedBy: d.String(), Reason: d.removal()}, nil
+		}
+	}
+	var conditional []holding
+	for _, h := range held {
+		if !gives(roles, h, p, r.Type) {
+			continue
+		}
+		if !h.conditional {
+			return Decision{Allowed: true}, nil
+		}
+		conditional = append(conditional, h)
+	}
+	if len(conditional) == 0 {
+		return Decision{Reason: "no grant gives it"}, nil
+	}
+	// Only now, with no unconditional grant to allow, are conditions read and evaluated.
+	if err := a.conditionsOf(ctx, a.db, r.Tenant, conditional); err != nil {
+		return Decision{}, err
+	}
+	if vars == nil {
+		vars = a.vars(ctx, s, p, r)
+	}
+	spend := newBudget()
+	cheapestFirst(conditional, holding.expression)
+	for _, h := range conditional {
+		if a.conds.holds(spend, h.Condition.Expression, vars) {
+			return Decision{Allowed: true}, nil
+		}
+	}
+	return Decision{Reason: unmet(spend)}, nil
 }
 
 // explain is Explain's decision once no constraint removes p: every grant that allows it, or why
@@ -277,19 +277,17 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 
 // permissionsOf is what Permissions lists, once its input is checked, of the permissions only
 // keeps, or all where it is nil; and of them, those a condition decided, a grant's or a deny's,
-// which a read without the request can't settle; and the exclusive dimensions s holds none of,
-// as its grants on the tenant could give it two (excludedBy).
+// or a constraint asked without the request's attributes, which a read without the request can't
+// settle; and the exclusive dimensions s holds none of, as its grants on the tenant could give it
+// two (excludedBy).
 func (a *Authorizer) permissionsOf(ctx context.Context, s Subject, r Resource, only func(Permission) bool) ([]Permission, map[Permission]bool, map[string]bool, error) {
 	kept := func(p Permission) bool { return only == nil || only(p) }
 	byCondition := map[Permission]bool{}
-	held, ds, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), "")
+	held, ds, roles, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), "", namedRoles)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	roles, err := a.book(ctx, a.db, r.Tenant, roleIDs(held))
-	if err != nil {
-		return nil, nil, nil, err
-	}
+	readingRoles()
 	given := map[Permission]bool{}
 	var conditional []holding
 	for _, h := range held {
@@ -338,6 +336,14 @@ func (a *Authorizer) permissionsOf(ctx context.Context, s Subject, r Resource, o
 		denied[p], always[p] = ok, ok && d.condition == ""
 		return ok
 	}
+	// Holders asks a constraint about s without the request's attributes, where it answers true if
+	// it removes p with any: what it removes another request may keep, unless a deny takes it
+	// whatever the request.
+	byConstraint := func(p Permission) {
+		if !isDenied(p) || !always[p] {
+			byCondition[p] = true
+		}
+	}
 	// Conditions are evaluated only for what no unconditional grant gives, as checks do, the
 	// cheapest first.
 	if err := a.conditionsOf(ctx, a.db, r.Tenant, conditional); err != nil {
@@ -354,6 +360,7 @@ func (a *Authorizer) permissionsOf(ctx context.Context, s Subject, r Resource, o
 				if err != nil {
 					return nil, nil, nil, err
 				}
+				byConstraint(p)
 				continue
 			}
 			// The grant's condition decides it, or a deny's that takes it first here, which another
@@ -376,10 +383,12 @@ func (a *Authorizer) permissionsOf(ctx context.Context, s Subject, r Resource, o
 			continue
 		}
 		gone, err := isRemoved(p)
-		if err != nil {
+		switch {
+		case err != nil:
 			return nil, nil, nil, err
-		}
-		if !gone && !isDenied(p) {
+		case gone:
+			byConstraint(p)
+		case !isDenied(p):
 			perms = append(perms, p)
 		}
 	}
@@ -412,10 +421,11 @@ type Holder struct {
 	// the request.
 	Conditional bool
 	// MaybeDenied is set when a deny on the path may bind it: one whose condition depends on the
-	// request, or for the members or the public one that may bind some of them. It is set too
-	// when the resource's label may refuse it: where a condition decides its label values, and
-	// for the members or the public, who hold values each their own; as it is for them where p is
-	// a value of an exclusive dimension, which some of them may hold none of.
+	// request, or for the members or the public one that may bind some of them; and when a
+	// constraint may remove the permission from it. It is set too when the resource's label may
+	// refuse it: where a condition, or a constraint as Holders asks it, decides its label values,
+	// and for the members or the public, who hold values each their own; as it is for them where p
+	// is a value of an exclusive dimension, which some of them may hold none of.
 	MaybeDenied bool
 }
 
@@ -424,8 +434,9 @@ type Holder struct {
 // or through its groups', and the tenant's members and the public where grants to them give it. It
 // counts conditional grants and marks them, and leaves out a holder a deny on the path binds,
 // marking one that a deny may bind: it reads the groups a deny names, and whom it exempts, as
-// checks do. An identity's record counts its own grants and its groups', not the members' or the
-// public's, which are records of their own.
+// checks do. Where a constraint may remove p, it marks each holder it may remove p from, asked
+// about as ConstraintInput says. An identity's record counts its own grants and its groups', not
+// the members' or the public's, which are records of their own.
 func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]Holder, error) {
 	if err := a.check(r); err != nil {
 		return nil, err
@@ -433,8 +444,8 @@ func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]H
 	if err := a.askable(p, r.Type); err != nil {
 		return nil, err
 	}
-	name, err := a.denied(ctx, ConstraintInput{Tenant: r.Tenant, ResourceType: r.Type, Permission: p, Resource: &r})
-	if err != nil || name != "" {
+	removed, err := a.denied(ctx, ConstraintInput{Tenant: r.Tenant, ResourceType: r.Type, Permission: p, Resource: &r})
+	if err != nil {
 		return nil, err
 	}
 	roles, custom := a.giving(p, r.Type), a.customGives(p, r.Type)
@@ -442,19 +453,43 @@ func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]H
 		return nil, nil
 	}
 	holders, err := snapshot(ctx, a, func(a *Authorizer) ([]Holder, error) { return a.holders(ctx, p, r, roles, custom) })
+	if err == nil && removed != "" {
+		holders, err = a.constrained(ctx, p, r, holders)
+	}
 	if _, exclusive := a.exclusiveValue(p); err != nil || !r.Labels.asks() && !exclusive {
 		return holders, err
 	}
 	return a.labeled(ctx, p, r, holders)
 }
 
+// constrained marks MaybeDenied the holders a constraint may remove p from, where one may remove
+// it from some: each identity as the constraint answers about it, as itself without the attributes
+// Holders doesn't know, true if it removes p with any, and the tenant's members and the public,
+// whose people a constraint tells apart. As for a deny whose condition reads the request, Holders
+// can't tell whom a check would refuse, so it lists them all.
+func (a *Authorizer) constrained(ctx context.Context, p Permission, r Resource, holders []Holder) ([]Holder, error) {
+	for i, h := range holders {
+		// One a deny already marks, the hooks needn't be asked about.
+		if h.Principal.broad() || h.MaybeDenied {
+			holders[i].MaybeDenied = true
+			continue
+		}
+		name, err := a.denied(ctx, ConstraintInput{Tenant: r.Tenant, ResourceType: r.Type, Permission: p, Subject: &Subject{Principal: h.Principal}, Resource: &r})
+		if err != nil {
+			return nil, err
+		}
+		holders[i].MaybeDenied = name != ""
+	}
+	return holders, nil
+}
+
 // labeled keeps of holders those whose holding satisfies r's label whatever the request, and
 // where p is a value of an exclusive dimension, holds it: one that satisfies it only with the
-// values a condition decided, which a read without the request can't settle, is marked
-// MaybeDenied, as the members and the public are, whose people hold apart, unless their own grants
-// give two of p's exclusive values, which leaves all of them none; and one that doesn't even then,
-// or holds none of p's dimension, is left out. Each identity's holding is read after the list, as
-// its constraints run as for any read.
+// values a condition or a constraint decided, which a read without the request can't settle, is
+// marked MaybeDenied, as the members and the public are, whose people hold apart, unless their own
+// grants give two of p's exclusive values, which leaves all of them none; and one that doesn't even
+// then, or holds none of p's dimension, is left out. Each identity's holding is read after the
+// list, as its constraints run as for any read.
 func (a *Authorizer) labeled(ctx context.Context, p Permission, r Resource, holders []Holder) ([]Holder, error) {
 	kept := holders[:0]
 	for _, h := range holders {
@@ -835,7 +870,7 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 // searchable returns the built-in roles that give p on a resource type, and whether a
 // constraint removes p there.
 func (a *Authorizer) searchable(ctx context.Context, s Subject, p Permission, tenant, resourceType string) (roles []string, removed bool, err error) {
-	if tenant == "" || !validName(resourceType) {
+	if !validID(tenant) || !validName(resourceType) {
 		return nil, false, fmt.Errorf("%w: a search needs a tenant and a resource type", ErrInvalid)
 	}
 	if err := a.askable(p, resourceType); err != nil {
@@ -853,9 +888,11 @@ func (a *Authorizer) searchable(ctx context.Context, s Subject, p Permission, te
 
 // Columns names the host's columns that Filter reads.
 type Columns struct {
-	// Tenant is the resource's tenant.
+	// Tenant is the resource's tenant, compared as text, byte for byte, as Authorize compares it:
+	// a column of another type, such as uuid, matches the tenant its text names.
 	Tenant string
-	// Path is a text[] holding the resource's Authorizer.Path, with a GIN index.
+	// Path is a text[] holding the resource's Authorizer.Path, with a GIN index. Its keys are
+	// compared byte for byte, whatever its collation, which the index serves in.
 	Path string
 	// Labels is a text[] holding the resource's label as `dimension:value` values, never NULL: '{}'
 	// for none. With a GIN index in the default collation, in which the test compares them, it
@@ -904,8 +941,8 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	keys := func(of string) string {
 		return "ARRAY(WITH RECURSIVE " + keysSQL(arg(1)+"::text", arg(2)+"::text", arg(4)) + " " + of + ")"
 	}
-	// The subject's grants on the scopes `of` keeps, in the default collation, as the host's
-	// path column has it, so its GIN index applies.
+	// The subject's grants on the scopes `of` keeps, in the default collation, which a column's own
+	// collation overrides where a comparison doesn't name one.
 	grants := func(of string) string {
 		return fmt.Sprintf(`SELECT g.scope COLLATE "default" FROM rbac_grants g
 			WHERE g.tenant = %s::text AND g.principal = ANY(%s) AND g.role = ANY(%s)
@@ -932,16 +969,22 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 		}
 		if many {
 			above = slices.DeleteFunc(above, func(t string) bool { return t == resourceType })
-			byKey = fmt.Sprintf(`(%s)[1] IN (%s) OR `, cols.Path, grants(ofType("g.scope", arg(9)+"::text")))
+			byKey = fmt.Sprintf(`(%s)[1] COLLATE "default" IN (%s) OR `, cols.Path, grants(ofType("g.scope", arg(9)+"::text")))
 		}
 	}
-	reached := fmt.Sprintf(`(%s%s && ARRAY(%s))`, byKey, cols.Path, grants(ofTypes("g.scope", arg(5), len(above))))
+	// The host's columns can have a collation of their own, which would compare keys and tenants
+	// that differ, such as in case, as equal. A collation inside a subquery doesn't carry out of
+	// it, so each comparison that decides names the default one, the tenant's as text, as the
+	// column needn't be. The tenant and the path are compared in the column's own collation too,
+	// which its indexes are in, so they serve whatever it is.
+	overlap := "ARRAY(" + grants(ofTypes("g.scope", arg(5), len(above))) + ")"
+	reached := fmt.Sprintf(`(%s%s && %s AND %s && (%s COLLATE "default"))`, byKey, cols.Path, overlap, cols.Path, overlap)
 	pred := Predicate{
-		SQL: fmt.Sprintf(`(%s = %s AND %s
-			AND NOT %s && ARRAY(SELECT d.scope COLLATE "default" FROM rbac_denies d
-			WHERE d.tenant = %s::text AND d.scope_type = ANY(%s::text[])
+		SQL: fmt.Sprintf(`(%[1]s = %[2]s AND (%[1]s)::text = %[5]s::text COLLATE "default" AND %[3]s
+			AND NOT %[4]s && (ARRAY(SELECT d.scope FROM rbac_denies d
+			WHERE d.tenant = %[5]s::text AND d.scope_type = ANY(%[6]s::text[])
 			  AND d.principals && %[7]s AND NOT d.exempt && %[10]s
-			  AND (%[8]s::text = ANY(d.permissions) OR %[9]s::text = ANY(d.permissions))))`,
+			  AND (%[8]s::text = ANY(d.permissions) OR %[9]s::text = ANY(d.permissions))) COLLATE "default"))`,
 			cols.Tenant, arg(0), reached, cols.Path, arg(1), arg(16), keys("SELECT k FROM bound"), arg(14), arg(15), keys("SELECT k FROM exempted")),
 		Args: append(append([]any{
 			tenant, tenant, s.identityKey(), roles, a.cfg.Now(), above, publicKey, a.publicRoles(roles),
@@ -1011,61 +1054,114 @@ type holding struct {
 	conditional bool
 }
 
+// rolesRead is which of a tenant's custom roles heldOrDenied reads with the grants.
+type rolesRead int
+
+const (
+	noRoles rolesRead = iota
+	// namedRoles are those the grants name.
+	namedRoles
+	// tenantRoles are all of them, as a role's GrantableRoles can name any.
+	tenantRoles
+)
+
 // heldOrDenied returns the grants on any of scopes, not expired, held by s's principals in a
 // tenant, counting broad ones as counts says, and the denies deniesOn reads for all its principals
 // and p, or any permission when p is empty, in one statement that reads its membership and groups
 // too, so a check is one round trip. The grants' part reads only what the key index holds, so it
 // is an index-only scan. Like Explain, it reads no deny for a subject none of whose grants count,
-// such as one that isn't a member or guest of the tenant.
-func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Subject, counts broad, scopes []string, p Permission) ([]holding, []denial, error) {
+// such as one that isn't a member or guest of the tenant. It reads the custom roles roles says in
+// the statement too, as SetRole changes one in place: read apart, a grant revoked and its role
+// widened meanwhile could give what no moment did.
+func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Subject, counts broad, scopes []string, p Permission,
+	roles rolesRead,
+) ([]holding, []denial, book, error) {
+	b := book{builtin: a.roles}
 	// The anonymous are the public alone.
 	if s.Principal == (Principal{}) && !counts.public {
-		return nil, nil, nil
+		return nil, nil, b, nil
 	}
 	var perm, wildcard string
 	if p != "" {
 		perm, wildcard = matchable(p)
 	}
+	// In the statement's text rather than an argument: a generic plan can't tell from one whether
+	// to read every role of the tenant or look up those the grants name.
+	var which string
+	switch roles {
+	case noRoles:
+		which = "FALSE"
+	case namedRoles:
+		which = "id IN (SELECT role FROM held WHERE role LIKE '" + CustomPrefix + "%')"
+	case tenantRoles:
+		which = "TRUE"
+	}
+	// Grants, denies and roles in that order; grants by principal, scope, role and id, denies by id
+	// and scope, as deniesOn.
+	const deny, role = 1, 2
 	rows, err := q.Query(ctx, `
-		WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$4")+`
-		SELECT false, id::text, principal, scope, role, expires_at, conditional, NULL::text[], ''
-		FROM rbac_grants
-		WHERE tenant = $1 AND principal = ANY(ARRAY(`+countedKeys("$7", "$8")+`)) AND scope = ANY($3::text[])
-		  AND (expires_at IS NULL OR expires_at > $4)
+		WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$4")+`, held AS (
+		  SELECT id::text, principal, scope, role, expires_at, conditional FROM rbac_grants
+		  WHERE tenant = $1 AND principal = ANY(ARRAY(`+countedKeys("$7", "$8")+`)) AND scope = ANY($3::text[])
+		    AND (expires_at IS NULL OR expires_at > $4)
+		)
+		SELECT 0, id, principal, scope, role, expires_at, conditional, NULL::text[], '', NULL::text[], false, false, NULL::text[], '', ''
+		FROM held
 		UNION ALL
-		SELECT true, id, id, scope, '', NULL, condition <> '', permissions, condition
+		SELECT 1, id, id, scope, '', NULL, condition <> '', permissions, condition, NULL, false, false, NULL, '', ''
 		FROM rbac_denies
 		WHERE tenant = $1 AND scope = ANY($3::text[]) AND principals && ARRAY(SELECT k FROM bound) AND NOT exempt && ARRAY(SELECT k FROM exempted)
 		  AND ($5 = '' OR $5 = ANY(permissions) OR $6 = ANY(permissions)) AND EXISTS (SELECT FROM keys WHERE `+counted("$7", "$8")+`)
-		ORDER BY 1, 3, 4, 5, 2`, // grants by principal, scope, role and id; denies by id and scope, as deniesOn
+		UNION ALL
+		SELECT 2, id, '', '', id, NULL, false, permissions, '', resource_types, privileged, public, grantable_roles, name, description
+		FROM rbac_roles
+		WHERE tenant = $1 AND `+which+`
+		ORDER BY 1, 3, 4, 5, 2`,
 		tenant, s.identityKey(), scopes, a.cfg.Now(), perm, wildcard, counts.public, counts.members)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, book{}, err
 	}
 	var held []holding
 	var ds []denial
-	var isDeny bool
-	var id, principal, scope, role, condition string
+	var custom []RoleDefinition
+	var kind int
+	var id, principal, scope, roleID, condition, name, description string
 	var expires *time.Time
-	var conditional bool
-	var perms []string
-	_, err = pgx.ForEachRow(rows, []any{&isDeny, &id, &principal, &scope, &role, &expires, &conditional, &perms, &condition}, func() error {
-		if isDeny {
+	var conditional, privileged, public bool
+	var perms, types, grantable []string
+	_, err = pgx.ForEachRow(rows, []any{&kind, &id, &principal, &scope, &roleID, &expires, &conditional, &perms, &condition, &types, &privileged, &public, &grantable, &name, &description}, func() error {
+		switch kind {
+		case deny:
 			d := denial{id: id, scope: scope, condition: condition}
 			for _, x := range perms {
 				d.permissions = append(d.permissions, Permission(x))
 			}
 			ds = append(ds, d)
-			return nil
+		case role:
+			r := RoleDefinition{ID: Role(id), Name: name, Description: description, ResourceTypes: types, Privileged: privileged, Public: public}
+			for _, x := range perms {
+				r.Permissions = append(r.Permissions, Permission(x))
+			}
+			for _, g := range grantable {
+				r.GrantableRoles = append(r.GrantableRoles, Role(g))
+			}
+			custom = append(custom, r)
+		default:
+			h := holding{Binding: Binding{ID: id, Principal: parsePrincipal(principal), Role: Role(roleID)}, scope: scope, conditional: conditional}
+			if expires != nil {
+				h.ExpiresAt = *expires
+			}
+			held = append(held, h)
 		}
-		h := holding{Binding: Binding{ID: id, Principal: parsePrincipal(principal), Role: Role(role)}, scope: scope, conditional: conditional}
-		if expires != nil {
-			h.ExpiresAt = *expires
-		}
-		held = append(held, h)
 		return nil
 	})
-	return held, ds, err
+	if err != nil {
+		return nil, nil, book{}, err
+	}
+	if len(custom) > 0 {
+		b = a.bookOf(a.current(custom))
+	}
+	return held, ds, b, nil
 }
 
 // conditionsOf reads the conditions of the conditional grants among held, in place.

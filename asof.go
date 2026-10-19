@@ -52,7 +52,7 @@ var asOfEntities = []struct {
 // they are now, so AsOf refuses it. It orders a row's changes by their ids in rbac_history, which
 // sessions take out of order once its id sequence caches more than one, so AsOf refuses that too.
 func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read func(*Authorizer) error) (err error) {
-	if tenant == "" {
+	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
 	if a.asOf {
