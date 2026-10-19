@@ -1637,6 +1637,130 @@ func TestChangingMembersReadsTheScopesItReachesFromTheHost(t *testing.T) {
 	}
 }
 
+func TestEndingAMembershipSoonerIsCheckedAsLeaving(t *testing.T) {
+	h := grouped(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), guardRole) })
+	ctx := t.Context()
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "contractors"}}); err != nil {
+		t.Fatal(err)
+	}
+	root := rbac.TenantRoot("t1")
+	h.seed(t, grant(root, "group.members", rbac.User, "lead"), grant(root, "group.members", rbac.User, "guardian"),
+		grant(cluster.Scope(), "guard", rbac.User, "guardian"), grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	guardian, lead := h.as(t, "guardian"), h.as(t, "lead")
+	h.join(t, "u", "v")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "contractors", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	d := rbac.Deny{ID: "d", Principals: []rbac.Principal{groupOf("contractors")}, Permissions: []rbac.Permission{login}}
+	if err := h.authz.SetDeny(ctx, guardian, cluster, d); err != nil {
+		t.Fatal(err)
+	}
+	until := func(id string) []rbac.Member {
+		return []rbac.Member{{Group: "contractors", Principal: identity(id), ExpiresAt: h.now.Add(time.Minute)}}
+	}
+	// Once it ends, u is no longer in the group the deny names, as if removed now.
+	if err := h.authz.ChangeMembers(ctx, lead, "t1", until("u"), nil); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("ending u's membership of a denied group sooner by a member manager: %v", err)
+	}
+	// Joining for a while lifts nothing that bound v before.
+	if err := h.authz.ChangeMembers(ctx, lead, "t1", until("v"), nil); err != nil {
+		t.Fatalf("v joining a denied group for a while: %v", err)
+	}
+	if err := h.authz.ChangeMembers(ctx, guardian, "t1", until("u"), nil); err != nil {
+		t.Fatalf("ending u's membership sooner by one who sets the deny: %v", err)
+	}
+	// Ending one that ends already, sooner still, is the same.
+	sooner := until("u")
+	sooner[0].ExpiresAt = h.now.Add(time.Second)
+	if err := h.authz.ChangeMembers(ctx, lead, "t1", sooner, nil); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("ending u's membership sooner still by a member manager: %v", err)
+	}
+}
+
+// A change joining someone to a group is refused when, while the host was asked about what it
+// gains, they joined it already for longer: the change ends that sooner, lifting a deny.
+func TestAJoinThatBecomesEndingSoonerMeanwhileIsTriedAgain(t *testing.T) {
+	var meanwhile func(ctx context.Context) error
+	h := grouped(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), guardRole)
+		c.ValidateGrant = func(ctx context.Context, _ rbac.DB, in rbac.GrantInput) error {
+			if do := meanwhile; do != nil && in.Via == rbac.ViaMembership {
+				meanwhile = nil
+				return do(ctx)
+			}
+			return nil
+		}
+	})
+	ctx := t.Context()
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "contractors"}}); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "contractors"), grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+	h.join(t, "u")
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, rbac.Deny{ID: "d", Principals: []rbac.Principal{groupOf("contractors")}, Permissions: []rbac.Permission{root}}); err != nil {
+		t.Fatal(err)
+	}
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "contractors", Principal: identity("u")}})
+	}
+	add := []rbac.Member{{Group: "contractors", Principal: identity("u"), ExpiresAt: h.now.Add(time.Minute)}}
+	if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", add, nil); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("a join that ends a membership made meanwhile sooner: %v", err)
+	}
+}
+
+func TestAGroupApprovingWhatCantBeGrantedNowTakesNoMembers(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "approvers"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+		VALUES ('t1', 'node', 'n1', 'user', 'v', 'cluster.login', 3600, '{group:approvers}')`); err != nil {
+		t.Fatal(err)
+	}
+	h.join(t, "u")
+	err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", []rbac.Member{{Group: "approvers", Principal: identity("u")}}, nil)
+	if !errors.Is(err, rbac.ErrInvalid) || !strings.Contains(err.Error(), "can't be granted there now") {
+		t.Fatalf("adding to a group approving what can't be granted now: %v", err)
+	}
+}
+
+func TestWithoutResourceOfAScopesAttributesAreDeclaredNone(t *testing.T) {
+	flat := func(attrs rbac.Attributes) func(*rbac.Config) {
+		return func(c *rbac.Config) {
+			c.ContainerTypes, c.ResourceOf, c.Attributes = nil, nil, attrs
+			c.Catalog = append(slices.Clone(c.Catalog), guardRole)
+		}
+	}
+	c1 := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c1", Attributes: map[string]any{"frozen": true}}
+	add := []rbac.Member{{Group: "admins", Principal: identity("u")}}
+	// Undeclared, a condition reads any attribute: one the scope is taken to lack would lift a
+	// deny on the cluster.
+	h := grouped(t, flat(rbac.Attributes{}))
+	ctx := t.Context()
+	h.seed(t, grant(c1.Scope(), "cluster.login", rbac.Group, "admins"), grant(c1.Scope(), "guard", rbac.User, "guardian"))
+	h.join(t, "u")
+	manager := h.as(t, "manager")
+	frozen := rbac.Deny{
+		ID: "frozen", Principals: []rbac.Principal{manager.Principal}, Permissions: []rbac.Permission{grantC},
+		Condition: rbac.Condition{Expression: "has(resource.attributes.frozen) && resource.attributes.frozen"},
+	}
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), c1, frozen); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", add, nil); !errors.Is(err, rbac.ErrInvalid) || !strings.Contains(err.Error(), "ResourceOf") {
+		t.Fatalf("adding with undeclared attributes and no ResourceOf: %v", err)
+	}
+	// Declared none, the scope is exactly as taken.
+	h = grouped(t, flat(rbac.Attributes{Resource: map[string]rbac.AttributeType{}}))
+	h.seed(t, grant(c1.Scope(), "cluster.login", rbac.Group, "admins"))
+	h.join(t, "u")
+	if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", add, nil); err != nil {
+		t.Fatalf("adding with no attributes declared: %v", err)
+	}
+}
+
 func TestAConstraintStopsChangingMembers(t *testing.T) {
 	h := grouped(t, constrain("managed elsewhere", rbac.GroupMembers))
 	ctx := t.Context()
@@ -1820,6 +1944,42 @@ func TestImportingMembersAsksAboutWhatAGroupHolds(t *testing.T) {
 	}
 	if len(asked) != 1 || asked[0].Binding.Principal != identity("u") || asked[0].Actor.Principal != host || asked[0].Binding.Role != "cluster.sudo" {
 		t.Fatalf("asked = %+v", asked)
+	}
+}
+
+func TestImportingMembersWaitsOnlyForWhatTheHostIsAsked(t *testing.T) {
+	var h *harness
+	var meanwhile func(ctx context.Context) error
+	h = grouped(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), guardRole)
+		c.ValidateGrant = func(ctx context.Context, _ rbac.DB, in rbac.GrantInput) error {
+			if do := meanwhile; do != nil && in.Via == rbac.ViaMembership {
+				meanwhile = nil
+				return do(ctx)
+			}
+			return nil
+		}
+	})
+	ctx := t.Context()
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "admins"}}); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "admins"), grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+	guardian := h.as(t, "guardian")
+	h.join(t, "u")
+	// The host's write isn't checked against denies, so one exempting the group meanwhile changes
+	// nothing it was asked about.
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.SetDeny(ctx, guardian, cluster, rbac.Deny{
+			ID: "d", Principals: []rbac.Principal{{Kind: rbac.Public}},
+			Exempt: []rbac.Principal{groupOf("admins")}, Permissions: []rbac.Permission{root},
+		})
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "admins", Principal: identity("u")}}); err != nil {
+		t.Fatalf("importing while a deny exempting the group is set: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("the host wasn't asked about what u gains")
 	}
 }
 
@@ -2116,5 +2276,50 @@ func TestConfigResourceOfIsTheScopeItIsAskedFor(t *testing.T) {
 	h.join(t, "u")
 	if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", []rbac.Member{{Group: "admins", Principal: identity("u")}}, nil); err == nil {
 		t.Fatal("a change checked on a resource other than the scope it reaches")
+	}
+}
+
+func TestChangingMembersReadsTheTenantFromTheHostToo(t *testing.T) {
+	locked := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1", Attributes: map[string]any{"locked": true}}
+	h := grouped(t, func(c *rbac.Config) {
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s == locked.Scope() {
+				return locked, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+		c.Constraints = []rbac.Constraint{{Name: "locked", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			return in.Permission == rbac.GrantPermission(rbac.TenantScope) && in.Resource != nil && in.Resource.Attributes["locked"] == true, nil
+		}}}
+	})
+	ctx := t.Context()
+	root := rbac.TenantRoot("t1")
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "leads"}}); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(root, "tenant.admin", rbac.Group, "leads"), grant(root, "tenant.admin", rbac.User, "manager"))
+	h.join(t, "u")
+	add := []rbac.Member{{Group: "leads", Principal: identity("u")}}
+	if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", add, nil); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("granting on a locked tenant through a group: %v", err)
+	}
+}
+
+func TestAGroupHoldingWhatCantBeGrantedNowTakesNoMembers(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "admins"}}); err != nil {
+		t.Fatal(err)
+	}
+	// As a catalog change leaves it: a role on a scope it is no longer for.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'node', 'n1', 'group', 'admins', 'cluster.login')`); err != nil {
+		t.Fatal(err)
+	}
+	h.join(t, "u")
+	err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", []rbac.Member{{Group: "admins", Principal: identity("u")}}, nil)
+	if !errors.Is(err, rbac.ErrInvalid) || !strings.Contains(err.Error(), "can't be granted there now") {
+		t.Fatalf("adding to a group holding what can't be granted now: %v", err)
 	}
 }

@@ -173,10 +173,12 @@ another store. Both search one tenant, and count only unconditional grants:
   gains the group's grants and eligibilities, which the actor must be able to grant it, and
   `ValidateGrant` is asked about each as the member's (`rbac.ViaMembership`); it approves what the
   group approves, which the actor must be able to set; and it is exempt from the denies the group
-  is exempt from, as a removed member is from those naming it, which the actor must be able to set.
-  So whoever manages a group that holds nothing changes its members freely, and one holding a role
-  only if they could grant that role themselves. `Config.ResourceOf` gives the package the
-  containers, label and attributes of the scopes a group's access is on.
+  is exempt from, as a removed member, or one whose membership is made to end sooner, is from
+  those naming it, which the actor must be able to set. So whoever manages a group that holds,
+  approves and is in no deny changes its members freely, and one holding a role only if they could
+  grant that role themselves. `Config.ResourceOf` gives the package the containers, label and
+  attributes of the scopes a group's access is on; a host without it declares no containers or
+  labels, and resource attributes as none.
 - **Privileged roles:** a role the catalog marks `Privileged`, or one that changes access, is
   privileged: it is never granted to the tenant's members, and gives nothing through them, as
   after a catalog change.

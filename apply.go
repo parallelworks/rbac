@@ -50,8 +50,8 @@ func (e *InvalidError) Unwrap() error { return e.Err }
 //     condition the grant has: a role a conditional grant lists is granted only under its
 //     condition;
 //   - a role that gives a `:grant` or `:deny` permission, DefineRoles, ManageGroups or
-//     ManagePrivilegedGroups can't be granted to a tenant's members or the public, and only a role
-//     marked Public can be granted to the public;
+//     GroupMembers can't be granted to a tenant's members or the public, and only a role marked
+//     Public can be granted to the public;
 //   - a group granted a role, or one a role is granted on, is one of the tenant's: what a grant
 //     naming one that doesn't exist gave would pass to a group made later with its id.
 //

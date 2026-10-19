@@ -296,18 +296,11 @@ func (a *Authorizer) Deactivate(ctx context.Context, s Subject, on Resource, rol
 // groups, as its grants do, never through the tenant's members.
 func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource, act Activation, until time.Time) (approved Principal, err error) {
 	scope, manage := on.Scope(), GrantPermission(on.Type)
-	keys, named, err := a.keysOf(ctx, q, on.Tenant, s)
+	keys, err := a.keysOf(ctx, q, on.Tenant, s)
 	if err != nil {
 		return Principal{}, err
 	}
-	roles, err := a.book(ctx, q, on.Tenant, []Role{act.Role})
-	if err != nil {
-		return Principal{}, err
-	}
-	if def, _ := roles.role(act.Role); def.Privileged {
-		keys = named
-	}
-	approvers, _, err := a.keysOf(ctx, q, on.Tenant, act.Approver)
+	approvers, err := a.keysOf(ctx, q, on.Tenant, act.Approver)
 	if err != nil {
 		return Principal{}, err
 	}
