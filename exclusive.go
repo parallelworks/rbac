@@ -233,6 +233,20 @@ func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives m
 			roles, values = append(roles, string(r)), append(values, string(p))
 		}
 	}
+	// The planner can't tell which of targets' branches the seeds reach, so it costs a change's
+	// check as if it read every identity in the tenant, past JIT's thresholds where they are in
+	// groups: compiling then takes a second for a plan that runs in milliseconds. JIT is off for
+	// this statement alone, so a host's transaction under WithTx gets its own setting back.
+	var jit string
+	if err := q.QueryRow(ctx, `SELECT current_setting('jit'), set_config('jit', 'off', true)`).Scan(&jit, nil); err != nil {
+		return nil, err
+	}
+	// A change's check and the listing of every conflict are statements of their own, so the
+	// listing's cost never moves a connection's cached plan for the check to a generic one.
+	limited := ""
+	if limit > 0 {
+		limited = fmt.Sprintf(" LIMIT %d", limit)
+	}
 	// Each key's values are looked up by key, so a change reads what the identities it reaches
 	// hold, not every value held in the tenant, and stops at the first conflict it finds.
 	rows, err := q.Query(ctx, `
@@ -266,8 +280,8 @@ func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives m
 		  JOIN unnest($5::text[], $6::text[]) AS v(role, value) ON v.role = g.role
 		)
 		SELECT identity, split_part(value, ':', 1), array_agg(DISTINCT value ORDER BY value) FROM held
-		GROUP BY 1, 2 HAVING count(DISTINCT value) > 1 ORDER BY 1, 2 LIMIT nullif($7, 0)`,
-		tenant, seeds, holdersOf, a.cfg.Now(), roles, values, limit)
+		GROUP BY 1, 2 HAVING count(DISTINCT value) > 1 ORDER BY 1, 2`+limited,
+		tenant, seeds, holdersOf, a.cfg.Now(), roles, values)
 	if err != nil {
 		return nil, err
 	}
@@ -287,5 +301,11 @@ func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives m
 		found = append(found, c)
 		return nil
 	})
-	return found, err
+	if err != nil {
+		return nil, err
+	}
+	if _, err := q.Exec(ctx, `SELECT set_config('jit', $1, true)`, jit); err != nil {
+		return nil, err
+	}
+	return found, nil
 }

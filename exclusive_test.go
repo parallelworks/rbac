@@ -598,6 +598,29 @@ func TestAChangeReadsOnlyTheValuesOfWhomItReaches(t *testing.T) {
 	}
 }
 
+// The check of a change's exclusive values runs without JIT, but leaves the host's transaction
+// its own setting.
+func TestAChangeLeavesTheHostItsJITSetting(t *testing.T) {
+	h := labeled(t, banks)
+	ctx := t.Context()
+	h.as(t, "ann")
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL jit = on`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.WithTx(tx).Import(ctx, host, "t1", []rbac.Grant{grant(rbac.TenantRoot("t1"), "bank.a", rbac.User, "ann")}); err != nil {
+		t.Fatal(err)
+	}
+	var jit string
+	if err := tx.QueryRow(ctx, `SELECT current_setting('jit')`).Scan(&jit); err != nil || jit != "on" {
+		t.Fatalf("jit = %q, %v", jit, err)
+	}
+}
+
 // pagesRead is how many pages of table and its indexes tx has read.
 func pagesRead(ctx context.Context, t *testing.T, tx pgx.Tx, table string) int64 {
 	t.Helper()

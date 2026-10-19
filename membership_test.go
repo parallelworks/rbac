@@ -576,6 +576,37 @@ func TestDeleteExpiredRemovesABatchAtATime(t *testing.T) {
 	}
 }
 
+// A batch whose transaction fails, though its statement ran, removed nothing, so DeleteExpired
+// counts only the batches before it.
+func TestDeleteExpiredCountsOnlyTheBatchesItRemoved(t *testing.T) {
+	rbac.SetExpiryBatch(t, 2)
+	h := setup(t)
+	ctx := t.Context()
+	for _, q := range []string{
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+		  SELECT 't1', 'cluster', 'c1', 'user', 'g' || i, 'cluster.login', '2025-01-01' FROM generate_series(1, 3) i`,
+		// Refused as its transaction commits, once the statement deleting it has counted it.
+		`CREATE FUNCTION refuse() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refused'; END $$`,
+		`CREATE CONSTRAINT TRIGGER refuse AFTER DELETE ON rbac_grants DEFERRABLE INITIALLY DEFERRED
+		  FOR EACH ROW WHEN (old.principal_id = 'g3') EXECUTE FUNCTION refuse()`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err := h.authz.DeleteExpired(ctx)
+	if err == nil {
+		t.Fatal("DeleteExpired removed a grant its transaction refused")
+	}
+	var left int64
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM rbac_grants WHERE principal_id LIKE 'g_'`).Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	if n != 3-left {
+		t.Errorf("DeleteExpired = %d, with %d of 3 grants left", n, left)
+	}
+}
+
 func TestDeleteExpiredRefusedForARaceConflicts(t *testing.T) {
 	h := grouped(t)
 	ctx := t.Context()

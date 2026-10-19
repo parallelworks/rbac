@@ -1695,8 +1695,9 @@ func (a *Authorizer) DeleteExpired(ctx context.Context) (n int64, err error) {
 	return n, conflicted(err)
 }
 
-// expiryBatch is the most rows of a table one of DeleteExpired's transactions deletes, so none
-// holds the locks of, or records, an unbounded number.
+// expiryBatch is the most rows of a table one of DeleteExpired's transactions picks, so none
+// holds the locks of, or records, an unbounded number; but for the places in groups of the
+// identities whose memberships it ends, which go with them, however many groups each is in.
 var expiryBatch = 1000
 
 func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
@@ -1750,11 +1751,12 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 		SELECT (SELECT count(*) FROM ended), (SELECT count(*) FROM ended) + (SELECT count(*) FROM left_groups)`,
 	} {
 		for {
+			// A batch that failed, even once its statement ran, removed nothing.
 			n, all, err := expire(sql)
-			total += all
 			if err != nil {
 				return total, err
 			}
+			total += all
 			if n < int64(expiryBatch) {
 				break
 			}
