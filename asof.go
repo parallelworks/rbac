@@ -149,6 +149,11 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 			if h, ok := e.columns[name]; ok {
 				selected[i] = "h." + h + " AS " + pgx.Identifier{name}.Sanitize()
 			}
+			// A version recorded before the tables refused an infinite expiry reads as migrating
+			// rewrote its row: a time.Time holds no infinity.
+			if name == "expires_at" {
+				selected[i] = `CASE r.expires_at WHEN 'infinity' THEN NULL WHEN '-infinity' THEN timestamptz 'epoch' ELSE r.expires_at END AS expires_at`
+			}
 		}
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`CREATE TEMP VIEW %[2]s AS
 			SELECT %[4]s FROM %[1]s.rbac_history h, LATERAL pg_catalog.jsonb_populate_record(NULL::%[1]s.%[2]s, h.after) r

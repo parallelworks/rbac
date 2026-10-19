@@ -442,12 +442,15 @@ func TestAsOfReadsARowChangedInPlaceAsItsLastVersion(t *testing.T) {
 }
 
 // A check as of a time reads the history of its subject's grants, memberships and groups, not
-// every row's: other principals' history costs it nothing.
+// every row's, and of a conditional grant it holds, for its condition: other principals' history
+// costs it nothing.
 func TestAsOfReadsOnlyTheRowsAStatementNames(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
-	u := h.as(t, "u", "sre")
-	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"), grant(cluster.Scope(), "cluster.sudo", rbac.Group, "sre"))
+	u, w := h.as(t, "u", "sre"), h.as(t, "w")
+	conditional := grant(cluster.Scope(), "cluster.login", rbac.User, "w")
+	conditional.Condition = rbac.Condition{Title: "t", Expression: `action == "cluster:login"`}
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"), grant(cluster.Scope(), "cluster.sudo", rbac.Group, "sre"), conditional)
 	// Other principals' grants on the cluster, each changed once since.
 	others := func(n int) {
 		t.Helper()
@@ -476,7 +479,10 @@ func TestAsOfReadsOnlyTheRowsAStatementNames(t *testing.T) {
 		var read int64
 		if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
 			start := historyPages(ctx, t, tx)
-			err := a.Authorize(ctx, u, root, cluster)
+			if err := a.Authorize(ctx, u, root, cluster); err != nil {
+				return err
+			}
+			err := a.Authorize(ctx, w, login, cluster)
 			read = historyPages(ctx, t, tx) - start
 			return err
 		}); err != nil {

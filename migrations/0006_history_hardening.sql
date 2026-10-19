@@ -76,15 +76,16 @@ ALTER TABLE rbac_history ALTER COLUMN recorded_at SET DEFAULT clock_timestamp();
 
 -- An expiry of infinity or -infinity, which a role that may write the tables could store, is one a
 -- time.Time can't hold, so History failed on its record, and every export stopped there. Those
--- stored are kept as what they meant: one at infinity never expires, and one at -infinity has.
+-- stored are kept as what they meant: one at infinity never expires, and one at -infinity has, by
+-- any clock: dated by the migration, it would read as held to a host whose clock is behind.
 SELECT set_config('rbac.change', '{"how": "Migrate"}', true);
-UPDATE rbac_grants SET expires_at = CASE WHEN expires_at = 'infinity' THEN NULL ELSE statement_timestamp() END
+UPDATE rbac_grants SET expires_at = CASE WHEN expires_at = 'infinity' THEN NULL ELSE timestamptz 'epoch' END
     WHERE expires_at IN ('infinity', '-infinity');
-UPDATE rbac_eligibilities SET expires_at = CASE WHEN expires_at = 'infinity' THEN NULL ELSE statement_timestamp() END
+UPDATE rbac_eligibilities SET expires_at = CASE WHEN expires_at = 'infinity' THEN NULL ELSE timestamptz 'epoch' END
     WHERE expires_at IN ('infinity', '-infinity');
-UPDATE rbac_memberships SET expires_at = CASE WHEN expires_at = 'infinity' THEN NULL ELSE statement_timestamp() END
+UPDATE rbac_memberships SET expires_at = CASE WHEN expires_at = 'infinity' THEN NULL ELSE timestamptz 'epoch' END
     WHERE expires_at IN ('infinity', '-infinity');
-UPDATE rbac_members SET expires_at = CASE WHEN expires_at = 'infinity' THEN NULL ELSE statement_timestamp() END
+UPDATE rbac_members SET expires_at = CASE WHEN expires_at = 'infinity' THEN NULL ELSE timestamptz 'epoch' END
     WHERE expires_at IN ('infinity', '-infinity');
 SELECT set_config('rbac.change', '', true);
 ALTER TABLE rbac_grants ADD CONSTRAINT rbac_grants_expires_at_check CHECK (expires_at IS NULL OR isfinite(expires_at));

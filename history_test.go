@@ -450,6 +450,10 @@ func TestMigratingKeepsWhatAnInfiniteExpiryMeant(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	var before time.Time
+	if err := pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
 	apply(true)
 	var wrong []string
 	for _, table := range []string{"rbac_grants", "rbac_eligibilities", "rbac_memberships", "rbac_members"} {
@@ -473,6 +477,43 @@ func TestMigratingKeepsWhatAnInfiniteExpiryMeant(t *testing.T) {
 	}
 	if how, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || !slices.Equal(how, []string{"Migrate"}) {
 		t.Fatalf("recorded by %v, %v", how, err)
+	}
+	// Checked by a host whose clock is behind the database's, and as of before migrating, the
+	// grant at -infinity is held by neither and the one at infinity by both. The ended identity's
+	// membership stands from here, so its grant's expiry alone decides.
+	if _, err := pool.Exec(ctx, `UPDATE rbac_memberships SET expires_at = NULL WHERE principal = 'user:ended'`); err != nil {
+		t.Fatal(err)
+	}
+	var now time.Time
+	if err := pool.QueryRow(ctx, `SELECT now()`).Scan(&now); err != nil {
+		t.Fatal(err)
+	}
+	authz, err := rbac.New(pool, rbac.Config{
+		Catalog: catalog, ContainerTypes: []string{"org", "workspace"},
+		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+		Now:           func() time.Time { return now.Add(-time.Minute) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	standing, ended := rbac.Principal{Kind: rbac.User, ID: "standing"}, rbac.Principal{Kind: rbac.User, ID: "ended"}
+	for _, p := range []rbac.Principal{standing, ended} {
+		err := authz.Authorize(ctx, rbac.Subject{Principal: p}, login, cluster)
+		if err != nil && !errors.Is(err, rbac.ErrDenied) {
+			t.Fatal(err)
+		}
+		if (err == nil) != (p == standing) {
+			t.Errorf("with the host's clock behind, Authorize(%s) = %v", p.ID, err)
+		}
+	}
+	if err := authz.AsOf(ctx, "t1", before, func(a *rbac.Authorizer) error {
+		grants, err := a.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{standing, ended}})
+		if err == nil && (len(grants) != 1 || grants[0].Principal != standing || !grants[0].ExpiresAt.IsZero()) {
+			t.Errorf("as of before migrating: %+v", grants)
+		}
+		return err
+	}); err != nil {
+		t.Fatalf("as of before migrating: %v", err)
 	}
 }
 
