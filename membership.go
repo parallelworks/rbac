@@ -105,14 +105,28 @@ func checkSource(s string) string {
 	return ""
 }
 
+// checkExpiry returns why an expiry can't be stored at now, or "" if it can: none, or one to come
+// by the end of 9999, the last year JSON and RFC 3339 write, so history can be exported as text.
+func checkExpiry(expires, now time.Time) string {
+	switch {
+	case expires.IsZero():
+		return ""
+	case !expires.After(now):
+		return "already expired"
+	case expires.After(time.Date(9999, time.December, 31, 23, 59, 59, 999999000, time.UTC)):
+		return "expires after 9999"
+	}
+	return ""
+}
+
 // checkKept returns why a membership's or member's source, expiry and note can't be stored at now.
 func checkKept(source string, expires time.Time, note string, now time.Time) []string {
 	var errs []string
 	if reason := checkSource(source); reason != "" {
 		errs = append(errs, reason)
 	}
-	if !expires.IsZero() && !expires.After(now) {
-		errs = append(errs, "already expired")
+	if reason := checkExpiry(expires, now); reason != "" {
+		errs = append(errs, reason)
 	}
 	if !validNote(note) {
 		errs = append(errs, fmt.Sprintf("a note is text of at most %d characters", MaxNote))

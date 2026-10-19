@@ -134,7 +134,8 @@ var maxPrune = MaxPrune
 // rights of history's owner, as the README's administrator's, never the application's; keep at
 // least as much as the host's audit retention requires. It refuses a before yet to come and, like
 // AsOf, history whose ids can't order a row's changes. It deletes at most MaxPrune records:
-// call it again while it deletes as many.
+// call it again while it deletes as many, and it goes on from where the last prune of the same
+// before and through stopped.
 func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) (int64, error) {
 	if through.TxID == 0 && through.ID == 0 {
 		return 0, fmt.Errorf("%w: a prune goes only as far as an export has read: through is the export's cursor", ErrInvalid)
@@ -155,6 +156,17 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 		if future {
 			return fmt.Errorf("%w: a prune is of history up to a time that has passed", ErrInvalid)
 		}
+		// A prune of the same time and cursor goes on from the last record the last one deleted:
+		// those before it that it kept, the last versions of their rows by then, stay so for both,
+		// as any record written since that could change it is past the cursor. Otherwise each call
+		// would read them all again, as many as the rows there are.
+		var from int64
+		if err := tx.QueryRow(ctx, `SELECT coalesce((SELECT (after->>'reached')::bigint FROM rbac_history
+			WHERE tenant = '' AND entity = 'history' AND key = to_char($1::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+			  AND op = 'prune' AND after->'through' = jsonb_build_object('txid', $2::xid8::text, 'id', $3::bigint)
+			ORDER BY effective_at DESC, id DESC LIMIT 1), 0)`, before, through.TxID, through.ID).Scan(&from); err != nil {
+			return err
+		}
 		// The planner can't know that what a batch deletes is history's oldest, and would rather
 		// read all of it and sort what it finds: by history's ids, a call reads only as far as its
 		// batch reaches.
@@ -170,10 +182,11 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 		// one that stays, as one the export hasn't read or one dated later but written first, as
 		// history written before its versions were dated in order can hold, would otherwise be the
 		// last AsOf finds. Each record is judged by its own row's versions, not every row's.
+		var reached int64
 		if err := tx.QueryRow(ctx, `
 			WITH doomed AS (
 			  SELECT h.id FROM rbac_history h
-			  WHERE h.effective_at <= $1 AND (h.txid, h.id) < ($2::xid8, $3) AND h.entity <> 'history'
+			  WHERE h.id > $5 AND h.effective_at <= $1 AND (h.txid, h.id) < ($2::xid8, $3) AND h.entity <> 'history'
 			    AND (EXISTS (
 			      SELECT FROM rbac_history n
 			      WHERE n.tenant = h.tenant AND n.entity = h.entity AND n.key = h.key AND n.effective_at <= $1 AND n.id > h.id)
@@ -186,9 +199,9 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 			  ORDER BY h.id LIMIT $4
 			), pruned AS (
 			  -- By id, from the batch: a join could read all of history to find it.
-			  DELETE FROM rbac_history WHERE id = ANY (ARRAY(SELECT id FROM doomed)) RETURNING 1
+			  DELETE FROM rbac_history WHERE id = ANY (ARRAY(SELECT id FROM doomed)) RETURNING id
 			)
-			SELECT count(*) FROM pruned`, before, through.TxID, through.ID, maxPrune).Scan(&n); err != nil {
+			SELECT count(*), coalesce(max(id), $5) FROM pruned`, before, through.TxID, through.ID, maxPrune, from).Scan(&n, &reached); err != nil {
 			return err
 		}
 		// Under a host's transaction, which goes on past the prune.
@@ -197,8 +210,9 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 		}
 		_, err := tx.Exec(ctx, `INSERT INTO rbac_history (effective_at, tenant, entity, key, op, after, how)
 			VALUES (now(), '', 'history', to_char($1::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), 'prune',
-			  jsonb_build_object('before', $1::timestamptz, 'through', jsonb_build_object('txid', $2::xid8::text, 'id', $3::bigint), 'deleted', $4::bigint),
-			  'PruneHistory')`, before, through.TxID, through.ID, n)
+			  jsonb_build_object('before', $1::timestamptz, 'through', jsonb_build_object('txid', $2::xid8::text, 'id', $3::bigint), 'deleted', $4::bigint,
+			    'reached', $5::bigint),
+			  'PruneHistory')`, before, through.TxID, through.ID, n, reached)
 		return err
 	})
 	return n, err
@@ -220,8 +234,8 @@ type Record struct {
 	// Entity is what changed: grant, role, deny, eligibility, membership, group or member, or
 	// history itself, in no tenant, for a prune. Key is which, in the tenant.
 	Entity, Key string
-	// Op is create, update, delete or expire, or prune, whose After is what PruneHistory was given
-	// and how many records it deleted.
+	// Op is create, update, delete or expire, or prune, whose After is what PruneHistory was given,
+	// how many records it deleted, and the id it reached, which a prune of the same goes on from.
 	Op string
 	// Principal, Role, Scope, Group and ExpiresAt are those of the row, where it has them.
 	Principal Principal

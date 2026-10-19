@@ -382,7 +382,8 @@ func TestHistoryReadsPastAnInfiniteTime(t *testing.T) {
 	}
 }
 
-// The tables refuse an expiry a time.Time can't hold, which a role that may write them can try.
+// The tables refuse an expiry a time.Time or JSON can't hold, which a role that may write them can
+// try.
 func TestNoExpiryIsInfinite(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -395,7 +396,7 @@ func TestNoExpiryIsInfinite(t *testing.T) {
 		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id, expires_at) VALUES ('t1', 'user', 'u', $1)`,
 		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, expires_at) VALUES ('t1', 'g', 'user', 'u', $1)`,
 	} {
-		for _, at := range []string{"infinity", "-infinity"} {
+		for _, at := range []string{"infinity", "-infinity", "10000-01-01 00:00:00+00", "0001-12-31 23:59:59+00 BC"} {
 			_, err := h.pool.Exec(ctx, sql, at)
 			if pgErr := (*pgconn.PgError)(nil); !errors.As(err, &pgErr) || pgErr.Code != "23514" {
 				t.Errorf("%s, expiring at %s: %v", sql, at, err)
@@ -404,8 +405,9 @@ func TestNoExpiryIsInfinite(t *testing.T) {
 	}
 }
 
-// Migrating a database whose tables hold an infinite expiry, as before they refused one, ends
-// none early or late: one at infinity never expires, and one at -infinity has expired.
+// Migrating a database whose tables hold an infinite expiry, or one outside the years 1 to 9999, as
+// before they refused one, ends none early or late: one at infinity never expires, one past 9999
+// expires at its end, and one at -infinity or before year 1 has expired.
 func TestMigratingKeepsWhatAnInfiniteExpiryMeant(t *testing.T) {
 	pool := pgtest.Open(t, "")
 	ctx := t.Context()
@@ -437,14 +439,20 @@ func TestMigratingKeepsWhatAnInfiniteExpiryMeant(t *testing.T) {
 		`INSERT INTO rbac_groups (tenant, id) VALUES ('t1', 'g')`,
 		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
 		 VALUES ('t1', 'cluster', 'c1', 'user', 'standing', 'cluster.login', 'infinity'),
-		   ('t1', 'cluster', 'c1', 'user', 'ended', 'cluster.login', '-infinity')`,
+		   ('t1', 'cluster', 'c1', 'user', 'ended', 'cluster.login', '-infinity'),
+		   ('t1', 'cluster', 'c1', 'user', 'far', 'cluster.login', '10000-01-01 00:00:00+00'),
+		   ('t1', 'cluster', 'c1', 'user', 'ancient', 'cluster.login', '0044-03-15 12:00:00+00 BC')`,
 		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, expires_at)
 		 VALUES ('t1', 'cluster', 'c1', 'user', 'standing', 'cluster.sudo', 60, 'infinity'),
-		   ('t1', 'cluster', 'c1', 'user', 'ended', 'cluster.sudo', 60, '-infinity')`,
+		   ('t1', 'cluster', 'c1', 'user', 'ended', 'cluster.sudo', 60, '-infinity'),
+		   ('t1', 'cluster', 'c1', 'user', 'far', 'cluster.sudo', 60, '10000-01-01 00:00:00+00'),
+		   ('t1', 'cluster', 'c1', 'user', 'ancient', 'cluster.sudo', 60, '0044-03-15 12:00:00+00 BC')`,
 		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id, expires_at)
-		 VALUES ('t1', 'user', 'standing', 'infinity'), ('t1', 'user', 'ended', '-infinity')`,
+		 VALUES ('t1', 'user', 'standing', 'infinity'), ('t1', 'user', 'ended', '-infinity'),
+		   ('t1', 'user', 'far', '10000-01-01 00:00:00+00'), ('t1', 'user', 'ancient', '0044-03-15 12:00:00+00 BC')`,
 		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, expires_at)
-		 VALUES ('t1', 'g', 'user', 'standing', 'infinity'), ('t1', 'g', 'user', 'ended', '-infinity')`,
+		 VALUES ('t1', 'g', 'user', 'standing', 'infinity'), ('t1', 'g', 'user', 'ended', '-infinity'),
+		   ('t1', 'g', 'user', 'far', '10000-01-01 00:00:00+00'), ('t1', 'g', 'user', 'ancient', '0044-03-15 12:00:00+00 BC')`,
 	} {
 		if _, err := pool.Exec(ctx, sql); err != nil {
 			t.Fatal(err)
@@ -458,7 +466,9 @@ func TestMigratingKeepsWhatAnInfiniteExpiryMeant(t *testing.T) {
 	var wrong []string
 	for _, table := range []string{"rbac_grants", "rbac_eligibilities", "rbac_memberships", "rbac_members"} {
 		rows, err := pool.Query(ctx, `SELECT principal || ' ' || coalesce(expires_at::text, 'never') FROM `+table+`
-			WHERE NOT (principal = 'user:standing' AND expires_at IS NULL OR principal = 'user:ended' AND isfinite(expires_at) AND expires_at <= now())`)
+			WHERE NOT (principal = 'user:standing' AND expires_at IS NULL
+			  OR principal IN ('user:ended', 'user:ancient') AND expires_at = 'epoch'
+			  OR principal = 'user:far' AND expires_at = '9999-12-31 23:59:59.999999+00')`)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1689,6 +1699,159 @@ func TestPruningHistoryInBatchesKeepsWhatAsOfReadsBetweenThem(t *testing.T) {
 	}
 }
 
+// A prune's next call goes on from where the last stopped, so it reads its own batch, not again
+// the rows its first call kept ahead of it.
+func TestPruningGoesOnFromWhereItStopped(t *testing.T) {
+	rbac.SetMaxPrune(t, 100)
+	// The pages of history the second call reads, behind rows kept from before.
+	second := func(t *testing.T, kept int) int64 {
+		t.Helper()
+		h := setup(t)
+		ctx := t.Context()
+		for _, q := range []struct {
+			sql  string
+			args []any
+		}{
+			{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			  SELECT 't1', 'cluster', 'c1', 'user', 'kept-' || i, 'cluster.login' FROM generate_series(1, $1) i`, []any{kept}},
+			{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			  SELECT 't1', 'cluster', 'c1', 'user', 'changed-' || i, 'cluster.login' FROM generate_series(1, 300) i`, nil},
+			{`UPDATE rbac_grants SET note = 'changed' WHERE principal LIKE 'user:changed-%'`, nil},
+		} {
+			if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
+				t.Fatal(err)
+			}
+		}
+		then, through := dbNow(t, h), exported(t, h)
+		// The first versions go oldest first, and the call records the last it deleted.
+		var last, reached int64
+		if err := h.pool.QueryRow(ctx, `SELECT max(id) FROM (SELECT id FROM rbac_history
+			WHERE principal LIKE 'user:changed-%' AND op = 'create' ORDER BY id LIMIT 100) d`).Scan(&last); err != nil {
+			t.Fatal(err)
+		}
+		if n, err := rbac.PruneHistory(ctx, h.pool, then, through); err != nil || n != 100 {
+			t.Fatalf("PruneHistory = %d, %v", n, err)
+		}
+		if err := h.pool.QueryRow(ctx, `SELECT (after->>'reached')::bigint FROM rbac_history WHERE entity = 'history'`).Scan(&reached); err != nil || reached != last {
+			t.Fatalf("the prune reached %d, %v, having deleted up to %d", reached, err, last)
+		}
+		if _, err := h.pool.Exec(ctx, `ANALYZE rbac_history`); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		start := historyPages(ctx, t, tx)
+		if n, err := rbac.PruneHistory(ctx, tx, then, through); err != nil || n != 100 {
+			t.Fatalf("PruneHistory again = %d, %v", n, err)
+		}
+		return historyPages(ctx, t, tx) - start
+	}
+	// About as deep in history's indexes either way.
+	if few, many := second(t, 500), second(t, 4000); many > few*11/10 {
+		t.Fatalf("a prune's second call read %d pages of history behind 500 kept rows, and %d behind 4000", few, many)
+	}
+}
+
+// A prune of another time or cursor starts from history's oldest record again. Versions the last
+// prune kept, which a later time or cursor can find superseded, would otherwise stay behind the end
+// of their row, which it deletes, and read as the row's.
+func TestAPruneOfAnotherTimeOrCursorStartsAgain(t *testing.T) {
+	const insert = `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'c1', 'user', $1, 'cluster.login')`
+	// prune prunes as of then through a cursor, a record a call, until a call prunes none.
+	prune := func(t *testing.T, h *harness, then time.Time, through rbac.Cursor) int64 {
+		t.Helper()
+		var total int64
+		for {
+			n, err := rbac.PruneHistory(t.Context(), h.pool, then, through)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n == 0 {
+				return total
+			}
+			total += n
+		}
+	}
+	t.Run("a later time", func(t *testing.T) {
+		rbac.SetMaxPrune(t, 1)
+		h := setup(t)
+		ctx := t.Context()
+		exec := func(sql string, args ...any) {
+			t.Helper()
+			if _, err := h.pool.Exec(ctx, sql, args...); err != nil {
+				t.Fatal(err)
+			}
+		}
+		exec(insert, "a")
+		exec(insert, "b")
+		exec(`UPDATE rbac_grants SET note = 'changed' WHERE principal = 'user:b'`)
+		first := dbNow(t, h)
+		exec(`DELETE FROM rbac_grants WHERE principal = 'user:a'`)
+		then := dbNow(t, h)
+		// A change since, so the export's cursor is past every record the prunes may take.
+		exec(`UPDATE rbac_grants SET note = 'again' WHERE principal = 'user:b'`)
+		through := exported(t, h)
+		// As of first, b's first version alone, which comes after a's.
+		if n := prune(t, h, first, through); n != 1 {
+			t.Fatalf("pruned %d as of first", n)
+		}
+		// a's grant, which was revoked, is gone.
+		prune(t, h, then, through)
+		if got, err := notesAt(t, h, then); err != nil || !maps.Equal(got, map[string]string{"b": "changed", "owner": ""}) {
+			t.Fatalf("as of then = %v, %v", got, err)
+		}
+	})
+	t.Run("a later cursor", func(t *testing.T) {
+		rbac.SetMaxPrune(t, 1)
+		h := setup(t)
+		ctx := t.Context()
+		exec := func(q pgx.Tx, sql string, args ...any) {
+			t.Helper()
+			var err error
+			if q == nil {
+				_, err = h.pool.Exec(ctx, sql, args...)
+			} else {
+				_, err = q.Exec(ctx, sql, args...)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		// A transaction writing before a's grant is, and b's grant and its change after, so a's
+		// records have lower ids than b's but a later transaction, which an export reads after.
+		other, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = other.Rollback(ctx) }()
+		exec(other, insert, "early")
+		exec(nil, insert, "a")
+		exec(other, insert, "b")
+		exec(other, `UPDATE rbac_grants SET note = 'changed' WHERE principal = 'user:b'`)
+		if err := other.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		// An export that has read the other transaction's records, and not a's yet.
+		first := cursorAt(t, h, `SELECT txid, id, recorded_at FROM rbac_history WHERE principal = 'user:b' ORDER BY id DESC LIMIT 1`)
+		exec(nil, `DELETE FROM rbac_grants WHERE principal = 'user:a'`)
+		then := dbNow(t, h)
+		exec(nil, `UPDATE rbac_grants SET note = 'again' WHERE principal = 'user:early'`)
+		through := exported(t, h)
+		// Through first, b's first version alone, which comes after a's.
+		if n := prune(t, h, then, first); n != 1 {
+			t.Fatalf("pruned %d through first", n)
+		}
+		prune(t, h, then, through)
+		if got, err := notesAt(t, h, then); err != nil || !maps.Equal(got, map[string]string{"b": "changed", "early": "", "owner": ""}) {
+			t.Fatalf("as of then = %v, %v", got, err)
+		}
+	})
+}
+
 // historyPages is how many pages of history and its indexes tx's session has read since it last
 // reported its statistics, which it doesn't in a transaction: what tx reads between two calls.
 func historyPages(ctx context.Context, t *testing.T, tx pgx.Tx) int64 {
@@ -1739,12 +1902,12 @@ func TestPruningHistoryReadsOnlyAsFarAsItsBatch(t *testing.T) {
 		}
 		return historyPages(ctx, t, tx) - start
 	}
-	// Each time as deep in history's indexes, so a call reads as many pages unless it reads what
-	// follows.
+	// Each time as deep in history's indexes, but for the few pages of where the last prune
+	// stopped, so a call reads about as many pages unless it reads what follows.
 	grants(1000)
 	few := read()
 	grants(4000)
-	if many := read(); many > few {
+	if many := read(); many > few*11/10 {
 		t.Fatalf("a call read %d pages of history, and %d once 4000 more records followed what it deleted", few, many)
 	}
 }

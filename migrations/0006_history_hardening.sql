@@ -75,23 +75,39 @@ END $$;
 ALTER TABLE rbac_history ALTER COLUMN recorded_at SET DEFAULT clock_timestamp();
 
 -- An expiry of infinity or -infinity, which a role that may write the tables could store, is one a
--- time.Time can't hold, so History failed on its record, and every export stopped there. Those
--- stored are kept as what they meant: one at infinity never expires, and one at -infinity has, by
--- any clock: dated by the migration, it would read as held to a host whose clock is behind.
+-- time.Time can't hold, so History failed on its record, and every export stopped there; and one
+-- outside the years 1 to 9999 is one JSON and RFC 3339 can't, so an export that writes either
+-- stopped there too. Those stored are kept as what they meant: one at infinity never expires, one
+-- past 9999 expires at its end, and one at -infinity or before year 1 has, by any clock: dated by
+-- the migration, it would read as held to a host whose clock is behind.
 SELECT set_config('rbac.change', '{"how": "Migrate"}', true);
-UPDATE rbac_grants SET expires_at = CASE WHEN expires_at = 'infinity' THEN NULL ELSE timestamptz 'epoch' END
-    WHERE expires_at IN ('infinity', '-infinity');
-UPDATE rbac_eligibilities SET expires_at = CASE WHEN expires_at = 'infinity' THEN NULL ELSE timestamptz 'epoch' END
-    WHERE expires_at IN ('infinity', '-infinity');
-UPDATE rbac_memberships SET expires_at = CASE WHEN expires_at = 'infinity' THEN NULL ELSE timestamptz 'epoch' END
-    WHERE expires_at IN ('infinity', '-infinity');
-UPDATE rbac_members SET expires_at = CASE WHEN expires_at = 'infinity' THEN NULL ELSE timestamptz 'epoch' END
-    WHERE expires_at IN ('infinity', '-infinity');
+UPDATE rbac_grants SET expires_at = CASE WHEN expires_at = 'infinity' THEN NULL
+    WHEN expires_at > '9999-12-31 23:59:59.999999+00' THEN '9999-12-31 23:59:59.999999+00' ELSE timestamptz 'epoch' END
+    WHERE expires_at NOT BETWEEN '0001-01-01 00:00:00+00' AND '9999-12-31 23:59:59.999999+00';
+UPDATE rbac_eligibilities SET expires_at = CASE WHEN expires_at = 'infinity' THEN NULL
+    WHEN expires_at > '9999-12-31 23:59:59.999999+00' THEN '9999-12-31 23:59:59.999999+00' ELSE timestamptz 'epoch' END
+    WHERE expires_at NOT BETWEEN '0001-01-01 00:00:00+00' AND '9999-12-31 23:59:59.999999+00';
+UPDATE rbac_memberships SET expires_at = CASE WHEN expires_at = 'infinity' THEN NULL
+    WHEN expires_at > '9999-12-31 23:59:59.999999+00' THEN '9999-12-31 23:59:59.999999+00' ELSE timestamptz 'epoch' END
+    WHERE expires_at NOT BETWEEN '0001-01-01 00:00:00+00' AND '9999-12-31 23:59:59.999999+00';
+UPDATE rbac_members SET expires_at = CASE WHEN expires_at = 'infinity' THEN NULL
+    WHEN expires_at > '9999-12-31 23:59:59.999999+00' THEN '9999-12-31 23:59:59.999999+00' ELSE timestamptz 'epoch' END
+    WHERE expires_at NOT BETWEEN '0001-01-01 00:00:00+00' AND '9999-12-31 23:59:59.999999+00';
 SELECT set_config('rbac.change', '', true);
-ALTER TABLE rbac_grants ADD CONSTRAINT rbac_grants_expires_at_check CHECK (expires_at IS NULL OR isfinite(expires_at));
-ALTER TABLE rbac_eligibilities ADD CONSTRAINT rbac_eligibilities_expires_at_check CHECK (expires_at IS NULL OR isfinite(expires_at));
-ALTER TABLE rbac_memberships ADD CONSTRAINT rbac_memberships_expires_at_check CHECK (expires_at IS NULL OR isfinite(expires_at));
-ALTER TABLE rbac_members ADD CONSTRAINT rbac_members_expires_at_check CHECK (expires_at IS NULL OR isfinite(expires_at));
+ALTER TABLE rbac_grants ADD CONSTRAINT rbac_grants_expires_at_check
+    CHECK (expires_at BETWEEN '0001-01-01 00:00:00+00' AND '9999-12-31 23:59:59.999999+00');
+ALTER TABLE rbac_eligibilities ADD CONSTRAINT rbac_eligibilities_expires_at_check
+    CHECK (expires_at BETWEEN '0001-01-01 00:00:00+00' AND '9999-12-31 23:59:59.999999+00');
+ALTER TABLE rbac_memberships ADD CONSTRAINT rbac_memberships_expires_at_check
+    CHECK (expires_at BETWEEN '0001-01-01 00:00:00+00' AND '9999-12-31 23:59:59.999999+00');
+ALTER TABLE rbac_members ADD CONSTRAINT rbac_members_expires_at_check
+    CHECK (expires_at BETWEEN '0001-01-01 00:00:00+00' AND '9999-12-31 23:59:59.999999+00');
+
+-- As of a time, a group's members and the denies on a scope are read by the rows a statement
+-- names, as a subject's grants are by principal, not all of the tenant's. Only those records have
+-- entries, so writes of grants pay nothing for them.
+CREATE INDEX rbac_history_group ON rbac_history (tenant, group_id, entity, effective_at DESC) WHERE group_id IS NOT NULL;
+CREATE INDEX rbac_history_deny ON rbac_history (tenant, scope, effective_at DESC) WHERE entity = 'deny';
 
 -- The trigger runs as whoever deletes, and read its operators on their search_path: a role granted
 -- DELETE on history, with a schema of its own first there, could make an = that finds a table it

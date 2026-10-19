@@ -585,8 +585,8 @@ func (a *Authorizer) checkBinding(roles book, tenant string, scope Scope, b Bind
 	case b.Principal.Kind == Members && def.Privileged:
 		bad("a privileged role is never granted to the tenant's members")
 	}
-	if !b.ExpiresAt.IsZero() && !b.ExpiresAt.After(now) {
-		bad("already expired")
+	if reason := checkExpiry(b.ExpiresAt, now); reason != "" {
+		bad(reason)
 	}
 	if !validNote(b.Note) {
 		bad(fmt.Sprintf("a note is text of at most %d characters", MaxNote))

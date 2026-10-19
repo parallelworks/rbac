@@ -983,6 +983,7 @@ func TestApplyValidatesEveryBinding(t *testing.T) {
 		{Role: "cluster.admin", Principal: rbac.TenantMembers("t1")},
 		{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "outsider1"}},
 		{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}, ExpiresAt: h.now.Add(-time.Minute)},
+		{Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}, ExpiresAt: time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC)},
 	}})
 	joined, ok := err.(interface{ Unwrap() []error })
 	if !ok {
@@ -995,7 +996,7 @@ func TestApplyValidatesEveryBinding(t *testing.T) {
 			invalid = append(invalid, ie)
 		}
 	}
-	if len(invalid) != 5 || !errors.Is(err, rbac.ErrInvalid) {
+	if len(invalid) != 6 || !errors.Is(err, rbac.ErrInvalid) {
 		t.Fatalf("got %d invalid bindings: %v", len(invalid), err)
 	}
 	if len(h.events) != 0 {

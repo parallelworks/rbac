@@ -3,7 +3,9 @@ package rbac_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -497,6 +499,71 @@ func TestAsOfReadsOnlyTheRowsAStatementNames(t *testing.T) {
 	others(2000)
 	if many := read(dbNow(t, h)); many > few {
 		t.Fatalf("a check as of a time read %d pages of history, and %d once 2000 more principals had grants", few, many)
+	}
+}
+
+// As of a time, a group's members and the denies on a resource's path are read by the rows they
+// name too: other groups' members and denies on other scopes cost about nothing.
+func TestAsOfReadsAGroupsMembersAndAScopesDeniesAlone(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	u := h.as(t, "u", "sre")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"), grant(cluster.Scope(), "cluster.sudo", rbac.Group, "sre"))
+	if err := h.authz.SetDeny(ctx, guardian, cluster, rbac.Deny{ID: "d", Principals: []rbac.Principal{u.Principal}, Permissions: []rbac.Permission{root}}); err != nil {
+		t.Fatal(err)
+	}
+	h.groups(t, "other")
+	// Members of another group and denies on other clusters, each changed once since.
+	others := func(n int) {
+		t.Helper()
+		for _, q := range []string{
+			`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+			  SELECT 't1', 'other', 'user', gen_random_uuid()::text FROM generate_series(1, $1)`,
+			`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+			  SELECT 't1', 'cluster', gen_random_uuid()::text, 'd', '{user:u}', '{cluster:sudo}' FROM generate_series(1, $1)`,
+			`UPDATE rbac_members SET note = 'changed' WHERE group_id = 'other' AND note = ''`,
+			`UPDATE rbac_denies SET name = 'changed' WHERE scope_id <> 'c1' AND name = ''`,
+			`ANALYZE rbac_history`,
+		} {
+			var args []any
+			if strings.Contains(q, "$1") {
+				args = []any{n}
+			}
+			if _, err := h.pool.Exec(ctx, q, args...); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	read := func(at time.Time) int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		var read int64
+		if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+			start := historyPages(ctx, t, tx)
+			members, err := a.Members(ctx, "t1", "sre")
+			if err != nil || len(members) != 1 {
+				return fmt.Errorf("members of sre: %v, %w", members, err)
+			}
+			if err := a.Authorize(ctx, u, root, cluster); !errors.Is(err, rbac.ErrDenied) {
+				return fmt.Errorf("the deny: %w", err)
+			}
+			read = historyPages(ctx, t, tx) - start
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return read
+	}
+	// Their longer keys deepen history's indexes, which each lookup reads a page more of.
+	others(500)
+	few := read(dbNow(t, h))
+	others(2000)
+	if many := read(dbNow(t, h)); many > few*3/2 {
+		t.Fatalf("a group's members and a cluster's denies as of a time read %d pages of history, and %d once 2000 more of each were changed", few, many)
 	}
 }
 

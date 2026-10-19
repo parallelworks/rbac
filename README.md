@@ -256,21 +256,23 @@ history held up to its last checkpoint, since a superuser who deletes a cursor's
 and each row as JSON text, not parsed into a store's own form, which can reorder its keys.
 
 `AsOf(ctx, tenant, at, read)` reads a tenant as it was at a time, from its history: every check,
-list and search the read makes answers as it would have then, with the catalog as it is now, as
-for an access review of a past date. A change counts from when the statement that made it began,
-but never before its row's change before it, and none can be made through it: one tried is no
-actor's attempt, and `Config.OnRefused` isn't told of it. A statement reads the history of the
-rows it names, as a check does its subject's grants and groups, not the whole tenant's. It orders
-a row's changes by their ids in `rbac_history`, which sessions take out of order once that
-table's id sequence caches more than one, so `AsOf` refuses that.
+list and search the read makes answers as it would have then, with the catalog as it is now, as for
+an access review of a past date. A change counts from when the statement that made it began, but
+never before its row's change before it, and none can be made through it: one tried is no actor's
+attempt, and `Config.OnRefused` isn't told of it. A statement reads the history of the rows it
+names, as a check does its subject's grants, groups and the denies on its resource's path, not the
+whole tenant's; `Holders`, which finds the members of each group it lists, can read the tenant's
+history of members. It orders a row's changes by their ids in `rbac_history`, which sessions take
+out of order once that table's id sequence caches more than one, so `AsOf` refuses that.
 
-`rbac.PruneHistory(ctx, db, before, through)` deletes what an export has read past (`through`,
-its cursor) and later records supersede: of each row, the last version at or before `before`
-stays, so `AsOf` answers as it did for any time from then on, and refuses an earlier one, and a
-row that had ended by then goes, once no version before its end stays. One call deletes at most
-`rbac.MaxPrune` records: call it again while it deletes as many. The prune is recorded in history. Run it on a connection of the
-administrator's role below, which has the rights of history's owner, as the application's hasn't,
-and keep what the host's audit retention requires: the federal floor is at least a year.
+`rbac.PruneHistory(ctx, db, before, through)` deletes what an export has read past (`through`, its
+cursor) and later records supersede: of each row, the last version at or before `before` stays, so
+`AsOf` answers as it did for any time from then on, and refuses an earlier one, and a row that had
+ended by then goes, once no version before its end stays. One call deletes at most `rbac.MaxPrune`
+records: call it again while it deletes as many, and each goes on from where the last stopped. The
+prune is recorded in history. Run it on a connection of the administrator's role below, which has
+the rights of history's owner, as the application's hasn't, and keep what the host's audit retention
+requires: the federal floor is at least a year.
 
 A role that owns a table can change it whatever its triggers say, and a schema's owner can drop
 any table in it. So that the application's database role can't rewrite history or write around

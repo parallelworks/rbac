@@ -106,6 +106,7 @@ func TestSettingMemberships(t *testing.T) {
 		"an undeclared kind": {Principal: rbac.Principal{Kind: "robot", ID: "r"}},
 		"no id":              {Principal: rbac.Principal{Kind: rbac.User}},
 		"already expired":    {Principal: identity("v"), ExpiresAt: h.now.Add(-time.Minute)},
+		"expiring past 9999": {Principal: identity("v"), ExpiresAt: time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC)},
 		"a malformed source": {Principal: identity("v"), Source: "Directory"},
 		"a reserved source":  {Principal: identity("v"), Source: "rbac.sync"},
 	} {
@@ -237,6 +238,7 @@ func TestGroupMembers(t *testing.T) {
 		"the public":                         {Group: "a", Principal: rbac.Principal{Kind: rbac.Public}},
 		"an undeclared kind":                 {Group: "a", Principal: rbac.Principal{Kind: "robot", ID: "r"}},
 		"already expired":                    {Group: "a", Principal: identity("v"), ExpiresAt: h.now.Add(-time.Minute)},
+		"expiring past 9999":                 {Group: "a", Principal: identity("v"), ExpiresAt: time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC)},
 		"from a reserved source":             {Group: "a", Principal: identity("v"), Source: "rbac.sync"},
 		"a group of another tenant's own id": {Group: "a", Principal: groupOf("t2-group")},
 	} {
