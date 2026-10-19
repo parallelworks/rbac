@@ -827,9 +827,12 @@ func vocabulary(declared []Permission, given map[Permission]bool, roleTypes map[
 // SetRole and DeleteRole lock the whole tenant, as does a change, Import, DeleteGrants or
 // DeleteScopes that would otherwise lock more than 64 scopes and principals. Make such a call the
 // first change in tx: after another, it waits for every change in the tenant while holding locks
-// they may wait for, and PostgreSQL fails one as a deadlock. Explain, Reachable and Holders read
-// in several statements, on tx at its isolation: at READ COMMITTED each reads a snapshot of its
-// own, so a change committing between them can mix two states.
+// they may wait for, and PostgreSQL fails one as a deadlock. Where a label dimension is
+// Exclusive, every change takes a lock of its tenant's first, which the tenant's other changes
+// wait for, so two transactions changing two tenants in opposite orders can deadlock too.
+// Explain, Reachable and Holders read in several statements, on tx at its isolation: at READ
+// COMMITTED each reads a snapshot of its own, so a change committing between them can mix two
+// states.
 func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 	// One AsOf gave reads its own transaction, whose views are the past: on another, it would read
 	// the tables as they are now.

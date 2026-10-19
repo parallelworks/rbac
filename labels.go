@@ -29,6 +29,12 @@ type LabelDimension struct {
 	Name   string
 	Rule   LabelRule
 	Values []string
+	// Exclusive values are held one at a time, as parties with a conflict of interest are: a
+	// change that leaves an identity able to hold two is refused, as is a role giving two, and a
+	// subject whose grants could give it two, under any condition, constraint or deny, holds none
+	// (Authorizer.Conflicts). An Ordered dimension's higher values include the lower, so it isn't
+	// exclusive.
+	Exclusive bool
 }
 
 // Label is a resource's label, or a data point's: by dimension, its values. A dimension it has no
@@ -64,8 +70,15 @@ func (a *Authorizer) unsatisfied(ctx context.Context, s Subject, r Resource) (st
 
 // labelDimension is a dimension as checks read it: each value's rank, lowest 0.
 type labelDimension struct {
-	rule LabelRule
-	rank map[string]int
+	rule      LabelRule
+	rank      map[string]int
+	exclusive bool
+}
+
+// exclusiveValue reports whether v is one of the dimension's values, held one at a time.
+func (ld labelDimension) exclusiveValue(v string) bool {
+	_, ok := ld.rank[v]
+	return ok && ld.exclusive
 }
 
 // declares reports whether the dimension declares every value of vs.
@@ -85,11 +98,13 @@ func indexLabels(dims []LabelDimension, catalog []RoleDefinition) (map[string]la
 			return nil, fmt.Errorf("rbac: label dimension %q has no rule", d.Name)
 		case len(d.Values) == 0:
 			return nil, fmt.Errorf("rbac: label dimension %q has no values", d.Name)
+		case d.Exclusive && d.Rule == Ordered:
+			return nil, fmt.Errorf("rbac: label dimension %q is Ordered, so its values aren't exclusive", d.Name)
 		}
 		if _, dup := index[d.Name]; dup {
 			return nil, fmt.Errorf("rbac: label dimension %q is declared twice", d.Name)
 		}
-		ld := labelDimension{rule: d.Rule, rank: map[string]int{}}
+		ld := labelDimension{rule: d.Rule, rank: map[string]int{}, exclusive: d.Exclusive}
 		for i, v := range d.Values {
 			p := Permission(d.Name + ":" + v)
 			if !p.Valid() {
@@ -125,6 +140,9 @@ func indexLabels(dims []LabelDimension, catalog []RoleDefinition) (map[string]la
 				return nil, fmt.Errorf("rbac: role %q gives %q, which isn't a value label dimension %q declares", r.ID, p, t)
 			}
 			gives = true
+		}
+		if p, q, two := twoExclusive(index, r.Permissions); two {
+			return nil, fmt.Errorf("rbac: role %q gives %q and %q, which are exclusive, so it would give neither", r.ID, p, q)
 		}
 		// A subject holds a value on the tenant: given on any other scope, it would read as held
 		// nowhere, or be mistaken for a permission on that scope.
@@ -168,6 +186,8 @@ type Holding struct {
 	dims     map[string]labelDimension
 	values   map[string]map[string]bool
 	releases map[string]bool
+	// excluded are the exclusive dimensions it holds no value of, as its grants could give it two.
+	excluded map[string]bool
 }
 
 // ReleasePermission is the permission, held on the tenant, to release data to a looser label in a
@@ -243,9 +263,16 @@ func (h Holding) satisfies(dim string, want []string) bool {
 	return false
 }
 
+// excludes reports whether p is a value of an exclusive dimension the holding holds none of, as
+// its grants could give it two, so a check or a search of p refuses it.
+func (h Holding) excludes(p Permission) bool {
+	t, v := p.parts()
+	return h.excluded[t] && h.dims[t].exclusiveValue(v)
+}
+
 // changed is a copy of the holding with ps held too, or with held false, without them.
 func (h Holding) changed(ps map[Permission]bool, held bool) Holding {
-	c := Holding{tenant: h.tenant, dims: h.dims, values: map[string]map[string]bool{}, releases: map[string]bool{}}
+	c := Holding{tenant: h.tenant, dims: h.dims, values: map[string]map[string]bool{}, releases: map[string]bool{}, excluded: h.excluded}
 	maps.Copy(c.releases, h.releases)
 	for dim, vs := range h.values {
 		c.values[dim] = maps.Clone(vs)
@@ -255,6 +282,7 @@ func (h Holding) changed(ps map[Permission]bool, held bool) Holding {
 		switch {
 		case v == releaseVerb:
 			c.releases[dim] = held
+		case c.excluded[dim]:
 		case !held:
 			delete(c.values[dim], v)
 		case c.values[dim] == nil:
@@ -282,21 +310,25 @@ func (a *Authorizer) Holding(ctx context.Context, tenant string, s Subject) (Hol
 // holding is Holding, and the values a condition decided, a grant's or a deny's, which a read
 // without the request, as Holders, can't settle.
 func (a *Authorizer) holding(ctx context.Context, tenant string, s Subject) (Holding, map[Permission]bool, error) {
-	h := Holding{tenant: tenant, dims: a.labels, values: map[string]map[string]bool{}, releases: map[string]bool{}}
+	h := Holding{tenant: tenant, dims: a.labels, values: map[string]map[string]bool{}, releases: map[string]bool{}, excluded: map[string]bool{}}
 	if len(a.labels) == 0 {
 		return h, nil, nil
 	}
 	// Only the values and the powers to release, so neither the constraints nor the conditions of
 	// the tenant's other permissions are asked about.
 	value := func(p Permission) bool { t, _ := p.parts(); _, ok := a.labels[t]; return ok }
-	perms, byCondition, err := a.permissionsOf(ctx, s, Resource{Tenant: tenant, Type: TenantScope, ID: tenant}, value)
+	perms, byCondition, excluded, err := a.permissionsOf(ctx, s, Resource{Tenant: tenant, Type: TenantScope, ID: tenant}, value)
 	if err != nil {
 		return Holding{}, nil, err
 	}
+	h.excluded = excluded
 	for _, p := range perms {
 		t, v := p.parts()
-		if v == releaseVerb {
+		switch {
+		case v == releaseVerb:
 			h.releases[t] = true
+			continue
+		case h.excluded[t]:
 			continue
 		}
 		if h.values[t] == nil {

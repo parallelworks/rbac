@@ -702,6 +702,11 @@ func (a *Authorizer) authorityOn(ctx context.Context, q DB, actor Subject, on Re
 	return a.authorityOf(ctx, q, actor, on, held, ds, b)
 }
 
+// orDenied is a deny check that also denies what more does.
+func orDenied(denied, more func(Permission) bool) func(Permission) bool {
+	return func(p Permission) bool { return more(p) || denied(p) }
+}
+
 // authorityOf is the authority of held grants under the denies on the path, reading the
 // grants' conditions.
 func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Resource, held []holding, ds []denial, b book) (authority, error) {
@@ -737,6 +742,13 @@ func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Re
 		reached := maps.Clone(vars)
 		delete(reached, "resource")
 		handsOn = deny(reached)
+	}
+	// The values of an exclusive dimension it holds none of, as its grants could give it two, it
+	// can't use or hand on either, as checks refuse it them. Read from its grants on the path, which
+	// hold its tenant's, so a change's recheck in its transaction asks no constraint.
+	if excluded := a.excludedBy(b, held); len(excluded) > 0 {
+		out := func(p Permission) bool { t, ok := a.exclusiveValue(p); return ok && excluded[t] }
+		denied, handsOn = orDenied(denied, out), orDenied(handsOn, out)
 	}
 	return authority{
 		held: held, roles: b,
@@ -993,9 +1005,16 @@ func scopeGrants(scope Scope, bindings []Binding) []Grant {
 }
 
 // inTx runs fn in a transaction, recording what it writes in history as actor's change made by
-// how, the call that makes it, and hands what it changed to Config.OnChange there.
+// how, the call that makes it, and hands what it changed to Config.OnChange there. Where a
+// dimension is Exclusive, it refuses a change that lets an identity hold two of its values.
 func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, how string, fn func(pgx.Tx) (ChangeEvent, error)) error {
 	return a.begin(ctx, func(tx pgx.Tx) error {
+		exclusive := a.exclusive()
+		if exclusive {
+			if err := lockExclusive(ctx, tx, tenant); err != nil {
+				return err
+			}
+		}
 		done, err := a.recording(ctx, tx, actor, how, "")
 		if err != nil {
 			return err
@@ -1003,6 +1022,11 @@ func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, h
 		e, err := fn(tx)
 		if err != nil {
 			return err
+		}
+		if exclusive {
+			if err := a.excludes(ctx, tx, tenant, e); err != nil {
+				return err
+			}
 		}
 		if err := done(); err != nil {
 			return err

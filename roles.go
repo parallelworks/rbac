@@ -182,6 +182,14 @@ func (a *Authorizer) checkCustom(r RoleDefinition) error {
 			}
 		}
 	}
+	if p, q, two := twoExclusive(a.labels, r.Permissions); two {
+		errs = append(errs, fmt.Errorf("permissions %q and %q are exclusive, so it would give neither", p, q))
+	}
+	// As for a built-in role (indexLabels): a value given on another scope would read as held
+	// nowhere, or be mistaken for a permission on that scope.
+	if a.givesLabels(r) && !slices.Equal(r.ResourceTypes, []string{TenantScope}) {
+		errs = append(errs, errors.New("gives label values or a power to release, so it is for the tenant alone"))
+	}
 	for _, t := range r.ResourceTypes {
 		if !a.types[t] {
 			errs = append(errs, fmt.Errorf("resource type %q is not one any built-in role is for", t))

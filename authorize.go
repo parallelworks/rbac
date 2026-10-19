@@ -53,14 +53,26 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 	if err != nil || !d.Allowed {
 		return d, err
 	}
-	dim, err := a.unsatisfied(ctx, s, r)
+	value, exclusive := a.exclusiveValue(p)
+	if !exclusive && !r.Labels.asks() {
+		return d, nil
+	}
+	h, _, err := a.holding(ctx, r.Tenant, s)
 	if err != nil {
 		return Decision{}, err
 	}
-	if dim != "" {
+	if h.excludes(p) {
+		return Decision{Reason: exclusiveRefusal(value)}, nil
+	}
+	if dim := h.Unsatisfied(r.Labels); dim != "" {
 		return Decision{Label: dim, Reason: labelRefusal(dim)}, nil
 	}
 	return d, nil
+}
+
+// exclusiveRefusal is why a check refuses a value of dim, an exclusive dimension.
+func exclusiveRefusal(dim string) string {
+	return "its grants could give it two values of " + dim + ", whose values are exclusive, so it holds none"
 }
 
 func (a *Authorizer) decideGrants(ctx context.Context, s Subject, p Permission, r Resource, explain bool) (Decision, error) {
@@ -256,23 +268,27 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 	if dim, err := a.unsatisfied(ctx, s, r); err != nil || dim != "" {
 		return nil, err
 	}
-	perms, _, err := a.permissionsOf(ctx, s, r, nil)
-	return perms, err
+	perms, _, excluded, err := a.permissionsOf(ctx, s, r, nil)
+	if err != nil {
+		return nil, err
+	}
+	return slices.DeleteFunc(perms, func(p Permission) bool { t, ok := a.exclusiveValue(p); return ok && excluded[t] }), nil
 }
 
 // permissionsOf is what Permissions lists, once its input is checked, of the permissions only
 // keeps, or all where it is nil; and of them, those a condition decided, a grant's or a deny's,
-// which a read without the request can't settle.
-func (a *Authorizer) permissionsOf(ctx context.Context, s Subject, r Resource, only func(Permission) bool) ([]Permission, map[Permission]bool, error) {
+// which a read without the request can't settle; and the exclusive dimensions s holds none of,
+// as its grants on the tenant could give it two (excludedBy).
+func (a *Authorizer) permissionsOf(ctx context.Context, s Subject, r Resource, only func(Permission) bool) ([]Permission, map[Permission]bool, map[string]bool, error) {
 	kept := func(p Permission) bool { return only == nil || only(p) }
 	byCondition := map[Permission]bool{}
 	held, ds, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), "")
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	roles, err := a.book(ctx, a.db, r.Tenant, roleIDs(held))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	given := map[Permission]bool{}
 	var conditional []holding
@@ -325,7 +341,7 @@ func (a *Authorizer) permissionsOf(ctx context.Context, s Subject, r Resource, o
 	// Conditions are evaluated only for what no unconditional grant gives, as checks do, the
 	// cheapest first.
 	if err := a.conditionsOf(ctx, a.db, r.Tenant, conditional); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	cheapestFirst(conditional, holding.expression)
 	for _, h := range conditional {
@@ -336,7 +352,7 @@ func (a *Authorizer) permissionsOf(ctx context.Context, s Subject, r Resource, o
 			}
 			if gone, err := isRemoved(p); err != nil || gone {
 				if err != nil {
-					return nil, nil, err
+					return nil, nil, nil, err
 				}
 				continue
 			}
@@ -361,7 +377,7 @@ func (a *Authorizer) permissionsOf(ctx context.Context, s Subject, r Resource, o
 		}
 		gone, err := isRemoved(p)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if !gone && !isDenied(p) {
 			perms = append(perms, p)
@@ -378,7 +394,7 @@ func (a *Authorizer) permissionsOf(ctx context.Context, s Subject, r Resource, o
 			}
 		}
 	}
-	return perms, byCondition, nil
+	return perms, byCondition, a.excludedBy(roles, held), nil
 }
 
 // Holder is one who may do p to r, as Holders finds it.
@@ -398,7 +414,8 @@ type Holder struct {
 	// MaybeDenied is set when a deny on the path may bind it: one whose condition depends on the
 	// request, or for the members or the public one that may bind some of them. It is set too
 	// when the resource's label may refuse it: where a condition decides its label values, and
-	// for the members or the public, who hold values each their own.
+	// for the members or the public, who hold values each their own; as it is for them where p is
+	// a value of an exclusive dimension, which some of them may hold none of.
 	MaybeDenied bool
 }
 
@@ -425,23 +442,31 @@ func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]H
 		return nil, nil
 	}
 	holders, err := snapshot(ctx, a, func(a *Authorizer) ([]Holder, error) { return a.holders(ctx, p, r, roles, custom) })
-	if err != nil || !r.Labels.asks() {
+	if _, exclusive := a.exclusiveValue(p); err != nil || !r.Labels.asks() && !exclusive {
 		return holders, err
 	}
-	return a.labeled(ctx, r, holders)
+	return a.labeled(ctx, p, r, holders)
 }
 
-// labeled keeps of holders those whose holding satisfies r's label whatever the request: one
-// that satisfies it only with the values a condition decided, which a read without the request
-// can't settle, is marked MaybeDenied, as the members and the public are, whose people hold
-// apart; and one that doesn't even then is left out. Each identity's holding is read after the
-// list, as its constraints run as for any read.
-func (a *Authorizer) labeled(ctx context.Context, r Resource, holders []Holder) ([]Holder, error) {
+// labeled keeps of holders those whose holding satisfies r's label whatever the request, and
+// where p is a value of an exclusive dimension, holds it: one that satisfies it only with the
+// values a condition decided, which a read without the request can't settle, is marked
+// MaybeDenied, as the members and the public are, whose people hold apart, unless their own grants
+// give two of p's exclusive values, which leaves all of them none; and one that doesn't even then,
+// or holds none of p's dimension, is left out. Each identity's holding is read after the list, as
+// its constraints run as for any read.
+func (a *Authorizer) labeled(ctx context.Context, p Permission, r Resource, holders []Holder) ([]Holder, error) {
 	kept := holders[:0]
 	for _, h := range holders {
 		if h.Principal.broad() {
-			h.MaybeDenied = true
-			kept = append(kept, h)
+			out, err := a.broadExcludes(ctx, r.Tenant, h.Principal, p)
+			if err != nil {
+				return nil, err
+			}
+			if !out {
+				h.MaybeDenied = true
+				kept = append(kept, h)
+			}
 			continue
 		}
 		holding, byCondition, err := a.holding(ctx, r.Tenant, Subject{Principal: h.Principal})
@@ -449,6 +474,7 @@ func (a *Authorizer) labeled(ctx context.Context, r Resource, holders []Holder) 
 			return nil, err
 		}
 		switch {
+		case holding.excludes(p):
 		case holding.changed(byCondition, false).Satisfies(r.Labels):
 			kept = append(kept, h)
 		case holding.changed(byCondition, true).Satisfies(r.Labels):
@@ -723,7 +749,7 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 	}
 	// Outside the snapshot, as its constraints run as for any read.
 	reach.Labels, _, err = a.holding(ctx, tenant, s)
-	if err != nil {
+	if err != nil || reach.Labels.excludes(p) {
 		return Reach{}, err
 	}
 	return reach, nil
@@ -935,6 +961,9 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	h, _, err := a.holding(ctx, tenant, s)
 	if err != nil {
 		return Predicate{}, err
+	}
+	if h.excludes(p) {
+		return Predicate{SQL: "FALSE"}, nil
 	}
 	labels, args := h.labelColumn(cols.Labels, arg, len(pred.Args))
 	pred.SQL = "(" + pred.SQL + " AND " + labels + ")"

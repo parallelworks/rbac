@@ -691,3 +691,22 @@ func TestAPowerToReleaseHeldUnderAConditionIsNoValue(t *testing.T) {
 		}
 	}
 }
+
+func TestACustomRoleGivingALabelValueIsForTheTenantAlone(t *testing.T) {
+	h := labeled(t, releasing)
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	h.hold(t, "admin", "rel:gbr", "rel:release")
+	for _, r := range []rbac.RoleDefinition{
+		{ID: "custom.liaison", Permissions: []rbac.Permission{"rel:gbr"}, ResourceTypes: []string{"cluster"}},
+		{ID: "custom.liaison", Permissions: []rbac.Permission{"rel:gbr"}, ResourceTypes: []string{rbac.TenantScope, "cluster"}},
+		{ID: "custom.officer", Permissions: []rbac.Permission{rbac.ReleasePermission("rel")}, ResourceTypes: []string{"cluster"}},
+	} {
+		if err := h.authz.SetRole(ctx, admin, "t1", r); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s for %v: %v", r.ID, r.ResourceTypes, err)
+		}
+	}
+	if err := h.authz.SetRole(ctx, admin, "t1", rbac.RoleDefinition{ID: "custom.liaison", Permissions: []rbac.Permission{"rel:gbr"}, ResourceTypes: []string{rbac.TenantScope}}); err != nil {
+		t.Fatalf("for the tenant: %v", err)
+	}
+}
