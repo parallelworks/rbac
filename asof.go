@@ -4,20 +4,26 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 )
 
-// asOfEntities are the tables history records, by the entity it records each as.
-var asOfEntities = []struct{ table, entity string }{
-	{"rbac_grants", "grant"},
-	{"rbac_roles", "role"},
-	{"rbac_denies", "deny"},
-	{"rbac_eligibilities", "eligibility"},
-	{"rbac_memberships", "membership"},
-	{"rbac_groups", "group"},
-	{"rbac_members", "member"},
+// asOfEntities are the tables history records, by the entity it records each as, and the columns
+// history records beside each of a table's rows, by the table's column each copies.
+var asOfEntities = []struct {
+	table, entity string
+	columns       map[string]string
+}{
+	{"rbac_grants", "grant", map[string]string{"tenant": "tenant", "principal": "principal", "role": "role", "scope": "scope"}},
+	{"rbac_roles", "role", map[string]string{"tenant": "tenant", "id": "role"}},
+	{"rbac_denies", "deny", map[string]string{"tenant": "tenant", "scope": "scope"}},
+	{"rbac_eligibilities", "eligibility", map[string]string{"tenant": "tenant", "principal": "principal", "role": "role", "scope": "scope"}},
+	{"rbac_memberships", "membership", map[string]string{"tenant": "tenant", "principal": "principal"}},
+	{"rbac_groups", "group", map[string]string{"tenant": "tenant", "id": "group_id"}},
+	{"rbac_members", "member", map[string]string{"tenant": "tenant", "group_id": "group_id", "principal": "principal"}},
 }
 
 // AsOf runs read on an Authorizer that reads a tenant as it was at a time, from its history: who
@@ -26,8 +32,9 @@ var asOfEntities = []struct{ table, entity string }{
 // they are now, and find nothing in another tenant. A resource's label, as its path, is what the
 // host passes: pass it as it was then. A change made on it is refused, as no actor's attempt, which
 // Config.OnRefused isn't told of, and its reads see no change made since, but for History, which
-// reads the whole record as it does outside. A change counts from when its transaction began, so
-// what a time reads can still change until every transaction that began before it has ended.
+// reads the whole record as it does outside. A change counts from when the statement that made it
+// began, but never before its row's change before it, so what a time reads can still change until
+// every transaction running then has ended.
 // Hooks run as for any read, and a constraint that reads the package's tables through the DB it
 // is given reads them as of the time too; one that reads the host's reads them as they are now.
 // A Filter condition reads as of the time only in a query on the transaction read runs in: under
@@ -106,18 +113,51 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	}
 	// Each table as the last version of each of its rows dated at or before the time left it:
 	// none where that was a delete or an expiry. A row's versions are written one at a time,
-	// each after the last committed, so their ids order them as their dates can't: a version
-	// is dated by its transaction's start, and one that began first can write last. The view
-	// reads its tenant and time from settings of the transaction, so no value is spliced into
-	// its definition. Each row's record is built once, where `(f(x)).*` builds it once a column.
+	// each after the last committed, so their ids order them, as their dates do only since none
+	// is dated before the last: one dated by its transaction's start, as before, can have been
+	// written after a version dated later. The view reads its tenant and time from settings of
+	// the transaction, so no value is spliced into its definition. Each row's record is built
+	// once, where `(f(x)).*` builds it once a column. A version is its row's last unless a later
+	// one is dated by then, and gives the columns history copied beside it as its row's, so a
+	// statement's condition on one, as a check's on its subject's principals, reads history by
+	// its index for the rows it names, rather than every version of every row in the tenant.
+	names := make([]string, len(asOfEntities))
+	for i, e := range asOfEntities {
+		names[i] = e.table
+	}
+	rows, err := tx.Query(ctx, `SELECT c.relname::text, array_agg(a.attname::text ORDER BY a.attnum)
+		FROM pg_catalog.pg_class c JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+		WHERE c.relnamespace = (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = $1)
+		  AND c.relname = ANY($2::text[]) AND a.attnum > 0 AND NOT a.attisdropped
+		GROUP BY c.relname`, schema, names)
+	if err != nil {
+		return err
+	}
+	tables := map[string][]string{}
+	var table string
+	var columns []string
+	if _, err := pgx.ForEachRow(rows, []any{&table, &columns}, func() error {
+		tables[table] = slices.Clone(columns)
+		return nil
+	}); err != nil {
+		return err
+	}
 	for _, e := range asOfEntities {
+		selected := make([]string, len(tables[e.table]))
+		for i, name := range tables[e.table] {
+			selected[i] = "r." + pgx.Identifier{name}.Sanitize()
+			if h, ok := e.columns[name]; ok {
+				selected[i] = "h." + h + " AS " + pgx.Identifier{name}.Sanitize()
+			}
+		}
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`CREATE TEMP VIEW %[2]s AS
-			SELECT r.* FROM (SELECT DISTINCT ON (h.key) h.op, h.after FROM %[1]s.rbac_history h
-			      WHERE h.tenant = current_setting('rbac.as_of_tenant') AND h.entity = '%[3]s'
-			        AND h.effective_at <= current_setting('rbac.as_of')::timestamptz
-			      ORDER BY h.key, h.id DESC) v,
-			  LATERAL pg_catalog.jsonb_populate_record(NULL::%[1]s.%[2]s, v.after) r
-			WHERE v.op NOT IN ('delete', 'expire')`, pgx.Identifier{schema}.Sanitize(), e.table, e.entity)); err != nil {
+			SELECT %[4]s FROM %[1]s.rbac_history h, LATERAL pg_catalog.jsonb_populate_record(NULL::%[1]s.%[2]s, h.after) r
+			WHERE h.tenant = current_setting('rbac.as_of_tenant') AND h.entity = '%[3]s'
+			  AND h.effective_at <= current_setting('rbac.as_of')::timestamptz AND h.op NOT IN ('delete', 'expire')
+			  AND NOT EXISTS (SELECT FROM %[1]s.rbac_history n
+			    WHERE n.tenant = h.tenant AND n.entity = h.entity AND n.key = h.key
+			      AND n.effective_at <= current_setting('rbac.as_of')::timestamptz AND n.id > h.id)`,
+			pgx.Identifier{schema}.Sanitize(), e.table, e.entity, strings.Join(selected, ", "))); err != nil {
 			return err
 		}
 	}

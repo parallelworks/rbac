@@ -4,11 +4,14 @@ package pgtest
 import (
 	"context"
 	"crypto/rand"
+	"errors"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -19,13 +22,15 @@ const URLEnv = "RBAC_TEST_DATABASE_URL"
 // params are added to the URL's query, such as "pool_max_conns=1".
 func Open(tb testing.TB, params string) *pgxpool.Pool {
 	tb.Helper()
-	url := os.Getenv(URLEnv)
-	if url == "" {
-		tb.Skip(URLEnv + " not set")
-	}
+	return OpenIn(tb, testURL(tb), params)
+}
+
+// OpenIn is Open in the database that database, a URL, names.
+func OpenIn(tb testing.TB, database, params string) *pgxpool.Pool {
+	tb.Helper()
 	ctx := tb.Context()
 	schema := pgx.Identifier{"test_" + strings.ToLower(rand.Text())}.Sanitize()
-	conn, err := pgx.Connect(ctx, url)
+	conn, err := pgx.Connect(ctx, database)
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -36,7 +41,7 @@ func Open(tb testing.TB, params string) *pgxpool.Pool {
 	tb.Cleanup(func() {
 		// tb.Context is already canceled during cleanup.
 		ctx := context.WithoutCancel(ctx)
-		conn, err := pgx.Connect(ctx, url)
+		conn, err := pgx.Connect(ctx, database)
 		if err != nil {
 			tb.Errorf("drop schema %s: %v", schema, err)
 			return
@@ -46,10 +51,10 @@ func Open(tb testing.TB, params string) *pgxpool.Pool {
 			tb.Errorf("drop schema %s: %v", schema, err)
 		}
 	})
-	poolURL := url
+	poolURL := database
 	if params != "" {
 		sep := "?"
-		if strings.Contains(url, "?") {
+		if strings.Contains(database, "?") {
 			sep = "&"
 		}
 		poolURL += sep + params
@@ -65,4 +70,55 @@ func Open(tb testing.TB, params string) *pgxpool.Pool {
 	}
 	tb.Cleanup(pool.Close)
 	return pool
+}
+
+// Database makes a database in the test database's cluster, with options as CREATE DATABASE
+// takes them, such as "TEMPLATE template0 ENCODING 'SQL_ASCII' LOCALE 'C'", drops it when the test
+// ends, and returns its name, quoted, and its URL. It skips the test where the test database's role
+// can't make one.
+func Database(tb testing.TB, options string) (name, database string) {
+	tb.Helper()
+	ctx := tb.Context()
+	base := testURL(tb)
+	id := "rbac_test_" + strings.ToLower(rand.Text())
+	name = pgx.Identifier{id}.Sanitize()
+	conn, err := pgx.Connect(ctx, base)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if _, err := conn.Exec(ctx, "CREATE DATABASE "+name+" "+options); err != nil {
+		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "42501" {
+			tb.Skip("the test database's role can't create databases")
+		}
+		tb.Fatal(err)
+	}
+	tb.Cleanup(func() {
+		ctx := context.WithoutCancel(ctx)
+		conn, err := pgx.Connect(ctx, base)
+		if err != nil {
+			tb.Errorf("drop database %s: %v", name, err)
+			return
+		}
+		defer func() { _ = conn.Close(ctx) }()
+		if _, err := conn.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)"); err != nil {
+			tb.Errorf("drop database %s: %v", name, err)
+		}
+	})
+	u, err := url.Parse(base)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	u.Path = "/" + id
+	return name, u.String()
+}
+
+// testURL is the test database's URL, or skips the test without one.
+func testURL(tb testing.TB) string {
+	tb.Helper()
+	database := os.Getenv(URLEnv)
+	if database == "" {
+		tb.Skip(URLEnv + " not set")
+	}
+	return database
 }

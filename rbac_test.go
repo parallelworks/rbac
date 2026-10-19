@@ -1856,6 +1856,16 @@ func TestMigrateNeedsASchema(t *testing.T) {
 	}
 }
 
+// A database that isn't UTF8 can hold text that isn't UTF-8, which history would record and no
+// export could chain.
+func TestMigrateNeedsUTF8(t *testing.T) {
+	_, database := pgtest.Database(t, "TEMPLATE template0 ENCODING 'SQL_ASCII' LOCALE 'C'")
+	pool := pgtest.OpenIn(t, database, "")
+	if err := rbac.Migrate(t.Context(), pool); err == nil || !strings.Contains(err.Error(), "UTF8") {
+		t.Fatalf("migrating a database encoded as SQL_ASCII: %v", err)
+	}
+}
+
 func TestCreatorsGetARoleInTheHostsTransaction(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()

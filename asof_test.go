@@ -341,6 +341,159 @@ func TestAsOfOrdersARowsChangesAsTheyWereMade(t *testing.T) {
 	}
 }
 
+// A change counts from its statement, not its transaction's start: a revoke made in a host's
+// transaction that began before the grant counts from after it, so the grant was held between.
+func TestAsOfReadsARevokeInAnOlderTransactionAfterItsGrant(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	owner, u := h.as(t, "owner"), rbac.Principal{Kind: rbac.User, ID: "u"}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT 1`); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	h.seed(t, grant(cluster.Scope(), "cluster.login", u.Kind, u.ID))
+	time.Sleep(20 * time.Millisecond)
+	between := dbNow(t, h)
+	time.Sleep(20 * time.Millisecond)
+	if err := h.authz.WithTx(tx).Apply(ctx, owner, cluster, rbac.Change{Revoke: []rbac.Binding{{Role: "cluster.login", Principal: u}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for at, want := range map[time.Time]int{between: 1, dbNow(t, h): 0} {
+		if err := h.authz.AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+			grants, err := a.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{u}})
+			if err == nil && len(grants) != want {
+				t.Errorf("as of %v, u holds %+v, want %d", at, grants, want)
+			}
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// RecordedAt is when each was written: the revoke's after the grant's.
+	rows, err := h.pool.Query(ctx, `SELECT recorded_at FROM rbac_history WHERE principal = 'user:u' ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	written, err := pgx.CollectRows(rows, pgx.RowTo[time.Time])
+	if err != nil || len(written) != 2 || !written[0].Before(written[1]) {
+		t.Fatalf("written at %v, %v", written, err)
+	}
+}
+
+// A statement reads a row by the columns history copies beside its versions, but only its last
+// version counts: a grant moved to another principal and scope, in place, as by hand, is the new
+// one's from then on, not the old one's too.
+func TestAsOfReadsARowChangedInPlaceAsItsLastVersion(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	u, v := h.as(t, "u"), h.as(t, "v")
+	h.seed(t, grant(workspace.Scope(), "cluster.login", rbac.User, "u"))
+	before := dbNow(t, h)
+	if _, err := h.pool.Exec(ctx, `UPDATE rbac_grants SET principal_id = 'v', scope_type = 'cluster', scope_id = 'c1'
+		WHERE principal = 'user:u'`); err != nil {
+		t.Fatal(err)
+	}
+	after := dbNow(t, h)
+	for _, c := range []struct {
+		at               time.Time
+		holder, other    rbac.Subject
+		scope, elsewhere rbac.Scope
+	}{{before, u, v, workspace.Scope(), cluster.Scope()}, {after, v, u, cluster.Scope(), workspace.Scope()}} {
+		if err := h.authz.AsOf(ctx, "t1", c.at, func(a *rbac.Authorizer) error {
+			for _, f := range []struct {
+				filter rbac.GrantFilter
+				held   bool
+			}{
+				{rbac.GrantFilter{Principals: []rbac.Principal{c.holder.Principal}}, true},
+				{rbac.GrantFilter{Principals: []rbac.Principal{c.other.Principal}}, false},
+				{rbac.GrantFilter{Scopes: []rbac.Scope{c.scope}}, true},
+				{rbac.GrantFilter{Scopes: []rbac.Scope{c.elsewhere}}, false},
+			} {
+				grants, err := a.Grants(ctx, "t1", f.filter)
+				if err != nil {
+					return err
+				}
+				if held := slices.ContainsFunc(grants, func(g rbac.Grant) bool { return g.Role == "cluster.login" }); held != f.held {
+					t.Errorf("as of %v, Grants(%+v) = %+v", c.at, f.filter, grants)
+				}
+			}
+			for _, s := range []rbac.Subject{c.holder, c.other} {
+				err := a.Authorize(ctx, s, login, cluster)
+				if err != nil && !errors.Is(err, rbac.ErrDenied) {
+					return err
+				}
+				if (err == nil) != (s.Principal == c.holder.Principal) {
+					t.Errorf("as of %v, Authorize(%s) = %v", c.at, s.Principal.ID, err)
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A check as of a time reads the history of its subject's grants, memberships and groups, not
+// every row's: other principals' history costs it nothing.
+func TestAsOfReadsOnlyTheRowsAStatementNames(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	u := h.as(t, "u", "sre")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"), grant(cluster.Scope(), "cluster.sudo", rbac.Group, "sre"))
+	// Other principals' grants on the cluster, each changed once since.
+	others := func(n int) {
+		t.Helper()
+		for _, q := range []struct {
+			sql  string
+			args []any
+		}{
+			{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			  SELECT 't1', 'cluster', 'c1', 'user', 'other-' || gen_random_uuid(), 'cluster.login' FROM generate_series(1, $1)`, []any{n}},
+			{`UPDATE rbac_grants SET note = 'changed' WHERE principal LIKE 'user:other-%' AND note = ''`, nil},
+			{`ANALYZE rbac_history`, nil},
+		} {
+			if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// The pages of history and its indexes a check reads, as of at.
+	read := func(at time.Time) int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		var read int64
+		if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+			start := historyPages(ctx, t, tx)
+			err := a.Authorize(ctx, u, root, cluster)
+			read = historyPages(ctx, t, tx) - start
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return read
+	}
+	// Each time as deep in history's indexes, so a check reads as many pages unless it reads
+	// other principals' history.
+	others(500)
+	few := read(dbNow(t, h))
+	others(2000)
+	if many := read(dbNow(t, h)); many > few {
+		t.Fatalf("a check as of a time read %d pages of history, and %d once 2000 more principals had grants", few, many)
+	}
+}
+
 func TestAsOfReadsPastAStatementTheSessionPrepared(t *testing.T) {
 	h := setupOn(t, pgtest.Open(t, "pool_max_conns=1"))
 	ctx := t.Context()
