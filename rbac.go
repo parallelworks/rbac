@@ -595,13 +595,15 @@ type Config struct {
 	ValidateGrant func(ctx context.Context, q DB, in GrantInput) error
 	Constraints   []Constraint
 	// ResourceOf returns the resource a scope is, with its ancestors, attributes and label, as the
-	// host passes it to a check. ChangeMembers checks a change to a group's members as the grants
-	// and denies it amounts to on each scope the group's access is on, the tenant's and groups'
-	// included, which the package knows only by type and id. Without it, the tenant and its groups
-	// are taken as they are, with no attributes or label, and any other scope is taken to be
-	// directly under the tenant, with no attributes or label, as constraints see it too, which only
-	// a host declaring no ContainerTypes or Labels, and resource Attributes as none (an empty map,
-	// as nil lets conditions read any), can rely on: for any other, that is refused.
+	// host passes it to a check. ChangeMembers checks GroupMembers on each group it changes, and a
+	// change to a group's members as the grants and denies it amounts to on each scope the group's
+	// access is on, the tenant's and groups' included, which the package knows only by type and id,
+	// on the resource it returns for each. Without it, a scope is taken as stored, its type and id
+	// directly under the tenant, with no attributes or label, as constraints see it too. GroupMembers
+	// is checked on a group as group management checks its permissions; the grants and denies a
+	// change amounts to only where that is all of the scope: for a host declaring no Labels, and
+	// resource Attributes as none (an empty map, as nil lets conditions read any), and on a scope
+	// other than the tenant or a group, no ContainerTypes. For any other, that change is refused.
 	ResourceOf func(ctx context.Context, tenant string, s Scope) (Resource, error)
 	// Permissions are every permission the host checks, whether or not a role gives it, so that a
 	// catalog leaving one out, as one an operator configures may, refuses it like any permission

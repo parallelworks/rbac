@@ -1622,9 +1622,10 @@ func TestChangingMembersReadsTheScopesItReachesFromTheHost(t *testing.T) {
 	if err := h.authz.ChangeMembers(ctx, manager, "t1", add, nil); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("adding under a deny on the cluster's workspace: %v", err)
 	}
-	// Without Config.ResourceOf, a host with containers can't say where the cluster is.
+	// Without Config.ResourceOf, a host with containers can't say where the cluster is, though its
+	// resources have no attributes.
 	cfg := h.cfg
-	cfg.ResourceOf = nil
+	cfg.ResourceOf, cfg.Attributes = nil, rbac.Attributes{Resource: map[string]rbac.AttributeType{}}
 	blind, err := rbac.New(h.pool, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -2306,6 +2307,34 @@ func TestChangingMembersReadsTheTenantFromTheHostToo(t *testing.T) {
 	}
 }
 
+func TestChangingMembersReadsTheGroupFromTheHost(t *testing.T) {
+	locked := rbac.Resource{Tenant: "t1", Type: rbac.GroupScope, ID: "leads", Attributes: map[string]any{"locked": true}}
+	h := grouped(t, func(c *rbac.Config) {
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s == locked.Scope() {
+				return locked, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+		c.Constraints = []rbac.Constraint{{Name: "locked", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			return in.Permission == rbac.GroupMembers && in.Resource != nil && in.Resource.Attributes["locked"] == true, nil
+		}}}
+	})
+	ctx := t.Context()
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "leads"}, {ID: "devs"}}); err != nil {
+		t.Fatal(err)
+	}
+	h.join(t, "u")
+	manager := h.as(t, "manager")
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", []rbac.Member{{Group: "leads", Principal: identity("u")}}, nil); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("adding to a locked group: %v", err)
+	}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", []rbac.Member{{Group: "devs", Principal: identity("u")}}, nil); err != nil {
+		t.Fatalf("adding to a group that isn't locked: %v", err)
+	}
+}
+
 func TestAGroupHoldingWhatCantBeGrantedNowTakesNoMembers(t *testing.T) {
 	h := grouped(t)
 	ctx := t.Context()
@@ -2321,5 +2350,31 @@ func TestAGroupHoldingWhatCantBeGrantedNowTakesNoMembers(t *testing.T) {
 	err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", []rbac.Member{{Group: "admins", Principal: identity("u")}}, nil)
 	if !errors.Is(err, rbac.ErrInvalid) || !strings.Contains(err.Error(), "can't be granted there now") {
 		t.Fatalf("adding to a group holding what can't be granted now: %v", err)
+	}
+}
+
+func TestWithoutResourceOfTheTenantIsAsStoredOnlyWhereResourcesHaveNoAttributes(t *testing.T) {
+	// Containers sit under the tenant, never above it, so they don't count here.
+	blind := func(attrs rbac.Attributes) func(*rbac.Config) {
+		return func(c *rbac.Config) { c.ResourceOf, c.Attributes = nil, attrs }
+	}
+	root := rbac.TenantRoot("t1")
+	add := []rbac.Member{{Group: "leads", Principal: identity("u")}}
+	for name, c := range map[string]struct {
+		attrs rbac.Attributes
+		want  error
+	}{
+		"undeclared":    {rbac.Attributes{}, rbac.ErrInvalid},
+		"declared none": {rbac.Attributes{Resource: map[string]rbac.AttributeType{}}, nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := grouped(t, blind(c.attrs))
+			ctx := t.Context()
+			h.seed(t, grant(root, "tenant.admin", rbac.Group, "leads"), grant(root, "tenant.admin", rbac.User, "manager"))
+			h.join(t, "u")
+			if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", add, nil); !errors.Is(err, c.want) {
+				t.Fatalf("adding to a group holding a role on the tenant: %v", err)
+			}
+		})
 	}
 }

@@ -669,7 +669,7 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 	if err != nil {
 		return err
 	}
-	rc, err := a.reachOf(ctx, a.db, tenant, set, nil)
+	rc, err := a.reachOf(ctx, a.db, tenant, set, nil, false)
 	if err != nil {
 		return err
 	}
@@ -703,22 +703,17 @@ func memberGroups(members []Member) []string {
 // the last given.
 func (a *Authorizer) memberSet(members []Member) ([]Member, error) {
 	now := a.cfg.Now()
-	type key struct {
-		group, principal, source string
-	}
-	byKey := map[key]Member{}
+	byKey := map[string]Member{}
 	var errs []error
 	for _, m := range members {
 		m.ExpiresAt = stored(m.ExpiresAt)
 		errs = append(errs, a.checkMember(m, now))
-		byKey[key{m.Group, m.Principal.key(), m.Source}] = m
+		byKey[memberKey(m)] = m
 	}
 	if err := errors.Join(errs...); err != nil {
 		return nil, err
 	}
-	return slices.SortedFunc(maps.Values(byKey), func(x, y Member) int {
-		return strings.Compare(x.Group+"\x00"+x.Principal.key()+"\x00"+x.Source, y.Group+"\x00"+y.Principal.key()+"\x00"+y.Source)
-	}), nil
+	return slices.SortedFunc(maps.Values(byKey), func(x, y Member) int { return strings.Compare(memberKey(x), memberKey(y)) }), nil
 }
 
 // memberLocks returns the scope and principal locks a change to members takes: each group's, the
@@ -788,10 +783,10 @@ func (a *Authorizer) join(ctx context.Context, tx pgx.Tx, tenant string, actor P
 // asked about each as the member's (ViaMembership); it approves the activations of the
 // eligibilities those approve, which the actor must be able to set; and it is exempt from the
 // denies those are exempt from, as a removed member is from the denies those name, which the actor
-// must be able to set; a membership made to end sooner is a removal then, checked as one now. A
-// scope is the tenant, a group or what Config.ResourceOf returns. Members from a source the host
-// owns, and the members of a group from one, only the host changes, and what ImportMembers
-// refuses, this does.
+// must be able to set; a membership made to end sooner is a removal then, checked as one now. Each
+// group changed, and each scope reached, is checked as Config.ResourceOf returns it. Members from a
+// source the host owns, and the members of a group from one, only the host changes, and what
+// ImportMembers refuses, this does.
 func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant string, add, remove []Member) (err error) {
 	defer a.refused(ctx, &err, tenant, actor.Principal, "ChangeMembers")
 	if tenant == "" {
@@ -820,18 +815,23 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 		return err
 	}
 	groups := memberGroups(slices.Concat(set, remove))
-	if err := a.mayChangeMembers(ctx, a.db, actor, tenant, groups, true); err != nil {
+	// As Config.ResourceOf gives them, so a constraint or deny reading a group's attributes sees
+	// what the host's own check of GroupMembers would.
+	targets := make([]Resource, len(groups))
+	for i, g := range groups {
+		if targets[i], _, err = a.hostResource(ctx, tenant, Scope{Type: GroupScope, ID: g}); err != nil {
+			return err
+		}
+	}
+	if err := a.mayChangeMembers(ctx, a.db, actor, targets, true); err != nil {
 		return err
 	}
 	// Refused before the host is asked about what the members would gain, and again under the locks.
 	if err := a.notOwnedGroups(ctx, a.db, tenant, groups); err != nil {
 		return err
 	}
-	rc, err := a.reachOf(ctx, a.db, tenant, set, remove)
+	rc, err := a.reachOf(ctx, a.db, tenant, set, remove, true)
 	if err != nil {
-		return err
-	}
-	if rc.ending, err = a.endingSooner(ctx, a.db, tenant, set); err != nil {
 		return err
 	}
 	checks, err := a.mayReach(ctx, actor, tenant, set, remove, rc)
@@ -854,7 +854,7 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 		if err := a.notOwnedGroups(ctx, tx, tenant, groups); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.mayChangeMembers(ctx, tx, actor, tenant, groups, false); err != nil {
+		if err := a.mayChangeMembers(ctx, tx, actor, targets, false); err != nil {
 			return ChangeEvent{}, err
 		}
 		if err := a.mayReachAgain(ctx, tx, actor, checks); err != nil {
@@ -875,12 +875,12 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 	})
 }
 
-// mayChangeMembers checks, on q, that actor may change the members of groups: GroupMembers on each
-// one's scope, or one that doesn't exist, which has none to change. Constraints are asked only with
-// constraints, before the transaction.
-func (a *Authorizer) mayChangeMembers(ctx context.Context, q DB, actor Subject, tenant string, groups []string, constraints bool) error {
+// mayChangeMembers checks, on q, that actor may change the members of groups, each the resource
+// hostResource gives: GroupMembers on each one's scope, or one that doesn't exist, which has none to
+// change. Constraints are asked only with constraints, before the transaction.
+func (a *Authorizer) mayChangeMembers(ctx context.Context, q DB, actor Subject, groups []Resource, constraints bool) error {
 	for _, g := range groups {
-		if err := a.mayManageGroups(ctx, q, actor, Resource{Tenant: tenant, Type: GroupScope, ID: g}, GroupMembers, constraints); err != nil {
+		if err := a.mayManageGroups(ctx, q, actor, g, GroupMembers, constraints); err != nil {
 			return err
 		}
 	}
@@ -910,8 +910,9 @@ type approving struct {
 	approvers []Principal
 }
 
-// reachOf reads, on q, what adding add and removing remove reaches, in force at now.
-func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remove []Member) (reach, error) {
+// reachOf reads, on q, what adding add and removing remove reaches, in force at now, and with
+// ending, which of add end a membership sooner.
+func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remove []Member, ending bool) (reach, error) {
 	r := reach{up: map[string]map[string]bool{}}
 	groups := memberGroups(slices.Concat(add, remove))
 	if len(groups) == 0 {
@@ -997,6 +998,11 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 		}
 		if slices.ContainsFunc(e.Approvers, func(p Principal) bool { return reached[p.key()] }) {
 			r.approving = append(r.approving, approving{v, e.Approvers})
+		}
+	}
+	if ending {
+		if r.ending, err = a.endingSooner(ctx, q, tenant, add); err != nil {
+			return reach{}, err
 		}
 	}
 	return r, nil
@@ -1139,14 +1145,9 @@ func (r reach) footprint(add, remove []Member, gains bool) map[reachKey]RoleDefi
 // of a role widened since. With gains, as for the host's write, which is checked only as the
 // host is asked about what members gain, it compares only those.
 func (a *Authorizer) stillReached(ctx context.Context, tx pgx.Tx, tenant string, add, remove []Member, was reach, gains bool) error {
-	now, err := a.reachOf(ctx, tx, tenant, add, remove)
+	now, err := a.reachOf(ctx, tx, tenant, add, remove, !gains)
 	if err != nil {
 		return err
-	}
-	if !gains {
-		if now.ending, err = a.endingSooner(ctx, tx, tenant, add); err != nil {
-			return err
-		}
 	}
 	before := was.footprint(add, remove, gains)
 	for k, role := range now.footprint(add, remove, gains) {
@@ -1279,27 +1280,38 @@ func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject
 	return nil
 }
 
-// resourceOf is the resource a scope a change to members reaches is, to check that change on: as
-// Config.ResourceOf returns it, or without it, the tenant and its groups as they are, and any other
-// directly under the tenant where the host declares no containers or labels and that resources
-// have no attributes. Undeclared, a condition reads any attribute, as
+// hostResource is a scope as Config.ResourceOf returns it, and true, or without it, as stored: its
+// type and id, directly under the tenant.
+func (a *Authorizer) hostResource(ctx context.Context, tenant string, s Scope) (Resource, bool, error) {
+	if a.cfg.ResourceOf == nil {
+		return Resource{Tenant: tenant, Type: s.Type, ID: s.ID}, false, nil
+	}
+	r, err := a.cfg.ResourceOf(ctx, tenant, s)
+	if err != nil {
+		return Resource{}, false, err
+	}
+	if r.Tenant != tenant || r.Scope() != s {
+		return Resource{}, false, fmt.Errorf("rbac: Config.ResourceOf gave %s of tenant %q for %s", r.Scope().Key(), r.Tenant, s.Key())
+	}
+	return r, true, a.check(r)
+}
+
+// resourceOf is the resource a scope a change to members reaches is, to check the grants and denies
+// the change amounts to there as Apply and SetDeny check them, on the resource the host passes: as
+// Config.ResourceOf returns it, or as stored only where that is all of it, as where the host
+// declares no labels and that resources have no attributes, and for a scope other than the tenant
+// or a group, no containers. Undeclared, a condition reads any attribute, as
 // `has(resource.attributes.frozen)` does.
 func (a *Authorizer) resourceOf(ctx context.Context, tenant string, s Scope) (Resource, error) {
+	r, given, err := a.hostResource(ctx, tenant, s)
 	switch {
-	case a.cfg.ResourceOf != nil:
-		r, err := a.cfg.ResourceOf(ctx, tenant, s)
-		if err != nil {
-			return Resource{}, err
-		}
-		if r.Tenant != tenant || r.Scope() != s {
-			return Resource{}, fmt.Errorf("rbac: Config.ResourceOf gave %s of tenant %q for %s", r.Scope().Key(), r.Tenant, s.Key())
-		}
-		return r, a.check(r)
-	case s.Type == TenantScope || s.Type == GroupScope:
-	case len(a.containers) > 0 || len(a.labels) > 0 || a.cfg.Attributes.Resource == nil || len(a.cfg.Attributes.Resource) > 0:
+	case err != nil || given:
+		return r, err
+	case len(a.labels) > 0 || a.cfg.Attributes.Resource == nil || len(a.cfg.Attributes.Resource) > 0,
+		s.Type != TenantScope && s.Type != GroupScope && len(a.containers) > 0:
 		return Resource{}, fmt.Errorf("%w: the change reaches %s, whose containers, label and attributes only Config.ResourceOf gives", ErrInvalid, s.Key())
 	}
-	return Resource{Tenant: tenant, Type: s.Type, ID: s.ID}, nil
+	return r, nil
 }
 
 // membersCanJoin refuses members of groups that don't exist, or identities that aren't members or
