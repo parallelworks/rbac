@@ -2,8 +2,8 @@ package rbac
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"maps"
 	"slices"
 
 	"github.com/jackc/pgx/v5"
@@ -30,6 +30,24 @@ func lockExclusive(ctx context.Context, tx pgx.Tx, tenant string) error {
 	return locked(tx.SendBatch(ctx, b))
 }
 
+// twoExclusive returns two values of one exclusive dimension that ps gives, which no one holds at
+// once, so a role giving both would give nothing; ok is false where it gives no two.
+func twoExclusive(labels map[string]labelDimension, ps []Permission) (p, q Permission, ok bool) {
+	first := map[string]Permission{}
+	for _, r := range ps {
+		t, v := r.parts()
+		ld := labels[t]
+		if _, value := ld.rank[v]; !value || !ld.exclusive {
+			continue
+		}
+		if f, seen := first[t]; seen && f != r {
+			return f, r, true
+		}
+		first[t] = r
+	}
+	return "", "", false
+}
+
 // exclusiveValues returns, by role, the values of exclusive dimensions each of roles gives.
 func (a *Authorizer) exclusiveValues(roles []RoleDefinition) map[Role][]Permission {
 	gives := map[Role][]Permission{}
@@ -44,19 +62,55 @@ func (a *Authorizer) exclusiveValues(roles []RoleDefinition) map[Role][]Permissi
 	return gives
 }
 
+// Conflict is an identity able to hold two or more values of an exclusive dimension, through any
+// grant or eligibility on the tenant, whatever its condition: it holds none of them, and a change
+// reaching it is refused until a removal leaves it one. The public, for what it holds, is
+// Principal{Kind: Public}.
+type Conflict struct {
+	Principal Principal
+	Dimension string
+	Values    []Permission
+}
+
+// Conflicts lists the identities in a tenant able to hold two values of an exclusive dimension,
+// as a catalog change or a dimension made Exclusive leaves them, by principal and dimension.
+func (a *Authorizer) Conflicts(ctx context.Context, tenant string) ([]Conflict, error) {
+	if tenant == "" {
+		return nil, fmt.Errorf("%w: no tenant", ErrInvalid)
+	}
+	if !a.exclusive() {
+		return nil, nil
+	}
+	return snapshot(ctx, a, func(a *Authorizer) ([]Conflict, error) {
+		custom, err := a.customRoles(ctx, a.db, tenant)
+		if err != nil {
+			return nil, err
+		}
+		gives := a.exclusiveValues(slices.Concat(a.cfg.Catalog, custom))
+		return a.conflicts(ctx, a.db, tenant, gives, []string{string(Members) + ":" + tenant, string(Public) + ":"}, []string{}, 0)
+	})
+}
+
 // excludes refuses a change, e, that leaves an identity it reaches able to hold two values of an
-// exclusive dimension, through any grant or eligibility on the tenant, whatever its condition:
-// those whose grants, eligibilities, memberships or places in groups it set, and those holding a
-// custom role it redefined. Denies don't count, so lifting one is no change to check.
+// exclusive dimension: those whose grants, eligibilities, memberships or places in groups it set,
+// and those holding a custom role it redefined. Denies don't count, so lifting one is no change to
+// check. One able to hold two before the change, as after a catalog change, is refused too, as
+// the check reads the tenant as the change leaves it.
 func (a *Authorizer) excludes(ctx context.Context, tx pgx.Tx, tenant string, e ChangeEvent) error {
-	if len(e.Granted)+len(e.Eligible)+len(e.Roles)+len(e.Memberships)+len(e.Joined) == 0 {
+	gives := a.exclusiveValues(a.cfg.Catalog)
+	// The tenant's custom roles are read only for a change that can reach someone, so one granting
+	// built-in roles that give no exclusive value reads nothing more under the tenant's lock.
+	reaches := func(r Role) bool { return gives[r] != nil || isCustom(r) }
+	if !slices.ContainsFunc(e.Granted, func(g Grant) bool { return reaches(g.Role) }) &&
+		!slices.ContainsFunc(e.Eligible, func(el Eligibility) bool { return reaches(el.Role) }) &&
+		len(e.Roles)+len(e.Memberships)+len(e.Joined) == 0 {
 		return nil
 	}
 	custom, err := a.customRoles(ctx, tx, tenant)
 	if err != nil {
 		return err
 	}
-	gives := a.exclusiveValues(slices.Concat(a.cfg.Catalog, custom))
+	maps.Copy(gives, a.exclusiveValues(custom))
 	// Empty, never nil, which pgx would send as NULL.
 	seeds, redefined := []string{}, []string{}
 	for _, g := range e.Granted {
@@ -83,17 +137,29 @@ func (a *Authorizer) excludes(ctx context.Context, tx pgx.Tx, tenant string, e C
 	if len(seeds)+len(redefined) == 0 {
 		return nil
 	}
+	found, err := a.conflicts(ctx, tx, tenant, gives, seeds, redefined, 1)
+	if err != nil || len(found) == 0 {
+		return err
+	}
+	who := found[0].Principal.key()
+	if found[0].Principal.Kind == Public {
+		who = "the public"
+	}
+	return fmt.Errorf("%w: the change leaves %s able to hold two values of %s, whose values are exclusive", ErrInvalid, who, found[0].Dimension)
+}
+
+// conflicts returns up to limit, or with 0 every, conflict of the identities the seeds reach, as
+// principal keys, and the holders of the roles redefined, by gives, the exclusive values each role
+// gives. Each is read up to its keys as checks read them; the anonymous, which holds what the
+// public does, is read where the public is reached.
+func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives map[Role][]Permission, seeds, redefined []string, limit int) ([]Conflict, error) {
 	roles, values := []string{}, []string{}
 	for r, ps := range gives {
 		for _, p := range ps {
 			roles, values = append(roles, string(r)), append(values, string(p))
 		}
 	}
-	now := a.cfg.Now()
-	// Each identity reached is read up to its keys as checks read them, and the anonymous, which
-	// holds what the public does, where the public is reached.
-	var who, dim string
-	err = tx.QueryRow(ctx, `
+	rows, err := q.Query(ctx, `
 		WITH RECURSIVE seeds(k) AS (
 		  SELECT unnest($2::text[]) COLLATE "C"
 		  UNION SELECT principal FROM rbac_grants WHERE tenant = $1 AND role = ANY($3::text[])
@@ -109,22 +175,35 @@ func (a *Authorizer) excludes(ctx context.Context, tx pgx.Tx, tenant string, e C
 		  SELECT t.identity, v.value FROM targets t
 		  CROSS JOIN LATERAL (WITH RECURSIVE `+keysSQL("$1::text", "t.identity", "$4")+` SELECT k FROM keys) ks
 		  JOIN (
-		    SELECT principal, role FROM rbac_grants WHERE tenant = $1 AND scope_type = 'tenant' AND (expires_at IS NULL OR expires_at > $4)
+		    SELECT principal, role FROM rbac_grants WHERE tenant = $1 AND scope_type = 'tenant' AND role = ANY($5::text[])
+		      AND (expires_at IS NULL OR expires_at > $4)
 		    UNION ALL
-		    SELECT principal, role FROM rbac_eligibilities WHERE tenant = $1 AND scope_type = 'tenant' AND (expires_at IS NULL OR expires_at > $4)
+		    SELECT principal, role FROM rbac_eligibilities WHERE tenant = $1 AND scope_type = 'tenant' AND role = ANY($5::text[])
+		      AND (expires_at IS NULL OR expires_at > $4)
 		  ) g ON g.principal = ks.k
 		  JOIN unnest($5::text[], $6::text[]) AS v(role, value) ON v.role = g.role
 		)
-		SELECT identity, split_part(value, ':', 1) FROM held
-		GROUP BY 1, 2 HAVING count(DISTINCT value) > 1 ORDER BY 1, 2 LIMIT 1`,
-		tenant, seeds, redefined, now, roles, values).Scan(&who, &dim)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		return nil
-	case err != nil:
-		return err
-	case who == "":
-		who = "the public"
+		SELECT identity, split_part(value, ':', 1), array_agg(DISTINCT value ORDER BY value) FROM held
+		GROUP BY 1, 2 HAVING count(DISTINCT value) > 1 ORDER BY 1, 2 LIMIT nullif($7, 0)`,
+		tenant, seeds, redefined, a.cfg.Now(), roles, values, limit)
+	if err != nil {
+		return nil, err
 	}
-	return fmt.Errorf("%w: the change would let %s hold two values of %s, whose values are exclusive", ErrInvalid, who, dim)
+	var found []Conflict
+	var c Conflict
+	var who string
+	var held []string
+	_, err = pgx.ForEachRow(rows, []any{&who, &c.Dimension, &held}, func() error {
+		c.Principal = Principal{Kind: Public}
+		if who != "" {
+			c.Principal = parsePrincipal(who)
+		}
+		c.Values = make([]Permission, len(held))
+		for i, v := range held {
+			c.Values[i] = Permission(v)
+		}
+		found = append(found, c)
+		return nil
+	})
+	return found, err
 }

@@ -256,23 +256,24 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 	if dim, err := a.unsatisfied(ctx, s, r); err != nil || dim != "" {
 		return nil, err
 	}
-	perms, _, err := a.permissionsOf(ctx, s, r, nil)
+	perms, _, _, err := a.permissionsOf(ctx, s, r, nil)
 	return perms, err
 }
 
 // permissionsOf is what Permissions lists, once its input is checked, of the permissions only
 // keeps, or all where it is nil; and of them, those a condition decided, a grant's or a deny's,
-// which a read without the request can't settle.
-func (a *Authorizer) permissionsOf(ctx context.Context, s Subject, r Resource, only func(Permission) bool) ([]Permission, map[Permission]bool, error) {
+// which a read without the request can't settle; and, true, those a grant gives that a
+// constraint removed, which can read the request too.
+func (a *Authorizer) permissionsOf(ctx context.Context, s Subject, r Resource, only func(Permission) bool) ([]Permission, map[Permission]bool, map[Permission]bool, error) {
 	kept := func(p Permission) bool { return only == nil || only(p) }
 	byCondition := map[Permission]bool{}
 	held, ds, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), "")
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	roles, err := a.book(ctx, a.db, r.Tenant, roleIDs(held))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	given := map[Permission]bool{}
 	var conditional []holding
@@ -325,7 +326,7 @@ func (a *Authorizer) permissionsOf(ctx context.Context, s Subject, r Resource, o
 	// Conditions are evaluated only for what no unconditional grant gives, as checks do, the
 	// cheapest first.
 	if err := a.conditionsOf(ctx, a.db, r.Tenant, conditional); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	cheapestFirst(conditional, holding.expression)
 	for _, h := range conditional {
@@ -336,7 +337,7 @@ func (a *Authorizer) permissionsOf(ctx context.Context, s Subject, r Resource, o
 			}
 			if gone, err := isRemoved(p); err != nil || gone {
 				if err != nil {
-					return nil, nil, err
+					return nil, nil, nil, err
 				}
 				continue
 			}
@@ -361,7 +362,7 @@ func (a *Authorizer) permissionsOf(ctx context.Context, s Subject, r Resource, o
 		}
 		gone, err := isRemoved(p)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if !gone && !isDenied(p) {
 			perms = append(perms, p)
@@ -378,7 +379,7 @@ func (a *Authorizer) permissionsOf(ctx context.Context, s Subject, r Resource, o
 			}
 		}
 	}
-	return perms, byCondition, nil
+	return perms, byCondition, removed, nil
 }
 
 // Holder is one who may do p to r, as Holders finds it.

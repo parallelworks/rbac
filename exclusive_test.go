@@ -3,6 +3,7 @@ package rbac_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -86,6 +87,16 @@ func TestAChangeLettingAnIdentityHoldTwoExclusiveValuesIsRefused(t *testing.T) {
 			h.hold(t, "admin", "bank:c")
 			return h.authz.SetEligibility(t.Context(), admin, tenantT1, rbac.Eligibility{Role: "bank.c", Principal: identity("ann"), MaxDuration: time.Hour})
 		},
+		"a custom role's grant": func(t *testing.T, h *harness) error {
+			t.Helper()
+			admin := roleAdmin(t, h)
+			h.hold(t, "admin", "bank:b")
+			r := rbac.RoleDefinition{ID: "custom.liaison", Permissions: []rbac.Permission{"bank:b"}, ResourceTypes: []string{rbac.TenantScope}}
+			if err := h.authz.SetRole(t.Context(), admin, "t1", r); err != nil {
+				t.Fatal(err)
+			}
+			return h.authz.Import(t.Context(), host, "t1", []rbac.Grant{grant(root, r.ID, rbac.User, "ann")})
+		},
 		"a custom role redefined": func(t *testing.T, h *harness) error {
 			t.Helper()
 			admin := roleAdmin(t, h)
@@ -146,9 +157,7 @@ func TestOnlyAValueHeldNowCountsAgainstAnother(t *testing.T) {
 	h.hold(t, "admin", "bank:c")
 	h.as(t, "ann")
 	h.hold(t, "ann", "bank:a")
-	if err := h.authz.SetEligibility(ctx, admin, tenantT1, rbac.Eligibility{Role: "bank.c", Principal: identity("ann"), MaxDuration: time.Hour}); err == nil {
-		t.Fatal("an eligibility for another value")
-	}
+	excluded(t, h.authz.SetEligibility(ctx, admin, tenantT1, rbac.Eligibility{Role: "bank.c", Principal: identity("ann"), MaxDuration: time.Hour}))
 	// A grant and an eligibility that have ended, which DeleteExpired hasn't removed yet, and a
 	// value's grant on a scope below the tenant, as a catalog change can leave, give nothing.
 	ended := h.now.Add(-time.Minute)
@@ -213,12 +222,57 @@ func TestASubjectWhoseGrantsCouldGiveTwoExclusiveValuesHoldsNone(t *testing.T) {
 			}
 		}
 	}
-	// Ending the other grant gives it back the value it holds alone.
+	conflicts, err := authz.Conflicts(ctx, "t1")
+	if want := []rbac.Conflict{{Principal: owner.Principal, Dimension: "bank", Values: []rbac.Permission{"bank:a", "bank:b"}}}; err != nil || !reflect.DeepEqual(conflicts, want) {
+		t.Fatalf("Conflicts = %+v, %v", conflicts, err)
+	}
+	// A change reaching it is refused until a removal leaves it one value.
+	h.groups(t, "staff")
+	err = authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "staff", Principal: owner.Principal}})
+	excluded(t, err)
+	if !strings.Contains(err.Error(), "leaves user:owner able to hold") {
+		t.Fatalf("refused for: %v", err)
+	}
 	if err := authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{g}); err != nil {
 		t.Fatal(err)
 	}
 	if err := authz.Authorize(ctx, owner, view, a); err != nil {
 		t.Fatalf("once it could hold one: %v", err)
+	}
+	if conflicts, err := authz.Conflicts(ctx, "t1"); err != nil || len(conflicts) != 0 {
+		t.Fatalf("Conflicts once resolved = %+v, %v", conflicts, err)
+	}
+	// Where no dimension is exclusive, there are none to list.
+	if conflicts, err := h.authz.Conflicts(ctx, "t1"); err != nil || conflicts != nil {
+		t.Fatalf("Conflicts with no exclusive dimension = %+v, %v", conflicts, err)
+	}
+}
+
+func TestConflictsListsThePublic(t *testing.T) {
+	h := labeled(t, func(c *rbac.Config) {
+		banks(c)
+		c.Labels[len(c.Labels)-1].Exclusive = false
+	})
+	ctx := t.Context()
+	root := rbac.TenantRoot("t1")
+	h.seed(t, grant(root, "bank.b", rbac.Public, ""), grant(root, "bank.c", rbac.Public, ""))
+	cfg := h.cfg
+	cfg.Labels = slices.Clone(cfg.Labels)
+	cfg.Labels[len(cfg.Labels)-1].Exclusive = true
+	authz, err := rbac.New(h.pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflicts, err := authz.Conflicts(ctx, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	public := rbac.Conflict{Principal: rbac.Principal{Kind: rbac.Public}, Dimension: "bank", Values: []rbac.Permission{"bank:b", "bank:c"}}
+	if !slices.ContainsFunc(conflicts, func(c rbac.Conflict) bool { return reflect.DeepEqual(c, public) }) {
+		t.Fatalf("Conflicts = %+v", conflicts)
+	}
+	if _, err := authz.Conflicts(ctx, ""); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("Conflicts of no tenant: %v", err)
 	}
 }
 
@@ -259,5 +313,62 @@ func TestAnOrderedDimensionIsntExclusive(t *testing.T) {
 	cfg.Labels[0].Exclusive = true
 	if _, err := rbac.New(h.pool, cfg); err == nil {
 		t.Fatal("New accepted an exclusive Ordered dimension")
+	}
+}
+
+func TestAValueAConstraintRemovesStillCountsAgainstAnother(t *testing.T) {
+	// The constraint removes bank:a from a subject not cleared for it, as Holders asks it of a
+	// holder without its attributes.
+	h := labeled(t, func(c *rbac.Config) {
+		banks(c)
+		c.Labels[len(c.Labels)-1].Exclusive = false
+		c.Constraints = []rbac.Constraint{{Name: "cleared", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			return in.Permission == "bank:a" && (in.Subject == nil || in.Subject.Attributes["cleared"] != true), nil
+		}}}
+	})
+	ctx := t.Context()
+	owner := h.as(t, "owner")
+	h.hold(t, "owner", "bank:a", "bank:b")
+	cfg := h.cfg
+	cfg.Labels = slices.Clone(cfg.Labels)
+	cfg.Labels[len(cfg.Labels)-1].Exclusive = true
+	authz, err := rbac.New(h.pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := cluster
+	b.Labels = rbac.Label{"bank": {"b"}}
+	cleared := rbac.Subject{Principal: owner.Principal, Attributes: map[string]any{"cleared": true}}
+	if err := authz.Authorize(ctx, cleared, view, b); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("Authorize cleared: %v", err)
+	}
+	holding, err := authz.Holding(ctx, "t1", owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := holding.Values(); len(got) != 0 {
+		t.Fatalf("Values = %v", got)
+	}
+	holders, err := authz.Holders(ctx, view, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.ContainsFunc(holders, func(x rbac.Holder) bool { return x.Principal == owner.Principal }) {
+		t.Fatalf("Holders = %+v", holders)
+	}
+}
+
+func TestARoleGivingTwoExclusiveValuesIsRefused(t *testing.T) {
+	h := labeled(t, banks)
+	both := rbac.RoleDefinition{ID: "bank.both", Permissions: []rbac.Permission{"bank:a", "bank:b"}, ResourceTypes: []string{rbac.TenantScope}}
+	cfg := h.cfg
+	cfg.Catalog = append(slices.Clone(cfg.Catalog), both)
+	if _, err := rbac.New(h.pool, cfg); err == nil || !strings.Contains(err.Error(), "exclusive") {
+		t.Fatalf("New: %v", err)
+	}
+	admin := roleAdmin(t, h)
+	both.ID = "custom.both"
+	if err := h.authz.SetRole(t.Context(), admin, "t1", both); !errors.Is(err, rbac.ErrInvalid) || !strings.Contains(err.Error(), "exclusive") {
+		t.Fatalf("SetRole: %v", err)
 	}
 }

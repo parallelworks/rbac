@@ -182,6 +182,9 @@ func (a *Authorizer) checkCustom(r RoleDefinition) error {
 			}
 		}
 	}
+	if p, q, two := twoExclusive(a.labels, r.Permissions); two {
+		errs = append(errs, fmt.Errorf("permissions %q and %q are exclusive, so it would give neither", p, q))
+	}
 	for _, t := range r.ResourceTypes {
 		if !a.types[t] {
 			errs = append(errs, fmt.Errorf("resource type %q is not one any built-in role is for", t))
