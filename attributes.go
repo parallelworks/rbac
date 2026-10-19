@@ -3,6 +3,7 @@ package rbac
 import (
 	"fmt"
 	"maps"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -31,7 +32,8 @@ import (
 // A condition reading an attribute a request doesn't carry, or carries as a value CEL reads as
 // another type than it is declared, or as nil, is false when it runs, and a deny's applies: a
 // declared attribute passed so fails whatever reads it, comparing it with `!=`, or a map or list
-// holding it, included. An undeclared kind's are read as passed, and CEL compares values of
+// holding it, included. A name a declared kind doesn't declare, which a condition reads only through
+// dyn(), fails so too. An undeclared kind's are read as passed, and CEL compares values of
 // different types as unequal.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
@@ -42,12 +44,24 @@ type AttributeType string
 
 // takes reports whether CEL reads v as a value of type t, whatever Go type a host passes it as:
 // a named string type, or a []any of strings decoded from JSON, is a string or a list of them.
-func (t AttributeType) takes(v any) bool {
+func (t AttributeType) takes(v any) (ok bool) {
+	// Converting some values panics, such as a pointer to a slice, held or not: a condition reading
+	// one fails, as CEL recovers it there, but this runs outside a condition, in the host's check.
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
 	switch v.(type) {
 	case []string:
 		return t == AttrStrings
 	case map[string]string:
 		return t == AttrStringMap
+	}
+	// A nil pointer is none, though CEL reads a nil timestamp or duration message as zero, and a
+	// nil list or map message as empty.
+	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Pointer && rv.IsNil() {
+		return false
 	}
 	switch v := types.DefaultTypeAdapter.NativeToValue(v).(type) {
 	case types.String:
@@ -87,7 +101,8 @@ func allStrings(it traits.Iterator, m traits.Mapper) bool {
 }
 
 // The types an attribute can be declared as, with the Go value a host passes for each, or any
-// other CEL reads as that type, such as a pointer to one, or a []any or map[string]any of strings.
+// other CEL reads as that type, such as a pointer to a string, number or bool, a protobuf
+// timestamp or duration, or a []any or map[string]any of strings. A nil pointer is none.
 const (
 	AttrString    AttributeType = "string"              // string
 	AttrInt       AttributeType = "int"                 // int or int64

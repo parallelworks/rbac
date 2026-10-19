@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/parallelworks/rbac"
@@ -157,6 +158,64 @@ func TestADeclaredAttributeIsReadAsWhatCELReadsItAs(t *testing.T) {
 	}
 }
 
+func TestADeclaredAttributePassedAsANilPointerOrAPointerToAListFailsItsConditions(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
+		c.Attributes = rbac.Attributes{Resource: map[string]rbac.AttributeType{
+			"at": rbac.AttrTimestamp, "age": rbac.AttrDuration, "tags": rbac.AttrStrings,
+		}}
+	})
+	ctx := t.Context()
+	// Each grant's condition holds, and each deny's doesn't, for a value read as zero or empty.
+	conditions := map[string][2]string{
+		"at":   {`resource.attributes.at < timestamp("2020-01-01T00:00:00Z")`, `resource.attributes.at >= timestamp("2020-01-01T00:00:00Z")`},
+		"age":  {`resource.attributes.age < duration("1h")`, `resource.attributes.age >= duration("1h")`},
+		"tags": {`!("blocked" in resource.attributes.tags)`, `"blocked" in resource.attributes.tags`},
+	}
+	gs := []rbac.Grant{grant(cluster.Scope(), "guard", rbac.User, "guardian")}
+	for name, c := range conditions {
+		g := grant(cluster.Scope(), "cluster.login", rbac.User, "granted-"+name)
+		g.Condition = rbac.Condition{Expression: c[0]}
+		gs = append(gs, g, grant(cluster.Scope(), "cluster.login", rbac.User, "denied-"+name))
+	}
+	h.seed(t, gs...)
+	for name, c := range conditions {
+		d := rbac.Deny{
+			ID: name, Principals: []rbac.Principal{h.as(t, "denied-"+name).Principal}, Permissions: []rbac.Permission{login},
+			Condition: rbac.Condition{Expression: c[1]},
+		}
+		if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	at := func(name string, v any) rbac.Resource {
+		r := cluster
+		r.Attributes = map[string]any{name: v}
+		return r
+	}
+	for name, v := range map[string]any{"at": timestamppb.New(time.Unix(0, 0)), "age": durationpb.New(time.Minute), "tags": []string{}} {
+		if !allowed(t, h, h.as(t, "granted-"+name), login, at(name, v)) || !allowed(t, h, h.as(t, "denied-"+name), login, at(name, v)) {
+			t.Fatalf("%s: a value the conditions take", name)
+		}
+	}
+	// CEL reads a nil timestamp or duration message as zero and a nil list message as empty, and
+	// converting a pointer to a slice panics.
+	for name, vs := range map[string][]any{
+		"at":   {(*timestamppb.Timestamp)(nil)},
+		"age":  {(*durationpb.Duration)(nil)},
+		"tags": {(*structpb.ListValue)(nil), &[]string{}, []any{&[]string{}}},
+	} {
+		for _, v := range vs {
+			if allowed(t, h, h.as(t, "granted-"+name), login, at(name, v)) {
+				t.Errorf("%s: a grant's condition held for %#v", name, v)
+			}
+			if allowed(t, h, h.as(t, "denied-"+name), login, at(name, v)) {
+				t.Errorf("%s: a deny's condition was lifted for %#v", name, v)
+			}
+		}
+	}
+}
+
 // doubling is a condition that nests a list in itself k times, so it holds 2^k values, at little
 // cost, and then compares it with itself, which reads them all in one call.
 func doubling(k int, compare string) string {
@@ -207,5 +266,20 @@ func TestAConditionPastItsCostSpendsNoMoreThanItsOwnBound(t *testing.T) {
 	ctx := rbac.WithRequest(t.Context(), map[string]any{"mfa": true, "site": "hq"})
 	if err := h.authz.Authorize(ctx, h.as(t, "alice"), login, r); err != nil {
 		t.Fatalf("a condition that holds, after one past its cost: %v", err)
+	}
+}
+
+func TestAnAttributeADeclaredKindDoesntDeclareFailsItsConditions(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Attributes = rbac.Attributes{Resource: map[string]rbac.AttributeType{"env": rbac.AttrString}}
+	})
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	// dyn() reads past the declaration, which checks no type for team when stored.
+	g.Condition = rbac.Condition{Expression: `dyn(resource.attributes).team != "x"`}
+	h.seed(t, g)
+	r := cluster
+	r.Attributes = map[string]any{"env": "dev", "team": nil}
+	if allowed(t, h, h.as(t, "u"), login, r) {
+		t.Fatal("a condition held on an attribute its kind doesn't declare")
 	}
 }

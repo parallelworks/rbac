@@ -622,8 +622,8 @@ func (a *Authorizer) vars(ctx context.Context, s Subject, p Permission, r Resour
 }
 
 // declared is attributes as conditions read them: each one as declares it, passed as another Go
-// value than its type takes or as none, made an error that whatever reads it fails on, comparing
-// it included, as one not passed is. CEL compares values of different types as unequal rather
+// value than its type takes or as none, and each one a declared kind doesn't declare, made an
+// error that whatever reads it fails on, comparing it included, as one not passed is. CEL compares values of different types as unequal rather
 // than fail, so otherwise a `!=` would hold for it, and a deny's `==` would lift. A kind not
 // declared is as passed.
 func declared(declares map[string]AttributeType, attributes map[string]any) map[string]any {
@@ -633,11 +633,19 @@ func declared(declares map[string]AttributeType, attributes map[string]any) map[
 	}
 	var typed map[string]any
 	for name, v := range attributes {
-		if t, ok := declares[name]; ok && !t.takes(v) {
-			if typed == nil {
-				typed = maps.Clone(attributes)
-			}
+		t, ok := declares[name]
+		if ok && t.takes(v) {
+			continue
+		}
+		if typed == nil {
+			typed = maps.Clone(attributes)
+		}
+		// One it doesn't declare a condition reads only through dyn(), which no type is checked by
+		// when stored, so it fails as one of another type does.
+		if ok {
 			typed[name] = types.NewErr("rbac: attribute %q is not a %s", name, t)
+		} else {
+			typed[name] = types.NewErr("rbac: attribute %q is not declared", name)
 		}
 	}
 	if typed == nil {
