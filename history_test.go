@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"maps"
@@ -382,6 +383,30 @@ func TestHistoryReadsPastAnInfiniteTime(t *testing.T) {
 	}
 }
 
+// History's times are in UTC, whatever the host's time zone, so an expiry at the end of 9999,
+// which the tables hold, writes as JSON: east of UTC, it is in 10000.
+func TestHistoryWritesAsJSONInAnyTimeZone(t *testing.T) {
+	h := setup(t)
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	g.ExpiresAt = time.Date(9999, time.December, 31, 23, 59, 59, 999999000, time.UTC)
+	h.seed(t, g)
+	var n int
+	if err := h.pool.QueryRow(t.Context(), `SELECT count(*) FROM rbac_history`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	var cursor rbac.Cursor
+	for _, r := range drain(t, h, &cursor, n) {
+		for _, at := range []time.Time{r.RecordedAt, r.EffectiveAt, r.ExpiresAt} {
+			if !at.IsZero() && at.Location() != time.UTC {
+				t.Errorf("record %d: a time in %v", r.ID, at.Location())
+			}
+		}
+		if _, err := json.Marshal(r); err != nil {
+			t.Errorf("record %d as JSON: %v", r.ID, err)
+		}
+	}
+}
+
 // The tables refuse an expiry a time.Time or JSON can't hold, which a role that may write them can
 // try.
 func TestNoExpiryIsInfinite(t *testing.T) {
@@ -441,7 +466,10 @@ func TestMigratingKeepsWhatAnInfiniteExpiryMeant(t *testing.T) {
 		 VALUES ('t1', 'cluster', 'c1', 'user', 'standing', 'cluster.login', 'infinity'),
 		   ('t1', 'cluster', 'c1', 'user', 'ended', 'cluster.login', '-infinity'),
 		   ('t1', 'cluster', 'c1', 'user', 'far', 'cluster.login', '10000-01-01 00:00:00+00'),
-		   ('t1', 'cluster', 'c1', 'user', 'ancient', 'cluster.login', '0044-03-15 12:00:00+00 BC')`,
+		   ('t1', 'cluster', 'c1', 'user', 'far', 'cluster.login', '20000-01-01 00:00:00+00'),
+		   ('t1', 'cluster', 'c1', 'user', 'ancient', 'cluster.login', '0044-03-15 12:00:00+00 BC'),
+		   ('t1', 'cluster', 'c1', 'user', 'ancient', 'cluster.login', '0100-01-01 00:00:00+00 BC'),
+		   ('t1', 'cluster', 'c1', 'user', 'ancient', 'cluster.login', 'epoch')`,
 		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, expires_at)
 		 VALUES ('t1', 'cluster', 'c1', 'user', 'standing', 'cluster.sudo', 60, 'infinity'),
 		   ('t1', 'cluster', 'c1', 'user', 'ended', 'cluster.sudo', 60, '-infinity'),
@@ -480,6 +508,17 @@ func TestMigratingKeepsWhatAnInfiniteExpiryMeant(t *testing.T) {
 	}
 	if len(wrong) != 0 {
 		t.Fatalf("after migrating: %v", wrong)
+	}
+	// Grants that differed only in expiries that became one are one grant: the far one past the
+	// first is revoked, and the ancient ones before year 1 expire, as the one at the epoch has.
+	gone, err := pool.Query(ctx, `SELECT principal || ' ' || op || ' ' || how FROM rbac_history
+		WHERE entity = 'grant' AND op IN ('delete', 'expire') ORDER BY 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := pgx.CollectRows(gone, pgx.RowTo[string]); err != nil ||
+		!slices.Equal(got, []string{"user:ancient expire Migrate", "user:ancient expire Migrate", "user:far delete Migrate"}) {
+		t.Fatalf("grants ended by migrating: %v, %v", got, err)
 	}
 	rows, err := pool.Query(ctx, `SELECT DISTINCT how FROM rbac_history WHERE op = 'update'`)
 	if err != nil {
@@ -1850,6 +1889,70 @@ func TestAPruneOfAnotherTimeOrCursorStartsAgain(t *testing.T) {
 			t.Fatalf("as of then = %v, %v", got, err)
 		}
 	})
+}
+
+// A prune on a host's transaction whose snapshot is older than the export's reads no record
+// committed between them, though the export read it: a revoke among them, which the next call
+// finds, stays while the grant's version before it, which the first kept and the next goes on
+// past, stays, or the grant would read as held again.
+func TestPruningGoesOnPastNoVersionAnOlderSnapshotKept(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.as(t, "revoked")
+	h.as(t, "changed")
+	exec := func(q pgx.Tx, sql string, args ...any) {
+		t.Helper()
+		var err error
+		if q == nil {
+			_, err = h.pool.Exec(ctx, sql, args...)
+		} else {
+			_, err = q.Exec(ctx, sql, args...)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	const insert = `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'c1', 'user', $1, 'cluster.login')`
+	// revoked's grant, then changed's, whose first version the first call deletes past the grant's.
+	exec(nil, insert, "revoked")
+	exec(nil, insert, "changed")
+	exec(nil, `UPDATE rbac_grants SET note = 'changed' WHERE principal = 'user:changed'`)
+	// The revoke takes its transaction's id before the change the export reads to, and commits after
+	// the host's snapshot.
+	revoke, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = revoke.Rollback(ctx) }()
+	exec(revoke, `DELETE FROM rbac_grants WHERE principal = 'user:revoked'`)
+	h.as(t, "mark")
+	host, err := h.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = host.Rollback(ctx) }()
+	exec(host, `SELECT 1`)
+	if err := revoke.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	then, through := dbNow(t, h), exported(t, h)
+	want, err := notesAt(t, h, then)
+	if _, held := want["revoked"]; err != nil || held {
+		t.Fatalf("as of then: %v, %v", want, err)
+	}
+	if n, err := rbac.PruneHistory(ctx, host, then, through); err != nil || n != 1 {
+		t.Fatalf("PruneHistory on the older snapshot = %d, %v", n, err)
+	}
+	if err := host.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rbac.PruneHistory(ctx, h.pool, then, through); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := notesAt(t, h, then); err != nil || !maps.Equal(got, want) {
+		t.Errorf("as of then, after pruning: %v, %v, before %v", got, err, want)
+	}
 }
 
 // historyPages is how many pages of history and its indexes tx's session has read since it last

@@ -80,6 +80,20 @@ ALTER TABLE rbac_history ALTER COLUMN recorded_at SET DEFAULT clock_timestamp();
 -- stopped there too. Those stored are kept as what they meant: one at infinity never expires, one
 -- past 9999 expires at its end, and one at -infinity or before year 1 has, by any clock: dated by
 -- the migration, it would read as held to a host whose clock is behind.
+-- A grant's key holds its expiry, so grants that differ only in expiries the rewrite makes one
+-- would stop it: they are one grant, and of them one already at that expiry stays, or else the
+-- first by id, the rest going as their expiry where they had expired.
+SELECT set_config('rbac.change', '{"how": "Migrate", "op": "expire"}', true);
+DELETE FROM rbac_grants g
+    WHERE g.expires_at NOT BETWEEN '0001-01-01 00:00:00+00' AND '9999-12-31 23:59:59.999999+00' AND g.expires_at <> 'infinity'
+      AND EXISTS (SELECT FROM rbac_grants o
+        WHERE (o.tenant, o.principal, o.scope, o.role, o.source, o.condition) = (g.tenant, g.principal, g.scope, g.role, g.source, g.condition)
+          AND o.id <> g.id
+          AND CASE WHEN o.expires_at = 'infinity' THEN NULL
+                WHEN o.expires_at > '9999-12-31 23:59:59.999999+00' THEN '9999-12-31 23:59:59.999999+00'
+                WHEN o.expires_at < '0001-01-01 00:00:00+00' THEN timestamptz 'epoch' ELSE o.expires_at END
+            = CASE WHEN g.expires_at > '9999-12-31 23:59:59.999999+00' THEN '9999-12-31 23:59:59.999999+00' ELSE timestamptz 'epoch' END
+          AND (o.expires_at BETWEEN '0001-01-01 00:00:00+00' AND '9999-12-31 23:59:59.999999+00' OR o.id < g.id));
 SELECT set_config('rbac.change', '{"how": "Migrate"}', true);
 UPDATE rbac_grants SET expires_at = CASE WHEN expires_at = 'infinity' THEN NULL
     WHEN expires_at > '9999-12-31 23:59:59.999999+00' THEN '9999-12-31 23:59:59.999999+00' ELSE timestamptz 'epoch' END

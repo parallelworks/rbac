@@ -125,6 +125,13 @@ const MaxPrune = 10000
 // maxPrune is MaxPrune, which a test lowers.
 var maxPrune = MaxPrune
 
+// pruneKey and pruneThrough are a prune's time, $1, and cursor, $2 and $3, as its record holds
+// them, by which a prune of the same finds where the last stopped.
+const (
+	pruneKey     = `to_char($1::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`
+	pruneThrough = `jsonb_build_object('txid', $2::xid8::text, 'id', $3::bigint)`
+)
+
 // PruneHistory deletes from history, on db, records that an export has read past and that later
 // ones supersede, and returns how many. Of each row it keeps the last version at or before before,
 // so AsOf answers as it did for any time from then on, and refuses an earlier one, and it removes
@@ -159,12 +166,15 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 		// A prune of the same time and cursor goes on from the last record the last one deleted:
 		// those before it that it kept, the last versions of their rows by then, stay so for both,
 		// as any record written since that could change it is past the cursor. Otherwise each call
-		// would read them all again, as many as the rows there are.
+		// would read them all again, as many as the rows there are. One it kept on a snapshot older
+		// than the export, as a host's at REPEATABLE READ, can since be superseded by an end the
+		// snapshot missed: it stays for this call, so the end does too. The last is by id, as they
+		// were written: one under a host's transaction is dated by that transaction's start.
 		var from int64
 		if err := tx.QueryRow(ctx, `SELECT coalesce((SELECT (after->>'reached')::bigint FROM rbac_history
-			WHERE tenant = '' AND entity = 'history' AND key = to_char($1::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
-			  AND op = 'prune' AND after->'through' = jsonb_build_object('txid', $2::xid8::text, 'id', $3::bigint)
-			ORDER BY effective_at DESC, id DESC LIMIT 1), 0)`, before, through.TxID, through.ID).Scan(&from); err != nil {
+			WHERE tenant = '' AND entity = 'history' AND key = `+pruneKey+`
+			  AND op = 'prune' AND after->'through' = `+pruneThrough+`
+			ORDER BY id DESC LIMIT 1), 0)`, before, through.TxID, through.ID).Scan(&from); err != nil {
 			return err
 		}
 		// The planner can't know that what a batch deletes is history's oldest, and would rather
@@ -193,7 +203,7 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 			    OR h.op IN ('delete', 'expire') AND NOT EXISTS (
 			      SELECT FROM rbac_history s
 			      WHERE s.tenant = h.tenant AND s.entity = h.entity AND s.key = h.key AND s.id < h.id
-			        AND (s.effective_at > $1 OR (s.txid, s.id) >= ($2::xid8, $3))))
+			        AND (s.id <= $5 OR s.effective_at > $1 OR (s.txid, s.id) >= ($2::xid8, $3))))
 			  -- A batch, oldest first: of a row, its end goes after every version before it, so a
 			  -- batch that stops between them leaves the end, which still reads as the row's.
 			  ORDER BY h.id LIMIT $4
@@ -209,19 +219,18 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 			return err
 		}
 		_, err := tx.Exec(ctx, `INSERT INTO rbac_history (effective_at, tenant, entity, key, op, after, how)
-			VALUES (now(), '', 'history', to_char($1::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), 'prune',
-			  jsonb_build_object('before', $1::timestamptz, 'through', jsonb_build_object('txid', $2::xid8::text, 'id', $3::bigint), 'deleted', $4::bigint,
-			    'reached', $5::bigint),
+			VALUES (now(), '', 'history', `+pruneKey+`, 'prune',
+			  jsonb_build_object('before', $1::timestamptz, 'through', `+pruneThrough+`, 'deleted', $4::bigint, 'reached', $5::bigint),
 			  'PruneHistory')`, before, through.TxID, through.ID, n, reached)
 		return err
 	})
 	return n, err
 }
 
-// Record is one change to a row the package keeps, as its history recorded it. A time.Time holds
-// no infinity, as PostgreSQL's times can, so a time of a record written before the tables refused
-// one, or by history's owner, reads as an instant PostgreSQL can't hold: infinity as
-// 294277-01-01T00:00:00Z, just after the latest it holds, and -infinity as
+// Record is one change to a row the package keeps, as its history recorded it, its times in UTC.
+// A time.Time holds no infinity, as PostgreSQL's times can, so a time of a record written before
+// the tables refused one, or by history's owner, reads as an instant PostgreSQL can't hold:
+// infinity as 294277-01-01T00:00:00Z, just after the latest it holds, and -infinity as
 // -4713-11-23T23:59:59.999999Z, just before the earliest.
 type Record struct {
 	ID   int64
@@ -263,7 +272,8 @@ var (
 	beforeEarliest = time.Date(-4713, time.November, 24, 0, 0, 0, 0, time.UTC).Add(-time.Microsecond)
 )
 
-// recordTime is t as a Record holds it: the zero time for none.
+// recordTime is t as a Record holds it: the zero time for none, and in UTC, as the tables bound an
+// expiry by its years there: in the host's time zone, one at the end of 9999 can be in 10000.
 func recordTime(t pgtype.Timestamptz) time.Time {
 	switch {
 	case !t.Valid:
@@ -273,7 +283,7 @@ func recordTime(t pgtype.Timestamptz) time.Time {
 	case t.InfinityModifier == pgtype.NegativeInfinity:
 		return beforeEarliest
 	}
-	return t.Time
+	return t.Time.UTC()
 }
 
 // storedTime is t as history stores it, which recordTime reads as t.
