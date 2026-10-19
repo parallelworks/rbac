@@ -717,6 +717,10 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 	}
 	cfg.Catalog = catalog
 	cfg.Constraints = slices.Clone(cfg.Constraints)
+	// Checks read the declared types of attributes as storing a condition reads them, from copies.
+	cfg.Attributes = Attributes{
+		Subject: maps.Clone(cfg.Attributes.Subject), Resource: maps.Clone(cfg.Attributes.Resource), Request: maps.Clone(cfg.Attributes.Request),
+	}
 	containers := map[string]bool{}
 	for _, t := range cfg.ContainerTypes {
 		if !validName(t) || t == TenantScope || t == GroupScope {

@@ -34,7 +34,8 @@ import (
 // A grant with one gives its role only where the expression is true. An expression that fails,
 // as one reading an attribute the host didn't pass does, is false. The zero Condition is none,
 // and one with a title or description has an expression. A pattern it matches is a string
-// literal, of bounded size. A check spends a bounded budget on its grants' conditions and another,
+// literal, of bounded size; it nests at most 32 deep; and a comparison, or a search of a list, that
+// would read more than a condition may spend fails before it runs. A check spends a bounded budget on its grants' conditions and another,
 // for each scope on its path, on its denies', compiling them included: past it, a grant's
 // condition is false and a deny's applies, so what still needs one is refused. A check evaluates
 // the cheapest first, so what it decides doesn't rest on ids, and SetDeny bounds a scope's
@@ -72,6 +73,9 @@ const (
 	// compilePerByte is what compiling a condition costs for each byte of it: compiling one
 	// takes about as long as evaluating eight units of cost for each.
 	compilePerByte = 8
+	// maxDepth bounds how deeply a condition nests: checking its types takes time that grows much
+	// faster than its length with depth, which compilePerByte doesn't count.
+	maxDepth = 32
 )
 
 // budget is what is left for a check to spend on conditions, the conditions it has paid to
@@ -139,6 +143,7 @@ func newConditions(attrs Attributes) (*conditions, error) {
 	}
 	untyped := cel.MapType(cel.StringType, cel.DynType)
 	env, err := cel.NewEnv(
+		cel.ParserRecursionLimit(maxDepth),
 		cel.Variable("subject", untyped),
 		cel.Variable("resource", untyped),
 		cel.Variable("request", untyped),
@@ -214,7 +219,7 @@ func (c *conditions) build(expr string) (cel.Program, error) {
 		return nil, fmt.Errorf("%w: %w", errCondition, err)
 	}
 	prg, err := c.env.Program(checked, cel.CostLimit(maxCost), cel.CostTracking(costs{patterns}),
-		cel.OptimizeRegex(matching(patterns)))
+		cel.OptimizeRegex(matching(patterns)), cel.CustomDecorator(bounded))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", errCondition, err)
 	}
@@ -252,21 +257,11 @@ func (c costs) CallCost(function, _ string, args []ref.Val, _ ref.Val) *uint64 {
 			return nil
 		}
 		n = matchCost(args[0], c.size(args[1]))
-	case operators.Equals, operators.NotEquals, operators.Less, operators.LessEquals, operators.Greater, operators.GreaterEquals:
-		// Comparing stops at the smaller value.
-		if len(args) == 2 {
-			n += smaller(args[0], args[1], maxCost)
-		}
-	case operators.In:
+	case operators.Equals, operators.NotEquals, operators.Less, operators.LessEquals, operators.Greater, operators.GreaterEquals, operators.In:
 		if len(args) != 2 {
 			return nil
 		}
-		// A map finds a key without reading the rest.
-		if _, isMap := args[1].(traits.Mapper); isMap {
-			n += valueSize(args[0], maxCost)
-		} else {
-			n += valueSize(args[1], maxCost)
-		}
+		n += comparing(function, args[0], args[1])
 	case operators.Add, overloads.Size, overloads.TypeConvertInt, overloads.TypeConvertUint, overloads.TypeConvertDouble,
 		overloads.TypeConvertBool, overloads.TypeConvertString, overloads.TypeConvertBytes,
 		overloads.TypeConvertTimestamp, overloads.TypeConvertDuration:
@@ -285,6 +280,134 @@ func (c costs) CallCost(function, _ string, args []ref.Val, _ ref.Val) *uint64 {
 		return nil
 	}
 	return &n
+}
+
+// comparing is what comparing x with y, or finding x in y, reads, counted no further than past
+// maxCost. Comparing stops at the smaller value; a map finds a key without reading the rest.
+func comparing(function string, x, y ref.Val) uint64 {
+	if function != operators.In {
+		return smaller(x, y, maxCost)
+	}
+	if _, isMap := y.(traits.Mapper); isMap {
+		return valueSize(x, maxCost)
+	}
+	return valueSize(y, maxCost)
+}
+
+// bounded refuses, before running it, a comparison or a search in a list that would read more than
+// a condition may: one call reads it all, and a call's cost is counted only once it has run, so a
+// list a condition doubles cheaply would otherwise hold a check for as long as walking it takes.
+func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
+	call, ok := i.(interpreter.InterpretableCall)
+	if !ok {
+		return i, nil
+	}
+	var op func(x, y ref.Val) ref.Val
+	switch call.Function() {
+	case operators.Equals:
+		op = equal
+	case operators.NotEquals:
+		op = func(x, y ref.Val) ref.Val {
+			eq := equal(x, y)
+			if b, ok := eq.(types.Bool); ok {
+				return !b
+			}
+			return eq
+		}
+	case operators.In:
+		op = func(x, y ref.Val) ref.Val {
+			if l, ok := y.(traits.Lister); ok {
+				return contains(l, x)
+			}
+			if c, ok := y.(traits.Container); ok {
+				return c.Contains(x)
+			}
+			return types.NoSuchOverloadErr()
+		}
+	default:
+		return i, nil
+	}
+	function := call.Function()
+	return interpreter.NewCall(call.ID(), function, call.OverloadID(), call.Args(), func(args ...ref.Val) ref.Val {
+		if len(args) != 2 {
+			return types.NoSuchOverloadErr()
+		}
+		if comparing(function, args[0], args[1]) > maxCost {
+			return types.NewErr("rbac: comparing values this large costs more than a condition may")
+		}
+		return op(args[0], args[1])
+	}), nil
+}
+
+// equal is x == y, failing where comparing values a map or list holds fails, as reading a
+// declared attribute passed as another type does: CEL's own comparison of maps and lists counts
+// such a value as equal, so that a map holding one would equal any map with its keys.
+func equal(x, y ref.Val) ref.Val {
+	if types.IsUnknownOrError(x) {
+		return x
+	}
+	if types.IsUnknownOrError(y) {
+		return y
+	}
+	var failed ref.Val
+	same := func(a, b ref.Val) bool {
+		eq := equal(a, b)
+		if eq != types.False && eq != types.True && failed == nil {
+			failed = eq
+		}
+		return eq != types.False
+	}
+	switch xs := x.(type) {
+	case traits.Mapper:
+		ys, ok := y.(traits.Mapper)
+		if !ok || xs.Size() != ys.Size() {
+			return types.Equal(x, y)
+		}
+		for it := xs.Iterator(); it.HasNext() == types.True; {
+			k := it.Next()
+			b, found := ys.Find(k)
+			if !found {
+				return types.False
+			}
+			if a, _ := xs.Find(k); !same(a, b) {
+				return types.False
+			}
+		}
+	case traits.Lister:
+		ys, ok := y.(traits.Lister)
+		n, sized := xs.Size().(types.Int)
+		if !ok || !sized || ys.Size() != n {
+			return types.Equal(x, y)
+		}
+		for i := types.Int(0); i < n; i++ {
+			if !same(xs.Get(i), ys.Get(i)) {
+				return types.False
+			}
+		}
+	default:
+		return types.Equal(x, y)
+	}
+	if failed != nil {
+		return failed
+	}
+	return types.True
+}
+
+// contains is x in l, failing where comparing x with a value l holds fails and none equals it.
+func contains(l traits.Lister, x ref.Val) ref.Val {
+	var failed ref.Val
+	for it := l.Iterator(); it.HasNext() == types.True; {
+		switch eq := equal(x, it.Next()); {
+		case eq == types.True:
+			return eq
+		case eq != types.False && failed == nil:
+			failed = eq
+		}
+	}
+	if failed != nil {
+		return failed
+	}
+	return types.False
 }
 
 // smaller is the smaller of two values' sizes, counted no further than past limit. It reads both
@@ -460,9 +583,11 @@ func (c *conditions) decide(b *budget, expr string, vars map[string]any) (held, 
 	}
 	left := b.left
 	out, details, err := prg.Eval(vars)
+	// One stopped at its limit costs at most that, past the call that took it there, so a single
+	// condition can't spend what the check's others need.
 	cost := uint64(maxCost)
 	if details != nil && details.ActualCost() != nil {
-		cost = *details.ActualCost()
+		cost = min(*details.ActualCost(), maxCost)
 	}
 	b.spend(cost)
 	// One that cost more than was left is past the budget too.
@@ -489,11 +614,44 @@ func WithRequest(ctx context.Context, attributes map[string]any) context.Context
 func (a *Authorizer) vars(ctx context.Context, s Subject, p Permission, r Resource) map[string]any {
 	request, _ := ctx.Value(requestKey{}).(map[string]any)
 	return map[string]any{
-		"subject":  map[string]any{"kind": string(s.Principal.Kind), "id": s.Principal.ID, "attributes": orEmpty(s.Attributes)},
-		"resource": map[string]any{"type": r.Type, "id": r.ID, "tenant": r.Tenant, "attributes": orEmpty(r.Attributes)},
-		"request":  map[string]any{"time": a.cfg.Now(), "attributes": orEmpty(request)},
+		"subject":  map[string]any{"kind": string(s.Principal.Kind), "id": s.Principal.ID, "attributes": declared(a.cfg.Attributes.Subject, s.Attributes)},
+		"resource": map[string]any{"type": r.Type, "id": r.ID, "tenant": r.Tenant, "attributes": declared(a.cfg.Attributes.Resource, r.Attributes)},
+		"request":  map[string]any{"time": a.cfg.Now(), "attributes": declared(a.cfg.Attributes.Request, request)},
 		"action":   string(p),
 	}
+}
+
+// declared is attributes as conditions read them: each one as declares it, passed as another Go
+// value than its type takes or as none, and each one a declared kind doesn't declare, made an
+// error that whatever reads it fails on, comparing it included, as one not passed is. CEL compares values of different types as unequal rather
+// than fail, so otherwise a `!=` would hold for it, and a deny's `==` would lift. A kind not
+// declared is as passed.
+func declared(declares map[string]AttributeType, attributes map[string]any) map[string]any {
+	attributes = orEmpty(attributes)
+	if declares == nil {
+		return attributes
+	}
+	var typed map[string]any
+	for name, v := range attributes {
+		t, ok := declares[name]
+		if ok && t.takes(v) {
+			continue
+		}
+		if typed == nil {
+			typed = maps.Clone(attributes)
+		}
+		// One it doesn't declare a condition reads only through dyn(), which no type is checked by
+		// when stored, so it fails as one of another type does.
+		if ok {
+			typed[name] = types.NewErr("rbac: attribute %q is not a %s", name, t)
+		} else {
+			typed[name] = types.NewErr("rbac: attribute %q is not declared", name)
+		}
+	}
+	if typed == nil {
+		return attributes
+	}
+	return typed
 }
 
 func orEmpty(m map[string]any) map[string]any {
