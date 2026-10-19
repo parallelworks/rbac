@@ -610,8 +610,9 @@ func readsSubject(expr string) bool {
 	if iss.Err() != nil {
 		return true
 	}
+	// `.subject` names it from the root, as `subject` does.
 	return len(ast.MatchDescendants(ast.NavigateAST(parsed.NativeRep()), func(e ast.NavigableExpr) bool {
-		return e.Kind() == ast.IdentKind && e.AsIdent() == "subject"
+		return e.Kind() == ast.IdentKind && strings.TrimPrefix(e.AsIdent(), ".") == "subject"
 	})) > 0
 }
 

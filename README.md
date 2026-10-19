@@ -83,11 +83,11 @@ another store. Both search one tenant, and count only unconditional grants:
   permissions and types the built-in roles use. Defining one needs `rbac.DefineRoles` on the
   tenant and everything the role gives across it. Redefining one so that its grants give more
   asks `ValidateGrant` about each grant and eligibility it widens, as the role will be, and the
-  host refusing one refuses the redefinition; an actor a label of a scope its grants are on
-  refuses can neither redefine nor delete it. `DeleteRole` removes one with its grants;
-  `Roles` lists the built-in and custom roles a scope type takes. Custom roles follow the
-  catalog: one gives only what the catalog still has, and is privileged when it gives what only
-  privileged roles do, or changes access.
+  host refusing one refuses the redefinition; an actor a label of a scope its grants are on, as
+  `Config.ResourceOf` gives it, refuses can neither redefine nor delete it. `DeleteRole` removes
+  one with its grants; `Roles` lists the built-in and custom roles a scope type takes. Custom
+  roles follow the catalog: one gives only what the catalog still has, and is privileged when it
+  gives what only privileged roles do, or changes access.
 - **Labels on data:** a mandatory layer above every grant. A host declares label dimensions
   (`Config.Labels`), each `Ordered` (a level), `AllOf` (compartments) or `AnyOf` (releasable to
   these partners), and a resource carries its label (`Resource.Labels`), stored with it as its

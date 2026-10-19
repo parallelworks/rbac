@@ -33,7 +33,8 @@ const MaxGroupDepth = 8
 
 // Membership is an identity's membership of a tenant. A member holds what it is granted there and
 // what is granted to the tenant's members; a guest only what it is granted; and a suspended one
-// keeps its grants and groups but holds nothing until the suspension is lifted. The host keeps
+// keeps its grants and groups but holds only what the public does until the suspension is lifted,
+// still bound by the denies that name its groups or the tenant's members. The host keeps
 // memberships with SetMemberships and ends them with DeletePrincipal.
 type Membership struct {
 	// Tenant is set on memberships read back.
@@ -313,7 +314,9 @@ func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string,
 }
 
 // ImportGroups creates groups in a tenant or replaces them, as actor: the host's own write, as for
-// a directory it syncs from, without the checks SetGroup makes of an actor.
+// a directory it syncs from, without the checks SetGroup makes of an actor. Taking over a group
+// the tenant made, from one of Config.Sources, removes the members it has from no source of the
+// host's, which ChangeEvent.Left reports.
 func (a *Authorizer) ImportGroups(ctx context.Context, actor Principal, tenant string, groups []GroupDefinition) (err error) {
 	defer a.refused(ctx, &err, tenant, actor, "ImportGroups")
 	if tenant == "" {
@@ -721,7 +724,7 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 		if err := a.stillReached(ctx, tx, tenant, set, nil, rc, true); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.stillStanding(ctx, tx, tenant, memberPrincipals(set), stand); err != nil {
+		if err := a.stillStanding(ctx, tx, tenant, stand); err != nil {
 			return ChangeEvent{}, err
 		}
 		joined, err := a.join(ctx, tx, tenant, actor, set)
@@ -890,7 +893,7 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 		if err := a.stillReached(ctx, tx, tenant, set, remove, rc, false); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.stillStanding(ctx, tx, tenant, memberPrincipals(set), stand); err != nil {
+		if err := a.stillStanding(ctx, tx, tenant, stand); err != nil {
 			return ChangeEvent{}, err
 		}
 		// The host's groups only the host changes, members and all.
@@ -922,6 +925,7 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 // hostResource gives: GroupMembers on each one's scope, or one that doesn't exist, which has none to
 // change. Constraints are asked only with constraints, before the transaction.
 func (a *Authorizer) mayChangeMembers(ctx context.Context, q DB, actor Subject, groups []Resource, constraints bool) error {
+	unsatisfied := a.unsatisfiedBy(ctx, actor)
 	for _, g := range groups {
 		if err := a.mayManageGroups(ctx, q, actor, g, GroupMembers, constraints); err != nil {
 			return err
@@ -930,7 +934,7 @@ func (a *Authorizer) mayChangeMembers(ctx context.Context, q DB, actor Subject, 
 		if !constraints {
 			continue
 		}
-		if dim, err := a.unsatisfied(ctx, actor, g); err != nil || dim != "" {
+		if dim, err := unsatisfied(g); err != nil || dim != "" {
 			return cmp.Or(err, error(&DeniedError{Permission: GroupMembers, Scope: g.Scope(), Reason: labelRefusal(dim)}))
 		}
 	}
@@ -1219,22 +1223,19 @@ func (v revalidation) as(m Member) Binding {
 	return b
 }
 
-// memberPrincipals is the principals members are.
-func memberPrincipals(members []Member) []Principal {
-	ps := make([]Principal, len(members))
-	for i, m := range members {
-		ps[i] = m.Principal
-	}
-	return ps
-}
-
 // askMemberships asks Config.ValidateGrant, before a change's transaction, about each grant and
-// eligibility each member set adds gains, as the member's, and returns the members' standing the
-// answers rest on.
-func (a *Authorizer) askMemberships(ctx context.Context, actor Subject, tenant string, set []Member, rc reach) (map[string]string, error) {
-	stand, err := a.standing(ctx, a.db, tenant, memberPrincipals(set))
+// eligibility each member set adds gains, as the member's, and returns the standing of the members
+// it asked about, which the answers rest on.
+func (a *Authorizer) askMemberships(ctx context.Context, actor Subject, tenant string, set []Member, rc reach) (standing, error) {
+	var asked []Principal
+	for _, m := range set {
+		if len(rc.heldBy(m.Group)) > 0 {
+			asked = append(asked, m.Principal)
+		}
+	}
+	stand, err := a.stand(ctx, a.db, tenant, asked)
 	if err != nil {
-		return nil, err
+		return standing{}, err
 	}
 	var refused []error
 	for _, m := range set {
@@ -1242,7 +1243,7 @@ func (a *Authorizer) askMemberships(ctx context.Context, actor Subject, tenant s
 			roles := book{builtin: a.roles, custom: map[Role]RoleDefinition{v.role.ID: v.role}}
 			bad, err := a.allowed(ctx, roles, actor, ViaMembership, tenant, v.scope, v.as(m))
 			if err != nil {
-				return nil, err
+				return standing{}, err
 			}
 			refused = append(refused, bad...)
 		}

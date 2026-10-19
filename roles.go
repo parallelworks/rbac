@@ -340,7 +340,8 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 				return ChangeEvent{}, fmt.Errorf("%w: grants %s's definition widens changed while it waited; try again", ErrConflict, r.ID)
 			}
 		}
-		if err := a.stillStanding(ctx, tx, tenant, holdersOf(need), stand); err != nil {
+		// The holders asked about, not need's: a grant revoked or ended meanwhile is no conflict.
+		if err := a.stillStanding(ctx, tx, tenant, stand); err != nil {
 			return ChangeEvent{}, err
 		}
 		others := len(au.roles.custom)
@@ -590,16 +591,21 @@ func (a *Authorizer) revalidations(ctx context.Context, q DB, tenant string, wid
 
 // revalidate asks Config.ValidateGrant, before SetRole's transaction, about each grant and
 // eligibility of a role that redefining r as actor widens, and returns those it asked about, with
-// the role as it asked. custom are the tenant's custom roles, as read.
-func (a *Authorizer) revalidate(ctx context.Context, actor Subject, tenant string, custom map[Role]RoleDefinition, r RoleDefinition) (map[revalidated]RoleDefinition, map[string]string, error) {
+// the role as it asked, and the standing of their holders. custom are the tenant's custom roles,
+// as read.
+func (a *Authorizer) revalidate(ctx context.Context, actor Subject, tenant string, custom map[Role]RoleDefinition, r RoleDefinition) (map[revalidated]RoleDefinition, standing, error) {
 	_, widened := a.redefining(custom, r)
 	need, err := a.revalidations(ctx, a.db, tenant, widened)
 	if err != nil {
-		return nil, nil, err
+		return nil, standing{}, err
 	}
-	stand, err := a.standing(ctx, a.db, tenant, holdersOf(need))
+	holders := make([]Principal, len(need))
+	for i, v := range need {
+		holders[i] = v.binding.Principal
+	}
+	stand, err := a.stand(ctx, a.db, tenant, holders)
 	if err != nil {
-		return nil, nil, err
+		return nil, standing{}, err
 	}
 	roles := book{builtin: a.roles, custom: widened}
 	asked := make(map[revalidated]RoleDefinition, len(need))
@@ -607,7 +613,7 @@ func (a *Authorizer) revalidate(ctx context.Context, actor Subject, tenant strin
 	for _, v := range need {
 		bad, err := a.allowed(ctx, roles, actor, ViaRedefinition, tenant, v.scope, v.binding)
 		if err != nil {
-			return nil, nil, err
+			return nil, standing{}, err
 		}
 		// The binding names no scope, and an eligibility has no ID, so the reason says which.
 		for _, e := range bad {
@@ -622,15 +628,6 @@ func (a *Authorizer) revalidate(ctx context.Context, actor Subject, tenant strin
 	return asked, stand, errors.Join(refused...)
 }
 
-// holdersOf is the principals of grants and eligibilities.
-func holdersOf(vs []revalidation) []Principal {
-	ps := make([]Principal, len(vs))
-	for i, v := range vs {
-		ps[i] = v.binding.Principal
-	}
-	return ps
-}
-
 // labelsAllow refuses changing what a custom role's grants and eligibilities give, or revoking
 // them, to an actor that a label of a scope they are on refuses, as Apply refuses changing grants
 // there: read before the change's transaction, as labels are the host's.
@@ -638,12 +635,15 @@ func (a *Authorizer) labelsAllow(ctx context.Context, actor Subject, tenant stri
 	if len(a.labels) == 0 {
 		return nil
 	}
-	// The LIKE matches the partial indexes on custom roles' grants and eligibilities.
+	// The LIKE matches the partial indexes on custom roles' grants and eligibilities. Those ended
+	// give nothing, so changing what they give changes no access.
 	rows, err := a.db.Query(ctx, `
 		SELECT scope_type, scope_id FROM rbac_grants WHERE tenant = $1 AND role = $2 AND role LIKE 'custom.%'
+		  AND (expires_at IS NULL OR expires_at > $3)
 		UNION
 		SELECT scope_type, scope_id FROM rbac_eligibilities WHERE tenant = $1 AND role = $2 AND role LIKE 'custom.%'
-		ORDER BY 1, 2`, tenant, string(id))
+		  AND (expires_at IS NULL OR expires_at > $3)
+		ORDER BY 1, 2`, tenant, string(id), a.cfg.Now())
 	if err != nil {
 		return err
 	}
@@ -651,12 +651,13 @@ func (a *Authorizer) labelsAllow(ctx context.Context, actor Subject, tenant stri
 	if err != nil {
 		return err
 	}
+	unsatisfied := a.unsatisfiedBy(ctx, actor)
 	for _, s := range scopes {
 		on, err := a.resourceOf(ctx, tenant, s)
 		if err != nil {
 			return err
 		}
-		if dim, err := a.unsatisfied(ctx, actor, on); err != nil || dim != "" {
+		if dim, err := unsatisfied(on); err != nil || dim != "" {
 			return cmp.Or(err, error(&DeniedError{Permission: GrantPermission(s.Type), Scope: s, Reason: labelRefusal(dim)}))
 		}
 	}

@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/parallelworks/rbac"
+	"github.com/parallelworks/rbac/internal/pgtest"
 )
 
 // granter changes grants on clusters, holding nothing it hands on; lister grants cluster.sudo
@@ -45,6 +46,12 @@ func TestAConditionReadingTheSubjectIsNoAuthorityToHandItOn(t *testing.T) {
 		if err := h.authz.Apply(mfaCtx, actor, cluster, toCarol(carolOnly)); !errors.Is(err, rbac.ErrDenied) {
 			t.Errorf("%s under a condition on the subject, handed on under it: %v", name, err)
 		}
+	}
+	// Named from the root, it reads the subject all the same.
+	rooted := rbac.Condition{Expression: `.subject.id == "carol"`}
+	h.seed(t, held("cluster.sudo", "ray", rooted), grant(cluster.Scope(), "cluster.granter", rbac.User, "ray"))
+	if err := h.authz.Apply(mfaCtx, h.as(t, "ray"), cluster, toCarol(rooted)); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("held under a condition on the subject named from the root, handed on under it: %v", err)
 	}
 	// A condition on the request is the same for whoever is granted it.
 	if err := h.authz.Apply(mfaCtx, h.as(t, "max"), cluster, toCarol(mfa)); err != nil {
@@ -390,5 +397,111 @@ func TestAChangeWhoseHostsAnswerRestsOnAChangedMembershipIsTriedAgain(t *testing
 				t.Fatalf("a membership the host's answer rests on changed meanwhile: %v", err)
 			}
 		})
+	}
+}
+
+func TestDeletingScopesInTheHostsTransactionHoldsUpNoOtherChange(t *testing.T) {
+	h := labeled(t, banks)
+	ctx := t.Context()
+	h.as(t, "ann")
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := h.authz.WithTx(tx).DeleteScopes(ctx, host, "t1", []rbac.Scope{cluster.Scope()}); err != nil {
+		t.Fatal(err)
+	}
+	// A change waits for the tenant's exclusive lock, which a removal there would hold until the
+	// host's transaction ends.
+	waited, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	if err := h.authz.Import(waited, host, "t1", []rbac.Grant{grant(rbac.TenantRoot("t1"), "bank.a", rbac.User, "ann")}); err != nil {
+		t.Fatalf("a change while the host's transaction deletes scopes: %v", err)
+	}
+}
+
+func TestAMembershipTheHostWasNotAskedAboutChangingIsNoConflict(t *testing.T) {
+	var meanwhile func(context.Context) error
+	h := meanwhileAsked(t, rbac.ViaMembership, &meanwhile)
+	ctx := t.Context()
+	h.join(t, "u", "v")
+	h.groups(t, "everyone")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "admins"))
+	// v joins a group that holds nothing, so the host is asked nothing about it.
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("v"), Guest: true}})
+	}
+	add := []rbac.Member{{Group: "admins", Principal: identity("u")}, {Group: "everyone", Principal: identity("v")}}
+	if err := h.authz.ImportMembers(ctx, host, "t1", add); err != nil {
+		t.Fatalf("a member of a group holding nothing became a guest while the host was asked about another: %v", err)
+	}
+}
+
+func TestARedefinitionWhoseGrantWasRevokedWhileTheHostWasAskedIsNoConflict(t *testing.T) {
+	var meanwhile func(context.Context) error
+	h := meanwhileAsked(t, rbac.ViaRedefinition, &meanwhile)
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	r := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
+		t.Fatal(err)
+	}
+	h.join(t, "u")
+	g := grant(cluster.Scope(), r.ID, rbac.User, "u")
+	h.seed(t, g)
+	meanwhile = func(ctx context.Context) error { return h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{g}) }
+	r.Permissions = []rbac.Permission{view, login}
+	if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
+		t.Fatalf("widening a role whose grant was revoked while the host was asked: %v", err)
+	}
+}
+
+func TestAnEndedGrantOnALabeledScopeAsksNothingOfDeletingItsRole(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	h := labeled(t, func(c *rbac.Config) {
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s == secret.Scope() {
+				return secret, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	r := rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
+		t.Fatal(err)
+	}
+	g := grant(cluster.Scope(), r.ID, rbac.User, "pilot")
+	g.ExpiresAt = h.now.Add(time.Hour)
+	h.seed(t, g)
+	h.now = h.now.Add(2 * time.Hour)
+	if err := h.authz.DeleteRole(ctx, admin, "t1", r.ID); err != nil {
+		t.Fatalf("deleting a role whose only grant on a labeled scope has ended: %v", err)
+	}
+}
+
+func TestAMembershipReadsTheSameInAnotherTimeZone(t *testing.T) {
+	// One connection, so the host's answer and the change's transaction read on the same one,
+	// whose time zone the host changes in between.
+	h := setupOn(t, pgtest.Open(t, "pool_max_conns=1"), func(c *rbac.Config) {
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			if _, err := q.Exec(ctx, `SET TIME ZONE 'Asia/Tokyo'`); err != nil {
+				return err
+			}
+			return validate(ctx, q, in)
+		}
+	})
+	ctx := t.Context()
+	if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("u"), ExpiresAt: h.now.Add(time.Hour)}}); err != nil {
+		t.Fatal(err)
+	}
+	sudo := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: identity("u")}}}
+	if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, sudo); err != nil {
+		t.Fatalf("a grant the host was asked about in one time zone, made in another: %v", err)
 	}
 }

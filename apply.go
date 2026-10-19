@@ -129,7 +129,7 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, how
 			return err
 		}
 	}
-	stand, err := a.standing(ctx, a.db, on.Tenant, bindingPrincipals(grants))
+	stand, err := a.stand(ctx, a.db, on.Tenant, bindingPrincipals(grants))
 	if err != nil {
 		return err
 	}
@@ -156,7 +156,7 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, how
 		if err := groupsExist(ctx, tx, on.Tenant, exist); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.stillStanding(ctx, tx, on.Tenant, bindingPrincipals(grants), stand); err != nil {
+		if err := a.stillStanding(ctx, tx, on.Tenant, stand); err != nil {
 			return ChangeEvent{}, err
 		}
 		// Decided again in the transaction, so the actor's access and the roles are read as the
@@ -188,7 +188,15 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, how
 // state: as a grant to an identity that has left the tenant, or to a group a guest joined
 // meanwhile, of a role the host refuses guests. The memberships of a group's members are read
 // with it, but their changes take the member's lock alone.
-func (a *Authorizer) standing(ctx context.Context, q DB, tenant string, principals []Principal) (map[string]string, error) {
+type standing struct {
+	principals []Principal
+	// by is, for each identity and group, its identities' memberships, one line each.
+	by map[string]string
+}
+
+// stand reads the standing of principals in a tenant on q.
+func (a *Authorizer) stand(ctx context.Context, q DB, tenant string, principals []Principal) (standing, error) {
+	s := standing{principals: principals}
 	var identities, groups []string
 	for _, p := range principals {
 		switch {
@@ -199,36 +207,39 @@ func (a *Authorizer) standing(ctx context.Context, q DB, tenant string, principa
 		}
 	}
 	if len(identities)+len(groups) == 0 {
-		return nil, nil
+		return s, nil
 	}
+	// Joined in the statement, as a group can have many members; an end as seconds since the epoch,
+	// which read the same whatever the session's time zone.
 	rows, err := q.Query(ctx, `
 		WITH RECURSIVE `+insideSQL("$3", "$4")+`, of(root, principal) AS (
 		  SELECT 'group:' || root, principal FROM inside
 		  UNION SELECT p, p FROM unnest($2::text[]) AS p
 		)
-		SELECT o.root, o.principal, coalesce(m.guest::text || ' ' || m.suspended::text || ' ' || coalesce(m.expires_at::text, ''), '')
+		SELECT o.root, string_agg(o.principal || '=' || coalesce(m.guest::text || ' ' || m.suspended::text || ' ' ||
+		  coalesce(extract(epoch FROM m.expires_at)::text, ''), ''), E'\n' ORDER BY o.principal)
 		FROM of o LEFT JOIN rbac_memberships m ON m.tenant = $1 AND m.principal = o.principal
-		ORDER BY 1, 2`, tenant, identities, groups, a.cfg.Now())
+		GROUP BY o.root`, tenant, identities, groups, a.cfg.Now())
 	if err != nil {
-		return nil, err
+		return standing{}, err
 	}
-	stand := map[string]string{}
-	var root, principal, membership string
-	_, err = pgx.ForEachRow(rows, []any{&root, &principal, &membership}, func() error {
-		stand[root] += principal + "=" + membership + "\n"
+	s.by = map[string]string{}
+	var root, members string
+	_, err = pgx.ForEachRow(rows, []any{&root, &members}, func() error {
+		s.by[root] = members
 		return nil
 	})
-	return stand, err
+	return s, err
 }
 
 // stillStanding refuses, under a change's locks, a change whose principals' standing has changed
 // since the host was asked about it.
-func (a *Authorizer) stillStanding(ctx context.Context, tx pgx.Tx, tenant string, principals []Principal, was map[string]string) error {
-	now, err := a.standing(ctx, tx, tenant, principals)
+func (a *Authorizer) stillStanding(ctx context.Context, tx pgx.Tx, tenant string, was standing) error {
+	now, err := a.stand(ctx, tx, tenant, was.principals)
 	if err != nil {
 		return err
 	}
-	if !maps.Equal(now, was) {
+	if !maps.Equal(now.by, was.by) {
 		return fmt.Errorf("%w: a membership the host was asked about changed while this change waited for it; try again", ErrConflict)
 	}
 	return nil
@@ -380,7 +391,7 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 	for i, g := range grants {
 		named[i] = g.Principal
 	}
-	stand, err := a.standing(ctx, a.db, tenant, named)
+	stand, err := a.stand(ctx, a.db, tenant, named)
 	if err != nil {
 		return err
 	}
@@ -409,7 +420,7 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 		if err := groupsExist(ctx, tx, tenant, slices.Concat(groupKeys(named), groupScopes(on))); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.stillStanding(ctx, tx, tenant, named, stand); err != nil {
+		if err := a.stillStanding(ctx, tx, tenant, stand); err != nil {
 			return ChangeEvent{}, err
 		}
 		// Again under the locks, so a custom role deleted since isn't granted, nor one redefined
@@ -1080,13 +1091,15 @@ func scopeGrants(scope Scope, bindings []Binding) []Grant {
 	return grants
 }
 
-// removals are the calls that only take access away, which can't leave anyone able to hold two
-// exclusive values, so neither wait for the tenant's exclusive lock nor check: one that rewrites
-// approvers or denies, as DeleteGroups does, would otherwise be refused for a conflict it left as
-// it found.
+// removals are the calls that only remove grants, eligibilities, denies, memberships, groups or
+// roles, which can't leave anyone able to hold two exclusive values, as denies don't count, so
+// neither wait for the tenant's exclusive lock nor check: one that rewrites approvers or denies,
+// as DeleteGroups does, would otherwise be refused for a conflict it left as it found, and
+// DeleteScopes, in the host's transaction, would hold the lock until that ends.
 var removals = map[string]bool{
 	"Deactivate": true, "DeleteDeny": true, "DeleteGrants": true, "DeleteGroup": true, "DeleteGroups": true,
-	"DeleteEligibility": true, "DeleteMembers": true, "DeletePrincipal": true, "DeleteRole": true, "DeleteTenant": true,
+	"DeleteEligibility": true, "DeleteMembers": true, "DeletePrincipal": true, "DeleteRole": true, "DeleteScope": true,
+	"DeleteScopes": true, "DeleteTenant": true,
 }
 
 // inTx runs fn in a transaction, recording what it writes in history as actor's change made by

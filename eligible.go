@@ -191,7 +191,7 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 	if err != nil {
 		return Grant{}, err
 	}
-	stand, err := a.standing(ctx, a.db, on.Tenant, []Principal{s.Principal})
+	stand, err := a.stand(ctx, a.db, on.Tenant, []Principal{s.Principal})
 	if err != nil {
 		return Grant{}, err
 	}
@@ -203,7 +203,7 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 		if err := lock(ctx, tx, on.Tenant, []string{scope.Key()}, []string{s.Principal.key()}); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.stillStanding(ctx, tx, on.Tenant, []Principal{s.Principal}, stand); err != nil {
+		if err := a.stillStanding(ctx, tx, on.Tenant, stand); err != nil {
 			return ChangeEvent{}, err
 		}
 		// Again under the locks, so an eligibility revoked meanwhile activates nothing.
