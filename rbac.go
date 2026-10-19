@@ -660,7 +660,9 @@ type Config struct {
 	Labels []LabelDimension
 	// OnChange runs in the transaction of every change but DeleteExpired, whose grants already
 	// gave nothing, once the change is written; an error rolls the change back. History records
-	// what it writes as the host's, not as the change's.
+	// what it writes as the host's, not as the change's. A delete's event holds every row it
+	// removes, in memory at once: for a tenant of millions of grants, remove them a batch of
+	// scopes at a time with DeleteScopes first.
 	OnChange func(ctx context.Context, tx pgx.Tx, e ChangeEvent) error
 	// OnRefused is told of every change refused as ErrDenied or ErrInvalid, as an attempt that
 	// failed, which history doesn't record, as nothing of it is written; but not of one on an

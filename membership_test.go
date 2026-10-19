@@ -530,6 +530,52 @@ func TestDeleteExpiredPassesOverAMembershipAChangeJoinsGroupsWith(t *testing.T) 
 	}
 }
 
+// DeleteExpired removes what has expired a batch at a time, each in a transaction of its own,
+// until none is left.
+func TestDeleteExpiredRemovesABatchAtATime(t *testing.T) {
+	rbac.SetExpiryBatch(t, 2)
+	h := setup(t)
+	ctx := t.Context()
+	// Three expired grants, eligibilities, members and memberships, whose identities are members
+	// too.
+	for _, q := range []string{
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+		  SELECT 't1', 'cluster', 'c1', 'user', 'g' || i, 'cluster.login', $1 FROM generate_series(1, 3) i`,
+		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, expires_at)
+		  SELECT 't1', 'cluster', 'c1', 'user', 'e' || i, 'cluster.login', 60, $1 FROM generate_series(1, 3) i`,
+		`INSERT INTO rbac_groups (tenant, id) VALUES ('t1', 'a')`,
+		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, expires_at)
+		  SELECT 't1', 'a', 'user', 'm' || i, $1 FROM generate_series(1, 3) i`,
+		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id, expires_at)
+		  SELECT 't1', 'user', 'left' || i, $1 FROM generate_series(1, 3) i`,
+		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+		  SELECT 't1', 'a', 'user', 'left' || i FROM generate_series(1, 3) i`,
+	} {
+		var args []any
+		if strings.Contains(q, "$1") {
+			args = []any{h.now.Add(-time.Hour)}
+		}
+		if _, err := h.pool.Exec(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err := h.authz.DeleteExpired(ctx); err != nil || n != 15 {
+		t.Fatalf("DeleteExpired = %d, %v", n, err)
+	}
+	rows, err := h.pool.Query(ctx, `SELECT entity || ' ' || count(DISTINCT txid) FROM rbac_history
+		WHERE op = 'expire' GROUP BY entity ORDER BY entity`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batches, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"eligibility 2", "grant 2", "member 2", "membership 2"}; !slices.Equal(batches, want) {
+		t.Errorf("expiries by transaction = %v, want %v", batches, want)
+	}
+}
+
 func TestDeleteExpiredRefusedForARaceConflicts(t *testing.T) {
 	h := grouped(t)
 	ctx := t.Context()

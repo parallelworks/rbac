@@ -233,6 +233,8 @@ func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives m
 			roles, values = append(roles, string(r)), append(values, string(p))
 		}
 	}
+	// Each key's values are looked up by key, so a change reads what the identities it reaches
+	// hold, not every value held in the tenant, and stops at the first conflict it finds.
 	rows, err := q.Query(ctx, `
 		WITH RECURSIVE seeds(k) AS (
 		  SELECT unnest($2::text[]) COLLATE "C"
@@ -254,13 +256,13 @@ func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives m
 		), held(identity, value) AS (
 		  SELECT t.identity, v.value COLLATE "C" FROM targets t
 		  CROSS JOIN LATERAL (WITH RECURSIVE `+keysSQL("$1::text", "t.identity", "$4")+` SELECT k FROM bound) ks
-		  JOIN (
-		    SELECT principal, role FROM rbac_grants WHERE tenant = $1 AND scope_type = 'tenant' AND role = ANY($5::text[])
+		  CROSS JOIN LATERAL (
+		    SELECT role FROM rbac_grants WHERE tenant = $1 AND principal = ks.k AND scope = 'tenant:' || $1 AND role = ANY($5::text[])
 		      AND (expires_at IS NULL OR expires_at > $4)
 		    UNION ALL
-		    SELECT principal, role FROM rbac_eligibilities WHERE tenant = $1 AND scope_type = 'tenant' AND role = ANY($5::text[])
+		    SELECT role FROM rbac_eligibilities WHERE tenant = $1 AND principal = ks.k AND scope = 'tenant:' || $1 AND role = ANY($5::text[])
 		      AND (expires_at IS NULL OR expires_at > $4)
-		  ) g ON g.principal = ks.k
+		  ) g
 		  JOIN unnest($5::text[], $6::text[]) AS v(role, value) ON v.role = g.role
 		)
 		SELECT identity, split_part(value, ':', 1), array_agg(DISTINCT value ORDER BY value) FROM held
