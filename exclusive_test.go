@@ -664,6 +664,9 @@ func TestThePublicsValuesAreReadWithTheirCustomRolesAsOfOneMoment(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !once {
+		t.Fatal("Holders read the public's values without reaching the hook")
+	}
 	if !slices.Equal(holderPrincipals(holders), []rbac.Principal{{Kind: rbac.Public}}) {
 		t.Fatalf("Holders = %+v: the public's values were read from two moments", holders)
 	}

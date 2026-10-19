@@ -30,8 +30,8 @@ func SetExpiryBatch(t *testing.T, n int) {
 	t.Cleanup(func() { expiryBatch = old })
 }
 
-// SetReadingRoles runs f once a read has read a subject's grants and the custom roles with them,
-// until t ends.
+// SetReadingRoles runs f once a read has read grants and the custom roles with them, until t
+// ends.
 func SetReadingRoles(t *testing.T, f func()) {
 	t.Helper()
 	old := readingRoles

@@ -777,16 +777,18 @@ func (p power) lists(r Role, condition string) bool {
 
 // authorityOn reads the actor's grants on a resource's path, and the roles they and the call
 // name. With a custom role among them it reads all the tenant's, which a role's GrantableRoles
-// can name.
+// can name, in the statement that reads the grants, as a check reads them: read apart, a grant
+// made and a role narrowed meanwhile could refuse what no moment did.
 func (a *Authorizer) authorityOn(ctx context.Context, q DB, actor Subject, on Resource, roles []Role) (authority, error) {
-	held, ds, _, err := a.heldOrDenied(ctx, q, on.Tenant, actor, all, on.path(), "", noRoles)
+	which := heldTenantRoles
+	if slices.ContainsFunc(roles, isCustom) {
+		which = tenantRoles
+	}
+	held, ds, b, err := a.heldOrDenied(ctx, q, on.Tenant, actor, all, on.path(), "", which)
 	if err != nil {
 		return authority{}, err
 	}
-	b, err := a.tenantBook(ctx, q, on.Tenant, append(roleIDs(held), roles...))
-	if err != nil {
-		return authority{}, err
-	}
+	readingRoles()
 	return a.authorityOf(ctx, q, actor, on, held, ds, b)
 }
 

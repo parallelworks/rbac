@@ -105,14 +105,14 @@ func (a *Authorizer) broadExcludes(ctx context.Context, tenant string, b Princip
 		keys = append(keys, b.key())
 	}
 	// With the custom roles they name, in one statement, as a check reads them: read apart, a grant
-	// revoked and its role widened meanwhile could give two values no moment did.
+	// revoked and its role widened meanwhile could give two values no moment did. Only their
+	// permissions, which alone excludedBy reads.
 	rows, err := a.db.Query(ctx, `
 		WITH held AS (
 		  SELECT DISTINCT role FROM rbac_grants WHERE tenant = $1 AND scope_type = 'tenant'
 		    AND principal = ANY($2::text[]) AND (expires_at IS NULL OR expires_at > $3)
 		)
-		SELECT h.role, r.id IS NOT NULL, coalesce(r.permissions, '{}'), coalesce(r.resource_types, '{}'),
-		  coalesce(r.privileged, false), coalesce(r.public, false)
+		SELECT h.role, r.id IS NOT NULL, coalesce(r.permissions, '{}')
 		FROM held h LEFT JOIN rbac_roles r ON r.tenant = $1 AND r.id = h.role`, tenant, keys, a.cfg.Now())
 	if err != nil {
 		return false, err
@@ -120,12 +120,12 @@ func (a *Authorizer) broadExcludes(ctx context.Context, tenant string, b Princip
 	var held []holding
 	var custom []RoleDefinition
 	var id string
-	var found, privileged, public bool
-	var perms, types []string
-	if _, err := pgx.ForEachRow(rows, []any{&id, &found, &perms, &types, &privileged, &public}, func() error {
+	var found bool
+	var perms []string
+	if _, err := pgx.ForEachRow(rows, []any{&id, &found, &perms}, func() error {
 		held = append(held, holding{Binding: Binding{Role: Role(id)}})
 		if found {
-			custom = append(custom, roleFrom(id, "", "", perms, types, privileged, public, nil))
+			custom = append(custom, roleFrom(id, "", "", perms, nil, false, false, nil))
 		}
 		return nil
 	}); err != nil {

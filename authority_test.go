@@ -561,3 +561,38 @@ func TestAMemberWhoseIDSpellsTwoMembersIsAChangedMembership(t *testing.T) {
 		t.Fatalf("a grant to a group whose members were replaced by one spelling them: %v", err)
 	}
 }
+
+// A change's authority is read with the custom roles its actor's grants name, as of one moment, as
+// a check reads them: a grant made and a role narrowed meanwhile can't refuse what no moment did.
+func TestAChangesAuthorityIsReadWithItsCustomRolesAsOfOneMoment(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	// Each lets its holder grant cluster.login.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+		VALUES ('t1', 'custom.a', $1, '{cluster}'), ('t1', 'custom.b', $1, '{cluster}')`,
+		[]string{string(view), string(login), string(grantC)}); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), "custom.a", rbac.User, "lead"))
+	lead := h.as(t, "lead")
+	h.as(t, "u")
+	// Once they are read, the lead is granted b, and then a no longer lets it grant: at every
+	// moment, one of them does.
+	once := false
+	rbac.SetReadingRoles(t, func() {
+		if once {
+			return
+		}
+		once = true
+		h.seed(t, grant(cluster.Scope(), "custom.b", rbac.User, "lead"))
+		if _, err := h.pool.Exec(ctx, `UPDATE rbac_roles SET permissions = $1 WHERE id = 'custom.a'`, []string{string(view)}); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := h.authz.Apply(ctx, lead, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("u")}}}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if !once {
+		t.Fatal("the change read its authority without reaching the hook")
+	}
+}

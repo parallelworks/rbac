@@ -1058,11 +1058,12 @@ type holding struct {
 type rolesRead int
 
 const (
-	noRoles rolesRead = iota
 	// namedRoles are those the grants name.
-	namedRoles
+	namedRoles rolesRead = iota
 	// tenantRoles are all of them, as a role's GrantableRoles can name any.
 	tenantRoles
+	// heldTenantRoles are all of them where a grant names one.
+	heldTenantRoles
 )
 
 // heldOrDenied returns the grants on any of scopes, not expired, held by s's principals in a
@@ -1089,12 +1090,12 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Su
 	// to read every role of the tenant or look up those the grants name.
 	var which string
 	switch roles {
-	case noRoles:
-		which = "FALSE"
 	case namedRoles:
 		which = "id IN (SELECT role FROM held WHERE role LIKE '" + CustomPrefix + "%')"
 	case tenantRoles:
 		which = "TRUE"
+	case heldTenantRoles:
+		which = "EXISTS (SELECT FROM held WHERE role LIKE '" + CustomPrefix + "%')"
 	}
 	// Grants, denies and roles in that order; grants by principal, scope, role and id, denies by id
 	// and scope, as deniesOn.
