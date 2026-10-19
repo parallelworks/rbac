@@ -159,7 +159,7 @@ func (a *Authorizer) decideGrants(ctx context.Context, s Subject, p Permission, 
 // none does.
 func (a *Authorizer) explain(ctx context.Context, s Subject, p Permission, r Resource, counts broad) (Decision, error) {
 	vars, spend := a.vars(ctx, s, p, r), newBudget()
-	keys, strong, err := a.keysOf(ctx, a.db, r.Tenant, s)
+	keys, err := a.keysOf(ctx, a.db, r.Tenant, s)
 	if err != nil {
 		return Decision{}, err
 	}
@@ -184,7 +184,7 @@ func (a *Authorizer) explain(ctx context.Context, s Subject, p Permission, r Res
 	}
 	d := Decision{Reason: "no grant gives it"}
 	grants = slices.DeleteFunc(grants, func(g Grant) bool {
-		return !gives(roles, holding{Binding: g.Binding, strong: slices.Contains(strong, g.Principal.key())}, p, r.Type)
+		return !gives(roles, holding{Binding: g.Binding}, p, r.Type)
 	})
 	// Evaluated in the order Authorize evaluates them, so a budget runs out where it does for it.
 	byCost := slices.Clone(grants)
@@ -247,10 +247,10 @@ func gives(roles book, h holding, p Permission, resourceType string) bool {
 }
 
 // carries reports whether a grant held as h gives p, which def gives: as its principal carries
-// it, and for a privileged role only through a strong key, so a catalog change that makes a role
-// privileged reaches what ordinary groups and the tenant's members hold.
+// it, and for a privileged role never through the tenant's members or the public, so a catalog
+// change that makes a role privileged reaches what they hold.
 func (h holding) carries(def RoleDefinition, p Permission) bool {
-	return h.Principal.carries(def, p) && (h.strong || !def.Privileged)
+	return h.Principal.carries(def, p) && (!h.Principal.broad() || !def.Privileged)
 }
 
 // Permissions lists what the subject may do to r, sorted: the AuthZEN action search.
@@ -493,18 +493,17 @@ func (a *Authorizer) holders(ctx context.Context, p Permission, r Resource, role
 	now := a.cfg.Now()
 	args := append(append([]any{
 		r.Tenant, r.path(), roles, now, p.managesAccess(),
-		[]string{string(Members), string(Public)},
+		broadKinds,
 		string(p), r.Type, a.publicRoles(roles), string(Public),
-	}, a.publicArgs(p, r.Type, custom)...), append([]any{a.privilegedRoles(roles), string(Group)}, a.catalogArgs(custom)...)...)
-	// A privileged role gives only through an identity or a privileged group.
+	}, a.publicArgs(p, r.Type, custom)...), append([]any{a.privilegedRoles(roles)}, a.catalogArgs(custom)...)...)
+	// A privileged role gives nothing through the tenant's members or the public.
 	rows, err := a.db.Query(ctx, `
 		SELECT id::text, principal_kind, principal_id, conditional FROM rbac_grants
 		WHERE tenant = $1 AND scope = ANY($2::text[]) AND role = ANY(`+givingSQL("$3", "$1", "$7", "$8", custom, "")+`)
 		  AND (expires_at IS NULL OR expires_at > $4) AND (NOT $5 OR principal_kind <> ALL($6::text[]))
 		  AND (principal_kind <> $10 OR role = ANY(`+givingSQL("$9", "$1", "$7", "$8", custom, publicOnly(catalogSQL{"$11", "$12", "$13"}))+`))
-		  AND (principal_kind <> ALL($6::text[]) AND principal_kind <> $15
-		    OR principal_kind = $15 AND EXISTS (SELECT FROM rbac_groups pg WHERE pg.tenant = $1 AND pg.id = principal_id AND pg.privileged)
-		    OR role <> ALL(`+givingSQL("$14", "$1", "$7", "$8", custom, privilegedOnly(catalogSQL{"$16", "$17", "$18"}))+`))
+		  AND (principal_kind <> ALL($6::text[])
+		    OR role <> ALL(`+givingSQL("$14", "$1", "$7", "$8", custom, privilegedOnly(catalogSQL{"$15", "$16", "$17"}))+`))
 		ORDER BY principal_kind, principal_id, id`, args...)
 	if err != nil {
 		return nil, err
@@ -758,7 +757,7 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 // reachable is Reachable's answer once no constraint removes p, for the built-in roles that give
 // it, and custom ones too where custom.
 func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, tenant, resourceType string, roles []string, custom bool) (Reach, error) {
-	keys, strong, err := a.keysOf(ctx, a.db, tenant, s)
+	keys, err := a.keysOf(ctx, a.db, tenant, s)
 	if err != nil {
 		return Reach{}, err
 	}
@@ -770,13 +769,13 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 	args := append(append([]any{
 		tenant, principals, roles, a.cfg.Now(), reaching, publicKey, a.publicRoles(roles),
 		string(p), resourceType,
-	}, a.publicArgs(p, resourceType, custom)...), append([]any{strong, a.privilegedRoles(roles)}, a.catalogArgs(custom)...)...)
+	}, a.publicArgs(p, resourceType, custom)...), append([]any{broadKinds, a.privilegedRoles(roles)}, a.catalogArgs(custom)...)...)
 	rows, err := a.db.Query(ctx, `
 		SELECT scope, bool_and(conditional) FROM rbac_grants
 		WHERE tenant = $1 AND principal = ANY($2::text[]) AND role = ANY(`+givingSQL("$3", "$1", "$8", "$9", custom, "")+`)
 		  AND (expires_at IS NULL OR expires_at > $4) AND `+ofTypes("scope", "$5", len(reaching))+`
 		  AND (principal <> $6 OR role = ANY(`+givingSQL("$7", "$1", "$8", "$9", custom, publicOnly(catalogSQL{"$10", "$11", "$12"}))+`))
-		  AND (principal = ANY($13::text[]) OR role <> ALL(`+givingSQL("$14", "$1", "$8", "$9", custom, privilegedOnly(catalogSQL{"$15", "$16", "$17"}))+`))
+		  AND (principal_kind <> ALL($13::text[]) OR role <> ALL(`+givingSQL("$14", "$1", "$8", "$9", custom, privilegedOnly(catalogSQL{"$15", "$16", "$17"}))+`))
 		GROUP BY scope ORDER BY scope`, args...)
 	if err != nil {
 		return Reach{}, err
@@ -905,7 +904,6 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	keys := func(of string) string {
 		return "ARRAY(WITH RECURSIVE " + keysSQL(arg(1)+"::text", arg(2)+"::text", arg(4)) + " " + of + ")"
 	}
-	strong := "ARRAY(WITH RECURSIVE " + keysSQL(arg(1)+"::text", arg(2)+"::text", arg(4)) + " " + strongKeys + ")"
 	// The subject's grants on the scopes `of` keeps, in the default collation, as the host's
 	// path column has it, so its GIN index applies.
 	grants := func(of string) string {
@@ -913,10 +911,10 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 			WHERE g.tenant = %s::text AND g.principal = ANY(%s) AND g.role = ANY(%s)
 			  AND (g.expires_at IS NULL OR g.expires_at > %s) AND NOT g.conditional AND %s
 			  AND (g.principal <> %s::text OR g.role = ANY(%s))
-			  AND (g.principal = ANY(%s) OR g.role <> ALL(%s))`,
+			  AND (g.principal_kind <> ALL(%s) OR g.role <> ALL(%s))`,
 			arg(1), keys(countedKeys(arg(13), arg(17))), givingSQL(arg(3), arg(1), arg(8), arg(9), custom, ""), arg(4), of, arg(6),
 			givingSQL(arg(7), arg(1), arg(8), arg(9), custom, publicOnly(catalogSQL{arg(10), arg(11), arg(12)})),
-			strong, givingSQL(arg(18), arg(1), arg(8), arg(9), custom, privilegedOnly(catalogSQL{arg(19), arg(20), arg(21)})))
+			broadKindsSQL, givingSQL(arg(18), arg(1), arg(8), arg(9), custom, privilegedOnly(catalogSQL{arg(19), arg(20), arg(21)})))
 	}
 	// The grants' tenant is an argument of its own: the host's tenant column needn't be text,
 	// and one argument can't take two types. The grants overlap the path, which the host's GIN
@@ -1011,8 +1009,6 @@ type holding struct {
 	Binding
 	scope       string
 	conditional bool
-	// strong is set when it is held through the identity or a privileged group.
-	strong bool
 }
 
 // heldOrDenied returns the grants on any of scopes, not expired, held by s's principals in a
@@ -1032,13 +1028,12 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Su
 	}
 	rows, err := q.Query(ctx, `
 		WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$4")+`
-		SELECT false, id::text, principal, scope, role, expires_at, conditional, NULL::text[], '',
-		  principal = ANY(ARRAY(`+strongKeys+`))
+		SELECT false, id::text, principal, scope, role, expires_at, conditional, NULL::text[], ''
 		FROM rbac_grants
 		WHERE tenant = $1 AND principal = ANY(ARRAY(`+countedKeys("$7", "$8")+`)) AND scope = ANY($3::text[])
 		  AND (expires_at IS NULL OR expires_at > $4)
 		UNION ALL
-		SELECT true, id, id, scope, '', NULL, condition <> '', permissions, condition, false
+		SELECT true, id, id, scope, '', NULL, condition <> '', permissions, condition
 		FROM rbac_denies
 		WHERE tenant = $1 AND scope = ANY($3::text[]) AND principals && ARRAY(SELECT k FROM bound) AND NOT exempt && ARRAY(SELECT k FROM bound)
 		  AND ($5 = '' OR $5 = ANY(permissions) OR $6 = ANY(permissions)) AND EXISTS (SELECT FROM keys WHERE `+counted("$7", "$8")+`)
@@ -1052,9 +1047,9 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Su
 	var isDeny bool
 	var id, principal, scope, role, condition string
 	var expires *time.Time
-	var conditional, strong bool
+	var conditional bool
 	var perms []string
-	_, err = pgx.ForEachRow(rows, []any{&isDeny, &id, &principal, &scope, &role, &expires, &conditional, &perms, &condition, &strong}, func() error {
+	_, err = pgx.ForEachRow(rows, []any{&isDeny, &id, &principal, &scope, &role, &expires, &conditional, &perms, &condition}, func() error {
 		if isDeny {
 			d := denial{id: id, scope: scope, condition: condition}
 			for _, x := range perms {
@@ -1063,7 +1058,7 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Su
 			ds = append(ds, d)
 			return nil
 		}
-		h := holding{Binding: Binding{ID: id, Principal: parsePrincipal(principal), Role: Role(role)}, scope: scope, conditional: conditional, strong: strong}
+		h := holding{Binding: Binding{ID: id, Principal: parsePrincipal(principal), Role: Role(role)}, scope: scope, conditional: conditional}
 		if expires != nil {
 			h.ExpiresAt = *expires
 		}

@@ -106,8 +106,7 @@ another store. Both search one tenant, and count only unconditional grants:
   release writes it. Loosening a label is a release:
   `Holding.MayRelease` allows it in the dimensions whose power to release the subject holds
   (`ReleasePermission(dimension)` on the tenant), for data it can read. A role giving it is
-  `Privileged`, so only identities and privileged groups hold it, and no value is named
-  `release`.
+  `Privileged`, so the tenant's members never hold it, and no value is named `release`.
 - **Exclusive values:** a dimension marked `Exclusive` names parties with a conflict of interest,
   whose values are held one at a time. A change that leaves an identity able to hold two, through
   any grant or eligibility on the tenant and under any condition, directly, through its groups, as
@@ -168,23 +167,27 @@ another store. Both search one tenant, and count only unconditional grants:
   and `Explain`, `Reachable` and `Holders` in one snapshot of the database, but under `WithTx` at
   READ COMMITTED, where each statement reads its own.
   A suspended identity is bound as one outside the tenant is: by a deny naming it or the public.
-- **Privileged groups:** a role the catalog marks `Privileged`, or one that changes access, is
-  privileged, and only identities and privileged groups (`GroupDefinition.Privileged`, set when one
-  is made) hold it: granting one to the tenant's members or an ordinary group is refused, and a
-  check gives nothing of one through them, as after a catalog change. A privileged group's members
-  are identities, changed only with `rbac.ManagePrivilegedGroups` on the tenant and never by an
-  actor for itself, and `ValidateGrant` is asked about each privileged grant a new member gains
-  (`rbac.ViaMembership`). An ordinary group's members change with `rbac.GroupMembers` on it
-  (`ChangeMembers`). A deny binds through ordinary groups too: removing someone from a group it
-  names, or adding them to one it exempts, lifts it for them, whatever it removes, so a deny that
-  must hold against those who change members names and exempts only identities and privileged
-  groups.
+- **Changing members is granting:** a group's members hold what it and the groups it is in hold,
+  so `ChangeMembers`, with `rbac.GroupMembers` on the group, checks a change to its members as the
+  changes to access it makes, each as `Apply` or `SetDeny` checks one on its scope. An added member
+  gains the group's grants and eligibilities, which the actor must be able to grant it, and
+  `ValidateGrant` is asked about each as the member's (`rbac.ViaMembership`); it approves what the
+  group approves, which the actor must be able to set; and it is exempt from the denies the group
+  is exempt from, as a removed member, or one whose membership is made to end sooner, is from
+  those naming it, which the actor must be able to set. So whoever manages a group that holds,
+  approves and is in no deny changes its members freely, and one holding a role only if they could
+  grant that role themselves. `Config.ResourceOf` gives the package the containers, label and
+  attributes of the scopes a group's access is on; a host without it declares no labels and
+  resource attributes as none, and for access below the tenant, no containers.
+- **Privileged roles:** a role the catalog marks `Privileged`, or one that changes access, is
+  privileged: it is never granted to the tenant's members, and gives nothing through them, as
+  after a catalog change.
 - **Public access:** the zero `Subject` is anonymous and holds only what is granted to the public.
   Only a role marked `Public` can be granted to the public, and a grant to the public gives
   nothing once its role no longer is.
 - **Broad grants:** a grant to a tenant's members (`rbac.TenantMembers`) or the public never gives
   a privileged role, nor any permission that changes access, so changing access always takes a
-  named identity or a privileged group.
+  named identity or group.
 
 ## Why
 

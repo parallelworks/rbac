@@ -406,7 +406,7 @@ func recordedSince(t *testing.T, h *harness, last *int64) []recorded {
 
 func TestHistoryRecordsWhoMadeEachChangeAndHow(t *testing.T) {
 	h := grouped(t, func(c *rbac.Config) {
-		c.Catalog = append(slices.Clone(c.Catalog), guardRole, groupMembers)
+		c.Catalog = append(slices.Clone(c.Catalog), guardRole)
 		c.PrincipalKinds = []rbac.PrincipalKind{"service_account"}
 	})
 	ctx := t.Context()

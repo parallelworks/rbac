@@ -133,8 +133,8 @@ func indexLabels(dims []LabelDimension, catalog []RoleDefinition) (map[string]la
 			_, value := ld.rank[v]
 			switch {
 			case v == releaseVerb && !r.Privileged:
-				// Held through an ordinary group or by a tenant's members, it would let anyone who
-				// can add to one release data.
+				// Held by the tenant's members, it would let anyone who joins the tenant release
+				// data.
 				return nil, fmt.Errorf("rbac: role %q gives %q, the power to release data, so it is Privileged", r.ID, p)
 			case !value && v != releaseVerb:
 				return nil, fmt.Errorf("rbac: role %q gives %q, which isn't a value label dimension %q declares", r.ID, p, t)

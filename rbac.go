@@ -104,6 +104,13 @@ var publicKey = Principal{Kind: Public}.key()
 // public.
 func (p Principal) broad() bool { return p.Kind == Members || p.Kind == Public }
 
+// broadKinds are the kinds of the broad principals, as a statement's argument, and broadKindsSQL
+// as SQL.
+var (
+	broadKinds    = []string{string(Members), string(Public)}
+	broadKindsSQL = fmt.Sprintf(`ARRAY['%s', '%s']::text[]`, Members, Public)
+)
+
 // wellFormed reports whether p could hold grants in a tenant, whether or not its kind is
 // declared, as a revoke needs.
 func (p Principal) wellFormed(tenant string) bool {
@@ -137,8 +144,8 @@ func (p Principal) carries(role RoleDefinition, perm Permission) bool {
 	return p.Kind != Public || role.Public
 }
 
-// privilegedRoles keeps the privileged built-in roles, which a grant gives through only an
-// identity or a privileged group.
+// privilegedRoles keeps the privileged built-in roles, which a grant to the tenant's members or the
+// public never gives.
 func (a *Authorizer) privilegedRoles(roles []string) []string {
 	var privileged []string
 	for _, id := range roles {
@@ -212,8 +219,7 @@ var all = broad{public: true, members: true}
 // are the public; and while the identity is a member or guest of the tenant, not suspended, the
 // identity, the groups it is in, through those they are in, and unless it is a guest the tenant's
 // members. A group is counted once, so membership nested in a cycle stops. It defines bound(k)
-// too, the keys a deny binds or exempts it by (bound), and strong(k), those of its keys through
-// which a privileged role gives anything: the identity and its privileged groups.
+// too, the keys a deny binds or exempts it by (bound).
 func keysSQL(tenant, identity, now string) string {
 	return fmt.Sprintf(`membership AS (
 		SELECT guest FROM rbac_memberships WHERE tenant = %[1]s AND principal = %[2]s AND NOT suspended
@@ -231,15 +237,8 @@ func keysSQL(tenant, identity, now string) string {
 		UNION ALL SELECT 'group:' || id FROM groups
 	), bound(k) AS (
 		SELECT k FROM keys UNION SELECT %[2]s COLLATE "C" WHERE %[2]s <> ''
-	), strong(k) AS (
-		SELECT %[2]s COLLATE "C" FROM membership
-		UNION ALL SELECT 'group:' || g.id FROM groups g JOIN rbac_groups pg ON pg.tenant = %[1]s AND pg.id = g.id
-		WHERE pg.privileged
 	)`, tenant, identity, now)
 }
-
-// strongKeys is SQL selecting the strong keys keysSQL defines.
-const strongKeys = `SELECT k FROM strong`
 
 // bound is the keys a deny binds or exempts s by: its keys, and its identity even where it isn't a
 // member or guest, as a grant to the public still reaches it there.
@@ -262,24 +261,14 @@ func counted(public, members string) string {
 	return fmt.Sprintf(`(k <> 'public:' OR %s) AND (k NOT LIKE 'members:%%' OR %s)`, public, members)
 }
 
-// keysOf reads the principal keys s is in a tenant, sorted, as keysSQL defines them, and those of
-// them that are strong.
-func (a *Authorizer) keysOf(ctx context.Context, q DB, tenant string, s Subject) (keys, strong []string, err error) {
+// keysOf reads the principal keys s is in a tenant, sorted, as keysSQL defines them.
+func (a *Authorizer) keysOf(ctx context.Context, q DB, tenant string, s Subject) ([]string, error) {
 	rows, err := q.Query(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`
-		SELECT k, k IN (`+strongKeys+`) FROM keys ORDER BY k`, tenant, s.identityKey(), a.cfg.Now())
+		SELECT k FROM keys ORDER BY k`, tenant, s.identityKey(), a.cfg.Now())
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	var k string
-	var isStrong bool
-	_, err = pgx.ForEachRow(rows, []any{&k, &isStrong}, func() error {
-		keys = append(keys, k)
-		if isStrong {
-			strong = append(strong, k)
-		}
-		return nil
-	})
-	return keys, strong, err
+	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
 // countedOf keeps the keys whose grants a read counts.
@@ -593,21 +582,36 @@ type Config struct {
 	// identity or group the tenant doesn't let in, such as one from another tenant; to the public
 	// where the host doesn't allow public access; of a role a principal's kind may not hold, such
 	// as a privileged one for a guest; or one this actor may not give this principal. It is asked
-	// about every grant Apply, Import and Activate make, every eligibility SetEligibility sets, and
-	// every grant and eligibility that SetRole redefining a custom role makes give more, once each
-	// is otherwise valid; the change's InvalidError for it wraps the error, so errors.Is and
+	// about every grant Apply, Import and Activate make, every eligibility SetEligibility sets,
+	// every grant and eligibility that SetRole redefining a custom role makes give more, and every
+	// one a member ChangeMembers or ImportMembers adds gains (ViaMembership), once each is
+	// otherwise valid; the change's InvalidError for it wraps the error, so errors.Is and
 	// errors.As find the host's own in it. Any other error fails the change as it is. q is what
-	// the change runs on, so under WithTx it sees a member added earlier in the transaction.
+	// the change runs on, so under WithTx it sees a member added earlier in the transaction. A
+	// grant to a group reaches whoever is in it, now and later: it is asked about with the group,
+	// and about each member as it joins, so a policy on who may hold a role, as none privileged for
+	// a guest, refuses the group's grant too while the group holds one that may not.
 	// Required: a grant to a principal the tenant doesn't let in must never be stored.
 	ValidateGrant func(ctx context.Context, q DB, in GrantInput) error
 	Constraints   []Constraint
+	// ResourceOf returns the resource a scope is, with its ancestors, attributes and label, as the
+	// host passes it to a check. ChangeMembers checks GroupMembers on each group it changes, and a
+	// change to a group's members as the grants and denies it amounts to on each scope the group's
+	// access is on, the tenant's and groups' included, which the package knows only by type and id,
+	// on the resource it returns for each. Without it, a scope is taken as stored, its type and id
+	// directly under the tenant, with no attributes or label, as constraints see it too. GroupMembers
+	// is checked on a group as group management checks its permissions; the grants and denies a
+	// change amounts to only where that is all of the scope: for a host declaring no Labels, and
+	// resource Attributes as none (an empty map, as nil lets conditions read any), and on a scope
+	// other than the tenant or a group, no ContainerTypes. For any other, that change is refused.
+	ResourceOf func(ctx context.Context, tenant string, s Scope) (Resource, error)
 	// Permissions are every permission the host checks, whether or not a role gives it, so that a
 	// catalog leaving one out, as one an operator configures may, refuses it like any permission
 	// no grant gives. A check or search of a permission not among them, or of a resource type none
 	// of them nor any built-in role is for, is refused as invalid, as a typo, and New refuses a
 	// built-in role giving one: they include what the package checks for the host that the
-	// built-in roles give, `:grant` and `:deny` permissions, DefineRoles, ManageGroups,
-	// ManagePrivilegedGroups and GroupMembers. Empty, they are what the built-in roles give.
+	// built-in roles give, `:grant` and `:deny` permissions, DefineRoles, ManageGroups and
+	// GroupMembers. Empty, they are what the built-in roles give.
 	Permissions []Permission
 	// Sources are the sources the host owns, such as the one it syncs grants from a directory
 	// from: Apply refuses to grant or revoke from one, by ID too, and DeleteRole to delete a role
@@ -865,8 +869,8 @@ type Via string
 // sets, which is the grant activating it would make. ViaRedefinition is a grant or eligibility
 // that exists, which SetRole redefining its custom role makes give more: an eligibility's binding
 // is the grant activating it would make, as with ViaEligibility, and has no ID. ViaMembership is a
-// privileged group's grant or eligibility of a privileged role that an identity ChangeMembers or
-// ImportMembers adds to it gains, its binding naming the identity, with no ID, and ending when the
+// grant or eligibility of a group, or of a group it is in, that a member ChangeMembers or
+// ImportMembers adds to it gains, its binding naming the member, with no ID, and ending when the
 // sooner of it and the membership does.
 const (
 	ViaApply        Via = "apply"
