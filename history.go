@@ -168,13 +168,14 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 		// as any record written since that could change it is past the cursor. Otherwise each call
 		// would read them all again, as many as the rows there are. One it kept on a snapshot older
 		// than the export, as a host's at REPEATABLE READ, can since be superseded by an end the
-		// snapshot missed: it stays for this call, so the end does too. The last is by id, as they
-		// were written: one under a host's transaction is dated by that transaction's start.
+		// snapshot missed: it stays for this call, so the end does too. So a call can go on from
+		// where any of them stopped, and goes on from the furthest: the last by date or id can have
+		// stopped short of it, as one dated by its host transaction's start, or one that waited on
+		// another's batch and deleted none of it.
 		var from int64
-		if err := tx.QueryRow(ctx, `SELECT coalesce((SELECT (after->>'reached')::bigint FROM rbac_history
+		if err := tx.QueryRow(ctx, `SELECT coalesce(max((after->>'reached')::bigint), 0) FROM rbac_history
 			WHERE tenant = '' AND entity = 'history' AND key = `+pruneKey+`
-			  AND op = 'prune' AND after->'through' = `+pruneThrough+`
-			ORDER BY id DESC LIMIT 1), 0)`, before, through.TxID, through.ID).Scan(&from); err != nil {
+			  AND op = 'prune' AND after->'through' = `+pruneThrough, before, through.TxID, through.ID).Scan(&from); err != nil {
 			return err
 		}
 		// The planner can't know that what a batch deletes is history's oldest, and would rather
@@ -272,8 +273,8 @@ var (
 	beforeEarliest = time.Date(-4713, time.November, 24, 0, 0, 0, 0, time.UTC).Add(-time.Microsecond)
 )
 
-// recordTime is t as a Record holds it: the zero time for none, and in UTC, as the tables bound an
-// expiry by its years there: in the host's time zone, one at the end of 9999 can be in 10000.
+// recordTime is t as a Record holds it: the zero time for none, and in UTC, so a record reads the
+// same whatever the host's time zone.
 func recordTime(t pgtype.Timestamptz) time.Time {
 	switch {
 	case !t.Valid:

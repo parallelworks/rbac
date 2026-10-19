@@ -106,15 +106,16 @@ func checkSource(s string) string {
 }
 
 // checkExpiry returns why an expiry can't be stored at now, or "" if it can: none, or one to come
-// by the end of 9999, the last year JSON and RFC 3339 write, so history can be exported as text.
+// by the end of 9999-12-30, which is in 9999 in every time zone, the last year JSON and RFC 3339
+// write, so the expiry, and history, can be written as text wherever it is read.
 func checkExpiry(expires, now time.Time) string {
 	switch {
 	case expires.IsZero():
 		return ""
 	case !expires.After(now):
 		return "already expired"
-	case expires.After(time.Date(9999, time.December, 31, 23, 59, 59, 999999000, time.UTC)):
-		return "expires after 9999"
+	case expires.After(time.Date(9999, time.December, 30, 23, 59, 59, 999999000, time.UTC)):
+		return "expires after 9999-12-30"
 	}
 	return ""
 }

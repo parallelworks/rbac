@@ -100,15 +100,16 @@ func TestSettingMemberships(t *testing.T) {
 		t.Fatalf("DeleteExpired = %d, %v", n, err)
 	}
 	for name, m := range map[string]rbac.Membership{
-		"a group":            {Principal: groupOf("g")},
-		"the members":        {Principal: rbac.TenantMembers("t1")},
-		"the public":         {Principal: rbac.Principal{Kind: rbac.Public}},
-		"an undeclared kind": {Principal: rbac.Principal{Kind: "robot", ID: "r"}},
-		"no id":              {Principal: rbac.Principal{Kind: rbac.User}},
-		"already expired":    {Principal: identity("v"), ExpiresAt: h.now.Add(-time.Minute)},
-		"expiring past 9999": {Principal: identity("v"), ExpiresAt: time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC)},
-		"a malformed source": {Principal: identity("v"), Source: "Directory"},
-		"a reserved source":  {Principal: identity("v"), Source: "rbac.sync"},
+		"a group":                {Principal: groupOf("g")},
+		"the members":            {Principal: rbac.TenantMembers("t1")},
+		"the public":             {Principal: rbac.Principal{Kind: rbac.Public}},
+		"an undeclared kind":     {Principal: rbac.Principal{Kind: "robot", ID: "r"}},
+		"no id":                  {Principal: rbac.Principal{Kind: rbac.User}},
+		"already expired":        {Principal: identity("v"), ExpiresAt: h.now.Add(-time.Minute)},
+		"expiring past 9999":     {Principal: identity("v"), ExpiresAt: time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC)},
+		"expiring on 9999-12-31": {Principal: identity("v"), ExpiresAt: time.Date(9999, time.December, 31, 0, 0, 0, 0, time.UTC)},
+		"a malformed source":     {Principal: identity("v"), Source: "Directory"},
+		"a reserved source":      {Principal: identity("v"), Source: "rbac.sync"},
 	} {
 		if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{m}); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("%s: %v", name, err)

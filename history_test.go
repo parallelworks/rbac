@@ -383,12 +383,12 @@ func TestHistoryReadsPastAnInfiniteTime(t *testing.T) {
 	}
 }
 
-// History's times are in UTC, whatever the host's time zone, so an expiry at the end of 9999,
-// which the tables hold, writes as JSON: east of UTC, it is in 10000.
+// History's times are in UTC, whatever the host's time zone or its session's, and the latest expiry
+// the tables hold writes as JSON in any time zone, its row's too.
 func TestHistoryWritesAsJSONInAnyTimeZone(t *testing.T) {
-	h := setup(t)
+	h := setupOn(t, pgtest.Open(t, "timezone=Asia/Kolkata"))
 	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
-	g.ExpiresAt = time.Date(9999, time.December, 31, 23, 59, 59, 999999000, time.UTC)
+	g.ExpiresAt = time.Date(9999, time.December, 30, 23, 59, 59, 999999000, time.UTC)
 	h.seed(t, g)
 	var n int
 	if err := h.pool.QueryRow(t.Context(), `SELECT count(*) FROM rbac_history`).Scan(&n); err != nil {
@@ -403,6 +403,16 @@ func TestHistoryWritesAsJSONInAnyTimeZone(t *testing.T) {
 		}
 		if _, err := json.Marshal(r); err != nil {
 			t.Errorf("record %d as JSON: %v", r.ID, err)
+		}
+		for _, row := range []json.RawMessage{r.Before, r.After} {
+			var times struct {
+				ExpiresAt *time.Time `json:"expires_at"`
+			}
+			if row != nil {
+				if err := json.Unmarshal(row, &times); err != nil {
+					t.Errorf("record %d's row: %v", r.ID, err)
+				}
+			}
 		}
 	}
 }
@@ -496,7 +506,7 @@ func TestMigratingKeepsWhatAnInfiniteExpiryMeant(t *testing.T) {
 		rows, err := pool.Query(ctx, `SELECT principal || ' ' || coalesce(expires_at::text, 'never') FROM `+table+`
 			WHERE NOT (principal = 'user:standing' AND expires_at IS NULL
 			  OR principal IN ('user:ended', 'user:ancient') AND expires_at = 'epoch'
-			  OR principal = 'user:far' AND expires_at = '9999-12-31 23:59:59.999999+00')`)
+			  OR principal = 'user:far' AND expires_at = '9999-12-30 23:59:59.999999+00')`)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -519,6 +529,13 @@ func TestMigratingKeepsWhatAnInfiniteExpiryMeant(t *testing.T) {
 	if got, err := pgx.CollectRows(gone, pgx.RowTo[string]); err != nil ||
 		!slices.Equal(got, []string{"user:ancient expire Migrate", "user:ancient expire Migrate", "user:far delete Migrate"}) {
 		t.Fatalf("grants ended by migrating: %v, %v", got, err)
+	}
+	// What migrating records holds no time the tables refuse, which JSON can't write.
+	var outside int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM rbac_history WHERE how = 'Migrate'
+		AND (expires_at NOT BETWEEN '0001-01-01 00:00:00+00' AND '9999-12-30 23:59:59.999999+00'
+		  OR effective_at NOT BETWEEN '0001-01-01 00:00:00+00' AND '9999-12-30 23:59:59.999999+00')`).Scan(&outside); err != nil || outside != 0 {
+		t.Fatalf("migrating recorded %d times outside the years 1 to 9999, %v", outside, err)
 	}
 	rows, err := pool.Query(ctx, `SELECT DISTINCT how FROM rbac_history WHERE op = 'update'`)
 	if err != nil {
