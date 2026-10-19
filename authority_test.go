@@ -400,27 +400,6 @@ func TestAChangeWhoseHostsAnswerRestsOnAChangedMembershipIsTriedAgain(t *testing
 	}
 }
 
-func TestDeletingScopesInTheHostsTransactionHoldsUpNoOtherChange(t *testing.T) {
-	h := labeled(t, banks)
-	ctx := t.Context()
-	h.as(t, "ann")
-	tx, err := h.pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if err := h.authz.WithTx(tx).DeleteScopes(ctx, host, "t1", []rbac.Scope{cluster.Scope()}); err != nil {
-		t.Fatal(err)
-	}
-	// A change waits for the tenant's exclusive lock, which a removal there would hold until the
-	// host's transaction ends.
-	waited, cancel := context.WithTimeout(ctx, time.Second)
-	defer cancel()
-	if err := h.authz.Import(waited, host, "t1", []rbac.Grant{grant(rbac.TenantRoot("t1"), "bank.a", rbac.User, "ann")}); err != nil {
-		t.Fatalf("a change while the host's transaction deletes scopes: %v", err)
-	}
-}
-
 func TestAMembershipTheHostWasNotAskedAboutChangingIsNoConflict(t *testing.T) {
 	var meanwhile func(context.Context) error
 	h := meanwhileAsked(t, rbac.ViaMembership, &meanwhile)
@@ -503,5 +482,82 @@ func TestAMembershipReadsTheSameInAnotherTimeZone(t *testing.T) {
 	sudo := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: identity("u")}}}
 	if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, sudo); err != nil {
 		t.Fatalf("a grant the host was asked about in one time zone, made in another: %v", err)
+	}
+}
+
+func TestARoleGrantedOnALabeledScopeWhileItsLabelsWereCheckedIsTriedAgain(t *testing.T) {
+	for _, op := range []string{"SetRole", "DeleteRole"} {
+		t.Run(op, func(t *testing.T) {
+			secret := cluster
+			secret.Labels = rbac.Label{"level": {"high"}}
+			open := rbac.Scope{Type: "cluster", ID: "c2"}
+			var meanwhile func(context.Context) error
+			h := labeled(t, func(c *rbac.Config) {
+				resourceOf := c.ResourceOf
+				c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+					if s == secret.Scope() {
+						return secret, nil
+					}
+					// Asked about the scope it is granted on, the host grants it on the labeled one.
+					if do := meanwhile; s == open && do != nil {
+						meanwhile = nil
+						if err := do(ctx); err != nil {
+							return rbac.Resource{}, err
+						}
+					}
+					return resourceOf(ctx, tenant, s)
+				}
+			})
+			ctx := t.Context()
+			admin := roleAdmin(t, h)
+			r := rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+			if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
+				t.Fatal(err)
+			}
+			h.seed(t, grant(open, r.ID, rbac.User, "pilot"))
+			meanwhile = func(ctx context.Context) error {
+				return h.authz.Import(ctx, host, "t1", []rbac.Grant{grant(secret.Scope(), r.ID, rbac.User, "pilot")})
+			}
+			change := func() error {
+				if op == "DeleteRole" {
+					return h.authz.DeleteRole(ctx, admin, "t1", r.ID)
+				}
+				widened := r
+				widened.Permissions = []rbac.Permission{view, login}
+				return h.authz.SetRole(ctx, admin, "t1", widened)
+			}
+			if err := change(); !errors.Is(err, rbac.ErrConflict) {
+				t.Fatalf("granted on a labeled scope while its labels were checked: %v", err)
+			}
+			if err := change(); !errors.Is(err, rbac.ErrDenied) {
+				t.Fatalf("tried again: %v", err)
+			}
+		})
+	}
+}
+
+func TestAMemberWhoseIDSpellsTwoMembersIsAChangedMembership(t *testing.T) {
+	var meanwhile func(context.Context) error
+	h := meanwhileAsked(t, rbac.ViaApply, &meanwhile)
+	ctx := t.Context()
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "ops"}}); err != nil {
+		t.Fatal(err)
+	}
+	// An id the host can give, which reads as the two members' memberships one after the other.
+	both := "a=false false \nuser:b"
+	h.join(t, "a", "b", both)
+	two := []rbac.Member{{Group: "ops", Principal: identity("a")}, {Group: "ops", Principal: identity("b")}}
+	if err := h.authz.ImportMembers(ctx, host, "t1", two); err != nil {
+		t.Fatal(err)
+	}
+	meanwhile = func(ctx context.Context) error {
+		if err := h.authz.DeleteMembers(ctx, host, "t1", two); err != nil {
+			return err
+		}
+		return h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "ops", Principal: identity(both)}})
+	}
+	sudo := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: groupOf("ops")}}}
+	if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, sudo); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("a grant to a group whose members were replaced by one spelling them: %v", err)
 	}
 }

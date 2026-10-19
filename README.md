@@ -157,7 +157,9 @@ another store. Both search one tenant, and count only unconditional grants:
   role a role it holds lists in `GrantableRoles`, which it grants without holding. The host is
   asked before a change takes its locks, so a change is tried again (`rbac.ErrConflict`) when the
   memberships its answers rest on, of an identity it grants to or of a group's members, changed
-  in between.
+  in between. A change to a group member's own membership takes that member's lock alone, so one
+  committing after the change reads them again isn't seen: a host whose policy rests on a group's
+  members checks the group's grants when it changes a membership, as `SetMemberships` says.
 
 ## Principals
 

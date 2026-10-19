@@ -280,6 +280,7 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 		return err
 	}
 	checked, existed := au.roles.custom[r.ID]
+	var labeled []Scope
 	if existed && !sameAccess(checked, r) {
 		// Its grants are on scopes of the types it is for, and on those it was for before and is
 		// for again, whose grants it brings back.
@@ -290,7 +291,7 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 		if err := a.changesDenied(au, tenant, types, fmt.Sprintf("changing what %s's grants give", r.ID)); err != nil {
 			return err
 		}
-		if err := a.labelsAllow(ctx, actor, tenant, r.ID); err != nil {
+		if labeled, err = a.labelsAllow(ctx, actor, tenant, r.ID); err != nil {
 			return err
 		}
 	}
@@ -313,9 +314,13 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 		if ok && !sameAccess(old, r) && (!existed || !sameAccess(old, checked)) {
 			return ChangeEvent{}, changedMeanwhile(r.ID)
 		}
-		// Again on the denies read under the lock, which a deny set meanwhile is among.
+		// Again on the denies read under the lock, which a deny set meanwhile is among, and on the
+		// scopes its grants are on now, which labelsAllow checked as they were.
 		if ok && !sameAccess(old, r) {
 			if err := a.changesDenied(au, tenant, slices.Concat(old.ResourceTypes, r.ResourceTypes), fmt.Sprintf("changing what %s's grants give", r.ID)); err != nil {
+				return ChangeEvent{}, err
+			}
+			if err := a.stillLabeled(ctx, tx, tenant, r.ID, labeled); err != nil {
 				return ChangeEvent{}, err
 			}
 		}
@@ -404,6 +409,7 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		return err
 	}
 	checked, existed := roles.role(id)
+	var labeled []Scope
 	if existed {
 		if err := a.changesStopped(ctx, actor, tenant, checked.ResourceTypes, "revoking "+string(id)); err != nil {
 			return err
@@ -411,7 +417,7 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		if err := a.changesDenied(au, tenant, checked.ResourceTypes, "revoking "+string(id)); err != nil {
 			return err
 		}
-		if err := a.labelsAllow(ctx, actor, tenant, id); err != nil {
+		if labeled, err = a.labelsAllow(ctx, actor, tenant, id); err != nil {
 			return err
 		}
 	}
@@ -432,6 +438,9 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		}
 		if existed {
 			if err := a.changesDenied(au, tenant, checked.ResourceTypes, "revoking "+string(id)); err != nil {
+				return ChangeEvent{}, err
+			}
+			if err := a.stillLabeled(ctx, tx, tenant, id, labeled); err != nil {
 				return ChangeEvent{}, err
 			}
 		}
@@ -630,14 +639,57 @@ func (a *Authorizer) revalidate(ctx context.Context, actor Subject, tenant strin
 
 // labelsAllow refuses changing what a custom role's grants and eligibilities give, or revoking
 // them, to an actor that a label of a scope they are on refuses, as Apply refuses changing grants
-// there: read before the change's transaction, as labels are the host's.
-func (a *Authorizer) labelsAllow(ctx context.Context, actor Subject, tenant string, id Role) error {
+// there: read before the change's transaction, as labels are the host's. It returns the scopes it
+// checked, which stillLabeled reads again under the change's lock.
+func (a *Authorizer) labelsAllow(ctx context.Context, actor Subject, tenant string, id Role) ([]Scope, error) {
+	if len(a.labels) == 0 {
+		return nil, nil
+	}
+	scopes, err := a.roleScopes(ctx, a.db, tenant, id)
+	if err != nil {
+		return nil, err
+	}
+	unsatisfied := a.unsatisfiedBy(ctx, actor)
+	for _, s := range scopes {
+		on, err := a.resourceOf(ctx, tenant, s)
+		if err != nil {
+			return nil, err
+		}
+		if dim, err := unsatisfied(on); err != nil || dim != "" {
+			return nil, cmp.Or(err, error(&DeniedError{Permission: GrantPermission(s.Type), Scope: s, Reason: labelRefusal(dim)}))
+		}
+	}
+	return scopes, nil
+}
+
+// stillLabeled refuses, under the tenant's lock, a change labelsAllow checked whose role is now
+// granted on a scope it didn't check, as one granted there while the change waited.
+func (a *Authorizer) stillLabeled(ctx context.Context, tx pgx.Tx, tenant string, id Role, checked []Scope) error {
 	if len(a.labels) == 0 {
 		return nil
 	}
+	scopes, err := a.roleScopes(ctx, tx, tenant, id)
+	if err != nil {
+		return err
+	}
+	seen := make(map[Scope]bool, len(checked))
+	for _, s := range checked {
+		seen[s] = true
+	}
+	for _, s := range scopes {
+		if !seen[s] {
+			return fmt.Errorf("%w: %s was granted on %s while this change waited; try again", ErrConflict, id, s.Key())
+		}
+	}
+	return nil
+}
+
+// roleScopes reads, on q, the scopes a custom role's grants and eligibilities in force are on,
+// sorted.
+func (a *Authorizer) roleScopes(ctx context.Context, q DB, tenant string, id Role) ([]Scope, error) {
 	// The LIKE matches the partial indexes on custom roles' grants and eligibilities. Those ended
 	// give nothing, so changing what they give changes no access.
-	rows, err := a.db.Query(ctx, `
+	rows, err := q.Query(ctx, `
 		SELECT scope_type, scope_id FROM rbac_grants WHERE tenant = $1 AND role = $2 AND role LIKE 'custom.%'
 		  AND (expires_at IS NULL OR expires_at > $3)
 		UNION
@@ -645,23 +697,9 @@ func (a *Authorizer) labelsAllow(ctx context.Context, actor Subject, tenant stri
 		  AND (expires_at IS NULL OR expires_at > $3)
 		ORDER BY 1, 2`, tenant, string(id), a.cfg.Now())
 	if err != nil {
-		return err
+		return nil, err
 	}
-	scopes, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Scope])
-	if err != nil {
-		return err
-	}
-	unsatisfied := a.unsatisfiedBy(ctx, actor)
-	for _, s := range scopes {
-		on, err := a.resourceOf(ctx, tenant, s)
-		if err != nil {
-			return err
-		}
-		if dim, err := unsatisfied(on); err != nil || dim != "" {
-			return cmp.Or(err, error(&DeniedError{Permission: GrantPermission(s.Type), Scope: s, Reason: labelRefusal(dim)}))
-		}
-	}
-	return nil
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[Scope])
 }
 
 // changesStopped returns why a constraint stops changing every grant of a custom role: one that
