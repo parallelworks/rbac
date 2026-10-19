@@ -451,15 +451,22 @@ func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]H
 // labeled keeps of holders those whose holding satisfies r's label whatever the request, and
 // where p is a value of an exclusive dimension, holds it: one that satisfies it only with the
 // values a condition decided, which a read without the request can't settle, is marked
-// MaybeDenied, as the members and the public are, whose people hold apart; and one that doesn't
-// even then, or holds none of p's dimension, is left out. Each identity's holding is read after
-// the list, as its constraints run as for any read.
+// MaybeDenied, as the members and the public are, whose people hold apart, unless their own grants
+// give two of p's exclusive values, which leaves all of them none; and one that doesn't even then,
+// or holds none of p's dimension, is left out. Each identity's holding is read after the list, as
+// its constraints run as for any read.
 func (a *Authorizer) labeled(ctx context.Context, p Permission, r Resource, holders []Holder) ([]Holder, error) {
 	kept := holders[:0]
 	for _, h := range holders {
 		if h.Principal.broad() {
-			h.MaybeDenied = true
-			kept = append(kept, h)
+			out, err := a.broadExcludes(ctx, r.Tenant, h.Principal, p)
+			if err != nil {
+				return nil, err
+			}
+			if !out {
+				h.MaybeDenied = true
+				kept = append(kept, h)
+			}
 			continue
 		}
 		holding, byCondition, err := a.holding(ctx, r.Tenant, Subject{Principal: h.Principal})

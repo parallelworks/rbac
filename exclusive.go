@@ -67,9 +67,10 @@ func (a *Authorizer) exclusiveValues(roles []RoleDefinition) map[Role][]Permissi
 }
 
 // excludedBy returns the exclusive dimensions whose values held grants, as roles defines them,
-// could give two of; a role giving one is for the tenant alone. A value counts whatever its
-// grant's condition, a constraint or a deny, as changes count it, so whether one is held never
-// turns on the request or the subject's attributes, and reading it asks no hook.
+// could give two of; a role giving one is for the tenant alone. Each grant counts as written,
+// whatever its condition, a constraint or a deny, and whether a check would honor it, as changes
+// and Conflicts count it, so whether a value is held never turns on the request or the subject's
+// attributes, and reading it asks no hook.
 func (a *Authorizer) excludedBy(roles book, held []holding) map[string]bool {
 	first, excluded := map[string]Permission{}, map[string]bool{}
 	for _, h := range held {
@@ -79,7 +80,7 @@ func (a *Authorizer) excludedBy(roles book, held []holding) map[string]bool {
 		}
 		for _, p := range def.Permissions {
 			t, ok := a.exclusiveValue(p)
-			if !ok || !h.carries(def, p) {
+			if !ok {
 				continue
 			}
 			if f, seen := first[t]; seen && f != p {
@@ -89,6 +90,38 @@ func (a *Authorizer) excludedBy(roles book, held []holding) map[string]bool {
 		}
 	}
 	return excluded
+}
+
+// broadExcludes reports whether p is a value of an exclusive dimension that the grants on a tenant
+// to a broad principal, with the public's it includes, could give two of, so no one it stands for
+// holds p.
+func (a *Authorizer) broadExcludes(ctx context.Context, tenant string, b Principal, p Permission) (bool, error) {
+	t, ok := a.exclusiveValue(p)
+	if !ok {
+		return false, nil
+	}
+	keys := []string{Principal{Kind: Public}.key()}
+	if b.Kind == Members {
+		keys = append(keys, b.key())
+	}
+	rows, err := a.db.Query(ctx, `SELECT DISTINCT role FROM rbac_grants WHERE tenant = $1 AND scope_type = 'tenant'
+		AND principal = ANY($2::text[]) AND (expires_at IS NULL OR expires_at > $3)`, tenant, keys, a.cfg.Now())
+	if err != nil {
+		return false, err
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[Role])
+	if err != nil {
+		return false, err
+	}
+	roles, err := a.book(ctx, a.db, tenant, ids)
+	if err != nil {
+		return false, err
+	}
+	held := make([]holding, len(ids))
+	for i, id := range ids {
+		held[i].Role = id
+	}
+	return a.excludedBy(roles, held)[t], nil
 }
 
 // Conflict is an identity able to hold two or more values of an exclusive dimension, through any

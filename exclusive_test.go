@@ -326,17 +326,28 @@ func TestConflictsListsThePublic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	public := rbac.Conflict{Principal: rbac.Principal{Kind: rbac.Public}, Dimension: "bank", Values: []rbac.Permission{"bank:b", "bank:c"}}
+	anyone := rbac.Conflict{Principal: rbac.Principal{Kind: rbac.Public}, Dimension: "bank", Values: []rbac.Permission{"bank:b", "bank:c"}}
 	zed := rbac.Conflict{Principal: identity("zed"), Dimension: "bank", Values: []rbac.Permission{"bank:a", "bank:b", "bank:c"}}
-	for _, want := range []rbac.Conflict{public, zed} {
+	for _, want := range []rbac.Conflict{anyone, zed} {
 		if !slices.ContainsFunc(conflicts, func(c rbac.Conflict) bool { return reflect.DeepEqual(c, want) }) {
 			t.Fatalf("Conflicts = %+v, without %+v", conflicts, want)
 		}
 	}
-	// The public holds a value each of its people may hold none of.
+	// The public's own grants give two, so no one holds either through it.
+	public := func(x rbac.Holder) bool { return x.Principal.Kind == rbac.Public }
 	holders, err := authz.Holders(ctx, "bank:b", tenantT1)
-	if err != nil || !slices.ContainsFunc(holders, func(x rbac.Holder) bool { return x.Principal.Kind == rbac.Public && x.MaybeDenied }) {
+	if err != nil || slices.ContainsFunc(holders, public) {
 		t.Fatalf("Holders of bank:b = %+v, %v", holders, err)
+	}
+	// With one, the other ended though DeleteExpired hasn't removed it yet, it holds a value each
+	// of its people may hold none of.
+	if _, err := h.pool.Exec(ctx, `UPDATE rbac_grants SET expires_at = $1 WHERE tenant = 't1' AND principal = 'public:' AND role = 'bank.c'`,
+		h.now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	holders, err = authz.Holders(ctx, "bank:b", tenantT1)
+	if err != nil || !slices.ContainsFunc(holders, func(x rbac.Holder) bool { return public(x) && x.MaybeDenied }) {
+		t.Fatalf("Holders of bank:b with one = %+v, %v", holders, err)
 	}
 	// Suspending a member, which then holds only the public's values, is never refused.
 	if err := authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("ann"), Suspended: true}}); err != nil {
@@ -494,7 +505,7 @@ func TestAnActorHoldingNoneOfTwoExclusiveValuesHandsNeitherOn(t *testing.T) {
 	}
 }
 
-func TestAGrantChecksDontHonorGivesNoExclusiveValue(t *testing.T) {
+func TestEveryGrantCountsTowardTwoExclusiveValues(t *testing.T) {
 	h := labeled(t, func(c *rbac.Config) {
 		banks(c)
 		c.Catalog = append(c.Catalog, rbac.RoleDefinition{ID: "bank.c-staff", Permissions: []rbac.Permission{"bank:c"}, ResourceTypes: []string{rbac.TenantScope}})
@@ -502,13 +513,39 @@ func TestAGrantChecksDontHonorGivesNoExclusiveValue(t *testing.T) {
 	ctx := t.Context()
 	owner := h.as(t, "owner")
 	h.hold(t, "owner", "bank:a")
-	// A grant to the public of a role that isn't public, as a catalog change can leave, gives
-	// nothing, so it is no second value.
+	// A grant to the public of a role that isn't public, as a catalog change can leave, gives no
+	// check anything, but counts as Conflicts counts it, so the owner holds neither.
 	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
 		VALUES ('t1', 'tenant', 't1', 'public', '', 'bank.c-staff')`); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.authz.Authorize(ctx, owner, "bank:a", tenantT1); err != nil {
+	if err := h.authz.Authorize(ctx, owner, "bank:a", tenantT1); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("Authorize bank:a: %v", err)
+	}
+	conflicts, err := h.authz.Conflicts(ctx, "t1")
+	if err != nil || !slices.ContainsFunc(conflicts, func(c rbac.Conflict) bool { return c.Principal == owner.Principal }) {
+		t.Fatalf("Conflicts = %+v, %v", conflicts, err)
+	}
+}
+
+func TestHoldersLeaveOutTheMembersWhoseGrantsGiveTwoExclusiveValues(t *testing.T) {
+	h := labeled(t, func(c *rbac.Config) {
+		banks(c)
+		c.Labels[len(c.Labels)-1].Exclusive = false
+	})
+	ctx := t.Context()
+	root := rbac.TenantRoot("t1")
+	h.as(t, "ann")
+	h.seed(t, grant(root, "bank.a", rbac.Members, "t1"), grant(root, "bank.b", rbac.Members, "t1"))
+	cfg := h.cfg
+	cfg.Labels = slices.Clone(cfg.Labels)
+	cfg.Labels[len(cfg.Labels)-1].Exclusive = true
+	authz, err := rbac.New(h.pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holders, err := authz.Holders(ctx, "bank:a", tenantT1)
+	if err != nil || slices.ContainsFunc(holders, func(x rbac.Holder) bool { return x.Principal.Kind == rbac.Members }) {
+		t.Fatalf("Holders of bank:a = %+v, %v", holders, err)
 	}
 }
