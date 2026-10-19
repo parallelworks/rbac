@@ -75,6 +75,12 @@ type labelDimension struct {
 	exclusive bool
 }
 
+// exclusiveValue reports whether v is one of the dimension's values, held one at a time.
+func (ld labelDimension) exclusiveValue(v string) bool {
+	_, ok := ld.rank[v]
+	return ok && ld.exclusive
+}
+
 // declares reports whether the dimension declares every value of vs.
 func (ld labelDimension) declares(vs []string) bool {
 	return !slices.ContainsFunc(vs, func(v string) bool { _, ok := ld.rank[v]; return !ok })
@@ -313,7 +319,7 @@ func (a *Authorizer) holding(ctx context.Context, tenant string, s Subject) (Hol
 	// request and the subject's attributes, removing it.
 	could := map[string]map[string]bool{}
 	count := func(p Permission) {
-		if t, v := p.parts(); v != releaseVerb && a.labels[t].exclusive {
+		if t, v := p.parts(); a.labels[t].exclusiveValue(v) {
 			if could[t] == nil {
 				could[t] = map[string]bool{}
 			}

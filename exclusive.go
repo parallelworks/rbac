@@ -36,8 +36,7 @@ func twoExclusive(labels map[string]labelDimension, ps []Permission) (p, q Permi
 	first := map[string]Permission{}
 	for _, r := range ps {
 		t, v := r.parts()
-		ld := labels[t]
-		if _, value := ld.rank[v]; !value || !ld.exclusive {
+		if !labels[t].exclusiveValue(v) {
 			continue
 		}
 		if f, seen := first[t]; seen && f != r {
@@ -48,13 +47,23 @@ func twoExclusive(labels map[string]labelDimension, ps []Permission) (p, q Permi
 	return "", "", false
 }
 
+// exclusiveValue returns the dimension p is a value of, and whether that dimension is exclusive.
+func (a *Authorizer) exclusiveValue(p Permission) (string, bool) {
+	t, v := p.parts()
+	return t, a.labels[t].exclusiveValue(v)
+}
+
+// anyExclusive reports whether ps holds a value of an exclusive dimension.
+func (a *Authorizer) anyExclusive(ps []Permission) bool {
+	return slices.ContainsFunc(ps, func(p Permission) bool { _, ok := a.exclusiveValue(p); return ok })
+}
+
 // exclusiveValues returns, by role, the values of exclusive dimensions each of roles gives.
 func (a *Authorizer) exclusiveValues(roles []RoleDefinition) map[Role][]Permission {
 	gives := map[Role][]Permission{}
 	for _, r := range roles {
 		for _, p := range r.Permissions {
-			t, v := p.parts()
-			if _, value := a.labels[t].rank[v]; value && a.labels[t].exclusive {
+			if _, ok := a.exclusiveValue(p); ok {
 				gives[r.ID] = append(gives[r.ID], p)
 			}
 		}
@@ -62,9 +71,23 @@ func (a *Authorizer) exclusiveValues(roles []RoleDefinition) map[Role][]Permissi
 	return gives
 }
 
+// withoutExcluded is perms without the values of the exclusive dimensions s holds none of in a
+// tenant, as its grants could give it two, so a check of one refuses it as its holding does.
+func (a *Authorizer) withoutExcluded(ctx context.Context, s Subject, tenant string, perms []Permission) ([]Permission, error) {
+	if !a.anyExclusive(perms) {
+		return perms, nil
+	}
+	h, _, err := a.holding(ctx, tenant, s)
+	if err != nil {
+		return nil, err
+	}
+	return slices.DeleteFunc(perms, func(p Permission) bool { t, ok := a.exclusiveValue(p); return ok && h.excluded[t] }), nil
+}
+
 // Conflict is an identity able to hold two or more values of an exclusive dimension, through any
-// grant or eligibility on the tenant, whatever its condition: it holds none of them, and a change
-// reaching it is refused until a removal leaves it one. The public, for what it holds, is
+// grant or eligibility on the tenant, whatever its condition, and its own grants while it is no
+// member or guest: a change reaching it is refused until a removal leaves it one, and where its
+// grants could give it two now, it holds none of them. The public, for what it holds, is
 // Principal{Kind: Public}.
 type Conflict struct {
 	Principal Principal
@@ -87,7 +110,12 @@ func (a *Authorizer) Conflicts(ctx context.Context, tenant string) ([]Conflict, 
 			return nil, err
 		}
 		gives := a.exclusiveValues(slices.Concat(a.cfg.Catalog, custom))
-		return a.conflicts(ctx, a.db, tenant, gives, []string{string(Members) + ":" + tenant, string(Public) + ":"}, []string{}, 0)
+		// Only those holding a role that gives a value can hold two, so they alone are read.
+		roles := []string{}
+		for r := range gives {
+			roles = append(roles, string(r))
+		}
+		return a.conflicts(ctx, a.db, tenant, gives, []string{}, roles, 0)
 	})
 }
 
@@ -128,8 +156,12 @@ func (a *Authorizer) excludes(ctx context.Context, tx pgx.Tx, tenant string, e C
 			redefined = append(redefined, string(r.ID))
 		}
 	}
+	// A suspended membership holds only what the public does, so suspending one never widens what
+	// it holds, and isn't refused even where the public's grants could give two values.
 	for _, m := range e.Memberships {
-		seeds = append(seeds, m.Principal.key())
+		if !m.Suspended {
+			seeds = append(seeds, m.Principal.key())
+		}
 	}
 	for _, m := range e.Joined {
 		seeds = append(seeds, m.Principal.key())
@@ -149,10 +181,11 @@ func (a *Authorizer) excludes(ctx context.Context, tx pgx.Tx, tenant string, e C
 }
 
 // conflicts returns up to limit, or with 0 every, conflict of the identities the seeds reach, as
-// principal keys, and the holders of the roles redefined, by gives, the exclusive values each role
-// gives. Each is read up to its keys as checks read them; the anonymous, which holds what the
-// public does, is read where the public is reached.
-func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives map[Role][]Permission, seeds, redefined []string, limit int) ([]Conflict, error) {
+// principal keys, and the holders of the roles in holdersOf, by gives, the exclusive values each
+// role gives. Each is read up to its keys as checks read them, and its own grants even while it is
+// no member or guest, which it holds once it is one; the anonymous, which holds what the public
+// does, is read where the public is reached.
+func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives map[Role][]Permission, seeds, holdersOf []string, limit int) ([]Conflict, error) {
 	roles, values := []string{}, []string{}
 	for r, ps := range gives {
 		for _, p := range ps {
@@ -172,8 +205,8 @@ func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives m
 		    AND EXISTS (SELECT FROM seeds WHERE k IN ('members:' || $1, 'public:'))
 		  UNION SELECT '' WHERE EXISTS (SELECT FROM seeds WHERE k = 'public:')
 		), held(identity, value) AS (
-		  SELECT t.identity, v.value FROM targets t
-		  CROSS JOIN LATERAL (WITH RECURSIVE `+keysSQL("$1::text", "t.identity", "$4")+` SELECT k FROM keys) ks
+		  SELECT t.identity, v.value COLLATE "C" FROM targets t
+		  CROSS JOIN LATERAL (WITH RECURSIVE `+keysSQL("$1::text", "t.identity", "$4")+` SELECT k FROM bound) ks
 		  JOIN (
 		    SELECT principal, role FROM rbac_grants WHERE tenant = $1 AND scope_type = 'tenant' AND role = ANY($5::text[])
 		      AND (expires_at IS NULL OR expires_at > $4)
@@ -185,7 +218,7 @@ func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives m
 		)
 		SELECT identity, split_part(value, ':', 1), array_agg(DISTINCT value ORDER BY value) FROM held
 		GROUP BY 1, 2 HAVING count(DISTINCT value) > 1 ORDER BY 1, 2 LIMIT nullif($7, 0)`,
-		tenant, seeds, redefined, a.cfg.Now(), roles, values, limit)
+		tenant, seeds, holdersOf, a.cfg.Now(), roles, values, limit)
 	if err != nil {
 		return nil, err
 	}

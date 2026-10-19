@@ -702,6 +702,11 @@ func (a *Authorizer) authorityOn(ctx context.Context, q DB, actor Subject, on Re
 	return a.authorityOf(ctx, q, actor, on, held, ds, b)
 }
 
+// orDenied is a deny check that also denies what more does.
+func orDenied(denied, more func(Permission) bool) func(Permission) bool {
+	return func(p Permission) bool { return more(p) || denied(p) }
+}
+
 // authorityOf is the authority of held grants under the denies on the path, reading the
 // grants' conditions.
 func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Resource, held []holding, ds []denial, b book) (authority, error) {
@@ -737,6 +742,21 @@ func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Re
 		reached := maps.Clone(vars)
 		delete(reached, "resource")
 		handsOn = deny(reached)
+	}
+	// The values of an exclusive dimension it holds none of, as its grants could give it two, it
+	// can't use or hand on either, as checks refuse it them.
+	if slices.ContainsFunc(held, func(h holding) bool { def, ok := b.role(h.Role); return ok && a.anyExclusive(def.Permissions) }) {
+		// On q, as a change rechecks in its transaction, not on a second connection.
+		reader := a
+		if tx, ok := q.(pgx.Tx); ok {
+			reader = a.WithTx(tx)
+		}
+		kept, _, err := reader.holding(ctx, on.Tenant, actor)
+		if err != nil {
+			return authority{}, err
+		}
+		excluded := func(p Permission) bool { t, ok := a.exclusiveValue(p); return ok && kept.excluded[t] }
+		denied, handsOn = orDenied(denied, excluded), orDenied(handsOn, excluded)
 	}
 	return authority{
 		held: held, roles: b,

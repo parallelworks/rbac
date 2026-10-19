@@ -53,6 +53,15 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 	if err != nil || !d.Allowed {
 		return d, err
 	}
+	if dim, ok := a.exclusiveValue(p); ok {
+		kept, err := a.withoutExcluded(ctx, s, r.Tenant, []Permission{p})
+		if err != nil {
+			return Decision{}, err
+		}
+		if len(kept) == 0 {
+			return Decision{Reason: "its grants could give it two values of " + dim + ", whose values are exclusive, so it holds none"}, nil
+		}
+	}
 	dim, err := a.unsatisfied(ctx, s, r)
 	if err != nil {
 		return Decision{}, err
@@ -257,7 +266,10 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 		return nil, err
 	}
 	perms, _, _, err := a.permissionsOf(ctx, s, r, nil)
-	return perms, err
+	if err != nil {
+		return nil, err
+	}
+	return a.withoutExcluded(ctx, s, r.Tenant, perms)
 }
 
 // permissionsOf is what Permissions lists, once its input is checked, of the permissions only
@@ -399,7 +411,8 @@ type Holder struct {
 	// MaybeDenied is set when a deny on the path may bind it: one whose condition depends on the
 	// request, or for the members or the public one that may bind some of them. It is set too
 	// when the resource's label may refuse it: where a condition decides its label values, and
-	// for the members or the public, who hold values each their own.
+	// for the members or the public, who hold values each their own; as it is for them where p is
+	// a value of an exclusive dimension, which some of them may hold none of.
 	MaybeDenied bool
 }
 
@@ -426,18 +439,20 @@ func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]H
 		return nil, nil
 	}
 	holders, err := snapshot(ctx, a, func(a *Authorizer) ([]Holder, error) { return a.holders(ctx, p, r, roles, custom) })
-	if err != nil || !r.Labels.asks() {
+	if _, exclusive := a.exclusiveValue(p); err != nil || !r.Labels.asks() && !exclusive {
 		return holders, err
 	}
-	return a.labeled(ctx, r, holders)
+	return a.labeled(ctx, p, r, holders)
 }
 
-// labeled keeps of holders those whose holding satisfies r's label whatever the request: one
-// that satisfies it only with the values a condition decided, which a read without the request
-// can't settle, is marked MaybeDenied, as the members and the public are, whose people hold
-// apart; and one that doesn't even then is left out. Each identity's holding is read after the
-// list, as its constraints run as for any read.
-func (a *Authorizer) labeled(ctx context.Context, r Resource, holders []Holder) ([]Holder, error) {
+// labeled keeps of holders those whose holding satisfies r's label whatever the request, and
+// where p is a value of an exclusive dimension, holds it: one that satisfies it only with the
+// values a condition decided, which a read without the request can't settle, is marked
+// MaybeDenied, as the members and the public are, whose people hold apart; and one that doesn't
+// even then, or holds none of p's dimension, is left out. Each identity's holding is read after
+// the list, as its constraints run as for any read.
+func (a *Authorizer) labeled(ctx context.Context, p Permission, r Resource, holders []Holder) ([]Holder, error) {
+	dim, exclusive := a.exclusiveValue(p)
 	kept := holders[:0]
 	for _, h := range holders {
 		if h.Principal.broad() {
@@ -450,6 +465,7 @@ func (a *Authorizer) labeled(ctx context.Context, r Resource, holders []Holder) 
 			return nil, err
 		}
 		switch {
+		case exclusive && holding.excluded[dim]:
 		case holding.changed(byCondition, false).Satisfies(r.Labels):
 			kept = append(kept, h)
 		case holding.changed(byCondition, true).Satisfies(r.Labels):
