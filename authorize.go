@@ -103,7 +103,7 @@ func (a *Authorizer) decideGrants(ctx context.Context, s Subject, p Permission, 
 	return snapshot(ctx, a, func(a *Authorizer) (Decision, error) { return a.explain(ctx, s, p, r, counts) })
 }
 
-// readingRoles runs once a read has read a subject's grants and the custom roles with them, as a
+// readingRoles runs once a read has read grants and the custom roles with them, as a
 // test's change that commits there.
 var readingRoles = func() {}
 
@@ -1058,11 +1058,12 @@ type holding struct {
 type rolesRead int
 
 const (
-	noRoles rolesRead = iota
 	// namedRoles are those the grants name.
-	namedRoles
+	namedRoles rolesRead = iota
 	// tenantRoles are all of them, as a role's GrantableRoles can name any.
 	tenantRoles
+	// heldTenantRoles are all of them where a grant names one.
+	heldTenantRoles
 )
 
 // heldOrDenied returns the grants on any of scopes, not expired, held by s's principals in a
@@ -1089,12 +1090,12 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Su
 	// to read every role of the tenant or look up those the grants name.
 	var which string
 	switch roles {
-	case noRoles:
-		which = "FALSE"
 	case namedRoles:
 		which = "id IN (SELECT role FROM held WHERE role LIKE '" + CustomPrefix + "%')"
 	case tenantRoles:
 		which = "TRUE"
+	case heldTenantRoles:
+		which = "EXISTS (SELECT FROM held WHERE role LIKE '" + CustomPrefix + "%')"
 	}
 	// Grants, denies and roles in that order; grants by principal, scope, role and id, denies by id
 	// and scope, as deniesOn.
@@ -1138,14 +1139,7 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Su
 			}
 			ds = append(ds, d)
 		case role:
-			r := RoleDefinition{ID: Role(id), Name: name, Description: description, ResourceTypes: types, Privileged: privileged, Public: public}
-			for _, x := range perms {
-				r.Permissions = append(r.Permissions, Permission(x))
-			}
-			for _, g := range grantable {
-				r.GrantableRoles = append(r.GrantableRoles, Role(g))
-			}
-			custom = append(custom, r)
+			custom = append(custom, roleFrom(id, name, description, perms, types, privileged, public, grantable))
 		default:
 			h := holding{Binding: Binding{ID: id, Principal: parsePrincipal(principal), Role: Role(roleID)}, scope: scope, conditional: conditional}
 			if expires != nil {

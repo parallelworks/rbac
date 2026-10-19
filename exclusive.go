@@ -104,24 +104,35 @@ func (a *Authorizer) broadExcludes(ctx context.Context, tenant string, b Princip
 	if b.Kind == Members {
 		keys = append(keys, b.key())
 	}
-	rows, err := a.db.Query(ctx, `SELECT DISTINCT role FROM rbac_grants WHERE tenant = $1 AND scope_type = 'tenant'
-		AND principal = ANY($2::text[]) AND (expires_at IS NULL OR expires_at > $3)`, tenant, keys, a.cfg.Now())
+	// With the custom roles they name, in one statement, as a check reads them: read apart, a grant
+	// revoked and its role widened meanwhile could give two values no moment did. Only their
+	// permissions, which alone excludedBy reads.
+	rows, err := a.db.Query(ctx, `
+		WITH held AS (
+		  SELECT DISTINCT role FROM rbac_grants WHERE tenant = $1 AND scope_type = 'tenant'
+		    AND principal = ANY($2::text[]) AND (expires_at IS NULL OR expires_at > $3)
+		)
+		SELECT h.role, r.id IS NOT NULL, coalesce(r.permissions, '{}')
+		FROM held h LEFT JOIN rbac_roles r ON r.tenant = $1 AND r.id = h.role`, tenant, keys, a.cfg.Now())
 	if err != nil {
 		return false, err
 	}
-	ids, err := pgx.CollectRows(rows, pgx.RowTo[Role])
-	if err != nil {
+	var held []holding
+	var custom []RoleDefinition
+	var id string
+	var found bool
+	var perms []string
+	if _, err := pgx.ForEachRow(rows, []any{&id, &found, &perms}, func() error {
+		held = append(held, holding{Binding: Binding{Role: Role(id)}})
+		if found {
+			custom = append(custom, roleFrom(id, "", "", perms, nil, false, false, nil))
+		}
+		return nil
+	}); err != nil {
 		return false, err
 	}
-	roles, err := a.book(ctx, a.db, tenant, ids)
-	if err != nil {
-		return false, err
-	}
-	held := make([]holding, len(ids))
-	for i, id := range ids {
-		held[i].Role = id
-	}
-	return a.excludedBy(roles, held)[t], nil
+	readingRoles()
+	return a.excludedBy(a.bookOf(a.current(custom)), held)[t], nil
 }
 
 // Conflict is an identity able to hold two or more values of an exclusive dimension, through any
