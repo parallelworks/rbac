@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/parallelworks/rbac"
 )
 
@@ -64,6 +66,11 @@ func TestAChangeLettingAnIdentityHoldTwoExclusiveValuesIsRefused(t *testing.T) {
 		"a grant to the public": func(t *testing.T, h *harness) error {
 			t.Helper()
 			return h.authz.Import(t.Context(), host, "t1", []rbac.Grant{grant(root, "bank.b", rbac.Public, "")})
+		},
+		"a grant to the public beside the own grants of an identity yet to join": func(t *testing.T, h *harness) error {
+			t.Helper()
+			h.hold(t, "zed", "bank:b")
+			return h.authz.Import(t.Context(), host, "t1", []rbac.Grant{grant(root, "bank.a", rbac.Public, "")})
 		},
 		"a grant to a group it is in": func(t *testing.T, h *harness) error {
 			t.Helper()
@@ -150,6 +157,9 @@ func TestExclusiveValuesAreHeldOneAtATime(t *testing.T) {
 	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "a-team", Principal: identity("ann")}}); err != nil {
 		t.Fatal(err)
 	}
+	if err := h.authz.Authorize(ctx, ann, "bank:a", tenantT1); err != nil {
+		t.Fatalf("bank:a through two grants: %v", err)
+	}
 	// Another value to every member.
 	excluded(t, h.authz.Import(ctx, host, "t1", []rbac.Grant{grant(root, "bank.c", rbac.Members, "t1")}))
 	// Two to the public, which the anonymous hold.
@@ -200,7 +210,7 @@ func TestASubjectWhoseGrantsCouldGiveTwoExclusiveValuesHoldsNone(t *testing.T) {
 	ctx := t.Context()
 	// The owner may view the cluster, but for its label.
 	owner := h.as(t, "owner")
-	h.hold(t, "owner", "bank:a", "rel:gbr")
+	h.hold(t, "owner", "bank:a", "rel:gbr", "bank:release")
 	g := grant(rbac.TenantRoot("t1"), "bank.b", rbac.User, "owner")
 	g.Condition = rbac.Condition{Expression: `request.attributes.mission == true`}
 	h.seed(t, g)
@@ -232,6 +242,19 @@ func TestASubjectWhoseGrantsCouldGiveTwoExclusiveValuesHoldsNone(t *testing.T) {
 		if err != nil || slices.ContainsFunc(holders, func(x rbac.Holder) bool { return x.Principal == owner.Principal }) {
 			t.Fatalf("Holders of bank:a = %+v, %v", holders, err)
 		}
+		// Nor does a search of one.
+		if reach, err := authz.Reachable(ctx, owner, "bank:a", "t1", rbac.TenantScope); err != nil || reach.All {
+			t.Fatalf("Reachable bank:a = %+v, %v", reach, err)
+		}
+		pred, err := authz.Filter(ctx, owner, "bank:a", "t1", rbac.TenantScope, rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var kept bool
+		if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM (SELECT 't1'::text AS tenant, '{tenant:t1}'::text[] AS path, '{}'::text[] AS labels) r
+			WHERE `+pred.SQL+`)`, pred.Args...).Scan(&kept); err != nil || kept {
+			t.Fatalf("Filter of bank:a kept the tenant: %v", err)
+		}
 		for _, r := range []rbac.Resource{a, b} {
 			if err := authz.Authorize(ctx, owner, view, r); !errors.Is(err, rbac.ErrDenied) {
 				t.Fatalf("Authorize %v: %v", r.Labels, err)
@@ -249,6 +272,10 @@ func TestASubjectWhoseGrantsCouldGiveTwoExclusiveValuesHoldsNone(t *testing.T) {
 	if want := []rbac.Conflict{{Principal: owner.Principal, Dimension: "bank", Values: []rbac.Permission{"bank:a", "bank:b"}}}; err != nil || !reflect.DeepEqual(conflicts, want) {
 		t.Fatalf("Conflicts = %+v, %v", conflicts, err)
 	}
+	// Its power to release is no value, which it keeps.
+	if reach, err := authz.Reachable(ctx, owner, rbac.ReleasePermission("bank"), "t1", rbac.TenantScope); err != nil || !reach.All {
+		t.Fatalf("Reachable bank:release = %+v, %v", reach, err)
+	}
 	// A change reaching it is refused until a removal leaves it one value.
 	h.groups(t, "staff")
 	err = authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "staff", Principal: owner.Principal}})
@@ -264,6 +291,9 @@ func TestASubjectWhoseGrantsCouldGiveTwoExclusiveValuesHoldsNone(t *testing.T) {
 	}
 	if err := authz.Authorize(ctx, owner, "bank:a", tenantT1); err != nil {
 		t.Fatalf("bank:a once it could hold one: %v", err)
+	}
+	if reach, err := authz.Reachable(ctx, owner, "bank:a", "t1", rbac.TenantScope); err != nil || !reach.All {
+		t.Fatalf("Reachable bank:a once it could hold one = %+v, %v", reach, err)
 	}
 	if conflicts, err := authz.Conflicts(ctx, "t1"); err != nil || len(conflicts) != 0 {
 		t.Fatalf("Conflicts once resolved = %+v, %v", conflicts, err)
@@ -363,6 +393,7 @@ func TestAValueAConstraintRemovesStillCountsAgainstAnother(t *testing.T) {
 	h := labeled(t, func(c *rbac.Config) {
 		banks(c)
 		c.Labels[len(c.Labels)-1].Exclusive = false
+		c.Catalog = append(c.Catalog, tenantGuard)
 		c.Constraints = []rbac.Constraint{{Name: "cleared", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
 			return in.Permission == "bank:a" && (in.Subject == nil || in.Subject.Attributes["cleared"] != true), nil
 		}}}
@@ -397,6 +428,15 @@ func TestAValueAConstraintRemovesStillCountsAgainstAnother(t *testing.T) {
 	if slices.ContainsFunc(holders, func(x rbac.Holder) bool { return x.Principal == owner.Principal }) {
 		t.Fatalf("Holders = %+v", holders)
 	}
+	// A deny taking the value too leaves it counted, so it still holds none, cleared or not.
+	guardian := h.as(t, "guardian")
+	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.guard", rbac.User, "guardian"))
+	if err := authz.SetDeny(ctx, guardian, tenantT1, rbac.Deny{ID: "no-a", Principals: []rbac.Principal{owner.Principal}, Permissions: []rbac.Permission{"bank:a"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := authz.Authorize(ctx, cleared, view, b); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("Authorize cleared under a deny: %v", err)
+	}
 }
 
 func TestARoleGivingTwoExclusiveValuesIsRefused(t *testing.T) {
@@ -415,9 +455,16 @@ func TestARoleGivingTwoExclusiveValuesIsRefused(t *testing.T) {
 }
 
 func TestAnActorHoldingNoneOfTwoExclusiveValuesHandsNeitherOn(t *testing.T) {
+	// Constraints run before a change's transaction, so one that queries the pool can't wait on it.
+	inTx := false
 	h := labeled(t, func(c *rbac.Config) {
 		banks(c)
 		c.Labels[len(c.Labels)-1].Exclusive = false
+		c.Constraints = []rbac.Constraint{{Name: "watch", Deny: func(_ context.Context, q rbac.DB, _ rbac.ConstraintInput) (bool, error) {
+			_, tx := q.(pgx.Tx)
+			inTx = inTx || tx
+			return false, nil
+		}}}
 	})
 	ctx := t.Context()
 	root := rbac.TenantRoot("t1")
@@ -441,5 +488,27 @@ func TestAnActorHoldingNoneOfTwoExclusiveValuesHandsNeitherOn(t *testing.T) {
 	}
 	if err := authz.Apply(ctx, admin, tenantT1, toBob); err != nil {
 		t.Fatalf("once it holds one: %v", err)
+	}
+	if inTx {
+		t.Fatal("a constraint was asked in the change's transaction")
+	}
+}
+
+func TestAGrantChecksDontHonorGivesNoExclusiveValue(t *testing.T) {
+	h := labeled(t, func(c *rbac.Config) {
+		banks(c)
+		c.Catalog = append(c.Catalog, rbac.RoleDefinition{ID: "bank.c-staff", Permissions: []rbac.Permission{"bank:c"}, ResourceTypes: []string{rbac.TenantScope}})
+	})
+	ctx := t.Context()
+	owner := h.as(t, "owner")
+	h.hold(t, "owner", "bank:a")
+	// A grant to the public of a role that isn't public, as a catalog change can leave, gives
+	// nothing, so it is no second value.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'tenant', 't1', 'public', '', 'bank.c-staff')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.Authorize(ctx, owner, "bank:a", tenantT1); err != nil {
+		t.Fatalf("Authorize bank:a: %v", err)
 	}
 }

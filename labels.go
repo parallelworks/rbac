@@ -31,7 +31,7 @@ type LabelDimension struct {
 	Values []string
 	// Exclusive values are held one at a time, as parties with a conflict of interest are: a
 	// change that leaves an identity able to hold two is refused, as is a role giving two, and a
-	// subject whose grants could give it two, under any condition or constraint, holds none
+	// subject whose grants could give it two, under any condition, constraint or deny, holds none
 	// (Authorizer.Conflicts). An Ordered dimension's higher values include the lower, so it isn't
 	// exclusive.
 	Exclusive bool
@@ -263,6 +263,13 @@ func (h Holding) satisfies(dim string, want []string) bool {
 	return false
 }
 
+// excludes reports whether p is a value of an exclusive dimension the holding holds none of, as
+// its grants could give it two, so a check or a search of p refuses it.
+func (h Holding) excludes(p Permission) bool {
+	t, v := p.parts()
+	return h.excluded[t] && h.dims[t].exclusiveValue(v)
+}
+
 // changed is a copy of the holding with ps held too, or with held false, without them.
 func (h Holding) changed(ps map[Permission]bool, held bool) Holding {
 	c := Holding{tenant: h.tenant, dims: h.dims, values: map[string]map[string]bool{}, releases: map[string]bool{}, excluded: h.excluded}
@@ -310,36 +317,11 @@ func (a *Authorizer) holding(ctx context.Context, tenant string, s Subject) (Hol
 	// Only the values and the powers to release, so neither the constraints nor the conditions of
 	// the tenant's other permissions are asked about.
 	value := func(p Permission) bool { t, _ := p.parts(); _, ok := a.labels[t]; return ok }
-	perms, byCondition, removed, err := a.permissionsOf(ctx, s, Resource{Tenant: tenant, Type: TenantScope, ID: tenant}, value)
+	perms, byCondition, excluded, err := a.permissionsOf(ctx, s, Resource{Tenant: tenant, Type: TenantScope, ID: tenant}, value)
 	if err != nil {
 		return Holding{}, nil, err
 	}
-	// An exclusive dimension's values are counted as any request could give them, so whether one
-	// is held never turns on a condition giving another, or on a constraint, which reads the
-	// request and the subject's attributes, removing it.
-	could := map[string]map[string]bool{}
-	count := func(p Permission) {
-		if t, v := p.parts(); a.labels[t].exclusiveValue(v) {
-			if could[t] == nil {
-				could[t] = map[string]bool{}
-			}
-			could[t][v] = true
-		}
-	}
-	for _, p := range perms {
-		count(p)
-	}
-	for p := range byCondition {
-		count(p)
-	}
-	for p, gone := range removed {
-		if gone {
-			count(p)
-		}
-	}
-	for t, vs := range could {
-		h.excluded[t] = len(vs) > 1
-	}
+	h.excluded = excluded
 	for _, p := range perms {
 		t, v := p.parts()
 		switch {

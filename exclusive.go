@@ -53,11 +53,6 @@ func (a *Authorizer) exclusiveValue(p Permission) (string, bool) {
 	return t, a.labels[t].exclusiveValue(v)
 }
 
-// anyExclusive reports whether ps holds a value of an exclusive dimension.
-func (a *Authorizer) anyExclusive(ps []Permission) bool {
-	return slices.ContainsFunc(ps, func(p Permission) bool { _, ok := a.exclusiveValue(p); return ok })
-}
-
 // exclusiveValues returns, by role, the values of exclusive dimensions each of roles gives.
 func (a *Authorizer) exclusiveValues(roles []RoleDefinition) map[Role][]Permission {
 	gives := map[Role][]Permission{}
@@ -71,17 +66,29 @@ func (a *Authorizer) exclusiveValues(roles []RoleDefinition) map[Role][]Permissi
 	return gives
 }
 
-// withoutExcluded is perms without the values of the exclusive dimensions s holds none of in a
-// tenant, as its grants could give it two, so a check of one refuses it as its holding does.
-func (a *Authorizer) withoutExcluded(ctx context.Context, s Subject, tenant string, perms []Permission) ([]Permission, error) {
-	if !a.anyExclusive(perms) {
-		return perms, nil
+// excludedBy returns the exclusive dimensions whose values held grants, as roles defines them,
+// could give two of; a role giving one is for the tenant alone. A value counts whatever its
+// grant's condition, a constraint or a deny, as changes count it, so whether one is held never
+// turns on the request or the subject's attributes, and reading it asks no hook.
+func (a *Authorizer) excludedBy(roles book, held []holding) map[string]bool {
+	first, excluded := map[string]Permission{}, map[string]bool{}
+	for _, h := range held {
+		def, ok := roles.role(h.Role)
+		if !ok {
+			continue
+		}
+		for _, p := range def.Permissions {
+			t, ok := a.exclusiveValue(p)
+			if !ok || !h.carries(def, p) {
+				continue
+			}
+			if f, seen := first[t]; seen && f != p {
+				excluded[t] = true
+			}
+			first[t] = p
+		}
 	}
-	h, _, err := a.holding(ctx, tenant, s)
-	if err != nil {
-		return nil, err
-	}
-	return slices.DeleteFunc(perms, func(p Permission) bool { t, ok := a.exclusiveValue(p); return ok && h.excluded[t] }), nil
+	return excluded
 }
 
 // Conflict is an identity able to hold two or more values of an exclusive dimension, through any
@@ -184,7 +191,8 @@ func (a *Authorizer) excludes(ctx context.Context, tx pgx.Tx, tenant string, e C
 // principal keys, and the holders of the roles in holdersOf, by gives, the exclusive values each
 // role gives. Each is read up to its keys as checks read them, and its own grants even while it is
 // no member or guest, which it holds once it is one; the anonymous, which holds what the public
-// does, is read where the public is reached.
+// does, is read where the public is reached, as are those no member whose own grants or
+// eligibilities give a value, which they hold beside the public's.
 func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives map[Role][]Permission, seeds, holdersOf []string, limit int) ([]Conflict, error) {
 	roles, values := []string{}, []string{}
 	for r, ps := range gives {
@@ -203,6 +211,12 @@ func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives m
 		  UNION SELECT principal FROM inside
 		  UNION SELECT principal FROM rbac_memberships WHERE tenant = $1
 		    AND EXISTS (SELECT FROM seeds WHERE k IN ('members:' || $1, 'public:'))
+		  UNION SELECT o.principal FROM (
+		    SELECT principal FROM rbac_grants WHERE tenant = $1 AND role = ANY($5::text[])
+		    UNION ALL
+		    SELECT principal FROM rbac_eligibilities WHERE tenant = $1 AND role = ANY($5::text[])
+		  ) o WHERE o.principal NOT LIKE 'group:%' AND o.principal NOT LIKE 'members:%' AND o.principal <> 'public:'
+		    AND EXISTS (SELECT FROM seeds WHERE k = 'public:')
 		  UNION SELECT '' WHERE EXISTS (SELECT FROM seeds WHERE k = 'public:')
 		), held(identity, value) AS (
 		  SELECT t.identity, v.value COLLATE "C" FROM targets t

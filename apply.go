@@ -744,19 +744,11 @@ func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Re
 		handsOn = deny(reached)
 	}
 	// The values of an exclusive dimension it holds none of, as its grants could give it two, it
-	// can't use or hand on either, as checks refuse it them.
-	if slices.ContainsFunc(held, func(h holding) bool { def, ok := b.role(h.Role); return ok && a.anyExclusive(def.Permissions) }) {
-		// On q, as a change rechecks in its transaction, not on a second connection.
-		reader := a
-		if tx, ok := q.(pgx.Tx); ok {
-			reader = a.WithTx(tx)
-		}
-		kept, _, err := reader.holding(ctx, on.Tenant, actor)
-		if err != nil {
-			return authority{}, err
-		}
-		excluded := func(p Permission) bool { t, ok := a.exclusiveValue(p); return ok && kept.excluded[t] }
-		denied, handsOn = orDenied(denied, excluded), orDenied(handsOn, excluded)
+	// can't use or hand on either, as checks refuse it them. Read from its grants on the path, which
+	// hold its tenant's, so a change's recheck in its transaction asks no constraint.
+	if excluded := a.excludedBy(b, held); len(excluded) > 0 {
+		out := func(p Permission) bool { t, ok := a.exclusiveValue(p); return ok && excluded[t] }
+		denied, handsOn = orDenied(denied, out), orDenied(handsOn, out)
 	}
 	return authority{
 		held: held, roles: b,
