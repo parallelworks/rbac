@@ -591,14 +591,12 @@ func (a *Authorizer) holders(ctx context.Context, p Permission, r Resource, role
 	// The identities in the groups granted, through those nested in them, and those granted
 	// directly, that are members or guests of the tenant now.
 	rows, err = a.db.Query(ctx, `
-		WITH RECURSIVE `+insideSQL("$2", "$3")+`, reached(root, principal) AS (
-		  SELECT root, principal FROM inside
-		  UNION
-		  SELECT '', p FROM unnest($4::text[]) AS p
-		)
-		SELECT r.root, r.principal, s.guest FROM reached r JOIN rbac_memberships s ON s.tenant = $1 AND s.principal = r.principal
-		WHERE NOT s.suspended AND (s.expires_at IS NULL OR s.expires_at > $3)
-		ORDER BY r.principal, r.root`, r.Tenant, groups, now, identities)
+		WITH RECURSIVE `+insideSQL("$2", "$3", "NULL", true)+`
+		SELECT root, principal, guest FROM inside
+		UNION
+		SELECT '', principal, guest FROM rbac_memberships WHERE tenant = $1 AND principal = ANY($4::text[])
+		  AND NOT suspended AND (expires_at IS NULL OR expires_at > $3)
+		ORDER BY principal, root`, r.Tenant, groups, now, identities)
 	if err != nil {
 		return nil, err
 	}
@@ -668,7 +666,8 @@ func (a *Authorizer) boundByDenies(ctx context.Context, p Permission, r Resource
 	}
 	// Of an identity's groups only those a deny names or exempts matter, so they are read from
 	// those groups down: walking up from every holder reads each one's every group, which on a
-	// large tenant costs far more than the list.
+	// large tenant costs far more than the list. Of their members only the holders are read, as a
+	// deny can name a group far larger than the list.
 	seen := map[string]bool{}
 	var groups []string
 	for _, d := range ds {
@@ -681,8 +680,8 @@ func (a *Authorizer) boundByDenies(ctx context.Context, p Permission, r Resource
 	}
 	if len(identities) > 0 && len(groups) > 0 {
 		rows, err := a.db.Query(ctx, `
-			WITH RECURSIVE `+insideSQL("$2", "$3")+`
-			SELECT DISTINCT principal, 'group:' || root FROM inside WHERE principal = ANY($4::text[])`,
+			WITH RECURSIVE `+insideSQL("$2", "$3", "$4", false)+`
+			SELECT DISTINCT principal, 'group:' || root FROM inside`,
 			r.Tenant, groups, now, identities)
 		if err != nil {
 			return err
@@ -729,21 +728,24 @@ func (a *Authorizer) boundByDenies(ctx context.Context, p Permission, r Resource
 	return nil
 }
 
-// insideSQL is SQL defining, in a WITH RECURSIVE, inside(root, principal): the identities in each
-// of the groups, given as SQL for an array of their ids, directly or through groups in it, at now,
-// by the same memberships keysSQL reads up from an identity, in the tenant $1. The groups in groups
-// are few, but their identities can be many, so they are read by rbac_group_members, which plans
-// for the groups reached.
-func insideSQL(groups, now string) string {
+// insideSQL is SQL defining, in a WITH RECURSIVE, inside(root, principal, guest): the identities in
+// each of the groups, given as SQL for an array of their ids, directly or through groups in it, at
+// now, by the same memberships keysSQL reads up from an identity, in the tenant $1; of principals
+// alone, SQL for an array of keys or NULL for every one, and with standing, only those that are
+// members or guests of the tenant at now, not suspended, with whether each is a guest. The groups
+// in groups are few, but their identities can be many, so they are read by rbac_group_members,
+// which plans for the groups reached, as it does what is read with them: planned here, it would be
+// for the thousand rows the planner counts a function as.
+func insideSQL(groups, now, principals string, standing bool) string {
 	return fmt.Sprintf(`down(root, id) AS (
 		  SELECT g, g COLLATE "C" FROM unnest(%[1]s::text[]) AS g
 		  UNION
 		  SELECT d.root, m.principal_id FROM rbac_members m JOIN down d ON m.group_id = d.id
 		  WHERE m.tenant = $1 AND m.principal LIKE 'group:%%' AND (m.expires_at IS NULL OR m.expires_at > %[2]s)
-		), inside(root, principal) AS (
-		  SELECT d.root, m.principal COLLATE "C" FROM down d
-		  JOIN rbac_group_members($1, ARRAY(SELECT DISTINCT id FROM down), %[2]s) m ON m.group_id COLLATE "C" = d.id
-		)`, groups, now)
+		), inside(root, principal, guest) AS (
+		  SELECT d.root, m.principal COLLATE "C", m.guest FROM down d
+		  JOIN rbac_group_members($1, ARRAY(SELECT DISTINCT id FROM down), %[2]s, %[3]s::text[], %[4]t) m ON m.group_id COLLATE "C" = d.id
+		)`, groups, now, principals, standing)
 }
 
 // Reach is where a subject may do something. A resource, by its path (Authorizer.Path), is

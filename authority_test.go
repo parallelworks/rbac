@@ -790,3 +790,121 @@ func TestASmallGroupsMembersAreReadAlone(t *testing.T) {
 		}
 	}
 }
+
+// Holders reads, of the members of a large group a deny on the resource names, only the holders,
+// now and as of a time: what reads them counts a function's rows as a thousand, and finding the
+// holders among every member reads each one.
+func TestHoldersReadsOnlyTheHoldersInTheGroupsADenyNames(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.groups(t, "everyone", "admins")
+	h.as(t, "a1", "admins", "everyone")
+	h.as(t, "a2", "admins")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "admins"))
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+		VALUES ('t1', 'cluster', 'c1', 'd', '{group:everyone}', '{cluster:login}')`); err != nil {
+		t.Fatal(err)
+	}
+	// The pages of the members, and of history, that Holders reads, in a transaction it rolls back.
+	read := func(at time.Time) (now, asOf int64) {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		held := func(a *rbac.Authorizer) error {
+			hs, err := a.Holders(ctx, login, cluster)
+			if ps := holderPrincipals(hs); err == nil && (slices.Contains(ps, rbac.Principal{Kind: rbac.User, ID: "a1"}) ||
+				!slices.Contains(ps, rbac.Principal{Kind: rbac.User, ID: "a2"})) {
+				err = fmt.Errorf("Holders = %+v", hs)
+			}
+			return err
+		}
+		start := pagesRead(ctx, t, tx, "rbac_members")
+		if err := held(h.authz.WithTx(tx)); err != nil {
+			t.Fatal(err)
+		}
+		now = pagesRead(ctx, t, tx, "rbac_members") - start
+		if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+			start := pagesRead(ctx, t, tx, "rbac_history")
+			err := held(a)
+			asOf = pagesRead(ctx, t, tx, "rbac_history") - start
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return now, asOf
+	}
+	others := func(n int) {
+		t.Helper()
+		manyMembers(t, h, n, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+			SELECT 't1', 'everyone', 'user', id FROM others`, "rbac_members", "rbac_history")
+	}
+	others(500)
+	now, asOf := read(dbNow(t, h))
+	others(4500)
+	moreNow, moreAsOf := read(dbNow(t, h))
+	for _, c := range []struct {
+		what      string
+		few, many int64
+	}{{"Holders", now, moreNow}, {"Holders as of a time", asOf, moreAsOf}} {
+		if c.many > c.few*3/2 {
+			t.Errorf("%s read %d pages, and %d once 4500 more were in the group a deny names", c.what, c.few, c.many)
+		}
+	}
+}
+
+// Holders reads the memberships of a large group it lists in no more pages than they fill, now
+// and as of a time: what reads them counts a function's rows as a thousand, and would look each
+// member's up on its own, which as of a time reads its every version.
+func TestHoldersReadsTheMembershipsOfALargeGroupInAsManyPages(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.groups(t, "everyone")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "everyone"))
+	const n = 5000
+	manyMembers(t, h, n, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+		SELECT 't1', 'everyone', 'user', id FROM others`, "rbac_members", "rbac_history")
+	// The pages table and its indexes fill.
+	filled := func(table string) int64 {
+		t.Helper()
+		var pages int64
+		if err := h.pool.QueryRow(ctx, `SELECT sum(pg_relation_size(oid) / current_setting('block_size')::bigint) FROM pg_class
+			WHERE oid = $1::regclass OR oid IN (SELECT indexrelid FROM pg_index WHERE indrelid = $1::regclass)`, table).Scan(&pages); err != nil {
+			t.Fatal(err)
+		}
+		return pages
+	}
+	at, history := dbNow(t, h), filled("rbac_history")
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	held := func(a *rbac.Authorizer) error {
+		hs, err := a.Holders(ctx, login, cluster)
+		if err == nil && len(hs) < n {
+			err = fmt.Errorf("Holders listed %d of the group's %d", len(hs), n)
+		}
+		return err
+	}
+	start := pagesRead(ctx, t, tx, "rbac_memberships")
+	if err := held(h.authz.WithTx(tx)); err != nil {
+		t.Fatal(err)
+	}
+	if read, fill := pagesRead(ctx, t, tx, "rbac_memberships")-start, filled("rbac_memberships"); read > 2*fill {
+		t.Errorf("Holders read %d pages of memberships that fill %d", read, fill)
+	}
+	// History as of the time reads each version and whether a later one replaced it.
+	if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+		start := pagesRead(ctx, t, tx, "rbac_history")
+		err := held(a)
+		if read := pagesRead(ctx, t, tx, "rbac_history") - start; err == nil && read > 4*history {
+			err = fmt.Errorf("Holders as of a time read %d pages of history that fill %d", read, history)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}

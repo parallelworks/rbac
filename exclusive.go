@@ -265,7 +265,7 @@ func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives m
 		  SELECT unnest($2::text[]) COLLATE "C"
 		  UNION SELECT principal FROM rbac_grants WHERE tenant = $1 AND role = ANY($3::text[])
 		  UNION SELECT principal FROM rbac_eligibilities WHERE tenant = $1 AND role = ANY($3::text[])
-		), `+insideSQL(`ARRAY(SELECT substr(k, 7) FROM seeds WHERE k LIKE 'group:%')`, "$4")+`,
+		), `+insideSQL(`ARRAY(SELECT substr(k, 7) FROM seeds WHERE k LIKE 'group:%')`, "$4", "NULL", false)+`,
 		targets(identity) AS (
 		  SELECT k FROM seeds WHERE k NOT LIKE 'group:%' AND k NOT LIKE 'members:%' AND k <> 'public:'
 		  UNION SELECT principal FROM inside
