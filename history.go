@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // Audit is what a change records in its history beside its actor and how it was made: on whose
@@ -96,11 +97,16 @@ func (a *Authorizer) recording(ctx context.Context, tx pgx.Tx, actor Principal, 
 // nothing, is followable from any.
 func followable(ctx context.Context, tx pgx.Tx, after Cursor) (generation string, err error) {
 	// The timeline WAL is written on, which promotion changes at once; the last checkpoint's
-	// changes only once the next completes, minutes later.
+	// changes only once the next completes, minutes later. And the database and schema of the
+	// history read, by OIDs, which a physical copy keeps: every database and schema in a cluster
+	// would otherwise share a generation, and with one key, checkpoints.
 	var held bool
-	if err := tx.QueryRow(ctx, `SELECT s.system_identifier::text || '/' || left(pg_walfile_name(pg_current_wal_lsn()), 8),
+	if err := tx.QueryRow(ctx, `SELECT s.system_identifier::text || '/' || left(pg_walfile_name(pg_current_wal_lsn()), 8)
+		    || '/' || d.oid::text || '/' || c.relnamespace::text,
 		  EXISTS (SELECT 1 FROM rbac_history WHERE txid = $1::xid8 AND id = $2 AND recorded_at = $3)
-		FROM pg_control_system() s`, after.TxID, after.ID, after.RecordedAt).Scan(&generation, &held); err != nil {
+		FROM pg_control_system() s, pg_database d, pg_class c
+		WHERE d.datname = current_database() AND c.oid = 'rbac_history'::regclass`,
+		after.TxID, after.ID, storedTime(after.RecordedAt)).Scan(&generation, &held); err != nil {
 		return "", err
 	}
 	if after != (Cursor{}) && after.Generation != generation {
@@ -119,6 +125,13 @@ const MaxPrune = 10000
 // maxPrune is MaxPrune, which a test lowers.
 var maxPrune = MaxPrune
 
+// pruneKey and pruneThrough are a prune's time, $1, and cursor, $2 and $3, as its record holds
+// them, by which a prune of the same finds where the last stopped.
+const (
+	pruneKey     = `to_char($1::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`
+	pruneThrough = `jsonb_build_object('txid', $2::xid8::text, 'id', $3::bigint)`
+)
+
 // PruneHistory deletes from history, on db, records that an export has read past and that later
 // ones supersede, and returns how many. Of each row it keeps the last version at or before before,
 // so AsOf answers as it did for any time from then on, and refuses an earlier one, and it removes
@@ -128,7 +141,8 @@ var maxPrune = MaxPrune
 // rights of history's owner, as the README's administrator's, never the application's; keep at
 // least as much as the host's audit retention requires. It refuses a before yet to come and, like
 // AsOf, history whose ids can't order a row's changes. It deletes at most MaxPrune records:
-// call it again while it deletes as many.
+// call it again while it deletes as many, and it goes on from where the last prune of the same
+// before and through stopped.
 func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) (int64, error) {
 	if through.TxID == 0 && through.ID == 0 {
 		return 0, fmt.Errorf("%w: a prune goes only as far as an export has read: through is the export's cursor", ErrInvalid)
@@ -149,60 +163,89 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 		if future {
 			return fmt.Errorf("%w: a prune is of history up to a time that has passed", ErrInvalid)
 		}
-		if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', 'on', true)`); err != nil {
+		// A prune of the same time and cursor goes on from the last record the last one deleted:
+		// those before it that it kept, the last versions of their rows by then, stay so for both,
+		// as any record written since that could change it is past the cursor. Otherwise each call
+		// would read them all again, as many as the rows there are. One it kept on a snapshot older
+		// than the export, as a host's at REPEATABLE READ, can since be superseded by an end the
+		// snapshot missed: it stays for this call, so the end does too. So a call can go on from
+		// where any of them stopped, and goes on from the furthest: the last by date or id can have
+		// stopped short of it, as one dated by its host transaction's start, or one that waited on
+		// another's batch and deleted none of it.
+		var from int64
+		if err := tx.QueryRow(ctx, `SELECT coalesce(max((after->>'reached')::bigint), 0) FROM rbac_history
+			WHERE tenant = '' AND entity = 'history' AND key = `+pruneKey+`
+			  AND op = 'prune' AND after->'through' = `+pruneThrough, before, through.TxID, through.ID).Scan(&from); err != nil {
+			return err
+		}
+		// The planner can't know that what a batch deletes is history's oldest, and would rather
+		// read all of it and sort what it finds: by history's ids, a call reads only as far as its
+		// batch reaches.
+		var sorting string
+		if err := tx.QueryRow(ctx, `SELECT current_setting('enable_sort')`).Scan(&sorting); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', 'on', true), set_config('enable_sort', 'off', true)`); err != nil {
 			return err
 		}
 		// Of each row's versions at or before the time, the last, by when it was written, as AsOf
 		// orders them, stays unless it ended the row. An end goes only with every version before it:
-		// one that stays, as one the export hasn't read or one dated later but written first by a
-		// transaction that began after the end's, would otherwise be the last AsOf finds.
+		// one that stays, as one the export hasn't read or one dated later but written first, as
+		// history written before its versions were dated in order can hold, would otherwise be the
+		// last AsOf finds. Each record is judged by its own row's versions, not every row's.
+		var reached int64
 		if err := tx.QueryRow(ctx, `
-			WITH kept AS (
-			  SELECT DISTINCT ON (tenant, entity, key) tenant, entity, key, id, op FROM rbac_history
-			  WHERE effective_at <= $1 AND entity <> 'history'
-			  ORDER BY tenant, entity, key, id DESC
-			), doomed AS (
-			  SELECT h.id FROM rbac_history h JOIN kept k ON h.tenant = k.tenant AND h.entity = k.entity AND h.key = k.key
-			  WHERE h.effective_at <= $1 AND (h.txid, h.id) < ($2::xid8, $3)
-			    AND (h.id < k.id OR k.op IN ('delete', 'expire') AND NOT EXISTS (
+			WITH doomed AS (
+			  SELECT h.id FROM rbac_history h
+			  WHERE h.id > $5 AND h.effective_at <= $1 AND (h.txid, h.id) < ($2::xid8, $3) AND h.entity <> 'history'
+			    AND (EXISTS (
+			      SELECT FROM rbac_history n
+			      WHERE n.tenant = h.tenant AND n.entity = h.entity AND n.key = h.key AND n.effective_at <= $1 AND n.id > h.id)
+			    OR h.op IN ('delete', 'expire') AND NOT EXISTS (
 			      SELECT FROM rbac_history s
-			      WHERE s.tenant = k.tenant AND s.entity = k.entity AND s.key = k.key AND s.id < k.id
-			        AND (s.effective_at > $1 OR (s.txid, s.id) >= ($2::xid8, $3))))
+			      WHERE s.tenant = h.tenant AND s.entity = h.entity AND s.key = h.key AND s.id < h.id
+			        AND (s.id <= $5 OR s.effective_at > $1 OR (s.txid, s.id) >= ($2::xid8, $3))))
 			  -- A batch, oldest first: of a row, its end goes after every version before it, so a
 			  -- batch that stops between them leaves the end, which still reads as the row's.
 			  ORDER BY h.id LIMIT $4
 			), pruned AS (
-			  DELETE FROM rbac_history WHERE id IN (SELECT id FROM doomed) RETURNING 1
+			  -- By id, from the batch: a join could read all of history to find it.
+			  DELETE FROM rbac_history WHERE id = ANY (ARRAY(SELECT id FROM doomed)) RETURNING id
 			)
-			SELECT count(*) FROM pruned`, before, through.TxID, through.ID, maxPrune).Scan(&n); err != nil {
+			SELECT count(*), coalesce(max(id), $5) FROM pruned`, before, through.TxID, through.ID, maxPrune, from).Scan(&n, &reached); err != nil {
 			return err
 		}
 		// Under a host's transaction, which goes on past the prune.
-		if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', '', true)`); err != nil {
+		if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', '', true), set_config('enable_sort', $1, true)`, sorting); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, `INSERT INTO rbac_history (effective_at, tenant, entity, key, op, after, how)
-			VALUES (now(), '', 'history', to_char($1::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), 'prune',
-			  jsonb_build_object('before', $1::timestamptz, 'through', jsonb_build_object('txid', $2::xid8::text, 'id', $3::bigint), 'deleted', $4::bigint),
-			  'PruneHistory')`, before, through.TxID, through.ID, n)
+			VALUES (now(), '', 'history', `+pruneKey+`, 'prune',
+			  jsonb_build_object('before', $1::timestamptz, 'through', `+pruneThrough+`, 'deleted', $4::bigint, 'reached', $5::bigint),
+			  'PruneHistory')`, before, through.TxID, through.ID, n, reached)
 		return err
 	})
 	return n, err
 }
 
-// Record is one change to a row the package keeps, as its history recorded it.
+// Record is one change to a row the package keeps, as its history recorded it, its times in UTC.
+// A time.Time holds no infinity, as PostgreSQL's times can, so a time of a record written before
+// the tables refused one, or by history's owner, reads as an instant PostgreSQL can't hold:
+// infinity as 294277-01-01T00:00:00Z, just after the latest it holds, and -infinity as
+// -4713-11-23T23:59:59.999999Z, just before the earliest.
 type Record struct {
 	ID   int64
 	TxID uint64
-	// RecordedAt is when it was written, and EffectiveAt when it took effect: the same, but for an
-	// expiry, when it expired.
+	// RecordedAt is when it was written, and EffectiveAt when it took effect: when the statement
+	// that made it began, or for an expiry, when it expired, but never before the row's record
+	// before it.
 	RecordedAt, EffectiveAt time.Time
 	Tenant                  string
 	// Entity is what changed: grant, role, deny, eligibility, membership, group or member, or
 	// history itself, in no tenant, for a prune. Key is which, in the tenant.
 	Entity, Key string
-	// Op is create, update, delete or expire, or prune, whose After is what PruneHistory was given
-	// and how many records it deleted.
+	// Op is create, update, delete or expire, or prune, whose After is what PruneHistory was given,
+	// how many records it deleted, and the id it reached, which a prune of the same goes on from.
 	Op string
 	// Principal, Role, Scope, Group and ExpiresAt are those of the row, where it has them.
 	Principal Principal
@@ -224,10 +267,43 @@ type Record struct {
 	DBUser     string
 }
 
+// The instants a Record reads PostgreSQL's infinity and -infinity as, which no time it holds is.
+var (
+	pastLatest     = time.Date(294277, time.January, 1, 0, 0, 0, 0, time.UTC)
+	beforeEarliest = time.Date(-4713, time.November, 24, 0, 0, 0, 0, time.UTC).Add(-time.Microsecond)
+)
+
+// recordTime is t as a Record holds it: the zero time for none, and in UTC, so a record reads the
+// same whatever the host's time zone.
+func recordTime(t pgtype.Timestamptz) time.Time {
+	switch {
+	case !t.Valid:
+		return time.Time{}
+	case t.InfinityModifier == pgtype.Infinity:
+		return pastLatest
+	case t.InfinityModifier == pgtype.NegativeInfinity:
+		return beforeEarliest
+	}
+	return t.Time.UTC()
+}
+
+// storedTime is t as history stores it, which recordTime reads as t.
+func storedTime(t time.Time) pgtype.Timestamptz {
+	switch {
+	case t.Equal(pastLatest):
+		return pgtype.Timestamptz{InfinityModifier: pgtype.Infinity, Valid: true}
+	case t.Equal(beforeEarliest):
+		return pgtype.Timestamptz{InfinityModifier: pgtype.NegativeInfinity, Valid: true}
+	}
+	return pgtype.Timestamptz{Time: t, Valid: true}
+}
+
 // Cursor is where a read of history stopped. The zero Cursor is its start.
 type Cursor struct {
-	// Generation names the database the records were read from, by its system and timeline, which
-	// failing over to a replica or recovering to a point in time changes.
+	// Generation names the history the records were read from: its database cluster, by its
+	// system and timeline, which failing over to a replica or recovering to a point in time
+	// changes, and the database and schema in it, by their OIDs, so no two installations in one
+	// cluster share one.
 	Generation string
 	TxID       uint64
 	ID         int64
@@ -282,13 +358,11 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 		records, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (Record, error) {
 			var r Record
 			var principal, role, scope, actor, onBehalfOf string
-			var expires *time.Time
+			var recorded, effective, expires pgtype.Timestamptz
 			var before, afterRow []byte
-			err := row.Scan(&r.ID, &r.TxID, &r.RecordedAt, &r.EffectiveAt, &r.Tenant, &r.Entity, &r.Key, &r.Op, &principal, &role,
+			err := row.Scan(&r.ID, &r.TxID, &recorded, &effective, &r.Tenant, &r.Entity, &r.Key, &r.Op, &principal, &role,
 				&scope, &r.Group, &expires, &before, &afterRow, &actor, &onBehalfOf, &r.How, &r.Request, &r.Reason, &r.DBUser)
-			if expires != nil {
-				r.ExpiresAt = *expires
-			}
+			r.RecordedAt, r.EffectiveAt, r.ExpiresAt = recordTime(recorded), recordTime(effective), recordTime(expires)
 			r.Principal, r.Scope, r.Actor, r.OnBehalfOf = parsePrincipal(principal), parseScope(scope), parsePrincipal(actor), parsePrincipal(onBehalfOf)
 			r.Role, r.Before, r.After = Role(role), before, afterRow
 			return r, err

@@ -983,6 +983,7 @@ func TestApplyValidatesEveryBinding(t *testing.T) {
 		{Role: "cluster.admin", Principal: rbac.TenantMembers("t1")},
 		{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "outsider1"}},
 		{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}, ExpiresAt: h.now.Add(-time.Minute)},
+		{Role: "cluster.sudo", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}, ExpiresAt: time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC)},
 	}})
 	joined, ok := err.(interface{ Unwrap() []error })
 	if !ok {
@@ -995,7 +996,7 @@ func TestApplyValidatesEveryBinding(t *testing.T) {
 			invalid = append(invalid, ie)
 		}
 	}
-	if len(invalid) != 5 || !errors.Is(err, rbac.ErrInvalid) {
+	if len(invalid) != 6 || !errors.Is(err, rbac.ErrInvalid) {
 		t.Fatalf("got %d invalid bindings: %v", len(invalid), err)
 	}
 	if len(h.events) != 0 {
@@ -1853,6 +1854,16 @@ func TestMigrateNeedsASchema(t *testing.T) {
 	}
 	if err := rbac.Migrate(t.Context(), pool); err == nil || !strings.Contains(err.Error(), "no schema in the search_path") {
 		t.Fatalf("migrating where the search_path names no schema that exists: %v", err)
+	}
+}
+
+// A database that isn't UTF8 can hold text that isn't UTF-8, which history would record and no
+// export could chain.
+func TestMigrateNeedsUTF8(t *testing.T) {
+	_, database := pgtest.Database(t, "TEMPLATE template0 ENCODING 'SQL_ASCII' LOCALE 'C'")
+	pool := pgtest.OpenIn(t, database, "")
+	if err := rbac.Migrate(t.Context(), pool); err == nil || !strings.Contains(err.Error(), "UTF8") {
+		t.Fatalf("migrating a database encoded as SQL_ASCII: %v", err)
 	}
 }
 

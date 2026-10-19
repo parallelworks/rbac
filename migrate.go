@@ -17,7 +17,7 @@ var migrations embed.FS
 
 // Migrations are the SQL files that create and upgrade the package's tables, for a host that
 // runs its migrations with a tool of its own: apply each once, in order of their names, in a
-// transaction. Migrate applies them itself.
+// transaction, in a database whose encoding is UTF8. Migrate applies them itself.
 func Migrations() fs.FS {
 	sub, err := fs.Sub(migrations, "migrations")
 	if err != nil {
@@ -27,11 +27,11 @@ func Migrations() fs.FS {
 }
 
 // Migrate creates or upgrades the package's tables, prefixed rbac_, in the current schema: the
-// first in the search_path that exists. It records what it applied in rbac_migrations, applies
-// what is pending in one transaction, is safe to call from several replicas at once, and never
-// runs by itself. On a host's transaction it runs at that transaction's isolation, which must be
-// READ COMMITTED for replicas to migrate at once: a stricter one reads the versions from before
-// it waited for another.
+// first in the search_path that exists, in a database whose encoding is UTF8. It records what it
+// applied in rbac_migrations, applies what is pending in one transaction, is safe to call from
+// several replicas at once, and never runs by itself. On a host's transaction it runs at that
+// transaction's isolation, which must be READ COMMITTED for replicas to migrate at once: a
+// stricter one reads the versions from before it waited for another.
 func Migrate(ctx context.Context, db DB) error {
 	// At READ COMMITTED, so a replica that waited for the lock reads the versions another applied
 	// meanwhile: a stricter snapshot, taken before the lock, would apply them again.
@@ -42,6 +42,16 @@ func Migrate(ctx context.Context, db DB) error {
 		}
 		if schema == nil {
 			return errors.New("rbac: no schema in the search_path exists to migrate in")
+		}
+		// A database in another encoding can give back text that isn't UTF-8, as SQL_ASCII gives
+		// back whatever was stored: history would record it, and no export could chain it, so every
+		// export would stop there.
+		var encoding string
+		if err := tx.QueryRow(ctx, `SELECT current_setting('server_encoding')`).Scan(&encoding); err != nil {
+			return err
+		}
+		if encoding != "UTF8" {
+			return fmt.Errorf("rbac: the database's encoding is %s, not UTF8", encoding)
 		}
 		// One migration at a time in the schema, under a key named as the change locks' are.
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(`+lockKey+`)`, "migrate"); err != nil {

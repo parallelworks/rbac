@@ -1070,17 +1070,20 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Su
 
 // conditionsOf reads the conditions of the conditional grants among held, in place.
 func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held []holding) error {
-	var ids []string
+	var ids, principals []string
 	for _, h := range held {
 		if h.conditional {
 			ids = append(ids, h.ID)
+			principals = append(principals, h.Principal.key())
 		}
 	}
 	if len(ids) == 0 {
 		return nil
 	}
-	// Only the expression: a check reads nothing else of a condition.
-	rows, err := q.Query(ctx, `SELECT id::text, condition FROM rbac_grants WHERE id = ANY($1::uuid[]) AND tenant = $2`, ids, tenant)
+	// Only the expression: a check reads nothing else of a condition. By principal too: as of a
+	// time, history finds a grant's versions by its principal, not by its id.
+	rows, err := q.Query(ctx, `SELECT id::text, condition FROM rbac_grants WHERE id = ANY($1::uuid[]) AND tenant = $2 AND principal = ANY($3::text[])`,
+		ids, tenant, principals)
 	if err != nil {
 		return err
 	}
