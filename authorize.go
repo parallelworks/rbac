@@ -159,14 +159,14 @@ func (a *Authorizer) decideGrants(ctx context.Context, s Subject, p Permission, 
 // none does.
 func (a *Authorizer) explain(ctx context.Context, s Subject, p Permission, r Resource, counts broad) (Decision, error) {
 	vars, spend := a.vars(ctx, s, p, r), newBudget()
-	keys, err := a.keysOf(ctx, a.db, r.Tenant, s)
+	keys, binding, err := a.keysOf(ctx, a.db, r.Tenant, s)
 	if err != nil {
 		return Decision{}, err
 	}
 	principals := countedOf(keys, counts)
 	// As Authorize, which reads no deny for a subject none of whose grants can give p.
 	if len(principals) > 0 {
-		ds, err := a.deniesOn(ctx, a.db, r.Tenant, bound(keys, s), r.path(), p)
+		ds, err := a.deniesOn(ctx, a.db, r.Tenant, binding, exempting(keys, s), r.path(), p)
 		if err != nil {
 			return Decision{}, err
 		}
@@ -556,7 +556,7 @@ func (a *Authorizer) holders(ctx context.Context, p Permission, r Resource, role
 	// The identities in the groups granted, through those nested in them, and those granted
 	// directly, that are members or guests of the tenant now.
 	rows, err = a.db.Query(ctx, `
-		WITH RECURSIVE `+insideSQL("$1", "$2", "$3")+`, reached(root, principal) AS (
+		WITH RECURSIVE `+insideSQL("$2", "$3")+`, reached(root, principal) AS (
 		  SELECT root, principal FROM inside
 		  UNION
 		  SELECT '', p FROM unnest($4::text[]) AS p
@@ -614,7 +614,7 @@ func (a *Authorizer) boundByDenies(ctx context.Context, p Permission, r Resource
 	if len(holders) == 0 {
 		return nil
 	}
-	ds, err := a.deniesOn(ctx, a.db, r.Tenant, nil, r.path(), p)
+	ds, err := a.deniesOn(ctx, a.db, r.Tenant, nil, nil, r.path(), p)
 	if err != nil || len(ds) == 0 {
 		return err
 	}
@@ -646,7 +646,7 @@ func (a *Authorizer) boundByDenies(ctx context.Context, p Permission, r Resource
 	}
 	if len(identities) > 0 && len(groups) > 0 {
 		rows, err := a.db.Query(ctx, `
-			WITH RECURSIVE `+insideSQL("$1", "$2", "$3")+`
+			WITH RECURSIVE `+insideSQL("$2", "$3")+`
 			SELECT DISTINCT principal, 'group:' || root FROM inside WHERE principal = ANY($4::text[])`,
 			r.Tenant, groups, now, identities)
 		if err != nil {
@@ -696,17 +696,17 @@ func (a *Authorizer) boundByDenies(ctx context.Context, p Permission, r Resource
 
 // insideSQL is SQL defining, in a WITH RECURSIVE, inside(root, principal): the identities in each
 // of the groups, given as SQL for an array of their ids, directly or through groups in it, at now,
-// by the same memberships keysSQL reads up from an identity.
-func insideSQL(tenant, groups, now string) string {
+// by the same memberships keysSQL reads up from an identity, in the tenant $1.
+func insideSQL(groups, now string) string {
 	return fmt.Sprintf(`down(root, id) AS (
-		  SELECT g, g COLLATE "C" FROM unnest(%[2]s::text[]) AS g
+		  SELECT g, g COLLATE "C" FROM unnest(%[1]s::text[]) AS g
 		  UNION
 		  SELECT d.root, m.principal_id FROM rbac_members m JOIN down d ON m.group_id = d.id
-		  WHERE m.tenant = %[1]s AND m.principal LIKE 'group:%%' AND (m.expires_at IS NULL OR m.expires_at > %[3]s)
+		  WHERE m.tenant = $1 AND m.principal LIKE 'group:%%' AND (m.expires_at IS NULL OR m.expires_at > %[2]s)
 		), inside(root, principal) AS (
-		  SELECT d.root, m.principal FROM down d JOIN rbac_members m ON m.tenant = %[1]s AND m.group_id = d.id
-		  WHERE m.principal NOT LIKE 'group:%%' AND (m.expires_at IS NULL OR m.expires_at > %[3]s)
-		)`, tenant, groups, now)
+		  SELECT d.root, m.principal FROM down d JOIN rbac_members m ON m.tenant = $1 AND m.group_id = d.id
+		  WHERE m.principal NOT LIKE 'group:%%' AND (m.expires_at IS NULL OR m.expires_at > %[2]s)
+		)`, groups, now)
 }
 
 // Reach is where a subject may do something. A resource, by its path (Authorizer.Path), is
@@ -757,7 +757,7 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 // reachable is Reachable's answer once no constraint removes p, for the built-in roles that give
 // it, and custom ones too where custom.
 func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, tenant, resourceType string, roles []string, custom bool) (Reach, error) {
-	keys, err := a.keysOf(ctx, a.db, tenant, s)
+	keys, binding, err := a.keysOf(ctx, a.db, tenant, s)
 	if err != nil {
 		return Reach{}, err
 	}
@@ -806,9 +806,9 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 	rows, err = a.db.Query(ctx, `
 		SELECT scope, bool_or(condition = '') FROM rbac_denies
 		WHERE tenant = $1 AND scope_type = ANY($2::text[])
-		  AND principals && $3::text[] AND NOT exempt && $3::text[] AND ($4 = ANY(permissions) OR $5 = ANY(permissions))
+		  AND principals && $3::text[] AND NOT exempt && $6::text[] AND ($4 = ANY(permissions) OR $5 = ANY(permissions))
 		GROUP BY scope ORDER BY scope`,
-		tenant, reaching, bound(keys, s), perm, wildcard)
+		tenant, reaching, binding, perm, wildcard, exempting(keys, s))
 	if err != nil {
 		return Reach{}, err
 	}
@@ -940,9 +940,9 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 		SQL: fmt.Sprintf(`(%s = %s AND %s
 			AND NOT %s && ARRAY(SELECT d.scope COLLATE "default" FROM rbac_denies d
 			WHERE d.tenant = %s::text AND d.scope_type = ANY(%s::text[])
-			  AND d.principals && %[7]s AND NOT d.exempt && %[7]s
+			  AND d.principals && %[7]s AND NOT d.exempt && %[10]s
 			  AND (%[8]s::text = ANY(d.permissions) OR %[9]s::text = ANY(d.permissions))))`,
-			cols.Tenant, arg(0), reached, cols.Path, arg(1), arg(16), keys("SELECT k FROM bound"), arg(14), arg(15)),
+			cols.Tenant, arg(0), reached, cols.Path, arg(1), arg(16), keys("SELECT k FROM bound"), arg(14), arg(15), keys("SELECT k FROM exempted")),
 		Args: append(append([]any{
 			tenant, tenant, s.identityKey(), roles, a.cfg.Now(), above, publicKey, a.publicRoles(roles),
 			string(p), resourceType,
@@ -1035,7 +1035,7 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Su
 		UNION ALL
 		SELECT true, id, id, scope, '', NULL, condition <> '', permissions, condition
 		FROM rbac_denies
-		WHERE tenant = $1 AND scope = ANY($3::text[]) AND principals && ARRAY(SELECT k FROM bound) AND NOT exempt && ARRAY(SELECT k FROM bound)
+		WHERE tenant = $1 AND scope = ANY($3::text[]) AND principals && ARRAY(SELECT k FROM bound) AND NOT exempt && ARRAY(SELECT k FROM exempted)
 		  AND ($5 = '' OR $5 = ANY(permissions) OR $6 = ANY(permissions)) AND EXISTS (SELECT FROM keys WHERE `+counted("$7", "$8")+`)
 		ORDER BY 1, 3, 4, 5, 2`, // grants by principal, scope, role and id; denies by id and scope, as deniesOn
 		tenant, s.identityKey(), scopes, a.cfg.Now(), perm, wildcard, counts.public, counts.members)

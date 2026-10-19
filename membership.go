@@ -1,6 +1,7 @@
 package rbac
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -32,7 +33,8 @@ const MaxGroupDepth = 8
 
 // Membership is an identity's membership of a tenant. A member holds what it is granted there and
 // what is granted to the tenant's members; a guest only what it is granted; and a suspended one
-// keeps its grants and groups but holds nothing until the suspension is lifted. The host keeps
+// keeps its grants and groups but holds only what the public does until the suspension is lifted,
+// still bound by the denies that name its groups or the tenant's members. The host keeps
 // memberships with SetMemberships and ends them with DeletePrincipal.
 type Membership struct {
 	// Tenant is set on memberships read back.
@@ -135,7 +137,9 @@ func (a *Authorizer) checkMembership(m Membership, now time.Time) error {
 // host's own write, without the checks a change by a tenant's admins has, as Import is for grants.
 // It reports the memberships it set or changed. An identity whose membership had ended joins again
 // in none of the groups it was in, whether or not DeleteExpired has run since, as a membership
-// made by actor now.
+// made by actor now. Config.ValidateGrant is asked about none of what an identity holds: a host
+// whose policy decides by membership, as none privileged for a guest, checks what one holds when
+// it makes it a guest or lifts its suspension.
 func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant string, ms []Membership) (err error) {
 	defer a.refused(ctx, &err, tenant, actor, "SetMemberships")
 	if tenant == "" {
@@ -310,7 +314,9 @@ func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string,
 }
 
 // ImportGroups creates groups in a tenant or replaces them, as actor: the host's own write, as for
-// a directory it syncs from, without the checks SetGroup makes of an actor.
+// a directory it syncs from, without the checks SetGroup makes of an actor. Taking over a group
+// the tenant made, from one of Config.Sources, removes the members it has from no source of the
+// host's, which ChangeEvent.Left reports.
 func (a *Authorizer) ImportGroups(ctx context.Context, actor Principal, tenant string, groups []GroupDefinition) (err error) {
 	defer a.refused(ctx, &err, tenant, actor, "ImportGroups")
 	if tenant == "" {
@@ -343,9 +349,41 @@ func (a *Authorizer) ImportGroups(ctx context.Context, actor Principal, tenant s
 		if err := lockAll(ctx, tx, tenant, keys, nil); err != nil {
 			return ChangeEvent{}, err
 		}
+		taken, err := a.takenOver(ctx, tx, tenant, set)
+		if err != nil {
+			return ChangeEvent{}, err
+		}
 		changed, err := upsertGroups(ctx, tx, tenant, actor, set)
-		return ChangeEvent{Groups: changed}, err
+		if err != nil || len(taken) == 0 {
+			return ChangeEvent{Groups: changed}, err
+		}
+		// Those a tenant put in a group it made were checked as granting what it held then, not
+		// what the host grants its own, as it may once it holds the group.
+		owned := slices.Sorted(maps.Keys(a.owned))
+		left, err := removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant,
+			"group_id = ANY($2::text[]) AND source <> ALL($3::text[])", taken, owned)
+		return ChangeEvent{Groups: changed, Left: left}, err
 	})
+}
+
+// takenOver returns, of the groups an import sets, those it takes from the tenant: that exist, from
+// a source the host doesn't own, and that it sets from one it does.
+func (a *Authorizer) takenOver(ctx context.Context, tx pgx.Tx, tenant string, set []GroupDefinition) ([]string, error) {
+	var ids []string
+	for _, g := range set {
+		if a.owned[g.Source] {
+			ids = append(ids, g.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	rows, err := tx.Query(ctx, `SELECT id FROM rbac_groups WHERE tenant = $1 AND id = ANY($2::text[]) AND source <> ALL($3::text[]) ORDER BY id`,
+		tenant, ids, slices.Sorted(maps.Keys(a.owned)))
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
 // upsertGroups stores groups, sorted by id, and returns those it created or changed.
@@ -673,7 +711,8 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 	if err != nil {
 		return err
 	}
-	if err := a.askMemberships(ctx, Subject{Principal: actor}, tenant, set, rc); err != nil {
+	stand, err := a.askMemberships(ctx, Subject{Principal: actor}, tenant, set, rc)
+	if err != nil {
 		return err
 	}
 	scopes, principals := memberLocks(set)
@@ -683,6 +722,9 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 			return ChangeEvent{}, err
 		}
 		if err := a.stillReached(ctx, tx, tenant, set, nil, rc, true); err != nil {
+			return ChangeEvent{}, err
+		}
+		if err := a.stillStanding(ctx, tx, tenant, stand); err != nil {
 			return ChangeEvent{}, err
 		}
 		joined, err := a.join(ctx, tx, tenant, actor, set)
@@ -838,7 +880,8 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 	if err != nil {
 		return err
 	}
-	if err := a.askMemberships(ctx, actor, tenant, set, rc); err != nil {
+	stand, err := a.askMemberships(ctx, actor, tenant, set, rc)
+	if err != nil {
 		return err
 	}
 	scopes, principals := memberLocks(slices.Concat(set, remove))
@@ -848,6 +891,9 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 			return ChangeEvent{}, err
 		}
 		if err := a.stillReached(ctx, tx, tenant, set, remove, rc, false); err != nil {
+			return ChangeEvent{}, err
+		}
+		if err := a.stillStanding(ctx, tx, tenant, stand); err != nil {
 			return ChangeEvent{}, err
 		}
 		// The host's groups only the host changes, members and all.
@@ -879,9 +925,17 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 // hostResource gives: GroupMembers on each one's scope, or one that doesn't exist, which has none to
 // change. Constraints are asked only with constraints, before the transaction.
 func (a *Authorizer) mayChangeMembers(ctx context.Context, q DB, actor Subject, groups []Resource, constraints bool) error {
+	unsatisfied := a.unsatisfiedBy(ctx, actor)
 	for _, g := range groups {
 		if err := a.mayManageGroups(ctx, q, actor, g, GroupMembers, constraints); err != nil {
 			return err
+		}
+		// As a check of GroupMembers on it refuses who can't see it, before the transaction.
+		if !constraints {
+			continue
+		}
+		if dim, err := unsatisfied(g); err != nil || dim != "" {
+			return cmp.Or(err, error(&DeniedError{Permission: GroupMembers, Scope: g.Scope(), Reason: labelRefusal(dim)}))
 		}
 	}
 	return nil
@@ -1170,20 +1224,31 @@ func (v revalidation) as(m Member) Binding {
 }
 
 // askMemberships asks Config.ValidateGrant, before a change's transaction, about each grant and
-// eligibility each member set adds gains, as the member's.
-func (a *Authorizer) askMemberships(ctx context.Context, actor Subject, tenant string, set []Member, rc reach) error {
+// eligibility each member set adds gains, as the member's, and returns the standing of the members
+// it asked about, which the answers rest on.
+func (a *Authorizer) askMemberships(ctx context.Context, actor Subject, tenant string, set []Member, rc reach) (standing, error) {
+	var asked []Principal
+	for _, m := range set {
+		if len(rc.heldBy(m.Group)) > 0 {
+			asked = append(asked, m.Principal)
+		}
+	}
+	stand, err := a.stand(ctx, a.db, tenant, asked)
+	if err != nil {
+		return standing{}, err
+	}
 	var refused []error
 	for _, m := range set {
 		for _, v := range rc.heldBy(m.Group) {
 			roles := book{builtin: a.roles, custom: map[Role]RoleDefinition{v.role.ID: v.role}}
 			bad, err := a.allowed(ctx, roles, actor, ViaMembership, tenant, v.scope, v.as(m))
 			if err != nil {
-				return err
+				return standing{}, err
 			}
 			refused = append(refused, bad...)
 		}
 	}
-	return errors.Join(refused...)
+	return stand, errors.Join(refused...)
 }
 
 // reachCheck is what a change to members is checked as on one scope it reaches: the grants it

@@ -601,6 +601,21 @@ func (c *conditions) decide(b *budget, expr string, vars map[string]any) (held, 
 	return isBool && ok, isBool
 }
 
+// parsing parses conditions for what they read, which needs no declarations.
+var parsing, _ = cel.NewEnv()
+
+// readsSubject reports whether expr reads the subject, or might: one that doesn't parse might.
+func readsSubject(expr string) bool {
+	parsed, iss := parsing.Parse(expr)
+	if iss.Err() != nil {
+		return true
+	}
+	// `.subject` names it from the root, as `subject` does.
+	return len(ast.MatchDescendants(ast.NavigateAST(parsed.NativeRep()), func(e ast.NavigableExpr) bool {
+		return e.Kind() == ast.IdentKind && strings.TrimPrefix(e.AsIdent(), ".") == "subject"
+	})) > 0
+}
+
 type requestKey struct{}
 
 // WithRequest returns ctx carrying the attributes of the request it serves, such as its

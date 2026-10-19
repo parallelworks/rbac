@@ -76,10 +76,10 @@ type denial struct {
 	unevaluated, spent bool
 }
 
-// deniesOn reads the denies on scopes that name one of keys, and none it exempts, or name
-// anyone when keys is nil, listing p.
-func (a *Authorizer) deniesOn(ctx context.Context, q DB, tenant string, keys, scopes []string, p Permission) ([]denial, error) {
-	if keys != nil && len(keys) == 0 {
+// deniesOn reads the denies on scopes that name one of binding and exempt none of exempt, the
+// keys keysOf and exempting give, or name anyone when binding is nil, listing p.
+func (a *Authorizer) deniesOn(ctx context.Context, q DB, tenant string, binding, exempt, scopes []string, p Permission) ([]denial, error) {
+	if binding != nil && len(binding) == 0 {
 		return nil, nil
 	}
 	perm, wildcard := matchable(p)
@@ -87,10 +87,10 @@ func (a *Authorizer) deniesOn(ctx context.Context, q DB, tenant string, keys, sc
 	rows, err := q.Query(ctx, `
 		SELECT id, scope, permissions, principals, exempt, condition FROM rbac_denies
 		WHERE tenant = $1 AND scope = ANY($2::text[])
-		  AND ($3::text[] IS NULL OR principals && $3::text[] AND NOT exempt && $3::text[])
+		  AND ($3::text[] IS NULL OR principals && $3::text[] AND NOT exempt && $6::text[])
 		  AND ($4 = ANY(permissions) OR $5 = ANY(permissions))
 		ORDER BY id, scope`,
-		tenant, scopes, keys, perm, wildcard)
+		tenant, scopes, binding, perm, wildcard, exempt)
 	if err != nil {
 		return nil, err
 	}

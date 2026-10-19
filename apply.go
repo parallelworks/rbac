@@ -129,6 +129,10 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, how
 			return err
 		}
 	}
+	stand, err := a.stand(ctx, a.db, on.Tenant, bindingPrincipals(grants))
+	if err != nil {
+		return err
+	}
 	if err := a.validate(ctx, au.roles, actor, via, on.Tenant, scope, grants, revokes); err != nil {
 		return err
 	}
@@ -152,6 +156,9 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, how
 		if err := groupsExist(ctx, tx, on.Tenant, exist); err != nil {
 			return ChangeEvent{}, err
 		}
+		if err := a.stillStanding(ctx, tx, on.Tenant, stand); err != nil {
+			return ChangeEvent{}, err
+		}
 		// Decided again in the transaction, so the actor's access and the roles are read as the
 		// change is made: a custom role deleted or redefined since is granted only as it is now.
 		// The constraints aren't asked again, as hooks run outside it.
@@ -172,6 +179,72 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, how
 		}
 		return write(tx)
 	})
+}
+
+// standing is what a host's answer about grants to principals rests on, as the package keeps it:
+// each identity's membership of the tenant, and the identities in each group with theirs. It is
+// read before the host is asked, and again under the change's locks, which a change to it takes
+// too, so a change made between them is tried again rather than made on an answer about another
+// state: as a grant to an identity that has left the tenant, or to a group a guest joined
+// meanwhile, of a role the host refuses guests. The memberships of a group's members are read
+// with it, but their changes take the member's lock alone.
+type standing struct {
+	principals []Principal
+	// by is, for each identity and group, its identities' memberships, each `principal=membership`:
+	// an element, not a line, as an identity's id can hold a newline, and no membership an '='.
+	by map[string][]string
+}
+
+// stand reads the standing of principals in a tenant on q.
+func (a *Authorizer) stand(ctx context.Context, q DB, tenant string, principals []Principal) (standing, error) {
+	s := standing{principals: principals}
+	var identities, groups []string
+	for _, p := range principals {
+		switch {
+		case p.Kind == Group:
+			groups = append(groups, p.ID)
+		case !p.broad():
+			identities = append(identities, p.key())
+		}
+	}
+	if len(identities)+len(groups) == 0 {
+		return s, nil
+	}
+	// Joined in the statement, as a group can have many members; an end as seconds since the epoch,
+	// which read the same whatever the session's time zone.
+	rows, err := q.Query(ctx, `
+		WITH RECURSIVE `+insideSQL("$3", "$4")+`, of(root, principal) AS (
+		  SELECT 'group:' || root, principal FROM inside
+		  UNION SELECT p, p FROM unnest($2::text[]) AS p
+		)
+		SELECT o.root, array_agg(o.principal || '=' || coalesce(m.guest::text || ' ' || m.suspended::text || ' ' ||
+		  coalesce(extract(epoch FROM m.expires_at)::text, ''), '') ORDER BY o.principal)
+		FROM of o LEFT JOIN rbac_memberships m ON m.tenant = $1 AND m.principal = o.principal
+		GROUP BY o.root`, tenant, identities, groups, a.cfg.Now())
+	if err != nil {
+		return standing{}, err
+	}
+	s.by = map[string][]string{}
+	var root string
+	var members []string
+	_, err = pgx.ForEachRow(rows, []any{&root, &members}, func() error {
+		s.by[root] = members
+		return nil
+	})
+	return s, err
+}
+
+// stillStanding refuses, under a change's locks, a change whose principals' standing has changed
+// since the host was asked about it.
+func (a *Authorizer) stillStanding(ctx context.Context, tx pgx.Tx, tenant string, was standing) error {
+	now, err := a.stand(ctx, tx, tenant, was.principals)
+	if err != nil {
+		return err
+	}
+	if !maps.EqualFunc(now.by, was.by, slices.Equal) {
+		return fmt.Errorf("%w: a membership the host was asked about changed while this change waited for it; try again", ErrConflict)
+	}
+	return nil
 }
 
 // mayChangeGrants checks, before a change's transaction, that actor may make grants and revokes on on: it
@@ -316,6 +389,14 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 	if err != nil {
 		return err
 	}
+	named := make([]Principal, len(grants))
+	for i, g := range grants {
+		named[i] = g.Principal
+	}
+	stand, err := a.stand(ctx, a.db, tenant, named)
+	if err != nil {
+		return err
+	}
 	var refused []error
 	for _, g := range grants {
 		bad, err := a.allowed(ctx, roles, Subject{Principal: actor}, ViaImport, tenant, g.Scope, g.Binding)
@@ -328,17 +409,20 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 		return err
 	}
 	scopes, principals := map[string]bool{}, map[string]bool{}
-	named, on := make([]Principal, len(grants)), make([]Scope, len(grants))
+	on := make([]Scope, len(grants))
 	for i, g := range grants {
 		scopes[g.Scope.Key()] = true
 		principals[g.Principal.key()] = true
-		named[i], on[i] = g.Principal, g.Scope
+		on[i] = g.Scope
 	}
 	return a.inTx(ctx, tenant, actor, "Import", func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lockAll(ctx, tx, tenant, slices.Collect(maps.Keys(scopes)), slices.Collect(maps.Keys(principals))); err != nil {
 			return ChangeEvent{}, err
 		}
 		if err := groupsExist(ctx, tx, tenant, slices.Concat(groupKeys(named), groupScopes(on))); err != nil {
+			return ChangeEvent{}, err
+		}
+		if err := a.stillStanding(ctx, tx, tenant, stand); err != nil {
 			return ChangeEvent{}, err
 		}
 		// Again under the locks, so a custom role deleted since isn't granted, nor one redefined
@@ -799,7 +883,14 @@ func (au authority) power(scopeType string, denied func(Permission) bool, counts
 // under reports whether a grant gives what it gives under condition: unconditionally, or under
 // the same condition, so a grant can't drop one its granter is bound by.
 func (h holding) under(condition string) bool {
-	return !h.conditional || h.Condition.Expression == condition
+	return !h.conditional || sameFor(h.Condition.Expression, condition)
+}
+
+// sameFor reports whether holding under one condition is holding under another for whoever is
+// granted it: the same condition, of the request and the resource. One that reads the subject
+// decides for each holder, so the actor's holding under it says nothing of what it hands on.
+func sameFor(held, condition string) bool {
+	return held == condition && !readsSubject(condition)
 }
 
 // holds reports whether the actor holds p for resources of a type, to hand it on with condition:
@@ -1002,11 +1093,23 @@ func scopeGrants(scope Scope, bindings []Binding) []Grant {
 	return grants
 }
 
+// removals are the calls that only remove grants, eligibilities, denies, memberships, groups or
+// roles, which can't leave anyone able to hold two exclusive values, as denies don't count, so
+// aren't checked for it: one that rewrites approvers or denies, as DeleteGroups does, would
+// otherwise be refused for a conflict it left as it found.
+var removals = map[string]bool{
+	"Deactivate": true, "DeleteDeny": true, "DeleteGrants": true, "DeleteGroup": true, "DeleteGroups": true,
+	"DeleteEligibility": true, "DeleteMembers": true, "DeletePrincipal": true, "DeleteRole": true, "DeleteScope": true,
+	"DeleteScopes": true, "DeleteTenant": true,
+}
+
 // inTx runs fn in a transaction, recording what it writes in history as actor's change made by
 // how, the call that makes it, and hands what it changed to Config.OnChange there. Where a
 // dimension is Exclusive, it refuses a change that lets an identity hold two of its values.
 func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, how string, fn func(pgx.Tx) (ChangeEvent, error)) error {
 	return a.begin(ctx, func(tx pgx.Tx) error {
+		// Taken by every change, removals too, so changes in one host transaction take their locks in
+		// one order.
 		exclusive := a.exclusive()
 		if exclusive {
 			if err := lockExclusive(ctx, tx, tenant); err != nil {
@@ -1021,7 +1124,7 @@ func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, h
 		if err != nil {
 			return err
 		}
-		if exclusive {
+		if exclusive && !removals[how] {
 			if err := a.excludes(ctx, tx, tenant, e); err != nil {
 				return err
 			}
@@ -1595,6 +1698,13 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 	expire := func(sql string) (int64, error) {
 		var n int64
 		err := a.begin(ctx, func(tx pgx.Tx) error {
+			// It takes no lock, but as a change it reads what committed before it, which only
+			// READ COMMITTED reads: an older snapshot would leave an ended member's newer places.
+			b := &pgx.Batch{}
+			b.Queue(`SELECT current_setting('transaction_isolation')`)
+			if err := locked(tx.SendBatch(ctx, b)); err != nil {
+				return err
+			}
 			done, err := a.recording(ctx, tx, Principal{}, "DeleteExpired", "expire")
 			if err != nil {
 				return err

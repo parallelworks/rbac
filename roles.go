@@ -280,6 +280,7 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 		return err
 	}
 	checked, existed := au.roles.custom[r.ID]
+	var labeled []Scope
 	if existed && !sameAccess(checked, r) {
 		// Its grants are on scopes of the types it is for, and on those it was for before and is
 		// for again, whose grants it brings back.
@@ -290,8 +291,11 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 		if err := a.changesDenied(au, tenant, types, fmt.Sprintf("changing what %s's grants give", r.ID)); err != nil {
 			return err
 		}
+		if labeled, err = a.labelsAllow(ctx, actor, tenant, r.ID); err != nil {
+			return err
+		}
 	}
-	asked, err := a.revalidate(ctx, actor, tenant, au.roles.custom, r)
+	asked, stand, err := a.revalidate(ctx, actor, tenant, au.roles.custom, r)
 	if err != nil {
 		return err
 	}
@@ -310,9 +314,13 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 		if ok && !sameAccess(old, r) && (!existed || !sameAccess(old, checked)) {
 			return ChangeEvent{}, changedMeanwhile(r.ID)
 		}
-		// Again on the denies read under the lock, which a deny set meanwhile is among.
+		// Again on the denies read under the lock, which a deny set meanwhile is among, and on the
+		// scopes its grants are on now, which labelsAllow checked as they were.
 		if ok && !sameAccess(old, r) {
 			if err := a.changesDenied(au, tenant, slices.Concat(old.ResourceTypes, r.ResourceTypes), fmt.Sprintf("changing what %s's grants give", r.ID)); err != nil {
+				return ChangeEvent{}, err
+			}
+			if err := a.stillLabeled(ctx, tx, tenant, r.ID, labeled); err != nil {
 				return ChangeEvent{}, err
 			}
 		}
@@ -336,6 +344,10 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 			if as, ok := asked[v.key()]; !ok || widens(as, v.role) {
 				return ChangeEvent{}, fmt.Errorf("%w: grants %s's definition widens changed while it waited; try again", ErrConflict, r.ID)
 			}
+		}
+		// The holders asked about, not need's: a grant revoked or ended meanwhile is no conflict.
+		if err := a.stillStanding(ctx, tx, tenant, stand); err != nil {
+			return ChangeEvent{}, err
 		}
 		others := len(au.roles.custom)
 		if ok {
@@ -397,11 +409,15 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		return err
 	}
 	checked, existed := roles.role(id)
+	var labeled []Scope
 	if existed {
 		if err := a.changesStopped(ctx, actor, tenant, checked.ResourceTypes, "revoking "+string(id)); err != nil {
 			return err
 		}
 		if err := a.changesDenied(au, tenant, checked.ResourceTypes, "revoking "+string(id)); err != nil {
+			return err
+		}
+		if labeled, err = a.labelsAllow(ctx, actor, tenant, id); err != nil {
 			return err
 		}
 	}
@@ -422,6 +438,9 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		}
 		if existed {
 			if err := a.changesDenied(au, tenant, checked.ResourceTypes, "revoking "+string(id)); err != nil {
+				return ChangeEvent{}, err
+			}
+			if err := a.stillLabeled(ctx, tx, tenant, id, labeled); err != nil {
 				return ChangeEvent{}, err
 			}
 		}
@@ -581,12 +600,21 @@ func (a *Authorizer) revalidations(ctx context.Context, q DB, tenant string, wid
 
 // revalidate asks Config.ValidateGrant, before SetRole's transaction, about each grant and
 // eligibility of a role that redefining r as actor widens, and returns those it asked about, with
-// the role as it asked. custom are the tenant's custom roles, as read.
-func (a *Authorizer) revalidate(ctx context.Context, actor Subject, tenant string, custom map[Role]RoleDefinition, r RoleDefinition) (map[revalidated]RoleDefinition, error) {
+// the role as it asked, and the standing of their holders. custom are the tenant's custom roles,
+// as read.
+func (a *Authorizer) revalidate(ctx context.Context, actor Subject, tenant string, custom map[Role]RoleDefinition, r RoleDefinition) (map[revalidated]RoleDefinition, standing, error) {
 	_, widened := a.redefining(custom, r)
 	need, err := a.revalidations(ctx, a.db, tenant, widened)
 	if err != nil {
-		return nil, err
+		return nil, standing{}, err
+	}
+	holders := make([]Principal, len(need))
+	for i, v := range need {
+		holders[i] = v.binding.Principal
+	}
+	stand, err := a.stand(ctx, a.db, tenant, holders)
+	if err != nil {
+		return nil, standing{}, err
 	}
 	roles := book{builtin: a.roles, custom: widened}
 	asked := make(map[revalidated]RoleDefinition, len(need))
@@ -594,7 +622,7 @@ func (a *Authorizer) revalidate(ctx context.Context, actor Subject, tenant strin
 	for _, v := range need {
 		bad, err := a.allowed(ctx, roles, actor, ViaRedefinition, tenant, v.scope, v.binding)
 		if err != nil {
-			return nil, err
+			return nil, standing{}, err
 		}
 		// The binding names no scope, and an eligibility has no ID, so the reason says which.
 		for _, e := range bad {
@@ -606,7 +634,72 @@ func (a *Authorizer) revalidate(ctx context.Context, actor Subject, tenant strin
 		refused = append(refused, bad...)
 		asked[v.key()] = v.role
 	}
-	return asked, errors.Join(refused...)
+	return asked, stand, errors.Join(refused...)
+}
+
+// labelsAllow refuses changing what a custom role's grants and eligibilities give, or revoking
+// them, to an actor that a label of a scope they are on refuses, as Apply refuses changing grants
+// there: read before the change's transaction, as labels are the host's. It returns the scopes it
+// checked, which stillLabeled reads again under the change's lock.
+func (a *Authorizer) labelsAllow(ctx context.Context, actor Subject, tenant string, id Role) ([]Scope, error) {
+	if len(a.labels) == 0 {
+		return nil, nil
+	}
+	scopes, err := a.roleScopes(ctx, a.db, tenant, id)
+	if err != nil {
+		return nil, err
+	}
+	unsatisfied := a.unsatisfiedBy(ctx, actor)
+	for _, s := range scopes {
+		on, err := a.resourceOf(ctx, tenant, s)
+		if err != nil {
+			return nil, err
+		}
+		if dim, err := unsatisfied(on); err != nil || dim != "" {
+			return nil, cmp.Or(err, error(&DeniedError{Permission: GrantPermission(s.Type), Scope: s, Reason: labelRefusal(dim)}))
+		}
+	}
+	return scopes, nil
+}
+
+// stillLabeled refuses, under the tenant's lock, a change labelsAllow checked whose role is now
+// granted on a scope it didn't check, as one granted there while the change waited.
+func (a *Authorizer) stillLabeled(ctx context.Context, tx pgx.Tx, tenant string, id Role, checked []Scope) error {
+	if len(a.labels) == 0 {
+		return nil
+	}
+	scopes, err := a.roleScopes(ctx, tx, tenant, id)
+	if err != nil {
+		return err
+	}
+	seen := make(map[Scope]bool, len(checked))
+	for _, s := range checked {
+		seen[s] = true
+	}
+	for _, s := range scopes {
+		if !seen[s] {
+			return fmt.Errorf("%w: %s was granted on %s while this change waited; try again", ErrConflict, id, s.Key())
+		}
+	}
+	return nil
+}
+
+// roleScopes reads, on q, the scopes a custom role's grants and eligibilities in force are on,
+// sorted.
+func (a *Authorizer) roleScopes(ctx context.Context, q DB, tenant string, id Role) ([]Scope, error) {
+	// The LIKE matches the partial indexes on custom roles' grants and eligibilities. Those ended
+	// give nothing, so changing what they give changes no access.
+	rows, err := q.Query(ctx, `
+		SELECT scope_type, scope_id FROM rbac_grants WHERE tenant = $1 AND role = $2 AND role LIKE 'custom.%'
+		  AND (expires_at IS NULL OR expires_at > $3)
+		UNION
+		SELECT scope_type, scope_id FROM rbac_eligibilities WHERE tenant = $1 AND role = $2 AND role LIKE 'custom.%'
+		  AND (expires_at IS NULL OR expires_at > $3)
+		ORDER BY 1, 2`, tenant, string(id), a.cfg.Now())
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[Scope])
 }
 
 // changesStopped returns why a constraint stops changing every grant of a custom role: one that
