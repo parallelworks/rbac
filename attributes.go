@@ -6,10 +6,11 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"time"
 	"unicode"
 
 	"cel.dev/cel-go/cel"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/traits"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoregistry"
@@ -27,10 +28,11 @@ import (
 // undeclared, read as any value under any name. Declared, they are read as fields, such as
 // `resource.attributes.env`, and named as identifiers.
 //
-// A condition reading an attribute a request doesn't carry, or carries declared as another type
-// than the Go value it passes, or as nil, is false when it runs, and a deny's applies: a declared
-// attribute passed so fails whatever reads it, comparing it with `!=` included. An undeclared
-// kind's are read as passed, and CEL compares values of different types as unequal.
+// A condition reading an attribute a request doesn't carry, or carries as a value CEL reads as
+// another type than it is declared, or as nil, is false when it runs, and a deny's applies: a
+// declared attribute passed so fails whatever reads it, comparing it with `!=`, or a map or list
+// holding it, included. An undeclared kind's are read as passed, and CEL compares values of
+// different types as unequal.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
@@ -38,30 +40,54 @@ type Attributes struct {
 // AttributeType is a declared attribute's type.
 type AttributeType string
 
-// takes reports whether v is the Go value a host passes for an attribute of type t.
+// takes reports whether CEL reads v as a value of type t, whatever Go type a host passes it as:
+// a named string type, or a []any of strings decoded from JSON, is a string or a list of them.
 func (t AttributeType) takes(v any) bool {
 	switch v.(type) {
-	case string:
-		return t == AttrString
-	case int, int64:
-		return t == AttrInt
-	case float64:
-		return t == AttrDouble
-	case bool:
-		return t == AttrBool
-	case time.Time:
-		return t == AttrTimestamp
-	case time.Duration:
-		return t == AttrDuration
 	case []string:
 		return t == AttrStrings
 	case map[string]string:
 		return t == AttrStringMap
 	}
+	switch v := types.DefaultTypeAdapter.NativeToValue(v).(type) {
+	case types.String:
+		return t == AttrString
+	case types.Int:
+		return t == AttrInt
+	case types.Double:
+		return t == AttrDouble
+	case types.Bool:
+		return t == AttrBool
+	case types.Timestamp:
+		return t == AttrTimestamp
+	case types.Duration:
+		return t == AttrDuration
+	case traits.Lister:
+		return t == AttrStrings && allStrings(v.Iterator(), nil)
+	case traits.Mapper:
+		return t == AttrStringMap && allStrings(v.Iterator(), v)
+	}
 	return false
 }
 
-// The types an attribute can be declared as, with the Go value a host passes for each.
+// allStrings reports whether it yields only strings, and m holds a string under each, if it is a map.
+func allStrings(it traits.Iterator, m traits.Mapper) bool {
+	for it.HasNext() == types.True {
+		k := it.Next()
+		if _, ok := k.(types.String); !ok {
+			return false
+		}
+		if m != nil {
+			if _, ok := m.Get(k).(types.String); !ok {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// The types an attribute can be declared as, with the Go value a host passes for each, or any
+// other CEL reads as that type, such as a pointer to one, or a []any or map[string]any of strings.
 const (
 	AttrString    AttributeType = "string"              // string
 	AttrInt       AttributeType = "int"                 // int or int64

@@ -305,16 +305,20 @@ func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 	var op func(x, y ref.Val) ref.Val
 	switch call.Function() {
 	case operators.Equals:
-		op = types.Equal
+		op = equal
 	case operators.NotEquals:
 		op = func(x, y ref.Val) ref.Val {
-			if eq, ok := types.Equal(x, y).(types.Bool); ok {
-				return !eq
+			eq := equal(x, y)
+			if b, ok := eq.(types.Bool); ok {
+				return !b
 			}
-			return types.NoSuchOverloadErr()
+			return eq
 		}
 	case operators.In:
 		op = func(x, y ref.Val) ref.Val {
+			if l, ok := y.(traits.Lister); ok {
+				return contains(l, x)
+			}
 			if c, ok := y.(traits.Container); ok {
 				return c.Contains(x)
 			}
@@ -333,6 +337,77 @@ func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 		}
 		return op(args[0], args[1])
 	}), nil
+}
+
+// equal is x == y, failing where comparing values a map or list holds fails, as reading a
+// declared attribute passed as another type does: CEL's own comparison of maps and lists counts
+// such a value as equal, so that a map holding one would equal any map with its keys.
+func equal(x, y ref.Val) ref.Val {
+	if types.IsUnknownOrError(x) {
+		return x
+	}
+	if types.IsUnknownOrError(y) {
+		return y
+	}
+	var failed ref.Val
+	same := func(a, b ref.Val) bool {
+		eq := equal(a, b)
+		if eq != types.False && eq != types.True && failed == nil {
+			failed = eq
+		}
+		return eq != types.False
+	}
+	switch xs := x.(type) {
+	case traits.Mapper:
+		ys, ok := y.(traits.Mapper)
+		if !ok || xs.Size() != ys.Size() {
+			return types.Equal(x, y)
+		}
+		for it := xs.Iterator(); it.HasNext() == types.True; {
+			k := it.Next()
+			b, found := ys.Find(k)
+			if !found {
+				return types.False
+			}
+			if a, _ := xs.Find(k); !same(a, b) {
+				return types.False
+			}
+		}
+	case traits.Lister:
+		ys, ok := y.(traits.Lister)
+		n, sized := xs.Size().(types.Int)
+		if !ok || !sized || ys.Size() != n {
+			return types.Equal(x, y)
+		}
+		for i := types.Int(0); i < n; i++ {
+			if !same(xs.Get(i), ys.Get(i)) {
+				return types.False
+			}
+		}
+	default:
+		return types.Equal(x, y)
+	}
+	if failed != nil {
+		return failed
+	}
+	return types.True
+}
+
+// contains is x in l, failing where comparing x with a value l holds fails and none equals it.
+func contains(l traits.Lister, x ref.Val) ref.Val {
+	var failed ref.Val
+	for it := l.Iterator(); it.HasNext() == types.True; {
+		switch eq := equal(x, it.Next()); {
+		case eq == types.True:
+			return eq
+		case eq != types.False && failed == nil:
+			failed = eq
+		}
+	}
+	if failed != nil {
+		return failed
+	}
+	return types.False
 }
 
 // smaller is the smaller of two values' sizes, counted no further than past limit. It reads both

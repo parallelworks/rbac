@@ -6,6 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
 	"github.com/parallelworks/rbac"
 )
 
@@ -46,23 +49,133 @@ func TestADeclaredAttributePassedAsAnotherTypeFailsItsConditions(t *testing.T) {
 	}
 }
 
+func TestADeclaredAttributePassedAsAnotherTypeFailsAComparisonOfWhatHoldsIt(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
+		c.Attributes = rbac.Attributes{Resource: map[string]rbac.AttributeType{"env": rbac.AttrString}}
+	})
+	ctx := t.Context()
+	// Each holds for env "dev": CEL's own comparison of maps and lists counts a value that fails
+	// as equal to anything.
+	grants := map[string]string{
+		"maps":        `dyn(resource.attributes) == {"env": "dev"}`,
+		"lists":       `[dyn(resource.attributes)] == [{"env": "dev"}]`,
+		"in a list":   `dyn(resource.attributes) in [{"env": "dev"}]`,
+		"maps unlike": `{"env": "prod"} != dyn(resource.attributes)`,
+	}
+	gs := []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "v"), grant(cluster.Scope(), "guard", rbac.User, "guardian")}
+	for id, expr := range grants {
+		g := grant(cluster.Scope(), "cluster.login", rbac.User, id)
+		g.Condition = rbac.Condition{Expression: expr}
+		gs = append(gs, g)
+	}
+	h.seed(t, gs...)
+	v := h.as(t, "v")
+	d := rbac.Deny{
+		ID: "prod", Principals: []rbac.Principal{v.Principal}, Permissions: []rbac.Permission{login},
+		Condition: rbac.Condition{Expression: `{"env": "prod"} == dyn(resource.attributes)`},
+	}
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, d); err != nil {
+		t.Fatal(err)
+	}
+	at := func(env any) rbac.Resource {
+		r := cluster
+		r.Attributes = map[string]any{"env": env}
+		return r
+	}
+	for id := range grants {
+		if !allowed(t, h, h.as(t, id), login, at("dev")) {
+			t.Errorf("%s: a string the condition takes", id)
+		}
+	}
+	if !allowed(t, h, v, login, at("dev")) {
+		t.Error("a deny's condition held for env dev")
+	}
+	for _, env := range []any{nil, 7, []string{"prod"}} {
+		for id := range grants {
+			if allowed(t, h, h.as(t, id), login, at(env)) {
+				t.Errorf("%s: a grant's condition held for env %#v", id, env)
+			}
+		}
+		if allowed(t, h, v, login, at(env)) {
+			t.Errorf("a deny's condition was lifted for env %#v", env)
+		}
+	}
+}
+
+func TestDeclaredAttributesChangedAfterNewAreReadAsDeclaredAtNew(t *testing.T) {
+	declared := map[string]rbac.AttributeType{"env": rbac.AttrString}
+	h := setup(t, func(c *rbac.Config) { c.Attributes = rbac.Attributes{Resource: declared} })
+	declared["env"] = rbac.AttrInt
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	g.Condition = rbac.Condition{Expression: `resource.attributes.env == "dev"`}
+	h.seed(t, g)
+	r := cluster
+	r.Attributes = map[string]any{"env": "dev"}
+	if !allowed(t, h, h.as(t, "u"), login, r) {
+		t.Error("an attribute checked as stored conditions read it")
+	}
+}
+
+// named is a Go type a host may pass an attribute as, which CEL reads as a string.
+type named string
+
+func TestADeclaredAttributeIsReadAsWhatCELReadsItAs(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Attributes = rbac.Attributes{Resource: map[string]rbac.AttributeType{
+			"env": rbac.AttrString, "size": rbac.AttrInt, "tags": rbac.AttrStrings, "labels": rbac.AttrStringMap,
+			"at": rbac.AttrTimestamp, "age": rbac.AttrDuration,
+		}}
+	})
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	g.Condition = rbac.Condition{Expression: `resource.attributes.env == "dev" && resource.attributes.size == 3 &&
+		"gpu" in resource.attributes.tags && resource.attributes.labels["team"] == "core" &&
+		resource.attributes.at < request.time && resource.attributes.age > duration("1m")`}
+	h.seed(t, g)
+	env := "dev"
+	r := cluster
+	// As decoded from JSON, or passed as pointers and protobuf values.
+	r.Attributes = map[string]any{
+		"env": named(env), "size": int32(3), "tags": []any{"gpu"}, "labels": map[string]any{"team": "core"},
+		"at": timestamppb.New(time.Unix(0, 0)), "age": durationpb.New(time.Hour),
+	}
+	if !allowed(t, h, h.as(t, "u"), login, r) {
+		t.Error("attributes CEL reads as their declared types")
+	}
+	r.Attributes["env"] = &env
+	if !allowed(t, h, h.as(t, "u"), login, r) {
+		t.Error("a pointer to a string")
+	}
+	// A list or map holding another type is another type.
+	r.Attributes["env"], r.Attributes["tags"] = "dev", []any{"gpu", 7}
+	if allowed(t, h, h.as(t, "u"), login, r) {
+		t.Error("a list holding an int read as a list of strings")
+	}
+	r.Attributes["tags"], r.Attributes["labels"] = []any{"gpu"}, map[string]any{"team": "core", "n": 7}
+	if allowed(t, h, h.as(t, "u"), login, r) {
+		t.Error("a map holding an int read as a map of strings")
+	}
+}
+
 // doubling is a condition that nests a list in itself k times, so it holds 2^k values, at little
 // cost, and then compares it with itself, which reads them all in one call.
-func doubling(k int) string {
-	return "[[1]]" + strings.Repeat(".map(x, [x, x])", k) + ".map(x, x == x)[0]"
+func doubling(k int, compare string) string {
+	return "[[1]]" + strings.Repeat(".map(x, [x, x])", k) + ".map(x, " + compare + ")[0]"
 }
 
 func TestAConditionComparingMoreThanItsCostIsRefusedBeforeItRuns(t *testing.T) {
 	h := setup(t)
-	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
-	g.Condition = rbac.Condition{Expression: doubling(24)}
-	h.seed(t, g)
-	start := time.Now()
-	if allowed(t, h, h.as(t, "u"), login, cluster) {
-		t.Fatal("a condition past its cost held")
-	}
-	if took := time.Since(start); took > time.Second {
-		t.Fatalf("a check took %s", took)
+	for id, compare := range map[string]string{"equal": "x == x", "unequal": "!(x != x)", "in": "x in [x]"} {
+		g := grant(cluster.Scope(), "cluster.login", rbac.User, id)
+		g.Condition = rbac.Condition{Expression: doubling(24, compare)}
+		h.seed(t, g)
+		start := time.Now()
+		if allowed(t, h, h.as(t, id), login, cluster) {
+			t.Errorf("%s: a condition past its cost held", id)
+		}
+		if took := time.Since(start); took > time.Second {
+			t.Errorf("%s: a check took %s", id, took)
+		}
 	}
 }
 
@@ -71,7 +184,7 @@ func TestAConditionNestedTooDeeplyIsRefused(t *testing.T) {
 	for name, expr := range map[string]string{
 		"lists":          strings.Repeat("[", 40) + strings.Repeat("]", 40) + " == []",
 		"parentheses":    strings.Repeat("(", 40) + "true" + strings.Repeat(")", 40),
-		"a chain of map": doubling(40),
+		"a chain of map": doubling(40, "x == x"),
 	} {
 		g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
 		g.Condition = rbac.Condition{Expression: expr}
