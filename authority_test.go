@@ -3,6 +3,7 @@ package rbac_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -724,6 +725,68 @@ func TestAChangeReadsTheStandingOfALargeGroupInRowsAsMany(t *testing.T) {
 		}
 		if r := rows(plan[0].Plan); r > 50*n {
 			t.Fatalf("reading the standing of a group of %d under %s passed %.0f rows through its plan", n, mode, r)
+		}
+	}
+}
+
+// A small group's members are read alone, however large the tenant's other groups, by a change
+// naming it, by Holders and by Holders as of a time: each statement reads the members of the groups
+// it reaches planned for those groups' own size.
+func TestASmallGroupsMembersAreReadAlone(t *testing.T) {
+	h := labeled(t, banks)
+	ctx := t.Context()
+	h.groups(t, "everyone", "admins")
+	for _, id := range []string{"a1", "a2", "a3"} {
+		h.as(t, id, "admins")
+	}
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "admins"))
+	// The pages of the members, and of history, that each reads, in a transaction it rolls back.
+	read := func(at time.Time) (change, holders, asOf int64) {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		start := pagesRead(ctx, t, tx, "rbac_members")
+		if err := h.authz.WithTx(tx).Import(ctx, host, "t1", []rbac.Grant{grant(rbac.TenantRoot("t1"), "bank.a", rbac.Group, "admins")}); err != nil {
+			t.Fatal(err)
+		}
+		mid := pagesRead(ctx, t, tx, "rbac_members")
+		if hs, err := h.authz.WithTx(tx).Holders(ctx, login, cluster); err != nil || len(hs) < 3 {
+			t.Fatalf("Holders = %+v, %v", hs, err)
+		}
+		change, holders = mid-start, pagesRead(ctx, t, tx, "rbac_members")-mid
+		if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+			start := pagesRead(ctx, t, tx, "rbac_history")
+			hs, err := a.Holders(ctx, login, cluster)
+			if err == nil && len(hs) < 3 {
+				err = fmt.Errorf("Holders as of now = %+v", hs)
+			}
+			asOf = pagesRead(ctx, t, tx, "rbac_history") - start
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return change, holders, asOf
+	}
+	others := func(n int) {
+		t.Helper()
+		manyMembers(t, h, n, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+			SELECT 't1', 'everyone', 'user', id FROM others`, "rbac_members", "rbac_history")
+	}
+	// Ten times as many others deepen the indexes, which each reads a few pages more of, but reading
+	// every member would take ten times the pages.
+	others(500)
+	change, holders, asOf := read(dbNow(t, h))
+	others(4500)
+	moreChange, moreHolders, moreAsOf := read(dbNow(t, h))
+	for _, c := range []struct {
+		what      string
+		few, many int64
+	}{{"a change naming it", change, moreChange}, {"Holders", holders, moreHolders}, {"Holders as of a time", asOf, moreAsOf}} {
+		if c.many > c.few*3/2 {
+			t.Errorf("%s read %d pages, and %d once 4500 more were in another group", c.what, c.few, c.many)
 		}
 	}
 }

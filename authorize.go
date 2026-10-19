@@ -731,7 +731,9 @@ func (a *Authorizer) boundByDenies(ctx context.Context, p Permission, r Resource
 
 // insideSQL is SQL defining, in a WITH RECURSIVE, inside(root, principal): the identities in each
 // of the groups, given as SQL for an array of their ids, directly or through groups in it, at now,
-// by the same memberships keysSQL reads up from an identity, in the tenant $1.
+// by the same memberships keysSQL reads up from an identity, in the tenant $1. The groups in groups
+// are few, but their identities can be many, so they are read by rbac_group_members, which plans
+// for the groups reached.
 func insideSQL(groups, now string) string {
 	return fmt.Sprintf(`down(root, id) AS (
 		  SELECT g, g COLLATE "C" FROM unnest(%[1]s::text[]) AS g
@@ -739,8 +741,8 @@ func insideSQL(groups, now string) string {
 		  SELECT d.root, m.principal_id FROM rbac_members m JOIN down d ON m.group_id = d.id
 		  WHERE m.tenant = $1 AND m.principal LIKE 'group:%%' AND (m.expires_at IS NULL OR m.expires_at > %[2]s)
 		), inside(root, principal) AS (
-		  SELECT d.root, m.principal FROM down d JOIN rbac_members m ON m.tenant = $1 AND m.group_id = d.id
-		  WHERE m.principal NOT LIKE 'group:%%' AND (m.expires_at IS NULL OR m.expires_at > %[2]s)
+		  SELECT d.root, m.principal COLLATE "C" FROM down d
+		  JOIN rbac_group_members($1, ARRAY(SELECT DISTINCT id FROM down), %[2]s) m ON m.group_id COLLATE "C" = d.id
 		)`, groups, now)
 }
 
