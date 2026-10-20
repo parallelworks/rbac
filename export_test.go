@@ -40,6 +40,15 @@ func SetMaxHistoryBytes(t *testing.T, n int) {
 	t.Cleanup(func() { maxHistoryBytes = old })
 }
 
+// SetMaxUnsized bounds the records one History call measures that no trigger counted to n until t
+// ends.
+func SetMaxUnsized(t *testing.T, n int) {
+	t.Helper()
+	old := maxUnsized
+	maxUnsized = n
+	t.Cleanup(func() { maxUnsized = old })
+}
+
 // SetExpiryBatch bounds what one of DeleteExpired's transactions deletes from a table to n until t
 // ends.
 func SetExpiryBatch(t *testing.T, n int) {

@@ -1559,6 +1559,37 @@ func TestHistoryReadsAboutMaxHistoryBytesAtOnce(t *testing.T) {
 	}
 }
 
+// Records no trigger counted the bytes of, as history written before they were counted, are each
+// measured by writing their rows out as JSON, so a read measures only so many of them, and stops at
+// the next, however small: the next read goes on from there.
+func TestHistoryMeasuresFewRecordsNoTriggerCounted(t *testing.T) {
+	rbac.SetMaxUnsized(t, 2)
+	h := setup(t)
+	ctx := t.Context()
+	var cursor rbac.Cursor
+	drain(t, h, &cursor, 1)
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_history (effective_at, tenant, entity, key, op, principal, after)
+		SELECT now(), 't1', 'grant', 'k' || i, 'create', 'user:u' || i, '{}' FROM generate_series(1, 5) i`); err != nil {
+		t.Fatal(err)
+	}
+	var pages []int
+	for deadline := time.Now().Add(10 * time.Second); len(pages) < 3 && time.Now().Before(deadline); {
+		got, next, err := h.authz.History(ctx, cursor, rbac.MaxHistory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) > 0 {
+			pages = append(pages, len(got))
+		} else {
+			time.Sleep(10 * time.Millisecond)
+		}
+		cursor = next
+	}
+	if !slices.Equal(pages, []int{2, 2, 1}) {
+		t.Fatalf("read pages of %v records", pages)
+	}
+}
+
 // A pool's connections can reach different servers, as an old primary and the new one after a
 // failover: History checks the cursor on the server it reads, which here doesn't hold its record.
 func TestHistoryChecksTheCursorWhereItReads(t *testing.T) {

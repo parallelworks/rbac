@@ -418,6 +418,11 @@ const (
 // maxHistoryBytes is MaxHistoryBytes, which a test lowers.
 var maxHistoryBytes = MaxHistoryBytes
 
+// maxUnsized is the most records one History call measures that no trigger counted the bytes of, as
+// history written before migration 0013 or a prune's own: measuring one writes its rows out as
+// JSON, so a call reads no more of them than this, and stops at the next. A test lowers it.
+var maxUnsized = 100
+
 // History reads up to limit records after a cursor, and the cursor after them, to export history
 // to storage of the host's own, but stops short of the record that would bring the bytes of their
 // rows' JSON and their text past MaxHistoryBytes, unless it is the first: a read of fewer than limit
@@ -461,28 +466,34 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 		}
 		// Of the records up to limit, those within the bytes, counted by what rbac_record counted of
 		// their rows, so the rows of those past them are never read; or, for one it didn't count, by
-		// its rows. Each text column is measured on its own, which reads a stored value's length
-		// without detoasting it, as joining them would.
+		// its rows, of at most maxUnsized such records, the next counted as past the bytes. Each text
+		// column is measured on its own, which reads a stored value's length without detoasting it,
+		// as joining them would.
 		rows, err := tx.Query(ctx, `
 			SELECT id, txid, recorded_at, effective_at, tenant, entity, key, op, coalesce(principal, ''), coalesce(role, ''),
 			  coalesce(scope, ''), coalesce(group_id, ''), expires_at, before, after, actor, on_behalf_of, how, request, reason, db_user
 			FROM (
 			  SELECT h.*, row_number() OVER w AS n,
-			    sum(coalesce(h.bytes, coalesce(pg_catalog.octet_length(h.before::pg_catalog.text), 0) + coalesce(pg_catalog.octet_length(h.after::pg_catalog.text), 0))
+			    sum(CASE WHEN h.bytes IS NOT NULL THEN h.bytes
+			        WHEN h.unsized <= $5 THEN coalesce(pg_catalog.octet_length(h.before::pg_catalog.text), 0) + coalesce(pg_catalog.octet_length(h.after::pg_catalog.text), 0)
+			        ELSE $4 + 1 END
 			      + pg_catalog.octet_length(h.tenant) + pg_catalog.octet_length(h.entity) + pg_catalog.octet_length(h.key) + pg_catalog.octet_length(h.op)
 			      + coalesce(pg_catalog.octet_length(h.principal), 0) + coalesce(pg_catalog.octet_length(h.role), 0)
 			      + coalesce(pg_catalog.octet_length(h.scope), 0) + coalesce(pg_catalog.octet_length(h.group_id), 0)
 			      + pg_catalog.octet_length(h.actor) + pg_catalog.octet_length(h.on_behalf_of) + pg_catalog.octet_length(h.how)
 			      + pg_catalog.octet_length(h.request) + pg_catalog.octet_length(h.reason) + pg_catalog.octet_length(h.db_user)) OVER w AS reached
 			  FROM (
-			    SELECT * FROM `+historyTable(schema)+`
-			    WHERE (txid, id) > ($1::pg_catalog.xid8, $2) AND txid < pg_snapshot_xmin(pg_current_snapshot())
-			    ORDER BY txid, id LIMIT $3
+			    SELECT h.*, count(*) FILTER (WHERE h.bytes IS NULL) OVER (ORDER BY h.txid, h.id ROWS UNBOUNDED PRECEDING) AS unsized
+			    FROM (
+			      SELECT * FROM `+historyTable(schema)+`
+			      WHERE (txid, id) > ($1::pg_catalog.xid8, $2) AND txid < pg_snapshot_xmin(pg_current_snapshot())
+			      ORDER BY txid, id LIMIT $3
+			    ) h
 			  ) h
 			  WINDOW w AS (ORDER BY h.txid, h.id ROWS UNBOUNDED PRECEDING)
 			) p
 			WHERE n = 1 OR reached <= $4
-			ORDER BY txid, id`, after.TxID, after.ID, limit, maxHistoryBytes)
+			ORDER BY txid, id`, after.TxID, after.ID, limit, maxHistoryBytes, maxUnsized)
 		if err != nil {
 			return err
 		}
