@@ -308,7 +308,8 @@ func (h Holding) changed(ps map[Permission]bool, held bool) Holding {
 }
 
 // Holding returns the label values s holds in a tenant: those its grants give it on the tenant,
-// decided as Permissions decides them, with ctx's request for their conditions.
+// decided as Permissions decides them, with ctx's request for their conditions, on the tenant
+// without attributes or a label (decidedOn).
 func (a *Authorizer) Holding(ctx context.Context, tenant string, s Subject) (Holding, error) {
 	if !validID(tenant) {
 		return Holding{}, fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -324,7 +325,30 @@ func (a *Authorizer) Holding(ctx context.Context, tenant string, s Subject) (Hol
 // asked without the request's attributes, which a read without the request, as Holders, can't
 // settle.
 func (a *Authorizer) holding(ctx context.Context, tenant string, s Subject) (Holding, map[Permission]bool, error) {
-	return a.holdingOn(ctx, a.db, s, a.constrain(ctx, s, Resource{Tenant: tenant, Type: TenantScope, ID: tenant}))
+	return a.holdingOn(ctx, a.db, s, a.constrain(ctx, s, tenantResource(tenant)))
+}
+
+// tenantResource is the tenant as a resource with no attributes, ancestors or label.
+func tenantResource(tenant string) Resource {
+	return Resource{Tenant: tenant, Type: TenantScope, ID: tenant}
+}
+
+// labelPermission reports whether p is a label value or a power to release.
+func (a *Authorizer) labelPermission(p Permission) bool {
+	t, _ := p.parts()
+	_, ok := a.labels[t]
+	return ok
+}
+
+// decidedOn is the resource a check of p on r decides it on: r, but for a label value or a power
+// to release on the tenant, which is decided on the tenant without the attributes, ancestors or
+// label passed, as Holding reads it for every labeled check, which can't know what tenant the host
+// means. So a check of a value and a check of a label agree on whether the subject holds it.
+func (a *Authorizer) decidedOn(p Permission, r Resource) Resource {
+	if r.Type == TenantScope && a.labelPermission(p) {
+		return tenantResource(r.Tenant)
+	}
+	return r
 }
 
 // holdingOn is holding read on q, asking the constraints through cs, which is on the tenant.
@@ -336,8 +360,7 @@ func (a *Authorizer) holdingOn(ctx context.Context, q DB, s Subject, cs *constra
 	}
 	// Only the values and the powers to release, so neither the constraints nor the conditions of
 	// the tenant's other permissions are asked about.
-	value := func(p Permission) bool { t, _ := p.parts(); _, ok := a.labels[t]; return ok }
-	perms, byCondition, excluded, err := a.permissionsOf(ctx, q, s, cs.on, value, cs)
+	perms, byCondition, excluded, err := a.permissionsOf(ctx, q, s, cs.on, a.labelPermission, cs)
 	if err != nil {
 		return Holding{}, nil, err
 	}

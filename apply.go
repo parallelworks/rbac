@@ -887,7 +887,7 @@ func (c *constrained) seal() {
 // ofTenant is what the constraints remove from the actor on its tenant, sealed as c is.
 func (c *constrained) ofTenant() *constrained {
 	if c.tenant == nil {
-		c.tenant = c.a.constrain(c.ctx, c.actor, Resource{Tenant: c.on.Tenant, Type: TenantScope, ID: c.on.Tenant})
+		c.tenant = c.a.constrain(c.ctx, c.actor, tenantResource(c.on.Tenant))
 		c.tenant.sealed = c.sealed
 	}
 	return c.tenant
@@ -914,7 +914,10 @@ func (c *constrained) removes(p Permission, resourceType string) bool {
 		return true
 	}
 	// denied asks each hook about copies of its own, so none can change what later ones are asked.
-	name, err := c.a.denied(c.ctx, ConstraintInput{Tenant: c.on.Tenant, ResourceType: resourceType, Permission: p, Subject: &c.actor, Resource: &c.on})
+	// A label value is asked about as checks decide it, or an actor could hand on, through a tenant
+	// passed with attributes, one it can't use.
+	on := c.a.decidedOn(p, c.on)
+	name, err := c.a.denied(c.ctx, ConstraintInput{Tenant: c.on.Tenant, ResourceType: resourceType, Permission: p, Subject: &c.actor, Resource: &on})
 	if err != nil {
 		c.err = err
 	}
@@ -1695,18 +1698,23 @@ type conditionBucket struct{ scope, principal, source string }
 func (a *Authorizer) bucketsOf(grants []Grant) []conditionBucket {
 	var buckets []conditionBucket
 	for _, g := range grants {
-		b := conditionBucket{g.Scope.Key(), g.Principal.key(), ""}
-		if reachesMany(g.Principal) {
-			b.principal = ""
-		}
-		if a.owned[g.Source] {
-			b.source = g.Source
-		}
-		if g.Condition.Expression != "" && !slices.Contains(buckets, b) {
+		if b := a.bucketOf(g.Scope, g.Principal, g.Source); g.Condition.Expression != "" && !slices.Contains(buckets, b) {
 			buckets = append(buckets, b)
 		}
 	}
 	return buckets
+}
+
+// bucketOf is the bucket of a conditional grant on a scope to p from source.
+func (a *Authorizer) bucketOf(scope Scope, p Principal, source string) conditionBucket {
+	b := conditionBucket{scope.Key(), p.key(), ""}
+	if reachesMany(p) {
+		b.principal = ""
+	}
+	if a.owned[source] {
+		b.source = source
+	}
+	return b
 }
 
 // conditionsIn reads on tx how many times a check may evaluate each condition of the grants in

@@ -926,7 +926,7 @@ func (a *Authorizer) groupLabeled(ctx context.Context, tenant, id string, labels
 // tenantLabels is what the constraints remove of actor's label values in a tenant, for
 // mayManageGroups to ask before a change's transaction and read back in it.
 func (a *Authorizer) tenantLabels(ctx context.Context, actor Subject, tenant string) *constrained {
-	return a.constrain(ctx, actor, Resource{Tenant: tenant, Type: TenantScope, ID: tenant})
+	return a.constrain(ctx, actor, tenantResource(tenant))
 }
 
 // Groups lists a tenant's groups, by id. It has no limit or cursor, so what it returns grows with
@@ -959,6 +959,19 @@ func collectGroups(rows pgx.Rows) ([]GroupDefinition, error) {
 func (a *Authorizer) clearsAll(ctx context.Context, q DB, labels *constrained) (bool, error) {
 	h, err := labels.holding(ctx, q)
 	return err == nil && h.clearsAll(), err
+}
+
+// stillClearsAll refuses, read on q in a change's transaction, a change that found the actor's
+// label values satisfying every label before it, which no longer do.
+func (a *Authorizer) stillClearsAll(ctx context.Context, q DB, labels *constrained) error {
+	all, err := a.clearsAll(ctx, q, labels)
+	if err != nil {
+		return err
+	}
+	if !all {
+		return fmt.Errorf("%w: the actor's label values changed while this change waited; try again", ErrConflict)
+	}
+	return nil
 }
 
 // groupKey is the scope key of a group, which changes to it lock.
@@ -1943,12 +1956,8 @@ func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject
 	}
 	clearance := a.labelCheck(ctx, tx, labels)
 	if slices.ContainsFunc(checks, func(c *reachCheck) bool { return c.cleared }) {
-		all, err := a.clearsAll(ctx, tx, labels)
-		if err != nil {
+		if err := a.stillClearsAll(ctx, tx, labels); err != nil {
 			return err
-		}
-		if !all {
-			return fmt.Errorf("%w: the actor's label values changed while this change waited; try again", ErrConflict)
 		}
 	}
 	for i, c := range checks {

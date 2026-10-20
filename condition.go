@@ -33,12 +33,15 @@ import (
 //	action                                                    // the permission asked for
 //
 // such as `request.time < timestamp("2027-01-01T00:00:00Z") && resource.attributes.env != "prod"`.
-// A grant with one gives its role only where the expression is true. An expression that fails,
-// as one reading an attribute the host didn't pass does, or comparing a double that isn't finite,
-// as dividing by zero makes, is false. The zero Condition is none, and one with a title or
-// description has an expression. A pattern it matches is a string literal, of bounded size; it
-// nests at most 32 deep; and a comparison, or a search of a list, that would read more than a
-// condition may spend fails before it runs.
+// A grant with one gives its role only where the expression is true. An expression that fails, as
+// one reading an attribute the host didn't pass does, or comparing a double that isn't finite, as
+// dividing by zero makes, is false. A label value and a power to release are decided on the tenant
+// with no attributes, whatever a check passes (Holding), and their conditions can't read the
+// tenant's: any read of resource.attributes fails, a test of an attribute's presence, in, size(), a
+// macro and a comparison included, so a grant's gives nothing and a deny's applies. The zero
+// Condition is none, and one with a title or description has an expression. A pattern it matches is
+// a string literal, of bounded size; it nests at most 32 deep; and a comparison, or a search of a
+// list, that would read more than a condition may spend fails before it runs.
 //
 // Each condition runs within the most evaluating it can cost, which its literals and types bound:
 // little for one comparing what a request passes with literals, whatever it passes, and all a
@@ -49,17 +52,18 @@ import (
 // grants to groups, the tenant's members and the public, which reach many, as much again, those
 // from each source the host owns (Config.Sources) apart from the rest; those of a scope's denies
 // (SetDeny); and the requirements of the eligibilities of groups for a role on a scope. Each
-// distinct condition counts once, as what compiling it and the most evaluating it can cost: hundreds
-// of comparisons with literals, or three of the longest that read a list or loop. A check of a
-// labeled resource decides each of the subject's label values as a check of it would, and
+// distinct condition counts once, as what compiling it and the most evaluating it can cost:
+// hundreds of comparisons with literals, or three of the longest that read a list or loop. A check
+// of a labeled resource decides each of the subject's label values as a check of it would, and
 // evaluates a condition that doesn't read the action once for them all, so on the tenant one that
 // does counts once for each label value its grants give or its denies deny. A change adding a
-// condition past a bound, or one evaluated more, is refused as invalid, so no grant, deny or
-// eligibility stored changes what the others decide, but one adding none isn't: conditions stored
-// past a bound before there were bounds can be rewritten in place, as by a restore over the rows
-// still stored, though restored where those are gone, they are added, and refused. A check may not
-// reach all of those, or of those of a custom role widened since: it evaluates the cheapest first,
-// and past its budget a grant's condition is false and a deny's applies.
+// condition past a bound, or one evaluated more, as by redefining a role to give more label values
+// (SetRole), is refused as invalid, so no grant, deny or eligibility stored changes what the others
+// decide, but one adding none isn't: conditions stored past a bound before there were bounds can be
+// rewritten in place, as by a restore over the rows still stored, though restored where those are
+// gone, they are added, and refused. A check may not reach all of those, or of those of a role a
+// catalog change widened since: it evaluates the cheapest first, and past its budget a grant's
+// condition is false and a deny's applies.
 //
 // Searches (Filter, Reachable, Holders) can't evaluate one: Filter and Reachable count only
 // unconditional grants, Filter counts a conditional deny as denying, and Reach.Conditional and
@@ -1115,13 +1119,28 @@ func WithRequest(ctx context.Context, attributes map[string]any) context.Context
 // vars is what a condition reads when s asks to do p to r.
 func (a *Authorizer) vars(ctx context.Context, s Subject, p Permission, r Resource) map[string]any {
 	request, _ := ctx.Value(requestKey{}).(map[string]any)
+	resource := map[string]any{"type": r.Type, "id": r.ID, "tenant": r.Tenant, "attributes": declared(a.cfg.Attributes.Resource, r.Attributes)}
+	if r.Type == TenantScope && a.labelPermission(p) {
+		resource = valueResource(r.Tenant)
+	}
 	return map[string]any{
 		"subject":  map[string]any{"kind": string(s.Principal.Kind), "id": s.Principal.ID, "attributes": declared(a.cfg.Attributes.Subject, s.Attributes)},
-		"resource": map[string]any{"type": r.Type, "id": r.ID, "tenant": r.Tenant, "attributes": declared(a.cfg.Attributes.Resource, r.Attributes)},
+		"resource": resource,
 		"request":  map[string]any{"time": a.cfg.Now(), "attributes": declared(a.cfg.Attributes.Request, request)},
 		"action":   string(p),
 	}
 }
+
+// valueResource is the tenant as a condition deciding a label value or a power to release reads
+// it: by its type and id, as checks decide those on it bare (decidedOn), and with attributes that
+// refuse every read. Empty, a test of an attribute's presence would hold for what the bare tenant
+// lacks, so a deny guarded by one would lift while the host's tenant has it.
+func valueResource(tenant string) map[string]any {
+	return map[string]any{"type": TenantScope, "id": tenant, "tenant": tenant, "attributes": unreadable}
+}
+
+// unreadable are attributes a condition reads none of.
+var unreadable = refusedAttributes{Mapper: types.NewStringInterfaceMap(types.DefaultTypeAdapter, map[string]any{}), all: true}
 
 // declared is attributes as conditions read them: each one as declares it, passed as another Go
 // value than its type takes or as none, and each one a declared kind doesn't declare, made an
@@ -1153,7 +1172,7 @@ func declared(declares map[string]AttributeType, attributes map[string]any) any 
 	if typed == nil {
 		return attributes
 	}
-	return refusedAttributes{types.NewStringInterfaceMap(types.DefaultTypeAdapter, typed)}
+	return refusedAttributes{Mapper: types.NewStringInterfaceMap(types.DefaultTypeAdapter, typed)}
 }
 
 // refusedAttributes are a kind's attributes with some refused, as conditions read them. A refused
@@ -1163,6 +1182,16 @@ func declared(declares map[string]AttributeType, attributes map[string]any) any 
 // refused name from one never passed.
 type refusedAttributes struct {
 	traits.Mapper
+	// all refuses every name, passed or not.
+	all bool
+}
+
+// Find fails for a refused name, and with all, for any name, so a test of its presence fails too.
+func (r refusedAttributes) Find(k ref.Val) (ref.Val, bool) {
+	if r.all {
+		return refusal(), true
+	}
+	return r.Mapper.Find(k)
 }
 
 // refusedAttributesType has none of a map's traits, so CEL has no size(), in or macro for it.

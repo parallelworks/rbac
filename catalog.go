@@ -186,11 +186,7 @@ func (a *Authorizer) grantableOn(r RoleDefinition, scopeType string) bool {
 
 // givesLabels reports whether a role gives a label value.
 func (a *Authorizer) givesLabels(r RoleDefinition) bool {
-	return slices.ContainsFunc(r.Permissions, func(p Permission) bool {
-		t, _ := p.parts()
-		_, ok := a.labels[t]
-		return ok
-	})
+	return slices.ContainsFunc(r.Permissions, a.labelPermission)
 }
 
 // giving lists the ids of the roles that give p on a resource type.

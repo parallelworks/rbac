@@ -259,7 +259,10 @@ func canonical(r RoleDefinition) RoleDefinition {
 // eligibilities in force that gives anything as the role will be (ViaRedefinition), and refusing
 // any refuses the redefinition, as granting the role so would be refused. Narrowing a role asks
 // about none. One made while this waited for the tenant refuses it too, to be tried again, as the
-// host wasn't asked about it.
+// host wasn't asked about it. Redefining it to give more label values or powers to release is
+// refused as invalid where a condition of its grants on the tenant that reads the action, which
+// counts once for each (Condition), would leave theirs costing more than a check may spend, as
+// granting it so would be refused.
 func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, r RoleDefinition) (err error) {
 	defer a.refused(ctx, &err, tenant, actor.Principal, "SetRole")
 	if !validID(tenant) {
@@ -268,7 +271,7 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 	if err := a.subject(actor); err != nil {
 		return err
 	}
-	root := Resource{Tenant: tenant, Type: TenantScope, ID: tenant}
+	root := tenantResource(tenant)
 	// Whether the actor may define roles at all, before the definition, so a refused actor
 	// learns nothing of the catalog from what is invalid.
 	if _, err := a.mayDefineRoles(ctx, actor, root); err != nil {
@@ -364,6 +367,19 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 		if others >= MaxCustomRoles {
 			return ChangeEvent{}, fmt.Errorf("%w: a tenant has at most %d custom roles", ErrInvalid, MaxCustomRoles)
 		}
+		// A condition of its grants that reads the action counts once for each label value and power
+		// to release they give (conditionsIn), so giving more can leave a bucket on the tenant past
+		// what a check may spend, as no grant stored there could.
+		var buckets []conditionBucket
+		var before map[conditionBucket]map[string]int
+		if a.givesMoreLabels(old, after) {
+			if buckets, err = a.tenantBuckets(ctx, tx, tenant, r.ID); err != nil {
+				return ChangeEvent{}, err
+			}
+			if before, err = a.conditionsIn(ctx, tx, tenant, buckets); err != nil {
+				return ChangeEvent{}, err
+			}
+		}
 		perms := make([]string, len(r.Permissions))
 		for i, p := range r.Permissions {
 			perms[i] = string(p)
@@ -387,8 +403,42 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 		if err != nil || tag.RowsAffected() == 0 {
 			return ChangeEvent{}, err
 		}
+		if err := a.conditionsBounded(ctx, tx, tenant, buckets, before); err != nil {
+			return ChangeEvent{}, err
+		}
 		return ChangeEvent{Roles: []RoleDefinition{r}}, nil
 	})
+}
+
+// givesMoreLabels reports whether a role defined as now gives a label value or a power to release
+// that it didn't as was.
+func (a *Authorizer) givesMoreLabels(was, now RoleDefinition) bool {
+	return slices.ContainsFunc(now.Permissions, func(p Permission) bool { return a.labelPermission(p) && !slices.Contains(was.Permissions, p) })
+}
+
+// tenantBuckets reads, on q, the buckets of a custom role's conditional grants in force on the
+// tenant, where what they give of label values is held.
+func (a *Authorizer) tenantBuckets(ctx context.Context, q DB, tenant string, id Role) ([]conditionBucket, error) {
+	// The LIKE matches the partial index on custom roles' grants.
+	rows, err := q.Query(ctx, `SELECT DISTINCT principal_kind, principal_id, source FROM rbac_grants
+		WHERE tenant = $1 AND role = $2 AND role LIKE 'custom.%' AND scope = $3 AND conditional
+		  AND (expires_at IS NULL OR expires_at > $4)
+		ORDER BY 1, 2, 3`, tenant, string(id), TenantRoot(tenant).Key(), a.cfg.Now())
+	if err != nil {
+		return nil, err
+	}
+	seen := map[conditionBucket]bool{}
+	var buckets []conditionBucket
+	var p Principal
+	var source string
+	_, err = pgx.ForEachRow(rows, []any{&p.Kind, &p.ID, &source}, func() error {
+		if b := a.bucketOf(TenantRoot(tenant), p, source); !seen[b] {
+			seen[b] = true
+			buckets = append(buckets, b)
+		}
+		return nil
+	})
+	return buckets, err
 }
 
 // DeleteRole deletes a tenant's custom role and every grant and eligibility of it, as actor, who
@@ -405,7 +455,7 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 	if err := a.subject(actor); err != nil {
 		return err
 	}
-	root := Resource{Tenant: tenant, Type: TenantScope, ID: tenant}
+	root := tenantResource(tenant)
 	au, err := a.mayDefineRoles(ctx, actor, root)
 	if err != nil {
 		return err
@@ -649,18 +699,21 @@ func (a *Authorizer) revalidate(ctx context.Context, actor Subject, tenant strin
 
 // labeling is what labelsAllow checked: the scopes a custom role's grants and eligibilities are
 // on, the resources of those whose label asks for values, and the constraints' answers about the
-// actor's, which stillLabeled reads back.
+// actor's, which stillLabeled reads back; or that the actor's satisfy every label, cleared.
 type labeling struct {
 	scopes  []Scope
 	labeled []Resource
 	cs      *constrained
+	cleared bool
 }
 
 // labelsAllow refuses changing what a custom role's grants and eligibilities give, or revoking
 // them, to an actor that a label of a scope they are on refuses, as Apply refuses changing grants
 // there: read before the change's transaction, as labels are the host's; with removing, as for
-// deleting the role, a scope the host no longer has (ErrNotFound) as unlabeled. It returns what it
-// checked, which stillLabeled reads again under the change's lock.
+// deleting the role, a scope the host no longer has (ErrNotFound) as unlabeled, and none asked
+// about where the actor's label values satisfy every label, as ChangeMembers asks about none a
+// removal alone reaches. It returns what it checked, which stillLabeled reads again under the
+// change's lock.
 func (a *Authorizer) labelsAllow(ctx context.Context, actor Subject, tenant string, id Role, removing bool) (labeling, error) {
 	if len(a.labels) == 0 {
 		return labeling{}, nil
@@ -669,7 +722,12 @@ func (a *Authorizer) labelsAllow(ctx context.Context, actor Subject, tenant stri
 	if err != nil {
 		return labeling{}, err
 	}
-	l := labeling{scopes: scopes, cs: a.constrain(ctx, actor, Resource{Tenant: tenant, Type: TenantScope, ID: tenant})}
+	l := labeling{scopes: scopes, cs: a.constrain(ctx, actor, tenantResource(tenant))}
+	if removing && len(scopes) > 0 {
+		if l.cleared, err = a.clearsAll(ctx, a.db, l.cs); err != nil || l.cleared {
+			return l, err
+		}
+	}
 	for _, s := range scopes {
 		on, err := a.resourceOf(ctx, tenant, s)
 		switch {
@@ -699,10 +757,15 @@ func (a *Authorizer) labelsHeld(ctx context.Context, q DB, l labeling) error {
 
 // stillLabeled refuses, under the tenant's lock, a change labelsAllow checked whose role is now
 // granted on a scope it didn't check, as one granted there while the change waited, or whose
-// actor no longer holds the values a label of one asks for, as one revoked meanwhile.
+// actor no longer holds the values a label of one asks for, as one revoked meanwhile, or, where
+// they satisfied every label, no longer does.
 func (a *Authorizer) stillLabeled(ctx context.Context, tx pgx.Tx, tenant string, id Role, checked labeling) error {
 	if len(a.labels) == 0 {
 		return nil
+	}
+	if checked.cleared {
+		checked.cs.seal()
+		return a.stillClearsAll(ctx, tx, checked.cs)
 	}
 	scopes, err := a.roleScopes(ctx, tx, tenant, id)
 	if err != nil {

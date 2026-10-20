@@ -337,7 +337,8 @@ type Resource struct {
 	// resource is stored, as its path, never from request input.
 	Attributes map[string]any
 	// Labels is its label, which a subject's holding must satisfy, whatever its grants give, for
-	// a check to allow anything (Config.Labels). Store it with the resource, as its path. A check
+	// a check to allow anything (Config.Labels) but, on the tenant, a label value or a power to
+	// release, which checks decide without it. Store it with the resource, as its path. A check
 	// reads the resource's own, not its ancestors': label what a labeled container holds too.
 	Labels Label
 }
@@ -520,7 +521,9 @@ type Constraint struct {
 // resource, their attributes, ancestors and label too, however deep, so one writing to them
 // changes nothing decided. A host's struct among the attributes is copied by its exported fields
 // and those an unexported struct it embeds promotes: the rest, a pointer it embeds unexported and
-// the fields that promotes among them, reflection can't set, so they are shared.
+// the fields that promotes among them, reflection can't set, so they are shared. A map's keys are
+// shared, and what a pointer among them reaches, as a copied key would be another key: key a map
+// among the attributes by values, not pointers, or write through none.
 type ConstraintInput struct {
 	Tenant       string
 	ResourceType string
@@ -530,13 +533,17 @@ type ConstraintInput struct {
 	// labeled resource: answer true there if the constraint removes it from that principal with any.
 	// Authorizer.GroupsOf reads the groups it is in, even while its membership is suspended.
 	Subject *Subject
-	// Resource is what is asked about, with its ancestors and attributes; for what a change hands
-	// on, the scope it is on, whose type is a container's or the tenant's where what it hands on
-	// reaches the resources of ResourceType under it. There, answer true if the constraint removes
-	// the permission on any of them: one that tells them apart by id or attributes sees only the
-	// scope, and would let the actor hand on what it can't use on them. It is nil in Filter and
-	// Reachable, and in SetRole and DeleteRole, which change grants on every scope of a type, but
-	// for what SetRole's role gives, asked about the tenant.
+	// Resource is what is asked about, with its ancestors and attributes, but for a label value or a
+	// power to release on the tenant, which every check decides, and a change hands on, on the tenant
+	// with no attributes, ancestors or label, whatever it is passed, as Holding reads them, and whose
+	// conditions can't read the tenant's attributes, any read making a grant's give nothing and a
+	// deny's apply: read the tenant's state through q. For what else a change hands on, it is the
+	// scope it is on, whose type is a container's or the tenant's where what it hands on reaches the
+	// resources of ResourceType under it. There, answer true if the constraint removes the permission
+	// on any of them: one that tells them apart by id or attributes sees only the scope, and would let
+	// the actor hand on what it can't use on them. It is nil in Filter and Reachable, and in SetRole
+	// and DeleteRole, which change grants on every scope of a type, but for what SetRole's role gives,
+	// asked about the tenant.
 	Resource *Resource
 }
 
@@ -683,8 +690,9 @@ type Config struct {
 	// on a scope other than the tenant or a group, no ContainerTypes. For any other, that change is
 	// refused. SetRole changing what a custom role's grants give, and DeleteRole, check the label of
 	// each scope the role is granted on as it returns it, so with Labels declared they need it too. A
-	// removal reads a scope it reports as ErrNotFound as unlabeled, and ChangeMembers asks nothing of
-	// the scopes only a removal reaches where the actor's label values satisfy every label.
+	// removal reads a scope it reports as ErrNotFound as unlabeled, and ChangeMembers and DeleteRole
+	// ask nothing of the scopes only a removal reaches where the actor's label values satisfy every
+	// label.
 	ResourceOf func(ctx context.Context, tenant string, s Scope) (Resource, error)
 	// Permissions are every permission the host checks, whether or not a role gives it, so that a
 	// catalog leaving one out, as one an operator configures may, refuses it like any permission

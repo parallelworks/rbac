@@ -5417,6 +5417,11 @@ func TestDefiningARoleCreatedWhileItWaitsAsksTheConstraintsAgain(t *testing.T) {
 	}
 	wider := op
 	wider.Permissions = []rbac.Permission{view, login}
+	// The host's transaction, whose locks SetRole waits on, not another's on the server.
+	var pid int32
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
 	done := make(chan error, 1)
 	go func() { done <- h.authz.SetRole(ctx, admin, "t1", wider) }()
 	for waiting := false; !waiting; {
@@ -5425,7 +5430,7 @@ func TestDefiningARoleCreatedWhileItWaitsAsksTheConstraintsAgain(t *testing.T) {
 			t.Fatalf("SetRole didn't wait for the host: %v", err)
 		default:
 			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
-				WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE '%/rbac/%')`).Scan(&waiting); err != nil {
+				WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND $1::int = ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
 				t.Fatal(err)
 			}
 		}

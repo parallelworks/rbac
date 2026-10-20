@@ -99,25 +99,33 @@ names the scopes conditional ones reach, to check one by one.
 ## Policies
 
 - **Custom roles:** a tenant defines its own with `SetRole`, ids starting `custom.`, from the
-  permissions and types the built-in roles use. Defining one needs `rbac.DefineRoles` on the
-  tenant and everything the role gives across it. Redefining one so that its grants give more
-  asks `ValidateGrant` about each grant and eligibility it widens, as the role will be, and the
-  host refusing one refuses the redefinition; an actor a label of a scope its grants are on, as
-  `Config.ResourceOf` gives it, refuses can neither redefine nor delete it. `DeleteRole` removes
-  one with its grants; `Roles` lists the built-in and custom roles a scope type takes. Custom
-  roles follow the catalog: one gives only what the catalog still has, and is privileged when it
-  gives what only privileged roles do, or changes access.
+  permissions and types the built-in roles use. Defining one needs `rbac.DefineRoles` on the tenant
+  and everything the role gives across it. Redefining one so that its grants give more asks
+  `ValidateGrant` about each grant and eligibility it widens, as the role will be, and the host
+  refusing one refuses the redefinition, as is one giving more label values where a condition of its
+  grants on the tenant reading the action would then cost a check more than it may spend; an actor a
+  label of a scope its grants are on, as `Config.ResourceOf` gives it, refuses can neither redefine
+  nor delete it. `DeleteRole` removes one with its grants; `Roles` lists the built-in and custom
+  roles a scope type takes. Custom roles follow the catalog: one gives only what the catalog still
+  has, and is privileged when it gives what only privileged roles do, or changes access.
 - **Labels on data:** a mandatory layer above every grant. A host declares label dimensions
   (`Config.Labels`), each `Ordered` (a level), `AllOf` (compartments) or `AnyOf` (releasable to
-  these partners), and a resource carries its label (`Resource.Labels`), stored with it as its
-  path is. A subject holds a dimension's values as permissions, `dimension:value`, which roles for
-  the tenant give, so groups, eligibilities, expiry, conditions, denies on the tenant and history
-  all apply to them. `Authorize`, `Explain`, `Permissions`, `Holders` and `Grantable` allow
-  nothing of a labeled resource unless what the subject holds satisfies the label, whatever its
-  grants give, nor do `Apply`, `SetEligibility` and `DeleteEligibility` change its grants, nor
-  `SetDeny` and `DeleteDeny` its denies, nor `SetRole` and `DeleteRole` the grants of a role on it,
-  nor `ChangeMembers` the members of a labeled group, or of one holding access or exempt from a deny
-  on a labeled scope, nor `SetGroup` and `DeleteGroup` a labeled group or the groups of a labeled
+  these partners), and a resource carries its label (`Resource.Labels`), stored with it as its path
+  is. A subject holds a dimension's values as permissions, `dimension:value`, which roles for the
+  tenant give, so groups, eligibilities, expiry, conditions, denies on the tenant and history all
+  apply to them. Every check decides them, and the powers to release, on the tenant with no
+  attributes or label, whatever tenant it is passed, as a check of a labeled resource reads them,
+  and a change hands one on only as the actor holds it there: a condition of theirs can't read the
+  tenant's attributes, only `resource.type`, `.id` and `.tenant`, and any read of
+  `resource.attributes`, a test of an attribute's presence, `in`, `size()`, a macro or a comparison
+  included, fails, so a grant's gives nothing and a deny's applies; and a constraint is asked about
+  that bare tenant, so one deciding them by the tenant's state reads it through its `q`.
+  `Authorize`, `Explain`, `Permissions`, `Holders` and `Grantable` allow nothing else of a labeled
+  resource unless what the subject holds satisfies the label, whatever its grants give, nor do
+  `Apply`, `SetEligibility` and `DeleteEligibility` change its grants, nor `SetDeny` and
+  `DeleteDeny` its denies, nor `SetRole` and `DeleteRole` the grants of a role on it, nor
+  `ChangeMembers` the members of a labeled group, or of one holding access or exempt from a deny on
+  a labeled scope, nor `SetGroup` and `DeleteGroup` a labeled group or the groups of a labeled
   tenant, each reading the actor's values again under the change's locks; `Explain` names the
   dimension that failed. `Filter` tests a `text[]` label column (`Columns.Labels`), which needs no
   index, as the path's drives the query; `Reachable` returns the holding, and `Holding` with
@@ -257,11 +265,13 @@ names the scopes conditional ones reach, to check one by one.
 
 ## Why
 
-`Explain` names the grants that allow, or the deny or constraint that denied; `Permissions` lists
-what a subject may do; `Holders` lists who may, for an access review: each identity, through its own
-grants and its groups', and the tenant's members and the public as one holder each, marking those
-that hold only under a condition or that a deny or constraint may bind. A `DeniedError`'s message
-names only the permission, so an error shown to a user shows no policy; its fields say why.
+`Explain` names the grants that allow, or the deny, the constraint or the label's dimension that
+denied, or for a value of an exclusive dimension the subject holds none of, that dimension;
+`Permissions` lists what a subject may do; `Holders` lists who may, for an access review: each
+identity, through its own grants and its groups', and the tenant's members and the public as one
+holder each, marking those that hold only under a condition or that a deny or constraint may bind. A
+`DeniedError`'s message names only the permission, so an error shown to a user shows no policy; its
+fields say why.
 
 ## History
 
