@@ -215,15 +215,15 @@ reach, to check one by one.
   nests it in too, which the actor must be able to grant it, until its place ends, and an
   eligibility for good, and `ValidateGrant` is asked about each as the member's
   (`rbac.ViaMembership`); it approves what the group approves, which the actor must be able to set;
-  and it is exempt from the denies the group is exempt from, as a removed member, or one whose
-  membership is made to end sooner, is from those naming it, which the actor must be able to set.
-  So whoever manages a group that holds, approves and is in no deny changes its members freely, and
-  one holding a role only if they could grant that role themselves. `Config.ResourceOf` gives the
-  package the tenant, which `SetGroup` and `DeleteGroup` check `rbac.ManageGroups` on, and the
-  groups, which `ChangeMembers` checks `rbac.GroupMembers` on, each with its constraints and label,
-  and the containers, label and attributes of the scopes a group's access is on; a host without it
-  declares no labels and resource attributes as none, and for access below the tenant, no
-  containers.
+  and it is exempt from the denies the group is exempt from, as a removed member is from those
+  naming it, which the actor must be able to set. A place made to end sooner gains nothing: it is a
+  removal then, checked as one now. So whoever manages a group that holds, approves and is in no
+  deny changes its members freely, and one holding a role only if they could grant that role
+  themselves. `Config.ResourceOf` gives the package the tenant, which `SetGroup` and `DeleteGroup`
+  check `rbac.ManageGroups` on, and the groups, which `ChangeMembers` checks `rbac.GroupMembers`
+  on, each with its constraints and label, and the containers, label and attributes of the scopes
+  a group's access is on; a host without it declares no labels and resource attributes as none,
+  and for access below the tenant, no containers.
 - **Privileged roles:** a role the catalog marks `Privileged`, or one that changes access, is
   privileged: it is never granted to the tenant's members, and gives nothing through them, as
   after a catalog change.

@@ -2805,6 +2805,34 @@ func TestEndingAMembershipSoonerIsCheckedAsLeaving(t *testing.T) {
 	}
 }
 
+func TestEndingAPlaceSoonerGrantsNothing(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "lead"), grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
+	h.join(t, "u", "v")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	// In crew around the hooks, as the host refuses an outsider any grant.
+	h.as(t, "outsider", "crew")
+	sooner := func(id string) []rbac.Member {
+		return []rbac.Member{{Group: "crew", Principal: identity(id), ExpiresAt: h.now.Add(time.Minute)}}
+	}
+	lead := h.as(t, "lead")
+	// Removing u needs no power to grant what crew holds, and neither does ending its place sooner.
+	if err := h.authz.ChangeMembers(ctx, lead, "t1", sooner("u"), nil); err != nil {
+		t.Fatalf("ending u's place sooner without the power to grant what crew holds: %v", err)
+	}
+	// Nor is the host asked about what a place ending sooner holds: it holds it already.
+	if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", sooner("outsider"), nil); err != nil {
+		t.Fatalf("ending the place of one the host refuses any grant sooner: %v", err)
+	}
+	// Joining for a while gains what crew holds.
+	if err := h.authz.ChangeMembers(ctx, lead, "t1", sooner("v"), nil); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("v joining crew for a while by one who can't grant what it holds: %v", err)
+	}
+}
+
 // A change joining someone to a group is refused when, while the host was asked about what it
 // gains, they joined it already for longer: the change ends that sooner, lifting a deny.
 func TestAJoinThatBecomesEndingSoonerMeanwhileIsTriedAgain(t *testing.T) {
@@ -2834,6 +2862,47 @@ func TestAJoinThatBecomesEndingSoonerMeanwhileIsTriedAgain(t *testing.T) {
 	add := []rbac.Member{{Group: "contractors", Principal: identity("u"), ExpiresAt: h.now.Add(time.Minute)}}
 	if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", add, nil); !errors.Is(err, rbac.ErrConflict) {
 		t.Fatalf("a join that ends a membership made meanwhile sooner: %v", err)
+	}
+}
+
+// A place ended sooner, checked as leaving its group, is refused when the place is removed while
+// the change is checked: it is a join then, gaining what the group holds.
+func TestAPlaceEndingSoonerRemovedMeanwhileIsTriedAgain(t *testing.T) {
+	var meanwhile func(ctx context.Context) error
+	h := grouped(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), guardRole)
+		c.Constraints = []rbac.Constraint{{Name: "meanwhile", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if do := meanwhile; do != nil && in.Permission == rbac.DenyPermission("cluster") {
+				meanwhile = nil
+				return false, do(ctx)
+			}
+			return false, nil
+		}}}
+	})
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "lead"), grant(cluster.Scope(), "guard", rbac.User, "lead"),
+		grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
+	h.join(t, "u")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	lead := h.as(t, "lead")
+	// Leaving crew lifts this, which lead may.
+	if err := h.authz.SetDeny(ctx, lead, cluster, rbac.Deny{ID: "d", Principals: []rbac.Principal{groupOf("crew")}, Permissions: []rbac.Permission{root}}); err != nil {
+		t.Fatal(err)
+	}
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}})
+	}
+	sooner := []rbac.Member{{Group: "crew", Principal: identity("u"), ExpiresAt: h.now.Add(time.Minute)}}
+	if err := h.authz.ChangeMembers(ctx, lead, "t1", sooner, nil); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("ending sooner a place removed meanwhile, by one who can't grant what crew holds: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("u's place should have been removed meanwhile")
+	}
+	if of, err := h.authz.GroupsOf(ctx, "t1", identity("u")); err != nil || len(of) != 0 {
+		t.Fatalf("u is in %v, %v", of, err)
 	}
 }
 

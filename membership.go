@@ -1132,10 +1132,10 @@ func (a *Authorizer) placesBounded(ctx context.Context, tx pgx.Tx, tenant string
 // Config.ValidateGrant is asked about each as the member's (ViaMembership); it approves the
 // activations of the eligibilities those approve, which the actor must be able to set; and it is
 // exempt from the denies those are exempt from, as a removed member is from the denies those name,
-// which the actor must be able to set; a membership made to end sooner is a removal then, checked
-// as one now. Each group changed, and each scope reached, is checked as Config.ResourceOf returns
-// it. Members from a source the host owns, and the members of a group from one, only the host
-// changes, and what ImportMembers refuses, this does.
+// which the actor must be able to set; a place made to end sooner gains nothing: it is a removal
+// then, checked as one now. Each group changed, and each scope reached, is checked as
+// Config.ResourceOf returns it. Members from a source the host owns, and the members of a group
+// from one, only the host changes, and what ImportMembers refuses, this does.
 func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant string, add, remove []Member) (err error) {
 	defer a.refused(ctx, &err, tenant, actor.Principal, "ChangeMembers")
 	if !validID(tenant) {
@@ -1449,6 +1449,21 @@ func (a *Authorizer) endingSooner(ctx context.Context, q DB, tenant string, add 
 	return ending, err
 }
 
+// gaining is the members added that gain what their groups hold: all but those added to end sooner,
+// which gain nothing.
+func (r reach) gaining(add []Member) []Member {
+	if len(r.ending) == 0 {
+		return add
+	}
+	var out []Member
+	for _, m := range add {
+		if !r.ending[memberKey(m)] {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 // leaving is the members that leave their groups: those removed, and those added to end sooner.
 func (r reach) leaving(add, remove []Member) []Member {
 	out := slices.Clone(remove)
@@ -1524,7 +1539,7 @@ type reachKey struct {
 // grant or eligibility; with gains, only the grants and eligibilities added members gain.
 func (r reach) footprint(add, remove []Member, gains bool) map[reachKey]RoleDefinition {
 	f := map[reachKey]RoleDefinition{}
-	for _, m := range add {
+	for _, m := range r.gaining(add) {
 		for _, v := range r.heldBy(m.Group) {
 			f[reachKey{group: m.Group, gained: v.key()}] = v.role
 		}
@@ -1591,8 +1606,9 @@ func (v revalidation) as(m Member) Binding {
 // eligibility each member set adds gains, as the member's, and returns the standing of the members
 // it asked about, which the answers rest on.
 func (a *Authorizer) askMemberships(ctx context.Context, actor Subject, tenant string, set []Member, rc reach) (standing, error) {
+	gaining := rc.gaining(set)
 	var asked []Principal
-	for _, m := range set {
+	for _, m := range gaining {
 		if len(rc.heldBy(m.Group)) > 0 {
 			asked = append(asked, m.Principal)
 		}
@@ -1602,7 +1618,7 @@ func (a *Authorizer) askMemberships(ctx context.Context, actor Subject, tenant s
 		return standing{}, err
 	}
 	var refused []error
-	for _, m := range set {
+	for _, m := range gaining {
 		for _, v := range rc.heldBy(m.Group) {
 			roles := book{builtin: a.roles, custom: map[Role]RoleDefinition{v.role.ID: v.role}}
 			bad, err := a.allowed(ctx, roles, actor, ViaMembership, tenant, v.scope, v.as(m))
@@ -1644,7 +1660,7 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 		}
 		return fmt.Errorf("%w: %s holds %s on %s, which can't be granted there now: revoke it first", ErrInvalid, v.binding.Principal.key(), v.role.ID, v.scope.Key())
 	}
-	for _, m := range add {
+	for _, m := range rc.gaining(add) {
 		for _, v := range rc.heldBy(m.Group) {
 			if err := stale(v); err != nil {
 				return nil, err
