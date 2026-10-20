@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -17,8 +19,9 @@ import (
 // grant of its own, from SourceActivation, until MaxDuration from then at most and no later than
 // the eligibility, its membership of the tenant or its place in the group that makes it eligible
 // ends, with its justification as the grant's note; one eligible through a group activates for
-// itself. The activation records the eligibility it was made through, and rests on its holder
-// being that one's principal, or in its group, through those it is in: a change ending the
+// itself. The activation records the eligibility it was made through, of those that allow it the
+// one whose path from its holder lasts longest, and rests on its holder being that one's
+// principal, or in its group, through those it is in: a change ending the
 // membership or a place on the way sooner, or removing it, cuts the activation short to the latest
 // end of the paths left, or ends it if none is left, whatever another eligibility would allow.
 // With Approvers, each activation needs one of them to approve it. What an activation gives, its
@@ -230,11 +233,14 @@ type Activation struct {
 // type stops it, and Config.ValidateGrant is asked about it, as about any grant. Where the
 // eligibility names approvers, the host's approval flow activates for s once one approves,
 // passing act.Approver and, in ctx, the request s made (WithRequest), which Requires reads. Of the
-// eligibilities that allow it, the activation is made through one needing no approval over one
-// that does, and of those through the one whose requirement is cheapest, and records it: it rests
-// on s being that one's principal or in its group (Eligibility). It holds the places in groups s
-// is in until it commits, and finds s eligible through those alone, so a change ending one of them
-// sooner waits for it, and cuts the activation short if it rests on that place.
+// eligibilities that allow it, with the approver and the request it has, the activation is made
+// through the one whose path from s lasts longest, s's own identity's as long as its membership
+// and a group's as long as the latest of its places to it, and records it: it rests on s being
+// that one's principal or in its group (Eligibility). Of those lasting alike, it is one needing no
+// approval over one that does, then the one whose requirement is cheapest, then s's own. It holds
+// the places in groups s is in until it commits, and finds s eligible through those alone, so a
+// change ending one of them sooner waits for it, and cuts the activation short if it rests on that
+// place.
 func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act Activation) (g Grant, err error) {
 	defer a.refused(ctx, &err, on.Tenant, s.Principal, "Activate")
 	if err := a.check(on); err != nil {
@@ -259,11 +265,16 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 		return Grant{}, &InvalidError{Binding: b, Reason: fmt.Sprintf("an activation lasts more than nothing and at most %s, and has a justification of at most %d characters", MaxActivation, MaxNote)}
 	}
 	b.ExpiresAt = stored(a.cfg.Now().Add(act.Duration))
+	// Whether any allows it, before asking the host: which, under the locks.
 	keys, _, err := a.keysAt(ctx, a.db, on.Tenant, s, b.ExpiresAt)
 	if err != nil {
 		return Grant{}, err
 	}
-	if _, _, err := a.eligible(ctx, a.db, s, on, act, b.ExpiresAt, keys); err != nil {
+	reached := paths{}
+	for _, k := range keys {
+		reached[k] = time.Time{}
+	}
+	if _, _, err := a.eligible(ctx, a.db, s, on, act, b.ExpiresAt, reached); err != nil {
 		return Grant{}, err
 	}
 	roles, err := a.tenantBook(ctx, a.db, on.Tenant, []Role{act.Role})
@@ -289,12 +300,12 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 		// the places in groups it holds alone.
 		b.ExpiresAt = stored(a.cfg.Now().Add(act.Duration))
 		held := holdingPlaces()
-		keys, err := holdPlaces(ctx, tx, on.Tenant, s, a.cfg.Now(), b.ExpiresAt)
+		reached, err := holdPlaces(ctx, tx, on.Tenant, s, a.cfg.Now(), b.ExpiresAt)
 		if err != nil {
 			return ChangeEvent{}, err
 		}
 		held()
-		through, approver, err := a.eligible(ctx, tx, s, on, act, b.ExpiresAt, keys)
+		through, approver, err := a.eligible(ctx, tx, s, on, act, b.ExpiresAt, reached)
 		if err != nil {
 			return ChangeEvent{}, err
 		}
@@ -393,34 +404,67 @@ func (a *Authorizer) Deactivate(ctx context.Context, s Subject, on Resource, rol
 // returns once it holds them, as a test changes them meanwhile.
 var holdingPlaces = func() func() { return func() {} }
 
+// paths is the principal keys a subject holds, each with when the latest of its paths to it ends,
+// zero for never: its identity's as its membership does, and a group's as the latest of the paths
+// of places in groups to it, each as the soonest of the membership and the places on it.
+type paths map[string]time.Time
+
 // holdPlaces holds, in tx, until it commits, the places in groups s can rest an activation on in the
 // tenant at now, its identity's and its groups', through those they are in, each key's found on its
 // own (byKey) and each held by its key, in the order changes hold them: a change ending one sooner
 // holds it before reading the activations resting on it, so it waits for the activation and finds
-// it. In the same statement it returns the keys s holds at until through the places it held alone,
+// it. In the same statement it returns the paths s holds at until through the places it held alone,
 // and its identity's while its membership is in force then and not suspended: a later statement
 // would read a place nested meanwhile, which no change removing it would wait for. Each is held as
 // it is when held, a place updated meanwhile in its new version. Walking up from s reads every place
 // held, so each is held before the keys are returned; where s isn't standing it reads none, and
 // activates nothing.
-func holdPlaces(ctx context.Context, tx pgx.Tx, tenant string, s Subject, now, until time.Time) ([]string, error) {
+func holdPlaces(ctx context.Context, tx pgx.Tx, tenant string, s Subject, now, until time.Time) (paths, error) {
 	rows, err := tx.Query(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`, held AS MATERIALIZED (
 		  SELECT m.* FROM (SELECT * FROM (`+byKey("ARRAY(SELECT k FROM keys)", "rbac_members", "principal", "group_id, principal, source",
 		"tenant = $1 AND (expires_at IS NULL OR expires_at > $3)")+`) p ORDER BY `+placeOrder+`) p CROSS JOIN LATERAL (
 		    SELECT group_id, principal, expires_at FROM rbac_members WHERE tenant = $1 AND group_id = p.group_id AND principal = p.principal
 		      AND source = p.source AND (expires_at IS NULL OR expires_at > $3) FOR SHARE) m
 		), standing AS (
-		  SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = $2 AND NOT suspended AND (expires_at IS NULL OR expires_at > $4)
-		), up(id) AS (
-		  SELECT group_id FROM held WHERE principal = $2 AND (expires_at IS NULL OR expires_at > $4) AND EXISTS (SELECT FROM standing)
+		  SELECT expires_at FROM rbac_memberships WHERE tenant = $1 AND principal = $2 AND NOT suspended
+		    AND (expires_at IS NULL OR expires_at > $4)
+		), up(id, ends) AS (
+		  SELECT h.group_id, least(s.expires_at, h.expires_at) FROM standing s
+		  JOIN held h ON h.principal = $2 AND (h.expires_at IS NULL OR h.expires_at > $4)
 		  UNION
-		  SELECT h.group_id FROM up u JOIN held h ON h.principal = 'group:' || u.id AND (h.expires_at IS NULL OR h.expires_at > $4)
+		  SELECT h.group_id, least(u.ends, h.expires_at) FROM up u JOIN held h ON h.principal = 'group:' || u.id
+		    AND (h.expires_at IS NULL OR h.expires_at > $4)
+		), reached(k, ends) AS (
+		  SELECT $2 COLLATE "C", expires_at FROM standing UNION ALL SELECT 'group:' || id, ends FROM up
 		)
-		SELECT $2 COLLATE "C" FROM standing UNION ALL SELECT 'group:' || id FROM up ORDER BY 1`, tenant, s.identityKey(), now, until)
+		SELECT k, nullif(max(coalesce(ends, 'infinity')), 'infinity') FROM reached GROUP BY k`, tenant, s.identityKey(), now, until)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, pgx.RowTo[string])
+	held := paths{}
+	var k string
+	var ends *time.Time
+	_, err = pgx.ForEachRow(rows, []any{&k, &ends}, func() error {
+		held[k] = time.Time{}
+		if ends != nil {
+			held[k] = *ends
+		}
+		return nil
+	})
+	return held, err
+}
+
+// lastsLonger compares when two paths end, zero for never: positive where x lasts longer than y.
+func lastsLonger(x, y time.Time) int {
+	switch {
+	case x.Equal(y):
+		return 0
+	case x.IsZero():
+		return 1
+	case y.IsZero():
+		return -1
+	}
+	return x.Compare(y)
 }
 
 // resting is the activations, by id, a change ending places in groups or memberships sooner may cut
@@ -550,14 +594,16 @@ type madeThrough struct {
 	principal string
 }
 
-// eligible checks that s may activate act.Role on on until until through keys, the principal keys
-// s holds then, so none outlasts the place in a group, or the membership, that makes s eligible. It
-// returns the eligibility that allows it and who approved: one of s's identity or of one of its
-// groups there, lasting act.Duration or longer and in force until then, whose requirement holds in
-// the request, failing closed, and whose approvers, if it names any, include act.Approver, who isn't
-// s. approved is zero when the eligibility allowing it names none. A privileged role's counts only
-// through s's identity or its groups, as its grants do, never through the tenant's members.
-func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource, act Activation, until time.Time, keys []string) (through madeThrough, approved Principal, err error) {
+// eligible checks that s may activate act.Role on on until until through reached, the principal
+// keys s holds then, so none outlasts the place in a group, or the membership, that makes s
+// eligible. It returns the eligibility that allows it and who approved: one of s's identity or of
+// one of its groups there, lasting act.Duration or longer and in force until then, whose
+// requirement holds in the request, failing closed, and whose approvers, if it names any, include
+// act.Approver, who isn't s. Of those, the one whose path from s lasts longest, as the activation
+// rests on it. approved is zero when the eligibility allowing it names none. A privileged role's
+// counts only through s's identity or its groups, as its grants do, never through the tenant's
+// members.
+func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource, act Activation, until time.Time, reached paths) (through madeThrough, approved Principal, err error) {
 	scope, manage := on.Scope(), GrantPermission(on.Type)
 	approvers, _, err := a.keysOf(ctx, q, on.Tenant, act.Approver)
 	if err != nil {
@@ -565,7 +611,7 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 	}
 	rows, err := q.Query(ctx, byKey("$4", "rbac_eligibilities", "principal", "id, principal, requires, approvers", `tenant = $1 AND scope = $2 AND role = $3
 		  AND max_seconds >= $5 AND (expires_at IS NULL OR expires_at > $6 AND expires_at >= $7)`),
-		on.Tenant, scope.Key(), act.Role, countedOf(keys, broad{}), seconds(act.Duration), a.cfg.Now(), until)
+		on.Tenant, scope.Key(), act.Role, countedOf(slices.Sorted(maps.Keys(reached)), broad{}), seconds(act.Duration), a.cfg.Now(), until)
 	if err != nil {
 		return madeThrough{}, Principal{}, err
 	}
@@ -581,13 +627,25 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 	if err != nil {
 		return madeThrough{}, Principal{}, err
 	}
-	// Those needing no approval first, so an approver passed where none is needed isn't recorded,
-	// and of each the cheapest requirement first, as checks order conditions, so which allows
-	// doesn't rest on how many approvers one names.
+	// Through the path that lasts longest first, so leaving a group ends no activation another
+	// path would keep. Of those lasting alike, those needing no approval first, so an approver
+	// passed where none is needed isn't recorded, and of each the cheapest requirement first, as
+	// checks order conditions, so which allows doesn't rest on how many approvers one names; then
+	// s's own, which rests on s's membership alone, as a group's path does too, then by principal.
+	own := func(e eligibility) int {
+		if e.principal == s.identityKey() {
+			return 1
+		}
+		return 0
+	}
+	slices.SortFunc(found, func(x, y eligibility) int {
+		return cmp.Or(cmp.Compare(own(y), own(x)), strings.Compare(x.principal, y.principal))
+	})
 	cheapestFirst(found, func(e eligibility) string { return e.requires })
 	slices.SortStableFunc(found, func(x, y eligibility) int {
 		return cmp.Compare(min(len(x.approvers), 1), min(len(y.approvers), 1))
 	})
+	slices.SortStableFunc(found, func(x, y eligibility) int { return lastsLonger(reached[y.principal], reached[x.principal]) })
 	reason := fmt.Sprintf("not eligible to activate %s here for %s", act.Role, act.Duration)
 	// The subject holds one eligibility for a role there, and its groups' requirements are bounded
 	// together (SetEligibility).

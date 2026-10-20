@@ -440,7 +440,8 @@ sequenceDiagram
   ends. It records the eligibility it was made through, by its principal's key
   (`activated_through`) and its id (`eligibility_id`), and rests on its holder reaching that
   principal: its own identity, through its membership, or a group, through the places in groups
-  from it. A change ending a membership or a place sooner, or removing it, holds it, in order,
+  from it. Of the eligibilities that allow it, it is made through the one whose path from the
+  holder lasts longest, so leaving a group ends none another path would keep. A change ending a membership or a place sooner, or removing it, holds it, in order,
   reads the activations of the identities it ends it for, and once it has ended it cuts each short
   to the latest end of the paths left to its principal, or ends it, whatever another eligibility
   would allow: worked out again from every eligibility the holder reaches, one whose requirement or
