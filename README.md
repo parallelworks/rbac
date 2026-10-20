@@ -250,18 +250,18 @@ names the scopes conditional ones reach, to check one by one.
   (`rbac.ViaMembership`); it approves what the group approves, which the actor must be able to set;
   and it is exempt from the denies the group is exempt from, as a removed member is from those
   naming it, which the actor must be able to set. A place made to end sooner gains nothing: it is a
-  removal then, checked as one now. So whoever manages a group that holds, approves and is in no
-  deny changes its members freely, and one holding a role only if they could grant that role
-  themselves. `Config.ResourceOf` gives the package the tenant, which `SetGroup` and `DeleteGroup`
-  check `rbac.ManageGroups` on, and the groups, which `ChangeMembers` checks `rbac.GroupMembers`
-  on and `SetGroup` and `DeleteGroup` the label of, each with its constraints and label, and the
-  containers, label and attributes of the scopes a group's access is on; a host without it
-  declares no labels and resource attributes as none, and for access below the tenant, no
-  containers. For a scope the host no longer has, as a resource deleted without `DeleteScopes`, it
-  returns `rbac.ErrNotFound`, or an error wrapping it: a change that only takes access away there,
-  as a member leaving a group with access on it or the group itself, `DeleteGroup`, or `DeleteRole`
-  deleting, or `SetRole` narrowing, a role granted on it, reads it as unlabeled, and any other
-  change fails with the error.
+  removal then, checked as one now; nor does one whose note alone changes. So whoever manages a
+  group that holds, approves and is in no deny changes its members freely, and one holding a role
+  only if they could grant that role themselves. `Config.ResourceOf` gives the package the tenant,
+  which `SetGroup` and `DeleteGroup` check `rbac.ManageGroups` on, and the groups, which
+  `ChangeMembers` checks `rbac.GroupMembers` on and `SetGroup` and `DeleteGroup` the label of, each
+  with its constraints and label, and the containers, label and attributes of the scopes a group's
+  access is on; a host without it declares no labels and resource attributes as none, and for
+  access below the tenant, no containers. For a scope the host no longer has, as a resource deleted
+  without `DeleteScopes`, it returns `rbac.ErrNotFound`, or an error wrapping it: a change that only
+  takes access away there, as a member leaving a group with access on it or the group itself,
+  `DeleteGroup`, or `DeleteRole` deleting, or `SetRole` narrowing, a role granted on it, reads it
+  as unlabeled, and any other change fails with the error.
 - **Privileged roles:** a role the catalog marks `Privileged`, or one that changes access, is
   privileged: it is never granted to the tenant's members, and gives nothing through them, as
   after a catalog change.

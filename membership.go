@@ -1084,7 +1084,7 @@ func keyedAll(members []Member) error {
 // itself, nor a chain of more than MaxGroupDepth groups; and a principal is in a group at most
 // MaxPlacesInGroup times, and in at most MaxGroupsOfPrincipal groups. Config.ValidateGrant is asked
 // about each grant and eligibility a member gains, as with ChangeMembers, so about none of a place
-// made to end sooner.
+// made to end sooner, or whose note alone changes.
 func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant string, members []Member) (err error) {
 	defer a.refused(ctx, &err, tenant, actor, "ImportMembers")
 	if !validID(tenant) {
@@ -1322,11 +1322,11 @@ func (a *Authorizer) placesBounded(ctx context.Context, tx pgx.Tx, tenant string
 // exempt from the denies those are exempt from, as a removed member is from the denies those name,
 // which the actor must be able to set. A removed member loses the rest, which only the label of
 // each scope it is on refuses the actor, as Apply refuses a revoke there; a place made to end
-// sooner gains nothing: it is a removal then, checked as one now. Each group changed, and each
-// scope reached, is checked as Config.ResourceOf returns it, a group the change adds no member to
-// that the host no longer has (ErrNotFound) as unlabeled. Members from a source the host owns,
-// and the members of a group from one, only the host changes, and what ImportMembers refuses, this
-// does.
+// sooner gains nothing: it is a removal then, checked as one now; nor does one whose note alone
+// changes. Each group changed, and each scope reached, is checked as Config.ResourceOf returns it,
+// a group the change adds no member to that the host no longer has (ErrNotFound) as unlabeled.
+// Members from a source the host owns, and the members of a group from one, only the host changes,
+// and what ImportMembers refuses, this does.
 func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant string, add, remove []Member) (err error) {
 	defer a.refused(ctx, &err, tenant, actor.Principal, "ChangeMembers")
 	if !validID(tenant) {
@@ -1449,16 +1449,22 @@ type reach struct {
 	held       []revalidation
 	approving  []approving
 	denies     []Deny
-	// ending is the members added, by memberKey, that end a membership in force sooner than it
-	// would: they leave the group then, as removing them does now.
-	ending map[string]bool
+	placed
+	// labeled is whether the host declares labels, which alone check what a member leaving loses:
+	// without them, a grant made to its group meanwhile changes nothing the change checked.
+	labeled bool
+}
+
+// placed is what a change leaves of the places in force of the members it names (placesLeft).
+type placed struct {
+	// kept is the members added, by memberKey, whose place in force lasts as long already: they
+	// make it end sooner, or change only its note, so gain nothing. One ending sooner leaves the
+	// group then, as removing it does now.
+	kept map[string]bool
 	// leaves is those of them and of the members removed, by memberKey, that leave their group: a
 	// place in force ends, and no other of theirs there, from another source, keeps them in it as
 	// long as it would have.
 	leaves map[string]bool
-	// labeled is whether the host declares labels, which alone check what a member leaving loses:
-	// without them, a grant made to its group meanwhile changes nothing the change checked.
-	labeled bool
 }
 
 // memberKey is what makes a member one member: its group, principal and source.
@@ -1470,9 +1476,9 @@ type approving struct {
 	approvers []Principal
 }
 
-// reachOf reads, on q, what adding add and removing remove reaches, in force at now, which of add
-// end a membership sooner and which members leave their groups: of what the groups hold, approve
-// and are named or exempt in, all a change checks.
+// reachOf reads, on q, what adding add and removing remove reaches, in force at now, what they
+// leave of their members' places, and of what the groups hold, approve and are named or exempt in,
+// all a change checks.
 func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remove []Member) (reach, error) {
 	r := reach{up: map[string]map[string]bool{}, labeled: len(a.labels) > 0}
 	groups := memberGroups(slices.Concat(add, remove))
@@ -1504,12 +1510,12 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 	}
 	r.stored, r.up = r.up, r.nested(add)
 	keys := slices.Sorted(maps.Keys(reached))
-	if r.ending, r.leaves, err = a.placesLeft(ctx, q, tenant, add, remove); err != nil {
+	if r.placed, err = a.placesLeft(ctx, q, tenant, add, remove); err != nil {
 		return reach{}, err
 	}
 	// Without declared labels, a member leaving loses nothing a change checks but the denies naming
 	// its groups, which then no longer bind it: where none gains, as none is added but to end a place
-	// sooner, those alone are read, not what the groups hold.
+	// sooner or change its note, those alone are read, not what the groups hold.
 	if !r.labeled && len(r.gaining(add)) == 0 {
 		rows, err = q.Query(ctx, `SELECT `+denyColumns+` FROM rbac_denies WHERE `+naming("principals", "$2")+` ORDER BY scope, id`, tenant, keys)
 		if err != nil {
@@ -1633,24 +1639,19 @@ func (r reach) nested(add []Member) map[string]map[string]bool {
 }
 
 // placesLeft reads, on q, the places in force in their groups of the principals add and remove
-// name, and returns, by memberKey, those of add that end a place sooner than it would end
-// (reach.ending), and those of them and of remove that leave their group (reach.leaves): whose
-// place in force ends, and that keep no other there, from another source, as long as that place
-// would have lasted, as the change leaves the others.
-func (a *Authorizer) placesLeft(ctx context.Context, q DB, tenant string, add, remove []Member) (ending, leaves map[string]bool, err error) {
+// name, and returns, by memberKey, those of add whose place lasts as long already (placed.kept),
+// and those of them and of remove that leave their group (placed.leaves): whose place in force
+// ends, and that keep no other there, from another source, as long as that place would have
+// lasted, as the change leaves the others.
+func (a *Authorizer) placesLeft(ctx context.Context, q DB, tenant string, add, remove []Member) (placed, error) {
 	type pair struct{ group, principal string }
 	pairOf := func(m Member) pair { return pair{m.Group, m.Principal.key()} }
 	pairs := map[pair]bool{}
-	for _, m := range add {
-		if !m.ExpiresAt.IsZero() {
-			pairs[pairOf(m)] = true
-		}
-	}
-	for _, m := range remove {
+	for _, m := range slices.Concat(add, remove) {
 		pairs[pairOf(m)] = true
 	}
 	if len(pairs) == 0 {
-		return nil, nil, nil
+		return placed{}, nil
 	}
 	var groups, principals []string
 	for p := range pairs {
@@ -1664,7 +1665,7 @@ func (a *Authorizer) placesLeft(ctx context.Context, q DB, tenant string, add, r
 		    AND (expires_at IS NULL OR expires_at > $4) OFFSET 0) m`,
 		tenant, groups, principals, now)
 	if err != nil {
-		return nil, nil, err
+		return placed{}, err
 	}
 	// Each pair's places, by source, as the change leaves them: until when, zero for never.
 	places := map[pair]map[string]time.Time{}
@@ -1681,7 +1682,7 @@ func (a *Authorizer) placesLeft(ctx context.Context, q DB, tenant string, add, r
 		}
 		return nil
 	}); err != nil {
-		return nil, nil, err
+		return placed{}, err
 	}
 	stored := maps.Clone(places)
 	for p, ps := range stored {
@@ -1706,49 +1707,38 @@ func (a *Authorizer) placesLeft(ctx context.Context, q DB, tenant string, add, r
 		}
 		return false
 	}
-	ending, leaves = map[string]bool{}, map[string]bool{}
+	p := placed{kept: map[string]bool{}, leaves: map[string]bool{}}
 	for _, m := range add {
 		was, ok := stored[pairOf(m)][m.Source]
-		if !ok || !outlasts(was, m.ExpiresAt) {
+		if !ok || outlasts(m.ExpiresAt, was) {
 			continue
 		}
-		ending[memberKey(m)] = true
-		if !keeps(m, was) {
-			leaves[memberKey(m)] = true
+		p.kept[memberKey(m)] = true
+		if outlasts(was, m.ExpiresAt) && !keeps(m, was) {
+			p.leaves[memberKey(m)] = true
 		}
 	}
 	for _, m := range remove {
 		if was, ok := stored[pairOf(m)][m.Source]; ok && !keeps(m, was) {
-			leaves[memberKey(m)] = true
+			p.leaves[memberKey(m)] = true
 		}
 	}
-	return ending, leaves, nil
+	return p, nil
 }
 
-// gaining is the members added that gain what their groups hold: all but those added to end sooner,
-// which gain nothing.
-func (r reach) gaining(add []Member) []Member {
-	if len(r.ending) == 0 {
-		return add
-	}
-	var out []Member
-	for _, m := range add {
-		if !r.ending[memberKey(m)] {
-			out = append(out, m)
-		}
-	}
-	return out
+// gaining is the members added that gain what their groups hold: all but those whose place lasts
+// as long already, which gain nothing.
+func (p placed) gaining(add []Member) []Member {
+	return slices.DeleteFunc(slices.Clone(add), func(m Member) bool { return p.kept[memberKey(m)] })
 }
 
 // joining is the keys of the principals of joined, the members a change stored, whose places
-// widen what they hold, which their exclusive values are checked for: all but those that only end
-// a place in force sooner, a removal then.
-func (r reach) joining(joined []Member) []string {
+// widen what they hold, which their exclusive values are checked for: all but those whose place
+// lasted as long already, which gain nothing.
+func (p placed) joining(joined []Member) []string {
 	var keys []string
-	for _, m := range joined {
-		if !r.ending[memberKey(m)] {
-			keys = append(keys, m.Principal.key())
-		}
+	for _, m := range p.gaining(joined) {
+		keys = append(keys, m.Principal.key())
 	}
 	return keys
 }

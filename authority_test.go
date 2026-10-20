@@ -1958,7 +1958,8 @@ func TestARemovalIsNeverRefusedForAnExclusiveConflict(t *testing.T) {
 }
 
 // Making a place or a membership end sooner, or a member a guest, is a removal, never refused for an
-// exclusive conflict, as removing it isn't; making one last longer, or a guest a member, is not.
+// exclusive conflict, as removing it isn't, and changing only a note no change; making one last
+// longer, or a guest a member, is not.
 func TestShorteningAConflictedIdentitysPlaceOrMembershipIsNeverRefused(t *testing.T) {
 	h := labeled(t, func(c *rbac.Config) {
 		banks(c)
@@ -1985,6 +1986,16 @@ func TestShorteningAConflictedIdentitysPlaceOrMembershipIsNeverRefused(t *testin
 	}
 	if err := authz.ChangeMembers(ctx, admin, "t1", place(time.Hour), nil); err != nil {
 		t.Errorf("ChangeMembers making ann's place end sooner: %v", err)
+	}
+	// Changing only its note gains nothing either.
+	noted := place(time.Hour)
+	noted[0].Note = "on call"
+	if err := authz.ChangeMembers(ctx, admin, "t1", noted, nil); err != nil {
+		t.Errorf("ChangeMembers changing the note of ann's place: %v", err)
+	}
+	noted[0].Note = "rotated"
+	if err := authz.ImportMembers(ctx, host, "t1", noted); err != nil {
+		t.Errorf("ImportMembers changing the note of ann's place: %v", err)
 	}
 	membership := func(until time.Duration, note string) []rbac.Membership {
 		return []rbac.Membership{{Principal: identity("ann"), ExpiresAt: h.now.Add(until), Note: note}}

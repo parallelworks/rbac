@@ -2967,9 +2967,24 @@ func TestEndingAPlaceSoonerGrantsNothing(t *testing.T) {
 	if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", sooner("outsider"), nil); err != nil {
 		t.Fatalf("ending the place of one the host refuses any grant sooner: %v", err)
 	}
+	// Nor is changing only the note of a place: here u's, ending as it does now.
+	noted := sooner("u")
+	noted[0].Note = "on call"
+	if err := h.authz.ChangeMembers(ctx, lead, "t1", noted, nil); err != nil {
+		t.Fatalf("changing the note of u's place without the power to grant what crew holds: %v", err)
+	}
+	noted = sooner("outsider")
+	noted[0].Note = "on call"
+	if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", noted, nil); err != nil {
+		t.Fatalf("changing the note of the place of one the host refuses any grant: %v", err)
+	}
 	// Joining for a while gains what crew holds.
 	if err := h.authz.ChangeMembers(ctx, lead, "t1", sooner("v"), nil); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("v joining crew for a while by one who can't grant what it holds: %v", err)
+	}
+	// And so does making a place last longer.
+	if err := h.authz.ChangeMembers(ctx, lead, "t1", []rbac.Member{{Group: "crew", Principal: identity("u"), ExpiresAt: h.now.Add(time.Hour)}}, nil); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("making u's place last longer by one who can't grant what crew holds: %v", err)
 	}
 }
 
