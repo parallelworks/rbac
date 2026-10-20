@@ -631,8 +631,9 @@ flowchart LR
 - **PruneHistory** deletes only what an export has read and later versions supersede. It keeps
   each row's last version at or before its time, so AsOf answers as before for any later time,
   and refuses an earlier one; of a row whose last version by then ended it, it deletes every
-  version, the end last. A prune that deleted records is recorded in history, and AsOf finds the
-  latest prune's time by history's index.
+  version, the end last. It reads history `MaxPrune` records at a time, each in a transaction of
+  its own, so none holds exports back for long however long history is. Each that deleted records
+  is recorded in history, and AsOf finds the latest prune's time by history's index.
 
 ## Database roles
 

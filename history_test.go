@@ -2752,7 +2752,8 @@ func TestPruningGoesOnFromWhereItStopped(t *testing.T) {
 			}
 		}
 		then, through := dbNow(t, h), exported(t, h)
-		// The first versions go oldest first, and the call records the last it deleted.
+		// The first versions go oldest first, and the call's records, one for each of its
+		// transactions that deleted any, reach the last it deleted.
 		var last, reached int64
 		if err := h.pool.QueryRow(ctx, `SELECT max(id) FROM (SELECT id FROM rbac_history
 			WHERE principal LIKE 'user:changed-%' AND op = 'create' ORDER BY id LIMIT 100) d`).Scan(&last); err != nil {
@@ -2761,7 +2762,7 @@ func TestPruningGoesOnFromWhereItStopped(t *testing.T) {
 		if n, err := rbac.PruneHistory(ctx, h.pool, then, through); err != nil || n != 100 {
 			t.Fatalf("PruneHistory = %d, %v", n, err)
 		}
-		if err := h.pool.QueryRow(ctx, `SELECT (after->>'reached')::bigint FROM rbac_history WHERE entity = 'history'`).Scan(&reached); err != nil || reached != last {
+		if err := h.pool.QueryRow(ctx, `SELECT max((after->>'reached')::bigint) FROM rbac_history WHERE entity = 'history'`).Scan(&reached); err != nil || reached != last {
 			t.Fatalf("the prune reached %d, %v, having deleted up to %d", reached, err, last)
 		}
 		if _, err := h.pool.Exec(ctx, `ANALYZE rbac_history`); err != nil {
@@ -3002,6 +3003,68 @@ func TestPruningHistoryReadsOnlyAsFarAsItsBatch(t *testing.T) {
 	grants(4000)
 	if many := read(); many > few*11/10 {
 		t.Fatalf("a call read %d pages of history, and %d once 4000 more records followed what it deleted", few, many)
+	}
+}
+
+// A prune reads history a window at a time, each in a transaction of its own, which reads as much
+// of history however long it is, so a call that finds little to delete in a long history holds no
+// export back for long; and it deletes what one transaction reading all of it would.
+func TestPruningALongHistoryReadsAsMuchInEachTransaction(t *testing.T) {
+	rbac.SetMaxPrune(t, 100)
+	// The most pages of history and its indexes one of the prune's transactions reads, behind as
+	// many grants of which three changed.
+	most := func(t *testing.T, grants int) int64 {
+		t.Helper()
+		h := setup(t)
+		ctx := t.Context()
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', 'c1', 'user', 'u' || i, 'cluster.login' FROM generate_series(1, $1::int) i`, grants); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.pool.Exec(ctx, `UPDATE rbac_grants SET note = 'changed' WHERE principal_id IN ('u1', 'u2', 'u3')`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.pool.Exec(ctx, `ANALYZE rbac_history`); err != nil {
+			t.Fatal(err)
+		}
+		then, through := dbNow(t, h), exported(t, h)
+		// On a connection of its own, whose session counts what each transaction reads on from the
+		// last, until it reports them and counts from none.
+		conn, err := h.pool.Acquire(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Release()
+		var last, pages int64
+		if err := pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+			last = historyPages(ctx, t, tx)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		transactions := 0
+		rbac.SetPrunedWindow(t, func(tx pgx.Tx) {
+			read := historyPages(ctx, t, tx)
+			if read >= last {
+				read, last = read-last, read
+			} else {
+				last = read
+			}
+			pages, transactions = max(pages, read), transactions+1
+		})
+		if n, err := rbac.PruneHistory(ctx, conn.Conn(), then, through); err != nil || n != 3 {
+			t.Fatalf("PruneHistory = %d, %v", n, err)
+		}
+		if transactions < grants/100 {
+			t.Fatalf("read %d records of history in %d transactions", grants, transactions)
+		}
+		if got, err := notesAt(t, h, then); err != nil || len(got) != grants+1 || got["u1"] != "changed" {
+			t.Fatalf("as of then, after pruning: %d grants, u1 %q, %v", len(got), got["u1"], err)
+		}
+		return pages
+	}
+	if few, many := most(t, 1000), most(t, 4000); many > few*11/10 {
+		t.Fatalf("a prune's transactions read up to %d pages of history behind 1000 grants, and %d behind 4000", few, many)
 	}
 }
 

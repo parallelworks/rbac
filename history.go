@@ -144,12 +144,16 @@ func followable(ctx context.Context, tx pgx.Tx, schema string, after Cursor) (ge
 	return generation, nil
 }
 
-// MaxPrune is the most records one PruneHistory deletes, so its transaction, which holds every
-// export in the cluster back while it runs, stays short: call it again while it returns as many.
+// MaxPrune is the most records one PruneHistory call deletes, and the most of history each of its
+// transactions reads, so each, which holds every export in the cluster back while it runs, stays
+// short however long history is: call it again while it deletes as many.
 const MaxPrune = 10000
 
 // maxPrune is MaxPrune, which a test lowers.
 var maxPrune = MaxPrune
+
+// prunedWindow runs at the end of each of PruneHistory's transactions, on it, which a test sets.
+var prunedWindow = func(pgx.Tx) {}
 
 // pruneKey and pruneThrough are a prune's time, $1, and cursor, $2 and $3, as its record holds
 // them, by which a prune of the same finds where the last stopped.
@@ -163,13 +167,16 @@ const (
 // so AsOf answers as it did for any time from then on, and refuses an earlier one, and it removes
 // every version of a row whose last one then was its delete or expiry, unless an earlier one stays.
 // It deletes nothing at or past through, the cursor of the last export the host has checkpointed,
-// so that export goes on from it, and it records in history a prune that deleted any: one that
-// deleted none changed nothing, and AsOf reads every time as it did. Run it as a role with the
+// so that export goes on from it, and it records in history each of its transactions that deleted
+// any: one that deleted none changed nothing, and AsOf reads every time as it did. Run it as a role with the
 // rights of history's owner, as the README's administrator's, never the application's; keep at
 // least as much as the host's audit retention requires. It refuses a before yet to come or before
 // year 1, earlier than history dates anything, and, like AsOf, history whose ids can't order a
 // row's changes. It deletes at most MaxPrune records: call it again while it deletes as many, and
-// it goes on from where the last prune of the same before and through stopped.
+// it goes on from where the last prune of the same before and through stopped. It reads history
+// MaxPrune records at a time, on a pool or a connection each in a transaction of its own, so none
+// holds exports back for long, and on an error what those before deleted stays deleted; on a
+// host's transaction, all in it.
 func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) (int64, error) {
 	if through.TxID == 0 && through.ID == 0 {
 		return 0, fmt.Errorf("%w: a prune goes only as far as an export has read: through is the export's cursor", ErrInvalid)
@@ -179,93 +186,132 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 	if before.Before(time.Date(1, time.January, 1, 0, 0, 0, 0, time.UTC)) {
 		return 0, fmt.Errorf("%w: a prune is of history up to a time in year 1 or later", ErrInvalid)
 	}
-	var n int64
-	err := begin(ctx, db, func(tx pgx.Tx) error {
-		schema, err := historySchema(ctx, tx)
+	// Where the next window starts, once the first has read where the last prune stopped.
+	from := int64(-1)
+	var total int64
+	for {
+		var n int64
+		var end *int64
+		err := begin(ctx, db, func(tx pgx.Tx) error {
+			var err error
+			n, end, err = pruneWindow(ctx, tx, before, through, from, int64(maxPrune)-total)
+			if err == nil {
+				prunedWindow(tx)
+			}
+			return err
+		})
 		if err != nil {
-			return err
+			return total, err
 		}
-		if _, err := followable(ctx, tx, schema, through); err != nil {
-			return err
+		total += n
+		// The window held no record, or the call deleted as many as it may: what follows reached is
+		// the next call's.
+		if end == nil || total >= int64(maxPrune) {
+			return total, nil
 		}
-		history := historyTable(schema)
-		// AsOf refuses a time before the prune's, so one yet to come would refuse the present.
-		var future bool
-		if err := tx.QueryRow(ctx, `SELECT $1::pg_catalog.timestamptz > statement_timestamp()`, before).Scan(&future); err != nil {
-			return err
-		}
-		if future {
-			return fmt.Errorf("%w: a prune is of history up to a time that has passed", ErrInvalid)
-		}
-		// A prune of the same time and cursor goes on from the last record the last one deleted:
-		// those before it that it kept, the last versions of their rows by then, stay so for both,
-		// as any record written since that could change it is past the cursor. Otherwise each call
-		// would read them all again, as many as the rows there are. One it kept on a snapshot older
-		// than the export, as a host's at REPEATABLE READ, can since be superseded by an end the
-		// snapshot missed: it stays for this call, so the end does too. So a call can go on from
-		// where any of them stopped, and goes on from the furthest: the last by date or id can have
-		// stopped short of it, as one dated by its host transaction's start, or one that waited on
-		// another's batch and deleted none of it.
-		var from int64
+		from = *end
+	}
+}
+
+// pruneWindow deletes, in tx, up to most records of the next MaxPrune after from, or after where
+// the last prune of the same before and through stopped where from is -1. It returns how many it
+// deleted, and where the window ends, nil for a window that held no record.
+func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Cursor, from, most int64) (n int64, end *int64, err error) {
+	schema, err := historySchema(ctx, tx)
+	if err != nil {
+		return 0, nil, err
+	}
+	if _, err := followable(ctx, tx, schema, through); err != nil {
+		return 0, nil, err
+	}
+	history := historyTable(schema)
+	// AsOf refuses a time before the prune's, so one yet to come would refuse the present.
+	var future bool
+	if err := tx.QueryRow(ctx, `SELECT $1::pg_catalog.timestamptz > statement_timestamp()`, before).Scan(&future); err != nil {
+		return 0, nil, err
+	}
+	if future {
+		return 0, nil, fmt.Errorf("%w: a prune is of history up to a time that has passed", ErrInvalid)
+	}
+	// A prune of the same time and cursor goes on from the last record the last one deleted, or
+	// the end of the last window it read past: those before it that it kept, the last versions of
+	// their rows by then, stay so for both, as any record written since that could change it is
+	// past the cursor. Otherwise each call would read them all again, as many as the rows there
+	// are. One it kept on a snapshot older than the export, as a host's at REPEATABLE READ, can
+	// since be superseded by an end the snapshot missed: it stays for this call, so the end does
+	// too. So a call can go on from where any of them stopped, and goes on from the furthest: the
+	// last by date or id can have stopped short of it, as one dated by its host transaction's
+	// start, or one that waited on another's batch and deleted none of it.
+	if from < 0 {
 		if err := tx.QueryRow(ctx, `SELECT coalesce(max((after->>'reached')::bigint), 0) FROM `+history+`
 			WHERE tenant = '' AND entity = 'history' AND key = `+pruneKey+`
 			  AND op = 'prune' AND after->'through' = `+pruneThrough, before, through.TxID, through.ID).Scan(&from); err != nil {
-			return err
+			return 0, nil, err
 		}
-		// The planner can't know that what a batch deletes is history's oldest, and would rather
-		// read all of it and sort what it finds: by history's ids, a call reads only as far as its
-		// batch reaches.
-		var sorting string
-		if err := tx.QueryRow(ctx, `SELECT current_setting('enable_sort')`).Scan(&sorting); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', 'on', true), set_config('enable_sort', 'off', true)`); err != nil {
-			return err
-		}
-		// Of each row's versions at or before the time, the last, by when it was written, as AsOf
-		// orders them, stays unless it ended the row. An end goes only with every version before it:
-		// one that stays, as one the export hasn't read or one dated later but written first, as
-		// history written before its versions were dated in order can hold, would otherwise be the
-		// last AsOf finds. Each record is judged by its own row's versions, not every row's.
-		var reached int64
-		if err := tx.QueryRow(ctx, `
-			WITH doomed AS (
-			  SELECT h.id FROM `+history+` h
-			  WHERE h.id > $5 AND h.effective_at <= $1 AND (h.txid, h.id) < ($2::pg_catalog.xid8, $3) AND h.entity <> 'history'
-			    AND (EXISTS (
-			      SELECT FROM `+history+` n
-			      WHERE n.tenant = h.tenant AND n.entity = h.entity AND n.key = h.key AND n.effective_at <= $1 AND n.id > h.id)
-			    OR h.op IN ('delete', 'expire') AND NOT EXISTS (
-			      SELECT FROM `+history+` s
-			      WHERE s.tenant = h.tenant AND s.entity = h.entity AND s.key = h.key AND s.id < h.id
-			        AND (s.id <= $5 OR s.effective_at > $1 OR (s.txid, s.id) >= ($2::pg_catalog.xid8, $3))))
-			  -- A batch, oldest first: of a row, its end goes after every version before it, so a
-			  -- batch that stops between them leaves the end, which still reads as the row's.
-			  ORDER BY h.id LIMIT $4
-			), pruned AS (
-			  -- By id, from the batch: a join could read all of history to find it.
-			  DELETE FROM `+history+` WHERE id = ANY (ARRAY(SELECT id FROM doomed)) RETURNING id
-			)
-			SELECT count(*), coalesce(max(id), $5) FROM pruned`, before, through.TxID, through.ID, maxPrune, from).Scan(&n, &reached); err != nil {
-			return err
-		}
-		// Under a host's transaction, which goes on past the prune.
-		if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', '', true), set_config('enable_sort', $1, true)`, sorting); err != nil {
-			return err
-		}
-		// One that deleted none left history as it was, and reached no further than the last of
-		// the same: its record would account for no record gone, refuse AsOf times history still
-		// holds, and grow history with each call of a host that prunes on a schedule.
-		if n == 0 {
-			return nil
-		}
-		_, err = tx.Exec(ctx, `INSERT INTO `+history+` (effective_at, tenant, entity, key, op, after, how)
-			VALUES (now(), '', 'history', `+pruneKey+`, 'prune',
-			  jsonb_build_object('before', $1::pg_catalog.timestamptz, 'through', `+pruneThrough+`, 'deleted', $4::bigint, 'reached', $5::bigint),
-			  'PruneHistory')`, before, through.TxID, through.ID, n, reached)
-		return err
-	})
-	return n, err
+	}
+	// The planner can't know that what a batch deletes is history's oldest, and would rather
+	// read all of it and sort what it finds: by history's ids, a call reads only as far as its
+	// batch reaches.
+	var sorting string
+	if err := tx.QueryRow(ctx, `SELECT current_setting('enable_sort')`).Scan(&sorting); err != nil {
+		return 0, nil, err
+	}
+	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', 'on', true), set_config('enable_sort', 'off', true)`); err != nil {
+		return 0, nil, err
+	}
+	// Of each row's versions at or before the time, the last, by when it was written, as AsOf
+	// orders them, stays unless it ended the row. An end goes only with every version before it:
+	// one that stays, as one the export hasn't read or one dated later but written first, as
+	// history written before its versions were dated in order can hold, would otherwise be the
+	// last AsOf finds. Each record is judged by its own row's versions, not every row's, and only
+	// those of the window, the next MaxPrune records by id, so a transaction reads no more of
+	// history however few records it finds to delete.
+	var reached int64
+	if err := tx.QueryRow(ctx, `
+		WITH win AS (
+		  SELECT max(id) AS last FROM (SELECT id FROM `+history+` WHERE id > $5 ORDER BY id LIMIT $6) w
+		), doomed AS (
+		  SELECT h.id FROM `+history+` h
+		  WHERE h.id > $5 AND h.id <= (SELECT last FROM win) AND h.effective_at <= $1 AND (h.txid, h.id) < ($2::pg_catalog.xid8, $3)
+		    AND h.entity <> 'history'
+		    AND (EXISTS (
+		      SELECT FROM `+history+` n
+		      WHERE n.tenant = h.tenant AND n.entity = h.entity AND n.key = h.key AND n.effective_at <= $1 AND n.id > h.id)
+		    OR h.op IN ('delete', 'expire') AND NOT EXISTS (
+		      SELECT FROM `+history+` s
+		      WHERE s.tenant = h.tenant AND s.entity = h.entity AND s.key = h.key AND s.id < h.id
+		        AND (s.id <= $5 OR s.effective_at > $1 OR (s.txid, s.id) >= ($2::pg_catalog.xid8, $3))))
+		  -- A batch, oldest first: of a row, its end goes after every version before it, so a
+		  -- batch that stops between them leaves the end, which still reads as the row's.
+		  ORDER BY h.id LIMIT $4
+		), pruned AS (
+		  -- By id, from the batch: a join could read all of history to find it.
+		  DELETE FROM `+history+` WHERE id = ANY (ARRAY(SELECT id FROM doomed)) RETURNING id
+		)
+		SELECT count(*), coalesce(max(id), 0), (SELECT last FROM win) FROM pruned`,
+		before, through.TxID, through.ID, most, from, maxPrune).Scan(&n, &reached, &end); err != nil {
+		return 0, nil, err
+	}
+	// Under a host's transaction, which goes on past the prune.
+	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', '', true), set_config('enable_sort', $1, true)`, sorting); err != nil {
+		return 0, nil, err
+	}
+	// One that deleted none left history as it was, and the call goes on to the next window itself:
+	// its record would account for no record gone, refuse AsOf times history still holds, and grow
+	// history with each window of each call of a host that prunes on a schedule.
+	if n == 0 {
+		return 0, end, nil
+	}
+	// It reached its window's end, unless its batch filled first: the rest of the window is the
+	// next call's.
+	if n < most {
+		reached = *end
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO `+history+` (effective_at, tenant, entity, key, op, after, how)
+		VALUES (now(), '', 'history', `+pruneKey+`, 'prune',
+		  jsonb_build_object('before', $1::pg_catalog.timestamptz, 'through', `+pruneThrough+`, 'deleted', $4::bigint, 'reached', $5::bigint),
+		  'PruneHistory')`, before, through.TxID, through.ID, n, reached)
+	return n, end, err
 }
 
 // Record is one change to a row the package keeps, as its history recorded it, its times in UTC.
@@ -289,8 +335,8 @@ type Record struct {
 	// Op is create, update, delete or expire; baseline, a row written before history was installed,
 	// as migrating found it, dated when it was created, or a role when it last changed, or at the
 	// epoch where that was before year 1 or at its first instant; or prune, whose After is what
-	// PruneHistory was given, how many records it deleted, and the id it reached, which a prune of
-	// the same goes on from.
+	// PruneHistory was given, how many records one of its transactions deleted, and the id it
+	// reached, which a prune of the same goes on from.
 	Op string
 	// Principal, Role, Scope, Group and ExpiresAt are those of the row, where it has them.
 	Principal Principal
