@@ -600,7 +600,10 @@ func (e *DeniedError) Error() string { return fmt.Sprintf("rbac: %s denied", e.P
 func (e *DeniedError) Is(target error) bool { return target == ErrDenied }
 
 // DB is what the package runs its queries on, and hands to the hooks: a *pgxpool.Pool, a
-// *pgx.Conn or a pgx.Tx.
+// *pgx.Conn or a pgx.Tx. A host's own DB, as one tracing its statements, that has no BeginTx begins
+// with Begin, and its transaction's first statement sets the isolation a change or a read of one
+// snapshot needs; one whose Begin gives a savepoint of a transaction under way runs them in that
+// transaction, at its isolation, as under WithTx.
 type DB interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
@@ -970,21 +973,29 @@ func actorKey(p Principal) string {
 
 // snapshot runs read on an Authorizer that reads one snapshot of the database, as a read made of
 // several statements needs, so a change committing between them can't leave it describing a state
-// that never was: on a pool, a REPEATABLE READ, READ ONLY transaction of its own; under WithTx, the
-// host's transaction, at its isolation. Constraints run before it, as their hooks may query the
-// pool while it holds a connection. A transaction that fails to commit answers nothing, as a
-// failed read does.
+// that never was: on a pool, a REPEATABLE READ, READ ONLY transaction of its own, as on a DB that
+// wraps one, as isolated says; under WithTx, or on a DB whose Begin gives a savepoint, the host's
+// transaction, at its isolation. Constraints run before it, as their hooks may query the pool while
+// it holds a connection. A transaction that fails to commit answers nothing, as a failed read does.
 func snapshot[T any](ctx context.Context, a *Authorizer, read func(*Authorizer) (T, error)) (T, error) {
-	conn, ok := a.db.(ownTx)
-	if !ok {
-		return read(a)
-	}
 	var v T
-	err := pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
+	in := func(tx pgx.Tx) error {
 		var err error
 		v, err = read(a.WithTx(tx))
 		return err
-	})
+	}
+	var err error
+	switch conn := a.db.(type) {
+	case ownTx:
+		err = pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, in)
+	case pgx.Tx:
+		return read(a)
+	default:
+		var nested bool
+		if nested, err = isolated(ctx, conn, "REPEATABLE READ, READ ONLY", in); nested {
+			return read(a)
+		}
+	}
 	if err != nil {
 		var none T
 		return none, err

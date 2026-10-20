@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -1233,15 +1234,21 @@ func (a *Authorizer) begin(ctx context.Context, fn func(pgx.Tx) error) error {
 }
 
 // begin runs fn in a transaction of its own at READ COMMITTED, whatever the database's default,
-// as a change's checks must read what committed before it took its locks; on any other DB, as a
-// pgx.Tx under WithTx, in a savepoint of that DB's transaction, whose isolation the locks check.
-// PostgreSQL refusing it for a race matches ErrConflict.
+// as a change's checks must read what committed before it took its locks; on a pgx.Tx, as under
+// WithTx, in a savepoint of its transaction, whose isolation the locks check; and on another DB,
+// as isolated says. PostgreSQL refusing it for a race matches ErrConflict.
 func begin(ctx context.Context, db DB, fn func(pgx.Tx) error) error {
 	var err error
-	if conn, ok := db.(ownTx); ok {
+	switch conn := db.(type) {
+	case ownTx:
 		err = pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, fn)
-	} else {
+	case pgx.Tx:
 		err = savepoint(ctx, db, fn)
+	default:
+		var nested bool
+		if nested, err = isolated(ctx, db, "READ COMMITTED", fn); nested {
+			err = savepoint(ctx, db, fn)
+		}
 	}
 	return conflicted(err)
 }
@@ -1249,6 +1256,26 @@ func begin(ctx context.Context, db DB, fn func(pgx.Tx) error) error {
 // ownTx is a DB that begin runs fn in a transaction of its own on, as a pool or a connection.
 type ownTx interface {
 	BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
+}
+
+// isolated runs fn in what db's Begin begins at level, on a DB that is neither an ownTx nor a
+// pgx.Tx, as a host's wrapper around a pool that traces its statements: its Begin begins at the
+// database's default, so the first statement sets it. Begin may give a savepoint of a transaction
+// under way, as a wrapper around a host's pgx.Tx does, which refuses that: then fn doesn't run, and
+// nested is set.
+func isolated(ctx context.Context, db DB, level string, fn func(pgx.Tx) error) (nested bool, err error) {
+	err = savepoint(ctx, db, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL "+level); err != nil {
+			var pg *pgconn.PgError
+			nested = errors.As(err, &pg) && pg.Code == "25001"
+			return err
+		}
+		return fn(tx)
+	})
+	if nested {
+		return true, nil
+	}
+	return false, err
 }
 
 // savepointEnd is how long a savepoint's release or rollback may take once its ctx is done.

@@ -2659,12 +2659,20 @@ func TestHostTransactionsDeletingAPrincipalDontDeadlock(t *testing.T) {
 
 func TestChangesOnASerializableDatabase(t *testing.T) {
 	h := setupOn(t, pgtest.Open(t, "default_transaction_isolation=serializable"))
-	b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}
-	if err := h.authz.Apply(t.Context(), h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
-		t.Fatalf("a change where transactions default to SERIALIZABLE: %v", err)
+	// On the pool, and on a host's wrapper around it that is only a DB, whose Begin begins at the
+	// default.
+	wrapped, err := rbac.New(struct{ rbac.DB }{h.pool}, h.cfg)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !allowed(t, h, h.as(t, "u"), login, cluster) {
-		t.Fatal("the grant should be stored")
+	for i, a := range []*rbac.Authorizer{h.authz, wrapped} {
+		u := rbac.Principal{Kind: rbac.User, ID: fmt.Sprint("u", i)}
+		if err := a.Apply(t.Context(), h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: u}}}); err != nil {
+			t.Fatalf("a change where transactions default to SERIALIZABLE, on DB %d: %v", i, err)
+		}
+		if !allowed(t, h, h.as(t, u.ID), login, cluster) {
+			t.Fatal("the grant should be stored")
+		}
 	}
 }
 
@@ -6009,6 +6017,11 @@ func (r *racing) BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error
 	return &racingTx{Tx: tx, r: r}, err
 }
 
+func (r *racing) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := r.Pool.Begin(ctx)
+	return &racingTx{Tx: tx, r: r}, err
+}
+
 type racingTx struct {
 	pgx.Tx
 	r *racing
@@ -6068,27 +6081,34 @@ func TestAReadOfSeveralStatementsReadsOneSnapshot(t *testing.T) {
 			}
 		},
 	}} {
-		t.Run(c.name, func(t *testing.T) {
-			h := setup(t)
-			u := h.as(t, "u", "ops", "contractors")
-			if _, err := h.pool.Exec(t.Context(), c.before); err != nil {
-				t.Fatal(err)
-			}
-			db := &racing{Pool: h.pool}
-			db.change = func() {
-				if _, err := h.pool.Exec(t.Context(), c.after); err != nil {
-					t.Error(err)
+		// On a pool, and on a host's wrapper around one that is only a DB, as one tracing its
+		// statements can be, whose Begin begins at the database's default.
+		for name, wrap := range map[string]func(*racing) rbac.DB{
+			"pool":    func(r *racing) rbac.DB { return r },
+			"wrapper": func(r *racing) rbac.DB { return struct{ rbac.DB }{r} },
+		} {
+			t.Run(c.name+" on a "+name, func(t *testing.T) {
+				h := setup(t)
+				u := h.as(t, "u", "ops", "contractors")
+				if _, err := h.pool.Exec(t.Context(), c.before); err != nil {
+					t.Fatal(err)
 				}
-			}
-			a, err := rbac.New(db, h.cfg)
-			if err != nil {
-				t.Fatal(err)
-			}
-			c.read(t, a, u)
-			if db.change != nil {
-				t.Fatal("the read never read denies")
-			}
-		})
+				db := &racing{Pool: h.pool}
+				db.change = func() {
+					if _, err := h.pool.Exec(t.Context(), c.after); err != nil {
+						t.Error(err)
+					}
+				}
+				a, err := rbac.New(wrap(db), h.cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				c.read(t, a, u)
+				if db.change != nil {
+					t.Fatal("the read never read denies")
+				}
+			})
+		}
 	}
 }
 
