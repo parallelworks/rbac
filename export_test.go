@@ -58,6 +58,24 @@ func SetCheckingRole(t *testing.T, f func()) {
 	t.Cleanup(func() { checkingRole = old })
 }
 
+// SetCheckingCondition runs f each time a change begins checking a condition it hasn't, until t
+// ends.
+func SetCheckingCondition(t *testing.T, f func()) {
+	t.Helper()
+	old := checkingCondition
+	checkingCondition = f
+	t.Cleanup(func() { checkingCondition = old })
+}
+
+// SetParsingCondition runs f each time a change begins parsing a condition for whether it reads
+// the subject, until t ends.
+func SetParsingCondition(t *testing.T, f func()) {
+	t.Helper()
+	old := parsingCondition
+	parsingCondition = f
+	t.Cleanup(func() { parsingCondition = old })
+}
+
 // SetDecidingGrants runs f as a change begins deciding its grants, and what f returns once it has,
 // until t ends.
 func SetDecidingGrants(t *testing.T, f func() func()) {

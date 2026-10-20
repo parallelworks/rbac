@@ -790,6 +790,7 @@ func (a *Authorizer) conditionFaults(checked map[string]error, c Condition) []st
 	case c.Expression != "":
 		err, ok := checked[c.Expression]
 		if !ok {
+			checkingCondition()
 			err = a.conds.check(c.Expression)
 			if checked != nil {
 				checked[c.Expression] = err
@@ -807,6 +808,10 @@ func (a *Authorizer) conditionFaults(checked map[string]error, c Condition) []st
 	}
 	return faults
 }
+
+// checkingCondition runs as a change begins checking a condition it hasn't, as a test counts how
+// many it compiles.
+var checkingCondition = func() {}
 
 // authority is an actor's grants on a resource's path, and the roles to read them by.
 type authority struct {
@@ -1164,11 +1169,16 @@ func (s subjects) sameFor(held, condition string) bool {
 	}
 	reads, ok := s[condition]
 	if !ok {
+		parsingCondition()
 		reads = readsSubject(condition)
 		s[condition] = reads
 	}
 	return !reads
 }
+
+// parsingCondition runs as a change begins parsing a condition for whether it reads the subject, as
+// a test counts how many it parses.
+var parsingCondition = func() {}
 
 // lasts reports whether the actor holds a grant until until, when what it hands on ends, zero for
 // never: what it holds only until a time, as an activation, it can't make last past it.
