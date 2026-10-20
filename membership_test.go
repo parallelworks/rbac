@@ -1113,6 +1113,43 @@ func TestDeleteGroupLeavesAccessAndTheHostsMembersAsTheyAre(t *testing.T) {
 	}
 }
 
+// A place from a source only the host changes, or in a group of the host's, gives nothing once it
+// has ended, as an expired grant doesn't, so DeleteGroup deletes the group with it rather than
+// refuse it until DeleteExpired runs.
+func TestDeleteGroupDeletesAGroupWhoseHostsPlacesHaveEnded(t *testing.T) {
+	h := grouped(t, func(c *rbac.Config) { c.Sources = []string{"directory"} })
+	ctx := t.Context()
+	h.groups(t, "team", "other")
+	h.join(t, "u")
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "hosts", Source: "directory"}}); err != nil {
+		t.Fatal(err)
+	}
+	// u in team and team in other from the directory, and team in the host's group, each for an hour.
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{
+		{Group: "team", Principal: identity("u"), Source: "directory", ExpiresAt: h.now.Add(time.Hour)},
+		{Group: "other", Principal: groupOf("team"), Source: "directory", ExpiresAt: h.now.Add(time.Hour)},
+		{Group: "hosts", Principal: groupOf("team"), ExpiresAt: h.now.Add(time.Hour)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	groupManager := h.as(t, "groups")
+	if err := h.authz.DeleteGroup(ctx, groupManager, "t1", "team"); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("deleting a group the host keeps places of: %v", err)
+	}
+	h.now = h.now.Add(2 * time.Hour)
+	h.events = nil
+	if err := h.authz.DeleteGroup(ctx, groupManager, "t1", "team"); err != nil {
+		t.Fatalf("deleting a group whose places from the host have all ended: %v", err)
+	}
+	if len(h.events) != 1 || len(h.events[0].DeletedGroups) != 1 {
+		t.Fatalf("events = %+v", h.events)
+	}
+	var left int
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM rbac_members WHERE tenant = 't1' AND (group_id = 'team' OR principal = 'group:team')`).Scan(&left); err != nil || left != 0 {
+		t.Fatalf("%d places of team are left once it was deleted, %v", left, err)
+	}
+}
+
 func TestAConstraintStopsManagingGroups(t *testing.T) {
 	h := grouped(t, constrain("frozen", rbac.ManageGroups))
 	ctx := t.Context()
