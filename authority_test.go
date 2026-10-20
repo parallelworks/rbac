@@ -1935,8 +1935,8 @@ func TestARemovalIsNeverRefusedForAnExclusiveConflict(t *testing.T) {
 	}
 }
 
-// Making a place or a membership end sooner is a removal, never refused for an exclusive conflict,
-// as removing it isn't; making one last longer is not.
+// Making a place or a membership end sooner, or a member a guest, is a removal, never refused for an
+// exclusive conflict, as removing it isn't; making one last longer, or a guest a member, is not.
 func TestShorteningAConflictedIdentitysPlaceOrMembershipIsNeverRefused(t *testing.T) {
 	h := labeled(t, func(c *rbac.Config) {
 		banks(c)
@@ -1973,6 +1973,17 @@ func TestShorteningAConflictedIdentitysPlaceOrMembershipIsNeverRefused(t *testin
 	if err := authz.SetMemberships(ctx, host, "t1", membership(24*time.Hour, "contractor")); err != nil {
 		t.Errorf("SetMemberships changing the note of ann's membership: %v", err)
 	}
+	moved := membership(24*time.Hour, "contractor")
+	moved[0].Source = "hr"
+	if err := authz.SetMemberships(ctx, host, "t1", moved); err != nil {
+		t.Errorf("SetMemberships changing the source of ann's membership: %v", err)
+	}
+	moved[0].Guest = true
+	if err := authz.SetMemberships(ctx, host, "t1", moved); err != nil {
+		t.Errorf("SetMemberships making ann a guest: %v", err)
+	}
+	moved[0].Guest = false
+	excluded(t, authz.SetMemberships(ctx, host, "t1", moved))
 	excluded(t, authz.ImportMembers(ctx, host, "t1", place(3*time.Hour)))
 	excluded(t, authz.ChangeMembers(ctx, admin, "t1", place(3*time.Hour), nil))
 	excluded(t, authz.SetMemberships(ctx, host, "t1", membership(48*time.Hour, "")))

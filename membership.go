@@ -232,7 +232,8 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 			return ChangeEvent{}, nil, err
 		}
 		// The places of each key leaving are found on its own and locked in order, as removeGroups
-		// finds and locks its own.
+		// finds and locks its own; each key's membership is looked up on its own, as in widening, and
+		// OFFSET 0 keeps a generic plan from making that an anti-join that reads every one.
 		left, err := removedWhere(ctx, a, tx, "rbac_members", memberColumns, collectMembers, lockedAnyOf("rbac_members", "ctid", placeOrder,
 			byKeys("rbac_members", "ctid", "principal", `(
 			  ARRAY(SELECT principal FROM rbac_memberships WHERE tenant = $1 AND principal = ANY($2::text[]) AND expires_at <= $3 FOR UPDATE)
@@ -274,13 +275,14 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 // only what the public does, so suspending one never widens what it holds, nor does a suspended
 // guest's, as the exclusive values count an identity's own grants before it joins; but a member's
 // made, renewed or lifted from a guest's while suspended will hold more once lifted, which lifting
-// it would then be refused for. One that only ends sooner, or changes its note, is a removal or no
-// change, never refused.
+// it would then be refused for. One that only ends sooner, makes a member a guest, which holds what
+// it did but what the tenant's members are granted, or changes its source or note, is a removal or
+// no change, never refused.
 func widening(ctx context.Context, tx pgx.Tx, tenant string, set []Membership, keys []string, at time.Time) ([]string, error) {
 	// Each key's membership is looked up on its own: as a join, a generic plan, costing the tenant's
 	// memberships by averages, reads every one. OFFSET 0 keeps the planner from making it one.
-	rows, err := tx.Query(ctx, `SELECT m.principal, m.guest, m.suspended, m.source, m.expires_at FROM unnest($2::text[]) AS k
-		CROSS JOIN LATERAL (SELECT principal, guest, suspended, source, expires_at FROM rbac_memberships
+	rows, err := tx.Query(ctx, `SELECT m.principal, m.guest, m.suspended, m.expires_at FROM unnest($2::text[]) AS k
+		CROSS JOIN LATERAL (SELECT principal, guest, suspended, expires_at FROM rbac_memberships
 		  WHERE tenant = $1 AND principal = k AND (expires_at IS NULL OR expires_at > $3) OFFSET 0) m`, tenant, keys, at)
 	if err != nil {
 		return nil, err
@@ -289,7 +291,7 @@ func widening(ctx context.Context, tx pgx.Tx, tenant string, set []Membership, k
 	var key string
 	var row Membership
 	var expires *time.Time
-	if _, err := pgx.ForEachRow(rows, []any{&key, &row.Guest, &row.Suspended, &row.Source, &expires}, func() error {
+	if _, err := pgx.ForEachRow(rows, []any{&key, &row.Guest, &row.Suspended, &expires}, func() error {
 		row.ExpiresAt = time.Time{}
 		if expires != nil {
 			row.ExpiresAt = *expires
@@ -306,7 +308,7 @@ func widening(ctx context.Context, tx pgx.Tx, tenant string, set []Membership, k
 		case m.Suspended && (m.Guest || ok && !old.Guest):
 		case m.Suspended:
 			widened = append(widened, keys[i])
-		case !ok || old.Guest != m.Guest || old.Suspended || old.Source != m.Source || outlasts(m.ExpiresAt, old.ExpiresAt):
+		case !ok || old.Guest && !m.Guest || old.Suspended || outlasts(m.ExpiresAt, old.ExpiresAt):
 			widened = append(widened, keys[i])
 		}
 	}
@@ -1321,7 +1323,8 @@ func (a *Authorizer) placesBounded(ctx context.Context, tx pgx.Tx, tenant string
 // which the actor must be able to set. A removed member loses the rest, which only the label of
 // each scope it is on refuses the actor, as Apply refuses a revoke there; a place made to end
 // sooner gains nothing: it is a removal then, checked as one now. Each group changed, and each
-// scope reached, is checked as Config.ResourceOf returns it. Members from a source the host owns,
+// scope reached, is checked as Config.ResourceOf returns it, a group the change adds no member to
+// that the host no longer has (ErrNotFound) as unlabeled. Members from a source the host owns,
 // and the members of a group from one, only the host changes, and what ImportMembers refuses, this
 // does.
 func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant string, add, remove []Member) (err error) {
@@ -1706,7 +1709,7 @@ func (a *Authorizer) placesLeft(ctx context.Context, q DB, tenant string, add, r
 	ending, leaves = map[string]bool{}, map[string]bool{}
 	for _, m := range add {
 		was, ok := stored[pairOf(m)][m.Source]
-		if m.ExpiresAt.IsZero() || !ok || !was.IsZero() && !was.After(m.ExpiresAt) {
+		if !ok || !outlasts(was, m.ExpiresAt) {
 			continue
 		}
 		ending[memberKey(m)] = true
