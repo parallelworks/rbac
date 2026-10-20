@@ -596,11 +596,37 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 	// The group's grants, and those on the group, as its managers', which would pass to a group
 	// made later with its id.
 	const ofGroups = "(principal = ANY($2::text[]) OR scope = ANY($3::text[]))"
-	var err error
-	if e.Revoked, err = a.remove(ctx, tx, tenant, ofGroups, principals, scopes); err != nil {
+	// DeleteScopes and DeletePrincipal hold other scopes' and principals' locks and change some of
+	// these rows too, so each table is changed in the order delete changes them, grants last, and
+	// the rows changed in it are locked in order first: otherwise they would deadlock.
+	if err := lockInOrder(ctx, tx, "rbac_eligibilities", "scope, principal, id", "("+ofGroups+" OR approvers && $2::text[])",
+		tenant, principals, scopes); err != nil {
 		return ChangeEvent{}, err
 	}
+	var err error
 	if e.Ineligible, err = a.removeEligible(ctx, tx, tenant, ofGroups, principals, scopes); err != nil {
+		return ChangeEvent{}, err
+	}
+	// An eligibility only the groups approve would need no approval without them, so it goes; the
+	// others no longer name them.
+	unapproved, err := removed(ctx, a, tx, "rbac_eligibilities", eligibilityColumns, collectEligibilities, tenant,
+		"approvers <> '{}' AND approvers <@ $2::text[]", principals)
+	if err != nil {
+		return ChangeEvent{}, err
+	}
+	e.Ineligible = append(e.Ineligible, unapproved...)
+	rows, err := tx.Query(ctx, `UPDATE rbac_eligibilities SET
+		  approvers = array(SELECT k FROM unnest(approvers) WITH ORDINALITY AS t(k, i) WHERE k <> ALL($2::text[]) ORDER BY i)
+		WHERE tenant = $1 AND approvers && $2::text[]
+		RETURNING `+eligibilityColumns, tenant, principals)
+	if err != nil {
+		return ChangeEvent{}, err
+	}
+	if e.Eligible, err = collectEligibilities(rows); err != nil {
+		return ChangeEvent{}, err
+	}
+	if err := lockInOrder(ctx, tx, "rbac_denies", "scope, id", "(scope = ANY($3::text[]) OR principals && $2::text[] OR exempt && $2::text[])",
+		tenant, principals, scopes); err != nil {
 		return ChangeEvent{}, err
 	}
 	if e.DeletedDenies, err = removed(ctx, a, tx, "rbac_denies", denyColumns, collectDenies, tenant, "scope = ANY($2::text[])", scopes); err != nil {
@@ -613,7 +639,7 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 		return ChangeEvent{}, err
 	}
 	e.DeletedDenies = append(e.DeletedDenies, unnamed...)
-	rows, err := tx.Query(ctx, `UPDATE rbac_denies SET
+	rows, err = tx.Query(ctx, `UPDATE rbac_denies SET
 		  principals = array(SELECT k FROM unnest(principals) WITH ORDINALITY AS t(k, i) WHERE k <> ALL($2::text[]) ORDER BY i),
 		  exempt = array(SELECT k FROM unnest(exempt) WITH ORDINALITY AS t(k, i) WHERE k <> ALL($2::text[]) ORDER BY i),
 		  updated_by = $3, updated_at = now()
@@ -625,29 +651,14 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 	if e.Denies, err = collectDenies(rows); err != nil {
 		return ChangeEvent{}, err
 	}
-	// An eligibility only the groups approve would need no approval without them, so it goes; the
-	// others no longer name them.
-	unapproved, err := removed(ctx, a, tx, "rbac_eligibilities", eligibilityColumns, collectEligibilities, tenant,
-		"approvers <> '{}' AND approvers <@ $2::text[]", principals)
-	if err != nil {
-		return ChangeEvent{}, err
-	}
-	e.Ineligible = append(e.Ineligible, unapproved...)
-	rows, err = tx.Query(ctx, `UPDATE rbac_eligibilities SET
-		  approvers = array(SELECT k FROM unnest(approvers) WITH ORDINALITY AS t(k, i) WHERE k <> ALL($2::text[]) ORDER BY i)
-		WHERE tenant = $1 AND approvers && $2::text[]
-		RETURNING `+eligibilityColumns, tenant, principals)
-	if err != nil {
-		return ChangeEvent{}, err
-	}
-	if e.Eligible, err = collectEligibilities(rows); err != nil {
-		return ChangeEvent{}, err
-	}
 	if e.Left, err = removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant,
-		"(group_id = ANY($2::text[]) OR principal = ANY($3::text[]))", ids, principals); err != nil {
+		placesInOrder("(group_id = ANY($2::text[]) OR principal = ANY($3::text[]))"), ids, principals); err != nil {
 		return ChangeEvent{}, err
 	}
-	e.DeletedGroups, err = removed(ctx, a, tx, "rbac_groups", groupColumns, collectGroups, tenant, "id = ANY($2::text[])", ids)
+	if e.DeletedGroups, err = removed(ctx, a, tx, "rbac_groups", groupColumns, collectGroups, tenant, "id = ANY($2::text[])", ids); err != nil {
+		return ChangeEvent{}, err
+	}
+	e.Revoked, err = a.remove(ctx, tx, tenant, inOrder("rbac_grants", ofGroups), principals, scopes)
 	return e, err
 }
 

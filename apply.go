@@ -602,7 +602,9 @@ func checkRevoke(tenant string, b Binding) []error {
 // fails the change.
 func (a *Authorizer) allowed(ctx context.Context, roles book, actor Subject, via Via, tenant string, scope Scope, b Binding) ([]error, error) {
 	role, _ := roles.role(b.Role)
-	err := a.cfg.ValidateGrant(ctx, a.db, GrantInput{Tenant: tenant, Scope: scope, Binding: b, Role: role.clone(), Actor: actor, Via: via})
+	// A copy of the actor, as a constraint is given, so a hook writing to its attributes changes
+	// nothing the change's transaction decides again.
+	err := a.cfg.ValidateGrant(ctx, a.db, GrantInput{Tenant: tenant, Scope: scope, Binding: b, Role: role.clone(), Actor: actor.copied(), Via: via})
 	switch {
 	case err == nil:
 		return nil, nil
@@ -1785,7 +1787,7 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Pri
 				if err != nil {
 					return err
 				}
-				left, err := removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, t, "principal = $2", p.key())
+				left, err := removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, t, placesInOrder("principal = $2"), p.key())
 				if err != nil {
 					return err
 				}
@@ -1825,7 +1827,8 @@ func (a *Authorizer) DeleteTenant(ctx context.Context, actor Principal, tenant s
 // deletion is what a delete removes in a tenant: grants and eligibilities where picks, denies
 // where denies does, and memberships of the tenant and of its groups where members does (none
 // where either is empty); with roles its custom roles, and with groups its groups. Each reads args
-// from $2. ordered locks the grants and eligibilities in order first (inOrder).
+// from $2. ordered locks the grants, eligibilities, denies and places in groups in order first
+// (inOrder).
 type deletion struct {
 	roles, groups, ordered bool
 	denies, where, members string
@@ -1833,11 +1836,28 @@ type deletion struct {
 
 // inOrder is SQL picking the rows of table, rbac_grants or rbac_eligibilities, that where picks,
 // once they are locked in the order of their scopes, principals and ids. DeleteScopes holds its
-// scopes' locks and DeletePrincipal its principal's, so neither waits for the other, and both
-// delete the grants of a principal on a scope: deleting them in the order of the index each
-// reads by, they would deadlock.
+// scopes' locks, DeletePrincipal its principal's and DeleteGroups its groups', so none waits for
+// another, and each deletes the grants of a principal on a scope: deleting them in the order of
+// the index each reads by, they would deadlock.
 func inOrder(table, where string) string {
 	return "id IN (SELECT id FROM " + table + " WHERE tenant = $1 AND " + where + " ORDER BY scope, principal, id FOR UPDATE)"
+}
+
+// placesInOrder is inOrder for places in groups, and deniesInOrder for denies, by their keys.
+func placesInOrder(where string) string {
+	return "(group_id, principal, source) IN (SELECT group_id, principal, source FROM rbac_members WHERE tenant = $1 AND " + where +
+		" ORDER BY group_id, principal, source FOR UPDATE)"
+}
+
+func deniesInOrder(where string) string {
+	return "(scope, id) IN (SELECT scope, id FROM rbac_denies WHERE tenant = $1 AND " + where + " ORDER BY scope, id FOR UPDATE)"
+}
+
+// lockInOrder locks, in tx, the rows of table in tenant $1 that where picks, in order, for a
+// change that changes them in several statements.
+func lockInOrder(ctx context.Context, tx pgx.Tx, table, order, where string, args ...any) error {
+	_, err := tx.Exec(ctx, `SELECT FROM `+table+` WHERE tenant = $1 AND `+where+` ORDER BY `+order+` FOR UPDATE`, args...)
+	return err
 }
 
 // delete removes what del picks in a tenant as actor, by how, once lock holds.
@@ -1854,9 +1874,15 @@ func (a *Authorizer) delete(ctx context.Context, actor Principal, tenant, how st
 		}
 		var e ChangeEvent
 		var err error
-		eligible, granted := del.where, del.where
+		eligible, granted, denied, places := del.where, del.where, del.denies, del.members
 		if del.ordered {
 			eligible, granted = inOrder("rbac_eligibilities", del.where), inOrder("rbac_grants", del.where)
+			if denied != "" {
+				denied = deniesInOrder(denied)
+			}
+			if places != "" {
+				places = placesInOrder(places)
+			}
 		}
 		if e.Ineligible, err = a.removeEligible(ctx, tx, tenant, eligible, args...); err != nil {
 			return ChangeEvent{}, err
@@ -1871,7 +1897,7 @@ func (a *Authorizer) delete(ctx context.Context, actor Principal, tenant, how st
 			}
 		}
 		if del.denies != "" {
-			if e.DeletedDenies, err = removed(ctx, a, tx, "rbac_denies", denyColumns, collectDenies, tenant, del.denies, args...); err != nil {
+			if e.DeletedDenies, err = removed(ctx, a, tx, "rbac_denies", denyColumns, collectDenies, tenant, denied, args...); err != nil {
 				return ChangeEvent{}, err
 			}
 		}
@@ -1881,7 +1907,7 @@ func (a *Authorizer) delete(ctx context.Context, actor Principal, tenant, how st
 			if e.EndedMemberships, err = removed(ctx, a, tx, "rbac_memberships", membershipColumns, collectMemberships, tenant, del.members, args...); err != nil {
 				return ChangeEvent{}, err
 			}
-			if e.Left, err = removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant, del.members, args...); err != nil {
+			if e.Left, err = removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant, places, args...); err != nil {
 				return ChangeEvent{}, err
 			}
 		}

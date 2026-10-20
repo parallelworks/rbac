@@ -846,32 +846,30 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 	}
 	// Denies on scopes a resource of the type can have on its path: those of the type, the
 	// containers and the tenant.
-	perm, wildcard, deniable := matchable(p)
-	if !deniable {
-		return reach, nil
-	}
-	rows, err = a.db.Query(ctx, `
-		SELECT scope, bool_or(condition = '') FROM rbac_denies
-		WHERE tenant = $1 AND scope_type = ANY($2::text[])
-		  AND principals && $3::text[] AND NOT exempt && $6::text[] AND ($4 = ANY(permissions) OR $5 = ANY(permissions))
-		GROUP BY scope ORDER BY scope`,
-		tenant, reaching, binding, perm, wildcard, exempting(keys, s))
-	if err != nil {
-		return Reach{}, err
-	}
-	var always bool
-	if _, err := pgx.ForEachRow(rows, []any{&key, &always}, func() error {
-		if always {
-			reach.Except = append(reach.Except, parseScope(key))
-		} else {
-			reach.ConditionalExcept = append(reach.ConditionalExcept, parseScope(key))
+	if perm, wildcard, deniable := matchable(p); deniable {
+		rows, err = a.db.Query(ctx, `
+			SELECT scope, bool_or(condition = '') FROM rbac_denies
+			WHERE tenant = $1 AND scope_type = ANY($2::text[])
+			  AND principals && $3::text[] AND NOT exempt && $6::text[] AND ($4 = ANY(permissions) OR $5 = ANY(permissions))
+			GROUP BY scope ORDER BY scope`,
+			tenant, reaching, binding, perm, wildcard, exempting(keys, s))
+		if err != nil {
+			return Reach{}, err
 		}
-		return nil
-	}); err != nil {
-		return Reach{}, err
-	}
-	if slices.Contains(reach.Except, TenantRoot(tenant)) {
-		return Reach{}, nil
+		var always bool
+		if _, err := pgx.ForEachRow(rows, []any{&key, &always}, func() error {
+			if always {
+				reach.Except = append(reach.Except, parseScope(key))
+			} else {
+				reach.ConditionalExcept = append(reach.ConditionalExcept, parseScope(key))
+			}
+			return nil
+		}); err != nil {
+			return Reach{}, err
+		}
+		if slices.Contains(reach.Except, TenantRoot(tenant)) {
+			return Reach{}, nil
+		}
 	}
 	if reach.All {
 		reach.Scopes, reach.Conditional = nil, nil

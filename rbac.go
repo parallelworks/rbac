@@ -199,6 +199,12 @@ func (a *Authorizer) subject(s Subject) error {
 	return nil
 }
 
+// copied is s with its attributes a deep copy, for a hook to be given.
+func (s Subject) copied() Subject {
+	s.Attributes = deepCopy(s.Attributes)
+	return s
+}
+
 // identityKey is the subject's key, as membership is read by: empty for the anonymous, which no
 // membership has.
 func (s Subject) identityKey() string {
@@ -532,8 +538,7 @@ type ConstraintInput struct {
 // copied is in with its subject and resource deep copies.
 func (in ConstraintInput) copied() ConstraintInput {
 	if in.Subject != nil {
-		s := *in.Subject
-		s.Attributes = deepCopy(s.Attributes)
+		s := in.Subject.copied()
 		in.Subject = &s
 	}
 	if in.Resource != nil {
@@ -931,7 +936,7 @@ type GrantInput struct {
 	// Role is what the grant gives: the role as defined now, or with ViaRedefinition, as it will be.
 	Role RoleDefinition
 	// Actor is who makes it: the subject changing grants, setting an eligibility, activating or
-	// redefining the role, or Import's actor.
+	// redefining the role, or Import's actor. Its attributes are a copy of the hook's own.
 	Actor Subject
 	// Via is how it is made.
 	Via Via

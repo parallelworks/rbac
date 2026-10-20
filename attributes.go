@@ -251,8 +251,9 @@ func typing(attrs Attributes) (*cel.Env, error) {
 	)
 }
 
-// deepCopy is a copy of v whose maps, slices, arrays and pointers are its own, however deep, a
-// protobuf message among them cloned, and a value reached twice copied once, so a cycle ends.
+// deepCopy is a copy of v whose maps, slices, arrays, pointers and structs' exported fields are its
+// own, however deep, a protobuf message among them cloned, and a value reached twice copied once,
+// so a cycle ends.
 func deepCopy[T any](v T) T {
 	out := reflect.ValueOf(&v).Elem()
 	out.Set(copier{}.copy(out))
@@ -302,8 +303,24 @@ func (c copier) copy(v reflect.Value) reflect.Value {
 		}
 		out := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
 		c[k] = out
+		// Each hook is given its own, so elements no write could reach through are copied at once.
+		if flat(v.Type().Elem()) {
+			reflect.Copy(out, v)
+			return out
+		}
 		for i := range v.Len() {
 			out.Index(i).Set(c.copy(v.Index(i)))
+		}
+		return out
+	case reflect.Struct:
+		// Its exported fields, which a hook can write to: an unexported one is out of its reach, as
+		// out of reflection's to set.
+		out := reflect.New(v.Type()).Elem()
+		out.Set(v)
+		for i := range v.NumField() {
+			if f := out.Field(i); f.CanSet() {
+				f.Set(c.copy(v.Field(i)))
+			}
 		}
 		return out
 	case reflect.Array:
@@ -329,5 +346,17 @@ func (c copier) copy(v reflect.Value) reflect.Value {
 		return out
 	default:
 		return v
+	}
+}
+
+// flat reports whether a value of type t holds no map, slice or pointer a copy would share.
+func flat(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128, reflect.String:
+		return true
+	default:
+		return false
 	}
 }
