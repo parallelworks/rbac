@@ -98,6 +98,13 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 		}
 	}
 	return a.change(ctx, actor, on, "Apply", ViaApply, grants, revokes, nil, nil, func(tx pgx.Tx) (ChangeEvent, error) {
+		// Read before the change's revokes too, so one moving a condition from a grant it revokes to
+		// one it grants adds none.
+		stored := scopeGrants(scope, grants)
+		before, err := a.conditionsBefore(ctx, tx, on.Tenant, stored)
+		if err != nil {
+			return ChangeEvent{}, err
+		}
 		revoked, err := a.revoke(ctx, tx, on.Tenant, scope, revokes, grants)
 		if err != nil {
 			return ChangeEvent{}, err
@@ -113,7 +120,7 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 		if err := errors.Join(owned...); err != nil {
 			return ChangeEvent{}, err
 		}
-		granted, err := a.upsert(ctx, tx, on.Tenant, actor.Principal, scopeGrants(scope, grants))
+		granted, err := a.upsert(ctx, tx, on.Tenant, actor.Principal, stored, before)
 		return ChangeEvent{Granted: granted, Revoked: revoked}, err
 	})
 }
@@ -556,7 +563,11 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 		if err := redefinedSince(roles, now, roleIDs(grants)); err != nil {
 			return ChangeEvent{}, err
 		}
-		granted, err := a.upsert(ctx, tx, tenant, actor, grants)
+		before, err := a.conditionsBefore(ctx, tx, tenant, grants)
+		if err != nil {
+			return ChangeEvent{}, err
+		}
+		granted, err := a.upsert(ctx, tx, tenant, actor, grants, before)
 		return ChangeEvent{Granted: granted}, err
 	})
 }
@@ -1596,8 +1607,11 @@ func (a *Authorizer) report(ctx context.Context, tx pgx.Tx, e ChangeEvent) error
 
 // upsert stores grants in one statement, sorted so concurrent changes lock rows in the same
 // order, and returns those it added or whose note it changed. Of grants that are one grant it
-// stores the last, since one statement can't change a row twice.
-func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, grants []Grant) ([]Grant, error) {
+// stores the last, since one statement can't change a row twice. before is conditionsBefore the
+// change.
+func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, grants []Grant,
+	before map[conditionBucket]map[string]int,
+) ([]Grant, error) {
 	if len(grants) == 0 {
 		return nil, nil
 	}
@@ -1610,13 +1624,6 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 	slices.Reverse(grants)
 	slices.SortStableFunc(grants, byKey)
 	grants = slices.CompactFunc(grants, func(x, y Grant) bool { return byKey(x, y) == 0 })
-	// What the conditions a check reads together cost before, so a change can store again what was
-	// stored past the bound before there were bounds.
-	buckets := a.bucketsOf(grants)
-	before, err := a.conditionsIn(ctx, tx, tenant, buckets)
-	if err != nil {
-		return nil, err
-	}
 	n := len(grants)
 	scopeTypes, scopeIDs, kinds, ids, roles := make([]string, n), make([]string, n), make([]string, n), make([]string, n), make([]string, n)
 	sources, expires := make([]string, n), make([]pgtype.Timestamptz, n)
@@ -1656,10 +1663,16 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 	if err := a.bounded(ctx, tx, tenant, granted); err != nil {
 		return nil, err
 	}
-	if err := a.conditionsBounded(ctx, tx, tenant, buckets, before); err != nil {
+	if err := a.conditionsBounded(ctx, tx, tenant, a.bucketsOf(grants), before); err != nil {
 		return nil, err
 	}
 	return granted, nil
+}
+
+// conditionsBefore is conditionsIn the buckets of grants a change stores, read under its locks
+// before it writes, so it can store again what was stored past the bound before there were bounds.
+func (a *Authorizer) conditionsBefore(ctx context.Context, tx pgx.Tx, tenant string, grants []Grant) (map[conditionBucket]map[string]int, error) {
+	return a.conditionsIn(ctx, tx, tenant, a.bucketsOf(grants))
 }
 
 // conditionBucket is conditional grants a check reads together on a scope: an identity's own, or,

@@ -5661,6 +5661,47 @@ func TestAGrantBesideOneTheActorCantRevokeLeavesItGiving(t *testing.T) {
 	}
 }
 
+// An actor's power to change grants, held under a condition, is decided as a check is: conditional
+// grants beside it, as by an admin of a scope below, who can't revoke it, leave it giving that power.
+func TestAPowerBesideGrantsTheActorCantRevokeLeavesItGiving(t *testing.T) {
+	helpdesk := rbac.RoleDefinition{
+		ID: "cluster.helpdesk", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"},
+		GrantableRoles: []rbac.Role{"cluster.login"},
+	}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), helpdesk) })
+	ctx := t.Context()
+	mfa := rbac.Condition{Expression: `request.attributes.mfa == true && request.attributes.network == "corp" && request.attributes.device != "unmanaged"`}
+	admin := grant(workspace.Scope(), "cluster.admin", rbac.User, "v")
+	admin.Condition = mfa
+	h.seed(t, admin)
+	h.groups(t, "staff")
+	v, owner := h.as(t, "v", "staff"), h.as(t, "owner")
+	// The cluster's admin gives v and its group the power to grant login there, each under a condition
+	// of its own, shorter than the workspace grant's, and so evaluated before it, and costing all one
+	// may.
+	l := "[1,2,3,4,5,6,7,8]"
+	refused := map[rbac.Principal]bool{}
+	for i := range 8 {
+		for j, p := range []rbac.Principal{v.Principal, groupOf("staff")} {
+			expr := fmt.Sprintf(`%s.all(a,%s.all(b,%s.all(c,%s.all(d,a>%d))))`, l, l, l, l, -1-i-10*j)
+			err := h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.helpdesk", Principal: p, Condition: rbac.Condition{Expression: expr}}}})
+			switch {
+			case errors.Is(err, rbac.ErrInvalid):
+				refused[p] = true
+			case err != nil:
+				t.Fatal(err)
+			}
+		}
+	}
+	if len(refused) != 2 {
+		t.Errorf("refused costly conditions only for %v", refused)
+	}
+	req := rbac.WithRequest(ctx, map[string]any{"mfa": true, "network": "corp", "device": "managed"})
+	if err := h.authz.Apply(req, v, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("w"), Condition: mfa}}}); err != nil {
+		t.Fatalf("grants the cluster's admin made stopped one it can't revoke giving the power to grant: %v", err)
+	}
+}
+
 // What the conditions a check reads on a scope cost together is bounded where they are stored, each
 // distinct one counted once: an identity's grants', of any role, and those of the grants to groups,
 // the tenant's members and the public, which reach many, together. Another identity's, another
@@ -5783,8 +5824,8 @@ func TestAHostsSourceIsBoundedApartFromTheTenantsGrants(t *testing.T) {
 }
 
 // Where conditions stored before there were bounds cost more than a check may spend, a change that
-// adds none, as one changing a note, granting one held again or restoring them as they are, isn't
-// refused; one adding a condition is.
+// adds none, as one changing a note, granting one held again, moving one from a grant it revokes to
+// one it grants or restoring them as they are, isn't refused; one adding a condition is.
 func TestAChangePastTheBoundIsRefusedOnlyForAConditionItAdds(t *testing.T) {
 	h, guardian := guarded(t)
 	ctx := t.Context()
@@ -5813,12 +5854,21 @@ func TestAChangePastTheBoundIsRefusedOnlyForAConditionItAdds(t *testing.T) {
 			Condition: rbac.Condition{Expression: expr},
 		})
 	}
+	var moved string
+	if err := h.pool.QueryRow(ctx, `SELECT id FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:u' AND condition = $1`,
+		spending(3)).Scan(&moved); err != nil {
+		t.Fatal(err)
+	}
 	for name, err := range map[string]error{
 		"a note":                         under("cluster.login", "on call", spending(0)),
 		"another role, a condition held": under("cluster.sudo", "", spending(1)),
 		"restoring them":                 h.authz.Import(ctx, host, "t1", grants),
-		"a deny's name":                  deny("d0", "renamed", spending(0)),
-		"a deny, a condition held":       deny("d4", "", spending(2)),
+		"a condition moved to another role": h.authz.Apply(ctx, owner, cluster, rbac.Change{
+			Revoke: []rbac.Binding{{ID: moved, Role: "cluster.login", Principal: identity("u")}},
+			Grant:  []rbac.Binding{{Role: "cluster.sudo", Principal: identity("u"), Condition: rbac.Condition{Expression: spending(3)}}},
+		}),
+		"a deny's name":            deny("d0", "renamed", spending(0)),
+		"a deny, a condition held": deny("d4", "", spending(2)),
 	} {
 		if err != nil {
 			t.Errorf("%s: %v", name, err)
@@ -5833,6 +5883,28 @@ func TestAChangePastTheBoundIsRefusedOnlyForAConditionItAdds(t *testing.T) {
 		if !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("adding %s: %v", name, err)
 		}
+	}
+}
+
+// Conditions stored past the bound before there were bounds can be many, and learning what one can
+// cost compiles it: a change among them, under its locks, compiles no more of them than it takes to
+// find them past the bound.
+func TestAChangePastTheBoundCompilesFewOfTheConditionsThere(t *testing.T) {
+	h := setup(t)
+	var grants []rbac.Grant
+	for i := range 40 {
+		g := grant(cluster.Scope(), "cluster.login", rbac.Group, fmt.Sprintf("g%02d", i))
+		g.Condition = rbac.Condition{Expression: spending(i)}
+		grants = append(grants, g)
+	}
+	storeAround(t, h, grants...)
+	if err := h.authz.Apply(t.Context(), h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{{
+		Role: "cluster.sudo", Principal: groupOf("g00"), Condition: rbac.Condition{Expression: spending(0)},
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	if n := rbac.Limits(h.authz); n > 5 {
+		t.Errorf("the change compiled %d of the conditions there", n)
 	}
 }
 

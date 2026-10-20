@@ -80,6 +80,13 @@ func Compiled(a *Authorizer) int {
 	return len(a.conds.programs)
 }
 
+// Limits is how many conditions a keeps the limit of, the most evaluating each can cost.
+func Limits(a *Authorizer) int {
+	a.conds.mu.RLock()
+	defer a.conds.mu.RUnlock()
+	return len(a.conds.limits)
+}
+
 // CountEvaluations counts the conditions evaluated until t ends.
 func CountEvaluations(t *testing.T) *int {
 	t.Helper()

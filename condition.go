@@ -155,11 +155,16 @@ func budgetOf(left uint64) *budget {
 	return &budget{left: left, compiled: map[string]bool{}, decided: map[string]decision{}}
 }
 
-// most is what a check can spend on conditions: each compiled once, and evaluated as many times as
-// evaluations has it, and at least once, each time costing at most what limit says.
+// most is what a check can spend on conditions, counted no further than past maxCheckCost: each
+// compiled once, and evaluated as many times as evaluations has it, and at least once, each time
+// costing at most what limit says. It stops there: conditions stored past the bound before there
+// were bounds can be many, and a change learns their limits by compiling them, under its locks.
 func most(evaluations map[string]int, limit func(string) uint64) uint64 {
 	var n uint64
 	for e, k := range evaluations {
+		if n > maxCheckCost {
+			break
+		}
 		n = cost.SafeAdd(n, cost.SafeAdd(uint64(len(e))*compilePerByte, cost.SafeMultiply(limit(e), uint64(max(k, 1)))))
 	}
 	return n
