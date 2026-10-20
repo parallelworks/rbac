@@ -1211,6 +1211,7 @@ func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string,
 	}
 	seen.keys[key] = true
 	seen.order = append(seen.order, key)
+	checkingRole()
 	for _, p := range def.Permissions {
 		t, verb := p.parts()
 		// Where the grant doesn't reach scopes of t, its t:grant changes no grants there: it is a
@@ -1249,6 +1250,14 @@ func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string,
 	}
 	return "", true
 }
+
+// checkingRole runs as holdsRole begins checking a role it hasn't for a decision, as a test counts
+// how many a change walks.
+var checkingRole = func() {}
+
+// decidingGrants runs as mayChangeBy begins deciding a change's grants, and what it returns once it
+// has, as a test measures what keeping what each proved costs, which counting checks can't show.
+var decidingGrants = func() func() { return func() {} }
 
 // checked are holdsRole's checks, each a role with what its grant reaches, its end and condition,
 // done or under way for the grants a decision makes, in the order they began: what a grant allowed
@@ -1289,6 +1298,7 @@ type grantDecided struct {
 // there, with the constraints on what it hands on, once the constraints on changing grants there
 // are checked.
 func (a *Authorizer) mayChangeBy(au authority, on Resource, grants, revokes []Binding) error {
+	defer decidingGrants()()
 	scope := on.Scope()
 	manage := GrantPermission(scope.Type)
 	cs := au.constrained
