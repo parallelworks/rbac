@@ -830,6 +830,9 @@ type authority struct {
 	// constrained is what the constraints remove from the actor, which it can't hand on.
 	constrained *constrained
 	subjects    subjects
+	// proven is holdsRole's checks of the grants decided by this authority, and by those on other
+	// scopes read with it that hand on just as it does.
+	proven *checked
 }
 
 // constrained is what the constraints remove from an actor handing permissions on through a
@@ -1021,11 +1024,32 @@ func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []
 	if err := a.conditionsOf(ctx, q, tenant, held); err != nil {
 		return nil, err
 	}
-	heldOn := onPaths(held, func(h holding) string { return h.scope }, paths)
+	at := make([]int, len(held))
+	for i := range at {
+		at[i] = i
+	}
+	heldAt := onPaths(at, func(i int) string { return held[i].scope }, paths)
 	deniedOn := onPaths(ds, func(d denial) string { return d.scope }, paths)
+	// Where the actor holds the same grants on two scopes, and neither a deny nor a constraint can
+	// tell them apart, as none binds the actor there, what it may hand on is the same on both: what
+	// deciding a grant on one proved holds on the other, so a change reaching many, as one to the
+	// members of a group granted a role on each, walks the roles a role lists once.
+	proven := map[string]*checked{}
 	aus := make([]authority, len(on))
 	for i, r := range on {
-		aus[i] = a.authorityOf(ctx, actor, r, heldOn[i], deniedOn[i], b)
+		heldOn := make([]holding, len(heldAt[i]))
+		for j, k := range heldAt[i] {
+			heldOn[j] = held[k]
+		}
+		aus[i] = a.authorityOf(ctx, actor, r, heldOn, deniedOn[i], b)
+		if len(a.cfg.Constraints) > 0 || len(deniedOn[i]) > 0 {
+			continue
+		}
+		k := fmt.Sprint(heldAt[i])
+		if proven[k] == nil {
+			proven[k] = newChecked()
+		}
+		aus[i].proven = proven[k]
 	}
 	return aus, nil
 }
@@ -1189,6 +1213,25 @@ func (h holding) lasts(until time.Time) bool {
 	return h.ends.IsZero() || !until.IsZero() && !h.ends.Before(until)
 }
 
+// decidedAs is the condition and end a grant made under condition until until is decided by, the
+// same for every grant the actor's grants can't tell apart, so a change granting a role to many,
+// each until its own time, decides it once. A condition none of its conditional grants has gives
+// it what none does: its conditional grants give nothing under either, nor list a role for it,
+// and the others give under both what they give. And each of its grants lasts until until just as
+// it lasts until the soonest of their ends at or after it, or never where none ends then.
+func (au authority) decidedAs(condition string, until time.Time) (string, time.Time) {
+	if !slices.ContainsFunc(au.held, func(g holding) bool { return g.conditional && g.Condition.Expression == condition }) {
+		condition = ""
+	}
+	var at time.Time
+	for _, g := range au.held {
+		if !until.IsZero() && !g.ends.IsZero() && !g.ends.Before(until) && (at.IsZero() || g.ends.Before(at)) {
+			at = g.ends
+		}
+	}
+	return condition, at.UTC()
+}
+
 // holds reports whether the actor holds p for resources of a type, to hand it on with condition
 // until until: neither a deny nor a constraint removes it.
 func (au authority) holds(p Permission, resourceType, condition string, until time.Time) bool {
@@ -1347,22 +1390,26 @@ func (a *Authorizer) mayChangeBy(au authority, on Resource, grants, revokes []Bi
 			errs = append(errs, &DeniedError{Permission: manage, Scope: scope, Reason: fmt.Sprintf("the actor may not revoke %s here", b.Role)})
 		}
 	}
-	// A role is decided once for each condition and end, by what it lacks then, if anything, or a
-	// change granting it to many would walk what it lists for each; and what a grant allowed proved
-	// holds for the others, as Grantable keeps it: a refused one's checks are dropped, as some passed
-	// only while it was in progress.
-	decisions, proven := map[grantAsked]grantDecided{}, newChecked()
+	// A role is decided once for each condition and end the actor's grants tell apart, by what it
+	// lacks then, if anything, or a change granting it to many would walk what it lists for each;
+	// and what a grant allowed proved holds for the others, as Grantable keeps it: a refused one's
+	// checks are dropped, as some passed only while it was in progress.
+	decisions, proven := map[grantAsked]grantDecided{}, au.proven
+	if proven == nil {
+		proven = newChecked()
+	}
 	for _, b := range grants {
 		def, known := au.roles.role(b.Role)
 		if !known || !a.grantableOn(def, scope.Type) {
 			// validate reports it as invalid rather than as an escalation.
 			continue
 		}
-		k := grantAsked{role: b.Role, condition: b.Condition.Expression, until: b.ExpiresAt.UTC()}
+		condition, until := au.decidedAs(b.Condition.Expression, b.ExpiresAt)
+		k := grantAsked{role: b.Role, condition: condition, until: until}
 		d, decided := decisions[k]
 		if !decided {
 			mark := proven.mark()
-			if d.lacks, d.ok = a.mayGrant(au, pw, scope.Type, def, b.Condition.Expression, b.ExpiresAt, proven); !d.ok {
+			if d.lacks, d.ok = a.mayGrant(au, pw, scope.Type, def, condition, until, proven); !d.ok {
 				proven.drop(mark)
 			}
 			decisions[k] = d

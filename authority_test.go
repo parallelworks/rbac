@@ -1072,6 +1072,56 @@ func TestWhatEndsIsHandedOnNoLongerThanItsLatestHolding(t *testing.T) {
 	}
 }
 
+// Grants of one role in one change are each decided by what the actor holds under their condition
+// until they end, however many share a decision.
+func TestGrantsInOneChangeAreEachDecidedByWhatTheActorHoldsThen(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), granter) })
+	ctx := t.Context()
+	hour, later := h.now.Add(time.Hour), h.now.Add(3*time.Hour)
+	mfa := rbac.Condition{Expression: `request.attributes.mfa == true`}
+	other := rbac.Condition{Expression: `request.attributes.site == "lab"`}
+	// u changes grants for good, and holds sudo until an hour from now, and under mfa until later.
+	sudo, underMFA := grant(cluster.Scope(), "cluster.sudo", rbac.User, "u"), grant(cluster.Scope(), "cluster.sudo", rbac.User, "u")
+	sudo.ExpiresAt, underMFA.ExpiresAt, underMFA.Condition = hour, later, mfa
+	h.seed(t, grant(cluster.Scope(), "cluster.granter", rbac.User, "u"), sudo, underMFA)
+	u := h.as(t, "u")
+	cases := []struct {
+		until   time.Time
+		under   rbac.Condition
+		granted bool
+	}{
+		{hour.Add(-time.Second), rbac.Condition{}, true},
+		{hour, rbac.Condition{}, true},
+		{hour, other, true},
+		{hour.Add(time.Second), rbac.Condition{}, false},
+		{hour.Add(time.Second), other, false},
+		{hour.Add(time.Second), mfa, true},
+		{later, mfa, true},
+		{later.Add(time.Second), mfa, false},
+		{time.Time{}, mfa, false},
+		{time.Time{}, rbac.Condition{}, false},
+	}
+	var all, granted rbac.Change
+	refused := 0
+	for i, c := range cases {
+		b := rbac.Binding{Role: "cluster.sudo", Principal: identity(fmt.Sprintf("p%d", i)), ExpiresAt: c.until, Condition: c.under}
+		all.Grant = append(all.Grant, b)
+		if c.granted {
+			granted.Grant = append(granted.Grant, b)
+		} else {
+			refused++
+		}
+	}
+	err := h.authz.Apply(ctx, u, cluster, all)
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok || len(joined.Unwrap()) != refused || !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("want %d of the grants refused, got %v", refused, err)
+	}
+	if err := h.authz.Apply(ctx, u, cluster, granted); err != nil {
+		t.Fatalf("the grants u holds sudo for, under their condition until they end: %v", err)
+	}
+}
+
 func TestDefiningARoleNeedsWhatItGivesHeldForGood(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
