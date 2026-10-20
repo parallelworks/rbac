@@ -842,7 +842,10 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 	}
 	// Denies on scopes a resource of the type can have on its path: those of the type, the
 	// containers and the tenant.
-	perm, wildcard := matchable(p)
+	perm, wildcard, deniable := matchable(p)
+	if !deniable {
+		return reach, nil
+	}
 	rows, err = a.db.Query(ctx, `
 		SELECT scope, bool_or(condition = '') FROM rbac_denies
 		WHERE tenant = $1 AND scope_type = ANY($2::text[])
@@ -943,7 +946,11 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 		return Predicate{SQL: "FALSE"}, nil
 	}
 	arg := func(i int) string { return fmt.Sprintf("$%d", firstArg+i) }
-	perm, wildcard := matchable(p)
+	// Null for a permission no deny removes, which no deny's permissions then match.
+	var perm, wildcard any
+	if listed, covering, ok := matchable(p); ok {
+		perm, wildcard = listed, covering
+	}
 	// The subject's principals, read in the statement as its grants and denies are, so a list
 	// reads its membership, its groups and what they hold in one snapshot.
 	keys := func(of string) string {
@@ -1118,8 +1125,15 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Su
 		return nil, nil, b, nil
 	}
 	var perm, wildcard string
+	deniable := true
 	if p != "" {
-		perm, wildcard = matchable(p)
+		perm, wildcard, deniable = matchable(p)
+	}
+	// No deny is read for a permission none removes, so no row stored around the package can
+	// remove it: in the statement's text, which then plans no read of them.
+	read := "TRUE"
+	if !deniable {
+		read = "FALSE"
 	}
 	// The latest end of the subject's place in each group, by any path to it, and of its
 	// membership, which every key but the public's rests on; null for never. In the statement,
@@ -1167,7 +1181,7 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Su
 		UNION ALL
 		SELECT 1, id, id, scope, '', NULL, condition <> '', permissions, condition, NULL, false, false, NULL, '', ''
 		FROM rbac_denies
-		WHERE tenant = $1 AND scope = ANY($3::text[]) AND principals && ARRAY(SELECT k FROM bound) AND NOT exempt && ARRAY(SELECT k FROM exempted)
+		WHERE `+read+` AND tenant = $1 AND scope = ANY($3::text[]) AND principals && ARRAY(SELECT k FROM bound) AND NOT exempt && ARRAY(SELECT k FROM exempted)
 		  AND ($5 = '' OR $5 = ANY(permissions) OR $6 = ANY(permissions)) AND EXISTS (SELECT FROM keys WHERE `+counted("$7", "$8")+`)
 		UNION ALL
 		SELECT 2, id, '', '', id, NULL, false, permissions, '', resource_types, privileged, public, grantable_roles, name, description

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/rbac"
@@ -5383,6 +5384,77 @@ func TestNoDenyLocksOutAGuardAbove(t *testing.T) {
 	}
 	if !allowed(t, h, h.as(t, "owner"), view, cluster) {
 		t.Fatal("a lifted deny should end")
+	}
+}
+
+func TestNoStoredDenyRemovesThePowerToSetDenies(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	resources := hostTable(t, h)
+	tenant := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}
+	// Rows written around the package, and past what the table checks of them: one listing what a
+	// deny of an undeniable permission was once matched as, and others listing one.
+	if _, err := h.pool.Exec(ctx, `ALTER TABLE rbac_denies DROP CONSTRAINT rbac_denies_permissions_deniable`); err != nil {
+		t.Fatal(err)
+	}
+	for i, perms := range []string{"{-}", "{cluster:deny}", "{tenant:deny,workspace:deny}"} {
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+			VALUES ('t1', 'tenant', 't1', $1, '{public:}', $2)`, fmt.Sprint("odd", i), perms); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, r := range []rbac.Resource{cluster, workspace, tenant} {
+		p := rbac.DenyPermission(r.Type)
+		if !allowed(t, h, guardian, p, r) {
+			t.Errorf("a stored deny removed %s", p)
+		}
+		if d, err := h.authz.Explain(ctx, guardian, p, r); err != nil || !d.Allowed {
+			t.Errorf("Explain(%s) = %+v, %v", p, d, err)
+		}
+		if perms, err := h.authz.Permissions(ctx, guardian, r); err != nil || !slices.Contains(perms, p) {
+			t.Errorf("Permissions = %v, %v", perms, err)
+		}
+		if holders, err := h.authz.Holders(ctx, p, r); err != nil || !slices.ContainsFunc(holders, func(x rbac.Holder) bool { return x.Principal == guardian.Principal && !x.MaybeDenied }) {
+			t.Errorf("Holders(%s) = %+v, %v", p, holders, err)
+		}
+		if reach, err := h.authz.Reachable(ctx, guardian, p, "t1", r.Type); err != nil || !reach.All || len(reach.Except)+len(reach.ConditionalExcept) > 0 {
+			t.Errorf("Reachable(%s) = %+v, %v", p, reach, err)
+		}
+	}
+	listingsAgree(t, h, resources, guardian, rbac.DenyPermission("cluster"))
+	for i := range 3 {
+		if err := h.authz.DeleteDeny(ctx, guardian, tenant, fmt.Sprint("odd", i)); err != nil {
+			t.Errorf("lifting a stored deny of the power to lift it: %v", err)
+		}
+	}
+}
+
+func TestADenyStoresOnlyPermissionsADenyRemoves(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	insert := func(perms []*string) error {
+		_, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+			VALUES ('t1', 'cluster', 'c1', 'd', '{public:}', $1)`, perms)
+		return err
+	}
+	text := func(ps ...string) []*string {
+		out := make([]*string, len(ps))
+		for i := range ps {
+			out[i] = &ps[i]
+		}
+		return out
+	}
+	for _, perms := range [][]*string{
+		text("-"), text("cluster:deny"), text("cluster:login", "workspace:deny"), text("cluster:Login"), text("cluster"),
+		text(":login"), text("cluster:login "), text(""), text("cluster:login", ""), append(text("cluster:login"), nil),
+	} {
+		var pg *pgconn.PgError
+		if err := insert(perms); !errors.As(err, &pg) || pg.Code != "23514" {
+			t.Errorf("a deny of %v stored: %v", perms, err)
+		}
+	}
+	if err := insert(text("cluster:login", "workspace:*", "cluster:root-ish")); err != nil {
+		t.Fatalf("a deny of permissions and a type's every one: %v", err)
 	}
 }
 

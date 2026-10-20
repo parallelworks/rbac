@@ -51,20 +51,21 @@ func undeniable(p Permission) bool {
 	return verb == "deny"
 }
 
-// matchable is what deny queries match for p: p and the `type:*` that covers it, or what no deny
-// lists for a permission none can remove.
-func matchable(p Permission) (perm, wildcard string) {
+// matchable is what deny queries match for p: p and the `type:*` that covers it; for a
+// permission none can remove, ok is false, and nothing is read, so no row stored around the
+// package can remove it either.
+func matchable(p Permission) (perm, wildcard string, ok bool) {
 	if undeniable(p) {
-		return "-", "-"
+		return "", "", false
 	}
 	t, _ := p.parts()
-	return string(p), t + ":*"
+	return string(p), t + ":*", true
 }
 
 // denies reports whether a permission a deny lists covers p.
 func denies(listed []Permission, p Permission) bool {
-	perm, wildcard := matchable(p)
-	return slices.Contains(listed, Permission(perm)) || slices.Contains(listed, Permission(wildcard))
+	perm, wildcard, ok := matchable(p)
+	return ok && (slices.Contains(listed, Permission(perm)) || slices.Contains(listed, Permission(wildcard)))
 }
 
 // denial is a deny as a check reads it.
@@ -81,10 +82,10 @@ type denial struct {
 // deniesOn reads the denies on scopes that name one of binding and exempt none of exempt, the
 // keys keysOf and exempting give, or name anyone when binding is nil, listing p.
 func (a *Authorizer) deniesOn(ctx context.Context, q DB, tenant string, binding, exempt, scopes []string, p Permission) ([]denial, error) {
-	if binding != nil && len(binding) == 0 {
+	perm, wildcard, ok := matchable(p)
+	if binding != nil && len(binding) == 0 || !ok {
 		return nil, nil
 	}
-	perm, wildcard := matchable(p)
 	// In the order a check reads them, so Explain names the deny Authorize does.
 	rows, err := q.Query(ctx, `
 		SELECT id, scope, permissions, principals, exempt, condition FROM rbac_denies
