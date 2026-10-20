@@ -1722,17 +1722,21 @@ func (a *Authorizer) conditionsBounded(ctx context.Context, tx pgx.Tx, tenant st
 		}
 	}
 	var over []error
+	readsAction := map[string]bool{}
 	for i, scope := range scopes {
 		gives := map[string][]Permission{}
 		for expr, roles := range carried[bucket{scope, principals[i]}] {
 			gives[expr] = nil
+			if len(a.labels) == 0 {
+				continue
+			}
 			for _, id := range roles {
 				if def, ok := b.role(id); ok {
 					gives[expr] = append(gives[expr], def.Permissions...)
 				}
 			}
 		}
-		if affordable(a.evaluations(gives)) {
+		if affordable(a.evaluations(gives, readsAction)) {
 			continue
 		}
 		whose := principals[i] + "'s grants"

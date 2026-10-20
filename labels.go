@@ -362,15 +362,24 @@ func (a *Authorizer) holdingOn(ctx context.Context, q DB, s Subject, cs *constra
 // evaluations is how many times a read of a subject's label values may evaluate each of
 // conditions, given the permissions of the grants or denies that carry each: one that reads the
 // action once for each label value and power to release among them, as it decides each apart, and
-// any other once.
-func (a *Authorizer) evaluations(carried map[string][]Permission) map[string]int {
+// any other once. readsAction keeps, by expression, whether each reads the action: a change's
+// buckets can hold the same conditions many times, and parsing them runs under its locks.
+func (a *Authorizer) evaluations(carried map[string][]Permission, readsAction map[string]bool) map[string]int {
 	n := map[string]int{}
 	for expr, ps := range carried {
 		if expr == "" {
 			continue
 		}
 		n[expr] = 1
-		if len(a.labels) > 0 && reads(expr, "action") {
+		if len(a.labels) == 0 {
+			continue
+		}
+		reading, ok := readsAction[expr]
+		if !ok {
+			reading = reads(expr, "action")
+			readsAction[expr] = reading
+		}
+		if reading {
 			n[expr] = len(a.labelPermissions(ps))
 		}
 	}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"regexp"
 	"regexp/syntax"
 	"slices"
@@ -32,7 +33,8 @@ import (
 //
 // such as `request.time < timestamp("2027-01-01T00:00:00Z") && resource.attributes.env != "prod"`.
 // A grant with one gives its role only where the expression is true. An expression that fails,
-// as one reading an attribute the host didn't pass does, is false. The zero Condition is none,
+// as one reading an attribute the host didn't pass does, or comparing a double that isn't finite,
+// as dividing by zero makes, is false. The zero Condition is none,
 // and one with a title or description has an expression. A pattern it matches is a string
 // literal, of bounded size; it nests at most 32 deep; and a comparison, or a search of a list, that
 // would read more than a condition may spend fails before it runs.
@@ -47,9 +49,9 @@ import (
 // subject's label values as a check of it would, and evaluates a condition that doesn't read the
 // action once for them all, so on the tenant one that does counts once for each label value its
 // grants give or its denies deny. A change past one is refused, so no grant, deny or eligibility
-// stored changes what the others decide. A condition stored around them, as on a custom role
-// widened since, a check may not reach: it evaluates the cheapest first, and past its budget a
-// grant's condition is false and a deny's applies.
+// stored changes what the others decide. A condition stored around them, as before there were
+// bounds or on a custom role widened since, a check may not reach: it evaluates the cheapest
+// first, and past its budget a grant's condition is false and a deny's applies.
 //
 // Searches (Filter, Reachable, Holders) can't evaluate one: Filter and Reachable count only
 // unconditional grants, Filter counts a conditional deny as denying, and Reach.Conditional and
@@ -105,7 +107,7 @@ type budget struct {
 	// ran is what conditions came to, evaluated on the same request but for its action, which a
 	// listing's budgets for each permission share: each pays for a condition as if it evaluated it,
 	// so it decides as a check of its permission would, but one that doesn't read the action runs
-	// once for them all.
+	// once for them all. nil for a budget that shares none, whose one request decided covers.
 	ran map[string]run
 }
 
@@ -138,7 +140,7 @@ func newGrantBudget(path []string) *budget { return budgetOf(uint64(len(path)) *
 func newDenyBudget(path []string) *budget { return budgetOf(uint64(len(path)) * maxCheckCost) }
 
 func budgetOf(left uint64) *budget {
-	return &budget{left: left, compiled: map[string]bool{}, decided: map[string]decision{}, ran: map[string]run{}}
+	return &budget{left: left, compiled: map[string]bool{}, decided: map[string]decision{}}
 }
 
 // affordable reports whether a check can evaluate conditions whole within maxCheckCost, each the
@@ -366,6 +368,7 @@ func comparing(function string, x, y ref.Val) uint64 {
 // bounded refuses, before running it, a comparison or a search in a list that would read more than
 // a condition may: one call reads it all, and a call's cost is counted only once it has run, so a
 // list a condition doubles cheaply would otherwise hold a check for as long as walking it takes.
+// It refuses a comparison of a double that isn't finite too (nonFinite).
 func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 	call, ok := i.(interpreter.InterpretableCall)
 	if !ok {
@@ -393,6 +396,8 @@ func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 			}
 			return types.NoSuchOverloadErr()
 		}
+	case operators.Less, operators.LessEquals, operators.Greater, operators.GreaterEquals:
+		op = ordering(call.Function())
 	default:
 		return i, nil
 	}
@@ -404,8 +409,50 @@ func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 		if comparing(function, args[0], args[1]) > maxCost {
 			return types.NewErr("rbac: comparing values this large costs more than a condition may")
 		}
+		if nonFinite(args[0]) || nonFinite(args[1]) {
+			return incomparable()
+		}
 		return op(args[0], args[1])
 	}), nil
+}
+
+// ordering is x compared with y by an ordering operator, as CEL orders them, once bounded has
+// refused a double that isn't finite.
+func ordering(function string) func(x, y ref.Val) ref.Val {
+	return func(x, y ref.Val) ref.Val {
+		c, ok := x.(traits.Comparer)
+		if !ok {
+			return types.MaybeNoSuchOverloadErr(x)
+		}
+		cmp := c.Compare(y)
+		n, ok := cmp.(types.Int)
+		if !ok {
+			return cmp
+		}
+		switch function {
+		case operators.Less:
+			return types.Bool(n < 0)
+		case operators.LessEquals:
+			return types.Bool(n <= 0)
+		case operators.Greater:
+			return types.Bool(n > 0)
+		default:
+			return types.Bool(n >= 0)
+		}
+	}
+}
+
+// nonFinite reports whether v is a double that isn't finite, which a condition makes of finite ones
+// dividing by zero or converting "NaN". CEL orders and equates NaN as false with anything, so a
+// deny's `failed / total >= 0.5` would lift where both are 0.0, and -Inf orders below every
+// bound, so comparing either fails, as a declared double that isn't finite does.
+func nonFinite(v ref.Val) bool {
+	d, ok := v.(types.Double)
+	return ok && (math.IsNaN(float64(d)) || math.IsInf(float64(d), 0))
+}
+
+func incomparable() ref.Val {
+	return types.NewErr("rbac: a double that isn't finite can't be compared")
 }
 
 // equal is x == y, failing where comparing values a map or list holds fails, as reading a
@@ -421,6 +468,10 @@ func equal(x, y ref.Val) ref.Val {
 	// By their sizes alone, CEL's comparison would tell a refused name from one never passed.
 	if refusing(x) || refusing(y) {
 		return refusal()
+	}
+	// As a list or map holds it too.
+	if nonFinite(x) || nonFinite(y) {
+		return incomparable()
 	}
 	var failed ref.Val
 	same := func(a, b ref.Val) bool {
@@ -661,7 +712,9 @@ func (c *conditions) decide(b *budget, expr string, vars map[string]any) (held, 
 	r, ok := b.ran[ranKey]
 	if !ok {
 		r = evaluate(prg, vars)
-		b.ran[ranKey] = r
+		if b.ran != nil {
+			b.ran[ranKey] = r
+		}
 	}
 	left := b.left
 	b.spend(r.cost)

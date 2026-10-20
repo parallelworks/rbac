@@ -93,6 +93,65 @@ func TestADeclaredDoubleThatIsntFiniteFailsItsConditions(t *testing.T) {
 	}
 }
 
+// A condition can make a double that isn't finite of finite ones, dividing by zero or converting
+// "NaN", which CEL orders and equates as false with anything: so comparing one fails too.
+func TestADoubleAConditionMakesThatIsntFiniteFailsWhatComparesIt(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
+		c.Attributes = rbac.Attributes{Request: map[string]rbac.AttributeType{
+			"failed": rbac.AttrDouble, "total": rbac.AttrDouble, "score": rbac.AttrString,
+		}}
+	})
+	ctx := t.Context()
+	const ratio = `request.attributes.failed / request.attributes.total`
+	grants := []string{ratio + ` < 0.5`, `!(` + ratio + ` >= 0.5)`, ratio + ` != 1.0`}
+	denies := []string{ratio + ` >= 0.5`, ratio + ` == 1.0`, `double(request.attributes.score) >= 0.5`}
+	seeded := []rbac.Grant{grant(cluster.Scope(), "guard", rbac.User, "guardian")}
+	for i, expr := range grants {
+		g := grant(cluster.Scope(), "cluster.login", rbac.User, fmt.Sprint("u", i))
+		g.Condition = rbac.Condition{Expression: expr}
+		seeded = append(seeded, g, grant(cluster.Scope(), "cluster.login", rbac.User, fmt.Sprint("v", i)))
+	}
+	h.seed(t, seeded...)
+	for i, expr := range denies {
+		d := rbac.Deny{
+			ID: fmt.Sprint("d", i), Principals: []rbac.Principal{identity(fmt.Sprint("v", i))}, Permissions: []rbac.Permission{login},
+			Condition: rbac.Condition{Expression: expr},
+		}
+		if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	is := func(who string, request map[string]any) bool {
+		t.Helper()
+		err := h.authz.Authorize(rbac.WithRequest(ctx, request), h.as(t, who), login, cluster)
+		if err != nil && !errors.Is(err, rbac.ErrDenied) {
+			t.Fatal(err)
+		}
+		return err == nil
+	}
+	finite := map[string]any{"failed": 0.0, "total": 1.0, "score": "0.1"}
+	for i := range 3 {
+		if !is(fmt.Sprint("u", i), finite) || !is(fmt.Sprint("v", i), finite) {
+			t.Fatalf("finite doubles: %s, %s", grants[i], denies[i])
+		}
+	}
+	for name, request := range map[string]map[string]any{
+		"NaN":       {"failed": 0.0, "total": 0.0, "score": "NaN"},
+		"infinity":  {"failed": 1.0, "total": 0.0, "score": "inf"},
+		"-infinity": {"failed": -1.0, "total": 0.0, "score": "-inf"},
+	} {
+		for i := range 3 {
+			if is(fmt.Sprint("u", i), request) {
+				t.Errorf("a grant's condition %s held for %s", grants[i], name)
+			}
+			if is(fmt.Sprint("v", i), request) {
+				t.Errorf("a deny's condition %s was lifted for %s", denies[i], name)
+			}
+		}
+	}
+}
+
 func TestADeclaredAttributePassedAsAnotherTypeFailsAComparisonOfWhatHoldsIt(t *testing.T) {
 	h := setup(t, func(c *rbac.Config) {
 		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
@@ -618,6 +677,28 @@ func TestGroupsRequirementsForARoleOnAScopeAreBoundedTogether(t *testing.T) {
 	act := rbac.Activation{Role: "cluster.sudo", Duration: time.Minute, Justification: "INC-1"}
 	if _, err := h.authz.Activate(ctx, h.as(t, "x", "g0", "g1", "g2", "g3", "g4"), cluster, act); err != nil {
 		t.Fatalf("Activate: %v", err)
+	}
+}
+
+// A group's eligibility set again as it is adds nothing activating reads, so it isn't refused, as a
+// grant granted again isn't, though the requirements stored around the bound cost more.
+func TestAnEligibilitySetAgainAsItIsIsntRefused(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.groups(t, "g0", "g1", "g2", "g3")
+	for i := range 4 {
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role,
+			max_seconds, requires) VALUES ('t1', 'cluster', 'c1', 'group', $1, 'cluster.sudo', 3600, $2)`, fmt.Sprint("g", i), spending(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e := rbac.Eligibility{Role: "cluster.sudo", Principal: groupOf("g0"), MaxDuration: time.Hour, Requires: spending(0)}
+	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, e); err != nil {
+		t.Errorf("set again as it is: %v", err)
+	}
+	e.Note = "on call"
+	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, e); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("changed, beside requirements that cost more than activating may spend: %v", err)
 	}
 }
 

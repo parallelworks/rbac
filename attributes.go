@@ -337,9 +337,7 @@ func (c copier) copy(v reflect.Value) reflect.Value {
 		if v.IsNil() {
 			return v
 		}
-		// A message is cloned only as itself: a host's type embedding one is a message by the methods
-		// it promotes, and Clone would return the embedded message in its place.
-		if m, ok := v.Interface().(proto.Message); ok && m.ProtoReflect().Interface() == m {
+		if m, ok := v.Interface().(proto.Message); ok && itself(m) {
 			return reflect.ValueOf(proto.Clone(m))
 		}
 		k := copiedKey{v.Type(), v.Pointer(), 0}
@@ -353,6 +351,18 @@ func (c copier) copy(v reflect.Value) reflect.Value {
 	default:
 		return v
 	}
+}
+
+// itself reports whether m is a message as itself, so cloned: a host's type embedding one is a
+// message by the methods it promotes, and Clone would return the embedded message in its place,
+// or panic where it embeds the message interface holding none.
+func itself(m proto.Message) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	return m.ProtoReflect().Interface() == m
 }
 
 // fields copies into out, a copy of the struct v, the fields a hook can write to: its exported

@@ -355,9 +355,10 @@ sequenceDiagram
   errors gives nothing, and a deny's that errors denies. What a check reads together is bounded
   where it is stored, for each scope: an identity's conditional grants, the conditional grants to
   groups, the tenant's members and the public, the conditional denies, and the requirements of
-  groups' eligibilities for a role. A check's budget is that for each scope on its path, so it
-  evaluates every condition it reads, and no grant made beside another changes what that one
-  decides.
+  groups' eligibilities for a role, and a change past one is refused as invalid. A check's budget
+  is that for each scope on its path, so it evaluates every condition it reads, and no grant made
+  beside another changes what that one decides. Conditions stored before there were bounds may be
+  past one: a check evaluates them cheapest first within its budget.
 
 ## A change
 

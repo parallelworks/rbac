@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/parallelworks/rbac"
@@ -1993,6 +1994,39 @@ func TestAConstraintIsGivenAHostTypeEmbeddingAMessageAsItIs(t *testing.T) {
 			}()
 			if allowed(t, h, u, login, cluster) {
 				t.Errorf("%s: the constraint was given another type than the frozen session", name)
+			}
+		}()
+	}
+}
+
+// envelope is a host's type embedding the message interface, so a message by the methods it
+// promotes, whatever it holds.
+type envelope struct {
+	proto.Message
+	Frozen bool
+}
+
+// A host's type embedding the message interface holding none is given as it is: asked for the
+// message it holds, it panics.
+func TestAConstraintIsGivenAHostTypeEmbeddingNoMessageAsItIs(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "frozen", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			e, ok := in.Subject.Attributes["envelope"].(*envelope)
+			return ok && e.Frozen, nil
+		}}}
+	})
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	for name, m := range map[string]proto.Message{"none": nil, "a message": timestamppb.Now()} {
+		u := h.as(t, "u")
+		u.Attributes = map[string]any{"envelope": &envelope{Message: m, Frozen: true}}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("%s: the check panicked: %v", name, r)
+				}
+			}()
+			if allowed(t, h, u, login, cluster) {
+				t.Errorf("%s: the constraint was given another type than the frozen envelope", name)
 			}
 		}()
 	}

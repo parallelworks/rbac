@@ -276,7 +276,7 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 		}
 		// Past this, a check's budget could run out before it evaluated them, and the rest would
 		// deny everyone they name, whatever their conditions say.
-		if d.Condition.Expression != "" && !affordable(a.evaluations(carried)) {
+		if d.Condition.Expression != "" && !affordable(a.evaluations(carried, map[string]bool{})) {
 			return ChangeEvent{}, fmt.Errorf("%w: a scope's conditional denies cost more together than a check may spend evaluating them", ErrInvalid)
 		}
 		rows, err = tx.Query(ctx, `

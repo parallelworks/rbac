@@ -133,6 +133,10 @@ func (a *Authorizer) SetEligibility(ctx context.Context, actor Subject, on Resou
 		if err != nil {
 			return ChangeEvent{}, err
 		}
+		// Set again as it is, it adds nothing activating reads, as a grant granted again doesn't.
+		if len(set) == 0 {
+			return ChangeEvent{}, nil
+		}
 		return ChangeEvent{Eligible: set}, a.requirementsBounded(ctx, tx, on.Tenant, e)
 	})
 }
