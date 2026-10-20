@@ -483,11 +483,14 @@ func (a *Authorizer) unrest(ctx context.Context, tx pgx.Tx, tenant string, actor
 	if len(r.ids) == 0 {
 		return nil, nil, nil
 	}
+	// Each by its id alone, kept to the tenant's activations in force outside the lookup: beside
+	// tenant = $1 and the source, a generic plan reads every activation in the tenant by the index
+	// on them, which it costs as an average tenant's few.
 	rows, err := tx.Query(ctx, `
 		WITH RECURSIVE act AS (
-		  SELECT g.* FROM unnest($2::text[]) AS w(i) CROSS JOIN LATERAL (
-		    SELECT id, principal, expires_at, activated_through FROM rbac_grants WHERE id = w.i::uuid AND tenant = $1
-		      AND source = 'activation' AND expires_at > $3 OFFSET 0) g
+		  SELECT g.id, g.principal, g.expires_at, g.activated_through FROM unnest($2::text[]) AS w(i) CROSS JOIN LATERAL (
+		    SELECT * FROM rbac_grants WHERE id = w.i::uuid OFFSET 0) g
+		  WHERE g.tenant = $1 AND g.source = 'activation' AND g.expires_at > $3
 		), `+reachingSQL("ARRAY(SELECT DISTINCT principal FROM act)", "$3")+`, rests(id, expires_at, until) AS (
 		  SELECT a.id, a.expires_at, (SELECT max(coalesce(r.ends, 'infinity')) FROM reaching r
 		    WHERE r.holder = a.principal AND r.k = a.activated_through)
