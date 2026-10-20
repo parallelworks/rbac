@@ -1771,13 +1771,18 @@ func collectGrants(rows pgx.Rows) ([]Grant, error) {
 	return pgx.CollectRows(rows, scanGrant)
 }
 
-func scanGrant(row pgx.CollectableRow) (Grant, error) {
+func scanGrant(row pgx.CollectableRow) (Grant, error) { return scanGrantWith(row) }
+
+// scanGrantWith scans a row of grantColumns, and after them, more.
+func scanGrantWith(row pgx.CollectableRow, more ...any) (Grant, error) {
 	var g Grant
 	var expires *time.Time
 	var approvedBy, createdBy, updatedBy string
-	err := row.Scan(&g.ID, &g.Scope.Type, &g.Scope.ID, &g.Principal.Kind, &g.Principal.ID, &g.Role, &g.Source, &expires,
+	err := row.Scan(append([]any{
+		&g.ID, &g.Scope.Type, &g.Scope.ID, &g.Principal.Kind, &g.Principal.ID, &g.Role, &g.Source, &expires,
 		&g.Condition.Title, &g.Condition.Description, &g.Condition.Expression, &g.Note,
-		&approvedBy, &createdBy, &g.CreatedAt, &updatedBy, &g.UpdatedAt)
+		&approvedBy, &createdBy, &g.CreatedAt, &updatedBy, &g.UpdatedAt,
+	}, more...)...)
 	if expires != nil {
 		g.ExpiresAt = *expires
 	}
