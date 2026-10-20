@@ -363,9 +363,11 @@ not what its actor's access rests on: the actor's grants, its membership and pla
 those groups' grants. So two changes that each take away what the other's actor acts by can both
 commit, a write skew: a manager removing another from the group that lets it change members, while
 that one removes the first from theirs, both succeed, though either after the other is refused, and
-no one is left to change members. Such a race only takes access away, as each change is one its
-actor could make when it was decided, and the two leave nothing granted that one after the other
-wouldn't: it locks the tenant's admins out, never lets anyone in. The host undoes it with its own
+no one is left to change members. Such a race grants only what each change's actor could grant
+when it was decided, but more can stand at once than one after the other would leave: two changes
+that each also grant, as adding a member while removing the other manager, leave both grants, where
+the second, made after the first, is refused. It never lets in anyone an actor couldn't have let
+in, but can take more away, as locking the tenant's admins out. The host undoes it with its own
 writes, as `ImportMembers`, `Import` or `SetMemberships`, which no actor's access decides. Locking
 what each actor acts by would close it, at the price of taking, for every change, a lock for each
 group the actor acts through, which past 64 would lock the whole tenant for every change by an
