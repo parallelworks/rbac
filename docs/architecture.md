@@ -42,7 +42,7 @@ flowchart LR
         tables[("rbac_grants, rbac_roles, rbac_denies,<br/>rbac_eligibilities, rbac_memberships,<br/>rbac_groups, rbac_members")]
         history[("rbac_history")]
         triggers["Triggers: rbac_record,<br/>append-only, no truncate"]
-        fn["rbac_group_members"]
+        fn["rbac_group_members,<br/>rbac_tenant_keys"]
     end
     code -->|"Authorize, Filter, Apply, ..."| api
     api -->|"asks"| hooks
@@ -206,6 +206,14 @@ erDiagram
   same, so a connection's cached statement, once PostgreSQL plans it generically by the tables'
   averages, still reads only the subject's grants on the path, from the index alone, whichever
   index it picks.
+- **A read of a list of keys reads each key's rows on its own** (`byKey`), as of a list's scopes
+  or principals, of the denies on a check's path, of `Activate`'s eligibilities and of
+  `DeleteScopes`' rows, and so does a walk through nested groups: a generic plan costs `= ANY` of
+  a list as ten seeks, and a read of the tenant by an index on it alone as an average tenant's few
+  rows, and would read every row of a large tenant. The eligibilities a group approves and the
+  denies that name or exempt it, which a change to its members reads, are found through GIN
+  indexes on those arrays of keys, each key prefixed by its tenant (`rbac_tenant_keys`), so
+  neither the tenant's other rows nor another tenant's group of the same id are read.
 - **Activations are grants** from the source `activation` (`SourceActivation`), made by
   `Activate` from an eligibility and ended by their expiry or `Deactivate`.
 - **Every write is recorded.** Each table above but `rbac_history` has the trigger
@@ -546,7 +554,7 @@ three roles. The README's [History](../README.md#history) section has the exact 
 flowchart LR
     admin["Administrator's role<br/>runs Migrate, owns the tables"]
     histrole["History's role<br/>owns rbac_history and rbac_record"]
-    app["Application's role<br/>DML on the tables, SELECT on history,<br/>EXECUTE rbac_group_members"]
+    app["Application's role<br/>DML on the tables, SELECT on history,<br/>EXECUTE rbac_group_members<br/>and rbac_tenant_keys"]
     admin -->|"member of"| histrole
     app -->|"writes"| tables[("rbac_* tables")]
     tables -->|"rbac_record runs as"| histrole

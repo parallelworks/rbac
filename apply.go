@@ -1482,15 +1482,15 @@ func (a *Authorizer) bounded(ctx context.Context, tx pgx.Tx, tenant string, stor
 		}
 	}
 	// Grants from each source the host owns count apart from the rest, so a tenant's admins can't
-	// fill the bound to keep the host's own from being made, nor the host fill theirs.
+	// fill the bound to keep the host's own from being made, nor the host fill theirs. Each is
+	// counted on its own, as byKey reads its rows.
 	rows, err := tx.Query(ctx, `
-		SELECT scope, principal, role FROM (
-		  SELECT scope, principal, role, CASE WHEN source = ANY($7::text[]) THEN source ELSE '' END AS bucket FROM rbac_grants
-		  WHERE tenant = $1 AND (scope, principal, role) IN (SELECT * FROM unnest($2::text[], $3::text[], $4::text[]))
-		    AND (expires_at IS NULL OR expires_at > $5)) g
-		WHERE (scope, principal, role, bucket) IN (SELECT * FROM unnest($2::text[], $3::text[], $4::text[], $8::text[]))
-		GROUP BY scope, principal, role, bucket HAVING count(*) > $6
-		ORDER BY scope, principal, role`,
+		SELECT t.s, t.p, t.r FROM (SELECT DISTINCT * FROM unnest($2::text[], $3::text[], $4::text[], $8::text[])) AS t(s, p, r, b)
+		CROSS JOIN LATERAL (
+		  SELECT count(*) AS n FROM rbac_grants WHERE tenant = $1 AND scope = t.s AND principal = t.p AND role = t.r
+		    AND CASE WHEN source = ANY($7::text[]) THEN source ELSE '' END = t.b AND (expires_at IS NULL OR expires_at > $5)) g
+		WHERE g.n > $6
+		ORDER BY t.s COLLATE "C", t.p COLLATE "C", t.r COLLATE "C"`,
 		tenant, scopes, principals, roles, a.cfg.Now(), MaxGrantsPerRole, slices.Sorted(maps.Keys(a.owned)), buckets)
 	if err != nil {
 		return err
@@ -1572,21 +1572,25 @@ func (f GrantFilter) valid(tenant string) bool {
 		!slices.ContainsFunc(f.Principals, func(p Principal) bool { return !p.wellFormed(tenant) })
 }
 
-// sql is the condition picking what the filter matches, on $2 and $3, and their arguments: a
-// statement of its own for each shape, so each plans for the index it can use.
-func (f GrantFilter) sql() (where string, scopes, principals []string) {
-	scopes = make([]string, len(f.Scopes))
-	for i, s := range f.Scopes {
-		scopes[i] = s.Key()
+// sql is SQL selecting cols, in order, of the rows of table in tenant $1 in force at $4 that the
+// filter matches, on $2 and $3, and their arguments: a statement of its own for each shape, so
+// each plans for the index it can use, reading the rows of each of its scopes, or with none of each
+// of its principals, in turn (byKey). from is cols as the rows hold them, and what order reads.
+func (f GrantFilter) sql(table, cols, from, order string) (query string, scopes, principals []string) {
+	for _, s := range f.Scopes {
+		scopes = append(scopes, s.Key())
 	}
-	principals = keysOf(f.Principals)
+	slices.Sort(scopes)
+	scopes, principals = slices.Compact(scopes), slices.Compact(slices.Sorted(slices.Values(keysOf(f.Principals))))
+	keys, col, where := "$2", "scope", "principal = ANY($3::text[])"
 	switch {
 	case len(principals) == 0:
-		return "scope = ANY($2::text[]) AND $3::text[] IS NULL", scopes, nil
+		where = "$3::text[] IS NULL"
 	case len(scopes) == 0:
-		return "$2::text[] IS NULL AND principal = ANY($3::text[])", nil, principals
+		keys, col, where = "$3", "principal", "$2::text[] IS NULL"
 	}
-	return "scope = ANY($2::text[]) AND principal = ANY($3::text[])", scopes, principals
+	return `SELECT ` + cols + ` FROM (` + byKey(keys, table, col, from, "tenant = $1 AND "+where+" AND (expires_at IS NULL OR expires_at > $4)") +
+		`) r ORDER BY ` + order, scopes, principals
 }
 
 // Grants lists the grants in force that match the filter: who has access to a resource and
@@ -1600,12 +1604,9 @@ func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) (
 	if !validID(tenant) || !f.valid(tenant) {
 		return nil, fmt.Errorf("%w: Grants needs a tenant and valid scopes or principals", ErrInvalid)
 	}
-	where, scopes, principals := f.sql()
-	rows, err := a.db.Query(ctx, `
-		SELECT `+grantColumns+` FROM rbac_grants
-		WHERE tenant = $1 AND `+where+` AND (expires_at IS NULL OR expires_at > $4)
-		ORDER BY scope, principal, role, source, expires_at NULLS FIRST, condition, id`,
-		tenant, scopes, principals, a.cfg.Now())
+	query, scopes, principals := f.sql("rbac_grants", grantColumns, grantColumns+", scope, principal",
+		"scope, principal, role, source, expires_at NULLS FIRST, condition, id")
+	rows, err := a.db.Query(ctx, query, tenant, scopes, principals, a.cfg.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -1724,7 +1725,7 @@ func (a *Authorizer) deleteScopes(ctx context.Context, actor Principal, tenant, 
 	slices.Sort(keys)
 	keys = slices.Compact(keys)
 	return a.delete(ctx, actor, tenant, how, func(tx pgx.Tx) error { return lockAll(ctx, tx, tenant, keys, nil) },
-		deletion{denies: "scope = ANY($2::text[])", where: "scope = ANY($2::text[])", ordered: true}, keys)
+		deletion{denies: "scope = ANY($2::text[])", where: "scope = ANY($2::text[])", ordered: true, scopes: true}, keys)
 }
 
 // DeletePrincipal removes every grant and eligibility of a principal in a tenant, as actor, with
@@ -1834,10 +1835,11 @@ func (a *Authorizer) DeleteTenant(ctx context.Context, actor Principal, tenant s
 // where denies does, and memberships of the tenant and of its groups where members does (none
 // where either is empty); with roles its custom roles, and with groups its groups. Each reads args
 // from $2. ordered locks the grants, eligibilities, denies and places in groups in order first
-// (inOrder).
+// (inOrder), and with scopes, where where and denies pick those on the scopes in $2, sorted, reads
+// them a scope at a time to do it (scopesInOrder).
 type deletion struct {
-	roles, groups, ordered bool
-	denies, where, members string
+	roles, groups, ordered, scopes bool
+	denies, where, members         string
 }
 
 // inOrder is SQL picking the rows of table, rbac_grants or rbac_eligibilities, that where picks,
@@ -1873,6 +1875,14 @@ func lockedInOrder(table, cols, order, where string) string {
 	return "SELECT " + cols + " FROM " + table + " WHERE " + where + " ORDER BY " + order + " FOR UPDATE"
 }
 
+// scopesInOrder is inOrder, or deniesInOrder, for the rows of table on the scopes in the array $2,
+// sorted, by their keys: read a scope at a time, as byKey reads them, each scope's locked in the
+// order of the rest of the keys order lists, so all of them in the order of their scopes first.
+func scopesInOrder(table, key, order string) string {
+	return "(" + key + ") IN (SELECT " + key + " FROM unnest($2::text[]) AS keyed(k) CROSS JOIN LATERAL (SELECT " + key + " FROM " + table +
+		" WHERE tenant = $1 AND scope = keyed.k ORDER BY " + order + " FOR UPDATE) r)"
+}
+
 // lockInOrder locks, in tx, the rows of table in tenant $1 that where picks, in order, for a
 // change that changes them in several statements.
 func lockInOrder(ctx context.Context, tx pgx.Tx, table, order, where string, args ...any) error {
@@ -1902,6 +1912,10 @@ func (a *Authorizer) delete(ctx context.Context, actor Principal, tenant, how st
 			}
 			if places != "" {
 				places = placesInOrder(places)
+			}
+			if del.scopes {
+				eligible, granted = scopesInOrder("rbac_eligibilities", "id", "principal, id"), scopesInOrder("rbac_grants", "id", "principal, id")
+				denied = scopesInOrder("rbac_denies", "scope, id", "id")
 			}
 		}
 		if e.Ineligible, err = a.removeEligible(ctx, tx, tenant, eligible, args...); err != nil {

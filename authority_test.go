@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/rbac"
 	"github.com/parallelworks/rbac/internal/pgtest"
@@ -1090,13 +1091,27 @@ func TestHoldersReadsTheMembershipsOfALargeGroupInAsManyPages(t *testing.T) {
 // would take ten times the pages.
 const deeper = 20
 
-// generic is setup on a pool whose sessions plan every statement as PostgreSQL plans one a
-// connection has run five times, generically, costing each index by the tables' averages, in a
-// database of many small tenants beside t1, where a principal and a scope hold a grant or two and a
-// group has a member or two.
+// generic is crowded on a pool whose sessions plan every statement as PostgreSQL plans one a
+// connection has run five times, generically, costing each index by the tables' averages.
 func generic(t *testing.T, mutate ...func(*rbac.Config)) *harness {
 	t.Helper()
-	h := setupOn(t, pgtest.Open(t, "plan_cache_mode=force_generic_plan"), mutate...)
+	return crowded(t, pgtest.Open(t, "plan_cache_mode=force_generic_plan"), mutate...)
+}
+
+// custom is setup on a pool whose sessions plan every statement for its arguments: at the default
+// plan_cache_mode, a statement a connection runs a sixth time can turn generic, as a test that
+// repeats a call on a pool's connections does.
+func custom(t *testing.T, mutate ...func(*rbac.Config)) *harness {
+	t.Helper()
+	return setupOn(t, pgtest.Open(t, "plan_cache_mode=force_custom_plan"), mutate...)
+}
+
+// crowded is setupOn in a database of many small tenants beside t1, where a principal and a scope
+// hold a grant or two, a group has a member or two, and a scope has an eligibility and a deny or
+// two, which name a group.
+func crowded(t *testing.T, pool *pgxpool.Pool, mutate ...func(*rbac.Config)) *harness {
+	t.Helper()
+	h := setupOn(t, pool, mutate...)
 	for _, q := range []string{
 		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
 		 SELECT 's' || j, 'cluster', 'c' || i, 'user', 'u' || j || '-' || i, 'cluster.admin' FROM generate_series(1, 2000) j, generate_series(1, 10) i`,
@@ -1105,6 +1120,12 @@ func generic(t *testing.T, mutate ...func(*rbac.Config)) *harness {
 		 SELECT 's' || j, 'user', 'u' || j || '-' || i FROM generate_series(1, 2000) j, generate_series(1, 3) i`,
 		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
 		 SELECT 's' || j, 'g' || i, 'user', 'u' || j || '-' || i FROM generate_series(1, 2000) j, generate_series(1, 3) i`,
+		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+		 SELECT 's' || j, 'cluster', 'c' || i, 'user', 'u' || j || '-' || i, 'cluster.sudo', 3600, ARRAY['group:g' || i]
+		 FROM generate_series(1, 2000) j, generate_series(1, 2) i`,
+		`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+		 SELECT 's' || j, 'cluster', 'c' || i, 'd', ARRAY['group:g' || i], ARRAY['user:u' || j || '-' || i], '{cluster:root}'
+		 FROM generate_series(1, 2000) j, generate_series(1, 2) i`,
 	} {
 		if _, err := h.pool.Exec(t.Context(), q); err != nil {
 			t.Fatal(err)
@@ -1114,10 +1135,11 @@ func generic(t *testing.T, mutate ...func(*rbac.Config)) *harness {
 }
 
 // A check, a list of what a subject may do and a change's authority read, of the grants, only the
-// subject's principals' on the path under a generic plan, and of the groups, only its own: there an
-// index leading to a scope or a principal alone looks as cheap as the key index, and would read
-// every grant on a busy tenant, or of a group granted on every cluster; and the groups a group is
-// in, joined to the tenant's members, would read every one.
+// subject's principals' on the path under a generic plan, and of the groups, only its own, as
+// GroupsOf reads them and as a change reads an actor's in a nested group: there an index leading to
+// a scope or a principal alone looks as cheap as the key index, and would read every grant on a busy
+// tenant, or of a group granted on every cluster; and the groups a group is in, joined to the
+// tenant's members, would read every one.
 func TestChecksUnderAGenericPlanReadOnlyTheirSubjectsGrants(t *testing.T) {
 	h := generic(t)
 	ctx := t.Context()
@@ -1128,39 +1150,46 @@ func TestChecksUnderAGenericPlanReadOnlyTheirSubjectsGrants(t *testing.T) {
 	}
 	owner := rbac.Subject{Principal: rbac.Principal{Kind: rbac.User, ID: "owner"}}
 	h.as(t, owner.Principal.ID)
+	boss := h.as(t, "boss", "inner")
 	sudo := grant(cluster.Scope(), "cluster.sudo", rbac.Group, "builders")
 	sudo.Condition = rbac.Condition{Expression: `subject.id == "ann"`}
-	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "ann"), sudo)
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "ann"), sudo, grant(cluster.Scope(), "cluster.admin", rbac.User, "boss"))
 	// The pages of the grants and the members, and their indexes, each reads, in a transaction it
 	// rolls back.
 	read := func() map[string]int64 {
 		t.Helper()
-		tx, err := h.pool.Begin(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() { _ = tx.Rollback(ctx) }()
-		a := h.authz.WithTx(tx)
 		pages := map[string]int64{}
-		for what, f := range map[string]func() error{
-			"Authorize":                   func() error { return a.Authorize(ctx, ann, login, cluster) },
-			"Authorize under a condition": func() error { return a.Authorize(ctx, ann, root, cluster) },
-			"Permissions":                 func() error { return second(a.Permissions(ctx, ann, cluster)) },
-			"Permissions on the tenant":   func() error { return second(a.Permissions(ctx, ann, tenantT1)) },
-			"Grantable":                   func() error { return second(a.Grantable(ctx, owner, cluster)) },
-			"Apply": func() error {
+		for what, f := range map[string]func(a *rbac.Authorizer) error{
+			"Authorize":                   func(a *rbac.Authorizer) error { return a.Authorize(ctx, ann, login, cluster) },
+			"Authorize under a condition": func(a *rbac.Authorizer) error { return a.Authorize(ctx, ann, root, cluster) },
+			"Permissions":                 func(a *rbac.Authorizer) error { return second(a.Permissions(ctx, ann, cluster)) },
+			"Permissions on the tenant":   func(a *rbac.Authorizer) error { return second(a.Permissions(ctx, ann, tenantT1)) },
+			"Grantable":                   func(a *rbac.Authorizer) error { return second(a.Grantable(ctx, owner, cluster)) },
+			"Apply": func(a *rbac.Authorizer) error {
 				return a.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: ann.Principal}}})
 			},
+			"Grantable in a nested group": func(a *rbac.Authorizer) error { return second(a.Grantable(ctx, boss, cluster)) },
+			"Apply in a nested group": func(a *rbac.Authorizer) error {
+				return a.Apply(ctx, boss, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: owner.Principal}}})
+			},
+			"GroupsOf": func(a *rbac.Authorizer) error { return second(a.GroupsOf(ctx, "t1", ann.Principal)) },
 		} {
-			for _, table := range []string{"rbac_grants", "rbac_members"} {
-				pages[what+" of "+table] -= pagesRead(ctx, t, tx, table)
-			}
-			if err := f(); err != nil {
-				t.Fatalf("%s: %v", what, err)
-			}
-			for _, table := range []string{"rbac_grants", "rbac_members"} {
-				pages[what+" of "+table] += pagesRead(ctx, t, tx, table)
-			}
+			func() {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				for _, table := range []string{"rbac_grants", "rbac_members"} {
+					pages[what+" of "+table] -= pagesRead(ctx, t, tx, table)
+				}
+				if err := f(h.authz.WithTx(tx)); err != nil {
+					t.Fatalf("%s: %v", what, err)
+				}
+				for _, table := range []string{"rbac_grants", "rbac_members"} {
+					pages[what+" of "+table] += pagesRead(ctx, t, tx, table)
+				}
+			}()
 		}
 		return pages
 	}
@@ -1373,5 +1402,282 @@ func TestRevokingAGrantOnABusyScopeReadsOnlyItsPrincipals(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A change to a group's members reads, of the eligibilities and denies, only those of the groups
+// it reaches, that they approve, and that name or exempt them, and of the places in groups only
+// theirs, under a generic plan too: no btree seeks a key in an array, so it read every eligibility
+// and deny in the tenant, and a generic plan, costing a read by the tenant as an average tenant's
+// few rows, reads the eligibilities and places of a large tenant by it; and an index on the arrays
+// alone would read those naming a group of the same id in every other tenant.
+func TestChangingMembersReadsOnlyWhatTheGroupsReach(t *testing.T) {
+	for _, plan := range []string{"custom", "generic"} {
+		t.Run(plan, func(t *testing.T) {
+			roles := func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), groupMembers, guardRole) }
+			var h *harness
+			if plan == "generic" {
+				h = generic(t, roles)
+			} else {
+				h = custom(t, roles)
+			}
+			ctx := t.Context()
+			h.groups(t, "oncall", "everyone", "pager")
+			h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "manager"),
+				grant(cluster.Scope(), "cluster.admin", rbac.User, "manager"), grant(cluster.Scope(), "guard", rbac.User, "manager"))
+			manager := h.as(t, "manager")
+			h.as(t, "ann", "oncall")
+			h.as(t, "bob")
+			// oncall is eligible on the cluster, approves v's activations there, and is named in one
+			// deny there and exempt from another.
+			for _, q := range []string{
+				`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+				 VALUES ('t1', 'cluster', 'c1', 'group', 'oncall', 'cluster.sudo', 3600, '{}'),
+				        ('t1', 'cluster', 'c1', 'user', 'v', 'cluster.sudo', 3600, '{group:oncall}')`,
+				`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+				 VALUES ('t1', 'cluster', 'c1', 'named', '{group:oncall}', '{}', '{cluster:root}'),
+				        ('t1', 'cluster', 'c1', 'exempt', '{user:v}', '{group:oncall}', '{cluster:root}')`,
+			} {
+				if _, err := h.pool.Exec(ctx, q); err != nil {
+					t.Fatal(err)
+				}
+			}
+			bob := []rbac.Member{{Group: "oncall", Principal: identity("bob")}}
+			// The pages of the eligibilities, denies and places in groups, and their indexes, each
+			// reads, in a transaction it rolls back.
+			read := func() map[string]int64 {
+				t.Helper()
+				pages := map[string]int64{}
+				for what, f := range map[string]func(a *rbac.Authorizer) error{
+					"ImportMembers": func(a *rbac.Authorizer) error { return a.ImportMembers(ctx, host, "t1", bob) },
+					"ImportMembers nesting a group": func(a *rbac.Authorizer) error {
+						return a.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "oncall", Principal: groupOf("pager")}})
+					},
+					"ChangeMembers": func(a *rbac.Authorizer) error {
+						return a.ChangeMembers(ctx, manager, "t1", bob, []rbac.Member{{Group: "oncall", Principal: identity("ann")}})
+					},
+					"ChangeMembers ending a place sooner": func(a *rbac.Authorizer) error {
+						return a.ChangeMembers(ctx, manager, "t1", []rbac.Member{{Group: "oncall", Principal: identity("ann"), ExpiresAt: h.now.Add(time.Hour)}}, nil)
+					},
+				} {
+					func() {
+						tx, err := h.pool.Begin(ctx)
+						if err != nil {
+							t.Fatal(err)
+						}
+						defer func() { _ = tx.Rollback(ctx) }()
+						for _, table := range []string{"rbac_eligibilities", "rbac_denies", "rbac_members"} {
+							pages[what+" of "+table] -= pagesRead(ctx, t, tx, table)
+						}
+						if err := f(h.authz.WithTx(tx)); err != nil {
+							t.Fatalf("%s: %v", what, err)
+						}
+						for _, table := range []string{"rbac_eligibilities", "rbac_denies", "rbac_members"} {
+							pages[what+" of "+table] += pagesRead(ctx, t, tx, table)
+						}
+					}()
+				}
+				return pages
+			}
+			// Others are in another group, and each has a group in a group of its own; each is eligible
+			// on a cluster, which the other group approves, and named in a deny there it is exempt from;
+			// and in a tenant each of their own, oncall approves an eligibility, and is named in a deny
+			// and exempt from it.
+			others := func(n int) {
+				t.Helper()
+				manyMembers(t, h, n, `, members AS (INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+					  SELECT 't1', 'everyone', 'user', id FROM others UNION ALL SELECT 't1', 'p' || id, 'group', 'g' || id FROM others),
+					parents AS (INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'p' || id FROM others),
+					eligible AS (INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+					  SELECT 't1', 'cluster', id, 'user', id, 'cluster.sudo', 3600, '{group:everyone}'::text[] FROM others
+					  UNION ALL SELECT id, 'cluster', 'c1', 'user', id, 'cluster.sudo', 3600, '{group:oncall}' FROM others)
+					INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+					SELECT 't1', 'cluster', id, 'd', ARRAY['user:' || id], '{group:everyone}'::text[], '{cluster:root}'::text[] FROM others
+					UNION ALL SELECT id, 'cluster', 'c1', 'd', '{group:oncall}', '{group:oncall}', '{cluster:root}' FROM others`,
+					"rbac_members", "rbac_eligibilities", "rbac_denies")
+			}
+			others(500)
+			few := read()
+			others(4500)
+			for what, many := range read() {
+				if many > few[what]*3/2+deeper {
+					t.Errorf("%s read %d pages, and %d once 4500 more were eligible, denied and in groups, and named elsewhere", what, few[what], many)
+				}
+			}
+		})
+	}
+}
+
+// Of the grants, eligibilities and denies, a list by scope or by principal, a check's and Holders'
+// read of the denies on a path, Activate's of the eligibilities, a write's count of a role's grants
+// toward its bound, and DeleteScopes read only those of their scopes or principals, and Holders, of
+// the places in groups, only those of the groups in a group granted, under a generic plan too: a
+// generic plan costs scope = ANY(...) or principal = ANY(...) as ten seeks, and a read of the
+// tenant by an index leading to it alone, which it costs as an average tenant's few rows, as
+// cheaper, which reads every row of a large tenant.
+func TestReadsByScopeOrPrincipalReadOnlyTheirRows(t *testing.T) {
+	for _, plan := range []string{"custom", "generic"} {
+		t.Run(plan, func(t *testing.T) {
+			var h *harness
+			if plan == "generic" {
+				h = generic(t)
+			} else {
+				h = custom(t)
+			}
+			ctx := t.Context()
+			h.groups(t, "oncall", "pager", "everyone")
+			ann := h.as(t, "ann", "oncall")
+			gone := []rbac.Scope{{Type: "cluster", ID: "c2"}, {Type: "cluster", ID: "c3"}}
+			// ann holds a role on the cluster, as oncall, with pager in it, does there and on each scope
+			// gone, where oncall is eligible and denied too, as it is eligible on the cluster, where a
+			// deny names ann.
+			for _, q := range []string{
+				`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'oncall', 'group', 'pager')`,
+				`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+				 VALUES ('t1', 'cluster', 'c1', 'user', 'ann', 'cluster.login'), ('t1', 'cluster', 'c1', 'group', 'oncall', 'cluster.login'),
+				        ('t1', 'cluster', 'c2', 'group', 'oncall', 'cluster.login'), ('t1', 'cluster', 'c3', 'group', 'oncall', 'cluster.login')`,
+				`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+				 VALUES ('t1', 'cluster', 'c1', 'group', 'oncall', 'cluster.sudo', 3600), ('t1', 'cluster', 'c2', 'group', 'oncall', 'cluster.sudo', 3600)`,
+				`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+				 VALUES ('t1', 'cluster', 'c1', 'd', '{user:ann}', '{cluster:root}'), ('t1', 'cluster', 'c2', 'd', '{group:oncall}', '{cluster:root}')`,
+			} {
+				if _, err := h.pool.Exec(ctx, q); err != nil {
+					t.Fatal(err)
+				}
+			}
+			oncall := []rbac.Principal{groupOf("oncall")}
+			tables := []string{"rbac_grants", "rbac_eligibilities", "rbac_denies", "rbac_members"}
+			// The pages of the grants, eligibilities, denies and places in groups, and their indexes,
+			// each reads, in a transaction it rolls back.
+			read := func() map[string]int64 {
+				t.Helper()
+				pages := map[string]int64{}
+				for what, f := range map[string]func(a *rbac.Authorizer) error{
+					"Authorize": func(a *rbac.Authorizer) error { return a.Authorize(ctx, ann, login, cluster) },
+					"Explain":   func(a *rbac.Authorizer) error { return second(a.Explain(ctx, ann, login, cluster)) },
+					"Holders":   func(a *rbac.Authorizer) error { return second(a.Holders(ctx, login, cluster)) },
+					"Grants by scope": func(a *rbac.Authorizer) error {
+						return second(a.Grants(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}}))
+					},
+					"Eligibilities by scope": func(a *rbac.Authorizer) error {
+						return second(a.Eligibilities(ctx, "t1", rbac.GrantFilter{Scopes: gone}))
+					},
+					"Eligibilities by principal": func(a *rbac.Authorizer) error {
+						return second(a.Eligibilities(ctx, "t1", rbac.GrantFilter{Principals: oncall}))
+					},
+					"Denies": func(a *rbac.Authorizer) error { return second(a.Denies(ctx, "t1", gone)) },
+					"Activate": func(a *rbac.Authorizer) error {
+						return second(a.Activate(ctx, ann, cluster, rbac.Activation{Role: "cluster.sudo", Duration: time.Minute, Justification: "INC-1"}))
+					},
+					"DeleteScopes": func(a *rbac.Authorizer) error { return a.DeleteScopes(ctx, host, "t1", gone) },
+				} {
+					func() {
+						tx, err := h.pool.Begin(ctx)
+						if err != nil {
+							t.Fatal(err)
+						}
+						defer func() { _ = tx.Rollback(ctx) }()
+						for _, table := range tables {
+							pages[what+" of "+table] -= pagesRead(ctx, t, tx, table)
+						}
+						if err := f(h.authz.WithTx(tx)); err != nil {
+							t.Fatalf("%s: %v", what, err)
+						}
+						for _, table := range tables {
+							pages[what+" of "+table] += pagesRead(ctx, t, tx, table)
+						}
+					}()
+				}
+				return pages
+			}
+			// Others are in another group, and each has a group in a group of its own; each holds a
+			// role on a cluster, is eligible there and on ann's cluster, and is denied on it.
+			others := func(n int) {
+				t.Helper()
+				manyMembers(t, h, n, `, members AS (INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+					  SELECT 't1', 'everyone', 'user', id FROM others UNION ALL SELECT 't1', 'p' || id, 'group', 'g' || id FROM others),
+					parents AS (INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'p' || id FROM others),
+					granted AS (INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+					  SELECT 't1', 'cluster', id, 'user', id, 'cluster.login' FROM others),
+					eligible AS (INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+					  SELECT 't1', 'cluster', c, 'user', id, 'cluster.sudo', 3600 FROM others, unnest(ARRAY[id, 'c1']) AS c)
+					INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+					SELECT 't1', 'cluster', id, 'd', ARRAY['user:' || id], '{cluster:root}'::text[] FROM others`,
+					"rbac_grants", "rbac_eligibilities", "rbac_denies", "rbac_members")
+			}
+			others(500)
+			few := read()
+			others(4500)
+			for what, many := range read() {
+				if many > few[what]*3/2+deeper {
+					t.Errorf("%s read %d pages, and %d once 4500 more were in groups, held a role, were eligible and were denied", what, few[what], many)
+				}
+			}
+		})
+	}
+}
+
+// Under PostgreSQL's default plan_cache_mode, a connection's statement may turn generic from its
+// sixth run, and a change by an actor in a nested group, GroupsOf, and a change to a group's members
+// read on each later call about as many pages as on the first, as they do under a generic plan.
+func TestReadsStayBoundedOnceAConnectionsStatementsTurnGeneric(t *testing.T) {
+	h := crowded(t, pgtest.Open(t, "pool_max_conns=1"), func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), groupMembers) })
+	ctx := t.Context()
+	h.groups(t, "builders", "oncall", "everyone")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'builders', 'group', 'inner')`); err != nil {
+		t.Fatal(err)
+	}
+	boss := h.as(t, "boss", "inner")
+	ann := h.as(t, "ann", "oncall")
+	h.as(t, "bob")
+	h.seed(t, grant(cluster.Scope(), "cluster.admin", rbac.User, "boss"), grant(cluster.Scope(), "cluster.login", rbac.Group, "builders"),
+		grant(cluster.Scope(), "cluster.login", rbac.Group, "oncall"), grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "boss"))
+	manyMembers(t, h, 5000, `, members AS (INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+		  SELECT 't1', 'everyone', 'user', id FROM others),
+		eligible AS (INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+		  SELECT 't1', 'cluster', id, 'user', id, 'cluster.sudo', 3600, '{group:everyone}'::text[] FROM others)
+		INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+		SELECT 't1', 'cluster', id, 'd', ARRAY['user:' || id], '{group:everyone}'::text[], '{cluster:root}'::text[] FROM others`,
+		"rbac_grants", "rbac_members", "rbac_eligibilities", "rbac_denies")
+	tables := []string{"rbac_grants", "rbac_eligibilities", "rbac_denies", "rbac_members"}
+	for what, f := range map[string]func(a *rbac.Authorizer) error{
+		"Apply in a nested group": func(a *rbac.Authorizer) error {
+			return a.Apply(ctx, boss, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: ann.Principal}}})
+		},
+		"GroupsOf": func(a *rbac.Authorizer) error { return second(a.GroupsOf(ctx, "t1", boss.Principal)) },
+		"ChangeMembers": func(a *rbac.Authorizer) error {
+			return a.ChangeMembers(ctx, boss, "t1", []rbac.Member{{Group: "oncall", Principal: identity("bob")}}, []rbac.Member{{Group: "oncall", Principal: ann.Principal}})
+		},
+	} {
+		// The pages of each table, and its indexes, each call reads, in a transaction it rolls back,
+		// on the pool's one connection.
+		var first map[string]int64
+		for call := range 8 {
+			pages := map[string]int64{}
+			func() {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				for _, table := range tables {
+					pages[table] -= pagesRead(ctx, t, tx, table)
+				}
+				if err := f(h.authz.WithTx(tx)); err != nil {
+					t.Fatalf("%s: %v", what, err)
+				}
+				for _, table := range tables {
+					pages[table] += pagesRead(ctx, t, tx, table)
+				}
+			}()
+			if first == nil {
+				first = pages
+			}
+			for _, table := range tables {
+				if pages[table] > first[table]*3/2+deeper {
+					t.Errorf("%s read %d pages of %s on its first call, and %d on call %d", what, first[table], table, pages[table], call+1)
+				}
+			}
+		}
 	}
 }
