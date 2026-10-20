@@ -191,10 +191,10 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 	var total int64
 	for {
 		var n int64
-		var end *int64
+		var next *int64
 		err := begin(ctx, db, func(tx pgx.Tx) error {
 			var err error
-			n, end, err = pruneWindow(ctx, tx, before, through, from, int64(maxPrune)-total)
+			n, next, err = pruneWindow(ctx, tx, before, through, from, int64(maxPrune)-total)
 			if err == nil {
 				prunedWindow(tx)
 			}
@@ -206,17 +206,18 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 		total += n
 		// The window held no record, or the call deleted as many as it may: what follows reached is
 		// the next call's.
-		if end == nil || total >= int64(maxPrune) {
+		if next == nil || total >= int64(maxPrune) {
 			return total, nil
 		}
-		from = *end
+		from = *next
 	}
 }
 
 // pruneWindow deletes, in tx, up to most records of the next MaxPrune after from, or after where
 // the last prune of the same before and through stopped where from is -1. It returns how many it
-// deleted, and where the window ends, nil for a window that held no record.
-func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Cursor, from, most int64) (n int64, end *int64, err error) {
+// deleted, and the last record it judged, which the next window starts after: nil for a window that
+// held no record.
+func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Cursor, from, most int64) (n int64, next *int64, err error) {
 	schema, err := historySchema(ctx, tx)
 	if err != nil {
 		return 0, nil, err
@@ -266,7 +267,8 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 	// last AsOf finds. Each record is judged by its own row's versions, not every row's, and only
 	// those of the window, the next MaxPrune records by id, so a transaction reads no more of
 	// history however few records it finds to delete.
-	var reached int64
+	var picked int64
+	var last, end *int64
 	if err := tx.QueryRow(ctx, `
 		WITH win AS (
 		  SELECT max(id) AS last FROM (SELECT id FROM `+history+` WHERE id > $5 ORDER BY id LIMIT $6) w
@@ -288,30 +290,32 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 		  -- By id, from the batch: a join could read all of history to find it.
 		  DELETE FROM `+history+` WHERE id = ANY (ARRAY(SELECT id FROM doomed)) RETURNING id
 		)
-		SELECT count(*), coalesce(max(id), 0), (SELECT last FROM win) FROM pruned`,
-		before, through.TxID, through.ID, most, from, maxPrune).Scan(&n, &reached, &end); err != nil {
+		SELECT (SELECT count(*) FROM pruned), (SELECT count(*) FROM doomed), (SELECT max(id) FROM doomed), (SELECT last FROM win)`,
+		before, through.TxID, through.ID, most, from, maxPrune).Scan(&n, &picked, &last, &end); err != nil {
 		return 0, nil, err
 	}
 	// Under a host's transaction, which goes on past the prune.
 	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', '', true), set_config('enable_sort', $1, true)`, sorting); err != nil {
 		return 0, nil, err
 	}
+	// It judged its window to the end, unless its batch filled first: by what it picked, not what
+	// it deleted, as a prune of the same that deleted some of them meanwhile leaves fewer to delete,
+	// and the rest of the window, which it never judged, is the next's.
+	next = end
+	if picked == most {
+		next = last
+	}
 	// One that deleted none left history as it was, and the call goes on to the next window itself:
 	// its record would account for no record gone, refuse AsOf times history still holds, and grow
 	// history with each window of each call of a host that prunes on a schedule.
 	if n == 0 {
-		return 0, end, nil
-	}
-	// It reached its window's end, unless its batch filled first: the rest of the window is the
-	// next call's.
-	if n < most {
-		reached = *end
+		return 0, next, nil
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO `+history+` (effective_at, tenant, entity, key, op, after, how)
 		VALUES (now(), '', 'history', `+pruneKey+`, 'prune',
 		  jsonb_build_object('before', $1::pg_catalog.timestamptz, 'through', `+pruneThrough+`, 'deleted', $4::bigint, 'reached', $5::bigint),
-		  'PruneHistory')`, before, through.TxID, through.ID, n, reached)
-	return n, end, err
+		  'PruneHistory')`, before, through.TxID, through.ID, n, *next)
+	return n, next, err
 }
 
 // Record is one change to a row the package keeps, as its history recorded it, its times in UTC.

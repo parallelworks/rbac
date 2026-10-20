@@ -3037,6 +3037,98 @@ func TestPruningHistoryReadsOnlyAsFarAsItsBatch(t *testing.T) {
 	}
 }
 
+// A prune's window whose batch another prune of the same deletes some of meanwhile goes on from the
+// last record it picked, not from the window's end: the records after its batch, which it never
+// judged, are deleted by what follows, and none stays behind where the prune recorded it reached.
+func TestPruningGoesOnFromTheLastRecordItPicked(t *testing.T) {
+	rbac.SetMaxPrune(t, 2)
+	h := setup(t)
+	ctx := t.Context()
+	// After the creator's grant, four whose first versions go once they changed.
+	for _, sql := range []string{
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		 SELECT 't1', 'cluster', 'c1', 'user', 'g' || i, 'cluster.login' FROM generate_series(1, 4) i`,
+		`UPDATE rbac_grants SET note = 'changed' WHERE principal_id LIKE 'g_'`,
+	} {
+		if _, err := h.pool.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firsts := func() []int64 {
+		t.Helper()
+		rows, err := h.pool.Query(ctx, `SELECT id FROM rbac_history WHERE op = 'create' AND principal LIKE 'user:g_' ORDER BY id`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ids
+	}
+	ids := firsts()
+	then, through := dbNow(t, h), exported(t, h)
+	// The first window, the creator's grant and g1's first version, deletes one; the second, g2's and
+	// g3's, picks one, g2's, which the other prune deletes while the window waits for it.
+	other, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = other.Rollback(ctx) }()
+	var pid int
+	if err := other.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	committed := make(chan error, 1)
+	windows := 0
+	rbac.SetPrunedWindow(t, func(pgx.Tx) {
+		if windows++; windows != 1 {
+			return
+		}
+		for _, q := range []struct {
+			sql  string
+			args []any
+		}{{`SELECT set_config('rbac.prune', 'on', true)`, nil}, {`DELETE FROM rbac_history WHERE id = $1`, []any{ids[1]}}} {
+			if _, err := other.Exec(ctx, q.sql, q.args...); err != nil {
+				committed <- err
+				return
+			}
+		}
+		go func() {
+			for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+				var waiting bool
+				if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1 = ANY (pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
+					committed <- err
+					return
+				}
+				if waiting {
+					committed <- other.Commit(ctx)
+					return
+				}
+			}
+			committed <- errors.New("the second window never waited for the other prune")
+		}()
+	})
+	if n, err := rbac.PruneHistory(ctx, h.pool, then, through); err != nil || n != 2 {
+		t.Fatalf("PruneHistory = %d, %v", n, err)
+	}
+	if err := <-committed; err != nil {
+		t.Fatal(err)
+	}
+	for {
+		n, err := rbac.PruneHistory(ctx, h.pool, then, through)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n == 0 {
+			break
+		}
+	}
+	if left := firsts(); len(left) != 0 {
+		t.Fatalf("first versions %v left of %v", left, ids)
+	}
+}
+
 // A prune reads history a window at a time, each in a transaction of its own, which reads as much
 // of history however long it is, so a call that finds little to delete in a long history holds no
 // export back for long; and it deletes what one transaction reading all of it would.
