@@ -92,21 +92,41 @@ func (a *Authorizer) recording(ctx context.Context, tx pgx.Tx, actor Principal, 
 	}, nil
 }
 
-// followable refuses, on tx, a cursor of another generation, or whose last record the database no
-// longer holds, and returns the generation tx reads. The zero Cursor, or one from a read that found
-// nothing, is followable from any.
-func followable(ctx context.Context, tx pgx.Tx, after Cursor) (generation string, err error) {
+// packageSchema returns the schema tx reads the package's tables in, by which history's reads name
+// its tables: any role may make a temporary table, which a search_path that doesn't name pg_temp
+// reads before every schema, and a pooled connection keeps, so one named as history's would stand
+// in for it, and Export would sign what it holds. It refuses the session's temporary schema, which
+// a search_path naming pg_temp first makes the current one.
+func packageSchema(ctx context.Context, tx pgx.Tx) (string, error) {
+	var schema string
+	var temporary bool
+	if err := tx.QueryRow(ctx, `SELECT n.nspname, n.oid = pg_catalog.pg_my_temp_schema()
+		FROM pg_catalog.pg_namespace n WHERE n.nspname = pg_catalog.current_schema()`).Scan(&schema, &temporary); err != nil {
+		return "", err
+	}
+	if temporary {
+		return "", fmt.Errorf("%w: the search_path names pg_temp first, where any role may make tables named as the package's", ErrInvalid)
+	}
+	return schema, nil
+}
+
+// followable refuses, on tx, a cursor of another generation, or whose last record history in schema
+// no longer holds, and returns the generation tx reads. The zero Cursor, or one from a read that
+// found nothing, is followable from any.
+func followable(ctx context.Context, tx pgx.Tx, schema string, after Cursor) (generation string, err error) {
+	history := pgx.Identifier{schema, "rbac_history"}.Sanitize()
 	// The timeline WAL is written on, which promotion changes at once; the last checkpoint's
 	// changes only once the next completes, minutes later. And the database and schema of the
 	// history read, by OIDs, which a physical copy keeps: every database and schema in a cluster
-	// would otherwise share a generation, and with one key, checkpoints.
+	// would otherwise share a generation, and with one key, checkpoints. The catalogs by schema
+	// too, as a temporary table is read before them.
 	var held bool
 	if err := tx.QueryRow(ctx, `SELECT s.system_identifier::text || '/' || left(pg_walfile_name(pg_current_wal_lsn()), 8)
 		    || '/' || d.oid::text || '/' || c.relnamespace::text,
-		  EXISTS (SELECT 1 FROM rbac_history WHERE txid = $1::xid8 AND id = $2 AND recorded_at = $3)
-		FROM pg_control_system() s, pg_database d, pg_class c
-		WHERE d.datname = current_database() AND c.oid = 'rbac_history'::regclass`,
-		after.TxID, after.ID, storedTime(after.RecordedAt)).Scan(&generation, &held); err != nil {
+		  EXISTS (SELECT 1 FROM `+history+` WHERE txid = $1::xid8 AND id = $2 AND recorded_at = $3)
+		FROM pg_control_system() s, pg_catalog.pg_database d, pg_catalog.pg_class c
+		WHERE d.datname = current_database() AND c.oid = $4::text::regclass`,
+		after.TxID, after.ID, storedTime(after.RecordedAt), history).Scan(&generation, &held); err != nil {
 		return "", err
 	}
 	if after != (Cursor{}) && after.Generation != generation {
@@ -149,12 +169,14 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 	}
 	var n int64
 	err := begin(ctx, db, func(tx pgx.Tx) error {
-		if _, err := followable(ctx, tx, through); err != nil {
+		schema, err := historySchema(ctx, tx)
+		if err != nil {
 			return err
 		}
-		if _, err := historySchema(ctx, tx); err != nil {
+		if _, err := followable(ctx, tx, schema, through); err != nil {
 			return err
 		}
+		history := pgx.Identifier{schema, "rbac_history"}.Sanitize()
 		// AsOf refuses a time before the prune's, so one yet to come would refuse the present.
 		var future bool
 		if err := tx.QueryRow(ctx, `SELECT $1::timestamptz > statement_timestamp()`, before).Scan(&future); err != nil {
@@ -173,7 +195,7 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 		// stopped short of it, as one dated by its host transaction's start, or one that waited on
 		// another's batch and deleted none of it.
 		var from int64
-		if err := tx.QueryRow(ctx, `SELECT coalesce(max((after->>'reached')::bigint), 0) FROM rbac_history
+		if err := tx.QueryRow(ctx, `SELECT coalesce(max((after->>'reached')::bigint), 0) FROM `+history+`
 			WHERE tenant = '' AND entity = 'history' AND key = `+pruneKey+`
 			  AND op = 'prune' AND after->'through' = `+pruneThrough, before, through.TxID, through.ID).Scan(&from); err != nil {
 			return err
@@ -196,13 +218,13 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 		var reached int64
 		if err := tx.QueryRow(ctx, `
 			WITH doomed AS (
-			  SELECT h.id FROM rbac_history h
+			  SELECT h.id FROM `+history+` h
 			  WHERE h.id > $5 AND h.effective_at <= $1 AND (h.txid, h.id) < ($2::xid8, $3) AND h.entity <> 'history'
 			    AND (EXISTS (
-			      SELECT FROM rbac_history n
+			      SELECT FROM `+history+` n
 			      WHERE n.tenant = h.tenant AND n.entity = h.entity AND n.key = h.key AND n.effective_at <= $1 AND n.id > h.id)
 			    OR h.op IN ('delete', 'expire') AND NOT EXISTS (
-			      SELECT FROM rbac_history s
+			      SELECT FROM `+history+` s
 			      WHERE s.tenant = h.tenant AND s.entity = h.entity AND s.key = h.key AND s.id < h.id
 			        AND (s.id <= $5 OR s.effective_at > $1 OR (s.txid, s.id) >= ($2::xid8, $3))))
 			  -- A batch, oldest first: of a row, its end goes after every version before it, so a
@@ -210,7 +232,7 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 			  ORDER BY h.id LIMIT $4
 			), pruned AS (
 			  -- By id, from the batch: a join could read all of history to find it.
-			  DELETE FROM rbac_history WHERE id = ANY (ARRAY(SELECT id FROM doomed)) RETURNING id
+			  DELETE FROM `+history+` WHERE id = ANY (ARRAY(SELECT id FROM doomed)) RETURNING id
 			)
 			SELECT count(*), coalesce(max(id), $5) FROM pruned`, before, through.TxID, through.ID, maxPrune, from).Scan(&n, &reached); err != nil {
 			return err
@@ -219,7 +241,7 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 		if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', '', true), set_config('enable_sort', $1, true)`, sorting); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `INSERT INTO rbac_history (effective_at, tenant, entity, key, op, after, how)
+		_, err = tx.Exec(ctx, `INSERT INTO `+history+` (effective_at, tenant, entity, key, op, after, how)
 			VALUES (now(), '', 'history', `+pruneKey+`, 'prune',
 			  jsonb_build_object('before', $1::timestamptz, 'through', `+pruneThrough+`, 'deleted', $4::bigint, 'reached', $5::bigint),
 			  'PruneHistory')`, before, through.TxID, through.ID, n, reached)
@@ -332,6 +354,9 @@ const MaxHistory = 10000
 // again from the start, kept apart from the last export. A logical dump restored into another
 // cluster numbers its transactions anew, which a cursor can't follow: move history with physical
 // backups and replicas.
+//
+// It reads history in the current schema by name, so a session's temporary table named as
+// history's stands in for none of it, and refuses a search_path that names pg_temp first.
 func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Record, Cursor, error) {
 	if limit < 1 || limit > MaxHistory {
 		return nil, after, fmt.Errorf("%w: a read of history takes from 1 to %d records", ErrInvalid, MaxHistory)
@@ -342,14 +367,17 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 	// reach both an old primary and the new one. Not a.begin, which refuses changes as of a time:
 	// this only reads.
 	err := begin(ctx, a.db, func(tx pgx.Tx) error {
-		var err error
-		if generation, err = followable(ctx, tx, after); err != nil {
+		schema, err := packageSchema(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if generation, err = followable(ctx, tx, schema, after); err != nil {
 			return err
 		}
 		rows, err := tx.Query(ctx, `
 			SELECT id, txid, recorded_at, effective_at, tenant, entity, key, op, coalesce(principal, ''), coalesce(role, ''),
 			  coalesce(scope, ''), coalesce(group_id, ''), expires_at, before, after, actor, on_behalf_of, how, request, reason, db_user
-			FROM rbac_history
+			FROM `+pgx.Identifier{schema, "rbac_history"}.Sanitize()+`
 			WHERE (txid, id) > ($1::xid8, $2) AND txid < pg_snapshot_xmin(pg_current_snapshot())
 			ORDER BY txid, id LIMIT $3`, after.TxID, after.ID, limit)
 		if err != nil {

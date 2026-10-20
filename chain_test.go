@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/parallelworks/rbac"
+	"github.com/parallelworks/rbac/internal/pgtest"
 )
 
 // exportAll exports history in batches of two, as an exporter would, until it has every record
@@ -166,6 +167,33 @@ func TestAnExportIsSigned(t *testing.T) {
 		return err
 	}); !errors.Is(err, rbac.ErrInvalid) {
 		t.Errorf("an export as of a time: %v", err)
+	}
+}
+
+// An export chains and signs history, not a session's temporary table named as it, which any role
+// may make and a pool keeps on its connection.
+func TestAnExportSignsHistoryWhateverTablesASessionMakes(t *testing.T) {
+	h := setupOn(t, pgtest.Open(t, "pool_max_conns=1"))
+	ctx := t.Context()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, checkpoints := exportAll(t, h, key)
+	last := checkpoints[len(checkpoints)-1]
+	// On a session of its own, which has planned none of History's statements.
+	h.pool.Reset()
+	if _, err := h.pool.Exec(ctx, `CREATE TEMP TABLE rbac_history AS SELECT * FROM rbac_history;
+		INSERT INTO pg_temp.rbac_history (id, txid, recorded_at, effective_at, tenant, entity, key, op)
+		VALUES (0, '1', now(), now(), 't1', 'grant', 'forged', 'create')`); err != nil {
+		t.Fatal(err)
+	}
+	got, from, err := h.authz.Export(ctx, rbac.Checkpoint{}, rbac.MaxHistory, key)
+	if err != nil || !reflect.DeepEqual(got, records) || from.Hash != last.Hash || from.Count != last.Count || from.Cursor.Generation != last.Cursor.Generation {
+		t.Fatalf("an export beside a session's own history = %+v, %+v, %v", got, from, err)
+	}
+	if more, _, err := h.authz.Export(ctx, last, 1, key); err != nil || len(more) != 0 {
+		t.Fatalf("an export from its checkpoint, beside a session's own history = %+v, %v", more, err)
 	}
 }
 

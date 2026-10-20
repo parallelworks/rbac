@@ -308,6 +308,12 @@ through which it could write `rbac_history` itself; and:
    `Migrate` calls functions by name, and an overload made there would run in its place, as the
    administrator's role.
 
+The application's role may create temporary tables, as `AsOf` needs, and a session reads its own
+before any schema's of the same name until it ends, which in a pool can be long after the call
+that made one. One named as a package's table stands in for it in that session, whose checks are
+the application's own to make; `History`, `Export` and `PruneHistory` name history's table by the
+package's schema, so none stands in for it, and refuse a search_path that names pg_temp first.
+
 ## Running it
 
 - **Tables:** `rbac.Migrate` creates them, prefixed `rbac_`, in the connection's current schema,

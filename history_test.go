@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io/fs"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -327,6 +328,65 @@ func role(t *testing.T, tx pgx.Tx) (name, schema string) {
 		t.Fatal(err)
 	}
 	return name, schema
+}
+
+// Any role may make a temporary table, which a search_path that doesn't name pg_temp reads before
+// any schema's, pg_catalog's too, and a pool keeps it on its connection: one named as history's,
+// empty or holding records history never held, or as a catalog its generation is read from, stands
+// in for none of it, to History, its generation and cursor, or PruneHistory. A search_path naming
+// pg_temp first, which makes it the current schema, is refused.
+func TestHistoryReadsItselfWhateverTablesASessionMakes(t *testing.T) {
+	h := setupOn(t, pgtest.Open(t, "pool_max_conns=1"))
+	ctx := t.Context()
+	var schema string
+	if err := h.pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `UPDATE rbac_grants SET note = 'changed' WHERE principal = 'user:owner'`); err != nil {
+		t.Fatal(err)
+	}
+	var through rbac.Cursor
+	want := drain(t, h, &through, 2)
+	before := dbNow(t, h)
+	for _, shadow := range []string{
+		`CREATE TEMP TABLE rbac_history (LIKE rbac_history INCLUDING ALL)`,
+		`CREATE TEMP TABLE pg_class AS SELECT oid, 0::oid AS relnamespace FROM pg_catalog.pg_class;
+		 CREATE TEMP TABLE pg_database AS SELECT 0::oid AS oid, datname FROM pg_catalog.pg_database`,
+		`CREATE TEMP TABLE rbac_history AS SELECT * FROM rbac_history;
+		 INSERT INTO pg_temp.rbac_history (id, txid, recorded_at, effective_at, tenant, entity, key, op)
+		 VALUES (0, '1', now(), now(), 't1', 'grant', 'forged', 'create')`,
+	} {
+		// Each on a session of its own, which has planned none of History's statements.
+		h.pool.Reset()
+		if _, err := h.pool.Exec(ctx, shadow); err != nil {
+			t.Fatal(err)
+		}
+		got, cursor, err := h.authz.History(ctx, rbac.Cursor{}, rbac.MaxHistory)
+		if err != nil || !reflect.DeepEqual(got, want) || cursor.Generation != through.Generation || cursor.ID != through.ID {
+			t.Errorf("History beside a session's own history = %+v, %+v, %v", got, cursor, err)
+		}
+		if more, _, err := h.authz.History(ctx, through, 1); err != nil || len(more) != 0 {
+			t.Errorf("History after its cursor, beside a session's own history = %+v, %v", more, err)
+		}
+	}
+	// The owner's grant's first version, which its second supersedes.
+	if n, err := rbac.PruneHistory(ctx, h.pool, before, through); err != nil || n != 1 {
+		t.Errorf("PruneHistory beside a session's own history = %d, %v", n, err)
+	}
+	var pruned, prunes int
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE id = $1), count(*) FILTER (WHERE entity = 'history')
+		FROM `+pgx.Identifier{schema, "rbac_history"}.Sanitize(), want[0].ID).Scan(&pruned, &prunes); err != nil || pruned != 0 || prunes != 1 {
+		t.Errorf("history holds %d of the version pruned and %d prunes, %v", pruned, prunes, err)
+	}
+	if _, err := h.pool.Exec(ctx, `SELECT set_config('search_path', 'pg_temp, ' || quote_ident(current_schema()), false)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h.authz.History(ctx, rbac.Cursor{}, 1); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("History with pg_temp first in the search_path: %v", err)
+	}
+	if _, err := rbac.PruneHistory(ctx, h.pool, before, through); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("PruneHistory with pg_temp first in the search_path: %v", err)
+	}
 }
 
 func TestHistoryKeysTellMembersApart(t *testing.T) {

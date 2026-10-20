@@ -49,8 +49,9 @@ var asOfEntities = []struct {
 // views named as the package's tables stand in for them, and rolls it back, even once ctx is
 // done. It needs a transaction that may write, on a primary, as a role that may create temporary
 // tables. A search_path that names pg_temp after the package's schema would read the tables as
-// they are now, so AsOf refuses it. It orders a row's changes by their ids in rbac_history, which
-// sessions take out of order once its id sequence caches more than one, so AsOf refuses that too.
+// they are now, and one that names it first the session's own tables as history, so AsOf refuses
+// both. It orders a row's changes by their ids in rbac_history, which sessions take out of order
+// once its id sequence caches more than one, so AsOf refuses that too.
 func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read func(*Authorizer) error) (err error) {
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -77,11 +78,11 @@ func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read
 	return a.readAsOf(ctx, tx, tenant, at, read)
 }
 
-// historySchema returns the schema tx reads history in, refusing it where history's ids can't
-// order a row's changes.
+// historySchema returns the schema tx reads history in, as packageSchema does, refusing it where
+// history's ids can't order a row's changes.
 func historySchema(ctx context.Context, tx pgx.Tx) (string, error) {
-	var schema string
-	if err := tx.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+	schema, err := packageSchema(ctx, tx)
+	if err != nil {
 		return "", err
 	}
 	// A cached sequence hands each session a block of ids of its own, so a change made after
