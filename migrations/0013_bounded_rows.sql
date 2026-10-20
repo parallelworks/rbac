@@ -125,3 +125,96 @@ BEGIN
         END;
     END LOOP;
 END $$;
+
+-- History returns each record whole, and PostgreSQL returns no text past 1 GB, so one record past
+-- it stops every read of history from there. The tables bound what they hold, but a change's
+-- context is the writing session's to set, and a column a later migration adds could go unbounded:
+-- a row of more than 1 MiB as jsonb, or a context of more than 1 MiB, is refused, which fails its
+-- write. The largest row the package writes, a deny naming and exempting as many of the longest
+-- keys as it may, is about a third of that, and a context a few kilobytes. A row already stored was
+-- bounded when it was written, so a change that removes one is never refused here.
+CREATE OR REPLACE FUNCTION rbac_record() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+<<rbac_record>>
+DECLARE
+    was    jsonb := CASE WHEN TG_OP = 'INSERT' THEN NULL ELSE pg_catalog.to_jsonb(OLD) END;
+    is_now jsonb := CASE WHEN TG_OP = 'DELETE' THEN NULL ELSE pg_catalog.to_jsonb(NEW) END;
+    r      jsonb := coalesce(is_now, was);
+    -- The row's expiry as the tables bound it, as migrating rewrites it: a grant migrating deletes,
+    -- merged into another, holds one they refuse, which JSON or a time.Time can't write.
+    expiry timestamptz := CASE WHEN (r->>'expires_at')::timestamptz = 'infinity' THEN NULL
+                   WHEN (r->>'expires_at')::timestamptz > '9999-12-30 23:59:59.999999+00' THEN '9999-12-30 23:59:59.999999+00'
+                   WHEN (r->>'expires_at')::timestamptz <= '0001-01-01 00:00:00+00' THEN timestamptz 'epoch'
+                   ELSE (r->>'expires_at')::timestamptz END;
+    -- Parsed only within the bound, which the record checks first.
+    said   text  := current_setting('rbac.change', true);
+    change jsonb := CASE WHEN pg_catalog.octet_length(said) > 1048576 THEN NULL ELSE coalesce(nullif(said, '')::jsonb, '{}') END;
+    -- The context says only whether a delete is an expiry, and only a row that has expired is one,
+    -- so whoever sets it can't record a revoke as anything else.
+    op     text  := CASE TG_OP WHEN 'INSERT' THEN 'create' WHEN 'UPDATE' THEN 'update'
+                   WHEN 'DELETE' THEN CASE WHEN change->>'op' = 'expire' AND (was->>'expires_at')::timestamptz <= statement_timestamp()
+                     THEN 'expire' ELSE 'delete' END END;
+    entity text  := CASE TG_TABLE_NAME WHEN 'rbac_grants' THEN 'grant' WHEN 'rbac_roles' THEN 'role'
+                   WHEN 'rbac_denies' THEN 'deny' WHEN 'rbac_eligibilities' THEN 'eligibility'
+                   WHEN 'rbac_memberships' THEN 'membership' WHEN 'rbac_groups' THEN 'group' WHEN 'rbac_members' THEN 'member' END;
+    key    text  := CASE entity WHEN 'deny' THEN (r->>'scope') || ' ' || (r->>'id') WHEN 'membership' THEN r->>'principal'
+                   WHEN 'member' THEN pg_catalog.jsonb_build_array(r->>'group_id', r->>'principal', r->>'source')::text
+                   ELSE r->>'id' END;
+    was_key text := CASE entity WHEN 'deny' THEN (was->>'scope') || ' ' || (was->>'id') WHEN 'membership' THEN was->>'principal'
+                   WHEN 'member' THEN pg_catalog.jsonb_build_array(was->>'group_id', was->>'principal', was->>'source')::text
+                   ELSE was->>'id' END;
+    ended  boolean;
+BEGIN
+    IF pg_catalog.pg_column_size(is_now) > 1048576 OR pg_catalog.octet_length(said) > 1048576 THEN
+        RAISE EXCEPTION 'history records no row or change of more than 1 MiB: this % row is % bytes and its change %',
+            TG_TABLE_NAME, pg_catalog.pg_column_size(is_now), pg_catalog.octet_length(said) USING ERRCODE = 'program_limit_exceeded';
+    END IF;
+    -- An update that moves a row to another key or tenant ends it under the old one, which would
+    -- otherwise read as live for good, and starts it under the new.
+    IF TG_OP = 'UPDATE' AND (was_key IS DISTINCT FROM key OR was->>'tenant' IS DISTINCT FROM is_now->>'tenant') THEN
+        -- An update revokes nothing, so a row it moves that had expired ended with its expiry, as an
+        -- activation Activate makes anew did, rather than by the change that moved it.
+        ended := (was->>'expires_at')::timestamptz <= statement_timestamp();
+        INSERT INTO rbac_history (effective_at, tenant, entity, key, op, principal, role, scope, group_id, expires_at,
+          before, after, actor, on_behalf_of, how, request, reason)
+        VALUES (
+          greatest(CASE WHEN ended THEN (was->>'expires_at')::timestamptz ELSE statement_timestamp() END,
+            (SELECT max(h.effective_at) FROM rbac_history h
+             WHERE h.tenant = was->>'tenant' AND h.entity = rbac_record.entity AND h.key = was_key)),
+          was->>'tenant', entity, was_key, CASE WHEN ended THEN 'expire' ELSE 'delete' END, was->>'principal',
+          CASE entity WHEN 'role' THEN was->>'id' ELSE was->>'role' END,
+          was->>'scope',
+          CASE entity WHEN 'group' THEN was->>'id' WHEN 'member' THEN was->>'group_id' END,
+          (was->>'expires_at')::timestamptz, was, NULL,
+          coalesce(change->>'actor', ''), coalesce(change->>'on_behalf_of', ''), coalesce(change->>'how', ''),
+          coalesce(change->>'request', ''), coalesce(change->>'reason', ''));
+        op := 'create';
+        was := NULL;
+    END IF;
+    INSERT INTO rbac_history (effective_at, tenant, entity, key, op, principal, role, scope, group_id, expires_at,
+      before, after, actor, on_behalf_of, how, request, reason)
+    VALUES (
+      -- A change took effect with its statement, and an expiry when it expired, but neither before
+      -- the row's last record: a change can have moved its expiry back to before then. The last a
+      -- write's snapshot holds: at READ COMMITTED, as the package changes the tables, this query
+      -- takes one once the write has waited for another's lock on the row, but at REPEATABLE READ
+      -- or SERIALIZABLE the transaction's is older, so a write that waited is dated before the
+      -- change it waited for. Write around the package at READ COMMITTED.
+      greatest(CASE WHEN op = 'expire' THEN expiry ELSE statement_timestamp() END,
+        (SELECT max(h.effective_at) FROM rbac_history h
+         WHERE h.tenant = r->>'tenant' AND h.entity = rbac_record.entity AND h.key = rbac_record.key)),
+      r->>'tenant', entity, key, op, r->>'principal',
+      CASE entity WHEN 'role' THEN r->>'id' ELSE r->>'role' END,
+      r->>'scope',
+      CASE entity WHEN 'group' THEN r->>'id' WHEN 'member' THEN r->>'group_id' END,
+      expiry, was, is_now,
+      coalesce(change->>'actor', ''), coalesce(change->>'on_behalf_of', ''), coalesce(change->>'how', ''),
+      coalesce(change->>'request', ''), coalesce(change->>'reason', ''));
+    RETURN NULL;
+END $$;
+
+
+-- Replacing a function resets its settings: its definer's rights read only this schema again, and
+-- it writes a row's times as JSON in UTC.
+DO $$ BEGIN
+    EXECUTE format('ALTER FUNCTION rbac_record() SET search_path = %I, pg_temp SET TimeZone = ''UTC''', current_schema());
+END $$;

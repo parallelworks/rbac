@@ -717,6 +717,129 @@ func TestMigratingNamesARowTheTablesRefuse(t *testing.T) {
 	}
 }
 
+// History records no row or change it couldn't return, as one of a column no check bounds, or a
+// context the writing session sets: past a mebibyte, its write fails, and History reads on past it.
+func TestHistoryRecordsNoRowOrChangeTooLargeToRead(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	var cursor rbac.Cursor
+	drain(t, h, &cursor, 1)
+	// As a column a later migration adds might be.
+	if _, err := h.pool.Exec(ctx, `ALTER TABLE rbac_grants DROP CONSTRAINT rbac_grants_note_check`); err != nil {
+		t.Fatal(err)
+	}
+	write := func(id string, note int, change string) error {
+		return pgx.BeginFunc(ctx, h.pool, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, `SELECT set_config('rbac.change', $1, true)`, change); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, note)
+				VALUES ('t1', 'cluster', 'c1', 'user', $1, 'cluster.login', repeat('x', $2))`, id, note)
+			return err
+		})
+	}
+	reason, err := json.Marshal(map[string]string{"reason": strings.Repeat("r", 1<<20)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, err := range map[string]error{
+		"a row":    write("long", 1<<20, ""),
+		"a change": write("told", 0, string(reason)),
+	} {
+		if pgErr := (*pgconn.PgError)(nil); !errors.As(err, &pgErr) || pgErr.Code != "54000" {
+			t.Errorf("%s of more than a mebibyte: %v", name, err)
+		}
+	}
+	if err := write("within", 1<<20-1024, `{"reason": "r"}`); err != nil {
+		t.Fatalf("a row within the bound: %v", err)
+	}
+	if got := drain(t, h, &cursor, 1); got[0].Principal != identity("within") {
+		t.Fatalf("read %+v", got[0])
+	}
+}
+
+// The largest rows the package writes, every id, key, list and text as long as it may be, are
+// recorded, and History returns them: history's bound is well above them.
+func TestHistoryRecordsTheLargestRowsThePackageWrites(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	var cursor rbac.Cursor
+	drain(t, h, &cursor, 1)
+	// Text of n characters of four bytes each, the most a character takes.
+	text := func(n int) string { return strings.Repeat("😀", n) }
+	id := text(rbac.MaxID / 4)
+	keys := func(n int) []string {
+		ks := make([]string, n)
+		for i := range ks {
+			ks[i] = fmt.Sprintf("k%062d:%s", i, id)
+		}
+		return ks
+	}
+	actor, name, typ, source := keys(1)[0], text(rbac.MaxName), "t"+strings.Repeat("x", 62), "s"+strings.Repeat("x", 62)
+	grantable := longestNames("r", rbac.MaxGrantableRoles)
+	for i := range grantable {
+		grantable[i] += strings.Repeat("x", 65)
+	}
+	for _, w := range []struct {
+		sql  string
+		args []any
+	}{
+		{
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, condition_title,
+			condition_description, condition, note, approved_by, created_by, updated_by)
+			VALUES ($1, $2, $1, $3, $1, $4, $5, $6, $7, $8, $7, $9, $9, $9)`,
+			[]any{id, typ, "k" + strings.Repeat("x", 62), "c" + strings.Repeat("x", 127), source, name, text(rbac.MaxNote), text(rbac.MaxExpression / 4), actor},
+		},
+		{
+			`INSERT INTO rbac_roles (tenant, id, name, description, permissions, resource_types, grantable_roles, updated_by)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			[]any{
+				id, "custom." + strings.Repeat("x", 121), name, text(rbac.MaxDescription), longestPermissions(rbac.MaxRoleEntries),
+				longestNames("t", rbac.MaxRoleEntries), grantable, actor,
+			},
+		},
+		{
+			`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, name, principals, exempt, permissions, condition_title,
+			condition_description, condition, created_by, updated_by)
+			VALUES ($1, $2, $1, $3, $4, $5, $6, $7, $4, $8, $9, $10, $10)`,
+			[]any{
+				id, typ, "d" + strings.Repeat("x", 127), name, keys(rbac.MaxDenyEntries), keys(2 * rbac.MaxDenyEntries)[rbac.MaxDenyEntries:],
+				longestPermissions(rbac.MaxDenyEntries), text(rbac.MaxDescription), text(rbac.MaxExpression / 4), actor,
+			},
+		},
+		{
+			`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, requires,
+			approvers, note, created_by)
+			VALUES ($1, $2, $1, $3, $1, $4, 60, $5, $6, $7, $8)`,
+			[]any{
+				id, typ, "k" + strings.Repeat("x", 62), "c" + strings.Repeat("x", 127), text(rbac.MaxExpression / 4), keys(rbac.MaxApprovers),
+				text(rbac.MaxNote), actor,
+			},
+		},
+		{`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id, source, note, created_by, updated_by)
+			VALUES ($1, $2, $1, $3, $4, $5, $5)`, []any{id, "k" + strings.Repeat("x", 62), source, text(rbac.MaxNote), actor}},
+		{`INSERT INTO rbac_groups (tenant, id, name, description, source, created_by, updated_by)
+			VALUES ($1, $2, $2, $3, $4, $5, $5)`, []any{id, name, text(rbac.MaxDescription), source, actor}},
+		{`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, source, note, created_by, updated_by)
+			VALUES ($1, $2, $3, $1, $4, $5, $6, $6)`, []any{id, name, "k" + strings.Repeat("x", 62), source, text(rbac.MaxNote), actor}},
+	} {
+		if _, err := h.pool.Exec(ctx, w.sql, w.args...); err != nil {
+			t.Fatalf("%s: %v", strings.Fields(w.sql)[2], err)
+		}
+	}
+	// Recorded as they were and as they are.
+	for _, table := range []string{"rbac_grants", "rbac_roles", "rbac_denies", "rbac_eligibilities", "rbac_memberships", "rbac_groups", "rbac_members"} {
+		if _, err := h.pool.Exec(ctx, `UPDATE `+table+` SET tenant = tenant WHERE tenant = $1`, id); err != nil {
+			t.Fatalf("%s: %v", table, err)
+		}
+	}
+	largest := 0
+	for _, r := range drain(t, h, &cursor, 14) {
+		largest = max(largest, len(r.Before)+len(r.After))
+	}
+	t.Logf("the largest record's rows are %d bytes of JSON", largest)
+}
+
 // migrateFiles applies the migrations named from from up to to, or past the last when to is empty,
 // as a host's own migration tool would: each once, in order, in a transaction of its own.
 func migrateFiles(t *testing.T, pool *pgxpool.Pool, from, to string) {

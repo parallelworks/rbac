@@ -288,7 +288,8 @@ actor and the call that made it (`Record.How`), and what the host attaches with 
 on whose behalf it was made, the request and the reason. An expiry `DeleteExpired` removes is
 recorded as one, made by no one. Triggers write it, so a write that bypasses the package is
 recorded too, as no one's. That context is what the session that wrote it says; the database role
-is what the database knows. A row written before history was installed, as by a host that applied
+is what the database knows. The tables hold only what the package could write, and a write whose
+row or context is more than 1 MiB as JSON fails rather than record what `History` couldn't return. A row written before history was installed, as by a host that applied
 the first migrations on their own, is recorded by migrating as it found it, its `baseline`, dated
 when it was created, or a role when it last changed. Nothing updates or truncates history, only
 `PruneHistory` deletes from it, and the package's tables can be deleted from but not truncated.
