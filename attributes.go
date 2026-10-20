@@ -28,7 +28,10 @@ import (
 // declared, or reading one as another type, is refused when it is stored, rather than being false
 // whenever it runs. Each map names attributes and their types; a nil one leaves that kind
 // undeclared, read as any value under any name. Declared, they are read as fields, such as
-// `resource.attributes.env`, and named as identifiers.
+// `resource.attributes.env`, and named as identifiers. A condition stored under other declarations
+// is checked against these too, once, when a check first reads it: one that no longer passes, as
+// one reading an attribute since declared another type or no longer declared, fails, so a grant's
+// gives nothing, a deny's applies, and a requirement isn't met.
 //
 // A condition reading an attribute a request doesn't carry, or carries as a value CEL reads as
 // another type than it is declared, as nil, or as a double that is NaN or infinite, is false when

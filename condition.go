@@ -71,9 +71,10 @@ const (
 	// refused.
 	maxCheckCost = 8 * maxCost
 	// compilePerByte is what compiling a condition costs for each byte of it. Compiling one takes
-	// about as long as evaluating forty units of cost for each, but once for each condition, which
-	// checks then read from the cache, so this counts it cheaper: a check of conditions none of
-	// which is cached can take a few times what its budget implies.
+	// about as long as evaluating forty units of cost for each, twice that where attributes are
+	// declared, as it is checked against them too, but once for each condition, which checks then
+	// read from the cache, so this counts it cheaper: a check of conditions none of which is cached
+	// can take a few times what its budget implies.
 	compilePerByte = 8
 	// maxDepth bounds how deeply a condition nests: checking its types takes time that grows much
 	// faster than its length with depth, which compilePerByte doesn't count.
@@ -127,15 +128,20 @@ func (b *budget) spend(cost uint64) { b.left -= min(cost, b.left) }
 // conditions compiles conditions once and keeps the programs, bounded.
 type conditions struct {
 	env *cel.Env
-	// typed checks a condition against the declared attributes when it is stored; nil when none
-	// are declared. typedOK are the expressions it passed, bounded as the programs are, so a change
-	// storing one condition many times checks it once.
+	// typed checks a condition against the declared attributes; nil when none are declared.
 	typed    *cel.Env
 	mu       sync.RWMutex
-	programs map[string]cel.Program
+	programs map[string]program
 	cached   int
-	typedOK  map[string]bool
-	typedLen int
+}
+
+// program is a condition compiled, and why it doesn't check against the attributes declared now,
+// if it doesn't: one stored under other declarations, as before an attribute was declared another
+// type or no longer, would otherwise run as if they hadn't changed, and a deny reading it as a
+// string lift for a list, so a check reads it as failing.
+type program struct {
+	cel.Program
+	typed error
 }
 
 func newConditions(attrs Attributes) (*conditions, error) {
@@ -154,48 +160,23 @@ func newConditions(attrs Attributes) (*conditions, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &conditions{env: env, typed: typed, programs: map[string]cel.Program{}, typedOK: map[string]bool{}}, nil
+	return &conditions{env: env, typed: typed, programs: map[string]program{}}, nil
 }
 
 // check returns why an expression can't be stored as a condition: it doesn't compile, or reads
 // an attribute it doesn't declare, or as another type.
 func (c *conditions) check(expr string) error {
-	if _, err := c.compile(expr); err != nil || c.typed == nil {
+	prg, err := c.compile(expr)
+	if err != nil {
 		return err
 	}
-	c.mu.RLock()
-	ok := c.typedOK[expr]
-	c.mu.RUnlock()
-	if ok {
-		return nil
-	}
-	checked, iss := c.typed.Compile(expr)
-	if iss.Err() != nil {
-		return fmt.Errorf("%w: %w", errCondition, iss.Err())
-	}
-	if checked.OutputType() != cel.BoolType {
-		return fmt.Errorf("%w: is %s, not a bool", errCondition, checked.OutputType())
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for k := range c.typedOK {
-		if c.typedLen+len(expr) <= maxCached {
-			break
-		}
-		delete(c.typedOK, k)
-		c.typedLen -= len(k)
-	}
-	if !c.typedOK[expr] {
-		c.typedOK[expr] = true
-		c.typedLen += len(expr)
-	}
-	return nil
+	return prg.typed
 }
 
 var errCondition = errors.New("rbac: condition")
 
 // compile returns an expression's program, or why it isn't a condition.
-func (c *conditions) compile(expr string) (cel.Program, error) {
+func (c *conditions) compile(expr string) (program, error) {
 	c.mu.RLock()
 	prg, ok := c.programs[expr]
 	c.mu.RUnlock()
@@ -205,26 +186,27 @@ func (c *conditions) compile(expr string) (cel.Program, error) {
 	return c.build(expr)
 }
 
-func (c *conditions) build(expr string) (cel.Program, error) {
+func (c *conditions) build(expr string) (program, error) {
 	if len(expr) > MaxExpression {
-		return nil, fmt.Errorf("%w: longer than %d bytes", errCondition, MaxExpression)
+		return program{}, fmt.Errorf("%w: longer than %d bytes", errCondition, MaxExpression)
 	}
 	checked, iss := c.env.Compile(expr)
 	if iss.Err() != nil {
-		return nil, fmt.Errorf("%w: %w", errCondition, iss.Err())
+		return program{}, fmt.Errorf("%w: %w", errCondition, iss.Err())
 	}
 	if checked.OutputType() != cel.BoolType {
-		return nil, fmt.Errorf("%w: is %s, not a bool", errCondition, checked.OutputType())
+		return program{}, fmt.Errorf("%w: is %s, not a bool", errCondition, checked.OutputType())
 	}
 	patterns, err := checkPatterns(checked)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", errCondition, err)
+		return program{}, fmt.Errorf("%w: %w", errCondition, err)
 	}
-	prg, err := c.env.Program(checked, cel.CostLimit(maxCost), cel.CostTracking(costs{patterns}),
+	run, err := c.env.Program(checked, cel.CostLimit(maxCost), cel.CostTracking(costs{patterns}),
 		cel.OptimizeRegex(matching(patterns)), cel.CustomDecorator(bounded))
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", errCondition, err)
+		return program{}, fmt.Errorf("%w: %w", errCondition, err)
 	}
+	prg := program{Program: run, typed: c.typeCheck(expr)}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, ok := c.programs[expr]; ok {
@@ -242,6 +224,22 @@ func (c *conditions) build(expr string) (cel.Program, error) {
 	c.programs[expr] = prg
 	c.cached += len(expr)
 	return prg, nil
+}
+
+// typeCheck returns why expr doesn't check against the declared attributes: it reads one they
+// don't declare, or as another type.
+func (c *conditions) typeCheck(expr string) error {
+	if c.typed == nil {
+		return nil
+	}
+	checked, iss := c.typed.Compile(expr)
+	if iss.Err() != nil {
+		return fmt.Errorf("%w: %w", errCondition, iss.Err())
+	}
+	if checked.OutputType() != cel.BoolType {
+		return fmt.Errorf("%w: is %s, not a bool", errCondition, checked.OutputType())
+	}
+	return nil
 }
 
 // costs charges calls by what they read where CEL's own estimate undercounts it: that counts a
@@ -584,7 +582,7 @@ func (c *conditions) decide(b *budget, expr string, vars map[string]any) (held, 
 		return false, false
 	}
 	prg, err := c.compile(expr)
-	if err != nil {
+	if err != nil || prg.typed != nil {
 		return false, false
 	}
 	left := b.left

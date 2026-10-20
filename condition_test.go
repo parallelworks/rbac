@@ -234,6 +234,64 @@ func TestDeclaredAttributesChangedAfterNewAreReadAsDeclaredAtNew(t *testing.T) {
 	}
 }
 
+// A grant's condition, a deny's and a requirement, stored while env and level were declared strings,
+// read once the host declares them lists of strings: none passes the declarations now, so each
+// fails, rather than run as if they hadn't changed, where a list is unequal to any string.
+func TestAConditionStoredUnderOtherDeclarationsFailsWhereItNoLongerPassesThem(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
+		c.Attributes = rbac.Attributes{
+			Resource: map[string]rbac.AttributeType{"env": rbac.AttrString},
+			Request:  map[string]rbac.AttributeType{"level": rbac.AttrString},
+		}
+	})
+	ctx := t.Context()
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	g.Condition = rbac.Condition{Expression: `resource.attributes.env != "prod"`}
+	h.seed(t, g, grant(cluster.Scope(), "cluster.login", rbac.User, "v"), grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+	u, v, w := h.as(t, "u"), h.as(t, "v"), h.as(t, "w")
+	d := rbac.Deny{
+		ID: "prod", Principals: []rbac.Principal{v.Principal}, Permissions: []rbac.Permission{login},
+		Condition: rbac.Condition{Expression: `resource.attributes.env == "prod"`},
+	}
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, d); err != nil {
+		t.Fatal(err)
+	}
+	e := rbac.Eligibility{Role: "cluster.login", Principal: w.Principal, MaxDuration: time.Hour, Requires: `request.attributes.level != "low"`}
+	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, e); err != nil {
+		t.Fatal(err)
+	}
+	cfg := h.cfg
+	cfg.Attributes = rbac.Attributes{
+		Resource: map[string]rbac.AttributeType{"env": rbac.AttrStrings},
+		Request:  map[string]rbac.AttributeType{"level": rbac.AttrStrings},
+	}
+	later, err := rbac.New(h.pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := later.SetDeny(ctx, h.as(t, "guardian"), cluster, d); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("storing the deny under the declarations now: %v", err)
+	}
+	r := cluster
+	r.Attributes = map[string]any{"env": []string{"prod"}}
+	if dec, err := later.Explain(ctx, v, login, r); err != nil || dec.Allowed || !strings.Contains(dec.Reason, "couldn't be evaluated") {
+		t.Errorf("a deny of prod, for a resource in prod: %+v, %v", dec, err)
+	}
+	if err := later.Authorize(ctx, u, login, r); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("a grant for anything but prod, for a resource in prod: %v", err)
+	}
+	act := rbac.Activation{Role: "cluster.login", Duration: time.Minute, Justification: "INC-1"}
+	if _, err := later.Activate(rbac.WithRequest(ctx, map[string]any{"level": []string{"low"}}), w, cluster, act); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("a requirement of a level other than low, at level low: %v", err)
+	}
+	// Under the declarations they were stored under, they decide as ever.
+	r.Attributes = map[string]any{"env": "prod"}
+	if allowed(t, h, u, login, r) || allowed(t, h, v, login, r) {
+		t.Error("the conditions under the declarations they were stored under")
+	}
+}
+
 // named is a Go type a host may pass an attribute as, which CEL reads as a string.
 type named string
 

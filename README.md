@@ -147,7 +147,8 @@ reach, to check one by one.
   request's attributes (`Subject.Attributes`, `Resource.Attributes`, `rbac.WithRequest`), the time
   and the action. It gives its role only where the expression holds; one that fails is false.
   `Config.Attributes` declares the attributes and their types, so a condition reading one
-  misnamed, or as another type, is refused when stored. Cost is bounded per condition and per
+  misnamed, or as another type, is refused when stored, and one stored under other declarations
+  fails where it no longer passes them. Cost is bounded per condition and per
   check, and a check evaluates the cheapest first, so what it decides doesn't rest on ids; a
   scope's conditional denies are bounded together, so a check always evaluates them. To hand a
   permission on, the actor holds it unconditionally or under the same condition, one that doesn't
