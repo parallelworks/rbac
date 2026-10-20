@@ -577,7 +577,9 @@ flowchart TB
   before grants, so they don't deadlock. A revoke locks the grants it deletes in that order too, as
   a change ending places in groups ends activations among them without their scope's lock. Every
   change holds grants last, after its places and memberships, as `Activate` holds the places an
-  activation rests on before its grant.
+  activation rests on before its grant. `DeleteRole` removes a role's grants before its
+  eligibilities, but holds the tenant's lock exclusive, so no change runs beside it but
+  `DeleteExpired`, which waits on no row.
 - **One snapshot for reads in several statements.** Explain, Reachable, Holders and Conflicts read
   in one REPEATABLE READ, READ ONLY transaction of their own on a pool, and AsOf in a REPEATABLE
   READ one it rolls back; the label values Explain, Reachable and Holders need are read after it.

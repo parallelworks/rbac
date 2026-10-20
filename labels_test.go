@@ -878,6 +878,44 @@ func TestApprovingAnActivationOnALabeledScopeNeedsItsLabel(t *testing.T) {
 	}
 }
 
+// The approver's values are read before the transaction wherever an eligibility it approves is
+// found, not only where it outranks the one chosen as found then: under the locks, the paths'
+// ends can rank an eligibility needing approval above one that doesn't, and its values, never
+// asked about, would refuse every activation as a conflict.
+func TestAnApprovalTheLocksRankFirstIsReadBeforeThem(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	h := labeled(t)
+	ctx := t.Context()
+	h.hold(t, "owner", "level:high")
+	h.groups(t, "a")
+	u := h.as(t, "u", "a")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "a", Principal: u.Principal, ExpiresAt: h.now.Add(3 * time.Hour)}}); err != nil {
+		t.Fatal(err)
+	}
+	cleared := h.as(t, "cleared")
+	h.hold(t, "cleared", "level:high")
+	owner := h.as(t, "owner")
+	// Through a, found first, needing no approval; through u's own, lasting longer, needing it.
+	for _, e := range []rbac.Eligibility{
+		{Role: "cluster.login", Principal: groupOf("a"), MaxDuration: time.Hour},
+		{Role: "cluster.login", Principal: u.Principal, MaxDuration: time.Hour, Approvers: []rbac.Principal{cleared.Principal}},
+	} {
+		if err := h.authz.SetEligibility(ctx, owner, secret, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	g, err := h.authz.Activate(ctx, u, secret, rbac.Activation{
+		Role: "cluster.login", Duration: time.Minute, Justification: "on call", Approver: cleared,
+	})
+	if err != nil {
+		t.Fatalf("approved by %s, holding the label's values: %v", cleared.Principal.ID, err)
+	}
+	if g.ApprovedBy != cleared.Principal {
+		t.Errorf("approved by %v, not through u's own eligibility", g.ApprovedBy)
+	}
+}
+
 func TestFilterNeedsTheLabelColumnWhereLabelsAreDeclared(t *testing.T) {
 	h := labeled(t)
 	s := h.as(t, "u")

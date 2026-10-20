@@ -669,15 +669,12 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 	vars, spend := a.vars(ctx, s, manage, on), budgetOf(2*maxCheckCost)
 	var chosen *eligibility
 	for i, e := range found {
-		// Found later, one that doesn't outrank the one chosen loses to it, on its requirement or
-		// principal where they tie, so needn't be evaluated.
-		if chosen != nil && !outranks(e, *chosen) {
-			continue
-		}
 		if len(e.approvers) > 0 && !approves(act.Approver, s, countedOf(approvers, broad{}), e.approvers) {
 			reason = fmt.Sprintf("activating %s here needs one of its approvers to approve", act.Role)
 			continue
 		}
+		// Before the ranking: the paths' ends, which only the transaction reads, can rank one it
+		// approves first there, and its values must have been asked about before it.
 		if len(e.approvers) > 0 && on.Labels.asks() {
 			// Read the first time in each phase, with no request, as approving asks the constraints.
 			held, err := approving.holding(WithRequest(ctx, nil), q)
@@ -688,6 +685,11 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 				reason = "the resource's label asks for values in " + dim + " its approver doesn't hold"
 				continue
 			}
+		}
+		// Found later, one that doesn't outrank the one chosen loses to it, on its requirement or
+		// principal where they tie, so needn't be evaluated.
+		if chosen != nil && !outranks(e, *chosen) {
+			continue
 		}
 		if e.requires == "" || a.conds.holds(spend, e.requires, vars) {
 			chosen = &found[i]
