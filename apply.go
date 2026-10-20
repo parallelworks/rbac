@@ -1846,23 +1846,37 @@ type deletion struct {
 // another, and each deletes the grants of a principal on a scope: deleting them in the order of
 // the index each reads by, they would deadlock.
 func inOrder(table, where string) string {
-	return "id IN (SELECT id FROM " + table + " WHERE tenant = $1 AND " + where + " ORDER BY scope, principal, id FOR UPDATE)"
+	return "id IN (" + lockedInOrder(table, "id", bindingOrder, "tenant = $1 AND "+where) + ")"
 }
+
+// The orders grants and eligibilities, places in groups and denies are locked in. Every change
+// that locks several of a table's rows takes them in its order, or two would deadlock.
+const (
+	bindingOrder = "scope, principal, id"
+	placeOrder   = "group_id, principal, source"
+	denyOrder    = "scope, id"
+)
 
 // placesInOrder is inOrder for places in groups, and deniesInOrder for denies, by their keys.
 func placesInOrder(where string) string {
-	return "(group_id, principal, source) IN (SELECT group_id, principal, source FROM rbac_members WHERE tenant = $1 AND " + where +
-		" ORDER BY group_id, principal, source FOR UPDATE)"
+	return "(group_id, principal, source) IN (" +
+		lockedInOrder("rbac_members", "group_id, principal, source", placeOrder, "tenant = $1 AND "+where) + ")"
 }
 
 func deniesInOrder(where string) string {
-	return "(scope, id) IN (SELECT scope, id FROM rbac_denies WHERE tenant = $1 AND " + where + " ORDER BY scope, id FOR UPDATE)"
+	return "(scope, id) IN (" + lockedInOrder("rbac_denies", "scope, id", denyOrder, "tenant = $1 AND "+where) + ")"
+}
+
+// lockedInOrder is SQL selecting cols of the rows of table that where picks, once they are locked
+// in order.
+func lockedInOrder(table, cols, order, where string) string {
+	return "SELECT " + cols + " FROM " + table + " WHERE " + where + " ORDER BY " + order + " FOR UPDATE"
 }
 
 // lockInOrder locks, in tx, the rows of table in tenant $1 that where picks, in order, for a
 // change that changes them in several statements.
 func lockInOrder(ctx context.Context, tx pgx.Tx, table, order, where string, args ...any) error {
-	_, err := tx.Exec(ctx, `SELECT FROM `+table+` WHERE tenant = $1 AND `+where+` ORDER BY `+order+` FOR UPDATE`, args...)
+	_, err := tx.Exec(ctx, lockedInOrder(table, "", order, "tenant = $1 AND "+where), args...)
 	return err
 }
 
@@ -1941,8 +1955,16 @@ func (a *Authorizer) remove(ctx context.Context, tx pgx.Tx, tenant, where string
 func removed[T any](ctx context.Context, a *Authorizer, tx pgx.Tx, table, columns string, collect func(pgx.Rows) ([]T, error),
 	tenant, where string, args ...any,
 ) ([]T, error) {
-	query := `DELETE FROM ` + table + ` WHERE tenant = $1 AND ` + where
-	args = append([]any{tenant}, args...)
+	return removedWhere(ctx, a, tx, table, columns, collect, "tenant = $1 AND "+where, append([]any{tenant}, args...)...)
+}
+
+// removedWhere is removed of the rows where alone picks, its arguments from $1: rows picked by key,
+// in a tenant they were found in, which beside tenant = $1 a generic plan, costing a tenant's rows
+// by averages, would find by reading every row in the tenant.
+func removedWhere[T any](ctx context.Context, a *Authorizer, tx pgx.Tx, table, columns string, collect func(pgx.Rows) ([]T, error),
+	where string, args ...any,
+) ([]T, error) {
+	query := `DELETE FROM ` + table + ` WHERE ` + where
 	// Only OnChange reads what was removed, which for a whole tenant can be every row it has.
 	if a.cfg.OnChange == nil {
 		_, err := tx.Exec(ctx, query, args...)
@@ -2007,19 +2029,24 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 			return n, all, err
 		}
 	}
+	// A batch of table's rows expired by Config.Now and by the database's clock too, which history
+	// records an expiry by: a row expired by Config.Now alone, which can run ahead of it, would be
+	// recorded as deleted. A generic plan, which doesn't know the time, costs the rows expired as a
+	// third of the table: taken in no order, they look as cheap to find by reading the whole table as
+	// by the index of expiries, and matched in a join to the rows to delete, as cheap to delete by
+	// reading every row of every tenant. So a batch is taken in order of expiry and deleted by key,
+	// each looked up on its own; places in groups, which have no id, by the version the batch holds.
+	expiring := func(table, key string) func(pgx.Tx) (int64, int64, error) {
+		return statement(`WITH d AS (DELETE FROM ` + table + ` WHERE ` + key + ` = ANY(ARRAY(
+			SELECT ` + key + ` FROM ` + table + ` WHERE expires_at <= least($1, statement_timestamp())
+			ORDER BY expires_at LIMIT $2 FOR UPDATE SKIP LOCKED)) RETURNING 1)
+		SELECT count(*), count(*) FROM d`)
+	}
 	var total int64
-	// By the database's clock too, which history records an expiry by: a row expired by Config.Now
-	// alone, which can run ahead of it, would be recorded as deleted.
 	for _, batch := range []func(pgx.Tx) (int64, int64, error){
-		statement(`WITH d AS (DELETE FROM rbac_grants WHERE id IN (
-			SELECT id FROM rbac_grants WHERE expires_at <= least($1, statement_timestamp()) LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING 1)
-		SELECT count(*), count(*) FROM d`),
-		statement(`WITH d AS (DELETE FROM rbac_eligibilities WHERE id IN (
-			SELECT id FROM rbac_eligibilities WHERE expires_at <= least($1, statement_timestamp()) LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING 1)
-		SELECT count(*), count(*) FROM d`),
-		statement(`WITH d AS (DELETE FROM rbac_members WHERE (tenant, group_id, principal, source) IN (
-			SELECT tenant, group_id, principal, source FROM rbac_members WHERE expires_at <= least($1, statement_timestamp()) LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING 1)
-		SELECT count(*), count(*) FROM d`),
+		expiring("rbac_grants", "id"),
+		expiring("rbac_eligibilities", "id"),
+		expiring("rbac_members", "ctid"),
 		func(tx pgx.Tx) (int64, int64, error) { return endMemberships(ctx, tx, now) },
 	} {
 		for {
@@ -2050,8 +2077,9 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 // place it made. Holding the membership, it waits on no change holding a place, which may roll
 // back the place's removal: it passes over that membership, for the next run.
 func endMemberships(ctx context.Context, tx pgx.Tx, now time.Time) (picked, all int64, err error) {
+	// Ordered, so a generic plan finds the batch by the index of expiries, as deleteExpired's.
 	rows, err := tx.Query(ctx, `SELECT tenant, principal FROM rbac_memberships
-		WHERE expires_at <= least($1, statement_timestamp()) LIMIT $2 FOR UPDATE SKIP LOCKED`, now, expiryBatch)
+		WHERE expires_at <= least($1, statement_timestamp()) ORDER BY expires_at LIMIT $2 FOR UPDATE SKIP LOCKED`, now, expiryBatch)
 	if err != nil {
 		return 0, 0, err
 	}

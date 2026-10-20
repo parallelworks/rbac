@@ -311,13 +311,20 @@ func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives m
 	if limit > 0 {
 		limited = fmt.Sprintf(" LIMIT %d", limit)
 	}
+	// The holders of roles are read only where holdersOf names some: in the statement's text, which
+	// then plans no read of them. A generic plan can't tell from an empty array to read none, and no
+	// index leads to a role, so it would read every grant and eligibility in the tenant each change.
+	holders := "FALSE"
+	if len(holdersOf) > 0 {
+		holders = "TRUE"
+	}
 	// Each key's values are looked up by key, so a change reads what the identities it reaches
 	// hold, not every value held in the tenant, and stops at the first conflict it finds.
 	rows, err := q.Query(ctx, `
 		WITH RECURSIVE seeds(k) AS (
 		  SELECT unnest($2::text[]) COLLATE "C"
-		  UNION SELECT principal FROM rbac_grants WHERE tenant = $1 AND role = ANY($3::text[])
-		  UNION SELECT principal FROM rbac_eligibilities WHERE tenant = $1 AND role = ANY($3::text[])
+		  UNION SELECT principal FROM rbac_grants WHERE `+holders+` AND tenant = $1 AND role = ANY($3::text[])
+		  UNION SELECT principal FROM rbac_eligibilities WHERE `+holders+` AND tenant = $1 AND role = ANY($3::text[])
 		), `+insideSQL(`ARRAY(SELECT substr(k, 7) FROM seeds WHERE k LIKE 'group:%')`, "$4", "NULL", false)+`,
 		targets(identity) AS (
 		  SELECT k FROM seeds WHERE k NOT LIKE 'group:%' AND k NOT LIKE 'members:%' AND k <> 'public:'

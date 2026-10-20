@@ -122,6 +122,95 @@ func TestSettingMemberships(t *testing.T) {
 	}
 }
 
+// Memberships of named principals, and SetMemberships, read only their memberships under a generic
+// plan: one plan for a tenant's every membership and for a few principals' reads every one to find
+// theirs, and the keys a change sets, joined to the tenant's memberships to find those it makes or
+// widens, read every one.
+func TestMembershipsOfNamedPrincipalsUnderAGenericPlanReadOnlyTheirs(t *testing.T) {
+	h := generic(t, banks)
+	ctx := t.Context()
+	ann := h.as(t, "ann")
+	// The pages of memberships each reads, in a transaction it rolls back.
+	read := func() map[string]int64 {
+		t.Helper()
+		pages := map[string]int64{}
+		for what, f := range map[string]func(a *rbac.Authorizer) error{
+			"Memberships": func(a *rbac.Authorizer) error {
+				ms, err := a.Memberships(ctx, "t1", []rbac.Principal{ann.Principal, identity("new")})
+				if err == nil && len(ms) != 1 {
+					err = fmt.Errorf("Memberships = %+v", ms)
+				}
+				return err
+			},
+			// A suspended member's, which widens what it holds once lifted where none was, and one made.
+			"SetMemberships": func(a *rbac.Authorizer) error {
+				return a.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: ann.Principal, Suspended: true}, {Principal: identity("new")}})
+			},
+		} {
+			// Rolled back on a failure too: a transaction left open keeps its connection, which the
+			// pool's cleanup would wait on.
+			func() {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				start := pagesRead(ctx, t, tx, "rbac_memberships")
+				if err := f(h.authz.WithTx(tx)); err != nil {
+					t.Fatalf("%s: %v", what, err)
+				}
+				pages[what] = pagesRead(ctx, t, tx, "rbac_memberships") - start
+			}()
+		}
+		return pages
+	}
+	others := func(n int) {
+		t.Helper()
+		manyMembers(t, h, n, `SELECT 1`)
+	}
+	others(500)
+	few := read()
+	others(4500)
+	for what, many := range read() {
+		if many > few[what]*3/2+deeper {
+			t.Errorf("%s read %d pages of memberships, and %d once 4500 more were members", what, few[what], many)
+		}
+	}
+}
+
+// Memberships of a principal reads only its own once its connection has listed the tenant's: as
+// one statement, the plan PostgreSQL caches for the listing, generic once it has run five times,
+// would read a principal's too, reading every membership.
+func TestMembershipsOfAPrincipalReadOnlyItsOwnOnceItsConnectionListedEvery(t *testing.T) {
+	h := setupOn(t, pgtest.Open(t, "pool_max_conns=1"))
+	ctx := t.Context()
+	ann := h.as(t, "ann")
+	manyMembers(t, h, 5000, `SELECT 1`)
+	// The pages of memberships reading ann's reads, in a transaction it rolls back.
+	read := func() int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		start := pagesRead(ctx, t, tx, "rbac_memberships")
+		if ms, err := h.authz.WithTx(tx).Memberships(ctx, "t1", []rbac.Principal{ann.Principal}); err != nil || len(ms) != 1 {
+			t.Fatalf("Memberships = %+v, %v", ms, err)
+		}
+		return pagesRead(ctx, t, tx, "rbac_memberships") - start
+	}
+	before := read()
+	for range 5 {
+		if _, err := h.authz.Memberships(ctx, "t1", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if after := read(); after > 2*before {
+		t.Errorf("reading ann's membership read %d pages, and %d once the tenant's were listed five times", before, after)
+	}
+}
+
 func TestManagingGroups(t *testing.T) {
 	h := grouped(t, func(c *rbac.Config) { c.Sources = []string{"directory"} })
 	ctx := t.Context()
@@ -410,6 +499,70 @@ func TestDeletingGroupsRemovesTheirGrants(t *testing.T) {
 	}
 	if members, err := h.authz.Members(ctx, "t1", "b"); err != nil || len(members) != 0 {
 		t.Fatalf("a deleted group is still in another: %+v, %v", members, err)
+	}
+}
+
+// DeleteGroups reads, of the tenant's grants and places in groups, only the groups' own, under a
+// generic plan too: a group's grants and those on it, and its members and its places in other
+// groups, are found by conditions ORed that no index seeks, and deleted matched to them in a join,
+// which a plan, costing the tenant's rows by averages, runs by reading every one.
+func TestDeletingAGroupUnderAGenericPlanReadsOnlyItsGrantsAndPlaces(t *testing.T) {
+	h := generic(t)
+	ctx := t.Context()
+	h.groups(t, "small", "everyone")
+	h.as(t, "ann", "small")
+	// small is in everyone, holds a grant and is granted on.
+	for _, q := range []string{
+		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'everyone', 'group', 'small')`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		  VALUES ('t1', 'cluster', 'c1', 'group', 'small', 'cluster.login'), ('t1', 'group', 'small', 'user', 'ann', 'group.owner')`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tables := []string{"rbac_grants", "rbac_members"}
+	// The pages of each that deleting small reads, in a transaction it rolls back.
+	read := func() map[string]int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		pages := map[string]int64{}
+		for _, table := range tables {
+			pages[table] -= pagesRead(ctx, t, tx, table)
+		}
+		if err := h.authz.WithTx(tx).DeleteGroups(ctx, host, "t1", []string{"small"}); err != nil {
+			t.Fatal(err)
+		}
+		for _, table := range tables {
+			pages[table] += pagesRead(ctx, t, tx, table)
+		}
+		var left int
+		if err := tx.QueryRow(ctx, `SELECT (SELECT count(*) FROM rbac_grants WHERE 'group:small' IN (principal, scope))
+			+ (SELECT count(*) FROM rbac_members WHERE 'small' = group_id OR 'group:small' = principal)`).Scan(&left); err != nil || left != 0 {
+			t.Fatalf("%d grants and places name small once it was deleted, %v", left, err)
+		}
+		return pages
+	}
+	// Others are in everyone, and hold a grant on the tenant and one on a cluster each.
+	others := func(n int) {
+		t.Helper()
+		manyMembers(t, h, n, `, members AS (INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+			  SELECT 't1', 'everyone', 'user', id FROM others)
+			INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'tenant', 't1', 'user', id, 'cluster.login' FROM others
+			UNION ALL SELECT 't1', 'cluster', id, 'user', id, 'cluster.login' FROM others`, tables...)
+	}
+	others(500)
+	few := read()
+	others(4500)
+	for what, many := range read() {
+		if many > few[what]*3/2+deeper {
+			t.Errorf("deleting small read %d pages of %s, and %d once 4500 more were in another group and granted", few[what], what, many)
+		}
 	}
 }
 
@@ -838,6 +991,70 @@ func TestDeleteExpiredRefusedForARaceConflicts(t *testing.T) {
 	}
 	if _, err := h.authz.WithTx(tx).DeleteExpired(ctx); !errors.Is(err, rbac.ErrConflict) {
 		t.Fatalf("DeleteExpired refused a lock: %v", err)
+	}
+}
+
+// DeleteExpired reads, of each table, only the rows expired, under a generic plan too, which costs
+// a batch as a third of the table: matched to the batch it holds in a join, a plan reads every
+// grant, eligibility and place in groups of every tenant, in each batch; and a batch taken in no
+// order looks as cheap to find by reading the whole table as by the index of expiries. It reads
+// across tenants, so one tenant's rows show what every tenant's would.
+func TestDeleteExpiredUnderAGenericPlanReadsOnlyWhatExpired(t *testing.T) {
+	tables := []string{"rbac_grants", "rbac_eligibilities", "rbac_members", "rbac_memberships"}
+	// Tables of n others, who hold a grant and an eligibility each and are in a group for good: each
+	// size in a schema and on a pool of its own, as a plan is made for what the tables held when it
+	// was first run.
+	beside := func(n int) *harness {
+		t.Helper()
+		h := setupOn(t, pgtest.Open(t, "plan_cache_mode=force_generic_plan"))
+		h.groups(t, "everyone")
+		manyMembers(t, h, n, `, members AS (INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+			  SELECT 't1', 'everyone', 'user', id FROM others),
+			eligibilities AS (INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+			  SELECT 't1', 'cluster', id, 'user', id, 'cluster.login', 60 FROM others)
+			INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', id, 'user', id, 'cluster.login' FROM others`, "rbac_grants", "rbac_eligibilities", "rbac_members")
+		return h
+	}
+	ctx := t.Context()
+	// The pages of each table DeleteExpired reads there once ten of each expired, and ten
+	// memberships with their places, in a transaction it rolls back.
+	read := func(h *harness) map[string]int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if _, err := tx.Exec(ctx, `WITH x AS (SELECT 'x' || i AS id FROM generate_series(1, 10) i),
+			grants AS (INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+			  SELECT 't1', 'tenant', 't1', 'user', id, 'cluster.login', '2025-01-01' FROM x),
+			eligibilities AS (INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, expires_at)
+			  SELECT 't1', 'cluster', 'c1', 'user', id, 'cluster.login', 60, '2025-01-01' FROM x),
+			memberships AS (INSERT INTO rbac_memberships (tenant, principal_kind, principal_id, expires_at)
+			  SELECT 't1', 'user', 'left-' || id, '2025-01-01' FROM x)
+			INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, source, expires_at)
+			SELECT 't1', 'everyone', 'user', id, 'directory', '2025-01-01'::timestamptz FROM x
+			UNION ALL SELECT 't1', 'everyone', 'user', 'left-' || id, '', NULL FROM x`); err != nil {
+			t.Fatal(err)
+		}
+		pages := map[string]int64{}
+		for _, table := range tables {
+			pages[table] -= pagesRead(ctx, t, tx, table)
+		}
+		if n, err := h.authz.WithTx(tx).DeleteExpired(ctx); err != nil || n != 50 {
+			t.Fatalf("DeleteExpired = %d, %v", n, err)
+		}
+		for _, table := range tables {
+			pages[table] += pagesRead(ctx, t, tx, table)
+		}
+		return pages
+	}
+	few := read(beside(500))
+	for what, many := range read(beside(5000)) {
+		if many > few[what]*3/2+deeper {
+			t.Errorf("DeleteExpired read %d pages of %s, and %d beside ten times as many that never expire", few[what], what, many)
+		}
 	}
 }
 

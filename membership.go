@@ -212,10 +212,13 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 		// A suspended member's membership widens what its identity will hold once lifted where no
 		// member's was in force: it is new, ended or a guest's. A suspended guest's never does, as the
 		// exclusive values count an identity's own grants before it joins. Read before the upsert.
+		// Here and below, each key's membership is looked up on its own: as an anti-join, a generic
+		// plan, costing the tenant's memberships by averages, reads every one. OFFSET 0 keeps the
+		// planner from making it one.
 		var widened []string
 		if a.exclusive() && len(suspendedMembers) > 0 {
 			rows, err := tx.Query(ctx, `SELECT k FROM unnest($2::text[]) AS k WHERE NOT EXISTS (SELECT FROM rbac_memberships m
-				WHERE m.tenant = $1 AND m.principal = k AND NOT m.guest AND (m.expires_at IS NULL OR m.expires_at > $3))`,
+				WHERE m.tenant = $1 AND m.principal = k AND NOT m.guest AND (m.expires_at IS NULL OR m.expires_at > $3) OFFSET 0)`,
 				tenant, suspendedMembers, at)
 			if err != nil {
 				return ChangeEvent{}, nil, err
@@ -226,7 +229,7 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 		}
 		left, err := removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant, `principal = ANY(
 			ARRAY(SELECT principal FROM rbac_memberships WHERE tenant = $1 AND principal = ANY($2::text[]) AND expires_at <= $3 FOR UPDATE)
-			|| ARRAY(SELECT k FROM unnest($2::text[]) AS k WHERE NOT EXISTS (SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = k)))`,
+			|| ARRAY(SELECT k FROM unnest($2::text[]) AS k WHERE NOT EXISTS (SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = k OFFSET 0)))`,
 			keys, at)
 		if err != nil {
 			return ChangeEvent{}, nil, err
@@ -261,12 +264,14 @@ func (a *Authorizer) Memberships(ctx context.Context, tenant string, principals 
 	if !validID(tenant) || slices.ContainsFunc(principals, func(p Principal) bool { return p != (Principal{}) && !p.wellFormed(tenant) }) {
 		return nil, fmt.Errorf("%w: Memberships needs a tenant and valid principals", ErrInvalid)
 	}
-	var keys []string
+	// A statement of its own for each shape, as GrantFilter's: one plan for both, cached generic
+	// once a connection has listed the tenant, reads every membership to find the principals'.
+	which, keys := "$2::text[] IS NULL", []string(nil)
 	if len(principals) > 0 {
-		keys = keysOf(principals)
+		which, keys = "principal = ANY($2::text[])", keysOf(principals)
 	}
 	rows, err := a.db.Query(ctx, `SELECT `+membershipColumns+` FROM rbac_memberships
-		WHERE tenant = $1 AND ($2::text[] IS NULL OR principal = ANY($2::text[])) AND (expires_at IS NULL OR expires_at > $3)
+		WHERE tenant = $1 AND `+which+` AND (expires_at IS NULL OR expires_at > $3)
 		ORDER BY principal`, tenant, keys, a.cfg.Now())
 	if err != nil {
 		return nil, err
@@ -599,7 +604,7 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 	// DeleteScopes and DeletePrincipal hold other scopes' and principals' locks and change some of
 	// these rows too, so each table is changed in the order delete changes them, grants last, and
 	// the rows changed in it are locked in order first: otherwise they would deadlock.
-	if err := lockInOrder(ctx, tx, "rbac_eligibilities", "scope, principal, id", "("+ofGroups+" OR approvers && $2::text[])",
+	if err := lockInOrder(ctx, tx, "rbac_eligibilities", bindingOrder, "("+ofGroups+" OR approvers && $2::text[])",
 		tenant, principals, scopes); err != nil {
 		return ChangeEvent{}, err
 	}
@@ -625,7 +630,7 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 	if e.Eligible, err = collectEligibilities(rows); err != nil {
 		return ChangeEvent{}, err
 	}
-	if err := lockInOrder(ctx, tx, "rbac_denies", "scope, id", "(scope = ANY($3::text[]) OR principals && $2::text[] OR exempt && $2::text[])",
+	if err := lockInOrder(ctx, tx, "rbac_denies", denyOrder, "(scope = ANY($3::text[]) OR principals && $2::text[] OR exempt && $2::text[])",
 		tenant, principals, scopes); err != nil {
 		return ChangeEvent{}, err
 	}
@@ -651,15 +656,46 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 	if e.Denies, err = collectDenies(rows); err != nil {
 		return ChangeEvent{}, err
 	}
-	if e.Left, err = removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant,
-		placesInOrder("(group_id = ANY($2::text[]) OR principal = ANY($3::text[]))"), ids, principals); err != nil {
+	// The places in the groups and of them, and the grants of the groups and on them, are each found
+	// by key on its own, locked in order as inOrder and placesInOrder lock them, and deleted by key:
+	// ORed, the conditions are none an index seeks, and matched to the rows to delete in a join, or
+	// beside tenant = $1, a generic plan can find them by reading every row in the tenant. Places in
+	// groups have no id, so a ctid keys them: no change moves one meanwhile, as each takes its
+	// group's lock or its principal's, which this change holds.
+	if e.Left, err = removedWhere(ctx, a, tx, "rbac_members", memberColumns, collectMembers,
+		lockedByKeys("rbac_members", "ctid", placeOrder, "group_id", "principal"), tenant, ids, principals); err != nil {
 		return ChangeEvent{}, err
 	}
 	if e.DeletedGroups, err = removed(ctx, a, tx, "rbac_groups", groupColumns, collectGroups, tenant, "id = ANY($2::text[])", ids); err != nil {
 		return ChangeEvent{}, err
 	}
-	e.Revoked, err = a.remove(ctx, tx, tenant, inOrder("rbac_grants", ofGroups), principals, scopes)
+	e.Revoked, err = removedWhere(ctx, a, tx, "rbac_grants", grantColumns, collectGrants,
+		lockedByKeys("rbac_grants", "id", bindingOrder, "principal", "scope"), tenant, principals, scopes)
 	return e, err
+}
+
+// lockedByKeys is SQL picking, by key, the rows of table in tenant $1 whose cols are each one of
+// the text array's keys from $2 on, the first col's from $2, once they are locked in order.
+func lockedByKeys(table, key, order string, cols ...string) string {
+	selects := make([]string, len(cols))
+	for i, col := range cols {
+		selects[i] = byKeys(table, key, col, fmt.Sprintf("$%d", i+2))
+	}
+	return anyOf(key, lockedInOrder(table, key, order, anyOf(key, selects...)))
+}
+
+// byKeys is SQL selecting key of the rows of table in tenant $1 whose col is one of the text array
+// keys, each looked up on its own. OFFSET 0 keeps the planner from flattening it into a join to the
+// whole array, which a generic plan, costing the tenant's rows by averages, can run by reading
+// every one.
+func byKeys(table, key, col, keys string) string {
+	return "SELECT x." + key + " FROM unnest(" + keys + "::text[]) AS k(k) CROSS JOIN LATERAL (SELECT " + key + " FROM " + table +
+		" WHERE tenant = $1 AND " + col + " = k.k OFFSET 0) x"
+}
+
+// anyOf is SQL picking, by key, the rows any of selects picks.
+func anyOf(key string, selects ...string) string {
+	return key + " = ANY(ARRAY(" + strings.Join(selects, " UNION ALL ") + "))"
 }
 
 // notOwnedGroups refuses, on q, changing groups from a source the host owns, which only it changes.
