@@ -263,6 +263,19 @@ func TestListingsAgreeWithChecksInRandomTenants(t *testing.T) {
 					}
 				}
 			}
+			// As Filter lists for a subject holding many grants on containers.
+			t.Run("looking up grants on containers", func(t *testing.T) {
+				rbac.SetMaxContainerOverlap(t, 0)
+				for _, s := range w.subjects {
+					for _, p := range []rbac.Permission{view, login, root} {
+						want := allowedOf(t, w.h, w.clusters, s, p)
+						_, unchecked := reachedBy(t, w.h, w.clusters, s, p)
+						if got := listed(t, w.h, s, p); !within(got, want) || !within(unchecked, got) {
+							t.Errorf("%+v %s: Filter %v, Authorize %v, Reachable unchecked %v", s, p, got, want, unchecked)
+						}
+					}
+				}
+			})
 			for _, r := range w.clusters {
 				for _, p := range []rbac.Permission{view, login, root} {
 					w.holdersAgree(t, p, r)

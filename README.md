@@ -84,13 +84,15 @@ query, which reads the grants in the same statement as the rows, so sorting and 
 nothing changes between deciding and reading. A condition holds for the query it was built for: it
 fixes the time, the subject's label holding and what the constraints answered, so build one for each
 query. It compares the tenant and keys byte for byte, as `Authorize` does, whatever the columns'
-collation, in which their indexes still serve. Past a few of a subject's grants on resources of the
-listed type, each row's own key is looked up in a hash of them, so a row costs one lookup however
-many it holds, as one holding a grant on everything it created does; no index serves that, so the
-query then reads every row of the tenant its other conditions keep. Denies on resources of the type
-are looked up so whatever their number. `Reachable` returns the same as
-scopes, for resources kept in another store. Both search one tenant, and count only unconditional
-grants: `Reach.Conditional` names the scopes conditional ones reach, to check one by one.
+collation, in which their indexes still serve. The subject's grants are matched through the path's
+index, whose cost for each row it finds grows with their number. Past a few on resources of the
+listed type, or past 128 on containers and the tenant, as one holding a grant on everything it
+created does, each of a row's keys is looked up among them instead, so a row costs a few lookups
+however many it holds; no index serves that, so the query then reads every row of the tenant its
+other conditions keep. Denies, on resources and containers alike, are looked up so whatever their
+number. `Reachable` returns the same as scopes, for resources kept in another store. Both search one
+tenant, and count only unconditional grants: `Reach.Conditional` names the scopes conditional ones
+reach, to check one by one.
 
 ## Policies
 

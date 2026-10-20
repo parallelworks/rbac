@@ -463,53 +463,133 @@ func TestListingsKeepToDeniesOnTheResourceItself(t *testing.T) {
 	}
 }
 
-// Filter's condition leaves out the resources denies on thousands of them cover in about the time
-// it takes for a few: a row's own key is looked up in a hash of the denies on resources of its
-// type, and only those on containers and the tenant overlap its path. Overlapping each row with
-// every deny would cost it thousands of comparisons, and a tenant's admins can set them.
-func TestFilterLooksUpDeniesOnResourcesByEachRowsKey(t *testing.T) {
+// Filter's condition leaves out the resources denies on thousands of them, or of the workspaces
+// they are in, cover in about the time it takes for a few: a row's own key is looked up in a hash of
+// the denies on resources of its type, and each of its keys in one object of those on containers and
+// the tenant. Overlapping each row with every deny would cost it thousands of comparisons, and a
+// tenant's admins can set them.
+func TestFilterLooksUpDeniesByEachRowsKeys(t *testing.T) {
+	for _, on := range []string{"cluster", "workspace"} {
+		t.Run(on, func(t *testing.T) {
+			h := setup(t)
+			ctx := t.Context()
+			const rows = 20000
+			if _, err := h.pool.Exec(ctx, `CREATE TABLE fleet (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL)`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := h.pool.Exec(ctx, `INSERT INTO fleet SELECT 't1', 'c' || i, ARRAY['cluster:c' || i, 'workspace:w' || i, 'org:o' || (i % 50), 'tenant:t1']
+				FROM generate_series(1, $1) i`, rows); err != nil {
+				t.Fatal(err)
+			}
+			h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "u"))
+			u := h.as(t, "u")
+			denied := 0
+			// The time Filter's condition takes to count the rows once n of them are denied, the
+			// fastest of a few, so a stall of the database's in one doesn't count.
+			listed := func(n int) time.Duration {
+				t.Helper()
+				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+					SELECT 't1', $3, left($3, 1) || (i * 5), 'd', '{public:}', '{cluster:login}' FROM generate_series($1 + 1, $2) i`, denied, n, on); err != nil {
+					t.Fatal(err)
+				}
+				denied = n
+				pred, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var fastest time.Duration
+				for i := range 3 {
+					start := time.Now()
+					var kept int
+					if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM fleet WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil || kept != rows-n {
+						t.Fatalf("Filter kept %d of %d rows with %d denied, %v", kept, rows, n, err)
+					}
+					if took := time.Since(start); i == 0 || took < fastest {
+						fastest = took
+					}
+				}
+				return fastest
+			}
+			few := listed(40)
+			if many := listed(4000); many > 10*few && many > 100*time.Millisecond {
+				t.Fatalf("Filter's condition took %v with 40 %ss denied, and %v with 4000", few, on, many)
+			}
+		})
+	}
+}
+
+// A subject holding a grant on each of thousands of workspaces, as one on each it created, lists a
+// page of them, or of the clusters in them, in about the time it takes for a few: past 128 grants,
+// each of a row's keys is looked up in one object of them. Overlapping each row with every grant
+// would cost it thousands of comparisons, and the index, which merges the rows each finds, as many
+// for each row it finds.
+func TestFilterLooksUpGrantsOnContainersByEachRowsKeys(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
-	const rows = 20000
-	if _, err := h.pool.Exec(ctx, `CREATE TABLE fleet (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL)`); err != nil {
-		t.Fatal(err)
+	for _, q := range []string{
+		`CREATE TABLE spaces (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL)`,
+		`INSERT INTO spaces SELECT 't1', 'w' || i, ARRAY['workspace:w' || i, 'org:o' || (i % 50), 'tenant:t1'] FROM generate_series(1, 20000) i`,
+		`CREATE TABLE fleet (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL)`,
+		`INSERT INTO fleet SELECT 't1', 'c' || i, ARRAY['cluster:c' || i, 'workspace:w' || i, 'org:o' || (i % 50), 'tenant:t1'] FROM generate_series(1, 20000) i`,
+		`CREATE INDEX ON spaces USING gin (path)`,
+		`CREATE INDEX ON spaces (tenant, id)`,
+		`CREATE INDEX ON fleet USING gin (path)`,
+		`CREATE INDEX ON fleet (tenant, id)`,
+		`ANALYZE spaces, fleet`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if _, err := h.pool.Exec(ctx, `INSERT INTO fleet SELECT 't1', 'c' || i, ARRAY['cluster:c' || i, 'workspace:w' || (i % 50), 'org:o1', 'tenant:t1']
-		FROM generate_series(1, $1) i`, rows); err != nil {
-		t.Fatal(err)
-	}
-	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "u"))
 	u := h.as(t, "u")
-	denied := 0
-	// The time Filter's condition takes to count the rows once n of them are denied, the fastest of
-	// a few, so a stall of the database's in one doesn't count.
-	listed := func(n int) time.Duration {
+	lists := []struct {
+		resourceType, table string
+		p                   rbac.Permission
+	}{{"workspace", "spaces", "workspace:view"}, {"cluster", "fleet", login}}
+	held := 0
+	// The time a page of 50 of each table's rows takes once u holds n workspaces, the fastest of a
+	// few, so a stall of the database's in one doesn't count.
+	pages := func(n int) []time.Duration {
 		t.Helper()
-		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
-			SELECT 't1', 'cluster', 'c' || (i * 5), 'd', '{public:}', '{cluster:login}' FROM generate_series($1 + 1, $2) i`, denied, n); err != nil {
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'workspace', 'w' || i, 'user', 'u', r FROM generate_series($1 + 1, $2) i, unnest('{workspace.admin,cluster.login}'::text[]) r`,
+			held, n); err != nil {
 			t.Fatal(err)
 		}
-		denied = n
-		pred, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var fastest time.Duration
-		for i := range 3 {
-			start := time.Now()
+		held = n
+		var took []time.Duration
+		for _, l := range lists {
+			pred, err := h.authz.Filter(ctx, u, l.p, "t1", l.resourceType, rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
 			var kept int
-			if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM fleet WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil || kept != rows-n {
-				t.Fatalf("Filter kept %d of %d rows with %d denied, %v", kept, rows, n, err)
+			if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM `+l.table+` WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil || kept != n {
+				t.Fatalf("Filter kept %d %ss of %d, %v", kept, l.resourceType, n, err)
 			}
-			if took := time.Since(start); i == 0 || took < fastest {
-				fastest = took
+			var fastest time.Duration
+			for i := range 3 {
+				start := time.Now()
+				rows, err := h.pool.Query(ctx, `SELECT id FROM `+l.table+` WHERE `+pred.SQL+` ORDER BY id LIMIT 50`, pred.Args...)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if ids, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || len(ids) != min(n, 50) {
+					t.Fatalf("a page of %d %ss, %v", len(ids), l.resourceType, err)
+				}
+				if d := time.Since(start); i == 0 || d < fastest {
+					fastest = d
+				}
 			}
+			took = append(took, fastest)
 		}
-		return fastest
+		return took
 	}
-	few := listed(40)
-	if many := listed(4000); many > 10*few && many > 100*time.Millisecond {
-		t.Fatalf("Filter's condition took %v with 40 resources denied, and %v with 4000", few, many)
+	few := pages(40)
+	for i, many := range pages(4000) {
+		if many > 10*few[i] && many > 100*time.Millisecond {
+			t.Errorf("a page of %ss took %v with 40 workspaces granted, and %v with 4000", lists[i].resourceType, few[i], many)
+		}
 	}
 }
 
@@ -663,62 +743,74 @@ func TestFilterOnATenantColumnThatIsNotText(t *testing.T) {
 // A host's columns in a collation that isn't deterministic compare keys and tenants the package
 // tells apart as equal: Filter compares them as Authorize does, byte for byte.
 func TestFilterTellsKeysAndTenantsApartInAnyCollation(t *testing.T) {
-	// Few grants on clusters are compared with the path, and many by its first key.
+	// Few grants on clusters are compared with the path, and many by its first key; few on
+	// containers are compared with the path, and many by each of its keys, as all denies on them
+	// are.
 	for _, n := range []int{1, 9} {
-		t.Run(fmt.Sprintf("%d cluster grants", n), func(t *testing.T) {
-			h, guardian := guarded(t)
-			ctx := t.Context()
-			for _, q := range []string{
-				`CREATE COLLATION loose (provider = icu, locale = 'und-u-ks-level2', deterministic = false)`,
-				`CREATE TABLE clusters (tenant text COLLATE loose NOT NULL, id text NOT NULL, path text[] COLLATE loose NOT NULL)`,
-			} {
-				if _, err := h.pool.Exec(ctx, q); err != nil {
+		for _, keyed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%d cluster grants, workspace grants looked up %t", n, keyed), func(t *testing.T) {
+				h, guardian := guarded(t)
+				if keyed {
+					rbac.SetMaxContainerOverlap(t, 0)
+				}
+				ctx := t.Context()
+				for _, q := range []string{
+					`CREATE COLLATION loose (provider = icu, locale = 'und-u-ks-level2', deterministic = false)`,
+					`CREATE TABLE clusters (tenant text COLLATE loose NOT NULL, id text NOT NULL, path text[] COLLATE loose NOT NULL)`,
+				} {
+					if _, err := h.pool.Exec(ctx, q); err != nil {
+						t.Fatal(err)
+					}
+				}
+				o1 := rbac.Scope{Type: "org", ID: "o1"}
+				w1 := []rbac.Scope{{Type: "workspace", ID: "w1"}, o1}
+				w2 := []rbac.Scope{{Type: "workspace", ID: "w2"}, o1}
+				grants := []rbac.Grant{grant(w1[0], "cluster.login", rbac.User, "u")}
+				for i := range n {
+					grants = append(grants, grant(rbac.Scope{Type: "cluster", ID: fmt.Sprintf("c%d", i+1)}, "cluster.login", rbac.User, "u"))
+				}
+				h.seed(t, grants...)
+				u := h.as(t, "u")
+				// u is granted c1 and w1 and denied d1 and W2, which C1, D1, W1 and w2 aren't.
+				resources := []rbac.Resource{
+					{Tenant: "t1", Type: "cluster", ID: "C1", Ancestors: w2},
+					{Tenant: "t1", Type: "cluster", ID: "D1", Ancestors: w1},
+					{Tenant: "t1", Type: "cluster", ID: "c1", Ancestors: w2},
+					{Tenant: "t1", Type: "cluster", ID: "d1", Ancestors: w1},
+					{Tenant: "t1", Type: "cluster", ID: "e1", Ancestors: []rbac.Scope{{Type: "workspace", ID: "W1"}, o1}},
+				}
+				deny := rbac.Deny{ID: "d", Principals: []rbac.Principal{u.Principal}, Permissions: []rbac.Permission{login}}
+				for _, r := range []rbac.Resource{resources[3], {Tenant: "t1", Type: "workspace", ID: "W2", Ancestors: []rbac.Scope{o1}}} {
+					if err := h.authz.SetDeny(ctx, guardian, r, deny); err != nil {
+						t.Fatal(err)
+					}
+				}
+				// And a tenant that differs from t1 only in case.
+				for _, r := range append(slices.Clone(resources), rbac.Resource{Tenant: "T1", Type: "cluster", ID: "x", Ancestors: w1}) {
+					if _, err := h.pool.Exec(ctx, `INSERT INTO clusters VALUES ($1, $2, $3)`, r.Tenant, r.ID, h.path(t, r)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if got := allowedOf(t, h, resources, u, login); !slices.Equal(got, []string{"D1", "c1"}) {
+					t.Fatalf("Authorize allowed %v", got)
+				}
+				pred, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+				if err != nil {
 					t.Fatal(err)
 				}
-			}
-			w1 := []rbac.Scope{{Type: "workspace", ID: "w1"}, {Type: "org", ID: "o1"}}
-			w2 := []rbac.Scope{{Type: "workspace", ID: "w2"}, {Type: "org", ID: "o1"}}
-			grants := []rbac.Grant{grant(w1[0], "cluster.login", rbac.User, "u")}
-			for i := range n {
-				grants = append(grants, grant(rbac.Scope{Type: "cluster", ID: fmt.Sprintf("c%d", i+1)}, "cluster.login", rbac.User, "u"))
-			}
-			h.seed(t, grants...)
-			u := h.as(t, "u")
-			// u is granted c1 and denied d1, which C1 and D1 aren't.
-			resources := []rbac.Resource{
-				{Tenant: "t1", Type: "cluster", ID: "C1", Ancestors: w2},
-				{Tenant: "t1", Type: "cluster", ID: "D1", Ancestors: w1},
-				{Tenant: "t1", Type: "cluster", ID: "c1", Ancestors: w2},
-				{Tenant: "t1", Type: "cluster", ID: "d1", Ancestors: w1},
-			}
-			if err := h.authz.SetDeny(ctx, guardian, resources[3], rbac.Deny{ID: "d", Principals: []rbac.Principal{u.Principal}, Permissions: []rbac.Permission{login}}); err != nil {
-				t.Fatal(err)
-			}
-			// And a tenant that differs from t1 only in case.
-			for _, r := range append(slices.Clone(resources), rbac.Resource{Tenant: "T1", Type: "cluster", ID: "x", Ancestors: w1}) {
-				if _, err := h.pool.Exec(ctx, `INSERT INTO clusters VALUES ($1, $2, $3)`, r.Tenant, r.ID, h.path(t, r)); err != nil {
+				rows, err := h.pool.Query(ctx, `SELECT tenant || '/' || id COLLATE "C" FROM clusters WHERE `+pred.SQL+` ORDER BY 1`, pred.Args...)
+				if err != nil {
+					t.Fatalf("%s: %v", pred.SQL, err)
+				}
+				got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+				if err != nil {
 					t.Fatal(err)
 				}
-			}
-			if got := allowedOf(t, h, resources, u, login); !slices.Equal(got, []string{"D1", "c1"}) {
-				t.Fatalf("Authorize allowed %v", got)
-			}
-			pred, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
-			if err != nil {
-				t.Fatal(err)
-			}
-			rows, err := h.pool.Query(ctx, `SELECT tenant || '/' || id COLLATE "C" FROM clusters WHERE `+pred.SQL+` ORDER BY 1`, pred.Args...)
-			if err != nil {
-				t.Fatalf("%s: %v", pred.SQL, err)
-			}
-			got, err := pgx.CollectRows(rows, pgx.RowTo[string])
-			if err != nil {
-				t.Fatal(err)
-			}
-			if want := []string{"t1/D1", "t1/c1"}; !slices.Equal(got, want) {
-				t.Errorf("Filter kept %v, want %v", got, want)
-			}
-		})
+				if want := []string{"t1/D1", "t1/c1"}; !slices.Equal(got, want) {
+					t.Errorf("Filter kept %v, want %v", got, want)
+				}
+			})
+		}
 	}
 }
 
