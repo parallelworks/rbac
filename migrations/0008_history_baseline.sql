@@ -90,14 +90,18 @@ END $$;
 -- A row written before history was installed, as by a host that applied the first migrations on
 -- their own, has no record, so AsOf would read it as never written. Each row with none is recorded
 -- as it is, its baseline, as rbac_record records a row: dated when it was created, or a role, which
--- keeps no such time, when it last changed, but never after now, and its times as JSON in UTC.
+-- keeps no such time, when it last changed, but never after now, and its times as JSON in UTC. No
+-- table bounds those times, and one at -infinity, before year 1 or at its first instant is one JSON
+-- or a time.Time can't hold, or a Record reads as none: it is dated at the epoch, as such an expiry
+-- is.
 DO $$
 DECLARE
     zone text := current_setting('TimeZone');
 BEGIN
     PERFORM set_config('TimeZone', 'UTC', true);
     INSERT INTO rbac_history (effective_at, tenant, entity, key, op, principal, role, scope, group_id, expires_at, after, how)
-    SELECT least(b.at, statement_timestamp()), b.r->>'tenant', b.entity, b.key, 'baseline', b.r->>'principal',
+    SELECT CASE WHEN b.at <= '0001-01-01 00:00:00+00' THEN timestamptz 'epoch' ELSE least(b.at, statement_timestamp()) END,
+      b.r->>'tenant', b.entity, b.key, 'baseline', b.r->>'principal',
       CASE b.entity WHEN 'role' THEN b.r->>'id' ELSE b.r->>'role' END,
       b.r->>'scope',
       CASE b.entity WHEN 'group' THEN b.r->>'id' WHEN 'member' THEN b.r->>'group_id' END,

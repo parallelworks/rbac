@@ -298,15 +298,18 @@ order once that table's id sequence caches more than one, so `AsOf` refuses that
 cursor) and later records supersede: of each row, the last version at or before `before` stays, so
 `AsOf` answers as it did for any time from then on, and refuses an earlier one, and a row that had
 ended by then goes, once no version before its end stays. One call deletes at most `rbac.MaxPrune`
-records: call it again while it deletes as many, and each goes on from where the last stopped. The
-prune is recorded in history. Run it on a connection of the administrator's role below, which has
-the rights of history's owner, as the application's hasn't, and keep what the host's audit retention
-requires: the federal floor is at least a year.
+records: call it again while it deletes as many, and each goes on from where the last stopped. A
+prune that deletes records is recorded in history; one that deletes none changes nothing, and is
+not. Run it on a connection of the administrator's role below, which has the rights of history's
+owner, as the application's hasn't, and keep what the host's audit retention requires: the federal
+floor is at least a year.
 
 A role that owns a table can change it whatever its triggers say, and a schema's owner can drop
 any table in it. So that the application's database role can't rewrite history or write around
 it, that role is no superuser, nor a member of `pg_write_all_data` or `pg_create_subscription`,
-through which it could write `rbac_history` itself; and:
+through which it could write `rbac_history` itself, and before PostgreSQL 16 has no `CREATEROLE`,
+with which it could make itself a member of any role but a superuser, such as those or the roles
+below; and:
 
 1. `Migrate` runs as an administrator's role the application's isn't a member of, with only the
    package's schema in its search_path, so that role owns the package's tables: their owner can
@@ -324,12 +327,16 @@ through which it could write `rbac_history` itself; and:
    read the row as it was before the change. Never `TRIGGER`, which `ALL` includes: a trigger
    runs its function as whoever writes the table, and one on `rbac_history` can drop each record,
    as history's owner.
-4. The application's role can create in no schema: not one it owns, as `public` is when that role
-   owns the database, nor `public` before PostgreSQL 15, where every role can. `Migrate` calls
-   functions by name, and an overload made in the package's schema would run in its place, as the
-   administrator's role; and the package's schema is a session's current one, the first on its
-   search_path, which a session can set, so one that named first a schema the role can create in
-   would read a table made there as history, and `Export` would sign what it holds.
+4. The application's role can make no schema and create in none: it neither owns the database nor
+   has `CREATE` on it, which `CREATE SCHEMA` needs and only the owner has by default, and it
+   creates in no schema it owns, as `public` is when that role owns the database, nor in `public`
+   before PostgreSQL 15, where every role can. `Migrate` calls functions by name, and an overload
+   made in the package's schema would run in its place, as the administrator's role; and the
+   package's schema is a session's current one, the first on its search_path, which a session can
+   set, so one that named first a schema the role made, or can create in, would read a table made
+   there as history: a generation of its own, which an export starts from `Genesis`, and `Export`
+   would sign what it holds. `History` and `Export` can't tell that table from history's own,
+   which the application's role owns where these roles aren't set up, so they don't refuse it.
 
 The application's role may create temporary tables, as `AsOf` needs, and a session reads its own
 tables and types before any schema's of the same name until it ends, which in a pool can be long
@@ -343,6 +350,8 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
 - **Tables:** `rbac.Migrate` creates them, prefixed `rbac_`, in the connection's current schema,
   in a database whose encoding is UTF8, and records what it applied in `rbac_migrations`. It never
   runs by itself; a host with a migration tool of its own can apply `rbac.Migrations()` instead.
+  On a host's transaction it refuses any isolation but READ COMMITTED: a stricter one's snapshot
+  would miss the writes it waits for.
   A migration that rebuilds an index, as `0009_grant_seeks` rebuilds two of `rbac_grants`, locks
   the table until it commits, so checks, lists and changes wait for the rebuild: on a large table,
   migrate when that wait is acceptable.

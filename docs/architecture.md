@@ -482,7 +482,7 @@ flowchart TB
 
 - **READ COMMITTED.** A change runs at READ COMMITTED, as its checks under the locks must read what
   committed before the locks were taken. Under `WithTx` the host's transaction must be at READ
-  COMMITTED too.
+  COMMITTED too, as must one `Migrate` is given.
 - **Rows in one order.** `DeleteScopes` holds its scopes' locks and `DeletePrincipal` its
   principal's, so neither waits for the other, and both delete the principal's grants and
   eligibilities on those scopes: each locks them in the order of their scopes first, eligibilities
@@ -511,12 +511,13 @@ flowchart LR
   the database role that wrote it, and the actor and call it was made through, with what the host
   attached. A write that bypassed the package is recorded too, with no actor. A row written
   before history was installed has one record from migrating, its baseline, dated when it was
-  created.
+  created, or at the epoch where that was before year 1 or at its first instant.
 - **History's order.** `History` reads records in transaction order, and only those of
   transactions older than every transaction still running, which have all ended. So a cursor
   never passes a record that commits later. It, `Export` and `PruneHistory` name history by its
   schema, as `AsOf` does, and their types by pg_catalog's, so a session's temporary table or type
-  stands in for none of it.
+  stands in for none of it. A schema the application's role made or can create in, first on its
+  search_path, would: that role can do neither.
 - **Generations.** A cursor names its generation: the database cluster, by its system and
   timeline, and the database and schema. Failing over or recovering to a point in time starts a
   new generation, which an export starts again from `Genesis`. A restore that starts none, as
@@ -533,7 +534,8 @@ flowchart LR
 - **PruneHistory** deletes only what an export has read and later versions supersede. It keeps
   each row's last version at or before its time, so AsOf answers as before for any later time,
   and refuses an earlier one; of a row whose last version by then ended it, it deletes every
-  version, the end last.
+  version, the end last. A prune that deleted records is recorded in history, and AsOf finds the
+  latest prune's time by history's index.
 
 ## Database roles
 

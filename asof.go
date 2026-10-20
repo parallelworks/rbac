@@ -38,9 +38,9 @@ var asOfEntities = []struct {
 // Hooks run as for any read, and a constraint that reads the package's tables through the DB it
 // is given reads them as of the time too; one that reads the host's reads them as they are now.
 // A Filter condition reads as of the time only in a query on the transaction read runs in: under
-// WithTx, the host's, before read returns. It refuses a time earlier than any PruneHistory's
-// before, since the prune removed versions such a time would read, and fails once read returns
-// if such a prune committed while it ran.
+// WithTx, the host's, before read returns. It refuses a time earlier than the before of any
+// PruneHistory that deleted records, as they can be versions such a time would read, and fails
+// once read returns if such a prune committed while it ran.
 //
 // WithTx on the Authorizer read is given returns it as it is, reading the past on its own
 // transaction.
@@ -74,7 +74,7 @@ func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read
 	// Once ctx is done, a rollback on it isn't sent: a savepoint of the host's left standing keeps
 	// the views in its transaction, which then reads the past, and in its session once it commits.
 	defer func() {
-		if rerr := tx.Rollback(context.WithoutCancel(ctx)); rerr != nil {
+		if rerr := finish(ctx, tx.Rollback); rerr != nil {
 			err = errors.Join(err, rerr)
 		}
 	}()
@@ -197,18 +197,18 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	// At READ COMMITTED, as a host's transaction under WithTx is, each of read's queries reads what
 	// has committed by then, so one after a prune that committed since the check read what it
 	// removed. Checked once ctx is done too, as read's answers stand only if this passes.
-	c, cancel := context.WithTimeout(context.WithoutCancel(ctx), savepointEnd)
-	defer cancel()
-	return unpruned(c, tx, schema, at)
+	return finish(ctx, func(c context.Context) error { return unpruned(c, tx, schema, at) })
 }
 
 // unpruned refuses at, on tx, once a prune has run past it: of each row a prune keeps only its
 // last version as of the prune's time, which an earlier time would read as the row's version
-// then, or as no row.
+// then, or as no row. Of the prunes' times, the last is that of the last record by key, which
+// holds its prune's time as text that sorts as time, so history's index finds it alone: no
+// prune's record is removed, and every AsOf would otherwise read them all, twice.
 func unpruned(ctx context.Context, tx pgx.Tx, schema string, at time.Time) error {
 	var pruned bool
-	if err := tx.QueryRow(ctx, `SELECT coalesce($1::pg_catalog.timestamptz < max((h.after->>'before')::pg_catalog.timestamptz), false)
-		FROM `+historyTable(schema)+` h WHERE h.tenant = '' AND h.entity = 'history' AND h.op = 'prune'`,
+	if err := tx.QueryRow(ctx, `SELECT coalesce($1::pg_catalog.timestamptz < (SELECT (h.after->>'before')::pg_catalog.timestamptz
+		FROM `+historyTable(schema)+` h WHERE h.tenant = '' AND h.entity = 'history' AND h.op = 'prune' ORDER BY h.key DESC LIMIT 1), false)`,
 		at).Scan(&pruned); err != nil {
 		return err
 	}

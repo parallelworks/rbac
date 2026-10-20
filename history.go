@@ -163,15 +163,21 @@ const (
 // so AsOf answers as it did for any time from then on, and refuses an earlier one, and it removes
 // every version of a row whose last one then was its delete or expiry, unless an earlier one stays.
 // It deletes nothing at or past through, the cursor of the last export the host has checkpointed,
-// so that export goes on from it, and it records the prune in history. Run it as a role with the
+// so that export goes on from it, and it records in history a prune that deleted any: one that
+// deleted none changed nothing, and AsOf reads every time as it did. Run it as a role with the
 // rights of history's owner, as the README's administrator's, never the application's; keep at
-// least as much as the host's audit retention requires. It refuses a before yet to come and, like
-// AsOf, history whose ids can't order a row's changes. It deletes at most MaxPrune records:
-// call it again while it deletes as many, and it goes on from where the last prune of the same
-// before and through stopped.
+// least as much as the host's audit retention requires. It refuses a before yet to come or before
+// year 1, earlier than history dates anything, and, like AsOf, history whose ids can't order a
+// row's changes. It deletes at most MaxPrune records: call it again while it deletes as many, and
+// it goes on from where the last prune of the same before and through stopped.
 func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) (int64, error) {
 	if through.TxID == 0 && through.ID == 0 {
 		return 0, fmt.Errorf("%w: a prune goes only as far as an export has read: through is the export's cursor", ErrInvalid)
+	}
+	// AsOf finds the last prune's time by its record's key, which holds it as text that sorts as
+	// time only from year 1: a year BC is written as the year AD of the same number.
+	if before.Before(time.Date(1, time.January, 1, 0, 0, 0, 0, time.UTC)) {
+		return 0, fmt.Errorf("%w: a prune is of history up to a time in year 1 or later", ErrInvalid)
 	}
 	var n int64
 	err := begin(ctx, db, func(tx pgx.Tx) error {
@@ -247,6 +253,12 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 		if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', '', true), set_config('enable_sort', $1, true)`, sorting); err != nil {
 			return err
 		}
+		// One that deleted none left history as it was, and reached no further than the last of
+		// the same: its record would account for no record gone, refuse AsOf times history still
+		// holds, and grow history with each call of a host that prunes on a schedule.
+		if n == 0 {
+			return nil
+		}
 		_, err = tx.Exec(ctx, `INSERT INTO `+history+` (effective_at, tenant, entity, key, op, after, how)
 			VALUES (now(), '', 'history', `+pruneKey+`, 'prune',
 			  jsonb_build_object('before', $1::pg_catalog.timestamptz, 'through', `+pruneThrough+`, 'deleted', $4::bigint, 'reached', $5::bigint),
@@ -275,9 +287,10 @@ type Record struct {
 	// history itself, in no tenant, for a prune. Key is which, in the tenant.
 	Entity, Key string
 	// Op is create, update, delete or expire; baseline, a row written before history was installed,
-	// as migrating found it, dated when it was created, or a role when it last changed; or prune,
-	// whose After is what PruneHistory was given, how many records it deleted, and the id it
-	// reached, which a prune of the same goes on from.
+	// as migrating found it, dated when it was created, or a role when it last changed, or at the
+	// epoch where that was before year 1 or at its first instant; or prune, whose After is what
+	// PruneHistory was given, how many records it deleted, and the id it reached, which a prune of
+	// the same goes on from.
 	Op string
 	// Principal, Role, Scope, Group and ExpiresAt are those of the row, where it has them.
 	Principal Principal
@@ -367,7 +380,8 @@ const MaxHistory = 10000
 //
 // It reads history in the current schema by name, so a session's temporary table or type named
 // as history's or a catalog's stands in for none of it, and refuses a search_path that names
-// pg_temp first.
+// pg_temp first. A schema the session's role made, or can create in, named first there is read as
+// the package's, so that role must be able to do neither: the README's database roles say how.
 func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Record, Cursor, error) {
 	if limit < 1 || limit > MaxHistory {
 		return nil, after, fmt.Errorf("%w: a read of history takes from 1 to %d records", ErrInvalid, MaxHistory)

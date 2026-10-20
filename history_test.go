@@ -809,6 +809,41 @@ func TestMigratingRecordsARowWrittenBeforeHistory(t *testing.T) {
 	}
 }
 
+// No table bounds when a row was created, so one written before history can say -infinity, before
+// year 1 or its first instant, times JSON can't write or a Record reads as none: migrating dates
+// its baseline at the epoch, as such an expiry, and AsOf reads the row from then.
+func TestMigratingDatesARowCreatedBeforeYearOneAtTheEpoch(t *testing.T) {
+	pool := pgtest.Open(t, "")
+	ctx := t.Context()
+	migrateFiles(t, pool, "", "0003")
+	for _, sql := range []string{
+		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id, created_at)
+		 VALUES ('t1', 'user', 'a', '-infinity'), ('t1', 'user', 'b', '0044-03-15 12:00:00+00 BC'), ('t1', 'user', 'c', '0001-01-01 00:00:00+00')`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, created_at)
+		 VALUES ('t1', 'cluster', 'c1', 'user', 'a', 'cluster.login', '0001-01-01 00:00:00+00')`,
+		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types, updated_at)
+		 VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}', '-infinity')`,
+	} {
+		if _, err := pool.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	migrateFiles(t, pool, "0003", "")
+	h := migrated(t, pool)
+	var cursor rbac.Cursor
+	for _, r := range drain(t, h, &cursor, 5) {
+		if _, err := json.Marshal(r); err != nil || r.Op != "baseline" || !r.EffectiveAt.Equal(time.Unix(0, 0)) {
+			t.Errorf("%s %s, dated %v: %v", r.Entity, r.Key, r.EffectiveAt, err)
+		}
+	}
+	a := rbac.Subject{Principal: rbac.Principal{Kind: rbac.User, ID: "a"}}
+	if err := h.authz.AsOf(ctx, "t1", time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC), func(b *rbac.Authorizer) error {
+		return b.Authorize(ctx, a, login, cluster)
+	}); err != nil {
+		t.Errorf("as of 2000: %v", err)
+	}
+}
+
 // A change in flight to a row written before history, as migrating records the row, is the row's
 // record: migrating waits for it rather than record the row as it was before, after the change,
 // in a transaction of its own at any isolation.
@@ -853,6 +888,58 @@ func TestMigratingRecordsNoRowAsItWasBeforeAChangeInFlight(t *testing.T) {
 			if err := <-done; err != nil {
 				t.Fatal(err)
 			}
+			if notes, err := notesAt(t, h, dbNow(t, h)); err != nil || notes["old"] != "second" {
+				t.Fatalf("as of now: %v, %v", notes, err)
+			}
+		})
+	}
+}
+
+// On a host's transaction, whose snapshot an earlier statement took at REPEATABLE READ or
+// SERIALIZABLE, migrating would record a row written before history as it was before a change that
+// has committed since, and AsOf would read it so: Migrate refuses it, and at READ COMMITTED reads
+// the change.
+func TestMigratingOnAHostsTransactionRecordsWhatHasCommitted(t *testing.T) {
+	for _, iso := range []pgx.TxIsoLevel{pgx.ReadCommitted, pgx.RepeatableRead, pgx.Serializable} {
+		t.Run(string(iso), func(t *testing.T) {
+			pool := pgtest.Open(t, "")
+			ctx := t.Context()
+			migrateFiles(t, pool, "", "0003")
+			if _, err := pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, note)
+				VALUES ('t1', 'cluster', 'c1', 'user', 'old', 'cluster.login', 'first')`); err != nil {
+				t.Fatal(err)
+			}
+			migrateFiles(t, pool, "0003", "0008")
+			// As Migrate records what it applied.
+			if _, err := pool.Exec(ctx, `CREATE TABLE rbac_migrations (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now());
+				INSERT INTO rbac_migrations (version) SELECT generate_series(1, 7)`); err != nil {
+				t.Fatal(err)
+			}
+			host, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: iso})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = host.Rollback(ctx) }()
+			if _, err := host.Exec(ctx, `SELECT FROM rbac_grants`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `UPDATE rbac_grants SET note = 'second' WHERE principal = 'user:old'`); err != nil {
+				t.Fatal(err)
+			}
+			err = rbac.Migrate(ctx, host)
+			if iso != pgx.ReadCommitted {
+				if err == nil || !strings.Contains(err.Error(), "READ COMMITTED") {
+					t.Fatalf("Migrate on a host's transaction at %s: %v", strings.ToUpper(string(iso)), err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := host.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			h := migrated(t, pool)
 			if notes, err := notesAt(t, h, dbNow(t, h)); err != nil || notes["old"] != "second" {
 				t.Fatalf("as of now: %v, %v", notes, err)
 			}
@@ -1676,13 +1763,16 @@ func TestPruningHistoryKeepsWhatAsOfReads(t *testing.T) {
 		}
 		return got
 	}
-	notes(start)
-	before, now := notes(then), notes(dbNow(t, h))
+	early, before, now := notes(start), notes(then), notes(dbNow(t, h))
 	through := exported(t, h)
 	// Only what an export read past goes: nothing at or past the cursor.
 	first := cursorAt(t, h, `SELECT txid, id, recorded_at FROM rbac_history ORDER BY txid, id LIMIT 1`)
 	if n, err := rbac.PruneHistory(ctx, h.pool, then, first); err != nil || n != 0 {
 		t.Fatalf("pruning through the first record: %d, %v", n, err)
+	}
+	// Which deleted nothing, so history still reads as of before then.
+	if got, err := notesAt(t, h, start); err != nil || !maps.Equal(got, early) {
+		t.Errorf("as of before a prune that deleted nothing: %v, %v", got, err)
 	}
 	// u's first version, which its second superseded before then, and d, whose delete ended it.
 	if n, err := rbac.PruneHistory(ctx, h.pool, then, through); err != nil || n != 3 {
@@ -1698,19 +1788,21 @@ func TestPruningHistoryKeepsWhatAsOfReads(t *testing.T) {
 	if got, err := notesAt(t, h, start); !errors.Is(err, rbac.ErrInvalid) {
 		t.Errorf("as of before the prune's time: %v, %v", got, err)
 	}
-	// The export goes on from its cursor, and reads both prunes, each with what it deleted.
+	// The export goes on from its cursor, and reads the prune that deleted, with what it deleted.
 	cursor := through
-	for i, r := range drain(t, h, &cursor, 2) {
-		deleted := []string{`"deleted": 0`, `"deleted": 3`}[i]
-		if r.Entity != "history" || r.Op != "prune" || r.How != "PruneHistory" || !strings.Contains(string(r.After), deleted) ||
-			r.Key != then.UTC().Format("2006-01-02T15:04:05.000000Z") {
-			t.Errorf("prune %d: %+v", i, r)
-		}
+	if r := drain(t, h, &cursor, 1)[0]; r.Entity != "history" || r.Op != "prune" || r.How != "PruneHistory" ||
+		!strings.Contains(string(r.After), `"deleted": 3`) || r.Key != then.UTC().Format("2006-01-02T15:04:05.000000Z") {
+		t.Errorf("prune: %+v", r)
 	}
 	// A prune needs an export's cursor, of this generation, and a time that has passed: AsOf would
 	// refuse the present until one to come.
 	if _, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h).Add(time.Hour), through); !errors.Is(err, rbac.ErrInvalid) {
 		t.Errorf("a prune of history up to a time to come: %v", err)
+	}
+	// Nor one before year 1, which history dates nothing at, and whose record's key would write its
+	// year BC as the year AD of the same number, which AsOf would read it as.
+	if _, err := rbac.PruneHistory(ctx, h.pool, time.Date(-43, time.March, 15, 0, 0, 0, 0, time.UTC), through); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("a prune of history up to a time before year 1: %v", err)
 	}
 	if _, err := rbac.PruneHistory(ctx, h.pool, then, rbac.Cursor{}); !errors.Is(err, rbac.ErrInvalid) {
 		t.Errorf("a prune with no cursor: %v", err)
@@ -2306,5 +2398,56 @@ func TestPruningHistoryReadsOnlyAsFarAsItsBatch(t *testing.T) {
 	grants(4000)
 	if many := read(); many > few*11/10 {
 		t.Fatalf("a call read %d pages of history, and %d once 4000 more records followed what it deleted", few, many)
+	}
+}
+
+// AsOf reads the latest prune's time from one record, which history's index finds by its key: what
+// it reads of history doesn't grow with the prunes recorded, which no prune removes, and a prune
+// recorded later can be of an earlier time.
+func TestAsOfReadsOnlyTheLatestPrune(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	// As many prunes, of times in the year before last, recorded as history's owner writes them.
+	prunes := func(n int) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_history (effective_at, tenant, entity, key, op, after, how)
+			SELECT now(), '', 'history', to_char(b AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), 'prune',
+			  jsonb_build_object('before', b, 'through', jsonb_build_object('txid', '1', 'id', 1), 'deleted', 1, 'reached', 1), 'PruneHistory'
+			FROM (SELECT now() - interval '2 years' + random() * interval '1 year' AS b FROM generate_series(1, $1)) p`, n); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.pool.Exec(ctx, `ANALYZE rbac_history`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The pages of history and its indexes an AsOf as of at reads, under a transaction of the test's.
+	read := func(at time.Time) int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		start := historyPages(ctx, t, tx)
+		if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(*rbac.Authorizer) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		return historyPages(ctx, t, tx) - start
+	}
+	prunes(1)
+	few := read(dbNow(t, h))
+	prunes(20000)
+	if many := read(dbNow(t, h)); many > few+10 {
+		t.Fatalf("AsOf read %d pages of history beside a prune's record, and %d beside 20,000", few, many)
+	}
+	var latest time.Time
+	if err := h.pool.QueryRow(ctx, `SELECT max((after->>'before')::timestamptz) FROM rbac_history WHERE entity = 'history'`).Scan(&latest); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.AsOf(ctx, "t1", latest.Add(-time.Microsecond), func(*rbac.Authorizer) error { return nil }); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("AsOf just before the latest prune's time: %v", err)
+	}
+	if err := h.authz.AsOf(ctx, "t1", latest, func(*rbac.Authorizer) error { return nil }); err != nil {
+		t.Errorf("AsOf at the latest prune's time: %v", err)
 	}
 }
