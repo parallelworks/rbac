@@ -145,7 +145,7 @@ func (a *Authorizer) decideHeld(ctx context.Context, s Subject, p Permission, r 
 	if vars == nil {
 		vars = a.vars(ctx, s, p, r)
 	}
-	spend := newBudget()
+	spend := newGrantBudget(r.path())
 	cheapestFirst(conditional, holding.expression)
 	for _, h := range conditional {
 		if a.conds.holds(spend, h.Condition.Expression, vars) {
@@ -158,7 +158,7 @@ func (a *Authorizer) decideHeld(ctx context.Context, s Subject, p Permission, r 
 // explain is Explain's decision once no constraint removes p: every grant that allows it, or why
 // none does.
 func (a *Authorizer) explain(ctx context.Context, s Subject, p Permission, r Resource, counts broad) (Decision, error) {
-	vars, spend := a.vars(ctx, s, p, r), newBudget()
+	vars, spend := a.vars(ctx, s, p, r), newGrantBudget(r.path())
 	keys, binding, err := a.keysOf(ctx, a.db, r.Tenant, s)
 	if err != nil {
 		return Decision{}, err
@@ -322,7 +322,7 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 	vars, spends := a.vars(ctx, s, "", r), map[Permission]*budget{}
 	spendOn := func(p Permission) *budget {
 		if spends[p] == nil {
-			spends[p] = newBudget()
+			spends[p] = newGrantBudget(r.path())
 		}
 		return spends[p]
 	}

@@ -585,9 +585,46 @@ func TestAChangeHandingOnUnderAConditionParsesItOnce(t *testing.T) {
 	}
 }
 
+// The requirements of groups' eligibilities for a role on a scope are bounded together where they
+// are stored, as activating evaluates those of each group the subject is in: so an eligibility set
+// beside another, as by an actor who can't delete it, never changes what that one allows.
+func TestGroupsRequirementsForARoleOnAScopeAreBoundedTogether(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	owner := h.as(t, "owner")
+	h.groups(t, "g0", "g1", "g2", "g3", "g4")
+	set := func(on rbac.Resource, p rbac.Principal, role rbac.Role, requires string) error {
+		return h.authz.SetEligibility(ctx, owner, on, rbac.Eligibility{Role: role, Principal: p, MaxDuration: time.Hour, Requires: requires})
+	}
+	for i := range 3 {
+		if err := set(cluster, groupOf(fmt.Sprint("g", i)), "cluster.sudo", spending(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := set(cluster, groupOf("g3"), "cluster.sudo", spending(3)); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a fourth costly requirement: %v", err)
+	}
+	// One they have counts once; another role's, and an identity's own, count apart.
+	for name, err := range map[string]error{
+		"one they have": set(cluster, groupOf("g3"), "cluster.sudo", spending(0)),
+		"another role":  set(cluster, groupOf("g4"), "cluster.login", spending(4)),
+		"an identity's": set(cluster, identity("x"), "cluster.sudo", "true || "+spending(5)),
+	} {
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	// Activating evaluates them whole, and reaches the one that holds, though it is the costliest.
+	act := rbac.Activation{Role: "cluster.sudo", Duration: time.Minute, Justification: "INC-1"}
+	if _, err := h.authz.Activate(ctx, h.as(t, "x", "g0", "g1", "g2", "g3", "g4"), cluster, act); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+}
+
 // Activate evaluates the cheapest requirement first, as a check does conditions, so one that holds
-// is reached however many costly ones the subject is also eligible through, whatever order the
-// database's collation would put them in, and however many approvers each names.
+// is reached however many costly ones stored around the bounds the subject is also eligible
+// through, whatever order the database's collation would put them in, and however many approvers
+// each names.
 func TestActivateTriesTheCheapestRequirementFirst(t *testing.T) {
 	boss := identity("boss")
 	for name, approvers := range map[string]struct{ costly, cheap []rbac.Principal }{
@@ -601,17 +638,19 @@ func TestActivateTriesTheCheapestRequirementFirst(t *testing.T) {
 			// Each runs up to its cost on the request's list, which spends it all, and together they
 			// spend what activating may.
 			var groups []string
-			for i := range 9 {
-				groups = append(groups, fmt.Sprintf("g%d", i))
+			for i := range 20 {
+				groups = append(groups, fmt.Sprintf("g%02d", i))
 			}
 			h.groups(t, groups...)
 			x := h.as(t, "x", groups...)
+			costly := []string{}
+			for _, p := range approvers.costly {
+				costly = append(costly, string(p.Kind)+":"+p.ID)
+			}
 			for i, g := range groups {
-				e := rbac.Eligibility{
-					Role: "cluster.sudo", Principal: groupOf(g), MaxDuration: time.Hour, Approvers: approvers.costly,
-					Requires: fmt.Sprintf(`request.attributes.big.map(x, x + %d).size() < 0`, i),
-				}
-				if err := h.authz.SetEligibility(ctx, owner, cluster, e); err != nil {
+				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role,
+					max_seconds, requires, approvers) VALUES ('t1', 'cluster', 'c1', 'group', $1, 'cluster.sudo', 3600, $2, $3)`,
+					g, fmt.Sprintf(`request.attributes.big.map(x, x + %d).size() < 0`, i), costly); err != nil {
 					t.Fatal(err)
 				}
 			}

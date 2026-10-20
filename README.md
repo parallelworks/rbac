@@ -148,9 +148,12 @@ reach, to check one by one.
   and the action. It gives its role only where the expression holds; one that fails is false.
   `Config.Attributes` declares the attributes and their types, so a condition reading one
   misnamed, or as another type, is refused when stored, and one stored under other declarations
-  fails where it no longer passes them. Cost is bounded per condition and per
-  check, and a check evaluates the cheapest first, so what it decides doesn't rest on ids; a
-  scope's conditional denies are bounded together, so a check always evaluates them. To hand a
+  fails where it no longer passes them. Cost is bounded per condition and per check, for each
+  scope on its path, and the conditions a check reads together are bounded where they are stored:
+  an identity's grants' on a scope, those of a scope's grants to groups, the tenant's members and
+  the public, a scope's denies', and the requirements of groups' eligibilities for a role on a
+  scope. So a check always evaluates every condition it reads, and a grant made beside another,
+  as by someone who can't revoke it, never changes what that one decides. To hand a
   permission on, the actor holds it unconditionally or under the same condition, one that doesn't
   read the subject: that one decides for each holder, so the actor's holding says nothing of
   another's.

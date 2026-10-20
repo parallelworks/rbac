@@ -5548,34 +5548,167 @@ func TestAConditionalRightToDefineRolesHoldsOnlyUnderItsCondition(t *testing.T) 
 	}
 }
 
-func TestACheckSpendsABoundedBudgetOnConditions(t *testing.T) {
-	h := setup(t)
+// spending is a condition of nearly the longest that is false, for each i another, which spends all
+// a condition may: what a check pays for it is about a third of what the conditions it reads on a
+// scope may cost together.
+func spending(i int) string {
 	var xs []string
-	for i := range 90 {
-		xs = append(xs, fmt.Sprint(i))
+	for j := range 276 {
+		xs = append(xs, fmt.Sprint(j))
 	}
 	list := "[" + strings.Join(xs, ",") + "]"
-	costly := func(i int) string { return fmt.Sprintf("%s.all(x, %s.all(y, x >= -%d)) && false", list, list, i) }
+	return fmt.Sprintf("%s.all(x, %s.all(y, x >= -%d)) && false", list, list, i)
+}
+
+// storeAround writes grants in t1 as a migration might, around the bounds a change checks, as on
+// what the conditions a check reads on a scope cost together.
+func storeAround(t *testing.T, h *harness, grants ...rbac.Grant) {
+	t.Helper()
+	var groups, scopeTypes, scopeIDs, kinds, ids, roles, conditions []string
+	for _, g := range grants {
+		if g.Principal.Kind == rbac.Group {
+			groups = append(groups, g.Principal.ID)
+		}
+		scopeTypes, scopeIDs = append(scopeTypes, g.Scope.Type), append(scopeIDs, g.Scope.ID)
+		kinds, ids = append(kinds, string(g.Principal.Kind)), append(ids, g.Principal.ID)
+		roles, conditions = append(roles, string(g.Role)), append(conditions, g.Condition.Expression)
+	}
+	h.groups(t, groups...)
+	if _, err := h.pool.Exec(t.Context(), `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+		SELECT 't1', * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[])`,
+		scopeTypes, scopeIDs, kinds, ids, roles, conditions); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A third party able to grant a subject a role, its groups, or the tenant's members, adds what the
+// conditions a check reads on a scope may cost beside a conditional grant it can't revoke: refused
+// once they would cost more together, and evaluated whole with it otherwise, so the grant goes on
+// giving what it gave.
+func TestAGrantBesideOneTheActorCantRevokeLeavesItGiving(t *testing.T) {
+	helpdesk := rbac.RoleDefinition{
+		ID: "cluster.helpdesk", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"},
+		GrantableRoles: []rbac.Role{"cluster.login"},
+	}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), helpdesk) })
+	ctx := t.Context()
+	sudo := grant(cluster.Scope(), "cluster.sudo", rbac.User, "v")
+	sudo.Condition = rbac.Condition{Expression: `request.attributes.mfa == true && request.attributes.network == "corp" && request.attributes.device != "unmanaged"`}
+	h.seed(t, sudo, grant(cluster.Scope(), "cluster.helpdesk", rbac.User, "desk"))
+	h.groups(t, "staff")
+	v, desk := h.as(t, "v", "staff"), h.as(t, "desk")
+	req := rbac.WithRequest(ctx, map[string]any{"mfa": true, "network": "corp", "device": "managed"})
+	if err := h.authz.Authorize(req, v, login, cluster); err != nil {
+		t.Fatalf("before: %v", err)
+	}
+	if err := h.authz.Apply(ctx, desk, cluster, rbac.Change{Revoke: []rbac.Binding{{Role: "cluster.sudo", Principal: v.Principal}}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("the helpdesk revoking sudo: %v", err)
+	}
+	// Each shorter than the sudo grant's, and so evaluated before it, and costing all a condition may.
+	l := "[1,2,3,4,5,6,7,8]"
+	refused := map[rbac.Principal]bool{}
+	for i := range 8 {
+		for _, p := range []rbac.Principal{v.Principal, groupOf("staff"), rbac.TenantMembers("t1")} {
+			expr := fmt.Sprintf(`%s.all(a,%s.all(b,%s.all(c,%s.all(d,a>%d))))`, l, l, l, l, -1-i)
+			err := h.authz.Apply(ctx, desk, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: p, Condition: rbac.Condition{Expression: expr}}}})
+			switch {
+			case errors.Is(err, rbac.ErrInvalid):
+				refused[p] = true
+			case err != nil:
+				t.Fatal(err)
+			}
+		}
+	}
+	if len(refused) != 3 {
+		t.Errorf("refused costly conditions only for %v", refused)
+	}
+	if d, err := h.authz.Explain(req, v, login, cluster); err != nil || !d.Allowed {
+		t.Fatalf("grants the helpdesk made stopped one it can't revoke giving login: %+v, %v", d, err)
+	}
+}
+
+// What the conditions a check reads on a scope cost together is bounded where they are stored, each
+// distinct one counted once: an identity's grants', of any role, and those of the grants to groups,
+// the tenant's members and the public, which reach many, together. Another identity's, another
+// scope's and an expired grant's count apart.
+func TestTheConditionsACheckReadsOnAScopeAreBoundedWhereTheyAreStored(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	owner := h.as(t, "owner")
+	h.groups(t, "g1", "g2")
+	apply := func(on rbac.Resource, bs ...rbac.Binding) error {
+		return h.authz.Apply(ctx, owner, on, rbac.Change{Grant: bs})
+	}
+	under := func(role rbac.Role, p rbac.Principal, expr string) rbac.Binding {
+		return rbac.Binding{Role: role, Principal: p, Condition: rbac.Condition{Expression: expr}}
+	}
+	// Three of the longest fit; a fourth doesn't, whatever its role.
+	for i := range 3 {
+		if err := apply(cluster, under("cluster.login", identity("u"), spending(i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := apply(cluster, under("cluster.sudo", identity("u"), spending(3))); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("an identity's fourth costly condition on a scope: %v", err)
+	}
+	if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: under("cluster.sudo", identity("u"), spending(3))}}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("importing it: %v", err)
+	}
+	// One it has counts once, and an unconditional grant costs nothing.
+	if err := apply(cluster, under("cluster.sudo", identity("u"), spending(0)), rbac.Binding{Role: "cluster.sudo", Principal: identity("u")}); err != nil {
+		t.Fatalf("a condition the identity has on the scope: %v", err)
+	}
+	// Another identity's, and the identity's on another scope, count apart.
+	if err := apply(cluster, under("cluster.login", identity("w"), spending(3))); err != nil {
+		t.Fatalf("another identity's: %v", err)
+	}
+	ws := workspace
+	h.seed(t, grant(ws.Scope(), "workspace.admin", rbac.User, "owner"), grant(ws.Scope(), "cluster.admin", rbac.User, "owner"))
+	if err := apply(ws, under("cluster.login", identity("u"), spending(3))); err != nil {
+		t.Fatalf("the identity's on another scope: %v", err)
+	}
+	// Grants to groups, the members and the public share one bound on a scope.
+	for i, p := range []rbac.Principal{groupOf("g1"), groupOf("g2"), rbac.TenantMembers("t1")} {
+		if err := apply(cluster, under("cluster.login", p, spending(10+i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := apply(cluster, under("cluster.login", groupOf("g1"), spending(13))); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a fourth costly condition of grants that reach many: %v", err)
+	}
+	// A grant that has expired costs a check nothing.
+	if _, err := h.pool.Exec(ctx, `UPDATE rbac_grants SET expires_at = $1 WHERE principal = 'group:g2'`, h.now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := apply(cluster, under("cluster.login", groupOf("g1"), spending(13))); err != nil {
+		t.Fatalf("beside an expired one: %v", err)
+	}
+}
+
+// Conditions stored around the bounds can cost more than a check may spend: it spends a bounded
+// budget on them, the cheapest first, and refuses what still needs one.
+func TestACheckSpendsABoundedBudgetOnConditionsStoredAroundTheBounds(t *testing.T) {
+	h := setup(t)
 	grants := func(prefix string, expr func(i int) string) []string {
 		var groups []string
 		var grants []rbac.Grant
-		for i := range 20 {
+		for i := range 30 {
 			g := fmt.Sprintf("%s%02d", prefix, i)
 			groups = append(groups, g)
 			// The one that holds costs the most to compile, so it is evaluated last.
 			e := expr(i)
-			if i == 19 {
-				e = "true || " + costly(0)
+			if i == 29 {
+				e = "true || " + spending(0)
 			}
 			grants = append(grants, rbac.Grant{Scope: cluster.Scope(), Binding: rbac.Binding{
-				Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.Group, ID: g}, Condition: rbac.Condition{Expression: e},
+				Role: "cluster.login", Principal: groupOf(g), Condition: rbac.Condition{Expression: e},
 			}})
 		}
-		h.seed(t, grants...)
+		storeAround(t, h, grants...)
 		return groups
 	}
-	groups := grants("g", costly)
-	if !allowed(t, h, h.as(t, "one", "g19"), login, cluster) {
+	groups := grants("g", spending)
+	if !allowed(t, h, h.as(t, "one", "g29"), login, cluster) {
 		t.Fatal("a condition that holds should allow")
 	}
 	// Spent on the grants before it, the check never reaches the one that holds, and says so.
@@ -5587,7 +5720,7 @@ func TestACheckSpendsABoundedBudgetOnConditions(t *testing.T) {
 	}
 	// One condition decides the same for a request, so however many grants have it, a check pays
 	// to evaluate it once and reaches the one that holds.
-	same := grants("s", func(int) string { return costly(1) })
+	same := grants("s", func(int) string { return spending(1) })
 	if !allowed(t, h, h.as(t, "many", same...), login, cluster) {
 		t.Fatal("a check paid for one condition again for each grant that has it")
 	}
@@ -5747,19 +5880,14 @@ func TestEachPermissionIsDecidedOnItsOwnBudgets(t *testing.T) {
 	if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.admin", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}}}); err != nil {
 		t.Fatalf("handing on what the denies leave: %v", err)
 	}
-	// And on a budget of its own for its grants' conditions: four costly ones that don't hold and,
-	// costliest, one that does, which one budget for both permissions the role gives never reaches.
-	var ys []string
-	for i := range 90 {
-		ys = append(ys, fmt.Sprint(i))
+	// And on a budget of its own for its grants' conditions: costly ones stored around the bounds
+	// that don't hold and, costliest, one that does, which one budget for both permissions the role
+	// gives never reaches.
+	grants := []rbac.Grant{{Scope: cluster.Scope(), Binding: conditional("cluster.login", "c", "true || "+spending(0))}}
+	for i := range 20 {
+		grants = append(grants, rbac.Grant{Scope: cluster.Scope(), Binding: conditional("cluster.login", "c", spending(i+1))})
 	}
-	long := "[" + strings.Join(ys, ",") + "]"
-	costly := func(i int) string { return fmt.Sprintf("%s.all(x, %s.all(y, x >= -%d)) && false", long, long, i) }
-	grants := []rbac.Grant{{Scope: cluster.Scope(), Binding: conditional("cluster.login", "c", "true || "+costly(0))}}
-	for i := range 4 {
-		grants = append(grants, rbac.Grant{Scope: cluster.Scope(), Binding: conditional("cluster.login", "c", costly(i+1))})
-	}
-	h.seed(t, grants...)
+	storeAround(t, h, grants...)
 	for _, p := range []rbac.Permission{login, view} {
 		if !allowed(t, h, h.as(t, "c"), p, cluster) {
 			t.Fatalf("a condition that holds should allow %s", p)
@@ -5773,22 +5901,18 @@ func TestEachPermissionIsDecidedOnItsOwnBudgets(t *testing.T) {
 func TestConditionalGrantsDecideWhateverTheirIDs(t *testing.T) {
 	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), guardRole) })
 	ctx := t.Context()
-	var xs []string
-	for i := range 90 {
-		xs = append(xs, fmt.Sprint(i))
-	}
-	list := "[" + strings.Join(xs, ",") + "]"
+	// Stored around the bounds, so a check's budget runs out before it evaluates them all.
 	var grants []rbac.Grant
 	for _, b := range []struct {
 		role rbac.Role
 		id   string
 	}{{"cluster.login", "u"}, {guardRole.ID, "g"}} {
-		for i := range 19 {
-			grants = append(grants, rbac.Grant{Scope: cluster.Scope(), Binding: conditional(b.role, b.id, fmt.Sprintf("%s.all(x, %s.all(y, x >= -%d)) && false", list, list, i))})
+		for i := range 30 {
+			grants = append(grants, rbac.Grant{Scope: cluster.Scope(), Binding: conditional(b.role, b.id, spending(i))})
 		}
 		grants = append(grants, rbac.Grant{Scope: cluster.Scope(), Binding: conditional(b.role, b.id, "true")})
 	}
-	h.seed(t, grants...)
+	storeAround(t, h, grants...)
 	// The grant that holds read first by id, then last: the cheapest is evaluated first either way.
 	for _, ids := range [][2]string{
 		{"00000000-0000-0000-0000-000000000000", "00000000-0000-0000-0000-000000000001"},
@@ -5816,25 +5940,19 @@ func TestConditionalGrantsDecideWhateverTheirIDs(t *testing.T) {
 }
 
 func TestExplainSpendsTheBudgetAsAuthorizeDoes(t *testing.T) {
-	var xs []string
-	for i := range 90 {
-		xs = append(xs, fmt.Sprint(i))
-	}
-	list := "[" + strings.Join(xs, ",") + "]"
-	costly := func(i int) string { return fmt.Sprintf("%s.all(x, %s.all(y, x >= -%d)) && false", list, list, i) }
 	workspace := rbac.Scope{Type: "workspace", ID: "w1"}
 	// The grant that holds is read first in one order of scopes and principals, and last in the
-	// other.
-	for _, holds := range []int{0, 19} {
+	// other, of grants stored around the bounds.
+	for _, holds := range []int{0, 29} {
 		h := setup(t)
 		var groups []string
 		var grants []rbac.Grant
-		for i := range 20 {
+		for i := range 30 {
 			g := fmt.Sprintf("g%02d", i)
 			groups = append(groups, g)
-			scope, expr := cluster.Scope(), costly(i)
+			scope, expr := cluster.Scope(), spending(i)
 			if i == holds {
-				expr = "true || " + costly(0)
+				expr = "true || " + spending(0)
 			}
 			if (i == holds) == (holds == 0) {
 				scope = workspace
@@ -5843,7 +5961,7 @@ func TestExplainSpendsTheBudgetAsAuthorizeDoes(t *testing.T) {
 				Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.Group, ID: g}, Condition: rbac.Condition{Expression: expr},
 			}})
 		}
-		h.seed(t, grants...)
+		storeAround(t, h, grants...)
 		s := h.as(t, "many", groups...)
 		d, err := h.authz.Explain(t.Context(), s, login, cluster)
 		if a := allowed(t, h, s, login, cluster); err != nil || d.Allowed != a {
@@ -5861,20 +5979,26 @@ func TestACheckDecidesAsItWouldWhateverIsCompiled(t *testing.T) {
 	list := "[" + strings.Join(xs, ",") + "]"
 	var groups []string
 	var grants []rbac.Grant
-	for i := range 21 {
+	// Cheap to evaluate and costly to compile, and stored around the bounds, so the check's budget
+	// runs out on compiling them.
+	for i := range 45 {
 		g := fmt.Sprintf("g%02d", i)
 		groups = append(groups, g)
 		expr := fmt.Sprintf(`%s.all(x, x >= 0) && %d == 0`, list, i+1)
 		// The one that holds costs the most to compile, so it is evaluated last.
-		if i == 20 {
+		if i == 44 {
 			expr = "true || " + expr
 		}
 		grants = append(grants, rbac.Grant{Scope: cluster.Scope(), Binding: rbac.Binding{
 			Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.Group, ID: g}, Condition: rbac.Condition{Expression: expr},
 		}})
 	}
-	// Storing them compiled them for h.authz; another Authorizer compiles them as it checks.
-	h.seed(t, grants...)
+	storeAround(t, h, grants...)
+	// Each checked alone, they are compiled for h.authz; another Authorizer compiles them as it
+	// checks.
+	for _, g := range groups {
+		allowed(t, h, h.as(t, "in-"+g, g), login, cluster)
+	}
 	fresh, err := rbac.New(h.pool, rbac.Config{
 		Catalog: catalog, ContainerTypes: []string{"org", "workspace"},
 		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },

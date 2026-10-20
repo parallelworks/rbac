@@ -35,11 +35,18 @@ import (
 // as one reading an attribute the host didn't pass does, is false. The zero Condition is none,
 // and one with a title or description has an expression. A pattern it matches is a string
 // literal, of bounded size; it nests at most 32 deep; and a comparison, or a search of a list, that
-// would read more than a condition may spend fails before it runs. A check spends a bounded budget on its grants' conditions and another,
-// for each scope on its path, on its denies', compiling them included: past it, a grant's
-// condition is false and a deny's applies, so what still needs one is refused. A check evaluates
-// the cheapest first, so what it decides doesn't rest on ids, and SetDeny bounds a scope's
-// conditional denies together so that a check always evaluates them whole.
+// would read more than a condition may spend fails before it runs.
+//
+// What a check may spend on conditions is bounded, for each scope on its path, and so are the
+// conditions stored, so that a check evaluates whole every one it reads: those of an identity's
+// grants on a scope cost at most so much together, and those of a scope's grants to groups, the
+// tenant's members and the public, which reach many, as much again; those of a scope's denies
+// (SetDeny); and the requirements of the eligibilities of groups for a role on a scope. Each
+// distinct condition counts once, as what compiling it and evaluating it to its bound cost: about
+// seven short ones, or three of the longest. A change past one is refused, so no grant, deny or
+// eligibility stored changes what the others decide. A condition stored around them a check may
+// not reach: it evaluates the cheapest first, and past its budget a grant's condition is false and
+// a deny's applies.
 //
 // Searches (Filter, Reachable, Holders) can't evaluate one: Filter and Reachable count only
 // unconditional grants, Filter counts a conditional deny as denying, and Reach.Conditional and
@@ -65,10 +72,11 @@ const (
 	maxCached = 256 << 10
 	// zoneCost is what reading a time in a named zone costs: it loads the zone each time.
 	zoneCost = 100
-	// maxCheckCost is what one check may spend on its grants' conditions, compiling included, and a
-	// listing or a change on each permission it decides, so many conditional grants on one path
-	// can't make it slow: once it is spent, no further condition holds, and what needs one is
-	// refused.
+	// maxCheckCost is what the conditions a check reads cost together where they are bounded: an
+	// identity's grants on a scope, a scope's grants that reach many, its denies, and the
+	// requirements of groups' eligibilities for a role on it. A check, and a listing or a change
+	// for each permission it decides, may spend that much on each for each scope of its path, so
+	// many conditional grants can't make it slow, and evaluates them whole.
 	maxCheckCost = 8 * maxCost
 	// compilePerByte is what compiling a condition costs for each byte of it. Compiling one takes
 	// about as long as evaluating forty units of cost for each, twice that where attributes are
@@ -96,7 +104,11 @@ type budget struct {
 // decision is what evaluating a condition decided.
 type decision struct{ held, evaluated bool }
 
-func newBudget() *budget { return budgetOf(maxCheckCost) }
+// newGrantBudget is a check's budget for its grants' conditions on a path of scopes: the subject's
+// own on a scope and those of the scope's grants that reach many each cost at most maxCheckCost
+// (bounded), so a check may spend twice that for each scope of its path, and evaluates them whole
+// however many grants or groups it reads, or a third party adds.
+func newGrantBudget(path []string) *budget { return budgetOf(uint64(len(path)) * 2 * maxCheckCost) }
 
 // newDenyBudget is a check's budget for the denies' conditions on a path of scopes, apart from
 // what it spends on its grants', so neither leaves the other nothing: a scope's conditional denies
@@ -110,6 +122,18 @@ func budgetOf(left uint64) *budget {
 
 // worstCost is the most a condition can cost a check: compiling it, and evaluating it to its bound.
 func worstCost(expr string) uint64 { return uint64(len(expr))*compilePerByte + maxCost }
+
+// affordable reports whether a check can evaluate the conditions exprs whole, each distinct one
+// once, within maxCheckCost.
+func affordable(exprs []string) bool {
+	var cost uint64
+	for _, e := range slices.Compact(slices.Sorted(slices.Values(exprs))) {
+		if e != "" {
+			cost += worstCost(e)
+		}
+	}
+	return cost <= maxCheckCost
+}
 
 // cheapestFirst sorts xs in the order checks evaluate their conditions, which expression reads: by
 // what compiling them costs, then by their text, as the same condition decides the same, so a

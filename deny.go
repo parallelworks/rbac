@@ -263,15 +263,8 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 		}
 		// Past this, a check's budget could run out before it evaluated them, and the rest would
 		// deny everyone they name, whatever their conditions say.
-		if d.Condition.Expression != "" {
-			// Each condition once, as a check evaluates it once.
-			var cost uint64
-			for _, c := range slices.Compact(slices.Sorted(slices.Values(append(conditions, d.Condition.Expression)))) {
-				cost += worstCost(c)
-			}
-			if cost > maxCheckCost {
-				return ChangeEvent{}, fmt.Errorf("%w: a scope's conditional denies cost more together than a check may spend evaluating them", ErrInvalid)
-			}
+		if d.Condition.Expression != "" && !affordable(append(conditions, d.Condition.Expression)) {
+			return ChangeEvent{}, fmt.Errorf("%w: a scope's conditional denies cost more together than a check may spend evaluating them", ErrInvalid)
 		}
 		rows, err := tx.Query(ctx, `
 			INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, name, principals, exempt, permissions,
