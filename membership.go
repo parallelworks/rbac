@@ -1064,7 +1064,8 @@ func keyedAll(members []Member) error {
 // note, as actor: the host's own write, as for a directory it syncs from. A member identity is a
 // member or guest of the tenant, and a member group exists; nesting a group can't make one contain
 // itself, nor a chain of more than MaxGroupDepth groups. Config.ValidateGrant is asked about each
-// grant and eligibility a member gains, as with ChangeMembers.
+// grant and eligibility a member gains, as with ChangeMembers, so about none of a place made to end
+// sooner.
 func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant string, members []Member) (err error) {
 	defer a.refused(ctx, &err, tenant, actor, "ImportMembers")
 	if !validID(tenant) {
@@ -1083,7 +1084,7 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 	if err != nil {
 		return err
 	}
-	rc, err := a.reachOf(ctx, a.db, tenant, set, nil, false)
+	rc, err := a.reachOf(ctx, a.db, tenant, set, nil)
 	if err != nil {
 		return err
 	}
@@ -1307,7 +1308,7 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 	if err := a.notOwnedGroups(ctx, a.db, tenant, groups); err != nil {
 		return err
 	}
-	rc, err := a.reachOf(ctx, a.db, tenant, set, remove, true)
+	rc, err := a.reachOf(ctx, a.db, tenant, set, remove)
 	if err != nil {
 		return err
 	}
@@ -1401,9 +1402,9 @@ type approving struct {
 	approvers []Principal
 }
 
-// reachOf reads, on q, what adding add and removing remove reaches, in force at now, and with
-// ending, which of add end a membership sooner and which members leave their groups.
-func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remove []Member, ending bool) (reach, error) {
+// reachOf reads, on q, what adding add and removing remove reaches, in force at now, which of add
+// end a membership sooner and which members leave their groups.
+func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remove []Member) (reach, error) {
 	r := reach{up: map[string]map[string]bool{}, labeled: len(a.labels) > 0}
 	groups := memberGroups(slices.Concat(add, remove))
 	if len(groups) == 0 {
@@ -1496,10 +1497,8 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 			r.approving = append(r.approving, approving{v, e.Approvers})
 		}
 	}
-	if ending {
-		if r.ending, r.leaves, err = a.placesLeft(ctx, q, tenant, add, remove); err != nil {
-			return reach{}, err
-		}
+	if r.ending, r.leaves, err = a.placesLeft(ctx, q, tenant, add, remove); err != nil {
+		return reach{}, err
 	}
 	return r, nil
 }
@@ -1810,7 +1809,7 @@ func (r reach) footprint(add, remove []Member, gains bool) map[reachKey]RoleDefi
 // write, which is checked only as the host is asked about what members gain, it compares only
 // those. It returns what the change reaches under the locks.
 func (a *Authorizer) stillReached(ctx context.Context, tx pgx.Tx, tenant string, add, remove []Member, was reach, gains bool) (reach, error) {
-	now, err := a.reachOf(ctx, tx, tenant, add, remove, true)
+	now, err := a.reachOf(ctx, tx, tenant, add, remove)
 	if err != nil {
 		return reach{}, err
 	}

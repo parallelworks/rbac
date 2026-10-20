@@ -3333,6 +3333,16 @@ func TestImportingMembersAsksAboutWhatAGroupHolds(t *testing.T) {
 	if len(asked) != 1 || asked[0].Binding.Principal != identity("u") || asked[0].Actor.Principal != host || asked[0].Binding.Role != "cluster.sudo" {
 		t.Fatalf("asked = %+v", asked)
 	}
+	// A place made to end sooner gains nothing, so the host is asked about none of it, as by
+	// ChangeMembers, and refuses none of it: here, the service account's, in admins around the hooks.
+	h.member(t, bot.Principal, "admins")
+	asked = nil
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "admins", Principal: bot.Principal, ExpiresAt: h.now.Add(time.Hour)}}); err != nil || len(asked) != 0 {
+		t.Fatalf("importing the service account's place to end sooner: %v, asked %+v", err, asked)
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "admins", Principal: bot.Principal, ExpiresAt: h.now.Add(2 * time.Hour)}}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("importing it to end later, gaining what admins holds meanwhile: %v", err)
+	}
 }
 
 func TestImportingMembersWaitsOnlyForWhatTheHostIsAsked(t *testing.T) {
