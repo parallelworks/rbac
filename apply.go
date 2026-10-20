@@ -303,24 +303,26 @@ func (a *Authorizer) mayChangeGrants(ctx context.Context, actor Subject, on Reso
 // grantsAllowed is what a change to the grants on on checks, Apply's and one to members' alike:
 // before its transaction, the constraints on changing them, asked through cs, then on's label and
 // what the actor holds there, as mayChangeBy decides; and once cs is sealed, under its locks, what
-// it holds and the label again. The actor's label values are read through labels, or where nil, cs
-// on the tenant, and what it holds on q, or is au, where read already. It returns the authority it
-// decided by.
+// it holds and the label again. What it holds is read on q, or is au, where read already, and its
+// label values are decided by that read, asking the constraints through labels, or where nil, cs on
+// the tenant. It returns the authority it decided by.
 func (a *Authorizer) grantsAllowed(ctx context.Context, q DB, actor Subject, on Resource, grants, revokes []Binding, cs, labels *constrained,
 	au *authority,
 ) (authority, error) {
-	checkLabel := func() error { return a.labelAllows(ctx, q, on, cs, labels, GrantPermission(on.Type)) }
 	if !cs.sealed {
 		if err := a.changing(actor, on, cs); err != nil {
-			return authority{}, err
-		}
-		if err := checkLabel(); err != nil {
 			return authority{}, err
 		}
 	}
 	held, err := a.authorityOr(ctx, q, actor, on, roleIDs(grants), au)
 	if err != nil {
 		return authority{}, err
+	}
+	checkLabel := func() error { return a.labelAllows(ctx, q, on, cs, labels, GrantPermission(on.Type), held) }
+	if !cs.sealed {
+		if err := checkLabel(); err != nil {
+			return authority{}, err
+		}
 	}
 	held.constrained = cs
 	if err := a.mayChangeBy(held, on, grants, revokes); err != nil {
@@ -342,18 +344,22 @@ func (a *Authorizer) authorityOr(ctx context.Context, q DB, actor Subject, on Re
 	return a.authorityOn(ctx, q, actor, on, roles)
 }
 
-// labelAllows refuses, as a DeniedError of p, a change on a scope whose label the actor's holding,
-// read on q, doesn't satisfy, asking the constraints about its values through labels, or where nil,
-// through cs on the tenant: before the change's transaction, and again under its locks, which reads
-// their answers back.
-func (a *Authorizer) labelAllows(ctx context.Context, q DB, on Resource, cs, labels *constrained, p Permission) error {
+// labelAllows refuses, as a DeniedError of p, a change on a scope whose label the actor's holding
+// doesn't satisfy, decided by au, its authority there, as of the read of its grants, asking the
+// constraints about its values through labels, or where nil, through cs on the tenant: before the
+// change's transaction, and again under its locks, which reads their answers back.
+func (a *Authorizer) labelAllows(ctx context.Context, q DB, on Resource, cs, labels *constrained, p Permission, au authority) error {
 	if !on.Labels.asks() {
 		return nil
 	}
 	if labels == nil {
 		labels = cs.ofTenant()
 	}
-	return a.labelCheck(ctx, q, labels)(on, p)
+	held, err := labels.holdingBy(ctx, q, au.values)
+	if err != nil {
+		return err
+	}
+	return labelRefused(held, on, p)
 }
 
 // labelCheck returns a check refusing, as a DeniedError of p, a change on a resource whose label
@@ -369,11 +375,16 @@ func (a *Authorizer) labelCheck(ctx context.Context, q DB, labels *constrained) 
 		if err != nil {
 			return err
 		}
-		if dim := held.Unsatisfied(on.Labels); dim != "" {
-			return &DeniedError{Permission: p, Scope: on.Scope(), Reason: labelRefusal(dim)}
-		}
-		return nil
+		return labelRefused(held, on, p)
 	}
+}
+
+// labelRefused refuses, as a DeniedError of p, a change on on whose label held doesn't satisfy.
+func labelRefused(held Holding, on Resource, p Permission) error {
+	if dim := held.Unsatisfied(on.Labels); dim != "" {
+		return &DeniedError{Permission: p, Scope: on.Scope(), Reason: labelRefusal(dim)}
+	}
+	return nil
 }
 
 // changing refuses a change to grants on a scope of a type the host doesn't have, as a typo no
@@ -846,6 +857,9 @@ type authority struct {
 	// given is what heldFor found the actor's grants give, which doesn't turn on the role a check
 	// asks about, so a decision checking many roles that give the same reads its grants once.
 	given map[heldKey]int
+	// values is what the actor's label values are decided by, read with its grants, so a change
+	// checks a label by what it held as it held its power there.
+	values *valuesRead
 }
 
 // heldKey is what heldFor is asked: a permission for a list of types, under a condition until a
@@ -878,8 +892,9 @@ type constrained struct {
 	// holds them, for a change on a labeled scope.
 	tenant *constrained
 	// held is the actor's label values read through c, once before the transaction and once in it,
-	// for every label a change checks.
+	// for every label a change checks, and keys its keys in the tenant read with them.
 	held [2]*Holding
+	keys [2][]string
 }
 
 func (a *Authorizer) constrain(ctx context.Context, actor Subject, on Resource) *constrained {
@@ -892,18 +907,45 @@ func (a *Authorizer) constrain(ctx context.Context, actor Subject, on Resource) 
 // holding is the actor's label values, read on q through c, which is on the tenant, the first time
 // a change asks for them before its transaction, and again the first time in it.
 func (c *constrained) holding(ctx context.Context, q DB) (Holding, error) {
+	h, _, err := c.holdingAndKeys(ctx, q)
+	return h, err
+}
+
+// holdingAndKeys is holding, and the actor's keys in the tenant, read with its values, so whom it
+// is a member of, as an approver, is of the moment they are.
+func (c *constrained) holdingAndKeys(ctx context.Context, q DB) (Holding, []string, error) {
 	phase := 0
 	if c.sealed {
 		phase = 1
 	}
 	if c.held[phase] == nil {
-		h, _, err := c.a.holdingOn(ctx, q, c.actor, c)
+		h, _, keys, err := c.a.holdingRead(ctx, q, c.actor, c, true)
 		if err != nil {
-			return Holding{}, err
+			return Holding{}, nil, err
 		}
-		c.held[phase] = &h
+		c.held[phase], c.keys[phase] = &h, keys
 	}
-	return *c.held[phase], nil
+	return *c.held[phase], c.keys[phase], nil
+}
+
+// holdingBy is the actor's label values decided through c by v, read with its other grants, once
+// for each read; or where v is nil, read on q (holding).
+func (c *constrained) holdingBy(ctx context.Context, q DB, v *valuesRead) (Holding, error) {
+	if v == nil {
+		return c.holding(ctx, q)
+	}
+	if h, ok := v.decided[c]; ok {
+		return h, nil
+	}
+	h, _, err := c.a.holdingFrom(ctx, q, c.actor, c, v)
+	if err != nil {
+		return Holding{}, err
+	}
+	if v.decided == nil {
+		v.decided = map[*constrained]Holding{}
+	}
+	v.decided[c] = h
+	return h, nil
 }
 
 func (c *constrained) seal() {
@@ -1075,7 +1117,7 @@ func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []
 			keys[k] = true
 		}
 	}
-	held, ds, b, err := a.heldOrDenied(ctx, q, tenant, actor, all, slices.Sorted(maps.Keys(keys)), "", which, true)
+	held, ds, b, err := a.heldOrDenied(ctx, q, tenant, actor, all, slices.Sorted(maps.Keys(keys)), which, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1095,6 +1137,8 @@ func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []
 	// members of a group granted a role on each, walks the roles a role lists once.
 	proven := map[string]*checked{}
 	b = b.keepingSets()
+	// Every path holds the tenant's scope, so the read holds what the actor's values are decided by.
+	values := onTenant(tenant, held, ds, b)
 	aus := make([]authority, len(on))
 	for i, r := range on {
 		heldOn := make([]holding, len(heldAt[i]))
@@ -1102,6 +1146,7 @@ func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []
 			heldOn[j] = held[k]
 		}
 		aus[i] = a.authorityOf(ctx, actor, r, heldOn, deniedOn[i], b)
+		aus[i].values = values
 		if len(a.cfg.Constraints) > 0 || len(deniedOn[i]) > 0 {
 			continue
 		}
@@ -1530,23 +1575,27 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 	if err := a.subject(s); err != nil {
 		return nil, err
 	}
-	if dim, err := a.unsatisfied(ctx, s, r); err != nil || dim != "" {
-		return nil, err
-	}
-	cs := a.constrain(ctx, s, r)
-	if cs.removes(GrantPermission(r.Type), r.Type) {
-		return nil, cs.failed()
-	}
 	// Every custom role, read once: the candidates, and those their GrantableRoles name. In the
 	// statement that reads the grants, as a check reads them: read apart, a grant revoked and its
-	// role widened meanwhile could offer what no moment would.
-	held, ds, b, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), "", tenantRoles, true)
+	// role widened meanwhile could offer what no moment would. Its label values too, which its
+	// grants on the tenant give.
+	held, ds, b, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), tenantRoles, true)
 	if err != nil || len(held) == 0 {
 		return nil, err
 	}
 	readingRoles()
 	if err := a.conditionsOf(ctx, a.db, r.Tenant, held); err != nil {
 		return nil, err
+	}
+	if r.Labels.asks() {
+		h, _, err := a.holdingFrom(ctx, a.db, s, a.constrain(ctx, s, tenantResource(r.Tenant)), onTenant(r.Tenant, held, ds, b))
+		if err != nil || h.Unsatisfied(r.Labels) != "" {
+			return nil, err
+		}
+	}
+	cs := a.constrain(ctx, s, r)
+	if cs.removes(GrantPermission(r.Type), r.Type) {
+		return nil, cs.failed()
 	}
 	au := a.authorityOf(ctx, s, r, held, ds, b)
 	custom := slices.SortedFunc(maps.Values(b.custom), func(x, y RoleDefinition) int { return strings.Compare(string(x.ID), string(y.ID)) })

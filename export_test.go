@@ -76,6 +76,14 @@ func SetReadingRoles(t *testing.T, f func()) {
 	t.Cleanup(func() { readingRoles = old })
 }
 
+// SetReadingKeys runs f once an activation has read its approver's keys, until t ends.
+func SetReadingKeys(t *testing.T, f func()) {
+	t.Helper()
+	old := readingKeys
+	readingKeys = f
+	t.Cleanup(func() { readingKeys = old })
+}
+
 // SetCheckingRole runs f each time a decision begins checking a role for a grant, until t ends.
 func SetCheckingRole(t *testing.T, f func()) {
 	t.Helper()

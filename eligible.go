@@ -639,7 +639,8 @@ type madeThrough struct {
 // eligible. It returns the eligibility that allows it and who approved: one of s's identity or of
 // one of its groups there, lasting act.Duration or longer and in force until then, whose
 // requirement holds in the request, failing closed, and whose approvers, if it names any, include
-// act.Approver, who isn't s, holding what on's label asks for, read through approving. Of those,
+// act.Approver, who isn't s, holding what on's label asks for, read through approving with the
+// groups it is in, so it is one of them as it holds the values. Of those,
 // the one whose path from s lasts longest, and of those lasting alike and needing approval alike
 // s's own, as the activation rests on it. approved is zero when the eligibility allowing it names
 // none. A privileged role's counts only through s's identity or its groups, as its grants do, never
@@ -652,6 +653,7 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 	if err != nil {
 		return madeThrough{}, Principal{}, err
 	}
+	readingKeys()
 	rows, err := q.Query(ctx, byKey("$4", "rbac_eligibilities", "principal", "id, principal, requires, approvers", `tenant = $1 AND scope = $2 AND role = $3
 		  AND max_seconds >= $5 AND (expires_at IS NULL OR expires_at > $6 AND expires_at >= $7)`),
 		on.Tenant, scope.Key(), act.Role, countedOf(slices.Sorted(maps.Keys(reached)), broad{}), seconds(act.Duration), a.cfg.Now(), until)
@@ -703,10 +705,15 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 		// approves first there, and its values must have been asked about before it.
 		if len(e.approvers) > 0 && on.Labels.asks() {
 			// Read the first time in each phase, with none of a request's attributes, as approving
-			// asks the constraints.
-			held, err := approving.holding(withoutRequest(ctx), q)
+			// asks the constraints; and its keys with them, so it approves as one of the approvers
+			// holding the values at one moment.
+			held, keys, err := approving.holdingAndKeys(withoutRequest(ctx), q)
 			if err != nil {
 				return madeThrough{}, Principal{}, err
+			}
+			if !approves(act.Approver, s, countedOf(keys, broad{}), e.approvers) {
+				reason = fmt.Sprintf("activating %s here needs one of its approvers to approve", act.Role)
+				continue
 			}
 			if dim := held.Unsatisfied(on.Labels); dim != "" {
 				reason = "the resource's label asks for values in " + dim + " its approver doesn't hold"
@@ -730,6 +737,10 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 	}
 	return chosen.madeThrough, Principal{}, nil
 }
+
+// readingKeys runs once an activation has read its approver's keys, apart from its label values, as
+// a test's change that commits there.
+var readingKeys = func() {}
 
 // approves reports whether approver, by one of its keys in the tenant, its identity or a group it
 // is in there, is among an eligibility's approvers, and isn't s, who can't approve its own
