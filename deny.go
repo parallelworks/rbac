@@ -247,11 +247,8 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 		if err := groupsExist(ctx, tx, on.Tenant, slices.Concat(groups, groupScopes([]Scope{d.Scope}))); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.holdsDeny(ctx, tx, actor, on); err != nil {
-			return ChangeEvent{}, err
-		}
 		cs.seal()
-		if err := a.cleared(ctx, tx, on, cs, DenyPermission(on.Type)); err != nil {
+		if err := a.denyAllowed(ctx, tx, actor, on, cs, nil, nil); err != nil {
 			return ChangeEvent{}, err
 		}
 		var others int
@@ -320,11 +317,8 @@ func (a *Authorizer) DeleteDeny(ctx context.Context, actor Subject, on Resource,
 		if err := lock(ctx, tx, on.Tenant, []string{on.Scope().Key()}, nil); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.holdsDeny(ctx, tx, actor, on); err != nil {
-			return ChangeEvent{}, err
-		}
 		cs.seal()
-		if err := a.cleared(ctx, tx, on, cs, DenyPermission(on.Type)); err != nil {
+		if err := a.denyAllowed(ctx, tx, actor, on, cs, nil, nil); err != nil {
 			return ChangeEvent{}, err
 		}
 		rows, err := tx.Query(ctx, `DELETE FROM rbac_denies WHERE tenant = $1 AND scope = $2 AND id = $3 RETURNING `+denyColumns,
@@ -343,31 +337,58 @@ func (a *Authorizer) DeleteDeny(ctx context.Context, actor Subject, on Resource,
 // constraints run here only, as in Apply: a hook that queries the pool while the transaction holds
 // a connection can wait forever on a busy pool.
 func (a *Authorizer) mayDeny(ctx context.Context, actor Subject, on Resource) (*constrained, error) {
-	if err := a.scopeOf(on); err != nil {
-		return nil, err
-	}
-	perm := DenyPermission(on.Type)
-	if actor.Principal == (Principal{}) {
-		return nil, &DeniedError{Permission: perm, Scope: on.Scope(), Reason: "an anonymous subject changes nothing"}
-	}
 	cs := a.constrain(ctx, actor, on)
-	if cs.removes(perm, on.Type) {
-		return nil, cmp.Or(cs.failed(), error(&DeniedError{Permission: perm, Scope: on.Scope(), Reason: "removed by " + cs.removedBy(perm)}))
-	}
-	// Who can't see a labeled scope sets no deny on it, nor lifts one, which would widen access.
-	if err := a.cleared(ctx, a.db, on, cs, perm); err != nil {
-		return nil, err
-	}
-	return cs, a.holdsDeny(ctx, a.db, actor, on)
+	return cs, a.denyAllowed(ctx, a.db, actor, on, cs, nil, nil)
 }
 
-// holdsDeny checks, on q, that actor holds DenyPermission(on's type) on a scope.
-func (a *Authorizer) holdsDeny(ctx context.Context, q DB, actor Subject, on Resource) error {
-	perm := DenyPermission(on.Type)
-	au, err := a.authorityOn(ctx, q, actor, on, nil)
+// denyAllowed is what setting or deleting a deny on on checks, and a change to members lifting one
+// there: before the change's transaction, the constraints on it, asked through cs, then on's label
+// and that the actor holds DenyPermission(on's type) there; and once cs is sealed, under its locks,
+// what it holds and the label again. The actor's label values are read through labels, or where
+// nil, cs on the tenant, and what it holds on q, or is au, where read already.
+func (a *Authorizer) denyAllowed(ctx context.Context, q DB, actor Subject, on Resource, cs, labels *constrained, au *authority) error {
+	checkLabel := func() error { return a.labelAllows(ctx, q, on, cs, labels, DenyPermission(on.Type)) }
+	if !cs.sealed {
+		if err := a.denying(actor, on, cs); err != nil {
+			return err
+		}
+		// Who can't see a labeled scope sets no deny on it, nor lifts one, which would widen access.
+		if err := checkLabel(); err != nil {
+			return err
+		}
+	}
+	held, err := a.authorityOr(ctx, q, actor, on, nil, au)
 	if err != nil {
 		return err
 	}
+	if err := held.setsDenies(on); err != nil {
+		return err
+	}
+	if cs.sealed {
+		return checkLabel()
+	}
+	return nil
+}
+
+// denying refuses setting or deleting the denies on a scope of a type the host doesn't have, by an
+// anonymous actor, or one a constraint on DenyPermission(on's type) stops, asked through cs.
+func (a *Authorizer) denying(actor Subject, on Resource, cs *constrained) error {
+	if err := a.scopeOf(on); err != nil {
+		return err
+	}
+	perm := DenyPermission(on.Type)
+	if actor.Principal == (Principal{}) {
+		return &DeniedError{Permission: perm, Scope: on.Scope(), Reason: "an anonymous subject changes nothing"}
+	}
+	if cs.removes(perm, on.Type) {
+		return cmp.Or(cs.failed(), error(&DeniedError{Permission: perm, Scope: on.Scope(), Reason: "removed by " + cs.removedBy(perm)}))
+	}
+	return nil
+}
+
+// setsDenies refuses an actor whose authority on on, au, doesn't give DenyPermission(on's type).
+func (au authority) setsDenies(on Resource) error {
+	perm := DenyPermission(on.Type)
 	if !au.may(perm, on.Type) {
 		return &DeniedError{Permission: perm, Scope: on.Scope(), Reason: "the actor may not set denies here"}
 	}

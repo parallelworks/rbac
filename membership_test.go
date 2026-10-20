@@ -3449,6 +3449,76 @@ func TestChangingMembersOfSeveralGroupsAsksAboutWhatEachGives(t *testing.T) {
 	}
 }
 
+// A change to members reads the actor's authority on every scope it reaches at once, before its
+// transaction and again in it, however many there are, and asks Config.ResourceOf about each once.
+func TestChangingMembersReadsTheActorsAuthorityOnceForAllItReaches(t *testing.T) {
+	asked := 0
+	h := grouped(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), guardRole)
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			asked++
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.admin", rbac.User, "manager"), grant(rbac.TenantRoot("t1"), "guard", rbac.User, "manager"))
+	h.join(t, "u", "v")
+	reads := 0
+	rbac.SetReadingRoles(t, func() { reads++ })
+	// Joining a group granted a role on n clusters, each with a deny it is exempt from.
+	join := func(group string, n int, member string) (int, int) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_groups (tenant, id) VALUES ('t1', $1)`, group); err != nil {
+			t.Fatal(err)
+		}
+		for _, q := range []string{
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			 SELECT 't1', 'cluster', $1 || i, 'group', $1, 'cluster.login' FROM generate_series(1, $2) i`,
+			`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+			 SELECT 't1', 'cluster', $1 || i, 'd', '{members:t1}', ARRAY['group:' || $1], '{cluster:root}' FROM generate_series(1, $2) i`,
+		} {
+			if _, err := h.pool.Exec(ctx, q, group, n); err != nil {
+				t.Fatal(err)
+			}
+		}
+		reads, asked = 0, 0
+		if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", []rbac.Member{{Group: group, Principal: identity(member)}}, nil); err != nil {
+			t.Fatal(err)
+		}
+		return reads, asked
+	}
+	fewReads, fewAsked := join("few", 2, "u")
+	manyReads, manyAsked := join("many", 40, "v")
+	if manyReads != fewReads {
+		t.Errorf("joining a group on 2 clusters read the actor's grants %d times, and on 40, %d", fewReads, manyReads)
+	}
+	if fewAsked != 2+1 || manyAsked != 40+1 {
+		t.Errorf("joining a group on 2 clusters asked Config.ResourceOf %d times, and on 40, %d", fewAsked, manyAsked)
+	}
+	// So does one changing the members of many groups, on each of which it is checked.
+	joinEach := func(n int) int {
+		t.Helper()
+		var add []rbac.Member
+		var ids []string
+		for i := range n {
+			ids = append(ids, fmt.Sprintf("g%d-%d", n, i))
+			add = append(add, rbac.Member{Group: ids[i], Principal: identity("u")})
+		}
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_groups (tenant, id) SELECT 't1', unnest($1::text[])`, ids); err != nil {
+			t.Fatal(err)
+		}
+		reads = 0
+		if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", add, nil); err != nil {
+			t.Fatal(err)
+		}
+		return reads
+	}
+	if few, many := joinEach(2), joinEach(40); many != few {
+		t.Errorf("joining 2 groups read the actor's grants %d times, and 40, %d", few, many)
+	}
+}
+
 // A change to members is checked again in its transaction: an actor that lost the power to make
 // what it makes while the host was asked about it is refused.
 func TestChangingMembersIsCheckedAgainUnderItsLocks(t *testing.T) {

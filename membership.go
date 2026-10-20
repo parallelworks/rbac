@@ -848,12 +848,17 @@ func (a *Authorizer) groupsTenant(ctx context.Context, tenant string) ([]Resourc
 // on q, once labels is sealed. labels is what the constraints remove of the actor's label values,
 // asked about on the tenant before the transaction and read back in it.
 func (a *Authorizer) mayManageGroups(ctx context.Context, q DB, actor Subject, perm Permission, on []Resource, labels *constrained) error {
+	if actor.Principal == (Principal{}) && len(on) > 0 {
+		return &DeniedError{Permission: perm, Scope: on[0].Scope(), Reason: "an anonymous subject changes nothing"}
+	}
+	// On all of them in one read, as a change to the members of many groups checks each.
+	aus, err := a.authorities(ctx, q, actor, on, nil)
+	if err != nil {
+		return err
+	}
 	clearance := a.labelCheck(ctx, q, labels)
-	for _, r := range on {
+	for i, r := range on {
 		scope := r.Scope()
-		if actor.Principal == (Principal{}) {
-			return &DeniedError{Permission: perm, Scope: scope, Reason: "an anonymous subject changes nothing"}
-		}
 		if !labels.sealed {
 			name, err := a.denied(ctx, ConstraintInput{Tenant: r.Tenant, ResourceType: r.Type, Permission: perm, Subject: &actor, Resource: &r})
 			if err != nil {
@@ -863,11 +868,7 @@ func (a *Authorizer) mayManageGroups(ctx context.Context, q DB, actor Subject, p
 				return &DeniedError{Permission: perm, Scope: scope, Reason: "removed by " + name}
 			}
 		}
-		au, err := a.authorityOn(ctx, q, actor, r, nil)
-		if err != nil {
-			return err
-		}
-		if !au.may(perm, r.Type) {
+		if !aus[i].may(perm, r.Type) {
 			return &DeniedError{Permission: perm, Scope: scope, Reason: "the actor may not manage these groups here"}
 		}
 		// As a check of perm on it refuses who can't see it, read again under the change's locks, so a
@@ -1795,7 +1796,7 @@ type reachCheck struct {
 // change to members makes, by scope: grant each grant and eligibility an added member gains, as
 // Apply would; set each eligibility it would approve; set each deny lifted for a member; and take
 // away what a member leaving loses, which only a scope's label refuses, as Apply refuses a revoke
-// there, read through labels.
+// there. The actor's label values are read through labels.
 func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string, add, remove []Member, rc reach, labels *constrained) ([]*reachCheck, error) {
 	byScope := map[Scope]*reachCheck{}
 	at := func(s Scope) *reachCheck {
@@ -1843,9 +1844,10 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 			at(s).leaves = true
 		}
 	}
-	clearance := a.labelCheck(ctx, a.db, labels)
-	// Where only its label checks a scope, the host is asked about it only if a label could refuse
-	// the actor, and one it no longer has, as for a revoke there, has none.
+	// Each as Config.ResourceOf gives it, and then the actor's authority on all of them in one read,
+	// so a group with access on many scopes doesn't cost a read on each. Where only its label checks
+	// a scope, the host is asked about it only if a label could refuse the actor, and one it no
+	// longer has, as for a revoke there, has none.
 	var cleared *bool
 	var checks []*reachCheck
 	for _, s := range slices.SortedFunc(maps.Keys(byScope), func(x, y Scope) int { return strings.Compare(x.Key(), y.Key()) }) {
@@ -1863,31 +1865,40 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 			checks = append(checks, c)
 			continue
 		}
-		on, err := a.resourceOf(ctx, tenant, s)
+		var err error
+		c.on, err = a.resourceOf(ctx, tenant, s)
 		switch {
 		case leaving && errors.Is(err, ErrNotFound):
 			continue
 		case err != nil:
 			return nil, err
 		}
-		c.on = on
+		checks = append(checks, c)
+	}
+	granting, denying, err := a.reachAuthority(ctx, a.db, actor, checks)
+	if err != nil {
+		return nil, err
+	}
+	clearance := a.labelCheck(ctx, a.db, labels)
+	for i, c := range checks {
+		// As Apply checks grants there, and SetDeny a deny.
 		if len(c.grants) > 0 {
-			if _, c.cs, err = a.mayChangeGrants(ctx, actor, on, c.grants, nil); err != nil {
+			c.cs = a.constrain(ctx, actor, c.on)
+			if _, err := a.grantsAllowed(ctx, a.db, actor, c.on, c.grants, nil, c.cs, labels, &granting[i]); err != nil {
 				return nil, err
 			}
 		}
 		if c.denies {
-			if c.ds, err = a.mayDeny(ctx, actor, on); err != nil {
+			c.ds = a.constrain(ctx, actor, c.on)
+			if err := a.denyAllowed(ctx, a.db, actor, c.on, c.ds, labels, &denying[i]); err != nil {
 				return nil, err
 			}
 		}
-		// Granting or lifting a deny there checked its label already.
-		if leaving {
-			if err := clearance(on, GrantPermission(on.Type)); err != nil {
+		if c.leaves && !c.cleared {
+			if err := clearance(c.on, GrantPermission(c.on.Type)); err != nil {
 				return nil, err
 			}
 		}
-		checks = append(checks, c)
 	}
 	return checks, nil
 }
@@ -1895,6 +1906,10 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 // mayReachAgain checks what mayReach checked again, in a change's transaction, reading the
 // constraints' answers from before it rather than ask them again, the actor's label values too.
 func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject, checks []*reachCheck, labels *constrained) error {
+	granting, denying, err := a.reachAuthority(ctx, tx, actor, checks)
+	if err != nil {
+		return err
+	}
 	clearance := a.labelCheck(ctx, tx, labels)
 	if slices.ContainsFunc(checks, func(c *reachCheck) bool { return c.cleared }) {
 		all, err := a.clearsAll(ctx, tx, labels)
@@ -1905,32 +1920,56 @@ func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject
 			return fmt.Errorf("%w: the actor's label values changed while this change waited; try again", ErrConflict)
 		}
 	}
-	for _, c := range checks {
+	for i, c := range checks {
 		if len(c.grants) > 0 {
 			c.cs.seal()
-			if _, err := a.mayChange(ctx, tx, actor, c.on, c.grants, nil, c.cs); err != nil {
-				return err
-			}
-			if err := a.cleared(ctx, tx, c.on, c.cs, GrantPermission(c.on.Type)); err != nil {
+			if _, err := a.grantsAllowed(ctx, tx, actor, c.on, c.grants, nil, c.cs, labels, &granting[i]); err != nil {
 				return err
 			}
 		}
 		if c.denies {
-			if err := a.holdsDeny(ctx, tx, actor, c.on); err != nil {
-				return err
-			}
 			c.ds.seal()
-			if err := a.cleared(ctx, tx, c.on, c.ds, DenyPermission(c.on.Type)); err != nil {
+			if err := a.denyAllowed(ctx, tx, actor, c.on, c.ds, labels, &denying[i]); err != nil {
 				return err
 			}
 		}
-		if c.leaves && len(c.grants) == 0 && !c.denies && !c.cleared {
+		if c.leaves && !c.cleared {
 			if err := clearance(c.on, GrantPermission(c.on.Type)); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// reachAuthority reads, on q, the actor's authority on each scope checks reach, in one read: for
+// the grants a change to members amounts to there, and apart for the denies it lifts, as Apply and
+// SetDeny each read their own, the conditions of the grants it holds spending a budget of its own.
+func (a *Authorizer) reachAuthority(ctx context.Context, q DB, actor Subject, checks []*reachCheck) (granting, denying []authority, err error) {
+	var on []Resource
+	var roles []Role
+	for _, c := range checks {
+		if len(c.grants) > 0 {
+			on, roles = append(on, c.on), append(roles, roleIDs(c.grants)...)
+		}
+		if c.denies {
+			on = append(on, c.on)
+		}
+	}
+	aus, err := a.authorities(ctx, q, actor, on, roles)
+	if err != nil {
+		return nil, nil, err
+	}
+	granting, denying = make([]authority, len(checks)), make([]authority, len(checks))
+	for i, c := range checks {
+		if len(c.grants) > 0 {
+			granting[i], aus = aus[0], aus[1:]
+		}
+		if c.denies {
+			denying[i], aus = aus[0], aus[1:]
+		}
+	}
+	return granting, denying, nil
 }
 
 // hostResource is a scope as Config.ResourceOf returns it, and true, or without it, as stored: its
