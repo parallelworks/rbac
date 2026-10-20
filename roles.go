@@ -8,6 +8,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
@@ -243,7 +244,8 @@ func canonical(r RoleDefinition) RoleDefinition {
 //
 // The actor needs DefineRoles on the tenant, not removed by a constraint (a condition on that
 // right reads the tenant as a resource with no attributes), and every permission
-// the role gives there, for each type it is for, as granting it on the tenant would need. Each
+// the role gives there, for each type it is for, as granting it on the tenant for good would
+// need: a definition never ends, so what the actor holds only until a time can't stand in. Each
 // of its GrantableRoles must be a role the actor may grant on the tenant. Replacing a role
 // another custom role lists needs the power to grant it as defined wherever that one lists it.
 // Replacing one so that its grants give something else changes them, so a constraint that stops
@@ -544,6 +546,8 @@ type revalidation struct {
 	scope   Scope
 	binding Binding
 	role    RoleDefinition
+	// eligibility is set on an eligibility's, which a change to members hands on as one.
+	eligibility bool
 }
 
 // revalidated is a revalidation as asked about: the same grant or eligibility, unchanged.
@@ -804,7 +808,8 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 		}
 	}
 	seen := map[string]bool{}
-	if p, ok := a.holdsRole(au, *r, r.ResourceTypes, "", seen); !ok {
+	// A definition never ends, so what the actor holds only until a time can't stand in.
+	if p, ok := a.holdsRole(au, *r, r.ResourceTypes, "", time.Time{}, seen); !ok {
 		reason := cs.refusal("define "+string(r.ID), p, fmt.Sprintf("the actor can't define %s without holding %s here", r.ID, p))
 		return authority{}, cmp.Or(cs.failed(), error(&DeniedError{Permission: p, Scope: scope, Reason: reason}))
 	}
@@ -821,7 +826,7 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 			if !p.changesGrants() || !a.grantableOn(*r, t) {
 				continue
 			}
-			if missing, ok := a.mayGrant(au, au.under(t, ""), t, *r, "", seen); !ok {
+			if missing, ok := a.mayGrant(au, au.under(t, "", time.Time{}), t, *r, "", time.Time{}, seen); !ok {
 				reason := cs.refusal("define "+string(r.ID), missing, fmt.Sprintf("the actor can't define %s, which %s lists, without the power to grant it on a %s", r.ID, id, t))
 				return authority{}, cmp.Or(cs.failed(), error(&DeniedError{Permission: missing, Scope: scope, Reason: reason}))
 			}

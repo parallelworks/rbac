@@ -385,6 +385,11 @@ sequenceDiagram
   `GrantableRoles`, it may grant only those roles, without holding them. Through any other role, it
   may grant a role only if it holds every permission of it, for every type the grant reaches.
   Either way, a limited grant permission can't mint a larger one.
+- **Until when.** What the actor holds only until a time, through an expiring grant, an activation,
+  or a membership or place in a group that ends, it hands on only until then: `authorityOn` reads
+  when each grant's holding ends, in the statement that reads the grants, and a grant may end no
+  later than the latest holding of each permission it hands on. An eligibility, a custom role's
+  definition and a place in a group that gains an eligibility need what they hand on held for good.
 - **Standing.** The host's answers rest on who is a member of what. `stand` fingerprints the
   memberships behind them, and `stillStanding` refuses the change with `ErrConflict` if any changed
   while the change waited for its locks.

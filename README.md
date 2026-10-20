@@ -64,8 +64,15 @@ if err := authz.Authorize(ctx, subject, "cluster:login", cluster); err != nil {
   may grant and revoke only those roles, without holding them; through any other, it may grant a
   role whose every permission it holds, for every type the grant reaches, and revoke any. A
   role's power to change grants counts as part of what it gives, so a limited grant permission
-  can't mint an unlimited one. `Grantable` lists the roles a subject may grant, for an access
-  screen. A grant outlives the actor's own access: put expiries on roles that can't change grants.
+  can't mint an unlimited one. `Grantable` lists the roles a subject may grant, unconditionally and
+  for good, for an access screen.
+- **Until when:** what the actor hands on it holds until the grant ends. What it holds only through
+  grants that end, such as an activation, or through a membership or a place in a group that ends,
+  it grants ending no later than the last of them, and never as an eligibility, a custom role's
+  definition or a place in a group that outlasts it, so access approved for an hour stays an
+  hour's. A grant outlives the actor's power to change grants, though: a power held for an hour
+  grants for good what the actor holds for good, and the roles a role it holds lists, which it
+  needn't hold. Put expiries on roles that list none.
 - **Creators:** nothing is owned. The host gives whoever creates a resource a role on it with
   `Import`, as an actor it names, in the same transaction through `WithTx`.
 
@@ -152,7 +159,8 @@ grants: `Reach.Conditional` names the scopes conditional ones reach, to check on
   activate a role on a scope for up to a maximum duration and no later than the eligibility, the
   activator's membership of the tenant, or its place in the group that makes it eligible ends,
   perhaps only where a condition holds, such as a second factor, and perhaps only once one of its
-  `Approvers` approves. `Activate` gives the activator a grant of its own from
+  `Approvers` approves. Setting one needs what granting the role for good does, so no activation
+  can make its holder eligible on looser terms. `Activate` gives the activator a grant of its own from
   `rbac.SourceActivation`, beside any it holds, with its justification and approver. It holds
   one activation of a role on a scope, recording the request its end rests on: activating again
   until later replaces it, one ending no later changes nothing, and once it has ended, activating
@@ -192,17 +200,18 @@ grants: `Reach.Conditional` names the scopes conditional ones reach, to check on
   so `ChangeMembers`, with `rbac.GroupMembers` on the group and its label, checks a change to its members as the
   changes to access it makes, each as `Apply` or `SetDeny` checks one on its scope. An added member
   gains the grants and eligibilities of the group and the groups it is in, those the same change
-  nests it in too, which the actor must be able to grant it, and `ValidateGrant` is asked about
-  each as the member's (`rbac.ViaMembership`); it approves what the group approves, which the
-  actor must be able to set; and it is exempt from the denies the group is exempt from, as a
-  removed member, or one whose membership is made to end sooner, is from those naming it, which
-  the actor must be able to set. So whoever manages a group that holds, approves and is in no deny
-  changes its members freely, and one holding a role only if they could grant that role
-  themselves. `Config.ResourceOf` gives the package the tenant, which `SetGroup` and `DeleteGroup`
-  check `rbac.ManageGroups` on, and the groups, which `ChangeMembers` checks `rbac.GroupMembers` on,
-  each with its constraints and label, and the containers, label and attributes of the scopes a
-  group's access is on; a host without it declares no labels and resource attributes as none, and
-  for access below the tenant, no containers.
+  nests it in too, which the actor must be able to grant it, until its place ends, and an
+  eligibility for good, and `ValidateGrant` is asked about each as the member's
+  (`rbac.ViaMembership`); it approves what the group approves, which the actor must be able to set;
+  and it is exempt from the denies the group is exempt from, as a removed member, or one whose
+  membership is made to end sooner, is from those naming it, which the actor must be able to set.
+  So whoever manages a group that holds, approves and is in no deny changes its members freely, and
+  one holding a role only if they could grant that role themselves. `Config.ResourceOf` gives the
+  package the tenant, which `SetGroup` and `DeleteGroup` check `rbac.ManageGroups` on, and the
+  groups, which `ChangeMembers` checks `rbac.GroupMembers` on, each with its constraints and label,
+  and the containers, label and attributes of the scopes a group's access is on; a host without it
+  declares no labels and resource attributes as none, and for access below the tenant, no
+  containers.
 - **Privileged roles:** a role the catalog marks `Privileged`, or one that changes access, is
   privileged: it is never granted to the tenant's members, and gives nothing through them, as
   after a catalog change.

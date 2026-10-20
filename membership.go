@@ -964,7 +964,8 @@ func (a *Authorizer) placesBounded(ctx context.Context, tx pgx.Tx, tenant string
 // change to them is checked as the changes to access it makes, each on its scope as Apply and
 // SetDeny check one there. An added member gains the grants and eligibilities of the group and the
 // groups it is in, those the same change nests it in too, which the actor must be able to grant to
-// it, and Config.ValidateGrant is asked about each as the member's (ViaMembership); it approves the
+// it, a grant until the member's place or the grant ends and an eligibility for good, and
+// Config.ValidateGrant is asked about each as the member's (ViaMembership); it approves the
 // activations of the eligibilities those approve, which the actor must be able to set; and it is
 // exempt from the denies those are exempt from, as a removed member is from the denies those name,
 // which the actor must be able to set; a membership made to end sooner is a removal then, checked
@@ -1174,7 +1175,7 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 		if !ok {
 			continue
 		}
-		v := revalidation{scope: e.Scope, binding: e.binding(), role: def}
+		v := revalidation{scope: e.Scope, binding: e.binding(), role: def, eligibility: true}
 		if reached[e.Principal.key()] {
 			r.held = append(r.held, v)
 		}
@@ -1457,15 +1458,19 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 			if err := stale(v); err != nil {
 				return nil, err
 			}
+			b := v.as(m)
+			if v.eligibility {
+				b = handedOn(b)
+			}
 			c := at(v.scope)
-			c.grants = append(c.grants, v.as(m))
+			c.grants = append(c.grants, b)
 		}
 		for _, v := range rc.approvedBy(m.Group) {
 			if err := stale(v); err != nil {
 				return nil, err
 			}
 			c := at(v.scope)
-			c.grants = append(c.grants, v.binding)
+			c.grants = append(c.grants, handedOn(v.binding))
 		}
 		for _, d := range rc.lifted(m.Group, false) {
 			at(d.Scope).denies = true

@@ -16,9 +16,11 @@ import (
 // than hold it standing: just-in-time access. Activating gives the identity that activates a
 // grant of its own, from SourceActivation, until MaxDuration from then at most and no later than
 // the eligibility ends, with its justification as the grant's note; one eligible through a group
-// activates for itself. With Approvers, each activation needs one of them to approve it. An
-// activated role that changes grants lets its holder make lasting grants, to itself too, as any
-// time-limited one does: make eligible roles that can't change grants.
+// activates for itself. With Approvers, each activation needs one of them to approve it. What an
+// activation gives, its holder can't hand on past its end, nor as an eligibility; but an activated
+// power to change grants grants for good what its holder holds for good, and the roles a role it
+// activated lists, as any power held for a while does (Authorizer.Apply): make eligible roles that
+// list none.
 type Eligibility struct {
 	Scope     Scope
 	Role      Role
@@ -44,6 +46,14 @@ type Eligibility struct {
 
 func (e Eligibility) binding() Binding {
 	return Binding{Role: e.Role, Principal: e.Principal, ExpiresAt: e.ExpiresAt, Note: e.Note}
+}
+
+// handedOn is an eligibility's binding as an actor setting it, or making it a member's, hands it
+// on: the grant for good activating it can become, on terms the actor sets, so what the actor
+// holds only until a time, as an activation, makes no one eligible for it.
+func handedOn(b Binding) Binding {
+	b.ExpiresAt = time.Time{}
+	return b
 }
 
 // checkEligibility returns why an eligibility is malformed beyond what checkBinding finds.
@@ -79,8 +89,10 @@ func (a *Authorizer) checkEligibility(e Eligibility) error {
 }
 
 // SetEligibility makes a principal eligible to activate a role on a scope, on, or changes how, as
-// actor, who needs what granting the role there unconditionally would: an eligibility is a grant
-// to come. The groups it names, eligible or approving, and a group it is on, are the tenant's.
+// actor, who needs what granting the role there unconditionally and for good would: an
+// eligibility is a grant to come, on terms the actor sets, so what the actor holds only until a
+// time, as an activation, it can't make anyone eligible for. The groups it names, eligible or
+// approving, and a group it is on, are the tenant's.
 func (a *Authorizer) SetEligibility(ctx context.Context, actor Subject, on Resource, e Eligibility) (err error) {
 	defer a.refused(ctx, &err, on.Tenant, actor.Principal, "SetEligibility")
 	if err := a.check(on); err != nil {

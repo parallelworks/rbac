@@ -86,6 +86,180 @@ func TestAnActivationLastsNoLongerThanThePlaceThatMakesItsSubjectEligible(t *tes
 	}
 }
 
+func TestAnActivationIsHandedOnNoLongerThanItLasts(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), granter) })
+	ctx := t.Context()
+	// u changes grants on the cluster for good, and holds sudo for an hour, as boss approved.
+	h.seed(t, grant(cluster.Scope(), "cluster.granter", rbac.User, "u"))
+	u, boss, v := h.as(t, "u"), h.as(t, "boss"), h.as(t, "v")
+	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, rbac.Eligibility{
+		Role: "cluster.sudo", Principal: u.Principal,
+		MaxDuration: time.Hour, Approvers: []rbac.Principal{boss.Principal},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	activated, err := h.authz.Activate(ctx, u, cluster, rbac.Activation{Role: "cluster.sudo", Duration: time.Hour, Justification: "INC-1", Approver: boss})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sudo := func(p rbac.Principal, until time.Time) rbac.Change {
+		return rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: p, ExpiresAt: until}}}
+	}
+	for name, until := range map[string]time.Time{"for good": {}, "past its end": activated.ExpiresAt.Add(time.Microsecond)} {
+		for _, to := range []rbac.Subject{u, v} {
+			if err := h.authz.Apply(ctx, u, cluster, sudo(to.Principal, until)); !errors.Is(err, rbac.ErrDenied) {
+				t.Errorf("an activation handed on to %s %s: %v", to.Principal.ID, name, err)
+			}
+		}
+	}
+	// An eligibility is activated on terms its setter chooses, such as no approver, so even one
+	// ending with the activation would outlast what boss approved.
+	for _, until := range []time.Time{{}, activated.ExpiresAt} {
+		e := rbac.Eligibility{Role: "cluster.sudo", Principal: u.Principal, MaxDuration: time.Hour, ExpiresAt: until}
+		if err := h.authz.SetEligibility(ctx, u, cluster, e); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("an activation handed on as an eligibility until %v: %v", until, err)
+		}
+	}
+	if roles, err := h.authz.Grantable(ctx, u, cluster); err != nil || slices.ContainsFunc(roles, func(r rbac.RoleDefinition) bool { return r.ID == "cluster.sudo" }) {
+		t.Errorf("Grantable offers what u may grant only until its activation ends: %v, %v", roles, err)
+	}
+	if err := h.authz.Apply(ctx, u, cluster, sudo(v.Principal, activated.ExpiresAt)); err != nil {
+		t.Fatalf("an activation handed on until it ends: %v", err)
+	}
+	h.now = activated.ExpiresAt
+	if allowed(t, h, u, root, cluster) || allowed(t, h, v, root, cluster) {
+		t.Fatal("what was handed on outlived the activation")
+	}
+}
+
+func TestAnActivatedPowerToChangeGrantsIsHandedOnNoLongerThanItLasts(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), granter) })
+	ctx := t.Context()
+	// u holds sudo for good, and activates the power to change grants on the cluster for an hour.
+	h.seed(t, grant(cluster.Scope(), "cluster.sudo", rbac.User, "u"))
+	u := h.as(t, "u")
+	h.as(t, "v")
+	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.granter", Principal: u.Principal, MaxDuration: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	activated, err := h.authz.Activate(ctx, u, cluster, rbac.Activation{Role: "cluster.granter", Duration: time.Hour, Justification: "INC-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	to := func(role rbac.Role, until time.Time) rbac.Change {
+		return rbac.Change{Grant: []rbac.Binding{{Role: role, Principal: identity("v"), ExpiresAt: until}}}
+	}
+	if err := h.authz.Apply(ctx, u, cluster, to("cluster.admin", time.Time{})); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("the power activated for an hour handed on for good: %v", err)
+	}
+	if err := h.authz.Apply(ctx, u, cluster, to("cluster.admin", activated.ExpiresAt)); err != nil {
+		t.Errorf("handed on until it ends: %v", err)
+	}
+	// What u holds for good, it grants for good through it.
+	if err := h.authz.Apply(ctx, u, cluster, to("cluster.sudo", time.Time{})); err != nil {
+		t.Errorf("what its holder holds for good granted for good through it: %v", err)
+	}
+}
+
+func TestWhatEndsIsHandedOnNoLongerThanItsLatestHolding(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), granter) })
+	ctx := t.Context()
+	hour, later := h.now.Add(time.Hour), h.now.Add(3*time.Hour)
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "ops"}, {ID: "night"}, {ID: "inner"}, {ID: "outer"}}); err != nil {
+		t.Fatal(err)
+	}
+	h.join(t, "g", "m", "n", "p", "v", "x")
+	if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("m"), ExpiresAt: hour}}); err != nil {
+		t.Fatal(err)
+	}
+	expiring := grant(cluster.Scope(), "cluster.sudo", rbac.User, "g")
+	expiring.ExpiresAt = hour
+	// g holds sudo until a time; m holds it for good, but is a member until then; n is in a group
+	// holding it until then; p is in a group in one holding it until then; and v is in two groups
+	// holding it, its place in one ending later.
+	h.seed(t, expiring, grant(cluster.Scope(), "cluster.sudo", rbac.User, "m"), grant(cluster.Scope(), "cluster.sudo", rbac.Group, "ops"),
+		grant(cluster.Scope(), "cluster.sudo", rbac.Group, "night"), grant(cluster.Scope(), "cluster.sudo", rbac.Group, "outer"))
+	for _, id := range []string{"g", "m", "n", "p", "v"} {
+		h.seed(t, grant(cluster.Scope(), "cluster.granter", rbac.User, id))
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{
+		{Group: "ops", Principal: identity("n"), ExpiresAt: hour},
+		{Group: "inner", Principal: identity("p")},
+		{Group: "outer", Principal: groupOf("inner"), ExpiresAt: hour},
+		{Group: "ops", Principal: identity("v"), ExpiresAt: hour},
+		{Group: "night", Principal: identity("v"), ExpiresAt: later},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sudo := func(until time.Time) rbac.Change {
+		return rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: identity("x"), ExpiresAt: until}}}
+	}
+	for id, ends := range map[string]time.Time{"g": hour, "m": hour, "n": hour, "p": hour, "v": later} {
+		actor := rbac.Subject{Principal: identity(id)}
+		for name, until := range map[string]time.Time{"for good": {}, "past its end": ends.Add(time.Second)} {
+			if err := h.authz.Apply(ctx, actor, cluster, sudo(until)); !errors.Is(err, rbac.ErrDenied) {
+				t.Errorf("%s handing sudo on %s: %v", id, name, err)
+			}
+		}
+		if err := h.authz.Apply(ctx, actor, cluster, sudo(ends)); err != nil {
+			t.Errorf("%s handing sudo on until its holding ends: %v", id, err)
+		}
+	}
+}
+
+func TestDefiningARoleNeedsWhatItGivesHeldForGood(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	tenant := rbac.TenantRoot("t1")
+	expiring := grant(tenant, "cluster.sudo", rbac.User, "definer")
+	expiring.ExpiresAt = h.now.Add(time.Hour)
+	h.seed(t, grant(tenant, "tenant.roles", rbac.User, "definer"), expiring)
+	definer := h.as(t, "definer")
+	r := rbac.RoleDefinition{ID: "custom.root", Permissions: []rbac.Permission{root}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(ctx, definer, "t1", r); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("defining a role from what the definer holds for an hour: %v", err)
+	}
+	h.seed(t, grant(tenant, "cluster.sudo", rbac.User, "definer"))
+	if err := h.authz.SetRole(ctx, definer, "t1", r); err != nil {
+		t.Fatalf("from what it holds for good: %v", err)
+	}
+}
+
+func TestChangingMembersHandsOnNoLongerThanTheActorHolds(t *testing.T) {
+	h := grouped(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), granter) })
+	ctx := t.Context()
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "ops"}, {ID: "oncall"}}); err != nil {
+		t.Fatal(err)
+	}
+	// lead changes ops' and oncall's members, and grants on the cluster, for good, but holds sudo,
+	// which ops holds and oncall may activate, only for an hour.
+	hour := h.now.Add(time.Hour)
+	expiring := grant(cluster.Scope(), "cluster.sudo", rbac.User, "lead")
+	expiring.ExpiresAt = hour
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "lead"), grant(cluster.Scope(), "cluster.granter", rbac.User, "lead"), expiring,
+		grant(cluster.Scope(), "cluster.sudo", rbac.Group, "ops"))
+	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: groupOf("oncall"), MaxDuration: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	h.join(t, "u")
+	lead := h.as(t, "lead")
+	in := func(group string, until time.Time) []rbac.Member {
+		return []rbac.Member{{Group: group, Principal: identity("u"), ExpiresAt: until}}
+	}
+	for name, add := range map[string][]rbac.Member{
+		"for good":                     in("ops", time.Time{}),
+		"past the holding's end":       in("ops", hour.Add(time.Second)),
+		"eligible, ending before then": in("oncall", hour.Add(-time.Minute)),
+	} {
+		if err := h.authz.ChangeMembers(ctx, lead, "t1", add, nil); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("a place in a group handing sudo on %s: %v", name, err)
+		}
+	}
+	if err := h.authz.ChangeMembers(ctx, lead, "t1", in("ops", hour), nil); err != nil {
+		t.Fatalf("a place ending with the holding: %v", err)
+	}
+}
+
 // meanwhileAsked is a harness whose host runs meanwhile, once, the first time it is asked about a
 // grant made as via, as another change committing between a change's checks and its transaction.
 func meanwhileAsked(t *testing.T, via rbac.Via, meanwhile *func(context.Context) error) *harness {

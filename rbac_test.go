@@ -1128,21 +1128,46 @@ func TestDefiningARoleListingOneRedefinedMeanwhileConflicts(t *testing.T) {
 	}
 }
 
+// A grant outlives the actor's power to change grants, but what it hands on the actor holds until
+// the grant ends; a role a role it holds lists, it grants without holding, so for good.
 func TestAGrantOutlivesTheActorsAccess(t *testing.T) {
-	h := setup(t)
-	temp := grant(rbac.Scope{Type: "workspace", ID: "w1"}, "workspace.admin", rbac.User, "temp")
-	temp.ExpiresAt = h.now.Add(time.Hour)
-	access := grant(rbac.Scope{Type: "org", ID: "o1"}, "cluster.login", rbac.User, "temp")
-	access.ExpiresAt = temp.ExpiresAt
-	h.seed(t, temp, access)
-	h.groups(t, "friends")
-	forever := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.Group, ID: "friends"}}
-	if err := h.authz.Apply(t.Context(), h.as(t, "temp"), workspace, rbac.Change{Grant: []rbac.Binding{forever}}); err != nil {
-		t.Fatalf("access for an hour granting for good: %v", err)
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), rbac.RoleDefinition{
+			ID: "workspace.lister", Permissions: []rbac.Permission{"workspace:grant"},
+			ResourceTypes: []string{"workspace"}, GrantableRoles: []rbac.Role{"cluster.login"},
+		})
+	})
+	ctx := t.Context()
+	hour := h.now.Add(time.Hour)
+	expiring := func(g rbac.Grant) rbac.Grant { g.ExpiresAt = hour; return g }
+	org := rbac.Scope{Type: "org", ID: "o1"}
+	// temp changes grants on the workspace for an hour, and logs in to its clusters for good; brief
+	// changes them for good, and logs in for an hour; lister, for an hour, may grant login there.
+	h.seed(t, expiring(grant(workspace.Scope(), "workspace.admin", rbac.User, "temp")), grant(org, "cluster.login", rbac.User, "temp"),
+		grant(workspace.Scope(), "workspace.admin", rbac.User, "brief"), expiring(grant(org, "cluster.login", rbac.User, "brief")),
+		expiring(grant(workspace.Scope(), "workspace.lister", rbac.User, "lister")))
+	h.groups(t, "friends", "others", "listed")
+	logins := func(group string, until time.Time) rbac.Change {
+		return rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: groupOf(group), ExpiresAt: until}}}
+	}
+	if err := h.authz.Apply(ctx, h.as(t, "temp"), workspace, logins("friends", time.Time{})); err != nil {
+		t.Fatalf("a power for an hour granting for good what its holder holds for good: %v", err)
+	}
+	if err := h.authz.Apply(ctx, h.as(t, "brief"), workspace, logins("others", time.Time{})); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("access for an hour granted for good: %v", err)
+	}
+	if err := h.authz.Apply(ctx, h.as(t, "brief"), workspace, logins("others", hour)); err != nil {
+		t.Fatalf("access for an hour granted for the hour: %v", err)
+	}
+	if err := h.authz.Apply(ctx, h.as(t, "lister"), workspace, logins("listed", time.Time{})); err != nil {
+		t.Fatalf("a listed role granted for good by a power for an hour: %v", err)
 	}
 	h.now = h.now.Add(2 * time.Hour)
-	if allowed(t, h, h.as(t, "temp"), login, cluster) || !allowed(t, h, h.as(t, "f", "friends"), login, cluster) {
-		t.Fatal("the grant should outlive the access of whoever made it")
+	if !allowed(t, h, h.as(t, "f", "friends"), login, cluster) || !allowed(t, h, h.as(t, "l", "listed"), login, cluster) {
+		t.Fatal("a grant should outlive the power to change grants of whoever made it")
+	}
+	if allowed(t, h, h.as(t, "o", "others"), login, cluster) {
+		t.Fatal("a grant should end with the access it handed on")
 	}
 }
 
