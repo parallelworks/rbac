@@ -516,6 +516,52 @@ func TestAChangeCarriesBoundedConditions(t *testing.T) {
 	}
 }
 
+// The most conditions a change carries, each distinct and as costly to compile as any, take about
+// as long to check as compiling sixteen of them alone, before the host is asked. And none is kept
+// compiled: the cache is the checks', and one change's conditions would otherwise evict what they
+// read, though no check may read them.
+func TestAChangesConditionsCompileBriefly(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Attributes = rbac.Attributes{Resource: map[string]rbac.AttributeType{"env": rbac.AttrString}}
+	})
+	ctx := t.Context()
+	n := 0
+	costly := func(bytes int) []rbac.Binding {
+		var bs []rbac.Binding
+		for total := 0; ; n++ {
+			s := fmt.Sprintf(`[%d,2,3] == [1,2,3]`, n)
+			for len(s)+len(` && [1,2,3] == [1,2,3]`) <= rbac.MaxExpression {
+				s += ` && [1,2,3] == [1,2,3]`
+			}
+			if total += len(s); total > bytes {
+				return bs
+			}
+			bs = append(bs, rbac.Binding{Role: "cluster.login", Principal: identity(fmt.Sprintf("u%d", n)), Condition: rbac.Condition{Expression: s}})
+		}
+	}
+	took := func(bs []rbac.Binding) time.Duration {
+		t.Helper()
+		start := time.Now()
+		if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: bs}); err != nil {
+			t.Fatal(err)
+		}
+		return time.Since(start)
+	}
+	one := min(took(costly(rbac.MaxExpression)), took(costly(rbac.MaxExpression)))
+	most := costly(rbac.MaxConditionBytes)
+	before := rbac.Compiled(h.authz)
+	if all := min(took(most), took(costly(rbac.MaxConditionBytes))); all > 24*one {
+		t.Errorf("a change of %d conditions took %v, one alone %v", len(most), all, one)
+	}
+	if after := rbac.Compiled(h.authz); after != before {
+		t.Errorf("changes kept %d conditions compiled that no check has read", after-before)
+	}
+	// u1's holds; u0's doesn't.
+	if allowed(t, h, h.as(t, "u0"), login, cluster) || !allowed(t, h, h.as(t, "u1"), login, cluster) || rbac.Compiled(h.authz) != before+2 {
+		t.Error("checks keep what they compile")
+	}
+}
+
 // An actor holding its power under a condition hands it on under that condition, which a change
 // parses for whether it reads the subject once, however many bindings and permissions carry it:
 // parsing one takes milliseconds, and the change decides again in its transaction.

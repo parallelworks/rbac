@@ -612,10 +612,9 @@ const (
 	MaxNote        = 2048
 	MaxExpression  = 2048
 	// MaxConditionBytes is how many bytes of conditions, each counted once, one change carries:
-	// compiling one takes milliseconds, before the host is asked and outside any check's budget,
-	// and a change of many distinct ones would otherwise spend seconds and fill the cache of
-	// compiled conditions every check reads.
-	MaxConditionBytes = 128 << 10
+	// compiling one takes up to ten milliseconds for each kilobyte, before the host is asked and
+	// outside any check's budget, so a change of many distinct ones would otherwise spend seconds.
+	MaxConditionBytes = 32 << 10
 )
 
 // DeniedError is a refusal, with why. Its message names only the permission, so a host that

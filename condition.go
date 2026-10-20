@@ -132,7 +132,8 @@ type conditions struct {
 	typed    *cel.Env
 	mu       sync.RWMutex
 	programs map[string]program
-	cached   int
+	// size is the length of the expressions programs holds.
+	size int
 }
 
 // program is a condition compiled, and why it doesn't check against the attributes declared now,
@@ -164,28 +165,59 @@ func newConditions(attrs Attributes) (*conditions, error) {
 }
 
 // check returns why an expression can't be stored as a condition: it doesn't compile, or reads
-// an attribute it doesn't declare, or as another type.
+// an attribute it doesn't declare, or as another type. It caches no program it compiles: a change
+// checks each of its conditions once, keeping what it found, and one change's conditions would
+// otherwise evict the programs checks read, though no check may read them.
 func (c *conditions) check(expr string) error {
-	prg, err := c.compile(expr)
-	if err != nil {
-		return err
+	prg, ok := c.cached(expr)
+	if !ok {
+		var err error
+		if prg, err = c.build(expr); err != nil {
+			return err
+		}
 	}
 	return prg.typed
 }
 
 var errCondition = errors.New("rbac: condition")
 
-// compile returns an expression's program, or why it isn't a condition.
-func (c *conditions) compile(expr string) (program, error) {
+// cached returns the program checks keep for expr, if they keep one.
+func (c *conditions) cached(expr string) (program, bool) {
 	c.mu.RLock()
+	defer c.mu.RUnlock()
 	prg, ok := c.programs[expr]
-	c.mu.RUnlock()
-	if ok {
-		return prg, nil
-	}
-	return c.build(expr)
+	return prg, ok
 }
 
+// compile returns an expression's program, or why it isn't a condition, and keeps the program.
+func (c *conditions) compile(expr string) (program, error) {
+	if prg, ok := c.cached(expr); ok {
+		return prg, nil
+	}
+	prg, err := c.build(expr)
+	if err != nil {
+		return program{}, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.programs[expr]; ok {
+		return prg, nil
+	}
+	// Bounded: conditions are data, so a tenant could store many. Those evicted are picked at
+	// random, so a tenant cycling through new conditions can't evict every other tenant's at once.
+	for k := range c.programs {
+		if c.size+len(expr) <= maxCached {
+			break
+		}
+		delete(c.programs, k)
+		c.size -= len(k)
+	}
+	c.programs[expr] = prg
+	c.size += len(expr)
+	return prg, nil
+}
+
+// build compiles an expression, or returns why it isn't a condition.
 func (c *conditions) build(expr string) (program, error) {
 	if len(expr) > MaxExpression {
 		return program{}, fmt.Errorf("%w: longer than %d bytes", errCondition, MaxExpression)
@@ -206,24 +238,7 @@ func (c *conditions) build(expr string) (program, error) {
 	if err != nil {
 		return program{}, fmt.Errorf("%w: %w", errCondition, err)
 	}
-	prg := program{Program: run, typed: c.typeCheck(expr)}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.programs[expr]; ok {
-		return prg, nil
-	}
-	// Bounded: conditions are data, so a tenant could store many. Those evicted are picked at
-	// random, so a tenant cycling through new conditions can't evict every other tenant's at once.
-	for k := range c.programs {
-		if c.cached+len(expr) <= maxCached {
-			break
-		}
-		delete(c.programs, k)
-		c.cached -= len(k)
-	}
-	c.programs[expr] = prg
-	c.cached += len(expr)
-	return prg, nil
+	return program{Program: run, typed: c.typeCheck(expr)}, nil
 }
 
 // typeCheck returns why expr doesn't check against the declared attributes: it reads one they

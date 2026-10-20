@@ -604,7 +604,7 @@ row a few lookups among them however many there are.
 | `MaxGroupDepth` | 8 | How deeply groups nest. |
 | `MaxPlacesInGroup` | 20 | Places in force of one principal in one group, each from another source. Those from each source the host owns count apart. |
 | `MaxExpression` | 2,048 bytes | A condition's or requirement's expression. Its cost is bounded too. |
-| `MaxConditionBytes` | 128 KiB | The conditions one `Apply` or `Import` carries, each distinct one counted once. |
+| `MaxConditionBytes` | 32 KiB | The conditions one `Apply` or `Import` carries, each distinct one counted once. |
 | `MaxName`, `MaxDescription`, `MaxNote` | 128, 2,048, 2,048 characters | Names, titles and group ids, descriptions, and notes and justifications. |
 | `MaxRequest` | 256 characters | A request id in `Audit`. |
 | `MaxHistory`, `MaxPrune` | 10,000 each | Records read by one `History` call, and deleted by one prune. |
