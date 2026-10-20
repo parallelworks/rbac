@@ -147,12 +147,23 @@ reach, to check one by one.
   request's attributes (`Subject.Attributes`, `Resource.Attributes`, `rbac.WithRequest`), the time
   and the action. It gives its role only where the expression holds; one that fails is false.
   `Config.Attributes` declares the attributes and their types, so a condition reading one
-  misnamed, or as another type, is refused when stored. Cost is bounded per condition and per
-  check, and a check evaluates the cheapest first, so what it decides doesn't rest on ids; a
-  scope's conditional denies are bounded together, so a check always evaluates them. To hand a
-  permission on, the actor holds it unconditionally or under the same condition, one that doesn't
-  read the subject: that one decides for each holder, so the actor's holding says nothing of
-  another's.
+  misnamed, or as another type, is refused when stored, and one stored under other declarations
+  fails where it no longer passes them. Each condition runs within the most evaluating it can
+  cost, which its literals and types bound: little for comparing what a request passes with
+  literals, and all a condition may for reading the size of, or looping over, a list the request
+  passes. Cost is bounded per check too, for each scope on its path, and the conditions a check
+  reads together are bounded where they are stored: an identity's grants' on a scope, those of a
+  scope's grants to groups, the tenant's members and the public, each the tenant's and those from
+  each source the host owns apart, a scope's denies', and the requirements of groups'
+  eligibilities for a role on a scope. Each holds hundreds of comparisons with literals, or three
+  of the longest conditions that read a list or loop, and a change adding a condition past one is
+  refused as invalid. So a check evaluates every condition it reads, and a grant made beside
+  another, as by someone who can't revoke it, never changes what that one decides. A change adding
+  no condition isn't refused, so what was stored past a bound before there were bounds can be
+  rewritten in place, as by a restore over the rows still stored, though not restored where they
+  are gone, and a check may not reach all of it: it evaluates the cheapest first within its budget. To hand a permission on, the actor holds it unconditionally or
+  under the same condition, one that doesn't read the subject: that one decides for each holder,
+  so the actor's holding says nothing of another's.
 - **Deny policies:** `SetDeny` puts a deny on a scope: under it, it removes permissions
   (`type:verb`, or `type:*` for a type's every one) from the principals it names, those it exempts
   aside, whatever their grants give. It names and exempts principals a grant could name, so not

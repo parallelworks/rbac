@@ -3,6 +3,8 @@ package rbac
 import (
 	"testing"
 	"time"
+
+	"cel.dev/cel-go/cel"
 )
 
 // SetSavepointEnd bounds a savepoint's release or rollback by d until t ends.
@@ -67,3 +69,62 @@ func SetDecidingGrants(t *testing.T, f func() func()) {
 
 // StandSQL is the statement a change reads the standing of its principals with.
 var StandSQL = standSQL
+
+// DeepCopy is the copy of attributes each hook is given.
+func DeepCopy(attributes map[string]any) map[string]any { return deepCopy(attributes) }
+
+// Compiled is how many conditions a keeps compiled for checks.
+func Compiled(a *Authorizer) int {
+	a.conds.mu.RLock()
+	defer a.conds.mu.RUnlock()
+	return len(a.conds.programs)
+}
+
+// Limits is how many conditions a keeps the limit of, the most evaluating each can cost.
+func Limits(a *Authorizer) int {
+	a.conds.mu.RLock()
+	defer a.conds.mu.RUnlock()
+	return len(a.conds.limits)
+}
+
+// CountEvaluations counts the conditions evaluated until t ends.
+func CountEvaluations(t *testing.T) *int {
+	t.Helper()
+	old, n := evaluating, new(int)
+	evaluating = func() { *n++ }
+	t.Cleanup(func() { evaluating = old })
+	return n
+}
+
+// ConditionCost is the most evaluating expr can cost, which a check runs it within, and what
+// evaluating it on a request with attributes, which the resource carries too, costs, up to
+// maxCost.
+func ConditionCost(t *testing.T, expr string, attributes map[string]any) (limit, actual uint64) {
+	t.Helper()
+	c, err := newConditions(Attributes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prg, err := c.build(expr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked, iss := c.env.Compile(expr)
+	if iss.Err() != nil {
+		t.Fatal(iss.Err())
+	}
+	patterns, err := checkPatterns(checked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlimited, err := c.env.Program(checked, cel.CostLimit(maxCost), cel.CostTracking(costs{patterns}),
+		cel.OptimizeRegex(matching(patterns)), cel.CustomDecorator(bounded))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Authorizer{cfg: Config{Now: time.Now}, conds: c}
+	vars := a.vars(WithRequest(t.Context(), attributes), Subject{Principal: Principal{Kind: User, ID: "u"}},
+		"cluster:login", Resource{Tenant: "t", Type: "cluster", ID: "c", Attributes: attributes})
+	_, details, _ := unlimited.Eval(vars)
+	return prg.limit, *details.ActualCost()
+}

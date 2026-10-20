@@ -67,8 +67,10 @@ func (e *InvalidError) Unwrap() error { return e.Err }
 // holds lists, to the actor too. Time-limit roles that list none.
 //
 // Bindings are checked only once the actor may make the change, so a refused actor learns
-// nothing about principals. Every invalid binding is reported at once, joined; an error from
-// Config.ValidateGrant that isn't ErrInvalid fails the change as it is. Constraints and
+// nothing about principals. A conditional grant that leaves the conditions a check reads together
+// on the scope, an identity's grants' or those of the grants that reach many, costing more than it
+// may spend on them is invalid (Condition). Every invalid binding is reported at once, joined; an
+// error from Config.ValidateGrant that isn't ErrInvalid fails the change as it is. Constraints and
 // Config.ValidateGrant run before the transaction, on what the Authorizer runs on;
 // Config.OnChange runs in it with the grants that changed.
 func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Change) (err error) {
@@ -96,6 +98,13 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 		}
 	}
 	return a.change(ctx, actor, on, "Apply", ViaApply, grants, revokes, nil, nil, func(tx pgx.Tx) (ChangeEvent, error) {
+		// Read before the change's revokes too, so one moving a condition from a grant it revokes to
+		// one it grants adds none.
+		stored := scopeGrants(scope, grants)
+		before, err := a.conditionsBefore(ctx, tx, on.Tenant, stored)
+		if err != nil {
+			return ChangeEvent{}, err
+		}
 		revoked, err := a.revoke(ctx, tx, on.Tenant, scope, revokes, grants)
 		if err != nil {
 			return ChangeEvent{}, err
@@ -111,7 +120,7 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 		if err := errors.Join(owned...); err != nil {
 			return ChangeEvent{}, err
 		}
-		granted, err := a.upsert(ctx, tx, on.Tenant, actor.Principal, scopeGrants(scope, grants))
+		granted, err := a.upsert(ctx, tx, on.Tenant, actor.Principal, stored, before)
 		return ChangeEvent{Granted: granted, Revoked: revoked}, err
 	})
 }
@@ -458,8 +467,9 @@ func readCommitted(what, level string) error {
 // seeding, restores and the host's own grants: give whoever creates a resource or container a
 // role on it, in the same transaction through WithTx. actor is who the grants are recorded as
 // made by, such as the creator or the host's own service account. Each grant is still
-// validated, and Config.ValidateGrant asked about it, via ViaImport. Grants from
-// SourceActivation are refused, as only Activate makes them: a restore leaves them out.
+// validated, and Config.ValidateGrant asked about it, via ViaImport, and their conditions are
+// bounded as Apply bounds them. Grants from SourceActivation are refused, as only Activate makes
+// them: a restore leaves them out.
 func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string, grants []Grant) (err error) {
 	defer a.refused(ctx, &err, tenant, actor, "Import")
 	if !validID(tenant) {
@@ -553,7 +563,11 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 		if err := redefinedSince(roles, now, roleIDs(grants)); err != nil {
 			return ChangeEvent{}, err
 		}
-		granted, err := a.upsert(ctx, tx, tenant, actor, grants)
+		before, err := a.conditionsBefore(ctx, tx, tenant, grants)
+		if err != nil {
+			return ChangeEvent{}, err
+		}
+		granted, err := a.upsert(ctx, tx, tenant, actor, grants, before)
 		return ChangeEvent{Granted: granted}, err
 	})
 }
@@ -1037,7 +1051,7 @@ func orDenied(denied, more func(Permission) bool) func(Permission) bool {
 // authorityOf is the authority of held grants, their conditions read, under the denies on the
 // path.
 func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource, held []holding, ds []denial, b book) authority {
-	vars, spend := a.vars(ctx, actor, "", on), newBudget()
+	vars := a.vars(ctx, actor, "", on)
 	// The cheapest conditions first, as callers evaluate them in this order, so what a budget run
 	// out decides doesn't rest on ids.
 	held = slices.Clone(held)
@@ -1046,6 +1060,14 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 		v := maps.Clone(vars)
 		v["action"] = string(action)
 		return v
+	}
+	// Each action on a budget of its own, as a check of it would be.
+	spends := map[Permission]*budget{}
+	spend := func(action Permission) *budget {
+		if spends[action] == nil {
+			spends[action] = a.grantBudget(on.path())
+		}
+		return spends[action]
 	}
 	deny := func(vars map[string]any) func(Permission) bool {
 		denied := map[Permission]bool{}
@@ -1077,7 +1099,7 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 	return authority{
 		held: held, roles: b,
 		allows: func(h holding, action Permission) bool {
-			return !h.conditional || a.conds.holds(spend, h.Condition.Expression, with(vars, action))
+			return !h.conditional || a.conds.holds(spend(action), h.Condition.Expression, with(vars, action))
 		},
 		denied: denied, handsOn: handsOn, subjects: subjects{},
 	}
@@ -1585,8 +1607,11 @@ func (a *Authorizer) report(ctx context.Context, tx pgx.Tx, e ChangeEvent) error
 
 // upsert stores grants in one statement, sorted so concurrent changes lock rows in the same
 // order, and returns those it added or whose note it changed. Of grants that are one grant it
-// stores the last, since one statement can't change a row twice.
-func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, grants []Grant) ([]Grant, error) {
+// stores the last, since one statement can't change a row twice. before is conditionsBefore the
+// change.
+func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, grants []Grant,
+	before map[conditionBucket]map[string]int,
+) ([]Grant, error) {
 	if len(grants) == 0 {
 		return nil, nil
 	}
@@ -1638,8 +1663,148 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 	if err := a.bounded(ctx, tx, tenant, granted); err != nil {
 		return nil, err
 	}
+	if err := a.conditionsBounded(ctx, tx, tenant, a.bucketsOf(grants), before); err != nil {
+		return nil, err
+	}
 	return granted, nil
 }
+
+// conditionsBefore is conditionsIn the buckets of grants a change stores, read under its locks
+// before it writes, so it can store again what was stored past the bound before there were bounds.
+func (a *Authorizer) conditionsBefore(ctx context.Context, tx pgx.Tx, tenant string, grants []Grant) (map[conditionBucket]map[string]int, error) {
+	return a.conditionsIn(ctx, tx, tenant, a.bucketsOf(grants))
+}
+
+// conditionBucket is conditional grants a check reads together on a scope: an identity's own, or,
+// with principal "", those to groups, the tenant's members and the public, which reach many, of
+// any role; those from each source the host owns (Config.Sources) apart from the rest, as bounded
+// counts them, so neither the host nor a tenant's admins can fill a bucket the other stores in.
+type conditionBucket struct{ scope, principal, source string }
+
+// bucketsOf are the buckets of the conditional grants among grants.
+func (a *Authorizer) bucketsOf(grants []Grant) []conditionBucket {
+	var buckets []conditionBucket
+	for _, g := range grants {
+		b := conditionBucket{g.Scope.Key(), g.Principal.key(), ""}
+		if reachesMany(g.Principal) {
+			b.principal = ""
+		}
+		if a.owned[g.Source] {
+			b.source = g.Source
+		}
+		if g.Condition.Expression != "" && !slices.Contains(buckets, b) {
+			buckets = append(buckets, b)
+		}
+	}
+	return buckets
+}
+
+// conditionsIn reads on tx how many times a check may evaluate each condition of the grants in
+// force in each bucket: once, or for one that reads the action on the tenant, once for each label
+// value its grants give, as a read of label values decides each apart.
+func (a *Authorizer) conditionsIn(ctx context.Context, tx pgx.Tx, tenant string, buckets []conditionBucket) (map[conditionBucket]map[string]int, error) {
+	if len(buckets) == 0 {
+		return nil, nil
+	}
+	scopes, principals, sources := make([]string, len(buckets)), make([]string, len(buckets)), make([]string, len(buckets))
+	for i, b := range buckets {
+		scopes[i], principals[i], sources[i] = b.scope, b.principal, b.source
+	}
+	// The grants that reach many by their keys, the groups' a range, each of which the scope's index
+	// seeks: '' is no principal's key.
+	rows, err := tx.Query(ctx, `
+		SELECT b.scope, b.principal, b.source, g.condition, array_agg(DISTINCT g.role)
+		FROM unnest($2::text[], $3::text[], $4::text[]) AS b(scope, principal, source)
+		CROSS JOIN LATERAL (
+		  SELECT condition, role, source FROM rbac_grants WHERE scope = b.scope AND tenant = $1 AND principal = b.principal
+		    AND conditional AND (expires_at IS NULL OR expires_at > $5)
+		  UNION ALL
+		  SELECT condition, role, source FROM rbac_grants WHERE b.principal = '' AND scope = b.scope AND tenant = $1
+		    AND principal >= 'group:' AND principal < 'group;' AND conditional AND (expires_at IS NULL OR expires_at > $5)
+		  UNION ALL
+		  SELECT condition, role, source FROM rbac_grants WHERE b.principal = '' AND scope = b.scope AND tenant = $1
+		    AND principal = ANY(ARRAY[$6, $7]::text[]) AND conditional AND (expires_at IS NULL OR expires_at > $5)
+		) g
+		WHERE CASE WHEN g.source = ANY($8::text[]) THEN g.source ELSE '' END = b.source
+		GROUP BY b.scope, b.principal, b.source, g.condition`,
+		tenant, scopes, principals, sources, a.cfg.Now(), TenantMembers(tenant).key(), publicKey, slices.Sorted(maps.Keys(a.owned)))
+	if err != nil {
+		return nil, err
+	}
+	carried := map[conditionBucket]map[string][]Role{}
+	var ids []Role
+	var b conditionBucket
+	var condition string
+	var roles []Role
+	if _, err := pgx.ForEachRow(rows, []any{&b.scope, &b.principal, &b.source, &condition, &roles}, func() error {
+		if carried[b] == nil {
+			carried[b] = map[string][]Role{}
+		}
+		carried[b][condition] = roles
+		ids = append(ids, roles...)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	// What the roles give matters only for counting label values.
+	defs := book{builtin: a.roles}
+	if len(a.labels) > 0 {
+		if defs, err = a.book(ctx, tx, tenant, ids); err != nil {
+			return nil, err
+		}
+	}
+	evaluations, readsAction := map[conditionBucket]map[string]int{}, map[string]bool{}
+	for b, conditions := range carried {
+		gives := map[string][]Permission{}
+		for expr, roles := range conditions {
+			gives[expr] = nil
+			if len(a.labels) == 0 {
+				continue
+			}
+			for _, id := range roles {
+				if def, ok := defs.role(id); ok {
+					gives[expr] = append(gives[expr], def.Permissions...)
+				}
+			}
+		}
+		evaluations[b] = a.evaluations(gives, readsAction)
+	}
+	return evaluations, nil
+}
+
+// conditionsBounded refuses conditional grants just stored that leave the conditions of a bucket
+// costing more together than a check may spend on them, and more than they did before. A check
+// evaluates them whole, so a grant made beside another, as by an actor who can't revoke it, never
+// changes what that one decides. It reads them under the change's locks, which every change of a
+// scope's grants takes, before they are stored and after, the grants in force the change didn't
+// touch included.
+func (a *Authorizer) conditionsBounded(ctx context.Context, tx pgx.Tx, tenant string, buckets []conditionBucket, before map[conditionBucket]map[string]int) error {
+	after, err := a.conditionsIn(ctx, tx, tenant, buckets)
+	if err != nil {
+		return err
+	}
+	var over []error
+	for _, b := range buckets {
+		if a.conds.within(before[b], after[b]) {
+			continue
+		}
+		whose := b.principal + "'s grants"
+		if b.principal == "" {
+			whose = "the grants to groups, the tenant's members and the public"
+		}
+		if b.source != "" {
+			whose += " from " + b.source
+		}
+		over = append(over, fmt.Errorf("%w: the conditions of %s on %s cost more together than a check may spend evaluating them",
+			ErrInvalid, whose, b.scope))
+	}
+	return errors.Join(over...)
+}
+
+// reachesMany reports whether a grant to p can reach many subjects, a group, the tenant's members
+// or the public, so that its conditions are bounded with those of the others on its scope: bounded
+// for each, a subject in many groups would read them without bound.
+func reachesMany(p Principal) bool { return p.Kind == Group || p.broad() }
 
 // bounded refuses grants just stored that leave a principal holding their role on their scope
 // more than MaxGrantsPerRole times. It counts under the change's locks, once they are stored, the

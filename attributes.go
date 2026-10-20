@@ -3,6 +3,7 @@ package rbac
 import (
 	"fmt"
 	"maps"
+	"math"
 	"reflect"
 	"regexp"
 	"slices"
@@ -27,15 +28,18 @@ import (
 // declared, or reading one as another type, is refused when it is stored, rather than being false
 // whenever it runs. Each map names attributes and their types; a nil one leaves that kind
 // undeclared, read as any value under any name. Declared, they are read as fields, such as
-// `resource.attributes.env`, and named as identifiers.
+// `resource.attributes.env`, and named as identifiers. A condition stored under other declarations
+// is checked against these too, once, when a check first reads it: one that no longer passes, as
+// one reading an attribute since declared another type or no longer declared, fails, so a grant's
+// gives nothing, a deny's applies, and a requirement isn't met.
 //
 // A condition reading an attribute a request doesn't carry, or carries as a value CEL reads as
-// another type than it is declared, or as nil, is false when it runs, and a deny's applies: a
-// declared attribute passed so fails whatever reads it, comparing it with `!=`, testing it with
-// has(), or a map or list holding it, included, and so does reading the kind's attributes as a
-// whole, by `in`, size(), a macro or comparing them. A name a declared kind doesn't declare, which
-// a condition reads only through dyn(), fails so too. An undeclared kind's are read as passed, and
-// CEL compares values of different types as unequal.
+// another type than it is declared, as nil, or as a double that is NaN or infinite, is false when
+// it runs, and a deny's applies: a declared attribute passed so fails whatever reads it, comparing
+// it with `!=`, testing it with has(), or a map or list holding it, included, and so does reading
+// the kind's attributes as a whole, by `in`, size(), a macro or comparing them. A name a declared
+// kind doesn't declare, which a condition reads only through dyn(), fails so too. An undeclared
+// kind's are read as passed, and CEL compares values of different types as unequal.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
@@ -70,7 +74,9 @@ func (t AttributeType) takes(v any) (ok bool) {
 	case types.Int:
 		return t == AttrInt
 	case types.Double:
-		return t == AttrDouble
+		// NaN compares as false with anything, so a deny ordering it, as `risk >= 0.5`, would lift,
+		// and an infinity is NaN once a condition takes it from another.
+		return t == AttrDouble && !math.IsNaN(float64(v)) && !math.IsInf(float64(v), 0)
 	case types.Bool:
 		return t == AttrBool
 	case types.Timestamp:
@@ -107,7 +113,7 @@ func allStrings(it traits.Iterator, m traits.Mapper) bool {
 const (
 	AttrString    AttributeType = "string"              // string
 	AttrInt       AttributeType = "int"                 // int or int64
-	AttrDouble    AttributeType = "double"              // float64
+	AttrDouble    AttributeType = "double"              // float64, finite
 	AttrBool      AttributeType = "bool"                // bool
 	AttrTimestamp AttributeType = "timestamp"           // time.Time
 	AttrDuration  AttributeType = "duration"            // time.Duration
@@ -253,7 +259,9 @@ func typing(attrs Attributes) (*cel.Env, error) {
 
 // deepCopy is a copy of v whose maps, slices, arrays, pointers and structs' exported fields are its
 // own, however deep, a protobuf message among them cloned, and a value reached twice copied once,
-// so a cycle ends.
+// so a cycle ends. A struct's fields an unexported struct it embeds promotes are its own too, but
+// its other unexported fields are shared, a pointer it embeds unexported among them, and so the
+// fields that one promotes: reflection can't set them.
 func deepCopy[T any](v T) T {
 	out := reflect.ValueOf(&v).Elem()
 	out.Set(copier{}.copy(out))
@@ -273,7 +281,7 @@ type copiedKey struct {
 func (c copier) copy(v reflect.Value) reflect.Value {
 	switch v.Kind() {
 	case reflect.Interface:
-		if v.IsNil() {
+		if unreachable(v) {
 			return v
 		}
 		out := reflect.New(v.Type()).Elem()
@@ -304,24 +312,20 @@ func (c copier) copy(v reflect.Value) reflect.Value {
 		out := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
 		c[k] = out
 		// Each hook is given its own, so elements no write could reach through are copied at once.
+		reflect.Copy(out, v)
 		if flat(v.Type().Elem()) {
-			reflect.Copy(out, v)
 			return out
 		}
 		for i := range v.Len() {
-			out.Index(i).Set(c.copy(v.Index(i)))
+			if e := v.Index(i); !unreachable(e) {
+				out.Index(i).Set(c.copy(e))
+			}
 		}
 		return out
 	case reflect.Struct:
-		// Its exported fields, which a hook can write to: an unexported one is out of its reach, as
-		// out of reflection's to set.
 		out := reflect.New(v.Type()).Elem()
 		out.Set(v)
-		for i := range v.NumField() {
-			if f := out.Field(i); f.CanSet() {
-				f.Set(c.copy(v.Field(i)))
-			}
-		}
+		c.fields(out, v)
 		return out
 	case reflect.Array:
 		out := reflect.New(v.Type()).Elem()
@@ -333,7 +337,7 @@ func (c copier) copy(v reflect.Value) reflect.Value {
 		if v.IsNil() {
 			return v
 		}
-		if m, ok := v.Interface().(proto.Message); ok {
+		if m, ok := v.Interface().(proto.Message); ok && itself(m) {
 			return reflect.ValueOf(proto.Clone(m))
 		}
 		k := copiedKey{v.Type(), v.Pointer(), 0}
@@ -347,6 +351,39 @@ func (c copier) copy(v reflect.Value) reflect.Value {
 	default:
 		return v
 	}
+}
+
+// itself reports whether m is a message as itself, so cloned: a host's type embedding one is a
+// message by the methods it promotes, and Clone would return the embedded message in its place,
+// or panic where it embeds the message interface holding none.
+func itself(m proto.Message) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	return m.ProtoReflect().Interface() == m
+}
+
+// fields copies into out, a copy of the struct v, the fields a hook can write to: its exported
+// ones, and those an unexported struct it embeds promotes, which reflection sets as the language
+// does. Its other unexported fields a hook reaches only through the type's methods.
+func (c copier) fields(out, v reflect.Value) {
+	for i := range v.NumField() {
+		switch f := out.Field(i); {
+		case f.CanSet():
+			f.Set(c.copy(v.Field(i)))
+		case v.Type().Field(i).Anonymous && f.Kind() == reflect.Struct:
+			c.fields(f, v.Field(i))
+		}
+	}
+}
+
+// unreachable reports whether no write could reach through v, an interface: nil, or holding a value
+// of a flat type, as each of an []any of strings decoded from JSON does, which boxing again would
+// cost an allocation for each.
+func unreachable(v reflect.Value) bool {
+	return v.Kind() == reflect.Interface && (v.IsNil() || flat(v.Elem().Type()))
 }
 
 // flat reports whether a value of type t holds no map, slice or pointer a copy would share.

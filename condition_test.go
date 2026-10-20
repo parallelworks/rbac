@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +49,105 @@ func TestADeclaredAttributePassedAsAnotherTypeFailsItsConditions(t *testing.T) {
 		}
 		if allowed(t, h, v, login, at(env)) {
 			t.Errorf("a deny's condition was lifted for env %#v", env)
+		}
+	}
+}
+
+// NaN compares as false with anything, and an infinity is NaN once taken from another, so either
+// would lift a deny ordering a declared double and hold a grant ordering it the other way.
+func TestADeclaredDoubleThatIsntFiniteFailsItsConditions(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
+		c.Attributes = rbac.Attributes{Request: map[string]rbac.AttributeType{"risk": rbac.AttrDouble}}
+	})
+	ctx := t.Context()
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	g.Condition = rbac.Condition{Expression: `request.attributes.risk < 0.5`}
+	h.seed(t, g, grant(cluster.Scope(), "cluster.login", rbac.User, "v"), grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+	u, v := h.as(t, "u"), h.as(t, "v")
+	d := rbac.Deny{
+		ID: "risky", Principals: []rbac.Principal{v.Principal}, Permissions: []rbac.Permission{login},
+		Condition: rbac.Condition{Expression: `request.attributes.risk >= 0.5`},
+	}
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, d); err != nil {
+		t.Fatal(err)
+	}
+	is := func(s rbac.Subject, risk float64) bool {
+		t.Helper()
+		err := h.authz.Authorize(rbac.WithRequest(ctx, map[string]any{"risk": risk}), s, login, cluster)
+		if err != nil && !errors.Is(err, rbac.ErrDenied) {
+			t.Fatal(err)
+		}
+		return err == nil
+	}
+	if !is(u, 0.1) || !is(v, 0.1) || is(u, 0.9) || is(v, 0.9) {
+		t.Fatal("finite risks the conditions order")
+	}
+	for _, risk := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		if is(u, risk) {
+			t.Errorf("a grant's condition held for risk %v", risk)
+		}
+		if is(v, risk) {
+			t.Errorf("a deny's condition was lifted for risk %v", risk)
+		}
+	}
+}
+
+// A condition can make a double that isn't finite of finite ones, dividing by zero or converting
+// "NaN", which CEL orders and equates as false with anything: so comparing one fails too.
+func TestADoubleAConditionMakesThatIsntFiniteFailsWhatComparesIt(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
+		c.Attributes = rbac.Attributes{Request: map[string]rbac.AttributeType{
+			"failed": rbac.AttrDouble, "total": rbac.AttrDouble, "score": rbac.AttrString,
+		}}
+	})
+	ctx := t.Context()
+	const ratio = `request.attributes.failed / request.attributes.total`
+	grants := []string{ratio + ` < 0.5`, `!(` + ratio + ` >= 0.5)`, ratio + ` != 1.0`}
+	denies := []string{ratio + ` >= 0.5`, ratio + ` == 1.0`, `double(request.attributes.score) >= 0.5`}
+	seeded := []rbac.Grant{grant(cluster.Scope(), "guard", rbac.User, "guardian")}
+	for i, expr := range grants {
+		g := grant(cluster.Scope(), "cluster.login", rbac.User, fmt.Sprint("u", i))
+		g.Condition = rbac.Condition{Expression: expr}
+		seeded = append(seeded, g, grant(cluster.Scope(), "cluster.login", rbac.User, fmt.Sprint("v", i)))
+	}
+	h.seed(t, seeded...)
+	for i, expr := range denies {
+		d := rbac.Deny{
+			ID: fmt.Sprint("d", i), Principals: []rbac.Principal{identity(fmt.Sprint("v", i))}, Permissions: []rbac.Permission{login},
+			Condition: rbac.Condition{Expression: expr},
+		}
+		if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	is := func(who string, request map[string]any) bool {
+		t.Helper()
+		err := h.authz.Authorize(rbac.WithRequest(ctx, request), h.as(t, who), login, cluster)
+		if err != nil && !errors.Is(err, rbac.ErrDenied) {
+			t.Fatal(err)
+		}
+		return err == nil
+	}
+	finite := map[string]any{"failed": 0.0, "total": 1.0, "score": "0.1"}
+	for i := range 3 {
+		if !is(fmt.Sprint("u", i), finite) || !is(fmt.Sprint("v", i), finite) {
+			t.Fatalf("finite doubles: %s, %s", grants[i], denies[i])
+		}
+	}
+	for name, request := range map[string]map[string]any{
+		"NaN":       {"failed": 0.0, "total": 0.0, "score": "NaN"},
+		"infinity":  {"failed": 1.0, "total": 0.0, "score": "inf"},
+		"-infinity": {"failed": -1.0, "total": 0.0, "score": "-inf"},
+	} {
+		for i := range 3 {
+			if is(fmt.Sprint("u", i), request) {
+				t.Errorf("a grant's condition %s held for %s", grants[i], name)
+			}
+			if is(fmt.Sprint("v", i), request) {
+				t.Errorf("a deny's condition %s was lifted for %s", denies[i], name)
+			}
 		}
 	}
 }
@@ -190,6 +290,64 @@ func TestDeclaredAttributesChangedAfterNewAreReadAsDeclaredAtNew(t *testing.T) {
 	r.Attributes = map[string]any{"env": "dev"}
 	if !allowed(t, h, h.as(t, "u"), login, r) {
 		t.Error("an attribute checked as stored conditions read it")
+	}
+}
+
+// A grant's condition, a deny's and a requirement, stored while env and level were declared strings,
+// read once the host declares them lists of strings: none passes the declarations now, so each
+// fails, rather than run as if they hadn't changed, where a list is unequal to any string.
+func TestAConditionStoredUnderOtherDeclarationsFailsWhereItNoLongerPassesThem(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
+		c.Attributes = rbac.Attributes{
+			Resource: map[string]rbac.AttributeType{"env": rbac.AttrString},
+			Request:  map[string]rbac.AttributeType{"level": rbac.AttrString},
+		}
+	})
+	ctx := t.Context()
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	g.Condition = rbac.Condition{Expression: `resource.attributes.env != "prod"`}
+	h.seed(t, g, grant(cluster.Scope(), "cluster.login", rbac.User, "v"), grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+	u, v, w := h.as(t, "u"), h.as(t, "v"), h.as(t, "w")
+	d := rbac.Deny{
+		ID: "prod", Principals: []rbac.Principal{v.Principal}, Permissions: []rbac.Permission{login},
+		Condition: rbac.Condition{Expression: `resource.attributes.env == "prod"`},
+	}
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, d); err != nil {
+		t.Fatal(err)
+	}
+	e := rbac.Eligibility{Role: "cluster.login", Principal: w.Principal, MaxDuration: time.Hour, Requires: `request.attributes.level != "low"`}
+	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, e); err != nil {
+		t.Fatal(err)
+	}
+	cfg := h.cfg
+	cfg.Attributes = rbac.Attributes{
+		Resource: map[string]rbac.AttributeType{"env": rbac.AttrStrings},
+		Request:  map[string]rbac.AttributeType{"level": rbac.AttrStrings},
+	}
+	later, err := rbac.New(h.pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := later.SetDeny(ctx, h.as(t, "guardian"), cluster, d); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("storing the deny under the declarations now: %v", err)
+	}
+	r := cluster
+	r.Attributes = map[string]any{"env": []string{"prod"}}
+	if dec, err := later.Explain(ctx, v, login, r); err != nil || dec.Allowed || !strings.Contains(dec.Reason, "couldn't be evaluated") {
+		t.Errorf("a deny of prod, for a resource in prod: %+v, %v", dec, err)
+	}
+	if err := later.Authorize(ctx, u, login, r); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("a grant for anything but prod, for a resource in prod: %v", err)
+	}
+	act := rbac.Activation{Role: "cluster.login", Duration: time.Minute, Justification: "INC-1"}
+	if _, err := later.Activate(rbac.WithRequest(ctx, map[string]any{"level": []string{"low"}}), w, cluster, act); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("a requirement of a level other than low, at level low: %v", err)
+	}
+	// Under the declarations they were stored under, they decide as ever.
+	r.Attributes = map[string]any{"env": "prod"}
+	if allowed(t, h, u, login, r) || allowed(t, h, v, login, r) {
+		t.Error("the conditions under the declarations they were stored under")
 	}
 }
 
@@ -417,6 +575,138 @@ func TestAChangeCarriesBoundedConditions(t *testing.T) {
 	}
 }
 
+// What evaluating a condition can cost is bounded by what it reads, which a check runs it within:
+// little for one comparing what a request passes with literals, whatever it passes, and all a
+// condition may for one reading the size of, or looping over, what the request decides. None costs
+// more than its bound, however large what it reads.
+func TestAConditionCostsNoMoreThanItsBound(t *testing.T) {
+	big := strings.Repeat("x", 20000)
+	many := make([]any, 5000)
+	for i := range many {
+		many[i] = big[:i%40]
+	}
+	requests := []map[string]any{
+		{},
+		{
+			"mfa": true, "ip": "10.0.0.1", "team": "sre", "env": "dev", "n": 3, "f": 1.0, "g": 2.0, "d": time.Minute,
+			"at": time.Now(), "tags": []any{"gpu"}, "m": map[string]any{"k": "v"}, "x": 1,
+		},
+		{
+			"mfa": big, "ip": big, "team": many, "env": map[string]any{"a": many}, "n": big, "f": 1.0, "g": 0.0, "d": big,
+			"at": big, "tags": many, "m": map[string]any{"k": many}, "x": many,
+		},
+	}
+	for _, c := range []struct {
+		expr  string
+		cheap bool
+	}{
+		{`request.attributes.mfa == true`, true},
+		{`request.attributes.ip == "10.0.0.1" || request.attributes.ip == "10.0.0.2"`, true},
+		{`resource.attributes.env != "prod" && subject.id in ["a", "b", "c"]`, true},
+		{`request.time < timestamp("2027-01-01T00:00:00Z") && request.time.getHours("America/New_York") >= 9`, true},
+		{`request.attributes.ip.startsWith("10.") && "abc".contains("b")`, true},
+		{`has(request.attributes.mfa) && !has(request.attributes.at) && request.attributes.x != null`, true},
+		{`dyn(request.attributes)["team"] == "sre" && request.attributes.m["k"] == "v"`, true},
+		{`request.attributes.d < duration("1h") && request.attributes.f / request.attributes.g >= 0.5`, true},
+		{`(request.attributes.mfa ? request.attributes.team : "none") == "sre"`, true},
+		{`[1, 2, 3].all(i, i > 0) && [request.attributes.x] == [1] && {"a": request.attributes.x} == {"a": 1}`, true},
+		{`[1, 2] + [3] == [1, 2, 3] && "a" + "b" == "ab" && size("abc") == 3 && action == "cluster:login"`, true},
+		{`"gpu" in request.attributes.tags`, false},
+		{`request.attributes.team in {"sre": true}`, false},
+		{`size(request.attributes.tags) > 0`, false},
+		{`request.attributes.ip.matches("^10[.]0[.]")`, false},
+		{`request.attributes.tags.exists(t, t == "gpu")`, false},
+		{`request.attributes.x == request.attributes.team`, false},
+		{`string(request.attributes.n) == "3" || int(request.attributes.n) > 2`, false},
+		{`request.attributes.ip + request.attributes.team == "ab"`, false},
+		{`[1,2,3,4,5,6,7,8].all(a, [1,2,3,4,5,6,7,8].all(b, [1,2,3,4,5,6,7,8].all(c, [1,2,3,4,5,6,7,8].all(d, a > 0))))`, false},
+	} {
+		for i, attributes := range requests {
+			limit, actual := rbac.ConditionCost(t, c.expr, attributes)
+			if actual > limit && limit < 10000 {
+				t.Errorf("%s on request %d cost %d, past its bound, %d", c.expr, i, actual, limit)
+			}
+			if c.cheap != (limit < 1000) {
+				t.Errorf("%s is bounded at %d", c.expr, limit)
+			}
+		}
+	}
+}
+
+// Conditions that compare what a request passes with literals cost little, so the grants a check
+// reads together on a scope may carry hundreds, as one for each group's addresses: what bounds them
+// is what compiling and evaluating each costs.
+func TestCheapConditionsFitAScopeByTheHundreds(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	var groups []string
+	var grants []rbac.Grant
+	for i := range 300 {
+		g := fmt.Sprintf("g%03d", i)
+		groups = append(groups, g)
+		b := rbac.Binding{Role: "cluster.login", Principal: groupOf(g), Condition: rbac.Condition{Expression: fmt.Sprintf(`request.attributes.ip == "10.0.%d.1"`, i)}}
+		grants = append(grants, rbac.Grant{Scope: cluster.Scope(), Binding: b})
+	}
+	h.groups(t, groups...)
+	if err := h.authz.Import(ctx, host, "t1", grants[:250]); err != nil {
+		t.Fatalf("250 cheap conditions: %v", err)
+	}
+	if err := h.authz.Import(ctx, host, "t1", grants[250:]); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("300 cheap conditions: %v", err)
+	}
+	// A check of a subject in every group evaluates them all.
+	s := h.as(t, "u", groups...)
+	if err := h.authz.Authorize(rbac.WithRequest(ctx, map[string]any{"ip": "10.0.249.1"}), s, login, cluster); err != nil {
+		t.Fatalf("the last group's address: %v", err)
+	}
+}
+
+// The most conditions a change carries, each distinct and as costly to compile as any, take about
+// as long to check as compiling sixteen of them alone, before the host is asked. And none is kept
+// compiled: the cache is the checks', and one change's conditions would otherwise evict what they
+// read, though no check may read them.
+func TestAChangesConditionsCompileBriefly(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Attributes = rbac.Attributes{Resource: map[string]rbac.AttributeType{"env": rbac.AttrString}}
+	})
+	ctx := t.Context()
+	n := 0
+	costly := func(bytes int) []rbac.Binding {
+		var bs []rbac.Binding
+		for total := 0; ; n++ {
+			s := fmt.Sprintf(`[%d,2,3] == [1,2,3]`, n)
+			for len(s)+len(` && [1,2,3] == [1,2,3]`) <= rbac.MaxExpression {
+				s += ` && [1,2,3] == [1,2,3]`
+			}
+			if total += len(s); total > bytes {
+				return bs
+			}
+			bs = append(bs, rbac.Binding{Role: "cluster.login", Principal: identity(fmt.Sprintf("u%d", n)), Condition: rbac.Condition{Expression: s}})
+		}
+	}
+	took := func(bs []rbac.Binding) time.Duration {
+		t.Helper()
+		start := time.Now()
+		if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: bs}); err != nil {
+			t.Fatal(err)
+		}
+		return time.Since(start)
+	}
+	one := min(took(costly(rbac.MaxExpression)), took(costly(rbac.MaxExpression)))
+	most := costly(rbac.MaxConditionBytes)
+	before := rbac.Compiled(h.authz)
+	if all := min(took(most), took(costly(rbac.MaxConditionBytes))); all > 24*one {
+		t.Errorf("a change of %d conditions took %v, one alone %v", len(most), all, one)
+	}
+	if after := rbac.Compiled(h.authz); after != before {
+		t.Errorf("changes kept %d conditions compiled that no check has read", after-before)
+	}
+	// u1's holds; u0's doesn't.
+	if allowed(t, h, h.as(t, "u0"), login, cluster) || !allowed(t, h, h.as(t, "u1"), login, cluster) || rbac.Compiled(h.authz) != before+2 {
+		t.Error("checks keep what they compile")
+	}
+}
+
 // An actor holding its power under a condition hands it on under that condition, which a change
 // parses for whether it reads the subject once, however many bindings and permissions carry it:
 // parsing one takes milliseconds, and the change decides again in its transaction.
@@ -440,9 +730,78 @@ func TestAChangeHandingOnUnderAConditionParsesItOnce(t *testing.T) {
 	}
 }
 
+// The requirements of groups' eligibilities for a role on a scope are bounded together where they
+// are stored, as activating evaluates those of each group the subject is in: so an eligibility set
+// beside another, as by an actor who can't delete it, never changes what that one allows.
+func TestGroupsRequirementsForARoleOnAScopeAreBoundedTogether(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	owner := h.as(t, "owner")
+	h.groups(t, "g0", "g1", "g2", "g3", "g4")
+	set := func(on rbac.Resource, p rbac.Principal, role rbac.Role, requires string) error {
+		return h.authz.SetEligibility(ctx, owner, on, rbac.Eligibility{Role: role, Principal: p, MaxDuration: time.Hour, Requires: requires})
+	}
+	for i := range 3 {
+		if err := set(cluster, groupOf(fmt.Sprint("g", i)), "cluster.sudo", spending(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := set(cluster, groupOf("g3"), "cluster.sudo", spending(3)); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a fourth costly requirement: %v", err)
+	}
+	// One they have counts once; another role's, and an identity's own, count apart.
+	for name, err := range map[string]error{
+		"one they have": set(cluster, groupOf("g3"), "cluster.sudo", spending(0)),
+		"another role":  set(cluster, groupOf("g4"), "cluster.login", spending(4)),
+		"an identity's": set(cluster, identity("x"), "cluster.sudo", "true || "+spending(5)),
+	} {
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	// Activating evaluates them whole, and reaches the one that holds, though it is the costliest.
+	act := rbac.Activation{Role: "cluster.sudo", Duration: time.Minute, Justification: "INC-1"}
+	if _, err := h.authz.Activate(ctx, h.as(t, "x", "g0", "g1", "g2", "g3", "g4"), cluster, act); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+}
+
+// Where groups' requirements stored before there were bounds cost more than activating may spend,
+// a group's eligibility set again as it is, or with a requirement another holds, adds nothing
+// activating reads, so it isn't refused; one adding a requirement is.
+func TestAnEligibilitySetPastTheBoundIsRefusedOnlyForARequirementItAdds(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.groups(t, "g0", "g1", "g2", "g3")
+	for i := range 4 {
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role,
+			max_seconds, requires) VALUES ('t1', 'cluster', 'c1', 'group', $1, 'cluster.sudo', 3600, $2)`, fmt.Sprint("g", i), spending(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	set := func(note, requires string) error {
+		return h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, rbac.Eligibility{
+			Role: "cluster.sudo", Principal: groupOf("g0"), MaxDuration: time.Hour, Requires: requires, Note: note,
+		})
+	}
+	for name, err := range map[string]error{
+		"as it is":                     set("", spending(0)),
+		"with another note":            set("on call", spending(0)),
+		"with a requirement they hold": set("on call", spending(1)),
+	} {
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if err := set("on call", spending(9)); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("with a requirement they don't hold: %v", err)
+	}
+}
+
 // Activate evaluates the cheapest requirement first, as a check does conditions, so one that holds
-// is reached however many costly ones the subject is also eligible through, whatever order the
-// database's collation would put them in, and however many approvers each names.
+// is reached however many costly ones stored around the bounds the subject is also eligible
+// through, whatever order the database's collation would put them in, and however many approvers
+// each names.
 func TestActivateTriesTheCheapestRequirementFirst(t *testing.T) {
 	boss := identity("boss")
 	for name, approvers := range map[string]struct{ costly, cheap []rbac.Principal }{
@@ -456,17 +815,19 @@ func TestActivateTriesTheCheapestRequirementFirst(t *testing.T) {
 			// Each runs up to its cost on the request's list, which spends it all, and together they
 			// spend what activating may.
 			var groups []string
-			for i := range 9 {
-				groups = append(groups, fmt.Sprintf("g%d", i))
+			for i := range 20 {
+				groups = append(groups, fmt.Sprintf("g%02d", i))
 			}
 			h.groups(t, groups...)
 			x := h.as(t, "x", groups...)
+			costly := []string{}
+			for _, p := range approvers.costly {
+				costly = append(costly, string(p.Kind)+":"+p.ID)
+			}
 			for i, g := range groups {
-				e := rbac.Eligibility{
-					Role: "cluster.sudo", Principal: groupOf(g), MaxDuration: time.Hour, Approvers: approvers.costly,
-					Requires: fmt.Sprintf(`request.attributes.big.map(x, x + %d).size() < 0`, i),
-				}
-				if err := h.authz.SetEligibility(ctx, owner, cluster, e); err != nil {
+				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role,
+					max_seconds, requires, approvers) VALUES ('t1', 'cluster', 'c1', 'group', $1, 'cluster.sudo', 3600, $2, $3)`,
+					g, fmt.Sprintf(`request.attributes.big.map(x, x + %d).size() < 0`, i), costly); err != nil {
 					t.Fatal(err)
 				}
 			}

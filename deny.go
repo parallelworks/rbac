@@ -217,11 +217,11 @@ func (a *Authorizer) checkDeny(tenant string, d Deny) error {
 // DenyPermission(on's type) there (through on, an ancestor or the tenant), not removed by a
 // constraint. A deny only takes access away, so setting one needs no more than that; one can
 // deny its setter too. A scope's conditional denies are bounded together by what a check may spend
-// on conditions, so that one always evaluates them: about seven short distinct conditions, or
-// three of the longest, however many denies share them. Whoever holds that permission on the
-// scope, those the deny names included, can replace or delete it, so to bind one who holds it
-// there, set the deny on a scope above where it doesn't. The groups it names or exempts, and a
-// group it is on, are the tenant's.
+// on conditions, so that one always evaluates them: hundreds of distinct comparisons with
+// literals, or three of the longest that read a list or loop, however many denies share them
+// (Condition). Whoever holds that permission on the scope, those the deny names included, can
+// replace or delete it, so to bind one who holds it there, set the deny on a scope above where it
+// doesn't. The groups it names or exempts, and a group it is on, are the tenant's.
 func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d Deny) (err error) {
 	defer a.refused(ctx, &err, on.Tenant, actor.Principal, "SetDeny")
 	if err := a.check(on); err != nil {
@@ -251,11 +251,29 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 		if err := a.denyAllowed(ctx, tx, actor, on, cs, nil, nil); err != nil {
 			return ChangeEvent{}, err
 		}
-		var others int
-		var conditions []string
-		if err := tx.QueryRow(ctx, `SELECT count(*), coalesce(array_agg(condition) FILTER (WHERE condition <> ''), '{}')
-			FROM rbac_denies WHERE tenant = $1 AND scope = $2 AND id <> $3`,
-			on.Tenant, d.Scope.Key(), d.ID).Scan(&others, &conditions); err != nil {
+		rows, err := tx.Query(ctx, `SELECT id, condition, permissions FROM rbac_denies WHERE tenant = $1 AND scope = $2`,
+			on.Tenant, d.Scope.Key())
+		if err != nil {
+			return ChangeEvent{}, err
+		}
+		// The permissions each condition is carried with, as a read of label values evaluates one that
+		// reads the action for each it denies, before the deny is set and after.
+		before, after := map[string][]Permission{}, map[string][]Permission{d.Condition.Expression: d.Permissions}
+		others := 0
+		var id, condition string
+		var perms []string
+		if _, err := pgx.ForEachRow(rows, []any{&id, &condition, &perms}, func() error {
+			for _, p := range perms {
+				before[condition] = append(before[condition], Permission(p))
+				if id != d.ID {
+					after[condition] = append(after[condition], Permission(p))
+				}
+			}
+			if id != d.ID {
+				others++
+			}
+			return nil
+		}); err != nil {
 			return ChangeEvent{}, err
 		}
 		if others >= MaxDenies {
@@ -263,17 +281,11 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 		}
 		// Past this, a check's budget could run out before it evaluated them, and the rest would
 		// deny everyone they name, whatever their conditions say.
-		if d.Condition.Expression != "" {
-			// Each condition once, as a check evaluates it once.
-			var cost uint64
-			for _, c := range slices.Compact(slices.Sorted(slices.Values(append(conditions, d.Condition.Expression)))) {
-				cost += worstCost(c)
-			}
-			if cost > maxCheckCost {
-				return ChangeEvent{}, fmt.Errorf("%w: a scope's conditional denies cost more together than a check may spend evaluating them", ErrInvalid)
-			}
+		readsAction := map[string]bool{}
+		if d.Condition.Expression != "" && !a.conds.within(a.evaluations(before, readsAction), a.evaluations(after, readsAction)) {
+			return ChangeEvent{}, fmt.Errorf("%w: a scope's conditional denies cost more together than a check may spend evaluating them", ErrInvalid)
 		}
-		rows, err := tx.Query(ctx, `
+		rows, err = tx.Query(ctx, `
 			INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, name, principals, exempt, permissions,
 			  condition_title, condition_description, condition, created_by, updated_by)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)

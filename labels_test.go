@@ -49,6 +49,113 @@ func (h *harness) hold(t *testing.T, id string, values ...string) {
 	h.seed(t, grants...)
 }
 
+// compartments declares sixty compartments a subject must hold all of, a role for the tenant
+// giving every one, and another giving one.
+func compartments(c *rbac.Config) {
+	var values []string
+	var perms []rbac.Permission
+	for i := range 60 {
+		values = append(values, fmt.Sprintf("c%02d", i))
+		perms = append(perms, rbac.Permission(fmt.Sprintf("comp:c%02d", i)))
+	}
+	c.Labels = []rbac.LabelDimension{{Name: "comp", Rule: rbac.AllOf, Values: values}}
+	c.Catalog = append(slices.Clone(c.Catalog),
+		rbac.RoleDefinition{ID: "compartments", Permissions: perms, ResourceTypes: []string{rbac.TenantScope}},
+		rbac.RoleDefinition{ID: "compartment", Permissions: perms[:1], ResourceTypes: []string{rbac.TenantScope}},
+		rbac.RoleDefinition{ID: "guard", Permissions: []rbac.Permission{rbac.DenyPermission(rbac.TenantScope)}, ResourceTypes: []string{rbac.TenantScope}},
+	)
+}
+
+// A labeled check reads the subject's label values, each decided as a check of it would be: a
+// condition that doesn't read the action decides the same for every value, so it is evaluated once
+// for them all, a grant's or a deny's, however many values the grants carrying it give.
+func TestALabeledCheckEvaluatesAConditionOnceForEveryValue(t *testing.T) {
+	h := setup(t, compartments)
+	ctx := t.Context()
+	l := "[1,2,3,4,5,6,7,8]"
+	costly := func(i int) string {
+		return fmt.Sprintf(`%s.all(a,%s.all(b,%s.all(c,%s.all(d,a>%d))))`, l, l, l, l, -1-i)
+	}
+	tenant := rbac.TenantRoot("t1")
+	// As many costly conditions as the subject's grants on the tenant and those to its members may
+	// carry, and, costliest to compile, the one that holds.
+	grants := []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "u"), grant(tenant, "guard", rbac.User, "guardian")}
+	holds := grant(tenant, "compartments", rbac.User, "u")
+	holds.Condition = rbac.Condition{Expression: `request.attributes.mfa == true && "` + strings.Repeat("x", 200) + `" != ""`}
+	grants = append(grants, holds)
+	for i := range 13 {
+		g := grant(tenant, "compartments", rbac.User, "u")
+		if i >= 6 {
+			g.Principal = rbac.TenantMembers("t1")
+		}
+		g.Condition = rbac.Condition{Expression: costly(i)}
+		grants = append(grants, g)
+	}
+	h.seed(t, grants...)
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}, rbac.Deny{
+		ID: "mfa", Principals: []rbac.Principal{rbac.TenantMembers("t1")}, Permissions: []rbac.Permission{"comp:*"},
+		Condition: rbac.Condition{Expression: `request.attributes.mfa != true`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	u := h.as(t, "u")
+	r := cluster
+	r.Labels = rbac.Label{"comp": {"c00", "c59"}}
+	n := rbac.CountEvaluations(t)
+	if err := h.authz.Authorize(rbac.WithRequest(ctx, map[string]any{"mfa": true}), u, login, r); err != nil {
+		t.Fatalf("with the condition that holds: %v", err)
+	}
+	if *n != 15 {
+		t.Errorf("a labeled check evaluated %d conditions, of 15", *n)
+	}
+	if allowed(t, h, u, login, r) {
+		t.Error("without it")
+	}
+}
+
+// A condition that reads the action is evaluated apart for each label value a read of the subject's
+// decides, so where it is stored it counts once for each value its grants give, or its denies deny:
+// a cheap one fits for sixty values, and one that may cost all a condition may doesn't.
+func TestAConditionReadingTheActionCountsOnceForEachLabelValue(t *testing.T) {
+	h := setup(t, compartments)
+	ctx := t.Context()
+	tenant := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}
+	h.seed(t, grant(tenant.Scope(), "guard", rbac.User, "guardian"), grant(tenant.Scope(), "tenant.admin", rbac.User, "admin"))
+	under := func(role rbac.Role, expr string) error {
+		return h.authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: tenant.Scope(), Binding: rbac.Binding{
+			Role: role, Principal: identity("u"), Condition: rbac.Condition{Expression: expr},
+		}}})
+	}
+	deny := func(id string, p rbac.Permission, expr string) error {
+		return h.authz.SetDeny(ctx, h.as(t, "guardian"), tenant, rbac.Deny{
+			ID: id, Principals: []rbac.Principal{rbac.TenantMembers("t1")}, Permissions: []rbac.Permission{p},
+			Condition: rbac.Condition{Expression: expr},
+		})
+	}
+	reading := `action != "comp:c07" && request.attributes.groups.exists(g, g == "ops")`
+	if err := under("compartments", reading); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("a costly condition reading the action on a grant of sixty values: %v", err)
+	}
+	if err := deny("reading", "comp:*", reading); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("a costly condition reading the action on a deny of sixty values: %v", err)
+	}
+	// A cheap one, one that doesn't read it, or a grant or a deny of one value, fits.
+	cheap := `action != "comp:c07" && request.attributes.mfa == true`
+	for name, err := range map[string]error{
+		"a cheap grant reading it": under("compartments", cheap),
+		"a cheap deny reading it":  deny("cheap", "comp:*", cheap),
+		"a grant not reading it":   under("compartments", `request.attributes.groups.exists(g, g == "sre")`),
+		"a grant of one value":     under("compartment", reading),
+		"a deny not reading it":    deny("not-reading", "comp:*", `request.attributes.groups.exists(g, g == "dev")`),
+		"a deny of one value":      deny("one", "comp:c00", reading),
+		"a grant of other powers":  under("tenant.admin", reading),
+	} {
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
 func TestAHoldingSatisfiesALabelByItsDimensionsRules(t *testing.T) {
 	h := labeled(t)
 	pilot := h.as(t, "pilot")

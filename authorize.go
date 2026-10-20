@@ -145,7 +145,7 @@ func (a *Authorizer) decideHeld(ctx context.Context, s Subject, p Permission, r 
 	if vars == nil {
 		vars = a.vars(ctx, s, p, r)
 	}
-	spend := newBudget()
+	spend := a.grantBudget(r.path())
 	cheapestFirst(conditional, holding.expression)
 	for _, h := range conditional {
 		if a.conds.holds(spend, h.Condition.Expression, vars) {
@@ -158,7 +158,7 @@ func (a *Authorizer) decideHeld(ctx context.Context, s Subject, p Permission, r 
 // explain is Explain's decision once no constraint removes p: every grant that allows it, or why
 // none does.
 func (a *Authorizer) explain(ctx context.Context, s Subject, p Permission, r Resource, counts broad) (Decision, error) {
-	vars, spend := a.vars(ctx, s, p, r), newBudget()
+	vars, spend := a.vars(ctx, s, p, r), a.grantBudget(r.path())
 	keys, binding, err := a.keysOf(ctx, a.db, r.Tenant, s)
 	if err != nil {
 		return Decision{}, err
@@ -318,11 +318,12 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 		removed[p] = cs.removes(p, r.Type)
 		return removed[p], cs.failed()
 	}
-	// Each permission is decided as Authorize would decide it, on budgets of its own.
-	vars, spends := a.vars(ctx, s, "", r), map[Permission]*budget{}
+	// Each permission is decided as Authorize would decide it, on budgets of its own, which share
+	// what conditions came to: one that doesn't read the action runs once for them all.
+	vars, spends, ran := a.vars(ctx, s, "", r), map[Permission]*budget{}, map[string]run{}
 	spendOn := func(p Permission) *budget {
 		if spends[p] == nil {
-			spends[p] = newBudget()
+			spends[p] = a.grantBudget(r.path()).sharing(ran)
 		}
 		return spends[p]
 	}
@@ -334,7 +335,7 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 			return d
 		}
 		vars["action"] = string(p)
-		d, ok := a.deniedBy(ds, p, newDenyBudget(r.path()), vars)
+		d, ok := a.deniedBy(ds, p, newDenyBudget(r.path()).sharing(ran), vars)
 		denied[p], always[p] = ok, ok && d.condition == ""
 		return ok
 	}

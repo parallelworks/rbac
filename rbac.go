@@ -517,8 +517,10 @@ type Constraint struct {
 // the constraint removes the permission for any, so that a search never keeps what a check
 // refuses. Holders then asks again about each identity it lists, which it marks MaybeDenied where
 // the constraint answers true. Each constraint is given copies of its own of the subject and the
-// resource, their attributes, ancestors and label too, so one writing to them changes nothing
-// decided.
+// resource, their attributes, ancestors and label too, however deep, so one writing to them
+// changes nothing decided. A host's struct among the attributes is copied by its exported fields
+// and those an unexported struct it embeds promotes: the rest, a pointer it embeds unexported and
+// the fields that promotes among them, reflection can't set, so they are shared.
 type ConstraintInput struct {
 	Tenant       string
 	ResourceType string
@@ -610,10 +612,9 @@ const (
 	MaxNote        = 2048
 	MaxExpression  = 2048
 	// MaxConditionBytes is how many bytes of conditions, each counted once, one change carries:
-	// compiling one takes milliseconds, before the host is asked and outside any check's budget,
-	// and a change of many distinct ones would otherwise spend seconds and fill the cache of
-	// compiled conditions every check reads.
-	MaxConditionBytes = 128 << 10
+	// compiling one takes up to ten milliseconds for each kilobyte, before the host is asked and
+	// outside any check's budget, so a change of many distinct ones would otherwise spend seconds.
+	MaxConditionBytes = 32 << 10
 )
 
 // DeniedError is a refusal, with why. Its message names only the permission, so a host that
@@ -698,7 +699,10 @@ type Config struct {
 	// granted from one, so a tenant's admins can neither forge the host's grants nor remove them
 	// behind its back. The host makes and removes them with Import and DeleteGrants. A custom role
 	// the host grants stays the tenant's to define: redefining it changes what the host's grants
-	// give, as it does any grant of it, asking the host about those it widens.
+	// give, as it does any grant of it, asking the host about those it widens. The conditions of
+	// grants from each are bounded apart from the tenant's, as MaxGrantsPerRole counts them, so
+	// neither can fill what the other stores in, and a check may spend as much again on each
+	// (Condition).
 	Sources []string
 	// Attributes declares the attributes conditions read, so one misnamed or of another type is
 	// refused when a condition is stored; undeclared, any is read.
