@@ -682,6 +682,42 @@ func TestAConditionCostsNoMoreThanItsBound(t *testing.T) {
 	}
 }
 
+// A stored condition's bound is computed again in each process, from what the CEL it is built with
+// makes of it, so another version of CEL can move the bounds of conditions already stored and leave
+// what a check reads together past one. These pin the bound of a condition of each shape, so an
+// upgrade that moves one shows.
+func TestStoredConditionsKeepTheirBounds(t *testing.T) {
+	for _, c := range []struct {
+		expr  string
+		bound uint64
+	}{
+		{`request.attributes.mfa == true`, 8},
+		{`request.attributes.ip == "10.0.0.1" || request.attributes.ip == "10.0.0.2"`, 16},
+		{`resource.attributes.env != "prod" && subject.id in ["a", "b", "c"]`, 27},
+		{`request.time < timestamp("2027-01-01T00:00:00Z") && request.time.getHours("America/New_York") >= 9`, 116},
+		{`request.attributes.ip.startsWith("10.") && "abcdefghijk".contains("bc")`, 9},
+		{`"abc".matches("^a(b|c){2}$")`, 11},
+		{`has(request.attributes.mfa) && request.attributes.x != null`, 14},
+		{`dyn(request.attributes)["team"] == "sre" && [1, 2, 3][1] == 2`, 23},
+		{`(request.attributes.mfa ? request.attributes.team : "none") == "sre"`, 14},
+		{`[request.attributes.x] == [1] && {"a": request.attributes.x} == {"a": 1}`, 99},
+		{`[1, 2] + [3] == [1, 2, 3] && "a" + "b" == "ab" && size("abc") == 3 && action == "cluster:login"`, 52},
+		{`int("12") == 12 && string(1) == "1" && duration("1h") > duration("1m")`, 14},
+		{`google.protobuf.Struct{fields: {"a": 1.0}} == {"a": 1.0}`, 104},
+		{`[1, 2, 3].all(i, i > 0) && [1, 2, 3].exists_one(i, i == 2) && {"a": 1}.exists(k, k == "a")`, 128},
+		{`[[1, 2], [3]].all(l, l.all(i, i > 0))`, 86},
+		{`[1, 2, 3].map(x, x > 1, x * 2) == [4, 6]`, 108},
+		{`[1, 2].map(x, "ab").all(s, s.contains("a"))`, 70},
+		{`["10.0.0.1", "10.0.0.2"].filter(ip, ip.startsWith("10.")).exists(ip, request.attributes.ip == ip)`, 100},
+		{`"gpu" in request.attributes.tags`, 10000},
+		{`request.attributes.tags.exists(t, t == "gpu")`, 10000},
+	} {
+		if limit, _ := rbac.ConditionCost(t, c.expr, nil); limit != c.bound {
+			t.Errorf("%s is bounded at %d, not %d", c.expr, limit, c.bound)
+		}
+	}
+}
+
 // Conditions that compare what a request passes with literals cost little, so the grants a check
 // reads together on a scope may carry hundreds, as one for each group's addresses: what bounds them
 // is what compiling and evaluating each costs.
