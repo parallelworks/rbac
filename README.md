@@ -453,8 +453,9 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   grants on any type.
 - **Limits:** a change takes at most `rbac.MaxBindings` bindings; a principal holds a role on a
   scope at most `rbac.MaxGrantsPerRole` times, and is in a group at most `rbac.MaxPlacesInGroup`
-  times, by source, and in at most `rbac.MaxGroupsOfPrincipal` groups, from each source the host
-  owns apart; a scope holds at most `rbac.MaxDenies` denies; a tenant has at most
+  times, by source, and directly in at most `rbac.MaxGroupsOfPrincipal` groups, from each source
+  the host owns apart, which bounds the groups a check reads through others only level by level, so
+  keep nesting narrow; a scope holds at most `rbac.MaxDenies` denies; a tenant has at most
   `rbac.MaxCustomRoles` custom roles; an id is at most `rbac.MaxID` bytes. The others are exported
   beside them. Lists have no limit or cursor, so what one returns grows with what it lists:
   `Memberships` of a whole tenant with its members and guests, `Groups` with its groups, `Members`

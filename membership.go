@@ -36,8 +36,12 @@ const MaxGroupDepth = 8
 const MaxPlacesInGroup = 20
 
 // MaxGroupsOfPrincipal is how many groups a principal, an identity or a group, is in directly, by
-// places in force, as every check reads each group its subject is in: those it is in from each
-// source the host owns (Config.Sources) counted apart, as for MaxPlacesInGroup.
+// places in force: those it is in from each source the host owns (Config.Sources) counted apart, as
+// for MaxPlacesInGroup. A check reads each group its subject is in, through those they are in, each
+// once, which this bounds only level by level: an identity in 300 groups each in 300 others reaches
+// 90,300, and only the tenant's groups bound how many. Nothing bounds them together, as whether
+// nesting a group keeps every identity under it within a bound turns on each one's other groups,
+// which the change would read under the tenant's nesting lock: seconds, for a group of thousands.
 const MaxGroupsOfPrincipal = 1000
 
 // Membership is an identity's membership of a tenant. A member holds what it is granted there and
