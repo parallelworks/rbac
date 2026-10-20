@@ -606,9 +606,10 @@ flowchart LR
 
 - **What a record holds.** Each holds the row as it was and as it became, when it took effect,
   the database role that wrote it, and the actor and call it was made through, with what the host
-  attached. A write that bypassed the package is recorded too, with no actor, but the tables hold
-  only what the package could write, and a row of more than 1 MiB as jsonb, or a context of more
-  than 1 MiB, fails its write, so no record is one `History` can't return. A row written before
+  attached. A write that bypassed the package is recorded too, with no actor. The tables bound its
+  row as the package bounds what it writes, but for the ids in its lists of principals, which they
+  count in characters rather than bytes, and a row of more than 1 MiB as jsonb, or a context of
+  more than 1 MiB, fails its write, so no record is one `History` can't return. A row written before
   history was installed has one record from migrating, its baseline, dated when it was created, or
   at the epoch where that was before year 1 or at its first instant.
 - **History's order.** `History` reads records in transaction order, and only those of
@@ -665,8 +666,12 @@ Every input that could grow without limit is bounded, so no call's cost depends 
 chose to store beyond these, but for the groups a subject is in through others (below) and for the
 lists, which read what they list: `Filter` reads the subject's grants on the scopes that can reach
 the listed type and the denies on them, and costs each row a few lookups among them however many
-there are. The tables hold rows only within the same bounds, so a role that writes around the
-package can store no row larger than the package writes.
+there are. The tables hold rows within the same bounds, but for the ids in a deny's principals and
+exemptions and an eligibility's approvers: a check can count an array element's bytes only with a
+function of the package's own, which every role writing the table would need `EXECUTE` on, so the
+tables count those in characters, to `MaxID`, and a role that writes around the package can store
+them at up to four times as many bytes. History refuses a row of more than 1 MiB as jsonb all the
+same.
 
 | Bound | Value | What it limits |
 |---|---|---|
