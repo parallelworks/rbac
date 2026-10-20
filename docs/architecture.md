@@ -441,14 +441,20 @@ sequenceDiagram
   (`activated_through`) and its id (`eligibility_id`), and rests on its holder reaching that
   principal: its own identity, through its membership, or a group, through the places in groups
   from it. Of the eligibilities that allow it, it is made through the one whose path from the
-  holder lasts longest, so leaving a group ends none another path would keep. A change ending a membership or a place sooner, or removing it, holds it, in order,
-  reads the activations of the identities it ends it for, and once it has ended it cuts each short
-  to the latest end of the paths left to its principal, or ends it, whatever another eligibility
-  would allow: worked out again from every eligibility the holder reaches, one whose requirement or
-  approver it never met would count. `Activate` holds the places it can rest on until it commits,
-  in the statement that reads the keys it finds its subject eligible through, so the two wait for
-  each other, and a place nested between them makes no one eligible. Setting the eligibility again
-  or deleting it leaves its activations to their own ends, or to their holders leaving its group.
+  holder lasts longest; of those lasting alike, one needing no approval, then its own, whose path
+  every other rests on too, so leaving a group ends none its own eligibility would keep unless that
+  needs an approval the group's doesn't; their requirements are evaluated cheapest first, as a
+  check's conditions are, and the choice is made of those that hold. Between groups whose paths
+  last alike it is by their approvers, requirements and keys, so leaving one can still end an
+  activation another would keep. A change ending a membership or a place sooner, or removing it,
+  holds it, in order, reads the activations of the identities it ends it for, and once it has
+  ended it cuts each short to the latest end of the paths left to its principal, or ends it,
+  whatever another eligibility would allow: worked out again from every eligibility the holder
+  reaches, one whose requirement or approver it never met would count. `Activate` holds the
+  places it can rest on until it commits, in the statement that reads the keys it finds its
+  subject eligible through, so the two wait for each other, and a place nested between them makes
+  no one eligible. Setting the eligibility again or deleting it leaves its activations to their
+  own ends, or to their holders leaving its group.
 - **Activations stored before migration 0012** record what migrating found: the one eligibility
   for their role on their scope whose principal their holder reached then, or, where it reached
   several or none, nothing. The first change re-checking one that records nothing ends it, as which

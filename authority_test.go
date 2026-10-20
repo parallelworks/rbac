@@ -398,8 +398,10 @@ func TestAnEligibilityAnActivationWasntMadeThroughDoesntKeepIt(t *testing.T) {
 // Of the eligibilities that allow an activation, it is made through the one whose path from its
 // holder lasts longest, activating again until later too: the identity's own, which lasts as long as
 // its membership, or a group it is in for good over one it is in until a time, so leaving the other
-// group keeps it. Which eligibilities allow it is decided first: one needing an approver the
-// activation has none of lasts no longer for being the identity's own.
+// group keeps it. Of those lasting alike, the identity's own is chosen over a group's with a
+// cheaper requirement, as the group's path rests on its membership too. Which eligibilities allow
+// it is decided first: one needing an approver the activation has none of lasts no longer for
+// being the identity's own.
 func TestAnActivationIsMadeThroughThePathThatLastsLongest(t *testing.T) {
 	for name, c := range map[string]struct {
 		// first are the eligibilities u activates through first, and then those set before it
@@ -410,6 +412,9 @@ func TestAnActivationIsMadeThroughThePathThatLastsLongest(t *testing.T) {
 		kept   bool
 	}{
 		"its own over a group's": {first: []rbac.Eligibility{{Principal: groupOf("oncall")}, {Principal: identity("u")}}, kept: true},
+		"its own needing a requirement it meets over a group's needing none": {
+			first: []rbac.Eligibility{{Principal: groupOf("oncall")}, {Principal: identity("u"), Requires: `request.attributes.mfa == true`}}, kept: true,
+		},
 		"its own over a group's, activating again until later": {
 			first: []rbac.Eligibility{{Principal: groupOf("oncall")}}, then: []rbac.Eligibility{{Principal: identity("u")}}, kept: true,
 		},
@@ -423,7 +428,7 @@ func TestAnActivationIsMadeThroughThePathThatLastsLongest(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := grouped(t)
-			ctx := t.Context()
+			ctx := rbac.WithRequest(t.Context(), map[string]any{"mfa": true})
 			h.groups(t, "oncall", "team")
 			h.as(t, "boss")
 			u := h.as(t, "u", "team")
@@ -455,6 +460,79 @@ func TestAnActivationIsMadeThroughThePathThatLastsLongest(t *testing.T) {
 			}
 			if allowed(t, h, u, root, cluster) != c.kept {
 				t.Errorf("u holds sudo once it left oncall: %v", !c.kept)
+			}
+		})
+	}
+}
+
+// A path from an activation's holder lasts as long as the soonest of its membership and the places
+// on it, and a principal's as the latest of the paths to it, through groups in groups too, so the
+// activation is made through the eligibility whose principal's lasts longest, and leaving the place
+// that leads to the other keeps it.
+func TestAnActivationsPathLastsAsItsSoonestPlaceAndAPrincipalsAsItsLatestPath(t *testing.T) {
+	type place struct {
+		group     string
+		principal rbac.Principal
+		// ends is how long from now it lasts, zero for good.
+		ends time.Duration
+	}
+	for name, c := range map[string]struct {
+		// membership is how long u's membership lasts, zero for good.
+		membership time.Duration
+		places     []place
+		eligible   []rbac.Principal
+		leave      rbac.Member
+	}{
+		"a path through a place that ends": {
+			places:   []place{{"inner", identity("u"), 3 * time.Hour}, {"oncall", groupOf("inner"), 0}, {"team", identity("u"), 0}},
+			eligible: []rbac.Principal{groupOf("oncall"), groupOf("team")}, leave: rbac.Member{Group: "inner", Principal: identity("u")},
+		},
+		"a group's path through a membership that ends": {
+			membership: 5 * time.Hour, places: []place{{"oncall", identity("u"), 0}},
+			eligible: []rbac.Principal{groupOf("oncall"), identity("u")}, leave: rbac.Member{Group: "oncall", Principal: identity("u")},
+		},
+		"the latest of the paths to a group": {
+			places: []place{
+				{"oncall", identity("u"), 3 * time.Hour}, {"inner", identity("u"), 0}, {"oncall", groupOf("inner"), 0}, {"team", identity("u"), 4 * time.Hour},
+			},
+			eligible: []rbac.Principal{groupOf("oncall"), groupOf("team")}, leave: rbac.Member{Group: "team", Principal: identity("u")},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := grouped(t)
+			ctx := t.Context()
+			h.groups(t, "oncall", "inner", "team")
+			u := h.as(t, "u")
+			if c.membership != 0 {
+				if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: u.Principal, ExpiresAt: h.now.Add(c.membership)}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var places []rbac.Member
+			for _, p := range c.places {
+				m := rbac.Member{Group: p.group, Principal: p.principal}
+				if p.ends != 0 {
+					m.ExpiresAt = h.now.Add(p.ends)
+				}
+				places = append(places, m)
+			}
+			if err := h.authz.ImportMembers(ctx, host, "t1", places); err != nil {
+				t.Fatal(err)
+			}
+			for _, p := range c.eligible {
+				e := rbac.Eligibility{Role: "cluster.sudo", Principal: p, MaxDuration: 8 * time.Hour}
+				if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, e); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := h.authz.Activate(ctx, u, cluster, rbac.Activation{Role: "cluster.sudo", Duration: time.Hour, Justification: "incident"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{c.leave}); err != nil {
+				t.Fatal(err)
+			}
+			if !allowed(t, h, u, root, cluster) {
+				t.Errorf("u leaving %s ended the activation", c.leave.Group)
 			}
 		})
 	}

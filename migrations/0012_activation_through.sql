@@ -8,22 +8,30 @@
 -- grants. Deleting the eligibility leaves both, as it leaves its activations to their own ends. A
 -- column added with no default rewrites no row.
 --
+-- The principal is a key, `kind:id`, of a kind as the package names them and an id of 1 to 512
+-- bytes, as it keeps them, so a row written around the package holds no more. Every row's is null
+-- as the column is added, so the bound is added NOT VALID, reading none of them under the table's
+-- lock: every row written from then on, migrating's too, is checked.
+--
 -- Stop the replicas running code from before this migration before migrating: none may run beside
 -- code after it. Its Activate writes neither column, and one extending an activation leaves those
 -- the earlier request recorded, so the activation rests on that request's path, which it can then
 -- outlast the eligibility of, rather than on the one it was extended through.
-ALTER TABLE rbac_grants ADD COLUMN activated_through text COLLATE "C", ADD COLUMN eligibility_id bigint;
+ALTER TABLE rbac_grants ADD COLUMN activated_through text COLLATE "C", ADD COLUMN eligibility_id bigint,
+    ADD CONSTRAINT rbac_grants_activated_through_check CHECK (activated_through ~ '^[a-z][a-z0-9_-]{0,62}:'
+        AND octet_length(substr(activated_through, strpos(activated_through, ':') + 1)) BETWEEN 1 AND 512) NOT VALID;
 
 -- An activation in force is recorded as made through the one eligibility for its role on its scope,
 -- of those stored, whose principal its holder reaches now, by its membership in force, suspended
 -- too, and the places in groups in force from it, as a change reads the paths an activation rests
 -- on. Where it reaches the principals of several, which made it can't be told; where it reaches
--- none, as once the eligibility it was made through is deleted, nothing says what it rested on.
--- Those record neither, and the first change that re-checks their holder's activations ends them,
--- one setting an end on or removing a membership or place of its holder's, even an end no sooner,
--- rather than leave one through a path it may not have rested on: activating again until later
--- records the eligibility. The package has had no release, so only a developer's database holds
--- any, and none lasts past a year.
+-- none, as once the eligibility it was made through is deleted, nothing says what it rested on; and
+-- one whose principal's id, written around the package, is past the bound, is none the package
+-- made it through. Those record neither, and the first change that re-checks their holder's
+-- activations ends them, one setting an end on or removing a membership or place of its holder's,
+-- even an end no sooner, rather than leave one through a path it may not have rested on: activating
+-- again until later records the eligibility. The package has had no release, so only a developer's
+-- database holds any, and none lasts past a year.
 SELECT set_config('rbac.change', '{"how": "Migrate"}', true);
 WITH RECURSIVE activations AS (
     SELECT id, tenant, principal, scope, role FROM rbac_grants WHERE source = 'activation' AND expires_at > now()
@@ -37,7 +45,7 @@ WITH RECURSIVE activations AS (
     SELECT a.id, min(e.principal) AS through, min(e.id) AS eligibility FROM activations a
     JOIN reaching r ON r.tenant = a.tenant AND r.holder = a.principal
     JOIN rbac_eligibilities e ON e.tenant = a.tenant AND e.scope = a.scope AND e.role = a.role AND e.principal = r.k
-    GROUP BY a.id HAVING count(*) = 1
+    GROUP BY a.id HAVING count(*) = 1 AND max(octet_length(e.principal_id)) <= 512
 )
 UPDATE rbac_grants g SET activated_through = m.through, eligibility_id = m.eligibility FROM made m WHERE g.id = m.id;
 SELECT set_config('rbac.change', '', true);

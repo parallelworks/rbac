@@ -1055,6 +1055,71 @@ func TestMigratingTiesAnActivationToTheEligibilityItWasMadeThrough(t *testing.T)
 	}
 }
 
+// An activation records the principal it was made through as a key the package could make, a kind
+// it names and an id of 1 to MaxID bytes, so a row written around the package holds no more.
+func TestAnActivationRecordsAPrincipalsKeyAlone(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	n := 0
+	insert := func(through *string) error {
+		n++
+		_, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source,
+			expires_at, activated_through) VALUES ('t1', 'cluster', 'c1', 'user', $1, 'cluster.sudo', 'activation', now() + interval '1 hour', $2)`,
+			fmt.Sprintf("u%d", n), through)
+		return err
+	}
+	for _, k := range []string{
+		"user:" + strings.Repeat("x", rbac.MaxID+1), "user:" + strings.Repeat("é", rbac.MaxID/2) + "x", "user:", "user", ":u", "User:u",
+		"1user:u", "user :u", strings.Repeat("k", 64) + ":u", "",
+	} {
+		var pg *pgconn.PgError
+		if err := insert(&k); !errors.As(err, &pg) || pg.Code != "23514" {
+			t.Errorf("an activation through %.20q… stored: %v", k, err)
+		}
+	}
+	for _, k := range []string{
+		"user:" + strings.Repeat("x", rbac.MaxID), "group:" + strings.Repeat("é", rbac.MaxID/2), "service_account:a:b", strings.Repeat("k", 63) + ":u",
+	} {
+		if err := insert(&k); err != nil {
+			t.Errorf("an activation through %.20q…: %v", k, err)
+		}
+	}
+	if err := insert(nil); err != nil {
+		t.Errorf("an activation through none: %v", err)
+	}
+}
+
+// Migrating records no principal past the bound: an eligibility whose principal's id, written around
+// the package, is longer than MaxID is none an activation was made through, and records nothing,
+// where one at the bound records its key.
+func TestMigratingRecordsNoPrincipalPastTheBound(t *testing.T) {
+	pool := pgtest.Open(t, "")
+	ctx := t.Context()
+	migrateFiles(t, pool, "", "0012")
+	long, longest := strings.Repeat("x", rbac.MaxID+1), strings.Repeat("y", rbac.MaxID)
+	for _, id := range []string{long, longest} {
+		for _, sql := range []string{
+			`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', $1)`,
+			`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+			 VALUES ('t1', 'cluster', 'c1', 'user', $1, 'cluster.sudo', 28800)`,
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at)
+			 VALUES ('t1', 'cluster', 'c1', 'user', $1, 'cluster.sudo', 'activation', now() + interval '1 hour')`,
+		} {
+			if _, err := pool.Exec(ctx, sql, id); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	migrateFiles(t, pool, "0012", "")
+	for id, want := range map[string]string{long: "none", longest: "user:" + longest} {
+		var through string
+		if err := pool.QueryRow(ctx, `SELECT coalesce(activated_through, 'none') FROM rbac_grants WHERE principal_id = $1`, id).Scan(&through); err != nil ||
+			through != want {
+			t.Errorf("the activation of an id of %d bytes is made through %.20q…, %v", len(id), through, err)
+		}
+	}
+}
+
 func TestHistoryRefusesACursorItCantFollow(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()

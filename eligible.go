@@ -20,14 +20,15 @@ import (
 // the eligibility, its membership of the tenant or its place in the group that makes it eligible
 // ends, with its justification as the grant's note; one eligible through a group activates for
 // itself. The activation records the eligibility it was made through, of those that allow it the
-// one whose path from its holder lasts longest, and rests on its holder being that one's
-// principal, or in its group, through those it is in: a change ending the
-// membership or a place on the way sooner, or removing it, cuts the activation short to the latest
-// end of the paths left, or ends it if none is left, whatever another eligibility would allow.
-// With Approvers, each activation needs one of them to approve it. What an activation gives, its
-// holder can't hand on past its end, nor as an eligibility; but an activated power to change grants
-// grants for good what its holder holds for good, and the roles a role it activated lists, as any
-// power held for a while does (Authorizer.Apply): make eligible roles that list none.
+// one whose path from its holder lasts longest, and of those lasting alike and needing approval
+// alike its own, and rests on its holder being that one's principal, or in its group, through
+// those it is in: a change ending the membership or a place on the way sooner, or removing it,
+// cuts the activation short to the latest end of the paths left, or ends it if none is left,
+// whatever another eligibility would allow. With Approvers, each activation needs one of them to
+// approve it. What an activation gives, its holder can't hand on past its end, nor as an
+// eligibility; but an activated power to change grants grants for good what its holder holds for
+// good, and the roles a role it activated lists, as any power held for a while does
+// (Authorizer.Apply): make eligible roles that list none.
 type Eligibility struct {
 	Scope     Scope
 	Role      Role
@@ -237,10 +238,11 @@ type Activation struct {
 // through the one whose path from s lasts longest, s's own identity's as long as its membership
 // and a group's as long as the latest of its places to it, and records it: it rests on s being
 // that one's principal or in its group (Eligibility). Of those lasting alike, it is one needing no
-// approval over one that does, then the one whose requirement is cheapest, then s's own. It holds
-// the places in groups s is in until it commits, and finds s eligible through those alone, so a
-// change ending one of them sooner waits for it, and cuts the activation short if it rests on that
-// place.
+// approval over one that does, then s's own, whose path every other rests on too, then the one
+// whose requirement is cheapest; their requirements are evaluated cheapest first, as a check's
+// conditions are. It holds the places in groups s is in until it commits, and finds s eligible
+// through those alone, so a change ending one of them sooner waits for it, and cuts the activation
+// short if it rests on that place.
 func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act Activation) (g Grant, err error) {
 	defer a.refused(ctx, &err, on.Tenant, s.Principal, "Activate")
 	if err := a.check(on); err != nil {
@@ -599,10 +601,10 @@ type madeThrough struct {
 // eligible. It returns the eligibility that allows it and who approved: one of s's identity or of
 // one of its groups there, lasting act.Duration or longer and in force until then, whose
 // requirement holds in the request, failing closed, and whose approvers, if it names any, include
-// act.Approver, who isn't s. Of those, the one whose path from s lasts longest, as the activation
-// rests on it. approved is zero when the eligibility allowing it names none. A privileged role's
-// counts only through s's identity or its groups, as its grants do, never through the tenant's
-// members.
+// act.Approver, who isn't s. Of those, the one whose path from s lasts longest, and of those
+// lasting alike and needing approval alike s's own, as the activation rests on it. approved is
+// zero when the eligibility allowing it names none. A privileged role's counts only through s's
+// identity or its groups, as its grants do, never through the tenant's members.
 func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource, act Activation, until time.Time, reached paths) (through madeThrough, approved Principal, err error) {
 	scope, manage := on.Scope(), GrantPermission(on.Type)
 	approvers, _, err := a.keysOf(ctx, q, on.Tenant, act.Approver)
@@ -627,42 +629,51 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 	if err != nil {
 		return madeThrough{}, Principal{}, err
 	}
-	// Through the path that lasts longest first, so leaving a group ends no activation another
-	// path would keep. Of those lasting alike, those needing no approval first, so an approver
-	// passed where none is needed isn't recorded, and of each the cheapest requirement first, as
-	// checks order conditions, so which allows doesn't rest on how many approvers one names; then
-	// s's own, which rests on s's membership alone, as a group's path does too, then by principal.
+	// Of those that allow it, through the path that lasts longest; of those lasting alike, one
+	// needing no approval, so an approver passed where none is needed isn't recorded; then s's own,
+	// which rests on s's membership alone, as every path does, so leaving a group ends none it
+	// would keep; then the cheapest requirement, and by principal. Requirements are evaluated
+	// cheapest first, as checks order conditions, so one that holds is reached within the budget
+	// however many costly ones stored around the bounds are on paths that last longer, or name
+	// approvers.
 	own := func(e eligibility) int {
 		if e.principal == s.identityKey() {
 			return 1
 		}
 		return 0
 	}
-	slices.SortFunc(found, func(x, y eligibility) int {
-		return cmp.Or(cmp.Compare(own(y), own(x)), strings.Compare(x.principal, y.principal))
-	})
+	outranks := func(x, y eligibility) bool {
+		return cmp.Or(lastsLonger(reached[x.principal], reached[y.principal]),
+			cmp.Compare(min(len(y.approvers), 1), min(len(x.approvers), 1)), cmp.Compare(own(x), own(y))) > 0
+	}
+	slices.SortFunc(found, func(x, y eligibility) int { return strings.Compare(x.principal, y.principal) })
 	cheapestFirst(found, func(e eligibility) string { return e.requires })
-	slices.SortStableFunc(found, func(x, y eligibility) int {
-		return cmp.Compare(min(len(x.approvers), 1), min(len(y.approvers), 1))
-	})
-	slices.SortStableFunc(found, func(x, y eligibility) int { return lastsLonger(reached[y.principal], reached[x.principal]) })
 	reason := fmt.Sprintf("not eligible to activate %s here for %s", act.Role, act.Duration)
 	// The subject holds one eligibility for a role there, and its groups' requirements are bounded
 	// together (SetEligibility).
 	vars, spend := a.vars(ctx, s, manage, on), budgetOf(2*maxCheckCost)
-	for _, e := range found {
+	var chosen *eligibility
+	for i, e := range found {
+		// Found later, one that doesn't outrank the one chosen loses to it, on its requirement or
+		// principal where they tie, so needn't be evaluated.
+		if chosen != nil && !outranks(e, *chosen) {
+			continue
+		}
 		if len(e.approvers) > 0 && !approves(act.Approver, s, countedOf(approvers, broad{}), e.approvers) {
 			reason = fmt.Sprintf("activating %s here needs one of its approvers to approve", act.Role)
 			continue
 		}
 		if e.requires == "" || a.conds.holds(spend, e.requires, vars) {
-			if len(e.approvers) > 0 {
-				return e.madeThrough, act.Approver.Principal, nil
-			}
-			return e.madeThrough, Principal{}, nil
+			chosen = &found[i]
 		}
 	}
-	return madeThrough{}, Principal{}, &DeniedError{Permission: manage, Scope: scope, Reason: reason}
+	switch {
+	case chosen == nil:
+		return madeThrough{}, Principal{}, &DeniedError{Permission: manage, Scope: scope, Reason: reason}
+	case len(chosen.approvers) > 0:
+		return chosen.madeThrough, act.Approver.Principal, nil
+	}
+	return chosen.madeThrough, Principal{}, nil
 }
 
 // approves reports whether approver, by one of its keys in the tenant, its identity or a group it
