@@ -310,21 +310,17 @@ func (a *Authorizer) cleared(ctx context.Context, q DB, on Resource, cs *constra
 }
 
 // labelCheck returns a check refusing, as a DeniedError of p, a change on a resource whose label
-// the actor's holding doesn't satisfy, read on q once, the first time a label asks for values,
-// asking the constraints about them on the tenant through labels: before the change's
-// transaction, and again under its locks, which reads their answers back.
+// the actor's holding doesn't satisfy, read on q through labels the first time a label asks for
+// values in each phase (constrained.holding), asking the constraints about them on the tenant:
+// before the change's transaction, and again under its locks, which reads their answers back.
 func (a *Authorizer) labelCheck(ctx context.Context, q DB, labels *constrained) func(on Resource, p Permission) error {
-	var held *Holding
 	return func(on Resource, p Permission) error {
 		if !on.Labels.asks() {
 			return nil
 		}
-		if held == nil {
-			h, _, err := a.holdingOn(ctx, q, labels.actor, labels)
-			if err != nil {
-				return err
-			}
-			held = &h
+		held, err := labels.holding(ctx, q)
+		if err != nil {
+			return err
 		}
 		if dim := held.Unsatisfied(on.Labels); dim != "" {
 			return &DeniedError{Permission: p, Scope: on.Scope(), Reason: labelRefusal(dim)}
@@ -799,10 +795,30 @@ type constrained struct {
 	// tenant is what they remove of the actor's label values, asked about on the tenant, where it
 	// holds them, for a change on a labeled scope.
 	tenant *constrained
+	// held is the actor's label values read through c, once before the transaction and once in it,
+	// for every label a change checks.
+	held [2]*Holding
 }
 
 func (a *Authorizer) constrain(ctx context.Context, actor Subject, on Resource) *constrained {
 	return &constrained{a: a, ctx: ctx, actor: actor, on: on, asked: map[permissionOn]bool{}, by: map[Permission]string{}}
+}
+
+// holding is the actor's label values, read on q through c, which is on the tenant, the first time
+// a change asks for them before its transaction, and again the first time in it.
+func (c *constrained) holding(ctx context.Context, q DB) (Holding, error) {
+	phase := 0
+	if c.sealed {
+		phase = 1
+	}
+	if c.held[phase] == nil {
+		h, _, err := c.a.holdingOn(ctx, q, c.actor, c)
+		if err != nil {
+			return Holding{}, err
+		}
+		c.held[phase] = &h
+	}
+	return *c.held[phase], nil
 }
 
 func (c *constrained) seal() {

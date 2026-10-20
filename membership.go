@@ -354,8 +354,8 @@ func checkGroup(g GroupDefinition) error {
 
 // SetGroup creates a group in a tenant, or renames or redescribes one, as actor, who needs
 // ManageGroups on the tenant as Config.ResourceOf gives it, not removed by a constraint nor refused
-// by its label. A group from a source the host owns (Config.Sources) only the host changes, with
-// ImportGroups.
+// by its label, nor by the group's, as Config.ResourceOf gives the group. A group from a source the
+// host owns (Config.Sources) only the host changes, with ImportGroups.
 func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string, g GroupDefinition) (err error) {
 	defer a.refused(ctx, &err, tenant, actor.Principal, "SetGroup")
 	if !validID(tenant) {
@@ -378,12 +378,19 @@ func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string,
 	if a.owned[g.Source] {
 		return fmt.Errorf("%w: group %q: only the host makes groups from %s, through ImportGroups", ErrInvalid, g.ID, g.Source)
 	}
+	group, err := a.groupLabeled(ctx, tenant, g.ID, labels)
+	if err != nil {
+		return err
+	}
 	return a.inTx(ctx, tenant, actor.Principal, "SetGroup", func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lock(ctx, tx, tenant, []string{groupKey(g.ID)}, nil); err != nil {
 			return ChangeEvent{}, err
 		}
 		labels.seal()
 		if err := a.mayManageGroups(ctx, tx, actor, ManageGroups, root, labels); err != nil {
+			return ChangeEvent{}, err
+		}
+		if err := a.labelCheck(ctx, tx, labels)(group, ManageGroups); err != nil {
 			return ChangeEvent{}, err
 		}
 		if err := a.notOwnedGroups(ctx, tx, tenant, []string{g.ID}); err != nil {
@@ -506,15 +513,16 @@ func upsertGroups(ctx context.Context, tx pgx.Tx, tenant string, actor Principal
 	return collectGroups(rows)
 }
 
-// DeleteGroup deletes a tenant's group, as actor, who needs ManageGroups on the tenant as SetGroup
-// does, and with it its members and its place in other groups. Its members hold what it and the
-// groups it is in hold, so it refuses a group that, or a group it is in, holds grants or
-// eligibilities in force, which revoking first shows, that a deny names or exempts, or that
-// approves an eligibility's activations: deleting one never changes access as a side effect. It
-// holds the locks of the groups it is in, as a change to their members does, so a grant,
-// eligibility or deny naming one waits for it, or it reads that one. It refuses one from a source
-// the host owns, in a group from one, or with members, a place in a group or grants on it from one.
-// Deleting a group that doesn't exist does nothing.
+// DeleteGroup deletes a tenant's group, as actor, who needs ManageGroups on the tenant, and the
+// group's label, as SetGroup does, and with it its members and its place in other groups. Its
+// members hold what it and the groups it is in hold, so it refuses a group that, or a group it is
+// in, holds grants or eligibilities in force, which revoking first shows, that a deny names or
+// exempts, or that approves an eligibility's activations: deleting one never changes access as a
+// side effect. It holds the locks of the groups it is in, as a change to their members does, so a
+// grant, eligibility or deny naming one waits for it, or it reads that one. It refuses one from a
+// source the host owns, in a group from one, or with members, a place in a group or grants on it
+// from one. Deleting a group that doesn't exist does nothing, and asks Config.ResourceOf nothing of
+// it.
 func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id string) (err error) {
 	defer a.refused(ctx, &err, tenant, actor.Principal, "DeleteGroup")
 	if !validID(tenant) || !validGroupID(id) {
@@ -540,12 +548,23 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 	if err != nil {
 		return err
 	}
+	// A group that doesn't exist has no label to ask the host for, and deleting it does nothing.
+	existed, err := groupExists(ctx, a.db, tenant, id)
+	if err != nil {
+		return err
+	}
+	var group Resource
+	if existed {
+		if group, err = a.groupLabeled(ctx, tenant, id, labels); err != nil {
+			return err
+		}
+	}
 	return a.inTx(ctx, tenant, actor.Principal, "DeleteGroup", func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lockAll(ctx, tx, tenant, scopes, above); err != nil {
 			return ChangeEvent{}, err
 		}
-		var exists bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT FROM rbac_groups WHERE tenant = $1 AND id = $2)`, tenant, id).Scan(&exists); err != nil {
+		exists, err := groupExists(ctx, tx, tenant, id)
+		if err != nil {
 			return ChangeEvent{}, err
 		}
 		labels.seal()
@@ -555,6 +574,12 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 		// Without a group, the grants and denies on its scope are no group's to remove.
 		if !exists {
 			return ChangeEvent{}, nil
+		}
+		if !existed {
+			return ChangeEvent{}, fmt.Errorf("%w: group %q was made while this change waited; try again", ErrConflict, id)
+		}
+		if err := a.labelCheck(ctx, tx, labels)(group, ManageGroups); err != nil {
+			return ChangeEvent{}, err
 		}
 		if err := a.notOwnedGroups(ctx, tx, tenant, []string{id}); err != nil {
 			return ChangeEvent{}, err
@@ -592,6 +617,13 @@ func upOf(ctx context.Context, q DB, tenant, id string, now time.Time) ([]string
 		return nil, err
 	}
 	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
+// groupExists reports, on q, whether a tenant has a group.
+func groupExists(ctx context.Context, q DB, tenant, id string) (bool, error) {
+	var exists bool
+	err := q.QueryRow(ctx, `SELECT EXISTS (SELECT FROM rbac_groups WHERE tenant = $1 AND id = $2)`, tenant, id).Scan(&exists)
+	return exists, err
 }
 
 // deletable refuses deleting a group an actor asks to delete when that would change access, its
@@ -847,6 +879,23 @@ func (a *Authorizer) mayManageGroups(ctx context.Context, q DB, actor Subject, p
 	return nil
 }
 
+// groupLabeled returns a group as Config.ResourceOf gives it, as ChangeMembers reads the groups it
+// changes, before a change's transaction, refusing an actor its label refuses, as a change to its
+// members does: ManageGroups is the tenant's, but who can't see a group doesn't rename or delete
+// it. labels is what mayManageGroups reads the actor's label values through, and the transaction
+// checks the label again with it. Without declared labels the host isn't asked: nothing it returns
+// is checked, and a host that knows no group it hasn't made yet would refuse making one.
+func (a *Authorizer) groupLabeled(ctx context.Context, tenant, id string, labels *constrained) (Resource, error) {
+	if len(a.labels) == 0 {
+		return Resource{Tenant: tenant, Type: GroupScope, ID: id}, nil
+	}
+	group, _, err := a.hostResource(ctx, tenant, Scope{Type: GroupScope, ID: id})
+	if err != nil {
+		return Resource{}, err
+	}
+	return group, a.labelCheck(ctx, a.db, labels)(group, ManageGroups)
+}
+
 // tenantLabels is what the constraints remove of actor's label values in a tenant, for
 // mayManageGroups to ask before a change's transaction and read back in it.
 func (a *Authorizer) tenantLabels(ctx context.Context, actor Subject, tenant string) *constrained {
@@ -881,7 +930,7 @@ func collectGroups(rows pgx.Rows) ([]GroupDefinition, error) {
 // clearsAll reports whether the actor's label values, read on q through labels, satisfy every label
 // a resource can have.
 func (a *Authorizer) clearsAll(ctx context.Context, q DB, labels *constrained) (bool, error) {
-	h, _, err := a.holdingOn(ctx, q, labels.actor, labels)
+	h, err := labels.holding(ctx, q)
 	return err == nil && h.clearsAll(), err
 }
 

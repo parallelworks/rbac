@@ -669,7 +669,8 @@ type Config struct {
 	ValidateGrant func(ctx context.Context, q DB, in GrantInput) error
 	Constraints   []Constraint
 	// ResourceOf returns the resource a scope is, with its ancestors, attributes and label, as the
-	// host passes it to a check. SetGroup and DeleteGroup check ManageGroups on the tenant, and
+	// host passes it to a check. SetGroup and DeleteGroup check ManageGroups on the tenant, and,
+	// where Labels are declared, the group's label, a group SetGroup creates included, and
 	// ChangeMembers GroupMembers on each group it changes, on the resource it returns, and a change
 	// to a group's members as the grants and denies it amounts to, and a removal by the label, on
 	// each scope the group's access is on, the tenant's and groups' included, which the package knows

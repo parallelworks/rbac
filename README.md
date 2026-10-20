@@ -115,11 +115,11 @@ reach, to check one by one.
   grants give, nor do `Apply`, `SetEligibility` and `DeleteEligibility` change its grants, nor
   `SetDeny` and `DeleteDeny` its denies, nor `SetRole` and `DeleteRole` the grants of a role on it,
   nor `ChangeMembers` the members of a labeled group, or of one holding access or exempt from a deny
-  on a labeled scope, nor `SetGroup` and `DeleteGroup` the groups of a labeled tenant, each reading
-  the actor's values again under the change's locks; `Explain` names the dimension that failed.
-  `Filter` tests a `text[]` label column (`Columns.Labels`), which needs no index, as the path's
-  drives the query; `Reachable` returns the holding, and `Holding` with `Satisfies` checks data
-  points in a feed without reading the database.
+  on a labeled scope, nor `SetGroup` and `DeleteGroup` a labeled group or the groups of a labeled
+  tenant, each reading the actor's values again under the change's locks; `Explain` names the
+  dimension that failed. `Filter` tests a `text[]` label column (`Columns.Labels`), which needs no
+  index, as the path's drives the query; `Reachable` returns the holding, and `Holding` with
+  `Satisfies` checks data points in a feed without reading the database.
 - **Writing labeled data:** data read under one label is written under another only if
   `Holding.MayWrite` allows it: the writer satisfies the label it read, and the new one is at
   least as restrictive in every dimension (a level as high, every compartment kept, partners
@@ -221,9 +221,10 @@ reach, to check one by one.
   deny changes its members freely, and one holding a role only if they could grant that role
   themselves. `Config.ResourceOf` gives the package the tenant, which `SetGroup` and `DeleteGroup`
   check `rbac.ManageGroups` on, and the groups, which `ChangeMembers` checks `rbac.GroupMembers`
-  on, each with its constraints and label, and the containers, label and attributes of the scopes
-  a group's access is on; a host without it declares no labels and resource attributes as none,
-  and for access below the tenant, no containers.
+  on and `SetGroup` and `DeleteGroup` the label of, each with its constraints and label, and the
+  containers, label and attributes of the scopes a group's access is on; a host without it
+  declares no labels and resource attributes as none, and for access below the tenant, no
+  containers.
 - **Privileged roles:** a role the catalog marks `Privileged`, or one that changes access, is
   privileged: it is never granted to the tenant's members, and gives nothing through them, as
   after a catalog change.

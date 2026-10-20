@@ -2942,6 +2942,28 @@ func TestARemovalWithoutLabelsIsNotTriedAgainForAGrantMadeMeanwhile(t *testing.T
 	}
 }
 
+// Without declared labels, SetGroup and DeleteGroup don't ask Config.ResourceOf about the group,
+// which has no label to check, so a host that knows no group it hasn't made yet can still make one.
+func TestManagingGroupsWithoutLabelsAsksTheHostNothingOfThem(t *testing.T) {
+	h := grouped(t, func(c *rbac.Config) {
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s.Type == rbac.GroupScope {
+				return rbac.Resource{}, fmt.Errorf("the host has no group %q", s.ID)
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	groups := h.as(t, "groups")
+	if err := h.authz.SetGroup(ctx, groups, "t1", rbac.GroupDefinition{ID: "fresh"}); err != nil {
+		t.Fatalf("making a group: %v", err)
+	}
+	if err := h.authz.DeleteGroup(ctx, groups, "t1", "fresh"); err != nil {
+		t.Fatalf("deleting a group: %v", err)
+	}
+}
+
 func TestAGroupApprovingWhatCantBeGrantedNowTakesNoMembers(t *testing.T) {
 	h := grouped(t)
 	ctx := t.Context()

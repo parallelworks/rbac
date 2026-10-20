@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -717,6 +718,164 @@ func TestChangingMembersOfALabeledGroupNeedsItsLabel(t *testing.T) {
 	h.hold(t, "admin", "level:high")
 	if err := h.authz.ChangeMembers(ctx, admin, "t1", add, nil); err != nil {
 		t.Fatalf("with its label: %v", err)
+	}
+}
+
+func TestManagingALabeledGroupNeedsItsLabel(t *testing.T) {
+	high := rbac.Label{"level": {"high"}}
+	var meanwhile func(context.Context) error
+	h := labeled(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), groupMembers,
+			rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}})
+		resourceOf := c.ResourceOf
+		// The groups whose ids start with "vault", made or not, the host labels.
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s.Type == rbac.GroupScope && strings.HasPrefix(s.ID, "vault") {
+				return rbac.Resource{Tenant: tenant, Type: s.Type, ID: s.ID, Labels: high}, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+		// Asked about the actor's clearance, before the change's transaction, the host revokes it.
+		c.Constraints = []rbac.Constraint{{Name: "meanwhile", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if do := meanwhile; do != nil && in.Permission == "level:high" {
+				meanwhile = nil
+				return false, do(ctx)
+			}
+			return false, nil
+		}}}
+	})
+	ctx := t.Context()
+	h.groups(t, "vault", "plain")
+	h.join(t, "u")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "vault", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"))
+	admin := h.as(t, "admin")
+	// As changing its members needs its label, so do renaming it, deleting it with them, and making it.
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "vault", Principal: identity("u")}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("removing a labeled group's member without its label: %v", err)
+	}
+	if err := h.authz.SetGroup(ctx, admin, "t1", rbac.GroupDefinition{ID: "vault", Name: "renamed"}); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("renaming a labeled group without its label: %v", err)
+	}
+	if err := h.authz.DeleteGroup(ctx, admin, "t1", "vault"); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("deleting a labeled group without its label: %v", err)
+	}
+	if err := h.authz.SetGroup(ctx, admin, "t1", rbac.GroupDefinition{ID: "vault-new"}); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("making a group the host labels without its label: %v", err)
+	}
+	if err := h.authz.SetGroup(ctx, admin, "t1", rbac.GroupDefinition{ID: "plain", Name: "renamed"}); err != nil {
+		t.Errorf("renaming an unlabeled group: %v", err)
+	}
+	if err := h.authz.DeleteGroup(ctx, admin, "t1", "plain"); err != nil {
+		t.Errorf("deleting an unlabeled group: %v", err)
+	}
+	if of, err := h.authz.GroupsOf(ctx, "t1", identity("u")); err != nil || !slices.Equal(of, []string{"vault"}) {
+		t.Fatalf("GroupsOf = %v, %v", of, err)
+	}
+	// With it, each is checked again under the change's locks.
+	h.hold(t, "admin", "level:high")
+	for name, change := range map[string]func() error{
+		"SetGroup": func() error {
+			return h.authz.SetGroup(ctx, admin, "t1", rbac.GroupDefinition{ID: "vault", Name: "renamed"})
+		},
+		"DeleteGroup": func() error { return h.authz.DeleteGroup(ctx, admin, "t1", "vault") },
+	} {
+		meanwhile = func(ctx context.Context) error {
+			return h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "admin")})
+		}
+		if err := change(); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("%s once the actor lost the group's label meanwhile: %v", name, err)
+		}
+		if meanwhile != nil {
+			t.Fatalf("%s: the clearance should have been revoked meanwhile", name)
+		}
+		h.hold(t, "admin", "level:high")
+	}
+	if err := h.authz.SetGroup(ctx, admin, "t1", rbac.GroupDefinition{ID: "vault", Name: "renamed"}); err != nil {
+		t.Errorf("renaming a labeled group with its label: %v", err)
+	}
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "vault", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.DeleteGroup(ctx, admin, "t1", "vault"); err != nil {
+		t.Errorf("deleting a labeled group with its label: %v", err)
+	}
+}
+
+// A change reads the actor's label values once before its transaction and once in it, however many
+// labels it checks: managing a labeled group in a labeled tenant reads them no more than managing
+// an unlabeled one.
+func TestManagingALabeledGroupReadsTheActorsLabelValuesOnce(t *testing.T) {
+	high := rbac.Label{"level": {"high"}}
+	h := labeled(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog),
+			rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}})
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s == rbac.TenantRoot("t1") || s == (rbac.Scope{Type: rbac.GroupScope, ID: "vault"}) {
+				return rbac.Resource{Tenant: tenant, Type: s.Type, ID: s.ID, Labels: high}, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "admin"))
+	admin := h.as(t, "admin")
+	h.hold(t, "admin", "level:high")
+	reads := 0
+	rbac.SetReadingRoles(t, func() { reads++ })
+	count := func(id string) int {
+		t.Helper()
+		reads = 0
+		if err := h.authz.SetGroup(ctx, admin, "t1", rbac.GroupDefinition{ID: id}); err != nil {
+			t.Fatal(err)
+		}
+		return reads
+	}
+	if plain, vault := count("plain"), count("vault"); vault != plain {
+		t.Errorf("making an unlabeled group read the actor's grants %d times, and a labeled one %d", plain, vault)
+	}
+}
+
+// Deleting a group that doesn't exist does nothing, and has no label to ask the host for; one made
+// while the deletion waits for its locks, whose label it didn't read, is tried again.
+func TestDeletingAMissingGroupAsksTheHostNothing(t *testing.T) {
+	h := labeled(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog),
+			rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}})
+		resourceOf := c.ResourceOf
+		// The host knows only the groups it made.
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s.Type == rbac.GroupScope {
+				return rbac.Resource{}, fmt.Errorf("the host has no group %q", s.ID)
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "admin"))
+	admin := h.as(t, "admin")
+	if err := h.authz.DeleteGroup(ctx, admin, "t1", "missing"); err != nil {
+		t.Fatalf("deleting a group that doesn't exist: %v", err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := h.authz.WithTx(tx).ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "missing"}}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- h.authz.DeleteGroup(ctx, admin, "t1", "missing") }()
+	commitOnceWaitedOn(t, h, tx, done)
+	if err := <-done; !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("deleting a group made while the deletion waited: %v", err)
+	}
+	if got, err := h.authz.Groups(ctx, "t1"); err != nil || len(got) != 1 {
+		t.Fatalf("Groups = %+v, %v", got, err)
 	}
 }
 
