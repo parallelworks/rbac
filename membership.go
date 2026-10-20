@@ -685,12 +685,9 @@ func lockedByKeys(table, key, order string, cols ...string) string {
 }
 
 // byKeys is SQL selecting key of the rows of table in tenant $1 whose col is one of the text array
-// keys, each looked up on its own. OFFSET 0 keeps the planner from flattening it into a join to the
-// whole array, which a generic plan, costing the tenant's rows by averages, can run by reading
-// every one.
+// keys, each looked up on its own, as byKey looks them up.
 func byKeys(table, key, col, keys string) string {
-	return "SELECT x." + key + " FROM unnest(" + keys + "::text[]) AS k(k) CROSS JOIN LATERAL (SELECT " + key + " FROM " + table +
-		" WHERE tenant = $1 AND " + col + " = k.k OFFSET 0) x"
+	return byKey(keys, table, col, key, "tenant = $1")
 }
 
 // anyOf is SQL picking, by key, the rows any of selects picks.
