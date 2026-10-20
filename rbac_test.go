@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"maps"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -1795,6 +1796,82 @@ func TestAPrincipalHoldsARoleABoundedNumberOfTimes(t *testing.T) {
 	h.now = h.now.Add(time.Duration(rbac.MaxGrantsPerRole) * time.Hour)
 	if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: until(0, 1)}); err != nil {
 		t.Fatalf("a grant once the others ended: %v", err)
+	}
+}
+
+// A change reaching the tables through a search_path that names another schema first takes the
+// same locks as one that names theirs alone, so it waits for them: two imports that each fill half
+// the bound on a role's grants can't both commit past it.
+func TestChangesThroughAnotherSearchPathWaitForTheSameLocks(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	var schema string
+	if err := h.pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	// A schema of the host's own, first in the other pool's search_path, holding none of the tables.
+	other := schema + "_host"
+	if _, err := h.pool.Exec(ctx, `CREATE SCHEMA `+pgx.Identifier{other}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = h.pool.Exec(context.WithoutCancel(ctx), `DROP SCHEMA IF EXISTS `+pgx.Identifier{other}.Sanitize()+` CASCADE`)
+	})
+	cfg, err := pgxpool.ParseConfig(os.Getenv(pgtest.URLEnv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = pgx.Identifier{other}.Sanitize() + ", " + pgx.Identifier{schema}.Sanitize()
+	cfg.ConnConfig.RuntimeParams["application_name"] = other
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	elsewhere, err := rbac.New(pool, h.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.as(t, "u")
+	half := func(from int) []rbac.Grant {
+		gs := make([]rbac.Grant, rbac.MaxGrantsPerRole/2+1)
+		for i := range gs {
+			gs[i] = grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+			gs[i].ExpiresAt = h.now.Add(time.Duration(from+i+1) * time.Hour)
+		}
+		return gs
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := h.authz.WithTx(tx).Import(ctx, host, "t1", half(0)); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- elsewhere.Import(ctx, host, "t1", half(100)) }()
+	// Commit once the other import has finished or waits on a lock.
+	for waiting := false; !waiting; {
+		select {
+		case err := <-done:
+			done <- err
+			waiting = true
+		default:
+			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity
+				WHERE application_name = $1 AND wait_event_type = 'Lock' AND wait_event = 'advisory')`, other).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("the other import, past the bound once the first committed: %v", err)
+	}
+	if got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{{Kind: rbac.User, ID: "u"}}}); err != nil || len(got) > rbac.MaxGrantsPerRole {
+		t.Fatalf("u holds cluster.login %d times: %v", len(got), err)
 	}
 }
 

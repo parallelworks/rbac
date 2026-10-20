@@ -456,7 +456,8 @@ flowchart TB
 
 ## Transactions and locks
 
-Changes take PostgreSQL advisory locks, keyed by the schema, so two changes to the same rows run
+Changes take PostgreSQL advisory locks, keyed by the schema holding the tables, as every session
+reaching them names it whatever its search_path, so two changes to the same rows run
 one after the other, each taking its locks in one order. The locks last until the transaction
 ends, so under `WithTx` two host transactions changing the same scopes or principals in opposite
 orders can still deadlock, as can a change that also writes rows it doesn't lock: PostgreSQL fails

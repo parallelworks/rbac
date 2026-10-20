@@ -328,7 +328,9 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   runs by itself; a host with a migration tool of its own can apply `rbac.Migrations()` instead.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
-  between host transactions, matches `rbac.ErrConflict`: try it again.
+  between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows
+  wait for each other by locks named for the schema holding the tables, so sessions reaching them
+  through different search_paths still do.
 - **What the host passes:** a check reads grants, memberships and groups as they are; only compiled
   conditions are cached. Read a resource's ancestors and attributes from where they are stored,
   never from request input, no earlier than the content they protect, and from the primary. A

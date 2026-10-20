@@ -306,10 +306,13 @@ func (a *Authorizer) changing(actor Subject, on Resource, cs *constrained) error
 // changes to the same rows run in turn. A change that also changes rows it doesn't lock, as
 // deleting groups changes denies and eligibilities on other scopes and SetMemberships removes an
 // ended membership's places in groups, can still deadlock with another change: PostgreSQL ends
-// one, which matches ErrConflict. The locks last until the
-// transaction ends. Advisory locks span the database, so the keys name the
-// schema: another application's grants are in a schema of their own.
-const lockKey = `hashtextextended(current_schema() || '/rbac/' || $1, 0)`
+// one, which matches ErrConflict. The locks last until the transaction ends. Advisory locks span
+// the database, so the keys name the schema holding the tables, as the session's statements reach
+// them: another application's grants are in a schema of their own. Not current_schema(), the first
+// in the search_path that exists, which two sessions reaching the same tables through paths that
+// differ before it name apart, so their changes would never wait for each other.
+const lockKey = `hashtextextended((SELECT n.nspname FROM pg_catalog.pg_class c
+	JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = 'rbac_grants'::regclass) || '/rbac/' || $1, 0)`
 
 // maxLocks is how many scopes and principals a change locks one by one; a larger one locks the
 // tenant, rather than fill PostgreSQL's lock table, which every session shares.
