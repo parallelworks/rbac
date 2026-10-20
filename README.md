@@ -383,7 +383,10 @@ itself, nor `pg_execute_server_program`, `pg_write_server_files` or `pg_read_ser
 which it could run any program as the server's operating system user, write any of its files, or
 read any, as one that holds a superuser's password; before PostgreSQL 16 it has no `CREATEROLE`,
 with which it could make itself a member of any role but a superuser, such as those or the roles
-below; and:
+below; it has no `REPLICATION` attribute, with which it could read every data file over a base
+backup, as `pg_read_server_files` can; from PostgreSQL 15 on, it has no `SET` or `ALTER SYSTEM`
+privilege on a parameter only a superuser may set (`GRANT ... ON PARAMETER`), with which it could
+have the server load a library or run a program of its choosing; and:
 
 1. `Migrate` runs as an administrator's role the application's isn't a member of, with only the
    package's schema in its search_path, so that role owns the package's tables: their owner can

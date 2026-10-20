@@ -644,8 +644,9 @@ The application's database role must not be able to rewrite history, so the sche
 three roles, and that role is no superuser and holds no role with a superuser's power or a way to
 it: not `pg_write_all_data` or `pg_create_subscription`, through which it could write history, nor
 `pg_execute_server_program`, `pg_write_server_files` or `pg_read_server_files`, which run programs
-and write and read files as the server. The README's [History](../README.md#history) section has
-the exact grants.
+and write and read files as the server; it has no `REPLICATION` attribute, which reads every data
+file, nor `SET` or `ALTER SYSTEM` on a parameter only a superuser may set. The README's
+[History](../README.md#history) section has the exact grants.
 
 ```mermaid
 flowchart LR
