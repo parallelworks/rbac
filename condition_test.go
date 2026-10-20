@@ -651,6 +651,12 @@ func TestAConditionCostsNoMoreThanItsBound(t *testing.T) {
 		{`(request.attributes.mfa ? request.attributes.team : "none") == "sre"`, true},
 		{`[1, 2, 3].all(i, i > 0) && [request.attributes.x] == [1] && {"a": request.attributes.x} == {"a": 1}`, true},
 		{`[1, 2] + [3] == [1, 2, 3] && "a" + "b" == "ab" && size("abc") == 3 && action == "cluster:login"`, true},
+		// What map() and filter() make of literals is bounded by them, so looping over it is cheap too.
+		{`[1, 2].map(x, "ab").all(s, s.contains("a"))`, true},
+		{`[1, 2, 3].map(x, [x, x]).all(l, l.all(y, y > 0))`, true},
+		{`["abc"].map(s, s + s + s).all(s, s.matches("c$")) && [[1], []].map(l, l + l).all(l, 1 in l)`, true},
+		{`["10.0.0.1", "10.0.0.2"].filter(ip, ip.startsWith("10.")).exists(ip, request.attributes.ip == ip)`, true},
+		{`[1, 2, 3].filter(x, x > 1).map(x, [x]) == [2, 3].map(x, [x]) && [[], ["ab"]].all(l, l.all(s, s.contains("a")))`, true},
 		{`"gpu" in request.attributes.tags`, false},
 		{`request.attributes.team in {"sre": true}`, false},
 		{`size(request.attributes.tags) > 0`, false},
@@ -660,6 +666,9 @@ func TestAConditionCostsNoMoreThanItsBound(t *testing.T) {
 		{`string(request.attributes.n) == "3" || int(request.attributes.n) > 2`, false},
 		{`request.attributes.ip + request.attributes.team == "ab"`, false},
 		{`[1,2,3,4,5,6,7,8].all(a, [1,2,3,4,5,6,7,8].all(b, [1,2,3,4,5,6,7,8].all(c, [1,2,3,4,5,6,7,8].all(d, a > 0))))`, false},
+		{`request.attributes.tags.map(t, "gpu").exists(t, t == "gpu")`, false},
+		{`["a", "b"].map(x, request.attributes.team).exists(t, t.contains("s"))`, false},
+		{`request.attributes.tags.filter(t, t != "").exists(t, t == "gpu")`, false},
 	} {
 		for i, attributes := range requests {
 			limit, actual := rbac.ConditionCost(t, c.expr, attributes)

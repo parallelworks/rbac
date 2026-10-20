@@ -471,7 +471,13 @@ var anything = extent{value: unbounded, text: unbounded, length: unbounded, byte
 
 func (x extent) union(y extent) extent {
 	u := extent{value: max(x.value, y.value), text: max(x.text, y.text), length: max(x.length, y.length), bytes: max(x.bytes, y.bytes)}
-	if x.elem != nil && y.elem != nil {
+	// A value of no elements, as the empty list map() and filter() start from, has none to bound.
+	switch {
+	case x.length == 0:
+		u.elem = y.elem
+	case y.length == 0:
+		u.elem = x.elem
+	case x.elem != nil && y.elem != nil:
 		e := x.elem.union(*y.elem)
 		u.elem = &e
 	}
@@ -567,14 +573,27 @@ func (w worst) typed(e ast.Expr) extent {
 func (w worst) comprehension(e ast.Expr) (uint64, extent) {
 	comp := e.AsComprehension()
 	n, over := w.walk(comp.IterRange())
-	init, _ := w.walk(comp.AccuInit())
+	init, start := w.walk(comp.AccuInit())
+	// A macro making a list, as map() and filter() do, starts from an empty one, and each loop's step
+	// adds to it what it would add to that: one element, transformed or as it is, which reads no
+	// other, as no condition can name the list being made.
+	making := comp.AccuInit().Kind() == ast.ListKind
+	var accu *extent
+	if making {
+		accu = &start
+	}
 	w.vars[comp.IterVar()] = append(w.vars[comp.IterVar()], over.elem)
 	if comp.HasIterVar2() {
 		w.vars[comp.IterVar2()] = append(w.vars[comp.IterVar2()], nil)
 	}
-	w.vars[comp.AccuVar()] = append(w.vars[comp.AccuVar()], nil)
+	w.vars[comp.AccuVar()] = append(w.vars[comp.AccuVar()], accu)
 	cond, _ := w.walk(comp.LoopCondition())
-	step, _ := w.walk(comp.LoopStep())
+	step, once := w.walk(comp.LoopStep())
+	x := w.typed(e)
+	if making {
+		x = grown(start, once, over.length)
+		w.vars[comp.AccuVar()][len(w.vars[comp.AccuVar()])-1] = &x
+	}
 	result, _ := w.walk(comp.Result())
 	for _, v := range []string{comp.IterVar(), comp.IterVar2(), comp.AccuVar()} {
 		if xs := w.vars[v]; len(xs) > 0 && (v != comp.IterVar2() || comp.HasIterVar2()) {
@@ -583,12 +602,14 @@ func (w worst) comprehension(e ast.Expr) (uint64, extent) {
 	}
 	// Each element evaluates the condition, and the step while it holds.
 	loops := cost.SafeMultiply(over.length, cost.SafeAdd(cond, step))
-	x := w.typed(e)
-	// A macro making a list, as map() and filter() do, makes one of at most as many elements.
-	if comp.AccuInit().Kind() == ast.ListKind {
-		x.length = over.length
-	}
 	return cost.SafeAdd(cost.SafeAdd(n, init), cost.SafeAdd(loops, result)), x
+}
+
+// grown is the most a list can be that starts as start and grows, each of n loops, by as much as
+// once, a loop's step from start, grew it.
+func grown(start, once extent, n uint64) extent {
+	more := func(from, to uint64) uint64 { return cost.SafeAdd(from, cost.SafeMultiply(n, to-min(to, from))) }
+	return extent{value: more(start.value, once.value), text: 1, length: more(start.length, once.length), elem: start.union(once).elem}
 }
 
 func (w worst) call(e ast.Expr) (uint64, extent) {
@@ -677,12 +698,7 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 func added(t *types.Type, x, y extent) extent {
 	switch t.Kind() {
 	case types.ListKind:
-		sum := extent{value: cost.SafeAdd(x.value, y.value), text: 1, length: cost.SafeAdd(x.length, y.length)}
-		if x.elem != nil && y.elem != nil {
-			u := x.elem.union(*y.elem)
-			sum.elem = &u
-		}
-		return sum
+		return extent{value: cost.SafeAdd(x.value, y.value), text: 1, length: cost.SafeAdd(x.length, y.length), elem: x.union(y).elem}
 	case types.StringKind, types.BytesKind:
 		if b := cost.SafeAdd(x.bytes, y.bytes); b != unbounded {
 			return extent{value: 1 + b/10, text: 1 + b/10, bytes: b}
