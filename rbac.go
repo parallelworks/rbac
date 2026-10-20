@@ -914,20 +914,21 @@ func vocabulary(declared []Permission, given map[Permission]bool, roleTypes map[
 	return checked, types, nil
 }
 
-// WithTx returns an Authorizer that runs on tx, so its changes commit or roll back with the
-// host's own writes. Changes need tx at READ COMMITTED, PostgreSQL's default, and fail in a
-// stricter one, whose snapshot can predate the locks they wait for. Their locks last until tx
-// ends, so two transactions that change the same scopes or principals in opposite orders can
-// deadlock, as with any row locks: PostgreSQL fails one, to be retried. DeleteTenant,
-// SetRole and DeleteRole lock the whole tenant, as does a change, Import, DeleteGrants or
-// DeleteScopes that would otherwise lock more than 64 scopes and principals. Make such a call the
+// WithTx returns an Authorizer that runs on tx, so its changes commit or roll back with the host's
+// own writes. Changes need tx at READ COMMITTED, PostgreSQL's default, and fail in a stricter one,
+// whose snapshot can predate the locks they wait for. Their locks last until tx ends, so two
+// transactions that change the same scopes or principals in opposite orders can deadlock, as with
+// any row locks: PostgreSQL fails one, to be retried. DeleteTenant, SetRole and DeleteRole lock the
+// whole tenant, as does any other call that would lock more than 64 scopes and principals: a change
+// by an actor, as Apply or ChangeMembers, and Import, DeleteGrants, DeleteScopes, SetMemberships,
+// ImportGroups, ImportMembers and DeleteMembers, and so SetDeny from 64 groups named, and
+// DeleteGroups from 32 groups, which it locks as scopes and principals both. Make such a call the
 // first change in tx: after another, it waits for every change in the tenant while holding locks
-// they may wait for, and PostgreSQL fails one as a deadlock. Where a label dimension is
-// Exclusive, every change takes a lock of its tenant's first, which the tenant's other changes
-// wait for, so two transactions changing two tenants in opposite orders can deadlock too.
-// Explain, Reachable and Holders read in several statements, on tx at its isolation: at READ
-// COMMITTED each reads a snapshot of its own, so a change committing between them can mix two
-// states.
+// they may wait for, and PostgreSQL fails one as a deadlock. Where a label dimension is Exclusive,
+// every change takes a lock of its tenant's first, which the tenant's other changes wait for, so
+// two transactions changing two tenants in opposite orders can deadlock too. Explain, Reachable and
+// Holders read in several statements, on tx at its isolation: at READ COMMITTED each reads a
+// snapshot of its own, so a change committing between them can mix two states.
 func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 	// One AsOf gave reads its own transaction, whose views are the past: on another, it would read
 	// the tables as they are now.
