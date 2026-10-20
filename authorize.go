@@ -1163,7 +1163,8 @@ type Columns struct {
 	// a column of another type, such as uuid, matches the tenant its text names.
 	Tenant string
 	// Path is a text[] holding the resource's Authorizer.Path, with a GIN index. Its keys are
-	// compared byte for byte, whatever its collation, which the index serves in.
+	// compared byte for byte, whatever its collation, which the index serves in. Its first element,
+	// at whatever subscript the array starts from, is the resource's own key.
 	Path string
 	// Labels is a text[] holding the resource's label as `dimension:value` values, never NULL: '{}'
 	// for none. The label's test, which keeps only the rows the subject's holding satisfies,
@@ -1250,10 +1251,14 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	overlap := "ARRAY(" + grants(arg(5)) + ")"
 	reached := fmt.Sprintf(`(%[1]s && %[2]s AND %[1]s && (%[2]s COLLATE "default"))`, cols.Path, overlap)
 	above, denied := a.reaching(resourceType), a.reaching(resourceType)
+	// A row's own key is its path's first, at the array's lower bound: an array can start from any
+	// subscript, and one stored from 0 holds its second key, a container's, at 1, which no deny or
+	// grant on a resource of the type names.
+	own := fmt.Sprintf(`(%[1]s)[array_lower(%[1]s, 1)] COLLATE "default"`, cols.Path)
 	var deniedByKey string
 	if !a.contains(resourceType) {
 		denied = slices.DeleteFunc(denied, func(t string) bool { return t == resourceType })
-		deniedByKey = fmt.Sprintf(`NOT (%s)[1] COLLATE "default" IN (%s) AND `, cols.Path, denies("ARRAY["+arg(9)+"::text]"))
+		deniedByKey = fmt.Sprintf(`NOT %s IN (%s) AND `, own, denies("ARRAY["+arg(9)+"::text]"))
 	}
 	now := a.cfg.Now()
 	// Which custom roles give p through the public and the tenant's members is read now, and the
@@ -1281,8 +1286,8 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 		reached = keyed(cols.Path, grants(arg(5)))
 	case resources > maxOverlap:
 		above = denied
-		reached = fmt.Sprintf(`((%[1]s)[1] COLLATE "default" IN (%[3]s) OR %[1]s && %[2]s AND %[1]s && (%[2]s COLLATE "default"))`,
-			cols.Path, overlap, grants("ARRAY["+arg(9)+"::text]"))
+		reached = fmt.Sprintf(`(%[4]s IN (%[3]s) OR %[1]s && %[2]s AND %[1]s && (%[2]s COLLATE "default"))`,
+			cols.Path, overlap, grants("ARRAY["+arg(9)+"::text]"), own)
 	}
 	pred := Predicate{
 		SQL: fmt.Sprintf(`(%[1]s = %[2]s AND (%[1]s)::text = %[5]s::text COLLATE "default" AND %[3]s
