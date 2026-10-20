@@ -3,6 +3,7 @@ package rbac
 import (
 	"fmt"
 	"maps"
+	"math"
 	"reflect"
 	"regexp"
 	"slices"
@@ -30,12 +31,12 @@ import (
 // `resource.attributes.env`, and named as identifiers.
 //
 // A condition reading an attribute a request doesn't carry, or carries as a value CEL reads as
-// another type than it is declared, or as nil, is false when it runs, and a deny's applies: a
-// declared attribute passed so fails whatever reads it, comparing it with `!=`, testing it with
-// has(), or a map or list holding it, included, and so does reading the kind's attributes as a
-// whole, by `in`, size(), a macro or comparing them. A name a declared kind doesn't declare, which
-// a condition reads only through dyn(), fails so too. An undeclared kind's are read as passed, and
-// CEL compares values of different types as unequal.
+// another type than it is declared, as nil, or as a double that is NaN or infinite, is false when
+// it runs, and a deny's applies: a declared attribute passed so fails whatever reads it, comparing
+// it with `!=`, testing it with has(), or a map or list holding it, included, and so does reading
+// the kind's attributes as a whole, by `in`, size(), a macro or comparing them. A name a declared
+// kind doesn't declare, which a condition reads only through dyn(), fails so too. An undeclared
+// kind's are read as passed, and CEL compares values of different types as unequal.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
@@ -70,7 +71,9 @@ func (t AttributeType) takes(v any) (ok bool) {
 	case types.Int:
 		return t == AttrInt
 	case types.Double:
-		return t == AttrDouble
+		// NaN compares as false with anything, so a deny ordering it, as `risk >= 0.5`, would lift,
+		// and an infinity is NaN once a condition takes it from another.
+		return t == AttrDouble && !math.IsNaN(float64(v)) && !math.IsInf(float64(v), 0)
 	case types.Bool:
 		return t == AttrBool
 	case types.Timestamp:
@@ -107,7 +110,7 @@ func allStrings(it traits.Iterator, m traits.Mapper) bool {
 const (
 	AttrString    AttributeType = "string"              // string
 	AttrInt       AttributeType = "int"                 // int or int64
-	AttrDouble    AttributeType = "double"              // float64
+	AttrDouble    AttributeType = "double"              // float64, finite
 	AttrBool      AttributeType = "bool"                // bool
 	AttrTimestamp AttributeType = "timestamp"           // time.Time
 	AttrDuration  AttributeType = "duration"            // time.Duration

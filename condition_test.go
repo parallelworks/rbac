@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +49,46 @@ func TestADeclaredAttributePassedAsAnotherTypeFailsItsConditions(t *testing.T) {
 		}
 		if allowed(t, h, v, login, at(env)) {
 			t.Errorf("a deny's condition was lifted for env %#v", env)
+		}
+	}
+}
+
+// NaN compares as false with anything, and an infinity is NaN once taken from another, so either
+// would lift a deny ordering a declared double and hold a grant ordering it the other way.
+func TestADeclaredDoubleThatIsntFiniteFailsItsConditions(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
+		c.Attributes = rbac.Attributes{Request: map[string]rbac.AttributeType{"risk": rbac.AttrDouble}}
+	})
+	ctx := t.Context()
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	g.Condition = rbac.Condition{Expression: `request.attributes.risk < 0.5`}
+	h.seed(t, g, grant(cluster.Scope(), "cluster.login", rbac.User, "v"), grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+	u, v := h.as(t, "u"), h.as(t, "v")
+	d := rbac.Deny{
+		ID: "risky", Principals: []rbac.Principal{v.Principal}, Permissions: []rbac.Permission{login},
+		Condition: rbac.Condition{Expression: `request.attributes.risk >= 0.5`},
+	}
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, d); err != nil {
+		t.Fatal(err)
+	}
+	is := func(s rbac.Subject, risk float64) bool {
+		t.Helper()
+		err := h.authz.Authorize(rbac.WithRequest(ctx, map[string]any{"risk": risk}), s, login, cluster)
+		if err != nil && !errors.Is(err, rbac.ErrDenied) {
+			t.Fatal(err)
+		}
+		return err == nil
+	}
+	if !is(u, 0.1) || !is(v, 0.1) || is(u, 0.9) || is(v, 0.9) {
+		t.Fatal("finite risks the conditions order")
+	}
+	for _, risk := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		if is(u, risk) {
+			t.Errorf("a grant's condition held for risk %v", risk)
+		}
+		if is(v, risk) {
+			t.Errorf("a deny's condition was lifted for risk %v", risk)
 		}
 	}
 }
