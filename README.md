@@ -299,9 +299,11 @@ after a later one is read after it, never skipped, and a record can be read twic
 reads at most `rbac.MaxHistory` records, and past the first, at most `rbac.MaxHistoryBytes` of their
 rows' JSON and their text, so a read of fewer than its limit doesn't mean history holds no more:
 read until one returns none. Any transaction still running in the database cluster, in any of its
-databases, holds `History` back until it ends. A time a record holds as PostgreSQL's infinity, which the tables refuse but an older
-record can hold, reads as an instant just past either end of PostgreSQL's range, as `Record` says,
-so `History` reads on past it. `History` reads the primary, and fails on a replica. A generation
+databases, holds `History` back until it ends, so bound how long one runs where a role can leave
+one open, as with `idle_in_transaction_session_timeout`, or from PostgreSQL 17 on with
+`transaction_timeout`. A time a record holds as PostgreSQL's infinity, which the tables refuse but
+an older record can hold, reads as an instant just past either end of PostgreSQL's range, as
+`Record` says, so `History` reads on past it. `History` reads the primary, and fails on a replica. A generation
 (`Cursor.Generation`) names the cluster, and the database and schema history is in, so no two
 installations in a cluster share one. A failover or a recovery to a point in time starts a new one,
 and a restore that starts none, as from a disk snapshot, loses what came after it: either can number
@@ -355,8 +357,11 @@ floor is at least a year.
 
 A role that owns a table can change it whatever its triggers say, and a schema's owner can drop
 any table in it. So that the application's database role can't rewrite history or write around
-it, that role is no superuser, nor a member of `pg_write_all_data` or `pg_create_subscription`,
-through which it could write `rbac_history` itself, and before PostgreSQL 16 has no `CREATEROLE`,
+it, that role is no superuser and holds no role that has a superuser's power or a way to it: not
+`pg_write_all_data` or `pg_create_subscription`, through which it could write `rbac_history`
+itself, nor `pg_execute_server_program`, `pg_write_server_files` or `pg_read_server_files`, with
+which it could run any program as the server's operating system user, write any of its files, or
+read any, as one that holds a superuser's password; before PostgreSQL 16 it has no `CREATEROLE`,
 with which it could make itself a member of any role but a superuser, such as those or the roles
 below; and:
 
