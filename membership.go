@@ -191,38 +191,38 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 	kinds, ids, sources, notes := make([]string, n), make([]string, n), make([]string, n), make([]string, n)
 	guests, suspended, expires := make([]bool, n), make([]bool, n), make([]pgtype.Timestamptz, n)
 	keys := make([]string, n)
+	var suspendedMembers []string
 	for i, m := range set {
 		kinds[i], ids[i], sources[i], notes[i] = string(m.Principal.Kind), m.Principal.ID, m.Source, m.Note
 		guests[i], suspended[i] = m.Guest, m.Suspended
 		expires[i] = pgtype.Timestamptz{Time: m.ExpiresAt, Valid: !m.ExpiresAt.IsZero()}
 		keys[i] = m.Principal.key()
+		if m.Suspended && !m.Guest {
+			suspendedMembers = append(suspendedMembers, keys[i])
+		}
 	}
-	return a.inTx(ctx, tenant, actor, "SetMemberships", func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTxReaching(ctx, tenant, actor, "SetMemberships", func(tx pgx.Tx) (ChangeEvent, []string, error) {
 		if err := lockAll(ctx, tx, tenant, nil, keys); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
 		// One time for both statements, under the locks: a membership ending between two reads
 		// would be made anew yet keep its groups. An ended membership's groups go, as DeleteExpired
 		// would remove them, each membership held before its members as there, so the two never
 		// deadlock; and any places of an identity with no membership, which joins in none.
 		at := a.cfg.Now()
-		// A suspended membership widens what its identity will hold once lifted where it is new, was
-		// ended, or was a guest's and no longer is: read before the upsert, for the exclusive values.
-		var widened []Principal
-		if a.exclusive() {
-			rows, err := tx.Query(ctx, `SELECT k FROM unnest($2::text[], $3::bool[], $4::bool[]) AS t(k, g, s)
-				WHERE s AND NOT EXISTS (SELECT FROM rbac_memberships m WHERE m.tenant = $1 AND m.principal = t.k
-				  AND (m.expires_at IS NULL OR m.expires_at > $5) AND (NOT m.guest OR t.g))`,
-				tenant, keys, guests, suspended, at)
+		// A suspended member's membership widens what its identity will hold once lifted where no
+		// member's was in force: it is new, ended or a guest's. A suspended guest's never does, as the
+		// exclusive values count an identity's own grants before it joins. Read before the upsert.
+		var widened []string
+		if a.exclusive() && len(suspendedMembers) > 0 {
+			rows, err := tx.Query(ctx, `SELECT k FROM unnest($2::text[]) AS k WHERE NOT EXISTS (SELECT FROM rbac_memberships m
+				WHERE m.tenant = $1 AND m.principal = k AND NOT m.guest AND (m.expires_at IS NULL OR m.expires_at > $3))`,
+				tenant, suspendedMembers, at)
 			if err != nil {
-				return ChangeEvent{}, err
+				return ChangeEvent{}, nil, err
 			}
-			ks, err := pgx.CollectRows(rows, pgx.RowTo[string])
-			if err != nil {
-				return ChangeEvent{}, err
-			}
-			for _, k := range ks {
-				widened = append(widened, parsePrincipal(k))
+			if widened, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
+				return ChangeEvent{}, nil, err
 			}
 		}
 		left, err := removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant, `principal = ANY(
@@ -230,7 +230,7 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 			|| ARRAY(SELECT k FROM unnest($2::text[]) AS k WHERE NOT EXISTS (SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = k)))`,
 			keys, at)
 		if err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
 		rows, err := tx.Query(ctx, `
 			INSERT INTO rbac_memberships AS m (tenant, principal_kind, principal_id, guest, suspended, source, expires_at, note,
@@ -247,10 +247,10 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 			RETURNING `+membershipColumns,
 			tenant, kinds, ids, guests, suspended, sources, expires, notes, actorKey(actor), at)
 		if err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
 		changed, err := collectMemberships(rows)
-		return ChangeEvent{Memberships: changed, Left: left, widened: widened}, err
+		return ChangeEvent{Memberships: changed, Left: left}, widened, err
 	})
 }
 

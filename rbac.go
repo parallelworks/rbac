@@ -475,9 +475,6 @@ type ChangeEvent struct {
 	// Joined are members added to groups or changed, as they are now; Left, those removed.
 	Joined []Member
 	Left   []Member
-	// widened are the suspended memberships among Memberships that widen what their identities
-	// will hold once lifted, which the exclusive values are checked for.
-	widened []Principal
 }
 
 func (e ChangeEvent) empty() bool {
@@ -514,7 +511,7 @@ type ConstraintInput struct {
 	// Subject is who asks, or who changes access; nil in Holders' first ask, and then each holder
 	// without the attributes Holders doesn't know, as for the label values of a holder of a
 	// labeled resource: answer true there if the constraint removes it from that principal with any.
-	// Authorizer.GroupsOf reads the groups it is in, a suspended member's too.
+	// Authorizer.GroupsOf reads the groups it is in, even while its membership is suspended.
 	Subject *Subject
 	// Resource is what is asked about, with its ancestors and attributes; for what a change hands
 	// on, the scope it is on, whose type is a container's or the tenant's where what it hands on
