@@ -149,6 +149,9 @@ func ConditionCost(t *testing.T, expr string, attributes map[string]any, opts ..
 		Resource{Tenant: "t", Type: "cluster", ID: "c", Attributes: attributes}, attributes, opts...)
 }
 
+// MaxPermission is the longest action conditions are bounded for.
+const MaxPermission = maxPermission
+
 // ConditionCostOn is ConditionCost for s asking to do p to r, on a request with attributes.
 func ConditionCostOn(t *testing.T, expr string, s Subject, p Permission, r Resource, attributes map[string]any, opts ...cel.EnvOption) (limit, actual uint64) {
 	t.Helper()

@@ -30,7 +30,7 @@ import (
 // whenever it runs. Each map names attributes and their types; a nil one leaves that kind
 // undeclared, read as any value under any name. Declared, they are read as fields, such as
 // `resource.attributes.env`, and named as identifiers. A map's entries are declared beside them
-// under the map's name in camel case and then Entry, as `TagsEntry` for `tags` and for `ta_gs`: a
+// under the map's name in camel case and then Entry, as `TagsEntry` for `tags` and for `_tags`: a
 // name no other attribute of its kind may have, nor another map's entries, and that can't begin
 // with a digit, as `_1`'s would. A condition stored under other declarations is checked against
 // these too, once, when a check first reads it: one that no longer passes, as one reading an

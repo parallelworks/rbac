@@ -180,9 +180,11 @@ names the scopes conditional ones reach, to check one by one.
   can leave conditions stored past a bound in the same way: each process bounds a stored condition
   again by what the CEL it is built with makes of it, so another version can bound one more, and
   the package's tests pin the bounds of conditions of common shapes, so that one an upgrade moves
-  fails them. To hand a permission on, the actor holds it unconditionally or under the same
-  condition, one that doesn't read the subject: that one decides for each holder, so the actor's
-  holding says nothing of another's.
+  fails them. Going back to an earlier release of this package does the same where that release
+  bounds a shape more, so while old and new replicas run side by side, the old ones may refuse
+  changes adding a condition to a scope the new ones filled. To hand a permission on, the actor
+  holds it unconditionally or under the same condition, one that doesn't read the subject: that
+  one decides for each holder, so the actor's holding says nothing of another's.
 - **Deny policies:** `SetDeny` puts a deny on a scope: under it, it removes permissions
   (`type:verb`, or `type:*` for a type's every one) from the principals it names, those it exempts
   aside, whatever their grants give. It names and exempts principals a grant could name, so not

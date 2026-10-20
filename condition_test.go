@@ -760,6 +760,12 @@ func TestAConditionCostsNoMoreThanItsBoundWhereCELExpandsMacrosOtherwise(t *test
 func TestAConditionReadingTheIDsACheckPassesCostsLittle(t *testing.T) {
 	longest := strings.Repeat("x", rbac.MaxID)
 	name := "k" + strings.Repeat("x", 62)
+	// The action is bounded at the longest permission, so a pattern admitting longer ones fails here.
+	action := rbac.Permission(name + ":" + name)
+	if !action.Valid() || len(action) != rbac.MaxPermission || rbac.Permission(name+"x:"+name).Valid() ||
+		rbac.Permission(name+":"+name+"x").Valid() {
+		t.Fatalf("the longest permission isn't the %d bytes an action is bounded at", rbac.MaxPermission)
+	}
 	big := strings.Repeat("y", 20000)
 	attributes := map[string]any{"owner": big, "dept": big, "id": big, "tags": []any{big, big}}
 	s := rbac.Subject{Principal: rbac.Principal{Kind: rbac.PrincipalKind(name), ID: longest}, Attributes: attributes}
@@ -775,11 +781,12 @@ func TestAConditionReadingTheIDsACheckPassesCostsLittle(t *testing.T) {
 		{`subject.id in {"alice": true} || action in {"cluster:login": true} || resource.type in {"cluster": 1}`, true},
 		{`subject.id.matches("^svc-") && size(resource.id) > 0 && string(resource.tenant) == subject.id`, true},
 		{`[resource.attributes].exists(subject, subject.owner == .subject.id)`, true},
+		{`[resource.attributes.owner].exists(action, action.startsWith(.action))`, true},
 		{`subject.id in resource.attributes.tags`, false},
 		{`[resource.attributes].exists(subject, subject.id == resource.attributes.owner)`, false},
 		{`resource.attributes.tags.exists(action, action == resource.attributes.owner)`, false},
 	} {
-		limit, actual := rbac.ConditionCostOn(t, c.expr, s, rbac.Permission(name+":"+name), r, attributes)
+		limit, actual := rbac.ConditionCostOn(t, c.expr, s, action, r, attributes)
 		if actual > limit {
 			t.Errorf("%s cost %d, past its bound, %d", c.expr, actual, limit)
 		}
