@@ -126,6 +126,12 @@ BEGIN
     END LOOP;
 END $$;
 
+-- How many bytes a record's rows take as JSON text, which History bounds a read by without reading
+-- them: a read of as many of the largest records the package writes, a deny's changes, would hold
+-- gigabytes. Null for one written before, or by PruneHistory, which History counts by its rows. A
+-- column added with no default rewrites no record.
+ALTER TABLE rbac_history ADD COLUMN bytes integer;
+
 -- History returns each record whole, and PostgreSQL returns no text past 1 GB, so one record past
 -- it stops every read of history from there. The tables bound what they hold, but a change's
 -- context is the writing session's to set, and a column a later migration adds could go unbounded:
@@ -175,7 +181,7 @@ BEGIN
         -- activation Activate makes anew did, rather than by the change that moved it.
         ended := (was->>'expires_at')::timestamptz <= statement_timestamp();
         INSERT INTO rbac_history (effective_at, tenant, entity, key, op, principal, role, scope, group_id, expires_at,
-          before, after, actor, on_behalf_of, how, request, reason)
+          before, after, bytes, actor, on_behalf_of, how, request, reason)
         VALUES (
           greatest(CASE WHEN ended THEN (was->>'expires_at')::timestamptz ELSE statement_timestamp() END,
             (SELECT max(h.effective_at) FROM rbac_history h
@@ -184,14 +190,14 @@ BEGIN
           CASE entity WHEN 'role' THEN was->>'id' ELSE was->>'role' END,
           was->>'scope',
           CASE entity WHEN 'group' THEN was->>'id' WHEN 'member' THEN was->>'group_id' END,
-          (was->>'expires_at')::timestamptz, was, NULL,
+          (was->>'expires_at')::timestamptz, was, NULL, pg_catalog.octet_length(was::text),
           coalesce(change->>'actor', ''), coalesce(change->>'on_behalf_of', ''), coalesce(change->>'how', ''),
           coalesce(change->>'request', ''), coalesce(change->>'reason', ''));
         op := 'create';
         was := NULL;
     END IF;
     INSERT INTO rbac_history (effective_at, tenant, entity, key, op, principal, role, scope, group_id, expires_at,
-      before, after, actor, on_behalf_of, how, request, reason)
+      before, after, bytes, actor, on_behalf_of, how, request, reason)
     VALUES (
       -- A change took effect with its statement, and an expiry when it expired, but neither before
       -- the row's last record: a change can have moved its expiry back to before then. The last a
@@ -206,7 +212,7 @@ BEGIN
       CASE entity WHEN 'role' THEN r->>'id' ELSE r->>'role' END,
       r->>'scope',
       CASE entity WHEN 'group' THEN r->>'id' WHEN 'member' THEN r->>'group_id' END,
-      expiry, was, is_now,
+      expiry, was, is_now, coalesce(pg_catalog.octet_length(was::text), 0) + coalesce(pg_catalog.octet_length(is_now::text), 0),
       coalesce(change->>'actor', ''), coalesce(change->>'on_behalf_of', ''), coalesce(change->>'how', ''),
       coalesce(change->>'request', ''), coalesce(change->>'reason', ''));
     RETURN NULL;

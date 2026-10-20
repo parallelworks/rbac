@@ -357,13 +357,23 @@ type Cursor struct {
 	RecordedAt time.Time
 }
 
-// MaxHistory is the most records one History call reads.
-const MaxHistory = 10000
+// MaxHistory is the most records one History call reads, and MaxHistoryBytes the most bytes of
+// JSON and text it reads in records after the first: of the largest the package writes, a deny's
+// changes, as many records would hold gigabytes.
+const (
+	MaxHistory      = 10000
+	MaxHistoryBytes = 64 << 20
+)
+
+// maxHistoryBytes is MaxHistoryBytes, which a test lowers.
+var maxHistoryBytes = MaxHistoryBytes
 
 // History reads up to limit records after a cursor, and the cursor after them, to export history
-// to storage of the host's own. It orders records by the transaction that wrote them and reads
-// only those of transactions older than any still running, so a transaction that commits after a
-// later one is read after it, never skipped. Transaction ids are the database cluster's, so a
+// to storage of the host's own, but stops short of the record that would bring the bytes of their
+// rows' JSON and their text past MaxHistoryBytes, unless it is the first: a read of fewer than limit
+// records doesn't mean history holds no more, so read until one reads none. It orders records by
+// the transaction that wrote them and reads only those of transactions older than any still
+// running, so a transaction that commits after a later one is read after it, never skipped. Transaction ids are the database cluster's, so a
 // transaction running anywhere in it, in any database, holds the read back until it ends: a long
 // one, or a prepared transaction left open, delays the export. A record can be read twice, as when
 // a host retries a read whose result it lost: dedupe on ID and RecordedAt, since a restore can
@@ -399,12 +409,26 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 		if generation, err = followable(ctx, tx, schema, after); err != nil {
 			return err
 		}
+		// Of the records up to limit, those within the bytes, counted by what rbac_record counted of
+		// their rows, so the rows of those past them are never read; or, for one it didn't count, by
+		// its rows.
 		rows, err := tx.Query(ctx, `
 			SELECT id, txid, recorded_at, effective_at, tenant, entity, key, op, coalesce(principal, ''), coalesce(role, ''),
 			  coalesce(scope, ''), coalesce(group_id, ''), expires_at, before, after, actor, on_behalf_of, how, request, reason, db_user
-			FROM `+historyTable(schema)+`
-			WHERE (txid, id) > ($1::pg_catalog.xid8, $2) AND txid < pg_snapshot_xmin(pg_current_snapshot())
-			ORDER BY txid, id LIMIT $3`, after.TxID, after.ID, limit)
+			FROM (
+			  SELECT h.*, row_number() OVER w AS n,
+			    sum(coalesce(h.bytes, coalesce(pg_catalog.octet_length(h.before::pg_catalog.text), 0) + coalesce(pg_catalog.octet_length(h.after::pg_catalog.text), 0))
+			      + pg_catalog.octet_length(pg_catalog.concat(h.tenant, h.entity, h.key, h.op, h.principal, h.role, h.scope, h.group_id,
+			        h.actor, h.on_behalf_of, h.how, h.request, h.reason, h.db_user))) OVER w AS reached
+			  FROM (
+			    SELECT * FROM `+historyTable(schema)+`
+			    WHERE (txid, id) > ($1::pg_catalog.xid8, $2) AND txid < pg_snapshot_xmin(pg_current_snapshot())
+			    ORDER BY txid, id LIMIT $3
+			  ) h
+			  WINDOW w AS (ORDER BY h.txid, h.id ROWS UNBOUNDED PRECEDING)
+			) p
+			WHERE n = 1 OR reached <= $4
+			ORDER BY txid, id`, after.TxID, after.ID, limit, maxHistoryBytes)
 		if err != nil {
 			return err
 		}

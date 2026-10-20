@@ -1474,6 +1474,60 @@ func TestHistoryRefusesACursorItCantFollow(t *testing.T) {
 	}
 }
 
+// A read of history stops short of the record that would bring what it read past MaxHistoryBytes,
+// but reads the first however large, so an export of the largest records holds no more than about
+// that in memory, and always goes on.
+func TestHistoryReadsAboutMaxHistoryBytesAtOnce(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	var cursor rbac.Cursor
+	drain(t, h, &cursor, 1)
+	var grants []rbac.Grant
+	for _, id := range []string{"a", "b", "c"} {
+		g := grant(cluster.Scope(), "cluster.login", rbac.User, id)
+		g.Note = strings.Repeat("n", rbac.MaxNote)
+		grants = append(grants, g)
+	}
+	if err := h.authz.Import(ctx, host, "t1", grants); err != nil {
+		t.Fatal(err)
+	}
+	// And one whose bytes no trigger counted, as one written before they were, counted by its row.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_history (effective_at, tenant, entity, key, op, principal, after)
+		VALUES (now(), 't1', 'grant', 'd', 'create', 'user:d', jsonb_build_object('note', repeat('n', $1)))`, rbac.MaxNote); err != nil {
+		t.Fatal(err)
+	}
+	all := []rbac.Principal{identity("a"), identity("b"), identity("c"), identity("d")}
+	// Each record more than half of it, then each more than all of it.
+	for _, bytes := range []int{4 << 10, 1 << 10} {
+		rbac.SetMaxHistoryBytes(t, bytes)
+		from := cursor
+		var read []rbac.Principal
+		for deadline := time.Now().Add(10 * time.Second); len(read) < len(all); {
+			got, next, err := h.authz.History(ctx, from, rbac.MaxHistory)
+			switch {
+			case err != nil:
+				t.Fatal(err)
+			case len(got) > 1:
+				t.Fatalf("%d records of %d bytes at most", len(got), bytes)
+			case len(got) == 0 && time.Now().After(deadline):
+				t.Fatalf("read %v", read)
+			case len(got) == 0:
+				time.Sleep(10 * time.Millisecond)
+			}
+			read, from = append(read, principals(got)...), next
+		}
+		slices.SortFunc(read, func(p, q rbac.Principal) int { return strings.Compare(p.ID, q.ID) })
+		if !slices.Equal(read, all) {
+			t.Fatalf("read %v", read)
+		}
+	}
+	// Within it, as many as the limit allows.
+	rbac.SetMaxHistoryBytes(t, rbac.MaxHistoryBytes)
+	if got, _, err := h.authz.History(ctx, cursor, rbac.MaxHistory); err != nil || len(got) != len(all) {
+		t.Fatalf("read %d, %v", len(got), err)
+	}
+}
+
 // A pool's connections can reach different servers, as an old primary and the new one after a
 // failover: History checks the cursor on the server it reads, which here doesn't hold its record.
 func TestHistoryChecksTheCursorWhereItReads(t *testing.T) {

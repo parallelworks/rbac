@@ -295,9 +295,11 @@ when it was created, or a role when it last changed. Nothing updates or truncate
 `PruneHistory` deletes from it, and the package's tables can be deleted from but not truncated.
 `History` reads it in order, to export it to storage of the host's own: a transaction that commits
 after a later one is read after it, never skipped, and a record can be read twice, so dedupe on
-`Record.ID` and `RecordedAt`: a restore can give another record the ID of one it lost. Any
-transaction still running in the database cluster, in any of its databases, holds `History` back
-until it ends. A time a record holds as PostgreSQL's infinity, which the tables refuse but an older
+`Record.ID` and `RecordedAt`: a restore can give another record the ID of one it lost. One call
+reads at most `rbac.MaxHistory` records, and past the first, at most `rbac.MaxHistoryBytes` of their
+rows' JSON and their text, so a read of fewer than its limit doesn't mean history holds no more:
+read until one returns none. Any transaction still running in the database cluster, in any of its
+databases, holds `History` back until it ends. A time a record holds as PostgreSQL's infinity, which the tables refuse but an older
 record can hold, reads as an instant just past either end of PostgreSQL's range, as `Record` says,
 so `History` reads on past it. `History` reads the primary, and fails on a replica. A generation
 (`Cursor.Generation`) names the cluster, and the database and schema history is in, so no two

@@ -23,6 +23,14 @@ func SetMaxPrune(t *testing.T, n int) {
 	t.Cleanup(func() { maxPrune = old })
 }
 
+// SetMaxHistoryBytes bounds the bytes one History call reads to n until t ends.
+func SetMaxHistoryBytes(t *testing.T, n int) {
+	t.Helper()
+	old := maxHistoryBytes
+	maxHistoryBytes = n
+	t.Cleanup(func() { maxHistoryBytes = old })
+}
+
 // SetExpiryBatch bounds what one of DeleteExpired's transactions deletes from a table to n until t
 // ends.
 func SetExpiryBatch(t *testing.T, n int) {
