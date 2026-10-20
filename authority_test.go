@@ -2974,11 +2974,14 @@ func TestDeletingGroupsReadsOnlyWhatNamesThem(t *testing.T) {
 		t.Run(plan, func(t *testing.T) {
 			groups := rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}
 			roles := func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), groups) }
+			// On one connection, where a call made once beforehand has planned its statements: planning
+			// one reads its indexes' metapages, as again once the tables are analyzed, which counts as
+			// pages read.
 			var h *harness
 			if plan == "generic" {
-				h = generic(t, roles)
+				h = crowded(t, pgtest.Open(t, "plan_cache_mode=force_generic_plan&pool_max_conns=1"), roles)
 			} else {
-				h = custom(t, roles)
+				h = setupOn(t, pgtest.Open(t, "plan_cache_mode=force_custom_plan&pool_max_conns=1"), roles)
 			}
 			ctx := t.Context()
 			h.groups(t, "oncall", "pager", "spare", "everyone")
@@ -3014,22 +3017,27 @@ func TestDeletingGroupsReadsOnlyWhatNamesThem(t *testing.T) {
 					"DeleteGroups": func(a *rbac.Authorizer) error { return a.DeleteGroups(ctx, host, "t1", []string{"oncall", "pager"}) },
 					"DeleteGroup":  func(a *rbac.Authorizer) error { return a.DeleteGroup(ctx, admin, "t1", "spare") },
 				} {
-					func() {
-						tx, err := h.pool.Begin(ctx)
-						if err != nil {
-							t.Fatal(err)
-						}
-						defer func() { _ = tx.Rollback(ctx) }()
-						for _, table := range tables {
-							pages[what+" of "+table] -= pagesRead(ctx, t, tx, table)
-						}
-						if err := f(h.authz.WithTx(tx)); err != nil {
-							t.Fatalf("%s: %v", what, err)
-						}
-						for _, table := range tables {
-							pages[what+" of "+table] += pagesRead(ctx, t, tx, table)
-						}
-					}()
+					for _, measured := range []bool{false, true} {
+						func() {
+							tx, err := h.pool.Begin(ctx)
+							if err != nil {
+								t.Fatal(err)
+							}
+							defer func() { _ = tx.Rollback(ctx) }()
+							before := map[string]int64{}
+							for _, table := range tables {
+								before[table] = pagesRead(ctx, t, tx, table)
+							}
+							if err := f(h.authz.WithTx(tx)); err != nil {
+								t.Fatalf("%s: %v", what, err)
+							}
+							for _, table := range tables {
+								if measured {
+									pages[what+" of "+table] = pagesRead(ctx, t, tx, table) - before[table]
+								}
+							}
+						}()
+					}
 				}
 				return pages
 			}
