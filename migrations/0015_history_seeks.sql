@@ -15,3 +15,18 @@ CREATE STATISTICS rbac_history_tenant_entity (mcv) ON tenant, entity FROM rbac_h
 -- Building it reads all of history, and every write to the package's tables, each of which writes
 -- history, waits until the migration commits.
 CREATE INDEX rbac_history_scope ON rbac_history (tenant, entity, scope, effective_at DESC) WHERE entity IN ('grant', 'eligibility');
+
+-- As of a time, Filter and Reachable find the denies naming their subject by the keys they name,
+-- as rbac_denies_principals finds them now, but history held those keys in each version's record
+-- alone, so they read every version of every deny in the tenant. This index holds them as that
+-- one does, and AsOf reads a deny's keys by the same expression, which a plan matches to it.
+-- rbac_text_array is the strings of a JSON array; its body, as rbac_tenant_keys', is parsed now and
+-- names pg_catalog's functions and operators.
+CREATE FUNCTION rbac_text_array(a jsonb) RETURNS text[]
+    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+    RETURN ARRAY(SELECT e FROM pg_catalog.jsonb_array_elements_text(
+        CASE WHEN pg_catalog.jsonb_typeof(a) OPERATOR(pg_catalog.=) 'array' THEN a END) AS e);
+
+CREATE INDEX rbac_history_deny_principals ON rbac_history
+    USING gin (rbac_tenant_keys(tenant, rbac_text_array(after -> 'principals') COLLATE "C")) WITH (fastupdate = off)
+    WHERE entity = 'deny';

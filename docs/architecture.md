@@ -42,7 +42,7 @@ flowchart LR
         tables[("rbac_grants, rbac_roles, rbac_denies,<br/>rbac_eligibilities, rbac_memberships,<br/>rbac_groups, rbac_members")]
         history[("rbac_history")]
         triggers["Triggers: rbac_record,<br/>append-only, no truncate"]
-        fn["rbac_group_members,<br/>rbac_tenant_keys"]
+        fn["rbac_group_members,<br/>rbac_tenant_keys,<br/>rbac_text_array"]
     end
     code -->|"Authorize, Filter, Apply, ..."| api
     api -->|"asks"| hooks
@@ -220,7 +220,8 @@ erDiagram
   those an identity or group leaving the tenant is taken out of, and the denies naming a list's
   subject or its groups, which `Filter` and `Reachable` read, are found through GIN indexes on
   those arrays of keys, each key prefixed by its tenant (`rbac_tenant_keys`), so neither the
-  tenant's other rows nor another tenant's group of the same id are read.
+  tenant's other rows nor another tenant's group of the same id are read. History indexes the keys
+  each version of a deny names so too, so as of a time those lists find them the same way.
 - **Activations are grants** from the source `activation` (`SourceActivation`), made by
   `Activate` from an eligibility, which they record, and ended by their expiry, `Deactivate`, or a
   change ending the membership or a place in a group on their holder's paths to that eligibility's
@@ -658,7 +659,7 @@ file, nor `SET` or `ALTER SYSTEM` on a parameter only a superuser may set. The R
 flowchart LR
     admin["Administrator's role<br/>runs Migrate, owns the tables"]
     histrole["History's role<br/>owns rbac_history and rbac_record"]
-    app["Application's role<br/>DML on the tables, SELECT on history,<br/>EXECUTE rbac_group_members<br/>and rbac_tenant_keys"]
+    app["Application's role<br/>DML on the tables, SELECT on history,<br/>EXECUTE rbac_group_members,<br/>rbac_tenant_keys and rbac_text_array"]
     admin -->|"member of"| histrole
     app -->|"writes"| tables[("rbac_* tables")]
     tables -->|"rbac_record runs as"| histrole

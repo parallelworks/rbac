@@ -164,6 +164,11 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 			if h, ok := e.columns[name]; ok {
 				selected[i] = "h." + h + " AS " + pgx.Identifier{name}.Sanitize()
 			}
+			// The keys a deny names, by the expression history's index on them reads them by
+			// (0015), so a list finds the denies naming its subject as it does now, by that index.
+			if e.table == "rbac_denies" && name == "principals" {
+				selected[i] = pgx.Identifier{schema}.Sanitize() + `.rbac_text_array(h.after -> 'principals') COLLATE "C" AS principals`
+			}
 			// A version recorded before the tables refused an infinite expiry reads as migrating
 			// rewrote its row: a time.Time holds no infinity.
 			if name == "expires_at" {
