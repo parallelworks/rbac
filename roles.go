@@ -8,6 +8,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
@@ -243,7 +244,8 @@ func canonical(r RoleDefinition) RoleDefinition {
 //
 // The actor needs DefineRoles on the tenant, not removed by a constraint (a condition on that
 // right reads the tenant as a resource with no attributes), and every permission
-// the role gives there, for each type it is for, as granting it on the tenant would need. Each
+// the role gives there, for each type it is for, as granting it on the tenant for good would
+// need: a definition never ends, so what the actor holds only until a time can't stand in. Each
 // of its GrantableRoles must be a role the actor may grant on the tenant. Replacing a role
 // another custom role lists needs the power to grant it as defined wherever that one lists it.
 // Replacing one so that its grants give something else changes them, so a constraint that stops
@@ -286,7 +288,7 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 		return err
 	}
 	checked, existed := au.roles.custom[r.ID]
-	var labeled []Scope
+	var labeled labeling
 	if existed && !sameAccess(checked, r) {
 		// Its grants are on scopes of the types it is for, and on those it was for before and is
 		// for again, whose grants it brings back.
@@ -415,7 +417,7 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		return err
 	}
 	checked, existed := roles.role(id)
-	var labeled []Scope
+	var labeled labeling
 	if existed {
 		if err := a.changesStopped(ctx, actor, tenant, checked.ResourceTypes, "revoking "+string(id)); err != nil {
 			return err
@@ -544,6 +546,8 @@ type revalidation struct {
 	scope   Scope
 	binding Binding
 	role    RoleDefinition
+	// eligibility is set on an eligibility's, which a change to members hands on as one.
+	eligibility bool
 }
 
 // revalidated is a revalidation as asked about: the same grant or eligibility, unchanged.
@@ -643,34 +647,62 @@ func (a *Authorizer) revalidate(ctx context.Context, actor Subject, tenant strin
 	return asked, stand, errors.Join(refused...)
 }
 
+// labeling is what labelsAllow checked: the scopes a custom role's grants and eligibilities are
+// on, the resources of those whose label asks for values, and the constraints' answers about the
+// actor's, which stillLabeled reads back.
+type labeling struct {
+	scopes  []Scope
+	labeled []Resource
+	cs      *constrained
+}
+
 // labelsAllow refuses changing what a custom role's grants and eligibilities give, or revoking
 // them, to an actor that a label of a scope they are on refuses, as Apply refuses changing grants
-// there: read before the change's transaction, as labels are the host's. It returns the scopes it
+// there: read before the change's transaction, as labels are the host's. It returns what it
 // checked, which stillLabeled reads again under the change's lock.
-func (a *Authorizer) labelsAllow(ctx context.Context, actor Subject, tenant string, id Role) ([]Scope, error) {
+func (a *Authorizer) labelsAllow(ctx context.Context, actor Subject, tenant string, id Role) (labeling, error) {
 	if len(a.labels) == 0 {
-		return nil, nil
+		return labeling{}, nil
 	}
 	scopes, err := a.roleScopes(ctx, a.db, tenant, id)
 	if err != nil {
-		return nil, err
+		return labeling{}, err
 	}
-	unsatisfied := a.unsatisfiedBy(ctx, actor)
+	l := labeling{scopes: scopes, cs: a.constrain(ctx, actor, Resource{Tenant: tenant, Type: TenantScope, ID: tenant})}
 	for _, s := range scopes {
 		on, err := a.resourceOf(ctx, tenant, s)
 		if err != nil {
-			return nil, err
+			return labeling{}, err
 		}
-		if dim, err := unsatisfied(on); err != nil || dim != "" {
-			return nil, cmp.Or(err, error(&DeniedError{Permission: GrantPermission(s.Type), Scope: s, Reason: labelRefusal(dim)}))
+		if on.Labels.asks() {
+			l.labeled = append(l.labeled, on)
 		}
 	}
-	return scopes, nil
+	return l, a.labelsHeld(ctx, a.db, l)
+}
+
+// labelsHeld refuses, reading the actor's label values on q, a change to a role granted on a scope
+// whose label they don't satisfy.
+func (a *Authorizer) labelsHeld(ctx context.Context, q DB, l labeling) error {
+	if len(l.labeled) == 0 {
+		return nil
+	}
+	h, _, err := a.holdingOn(ctx, q, l.cs.actor, l.cs)
+	if err != nil {
+		return err
+	}
+	for _, on := range l.labeled {
+		if dim := h.Unsatisfied(on.Labels); dim != "" {
+			return &DeniedError{Permission: GrantPermission(on.Type), Scope: on.Scope(), Reason: labelRefusal(dim)}
+		}
+	}
+	return nil
 }
 
 // stillLabeled refuses, under the tenant's lock, a change labelsAllow checked whose role is now
-// granted on a scope it didn't check, as one granted there while the change waited.
-func (a *Authorizer) stillLabeled(ctx context.Context, tx pgx.Tx, tenant string, id Role, checked []Scope) error {
+// granted on a scope it didn't check, as one granted there while the change waited, or whose
+// actor no longer holds the values a label of one asks for, as one revoked meanwhile.
+func (a *Authorizer) stillLabeled(ctx context.Context, tx pgx.Tx, tenant string, id Role, checked labeling) error {
 	if len(a.labels) == 0 {
 		return nil
 	}
@@ -678,8 +710,8 @@ func (a *Authorizer) stillLabeled(ctx context.Context, tx pgx.Tx, tenant string,
 	if err != nil {
 		return err
 	}
-	seen := make(map[Scope]bool, len(checked))
-	for _, s := range checked {
+	seen := make(map[Scope]bool, len(checked.scopes))
+	for _, s := range checked.scopes {
 		seen[s] = true
 	}
 	for _, s := range scopes {
@@ -687,7 +719,10 @@ func (a *Authorizer) stillLabeled(ctx context.Context, tx pgx.Tx, tenant string,
 			return fmt.Errorf("%w: %s was granted on %s while this change waited; try again", ErrConflict, id, s.Key())
 		}
 	}
-	return nil
+	if checked.cs != nil {
+		checked.cs.seal()
+	}
+	return a.labelsHeld(ctx, tx, checked)
 }
 
 // roleScopes reads, on q, the scopes a custom role's grants and eligibilities in force are on,
@@ -804,7 +839,8 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 		}
 	}
 	seen := map[string]bool{}
-	if p, ok := a.holdsRole(au, *r, r.ResourceTypes, "", seen); !ok {
+	// A definition never ends, so what the actor holds only until a time can't stand in.
+	if p, ok := a.holdsRole(au, *r, r.ResourceTypes, "", time.Time{}, seen); !ok {
 		reason := cs.refusal("define "+string(r.ID), p, fmt.Sprintf("the actor can't define %s without holding %s here", r.ID, p))
 		return authority{}, cmp.Or(cs.failed(), error(&DeniedError{Permission: p, Scope: scope, Reason: reason}))
 	}
@@ -821,7 +857,7 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 			if !p.changesGrants() || !a.grantableOn(*r, t) {
 				continue
 			}
-			if missing, ok := a.mayGrant(au, au.under(t, ""), t, *r, "", seen); !ok {
+			if missing, ok := a.mayGrant(au, au.under(t, "", time.Time{}), t, *r, "", time.Time{}, seen); !ok {
 				reason := cs.refusal("define "+string(r.ID), missing, fmt.Sprintf("the actor can't define %s, which %s lists, without the power to grant it on a %s", r.ID, id, t))
 				return authority{}, cmp.Or(cs.failed(), error(&DeniedError{Permission: missing, Scope: scope, Reason: reason}))
 			}

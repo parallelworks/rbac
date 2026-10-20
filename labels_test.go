@@ -524,6 +524,115 @@ func TestWhoCantSeeALabeledScopeSetsNoDenyOnIt(t *testing.T) {
 	}
 }
 
+func TestALabelValueRevokedWhileAChangeWaitsRefusesIt(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	viewer := rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	// Of root, which no change here hands on, so that binding the actor too it refuses none of them.
+	d := rbac.Deny{ID: "d", Principals: []rbac.Principal{rbac.TenantMembers("t1")}, Permissions: []rbac.Permission{root}}
+	pilot := rbac.Binding{Role: "cluster.login", Principal: identity("pilot")}
+	for name, change := range map[string]func(ctx context.Context, h *harness, admin rbac.Subject) error{
+		"Apply": func(ctx context.Context, h *harness, admin rbac.Subject) error {
+			return h.authz.Apply(ctx, admin, secret, rbac.Change{Grant: []rbac.Binding{pilot}})
+		},
+		"SetEligibility": func(ctx context.Context, h *harness, admin rbac.Subject) error {
+			return h.authz.SetEligibility(ctx, admin, secret, rbac.Eligibility{Role: pilot.Role, Principal: pilot.Principal, MaxDuration: time.Minute})
+		},
+		"DeleteEligibility": func(ctx context.Context, h *harness, admin rbac.Subject) error {
+			return h.authz.DeleteEligibility(ctx, admin, secret, pilot.Role, pilot.Principal)
+		},
+		"SetDeny": func(ctx context.Context, h *harness, admin rbac.Subject) error {
+			return h.authz.SetDeny(ctx, admin, secret, rbac.Deny{ID: "e", Principals: d.Principals, Permissions: d.Permissions})
+		},
+		"DeleteDeny": func(ctx context.Context, h *harness, admin rbac.Subject) error {
+			return h.authz.DeleteDeny(ctx, admin, secret, d.ID)
+		},
+		"SetRole": func(ctx context.Context, h *harness, admin rbac.Subject) error {
+			widened := viewer
+			widened.Permissions = []rbac.Permission{view, login}
+			return h.authz.SetRole(ctx, admin, "t1", widened)
+		},
+		"DeleteRole": func(ctx context.Context, h *harness, admin rbac.Subject) error {
+			return h.authz.DeleteRole(ctx, admin, "t1", viewer.ID)
+		},
+		"SetGroup": func(ctx context.Context, h *harness, admin rbac.Subject) error {
+			return h.authz.SetGroup(ctx, admin, "t1", rbac.GroupDefinition{ID: "new"})
+		},
+		"DeleteGroup": func(ctx context.Context, h *harness, admin rbac.Subject) error {
+			return h.authz.DeleteGroup(ctx, admin, "t1", "old")
+		},
+		"ChangeMembers of a labeled group": func(ctx context.Context, h *harness, admin rbac.Subject) error {
+			return h.authz.ChangeMembers(ctx, admin, "t1", []rbac.Member{{Group: "vault", Principal: pilot.Principal}}, nil)
+		},
+		"ChangeMembers granting on a labeled scope": func(ctx context.Context, h *harness, admin rbac.Subject) error {
+			return h.authz.ChangeMembers(ctx, admin, "t1", []rbac.Member{{Group: "ops", Principal: pilot.Principal}}, nil)
+		},
+		"ChangeMembers lifting a deny on a labeled scope": func(ctx context.Context, h *harness, admin rbac.Subject) error {
+			return h.authz.ChangeMembers(ctx, admin, "t1", []rbac.Member{{Group: "exempt", Principal: pilot.Principal}}, nil)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var meanwhile func(context.Context) error
+			h := labeled(t, func(c *rbac.Config) {
+				c.Catalog = append(c.Catalog, guardRole, groupMembers,
+					rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}})
+				resourceOf := c.ResourceOf
+				// The cluster, a group and the tenant, as the host stores them, labeled.
+				c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+					switch s {
+					case secret.Scope():
+						return secret, nil
+					case rbac.Scope{Type: rbac.GroupScope, ID: "vault"}, rbac.TenantRoot("t1"):
+						return rbac.Resource{Tenant: tenant, Type: s.Type, ID: s.ID, Labels: secret.Labels}, nil
+					}
+					return resourceOf(ctx, tenant, s)
+				}
+				// Asked about the actor's clearance, before the change's transaction, the host revokes it.
+				c.Constraints = []rbac.Constraint{{Name: "meanwhile", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+					if do := meanwhile; do != nil && in.Permission == "level:high" {
+						meanwhile = nil
+						return false, do(ctx)
+					}
+					return false, nil
+				}}}
+			})
+			ctx := t.Context()
+			admin := roleAdmin(t, h)
+			h.as(t, "pilot")
+			h.hold(t, "admin", "level:high")
+			h.seed(t, grant(rbac.TenantRoot("t1"), "guard", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "admin"),
+				grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"))
+			// Groups the change to members names: one labeled, one holding a role on the labeled
+			// cluster, and one a deny there exempts.
+			h.groups(t, "vault", "ops", "exempt", "old")
+			h.seed(t, grant(secret.Scope(), "cluster.login", rbac.Group, "ops"))
+			if err := h.authz.SetDeny(ctx, admin, secret, rbac.Deny{ID: "x", Principals: d.Principals, Exempt: []rbac.Principal{groupOf("exempt")}, Permissions: d.Permissions}); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.authz.SetRole(ctx, admin, "t1", viewer); err != nil {
+				t.Fatal(err)
+			}
+			h.seed(t, grant(secret.Scope(), viewer.ID, rbac.User, "pilot"))
+			if err := h.authz.SetEligibility(ctx, admin, secret, rbac.Eligibility{Role: pilot.Role, Principal: pilot.Principal, MaxDuration: time.Hour}); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.authz.SetDeny(ctx, admin, secret, d); err != nil {
+				t.Fatal(err)
+			}
+			meanwhile = func(ctx context.Context) error {
+				return h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "admin")})
+			}
+			h.events = nil
+			if err := change(ctx, h, admin); !errors.Is(err, rbac.ErrDenied) {
+				t.Fatalf("a change made once the actor lost the label value its scope's label asks for: %v", err)
+			}
+			if meanwhile != nil || len(h.events) != 1 || len(h.events[0].Revoked) != 1 {
+				t.Fatalf("the clearance should have been revoked meanwhile, and nothing else changed: %+v", h.events)
+			}
+		})
+	}
+}
+
 func TestFilterNeedsTheLabelColumnWhereLabelsAreDeclared(t *testing.T) {
 	h := labeled(t)
 	s := h.as(t, "u")

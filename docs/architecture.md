@@ -372,6 +372,7 @@ sequenceDiagram
     A->>DB: lock: exclusive/tenant if a dimension is Exclusive, then the tenant<br/>shared and the scope and principals exclusive, or past 64 the tenant exclusive
     A->>DB: the groups named exist, and stillStanding:<br/>memberships unchanged since the host was asked
     A->>DB: authority again, under the locks, the constraints' answers read back
+    A->>DB: the actor's label values again, where the scope is labeled
     A->>DB: revoke and upsert
     DB->>DB: rbac_record writes rbac_history, as the actor
     A->>DB: exclusive values: no one can now hold two
@@ -385,6 +386,11 @@ sequenceDiagram
   `GrantableRoles`, it may grant only those roles, without holding them. Through any other role, it
   may grant a role only if it holds every permission of it, for every type the grant reaches.
   Either way, a limited grant permission can't mint a larger one.
+- **Until when.** What the actor holds only until a time, through an expiring grant, an activation,
+  or a membership or place in a group that ends, it hands on only until then: `authorityOn` reads
+  when each grant's holding ends, in the statement that reads the grants, and a grant may end no
+  later than the latest holding of each permission it hands on. An eligibility, a custom role's
+  definition and a place in a group that gains an eligibility need what they hand on held for good.
 - **Standing.** The host's answers rest on who is a member of what. `stand` fingerprints the
   memberships behind them, and `stillStanding` refuses the change with `ErrConflict` if any changed
   while the change waited for its locks.
@@ -477,6 +483,10 @@ flowchart TB
 - **READ COMMITTED.** A change runs at READ COMMITTED, as its checks under the locks must read what
   committed before the locks were taken. Under `WithTx` the host's transaction must be at READ
   COMMITTED too.
+- **Rows in one order.** `DeleteScopes` holds its scopes' locks and `DeletePrincipal` its
+  principal's, so neither waits for the other, and both delete the principal's grants and
+  eligibilities on those scopes: each locks them in the order of their scopes first, eligibilities
+  before grants, so they don't deadlock.
 - **One snapshot for reads in several statements.** Explain, Reachable, Holders and Conflicts read
   in one REPEATABLE READ, READ ONLY transaction of their own on a pool, and AsOf in a REPEATABLE
   READ one it rolls back; the label values Explain, Reachable and Holders need are read after it.

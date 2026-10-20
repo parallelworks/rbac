@@ -58,27 +58,14 @@ func labelRefusal(dim string) string {
 
 // unsatisfied returns the dimension of r's label that s's holding doesn't satisfy, or "".
 func (a *Authorizer) unsatisfied(ctx context.Context, s Subject, r Resource) (string, error) {
-	return a.unsatisfiedBy(ctx, s)(r)
-}
-
-// unsatisfiedBy is unsatisfied for many resources, reading s's holding in a tenant once, when a
-// label first asks for it.
-func (a *Authorizer) unsatisfiedBy(ctx context.Context, s Subject) func(Resource) (string, error) {
-	held := map[string]Holding{}
-	return func(r Resource) (string, error) {
-		if !r.Labels.asks() {
-			return "", nil
-		}
-		h, ok := held[r.Tenant]
-		if !ok {
-			var err error
-			if h, _, err = a.holding(ctx, r.Tenant, s); err != nil {
-				return "", err
-			}
-			held[r.Tenant] = h
-		}
-		return h.Unsatisfied(r.Labels), nil
+	if !r.Labels.asks() {
+		return "", nil
 	}
+	h, _, err := a.holding(ctx, r.Tenant, s)
+	if err != nil {
+		return "", err
+	}
+	return h.Unsatisfied(r.Labels), nil
 }
 
 // labelDimension is a dimension as checks read it: each value's rank, lowest 0.
@@ -324,6 +311,12 @@ func (a *Authorizer) Holding(ctx context.Context, tenant string, s Subject) (Hol
 // asked without the request's attributes, which a read without the request, as Holders, can't
 // settle.
 func (a *Authorizer) holding(ctx context.Context, tenant string, s Subject) (Holding, map[Permission]bool, error) {
+	return a.holdingOn(ctx, a.db, s, a.constrain(ctx, s, Resource{Tenant: tenant, Type: TenantScope, ID: tenant}))
+}
+
+// holdingOn is holding read on q, asking the constraints through cs, which is on the tenant.
+func (a *Authorizer) holdingOn(ctx context.Context, q DB, s Subject, cs *constrained) (Holding, map[Permission]bool, error) {
+	tenant := cs.on.Tenant
 	h := Holding{tenant: tenant, dims: a.labels, values: map[string]map[string]bool{}, releases: map[string]bool{}, excluded: map[string]bool{}}
 	if len(a.labels) == 0 {
 		return h, nil, nil
@@ -331,7 +324,7 @@ func (a *Authorizer) holding(ctx context.Context, tenant string, s Subject) (Hol
 	// Only the values and the powers to release, so neither the constraints nor the conditions of
 	// the tenant's other permissions are asked about.
 	value := func(p Permission) bool { t, _ := p.parts(); _, ok := a.labels[t]; return ok }
-	perms, byCondition, excluded, err := a.permissionsOf(ctx, s, Resource{Tenant: tenant, Type: TenantScope, ID: tenant}, value)
+	perms, byCondition, excluded, err := a.permissionsOf(ctx, q, s, cs.on, value, cs)
 	if err != nil {
 		return Holding{}, nil, err
 	}

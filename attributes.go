@@ -250,3 +250,113 @@ func typing(attrs Attributes) (*cel.Env, error) {
 		cel.Variable("action", cel.StringType),
 	)
 }
+
+// deepCopy is a copy of v whose maps, slices, arrays, pointers and structs' exported fields are its
+// own, however deep, a protobuf message among them cloned, and a value reached twice copied once,
+// so a cycle ends.
+func deepCopy[T any](v T) T {
+	out := reflect.ValueOf(&v).Elem()
+	out.Set(copier{}.copy(out))
+	return v
+}
+
+// copier copies values for deepCopy, keeping each map, slice and pointer it copied by where it
+// points, its length and its type.
+type copier map[copiedKey]reflect.Value
+
+type copiedKey struct {
+	t   reflect.Type
+	at  uintptr
+	len int
+}
+
+func (c copier) copy(v reflect.Value) reflect.Value {
+	switch v.Kind() {
+	case reflect.Interface:
+		if v.IsNil() {
+			return v
+		}
+		out := reflect.New(v.Type()).Elem()
+		out.Set(c.copy(v.Elem()))
+		return out
+	case reflect.Map:
+		if v.IsNil() {
+			return v
+		}
+		k := copiedKey{v.Type(), v.Pointer(), 0}
+		if done, ok := c[k]; ok {
+			return done
+		}
+		out := reflect.MakeMapWithSize(v.Type(), v.Len())
+		c[k] = out
+		for it := v.MapRange(); it.Next(); {
+			out.SetMapIndex(it.Key(), c.copy(it.Value()))
+		}
+		return out
+	case reflect.Slice:
+		if v.IsNil() {
+			return v
+		}
+		k := copiedKey{v.Type(), v.Pointer(), v.Len()}
+		if done, ok := c[k]; ok {
+			return done
+		}
+		out := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
+		c[k] = out
+		// Each hook is given its own, so elements no write could reach through are copied at once.
+		if flat(v.Type().Elem()) {
+			reflect.Copy(out, v)
+			return out
+		}
+		for i := range v.Len() {
+			out.Index(i).Set(c.copy(v.Index(i)))
+		}
+		return out
+	case reflect.Struct:
+		// Its exported fields, which a hook can write to: an unexported one is out of its reach, as
+		// out of reflection's to set.
+		out := reflect.New(v.Type()).Elem()
+		out.Set(v)
+		for i := range v.NumField() {
+			if f := out.Field(i); f.CanSet() {
+				f.Set(c.copy(v.Field(i)))
+			}
+		}
+		return out
+	case reflect.Array:
+		out := reflect.New(v.Type()).Elem()
+		for i := range v.Len() {
+			out.Index(i).Set(c.copy(v.Index(i)))
+		}
+		return out
+	case reflect.Pointer:
+		if v.IsNil() {
+			return v
+		}
+		if m, ok := v.Interface().(proto.Message); ok {
+			return reflect.ValueOf(proto.Clone(m))
+		}
+		k := copiedKey{v.Type(), v.Pointer(), 0}
+		if done, ok := c[k]; ok {
+			return done
+		}
+		out := reflect.New(v.Type().Elem())
+		c[k] = out
+		out.Elem().Set(c.copy(v.Elem()))
+		return out
+	default:
+		return v
+	}
+}
+
+// flat reports whether a value of type t holds no map, slice or pointer a copy would share.
+func flat(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128, reflect.String:
+		return true
+	default:
+		return false
+	}
+}

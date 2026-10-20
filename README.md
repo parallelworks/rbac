@@ -64,8 +64,15 @@ if err := authz.Authorize(ctx, subject, "cluster:login", cluster); err != nil {
   may grant and revoke only those roles, without holding them; through any other, it may grant a
   role whose every permission it holds, for every type the grant reaches, and revoke any. A
   role's power to change grants counts as part of what it gives, so a limited grant permission
-  can't mint an unlimited one. `Grantable` lists the roles a subject may grant, for an access
-  screen. A grant outlives the actor's own access: put expiries on roles that can't change grants.
+  can't mint an unlimited one. `Grantable` lists the roles a subject may grant, unconditionally and
+  for good, for an access screen.
+- **Until when:** what the actor hands on it holds until the grant ends. What it holds only through
+  grants that end, such as an activation, or through a membership or a place in a group that ends,
+  it grants ending no later than the last of them, and never as an eligibility, a custom role's
+  definition or a place in a group that outlasts it, so access approved for an hour stays an
+  hour's. A grant outlives the actor's power to change grants, though: a power held for an hour
+  grants for good what the actor holds for good, and the roles a role it holds lists, which it
+  needn't hold. Put expiries on roles that list none.
 - **Creators:** nothing is owned. The host gives whoever creates a resource a role on it with
   `Import`, as an actor it names, in the same transaction through `WithTx`.
 
@@ -104,9 +111,12 @@ grants: `Reach.Conditional` names the scopes conditional ones reach, to check on
   all apply to them. `Authorize`, `Explain`, `Permissions`, `Holders` and `Grantable` allow
   nothing of a labeled resource unless what the subject holds satisfies the label, whatever its
   grants give, nor do `Apply`, `SetEligibility` and `DeleteEligibility` change its grants, nor
-  `SetDeny` and `DeleteDeny` its denies; `Explain` names the dimension that failed. `Filter`
-  tests a `text[]` label column (`Columns.Labels`), `Reachable` returns the holding, and `Holding`
-  with `Satisfies` checks data points in a feed without reading the database.
+  `SetDeny` and `DeleteDeny` its denies, nor `SetRole` and `DeleteRole` the grants of a role on it,
+  nor `ChangeMembers` the members of a labeled group, or of one holding access or exempt from a deny
+  on a labeled scope, nor `SetGroup` and `DeleteGroup` the groups of a labeled tenant, each reading
+  the actor's values again under the change's locks; `Explain` names the dimension that failed.
+  `Filter` tests a `text[]` label column (`Columns.Labels`), `Reachable` returns the holding, and
+  `Holding` with `Satisfies` checks data points in a feed without reading the database.
 - **Writing labeled data:** data read under one label is written under another only if
   `Holding.MayWrite` allows it: the writer satisfies the label it read, and the new one is at
   least as restrictive in every dimension (a level as high, every compartment kept, partners
@@ -142,8 +152,9 @@ grants: `Reach.Conditional` names the scopes conditional ones reach, to check on
   another's.
 - **Deny policies:** `SetDeny` puts a deny on a scope: under it, it removes permissions
   (`type:verb`, or `type:*` for a type's every one) from the principals it names, those it exempts
-  aside, whatever their grants give. It exempts identities and groups, or from a deny naming the
-  public the tenant's members, to bind only those who aren't; never the public, which would
+  aside, whatever their grants give. It names and exempts principals a grant could name, so not
+  one of a kind the host doesn't declare. It exempts identities and groups, or from a deny naming
+  the public the tenant's members, to bind only those who aren't; never the public, which would
   exempt everyone, nor one it names. A conditional one denies where its condition holds or can't
   be evaluated. Setting one needs `rbac.DenyPermission(type)` there, which no deny removes, so
   whoever holds it on a scope above can always lift a deny set below. `Filter`, `Reachable` and
@@ -152,7 +163,8 @@ grants: `Reach.Conditional` names the scopes conditional ones reach, to check on
   activate a role on a scope for up to a maximum duration and no later than the eligibility, the
   activator's membership of the tenant, or its place in the group that makes it eligible ends,
   perhaps only where a condition holds, such as a second factor, and perhaps only once one of its
-  `Approvers` approves. `Activate` gives the activator a grant of its own from
+  `Approvers` approves. Setting one needs what granting the role for good does, so no activation
+  can make its holder eligible on looser terms. `Activate` gives the activator a grant of its own from
   `rbac.SourceActivation`, beside any it holds, with its justification and approver. It holds
   one activation of a role on a scope, recording the request its end rests on: activating again
   until later replaces it, one ending no later changes nothing, and once it has ended, activating
@@ -160,8 +172,8 @@ grants: `Reach.Conditional` names the scopes conditional ones reach, to check on
 - **Host policy:** `Config.ValidateGrant` is asked about every grant with the role, the principal,
   the actor and how it is made, so the host decides who may hold what: members only, no
   privileged roles for service accounts or guests. `Config.Constraints` remove permissions above
-  anything a tenant grants or denies, seeing the subject and the resource, such as freezing
-  changes under a container. What one removes from an actor the actor can't hand on, but for a
+  anything a tenant grants or denies, seeing copies of the subject and the resource, such as
+  freezing changes under a container. What one removes from an actor the actor can't hand on, but for a
   role a role it holds lists in `GrantableRoles`, which it grants without holding. The host is
   asked before a change takes its locks, so a change is tried again (`rbac.ErrConflict`) when the
   memberships its answers rest on, of an identity it grants to or of a group's members, changed
@@ -192,17 +204,18 @@ grants: `Reach.Conditional` names the scopes conditional ones reach, to check on
   so `ChangeMembers`, with `rbac.GroupMembers` on the group and its label, checks a change to its members as the
   changes to access it makes, each as `Apply` or `SetDeny` checks one on its scope. An added member
   gains the grants and eligibilities of the group and the groups it is in, those the same change
-  nests it in too, which the actor must be able to grant it, and `ValidateGrant` is asked about
-  each as the member's (`rbac.ViaMembership`); it approves what the group approves, which the
-  actor must be able to set; and it is exempt from the denies the group is exempt from, as a
-  removed member, or one whose membership is made to end sooner, is from those naming it, which
-  the actor must be able to set. So whoever manages a group that holds, approves and is in no deny
-  changes its members freely, and one holding a role only if they could grant that role
-  themselves. `Config.ResourceOf` gives the package the tenant, which `SetGroup` and `DeleteGroup`
-  check `rbac.ManageGroups` on, and the groups, which `ChangeMembers` checks `rbac.GroupMembers` on,
-  each with its constraints and label, and the containers, label and attributes of the scopes a
-  group's access is on; a host without it declares no labels and resource attributes as none, and
-  for access below the tenant, no containers.
+  nests it in too, which the actor must be able to grant it, until its place ends, and an
+  eligibility for good, and `ValidateGrant` is asked about each as the member's
+  (`rbac.ViaMembership`); it approves what the group approves, which the actor must be able to set;
+  and it is exempt from the denies the group is exempt from, as a removed member, or one whose
+  membership is made to end sooner, is from those naming it, which the actor must be able to set.
+  So whoever manages a group that holds, approves and is in no deny changes its members freely, and
+  one holding a role only if they could grant that role themselves. `Config.ResourceOf` gives the
+  package the tenant, which `SetGroup` and `DeleteGroup` check `rbac.ManageGroups` on, and the
+  groups, which `ChangeMembers` checks `rbac.GroupMembers` on, each with its constraints and label,
+  and the containers, label and attributes of the scopes a group's access is on; a host without it
+  declares no labels and resource attributes as none, and for access below the tenant, no
+  containers.
 - **Privileged roles:** a role the catalog marks `Privileged`, or one that changes access, is
   privileged: it is never granted to the tenant's members, and gives nothing through them, as
   after a catalog change.
@@ -349,9 +362,12 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   below a container when it moves.
 - **Permissions:** a check or search of a permission, or a resource type, the host doesn't have
   is refused as `rbac.ErrInvalid`, as a typo, not denied, as is a change on a scope of such a
-  type. They are what the catalog's roles give and are for, or with `Config.Permissions` every
-  permission the host checks, which a catalog an operator configures can leave out of every role:
-  then it is denied like any other.
+  type, a removal too (`Deactivate`, `DeleteScopes`, `DeleteGrants`), which would otherwise
+  succeed having removed nothing. They are what the catalog's roles give and are for, or with
+  `Config.Permissions` every permission the host checks, which a catalog an operator configures
+  can leave out of every role: then it is denied like any other. To retire a type, keep one of its
+  permissions there until its scopes are deleted; `DeletePrincipal` and `DeleteTenant` remove
+  grants on any type.
 - **Limits:** a change takes at most `rbac.MaxBindings` bindings; a principal holds a role on a
   scope at most `rbac.MaxGrantsPerRole` times, and is in a group at most `rbac.MaxPlacesInGroup`
   times, by source, from each source the host owns apart; a scope holds at most `rbac.MaxDenies`

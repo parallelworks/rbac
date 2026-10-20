@@ -50,15 +50,21 @@ func (e *InvalidError) Unwrap() error { return e.Err }
 //     actor hands on, permissions and power alike, it holds unconditionally or under the
 //     condition the grant has: a role a conditional grant lists is granted only under its
 //     condition;
+//   - what the actor hands on, permissions and power alike, it holds until the grant ends: what
+//     it holds only through grants that end, as an activation, or through a membership of the
+//     tenant or a place in a group that ends, it grants ending no later than the last of them,
+//     never for good; a role a role it holds lists, it grants without holding, so for as long as
+//     it likes;
 //   - a role that gives a `:grant` or `:deny` permission, DefineRoles, ManageGroups or
 //     GroupMembers can't be granted to a tenant's members or the public, and only a role marked
 //     Public can be granted to the public;
 //   - a group granted a role, or one a role is granted on, is one of the tenant's: what a grant
 //     naming one that doesn't exist gave would pass to a group made later with its id.
 //
-// Anonymous subjects change nothing. A grant outlives the actor's own access: revoking that
-// access leaves the grants the actor made, as in cloud IAM, so a time-limited power to change
-// grants can make lasting ones, to the actor too. Time-limit roles that can't change grants.
+// Anonymous subjects change nothing. A grant outlives the actor's power to change grants:
+// revoking that power leaves the grants the actor made, as in cloud IAM, so a power held for a
+// while, as one activated, grants for good what the actor holds for good, and the roles a role it
+// holds lists, to the actor too. Time-limit roles that list none.
 //
 // Bindings are checked only once the actor may make the change, so a refused actor learns
 // nothing about principals. Every invalid binding is reported at once, joined; an error from
@@ -124,7 +130,14 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, how
 	named []Principal, check func() error, write func(pgx.Tx) (ChangeEvent, error),
 ) error {
 	scope := on.Scope()
-	au, cs, err := a.mayChangeGrants(ctx, actor, on, grants, revokes)
+	handed := grants
+	if via == ViaEligibility {
+		handed = make([]Binding, len(grants))
+		for i, b := range grants {
+			handed[i] = handedOn(b)
+		}
+	}
+	au, cs, err := a.mayChangeGrants(ctx, actor, on, handed, revokes)
 	if err != nil {
 		return err
 	}
@@ -163,12 +176,15 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, how
 		if err := a.stillStanding(ctx, tx, on.Tenant, stand); err != nil {
 			return ChangeEvent{}, err
 		}
-		// Decided again in the transaction, so the actor's access and the roles are read as the
-		// change is made: a custom role deleted or redefined since is granted only as it is now.
-		// The constraints aren't asked again, as hooks run outside it.
+		// Decided again in the transaction, so the actor's access, its label values and the roles
+		// are read as the change is made: a custom role deleted or redefined since is granted only as
+		// it is now. The constraints aren't asked again, as hooks run outside it.
 		cs.seal()
-		now, err := a.mayChange(ctx, tx, actor, on, grants, revokes, cs)
+		now, err := a.mayChange(ctx, tx, actor, on, handed, revokes, cs)
 		if err != nil {
+			return ChangeEvent{}, err
+		}
+		if err := a.cleared(ctx, tx, on, cs, GrantPermission(scope.Type)); err != nil {
 			return ChangeEvent{}, err
 		}
 		var bad []error
@@ -276,11 +292,28 @@ func (a *Authorizer) mayChangeGrants(ctx context.Context, actor Subject, on Reso
 	if err := a.changing(actor, on, cs); err != nil {
 		return authority{}, nil, err
 	}
-	if dim, err := a.unsatisfied(ctx, actor, on); err != nil || dim != "" {
-		return authority{}, nil, cmp.Or(err, error(&DeniedError{Permission: GrantPermission(on.Type), Scope: on.Scope(), Reason: labelRefusal(dim)}))
+	if err := a.cleared(ctx, a.db, on, cs, GrantPermission(on.Type)); err != nil {
+		return authority{}, nil, err
 	}
 	au, err := a.mayChange(ctx, a.db, actor, on, grants, revokes, cs)
 	return au, cs, err
+}
+
+// cleared refuses, as a DeniedError of p, a change on a scope whose label the actor's holding,
+// read on q, doesn't satisfy, asking the constraints about its values on the tenant through cs:
+// before the change's transaction, and again under its locks, which reads their answers back.
+func (a *Authorizer) cleared(ctx context.Context, q DB, on Resource, cs *constrained, p Permission) error {
+	if !on.Labels.asks() {
+		return nil
+	}
+	h, _, err := a.holdingOn(ctx, q, cs.actor, cs.ofTenant())
+	if err != nil {
+		return err
+	}
+	if dim := h.Unsatisfied(on.Labels); dim != "" {
+		return &DeniedError{Permission: p, Scope: on.Scope(), Reason: labelRefusal(dim)}
+	}
+	return nil
 }
 
 // changing refuses a change to grants on a scope of a type the host doesn't have, as a typo no
@@ -569,7 +602,9 @@ func checkRevoke(tenant string, b Binding) []error {
 // fails the change.
 func (a *Authorizer) allowed(ctx context.Context, roles book, actor Subject, via Via, tenant string, scope Scope, b Binding) ([]error, error) {
 	role, _ := roles.role(b.Role)
-	err := a.cfg.ValidateGrant(ctx, a.db, GrantInput{Tenant: tenant, Scope: scope, Binding: b, Role: role.clone(), Actor: actor, Via: via})
+	// A copy of the actor, as a constraint is given, so a hook writing to its attributes changes
+	// nothing the change's transaction decides again.
+	err := a.cfg.ValidateGrant(ctx, a.db, GrantInput{Tenant: tenant, Scope: scope, Binding: b, Role: role.clone(), Actor: actor.copied(), Via: via})
 	switch {
 	case err == nil:
 		return nil, nil
@@ -738,13 +773,30 @@ type constrained struct {
 	// sealed is set in the transaction, where a permission not asked about before is one the change
 	// came to need since, as for a role redefined meanwhile: missed refuses it, to be tried again.
 	sealed, missed bool
+	// tenant is what they remove of the actor's label values, asked about on the tenant, where it
+	// holds them, for a change on a labeled scope.
+	tenant *constrained
 }
 
 func (a *Authorizer) constrain(ctx context.Context, actor Subject, on Resource) *constrained {
 	return &constrained{a: a, ctx: ctx, actor: actor, on: on, asked: map[permissionOn]bool{}, by: map[Permission]string{}}
 }
 
-func (c *constrained) seal() { c.sealed = true }
+func (c *constrained) seal() {
+	c.sealed = true
+	if c.tenant != nil {
+		c.tenant.seal()
+	}
+}
+
+// ofTenant is what the constraints remove from the actor on its tenant, sealed as c is.
+func (c *constrained) ofTenant() *constrained {
+	if c.tenant == nil {
+		c.tenant = c.a.constrain(c.ctx, c.actor, Resource{Tenant: c.on.Tenant, Type: TenantScope, ID: c.on.Tenant})
+		c.tenant.sealed = c.sealed
+	}
+	return c.tenant
+}
 
 // removes reports whether a constraint removes p on resources of a type from the actor, failing
 // closed. The constraints are asked about the scope the change is on, a container or the tenant
@@ -766,9 +818,8 @@ func (c *constrained) removes(p Permission, resourceType string) bool {
 	if c.err != nil {
 		return true
 	}
-	// Copies, so a hook that changes what it is asked about can't change what later ones are.
-	actor, on := c.actor, c.on
-	name, err := c.a.denied(c.ctx, ConstraintInput{Tenant: on.Tenant, ResourceType: resourceType, Permission: p, Subject: &actor, Resource: &on})
+	// denied asks each hook about copies of its own, so none can change what later ones are asked.
+	name, err := c.a.denied(c.ctx, ConstraintInput{Tenant: c.on.Tenant, ResourceType: resourceType, Permission: p, Subject: &c.actor, Resource: &c.on})
 	if err != nil {
 		c.err = err
 	}
@@ -843,7 +894,7 @@ func (a *Authorizer) authorityOn(ctx context.Context, q DB, actor Subject, on Re
 	if slices.ContainsFunc(roles, isCustom) {
 		which = tenantRoles
 	}
-	held, ds, b, err := a.heldOrDenied(ctx, q, on.Tenant, actor, all, on.path(), "", which)
+	held, ds, b, err := a.heldOrDenied(ctx, q, on.Tenant, actor, all, on.path(), "", which, true)
 	if err != nil {
 		return authority{}, err
 	}
@@ -915,10 +966,11 @@ func (au authority) over(scopeType string) power {
 	return au.power(scopeType, au.denied, func(g holding) bool { return au.allows(g, manage) })
 }
 
-// under is the power the actor may hand on with condition, as holds counts permissions: a power
-// held under a condition can't be handed on without it, nor one a constraint removes.
-func (au authority) under(scopeType, condition string) power {
-	pw := au.power(scopeType, au.handsOn, func(g holding) bool { return g.under(au.subjects, condition) })
+// under is the power the actor may hand on with condition until until, as holds counts
+// permissions: a power held under a condition can't be handed on without it, nor one held until a
+// time past it, nor one a constraint removes.
+func (au authority) under(scopeType, condition string, until time.Time) power {
+	pw := au.power(scopeType, au.handsOn, func(g holding) bool { return g.under(au.subjects, condition) && g.lasts(until) })
 	// Asked only of a power the actor holds, as each ask calls the hooks.
 	if !pw.none() && au.constrained.removes(GrantPermission(scopeType), scopeType) {
 		return power{listed: map[Role][]string{}}
@@ -972,11 +1024,17 @@ func (s subjects) sameFor(held, condition string) bool {
 	return !reads
 }
 
-// holds reports whether the actor holds p for resources of a type, to hand it on with condition:
-// neither a deny nor a constraint removes it.
-func (au authority) holds(p Permission, resourceType, condition string) bool {
+// lasts reports whether the actor holds a grant until until, when what it hands on ends, zero for
+// never: what it holds only until a time, as an activation, it can't make last past it.
+func (h holding) lasts(until time.Time) bool {
+	return h.ends.IsZero() || !until.IsZero() && !h.ends.Before(until)
+}
+
+// holds reports whether the actor holds p for resources of a type, to hand it on with condition
+// until until: neither a deny nor a constraint removes it.
+func (au authority) holds(p Permission, resourceType, condition string, until time.Time) bool {
 	return !au.handsOn(p) && slices.ContainsFunc(au.held, func(g holding) bool {
-		return gives(au.roles, g, p, resourceType) && g.under(au.subjects, condition)
+		return gives(au.roles, g, p, resourceType) && g.under(au.subjects, condition) && g.lasts(until)
 	}) && !au.constrained.removes(p, resourceType)
 }
 
@@ -987,12 +1045,14 @@ func (au authority) may(p Permission, resourceType string) bool {
 	})
 }
 
-// mayGrant reports whether the actor may grant def on a scope of a type, with condition, and if
-// not, a permission it lacks: its power there, pw, lists def, or lets it grant any role and it
-// holds everything def gives. pw is over for a grant the actor makes, and under for one a grant
-// it makes would let others make. seen is holdsRole's: fresh for each grant decided, or what
-// grants already allowed proved.
-func (a *Authorizer) mayGrant(au authority, pw power, scopeType string, def RoleDefinition, condition string, seen map[string]bool) (Permission, bool) {
+// mayGrant reports whether the actor may grant def on a scope of a type, with condition, until
+// until, zero for never, and if not, a permission it lacks: its power there, pw, lists def, or
+// lets it grant any role and it holds everything def gives until then. pw is over for a grant the
+// actor makes, and under for one a grant it makes would let others make. seen is holdsRole's:
+// fresh for each grant decided, or what grants already allowed proved.
+func (a *Authorizer) mayGrant(au authority, pw power, scopeType string, def RoleDefinition, condition string, until time.Time,
+	seen map[string]bool,
+) (Permission, bool) {
 	if pw.lists(def.ID, condition) {
 		return "", true
 	}
@@ -1005,21 +1065,23 @@ func (a *Authorizer) mayGrant(au authority, pw power, scopeType string, def Role
 	if a.contains(scopeType) {
 		types = def.ResourceTypes
 	}
-	return a.holdsRole(au, def, types, condition, seen)
+	return a.holdsRole(au, def, types, condition, until, seen)
 }
 
-// holdsRole reports whether the actor holds everything def gives for each of types, and if
-// not, a permission it lacks. A permission to change grants on a type gives a power there: to
-// grant any role, or the listed ones. The actor must have as much, or a grant could hand on
-// more than it has: an unlimited one itself, or the power to grant each listed role that can
-// be granted there.
+// holdsRole reports whether the actor holds everything def gives for each of types, under
+// condition until until, and if not, a permission it lacks. A permission to change grants on a
+// type gives a power there: to grant any role, or the listed ones. The actor must have as much, or
+// a grant could hand on more than it has: an unlimited one itself, or the power to grant each
+// listed role that can be granted there.
 //
 // seen are the roles, with the types their grant reaches, already checked or being checked for
 // this grant. Each is checked once: the grant needs every check to pass, so checking one again,
 // as for a role that lists itself or one that lists it back, adds nothing. Without it, roles
 // listing each other would be checked along every order they can be reached in.
-func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string, condition string, seen map[string]bool) (Permission, bool) {
-	key := string(def.ID) + " " + strings.Join(types, ",") + " " + condition
+func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string, condition string, until time.Time,
+	seen map[string]bool,
+) (Permission, bool) {
+	key := string(def.ID) + " " + strings.Join(types, ",") + " " + until.UTC().Format(time.RFC3339Nano) + " " + condition
 	if seen[key] {
 		return "", true
 	}
@@ -1030,14 +1092,15 @@ func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string,
 		// permission like any other.
 		if verb != "grant" || !slices.Contains(types, t) {
 			for _, rt := range types {
-				if !au.holds(p, rt, condition) {
+				if !au.holds(p, rt, condition, until) {
 					return p, false
 				}
 			}
 			continue
 		}
-		// The holders' power holds under the condition the grant has, so the actor's must too.
-		pw := au.under(t, condition)
+		// The holders' power holds under the condition the grant has, and until it ends, so the
+		// actor's must too.
+		pw := au.under(t, condition, until)
 		if len(def.GrantableRoles) == 0 {
 			if !pw.any {
 				return p, false
@@ -1054,7 +1117,7 @@ func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string,
 				continue
 			}
 			// Its holders may grant it under the grant's condition, or with any if it has none.
-			if missing, ok := a.mayGrant(au, pw, t, listed, condition, seen); !ok {
+			if missing, ok := a.mayGrant(au, pw, t, listed, condition, until, seen); !ok {
 				return missing, false
 			}
 		}
@@ -1089,7 +1152,7 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 			// validate reports it as invalid rather than as an escalation.
 			continue
 		}
-		if p, ok := a.mayGrant(au, pw, scope.Type, def, b.Condition.Expression, map[string]bool{}); !ok {
+		if p, ok := a.mayGrant(au, pw, scope.Type, def, b.Condition.Expression, b.ExpiresAt, map[string]bool{}); !ok {
 			reason := cs.refusal("grant "+string(b.Role), p, fmt.Sprintf("the actor can't grant %s without holding %s here", b.Role, p))
 			switch {
 			case !pw.any && len(pw.listed[b.Role]) > 0:
@@ -1106,8 +1169,8 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 	return au, errors.Join(errs...)
 }
 
-// Grantable lists the roles the subject may grant on r, built-in ones in catalog order and then
-// the tenant's custom ones, for an access screen to offer.
+// Grantable lists the roles the subject may grant on r, unconditionally and for good, built-in
+// ones in catalog order and then the tenant's custom ones, for an access screen to offer.
 func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]RoleDefinition, error) {
 	if err := a.check(r); err != nil {
 		return nil, err
@@ -1128,7 +1191,7 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 	// Every custom role, read once: the candidates, and those their GrantableRoles name. In the
 	// statement that reads the grants, as a check reads them: read apart, a grant revoked and its
 	// role widened meanwhile could offer what no moment would.
-	held, ds, b, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), "", tenantRoles)
+	held, ds, b, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), "", tenantRoles, true)
 	if err != nil || len(held) == 0 {
 		return nil, err
 	}
@@ -1149,7 +1212,7 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 	proven := map[string]bool{}
 	for _, def := range a.rolesIn(r.Type, custom) {
 		seen := maps.Clone(proven)
-		if _, ok := a.mayGrant(au, pw, r.Type, def, "", seen); ok {
+		if _, ok := a.mayGrant(au, pw, r.Type, def, "", time.Time{}, seen); ok {
 			proven = seen
 			roles = append(roles, def)
 		}
@@ -1548,7 +1611,8 @@ func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) (
 // (Config.Sources), which Apply can't change. Each names its scope and, as Change.Revoke does, its
 // role, principal and source, every grant of the role to the principal from the source there, or
 // with an ID that one grant. actor is who they are recorded as revoked by. It locks their scopes
-// and principals until the transaction ends, or past 64 the tenant, as Import does.
+// and principals until the transaction ends, or past 64 the tenant, as Import does. A scope of a
+// type the host doesn't have is refused as invalid, as DeleteScopes refuses it.
 func (a *Authorizer) DeleteGrants(ctx context.Context, actor Principal, tenant string, grants []Grant) (err error) {
 	defer a.refused(ctx, &err, tenant, actor, "DeleteGrants")
 	if !validID(tenant) {
@@ -1568,6 +1632,10 @@ func (a *Authorizer) DeleteGrants(ctx context.Context, actor Principal, tenant s
 	for _, g := range grants {
 		if !g.Scope.in(tenant) {
 			errs = append(errs, &InvalidError{Binding: g.Binding, Reason: fmt.Sprintf("scope %q is not valid", g.Scope.Key())})
+			continue
+		}
+		if a.scopeType(g.Scope.Type) != nil {
+			errs = append(errs, &InvalidError{Binding: g.Binding, Reason: fmt.Sprintf("scope type %q is not one the host checks", g.Scope.Type)})
 			continue
 		}
 		errs = append(errs, checkRevoke(tenant, g.Binding)...)
@@ -1624,6 +1692,11 @@ func (a *Authorizer) DeleteScope(ctx context.Context, actor Principal, tenant st
 // holds a bounded number of locks however many scopes it removes. A call for each scope in one
 // transaction would hold a lock for each, which PostgreSQL keeps in one table every session
 // shares: a few thousand can fill it.
+//
+// A scope of a type the host doesn't have is refused as invalid, as a typo would otherwise remove
+// nothing and succeed. A type the catalog no longer has is still one while Config.Permissions
+// lists a permission of it, so to retire a type, keep one listed there until its scopes are
+// deleted; DeletePrincipal, DeletePrincipalEverywhere and DeleteTenant remove grants on any type.
 func (a *Authorizer) DeleteScopes(ctx context.Context, actor Principal, tenant string, scopes []Scope) (err error) {
 	defer a.refused(ctx, &err, tenant, actor, "DeleteScopes")
 	return a.deleteScopes(ctx, actor, tenant, "DeleteScopes", scopes)
@@ -1635,6 +1708,9 @@ func (a *Authorizer) deleteScopes(ctx context.Context, actor Principal, tenant, 
 		if !s.in(tenant) {
 			return fmt.Errorf("%w: scope %q is not valid", ErrInvalid, s.Key())
 		}
+		if err := a.scopeType(s.Type); err != nil {
+			return err
+		}
 		keys[i] = s.Key()
 	}
 	// A scope listed twice, as on the paths of resources under one container, counts toward
@@ -1642,7 +1718,7 @@ func (a *Authorizer) deleteScopes(ctx context.Context, actor Principal, tenant, 
 	slices.Sort(keys)
 	keys = slices.Compact(keys)
 	return a.delete(ctx, actor, tenant, how, func(tx pgx.Tx) error { return lockAll(ctx, tx, tenant, keys, nil) },
-		deletion{denies: "scope = ANY($2::text[])", where: "scope = ANY($2::text[])"}, keys)
+		deletion{denies: "scope = ANY($2::text[])", where: "scope = ANY($2::text[])", ordered: true}, keys)
 }
 
 // DeletePrincipal removes every grant and eligibility of a principal in a tenant, as actor, with
@@ -1654,7 +1730,7 @@ func (a *Authorizer) DeletePrincipal(ctx context.Context, actor Principal, tenan
 		return fmt.Errorf("%w: principal %q is not valid", ErrInvalid, p.key())
 	}
 	return a.delete(ctx, actor, tenant, "DeletePrincipal", func(tx pgx.Tx) error { return lock(ctx, tx, tenant, nil, []string{p.key()}) },
-		deletion{where: "principal = $2", members: "principal = $2"}, p.key())
+		deletion{where: "principal = $2", members: "principal = $2", ordered: true}, p.key())
 }
 
 // DeletePrincipalEverywhere removes every grant and eligibility of an identity in every tenant,
@@ -1702,20 +1778,20 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Pri
 				if err := lock(ctx, tx, t, nil, []string{p.key()}); err != nil {
 					return err
 				}
-				revoked, err := a.remove(ctx, tx, t, "principal = $2", p.key())
+				// In the order delete removes them, as DeleteScopes does too, so the two never deadlock.
+				ended, err := a.removeEligible(ctx, tx, t, inOrder("rbac_eligibilities", "principal = $2"), p.key())
 				if err != nil {
 					return err
 				}
-				ended, err := a.removeEligible(ctx, tx, t, "principal = $2", p.key())
-				if err != nil {
-					return err
-				}
-				// The membership before the groups it reaches, as delete removes them.
 				memberships, err := removed(ctx, a, tx, "rbac_memberships", membershipColumns, collectMemberships, t, "principal = $2", p.key())
 				if err != nil {
 					return err
 				}
-				left, err := removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, t, "principal = $2", p.key())
+				left, err := removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, t, placesInOrder("principal = $2"), p.key())
+				if err != nil {
+					return err
+				}
+				revoked, err := a.remove(ctx, tx, t, inOrder("rbac_grants", "principal = $2"), p.key())
 				if err != nil {
 					return err
 				}
@@ -1751,10 +1827,37 @@ func (a *Authorizer) DeleteTenant(ctx context.Context, actor Principal, tenant s
 // deletion is what a delete removes in a tenant: grants and eligibilities where picks, denies
 // where denies does, and memberships of the tenant and of its groups where members does (none
 // where either is empty); with roles its custom roles, and with groups its groups. Each reads args
-// from $2.
+// from $2. ordered locks the grants, eligibilities, denies and places in groups in order first
+// (inOrder).
 type deletion struct {
-	roles, groups          bool
+	roles, groups, ordered bool
 	denies, where, members string
+}
+
+// inOrder is SQL picking the rows of table, rbac_grants or rbac_eligibilities, that where picks,
+// once they are locked in the order of their scopes, principals and ids. DeleteScopes holds its
+// scopes' locks, DeletePrincipal its principal's and DeleteGroups its groups', so none waits for
+// another, and each deletes the grants of a principal on a scope: deleting them in the order of
+// the index each reads by, they would deadlock.
+func inOrder(table, where string) string {
+	return "id IN (SELECT id FROM " + table + " WHERE tenant = $1 AND " + where + " ORDER BY scope, principal, id FOR UPDATE)"
+}
+
+// placesInOrder is inOrder for places in groups, and deniesInOrder for denies, by their keys.
+func placesInOrder(where string) string {
+	return "(group_id, principal, source) IN (SELECT group_id, principal, source FROM rbac_members WHERE tenant = $1 AND " + where +
+		" ORDER BY group_id, principal, source FOR UPDATE)"
+}
+
+func deniesInOrder(where string) string {
+	return "(scope, id) IN (SELECT scope, id FROM rbac_denies WHERE tenant = $1 AND " + where + " ORDER BY scope, id FOR UPDATE)"
+}
+
+// lockInOrder locks, in tx, the rows of table in tenant $1 that where picks, in order, for a
+// change that changes them in several statements.
+func lockInOrder(ctx context.Context, tx pgx.Tx, table, order, where string, args ...any) error {
+	_, err := tx.Exec(ctx, `SELECT FROM `+table+` WHERE tenant = $1 AND `+where+` ORDER BY `+order+` FOR UPDATE`, args...)
+	return err
 }
 
 // delete removes what del picks in a tenant as actor, by how, once lock holds.
@@ -1771,7 +1874,17 @@ func (a *Authorizer) delete(ctx context.Context, actor Principal, tenant, how st
 		}
 		var e ChangeEvent
 		var err error
-		if e.Ineligible, err = a.removeEligible(ctx, tx, tenant, del.where, args...); err != nil {
+		eligible, granted, denied, places := del.where, del.where, del.denies, del.members
+		if del.ordered {
+			eligible, granted = inOrder("rbac_eligibilities", del.where), inOrder("rbac_grants", del.where)
+			if denied != "" {
+				denied = deniesInOrder(denied)
+			}
+			if places != "" {
+				places = placesInOrder(places)
+			}
+		}
+		if e.Ineligible, err = a.removeEligible(ctx, tx, tenant, eligible, args...); err != nil {
 			return ChangeEvent{}, err
 		}
 		if del.roles {
@@ -1784,7 +1897,7 @@ func (a *Authorizer) delete(ctx context.Context, actor Principal, tenant, how st
 			}
 		}
 		if del.denies != "" {
-			if e.DeletedDenies, err = removed(ctx, a, tx, "rbac_denies", denyColumns, collectDenies, tenant, del.denies, args...); err != nil {
+			if e.DeletedDenies, err = removed(ctx, a, tx, "rbac_denies", denyColumns, collectDenies, tenant, denied, args...); err != nil {
 				return ChangeEvent{}, err
 			}
 		}
@@ -1794,7 +1907,7 @@ func (a *Authorizer) delete(ctx context.Context, actor Principal, tenant, how st
 			if e.EndedMemberships, err = removed(ctx, a, tx, "rbac_memberships", membershipColumns, collectMemberships, tenant, del.members, args...); err != nil {
 				return ChangeEvent{}, err
 			}
-			if e.Left, err = removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant, del.members, args...); err != nil {
+			if e.Left, err = removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant, places, args...); err != nil {
 				return ChangeEvent{}, err
 			}
 		}
@@ -1803,7 +1916,7 @@ func (a *Authorizer) delete(ctx context.Context, actor Principal, tenant, how st
 				return ChangeEvent{}, err
 			}
 		}
-		e.Revoked, err = a.remove(ctx, tx, tenant, del.where, args...)
+		e.Revoked, err = a.remove(ctx, tx, tenant, granted, args...)
 		return e, err
 	})
 }

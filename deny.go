@@ -1,6 +1,7 @@
 package rbac
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -15,12 +16,13 @@ import (
 
 // Deny is a deny policy: on its scope and everything under it, it removes permissions from
 // principals, whatever their grants give, as a guardrail above roles. A principal it names is
-// an identity, a group, a tenant's members or the public (everyone, signed in or not); those
-// Exempt names, identities or groups, keep their access. A deny naming the public may exempt the
-// tenant's members, to bind only those who aren't; the public itself is never exempt, as that
-// would exempt everyone, nor is a principal it names. Permissions are `type:verb`, or `type:*`
-// for every permission on a type. With a Condition it denies only where the expression holds, or
-// can't be evaluated.
+// an identity, a user or of a kind the host declares, a group, a tenant's members or the public
+// (everyone, signed in or not); those Exempt names, identities or groups, keep their access. One
+// of a kind the host doesn't declare, which no subject can be, is refused, as a grant to it is. A
+// deny naming the public may exempt the tenant's members, to bind only those who aren't; the
+// public itself is never exempt, as that would exempt everyone, nor is a principal it names.
+// Permissions are `type:verb`, or `type:*` for every permission on a type. With a Condition it
+// denies only where the expression holds, or can't be evaluated.
 type Deny struct {
 	// ID names it on its scope, in lowercase letters, digits, dots, hyphens and underscores.
 	ID          string
@@ -49,20 +51,21 @@ func undeniable(p Permission) bool {
 	return verb == "deny"
 }
 
-// matchable is what deny queries match for p: p and the `type:*` that covers it, or what no deny
-// lists for a permission none can remove.
-func matchable(p Permission) (perm, wildcard string) {
+// matchable is what deny queries match for p: p and the `type:*` that covers it; for a
+// permission none can remove, ok is false, and nothing is read, so no row stored around the
+// package can remove it either.
+func matchable(p Permission) (perm, wildcard string, ok bool) {
 	if undeniable(p) {
-		return "-", "-"
+		return "", "", false
 	}
 	t, _ := p.parts()
-	return string(p), t + ":*"
+	return string(p), t + ":*", true
 }
 
 // denies reports whether a permission a deny lists covers p.
 func denies(listed []Permission, p Permission) bool {
-	perm, wildcard := matchable(p)
-	return slices.Contains(listed, Permission(perm)) || slices.Contains(listed, Permission(wildcard))
+	perm, wildcard, ok := matchable(p)
+	return ok && (slices.Contains(listed, Permission(perm)) || slices.Contains(listed, Permission(wildcard)))
 }
 
 // denial is a deny as a check reads it.
@@ -79,10 +82,10 @@ type denial struct {
 // deniesOn reads the denies on scopes that name one of binding and exempt none of exempt, the
 // keys keysOf and exempting give, or name anyone when binding is nil, listing p.
 func (a *Authorizer) deniesOn(ctx context.Context, q DB, tenant string, binding, exempt, scopes []string, p Permission) ([]denial, error) {
-	if binding != nil && len(binding) == 0 {
+	perm, wildcard, ok := matchable(p)
+	if binding != nil && len(binding) == 0 || !ok {
 		return nil, nil
 	}
-	perm, wildcard := matchable(p)
 	// In the order a check reads them, so Explain names the deny Authorize does.
 	rows, err := q.Query(ctx, `
 		SELECT id, scope, permissions, principals, exempt, condition FROM rbac_denies
@@ -157,8 +160,11 @@ func (a *Authorizer) checkDeny(tenant string, d Deny) error {
 	if len(d.Principals) == 0 || len(d.Principals) > MaxDenyEntries || len(d.Exempt) > MaxDenyEntries {
 		bad("it names 1 to %d principals and exempts at most %d", MaxDenyEntries, MaxDenyEntries)
 	}
+	// Of a kind the host declares, as a grant's principal is: one of another, such as a misspelled
+	// kind, no subject can be, so a deny naming it would bind no one, and one exempting it would
+	// leave bound whom it meant to exempt.
 	for _, p := range slices.Concat(d.Principals, d.Exempt) {
-		if !p.wellFormed(tenant) {
+		if !a.known(tenant, p) {
 			bad("principal %q is not valid", p.key())
 		}
 	}
@@ -227,7 +233,8 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 		return err
 	}
 	d.Scope = on.Scope()
-	if err := a.mayDeny(ctx, actor, on); err != nil {
+	cs, err := a.mayDeny(ctx, actor, on)
+	if err != nil {
 		return err
 	}
 	if err := a.checkDeny(on.Tenant, d); err != nil {
@@ -243,6 +250,10 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 			return ChangeEvent{}, err
 		}
 		if err := a.holdsDeny(ctx, tx, actor, on); err != nil {
+			return ChangeEvent{}, err
+		}
+		cs.seal()
+		if err := a.cleared(ctx, tx, on, cs, DenyPermission(on.Type)); err != nil {
 			return ChangeEvent{}, err
 		}
 		var others int
@@ -303,7 +314,8 @@ func (a *Authorizer) DeleteDeny(ctx context.Context, actor Subject, on Resource,
 	if err := a.subject(actor); err != nil {
 		return err
 	}
-	if err := a.mayDeny(ctx, actor, on); err != nil {
+	cs, err := a.mayDeny(ctx, actor, on)
+	if err != nil {
 		return err
 	}
 	return a.inTx(ctx, on.Tenant, actor.Principal, "DeleteDeny", func(tx pgx.Tx) (ChangeEvent, error) {
@@ -311,6 +323,10 @@ func (a *Authorizer) DeleteDeny(ctx context.Context, actor Subject, on Resource,
 			return ChangeEvent{}, err
 		}
 		if err := a.holdsDeny(ctx, tx, actor, on); err != nil {
+			return ChangeEvent{}, err
+		}
+		cs.seal()
+		if err := a.cleared(ctx, tx, on, cs, DenyPermission(on.Type)); err != nil {
 			return ChangeEvent{}, err
 		}
 		rows, err := tx.Query(ctx, `DELETE FROM rbac_denies WHERE tenant = $1 AND scope = $2 AND id = $3 RETURNING `+denyColumns,
@@ -324,32 +340,27 @@ func (a *Authorizer) DeleteDeny(ctx context.Context, actor Subject, on Resource,
 }
 
 // mayDeny checks, before the transaction, that actor may set and delete the denies on a scope,
-// one of a type the host has, as changing does for grants. The constraints run here only, as in
-// Apply: a hook that queries the pool while the transaction holds a connection can wait forever
-// on a busy pool.
-func (a *Authorizer) mayDeny(ctx context.Context, actor Subject, on Resource) error {
+// one of a type the host has, as changing does for grants, and returns the constraints' answers,
+// which the transaction reads back to check the actor's label values again under its locks. The
+// constraints run here only, as in Apply: a hook that queries the pool while the transaction holds
+// a connection can wait forever on a busy pool.
+func (a *Authorizer) mayDeny(ctx context.Context, actor Subject, on Resource) (*constrained, error) {
 	if err := a.scopeOf(on); err != nil {
-		return err
+		return nil, err
 	}
 	perm := DenyPermission(on.Type)
 	if actor.Principal == (Principal{}) {
-		return &DeniedError{Permission: perm, Scope: on.Scope(), Reason: "an anonymous subject changes nothing"}
+		return nil, &DeniedError{Permission: perm, Scope: on.Scope(), Reason: "an anonymous subject changes nothing"}
 	}
-	name, err := a.denied(ctx, ConstraintInput{Tenant: on.Tenant, ResourceType: on.Type, Permission: perm, Subject: &actor, Resource: &on})
-	if err != nil {
-		return err
-	}
-	if name != "" {
-		return &DeniedError{Permission: perm, Scope: on.Scope(), Reason: "removed by " + name}
+	cs := a.constrain(ctx, actor, on)
+	if cs.removes(perm, on.Type) {
+		return nil, cmp.Or(cs.failed(), error(&DeniedError{Permission: perm, Scope: on.Scope(), Reason: "removed by " + cs.removedBy(perm)}))
 	}
 	// Who can't see a labeled scope sets no deny on it, nor lifts one, which would widen access.
-	if dim, err := a.unsatisfied(ctx, actor, on); err != nil || dim != "" {
-		if err != nil {
-			return err
-		}
-		return &DeniedError{Permission: perm, Scope: on.Scope(), Reason: labelRefusal(dim)}
+	if err := a.cleared(ctx, a.db, on, cs, perm); err != nil {
+		return nil, err
 	}
-	return a.holdsDeny(ctx, a.db, actor, on)
+	return cs, a.holdsDeny(ctx, a.db, actor, on)
 }
 
 // holdsDeny checks, on q, that actor holds DenyPermission(on's type) on a scope.

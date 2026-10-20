@@ -1,7 +1,6 @@
 package rbac
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -345,7 +344,8 @@ func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string,
 	if err != nil {
 		return err
 	}
-	if err := a.mayManageGroups(ctx, a.db, actor, ManageGroups, root, true); err != nil {
+	labels := a.tenantLabels(ctx, actor, tenant)
+	if err := a.mayManageGroups(ctx, a.db, actor, ManageGroups, root, labels); err != nil {
 		return err
 	}
 	if err := checkGroup(g); err != nil {
@@ -358,7 +358,8 @@ func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string,
 		if err := lock(ctx, tx, tenant, []string{groupKey(g.ID)}, nil); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.mayManageGroups(ctx, tx, actor, ManageGroups, root, false); err != nil {
+		labels.seal()
+		if err := a.mayManageGroups(ctx, tx, actor, ManageGroups, root, labels); err != nil {
 			return ChangeEvent{}, err
 		}
 		if err := a.notOwnedGroups(ctx, tx, tenant, []string{g.ID}); err != nil {
@@ -482,7 +483,8 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 	if err != nil {
 		return err
 	}
-	if err := a.mayManageGroups(ctx, a.db, actor, ManageGroups, root, true); err != nil {
+	labels := a.tenantLabels(ctx, actor, tenant)
+	if err := a.mayManageGroups(ctx, a.db, actor, ManageGroups, root, labels); err != nil {
 		return err
 	}
 	return a.inTx(ctx, tenant, actor.Principal, "DeleteGroup", func(tx pgx.Tx) (ChangeEvent, error) {
@@ -493,7 +495,8 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT FROM rbac_groups WHERE tenant = $1 AND id = $2)`, tenant, id).Scan(&exists); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.mayManageGroups(ctx, tx, actor, ManageGroups, root, false); err != nil {
+		labels.seal()
+		if err := a.mayManageGroups(ctx, tx, actor, ManageGroups, root, labels); err != nil {
 			return ChangeEvent{}, err
 		}
 		// Without a group, the grants and denies on its scope are no group's to remove.
@@ -593,11 +596,37 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 	// The group's grants, and those on the group, as its managers', which would pass to a group
 	// made later with its id.
 	const ofGroups = "(principal = ANY($2::text[]) OR scope = ANY($3::text[]))"
-	var err error
-	if e.Revoked, err = a.remove(ctx, tx, tenant, ofGroups, principals, scopes); err != nil {
+	// DeleteScopes and DeletePrincipal hold other scopes' and principals' locks and change some of
+	// these rows too, so each table is changed in the order delete changes them, grants last, and
+	// the rows changed in it are locked in order first: otherwise they would deadlock.
+	if err := lockInOrder(ctx, tx, "rbac_eligibilities", "scope, principal, id", "("+ofGroups+" OR approvers && $2::text[])",
+		tenant, principals, scopes); err != nil {
 		return ChangeEvent{}, err
 	}
+	var err error
 	if e.Ineligible, err = a.removeEligible(ctx, tx, tenant, ofGroups, principals, scopes); err != nil {
+		return ChangeEvent{}, err
+	}
+	// An eligibility only the groups approve would need no approval without them, so it goes; the
+	// others no longer name them.
+	unapproved, err := removed(ctx, a, tx, "rbac_eligibilities", eligibilityColumns, collectEligibilities, tenant,
+		"approvers <> '{}' AND approvers <@ $2::text[]", principals)
+	if err != nil {
+		return ChangeEvent{}, err
+	}
+	e.Ineligible = append(e.Ineligible, unapproved...)
+	rows, err := tx.Query(ctx, `UPDATE rbac_eligibilities SET
+		  approvers = array(SELECT k FROM unnest(approvers) WITH ORDINALITY AS t(k, i) WHERE k <> ALL($2::text[]) ORDER BY i)
+		WHERE tenant = $1 AND approvers && $2::text[]
+		RETURNING `+eligibilityColumns, tenant, principals)
+	if err != nil {
+		return ChangeEvent{}, err
+	}
+	if e.Eligible, err = collectEligibilities(rows); err != nil {
+		return ChangeEvent{}, err
+	}
+	if err := lockInOrder(ctx, tx, "rbac_denies", "scope, id", "(scope = ANY($3::text[]) OR principals && $2::text[] OR exempt && $2::text[])",
+		tenant, principals, scopes); err != nil {
 		return ChangeEvent{}, err
 	}
 	if e.DeletedDenies, err = removed(ctx, a, tx, "rbac_denies", denyColumns, collectDenies, tenant, "scope = ANY($2::text[])", scopes); err != nil {
@@ -610,7 +639,7 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 		return ChangeEvent{}, err
 	}
 	e.DeletedDenies = append(e.DeletedDenies, unnamed...)
-	rows, err := tx.Query(ctx, `UPDATE rbac_denies SET
+	rows, err = tx.Query(ctx, `UPDATE rbac_denies SET
 		  principals = array(SELECT k FROM unnest(principals) WITH ORDINALITY AS t(k, i) WHERE k <> ALL($2::text[]) ORDER BY i),
 		  exempt = array(SELECT k FROM unnest(exempt) WITH ORDINALITY AS t(k, i) WHERE k <> ALL($2::text[]) ORDER BY i),
 		  updated_by = $3, updated_at = now()
@@ -622,29 +651,14 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 	if e.Denies, err = collectDenies(rows); err != nil {
 		return ChangeEvent{}, err
 	}
-	// An eligibility only the groups approve would need no approval without them, so it goes; the
-	// others no longer name them.
-	unapproved, err := removed(ctx, a, tx, "rbac_eligibilities", eligibilityColumns, collectEligibilities, tenant,
-		"approvers <> '{}' AND approvers <@ $2::text[]", principals)
-	if err != nil {
-		return ChangeEvent{}, err
-	}
-	e.Ineligible = append(e.Ineligible, unapproved...)
-	rows, err = tx.Query(ctx, `UPDATE rbac_eligibilities SET
-		  approvers = array(SELECT k FROM unnest(approvers) WITH ORDINALITY AS t(k, i) WHERE k <> ALL($2::text[]) ORDER BY i)
-		WHERE tenant = $1 AND approvers && $2::text[]
-		RETURNING `+eligibilityColumns, tenant, principals)
-	if err != nil {
-		return ChangeEvent{}, err
-	}
-	if e.Eligible, err = collectEligibilities(rows); err != nil {
-		return ChangeEvent{}, err
-	}
 	if e.Left, err = removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant,
-		"(group_id = ANY($2::text[]) OR principal = ANY($3::text[]))", ids, principals); err != nil {
+		placesInOrder("(group_id = ANY($2::text[]) OR principal = ANY($3::text[]))"), ids, principals); err != nil {
 		return ChangeEvent{}, err
 	}
-	e.DeletedGroups, err = removed(ctx, a, tx, "rbac_groups", groupColumns, collectGroups, tenant, "id = ANY($2::text[])", ids)
+	if e.DeletedGroups, err = removed(ctx, a, tx, "rbac_groups", groupColumns, collectGroups, tenant, "id = ANY($2::text[])", ids); err != nil {
+		return ChangeEvent{}, err
+	}
+	e.Revoked, err = a.remove(ctx, tx, tenant, inOrder("rbac_grants", ofGroups), principals, scopes)
 	return e, err
 }
 
@@ -674,16 +688,17 @@ func (a *Authorizer) groupsTenant(ctx context.Context, tenant string) ([]Resourc
 
 // mayManageGroups checks that actor holds perm, to manage groups or their members, on each of on,
 // as hostResource gives them, so a constraint, a deny or a label reading one sees what the host's
-// own check of perm would: before the change's transaction, with the constraints and labels, and
-// again in it, on q.
-func (a *Authorizer) mayManageGroups(ctx context.Context, q DB, actor Subject, perm Permission, on []Resource, constraints bool) error {
-	unsatisfied := a.unsatisfiedBy(ctx, actor)
+// own check of perm would: before the change's transaction, with the constraints, and again in it,
+// on q, once labels is sealed. labels is what the constraints remove of the actor's label values,
+// asked about on the tenant before the transaction and read back in it.
+func (a *Authorizer) mayManageGroups(ctx context.Context, q DB, actor Subject, perm Permission, on []Resource, labels *constrained) error {
+	var held *Holding
 	for _, r := range on {
 		scope := r.Scope()
 		if actor.Principal == (Principal{}) {
 			return &DeniedError{Permission: perm, Scope: scope, Reason: "an anonymous subject changes nothing"}
 		}
-		if constraints {
+		if !labels.sealed {
 			name, err := a.denied(ctx, ConstraintInput{Tenant: r.Tenant, ResourceType: r.Type, Permission: perm, Subject: &actor, Resource: &r})
 			if err != nil {
 				return err
@@ -699,15 +714,29 @@ func (a *Authorizer) mayManageGroups(ctx context.Context, q DB, actor Subject, p
 		if !au.may(perm, r.Type) {
 			return &DeniedError{Permission: perm, Scope: scope, Reason: "the actor may not manage these groups here"}
 		}
-		// As a check of perm on it refuses who can't see it, before the transaction.
-		if !constraints {
+		// As a check of perm on it refuses who can't see it, read again under the change's locks, so a
+		// value revoked meanwhile changes nothing.
+		if !r.Labels.asks() {
 			continue
 		}
-		if dim, err := unsatisfied(r); err != nil || dim != "" {
-			return cmp.Or(err, error(&DeniedError{Permission: perm, Scope: scope, Reason: labelRefusal(dim)}))
+		if held == nil {
+			h, _, err := a.holdingOn(ctx, q, actor, labels)
+			if err != nil {
+				return err
+			}
+			held = &h
+		}
+		if dim := held.Unsatisfied(r.Labels); dim != "" {
+			return &DeniedError{Permission: perm, Scope: scope, Reason: labelRefusal(dim)}
 		}
 	}
 	return nil
+}
+
+// tenantLabels is what the constraints remove of actor's label values in a tenant, for
+// mayManageGroups to ask before a change's transaction and read back in it.
+func (a *Authorizer) tenantLabels(ctx context.Context, actor Subject, tenant string) *constrained {
+	return a.constrain(ctx, actor, Resource{Tenant: tenant, Type: TenantScope, ID: tenant})
 }
 
 // Groups lists a tenant's groups, by id. It has no limit or cursor, so what it returns grows with
@@ -964,7 +993,8 @@ func (a *Authorizer) placesBounded(ctx context.Context, tx pgx.Tx, tenant string
 // change to them is checked as the changes to access it makes, each on its scope as Apply and
 // SetDeny check one there. An added member gains the grants and eligibilities of the group and the
 // groups it is in, those the same change nests it in too, which the actor must be able to grant to
-// it, and Config.ValidateGrant is asked about each as the member's (ViaMembership); it approves the
+// it, a grant until the member's place or the grant ends and an eligibility for good, and
+// Config.ValidateGrant is asked about each as the member's (ViaMembership); it approves the
 // activations of the eligibilities those approve, which the actor must be able to set; and it is
 // exempt from the denies those are exempt from, as a removed member is from the denies those name,
 // which the actor must be able to set; a membership made to end sooner is a removal then, checked
@@ -1010,7 +1040,8 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 			return err
 		}
 	}
-	if err := a.mayManageGroups(ctx, a.db, actor, GroupMembers, targets, true); err != nil {
+	labels := a.tenantLabels(ctx, actor, tenant)
+	if err := a.mayManageGroups(ctx, a.db, actor, GroupMembers, targets, labels); err != nil {
 		return err
 	}
 	// Refused before the host is asked about what the members would gain, and again under the locks.
@@ -1045,7 +1076,8 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 		if err := a.notOwnedGroups(ctx, tx, tenant, groups); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.mayManageGroups(ctx, tx, actor, GroupMembers, targets, false); err != nil {
+		labels.seal()
+		if err := a.mayManageGroups(ctx, tx, actor, GroupMembers, targets, labels); err != nil {
 			return ChangeEvent{}, err
 		}
 		if err := a.mayReachAgain(ctx, tx, actor, checks); err != nil {
@@ -1174,7 +1206,7 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 		if !ok {
 			continue
 		}
-		v := revalidation{scope: e.Scope, binding: e.binding(), role: def}
+		v := revalidation{scope: e.Scope, binding: e.binding(), role: def, eligibility: true}
 		if reached[e.Principal.key()] {
 			r.held = append(r.held, v)
 		}
@@ -1430,7 +1462,8 @@ type reachCheck struct {
 	on     Resource
 	grants []Binding
 	denies bool
-	cs     *constrained
+	// cs and ds are the constraints' answers on granting and on lifting denies there.
+	cs, ds *constrained
 }
 
 // mayReach checks, before ChangeMembers' transaction, that actor may make each change to access a
@@ -1457,15 +1490,19 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 			if err := stale(v); err != nil {
 				return nil, err
 			}
+			b := v.as(m)
+			if v.eligibility {
+				b = handedOn(b)
+			}
 			c := at(v.scope)
-			c.grants = append(c.grants, v.as(m))
+			c.grants = append(c.grants, b)
 		}
 		for _, v := range rc.approvedBy(m.Group) {
 			if err := stale(v); err != nil {
 				return nil, err
 			}
 			c := at(v.scope)
-			c.grants = append(c.grants, v.binding)
+			c.grants = append(c.grants, handedOn(v.binding))
 		}
 		for _, d := range rc.lifted(m.Group, false) {
 			at(d.Scope).denies = true
@@ -1490,7 +1527,7 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 			}
 		}
 		if c.denies {
-			if err := a.mayDeny(ctx, actor, on); err != nil {
+			if c.ds, err = a.mayDeny(ctx, actor, on); err != nil {
 				return nil, err
 			}
 		}
@@ -1500,7 +1537,7 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 }
 
 // mayReachAgain checks what mayReach checked again, in a change's transaction, reading the
-// constraints' answers from before it rather than ask them again.
+// constraints' answers from before it rather than ask them again, the actor's label values too.
 func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject, checks []*reachCheck) error {
 	for _, c := range checks {
 		if len(c.grants) > 0 {
@@ -1508,9 +1545,16 @@ func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject
 			if _, err := a.mayChange(ctx, tx, actor, c.on, c.grants, nil, c.cs); err != nil {
 				return err
 			}
+			if err := a.cleared(ctx, tx, c.on, c.cs, GrantPermission(c.on.Type)); err != nil {
+				return err
+			}
 		}
 		if c.denies {
 			if err := a.holdsDeny(ctx, tx, actor, c.on); err != nil {
+				return err
+			}
+			c.ds.seal()
+			if err := a.cleared(ctx, tx, c.on, c.ds, DenyPermission(c.on.Type)); err != nil {
 				return err
 			}
 		}

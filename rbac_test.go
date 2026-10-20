@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/rbac"
@@ -846,6 +847,16 @@ func TestAMisspelledPermissionOrTypeIsInvalid(t *testing.T) {
 			_, err := h.authz.Activate(ctx, h.as(t, "u"), misspelled, rbac.Activation{Role: "cluster.login", Duration: time.Hour, Justification: "on call"})
 			return err
 		},
+		// A removal too, which would otherwise succeed having removed nothing, leaving the grants
+		// of the type it meant.
+		"a type Deactivate":  func() error { return h.authz.Deactivate(ctx, h.as(t, "u"), misspelled, "cluster.login") },
+		"a type DeleteScope": func() error { return h.authz.DeleteScope(ctx, host, "t1", misspelled.Scope()) },
+		"a type DeleteScopes": func() error {
+			return h.authz.DeleteScopes(ctx, host, "t1", []rbac.Scope{cluster.Scope(), misspelled.Scope()})
+		},
+		"a type DeleteGrants": func() error {
+			return h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(misspelled.Scope(), "cluster.admin", rbac.User, "owner")})
+		},
 	} {
 		if err := ask(); !errors.Is(err, rbac.ErrInvalid) || errors.Is(err, rbac.ErrDenied) {
 			t.Errorf("%s misspelled: %v", name, err)
@@ -864,6 +875,43 @@ func TestAMisspelledPermissionOrTypeIsInvalid(t *testing.T) {
 	// What a container is can be asked even where no role is for its type.
 	if perms, err := h.authz.Permissions(ctx, h.as(t, "owner"), rbac.Resource{Tenant: "t1", Type: "org", ID: "o1"}); err != nil || len(perms) != 0 {
 		t.Fatalf("Permissions on a container no role is for = %v, %v", perms, err)
+	}
+}
+
+func TestARetiredTypesScopesAreDeletedWhileTheHostChecksIt(t *testing.T) {
+	queue := rbac.RoleDefinition{ID: "queue.reader", Permissions: []rbac.Permission{"queue:read"}, ResourceTypes: []string{"queue"}}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), queue) })
+	ctx := t.Context()
+	q1, q2 := rbac.Scope{Type: "queue", ID: "q1"}, rbac.Scope{Type: "queue", ID: "q2"}
+	h.seed(t, grant(q1, queue.ID, rbac.User, "u"), grant(q2, queue.ID, rbac.User, "u"), grant(q2, queue.ID, rbac.User, "v"))
+	// The catalog drops queues; while the host still lists one of their permissions, it has the type.
+	retiring := func(c *rbac.Config) {
+		c.Catalog = catalog
+		c.Permissions = declaring(catalog, "queue:read")
+	}
+	for name, mutate := range map[string]func(*rbac.Config){"retired": func(c *rbac.Config) { c.Catalog = catalog }, "retiring": retiring} {
+		authz, err := rbac.New(h.pool, func() rbac.Config { c := h.cfg; mutate(&c); return c }())
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = authz.DeleteScopes(ctx, host, "t1", []rbac.Scope{q1})
+		if name == "retired" && !errors.Is(err, rbac.ErrInvalid) || name == "retiring" && err != nil {
+			t.Errorf("deleting a %s type's scopes: %v", name, err)
+		}
+	}
+	if gs, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{q1, q2}}); err != nil || len(gs) != 2 {
+		t.Fatalf("Grants = %+v, %v", gs, err)
+	}
+	// Whatever the type, a principal's grants go with it.
+	retired, err := rbac.New(h.pool, func() rbac.Config { c := h.cfg; c.Catalog = catalog; return c }())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := retired.DeletePrincipal(ctx, host, "t1", identity("u")); err != nil {
+		t.Fatal(err)
+	}
+	if gs, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{q2}}); err != nil || len(gs) != 1 || gs[0].Principal != identity("v") {
+		t.Fatalf("Grants = %+v, %v", gs, err)
 	}
 }
 
@@ -1128,21 +1176,46 @@ func TestDefiningARoleListingOneRedefinedMeanwhileConflicts(t *testing.T) {
 	}
 }
 
+// A grant outlives the actor's power to change grants, but what it hands on the actor holds until
+// the grant ends; a role a role it holds lists, it grants without holding, so for good.
 func TestAGrantOutlivesTheActorsAccess(t *testing.T) {
-	h := setup(t)
-	temp := grant(rbac.Scope{Type: "workspace", ID: "w1"}, "workspace.admin", rbac.User, "temp")
-	temp.ExpiresAt = h.now.Add(time.Hour)
-	access := grant(rbac.Scope{Type: "org", ID: "o1"}, "cluster.login", rbac.User, "temp")
-	access.ExpiresAt = temp.ExpiresAt
-	h.seed(t, temp, access)
-	h.groups(t, "friends")
-	forever := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.Group, ID: "friends"}}
-	if err := h.authz.Apply(t.Context(), h.as(t, "temp"), workspace, rbac.Change{Grant: []rbac.Binding{forever}}); err != nil {
-		t.Fatalf("access for an hour granting for good: %v", err)
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), rbac.RoleDefinition{
+			ID: "workspace.lister", Permissions: []rbac.Permission{"workspace:grant"},
+			ResourceTypes: []string{"workspace"}, GrantableRoles: []rbac.Role{"cluster.login"},
+		})
+	})
+	ctx := t.Context()
+	hour := h.now.Add(time.Hour)
+	expiring := func(g rbac.Grant) rbac.Grant { g.ExpiresAt = hour; return g }
+	org := rbac.Scope{Type: "org", ID: "o1"}
+	// temp changes grants on the workspace for an hour, and logs in to its clusters for good; brief
+	// changes them for good, and logs in for an hour; lister, for an hour, may grant login there.
+	h.seed(t, expiring(grant(workspace.Scope(), "workspace.admin", rbac.User, "temp")), grant(org, "cluster.login", rbac.User, "temp"),
+		grant(workspace.Scope(), "workspace.admin", rbac.User, "brief"), expiring(grant(org, "cluster.login", rbac.User, "brief")),
+		expiring(grant(workspace.Scope(), "workspace.lister", rbac.User, "lister")))
+	h.groups(t, "friends", "others", "listed")
+	logins := func(group string, until time.Time) rbac.Change {
+		return rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: groupOf(group), ExpiresAt: until}}}
+	}
+	if err := h.authz.Apply(ctx, h.as(t, "temp"), workspace, logins("friends", time.Time{})); err != nil {
+		t.Fatalf("a power for an hour granting for good what its holder holds for good: %v", err)
+	}
+	if err := h.authz.Apply(ctx, h.as(t, "brief"), workspace, logins("others", time.Time{})); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("access for an hour granted for good: %v", err)
+	}
+	if err := h.authz.Apply(ctx, h.as(t, "brief"), workspace, logins("others", hour)); err != nil {
+		t.Fatalf("access for an hour granted for the hour: %v", err)
+	}
+	if err := h.authz.Apply(ctx, h.as(t, "lister"), workspace, logins("listed", time.Time{})); err != nil {
+		t.Fatalf("a listed role granted for good by a power for an hour: %v", err)
 	}
 	h.now = h.now.Add(2 * time.Hour)
-	if allowed(t, h, h.as(t, "temp"), login, cluster) || !allowed(t, h, h.as(t, "f", "friends"), login, cluster) {
-		t.Fatal("the grant should outlive the access of whoever made it")
+	if !allowed(t, h, h.as(t, "f", "friends"), login, cluster) || !allowed(t, h, h.as(t, "l", "listed"), login, cluster) {
+		t.Fatal("a grant should outlive the power to change grants of whoever made it")
+	}
+	if allowed(t, h, h.as(t, "o", "others"), login, cluster) {
+		t.Fatal("a grant should end with the access it handed on")
 	}
 }
 
@@ -1527,6 +1600,129 @@ func TestConstraintsSeeWhoAndWhere(t *testing.T) {
 	}
 }
 
+func TestAConstraintWritingToWhatItIsAskedChangesNothing(t *testing.T) {
+	w9 := rbac.Scope{Type: "workspace", ID: "w9"}
+	var seen []string
+	h := labeled(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{
+			// A hook that fills in what it reads, as one loading the stored resource might.
+			{Name: "careless", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+				if r := in.Resource; r != nil {
+					if len(r.Ancestors) > 0 {
+						r.Ancestors[0] = w9
+					}
+					if r.Attributes != nil {
+						r.Attributes["env"] = "prod"
+					}
+					if vs := r.Labels["level"]; len(vs) > 0 {
+						vs[0] = "low"
+					}
+				}
+				if s := in.Subject; s != nil && s.Attributes != nil {
+					s.Attributes["team"] = "sre"
+				}
+				return false, nil
+			}},
+			{Name: "after", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+				if r := in.Resource; r != nil && (slices.Contains(r.Ancestors, w9) || r.Attributes["env"] == "prod" || slices.Contains(r.Labels["level"], "low")) ||
+					in.Subject != nil && in.Subject.Attributes["team"] == "sre" {
+					seen = append(seen, string(in.Permission))
+				}
+				return false, nil
+			}},
+		}
+	})
+	ctx := t.Context()
+	c2 := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c2", Ancestors: []rbac.Scope{{Type: "workspace", ID: "w1"}, {Type: "org", ID: "o1"}}}
+	prodOnly := grant(rbac.Scope{Type: "cluster", ID: "c3"}, "cluster.sudo", rbac.User, "u")
+	prodOnly.Condition = rbac.Condition{Expression: `resource.attributes.env == "prod"`}
+	sreOnly := grant(rbac.Scope{Type: "cluster", ID: "c4"}, "cluster.sudo", rbac.User, "u")
+	sreOnly.Condition = rbac.Condition{Expression: `subject.attributes.team == "sre"`}
+	// u logs in to clusters under w9 and to the secret one, and is root on c3 in prod and on c4 for
+	// the SRE team; owner changes grants under w9.
+	h.seed(t, grant(w9, "cluster.login", rbac.User, "u"), grant(rbac.Scope{Type: "cluster", ID: "c5"}, "cluster.login", rbac.User, "u"),
+		prodOnly, sreOnly, grant(w9, "cluster.admin", rbac.User, "admin"))
+	h.hold(t, "u", "level:low")
+	u := rbac.Subject{Principal: h.as(t, "u").Principal, Attributes: map[string]any{"team": "dev"}}
+	h.as(t, "x")
+	c3 := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c3", Attributes: map[string]any{"env": "dev"}}
+	c4 := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c4"}
+	c5 := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c5", Labels: rbac.Label{"level": {"high"}}}
+	for name, ask := range map[string]func() bool{
+		"its ancestors":  func() bool { return allowed(t, h, u, login, c2) },
+		"its attributes": func() bool { return allowed(t, h, u, root, c3) },
+		"the subject's":  func() bool { return allowed(t, h, u, root, c4) },
+		"its label":      func() bool { return allowed(t, h, u, view, c5) },
+		"its ancestors, handing": func() bool {
+			return h.authz.Apply(ctx, h.as(t, "admin"), c2, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("x")}}}) == nil
+		},
+	} {
+		if ask() {
+			t.Errorf("a constraint writing to %s changed what was decided", name)
+		}
+	}
+	if c2.Ancestors[0] != (rbac.Scope{Type: "workspace", ID: "w1"}) || c3.Attributes["env"] != "dev" || c5.Labels["level"][0] != "high" || u.Attributes["team"] != "dev" {
+		t.Errorf("a constraint wrote to what the host passed: %v %v %v %v", c2.Ancestors, c3.Attributes, c5.Labels, u.Attributes)
+	}
+	if seen != nil {
+		t.Errorf("a constraint was asked about what another wrote, for %v", seen)
+	}
+}
+
+func TestAConstraintWritingToAStructItIsGivenChangesNothing(t *testing.T) {
+	type owner struct{ Tags map[string]string }
+	var seen bool
+	h := setup(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{
+			{Name: "careless", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+				if o, ok := in.Resource.Attributes["owner"].(owner); ok {
+					o.Tags["team"] = "sre"
+				}
+				return false, nil
+			}},
+			{Name: "after", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+				if o, ok := in.Resource.Attributes["owner"].(owner); ok && o.Tags["team"] == "sre" {
+					seen = true
+				}
+				return false, nil
+			}},
+		}
+	})
+	r := cluster
+	r.Attributes = map[string]any{"owner": owner{Tags: map[string]string{"team": "dev"}}}
+	if !allowed(t, h, h.as(t, "owner"), login, r) {
+		t.Fatal("the owner should log in")
+	}
+	if o, _ := r.Attributes["owner"].(owner); seen || o.Tags["team"] != "dev" {
+		t.Fatalf("a constraint's write to a struct's map reached another or the host: %v, %v", seen, r.Attributes)
+	}
+}
+
+func TestAHostWritingToTheActorItIsAskedAboutChangesNothing(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		validate := c.ValidateGrant
+		// A hook that fills in what it reads, as one loading the stored actor might.
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			if in.Actor.Attributes != nil {
+				in.Actor.Attributes["team"] = "sre"
+			}
+			return validate(ctx, q, in)
+		}
+	})
+	// lead changes grants on the cluster while on the dev team, and logs in to it.
+	admin := grant(cluster.Scope(), "cluster.admin", rbac.User, "lead")
+	admin.Condition = rbac.Condition{Expression: `subject.attributes.team == "dev"`}
+	h.seed(t, admin, grant(cluster.Scope(), "cluster.login", rbac.User, "lead"))
+	lead := rbac.Subject{Principal: h.as(t, "lead").Principal, Attributes: map[string]any{"team": "dev"}}
+	h.as(t, "x")
+	if err := h.authz.Apply(t.Context(), lead, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("x")}}}); err != nil {
+		t.Fatalf("a change whose host wrote to the actor it was asked about: %v", err)
+	}
+	if lead.Attributes["team"] != "dev" {
+		t.Fatalf("the host wrote to the actor the change was given: %v", lead.Attributes)
+	}
+}
+
 func TestFilterScalesWithResourceGrants(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -1711,6 +1907,36 @@ func TestDeniesNameWhatTheCatalogHas(t *testing.T) {
 	d := rbac.Deny{ID: "d", Principals: []rbac.Principal{{Kind: rbac.Public}}, Permissions: []rbac.Permission{"cluster:*", "workspace:view"}}
 	if err := h.authz.SetDeny(t.Context(), h.as(t, "owner"), cluster, d); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestADenyNamesOnlyKindsTheHostDeclares(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), guardRole)
+		c.PrincipalKinds = []rbac.PrincipalKind{"service_account"}
+	})
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "guardian"), grant(cluster.Scope(), "cluster.login", "service_account", "sa"))
+	guardian := h.as(t, "guardian")
+	sa := h.member(t, rbac.Principal{Kind: "service_account", ID: "sa"})
+	typo := rbac.Principal{Kind: "service_acount", ID: "sa"}
+	for name, d := range map[string]rbac.Deny{
+		"naming":    {ID: "d", Principals: []rbac.Principal{typo}, Permissions: []rbac.Permission{login}},
+		"exempting": {ID: "d", Principals: []rbac.Principal{rbac.TenantMembers("t1")}, Exempt: []rbac.Principal{typo}, Permissions: []rbac.Permission{login}},
+	} {
+		if err := h.authz.SetDeny(ctx, guardian, cluster, d); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("a deny %s a kind the host doesn't declare: %v", name, err)
+		}
+	}
+	if ds, err := h.authz.Denies(ctx, "t1", []rbac.Scope{cluster.Scope()}); err != nil || len(ds) != 0 {
+		t.Fatalf("Denies = %+v, %v", ds, err)
+	}
+	d := rbac.Deny{ID: "d", Principals: []rbac.Principal{sa.Principal}, Permissions: []rbac.Permission{login}}
+	if err := h.authz.SetDeny(ctx, guardian, cluster, d); err != nil {
+		t.Fatal(err)
+	}
+	if allowed(t, h, sa, login, cluster) {
+		t.Fatal("a deny naming a declared kind binds it")
 	}
 }
 
@@ -2372,6 +2598,178 @@ func TestDeleteScopeRemovesAGrantMadeWhileItWaits(t *testing.T) {
 			}
 			if allowed(t, h, h.as(t, "u"), login, cluster) {
 				t.Fatal("a grant made while its scope was deleted outlived the delete")
+			}
+		})
+	}
+}
+
+func TestDeletingScopesAndAPrincipalOnThemAtOnceNeverDeadlocks(t *testing.T) {
+	for name, deletePrincipal := range map[string]func(ctx context.Context, h *harness) error{
+		"DeletePrincipal": func(ctx context.Context, h *harness) error {
+			return h.authz.DeletePrincipal(ctx, host, "t1", identity("p"))
+		},
+		"DeletePrincipalEverywhere": func(ctx context.Context, h *harness) error {
+			return h.authz.DeletePrincipalEverywhere(ctx, host, identity("p"))
+		},
+	} {
+		for _, held := range []string{"rbac_grants", "rbac_eligibilities"} {
+			for rows, both := range map[string]bool{"in it alone": false, "in both tables": true} {
+				t.Run(fmt.Sprintf("%s, %s held, rows %s", name, held, rows), func(t *testing.T) {
+					h := setup(t)
+					ctx := t.Context()
+					scopes := make([]rbac.Scope, 60)
+					for i := range scopes {
+						scopes[i] = rbac.Scope{Type: "cluster", ID: fmt.Sprintf("c%02d", i)}
+					}
+					// p's grants and eligibilities on each scope, written in the reverse of the scopes'
+					// order, so reading them by principal meets them the other way round.
+					for i := range slices.Backward(scopes) {
+						if held == "rbac_grants" || both {
+							if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+								VALUES ('t1', 'cluster', $1, 'user', 'p', 'cluster.login')`, scopes[i].ID); err != nil {
+								t.Fatal(err)
+							}
+						}
+						if held == "rbac_eligibilities" || both {
+							if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+								VALUES ('t1', 'cluster', $1, 'user', 'p', 'cluster.login', 60)`, scopes[i].ID); err != nil {
+								t.Fatal(err)
+							}
+						}
+					}
+					// A transaction holding the row on the middle scope stops both deletes there, each
+					// holding what it deleted before it, until it ends.
+					hold, err := h.pool.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = hold.Rollback(ctx) }()
+					var pid int
+					if err := hold.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := hold.Exec(ctx, `SELECT FROM `+held+` WHERE tenant = 't1' AND scope = 'cluster:c30' FOR UPDATE`); err != nil {
+						t.Fatal(err)
+					}
+					errs := make(chan error, 2)
+					go func() { errs <- h.authz.DeleteScopes(ctx, host, "t1", scopes) }()
+					go func() { errs <- deletePrincipal(ctx, h) }()
+					for waiting := 0; waiting < 2; {
+						if err := h.pool.QueryRow(ctx, `WITH RECURSIVE waiting(pid) AS (
+							SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))
+							UNION SELECT a.pid FROM pg_stat_activity a JOIN waiting w ON w.pid = ANY(pg_blocking_pids(a.pid)))
+							SELECT count(*) FROM waiting`, pid).Scan(&waiting); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := hold.Rollback(ctx); err != nil {
+						t.Fatal(err)
+					}
+					for range 2 {
+						if err := <-errs; err != nil {
+							t.Errorf("deleting the scopes and a principal on them at once: %v", err)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestDeletingGroupsAndWhatTheyReachAtOnceNeverDeadlocks(t *testing.T) {
+	for name, c := range map[string]struct {
+		// rows are what both deletes remove, and held is the scope of a deny the first stops at,
+		// holding what it removed before it.
+		rows         []string
+		held         rbac.Scope
+		first, other func(ctx context.Context, h *harness) error
+	}{
+		"DeletePrincipal of a member granted on the group": {
+			rows: []string{
+				`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'group', 'g', 'user', 'p', 'cluster.login')`,
+				`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'g', 'user', 'p')`,
+			},
+			held: rbac.Scope{Type: rbac.GroupScope, ID: "g"},
+			first: func(ctx context.Context, h *harness) error {
+				return h.authz.DeleteGroups(ctx, host, "t1", []string{"g"})
+			},
+			other: func(ctx context.Context, h *harness) error {
+				return h.authz.DeletePrincipal(ctx, host, "t1", identity("p"))
+			},
+		},
+		"DeleteScopes of a scope the group holds": {
+			rows: []string{
+				`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'cluster', 'c7', 'group', 'g', 'cluster.login')`,
+				`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds) VALUES ('t1', 'cluster', 'c7', 'group', 'g', 'cluster.login', 60)`,
+			},
+			held: rbac.Scope{Type: "cluster", ID: "c7"},
+			first: func(ctx context.Context, h *harness) error {
+				return h.authz.DeleteScopes(ctx, host, "t1", []rbac.Scope{{Type: "cluster", ID: "c7"}})
+			},
+			other: func(ctx context.Context, h *harness) error {
+				return h.authz.DeleteGroups(ctx, host, "t1", []string{"g"})
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := setup(t)
+			ctx := t.Context()
+			h.groups(t, "g")
+			for _, q := range c.rows {
+				if _, err := h.pool.Exec(ctx, q); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+				VALUES ('t1', $1, $2, 'held', '{public:}', '{cluster:login}')`, c.held.Type, c.held.ID); err != nil {
+				t.Fatal(err)
+			}
+			hold, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = hold.Rollback(ctx) }()
+			var pid int
+			if err := hold.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := hold.Exec(ctx, `SELECT FROM rbac_denies WHERE tenant = 't1' AND id = 'held' FOR UPDATE`); err != nil {
+				t.Fatal(err)
+			}
+			// Until n wait on the hold, or one is done, as the other is once it waits for nothing the
+			// first holds.
+			errs := make(chan error, 2)
+			done := 0
+			waiting := func(n int) {
+				for blocked := 0; blocked < n; {
+					select {
+					case err := <-errs:
+						if err != nil {
+							t.Errorf("a delete run while the other waited: %v", err)
+						}
+						done++
+						return
+					default:
+					}
+					if err := h.pool.QueryRow(ctx, `WITH RECURSIVE waiting(pid) AS (
+						SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))
+						UNION SELECT a.pid FROM pg_stat_activity a JOIN waiting w ON w.pid = ANY(pg_blocking_pids(a.pid)))
+						SELECT count(*) FROM waiting`, pid).Scan(&blocked); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			go func() { errs <- c.first(ctx, h) }()
+			waiting(1)
+			go func() { errs <- c.other(ctx, h) }()
+			waiting(2)
+			if err := hold.Rollback(ctx); err != nil {
+				t.Fatal(err)
+			}
+			for ; done < 2; done++ {
+				if err := <-errs; err != nil {
+					t.Errorf("deleting groups and what they reach at once: %v", err)
+				}
 			}
 		})
 	}
@@ -5259,6 +5657,79 @@ func TestNoDenyLocksOutAGuardAbove(t *testing.T) {
 	}
 	if !allowed(t, h, h.as(t, "owner"), view, cluster) {
 		t.Fatal("a lifted deny should end")
+	}
+}
+
+func TestNoStoredDenyRemovesThePowerToSetDenies(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	// On the workspace too, which reaching everything already, Reachable doesn't list.
+	h.seed(t, grant(workspace.Scope(), "guard", rbac.User, "guardian"))
+	resources := hostTable(t, h)
+	tenant := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}
+	// Rows written around the package, and past what the table checks of them: one listing what a
+	// deny of an undeniable permission was once matched as, and others listing one.
+	if _, err := h.pool.Exec(ctx, `ALTER TABLE rbac_denies DROP CONSTRAINT rbac_denies_permissions_deniable`); err != nil {
+		t.Fatal(err)
+	}
+	for i, perms := range []string{"{-}", "{cluster:deny}", "{tenant:deny,workspace:deny}"} {
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+			VALUES ('t1', 'tenant', 't1', $1, '{public:}', $2)`, fmt.Sprint("odd", i), perms); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, r := range []rbac.Resource{cluster, workspace, tenant} {
+		p := rbac.DenyPermission(r.Type)
+		if !allowed(t, h, guardian, p, r) {
+			t.Errorf("a stored deny removed %s", p)
+		}
+		if d, err := h.authz.Explain(ctx, guardian, p, r); err != nil || !d.Allowed {
+			t.Errorf("Explain(%s) = %+v, %v", p, d, err)
+		}
+		if perms, err := h.authz.Permissions(ctx, guardian, r); err != nil || !slices.Contains(perms, p) {
+			t.Errorf("Permissions = %v, %v", perms, err)
+		}
+		if holders, err := h.authz.Holders(ctx, p, r); err != nil || !slices.ContainsFunc(holders, func(x rbac.Holder) bool { return x.Principal == guardian.Principal && !x.MaybeDenied }) {
+			t.Errorf("Holders(%s) = %+v, %v", p, holders, err)
+		}
+		if reach, err := h.authz.Reachable(ctx, guardian, p, "t1", r.Type); err != nil || !reach.All || len(reach.Scopes)+len(reach.Conditional)+len(reach.Except)+len(reach.ConditionalExcept) > 0 {
+			t.Errorf("Reachable(%s) = %+v, %v", p, reach, err)
+		}
+	}
+	listingsAgree(t, h, resources, guardian, rbac.DenyPermission("cluster"))
+	for i := range 3 {
+		if err := h.authz.DeleteDeny(ctx, guardian, tenant, fmt.Sprint("odd", i)); err != nil {
+			t.Errorf("lifting a stored deny of the power to lift it: %v", err)
+		}
+	}
+}
+
+func TestADenyStoresOnlyPermissionsADenyRemoves(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	insert := func(perms []*string) error {
+		_, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+			VALUES ('t1', 'cluster', 'c1', 'd', '{public:}', $1)`, perms)
+		return err
+	}
+	text := func(ps ...string) []*string {
+		out := make([]*string, len(ps))
+		for i := range ps {
+			out[i] = &ps[i]
+		}
+		return out
+	}
+	for _, perms := range [][]*string{
+		text("-"), text("cluster:deny"), text("cluster:login", "workspace:deny"), text("cluster:Login"), text("cluster"),
+		text(":login"), text("cluster:login "), text(""), text("cluster:login", ""), append(text("cluster:login"), nil),
+	} {
+		var pg *pgconn.PgError
+		if err := insert(perms); !errors.As(err, &pg) || pg.Code != "23514" {
+			t.Errorf("a deny of %v stored: %v", perms, err)
+		}
+	}
+	if err := insert(text("cluster:login", "workspace:*", "cluster:root-ish")); err != nil {
+		t.Fatalf("a deny of permissions and a type's every one: %v", err)
 	}
 }
 
