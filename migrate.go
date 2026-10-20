@@ -19,7 +19,8 @@ var migrations embed.FS
 // runs its migrations with a tool of its own: apply each once, in order of their names, in a
 // transaction of its own or at READ COMMITTED, in a database whose encoding is UTF8: one that
 // waits for the writes in flight to the tables reads them once they end, which a stricter
-// transaction's snapshot, taken by an earlier statement, doesn't. Migrate applies them itself.
+// transaction's snapshot, taken by an earlier statement, doesn't. They hold no backslash, so they
+// mean the same whatever the session's standard_conforming_strings. Migrate applies them itself.
 func Migrations() fs.FS {
 	sub, err := fs.Sub(migrations, "migrations")
 	if err != nil {
@@ -40,8 +41,9 @@ func Migrate(ctx context.Context, db DB) error {
 	// meanwhile: a stricter snapshot, taken before the lock, would apply them again.
 	return begin(ctx, db, func(tx pgx.Tx) error {
 		var schema *string
-		var level string
-		if err := tx.QueryRow(ctx, `SELECT current_schema(), current_setting('transaction_isolation')`).Scan(&schema, &level); err != nil {
+		var level, conforming string
+		if err := tx.QueryRow(ctx, `SELECT current_schema(), current_setting('transaction_isolation'),
+			current_setting('standard_conforming_strings')`).Scan(&schema, &level, &conforming); err != nil {
 			return err
 		}
 		if err := readCommitted("Migrate", level); err != nil {
@@ -49,6 +51,11 @@ func Migrate(ctx context.Context, db DB) error {
 		}
 		if schema == nil {
 			return errors.New("rbac: no schema in the search_path exists to migrate in")
+		}
+		// A session with it off reads a backslash in a literal as an escape, so a pattern would check
+		// another thing than its migration says. None holds one, but Migrate doesn't rely on that.
+		if _, err := tx.Exec(ctx, `SET LOCAL standard_conforming_strings = on`); err != nil {
+			return err
 		}
 		// A database in another encoding can give back text that isn't UTF-8, as SQL_ASCII gives
 		// back whatever was stored: history would record it, and no export could chain it, so every
@@ -100,6 +107,8 @@ func Migrate(ctx context.Context, db DB) error {
 				return err
 			}
 		}
-		return nil
+		// As it was, for what a host's transaction runs after.
+		_, err = tx.Exec(ctx, `SELECT set_config('standard_conforming_strings', $1, true)`, conforming)
+		return err
 	})
 }

@@ -67,7 +67,7 @@ CREATE INDEX rbac_grants_custom_role ON rbac_grants (tenant, role) WHERE role LI
 -- A tenant's own roles, beside the built-in catalog. Grants name them by id like any role.
 CREATE TABLE rbac_roles (
     tenant          text        COLLATE "C" NOT NULL CHECK (tenant <> ''),
-    id              text        COLLATE "C" NOT NULL CHECK (id ~ '^custom\.[a-z0-9._-]{1,121}$'),
+    id              text        COLLATE "C" NOT NULL CHECK (id ~ '^custom[.][a-z0-9._-]{1,121}$'),
     name            text        NOT NULL DEFAULT '' CHECK (length(name) <= 128),
     description     text        NOT NULL DEFAULT '' CHECK (length(description) <= 2048),
     permissions     text[]      COLLATE "C" NOT NULL CHECK (cardinality(permissions) > 0),

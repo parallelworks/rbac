@@ -7,5 +7,5 @@
 ALTER TABLE rbac_denies ADD CONSTRAINT rbac_denies_permissions_deniable CHECK (
     pg_catalog.strpos(pg_catalog.array_to_string(permissions, ''), ',') = 0
     AND pg_catalog.array_to_string(permissions, ',', '')
-        ~ '^[a-z][a-z0-9_-]{0,62}:([a-z][a-z0-9_-]{0,62}|\*)(,[a-z][a-z0-9_-]{0,62}:([a-z][a-z0-9_-]{0,62}|\*))*$'
+        ~ '^[a-z][a-z0-9_-]{0,62}:([a-z][a-z0-9_-]{0,62}|[*])(,[a-z][a-z0-9_-]{0,62}:([a-z][a-z0-9_-]{0,62}|[*]))*$'
     AND ',' || pg_catalog.array_to_string(permissions, ',', '') || ',' NOT LIKE '%:deny,%');
