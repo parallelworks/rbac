@@ -473,6 +473,204 @@ func TestLeavingATenantRemovesWhatItHeldThere(t *testing.T) {
 	}
 }
 
+// An identity that leaves a tenant leaves the denies that exempt it and the approvers of what it
+// approves: exempt by its own key from a deny on the public, it would otherwise read, as an
+// outsider, what the deny takes from every other, and joining again it would approve again. A deny
+// naming it still does.
+func TestLeavingATenantEndsItsExemptionsAndApprovals(t *testing.T) {
+	viewer := rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
+	for name, leave := range map[string]func(ctx context.Context, h *harness) error{
+		"DeletePrincipal": func(ctx context.Context, h *harness) error {
+			return h.authz.DeletePrincipal(ctx, host, "t1", identity("x"))
+		},
+		"DeletePrincipalEverywhere": func(ctx context.Context, h *harness) error {
+			return h.authz.DeletePrincipalEverywhere(ctx, host, identity("x"))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), viewer, guardRole) })
+			ctx := t.Context()
+			h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.viewer", rbac.Public, ""), grant(cluster.Scope(), "guard", rbac.User, "owner"))
+			owner, x, u, w := h.as(t, "owner"), h.as(t, "x"), h.as(t, "u"), h.as(t, "w")
+			for _, d := range []rbac.Deny{
+				{ID: "no-public", Principals: []rbac.Principal{{Kind: rbac.Public}}, Exempt: []rbac.Principal{rbac.TenantMembers("t1"), x.Principal}, Permissions: []rbac.Permission{view}},
+				{ID: "watched", Principals: []rbac.Principal{x.Principal, u.Principal}, Permissions: []rbac.Permission{root}},
+			} {
+				if err := h.authz.SetDeny(ctx, owner, cluster, d); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, e := range []rbac.Eligibility{
+				{Role: "cluster.sudo", Principal: u.Principal, MaxDuration: time.Hour, Approvers: []rbac.Principal{x.Principal}},
+				{Role: "cluster.sudo", Principal: w.Principal, MaxDuration: time.Hour, Approvers: []rbac.Principal{identity("lead"), x.Principal}},
+			} {
+				if err := h.authz.SetEligibility(ctx, owner, cluster, e); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// In another tenant, x is in nothing but a deny's exemptions and an eligibility's approvers.
+			for _, q := range []string{
+				`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+				 VALUES ('t2', 'cluster', 'c1', 'd', '{public:}', '{user:x}', '{cluster:view}')`,
+				`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+				 VALUES ('t2', 'cluster', 'c1', 'user', 'u', 'cluster.sudo', 3600, '{user:lead,user:x}')`,
+			} {
+				if _, err := h.pool.Exec(ctx, q); err != nil {
+					t.Fatal(err)
+				}
+			}
+			h.events = nil
+			if err := leave(ctx, h); err != nil {
+				t.Fatal(err)
+			}
+			if allowed(t, h, x, view, cluster) {
+				t.Error("x left and reads, as an outsider, what the deny takes from every other")
+			}
+			ds, err := h.authz.Denies(ctx, "t1", []rbac.Scope{cluster.Scope()})
+			if err != nil || len(ds) != 2 || !slices.Equal(ds[0].Exempt, []rbac.Principal{rbac.TenantMembers("t1")}) ||
+				!slices.Equal(ds[1].Principals, []rbac.Principal{u.Principal, x.Principal}) {
+				t.Fatalf("Denies = %+v, %v", ds, err)
+			}
+			es, err := h.authz.Eligibilities(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}})
+			if err != nil || len(es) != 1 || es[0].Principal != w.Principal || !slices.Equal(es[0].Approvers, []rbac.Principal{identity("lead")}) {
+				t.Fatalf("Eligibilities = %+v, %v", es, err)
+			}
+			var e rbac.ChangeEvent
+			for _, ev := range h.events {
+				if ev.Tenant == "t1" {
+					e = ev
+				}
+			}
+			if len(e.Denies) != 1 || len(e.Eligible) != 1 || len(e.Ineligible) != 1 || e.Ineligible[0].Principal != u.Principal {
+				t.Fatalf("event = %+v", e)
+			}
+			h.as(t, "x")
+			if _, err := h.authz.Activate(ctx, w, cluster, rbac.Activation{Role: "cluster.sudo", Duration: time.Minute, Justification: "x", Approver: x}); !errors.Is(err, rbac.ErrDenied) {
+				t.Errorf("x left and joined again, and approves as before: %v", err)
+			}
+			if name != "DeletePrincipalEverywhere" {
+				return
+			}
+			if ds, err := h.authz.Denies(ctx, "t2", []rbac.Scope{cluster.Scope()}); err != nil || len(ds) != 1 || len(ds[0].Exempt) != 0 {
+				t.Errorf("Denies in a tenant x was only exempt in = %+v, %v", ds, err)
+			}
+			if es, err := h.authz.Eligibilities(ctx, "t2", rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}}); err != nil || len(es) != 1 ||
+				!slices.Equal(es[0].Approvers, []rbac.Principal{identity("lead")}) {
+				t.Errorf("Eligibilities in a tenant x only approved in = %+v, %v", es, err)
+			}
+		})
+	}
+}
+
+// Leaving a tenant reads, of its denies, only those that exempt whom leaves, and of its grants and
+// places in groups, only its own and the activations its places allowed, under a generic plan too:
+// no btree finds a key in exempt, and beside tenant = $1 a plan, costing the tenant's rows by
+// averages, would read every deny. Not the eligibilities: under a generic plan, deleting the
+// leaver's own in order (inOrder) reads every one in the tenant.
+func TestLeavingUnderAGenericPlanReadsOnlyWhatNamesTheLeaver(t *testing.T) {
+	h := generic(t)
+	ctx := t.Context()
+	h.groups(t, "oncall", "everyone")
+	x := h.as(t, "x", "oncall")
+	// oncall is in everyone, which is eligible on the cluster, where x activated through it; x and
+	// oncall approve an eligibility there and are exempt from a deny.
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'everyone', 'group', 'oncall')`, nil},
+		{`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+		  VALUES ('t1', 'cluster', 'c1', 'group', 'everyone', 'cluster.sudo', 7200, '{}'),
+		         ('t1', 'cluster', 'c1', 'user', 'v', 'cluster.sudo', 3600, '{user:x,group:oncall,user:lead}')`, nil},
+		{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at)
+		  VALUES ('t1', 'cluster', 'c1', 'user', 'x', 'cluster.sudo', 'activation', $1)`, []any{h.now.Add(time.Hour)}},
+		{`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+		  VALUES ('t1', 'cluster', 'c1', 'd', '{public:}', '{user:x,group:oncall}', '{cluster:root}')`, nil},
+	} {
+		if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tables := []string{"rbac_grants", "rbac_eligibilities", "rbac_denies", "rbac_members"}
+	// The pages of each, and their indexes, each reads, in a transaction it rolls back.
+	read := func() map[string]int64 {
+		t.Helper()
+		pages := map[string]int64{}
+		for what, f := range map[string]func(a *rbac.Authorizer) error{
+			"DeletePrincipal": func(a *rbac.Authorizer) error { return a.DeletePrincipal(ctx, host, "t1", x.Principal) },
+			// Which ends x's activation, through oncall's place in everyone.
+			"DeletePrincipal of a group": func(a *rbac.Authorizer) error { return a.DeletePrincipal(ctx, host, "t1", groupOf("oncall")) },
+		} {
+			func() {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				for _, table := range tables {
+					pages[what+" of "+table] -= pagesRead(ctx, t, tx, table)
+				}
+				if err := f(h.authz.WithTx(tx)); err != nil {
+					t.Fatalf("%s: %v", what, err)
+				}
+				for _, table := range tables {
+					pages[what+" of "+table] += pagesRead(ctx, t, tx, table)
+				}
+				var left int
+				if err := tx.QueryRow(ctx, `SELECT count(*) FROM rbac_grants WHERE tenant = 't1' AND source = 'activation'`).Scan(&left); err != nil || left != 0 {
+					t.Fatalf("%s left %d activations, %v", what, left, err)
+				}
+			}()
+		}
+		return pages
+	}
+	// Others are in everyone, and each holds a grant on a cluster of its own, approves an eligibility
+	// there and is exempt from a deny there.
+	others := func(n int) {
+		t.Helper()
+		manyMembers(t, h, n, `, members AS (INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+			  SELECT 't1', 'everyone', 'user', id FROM others),
+			granted AS (INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			  SELECT 't1', 'cluster', id, 'user', id, 'cluster.login' FROM others),
+			eligible AS (INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+			  SELECT 't1', 'cluster', id, 'user', id, 'cluster.sudo', 3600, ARRAY['user:' || id] FROM others)
+			INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+			SELECT 't1', 'cluster', id, 'd', '{public:}', ARRAY['user:' || id], '{cluster:root}' FROM others`, tables...)
+	}
+	others(500)
+	few := read()
+	others(4500)
+	for what, many := range read() {
+		if many > few[what]*3/2+deeper {
+			t.Errorf("%s read %d pages, and %d once 4500 more were granted, approving, exempt and in a group", what, few[what], many)
+		}
+	}
+}
+
+// A group removed from a tenant's grants and groups leaves the denies that exempt it too, but the
+// tenant's members, whose grants are removed, stay exempt: they leave nothing.
+func TestDeletingAPrincipalTakesOnlyAGroupOrIdentityOutOfExemptions(t *testing.T) {
+	h := grouped(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), guardRole) })
+	ctx := t.Context()
+	h.groups(t, "staff")
+	h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "owner"))
+	if err := h.authz.SetDeny(ctx, h.as(t, "owner"), cluster, rbac.Deny{
+		ID: "no-public", Principals: []rbac.Principal{{Kind: rbac.Public}}, Exempt: []rbac.Principal{rbac.TenantMembers("t1"), groupOf("staff")},
+		Permissions: []rbac.Permission{view},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []rbac.Principal{groupOf("staff"), rbac.TenantMembers("t1")} {
+		if err := h.authz.DeletePrincipal(ctx, host, "t1", p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if ds, err := h.authz.Denies(ctx, "t1", []rbac.Scope{cluster.Scope()}); err != nil || len(ds) != 1 ||
+		!slices.Equal(ds[0].Exempt, []rbac.Principal{rbac.TenantMembers("t1")}) {
+		t.Fatalf("Denies = %+v, %v", ds, err)
+	}
+}
+
 func TestDeletingGroupsRemovesTheirGrants(t *testing.T) {
 	h := grouped(t)
 	ctx := t.Context()
@@ -1358,6 +1556,175 @@ func TestDeleteGroupLeavesWhatTheGroupsItIsInGiveAsTheyAre(t *testing.T) {
 	}
 }
 
+// A deny set on a group above the one deleted, while the deletion checks what that one is in,
+// waits for it: committed between its check and its deletes, it would be lifted from the deleted
+// group's members.
+func TestDeleteGroupWaitsForADenyOnAGroupAbove(t *testing.T) {
+	h := grouped(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), guardRole) })
+	ctx := t.Context()
+	groupManager, owner, u := h.as(t, "groups"), h.as(t, "owner"), h.as(t, "u")
+	for _, id := range []string{"inner", "outer"} {
+		if err := h.authz.SetGroup(ctx, groupManager, "t1", rbac.GroupDefinition{ID: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "outer", Principal: groupOf("inner")}, {Group: "inner", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "owner"), grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	// An eligibility on inner's scope, which the deletion removes once it has checked inner:
+	// holding it stops the deletion there.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+		VALUES ('t1', 'group', 'inner', 'user', 'x', 'group.members', 3600)`); err != nil {
+		t.Fatal(err)
+	}
+	hold, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = hold.Rollback(ctx) }()
+	var pid int
+	if err := hold.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hold.Exec(ctx, `SELECT FROM rbac_eligibilities WHERE tenant = 't1' AND scope = 'group:inner' FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+	// How many wait on the hold, directly or through one another.
+	blocked := func() int {
+		var n int
+		if err := h.pool.QueryRow(ctx, `WITH RECURSIVE waiting(pid) AS (
+			SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))
+			UNION SELECT a.pid FROM pg_stat_activity a JOIN waiting w ON w.pid = ANY(pg_blocking_pids(a.pid)))
+			SELECT count(*) FROM waiting`, pid).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	deleted := make(chan error, 1)
+	go func() { deleted <- h.authz.DeleteGroup(ctx, groupManager, "t1", "inner") }()
+	for blocked() < 1 {
+		select {
+		case err := <-deleted:
+			t.Fatalf("DeleteGroup ran before it was stopped: %v", err)
+		default:
+		}
+	}
+	// A guard binds outer's members, which u is through inner.
+	denied := make(chan error, 1)
+	go func() {
+		denied <- h.authz.SetDeny(ctx, owner, cluster, rbac.Deny{ID: "d", Principals: []rbac.Principal{groupOf("outer")}, Permissions: []rbac.Permission{login}})
+	}()
+	first := false
+	for !first && blocked() < 2 {
+		select {
+		case err := <-denied:
+			denied <- err
+			first = true
+		default:
+		}
+	}
+	if err := hold.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	errDelete, errDeny := <-deleted, <-denied
+	if errDeny != nil {
+		t.Fatal(errDeny)
+	}
+	switch {
+	case first && errDelete == nil:
+		t.Errorf("a deny on a group above set while DeleteGroup checked it; deleting inner lifted it from u: allowed %v",
+			allowed(t, h, u, login, cluster))
+	case first && !errors.Is(errDelete, rbac.ErrInvalid), !first && errDelete != nil:
+		t.Fatalf("DeleteGroup: %v", errDelete)
+	}
+}
+
+// A group nested in another while its deletion waits for the locks of the groups it was in is in
+// one whose lock the deletion doesn't hold, so it is tried again.
+func TestDeletingAGroupNestedMeanwhileIsTriedAgain(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	groupManager := h.as(t, "groups")
+	h.groups(t, "inner", "outer")
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := h.authz.WithTx(tx).ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "outer", Principal: groupOf("inner")}}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- h.authz.DeleteGroup(ctx, groupManager, "t1", "inner") }()
+	commitOnceWaitedOn(t, h, tx, done)
+	if err := <-done; !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("deleting a group nested meanwhile: %v", err)
+	}
+	if err := h.authz.DeleteGroup(ctx, groupManager, "t1", "inner"); err != nil {
+		t.Fatalf("tried again: %v", err)
+	}
+}
+
+// Deleting a group reads, of the groups it is in, only those under a generic plan, and of the
+// grants, eligibilities and denies, only those of the groups it reaches: joined to the tenant's
+// members, the groups a group is in would read every one, and beside tenant = $1 a plan, costing
+// the tenant's rows by averages, would read every grant and eligibility of them, and every deny
+// and approver, which no btree finds by a key in an array.
+func TestDeleteGroupUnderAGenericPlanReadsOnlyTheGroupsItIsIn(t *testing.T) {
+	groups := rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}
+	h := generic(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), groups) })
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "groups"), grant(cluster.Scope(), "cluster.login", rbac.Group, "outer"))
+	manager := h.as(t, "groups")
+	h.groups(t, "inner", "everyone")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'outer', 'group', 'inner')`); err != nil {
+		t.Fatal(err)
+	}
+	tables := []string{"rbac_members", "rbac_grants", "rbac_eligibilities", "rbac_denies"}
+	// The pages of each, and their indexes, deciding inner can't be deleted reads, for the grant to
+	// outer, which it is in.
+	read := func() map[string]int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		pages := map[string]int64{}
+		for _, table := range tables {
+			pages[table] -= pagesRead(ctx, t, tx, table)
+		}
+		if err := h.authz.WithTx(tx).DeleteGroup(ctx, manager, "t1", "inner"); !errors.Is(err, rbac.ErrInvalid) {
+			t.Fatalf("deleting a group in one holding a grant: %v", err)
+		}
+		for _, table := range tables {
+			pages[table] += pagesRead(ctx, t, tx, table)
+		}
+		return pages
+	}
+	// Others are in another group, hold a grant, approve an eligibility and are exempt from a deny.
+	others := func(n int) {
+		t.Helper()
+		manyMembers(t, h, n, `, members AS (INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+			  SELECT 't1', 'everyone', 'user', id FROM others),
+			granted AS (INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			  SELECT 't1', 'cluster', id, 'user', id, 'cluster.login' FROM others),
+			eligible AS (INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+			  SELECT 't1', 'cluster', id, 'user', id, 'cluster.sudo', 3600, ARRAY['user:' || id] FROM others)
+			INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+			SELECT 't1', 'cluster', id, 'd', '{public:}', ARRAY['user:' || id], '{cluster:root}' FROM others`, tables...)
+	}
+	others(500)
+	few := read()
+	others(9500)
+	for what, many := range read() {
+		if many > few[what]*3/2+deeper {
+			t.Errorf("deleting a group read %d pages of %s, and %d once 9500 more were in another group, granted, approving and exempt", few[what], what, many)
+		}
+	}
+}
+
 func TestJoiningAgainBeforeDeleteExpiredGivesBackNoGroups(t *testing.T) {
 	h := grouped(t)
 	ctx := t.Context()
@@ -1529,6 +1896,105 @@ func TestEndingMembershipsNeverDeadlocksWithDeleteExpired(t *testing.T) {
 			}
 			if err := <-expired; err != nil {
 				t.Errorf("DeleteExpired: %v", err)
+			}
+		})
+	}
+}
+
+// Every removal of places in groups takes them in one order, so two at once never deadlock: one
+// stopped partway, holding the places before the one it waits for, holds none the other takes
+// before those.
+func TestRemovingPlacesInGroupsNeverDeadlocks(t *testing.T) {
+	for name, c := range map[string]struct {
+		// places are written in order, so a read of them by principal finds the first first; held is
+		// one only the first removal takes, after another it takes too.
+		places       [][3]string
+		held         [3]string
+		first, other func(ctx context.Context, a *rbac.Authorizer) error
+	}{
+		"SetMemberships joining again, with DeleteGroups": {
+			places: [][3]string{{"b", "user:u", ""}, {"a", "user:u", ""}, {"a", "user:v", ""}},
+			held:   [3]string{"a", "user:v", ""},
+			first: func(ctx context.Context, a *rbac.Authorizer) error {
+				return a.DeleteGroups(ctx, host, "t1", []string{"a", "b"})
+			},
+			other: func(ctx context.Context, a *rbac.Authorizer) error {
+				return a.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("u")}})
+			},
+		},
+		"ImportGroups taking groups over, with DeletePrincipal": {
+			places: [][3]string{{"b", "user:u", ""}, {"a", "user:u", ""}, {"a", "user:u", "directory"}},
+			held:   [3]string{"a", "user:u", "directory"},
+			first: func(ctx context.Context, a *rbac.Authorizer) error {
+				return a.DeletePrincipal(ctx, host, "t1", identity("u"))
+			},
+			other: func(ctx context.Context, a *rbac.Authorizer) error {
+				return a.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "a", Source: "directory"}, {ID: "b", Source: "directory"}})
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := setup(t, func(c *rbac.Config) { c.Sources = []string{"directory"} })
+			ctx := t.Context()
+			h.groups(t, "a", "b")
+			// u's membership has ended, so joining again removes its places.
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_memberships (tenant, principal_kind, principal_id, expires_at)
+				VALUES ('t1', 'user', 'u', '2025-01-01')`); err != nil {
+				t.Fatal(err)
+			}
+			for _, p := range c.places {
+				kind, id, _ := strings.Cut(p[1], ":")
+				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, source) VALUES ('t1', $1, $2, $3, $4)`,
+					p[0], kind, id, p[2]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			hold, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = hold.Rollback(ctx) }()
+			var pid int
+			if err := hold.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := hold.Exec(ctx, `SELECT FROM rbac_members WHERE tenant = 't1' AND group_id = $1 AND principal = $2 AND source = $3 FOR UPDATE`,
+				c.held[0], c.held[1], c.held[2]); err != nil {
+				t.Fatal(err)
+			}
+			errs := make(chan error, 2)
+			done := 0
+			// Until n wait on the hold, directly or through one another, or one is done.
+			waiting := func(n int) {
+				for blocked := 0; blocked < n; {
+					select {
+					case err := <-errs:
+						if err != nil {
+							t.Errorf("a removal run while the other waited: %v", err)
+						}
+						done++
+						return
+					default:
+					}
+					if err := h.pool.QueryRow(ctx, `WITH RECURSIVE waiting(pid) AS (
+						SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))
+						UNION SELECT a.pid FROM pg_stat_activity a JOIN waiting w ON w.pid = ANY(pg_blocking_pids(a.pid)))
+						SELECT count(*) FROM waiting`, pid).Scan(&blocked); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			go func() { errs <- c.first(ctx, h.authz) }()
+			waiting(1)
+			go func() { errs <- c.other(ctx, h.authz) }()
+			waiting(2)
+			if err := hold.Rollback(ctx); err != nil {
+				t.Fatal(err)
+			}
+			for ; done < 2; done++ {
+				if err := <-errs; err != nil {
+					t.Errorf("removing places at once: %v", err)
+				}
 			}
 		})
 	}

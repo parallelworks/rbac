@@ -457,16 +457,19 @@ type Change struct {
 }
 
 // ChangeEvent is what a committed change did: only the grants that were added, whose note or
-// condition's title or description changed, or removed, the custom roles defined or deleted, the
-// deny policies set or deleted, the eligibilities set or ended, the tenant memberships set or
-// ended, the groups set or deleted, and the members who joined or left groups. An activation is a
-// grant from SourceActivation: one that moves no end later changes nothing, so isn't reported.
+// condition's title or description changed, cut short or removed, the custom roles defined or
+// deleted, the deny policies set or deleted, the eligibilities set or ended, the tenant memberships
+// set or ended, the groups set or deleted, and the members who joined or left groups. An activation
+// is a grant from SourceActivation: one that moves no end later changes nothing, so isn't reported.
 type ChangeEvent struct {
 	Tenant string
 	// Actor is who made the change: for Import and the deletes, the actor they name.
 	Actor   Principal
 	Granted []Grant
 	Revoked []Grant
+	// Shortened are activations a change cut short, as they are now: one ending, sooner, a place in a
+	// group or a membership an activation rested on.
+	Shortened []Grant
 	// Roles are custom roles created or replaced, as they are now.
 	Roles        []RoleDefinition
 	DeletedRoles []Role
@@ -488,7 +491,7 @@ type ChangeEvent struct {
 }
 
 func (e ChangeEvent) empty() bool {
-	return len(e.Granted)+len(e.Revoked)+len(e.Roles)+len(e.DeletedRoles)+len(e.Denies)+len(e.DeletedDenies)+
+	return len(e.Granted)+len(e.Revoked)+len(e.Shortened)+len(e.Roles)+len(e.DeletedRoles)+len(e.Denies)+len(e.DeletedDenies)+
 		len(e.Eligible)+len(e.Ineligible)+len(e.Memberships)+len(e.EndedMemberships)+len(e.Groups)+len(e.DeletedGroups)+
 		len(e.Joined)+len(e.Left) == 0
 }

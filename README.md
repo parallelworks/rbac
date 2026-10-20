@@ -171,7 +171,11 @@ reach, to check one by one.
   `rbac.SourceActivation`, beside any it holds, with its justification and approver. It holds
   one activation of a role on a scope, recording the request its end rests on: activating again
   until later replaces it, one ending no later changes nothing, and once it has ended, activating
-  again makes a new grant. `Deactivate` ends it early.
+  again makes a new grant. `Deactivate` ends it early. A change that ends the membership or the
+  place it rests on sooner, or removes it, as by leaving the group, cuts the activation short with
+  it, to when another place or eligibility still allows it, or ends it (`ChangeEvent.Shortened` and
+  `Revoked`), as an activation made then would last no longer. Setting the eligibility again or
+  deleting it bounds only the activations made from then on, and leaves those made to their ends.
 - **Host policy:** `Config.ValidateGrant` is asked about every grant with the role, the principal,
   the actor and how it is made, so the host decides who may hold what: members only, no
   privileged roles for service accounts or guests. `Config.Constraints` remove permissions above
@@ -190,8 +194,9 @@ reach, to check one by one.
 - **Members and guests:** an identity holds what it is granted in a tenant only while it is a
   member or guest of it (`SetMemberships`), and nothing while its membership is suspended. A guest,
   such as one from another tenant, holds what it is granted there and nothing granted to the
-  tenant's members. Leaving a tenant (`DeletePrincipal`) removes what the identity held there;
-  `DeletePrincipalEverywhere` removes a deleted identity from every tenant.
+  tenant's members. Leaving a tenant (`DeletePrincipal`) removes what the identity held there,
+  its exemptions from denies and its place among approvers too; `DeletePrincipalEverywhere` removes
+  a deleted identity from every tenant.
 - **Groups:** a group is its tenant's (`SetGroup`, `ImportGroups`), and `group:<id>` names it only
   there. Its members are identities that are members or guests of the tenant, and other groups of
   the tenant, at most `rbac.MaxGroupDepth` deep (`ImportMembers`), each from a source, perhaps
