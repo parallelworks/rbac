@@ -417,6 +417,29 @@ func TestAChangeCarriesBoundedConditions(t *testing.T) {
 	}
 }
 
+// An actor holding its power under a condition hands it on under that condition, which a change
+// parses for whether it reads the subject once, however many bindings and permissions carry it:
+// parsing one takes milliseconds, and the change decides again in its transaction.
+func TestAChangeHandingOnUnderAConditionParsesItOnce(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	cond := rbac.Condition{Expression: strings.Repeat(`"x" != "" && `, 145) + "true"}
+	g := grant(cluster.Scope(), "cluster.admin", rbac.User, "admin")
+	g.Condition = cond
+	h.seed(t, g)
+	bs := make([]rbac.Binding, rbac.MaxBindings)
+	for i := range bs {
+		bs[i] = rbac.Binding{Role: "cluster.login", Principal: identity(fmt.Sprintf("u%d", i)), Condition: cond}
+	}
+	start := time.Now()
+	if err := h.authz.Apply(ctx, h.as(t, "admin"), cluster, rbac.Change{Grant: bs}); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("handing on under one condition on %d bindings took %s", len(bs), took)
+	}
+}
+
 // Activate evaluates the cheapest requirement first, as a check does conditions, so one that holds
 // is reached however many costly ones the subject is also eligible through, whatever order the
 // database's collation would put them in, and however many approvers each names.

@@ -715,6 +715,7 @@ type authority struct {
 	defining *RoleDefinition
 	// constrained is what the constraints remove from the actor, which it can't hand on.
 	constrained *constrained
+	subjects    subjects
 }
 
 // constrained is what the constraints remove from an actor handing permissions on through a
@@ -899,7 +900,7 @@ func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Re
 		allows: func(h holding, action Permission) bool {
 			return !h.conditional || a.conds.holds(spend, h.Condition.Expression, with(vars, action))
 		},
-		denied: denied, handsOn: handsOn,
+		denied: denied, handsOn: handsOn, subjects: subjects{},
 	}, nil
 }
 
@@ -913,7 +914,7 @@ func (au authority) over(scopeType string) power {
 // under is the power the actor may hand on with condition, as holds counts permissions: a power
 // held under a condition can't be handed on without it, nor one a constraint removes.
 func (au authority) under(scopeType, condition string) power {
-	pw := au.power(scopeType, au.handsOn, func(g holding) bool { return g.under(condition) })
+	pw := au.power(scopeType, au.handsOn, func(g holding) bool { return g.under(au.subjects, condition) })
 	// Asked only of a power the actor holds, as each ask calls the hooks.
 	if !pw.none() && au.constrained.removes(GrantPermission(scopeType), scopeType) {
 		return power{listed: map[Role][]string{}}
@@ -944,22 +945,34 @@ func (au authority) power(scopeType string, denied func(Permission) bool, counts
 
 // under reports whether a grant gives what it gives under condition: unconditionally, or under
 // the same condition, so a grant can't drop one its granter is bound by.
-func (h holding) under(condition string) bool {
-	return !h.conditional || sameFor(h.Condition.Expression, condition)
+func (h holding) under(s subjects, condition string) bool {
+	return !h.conditional || s.sameFor(h.Condition.Expression, condition)
 }
+
+// subjects are what conditions were found to read of the subject: parsing one takes milliseconds,
+// and a change asks it of the condition it hands on under for each binding, permission and type.
+type subjects map[string]bool
 
 // sameFor reports whether holding under one condition is holding under another for whoever is
 // granted it: the same condition, of the request and the resource. One that reads the subject
 // decides for each holder, so the actor's holding under it says nothing of what it hands on.
-func sameFor(held, condition string) bool {
-	return held == condition && !readsSubject(condition)
+func (s subjects) sameFor(held, condition string) bool {
+	if held != condition {
+		return false
+	}
+	reads, ok := s[condition]
+	if !ok {
+		reads = readsSubject(condition)
+		s[condition] = reads
+	}
+	return !reads
 }
 
 // holds reports whether the actor holds p for resources of a type, to hand it on with condition:
 // neither a deny nor a constraint removes it.
 func (au authority) holds(p Permission, resourceType, condition string) bool {
 	return !au.handsOn(p) && slices.ContainsFunc(au.held, func(g holding) bool {
-		return gives(au.roles, g, p, resourceType) && g.under(condition)
+		return gives(au.roles, g, p, resourceType) && g.under(au.subjects, condition)
 	}) && !au.constrained.removes(p, resourceType)
 }
 
