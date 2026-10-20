@@ -2007,19 +2007,24 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 			return n, all, err
 		}
 	}
+	// A batch of table's rows expired by Config.Now and by the database's clock too, which history
+	// records an expiry by: a row expired by Config.Now alone, which can run ahead of it, would be
+	// recorded as deleted. A generic plan, which doesn't know the time, costs the rows expired as a
+	// third of the table: taken in no order, they look as cheap to find by reading the whole table as
+	// by the index of expiries, and matched in a join to the rows to delete, as cheap to delete by
+	// reading every row of every tenant. So a batch is taken in order of expiry and deleted by key,
+	// each looked up on its own; places in groups, which have no id, by the version the batch holds.
+	expiring := func(table, key string) func(pgx.Tx) (int64, int64, error) {
+		return statement(`WITH d AS (DELETE FROM ` + table + ` WHERE ` + key + ` = ANY(ARRAY(
+			SELECT ` + key + ` FROM ` + table + ` WHERE expires_at <= least($1, statement_timestamp())
+			ORDER BY expires_at LIMIT $2 FOR UPDATE SKIP LOCKED)) RETURNING 1)
+		SELECT count(*), count(*) FROM d`)
+	}
 	var total int64
-	// By the database's clock too, which history records an expiry by: a row expired by Config.Now
-	// alone, which can run ahead of it, would be recorded as deleted.
 	for _, batch := range []func(pgx.Tx) (int64, int64, error){
-		statement(`WITH d AS (DELETE FROM rbac_grants WHERE id IN (
-			SELECT id FROM rbac_grants WHERE expires_at <= least($1, statement_timestamp()) LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING 1)
-		SELECT count(*), count(*) FROM d`),
-		statement(`WITH d AS (DELETE FROM rbac_eligibilities WHERE id IN (
-			SELECT id FROM rbac_eligibilities WHERE expires_at <= least($1, statement_timestamp()) LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING 1)
-		SELECT count(*), count(*) FROM d`),
-		statement(`WITH d AS (DELETE FROM rbac_members WHERE (tenant, group_id, principal, source) IN (
-			SELECT tenant, group_id, principal, source FROM rbac_members WHERE expires_at <= least($1, statement_timestamp()) LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING 1)
-		SELECT count(*), count(*) FROM d`),
+		expiring("rbac_grants", "id"),
+		expiring("rbac_eligibilities", "id"),
+		expiring("rbac_members", "ctid"),
 		func(tx pgx.Tx) (int64, int64, error) { return endMemberships(ctx, tx, now) },
 	} {
 		for {
@@ -2050,8 +2055,9 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 // place it made. Holding the membership, it waits on no change holding a place, which may roll
 // back the place's removal: it passes over that membership, for the next run.
 func endMemberships(ctx context.Context, tx pgx.Tx, now time.Time) (picked, all int64, err error) {
+	// In order of expiry, as deleteExpired takes its batches.
 	rows, err := tx.Query(ctx, `SELECT tenant, principal FROM rbac_memberships
-		WHERE expires_at <= least($1, statement_timestamp()) LIMIT $2 FOR UPDATE SKIP LOCKED`, now, expiryBatch)
+		WHERE expires_at <= least($1, statement_timestamp()) ORDER BY expires_at LIMIT $2 FOR UPDATE SKIP LOCKED`, now, expiryBatch)
 	if err != nil {
 		return 0, 0, err
 	}

@@ -926,6 +926,69 @@ func TestDeleteExpiredRefusedForARaceConflicts(t *testing.T) {
 	}
 }
 
+// DeleteExpired reads, of each table, only the rows expired, under a generic plan too, which costs
+// a batch as a third of the table: matched to the batch it holds in a join, a plan reads every
+// grant, eligibility and place in groups of every tenant, in each batch; and a batch taken in no
+// order looks as cheap to find by reading the whole table as by the index of expiries. It reads
+// across tenants, so one tenant's rows show what every tenant's would.
+func TestDeleteExpiredUnderAGenericPlanReadsOnlyWhatExpired(t *testing.T) {
+	tables := []string{"rbac_grants", "rbac_eligibilities", "rbac_members", "rbac_memberships"}
+	// A database of n others, which hold a grant and an eligibility each and are in a group for good:
+	// each size in one of its own, as a plan is made for what the tables held when it was first run.
+	beside := func(n int) *harness {
+		t.Helper()
+		h := setupOn(t, pgtest.Open(t, "plan_cache_mode=force_generic_plan"))
+		h.groups(t, "everyone")
+		manyMembers(t, h, n, `, members AS (INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+			  SELECT 't1', 'everyone', 'user', id FROM others),
+			eligibilities AS (INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+			  SELECT 't1', 'cluster', id, 'user', id, 'cluster.login', 60 FROM others)
+			INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', id, 'user', id, 'cluster.login' FROM others`, "rbac_grants", "rbac_eligibilities", "rbac_members")
+		return h
+	}
+	ctx := t.Context()
+	// The pages of each table DeleteExpired reads there once ten of each expired, and ten
+	// memberships with their places, in a transaction it rolls back.
+	read := func(h *harness) map[string]int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if _, err := tx.Exec(ctx, `WITH x AS (SELECT 'x' || i AS id FROM generate_series(1, 10) i),
+			grants AS (INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+			  SELECT 't1', 'tenant', 't1', 'user', id, 'cluster.login', '2025-01-01' FROM x),
+			eligibilities AS (INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, expires_at)
+			  SELECT 't1', 'cluster', 'c1', 'user', id, 'cluster.login', 60, '2025-01-01' FROM x),
+			memberships AS (INSERT INTO rbac_memberships (tenant, principal_kind, principal_id, expires_at)
+			  SELECT 't1', 'user', 'left-' || id, '2025-01-01' FROM x)
+			INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, source, expires_at)
+			SELECT 't1', 'everyone', 'user', id, 'directory', '2025-01-01'::timestamptz FROM x
+			UNION ALL SELECT 't1', 'everyone', 'user', 'left-' || id, '', NULL FROM x`); err != nil {
+			t.Fatal(err)
+		}
+		pages := map[string]int64{}
+		for _, table := range tables {
+			pages[table] -= pagesRead(ctx, t, tx, table)
+		}
+		if n, err := h.authz.WithTx(tx).DeleteExpired(ctx); err != nil || n != 50 {
+			t.Fatalf("DeleteExpired = %d, %v", n, err)
+		}
+		for _, table := range tables {
+			pages[table] += pagesRead(ctx, t, tx, table)
+		}
+		return pages
+	}
+	few := read(beside(500))
+	for what, many := range read(beside(5000)) {
+		if many > few[what]*3/2+deeper {
+			t.Errorf("DeleteExpired read %d pages of %s, and %d beside ten times as many that never expire", few[what], what, many)
+		}
+	}
+}
+
 func TestDeletingGroupsTakesThemOutOfDenies(t *testing.T) {
 	h := grouped(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), guardRole) })
 	ctx := t.Context()
