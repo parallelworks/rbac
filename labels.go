@@ -58,27 +58,14 @@ func labelRefusal(dim string) string {
 
 // unsatisfied returns the dimension of r's label that s's holding doesn't satisfy, or "".
 func (a *Authorizer) unsatisfied(ctx context.Context, s Subject, r Resource) (string, error) {
-	return a.unsatisfiedBy(ctx, s)(r)
-}
-
-// unsatisfiedBy is unsatisfied for many resources, reading s's holding in a tenant once, when a
-// label first asks for it.
-func (a *Authorizer) unsatisfiedBy(ctx context.Context, s Subject) func(Resource) (string, error) {
-	held := map[string]Holding{}
-	return func(r Resource) (string, error) {
-		if !r.Labels.asks() {
-			return "", nil
-		}
-		h, ok := held[r.Tenant]
-		if !ok {
-			var err error
-			if h, _, err = a.holding(ctx, r.Tenant, s); err != nil {
-				return "", err
-			}
-			held[r.Tenant] = h
-		}
-		return h.Unsatisfied(r.Labels), nil
+	if !r.Labels.asks() {
+		return "", nil
 	}
+	h, _, err := a.holding(ctx, r.Tenant, s)
+	if err != nil {
+		return "", err
+	}
+	return h.Unsatisfied(r.Labels), nil
 }
 
 // labelDimension is a dimension as checks read it: each value's rank, lowest 0.

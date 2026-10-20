@@ -233,7 +233,7 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 		return err
 	}
 	d.Scope = on.Scope()
-	cs, err := a.denying(ctx, actor, on)
+	cs, err := a.mayDeny(ctx, actor, on)
 	if err != nil {
 		return err
 	}
@@ -314,7 +314,7 @@ func (a *Authorizer) DeleteDeny(ctx context.Context, actor Subject, on Resource,
 	if err := a.subject(actor); err != nil {
 		return err
 	}
-	cs, err := a.denying(ctx, actor, on)
+	cs, err := a.mayDeny(ctx, actor, on)
 	if err != nil {
 		return err
 	}
@@ -340,17 +340,11 @@ func (a *Authorizer) DeleteDeny(ctx context.Context, actor Subject, on Resource,
 }
 
 // mayDeny checks, before the transaction, that actor may set and delete the denies on a scope,
-// one of a type the host has, as changing does for grants. The constraints run here only, as in
-// Apply: a hook that queries the pool while the transaction holds a connection can wait forever
-// on a busy pool.
-func (a *Authorizer) mayDeny(ctx context.Context, actor Subject, on Resource) error {
-	_, err := a.denying(ctx, actor, on)
-	return err
-}
-
-// denying is mayDeny, returning the constraints' answers, which the transaction reads back to
-// check the actor's label values again under its lock.
-func (a *Authorizer) denying(ctx context.Context, actor Subject, on Resource) (*constrained, error) {
+// one of a type the host has, as changing does for grants, and returns the constraints' answers,
+// which the transaction reads back to check the actor's label values again under its locks. The
+// constraints run here only, as in Apply: a hook that queries the pool while the transaction holds
+// a connection can wait forever on a busy pool.
+func (a *Authorizer) mayDeny(ctx context.Context, actor Subject, on Resource) (*constrained, error) {
 	if err := a.scopeOf(on); err != nil {
 		return nil, err
 	}

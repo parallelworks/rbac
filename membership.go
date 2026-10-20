@@ -1,7 +1,6 @@
 package rbac
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -345,7 +344,8 @@ func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string,
 	if err != nil {
 		return err
 	}
-	if err := a.mayManageGroups(ctx, a.db, actor, ManageGroups, root, true); err != nil {
+	labels := a.tenantLabels(ctx, actor, tenant)
+	if err := a.mayManageGroups(ctx, a.db, actor, ManageGroups, root, labels); err != nil {
 		return err
 	}
 	if err := checkGroup(g); err != nil {
@@ -358,7 +358,8 @@ func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string,
 		if err := lock(ctx, tx, tenant, []string{groupKey(g.ID)}, nil); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.mayManageGroups(ctx, tx, actor, ManageGroups, root, false); err != nil {
+		labels.seal()
+		if err := a.mayManageGroups(ctx, tx, actor, ManageGroups, root, labels); err != nil {
 			return ChangeEvent{}, err
 		}
 		if err := a.notOwnedGroups(ctx, tx, tenant, []string{g.ID}); err != nil {
@@ -482,7 +483,8 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 	if err != nil {
 		return err
 	}
-	if err := a.mayManageGroups(ctx, a.db, actor, ManageGroups, root, true); err != nil {
+	labels := a.tenantLabels(ctx, actor, tenant)
+	if err := a.mayManageGroups(ctx, a.db, actor, ManageGroups, root, labels); err != nil {
 		return err
 	}
 	return a.inTx(ctx, tenant, actor.Principal, "DeleteGroup", func(tx pgx.Tx) (ChangeEvent, error) {
@@ -493,7 +495,8 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT FROM rbac_groups WHERE tenant = $1 AND id = $2)`, tenant, id).Scan(&exists); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.mayManageGroups(ctx, tx, actor, ManageGroups, root, false); err != nil {
+		labels.seal()
+		if err := a.mayManageGroups(ctx, tx, actor, ManageGroups, root, labels); err != nil {
 			return ChangeEvent{}, err
 		}
 		// Without a group, the grants and denies on its scope are no group's to remove.
@@ -674,16 +677,17 @@ func (a *Authorizer) groupsTenant(ctx context.Context, tenant string) ([]Resourc
 
 // mayManageGroups checks that actor holds perm, to manage groups or their members, on each of on,
 // as hostResource gives them, so a constraint, a deny or a label reading one sees what the host's
-// own check of perm would: before the change's transaction, with the constraints and labels, and
-// again in it, on q.
-func (a *Authorizer) mayManageGroups(ctx context.Context, q DB, actor Subject, perm Permission, on []Resource, constraints bool) error {
-	unsatisfied := a.unsatisfiedBy(ctx, actor)
+// own check of perm would: before the change's transaction, with the constraints, and again in it,
+// on q, once labels is sealed. labels is what the constraints remove of the actor's label values,
+// asked about on the tenant before the transaction and read back in it.
+func (a *Authorizer) mayManageGroups(ctx context.Context, q DB, actor Subject, perm Permission, on []Resource, labels *constrained) error {
+	var held *Holding
 	for _, r := range on {
 		scope := r.Scope()
 		if actor.Principal == (Principal{}) {
 			return &DeniedError{Permission: perm, Scope: scope, Reason: "an anonymous subject changes nothing"}
 		}
-		if constraints {
+		if !labels.sealed {
 			name, err := a.denied(ctx, ConstraintInput{Tenant: r.Tenant, ResourceType: r.Type, Permission: perm, Subject: &actor, Resource: &r})
 			if err != nil {
 				return err
@@ -699,15 +703,29 @@ func (a *Authorizer) mayManageGroups(ctx context.Context, q DB, actor Subject, p
 		if !au.may(perm, r.Type) {
 			return &DeniedError{Permission: perm, Scope: scope, Reason: "the actor may not manage these groups here"}
 		}
-		// As a check of perm on it refuses who can't see it, before the transaction.
-		if !constraints {
+		// As a check of perm on it refuses who can't see it, read again under the change's locks, so a
+		// value revoked meanwhile changes nothing.
+		if !r.Labels.asks() {
 			continue
 		}
-		if dim, err := unsatisfied(r); err != nil || dim != "" {
-			return cmp.Or(err, error(&DeniedError{Permission: perm, Scope: scope, Reason: labelRefusal(dim)}))
+		if held == nil {
+			h, _, err := a.holdingOn(ctx, q, actor, labels)
+			if err != nil {
+				return err
+			}
+			held = &h
+		}
+		if dim := held.Unsatisfied(r.Labels); dim != "" {
+			return &DeniedError{Permission: perm, Scope: scope, Reason: labelRefusal(dim)}
 		}
 	}
 	return nil
+}
+
+// tenantLabels is what the constraints remove of actor's label values in a tenant, for
+// mayManageGroups to ask before a change's transaction and read back in it.
+func (a *Authorizer) tenantLabels(ctx context.Context, actor Subject, tenant string) *constrained {
+	return a.constrain(ctx, actor, Resource{Tenant: tenant, Type: TenantScope, ID: tenant})
 }
 
 // Groups lists a tenant's groups, by id. It has no limit or cursor, so what it returns grows with
@@ -1011,7 +1029,8 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 			return err
 		}
 	}
-	if err := a.mayManageGroups(ctx, a.db, actor, GroupMembers, targets, true); err != nil {
+	labels := a.tenantLabels(ctx, actor, tenant)
+	if err := a.mayManageGroups(ctx, a.db, actor, GroupMembers, targets, labels); err != nil {
 		return err
 	}
 	// Refused before the host is asked about what the members would gain, and again under the locks.
@@ -1046,7 +1065,8 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 		if err := a.notOwnedGroups(ctx, tx, tenant, groups); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.mayManageGroups(ctx, tx, actor, GroupMembers, targets, false); err != nil {
+		labels.seal()
+		if err := a.mayManageGroups(ctx, tx, actor, GroupMembers, targets, labels); err != nil {
 			return ChangeEvent{}, err
 		}
 		if err := a.mayReachAgain(ctx, tx, actor, checks); err != nil {
@@ -1431,7 +1451,8 @@ type reachCheck struct {
 	on     Resource
 	grants []Binding
 	denies bool
-	cs     *constrained
+	// cs and ds are the constraints' answers on granting and on lifting denies there.
+	cs, ds *constrained
 }
 
 // mayReach checks, before ChangeMembers' transaction, that actor may make each change to access a
@@ -1495,7 +1516,7 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 			}
 		}
 		if c.denies {
-			if err := a.mayDeny(ctx, actor, on); err != nil {
+			if c.ds, err = a.mayDeny(ctx, actor, on); err != nil {
 				return nil, err
 			}
 		}
@@ -1505,7 +1526,7 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 }
 
 // mayReachAgain checks what mayReach checked again, in a change's transaction, reading the
-// constraints' answers from before it rather than ask them again.
+// constraints' answers from before it rather than ask them again, the actor's label values too.
 func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject, checks []*reachCheck) error {
 	for _, c := range checks {
 		if len(c.grants) > 0 {
@@ -1513,9 +1534,16 @@ func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject
 			if _, err := a.mayChange(ctx, tx, actor, c.on, c.grants, nil, c.cs); err != nil {
 				return err
 			}
+			if err := a.cleared(ctx, tx, c.on, c.cs, GrantPermission(c.on.Type)); err != nil {
+				return err
+			}
 		}
 		if c.denies {
 			if err := a.holdsDeny(ctx, tx, actor, c.on); err != nil {
+				return err
+			}
+			c.ds.seal()
+			if err := a.cleared(ctx, tx, c.on, c.ds, DenyPermission(c.on.Type)); err != nil {
 				return err
 			}
 		}

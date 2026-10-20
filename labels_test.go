@@ -555,15 +555,35 @@ func TestALabelValueRevokedWhileAChangeWaitsRefusesIt(t *testing.T) {
 		"DeleteRole": func(ctx context.Context, h *harness, admin rbac.Subject) error {
 			return h.authz.DeleteRole(ctx, admin, "t1", viewer.ID)
 		},
+		"SetGroup": func(ctx context.Context, h *harness, admin rbac.Subject) error {
+			return h.authz.SetGroup(ctx, admin, "t1", rbac.GroupDefinition{ID: "new"})
+		},
+		"DeleteGroup": func(ctx context.Context, h *harness, admin rbac.Subject) error {
+			return h.authz.DeleteGroup(ctx, admin, "t1", "old")
+		},
+		"ChangeMembers of a labeled group": func(ctx context.Context, h *harness, admin rbac.Subject) error {
+			return h.authz.ChangeMembers(ctx, admin, "t1", []rbac.Member{{Group: "vault", Principal: pilot.Principal}}, nil)
+		},
+		"ChangeMembers granting on a labeled scope": func(ctx context.Context, h *harness, admin rbac.Subject) error {
+			return h.authz.ChangeMembers(ctx, admin, "t1", []rbac.Member{{Group: "ops", Principal: pilot.Principal}}, nil)
+		},
+		"ChangeMembers lifting a deny on a labeled scope": func(ctx context.Context, h *harness, admin rbac.Subject) error {
+			return h.authz.ChangeMembers(ctx, admin, "t1", []rbac.Member{{Group: "exempt", Principal: pilot.Principal}}, nil)
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var meanwhile func(context.Context) error
 			h := labeled(t, func(c *rbac.Config) {
-				c.Catalog = append(c.Catalog, guardRole)
+				c.Catalog = append(c.Catalog, guardRole, groupMembers,
+					rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}})
 				resourceOf := c.ResourceOf
+				// The cluster, a group and the tenant, as the host stores them, labeled.
 				c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
-					if s == secret.Scope() {
+					switch s {
+					case secret.Scope():
 						return secret, nil
+					case rbac.Scope{Type: rbac.GroupScope, ID: "vault"}, rbac.TenantRoot("t1"):
+						return rbac.Resource{Tenant: tenant, Type: s.Type, ID: s.ID, Labels: secret.Labels}, nil
 					}
 					return resourceOf(ctx, tenant, s)
 				}
@@ -580,7 +600,15 @@ func TestALabelValueRevokedWhileAChangeWaitsRefusesIt(t *testing.T) {
 			admin := roleAdmin(t, h)
 			h.as(t, "pilot")
 			h.hold(t, "admin", "level:high")
-			h.seed(t, grant(rbac.TenantRoot("t1"), "guard", rbac.User, "admin"))
+			h.seed(t, grant(rbac.TenantRoot("t1"), "guard", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "admin"),
+				grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"))
+			// Groups the change to members names: one labeled, one holding a role on the labeled
+			// cluster, and one a deny there exempts.
+			h.groups(t, "vault", "ops", "exempt", "old")
+			h.seed(t, grant(secret.Scope(), "cluster.login", rbac.Group, "ops"))
+			if err := h.authz.SetDeny(ctx, admin, secret, rbac.Deny{ID: "x", Principals: d.Principals, Exempt: []rbac.Principal{groupOf("exempt")}, Permissions: d.Permissions}); err != nil {
+				t.Fatal(err)
+			}
 			if err := h.authz.SetRole(ctx, admin, "t1", viewer); err != nil {
 				t.Fatal(err)
 			}
