@@ -22,8 +22,9 @@ names the functions and tables it shows, so it can be checked against the code.
 ## Context
 
 The package is a Go library that a host application links. It keeps everything in PostgreSQL, in
-tables prefixed `rbac_` in one schema, and asks the host only through the hooks in `Config`. It
-runs no server and holds no state between calls but compiled conditions.
+tables prefixed `rbac_` in one schema, and asks the host only through the hooks in `Config` and
+the `crypto.Signer` an export is given. It runs no server and holds no state between calls but
+compiled conditions.
 
 ```mermaid
 flowchart LR
@@ -51,7 +52,7 @@ flowchart LR
     code -->|"query with Filter's predicate"| own
     own -.->|"same statement reads"| tables
     api -->|"Export, signed by"| signer
-    api -->|"records and checkpoints"| store
+    code -->|"keeps Export's records<br/>and checkpoints"| store
 ```
 
 - **One database, one transaction.** A change runs in a transaction of its own, or under
@@ -59,20 +60,23 @@ flowchart LR
   together.
 - **The host owns identity and resources.** It says who a subject is (`Subject`) and what a
   resource is, with its ancestors and attributes (`Resource`). The package stores only grants,
-  roles, policies, memberships and groups, keyed by the ids the host gives.
+  eligibilities, roles, denies, memberships and groups, and their history, keyed by the ids the
+  host gives.
 - **The host decides who may hold what.** `ValidateGrant` is asked about every grant and
   eligibility a change makes, and every place in a group, which gives what the group holds.
-  `Constraints` remove permissions above anything a tenant grants. `SetMemberships` and the
-  imports are the host's own writes, which ask about nothing.
+  `Constraints` remove permissions above anything a tenant grants. The host's own writes,
+  `Import`, `ImportGroups`, `ImportMembers`, `SetMemberships` and the host's deletes, skip the
+  checks made of an actor, but `Import` and `ImportMembers` still ask `ValidateGrant` about what
+  they give.
 
 ## Inside the package
 
 ```mermaid
 flowchart TB
     subgraph entry["Entry points"]
-        checks["Checks<br/>Authorize, Explain, Permissions, Holding<br/>authorize.go"]
-        lists["Lists<br/>Filter, Reachable, Holders, Grantable,<br/>Grants, Denies, Eligibilities<br/>authorize.go, apply.go"]
-        changes["Changes<br/>Apply, Import, Delete*, SetRole, SetDeny,<br/>SetEligibility, Activate, SetMemberships,<br/>ImportGroups, ChangeMembers<br/>apply.go, roles.go, deny.go, eligible.go, membership.go"]
+        checks["Checks<br/>Authorize, Explain, Permissions, Holding<br/>authorize.go, labels.go"]
+        lists["Lists<br/>Filter, Reachable, Holders, Grantable,<br/>Grants, Denies, Eligibilities<br/>authorize.go, apply.go, deny.go, eligible.go"]
+        changes["Changes<br/>Apply, Import, Delete*, SetRole, SetDeny,<br/>SetEligibility, Activate, Deactivate, SetMemberships,<br/>SetGroup, ImportGroups, ChangeMembers, ImportMembers<br/>apply.go, roles.go, deny.go, eligible.go, membership.go"]
         audit["History<br/>History, Export, VerifyChain,<br/>PruneHistory, AsOf<br/>history.go, chain.go, asof.go"]
     end
     subgraph core["Shared machinery"]
@@ -102,10 +106,10 @@ flowchart TB
 
 ## Data model
 
-Every table is keyed by tenant first: nothing is shared between tenants, and a tenant is deleted
-with `DeleteTenant`. A scope is `type:id`, as `scope_type` and `scope_id`, with the generated
-column `scope`. A principal is `kind:id`, as `principal_kind` and `principal_id`, with the
-generated column `principal`.
+Every row is a tenant's, by its `tenant` column: nothing is shared between tenants, and a tenant
+is deleted with `DeleteTenant`. A scope is `type:id`, as `scope_type` and `scope_id`, with the
+generated column `scope`. A principal is `kind:id`, as `principal_kind` and `principal_id`, with
+the generated column `principal`.
 
 ```mermaid
 erDiagram
@@ -115,7 +119,7 @@ erDiagram
         text scope "type:id"
         text principal "kind:id"
         text role "built-in, or custom.*"
-        text source "the host's own, or empty"
+        text source "empty, activation, or the host's"
         timestamptz expires_at
         text condition "CEL, or empty"
         bool conditional
@@ -177,7 +181,7 @@ erDiagram
         text tenant
         text entity
         text key
-        text op "create, update, delete, expire"
+        text op "create, update, delete, expire, prune"
         jsonb before
         jsonb after
         text actor
@@ -202,14 +206,15 @@ erDiagram
 - **Activations are grants** from the source `activation` (`SourceActivation`), made by
   `Activate` from an eligibility and ended by their expiry or `Deactivate`.
 - **Every write is recorded.** Each table above but `rbac_history` has the trigger
-  `rbac_record`, which writes the change into `rbac_history`. Only history's owner can change that
-  table, and only `PruneHistory` deletes from it.
+  `rbac_record`, which writes the change into `rbac_history`. Nothing updates or truncates that
+  table, and only `PruneHistory`, as a role with the rights of its owner, deletes from it.
 
 ## Principals, groups and keys
 
 A check counts what the subject's principals hold. They are found in the same statement as the
-grants (`keysSQL`), up from the identity: its membership of the tenant, the groups it is in, the
-groups those are in, to `MaxGroupDepth`.
+grants (`keysSQL`), up from the identity: its membership of the tenant, the groups it is in, and
+the groups those are in, each counted once, as deep as they nest, which changes keep to
+`MaxGroupDepth`.
 
 ```mermaid
 flowchart BT
@@ -228,14 +233,16 @@ flowchart BT
 
 | Key | Counts for | Notes |
 |---|---|---|
-| `user:ann` | Its own grants | Only while it is a member or guest of the tenant. |
-| `group:sre` and the groups above it | The group's grants | Through each place in force, to `MaxGroupDepth`. |
+| `user:ann` | Its own grants | Only while it is a member or guest of the tenant, not suspended. |
+| `group:sre` and the groups above it | The group's grants | Through each place in force, while the identity's membership is not suspended. |
 | `members:<tenant>` | Grants to every member | Not to guests. Never a privileged role, nor one that changes access. |
-| `public:` | Grants to everyone | Only roles marked `Public`. The anonymous subject holds these alone. |
+| `public:` | Grants to everyone | Only roles marked `Public`, never a privileged one nor one that changes access. The anonymous subject holds these alone. |
 
-- **Denies bind more widely than grants give.** A deny binds an identity through its groups even
-  while its membership is suspended, so suspending someone never lifts a deny (`bound`). A deny's
-  exemptions are matched against the keys a check counts and the identity's own (`exempted`).
+- **Denies bind more widely than grants give.** A deny binds an identity through its groups and
+  the tenant's members even while its membership is suspended, so suspending someone never lifts
+  a deny (`bound`). A deny's exemptions are matched against every key the subject is in, the
+  tenant's members too where a check of a permission that changes access counts none of their
+  grants, and the identity's own (`exempted`).
 - **Changing a group's members is granting.** Adding an identity to a group gives it what the
   group holds, so `ChangeMembers` needs the authority to grant all of it, and the host's
   `ValidateGrant` is asked as for a grant. The same holds for nesting one group in another.
@@ -258,7 +265,8 @@ flowchart LR
 ```
 
 - **The host passes the ancestors** on every call, read from where it stores them. The package
-  never looks a resource up for a check, so a check costs one statement. `ResourceOf` is asked only
+  never looks a resource up for a check, so a check costs one statement, and more only where it
+  needs its grants' conditions or the subject's label values. `ResourceOf` is asked only
   when a change needs a scope's own ancestors, labels or attributes.
 - **For lists, the host stores the path** in a `text[]` column with a GIN index, and `Filter`
   matches it.
@@ -266,7 +274,8 @@ flowchart LR
 ## A check
 
 `Authorize` answers whether a subject may do one permission on one resource. It reads in one
-statement, apart from the subject's label values, and refuses unless something allows.
+statement, apart from the conditions of conditional grants, read only when no unconditional grant
+allows, and the subject's label values, and refuses unless something allows.
 
 ```mermaid
 flowchart TB
@@ -277,25 +286,25 @@ flowchart TB
     cons -->|no| read["One statement: the subject's keys,<br/>its grants on the path, the denies on the path<br/>and the custom roles the grants name<br/>(heldOrDenied)"]
     read --> deny{"A deny binds it?<br/>conditions evaluated"}
     deny -->|yes| refused
-    deny -->|no| grant{"A grant gives it?<br/>built-in, then custom, then conditional"}
+    deny -->|no| grant{"A grant gives it?<br/>any unconditional one, then conditional"}
     grant -->|no| refused
     grant -->|yes| asks{"Labeled resource, or an<br/>exclusive value?"}
     asks -->|no| allowed(["nil"])
     asks -->|yes| holding["The subject's label values<br/>(holding, permissionsOf)"]
-    holding --> sat{"Satisfies the label,<br/>and holds no two exclusive values?"}
+    holding --> sat{"Holds no two exclusive values,<br/>and satisfies the label?"}
     sat -->|yes| allowed
     sat -->|no| refused
 ```
 
-The layers, from the strongest:
+The layers, in the order a check applies them:
 
 | Layer | Who sets it | Effect |
 |---|---|---|
 | Constraints | The host, in `Config.Constraints` | Removes a permission above every grant and deny. A tenant can't change it. |
-| Denies | A tenant, with `SetDeny`, on a scope | Removes a permission from principals on the scope and under it, unless exempt. |
+| Denies | A tenant, with `SetDeny`, on a scope | Removes a permission from principals on the scope and under it, unless exempt. No deny removes `<type>:deny`. |
 | Grants | A tenant, with `Apply`, on a scope | Gives a role's permissions on the scope and under it, perhaps under a condition. |
-| Labels | The host declares dimensions; tenants grant values | A labeled resource is allowed only to a subject whose values satisfy its label. |
 | Exclusive values | The host marks a dimension `Exclusive` | A subject able to hold two values of one holds none. |
+| Labels | The host declares dimensions; tenants grant values | A labeled resource is allowed only to a subject whose values satisfy its label. |
 
 ```mermaid
 sequenceDiagram
@@ -311,18 +320,19 @@ sequenceDiagram
     A->>DB: heldOrDenied: keys, grants, denies, custom roles
     DB-->>A: holdings, denials, roles
     A->>E: deny conditions, within a deny budget
-    A->>A: built-in unconditional grant? custom role's?
+    A->>A: an unconditional grant, of a built-in or custom role, that gives it?
     A->>DB: conditionsOf (only where a conditional grant is all that's left)
     A->>E: grant conditions, cheapest first, within a budget
     opt labeled resource or exclusive value
         A->>DB: the subject's values on the tenant (permissionsOf)
-        A->>A: Satisfies, excludedBy
+        A->>A: excludes, then Unsatisfied
     end
     A-->>H: nil, or DeniedError
 ```
 
 - **Explain** decides the same way and says why: every grant that allows, or the deny, constraint
-  or label that refused. It reads in one snapshot.
+  or label that refused. It reads the subject's keys, grants and denies in one snapshot, and its
+  label values after it.
 - **Permissions** lists everything a subject may do on a resource, deciding each as Authorize
   would.
 - **Conditions** are CEL over `subject`, `resource`, `request` and `action`, typed by
@@ -331,28 +341,32 @@ sequenceDiagram
 
 ## A change
 
-`Apply` grants and revokes on one scope as an actor. Every change follows the same shape: it is
-decided once before its transaction, so the host's hooks run outside it, then again under its
-locks, so nothing it read can change before it commits.
+`Apply` grants and revokes on one scope as an actor. Every change an actor makes follows the same
+shape: it is decided once before its transaction, so `ValidateGrant`, the constraints and
+`ResourceOf` run outside it, then again under its locks, so nothing it read can change before it
+commits.
 
 ```mermaid
 sequenceDiagram
     participant H as Host
     participant A as Authorizer
+    participant C as Constraints
     participant V as ValidateGrant
     participant DB as PostgreSQL
     H->>A: Apply(ctx, actor, resource, change)
     A->>A: validate inputs, MaxBindings
-    A->>DB: authorityOn: the actor's grants and roles in one statement
-    A->>A: hand-on rules, constraints on type:grant
+    A->>C: changing: Deny of type:grant on the scope
+    A->>DB: the actor's label values, where the scope is labeled
+    A->>DB: authorityOn: the actor's grants, denies and roles<br/>in one statement, then their conditions
+    A->>C: hand-on rules: Deny of each permission it hands on
     A->>DB: stand: the standing of the principals named
     A->>V: each grant, as it will be
     V-->>A: nil, or a refusal
     rect rgb(240, 240, 240)
     note over A,DB: one transaction, or a savepoint under WithTx
-    A->>DB: lock: exclusive tenant lock if a dimension is Exclusive,<br/>the tenant shared, the scope and principals exclusive
-    A->>DB: stillStanding: memberships unchanged since the host was asked
-    A->>DB: authority again, under the locks
+    A->>DB: lock: exclusive/tenant if a dimension is Exclusive, then the tenant<br/>shared and the scope and principals exclusive, or past 64 the tenant exclusive
+    A->>DB: the groups named exist, and stillStanding:<br/>memberships unchanged since the host was asked
+    A->>DB: authority again, under the locks, the constraints' answers read back
     A->>DB: revoke and upsert
     DB->>DB: rbac_record writes rbac_history, as the actor
     A->>DB: exclusive values: no one can now hold two
@@ -370,13 +384,13 @@ sequenceDiagram
   memberships behind them, and `stillStanding` refuses the change with `ErrConflict` if any changed
   while the change waited for its locks.
 - **Sources.** Grants, groups and members from a source in `Config.Sources` are the host's: only
-  `Import`, `ImportGroups`, `ImportMembers` and the deletes change them.
+  `Import`, `ImportGroups`, `ImportMembers` and the host's deletes change them.
 - **Custom roles.** `SetRole` redefines a role in place for every grant of it, so it asks
-  `ValidateGrant` about every grant and eligibility the new definition widens, under the tenant's
-  lock.
+  `ValidateGrant` about every grant and eligibility the new definition widens, before its
+  transaction, and under the tenant's lock refuses with `ErrConflict` if those changed meanwhile.
 - **Eligibilities.** `SetEligibility` lets a principal `Activate` a role for a while, perhaps
-  only with approvers or a `requires` condition. An activation is a grant that never outlasts its
-  eligibility.
+  only with approvers or a `requires` condition. An activation is a grant that ends no later than
+  its eligibility expires; deleting the eligibility leaves its activations to their own ends.
 
 ## Lists and searches
 
@@ -387,9 +401,9 @@ flowchart LR
         pred["WHERE Filter's predicate<br/>AND the host's own conditions<br/>ORDER BY ... LIMIT ..."]
     end
     filter["Filter(subject, permission,<br/>tenant, type, columns)"] -->|"SQL and arguments"| pred
-    pred -->|"reads in the same snapshot"| g[("rbac_grants, rbac_denies,<br/>rbac_memberships, rbac_members")]
+    pred -->|"reads in the same snapshot"| g[("rbac_grants, rbac_denies, rbac_roles,<br/>rbac_memberships, rbac_members")]
     rows --> pred
-    reach["Reachable"] -->|"scopes: All, Scopes,<br/>Except, Conditional, Labels"| other[("Another store")]
+    reach["Reachable"] -->|"scopes: All, Scopes, Conditional,<br/>Except, ConditionalExcept, Labels"| other[("Another store")]
     holders["Holders(permission, resource)"] -->|"each identity, its groups,<br/>the members, the public"| review["Access review"]
 ```
 
@@ -399,7 +413,7 @@ flowchart LR
   listed type are looked up by each row's own key, so one with a grant on everything it created
   lists as fast as one with a few.
 - **Reachable** returns the same as scopes, for a host that keeps its resources elsewhere.
-  Conditional grants come back apart, to check one by one.
+  Conditional grants and conditional denies come back apart, to check one by one.
 - **Holders** lists who may do a permission on a resource, for an access review. That is each
   identity, through its own grants and its groups', with the tenant's members and the public as
   one holder each. It marks holders that hold only under a condition, or that a deny, a
@@ -418,7 +432,7 @@ flowchart TB
         allof["AllOf: compartments,<br/>every one needed"]
         anyof["AnyOf: releasable-to,<br/>one is enough"]
         ordered["Ordered: levels,<br/>this one or a higher one"]
-        excl["Exclusive: values that conflict,<br/>at most one held"]
+        excl["Exclusive, on an AllOf or AnyOf one:<br/>values that conflict, at most one held"]
     end
     grants["Grants on the tenant of roles<br/>giving dimension:value"] --> holding["Holding<br/>(holding, permissionsOf)"]
     holding --> sat{"Satisfies(resource.Labels)"}
@@ -428,33 +442,37 @@ flowchart TB
     two -->|yes| none(["holds none of them"])
 ```
 
-- **Releasing and writing.** `ReleasePermission(dimension)` is the power to remove a value from a
-  label, so only a holder of it can downgrade data. `MayWrite` and `MayRelease` say whether a
-  subject may give data a label.
+- **Releasing and writing.** `ReleasePermission(dimension)`, held on the tenant, is the power to
+  release data to a looser label in that dimension, so only a holder of it can downgrade data. A
+  `Holding`'s `MayWrite` and `MayRelease` say whether data read under one label may be written, or
+  released, under another.
 - **Exclusive values are checked when they change.** A change that would let anyone hold two
   values of an Exclusive dimension is refused, after its writes and under its locks. `Conflicts`
   lists anyone left able to, as a catalog change can leave them.
 
 ## Transactions and locks
 
-Changes take PostgreSQL advisory locks, keyed by the schema, so two changes that could conflict
-run one after the other, in one order, and a host transaction holding several never deadlocks
-with another doing the same.
+Changes take PostgreSQL advisory locks, keyed by the schema, so two changes to the same rows run
+one after the other, each taking its locks in one order. The locks last until the transaction
+ends, so under `WithTx` two host transactions changing the same scopes or principals in opposite
+orders can still deadlock, as can a change that also writes rows it doesn't lock: PostgreSQL fails
+one, which matches `ErrConflict`.
 
 ```mermaid
 flowchart TB
-    excl["exclusive/tenant<br/>first, where a dimension is Exclusive"] --> tshared["tenant/tenant, shared<br/>every change"]
+    excl["exclusive/tenant<br/>first, where a dimension is Exclusive"] --> tshared["tenant/tenant, shared<br/>every change but DeleteExpired, which takes none"]
     tshared --> scope["scope/tenant/type:id, exclusive<br/>each scope a change writes"]
     scope --> princ["principal/tenant/kind:id, exclusive<br/>each principal it names"]
-    texcl["tenant/tenant, exclusive<br/>SetRole, DeleteRole, DeleteTenant,<br/>and past 64 scopes or principals"] -.->|"instead of"| tshared
+    texcl["tenant/tenant, exclusive<br/>SetRole, DeleteRole, DeleteTenant,<br/>and past 64 scopes and principals together"] -.->|"instead of the shared lock<br/>and the scope and principal locks"| tshared
 ```
 
 - **READ COMMITTED.** A change runs at READ COMMITTED, as its checks under the locks must read what
   committed before the locks were taken. Under `WithTx` the host's transaction must be at READ
   COMMITTED too.
-- **One snapshot for reads in several statements.** Explain, Reachable, Holders and AsOf read in
-  one REPEATABLE READ transaction of their own, on a pool. Under `WithTx` they read on the host's
-  transaction at its isolation.
+- **One snapshot for reads in several statements.** Explain, Reachable, Holders and Conflicts read
+  in one REPEATABLE READ, READ ONLY transaction of their own on a pool, and AsOf in a REPEATABLE
+  READ one it rolls back; the label values Explain, Reachable and Holders need are read after it.
+  Under `WithTx` they read on the host's transaction at its isolation, AsOf in a savepoint.
 - **Races** PostgreSQL refuses, such as a serialization failure or a deadlock between host
   transactions, match `ErrConflict`: try again.
 
@@ -468,7 +486,7 @@ flowchart LR
     exp -->|"records and a signed checkpoint:<br/>SHA-256 chain"| store[("Host's write-once store")]
     store -->|"VerifyChain(from, records, to, key)"| verify(["records unaltered,<br/>none dropped"])
     hist -->|"temporary views of each table<br/>as it was at a time"| asof["AsOf(tenant, time, read)"]
-    hist -->|"PruneHistory(before, through)"| prune["superseded versions<br/>an export has read"]
+    hist -->|"PruneHistory(before, through)"| prune["superseded versions, and rows<br/>ended, that an export has read"]
 ```
 
 - **What a record holds.** Each holds the row as it was and as it became, when it took effect,
@@ -478,17 +496,22 @@ flowchart LR
   transactions older than every transaction still running, which have all ended. So a cursor
   never passes a record that commits later.
 - **Generations.** A cursor names its generation: the database cluster, by its system and
-  timeline, and the database and schema. Failing over or restoring starts a new generation, which
-  an export starts again from `Genesis`.
+  timeline, and the database and schema. Failing over or recovering to a point in time starts a
+  new generation, which an export starts again from `Genesis`. A restore that starts none, as
+  from a disk snapshot, keeps the generation: where it lost a cursor's last record, `History`
+  refuses that cursor, and history is exported again from the start.
 - **The export chain.** `Export` hashes each record onto the last checkpoint with SHA-256 and signs
-  the checkpoint with the host's `crypto.Signer`: ECDSA, Ed25519 or RSA, all from the Go standard
-  library. `VerifyChain` checks a run of records between two checkpoints.
+  the checkpoint with the host's `crypto.Signer`: ECDSA on P-256, P-384 or P-521, Ed25519, or RSA
+  of at least 3072 bits, each verified with the Go standard library. `VerifyChain` checks a run of
+  records between two checkpoints.
 - **AsOf** stands temporary views of history in for the tables, in a transaction it rolls back,
-  so every check, list and search answers as it would have at a past time. Each statement reads
-  history by the rows it names, through history's indexes.
+  so every check, list and search answers as it would have at a past time, with the catalog and
+  the label dimensions as they are now. Each statement reads history by the rows it names, through
+  history's indexes.
 - **PruneHistory** deletes only what an export has read and later versions supersede. It keeps
   each row's last version at or before its time, so AsOf answers as before for any later time,
-  and refuses an earlier one.
+  and refuses an earlier one; of a row whose last version by then ended it, it deletes every
+  version, the end last.
 
 ## Database roles
 
@@ -515,14 +538,14 @@ chose to store beyond these.
 
 | Bound | Value | What it limits |
 |---|---|---|
-| `MaxID` | 512 bytes | A tenant's, scope's, principal's or group's id. |
-| `MaxBindings` | 1,000 | Bindings in one `Apply` or `Import`, and members in one change. |
+| `MaxID` | 512 bytes | A tenant's, scope's or principal's id. |
+| `MaxBindings` | 1,000 | Bindings in one `Apply`, and the grants, memberships, groups or members one `Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`, `DeleteGroups`, `ImportMembers`, `ChangeMembers` or `DeleteMembers` takes. |
 | `MaxGrantsPerRole` | 20 | Grants in force of one role to one principal on one scope, differing by source, expiry or condition. Those from each source the host owns count apart. |
 | `MaxDenies`, `MaxDenyEntries` | 100, 256 | Denies on a scope, and the principals, exemptions or permissions one names. |
 | `MaxCustomRoles`, `MaxGrantableRoles` | 300, 64 | Custom roles in a tenant, and roles one lists in `GrantableRoles`. |
 | `MaxApprovers`, `MaxActivation` | 16, 366 days | An eligibility's approvers, and its longest activation. |
 | `MaxGroupDepth` | 8 | How deeply groups nest. |
-| `MaxExpression` | 2,048 | A condition's or requirement's expression. Its cost is bounded too. |
-| `MaxName`, `MaxDescription`, `MaxNote` | 128, 2,048, 2,048 | Names and titles, descriptions, and notes and justifications. |
-| `MaxRequest` | 256 | A request id in `Audit`. |
+| `MaxExpression` | 2,048 bytes | A condition's or requirement's expression. Its cost is bounded too. |
+| `MaxName`, `MaxDescription`, `MaxNote` | 128, 2,048, 2,048 characters | Names, titles and group ids, descriptions, and notes and justifications. |
+| `MaxRequest` | 256 characters | A request id in `Audit`. |
 | `MaxHistory`, `MaxPrune` | 10,000 each | Records read by one `History` call, and deleted by one prune. |
