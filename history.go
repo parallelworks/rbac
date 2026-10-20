@@ -266,8 +266,10 @@ type Record struct {
 	// Entity is what changed: grant, role, deny, eligibility, membership, group or member, or
 	// history itself, in no tenant, for a prune. Key is which, in the tenant.
 	Entity, Key string
-	// Op is create, update, delete or expire, or prune, whose After is what PruneHistory was given,
-	// how many records it deleted, and the id it reached, which a prune of the same goes on from.
+	// Op is create, update, delete or expire; baseline, a row written before history was installed,
+	// as migrating found it, dated when it was created, or a role when it last changed; or prune,
+	// whose After is what PruneHistory was given, how many records it deleted, and the id it
+	// reached, which a prune of the same goes on from.
 	Op string
 	// Principal, Role, Scope, Group and ExpiresAt are those of the row, where it has them.
 	Principal Principal

@@ -225,23 +225,24 @@ actor and the call that made it (`Record.How`), and what the host attaches with 
 on whose behalf it was made, the request and the reason. An expiry `DeleteExpired` removes is
 recorded as one, made by no one. Triggers write it, so a write that bypasses the package is
 recorded too, as no one's. That context is what the session that wrote it says; the database role
-is what the database knows. Nothing updates or truncates it, only `PruneHistory` deletes from it,
-and the package's tables can be deleted from but not truncated. `History` reads it in order, to
-export it to storage of the host's own: a transaction that commits after a later one is read
-after it, never skipped, and a record can be read twice, so dedupe on `Record.ID` and
-`RecordedAt`: a restore can give another record the ID of one it lost. Any transaction still
-running in the database cluster, in any of its databases, holds `History` back until it ends.
-A time a record holds as PostgreSQL's infinity, which the tables refuse but an older record can
-hold, reads as an instant just past either end of PostgreSQL's range, as `Record` says, so
-`History` reads on past it. `History` reads the primary, and fails on a replica. A generation
+is what the database knows. A row written before history was installed, as by a host that applied
+the first migrations on their own, is recorded by migrating as it found it, its `baseline`, dated
+when it was created, or a role when it last changed. Nothing updates or truncates history, only
+`PruneHistory` deletes from it, and the package's tables can be deleted from but not truncated.
+`History` reads it in order, to export it to storage of the host's own: a transaction that commits
+after a later one is read after it, never skipped, and a record can be read twice, so dedupe on
+`Record.ID` and `RecordedAt`: a restore can give another record the ID of one it lost. Any
+transaction still running in the database cluster, in any of its databases, holds `History` back
+until it ends. A time a record holds as PostgreSQL's infinity, which the tables refuse but an older
+record can hold, reads as an instant just past either end of PostgreSQL's range, as `Record` says,
+so `History` reads on past it. `History` reads the primary, and fails on a replica. A generation
 (`Cursor.Generation`) names the cluster, and the database and schema history is in, so no two
-installations in a cluster share one. A failover or a recovery to a point in time starts a new
-one, and a restore that starts none, as from a disk snapshot, loses what came after it: either
-can number again what the last one numbered past what it kept.
-`History` refuses a cursor from another generation, or whose last record the database no longer
-holds, and history is exported again from the start, kept apart from the last export. Move
-history with physical backups and replicas; a logical dump restored into another cluster numbers
-its transactions anew.
+installations in a cluster share one. A failover or a recovery to a point in time starts a new one,
+and a restore that starts none, as from a disk snapshot, loses what came after it: either can number
+again what the last one numbered past what it kept. `History` refuses a cursor from another
+generation, or whose last record the database no longer holds, and history is exported again from
+the start, kept apart from the last export. Move history with physical backups and replicas; a
+logical dump restored into another cluster numbers its transactions anew.
 
 A change refused, as `ErrDenied` or `ErrInvalid`, writes nothing, so history doesn't record it:
 `Config.OnRefused` is told of each, with its actor, the call and the host's audit, to record the
@@ -266,12 +267,15 @@ and each row as JSON text, not parsed into a store's own form, which can reorder
 `AsOf(ctx, tenant, at, read)` reads a tenant as it was at a time, from its history: every check,
 list and search the read makes answers as it would have then, with the catalog as it is now, as for
 an access review of a past date. A change counts from when the statement that made it began, but
-never before its row's change before it, and none can be made through it: one tried is no actor's
-attempt, and `Config.OnRefused` isn't told of it. A statement reads the history of the rows it
-names, as a check does its subject's grants, groups and the denies on its resource's path, and
-`Holders` the members of the groups it lists, not the whole tenant's. It orders a row's changes by
-their ids in `rbac_history`, which sessions take out of order once that table's id sequence caches
-more than one, so `AsOf` refuses that.
+never before its row's change before it, as the writer's snapshot holds it: at READ COMMITTED, as
+the package changes the tables, a statement that waited for another's lock on the row reads the
+change it waited for, but at REPEATABLE READ or SERIALIZABLE its transaction's snapshot is older,
+and it is dated before that change. Write around the package at READ COMMITTED. `AsOf` makes no
+change: one tried is no actor's attempt, and `Config.OnRefused` isn't told of it. A statement
+reads the history of the rows it names, as a check does its subject's grants, groups and the
+denies on its resource's path, and `Holders` the members of the groups it lists, not the whole
+tenant's. It orders a row's changes by their ids in `rbac_history`, which sessions take out of
+order once that table's id sequence caches more than one, so `AsOf` refuses that.
 
 `rbac.PruneHistory(ctx, db, before, through)` deletes what an export has read past (`through`, its
 cursor) and later records supersede: of each row, the last version at or before `before` stays, so

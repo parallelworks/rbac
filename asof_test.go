@@ -254,6 +254,13 @@ func TestAsOfRebuildsEveryTableAsItIs(t *testing.T) {
 	if err := h.authz.SetDeny(ctx, guardian, cluster, rbac.Deny{ID: "d", Principals: []rbac.Principal{{Kind: rbac.User, ID: "v"}}, Permissions: []rbac.Permission{root}}); err != nil {
 		t.Fatal(err)
 	}
+	rebuilt(t, h, dbNow(t, h))
+}
+
+// rebuilt checks that AsOf as of at reads each of the package's tables as t1's rows of it are now.
+func rebuilt(t *testing.T, h *harness, at time.Time) {
+	t.Helper()
+	ctx := t.Context()
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -269,7 +276,7 @@ func TestAsOfRebuildsEveryTableAsItIs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.authz.WithTx(tx).AsOf(ctx, "t1", dbNow(t, h), func(*rbac.Authorizer) error {
+	if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(*rbac.Authorizer) error {
 		for _, tb := range tables {
 			// The tenant's rows, each whole, generated columns included, in columns of the table's
 			// names, types and collations, in its order.
@@ -284,7 +291,7 @@ func TestAsOfRebuildsEveryTableAsItIs(t *testing.T) {
 				return err
 			}
 			if missing != 0 || extra != 0 || columns != 0 {
-				t.Errorf("%s as of now: %d rows missing, %d extra, %d columns differ", tb.Name, missing, extra, columns)
+				t.Errorf("%s as of %v: %d rows missing, %d extra, %d columns differ", tb.Name, at, missing, extra, columns)
 			}
 		}
 		return nil
