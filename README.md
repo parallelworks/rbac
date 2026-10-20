@@ -343,6 +343,8 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
 - **Tables:** `rbac.Migrate` creates them, prefixed `rbac_`, in the connection's current schema,
   in a database whose encoding is UTF8, and records what it applied in `rbac_migrations`. It never
   runs by itself; a host with a migration tool of its own can apply `rbac.Migrations()` instead.
+  On a host's transaction it refuses any isolation but READ COMMITTED: a stricter one's snapshot
+  would miss the writes it waits for.
   A migration that rebuilds an index, as `0009_grant_seeks` rebuilds two of `rbac_grants`, locks
   the table until it commits, so checks, lists and changes wait for the rebuild: on a large table,
   migrate when that wait is acceptable.

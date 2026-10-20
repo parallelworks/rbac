@@ -482,7 +482,7 @@ flowchart TB
 
 - **READ COMMITTED.** A change runs at READ COMMITTED, as its checks under the locks must read what
   committed before the locks were taken. Under `WithTx` the host's transaction must be at READ
-  COMMITTED too.
+  COMMITTED too, as must one `Migrate` is given.
 - **Rows in one order.** `DeleteScopes` holds its scopes' locks and `DeletePrincipal` its
   principal's, so neither waits for the other, and both delete the principal's grants and
   eligibilities on those scopes: each locks them in the order of their scopes first, eligibilities

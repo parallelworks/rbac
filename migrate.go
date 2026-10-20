@@ -32,16 +32,20 @@ func Migrations() fs.FS {
 // first in the search_path that exists, in a database whose encoding is UTF8. It records what it
 // applied in rbac_migrations, applies what is pending in one transaction, is safe to call from
 // several replicas at once, and never runs by itself. On a host's transaction it runs at that
-// transaction's isolation, which must be READ COMMITTED: a stricter one reads the versions from
-// before it waited for another replica, and the rows it records as they were before it waited for
-// the writes in flight to them.
+// transaction's isolation, and refuses any but READ COMMITTED: a stricter one's snapshot, taken by
+// an earlier statement, reads the versions from before it waited for another replica, and the rows
+// it records as they were before the writes it waited for.
 func Migrate(ctx context.Context, db DB) error {
 	// At READ COMMITTED, so a replica that waited for the lock reads the versions another applied
 	// meanwhile: a stricter snapshot, taken before the lock, would apply them again.
 	return begin(ctx, db, func(tx pgx.Tx) error {
 		var schema *string
-		if err := tx.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		var level string
+		if err := tx.QueryRow(ctx, `SELECT current_schema(), current_setting('transaction_isolation')`).Scan(&schema, &level); err != nil {
 			return err
+		}
+		if level != "read committed" {
+			return fmt.Errorf("rbac: Migrate runs at READ COMMITTED, not %s", strings.ToUpper(level))
 		}
 		if schema == nil {
 			return errors.New("rbac: no schema in the search_path exists to migrate in")

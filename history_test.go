@@ -860,6 +860,58 @@ func TestMigratingRecordsNoRowAsItWasBeforeAChangeInFlight(t *testing.T) {
 	}
 }
 
+// On a host's transaction, whose snapshot an earlier statement took at REPEATABLE READ or
+// SERIALIZABLE, migrating would record a row written before history as it was before a change that
+// has committed since, and AsOf would read it so: Migrate refuses it, and at READ COMMITTED reads
+// the change.
+func TestMigratingOnAHostsTransactionRecordsWhatHasCommitted(t *testing.T) {
+	for _, iso := range []pgx.TxIsoLevel{pgx.ReadCommitted, pgx.RepeatableRead, pgx.Serializable} {
+		t.Run(string(iso), func(t *testing.T) {
+			pool := pgtest.Open(t, "")
+			ctx := t.Context()
+			migrateFiles(t, pool, "", "0003")
+			if _, err := pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, note)
+				VALUES ('t1', 'cluster', 'c1', 'user', 'old', 'cluster.login', 'first')`); err != nil {
+				t.Fatal(err)
+			}
+			migrateFiles(t, pool, "0003", "0008")
+			// As Migrate records what it applied.
+			if _, err := pool.Exec(ctx, `CREATE TABLE rbac_migrations (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now());
+				INSERT INTO rbac_migrations (version) SELECT generate_series(1, 7)`); err != nil {
+				t.Fatal(err)
+			}
+			host, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: iso})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = host.Rollback(ctx) }()
+			if _, err := host.Exec(ctx, `SELECT FROM rbac_grants`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `UPDATE rbac_grants SET note = 'second' WHERE principal = 'user:old'`); err != nil {
+				t.Fatal(err)
+			}
+			err = rbac.Migrate(ctx, host)
+			if iso != pgx.ReadCommitted {
+				if err == nil || !strings.Contains(err.Error(), "READ COMMITTED") {
+					t.Fatalf("Migrate on a host's transaction at %s: %v", strings.ToUpper(string(iso)), err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := host.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			h := migrated(t, pool)
+			if notes, err := notesAt(t, h, dbNow(t, h)); err != nil || notes["old"] != "second" {
+				t.Fatalf("as of now: %v, %v", notes, err)
+			}
+		})
+	}
+}
+
 func TestHistoryRefusesACursorItCantFollow(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
