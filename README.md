@@ -151,13 +151,13 @@ reach, to check one by one.
   fails where it no longer passes them. Cost is bounded per condition and per check, for each
   scope on its path, and the conditions a check reads together are bounded where they are stored:
   an identity's grants' on a scope, those of a scope's grants to groups, the tenant's members and
-  the public, a scope's denies', and the requirements of groups' eligibilities for a role on a
-  scope, each to about seven short conditions or three of the longest, and a change past one is
-  refused as invalid. So a check evaluates every condition it reads, and a grant made beside
-  another, as by someone who can't revoke it, never changes what that one decides. Those stored
-  past a bound, as before there were bounds, a check may not all reach, as it evaluates the
-  cheapest first within its budget, and a change storing one among them is refused until revokes
-  bring them within it. To hand a
+  the public, each the tenant's and those from each source the host owns apart, a scope's denies',
+  and the requirements of groups' eligibilities for a role on a scope, each to about seven short
+  conditions or three of the longest, and a change past one is refused as invalid. So a check
+  evaluates every condition it reads, and a grant made beside another, as by someone who can't
+  revoke it, never changes what that one decides. Those stored past a bound, as before there were
+  bounds, a check may not all reach, as it evaluates the cheapest first within its budget, and a
+  change storing one among them is refused until revokes bring them within it. To hand a
   permission on, the actor holds it unconditionally or under the same condition, one that doesn't
   read the subject: that one decides for each holder, so the actor's holding says nothing of
   another's.

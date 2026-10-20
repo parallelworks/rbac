@@ -42,16 +42,17 @@ import (
 // What a check may spend on conditions is bounded, for each scope on its path, and so are the
 // conditions stored, so that a check evaluates whole every one it reads: those of an identity's
 // grants on a scope cost at most so much together, and those of a scope's grants to groups, the
-// tenant's members and the public, which reach many, as much again; those of a scope's denies
-// (SetDeny); and the requirements of the eligibilities of groups for a role on a scope. Each
-// distinct condition counts once, as what compiling it and evaluating it to its bound cost: about
-// seven short ones, or three of the longest. A check of a labeled resource decides each of the
-// subject's label values as a check of it would, and evaluates a condition that doesn't read the
-// action once for them all, so on the tenant one that does counts once for each label value its
-// grants give or its denies deny. A change past one is refused, so no grant, deny or eligibility
-// stored changes what the others decide. A condition stored around them, as before there were
-// bounds or on a custom role widened since, a check may not reach: it evaluates the cheapest
-// first, and past its budget a grant's condition is false and a deny's applies.
+// tenant's members and the public, which reach many, as much again, those from each source the
+// host owns (Config.Sources) apart from the rest; those of a scope's denies (SetDeny); and the
+// requirements of the eligibilities of groups for a role on a scope. Each distinct condition
+// counts once, as what compiling it and evaluating it to its bound cost: about seven short ones,
+// or three of the longest. A check of a labeled resource decides each of the subject's label
+// values as a check of it would, and evaluates a condition that doesn't read the action once for
+// them all, so on the tenant one that does counts once for each label value its grants give or its
+// denies deny. A change past one is refused, so no grant, deny or eligibility stored changes what
+// the others decide. A condition stored around them, as before there were bounds or on a custom
+// role widened since, a check may not reach: it evaluates the cheapest first, and past its budget
+// a grant's condition is false and a deny's applies.
 //
 // Searches (Filter, Reachable, Holders) can't evaluate one: Filter and Reachable count only
 // unconditional grants, Filter counts a conditional deny as denying, and Reach.Conditional and
@@ -78,10 +79,11 @@ const (
 	// zoneCost is what reading a time in a named zone costs: it loads the zone each time.
 	zoneCost = 100
 	// maxCheckCost is what the conditions a check reads cost together where they are bounded: an
-	// identity's grants on a scope, a scope's grants that reach many, its denies, and the
-	// requirements of groups' eligibilities for a role on it. A check, and a listing or a change
-	// for each permission it decides, may spend that much on each for each scope of its path, so
-	// many conditional grants can't make it slow, and evaluates them whole.
+	// identity's grants on a scope, a scope's grants that reach many, each the tenant's and from
+	// each source the host owns, its denies, and the requirements of groups' eligibilities for a
+	// role on it. A check, and a listing or a change for each permission it decides, may spend that
+	// much on each for each scope of its path, so many conditional grants can't make it slow, and
+	// evaluates them whole.
 	maxCheckCost = 8 * maxCost
 	// compilePerByte is what compiling a condition costs for each byte of it. Compiling one takes
 	// about as long as evaluating forty units of cost for each, twice that where attributes are
@@ -127,11 +129,14 @@ func (b *budget) sharing(ran map[string]run) *budget {
 	return b
 }
 
-// newGrantBudget is a check's budget for its grants' conditions on a path of scopes: the subject's
-// own on a scope and those of the scope's grants that reach many each cost at most maxCheckCost
-// (bounded), so a check may spend twice that for each scope of its path, and evaluates them whole
-// however many grants or groups it reads, or a third party adds.
-func newGrantBudget(path []string) *budget { return budgetOf(uint64(len(path)) * 2 * maxCheckCost) }
+// grantBudget is a check's budget for its grants' conditions on a path of scopes: the subject's own
+// on a scope and those of the scope's grants that reach many each cost at most maxCheckCost, the
+// tenant's and those from each source the host owns apart (conditionBucket), so a check may spend
+// that for each of them on each scope of its path, and evaluates them whole however many grants or
+// groups it reads, or a third party adds.
+func (a *Authorizer) grantBudget(path []string) *budget {
+	return budgetOf(uint64(len(path)) * 2 * uint64(1+len(a.owned)) * maxCheckCost)
+}
 
 // newDenyBudget is a check's budget for the denies' conditions on a path of scopes, apart from
 // what it spends on its grants', so neither leaves the other nothing: a scope's conditional denies

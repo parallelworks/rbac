@@ -5719,6 +5719,69 @@ func TestTheConditionsACheckReadsOnAScopeAreBoundedWhereTheyAreStored(t *testing
 	}
 }
 
+// The conditions of grants from a source the host owns are bounded apart from the tenant's, as their
+// number is: neither the tenant's admins, filling what a check reads together on a scope, can stop
+// the host storing a conditional grant there, nor the host them. A check evaluates both whole.
+func TestAHostsSourceIsBoundedApartFromTheTenantsGrants(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) { c.Sources = []string{"directory"} })
+	ctx := t.Context()
+	owner := h.as(t, "owner")
+	h.groups(t, "staff")
+	under := func(p rbac.Principal, expr string) rbac.Binding {
+		return rbac.Binding{Role: "cluster.login", Principal: p, Condition: rbac.Condition{Expression: expr}}
+	}
+	fromHost := func(b rbac.Binding) error {
+		b.Source = "directory"
+		return h.authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: b}})
+	}
+	for _, p := range []rbac.Principal{identity("u"), groupOf("staff")} {
+		// The tenant's admins fill what a check reads of the tenant's grants.
+		for i := range 3 {
+			if err := h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{under(p, spending(i))}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{under(p, spending(3))}}); !errors.Is(err, rbac.ErrInvalid) {
+			t.Fatalf("%s: the tenant's fourth: %v", p.ID, err)
+		}
+		// The host stores its own beside them, as many, and the last costliest.
+		for i := range 2 {
+			if err := fromHost(under(p, spending(10+i))); err != nil {
+				t.Fatalf("%s: the host's, beside the tenant's: %v", p.ID, err)
+			}
+		}
+		if err := fromHost(under(p, "true || "+spending(19))); err != nil {
+			t.Fatalf("%s: the host's third: %v", p.ID, err)
+		}
+		if err := fromHost(under(p, spending(13))); !errors.Is(err, rbac.ErrInvalid) {
+			t.Fatalf("%s: the host's fourth: %v", p.ID, err)
+		}
+	}
+	// Filled so on every scope of the cluster's path, a check reads them all, and reaches the
+	// costliest, which holds.
+	n := 100
+	for _, scope := range []rbac.Scope{workspace.Scope(), {Type: "org", ID: "o1"}, rbac.TenantRoot("t1")} {
+		var more []rbac.Grant
+		for _, p := range []rbac.Principal{identity("u"), groupOf("staff")} {
+			for i := range 6 {
+				// Each its own, as a check pays for one condition once.
+				n++
+				b := under(p, spending(n))
+				if i >= 3 {
+					b.Source = "directory"
+				}
+				more = append(more, rbac.Grant{Scope: scope, Binding: b})
+			}
+		}
+		if err := h.authz.Import(ctx, host, "t1", more); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if d, err := h.authz.Explain(ctx, h.as(t, "u", "staff"), login, cluster); err != nil || len(d.Grants) != 2 {
+		t.Fatalf("Explain = %+v, %v", d, err)
+	}
+}
+
 // Conditions stored around the bounds can cost more than a check may spend: it spends a bounded
 // budget on them, the cheapest first, and refuses what still needs one.
 func TestACheckSpendsABoundedBudgetOnConditionsStoredAroundTheBounds(t *testing.T) {

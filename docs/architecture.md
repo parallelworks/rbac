@@ -354,8 +354,9 @@ sequenceDiagram
   `Config.Attributes`. Each is compiled once, bounded in cost, and fails closed: a condition that
   errors gives nothing, and a deny's that errors denies. What a check reads together is bounded
   where it is stored, for each scope: an identity's conditional grants, the conditional grants to
-  groups, the tenant's members and the public, the conditional denies, and the requirements of
-  groups' eligibilities for a role, and a change past one is refused as invalid. A check's budget
+  groups, the tenant's members and the public, each the tenant's and those from each source the
+  host owns apart, the conditional denies, and the requirements of groups' eligibilities for a
+  role, and a change past one is refused as invalid. A check's budget
   is that for each scope on its path, so it evaluates every condition it reads, and no grant made
   beside another changes what that one decides. Conditions stored before there were bounds may be
   past one: a check evaluates them cheapest first within its budget.
@@ -610,7 +611,7 @@ row a few lookups among them however many there are.
 | `MaxGroupDepth` | 8 | How deeply groups nest. |
 | `MaxPlacesInGroup` | 20 | Places in force of one principal in one group, each from another source. Those from each source the host owns count apart. |
 | `MaxExpression` | 2,048 bytes | A condition's or requirement's expression. Its cost is bounded too. |
-| What a check reads together | About seven short conditions, or three of the longest | The distinct conditions of an identity's conditional grants on a scope; of a scope's conditional grants to groups, the tenant's members and the public; of a scope's conditional denies; and the requirements of groups' eligibilities for a role on a scope. On the tenant, one reading the action counts once for each label value it gives or denies. |
+| What a check reads together | About seven short conditions, or three of the longest | The distinct conditions of an identity's conditional grants on a scope; of a scope's conditional grants to groups, the tenant's members and the public; each the tenant's and those from each source the host owns apart; of a scope's conditional denies; and the requirements of groups' eligibilities for a role on a scope. On the tenant, one reading the action counts once for each label value it gives or denies. |
 | `MaxConditionBytes` | 32 KiB | The conditions one `Apply` or `Import` carries, each distinct one counted once. |
 | `MaxName`, `MaxDescription`, `MaxNote` | 128, 2,048, 2,048 characters | Names, titles and group ids, descriptions, and notes and justifications. |
 | `MaxRequest` | 256 characters | A request id in `Audit`. |

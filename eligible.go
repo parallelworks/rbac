@@ -589,9 +589,9 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 		return cmp.Compare(min(len(x.approvers), 1), min(len(y.approvers), 1))
 	})
 	reason := fmt.Sprintf("not eligible to activate %s here for %s", act.Role, act.Duration)
-	// On the budget of a check of the scope: the subject holds one eligibility for a role there,
-	// and its groups' requirements are bounded together (SetEligibility).
-	vars, spend := a.vars(ctx, s, manage, on), newGrantBudget([]string{scope.Key()})
+	// The subject holds one eligibility for a role there, and its groups' requirements are bounded
+	// together (SetEligibility).
+	vars, spend := a.vars(ctx, s, manage, on), budgetOf(2*maxCheckCost)
 	for _, e := range found {
 		if len(e.approvers) > 0 && !approves(act.Approver, s, countedOf(approvers, broad{}), e.approvers) {
 			reason = fmt.Sprintf("activating %s here needs one of its approvers to approve", act.Role)

@@ -1054,7 +1054,7 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 	spends := map[Permission]*budget{}
 	spend := func(action Permission) *budget {
 		if spends[action] == nil {
-			spends[action] = newGrantBudget(on.path())
+			spends[action] = a.grantBudget(on.path())
 		}
 		return spends[action]
 	}
@@ -1655,56 +1655,73 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 	return granted, nil
 }
 
-// conditionsBounded refuses conditional grants just stored that leave the conditions a check reads
-// on their scope costing more together than it may spend on them: those of an identity's grants,
-// and those of the grants to groups, the tenant's members and the public, which reach many,
-// whatever their roles, one that reads the action counted once for each label value its grants
-// give, as a read of label values decides each apart. A check evaluates them whole, so a grant
-// made beside another, as by an actor who can't revoke it, never changes what that one decides. It
-// reads them under the change's locks, which every change of a scope's grants takes, once they are
-// stored, the grants in force the change didn't touch included.
-func (a *Authorizer) conditionsBounded(ctx context.Context, tx pgx.Tx, tenant string, stored []Grant) error {
-	type bucket struct{ scope, principal string }
-	seen := map[bucket]bool{}
-	var scopes, principals []string
-	for _, g := range stored {
-		b := bucket{g.Scope.Key(), g.Principal.key()}
+// conditionBucket is conditional grants a check reads together on a scope: an identity's own, or,
+// with principal "", those to groups, the tenant's members and the public, which reach many, of
+// any role; those from each source the host owns (Config.Sources) apart from the rest, as bounded
+// counts them, so neither the host nor a tenant's admins can fill a bucket the other stores in.
+type conditionBucket struct{ scope, principal, source string }
+
+// bucketsOf are the buckets of the conditional grants among grants.
+func (a *Authorizer) bucketsOf(grants []Grant) []conditionBucket {
+	var buckets []conditionBucket
+	for _, g := range grants {
+		b := conditionBucket{g.Scope.Key(), g.Principal.key(), ""}
 		if reachesMany(g.Principal) {
 			b.principal = ""
 		}
-		if g.Condition.Expression != "" && !seen[b] {
-			seen[b] = true
-			scopes, principals = append(scopes, b.scope), append(principals, b.principal)
+		if a.owned[g.Source] {
+			b.source = g.Source
+		}
+		if g.Condition.Expression != "" && !slices.Contains(buckets, b) {
+			buckets = append(buckets, b)
 		}
 	}
-	if len(scopes) == 0 {
+	return buckets
+}
+
+// conditionsBounded refuses conditional grants just stored that leave the conditions of a bucket
+// costing more together than a check may spend on them, one that reads the action counted once
+// for each label value its grants give, as a read of label values decides each apart. A check
+// evaluates them whole, so a grant made beside another, as by an actor who can't revoke it, never
+// changes what that one decides. It reads them under the change's locks, which every change of a
+// scope's grants takes, once they are stored, the grants in force the change didn't touch
+// included.
+func (a *Authorizer) conditionsBounded(ctx context.Context, tx pgx.Tx, tenant string, stored []Grant) error {
+	buckets := a.bucketsOf(stored)
+	if len(buckets) == 0 {
 		return nil
+	}
+	scopes, principals, sources := make([]string, len(buckets)), make([]string, len(buckets)), make([]string, len(buckets))
+	for i, b := range buckets {
+		scopes[i], principals[i], sources[i] = b.scope, b.principal, b.source
 	}
 	// The grants that reach many by their keys, the groups' a range, each of which the scope's index
 	// seeks: '' is no principal's key.
 	rows, err := tx.Query(ctx, `
-		SELECT b.scope, b.principal, g.condition, array_agg(DISTINCT g.role) FROM unnest($2::text[], $3::text[]) AS b(scope, principal)
+		SELECT b.scope, b.principal, b.source, g.condition, array_agg(DISTINCT g.role)
+		FROM unnest($2::text[], $3::text[], $4::text[]) AS b(scope, principal, source)
 		CROSS JOIN LATERAL (
-		  SELECT condition, role FROM rbac_grants WHERE scope = b.scope AND tenant = $1 AND principal = b.principal
-		    AND conditional AND (expires_at IS NULL OR expires_at > $4)
+		  SELECT condition, role, source FROM rbac_grants WHERE scope = b.scope AND tenant = $1 AND principal = b.principal
+		    AND conditional AND (expires_at IS NULL OR expires_at > $5)
 		  UNION ALL
-		  SELECT condition, role FROM rbac_grants WHERE b.principal = '' AND scope = b.scope AND tenant = $1
-		    AND principal >= 'group:' AND principal < 'group;' AND conditional AND (expires_at IS NULL OR expires_at > $4)
+		  SELECT condition, role, source FROM rbac_grants WHERE b.principal = '' AND scope = b.scope AND tenant = $1
+		    AND principal >= 'group:' AND principal < 'group;' AND conditional AND (expires_at IS NULL OR expires_at > $5)
 		  UNION ALL
-		  SELECT condition, role FROM rbac_grants WHERE b.principal = '' AND scope = b.scope AND tenant = $1
-		    AND principal = ANY(ARRAY[$5, $6]::text[]) AND conditional AND (expires_at IS NULL OR expires_at > $4)
+		  SELECT condition, role, source FROM rbac_grants WHERE b.principal = '' AND scope = b.scope AND tenant = $1
+		    AND principal = ANY(ARRAY[$6, $7]::text[]) AND conditional AND (expires_at IS NULL OR expires_at > $5)
 		) g
-		GROUP BY b.scope, b.principal, g.condition`,
-		tenant, scopes, principals, a.cfg.Now(), TenantMembers(tenant).key(), publicKey)
+		WHERE CASE WHEN g.source = ANY($8::text[]) THEN g.source ELSE '' END = b.source
+		GROUP BY b.scope, b.principal, b.source, g.condition`,
+		tenant, scopes, principals, sources, a.cfg.Now(), TenantMembers(tenant).key(), publicKey, slices.Sorted(maps.Keys(a.owned)))
 	if err != nil {
 		return err
 	}
-	carried := map[bucket]map[string][]Role{}
+	carried := map[conditionBucket]map[string][]Role{}
 	var ids []Role
-	var scope, principal, condition string
+	var b conditionBucket
+	var condition string
 	var roles []Role
-	if _, err := pgx.ForEachRow(rows, []any{&scope, &principal, &condition, &roles}, func() error {
-		b := bucket{scope, principal}
+	if _, err := pgx.ForEachRow(rows, []any{&b.scope, &b.principal, &b.source, &condition, &roles}, func() error {
 		if carried[b] == nil {
 			carried[b] = map[string][]Role{}
 		}
@@ -1715,23 +1732,23 @@ func (a *Authorizer) conditionsBounded(ctx context.Context, tx pgx.Tx, tenant st
 		return err
 	}
 	// What the roles give matters only for counting label values.
-	b := book{builtin: a.roles}
+	defs := book{builtin: a.roles}
 	if len(a.labels) > 0 {
-		if b, err = a.book(ctx, tx, tenant, ids); err != nil {
+		if defs, err = a.book(ctx, tx, tenant, ids); err != nil {
 			return err
 		}
 	}
 	var over []error
 	readsAction := map[string]bool{}
-	for i, scope := range scopes {
+	for _, b := range buckets {
 		gives := map[string][]Permission{}
-		for expr, roles := range carried[bucket{scope, principals[i]}] {
+		for expr, roles := range carried[b] {
 			gives[expr] = nil
 			if len(a.labels) == 0 {
 				continue
 			}
 			for _, id := range roles {
-				if def, ok := b.role(id); ok {
+				if def, ok := defs.role(id); ok {
 					gives[expr] = append(gives[expr], def.Permissions...)
 				}
 			}
@@ -1739,12 +1756,15 @@ func (a *Authorizer) conditionsBounded(ctx context.Context, tx pgx.Tx, tenant st
 		if affordable(a.evaluations(gives, readsAction)) {
 			continue
 		}
-		whose := principals[i] + "'s grants"
-		if principals[i] == "" {
+		whose := b.principal + "'s grants"
+		if b.principal == "" {
 			whose = "the grants to groups, the tenant's members and the public"
 		}
+		if b.source != "" {
+			whose += " from " + b.source
+		}
 		over = append(over, fmt.Errorf("%w: the conditions of %s on %s cost more together than a check may spend evaluating them",
-			ErrInvalid, whose, scope))
+			ErrInvalid, whose, b.scope))
 	}
 	return errors.Join(over...)
 }

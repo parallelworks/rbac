@@ -699,7 +699,10 @@ type Config struct {
 	// granted from one, so a tenant's admins can neither forge the host's grants nor remove them
 	// behind its back. The host makes and removes them with Import and DeleteGrants. A custom role
 	// the host grants stays the tenant's to define: redefining it changes what the host's grants
-	// give, as it does any grant of it, asking the host about those it widens.
+	// give, as it does any grant of it, asking the host about those it widens. The conditions of
+	// grants from each are bounded apart from the tenant's, as MaxGrantsPerRole counts them, so
+	// neither can fill what the other stores in, and a check may spend as much again on each
+	// (Condition).
 	Sources []string
 	// Attributes declares the attributes conditions read, so one misnamed or of another type is
 	// refused when a condition is stored; undeclared, any is read.
