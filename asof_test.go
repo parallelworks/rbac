@@ -188,16 +188,21 @@ func TestAsOfLeavesTheHostsTransactionAsItWas(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL plan_cache_mode = force_generic_plan`); err != nil {
+		t.Fatal(err)
+	}
 	if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
 		_, err := a.Grants(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}})
 		return err
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// The views are gone with its savepoint: the host's transaction reads the tables again.
-	var name string
-	if err := tx.QueryRow(ctx, `SELECT 'rbac_grants'::regclass::text`).Scan(&name); err != nil || name != "rbac_grants" {
-		t.Fatalf("rbac_grants is %q, %v", name, err)
+	// The views are gone with its savepoint, and the host plans as it did: the host's transaction
+	// reads the tables again.
+	var name, plans string
+	if err := tx.QueryRow(ctx, `SELECT 'rbac_grants'::regclass::text, current_setting('plan_cache_mode')`).Scan(&name, &plans); err != nil ||
+		name != "rbac_grants" || plans != "force_generic_plan" {
+		t.Fatalf("rbac_grants is %q, plan_cache_mode %q, %v", name, plans, err)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
 		VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'cluster.login')`); err != nil {
@@ -692,5 +697,160 @@ func TestAsOfReadsPastAStatementTheSessionPrepared(t *testing.T) {
 	}
 	if n := held(h.authz); n != 0 {
 		t.Errorf("after AsOf, u holds %d grants", n)
+	}
+}
+
+// A connection's statement is the same one as of a time as now, and from its sixth run can take a
+// generic plan, which costs history's indexes by an average tenant's few rows. As of a time, each
+// run of a check reads as much history as the first, in a tenant whose custom roles have each been
+// defined three times, one of which the check's subject holds.
+func TestAsOfReadsAsMuchOnEveryRunOfACheck(t *testing.T) {
+	h := crowded(t, pgtest.Open(t, "pool_max_conns=1"))
+	ctx := t.Context()
+	u := h.as(t, "u")
+	for _, q := range []string{
+		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+		  SELECT 't1', 'custom.r' || i, '{cluster:login}', '{cluster}' FROM generate_series(1, 300) i`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'custom.r1')`,
+		`UPDATE rbac_roles SET name = 'again' WHERE tenant = 't1'`,
+		`UPDATE rbac_roles SET name = 'and again' WHERE tenant = 't1'`,
+		`ANALYZE rbac_history, rbac_roles`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	at := dbNow(t, h)
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+		var first int64
+		for run := range 8 {
+			start := historyPages(ctx, t, tx)
+			if err := a.Authorize(ctx, u, login, cluster); err != nil {
+				return err
+			}
+			read := historyPages(ctx, t, tx) - start
+			if run == 0 {
+				first = read
+			} else if read > first*3/2+deeper {
+				t.Errorf("as of a time, a check read %d pages of history on its first run, and %d on run %d", first, read, run+1)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// As of a time, a session that plans each statement generically lists a principal's memberships
+// from its own versions: planned by the averages, the read leads to the tenant and reads every
+// member's.
+func TestAsOfListsAPrincipalsMembershipsAloneWhateverTheSessionsPlans(t *testing.T) {
+	h := generic(t)
+	ctx := t.Context()
+	u := h.as(t, "u")
+	read := func(at time.Time) int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		var read int64
+		if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+			start := historyPages(ctx, t, tx)
+			ms, err := a.Memberships(ctx, "t1", []rbac.Principal{u.Principal})
+			if err == nil && len(ms) != 1 {
+				err = fmt.Errorf("u's memberships: %+v", ms)
+			}
+			read = historyPages(ctx, t, tx) - start
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return read
+	}
+	manyMembers(t, h, 500, `SELECT FROM others`, "rbac_history")
+	few := read(dbNow(t, h))
+	manyMembers(t, h, 4500, `SELECT FROM others`, "rbac_history")
+	if many := read(dbNow(t, h)); many > few*3/2+deeper {
+		t.Errorf("as of a time, a principal's memberships read %d pages of history beside 500 other members, and %d beside 5000", few, many)
+	}
+}
+
+// customRolesAsOf is how many pages of history a check by s reads as of now, beside many tenants'
+// history, before the tenant has other custom roles and once it has 200, each defined twice.
+func customRolesAsOf(t *testing.T, h *harness, s rbac.Subject) (few, many int64) {
+	t.Helper()
+	ctx := t.Context()
+	read := func(at time.Time) int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		var read int64
+		if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+			start := historyPages(ctx, t, tx)
+			err := a.Authorize(ctx, s, login, cluster)
+			read = historyPages(ctx, t, tx) - start
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return read
+	}
+	if _, err := h.pool.Exec(ctx, `ANALYZE rbac_history, rbac_roles`); err != nil {
+		t.Fatal(err)
+	}
+	few = read(dbNow(t, h))
+	for _, q := range []string{
+		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+		  SELECT 't1', 'custom.other' || i, '{cluster:view}', '{cluster}' FROM generate_series(1, 200) i`,
+		`UPDATE rbac_roles SET name = 'again' WHERE tenant = 't1' AND id LIKE 'custom.other%'`,
+		`ANALYZE rbac_history, rbac_roles`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return few, read(dbNow(t, h))
+}
+
+// As of a time, a check reads the custom role its grant names by its id, however few of history's
+// records, among many tenants', are the tenant's custom roles: counted as a row, they would all be
+// read for each version of the one it holds.
+func TestAsOfReadsACheckersCustomRoleAloneAmongManyTenants(t *testing.T) {
+	h := crowded(t, pgtest.Open(t, ""))
+	ctx := t.Context()
+	u := h.as(t, "u")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.login', '{cluster:login}', '{cluster}')`); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), "custom.login", rbac.User, "u"))
+	if few, many := customRolesAsOf(t, h, u); many > few*3/2+deeper {
+		t.Errorf("a check as of a time read %d pages of history beside no other custom role, and %d beside 200", few, many)
+	}
+}
+
+// As of a time, a check reads no custom role its grants don't name, as history's statistics can
+// leave out the tenant's: here they hold only the commonest tenant and entity, another tenant's
+// grants.
+func TestAsOfReadsNoCustomRoleACheckDoesntName(t *testing.T) {
+	h := crowded(t, pgtest.Open(t, "default_statistics_target=1"))
+	ctx := t.Context()
+	u := h.as(t, "u")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		SELECT 'large', 'cluster', 'c' || i, 'user', 'u' || i, 'cluster.login' FROM generate_series(1, 5000) i`); err != nil {
+		t.Fatal(err)
+	}
+	if few, many := customRolesAsOf(t, h, u); many > few*3/2+deeper {
+		t.Errorf("a check as of a time read %d pages of history beside no custom role, and %d beside 200", few, many)
 	}
 }

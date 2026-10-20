@@ -51,7 +51,8 @@ var asOfEntities = []struct {
 //
 // It reads in one transaction, or a savepoint of the host's under WithTx, in which temporary
 // views named as the package's tables stand in for them, and rolls it back, even once ctx is
-// done. It needs a transaction that may write, on a primary, as a role that may create temporary
+// done. Every statement there is planned for its arguments, the host's under WithTx too, as
+// plan_cache_mode force_custom_plan plans them, until the rollback restores the setting. It needs a transaction that may write, on a primary, as a role that may create temporary
 // tables. A search_path that names pg_temp after the package's schema would read the tables as
 // they are now, and one that names it first the session's own tables as history, so AsOf refuses
 // both. It orders a row's changes by their ids in rbac_history, which sessions take out of order
@@ -115,7 +116,13 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	if err := unpruned(ctx, tx, schema, at); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.as_of_tenant', $1, true), set_config('rbac.as_of', $2::pg_catalog.timestamptz::pg_catalog.text, true)`,
+	// Each statement is planned for its arguments until AsOf rolls back. A connection prepares a
+	// statement once, as of a time and now alike, and from its sixth run can plan it generically,
+	// costing history's indexes by an average tenant's few rows: a check would then read every
+	// version of the tenant's custom roles again for each it read, and a list of a principal's
+	// memberships every member's.
+	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.as_of_tenant', $1, true), set_config('rbac.as_of', $2::pg_catalog.timestamptz::pg_catalog.text, true),
+		set_config('plan_cache_mode', 'force_custom_plan', true)`,
 		tenant, at); err != nil {
 		return err
 	}

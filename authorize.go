@@ -1593,15 +1593,16 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 		SELECT 3, k, '', '', '', e, false, NULL, '', NULL, false, false, NULL, '', '', false FROM ends`
 	}
 	// In the statement's text rather than an argument: a generic plan can't tell from one whether
-	// to read every role of the tenant or look up those the grants name.
-	var which string
+	// to read every role of the tenant or look up those the grants name. Those are looked up a key at
+	// a time (byKey): matched to the grants, a plan counting the tenant's roles as a few reads them
+	// all, and as of a time each one's every version, again for each version.
+	customRoles := "rbac_roles WHERE tenant = $1"
 	switch roles {
 	case namedRoles:
-		which = "id IN (SELECT role FROM held WHERE role LIKE '" + CustomPrefix + "%')"
+		customRoles = "(" + byKey("ARRAY(SELECT DISTINCT role FROM held WHERE role LIKE '"+CustomPrefix+"%')", "rbac_roles", "id", roleColumns, "tenant = $1") + ") r"
 	case tenantRoles:
-		which = "TRUE"
 	case heldTenantRoles:
-		which = "EXISTS (SELECT FROM held WHERE role LIKE '" + CustomPrefix + "%')"
+		customRoles += " AND EXISTS (SELECT FROM held WHERE role LIKE '" + CustomPrefix + "%')"
 	}
 	// Grants, denies, roles and keys in that order; grants by principal, scope, role and id, denies
 	// by id and scope, as deniesOn.
@@ -1625,8 +1626,7 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 		  AND (`+forP+` OR `+values+` AND scope = 'tenant:' || $1)`)+`) d
 		UNION ALL
 		SELECT 2, id, '', '', id, NULL, false, permissions, '', resource_types, privileged, public, grantable_roles, name, description, false
-		FROM rbac_roles
-		WHERE tenant = $1 AND `+which+ends+`
+		FROM `+customRoles+ends+`
 		UNION ALL
 		SELECT 4, k, '', '', '', NULL, false, NULL, '', NULL, false, false, NULL, '', '', false FROM keys WHERE `+keyed+`
 		ORDER BY 1, 3, 4, 5, 2`,
