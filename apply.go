@@ -916,6 +916,12 @@ func (c *constrained) removes(p Permission, resourceType string) bool {
 	if removed, ok := c.asked[k]; ok {
 		return removed
 	}
+	// Without constraints there is nothing to ask, so none was missed: as where scopes the actor
+	// holds the same grants on decided together before the transaction, and one decides apart in it.
+	if len(c.a.cfg.Constraints) == 0 {
+		c.asked[k] = false
+		return false
+	}
 	if c.sealed {
 		c.missed = true
 		return true

@@ -1193,6 +1193,28 @@ func meanwhileAsked(t *testing.T, via rbac.Via, meanwhile *func(context.Context)
 	})
 }
 
+// Scopes a change to members reaches decide together where the actor holds the same grants on
+// each, and one whose grants changed meanwhile decides apart under the locks: with no constraints
+// to ask, nothing it checks there was missed before the transaction, so the change goes through.
+func TestAScopeDecidedApartUnderTheLocksIsNoConflict(t *testing.T) {
+	var meanwhile func(context.Context) error
+	h := meanwhileAsked(t, rbac.ViaMembership, &meanwhile)
+	ctx := t.Context()
+	a, b := rbac.Scope{Type: "cluster", ID: "a"}, rbac.Scope{Type: "cluster", ID: "b"}
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.admin", rbac.User, "lead"), grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "lead"),
+		grant(a, "cluster.login", rbac.Group, "crew"), grant(b, "cluster.login", rbac.Group, "crew"))
+	h.join(t, "u")
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.Import(ctx, host, "t1", []rbac.Grant{grant(b, "cluster.login", rbac.User, "lead")})
+	}
+	if err := h.authz.ChangeMembers(ctx, h.as(t, "lead"), "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}}, nil); err != nil {
+		t.Fatalf("a member gaining what crew holds, once the actor's grants on one scope changed meanwhile: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("lead should have been granted on b meanwhile")
+	}
+}
+
 func TestAGrantToAGroupAMemberJoinedWhileTheHostWasAskedIsTriedAgain(t *testing.T) {
 	var meanwhile func(context.Context) error
 	h := meanwhileAsked(t, rbac.ViaApply, &meanwhile)
