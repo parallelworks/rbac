@@ -31,9 +31,10 @@ import (
 //
 // A condition reading an attribute a request doesn't carry, or carries as a value CEL reads as
 // another type than it is declared, or as nil, is false when it runs, and a deny's applies: a
-// declared attribute passed so fails whatever reads it, comparing it with `!=`, or a map or list
-// holding it, included. A name a declared kind doesn't declare, which a condition reads only through
-// dyn(), fails so too. An undeclared kind's are read as passed, and CEL compares values of
+// declared attribute passed so fails whatever reads it, comparing it with `!=`, testing it with
+// has(), or a map or list holding it, included, and so does reading the kind's attributes as a
+// whole, by `in`, size() or a macro. A name a declared kind doesn't declare, which a condition reads
+// only through dyn(), fails so too. An undeclared kind's are read as passed, and CEL compares values of
 // different types as unequal.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType

@@ -575,6 +575,11 @@ const (
 	MaxDescription = 2048
 	MaxNote        = 2048
 	MaxExpression  = 2048
+	// MaxConditionBytes is how many bytes of conditions, each counted once, one change carries:
+	// compiling one takes milliseconds, before the host is asked and outside any check's budget,
+	// and a change of many distinct ones would otherwise spend seconds and fill the cache of
+	// compiled conditions every check reads.
+	MaxConditionBytes = 128 << 10
 )
 
 // DeniedError is a refusal, with why. Its message names only the permission, so a host that
@@ -762,6 +767,10 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 	for _, t := range cfg.ContainerTypes {
 		if !validName(t) || t == TenantScope || t == GroupScope {
 			return nil, fmt.Errorf("rbac: container type %q is not valid", t)
+		}
+		// Its permissions would read as the dimension's values, so none could change its grants.
+		if slices.ContainsFunc(cfg.Labels, func(d LabelDimension) bool { return d.Name == t }) {
+			return nil, fmt.Errorf("rbac: container type %q is named as a label dimension", t)
 		}
 		containers[t] = true
 	}

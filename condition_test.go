@@ -1,7 +1,9 @@
 package rbac_test
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -100,6 +102,77 @@ func TestADeclaredAttributePassedAsAnotherTypeFailsAComparisonOfWhatHoldsIt(t *t
 		}
 		if allowed(t, h, v, login, at(env)) {
 			t.Errorf("a deny's condition was lifted for env %#v", env)
+		}
+	}
+}
+
+// A declared attribute passed as nil, as a nil pointer or as another type fails a test of its
+// presence, and whatever reads the attributes as a whole, as it fails what reads it: otherwise a
+// deny that applies while one is missing would lift, and a grant given while one is present hold.
+// The attributes it doesn't refuse read as they are.
+func TestADeclaredAttributePassedAsAnotherTypeFailsAPresenceTest(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
+		c.Attributes = rbac.Attributes{Request: map[string]rbac.AttributeType{"mfa_at": rbac.AttrTimestamp, "team": rbac.AttrString}}
+	})
+	ctx := t.Context()
+	grants := map[string]string{
+		"present":  `has(request.attributes.mfa_at)`,
+		"listed":   `"mfa_at" in dyn(request.attributes)`,
+		"counted":  `size(dyn(request.attributes)) == 2`,
+		"iterated": `dyn(request.attributes).exists(k, k == "mfa_at")`,
+	}
+	gs := []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "v"), grant(cluster.Scope(), "guard", rbac.User, "guardian")}
+	sibling := grant(cluster.Scope(), "cluster.login", rbac.User, "sibling")
+	sibling.Condition = rbac.Condition{Expression: `request.attributes.team == "sre"`}
+	gs = append(gs, sibling)
+	for id, expr := range grants {
+		g := grant(cluster.Scope(), "cluster.login", rbac.User, id)
+		g.Condition = rbac.Condition{Expression: expr}
+		gs = append(gs, g)
+	}
+	h.seed(t, gs...)
+	v := h.as(t, "v")
+	d := rbac.Deny{
+		ID: "mfa", Principals: []rbac.Principal{v.Principal}, Permissions: []rbac.Permission{login},
+		Condition: rbac.Condition{Expression: `!has(request.attributes.mfa_at)`},
+	}
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, d); err != nil {
+		t.Fatal(err)
+	}
+	with := func(mfa any) context.Context {
+		return rbac.WithRequest(ctx, map[string]any{"mfa_at": mfa, "team": "sre"})
+	}
+	is := func(c context.Context, id string) bool {
+		t.Helper()
+		err := h.authz.Authorize(c, h.as(t, id), login, cluster)
+		if err != nil && !errors.Is(err, rbac.ErrDenied) {
+			t.Fatal(err)
+		}
+		return err == nil
+	}
+	ok := with(time.Now())
+	for id := range grants {
+		if !is(ok, id) {
+			t.Errorf("%s: a timestamp the condition takes", id)
+		}
+	}
+	if !is(ok, "v") {
+		t.Error("a deny's condition held with mfa_at present")
+	}
+	var none *time.Time
+	for _, mfa := range []any{nil, none, "not a time", 7} {
+		c := with(mfa)
+		for id := range grants {
+			if is(c, id) {
+				t.Errorf("%s: a grant's condition held for mfa_at %#v", id, mfa)
+			}
+		}
+		if is(c, "v") {
+			t.Errorf("a deny's condition was lifted for mfa_at %#v", mfa)
+		}
+		if !is(c, "sibling") {
+			t.Errorf("an attribute beside one refused was refused too, for mfa_at %#v", mfa)
 		}
 	}
 }
@@ -281,5 +354,79 @@ func TestAnAttributeADeclaredKindDoesntDeclareFailsItsConditions(t *testing.T) {
 	r.Attributes = map[string]any{"env": "dev", "team": nil}
 	if allowed(t, h, h.as(t, "u"), login, r) {
 		t.Fatal("a condition held on an attribute its kind doesn't declare")
+	}
+}
+
+// A change's conditions are bounded together, each counted once: compiling one takes milliseconds,
+// before the host is asked, so a change of a thousand distinct ones would spend seconds.
+func TestAChangeCarriesBoundedConditions(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	pad := strings.Repeat("x", 180)
+	distinct := func(n int, same bool) []rbac.Binding {
+		bs := make([]rbac.Binding, n)
+		for i := range bs {
+			c := i
+			if same {
+				c = 0
+			}
+			bs[i] = rbac.Binding{
+				Role: "cluster.login", Principal: identity(fmt.Sprintf("u%d", i)),
+				Condition: rbac.Condition{Expression: fmt.Sprintf(`"%d%s" != ""`, c, pad)},
+			}
+		}
+		return bs
+	}
+	many := distinct(rbac.MaxBindings, false)
+	if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: many}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("Apply of %d distinct conditions: %v", len(many), err)
+	}
+	grants := make([]rbac.Grant, len(many))
+	for i, b := range many {
+		grants[i] = rbac.Grant{Scope: cluster.Scope(), Binding: b}
+	}
+	if err := h.authz.Import(ctx, host, "t1", grants); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("Import of %d distinct conditions: %v", len(grants), err)
+	}
+	// One condition carried by every binding counts once.
+	if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: distinct(rbac.MaxBindings, true)}); err != nil {
+		t.Errorf("Apply of one condition on every binding: %v", err)
+	}
+}
+
+// Activate evaluates the cheapest requirement first, as a check does conditions, so one that holds
+// is reached however many costly ones the subject is also eligible through, whatever order the
+// database's collation would put them in.
+func TestActivateTriesTheCheapestRequirementFirst(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	owner := h.as(t, "owner")
+	// Each runs up to its cost on the request's list, which spends it all, and together they spend
+	// what activating may.
+	var groups []string
+	for i := range 9 {
+		groups = append(groups, fmt.Sprintf("g%d", i))
+	}
+	h.groups(t, groups...)
+	x := h.as(t, "x", groups...)
+	for i, g := range groups {
+		e := rbac.Eligibility{
+			Role: "cluster.sudo", Principal: groupOf(g), MaxDuration: time.Hour,
+			Requires: fmt.Sprintf(`request.attributes.big.map(x, x + %d).size() < 0`, i),
+		}
+		if err := h.authz.SetEligibility(ctx, owner, cluster, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.authz.SetEligibility(ctx, owner, cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: x.Principal, MaxDuration: time.Hour, Requires: "true"}); err != nil {
+		t.Fatal(err)
+	}
+	big := make([]any, 20000)
+	for i := range big {
+		big[i] = i
+	}
+	req := rbac.WithRequest(ctx, map[string]any{"big": big})
+	if _, err := h.authz.Activate(req, x, cluster, rbac.Activation{Role: "cluster.sudo", Duration: time.Minute, Justification: "INC-1"}); err != nil {
+		t.Fatalf("Activate: %v", err)
 	}
 }

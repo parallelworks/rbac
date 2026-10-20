@@ -80,6 +80,9 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 	if len(grants)+len(revokes) > MaxBindings {
 		return fmt.Errorf("%w: a change grants and revokes at most %d bindings", ErrInvalid, MaxBindings)
 	}
+	if err := conditionsWithin(grants); err != nil {
+		return err
+	}
 	for _, b := range grants {
 		if b.Source == SourceActivation {
 			return &InvalidError{Binding: b, Reason: "only Activate grants from " + SourceActivation}
@@ -379,8 +382,18 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 		return fmt.Errorf("%w: an import stores at most %d grants", ErrInvalid, MaxBindings)
 	}
 	grants = slices.Clone(grants)
+	bindings := make([]Binding, len(grants))
+	for i, g := range grants {
+		bindings[i] = g.Binding
+	}
+	if err := conditionsWithin(bindings); err != nil {
+		return err
+	}
 	var conditions []error
 	for i := range grants {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		grants[i].ExpiresAt = stored(grants[i].ExpiresAt)
 		conditions = append(conditions, a.checkCondition(grants[i].Binding)...)
 		if grants[i].Source == SourceActivation {
@@ -506,6 +519,10 @@ func (a *Authorizer) validate(ctx context.Context, roles book, actor Subject, vi
 	var errs []error
 	now := a.cfg.Now()
 	for _, b := range grants {
+		// Compiling a condition takes milliseconds, which a canceled change shouldn't go on spending.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		bad := append(a.checkBinding(roles, tenant, scope, b, now), a.checkCondition(b)...)
 		if a.owned[b.Source] {
 			bad = append(bad, &InvalidError{Binding: b, Reason: "only the host grants from " + b.Source + ", through Import"})
@@ -624,6 +641,21 @@ func validSource(s string) bool { return sourceName.MatchString(s) }
 func reservedSource(s string) bool { return strings.HasPrefix(s, "rbac") }
 
 func validNote(s string) bool { return utf8.RuneCountInString(s) <= MaxNote && validText(s) }
+
+// conditionsWithin refuses bindings whose conditions, each counted once, are more than
+// MaxConditionBytes.
+func conditionsWithin(bindings []Binding) error {
+	seen, n := map[string]bool{}, 0
+	for _, b := range bindings {
+		if e := b.Condition.Expression; !seen[e] {
+			seen[e], n = true, n+len(e)
+		}
+	}
+	if n > MaxConditionBytes {
+		return fmt.Errorf("%w: a change carries at most %d bytes of conditions", ErrInvalid, MaxConditionBytes)
+	}
+	return nil
+}
 
 // checkCondition returns why a binding's condition can't be stored. It reads nothing stored, so a
 // change checks it once, before its transaction: compiling a condition can take milliseconds,
