@@ -436,13 +436,13 @@ var holdSQL = `WITH RECURSIVE ` + keysSQL("$1::text", "$2::text", "$3") + `, hel
 	), standing AS (
 	  SELECT coalesce(expires_at, 'infinity') AS ends FROM rbac_memberships WHERE tenant = $1 AND principal = $2 AND NOT suspended
 	    AND (expires_at IS NULL OR expires_at > $4)
-	), up(id, ends, latest) AS (
-	  SELECT h.group_id, least(s.ends, h.expires_at), max(least(s.ends, h.expires_at)) OVER (PARTITION BY h.group_id) FROM standing s
+	), up(id, ends) AS (
+	  SELECT h.group_id, max(least(s.ends, h.expires_at)) FROM standing s
 	  JOIN held h ON h.principal = $2 AND (h.expires_at IS NULL OR h.expires_at > $4)
+	  GROUP BY h.group_id
 	  UNION
-	  SELECT h.group_id, least(u.ends, h.expires_at), max(least(u.ends, h.expires_at)) OVER (PARTITION BY h.group_id)
+	  SELECT DISTINCT h.group_id, max(least(u.ends, h.expires_at)) OVER (PARTITION BY h.group_id)
 	  FROM up u JOIN held h ON h.principal = 'group:' || u.id AND (h.expires_at IS NULL OR h.expires_at > $4)
-	  WHERE u.ends = u.latest
 	), reached(k, ends) AS (
 	  SELECT $2 COLLATE "C", ends FROM standing UNION ALL SELECT 'group:' || id, ends FROM up
 	)
@@ -504,19 +504,28 @@ type resting struct {
 func reachingSQL(holders, now string) string {
 	return fmt.Sprintf(`tenure(holder, ends) AS (
 		%[1]s
-	), placed(holder, id, ends, latest) AS (
-		SELECT t.holder, m.group_id, m.ends, max(m.ends) OVER (PARTITION BY t.holder, m.group_id) FROM tenure t CROSS JOIN LATERAL (
+	), placed(holder, id, ends) AS (
+		SELECT t.holder, m.group_id, max(m.ends) FROM tenure t CROSS JOIN LATERAL (
 		  SELECT group_id, least(coalesce(t.ends, 'infinity'), expires_at) AS ends FROM rbac_members WHERE tenant = $1 AND principal = t.holder
 		    AND (expires_at IS NULL OR expires_at > %[2]s) OFFSET 0) m
+		GROUP BY t.holder, m.group_id
 		UNION
-		SELECT p.holder, m.group_id, least(p.ends, m.expires_at), max(least(p.ends, m.expires_at)) OVER (PARTITION BY p.holder, m.group_id)
+		SELECT DISTINCT p.holder, m.group_id, max(least(p.ends, m.expires_at)) OVER (PARTITION BY p.holder, m.group_id)
 		FROM placed p %[3]s
-		WHERE p.ends = p.latest
 	), reaching(holder, k, ends) AS (
 		SELECT holder, holder, ends FROM tenure
 		UNION ALL SELECT holder, 'group:' || id, nullif(ends, 'infinity') FROM placed
 	)`, byKey(holders, "rbac_memberships", "principal", "principal, expires_at", "tenant = $1 AND (expires_at IS NULL OR expires_at > "+now+")"),
 		now, groupsAbove("p.id", now, "group_id, expires_at"))
+}
+
+// endsSQL is SQL defining, in a WITH RECURSIVE, ends(k, e): the keys the identity, SQL for its key,
+// holds in the tenant $1 at now through its membership and groups, with when the latest path to
+// each ends, null for never, walked as reachingSQL walks them.
+func endsSQL(identity, now string) string {
+	return reachingSQL("ARRAY["+identity+"]", now) + `, ends(k, e) AS (
+	  SELECT k, nullif(max(coalesce(ends, 'infinity')), 'infinity') FROM reaching GROUP BY k
+	)`
 }
 
 // restingOn reads, in tx, at now, the activations of identities, by key, and of the identities in

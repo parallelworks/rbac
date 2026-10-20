@@ -569,12 +569,12 @@ func TestEndingAPathCutsAnActivationToTheLatestLeft(t *testing.T) {
 	}
 }
 
-// Activate, and a change ending places an activation rests on, walk up from its holder on the latest
-// path to each group alone, so their walks make rows about as many as the places they walk, however
-// the groups converge and fan out again: walking on from every end, each group past a fan-out is
-// walked once for every end converging before it, and layers of a few hundred groups make millions
-// of rows, read for seconds under the change's locks. The activation lasts, and is cut short to,
-// the latest of its paths all the same.
+// Activate, a change ending places an activation rests on, and a change reading when its actor's
+// paths end, walk up on the latest path to each group alone, so their walks make rows about as many
+// as the places they walk, however the groups converge and fan out again: walking on from every
+// end, each group past a fan-out is walked once for every end converging before it, and layers of a
+// few hundred groups make millions of rows, read for seconds under the change's locks. The
+// activation lasts, and is cut short to, the latest of its paths all the same.
 func TestWalkingUpLayeredGroupsWalksTheLatestPathToEachAlone(t *testing.T) {
 	h := grouped(t)
 	ctx := t.Context()
@@ -646,6 +646,7 @@ func TestWalkingUpLayeredGroupsWalksTheLatestPathToEachAlone(t *testing.T) {
 		}
 	}
 	walks("Activate", rbac.HoldSQL, "t1", "user:u", h.now, g.ExpiresAt)
+	walks("A change's authority", rbac.EndsSQL, "t1", "user:u", h.now)
 	// u's places in the x_i end sooner, the latest in 40 minutes, which the activation is cut to.
 	var sooner []rbac.Member
 	for i := 1; i <= n; i++ {

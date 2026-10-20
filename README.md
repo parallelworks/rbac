@@ -463,6 +463,13 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   the tenant's scope with what is granted there, `Reach.Scopes` with the scopes a subject's grants
   are on, and `Conflicts` with the identities in conflict. In a large tenant, ask for less:
   `Memberships` of named principals, `Grants` of one principal.
+- **JIT:** turn JIT compilation off for the application's role, as in
+  `ALTER ROLE app SET jit = off`, which a session takes as it starts, so a pool's connections take
+  it once they reconnect. The planner can't tell how far a walk of a subject's groups goes, so for
+  a subject in many groups it costs every check, and Activate, far past `jit_above_cost`, and each
+  call then compiles its statement before running it, which takes longer than running it: for an
+  identity in 1,000 groups, a check took 550 ms, and 120 ms with JIT off, and Activate's statement
+  spent 500 of its 650 ms compiling.
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
   to run on a schedule, passing over what a change holds until the next run.
 

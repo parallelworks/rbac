@@ -1292,22 +1292,10 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Su
 	if !deniable {
 		read = "FALSE"
 	}
-	// The latest end of the subject's place in each group, by any path to it, and of its
-	// membership, which every key but the public's rests on; null for never. In the statement,
-	// so they are of the moment its grants are.
+	// In the statement, so they are of the moment its grants are.
 	var places, ends string
 	if ending {
-		places = `, placed(id, ends) AS (
-		  SELECT group_id, expires_at FROM rbac_members WHERE tenant = $1 AND principal = $2::text
-		    AND (expires_at IS NULL OR expires_at > $4) AND EXISTS (SELECT FROM membership)
-		  UNION
-		  SELECT m.group_id, least(p.ends, m.expires_at) FROM placed p ` + groupsAbove("p.id", "$4", "group_id, expires_at") + `
-		), ends(k, e) AS (
-		  SELECT 'group:' || id, CASE WHEN bool_or(ends IS NULL) THEN NULL ELSE max(ends) END FROM placed GROUP BY id
-		  UNION ALL
-		  SELECT principal, expires_at FROM rbac_memberships WHERE tenant = $1 AND principal = $2::text
-		    AND (expires_at IS NULL OR expires_at > $4)
-		)`
+		places = `, ` + endsSQL("$2::text", "$4")
 		ends = `
 		UNION ALL
 		SELECT 3, k, '', '', '', e, false, NULL, '', NULL, false, false, NULL, '', '' FROM ends`
