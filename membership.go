@@ -1243,7 +1243,7 @@ func (a *Authorizer) groupsBounded(ctx context.Context, tx pgx.Tx, tenant string
 		principals[i], sources[i] = m.Principal.key(), m.Source
 	}
 	// Each principal's places by source, the others' together, counted on its own, as byKey reads
-	// its rows.
+	// its rows, from the index on the principal alone, which holds their sources.
 	rows, err := tx.Query(ctx, `
 		SELECT t.p, t.s FROM (SELECT DISTINCT p, CASE WHEN s = ANY($4::text[]) THEN s ELSE '' END
 		  FROM unnest($2::text[], $3::text[]) AS u(p, s)) AS t(p, s) CROSS JOIN LATERAL (

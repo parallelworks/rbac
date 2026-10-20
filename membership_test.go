@@ -510,6 +510,67 @@ func TestAPrincipalIsInABoundedNumberOfGroups(t *testing.T) {
 	}
 }
 
+// A change adding a place counts the groups its principal is in from the index on the principal
+// alone, its source included, so it reads none of the rows of the places the principal has.
+func TestCountingAPrincipalsGroupsReadsTheIndexAlone(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	h.groups(t, "extra")
+	h.join(t, "u")
+	manager := h.as(t, "manager")
+	// u is in all the groups it may be in but one, each of a hundred members, so its place in each
+	// is on a page of the others'.
+	in := rbac.MaxGroupsOfPrincipal - 1
+	for _, q := range []string{
+		`INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'g' || i FROM generate_series(1, $1::int) i`,
+		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+		 SELECT 't1', 'g' || i, 'user', CASE WHEN j = 0 THEN 'u' ELSE 'o' || j END FROM generate_series(1, $1::int) i, generate_series(0, 99) j
+		 ORDER BY i, j`,
+	} {
+		if _, err := h.pool.Exec(ctx, q, in); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// So the visibility map lets a scan of an index skip the rows. VACUUM marks none visible to all
+	// while an older snapshot elsewhere in the database, such as another run's, is open.
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(time.Second) {
+		if _, err := h.pool.Exec(ctx, `VACUUM (ANALYZE) rbac_members`); err != nil {
+			t.Fatal(err)
+		}
+		var visible bool
+		if err := h.pool.QueryRow(ctx, `SELECT relallvisible >= relpages FROM pg_class WHERE oid = 'rbac_members'::regclass`).Scan(&visible); err != nil {
+			t.Fatal(err)
+		}
+		if visible {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Skip("an older snapshot elsewhere in the database keeps rbac_members' rows from being visible to all")
+		}
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// The pages of the table itself, not its indexes: its rows and its visibility map.
+	rows := func() int64 {
+		t.Helper()
+		var n int64
+		if err := tx.QueryRow(ctx, `SELECT pg_stat_get_xact_blocks_fetched('rbac_members'::regclass)`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	start := rows()
+	if err := h.authz.WithTx(tx).ChangeMembers(ctx, manager, "t1", []rbac.Member{{Group: "extra", Principal: identity("u")}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if read := rows() - start; read > int64(in/10) {
+		t.Errorf("adding a place for a principal in %d groups read %d pages of the table's rows", in, read)
+	}
+}
+
 func TestLeavingATenantRemovesWhatItHeldThere(t *testing.T) {
 	h := grouped(t)
 	ctx := t.Context()
