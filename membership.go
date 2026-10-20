@@ -36,8 +36,12 @@ const MaxGroupDepth = 8
 const MaxPlacesInGroup = 20
 
 // MaxGroupsOfPrincipal is how many groups a principal, an identity or a group, is in directly, by
-// places in force, as every check reads each group its subject is in: those it is in from each
-// source the host owns (Config.Sources) counted apart, as for MaxPlacesInGroup.
+// places in force: those it is in from each source the host owns (Config.Sources) counted apart, as
+// for MaxPlacesInGroup. A check reads each group its subject is in, through those they are in, each
+// once, which this bounds only level by level: an identity in 300 groups each in 300 others reaches
+// 90,300, and only the tenant's groups bound how many. Nothing bounds them together, as whether
+// nesting a group keeps every identity under it within a bound turns on each one's other groups,
+// which the change would read under the tenant's nesting lock: seconds, for a group of thousands.
 const MaxGroupsOfPrincipal = 1000
 
 // Membership is an identity's membership of a tenant. A member holds what it is granted there and
@@ -566,8 +570,9 @@ func upsertGroups(ctx context.Context, tx pgx.Tx, tenant string, actor Principal
 // side effect. It holds the locks of the groups it is in, as a change to their members does, so a
 // grant, eligibility or deny naming one waits for it, or it reads that one. It refuses one from a
 // source the host owns, in a group from one, or with members, a place in a group or grants on it
-// from one. Deleting a group that doesn't exist does nothing, and asks Config.ResourceOf nothing of
-// it; one the host no longer has (ErrNotFound) it reads as unlabeled, as a removal reads any scope.
+// from one, in force: those that have ended give nothing, and go with it. Deleting a group that
+// doesn't exist does nothing, and asks Config.ResourceOf nothing of it; one the host no longer has
+// (ErrNotFound) it reads as unlabeled, as a removal reads any scope.
 func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id string) (err error) {
 	defer a.refused(ctx, &err, tenant, actor.Principal, "DeleteGroup")
 	if !validID(tenant) || !validGroupID(id) {
@@ -685,9 +690,10 @@ func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string
 		    OR EXISTS (`+byKey("$7", "rbac_eligibilities", "principal", "1", "tenant = $1 AND (expires_at IS NULL OR expires_at > $3)")+`),
 		  EXISTS (SELECT FROM rbac_denies WHERE `+naming("principals", "$7")+` OR `+naming("exempt", "$7")+`),
 		  EXISTS (SELECT FROM rbac_eligibilities WHERE `+naming("approvers", "$7")+` AND (expires_at IS NULL OR expires_at > $3)),
-		  EXISTS (SELECT FROM rbac_members WHERE tenant = $1 AND (group_id = $4 OR principal = $2) AND source = ANY($5::text[]))
+		  EXISTS (SELECT FROM rbac_members WHERE tenant = $1 AND (group_id = $4 OR principal = $2) AND source = ANY($5::text[])
+		      AND (expires_at IS NULL OR expires_at > $3))
 		    OR EXISTS (SELECT FROM rbac_members m JOIN rbac_groups g ON g.tenant = m.tenant AND g.id = m.group_id
-		      WHERE m.tenant = $1 AND m.principal = $2 AND g.source = ANY($5::text[]))
+		      WHERE m.tenant = $1 AND m.principal = $2 AND g.source = ANY($5::text[]) AND (m.expires_at IS NULL OR m.expires_at > $3))
 		    OR EXISTS (SELECT FROM rbac_grants WHERE tenant = $1 AND scope = $6 AND source = ANY($5::text[])
 		      AND (expires_at IS NULL OR expires_at > $3))`,
 		tenant, groupPrincipal(id).key(), a.cfg.Now(), id, slices.Sorted(maps.Keys(a.owned)), groupKey(id), above).Scan(&held, &denied, &approves, &owned); err != nil {

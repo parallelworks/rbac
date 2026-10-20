@@ -662,10 +662,11 @@ flowchart LR
 ## Bounds
 
 Every input that could grow without limit is bounded, so no call's cost depends on what a tenant
-chose to store beyond these, but for the lists, which read what they list: `Filter` reads the
-subject's grants on the scopes that can reach the listed type and the denies on them, and costs each
-row a few lookups among them however many there are. The tables hold rows only within the same
-bounds, so a role that writes around the package can store no row larger than the package writes.
+chose to store beyond these, but for the groups a subject is in through others (below) and for the
+lists, which read what they list: `Filter` reads the subject's grants on the scopes that can reach
+the listed type and the denies on them, and costs each row a few lookups among them however many
+there are. The tables hold rows only within the same bounds, so a role that writes around the
+package can store no row larger than the package writes.
 
 | Bound | Value | What it limits |
 |---|---|---|
@@ -677,10 +678,19 @@ bounds, so a role that writes around the package can store no row larger than th
 | `MaxApprovers`, `MaxActivation` | 16, 366 days | An eligibility's approvers, and its longest activation. |
 | `MaxGroupDepth` | 8 | How deeply groups nest. |
 | `MaxPlacesInGroup` | 20 | Places in force of one principal in one group, each from another source. Those from each source the host owns count apart. |
-| `MaxGroupsOfPrincipal` | 1,000 | Groups one principal, an identity or a group, is in directly, by places in force. Those from each source the host owns count apart. A check reads every group its subject is in, and every group those are in, `MaxGroupDepth` deep. |
+| `MaxGroupsOfPrincipal` | 1,000 | Groups one principal, an identity or a group, is in directly, by places in force. Those from each source the host owns count apart. A check reads every group its subject is in, and every group those are in, `MaxGroupDepth` deep, which this bounds only level by level (below). |
 | `MaxExpression` | 2,048 bytes | A condition's or requirement's expression. Its cost is bounded too. |
 | What a check reads together | 80,000 units: hundreds of comparisons with literals, a hundred of an attribute with the subject's id, or three of the longest conditions that read a list or loop | The distinct conditions of an identity's conditional grants on a scope; of a scope's conditional grants to groups, the tenant's members and the public; each the tenant's and those from each source the host owns apart; of a scope's conditional denies; and the requirements of groups' eligibilities for a role on a scope. Each counts compiling it, 8 a byte, and the most evaluating it can cost, at most 10,000. On the tenant, one reading the action counts once for each label value it gives or denies. A check may spend this for each on each scope of its path. |
 | `MaxConditionBytes` | 32 KiB | The conditions one `Apply` or `Import` carries, each distinct one counted once. |
 | `MaxName`, `MaxDescription`, `MaxNote` | 128, 2,048, 2,048 characters | Names, titles and group ids, descriptions, and notes and justifications. |
 | `MaxRequest` | 256 characters | A request id in `Audit`. |
 | `MaxHistory`, `MaxHistoryBytes`, `MaxPrune` | 10,000, 64 MiB, 10,000 | Records read by one `History` call, the bytes of their rows' JSON and their text past the first, and records deleted by one prune. |
+
+`MaxGroupsOfPrincipal` and `MaxGroupDepth` bound the groups a subject reaches only level by level. A
+check reads every group its subject is in, and every group those are in, each once, so an identity
+in 300 groups, each in 300 others, is within every bound, and each of its checks reads 90,300
+groups, for over half a second: only the tenant's groups bound how many. Bounding the groups
+reached would have each change nesting a group read, for every identity under it, every other
+group that identity is in, under the lock that serializes nesting in the tenant: nesting a group of
+20,000 identities, each in about 50 groups, would read a million rows, for seconds, while every
+other nesting in the tenant waits. Keeping nesting narrow is the host's, and the group managers'.

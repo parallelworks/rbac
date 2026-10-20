@@ -114,6 +114,18 @@ func SetDecidingGrants(t *testing.T, f func() func()) {
 // StandSQL is the statement a change reads the standing of its principals with.
 var StandSQL = standSQL
 
+// HoldSQL is the statement Activate holds the places it rests on and reads its subject's paths
+// with: tenant $1, the identity's key $2, now $3, until $4.
+var HoldSQL = holdSQL
+
+// RestsSQL is the statement a change ending places reads the paths left to activations with:
+// tenant $1, the activations' ids $2, now $3.
+var RestsSQL = restsSQL
+
+// EndsSQL is the statement a change reads when its actor's paths to each key it holds end with:
+// tenant $1, the identity's key $2, now $3.
+var EndsSQL = `WITH RECURSIVE ` + endsSQL("$2::text", "$3") + ` SELECT k, e FROM ends`
+
 // DeepCopy is the copy of attributes each hook is given.
 func DeepCopy(attributes map[string]any) map[string]any { return deepCopy(attributes) }
 
