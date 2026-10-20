@@ -605,10 +605,10 @@ flowchart LR
 - **What a record holds.** Each holds the row as it was and as it became, when it took effect,
   the database role that wrote it, and the actor and call it was made through, with what the host
   attached. A write that bypassed the package is recorded too, with no actor, but the tables hold
-  only what the package could write, and a row or context of more than 1 MiB as JSON fails its
-  write, so no record is one `History` can't return. A row written before history was installed
-  has one record from migrating, its baseline, dated when it was created, or at the epoch where
-  that was before year 1 or at its first instant.
+  only what the package could write, and a row of more than 1 MiB as jsonb, or a context of more
+  than 1 MiB, fails its write, so no record is one `History` can't return. A row written before
+  history was installed has one record from migrating, its baseline, dated when it was created, or
+  at the epoch where that was before year 1 or at its first instant.
 - **History's order.** `History` reads records in transaction order, and only those of
   transactions older than every transaction still running, which have all ended. So a cursor
   never passes a record that commits later. It, `Export` and `PruneHistory` name history by its

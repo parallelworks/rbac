@@ -14,11 +14,13 @@
 -- one refuses stops the migration, which names the table, the check and a query that finds the row.
 -- Each is added unchecked, then checked on its own, so a row one refuses is reported with the
 -- check's own condition; a check left unchecked before, as 0012's on a column every row held null
--- in, stays so. Writes to the tables wait until migrating commits.
+-- in, stays so. Dropping and adding a check locks its table, so reads of the tables wait too until
+-- migrating commits, and each check reads the whole of its table. The schema is found by its name:
+-- a cast to regnamespace reads one that needs quoting, as one with capitals, as another's.
 DO $$
 DECLARE
-    unchecked oid[] := ARRAY(SELECT k.oid FROM pg_catalog.pg_constraint k
-        WHERE k.connamespace = pg_catalog.current_schema()::regnamespace AND NOT k.convalidated);
+    here      oid   := (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = pg_catalog.current_schema());
+    unchecked oid[] := ARRAY(SELECT k.oid FROM pg_catalog.pg_constraint k WHERE k.connamespace = here AND NOT k.convalidated);
     c record;
 BEGIN
     ALTER TABLE rbac_grants
@@ -114,7 +116,7 @@ BEGIN
 
     FOR c IN SELECT k.conrelid::regclass AS tab, k.conname, pg_catalog.pg_get_expr(k.conbin, k.conrelid) AS cond
         FROM pg_catalog.pg_constraint k
-        WHERE k.connamespace = pg_catalog.current_schema()::regnamespace AND NOT k.convalidated AND k.oid <> ALL (unchecked)
+        WHERE k.connamespace = here AND NOT k.convalidated AND k.oid <> ALL (unchecked)
         ORDER BY k.conname
     LOOP
         BEGIN

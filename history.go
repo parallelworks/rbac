@@ -457,15 +457,19 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 		}
 		// Of the records up to limit, those within the bytes, counted by what rbac_record counted of
 		// their rows, so the rows of those past them are never read; or, for one it didn't count, by
-		// its rows.
+		// its rows. Each text column is measured on its own, which reads a stored value's length
+		// without detoasting it, as joining them would.
 		rows, err := tx.Query(ctx, `
 			SELECT id, txid, recorded_at, effective_at, tenant, entity, key, op, coalesce(principal, ''), coalesce(role, ''),
 			  coalesce(scope, ''), coalesce(group_id, ''), expires_at, before, after, actor, on_behalf_of, how, request, reason, db_user
 			FROM (
 			  SELECT h.*, row_number() OVER w AS n,
 			    sum(coalesce(h.bytes, coalesce(pg_catalog.octet_length(h.before::pg_catalog.text), 0) + coalesce(pg_catalog.octet_length(h.after::pg_catalog.text), 0))
-			      + pg_catalog.octet_length(pg_catalog.concat(h.tenant, h.entity, h.key, h.op, h.principal, h.role, h.scope, h.group_id,
-			        h.actor, h.on_behalf_of, h.how, h.request, h.reason, h.db_user))) OVER w AS reached
+			      + pg_catalog.octet_length(h.tenant) + pg_catalog.octet_length(h.entity) + pg_catalog.octet_length(h.key) + pg_catalog.octet_length(h.op)
+			      + coalesce(pg_catalog.octet_length(h.principal), 0) + coalesce(pg_catalog.octet_length(h.role), 0)
+			      + coalesce(pg_catalog.octet_length(h.scope), 0) + coalesce(pg_catalog.octet_length(h.group_id), 0)
+			      + pg_catalog.octet_length(h.actor) + pg_catalog.octet_length(h.on_behalf_of) + pg_catalog.octet_length(h.how)
+			      + pg_catalog.octet_length(h.request) + pg_catalog.octet_length(h.reason) + pg_catalog.octet_length(h.db_user)) OVER w AS reached
 			  FROM (
 			    SELECT * FROM `+historyTable(schema)+`
 			    WHERE (txid, id) > ($1::pg_catalog.xid8, $2) AND txid < pg_snapshot_xmin(pg_current_snapshot())

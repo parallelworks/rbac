@@ -289,7 +289,8 @@ on whose behalf it was made, the request and the reason. An expiry `DeleteExpire
 recorded as one, made by no one. Triggers write it, so a write that bypasses the package is
 recorded too, as no one's. That context is what the session that wrote it says; the database role
 is what the database knows. The tables hold only what the package could write, and a write whose
-row or context is more than 1 MiB as JSON fails rather than record what `History` couldn't return. A row written before history was installed, as by a host that applied
+row is more than 1 MiB as jsonb, or whose context is more than 1 MiB, fails rather than record what
+`History` couldn't return. A row written before history was installed, as by a host that applied
 the first migrations on their own, is recorded by migrating as it found it, its `baseline`, dated
 when it was created, or a role when it last changed. Nothing updates or truncates history, only
 `PruneHistory` deletes from it, and the package's tables can be deleted from but not truncated.
@@ -417,7 +418,9 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   writes to the table waiting until it commits, though reads go on: on a large table, migrate when
   that wait is acceptable. Code from before `0012_activation_through` must not run beside code
   after it: an activation it extends keeps the eligibility recorded before, and can outlast the one
-  it was extended through. Stop the replicas running it before migrating.
+  it was extended through. Stop the replicas running it before migrating. `0013_bounded_rows`
+  locks every table until it commits, history only for its last steps, and reads each once for
+  each check it adds, so checks, lists and changes wait for it.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
   between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows

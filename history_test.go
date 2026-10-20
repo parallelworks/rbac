@@ -717,6 +717,37 @@ func TestMigratingNamesARowTheTablesRefuse(t *testing.T) {
 	}
 }
 
+// Migrating a schema whose name needs quoting checks its own rows, not those of a schema named as
+// it reads unquoted: here one that exists beside it, holding none of the tables.
+func TestMigratingASchemaNamedWithCapitalsChecksItsRows(t *testing.T) {
+	twin := pgtest.Open(t, "")
+	ctx := t.Context()
+	var lower string
+	if err := twin.QueryRow(ctx, `SELECT current_schema()`).Scan(&lower); err != nil {
+		t.Fatal(err)
+	}
+	schema := pgx.Identifier{strings.ToUpper(lower)}.Sanitize()
+	if _, err := twin.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = twin.Exec(context.WithoutCancel(ctx), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`) })
+	cfg := twin.Config()
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	migrateFiles(t, pool, "", "0013")
+	if _, err := pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, created_by)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'cluster.login', repeat(chr(1), 600))`); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyMigrations(ctx, pool, pgx.ReadCommitted, "0013", ""); !strings.Contains(fmt.Sprint(err), "rbac_grants_created_by_check") {
+		t.Fatalf("migrating past a row the package never wrote: %v", err)
+	}
+}
+
 // History records no row or change it couldn't return, as one of a column no check bounds, or a
 // context the writing session sets: past a mebibyte, its write fails, and History reads on past it.
 func TestHistoryRecordsNoRowOrChangeTooLargeToRead(t *testing.T) {
