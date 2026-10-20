@@ -295,8 +295,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 // or a constraint asked without the request's attributes, which a read without the request can't
 // settle; and the exclusive dimensions s holds none of, as its grants on the tenant could give it
 // two (excludedBy). It reads on q, and asks the constraints through cs, which is on r, so a change
-// reads them back in its transaction; about a label value or a power to release on a tenant passed
-// with attributes, ancestors or a label, through cs.ofTenant(), as decidedOn decides it.
+// reads them back in its transaction.
 func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resource, only func(Permission) bool, cs *constrained,
 ) ([]Permission, map[Permission]bool, map[string]bool, error) {
 	kept := func(p Permission) bool { return only == nil || only(p) }
@@ -330,12 +329,11 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 	type deciding struct {
 		vars map[string]any
 		ran  map[string]run
-		cs   *constrained
 	}
-	resource := &deciding{a.vars(ctx, s, "", r), map[string]run{}, cs}
+	resource := &deciding{a.vars(ctx, s, "", r), map[string]run{}}
 	values := resource
 	if r.Type == TenantScope && len(a.labels) > 0 && !bare(r) {
-		values = &deciding{a.vars(ctx, s, "", tenantResource(r.Tenant)), map[string]run{}, cs.ofTenant()}
+		values = &deciding{a.vars(ctx, s, "", tenantResource(r.Tenant)), map[string]run{}}
 	}
 	on := func(p Permission) *deciding {
 		if a.labelPermission(p) {
@@ -346,7 +344,6 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 	// What a constraint removes is settled first, so no budget is spent on conditions for it.
 	removed := map[Permission]bool{}
 	isRemoved := func(p Permission) (bool, error) {
-		cs := on(p).cs
 		removed[p] = cs.removes(p, r.Type)
 		return removed[p], cs.failed()
 	}

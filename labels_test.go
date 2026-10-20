@@ -1095,3 +1095,35 @@ func TestALabelValueIsDecidedOnTheTenantAsALabeledCheckReadsIt(t *testing.T) {
 		t.Errorf("Permissions on the labeled tenant = %v, %v", perms, err)
 	}
 }
+
+// An actor hands on a label value only as it holds it: a change on the tenant passed with
+// attributes asks a constraint about the value on the tenant as every check decides it, so one the
+// actor can't use there it can't grant, nor offer.
+func TestALabelValueIsHandedOnAsChecksDecideIt(t *testing.T) {
+	h := labeled(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "probation", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			// Lifted only on a tenant passed as approved.
+			approved := in.Resource != nil && in.Resource.Attributes["approved"] == true
+			return in.Permission == "level:high" && in.Subject != nil && in.Subject.Principal.ID == "ann" && !approved, nil
+		}}}
+	})
+	ctx := t.Context()
+	h.hold(t, "ann", "level:high")
+	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.admin", rbac.User, "ann"))
+	ann, bob := h.as(t, "ann"), h.as(t, "bob")
+	approved := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1", Attributes: map[string]any{"approved": true}}
+	if allowed(t, h, ann, "level:high", approved) {
+		t.Fatal("the constraint should remove level:high from ann on the tenant as checks decide it")
+	}
+	roles, err := h.authz.Grantable(ctx, ann, approved)
+	if err != nil || slices.ContainsFunc(roles, func(r rbac.RoleDefinition) bool { return r.ID == "level.high" }) {
+		t.Errorf("Grantable offers level.high, which ann can't use: %v", err)
+	}
+	err = h.authz.Apply(ctx, ann, approved, rbac.Change{Grant: []rbac.Binding{{Role: "level.high", Principal: bob.Principal}}})
+	if !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("ann granted level.high, which it can't use: %v", err)
+	}
+	if allowed(t, h, bob, "level:high", tenantT1) {
+		t.Error("bob holds level:high")
+	}
+}

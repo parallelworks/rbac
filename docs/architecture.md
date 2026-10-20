@@ -353,8 +353,8 @@ sequenceDiagram
 ```
 
 - **Explain** decides the same way and says why: every grant that allows, or the deny, constraint
-  or label that refused, a label's or an exclusive value's dimension in `Decision.Label`. It reads the subject's keys, grants and denies in one snapshot, and its
-  label values after it.
+  or label that refused, a label's or an exclusive value's dimension in `Decision.Label`. It reads
+  the subject's keys, grants and denies in one snapshot, and its label values after it.
 - **Permissions** lists everything a subject may do on a resource, deciding each as Authorize
   would.
 - **Conditions** are CEL over `subject`, `resource`, `request` and `action`, typed by
@@ -528,8 +528,10 @@ flowchart TB
 - **Values are decided on the bare tenant.** Every check decides a label value or a power to
   release on the tenant with no attributes or label, whatever tenant resource it is passed, as
   `Holding` reads them for a labeled check, which can't know what tenant the host means. So a check
-  of a value and a check of a label agree; a condition of theirs reading resource attributes gives
-  nothing, or denies, and a constraint deciding them by the tenant's state reads it itself.
+  of a value and a check of a label agree, and an actor hands one on only as it holds it. A
+  condition of theirs reading a resource attribute fails, so a grant's gives nothing and a deny's
+  denies, but a test of one's presence finds none; a constraint deciding them by the tenant's state
+  reads it itself.
 - **Releasing and writing.** `ReleasePermission(dimension)`, held on the tenant, is the power to
   release data to a looser label in that dimension, so only a holder of it can downgrade data. A
   `Holding`'s `MayWrite` and `MayRelease` say whether data read under one label may be written, or

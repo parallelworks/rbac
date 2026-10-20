@@ -36,11 +36,11 @@ import (
 // A grant with one gives its role only where the expression is true. An expression that fails, as
 // one reading an attribute the host didn't pass does, or comparing a double that isn't finite, as
 // dividing by zero makes, is false. A label value and a power to release are decided on the tenant
-// with no attributes, whatever a check passes (Holding), so there resource.attributes is empty, and
-// one reading an attribute of it fails. The zero Condition is none, and one with a title or
-// description has an expression. A pattern it matches is a string literal, of bounded size; it
-// nests at most 32 deep; and a comparison, or a search of a list, that would read more than a
-// condition may spend fails before it runs.
+// with no attributes, whatever a check passes (Holding), so there resource.attributes is empty: one
+// reading an attribute of it fails, but a test of one's presence, as has(), is false. The zero
+// Condition is none, and one with a title or description has an expression. A pattern it matches is
+// a string literal, of bounded size; it nests at most 32 deep; and a comparison, or a search of a
+// list, that would read more than a condition may spend fails before it runs.
 //
 // Each condition runs within the most evaluating it can cost, which its literals and types bound:
 // little for one comparing what a request passes with literals, whatever it passes, and all a
