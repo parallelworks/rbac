@@ -1694,15 +1694,16 @@ func TestARemovalReadsAScopeTheHostNoLongerHasAsUnlabeled(t *testing.T) {
 	secret := cluster
 	secret.Labels = rbac.Label{"level": {"high"}}
 	errDown := errors.New("the host is down")
+	manager := rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}
 	h := labeled(t, func(c *rbac.Config) {
-		c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
+		c.Catalog = append(slices.Clone(c.Catalog), groupMembers, manager)
 		resourceOf := c.ResourceOf
 		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
 			switch s {
 			case secret.Scope():
 				return secret, nil
-			case rbac.Scope{Type: "cluster", ID: "gone"}:
-				return rbac.Resource{}, fmt.Errorf("%w: cluster gone", rbac.ErrNotFound)
+			case rbac.Scope{Type: "cluster", ID: "gone"}, rbac.Scope{Type: rbac.GroupScope, ID: "lost"}:
+				return rbac.Resource{}, fmt.Errorf("%w: %s", rbac.ErrNotFound, s.Key())
 			case rbac.Scope{Type: "cluster", ID: "down"}:
 				return rbac.Resource{}, errDown
 			}
@@ -1710,15 +1711,22 @@ func TestARemovalReadsAScopeTheHostNoLongerHasAsUnlabeled(t *testing.T) {
 		}
 	})
 	ctx := t.Context()
-	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}')`); err != nil {
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}'),
+		('t1', 'custom.ops', '{cluster:view,cluster:login}', '{cluster}')`); err != nil {
 		t.Fatal(err)
 	}
 	gone, down := rbac.Scope{Type: "cluster", ID: "gone"}, rbac.Scope{Type: "cluster", ID: "down"}
 	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "tenant.roles", rbac.User, "admin"),
+		grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "admin"),
 		grant(gone, "cluster.login", rbac.Group, "crew"), grant(secret.Scope(), "cluster.login", rbac.Group, "crew"),
-		grant(down, "cluster.login", rbac.Group, "ops"), grant(gone, "custom.viewer", rbac.User, "u"))
-	h.join(t, "u")
-	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}, {Group: "ops", Principal: identity("u")}}); err != nil {
+		grant(down, "cluster.login", rbac.Group, "ops"), grant(gone, "custom.viewer", rbac.User, "u"), grant(gone, "custom.ops", rbac.User, "u"))
+	h.join(t, "u", "v")
+	h.groups(t, "lost")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{
+		{Group: "crew", Principal: identity("u")},
+		{Group: "ops", Principal: identity("u")},
+		{Group: "lost", Principal: identity("u")},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	admin := h.as(t, "admin")
@@ -1728,6 +1736,26 @@ func TestARemovalReadsAScopeTheHostNoLongerHasAsUnlabeled(t *testing.T) {
 	}
 	if err := h.authz.DeleteRole(ctx, admin, "t1", "custom.viewer"); err != nil {
 		t.Errorf("deleting a role granted on a scope the host no longer has: %v", err)
+	}
+	// Narrowing a role only takes access away, and widening it is a change the host must read the
+	// scope for.
+	ops := rbac.RoleDefinition{ID: "custom.ops", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(ctx, admin, "t1", ops); err != nil {
+		t.Errorf("narrowing a role granted on a scope the host no longer has: %v", err)
+	}
+	ops.Permissions = []rbac.Permission{view, login}
+	if err := h.authz.SetRole(ctx, admin, "t1", ops); !errors.Is(err, rbac.ErrNotFound) {
+		t.Errorf("widening it: %v", err)
+	}
+	// So with a group the host no longer has: its members are removed, but none added.
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", []rbac.Member{{Group: "lost", Principal: identity("v")}}, nil); !errors.Is(err, rbac.ErrNotFound) {
+		t.Errorf("adding a member to a group the host no longer has: %v", err)
+	}
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "lost", Principal: identity("u")}}); err != nil {
+		t.Errorf("removing a member of a group the host no longer has: %v", err)
+	}
+	if err := h.authz.DeleteGroup(ctx, admin, "t1", "lost"); err != nil {
+		t.Errorf("deleting a group the host no longer has: %v", err)
 	}
 	if err := h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "ops", Principal: identity("u")}}); !errors.Is(err, errDown) {
 		t.Errorf("removing a member of a group with access on a scope the host fails to read: %v", err)

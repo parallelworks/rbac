@@ -416,7 +416,7 @@ func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string,
 	if a.owned[g.Source] {
 		return fmt.Errorf("%w: group %q: only the host makes groups from %s, through ImportGroups", ErrInvalid, g.ID, g.Source)
 	}
-	group, err := a.groupLabeled(ctx, tenant, g.ID, labels)
+	group, err := a.groupLabeled(ctx, tenant, g.ID, labels, false)
 	if err != nil {
 		return err
 	}
@@ -560,7 +560,7 @@ func upsertGroups(ctx context.Context, tx pgx.Tx, tenant string, actor Principal
 // grant, eligibility or deny naming one waits for it, or it reads that one. It refuses one from a
 // source the host owns, in a group from one, or with members, a place in a group or grants on it
 // from one. Deleting a group that doesn't exist does nothing, and asks Config.ResourceOf nothing of
-// it.
+// it; one the host no longer has (ErrNotFound) it reads as unlabeled, as a removal reads any scope.
 func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id string) (err error) {
 	defer a.refused(ctx, &err, tenant, actor.Principal, "DeleteGroup")
 	if !validID(tenant) || !validGroupID(id) {
@@ -594,7 +594,7 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 			return err
 		}
 		if existed {
-			if group, err = a.groupLabeled(ctx, tenant, id, labels); err != nil {
+			if group, err = a.groupLabeled(ctx, tenant, id, labels, true); err != nil {
 				return err
 			}
 		}
@@ -941,21 +941,32 @@ func (a *Authorizer) mayManageGroups(ctx context.Context, q DB, actor Subject, p
 	return nil
 }
 
-// groupLabeled returns a group as Config.ResourceOf gives it, as ChangeMembers reads the groups it
-// changes, before a change's transaction, refusing an actor its label refuses, as a change to its
-// members does: ManageGroups is the tenant's, but who can't see a group doesn't rename or delete
-// it. labels is what mayManageGroups reads the actor's label values through, and the transaction
-// checks the label again with it. Without declared labels the host isn't asked: nothing it returns
-// is checked, and a host that knows no group it hasn't made yet would refuse making one.
-func (a *Authorizer) groupLabeled(ctx context.Context, tenant, id string, labels *constrained) (Resource, error) {
+// groupLabeled returns a group as groupOf gives it, as ChangeMembers reads the groups it changes,
+// before a change's transaction, refusing an actor its label refuses, as a change to its members
+// does: ManageGroups is the tenant's, but who can't see a group doesn't rename or delete it. labels
+// is what mayManageGroups reads the actor's label values through, and the transaction checks the
+// label again with it. Without declared labels the host isn't asked: nothing it returns is checked,
+// and a host that knows no group it hasn't made yet would refuse making one.
+func (a *Authorizer) groupLabeled(ctx context.Context, tenant, id string, labels *constrained, removing bool) (Resource, error) {
 	if len(a.labels) == 0 {
 		return Resource{Tenant: tenant, Type: GroupScope, ID: id}, nil
 	}
-	group, _, err := a.hostResource(ctx, tenant, Scope{Type: GroupScope, ID: id})
+	group, err := a.groupOf(ctx, tenant, id, removing)
 	if err != nil {
 		return Resource{}, err
 	}
 	return group, a.labelCheck(ctx, a.db, labels)(group, ManageGroups)
+}
+
+// groupOf returns a group as Config.ResourceOf gives it: with removing, as for a change that only
+// takes access away from its members, one the host no longer has (ErrNotFound) as unlabeled, as a
+// removal reads any scope.
+func (a *Authorizer) groupOf(ctx context.Context, tenant, id string, removing bool) (Resource, error) {
+	group, _, err := a.hostResource(ctx, tenant, Scope{Type: GroupScope, ID: id})
+	if removing && errors.Is(err, ErrNotFound) {
+		return Resource{Tenant: tenant, Type: GroupScope, ID: id}, nil
+	}
+	return group, err
 }
 
 // tenantLabels is what the constraints remove of actor's label values in a tenant, for
@@ -1291,12 +1302,14 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 	if err := errors.Join(owned...); err != nil {
 		return err
 	}
-	groups := memberGroups(slices.Concat(set, remove))
+	groups, adding := memberGroups(slices.Concat(set, remove)), memberGroups(set)
 	// As Config.ResourceOf gives them, so a constraint or deny reading a group's attributes sees
-	// what the host's own check of GroupMembers would.
+	// what the host's own check of GroupMembers would; a group the change only removes members from,
+	// as a removal reads it.
 	targets := make([]Resource, len(groups))
 	for i, g := range groups {
-		if targets[i], _, err = a.hostResource(ctx, tenant, Scope{Type: GroupScope, ID: g}); err != nil {
+		_, adds := slices.BinarySearch(adding, g)
+		if targets[i], err = a.groupOf(ctx, tenant, g, !adds); err != nil {
 			return err
 		}
 	}
