@@ -88,6 +88,15 @@ func TestAnActivationLastsNoLongerThanThePlaceThatMakesItsSubjectEligible(t *tes
 	}
 }
 
+// lastEvent is the last change h reported, failing t where it reported none.
+func lastEvent(t *testing.T, h *harness) rbac.ChangeEvent {
+	t.Helper()
+	if len(h.events) == 0 {
+		t.Fatal("no change was reported")
+	}
+	return h.events[len(h.events)-1]
+}
+
 // activatedThroughOncall is grouped with u in oncall, or in inner, which is in oncall, and an
 // activation of sudo on the cluster for eight hours, which u is eligible for through oncall.
 func activatedThroughOncall(t *testing.T, nested bool) (*harness, rbac.Subject, rbac.Grant) {
@@ -172,7 +181,7 @@ func TestEndingAPlaceOrMembershipEndsTheActivationsRestingOnIt(t *testing.T) {
 			if err := c.end(t, h); err != nil {
 				t.Fatal(err)
 			}
-			e := h.events[len(h.events)-1]
+			e := lastEvent(t, h)
 			reported := e.Revoked
 			if c.sooner {
 				reported = e.Shortened
@@ -342,7 +351,7 @@ func TestEndingThePlaceAnActivationWasMadeThroughEndsItWhateverElseAllows(t *tes
 			if err := c.end(t, h); err != nil {
 				t.Fatal(err)
 			}
-			if e := h.events[len(h.events)-1]; len(e.Shortened) != 0 || !slices.ContainsFunc(e.Revoked, func(r rbac.Grant) bool { return r.ID == g.ID }) {
+			if e := lastEvent(t, h); len(e.Shortened) != 0 || !slices.ContainsFunc(e.Revoked, func(r rbac.Grant) bool { return r.ID == g.ID }) {
 				t.Errorf("the activation isn't reported ended: %+v", e)
 			}
 			if allowed(t, h, u, root, cluster) {
@@ -404,7 +413,7 @@ func TestEndingAPathCutsAnActivationToTheLatestLeft(t *testing.T) {
 	if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", nil, []rbac.Member{{Group: "oncall", Principal: u.Principal}}); err != nil {
 		t.Fatal(err)
 	}
-	if e := h.events[len(h.events)-1]; len(e.Shortened) != 1 || e.Shortened[0].ID != g.ID || !e.Shortened[0].ExpiresAt.Equal(ends) {
+	if e := lastEvent(t, h); len(e.Shortened) != 1 || e.Shortened[0].ID != g.ID || !e.Shortened[0].ExpiresAt.Equal(ends) {
 		t.Errorf("the activation isn't reported cut short to when u's place through team ends: %+v", e)
 	}
 	h.now = h.now.Add(90 * time.Minute)
