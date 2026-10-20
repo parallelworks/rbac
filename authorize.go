@@ -625,20 +625,115 @@ func (a *Authorizer) labeled(ctx context.Context, p Permission, r Resource, hold
 	return kept, nil
 }
 
-// valuesOfEach reads on q what the label values in a tenant of each identity among holders are
-// decided by (valuesRead), by its key, with their conditions.
+// valuesOfEach reads on q, in one statement, what the label values in a tenant of each identity
+// among holders are decided by (valuesRead), by its key, with their conditions: each one's keys
+// apart, as conflicts reads them, and the grants on the tenant and the denies there binding any of
+// them once, as many share a group.
 func (a *Authorizer) valuesOfEach(ctx context.Context, q DB, tenant string, holders []Holder) (map[string]*valuesRead, error) {
-	values := map[string]*valuesRead{}
+	var identities []string
 	for _, h := range holders {
-		if h.Principal.broad() {
-			continue
+		if !h.Principal.broad() {
+			identities = append(identities, h.Principal.key())
 		}
-		v, err := a.valuesOn(ctx, q, tenant, Subject{Principal: h.Principal})
-		if err != nil {
-			return nil, err
+	}
+	if len(identities) == 0 {
+		return nil, nil
+	}
+	// Each identity's keys cost the planner as a walk of many groups, which across many identities is
+	// past JIT's thresholds.
+	return withoutJIT(ctx, q, func() (map[string]*valuesRead, error) { return a.valuesOfAll(ctx, q, tenant, identities) })
+}
+
+// valuesOfAll is valuesOfEach's read of identities, by key.
+func (a *Authorizer) valuesOfAll(ctx context.Context, q DB, tenant string, identities []string) (map[string]*valuesRead, error) {
+	rows, err := q.Query(ctx, `
+		WITH idents AS MATERIALIZED (
+		  SELECT t.identity, ks.keys, ks.bound, ks.exempted FROM (SELECT unnest($2::text[]) COLLATE "C" AS identity) t
+		  CROSS JOIN LATERAL (WITH RECURSIVE `+keysSQL("$1::text", "t.identity", "$3")+`
+		    SELECT ARRAY(SELECT k FROM keys) AS keys, ARRAY(SELECT k FROM bound) AS bound, ARRAY(SELECT k FROM exempted) AS exempted) ks
+		), held AS (
+		  SELECT g.* FROM (SELECT DISTINCT unnest(keys) AS k FROM idents) k CROSS JOIN LATERAL (
+		    SELECT id::text, principal, role, expires_at, condition FROM rbac_grants
+		    WHERE tenant = $1 AND principal = k.k AND scope = 'tenant:' || $1 AND (expires_at IS NULL OR expires_at > $3) OFFSET 0) g
+		)
+		SELECT 0, identity, '', '', NULL::timestamptz, '', keys, bound, exempted, false, false, '', '' FROM idents
+		UNION ALL
+		SELECT 1, id, principal, role, expires_at, condition, NULL, NULL, NULL, false, false, '', '' FROM held
+		UNION ALL
+		SELECT 2, id, '', '', NULL, condition, permissions, principals, exempt, false, false, '', '' FROM rbac_denies
+		WHERE tenant = $1 AND scope = 'tenant:' || $1 AND principals && ARRAY(SELECT DISTINCT unnest(bound) FROM idents)
+		UNION ALL
+		SELECT 3, id, '', '', NULL, '', permissions, resource_types, grantable_roles, privileged, public, name, description
+		FROM rbac_roles WHERE tenant = $1 AND id IN (SELECT role FROM held WHERE role LIKE '`+CustomPrefix+`%')
+		ORDER BY 1, 3, 4, 2`, tenant, identities, a.cfg.Now())
+	if err != nil {
+		return nil, err
+	}
+	// Grants by principal, role and id, and denies by id, as a read of one identity's orders them.
+	type keyed struct{ keys, bound, exempted []string }
+	byIdentity := map[string]keyed{}
+	var grants []holding
+	at := map[string][]int{}
+	var ds []denial
+	var custom []RoleDefinition
+	scope := TenantRoot(tenant).Key()
+	var kind int
+	var id, principal, role, condition, name, description string
+	var expires *time.Time
+	var first, second, third []string
+	var privileged, public bool
+	if _, err := pgx.ForEachRow(rows, []any{&kind, &id, &principal, &role, &expires, &condition, &first, &second, &third, &privileged, &public, &name, &description}, func() error {
+		switch kind {
+		case 0:
+			byIdentity[id] = keyed{first, second, third}
+		case 1:
+			h := holding{
+				Binding: Binding{ID: id, Principal: parsePrincipal(principal), Role: Role(role), Condition: Condition{Expression: condition}},
+				scope:   scope, conditional: condition != "",
+			}
+			if expires != nil {
+				h.ExpiresAt = *expires
+			}
+			at[principal] = append(at[principal], len(grants))
+			grants = append(grants, h)
+		case 2:
+			d := denial{id: id, scope: scope, condition: condition, principals: second, exempt: third}
+			for _, x := range first {
+				d.permissions = append(d.permissions, Permission(x))
+			}
+			ds = append(ds, d)
+		default:
+			custom = append(custom, roleFrom(id, name, description, first, second, privileged, public, third))
 		}
-		readingRoles()
-		values[h.Principal.key()] = v
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	readingRoles()
+	roles := a.builtinBook()
+	if len(custom) > 0 {
+		roles = a.bookOf(a.current(custom))
+	}
+	overlaps := func(xs, ys []string) bool {
+		return slices.ContainsFunc(xs, func(x string) bool { return slices.Contains(ys, x) })
+	}
+	values := make(map[string]*valuesRead, len(byIdentity))
+	for identity, k := range byIdentity {
+		v := &valuesRead{roles: roles}
+		var is []int
+		for _, key := range slices.Compact(slices.Sorted(slices.Values(k.keys))) {
+			is = append(is, at[key]...)
+		}
+		slices.Sort(is)
+		for _, i := range is {
+			v.held = append(v.held, grants[i])
+		}
+		for _, d := range ds {
+			if overlaps(d.principals, k.bound) && !overlaps(d.exempt, k.exempted) {
+				v.ds = append(v.ds, d)
+			}
+		}
+		values[identity] = v
 	}
 	return values, nil
 }

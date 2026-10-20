@@ -1609,3 +1609,64 @@ func TestALabelValuesDenyReadsTheTenantAsChecksDoWhenTheValueIsHandedOn(t *testi
 		}
 	}
 }
+
+// Holders of a labeled resource reads the label values of every identity it lists in one
+// statement, however many they are, and decides each as a read of one decides it: by its grants
+// on the tenant and its groups', through those they are in, under the denies binding it there,
+// marking one a condition decides.
+func TestHoldersOfALabeledResourceReadEveryHoldersValuesAtOnce(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	list := func(t *testing.T, others int) (map[string]bool, int) {
+		t.Helper()
+		h := labeled(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), tenantGuard) })
+		ctx := t.Context()
+		h.groups(t, "big", "cleared", "inner")
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'cleared', 'group', 'inner')`); err != nil {
+			t.Fatal(err)
+		}
+		conditional := grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "conditional")
+		conditional.Condition = rbac.Condition{Expression: `request.attributes.mfa == true`}
+		h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "big"), grant(rbac.TenantRoot("t1"), "level.high", rbac.Group, "cleared"),
+			grant(rbac.TenantRoot("t1"), "tenant.guard", rbac.User, "guardian"), conditional)
+		for id, groups := range map[string][]string{
+			"direct": {"big"}, "nested": {"big", "inner"}, "lower": {"big"}, "none": {"big"}, "conditional": {"big"},
+			"denied": {"big", "cleared"}, "exempt": {"big", "cleared"},
+		} {
+			h.as(t, id, groups...)
+		}
+		h.hold(t, "direct", "level:high")
+		h.hold(t, "lower", "level:mid")
+		if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), tenantT1, rbac.Deny{
+			ID: "cleared", Principals: []rbac.Principal{groupOf("cleared")}, Exempt: []rbac.Principal{identity("exempt"), groupOf("inner")},
+			Permissions: []rbac.Permission{"level:*"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		manyMembers(t, h, others, `, places AS (INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) SELECT 't1', 'big', 'user', id FROM others)
+			SELECT 1`, "rbac_members")
+		reads := 0
+		rbac.SetReadingRoles(t, func() { reads++ })
+		holders, err := h.authz.Holders(ctx, view, secret)
+		if err != nil {
+			t.Fatal(err)
+		}
+		listed := map[string]bool{}
+		for _, hd := range holders {
+			listed[hd.Principal.ID] = hd.MaybeDenied
+		}
+		return listed, reads
+	}
+	want := map[string]bool{"direct": false, "nested": false, "exempt": false, "conditional": true}
+	few, n := list(t, 0)
+	if !maps.Equal(few, want) {
+		t.Errorf("Holders = %v, by MaybeDenied, of %v", few, want)
+	}
+	many, m := list(t, 200)
+	if !maps.Equal(many, want) {
+		t.Errorf("among 200 more members: Holders = %v, by MaybeDenied, of %v", many, want)
+	}
+	if m != n {
+		t.Errorf("Holders read grants %d times among 7 members, and %d among 207", n, m)
+	}
+}
