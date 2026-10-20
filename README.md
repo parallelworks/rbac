@@ -171,8 +171,8 @@ grants: `Reach.Conditional` names the scopes conditional ones reach, to check on
 - **Host policy:** `Config.ValidateGrant` is asked about every grant with the role, the principal,
   the actor and how it is made, so the host decides who may hold what: members only, no
   privileged roles for service accounts or guests. `Config.Constraints` remove permissions above
-  anything a tenant grants or denies, seeing the subject and the resource, such as freezing
-  changes under a container. What one removes from an actor the actor can't hand on, but for a
+  anything a tenant grants or denies, seeing copies of the subject and the resource, such as
+  freezing changes under a container. What one removes from an actor the actor can't hand on, but for a
   role a role it holds lists in `GrantableRoles`, which it grants without holding. The host is
   asked before a change takes its locks, so a change is tried again (`rbac.ErrConflict`) when the
   memberships its answers rest on, of an identity it grants to or of a group's members, changed

@@ -507,7 +507,9 @@ type Constraint struct {
 // type, and Holders first once for every holder: where Resource or Subject is nil, answer true if
 // the constraint removes the permission for any, so that a search never keeps what a check
 // refuses. Holders then asks again about each identity it lists, which it marks MaybeDenied where
-// the constraint answers true.
+// the constraint answers true. Each constraint is given copies of its own of the subject and the
+// resource, their attributes, ancestors and label too, so one writing to them changes nothing
+// decided.
 type ConstraintInput struct {
 	Tenant       string
 	ResourceType string
@@ -525,6 +527,21 @@ type ConstraintInput struct {
 	// Reachable, and in SetRole and DeleteRole, which change grants on every scope of a type, but
 	// for what SetRole's role gives, asked about the tenant.
 	Resource *Resource
+}
+
+// copied is in with its subject and resource deep copies.
+func (in ConstraintInput) copied() ConstraintInput {
+	if in.Subject != nil {
+		s := *in.Subject
+		s.Attributes = deepCopy(s.Attributes)
+		in.Subject = &s
+	}
+	if in.Resource != nil {
+		r := *in.Resource
+		r.Ancestors, r.Attributes, r.Labels = deepCopy(r.Ancestors), deepCopy(r.Attributes), deepCopy(r.Labels)
+		in.Resource = &r
+	}
+	return in
 }
 
 var (
@@ -939,10 +956,12 @@ const (
 	ViaMembership   Via = "membership"
 )
 
-// denied returns the name of the first constraint that removes in.Permission, or "".
+// denied returns the name of the first constraint that removes in.Permission, or "". Each hook is
+// asked about copies of its own, so one that writes to what it is given changes neither what is
+// decided, its input already validated, nor what a later hook is asked.
 func (a *Authorizer) denied(ctx context.Context, in ConstraintInput) (string, error) {
 	for _, c := range a.cfg.Constraints {
-		deny, err := c.Deny(ctx, a.db, in)
+		deny, err := c.Deny(ctx, a.db, in.copied())
 		if err != nil {
 			return "", err
 		}

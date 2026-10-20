@@ -250,3 +250,84 @@ func typing(attrs Attributes) (*cel.Env, error) {
 		cel.Variable("action", cel.StringType),
 	)
 }
+
+// deepCopy is a copy of v whose maps, slices, arrays and pointers are its own, however deep, a
+// protobuf message among them cloned, and a value reached twice copied once, so a cycle ends.
+func deepCopy[T any](v T) T {
+	out := reflect.ValueOf(&v).Elem()
+	out.Set(copier{}.copy(out))
+	return v
+}
+
+// copier copies values for deepCopy, keeping each map, slice and pointer it copied by where it
+// points, its length and its type.
+type copier map[copiedKey]reflect.Value
+
+type copiedKey struct {
+	t   reflect.Type
+	at  uintptr
+	len int
+}
+
+func (c copier) copy(v reflect.Value) reflect.Value {
+	switch v.Kind() {
+	case reflect.Interface:
+		if v.IsNil() {
+			return v
+		}
+		out := reflect.New(v.Type()).Elem()
+		out.Set(c.copy(v.Elem()))
+		return out
+	case reflect.Map:
+		if v.IsNil() {
+			return v
+		}
+		k := copiedKey{v.Type(), v.Pointer(), 0}
+		if done, ok := c[k]; ok {
+			return done
+		}
+		out := reflect.MakeMapWithSize(v.Type(), v.Len())
+		c[k] = out
+		for it := v.MapRange(); it.Next(); {
+			out.SetMapIndex(it.Key(), c.copy(it.Value()))
+		}
+		return out
+	case reflect.Slice:
+		if v.IsNil() {
+			return v
+		}
+		k := copiedKey{v.Type(), v.Pointer(), v.Len()}
+		if done, ok := c[k]; ok {
+			return done
+		}
+		out := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
+		c[k] = out
+		for i := range v.Len() {
+			out.Index(i).Set(c.copy(v.Index(i)))
+		}
+		return out
+	case reflect.Array:
+		out := reflect.New(v.Type()).Elem()
+		for i := range v.Len() {
+			out.Index(i).Set(c.copy(v.Index(i)))
+		}
+		return out
+	case reflect.Pointer:
+		if v.IsNil() {
+			return v
+		}
+		if m, ok := v.Interface().(proto.Message); ok {
+			return reflect.ValueOf(proto.Clone(m))
+		}
+		k := copiedKey{v.Type(), v.Pointer(), 0}
+		if done, ok := c[k]; ok {
+			return done
+		}
+		out := reflect.New(v.Type().Elem())
+		c[k] = out
+		out.Elem().Set(c.copy(v.Elem()))
+		return out
+	default:
+		return v
+	}
+}

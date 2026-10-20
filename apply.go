@@ -816,9 +816,8 @@ func (c *constrained) removes(p Permission, resourceType string) bool {
 	if c.err != nil {
 		return true
 	}
-	// Copies, so a hook that changes what it is asked about can't change what later ones are.
-	actor, on := c.actor, c.on
-	name, err := c.a.denied(c.ctx, ConstraintInput{Tenant: on.Tenant, ResourceType: resourceType, Permission: p, Subject: &actor, Resource: &on})
+	// denied asks each hook about copies of its own, so none can change what later ones are asked.
+	name, err := c.a.denied(c.ctx, ConstraintInput{Tenant: c.on.Tenant, ResourceType: resourceType, Permission: p, Subject: &c.actor, Resource: &c.on})
 	if err != nil {
 		c.err = err
 	}

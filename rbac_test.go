@@ -1552,6 +1552,75 @@ func TestConstraintsSeeWhoAndWhere(t *testing.T) {
 	}
 }
 
+func TestAConstraintWritingToWhatItIsAskedChangesNothing(t *testing.T) {
+	w9 := rbac.Scope{Type: "workspace", ID: "w9"}
+	var seen []string
+	h := labeled(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{
+			// A hook that fills in what it reads, as one loading the stored resource might.
+			{Name: "careless", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+				if r := in.Resource; r != nil {
+					if len(r.Ancestors) > 0 {
+						r.Ancestors[0] = w9
+					}
+					if r.Attributes != nil {
+						r.Attributes["env"] = "prod"
+					}
+					if vs := r.Labels["level"]; len(vs) > 0 {
+						vs[0] = "low"
+					}
+				}
+				if s := in.Subject; s != nil && s.Attributes != nil {
+					s.Attributes["team"] = "sre"
+				}
+				return false, nil
+			}},
+			{Name: "after", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+				if r := in.Resource; r != nil && (slices.Contains(r.Ancestors, w9) || r.Attributes["env"] == "prod" || slices.Contains(r.Labels["level"], "low")) ||
+					in.Subject != nil && in.Subject.Attributes["team"] == "sre" {
+					seen = append(seen, string(in.Permission))
+				}
+				return false, nil
+			}},
+		}
+	})
+	ctx := t.Context()
+	c2 := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c2", Ancestors: []rbac.Scope{{Type: "workspace", ID: "w1"}, {Type: "org", ID: "o1"}}}
+	prodOnly := grant(rbac.Scope{Type: "cluster", ID: "c3"}, "cluster.sudo", rbac.User, "u")
+	prodOnly.Condition = rbac.Condition{Expression: `resource.attributes.env == "prod"`}
+	sreOnly := grant(rbac.Scope{Type: "cluster", ID: "c4"}, "cluster.sudo", rbac.User, "u")
+	sreOnly.Condition = rbac.Condition{Expression: `subject.attributes.team == "sre"`}
+	// u logs in to clusters under w9 and to the secret one, and is root on c3 in prod and on c4 for
+	// the SRE team; owner changes grants under w9.
+	h.seed(t, grant(w9, "cluster.login", rbac.User, "u"), grant(rbac.Scope{Type: "cluster", ID: "c5"}, "cluster.login", rbac.User, "u"),
+		prodOnly, sreOnly, grant(w9, "cluster.admin", rbac.User, "admin"))
+	h.hold(t, "u", "level:low")
+	u := rbac.Subject{Principal: h.as(t, "u").Principal, Attributes: map[string]any{"team": "dev"}}
+	h.as(t, "x")
+	c3 := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c3", Attributes: map[string]any{"env": "dev"}}
+	c4 := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c4"}
+	c5 := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c5", Labels: rbac.Label{"level": {"high"}}}
+	for name, ask := range map[string]func() bool{
+		"its ancestors":  func() bool { return allowed(t, h, u, login, c2) },
+		"its attributes": func() bool { return allowed(t, h, u, root, c3) },
+		"the subject's":  func() bool { return allowed(t, h, u, root, c4) },
+		"its label":      func() bool { return allowed(t, h, u, view, c5) },
+		"its ancestors, handing": func() bool {
+			return h.authz.Apply(ctx, h.as(t, "admin"), c2, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("x")}}}) == nil
+		},
+	} {
+		if ask() {
+			t.Errorf("a constraint writing to %s changed what was decided", name)
+		}
+	}
+	if c2.Ancestors[0] != (rbac.Scope{Type: "workspace", ID: "w1"}) || c3.Attributes["env"] != "dev" || c5.Labels["level"][0] != "high" || u.Attributes["team"] != "dev" {
+		t.Errorf("a constraint wrote to what the host passed: %v %v %v %v", c2.Ancestors, c3.Attributes, c5.Labels, u.Attributes)
+	}
+	if seen != nil {
+		t.Errorf("a constraint was asked about what another wrote, for %v", seen)
+	}
+}
+
 func TestFilterScalesWithResourceGrants(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
