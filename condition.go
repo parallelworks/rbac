@@ -1190,9 +1190,24 @@ func WithRequest(ctx context.Context, attributes map[string]any) context.Context
 	return context.WithValue(ctx, requestKey{}, maps.Clone(attributes))
 }
 
+// unrequested stands in ctx for a request's attributes where conditions are decided for a subject
+// that made no request there, as an approver's label values are, beside the request of the one
+// activating: they read none, a test of one's presence included, as unreadable refuses them.
+// Empty, a test of an attribute's absence would hold, and a deny guarded by its presence lift.
+type unrequested struct{}
+
+// withoutRequest is ctx with no request's attributes for conditions to read.
+func withoutRequest(ctx context.Context) context.Context {
+	return context.WithValue(ctx, requestKey{}, unrequested{})
+}
+
 // vars is what a condition reads when s asks to do p to r.
 func (a *Authorizer) vars(ctx context.Context, s Subject, p Permission, r Resource) map[string]any {
-	request, _ := ctx.Value(requestKey{}).(map[string]any)
+	var attributes any = unreadable
+	if _, none := ctx.Value(requestKey{}).(unrequested); !none {
+		request, _ := ctx.Value(requestKey{}).(map[string]any)
+		attributes = declared(a.cfg.Attributes.Request, request)
+	}
 	resource := map[string]any{"type": r.Type, "id": r.ID, "tenant": r.Tenant, "attributes": declared(a.cfg.Attributes.Resource, r.Attributes)}
 	if r.Type == TenantScope && a.labelPermission(p) {
 		resource = valueResource(r.Tenant)
@@ -1200,7 +1215,7 @@ func (a *Authorizer) vars(ctx context.Context, s Subject, p Permission, r Resour
 	return map[string]any{
 		"subject":  map[string]any{"kind": string(s.Principal.Kind), "id": s.Principal.ID, "attributes": declared(a.cfg.Attributes.Subject, s.Attributes)},
 		"resource": resource,
-		"request":  map[string]any{"time": a.cfg.Now(), "attributes": declared(a.cfg.Attributes.Request, request)},
+		"request":  map[string]any{"time": a.cfg.Now(), "attributes": attributes},
 		"action":   string(p),
 	}
 }

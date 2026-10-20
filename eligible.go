@@ -237,17 +237,18 @@ type Activation struct {
 // passing act.Approver and, in ctx, the request s made (WithRequest), which Requires reads.
 // Approving decides access on the scope, as changing its grants does, so where the scope's label
 // asks for values, an approver approves only holding them, as one changing its grants must: its
-// own, decided as Holding decides them, with act.Approver's attributes and no request, as the one
-// in ctx is s's, so a value it holds under a condition on the request's attributes counts for
-// nothing. Of the eligibilities that allow it, with the approver and the request it has, the
-// activation is made through the one whose path from s lasts longest, s's own identity's as long
-// as its membership and a group's as long as the latest of its places to it, and records it: it
-// rests on s being that one's principal or in its group (Eligibility). Of those lasting alike, it
-// is one needing no approval over one that does, then s's own, whose path every other rests on
-// too, then the one whose requirement is cheapest; their requirements are evaluated cheapest
-// first, as a check's conditions are. It holds the places in groups s is in until it commits, and
-// finds s eligible through those alone, so a change ending one of them sooner waits for it, and
-// cuts the activation short if it rests on that place.
+// own, decided as Holding decides them, with act.Approver's attributes and none of a request's, as
+// the one in ctx is s's: any read of request.attributes by a condition of them, a test of an
+// attribute's presence included, fails, so a grant's gives nothing and a deny's applies. Of the
+// eligibilities that allow it, with the approver and the request it has, the activation is made
+// through the one whose path from s lasts longest, s's own identity's as long as its membership
+// and a group's as long as the latest of its places to it, and records it: it rests on s being
+// that one's principal or in its group (Eligibility). Of those lasting alike, it is one needing no
+// approval over one that does, then s's own, whose path every other rests on too, then the one
+// whose requirement is cheapest; their requirements are evaluated cheapest first, as a check's
+// conditions are. It holds the places in groups s is in until it commits, and finds s eligible
+// through those alone, so a change ending one of them sooner waits for it, and cuts the activation
+// short if it rests on that place.
 func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act Activation) (g Grant, err error) {
 	defer a.refused(ctx, &err, on.Tenant, s.Principal, "Activate")
 	if err := a.check(on); err != nil {
@@ -282,8 +283,8 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 		reached[k] = time.Time{}
 	}
 	// What the constraints remove of the approver's label values, asked about once, as an actor's
-	// are, with no request.
-	approving := a.constrain(WithRequest(ctx, nil), act.Approver, Resource{Tenant: on.Tenant, Type: TenantScope, ID: on.Tenant})
+	// are, with none of a request's attributes.
+	approving := a.constrain(withoutRequest(ctx), act.Approver, Resource{Tenant: on.Tenant, Type: TenantScope, ID: on.Tenant})
 	if _, _, err := a.eligible(ctx, a.db, s, on, act, b.ExpiresAt, reached, approving); err != nil {
 		return Grant{}, err
 	}
@@ -676,8 +677,9 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 		// Before the ranking: the paths' ends, which only the transaction reads, can rank one it
 		// approves first there, and its values must have been asked about before it.
 		if len(e.approvers) > 0 && on.Labels.asks() {
-			// Read the first time in each phase, with no request, as approving asks the constraints.
-			held, err := approving.holding(WithRequest(ctx, nil), q)
+			// Read the first time in each phase, with none of a request's attributes, as approving
+			// asks the constraints.
+			held, err := approving.holding(withoutRequest(ctx), q)
 			if err != nil {
 				return madeThrough{}, Principal{}, err
 			}

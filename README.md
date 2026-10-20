@@ -127,7 +127,7 @@ names the scopes conditional ones reach, to check one by one.
   `ChangeMembers` the members of a labeled group, or of one holding access or exempt from a deny on
   a labeled scope, nor `SetGroup` and `DeleteGroup` a labeled group or the groups of a labeled
   tenant, nor does `Activate` count an approval on a labeled scope by an approver whose own values,
-  read without the activator's request, don't satisfy its label, each reading the actor's or
+  read with no request's attributes, don't satisfy its label, each reading the actor's or
   approver's values again under the change's locks; `Explain` names the dimension that failed.
   `Filter` tests a `text[]` label column (`Columns.Labels`), which needs no
   index, as the path's drives the query; `Reachable` returns the holding, and `Holding` with
