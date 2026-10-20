@@ -1941,8 +1941,16 @@ func (a *Authorizer) remove(ctx context.Context, tx pgx.Tx, tenant, where string
 func removed[T any](ctx context.Context, a *Authorizer, tx pgx.Tx, table, columns string, collect func(pgx.Rows) ([]T, error),
 	tenant, where string, args ...any,
 ) ([]T, error) {
-	query := `DELETE FROM ` + table + ` WHERE tenant = $1 AND ` + where
-	args = append([]any{tenant}, args...)
+	return removedWhere(ctx, a, tx, table, columns, collect, "tenant = $1 AND "+where, append([]any{tenant}, args...)...)
+}
+
+// removedWhere is removed of the rows where alone picks, its arguments from $1: rows picked by key,
+// in a tenant they were found in, which beside tenant = $1 a generic plan, costing a tenant's rows
+// by averages, would find by reading every row in the tenant.
+func removedWhere[T any](ctx context.Context, a *Authorizer, tx pgx.Tx, table, columns string, collect func(pgx.Rows) ([]T, error),
+	where string, args ...any,
+) ([]T, error) {
+	query := `DELETE FROM ` + table + ` WHERE ` + where
 	// Only OnChange reads what was removed, which for a whole tenant can be every row it has.
 	if a.cfg.OnChange == nil {
 		_, err := tx.Exec(ctx, query, args...)

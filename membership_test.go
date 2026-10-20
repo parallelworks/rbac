@@ -498,6 +498,70 @@ func TestDeletingGroupsRemovesTheirGrants(t *testing.T) {
 	}
 }
 
+// DeleteGroups reads, of the tenant's grants and places in groups, only the groups' own, under a
+// generic plan too: a group's grants and those on it, and its members and its places in other
+// groups, are found by conditions ORed that no index seeks, and deleted matched to them in a join,
+// which a plan, costing the tenant's rows by averages, runs by reading every one.
+func TestDeletingAGroupUnderAGenericPlanReadsOnlyItsGrantsAndPlaces(t *testing.T) {
+	h := generic(t)
+	ctx := t.Context()
+	h.groups(t, "small", "everyone")
+	h.as(t, "ann", "small")
+	// small is in everyone, holds a grant and is granted on.
+	for _, q := range []string{
+		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'everyone', 'group', 'small')`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		  VALUES ('t1', 'cluster', 'c1', 'group', 'small', 'cluster.login'), ('t1', 'group', 'small', 'user', 'ann', 'group.owner')`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tables := []string{"rbac_grants", "rbac_members"}
+	// The pages of each that deleting small reads, in a transaction it rolls back.
+	read := func() map[string]int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		pages := map[string]int64{}
+		for _, table := range tables {
+			pages[table] -= pagesRead(ctx, t, tx, table)
+		}
+		if err := h.authz.WithTx(tx).DeleteGroups(ctx, host, "t1", []string{"small"}); err != nil {
+			t.Fatal(err)
+		}
+		for _, table := range tables {
+			pages[table] += pagesRead(ctx, t, tx, table)
+		}
+		var left int
+		if err := tx.QueryRow(ctx, `SELECT (SELECT count(*) FROM rbac_grants WHERE 'group:small' IN (principal, scope))
+			+ (SELECT count(*) FROM rbac_members WHERE 'small' = group_id OR 'group:small' = principal)`).Scan(&left); err != nil || left != 0 {
+			t.Fatalf("%d grants and places name small once it was deleted, %v", left, err)
+		}
+		return pages
+	}
+	// Others are in everyone, and hold a grant on the tenant and one on a cluster each.
+	others := func(n int) {
+		t.Helper()
+		manyMembers(t, h, n, `, members AS (INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+			  SELECT 't1', 'everyone', 'user', id FROM others)
+			INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'tenant', 't1', 'user', id, 'cluster.login' FROM others
+			UNION ALL SELECT 't1', 'cluster', id, 'user', id, 'cluster.login' FROM others`, tables...)
+	}
+	others(500)
+	few := read()
+	others(4500)
+	for what, many := range read() {
+		if many > few[what]*3/2+deeper {
+			t.Errorf("deleting small read %d pages of %s, and %d once 4500 more were in another group and granted", few[what], what, many)
+		}
+	}
+}
+
 func TestDeleteGroupLeavesAccessAndTheHostsMembersAsTheyAre(t *testing.T) {
 	h := grouped(t, func(c *rbac.Config) {
 		c.Catalog = append(slices.Clone(c.Catalog), guardRole, groupOwner)

@@ -656,15 +656,46 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 	if e.Denies, err = collectDenies(rows); err != nil {
 		return ChangeEvent{}, err
 	}
-	if e.Left, err = removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant,
-		placesInOrder("(group_id = ANY($2::text[]) OR principal = ANY($3::text[]))"), ids, principals); err != nil {
+	// The places in the groups and of them, and the grants of the groups and on them, are each found
+	// by key on its own, locked in order as inOrder and placesInOrder lock them, and deleted by key:
+	// ORed, the conditions are none an index seeks, and matched to the rows to delete in a join, or
+	// beside tenant = $1, a generic plan can find them by reading every row in the tenant. Places in
+	// groups have no id, so a ctid keys them: no change moves one meanwhile, as each takes its
+	// group's lock or its principal's, which this change holds.
+	if e.Left, err = removedWhere(ctx, a, tx, "rbac_members", memberColumns, collectMembers,
+		anyOf("ctid", lockedInOrder("rbac_members", "ctid", "group_id, principal, source", anyOf("ctid",
+			byKeys("rbac_members", "ctid", "group_id", "$2"), byKeys("rbac_members", "ctid", "principal", "$3")))),
+		tenant, ids, principals); err != nil {
 		return ChangeEvent{}, err
 	}
 	if e.DeletedGroups, err = removed(ctx, a, tx, "rbac_groups", groupColumns, collectGroups, tenant, "id = ANY($2::text[])", ids); err != nil {
 		return ChangeEvent{}, err
 	}
-	e.Revoked, err = a.remove(ctx, tx, tenant, inOrder("rbac_grants", ofGroups), principals, scopes)
+	e.Revoked, err = removedWhere(ctx, a, tx, "rbac_grants", grantColumns, collectGrants,
+		anyOf("id", lockedInOrder("rbac_grants", "id", "scope, principal, id", anyOf("id",
+			byKeys("rbac_grants", "id", "principal", "$2"), byKeys("rbac_grants", "id", "scope", "$3")))),
+		tenant, principals, scopes)
 	return e, err
+}
+
+// byKeys is SQL selecting key of the rows of table in tenant $1 whose col is one of the text array
+// keys, each looked up on its own. OFFSET 0 keeps the planner from flattening it into a join to the
+// whole array, which a generic plan, costing the tenant's rows by averages, can run by reading
+// every one.
+func byKeys(table, key, col, keys string) string {
+	return "SELECT x." + key + " FROM unnest(" + keys + "::text[]) AS k(k) CROSS JOIN LATERAL (SELECT " + key + " FROM " + table +
+		" WHERE tenant = $1 AND " + col + " = k.k OFFSET 0) x"
+}
+
+// anyOf is SQL picking, by key, the rows any of selects picks.
+func anyOf(key string, selects ...string) string {
+	return key + " = ANY(ARRAY(" + strings.Join(selects, " UNION ALL ") + "))"
+}
+
+// lockedInOrder is SQL selecting cols of the rows of table that where picks, once they are locked
+// in order.
+func lockedInOrder(table, cols, order, where string) string {
+	return "SELECT " + cols + " FROM " + table + " WHERE " + where + " ORDER BY " + order + " FOR UPDATE"
 }
 
 // notOwnedGroups refuses, on q, changing groups from a source the host owns, which only it changes.
