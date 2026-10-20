@@ -847,6 +847,16 @@ func TestAMisspelledPermissionOrTypeIsInvalid(t *testing.T) {
 			_, err := h.authz.Activate(ctx, h.as(t, "u"), misspelled, rbac.Activation{Role: "cluster.login", Duration: time.Hour, Justification: "on call"})
 			return err
 		},
+		// A removal too, which would otherwise succeed having removed nothing, leaving the grants
+		// of the type it meant.
+		"a type Deactivate":  func() error { return h.authz.Deactivate(ctx, h.as(t, "u"), misspelled, "cluster.login") },
+		"a type DeleteScope": func() error { return h.authz.DeleteScope(ctx, host, "t1", misspelled.Scope()) },
+		"a type DeleteScopes": func() error {
+			return h.authz.DeleteScopes(ctx, host, "t1", []rbac.Scope{cluster.Scope(), misspelled.Scope()})
+		},
+		"a type DeleteGrants": func() error {
+			return h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(misspelled.Scope(), "cluster.admin", rbac.User, "owner")})
+		},
 	} {
 		if err := ask(); !errors.Is(err, rbac.ErrInvalid) || errors.Is(err, rbac.ErrDenied) {
 			t.Errorf("%s misspelled: %v", name, err)
@@ -865,6 +875,43 @@ func TestAMisspelledPermissionOrTypeIsInvalid(t *testing.T) {
 	// What a container is can be asked even where no role is for its type.
 	if perms, err := h.authz.Permissions(ctx, h.as(t, "owner"), rbac.Resource{Tenant: "t1", Type: "org", ID: "o1"}); err != nil || len(perms) != 0 {
 		t.Fatalf("Permissions on a container no role is for = %v, %v", perms, err)
+	}
+}
+
+func TestARetiredTypesScopesAreDeletedWhileTheHostChecksIt(t *testing.T) {
+	queue := rbac.RoleDefinition{ID: "queue.reader", Permissions: []rbac.Permission{"queue:read"}, ResourceTypes: []string{"queue"}}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), queue) })
+	ctx := t.Context()
+	q1, q2 := rbac.Scope{Type: "queue", ID: "q1"}, rbac.Scope{Type: "queue", ID: "q2"}
+	h.seed(t, grant(q1, queue.ID, rbac.User, "u"), grant(q2, queue.ID, rbac.User, "u"), grant(q2, queue.ID, rbac.User, "v"))
+	// The catalog drops queues; while the host still lists one of their permissions, it has the type.
+	retiring := func(c *rbac.Config) {
+		c.Catalog = catalog
+		c.Permissions = declaring(catalog, "queue:read")
+	}
+	for name, mutate := range map[string]func(*rbac.Config){"retired": func(c *rbac.Config) { c.Catalog = catalog }, "retiring": retiring} {
+		authz, err := rbac.New(h.pool, func() rbac.Config { c := h.cfg; mutate(&c); return c }())
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = authz.DeleteScopes(ctx, host, "t1", []rbac.Scope{q1})
+		if name == "retired" && !errors.Is(err, rbac.ErrInvalid) || name == "retiring" && err != nil {
+			t.Errorf("deleting a %s type's scopes: %v", name, err)
+		}
+	}
+	if gs, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{q1, q2}}); err != nil || len(gs) != 2 {
+		t.Fatalf("Grants = %+v, %v", gs, err)
+	}
+	// Whatever the type, a principal's grants go with it.
+	retired, err := rbac.New(h.pool, func() rbac.Config { c := h.cfg; c.Catalog = catalog; return c }())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := retired.DeletePrincipal(ctx, host, "t1", identity("u")); err != nil {
+		t.Fatal(err)
+	}
+	if gs, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{q2}}); err != nil || len(gs) != 1 || gs[0].Principal != identity("v") {
+		t.Fatalf("Grants = %+v, %v", gs, err)
 	}
 }
 

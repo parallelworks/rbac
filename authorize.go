@@ -224,9 +224,13 @@ func (a *Authorizer) askable(p Permission, resourceType string) error {
 
 // scopeOf returns why r's type is no scope the host has: not a resource type a check may name, a
 // container's or the tenant's, so nothing could be done to it or granted on it.
-func (a *Authorizer) scopeOf(r Resource) error {
-	if !a.checkedTypes[r.Type] && !a.contains(r.Type) {
-		return fmt.Errorf("%w: resource type %q is not one the host checks", ErrInvalid, r.Type)
+func (a *Authorizer) scopeOf(r Resource) error { return a.scopeType(r.Type) }
+
+// scopeType is scopeOf for a scope's type. A type the catalog no longer has stays one while
+// Config.Permissions lists a permission of it, so what is stored on it can still be removed.
+func (a *Authorizer) scopeType(t string) error {
+	if !a.checkedTypes[t] && !a.contains(t) {
+		return fmt.Errorf("%w: resource type %q is not one the host checks", ErrInvalid, t)
 	}
 	return nil
 }

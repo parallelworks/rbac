@@ -361,9 +361,12 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   below a container when it moves.
 - **Permissions:** a check or search of a permission, or a resource type, the host doesn't have
   is refused as `rbac.ErrInvalid`, as a typo, not denied, as is a change on a scope of such a
-  type. They are what the catalog's roles give and are for, or with `Config.Permissions` every
-  permission the host checks, which a catalog an operator configures can leave out of every role:
-  then it is denied like any other.
+  type, a removal too (`Deactivate`, `DeleteScopes`, `DeleteGrants`), which would otherwise
+  succeed having removed nothing. They are what the catalog's roles give and are for, or with
+  `Config.Permissions` every permission the host checks, which a catalog an operator configures
+  can leave out of every role: then it is denied like any other. To retire a type, keep one of its
+  permissions there until its scopes are deleted; `DeletePrincipal` and `DeleteTenant` remove
+  grants on any type.
 - **Limits:** a change takes at most `rbac.MaxBindings` bindings; a principal holds a role on a
   scope at most `rbac.MaxGrantsPerRole` times, and is in a group at most `rbac.MaxPlacesInGroup`
   times, by source, from each source the host owns apart; a scope holds at most `rbac.MaxDenies`

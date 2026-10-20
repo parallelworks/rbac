@@ -288,10 +288,14 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 }
 
 // Deactivate ends s's activations of a role on a scope, on, early, as when the work is done. It
-// needs no permission, and no constraint stops it: s gives up only access it activated.
+// needs no permission, and no constraint stops it: s gives up only access it activated. A scope of
+// a type the host doesn't have is refused as invalid, as a typo, as Activate refuses it.
 func (a *Authorizer) Deactivate(ctx context.Context, s Subject, on Resource, role Role) (err error) {
 	defer a.refused(ctx, &err, on.Tenant, s.Principal, "Deactivate")
 	if err := a.check(on); err != nil {
+		return err
+	}
+	if err := a.scopeOf(on); err != nil {
 		return err
 	}
 	if err := a.subject(s); err != nil {

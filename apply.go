@@ -1609,7 +1609,8 @@ func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) (
 // (Config.Sources), which Apply can't change. Each names its scope and, as Change.Revoke does, its
 // role, principal and source, every grant of the role to the principal from the source there, or
 // with an ID that one grant. actor is who they are recorded as revoked by. It locks their scopes
-// and principals until the transaction ends, or past 64 the tenant, as Import does.
+// and principals until the transaction ends, or past 64 the tenant, as Import does. A scope of a
+// type the host doesn't have is refused as invalid, as DeleteScopes refuses it.
 func (a *Authorizer) DeleteGrants(ctx context.Context, actor Principal, tenant string, grants []Grant) (err error) {
 	defer a.refused(ctx, &err, tenant, actor, "DeleteGrants")
 	if !validID(tenant) {
@@ -1629,6 +1630,10 @@ func (a *Authorizer) DeleteGrants(ctx context.Context, actor Principal, tenant s
 	for _, g := range grants {
 		if !g.Scope.in(tenant) {
 			errs = append(errs, &InvalidError{Binding: g.Binding, Reason: fmt.Sprintf("scope %q is not valid", g.Scope.Key())})
+			continue
+		}
+		if a.scopeType(g.Scope.Type) != nil {
+			errs = append(errs, &InvalidError{Binding: g.Binding, Reason: fmt.Sprintf("scope type %q is not one the host checks", g.Scope.Type)})
 			continue
 		}
 		errs = append(errs, checkRevoke(tenant, g.Binding)...)
@@ -1685,6 +1690,11 @@ func (a *Authorizer) DeleteScope(ctx context.Context, actor Principal, tenant st
 // holds a bounded number of locks however many scopes it removes. A call for each scope in one
 // transaction would hold a lock for each, which PostgreSQL keeps in one table every session
 // shares: a few thousand can fill it.
+//
+// A scope of a type the host doesn't have is refused as invalid, as a typo would otherwise remove
+// nothing and succeed. A type the catalog no longer has is still one while Config.Permissions
+// lists a permission of it, so to retire a type, keep one listed there until its scopes are
+// deleted; DeletePrincipal, DeletePrincipalEverywhere and DeleteTenant remove grants on any type.
 func (a *Authorizer) DeleteScopes(ctx context.Context, actor Principal, tenant string, scopes []Scope) (err error) {
 	defer a.refused(ctx, &err, tenant, actor, "DeleteScopes")
 	return a.deleteScopes(ctx, actor, tenant, "DeleteScopes", scopes)
@@ -1695,6 +1705,9 @@ func (a *Authorizer) deleteScopes(ctx context.Context, actor Principal, tenant, 
 	for i, s := range scopes {
 		if !s.in(tenant) {
 			return fmt.Errorf("%w: scope %q is not valid", ErrInvalid, s.Key())
+		}
+		if err := a.scopeType(s.Type); err != nil {
+			return err
 		}
 		keys[i] = s.Key()
 	}
