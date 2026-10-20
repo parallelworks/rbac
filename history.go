@@ -165,13 +165,18 @@ const (
 // It deletes nothing at or past through, the cursor of the last export the host has checkpointed,
 // so that export goes on from it, and it records the prune in history. Run it as a role with the
 // rights of history's owner, as the README's administrator's, never the application's; keep at
-// least as much as the host's audit retention requires. It refuses a before yet to come and, like
-// AsOf, history whose ids can't order a row's changes. It deletes at most MaxPrune records:
-// call it again while it deletes as many, and it goes on from where the last prune of the same
-// before and through stopped.
+// least as much as the host's audit retention requires. It refuses a before yet to come or before
+// year 1, earlier than history dates anything, and, like AsOf, history whose ids can't order a
+// row's changes. It deletes at most MaxPrune records: call it again while it deletes as many, and
+// it goes on from where the last prune of the same before and through stopped.
 func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) (int64, error) {
 	if through.TxID == 0 && through.ID == 0 {
 		return 0, fmt.Errorf("%w: a prune goes only as far as an export has read: through is the export's cursor", ErrInvalid)
+	}
+	// AsOf finds the last prune's time by its record's key, which holds it as text that sorts as
+	// time only from year 1: a year BC is written as the year AD of the same number.
+	if before.Before(time.Date(1, time.January, 1, 0, 0, 0, 0, time.UTC)) {
+		return 0, fmt.Errorf("%w: a prune is of history up to a time in year 1 or later", ErrInvalid)
 	}
 	var n int64
 	err := begin(ctx, db, func(tx pgx.Tx) error {

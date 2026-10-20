@@ -204,11 +204,13 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 
 // unpruned refuses at, on tx, once a prune has run past it: of each row a prune keeps only its
 // last version as of the prune's time, which an earlier time would read as the row's version
-// then, or as no row.
+// then, or as no row. Of the prunes' times, the last is that of the last record by key, which
+// holds its prune's time as text that sorts as time, so history's index finds it alone: no
+// prune's record is removed, and every AsOf would otherwise read them all, twice.
 func unpruned(ctx context.Context, tx pgx.Tx, schema string, at time.Time) error {
 	var pruned bool
-	if err := tx.QueryRow(ctx, `SELECT coalesce($1::pg_catalog.timestamptz < max((h.after->>'before')::pg_catalog.timestamptz), false)
-		FROM `+historyTable(schema)+` h WHERE h.tenant = '' AND h.entity = 'history' AND h.op = 'prune'`,
+	if err := tx.QueryRow(ctx, `SELECT coalesce($1::pg_catalog.timestamptz < (SELECT (h.after->>'before')::pg_catalog.timestamptz
+		FROM `+historyTable(schema)+` h WHERE h.tenant = '' AND h.entity = 'history' AND h.op = 'prune' ORDER BY h.key DESC LIMIT 1), false)`,
 		at).Scan(&pruned); err != nil {
 		return err
 	}

@@ -1799,6 +1799,11 @@ func TestPruningHistoryKeepsWhatAsOfReads(t *testing.T) {
 	if _, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h).Add(time.Hour), through); !errors.Is(err, rbac.ErrInvalid) {
 		t.Errorf("a prune of history up to a time to come: %v", err)
 	}
+	// Nor one before year 1, which history dates nothing at, and whose record's key would write its
+	// year BC as the year AD of the same number, which AsOf would read it as.
+	if _, err := rbac.PruneHistory(ctx, h.pool, time.Date(-43, time.March, 15, 0, 0, 0, 0, time.UTC), through); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("a prune of history up to a time before year 1: %v", err)
+	}
 	if _, err := rbac.PruneHistory(ctx, h.pool, then, rbac.Cursor{}); !errors.Is(err, rbac.ErrInvalid) {
 		t.Errorf("a prune with no cursor: %v", err)
 	}
@@ -2393,5 +2398,56 @@ func TestPruningHistoryReadsOnlyAsFarAsItsBatch(t *testing.T) {
 	grants(4000)
 	if many := read(); many > few*11/10 {
 		t.Fatalf("a call read %d pages of history, and %d once 4000 more records followed what it deleted", few, many)
+	}
+}
+
+// AsOf reads the latest prune's time from one record, which history's index finds by its key: what
+// it reads of history doesn't grow with the prunes recorded, which no prune removes, and a prune
+// recorded later can be of an earlier time.
+func TestAsOfReadsOnlyTheLatestPrune(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	// As many prunes, of times in the year before last, recorded as history's owner writes them.
+	prunes := func(n int) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_history (effective_at, tenant, entity, key, op, after, how)
+			SELECT now(), '', 'history', to_char(b AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), 'prune',
+			  jsonb_build_object('before', b, 'through', jsonb_build_object('txid', '1', 'id', 1), 'deleted', 1, 'reached', 1), 'PruneHistory'
+			FROM (SELECT now() - interval '2 years' + random() * interval '1 year' AS b FROM generate_series(1, $1)) p`, n); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.pool.Exec(ctx, `ANALYZE rbac_history`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The pages of history and its indexes an AsOf as of at reads, under a transaction of the test's.
+	read := func(at time.Time) int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		start := historyPages(ctx, t, tx)
+		if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(*rbac.Authorizer) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		return historyPages(ctx, t, tx) - start
+	}
+	prunes(1)
+	few := read(dbNow(t, h))
+	prunes(20000)
+	if many := read(dbNow(t, h)); many > few+10 {
+		t.Fatalf("AsOf read %d pages of history beside a prune's record, and %d beside 20,000", few, many)
+	}
+	var latest time.Time
+	if err := h.pool.QueryRow(ctx, `SELECT max((after->>'before')::timestamptz) FROM rbac_history WHERE entity = 'history'`).Scan(&latest); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.AsOf(ctx, "t1", latest.Add(-time.Microsecond), func(*rbac.Authorizer) error { return nil }); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("AsOf just before the latest prune's time: %v", err)
+	}
+	if err := h.authz.AsOf(ctx, "t1", latest, func(*rbac.Authorizer) error { return nil }); err != nil {
+		t.Errorf("AsOf at the latest prune's time: %v", err)
 	}
 }
