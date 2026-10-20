@@ -445,8 +445,9 @@ sequenceDiagram
   to the latest end of the paths left to its principal, or ends it, whatever another eligibility
   would allow: worked out again from every eligibility the holder reaches, one whose requirement or
   approver it never met would count. `Activate` holds the places it can rest on until it commits,
-  so the two wait for each other. Setting the eligibility again or deleting it leaves its
-  activations to their own ends, or to their holders leaving its group.
+  in the statement that reads the keys it finds its subject eligible through, so the two wait for
+  each other, and a place nested between them makes no one eligible. Setting the eligibility again
+  or deleting it leaves its activations to their own ends, or to their holders leaving its group.
 - **Activations stored before migration 0012** record what migrating found: the one eligibility
   for their role on their scope whose principal their holder reached then, or, where it reached
   several or none, nothing. The first change re-checking one that records nothing ends it, as which

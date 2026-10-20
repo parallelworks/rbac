@@ -472,6 +472,55 @@ func TestEndingAPlaceWaitsForAnActivationThroughIt(t *testing.T) {
 	}
 }
 
+// Activate finds its subject eligible only through the places in groups it holds: through a place
+// nested once it holds them, which no change removing it waits for, the activation would outlast
+// the place, removed before it commits.
+func TestAnActivationIsEligibleOnlyThroughThePlacesItHolds(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	h.groups(t, "oncall")
+	u := h.as(t, "u", "inner")
+	nesting := []rbac.Member{{Group: "oncall", Principal: groupOf("inner")}}
+	if err := h.authz.ImportMembers(ctx, host, "t1", nesting); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: groupOf("oncall"), MaxDuration: 8 * time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	// inner leaves oncall as Activate begins holding u's places, and is nested in it again once it
+	// holds them.
+	rbac.SetHoldingPlaces(t, func() func() {
+		if err := h.authz.DeleteMembers(ctx, host, "t1", nesting); err != nil {
+			t.Error(err)
+		}
+		return func() {
+			if err := h.authz.ImportMembers(ctx, host, "t1", nesting); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	_, err = h.authz.WithTx(tx).Activate(ctx, u, cluster, rbac.Activation{Role: "cluster.sudo", Duration: 8 * time.Hour, Justification: "incident"})
+	if err == nil {
+		done := make(chan error, 1)
+		go func() { done <- h.authz.DeleteMembers(ctx, host, "t1", nesting) }()
+		commitOnceWaitedOn(t, h, tx, done)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if allowed(t, h, u, root, cluster) {
+			t.Fatal("u holds sudo through a place removed while it activated")
+		}
+	}
+	if !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("activating through a place nested once u's were held: %v", err)
+	}
+}
+
 // A change ending one place and writing another holds both in order before it writes either, as
 // Activate holds them: holding only the one it ends first, its write of the other would wait on an
 // Activate holding that one and waiting on the first.

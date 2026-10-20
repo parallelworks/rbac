@@ -128,3 +128,12 @@ func ConditionCost(t *testing.T, expr string, attributes map[string]any) (limit,
 	_, details, _ := unlimited.Eval(vars)
 	return prg.limit, *details.ActualCost()
 }
+
+// SetHoldingPlaces runs f as Activate begins holding the places in groups it can rest on, and what
+// f returns once it holds them, until t ends.
+func SetHoldingPlaces(t *testing.T, f func() func()) {
+	t.Helper()
+	old := holdingPlaces
+	holdingPlaces = f
+	t.Cleanup(func() { holdingPlaces = old })
+}

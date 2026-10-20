@@ -233,8 +233,8 @@ type Activation struct {
 // eligibilities that allow it, the activation is made through one needing no approval over one
 // that does, and of those through the one whose requirement is cheapest, and records it: it rests
 // on s being that one's principal or in its group (Eligibility). It holds the places in groups s
-// is in until it commits, so a change ending one of them sooner waits for it, and cuts the
-// activation short if it rests on that place.
+// is in until it commits, and finds s eligible through those alone, so a change ending one of them
+// sooner waits for it, and cuts the activation short if it rests on that place.
 func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act Activation) (g Grant, err error) {
 	defer a.refused(ctx, &err, on.Tenant, s.Principal, "Activate")
 	if err := a.check(on); err != nil {
@@ -259,7 +259,11 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 		return Grant{}, &InvalidError{Binding: b, Reason: fmt.Sprintf("an activation lasts more than nothing and at most %s, and has a justification of at most %d characters", MaxActivation, MaxNote)}
 	}
 	b.ExpiresAt = stored(a.cfg.Now().Add(act.Duration))
-	if _, _, err := a.eligible(ctx, a.db, s, on, act, b.ExpiresAt); err != nil {
+	keys, _, err := a.keysAt(ctx, a.db, on.Tenant, s, b.ExpiresAt)
+	if err != nil {
+		return Grant{}, err
+	}
+	if _, _, err := a.eligible(ctx, a.db, s, on, act, b.ExpiresAt, keys); err != nil {
 		return Grant{}, err
 	}
 	roles, err := a.tenantBook(ctx, a.db, on.Tenant, []Role{act.Role})
@@ -281,19 +285,16 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 		if err := a.stillStanding(ctx, tx, on.Tenant, stand); err != nil {
 			return ChangeEvent{}, err
 		}
-		// The places in groups it can rest on, held until it commits: a change ending one sooner holds
-		// it before reading the activations resting on it, so it waits for this one and finds it. Each
-		// key's are found on its own (byKey), then each held by its key in the order changes hold them.
-		if _, err := tx.Exec(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`
-			SELECT FROM (SELECT * FROM (`+byKey("ARRAY(SELECT k FROM keys)", "rbac_members", "principal", "group_id, principal, source",
-			"tenant = $1 AND (expires_at IS NULL OR expires_at > $3)")+`) p ORDER BY `+placeOrder+`) p CROSS JOIN LATERAL (
-			  SELECT FROM rbac_members WHERE tenant = $1 AND group_id = p.group_id AND principal = p.principal AND source = p.source
-			    AND (expires_at IS NULL OR expires_at > $3) FOR SHARE) m`, on.Tenant, s.identityKey(), a.cfg.Now()); err != nil {
+		// Again under the locks, so an eligibility revoked meanwhile activates nothing, and through
+		// the places in groups it holds alone.
+		b.ExpiresAt = stored(a.cfg.Now().Add(act.Duration))
+		held := holdingPlaces()
+		keys, err := holdPlaces(ctx, tx, on.Tenant, s, a.cfg.Now(), b.ExpiresAt)
+		if err != nil {
 			return ChangeEvent{}, err
 		}
-		// Again under the locks, so an eligibility revoked meanwhile activates nothing.
-		b.ExpiresAt = stored(a.cfg.Now().Add(act.Duration))
-		through, approver, err := a.eligible(ctx, tx, s, on, act, b.ExpiresAt)
+		held()
+		through, approver, err := a.eligible(ctx, tx, s, on, act, b.ExpiresAt, keys)
 		if err != nil {
 			return ChangeEvent{}, err
 		}
@@ -386,6 +387,41 @@ func (a *Authorizer) Deactivate(ctx context.Context, s Subject, on Resource, rol
 			scope.Key(), s.Principal.key(), role, SourceActivation)
 		return ChangeEvent{Revoked: ended}, err
 	})
+}
+
+// holdingPlaces runs as Activate begins holding the places in groups it can rest on, and what it
+// returns once it holds them, as a test changes them meanwhile.
+var holdingPlaces = func() func() { return func() {} }
+
+// holdPlaces holds, in tx, until it commits, the places in groups s can rest an activation on in the
+// tenant at now, its identity's and its groups', through those they are in, each key's found on its
+// own (byKey) and each held by its key, in the order changes hold them: a change ending one sooner
+// holds it before reading the activations resting on it, so it waits for the activation and finds
+// it. In the same statement it returns the keys s holds at until through the places it held alone,
+// and its identity's while its membership is in force then and not suspended: a later statement
+// would read a place nested meanwhile, which no change removing it would wait for. Each is held as
+// it is when held, a place updated meanwhile in its new version.
+func holdPlaces(ctx context.Context, tx pgx.Tx, tenant string, s Subject, now, until time.Time) ([]string, error) {
+	rows, err := tx.Query(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`, held AS MATERIALIZED (
+		  SELECT m.* FROM (SELECT * FROM (`+byKey("ARRAY(SELECT k FROM keys)", "rbac_members", "principal", "group_id, principal, source",
+		"tenant = $1 AND (expires_at IS NULL OR expires_at > $3)")+`) p ORDER BY `+placeOrder+`) p CROSS JOIN LATERAL (
+		    SELECT group_id, principal, expires_at FROM rbac_members WHERE tenant = $1 AND group_id = p.group_id AND principal = p.principal
+		      AND source = p.source AND (expires_at IS NULL OR expires_at > $3) FOR SHARE) m
+		), standing AS (
+		  SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = $2 AND NOT suspended AND (expires_at IS NULL OR expires_at > $4)
+		), up(id) AS (
+		  SELECT group_id FROM held WHERE principal = $2 AND (expires_at IS NULL OR expires_at > $4) AND EXISTS (SELECT FROM standing)
+		  UNION
+		  SELECT h.group_id FROM up u JOIN held h ON h.principal = 'group:' || u.id AND (h.expires_at IS NULL OR h.expires_at > $4)
+		)
+		-- Every place held, read whole before the keys are.
+		SELECT k FROM (SELECT count(*) FROM held) n, LATERAL (
+		  SELECT $2 COLLATE "C" FROM standing UNION ALL SELECT 'group:' || id FROM up) r(k)
+		ORDER BY k`, tenant, s.identityKey(), now, until)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
 // resting is the activations, by id, a change ending places in groups or memberships sooner may cut
@@ -511,20 +547,15 @@ type madeThrough struct {
 	principal string
 }
 
-// eligible checks that s may activate act.Role on on until until, and returns the eligibility that
-// allows it and who approved: one of s's identity or of one of its groups there, lasting
-// act.Duration or longer and in force until then, whose requirement holds in the request, failing
-// closed, and whose approvers, if it names any, include act.Approver, who isn't s. approved is zero
-// when the eligibility allowing it names none. A privileged role's counts only through s's identity
-// or its groups, as its grants do, never through the tenant's members.
-func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource, act Activation, until time.Time) (through madeThrough, approved Principal, err error) {
+// eligible checks that s may activate act.Role on on until until through keys, the principal keys
+// s holds then, so none outlasts the place in a group, or the membership, that makes s eligible. It
+// returns the eligibility that allows it and who approved: one of s's identity or of one of its
+// groups there, lasting act.Duration or longer and in force until then, whose requirement holds in
+// the request, failing closed, and whose approvers, if it names any, include act.Approver, who isn't
+// s. approved is zero when the eligibility allowing it names none. A privileged role's counts only
+// through s's identity or its groups, as its grants do, never through the tenant's members.
+func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource, act Activation, until time.Time, keys []string) (through madeThrough, approved Principal, err error) {
 	scope, manage := on.Scope(), GrantPermission(on.Type)
-	// As s will be when the activation ends, so none outlasts the place in a group, or the
-	// membership, that makes s eligible.
-	keys, _, err := a.keysAt(ctx, q, on.Tenant, s, until)
-	if err != nil {
-		return madeThrough{}, Principal{}, err
-	}
 	approvers, _, err := a.keysOf(ctx, q, on.Tenant, act.Approver)
 	if err != nil {
 		return madeThrough{}, Principal{}, err
