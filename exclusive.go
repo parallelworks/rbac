@@ -219,17 +219,18 @@ func (a *Authorizer) Conflicts(ctx context.Context, tenant string) ([]Conflict, 
 
 // excludes refuses a change, e, that leaves an identity it reaches able to hold two values of an
 // exclusive dimension: those whose grants, eligibilities, memberships or places in groups it set,
-// and those holding a custom role it redefined. Denies don't count, so lifting one is no change to
-// check. One able to hold two before the change, as after a catalog change, is refused too, as
-// the check reads the tenant as the change leaves it.
-func (a *Authorizer) excludes(ctx context.Context, tx pgx.Tx, tenant string, e ChangeEvent) error {
+// those holding a custom role it redefined, and those, by key, whose suspended memberships it
+// widened. Denies don't count, so lifting one is no change to check. One able to hold two before
+// the change, as after a catalog change, is refused too, as the check reads the tenant as the
+// change leaves it.
+func (a *Authorizer) excludes(ctx context.Context, tx pgx.Tx, tenant string, e ChangeEvent, widened []string) error {
 	gives := a.exclusiveValues(a.cfg.Catalog)
 	// The tenant's custom roles are read only for a change that can reach someone, so one granting
 	// built-in roles that give no exclusive value reads nothing more under the tenant's lock.
 	reaches := func(r Role) bool { return gives[r] != nil || isCustom(r) }
 	if !slices.ContainsFunc(e.Granted, func(g Grant) bool { return reaches(g.Role) }) &&
 		!slices.ContainsFunc(e.Eligible, func(el Eligibility) bool { return reaches(el.Role) }) &&
-		len(e.Roles)+len(e.Memberships)+len(e.Joined) == 0 {
+		len(e.Roles)+len(e.Memberships)+len(e.Joined)+len(widened) == 0 {
 		return nil
 	}
 	custom, err := a.customRoles(ctx, tx, tenant)
@@ -255,12 +256,15 @@ func (a *Authorizer) excludes(ctx context.Context, tx pgx.Tx, tenant string, e C
 		}
 	}
 	// A suspended membership holds only what the public does, so suspending one never widens what
-	// it holds, and isn't refused even where the public's grants could give two values.
+	// it holds, and isn't refused even where the public's grants could give two values; but a
+	// member's made, renewed or lifted from a guest's suspended will hold more once lifted, which
+	// lifting it would then be refused for.
 	for _, m := range e.Memberships {
 		if !m.Suspended {
 			seeds = append(seeds, m.Principal.key())
 		}
 	}
+	seeds = append(seeds, widened...)
 	for _, m := range e.Joined {
 		seeds = append(seeds, m.Principal.key())
 	}

@@ -1182,6 +1182,16 @@ var removals = map[string]bool{
 // how, the call that makes it, and hands what it changed to Config.OnChange there. Where a
 // dimension is Exclusive, it refuses a change that lets an identity hold two of its values.
 func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, how string, fn func(pgx.Tx) (ChangeEvent, error)) error {
+	return a.inTxReaching(ctx, tenant, actor, how, func(tx pgx.Tx) (ChangeEvent, []string, error) {
+		e, err := fn(tx)
+		return e, nil, err
+	})
+}
+
+// inTxReaching is inTx for a change whose exclusive values are checked for the identities, by key,
+// fn returns besides those its event names: kept out of the event, so OnChange is handed only what
+// a host can build and compare.
+func (a *Authorizer) inTxReaching(ctx context.Context, tenant string, actor Principal, how string, fn func(pgx.Tx) (ChangeEvent, []string, error)) error {
 	return a.begin(ctx, func(tx pgx.Tx) error {
 		// Taken by every change, removals too, so changes in one host transaction take their locks in
 		// one order.
@@ -1195,12 +1205,12 @@ func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, h
 		if err != nil {
 			return err
 		}
-		e, err := fn(tx)
+		e, reached, err := fn(tx)
 		if err != nil {
 			return err
 		}
 		if exclusive && !removals[how] {
-			if err := a.excludes(ctx, tx, tenant, e); err != nil {
+			if err := a.excludes(ctx, tx, tenant, e, reached); err != nil {
 				return err
 			}
 		}

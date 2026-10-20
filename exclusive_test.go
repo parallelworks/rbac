@@ -779,3 +779,79 @@ func TestHoldersListsNoOneForALabelAskingTwoExclusiveValuesOfAllOf(t *testing.T)
 		t.Fatal("the members, each holding x, are listed for a label asking y")
 	}
 }
+
+// A member's membership made or renewed suspended, or a guest's made a member's while suspended,
+// will hold more once lifted, so it is checked for exclusive values as a membership in force is:
+// otherwise it leaves a conflict no catalog change made, which lifting the suspension is refused
+// for.
+func TestASuspendedJoinIsCheckedForExclusiveValues(t *testing.T) {
+	for name, before := range map[string]func(*testing.T, *harness){
+		"no member yet": func(*testing.T, *harness) {},
+		"a guest": func(t *testing.T, h *harness) {
+			t.Helper()
+			h.guest(t, "zed")
+		},
+		"a membership that ended now": func(t *testing.T, h *harness) {
+			t.Helper()
+			h.as(t, "zed")
+			if _, err := h.pool.Exec(t.Context(), `UPDATE rbac_memberships SET expires_at = $1 WHERE tenant = 't1' AND principal = 'user:zed'`, h.now); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := labeled(t, banks)
+			ctx := t.Context()
+			before(t, h)
+			h.hold(t, "zed", "bank:a")
+			h.seed(t, grant(rbac.TenantRoot("t1"), "bank.b", rbac.Members, "t1"))
+			excluded(t, h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("zed"), Suspended: true}}))
+			if cs, err := h.authz.Conflicts(ctx, "t1"); err != nil || len(cs) > 0 {
+				t.Fatalf("Conflicts = %+v, %v", cs, err)
+			}
+		})
+	}
+}
+
+// A suspended guest's membership holds, once lifted, only what the identity's own grants and the
+// public's give, which the exclusive values count before it joins, so joining as one widens nothing
+// and isn't refused where those could give two, as after a catalog change; lifting it is.
+func TestASuspendedGuestJoinIsNotRefusedForAConflictItLeavesAsItFound(t *testing.T) {
+	h := labeled(t, func(c *rbac.Config) {
+		banks(c)
+		c.Labels[len(c.Labels)-1].Exclusive = false
+	})
+	ctx := t.Context()
+	h.hold(t, "zed", "bank:a", "bank:b")
+	cfg := h.cfg
+	cfg.Labels = slices.Clone(cfg.Labels)
+	cfg.Labels[len(cfg.Labels)-1].Exclusive = true
+	authz, err := rbac.New(h.pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zed := rbac.Membership{Principal: identity("zed"), Guest: true, Suspended: true}
+	if err := authz.SetMemberships(ctx, host, "t1", []rbac.Membership{zed}); err != nil {
+		t.Fatalf("joining as a suspended guest: %v", err)
+	}
+	zed.Suspended = false
+	excluded(t, authz.SetMemberships(ctx, host, "t1", []rbac.Membership{zed}))
+}
+
+// What OnChange is handed for a suspended join holds only what it reports, so a host can compare
+// it with an event it builds.
+func TestASuspendedJoinReportsOnlyWhatChanged(t *testing.T) {
+	h := labeled(t, banks)
+	h.events = nil
+	if err := h.authz.SetMemberships(t.Context(), host, "t1", []rbac.Membership{{Principal: identity("zed"), Suspended: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.events) != 1 {
+		t.Fatalf("events = %+v", h.events)
+	}
+	got := h.events[0]
+	want := rbac.ChangeEvent{Tenant: "t1", Actor: host, Memberships: got.Memberships, Left: got.Left}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("OnChange was handed %+v, not %+v", got, want)
+	}
+}
