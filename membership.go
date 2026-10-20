@@ -35,6 +35,11 @@ const MaxGroupDepth = 8
 // (Config.Sources) counted apart.
 const MaxPlacesInGroup = 20
 
+// MaxGroupsOfPrincipal is how many groups a principal, an identity or a group, is in directly, by
+// places in force, as every check reads each group its subject is in: those it is in from each
+// source the host owns (Config.Sources) counted apart, as for MaxPlacesInGroup.
+const MaxGroupsOfPrincipal = 1000
+
 // Membership is an identity's membership of a tenant. A member holds what it is granted there and
 // what is granted to the tenant's members; a guest only what it is granted; and a suspended one
 // keeps its grants and groups but holds only what the public does until the suspension is lifted,
@@ -195,15 +200,12 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 	kinds, ids, sources, notes := make([]string, n), make([]string, n), make([]string, n), make([]string, n)
 	guests, suspended, expires := make([]bool, n), make([]bool, n), make([]pgtype.Timestamptz, n)
 	keys := make([]string, n)
-	var suspendedMembers, ending []string
+	var ending []string
 	for i, m := range set {
 		kinds[i], ids[i], sources[i], notes[i] = string(m.Principal.Kind), m.Principal.ID, m.Source, m.Note
 		guests[i], suspended[i] = m.Guest, m.Suspended
 		expires[i] = pgtype.Timestamptz{Time: m.ExpiresAt, Valid: !m.ExpiresAt.IsZero()}
 		keys[i] = m.Principal.key()
-		if m.Suspended && !m.Guest {
-			suspendedMembers = append(suspendedMembers, keys[i])
-		}
 		if !m.ExpiresAt.IsZero() {
 			ending = append(ending, keys[i])
 		}
@@ -217,21 +219,9 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 		// would remove them, each membership held before its members as there, so the two never
 		// deadlock; and any places of an identity with no membership, which joins in none.
 		at := a.cfg.Now()
-		// A suspended member's membership widens what its identity will hold once lifted where no
-		// member's was in force: it is new, ended or a guest's. A suspended guest's never does, as the
-		// exclusive values count an identity's own grants before it joins. Read before the upsert.
-		// Here and below, each key's membership is looked up on its own: as an anti-join, a generic
-		// plan, costing the tenant's memberships by averages, reads every one. OFFSET 0 keeps the
-		// planner from making it one.
 		var widened []string
-		if a.exclusive() && len(suspendedMembers) > 0 {
-			rows, err := tx.Query(ctx, `SELECT k FROM unnest($2::text[]) AS k WHERE NOT EXISTS (SELECT FROM rbac_memberships m
-				WHERE m.tenant = $1 AND m.principal = k AND NOT m.guest AND (m.expires_at IS NULL OR m.expires_at > $3) OFFSET 0)`,
-				tenant, suspendedMembers, at)
-			if err != nil {
-				return ChangeEvent{}, nil, err
-			}
-			if widened, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
+		if a.exclusive() {
+			if widened, err = widening(ctx, tx, tenant, set, keys, at); err != nil {
 				return ChangeEvent{}, nil, err
 			}
 		}
@@ -242,7 +232,8 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 			return ChangeEvent{}, nil, err
 		}
 		// The places of each key leaving are found on its own and locked in order, as removeGroups
-		// finds and locks its own.
+		// finds and locks its own; each key's membership is looked up on its own, as in widening, and
+		// OFFSET 0 keeps a generic plan from making that an anti-join that reads every one.
 		left, err := removedWhere(ctx, a, tx, "rbac_members", memberColumns, collectMembers, lockedAnyOf("rbac_members", "ctid", placeOrder,
 			byKeys("rbac_members", "ctid", "principal", `(
 			  ARRAY(SELECT principal FROM rbac_memberships WHERE tenant = $1 AND principal = ANY($2::text[]) AND expires_at <= $3 FOR UPDATE)
@@ -276,6 +267,57 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 		e.Shortened, e.Revoked, err = a.unrest(ctx, tx, tenant, actor, r, at)
 		return e, widened, err
 	})
+}
+
+// widening reads, on tx before set is stored, the memberships in force of its identities, by keys,
+// and returns the keys of those whose memberships set widens what they hold, or will hold once a
+// suspension is lifted, which their exclusive values are checked for. A suspended membership holds
+// only what the public does, so suspending one never widens what it holds, nor does a suspended
+// guest's, as the exclusive values count an identity's own grants before it joins; but a member's
+// made, renewed or lifted from a guest's while suspended will hold more once lifted, which lifting
+// it would then be refused for. One that only ends sooner, makes a member a guest, which holds what
+// it did but what the tenant's members are granted, or changes its source or note, is a removal or
+// no change, never refused.
+func widening(ctx context.Context, tx pgx.Tx, tenant string, set []Membership, keys []string, at time.Time) ([]string, error) {
+	// Each key's membership is looked up on its own: as a join, a generic plan, costing the tenant's
+	// memberships by averages, reads every one. OFFSET 0 keeps the planner from making it one.
+	rows, err := tx.Query(ctx, `SELECT m.principal, m.guest, m.suspended, m.expires_at FROM unnest($2::text[]) AS k
+		CROSS JOIN LATERAL (SELECT principal, guest, suspended, expires_at FROM rbac_memberships
+		  WHERE tenant = $1 AND principal = k AND (expires_at IS NULL OR expires_at > $3) OFFSET 0) m`, tenant, keys, at)
+	if err != nil {
+		return nil, err
+	}
+	was := map[string]Membership{}
+	var key string
+	var row Membership
+	var expires *time.Time
+	if _, err := pgx.ForEachRow(rows, []any{&key, &row.Guest, &row.Suspended, &expires}, func() error {
+		row.ExpiresAt = time.Time{}
+		if expires != nil {
+			row.ExpiresAt = *expires
+		}
+		was[key] = row
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	var widened []string
+	for i, m := range set {
+		old, ok := was[keys[i]]
+		switch {
+		case m.Suspended && (m.Guest || ok && !old.Guest):
+		case m.Suspended:
+			widened = append(widened, keys[i])
+		case !ok || old.Guest && !m.Guest || old.Suspended || outlasts(m.ExpiresAt, old.ExpiresAt):
+			widened = append(widened, keys[i])
+		}
+	}
+	return widened, nil
+}
+
+// outlasts reports whether what ends at end, zero for never, lasts past was.
+func outlasts(end, was time.Time) bool {
+	return !was.IsZero() && (end.IsZero() || end.After(was))
 }
 
 // Memberships lists a tenant's memberships in force, by principal: of those principals, or with
@@ -381,7 +423,7 @@ func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string,
 	if a.owned[g.Source] {
 		return fmt.Errorf("%w: group %q: only the host makes groups from %s, through ImportGroups", ErrInvalid, g.ID, g.Source)
 	}
-	group, err := a.groupLabeled(ctx, tenant, g.ID, labels)
+	group, err := a.groupLabeled(ctx, tenant, g.ID, labels, false)
 	if err != nil {
 		return err
 	}
@@ -525,7 +567,7 @@ func upsertGroups(ctx context.Context, tx pgx.Tx, tenant string, actor Principal
 // grant, eligibility or deny naming one waits for it, or it reads that one. It refuses one from a
 // source the host owns, in a group from one, or with members, a place in a group or grants on it
 // from one. Deleting a group that doesn't exist does nothing, and asks Config.ResourceOf nothing of
-// it.
+// it; one the host no longer has (ErrNotFound) it reads as unlabeled, as a removal reads any scope.
 func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id string) (err error) {
 	defer a.refused(ctx, &err, tenant, actor.Principal, "DeleteGroup")
 	if !validID(tenant) || !validGroupID(id) {
@@ -559,7 +601,7 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 			return err
 		}
 		if existed {
-			if group, err = a.groupLabeled(ctx, tenant, id, labels); err != nil {
+			if group, err = a.groupLabeled(ctx, tenant, id, labels, true); err != nil {
 				return err
 			}
 		}
@@ -906,21 +948,32 @@ func (a *Authorizer) mayManageGroups(ctx context.Context, q DB, actor Subject, p
 	return nil
 }
 
-// groupLabeled returns a group as Config.ResourceOf gives it, as ChangeMembers reads the groups it
-// changes, before a change's transaction, refusing an actor its label refuses, as a change to its
-// members does: ManageGroups is the tenant's, but who can't see a group doesn't rename or delete
-// it. labels is what mayManageGroups reads the actor's label values through, and the transaction
-// checks the label again with it. Without declared labels the host isn't asked: nothing it returns
-// is checked, and a host that knows no group it hasn't made yet would refuse making one.
-func (a *Authorizer) groupLabeled(ctx context.Context, tenant, id string, labels *constrained) (Resource, error) {
+// groupLabeled returns a group as groupOf gives it, as ChangeMembers reads the groups it changes,
+// before a change's transaction, refusing an actor its label refuses, as a change to its members
+// does: ManageGroups is the tenant's, but who can't see a group doesn't rename or delete it. labels
+// is what mayManageGroups reads the actor's label values through, and the transaction checks the
+// label again with it. Without declared labels the host isn't asked: nothing it returns is checked,
+// and a host that knows no group it hasn't made yet would refuse making one.
+func (a *Authorizer) groupLabeled(ctx context.Context, tenant, id string, labels *constrained, removing bool) (Resource, error) {
 	if len(a.labels) == 0 {
 		return Resource{Tenant: tenant, Type: GroupScope, ID: id}, nil
 	}
-	group, _, err := a.hostResource(ctx, tenant, Scope{Type: GroupScope, ID: id})
+	group, _, err := a.groupOf(ctx, tenant, id, removing)
 	if err != nil {
 		return Resource{}, err
 	}
 	return group, a.labelCheck(ctx, a.db, labels)(group, ManageGroups)
+}
+
+// groupOf returns a group as Config.ResourceOf gives it: with removing, as for a change that only
+// takes access away from its members, one the host no longer has (ErrNotFound) as unlabeled, as a
+// removal reads any scope, and gone set.
+func (a *Authorizer) groupOf(ctx context.Context, tenant, id string, removing bool) (group Resource, gone bool, err error) {
+	group, _, err = a.hostResource(ctx, tenant, Scope{Type: GroupScope, ID: id})
+	if removing && errors.Is(err, ErrNotFound) {
+		return Resource{Tenant: tenant, Type: GroupScope, ID: id}, true, nil
+	}
+	return group, false, err
 }
 
 // tenantLabels is what the constraints remove of actor's label values in a tenant, for
@@ -1028,8 +1081,10 @@ func keyedAll(members []Member) error {
 // ImportMembers adds members to a tenant's groups, from their sources, or changes their expiry or
 // note, as actor: the host's own write, as for a directory it syncs from. A member identity is a
 // member or guest of the tenant, and a member group exists; nesting a group can't make one contain
-// itself, nor a chain of more than MaxGroupDepth groups. Config.ValidateGrant is asked about each
-// grant and eligibility a member gains, as with ChangeMembers.
+// itself, nor a chain of more than MaxGroupDepth groups; and a principal is in a group at most
+// MaxPlacesInGroup times, and in at most MaxGroupsOfPrincipal groups. Config.ValidateGrant is asked
+// about each grant and eligibility a member gains, as with ChangeMembers, so about none of a place
+// made to end sooner, or whose note alone changes.
 func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant string, members []Member) (err error) {
 	defer a.refused(ctx, &err, tenant, actor, "ImportMembers")
 	if !validID(tenant) {
@@ -1048,7 +1103,7 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 	if err != nil {
 		return err
 	}
-	rc, err := a.reachOf(ctx, a.db, tenant, set, nil, false)
+	rc, err := a.reachOf(ctx, a.db, tenant, set, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -1058,27 +1113,28 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 	}
 	scopes, principals := memberLocks(set)
 	principals = append(principals, rc.locks()...)
-	return a.inTx(ctx, tenant, actor, "ImportMembers", func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTxReaching(ctx, tenant, actor, "ImportMembers", func(tx pgx.Tx) (ChangeEvent, []string, error) {
 		if err := lockAll(ctx, tx, tenant, scopes, principals); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
-		if err := a.stillReached(ctx, tx, tenant, set, nil, rc, true); err != nil {
-			return ChangeEvent{}, err
+		locked, err := a.stillReached(ctx, tx, tenant, set, nil, rc, true)
+		if err != nil {
+			return ChangeEvent{}, nil, err
 		}
 		if err := a.stillStanding(ctx, tx, tenant, stand); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
 		now := a.cfg.Now()
 		r, err := a.restingIn(ctx, tx, tenant, set, expiring(set), now)
 		if err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
 		e := ChangeEvent{}
-		if e.Joined, err = a.join(ctx, tx, tenant, actor, set); err != nil {
-			return ChangeEvent{}, err
+		if e.Joined, err = a.join(ctx, tx, tenant, actor, set, locked.placed); err != nil {
+			return ChangeEvent{}, nil, err
 		}
 		e.Shortened, e.Revoked, err = a.unrest(ctx, tx, tenant, actor, r, now)
-		return e, err
+		return e, locked.joining(e.Joined), err
 	})
 }
 
@@ -1124,8 +1180,9 @@ func memberLocks(members []Member) (scopes, principals []string) {
 
 // join stores members memberSet checked, under the change's locks, and returns those it added or
 // changed: refusing an identity that isn't a member or guest of the tenant, a group that doesn't
-// exist, and nesting that makes a cycle or too long a chain.
-func (a *Authorizer) join(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, set []Member) ([]Member, error) {
+// exist, nesting that makes a cycle or too long a chain, and places past the bounds, but those kept
+// (placed.kept), which last no longer than they did.
+func (a *Authorizer) join(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, set []Member, kept placed) ([]Member, error) {
 	groups, identities := map[string]bool{}, map[string]bool{}
 	var nested []Member
 	for _, m := range set {
@@ -1163,10 +1220,56 @@ func (a *Authorizer) join(ctx context.Context, tx pgx.Tx, tenant string, actor P
 	if err != nil {
 		return nil, err
 	}
-	if err := a.placesBounded(ctx, tx, tenant, joined); err != nil {
+	if err := a.placesBounded(ctx, tx, tenant, kept.gaining(joined)); err != nil {
+		return nil, err
+	}
+	if err := a.groupsBounded(ctx, tx, tenant, kept.gaining(joined)); err != nil {
 		return nil, err
 	}
 	return joined, a.nestable(ctx, tx, tenant, nested)
+}
+
+// groupsBounded refuses places just stored that leave a principal in more than MaxGroupsOfPrincipal
+// groups: under the change's locks, which every change to the principal's places takes, once they
+// are stored, those in force the change didn't touch included. Those from each source the host
+// owns count apart, as placesBounded counts, so neither the tenant's admins nor the host can fill
+// the bound to keep the other's from being made.
+func (a *Authorizer) groupsBounded(ctx context.Context, tx pgx.Tx, tenant string, stored []Member) error {
+	if len(stored) == 0 {
+		return nil
+	}
+	principals, sources := make([]string, len(stored)), make([]string, len(stored))
+	for i, m := range stored {
+		principals[i], sources[i] = m.Principal.key(), m.Source
+	}
+	// Each principal's places by source, the others' together, counted on its own, as byKey reads
+	// its rows, from the index on the principal alone, which holds their sources.
+	rows, err := tx.Query(ctx, `
+		SELECT t.p, t.s FROM (SELECT DISTINCT p, CASE WHEN s = ANY($4::text[]) THEN s ELSE '' END
+		  FROM unnest($2::text[], $3::text[]) AS u(p, s)) AS t(p, s) CROSS JOIN LATERAL (
+		  SELECT count(DISTINCT group_id) AS n FROM rbac_members WHERE tenant = $1 AND principal = t.p
+		    AND (expires_at IS NULL OR expires_at > $5)
+		    AND CASE WHEN t.s = '' THEN (source = ANY($4::text[])) IS NOT TRUE ELSE source = t.s END) m
+		WHERE m.n > $6
+		ORDER BY t.p COLLATE "C", t.s COLLATE "C"`,
+		tenant, principals, sources, slices.Sorted(maps.Keys(a.owned)), a.cfg.Now(), MaxGroupsOfPrincipal)
+	if err != nil {
+		return err
+	}
+	over, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (error, error) {
+		var principal, source string
+		if err := row.Scan(&principal, &source); err != nil {
+			return nil, err
+		}
+		if source != "" {
+			return fmt.Errorf("%w: %s is in at most %d groups from %s", ErrInvalid, principal, MaxGroupsOfPrincipal, source), nil
+		}
+		return fmt.Errorf("%w: %s is in at most %d groups", ErrInvalid, principal, MaxGroupsOfPrincipal), nil
+	})
+	if err != nil {
+		return err
+	}
+	return errors.Join(over...)
 }
 
 // placesBounded refuses places just stored that leave a principal in their group more than
@@ -1220,10 +1323,11 @@ func (a *Authorizer) placesBounded(ctx context.Context, tx pgx.Tx, tenant string
 // exempt from the denies those are exempt from, as a removed member is from the denies those name,
 // which the actor must be able to set. A removed member loses the rest, which only the label of
 // each scope it is on refuses the actor, as Apply refuses a revoke there; a place made to end
-// sooner gains nothing: it is a removal then, checked as one now. Each group changed, and each
-// scope reached, is checked as Config.ResourceOf returns it. Members from a source the host owns,
-// and the members of a group from one, only the host changes, and what ImportMembers refuses, this
-// does.
+// sooner gains nothing: it is a removal then, checked as one now; nor does one whose note alone
+// changes. Each group changed, and each scope reached, is checked as Config.ResourceOf returns it,
+// a group no member gains a place in that the host no longer has (ErrNotFound) as unlabeled.
+// Members from a source the host owns, and the members of a group from one, only the host changes,
+// and what ImportMembers refuses, this does.
 func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant string, add, remove []Member) (err error) {
 	defer a.refused(ctx, &err, tenant, actor.Principal, "ChangeMembers")
 	if !validID(tenant) {
@@ -1254,12 +1358,18 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 	if err := errors.Join(owned...); err != nil {
 		return err
 	}
-	groups := memberGroups(slices.Concat(set, remove))
+	left, err := a.placesLeft(ctx, a.db, tenant, set, remove)
+	if err != nil {
+		return err
+	}
+	groups, gaining := memberGroups(slices.Concat(set, remove)), memberGroups(left.gaining(set))
 	// As Config.ResourceOf gives them, so a constraint or deny reading a group's attributes sees
-	// what the host's own check of GroupMembers would.
-	targets := make([]Resource, len(groups))
+	// what the host's own check of GroupMembers would; a group no member gains a place in, as a
+	// removal reads it.
+	targets, gone := make([]Resource, len(groups)), map[string]bool{}
 	for i, g := range groups {
-		if targets[i], _, err = a.hostResource(ctx, tenant, Scope{Type: GroupScope, ID: g}); err != nil {
+		_, gains := slices.BinarySearch(gaining, g)
+		if targets[i], gone[g], err = a.groupOf(ctx, tenant, g, !gains); err != nil {
 			return err
 		}
 	}
@@ -1271,7 +1381,7 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 	if err := a.notOwnedGroups(ctx, a.db, tenant, groups); err != nil {
 		return err
 	}
-	rc, err := a.reachOf(ctx, a.db, tenant, set, remove, true)
+	rc, err := a.reachOf(ctx, a.db, tenant, set, remove, &left)
 	if err != nil {
 		return err
 	}
@@ -1285,45 +1395,52 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 	}
 	scopes, principals := memberLocks(slices.Concat(set, remove))
 	principals = append(principals, rc.locks()...)
-	return a.inTx(ctx, tenant, actor.Principal, "ChangeMembers", func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTxReaching(ctx, tenant, actor.Principal, "ChangeMembers", func(tx pgx.Tx) (ChangeEvent, []string, error) {
 		if err := lockAll(ctx, tx, tenant, scopes, principals); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
-		if err := a.stillReached(ctx, tx, tenant, set, remove, rc, false); err != nil {
-			return ChangeEvent{}, err
+		locked, err := a.stillReached(ctx, tx, tenant, set, remove, rc, false)
+		if err != nil {
+			return ChangeEvent{}, nil, err
+		}
+		// A group the host no longer has was read as unlabeled, as no member gained a place in it.
+		for _, m := range locked.gaining(set) {
+			if gone[m.Group] {
+				return ChangeEvent{}, nil, fmt.Errorf("%w: group %q, which the host no longer has, gains a member: a place this change keeps ended while it waited; try again", ErrConflict, m.Group)
+			}
 		}
 		if err := a.stillStanding(ctx, tx, tenant, stand); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
 		// The host's groups only the host changes, members and all.
 		if err := a.notOwnedGroups(ctx, tx, tenant, groups); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
 		labels.seal()
 		if err := a.mayManageGroups(ctx, tx, actor, GroupMembers, targets, labels); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
 		if err := a.mayReachAgain(ctx, tx, actor, checks, labels); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
 		now := a.cfg.Now()
 		r, err := a.restingIn(ctx, tx, tenant, slices.Concat(remove, set), slices.Concat(remove, expiring(set)), now)
 		if err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
 		var e ChangeEvent
 		if len(remove) > 0 {
 			if e.Left, err = a.leave(ctx, tx, tenant, remove); err != nil {
-				return ChangeEvent{}, err
+				return ChangeEvent{}, nil, err
 			}
 		}
 		if len(set) > 0 {
-			if e.Joined, err = a.join(ctx, tx, tenant, actor.Principal, set); err != nil {
-				return ChangeEvent{}, err
+			if e.Joined, err = a.join(ctx, tx, tenant, actor.Principal, set, locked.placed); err != nil {
+				return ChangeEvent{}, nil, err
 			}
 		}
 		e.Shortened, e.Revoked, err = a.unrest(ctx, tx, tenant, actor.Principal, r, now)
-		return e, err
+		return e, locked.joining(e.Joined), err
 	})
 }
 
@@ -1343,16 +1460,22 @@ type reach struct {
 	held       []revalidation
 	approving  []approving
 	denies     []Deny
-	// ending is the members added, by memberKey, that end a membership in force sooner than it
-	// would: they leave the group then, as removing them does now.
-	ending map[string]bool
+	placed
+	// labeled is whether the host declares labels, which alone check what a member leaving loses:
+	// without them, a grant made to its group meanwhile changes nothing the change checked.
+	labeled bool
+}
+
+// placed is what a change leaves of the places in force of the members it names (placesLeft).
+type placed struct {
+	// kept is the members added, by memberKey, whose place in force lasts as long already: they
+	// make it end sooner, or change only its note, so gain nothing. One ending sooner leaves the
+	// group then, as removing it does now.
+	kept map[string]bool
 	// leaves is those of them and of the members removed, by memberKey, that leave their group: a
 	// place in force ends, and no other of theirs there, from another source, keeps them in it as
 	// long as it would have.
 	leaves map[string]bool
-	// labeled is whether the host declares labels, which alone check what a member leaving loses:
-	// without them, a grant made to its group meanwhile changes nothing the change checked.
-	labeled bool
 }
 
 // memberKey is what makes a member one member: its group, principal and source.
@@ -1364,9 +1487,10 @@ type approving struct {
 	approvers []Principal
 }
 
-// reachOf reads, on q, what adding add and removing remove reaches, in force at now, and with
-// ending, which of add end a membership sooner and which members leave their groups.
-func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remove []Member, ending bool) (reach, error) {
+// reachOf reads, on q, what adding add and removing remove reaches, in force at now, what they
+// leave of their members' places, as left gives it or where nil as read, and of what the groups
+// hold, approve and are named or exempt in, all a change checks.
+func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remove []Member, left *placed) (reach, error) {
 	r := reach{up: map[string]map[string]bool{}, labeled: len(a.labels) > 0}
 	groups := memberGroups(slices.Concat(add, remove))
 	if len(groups) == 0 {
@@ -1397,6 +1521,27 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 	}
 	r.stored, r.up = r.up, r.nested(add)
 	keys := slices.Sorted(maps.Keys(reached))
+	if left == nil {
+		read, err := a.placesLeft(ctx, q, tenant, add, remove)
+		if err != nil {
+			return reach{}, err
+		}
+		left = &read
+	}
+	r.placed = *left
+	// Without declared labels, a member leaving loses nothing a change checks but the denies naming
+	// its groups, which then no longer bind it: where none gains, as none is added but to end a place
+	// sooner or change its note, those alone are read, not what the groups hold.
+	if !r.labeled && len(r.gaining(add)) == 0 {
+		rows, err = q.Query(ctx, `SELECT `+denyColumns+` FROM rbac_denies WHERE `+naming("principals", "$2")+` ORDER BY scope, id`, tenant, keys)
+		if err != nil {
+			return reach{}, err
+		}
+		if r.denies, err = collectDenies(rows); err != nil {
+			return reach{}, err
+		}
+		return r, nil
+	}
 	rows, err = q.Query(ctx, `SELECT `+grantColumns+` FROM rbac_grants
 		WHERE tenant = $1 AND principal = ANY($2::text[]) AND (expires_at IS NULL OR expires_at > $3) ORDER BY id`, tenant, keys, now)
 	if err != nil {
@@ -1459,11 +1604,6 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 			r.approving = append(r.approving, approving{v, e.Approvers})
 		}
 	}
-	if ending {
-		if r.ending, r.leaves, err = a.placesLeft(ctx, q, tenant, add, remove); err != nil {
-			return reach{}, err
-		}
-	}
 	return r, nil
 }
 
@@ -1515,24 +1655,19 @@ func (r reach) nested(add []Member) map[string]map[string]bool {
 }
 
 // placesLeft reads, on q, the places in force in their groups of the principals add and remove
-// name, and returns, by memberKey, those of add that end a place sooner than it would end
-// (reach.ending), and those of them and of remove that leave their group (reach.leaves): whose
-// place in force ends, and that keep no other there, from another source, as long as that place
-// would have lasted, as the change leaves the others.
-func (a *Authorizer) placesLeft(ctx context.Context, q DB, tenant string, add, remove []Member) (ending, leaves map[string]bool, err error) {
+// name, and returns, by memberKey, those of add whose place lasts as long already (placed.kept),
+// and those of them and of remove that leave their group (placed.leaves): whose place in force
+// ends, and that keep no other there, from another source, as long as that place would have
+// lasted, as the change leaves the others.
+func (a *Authorizer) placesLeft(ctx context.Context, q DB, tenant string, add, remove []Member) (placed, error) {
 	type pair struct{ group, principal string }
 	pairOf := func(m Member) pair { return pair{m.Group, m.Principal.key()} }
 	pairs := map[pair]bool{}
-	for _, m := range add {
-		if !m.ExpiresAt.IsZero() {
-			pairs[pairOf(m)] = true
-		}
-	}
-	for _, m := range remove {
+	for _, m := range slices.Concat(add, remove) {
 		pairs[pairOf(m)] = true
 	}
 	if len(pairs) == 0 {
-		return nil, nil, nil
+		return placed{}, nil
 	}
 	var groups, principals []string
 	for p := range pairs {
@@ -1546,7 +1681,7 @@ func (a *Authorizer) placesLeft(ctx context.Context, q DB, tenant string, add, r
 		    AND (expires_at IS NULL OR expires_at > $4) OFFSET 0) m`,
 		tenant, groups, principals, now)
 	if err != nil {
-		return nil, nil, err
+		return placed{}, err
 	}
 	// Each pair's places, by source, as the change leaves them: until when, zero for never.
 	places := map[pair]map[string]time.Time{}
@@ -1563,7 +1698,7 @@ func (a *Authorizer) placesLeft(ctx context.Context, q DB, tenant string, add, r
 		}
 		return nil
 	}); err != nil {
-		return nil, nil, err
+		return placed{}, err
 	}
 	stored := maps.Clone(places)
 	for p, ps := range stored {
@@ -1588,38 +1723,40 @@ func (a *Authorizer) placesLeft(ctx context.Context, q DB, tenant string, add, r
 		}
 		return false
 	}
-	ending, leaves = map[string]bool{}, map[string]bool{}
+	p := placed{kept: map[string]bool{}, leaves: map[string]bool{}}
 	for _, m := range add {
 		was, ok := stored[pairOf(m)][m.Source]
-		if m.ExpiresAt.IsZero() || !ok || !was.IsZero() && !was.After(m.ExpiresAt) {
+		if !ok || outlasts(m.ExpiresAt, was) {
 			continue
 		}
-		ending[memberKey(m)] = true
-		if !keeps(m, was) {
-			leaves[memberKey(m)] = true
+		p.kept[memberKey(m)] = true
+		if outlasts(was, m.ExpiresAt) && !keeps(m, was) {
+			p.leaves[memberKey(m)] = true
 		}
 	}
 	for _, m := range remove {
 		if was, ok := stored[pairOf(m)][m.Source]; ok && !keeps(m, was) {
-			leaves[memberKey(m)] = true
+			p.leaves[memberKey(m)] = true
 		}
 	}
-	return ending, leaves, nil
+	return p, nil
 }
 
-// gaining is the members added that gain what their groups hold: all but those added to end sooner,
-// which gain nothing.
-func (r reach) gaining(add []Member) []Member {
-	if len(r.ending) == 0 {
-		return add
+// gaining is the members added that gain what their groups hold: all but those whose place lasts
+// as long already, which gain nothing.
+func (p placed) gaining(add []Member) []Member {
+	return slices.DeleteFunc(slices.Clone(add), func(m Member) bool { return p.kept[memberKey(m)] })
+}
+
+// joining is the keys of the principals of joined, the members a change stored, whose places
+// widen what they hold, which their exclusive values are checked for: all but those whose place
+// lasted as long already, which gain nothing.
+func (p placed) joining(joined []Member) []string {
+	var keys []string
+	for _, m := range p.gaining(joined) {
+		keys = append(keys, m.Principal.key())
 	}
-	var out []Member
-	for _, m := range add {
-		if !r.ending[memberKey(m)] {
-			out = append(out, m)
-		}
-	}
-	return out
+	return keys
 }
 
 // leaving is the members that leave their groups: those removed, and those added to end sooner,
@@ -1758,27 +1895,35 @@ func (r reach) footprint(add, remove []Member, gains bool) map[reachKey]RoleDefi
 // access it didn't when it was checked and the host asked about it before the transaction, or one
 // of a role widened since, or that reaches a group it didn't then. With gains, as for the host's
 // write, which is checked only as the host is asked about what members gain, it compares only
-// those.
-func (a *Authorizer) stillReached(ctx context.Context, tx pgx.Tx, tenant string, add, remove []Member, was reach, gains bool) error {
-	now, err := a.reachOf(ctx, tx, tenant, add, remove, !gains)
+// those. It returns what the change reaches under the locks.
+func (a *Authorizer) stillReached(ctx context.Context, tx pgx.Tx, tenant string, add, remove []Member, was reach, gains bool) (reach, error) {
+	now, err := a.reachOf(ctx, tx, tenant, add, remove, nil)
 	if err != nil {
-		return err
+		return reach{}, err
 	}
 	// A group nested meanwhile above one the change reaches is one whose lock it doesn't hold, so
 	// a grant to it could commit without the host asked about what the members gain.
 	locked := was.locks()
 	for _, k := range now.locks() {
 		if _, ok := slices.BinarySearch(locked, k); !ok {
-			return fmt.Errorf("%w: the groups changed are now in %s, which this change doesn't lock; try again", ErrConflict, k)
+			return reach{}, fmt.Errorf("%w: the groups changed are now in %s, which this change doesn't lock; try again", ErrConflict, k)
+		}
+	}
+	// A place kept then that ended meanwhile is a join now, which neither the host nor the actor's
+	// authority was asked about for its member: the footprint, by group, can't tell it from another
+	// member gaining the same there.
+	for _, m := range add {
+		if k := memberKey(m); was.kept[k] && !now.kept[k] && len(now.footprint([]Member{m}, nil, gains)) > 0 {
+			return reach{}, fmt.Errorf("%w: %s's place in group %q, which this change keeps, ended while it waited; try again", ErrConflict, m.Principal.key(), m.Group)
 		}
 	}
 	before := was.footprint(add, remove, gains)
 	for k, role := range now.footprint(add, remove, gains) {
 		if old, ok := before[k]; !ok || widens(old, role) {
-			return fmt.Errorf("%w: what group %q holds changed while this change waited for it; try again", ErrConflict, k.group)
+			return reach{}, fmt.Errorf("%w: what group %q holds changed while this change waited for it; try again", ErrConflict, k.group)
 		}
 	}
-	return nil
+	return now, nil
 }
 
 // as is v, a group's grant or eligibility, as the one m gains by joining it or a group in it, as

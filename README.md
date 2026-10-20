@@ -146,15 +146,16 @@ names the scopes conditional ones reach, to check one by one.
   any grant or eligibility on the tenant and under any condition, directly, through its groups, as
   one of the tenant's members or the public, or by its own grants before it joins, is refused with
   `ErrInvalid`; denies don't count, and removing a grant, an eligibility, a membership or a place in
-  a group, or suspending a membership, is never refused. Where a dimension is exclusive, a tenant's
-  changes run in turn, so two can't each give one value. The check reads every identity a change
-  reaches, so a grant to the tenant's members or the public reads every member. A subject whose
-  grants could give it two anyway, as after a catalog change, holds none of them, whatever the
-  request, a constraint or a deny removes: checks and searches of its labels and of the values
-  themselves refuse it, and it can't hand them on. A change reaching it is refused until a removal
-  leaves it one; `Conflicts` lists them. A role giving two of them is refused. An `Ordered`
-  dimension's higher values include the lower, so it isn't exclusive, and in an `AllOf` one a label
-  naming two is one no one can read, as data that joins two parties is.
+  a group, making a membership or a place end sooner, making a member a guest, or suspending a
+  membership, is never refused. Where a dimension is exclusive, a tenant's changes run in turn, so
+  two can't each give one value. The check reads every identity a change reaches, so a grant to the
+  tenant's members or the public reads every member. A subject whose grants could give it two
+  anyway, as after a catalog change, holds none of them, whatever the request, a constraint or a
+  deny removes: checks and searches of its labels and of the values themselves refuse it, and it
+  can't hand them on. A change reaching it is refused until a removal leaves it one; `Conflicts`
+  lists them. A role giving two of them is refused. An `Ordered` dimension's higher values include
+  the lower, so it isn't exclusive, and in an `AllOf` one a label naming two is one no one can read,
+  as data that joins two parties is.
 - **Conditions:** a grant can carry a CEL expression over the subject's, the resource's and the
   request's attributes (`Subject.Attributes`, `Resource.Attributes`, `rbac.WithRequest`), the time
   and the action. It gives its role only where the expression holds; one that fails is false.
@@ -249,17 +250,19 @@ names the scopes conditional ones reach, to check one by one.
   (`rbac.ViaMembership`); it approves what the group approves, which the actor must be able to set;
   and it is exempt from the denies the group is exempt from, as a removed member is from those
   naming it, which the actor must be able to set. A place made to end sooner gains nothing: it is a
-  removal then, checked as one now. So whoever manages a group that holds, approves and is in no
-  deny changes its members freely, and one holding a role only if they could grant that role
-  themselves. `Config.ResourceOf` gives the package the tenant, which `SetGroup` and `DeleteGroup`
-  check `rbac.ManageGroups` on, and the groups, which `ChangeMembers` checks `rbac.GroupMembers`
-  on and `SetGroup` and `DeleteGroup` the label of, each with its constraints and label, and the
-  containers, label and attributes of the scopes a group's access is on; a host without it
-  declares no labels and resource attributes as none, and for access below the tenant, no
-  containers. For a scope the host no longer has, as a resource deleted without `DeleteScopes`, it
-  returns `rbac.ErrNotFound`, or an error wrapping it: a change that only takes access away there,
-  as a member leaving a group with access on it or `DeleteRole` deleting a role granted on it,
-  reads it as unlabeled, and any other change fails with the error.
+  removal then, checked as one now; nor does one whose note alone changes. So whoever manages a
+  group that holds, approves and is in no deny changes its members freely, and one holding a role
+  only if they could grant that role themselves. `Config.ResourceOf` gives the package the tenant,
+  which `SetGroup` and `DeleteGroup` check `rbac.ManageGroups` on, and the groups, which
+  `ChangeMembers` checks `rbac.GroupMembers` on and `SetGroup` and `DeleteGroup` the label of, each
+  with its constraints and label, and the containers, label and attributes of the scopes a group's
+  access is on; a host without it declares no labels and resource attributes as none, and for
+  access below the tenant, no containers. For a scope the host no longer has, as a resource deleted
+  without `DeleteScopes`, it returns `rbac.ErrNotFound`, or an error wrapping it: a change that only
+  takes access away there, as a member leaving a group with access on it or the group itself, a
+  place in the group made to end sooner, `DeleteGroup`, or `DeleteRole` deleting, or `SetRole`
+  narrowing, a role granted on it, reads it as unlabeled, and any other change fails with the
+  error.
 - **Privileged roles:** a role the catalog marks `Privileged`, or one that changes access, is
   privileged: it is never granted to the tenant's members, and gives nothing through them, as
   after a catalog change.
@@ -446,14 +449,15 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   grants on any type.
 - **Limits:** a change takes at most `rbac.MaxBindings` bindings; a principal holds a role on a
   scope at most `rbac.MaxGrantsPerRole` times, and is in a group at most `rbac.MaxPlacesInGroup`
-  times, by source, from each source the host owns apart; a scope holds at most `rbac.MaxDenies`
-  denies; a tenant has at most `rbac.MaxCustomRoles` custom roles; an id is at most `rbac.MaxID`
-  bytes. The others are exported beside them. Lists have no limit or cursor, so what one returns
-  grows with what it lists: `Memberships` of a whole tenant with its members and guests, `Groups`
-  with its groups, `Members` with a group's members, `Holders` with who holds the permission,
-  `Grants` and `Eligibilities` on the tenant's scope with what is granted there, `Reach.Scopes`
-  with the scopes a subject's grants are on, and `Conflicts` with the identities in conflict. In a
-  large tenant, ask for less: `Memberships` of named principals, `Grants` of one principal.
+  times, by source, and in at most `rbac.MaxGroupsOfPrincipal` groups, from each source the host
+  owns apart; a scope holds at most `rbac.MaxDenies` denies; a tenant has at most
+  `rbac.MaxCustomRoles` custom roles; an id is at most `rbac.MaxID` bytes. The others are exported
+  beside them. Lists have no limit or cursor, so what one returns grows with what it lists:
+  `Memberships` of a whole tenant with its members and guests, `Groups` with its groups, `Members`
+  with a group's members, `Holders` with who holds the permission, `Grants` and `Eligibilities` on
+  the tenant's scope with what is granted there, `Reach.Scopes` with the scopes a subject's grants
+  are on, and `Conflicts` with the identities in conflict. In a large tenant, ask for less:
+  `Memberships` of named principals, `Grants` of one principal.
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
   to run on a schedule, passing over what a change holds until the next run.
 

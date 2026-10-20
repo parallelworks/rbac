@@ -423,10 +423,194 @@ func TestAPrincipalIsInAGroupABoundedNumberOfTimes(t *testing.T) {
 	if err := h.authz.ChangeMembers(ctx, manager, "t1", again, nil); err != nil {
 		t.Fatalf("a new note at the limit: %v", err)
 	}
+	// Past it, as written around the package, a place made to end sooner, or whose note alone
+	// changes, adds none.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, source) VALUES ('t1', 'devs', 'user', 'u', 'past')`); err != nil {
+		t.Fatal(err)
+	}
+	again[0].Note = "past the limit"
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", again, nil); err != nil {
+		t.Fatalf("a new note past the limit: %v", err)
+	}
+	again[0].ExpiresAt = again[0].ExpiresAt.Add(-time.Minute)
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", again, nil); err != nil {
+		t.Fatalf("a place made to end sooner past the limit: %v", err)
+	}
+	again[0].ExpiresAt = again[0].ExpiresAt.Add(time.Hour)
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", again, nil); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a place made to last longer past the limit: %v", err)
+	}
+	if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_members WHERE tenant = 't1' AND source = 'past'`); err != nil {
+		t.Fatal(err)
+	}
 	// Places that have ended don't count.
 	h.now = h.now.Add(time.Duration(rbac.MaxPlacesInGroup) * time.Hour)
 	if err := h.authz.ChangeMembers(ctx, manager, "t1", until(rbac.MaxPlacesInGroup, 1), nil); err != nil {
 		t.Fatalf("a place once the others ended: %v", err)
+	}
+}
+
+func TestAPrincipalIsInABoundedNumberOfGroups(t *testing.T) {
+	h := grouped(t, func(c *rbac.Config) { c.Sources = []string{"directory"} })
+	ctx := t.Context()
+	h.groups(t, "inner", "more")
+	h.join(t, "u")
+	// u and inner are each in as many groups as they may be, for an hour, written around the hooks.
+	if _, err := h.pool.Exec(ctx, `WITH g AS (INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'g' || i FROM generate_series(1, $1::int) i RETURNING id)
+		INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, expires_at)
+		SELECT 't1', id, k, p, $2 FROM g, (VALUES ('user', 'u'), ('group', 'inner')) AS m(k, p)`, rbac.MaxGroupsOfPrincipal, h.now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	manager := h.as(t, "manager")
+	in := func(group string, p rbac.Principal, source string) []rbac.Member {
+		return []rbac.Member{{Group: group, Principal: p, Source: source}}
+	}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", in("more", identity("u"), ""), nil); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("joining a group past the limit: %v", err)
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t1", in("more", identity("u"), "")); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("an import past the limit: %v", err)
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t1", in("more", groupOf("inner"), "")); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("nesting a group past the limit: %v", err)
+	}
+	// The host's own count apart, so the tenant's admins can't keep them from being made.
+	if err := h.authz.ImportMembers(ctx, host, "t1", in("more", identity("u"), "directory")); err != nil {
+		t.Errorf("a place from the host's source at the limit: %v", err)
+	}
+	// Another place in a group it is in is in no more groups.
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", in("g1", identity("u"), "other"), nil); err != nil {
+		t.Errorf("another place in a group at the limit: %v", err)
+	}
+	// Past it, as written around the package, a place made to end sooner, or whose note alone
+	// changes, is in no more groups either.
+	h.groups(t, "past")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'past', 'user', 'u')`); err != nil {
+		t.Fatal(err)
+	}
+	place := []rbac.Member{{Group: "g2", Principal: identity("u"), ExpiresAt: h.now.Add(30 * time.Minute)}}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", place, nil); err != nil {
+		t.Errorf("a place made to end sooner past the limit: %v", err)
+	}
+	place[0].Note = "past the limit"
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", place, nil); err != nil {
+		t.Errorf("a new note past the limit: %v", err)
+	}
+	place[0].ExpiresAt = h.now.Add(45 * time.Minute)
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", place, nil); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("a place made to last longer past the limit: %v", err)
+	}
+	if err := h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "past", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	// Places that have ended don't count.
+	h.now = h.now.Add(time.Hour)
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", in("more", identity("u"), ""), nil); err != nil {
+		t.Errorf("a group once the others' places ended: %v", err)
+	}
+}
+
+// A change adding a place counts the groups its principal is in from the index on the principal
+// alone, its source included, so it reads none of the rows of the places the principal has.
+func TestCountingAPrincipalsGroupsReadsTheIndexAlone(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	h.groups(t, "extra")
+	h.join(t, "u")
+	manager := h.as(t, "manager")
+	// u is in all the groups it may be in but one, each of a hundred members, so its place in each
+	// is on a page of the others'.
+	in := rbac.MaxGroupsOfPrincipal - 1
+	for _, q := range []string{
+		`INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'g' || i FROM generate_series(1, $1::int) i`,
+		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+		 SELECT 't1', 'g' || i, 'user', CASE WHEN j = 0 THEN 'u' ELSE 'o' || j END FROM generate_series(1, $1::int) i, generate_series(0, 99) j
+		 ORDER BY i, j`,
+	} {
+		if _, err := h.pool.Exec(ctx, q, in); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// So the visibility map lets a scan of an index skip the rows. VACUUM marks none visible to all
+	// while an older snapshot elsewhere in the database, such as another run's, is open.
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(time.Second) {
+		if _, err := h.pool.Exec(ctx, `VACUUM (ANALYZE) rbac_members`); err != nil {
+			t.Fatal(err)
+		}
+		var visible bool
+		if err := h.pool.QueryRow(ctx, `SELECT relallvisible >= relpages FROM pg_class WHERE oid = 'rbac_members'::regclass`).Scan(&visible); err != nil {
+			t.Fatal(err)
+		}
+		if visible {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Skip("an older snapshot elsewhere in the database keeps rbac_members' rows from being visible to all")
+		}
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// The pages of the table itself, not its indexes: its rows and its visibility map.
+	rows := func() int64 {
+		t.Helper()
+		var n int64
+		if err := tx.QueryRow(ctx, `SELECT pg_stat_get_xact_blocks_fetched('rbac_members'::regclass)`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	start := rows()
+	if err := h.authz.WithTx(tx).ChangeMembers(ctx, manager, "t1", []rbac.Member{{Group: "extra", Principal: identity("u")}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if read := rows() - start; read > int64(in/10) {
+		t.Errorf("adding a place for a principal in %d groups read %d pages of the table's rows", in, read)
+	}
+}
+
+// Migrating the index on the principal waits for a change in flight that has read the places and
+// then writes one, as a change to members does under its locks, rather than deadlock with it.
+func TestMigratingTheMembersIndexWaitsForAChangeInFlight(t *testing.T) {
+	pool := pgtest.Open(t, "")
+	ctx := t.Context()
+	migrateFiles(t, pool, "", "0014")
+	if _, err := pool.Exec(ctx, `INSERT INTO rbac_groups (tenant, id) VALUES ('t1', 'crew')`); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = writer.Rollback(ctx) }()
+	var pid int
+	if err := writer.QueryRow(ctx, `SELECT pg_backend_pid() FROM rbac_members WHERE tenant = 't1' AND principal = 'user:u' UNION ALL SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- applyMigrations(ctx, pool, pgx.ReadCommitted, "0014", "") }()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		var blocked bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))`, pid).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("migrating never waited for the change")
+		}
+	}
+	if _, err := writer.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'crew', 'user', 'u')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("migrating while a change that read the places writes one: %v", err)
 	}
 }
 
@@ -2928,9 +3112,24 @@ func TestEndingAPlaceSoonerGrantsNothing(t *testing.T) {
 	if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", sooner("outsider"), nil); err != nil {
 		t.Fatalf("ending the place of one the host refuses any grant sooner: %v", err)
 	}
+	// Nor is changing only the note of a place: here u's, ending as it does now.
+	noted := sooner("u")
+	noted[0].Note = "on call"
+	if err := h.authz.ChangeMembers(ctx, lead, "t1", noted, nil); err != nil {
+		t.Fatalf("changing the note of u's place without the power to grant what crew holds: %v", err)
+	}
+	noted = sooner("outsider")
+	noted[0].Note = "on call"
+	if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", noted, nil); err != nil {
+		t.Fatalf("changing the note of the place of one the host refuses any grant: %v", err)
+	}
 	// Joining for a while gains what crew holds.
 	if err := h.authz.ChangeMembers(ctx, lead, "t1", sooner("v"), nil); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("v joining crew for a while by one who can't grant what it holds: %v", err)
+	}
+	// And so does making a place last longer.
+	if err := h.authz.ChangeMembers(ctx, lead, "t1", []rbac.Member{{Group: "crew", Principal: identity("u"), ExpiresAt: h.now.Add(time.Hour)}}, nil); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("making u's place last longer by one who can't grant what crew holds: %v", err)
 	}
 }
 
@@ -3004,6 +3203,63 @@ func TestAPlaceEndingSoonerRemovedMeanwhileIsTriedAgain(t *testing.T) {
 	}
 	if of, err := h.authz.GroupsOf(ctx, "t1", identity("u")); err != nil || len(of) != 0 {
 		t.Fatalf("u is in %v, %v", of, err)
+	}
+}
+
+// A place a change keeps, here one whose note alone changes, that is removed while the host is asked
+// about another member joining the same group, is a join then, which neither the host nor the
+// actor's authority was asked about: the change is tried again, though the other member gains the
+// same there.
+func TestAKeptPlaceRemovedMeanwhileBesideAJoinIsTriedAgain(t *testing.T) {
+	var meanwhile func(ctx context.Context) error
+	h := grouped(t, func(c *rbac.Config) {
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, db rbac.DB, in rbac.GrantInput) error {
+			if do := meanwhile; do != nil && in.Via == rbac.ViaMembership {
+				meanwhile = nil
+				if err := do(ctx); err != nil {
+					return err
+				}
+			}
+			return validate(ctx, db, in)
+		}
+	})
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
+	h.join(t, "v", "w")
+	manager := h.as(t, "manager")
+	for _, change := range []struct {
+		name   string
+		member string
+		apply  func([]rbac.Member) error
+	}{
+		{"ChangeMembers", "v", func(add []rbac.Member) error { return h.authz.ChangeMembers(ctx, manager, "t1", add, nil) }},
+		{"ImportMembers", "w", func(add []rbac.Member) error { return h.authz.ImportMembers(ctx, host, "t1", add) }},
+	} {
+		// In crew around the hooks, as the host refuses an outsider any grant.
+		h.as(t, "outsider", "crew")
+		noted := []rbac.Member{{Group: "crew", Principal: identity("outsider"), Note: change.name}}
+		if err := change.apply(noted); err != nil {
+			t.Fatalf("%s changing only the note of the outsider's place: %v", change.name, err)
+		}
+		meanwhile = func(ctx context.Context) error {
+			return h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("outsider")}})
+		}
+		noted[0].Note += " again"
+		add := append([]rbac.Member{{Group: "crew", Principal: identity(change.member)}}, noted...)
+		if err := change.apply(add); !errors.Is(err, rbac.ErrConflict) {
+			t.Errorf("%s with %s joining crew, the outsider's place removed meanwhile: %v", change.name, change.member, err)
+		}
+		if meanwhile != nil {
+			t.Fatal("the outsider's place should have been removed meanwhile")
+		}
+		if of, err := h.authz.GroupsOf(ctx, "t1", identity("outsider")); err != nil || len(of) != 0 {
+			t.Errorf("%s: the outsider is in %v, %v", change.name, of, err)
+		}
+		// Joining now, as it would have, the host refuses it.
+		if err := change.apply(add); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s with the outsider joining crew: %v", change.name, err)
+		}
 	}
 }
 
@@ -3332,6 +3588,16 @@ func TestImportingMembersAsksAboutWhatAGroupHolds(t *testing.T) {
 	}
 	if len(asked) != 1 || asked[0].Binding.Principal != identity("u") || asked[0].Actor.Principal != host || asked[0].Binding.Role != "cluster.sudo" {
 		t.Fatalf("asked = %+v", asked)
+	}
+	// A place made to end sooner gains nothing, so the host is asked about none of it, as by
+	// ChangeMembers, and refuses none of it: here, the service account's, in admins around the hooks.
+	h.member(t, bot.Principal, "admins")
+	asked = nil
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "admins", Principal: bot.Principal, ExpiresAt: h.now.Add(time.Hour)}}); err != nil || len(asked) != 0 {
+		t.Fatalf("importing the service account's place to end sooner: %v, asked %+v", err, asked)
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "admins", Principal: bot.Principal, ExpiresAt: h.now.Add(2 * time.Hour)}}); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("importing it to end later, gaining what admins holds meanwhile: %v", err)
 	}
 }
 

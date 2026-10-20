@@ -1072,6 +1072,56 @@ func TestWhatEndsIsHandedOnNoLongerThanItsLatestHolding(t *testing.T) {
 	}
 }
 
+// Grants of one role in one change are each decided by what the actor holds under their condition
+// until they end, however many share a decision.
+func TestGrantsInOneChangeAreEachDecidedByWhatTheActorHoldsThen(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), granter) })
+	ctx := t.Context()
+	hour, later := h.now.Add(time.Hour), h.now.Add(3*time.Hour)
+	mfa := rbac.Condition{Expression: `request.attributes.mfa == true`}
+	other := rbac.Condition{Expression: `request.attributes.site == "lab"`}
+	// u changes grants for good, and holds sudo until an hour from now, and under mfa until later.
+	sudo, underMFA := grant(cluster.Scope(), "cluster.sudo", rbac.User, "u"), grant(cluster.Scope(), "cluster.sudo", rbac.User, "u")
+	sudo.ExpiresAt, underMFA.ExpiresAt, underMFA.Condition = hour, later, mfa
+	h.seed(t, grant(cluster.Scope(), "cluster.granter", rbac.User, "u"), sudo, underMFA)
+	u := h.as(t, "u")
+	cases := []struct {
+		until   time.Time
+		under   rbac.Condition
+		granted bool
+	}{
+		{hour.Add(-time.Second), rbac.Condition{}, true},
+		{hour, rbac.Condition{}, true},
+		{hour, other, true},
+		{hour.Add(time.Second), rbac.Condition{}, false},
+		{hour.Add(time.Second), other, false},
+		{hour.Add(time.Second), mfa, true},
+		{later, mfa, true},
+		{later.Add(time.Second), mfa, false},
+		{time.Time{}, mfa, false},
+		{time.Time{}, rbac.Condition{}, false},
+	}
+	var all, granted rbac.Change
+	refused := 0
+	for i, c := range cases {
+		b := rbac.Binding{Role: "cluster.sudo", Principal: identity(fmt.Sprintf("p%d", i)), ExpiresAt: c.until, Condition: c.under}
+		all.Grant = append(all.Grant, b)
+		if c.granted {
+			granted.Grant = append(granted.Grant, b)
+		} else {
+			refused++
+		}
+	}
+	err := h.authz.Apply(ctx, u, cluster, all)
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok || len(joined.Unwrap()) != refused || !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("want %d of the grants refused, got %v", refused, err)
+	}
+	if err := h.authz.Apply(ctx, u, cluster, granted); err != nil {
+		t.Fatalf("the grants u holds sudo for, under their condition until they end: %v", err)
+	}
+}
+
 func TestDefiningARoleNeedsWhatItGivesHeldForGood(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -1141,6 +1191,28 @@ func meanwhileAsked(t *testing.T, via rbac.Via, meanwhile *func(context.Context)
 			return validate(ctx, q, in)
 		}
 	})
+}
+
+// Scopes a change to members reaches decide together where the actor holds the same grants on
+// each, and one whose grants changed meanwhile decides apart under the locks: with no constraints
+// to ask, nothing it checks there was missed before the transaction, so the change goes through.
+func TestAScopeDecidedApartUnderTheLocksIsNoConflict(t *testing.T) {
+	var meanwhile func(context.Context) error
+	h := meanwhileAsked(t, rbac.ViaMembership, &meanwhile)
+	ctx := t.Context()
+	a, b := rbac.Scope{Type: "cluster", ID: "a"}, rbac.Scope{Type: "cluster", ID: "b"}
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.admin", rbac.User, "lead"), grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "lead"),
+		grant(a, "cluster.login", rbac.Group, "crew"), grant(b, "cluster.login", rbac.Group, "crew"))
+	h.join(t, "u")
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.Import(ctx, host, "t1", []rbac.Grant{grant(b, "cluster.login", rbac.User, "lead")})
+	}
+	if err := h.authz.ChangeMembers(ctx, h.as(t, "lead"), "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}}, nil); err != nil {
+		t.Fatalf("a member gaining what crew holds, once the actor's grants on one scope changed meanwhile: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("lead should have been granted on b meanwhile")
+	}
 }
 
 func TestAGrantToAGroupAMemberJoinedWhileTheHostWasAskedIsTriedAgain(t *testing.T) {
@@ -1644,15 +1716,16 @@ func TestARemovalReadsAScopeTheHostNoLongerHasAsUnlabeled(t *testing.T) {
 	secret := cluster
 	secret.Labels = rbac.Label{"level": {"high"}}
 	errDown := errors.New("the host is down")
+	manager := rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}
 	h := labeled(t, func(c *rbac.Config) {
-		c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
+		c.Catalog = append(slices.Clone(c.Catalog), groupMembers, manager)
 		resourceOf := c.ResourceOf
 		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
 			switch s {
 			case secret.Scope():
 				return secret, nil
-			case rbac.Scope{Type: "cluster", ID: "gone"}:
-				return rbac.Resource{}, fmt.Errorf("%w: cluster gone", rbac.ErrNotFound)
+			case rbac.Scope{Type: "cluster", ID: "gone"}, rbac.Scope{Type: rbac.GroupScope, ID: "lost"}:
+				return rbac.Resource{}, fmt.Errorf("%w: %s", rbac.ErrNotFound, s.Key())
 			case rbac.Scope{Type: "cluster", ID: "down"}:
 				return rbac.Resource{}, errDown
 			}
@@ -1660,15 +1733,22 @@ func TestARemovalReadsAScopeTheHostNoLongerHasAsUnlabeled(t *testing.T) {
 		}
 	})
 	ctx := t.Context()
-	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}')`); err != nil {
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}'),
+		('t1', 'custom.ops', '{cluster:view,cluster:login}', '{cluster}')`); err != nil {
 		t.Fatal(err)
 	}
 	gone, down := rbac.Scope{Type: "cluster", ID: "gone"}, rbac.Scope{Type: "cluster", ID: "down"}
 	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "tenant.roles", rbac.User, "admin"),
+		grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "admin"),
 		grant(gone, "cluster.login", rbac.Group, "crew"), grant(secret.Scope(), "cluster.login", rbac.Group, "crew"),
-		grant(down, "cluster.login", rbac.Group, "ops"), grant(gone, "custom.viewer", rbac.User, "u"))
-	h.join(t, "u")
-	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}, {Group: "ops", Principal: identity("u")}}); err != nil {
+		grant(down, "cluster.login", rbac.Group, "ops"), grant(gone, "custom.viewer", rbac.User, "u"), grant(gone, "custom.ops", rbac.User, "u"))
+	h.join(t, "u", "v")
+	h.groups(t, "lost")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{
+		{Group: "crew", Principal: identity("u")},
+		{Group: "ops", Principal: identity("u")},
+		{Group: "lost", Principal: identity("u")},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	admin := h.as(t, "admin")
@@ -1679,8 +1759,77 @@ func TestARemovalReadsAScopeTheHostNoLongerHasAsUnlabeled(t *testing.T) {
 	if err := h.authz.DeleteRole(ctx, admin, "t1", "custom.viewer"); err != nil {
 		t.Errorf("deleting a role granted on a scope the host no longer has: %v", err)
 	}
+	// Narrowing a role only takes access away, and widening it is a change the host must read the
+	// scope for.
+	ops := rbac.RoleDefinition{ID: "custom.ops", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(ctx, admin, "t1", ops); err != nil {
+		t.Errorf("narrowing a role granted on a scope the host no longer has: %v", err)
+	}
+	ops.Permissions = []rbac.Permission{view, login}
+	if err := h.authz.SetRole(ctx, admin, "t1", ops); !errors.Is(err, rbac.ErrNotFound) {
+		t.Errorf("widening it: %v", err)
+	}
+	// So with a group the host no longer has: its members are removed, and their places made to end
+	// sooner, but none added, nor any place made to last longer.
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", []rbac.Member{{Group: "lost", Principal: identity("v")}}, nil); !errors.Is(err, rbac.ErrNotFound) {
+		t.Errorf("adding a member to a group the host no longer has: %v", err)
+	}
+	sooner := []rbac.Member{{Group: "lost", Principal: identity("u"), ExpiresAt: h.now.Add(time.Hour)}}
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", sooner, nil); err != nil {
+		t.Errorf("making a place in a group the host no longer has end sooner: %v", err)
+	}
+	sooner[0].Note = "leaving"
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", sooner, nil); err != nil {
+		t.Errorf("changing the note of a place in a group the host no longer has: %v", err)
+	}
+	sooner[0].ExpiresAt = h.now.Add(2 * time.Hour)
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", sooner, nil); !errors.Is(err, rbac.ErrNotFound) {
+		t.Errorf("making a place in a group the host no longer has last longer: %v", err)
+	}
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "lost", Principal: identity("u")}}); err != nil {
+		t.Errorf("removing a member of a group the host no longer has: %v", err)
+	}
+	if err := h.authz.DeleteGroup(ctx, admin, "t1", "lost"); err != nil {
+		t.Errorf("deleting a group the host no longer has: %v", err)
+	}
 	if err := h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "ops", Principal: identity("u")}}); !errors.Is(err, errDown) {
 		t.Errorf("removing a member of a group with access on a scope the host fails to read: %v", err)
+	}
+}
+
+// A place a change makes end sooner in a group the host no longer has, which it reads as unlabeled,
+// is tried again where the place was removed while the change waited: it joins the group then.
+func TestAPlaceEndingSoonerInAGroupTheHostLostRemovedMeanwhileIsTriedAgain(t *testing.T) {
+	var meanwhile func(context.Context) error
+	h := grouped(t, func(c *rbac.Config) {
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s != (rbac.Scope{Type: rbac.GroupScope, ID: "lost"}) {
+				return resourceOf(ctx, tenant, s)
+			}
+			if do := meanwhile; do != nil {
+				meanwhile = nil
+				if err := do(ctx); err != nil {
+					return rbac.Resource{}, err
+				}
+			}
+			return rbac.Resource{}, fmt.Errorf("%w: %s", rbac.ErrNotFound, s.Key())
+		}
+	})
+	ctx := t.Context()
+	h.as(t, "u", "lost")
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "lost", Principal: identity("u")}})
+	}
+	sooner := []rbac.Member{{Group: "lost", Principal: identity("u"), ExpiresAt: h.now.Add(time.Hour)}}
+	if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", sooner, nil); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("ending sooner a place in a group the host no longer has, removed meanwhile: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("u's place should have been removed meanwhile")
+	}
+	if of, err := h.authz.GroupsOf(ctx, "t1", identity("u")); err != nil || len(of) != 0 {
+		t.Fatalf("u is in %v, %v", of, err)
 	}
 }
 
@@ -1854,6 +2003,74 @@ func TestARemovalIsNeverRefusedForAnExclusiveConflict(t *testing.T) {
 	// Taking the group out of the approvers rewrites the eligibility, as no change that gives.
 	if err := authz.DeleteGroups(ctx, host, "t1", []string{"approvers"}); err != nil {
 		t.Fatalf("deleting a group a conflicted identity's eligibility names: %v", err)
+	}
+}
+
+// Making a place or a membership end sooner, or a member a guest, is a removal, never refused for an
+// exclusive conflict, as removing it isn't, and changing only a note no change; making one last
+// longer, or a guest a member, is not.
+func TestShorteningAConflictedIdentitysPlaceOrMembershipIsNeverRefused(t *testing.T) {
+	h := labeled(t, func(c *rbac.Config) {
+		banks(c)
+		c.Labels[len(c.Labels)-1].Exclusive = false
+		c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
+	})
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"))
+	h.as(t, "ann", "crew")
+	h.hold(t, "ann", "bank:a", "bank:b")
+	cfg := h.cfg
+	cfg.Labels = slices.Clone(cfg.Labels)
+	cfg.Labels[len(cfg.Labels)-1].Exclusive = true
+	authz, err := rbac.New(h.pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin := h.as(t, "admin")
+	place := func(until time.Duration) []rbac.Member {
+		return []rbac.Member{{Group: "crew", Principal: identity("ann"), ExpiresAt: h.now.Add(until)}}
+	}
+	if err := authz.ImportMembers(ctx, host, "t1", place(2*time.Hour)); err != nil {
+		t.Errorf("ImportMembers making ann's place end sooner: %v", err)
+	}
+	if err := authz.ChangeMembers(ctx, admin, "t1", place(time.Hour), nil); err != nil {
+		t.Errorf("ChangeMembers making ann's place end sooner: %v", err)
+	}
+	// Changing only its note gains nothing either.
+	noted := place(time.Hour)
+	noted[0].Note = "on call"
+	if err := authz.ChangeMembers(ctx, admin, "t1", noted, nil); err != nil {
+		t.Errorf("ChangeMembers changing the note of ann's place: %v", err)
+	}
+	noted[0].Note = "rotated"
+	if err := authz.ImportMembers(ctx, host, "t1", noted); err != nil {
+		t.Errorf("ImportMembers changing the note of ann's place: %v", err)
+	}
+	membership := func(until time.Duration, note string) []rbac.Membership {
+		return []rbac.Membership{{Principal: identity("ann"), ExpiresAt: h.now.Add(until), Note: note}}
+	}
+	if err := authz.SetMemberships(ctx, host, "t1", membership(24*time.Hour, "")); err != nil {
+		t.Errorf("SetMemberships making ann's membership end sooner: %v", err)
+	}
+	if err := authz.SetMemberships(ctx, host, "t1", membership(24*time.Hour, "contractor")); err != nil {
+		t.Errorf("SetMemberships changing the note of ann's membership: %v", err)
+	}
+	moved := membership(24*time.Hour, "contractor")
+	moved[0].Source = "hr"
+	if err := authz.SetMemberships(ctx, host, "t1", moved); err != nil {
+		t.Errorf("SetMemberships changing the source of ann's membership: %v", err)
+	}
+	moved[0].Guest = true
+	if err := authz.SetMemberships(ctx, host, "t1", moved); err != nil {
+		t.Errorf("SetMemberships making ann a guest: %v", err)
+	}
+	moved[0].Guest = false
+	excluded(t, authz.SetMemberships(ctx, host, "t1", moved))
+	excluded(t, authz.ImportMembers(ctx, host, "t1", place(3*time.Hour)))
+	excluded(t, authz.ChangeMembers(ctx, admin, "t1", place(3*time.Hour), nil))
+	excluded(t, authz.SetMemberships(ctx, host, "t1", membership(48*time.Hour, "")))
+	if err := authz.ChangeMembers(ctx, admin, "t1", nil, place(0)); err != nil {
+		t.Errorf("removing ann's place: %v", err)
 	}
 }
 
@@ -2959,6 +3176,75 @@ func TestChangingMembersReadsOnlyWhatTheGroupsReach(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Without declared labels, a member leaving loses nothing a change checks but the denies naming its
+// groups, so removing one, or ending its place sooner, reads nothing else of what they hold: as few
+// pages however much the groups it is in hold.
+func TestRemovingAMemberReadsNothingItsGroupsHold(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	h.groups(t, "big", "inner")
+	h.as(t, "ann", "inner")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'big', 'group', 'inner')`); err != nil {
+		t.Fatal(err)
+	}
+	manager := h.as(t, "manager")
+	tables := []string{"rbac_grants", "rbac_eligibilities"}
+	from := 0
+	// The pages of the grants and eligibilities each removal reads, in a transaction it rolls back,
+	// once big holds n more of each on clusters, and approves n more activations.
+	read := func(n int) map[string]int64 {
+		t.Helper()
+		for _, q := range []string{
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			 SELECT 't1', 'cluster', 'c' || i, 'group', 'big', 'cluster.login' FROM generate_series($1::int + 1, $1::int + $2::int) i`,
+			`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+			 SELECT 't1', 'cluster', 'c' || i, 'group', 'big', 'cluster.sudo', 3600, '{}'::text[] FROM generate_series($1::int + 1, $1::int + $2::int) i
+			 UNION ALL SELECT 't1', 'cluster', 'c' || i, 'user', 'v' || i, 'cluster.sudo', 3600, '{group:big}' FROM generate_series($1::int + 1, $1::int + $2::int) i`,
+		} {
+			if _, err := h.pool.Exec(ctx, q, from, n); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants, rbac_eligibilities`); err != nil {
+			t.Fatal(err)
+		}
+		from += n
+		pages := map[string]int64{}
+		for what, change := range map[string][]rbac.Member{
+			"removing ann":              nil,
+			"ending ann's place sooner": {{Group: "inner", Principal: identity("ann"), ExpiresAt: h.now.Add(time.Hour)}},
+		} {
+			func() {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				for _, table := range tables {
+					pages[what+" of "+table] -= pagesRead(ctx, t, tx, table)
+				}
+				var remove []rbac.Member
+				if change == nil {
+					remove = []rbac.Member{{Group: "inner", Principal: identity("ann")}}
+				}
+				if err := h.authz.WithTx(tx).ChangeMembers(ctx, manager, "t1", change, remove); err != nil {
+					t.Fatalf("%s: %v", what, err)
+				}
+				for _, table := range tables {
+					pages[what+" of "+table] += pagesRead(ctx, t, tx, table)
+				}
+			}()
+		}
+		return pages
+	}
+	few := read(500)
+	for what, many := range read(9500) {
+		if many > few[what]*3/2+deeper {
+			t.Errorf("%s read %d pages, and %d once its groups held 9500 more grants and eligibilities", what, few[what], many)
+		}
 	}
 }
 

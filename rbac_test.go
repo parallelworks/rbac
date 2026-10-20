@@ -2519,6 +2519,34 @@ func TestAPrincipalHoldsARoleABoundedNumberOfTimes(t *testing.T) {
 	}
 }
 
+// The locks of two tenants never meet, though an id may hold '/': a change in one never waits for
+// a change in another.
+func TestChangesInTwoTenantsNeverShareALock(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// In tenant acme, the lock of user x/group:g, which joined its tenant's and its id would name
+	// tenant acme/user:x's lock of group g.
+	if err := h.authz.WithTx(tx).SetMemberships(ctx, host, "acme", []rbac.Membership{{Principal: identity("x/group:g")}}); err != nil {
+		t.Fatal(err)
+	}
+	other, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = other.Rollback(ctx) }()
+	if _, err := other.Exec(ctx, `SET LOCAL lock_timeout = '1s'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.WithTx(other).DeletePrincipal(ctx, host, "acme/user:x", groupOf("g")); err != nil {
+		t.Errorf("a change in tenant acme/user:x waited for one in tenant acme: %v", err)
+	}
+}
+
 // A change reaching the tables through a search_path that names another schema first takes the
 // same locks as one that names theirs alone, so it waits for them: two imports that each fill half
 // the bound on a role's grants can't both commit past it.
@@ -4168,14 +4196,16 @@ func TestManyGrantsOfARoleAreDecidedOnce(t *testing.T) {
 	checks := 0
 	rbac.SetCheckingRole(t, func() { checks++ })
 	n := 0
-	// The roles a change granting role(i) to each of count principals checks, before its transaction
-	// and in it.
-	apply := func(actor rbac.Subject, role func(i int) rbac.Role, count int) int {
+	// The roles a change granting binding(i) to each of count principals checks, before its
+	// transaction and in it.
+	apply := func(actor rbac.Subject, binding func(i int) rbac.Binding, count int) int {
 		t.Helper()
 		var c rbac.Change
 		for j := range count {
 			n++
-			c.Grant = append(c.Grant, rbac.Binding{Role: role(j), Principal: identity(fmt.Sprintf("p%d", n))})
+			b := binding(j)
+			b.Principal = identity(fmt.Sprintf("p%d", n))
+			c.Grant = append(c.Grant, b)
 		}
 		checks = 0
 		if err := h.authz.Apply(ctx, actor, cluster, c); err != nil && (actor.Principal != lead.Principal || !errors.Is(err, rbac.ErrDenied)) {
@@ -4184,39 +4214,110 @@ func TestManyGrantsOfARoleAreDecidedOnce(t *testing.T) {
 		return checks
 	}
 	const few = 10
-	first := func(int) rbac.Role { return "custom.r0" }
+	first := func(int) rbac.Binding { return rbac.Binding{Role: "custom.r0"} }
 	for _, tc := range []struct {
-		name  string
-		actor rbac.Subject
-		role  func(int) rbac.Role
-		many  int
+		name    string
+		actor   rbac.Subject
+		binding func(int) rbac.Binding
+		many    int
 	}{
 		{"granting one role listing many", owner, first, rbac.MaxBindings},
 		// What one grant proved holds for the others: each role is checked for the first alone.
-		{"granting each role listing many", owner, func(i int) rbac.Role { return rbac.Role(fmt.Sprintf("custom.r%d", i)) }, 200},
+		{"granting each role listing many", owner, func(i int) rbac.Binding { return rbac.Binding{Role: rbac.Role(fmt.Sprintf("custom.r%d", i))} }, 200},
+		// The owner holds what it grants for good and under no condition, so how long each grant
+		// lasts and its condition tell none apart.
+		{"granting one role listing many, each until its own time", owner, func(i int) rbac.Binding {
+			return rbac.Binding{Role: "custom.r0", ExpiresAt: h.now.Add(time.Duration(i+1) * time.Second)}
+		}, rbac.MaxBindings},
+		{"granting one role listing many, each under its own condition", owner, func(i int) rbac.Binding {
+			return rbac.Binding{Role: "custom.r0", Condition: rbac.Condition{Expression: fmt.Sprintf(`request.attributes.ticket == "T-%d"`, i)}}
+		}, 100},
 		// A refusal, found once all the others are checked, is found once too.
 		{"refusing a role listing many", lead, first, rbac.MaxBindings},
+		{"refusing a role listing many, each until its own time", lead, func(i int) rbac.Binding {
+			return rbac.Binding{Role: "custom.r0", ExpiresAt: h.now.Add(time.Duration(i+1) * time.Second)}
+		}, rbac.MaxBindings},
 	} {
-		small := apply(tc.actor, tc.role, few)
+		small := apply(tc.actor, tc.binding, few)
 		if small == 0 {
 			t.Fatalf("%s: no role checked", tc.name)
 		}
-		if large := apply(tc.actor, tc.role, tc.many); large > small {
+		if large := apply(tc.actor, tc.binding, tc.many); large > small {
 			t.Errorf("%s checked %d roles for %d principals and %d for %d", tc.name, small, few, large, tc.many)
 		}
 	}
 }
 
-// Grants of a role each ending at its own time are each decided, as what the actor holds until
+// A change to the members of a group granted a role on many scopes decides the role once where
+// the actor holds what it grants alike on each: what it proved on one holds on the others.
+func TestMembersGainingARoleOnManyScopesAreDecidedOnce(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles)
+		SELECT 't1', 'custom.r' || i, '{cluster:view,cluster:login,cluster:grant}', '{cluster}',
+		  ARRAY(SELECT 'custom.r' || ((i + j) % 100) FROM generate_series(1, 64) j)
+		FROM generate_series(0, 99) i`); err != nil {
+		t.Fatal(err)
+	}
+	gs := []rbac.Grant{
+		grant(rbac.TenantRoot("t1"), "cluster.admin", rbac.User, "lead"), grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "lead"),
+		grant(rbac.Scope{Type: "cluster", ID: "x0"}, "custom.r0", rbac.Group, "one"),
+	}
+	for i := range 20 {
+		gs = append(gs, grant(rbac.Scope{Type: "cluster", ID: fmt.Sprintf("x%d", i)}, "custom.r0", rbac.Group, "many"))
+	}
+	h.seed(t, gs...)
+	lead := h.as(t, "lead")
+	checks := 0
+	rbac.SetCheckingRole(t, func() { checks++ })
+	n := 0
+	// The roles adding count members to group checks, each until its own time, before the change's
+	// transaction and in it.
+	add := func(group string, count int) int {
+		t.Helper()
+		var ms []rbac.Member
+		var joined []rbac.Membership
+		for j := range count {
+			n++
+			p := identity(fmt.Sprintf("m%d", n))
+			ms = append(ms, rbac.Member{Group: group, Principal: p, ExpiresAt: h.now.Add(time.Duration(j+1) * time.Second)})
+			joined = append(joined, rbac.Membership{Principal: p})
+		}
+		if err := h.authz.SetMemberships(ctx, host, "t1", joined); err != nil {
+			t.Fatal(err)
+		}
+		checks = 0
+		if err := h.authz.ChangeMembers(ctx, lead, "t1", ms, nil); err != nil {
+			t.Fatal(err)
+		}
+		return checks
+	}
+	one := add("one", 1)
+	if one == 0 {
+		t.Fatal("no role checked")
+	}
+	if many := add("many", 50); many > one {
+		t.Errorf("adding a member to a group granted a role on one scope checked %d roles, and fifty to one granted it on twenty %d", one, many)
+	}
+}
+
+// Grants of a role each ending at its own time are each decided where what the actor holds until
 // then differs, but what each proved is kept without copying what the others did, so deciding each
 // costs about as much however many there are.
 func TestGrantsEndingApartAreDecidedInTimeAsTheyAreMany(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
-	// A chain of roles, each listing the next, so a grant of the first checks them all.
+	const few, many = 10, 300
+	// A chain of roles, each listing the next, so a grant of the first checks them all; and what the
+	// owner holds for good, held besides until each hour to come, written around the bound on them.
 	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles)
 		SELECT 't1', 'custom.s' || i, '{cluster:view,cluster:login,cluster:grant}', '{cluster}', ARRAY['custom.s' || ((i + 1) % 100)]
 		FROM generate_series(0, 99) i`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+		SELECT 't1', 'cluster', 'c1', 'user', 'owner', 'cluster.admin', $1::timestamptz + i * interval '1 hour' FROM generate_series(1, $2::int) i`,
+		h.now, many); err != nil {
 		t.Fatal(err)
 	}
 	owner := h.as(t, "owner")
@@ -4248,10 +4349,9 @@ func TestGrantsEndingApartAreDecidedInTimeAsTheyAreMany(t *testing.T) {
 		}
 		return allocated
 	}
-	const few = 10
-	small, large := apply(few), apply(rbac.MaxBindings)
-	if large > 3*rbac.MaxBindings/few*small {
-		t.Errorf("deciding %d grants ending apart allocated %d bytes, and %d for %d", few, small, large, rbac.MaxBindings)
+	small, large := apply(few), apply(many)
+	if large > 3*many/few*small {
+		t.Errorf("deciding %d grants ending apart allocated %d bytes, and %d for %d", few, small, large, many)
 	}
 }
 

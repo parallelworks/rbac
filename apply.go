@@ -8,6 +8,7 @@ import (
 	"maps"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -404,9 +405,16 @@ func (a *Authorizer) changing(actor Subject, on Resource, cs *constrained) error
 // session's statements reach them: another application's grants are in a schema of their own. Not
 // current_schema(), the first in the search_path that exists, which two sessions reaching the same
 // tables through paths that differ before it name apart, so their changes would never wait for
-// each other.
-const lockKey = `hashtextextended((SELECT n.nspname FROM pg_catalog.pg_class c
+// each other. The schema and the tenant go first with their lengths, as each may hold '/', so the
+// keys of two never meet (lockName).
+const lockKey = `hashtextextended((SELECT pg_catalog.length(n.nspname) || ':' || n.nspname FROM pg_catalog.pg_class c
 	JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = 'rbac_grants'::regclass) || '/rbac/' || $1, 0)`
+
+// lockName is the name lockKey hashes of a tenant's lock of a kind on key, empty for the tenant's
+// own.
+func lockName(kind, tenant, key string) string {
+	return kind + "/" + strconv.Itoa(len(tenant)) + ":" + tenant + "/" + key
+}
 
 // maxLocks is how many scopes and principals a change locks one by one; a larger one locks the
 // tenant, rather than fill PostgreSQL's lock table, which every session shares.
@@ -415,12 +423,12 @@ const maxLocks = 64
 func lock(ctx context.Context, tx pgx.Tx, tenant string, scopes, principals []string) error {
 	b := &pgx.Batch{}
 	b.Queue(`SELECT current_setting('transaction_isolation')`)
-	b.Queue(`SELECT pg_advisory_xact_lock_shared(`+lockKey+`)`, "tenant/"+tenant)
+	b.Queue(`SELECT pg_advisory_xact_lock_shared(`+lockKey+`)`, lockName("tenant", tenant, ""))
 	for _, s := range slices.Compact(slices.Sorted(slices.Values(scopes))) {
-		b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, "scope/"+tenant+"/"+s)
+		b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, lockName("scope", tenant, s))
 	}
 	for _, p := range slices.Compact(slices.Sorted(slices.Values(principals))) {
-		b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, "principal/"+tenant+"/"+p)
+		b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, lockName("principal", tenant, p))
 	}
 	return locked(tx.SendBatch(ctx, b))
 }
@@ -436,7 +444,7 @@ func lockAll(ctx context.Context, tx pgx.Tx, tenant string, scopes, principals [
 func lockTenant(ctx context.Context, tx pgx.Tx, tenant string) error {
 	b := &pgx.Batch{}
 	b.Queue(`SELECT current_setting('transaction_isolation')`)
-	b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, "tenant/"+tenant)
+	b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, lockName("tenant", tenant, ""))
 	return locked(tx.SendBatch(ctx, b))
 }
 
@@ -830,6 +838,9 @@ type authority struct {
 	// constrained is what the constraints remove from the actor, which it can't hand on.
 	constrained *constrained
 	subjects    subjects
+	// proven is holdsRole's checks of the grants decided by this authority, and by those on other
+	// scopes read with it that hand on just as it does.
+	proven *checked
 }
 
 // constrained is what the constraints remove from an actor handing permissions on through a
@@ -904,6 +915,12 @@ func (c *constrained) removes(p Permission, resourceType string) bool {
 	k := permissionOn{p, resourceType}
 	if removed, ok := c.asked[k]; ok {
 		return removed
+	}
+	// Without constraints there is nothing to ask, so none was missed: as where scopes the actor
+	// holds the same grants on decided together before the transaction, and one decides apart in it.
+	if len(c.a.cfg.Constraints) == 0 {
+		c.asked[k] = false
+		return false
 	}
 	if c.sealed {
 		c.missed = true
@@ -1021,11 +1038,32 @@ func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []
 	if err := a.conditionsOf(ctx, q, tenant, held); err != nil {
 		return nil, err
 	}
-	heldOn := onPaths(held, func(h holding) string { return h.scope }, paths)
+	at := make([]int, len(held))
+	for i := range at {
+		at[i] = i
+	}
+	heldAt := onPaths(at, func(i int) string { return held[i].scope }, paths)
 	deniedOn := onPaths(ds, func(d denial) string { return d.scope }, paths)
+	// Where the actor holds the same grants on two scopes, and neither a deny nor a constraint can
+	// tell them apart, as none binds the actor there, what it may hand on is the same on both: what
+	// deciding a grant on one proved holds on the other, so a change reaching many, as one to the
+	// members of a group granted a role on each, walks the roles a role lists once.
+	proven := map[string]*checked{}
 	aus := make([]authority, len(on))
 	for i, r := range on {
-		aus[i] = a.authorityOf(ctx, actor, r, heldOn[i], deniedOn[i], b)
+		heldOn := make([]holding, len(heldAt[i]))
+		for j, k := range heldAt[i] {
+			heldOn[j] = held[k]
+		}
+		aus[i] = a.authorityOf(ctx, actor, r, heldOn, deniedOn[i], b)
+		if len(a.cfg.Constraints) > 0 || len(deniedOn[i]) > 0 {
+			continue
+		}
+		k := fmt.Sprint(heldAt[i])
+		if proven[k] == nil {
+			proven[k] = newChecked()
+		}
+		aus[i].proven = proven[k]
 	}
 	return aus, nil
 }
@@ -1189,6 +1227,25 @@ func (h holding) lasts(until time.Time) bool {
 	return h.ends.IsZero() || !until.IsZero() && !h.ends.Before(until)
 }
 
+// decidedAs is the condition and end a grant made under condition until until is decided by, the
+// same for every grant the actor's grants can't tell apart, so a change granting a role to many,
+// each until its own time, decides it once. A condition none of its conditional grants has gives
+// it what none does: its conditional grants give nothing under either, nor list a role for it,
+// and the others give under both what they give. And each of its grants lasts until until just as
+// it lasts until the soonest of their ends at or after it, or never where none ends then.
+func (au authority) decidedAs(condition string, until time.Time) (string, time.Time) {
+	if !slices.ContainsFunc(au.held, func(g holding) bool { return g.conditional && g.Condition.Expression == condition }) {
+		condition = ""
+	}
+	var at time.Time
+	for _, g := range au.held {
+		if !until.IsZero() && !g.ends.IsZero() && !g.ends.Before(until) && (at.IsZero() || g.ends.Before(at)) {
+			at = g.ends
+		}
+	}
+	return condition, at.UTC()
+}
+
 // holds reports whether the actor holds p for resources of a type, to hand it on with condition
 // until until: neither a deny nor a constraint removes it.
 func (au authority) holds(p Permission, resourceType, condition string, until time.Time) bool {
@@ -1347,22 +1404,26 @@ func (a *Authorizer) mayChangeBy(au authority, on Resource, grants, revokes []Bi
 			errs = append(errs, &DeniedError{Permission: manage, Scope: scope, Reason: fmt.Sprintf("the actor may not revoke %s here", b.Role)})
 		}
 	}
-	// A role is decided once for each condition and end, by what it lacks then, if anything, or a
-	// change granting it to many would walk what it lists for each; and what a grant allowed proved
-	// holds for the others, as Grantable keeps it: a refused one's checks are dropped, as some passed
-	// only while it was in progress.
-	decisions, proven := map[grantAsked]grantDecided{}, newChecked()
+	// A role is decided once for each condition and end the actor's grants tell apart, by what it
+	// lacks then, if anything, or a change granting it to many would walk what it lists for each;
+	// and what a grant allowed proved holds for the others, as Grantable keeps it: a refused one's
+	// checks are dropped, as some passed only while it was in progress.
+	decisions, proven := map[grantAsked]grantDecided{}, au.proven
+	if proven == nil {
+		proven = newChecked()
+	}
 	for _, b := range grants {
 		def, known := au.roles.role(b.Role)
 		if !known || !a.grantableOn(def, scope.Type) {
 			// validate reports it as invalid rather than as an escalation.
 			continue
 		}
-		k := grantAsked{role: b.Role, condition: b.Condition.Expression, until: b.ExpiresAt.UTC()}
+		condition, until := au.decidedAs(b.Condition.Expression, b.ExpiresAt)
+		k := grantAsked{role: b.Role, condition: condition, until: until}
 		d, decided := decisions[k]
 		if !decided {
 			mark := proven.mark()
-			if d.lacks, d.ok = a.mayGrant(au, pw, scope.Type, def, b.Condition.Expression, b.ExpiresAt, proven); !d.ok {
+			if d.lacks, d.ok = a.mayGrant(au, pw, scope.Type, def, condition, until, proven); !d.ok {
 				proven.drop(mark)
 			}
 			decisions[k] = d
@@ -1471,9 +1532,10 @@ func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, h
 	})
 }
 
-// inTxReaching is inTx for a change whose exclusive values are checked for the identities, by key,
-// fn returns besides those its event names: kept out of the event, so OnChange is handed only what
-// a host can build and compare.
+// inTxReaching is inTx for a change to memberships or places in groups, whose exclusive values are
+// checked for the identities, by key, fn returns as those whose memberships or places it widened,
+// besides those its grants and eligibilities name: kept out of the event, so OnChange is handed
+// only what a host can build and compare.
 func (a *Authorizer) inTxReaching(ctx context.Context, tenant string, actor Principal, how string, fn func(pgx.Tx) (ChangeEvent, []string, error)) error {
 	return a.begin(ctx, func(tx pgx.Tx) error {
 		// Taken by every change, removals too, so changes in one host transaction take their locks in

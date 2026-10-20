@@ -557,10 +557,11 @@ flowchart TB
 
 Changes take PostgreSQL advisory locks, keyed by the schema holding the tables, as every session
 reaching them names it whatever its search_path, so two changes to the same rows run
-one after the other, each taking its locks in one order. The locks last until the transaction
-ends, so under `WithTx` two host transactions changing the same scopes or principals in opposite
-orders can still deadlock, as can a change that also writes rows it doesn't lock: PostgreSQL fails
-one, which matches `ErrConflict`.
+one after the other, each taking its locks in one order. A key gives the schema and the tenant
+each with its length, as either may hold `/`, so the locks of two tenants never meet. The locks
+last until the transaction ends, so under `WithTx` two host transactions changing the same scopes
+or principals in opposite orders can still deadlock, as can a change that also writes rows it
+doesn't lock: PostgreSQL fails one, which matches `ErrConflict`.
 
 ```mermaid
 flowchart TB
@@ -675,6 +676,7 @@ bounds, so a role that writes around the package can store no row larger than th
 | `MaxApprovers`, `MaxActivation` | 16, 366 days | An eligibility's approvers, and its longest activation. |
 | `MaxGroupDepth` | 8 | How deeply groups nest. |
 | `MaxPlacesInGroup` | 20 | Places in force of one principal in one group, each from another source. Those from each source the host owns count apart. |
+| `MaxGroupsOfPrincipal` | 1,000 | Groups one principal, an identity or a group, is in directly, by places in force. Those from each source the host owns count apart. A check reads every group its subject is in, and every group those are in, `MaxGroupDepth` deep. |
 | `MaxExpression` | 2,048 bytes | A condition's or requirement's expression. Its cost is bounded too. |
 | What a check reads together | 80,000 units: hundreds of comparisons with literals, or three of the longest conditions that read a list or loop | The distinct conditions of an identity's conditional grants on a scope; of a scope's conditional grants to groups, the tenant's members and the public; each the tenant's and those from each source the host owns apart; of a scope's conditional denies; and the requirements of groups' eligibilities for a role on a scope. Each counts compiling it, 8 a byte, and the most evaluating it can cost, at most 10,000. On the tenant, one reading the action counts once for each label value it gives or denies. A check may spend this for each on each scope of its path. |
 | `MaxConditionBytes` | 32 KiB | The conditions one `Apply` or `Import` carries, each distinct one counted once. |

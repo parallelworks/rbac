@@ -306,7 +306,8 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 		if err := a.changesDenied(au, tenant, types, fmt.Sprintf("changing what %s's grants give", r.ID)); err != nil {
 			return err
 		}
-		if labeled, err = a.labelsAllow(ctx, actor, tenant, r.ID, false); err != nil {
+		// Narrowed, it only takes access away, as deleting it does.
+		if labeled, err = a.labelsAllow(ctx, actor, tenant, r.ID, !givesMore(checked, r)); err != nil {
 			return err
 		}
 	}
@@ -714,10 +715,10 @@ type labeling struct {
 // labelsAllow refuses changing what a custom role's grants and eligibilities give, or revoking
 // them, to an actor that a label of a scope they are on refuses, as Apply refuses changing grants
 // there: read before the change's transaction, as labels are the host's; with removing, as for
-// deleting the role, a scope the host no longer has (ErrNotFound) as unlabeled, and none asked
-// about where the actor's label values satisfy every label, as ChangeMembers asks about none a
-// removal alone reaches. It returns what it checked, which stillLabeled reads again under the
-// change's lock.
+// deleting or narrowing the role, a scope the host no longer has (ErrNotFound) as unlabeled, and
+// none asked about where the actor's label values satisfy every label, as ChangeMembers asks about
+// none a removal alone reaches. It returns what it checked, which stillLabeled reads again under
+// the change's lock.
 func (a *Authorizer) labelsAllow(ctx context.Context, actor Subject, tenant string, id Role, removing bool) (labeling, error) {
 	if len(a.labels) == 0 {
 		return labeling{}, nil
