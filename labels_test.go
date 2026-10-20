@@ -509,6 +509,53 @@ func listPoints(t *testing.T, h *harness, where string, args ...any) []string {
 	return ids
 }
 
+// A label value on the tenant is decided on the tenant without its label, by a check and by
+// Holders, so a list of tenants by one keeps a tenant whatever its label holds of declared values:
+// Filter keeps its row, and Reachable's holding satisfies its label. A row whose label holds a
+// value no dimension declares stays out, as a check of such a label is refused.
+func TestListingTenantsByALabelValueLeavesTheirLabelsOut(t *testing.T) {
+	h := labeled(t)
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE tenants (tenant text NOT NULL, path text[] NOT NULL, labels text[] NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO tenants VALUES ('t1', '{tenant:t1}', '{level:high,comp:alpha}'), ('t1', '{tenant:t1}', '{level:secret}')`); err != nil {
+		t.Fatal(err)
+	}
+	h.hold(t, "ann", "level:low")
+	ann := h.as(t, "ann")
+	tenant := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1", Labels: rbac.Label{"level": {"high"}, "comp": {"alpha"}}}
+	if !allowed(t, h, ann, "level:low", tenant) {
+		t.Fatal("Authorize refuses the value ann holds on a tenant labeled above it")
+	}
+	if holders, err := h.authz.Holders(ctx, "level:low", tenant); err != nil || len(holders) != 1 {
+		t.Fatalf("Holders %+v, %v", holders, err)
+	}
+	pred, err := h.authz.Filter(ctx, ann, "level:low", "t1", rbac.TenantScope, rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kept []string
+	rows, err := h.pool.Query(ctx, `SELECT labels::text FROM tenants WHERE `+pred.SQL, pred.Args...)
+	if err == nil {
+		kept, err = pgx.CollectRows(rows, pgx.RowTo[string])
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(kept, []string{"{level:high,comp:alpha}"}) {
+		t.Errorf("Filter keeps the tenants labeled %v by the value ann holds", kept)
+	}
+	reach, err := h.authz.Reachable(ctx, ann, "level:low", "t1", rbac.TenantScope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reach.All || !reach.Labels.Satisfies(tenant.Labels) || reach.Labels.Satisfies(rbac.Label{"level": {"secret"}}) {
+		t.Errorf("Reachable reaches all: %v; its labels satisfy the tenant's: %v, an undeclared value: %v",
+			reach.All, reach.Labels.Satisfies(tenant.Labels), reach.Labels.Satisfies(rbac.Label{"level": {"secret"}}))
+	}
+}
+
 // A label column in a collation that isn't deterministic compares values the package tells apart
 // as equal: Filter compares them as Satisfies does, byte for byte.
 func TestFilterTellsLabelValuesApartInAnyCollation(t *testing.T) {

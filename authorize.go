@@ -1010,7 +1010,9 @@ type Reach struct {
 	// otherwise reachable is checked on its own.
 	ConditionalExcept []Scope
 	// Labels is the subject's holding (Config.Labels): of what the scopes reach, it may do p only
-	// to resources whose label the holding satisfies.
+	// to resources whose label the holding satisfies. For a label value or a power to release on the
+	// tenant, which a check decides on the tenant without its label, it holds every value, so it
+	// satisfies any label whose values are declared.
 	Labels Holding
 }
 
@@ -1046,11 +1048,30 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 		return reach, err
 	}
 	// Decided outside the snapshot, as its constraints run as for any read.
-	reach.Labels, _, err = a.holdingOf(ctx, tenant, s, got.values)
-	if err != nil || reach.Labels.excludes(p) {
+	h, _, err := a.holdingOf(ctx, tenant, s, got.values)
+	if err != nil || h.excludes(p) {
 		return Reach{}, err
 	}
+	reach.Labels = a.listedBy(h, p, resourceType)
 	return reach, nil
+}
+
+// listedBy is the holding a list of resources of a type by p keeps those by whose label it
+// satisfies: h, but for a label value or a power to release on the tenant, which a check decides
+// on the tenant without its label (decidedOn), every value, which satisfies any label whose values
+// are declared, as a check refuses one whose values aren't.
+func (a *Authorizer) listedBy(h Holding, p Permission, resourceType string) Holding {
+	if resourceType != TenantScope || !a.labelPermission(p) {
+		return h
+	}
+	every := Holding{tenant: h.tenant, dims: h.dims, values: map[string]map[string]bool{}, releases: map[string]bool{}, excluded: map[string]bool{}}
+	for dim, ld := range h.dims {
+		every.values[dim] = map[string]bool{}
+		for v := range ld.rank {
+			every.values[dim][v] = true
+		}
+	}
+	return every
 }
 
 // reachable is Reachable's answer once no constraint removes p, for the built-in roles that give
@@ -1308,7 +1329,7 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	if h.excludes(p) {
 		return Predicate{SQL: "FALSE"}, nil
 	}
-	labels, args := h.labelColumn(cols.Labels, arg, len(pred.Args))
+	labels, args := a.listedBy(h, p, resourceType).labelColumn(cols.Labels, arg, len(pred.Args))
 	pred.SQL = "(" + pred.SQL + " AND " + labels + ")"
 	pred.Args = append(pred.Args, args...)
 	return pred, nil
