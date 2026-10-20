@@ -869,14 +869,15 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 		return Reach{}, nil
 	}
 	// Denies on scopes a resource of the type can have on its path: those of the type, the
-	// containers and the tenant.
+	// containers and the tenant, that bind the subject (bindingDenies), as Filter finds them.
 	if perm, wildcard, deniable := matchable(p); deniable {
+		narrow := countedOf(binding, broad{})
+		wide := slices.DeleteFunc(slices.Clone(binding), func(k string) bool { return slices.Contains(narrow, k) })
 		rows, err = a.db.Query(ctx, `
-			SELECT scope, bool_or(condition = '') FROM rbac_denies
-			WHERE tenant = $1 AND scope_type = ANY($2::text[])
-			  AND principals && $3::text[] AND NOT exempt && $6::text[] AND ($4 = ANY(permissions) OR $5 = ANY(permissions))
+			SELECT scope, bool_or(condition = '') FROM (`+bindingDenies("$1", "$2", "$3", "$7", "scope, condition, exempt, permissions")+`) d
+			WHERE NOT exempt && $6::text[] AND ($4 = ANY(permissions) OR $5 = ANY(permissions))
 			GROUP BY scope ORDER BY scope`,
-			tenant, reaching, binding, perm, wildcard, exempting(keys, s))
+			tenant, reaching, narrow, perm, wildcard, exempting(keys, s), wide)
 		if err != nil {
 			return Reach{}, err
 		}
@@ -950,11 +951,11 @@ type Predicate struct {
 // for the query it was built for: it fixes the time (Config.Now), the subject's label holding and
 // what the constraints answered when Filter was called, so a later query keeps rows Authorize then
 // refuses, as once a grant it counted has expired. Build one for each query. The host's
-// query must reach this package's tables (they are in the pool's schema), and column names are
-// trusted host code; every value is an argument. It counts only unconditional grants, and leaves
-// out every resource a deny covers, conditional ones included, so it never keeps one Authorize
-// refuses: Reachable's Conditional and ConditionalExcept name the scopes where that may be too
-// strict.
+// query must reach this package's tables and call its function rbac_tenant_keys (they are in the
+// pool's schema), and column names are trusted host code; every value is an argument. It counts
+// only unconditional grants, and leaves out every resource a deny covers, conditional ones
+// included, so it never keeps one Authorize refuses: Reachable's Conditional and
+// ConditionalExcept name the scopes where that may be too strict.
 func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant, resourceType string, cols Columns, firstArg int) (Predicate, error) {
 	if cols.Tenant == "" || cols.Path == "" || firstArg < 1 {
 		return Predicate{}, fmt.Errorf("%w: Filter needs the tenant and path columns and a first argument", ErrInvalid)
@@ -978,29 +979,16 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	if listed, covering, ok := matchable(p); ok {
 		perm, wildcard = listed, covering
 	}
-	// The subject's principals, read in the statement as its grants and denies are, so a list
-	// reads its membership, its groups and what they hold in one snapshot.
-	keys := func(of string) string {
-		return "ARRAY(WITH RECURSIVE " + keysSQL(arg(1)+"::text", arg(2)+"::text", arg(4)) + " " + of + ")"
-	}
-	// The subject's grants on the scopes of the types in the array types, in the default collation,
-	// which a column's own collation overrides where a comparison doesn't name one.
-	grants := func(types string) string {
-		return byType(types, `g.scope COLLATE "default"`, fmt.Sprintf(`g.tenant = %s::text AND g.principal = ANY(%s) AND g.role = ANY(%s)
-			  AND (g.expires_at IS NULL OR g.expires_at > %s) AND NOT g.conditional
-			  AND (g.principal <> %s::text OR g.role = ANY(%s))
-			  AND (g.principal_kind <> ALL(%s) OR g.role <> ALL(%s))`,
-			arg(1), keys(countedKeys(arg(13), arg(17))), givingSQL(arg(3), arg(1), arg(8), arg(9), custom, ""), arg(4), arg(6),
-			givingSQL(arg(7), arg(1), arg(8), arg(9), custom, publicOnly(catalogSQL{arg(10), arg(11), arg(12)})),
-			broadKindsSQL, givingSQL(arg(18), arg(1), arg(8), arg(9), custom, privilegedOnly(catalogSQL{arg(19), arg(20), arg(21)}))))
-	}
-	// The denies on the scopes `of` keeps that bind the subject, by the primary key, which leads to
-	// a scope's type.
-	denies := func(of string) string {
-		return fmt.Sprintf(`SELECT d.scope FROM rbac_denies d
-			WHERE d.tenant = %s::text AND %s AND d.principals && %s AND NOT d.exempt && %s
-			  AND (%s::text = ANY(d.permissions) OR %s::text = ANY(d.permissions))`,
-			arg(1), of, keys("SELECT k FROM bound"), keys("SELECT k FROM exempted"), arg(14), arg(15))
+	keys := func(of string) string { return filterKeys(arg, of) }
+	grants := func(types string) string { return filterGrants(arg, custom, types) }
+	// The denies on scopes of the types in the array types that bind the subject (bindingDenies).
+	narrow := counted("FALSE", "FALSE")
+	denies := func(types string) string {
+		return fmt.Sprintf(`SELECT d.scope FROM (%s) d
+			WHERE NOT d.exempt && %s AND (%s::text = ANY(d.permissions) OR %s::text = ANY(d.permissions))`,
+			bindingDenies(arg(1)+"::text", types, keys("SELECT k FROM bound WHERE "+narrow), keys("SELECT k FROM bound WHERE NOT ("+narrow+")"),
+				"scope, exempt, permissions"),
+			keys("SELECT k FROM exempted"), arg(14), arg(15))
 	}
 	// The grants' tenant is an argument of its own: the host's tenant column needn't be text,
 	// and one argument can't take two types. The grants overlap the path, which the host's GIN
@@ -1028,9 +1016,18 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	var deniedByKey string
 	if !a.contains(resourceType) {
 		denied = slices.DeleteFunc(denied, func(t string) bool { return t == resourceType })
-		deniedByKey = fmt.Sprintf(`NOT (%s)[1] COLLATE "default" IN (%s) AND `, cols.Path, denies("d.scope_type = "+arg(9)+"::text"))
+		deniedByKey = fmt.Sprintf(`NOT (%s)[1] COLLATE "default" IN (%s) AND `, cols.Path, denies("ARRAY["+arg(9)+"::text]"))
 	}
-	resources, containers, err := a.grantCounts(ctx, tenant, s, p, roles, custom, counts, resourceType)
+	now := a.cfg.Now()
+	filterArgs := func(above []string) []any {
+		return append(append([]any{
+			tenant, tenant, s.identityKey(), roles, now, above, publicKey, a.publicRoles(roles),
+			string(p), resourceType,
+		}, a.publicArgs(p, resourceType, custom)...), append([]any{
+			counts.public, perm, wildcard, denied, counts.members, a.privilegedRoles(roles),
+		}, a.catalogArgs(custom)...)...)
+	}
+	resources, containers, err := a.grantCounts(ctx, custom, a.contains(resourceType), filterArgs(above))
 	if err != nil {
 		return Predicate{}, err
 	}
@@ -1048,13 +1045,8 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	pred := Predicate{
 		SQL: fmt.Sprintf(`(%[1]s = %[2]s AND (%[1]s)::text = %[5]s::text COLLATE "default" AND %[3]s
 			AND %[7]sNOT %[6]s)`,
-			cols.Tenant, arg(0), reached, cols.Path, arg(1), keyed(cols.Path, denies("d.scope_type = ANY("+arg(16)+"::text[])")), deniedByKey),
-		Args: append(append([]any{
-			tenant, tenant, s.identityKey(), roles, a.cfg.Now(), above, publicKey, a.publicRoles(roles),
-			string(p), resourceType,
-		}, a.publicArgs(p, resourceType, custom)...), append([]any{
-			counts.public, perm, wildcard, denied, counts.members, a.privilegedRoles(roles),
-		}, a.catalogArgs(custom)...)...),
+			cols.Tenant, arg(0), reached, cols.Path, arg(1), keyed(cols.Path, denies(arg(16))), deniedByKey),
+		Args: filterArgs(above),
 	}
 	// With no dimension declared too, as then any label is invalid, and Authorize refuses it.
 	if cols.Labels == "" {
@@ -1087,15 +1079,46 @@ func byType(types, cols, where string) string {
 }
 
 // byKey is SQL selecting cols of the rows of table for which where holds whose col is one of the
-// distinct keys in the array keys, a key at a time: each an equality the indexes leading to col, or
-// to the tenant and col, seek. A generic plan costs col = ANY(keys) as ten seeks, and a read of the
-// tenant by an index leading to it alone, which it costs as an average tenant's few rows, as
-// cheaper, so it reads every row of a large tenant. OFFSET 0 keeps the planner from flattening it
-// into a join it could run the other way round.
+// keys in the array keys, a key at a time: each an equality the indexes leading to col, or to the
+// tenant and col, seek. A generic plan costs col = ANY(keys) as ten seeks, and a read of the tenant
+// by an index leading to it alone, which it costs as an average tenant's few rows, as cheaper, so
+// it reads every row of a large tenant. OFFSET 0 keeps the planner from flattening it into a join
+// it could run the other way round. A key listed twice selects its rows twice, so each caller lists
+// a key once, as a path and a sorted, compacted list do, or reads them through = ANY, EXISTS or
+// DISTINCT, which a repeat changes nothing in.
 func byKey(keys, table, col, cols, where string) string {
 	return fmt.Sprintf(`SELECT r.* FROM unnest(%[1]s::text[]) AS keyed(k) CROSS JOIN LATERAL (
 		SELECT %[4]s FROM %[2]s WHERE (%[5]s) AND %[3]s = keyed.k OFFSET 0) r`, keys, table, col, cols, where)
 }
+
+// bindingDenies is SQL selecting cols of the denies in a tenant, SQL for its text, on scopes of the
+// types in the array types, that name one of the keys in the array narrow, an identity's or a
+// group's, or in the array broad, the public's or the tenant's members'. Those naming narrow are
+// found by those keys (naming). Any number of the tenant's denies can name broad, on scopes of any
+// type, and no index finds those of a type alone: so while fewer than manyTypedDenies of the
+// tenant's denies are on scopes of the types, they are read a type at a time, each a range of the
+// scopes (ofType), and past that they are found by those keys too. Each way reads every deny the
+// other passes over, so with many of both a list reads every deny in the tenant naming broad. The
+// count reads at most manyTypedDenies entries of the scopes' index, once for the statement, in its
+// snapshot. A deny naming both narrow and broad is selected twice.
+func bindingDenies(tenant, types, narrow, broad, cols string) string {
+	ofTypes := func(cols, where string) string {
+		return `SELECT d.* FROM unnest(` + types + `::text[]) AS t(t) CROSS JOIN LATERAL (SELECT ` + cols + ` FROM rbac_denies
+			WHERE tenant = ` + tenant + ` AND ` + where + ofType("scope", "t.t") + ` OFFSET 0) d`
+	}
+	return fmt.Sprintf(`WITH typed(few) AS MATERIALIZED (SELECT count(*) < %[5]d FROM (%[6]s LIMIT %[5]d) c)
+		SELECT %[4]s FROM rbac_denies WHERE %[2]s AND scope_type = ANY(%[1]s::text[])
+		UNION ALL
+		SELECT %[4]s FROM rbac_denies WHERE %[3]s AND scope_type = ANY(%[1]s::text[]) AND NOT (SELECT few FROM typed)
+		UNION ALL
+		SELECT * FROM (%[7]s) d WHERE (SELECT few FROM typed)`,
+		types, namingIn(tenant, "principals", narrow), namingIn(tenant, "principals", broad), cols, manyTypedDenies,
+		ofTypes("1", ""), ofTypes(cols, "principals && "+broad+"::text[] AND "))
+}
+
+// manyTypedDenies is how many denies on scopes of the types a list reads bindingDenies reads by type
+// to find those naming the public or the tenant's members, before it finds them by those keys.
+const manyTypedDenies = 16
 
 // ofType is SQL keeping the rows whose scope, col, is of the type t. A scope is `type:id`, and in
 // the C collation the scopes of a type sort from `type:` to just before `type;`, so a btree on the
@@ -1125,20 +1148,53 @@ const maxOverlap = 8
 // keys. A test lowers it.
 var maxContainerOverlap = 128
 
-// grantCounts counts s's principals' unconditional grants in force on resources of a type, and on
-// the containers, a container type's own among them, and the tenant, of the roles that give p on
-// the type, the built-in ones in roles and with custom the tenant's, counting broad ones as counts
-// says, of each type only until they pass maxContainerOverlap: it only picks the form of Filter's
-// condition. Grants of other roles aren't in the condition, and counted they would trade an index
-// that finds the few rows its grants reach for a read of every row of the tenant.
-func (a *Authorizer) grantCounts(ctx context.Context, tenant string, s Subject, p Permission, roles []string, custom bool, counts broad, resourceType string) (resources, containers int, err error) {
-	err = a.db.QueryRow(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$5")+`
-		SELECT coalesce(sum(n) FILTER (WHERE t = $3 AND NOT $4), 0)::int, coalesce(sum(n) FILTER (WHERE t <> $3 OR $4), 0)::int
-		FROM unnest($6::text[]) AS t(t) CROSS JOIN LATERAL (SELECT count(*) AS n FROM (SELECT FROM rbac_grants
-		  WHERE tenant = $1 AND principal = ANY(ARRAY(`+countedKeys("$8", "$9")+`)) AND `+ofType("scope", "t.t")+` AND NOT conditional
-		    AND (expires_at IS NULL OR expires_at > $5) AND role = ANY(`+givingSQL("$10", "$1", "$11", "$3", custom, "")+`) LIMIT $7) g) g`,
-		tenant, s.identityKey(), resourceType, a.contains(resourceType), a.cfg.Now(), a.reaching(resourceType), maxContainerOverlap+1,
-		counts.public, counts.members, roles, string(p)).Scan(&resources, &containers)
+// filterKeys is SQL for the array of Filter's subject's keys of selects, as keysSQL defines them,
+// read in the statement, as its grants and denies are, so a list reads its membership, its groups
+// and what they hold in one snapshot. arg numbers Filter's arguments.
+func filterKeys(arg func(int) string, of string) string {
+	return "ARRAY(WITH RECURSIVE " + keysSQL(arg(1)+"::text", arg(2)+"::text", arg(4)) + " " + of + ")"
+}
+
+// filterGrants is SQL selecting the scopes of the grants Filter's condition counts for its subject
+// on scopes of the types in the array types, in the default collation, which a column's own
+// collation overrides where a comparison doesn't name one: unconditional, in force, of the roles
+// that give the permission, the public's only of public ones and the broad principals' of none
+// privileged. arg numbers Filter's arguments.
+func filterGrants(arg func(int) string, custom bool, types string) string {
+	return byType(types, `g.scope COLLATE "default"`, fmt.Sprintf(`g.tenant = %s::text AND g.principal = ANY(%s) AND g.role = ANY(%s)
+		  AND (g.expires_at IS NULL OR g.expires_at > %s) AND NOT g.conditional
+		  AND (g.principal <> %s::text OR g.role = ANY(%s))
+		  AND (g.principal_kind <> ALL(%s) OR g.role <> ALL(%s))`,
+		arg(1), filterKeys(arg, countedKeys(arg(13), arg(17))), givingSQL(arg(3), arg(1), arg(8), arg(9), custom, ""), arg(4), arg(6),
+		givingSQL(arg(7), arg(1), arg(8), arg(9), custom, publicOnly(catalogSQL{arg(10), arg(11), arg(12)})),
+		broadKindsSQL, givingSQL(arg(18), arg(1), arg(8), arg(9), custom, privilegedOnly(catalogSQL{arg(19), arg(20), arg(21)}))))
+}
+
+// grantCounts counts, with Filter's arguments args, the grants its condition counts (filterGrants)
+// on resources of the type, none for a container type, and on the containers, a container type's
+// own among them, and the tenant, each only past where Filter's form compares them: it only picks
+// the form. Grants the condition doesn't count, as of roles that don't give the permission, or a
+// broad principal's that give nothing, counted would trade an index that finds the few rows its
+// grants reach for a read of every row of the tenant.
+func (a *Authorizer) grantCounts(ctx context.Context, custom, container bool, args []any) (resources, containers int, err error) {
+	// The arguments the count reads, numbered from $1 as it first reads each.
+	var read []any
+	at := map[int]int{}
+	arg := func(i int) string {
+		if at[i] == 0 {
+			read = append(read, args[i])
+			at[i] = len(read)
+		}
+		return fmt.Sprintf("$%d", at[i])
+	}
+	onResources := "0"
+	if !container {
+		onResources = fmt.Sprintf(`(SELECT count(*) FROM (%s LIMIT %d) g)`, filterGrants(arg, custom, "ARRAY["+arg(9)+"::text]"), maxOverlap+1)
+	}
+	// The containers' and the tenant's are of the types Filter reads denies on by each key (16).
+	query := fmt.Sprintf(`SELECT %s, (SELECT count(*) FROM (%s LIMIT %d) g)`,
+		onResources, filterGrants(arg, custom, arg(16)), max(maxOverlap, maxContainerOverlap)+1)
+	err = a.db.QueryRow(ctx, query, read...).Scan(&resources, &containers)
 	return resources, containers, err
 }
 

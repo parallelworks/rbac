@@ -210,14 +210,17 @@ erDiagram
   averages, still reads only the subject's grants on the path, from the index alone, whichever
   index it picks.
 - **A read of a list of keys reads each key's rows on its own** (`byKey`), as of a list's scopes
-  or principals, of the denies on a check's path, of `Activate`'s eligibilities and of
-  `DeleteScopes`' rows, and so does a walk through nested groups: a generic plan costs `= ANY` of
-  a list as ten seeks, and a read of the tenant by an index on it alone as an average tenant's few
-  rows, and would read every row of a large tenant. The eligibilities a group approves and the
+  or principals, of the denies on a check's path, of `Activate`'s eligibilities and of the rows
+  `DeleteScopes`, `DeletePrincipal` and `DeleteGroups` remove, and so does a walk through nested
+  groups: a generic plan costs `= ANY` of a list as ten seeks, and a read of the tenant by an index
+  on it alone as an average tenant's few rows, and would read every row of a large tenant. The rows
+  a removal locks in order it then deletes by key, never matched to the tenant's in a semi-join,
+  which such a plan runs by reading every one. The eligibilities a group approves and the
   denies that name or exempt it, which a change to its members and `DeleteGroup`'s check read,
-  and those an identity or group leaving the tenant is taken out of, are found through GIN
-  indexes on those arrays of keys, each key prefixed by its tenant (`rbac_tenant_keys`), so
-  neither the tenant's other rows nor another tenant's group of the same id are read.
+  those an identity or group leaving the tenant is taken out of, and the denies naming a list's
+  subject or its groups, which `Filter` and `Reachable` read, are found through GIN indexes on
+  those arrays of keys, each key prefixed by its tenant (`rbac_tenant_keys`), so neither the
+  tenant's other rows nor another tenant's group of the same id are read.
 - **Activations are grants** from the source `activation` (`SourceActivation`), made by
   `Activate` from an eligibility, which they record, and ended by their expiry, `Deactivate`, or a
   change ending the membership or a place in a group on their holder's paths to that eligibility's
@@ -487,7 +490,11 @@ flowchart LR
   everything it created costs a row a few lookups; no index serves that, so the query reads every
   row of the tenant its other conditions keep. Denies are looked up so whatever their number: those
   on resources of the type by the row's own key, and those on containers and the tenant by each of
-  its keys.
+  its keys. Those naming the subject or its groups are read by those keys alone. Those naming the
+  public or the tenant's members bind everyone, and any number of them can be on scopes of other
+  types, which no index tells apart: while fewer than 16 denies are on scopes of the types a list
+  reads, it reads those by type, and otherwise finds the ones naming everyone by those keys, so a
+  tenant with many of both has every list read every deny naming everyone.
 - **Reachable** returns the same as scopes, for a host that keeps its resources elsewhere.
   Conditional grants and conditional denies come back apart, to check one by one.
 - **Holders** lists who may do a permission on a resource, for an access review. That is each

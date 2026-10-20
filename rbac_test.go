@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"maps"
 	"os"
+	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -466,11 +467,76 @@ func TestListingsKeepToDeniesOnTheResourceItself(t *testing.T) {
 	}
 }
 
+// overlapping returns the conditions in the plan of query, on h's pool, that overlap an array with
+// what a subquery reading table selects (`&&`): each compares a row with every value the subquery
+// selects, rather than look the row's keys up in a hash or an object of them.
+func overlapping(ctx context.Context, t *testing.T, h *harness, table, query string, args ...any) []string {
+	t.Helper()
+	return planConditions(ctx, t, h, overlap, table, query, args...)
+}
+
+// hashing returns the conditions in the plan of query, on h's pool, that look a row's key up in a
+// hash of what a subquery reading table selects.
+func hashing(ctx context.Context, t *testing.T, h *harness, table, query string, args ...any) []string {
+	t.Helper()
+	return planConditions(ctx, t, h, hashed, table, query, args...)
+}
+
+// planConditions returns the conditions in the plan of query, on h's pool, where use, which
+// captures a subquery's name, finds one reading table.
+func planConditions(ctx context.Context, t *testing.T, h *harness, use *regexp.Regexp, table, query string, args ...any) []string {
+	t.Helper()
+	var plans []struct{ Plan map[string]any }
+	if err := h.pool.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+query, args...).Scan(&plans); err != nil || len(plans) != 1 {
+		t.Fatalf("EXPLAIN %d plans, %v", len(plans), err)
+	}
+	// Each subquery's name, as conditions read it, and whether it reads table; every condition.
+	reads := map[string]bool{}
+	var conditions []string
+	var walk func(node map[string]any) bool
+	walk = func(node map[string]any) bool {
+		found := node["Relation Name"] == table
+		for _, k := range []string{"Filter", "Index Cond", "Recheck Cond", "Join Filter", "Hash Cond", "One-Time Filter"} {
+			if c, ok := node[k].(string); ok {
+				conditions = append(conditions, c)
+			}
+		}
+		children, _ := node["Plans"].([]any)
+		for _, c := range children {
+			child, _ := c.(map[string]any)
+			below := walk(child)
+			if name, ok := child["Subplan Name"].(string); ok {
+				reads[name] = below
+			}
+			found = found || below
+		}
+		return found
+	}
+	walk(plans[0].Plan)
+	var found []string
+	for _, c := range conditions {
+		for _, m := range use.FindAllStringSubmatch(c, -1) {
+			if reads[m[1]] {
+				found = append(found, c)
+				break
+			}
+		}
+	}
+	return found
+}
+
+// overlap finds an array overlapped with a subquery's in a plan's condition, and hashed a key
+// looked up in a hashed subquery.
+var (
+	overlap = regexp.MustCompile(`&& \(*(InitPlan \d+)\)`)
+	hashed  = regexp.MustCompile(`hashed (SubPlan \d+)`)
+)
+
 // Filter's condition leaves out the resources denies on thousands of them, or of the workspaces
-// they are in, cover in about the time it takes for a few: a row's own key is looked up in a hash of
-// the denies on resources of its type, and each of its keys in one object of those on containers and
-// the tenant. Overlapping each row with every deny would cost it thousands of comparisons, and a
-// tenant's admins can set them.
+// they are in, cover by looking each row's keys up: its own in a hash of the denies on resources of
+// its type, and each of its keys in one object of those on containers and the tenant. Overlapping
+// each row with every deny would cost it thousands of comparisons, and a tenant's admins can set
+// them.
 func TestFilterLooksUpDeniesByEachRowsKeys(t *testing.T) {
 	for _, on := range []string{"cluster", "workspace"} {
 		t.Run(on, func(t *testing.T) {
@@ -487,9 +553,9 @@ func TestFilterLooksUpDeniesByEachRowsKeys(t *testing.T) {
 			h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "u"))
 			u := h.as(t, "u")
 			denied := 0
-			// The time Filter's condition takes to count the rows once n of them are denied, the
-			// fastest of a few, so a stall of the database's in one doesn't count.
-			listed := func(n int) time.Duration {
+			// Filter's condition, with what it keeps and how its plan reads the denies, once n of the
+			// rows are denied.
+			listed := func(n int) {
 				t.Helper()
 				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
 					SELECT 't1', $3, left($3, 1) || (i * 5), 'd', '{public:}', '{cluster:login}' FROM generate_series($1 + 1, $2) i`, denied, n, on); err != nil {
@@ -500,32 +566,29 @@ func TestFilterLooksUpDeniesByEachRowsKeys(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				var fastest time.Duration
-				for i := range 3 {
-					start := time.Now()
-					var kept int
-					if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM fleet WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil || kept != rows-n {
-						t.Fatalf("Filter kept %d of %d rows with %d denied, %v", kept, rows, n, err)
-					}
-					if took := time.Since(start); i == 0 || took < fastest {
-						fastest = took
-					}
+				query := `SELECT count(*) FROM fleet WHERE ` + pred.SQL
+				var kept int
+				if err := h.pool.QueryRow(ctx, query, pred.Args...).Scan(&kept); err != nil || kept != rows-n {
+					t.Fatalf("Filter kept %d of %d rows with %d denied, %v", kept, rows, n, err)
 				}
-				return fastest
+				if over := overlapping(ctx, t, h, "rbac_denies", query, pred.Args...); len(over) > 0 {
+					t.Errorf("with %d %ss denied, Filter's condition overlaps each row with the denies: %q", n, on, over)
+				}
+				// u's one grant is overlapped with each row's path, so finding none above is the plan's.
+				if len(overlapping(ctx, t, h, "rbac_grants", query, pred.Args...)) == 0 {
+					t.Fatal("overlapping finds no overlap of the path with u's one grant")
+				}
 			}
-			few := listed(40)
-			if many := listed(4000); many > 10*few && many > 100*time.Millisecond {
-				t.Fatalf("Filter's condition took %v with 40 %ss denied, and %v with 4000", few, on, many)
-			}
+			listed(40)
+			listed(4000)
 		})
 	}
 }
 
 // A subject holding a grant on each of thousands of workspaces, as one on each it created, lists a
-// page of them, or of the clusters in them, in about the time it takes for a few: past 128 grants,
-// each of a row's keys is looked up in one object of them. Overlapping each row with every grant
-// would cost it thousands of comparisons, and the index, which merges the rows each finds, as many
-// for each row it finds.
+// page of them, or of the clusters in them, by looking each of a row's keys up in one object of
+// them, past 128 grants. Overlapping each row with every grant would cost it thousands of
+// comparisons, and the index, which merges the rows each finds, as many for each row it finds.
 func TestFilterLooksUpGrantsOnContainersByEachRowsKeys(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -539,67 +602,44 @@ func TestFilterLooksUpGrantsOnContainersByEachRowsKeys(t *testing.T) {
 		`CREATE INDEX ON fleet USING gin (path)`,
 		`CREATE INDEX ON fleet (tenant, id)`,
 		`ANALYZE spaces, fleet`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'workspace', 'w' || i, 'user', 'u', r FROM generate_series(1, 4000) i, unnest('{workspace.admin,cluster.login}'::text[]) r`,
 	} {
 		if _, err := h.pool.Exec(ctx, q); err != nil {
 			t.Fatal(err)
 		}
 	}
 	u := h.as(t, "u")
-	lists := []struct {
+	for _, l := range []struct {
 		resourceType, table string
 		p                   rbac.Permission
-	}{{"workspace", "spaces", "workspace:view"}, {"cluster", "fleet", login}}
-	held := 0
-	// The time a page of 50 of each table's rows takes once u holds n workspaces, the fastest of a
-	// few, so a stall of the database's in one doesn't count.
-	pages := func(n int) []time.Duration {
-		t.Helper()
-		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
-			SELECT 't1', 'workspace', 'w' || i, 'user', 'u', r FROM generate_series($1 + 1, $2) i, unnest('{workspace.admin,cluster.login}'::text[]) r`,
-			held, n); err != nil {
+	}{{"workspace", "spaces", "workspace:view"}, {"cluster", "fleet", login}} {
+		pred, err := h.authz.Filter(ctx, u, l.p, "t1", l.resourceType, rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+		if err != nil {
 			t.Fatal(err)
 		}
-		held = n
-		var took []time.Duration
-		for _, l := range lists {
-			pred, err := h.authz.Filter(ctx, u, l.p, "t1", l.resourceType, rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var kept int
-			if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM `+l.table+` WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil || kept != n {
-				t.Fatalf("Filter kept %d %ss of %d, %v", kept, l.resourceType, n, err)
-			}
-			var fastest time.Duration
-			for i := range 3 {
-				start := time.Now()
-				rows, err := h.pool.Query(ctx, `SELECT id FROM `+l.table+` WHERE `+pred.SQL+` ORDER BY id LIMIT 50`, pred.Args...)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if ids, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || len(ids) != min(n, 50) {
-					t.Fatalf("a page of %d %ss, %v", len(ids), l.resourceType, err)
-				}
-				if d := time.Since(start); i == 0 || d < fastest {
-					fastest = d
-				}
-			}
-			took = append(took, fastest)
+		var kept int
+		if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM `+l.table+` WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil || kept != 4000 {
+			t.Fatalf("Filter kept %d %ss of 4000, %v", kept, l.resourceType, err)
 		}
-		return took
-	}
-	few := pages(40)
-	for i, many := range pages(4000) {
-		if many > 10*few[i] && many > 100*time.Millisecond {
-			t.Errorf("a page of %ss took %v with 40 workspaces granted, and %v with 4000", lists[i].resourceType, few[i], many)
+		page := `SELECT id FROM ` + l.table + ` WHERE ` + pred.SQL + ` ORDER BY id LIMIT 50`
+		rows, err := h.pool.Query(ctx, page, pred.Args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ids, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || len(ids) != 50 {
+			t.Fatalf("a page of %d %ss, %v", len(ids), l.resourceType, err)
+		}
+		if over := overlapping(ctx, t, h, "rbac_grants", page, pred.Args...); len(over) > 0 {
+			t.Errorf("a page of %ss overlaps each row with the 4000 workspaces granted: %q", l.resourceType, over)
 		}
 	}
 }
 
 // A subject holding grants on many clusters and on dozens of workspaces, as one on each it created,
-// is listed about as fast as when every grant is looked up by each of a row's keys: with those on
-// clusters in a hash, no index serves the condition, so overlapping each row with every grant on
-// the workspaces would cost every row of the tenant a comparison for each.
+// is listed by looking every grant up by each of a row's keys: with those on clusters in a hash, no
+// index serves the condition, so overlapping each row with every grant on the workspaces would cost
+// every row of the tenant a comparison for each.
 func TestFilterLooksUpGrantsOnContainersAlongsideManyOnResources(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -617,32 +657,18 @@ func TestFilterLooksUpGrantsOnContainersAlongsideManyOnResources(t *testing.T) {
 		}
 	}
 	u := h.as(t, "u")
-	// The time Filter's condition takes to count what it keeps, the fastest of a few, so a stall of
-	// the database's in one doesn't count.
-	counted := func() time.Duration {
-		t.Helper()
-		pred, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var fastest time.Duration
-		for i := range 3 {
-			start := time.Now()
-			// The ten clusters in each of w1 to w100, and those of c7 to c700 in none of them.
-			var kept int
-			if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM fleet WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil || kept != 1086 {
-				t.Fatalf("Filter kept %d clusters, %v", kept, err)
-			}
-			if took := time.Since(start); i == 0 || took < fastest {
-				fastest = took
-			}
-		}
-		return fastest
+	pred, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
 	}
-	took := counted()
-	rbac.SetMaxContainerOverlap(t, 0)
-	if keyed := counted(); took > 3*keyed && took > 100*time.Millisecond {
-		t.Errorf("Filter's condition took %v, and %v with every grant looked up", took, keyed)
+	// The ten clusters in each of w1 to w100, and those of c7 to c700 in none of them.
+	query := `SELECT count(*) FROM fleet WHERE ` + pred.SQL
+	var kept int
+	if err := h.pool.QueryRow(ctx, query, pred.Args...).Scan(&kept); err != nil || kept != 1086 {
+		t.Fatalf("Filter kept %d clusters, %v", kept, err)
+	}
+	if over := overlapping(ctx, t, h, "rbac_grants", query, pred.Args...); len(over) > 0 {
+		t.Errorf("Filter's condition overlaps each row with the grants on workspaces: %q", over)
 	}
 }
 
@@ -698,6 +724,130 @@ func TestFilterCountsOnlyTheGrantsGivingThePermission(t *testing.T) {
 	}
 	if indexed("op", 200) {
 		t.Error("Filter overlaps each cluster with 200 grants of a custom role")
+	}
+}
+
+// A list keeps to the path's index whatever grants giving nothing are stored, as a privileged
+// role's to the tenant's members, or the public's of a role that isn't public, as one a tenant's
+// admin made no longer public leaves: its condition counts none of them, so they don't pick its
+// form, where counted they would move every subject's list to a read of every row.
+func TestFilterIsFormedByTheGrantsItCounts(t *testing.T) {
+	public := rbac.RoleDefinition{ID: "cluster.public", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}, Public: true}
+	// A harness with a table of clusters whose path is indexed, and ann granted on one, where the
+	// public's grants count for logging in.
+	fleet := func(t *testing.T) (*harness, rbac.Subject) {
+		t.Helper()
+		h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), public) })
+		for _, q := range []string{
+			`CREATE TABLE fleet (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL)`,
+			`INSERT INTO fleet SELECT 't1', 'c' || i, ARRAY['cluster:c' || i, 'workspace:w' || (i % 500), 'org:o1', 'tenant:t1']
+				FROM generate_series(1, 20000) i`,
+			`CREATE INDEX fleet_path ON fleet USING gin (path)`,
+			`ANALYZE fleet`,
+		} {
+			if _, err := h.pool.Exec(t.Context(), q); err != nil {
+				t.Fatal(err)
+			}
+		}
+		h.seed(t, grant(rbac.Scope{Type: "cluster", ID: "c7"}, "cluster.login", rbac.User, "ann"))
+		return h, h.as(t, "ann")
+	}
+	// Whether s's list of clusters, keeping n, is served by the path's index.
+	indexed := func(t *testing.T, h *harness, s rbac.Subject, n int) bool {
+		t.Helper()
+		ctx := t.Context()
+		pred, err := h.authz.Filter(ctx, s, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var kept int
+		if err := h.pool.QueryRow(ctx, "SELECT count(*) FROM fleet WHERE "+pred.SQL, pred.Args...).Scan(&kept); err != nil || kept != n {
+			t.Fatalf("Filter kept %d clusters, %v", kept, err)
+		}
+		rows, err := h.pool.Query(ctx, "EXPLAIN SELECT count(*) FROM fleet WHERE "+pred.SQL, pred.Args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Contains(strings.Join(plan, "\n"), "Bitmap Index Scan on fleet_path")
+	}
+	for name, inert := range map[string]string{
+		"a privileged role's on 200 workspaces to the members": `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'workspace', 'w' || i, 'members', 't1', 'cluster.sudo' FROM generate_series(1, 200) i`,
+		"a privileged role's on 9 clusters to the members": `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', 'x' || i, 'members', 't1', 'cluster.sudo' FROM generate_series(1, 9) i`,
+		"the public's on 9 clusters of a role that isn't public": `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', 'x' || i, 'public', '', 'cluster.login' FROM generate_series(1, 9) i`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, ann := fleet(t)
+			// Stored around the package, as a catalog change leaves them.
+			if _, err := h.pool.Exec(t.Context(), inert); err != nil {
+				t.Fatal(err)
+			}
+			if !indexed(t, h, ann, 1) {
+				t.Error("grants giving nothing move a list off the path's index")
+			}
+		})
+	}
+	t.Run("a custom role made no longer public, the public's on 9 clusters", func(t *testing.T) {
+		h, ann := fleet(t)
+		ctx := t.Context()
+		h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.roles", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "cluster.admin", rbac.User, "admin"))
+		admin := h.as(t, "admin")
+		shared := rbac.RoleDefinition{ID: "custom.shared", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}, Public: true}
+		if err := h.authz.SetRole(ctx, admin, "t1", shared); err != nil {
+			t.Fatal(err)
+		}
+		var grants []rbac.Grant
+		for i := range 9 {
+			grants = append(grants, grant(rbac.Scope{Type: "cluster", ID: fmt.Sprint("c", 100+i)}, "custom.shared", rbac.Public, ""))
+		}
+		h.seed(t, grants...)
+		shared.Public = false
+		if err := h.authz.SetRole(ctx, admin, "t1", shared); err != nil {
+			t.Fatalf("SetRole making it not public: %v", err)
+		}
+		if allowed(t, h, rbac.Subject{}, login, rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c100"}) {
+			t.Fatal("the public's grant of a role no longer public gives")
+		}
+		for name, c := range map[string]struct {
+			s rbac.Subject
+			n int
+		}{"ann": {ann, 1}, "the anonymous": {rbac.Subject{}, 0}} {
+			if !indexed(t, h, c.s, c.n) {
+				t.Errorf("%s: grants giving nothing move a list off the path's index", name)
+			}
+		}
+	})
+}
+
+// Lowering how many grants on containers Filter overlaps, as a test does to compare the forms it
+// takes past that, leaves a subject with many grants on resources of the type and none on
+// containers looking those up in a hash: counted only as far as the lowered bound, they never
+// passed the few the hash takes.
+func TestLoweringTheContainerBoundKeepsTheHashOfGrantsOnResources(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE fleet (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	var grants []rbac.Grant
+	for i := range 9 {
+		grants = append(grants, grant(rbac.Scope{Type: "cluster", ID: fmt.Sprint("x", i)}, "cluster.login", rbac.User, "ann"))
+	}
+	h.seed(t, grants...)
+	ann := h.as(t, "ann")
+	rbac.SetMaxContainerOverlap(t, 0)
+	pred, err := h.authz.Filter(ctx, ann, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hashing(ctx, t, h, "rbac_grants", "SELECT count(*) FROM fleet WHERE "+pred.SQL, pred.Args...)) == 0 {
+		t.Error("with SetMaxContainerOverlap(0), Filter doesn't look 9 grants on clusters up in a hash")
 	}
 }
 
@@ -2937,6 +3087,54 @@ func TestDeleteScopeRemovesAGrantMadeWhileItWaits(t *testing.T) {
 				t.Fatal("a grant made while its scope was deleted outlived the delete")
 			}
 		})
+	}
+}
+
+// DeleteScopes removes a deny on its scopes that a change taking a principal out of the deny's
+// exemptions, which takes no lock of the scope's, changed while the delete waited for it: the delete
+// finds it again by its key, where by a ctid, which the change moved, it would pass over it.
+func TestDeleteScopesRemovesADenyChangedWhileItWaits(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+		VALUES ('t1', 'cluster', 'c1', 'd', '{public:}', '{user:p}', '{cluster:root}')`); err != nil {
+		t.Fatal(err)
+	}
+	h.as(t, "p")
+	// p leaves the tenant, and its exemption, in a transaction that holds the deny until it ends.
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := h.authz.WithTx(tx).DeletePrincipal(ctx, host, "t1", identity("p")); err != nil {
+		t.Fatal(err)
+	}
+	var pid int
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- h.authz.DeleteScopes(ctx, host, "t1", []rbac.Scope{cluster.Scope()}) }()
+	for waiting := false; !waiting; {
+		select {
+		case err := <-done:
+			t.Fatalf("DeleteScopes waited for nothing p's removal holds: %v", err)
+		default:
+		}
+		if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	ds, err := h.authz.Denies(ctx, "t1", []rbac.Scope{cluster.Scope()})
+	if err != nil || len(ds) > 0 {
+		t.Fatalf("denies left on a scope deleted: %+v, %v", ds, err)
 	}
 }
 

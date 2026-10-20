@@ -5,10 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -449,24 +452,59 @@ func TestADeclaredAttributePassedAsANilPointerOrAPointerToAListFailsItsCondition
 	}
 }
 
-// doubling is a condition that nests a list in itself k times, so it holds 2^k values, at little
-// cost, and then compares it with itself, which reads them all in one call.
-func doubling(k int, compare string) string {
-	return "[[1]]" + strings.Repeat(".map(x, [x, x])", k) + ".map(x, " + compare + ")[0]"
+// doubling is a condition that nests a list of leaf in itself k times, so it holds 2^k leaves, at
+// little cost, and then compares it with itself, which reads them all in one call.
+func doubling(leaf string, k int, compare string) string {
+	return "[[" + leaf + "]]" + strings.Repeat(".map(x, [x, x])", k) + ".map(x, " + compare + ")[0]"
 }
 
+// compared is a value a condition reads that counts each comparison of it, so a test sees whether
+// a comparison ran.
+type compared struct{ n *int }
+
+var comparedType = types.NewOpaqueType("rbac_test.Compared")
+
+func (c compared) ConvertToNative(reflect.Type) (any, error) {
+	return nil, errors.New("compared converts to nothing")
+}
+
+func (c compared) ConvertToType(ref.Type) ref.Val {
+	return types.NewErr("compared converts to nothing")
+}
+
+func (c compared) Equal(other ref.Val) ref.Val {
+	*c.n++
+	return types.Bool(other == ref.Val(c))
+}
+
+func (c compared) Type() ref.Type { return comparedType }
+
+func (c compared) Value() any { return c }
+
+// A comparison of more values than a condition may spend reading is refused before it reads any:
+// a call's cost is counted only once it has run, and the values a condition doubles cheaply would
+// hold a check for as long as reading them takes.
 func TestAConditionComparingMoreThanItsCostIsRefusedBeforeItRuns(t *testing.T) {
 	h := setup(t)
 	for id, compare := range map[string]string{"equal": "x == x", "unequal": "!(x != x)", "in": "x in [x]"} {
 		g := grant(cluster.Scope(), "cluster.login", rbac.User, id)
-		g.Condition = rbac.Condition{Expression: doubling(24, compare)}
+		g.Condition = rbac.Condition{Expression: doubling("resource.attributes.leaf", 16, compare)}
 		h.seed(t, g)
-		start := time.Now()
-		if allowed(t, h, h.as(t, id), login, cluster) {
+		n := 0
+		r := cluster
+		r.Attributes = map[string]any{"leaf": compared{&n}}
+		if allowed(t, h, h.as(t, id), login, r) {
 			t.Errorf("%s: a condition past its cost held", id)
 		}
-		if took := time.Since(start); took > time.Second {
-			t.Errorf("%s: a check took %s", id, took)
+		if n > 0 {
+			t.Errorf("%s: a check compared %d of the values of a comparison past its cost", id, n)
+		}
+		// Within its cost the comparison reads the leaf, so a count of none above is one refused.
+		few := grant(cluster.Scope(), "cluster.login", rbac.User, id+"-few")
+		few.Condition = rbac.Condition{Expression: doubling("resource.attributes.leaf", 1, compare)}
+		h.seed(t, few)
+		if !allowed(t, h, h.as(t, id+"-few"), login, r) || n == 0 {
+			t.Errorf("%s: a comparison within its cost compared %d values", id, n)
 		}
 	}
 }
@@ -476,7 +514,7 @@ func TestAConditionNestedTooDeeplyIsRefused(t *testing.T) {
 	for name, expr := range map[string]string{
 		"lists":          strings.Repeat("[", 40) + strings.Repeat("]", 40) + " == []",
 		"parentheses":    strings.Repeat("(", 40) + "true" + strings.Repeat(")", 40),
-		"a chain of map": doubling(40, "x == x"),
+		"a chain of map": doubling("1", 40, "x == x"),
 	} {
 		g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
 		g.Condition = rbac.Condition{Expression: expr}
@@ -561,16 +599,18 @@ func TestAChangeCarriesBoundedConditions(t *testing.T) {
 	for i, b := range broken {
 		imported[i] = rbac.Grant{Scope: cluster.Scope(), Binding: b}
 	}
+	checks := 0
+	rbac.SetCheckingCondition(t, func() { checks++ })
 	for how, change := range map[string]func() error{
 		"Apply":  func() error { return h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: broken}) },
 		"Import": func() error { return h.authz.Import(ctx, host, "t1", imported) },
 	} {
-		start := time.Now()
+		checks = 0
 		if err := change(); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("%s of one condition that doesn't compile on every binding: %v", how, err)
 		}
-		if took := time.Since(start); took > time.Second {
-			t.Errorf("%s of one condition that doesn't compile on every binding took %s", how, took)
+		if checks != 1 {
+			t.Errorf("%s of one condition that doesn't compile on %d bindings checked it %d times", how, len(broken), checks)
 		}
 	}
 }
@@ -721,12 +761,15 @@ func TestAChangeHandingOnUnderAConditionParsesItOnce(t *testing.T) {
 	for i := range bs {
 		bs[i] = rbac.Binding{Role: "cluster.login", Principal: identity(fmt.Sprintf("u%d", i)), Condition: cond}
 	}
-	start := time.Now()
-	if err := h.authz.Apply(ctx, h.as(t, "admin"), cluster, rbac.Change{Grant: bs}); err != nil {
+	admin := h.as(t, "admin")
+	parsed := 0
+	rbac.SetParsingCondition(t, func() { parsed++ })
+	if err := h.authz.Apply(ctx, admin, cluster, rbac.Change{Grant: bs}); err != nil {
 		t.Fatal(err)
 	}
-	if took := time.Since(start); took > time.Second {
-		t.Errorf("handing on under one condition on %d bindings took %s", len(bs), took)
+	// Once as the change is decided, and once as it is decided again in its transaction.
+	if parsed == 0 || parsed > 2 {
+		t.Errorf("handing on under one condition on %d bindings parsed it %d times", len(bs), parsed)
 	}
 }
 

@@ -831,6 +831,52 @@ func TestHoldersLeavesOutTheBroadWhoseOneValueTheLabelDoesNotAsk(t *testing.T) {
 	}
 }
 
+// Holders of a resource labeled with an exclusive dimension reads, of the grants to the tenant's
+// members and the public, only those on the tenant, for the values they could give, under a generic
+// plan too: by the scope's type, which no index holds, it read every grant they hold in the tenant.
+func TestHoldersOfAnExclusivelyLabeledResourceReadOnlyTheBroadGrantsOnTheTenant(t *testing.T) {
+	for _, plan := range []string{"custom", "generic"} {
+		t.Run(plan, func(t *testing.T) {
+			var h *harness
+			if plan == "generic" {
+				h = generic(t, banks)
+			} else {
+				h = custom(t, banks)
+			}
+			ctx := t.Context()
+			h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Members, "t1"), grant(rbac.TenantRoot("t1"), "bank.a", rbac.Members, "t1"))
+			labeled := cluster
+			labeled.Labels = rbac.Label{"bank": {"a"}}
+			// The pages of the grants Holders reads, in a transaction it rolls back.
+			read := func() int64 {
+				t.Helper()
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				start := pagesRead(ctx, t, tx, "rbac_grants")
+				if hs, err := h.authz.WithTx(tx).Holders(ctx, login, labeled); err != nil || len(hs) != 1 {
+					t.Fatalf("Holders = %+v, %v", hs, err)
+				}
+				return pagesRead(ctx, t, tx, "rbac_grants") - start
+			}
+			// The members hold a role on a workspace of each other identity's.
+			others := func(n int) {
+				t.Helper()
+				manyMembers(t, h, n, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+					SELECT 't1', 'workspace', id, 'members', 't1', 'cluster.login' FROM others`, "rbac_grants")
+			}
+			others(500)
+			few := read()
+			others(4500)
+			if many := read(); many > few*3/2+deeper {
+				t.Errorf("Holders read %d pages of grants, and %d once the members held 4500 more on workspaces", few, many)
+			}
+		})
+	}
+}
+
 // Under an exclusive AllOf dimension, a label asking two values is one no one passes, so Holders
 // leaves out the tenant's members, though each may hold one value of their own, as it does, once
 // their grants give one, for a label asking another.
