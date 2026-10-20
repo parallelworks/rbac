@@ -694,10 +694,11 @@ type Config struct {
 	// no Labels, and resource Attributes as none (an empty map, as nil lets conditions read any), and
 	// on a scope other than the tenant or a group, no ContainerTypes. For any other, that change is
 	// refused. SetRole changing what a custom role's grants give, and DeleteRole, check the label of
-	// each scope the role is granted on as it returns it, so with Labels declared they need it too. A
-	// removal reads a scope it reports as ErrNotFound as unlabeled, and ChangeMembers and DeleteRole
-	// ask nothing of the scopes only a removal reaches where the actor's label values satisfy every
-	// label.
+	// each scope the role is granted on, and where a deny on a scope other than the tenant binds the
+	// actor, the denies on its path, as it returns it, so with Labels declared, or such a deny, they
+	// need it too. A removal reads a scope it reports as ErrNotFound as stored and unlabeled, and
+	// ChangeMembers and DeleteRole ask nothing of the scopes only a removal reaches where the actor's
+	// label values satisfy every label and, for DeleteRole, no such deny binds it.
 	ResourceOf func(ctx context.Context, tenant string, s Scope) (Resource, error)
 	// Permissions are every permission the host checks, whether or not a role gives it, so that a
 	// catalog leaving one out, as one an operator configures may, refuses it like any permission

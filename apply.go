@@ -832,6 +832,8 @@ type authority struct {
 	// the tenant reaches other resources: a deny whose condition reads the resource can't be
 	// evaluated for them, so it denies. What a deny removes the actor can't use or hand on.
 	denied, handsOn func(p Permission) bool
+	// denials are the denies on the path that bind the actor, which denied and handsOn read.
+	denials []denial
 	// defining is a custom role SetRole checks: the roles a check names resolve to it, but the
 	// actor's own grants of it give what it gives now.
 	defining *RoleDefinition
@@ -1147,7 +1149,7 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 		allows: func(h holding, action Permission) bool {
 			return !h.conditional || a.conds.holds(spend(action), h.Condition.Expression, with(vars, action))
 		},
-		denied: denied, handsOn: handsOn, subjects: subjects{},
+		denied: denied, handsOn: handsOn, denials: ds, subjects: subjects{},
 	}
 }
 
