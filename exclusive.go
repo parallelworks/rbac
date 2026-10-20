@@ -255,11 +255,16 @@ func (a *Authorizer) excludes(ctx context.Context, tx pgx.Tx, tenant string, e C
 		}
 	}
 	// A suspended membership holds only what the public does, so suspending one never widens what
-	// it holds, and isn't refused even where the public's grants could give two values.
+	// it holds, and isn't refused even where the public's grants could give two values; but one
+	// made, renewed or lifted from a guest's suspended will hold more once lifted, which lifting it
+	// would then be refused for.
 	for _, m := range e.Memberships {
 		if !m.Suspended {
 			seeds = append(seeds, m.Principal.key())
 		}
+	}
+	for _, p := range e.widened {
+		seeds = append(seeds, p.key())
 	}
 	for _, m := range e.Joined {
 		seeds = append(seeds, m.Principal.key())

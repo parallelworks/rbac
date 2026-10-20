@@ -206,6 +206,25 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 		// would remove them, each membership held before its members as there, so the two never
 		// deadlock; and any places of an identity with no membership, which joins in none.
 		at := a.cfg.Now()
+		// A suspended membership widens what its identity will hold once lifted where it is new, was
+		// ended, or was a guest's and no longer is: read before the upsert, for the exclusive values.
+		var widened []Principal
+		if a.exclusive() {
+			rows, err := tx.Query(ctx, `SELECT k FROM unnest($2::text[], $3::bool[], $4::bool[]) AS t(k, g, s)
+				WHERE s AND NOT EXISTS (SELECT FROM rbac_memberships m WHERE m.tenant = $1 AND m.principal = t.k
+				  AND (m.expires_at IS NULL OR m.expires_at > $5) AND (NOT m.guest OR t.g))`,
+				tenant, keys, guests, suspended, at)
+			if err != nil {
+				return ChangeEvent{}, err
+			}
+			ks, err := pgx.CollectRows(rows, pgx.RowTo[string])
+			if err != nil {
+				return ChangeEvent{}, err
+			}
+			for _, k := range ks {
+				widened = append(widened, parsePrincipal(k))
+			}
+		}
 		left, err := removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant, `principal = ANY(
 			ARRAY(SELECT principal FROM rbac_memberships WHERE tenant = $1 AND principal = ANY($2::text[]) AND expires_at <= $3 FOR UPDATE)
 			|| ARRAY(SELECT k FROM unnest($2::text[]) AS k WHERE NOT EXISTS (SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = k)))`,
@@ -231,7 +250,7 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 			return ChangeEvent{}, err
 		}
 		changed, err := collectMemberships(rows)
-		return ChangeEvent{Memberships: changed, Left: left}, err
+		return ChangeEvent{Memberships: changed, Left: left, widened: widened}, err
 	})
 }
 
@@ -1669,7 +1688,9 @@ func (a *Authorizer) Members(ctx context.Context, tenant, group string) ([]Membe
 
 // GroupsOf lists the groups a principal is in in a tenant, by id: those it is a member of, and
 // those they are in, to the top, as memberships are in force now. An identity whose membership of
-// the tenant ended is in none.
+// the tenant ended is in none. One whose membership is suspended is listed in its groups, which a
+// check counts then only to bind it to denies, never to give it their grants: a constraint that
+// lets a group's members through should check the membership too (Memberships).
 func (a *Authorizer) GroupsOf(ctx context.Context, tenant string, p Principal) ([]string, error) {
 	// The zero principal, the anonymous subject's, which a constraint may ask about, is in none.
 	if !validID(tenant) || p != (Principal{}) && !p.wellFormed(tenant) {

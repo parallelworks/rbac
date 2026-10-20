@@ -779,3 +779,28 @@ func TestHoldersListsNoOneForALabelAskingTwoExclusiveValuesOfAllOf(t *testing.T)
 		t.Fatal("the members, each holding x, are listed for a label asking y")
 	}
 }
+
+// A membership made suspended, or a guest's made a member's while suspended, will hold more once
+// lifted, so it is checked for exclusive values as a membership in force is: otherwise it leaves a
+// conflict no catalog change made, which lifting the suspension is refused for.
+func TestASuspendedJoinIsCheckedForExclusiveValues(t *testing.T) {
+	for name, before := range map[string]func(*testing.T, *harness){
+		"no member yet": func(*testing.T, *harness) {},
+		"a guest": func(t *testing.T, h *harness) {
+			t.Helper()
+			h.guest(t, "zed")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := labeled(t, banks)
+			ctx := t.Context()
+			before(t, h)
+			h.hold(t, "zed", "bank:a")
+			h.seed(t, grant(rbac.TenantRoot("t1"), "bank.b", rbac.Members, "t1"))
+			excluded(t, h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("zed"), Suspended: true}}))
+			if cs, err := h.authz.Conflicts(ctx, "t1"); err != nil || len(cs) > 0 {
+				t.Fatalf("Conflicts = %+v, %v", cs, err)
+			}
+		})
+	}
+}
