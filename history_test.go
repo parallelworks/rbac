@@ -784,7 +784,8 @@ func TestMigratingRecordsARowWrittenBeforeHistory(t *testing.T) {
 		t.Fatalf("as of after the prune: %v, %v", notes, err)
 	}
 	// Each holds what rbac_record records of its row: the record of the row's next change holds as
-	// Before what the baseline holds as After, beside the same columns.
+	// Before what the baseline holds as After, beside the same columns, and the columns a later
+	// migration added, null.
 	for _, table := range []string{"rbac_members", "rbac_grants", "rbac_eligibilities", "rbac_denies", "rbac_roles", "rbac_memberships", "rbac_groups"} {
 		if _, err := pool.Exec(ctx, `DELETE FROM `+table); err != nil {
 			t.Fatal(err)
@@ -803,10 +804,28 @@ func TestMigratingRecordsARowWrittenBeforeHistory(t *testing.T) {
 	for _, b := range baselines {
 		r := next[[3]string{b.Tenant, b.Entity, b.Key}]
 		if r.Principal != b.Principal || r.Role != b.Role || r.Scope != b.Scope || r.Group != b.Group ||
-			!r.ExpiresAt.Equal(b.ExpiresAt) || string(r.Before) != string(b.After) {
+			!r.ExpiresAt.Equal(b.ExpiresAt) || !sameRow(t, b.After, r.Before) {
 			t.Errorf("%s %s: baseline %+v, next record %+v", b.Entity, b.Key, b, r)
 		}
 	}
+}
+
+// sameRow reports whether two records hold a row alike, but for the columns later holds that were
+// added since, null in it.
+func sameRow(t *testing.T, earlier, later json.RawMessage) bool {
+	t.Helper()
+	var was, is map[string]any
+	if err := json.Unmarshal(earlier, &was); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(later, &is); err != nil {
+		t.Fatal(err)
+	}
+	maps.DeleteFunc(is, func(k string, v any) bool {
+		_, held := was[k]
+		return !held && v == nil
+	})
+	return reflect.DeepEqual(was, is)
 }
 
 // No table bounds when a row was created, so one written before history can say -infinity, before
@@ -944,6 +963,95 @@ func TestMigratingOnAHostsTransactionRecordsWhatHasCommitted(t *testing.T) {
 				t.Fatalf("as of now: %v, %v", notes, err)
 			}
 		})
+	}
+}
+
+// Migrating records an activation stored before Activate recorded what it was made through as made
+// through the one eligibility for its role on its scope whose principal its holder reaches, in its
+// tenant, by its membership and the places in groups in force; one whose holder reaches several, or
+// none, records nothing, and the first change ending a place of its holder's ends it. An activation
+// that has ended is left as it is.
+func TestMigratingTiesAnActivationToTheEligibilityItWasMadeThrough(t *testing.T) {
+	pool := pgtest.Open(t, "")
+	ctx := t.Context()
+	migrateFiles(t, pool, "", "0012")
+	// In t1, u1 is in oncall, u3 in inner, which is in oncall, u4 in oncall and team, u5 in other,
+	// u6 in team and, no longer, in oncall, and u7, in oncall, has left; u2 is eligible itself, and
+	// oncall and team are. In t2, u1 is in team, which is eligible there.
+	for _, sql := range []string{
+		`INSERT INTO rbac_groups (tenant, id) VALUES ('t1', 'oncall'), ('t1', 'team'), ('t1', 'inner'), ('t1', 'other'), ('t2', 'team')`,
+		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id, expires_at)
+		 SELECT 't1', 'user', 'u' || i, CASE WHEN i = 7 THEN now() - interval '1 hour' END FROM generate_series(1, 8) i
+		 UNION ALL SELECT 't2', 'user', 'u1', NULL`,
+		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, expires_at)
+		 VALUES ('t1', 'oncall', 'user', 'u1', NULL), ('t1', 'other', 'user', 'u1', NULL), ('t1', 'inner', 'user', 'u3', NULL),
+		   ('t1', 'oncall', 'group', 'inner', NULL), ('t1', 'oncall', 'user', 'u4', NULL), ('t1', 'team', 'user', 'u4', NULL),
+		   ('t1', 'other', 'user', 'u5', NULL), ('t1', 'team', 'user', 'u6', NULL), ('t1', 'oncall', 'user', 'u6', now() - interval '1 minute'),
+		   ('t1', 'oncall', 'user', 'u7', NULL), ('t1', 'oncall', 'user', 'u8', NULL), ('t2', 'team', 'user', 'u1', NULL)`,
+		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+		 VALUES ('t1', 'cluster', 'c1', 'group', 'oncall', 'cluster.sudo', 28800), ('t1', 'cluster', 'c1', 'group', 'team', 'cluster.sudo', 28800),
+		   ('t1', 'cluster', 'c1', 'user', 'u2', 'cluster.sudo', 28800), ('t1', 'cluster', 'c1', 'group', 'other', 'cluster.login', 28800),
+		   ('t2', 'cluster', 'c1', 'group', 'team', 'cluster.sudo', 28800)`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at)
+		 SELECT 't1', 'cluster', 'c1', 'user', 'u' || i, 'cluster.sudo', 'activation', now() + CASE WHEN i = 8 THEN interval '-1 hour' ELSE interval '1 hour' END
+		 FROM generate_series(1, 8) i`,
+	} {
+		if _, err := pool.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	migrateFiles(t, pool, "0012", "")
+	rows, err := pool.Query(ctx, `SELECT g.principal || ' ' || coalesce(g.activated_through, 'none') || ' ' || coalesce((g.eligibility_id = e.id)::text, 'none')
+		FROM rbac_grants g LEFT JOIN rbac_eligibilities e ON e.tenant = g.tenant AND e.scope = g.scope AND e.role = g.role AND e.principal = g.activated_through
+		ORDER BY g.principal`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || !slices.Equal(got, []string{
+		"user:u1 group:oncall true", "user:u2 user:u2 true", "user:u3 group:oncall true", "user:u4 none none",
+		"user:u5 none none", "user:u6 group:team true", "user:u7 none none", "user:u8 none none",
+	}) {
+		t.Fatalf("activations made through: %v, %v", got, err)
+	}
+	// History records what each is made through, as migrating found it.
+	var recorded int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM rbac_history WHERE entity = 'grant' AND op = 'update' AND how = 'Migrate'
+		AND after->>'activated_through' IS NOT NULL AND after->'eligibility_id' IS NOT NULL`).Scan(&recorded); err != nil || recorded != 4 {
+		t.Fatalf("migrating recorded %d activations' eligibilities, %v", recorded, err)
+	}
+	h := migrated(t, pool)
+	leave := func(group string, ids ...string) {
+		t.Helper()
+		var ms []rbac.Member
+		for _, id := range ids {
+			ms = append(ms, rbac.Member{Group: group, Principal: identity(id)})
+		}
+		if err := h.authz.DeleteMembers(ctx, host, "t1", ms); err != nil {
+			t.Fatal(err)
+		}
+	}
+	held := func() []string {
+		t.Helper()
+		grants, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ids []string
+		for _, g := range grants {
+			ids = append(ids, g.Principal.ID)
+		}
+		return ids
+	}
+	// u1 leaving a group its activation doesn't rest on keeps it, u4 leaving one ends what records
+	// nothing, and u1 leaving oncall ends its own.
+	leave("other", "u1", "u5")
+	leave("team", "u4")
+	if got := held(); !slices.Equal(got, []string{"u1", "u2", "u3", "u6", "u7"}) {
+		t.Fatalf("activations held once u1 and u5 left other and u4 team: %v", got)
+	}
+	leave("oncall", "u1")
+	if got := held(); slices.Contains(got, "u1") {
+		t.Fatalf("activations held once u1 left oncall: %v", got)
 	}
 }
 
@@ -1588,6 +1696,61 @@ func TestAnActivationEndedAheadOfTheDatabasesClockIsExtended(t *testing.T) {
 	}
 	if got, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || !slices.Equal(got, []string{"create", "update"}) {
 		t.Fatalf("recorded %v, %v", got, err)
+	}
+}
+
+// History records the eligibility each version of an activation was made through, by its principal
+// and its id, which keys the eligibility's own records, and AsOf reads each version so.
+func TestHistoryRecordsWhatAnActivationWasMadeThrough(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.groups(t, "oncall", "team")
+	u := h.as(t, "u", "oncall", "team")
+	for _, g := range []string{"oncall", "team"} {
+		if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: groupOf(g), MaxDuration: 8 * time.Hour}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	act := func(d time.Duration) rbac.Grant {
+		t.Helper()
+		g, err := h.authz.Activate(ctx, u, cluster, rbac.Activation{Role: "cluster.sudo", Duration: d, Justification: "incident"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return g
+	}
+	g := act(time.Hour)
+	between := dbNow(t, h)
+	// Through team, once oncall's is gone, for longer.
+	if err := h.authz.DeleteEligibility(ctx, h.as(t, "owner"), cluster, "cluster.sudo", groupOf("oncall")); err != nil {
+		t.Fatal(err)
+	}
+	act(2 * time.Hour)
+	rows, err := h.pool.Query(ctx, `SELECT g.op || ' ' || (g.after->>'activated_through') || ' ' || (g.after->>'eligibility_id' = e.key)::text
+		FROM rbac_history g JOIN rbac_history e ON e.tenant = g.tenant AND e.entity = 'eligibility' AND e.op = 'create' AND e.principal = g.after->>'activated_through'
+		WHERE g.entity = 'grant' AND g.key = $1 ORDER BY g.id`, g.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || !slices.Equal(got, []string{"create group:oncall true", "update group:team true"}) {
+		t.Fatalf("recorded %v, %v", got, err)
+	}
+	rebuilt(t, h, dbNow(t, h))
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := h.authz.WithTx(tx).AsOf(ctx, "t1", between, func(*rbac.Authorizer) error {
+		var through string
+		var id int64
+		if err := tx.QueryRow(ctx, `SELECT g.activated_through, g.eligibility_id - e.id FROM rbac_grants g
+			JOIN rbac_eligibilities e ON e.principal = g.activated_through`).Scan(&through, &id); err != nil || through != "group:oncall" || id != 0 {
+			t.Errorf("as of the first activation, made through %q, %d from its id, %v", through, id, err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 

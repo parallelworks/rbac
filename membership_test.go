@@ -582,8 +582,8 @@ func TestLeavingUnderAGenericPlanReadsOnlyWhatNamesTheLeaver(t *testing.T) {
 		{`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
 		  VALUES ('t1', 'cluster', 'c1', 'group', 'everyone', 'cluster.sudo', 7200, '{}'),
 		         ('t1', 'cluster', 'c1', 'user', 'v', 'cluster.sudo', 3600, '{user:x,group:oncall,user:lead}')`, nil},
-		{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at)
-		  VALUES ('t1', 'cluster', 'c1', 'user', 'x', 'cluster.sudo', 'activation', $1)`, []any{h.now.Add(time.Hour)}},
+		{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at, activated_through)
+		  VALUES ('t1', 'cluster', 'c1', 'user', 'x', 'cluster.sudo', 'activation', $1, 'group:everyone')`, []any{h.now.Add(time.Hour)}},
 		{`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
 		  VALUES ('t1', 'cluster', 'c1', 'd', '{public:}', '{user:x,group:oncall}', '{cluster:root}')`, nil},
 	} {

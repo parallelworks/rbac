@@ -192,86 +192,104 @@ func TestEndingAPlaceOrMembershipEndsTheActivationsRestingOnIt(t *testing.T) {
 	}
 }
 
-// Ending a place or a membership ends only what it allowed: an activation another place, or the
-// identity's own eligibility, still allows lasts, as does one no eligibility allows anymore, which
-// deleting its eligibility left to its own end.
+// Ending a place or a membership ends only the activations resting on it: one made through another
+// group, or through the identity's own eligibility, lasts, as does one whose group the change leaves
+// its holder in, and one whose eligibility was deleted or set to end sooner, which that left to its
+// own end, when its holder leaves another group.
 func TestEndingAPlaceLeavesTheActivationsItDoesntAllow(t *testing.T) {
-	leave := func(t *testing.T, h *harness) error {
+	leave := func(group string) func(t *testing.T, h *harness) error {
+		return func(t *testing.T, h *harness) error {
+			t.Helper()
+			return h.authz.ChangeMembers(t.Context(), h.as(t, "manager"), "t1", nil, []rbac.Member{{Group: group, Principal: identity("u")}})
+		}
+	}
+	eligible := func(t *testing.T, h *harness, e rbac.Eligibility) {
 		t.Helper()
-		return h.authz.ChangeMembers(t.Context(), h.as(t, "manager"), "t1", nil, []rbac.Member{{Group: "oncall", Principal: identity("u")}})
+		e.Role, e.MaxDuration = "cluster.sudo", 8*time.Hour
+		if err := h.authz.SetEligibility(t.Context(), h.as(t, "owner"), cluster, e); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for name, c := range map[string]struct {
-		nested bool
+		// made sets up what u activates through, and returns u and whoever approves.
+		made func(t *testing.T, h *harness) (u, approver rbac.Subject)
+		// before changes what u activated, once it has.
 		before func(t *testing.T, h *harness) error
 		end    func(t *testing.T, h *harness) error
 	}{
-		"another group allows it": {before: func(t *testing.T, h *harness) error {
+		"made through another group": {made: func(t *testing.T, h *harness) (rbac.Subject, rbac.Subject) {
 			t.Helper()
-			h.as(t, "u", "oncall", "team")
-			return h.authz.SetEligibility(t.Context(), h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: groupOf("team"), MaxDuration: 8 * time.Hour})
-		}, end: leave},
-		"its own eligibility allows it": {before: func(t *testing.T, h *harness) error {
+			eligible(t, h, rbac.Eligibility{Principal: groupOf("team")})
+			return h.as(t, "u", "oncall", "team"), rbac.Subject{}
+		}, end: leave("oncall")},
+		"made through its own eligibility": {made: func(t *testing.T, h *harness) (rbac.Subject, rbac.Subject) {
 			t.Helper()
-			return h.authz.SetEligibility(t.Context(), h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: identity("u"), MaxDuration: 8 * time.Hour})
-		}, end: leave},
-		"its eligibility was deleted": {before: func(t *testing.T, h *harness) error {
+			eligible(t, h, rbac.Eligibility{Principal: identity("u")})
+			return h.as(t, "u", "oncall"), rbac.Subject{}
+		}, end: leave("oncall")},
+		// Setting the eligibility to end sooner, or deleting it, left the activation to its end,
+		// which leaving a group it doesn't rest on changes nothing of.
+		"its eligibility ends sooner, and it leaves another group": {made: func(t *testing.T, h *harness) (rbac.Subject, rbac.Subject) {
 			t.Helper()
-			return h.authz.DeleteEligibility(t.Context(), h.as(t, "owner"), cluster, "cluster.sudo", groupOf("oncall"))
-		}, end: leave},
-		// Setting the eligibility to end sooner left the activation to its end, which leaving a group
-		// it doesn't rest on changes nothing of.
-		"its eligibility ends sooner, and it leaves another group": {before: func(t *testing.T, h *harness) error {
+			eligible(t, h, rbac.Eligibility{Principal: groupOf("oncall")})
+			return h.as(t, "u", "oncall", "team"), rbac.Subject{}
+		}, before: func(t *testing.T, h *harness) error {
 			t.Helper()
-			h.as(t, "u", "oncall", "team")
 			return h.authz.SetEligibility(t.Context(), h.as(t, "owner"), cluster, rbac.Eligibility{
 				Role: "cluster.sudo", Principal: groupOf("oncall"), MaxDuration: 8 * time.Hour, ExpiresAt: h.now.Add(2 * time.Hour),
 			})
-		}, end: func(t *testing.T, h *harness) error {
+		}, end: leave("team")},
+		"its eligibility was deleted, and it leaves another group": {made: func(t *testing.T, h *harness) (rbac.Subject, rbac.Subject) {
 			t.Helper()
-			return h.authz.ChangeMembers(t.Context(), h.as(t, "manager"), "t1", nil, []rbac.Member{{Group: "team", Principal: identity("u")}})
-		}},
-		// Deleting a group's eligibilities and places leaves its members in it: the activation resting
-		// on its own eligibility, which deleting leaves to its end, rests on nothing deleting ends.
-		"the group it rests on keeps its members": {nested: true, before: func(t *testing.T, h *harness) error {
+			eligible(t, h, rbac.Eligibility{Principal: groupOf("oncall")})
+			return h.as(t, "u", "oncall", "team"), rbac.Subject{}
+		}, before: func(t *testing.T, h *harness) error {
 			t.Helper()
-			if err := h.authz.SetEligibility(t.Context(), h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: groupOf("inner"), MaxDuration: 8 * time.Hour}); err != nil {
-				return err
-			}
 			return h.authz.DeleteEligibility(t.Context(), h.as(t, "owner"), cluster, "cluster.sudo", groupOf("oncall"))
+		}, end: leave("team")},
+		// Deleting a group as a principal deletes its eligibilities and its places in other groups,
+		// and leaves its members in it, which the activation made through it rests on.
+		"the group it was made through keeps its members": {made: func(t *testing.T, h *harness) (rbac.Subject, rbac.Subject) {
+			t.Helper()
+			if err := h.authz.ImportMembers(t.Context(), host, "t1", []rbac.Member{{Group: "oncall", Principal: groupOf("inner")}}); err != nil {
+				t.Fatal(err)
+			}
+			eligible(t, h, rbac.Eligibility{Principal: groupOf("inner")})
+			return h.as(t, "u", "inner"), rbac.Subject{}
 		}, end: func(t *testing.T, h *harness) error {
 			t.Helper()
 			return h.authz.DeletePrincipal(t.Context(), host, "t1", groupOf("inner"))
 		}},
-		// Deleting its eligibility leaves the activation to its end, so a place the deletion also ends
-		// that allowed it too, oncall's, ends nothing.
-		"the group it rests on keeps its members, and leaves another that allows it": {nested: true, before: func(t *testing.T, h *harness) error {
+		// Deleting a group deletes the eligibilities only it approves, and the activation made through
+		// one rests on the identity alone.
+		"made through an eligibility only the deleted group approves": {made: func(t *testing.T, h *harness) (rbac.Subject, rbac.Subject) {
 			t.Helper()
-			return h.authz.SetEligibility(t.Context(), h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: groupOf("inner"), MaxDuration: 8 * time.Hour})
-		}, end: func(t *testing.T, h *harness) error {
-			t.Helper()
-			return h.authz.DeletePrincipal(t.Context(), host, "t1", groupOf("inner"))
-		}},
-		"an eligibility only the deleted group approves allows it": {before: func(t *testing.T, h *harness) error {
-			t.Helper()
-			return h.authz.SetEligibility(t.Context(), h.as(t, "owner"), cluster, rbac.Eligibility{
-				Role: "cluster.sudo", Principal: identity("u"), MaxDuration: 8 * time.Hour, Approvers: []rbac.Principal{groupOf("oncall")},
-			})
+			eligible(t, h, rbac.Eligibility{Principal: identity("u"), Approvers: []rbac.Principal{groupOf("oncall")}})
+			return h.as(t, "u", "oncall"), h.as(t, "boss", "oncall")
 		}, end: func(t *testing.T, h *harness) error {
 			t.Helper()
 			return h.authz.DeleteGroups(t.Context(), host, "t1", []string{"oncall"})
 		}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			h, u, g := activatedThroughOncall(t, c.nested)
-			if err := c.before(t, h); err != nil {
+			h := grouped(t)
+			h.groups(t, "oncall", "inner", "team")
+			u, approver := c.made(t, h)
+			g, err := h.authz.Activate(t.Context(), u, cluster, rbac.Activation{Role: "cluster.sudo", Duration: 8 * time.Hour, Justification: "incident", Approver: approver})
+			if err != nil {
 				t.Fatal(err)
+			}
+			if c.before != nil {
+				if err := c.before(t, h); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if err := c.end(t, h); err != nil {
 				t.Fatal(err)
 			}
 			h.now = h.now.Add(time.Hour)
 			if !allowed(t, h, u, root, cluster) {
-				t.Error("ending a place ended an activation it didn't allow")
+				t.Error("ending a place ended an activation that doesn't rest on it")
 			}
 			if got, err := h.authz.Grants(t.Context(), "t1", rbac.GrantFilter{Principals: []rbac.Principal{u.Principal}}); err != nil || len(got) != 1 || !got[0].ExpiresAt.Equal(g.ExpiresAt) {
 				t.Fatalf("Grants = %+v, %v", got, err)
@@ -280,26 +298,122 @@ func TestEndingAPlaceLeavesTheActivationsItDoesntAllow(t *testing.T) {
 	}
 }
 
-// What is left allows an activation only as long as one made from it now would last: leaving the
-// group it was made through cuts it short to another's MaxDuration from then.
-func TestEndingAPlaceCutsAnActivationToWhatTheOthersAllowMadeNow(t *testing.T) {
-	h, u, g := activatedThroughOncall(t, false)
+// An activation rests on the group it was made through, whatever else would allow one: leaving the
+// group ends it though another group, or the identity's own eligibility, would allow it for as long
+// or for an hour, or its eligibility was deleted, which left it to its end only while the place it
+// rests on lasts.
+func TestEndingThePlaceAnActivationWasMadeThroughEndsItWhateverElseAllows(t *testing.T) {
+	leave := func(t *testing.T, h *harness) error {
+		t.Helper()
+		return h.authz.ChangeMembers(t.Context(), h.as(t, "manager"), "t1", nil, []rbac.Member{{Group: "oncall", Principal: identity("u")}})
+	}
+	eligible := func(p rbac.Principal, d time.Duration) func(t *testing.T, h *harness) error {
+		return func(t *testing.T, h *harness) error {
+			t.Helper()
+			return h.authz.SetEligibility(t.Context(), h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: p, MaxDuration: d})
+		}
+	}
+	for name, c := range map[string]struct {
+		nested bool
+		before func(t *testing.T, h *harness) error
+		end    func(t *testing.T, h *harness) error
+	}{
+		"another group allows it":             {before: eligible(groupOf("team"), 8*time.Hour), end: leave},
+		"another group allows it for an hour": {before: eligible(groupOf("team"), time.Hour), end: leave},
+		"its own eligibility allows it":       {before: eligible(identity("u"), 8*time.Hour), end: leave},
+		"its eligibility was deleted": {before: func(t *testing.T, h *harness) error {
+			t.Helper()
+			return h.authz.DeleteEligibility(t.Context(), h.as(t, "owner"), cluster, "cluster.sudo", groupOf("oncall"))
+		}, end: leave},
+		"the group it is in through, deleted as a principal, allows it": {nested: true, before: eligible(groupOf("inner"), 8*time.Hour), end: func(t *testing.T, h *harness) error {
+			t.Helper()
+			return h.authz.DeletePrincipal(t.Context(), host, "t1", groupOf("inner"))
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, u, g := activatedThroughOncall(t, c.nested)
+			if !c.nested {
+				u = h.as(t, "u", "oncall", "team")
+			}
+			if err := c.before(t, h); err != nil {
+				t.Fatal(err)
+			}
+			h.events = nil
+			if err := c.end(t, h); err != nil {
+				t.Fatal(err)
+			}
+			if e := h.events[len(h.events)-1]; len(e.Shortened) != 0 || !slices.ContainsFunc(e.Revoked, func(r rbac.Grant) bool { return r.ID == g.ID }) {
+				t.Errorf("the activation isn't reported ended: %+v", e)
+			}
+			if allowed(t, h, u, root, cluster) {
+				t.Error("u holds sudo it activated through oncall once it is no longer in oncall")
+			}
+		})
+	}
+}
+
+// An activation rests on the eligibility it was made through alone: one its holder could reach whose
+// requirement it didn't meet, or that needs an approver it had none of, didn't allow it, and keeps
+// nothing once it leaves the group it was made through.
+func TestAnEligibilityAnActivationWasntMadeThroughDoesntKeepIt(t *testing.T) {
+	for name, team := range map[string]rbac.Eligibility{
+		"a requirement it didn't meet": {Requires: `request.attributes.mfa == true`},
+		"an approver it had none of":   {Approvers: []rbac.Principal{identity("boss")}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := grouped(t)
+			ctx := t.Context()
+			h.groups(t, "oncall", "team")
+			h.as(t, "boss")
+			u := h.as(t, "u", "oncall", "team")
+			team.Role, team.Principal, team.MaxDuration = "cluster.sudo", groupOf("team"), 8*time.Hour
+			oncall := rbac.Eligibility{Role: "cluster.sudo", Principal: groupOf("oncall"), MaxDuration: 8 * time.Hour}
+			for _, e := range []rbac.Eligibility{team, oncall} {
+				if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, e); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := h.authz.Activate(ctx, u, cluster, rbac.Activation{Role: "cluster.sudo", Duration: 8 * time.Hour, Justification: "incident"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", nil, []rbac.Member{{Group: "oncall", Principal: u.Principal}}); err != nil {
+				t.Fatal(err)
+			}
+			if allowed(t, h, u, root, cluster) {
+				t.Error("u holds sudo through team's eligibility, which never allowed it")
+			}
+		})
+	}
+}
+
+// Ending one of the paths to the group an activation was made through cuts it short to the latest
+// end of those left.
+func TestEndingAPathCutsAnActivationToTheLatestLeft(t *testing.T) {
+	h, _, g := activatedThroughOncall(t, false)
 	ctx := t.Context()
-	h.as(t, "u", "oncall", "team")
-	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: groupOf("team"), MaxDuration: time.Hour}); err != nil {
+	u := h.as(t, "u", "oncall", "inner")
+	ends := h.now.Add(2 * time.Hour)
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{
+		{Group: "oncall", Principal: groupOf("inner"), ExpiresAt: h.now.Add(time.Hour)},
+		{Group: "team", Principal: identity("u")},
+		{Group: "oncall", Principal: groupOf("team"), ExpiresAt: ends},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	h.events = nil
-	if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", nil, []rbac.Member{{Group: "oncall", Principal: identity("u")}}); err != nil {
+	if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", nil, []rbac.Member{{Group: "oncall", Principal: u.Principal}}); err != nil {
 		t.Fatal(err)
 	}
-	ends := h.now.Add(time.Hour)
 	if e := h.events[len(h.events)-1]; len(e.Shortened) != 1 || e.Shortened[0].ID != g.ID || !e.Shortened[0].ExpiresAt.Equal(ends) {
-		t.Errorf("the activation isn't reported cut short to team's MaxDuration: %+v", e)
+		t.Errorf("the activation isn't reported cut short to when u's place through team ends: %+v", e)
 	}
-	h.now = h.now.Add(2 * time.Hour)
+	h.now = h.now.Add(90 * time.Minute)
+	if !allowed(t, h, u, root, cluster) {
+		t.Error("u lost sudo while in oncall through team")
+	}
+	h.now = ends
 	if allowed(t, h, u, root, cluster) {
-		t.Error("u holds sudo past what team's eligibility allows an activation made when u left oncall")
+		t.Error("u holds sudo past its last path to oncall")
 	}
 }
 

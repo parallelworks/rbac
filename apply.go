@@ -2286,8 +2286,6 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 	named := []string{del.named}
 	// The argument after args, for named or an array of activations' ids.
 	next := fmt.Sprintf("$%d", len(args)+2)
-	var gone []Eligibility
-	var now time.Time
 	// Those it approves with its own, in one order, as removeGroups locks them; those it approves by
 	// its key (naming), as no other index finds them.
 	if del.named != "" {
@@ -2295,12 +2293,6 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 			"SELECT id FROM rbac_eligibilities WHERE tenant = $1 AND "+del.where, "SELECT id FROM rbac_eligibilities WHERE "+naming("approvers", next))),
 			slices.Concat([]any{tenant}, args, []any{named})...); err != nil {
 			return ChangeEvent{}, err
-		}
-		if del.group != "" {
-			now = a.cfg.Now()
-			if gone, err = doomed(ctx, tx, tenant, named, now); err != nil {
-				return ChangeEvent{}, err
-			}
 		}
 	}
 	if del.named != "" {
@@ -2344,6 +2336,7 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 		}
 	}
 	var r resting
+	var now time.Time
 	if del.members != "" {
 		// Memberships before the members they reach, as DeleteExpired takes them, so the two never
 		// deadlock.
@@ -2357,7 +2350,8 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 			if err != nil {
 				return ChangeEvent{}, err
 			}
-			if r, err = a.restingOn(ctx, tx, tenant, nil, held, gone, now); err != nil {
+			now = a.cfg.Now()
+			if r, err = a.restingOn(ctx, tx, tenant, nil, held, now); err != nil {
 				return ChangeEvent{}, err
 			}
 		}

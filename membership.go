@@ -50,7 +50,8 @@ type Membership struct {
 	// directory it syncs from.
 	Source string
 	// ExpiresAt ends it; zero never does. Ending it sooner, or removing it, cuts short the
-	// activations made through it (Eligibility).
+	// identity's activations to it, as each rests on it, whichever eligibility it was made through
+	// (Eligibility).
 	ExpiresAt time.Time
 	Note      string
 	// CreatedBy, CreatedAt, UpdatedBy and UpdatedAt are set on memberships read back.
@@ -86,7 +87,9 @@ type Member struct {
 	Principal Principal
 	Source    string
 	// ExpiresAt ends it; zero never does. Ending it sooner, or removing it, cuts short the
-	// activations made through it (Eligibility).
+	// activations made through an eligibility of the group, or of a group it is in, by the
+	// identities it puts there, to the latest end of the paths they have left to that group, or
+	// ends them (Eligibility).
 	ExpiresAt time.Time
 	Note      string
 	// CreatedBy, CreatedAt, UpdatedBy and UpdatedAt are set on members read back.
@@ -234,7 +237,7 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 		}
 		// A membership with an end may end one in force sooner, which the activations resting on it
 		// end with.
-		r, err := a.restingOn(ctx, tx, tenant, ending, nil, nil, at)
+		r, err := a.restingOn(ctx, tx, tenant, ending, nil, at)
 		if err != nil {
 			return ChangeEvent{}, nil, err
 		}
@@ -457,7 +460,7 @@ func (a *Authorizer) ImportGroups(ctx context.Context, actor Principal, tenant s
 		if err != nil {
 			return ChangeEvent{}, err
 		}
-		r, err := a.restingOn(ctx, tx, tenant, identities, groups, nil, now)
+		r, err := a.restingOn(ctx, tx, tenant, identities, groups, now)
 		if err != nil {
 			return ChangeEvent{}, err
 		}
@@ -714,10 +717,7 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 		return ChangeEvent{}, err
 	}
 	now := a.cfg.Now()
-	gone, err := doomed(ctx, tx, tenant, principals, now)
-	if err != nil {
-		return ChangeEvent{}, err
-	}
+	var err error
 	if e.Ineligible, err = a.removeEligible(ctx, tx, tenant, ofGroups, principals, scopes); err != nil {
 		return ChangeEvent{}, err
 	}
@@ -753,7 +753,7 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 	if err := lockByKeys(ctx, tx, "rbac_members", "ctid", placeOrder, []string{"group_id", "principal"}, nil, tenant, ids, principals); err != nil {
 		return ChangeEvent{}, err
 	}
-	r, err := a.restingOn(ctx, tx, tenant, nil, ids, gone, now)
+	r, err := a.restingOn(ctx, tx, tenant, nil, ids, now)
 	if err != nil {
 		return ChangeEvent{}, err
 	}
@@ -2174,7 +2174,7 @@ func (a *Authorizer) restingIn(ctx context.Context, tx pgx.Tx, tenant string, me
 	}
 	identities = slices.DeleteFunc(identities, func(k string) bool { return !ends[k] })
 	groups = slices.DeleteFunc(groups, func(id string) bool { return !ends[groupPrincipal(id).key()] })
-	return a.restingOn(ctx, tx, tenant, identities, groups, nil, now)
+	return a.restingOn(ctx, tx, tenant, identities, groups, now)
 }
 
 // endingPlaces holds, in tx, the places in groups query picks, in the order of their groups,
