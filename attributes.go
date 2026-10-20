@@ -15,6 +15,7 @@ import (
 	"cel.dev/cel-go/common/types/traits"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/descriptorpb"
 
@@ -28,10 +29,13 @@ import (
 // declared, or reading one as another type, is refused when it is stored, rather than being false
 // whenever it runs. Each map names attributes and their types; a nil one leaves that kind
 // undeclared, read as any value under any name. Declared, they are read as fields, such as
-// `resource.attributes.env`, and named as identifiers. A condition stored under other declarations
-// is checked against these too, once, when a check first reads it: one that no longer passes, as
-// one reading an attribute since declared another type or no longer declared, fails, so a grant's
-// gives nothing, a deny's applies, and a requirement isn't met.
+// `resource.attributes.env`, and named as identifiers. A map's entries are declared beside them
+// under the map's name in camel case and then Entry, as `TagsEntry` for `tags` and for `ta_gs`: a
+// name no other attribute of its kind may have, nor another map's entries, and that can't begin
+// with a digit, as `_1`'s would. A condition stored under other declarations is checked against
+// these too, once, when a check first reads it: one that no longer passes, as one reading an
+// attribute since declared another type or no longer declared, fails, so a grant's gives nothing, a
+// deny's applies, and a requirement isn't met.
 //
 // A condition reading an attribute a request doesn't carry, or carries as a value CEL reads as
 // another type than it is declared, as nil, or as a double that is NaN or infinite, is false when
@@ -180,6 +184,8 @@ func typing(attrs Attributes) (*cel.Env, error) {
 			return field("attributes", n, message, ".google.protobuf.Struct"), nil
 		}
 		msg := &descriptorpb.DescriptorProto{Name: proto.String(kind + "Attributes")}
+		// entries are the maps by the name of their entries.
+		entries := map[string]string{}
 		for i, name := range slices.Sorted(maps.Keys(declared)) {
 			if !attributeName.MatchString(name) || slices.Contains(celReserved, name) {
 				return nil, fmt.Errorf("rbac: %s attribute %q is not an identifier", kind, name)
@@ -203,8 +209,20 @@ func typing(attrs Attributes) (*cel.Env, error) {
 				f = field(name, number, str, "")
 				f.Label = descriptorpb.FieldDescriptorProto_LABEL_REPEATED.Enum()
 			case AttrStringMap:
-				// A map is a repeated entry of a key and a value, named for its field.
+				// A map is a repeated entry of a key and a value, a message named for its field beside the
+				// fields, which protobuf refuses named as a field or another map's entry is, or beginning
+				// with a digit, with an error naming neither attribute.
 				entry := mapEntryName(name)
+				if !protoreflect.Name(entry).IsValid() {
+					return nil, fmt.Errorf("rbac: %s attribute %q can't be a map: its entries would be named %q, which isn't an identifier", kind, name, entry)
+				}
+				if _, ok := declared[entry]; ok {
+					return nil, fmt.Errorf("rbac: %s attributes %q and %q can't both be declared: the entries of the map %q are named %q", kind, name, entry, name, entry)
+				}
+				if other, ok := entries[entry]; ok {
+					return nil, fmt.Errorf("rbac: %s attributes %q and %q can't both be declared: the entries of both maps are named %q", kind, other, name, entry)
+				}
+				entries[entry] = name
 				msg.NestedType = append(msg.NestedType, &descriptorpb.DescriptorProto{
 					Name:    proto.String(entry),
 					Field:   []*descriptorpb.FieldDescriptorProto{field("key", 1, str, ""), field("value", 2, str, "")},

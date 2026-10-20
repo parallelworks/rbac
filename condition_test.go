@@ -298,6 +298,43 @@ func TestDeclaredAttributesChangedAfterNewAreReadAsDeclaredAtNew(t *testing.T) {
 	}
 }
 
+// A map's entries are named for it beside its kind's attributes, so names that are each an
+// identifier can name one thing between them, or a map's entries no identifier: New refuses them,
+// naming the attributes, where declaring them would fail with an error naming neither.
+func TestDeclaredAttributesNamingAMapsEntriesAreRefusedByName(t *testing.T) {
+	h := setup(t)
+	for _, c := range []struct {
+		attrs rbac.Attributes
+		names []string
+	}{
+		{rbac.Attributes{Subject: map[string]rbac.AttributeType{"a_b": rbac.AttrStringMap, "aB": rbac.AttrStringMap}}, []string{`"aB"`, `"a_b"`}},
+		{rbac.Attributes{Resource: map[string]rbac.AttributeType{"tags": rbac.AttrStringMap, "TagsEntry": rbac.AttrString}}, []string{`"tags"`, `"TagsEntry"`}},
+		{rbac.Attributes{Request: map[string]rbac.AttributeType{"_1": rbac.AttrStringMap}}, []string{`"_1"`}},
+	} {
+		cfg := h.cfg
+		cfg.Attributes = c.attrs
+		_, err := rbac.New(h.pool, cfg)
+		if err == nil {
+			t.Errorf("%v declared", c.attrs)
+			continue
+		}
+		for _, name := range c.names {
+			if !strings.Contains(err.Error(), name) {
+				t.Errorf("%v refused without naming %s: %v", c.attrs, name, err)
+			}
+		}
+	}
+	// Names alike that name nothing twice in a kind are declared.
+	cfg := h.cfg
+	cfg.Attributes = rbac.Attributes{
+		Resource: map[string]rbac.AttributeType{"a_b": rbac.AttrStringMap, "aEntry": rbac.AttrStringMap, "AEntry": rbac.AttrString, "__": rbac.AttrStringMap},
+		Request:  map[string]rbac.AttributeType{"aB": rbac.AttrStringMap, "a_1": rbac.AttrStringMap},
+	}
+	if _, err := rbac.New(h.pool, cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // A grant's condition, a deny's and a requirement, stored while env and level were declared strings,
 // read once the host declares them lists of strings: none passes the declarations now, so each
 // fails, rather than run as if they hadn't changed, where a list is unequal to any string.
