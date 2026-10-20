@@ -17,6 +17,15 @@
 -- in, stays so. Dropping and adding a check locks its table, so reads of the tables wait too until
 -- migrating commits, and each check reads the whole of its table. The schema is found by its name:
 -- a cast to regnamespace reads one that needs quoting, as one with capitals, as another's.
+--
+-- Every table is locked first, in one statement, as 0008 does: altered in turn, each was locked
+-- while those before were held, and history only once the checks had read them all, so a host
+-- transaction holding one table and reading another could deadlock with migrating for as long as
+-- it ran. History goes last, as every write to a table writes history after it: a write holding its
+-- table and waiting for history would otherwise wait for migrating, which waits for its table.
+LOCK TABLE rbac_grants, rbac_roles, rbac_denies, rbac_eligibilities, rbac_memberships, rbac_groups, rbac_members, rbac_history
+    IN ACCESS EXCLUSIVE MODE;
+
 DO $$
 DECLARE
     here      oid   := (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = pg_catalog.current_schema());

@@ -419,8 +419,8 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   that wait is acceptable. Code from before `0012_activation_through` must not run beside code
   after it: an activation it extends keeps the eligibility recorded before, and can outlast the one
   it was extended through. Stop the replicas running it before migrating. `0013_bounded_rows`
-  locks every table until it commits, history only for its last steps, and reads each once for
-  each check it adds, so checks, lists and changes wait for it.
+  locks every table, history too, until it commits, and reads each once for each check it adds,
+  so checks, lists, changes and reads of history wait for it.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
   between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows
