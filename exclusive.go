@@ -67,12 +67,24 @@ func (a *Authorizer) exclusiveValues(roles []RoleDefinition) map[Role][]Permissi
 }
 
 // excludedBy returns the exclusive dimensions whose values held grants, as roles defines them,
-// could give two of; a role giving one is for the tenant alone. Each grant counts as written,
-// whatever its condition, a constraint or a deny, and whether a check would honor it, as changes
-// and Conflicts count it, so whether a value is held never turns on the request or the subject's
-// attributes, and reading it asks no hook.
+// could give two of (exclusiveGiven).
 func (a *Authorizer) excludedBy(roles book, held []holding) map[string]bool {
-	first, excluded := map[string]Permission{}, map[string]bool{}
+	excluded := map[string]bool{}
+	for t, vs := range a.exclusiveGiven(roles, held) {
+		if len(vs) > 1 {
+			excluded[t] = true
+		}
+	}
+	return excluded
+}
+
+// exclusiveGiven returns, by exclusive dimension, the values held grants, as roles defines them,
+// could give; a role giving one is for the tenant alone. Each grant counts as written, whatever
+// its condition, a constraint or a deny, and whether a check would honor it, as changes and
+// Conflicts count it, so whether a value is held never turns on the request or the subject's
+// attributes, and reading it asks no hook.
+func (a *Authorizer) exclusiveGiven(roles book, held []holding) map[string]map[string]bool {
+	given := map[string]map[string]bool{}
 	for _, h := range held {
 		def, ok := roles.role(h.Role)
 		if !ok {
@@ -83,29 +95,52 @@ func (a *Authorizer) excludedBy(roles book, held []holding) map[string]bool {
 			if !ok {
 				continue
 			}
-			if f, seen := first[t]; seen && f != p {
-				excluded[t] = true
+			if given[t] == nil {
+				given[t] = map[string]bool{}
 			}
-			first[t] = p
+			_, v := p.parts()
+			given[t][v] = true
 		}
 	}
-	return excluded
+	return given
 }
 
-// broadExcludes reports whether p is a value of an exclusive dimension, or the label l names one,
-// that the grants on a tenant to a broad principal, with the public's it includes, could give two
-// of, so no one it stands for holds p, or any value l asks of it.
+// satisfiableByOne reports whether someone holding at most one of an exclusive dimension's values,
+// and that one where given has one, could satisfy want, which has values: no one can where given
+// has two, which leave none held, or where want, under AllOf, has two.
+func (ld labelDimension) satisfiableByOne(given map[string]bool, want []string) bool {
+	if len(given) > 1 {
+		return false
+	}
+	one := want[0]
+	for v := range given {
+		one = v
+	}
+	switch ld.rule {
+	case AnyOf:
+		return slices.Contains(want, one)
+	case AllOf:
+		return !slices.ContainsFunc(want, func(w string) bool { return w != one })
+	case Ordered:
+		// Never exclusive, as a higher value includes the lower.
+	}
+	return true
+}
+
+// broadExcludes reports whether no one a broad principal stands for can do p to a resource labeled
+// l, by the exclusive values the grants on a tenant to it, with the public's it includes, could
+// give each of them: where two of a dimension, they hold none, so none holds p where it is one, nor
+// passes l where it asks a value of it; and where one, each holds that one or none, so none passes
+// l where it asks of that dimension values only another would satisfy.
 func (a *Authorizer) broadExcludes(ctx context.Context, tenant string, b Principal, p Permission, l Label) (bool, error) {
 	var dims []string
-	if t, ok := a.exclusiveValue(p); ok {
-		dims = append(dims, t)
-	}
 	for t, vs := range l {
 		if len(vs) > 0 && a.labels[t].exclusive {
 			dims = append(dims, t)
 		}
 	}
-	if len(dims) == 0 {
+	dim, exclusive := a.exclusiveValue(p)
+	if !exclusive && len(dims) == 0 {
 		return false, nil
 	}
 	keys := []string{Principal{Kind: Public}.key()}
@@ -114,7 +149,7 @@ func (a *Authorizer) broadExcludes(ctx context.Context, tenant string, b Princip
 	}
 	// With the custom roles they name, in one statement, as a check reads them: read apart, a grant
 	// revoked and its role widened meanwhile could give two values no moment did. Only their
-	// permissions, which alone excludedBy reads.
+	// permissions, which alone exclusiveGiven reads.
 	rows, err := a.db.Query(ctx, `
 		WITH held AS (
 		  SELECT DISTINCT role FROM rbac_grants WHERE tenant = $1 AND scope_type = 'tenant'
@@ -140,8 +175,11 @@ func (a *Authorizer) broadExcludes(ctx context.Context, tenant string, b Princip
 		return false, err
 	}
 	readingRoles()
-	excluded := a.excludedBy(a.bookOf(a.current(custom)), held)
-	return slices.ContainsFunc(dims, func(t string) bool { return excluded[t] }), nil
+	given := a.exclusiveGiven(a.bookOf(a.current(custom)), held)
+	if exclusive && len(given[dim]) > 1 {
+		return true, nil
+	}
+	return slices.ContainsFunc(dims, func(t string) bool { return !a.labels[t].satisfiableByOne(given[t], l[t]) }), nil
 }
 
 // Conflict is an identity able to hold two or more values of an exclusive dimension, through any

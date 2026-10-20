@@ -705,3 +705,77 @@ func TestHoldersLeavesOutTheBroadWhoseGrantsExcludeTheLabelsDimension(t *testing
 		})
 	}
 }
+
+// Holders leaves out the tenant's members or the public where their own grants give one value of
+// an exclusive dimension and the resource's label asks of it only others: each of them holds that
+// one, so holds no other, and none passes the label. Where it asks that one, they are listed.
+func TestHoldersLeavesOutTheBroadWhoseOneValueTheLabelDoesNotAsk(t *testing.T) {
+	root := rbac.TenantRoot("t1")
+	for _, broad := range []rbac.Principal{rbac.TenantMembers("t1"), {Kind: rbac.Public}} {
+		t.Run(string(broad.Kind), func(t *testing.T) {
+			h := labeled(t, func(c *rbac.Config) {
+				banks(c)
+				c.Catalog = append(c.Catalog, rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true})
+			})
+			ann := h.as(t, "ann")
+			h.seed(t, grant(root, "bank.a", broad.Kind, broad.ID), grant(root, "cluster.viewer", broad.Kind, broad.ID))
+			for _, c := range []struct {
+				banks []string
+				pass  bool
+			}{{[]string{"a", "b"}, true}, {[]string{"b"}, false}, {[]string{"b", "c"}, false}} {
+				a := cluster
+				a.Labels = rbac.Label{"bank": c.banks}
+				if allowed(t, h, ann, view, a) != c.pass {
+					t.Fatalf("Authorize under %v: want %t", c.banks, c.pass)
+				}
+				holders, err := h.authz.Holders(t.Context(), view, a)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if slices.ContainsFunc(holders, func(x rbac.Holder) bool { return x.Principal == broad }) != c.pass {
+					t.Fatalf("Holders under %v = %+v", c.banks, holders)
+				}
+			}
+		})
+	}
+}
+
+// Under an exclusive AllOf dimension, a label asking two values is one no one passes, so Holders
+// leaves out the tenant's members, though each may hold one value of their own, as it does, once
+// their grants give one, for a label asking another.
+func TestHoldersListsNoOneForALabelAskingTwoExclusiveValuesOfAllOf(t *testing.T) {
+	party := rbac.LabelDimension{Name: "party", Rule: rbac.AllOf, Values: []string{"x", "y"}, Exclusive: true}
+	h := labeled(t, func(c *rbac.Config) {
+		c.Labels = append(slices.Clone(c.Labels), party)
+		for _, v := range party.Values {
+			c.Catalog = append(c.Catalog, rbac.RoleDefinition{
+				ID: rbac.Role("party." + v), Permissions: []rbac.Permission{rbac.Permission("party:" + v)}, ResourceTypes: []string{rbac.TenantScope},
+			})
+		}
+	})
+	ctx := t.Context()
+	root := rbac.TenantRoot("t1")
+	ann := h.as(t, "ann")
+	h.seed(t, grant(root, "party.x", rbac.User, "ann"), grant(root, "cluster.login", rbac.Members, "t1"))
+	holds := func(values ...string) bool {
+		t.Helper()
+		a := cluster
+		a.Labels = rbac.Label{"party": values}
+		holders, err := h.authz.Holders(ctx, view, a)
+		if err != nil {
+			t.Fatal(err)
+		}
+		listed := slices.ContainsFunc(holders, func(x rbac.Holder) bool { return x.Principal == rbac.TenantMembers("t1") })
+		if err := h.authz.Authorize(ctx, ann, view, a); listed != (err == nil) {
+			t.Fatalf("Holders under %v = %+v, where Authorize of ann = %v", values, holders, err)
+		}
+		return listed
+	}
+	if !holds("x") || holds("x", "y") {
+		t.Fatal("the members are listed for a label asking two values, or not for one asking ann's")
+	}
+	h.seed(t, grant(root, "party.x", rbac.Members, "t1"))
+	if holds("y") {
+		t.Fatal("the members, each holding x, are listed for a label asking y")
+	}
+}
