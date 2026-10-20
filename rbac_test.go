@@ -5877,17 +5877,20 @@ func TestACheckSpendsABoundedBudgetOnConditionsStoredAroundTheBounds(t *testing.
 	}
 }
 
+// longFalse is a condition near the longest, false but for the contractors it lists, which may cost
+// all a condition may to evaluate, as it reads the request's attributes whole.
 func longFalse(i int) string {
+	const reading = ` || dyn(request.attributes).exists(k, k == "-")`
 	var b strings.Builder
 	b.WriteString("subject.id in [")
 	for j := 0; ; j++ {
 		item := fmt.Sprintf("%q,", fmt.Sprintf("contractor-%d-%04d", i, j))
-		if b.Len()+len(item)+1 > rbac.MaxExpression-8 {
+		if b.Len()+len(item)+1+len(reading) > rbac.MaxExpression-8 {
 			break
 		}
 		b.WriteString(item)
 	}
-	return strings.TrimSuffix(b.String(), ",") + "]"
+	return strings.TrimSuffix(b.String(), ",") + "]" + reading
 }
 
 func TestAPathsConditionalDeniesAreEvaluatedWhole(t *testing.T) {
@@ -5900,8 +5903,8 @@ func TestAPathsConditionalDeniesAreEvaluatedWhole(t *testing.T) {
 			Permissions: []rbac.Permission{login}, Condition: rbac.Condition{Expression: longFalse(i)},
 		})
 	}
-	// Three of the longest fit a scope; a fourth could leave a check's budget short of them, so it
-	// is refused rather than stored to deny everyone they name.
+	// Three of the longest that may cost all a condition may fit a scope; a fourth could leave a
+	// check's budget short of them, so it is refused rather than stored to deny everyone they name.
 	for i := range 3 {
 		// Each its own, as a check pays to compile each distinct condition once.
 		for j, on := range []rbac.Resource{cluster, workspace} {
@@ -5935,18 +5938,13 @@ func TestAPathsConditionalDeniesAreEvaluatedWhole(t *testing.T) {
 	if !allowed(t, h, h.as(t, "contractor-1-0007"), view, cluster) || allowed(t, h, h.as(t, "contractor-1-0007"), login, cluster) {
 		t.Fatal("a deny should bind whom its condition names")
 	}
-	// A deny whose condition can't be evaluated denies, and Explain says why.
+	// A deny whose condition can't be evaluated denies, and Explain says why. Cheap, it fits beside
+	// three of the longest that may cost all a condition may.
 	if err := h.authz.SetDeny(ctx, guardian, cluster, rbac.Deny{
 		ID: "mfa", Principals: []rbac.Principal{{Kind: rbac.User, ID: "u"}},
 		Permissions: []rbac.Permission{login}, Condition: rbac.Condition{Expression: "request.attributes.mfa != true"},
-	}); !errors.Is(err, rbac.ErrInvalid) {
-		t.Fatalf("a scope's conditional denies past the bound: %v", err)
-	}
-	if err := h.authz.SetDeny(ctx, guardian, workspace, rbac.Deny{
-		ID: "d0", Principals: []rbac.Principal{{Kind: rbac.User, ID: "u"}},
-		Permissions: []rbac.Permission{login}, Condition: rbac.Condition{Expression: "request.attributes.mfa != true"},
 	}); err != nil {
-		t.Fatal(err)
+		t.Fatalf("a cheap conditional deny beside them: %v", err)
 	}
 	if d, err := h.authz.Explain(ctx, h.as(t, "u"), login, cluster); err != nil || d.Allowed || !strings.Contains(d.Reason, "couldn't be evaluated") || strings.Contains(d.Reason, "budget") {
 		t.Fatalf("Explain = %+v, %v", d, err)

@@ -174,7 +174,7 @@ func (a *Authorizer) requirementsBounded(ctx context.Context, tx pgx.Tx, tenant 
 		tenant, e.Scope.Key(), e.Role, e.Principal.key(), a.cfg.Now()).Scan(&others); err != nil {
 		return err
 	}
-	if !within(once(append(others, was)), once(append(others, e.Requires))) {
+	if !a.conds.within(once(append(others, was)), once(append(others, e.Requires))) {
 		return fmt.Errorf("%w: the requirements of groups' eligibilities for %s on %s cost more together than activating may spend evaluating them",
 			ErrInvalid, e.Role, e.Scope.Key())
 	}

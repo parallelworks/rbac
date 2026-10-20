@@ -575,6 +575,92 @@ func TestAChangeCarriesBoundedConditions(t *testing.T) {
 	}
 }
 
+// What evaluating a condition can cost is bounded by what it reads, which a check runs it within:
+// little for one comparing what a request passes with literals, whatever it passes, and all a
+// condition may for one reading the size of, or looping over, what the request decides. None costs
+// more than its bound, however large what it reads.
+func TestAConditionCostsNoMoreThanItsBound(t *testing.T) {
+	big := strings.Repeat("x", 20000)
+	many := make([]any, 5000)
+	for i := range many {
+		many[i] = big[:i%40]
+	}
+	requests := []map[string]any{
+		{},
+		{
+			"mfa": true, "ip": "10.0.0.1", "team": "sre", "env": "dev", "n": 3, "f": 1.0, "g": 2.0, "d": time.Minute,
+			"at": time.Now(), "tags": []any{"gpu"}, "m": map[string]any{"k": "v"}, "x": 1,
+		},
+		{
+			"mfa": big, "ip": big, "team": many, "env": map[string]any{"a": many}, "n": big, "f": 1.0, "g": 0.0, "d": big,
+			"at": big, "tags": many, "m": map[string]any{"k": many}, "x": many,
+		},
+	}
+	for _, c := range []struct {
+		expr  string
+		cheap bool
+	}{
+		{`request.attributes.mfa == true`, true},
+		{`request.attributes.ip == "10.0.0.1" || request.attributes.ip == "10.0.0.2"`, true},
+		{`resource.attributes.env != "prod" && subject.id in ["a", "b", "c"]`, true},
+		{`request.time < timestamp("2027-01-01T00:00:00Z") && request.time.getHours("America/New_York") >= 9`, true},
+		{`request.attributes.ip.startsWith("10.") && "abc".contains("b")`, true},
+		{`has(request.attributes.mfa) && !has(request.attributes.at) && request.attributes.x != null`, true},
+		{`dyn(request.attributes)["team"] == "sre" && request.attributes.m["k"] == "v"`, true},
+		{`request.attributes.d < duration("1h") && request.attributes.f / request.attributes.g >= 0.5`, true},
+		{`(request.attributes.mfa ? request.attributes.team : "none") == "sre"`, true},
+		{`[1, 2, 3].all(i, i > 0) && [request.attributes.x] == [1] && {"a": request.attributes.x} == {"a": 1}`, true},
+		{`[1, 2] + [3] == [1, 2, 3] && "a" + "b" == "ab" && size("abc") == 3 && action == "cluster:login"`, true},
+		{`"gpu" in request.attributes.tags`, false},
+		{`request.attributes.team in {"sre": true}`, false},
+		{`size(request.attributes.tags) > 0`, false},
+		{`request.attributes.ip.matches("^10[.]0[.]")`, false},
+		{`request.attributes.tags.exists(t, t == "gpu")`, false},
+		{`request.attributes.x == request.attributes.team`, false},
+		{`string(request.attributes.n) == "3" || int(request.attributes.n) > 2`, false},
+		{`request.attributes.ip + request.attributes.team == "ab"`, false},
+		{`[1,2,3,4,5,6,7,8].all(a, [1,2,3,4,5,6,7,8].all(b, [1,2,3,4,5,6,7,8].all(c, [1,2,3,4,5,6,7,8].all(d, a > 0))))`, false},
+	} {
+		for i, attributes := range requests {
+			limit, actual := rbac.ConditionCost(t, c.expr, attributes)
+			if actual > limit && limit < 10000 {
+				t.Errorf("%s on request %d cost %d, past its bound, %d", c.expr, i, actual, limit)
+			}
+			if c.cheap != (limit < 1000) {
+				t.Errorf("%s is bounded at %d", c.expr, limit)
+			}
+		}
+	}
+}
+
+// Conditions that compare what a request passes with literals cost little, so the grants a check
+// reads together on a scope may carry hundreds, as one for each group's addresses: what bounds them
+// is what compiling and evaluating each costs.
+func TestCheapConditionsFitAScopeByTheHundreds(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	var groups []string
+	var grants []rbac.Grant
+	for i := range 300 {
+		g := fmt.Sprintf("g%03d", i)
+		groups = append(groups, g)
+		b := rbac.Binding{Role: "cluster.login", Principal: groupOf(g), Condition: rbac.Condition{Expression: fmt.Sprintf(`request.attributes.ip == "10.0.%d.1"`, i)}}
+		grants = append(grants, rbac.Grant{Scope: cluster.Scope(), Binding: b})
+	}
+	h.groups(t, groups...)
+	if err := h.authz.Import(ctx, host, "t1", grants[:250]); err != nil {
+		t.Fatalf("250 cheap conditions: %v", err)
+	}
+	if err := h.authz.Import(ctx, host, "t1", grants[250:]); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("300 cheap conditions: %v", err)
+	}
+	// A check of a subject in every group evaluates them all.
+	s := h.as(t, "u", groups...)
+	if err := h.authz.Authorize(rbac.WithRequest(ctx, map[string]any{"ip": "10.0.249.1"}), s, login, cluster); err != nil {
+		t.Fatalf("the last group's address: %v", err)
+	}
+}
+
 // The most conditions a change carries, each distinct and as costly to compile as any, take about
 // as long to check as compiling sixteen of them alone, before the host is asked. And none is kept
 // compiled: the cache is the checks', and one change's conditions would otherwise evict what they

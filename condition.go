@@ -15,6 +15,7 @@ import (
 
 	"cel.dev/cel-go/cel"
 	"cel.dev/cel-go/common/ast"
+	"cel.dev/cel-go/common/cost"
 	"cel.dev/cel-go/common/operators"
 	"cel.dev/cel-go/common/overloads"
 	"cel.dev/cel-go/common/types"
@@ -34,27 +35,30 @@ import (
 // such as `request.time < timestamp("2027-01-01T00:00:00Z") && resource.attributes.env != "prod"`.
 // A grant with one gives its role only where the expression is true. An expression that fails,
 // as one reading an attribute the host didn't pass does, or comparing a double that isn't finite,
-// as dividing by zero makes, is false. The zero Condition is none,
-// and one with a title or description has an expression. A pattern it matches is a string
-// literal, of bounded size; it nests at most 32 deep; and a comparison, or a search of a list, that
-// would read more than a condition may spend fails before it runs.
+// as dividing by zero makes, is false. The zero Condition is none, and one with a title or
+// description has an expression. A pattern it matches is a string literal, of bounded size; it
+// nests at most 32 deep; and a comparison, or a search of a list, that would read more than a
+// condition may spend fails before it runs.
 //
-// What a check may spend on conditions is bounded, for each scope on its path, and so are the
-// conditions stored, so that a check evaluates whole every one it reads: those of an identity's
-// grants on a scope cost at most so much together, and those of a scope's grants to groups, the
-// tenant's members and the public, which reach many, as much again, those from each source the
-// host owns (Config.Sources) apart from the rest; those of a scope's denies (SetDeny); and the
-// requirements of the eligibilities of groups for a role on a scope. Each distinct condition
-// counts once, as what compiling it and evaluating it to its bound cost: about seven short ones,
-// or three of the longest. A check of a labeled resource decides each of the subject's label
-// values as a check of it would, and evaluates a condition that doesn't read the action once for
-// them all, so on the tenant one that does counts once for each label value its grants give or its
-// denies deny. A change adding a condition past a bound, or one evaluated more, is refused as
-// invalid, so no grant, deny or eligibility stored changes what the others decide, but one adding
-// none isn't: conditions stored past a bound before there were bounds can be stored again as they
-// are, as by a restore. A check may not reach all of those, or of those of a custom role widened
-// since: it evaluates the cheapest first, and past its budget a grant's condition is false and a
-// deny's applies.
+// Each condition runs within the most evaluating it can cost, which its literals and types bound:
+// little for one comparing what a request passes with literals, whatever it passes, and all a
+// condition may for one reading the size of a value the request decides, as a list or a long
+// string, or looping over one. What a check may spend on conditions is bounded, for each scope on
+// its path, and so are the conditions stored, so that a check evaluates whole every one it reads:
+// those of an identity's grants on a scope cost at most so much together, and those of a scope's
+// grants to groups, the tenant's members and the public, which reach many, as much again, those
+// from each source the host owns (Config.Sources) apart from the rest; those of a scope's denies
+// (SetDeny); and the requirements of the eligibilities of groups for a role on a scope. Each
+// distinct condition counts once, as what compiling it and the most evaluating it can cost: hundreds
+// of comparisons with literals, or three of the longest that read a list or loop. A check of a
+// labeled resource decides each of the subject's label values as a check of it would, and
+// evaluates a condition that doesn't read the action once for them all, so on the tenant one that
+// does counts once for each label value its grants give or its denies deny. A change adding a
+// condition past a bound, or one evaluated more, is refused as invalid, so no grant, deny or
+// eligibility stored changes what the others decide, but one adding none isn't: conditions stored
+// past a bound before there were bounds can be stored again as they are, as by a restore. A check
+// may not reach all of those, or of those of a custom role widened since: it evaluates the
+// cheapest first, and past its budget a grant's condition is false and a deny's applies.
 //
 // Searches (Filter, Reachable, Holders) can't evaluate one: Filter and Reachable count only
 // unconditional grants, Filter counts a conditional deny as denying, and Reach.Conditional and
@@ -76,8 +80,9 @@ const (
 	maxPattern = 1000
 	// maxCached bounds the programs kept by the length of their expressions: a program is up to
 	// about a hundred times its expression's length, so a count alone would let long conditions
-	// hold gigabytes.
+	// hold gigabytes. maxLimits bounds the limits kept so.
 	maxCached = 256 << 10
+	maxLimits = 2 << 20
 	// zoneCost is what reading a time in a named zone costs: it loads the zone each time.
 	zoneCost = 100
 	// maxCheckCost is what the conditions a check reads cost together where they are bounded: an
@@ -150,22 +155,25 @@ func budgetOf(left uint64) *budget {
 	return &budget{left: left, compiled: map[string]bool{}, decided: map[string]decision{}}
 }
 
-// most is what a check can spend on conditions: each compiled once, and evaluated to its bound as
-// many times as evaluations has it, and at least once.
-func most(evaluations map[string]int) uint64 {
+// most is what a check can spend on conditions: each compiled once, and evaluated as many times as
+// evaluations has it, and at least once, each time costing at most what limit says.
+func most(evaluations map[string]int, limit func(string) uint64) uint64 {
 	var n uint64
 	for e, k := range evaluations {
-		n += uint64(len(e))*compilePerByte + maxCost*uint64(max(k, 1))
+		n = cost.SafeAdd(n, cost.SafeAdd(uint64(len(e))*compilePerByte, cost.SafeMultiply(limit(e), uint64(max(k, 1)))))
 	}
 	return n
 }
+
+func atMostMaxCost(string) uint64 { return maxCost }
 
 // within reports whether conditions a check reads together, after a change has left them so from
 // before, cost what a check may spend on them at most, or, as conditions stored past that before
 // there were bounds may, add no condition and none evaluated more: so none is stored past it, and
 // what was can be stored again as it is.
-func within(before, after map[string]int) bool {
-	if most(after) <= maxCheckCost {
+func (c *conditions) within(before, after map[string]int) bool {
+	// Most fit however costly each is, and needn't be compiled to tell.
+	if most(after, atMostMaxCost) <= maxCheckCost || most(after, c.limit) <= maxCheckCost {
 		return true
 	}
 	for e, n := range after {
@@ -210,6 +218,11 @@ type conditions struct {
 	programs map[string]program
 	// size is the length of the expressions programs holds.
 	size int
+	// limits are what evaluating conditions can cost, of those programs holds and more, as a change
+	// bounding what a check reads together reads the limit of each condition on a scope, and a
+	// limit takes a few bytes where a program takes a hundred times its expression.
+	limits     map[string]uint64
+	limitsSize int
 }
 
 // program is a condition compiled, and why it doesn't check against the attributes declared now,
@@ -221,6 +234,9 @@ type program struct {
 	typed error
 	// readsAction is whether it reads the action, or might, so it can decide apart for each.
 	readsAction bool
+	// limit is the most evaluating it can cost (worstCost), which it runs within, so a check never
+	// spends more on it than its bound counted.
+	limit uint64
 }
 
 func newConditions(attrs Attributes) (*conditions, error) {
@@ -239,7 +255,7 @@ func newConditions(attrs Attributes) (*conditions, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &conditions{env: env, typed: typed, programs: map[string]program{}}, nil
+	return &conditions{env: env, typed: typed, programs: map[string]program{}, limits: map[string]uint64{}}, nil
 }
 
 // check returns why an expression can't be stored as a condition: it doesn't compile, or reads
@@ -253,8 +269,48 @@ func (c *conditions) check(expr string) error {
 		if prg, err = c.build(expr); err != nil {
 			return err
 		}
+		c.keepLimit(expr, prg.limit)
 	}
 	return prg.typed
+}
+
+// limit is the most evaluating expr can cost, compiling it where none is kept; nothing for one that
+// isn't a condition, which a check refuses once it has paid to compile it.
+func (c *conditions) limit(expr string) uint64 {
+	c.mu.RLock()
+	limit, ok := c.limits[expr]
+	c.mu.RUnlock()
+	if ok {
+		return limit
+	}
+	prg, err := c.build(expr)
+	if err != nil {
+		return 0
+	}
+	c.keepLimit(expr, prg.limit)
+	return prg.limit
+}
+
+func (c *conditions) keepLimit(expr string, limit uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.keptLimit(expr, limit)
+}
+
+// keptLimit is keepLimit with c.mu held.
+func (c *conditions) keptLimit(expr string, limit uint64) {
+	if _, ok := c.limits[expr]; ok {
+		return
+	}
+	for k := range c.limits {
+		if c.limitsSize+len(expr) <= maxLimits {
+			break
+		}
+		delete(c.limits, k)
+		c.limitsSize -= len(k)
+	}
+	c.limits[expr] = limit
+	c.limitsSize += len(expr)
 }
 
 var errCondition = errors.New("rbac: condition")
@@ -292,6 +348,7 @@ func (c *conditions) compile(expr string) (program, error) {
 	}
 	c.programs[expr] = prg
 	c.size += len(expr)
+	c.keptLimit(expr, prg.limit)
 	return prg, nil
 }
 
@@ -311,12 +368,13 @@ func (c *conditions) build(expr string) (program, error) {
 	if err != nil {
 		return program{}, fmt.Errorf("%w: %w", errCondition, err)
 	}
-	prg, err := c.env.Program(checked, cel.CostLimit(maxCost), cel.CostTracking(costs{patterns}),
+	limit := worstCost(checked, patterns)
+	prg, err := c.env.Program(checked, cel.CostLimit(limit), cel.CostTracking(costs{patterns}),
 		cel.OptimizeRegex(matching(patterns)), cel.CustomDecorator(bounded))
 	if err != nil {
 		return program{}, fmt.Errorf("%w: %w", errCondition, err)
 	}
-	return program{Program: prg, typed: c.typeCheck(expr), readsAction: reading(checked.NativeRep(), "action")}, nil
+	return program{Program: prg, typed: c.typeCheck(expr), readsAction: reading(checked.NativeRep(), "action"), limit: limit}, nil
 }
 
 // typeCheck returns why expr doesn't check against the declared attributes: it reads one they
@@ -373,6 +431,256 @@ func (c costs) CallCost(function, _ string, args []ref.Val, _ ref.Val) *uint64 {
 		return nil
 	}
 	return &n
+}
+
+// worst is what evaluating a checked condition can cost at most, as costs and CEL charge it when it
+// runs: each node at the most it can, which the condition's literals and types bound, and past
+// maxCost where it reads, or loops over, a value whose size the request decides, as an attribute
+// does. It counts an identifier, a select and an index twice what CEL charges for one, as it can
+// plan one as an attribute of its own.
+type worst struct {
+	costs
+	checked *ast.AST
+	// vars are what the comprehensions' variables in scope range over, by name; nil for what their
+	// type bounds.
+	vars map[string][]*extent
+}
+
+// extent is the most an expression's value can be: its valueSize and textSize, the elements of a
+// list or the keys of a map, the bytes of a string, and what each element or key can be, nil for
+// what their type bounds.
+type extent struct {
+	value, text, length, bytes uint64
+	elem                       *extent
+}
+
+// unbounded is a cost or a size a condition doesn't bound.
+const unbounded = math.MaxUint64
+
+var anything = extent{value: unbounded, text: unbounded, length: unbounded, bytes: unbounded}
+
+func (x extent) union(y extent) extent {
+	u := extent{value: max(x.value, y.value), text: max(x.text, y.text), length: max(x.length, y.length), bytes: max(x.bytes, y.bytes)}
+	if x.elem != nil && y.elem != nil {
+		e := x.elem.union(*y.elem)
+		u.elem = &e
+	}
+	return u
+}
+
+// worstCost is what evaluating checked can cost at most, no more than maxCost.
+func worstCost(checked *cel.Ast, patterns map[string]uint64) uint64 {
+	w := worst{costs: costs{patterns}, checked: checked.NativeRep(), vars: map[string][]*extent{}}
+	n, _ := w.walk(w.checked.Expr())
+	return min(n, maxCost)
+}
+
+func (w worst) walk(e ast.Expr) (uint64, extent) {
+	switch e.Kind() {
+	case ast.LiteralKind:
+		v := e.AsLiteral()
+		x := extent{value: valueSize(v, unbounded), text: textSize(v), length: 0, bytes: 0}
+		switch v := v.(type) {
+		case types.String:
+			x.bytes = uint64(len(v))
+		case types.Bytes:
+			x.bytes = uint64(len(v))
+		}
+		return 0, x
+	case ast.IdentKind:
+		if xs := w.vars[e.AsIdent()]; len(xs) > 0 && xs[len(xs)-1] != nil {
+			return 2, *xs[len(xs)-1]
+		}
+		return 2, w.typed(e)
+	case ast.SelectKind:
+		n, _ := w.walk(e.AsSelect().Operand())
+		return cost.SafeAdd(n, 2), w.typed(e)
+	case ast.ListKind:
+		n, x := uint64(10), extent{value: 1, text: 1, length: uint64(len(e.AsList().Elements()))}
+		for i, el := range e.AsList().Elements() {
+			c, ex := w.walk(el)
+			n, x.value = cost.SafeAdd(n, c), cost.SafeAdd(x.value, ex.value)
+			if i == 0 {
+				x.elem = &ex
+			} else {
+				u := x.elem.union(ex)
+				x.elem = &u
+			}
+		}
+		return n, x
+	case ast.MapKind:
+		n, x := uint64(30), extent{value: 1, text: 1, length: uint64(len(e.AsMap().Entries()))}
+		for i, entry := range e.AsMap().Entries() {
+			ck, k := w.walk(entry.AsMapEntry().Key())
+			cv, v := w.walk(entry.AsMapEntry().Value())
+			n, x.value = cost.SafeAdd(n, cost.SafeAdd(ck, cv)), cost.SafeAdd(x.value, cost.SafeAdd(k.value, v.value))
+			if i == 0 {
+				x.elem = &k
+			} else {
+				u := x.elem.union(k)
+				x.elem = &u
+			}
+		}
+		return n, x
+	case ast.StructKind:
+		n := uint64(40)
+		for _, f := range e.AsStruct().Fields() {
+			c, _ := w.walk(f.AsStructField().Value())
+			n = cost.SafeAdd(n, c)
+		}
+		return n, w.typed(e)
+	case ast.ComprehensionKind:
+		return w.comprehension(e)
+	case ast.CallKind:
+		return w.call(e)
+	default:
+		return unbounded, anything
+	}
+}
+
+// typed is the most a value of e's type can be: one for a scalar, and for a string, a list or a map
+// past any bound.
+func (w worst) typed(e ast.Expr) extent {
+	switch w.checked.GetType(e.ID()).Kind() {
+	case types.BoolKind, types.IntKind, types.UintKind, types.DoubleKind, types.DurationKind, types.TimestampKind,
+		types.NullTypeKind, types.TypeKind:
+		return extent{value: 1, text: 1}
+	case types.ListKind, types.MapKind:
+		x := anything
+		x.text = 1
+		return x
+	default:
+		return anything
+	}
+}
+
+func (w worst) comprehension(e ast.Expr) (uint64, extent) {
+	comp := e.AsComprehension()
+	n, over := w.walk(comp.IterRange())
+	init, _ := w.walk(comp.AccuInit())
+	w.vars[comp.IterVar()] = append(w.vars[comp.IterVar()], over.elem)
+	if comp.HasIterVar2() {
+		w.vars[comp.IterVar2()] = append(w.vars[comp.IterVar2()], nil)
+	}
+	w.vars[comp.AccuVar()] = append(w.vars[comp.AccuVar()], nil)
+	cond, _ := w.walk(comp.LoopCondition())
+	step, _ := w.walk(comp.LoopStep())
+	result, _ := w.walk(comp.Result())
+	for _, v := range []string{comp.IterVar(), comp.IterVar2(), comp.AccuVar()} {
+		if xs := w.vars[v]; len(xs) > 0 && (v != comp.IterVar2() || comp.HasIterVar2()) {
+			w.vars[v] = xs[:len(xs)-1]
+		}
+	}
+	// Each element evaluates the condition, and the step while it holds.
+	loops := cost.SafeMultiply(over.length, cost.SafeAdd(cond, step))
+	x := w.typed(e)
+	// A macro making a list, as map() and filter() do, makes one of at most as many elements.
+	if comp.AccuInit().Kind() == ast.ListKind {
+		x.length = over.length
+	}
+	return cost.SafeAdd(cost.SafeAdd(n, init), cost.SafeAdd(loops, result)), x
+}
+
+func (w worst) call(e ast.Expr) (uint64, extent) {
+	call := e.AsCall()
+	args := call.Args()
+	// A method's target is its first argument when it runs.
+	if call.IsMemberFunction() {
+		args = append([]ast.Expr{call.Target()}, args...)
+	}
+	var n uint64
+	xs := make([]extent, len(args))
+	for i, a := range args {
+		var c uint64
+		c, xs[i] = w.walk(a)
+		n = cost.SafeAdd(n, c)
+	}
+	own, x := uint64(1), w.typed(e)
+	switch fn := call.FunctionName(); fn {
+	case operators.LogicalAnd, operators.LogicalOr:
+		own = 0
+	case operators.Conditional:
+		own = 0
+		if len(xs) == 3 {
+			x = xs[1].union(xs[2])
+		}
+	case "dyn":
+		if len(xs) == 1 {
+			x = xs[0]
+		}
+	case operators.Index:
+		own = 2
+		if len(xs) == 2 && xs[0].elem != nil && args[0].Kind() == ast.ListKind {
+			x = *xs[0].elem
+		}
+	case overloads.Matches:
+		own = unbounded
+		if len(xs) == 2 && args[1].Kind() == ast.LiteralKind {
+			own = cost.SafeMultiply(xs[0].text, w.size(args[1].AsLiteral()))
+		}
+	case operators.Equals, operators.NotEquals, operators.Less, operators.LessEquals, operators.Greater, operators.GreaterEquals, operators.In:
+		if len(xs) != 2 {
+			return unbounded, x
+		}
+		switch t := w.checked.GetType(args[1].ID()).Kind(); {
+		case fn != operators.In:
+			own = cost.SafeAdd(1, min(xs[0].value, xs[1].value))
+		case t == types.MapKind:
+			own = cost.SafeAdd(1, xs[0].value)
+		case t == types.ListKind:
+			own = cost.SafeAdd(1, xs[1].value)
+		default:
+			own = cost.SafeAdd(1, max(xs[0].value, xs[1].value))
+		}
+	case operators.Add, overloads.Size, overloads.TypeConvertInt, overloads.TypeConvertUint, overloads.TypeConvertDouble,
+		overloads.TypeConvertBool, overloads.TypeConvertString, overloads.TypeConvertBytes,
+		overloads.TypeConvertTimestamp, overloads.TypeConvertDuration:
+		for _, a := range xs {
+			own = cost.SafeAdd(own, a.text)
+		}
+		if t := w.checked.GetType(e.ID()); fn == operators.Add && len(xs) == 2 &&
+			(t.Kind() == types.ListKind || t.Kind() == types.StringKind || t.Kind() == types.BytesKind) {
+			x = added(t, xs[0], xs[1])
+		}
+	case overloads.TimeGetFullYear, overloads.TimeGetMonth, overloads.TimeGetDayOfYear, overloads.TimeGetDate,
+		overloads.TimeGetDayOfMonth, overloads.TimeGetDayOfWeek, overloads.TimeGetHours, overloads.TimeGetMinutes,
+		overloads.TimeGetSeconds, overloads.TimeGetMilliseconds:
+		if len(xs) >= 2 {
+			own = zoneCost
+		}
+	case overloads.StartsWith, overloads.EndsWith:
+		// CEL charges a tenth of the prefix's characters, rounded up.
+		if len(xs) == 2 {
+			own = cost.SafeAdd(xs[1].bytes/10, 1)
+		}
+	case overloads.Contains:
+		// And a tenth of each string's characters, multiplied.
+		if len(xs) == 2 {
+			own = cost.SafeMultiply(cost.SafeAdd(xs[0].bytes/10, 1), cost.SafeAdd(xs[1].bytes/10, 1))
+		}
+	}
+	return cost.SafeAdd(n, own), x
+}
+
+// added is the most what adding x and y makes can be, of type t: a list of both's elements, or a
+// string or bytes of both's.
+func added(t *types.Type, x, y extent) extent {
+	switch t.Kind() {
+	case types.ListKind:
+		sum := extent{value: cost.SafeAdd(x.value, y.value), text: 1, length: cost.SafeAdd(x.length, y.length)}
+		if x.elem != nil && y.elem != nil {
+			u := x.elem.union(*y.elem)
+			sum.elem = &u
+		}
+		return sum
+	case types.StringKind, types.BytesKind:
+		if b := cost.SafeAdd(x.bytes, y.bytes); b != unbounded {
+			return extent{value: 1 + b/10, text: 1 + b/10, bytes: b}
+		}
+		return anything
+	default:
+		return anything
+	}
 }
 
 // comparing is what comparing x with y, or finding x in y, reads, counted no further than past
@@ -757,9 +1065,9 @@ func evaluate(prg program, vars map[string]any) run {
 	out, details, err := prg.Eval(vars)
 	// One stopped at its limit costs at most that, past the call that took it there, so a single
 	// condition can't spend what the check's others need.
-	cost := uint64(maxCost)
+	cost := prg.limit
 	if details != nil && details.ActualCost() != nil {
-		cost = min(*details.ActualCost(), maxCost)
+		cost = min(*details.ActualCost(), prg.limit)
 	}
 	if err != nil {
 		return run{cost: cost}

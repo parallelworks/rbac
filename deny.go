@@ -217,11 +217,11 @@ func (a *Authorizer) checkDeny(tenant string, d Deny) error {
 // DenyPermission(on's type) there (through on, an ancestor or the tenant), not removed by a
 // constraint. A deny only takes access away, so setting one needs no more than that; one can
 // deny its setter too. A scope's conditional denies are bounded together by what a check may spend
-// on conditions, so that one always evaluates them: about seven short distinct conditions, or
-// three of the longest, however many denies share them. Whoever holds that permission on the
-// scope, those the deny names included, can replace or delete it, so to bind one who holds it
-// there, set the deny on a scope above where it doesn't. The groups it names or exempts, and a
-// group it is on, are the tenant's.
+// on conditions, so that one always evaluates them: hundreds of distinct comparisons with
+// literals, or three of the longest that read a list or loop, however many denies share them
+// (Condition). Whoever holds that permission on the scope, those the deny names included, can
+// replace or delete it, so to bind one who holds it there, set the deny on a scope above where it
+// doesn't. The groups it names or exempts, and a group it is on, are the tenant's.
 func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d Deny) (err error) {
 	defer a.refused(ctx, &err, on.Tenant, actor.Principal, "SetDeny")
 	if err := a.check(on); err != nil {
@@ -282,7 +282,7 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 		// Past this, a check's budget could run out before it evaluated them, and the rest would
 		// deny everyone they name, whatever their conditions say.
 		readsAction := map[string]bool{}
-		if d.Condition.Expression != "" && !within(a.evaluations(before, readsAction), a.evaluations(after, readsAction)) {
+		if d.Condition.Expression != "" && !a.conds.within(a.evaluations(before, readsAction), a.evaluations(after, readsAction)) {
 			return ChangeEvent{}, fmt.Errorf("%w: a scope's conditional denies cost more together than a check may spend evaluating them", ErrInvalid)
 		}
 		rows, err = tx.Query(ctx, `

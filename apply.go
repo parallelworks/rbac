@@ -1772,7 +1772,7 @@ func (a *Authorizer) conditionsBounded(ctx context.Context, tx pgx.Tx, tenant st
 	}
 	var over []error
 	for _, b := range buckets {
-		if within(before[b], after[b]) {
+		if a.conds.within(before[b], after[b]) {
 			continue
 		}
 		whose := b.principal + "'s grants"

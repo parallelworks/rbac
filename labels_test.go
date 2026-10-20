@@ -114,7 +114,8 @@ func TestALabeledCheckEvaluatesAConditionOnceForEveryValue(t *testing.T) {
 }
 
 // A condition that reads the action is evaluated apart for each label value a read of the subject's
-// decides, so where it is stored it counts once for each value its grants give, or its denies deny.
+// decides, so where it is stored it counts once for each value its grants give, or its denies deny:
+// a cheap one fits for sixty values, and one that may cost all a condition may doesn't.
 func TestAConditionReadingTheActionCountsOnceForEachLabelValue(t *testing.T) {
 	h := setup(t, compartments)
 	ctx := t.Context()
@@ -131,20 +132,23 @@ func TestAConditionReadingTheActionCountsOnceForEachLabelValue(t *testing.T) {
 			Condition: rbac.Condition{Expression: expr},
 		})
 	}
-	reading := `action != "comp:c07" && request.attributes.mfa == true`
+	reading := `action != "comp:c07" && request.attributes.groups.exists(g, g == "ops")`
 	if err := under("compartments", reading); !errors.Is(err, rbac.ErrInvalid) {
-		t.Errorf("a condition reading the action on a grant of sixty values: %v", err)
+		t.Errorf("a costly condition reading the action on a grant of sixty values: %v", err)
 	}
 	if err := deny("reading", "comp:*", reading); !errors.Is(err, rbac.ErrInvalid) {
-		t.Errorf("a condition reading the action on a deny of sixty values: %v", err)
+		t.Errorf("a costly condition reading the action on a deny of sixty values: %v", err)
 	}
-	// One that doesn't, or a grant or a deny of one value, counts once.
+	// A cheap one, one that doesn't read it, or a grant or a deny of one value, fits.
+	cheap := `action != "comp:c07" && request.attributes.mfa == true`
 	for name, err := range map[string]error{
-		"a grant not reading it":  under("compartments", `request.attributes.mfa == true`),
-		"a grant of one value":    under("compartment", reading),
-		"a deny not reading it":   deny("not-reading", "comp:*", `request.attributes.mfa != true`),
-		"a deny of one value":     deny("one", "comp:c00", reading),
-		"a grant of other powers": under("tenant.admin", reading),
+		"a cheap grant reading it": under("compartments", cheap),
+		"a cheap deny reading it":  deny("cheap", "comp:*", cheap),
+		"a grant not reading it":   under("compartments", `request.attributes.groups.exists(g, g == "sre")`),
+		"a grant of one value":     under("compartment", reading),
+		"a deny not reading it":    deny("not-reading", "comp:*", `request.attributes.groups.exists(g, g == "dev")`),
+		"a deny of one value":      deny("one", "comp:c00", reading),
+		"a grant of other powers":  under("tenant.admin", reading),
 	} {
 		if err != nil {
 			t.Errorf("%s: %v", name, err)
