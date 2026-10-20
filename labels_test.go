@@ -156,6 +156,39 @@ func TestAConditionReadingTheActionCountsOnceForEachLabelValue(t *testing.T) {
 	}
 }
 
+// Redefining a role to give more label values counts a condition of its grants on the tenant that
+// reads the action once for each, as granting it so would: one the role's grants carry where it
+// gave one value can't stay where it gives sixty, and a cheap one can.
+func TestRedefiningARoleToGiveMoreLabelValuesIsBoundedAsGrantingItSo(t *testing.T) {
+	h := setup(t, compartments)
+	ctx := t.Context()
+	tenant := rbac.TenantRoot("t1")
+	h.seed(t, grant(tenant, "tenant.roles", rbac.User, "definer"), grant(tenant, "compartments", rbac.User, "definer"))
+	definer := h.as(t, "definer")
+	all, _ := h.authz.BuiltinRole("compartments")
+	reading := `action != "comp:c07" && request.attributes.groups.exists(g, g == "ops")`
+	cheap := `action != "comp:c07" && request.attributes.mfa == true`
+	for id, expr := range map[rbac.Role]string{"custom.costly": reading, "custom.cheap": cheap} {
+		role := rbac.RoleDefinition{ID: id, Permissions: []rbac.Permission{"comp:c00"}, ResourceTypes: []string{rbac.TenantScope}}
+		if err := h.authz.SetRole(ctx, definer, "t1", role); err != nil {
+			t.Fatal(err)
+		}
+		// Each to a holder of its own, so neither's conditions count in the other's bucket.
+		g := grant(tenant, id, rbac.User, string(id))
+		g.Condition = rbac.Condition{Expression: expr}
+		h.seed(t, g)
+		role.Permissions = all.Permissions
+		err := h.authz.SetRole(ctx, definer, "t1", role)
+		if expr == reading && !errors.Is(err, rbac.ErrInvalid) || expr == cheap && err != nil {
+			t.Errorf("%s widened to sixty values: %v", id, err)
+		}
+	}
+	roles, err := h.authz.CustomRoles(ctx, "t1")
+	if err != nil || len(roles) != 2 || len(roles[0].Permissions) != 60 || len(roles[1].Permissions) != 1 {
+		t.Fatalf("the cheap role gives sixty values and the costly one still one: %d roles, %v", len(roles), err)
+	}
+}
+
 func TestAHoldingSatisfiesALabelByItsDimensionsRules(t *testing.T) {
 	h := labeled(t)
 	pilot := h.as(t, "pilot")

@@ -1695,18 +1695,23 @@ type conditionBucket struct{ scope, principal, source string }
 func (a *Authorizer) bucketsOf(grants []Grant) []conditionBucket {
 	var buckets []conditionBucket
 	for _, g := range grants {
-		b := conditionBucket{g.Scope.Key(), g.Principal.key(), ""}
-		if reachesMany(g.Principal) {
-			b.principal = ""
-		}
-		if a.owned[g.Source] {
-			b.source = g.Source
-		}
-		if g.Condition.Expression != "" && !slices.Contains(buckets, b) {
+		if b := a.bucketOf(g.Scope, g.Principal, g.Source); g.Condition.Expression != "" && !slices.Contains(buckets, b) {
 			buckets = append(buckets, b)
 		}
 	}
 	return buckets
+}
+
+// bucketOf is the bucket of a conditional grant on a scope to p from source.
+func (a *Authorizer) bucketOf(scope Scope, p Principal, source string) conditionBucket {
+	b := conditionBucket{scope.Key(), p.key(), ""}
+	if reachesMany(p) {
+		b.principal = ""
+	}
+	if a.owned[source] {
+		b.source = source
+	}
+	return b
 }
 
 // conditionsIn reads on tx how many times a check may evaluate each condition of the grants in
