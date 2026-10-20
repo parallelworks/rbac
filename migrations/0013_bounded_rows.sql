@@ -6,11 +6,11 @@
 -- bounded here as the package bounds what it writes, so nothing it writes is refused: an id to
 -- MaxID bytes; an actor's key, none or `kind:id`, to a kind's name and an id, as 0012 bounds an
 -- activation's principal; a role to a role's id; a condition or a requirement to MaxExpression
--- bytes, where 0001 counted characters, and twice as many for a deny's; and a list to its number of
--- elements and each one's form. A check can't count an element's bytes without a function of the
--- package's own, which every role writing the table would need EXECUTE on, so it counts its
--- characters, to MaxID, and refuses a NULL: an element written around the package can hold four
--- times the bytes the package writes, and history's bound on a row, below, still holds.
+-- bytes, a deny's too, where 0001 counted characters and let a deny's hold twice as many; and a list
+-- to its number of elements and each one's form. A check can't count an element's bytes without a
+-- function of the package's own, which every role writing the table would need EXECUTE on, so it
+-- counts its characters, to MaxID, and refuses a NULL: an element written around the package can
+-- hold four times the bytes the package writes, and history's bound on a row, below, still holds.
 --
 -- The package never wrote a row these refuse, so none is rewritten: a row written around it that
 -- one refuses stops the migration, which names the table, the check and a query that finds the row.

@@ -2864,7 +2864,8 @@ func TestMigratingMeansTheSameWhateverStandardConformingStrings(t *testing.T) {
 	ctx := t.Context()
 	// Each read on its own pool, whose search_path names its schema, so none is qualified, and
 	// written out as standard SQL, which a session with it off writes a backslash of in two; but
-	// rbac_migrations', which a host's tool doesn't make.
+	// rbac_migrations', which a host's tool doesn't make. An index's predicate and a column's
+	// default hold literals as a check does.
 	constraints := func(pool *pgxpool.Pool) map[string]string {
 		t.Helper()
 		defs := map[string]string{}
@@ -2872,8 +2873,18 @@ func TestMigratingMeansTheSameWhateverStandardConformingStrings(t *testing.T) {
 			if _, err := tx.Exec(ctx, `SET LOCAL standard_conforming_strings = on`); err != nil {
 				return err
 			}
-			rows, err := tx.Query(ctx, `SELECT c.relname || '.' || k.conname, pg_get_constraintdef(k.oid)
+			rows, err := tx.Query(ctx, `SELECT 'constraint ' || c.relname || '.' || k.conname, pg_get_constraintdef(k.oid)
 				FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid JOIN pg_namespace n ON n.oid = k.connamespace
+				WHERE n.nspname = current_schema() AND c.relname <> 'rbac_migrations'
+				UNION ALL
+				SELECT 'index ' || i.relname, pg_get_indexdef(i.oid, 0, true)
+				FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_class c ON c.oid = x.indrelid
+				JOIN pg_namespace n ON n.oid = c.relnamespace
+				WHERE n.nspname = current_schema() AND c.relname <> 'rbac_migrations'
+				UNION ALL
+				SELECT 'default ' || c.relname || '.' || a.attname, pg_get_expr(d.adbin, d.adrelid)
+				FROM pg_attrdef d JOIN pg_class c ON c.oid = d.adrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+				JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
 				WHERE n.nspname = current_schema() AND c.relname <> 'rbac_migrations'`)
 			if err != nil {
 				return err
@@ -2906,11 +2917,11 @@ func TestMigratingMeansTheSameWhateverStandardConformingStrings(t *testing.T) {
 			}
 		}
 		if len(got) != len(want) {
-			t.Errorf("migrated by %s, the tables have %d constraints, not %d", how, len(got), len(want))
+			t.Errorf("migrated by %s, the tables have %d constraints, indexes and defaults, not %d", how, len(got), len(want))
 		}
 		_, err := pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'customXadmin', '{cluster:view}', '{cluster}')`)
-		if pgErr := (*pgconn.PgError)(nil); !errors.As(err, &pgErr) || pgErr.Code != "23514" {
-			t.Errorf("migrated by %s, the roles took the id customXadmin: %v", how, err)
+		if pgErr := (*pgconn.PgError)(nil); !errors.As(err, &pgErr) || pgErr.ConstraintName != "rbac_roles_id_check" {
+			t.Errorf("migrated by %s, the roles' id check didn't refuse customXadmin: %v", how, err)
 		}
 		for i, p := range []string{"cluster:login", "cluster:*"} {
 			if _, err := pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
@@ -2924,16 +2935,8 @@ func TestMigratingMeansTheSameWhateverStandardConformingStrings(t *testing.T) {
 // What a migration means can't hang on the session's standard_conforming_strings, as a host's
 // tool applies it: none holds a backslash, which writes a dot in a pattern as [.] instead.
 func TestNoMigrationHoldsABackslash(t *testing.T) {
-	files, err := fs.Glob(rbac.Migrations(), "*.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, name := range files {
-		sql, err := fs.ReadFile(rbac.Migrations(), name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for i, line := range strings.Split(string(sql), "\n") {
+	for name, sql := range migrationSQL(t) {
+		for i, line := range strings.Split(sql, "\n") {
 			if strings.Contains(line, `\`) {
 				t.Errorf("%s:%d holds a backslash: %s", name, i+1, line)
 			}
@@ -2941,21 +2944,32 @@ func TestNoMigrationHoldsABackslash(t *testing.T) {
 	}
 }
 
-// Migrate applies every migration with standard_conforming_strings on, whatever the session's, and
-// leaves a host's transaction with it as it was.
-func TestMigrateReadsItsMigrationsAsStandardSQL(t *testing.T) {
-	ctx := t.Context()
+// migrationSQL is each migration's SQL by its file's name.
+func migrationSQL(t *testing.T) map[string]string {
+	t.Helper()
 	files, err := fs.Glob(rbac.Migrations(), "*.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
-	tracer := &settingTracer{setting: "standard_conforming_strings", of: map[string]string{}, seen: map[string]string{}}
+	sqls := make(map[string]string, len(files))
 	for _, name := range files {
 		sql, err := fs.ReadFile(rbac.Migrations(), name)
 		if err != nil {
 			t.Fatal(err)
 		}
-		tracer.of[string(sql)] = name
+		sqls[name] = string(sql)
+	}
+	return sqls
+}
+
+// Migrate applies every migration with standard_conforming_strings on, whatever the session's, and
+// leaves a host's transaction with it as it was.
+func TestMigrateReadsItsMigrationsAsStandardSQL(t *testing.T) {
+	ctx := t.Context()
+	sqls := migrationSQL(t)
+	tracer := &settingTracer{setting: "standard_conforming_strings", of: map[string]string{}, seen: map[string]string{}}
+	for name, sql := range sqls {
+		tracer.of[sql] = name
 	}
 	cfg := pgtest.Open(t, "standard_conforming_strings=off").Config().ConnConfig
 	cfg.Tracer = tracer
@@ -2972,7 +2986,7 @@ func TestMigrateReadsItsMigrationsAsStandardSQL(t *testing.T) {
 	if err := rbac.Migrate(ctx, tx); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range files {
+	for name := range sqls {
 		if got := tracer.seen[name]; got != "on" {
 			t.Errorf("%s applied with standard_conforming_strings %q", name, got)
 		}

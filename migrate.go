@@ -53,9 +53,13 @@ func Migrate(ctx context.Context, db DB) error {
 			return errors.New("rbac: no schema in the search_path exists to migrate in")
 		}
 		// A session with it off reads a backslash in a literal as an escape, so a pattern would check
-		// another thing than its migration says. None holds one, but Migrate doesn't rely on that.
-		if _, err := tx.Exec(ctx, `SET LOCAL standard_conforming_strings = on`); err != nil {
-			return err
+		// another thing than its migration says. This covers what migrating parses, not a function
+		// body, which each session parses as it calls it, so no migration holds a backslash either.
+		standard := conforming == "on"
+		if !standard {
+			if _, err := tx.Exec(ctx, `SET LOCAL standard_conforming_strings = on`); err != nil {
+				return err
+			}
 		}
 		// A database in another encoding can give back text that isn't UTF-8, as SQL_ASCII gives
 		// back whatever was stored: history would record it, and no export could chain it, so every
@@ -106,6 +110,9 @@ func Migrate(ctx context.Context, db DB) error {
 			if _, err := tx.Exec(ctx, `INSERT INTO rbac_migrations (version) VALUES ($1)`, version); err != nil {
 				return err
 			}
+		}
+		if standard {
+			return nil
 		}
 		// As it was, for what a host's transaction runs after.
 		_, err = tx.Exec(ctx, `SELECT set_config('standard_conforming_strings', $1, true)`, conforming)

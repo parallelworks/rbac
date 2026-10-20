@@ -607,11 +607,11 @@ flowchart LR
 - **What a record holds.** Each holds the row as it was and as it became, when it took effect,
   the database role that wrote it, and the actor and call it was made through, with what the host
   attached. A write that bypassed the package is recorded too, with no actor. The tables bound its
-  row as the package bounds what it writes, but for the ids in its lists of principals, which they
-  count in characters rather than bytes, and a row of more than 1 MiB as jsonb, or a context of
-  more than 1 MiB, fails its write, so no record is one `History` can't return. A row written before
-  history was installed has one record from migrating, its baseline, dated when it was created, or
-  at the epoch where that was before year 1 or at its first instant.
+  row as the package bounds what it writes, but for the ids in a deny's or an eligibility's lists
+  of principals, which they count in characters rather than bytes. A row of more than 1 MiB as
+  jsonb, or a context of more than 1 MiB, fails its write, so no record is one `History` can't
+  return. A row written before history was installed has one record from migrating, its baseline,
+  dated when it was created, or at the epoch where that was before year 1 or at its first instant.
 - **History's order.** `History` reads records in transaction order, and only those of
   transactions older than every transaction still running, which have all ended. So a cursor
   never passes a record that commits later. It, `Export` and `PruneHistory` name history by its
@@ -644,7 +644,8 @@ The application's database role must not be able to rewrite history, so the sche
 three roles, and that role is no superuser and holds no role with a superuser's power or a way to
 it: not `pg_write_all_data` or `pg_create_subscription`, through which it could write history, nor
 `pg_execute_server_program`, `pg_write_server_files` or `pg_read_server_files`, which run programs
-and write and read files as the server; it has no `REPLICATION` attribute, which reads every data
+and write and read files as the server; before PostgreSQL 16 it has no `CREATEROLE`, which makes it
+a member of any role but a superuser; it has no `REPLICATION` attribute, which reads every data
 file, nor `SET` or `ALTER SYSTEM` on a parameter only a superuser may set. The README's
 [History](../README.md#history) section has the exact grants.
 
