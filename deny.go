@@ -87,11 +87,9 @@ func (a *Authorizer) deniesOn(ctx context.Context, q DB, tenant string, binding,
 		return nil, nil
 	}
 	// In the order a check reads them, so Explain names the deny Authorize does.
-	rows, err := q.Query(ctx, `
-		SELECT id, scope, permissions, principals, exempt, condition FROM rbac_denies
-		WHERE tenant = $1 AND scope = ANY($2::text[])
+	rows, err := q.Query(ctx, byKey("$2", "rbac_denies", "scope", "id, scope, permissions, principals, exempt, condition", `tenant = $1
 		  AND ($3::text[] IS NULL OR principals && $3::text[] AND NOT exempt && $6::text[])
-		  AND ($4 = ANY(permissions) OR $5 = ANY(permissions))
+		  AND ($4 = ANY(permissions) OR $5 = ANY(permissions))`)+`
 		ORDER BY id, scope`,
 		tenant, scopes, binding, perm, wildcard, exempt)
 	if err != nil {
@@ -385,7 +383,9 @@ func (a *Authorizer) Denies(ctx context.Context, tenant string, scopes []Scope) 
 	for i, s := range scopes {
 		keys[i] = s.Key()
 	}
-	rows, err := a.db.Query(ctx, `SELECT `+denyColumns+` FROM rbac_denies WHERE tenant = $1 AND scope = ANY($2::text[]) ORDER BY scope, id`, tenant, keys)
+	slices.Sort(keys)
+	rows, err := a.db.Query(ctx, `SELECT `+denyColumns+` FROM (`+byKey("$2", "rbac_denies", "scope", denyColumns+", scope", "tenant = $1")+`) d
+		ORDER BY scope, id`, tenant, slices.Compact(keys))
 	if err != nil {
 		return nil, err
 	}

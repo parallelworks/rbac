@@ -439,7 +439,9 @@ type Holder struct {
 // checks do. Where a constraint may remove p, it marks each holder it may remove p from, asked
 // about as ConstraintInput says. An identity's record counts its own grants and its groups', not
 // the members' or the public's, which are records of their own. It has no limit or cursor, so what
-// it returns grows with the holders, as every identity in a group granted on the tenant.
+// it returns grows with the holders, as every identity in a group granted on the tenant; and it
+// reads every grant on the path, of any role, so it takes longer with those that don't give p too,
+// as many to other members on the tenant.
 func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]Holder, error) {
 	if err := a.check(r); err != nil {
 		return nil, err
@@ -535,13 +537,12 @@ func (a *Authorizer) holders(ctx context.Context, p Permission, r Resource, role
 		string(p), r.Type, a.publicRoles(roles), string(Public),
 	}, a.publicArgs(p, r.Type, custom)...), append([]any{a.privilegedRoles(roles)}, a.catalogArgs(custom)...)...)
 	// A privileged role gives nothing through the tenant's members or the public.
-	rows, err := a.db.Query(ctx, `
-		SELECT id::text, principal_kind, principal_id, conditional FROM rbac_grants
-		WHERE tenant = $1 AND scope = ANY($2::text[]) AND role = ANY(`+givingSQL("$3", "$1", "$7", "$8", custom, "")+`)
+	rows, err := a.db.Query(ctx, byKey("$2", "rbac_grants", "scope", "id::text, principal_kind, principal_id, conditional", `
+		  tenant = $1 AND role = ANY(`+givingSQL("$3", "$1", "$7", "$8", custom, "")+`)
 		  AND (expires_at IS NULL OR expires_at > $4) AND (NOT $5 OR principal_kind <> ALL($6::text[]))
 		  AND (principal_kind <> $10 OR role = ANY(`+givingSQL("$9", "$1", "$7", "$8", custom, publicOnly(catalogSQL{"$11", "$12", "$13"}))+`))
 		  AND (principal_kind <> ALL($6::text[])
-		    OR role <> ALL(`+givingSQL("$14", "$1", "$7", "$8", custom, privilegedOnly(catalogSQL{"$15", "$16", "$17"}))+`))
+		    OR role <> ALL(`+givingSQL("$14", "$1", "$7", "$8", custom, privilegedOnly(catalogSQL{"$15", "$16", "$17"}))+`))`)+`
 		ORDER BY principal_kind, principal_id, id`, args...)
 	if err != nil {
 		return nil, err
@@ -736,19 +737,33 @@ func (a *Authorizer) boundByDenies(ctx context.Context, p Permission, r Resource
 // now, by the same memberships keysSQL reads up from an identity, in the tenant $1; of principals
 // alone, SQL for an array of keys or NULL for every one, and with standing, only those that are
 // members or guests of the tenant at now, not suspended, with whether each is a guest. The groups
-// in groups are few, but their identities can be many, so they are read by rbac_group_members,
-// which plans for the groups reached, as it does what is read with them: planned here, it would be
-// for the thousand rows the planner counts a function as.
+// in groups are few, and each group's are read on its own, as keysSQL reads up; but their
+// identities can be many, so they are read by rbac_group_members, which plans for the groups
+// reached, as it does what is read with them: planned here, it would be for the thousand rows the
+// planner counts a function as.
 func insideSQL(groups, now, principals string, standing bool) string {
 	return fmt.Sprintf(`down(root, id) AS (
 		  SELECT g, g COLLATE "C" FROM unnest(%[1]s::text[]) AS g
 		  UNION
-		  SELECT d.root, m.principal_id FROM rbac_members m JOIN down d ON m.group_id = d.id
-		  WHERE m.tenant = $1 AND m.principal LIKE 'group:%%' AND (m.expires_at IS NULL OR m.expires_at > %[2]s)
+		  SELECT d.root, m.principal_id FROM down d CROSS JOIN LATERAL (
+		    SELECT principal_id FROM rbac_members WHERE tenant = $1 AND `+groupsIn("d.id")+`
+		      AND (expires_at IS NULL OR expires_at > %[2]s) OFFSET 0) m
 		), inside(root, principal, guest) AS (
 		  SELECT d.root, m.principal COLLATE "C", m.guest FROM down d
 		  JOIN rbac_group_members($1, ARRAY(SELECT DISTINCT id FROM down), %[2]s, %[3]s::text[], %[4]t) m ON m.group_id COLLATE "C" = d.id
 		)`, groups, now, principals, standing)
+}
+
+// groupsIn is SQL for whether a place in a group is a group's in the group g: a range of the key
+// index, by group and then principal, written as a row comparison, which no other index seeks. The
+// index by principal holds the tenant's places of groups too, and a generic plan, costing both as
+// an average tenant's few rows, can read them all by it to find one group's. The range of the
+// principal alone lets a plan count the places by its statistics, as few, not as many as the
+// average group's members, which in a tenant of a few large groups costs a walk past JIT's
+// thresholds.
+func groupsIn(g string) string {
+	return fmt.Sprintf(`group_id = %[1]s AND principal >= 'group:' AND principal < 'group;'
+		AND (group_id, principal) >= (%[1]s, 'group:') AND (group_id, principal) < (%[1]s, 'group;')`, g)
 }
 
 // Reach is where a subject may do something. A resource, by its path (Authorizer.Path), is
@@ -1051,6 +1066,17 @@ func byType(types, cols, where string) string {
 		SELECT %[2]s FROM rbac_grants g WHERE %[3]s AND %[4]s OFFSET 0) g`, types, cols, where, ofType("g.scope", "t.t"))
 }
 
+// byKey is SQL selecting cols of the rows of table for which where holds whose col is one of the
+// distinct keys in the array keys, a key at a time: each an equality the indexes leading to col, or
+// to the tenant and col, seek. A generic plan costs col = ANY(keys) as ten seeks, and a read of the
+// tenant by an index leading to it alone, which it costs as an average tenant's few rows, as
+// cheaper, so it reads every row of a large tenant. OFFSET 0 keeps the planner from flattening it
+// into a join it could run the other way round.
+func byKey(keys, table, col, cols, where string) string {
+	return fmt.Sprintf(`SELECT %[4]s FROM unnest(%[1]s::text[]) AS keyed(k) CROSS JOIN LATERAL (
+		SELECT %[4]s FROM %[2]s WHERE %[5]s AND %[3]s = keyed.k OFFSET 0) r`, keys, table, col, cols, where)
+}
+
 // ofType is SQL keeping the rows whose scope, col, is of the type t. A scope is `type:id`, and in
 // the C collation the scopes of a type sort from `type:` to just before `type;`, so a btree on the
 // scope reads only them, as one on split_part couldn't.
@@ -1146,8 +1172,10 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Su
 		  SELECT group_id, expires_at FROM rbac_members WHERE tenant = $1 AND principal = $2::text
 		    AND (expires_at IS NULL OR expires_at > $4) AND EXISTS (SELECT FROM membership)
 		  UNION
-		  SELECT m.group_id, least(p.ends, m.expires_at) FROM rbac_members m JOIN placed p ON m.principal = 'group:' || p.id
-		  WHERE m.tenant = $1 AND (m.expires_at IS NULL OR m.expires_at > $4)
+		  -- Each group's own, as keysSQL reads them.
+		  SELECT m.group_id, least(p.ends, m.expires_at) FROM placed p CROSS JOIN LATERAL (
+		    SELECT group_id, expires_at FROM rbac_members WHERE tenant = $1 AND principal = 'group:' || p.id
+		      AND (expires_at IS NULL OR expires_at > $4) OFFSET 0) m
 		), ends(k, e) AS (
 		  SELECT 'group:' || id, CASE WHEN bool_or(ends IS NULL) THEN NULL ELSE max(ends) END FROM placed GROUP BY id
 		  UNION ALL
@@ -1182,9 +1210,9 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Su
 		FROM held
 		UNION ALL
 		SELECT 1, id, id, scope, '', NULL, condition <> '', permissions, condition, NULL, false, false, NULL, '', ''
-		FROM rbac_denies
-		WHERE `+read+` AND tenant = $1 AND scope = ANY($3::text[]) AND principals && ARRAY(SELECT k FROM bound) AND NOT exempt && ARRAY(SELECT k FROM exempted)
-		  AND ($5 = '' OR $5 = ANY(permissions) OR $6 = ANY(permissions)) AND EXISTS (SELECT FROM keys WHERE `+counted("$7", "$8")+`)
+		FROM (`+byKey("$3", "rbac_denies", "scope", "id, scope, permissions, condition", read+` AND tenant = $1
+		  AND principals && ARRAY(SELECT k FROM bound) AND NOT exempt && ARRAY(SELECT k FROM exempted)
+		  AND ($5 = '' OR $5 = ANY(permissions) OR $6 = ANY(permissions)) AND EXISTS (SELECT FROM keys WHERE `+counted("$7", "$8")+`)`)+`) d
 		UNION ALL
 		SELECT 2, id, '', '', id, NULL, false, permissions, '', resource_types, privileged, public, grantable_roles, name, description
 		FROM rbac_roles

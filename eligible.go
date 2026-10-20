@@ -336,10 +336,8 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 	if err != nil {
 		return Principal{}, err
 	}
-	rows, err := q.Query(ctx, `
-		SELECT requires, approvers FROM rbac_eligibilities
-		WHERE tenant = $1 AND scope = $2 AND role = $3 AND principal = ANY($4::text[]) AND max_seconds >= $5
-		  AND (expires_at IS NULL OR expires_at > $6 AND expires_at >= $7)`,
+	rows, err := q.Query(ctx, byKey("$4", "rbac_eligibilities", "principal", "requires, approvers", `tenant = $1 AND scope = $2 AND role = $3
+		  AND max_seconds >= $5 AND (expires_at IS NULL OR expires_at > $6 AND expires_at >= $7)`),
 		on.Tenant, scope.Key(), act.Role, countedOf(keys, broad{}), seconds(act.Duration), a.cfg.Now(), until)
 	if err != nil {
 		return Principal{}, err
@@ -405,12 +403,8 @@ func (a *Authorizer) Eligibilities(ctx context.Context, tenant string, f GrantFi
 	if !validID(tenant) || !f.valid(tenant) {
 		return nil, fmt.Errorf("%w: Eligibilities needs a tenant and valid scopes or principals", ErrInvalid)
 	}
-	where, scopes, principals := f.sql()
-	rows, err := a.db.Query(ctx, `
-		SELECT `+eligibilityColumns+` FROM rbac_eligibilities
-		WHERE tenant = $1 AND `+where+` AND (expires_at IS NULL OR expires_at > $4)
-		ORDER BY scope, principal, role`,
-		tenant, scopes, principals, a.cfg.Now())
+	query, scopes, principals := f.sql("rbac_eligibilities", eligibilityColumns, eligibilityColumns+", scope, principal", "scope, principal, role")
+	rows, err := a.db.Query(ctx, query, tenant, scopes, principals, a.cfg.Now())
 	if err != nil {
 		return nil, err
 	}

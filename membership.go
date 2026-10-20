@@ -1001,11 +1001,13 @@ func (a *Authorizer) placesBounded(ctx context.Context, tx pgx.Tx, tenant string
 	if len(groups) == 0 {
 		return nil
 	}
-	rows, err := tx.Query(ctx, `SELECT group_id, principal FROM rbac_members
-		WHERE tenant = $1 AND (group_id, principal) IN (SELECT * FROM unnest($2::text[], $3::text[]))
-		  AND (source = ANY($4::text[])) IS NOT TRUE AND (expires_at IS NULL OR expires_at > $5)
-		GROUP BY group_id, principal HAVING count(*) > $6
-		ORDER BY group_id, principal`,
+	// Each counted on its own, as byKey reads its rows.
+	rows, err := tx.Query(ctx, `
+		SELECT t.g, t.p FROM (SELECT DISTINCT * FROM unnest($2::text[], $3::text[])) AS t(g, p) CROSS JOIN LATERAL (
+		  SELECT count(*) AS n FROM rbac_members WHERE tenant = $1 AND group_id = t.g AND principal = t.p
+		    AND (source = ANY($4::text[])) IS NOT TRUE AND (expires_at IS NULL OR expires_at > $5)) m
+		WHERE m.n > $6
+		ORDER BY t.g COLLATE "C", t.p COLLATE "C"`,
 		tenant, groups, principals, slices.Sorted(maps.Keys(a.owned)), a.cfg.Now(), MaxPlacesInGroup)
 	if err != nil {
 		return err
@@ -1172,8 +1174,10 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 		WITH RECURSIVE up(root, id) AS (
 		  SELECT g, g COLLATE "C" FROM unnest($2::text[]) AS g
 		  UNION
-		  SELECT u.root, m.group_id FROM rbac_members m JOIN up u ON m.principal = 'group:' || u.id
-		  WHERE m.tenant = $1 AND (m.expires_at IS NULL OR m.expires_at > $3)
+		  -- Each group's own, as keysSQL reads them.
+		  SELECT u.root, m.group_id FROM up u CROSS JOIN LATERAL (
+		    SELECT group_id FROM rbac_members WHERE tenant = $1 AND principal = 'group:' || u.id
+		      AND (expires_at IS NULL OR expires_at > $3) OFFSET 0) m
 		)
 		SELECT root, id FROM up`, tenant, groups, now)
 	if err != nil {
@@ -1202,8 +1206,13 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 	if err != nil {
 		return reach{}, err
 	}
-	rows, err = q.Query(ctx, `SELECT `+eligibilityColumns+` FROM rbac_eligibilities
-		WHERE tenant = $1 AND (principal = ANY($2::text[]) OR approvers && $2::text[]) AND (expires_at IS NULL OR expires_at > $3)
+	// The groups' eligibilities by principal, a group at a time, and those they approve, each once.
+	rows, err = q.Query(ctx, `SELECT `+eligibilityColumns+` FROM (
+		  `+byKey("$2", "rbac_eligibilities", "principal", eligibilityColumns+", scope, principal",
+		"tenant = $1 AND (expires_at IS NULL OR expires_at > $3)")+`
+		  UNION ALL
+		  SELECT `+eligibilityColumns+`, scope, principal FROM rbac_eligibilities
+		  WHERE `+naming("approvers", "$1", "$2")+` AND principal <> ALL($2::text[]) AND (expires_at IS NULL OR expires_at > $3)) e
 		ORDER BY scope, principal, role`, tenant, keys, now)
 	if err != nil {
 		return reach{}, err
@@ -1213,7 +1222,7 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 		return reach{}, err
 	}
 	rows, err = q.Query(ctx, `SELECT `+denyColumns+` FROM rbac_denies
-		WHERE tenant = $1 AND (principals && $2::text[] OR exempt && $2::text[]) ORDER BY scope, id`, tenant, keys)
+		WHERE `+naming("principals", "$1", "$2")+` OR `+naming("exempt", "$1", "$2")+` ORDER BY scope, id`, tenant, keys)
 	if err != nil {
 		return reach{}, err
 	}
@@ -1256,6 +1265,14 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 		}
 	}
 	return r, nil
+}
+
+// naming is SQL for whether the array of keys col of a row holds one of the keys in the array keys
+// in the tenant: as the GIN indexes on rbac_tenant_keys find them, with no other condition on the
+// tenant, which a generic plan, costing it as an average tenant's few rows, would read every row of
+// the tenant by.
+func naming(col, tenant, keys string) string {
+	return fmt.Sprintf("rbac_tenant_keys(tenant, %s) && rbac_tenant_keys(%s, %s::text[])", col, tenant, keys)
 }
 
 // nested is each group's up extended over the groups add nests in others, as the change will store
@@ -1696,19 +1713,24 @@ func (a *Authorizer) nestable(ctx context.Context, tx pgx.Tx, tenant string, nes
 	return br.Close()
 }
 
-// nestingDepths walks down from a group, $3, by the principal of its members, so the walk reads only
-// the tenant's nested groups from rbac_members_principal rather than every member of each group.
-const nestingDepths = `
+// nestingDepths walks down from a group, $3, to the groups in it (groupsIn), and up from another,
+// $2, to those it is in, a group at a time, as keysSQL walks up: so it reads only those groups'
+// places, rather than every member of each group, or of the tenant.
+var nestingDepths = `
 	WITH RECURSIVE down(id, depth) AS (
 	  SELECT $3::text COLLATE "C", 0
 	  UNION
-	  SELECT substr(m.principal, length('group:') + 1), d.depth + 1 FROM rbac_members m JOIN down d ON m.group_id = d.id
-	  WHERE m.tenant = $1 AND m.principal LIKE 'group:%' AND (m.expires_at IS NULL OR m.expires_at > $4) AND d.depth <= $5
+	  SELECT m.principal_id, d.depth + 1 FROM down d CROSS JOIN LATERAL (
+	    SELECT principal_id FROM rbac_members WHERE tenant = $1 AND ` + groupsIn("d.id") + `
+	      AND (expires_at IS NULL OR expires_at > $4) OFFSET 0) m
+	  WHERE d.depth <= $5
 	), up(id, depth) AS (
 	  SELECT $2::text COLLATE "C", 0
 	  UNION
-	  SELECT m.group_id, u.depth + 1 FROM rbac_members m JOIN up u ON m.principal = 'group:' || u.id
-	  WHERE m.tenant = $1 AND (m.expires_at IS NULL OR m.expires_at > $4) AND u.depth <= $5
+	  SELECT m.group_id, u.depth + 1 FROM up u CROSS JOIN LATERAL (
+	    SELECT group_id FROM rbac_members WHERE tenant = $1 AND principal = 'group:' || u.id
+	      AND (expires_at IS NULL OR expires_at > $4) OFFSET 0) m
+	  WHERE u.depth <= $5
 	)
 	SELECT (SELECT max(depth) FROM down), (SELECT max(depth) FROM up), EXISTS (SELECT FROM down WHERE id = $2)`
 
@@ -1748,8 +1770,11 @@ func (a *Authorizer) leave(ctx context.Context, tx pgx.Tx, tenant string, member
 	for i, m := range members {
 		groups[i], principals[i], sources[i] = m.Group, m.Principal.key(), m.Source
 	}
-	return removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant,
-		"(group_id, principal, source) IN (SELECT * FROM unnest($2::text[], $3::text[], $4::text[]))", groups, principals, sources)
+	// Each found on its own, as byKey finds its rows.
+	return removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant, `(group_id, principal, source) IN (
+		  SELECT m.group_id, m.principal, m.source FROM unnest($2::text[], $3::text[], $4::text[]) AS t(g, p, s) CROSS JOIN LATERAL (
+		    SELECT group_id, principal, source FROM rbac_members WHERE tenant = $1 AND group_id = t.g AND principal = t.p AND source = t.s
+		    OFFSET 0) m)`, groups, principals, sources)
 }
 
 // Members lists a group's members in force, as stored: identities and groups, not the members of
@@ -1784,8 +1809,10 @@ func (a *Authorizer) GroupsOf(ctx context.Context, tenant string, p Principal) (
 		  SELECT group_id FROM rbac_members WHERE tenant = $1 AND principal = $2 AND (expires_at IS NULL OR expires_at > $3)
 		    AND ($4 OR `+inTenant("$2", "$1", "$3")+`)
 		  UNION
-		  SELECT m.group_id FROM rbac_members m JOIN g ON m.principal = 'group:' || g.id
-		  WHERE m.tenant = $1 AND (m.expires_at IS NULL OR m.expires_at > $3)
+		  -- Each group's own, as keysSQL reads them.
+		  SELECT m.group_id FROM g CROSS JOIN LATERAL (
+		    SELECT group_id FROM rbac_members WHERE tenant = $1 AND principal = 'group:' || g.id
+		      AND (expires_at IS NULL OR expires_at > $3) OFFSET 0) m
 		)
 		SELECT id FROM g ORDER BY id`, tenant, p.key(), a.cfg.Now(), p.Kind == Group)
 	if err != nil {

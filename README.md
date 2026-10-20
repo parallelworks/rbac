@@ -321,12 +321,12 @@ below; and:
    as it, and `CREATE` there to be given them, unless a superuser gives them.
 3. The application's role has `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the package's tables
    but `rbac_history` and `rbac_migrations`, and on any a later migration adds, `EXECUTE` on the
-   function `rbac_group_members`, which every role has unless it is revoked, and only `SELECT`
-   on `rbac_history`, with no `UPDATE` on its id sequence, which a grant on all the schema's
-   sequences can give: `setval` could number a change below the one before it, and `AsOf` would
-   read the row as it was before the change. Never `TRIGGER`, which `ALL` includes: a trigger
-   runs its function as whoever writes the table, and one on `rbac_history` can drop each record,
-   as history's owner.
+   functions `rbac_group_members` and `rbac_tenant_keys`, which every role has unless it is
+   revoked, and only `SELECT` on `rbac_history`, with no `UPDATE` on its id sequence, which a
+   grant on all the schema's sequences can give: `setval` could number a change below the one
+   before it, and `AsOf` would read the row as it was before the change. Never `TRIGGER`, which
+   `ALL` includes: a trigger runs its function as whoever writes the table, and one on
+   `rbac_history` can drop each record, as history's owner.
 4. The application's role can make no schema and create in none: it neither owns the database nor
    has `CREATE` on it, which `CREATE SCHEMA` needs and only the owner has by default, and it
    creates in no schema it owns, as `public` is when that role owns the database, nor in `public`
