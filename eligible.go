@@ -400,7 +400,9 @@ var holdingPlaces = func() func() { return func() {} }
 // it. In the same statement it returns the keys s holds at until through the places it held alone,
 // and its identity's while its membership is in force then and not suspended: a later statement
 // would read a place nested meanwhile, which no change removing it would wait for. Each is held as
-// it is when held, a place updated meanwhile in its new version.
+// it is when held, a place updated meanwhile in its new version. Walking up from s reads every place
+// held, so each is held before the keys are returned; where s isn't standing it reads none, and
+// activates nothing.
 func holdPlaces(ctx context.Context, tx pgx.Tx, tenant string, s Subject, now, until time.Time) ([]string, error) {
 	rows, err := tx.Query(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`, held AS MATERIALIZED (
 		  SELECT m.* FROM (SELECT * FROM (`+byKey("ARRAY(SELECT k FROM keys)", "rbac_members", "principal", "group_id, principal, source",
@@ -414,10 +416,7 @@ func holdPlaces(ctx context.Context, tx pgx.Tx, tenant string, s Subject, now, u
 		  UNION
 		  SELECT h.group_id FROM up u JOIN held h ON h.principal = 'group:' || u.id AND (h.expires_at IS NULL OR h.expires_at > $4)
 		)
-		-- Every place held, read whole before the keys are.
-		SELECT k FROM (SELECT count(*) FROM held) n, LATERAL (
-		  SELECT $2 COLLATE "C" FROM standing UNION ALL SELECT 'group:' || id FROM up) r(k)
-		ORDER BY k`, tenant, s.identityKey(), now, until)
+		SELECT $2 COLLATE "C" FROM standing UNION ALL SELECT 'group:' || id FROM up ORDER BY 1`, tenant, s.identityKey(), now, until)
 	if err != nil {
 		return nil, err
 	}
