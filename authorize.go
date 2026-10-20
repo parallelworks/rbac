@@ -487,14 +487,14 @@ func (a *Authorizer) constrained(ctx context.Context, p Permission, r Resource, 
 // where p is a value of an exclusive dimension, holds it: one that satisfies it only with the
 // values a condition or a constraint decided, which a read without the request can't settle, is
 // marked MaybeDenied, as the members and the public are, whose people hold apart, unless their own
-// grants give two of p's exclusive values, which leaves all of them none; and one that doesn't even
-// then, or holds none of p's dimension, is left out. Each identity's holding is read after the
-// list, as its constraints run as for any read.
+// grants leave none of them able to (broadExcludes); and one that doesn't even then, or holds none
+// of p's dimension, is left out. Each identity's holding is read after the list, as its
+// constraints run as for any read.
 func (a *Authorizer) labeled(ctx context.Context, p Permission, r Resource, holders []Holder) ([]Holder, error) {
 	kept := holders[:0]
 	for _, h := range holders {
 		if h.Principal.broad() {
-			out, err := a.broadExcludes(ctx, r.Tenant, h.Principal, p)
+			out, err := a.broadExcludes(ctx, r.Tenant, h.Principal, p, r.Labels)
 			if err != nil {
 				return nil, err
 			}
