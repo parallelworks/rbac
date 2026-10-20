@@ -147,16 +147,20 @@ func TestMembershipsOfNamedPrincipalsUnderAGenericPlanReadOnlyTheirs(t *testing.
 				return a.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: ann.Principal, Suspended: true}, {Principal: identity("new")}})
 			},
 		} {
-			tx, err := h.pool.Begin(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			start := pagesRead(ctx, t, tx, "rbac_memberships")
-			if err := f(h.authz.WithTx(tx)); err != nil {
-				t.Fatalf("%s: %v", what, err)
-			}
-			pages[what] = pagesRead(ctx, t, tx, "rbac_memberships") - start
-			_ = tx.Rollback(ctx)
+			// Rolled back on a failure too: a transaction left open keeps its connection, which the
+			// pool's cleanup would wait on.
+			func() {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				start := pagesRead(ctx, t, tx, "rbac_memberships")
+				if err := f(h.authz.WithTx(tx)); err != nil {
+					t.Fatalf("%s: %v", what, err)
+				}
+				pages[what] = pagesRead(ctx, t, tx, "rbac_memberships") - start
+			}()
 		}
 		return pages
 	}
@@ -997,8 +1001,9 @@ func TestDeleteExpiredRefusedForARaceConflicts(t *testing.T) {
 // across tenants, so one tenant's rows show what every tenant's would.
 func TestDeleteExpiredUnderAGenericPlanReadsOnlyWhatExpired(t *testing.T) {
 	tables := []string{"rbac_grants", "rbac_eligibilities", "rbac_members", "rbac_memberships"}
-	// A database of n others, which hold a grant and an eligibility each and are in a group for good:
-	// each size in one of its own, as a plan is made for what the tables held when it was first run.
+	// Tables of n others, who hold a grant and an eligibility each and are in a group for good: each
+	// size in a schema and on a pool of its own, as a plan is made for what the tables held when it
+	// was first run.
 	beside := func(n int) *harness {
 		t.Helper()
 		h := setupOn(t, pgtest.Open(t, "plan_cache_mode=force_generic_plan"))

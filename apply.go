@@ -1846,23 +1846,37 @@ type deletion struct {
 // another, and each deletes the grants of a principal on a scope: deleting them in the order of
 // the index each reads by, they would deadlock.
 func inOrder(table, where string) string {
-	return "id IN (SELECT id FROM " + table + " WHERE tenant = $1 AND " + where + " ORDER BY scope, principal, id FOR UPDATE)"
+	return "id IN (" + lockedInOrder(table, "id", bindingOrder, "tenant = $1 AND "+where) + ")"
 }
+
+// The orders grants and eligibilities, places in groups and denies are locked in. Every change
+// that locks several of a table's rows takes them in its order, or two would deadlock.
+const (
+	bindingOrder = "scope, principal, id"
+	placeOrder   = "group_id, principal, source"
+	denyOrder    = "scope, id"
+)
 
 // placesInOrder is inOrder for places in groups, and deniesInOrder for denies, by their keys.
 func placesInOrder(where string) string {
-	return "(group_id, principal, source) IN (SELECT group_id, principal, source FROM rbac_members WHERE tenant = $1 AND " + where +
-		" ORDER BY group_id, principal, source FOR UPDATE)"
+	return "(group_id, principal, source) IN (" +
+		lockedInOrder("rbac_members", "group_id, principal, source", placeOrder, "tenant = $1 AND "+where) + ")"
 }
 
 func deniesInOrder(where string) string {
-	return "(scope, id) IN (SELECT scope, id FROM rbac_denies WHERE tenant = $1 AND " + where + " ORDER BY scope, id FOR UPDATE)"
+	return "(scope, id) IN (" + lockedInOrder("rbac_denies", "scope, id", denyOrder, "tenant = $1 AND "+where) + ")"
+}
+
+// lockedInOrder is SQL selecting cols of the rows of table that where picks, once they are locked
+// in order.
+func lockedInOrder(table, cols, order, where string) string {
+	return "SELECT " + cols + " FROM " + table + " WHERE " + where + " ORDER BY " + order + " FOR UPDATE"
 }
 
 // lockInOrder locks, in tx, the rows of table in tenant $1 that where picks, in order, for a
 // change that changes them in several statements.
 func lockInOrder(ctx context.Context, tx pgx.Tx, table, order, where string, args ...any) error {
-	_, err := tx.Exec(ctx, `SELECT FROM `+table+` WHERE tenant = $1 AND `+where+` ORDER BY `+order+` FOR UPDATE`, args...)
+	_, err := tx.Exec(ctx, lockedInOrder(table, "", order, "tenant = $1 AND "+where), args...)
 	return err
 }
 
@@ -2063,7 +2077,7 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 // place it made. Holding the membership, it waits on no change holding a place, which may roll
 // back the place's removal: it passes over that membership, for the next run.
 func endMemberships(ctx context.Context, tx pgx.Tx, now time.Time) (picked, all int64, err error) {
-	// In order of expiry, as deleteExpired takes its batches.
+	// Ordered, so a generic plan finds the batch by the index of expiries, as deleteExpired's.
 	rows, err := tx.Query(ctx, `SELECT tenant, principal FROM rbac_memberships
 		WHERE expires_at <= least($1, statement_timestamp()) ORDER BY expires_at LIMIT $2 FOR UPDATE SKIP LOCKED`, now, expiryBatch)
 	if err != nil {

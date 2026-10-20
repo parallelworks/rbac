@@ -604,7 +604,7 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 	// DeleteScopes and DeletePrincipal hold other scopes' and principals' locks and change some of
 	// these rows too, so each table is changed in the order delete changes them, grants last, and
 	// the rows changed in it are locked in order first: otherwise they would deadlock.
-	if err := lockInOrder(ctx, tx, "rbac_eligibilities", "scope, principal, id", "("+ofGroups+" OR approvers && $2::text[])",
+	if err := lockInOrder(ctx, tx, "rbac_eligibilities", bindingOrder, "("+ofGroups+" OR approvers && $2::text[])",
 		tenant, principals, scopes); err != nil {
 		return ChangeEvent{}, err
 	}
@@ -630,7 +630,7 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 	if e.Eligible, err = collectEligibilities(rows); err != nil {
 		return ChangeEvent{}, err
 	}
-	if err := lockInOrder(ctx, tx, "rbac_denies", "scope, id", "(scope = ANY($3::text[]) OR principals && $2::text[] OR exempt && $2::text[])",
+	if err := lockInOrder(ctx, tx, "rbac_denies", denyOrder, "(scope = ANY($3::text[]) OR principals && $2::text[] OR exempt && $2::text[])",
 		tenant, principals, scopes); err != nil {
 		return ChangeEvent{}, err
 	}
@@ -663,19 +663,25 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 	// groups have no id, so a ctid keys them: no change moves one meanwhile, as each takes its
 	// group's lock or its principal's, which this change holds.
 	if e.Left, err = removedWhere(ctx, a, tx, "rbac_members", memberColumns, collectMembers,
-		anyOf("ctid", lockedInOrder("rbac_members", "ctid", "group_id, principal, source", anyOf("ctid",
-			byKeys("rbac_members", "ctid", "group_id", "$2"), byKeys("rbac_members", "ctid", "principal", "$3")))),
-		tenant, ids, principals); err != nil {
+		lockedByKeys("rbac_members", "ctid", placeOrder, "group_id", "principal"), tenant, ids, principals); err != nil {
 		return ChangeEvent{}, err
 	}
 	if e.DeletedGroups, err = removed(ctx, a, tx, "rbac_groups", groupColumns, collectGroups, tenant, "id = ANY($2::text[])", ids); err != nil {
 		return ChangeEvent{}, err
 	}
 	e.Revoked, err = removedWhere(ctx, a, tx, "rbac_grants", grantColumns, collectGrants,
-		anyOf("id", lockedInOrder("rbac_grants", "id", "scope, principal, id", anyOf("id",
-			byKeys("rbac_grants", "id", "principal", "$2"), byKeys("rbac_grants", "id", "scope", "$3")))),
-		tenant, principals, scopes)
+		lockedByKeys("rbac_grants", "id", bindingOrder, "principal", "scope"), tenant, principals, scopes)
 	return e, err
+}
+
+// lockedByKeys is SQL picking, by key, the rows of table in tenant $1 whose cols are each one of
+// the text array's keys from $2 on, the first col's from $2, once they are locked in order.
+func lockedByKeys(table, key, order string, cols ...string) string {
+	selects := make([]string, len(cols))
+	for i, col := range cols {
+		selects[i] = byKeys(table, key, col, fmt.Sprintf("$%d", i+2))
+	}
+	return anyOf(key, lockedInOrder(table, key, order, anyOf(key, selects...)))
 }
 
 // byKeys is SQL selecting key of the rows of table in tenant $1 whose col is one of the text array
@@ -690,12 +696,6 @@ func byKeys(table, key, col, keys string) string {
 // anyOf is SQL picking, by key, the rows any of selects picks.
 func anyOf(key string, selects ...string) string {
 	return key + " = ANY(ARRAY(" + strings.Join(selects, " UNION ALL ") + "))"
-}
-
-// lockedInOrder is SQL selecting cols of the rows of table that where picks, once they are locked
-// in order.
-func lockedInOrder(table, cols, order, where string) string {
-	return "SELECT " + cols + " FROM " + table + " WHERE " + where + " ORDER BY " + order + " FOR UPDATE"
 }
 
 // notOwnedGroups refuses, on q, changing groups from a source the host owns, which only it changes.
