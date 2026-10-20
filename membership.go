@@ -195,15 +195,12 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 	kinds, ids, sources, notes := make([]string, n), make([]string, n), make([]string, n), make([]string, n)
 	guests, suspended, expires := make([]bool, n), make([]bool, n), make([]pgtype.Timestamptz, n)
 	keys := make([]string, n)
-	var suspendedMembers, ending []string
+	var ending []string
 	for i, m := range set {
 		kinds[i], ids[i], sources[i], notes[i] = string(m.Principal.Kind), m.Principal.ID, m.Source, m.Note
 		guests[i], suspended[i] = m.Guest, m.Suspended
 		expires[i] = pgtype.Timestamptz{Time: m.ExpiresAt, Valid: !m.ExpiresAt.IsZero()}
 		keys[i] = m.Principal.key()
-		if m.Suspended && !m.Guest {
-			suspendedMembers = append(suspendedMembers, keys[i])
-		}
 		if !m.ExpiresAt.IsZero() {
 			ending = append(ending, keys[i])
 		}
@@ -217,21 +214,9 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 		// would remove them, each membership held before its members as there, so the two never
 		// deadlock; and any places of an identity with no membership, which joins in none.
 		at := a.cfg.Now()
-		// A suspended member's membership widens what its identity will hold once lifted where no
-		// member's was in force: it is new, ended or a guest's. A suspended guest's never does, as the
-		// exclusive values count an identity's own grants before it joins. Read before the upsert.
-		// Here and below, each key's membership is looked up on its own: as an anti-join, a generic
-		// plan, costing the tenant's memberships by averages, reads every one. OFFSET 0 keeps the
-		// planner from making it one.
 		var widened []string
-		if a.exclusive() && len(suspendedMembers) > 0 {
-			rows, err := tx.Query(ctx, `SELECT k FROM unnest($2::text[]) AS k WHERE NOT EXISTS (SELECT FROM rbac_memberships m
-				WHERE m.tenant = $1 AND m.principal = k AND NOT m.guest AND (m.expires_at IS NULL OR m.expires_at > $3) OFFSET 0)`,
-				tenant, suspendedMembers, at)
-			if err != nil {
-				return ChangeEvent{}, nil, err
-			}
-			if widened, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
+		if a.exclusive() {
+			if widened, err = widening(ctx, tx, tenant, set, keys, at); err != nil {
 				return ChangeEvent{}, nil, err
 			}
 		}
@@ -276,6 +261,56 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 		e.Shortened, e.Revoked, err = a.unrest(ctx, tx, tenant, actor, r, at)
 		return e, widened, err
 	})
+}
+
+// widening reads, on tx before set is stored, the memberships in force of its identities, by keys,
+// and returns the keys of those whose memberships set widens what they hold, or will hold once a
+// suspension is lifted, which their exclusive values are checked for. A suspended membership holds
+// only what the public does, so suspending one never widens what it holds, nor does a suspended
+// guest's, as the exclusive values count an identity's own grants before it joins; but a member's
+// made, renewed or lifted from a guest's while suspended will hold more once lifted, which lifting
+// it would then be refused for. One that only ends sooner, or changes its note, is a removal or no
+// change, never refused.
+func widening(ctx context.Context, tx pgx.Tx, tenant string, set []Membership, keys []string, at time.Time) ([]string, error) {
+	// Each key's membership is looked up on its own: as a join, a generic plan, costing the tenant's
+	// memberships by averages, reads every one. OFFSET 0 keeps the planner from making it one.
+	rows, err := tx.Query(ctx, `SELECT m.principal, m.guest, m.suspended, m.source, m.expires_at FROM unnest($2::text[]) AS k
+		CROSS JOIN LATERAL (SELECT principal, guest, suspended, source, expires_at FROM rbac_memberships
+		  WHERE tenant = $1 AND principal = k AND (expires_at IS NULL OR expires_at > $3) OFFSET 0) m`, tenant, keys, at)
+	if err != nil {
+		return nil, err
+	}
+	was := map[string]Membership{}
+	var key string
+	var row Membership
+	var expires *time.Time
+	if _, err := pgx.ForEachRow(rows, []any{&key, &row.Guest, &row.Suspended, &row.Source, &expires}, func() error {
+		row.ExpiresAt = time.Time{}
+		if expires != nil {
+			row.ExpiresAt = *expires
+		}
+		was[key] = row
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	var widened []string
+	for i, m := range set {
+		old, ok := was[keys[i]]
+		switch {
+		case m.Suspended && (m.Guest || ok && !old.Guest):
+		case m.Suspended:
+			widened = append(widened, keys[i])
+		case !ok || old.Guest != m.Guest || old.Suspended || old.Source != m.Source || outlasts(m.ExpiresAt, old.ExpiresAt):
+			widened = append(widened, keys[i])
+		}
+	}
+	return widened, nil
+}
+
+// outlasts reports whether what ends at end, zero for never, lasts past was.
+func outlasts(end, was time.Time) bool {
+	return !was.IsZero() && (end.IsZero() || end.After(was))
 }
 
 // Memberships lists a tenant's memberships in force, by principal: of those principals, or with
@@ -1058,27 +1093,28 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 	}
 	scopes, principals := memberLocks(set)
 	principals = append(principals, rc.locks()...)
-	return a.inTx(ctx, tenant, actor, "ImportMembers", func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTxReaching(ctx, tenant, actor, "ImportMembers", func(tx pgx.Tx) (ChangeEvent, []string, error) {
 		if err := lockAll(ctx, tx, tenant, scopes, principals); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
-		if err := a.stillReached(ctx, tx, tenant, set, nil, rc, true); err != nil {
-			return ChangeEvent{}, err
+		locked, err := a.stillReached(ctx, tx, tenant, set, nil, rc, true)
+		if err != nil {
+			return ChangeEvent{}, nil, err
 		}
 		if err := a.stillStanding(ctx, tx, tenant, stand); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
 		now := a.cfg.Now()
 		r, err := a.restingIn(ctx, tx, tenant, set, expiring(set), now)
 		if err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
 		e := ChangeEvent{}
 		if e.Joined, err = a.join(ctx, tx, tenant, actor, set); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
 		e.Shortened, e.Revoked, err = a.unrest(ctx, tx, tenant, actor, r, now)
-		return e, err
+		return e, locked.joining(e.Joined), err
 	})
 }
 
@@ -1285,45 +1321,46 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 	}
 	scopes, principals := memberLocks(slices.Concat(set, remove))
 	principals = append(principals, rc.locks()...)
-	return a.inTx(ctx, tenant, actor.Principal, "ChangeMembers", func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTxReaching(ctx, tenant, actor.Principal, "ChangeMembers", func(tx pgx.Tx) (ChangeEvent, []string, error) {
 		if err := lockAll(ctx, tx, tenant, scopes, principals); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
-		if err := a.stillReached(ctx, tx, tenant, set, remove, rc, false); err != nil {
-			return ChangeEvent{}, err
+		locked, err := a.stillReached(ctx, tx, tenant, set, remove, rc, false)
+		if err != nil {
+			return ChangeEvent{}, nil, err
 		}
 		if err := a.stillStanding(ctx, tx, tenant, stand); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
 		// The host's groups only the host changes, members and all.
 		if err := a.notOwnedGroups(ctx, tx, tenant, groups); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
 		labels.seal()
 		if err := a.mayManageGroups(ctx, tx, actor, GroupMembers, targets, labels); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
 		if err := a.mayReachAgain(ctx, tx, actor, checks, labels); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
 		now := a.cfg.Now()
 		r, err := a.restingIn(ctx, tx, tenant, slices.Concat(remove, set), slices.Concat(remove, expiring(set)), now)
 		if err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, nil, err
 		}
 		var e ChangeEvent
 		if len(remove) > 0 {
 			if e.Left, err = a.leave(ctx, tx, tenant, remove); err != nil {
-				return ChangeEvent{}, err
+				return ChangeEvent{}, nil, err
 			}
 		}
 		if len(set) > 0 {
 			if e.Joined, err = a.join(ctx, tx, tenant, actor.Principal, set); err != nil {
-				return ChangeEvent{}, err
+				return ChangeEvent{}, nil, err
 			}
 		}
 		e.Shortened, e.Revoked, err = a.unrest(ctx, tx, tenant, actor.Principal, r, now)
-		return e, err
+		return e, locked.joining(e.Joined), err
 	})
 }
 
@@ -1622,6 +1659,19 @@ func (r reach) gaining(add []Member) []Member {
 	return out
 }
 
+// joining is the keys of the principals of joined, the members a change stored, whose places
+// widen what they hold, which their exclusive values are checked for: all but those that only end
+// a place in force sooner, a removal then.
+func (r reach) joining(joined []Member) []string {
+	var keys []string
+	for _, m := range joined {
+		if !r.ending[memberKey(m)] {
+			keys = append(keys, m.Principal.key())
+		}
+	}
+	return keys
+}
+
 // leaving is the members that leave their groups: those removed, and those added to end sooner,
 // that no other place there keeps in it.
 func (r reach) leaving(add, remove []Member) []Member {
@@ -1758,27 +1808,27 @@ func (r reach) footprint(add, remove []Member, gains bool) map[reachKey]RoleDefi
 // access it didn't when it was checked and the host asked about it before the transaction, or one
 // of a role widened since, or that reaches a group it didn't then. With gains, as for the host's
 // write, which is checked only as the host is asked about what members gain, it compares only
-// those.
-func (a *Authorizer) stillReached(ctx context.Context, tx pgx.Tx, tenant string, add, remove []Member, was reach, gains bool) error {
-	now, err := a.reachOf(ctx, tx, tenant, add, remove, !gains)
+// those. It returns what the change reaches under the locks.
+func (a *Authorizer) stillReached(ctx context.Context, tx pgx.Tx, tenant string, add, remove []Member, was reach, gains bool) (reach, error) {
+	now, err := a.reachOf(ctx, tx, tenant, add, remove, true)
 	if err != nil {
-		return err
+		return reach{}, err
 	}
 	// A group nested meanwhile above one the change reaches is one whose lock it doesn't hold, so
 	// a grant to it could commit without the host asked about what the members gain.
 	locked := was.locks()
 	for _, k := range now.locks() {
 		if _, ok := slices.BinarySearch(locked, k); !ok {
-			return fmt.Errorf("%w: the groups changed are now in %s, which this change doesn't lock; try again", ErrConflict, k)
+			return reach{}, fmt.Errorf("%w: the groups changed are now in %s, which this change doesn't lock; try again", ErrConflict, k)
 		}
 	}
 	before := was.footprint(add, remove, gains)
 	for k, role := range now.footprint(add, remove, gains) {
 		if old, ok := before[k]; !ok || widens(old, role) {
-			return fmt.Errorf("%w: what group %q holds changed while this change waited for it; try again", ErrConflict, k.group)
+			return reach{}, fmt.Errorf("%w: what group %q holds changed while this change waited for it; try again", ErrConflict, k.group)
 		}
 	}
-	return nil
+	return now, nil
 }
 
 // as is v, a group's grant or eligibility, as the one m gains by joining it or a group in it, as

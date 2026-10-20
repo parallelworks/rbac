@@ -1518,9 +1518,10 @@ func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, h
 	})
 }
 
-// inTxReaching is inTx for a change whose exclusive values are checked for the identities, by key,
-// fn returns besides those its event names: kept out of the event, so OnChange is handed only what
-// a host can build and compare.
+// inTxReaching is inTx for a change to memberships or places in groups, whose exclusive values are
+// checked for the identities, by key, fn returns as those whose memberships or places it widened,
+// besides those its grants and eligibilities name: kept out of the event, so OnChange is handed
+// only what a host can build and compare.
 func (a *Authorizer) inTxReaching(ctx context.Context, tenant string, actor Principal, how string, fn func(pgx.Tx) (ChangeEvent, []string, error)) error {
 	return a.begin(ctx, func(tx pgx.Tx) error {
 		// Taken by every change, removals too, so changes in one host transaction take their locks in

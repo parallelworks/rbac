@@ -1907,6 +1907,52 @@ func TestARemovalIsNeverRefusedForAnExclusiveConflict(t *testing.T) {
 	}
 }
 
+// Making a place or a membership end sooner is a removal, never refused for an exclusive conflict,
+// as removing it isn't; making one last longer is not.
+func TestShorteningAConflictedIdentitysPlaceOrMembershipIsNeverRefused(t *testing.T) {
+	h := labeled(t, func(c *rbac.Config) {
+		banks(c)
+		c.Labels[len(c.Labels)-1].Exclusive = false
+		c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
+	})
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"))
+	h.as(t, "ann", "crew")
+	h.hold(t, "ann", "bank:a", "bank:b")
+	cfg := h.cfg
+	cfg.Labels = slices.Clone(cfg.Labels)
+	cfg.Labels[len(cfg.Labels)-1].Exclusive = true
+	authz, err := rbac.New(h.pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin := h.as(t, "admin")
+	place := func(until time.Duration) []rbac.Member {
+		return []rbac.Member{{Group: "crew", Principal: identity("ann"), ExpiresAt: h.now.Add(until)}}
+	}
+	if err := authz.ImportMembers(ctx, host, "t1", place(2*time.Hour)); err != nil {
+		t.Errorf("ImportMembers making ann's place end sooner: %v", err)
+	}
+	if err := authz.ChangeMembers(ctx, admin, "t1", place(time.Hour), nil); err != nil {
+		t.Errorf("ChangeMembers making ann's place end sooner: %v", err)
+	}
+	membership := func(until time.Duration, note string) []rbac.Membership {
+		return []rbac.Membership{{Principal: identity("ann"), ExpiresAt: h.now.Add(until), Note: note}}
+	}
+	if err := authz.SetMemberships(ctx, host, "t1", membership(24*time.Hour, "")); err != nil {
+		t.Errorf("SetMemberships making ann's membership end sooner: %v", err)
+	}
+	if err := authz.SetMemberships(ctx, host, "t1", membership(24*time.Hour, "contractor")); err != nil {
+		t.Errorf("SetMemberships changing the note of ann's membership: %v", err)
+	}
+	excluded(t, authz.ImportMembers(ctx, host, "t1", place(3*time.Hour)))
+	excluded(t, authz.ChangeMembers(ctx, admin, "t1", place(3*time.Hour), nil))
+	excluded(t, authz.SetMemberships(ctx, host, "t1", membership(48*time.Hour, "")))
+	if err := authz.ChangeMembers(ctx, admin, "t1", nil, place(0)); err != nil {
+		t.Errorf("removing ann's place: %v", err)
+	}
+}
+
 func TestSuspendingAMemberLiftsNoDeny(t *testing.T) {
 	viewer := rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
 	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), viewer, guardRole) })
