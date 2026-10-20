@@ -3787,6 +3787,39 @@ func TestRolesListingEachOtherAreDecidedOnce(t *testing.T) {
 	}
 }
 
+// What a refused grant checked on its way is forgotten, as some passed only while it was in
+// progress: a later grant in the same change resting on it is decided afresh.
+func TestARefusedGrantProvesNothingForTheNext(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	// custom.a lists custom.b, which lists it back; custom.a also gives root, which lead lacks.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles) VALUES
+		('t1', 'custom.a', '{cluster:grant,cluster:root}', '{cluster}', '{custom.b}'),
+		('t1', 'custom.b', '{cluster:grant,cluster:view}', '{cluster}', '{custom.a}'),
+		('t1', 'custom.lead', '{cluster:view,cluster:login,cluster:grant}', '{cluster}', '{}')`); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), "custom.lead", rbac.User, "lead"))
+	lead := h.as(t, "lead")
+	err := h.authz.Apply(ctx, lead, cluster, rbac.Change{Grant: []rbac.Binding{
+		{Role: "custom.a", Principal: identity("p1")}, {Role: "custom.b", Principal: identity("p2")},
+	}})
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		t.Fatalf("want both grants refused, got %v", err)
+	}
+	var refused []string
+	for _, e := range joined.Unwrap() {
+		var denied *rbac.DeniedError
+		if errors.As(e, &denied) {
+			refused = append(refused, denied.Reason)
+		}
+	}
+	if len(refused) != 2 || !strings.Contains(refused[1], "grant custom.b") {
+		t.Fatalf("granting custom.b, whose holders may grant custom.a, after custom.a was refused: %q", refused)
+	}
+}
+
 func TestManyGrantsOfARoleAreDecidedOnce(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
