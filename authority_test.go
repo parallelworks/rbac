@@ -1208,9 +1208,22 @@ func TestChecksReadTheirGrantsFromAnIndexAlone(t *testing.T) {
 						SELECT 't1', 'tenant', 't1', 'user', id, 'cluster.login' FROM others`, "rbac_grants")
 				}
 			}
-			// So the visibility map lets a scan of an index skip the rows.
-			if _, err := h.pool.Exec(ctx, `VACUUM rbac_grants`); err != nil {
-				t.Fatal(err)
+			// So the visibility map lets a scan of an index skip the rows. VACUUM marks none visible to
+			// all while an older snapshot elsewhere in the database, such as another run's, is open.
+			for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(time.Second) {
+				if _, err := h.pool.Exec(ctx, `VACUUM rbac_grants`); err != nil {
+					t.Fatal(err)
+				}
+				var visible bool
+				if err := h.pool.QueryRow(ctx, `SELECT relallvisible >= relpages FROM pg_class WHERE oid = 'rbac_grants'::regclass`).Scan(&visible); err != nil {
+					t.Fatal(err)
+				}
+				if visible {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Skip("an older snapshot elsewhere in the database keeps rbac_grants' rows from being visible to all")
+				}
 			}
 			tx, err := h.pool.Begin(ctx)
 			if err != nil {
