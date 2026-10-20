@@ -306,14 +306,31 @@ func (a *Authorizer) cleared(ctx context.Context, q DB, on Resource, cs *constra
 	if !on.Labels.asks() {
 		return nil
 	}
-	h, _, err := a.holdingOn(ctx, q, cs.actor, cs.ofTenant())
-	if err != nil {
-		return err
+	return a.labelCheck(ctx, q, cs.ofTenant())(on, p)
+}
+
+// labelCheck returns a check refusing, as a DeniedError of p, a change on a resource whose label
+// the actor's holding doesn't satisfy, read on q once, the first time a label asks for values,
+// asking the constraints about them on the tenant through labels: before the change's
+// transaction, and again under its locks, which reads their answers back.
+func (a *Authorizer) labelCheck(ctx context.Context, q DB, labels *constrained) func(on Resource, p Permission) error {
+	var held *Holding
+	return func(on Resource, p Permission) error {
+		if !on.Labels.asks() {
+			return nil
+		}
+		if held == nil {
+			h, _, err := a.holdingOn(ctx, q, labels.actor, labels)
+			if err != nil {
+				return err
+			}
+			held = &h
+		}
+		if dim := held.Unsatisfied(on.Labels); dim != "" {
+			return &DeniedError{Permission: p, Scope: on.Scope(), Reason: labelRefusal(dim)}
+		}
+		return nil
 	}
-	if dim := h.Unsatisfied(on.Labels); dim != "" {
-		return &DeniedError{Permission: p, Scope: on.Scope(), Reason: labelRefusal(dim)}
-	}
-	return nil
 }
 
 // changing refuses a change to grants on a scope of a type the host doesn't have, as a typo no

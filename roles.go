@@ -299,7 +299,7 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 		if err := a.changesDenied(au, tenant, types, fmt.Sprintf("changing what %s's grants give", r.ID)); err != nil {
 			return err
 		}
-		if labeled, err = a.labelsAllow(ctx, actor, tenant, r.ID); err != nil {
+		if labeled, err = a.labelsAllow(ctx, actor, tenant, r.ID, false); err != nil {
 			return err
 		}
 	}
@@ -425,7 +425,7 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		if err := a.changesDenied(au, tenant, checked.ResourceTypes, "revoking "+string(id)); err != nil {
 			return err
 		}
-		if labeled, err = a.labelsAllow(ctx, actor, tenant, id); err != nil {
+		if labeled, err = a.labelsAllow(ctx, actor, tenant, id, true); err != nil {
 			return err
 		}
 	}
@@ -658,9 +658,10 @@ type labeling struct {
 
 // labelsAllow refuses changing what a custom role's grants and eligibilities give, or revoking
 // them, to an actor that a label of a scope they are on refuses, as Apply refuses changing grants
-// there: read before the change's transaction, as labels are the host's. It returns what it
+// there: read before the change's transaction, as labels are the host's; with removing, as for
+// deleting the role, a scope the host no longer has (ErrNotFound) as unlabeled. It returns what it
 // checked, which stillLabeled reads again under the change's lock.
-func (a *Authorizer) labelsAllow(ctx context.Context, actor Subject, tenant string, id Role) (labeling, error) {
+func (a *Authorizer) labelsAllow(ctx context.Context, actor Subject, tenant string, id Role, removing bool) (labeling, error) {
 	if len(a.labels) == 0 {
 		return labeling{}, nil
 	}
@@ -671,7 +672,10 @@ func (a *Authorizer) labelsAllow(ctx context.Context, actor Subject, tenant stri
 	l := labeling{scopes: scopes, cs: a.constrain(ctx, actor, Resource{Tenant: tenant, Type: TenantScope, ID: tenant})}
 	for _, s := range scopes {
 		on, err := a.resourceOf(ctx, tenant, s)
-		if err != nil {
+		switch {
+		case removing && errors.Is(err, ErrNotFound):
+			continue
+		case err != nil:
 			return labeling{}, err
 		}
 		if on.Labels.asks() {
@@ -684,16 +688,10 @@ func (a *Authorizer) labelsAllow(ctx context.Context, actor Subject, tenant stri
 // labelsHeld refuses, reading the actor's label values on q, a change to a role granted on a scope
 // whose label they don't satisfy.
 func (a *Authorizer) labelsHeld(ctx context.Context, q DB, l labeling) error {
-	if len(l.labeled) == 0 {
-		return nil
-	}
-	h, _, err := a.holdingOn(ctx, q, l.cs.actor, l.cs)
-	if err != nil {
-		return err
-	}
+	clearance := a.labelCheck(ctx, q, l.cs)
 	for _, on := range l.labeled {
-		if dim := h.Unsatisfied(on.Labels); dim != "" {
-			return &DeniedError{Permission: GrantPermission(on.Type), Scope: on.Scope(), Reason: labelRefusal(dim)}
+		if err := clearance(on, GrantPermission(on.Type)); err != nil {
+			return err
 		}
 	}
 	return nil

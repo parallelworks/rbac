@@ -564,6 +564,11 @@ var (
 	// it waited, or that PostgreSQL refused for a race, as a deadlock between host transactions:
 	// try it again.
 	ErrConflict = errors.New("rbac: conflict")
+	// ErrNotFound is what Config.ResourceOf returns, or wraps, for a scope the host no longer has,
+	// as a resource deleted without DeleteScopes: a change that only takes access away there, as
+	// removing a member of a group with access on it or deleting a role granted on it, reads it as
+	// unlabeled. Any other error fails the change.
+	ErrNotFound = errors.New("rbac: not found")
 )
 
 // conflicted makes PostgreSQL's refusals for a race match ErrConflict, keeping the error: a
@@ -665,17 +670,19 @@ type Config struct {
 	Constraints   []Constraint
 	// ResourceOf returns the resource a scope is, with its ancestors, attributes and label, as the
 	// host passes it to a check. SetGroup and DeleteGroup check ManageGroups on the tenant, and
-	// ChangeMembers GroupMembers on each group it changes, on the resource it returns, and a
-	// change to a group's members as the grants and denies it amounts to on each scope the group's
-	// access is on, the tenant's and groups' included, which the package knows only by type and id,
-	// on the resource it returns for each. Without it, a scope is taken as stored, its type and id
-	// directly under the tenant, with no attributes or label, as constraints see it too. GroupMembers
-	// is checked on a group as group management checks its permissions; the grants and denies a
-	// change amounts to only where that is all of the scope: for a host declaring no Labels, and
-	// resource Attributes as none (an empty map, as nil lets conditions read any), and on a scope
-	// other than the tenant or a group, no ContainerTypes. For any other, that change is refused.
-	// SetRole changing what a custom role's grants give, and DeleteRole, check the label of each
-	// scope the role is granted on as it returns it, so with Labels declared they need it too.
+	// ChangeMembers GroupMembers on each group it changes, on the resource it returns, and a change
+	// to a group's members as the grants and denies it amounts to, and a removal by the label, on
+	// each scope the group's access is on, the tenant's and groups' included, which the package knows
+	// only by type and id, on the resource it returns for each. Without it, a scope is taken as
+	// stored, its type and id directly under the tenant, with no attributes or label, as constraints
+	// see it too. GroupMembers is checked on a group as group management checks its permissions; the
+	// grants and denies a change amounts to only where that is all of the scope: for a host declaring
+	// no Labels, and resource Attributes as none (an empty map, as nil lets conditions read any), and
+	// on a scope other than the tenant or a group, no ContainerTypes. For any other, that change is
+	// refused. SetRole changing what a custom role's grants give, and DeleteRole, check the label of
+	// each scope the role is granted on as it returns it, so with Labels declared they need it too. A
+	// removal reads a scope it reports as ErrNotFound as unlabeled, and ChangeMembers asks nothing of
+	// the scopes only a removal reaches where the actor's label values satisfy every label.
 	ResourceOf func(ctx context.Context, tenant string, s Scope) (Resource, error)
 	// Permissions are every permission the host checks, whether or not a role gives it, so that a
 	// catalog leaving one out, as one an operator configures may, refuses it like any permission

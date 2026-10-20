@@ -2906,6 +2906,42 @@ func TestAPlaceEndingSoonerRemovedMeanwhileIsTriedAgain(t *testing.T) {
 	}
 }
 
+// Without declared labels, only labels check what a member leaving loses, so a grant to its group
+// made while a removal is checked changes nothing the removal checked.
+func TestARemovalWithoutLabelsIsNotTriedAgainForAGrantMadeMeanwhile(t *testing.T) {
+	var meanwhile func(ctx context.Context) error
+	h := grouped(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), guardRole)
+		c.Constraints = []rbac.Constraint{{Name: "meanwhile", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if do := meanwhile; do != nil && in.Permission == rbac.DenyPermission("cluster") {
+				meanwhile = nil
+				return false, do(ctx)
+			}
+			return false, nil
+		}}}
+	})
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "manager"), grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
+	h.join(t, "u")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	manager := h.as(t, "manager")
+	// Leaving crew lifts this, which asks the constraints.
+	if err := h.authz.SetDeny(ctx, manager, cluster, rbac.Deny{ID: "d", Principals: []rbac.Principal{groupOf("crew")}, Permissions: []rbac.Permission{root}}); err != nil {
+		t.Fatal(err)
+	}
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.Import(ctx, host, "t1", []rbac.Grant{grant(workspace.Scope(), "workspace.admin", rbac.Group, "crew")})
+	}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", nil, []rbac.Member{{Group: "crew", Principal: identity("u")}}); err != nil {
+		t.Fatalf("a removal from a group granted elsewhere meanwhile, with no labels declared: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("crew should have been granted on the workspace meanwhile")
+	}
+}
+
 func TestAGroupApprovingWhatCantBeGrantedNowTakesNoMembers(t *testing.T) {
 	h := grouped(t)
 	ctx := t.Context()

@@ -720,6 +720,316 @@ func TestChangingMembersOfALabeledGroupNeedsItsLabel(t *testing.T) {
 	}
 }
 
+func TestRemovingAMemberNeedsTheLabelOfWhereItsGroupsHoldAccess(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	h := labeled(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s == secret.Scope() {
+				return secret, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	// Groups holding a grant, an eligibility and an approval on the labeled cluster, one a deny there
+	// exempts, one in the first, and one holding access only elsewhere.
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"),
+		grant(secret.Scope(), "cluster.login", rbac.Group, "crew"), grant(workspace.Scope(), "workspace.admin", rbac.Group, "plain"))
+	h.groups(t, "eligible", "approvers", "exempt", "inner")
+	for _, q := range []string{
+		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+		 VALUES ('t1', 'cluster', 'c1', 'group', 'eligible', 'cluster.login', 3600, '{}'),
+		   ('t1', 'cluster', 'c1', 'user', 'x', 'cluster.login', 3600, '{group:approvers}')`,
+		`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+		 VALUES ('t1', 'cluster', 'c1', 'd', '{members:t1}', '{group:exempt}', '{cluster:root}')`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.join(t, "u")
+	labeledGroups := []string{"crew", "eligible", "approvers", "exempt", "inner"}
+	var members []rbac.Member
+	for _, g := range append(labeledGroups, "plain") {
+		members = append(members, rbac.Member{Group: g, Principal: identity("u")})
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t1", append(members, rbac.Member{Group: "crew", Principal: groupOf("inner")})); err != nil {
+		t.Fatal(err)
+	}
+	admin := h.as(t, "admin")
+	remove := func(group string) error {
+		return h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: group, Principal: identity("u")}})
+	}
+	for _, g := range labeledGroups {
+		if err := remove(g); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("removing a member of %s without the cluster's label: %v", g, err)
+		}
+	}
+	sooner := []rbac.Member{{Group: "crew", Principal: identity("u"), ExpiresAt: h.now.Add(time.Minute)}}
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", sooner, nil); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("ending a place in crew sooner without the cluster's label: %v", err)
+	}
+	if err := remove("plain"); err != nil {
+		t.Errorf("removing a member of a group holding access only on unlabeled scopes: %v", err)
+	}
+	h.hold(t, "admin", "level:high")
+	for _, g := range labeledGroups {
+		if err := remove(g); err != nil {
+			t.Errorf("removing a member of %s with the cluster's label: %v", g, err)
+		}
+	}
+}
+
+// A removal a label refuses is refused before its transaction, waiting for no lock another
+// change holds.
+func TestARemovalALabelRefusesWaitsForNoLock(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	h := labeled(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s == secret.Scope() {
+				return secret, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"), grant(secret.Scope(), "cluster.login", rbac.Group, "crew"))
+	h.join(t, "u", "v")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	admin := h.as(t, "admin")
+	// Another change to crew's members holds its locks.
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := h.authz.WithTx(tx).ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("v")}}); err != nil {
+		t.Fatal(err)
+	}
+	var pid int32
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "crew", Principal: identity("u")}})
+	}()
+	for {
+		select {
+		case err := <-done:
+			if !errors.Is(err, rbac.ErrDenied) {
+				t.Fatalf("removing a member of a group holding access on a labeled scope without its label: %v", err)
+			}
+			return
+		default:
+		}
+		var waiting bool
+		if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("a removal its label refuses waited for another change's locks, then: %v", <-done)
+		}
+	}
+}
+
+// A member with another place in its group, from another source, doesn't leave it when one place
+// is removed or ends sooner: nothing changes for it, so neither a label nor a deny is checked.
+func TestRemovingOneOfAMembersPlacesChecksNothing(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	h := labeled(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), groupMembers, guardRole)
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s == secret.Scope() {
+				return secret, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"), grant(secret.Scope(), "cluster.login", rbac.Group, "crew"))
+	// A deny naming crew, whose lifting would need cluster:deny there.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+		VALUES ('t1', 'cluster', 'c1', 'd', '{group:crew}', '{cluster:root}')`); err != nil {
+		t.Fatal(err)
+	}
+	h.join(t, "u", "v")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{
+		{Group: "crew", Principal: identity("u")},
+		{Group: "crew", Principal: identity("u"), Source: "dir"},
+		{Group: "crew", Principal: identity("v")},
+		{Group: "crew", Principal: identity("v"), Source: "dir"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	admin := h.as(t, "admin")
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "crew", Principal: identity("u")}}); err != nil {
+		t.Errorf("removing one of u's two places in crew: %v", err)
+	}
+	sooner := []rbac.Member{{Group: "crew", Principal: identity("v"), ExpiresAt: h.now.Add(time.Minute)}}
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", sooner, nil); err != nil {
+		t.Errorf("ending one of v's two places in crew sooner: %v", err)
+	}
+	// Its last place, it leaves by.
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "crew", Principal: identity("u"), Source: "dir"}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("removing u's last place in crew: %v", err)
+	}
+	both := []rbac.Member{{Group: "crew", Principal: identity("v")}, {Group: "crew", Principal: identity("v"), Source: "dir"}}
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", nil, both); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("removing both of v's places in crew at once: %v", err)
+	}
+}
+
+// A scope the host reports it no longer has, as one it deleted without DeleteScopes, has no label
+// to refuse taking access away there, so a removal or deleting a role reads it as unlabeled; any
+// other error of the host's still fails the change.
+func TestARemovalReadsAScopeTheHostNoLongerHasAsUnlabeled(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	errDown := errors.New("the host is down")
+	h := labeled(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			switch s {
+			case secret.Scope():
+				return secret, nil
+			case rbac.Scope{Type: "cluster", ID: "gone"}:
+				return rbac.Resource{}, fmt.Errorf("%w: cluster gone", rbac.ErrNotFound)
+			case rbac.Scope{Type: "cluster", ID: "down"}:
+				return rbac.Resource{}, errDown
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}')`); err != nil {
+		t.Fatal(err)
+	}
+	gone, down := rbac.Scope{Type: "cluster", ID: "gone"}, rbac.Scope{Type: "cluster", ID: "down"}
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "tenant.roles", rbac.User, "admin"),
+		grant(gone, "cluster.login", rbac.Group, "crew"), grant(secret.Scope(), "cluster.login", rbac.Group, "crew"),
+		grant(down, "cluster.login", rbac.Group, "ops"), grant(gone, "custom.viewer", rbac.User, "u"))
+	h.join(t, "u")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}, {Group: "ops", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	admin := h.as(t, "admin")
+	h.hold(t, "admin", "level:high")
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "crew", Principal: identity("u")}}); err != nil {
+		t.Errorf("removing a member of a group with access on a scope the host no longer has: %v", err)
+	}
+	if err := h.authz.DeleteRole(ctx, admin, "t1", "custom.viewer"); err != nil {
+		t.Errorf("deleting a role granted on a scope the host no longer has: %v", err)
+	}
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "ops", Principal: identity("u")}}); !errors.Is(err, errDown) {
+		t.Errorf("removing a member of a group with access on a scope the host fails to read: %v", err)
+	}
+}
+
+// Where the actor's label values satisfy every label, none can refuse it taking access away, so a
+// removal asks the host nothing about the scopes it takes it away on, and is tried again where they
+// no longer do once it holds its locks.
+func TestARemovalByOneClearedForEveryLabelAsksTheHostNothing(t *testing.T) {
+	asked := 0
+	var meanwhile func(context.Context) error
+	h := labeled(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s.Type == "cluster" {
+				asked++
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+		c.Constraints = []rbac.Constraint{{Name: "meanwhile", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if do := meanwhile; do != nil && in.Permission == "rel:fra" {
+				meanwhile = nil
+				return false, do(ctx)
+			}
+			return false, nil
+		}}}
+	})
+	ctx := t.Context()
+	h.groups(t, "crew")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		SELECT 't1', 'cluster', 'c' || i, 'group', 'crew', 'cluster.login' FROM generate_series(1, 20) i`); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"))
+	h.join(t, "u", "v")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}, {Group: "crew", Principal: identity("v")}}); err != nil {
+		t.Fatal(err)
+	}
+	admin := h.as(t, "admin")
+	h.hold(t, "admin", "level:high", "comp:alpha", "comp:bravo", "rel:usa", "rel:gbr", "rel:fra")
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "crew", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	if asked != 0 {
+		t.Errorf("a removal by one cleared for every label asked Config.ResourceOf about %d clusters", asked)
+	}
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(rbac.TenantRoot("t1"), "rel.fra", rbac.User, "admin")})
+	}
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "crew", Principal: identity("v")}}); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("a removal once the actor lost a label value meanwhile: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("the label value should have been revoked meanwhile")
+	}
+}
+
+// A removal is refused when, while the scopes its group holds access on are read from the host,
+// the group is granted a role on a labeled one, whose label it didn't check.
+func TestAGrantToAGroupMadeWhileARemovalIsCheckedIsTriedAgain(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	var meanwhile func(ctx context.Context) error
+	h := labeled(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if do := meanwhile; do != nil && s == workspace.Scope() {
+				meanwhile = nil
+				if err := do(ctx); err != nil {
+					return rbac.Resource{}, err
+				}
+			}
+			if s == secret.Scope() {
+				return secret, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"), grant(workspace.Scope(), "workspace.admin", rbac.Group, "crew"))
+	h.join(t, "u")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.Import(ctx, host, "t1", []rbac.Grant{grant(secret.Scope(), "cluster.login", rbac.Group, "crew")})
+	}
+	if err := h.authz.ChangeMembers(ctx, h.as(t, "admin"), "t1", nil, []rbac.Member{{Group: "crew", Principal: identity("u")}}); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("a removal from a group granted on a labeled scope meanwhile: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("crew should have been granted on the cluster meanwhile")
+	}
+}
+
 func TestARemovalIsNeverRefusedForAnExclusiveConflict(t *testing.T) {
 	h := labeled(t, func(c *rbac.Config) {
 		banks(c)

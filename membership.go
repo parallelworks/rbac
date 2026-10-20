@@ -816,7 +816,7 @@ func (a *Authorizer) groupsTenant(ctx context.Context, tenant string) ([]Resourc
 // on q, once labels is sealed. labels is what the constraints remove of the actor's label values,
 // asked about on the tenant before the transaction and read back in it.
 func (a *Authorizer) mayManageGroups(ctx context.Context, q DB, actor Subject, perm Permission, on []Resource, labels *constrained) error {
-	var held *Holding
+	clearance := a.labelCheck(ctx, q, labels)
 	for _, r := range on {
 		scope := r.Scope()
 		if actor.Principal == (Principal{}) {
@@ -840,18 +840,8 @@ func (a *Authorizer) mayManageGroups(ctx context.Context, q DB, actor Subject, p
 		}
 		// As a check of perm on it refuses who can't see it, read again under the change's locks, so a
 		// value revoked meanwhile changes nothing.
-		if !r.Labels.asks() {
-			continue
-		}
-		if held == nil {
-			h, _, err := a.holdingOn(ctx, q, actor, labels)
-			if err != nil {
-				return err
-			}
-			held = &h
-		}
-		if dim := held.Unsatisfied(r.Labels); dim != "" {
-			return &DeniedError{Permission: perm, Scope: scope, Reason: labelRefusal(dim)}
+		if err := clearance(r, perm); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -886,6 +876,13 @@ func collectGroups(rows pgx.Rows) ([]GroupDefinition, error) {
 		g.CreatedBy, g.UpdatedBy = parsePrincipal(createdBy), parsePrincipal(updatedBy)
 		return g, err
 	})
+}
+
+// clearsAll reports whether the actor's label values, read on q through labels, satisfy every label
+// a resource can have.
+func (a *Authorizer) clearsAll(ctx context.Context, q DB, labels *constrained) (bool, error) {
+	h, _, err := a.holdingOn(ctx, q, labels.actor, labels)
+	return err == nil && h.clearsAll(), err
 }
 
 // groupKey is the scope key of a group, which changes to it lock.
@@ -1132,10 +1129,12 @@ func (a *Authorizer) placesBounded(ctx context.Context, tx pgx.Tx, tenant string
 // Config.ValidateGrant is asked about each as the member's (ViaMembership); it approves the
 // activations of the eligibilities those approve, which the actor must be able to set; and it is
 // exempt from the denies those are exempt from, as a removed member is from the denies those name,
-// which the actor must be able to set; a place made to end sooner gains nothing: it is a removal
-// then, checked as one now. Each group changed, and each scope reached, is checked as
-// Config.ResourceOf returns it. Members from a source the host owns, and the members of a group
-// from one, only the host changes, and what ImportMembers refuses, this does.
+// which the actor must be able to set. A removed member loses the rest, which only the label of
+// each scope it is on refuses the actor, as Apply refuses a revoke there; a place made to end
+// sooner gains nothing: it is a removal then, checked as one now. Each group changed, and each
+// scope reached, is checked as Config.ResourceOf returns it. Members from a source the host owns,
+// and the members of a group from one, only the host changes, and what ImportMembers refuses, this
+// does.
 func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant string, add, remove []Member) (err error) {
 	defer a.refused(ctx, &err, tenant, actor.Principal, "ChangeMembers")
 	if !validID(tenant) {
@@ -1187,7 +1186,7 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 	if err != nil {
 		return err
 	}
-	checks, err := a.mayReach(ctx, actor, tenant, set, remove, rc)
+	checks, err := a.mayReach(ctx, actor, tenant, set, remove, rc, labels)
 	if err != nil {
 		return err
 	}
@@ -1215,7 +1214,7 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 		if err := a.mayManageGroups(ctx, tx, actor, GroupMembers, targets, labels); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.mayReachAgain(ctx, tx, actor, checks); err != nil {
+		if err := a.mayReachAgain(ctx, tx, actor, checks, labels); err != nil {
 			return ChangeEvent{}, err
 		}
 		now := a.cfg.Now()
@@ -1258,6 +1257,12 @@ type reach struct {
 	// ending is the members added, by memberKey, that end a membership in force sooner than it
 	// would: they leave the group then, as removing them does now.
 	ending map[string]bool
+	// leaves is those of them and of the members removed, by memberKey, that leave their group: a
+	// place in force ends, and no other of theirs there, from another source, keeps them in it.
+	leaves map[string]bool
+	// labeled is whether the host declares labels, which alone check what a member leaving loses:
+	// without them, a grant made to its group meanwhile changes nothing the change checked.
+	labeled bool
 }
 
 // memberKey is what makes a member one member: its group, principal and source.
@@ -1270,9 +1275,9 @@ type approving struct {
 }
 
 // reachOf reads, on q, what adding add and removing remove reaches, in force at now, and with
-// ending, which of add end a membership sooner.
+// ending, which of add end a membership sooner and which members leave their groups.
 func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remove []Member, ending bool) (reach, error) {
-	r := reach{up: map[string]map[string]bool{}}
+	r := reach{up: map[string]map[string]bool{}, labeled: len(a.labels) > 0}
 	groups := memberGroups(slices.Concat(add, remove))
 	if len(groups) == 0 {
 		return r, nil
@@ -1365,7 +1370,7 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 		}
 	}
 	if ending {
-		if r.ending, err = a.endingSooner(ctx, q, tenant, add); err != nil {
+		if r.ending, r.leaves, err = a.placesLeft(ctx, q, tenant, add, remove); err != nil {
 			return reach{}, err
 		}
 	}
@@ -1416,37 +1421,96 @@ func (r reach) nested(add []Member) map[string]map[string]bool {
 	return nested
 }
 
-// endingSooner reads, on q, which of the members add sets, by memberKey, end a membership in force
-// sooner than it would end, for reach.ending.
-func (a *Authorizer) endingSooner(ctx context.Context, q DB, tenant string, add []Member) (map[string]bool, error) {
-	var groups, principals, sources []string
-	var ends []time.Time
+// placesLeft reads, on q, the places in force in their groups of the principals add and remove
+// name, and returns, by memberKey, those of add that end a place sooner than it would end
+// (reach.ending), and those of them and of remove that leave their group (reach.leaves): whose
+// place in force ends, and that keep no other there, from another source, past its end, as the
+// change leaves the others.
+func (a *Authorizer) placesLeft(ctx context.Context, q DB, tenant string, add, remove []Member) (ending, leaves map[string]bool, err error) {
+	type pair struct{ group, principal string }
+	pairOf := func(m Member) pair { return pair{m.Group, m.Principal.key()} }
+	pairs := map[pair]bool{}
 	for _, m := range add {
 		if !m.ExpiresAt.IsZero() {
-			groups, principals, sources = append(groups, m.Group), append(principals, m.Principal.key()), append(sources, m.Source)
-			ends = append(ends, m.ExpiresAt)
+			pairs[pairOf(m)] = true
 		}
 	}
-	if len(groups) == 0 {
-		return nil, nil
+	for _, m := range remove {
+		pairs[pairOf(m)] = true
 	}
-	// Each found on its own, as leave finds its rows.
+	if len(pairs) == 0 {
+		return nil, nil, nil
+	}
+	var groups, principals []string
+	for p := range pairs {
+		groups, principals = append(groups, p.group), append(principals, p.principal)
+	}
+	now := a.cfg.Now()
+	// Each pair's found on its own, as leave finds its rows.
 	rows, err := q.Query(ctx, `
-		SELECT m.group_id, m.principal, m.source FROM unnest($2::text[], $3::text[], $4::text[], $5::timestamptz[]) AS t(g, p, s, e)
-		CROSS JOIN LATERAL (
-		  SELECT group_id, principal, source FROM rbac_members WHERE tenant = $1 AND group_id = t.g AND principal = t.p AND source = t.s
-		    AND (expires_at IS NULL OR expires_at > t.e AND expires_at > $6) OFFSET 0) m`,
-		tenant, groups, principals, sources, ends, a.cfg.Now())
+		SELECT m.group_id, m.principal, m.source, m.expires_at FROM unnest($2::text[], $3::text[]) AS t(g, p) CROSS JOIN LATERAL (
+		  SELECT group_id, principal, source, expires_at FROM rbac_members WHERE tenant = $1 AND group_id = t.g AND principal = t.p
+		    AND (expires_at IS NULL OR expires_at > $4) OFFSET 0) m`,
+		tenant, groups, principals, now)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	ending := map[string]bool{}
+	// Each pair's places, by source, as the change leaves them: until when, zero for never.
+	places := map[pair]map[string]time.Time{}
 	var group, principal, source string
-	_, err = pgx.ForEachRow(rows, []any{&group, &principal, &source}, func() error {
-		ending[memberKey(Member{Group: group, Principal: parsePrincipal(principal), Source: source})] = true
+	var expires *time.Time
+	if _, err := pgx.ForEachRow(rows, []any{&group, &principal, &source, &expires}, func() error {
+		p := pair{group, principal}
+		if places[p] == nil {
+			places[p] = map[string]time.Time{}
+		}
+		places[p][source] = time.Time{}
+		if expires != nil {
+			places[p][source] = *expires
+		}
 		return nil
-	})
-	return ending, err
+	}); err != nil {
+		return nil, nil, err
+	}
+	stored := maps.Clone(places)
+	for p, ps := range stored {
+		stored[p] = maps.Clone(ps)
+	}
+	for _, m := range add {
+		if places[pairOf(m)] == nil {
+			places[pairOf(m)] = map[string]time.Time{}
+		}
+		places[pairOf(m)][m.Source] = m.ExpiresAt
+	}
+	for _, m := range remove {
+		delete(places[pairOf(m)], m.Source)
+	}
+	// keeps reports whether another of m's places keeps it in its group past until.
+	keeps := func(m Member, until time.Time) bool {
+		for source, end := range places[pairOf(m)] {
+			if source != m.Source && (end.IsZero() || end.After(until)) {
+				return true
+			}
+		}
+		return false
+	}
+	ending, leaves = map[string]bool{}, map[string]bool{}
+	for _, m := range add {
+		was, ok := stored[pairOf(m)][m.Source]
+		if m.ExpiresAt.IsZero() || !ok || !was.IsZero() && !was.After(m.ExpiresAt) {
+			continue
+		}
+		ending[memberKey(m)] = true
+		if !keeps(m, m.ExpiresAt) {
+			leaves[memberKey(m)] = true
+		}
+	}
+	for _, m := range remove {
+		if _, ok := stored[pairOf(m)][m.Source]; ok && !keeps(m, now) {
+			leaves[memberKey(m)] = true
+		}
+	}
+	return ending, leaves, nil
 }
 
 // gaining is the members added that gain what their groups hold: all but those added to end sooner,
@@ -1464,11 +1528,12 @@ func (r reach) gaining(add []Member) []Member {
 	return out
 }
 
-// leaving is the members that leave their groups: those removed, and those added to end sooner.
+// leaving is the members that leave their groups: those removed, and those added to end sooner,
+// that no other place there keeps in it.
 func (r reach) leaving(add, remove []Member) []Member {
-	out := slices.Clone(remove)
-	for _, m := range add {
-		if r.ending[memberKey(m)] {
+	var out []Member
+	for _, m := range slices.Concat(remove, add) {
+		if r.leaves[memberKey(m)] {
 			out = append(out, m)
 		}
 	}
@@ -1514,6 +1579,32 @@ func (r reach) lifted(group string, leaving bool) []Deny {
 	return ds
 }
 
+// leftBy is the scopes a member leaving group loses access on, as stored: those of the grants and
+// eligibilities of it and those it is in, of the eligibilities they approve, and of the denies that
+// exempt them; none where no label checks them.
+func (r reach) leftBy(group string) []Scope {
+	if !r.labeled {
+		return nil
+	}
+	var ss []Scope
+	for _, v := range r.held {
+		if in(r.stored, group, v.binding.Principal) {
+			ss = append(ss, v.scope)
+		}
+	}
+	for _, v := range r.approving {
+		if in(r.stored, group, v.approvers...) {
+			ss = append(ss, v.scope)
+		}
+	}
+	for _, d := range r.denies {
+		if in(r.stored, group, d.Exempt...) {
+			ss = append(ss, d.Scope)
+		}
+	}
+	return ss
+}
+
 // locks are the principal locks of every group the change reaches: a grant, an eligibility or a
 // deny naming one takes its lock, and so does nesting it in another group.
 func (r reach) locks() []string {
@@ -1527,12 +1618,14 @@ func (r reach) locks() []string {
 }
 
 // reachKey is one change to access a change to members makes for a member of group: a grant or
-// eligibility gained, or one whose activations it approves, or a deny on a scope lifted.
+// eligibility gained, or one whose activations it approves, a deny on a scope lifted, or access on
+// a scope left.
 type reachKey struct {
 	group    string
 	approves bool
 	gained   revalidated
 	deny     Scope
+	left     Scope
 }
 
 // footprint is the changes to access adding add and removing remove make, with the role of each
@@ -1559,6 +1652,9 @@ func (r reach) footprint(add, remove []Member, gains bool) map[reachKey]RoleDefi
 	for _, m := range r.leaving(add, remove) {
 		for _, d := range r.lifted(m.Group, true) {
 			f[reachKey{group: m.Group, deny: d.Scope}] = RoleDefinition{}
+		}
+		for _, s := range r.leftBy(m.Group) {
+			f[reachKey{group: m.Group, left: s}] = RoleDefinition{}
 		}
 	}
 	return f
@@ -1632,19 +1728,26 @@ func (a *Authorizer) askMemberships(ctx context.Context, actor Subject, tenant s
 }
 
 // reachCheck is what a change to members is checked as on one scope it reaches: the grants it
-// amounts to there, and whether it lifts a deny there, with what the transaction checks again.
+// amounts to there, whether it lifts a deny there, and whether a member leaving loses access there,
+// with what the transaction checks again.
 type reachCheck struct {
 	on     Resource
 	grants []Binding
 	denies bool
+	leaves bool
+	// cleared is set where only a member leaving is checked, by the label alone, and the actor's
+	// label values satisfied every label, so the host wasn't asked: they must still.
+	cleared bool
 	// cs and ds are the constraints' answers on granting and on lifting denies there.
 	cs, ds *constrained
 }
 
 // mayReach checks, before ChangeMembers' transaction, that actor may make each change to access a
 // change to members makes, by scope: grant each grant and eligibility an added member gains, as
-// Apply would; set each eligibility it would approve; and set each deny lifted for a member.
-func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string, add, remove []Member, rc reach) ([]*reachCheck, error) {
+// Apply would; set each eligibility it would approve; set each deny lifted for a member; and take
+// away what a member leaving loses, which only a scope's label refuses, as Apply refuses a revoke
+// there, read through labels.
+func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string, add, remove []Member, rc reach, labels *constrained) ([]*reachCheck, error) {
 	byScope := map[Scope]*reachCheck{}
 	at := func(s Scope) *reachCheck {
 		if byScope[s] == nil {
@@ -1687,12 +1790,35 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 		for _, d := range rc.lifted(m.Group, true) {
 			at(d.Scope).denies = true
 		}
+		for _, s := range rc.leftBy(m.Group) {
+			at(s).leaves = true
+		}
 	}
+	clearance := a.labelCheck(ctx, a.db, labels)
+	// Where only its label checks a scope, the host is asked about it only if a label could refuse
+	// the actor, and one it no longer has, as for a revoke there, has none.
+	var cleared *bool
 	var checks []*reachCheck
 	for _, s := range slices.SortedFunc(maps.Keys(byScope), func(x, y Scope) int { return strings.Compare(x.Key(), y.Key()) }) {
 		c := byScope[s]
+		leaving := len(c.grants) == 0 && !c.denies
+		if leaving && cleared == nil {
+			all, err := a.clearsAll(ctx, a.db, labels)
+			if err != nil {
+				return nil, err
+			}
+			cleared = &all
+		}
+		if leaving && *cleared {
+			c.cleared = true
+			checks = append(checks, c)
+			continue
+		}
 		on, err := a.resourceOf(ctx, tenant, s)
-		if err != nil {
+		switch {
+		case leaving && errors.Is(err, ErrNotFound):
+			continue
+		case err != nil:
 			return nil, err
 		}
 		c.on = on
@@ -1706,6 +1832,12 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 				return nil, err
 			}
 		}
+		// Granting or lifting a deny there checked its label already.
+		if leaving {
+			if err := clearance(on, GrantPermission(on.Type)); err != nil {
+				return nil, err
+			}
+		}
 		checks = append(checks, c)
 	}
 	return checks, nil
@@ -1713,7 +1845,17 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 
 // mayReachAgain checks what mayReach checked again, in a change's transaction, reading the
 // constraints' answers from before it rather than ask them again, the actor's label values too.
-func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject, checks []*reachCheck) error {
+func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject, checks []*reachCheck, labels *constrained) error {
+	clearance := a.labelCheck(ctx, tx, labels)
+	if slices.ContainsFunc(checks, func(c *reachCheck) bool { return c.cleared }) {
+		all, err := a.clearsAll(ctx, tx, labels)
+		if err != nil {
+			return err
+		}
+		if !all {
+			return fmt.Errorf("%w: the actor's label values changed while this change waited; try again", ErrConflict)
+		}
+	}
 	for _, c := range checks {
 		if len(c.grants) > 0 {
 			c.cs.seal()
@@ -1730,6 +1872,11 @@ func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject
 			}
 			c.ds.seal()
 			if err := a.cleared(ctx, tx, c.on, c.ds, DenyPermission(c.on.Type)); err != nil {
+				return err
+			}
+		}
+		if c.leaves && len(c.grants) == 0 && !c.denies && !c.cleared {
+			if err := clearance(c.on, GrantPermission(c.on.Type)); err != nil {
 				return err
 			}
 		}
