@@ -380,7 +380,8 @@ const MaxHistory = 10000
 //
 // It reads history in the current schema by name, so a session's temporary table or type named
 // as history's or a catalog's stands in for none of it, and refuses a search_path that names
-// pg_temp first.
+// pg_temp first. A schema the session's role made, or can create in, named first there is read as
+// the package's, so that role must be able to do neither: the README's database roles say how.
 func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Record, Cursor, error) {
 	if limit < 1 || limit > MaxHistory {
 		return nil, after, fmt.Errorf("%w: a read of history takes from 1 to %d records", ErrInvalid, MaxHistory)

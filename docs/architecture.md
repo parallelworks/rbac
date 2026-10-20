@@ -516,7 +516,8 @@ flowchart LR
   transactions older than every transaction still running, which have all ended. So a cursor
   never passes a record that commits later. It, `Export` and `PruneHistory` name history by its
   schema, as `AsOf` does, and their types by pg_catalog's, so a session's temporary table or type
-  stands in for none of it.
+  stands in for none of it. A schema the application's role made, first on its search_path, would:
+  that role can make none.
 - **Generations.** A cursor names its generation: the database cluster, by its system and
   timeline, and the database and schema. Failing over or recovering to a point in time starts a
   new generation, which an export starts again from `Genesis`. A restore that starts none, as

@@ -325,12 +325,16 @@ through which it could write `rbac_history` itself; and:
    read the row as it was before the change. Never `TRIGGER`, which `ALL` includes: a trigger
    runs its function as whoever writes the table, and one on `rbac_history` can drop each record,
    as history's owner.
-4. The application's role can create in no schema: not one it owns, as `public` is when that role
-   owns the database, nor `public` before PostgreSQL 15, where every role can. `Migrate` calls
-   functions by name, and an overload made in the package's schema would run in its place, as the
-   administrator's role; and the package's schema is a session's current one, the first on its
-   search_path, which a session can set, so one that named first a schema the role can create in
-   would read a table made there as history, and `Export` would sign what it holds.
+4. The application's role can make no schema and create in none: it neither owns the database nor
+   has `CREATE` on it, which `CREATE SCHEMA` needs and only the owner has by default, and it
+   creates in no schema it owns, as `public` is when that role owns the database, nor in `public`
+   before PostgreSQL 15, where every role can. `Migrate` calls functions by name, and an overload
+   made in the package's schema would run in its place, as the administrator's role; and the
+   package's schema is a session's current one, the first on its search_path, which a session can
+   set, so one that named first a schema the role made, or can create in, would read a table made
+   there as history: a generation of its own, which an export starts from `Genesis`, and `Export`
+   would sign what it holds. `History` and `Export` can't tell that table from history's own,
+   which the application's role owns where these roles aren't set up, so they don't refuse it.
 
 The application's role may create temporary tables, as `AsOf` needs, and a session reads its own
 tables and types before any schema's of the same name until it ends, which in a pool can be long
