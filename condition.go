@@ -44,28 +44,30 @@ import (
 // list, that would read more than a condition may spend fails before it runs.
 //
 // Each condition runs within the most evaluating it can cost, which its literals and types bound:
-// little for one comparing what a request passes with literals, whatever it passes, and all a
-// condition may for one reading the size of a value the request decides, as a list or a long
-// string, or looping over one. What a check may spend on conditions is bounded, for each scope on
-// its path, and so are the conditions stored, so that a check evaluates whole every one it reads:
-// those of an identity's grants on a scope cost at most so much together, and those of a scope's
-// grants to groups, the tenant's members and the public, which reach many, as much again, those
-// from each source the host owns (Config.Sources) apart from the rest; those of a scope's denies
-// (SetDeny); and the requirements of the eligibilities of groups for a role on a scope. Each
-// distinct condition counts once, as what compiling it and the most evaluating it can cost:
-// hundreds of comparisons with literals, or three of the longest that read a list or loop. A check
-// of a labeled resource decides each of the subject's label values as a check of it would, and
-// evaluates a condition that doesn't read the action once for them all, so on the tenant one that
-// does counts once for each label value its grants give or its denies deny. A change adding a
-// condition past a bound, or one evaluated more, as by redefining a role to give more label values
-// (SetRole), is refused as invalid, so no grant, deny or eligibility stored changes what the others
-// decide, but one adding none isn't: conditions stored past a bound before there were bounds can be
-// rewritten in place, as by a restore over the rows still stored, though restored where those are
-// gone, they are added, and refused. An upgrade of CEL can leave conditions stored past a bound in
-// the same way: each process bounds a condition by what the CEL it is built with makes of it, its
-// macros and types, and another version may bound one stored more. A check may not reach all of
-// those, or of those of a role a catalog change widened since: it evaluates the cheapest first, and
-// past its budget a grant's condition is false and a deny's applies.
+// little for one comparing what a request passes with literals, or with the subject's kind or id,
+// the resource's type, id or tenant, or the action, which a check refuses past MaxID bytes,
+// whatever it passes, and all a condition may for one reading the size of a value the request
+// decides, as a list or a long string, or looping over one. What a check may spend on conditions is
+// bounded, for each scope on its path, and so are the conditions stored, so that a check evaluates
+// whole every one it reads: those of an identity's grants on a scope cost at most so much together,
+// and those of a scope's grants to groups, the tenant's members and the public, which reach many,
+// as much again, those from each source the host owns (Config.Sources) apart from the rest; those
+// of a scope's denies (SetDeny); and the requirements of the eligibilities of groups for a role on
+// a scope. Each distinct condition counts once, as what compiling it and the most evaluating it can
+// cost: hundreds of comparisons with literals, a hundred of an attribute with the subject's id, or
+// three of the longest that read a list or loop. A check of a labeled resource decides each of the
+// subject's label values as a check of it would, and evaluates a condition that doesn't read the
+// action once for them all, so on the tenant one that does counts once for each label value its
+// grants give or its denies deny. A change adding a condition past a bound, or one evaluated more,
+// as by redefining a role to give more label values (SetRole), is refused as invalid, so no grant,
+// deny or eligibility stored changes what the others decide, but one adding none isn't: conditions
+// stored past a bound before there were bounds can be rewritten in place, as by a restore over the
+// rows still stored, though restored where those are gone, they are added, and refused. An upgrade
+// of CEL can leave conditions stored past a bound in the same way: each process bounds a condition
+// by what the CEL it is built with makes of it, its macros and types, and another version may bound
+// one stored more. A check may not reach all of those, or of those of a role a catalog change
+// widened since: it evaluates the cheapest first, and past its budget a grant's condition is false
+// and a deny's applies.
 //
 // Searches (Filter, Reachable, Holders) can't evaluate one: Filter and Reachable count only
 // unconditional grants, Filter counts a conditional deny as denying, and Reach.Conditional and
@@ -537,12 +539,21 @@ func (w worst) walk(e ast.Expr) (uint64, extent) {
 		if xs := w.vars[e.AsIdent()]; len(xs) > 0 && xs[len(xs)-1] != nil {
 			return 2, *xs[len(xs)-1]
 		}
+		if w.root(e, "action") {
+			return 2, text(maxPermission)
+		}
 		return 2, w.typed(e)
 	case ast.SelectKind:
-		n, x := w.walk(e.AsSelect().Operand())
+		sel := e.AsSelect()
+		n, x := w.walk(sel.Operand())
 		// A presence test is a bool; a field may be what its type isn't (typed).
-		if e.AsSelect().IsTestOnly() {
+		if sel.IsTestOnly() {
 			return cost.SafeAdd(n, 2), w.typed(e)
+		}
+		for v, fields := range named {
+			if w.root(sel.Operand(), v) && slices.Contains(fields, sel.FieldName()) {
+				return cost.SafeAdd(n, 2), text(MaxID)
+			}
 		}
 		return cost.SafeAdd(n, 2), inside(x)
 	case ast.ListKind:
@@ -586,6 +597,32 @@ func (w worst) walk(e ast.Expr) (uint64, extent) {
 	default:
 		return unbounded, anything
 	}
+}
+
+// maxPermission is the longest a permission is, in bytes: `type:verb`, each a name of at most 63
+// (permissionName), as the action a check passes is, once Authorize has refused one that isn't, and
+// a role's are where they are stored.
+const maxPermission = 127
+
+// named are the fields of the subject and the resource a check passes of at most MaxID bytes, as
+// it refuses a subject, a resource or its tenant otherwise (Authorizer.subject, Resource.validate):
+// a kind's name and a type's are shorter still.
+var named = map[string][]string{"subject": {"kind", "id"}, "resource": {"type", "id", "tenant"}}
+
+// root reports whether e names the variable name a check passes, not a comprehension's variable of
+// the same name, which CEL checks the variable as `.name` beside.
+func (w worst) root(e ast.Expr, name string) bool {
+	if e.Kind() != ast.IdentKind {
+		return false
+	}
+	id := e.AsIdent()
+	return id == "."+name || id == name && len(w.vars[name]) == 0
+}
+
+// text is the most a string of at most n bytes can be.
+func text(n uint64) extent {
+	size := 1 + n/10
+	return extent{value: size, text: size, bytes: n, form: notMap}
 }
 
 // typed is the most a value of e's type can be: one for a scalar, and for a string, a list or a map

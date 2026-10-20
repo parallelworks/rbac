@@ -360,18 +360,19 @@ sequenceDiagram
 - **Conditions** are CEL over `subject`, `resource`, `request` and `action`, typed by
   `Config.Attributes`. Each is compiled once, bounded in cost, and fails closed: a condition that
   errors gives nothing, and a deny's that errors denies. Each runs within the most evaluating it
-  can cost, which its literals and types bound. What a check reads together is bounded where it is
-  stored, for each scope: an identity's conditional grants, the conditional grants to groups, the
-  tenant's members and the public, each the tenant's and those from each source the host owns
-  apart, the conditional denies, and the requirements of groups' eligibilities for a role, and a
-  change adding a condition past one is refused as invalid. A check's budget is that for each
-  scope on its path, so it evaluates every condition it reads, and no grant made beside another
-  changes what that one decides. Conditions stored before there were bounds may be past one, and
-  so may those another version of CEL bounds: each process bounds a stored condition again by what
-  the CEL it is built with makes of it, its macros and types, so an upgrade can bound one more.
-  `TestStoredConditionsKeepTheirBounds` pins the bounds of conditions of common shapes, so that one an
-  upgrade moves shows in review. A change adding no condition to them isn't refused, and a check
-  evaluates them cheapest first within its budget.
+  can cost, which its literals and types bound, and the ids, kinds, types and tenant a check
+  passes and its action, which are no longer than `MaxID`. What a check reads together is bounded
+  where it is stored, for each scope: an identity's conditional grants, the conditional grants to
+  groups, the tenant's members and the public, each the tenant's and those from each source the
+  host owns apart, the conditional denies, and the requirements of groups' eligibilities for a
+  role, and a change adding a condition past one is refused as invalid. A check's budget is that
+  for each scope on its path, so it evaluates every condition it reads, and no grant made beside
+  another changes what that one decides. Conditions stored before there were bounds may be past
+  one, and so may those another version of CEL bounds: each process bounds a stored condition
+  again by what the CEL it is built with makes of it, its macros and types, so an upgrade can
+  bound one more. `TestStoredConditionsKeepTheirBounds` pins the bounds of conditions of common
+  shapes, so that one an upgrade moves shows in review. A change adding no condition to them isn't
+  refused, and a check evaluates them cheapest first within its budget.
 
 ## A change
 
@@ -678,7 +679,7 @@ bounds, so a role that writes around the package can store no row larger than th
 | `MaxPlacesInGroup` | 20 | Places in force of one principal in one group, each from another source. Those from each source the host owns count apart. |
 | `MaxGroupsOfPrincipal` | 1,000 | Groups one principal, an identity or a group, is in directly, by places in force. Those from each source the host owns count apart. A check reads every group its subject is in, and every group those are in, `MaxGroupDepth` deep. |
 | `MaxExpression` | 2,048 bytes | A condition's or requirement's expression. Its cost is bounded too. |
-| What a check reads together | 80,000 units: hundreds of comparisons with literals, or three of the longest conditions that read a list or loop | The distinct conditions of an identity's conditional grants on a scope; of a scope's conditional grants to groups, the tenant's members and the public; each the tenant's and those from each source the host owns apart; of a scope's conditional denies; and the requirements of groups' eligibilities for a role on a scope. Each counts compiling it, 8 a byte, and the most evaluating it can cost, at most 10,000. On the tenant, one reading the action counts once for each label value it gives or denies. A check may spend this for each on each scope of its path. |
+| What a check reads together | 80,000 units: hundreds of comparisons with literals, a hundred of an attribute with the subject's id, or three of the longest conditions that read a list or loop | The distinct conditions of an identity's conditional grants on a scope; of a scope's conditional grants to groups, the tenant's members and the public; each the tenant's and those from each source the host owns apart; of a scope's conditional denies; and the requirements of groups' eligibilities for a role on a scope. Each counts compiling it, 8 a byte, and the most evaluating it can cost, at most 10,000. On the tenant, one reading the action counts once for each label value it gives or denies. A check may spend this for each on each scope of its path. |
 | `MaxConditionBytes` | 32 KiB | The conditions one `Apply` or `Import` carries, each distinct one counted once. |
 | `MaxName`, `MaxDescription`, `MaxNote` | 128, 2,048, 2,048 characters | Names, titles and group ids, descriptions, and notes and justifications. |
 | `MaxRequest` | 256 characters | A request id in `Audit`. |
