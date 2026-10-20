@@ -869,12 +869,13 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 		return Reach{}, nil
 	}
 	// Denies on scopes a resource of the type can have on its path: those of the type, the
-	// containers and the tenant.
+	// containers and the tenant, that bind the subject, found by the keys they bind it by (naming),
+	// as Filter finds them.
 	if perm, wildcard, deniable := matchable(p); deniable {
 		rows, err = a.db.Query(ctx, `
 			SELECT scope, bool_or(condition = '') FROM rbac_denies
-			WHERE tenant = $1 AND scope_type = ANY($2::text[])
-			  AND principals && $3::text[] AND NOT exempt && $6::text[] AND ($4 = ANY(permissions) OR $5 = ANY(permissions))
+			WHERE `+naming("principals", "$3")+` AND scope_type = ANY($2::text[])
+			  AND NOT exempt && $6::text[] AND ($4 = ANY(permissions) OR $5 = ANY(permissions))
 			GROUP BY scope ORDER BY scope`,
 			tenant, reaching, binding, perm, wildcard, exempting(keys, s))
 		if err != nil {
@@ -994,13 +995,14 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 			givingSQL(arg(7), arg(1), arg(8), arg(9), custom, publicOnly(catalogSQL{arg(10), arg(11), arg(12)})),
 			broadKindsSQL, givingSQL(arg(18), arg(1), arg(8), arg(9), custom, privilegedOnly(catalogSQL{arg(19), arg(20), arg(21)}))))
 	}
-	// The denies on the scopes `of` keeps that bind the subject, by the primary key, which leads to
-	// a scope's type.
+	// The denies on the scopes `of` keeps that bind the subject, found by the keys they bind it by
+	// (naming): by the scope's type, a list would read every deny on resources of the type in the
+	// tenant, whoever it names, as its admins can put one on each of thousands.
 	denies := func(of string) string {
 		return fmt.Sprintf(`SELECT d.scope FROM rbac_denies d
-			WHERE d.tenant = %s::text AND %s AND d.principals && %s AND NOT d.exempt && %s
+			WHERE %s AND %s AND NOT d.exempt && %s
 			  AND (%s::text = ANY(d.permissions) OR %s::text = ANY(d.permissions))`,
-			arg(1), of, keys("SELECT k FROM bound"), keys("SELECT k FROM exempted"), arg(14), arg(15))
+			namingIn(arg(1)+"::text", "d.principals", keys("SELECT k FROM bound")), of, keys("SELECT k FROM exempted"), arg(14), arg(15))
 	}
 	// The grants' tenant is an argument of its own: the host's tenant column needn't be text,
 	// and one argument can't take two types. The grants overlap the path, which the host's GIN

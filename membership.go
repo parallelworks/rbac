@@ -1434,8 +1434,11 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 // in the tenant $1: as the GIN indexes on rbac_tenant_keys find them, with no other condition on
 // the tenant, which a generic plan, costing it as an average tenant's few rows, would read every row
 // of the tenant by.
-func naming(col, keys string) string {
-	return fmt.Sprintf("rbac_tenant_keys(tenant, %s) && rbac_tenant_keys($1, %s::text[])", col, keys)
+func naming(col, keys string) string { return namingIn("$1", col, keys) }
+
+// namingIn is naming in the tenant SQL gives, as text.
+func namingIn(tenant, col, keys string) string {
+	return fmt.Sprintf("rbac_tenant_keys(tenant, %s) && rbac_tenant_keys(%s, %s::text[])", col, tenant, keys)
 }
 
 // nested is each group's up extended over the groups add nests in others, as the change will store

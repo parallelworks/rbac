@@ -215,9 +215,10 @@ erDiagram
   a list as ten seeks, and a read of the tenant by an index on it alone as an average tenant's few
   rows, and would read every row of a large tenant. The eligibilities a group approves and the
   denies that name or exempt it, which a change to its members and `DeleteGroup`'s check read,
-  and those an identity or group leaving the tenant is taken out of, are found through GIN
-  indexes on those arrays of keys, each key prefixed by its tenant (`rbac_tenant_keys`), so
-  neither the tenant's other rows nor another tenant's group of the same id are read.
+  those an identity or group leaving the tenant is taken out of, and the denies binding a list's
+  subject, which `Filter` and `Reachable` read, are found through GIN indexes on those arrays of
+  keys, each key prefixed by its tenant (`rbac_tenant_keys`), so neither the tenant's other rows
+  nor another tenant's group of the same id are read.
 - **Activations are grants** from the source `activation` (`SourceActivation`), made by
   `Activate` from an eligibility, which they record, and ended by their expiry, `Deactivate`, or a
   change ending the membership or a place in a group on their holder's paths to that eligibility's
@@ -487,7 +488,7 @@ flowchart LR
   everything it created costs a row a few lookups; no index serves that, so the query reads every
   row of the tenant its other conditions keep. Denies are looked up so whatever their number: those
   on resources of the type by the row's own key, and those on containers and the tenant by each of
-  its keys.
+  its keys. Only those binding the subject are read, found by the keys it is bound by.
 - **Reachable** returns the same as scopes, for a host that keeps its resources elsewhere.
   Conditional grants and conditional denies come back apart, to check one by one.
 - **Holders** lists who may do a permission on a resource, for an access review. That is each

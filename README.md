@@ -90,9 +90,9 @@ listed type, or past 128 on containers and the tenant, as one holding a grant on
 created does, each of a row's keys is looked up among them instead, so a row costs a few lookups
 however many it holds; no index serves that, so the query then reads every row of the tenant its
 other conditions keep. Denies, on resources and containers alike, are looked up so whatever their
-number. `Reachable` returns the same as scopes, for resources kept in another store. Both search one
-tenant, and count only unconditional grants: `Reach.Conditional` names the scopes conditional ones
-reach, to check one by one.
+number, and only those binding the subject are read. `Reachable` returns the same as scopes, for
+resources kept in another store. Both search one tenant, and count only unconditional grants:
+`Reach.Conditional` names the scopes conditional ones reach, to check one by one.
 
 ## Policies
 
