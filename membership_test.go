@@ -423,6 +423,26 @@ func TestAPrincipalIsInAGroupABoundedNumberOfTimes(t *testing.T) {
 	if err := h.authz.ChangeMembers(ctx, manager, "t1", again, nil); err != nil {
 		t.Fatalf("a new note at the limit: %v", err)
 	}
+	// Past it, as written around the package, a place made to end sooner, or whose note alone
+	// changes, adds none.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, source) VALUES ('t1', 'devs', 'user', 'u', 'past')`); err != nil {
+		t.Fatal(err)
+	}
+	again[0].Note = "past the limit"
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", again, nil); err != nil {
+		t.Fatalf("a new note past the limit: %v", err)
+	}
+	again[0].ExpiresAt = again[0].ExpiresAt.Add(-time.Minute)
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", again, nil); err != nil {
+		t.Fatalf("a place made to end sooner past the limit: %v", err)
+	}
+	again[0].ExpiresAt = again[0].ExpiresAt.Add(time.Hour)
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", again, nil); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a place made to last longer past the limit: %v", err)
+	}
+	if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_members WHERE tenant = 't1' AND source = 'past'`); err != nil {
+		t.Fatal(err)
+	}
 	// Places that have ended don't count.
 	h.now = h.now.Add(time.Duration(rbac.MaxPlacesInGroup) * time.Hour)
 	if err := h.authz.ChangeMembers(ctx, manager, "t1", until(rbac.MaxPlacesInGroup, 1), nil); err != nil {
@@ -461,6 +481,27 @@ func TestAPrincipalIsInABoundedNumberOfGroups(t *testing.T) {
 	// Another place in a group it is in is in no more groups.
 	if err := h.authz.ChangeMembers(ctx, manager, "t1", in("g1", identity("u"), "other"), nil); err != nil {
 		t.Errorf("another place in a group at the limit: %v", err)
+	}
+	// Past it, as written around the package, a place made to end sooner, or whose note alone
+	// changes, is in no more groups either.
+	h.groups(t, "past")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'past', 'user', 'u')`); err != nil {
+		t.Fatal(err)
+	}
+	place := []rbac.Member{{Group: "g2", Principal: identity("u"), ExpiresAt: h.now.Add(30 * time.Minute)}}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", place, nil); err != nil {
+		t.Errorf("a place made to end sooner past the limit: %v", err)
+	}
+	place[0].Note = "past the limit"
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", place, nil); err != nil {
+		t.Errorf("a new note past the limit: %v", err)
+	}
+	place[0].ExpiresAt = h.now.Add(45 * time.Minute)
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", place, nil); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("a place made to last longer past the limit: %v", err)
+	}
+	if err := h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "past", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
 	}
 	// Places that have ended don't count.
 	h.now = h.now.Add(time.Hour)

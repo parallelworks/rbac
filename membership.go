@@ -1130,7 +1130,7 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 			return ChangeEvent{}, nil, err
 		}
 		e := ChangeEvent{}
-		if e.Joined, err = a.join(ctx, tx, tenant, actor, set); err != nil {
+		if e.Joined, err = a.join(ctx, tx, tenant, actor, set, locked.placed); err != nil {
 			return ChangeEvent{}, nil, err
 		}
 		e.Shortened, e.Revoked, err = a.unrest(ctx, tx, tenant, actor, r, now)
@@ -1180,8 +1180,9 @@ func memberLocks(members []Member) (scopes, principals []string) {
 
 // join stores members memberSet checked, under the change's locks, and returns those it added or
 // changed: refusing an identity that isn't a member or guest of the tenant, a group that doesn't
-// exist, and nesting that makes a cycle or too long a chain.
-func (a *Authorizer) join(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, set []Member) ([]Member, error) {
+// exist, nesting that makes a cycle or too long a chain, and places past the bounds, but those kept
+// (placed.kept), which last no longer than they did.
+func (a *Authorizer) join(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, set []Member, kept placed) ([]Member, error) {
 	groups, identities := map[string]bool{}, map[string]bool{}
 	var nested []Member
 	for _, m := range set {
@@ -1219,10 +1220,10 @@ func (a *Authorizer) join(ctx context.Context, tx pgx.Tx, tenant string, actor P
 	if err != nil {
 		return nil, err
 	}
-	if err := a.placesBounded(ctx, tx, tenant, joined); err != nil {
+	if err := a.placesBounded(ctx, tx, tenant, kept.gaining(joined)); err != nil {
 		return nil, err
 	}
-	if err := a.groupsBounded(ctx, tx, tenant, joined); err != nil {
+	if err := a.groupsBounded(ctx, tx, tenant, kept.gaining(joined)); err != nil {
 		return nil, err
 	}
 	return joined, a.nestable(ctx, tx, tenant, nested)
@@ -1434,7 +1435,7 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 			}
 		}
 		if len(set) > 0 {
-			if e.Joined, err = a.join(ctx, tx, tenant, actor.Principal, set); err != nil {
+			if e.Joined, err = a.join(ctx, tx, tenant, actor.Principal, set, locked.placed); err != nil {
 				return ChangeEvent{}, nil, err
 			}
 		}
