@@ -1193,7 +1193,18 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 	// out decides doesn't rest on ids.
 	held = slices.Clone(held)
 	cheapestFirst(held, holding.expression)
+	// A label value or a power to release on the tenant is decided on the bare tenant, as checks
+	// decide it (decidedOn), what the actor hands on too: it is held there alone, so a condition
+	// reading the resource reads that tenant, as it does for every check of it.
+	var valued map[string]any
+	if on.Type == TenantScope {
+		valued = maps.Clone(vars)
+		valued["resource"] = valueResource(on.Tenant)
+	}
 	with := func(vars map[string]any, action Permission) map[string]any {
+		if valued != nil && a.labelPermission(action) {
+			vars = valued
+		}
 		v := maps.Clone(vars)
 		v["action"] = string(action)
 		return v

@@ -1561,3 +1561,51 @@ func TestAnApproverIsCheckedAsOneOfTheApproversHoldingTheValuesAtOnce(t *testing
 		t.Errorf("approved by one that never was an approver holding the label's value: %v", err)
 	}
 }
+
+// A deny of a label value reads the tenant as checks decide the value, its type, id and tenant
+// included, when the actor hands the value on as when it uses it: one whose condition is false
+// there takes nothing the actor hands on, as it takes nothing it uses, and one that holds there, or
+// reads the tenant's attributes, takes both, whatever tenant a change passes.
+func TestALabelValuesDenyReadsTheTenantAsChecksDoWhenTheValueIsHandedOn(t *testing.T) {
+	h := labeled(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), tenantGuard) })
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.guard", rbac.User, "guardian"))
+	guardian, bob := h.as(t, "guardian"), h.as(t, "bob")
+	passed := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1", Attributes: map[string]any{"region": "eu"}}
+	for i, c := range []struct {
+		expr string
+		held bool
+	}{
+		{`resource.id == "t2"`, true},
+		{`resource.tenant != "t1"`, true},
+		{`resource.type != "tenant"`, true},
+		{`resource.id == "t1"`, false},
+		{`resource.attributes.region == "eu"`, false},
+	} {
+		actor := h.as(t, fmt.Sprint("actor", i))
+		h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.admin", rbac.User, actor.Principal.ID))
+		h.hold(t, actor.Principal.ID, "level:high")
+		if err := h.authz.SetDeny(ctx, guardian, tenantT1, rbac.Deny{
+			ID: fmt.Sprint("deny", i), Principals: []rbac.Principal{actor.Principal}, Permissions: []rbac.Permission{"level:high"},
+			Condition: rbac.Condition{Expression: c.expr},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		for _, tenant := range []rbac.Resource{tenantT1, passed} {
+			if allowed(t, h, actor, "level:high", tenant) != c.held {
+				t.Fatalf("%s: a check of the value allows it: %v", c.expr, !c.held)
+			}
+			roles, err := h.authz.Grantable(ctx, actor, tenant)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if slices.ContainsFunc(roles, func(r rbac.RoleDefinition) bool { return r.ID == "level.high" }) != c.held {
+				t.Errorf("%s, on %v: Grantable offers level.high: %v, though the actor holds it: %v", c.expr, tenant.Attributes, !c.held, c.held)
+			}
+			err = h.authz.Apply(ctx, actor, tenant, rbac.Change{Grant: []rbac.Binding{{Role: "level.high", Principal: bob.Principal}}})
+			if (err == nil) != c.held || err != nil && !errors.Is(err, rbac.ErrDenied) {
+				t.Errorf("%s, on %v: handing on level:high, which the actor holds: %v: %v", c.expr, tenant.Attributes, c.held, err)
+			}
+		}
+	}
+}
