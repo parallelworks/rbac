@@ -571,6 +571,49 @@ func TestCountingAPrincipalsGroupsReadsTheIndexAlone(t *testing.T) {
 	}
 }
 
+// Migrating the index on the principal waits for a change in flight that has read the places and
+// then writes one, as a change to members does under its locks, rather than deadlock with it.
+func TestMigratingTheMembersIndexWaitsForAChangeInFlight(t *testing.T) {
+	pool := pgtest.Open(t, "")
+	ctx := t.Context()
+	migrateFiles(t, pool, "", "0014")
+	if _, err := pool.Exec(ctx, `INSERT INTO rbac_groups (tenant, id) VALUES ('t1', 'crew')`); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = writer.Rollback(ctx) }()
+	var pid int
+	if err := writer.QueryRow(ctx, `SELECT pg_backend_pid() FROM rbac_members WHERE tenant = 't1' AND principal = 'user:u' UNION ALL SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- applyMigrations(ctx, pool, pgx.ReadCommitted, "0014", "") }()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		var blocked bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))`, pid).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("migrating never waited for the change")
+		}
+	}
+	if _, err := writer.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'crew', 'user', 'u')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("migrating while a change that read the places writes one: %v", err)
+	}
+}
+
 func TestLeavingATenantRemovesWhatItHeldThere(t *testing.T) {
 	h := grouped(t)
 	ctx := t.Context()
@@ -3160,6 +3203,63 @@ func TestAPlaceEndingSoonerRemovedMeanwhileIsTriedAgain(t *testing.T) {
 	}
 	if of, err := h.authz.GroupsOf(ctx, "t1", identity("u")); err != nil || len(of) != 0 {
 		t.Fatalf("u is in %v, %v", of, err)
+	}
+}
+
+// A place a change keeps, here one whose note alone changes, that is removed while the host is asked
+// about another member joining the same group, is a join then, which neither the host nor the
+// actor's authority was asked about: the change is tried again, though the other member gains the
+// same there.
+func TestAKeptPlaceRemovedMeanwhileBesideAJoinIsTriedAgain(t *testing.T) {
+	var meanwhile func(ctx context.Context) error
+	h := grouped(t, func(c *rbac.Config) {
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, db rbac.DB, in rbac.GrantInput) error {
+			if do := meanwhile; do != nil && in.Via == rbac.ViaMembership {
+				meanwhile = nil
+				if err := do(ctx); err != nil {
+					return err
+				}
+			}
+			return validate(ctx, db, in)
+		}
+	})
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
+	h.join(t, "v", "w")
+	manager := h.as(t, "manager")
+	for _, change := range []struct {
+		name   string
+		member string
+		apply  func([]rbac.Member) error
+	}{
+		{"ChangeMembers", "v", func(add []rbac.Member) error { return h.authz.ChangeMembers(ctx, manager, "t1", add, nil) }},
+		{"ImportMembers", "w", func(add []rbac.Member) error { return h.authz.ImportMembers(ctx, host, "t1", add) }},
+	} {
+		// In crew around the hooks, as the host refuses an outsider any grant.
+		h.as(t, "outsider", "crew")
+		noted := []rbac.Member{{Group: "crew", Principal: identity("outsider"), Note: change.name}}
+		if err := change.apply(noted); err != nil {
+			t.Fatalf("%s changing only the note of the outsider's place: %v", change.name, err)
+		}
+		meanwhile = func(ctx context.Context) error {
+			return h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("outsider")}})
+		}
+		noted[0].Note += " again"
+		add := append([]rbac.Member{{Group: "crew", Principal: identity(change.member)}}, noted...)
+		if err := change.apply(add); !errors.Is(err, rbac.ErrConflict) {
+			t.Errorf("%s with %s joining crew, the outsider's place removed meanwhile: %v", change.name, change.member, err)
+		}
+		if meanwhile != nil {
+			t.Fatal("the outsider's place should have been removed meanwhile")
+		}
+		if of, err := h.authz.GroupsOf(ctx, "t1", identity("outsider")); err != nil || len(of) != 0 {
+			t.Errorf("%s: the outsider is in %v, %v", change.name, of, err)
+		}
+		// Joining now, as it would have, the host refuses it.
+		if err := change.apply(add); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s with the outsider joining crew: %v", change.name, err)
+		}
 	}
 }
 

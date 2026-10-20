@@ -1909,6 +1909,14 @@ func (a *Authorizer) stillReached(ctx context.Context, tx pgx.Tx, tenant string,
 			return reach{}, fmt.Errorf("%w: the groups changed are now in %s, which this change doesn't lock; try again", ErrConflict, k)
 		}
 	}
+	// A place kept then that ended meanwhile is a join now, which neither the host nor the actor's
+	// authority was asked about for its member: the footprint, by group, can't tell it from another
+	// member gaining the same there.
+	for _, m := range add {
+		if k := memberKey(m); was.kept[k] && !now.kept[k] && len(now.footprint([]Member{m}, nil, gains)) > 0 {
+			return reach{}, fmt.Errorf("%w: %s's place in group %q, which this change keeps, ended while it waited; try again", ErrConflict, m.Principal.key(), m.Group)
+		}
+	}
 	before := was.footprint(add, remove, gains)
 	for k, role := range now.footprint(add, remove, gains) {
 		if old, ok := before[k]; !ok || widens(old, role) {

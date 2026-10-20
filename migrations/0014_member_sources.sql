@@ -3,8 +3,9 @@
 -- principal held each place's group and end but not its source, so the count read every place's
 -- row of the table, one page for each. With the source too, it reads the index alone, as checks do.
 --
--- Built beside the index it replaces, which serves checks until then: writes to the table wait while
--- it is built, and every read only for the swap, until the migration commits.
-CREATE INDEX rbac_members_principal_sources ON rbac_members (tenant, principal) INCLUDE (group_id, expires_at, source);
+-- Dropped before its replacement is built, as 0009 does, so the migration takes the table's
+-- strongest lock before any other: built first, the replacement's lock would stop a change that has
+-- read places from writing while the drop waits for that change to end, a deadlock that fails the
+-- migration or the change. Reads and writes of the table wait until the migration commits.
 DROP INDEX rbac_members_principal;
-ALTER INDEX rbac_members_principal_sources RENAME TO rbac_members_principal;
+CREATE INDEX rbac_members_principal ON rbac_members (tenant, principal) INCLUDE (group_id, expires_at, source);
