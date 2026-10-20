@@ -95,8 +95,9 @@ func (a *Authorizer) recording(ctx context.Context, tx pgx.Tx, actor Principal, 
 // packageSchema returns the schema tx reads the package's tables in, by which history's reads name
 // its tables: any role may make a temporary table, which a search_path that doesn't name pg_temp
 // reads before every schema, and a pooled connection keeps, so one named as history's would stand
-// in for it, and Export would sign what it holds. It refuses the session's temporary schema, which
-// a search_path naming pg_temp first makes the current one.
+// in for it, and Export would sign what it holds. A temporary type is read before pg_catalog's
+// too, so those reads name their types by pg_catalog's. It refuses the session's temporary schema,
+// which a search_path naming pg_temp first makes the current one.
 func packageSchema(ctx context.Context, tx pgx.Tx) (string, error) {
 	var schema string
 	var temporary bool
@@ -110,22 +111,27 @@ func packageSchema(ctx context.Context, tx pgx.Tx) (string, error) {
 	return schema, nil
 }
 
+// historyTable is history's table in schema, as packageSchema returns it.
+func historyTable(schema string) string {
+	return pgx.Identifier{schema, "rbac_history"}.Sanitize()
+}
+
 // followable refuses, on tx, a cursor of another generation, or whose last record history in schema
 // no longer holds, and returns the generation tx reads. The zero Cursor, or one from a read that
 // found nothing, is followable from any.
 func followable(ctx context.Context, tx pgx.Tx, schema string, after Cursor) (generation string, err error) {
-	history := pgx.Identifier{schema, "rbac_history"}.Sanitize()
+	history := historyTable(schema)
 	// The timeline WAL is written on, which promotion changes at once; the last checkpoint's
 	// changes only once the next completes, minutes later. And the database and schema of the
 	// history read, by OIDs, which a physical copy keeps: every database and schema in a cluster
 	// would otherwise share a generation, and with one key, checkpoints. The catalogs by schema
 	// too, as a temporary table is read before them.
 	var held bool
-	if err := tx.QueryRow(ctx, `SELECT s.system_identifier::text || '/' || left(pg_walfile_name(pg_current_wal_lsn()), 8)
-		    || '/' || d.oid::text || '/' || c.relnamespace::text,
-		  EXISTS (SELECT 1 FROM `+history+` WHERE txid = $1::xid8 AND id = $2 AND recorded_at = $3)
+	if err := tx.QueryRow(ctx, `SELECT s.system_identifier::pg_catalog.text || '/' || left(pg_walfile_name(pg_current_wal_lsn()), 8)
+		    || '/' || d.oid::pg_catalog.text || '/' || c.relnamespace::pg_catalog.text,
+		  EXISTS (SELECT 1 FROM `+history+` WHERE txid = $1::pg_catalog.xid8 AND id = $2 AND recorded_at = $3)
 		FROM pg_control_system() s, pg_catalog.pg_database d, pg_catalog.pg_class c
-		WHERE d.datname = current_database() AND c.oid = $4::text::regclass`,
+		WHERE d.datname = current_database() AND c.oid = $4::pg_catalog.text::pg_catalog.regclass`,
 		after.TxID, after.ID, storedTime(after.RecordedAt), history).Scan(&generation, &held); err != nil {
 		return "", err
 	}
@@ -148,8 +154,8 @@ var maxPrune = MaxPrune
 // pruneKey and pruneThrough are a prune's time, $1, and cursor, $2 and $3, as its record holds
 // them, by which a prune of the same finds where the last stopped.
 const (
-	pruneKey     = `to_char($1::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`
-	pruneThrough = `jsonb_build_object('txid', $2::xid8::text, 'id', $3::bigint)`
+	pruneKey     = `to_char($1::pg_catalog.timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`
+	pruneThrough = `jsonb_build_object('txid', $2::pg_catalog.xid8::pg_catalog.text, 'id', $3::bigint)`
 )
 
 // PruneHistory deletes from history, on db, records that an export has read past and that later
@@ -176,10 +182,10 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 		if _, err := followable(ctx, tx, schema, through); err != nil {
 			return err
 		}
-		history := pgx.Identifier{schema, "rbac_history"}.Sanitize()
+		history := historyTable(schema)
 		// AsOf refuses a time before the prune's, so one yet to come would refuse the present.
 		var future bool
-		if err := tx.QueryRow(ctx, `SELECT $1::timestamptz > statement_timestamp()`, before).Scan(&future); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT $1::pg_catalog.timestamptz > statement_timestamp()`, before).Scan(&future); err != nil {
 			return err
 		}
 		if future {
@@ -219,14 +225,14 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 		if err := tx.QueryRow(ctx, `
 			WITH doomed AS (
 			  SELECT h.id FROM `+history+` h
-			  WHERE h.id > $5 AND h.effective_at <= $1 AND (h.txid, h.id) < ($2::xid8, $3) AND h.entity <> 'history'
+			  WHERE h.id > $5 AND h.effective_at <= $1 AND (h.txid, h.id) < ($2::pg_catalog.xid8, $3) AND h.entity <> 'history'
 			    AND (EXISTS (
 			      SELECT FROM `+history+` n
 			      WHERE n.tenant = h.tenant AND n.entity = h.entity AND n.key = h.key AND n.effective_at <= $1 AND n.id > h.id)
 			    OR h.op IN ('delete', 'expire') AND NOT EXISTS (
 			      SELECT FROM `+history+` s
 			      WHERE s.tenant = h.tenant AND s.entity = h.entity AND s.key = h.key AND s.id < h.id
-			        AND (s.id <= $5 OR s.effective_at > $1 OR (s.txid, s.id) >= ($2::xid8, $3))))
+			        AND (s.id <= $5 OR s.effective_at > $1 OR (s.txid, s.id) >= ($2::pg_catalog.xid8, $3))))
 			  -- A batch, oldest first: of a row, its end goes after every version before it, so a
 			  -- batch that stops between them leaves the end, which still reads as the row's.
 			  ORDER BY h.id LIMIT $4
@@ -243,7 +249,7 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 		}
 		_, err = tx.Exec(ctx, `INSERT INTO `+history+` (effective_at, tenant, entity, key, op, after, how)
 			VALUES (now(), '', 'history', `+pruneKey+`, 'prune',
-			  jsonb_build_object('before', $1::timestamptz, 'through', `+pruneThrough+`, 'deleted', $4::bigint, 'reached', $5::bigint),
+			  jsonb_build_object('before', $1::pg_catalog.timestamptz, 'through', `+pruneThrough+`, 'deleted', $4::bigint, 'reached', $5::bigint),
 			  'PruneHistory')`, before, through.TxID, through.ID, n, reached)
 		return err
 	})
@@ -254,7 +260,9 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 // A time.Time holds no infinity, as PostgreSQL's times can, so a time of a record written before
 // the tables refused one, or by history's owner, reads as an instant PostgreSQL can't hold:
 // infinity as 294277-01-01T00:00:00Z, just after the latest it holds, and -infinity as
-// -4713-11-23T23:59:59.999999Z, just before the earliest.
+// -4713-11-23T23:59:59.999999Z, just before the earliest. An expiry at the first instant of year 1,
+// which a record written before the tables refused one can hold, is a time.Time's zero, so it
+// reads, and chains, as none; its row's Before or After holds it.
 type Record struct {
 	ID   int64
 	TxID uint64
@@ -357,8 +365,9 @@ const MaxHistory = 10000
 // cluster numbers its transactions anew, which a cursor can't follow: move history with physical
 // backups and replicas.
 //
-// It reads history in the current schema by name, so a session's temporary table named as
-// history's stands in for none of it, and refuses a search_path that names pg_temp first.
+// It reads history in the current schema by name, so a session's temporary table or type named
+// as history's or a catalog's stands in for none of it, and refuses a search_path that names
+// pg_temp first.
 func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Record, Cursor, error) {
 	if limit < 1 || limit > MaxHistory {
 		return nil, after, fmt.Errorf("%w: a read of history takes from 1 to %d records", ErrInvalid, MaxHistory)
@@ -379,8 +388,8 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 		rows, err := tx.Query(ctx, `
 			SELECT id, txid, recorded_at, effective_at, tenant, entity, key, op, coalesce(principal, ''), coalesce(role, ''),
 			  coalesce(scope, ''), coalesce(group_id, ''), expires_at, before, after, actor, on_behalf_of, how, request, reason, db_user
-			FROM `+pgx.Identifier{schema, "rbac_history"}.Sanitize()+`
-			WHERE (txid, id) > ($1::xid8, $2) AND txid < pg_snapshot_xmin(pg_current_snapshot())
+			FROM `+historyTable(schema)+`
+			WHERE (txid, id) > ($1::pg_catalog.xid8, $2) AND txid < pg_snapshot_xmin(pg_current_snapshot())
 			ORDER BY txid, id LIMIT $3`, after.TxID, after.ID, limit)
 		if err != nil {
 			return err

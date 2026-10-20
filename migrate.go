@@ -17,7 +17,9 @@ var migrations embed.FS
 
 // Migrations are the SQL files that create and upgrade the package's tables, for a host that
 // runs its migrations with a tool of its own: apply each once, in order of their names, in a
-// transaction, in a database whose encoding is UTF8. Migrate applies them itself.
+// transaction of its own or at READ COMMITTED, in a database whose encoding is UTF8: one that
+// waits for the writes in flight to the tables reads them once they end, which a stricter
+// transaction's snapshot, taken by an earlier statement, doesn't. Migrate applies them itself.
 func Migrations() fs.FS {
 	sub, err := fs.Sub(migrations, "migrations")
 	if err != nil {
@@ -30,8 +32,9 @@ func Migrations() fs.FS {
 // first in the search_path that exists, in a database whose encoding is UTF8. It records what it
 // applied in rbac_migrations, applies what is pending in one transaction, is safe to call from
 // several replicas at once, and never runs by itself. On a host's transaction it runs at that
-// transaction's isolation, which must be READ COMMITTED for replicas to migrate at once: a
-// stricter one reads the versions from before it waited for another.
+// transaction's isolation, which must be READ COMMITTED: a stricter one reads the versions from
+// before it waited for another replica, and the rows it records as they were before it waited for
+// the writes in flight to them.
 func Migrate(ctx context.Context, db DB) error {
 	// At READ COMMITTED, so a replica that waited for the lock reads the versions another applied
 	// meanwhile: a stricter snapshot, taken before the lock, would apply them again.

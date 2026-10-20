@@ -1,3 +1,10 @@
+-- Writes to the tables wait until migrating commits, and those in flight end first: a change that
+-- committed after the baseline below read its row, with a record numbered before the baseline,
+-- would be superseded by it, and AsOf would read the row as it was before the change. First, as a
+-- REPEATABLE READ or SERIALIZABLE transaction reads by the snapshot of its first statement but a
+-- lock, which, taken before the lock, would miss the changes it waited for.
+LOCK TABLE rbac_grants, rbac_roles, rbac_denies, rbac_eligibilities, rbac_memberships, rbac_groups, rbac_members IN SHARE MODE;
+
 -- A row's record, as 0006 wrote it, but for an expiry at the first instant of year 1, which a
 -- time.Time holds as its zero, read as none: the tables refuse it from here, as one before it, and
 -- it is recorded as the epoch, as migrating rewrites it.
@@ -84,10 +91,6 @@ END $$;
 -- their own, has no record, so AsOf would read it as never written. Each row with none is recorded
 -- as it is, its baseline, as rbac_record records a row: dated when it was created, or a role, which
 -- keeps no such time, when it last changed, but never after now, and its times as JSON in UTC.
--- Writes to the tables wait until migrating commits, and those in flight end first: a change that
--- committed after the baseline read its row, with a record numbered before the baseline, would be
--- superseded by it, and AsOf would read the row as it was before the change.
-LOCK TABLE rbac_grants, rbac_roles, rbac_denies, rbac_eligibilities, rbac_memberships, rbac_groups, rbac_members IN SHARE MODE;
 DO $$
 DECLARE
     zone text := current_setting('TimeZone');

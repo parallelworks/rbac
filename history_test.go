@@ -331,11 +331,12 @@ func role(t *testing.T, tx pgx.Tx) (name, schema string) {
 	return name, schema
 }
 
-// Any role may make a temporary table, which a search_path that doesn't name pg_temp reads before
-// any schema's, pg_catalog's too, and a pool keeps it on its connection: one named as history's,
-// empty or holding records history never held, or as a catalog its generation is read from, stands
-// in for none of it, to History, its generation and cursor, or PruneHistory. A search_path naming
-// pg_temp first, which makes it the current schema, is refused.
+// Any role may make a temporary table or type, which a search_path that doesn't name pg_temp reads
+// before any schema's, pg_catalog's too, and a pool keeps it on its connection: one named as
+// history's, empty or holding records history never held, as a catalog its generation is read
+// from, or as a type its reads name, stands in for none of it, to History, its generation and
+// cursor, PruneHistory, or AsOf's check of what a prune removed. A search_path naming pg_temp
+// first, which makes it the current schema, is refused.
 func TestHistoryReadsItselfWhateverTablesASessionMakes(t *testing.T) {
 	h := setupOn(t, pgtest.Open(t, "pool_max_conns=1"))
 	ctx := t.Context()
@@ -349,11 +350,19 @@ func TestHistoryReadsItselfWhateverTablesASessionMakes(t *testing.T) {
 	var through rbac.Cursor
 	want := drain(t, h, &through, 2)
 	before := dbNow(t, h)
+	// Types named as those history's reads cast to: as a date, a time compares by its day, so a
+	// prune's time, and AsOf's check of it, would be its day's start.
+	const types = `CREATE DOMAIN pg_temp.xid8 AS pg_catalog.xid8 CHECK (VALUE <> '0');
+		 CREATE DOMAIN pg_temp.text AS pg_catalog.varchar(1);
+		 CREATE DOMAIN pg_temp.regclass AS pg_catalog.oid;
+		 CREATE DOMAIN pg_temp.timestamptz AS pg_catalog.date;`
 	for _, shadow := range []string{
 		`CREATE TEMP TABLE rbac_history (LIKE rbac_history INCLUDING ALL)`,
 		`CREATE TEMP TABLE pg_class AS SELECT oid, 0::oid AS relnamespace FROM pg_catalog.pg_class;
 		 CREATE TEMP TABLE pg_database AS SELECT 0::oid AS oid, datname FROM pg_catalog.pg_database`,
-		`CREATE TEMP TABLE rbac_history AS SELECT * FROM rbac_history;
+		types,
+		// The last, beside which history is pruned.
+		types + `CREATE TEMP TABLE rbac_history AS SELECT * FROM rbac_history;
 		 INSERT INTO pg_temp.rbac_history (id, txid, recorded_at, effective_at, tenant, entity, key, op)
 		 VALUES (0, '1', now(), now(), 't1', 'grant', 'forged', 'create')`,
 	} {
@@ -379,6 +388,12 @@ func TestHistoryReadsItselfWhateverTablesASessionMakes(t *testing.T) {
 		FROM `+pgx.Identifier{schema, "rbac_history"}.Sanitize(), want[0].ID).Scan(&pruned, &prunes); err != nil || pruned != 0 || prunes != 1 {
 		t.Errorf("history holds %d of the version pruned and %d prunes, %v", pruned, prunes, err)
 	}
+	if err := h.authz.AsOf(ctx, "t1", before.Add(-time.Microsecond), func(*rbac.Authorizer) error { return nil }); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("AsOf just before the prune's time, beside a session's own types: %v", err)
+	}
+	if err := h.authz.AsOf(ctx, "t1", dbNow(t, h), func(*rbac.Authorizer) error { return nil }); err != nil {
+		t.Errorf("AsOf now, beside a session's own types: %v", err)
+	}
 	if _, err := h.pool.Exec(ctx, `SELECT set_config('search_path', 'pg_temp, ' || quote_ident(current_schema()), false)`); err != nil {
 		t.Fatal(err)
 	}
@@ -387,6 +402,9 @@ func TestHistoryReadsItselfWhateverTablesASessionMakes(t *testing.T) {
 	}
 	if _, err := rbac.PruneHistory(ctx, h.pool, before, through); !errors.Is(err, rbac.ErrInvalid) {
 		t.Errorf("PruneHistory with pg_temp first in the search_path: %v", err)
+	}
+	if err := h.authz.AsOf(ctx, "t1", dbNow(t, h), func(*rbac.Authorizer) error { return nil }); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("AsOf with pg_temp first in the search_path: %v", err)
 	}
 }
 
@@ -505,13 +523,14 @@ func TestNoExpiryIsInfinite(t *testing.T) {
 // as a host's own migration tool would: each once, in order, in a transaction of its own.
 func migrateFiles(t *testing.T, pool *pgxpool.Pool, from, to string) {
 	t.Helper()
-	if err := applyMigrations(t.Context(), pool, from, to); err != nil {
+	if err := applyMigrations(t.Context(), pool, pgx.ReadCommitted, from, to); err != nil {
 		t.Fatal(err)
 	}
 }
 
-// applyMigrations is migrateFiles, returning why it failed, for a test's goroutine.
-func applyMigrations(ctx context.Context, pool *pgxpool.Pool, from, to string) error {
+// applyMigrations is migrateFiles, each in a transaction at iso, returning why it failed, for a
+// test's goroutine.
+func applyMigrations(ctx context.Context, pool *pgxpool.Pool, iso pgx.TxIsoLevel, from, to string) error {
 	files, err := fs.Glob(rbac.Migrations(), "*.sql")
 	if err != nil {
 		return err
@@ -524,7 +543,7 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool, from, to string) e
 		if err != nil {
 			return err
 		}
-		if err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		if err := pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{IsoLevel: iso}, func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, string(sql))
 			return err
 		}); err != nil {
@@ -791,48 +810,53 @@ func TestMigratingRecordsARowWrittenBeforeHistory(t *testing.T) {
 }
 
 // A change in flight to a row written before history, as migrating records the row, is the row's
-// record: migrating waits for it rather than record the row as it was before, after the change.
+// record: migrating waits for it rather than record the row as it was before, after the change,
+// in a transaction of its own at any isolation.
 func TestMigratingRecordsNoRowAsItWasBeforeAChangeInFlight(t *testing.T) {
-	pool := pgtest.Open(t, "")
-	ctx := t.Context()
-	migrateFiles(t, pool, "", "0003")
-	if _, err := pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, note)
-		VALUES ('t1', 'cluster', 'c1', 'user', 'old', 'cluster.login', 'first')`); err != nil {
-		t.Fatal(err)
-	}
-	migrateFiles(t, pool, "0003", "0008")
-	h := migrated(t, pool)
-	writer, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = writer.Rollback(ctx) }()
-	var pid int
-	if err := writer.QueryRow(ctx, `UPDATE rbac_grants SET note = 'second' WHERE principal = 'user:old' RETURNING pg_backend_pid()`).Scan(&pid); err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- applyMigrations(ctx, pool, "0008", "") }()
-	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
-		var blocked bool
-		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))`, pid).Scan(&blocked); err != nil {
-			t.Fatal(err)
-		}
-		if blocked {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("migrating never waited for the write")
-		}
-	}
-	if err := writer.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	if notes, err := notesAt(t, h, dbNow(t, h)); err != nil || notes["old"] != "second" {
-		t.Fatalf("as of now: %v, %v", notes, err)
+	for _, iso := range []pgx.TxIsoLevel{pgx.ReadCommitted, pgx.RepeatableRead} {
+		t.Run(string(iso), func(t *testing.T) {
+			pool := pgtest.Open(t, "")
+			ctx := t.Context()
+			migrateFiles(t, pool, "", "0003")
+			if _, err := pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, note)
+				VALUES ('t1', 'cluster', 'c1', 'user', 'old', 'cluster.login', 'first')`); err != nil {
+				t.Fatal(err)
+			}
+			migrateFiles(t, pool, "0003", "0008")
+			h := migrated(t, pool)
+			writer, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = writer.Rollback(ctx) }()
+			var pid int
+			if err := writer.QueryRow(ctx, `UPDATE rbac_grants SET note = 'second' WHERE principal = 'user:old' RETURNING pg_backend_pid()`).Scan(&pid); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- applyMigrations(ctx, pool, iso, "0008", "") }()
+			for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+				var blocked bool
+				if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))`, pid).Scan(&blocked); err != nil {
+					t.Fatal(err)
+				}
+				if blocked {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("migrating never waited for the write")
+				}
+			}
+			if err := writer.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if notes, err := notesAt(t, h, dbNow(t, h)); err != nil || notes["old"] != "second" {
+				t.Fatalf("as of now: %v, %v", notes, err)
+			}
+		})
 	}
 }
 

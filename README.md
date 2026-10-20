@@ -307,16 +307,19 @@ through which it could write `rbac_history` itself; and:
    read the row as it was before the change. Never `TRIGGER`, which `ALL` includes: a trigger
    runs its function as whoever writes the table, and one on `rbac_history` can drop each record,
    as history's owner.
-4. The schema isn't the application's role's, as `public` is when that role owns the database,
-   and that role can't create in it, as every role can in `public` before PostgreSQL 15:
-   `Migrate` calls functions by name, and an overload made there would run in its place, as the
-   administrator's role.
+4. The application's role can create in no schema: not one it owns, as `public` is when that role
+   owns the database, nor `public` before PostgreSQL 15, where every role can. `Migrate` calls
+   functions by name, and an overload made in the package's schema would run in its place, as the
+   administrator's role; and the package's schema is a session's current one, the first on its
+   search_path, which a session can set, so one that named first a schema the role can create in
+   would read a table made there as history, and `Export` would sign what it holds.
 
 The application's role may create temporary tables, as `AsOf` needs, and a session reads its own
-before any schema's of the same name until it ends, which in a pool can be long after the call
-that made one. One named as a package's table stands in for it in that session, whose checks are
-the application's own to make; `History`, `Export` and `PruneHistory` name history's table by the
-package's schema, so none stands in for it, and refuse a search_path that names pg_temp first.
+tables and types before any schema's of the same name until it ends, which in a pool can be long
+after the call that made one. One named as a package's table stands in for it in that session,
+whose checks are the application's own to make; `History`, `Export` and `PruneHistory`, and
+`AsOf`'s checks of history, name history's table by the package's schema and their types by
+pg_catalog's, so none stands in for them, and refuse a search_path that names pg_temp first.
 
 ## Running it
 
