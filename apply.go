@@ -206,7 +206,7 @@ type standing struct {
 // the planner would cost them by the tenant's largest groups, past JIT's thresholds in a large
 // tenant.
 var standSQL = `
-	WITH RECURSIVE ` + insideSQL("$3", "$4") + `, of(root, principal) AS (
+	WITH RECURSIVE ` + insideSQL("$3", "$4", "NULL", false) + `, of(root, principal) AS (
 	  SELECT 'group:' || root, principal FROM inside WHERE $3::text[] IS NOT NULL
 	  UNION SELECT p, p FROM unnest($2::text[]) AS p
 	), held(m) AS (

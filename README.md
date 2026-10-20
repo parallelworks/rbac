@@ -261,10 +261,10 @@ list and search the read makes answers as it would have then, with the catalog a
 an access review of a past date. A change counts from when the statement that made it began, but
 never before its row's change before it, and none can be made through it: one tried is no actor's
 attempt, and `Config.OnRefused` isn't told of it. A statement reads the history of the rows it
-names, as a check does its subject's grants, groups and the denies on its resource's path, not the
-whole tenant's; `Holders`, which finds the members of each group it lists, can read the tenant's
-history of members. It orders a row's changes by their ids in `rbac_history`, which sessions take
-out of order once that table's id sequence caches more than one, so `AsOf` refuses that.
+names, as a check does its subject's grants, groups and the denies on its resource's path, and
+`Holders` the members of the groups it lists, not the whole tenant's. It orders a row's changes by
+their ids in `rbac_history`, which sessions take out of order once that table's id sequence caches
+more than one, so `AsOf` refuses that.
 
 `rbac.PruneHistory(ctx, db, before, through)` deletes what an export has read past (`through`, its
 cursor) and later records supersede: of each row, the last version at or before `before` stays, so
@@ -289,7 +289,8 @@ through which it could write `rbac_history` itself; and:
    It needs `USAGE` on the schema, since every write to the package's tables runs `rbac_record`
    as it, and `CREATE` there to be given them, unless a superuser gives them.
 3. The application's role has `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the package's tables
-   but `rbac_history` and `rbac_migrations`, and on any a later migration adds, and only `SELECT`
+   but `rbac_history` and `rbac_migrations`, and on any a later migration adds, `EXECUTE` on the
+   function `rbac_group_members`, which every role has unless it is revoked, and only `SELECT`
    on `rbac_history`, with no `UPDATE` on its id sequence, which a grant on all the schema's
    sequences can give: `setval` could number a change below the one before it, and `AsOf` would
    read the row as it was before the change. Never `TRIGGER`, which `ALL` includes: a trigger
