@@ -356,10 +356,11 @@ sequenceDiagram
   where it is stored, for each scope: an identity's conditional grants, the conditional grants to
   groups, the tenant's members and the public, each the tenant's and those from each source the
   host owns apart, the conditional denies, and the requirements of groups' eligibilities for a
-  role, and a change past one is refused as invalid. A check's budget
-  is that for each scope on its path, so it evaluates every condition it reads, and no grant made
-  beside another changes what that one decides. Conditions stored before there were bounds may be
-  past one: a check evaluates them cheapest first within its budget.
+  role, and a change adding a condition past one is refused as invalid. A check's budget is that
+  for each scope on its path, so it evaluates every condition it reads, and no grant made beside
+  another changes what that one decides. Conditions stored before there were bounds may be past
+  one: a change adding none to them isn't refused, and a check evaluates them cheapest first
+  within its budget.
 
 ## A change
 

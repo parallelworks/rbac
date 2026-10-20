@@ -1610,6 +1610,13 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 	slices.Reverse(grants)
 	slices.SortStableFunc(grants, byKey)
 	grants = slices.CompactFunc(grants, func(x, y Grant) bool { return byKey(x, y) == 0 })
+	// What the conditions a check reads together cost before, so a change can store again what was
+	// stored past the bound before there were bounds.
+	buckets := a.bucketsOf(grants)
+	before, err := a.conditionsIn(ctx, tx, tenant, buckets)
+	if err != nil {
+		return nil, err
+	}
 	n := len(grants)
 	scopeTypes, scopeIDs, kinds, ids, roles := make([]string, n), make([]string, n), make([]string, n), make([]string, n), make([]string, n)
 	sources, expires := make([]string, n), make([]pgtype.Timestamptz, n)
@@ -1649,7 +1656,7 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 	if err := a.bounded(ctx, tx, tenant, granted); err != nil {
 		return nil, err
 	}
-	if err := a.conditionsBounded(ctx, tx, tenant, granted); err != nil {
+	if err := a.conditionsBounded(ctx, tx, tenant, buckets, before); err != nil {
 		return nil, err
 	}
 	return granted, nil
@@ -1679,17 +1686,12 @@ func (a *Authorizer) bucketsOf(grants []Grant) []conditionBucket {
 	return buckets
 }
 
-// conditionsBounded refuses conditional grants just stored that leave the conditions of a bucket
-// costing more together than a check may spend on them, one that reads the action counted once
-// for each label value its grants give, as a read of label values decides each apart. A check
-// evaluates them whole, so a grant made beside another, as by an actor who can't revoke it, never
-// changes what that one decides. It reads them under the change's locks, which every change of a
-// scope's grants takes, once they are stored, the grants in force the change didn't touch
-// included.
-func (a *Authorizer) conditionsBounded(ctx context.Context, tx pgx.Tx, tenant string, stored []Grant) error {
-	buckets := a.bucketsOf(stored)
+// conditionsIn reads on tx how many times a check may evaluate each condition of the grants in
+// force in each bucket: once, or for one that reads the action on the tenant, once for each label
+// value its grants give, as a read of label values decides each apart.
+func (a *Authorizer) conditionsIn(ctx context.Context, tx pgx.Tx, tenant string, buckets []conditionBucket) (map[conditionBucket]map[string]int, error) {
 	if len(buckets) == 0 {
-		return nil
+		return nil, nil
 	}
 	scopes, principals, sources := make([]string, len(buckets)), make([]string, len(buckets)), make([]string, len(buckets))
 	for i, b := range buckets {
@@ -1714,7 +1716,7 @@ func (a *Authorizer) conditionsBounded(ctx context.Context, tx pgx.Tx, tenant st
 		GROUP BY b.scope, b.principal, b.source, g.condition`,
 		tenant, scopes, principals, sources, a.cfg.Now(), TenantMembers(tenant).key(), publicKey, slices.Sorted(maps.Keys(a.owned)))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	carried := map[conditionBucket]map[string][]Role{}
 	var ids []Role
@@ -1729,20 +1731,19 @@ func (a *Authorizer) conditionsBounded(ctx context.Context, tx pgx.Tx, tenant st
 		ids = append(ids, roles...)
 		return nil
 	}); err != nil {
-		return err
+		return nil, err
 	}
 	// What the roles give matters only for counting label values.
 	defs := book{builtin: a.roles}
 	if len(a.labels) > 0 {
 		if defs, err = a.book(ctx, tx, tenant, ids); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	var over []error
-	readsAction := map[string]bool{}
-	for _, b := range buckets {
+	evaluations, readsAction := map[conditionBucket]map[string]int{}, map[string]bool{}
+	for b, conditions := range carried {
 		gives := map[string][]Permission{}
-		for expr, roles := range carried[b] {
+		for expr, roles := range conditions {
 			gives[expr] = nil
 			if len(a.labels) == 0 {
 				continue
@@ -1753,7 +1754,25 @@ func (a *Authorizer) conditionsBounded(ctx context.Context, tx pgx.Tx, tenant st
 				}
 			}
 		}
-		if affordable(a.evaluations(gives, readsAction)) {
+		evaluations[b] = a.evaluations(gives, readsAction)
+	}
+	return evaluations, nil
+}
+
+// conditionsBounded refuses conditional grants just stored that leave the conditions of a bucket
+// costing more together than a check may spend on them, and more than they did before. A check
+// evaluates them whole, so a grant made beside another, as by an actor who can't revoke it, never
+// changes what that one decides. It reads them under the change's locks, which every change of a
+// scope's grants takes, before they are stored and after, the grants in force the change didn't
+// touch included.
+func (a *Authorizer) conditionsBounded(ctx context.Context, tx pgx.Tx, tenant string, buckets []conditionBucket, before map[conditionBucket]map[string]int) error {
+	after, err := a.conditionsIn(ctx, tx, tenant, buckets)
+	if err != nil {
+		return err
+	}
+	var over []error
+	for _, b := range buckets {
+		if within(before[b], after[b]) {
 			continue
 		}
 		whose := b.principal + "'s grants"

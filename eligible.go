@@ -109,6 +109,10 @@ func (a *Authorizer) SetEligibility(ctx context.Context, actor Subject, on Resou
 	e.Approvers = canonicalPrincipals(e.Approvers)
 	check := func() error { return a.checkEligibility(e) }
 	return a.change(ctx, actor, on, "SetEligibility", ViaEligibility, []Binding{e.binding()}, nil, e.Approvers, check, func(tx pgx.Tx) (ChangeEvent, error) {
+		was, err := a.requirementOf(ctx, tx, on.Tenant, e)
+		if err != nil {
+			return ChangeEvent{}, err
+		}
 		// An expired eligibility that is still stored allowed nothing, so setting it again records
 		// the new actor and time.
 		rows, err := tx.Query(ctx, `
@@ -137,27 +141,40 @@ func (a *Authorizer) SetEligibility(ctx context.Context, actor Subject, on Resou
 		if len(set) == 0 {
 			return ChangeEvent{}, nil
 		}
-		return ChangeEvent{Eligible: set}, a.requirementsBounded(ctx, tx, on.Tenant, e)
+		return ChangeEvent{Eligible: set}, a.requirementsBounded(ctx, tx, on.Tenant, e, was)
 	})
 }
 
-// requirementsBounded refuses an eligibility of a group just stored that leaves the requirements
-// of groups' eligibilities for its role on its scope costing more together than activating may
-// spend on them: one activating evaluates those of each group it is in, and a subject holds one
-// eligibility of its own there. Activating evaluates them whole, so an eligibility set beside
-// another, as by an actor who can't delete it, never changes what that one allows.
-func (a *Authorizer) requirementsBounded(ctx context.Context, tx pgx.Tx, tenant string, e Eligibility) error {
+// requirementOf is what an eligibility of a group in force requires, as stored, "" for none.
+func (a *Authorizer) requirementOf(ctx context.Context, tx pgx.Tx, tenant string, e Eligibility) (string, error) {
+	if e.Principal.Kind != Group {
+		return "", nil
+	}
+	var requires string
+	err := tx.QueryRow(ctx, `SELECT coalesce(max(requires), '') FROM rbac_eligibilities
+		WHERE tenant = $1 AND principal = $2 AND scope = $3 AND role = $4 AND (expires_at IS NULL OR expires_at > $5)`,
+		tenant, e.Principal.key(), e.Scope.Key(), e.Role, a.cfg.Now()).Scan(&requires)
+	return requires, err
+}
+
+// requirementsBounded refuses an eligibility of a group just stored, which required was before,
+// that leaves the requirements of groups' eligibilities for its role on its scope costing more
+// together than activating may spend on them, and more than they did: one activating evaluates
+// those of each group it is in, and a subject holds one eligibility of its own there. Activating
+// evaluates them whole, so an eligibility set beside another, as by an actor who can't delete it,
+// never changes what that one allows.
+func (a *Authorizer) requirementsBounded(ctx context.Context, tx pgx.Tx, tenant string, e Eligibility, was string) error {
 	if e.Requires == "" || e.Principal.Kind != Group {
 		return nil
 	}
-	var requires []string
+	var others []string
 	if err := tx.QueryRow(ctx, `SELECT coalesce(array_agg(DISTINCT requires), '{}') FROM rbac_eligibilities
-		WHERE tenant = $1 AND scope = $2 AND role = $3 AND principal >= 'group:' AND principal < 'group;' AND requires <> ''
-		  AND (expires_at IS NULL OR expires_at > $4)`,
-		tenant, e.Scope.Key(), e.Role, a.cfg.Now()).Scan(&requires); err != nil {
+		WHERE tenant = $1 AND scope = $2 AND role = $3 AND principal >= 'group:' AND principal < 'group;' AND principal <> $4
+		  AND requires <> '' AND (expires_at IS NULL OR expires_at > $5)`,
+		tenant, e.Scope.Key(), e.Role, e.Principal.key(), a.cfg.Now()).Scan(&others); err != nil {
 		return err
 	}
-	if !affordable(once(requires)) {
+	if !within(once(append(others, was)), once(append(others, e.Requires))) {
 		return fmt.Errorf("%w: the requirements of groups' eligibilities for %s on %s cost more together than activating may spend evaluating them",
 			ErrInvalid, e.Role, e.Scope.Key())
 	}

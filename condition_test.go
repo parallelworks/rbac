@@ -680,9 +680,10 @@ func TestGroupsRequirementsForARoleOnAScopeAreBoundedTogether(t *testing.T) {
 	}
 }
 
-// A group's eligibility set again as it is adds nothing activating reads, so it isn't refused, as a
-// grant granted again isn't, though the requirements stored around the bound cost more.
-func TestAnEligibilitySetAgainAsItIsIsntRefused(t *testing.T) {
+// Where groups' requirements stored before there were bounds cost more than activating may spend,
+// a group's eligibility set again as it is, or with a requirement another holds, adds nothing
+// activating reads, so it isn't refused; one adding a requirement is.
+func TestAnEligibilitySetPastTheBoundIsRefusedOnlyForARequirementItAdds(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
 	h.groups(t, "g0", "g1", "g2", "g3")
@@ -692,13 +693,22 @@ func TestAnEligibilitySetAgainAsItIsIsntRefused(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	e := rbac.Eligibility{Role: "cluster.sudo", Principal: groupOf("g0"), MaxDuration: time.Hour, Requires: spending(0)}
-	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, e); err != nil {
-		t.Errorf("set again as it is: %v", err)
+	set := func(note, requires string) error {
+		return h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, rbac.Eligibility{
+			Role: "cluster.sudo", Principal: groupOf("g0"), MaxDuration: time.Hour, Requires: requires, Note: note,
+		})
 	}
-	e.Note = "on call"
-	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, e); !errors.Is(err, rbac.ErrInvalid) {
-		t.Errorf("changed, beside requirements that cost more than activating may spend: %v", err)
+	for name, err := range map[string]error{
+		"as it is":                     set("", spending(0)),
+		"with another note":            set("on call", spending(0)),
+		"with a requirement they hold": set("on call", spending(1)),
+	} {
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if err := set("on call", spending(9)); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("with a requirement they don't hold: %v", err)
 	}
 }
 

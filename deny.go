@@ -251,21 +251,26 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 		if err := a.denyAllowed(ctx, tx, actor, on, cs, nil, nil); err != nil {
 			return ChangeEvent{}, err
 		}
-		rows, err := tx.Query(ctx, `SELECT condition, permissions FROM rbac_denies WHERE tenant = $1 AND scope = $2 AND id <> $3`,
-			on.Tenant, d.Scope.Key(), d.ID)
+		rows, err := tx.Query(ctx, `SELECT id, condition, permissions FROM rbac_denies WHERE tenant = $1 AND scope = $2`,
+			on.Tenant, d.Scope.Key())
 		if err != nil {
 			return ChangeEvent{}, err
 		}
 		// The permissions each condition is carried with, as a read of label values evaluates one that
-		// reads the action for each it denies.
-		carried := map[string][]Permission{d.Condition.Expression: d.Permissions}
+		// reads the action for each it denies, before the deny is set and after.
+		before, after := map[string][]Permission{}, map[string][]Permission{d.Condition.Expression: d.Permissions}
 		others := 0
-		var condition string
+		var id, condition string
 		var perms []string
-		if _, err := pgx.ForEachRow(rows, []any{&condition, &perms}, func() error {
-			others++
+		if _, err := pgx.ForEachRow(rows, []any{&id, &condition, &perms}, func() error {
 			for _, p := range perms {
-				carried[condition] = append(carried[condition], Permission(p))
+				before[condition] = append(before[condition], Permission(p))
+				if id != d.ID {
+					after[condition] = append(after[condition], Permission(p))
+				}
+			}
+			if id != d.ID {
+				others++
 			}
 			return nil
 		}); err != nil {
@@ -276,7 +281,8 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 		}
 		// Past this, a check's budget could run out before it evaluated them, and the rest would
 		// deny everyone they name, whatever their conditions say.
-		if d.Condition.Expression != "" && !affordable(a.evaluations(carried, map[string]bool{})) {
+		readsAction := map[string]bool{}
+		if d.Condition.Expression != "" && !within(a.evaluations(before, readsAction), a.evaluations(after, readsAction)) {
 			return ChangeEvent{}, fmt.Errorf("%w: a scope's conditional denies cost more together than a check may spend evaluating them", ErrInvalid)
 		}
 		rows, err = tx.Query(ctx, `

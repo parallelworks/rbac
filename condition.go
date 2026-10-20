@@ -49,10 +49,12 @@ import (
 // or three of the longest. A check of a labeled resource decides each of the subject's label
 // values as a check of it would, and evaluates a condition that doesn't read the action once for
 // them all, so on the tenant one that does counts once for each label value its grants give or its
-// denies deny. A change past one is refused, so no grant, deny or eligibility stored changes what
-// the others decide. A condition stored around them, as before there were bounds or on a custom
-// role widened since, a check may not reach: it evaluates the cheapest first, and past its budget
-// a grant's condition is false and a deny's applies.
+// denies deny. A change adding a condition past a bound, or one evaluated more, is refused as
+// invalid, so no grant, deny or eligibility stored changes what the others decide, but one adding
+// none isn't: conditions stored past a bound before there were bounds can be stored again as they
+// are, as by a restore. A check may not reach all of those, or of those of a custom role widened
+// since: it evaluates the cheapest first, and past its budget a grant's condition is false and a
+// deny's applies.
 //
 // Searches (Filter, Reachable, Holders) can't evaluate one: Filter and Reachable count only
 // unconditional grants, Filter counts a conditional deny as denying, and Reach.Conditional and
@@ -148,15 +150,30 @@ func budgetOf(left uint64) *budget {
 	return &budget{left: left, compiled: map[string]bool{}, decided: map[string]decision{}}
 }
 
-// affordable reports whether a check can evaluate conditions whole within maxCheckCost, each the
-// most it can cost: compiling it once, and evaluating it to its bound as many times as evaluations
-// has it, and at least once.
-func affordable(evaluations map[string]int) bool {
-	var cost uint64
-	for e, n := range evaluations {
-		cost += uint64(len(e))*compilePerByte + maxCost*uint64(max(n, 1))
+// most is what a check can spend on conditions: each compiled once, and evaluated to its bound as
+// many times as evaluations has it, and at least once.
+func most(evaluations map[string]int) uint64 {
+	var n uint64
+	for e, k := range evaluations {
+		n += uint64(len(e))*compilePerByte + maxCost*uint64(max(k, 1))
 	}
-	return cost <= maxCheckCost
+	return n
+}
+
+// within reports whether conditions a check reads together, after a change has left them so from
+// before, cost what a check may spend on them at most, or, as conditions stored past that before
+// there were bounds may, add no condition and none evaluated more: so none is stored past it, and
+// what was can be stored again as it is.
+func within(before, after map[string]int) bool {
+	if most(after) <= maxCheckCost {
+		return true
+	}
+	for e, n := range after {
+		if was, ok := before[e]; !ok || n > was {
+			return false
+		}
+	}
+	return true
 }
 
 // once is each of exprs evaluated once, as a check of one permission evaluates them.

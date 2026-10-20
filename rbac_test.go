@@ -5782,6 +5782,60 @@ func TestAHostsSourceIsBoundedApartFromTheTenantsGrants(t *testing.T) {
 	}
 }
 
+// Where conditions stored before there were bounds cost more than a check may spend, a change that
+// adds none, as one changing a note, granting one held again or restoring them as they are, isn't
+// refused; one adding a condition is.
+func TestAChangePastTheBoundIsRefusedOnlyForAConditionItAdds(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	var grants []rbac.Grant
+	for i := range 4 {
+		g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+		g.Condition = rbac.Condition{Expression: spending(i)}
+		grants = append(grants, g)
+	}
+	storeAround(t, h, grants...)
+	for i := range 4 {
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions, condition)
+			VALUES ('t1', 'cluster', 'c1', $1, $2, $3, $4)`, fmt.Sprint("d", i), []string{"user:v"}, []string{string(login)}, spending(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	owner := h.as(t, "owner")
+	under := func(role rbac.Role, note, expr string) error {
+		return h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{
+			Role: role, Principal: identity("u"), Note: note, Condition: rbac.Condition{Expression: expr},
+		}}})
+	}
+	deny := func(id, name, expr string) error {
+		return h.authz.SetDeny(ctx, guardian, cluster, rbac.Deny{
+			ID: id, Name: name, Principals: []rbac.Principal{identity("v")}, Permissions: []rbac.Permission{login},
+			Condition: rbac.Condition{Expression: expr},
+		})
+	}
+	for name, err := range map[string]error{
+		"a note":                         under("cluster.login", "on call", spending(0)),
+		"another role, a condition held": under("cluster.sudo", "", spending(1)),
+		"restoring them":                 h.authz.Import(ctx, host, "t1", grants),
+		"a deny's name":                  deny("d0", "renamed", spending(0)),
+		"a deny, a condition held":       deny("d4", "", spending(2)),
+	} {
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	for name, err := range map[string]error{
+		"a grant's costly condition": under("cluster.login", "", spending(9)),
+		"a grant's cheap condition":  under("cluster.login", "", "true"),
+		"a deny's condition":         deny("d5", "", "true"),
+		"a deny's changed condition": deny("d0", "", spending(9)),
+	} {
+		if !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("adding %s: %v", name, err)
+		}
+	}
+}
+
 // Conditions stored around the bounds can cost more than a check may spend: it spends a bounded
 // budget on them, the cheapest first, and refuses what still needs one.
 func TestACheckSpendsABoundedBudgetOnConditionsStoredAroundTheBounds(t *testing.T) {

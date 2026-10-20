@@ -153,11 +153,12 @@ reach, to check one by one.
   an identity's grants' on a scope, those of a scope's grants to groups, the tenant's members and
   the public, each the tenant's and those from each source the host owns apart, a scope's denies',
   and the requirements of groups' eligibilities for a role on a scope, each to about seven short
-  conditions or three of the longest, and a change past one is refused as invalid. So a check
-  evaluates every condition it reads, and a grant made beside another, as by someone who can't
-  revoke it, never changes what that one decides. Those stored past a bound, as before there were
-  bounds, a check may not all reach, as it evaluates the cheapest first within its budget, and a
-  change storing one among them is refused until revokes bring them within it. To hand a
+  conditions or three of the longest, and a change adding a condition past one is refused as
+  invalid. So a check evaluates every condition it reads, and a grant made beside another, as by
+  someone who can't revoke it, never changes what that one decides. A change adding no condition
+  isn't refused, so what was stored past a bound before there were bounds can be stored again as
+  it is, as by a restore, though a check may not reach all of it: it evaluates the cheapest first
+  within its budget. To hand a
   permission on, the actor holds it unconditionally or under the same condition, one that doesn't
   read the subject: that one decides for each holder, so the actor's holding says nothing of
   another's.
