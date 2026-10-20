@@ -180,11 +180,8 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, how
 		// are read as the change is made: a custom role deleted or redefined since is granted only as
 		// it is now. The constraints aren't asked again, as hooks run outside it.
 		cs.seal()
-		now, err := a.mayChange(ctx, tx, actor, on, handed, revokes, cs)
+		now, err := a.grantsAllowed(ctx, tx, actor, on, handed, revokes, cs, nil, nil)
 		if err != nil {
-			return ChangeEvent{}, err
-		}
-		if err := a.cleared(ctx, tx, on, cs, GrantPermission(scope.Type)); err != nil {
 			return ChangeEvent{}, err
 		}
 		var bad []error
@@ -289,31 +286,84 @@ func (a *Authorizer) stillStanding(ctx context.Context, tx pgx.Tx, tenant string
 // transaction reads back rather than ask again.
 func (a *Authorizer) mayChangeGrants(ctx context.Context, actor Subject, on Resource, grants, revokes []Binding) (authority, *constrained, error) {
 	cs := a.constrain(ctx, actor, on)
-	if err := a.changing(actor, on, cs); err != nil {
-		return authority{}, nil, err
-	}
-	if err := a.cleared(ctx, a.db, on, cs, GrantPermission(on.Type)); err != nil {
-		return authority{}, nil, err
-	}
-	au, err := a.mayChange(ctx, a.db, actor, on, grants, revokes, cs)
+	au, err := a.grantsAllowed(ctx, a.db, actor, on, grants, revokes, cs, nil, nil)
 	return au, cs, err
 }
 
-// cleared refuses, as a DeniedError of p, a change on a scope whose label the actor's holding,
-// read on q, doesn't satisfy, asking the constraints about its values on the tenant through cs:
-// before the change's transaction, and again under its locks, which reads their answers back.
-func (a *Authorizer) cleared(ctx context.Context, q DB, on Resource, cs *constrained, p Permission) error {
+// grantsAllowed is what a change to the grants on on checks, Apply's and one to members' alike:
+// before its transaction, the constraints on changing them, asked through cs, then on's label and
+// what the actor holds there, as mayChangeBy decides; and once cs is sealed, under its locks, what
+// it holds and the label again. The actor's label values are read through labels, or where nil, cs
+// on the tenant, and what it holds on q, or is au, where read already. It returns the authority it
+// decided by.
+func (a *Authorizer) grantsAllowed(ctx context.Context, q DB, actor Subject, on Resource, grants, revokes []Binding, cs, labels *constrained,
+	au *authority,
+) (authority, error) {
+	checkLabel := func() error { return a.labelAllows(ctx, q, on, cs, labels, GrantPermission(on.Type)) }
+	if !cs.sealed {
+		if err := a.changing(actor, on, cs); err != nil {
+			return authority{}, err
+		}
+		if err := checkLabel(); err != nil {
+			return authority{}, err
+		}
+	}
+	held, err := a.authorityOr(ctx, q, actor, on, roleIDs(grants), au)
+	if err != nil {
+		return authority{}, err
+	}
+	held.constrained = cs
+	if err := a.mayChangeBy(held, on, grants, revokes); err != nil {
+		return authority{}, err
+	}
+	if cs.sealed {
+		if err := checkLabel(); err != nil {
+			return authority{}, err
+		}
+	}
+	return held, nil
+}
+
+// authorityOr is au, the actor's authority on on read already, or where nil, read on q.
+func (a *Authorizer) authorityOr(ctx context.Context, q DB, actor Subject, on Resource, roles []Role, au *authority) (authority, error) {
+	if au != nil {
+		return *au, nil
+	}
+	return a.authorityOn(ctx, q, actor, on, roles)
+}
+
+// labelAllows refuses, as a DeniedError of p, a change on a scope whose label the actor's holding,
+// read on q, doesn't satisfy, asking the constraints about its values through labels, or where nil,
+// through cs on the tenant: before the change's transaction, and again under its locks, which reads
+// their answers back.
+func (a *Authorizer) labelAllows(ctx context.Context, q DB, on Resource, cs, labels *constrained, p Permission) error {
 	if !on.Labels.asks() {
 		return nil
 	}
-	h, _, err := a.holdingOn(ctx, q, cs.actor, cs.ofTenant())
-	if err != nil {
-		return err
+	if labels == nil {
+		labels = cs.ofTenant()
 	}
-	if dim := h.Unsatisfied(on.Labels); dim != "" {
-		return &DeniedError{Permission: p, Scope: on.Scope(), Reason: labelRefusal(dim)}
+	return a.labelCheck(ctx, q, labels)(on, p)
+}
+
+// labelCheck returns a check refusing, as a DeniedError of p, a change on a resource whose label
+// the actor's holding doesn't satisfy, read on q through labels the first time a label asks for
+// values in each phase (constrained.holding), asking the constraints about them on the tenant:
+// before the change's transaction, and again under its locks, which reads their answers back.
+func (a *Authorizer) labelCheck(ctx context.Context, q DB, labels *constrained) func(on Resource, p Permission) error {
+	return func(on Resource, p Permission) error {
+		if !on.Labels.asks() {
+			return nil
+		}
+		held, err := labels.holding(ctx, q)
+		if err != nil {
+			return err
+		}
+		if dim := held.Unsatisfied(on.Labels); dim != "" {
+			return &DeniedError{Permission: p, Scope: on.Scope(), Reason: labelRefusal(dim)}
+		}
+		return nil
 	}
-	return nil
 }
 
 // changing refuses a change to grants on a scope of a type the host doesn't have, as a typo no
@@ -553,7 +603,7 @@ func keyOf(b Binding) grantKey {
 	return grantKey{b.Role, b.Principal, b.Source, expires, b.Condition.Expression}
 }
 
-// validate checks the bindings against the roles mayChange read, and asks the host about each
+// validate checks the bindings against the roles grantsAllowed read, and asks the host about each
 // grant otherwise valid.
 func (a *Authorizer) validate(ctx context.Context, roles book, actor Subject, via Via, tenant string, scope Scope, grants, revokes []Binding) error {
 	var errs []error
@@ -782,10 +832,30 @@ type constrained struct {
 	// tenant is what they remove of the actor's label values, asked about on the tenant, where it
 	// holds them, for a change on a labeled scope.
 	tenant *constrained
+	// held is the actor's label values read through c, once before the transaction and once in it,
+	// for every label a change checks.
+	held [2]*Holding
 }
 
 func (a *Authorizer) constrain(ctx context.Context, actor Subject, on Resource) *constrained {
 	return &constrained{a: a, ctx: ctx, actor: actor, on: on, asked: map[permissionOn]bool{}, by: map[Permission]string{}}
+}
+
+// holding is the actor's label values, read on q through c, which is on the tenant, the first time
+// a change asks for them before its transaction, and again the first time in it.
+func (c *constrained) holding(ctx context.Context, q DB) (Holding, error) {
+	phase := 0
+	if c.sealed {
+		phase = 1
+	}
+	if c.held[phase] == nil {
+		h, _, err := c.a.holdingOn(ctx, q, c.actor, c)
+		if err != nil {
+			return Holding{}, err
+		}
+		c.held[phase] = &h
+	}
+	return *c.held[phase], nil
 }
 
 func (c *constrained) seal() {
@@ -896,16 +966,67 @@ func (p power) lists(r Role, condition string) bool {
 // can name, in the statement that reads the grants, as a check reads them: read apart, a grant
 // made and a role narrowed meanwhile could refuse what no moment did.
 func (a *Authorizer) authorityOn(ctx context.Context, q DB, actor Subject, on Resource, roles []Role) (authority, error) {
+	aus, err := a.authorities(ctx, q, actor, []Resource{on}, roles)
+	if err != nil {
+		return authority{}, err
+	}
+	return aus[0], nil
+}
+
+// authorities is authorityOn on each of on, resources of one tenant, read in one statement over
+// all their paths, so a change reaching many scopes, as one to the members of a group granted a
+// role on each, reads the actor's grants once rather than for each.
+func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []Resource, roles []Role) ([]authority, error) {
+	if len(on) == 0 {
+		return nil, nil
+	}
 	which := heldTenantRoles
 	if slices.ContainsFunc(roles, isCustom) {
 		which = tenantRoles
 	}
-	held, ds, b, err := a.heldOrDenied(ctx, q, on.Tenant, actor, all, on.path(), "", which, true)
+	tenant, paths, keys := on[0].Tenant, make([][]string, len(on)), map[string]bool{}
+	for i, r := range on {
+		paths[i] = r.path()
+		for _, k := range paths[i] {
+			keys[k] = true
+		}
+	}
+	held, ds, b, err := a.heldOrDenied(ctx, q, tenant, actor, all, slices.Sorted(maps.Keys(keys)), "", which, true)
 	if err != nil {
-		return authority{}, err
+		return nil, err
 	}
 	readingRoles()
-	return a.authorityOf(ctx, q, actor, on, held, ds, b)
+	if err := a.conditionsOf(ctx, q, tenant, held); err != nil {
+		return nil, err
+	}
+	heldOn := onPaths(held, func(h holding) string { return h.scope }, paths)
+	deniedOn := onPaths(ds, func(d denial) string { return d.scope }, paths)
+	aus := make([]authority, len(on))
+	for i, r := range on {
+		aus[i] = a.authorityOf(ctx, actor, r, heldOn[i], deniedOn[i], b)
+	}
+	return aus, nil
+}
+
+// onPaths returns, for each of paths, those of xs whose scope is on it, in the order of xs, as a
+// read of that path alone returns them.
+func onPaths[T any](xs []T, scope func(T) string, paths [][]string) [][]T {
+	at := map[string][]int{}
+	for i, x := range xs {
+		at[scope(x)] = append(at[scope(x)], i)
+	}
+	out := make([][]T, len(paths))
+	for i, path := range paths {
+		var is []int
+		for _, k := range path {
+			is = append(is, at[k]...)
+		}
+		slices.Sort(is)
+		for _, j := range is {
+			out[i] = append(out[i], xs[j])
+		}
+	}
+	return out
 }
 
 // orDenied is a deny check that also denies what more does.
@@ -913,12 +1034,9 @@ func orDenied(denied, more func(Permission) bool) func(Permission) bool {
 	return func(p Permission) bool { return more(p) || denied(p) }
 }
 
-// authorityOf is the authority of held grants under the denies on the path, reading the
-// grants' conditions.
-func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Resource, held []holding, ds []denial, b book) (authority, error) {
-	if err := a.conditionsOf(ctx, q, on.Tenant, held); err != nil {
-		return authority{}, err
-	}
+// authorityOf is the authority of held grants, their conditions read, under the denies on the
+// path.
+func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource, held []holding, ds []denial, b book) authority {
 	vars, spend := a.vars(ctx, actor, "", on), newBudget()
 	// The cheapest conditions first, as callers evaluate them in this order, so what a budget run
 	// out decides doesn't rest on ids.
@@ -962,7 +1080,7 @@ func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Re
 			return !h.conditional || a.conds.holds(spend, h.Condition.Expression, with(vars, action))
 		},
 		denied: denied, handsOn: handsOn, subjects: subjects{},
-	}, nil
+	}
 }
 
 // over is what the actor's grants let it change on scopes of a type in this request: a
@@ -1057,7 +1175,7 @@ func (au authority) may(p Permission, resourceType string) bool {
 // actor makes, and under for one a grant it makes would let others make. seen is holdsRole's:
 // fresh for each grant decided, or what grants already allowed proved.
 func (a *Authorizer) mayGrant(au authority, pw power, scopeType string, def RoleDefinition, condition string, until time.Time,
-	seen map[string]bool,
+	seen *checked,
 ) (Permission, bool) {
 	if pw.lists(def.ID, condition) {
 		return "", true
@@ -1085,13 +1203,15 @@ func (a *Authorizer) mayGrant(au authority, pw power, scopeType string, def Role
 // as for a role that lists itself or one that lists it back, adds nothing. Without it, roles
 // listing each other would be checked along every order they can be reached in.
 func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string, condition string, until time.Time,
-	seen map[string]bool,
+	seen *checked,
 ) (Permission, bool) {
 	key := string(def.ID) + " " + strings.Join(types, ",") + " " + until.UTC().Format(time.RFC3339Nano) + " " + condition
-	if seen[key] {
+	if seen.keys[key] {
 		return "", true
 	}
-	seen[key] = true
+	seen.keys[key] = true
+	seen.order = append(seen.order, key)
+	checkingRole()
 	for _, p := range def.Permissions {
 		t, verb := p.parts()
 		// Where the grant doesn't reach scopes of t, its t:grant changes no grants there: it is a
@@ -1131,20 +1251,60 @@ func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string,
 	return "", true
 }
 
-// mayChange checks the actor's own access on the scope against the change, once Apply has
-// checked the constraints on changing it, and returns what it read; cs are those on what the
-// actor hands on.
-func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Resource, grants, revokes []Binding, cs *constrained) (authority, error) {
+// checkingRole runs as holdsRole begins checking a role it hasn't for a decision, as a test counts
+// how many a change walks.
+var checkingRole = func() {}
+
+// decidingGrants runs as mayChangeBy begins deciding a change's grants, and what it returns once it
+// has, as a test measures what keeping what each proved costs, which counting checks can't show.
+var decidingGrants = func() func() { return func() {} }
+
+// checked are holdsRole's checks, each a role with what its grant reaches, its end and condition,
+// done or under way for the grants a decision makes, in the order they began: what a grant allowed
+// proved holds for the next, and a refused one's are dropped, as some passed only while it was in
+// progress.
+type checked struct {
+	keys  map[string]bool
+	order []string
+}
+
+func newChecked() *checked { return &checked{keys: map[string]bool{}} }
+
+// mark is how many checks have begun, for drop to forget those begun since.
+func (c *checked) mark() int { return len(c.order) }
+
+func (c *checked) drop(mark int) {
+	for _, k := range c.order[mark:] {
+		delete(c.keys, k)
+	}
+	c.order = c.order[:mark]
+}
+
+// grantAsked is a grant as mayChangeBy decides it: its role, under a condition, until a time.
+type grantAsked struct {
+	role      Role
+	condition string
+	until     time.Time
+}
+
+// grantDecided is what mayGrant decided of a grantAsked: whether the actor may grant it, and if
+// not, a permission it lacks.
+type grantDecided struct {
+	lacks Permission
+	ok    bool
+}
+
+// mayChangeBy checks the actor's own access on the scope against the change, by au, its authority
+// there, with the constraints on what it hands on, once the constraints on changing grants there
+// are checked.
+func (a *Authorizer) mayChangeBy(au authority, on Resource, grants, revokes []Binding) error {
+	defer decidingGrants()()
 	scope := on.Scope()
 	manage := GrantPermission(scope.Type)
-	au, err := a.authorityOn(ctx, q, actor, on, roleIDs(grants))
-	if err != nil {
-		return authority{}, err
-	}
-	au.constrained = cs
+	cs := au.constrained
 	pw := au.over(scope.Type)
 	if pw.none() {
-		return authority{}, &DeniedError{Permission: manage, Scope: scope, Reason: "the actor may not change access here"}
+		return &DeniedError{Permission: manage, Scope: scope, Reason: "the actor may not change access here"}
 	}
 	var errs []error
 	for _, b := range revokes {
@@ -1152,13 +1312,27 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 			errs = append(errs, &DeniedError{Permission: manage, Scope: scope, Reason: fmt.Sprintf("the actor may not revoke %s here", b.Role)})
 		}
 	}
+	// A role is decided once for each condition and end, by what it lacks then, if anything, or a
+	// change granting it to many would walk what it lists for each; and what a grant allowed proved
+	// holds for the others, as Grantable keeps it: a refused one's checks are dropped, as some passed
+	// only while it was in progress.
+	decisions, proven := map[grantAsked]grantDecided{}, newChecked()
 	for _, b := range grants {
 		def, known := au.roles.role(b.Role)
 		if !known || !a.grantableOn(def, scope.Type) {
 			// validate reports it as invalid rather than as an escalation.
 			continue
 		}
-		if p, ok := a.mayGrant(au, pw, scope.Type, def, b.Condition.Expression, b.ExpiresAt, map[string]bool{}); !ok {
+		k := grantAsked{role: b.Role, condition: b.Condition.Expression, until: b.ExpiresAt.UTC()}
+		d, decided := decisions[k]
+		if !decided {
+			mark := proven.mark()
+			if d.lacks, d.ok = a.mayGrant(au, pw, scope.Type, def, b.Condition.Expression, b.ExpiresAt, proven); !d.ok {
+				proven.drop(mark)
+			}
+			decisions[k] = d
+		}
+		if p := d.lacks; !d.ok {
 			reason := cs.refusal("grant "+string(b.Role), p, fmt.Sprintf("the actor can't grant %s without holding %s here", b.Role, p))
 			switch {
 			case !pw.any && len(pw.listed[b.Role]) > 0:
@@ -1170,9 +1344,9 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 		}
 	}
 	if err := cs.failed(); err != nil {
-		return authority{}, err
+		return err
 	}
-	return au, errors.Join(errs...)
+	return errors.Join(errs...)
 }
 
 // Grantable lists the roles the subject may grant on r, unconditionally and for good, built-in
@@ -1202,10 +1376,10 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 		return nil, err
 	}
 	readingRoles()
-	au, err := a.authorityOf(ctx, a.db, s, r, held, ds, b)
-	if err != nil {
+	if err := a.conditionsOf(ctx, a.db, r.Tenant, held); err != nil {
 		return nil, err
 	}
+	au := a.authorityOf(ctx, s, r, held, ds, b)
 	custom := slices.SortedFunc(maps.Values(b.custom), func(x, y RoleDefinition) int { return strings.Compare(string(x.ID), string(y.ID)) })
 	au.constrained = cs
 	pw := au.over(r.Type)
@@ -1215,12 +1389,13 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 	var roles []RoleDefinition
 	// Everything checked for a role the actor may grant holds, so later roles needn't check it
 	// again. A refused role's checks are dropped: some passed only while it was in progress.
-	proven := map[string]bool{}
+	proven := newChecked()
 	for _, def := range a.rolesIn(r.Type, custom) {
-		seen := maps.Clone(proven)
-		if _, ok := a.mayGrant(au, pw, r.Type, def, "", time.Time{}, seen); ok {
-			proven = seen
+		mark := proven.mark()
+		if _, ok := a.mayGrant(au, pw, r.Type, def, "", time.Time{}, proven); ok {
 			roles = append(roles, def)
+		} else {
+			proven.drop(mark)
 		}
 	}
 	if err := cs.failed(); err != nil {

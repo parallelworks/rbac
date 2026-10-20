@@ -115,11 +115,11 @@ reach, to check one by one.
   grants give, nor do `Apply`, `SetEligibility` and `DeleteEligibility` change its grants, nor
   `SetDeny` and `DeleteDeny` its denies, nor `SetRole` and `DeleteRole` the grants of a role on it,
   nor `ChangeMembers` the members of a labeled group, or of one holding access or exempt from a deny
-  on a labeled scope, nor `SetGroup` and `DeleteGroup` the groups of a labeled tenant, each reading
-  the actor's values again under the change's locks; `Explain` names the dimension that failed.
-  `Filter` tests a `text[]` label column (`Columns.Labels`), which needs no index, as the path's
-  drives the query; `Reachable` returns the holding, and `Holding` with `Satisfies` checks data
-  points in a feed without reading the database.
+  on a labeled scope, nor `SetGroup` and `DeleteGroup` a labeled group or the groups of a labeled
+  tenant, each reading the actor's values again under the change's locks; `Explain` names the
+  dimension that failed. `Filter` tests a `text[]` label column (`Columns.Labels`), which needs no
+  index, as the path's drives the query; `Reachable` returns the holding, and `Holding` with
+  `Satisfies` checks data points in a feed without reading the database.
 - **Writing labeled data:** data read under one label is written under another only if
   `Holding.MayWrite` allows it: the writer satisfies the label it read, and the new one is at
   least as restrictive in every dimension (a level as high, every compartment kept, partners
@@ -215,15 +215,19 @@ reach, to check one by one.
   nests it in too, which the actor must be able to grant it, until its place ends, and an
   eligibility for good, and `ValidateGrant` is asked about each as the member's
   (`rbac.ViaMembership`); it approves what the group approves, which the actor must be able to set;
-  and it is exempt from the denies the group is exempt from, as a removed member, or one whose
-  membership is made to end sooner, is from those naming it, which the actor must be able to set.
-  So whoever manages a group that holds, approves and is in no deny changes its members freely, and
-  one holding a role only if they could grant that role themselves. `Config.ResourceOf` gives the
-  package the tenant, which `SetGroup` and `DeleteGroup` check `rbac.ManageGroups` on, and the
-  groups, which `ChangeMembers` checks `rbac.GroupMembers` on, each with its constraints and label,
-  and the containers, label and attributes of the scopes a group's access is on; a host without it
+  and it is exempt from the denies the group is exempt from, as a removed member is from those
+  naming it, which the actor must be able to set. A place made to end sooner gains nothing: it is a
+  removal then, checked as one now. So whoever manages a group that holds, approves and is in no
+  deny changes its members freely, and one holding a role only if they could grant that role
+  themselves. `Config.ResourceOf` gives the package the tenant, which `SetGroup` and `DeleteGroup`
+  check `rbac.ManageGroups` on, and the groups, which `ChangeMembers` checks `rbac.GroupMembers`
+  on and `SetGroup` and `DeleteGroup` the label of, each with its constraints and label, and the
+  containers, label and attributes of the scopes a group's access is on; a host without it
   declares no labels and resource attributes as none, and for access below the tenant, no
-  containers.
+  containers. For a scope the host no longer has, as a resource deleted without `DeleteScopes`, it
+  returns `rbac.ErrNotFound`, or an error wrapping it: a change that only takes access away there,
+  as a member leaving a group with access on it or `DeleteRole` deleting a role granted on it,
+  reads it as unlabeled, and any other change fails with the error.
 - **Privileged roles:** a role the catalog marks `Privileged`, or one that changes access, is
   privileged: it is never granted to the tenant's members, and gives nothing through them, as
   after a catalog change.

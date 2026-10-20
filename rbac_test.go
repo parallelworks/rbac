@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"maps"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -3784,6 +3785,143 @@ func TestRolesListingEachOtherAreDecidedOnce(t *testing.T) {
 	got, err := h.authz.Grantable(t.Context(), h.as(t, "owner"), cluster)
 	if err != nil || len(got) != len(h.authz.BuiltinRoles("cluster")) {
 		t.Fatalf("Grantable = %d roles, %v", len(got), err)
+	}
+}
+
+// What a refused grant checked on its way is forgotten, as some passed only while it was in
+// progress: a later grant in the same change resting on it is decided afresh.
+func TestARefusedGrantProvesNothingForTheNext(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	// custom.a lists custom.b, which lists it back; custom.a also gives root, which lead lacks.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles) VALUES
+		('t1', 'custom.a', '{cluster:grant,cluster:root}', '{cluster}', '{custom.b}'),
+		('t1', 'custom.b', '{cluster:grant,cluster:view}', '{cluster}', '{custom.a}'),
+		('t1', 'custom.lead', '{cluster:view,cluster:login,cluster:grant}', '{cluster}', '{}')`); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), "custom.lead", rbac.User, "lead"))
+	lead := h.as(t, "lead")
+	err := h.authz.Apply(ctx, lead, cluster, rbac.Change{Grant: []rbac.Binding{
+		{Role: "custom.a", Principal: identity("p1")}, {Role: "custom.b", Principal: identity("p2")},
+	}})
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		t.Fatalf("want both grants refused, got %v", err)
+	}
+	var refused []string
+	for _, e := range joined.Unwrap() {
+		var denied *rbac.DeniedError
+		if errors.As(e, &denied) {
+			refused = append(refused, denied.Reason)
+		}
+	}
+	if len(refused) != 2 || !strings.Contains(refused[1], "grant custom.b") {
+		t.Fatalf("granting custom.b, whose holders may grant custom.a, after custom.a was refused: %q", refused)
+	}
+}
+
+func TestManyGrantsOfARoleAreDecidedOnce(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	// Roles each listing many of the others, whose power to grant them a grant of one hands on, the
+	// last giving root too, and one for whoever may grant them all but that.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles)
+		SELECT 't1', 'custom.r' || i, '{cluster:view,cluster:login,cluster:grant}'::text[] || CASE WHEN i = 199 THEN '{cluster:root}' ELSE '{}' END::text[],
+		  '{cluster}'::text[], ARRAY(SELECT 'custom.r' || ((i + j) % 200) FROM generate_series(1, 64) j)
+		FROM generate_series(0, 199) i
+		UNION ALL SELECT 't1', 'custom.lead', '{cluster:view,cluster:login,cluster:grant}', '{cluster}', '{}'`); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), "custom.lead", rbac.User, "lead"))
+	owner, lead := h.as(t, "owner"), h.as(t, "lead")
+	checks := 0
+	rbac.SetCheckingRole(t, func() { checks++ })
+	n := 0
+	// The roles a change granting role(i) to each of count principals checks, before its transaction
+	// and in it.
+	apply := func(actor rbac.Subject, role func(i int) rbac.Role, count int) int {
+		t.Helper()
+		var c rbac.Change
+		for j := range count {
+			n++
+			c.Grant = append(c.Grant, rbac.Binding{Role: role(j), Principal: identity(fmt.Sprintf("p%d", n))})
+		}
+		checks = 0
+		if err := h.authz.Apply(ctx, actor, cluster, c); err != nil && (actor.Principal != lead.Principal || !errors.Is(err, rbac.ErrDenied)) {
+			t.Fatal(err)
+		}
+		return checks
+	}
+	const few = 10
+	first := func(int) rbac.Role { return "custom.r0" }
+	for _, tc := range []struct {
+		name  string
+		actor rbac.Subject
+		role  func(int) rbac.Role
+		many  int
+	}{
+		{"granting one role listing many", owner, first, rbac.MaxBindings},
+		// What one grant proved holds for the others: each role is checked for the first alone.
+		{"granting each role listing many", owner, func(i int) rbac.Role { return rbac.Role(fmt.Sprintf("custom.r%d", i)) }, 200},
+		// A refusal, found once all the others are checked, is found once too.
+		{"refusing a role listing many", lead, first, rbac.MaxBindings},
+	} {
+		small := apply(tc.actor, tc.role, few)
+		if small == 0 {
+			t.Fatalf("%s: no role checked", tc.name)
+		}
+		if large := apply(tc.actor, tc.role, tc.many); large > small {
+			t.Errorf("%s checked %d roles for %d principals and %d for %d", tc.name, small, few, large, tc.many)
+		}
+	}
+}
+
+// Grants of a role each ending at its own time are each decided, as what the actor holds until
+// then differs, but what each proved is kept without copying what the others did, so deciding each
+// costs about as much however many there are.
+func TestGrantsEndingApartAreDecidedInTimeAsTheyAreMany(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	// A chain of roles, each listing the next, so a grant of the first checks them all.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles)
+		SELECT 't1', 'custom.s' || i, '{cluster:view,cluster:login,cluster:grant}', '{cluster}', ARRAY['custom.s' || ((i + 1) % 100)]
+		FROM generate_series(0, 99) i`); err != nil {
+		t.Fatal(err)
+	}
+	owner := h.as(t, "owner")
+	// The checks are as many for each grant either way, so it is what keeping them takes that shows a
+	// copy for each: the heap deciding a change allocates, which copies would grow with its square.
+	var allocated uint64
+	rbac.SetDecidingGrants(t, func() func() {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		before := m.TotalAlloc
+		return func() {
+			runtime.ReadMemStats(&m)
+			allocated += m.TotalAlloc - before
+		}
+	})
+	n := 0
+	// What deciding a change granting the chain's first role to count principals, each until an hour
+	// later than the last, allocates, before its transaction and in it.
+	apply := func(count int) uint64 {
+		t.Helper()
+		var c rbac.Change
+		for j := range count {
+			n++
+			c.Grant = append(c.Grant, rbac.Binding{Role: "custom.s0", Principal: identity(fmt.Sprintf("p%d", n)), ExpiresAt: h.now.Add(time.Duration(j+1) * time.Hour)})
+		}
+		allocated = 0
+		if err := h.authz.Apply(ctx, owner, cluster, c); err != nil {
+			t.Fatal(err)
+		}
+		return allocated
+	}
+	const few = 10
+	small, large := apply(few), apply(rbac.MaxBindings)
+	if large > 3*rbac.MaxBindings/few*small {
+		t.Errorf("deciding %d grants ending apart allocated %d bytes, and %d for %d", few, small, large, rbac.MaxBindings)
 	}
 }
 

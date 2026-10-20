@@ -235,6 +235,19 @@ func (h Holding) Unsatisfied(l Label) string {
 	return ""
 }
 
+// clearsAll reports whether the holding satisfies every label of declared values: it holds each
+// value of every dimension, of an Ordered one the highest.
+func (h Holding) clearsAll() bool {
+	for dim, ld := range h.dims {
+		for v := range ld.rank {
+			if !h.satisfies(dim, []string{v}) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func (h Holding) satisfies(dim string, want []string) bool {
 	ld, ok := h.dims[dim]
 	if !ok {

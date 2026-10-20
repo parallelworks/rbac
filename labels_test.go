@@ -570,6 +570,9 @@ func TestALabelValueRevokedWhileAChangeWaitsRefusesIt(t *testing.T) {
 		"ChangeMembers lifting a deny on a labeled scope": func(ctx context.Context, h *harness, admin rbac.Subject) error {
 			return h.authz.ChangeMembers(ctx, admin, "t1", []rbac.Member{{Group: "exempt", Principal: pilot.Principal}}, nil)
 		},
+		"ChangeMembers taking away access on a labeled scope": func(ctx context.Context, h *harness, admin rbac.Subject) error {
+			return h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "ops", Principal: identity("crew")}})
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var meanwhile func(context.Context) error
@@ -603,9 +606,10 @@ func TestALabelValueRevokedWhileAChangeWaitsRefusesIt(t *testing.T) {
 			h.seed(t, grant(rbac.TenantRoot("t1"), "guard", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "admin"),
 				grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"))
 			// Groups the change to members names: one labeled, one holding a role on the labeled
-			// cluster, and one a deny there exempts.
+			// cluster, with a member, and one a deny there exempts.
 			h.groups(t, "vault", "ops", "exempt", "old")
 			h.seed(t, grant(secret.Scope(), "cluster.login", rbac.Group, "ops"))
+			h.as(t, "crew", "ops")
 			if err := h.authz.SetDeny(ctx, admin, secret, rbac.Deny{ID: "x", Principals: d.Principals, Exempt: []rbac.Principal{groupOf("exempt")}, Permissions: d.Permissions}); err != nil {
 				t.Fatal(err)
 			}

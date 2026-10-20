@@ -564,6 +564,11 @@ var (
 	// it waited, or that PostgreSQL refused for a race, as a deadlock between host transactions:
 	// try it again.
 	ErrConflict = errors.New("rbac: conflict")
+	// ErrNotFound is what Config.ResourceOf returns, or wraps, for a scope the host no longer has,
+	// as a resource deleted without DeleteScopes: a change that only takes access away there, as
+	// removing a member of a group with access on it or deleting a role granted on it, reads it as
+	// unlabeled. Any other error fails the change.
+	ErrNotFound = errors.New("rbac: not found")
 )
 
 // conflicted makes PostgreSQL's refusals for a race match ErrConflict, keeping the error: a
@@ -664,18 +669,21 @@ type Config struct {
 	ValidateGrant func(ctx context.Context, q DB, in GrantInput) error
 	Constraints   []Constraint
 	// ResourceOf returns the resource a scope is, with its ancestors, attributes and label, as the
-	// host passes it to a check. SetGroup and DeleteGroup check ManageGroups on the tenant, and
-	// ChangeMembers GroupMembers on each group it changes, on the resource it returns, and a
-	// change to a group's members as the grants and denies it amounts to on each scope the group's
-	// access is on, the tenant's and groups' included, which the package knows only by type and id,
-	// on the resource it returns for each. Without it, a scope is taken as stored, its type and id
-	// directly under the tenant, with no attributes or label, as constraints see it too. GroupMembers
-	// is checked on a group as group management checks its permissions; the grants and denies a
-	// change amounts to only where that is all of the scope: for a host declaring no Labels, and
-	// resource Attributes as none (an empty map, as nil lets conditions read any), and on a scope
-	// other than the tenant or a group, no ContainerTypes. For any other, that change is refused.
-	// SetRole changing what a custom role's grants give, and DeleteRole, check the label of each
-	// scope the role is granted on as it returns it, so with Labels declared they need it too.
+	// host passes it to a check. SetGroup and DeleteGroup check ManageGroups on the tenant, and,
+	// where Labels are declared, the group's label, a group SetGroup creates included, and
+	// ChangeMembers GroupMembers on each group it changes, on the resource it returns, and a change
+	// to a group's members as the grants and denies it amounts to, and a removal by the label, on
+	// each scope the group's access is on, the tenant's and groups' included, which the package knows
+	// only by type and id, on the resource it returns for each. Without it, a scope is taken as
+	// stored, its type and id directly under the tenant, with no attributes or label, as constraints
+	// see it too. GroupMembers is checked on a group as group management checks its permissions; the
+	// grants and denies a change amounts to only where that is all of the scope: for a host declaring
+	// no Labels, and resource Attributes as none (an empty map, as nil lets conditions read any), and
+	// on a scope other than the tenant or a group, no ContainerTypes. For any other, that change is
+	// refused. SetRole changing what a custom role's grants give, and DeleteRole, check the label of
+	// each scope the role is granted on as it returns it, so with Labels declared they need it too. A
+	// removal reads a scope it reports as ErrNotFound as unlabeled, and ChangeMembers asks nothing of
+	// the scopes only a removal reaches where the actor's label values satisfy every label.
 	ResourceOf func(ctx context.Context, tenant string, s Scope) (Resource, error)
 	// Permissions are every permission the host checks, whether or not a role gives it, so that a
 	// catalog leaving one out, as one an operator configures may, refuses it like any permission
@@ -906,20 +914,22 @@ func vocabulary(declared []Permission, given map[Permission]bool, roleTypes map[
 	return checked, types, nil
 }
 
-// WithTx returns an Authorizer that runs on tx, so its changes commit or roll back with the
-// host's own writes. Changes need tx at READ COMMITTED, PostgreSQL's default, and fail in a
-// stricter one, whose snapshot can predate the locks they wait for. Their locks last until tx
-// ends, so two transactions that change the same scopes or principals in opposite orders can
-// deadlock, as with any row locks: PostgreSQL fails one, to be retried. DeleteTenant,
-// SetRole and DeleteRole lock the whole tenant, as does a change, Import, DeleteGrants or
-// DeleteScopes that would otherwise lock more than 64 scopes and principals. Make such a call the
-// first change in tx: after another, it waits for every change in the tenant while holding locks
-// they may wait for, and PostgreSQL fails one as a deadlock. Where a label dimension is
-// Exclusive, every change takes a lock of its tenant's first, which the tenant's other changes
-// wait for, so two transactions changing two tenants in opposite orders can deadlock too.
-// Explain, Reachable and Holders read in several statements, on tx at its isolation: at READ
-// COMMITTED each reads a snapshot of its own, so a change committing between them can mix two
-// states.
+// WithTx returns an Authorizer that runs on tx, so its changes commit or roll back with the host's
+// own writes. Changes need tx at READ COMMITTED, PostgreSQL's default, and fail in a stricter one,
+// whose snapshot can predate the locks they wait for. Their locks last until tx ends, so two
+// transactions that change the same scopes or principals in opposite orders can deadlock, as with
+// any row locks: PostgreSQL fails one, to be retried. DeleteTenant, SetRole and DeleteRole lock the
+// whole tenant, as does any other call that would lock more than 64 scopes and principals: a change
+// by an actor, as Apply or ChangeMembers, and Import, DeleteGrants, DeleteScopes, SetMemberships,
+// ImportGroups, ImportMembers and DeleteMembers, and so SetDeny from 64 groups named, DeleteGroups
+// from 32 groups, which it locks as scopes and principals both, and DeleteGroup from 62 groups the
+// group is in, through those they are in, whose locks it holds. Make such a call the first change
+// in tx: after another, it waits for every change in the tenant while holding locks they may wait
+// for, and PostgreSQL fails one as a deadlock. Where a label dimension is Exclusive, every change
+// takes a lock of its tenant's first, which the tenant's other changes wait for, so two
+// transactions changing two tenants in opposite orders can deadlock too. Explain, Reachable and
+// Holders read in several statements, on tx at its isolation: at READ COMMITTED each reads a
+// snapshot of its own, so a change committing between them can mix two states.
 func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 	// One AsOf gave reads its own transaction, whose views are the past: on another, it would read
 	// the tables as they are now.

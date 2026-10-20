@@ -2805,6 +2805,34 @@ func TestEndingAMembershipSoonerIsCheckedAsLeaving(t *testing.T) {
 	}
 }
 
+func TestEndingAPlaceSoonerGrantsNothing(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "lead"), grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
+	h.join(t, "u", "v")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	// In crew around the hooks, as the host refuses an outsider any grant.
+	h.as(t, "outsider", "crew")
+	sooner := func(id string) []rbac.Member {
+		return []rbac.Member{{Group: "crew", Principal: identity(id), ExpiresAt: h.now.Add(time.Minute)}}
+	}
+	lead := h.as(t, "lead")
+	// Removing u needs no power to grant what crew holds, and neither does ending its place sooner.
+	if err := h.authz.ChangeMembers(ctx, lead, "t1", sooner("u"), nil); err != nil {
+		t.Fatalf("ending u's place sooner without the power to grant what crew holds: %v", err)
+	}
+	// Nor is the host asked about what a place ending sooner holds: it holds it already.
+	if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", sooner("outsider"), nil); err != nil {
+		t.Fatalf("ending the place of one the host refuses any grant sooner: %v", err)
+	}
+	// Joining for a while gains what crew holds.
+	if err := h.authz.ChangeMembers(ctx, lead, "t1", sooner("v"), nil); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("v joining crew for a while by one who can't grant what it holds: %v", err)
+	}
+}
+
 // A change joining someone to a group is refused when, while the host was asked about what it
 // gains, they joined it already for longer: the change ends that sooner, lifting a deny.
 func TestAJoinThatBecomesEndingSoonerMeanwhileIsTriedAgain(t *testing.T) {
@@ -2834,6 +2862,105 @@ func TestAJoinThatBecomesEndingSoonerMeanwhileIsTriedAgain(t *testing.T) {
 	add := []rbac.Member{{Group: "contractors", Principal: identity("u"), ExpiresAt: h.now.Add(time.Minute)}}
 	if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", add, nil); !errors.Is(err, rbac.ErrConflict) {
 		t.Fatalf("a join that ends a membership made meanwhile sooner: %v", err)
+	}
+}
+
+// A place ended sooner, checked as leaving its group, is refused when the place is removed while
+// the change is checked: it is a join then, gaining what the group holds.
+func TestAPlaceEndingSoonerRemovedMeanwhileIsTriedAgain(t *testing.T) {
+	var meanwhile func(ctx context.Context) error
+	h := grouped(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), guardRole)
+		c.Constraints = []rbac.Constraint{{Name: "meanwhile", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if do := meanwhile; do != nil && in.Permission == rbac.DenyPermission("cluster") {
+				meanwhile = nil
+				return false, do(ctx)
+			}
+			return false, nil
+		}}}
+	})
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "lead"), grant(cluster.Scope(), "guard", rbac.User, "lead"),
+		grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
+	h.join(t, "u")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	lead := h.as(t, "lead")
+	// Leaving crew lifts this, which lead may.
+	if err := h.authz.SetDeny(ctx, lead, cluster, rbac.Deny{ID: "d", Principals: []rbac.Principal{groupOf("crew")}, Permissions: []rbac.Permission{root}}); err != nil {
+		t.Fatal(err)
+	}
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}})
+	}
+	sooner := []rbac.Member{{Group: "crew", Principal: identity("u"), ExpiresAt: h.now.Add(time.Minute)}}
+	if err := h.authz.ChangeMembers(ctx, lead, "t1", sooner, nil); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("ending sooner a place removed meanwhile, by one who can't grant what crew holds: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("u's place should have been removed meanwhile")
+	}
+	if of, err := h.authz.GroupsOf(ctx, "t1", identity("u")); err != nil || len(of) != 0 {
+		t.Fatalf("u is in %v, %v", of, err)
+	}
+}
+
+// Without declared labels, only labels check what a member leaving loses, so a grant to its group
+// made while a removal is checked changes nothing the removal checked.
+func TestARemovalWithoutLabelsIsNotTriedAgainForAGrantMadeMeanwhile(t *testing.T) {
+	var meanwhile func(ctx context.Context) error
+	h := grouped(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), guardRole)
+		c.Constraints = []rbac.Constraint{{Name: "meanwhile", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if do := meanwhile; do != nil && in.Permission == rbac.DenyPermission("cluster") {
+				meanwhile = nil
+				return false, do(ctx)
+			}
+			return false, nil
+		}}}
+	})
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "manager"), grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
+	h.join(t, "u")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	manager := h.as(t, "manager")
+	// Leaving crew lifts this, which asks the constraints.
+	if err := h.authz.SetDeny(ctx, manager, cluster, rbac.Deny{ID: "d", Principals: []rbac.Principal{groupOf("crew")}, Permissions: []rbac.Permission{root}}); err != nil {
+		t.Fatal(err)
+	}
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.Import(ctx, host, "t1", []rbac.Grant{grant(workspace.Scope(), "workspace.admin", rbac.Group, "crew")})
+	}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", nil, []rbac.Member{{Group: "crew", Principal: identity("u")}}); err != nil {
+		t.Fatalf("a removal from a group granted elsewhere meanwhile, with no labels declared: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("crew should have been granted on the workspace meanwhile")
+	}
+}
+
+// Without declared labels, SetGroup and DeleteGroup don't ask Config.ResourceOf about the group,
+// which has no label to check, so a host that knows no group it hasn't made yet can still make one.
+func TestManagingGroupsWithoutLabelsAsksTheHostNothingOfThem(t *testing.T) {
+	h := grouped(t, func(c *rbac.Config) {
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s.Type == rbac.GroupScope {
+				return rbac.Resource{}, fmt.Errorf("the host has no group %q", s.ID)
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	groups := h.as(t, "groups")
+	if err := h.authz.SetGroup(ctx, groups, "t1", rbac.GroupDefinition{ID: "fresh"}); err != nil {
+		t.Fatalf("making a group: %v", err)
+	}
+	if err := h.authz.DeleteGroup(ctx, groups, "t1", "fresh"); err != nil {
+		t.Fatalf("deleting a group: %v", err)
 	}
 }
 
@@ -3319,6 +3446,76 @@ func TestChangingMembersOfSeveralGroupsAsksAboutWhatEachGives(t *testing.T) {
 	}
 	if len(asked) != 1 || asked[0].Binding.Principal != identity("v") {
 		t.Fatalf("asked = %+v", asked)
+	}
+}
+
+// A change to members reads the actor's authority on every scope it reaches at once, before its
+// transaction and again in it, however many there are, and asks Config.ResourceOf about each once.
+func TestChangingMembersReadsTheActorsAuthorityOnceForAllItReaches(t *testing.T) {
+	asked := 0
+	h := grouped(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), guardRole)
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			asked++
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.admin", rbac.User, "manager"), grant(rbac.TenantRoot("t1"), "guard", rbac.User, "manager"))
+	h.join(t, "u", "v")
+	reads := 0
+	rbac.SetReadingRoles(t, func() { reads++ })
+	// Joining a group granted a role on n clusters, each with a deny it is exempt from.
+	join := func(group string, n int, member string) (int, int) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_groups (tenant, id) VALUES ('t1', $1)`, group); err != nil {
+			t.Fatal(err)
+		}
+		for _, q := range []string{
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			 SELECT 't1', 'cluster', $1 || i, 'group', $1, 'cluster.login' FROM generate_series(1, $2) i`,
+			`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+			 SELECT 't1', 'cluster', $1 || i, 'd', '{members:t1}', ARRAY['group:' || $1], '{cluster:root}' FROM generate_series(1, $2) i`,
+		} {
+			if _, err := h.pool.Exec(ctx, q, group, n); err != nil {
+				t.Fatal(err)
+			}
+		}
+		reads, asked = 0, 0
+		if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", []rbac.Member{{Group: group, Principal: identity(member)}}, nil); err != nil {
+			t.Fatal(err)
+		}
+		return reads, asked
+	}
+	fewReads, fewAsked := join("few", 2, "u")
+	manyReads, manyAsked := join("many", 40, "v")
+	if manyReads != fewReads {
+		t.Errorf("joining a group on 2 clusters read the actor's grants %d times, and on 40, %d", fewReads, manyReads)
+	}
+	if fewAsked != 2+1 || manyAsked != 40+1 {
+		t.Errorf("joining a group on 2 clusters asked Config.ResourceOf %d times, and on 40, %d", fewAsked, manyAsked)
+	}
+	// So does one changing the members of many groups, on each of which it is checked.
+	joinEach := func(n int) int {
+		t.Helper()
+		var add []rbac.Member
+		var ids []string
+		for i := range n {
+			ids = append(ids, fmt.Sprintf("g%d-%d", n, i))
+			add = append(add, rbac.Member{Group: ids[i], Principal: identity("u")})
+		}
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_groups (tenant, id) SELECT 't1', unnest($1::text[])`, ids); err != nil {
+			t.Fatal(err)
+		}
+		reads = 0
+		if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", add, nil); err != nil {
+			t.Fatal(err)
+		}
+		return reads
+	}
+	if few, many := joinEach(2), joinEach(40); many != few {
+		t.Errorf("joining 2 groups read the actor's grants %d times, and 40, %d", few, many)
 	}
 }
 

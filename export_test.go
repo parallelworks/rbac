@@ -48,5 +48,22 @@ func SetReadingRoles(t *testing.T, f func()) {
 	t.Cleanup(func() { readingRoles = old })
 }
 
+// SetCheckingRole runs f each time a decision begins checking a role for a grant, until t ends.
+func SetCheckingRole(t *testing.T, f func()) {
+	t.Helper()
+	old := checkingRole
+	checkingRole = f
+	t.Cleanup(func() { checkingRole = old })
+}
+
+// SetDecidingGrants runs f as a change begins deciding its grants, and what f returns once it has,
+// until t ends.
+func SetDecidingGrants(t *testing.T, f func() func()) {
+	t.Helper()
+	old := decidingGrants
+	decidingGrants = f
+	t.Cleanup(func() { decidingGrants = old })
+}
+
 // StandSQL is the statement a change reads the standing of its principals with.
 var StandSQL = standSQL
