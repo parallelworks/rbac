@@ -461,6 +461,49 @@ func TestListingsKeepToDeniesOnTheResourceItself(t *testing.T) {
 	}
 }
 
+// Filter's condition leaves out the resources denies on thousands of them cover in about the time
+// it takes for a few: a row's own key is looked up in a hash of the denies on resources of its
+// type, and only those on containers and the tenant overlap its path. Overlapping each row with
+// every deny would cost it thousands of comparisons, and a tenant's admins can set them.
+func TestFilterLooksUpDeniesOnResourcesByEachRowsKey(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	const rows = 20000
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE fleet (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO fleet SELECT 't1', 'c' || i, ARRAY['cluster:c' || i, 'workspace:w' || (i % 50), 'org:o1', 'tenant:t1']
+		FROM generate_series(1, $1) i`, rows); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "u"))
+	u := h.as(t, "u")
+	denied := 0
+	// The time Filter's condition takes to count the rows once n of them are denied.
+	listed := func(n int) time.Duration {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+			SELECT 't1', 'cluster', 'c' || (i * 5), 'd', '{public:}', '{cluster:login}' FROM generate_series($1 + 1, $2) i`, denied, n); err != nil {
+			t.Fatal(err)
+		}
+		denied = n
+		pred, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		var kept int
+		if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM fleet WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil || kept != rows-n {
+			t.Fatalf("Filter kept %d of %d rows with %d denied, %v", kept, rows, n, err)
+		}
+		return time.Since(start)
+	}
+	few := listed(40)
+	if many := listed(4000); many > 10*few && many > 100*time.Millisecond {
+		t.Fatalf("Filter's condition took %v with 40 resources denied, and %v with 4000", few, many)
+	}
+}
+
 func TestListingContainersUnderOthersOfTheirType(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()

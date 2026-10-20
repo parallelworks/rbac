@@ -202,7 +202,9 @@ erDiagram
   only permissions and types the catalog has.
 - **A grant is one role to one principal on one scope**, from one source, until one time, under
   one condition. The key index `rbac_grants_key` holds what a check reads, so a check's read of
-  grants is an index-only scan.
+  grants is an index-only scan. The indexes by scope and by principal lead to both too, so a
+  connection's cached statement, once PostgreSQL plans it generically by the tables' averages,
+  still reads only the subject's grants on the path, whichever index it picks.
 - **Activations are grants** from the source `activation` (`SourceActivation`), made by
   `Activate` from an eligibility and ended by their expiry or `Deactivate`.
 - **Every write is recorded.** Each table above but `rbac_history` has the trigger

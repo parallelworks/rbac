@@ -230,7 +230,10 @@ var all = broad{public: true, members: true}
 // too, the keys a deny exempts it by: its keys, and its identity even where it isn't a member or
 // guest, as a grant to the public still reaches it there; and bound(k), the keys a deny binds it
 // by: those, and while its membership is suspended, the groups and the tenant's members it would
-// be in, so suspending it, which gives it only the public's grants, lifts no deny from it.
+// be in, so suspending it, which gives it only the public's grants, lifts no deny from it. The
+// groups a group is in are looked up by its key, each on its own: joined to the tenant's members, a
+// generic plan, costing them by averages, can read every one to find a few. OFFSET 0 keeps the
+// planner from flattening it into that join.
 func keysSQL(tenant, identity, now string) string {
 	return fmt.Sprintf(`membership AS (
 		SELECT guest, suspended FROM rbac_memberships WHERE tenant = %[1]s AND principal = %[2]s
@@ -239,8 +242,9 @@ func keysSQL(tenant, identity, now string) string {
 		SELECT group_id FROM rbac_members WHERE tenant = %[1]s AND principal = %[2]s
 		  AND (expires_at IS NULL OR expires_at > %[3]s) AND EXISTS (SELECT FROM membership)
 		UNION
-		SELECT m.group_id FROM rbac_members m JOIN groups g ON m.principal = 'group:' || g.id
-		WHERE m.tenant = %[1]s AND (m.expires_at IS NULL OR m.expires_at > %[3]s)
+		SELECT m.group_id FROM groups g CROSS JOIN LATERAL (
+		  SELECT group_id FROM rbac_members WHERE tenant = %[1]s AND principal = 'group:' || g.id
+		    AND (expires_at IS NULL OR expires_at > %[3]s) OFFSET 0) m
 	), keys(k) AS (
 		SELECT 'public:' COLLATE "C"
 		UNION ALL SELECT %[2]s COLLATE "C" FROM membership WHERE NOT suspended
