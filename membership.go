@@ -549,14 +549,16 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 		return err
 	}
 	// A group that doesn't exist has no label to ask the host for, and deleting it does nothing.
-	existed, err := groupExists(ctx, a.db, tenant, id)
-	if err != nil {
-		return err
-	}
-	var group Resource
-	if existed {
-		if group, err = a.groupLabeled(ctx, tenant, id, labels); err != nil {
+	// Without declared labels none is asked for, so one made meanwhile needs no new check.
+	existed, group := true, Resource{Tenant: tenant, Type: GroupScope, ID: id}
+	if len(a.labels) > 0 {
+		if existed, err = groupExists(ctx, a.db, tenant, id); err != nil {
 			return err
+		}
+		if existed {
+			if group, err = a.groupLabeled(ctx, tenant, id, labels); err != nil {
+				return err
+			}
 		}
 	}
 	return a.inTx(ctx, tenant, actor.Principal, "DeleteGroup", func(tx pgx.Tx) (ChangeEvent, error) {

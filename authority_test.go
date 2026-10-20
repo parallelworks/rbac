@@ -879,6 +879,31 @@ func TestDeletingAMissingGroupAsksTheHostNothing(t *testing.T) {
 	}
 }
 
+// Without declared labels no group's label is read, so a group made while a deletion waits for its
+// locks has nothing unchecked to try again for: it is deleted.
+func TestDeletingAGroupMadeMeanwhileWithoutLabelsDeletesIt(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	manager := h.as(t, "groups")
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := h.authz.WithTx(tx).ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "fresh"}}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- h.authz.DeleteGroup(ctx, manager, "t1", "fresh") }()
+	commitOnceWaitedOn(t, h, tx, done)
+	if err := <-done; err != nil {
+		t.Fatalf("deleting a group made while the deletion waited: %v", err)
+	}
+	if got, err := h.authz.Groups(ctx, "t1"); err != nil || slices.ContainsFunc(got, func(g rbac.GroupDefinition) bool { return g.ID == "fresh" }) {
+		t.Fatalf("Groups = %+v, %v", got, err)
+	}
+}
+
 func TestRemovingAMemberNeedsTheLabelOfWhereItsGroupsHoldAccess(t *testing.T) {
 	secret := cluster
 	secret.Labels = rbac.Label{"level": {"high"}}
