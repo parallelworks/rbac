@@ -658,3 +658,50 @@ func TestThePublicsValuesAreReadWithTheirCustomRolesAsOfOneMoment(t *testing.T) 
 		t.Fatalf("Holders = %+v: the public's values were read from two moments", holders)
 	}
 }
+
+// Holders leaves out the tenant's members or the public where their own grants could give two
+// values of a dimension the resource's label asks of: then none of them holds any, so none passes
+// the label. Where their grants give one, they are listed, as some may pass it.
+func TestHoldersLeavesOutTheBroadWhoseGrantsExcludeTheLabelsDimension(t *testing.T) {
+	root := rbac.TenantRoot("t1")
+	for _, broad := range []rbac.Principal{rbac.TenantMembers("t1"), {Kind: rbac.Public}} {
+		t.Run(string(broad.Kind), func(t *testing.T) {
+			// Stored before bank was exclusive, as a catalog change leaves them.
+			h := labeled(t, func(c *rbac.Config) {
+				banks(c)
+				c.Labels[len(c.Labels)-1].Exclusive = false
+				c.Catalog = append(c.Catalog, rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true})
+			})
+			ctx := t.Context()
+			ann := h.as(t, "ann")
+			h.seed(t, grant(root, "bank.a", broad.Kind, broad.ID), grant(root, "cluster.viewer", broad.Kind, broad.ID))
+			cfg := h.cfg
+			cfg.Labels = slices.Clone(cfg.Labels)
+			cfg.Labels[len(cfg.Labels)-1].Exclusive = true
+			authz, err := rbac.New(h.pool, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := cluster
+			a.Labels = rbac.Label{"bank": {"a"}}
+			listed := func() bool {
+				t.Helper()
+				holders, err := authz.Holders(ctx, view, a)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return slices.ContainsFunc(holders, func(x rbac.Holder) bool { return x.Principal == broad })
+			}
+			if !listed() {
+				t.Fatalf("%s, holding one value, isn't listed", broad.Kind)
+			}
+			h.seed(t, grant(root, "bank.b", broad.Kind, broad.ID))
+			if err := authz.Authorize(ctx, ann, view, a); !errors.Is(err, rbac.ErrDenied) {
+				t.Fatalf("Authorize = %v", err)
+			}
+			if listed() {
+				t.Fatalf("%s, none of whom can pass the label, is listed", broad.Kind)
+			}
+		})
+	}
+}

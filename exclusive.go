@@ -92,12 +92,20 @@ func (a *Authorizer) excludedBy(roles book, held []holding) map[string]bool {
 	return excluded
 }
 
-// broadExcludes reports whether p is a value of an exclusive dimension that the grants on a tenant
-// to a broad principal, with the public's it includes, could give two of, so no one it stands for
-// holds p.
-func (a *Authorizer) broadExcludes(ctx context.Context, tenant string, b Principal, p Permission) (bool, error) {
-	t, ok := a.exclusiveValue(p)
-	if !ok {
+// broadExcludes reports whether p is a value of an exclusive dimension, or the label l names one,
+// that the grants on a tenant to a broad principal, with the public's it includes, could give two
+// of, so no one it stands for holds p, or any value l asks of it.
+func (a *Authorizer) broadExcludes(ctx context.Context, tenant string, b Principal, p Permission, l Label) (bool, error) {
+	var dims []string
+	if t, ok := a.exclusiveValue(p); ok {
+		dims = append(dims, t)
+	}
+	for t, vs := range l {
+		if len(vs) > 0 && a.labels[t].exclusive {
+			dims = append(dims, t)
+		}
+	}
+	if len(dims) == 0 {
 		return false, nil
 	}
 	keys := []string{Principal{Kind: Public}.key()}
@@ -132,7 +140,8 @@ func (a *Authorizer) broadExcludes(ctx context.Context, tenant string, b Princip
 		return false, err
 	}
 	readingRoles()
-	return a.excludedBy(a.bookOf(a.current(custom)), held)[t], nil
+	excluded := a.excludedBy(a.bookOf(a.current(custom)), held)
+	return slices.ContainsFunc(dims, func(t string) bool { return excluded[t] }), nil
 }
 
 // Conflict is an identity able to hold two or more values of an exclusive dimension, through any
