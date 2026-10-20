@@ -1127,3 +1127,78 @@ func TestALabelValueIsHandedOnAsChecksDecideIt(t *testing.T) {
 		t.Error("bob holds level:high")
 	}
 }
+
+// A label value's conditions can't read the tenant's attributes: it is decided on the bare tenant,
+// where any read of them fails, a test of one's presence, in, size(), a macro and a comparison
+// too, so a deny guarded by one applies and a grant guarded by one's absence gives nothing,
+// whatever tenant a check passes, rather than lift or hold for what the bare tenant lacks. The
+// tenant's type and id read as ever.
+func TestALabelValuesConditionsCantReadTheTenantsAttributes(t *testing.T) {
+	h := labeled(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), tenantGuard) })
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.guard", rbac.User, "guardian"))
+	guardian := h.as(t, "guardian")
+	// Each false where the attributes are empty, so a deny under it would lift there, and a grant
+	// under its negation give.
+	frozen := []string{
+		`has(resource.attributes.frozen) && resource.attributes.frozen == true`,
+		`"frozen" in resource.attributes`,
+		`size(resource.attributes) > 0`,
+		`resource.attributes.exists(k, k == "frozen")`,
+		`resource.attributes != {}`,
+	}
+	type held struct {
+		s    rbac.Subject
+		held bool
+	}
+	var subjects []held
+	for i, expr := range frozen {
+		denied, granted := h.as(t, fmt.Sprint("denied", i)), h.as(t, fmt.Sprint("granted", i))
+		g := grant(rbac.TenantRoot("t1"), "level.high", rbac.User, granted.Principal.ID)
+		g.Condition = rbac.Condition{Expression: "!(" + expr + ")"}
+		h.seed(t, g, grant(cluster.Scope(), "cluster.login", rbac.User, denied.Principal.ID), grant(cluster.Scope(), "cluster.login", rbac.User, granted.Principal.ID))
+		h.hold(t, denied.Principal.ID, "level:high")
+		if err := h.authz.SetDeny(ctx, guardian, tenantT1, rbac.Deny{
+			ID: fmt.Sprint("frozen", i), Principals: []rbac.Principal{denied.Principal}, Permissions: []rbac.Permission{"level:high"},
+			Condition: rbac.Condition{Expression: expr},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		subjects = append(subjects, held{denied, false}, held{granted, false})
+	}
+	// One reading only the tenant's type and id holds.
+	ours := grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "ours")
+	ours.Condition = rbac.Condition{Expression: `resource.type == "tenant" && resource.id == "t1" && resource.tenant == "t1"`}
+	h.seed(t, ours, grant(cluster.Scope(), "cluster.login", rbac.User, "ours"))
+	subjects = append(subjects, held{h.as(t, "ours"), true})
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	tenants := []rbac.Resource{tenantT1, {Tenant: "t1", Type: rbac.TenantScope, ID: "t1", Attributes: map[string]any{"frozen": true}}}
+	for _, c := range subjects {
+		holding, err := h.authz.Holding(ctx, "t1", c.s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if slices.Contains(holding.Values(), "level:high") != c.held {
+			t.Errorf("%s: Holding = %v", c.s.Principal.ID, holding.Values())
+		}
+		for _, tenant := range tenants {
+			if allowed(t, h, c.s, "level:high", tenant) != c.held {
+				t.Errorf("%s: Authorize of the value on %v allows it: %v", c.s.Principal.ID, tenant.Attributes, !c.held)
+			}
+			perms, err := h.authz.Permissions(ctx, c.s, tenant)
+			if err != nil || slices.Contains(perms, "level:high") != c.held {
+				t.Errorf("%s: Permissions on %v = %v, %v", c.s.Principal.ID, tenant.Attributes, perms, err)
+			}
+		}
+		if allowed(t, h, c.s, view, secret) != c.held {
+			t.Errorf("%s: a check of the labeled cluster allows it: %v", c.s.Principal.ID, !c.held)
+		}
+	}
+	// What a deny takes from one it can't hand on either.
+	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.admin", rbac.User, "denied0"))
+	err := h.authz.Apply(ctx, subjects[0].s, tenantT1, rbac.Change{Grant: []rbac.Binding{{Role: "level.high", Principal: identity("ours")}}})
+	if !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("handing on level:high, which a deny takes: %v", err)
+	}
+}

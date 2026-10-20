@@ -323,17 +323,19 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 			}
 		}
 	}
-	// Each permission is decided as Authorize would decide it, on r as decidedOn makes it, on
-	// budgets of its own, which share what conditions came to there: one that doesn't read the
-	// action runs once for them all.
+	// Each permission is decided as Authorize would decide it, a label value or a power to release
+	// on the tenant as valueResource, on budgets of its own, which share what conditions came to on
+	// the same resource: one that doesn't read the action runs once for them all.
 	type deciding struct {
 		vars map[string]any
 		ran  map[string]run
 	}
 	resource := &deciding{a.vars(ctx, s, "", r), map[string]run{}}
 	values := resource
-	if r.Type == TenantScope && len(a.labels) > 0 && !bare(r) {
-		values = &deciding{a.vars(ctx, s, "", tenantResource(r.Tenant)), map[string]run{}}
+	if r.Type == TenantScope && len(a.labels) > 0 {
+		vars := a.vars(ctx, s, "", r)
+		vars["resource"] = valueResource(r.Tenant)
+		values = &deciding{vars, map[string]run{}}
 	}
 	on := func(p Permission) *deciding {
 		if a.labelPermission(p) {

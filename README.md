@@ -115,20 +115,21 @@ names the scopes conditional ones reach, to check one by one.
   tenant give, so groups, eligibilities, expiry, conditions, denies on the tenant and history all
   apply to them. Every check decides them, and the powers to release, on the tenant with no
   attributes or label, whatever tenant it is passed, as a check of a labeled resource reads them,
-  and a change hands one on only as the actor holds it there: a condition of theirs reads
-  `resource.type`, `.id` and `.tenant` alone, so one reading an attribute of `resource.attributes`
-  fails, a grant's giving nothing and a deny's applying, though a test of one's presence, as
-  `has()`, finds none; and a constraint is asked about that bare tenant, so one deciding them by the
-  tenant's state reads it through its `q`. `Authorize`, `Explain`, `Permissions`, `Holders` and
-  `Grantable` allow nothing else of a labeled resource unless what the subject holds satisfies the
-  label, whatever its grants give, nor do `Apply`, `SetEligibility` and `DeleteEligibility` change
-  its grants, nor `SetDeny` and `DeleteDeny` its denies, nor `SetRole` and `DeleteRole` the grants
-  of a role on it, nor `ChangeMembers` the members of a labeled group, or of one holding access or
-  exempt from a deny on a labeled scope, nor `SetGroup` and `DeleteGroup` a labeled group or the
-  groups of a labeled tenant, each reading the actor's values again under the change's locks;
-  `Explain` names the dimension that failed. `Filter` tests a `text[]` label column
-  (`Columns.Labels`), which needs no index, as the path's drives the query; `Reachable` returns the
-  holding, and `Holding` with `Satisfies` checks data points in a feed without reading the database.
+  and a change hands one on only as the actor holds it there: a condition of theirs can't read the
+  tenant's attributes, only `resource.type`, `.id` and `.tenant`, and any read of
+  `resource.attributes`, a test of an attribute's presence, `in`, `size()`, a macro or a comparison
+  included, fails, so a grant's gives nothing and a deny's applies; and a constraint is asked about
+  that bare tenant, so one deciding them by the tenant's state reads it through its `q`.
+  `Authorize`, `Explain`, `Permissions`, `Holders` and `Grantable` allow nothing else of a labeled
+  resource unless what the subject holds satisfies the label, whatever its grants give, nor do
+  `Apply`, `SetEligibility` and `DeleteEligibility` change its grants, nor `SetDeny` and
+  `DeleteDeny` its denies, nor `SetRole` and `DeleteRole` the grants of a role on it, nor
+  `ChangeMembers` the members of a labeled group, or of one holding access or exempt from a deny on
+  a labeled scope, nor `SetGroup` and `DeleteGroup` a labeled group or the groups of a labeled
+  tenant, each reading the actor's values again under the change's locks; `Explain` names the
+  dimension that failed. `Filter` tests a `text[]` label column (`Columns.Labels`), which needs no
+  index, as the path's drives the query; `Reachable` returns the holding, and `Holding` with
+  `Satisfies` checks data points in a feed without reading the database.
 - **Writing labeled data:** data read under one label is written under another only if
   `Holding.MayWrite` allows it: the writer satisfies the label it read, and the new one is at
   least as restrictive in every dimension (a level as high, every compartment kept, partners

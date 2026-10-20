@@ -525,13 +525,13 @@ flowchart TB
     two -->|yes| none(["holds none of them,<br/>Decision.Label names it"])
 ```
 
-- **Values are decided on the bare tenant.** Every check decides a label value or a power to
-  release on the tenant with no attributes or label, whatever tenant resource it is passed, as
-  `Holding` reads them for a labeled check, which can't know what tenant the host means. So a check
-  of a value and a check of a label agree, and an actor hands one on only as it holds it. A
-  condition of theirs reading a resource attribute fails, so a grant's gives nothing and a deny's
-  denies, but a test of one's presence finds none; a constraint deciding them by the tenant's state
-  reads it itself.
+- **Values are decided on the bare tenant.** Every check decides a label value or a power to release
+  on the tenant with no attributes or label, whatever tenant resource it is passed, as `Holding`
+  reads them for a labeled check, which can't know what tenant the host means. So a check of a value
+  and a check of a label agree, and an actor hands one on only as it holds it. A condition of theirs
+  can't read the tenant's attributes: any read of them fails, a test of one's presence included, so
+  a grant's gives nothing and a deny's denies, rather than hold or lift for what the bare tenant
+  lacks. A constraint deciding them by the tenant's state reads it itself, through its `q`.
 - **Releasing and writing.** `ReleasePermission(dimension)`, held on the tenant, is the power to
   release data to a looser label in that dimension, so only a holder of it can downgrade data. A
   `Holding`'s `MayWrite` and `MayRelease` say whether data read under one label may be written, or

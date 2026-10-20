@@ -535,14 +535,15 @@ type ConstraintInput struct {
 	Subject *Subject
 	// Resource is what is asked about, with its ancestors and attributes, but for a label value or a
 	// power to release on the tenant, which every check decides, and a change hands on, on the tenant
-	// with no attributes, ancestors or label, whatever it is passed, as Holding reads them: read the
-	// tenant's state through q. For what else a change hands on, it is the scope it is on, whose type
-	// is a container's or the tenant's where what it hands on reaches the resources of ResourceType
-	// under it. There, answer true if the constraint removes the permission on any of them: one that
-	// tells them apart by id or attributes sees only the scope, and would let the actor hand on what
-	// it can't use on them. It is nil in Filter and Reachable, and in SetRole and DeleteRole, which
-	// change grants on every scope of a type, but for what SetRole's role gives, asked about the
-	// tenant.
+	// with no attributes, ancestors or label, whatever it is passed, as Holding reads them, and whose
+	// conditions can't read the tenant's attributes, any read making a grant's give nothing and a
+	// deny's apply: read the tenant's state through q. For what else a change hands on, it is the
+	// scope it is on, whose type is a container's or the tenant's where what it hands on reaches the
+	// resources of ResourceType under it. There, answer true if the constraint removes the permission
+	// on any of them: one that tells them apart by id or attributes sees only the scope, and would let
+	// the actor hand on what it can't use on them. It is nil in Filter and Reachable, and in SetRole
+	// and DeleteRole, which change grants on every scope of a type, but for what SetRole's role gives,
+	// asked about the tenant.
 	Resource *Resource
 }
 

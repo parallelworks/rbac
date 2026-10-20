@@ -351,11 +351,6 @@ func (a *Authorizer) decidedOn(p Permission, r Resource) Resource {
 	return r
 }
 
-// bare reports whether r, the tenant, is as decidedOn makes it.
-func bare(r Resource) bool {
-	return len(r.Attributes) == 0 && len(r.Ancestors) == 0 && len(r.Labels) == 0
-}
-
 // holdingOn is holding read on q, asking the constraints through cs, which is on the tenant.
 func (a *Authorizer) holdingOn(ctx context.Context, q DB, s Subject, cs *constrained) (Holding, map[Permission]bool, error) {
 	tenant := cs.on.Tenant
