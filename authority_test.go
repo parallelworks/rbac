@@ -569,6 +569,98 @@ func TestEndingAPathCutsAnActivationToTheLatestLeft(t *testing.T) {
 	}
 }
 
+// Activate, and a change ending places an activation rests on, walk up from its holder on the latest
+// path to each group alone, so their walks make rows about as many as the places they walk, however
+// the groups converge and fan out again: walking on from every end, each group past a fan-out is
+// walked once for every end converging before it, and layers of a few hundred groups make millions
+// of rows, read for seconds under the change's locks. The activation lasts, and is cut short to,
+// the latest of its paths all the same.
+func TestWalkingUpLayeredGroupsWalksTheLatestPathToEachAlone(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	const n = 40
+	// u is in n groups x_i, its place in each ending a minute after the one before; each is in y,
+	// which is in n groups z_i, each in w, which is in n groups v_i, each in q. Written around the
+	// hooks, as a large tenant's are.
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'u')`, nil},
+		{`INSERT INTO rbac_groups (tenant, id) SELECT 't1', unnest(ARRAY['y', 'w', 'q'])
+		  UNION ALL SELECT 't1', l || i FROM unnest(ARRAY['x', 'z', 'v']) l, generate_series(1, $1) i`, []any{n}},
+		{`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, expires_at)
+		  SELECT 't1', 'x' || i, 'user', 'u', $2::timestamptz + i * interval '1 minute' FROM generate_series(1, $1) i`, []any{n, h.now.Add(time.Hour)}},
+		{`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+		  SELECT 't1', 'y', 'group', 'x' || i FROM generate_series(1, $1) i
+		  UNION ALL SELECT 't1', 'z' || i, 'group', 'y' FROM generate_series(1, $1) i
+		  UNION ALL SELECT 't1', 'w', 'group', 'z' || i FROM generate_series(1, $1) i
+		  UNION ALL SELECT 't1', 'v' || i, 'group', 'w' FROM generate_series(1, $1) i
+		  UNION ALL SELECT 't1', 'q', 'group', 'v' || i FROM generate_series(1, $1) i`, []any{n}},
+		{`ANALYZE rbac_members, rbac_groups, rbac_memberships`, nil},
+	} {
+		if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: groupOf("q"), MaxDuration: 8 * time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	u := rbac.Subject{Principal: identity("u")}
+	g, err := h.authz.Activate(ctx, u, cluster, rbac.Activation{Role: "cluster.sudo", Duration: time.Hour, Justification: "incident"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The rows the recursive walks of a statement make, in a transaction it rolls back.
+	type node struct {
+		Type  string  `json:"Node Type"`
+		Rows  float64 `json:"Actual Rows"`
+		Loops float64 `json:"Actual Loops"`
+		Plans []node
+	}
+	var walked func(node) float64
+	walked = func(p node) float64 {
+		var sum float64
+		if p.Type == "Recursive Union" {
+			sum = p.Rows * p.Loops
+		}
+		for _, c := range p.Plans {
+			sum += walked(c)
+		}
+		return sum
+	}
+	const places = 6 * n
+	walks := func(what, sql string, args ...any) {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		var plan []struct{ Plan node }
+		if err := tx.QueryRow(ctx, "EXPLAIN (ANALYZE, FORMAT JSON) "+sql, args...).Scan(&plan); err != nil {
+			t.Fatal(err)
+		}
+		if rows := walked(plan[0].Plan); rows > 2*places {
+			t.Errorf("%s through %d places made %.0f rows walking up", what, places, rows)
+		}
+	}
+	walks("Activate", rbac.HoldSQL, "t1", "user:u", h.now, g.ExpiresAt)
+	// u's places in the x_i end sooner, the latest in 40 minutes, which the activation is cut to.
+	var sooner []rbac.Member
+	for i := 1; i <= n; i++ {
+		sooner = append(sooner, rbac.Member{Group: fmt.Sprint("x", i), Principal: u.Principal, ExpiresAt: h.now.Add(time.Duration(i) * time.Minute)})
+	}
+	h.events = nil
+	if err := h.authz.ImportMembers(ctx, host, "t1", sooner); err != nil {
+		t.Fatal(err)
+	}
+	if e := lastEvent(t, h); len(e.Shortened) != 1 || e.Shortened[0].ID != g.ID || !e.Shortened[0].ExpiresAt.Equal(h.now.Add(n*time.Minute)) {
+		t.Fatalf("the activation isn't reported cut short to when u's latest path ends: %+v", e)
+	}
+	walks("Ending places sooner", rbac.RestsSQL, "t1", []string{g.ID}, h.now)
+}
+
 // An identity whose membership is made to end sooner, and ends, joins again in none of its groups
 // and with none of the activations it made through them.
 func TestJoiningAgainGivesBackNoActivationThroughAGroup(t *testing.T) {

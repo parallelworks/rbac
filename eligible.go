@@ -421,6 +421,33 @@ var holdingPlaces = func() func() { return func() {} }
 // of places in groups to it, each as the soonest of the membership and the places on it.
 type paths map[string]time.Time
 
+// holdSQL is holdPlaces' statement: tenant $1, the identity's key $2, now $3, until $4. A path lasts
+// as long as the soonest of the membership and the places on it, so of the paths one step up
+// reaches a group by, only the latest can lead anywhere later: each step walks on from that one
+// alone, found by a window, as a recursive query can't aggregate, and a key's latest is that of all
+// the steps reach it by. Walking on from every end instead, each group past groups that converge
+// and fan out again is walked once for every end converging before it: in layers of a few hundred
+// groups, millions of rows.
+var holdSQL = `WITH RECURSIVE ` + keysSQL("$1::text", "$2::text", "$3") + `, held AS MATERIALIZED (
+	  SELECT m.* FROM (SELECT * FROM (` + byKey("ARRAY(SELECT k FROM keys)", "rbac_members", "principal", "group_id, principal, source",
+	"tenant = $1 AND (expires_at IS NULL OR expires_at > $3)") + `) p ORDER BY ` + placeOrder + `) p CROSS JOIN LATERAL (
+	    SELECT group_id, principal, expires_at FROM rbac_members WHERE tenant = $1 AND group_id = p.group_id AND principal = p.principal
+	      AND source = p.source AND (expires_at IS NULL OR expires_at > $3) FOR SHARE) m
+	), standing AS (
+	  SELECT coalesce(expires_at, 'infinity') AS ends FROM rbac_memberships WHERE tenant = $1 AND principal = $2 AND NOT suspended
+	    AND (expires_at IS NULL OR expires_at > $4)
+	), up(id, ends, latest) AS (
+	  SELECT h.group_id, least(s.ends, h.expires_at), max(least(s.ends, h.expires_at)) OVER (PARTITION BY h.group_id) FROM standing s
+	  JOIN held h ON h.principal = $2 AND (h.expires_at IS NULL OR h.expires_at > $4)
+	  UNION
+	  SELECT h.group_id, least(u.ends, h.expires_at), max(least(u.ends, h.expires_at)) OVER (PARTITION BY h.group_id)
+	  FROM up u JOIN held h ON h.principal = 'group:' || u.id AND (h.expires_at IS NULL OR h.expires_at > $4)
+	  WHERE u.ends = u.latest
+	), reached(k, ends) AS (
+	  SELECT $2 COLLATE "C", ends FROM standing UNION ALL SELECT 'group:' || id, ends FROM up
+	)
+	SELECT k, nullif(max(ends), 'infinity') FROM reached GROUP BY k`
+
 // holdPlaces holds, in tx, until it commits, the places in groups s can rest an activation on in the
 // tenant at now, its identity's and its groups', through those they are in, each key's found on its
 // own (byKey) and each held by its key, in the order changes hold them: a change ending one sooner
@@ -432,24 +459,7 @@ type paths map[string]time.Time
 // held, so each is held before the keys are returned; where s isn't standing it reads none, and
 // activates nothing.
 func holdPlaces(ctx context.Context, tx pgx.Tx, tenant string, s Subject, now, until time.Time) (paths, error) {
-	rows, err := tx.Query(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`, held AS MATERIALIZED (
-		  SELECT m.* FROM (SELECT * FROM (`+byKey("ARRAY(SELECT k FROM keys)", "rbac_members", "principal", "group_id, principal, source",
-		"tenant = $1 AND (expires_at IS NULL OR expires_at > $3)")+`) p ORDER BY `+placeOrder+`) p CROSS JOIN LATERAL (
-		    SELECT group_id, principal, expires_at FROM rbac_members WHERE tenant = $1 AND group_id = p.group_id AND principal = p.principal
-		      AND source = p.source AND (expires_at IS NULL OR expires_at > $3) FOR SHARE) m
-		), standing AS (
-		  SELECT expires_at FROM rbac_memberships WHERE tenant = $1 AND principal = $2 AND NOT suspended
-		    AND (expires_at IS NULL OR expires_at > $4)
-		), up(id, ends) AS (
-		  SELECT h.group_id, least(s.expires_at, h.expires_at) FROM standing s
-		  JOIN held h ON h.principal = $2 AND (h.expires_at IS NULL OR h.expires_at > $4)
-		  UNION
-		  SELECT h.group_id, least(u.ends, h.expires_at) FROM up u JOIN held h ON h.principal = 'group:' || u.id
-		    AND (h.expires_at IS NULL OR h.expires_at > $4)
-		), reached(k, ends) AS (
-		  SELECT $2 COLLATE "C", expires_at FROM standing UNION ALL SELECT 'group:' || id, ends FROM up
-		)
-		SELECT k, nullif(max(coalesce(ends, 'infinity')), 'infinity') FROM reached GROUP BY k`, tenant, s.identityKey(), now, until)
+	rows, err := tx.Query(ctx, holdSQL, tenant, s.identityKey(), now, until)
 	if err != nil {
 		return nil, err
 	}
@@ -489,19 +499,22 @@ type resting struct {
 // identities holders, SQL for an array of their keys, hold in the tenant $1 at now, with when the
 // latest of the paths to each ends, null for never: its own while its membership is in force,
 // suspended too, as lifting it holds them again, and its groups', through those they are in, while
-// its places in them are. Each key's are looked up on its own (byKey, groupsAbove).
+// its places in them are. Each key's are looked up on its own (byKey, groupsAbove), and each step up
+// walks on from the latest path to each group alone, as holdSQL's do.
 func reachingSQL(holders, now string) string {
 	return fmt.Sprintf(`tenure(holder, ends) AS (
 		%[1]s
-	), placed(holder, id, ends) AS (
-		SELECT t.holder, m.group_id, least(t.ends, m.expires_at) FROM tenure t CROSS JOIN LATERAL (
-		  SELECT group_id, expires_at FROM rbac_members WHERE tenant = $1 AND principal = t.holder
+	), placed(holder, id, ends, latest) AS (
+		SELECT t.holder, m.group_id, m.ends, max(m.ends) OVER (PARTITION BY t.holder, m.group_id) FROM tenure t CROSS JOIN LATERAL (
+		  SELECT group_id, least(coalesce(t.ends, 'infinity'), expires_at) AS ends FROM rbac_members WHERE tenant = $1 AND principal = t.holder
 		    AND (expires_at IS NULL OR expires_at > %[2]s) OFFSET 0) m
 		UNION
-		SELECT p.holder, m.group_id, least(p.ends, m.expires_at) FROM placed p %[3]s
+		SELECT p.holder, m.group_id, least(p.ends, m.expires_at), max(least(p.ends, m.expires_at)) OVER (PARTITION BY p.holder, m.group_id)
+		FROM placed p %[3]s
+		WHERE p.ends = p.latest
 	), reaching(holder, k, ends) AS (
 		SELECT holder, holder, ends FROM tenure
-		UNION ALL SELECT holder, 'group:' || id, ends FROM placed
+		UNION ALL SELECT holder, 'group:' || id, nullif(ends, 'infinity') FROM placed
 	)`, byKey(holders, "rbac_memberships", "principal", "principal, expires_at", "tenant = $1 AND (expires_at IS NULL OR expires_at > "+now+")"),
 		now, groupsAbove("p.id", now, "group_id, expires_at"))
 }
@@ -528,6 +541,24 @@ func (a *Authorizer) restingOn(ctx context.Context, tx pgx.Tx, tenant string, id
 	return resting{ids: ids}, err
 }
 
+// restsSQL is unrest's statement reading the activations whose paths left end sooner than they do,
+// with the latest end of those: tenant $1, the activations' ids $2, now $3. Each by its id alone,
+// kept to the tenant's activations in force outside the lookup: beside tenant = $1 and the source,
+// a generic plan reads every activation in the tenant by the index on them, which it costs as an
+// average tenant's few. Each joined to its paths, not a subquery per activation, which scans every
+// holder's paths for each, once for each use of until.
+var restsSQL = `
+	WITH RECURSIVE act AS (
+	  SELECT g.id, g.principal, g.expires_at, g.activated_through FROM unnest($2::text[]) AS w(i) CROSS JOIN LATERAL (
+	    SELECT id, tenant, source, principal, expires_at, activated_through FROM rbac_grants WHERE id = w.i::uuid OFFSET 0) g
+	  WHERE g.tenant = $1 AND g.source = 'activation' AND g.expires_at > $3
+	), ` + reachingSQL("ARRAY(SELECT DISTINCT principal FROM act)", "$3") + `, rests(id, expires_at, until) AS (
+	  SELECT a.id, a.expires_at, max(coalesce(r.ends, 'infinity')) FILTER (WHERE r.k IS NOT NULL)
+	  FROM act a LEFT JOIN reaching r ON r.holder = a.principal AND r.k = a.activated_through
+	  GROUP BY a.id, a.expires_at
+	)
+	SELECT id::text, until FROM rests WHERE until IS NULL OR until < expires_at ORDER BY id`
+
 // unrest cuts short, in tx, as actor, the activations r found resting, once the change has ended
 // places or memberships, whose holders reach the principals they were made through until sooner
 // than they last: each to the latest end of the paths left, or ended if none is left past now,
@@ -550,22 +581,7 @@ func (a *Authorizer) unrest(ctx context.Context, tx pgx.Tx, tenant string, actor
 	if _, err := tx.Exec(ctx, lockedInOrder("rbac_grants", "", bindingOrder, "id = ANY($1::text[]::uuid[])"), r.ids); err != nil {
 		return nil, nil, err
 	}
-	// Each by its id alone, kept to the tenant's activations in force outside the lookup: beside
-	// tenant = $1 and the source, a generic plan reads every activation in the tenant by the index
-	// on them, which it costs as an average tenant's few. Each joined to its paths, not a subquery
-	// per activation, which scans every holder's paths for each, once for each use of until.
-	rows, err := tx.Query(ctx, `
-		WITH RECURSIVE act AS (
-		  SELECT g.id, g.principal, g.expires_at, g.activated_through FROM unnest($2::text[]) AS w(i) CROSS JOIN LATERAL (
-		    SELECT id, tenant, source, principal, expires_at, activated_through FROM rbac_grants WHERE id = w.i::uuid OFFSET 0) g
-		  WHERE g.tenant = $1 AND g.source = 'activation' AND g.expires_at > $3
-		), `+reachingSQL("ARRAY(SELECT DISTINCT principal FROM act)", "$3")+`, rests(id, expires_at, until) AS (
-		  SELECT a.id, a.expires_at, max(coalesce(r.ends, 'infinity')) FILTER (WHERE r.k IS NOT NULL)
-		  FROM act a LEFT JOIN reaching r ON r.holder = a.principal AND r.k = a.activated_through
-		  GROUP BY a.id, a.expires_at
-		)
-		SELECT id::text, until FROM rests WHERE until IS NULL OR until < expires_at ORDER BY id`,
-		tenant, r.ids, now)
+	rows, err := tx.Query(ctx, restsSQL, tenant, r.ids, now)
 	if err != nil {
 		return nil, nil, err
 	}
