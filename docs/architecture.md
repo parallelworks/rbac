@@ -655,7 +655,8 @@ flowchart LR
 Every input that could grow without limit is bounded, so no call's cost depends on what a tenant
 chose to store beyond these, but for the lists, which read what they list: `Filter` reads the
 subject's grants on the scopes that can reach the listed type and the denies on them, and costs each
-row a few lookups among them however many there are.
+row a few lookups among them however many there are. The tables hold rows only within the same
+bounds, so a role that writes around the package can store no row larger than the package writes.
 
 | Bound | Value | What it limits |
 |---|---|---|
@@ -663,7 +664,7 @@ row a few lookups among them however many there are.
 | `MaxBindings` | 1,000 | Bindings in one `Apply`, and the grants, memberships, groups or members one `Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`, `DeleteGroups`, `ImportMembers`, `ChangeMembers` or `DeleteMembers` takes. |
 | `MaxGrantsPerRole` | 20 | Grants in force of one role to one principal on one scope, differing by source, expiry or condition. Those from each source the host owns count apart. |
 | `MaxDenies`, `MaxDenyEntries` | 100, 256 | Denies on a scope, and the principals, exemptions or permissions one names. |
-| `MaxCustomRoles`, `MaxGrantableRoles` | 300, 64 | Custom roles in a tenant, and roles one lists in `GrantableRoles`. |
+| `MaxCustomRoles`, `MaxRoleEntries`, `MaxGrantableRoles` | 300, 1,000, 64 | Custom roles in a tenant, the permissions one gives and the types it is for, and roles one lists in `GrantableRoles`. |
 | `MaxApprovers`, `MaxActivation` | 16, 366 days | An eligibility's approvers, and its longest activation. |
 | `MaxGroupDepth` | 8 | How deeply groups nest. |
 | `MaxPlacesInGroup` | 20 | Places in force of one principal in one group, each from another source. Those from each source the host owns count apart. |

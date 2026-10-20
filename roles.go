@@ -202,6 +202,9 @@ func (a *Authorizer) checkCustom(r RoleDefinition) error {
 			errs = append(errs, fmt.Errorf("resource type %q is not one any built-in role is for", t))
 		}
 	}
+	if len(r.Permissions) > MaxRoleEntries || len(r.ResourceTypes) > MaxRoleEntries {
+		errs = append(errs, fmt.Errorf("gives more than %d permissions or is for more than %d resource types", MaxRoleEntries, MaxRoleEntries))
+	}
 	if len(r.GrantableRoles) > MaxGrantableRoles {
 		errs = append(errs, fmt.Errorf("lists more than %d grantable roles", MaxGrantableRoles))
 	}

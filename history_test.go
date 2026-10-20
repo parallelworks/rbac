@@ -519,6 +519,204 @@ func TestNoExpiryIsInfinite(t *testing.T) {
 	}
 }
 
+// longestNames are n names of the longest a type or verb is, 63 characters, each prefix and a
+// number.
+func longestNames(prefix string, n int) []string {
+	names := make([]string, n)
+	for i := range names {
+		names[i] = fmt.Sprintf("%s%0*d", prefix, 63-len(prefix), i)
+	}
+	return names
+}
+
+// longestPermissions are n permissions of the longest names, on longestNames("t", n).
+func longestPermissions(n int) []string {
+	ps := longestNames("t", n)
+	for i := range ps {
+		ps[i] += ":v" + strings.Repeat("x", 62)
+	}
+	return ps
+}
+
+// longestKeys are n keys of kind of the longest ids, MaxID characters.
+func longestKeys(kind string, n int) []string {
+	keys := make([]string, n)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("%s:%0*d", kind, rbac.MaxID, i)
+	}
+	return keys
+}
+
+// The tables refuse what the package never writes, as a role that may write them can try: an id of
+// more than MaxID bytes, an actor's key that is no key, a role that is no role's id, and a list past
+// its bound or holding what is no element of it. Unbounded, one row a hundred megabytes long, built
+// on the server, was recorded as JSON no read of history could return, and every export stopped
+// there.
+func TestTheTablesRefuseWhatThePackageNeverWrites(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.groups(t, "g")
+	rows := map[string]map[string]any{
+		"rbac_grants": {"tenant": "t1", "scope_type": "cluster", "scope_id": "c1", "principal_kind": "user", "principal_id": "u", "role": "cluster.login"},
+		"rbac_roles":  {"tenant": "t1", "id": "custom.r", "permissions": []string{"cluster:view"}, "resource_types": []string{"cluster"}},
+		"rbac_denies": {"tenant": "t1", "scope_type": "cluster", "scope_id": "c1", "id": "d", "principals": []string{"public:"}, "permissions": []string{"cluster:login"}},
+		"rbac_eligibilities": {
+			"tenant": "t1", "scope_type": "cluster", "scope_id": "c1", "principal_kind": "user", "principal_id": "u",
+			"role": "cluster.sudo", "max_seconds": 60,
+		},
+		"rbac_memberships": {"tenant": "t1", "principal_kind": "user", "principal_id": "u"},
+		"rbac_groups":      {"tenant": "t1", "id": "g2"},
+		"rbac_members":     {"tenant": "t1", "group_id": "g", "principal_kind": "user", "principal_id": "u"},
+	}
+	// Each in a transaction of its own, rolled back, so none stands in another's way.
+	insert := func(table, column string, v any) error {
+		row := maps.Clone(rows[table])
+		row[column] = v
+		columns := slices.Sorted(maps.Keys(row))
+		params, args := make([]string, len(columns)), make([]any, len(columns))
+		for i, c := range columns {
+			params[i], args[i] = fmt.Sprintf("$%d", i+1), row[c]
+		}
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		_, err = tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (%s) VALUES (%s)`, table, strings.Join(columns, ", "), strings.Join(params, ", ")), args...)
+		return err
+	}
+	type bound struct {
+		table, column string
+		ok, bad       []any
+	}
+	var bounds []bound
+	// MaxID bytes, of characters of two bytes each.
+	id := strings.Repeat("é", rbac.MaxID/2)
+	for _, table := range []string{"rbac_grants", "rbac_roles", "rbac_denies", "rbac_eligibilities", "rbac_memberships", "rbac_groups"} {
+		bounds = append(bounds, bound{table, "tenant", []any{id}, []any{id + "x"}})
+	}
+	for _, c := range [][2]string{
+		{"rbac_grants", "scope_id"},
+		{"rbac_denies", "scope_id"},
+		{"rbac_eligibilities", "scope_id"},
+		{"rbac_grants", "principal_id"},
+		{"rbac_eligibilities", "principal_id"},
+		{"rbac_memberships", "principal_id"},
+		{"rbac_members", "principal_id"},
+	} {
+		bounds = append(bounds, bound{c[0], c[1], []any{id}, []any{id + "x"}})
+	}
+	kind := "k" + strings.Repeat("x", 62)
+	actors := []any{"", "user:" + id, kind + ":" + id, "user:a:b"}
+	notActors := []any{"user:" + id + "x", "user", "user:", ":u", "User:u", "user\n:u", strings.Repeat("\x01", 600)}
+	for _, c := range [][2]string{
+		{"rbac_grants", "approved_by"},
+		{"rbac_grants", "created_by"},
+		{"rbac_grants", "updated_by"},
+		{"rbac_roles", "updated_by"},
+		{"rbac_denies", "created_by"},
+		{"rbac_denies", "updated_by"},
+		{"rbac_eligibilities", "created_by"},
+		{"rbac_memberships", "created_by"},
+		{"rbac_memberships", "updated_by"},
+		{"rbac_groups", "created_by"},
+		{"rbac_groups", "updated_by"},
+		{"rbac_members", "created_by"},
+		{"rbac_members", "updated_by"},
+	} {
+		bounds = append(bounds, bound{c[0], c[1], actors, notActors})
+	}
+	roles := []any{"c" + strings.Repeat("x", 127), "custom.x"}
+	notRoles := []any{"c" + strings.Repeat("x", 128), "Cluster.login", "", "1x", "cluster login"}
+	bounds = append(bounds, bound{"rbac_grants", "role", roles, notRoles}, bound{"rbac_eligibilities", "role", roles, notRoles})
+	null := func(ss ...string) []*string {
+		out := make([]*string, len(ss)+1)
+		for i := range ss {
+			out[i] = &ss[i]
+		}
+		return out
+	}
+	grantable := longestNames("r", rbac.MaxGrantableRoles+1)
+	for i := range grantable {
+		grantable[i] += strings.Repeat("x", 65)
+	}
+	keys := []any{longestKeys("user", rbac.MaxDenyEntries), []string{"public:", "members:t1", "user:" + id, "group:a:b\nc"}}
+	notKeys := func(n int) []any {
+		return []any{longestKeys("user", n+1), []string{"user:" + strings.Repeat("x", rbac.MaxID+1)}, []string{"user"}, []string{"User:u"}, null("public:")}
+	}
+	bounds = append(bounds,
+		bound{
+			"rbac_roles", "permissions",
+			[]any{longestPermissions(rbac.MaxRoleEntries)},
+			[]any{longestPermissions(rbac.MaxRoleEntries + 1), []string{"cluster"}, []string{"cluster:View"}, null("cluster:view")},
+		},
+		bound{
+			"rbac_roles", "resource_types",
+			[]any{longestNames("t", rbac.MaxRoleEntries)},
+			[]any{longestNames("t", rbac.MaxRoleEntries+1), []string{"Cluster"}, []string{"t" + strings.Repeat("x", 63)}, null("cluster")},
+		},
+		bound{
+			"rbac_roles", "grantable_roles",
+			[]any{[]string{}, grantable[:rbac.MaxGrantableRoles]},
+			[]any{grantable, []string{"custom.X"}, null()},
+		},
+		bound{"rbac_denies", "principals", keys, notKeys(rbac.MaxDenyEntries)},
+		bound{"rbac_denies", "exempt", append([]any{[]string{}}, keys...), notKeys(rbac.MaxDenyEntries)},
+		bound{"rbac_eligibilities", "approvers", []any{[]string{}, longestKeys("group", rbac.MaxApprovers)}, notKeys(rbac.MaxApprovers)},
+	)
+	for _, b := range bounds {
+		for i, v := range b.ok {
+			if err := insert(b.table, b.column, v); err != nil {
+				t.Errorf("%s.%s, value %d the package can write: %v", b.table, b.column, i, err)
+			}
+		}
+		for i, v := range b.bad {
+			if pgErr := (*pgconn.PgError)(nil); !errors.As(insert(b.table, b.column, v), &pgErr) || pgErr.Code != "23514" {
+				t.Errorf("%s.%s, value %d the package never writes: stored", b.table, b.column, i)
+			}
+		}
+	}
+}
+
+// A row written around the package that the tables refuse now, as one migrating finds, stops it,
+// with a message that names the check and a query that finds the row; deleted, migrating goes on. A
+// check left unchecked before, as 0012's, stays so, whatever the rows hold.
+func TestMigratingNamesARowTheTablesRefuse(t *testing.T) {
+	pool := pgtest.Open(t, "")
+	ctx := t.Context()
+	migrateFiles(t, pool, "", "0013")
+	for _, sql := range []string{
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, note)
+		 VALUES ('t1', 'cluster', 'c1', 'user', 'kept', 'cluster.login', 'unchecked')`,
+		`ALTER TABLE rbac_grants ADD CONSTRAINT rbac_grants_host_check CHECK (note <> 'unchecked') NOT VALID`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, created_by)
+		 VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'cluster.login', repeat(chr(1), 600))`,
+	} {
+		if _, err := pool.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := applyMigrations(ctx, pool, pgx.ReadCommitted, "0013", "")
+	_, query, found := strings.Cut(fmt.Sprint(err), "find it with ")
+	query, _, _ = strings.Cut(query, ", correct or delete it")
+	if !found || !strings.Contains(fmt.Sprint(err), "rbac_grants_created_by_check") {
+		t.Fatalf("migrating past a row the package never wrote: %v", err)
+	}
+	var principal string
+	if err := pool.QueryRow(ctx, strings.Replace(query, "SELECT *", "SELECT principal", 1)).Scan(&principal); err != nil || principal != "user:u" {
+		t.Fatalf("%s found %q, %v", query, principal, err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM rbac_grants WHERE principal = 'user:u'`); err != nil {
+		t.Fatal(err)
+	}
+	migrateFiles(t, pool, "0013", "")
+	var checked bool
+	if err := pool.QueryRow(ctx, `SELECT convalidated FROM pg_constraint WHERE conrelid = 'rbac_grants'::regclass
+		AND conname = 'rbac_grants_host_check'`).Scan(&checked); err != nil || checked {
+		t.Fatalf("a check left unchecked: checked %t, %v", checked, err)
+	}
+}
+
 // migrateFiles applies the migrations named from from up to to, or past the last when to is empty,
 // as a host's own migration tool would: each once, in order, in a transaction of its own.
 func migrateFiles(t *testing.T, pool *pgxpool.Pool, from, to string) {
@@ -1110,7 +1308,8 @@ func TestMigratingRecordsNoPrincipalPastTheBound(t *testing.T) {
 			}
 		}
 	}
-	migrateFiles(t, pool, "0012", "")
+	// 0012 alone: 0013 refuses an id past the bound.
+	migrateFiles(t, pool, "0012", "0013")
 	for id, want := range map[string]string{long: "none", longest: "user:" + longest} {
 		var through string
 		if err := pool.QueryRow(ctx, `SELECT coalesce(activated_through, 'none') FROM rbac_grants WHERE principal_id = $1`, id).Scan(&through); err != nil ||

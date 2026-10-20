@@ -604,9 +604,11 @@ const (
 	// exemptions or permissions one names.
 	MaxDenies      = 100
 	MaxDenyEntries = 256
-	// MaxCustomRoles is how many custom roles a tenant has, and MaxGrantableRoles how many roles one
-	// role lists.
+	// MaxCustomRoles is how many custom roles a tenant has, MaxRoleEntries how many permissions one
+	// gives and how many resource types it is for, and MaxGrantableRoles how many roles one role
+	// lists.
 	MaxCustomRoles    = 300
+	MaxRoleEntries    = 1000
 	MaxGrantableRoles = 64
 	// MaxApprovers is how many approvers an eligibility names.
 	MaxApprovers = 16

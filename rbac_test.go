@@ -4386,6 +4386,38 @@ func TestCustomRoles(t *testing.T) {
 	}
 }
 
+// A custom role gives at most MaxRoleEntries permissions and is for at most as many types, as the
+// table holds, however many the catalog has: past either, defining one is invalid, not a failure of
+// the database.
+func TestACustomRoleListsAtMostMaxRoleEntries(t *testing.T) {
+	var perms []rbac.Permission
+	for _, p := range longestPermissions(rbac.MaxRoleEntries + 1) {
+		perms = append(perms, rbac.Permission(p))
+	}
+	types := longestNames("t", rbac.MaxRoleEntries+1)
+	wide := rbac.RoleDefinition{ID: "wide", Permissions: perms, ResourceTypes: types}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), wide) })
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.roles", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), wide.ID, rbac.User, "admin"))
+	admin := h.as(t, "admin")
+	for _, r := range []rbac.RoleDefinition{
+		{ID: "custom.many", Permissions: perms, ResourceTypes: types[:1]},
+		{ID: "custom.many", Permissions: perms[:1], ResourceTypes: types},
+	} {
+		if err := h.authz.SetRole(ctx, admin, "t1", r); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("a role of %d permissions for %d types: %v", len(r.Permissions), len(r.ResourceTypes), err)
+		}
+	}
+	for _, r := range []rbac.RoleDefinition{
+		{ID: "custom.many", Permissions: perms[:rbac.MaxRoleEntries], ResourceTypes: types[:1]},
+		{ID: "custom.many", Permissions: perms[:1], ResourceTypes: types[:rbac.MaxRoleEntries]},
+	} {
+		if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
+			t.Errorf("a role of %d permissions for %d types: %v", len(r.Permissions), len(r.ResourceTypes), err)
+		}
+	}
+}
+
 func TestDefiningARoleChecksTheActor(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
