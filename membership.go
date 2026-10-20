@@ -1308,7 +1308,8 @@ type reach struct {
 	// would: they leave the group then, as removing them does now.
 	ending map[string]bool
 	// leaves is those of them and of the members removed, by memberKey, that leave their group: a
-	// place in force ends, and no other of theirs there, from another source, keeps them in it.
+	// place in force ends, and no other of theirs there, from another source, keeps them in it as
+	// long as it would have.
 	leaves map[string]bool
 	// labeled is whether the host declares labels, which alone check what a member leaving loses:
 	// without them, a grant made to its group meanwhile changes nothing the change checked.
@@ -1474,8 +1475,8 @@ func (r reach) nested(add []Member) map[string]map[string]bool {
 // placesLeft reads, on q, the places in force in their groups of the principals add and remove
 // name, and returns, by memberKey, those of add that end a place sooner than it would end
 // (reach.ending), and those of them and of remove that leave their group (reach.leaves): whose
-// place in force ends, and that keep no other there, from another source, past its end, as the
-// change leaves the others.
+// place in force ends, and that keep no other there, from another source, as long as that place
+// would have lasted, as the change leaves the others.
 func (a *Authorizer) placesLeft(ctx context.Context, q DB, tenant string, add, remove []Member) (ending, leaves map[string]bool, err error) {
 	type pair struct{ group, principal string }
 	pairOf := func(m Member) pair { return pair{m.Group, m.Principal.key()} }
@@ -1535,10 +1536,11 @@ func (a *Authorizer) placesLeft(ctx context.Context, q DB, tenant string, add, r
 	for _, m := range remove {
 		delete(places[pairOf(m)], m.Source)
 	}
-	// keeps reports whether another of m's places keeps it in its group past until.
+	// keeps reports whether another of m's places keeps it in its group until until, zero for never:
+	// as long as the place the change ends sooner would have, so its member's time there is as it was.
 	keeps := func(m Member, until time.Time) bool {
 		for source, end := range places[pairOf(m)] {
-			if source != m.Source && (end.IsZero() || end.After(until)) {
+			if source != m.Source && (end.IsZero() || !until.IsZero() && !end.Before(until)) {
 				return true
 			}
 		}
@@ -1551,12 +1553,12 @@ func (a *Authorizer) placesLeft(ctx context.Context, q DB, tenant string, add, r
 			continue
 		}
 		ending[memberKey(m)] = true
-		if !keeps(m, m.ExpiresAt) {
+		if !keeps(m, was) {
 			leaves[memberKey(m)] = true
 		}
 	}
 	for _, m := range remove {
-		if _, ok := stored[pairOf(m)][m.Source]; ok && !keeps(m, now) {
+		if was, ok := stored[pairOf(m)][m.Source]; ok && !keeps(m, was) {
 			leaves[memberKey(m)] = true
 		}
 	}

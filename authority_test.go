@@ -1050,6 +1050,48 @@ func TestRemovingOneOfAMembersPlacesChecksNothing(t *testing.T) {
 	}
 }
 
+// A member is in its group until its last place there ends, so removing the place that outlasts its
+// others, or ending it sooner, takes it out sooner: it leaves, as by its last place.
+func TestRemovingThePlaceThatOutlastsAMembersOthersIsLeaving(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	h := labeled(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s == secret.Scope() {
+				return secret, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"), grant(secret.Scope(), "cluster.login", rbac.Group, "crew"))
+	h.join(t, "u", "v", "w")
+	soon, later := h.now.Add(time.Minute), h.now.Add(time.Hour)
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{
+		{Group: "crew", Principal: identity("u")},
+		{Group: "crew", Principal: identity("u"), Source: "dir", ExpiresAt: later},
+		{Group: "crew", Principal: identity("v")},
+		{Group: "crew", Principal: identity("v"), Source: "dir", ExpiresAt: later},
+		{Group: "crew", Principal: identity("w"), ExpiresAt: later},
+		{Group: "crew", Principal: identity("w"), Source: "dir", ExpiresAt: later},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	admin := h.as(t, "admin")
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "crew", Principal: identity("u")}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("removing u's place for good, leaving one that ends in an hour: %v", err)
+	}
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", []rbac.Member{{Group: "crew", Principal: identity("v"), ExpiresAt: soon}}, nil); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("ending v's place for good sooner than its other: %v", err)
+	}
+	// Another place lasting as long keeps it in the group as long as before.
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "crew", Principal: identity("w")}}); err != nil {
+		t.Errorf("removing one of w's two places ending at once: %v", err)
+	}
+}
+
 // A scope the host reports it no longer has, as one it deleted without DeleteScopes, has no label
 // to refuse taking access away there, so a removal or deleting a role reads it as unlabeled; any
 // other error of the host's still fails the change.
