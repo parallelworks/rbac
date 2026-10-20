@@ -8,6 +8,7 @@ import (
 	"maps"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -404,9 +405,16 @@ func (a *Authorizer) changing(actor Subject, on Resource, cs *constrained) error
 // session's statements reach them: another application's grants are in a schema of their own. Not
 // current_schema(), the first in the search_path that exists, which two sessions reaching the same
 // tables through paths that differ before it name apart, so their changes would never wait for
-// each other.
-const lockKey = `hashtextextended((SELECT n.nspname FROM pg_catalog.pg_class c
+// each other. The schema and the tenant go first with their lengths, as each may hold '/', so the
+// keys of two never meet (lockName).
+const lockKey = `hashtextextended((SELECT pg_catalog.length(n.nspname) || ':' || n.nspname FROM pg_catalog.pg_class c
 	JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = 'rbac_grants'::regclass) || '/rbac/' || $1, 0)`
+
+// lockName is the name lockKey hashes of a tenant's lock of a kind on key, empty for the tenant's
+// own.
+func lockName(kind, tenant, key string) string {
+	return kind + "/" + strconv.Itoa(len(tenant)) + ":" + tenant + "/" + key
+}
 
 // maxLocks is how many scopes and principals a change locks one by one; a larger one locks the
 // tenant, rather than fill PostgreSQL's lock table, which every session shares.
@@ -415,12 +423,12 @@ const maxLocks = 64
 func lock(ctx context.Context, tx pgx.Tx, tenant string, scopes, principals []string) error {
 	b := &pgx.Batch{}
 	b.Queue(`SELECT current_setting('transaction_isolation')`)
-	b.Queue(`SELECT pg_advisory_xact_lock_shared(`+lockKey+`)`, "tenant/"+tenant)
+	b.Queue(`SELECT pg_advisory_xact_lock_shared(`+lockKey+`)`, lockName("tenant", tenant, ""))
 	for _, s := range slices.Compact(slices.Sorted(slices.Values(scopes))) {
-		b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, "scope/"+tenant+"/"+s)
+		b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, lockName("scope", tenant, s))
 	}
 	for _, p := range slices.Compact(slices.Sorted(slices.Values(principals))) {
-		b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, "principal/"+tenant+"/"+p)
+		b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, lockName("principal", tenant, p))
 	}
 	return locked(tx.SendBatch(ctx, b))
 }
@@ -436,7 +444,7 @@ func lockAll(ctx context.Context, tx pgx.Tx, tenant string, scopes, principals [
 func lockTenant(ctx context.Context, tx pgx.Tx, tenant string) error {
 	b := &pgx.Batch{}
 	b.Queue(`SELECT current_setting('transaction_isolation')`)
-	b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, "tenant/"+tenant)
+	b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, lockName("tenant", tenant, ""))
 	return locked(tx.SendBatch(ctx, b))
 }
 

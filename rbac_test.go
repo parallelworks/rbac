@@ -2519,6 +2519,34 @@ func TestAPrincipalHoldsARoleABoundedNumberOfTimes(t *testing.T) {
 	}
 }
 
+// The locks of two tenants never meet, though an id may hold '/': a change in one never waits for
+// a change in another.
+func TestChangesInTwoTenantsNeverShareALock(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// In tenant acme, the lock of user x/group:g, which joined its tenant's and its id would name
+	// tenant acme/user:x's lock of group g.
+	if err := h.authz.WithTx(tx).SetMemberships(ctx, host, "acme", []rbac.Membership{{Principal: identity("x/group:g")}}); err != nil {
+		t.Fatal(err)
+	}
+	other, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = other.Rollback(ctx) }()
+	if _, err := other.Exec(ctx, `SET LOCAL lock_timeout = '1s'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.WithTx(other).DeletePrincipal(ctx, host, "acme/user:x", groupOf("g")); err != nil {
+		t.Errorf("a change in tenant acme/user:x waited for one in tenant acme: %v", err)
+	}
+}
+
 // A change reaching the tables through a search_path that names another schema first takes the
 // same locks as one that names theirs alone, so it waits for them: two imports that each fill half
 // the bound on a role's grants can't both commit past it.

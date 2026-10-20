@@ -557,10 +557,11 @@ flowchart TB
 
 Changes take PostgreSQL advisory locks, keyed by the schema holding the tables, as every session
 reaching them names it whatever its search_path, so two changes to the same rows run
-one after the other, each taking its locks in one order. The locks last until the transaction
-ends, so under `WithTx` two host transactions changing the same scopes or principals in opposite
-orders can still deadlock, as can a change that also writes rows it doesn't lock: PostgreSQL fails
-one, which matches `ErrConflict`.
+one after the other, each taking its locks in one order. A key gives the schema and the tenant
+each with its length, as either may hold `/`, so the locks of two tenants never meet. The locks
+last until the transaction ends, so under `WithTx` two host transactions changing the same scopes
+or principals in opposite orders can still deadlock, as can a change that also writes rows it
+doesn't lock: PostgreSQL fails one, which matches `ErrConflict`.
 
 ```mermaid
 flowchart TB

@@ -26,7 +26,7 @@ func (a *Authorizer) exclusive() bool {
 func lockExclusive(ctx context.Context, tx pgx.Tx, tenant string) error {
 	b := &pgx.Batch{}
 	b.Queue(`SELECT current_setting('transaction_isolation')`)
-	b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, "exclusive/"+tenant)
+	b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, lockName("exclusive", tenant, ""))
 	return locked(tx.SendBatch(ctx, b))
 }
 
