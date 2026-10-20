@@ -463,6 +463,12 @@ sequenceDiagram
   keys it finds its subject eligible through, so the two wait for each other, and a place nested
   between them makes no one eligible. Setting the eligibility again or deleting it leaves its
   activations to their own ends, or to their holders leaving its group.
+- **Approvals.** Approving decides access on the scope, so on a labeled one an approval counts
+  only from an approver whose own label values satisfy the label: read before the transaction and
+  again under its locks, with the constraints' answers on them sealed, as an actor's are, and
+  without the request, which is the activator's, so a value held under a condition on the
+  request's attributes counts for nothing. `SetEligibility` doesn't check the approvers it names,
+  whose values, and their groups' members, change after it: `Activate` checks the one approving.
 - **Activations stored before migration 0012** record what migrating found: the one eligibility
   for their role on their scope whose principal their holder reached then, or, where it reached
   several or none, nothing. The first change re-checking one that records nothing ends it, as which
