@@ -1029,14 +1029,17 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 		denied = slices.DeleteFunc(denied, func(t string) bool { return t == resourceType })
 		deniedByKey = fmt.Sprintf(`NOT (%s)[1] COLLATE "default" IN (%s) AND `, cols.Path, denies("d.scope_type = "+arg(9)+"::text"))
 	}
-	resources, containers, err := a.manyGrants(ctx, tenant, s, counts, resourceType)
+	resources, containers, err := a.grantCounts(ctx, tenant, s, p, roles, custom, counts, resourceType)
 	if err != nil {
 		return Predicate{}, err
 	}
 	switch {
-	case containers:
+	// Past a few on resources of the type no index serves the condition, so the overlap would
+	// compare every row of the tenant with each grant on containers: past a few of those too, each
+	// key is looked up.
+	case containers > maxContainerOverlap || resources > maxOverlap && containers > maxOverlap:
 		reached = keyed(cols.Path, grants(arg(5)))
-	case resources:
+	case resources > maxOverlap:
 		above = denied
 		reached = fmt.Sprintf(`((%[1]s)[1] COLLATE "default" IN (%[3]s) OR %[1]s && %[2]s AND %[1]s && (%[2]s COLLATE "default"))`,
 			cols.Path, overlap, grants("ARRAY["+arg(9)+"::text]"))
@@ -1115,25 +1118,27 @@ func keyed(col, scopes string) string {
 const maxOverlap = 8
 
 // maxContainerOverlap is how many grants on containers and the tenant Filter overlaps with each
-// row's path. The host's index finds the rows under them, merging what each finds, which costs each
-// row it finds a comparison for every one: about where that costs as much as reading a row and
-// looking up its keys. A test lowers it.
+// row's path where the host's index serves the overlap; where none does, it is maxOverlap. The
+// index finds the rows under them, merging what each finds, which costs each row it finds a
+// comparison for every one: about where that costs as much as reading a row and looking up its
+// keys. A test lowers it.
 var maxContainerOverlap = 128
 
-// manyGrants reports whether s's principals hold more than maxOverlap unconditional grants in force
-// on resources of a type, and whether more than maxContainerOverlap on the containers, a container
-// type's own among them, and the tenant, of any role, counting broad ones as counts says: it only
-// picks the form of Filter's condition.
-func (a *Authorizer) manyGrants(ctx context.Context, tenant string, s Subject, counts broad, resourceType string) (bool, bool, error) {
-	var resources, containers int
-	err := a.db.QueryRow(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$5")+`
+// grantCounts counts s's principals' unconditional grants in force on resources of a type, and on
+// the containers, a container type's own among them, and the tenant, of the roles that give p on
+// the type, the built-in ones in roles and with custom the tenant's, counting broad ones as counts
+// says, of each type only until they pass maxContainerOverlap: it only picks the form of Filter's
+// condition. Grants of other roles aren't in the condition, and counted they would trade an index
+// that finds the few rows its grants reach for a read of every row of the tenant.
+func (a *Authorizer) grantCounts(ctx context.Context, tenant string, s Subject, p Permission, roles []string, custom bool, counts broad, resourceType string) (resources, containers int, err error) {
+	err = a.db.QueryRow(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$5")+`
 		SELECT coalesce(sum(n) FILTER (WHERE t = $3 AND NOT $4), 0)::int, coalesce(sum(n) FILTER (WHERE t <> $3 OR $4), 0)::int
 		FROM unnest($6::text[]) AS t(t) CROSS JOIN LATERAL (SELECT count(*) AS n FROM (SELECT FROM rbac_grants
 		  WHERE tenant = $1 AND principal = ANY(ARRAY(`+countedKeys("$8", "$9")+`)) AND `+ofType("scope", "t.t")+` AND NOT conditional
-		    AND (expires_at IS NULL OR expires_at > $5) LIMIT $7) g) g`,
+		    AND (expires_at IS NULL OR expires_at > $5) AND role = ANY(`+givingSQL("$10", "$1", "$11", "$3", custom, "")+`) LIMIT $7) g) g`,
 		tenant, s.identityKey(), resourceType, a.contains(resourceType), a.cfg.Now(), a.reaching(resourceType), maxContainerOverlap+1,
-		counts.public, counts.members).Scan(&resources, &containers)
-	return resources > maxOverlap, containers > maxContainerOverlap, err
+		counts.public, counts.members, roles, string(p)).Scan(&resources, &containers)
+	return resources, containers, err
 }
 
 // holding is a grant as a check reads it from the key index: whether it has a condition, not

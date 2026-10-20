@@ -432,10 +432,11 @@ flowchart LR
   refuse. The subject's grants are matched through the path's GIN index, which merges the rows each
   finds, so its cost for each row grows with their number. Past a few on resources of the listed
   type, each row's own key is looked up in a hash of them, and past 128 on containers and the tenant,
-  each of its keys in one object of them all, so one with a grant on everything it created costs a
-  row a few lookups; no index serves that, so the query reads every row of the tenant its other
-  conditions keep. Denies are looked up so whatever their number: those on resources of the type by
-  the row's own key, and those on containers and the tenant by each of its keys.
+  or past a few alongside those, each of its keys in one object of them all, so one with a grant on
+  everything it created costs a row a few lookups; no index serves that, so the query reads every
+  row of the tenant its other conditions keep. Denies are looked up so whatever their number: those
+  on resources of the type by the row's own key, and those on containers and the tenant by each of
+  its keys.
 - **Reachable** returns the same as scopes, for a host that keeps its resources elsewhere.
   Conditional grants and conditional denies come back apart, to check one by one.
 - **Holders** lists who may do a permission on a resource, for an access review. That is each

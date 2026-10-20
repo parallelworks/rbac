@@ -593,6 +593,111 @@ func TestFilterLooksUpGrantsOnContainersByEachRowsKeys(t *testing.T) {
 	}
 }
 
+// A subject holding grants on many clusters and on dozens of workspaces, as one on each it created,
+// is listed about as fast as when every grant is looked up by each of a row's keys: with those on
+// clusters in a hash, no index serves the condition, so overlapping each row with every grant on
+// the workspaces would cost every row of the tenant a comparison for each.
+func TestFilterLooksUpGrantsOnContainersAlongsideManyOnResources(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	for _, q := range []string{
+		`CREATE TABLE fleet (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL)`,
+		`INSERT INTO fleet SELECT 't1', 'c' || i, ARRAY['cluster:c' || i, 'workspace:w' || (i % 10000), 'org:o' || (i % 50), 'tenant:t1']
+			FROM generate_series(1, 100000) i`,
+		`ANALYZE fleet`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'workspace', 'w' || i, 'user', 'u', 'cluster.login' FROM generate_series(1, 100) i
+			UNION ALL SELECT 't1', 'cluster', 'c' || (i * 7), 'user', 'u', 'cluster.login' FROM generate_series(1, 100) i`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	u := h.as(t, "u")
+	// The time Filter's condition takes to count what it keeps, the fastest of a few, so a stall of
+	// the database's in one doesn't count.
+	counted := func() time.Duration {
+		t.Helper()
+		pred, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fastest time.Duration
+		for i := range 3 {
+			start := time.Now()
+			// The ten clusters in each of w1 to w100, and those of c7 to c700 in none of them.
+			var kept int
+			if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM fleet WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil || kept != 1086 {
+				t.Fatalf("Filter kept %d clusters, %v", kept, err)
+			}
+			if took := time.Since(start); i == 0 || took < fastest {
+				fastest = took
+			}
+		}
+		return fastest
+	}
+	took := counted()
+	rbac.SetMaxContainerOverlap(t, 0)
+	if keyed := counted(); took > 3*keyed && took > 100*time.Millisecond {
+		t.Errorf("Filter's condition took %v, and %v with every grant looked up", took, keyed)
+	}
+}
+
+// A subject administering hundreds of workspaces still finds the clusters it may log in to in one
+// of them through the path's index: only grants of roles giving the permission, custom ones among
+// them, pick how Filter matches them, as only those are in its condition.
+func TestFilterCountsOnlyTheGrantsGivingThePermission(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	op := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(ctx, roleAdmin(t, h), "t1", op); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`CREATE TABLE fleet (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL)`,
+		`INSERT INTO fleet SELECT 't1', 'c' || i, ARRAY['cluster:c' || i, 'workspace:w' || (i % 1000), 'org:o1', 'tenant:t1']
+			FROM generate_series(1, 20000) i`,
+		`CREATE INDEX fleet_path ON fleet USING gin (path)`,
+		`ANALYZE fleet`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'workspace', 'w' || i, 'user', 'u', 'workspace.admin' FROM generate_series(1, 200) i
+			UNION ALL SELECT 't1', 'workspace', 'w1', 'user', 'u', 'cluster.login'
+			UNION ALL SELECT 't1', 'workspace', 'w' || i, 'user', 'op', 'custom.op' FROM generate_series(1, 200) i`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Whether Filter's condition for id, keeping the clusters of n workspaces, is served by the
+	// path's index.
+	indexed := func(id string, n int) bool {
+		t.Helper()
+		pred, err := h.authz.Filter(ctx, h.as(t, id), login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var kept int
+		if err := h.pool.QueryRow(ctx, "SELECT count(*) FROM fleet WHERE "+pred.SQL, pred.Args...).Scan(&kept); err != nil || kept != 20*n {
+			t.Fatalf("Filter kept %d clusters for %s, %v", kept, id, err)
+		}
+		rows, err := h.pool.Query(ctx, "EXPLAIN SELECT count(*) FROM fleet WHERE "+pred.SQL, pred.Args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Contains(strings.Join(plan, "\n"), "Bitmap Index Scan on fleet_path")
+	}
+	if !indexed("u", 1) {
+		t.Error("Filter reads every cluster for a subject with one grant giving the permission")
+	}
+	if indexed("op", 200) {
+		t.Error("Filter overlaps each cluster with 200 grants of a custom role")
+	}
+}
+
 func TestListingContainersUnderOthersOfTheirType(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -669,6 +774,10 @@ func listed(t *testing.T, h *harness, s rbac.Subject, p rbac.Permission) []strin
 	pred, err := h.authz.Filter(t.Context(), s, p, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// A host's query builder can read a `?` as a placeholder of its own.
+	if strings.Contains(pred.SQL, "?") {
+		t.Errorf("Filter's condition has a ?: %s", pred.SQL)
 	}
 	// Another tenant's rows are named with their tenant, so one Filter keeps shows even where t1
 	// has a cluster of the same id.
@@ -1853,10 +1962,7 @@ func TestFilterScalesWithResourceGrants(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Each row's own key is looked up in a hash of the subject's grants, not compared with each.
-	if text := strings.Join(plan, "\n"); !strings.Contains(text, "hashed SubPlan") {
-		t.Fatalf("Filter's plan for a subject with many resource grants:\n%s", text)
-	}
+	hashed := strings.Join(plan, "\n")
 	// A subject with a few still finds its rows through the GIN index, rather than read them all.
 	h.seed(t, grant(rbac.Scope{Type: "cluster", ID: "c7"}, "cluster.login", rbac.User, "few"))
 	pred, err = h.authz.Filter(ctx, h.as(t, "few"), login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
@@ -1873,8 +1979,14 @@ func TestFilterScalesWithResourceGrants(t *testing.T) {
 	if plan, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
 		t.Fatal(err)
 	}
-	if text := strings.Join(plan, "\n"); !strings.Contains(text, "Bitmap Index Scan") {
+	text := strings.Join(plan, "\n")
+	if !strings.Contains(text, "Bitmap Index Scan") {
 		t.Fatalf("Filter's plan for a subject with one resource grant:\n%s", text)
+	}
+	// Each row's own key is looked up in a hash of the subject's grants, not compared with each:
+	// one hashed subquery more than for a subject with one, whose plan hashes the denies on clusters.
+	if strings.Count(hashed, "hashed SubPlan") <= strings.Count(text, "hashed SubPlan") {
+		t.Fatalf("Filter's plan for a subject with many resource grants:\n%s", hashed)
 	}
 }
 

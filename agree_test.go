@@ -248,6 +248,18 @@ func TestListingsAgreeWithChecksInRandomTenants(t *testing.T) {
 	for seed := range uint64(12) {
 		t.Run(fmt.Sprint("seed", seed), func(t *testing.T) {
 			w := newWorld(t, seed, seed%2 == 1)
+			type expected struct {
+				s               rbac.Subject
+				p               rbac.Permission
+				want, unchecked []string
+			}
+			var expect []expected
+			filterAgrees := func(t *testing.T, e expected) {
+				t.Helper()
+				if got := listed(t, w.h, e.s, e.p); !within(got, e.want) || !within(e.unchecked, got) {
+					t.Errorf("%+v %s: Filter %v, Authorize %v, Reachable unchecked %v", e.s, e.p, got, e.want, e.unchecked)
+				}
+			}
 			for _, s := range w.subjects {
 				for _, p := range []rbac.Permission{view, login, root} {
 					want := allowedOf(t, w.h, w.clusters, s, p)
@@ -258,22 +270,16 @@ func TestListingsAgreeWithChecksInRandomTenants(t *testing.T) {
 					if !w.conditional && !slices.Equal(unchecked, reached) {
 						t.Errorf("%+v %s: Reachable checks some of %v, unchecked %v, with no conditions", s, p, reached, unchecked)
 					}
-					if got := listed(t, w.h, s, p); !within(got, want) || !within(unchecked, got) {
-						t.Errorf("%+v %s: Filter %v, Authorize %v, Reachable unchecked %v", s, p, got, want, unchecked)
-					}
+					e := expected{s, p, want, unchecked}
+					filterAgrees(t, e)
+					expect = append(expect, e)
 				}
 			}
 			// As Filter lists for a subject holding many grants on containers.
 			t.Run("looking up grants on containers", func(t *testing.T) {
 				rbac.SetMaxContainerOverlap(t, 0)
-				for _, s := range w.subjects {
-					for _, p := range []rbac.Permission{view, login, root} {
-						want := allowedOf(t, w.h, w.clusters, s, p)
-						_, unchecked := reachedBy(t, w.h, w.clusters, s, p)
-						if got := listed(t, w.h, s, p); !within(got, want) || !within(unchecked, got) {
-							t.Errorf("%+v %s: Filter %v, Authorize %v, Reachable unchecked %v", s, p, got, want, unchecked)
-						}
-					}
+				for _, e := range expect {
+					filterAgrees(t, e)
 				}
 			})
 			for _, r := range w.clusters {
