@@ -591,7 +591,7 @@ func TestLeavingUnderAGenericPlanReadsOnlyWhatNamesTheLeaver(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	tables := []string{"rbac_grants", "rbac_denies", "rbac_members"}
+	tables := []string{"rbac_grants", "rbac_eligibilities", "rbac_denies", "rbac_members"}
 	// The pages of each, and their indexes, each reads, in a transaction it rolls back.
 	read := func() map[string]int64 {
 		t.Helper()
@@ -635,7 +635,7 @@ func TestLeavingUnderAGenericPlanReadsOnlyWhatNamesTheLeaver(t *testing.T) {
 			eligible AS (INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
 			  SELECT 't1', 'cluster', id, 'user', id, 'cluster.sudo', 3600, ARRAY['user:' || id] FROM others)
 			INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
-			SELECT 't1', 'cluster', id, 'd', '{public:}', ARRAY['user:' || id], '{cluster:root}' FROM others`, append(tables, "rbac_eligibilities")...)
+			SELECT 't1', 'cluster', id, 'd', '{public:}', ARRAY['user:' || id], '{cluster:root}' FROM others`, tables...)
 	}
 	others(500)
 	few := read()

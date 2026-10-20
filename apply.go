@@ -1963,7 +1963,15 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 			}
 		}
 	}
-	if e.Ineligible, err = a.removeEligible(ctx, tx, tenant, eligible, args...); err != nil {
+	if del.named != "" {
+		// Its own by its key: beside tenant = $1, a generic plan deletes them by reading every
+		// eligibility in the tenant.
+		e.Ineligible, err = removedWhere(ctx, a, tx, "rbac_eligibilities", eligibilityColumns, collectEligibilities,
+			lockedByKeys("rbac_eligibilities", "id", bindingOrder, "principal"), tenant, named)
+	} else {
+		e.Ineligible, err = a.removeEligible(ctx, tx, tenant, eligible, args...)
+	}
+	if err != nil {
 		return ChangeEvent{}, err
 	}
 	if del.named != "" {
