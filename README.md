@@ -283,29 +283,36 @@ fields say why.
 ## History
 
 Every change to the package's tables is recorded in `rbac_history`: the row as it was and as it
-became, when, and the database role that wrote it. A change through the package records its
-actor and the call that made it (`Record.How`), and what the host attaches with `rbac.WithAudit`:
-on whose behalf it was made, the request and the reason. An expiry `DeleteExpired` removes is
-recorded as one, made by no one. Triggers write it, so a write that bypasses the package is
-recorded too, as no one's. That context is what the session that wrote it says; the database role
-is what the database knows. A row written before history was installed, as by a host that applied
-the first migrations on their own, is recorded by migrating as it found it, its `baseline`, dated
-when it was created, or a role when it last changed. Nothing updates or truncates history, only
-`PruneHistory` deletes from it, and the package's tables can be deleted from but not truncated.
-`History` reads it in order, to export it to storage of the host's own: a transaction that commits
-after a later one is read after it, never skipped, and a record can be read twice, so dedupe on
-`Record.ID` and `RecordedAt`: a restore can give another record the ID of one it lost. Any
-transaction still running in the database cluster, in any of its databases, holds `History` back
-until it ends. A time a record holds as PostgreSQL's infinity, which the tables refuse but an older
-record can hold, reads as an instant just past either end of PostgreSQL's range, as `Record` says,
-so `History` reads on past it. `History` reads the primary, and fails on a replica. A generation
-(`Cursor.Generation`) names the cluster, and the database and schema history is in, so no two
-installations in a cluster share one. A failover or a recovery to a point in time starts a new one,
-and a restore that starts none, as from a disk snapshot, loses what came after it: either can number
-again what the last one numbered past what it kept. `History` refuses a cursor from another
-generation, or whose last record the database no longer holds, and history is exported again from
-the start, kept apart from the last export. Move history with physical backups and replicas; a
-logical dump restored into another cluster numbers its transactions anew.
+became, when, and the database role that wrote it. A change through the package records its actor
+and the call that made it (`Record.How`), and what the host attaches with `rbac.WithAudit`: on whose
+behalf it was made, the request and the reason. An expiry `DeleteExpired` removes is recorded as
+one, made by no one. Triggers write it, so a write that bypasses the package is recorded too, as no
+one's. That context is what the session that wrote it says; the database role is what the database
+knows. The tables hold only what the package could write, and a write whose row is more than 1 MiB
+as jsonb, or whose context is more than 1 MiB, fails rather than record what `History` couldn't
+return. A row written before history was installed, as by a host that applied the first migrations
+on their own, is recorded by migrating as it found it, its `baseline`, dated when it was created, or
+a role when it last changed. Nothing updates or truncates history, only `PruneHistory` deletes from
+it, and the package's tables can be deleted from but not truncated. `History` reads it in order, to
+export it to storage of the host's own: a transaction that commits after a later one is read after
+it, never skipped, and a record can be read twice, so dedupe on `Record.ID` and `RecordedAt`: a
+restore can give another record the ID of one it lost. One call reads at most `rbac.MaxHistory`
+records, and past the first, at most `rbac.MaxHistoryBytes` of their rows' JSON and their text, so a
+read of fewer than its limit doesn't mean history holds no more: read until one returns none.
+History written before `0013_bounded_rows` counted no bytes, so a read measures each such record by
+writing out its rows, and reads at most 100 of them. Any transaction still running in the database
+cluster, in any of its databases, holds `History` back until it ends, so bound how long one runs
+where a role can leave one open, as with `idle_in_transaction_session_timeout`, or from PostgreSQL
+17 on with `transaction_timeout`. A time a record holds as PostgreSQL's infinity, which the tables
+refuse but an older record can hold, reads as an instant just past either end of PostgreSQL's range,
+as `Record` says, so `History` reads on past it. `History` reads the primary, and fails on a
+replica. A generation (`Cursor.Generation`) names the cluster, and the database and schema history
+is in, so no two installations in a cluster share one. A failover or a recovery to a point in time
+starts a new one, and a restore that starts none, as from a disk snapshot, loses what came after it:
+either can number again what the last one numbered past what it kept. `History` refuses a cursor
+from another generation, or whose last record the database no longer holds, and history is exported
+again from the start, kept apart from the last export. Move history with physical backups and
+replicas; a logical dump restored into another cluster numbers its transactions anew.
 
 A change refused, as `ErrDenied` or `ErrInvalid`, writes nothing, so history doesn't record it:
 `Config.OnRefused` is told of each, with its actor, the call and the host's audit, to record the
@@ -338,22 +345,30 @@ change: one tried is no actor's attempt, and `Config.OnRefused` isn't told of it
 reads the history of the rows it names, as a check does its subject's grants, groups and the
 denies on its resource's path, and `Holders` the members of the groups it lists, not the whole
 tenant's. It orders a row's changes by their ids in `rbac_history`, which sessions take out of
-order once that table's id sequence caches more than one, so `AsOf` refuses that.
+order once that table's id sequence caches more than one, so `AsOf` refuses that. Its read's hooks
+run in its transaction, which holds one of the pool's connections: a constraint there queries the
+`DB` it is given, as one that queries the pool waits for another connection, which a busy pool may
+never free.
 
 `rbac.PruneHistory(ctx, db, before, through)` deletes what an export has read past (`through`, its
 cursor) and later records supersede: of each row, the last version at or before `before` stays, so
 `AsOf` answers as it did for any time from then on, and refuses an earlier one, and a row that had
 ended by then goes, once no version before its end stays. One call deletes at most `rbac.MaxPrune`
-records: call it again while it deletes as many, and each goes on from where the last stopped. A
-prune that deletes records is recorded in history; one that deletes none changes nothing, and is
-not. Run it on a connection of the administrator's role below, which has the rights of history's
-owner, as the application's hasn't, and keep what the host's audit retention requires: the federal
-floor is at least a year.
+records: call it again while it deletes as many, and each goes on from where the last stopped. It
+reads history that many records at a time, on a pool or a connection each in a transaction of its
+own, so however long history is, none holds exports back for long. A transaction that deletes
+records is recorded in history; one that deletes none changes nothing, and is not. Run it on a
+connection of the administrator's role below, which has the rights of history's owner, as the
+application's hasn't, and keep what the host's audit retention requires: the federal floor is at
+least a year.
 
 A role that owns a table can change it whatever its triggers say, and a schema's owner can drop
 any table in it. So that the application's database role can't rewrite history or write around
-it, that role is no superuser, nor a member of `pg_write_all_data` or `pg_create_subscription`,
-through which it could write `rbac_history` itself, and before PostgreSQL 16 has no `CREATEROLE`,
+it, that role is no superuser and holds no role that has a superuser's power or a way to it: not
+`pg_write_all_data` or `pg_create_subscription`, through which it could write `rbac_history`
+itself, nor `pg_execute_server_program`, `pg_write_server_files` or `pg_read_server_files`, with
+which it could run any program as the server's operating system user, write any of its files, or
+read any, as one that holds a superuser's password; before PostgreSQL 16 it has no `CREATEROLE`,
 with which it could make itself a member of any role but a superuser, such as those or the roles
 below; and:
 
@@ -404,7 +419,9 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   writes to the table waiting until it commits, though reads go on: on a large table, migrate when
   that wait is acceptable. Code from before `0012_activation_through` must not run beside code
   after it: an activation it extends keeps the eligibility recorded before, and can outlast the one
-  it was extended through. Stop the replicas running it before migrating.
+  it was extended through. Stop the replicas running it before migrating. `0013_bounded_rows`
+  locks every table, history too, until it commits, and reads each once for each check it adds,
+  so checks, lists, changes and reads of history wait for it.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
   between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows

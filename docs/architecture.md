@@ -604,9 +604,11 @@ flowchart LR
 
 - **What a record holds.** Each holds the row as it was and as it became, when it took effect,
   the database role that wrote it, and the actor and call it was made through, with what the host
-  attached. A write that bypassed the package is recorded too, with no actor. A row written
-  before history was installed has one record from migrating, its baseline, dated when it was
-  created, or at the epoch where that was before year 1 or at its first instant.
+  attached. A write that bypassed the package is recorded too, with no actor, but the tables hold
+  only what the package could write, and a row of more than 1 MiB as jsonb, or a context of more
+  than 1 MiB, fails its write, so no record is one `History` can't return. A row written before
+  history was installed has one record from migrating, its baseline, dated when it was created, or
+  at the epoch where that was before year 1 or at its first instant.
 - **History's order.** `History` reads records in transaction order, and only those of
   transactions older than every transaction still running, which have all ended. So a cursor
   never passes a record that commits later. It, `Export` and `PruneHistory` name history by its
@@ -629,13 +631,18 @@ flowchart LR
 - **PruneHistory** deletes only what an export has read and later versions supersede. It keeps
   each row's last version at or before its time, so AsOf answers as before for any later time,
   and refuses an earlier one; of a row whose last version by then ended it, it deletes every
-  version, the end last. A prune that deleted records is recorded in history, and AsOf finds the
-  latest prune's time by history's index.
+  version, the end last. It reads history `MaxPrune` records at a time, each in a transaction of
+  its own, so none holds exports back for long however long history is. Each that deleted records
+  is recorded in history, and AsOf finds the latest prune's time by history's index.
 
 ## Database roles
 
 The application's database role must not be able to rewrite history, so the schema is set up with
-three roles. The README's [History](../README.md#history) section has the exact grants.
+three roles, and that role is no superuser and holds no role with a superuser's power or a way to
+it: not `pg_write_all_data` or `pg_create_subscription`, through which it could write history, nor
+`pg_execute_server_program`, `pg_write_server_files` or `pg_read_server_files`, which run programs
+and write and read files as the server. The README's [History](../README.md#history) section has
+the exact grants.
 
 ```mermaid
 flowchart LR
@@ -655,7 +662,8 @@ flowchart LR
 Every input that could grow without limit is bounded, so no call's cost depends on what a tenant
 chose to store beyond these, but for the lists, which read what they list: `Filter` reads the
 subject's grants on the scopes that can reach the listed type and the denies on them, and costs each
-row a few lookups among them however many there are.
+row a few lookups among them however many there are. The tables hold rows only within the same
+bounds, so a role that writes around the package can store no row larger than the package writes.
 
 | Bound | Value | What it limits |
 |---|---|---|
@@ -663,7 +671,7 @@ row a few lookups among them however many there are.
 | `MaxBindings` | 1,000 | Bindings in one `Apply`, and the grants, memberships, groups or members one `Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`, `DeleteGroups`, `ImportMembers`, `ChangeMembers` or `DeleteMembers` takes. |
 | `MaxGrantsPerRole` | 20 | Grants in force of one role to one principal on one scope, differing by source, expiry or condition. Those from each source the host owns count apart. |
 | `MaxDenies`, `MaxDenyEntries` | 100, 256 | Denies on a scope, and the principals, exemptions or permissions one names. |
-| `MaxCustomRoles`, `MaxGrantableRoles` | 300, 64 | Custom roles in a tenant, and roles one lists in `GrantableRoles`. |
+| `MaxCustomRoles`, `MaxRoleEntries`, `MaxGrantableRoles` | 300, 1,000, 64 | Custom roles in a tenant, the permissions one gives and the types it is for, and roles one lists in `GrantableRoles`. |
 | `MaxApprovers`, `MaxActivation` | 16, 366 days | An eligibility's approvers, and its longest activation. |
 | `MaxGroupDepth` | 8 | How deeply groups nest. |
 | `MaxPlacesInGroup` | 20 | Places in force of one principal in one group, each from another source. Those from each source the host owns count apart. |
@@ -672,4 +680,4 @@ row a few lookups among them however many there are.
 | `MaxConditionBytes` | 32 KiB | The conditions one `Apply` or `Import` carries, each distinct one counted once. |
 | `MaxName`, `MaxDescription`, `MaxNote` | 128, 2,048, 2,048 characters | Names, titles and group ids, descriptions, and notes and justifications. |
 | `MaxRequest` | 256 characters | A request id in `Audit`. |
-| `MaxHistory`, `MaxPrune` | 10,000 each | Records read by one `History` call, and deleted by one prune. |
+| `MaxHistory`, `MaxHistoryBytes`, `MaxPrune` | 10,000, 64 MiB, 10,000 | Records read by one `History` call, the bytes of their rows' JSON and their text past the first, and records deleted by one prune. |

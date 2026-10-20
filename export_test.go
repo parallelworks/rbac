@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"cel.dev/cel-go/cel"
+	"github.com/jackc/pgx/v5"
 )
 
 // SetSavepointEnd bounds a savepoint's release or rollback by d until t ends.
@@ -21,6 +22,31 @@ func SetMaxPrune(t *testing.T, n int) {
 	old := maxPrune
 	maxPrune = n
 	t.Cleanup(func() { maxPrune = old })
+}
+
+// SetPrunedWindow runs f at the end of each of PruneHistory's transactions, on it, until t ends.
+func SetPrunedWindow(t *testing.T, f func(pgx.Tx)) {
+	t.Helper()
+	old := prunedWindow
+	prunedWindow = f
+	t.Cleanup(func() { prunedWindow = old })
+}
+
+// SetMaxHistoryBytes bounds the bytes one History call reads to n until t ends.
+func SetMaxHistoryBytes(t *testing.T, n int) {
+	t.Helper()
+	old := maxHistoryBytes
+	maxHistoryBytes = n
+	t.Cleanup(func() { maxHistoryBytes = old })
+}
+
+// SetMaxUnsized bounds the records one History call measures that no trigger counted to n until t
+// ends.
+func SetMaxUnsized(t *testing.T, n int) {
+	t.Helper()
+	old := maxUnsized
+	maxUnsized = n
+	t.Cleanup(func() { maxUnsized = old })
 }
 
 // SetExpiryBatch bounds what one of DeleteExpired's transactions deletes from a table to n until t

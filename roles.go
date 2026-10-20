@@ -177,6 +177,10 @@ func (a *Authorizer) checkCustom(r RoleDefinition) error {
 	if !isCustom(r.ID) || !roleID.MatchString(string(r.ID)) || len(r.ID) == len(CustomPrefix) {
 		return fmt.Errorf("%w: a custom role's id is %q and lowercase letters, digits, dots, hyphens and underscores", ErrInvalid, CustomPrefix+"…")
 	}
+	// Before the checks below, which read each permission against each type.
+	if len(r.Permissions) > MaxRoleEntries || len(r.ResourceTypes) > MaxRoleEntries {
+		return fmt.Errorf("%w: role %q gives more than %d permissions or is for more than %d resource types", ErrInvalid, r.ID, MaxRoleEntries, MaxRoleEntries)
+	}
 	errs := shape(r)
 	for _, p := range r.Permissions {
 		if !a.permissions[p] {
