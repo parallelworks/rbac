@@ -211,11 +211,13 @@ erDiagram
   `DeleteScopes`' rows, and so does a walk through nested groups: a generic plan costs `= ANY` of
   a list as ten seeks, and a read of the tenant by an index on it alone as an average tenant's few
   rows, and would read every row of a large tenant. The eligibilities a group approves and the
-  denies that name or exempt it, which a change to its members reads, are found through GIN
+  denies that name or exempt it, which a change to its members and `DeleteGroup`'s check read,
+  and those an identity or group leaving the tenant is taken out of, are found through GIN
   indexes on those arrays of keys, each key prefixed by its tenant (`rbac_tenant_keys`), so
   neither the tenant's other rows nor another tenant's group of the same id are read.
 - **Activations are grants** from the source `activation` (`SourceActivation`), made by
-  `Activate` from an eligibility and ended by their expiry or `Deactivate`.
+  `Activate` from an eligibility and ended by their expiry, `Deactivate`, or a change ending the
+  membership or place in a group they rest on sooner.
 - **Every write is recorded.** Each table above but `rbac_history` has the trigger
   `rbac_record`, which writes the change into `rbac_history`. Nothing updates or truncates that
   table, and only `PruneHistory`, as a role with the rights of its owner, deletes from it.
@@ -409,7 +411,12 @@ sequenceDiagram
   transaction, and under the tenant's lock refuses with `ErrConflict` if those changed meanwhile.
 - **Eligibilities.** `SetEligibility` lets a principal `Activate` a role for a while, perhaps
   only with approvers or a `requires` condition. An activation is a grant that ends no later than
-  its eligibility expires; deleting the eligibility leaves its activations to their own ends.
+  its eligibility expires, or its holder's membership or place in the group the eligibility names
+  ends. A change ending one of those sooner holds it, in order, then reads the activations of the
+  identities it ends it for that the eligibilities allowed until then, and cuts each short to when
+  they still allow it through what is left; `Activate` holds the places it rests on until it
+  commits, so the two wait for each other. Setting the eligibility again or deleting it leaves its
+  activations to their own ends.
 
 ## Lists and searches
 

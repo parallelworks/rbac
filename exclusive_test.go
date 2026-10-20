@@ -388,6 +388,50 @@ func TestChangesToExclusiveValuesRunInTurn(t *testing.T) {
 	excluded(t, <-second)
 }
 
+// Removing an identity everywhere takes each tenant's exclusive lock first, as every change does,
+// so a host transaction that removes one and then changes the tenant again waits for no change that
+// waits for it.
+func TestDeletingAPrincipalEverywhereTakesTheExclusiveLockFirst(t *testing.T) {
+	h := labeled(t, banks)
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := h.authz.WithTx(tx).DeletePrincipalEverywhere(ctx, host, identity("u")); err != nil {
+		t.Fatal(err)
+	}
+	other := make(chan error, 1)
+	go func() {
+		other <- h.authz.Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "u")})
+	}()
+	var pid int32
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	for waiting := false; !waiting; {
+		select {
+		case err := <-other:
+			t.Fatalf("a change to u ran before its removal committed: %v", err)
+		default:
+			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := h.authz.WithTx(tx).Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "v")}); err != nil {
+		t.Fatalf("the host transaction's next change: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-other; err != nil {
+		t.Fatalf("the change that waited: %v", err)
+	}
+}
+
 func TestAnOrderedDimensionIsntExclusive(t *testing.T) {
 	h := labeled(t)
 	cfg := h.cfg

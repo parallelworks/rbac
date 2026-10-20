@@ -15,12 +15,13 @@ import (
 // Eligibility lets a principal activate a role on a scope when it needs it, for a while, rather
 // than hold it standing: just-in-time access. Activating gives the identity that activates a
 // grant of its own, from SourceActivation, until MaxDuration from then at most and no later than
-// the eligibility ends, with its justification as the grant's note; one eligible through a group
-// activates for itself. With Approvers, each activation needs one of them to approve it. What an
-// activation gives, its holder can't hand on past its end, nor as an eligibility; but an activated
-// power to change grants grants for good what its holder holds for good, and the roles a role it
-// activated lists, as any power held for a while does (Authorizer.Apply): make eligible roles that
-// list none.
+// the eligibility, its membership of the tenant or its place in the group that makes it eligible
+// ends, with its justification as the grant's note; one eligible through a group activates for
+// itself, and a change ending that membership or place sooner cuts the activation short with it.
+// With Approvers, each activation needs one of them to approve it. What an activation gives, its
+// holder can't hand on past its end, nor as an eligibility; but an activated power to change grants
+// grants for good what its holder holds for good, and the roles a role it activated lists, as any
+// power held for a while does (Authorizer.Apply): make eligible roles that list none.
 type Eligibility struct {
 	Scope     Scope
 	Role      Role
@@ -28,8 +29,9 @@ type Eligibility struct {
 	// MaxDuration is the longest an activation lasts, in whole seconds, rounded down, and at most
 	// a year.
 	MaxDuration time.Duration
-	// ExpiresAt ends the eligibility, which no activation outlasts; zero never does. Revoking it
-	// leaves the grants activated from it to their own ends.
+	// ExpiresAt ends the eligibility, which no activation made from it outlasts; zero never does.
+	// Setting it sooner, or revoking the eligibility, leaves the grants activated from it to their
+	// own ends.
 	ExpiresAt time.Time
 	// Requires is what activating needs, as a condition's expression read with the action
 	// `<type>:grant`, such as a second factor (`request.attributes.mfa == true`); empty for
@@ -175,7 +177,9 @@ type Activation struct {
 // eligibility being the authority, but a constraint that stops changes to grants on the scope's
 // type stops it, and Config.ValidateGrant is asked about it, as about any grant. Where the
 // eligibility names approvers, the host's approval flow activates for s once one approves,
-// passing act.Approver and, in ctx, the request s made (WithRequest), which Requires reads.
+// passing act.Approver and, in ctx, the request s made (WithRequest), which Requires reads. It
+// holds the places in groups s is in until it commits, so a change ending one of them sooner waits
+// for it, and cuts the activation short if it rests on that place.
 func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act Activation) (g Grant, err error) {
 	defer a.refused(ctx, &err, on.Tenant, s.Principal, "Activate")
 	if err := a.check(on); err != nil {
@@ -220,6 +224,16 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 			return ChangeEvent{}, err
 		}
 		if err := a.stillStanding(ctx, tx, on.Tenant, stand); err != nil {
+			return ChangeEvent{}, err
+		}
+		// The places in groups it can rest on, held until it commits: a change ending one sooner holds
+		// it before reading the activations resting on it, so it waits for this one and finds it. Each
+		// key's are found on its own (byKey), then each held by its key in the order changes hold them.
+		if _, err := tx.Exec(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`
+			SELECT FROM (SELECT * FROM (`+byKey("ARRAY(SELECT k FROM keys)", "rbac_members", "principal", "group_id, principal, source",
+			"tenant = $1 AND (expires_at IS NULL OR expires_at > $3)")+`) p ORDER BY `+placeOrder+`) p CROSS JOIN LATERAL (
+			  SELECT FROM rbac_members WHERE tenant = $1 AND group_id = p.group_id AND principal = p.principal AND source = p.source
+			    AND (expires_at IS NULL OR expires_at > $3) FOR SHARE) m`, on.Tenant, s.identityKey(), a.cfg.Now()); err != nil {
 			return ChangeEvent{}, err
 		}
 		// Again under the locks, so an eligibility revoked meanwhile activates nothing.
@@ -316,6 +330,188 @@ func (a *Authorizer) Deactivate(ctx context.Context, s Subject, on Resource, rol
 			scope.Key(), s.Principal.key(), role, SourceActivation)
 		return ChangeEvent{Revoked: ended}, err
 	})
+}
+
+// resting is the activations a change ending places in groups or memberships sooner may cut short:
+// of the identities it ends them for, those the eligibilities allowed through their keys before the
+// change, each with when the latest they allowed ends. gone are the eligibilities the change
+// deletes besides, which still count, as deleting one leaves its activations to their own ends.
+type resting struct {
+	ids     []string
+	allowed []pgtype.Timestamptz
+	gone    []Eligibility
+}
+
+// reachingSQL is SQL defining, in a WITH RECURSIVE, reaching(holder, k, ends): the keys of the
+// identities holders, SQL for an array of their keys, hold in the tenant $1 at now, with when the
+// latest of the paths to each ends, null for never: its own while its membership is in force,
+// suspended too, as lifting it holds them again, and its groups', through those they are in, while
+// its places in them are. Each key's are looked up on its own (byKey, groupsAbove).
+func reachingSQL(holders, now string) string {
+	return fmt.Sprintf(`tenure(holder, ends) AS (
+		%[1]s
+	), placed(holder, id, ends) AS (
+		SELECT t.holder, m.group_id, least(t.ends, m.expires_at) FROM tenure t CROSS JOIN LATERAL (
+		  SELECT group_id, expires_at FROM rbac_members WHERE tenant = $1 AND principal = t.holder
+		    AND (expires_at IS NULL OR expires_at > %[2]s) OFFSET 0) m
+		UNION
+		SELECT p.holder, m.group_id, least(p.ends, m.expires_at) FROM placed p %[3]s
+	), reaching(holder, k, ends) AS (
+		SELECT holder, holder, ends FROM tenure
+		UNION ALL SELECT holder, 'group:' || id, ends FROM placed
+	)`, byKey(holders, "rbac_memberships", "principal", "principal, expires_at", "tenant = $1 AND (expires_at IS NULL OR expires_at > "+now+")"),
+		now, groupsAbove("p.id", now, "group_id, expires_at"))
+}
+
+// allowingSQL is SQL defining, after act(id, principal, scope, role, expires_at), activations, and
+// reachingSQL for their holders, elig(scope, role, principal, ends) and allowing(id, expires_at,
+// until): the eligibilities in force at now, SQL for it, on the activations' scopes for their roles,
+// and those as arrays at gone, SQL for the first of five parameters, a change deletes, each ending
+// when it does or when an activation made from it now would, at its MaxDuration; and until when the
+// eligibilities allow each activation through its holder's keys, by the latest of them, each until
+// it or the holding of the key it names ends, null for none.
+func allowingSQL(now string, gone int) string {
+	return fmt.Sprintf(`elig(scope, role, principal, ends) AS (
+		SELECT e.scope, e.role, e.principal, least(e.expires_at, %[1]s + e.max_seconds * interval '1 second')
+		FROM (SELECT DISTINCT scope, role FROM act) a CROSS JOIN LATERAL (
+		  SELECT scope, role, principal, expires_at, max_seconds FROM rbac_eligibilities WHERE tenant = $1 AND scope = a.scope AND role = a.role
+		    AND (expires_at IS NULL OR expires_at > %[1]s) OFFSET 0) e
+		UNION ALL
+		SELECT s COLLATE "C", r COLLATE "C", p COLLATE "C", least(x, %[1]s + m * interval '1 second')
+		FROM unnest($%[2]d::text[], $%[3]d::text[], $%[4]d::text[], $%[5]d::timestamptz[], $%[6]d::bigint[]) AS g(s, r, p, x, m)
+	), allowing(id, expires_at, until) AS (
+		SELECT a.id, a.expires_at, (SELECT max(least(e.ends, r.ends)) FROM elig e JOIN reaching r ON r.k = e.principal
+		  WHERE e.scope = a.scope AND e.role = a.role AND r.holder = a.principal)
+		FROM act a
+	)`, now, gone, gone+1, gone+2, gone+3, gone+4)
+}
+
+// goneArgs are the arguments allowingSQL reads gone from.
+func goneArgs(gone []Eligibility) []any {
+	n := len(gone)
+	scopes, roles, principals, ends := make([]string, n), make([]string, n), make([]string, n), make([]pgtype.Timestamptz, n)
+	seconds := make([]int64, n)
+	for i, e := range gone {
+		scopes[i], roles[i], principals[i] = e.Scope.Key(), string(e.Role), e.Principal.key()
+		ends[i] = pgtype.Timestamptz{Time: e.ExpiresAt, Valid: !e.ExpiresAt.IsZero()}
+		seconds[i] = int64(e.MaxDuration / time.Second)
+	}
+	return []any{scopes, roles, principals, ends, seconds}
+}
+
+// doomed reads, in tx, the eligibilities in force at now that deleting those of principals, by key,
+// deletes: theirs, and those only they approve, which unapprove deletes. They still count for the
+// activations resting on what the change ends (resting.gone).
+func doomed(ctx context.Context, tx pgx.Tx, tenant string, principals []string, now time.Time) ([]Eligibility, error) {
+	// Theirs a principal at a time, and those they approve by the keys named (naming), each once.
+	rows, err := tx.Query(ctx, `SELECT `+eligibilityColumns+` FROM (
+		  `+byKey("$2", "rbac_eligibilities", "principal", eligibilityColumns, "tenant = $1 AND (expires_at IS NULL OR expires_at > $3)")+`
+		  UNION ALL
+		  SELECT `+eligibilityColumns+` FROM rbac_eligibilities
+		  WHERE `+naming("approvers", "$2")+` AND approvers <@ $2::text[] AND principal <> ALL($2::text[])
+		    AND (expires_at IS NULL OR expires_at > $3)) e`, tenant, principals, now)
+	if err != nil {
+		return nil, err
+	}
+	return collectEligibilities(rows)
+}
+
+// restingOn reads, in tx, at now, the activations resting of identities, by key, and of the
+// identities in groups, by id, in a tenant, that a change ending their places in groups or
+// memberships sooner may cut short, with gone, the eligibilities it deletes besides. The change
+// holds the rows it ends first, as Activate holds those an activation rests on, so none is made
+// meanwhile through what the change ends.
+func (a *Authorizer) restingOn(ctx context.Context, tx pgx.Tx, tenant string, identities, groups []string, gone []Eligibility, now time.Time) (resting, error) {
+	if len(identities)+len(groups) == 0 {
+		return resting{}, nil
+	}
+	rows, err := tx.Query(ctx, `
+		WITH RECURSIVE `+insideSQL("$3", "$4", "NULL", false)+`, holders(k) AS (
+		  SELECT unnest($2::text[]) COLLATE "C" UNION SELECT principal FROM inside
+		), act AS (
+		  `+byKey("ARRAY(SELECT k FROM holders)", "rbac_grants", "principal", "id, principal, scope, role, expires_at",
+		"tenant = $1 AND source = 'activation' AND expires_at > $4")+`
+		), `+reachingSQL("ARRAY(SELECT DISTINCT principal FROM act)", "$4")+`, `+allowingSQL("$4", 5)+`
+		SELECT id::text, until FROM allowing WHERE until IS NOT NULL ORDER BY id`,
+		append([]any{tenant, identities, groups, now}, goneArgs(gone)...)...)
+	if err != nil {
+		return resting{}, err
+	}
+	r := resting{gone: gone}
+	var id string
+	var until pgtype.Timestamptz
+	_, err = pgx.ForEachRow(rows, []any{&id, &until}, func() error {
+		r.ids, r.allowed = append(r.ids, id), append(r.allowed, until)
+		return nil
+	})
+	return r, err
+}
+
+// unrest cuts short, in tx, as actor, the activations r found resting that the eligibilities now
+// allow, through the keys their holders hold once the change has ended places or memberships, less
+// long than before it and than they last: each to when they still allow it, or ended if they don't
+// past now, as an activation made now would last no longer. It returns those it cut short and
+// those it ended.
+func (a *Authorizer) unrest(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, r resting, now time.Time) (short, ended []Grant, err error) {
+	if len(r.ids) == 0 {
+		return nil, nil, nil
+	}
+	rows, err := tx.Query(ctx, `
+		WITH RECURSIVE was(id, allowed) AS (
+		  SELECT i::uuid, x FROM unnest($2::text[], $3::timestamptz[]) AS t(i, x)
+		), act AS (
+		  SELECT g.id, g.principal, g.scope, g.role, g.expires_at FROM was w CROSS JOIN LATERAL (
+		    SELECT id, principal, scope, role, expires_at FROM rbac_grants WHERE id = w.id AND tenant = $1
+		      AND source = 'activation' AND expires_at > $4 OFFSET 0) g
+		), `+reachingSQL("ARRAY(SELECT DISTINCT principal FROM act)", "$4")+`, `+allowingSQL("$4", 5)+`
+		SELECT a.id::text, a.until FROM allowing a JOIN was w ON w.id = a.id
+		WHERE a.until IS NULL OR a.until < w.allowed AND a.until < a.expires_at
+		ORDER BY a.id`,
+		append([]any{tenant, r.ids, r.allowed, now}, goneArgs(r.gone)...)...)
+	if err != nil {
+		return nil, nil, err
+	}
+	var gone, cut []string
+	var to []time.Time
+	var id string
+	var until *time.Time
+	if _, err := pgx.ForEachRow(rows, []any{&id, &until}, func() error {
+		if until == nil || !until.After(now) {
+			gone = append(gone, id)
+		} else {
+			cut, to = append(cut, id), append(to, *until)
+		}
+		return nil
+	}); err != nil {
+		return nil, nil, err
+	}
+	if len(gone)+len(cut) == 0 {
+		return nil, nil, nil
+	}
+	// In the order the grants a change removes are locked in (inOrder), as two changes ending places
+	// can each cut short the other's. By id alone, which act found in the tenant: beside tenant = $1,
+	// a generic plan could read the tenant's grants by it (byKey).
+	if _, err := tx.Exec(ctx, lockedInOrder("rbac_grants", "", bindingOrder, "id = ANY($1::text[]::uuid[])"), slices.Concat(gone, cut)); err != nil {
+		return nil, nil, err
+	}
+	if len(gone) > 0 {
+		if ended, err = removedWhere(ctx, a, tx, "rbac_grants", grantColumns, collectGrants, "id = ANY($1::text[]::uuid[])", gone); err != nil {
+			return nil, nil, err
+		}
+	}
+	if len(cut) > 0 {
+		rows, err := tx.Query(ctx, `UPDATE rbac_grants SET expires_at = c.x, updated_by = $3, updated_at = now()
+			FROM unnest($1::text[], $2::timestamptz[]) AS c(i, x)
+			WHERE id = c.i::uuid
+			RETURNING `+grantColumns, cut, to, actorKey(actor))
+		if err != nil {
+			return nil, nil, err
+		}
+		if short, err = collectGrants(rows); err != nil {
+			return nil, nil, err
+		}
+	}
+	return short, ended, nil
 }
 
 // eligible checks that s may activate act.Role on on until until, and returns who approved: an
