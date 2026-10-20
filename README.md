@@ -11,6 +11,9 @@ go get github.com/parallelworks/rbac
 It needs Go 1.26 or later and is tested on PostgreSQL 18. It runs in FIPS 140-3 mode: it uses no
 cryptography outside the Go standard library.
 
+[Architecture](docs/architecture.md) maps how it works, with diagrams of its data, checks, changes,
+lists and history.
+
 ## The model
 
 A role is a set of `type:verb` permissions, such as `cluster:login`, built into the application's
