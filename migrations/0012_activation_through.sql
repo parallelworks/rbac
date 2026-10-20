@@ -7,6 +7,11 @@
 -- the activation, and another's MaxDuration would cut short one made through this one. Null on other
 -- grants. Deleting the eligibility leaves both, as it leaves its activations to their own ends. A
 -- column added with no default rewrites no row.
+--
+-- Stop the replicas running code from before this migration before migrating: none may run beside
+-- code after it. Its Activate writes neither column, and one extending an activation leaves those
+-- the earlier request recorded, so the activation rests on that request's path, which it can then
+-- outlast the eligibility of, rather than on the one it was extended through.
 ALTER TABLE rbac_grants ADD COLUMN activated_through text COLLATE "C", ADD COLUMN eligibility_id bigint;
 
 -- An activation in force is recorded as made through the one eligibility for its role on its scope,
@@ -14,12 +19,11 @@ ALTER TABLE rbac_grants ADD COLUMN activated_through text COLLATE "C", ADD COLUM
 -- too, and the places in groups in force from it, as a change reads the paths an activation rests
 -- on. Where it reaches the principals of several, which made it can't be told; where it reaches
 -- none, as once the eligibility it was made through is deleted, nothing says what it rested on.
--- Those record neither, as do those that code from before this migration activates while a host
--- upgrades, and the first change that re-checks their holder's activations ends them, one setting
--- an end on or removing a membership or place of its holder's, even an end no sooner, rather than
--- leave one through a path it may not have rested on: activating again until later records the
--- eligibility. The package has had no release, so only a developer's database holds any, and none
--- lasts past a year.
+-- Those record neither, and the first change that re-checks their holder's activations ends them,
+-- one setting an end on or removing a membership or place of its holder's, even an end no sooner,
+-- rather than leave one through a path it may not have rested on: activating again until later
+-- records the eligibility. The package has had no release, so only a developer's database holds
+-- any, and none lasts past a year.
 SELECT set_config('rbac.change', '{"how": "Migrate"}', true);
 WITH RECURSIVE activations AS (
     SELECT id, tenant, principal, scope, role FROM rbac_grants WHERE source = 'activation' AND expires_at > now()
