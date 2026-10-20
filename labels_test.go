@@ -777,6 +777,157 @@ func TestALabelValueRevokedWhileAChangeWaitsRefusesIt(t *testing.T) {
 	}
 }
 
+// Approving an activation decides access on its scope, as changing the grants there does, so on a
+// labeled scope only an approver holding what the label asks for approves one: by its own values,
+// which the constraints may remove, read again under the activation's locks, and decided without
+// the request, which is the activating subject's, so every read of its attributes fails.
+func TestApprovingAnActivationOnALabeledScopeNeedsItsLabel(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	var meanwhile func(context.Context) error
+	validated := 0
+	h := labeled(t, func(c *rbac.Config) {
+		c.Catalog = append(c.Catalog, tenantGuard)
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s == secret.Scope() {
+				return secret, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+		c.Constraints = []rbac.Constraint{{Name: "clearance", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if in.Permission != "level:high" || in.Subject == nil {
+				return false, nil
+			}
+			switch in.Subject.Principal.ID {
+			case "barred":
+				return true, nil
+			case "revoked":
+				// Asked before the activation's transaction, the host revokes the value.
+				if do := meanwhile; do != nil {
+					meanwhile = nil
+					return false, do(ctx)
+				}
+			}
+			return false, nil
+		}}}
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, db rbac.DB, in rbac.GrantInput) error {
+			if in.Via == rbac.ViaActivation {
+				validated++
+			}
+			return validate(ctx, db, in)
+		}
+	})
+	ctx := t.Context()
+	h.hold(t, "owner", "level:high")
+	u := h.as(t, "u")
+	h.hold(t, "u", "level:high")
+	h.groups(t, "approvers")
+	approvers := []rbac.Principal{groupOf("approvers")}
+	for _, id := range []string{"cleared", "uncleared", "lower", "conditional", "guarded", "flagged", "barred", "revoked"} {
+		approvers = append(approvers, h.as(t, id).Principal)
+	}
+	h.as(t, "lead", "approvers")
+	h.as(t, "member", "approvers")
+	h.hold(t, "cleared", "level:high")
+	h.hold(t, "lower", "level:mid")
+	h.hold(t, "barred", "level:high")
+	h.hold(t, "revoked", "level:high")
+	h.hold(t, "lead", "level:high")
+	// Its value under a condition on the request, which u's request in ctx meets.
+	mfa := grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "conditional")
+	mfa.Condition = rbac.Condition{Expression: `request.attributes.mfa == true`}
+	// Its value unless a request carries a risk, and a deny of another's where one does: u's
+	// carries none, and with none, or an empty one, the value would hold and the deny lift.
+	unflagged := grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "guarded")
+	unflagged.Condition = rbac.Condition{Expression: `!has(request.attributes.risk)`}
+	h.seed(t, mfa, unflagged, grant(rbac.TenantRoot("t1"), "tenant.guard", rbac.User, "guardian"))
+	h.hold(t, "flagged", "level:high")
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}, rbac.Deny{
+		ID: "risky", Principals: []rbac.Principal{identity("flagged")}, Permissions: []rbac.Permission{"level:high"},
+		Condition: rbac.Condition{Expression: `has(request.attributes.risk)`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx = rbac.WithRequest(ctx, map[string]any{"mfa": true})
+	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), secret, rbac.Eligibility{
+		Role: "cluster.login", Principal: u.Principal, MaxDuration: time.Hour, Approvers: approvers,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	activate := func(approver string) error {
+		_, err := h.authz.Activate(ctx, u, secret, rbac.Activation{
+			Role: "cluster.login", Duration: time.Minute, Justification: "on call", Approver: rbac.Subject{Principal: identity(approver)},
+		})
+		return err
+	}
+	for _, id := range []string{"uncleared", "lower", "member", "conditional", "guarded", "flagged", "barred"} {
+		validated = 0
+		if err := activate(id); !errors.Is(err, rbac.ErrDenied) || validated != 0 {
+			t.Errorf("approved by %s, without the label's values: %v, the host asked %d times", id, err, validated)
+		}
+		if allowed(t, h, u, view, secret) {
+			t.Fatalf("approved by %s, u can see the cluster", id)
+		}
+	}
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "revoked")})
+	}
+	if err := activate("revoked"); !errors.Is(err, rbac.ErrDenied) || meanwhile != nil {
+		t.Errorf("approved by one whose value was revoked while it activated: %v", err)
+	}
+	for _, id := range []string{"cleared", "lead"} {
+		if err := activate(id); err != nil {
+			t.Fatalf("approved by %s, holding the label's values: %v", id, err)
+		}
+		if !allowed(t, h, u, view, secret) {
+			t.Fatalf("approved by %s, u can't see the cluster", id)
+		}
+		if err := h.authz.Deactivate(ctx, u, secret, "cluster.login"); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// The approver's values are read before the transaction wherever an eligibility it approves is
+// found, not only where it outranks the one chosen as found then: under the locks, the paths'
+// ends can rank an eligibility needing approval above one that doesn't, and its values, never
+// asked about, would refuse every activation as a conflict.
+func TestAnApprovalTheLocksRankFirstIsReadBeforeThem(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	h := labeled(t)
+	ctx := t.Context()
+	h.hold(t, "owner", "level:high")
+	h.groups(t, "a")
+	u := h.as(t, "u", "a")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "a", Principal: u.Principal, ExpiresAt: h.now.Add(3 * time.Hour)}}); err != nil {
+		t.Fatal(err)
+	}
+	cleared := h.as(t, "cleared")
+	h.hold(t, "cleared", "level:high")
+	owner := h.as(t, "owner")
+	// Through a, found first, needing no approval; through u's own, lasting longer, needing it.
+	for _, e := range []rbac.Eligibility{
+		{Role: "cluster.login", Principal: groupOf("a"), MaxDuration: time.Hour},
+		{Role: "cluster.login", Principal: u.Principal, MaxDuration: time.Hour, Approvers: []rbac.Principal{cleared.Principal}},
+	} {
+		if err := h.authz.SetEligibility(ctx, owner, secret, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	g, err := h.authz.Activate(ctx, u, secret, rbac.Activation{
+		Role: "cluster.login", Duration: time.Minute, Justification: "on call", Approver: cleared,
+	})
+	if err != nil {
+		t.Fatalf("approved by %s, holding the label's values: %v", cleared.Principal.ID, err)
+	}
+	if g.ApprovedBy != cleared.Principal {
+		t.Errorf("approved by %v, not through u's own eligibility", g.ApprovedBy)
+	}
+}
+
 func TestFilterNeedsTheLabelColumnWhereLabelsAreDeclared(t *testing.T) {
 	h := labeled(t)
 	s := h.as(t, "u")

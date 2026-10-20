@@ -126,8 +126,10 @@ names the scopes conditional ones reach, to check one by one.
   `DeleteDeny` its denies, nor `SetRole` and `DeleteRole` the grants of a role on it, nor
   `ChangeMembers` the members of a labeled group, or of one holding access or exempt from a deny on
   a labeled scope, nor `SetGroup` and `DeleteGroup` a labeled group or the groups of a labeled
-  tenant, each reading the actor's values again under the change's locks; `Explain` names the
-  dimension that failed. `Filter` tests a `text[]` label column (`Columns.Labels`), which needs no
+  tenant, nor does `Activate` count an approval on a labeled scope by an approver whose own values,
+  read with no request's attributes, don't satisfy its label, each reading the actor's or
+  approver's values again under the change's locks; `Explain` names the dimension that failed.
+  `Filter` tests a `text[]` label column (`Columns.Labels`), which needs no
   index, as the path's drives the query; `Reachable` returns the holding, and `Holding` with
   `Satisfies` checks data points in a feed without reading the database.
 - **Writing labeled data:** data read under one label is written under another only if
@@ -204,7 +206,8 @@ names the scopes conditional ones reach, to check one by one.
   cuts the activation short to the latest end of the paths left, or ends it if none is left
   (`ChangeEvent.Shortened` and `Revoked`), whatever another eligibility would allow. Setting the
   eligibility again or deleting it bounds only the activations made from then on, and leaves
-  those made to their ends, or to their holders leaving its group.
+  those made to their ends, or to their holders leaving its group. On a labeled scope, only an
+  approver holding what its label asks for approves.
 - **Host policy:** `Config.ValidateGrant` is asked about every grant with the role, the principal,
   the actor and how it is made, so the host decides who may hold what: members only, no
   privileged roles for service accounts or guests. `Config.Constraints` remove permissions above

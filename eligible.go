@@ -45,7 +45,8 @@ type Eligibility struct {
 	// nothing more.
 	Requires string
 	// Approvers are who approves each activation, identities or groups, at most MaxApprovers; none
-	// when empty. One of them other than the one activating is Activation.Approver.
+	// when empty. One of them other than the one activating is Activation.Approver, and on a scope
+	// whose label asks for values, one that holds them (Authorizer.Activate).
 	Approvers []Principal
 	Note      string
 	// CreatedBy and CreatedAt are set on eligibilities read back.
@@ -233,7 +234,12 @@ type Activation struct {
 // eligibility being the authority, but a constraint that stops changes to grants on the scope's
 // type stops it, and Config.ValidateGrant is asked about it, as about any grant. Where the
 // eligibility names approvers, the host's approval flow activates for s once one approves,
-// passing act.Approver and, in ctx, the request s made (WithRequest), which Requires reads. Of the
+// passing act.Approver and, in ctx, the request s made (WithRequest), which Requires reads.
+// Approving decides access on the scope, as changing its grants does, so where the scope's label
+// asks for values, an approver approves only holding them, as one changing its grants must: its
+// own, decided as Holding decides them, with act.Approver's attributes and none of a request's, as
+// the one in ctx is s's: any read of request.attributes by a condition of them, a test of an
+// attribute's presence included, fails, so a grant's gives nothing and a deny's applies. Of the
 // eligibilities that allow it, with the approver and the request it has, the activation is made
 // through the one whose path from s lasts longest, s's own identity's as long as its membership
 // and a group's as long as the latest of its places to it, and records it: it rests on s being
@@ -276,7 +282,10 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 	for _, k := range keys {
 		reached[k] = time.Time{}
 	}
-	if _, _, err := a.eligible(ctx, a.db, s, on, act, b.ExpiresAt, reached); err != nil {
+	// What the constraints remove of the approver's label values, asked about once, as an actor's
+	// are, with none of a request's attributes.
+	approving := a.constrain(withoutRequest(ctx), act.Approver, Resource{Tenant: on.Tenant, Type: TenantScope, ID: on.Tenant})
+	if _, _, err := a.eligible(ctx, a.db, s, on, act, b.ExpiresAt, reached, approving); err != nil {
 		return Grant{}, err
 	}
 	roles, err := a.tenantBook(ctx, a.db, on.Tenant, []Role{act.Role})
@@ -307,7 +316,8 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 			return ChangeEvent{}, err
 		}
 		held()
-		through, approver, err := a.eligible(ctx, tx, s, on, act, b.ExpiresAt, reached)
+		approving.seal()
+		through, approver, err := a.eligible(ctx, tx, s, on, act, b.ExpiresAt, reached, approving)
 		if err != nil {
 			return ChangeEvent{}, err
 		}
@@ -524,9 +534,21 @@ func (a *Authorizer) restingOn(ctx context.Context, tx pgx.Tx, tenant string, id
 // whatever another eligibility would allow. One that records no principal, stored before Activate
 // recorded them and that migrating couldn't tie to one eligibility, ends, as which of its holder's
 // paths it rested on can't be told. It returns those it cut short and those it ended.
+//
+// It holds them all until the change commits before it reads the paths left, in a later statement:
+// two changes that share no lock, each ending one of an activation's paths, would otherwise each
+// read the other's as left, and neither cut it. Held, the second waits for the first and reads what
+// it left. Grants are the last rows a change holds, after its places and memberships, as Activate
+// holds an activation's places before its grant, and in the order the grants a change removes are
+// locked in (inOrder), so none of this waits out of order.
 func (a *Authorizer) unrest(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, r resting, now time.Time) (short, ended []Grant, err error) {
 	if len(r.ids) == 0 {
 		return nil, nil, nil
+	}
+	// By id alone, which restingOn found in the tenant: beside tenant = $1, a generic plan could read
+	// the tenant's grants by it (byKey).
+	if _, err := tx.Exec(ctx, lockedInOrder("rbac_grants", "", bindingOrder, "id = ANY($1::text[]::uuid[])"), r.ids); err != nil {
+		return nil, nil, err
 	}
 	// Each by its id alone, kept to the tenant's activations in force outside the lookup: beside
 	// tenant = $1 and the source, a generic plan reads every activation in the tenant by the index
@@ -561,15 +583,6 @@ func (a *Authorizer) unrest(ctx context.Context, tx pgx.Tx, tenant string, actor
 	}); err != nil {
 		return nil, nil, err
 	}
-	if len(gone)+len(cut) == 0 {
-		return nil, nil, nil
-	}
-	// In the order the grants a change removes are locked in (inOrder), as two changes ending places
-	// can each cut short the other's. By id alone, which act found in the tenant: beside tenant = $1,
-	// a generic plan could read the tenant's grants by it (byKey).
-	if _, err := tx.Exec(ctx, lockedInOrder("rbac_grants", "", bindingOrder, "id = ANY($1::text[]::uuid[])"), slices.Concat(gone, cut)); err != nil {
-		return nil, nil, err
-	}
 	if len(gone) > 0 {
 		if ended, err = removedWhere(ctx, a, tx, "rbac_grants", grantColumns, collectGrants, "id = ANY($1::text[]::uuid[])", gone); err != nil {
 			return nil, nil, err
@@ -601,11 +614,14 @@ type madeThrough struct {
 // eligible. It returns the eligibility that allows it and who approved: one of s's identity or of
 // one of its groups there, lasting act.Duration or longer and in force until then, whose
 // requirement holds in the request, failing closed, and whose approvers, if it names any, include
-// act.Approver, who isn't s. Of those, the one whose path from s lasts longest, and of those
-// lasting alike and needing approval alike s's own, as the activation rests on it. approved is
-// zero when the eligibility allowing it names none. A privileged role's counts only through s's
-// identity or its groups, as its grants do, never through the tenant's members.
-func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource, act Activation, until time.Time, reached paths) (through madeThrough, approved Principal, err error) {
+// act.Approver, who isn't s, holding what on's label asks for, read through approving. Of those,
+// the one whose path from s lasts longest, and of those lasting alike and needing approval alike
+// s's own, as the activation rests on it. approved is zero when the eligibility allowing it names
+// none. A privileged role's counts only through s's identity or its groups, as its grants do, never
+// through the tenant's members.
+func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource, act Activation, until time.Time, reached paths,
+	approving *constrained,
+) (through madeThrough, approved Principal, err error) {
 	scope, manage := on.Scope(), GrantPermission(on.Type)
 	approvers, _, err := a.keysOf(ctx, q, on.Tenant, act.Approver)
 	if err != nil {
@@ -654,13 +670,27 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 	vars, spend := a.vars(ctx, s, manage, on), budgetOf(2*maxCheckCost)
 	var chosen *eligibility
 	for i, e := range found {
+		if len(e.approvers) > 0 && !approves(act.Approver, s, countedOf(approvers, broad{}), e.approvers) {
+			reason = fmt.Sprintf("activating %s here needs one of its approvers to approve", act.Role)
+			continue
+		}
+		// Before the ranking: the paths' ends, which only the transaction reads, can rank one it
+		// approves first there, and its values must have been asked about before it.
+		if len(e.approvers) > 0 && on.Labels.asks() {
+			// Read the first time in each phase, with none of a request's attributes, as approving
+			// asks the constraints.
+			held, err := approving.holding(withoutRequest(ctx), q)
+			if err != nil {
+				return madeThrough{}, Principal{}, err
+			}
+			if dim := held.Unsatisfied(on.Labels); dim != "" {
+				reason = "the resource's label asks for values in " + dim + " its approver doesn't hold"
+				continue
+			}
+		}
 		// Found later, one that doesn't outrank the one chosen loses to it, on its requirement or
 		// principal where they tie, so needn't be evaluated.
 		if chosen != nil && !outranks(e, *chosen) {
-			continue
-		}
-		if len(e.approvers) > 0 && !approves(act.Approver, s, countedOf(approvers, broad{}), e.approvers) {
-			reason = fmt.Sprintf("activating %s here needs one of its approvers to approve", act.Role)
 			continue
 		}
 		if e.requires == "" || a.conds.holds(spend, e.requires, vars) {
