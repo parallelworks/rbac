@@ -863,7 +863,9 @@ func TestHoldersReadsTheMembershipsOfALargeGroupInAsManyPages(t *testing.T) {
 	ctx := t.Context()
 	h.groups(t, "everyone")
 	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "everyone"))
-	const n = 5000
+	// Only in a tenant this large does the planner, counting a function's rows as a thousand, look
+	// each member's membership up on its own: at 5,000 it hashes them.
+	const n = 20000
 	manyMembers(t, h, n, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
 		SELECT 't1', 'everyone', 'user', id FROM others`, "rbac_members", "rbac_history")
 	// The pages table and its indexes fill.
