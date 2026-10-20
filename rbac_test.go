@@ -249,11 +249,15 @@ func allowed(t *testing.T, h *harness, s rbac.Subject, p rbac.Permission, r rbac
 func TestNewRejectsBadConfiguration(t *testing.T) {
 	ok := func(context.Context, rbac.DB, rbac.GrantInput) error { return nil }
 	for name, cfg := range map[string]rbac.Config{
-		"no principal check":    {Catalog: catalog},
-		"duplicate role":        {Catalog: append(slices.Clone(catalog), catalog[0]), ValidateGrant: ok},
-		"bad permission":        {Catalog: []rbac.RoleDefinition{{ID: "r", Permissions: []rbac.Permission{"login"}, ResourceTypes: []string{"cluster"}}}, ValidateGrant: ok},
-		"no permissions":        {Catalog: []rbac.RoleDefinition{{ID: "r", ResourceTypes: []string{"cluster"}}}, ValidateGrant: ok},
-		"bad container":         {Catalog: catalog, ContainerTypes: []string{"tenant"}, ValidateGrant: ok},
+		"no principal check": {Catalog: catalog},
+		"duplicate role":     {Catalog: append(slices.Clone(catalog), catalog[0]), ValidateGrant: ok},
+		"bad permission":     {Catalog: []rbac.RoleDefinition{{ID: "r", Permissions: []rbac.Permission{"login"}, ResourceTypes: []string{"cluster"}}}, ValidateGrant: ok},
+		"no permissions":     {Catalog: []rbac.RoleDefinition{{ID: "r", ResourceTypes: []string{"cluster"}}}, ValidateGrant: ok},
+		"bad container":      {Catalog: catalog, ContainerTypes: []string{"tenant"}, ValidateGrant: ok},
+		"a container named as a dimension": {
+			Catalog: catalog, ContainerTypes: []string{"rel"}, ValidateGrant: ok,
+			Labels: []rbac.LabelDimension{{Name: "rel", Rule: rbac.AnyOf, Values: []string{"gbr"}}},
+		},
 		"a kind every host has": {Catalog: catalog, PrincipalKinds: []rbac.PrincipalKind{rbac.Group}, ValidateGrant: ok},
 		"a malformed kind":      {Catalog: catalog, PrincipalKinds: []rbac.PrincipalKind{"Service Account"}, ValidateGrant: ok},
 		"a reserved kind":       {Catalog: catalog, PrincipalKinds: []rbac.PrincipalKind{"authenticated"}, ValidateGrant: ok},

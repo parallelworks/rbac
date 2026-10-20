@@ -200,7 +200,7 @@ func (a *Authorizer) checkDeny(tenant string, d Deny) error {
 			bad("permission %q is a label value or a power to release, which is held on the tenant, so it is denied there alone", p)
 		}
 	}
-	for _, fault := range a.conditionFaults(d.Condition) {
+	for _, fault := range a.conditionFaults(nil, d.Condition) {
 		bad("%s", fault)
 	}
 	if len(errs) > 0 {

@@ -546,6 +546,7 @@ chose to store beyond these.
 | `MaxApprovers`, `MaxActivation` | 16, 366 days | An eligibility's approvers, and its longest activation. |
 | `MaxGroupDepth` | 8 | How deeply groups nest. |
 | `MaxExpression` | 2,048 bytes | A condition's or requirement's expression. Its cost is bounded too. |
+| `MaxConditionBytes` | 128 KiB | The conditions one `Apply` or `Import` carries, each distinct one counted once. |
 | `MaxName`, `MaxDescription`, `MaxNote` | 128, 2,048, 2,048 characters | Names, titles and group ids, descriptions, and notes and justifications. |
 | `MaxRequest` | 256 characters | A request id in `Audit`. |
 | `MaxHistory`, `MaxPrune` | 10,000 each | Records read by one `History` call, and deleted by one prune. |

@@ -70,8 +70,10 @@ const (
 	// can't make it slow: once it is spent, no further condition holds, and what needs one is
 	// refused.
 	maxCheckCost = 8 * maxCost
-	// compilePerByte is what compiling a condition costs for each byte of it: compiling one
-	// takes about as long as evaluating eight units of cost for each.
+	// compilePerByte is what compiling a condition costs for each byte of it. Compiling one takes
+	// about as long as evaluating forty units of cost for each, but once for each condition, which
+	// checks then read from the cache, so this counts it cheaper: a check of conditions none of
+	// which is cached can take a few times what its budget implies.
 	compilePerByte = 8
 	// maxDepth bounds how deeply a condition nests: checking its types takes time that grows much
 	// faster than its length with depth, which compilePerByte doesn't count.
@@ -348,6 +350,10 @@ func equal(x, y ref.Val) ref.Val {
 	}
 	if types.IsUnknownOrError(y) {
 		return y
+	}
+	// By their sizes alone, CEL's comparison would tell a refused name from one never passed.
+	if refusing(x) || refusing(y) {
+		return refusal()
 	}
 	var failed ref.Val
 	same := func(a, b ref.Val) bool {
@@ -641,7 +647,7 @@ func (a *Authorizer) vars(ctx context.Context, s Subject, p Permission, r Resour
 // error that whatever reads it fails on, comparing it included, as one not passed is. CEL compares values of different types as unequal rather
 // than fail, so otherwise a `!=` would hold for it, and a deny's `==` would lift. A kind not
 // declared is as passed.
-func declared(declares map[string]AttributeType, attributes map[string]any) map[string]any {
+func declared(declares map[string]AttributeType, attributes map[string]any) any {
 	attributes = orEmpty(attributes)
 	if declares == nil {
 		return attributes
@@ -666,8 +672,33 @@ func declared(declares map[string]AttributeType, attributes map[string]any) map[
 	if typed == nil {
 		return attributes
 	}
-	return typed
+	return refusedAttributes{types.NewStringInterfaceMap(types.DefaultTypeAdapter, typed)}
 }
+
+// refusedAttributes are a kind's attributes with some refused, as conditions read them. A refused
+// one fails what reads it by name, as CEL fails a value that is an error, and so does a test of
+// its presence, which CEL reads from a map's keys alone and which would otherwise hold. Whatever
+// reads the map as a whole, in, size(), the macros and comparing it, fails too, as it could tell a
+// refused name from one never passed.
+type refusedAttributes struct {
+	traits.Mapper
+}
+
+// refusedAttributesType has none of a map's traits, so CEL has no size(), in or macro for it.
+var refusedAttributesType = types.NewOpaqueType("rbac.RefusedAttributes")
+
+func (refusedAttributes) Type() ref.Type { return refusedAttributesType }
+
+// Contains fails, for the bounded decorator, which finds in by a map's own method.
+func (refusedAttributes) Contains(ref.Val) ref.Val { return refusal() }
+
+func refusing(v ref.Val) bool {
+	_, ok := v.(refusedAttributes)
+	return ok
+}
+
+// refusal is a new error each time, as CEL labels an error with the node it was raised at.
+func refusal() ref.Val { return types.NewErr("rbac: the attributes hold one refused") }
 
 func orEmpty(m map[string]any) map[string]any {
 	if m == nil {

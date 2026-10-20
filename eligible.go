@@ -1,6 +1,7 @@
 package rbac
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -319,12 +320,10 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 	if err != nil {
 		return Principal{}, err
 	}
-	// Those needing no approval first, so an approver passed where none is needed isn't recorded.
 	rows, err := q.Query(ctx, `
 		SELECT requires, approvers FROM rbac_eligibilities
 		WHERE tenant = $1 AND scope = $2 AND role = $3 AND principal = ANY($4::text[]) AND max_seconds >= $5
-		  AND (expires_at IS NULL OR expires_at > $6 AND expires_at >= $7)
-		ORDER BY cardinality(approvers), requires`,
+		  AND (expires_at IS NULL OR expires_at > $6 AND expires_at >= $7)`,
 		on.Tenant, scope.Key(), act.Role, countedOf(keys, broad{}), seconds(act.Duration), a.cfg.Now(), until)
 	if err != nil {
 		return Principal{}, err
@@ -340,6 +339,13 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 	if err != nil {
 		return Principal{}, err
 	}
+	// Those needing no approval first, so an approver passed where none is needed isn't recorded,
+	// and of each the cheapest requirement first, as checks order conditions, so which allows
+	// doesn't rest on how many approvers one names.
+	cheapestFirst(found, func(e eligibility) string { return e.requires })
+	slices.SortStableFunc(found, func(x, y eligibility) int {
+		return cmp.Compare(min(len(x.approvers), 1), min(len(y.approvers), 1))
+	})
 	reason := fmt.Sprintf("not eligible to activate %s here for %s", act.Role, act.Duration)
 	vars, spend := a.vars(ctx, s, manage, on), newBudget()
 	for _, e := range found {
