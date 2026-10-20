@@ -809,6 +809,41 @@ func TestMigratingRecordsARowWrittenBeforeHistory(t *testing.T) {
 	}
 }
 
+// No table bounds when a row was created, so one written before history can say -infinity, before
+// year 1 or its first instant, times JSON can't write or a Record reads as none: migrating dates
+// its baseline at the epoch, as such an expiry, and AsOf reads the row from then.
+func TestMigratingDatesARowCreatedBeforeYearOneAtTheEpoch(t *testing.T) {
+	pool := pgtest.Open(t, "")
+	ctx := t.Context()
+	migrateFiles(t, pool, "", "0003")
+	for _, sql := range []string{
+		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id, created_at)
+		 VALUES ('t1', 'user', 'a', '-infinity'), ('t1', 'user', 'b', '0044-03-15 12:00:00+00 BC'), ('t1', 'user', 'c', '0001-01-01 00:00:00+00')`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, created_at)
+		 VALUES ('t1', 'cluster', 'c1', 'user', 'a', 'cluster.login', '0001-01-01 00:00:00+00')`,
+		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types, updated_at)
+		 VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}', '-infinity')`,
+	} {
+		if _, err := pool.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	migrateFiles(t, pool, "0003", "")
+	h := migrated(t, pool)
+	var cursor rbac.Cursor
+	for _, r := range drain(t, h, &cursor, 5) {
+		if _, err := json.Marshal(r); err != nil || r.Op != "baseline" || !r.EffectiveAt.Equal(time.Unix(0, 0)) {
+			t.Errorf("%s %s, dated %v: %v", r.Entity, r.Key, r.EffectiveAt, err)
+		}
+	}
+	a := rbac.Subject{Principal: rbac.Principal{Kind: rbac.User, ID: "a"}}
+	if err := h.authz.AsOf(ctx, "t1", time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC), func(b *rbac.Authorizer) error {
+		return b.Authorize(ctx, a, login, cluster)
+	}); err != nil {
+		t.Errorf("as of 2000: %v", err)
+	}
+}
+
 // A change in flight to a row written before history, as migrating records the row, is the row's
 // record: migrating waits for it rather than record the row as it was before, after the change,
 // in a transaction of its own at any isolation.

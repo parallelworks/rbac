@@ -511,7 +511,7 @@ flowchart LR
   the database role that wrote it, and the actor and call it was made through, with what the host
   attached. A write that bypassed the package is recorded too, with no actor. A row written
   before history was installed has one record from migrating, its baseline, dated when it was
-  created.
+  created, or at the epoch where that was before year 1 or at its first instant.
 - **History's order.** `History` reads records in transaction order, and only those of
   transactions older than every transaction still running, which have all ended. So a cursor
   never passes a record that commits later. It, `Export` and `PruneHistory` name history by its
