@@ -141,6 +141,43 @@ func TestAsOfChangesNothing(t *testing.T) {
 	}
 }
 
+// AsOf on a host's DB that has no BeginTx reads the past at REPEATABLE READ, as on a pool, so a
+// read of several statements reads one snapshot; on a wrapper around the host's transaction, at
+// that transaction's isolation, as under WithTx.
+func TestAsOfOnAWrapperReadsOneSnapshot(t *testing.T) {
+	var level string
+	h := setup(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "level", Deny: func(ctx context.Context, q rbac.DB, _ rbac.ConstraintInput) (bool, error) {
+			return false, q.QueryRow(ctx, `SELECT current_setting('transaction_isolation')`).Scan(&level)
+		}}}
+	})
+	ctx := t.Context()
+	owner := h.as(t, "owner")
+	at := dbNow(t, h)
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, c := range []struct {
+		name string
+		db   rbac.DB
+		want string
+	}{{"a pool", h.pool, "repeatable read"}, {"the host's transaction", tx, "read committed"}} {
+		a, err := rbac.New(struct{ rbac.DB }{c.db}, h.cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		level = ""
+		if err := a.AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error { return a.Authorize(ctx, owner, login, cluster) }); err != nil {
+			t.Fatalf("on a wrapper around %s: %v", c.name, err)
+		}
+		if level != c.want {
+			t.Errorf("on a wrapper around %s, AsOf read at %q, not %q", c.name, level, c.want)
+		}
+	}
+}
+
 func TestAsOfLeavesTheHostsTransactionAsItWas(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()

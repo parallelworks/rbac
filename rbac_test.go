@@ -480,7 +480,8 @@ func TestFilterLooksUpDeniesOnResourcesByEachRowsKey(t *testing.T) {
 	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "u"))
 	u := h.as(t, "u")
 	denied := 0
-	// The time Filter's condition takes to count the rows once n of them are denied.
+	// The time Filter's condition takes to count the rows once n of them are denied, the fastest of
+	// a few, so a stall of the database's in one doesn't count.
 	listed := func(n int) time.Duration {
 		t.Helper()
 		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
@@ -492,12 +493,18 @@ func TestFilterLooksUpDeniesOnResourcesByEachRowsKey(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		start := time.Now()
-		var kept int
-		if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM fleet WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil || kept != rows-n {
-			t.Fatalf("Filter kept %d of %d rows with %d denied, %v", kept, rows, n, err)
+		var fastest time.Duration
+		for i := range 3 {
+			start := time.Now()
+			var kept int
+			if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM fleet WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil || kept != rows-n {
+				t.Fatalf("Filter kept %d of %d rows with %d denied, %v", kept, rows, n, err)
+			}
+			if took := time.Since(start); i == 0 || took < fastest {
+				fastest = took
+			}
 		}
-		return time.Since(start)
+		return fastest
 	}
 	few := listed(40)
 	if many := listed(4000); many > 10*few && many > 100*time.Millisecond {
@@ -2673,6 +2680,43 @@ func TestChangesOnASerializableDatabase(t *testing.T) {
 		if !allowed(t, h, h.as(t, u.ID), login, cluster) {
 			t.Fatal("the grant should be stored")
 		}
+	}
+}
+
+// On a host's wrapper around its own transaction, whose Begin gives a savepoint, which can't take
+// another isolation, changes and reads of several statements run in that transaction at its
+// isolation, as under WithTx: what a change makes, a read sees, and the host's rollback undoes.
+func TestAWrapperAroundAHostsTransaction(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	owner, u := h.as(t, "owner"), h.as(t, "u")
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	a, err := rbac.New(struct{ rbac.DB }{tx}, h.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: u.Principal}}}); err != nil {
+		t.Fatalf("a change: %v", err)
+	}
+	holders, err := a.Holders(ctx, login, cluster)
+	if err != nil || !slices.ContainsFunc(holders, func(x rbac.Holder) bool { return x.Principal == u.Principal }) {
+		t.Fatalf("Holders = %+v, %v", holders, err)
+	}
+	if reach, err := a.Reachable(ctx, u, login, "t1", "cluster"); err != nil || !slices.Contains(reach.Scopes, cluster.Scope()) {
+		t.Fatalf("Reachable = %+v, %v", reach, err)
+	}
+	if d, err := a.Explain(ctx, u, login, cluster); err != nil || !d.Allowed {
+		t.Fatalf("Explain = %+v, %v", d, err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if allowed(t, h, u, login, cluster) {
+		t.Fatal("the change outlived the host's transaction")
 	}
 }
 

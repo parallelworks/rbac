@@ -1091,12 +1091,13 @@ const (
 // heldOrDenied returns the grants on any of scopes, not expired, held by s's principals in a
 // tenant, counting broad ones as counts says, and the denies deniesOn reads for all its principals
 // and p, or any permission when p is empty, in one statement that reads its membership and groups
-// too, so a check is one round trip. The grants' part reads only what the key index holds, so it
-// is an index-only scan, and the other indexes it could use lead to the principals and scopes too,
-// so a generic plan reads no more grants whichever it picks. Like Explain, it reads no deny for a
-// subject none of whose grants count, such as one that isn't a member or guest of the tenant. It
-// reads the custom roles roles says in the statement too, as SetRole changes one in place: read
-// apart, a grant revoked and its role widened meanwhile could give what no moment did.
+// too, so a check is one round trip. The grants' part reads only what the key index holds, and the
+// other indexes it could use lead to the principals and scopes too and hold the same, so whichever
+// a plan picks, a generic one too, it is an index-only scan of no more grants. Like Explain, it
+// reads no deny for a subject none of whose grants count, such as one that isn't a member or guest
+// of the tenant. It reads the custom roles roles says in the statement too, as SetRole changes one
+// in place: read apart, a grant revoked and its role widened meanwhile could give what no moment
+// did.
 func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Subject, counts broad, scopes []string, p Permission,
 	roles rolesRead,
 ) ([]holding, []denial, book, error) {

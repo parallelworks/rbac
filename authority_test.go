@@ -1010,6 +1010,59 @@ func TestChecksUnderAGenericPlanReadOnlyTheirSubjectsGrants(t *testing.T) {
 	}
 }
 
+// A check reads its subject's grants from an index alone, under a generic plan too: a plan picks
+// the narrower indexes leading to a scope or to a principal over the key, so they hold what a check
+// reads, as the key does, or it would read each grant's row, which grants made at different times
+// have on pages of their own.
+func TestChecksReadTheirGrantsFromAnIndexAlone(t *testing.T) {
+	for _, plan := range []string{"custom", "generic"} {
+		t.Run(plan, func(t *testing.T) {
+			var h *harness
+			if plan == "generic" {
+				h = generic(t)
+			} else {
+				h = setup(t)
+			}
+			ctx := t.Context()
+			ann := h.as(t, "ann", "builders")
+			held := 0
+			for _, s := range []rbac.Scope{cluster.Scope(), {Type: "workspace", ID: "w1"}, {Type: "org", ID: "o1"}, rbac.TenantRoot("t1")} {
+				for _, r := range []rbac.Role{"cluster.login", "cluster.sudo", "cluster.admin"} {
+					h.seed(t, grant(s, r, rbac.User, "ann"), grant(s, r, rbac.Group, "builders"))
+					held += 2
+					manyMembers(t, h, 300, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+						SELECT 't1', 'tenant', 't1', 'user', id, 'cluster.login' FROM others`, "rbac_grants")
+				}
+			}
+			// So the visibility map lets a scan of an index skip the rows.
+			if _, err := h.pool.Exec(ctx, `VACUUM rbac_grants`); err != nil {
+				t.Fatal(err)
+			}
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			// The pages of the table itself, not its indexes: its rows and its visibility map.
+			rows := func() int64 {
+				t.Helper()
+				var n int64
+				if err := tx.QueryRow(ctx, `SELECT pg_stat_get_xact_blocks_fetched('rbac_grants'::regclass)`).Scan(&n); err != nil {
+					t.Fatal(err)
+				}
+				return n
+			}
+			start := rows()
+			if err := h.authz.WithTx(tx).Authorize(ctx, ann, login, cluster); err != nil {
+				t.Fatal(err)
+			}
+			if read := rows() - start; read > int64(held/4) {
+				t.Errorf("a check of a subject holding %d grants read %d pages of the table's rows", held, read)
+			}
+		})
+	}
+}
+
 // Filter, its condition in the host's query, and Reachable read, of the grants, only the subject's
 // principals' on scopes of the types a resource's path holds, a type at a time, under a generic plan
 // too: of a range of each type's scopes, a plan can seek only one, and reading every grant of the

@@ -1266,8 +1266,7 @@ type ownTx interface {
 func isolated(ctx context.Context, db DB, level string, fn func(pgx.Tx) error) (nested bool, err error) {
 	err = savepoint(ctx, db, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL "+level); err != nil {
-			var pg *pgconn.PgError
-			nested = errors.As(err, &pg) && pg.Code == "25001"
+			nested = isolationRefused(err)
 			return err
 		}
 		return fn(tx)
@@ -1276,6 +1275,33 @@ func isolated(ctx context.Context, db DB, level string, fn func(pgx.Tx) error) (
 		return true, nil
 	}
 	return false, err
+}
+
+// isolationRefused reports whether err is PostgreSQL refusing to set a transaction's isolation
+// once it is under way, as in a savepoint of a host's transaction.
+func isolationRefused(err error) bool {
+	var pg *pgconn.PgError
+	return errors.As(err, &pg) && pg.Code == "25001"
+}
+
+// repeatableRead begins on db, a DB that is neither an ownTx nor a pgx.Tx, a transaction at
+// REPEATABLE READ, as isolated does, so a read of several statements reads one snapshot; where its
+// Begin gives a savepoint of a transaction under way, which refuses that, a savepoint at that
+// transaction's isolation, as under WithTx.
+func repeatableRead(ctx context.Context, db DB) (pgx.Tx, error) {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err == nil {
+		return tx, nil
+	}
+	c, cancel := context.WithTimeout(context.WithoutCancel(ctx), savepointEnd)
+	defer cancel()
+	if rerr := tx.Rollback(c); rerr != nil || !isolationRefused(err) {
+		return nil, errors.Join(err, rerr)
+	}
+	return db.Begin(ctx)
 }
 
 // savepointEnd is how long a savepoint's release or rollback may take once its ctx is done.

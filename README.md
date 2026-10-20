@@ -330,6 +330,9 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
 - **Tables:** `rbac.Migrate` creates them, prefixed `rbac_`, in the connection's current schema,
   in a database whose encoding is UTF8, and records what it applied in `rbac_migrations`. It never
   runs by itself; a host with a migration tool of its own can apply `rbac.Migrations()` instead.
+  A migration that rebuilds an index, as `0009_grant_seeks` rebuilds two of `rbac_grants`, locks
+  the table until it commits, so checks, lists and changes wait for the rebuild: on a large table,
+  migrate when that wait is acceptable.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
   between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows
