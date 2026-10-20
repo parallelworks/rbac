@@ -261,7 +261,9 @@ func typing(attrs Attributes) (*cel.Env, error) {
 // own, however deep, a protobuf message among them cloned, and a value reached twice copied once,
 // so a cycle ends. A struct's fields an unexported struct it embeds promotes are its own too, but
 // its other unexported fields are shared, a pointer it embeds unexported among them, and so the
-// fields that one promotes: reflection can't set them.
+// fields that one promotes: reflection can't set them. A map's keys are shared too, and what a
+// pointer among them reaches: a copied key would be another key, so the copy would find nothing
+// under the one the host passed.
 func deepCopy[T any](v T) T {
 	out := reflect.ValueOf(&v).Elem()
 	out.Set(copier{}.copy(out))

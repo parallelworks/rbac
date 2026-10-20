@@ -520,7 +520,9 @@ type Constraint struct {
 // resource, their attributes, ancestors and label too, however deep, so one writing to them
 // changes nothing decided. A host's struct among the attributes is copied by its exported fields
 // and those an unexported struct it embeds promotes: the rest, a pointer it embeds unexported and
-// the fields that promotes among them, reflection can't set, so they are shared.
+// the fields that promotes among them, reflection can't set, so they are shared. A map's keys are
+// shared, and what a pointer among them reaches, as a copied key would be another key: key a map
+// among the attributes by values, not pointers, or write through none.
 type ConstraintInput struct {
 	Tenant       string
 	ResourceType string
