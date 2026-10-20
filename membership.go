@@ -827,20 +827,22 @@ func anyOf(key string, selects ...string) string {
 	return key + " = ANY(ARRAY(" + strings.Join(selects, " UNION ALL ") + "))"
 }
 
-// lockDenies locks, in tx, in order, the denies any of selects picks by their keys, a deny's
-// tenant, scope and id (denyKey), each looked up by its key on its own, for a change that changes
-// them in later statements, which can then find them by a ctid. A deny has no column of its own
-// that keys it, and its ctid moves as a change takes a principal out of its exemptions, which
-// takes no lock of its scope's: a lock by ctid that waited for that change would pass over it.
-// Matched to the denies in a semi-join instead, a plan can read the table whole.
+// lockDenies locks, in tx, in order, the denies any of selects picks by denyKey, each looked up by
+// its primary key on its own, for a change that changes them in later statements, which can then
+// find them by a ctid. A deny has no column of its own that keys it, and its ctid moves as a change
+// takes a principal out of its exemptions, which takes no lock of its scope's: a lock by ctid that
+// waited for that change would pass over it. Matched to the denies in a semi-join instead, a plan
+// can read the table whole.
 func lockDenies(ctx context.Context, tx pgx.Tx, selects []string, args ...any) error {
 	_, err := tx.Exec(ctx, `SELECT FROM (SELECT DISTINCT `+denyKey+` FROM (`+strings.Join(selects, " UNION ALL ")+`) u ORDER BY `+denyOrder+`) k
-		CROSS JOIN LATERAL (SELECT FROM rbac_denies d WHERE d.tenant = k.tenant AND d.scope = k.scope AND d.id = k.id FOR UPDATE) d`, args...)
+		CROSS JOIN LATERAL (SELECT FROM rbac_denies d
+		  WHERE d.tenant = k.tenant AND d.scope_type = k.scope_type AND d.scope_id = k.scope_id AND d.id = k.id FOR UPDATE) d`, args...)
 	return err
 }
 
-// denyKey is what keys a deny, in the order of denyOrder.
-const denyKey = "tenant, scope, id"
+// denyKey is what keys a deny, its primary key, with its scope, which denyOrder sorts by: types sort
+// apart from their scopes, as a type can hold '-', which sorts before ':'.
+const denyKey = "tenant, scope_type, scope_id, id, scope"
 
 // notOwnedGroups refuses, on q, changing groups from a source the host owns, which only it changes.
 func (a *Authorizer) notOwnedGroups(ctx context.Context, q DB, tenant string, ids []string) error {

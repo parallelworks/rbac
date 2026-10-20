@@ -2907,6 +2907,64 @@ func TestDeletesReadOnlyTheirScopesOrPrincipalsRows(t *testing.T) {
 	}
 }
 
+// Deleting a scope, or a group, with many denies on it reads about as many pages for each of them
+// however many there are: each is locked by its primary key. By the index on the scope, each
+// lookup reads every deny on the scope.
+func TestDeletingAScopesDeniesReadsEachByItsKey(t *testing.T) {
+	for _, plan := range []string{"custom", "generic"} {
+		t.Run(plan, func(t *testing.T) {
+			var h *harness
+			if plan == "generic" {
+				h = generic(t)
+			} else {
+				h = custom(t)
+			}
+			ctx := t.Context()
+			h.groups(t, "g")
+			denied := 0
+			// The pages of the denies and their indexes each deletion reads once n denies are on the
+			// cluster and on g, in a transaction it rolls back.
+			read := func(n int) map[string]int64 {
+				t.Helper()
+				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+					SELECT 't1', s, i, 'd' || j, '{public:}', '{cluster:login}' FROM (VALUES ('cluster', 'c1'), ('group', 'g')) v(s, i),
+					  generate_series($1 + 1, $2) j`, denied, n); err != nil {
+					t.Fatal(err)
+				}
+				denied = n
+				if _, err := h.pool.Exec(ctx, `ANALYZE rbac_denies`); err != nil {
+					t.Fatal(err)
+				}
+				pages := map[string]int64{}
+				for what, f := range map[string]func(a *rbac.Authorizer) error{
+					"DeleteScopes": func(a *rbac.Authorizer) error { return a.DeleteScopes(ctx, host, "t1", []rbac.Scope{cluster.Scope()}) },
+					"DeleteGroups": func(a *rbac.Authorizer) error { return a.DeleteGroups(ctx, host, "t1", []string{"g"}) },
+				} {
+					func() {
+						tx, err := h.pool.Begin(ctx)
+						if err != nil {
+							t.Fatal(err)
+						}
+						defer func() { _ = tx.Rollback(ctx) }()
+						start := pagesRead(ctx, t, tx, "rbac_denies")
+						if err := f(h.authz.WithTx(tx)); err != nil {
+							t.Fatalf("%s: %v", what, err)
+						}
+						pages[what] = pagesRead(ctx, t, tx, "rbac_denies") - start
+					}()
+				}
+				return pages
+			}
+			few := read(100)
+			for what, many := range read(1000) {
+				if many > few[what]*10*3/2+deeper {
+					t.Errorf("%s read %d pages with 100 denies on its scope, and %d with 1,000", what, few[what], many)
+				}
+			}
+		})
+	}
+}
+
 // Deleting groups reads, of the eligibilities and denies, only those of the groups, on them, that
 // they approve, and that name or exempt them, under a generic plan too: found by those conditions
 // ORed beside tenant = $1, which no index seeks, they were read from every eligibility and deny in
