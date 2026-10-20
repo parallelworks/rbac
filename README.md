@@ -117,8 +117,9 @@ reach, to check one by one.
   nor `ChangeMembers` the members of a labeled group, or of one holding access or exempt from a deny
   on a labeled scope, nor `SetGroup` and `DeleteGroup` the groups of a labeled tenant, each reading
   the actor's values again under the change's locks; `Explain` names the dimension that failed.
-  `Filter` tests a `text[]` label column (`Columns.Labels`), `Reachable` returns the holding, and
-  `Holding` with `Satisfies` checks data points in a feed without reading the database.
+  `Filter` tests a `text[]` label column (`Columns.Labels`), which needs no index, as the path's
+  drives the query; `Reachable` returns the holding, and `Holding` with `Satisfies` checks data
+  points in a feed without reading the database.
 - **Writing labeled data:** data read under one label is written under another only if
   `Holding.MayWrite` allows it: the writer satisfies the label it read, and the new one is at
   least as restrictive in every dimension (a level as high, every compartment kept, partners

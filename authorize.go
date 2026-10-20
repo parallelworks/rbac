@@ -928,9 +928,10 @@ type Columns struct {
 	// compared byte for byte, whatever its collation, which the index serves in.
 	Path string
 	// Labels is a text[] holding the resource's label as `dimension:value` values, never NULL: '{}'
-	// for none. With a GIN index in the default collation, in which the test compares them, it
-	// serves the label's test, which keeps only the rows the subject's holding satisfies. With
-	// labels declared it is needed, so Filter refuses a call without it as invalid: pass
+	// for none. The label's test, which keeps only the rows the subject's holding satisfies,
+	// compares them in the default collation and needs no index: an index on the column could serve
+	// it only by reading every row it holds, so the path's index drives the query. With labels
+	// declared the column is needed, so Filter refuses a call without it as invalid: pass
 	// '{}'::text[] for a type whose resources carry no label.
 	Labels string
 }
