@@ -854,3 +854,81 @@ func TestAsOfReadsNoCustomRoleACheckDoesntName(t *testing.T) {
 		t.Errorf("a check as of a time read %d pages of history beside no custom role, and %d beside 200", few, many)
 	}
 }
+
+// As of a time, a list of the grants or the eligibilities on a scope reads their history, not every
+// grant's and eligibility's in the tenant.
+func TestAsOfListsAScopesGrantsAndEligibilitiesAlone(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.as(t, "u")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'cluster.sudo', 3600)`); err != nil {
+		t.Fatal(err)
+	}
+	// Grants and eligibilities on other clusters.
+	others := func(n int) {
+		t.Helper()
+		for _, q := range []string{
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			  SELECT 't1', 'cluster', gen_random_uuid()::text, 'user', gen_random_uuid()::text, 'cluster.login' FROM generate_series(1, $1)`,
+			`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+			  SELECT 't1', 'cluster', gen_random_uuid()::text, 'user', gen_random_uuid()::text, 'cluster.sudo', 3600 FROM generate_series(1, $1)`,
+		} {
+			if _, err := h.pool.Exec(ctx, q, n); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := h.pool.Exec(ctx, `ANALYZE rbac_history`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scopes := rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}}
+	lists := []struct {
+		what string
+		list func(a *rbac.Authorizer) (int, error)
+	}{
+		{"the grants on a cluster", func(a *rbac.Authorizer) (int, error) {
+			gs, err := a.Grants(ctx, "t1", scopes)
+			return len(gs), err
+		}},
+		{"the eligibilities on a cluster", func(a *rbac.Authorizer) (int, error) {
+			es, err := a.Eligibilities(ctx, "t1", scopes)
+			return len(es), err
+		}},
+	}
+	read := func(at time.Time) map[string]int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		pages := map[string]int64{}
+		if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+			for _, l := range lists {
+				start := historyPages(ctx, t, tx)
+				n, err := l.list(a)
+				if err == nil && n == 0 {
+					err = errors.New("none listed")
+				}
+				if err != nil {
+					return fmt.Errorf("%s: %w", l.what, err)
+				}
+				pages[l.what] = historyPages(ctx, t, tx) - start
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return pages
+	}
+	others(1000)
+	few := read(dbNow(t, h))
+	others(9000)
+	for what, many := range read(dbNow(t, h)) {
+		if many > few[what]*3/2+deeper {
+			t.Errorf("as of a time, %s read %d pages of history beside 1000 others in the tenant, and %d beside 10,000", what, few[what], many)
+		}
+	}
+}

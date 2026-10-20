@@ -445,7 +445,8 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   after it: an activation it extends keeps the eligibility recorded before, and can outlast the one
   it was extended through. Stop the replicas running it before migrating. `0013_bounded_rows`
   locks every table, history too, until it commits, and reads each once for each check it adds,
-  so checks, lists, changes and reads of history wait for it.
+  so checks, lists, changes and reads of history wait for it. `0015_history_seeks` builds an index
+  on `rbac_history`, which every change writes, so changes wait until it commits.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
   between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows

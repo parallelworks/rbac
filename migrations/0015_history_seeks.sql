@@ -7,3 +7,11 @@
 -- 200 roles was about 20,000 pages. Statistics of the two columns together count each pair common
 -- enough to matter as it is.
 CREATE STATISTICS rbac_history_tenant_entity (mcv) ON tenant, entity FROM rbac_history;
+
+-- As of a time, a list of the grants or the eligibilities on a scope read every version of every
+-- one in the tenant: history had an index by scope for denies alone. This one finds an entity's
+-- versions on a scope. Denies keep theirs, which holds no grant: in this one, every grant's version
+-- would deepen each lookup of a scope's denies, which a check makes for each scope on its path.
+-- Building it reads all of history, and every write to the package's tables, each of which writes
+-- history, waits until the migration commits.
+CREATE INDEX rbac_history_scope ON rbac_history (tenant, entity, scope, effective_at DESC) WHERE entity IN ('grant', 'eligibility');
