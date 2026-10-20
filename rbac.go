@@ -509,7 +509,10 @@ func (e ChangeEvent) empty() bool {
 type Constraint struct {
 	Name string
 	// Deny reports whether the constraint removes in.Permission. q is what the call runs on, to
-	// read the host's policy in the same transaction.
+	// read the host's policy in the same transaction. A read asks before its own transaction, so
+	// Deny may query the host's pool there too; but under AsOf, as under WithTx, q is a transaction
+	// that holds one of the pool's connections while Deny runs, so query q: a query of the pool
+	// waits for another connection, which on a busy pool may never come.
 	Deny func(ctx context.Context, q DB, in ConstraintInput) (bool, error)
 }
 

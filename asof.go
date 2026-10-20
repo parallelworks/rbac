@@ -35,8 +35,12 @@ var asOfEntities = []struct {
 // reads the whole record as it does outside. A change counts from when the statement that made it
 // began, but never before its row's change before it, so what a time reads can still change until
 // every transaction running then has ended.
-// Hooks run as for any read, and a constraint that reads the package's tables through the DB it
-// is given reads them as of the time too; one that reads the host's reads them as they are now.
+// Hooks run as for any read, but in its transaction, which holds one of the pool's connections
+// until read returns: a constraint that reads the package's tables through the DB it is given reads
+// them as of the time too, and one that reads the host's reads them as they are now. A hook that
+// queries the pool, rather than the DB it is given, waits for another of its connections, which on
+// a busy pool, or one of a single connection, may never come: under AsOf, hooks query what they are
+// given.
 // A Filter condition reads as of the time only in a query on the transaction read runs in: under
 // WithTx, the host's, before read returns. It refuses a time earlier than the before of any
 // PruneHistory that deleted records, as they can be versions such a time would read, and fails
