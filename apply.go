@@ -2066,7 +2066,7 @@ func (a *Authorizer) deleteScopes(ctx context.Context, actor Principal, tenant, 
 	slices.Sort(keys)
 	keys = slices.Compact(keys)
 	return a.delete(ctx, actor, tenant, how, func(tx pgx.Tx) error { return lockAll(ctx, tx, tenant, keys, nil) },
-		deletion{denies: "scope = ANY($2::text[])", where: "scope = ANY($2::text[])", ordered: true, scopes: true}, keys)
+		deletion{by: "scope", keys: keys, denies: true})
 }
 
 // DeletePrincipal removes every grant and eligibility of a principal in a tenant, as actor, with
@@ -2086,7 +2086,7 @@ func (a *Authorizer) DeletePrincipal(ctx context.Context, actor Principal, tenan
 
 // leaving is what DeletePrincipal removes of p in a tenant, with its key as $2.
 func leaving(p Principal) deletion {
-	del := deletion{where: "principal = $2", members: "principal = $2", ordered: true}
+	del := deletion{by: "principal", keys: []string{p.key()}, where: "principal = $2", members: "principal = $2"}
 	if !p.broad() {
 		del.named = p.key()
 	}
@@ -2184,30 +2184,30 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Pri
 func (a *Authorizer) DeleteTenant(ctx context.Context, actor Principal, tenant string) (err error) {
 	defer a.refused(ctx, &err, tenant, actor, "DeleteTenant")
 	return a.delete(ctx, actor, tenant, "DeleteTenant", func(tx pgx.Tx) error { return lockTenant(ctx, tx, tenant) },
-		deletion{roles: true, groups: true, denies: "TRUE", where: "TRUE", members: "TRUE"})
+		deletion{roles: true, groups: true, denies: true, where: "TRUE", members: "TRUE"})
 }
 
-// deletion is what a delete removes in a tenant: grants and eligibilities where picks, denies
-// where denies does, and memberships of the tenant and of its groups where members does (none
-// where either is empty); with roles its custom roles, and with groups its groups. Each reads args
-// from $2. ordered locks the grants, eligibilities, denies and places in groups in order first
-// (inOrder), and with scopes, where where and denies pick those on the scopes in $2, sorted, reads
-// them a scope at a time to do it (scopesInOrder). named is the key of a principal, where picks its
-// rows, to take out of the denies that exempt it and the eligibilities it approves; group is a group
-// whose places in groups members picks, which its members' activations may rest on.
+// deletion is what a delete removes in a tenant: the grants and eligibilities, and with denies the
+// denies, whose column by is one of keys, and the places in groups too where members picks them;
+// or, without by, those where picks; and memberships of the tenant and of its groups where members
+// picks (none where it is empty); with roles its custom roles, and with groups its groups. where
+// and members read args from $2. named is the key of a principal whose rows by picks, to take out
+// of the denies that exempt it and the eligibilities it approves; group is a group whose places in
+// groups members picks, which its members' activations may rest on.
+//
+// With by, each key's rows are found on its own (byKeys) and locked in order before they are
+// deleted, places in groups by a ctid as removeGroups finds them, and denies by their keys
+// (lockDenies): DeleteScopes holds its scopes' locks, DeletePrincipal its principal's and
+// DeleteGroups its groups', so none waits for another, and each deletes the grants of a principal
+// on a scope, which deleted in the order of the index each reads by would deadlock. Found beside
+// tenant = $1, or matched to the rows to delete in a semi-join, a generic plan, costing the tenant
+// as an average tenant's few rows, finds them by reading every row in the tenant.
 type deletion struct {
-	roles, groups, ordered, scopes bool
-	denies, where, members         string
-	named, group                   string
-}
-
-// inOrder is SQL picking the rows of table, rbac_grants or rbac_eligibilities, that where picks,
-// once they are locked in the order of their scopes, principals and ids. DeleteScopes holds its
-// scopes' locks, DeletePrincipal its principal's and DeleteGroups its groups', so none waits for
-// another, and each deletes the grants of a principal on a scope: deleting them in the order of
-// the index each reads by, they would deadlock.
-func inOrder(table, where string) string {
-	return "id IN (" + lockedInOrder(table, "id", bindingOrder, "tenant = $1 AND "+where) + ")"
+	roles, groups, denies bool
+	by                    string
+	keys                  []string
+	where, members        string
+	named, group          string
 }
 
 // The orders grants and eligibilities, places in groups and denies are locked in. Every change
@@ -2218,28 +2218,10 @@ const (
 	denyOrder    = "scope, id"
 )
 
-// placesInOrder is inOrder for places in groups, and deniesInOrder for denies, by their keys.
-func placesInOrder(where string) string {
-	return "(group_id, principal, source) IN (" +
-		lockedInOrder("rbac_members", "group_id, principal, source", placeOrder, "tenant = $1 AND "+where) + ")"
-}
-
-func deniesInOrder(where string) string {
-	return "(scope, id) IN (" + lockedInOrder("rbac_denies", "scope, id", denyOrder, "tenant = $1 AND "+where) + ")"
-}
-
 // lockedInOrder is SQL selecting cols of the rows of table that where picks, once they are locked
 // in order.
 func lockedInOrder(table, cols, order, where string) string {
 	return "SELECT " + cols + " FROM " + table + " WHERE " + where + " ORDER BY " + order + " FOR UPDATE"
-}
-
-// scopesInOrder is inOrder, or deniesInOrder, for the rows of table on the scopes in the array $2,
-// sorted, by their keys: read a scope at a time, as byKey reads them, each scope's locked in the
-// order of the rest of the keys order lists, so all of them in the order of their scopes first.
-func scopesInOrder(table, key, order string) string {
-	return "(" + key + ") IN (SELECT " + key + " FROM unnest($2::text[]) AS keyed(k) CROSS JOIN LATERAL (SELECT " + key + " FROM " + table +
-		" WHERE tenant = $1 AND scope = keyed.k ORDER BY " + order + " FOR UPDATE) r)"
 }
 
 // delete removes what del picks in a tenant as actor, by how, once lock holds.
@@ -2262,19 +2244,13 @@ func (a *Authorizer) delete(ctx context.Context, actor Principal, tenant, how st
 func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, del deletion, args ...any) (ChangeEvent, error) {
 	var e ChangeEvent
 	var err error
-	eligible, granted, denied, places := del.where, del.where, del.denies, del.members
-	if del.ordered {
-		eligible, granted = inOrder("rbac_eligibilities", del.where), inOrder("rbac_grants", del.where)
-		if denied != "" {
-			denied = deniesInOrder(denied)
+	// The rows of table del removes, by key, locked in order, or those where picks, and the
+	// arguments they are read with.
+	picked := func(table, key, order, where string) (string, []any) {
+		if del.by == "" {
+			return "tenant = $1 AND " + where, slices.Concat([]any{tenant}, args)
 		}
-		if places != "" {
-			places = placesInOrder(places)
-		}
-		if del.scopes {
-			eligible, granted = scopesInOrder("rbac_eligibilities", "id", "principal, id"), scopesInOrder("rbac_grants", "id", "principal, id")
-			denied = scopesInOrder("rbac_denies", "scope, id", "id")
-		}
+		return lockedByKeys(table, key, order, del.by), []any{tenant, del.keys}
 	}
 	named := []string{del.named}
 	// The argument after args, for named or an array of activations' ids.
@@ -2288,15 +2264,8 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 			return ChangeEvent{}, err
 		}
 	}
-	if del.named != "" {
-		// Its own by its key: beside tenant = $1, a generic plan deletes them by reading every
-		// eligibility in the tenant.
-		e.Ineligible, err = removedWhere(ctx, a, tx, "rbac_eligibilities", eligibilityColumns, collectEligibilities,
-			lockedByKeys("rbac_eligibilities", "id", bindingOrder, "principal"), tenant, named)
-	} else {
-		e.Ineligible, err = a.removeEligible(ctx, tx, tenant, eligible, args...)
-	}
-	if err != nil {
+	eligible, eligibleArgs := picked("rbac_eligibilities", "id", bindingOrder, del.where)
+	if e.Ineligible, err = removedWhere(ctx, a, tx, "rbac_eligibilities", eligibilityColumns, collectEligibilities, eligible, eligibleArgs...); err != nil {
 		return ChangeEvent{}, err
 	}
 	if del.named != "" {
@@ -2315,8 +2284,17 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 			return ChangeEvent{}, err
 		}
 	}
-	if del.denies != "" {
-		if e.DeletedDenies, err = removed(ctx, a, tx, "rbac_denies", denyColumns, collectDenies, tenant, denied, args...); err != nil {
+	switch {
+	case del.denies && del.by != "":
+		if err := lockDenies(ctx, tx, []string{byKeys("rbac_denies", denyKey, del.by, "$2")}, tenant, del.keys); err != nil {
+			return ChangeEvent{}, err
+		}
+		if e.DeletedDenies, err = removedWhere(ctx, a, tx, "rbac_denies", denyColumns, collectDenies,
+			anyOf("ctid", byKeys("rbac_denies", "ctid", del.by, "$2")), tenant, del.keys); err != nil {
+			return ChangeEvent{}, err
+		}
+	case del.denies:
+		if e.DeletedDenies, err = removed(ctx, a, tx, "rbac_denies", denyColumns, collectDenies, tenant, del.where, args...); err != nil {
 			return ChangeEvent{}, err
 		}
 	}
@@ -2348,7 +2326,8 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 				return ChangeEvent{}, err
 			}
 		}
-		if e.Left, err = removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant, places, args...); err != nil {
+		places, placesArgs := picked("rbac_members", "ctid", placeOrder, del.members)
+		if e.Left, err = removedWhere(ctx, a, tx, "rbac_members", memberColumns, collectMembers, places, placesArgs...); err != nil {
 			return ChangeEvent{}, err
 		}
 	}
@@ -2365,7 +2344,8 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 			return ChangeEvent{}, err
 		}
 	}
-	if e.Revoked, err = a.remove(ctx, tx, tenant, granted, args...); err != nil {
+	granted, grantedArgs := picked("rbac_grants", "id", bindingOrder, del.where)
+	if e.Revoked, err = removedWhere(ctx, a, tx, "rbac_grants", grantColumns, collectGrants, granted, grantedArgs...); err != nil {
 		return ChangeEvent{}, err
 	}
 	short, ended, err := a.unrest(ctx, tx, tenant, actor, r, now)

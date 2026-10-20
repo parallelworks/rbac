@@ -2811,6 +2811,102 @@ func TestReadsByScopeOrPrincipalReadOnlyTheirRows(t *testing.T) {
 	}
 }
 
+// DeleteScopes and DeletePrincipal read, of the grants, eligibilities, denies and places in groups,
+// only those on their scopes or of their principal, under a generic plan too: each table's were
+// matched to those it locked in order in a semi-join, which a generic plan, costing the tenant's
+// rows as an average tenant's few, runs by reading every row of the tenant.
+func TestDeletesReadOnlyTheirScopesOrPrincipalsRows(t *testing.T) {
+	for _, plan := range []string{"custom", "generic"} {
+		t.Run(plan, func(t *testing.T) {
+			var h *harness
+			if plan == "generic" {
+				h = generic(t)
+			} else {
+				h = custom(t)
+			}
+			ctx := t.Context()
+			h.groups(t, "oncall", "pager", "everyone")
+			ann := h.as(t, "ann", "oncall")
+			gone := []rbac.Scope{{Type: "cluster", ID: "c2"}, {Type: "cluster", ID: "c3"}}
+			// ann and oncall, with pager in it, hold roles on the scopes gone, where oncall is eligible
+			// and named in a deny ann is exempt from; the tenant's members and the public hold roles
+			// there too.
+			for _, q := range []string{
+				`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'oncall', 'group', 'pager')`,
+				`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+				 SELECT 't1', 'cluster', c, k, i, 'cluster.login' FROM unnest('{c2,c3}'::text[]) AS c,
+				   unnest('{user,group,members,public}'::text[], '{ann,oncall,t1,""}'::text[]) AS p(k, i)`,
+				`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+				 VALUES ('t1', 'cluster', 'c2', 'group', 'oncall', 'cluster.sudo', 3600, '{}'),
+				        ('t1', 'cluster', 'c2', 'user', 'ann', 'cluster.sudo', 3600, '{group:oncall}')`,
+				`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+				 VALUES ('t1', 'cluster', 'c2', 'd', '{group:oncall}', '{user:ann}', '{cluster:root}')`,
+			} {
+				if _, err := h.pool.Exec(ctx, q); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tables := []string{"rbac_grants", "rbac_eligibilities", "rbac_denies", "rbac_members"}
+			// The pages of the grants, eligibilities, denies and places in groups, and their indexes,
+			// each reads, in a transaction it rolls back.
+			read := func() map[string]int64 {
+				t.Helper()
+				pages := map[string]int64{}
+				for what, f := range map[string]func(a *rbac.Authorizer) error{
+					"DeleteScopes":                   func(a *rbac.Authorizer) error { return a.DeleteScopes(ctx, host, "t1", gone) },
+					"DeletePrincipal of an identity": func(a *rbac.Authorizer) error { return a.DeletePrincipal(ctx, host, "t1", ann.Principal) },
+					"DeletePrincipal of a group":     func(a *rbac.Authorizer) error { return a.DeletePrincipal(ctx, host, "t1", groupOf("oncall")) },
+					"DeletePrincipal of the members": func(a *rbac.Authorizer) error { return a.DeletePrincipal(ctx, host, "t1", rbac.TenantMembers("t1")) },
+					"DeletePrincipal of the public": func(a *rbac.Authorizer) error {
+						return a.DeletePrincipal(ctx, host, "t1", rbac.Principal{Kind: rbac.Public})
+					},
+				} {
+					func() {
+						tx, err := h.pool.Begin(ctx)
+						if err != nil {
+							t.Fatal(err)
+						}
+						defer func() { _ = tx.Rollback(ctx) }()
+						for _, table := range tables {
+							pages[what+" of "+table] -= pagesRead(ctx, t, tx, table)
+						}
+						if err := f(h.authz.WithTx(tx)); err != nil {
+							t.Fatalf("%s: %v", what, err)
+						}
+						for _, table := range tables {
+							pages[what+" of "+table] += pagesRead(ctx, t, tx, table)
+						}
+					}()
+				}
+				return pages
+			}
+			// Others are in another group, and each has a group in a group of its own; each holds a role
+			// on the tenant and on a cluster of its own, where it is eligible and denied.
+			others := func(n int) {
+				t.Helper()
+				manyMembers(t, h, n, `, members AS (INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+					  SELECT 't1', 'everyone', 'user', id FROM others UNION ALL SELECT 't1', 'p' || id, 'group', 'g' || id FROM others),
+					parents AS (INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'p' || id FROM others),
+					granted AS (INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+					  SELECT 't1', s, i, 'user', id, 'cluster.login' FROM others, unnest('{cluster,tenant}'::text[], ARRAY[id, 't1']) AS t(s, i)),
+					eligible AS (INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+					  SELECT 't1', 'cluster', id, 'user', id, 'cluster.sudo', 3600, '{group:everyone}'::text[] FROM others)
+					INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+					SELECT 't1', 'cluster', id, 'd', ARRAY['user:' || id], '{group:everyone}'::text[], '{cluster:root}'::text[] FROM others`,
+					"rbac_grants", "rbac_eligibilities", "rbac_denies", "rbac_members", "rbac_groups")
+			}
+			others(500)
+			few := read()
+			others(4500)
+			for what, many := range read() {
+				if many > few[what]*3/2+deeper {
+					t.Errorf("%s read %d pages, and %d once 4500 more were in groups, held roles, were eligible and were denied", what, few[what], many)
+				}
+			}
+		})
+	}
+}
+
 // Deleting groups reads, of the eligibilities and denies, only those of the groups, on them, that
 // they approve, and that name or exempt them, under a generic plan too: found by those conditions
 // ORed beside tenant = $1, which no index seeks, they were read from every eligibility and deny in

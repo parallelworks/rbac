@@ -2940,6 +2940,54 @@ func TestDeleteScopeRemovesAGrantMadeWhileItWaits(t *testing.T) {
 	}
 }
 
+// DeleteScopes removes a deny on its scopes that a change taking a principal out of the deny's
+// exemptions, which takes no lock of the scope's, changed while the delete waited for it: the delete
+// finds it again by its key, where by a ctid, which the change moved, it would pass over it.
+func TestDeleteScopesRemovesADenyChangedWhileItWaits(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+		VALUES ('t1', 'cluster', 'c1', 'd', '{public:}', '{user:p}', '{cluster:root}')`); err != nil {
+		t.Fatal(err)
+	}
+	h.as(t, "p")
+	// p leaves the tenant, and its exemption, in a transaction that holds the deny until it ends.
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := h.authz.WithTx(tx).DeletePrincipal(ctx, host, "t1", identity("p")); err != nil {
+		t.Fatal(err)
+	}
+	var pid int
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- h.authz.DeleteScopes(ctx, host, "t1", []rbac.Scope{cluster.Scope()}) }()
+	for waiting := false; !waiting; {
+		select {
+		case err := <-done:
+			t.Fatalf("DeleteScopes waited for nothing p's removal holds: %v", err)
+		default:
+		}
+		if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	ds, err := h.authz.Denies(ctx, "t1", []rbac.Scope{cluster.Scope()})
+	if err != nil || len(ds) > 0 {
+		t.Fatalf("denies left on a scope deleted: %+v, %v", ds, err)
+	}
+}
+
 func TestDeletingScopesAndAPrincipalOnThemAtOnceNeverDeadlocks(t *testing.T) {
 	for name, deletePrincipal := range map[string]func(ctx context.Context, h *harness) error{
 		"DeletePrincipal": func(ctx context.Context, h *harness) error {

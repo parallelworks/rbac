@@ -210,10 +210,12 @@ erDiagram
   averages, still reads only the subject's grants on the path, from the index alone, whichever
   index it picks.
 - **A read of a list of keys reads each key's rows on its own** (`byKey`), as of a list's scopes
-  or principals, of the denies on a check's path, of `Activate`'s eligibilities and of
-  `DeleteScopes`' rows, and so does a walk through nested groups: a generic plan costs `= ANY` of
-  a list as ten seeks, and a read of the tenant by an index on it alone as an average tenant's few
-  rows, and would read every row of a large tenant. The eligibilities a group approves and the
+  or principals, of the denies on a check's path, of `Activate`'s eligibilities and of the rows
+  `DeleteScopes`, `DeletePrincipal` and `DeleteGroups` remove, and so does a walk through nested
+  groups: a generic plan costs `= ANY` of a list as ten seeks, and a read of the tenant by an index
+  on it alone as an average tenant's few rows, and would read every row of a large tenant. The rows
+  a removal locks in order it then deletes by key, never matched to the tenant's in a semi-join,
+  which such a plan runs by reading every one. The eligibilities a group approves and the
   denies that name or exempt it, which a change to its members and `DeleteGroup`'s check read,
   those an identity or group leaving the tenant is taken out of, and the denies binding a list's
   subject, which `Filter` and `Reachable` read, are found through GIN indexes on those arrays of
