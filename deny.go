@@ -16,12 +16,13 @@ import (
 
 // Deny is a deny policy: on its scope and everything under it, it removes permissions from
 // principals, whatever their grants give, as a guardrail above roles. A principal it names is
-// an identity, a group, a tenant's members or the public (everyone, signed in or not); those
-// Exempt names, identities or groups, keep their access. A deny naming the public may exempt the
-// tenant's members, to bind only those who aren't; the public itself is never exempt, as that
-// would exempt everyone, nor is a principal it names. Permissions are `type:verb`, or `type:*`
-// for every permission on a type. With a Condition it denies only where the expression holds, or
-// can't be evaluated.
+// an identity, a user or of a kind the host declares, a group, a tenant's members or the public
+// (everyone, signed in or not); those Exempt names, identities or groups, keep their access. One
+// of a kind the host doesn't declare, which no subject can be, is refused, as a grant to it is. A
+// deny naming the public may exempt the tenant's members, to bind only those who aren't; the
+// public itself is never exempt, as that would exempt everyone, nor is a principal it names.
+// Permissions are `type:verb`, or `type:*` for every permission on a type. With a Condition it
+// denies only where the expression holds, or can't be evaluated.
 type Deny struct {
 	// ID names it on its scope, in lowercase letters, digits, dots, hyphens and underscores.
 	ID          string
@@ -158,8 +159,11 @@ func (a *Authorizer) checkDeny(tenant string, d Deny) error {
 	if len(d.Principals) == 0 || len(d.Principals) > MaxDenyEntries || len(d.Exempt) > MaxDenyEntries {
 		bad("it names 1 to %d principals and exempts at most %d", MaxDenyEntries, MaxDenyEntries)
 	}
+	// Of a kind the host declares, as a grant's principal is: one of another, such as a misspelled
+	// kind, no subject can be, so a deny naming it would bind no one, and one exempting it would
+	// leave bound whom it meant to exempt.
 	for _, p := range slices.Concat(d.Principals, d.Exempt) {
-		if !p.wellFormed(tenant) {
+		if !a.known(tenant, p) {
 			bad("principal %q is not valid", p.key())
 		}
 	}

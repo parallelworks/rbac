@@ -151,8 +151,9 @@ grants: `Reach.Conditional` names the scopes conditional ones reach, to check on
   another's.
 - **Deny policies:** `SetDeny` puts a deny on a scope: under it, it removes permissions
   (`type:verb`, or `type:*` for a type's every one) from the principals it names, those it exempts
-  aside, whatever their grants give. It exempts identities and groups, or from a deny naming the
-  public the tenant's members, to bind only those who aren't; never the public, which would
+  aside, whatever their grants give. It names and exempts principals a grant could name, so not
+  one of a kind the host doesn't declare. It exempts identities and groups, or from a deny naming
+  the public the tenant's members, to bind only those who aren't; never the public, which would
   exempt everyone, nor one it names. A conditional one denies where its condition holds or can't
   be evaluated. Setting one needs `rbac.DenyPermission(type)` there, which no deny removes, so
   whoever holds it on a scope above can always lift a deny set below. `Filter`, `Reachable` and

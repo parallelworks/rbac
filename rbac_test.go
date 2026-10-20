@@ -1739,6 +1739,36 @@ func TestDeniesNameWhatTheCatalogHas(t *testing.T) {
 	}
 }
 
+func TestADenyNamesOnlyKindsTheHostDeclares(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), guardRole)
+		c.PrincipalKinds = []rbac.PrincipalKind{"service_account"}
+	})
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "guardian"), grant(cluster.Scope(), "cluster.login", "service_account", "sa"))
+	guardian := h.as(t, "guardian")
+	sa := h.member(t, rbac.Principal{Kind: "service_account", ID: "sa"})
+	typo := rbac.Principal{Kind: "service_acount", ID: "sa"}
+	for name, d := range map[string]rbac.Deny{
+		"naming":    {ID: "d", Principals: []rbac.Principal{typo}, Permissions: []rbac.Permission{login}},
+		"exempting": {ID: "d", Principals: []rbac.Principal{rbac.TenantMembers("t1")}, Exempt: []rbac.Principal{typo}, Permissions: []rbac.Permission{login}},
+	} {
+		if err := h.authz.SetDeny(ctx, guardian, cluster, d); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("a deny %s a kind the host doesn't declare: %v", name, err)
+		}
+	}
+	if ds, err := h.authz.Denies(ctx, "t1", []rbac.Scope{cluster.Scope()}); err != nil || len(ds) != 0 {
+		t.Fatalf("Denies = %+v, %v", ds, err)
+	}
+	d := rbac.Deny{ID: "d", Principals: []rbac.Principal{sa.Principal}, Permissions: []rbac.Permission{login}}
+	if err := h.authz.SetDeny(ctx, guardian, cluster, d); err != nil {
+		t.Fatal(err)
+	}
+	if allowed(t, h, sa, login, cluster) {
+		t.Fatal("a deny naming a declared kind binds it")
+	}
+}
+
 func TestChangesAreBounded(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
