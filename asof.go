@@ -73,8 +73,11 @@ func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read
 	}
 	// Once ctx is done, a rollback on it isn't sent: a savepoint of the host's left standing keeps
 	// the views in its transaction, which then reads the past, and in its session once it commits.
+	// Bounded, as savepoint's end is, so a dead connection can't hold AsOf for good.
 	defer func() {
-		if rerr := tx.Rollback(context.WithoutCancel(ctx)); rerr != nil {
+		c, cancel := context.WithTimeout(context.WithoutCancel(ctx), savepointEnd)
+		defer cancel()
+		if rerr := tx.Rollback(c); rerr != nil {
 			err = errors.Join(err, rerr)
 		}
 	}()

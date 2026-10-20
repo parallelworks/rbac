@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/rbac"
 	"github.com/parallelworks/rbac/internal/pgtest"
@@ -263,6 +264,54 @@ func TestAsOfRollsBackOnceItsContextIsDone(t *testing.T) {
 	}
 	if got, err := h.authz.WithTx(tx).Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{{Kind: rbac.User, ID: "u"}}}); err != nil || len(got) != 0 {
 		t.Errorf("after AsOf, the host's transaction reads u's grants as %+v, %v", got, err)
+	}
+}
+
+// stalled is a pool whose transactions' rollbacks wait until their context is done, or the
+// test's, as on a connection that has stopped answering.
+type stalled struct {
+	*pgxpool.Pool
+	test context.Context
+}
+
+func (s stalled) BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error) {
+	tx, err := s.Pool.BeginTx(ctx, opts)
+	return stalledTx{tx, s.test}, err
+}
+
+type stalledTx struct {
+	pgx.Tx
+	test context.Context
+}
+
+func (s stalledTx) Rollback(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+	case <-s.test.Done():
+	}
+	_ = s.Tx.Rollback(context.WithoutCancel(ctx))
+	return ctx.Err()
+}
+
+// AsOf's rollback is bounded, as a savepoint's end is, so a connection that stops answering fails
+// it rather than holding it for good.
+func TestAsOfEndsOnAConnectionThatStopsAnswering(t *testing.T) {
+	rbac.SetSavepointEnd(t, 100*time.Millisecond)
+	h := setup(t)
+	authz, err := rbac.New(stalled{h.pool, t.Context()}, h.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := dbNow(t, h)
+	done := make(chan error, 1)
+	go func() { done <- authz.AsOf(t.Context(), "t1", at, func(*rbac.Authorizer) error { return nil }) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("AsOf on a connection that stops answering: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("AsOf waited for good on a rollback its connection never answers")
 	}
 }
 
