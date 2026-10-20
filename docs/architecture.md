@@ -123,6 +123,8 @@ erDiagram
         timestamptz expires_at
         text condition "CEL, or empty"
         bool conditional
+        text activated_through "an activation's eligibility's principal"
+        bigint eligibility_id "an activation's eligibility"
         text note
     }
     rbac_roles {
@@ -189,6 +191,7 @@ erDiagram
     }
     rbac_roles ||--o{ rbac_grants : "a custom role's grants"
     rbac_roles ||--o{ rbac_eligibilities : "a custom role's eligibilities"
+    rbac_eligibilities |o--o{ rbac_grants : "activations made through it"
     rbac_groups ||--o{ rbac_members : "members, cascading"
     rbac_groups ||--o{ rbac_members : "nested as a member"
     rbac_memberships ||--o{ rbac_members : "an identity's places"
@@ -216,8 +219,9 @@ erDiagram
   indexes on those arrays of keys, each key prefixed by its tenant (`rbac_tenant_keys`), so
   neither the tenant's other rows nor another tenant's group of the same id are read.
 - **Activations are grants** from the source `activation` (`SourceActivation`), made by
-  `Activate` from an eligibility and ended by their expiry, `Deactivate`, or a change ending the
-  membership or place in a group they rest on sooner.
+  `Activate` from an eligibility, which they record, and ended by their expiry, `Deactivate`, or a
+  change ending the membership or a place in a group on their holder's paths to that eligibility's
+  principal sooner.
 - **Every write is recorded.** Each table above but `rbac_history` has the trigger
   `rbac_record`, which writes the change into `rbac_history`. Nothing updates or truncates that
   table, and only `PruneHistory`, as a role with the rights of its owner, deletes from it.
@@ -433,11 +437,30 @@ sequenceDiagram
 - **Eligibilities.** `SetEligibility` lets a principal `Activate` a role for a while, perhaps
   only with approvers or a `requires` condition. An activation is a grant that ends no later than
   its eligibility expires, or its holder's membership or place in the group the eligibility names
-  ends. A change ending one of those sooner holds it, in order, then reads the activations of the
-  identities it ends it for that the eligibilities allowed until then, and cuts each short to when
-  they still allow it through what is left; `Activate` holds the places it rests on until it
-  commits, so the two wait for each other. Setting the eligibility again or deleting it leaves its
-  activations to their own ends.
+  ends. It records the eligibility it was made through, by its principal's key
+  (`activated_through`) and its id (`eligibility_id`), and rests on its holder reaching that
+  principal: its own identity, through its membership, or a group, through the places in groups
+  from it. Of the eligibilities that allow it, it is made through the one whose path from the
+  holder lasts longest; of those lasting alike, one needing no approval, then its own, whose path
+  every other rests on too, so leaving a group ends none its own eligibility would keep unless that
+  needs an approval the group's doesn't; their requirements are evaluated cheapest first, as a
+  check's conditions are, and the choice is made of those that hold. Between groups whose paths
+  last alike it is by their approvers, requirements and keys, so leaving one can still end an
+  activation another would keep. A change ending a membership or a place sooner, or removing it,
+  holds it, in order, reads the activations of the identities it ends it for, and once it has
+  ended it cuts each short to the latest end of the paths left to its principal, or ends it,
+  whatever another eligibility would allow: worked out again from every eligibility the holder
+  reaches, one whose requirement or approver it never met would count. `Activate` holds the
+  places it can rest on until it commits, in the statement that reads the keys it finds its
+  subject eligible through, so the two wait for each other, and a place nested between them makes
+  no one eligible. Setting the eligibility again or deleting it leaves its activations to their
+  own ends, or to their holders leaving its group.
+- **Activations stored before migration 0012** record what migrating found: the one eligibility
+  for their role on their scope whose principal their holder reached then, or, where it reached
+  several or none, nothing. The first change re-checking one that records nothing ends it, as which
+  path it rested on can't be told; activating again until later records it. The package had no
+  release before it, so only a developer's database holds them, and none lasts past
+  `MaxActivation`.
 
 ## Lists and searches
 

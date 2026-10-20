@@ -582,8 +582,8 @@ func TestLeavingUnderAGenericPlanReadsOnlyWhatNamesTheLeaver(t *testing.T) {
 		{`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
 		  VALUES ('t1', 'cluster', 'c1', 'group', 'everyone', 'cluster.sudo', 7200, '{}'),
 		         ('t1', 'cluster', 'c1', 'user', 'v', 'cluster.sudo', 3600, '{user:x,group:oncall,user:lead}')`, nil},
-		{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at)
-		  VALUES ('t1', 'cluster', 'c1', 'user', 'x', 'cluster.sudo', 'activation', $1)`, []any{h.now.Add(time.Hour)}},
+		{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at, activated_through)
+		  VALUES ('t1', 'cluster', 'c1', 'user', 'x', 'cluster.sudo', 'activation', $1, 'group:everyone')`, []any{h.now.Add(time.Hour)}},
 		{`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
 		  VALUES ('t1', 'cluster', 'c1', 'd', '{public:}', '{user:x,group:oncall}', '{cluster:root}')`, nil},
 	} {
@@ -643,6 +643,107 @@ func TestLeavingUnderAGenericPlanReadsOnlyWhatNamesTheLeaver(t *testing.T) {
 	for what, many := range read() {
 		if many > few[what]*3/2+deeper {
 			t.Errorf("%s read %d pages, and %d once 4500 more were granted, approving, exempt and in a group", what, few[what], many)
+		}
+	}
+}
+
+// Activate through a nested group, and the changes ending a place in a group or a membership an
+// activation rests on, read of the grants, places, memberships and eligibilities only those of the
+// identities whose activations they make or check, and the paths up from them, under a generic plan
+// too: joined to the arguments, or beside the tenant, a generic plan costing them by averages would
+// read every activation, place or membership in the tenant.
+func TestActivationsUnderAGenericPlanReadOnlyTheirHoldersPaths(t *testing.T) {
+	h := generic(t)
+	ctx := t.Context()
+	h.groups(t, "oncall", "everyone")
+	ann := h.as(t, "ann", "inner")
+	bob := h.as(t, "bob", "inner")
+	// inner is in oncall, which is eligible on the cluster, where bob activated through it.
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'oncall', 'group', 'inner')`, nil},
+		{`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+		  VALUES ('t1', 'cluster', 'c1', 'group', 'oncall', 'cluster.sudo', 7200)`, nil},
+		{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at, activated_through)
+		  VALUES ('t1', 'cluster', 'c1', 'user', 'bob', 'cluster.sudo', 'activation', $1, 'group:oncall')`, []any{h.now.Add(time.Hour)}},
+	} {
+		if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	soon := h.now.Add(30 * time.Minute)
+	tables := []string{"rbac_grants", "rbac_members", "rbac_memberships", "rbac_eligibilities"}
+	// The pages of each, and their indexes, each reads, in a transaction it rolls back.
+	read := func() map[string]int64 {
+		t.Helper()
+		pages := map[string]int64{}
+		for what, c := range map[string]struct {
+			f func(a *rbac.Authorizer) error
+			// ends is when bob's activation ends once it has run, zero for ended.
+			ends time.Time
+		}{
+			"Activate": {f: func(a *rbac.Authorizer) error {
+				return second(a.Activate(ctx, ann, cluster, rbac.Activation{Role: "cluster.sudo", Duration: time.Minute, Justification: "INC-1"}))
+			}, ends: h.now.Add(time.Hour)},
+			"DeleteMembers": {f: func(a *rbac.Authorizer) error {
+				return a.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "inner", Principal: bob.Principal}})
+			}},
+			"ImportMembers ending a group's place sooner": {f: func(a *rbac.Authorizer) error {
+				return a.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "oncall", Principal: groupOf("inner"), ExpiresAt: soon}})
+			}, ends: soon},
+			"SetMemberships ending a membership sooner": {f: func(a *rbac.Authorizer) error {
+				return a.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: bob.Principal, ExpiresAt: soon}})
+			}, ends: soon},
+		} {
+			func() {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				for _, table := range tables {
+					pages[what+" of "+table] -= pagesRead(ctx, t, tx, table)
+				}
+				if err := c.f(h.authz.WithTx(tx)); err != nil {
+					t.Fatalf("%s: %v", what, err)
+				}
+				for _, table := range tables {
+					pages[what+" of "+table] += pagesRead(ctx, t, tx, table)
+				}
+				var ends *time.Time
+				if err := tx.QueryRow(ctx, `SELECT max(expires_at) FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:bob'`).Scan(&ends); err != nil ||
+					(ends == nil) != c.ends.IsZero() || ends != nil && !ends.Equal(c.ends) {
+					t.Fatalf("%s left bob's activation ending at %v, %v", what, ends, err)
+				}
+			}()
+		}
+		return pages
+	}
+	// Others are in a group of their own, in everyone, and each activated, through everyone, on a
+	// cluster of its own, where everyone is eligible.
+	others := func(n int) {
+		t.Helper()
+		manyMembers(t, h, n, `, groups AS (INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'g' || id FROM others),
+			members AS (INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+			  SELECT 't1', 'g' || id, 'user', id FROM others UNION ALL SELECT 't1', 'everyone', 'group', 'g' || id FROM others),
+			eligible AS (INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+			  SELECT 't1', 'cluster', id, 'group', 'everyone', 'cluster.sudo', 3600 FROM others)
+			INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at, activated_through)
+			SELECT 't1', 'cluster', id, 'user', id, 'cluster.sudo', 'activation', '2026-01-01 13:00:00+00', 'group:everyone' FROM others`,
+			"rbac_groups", "rbac_grants", "rbac_members", "rbac_eligibilities")
+	}
+	// Measured at three sizes, as a plan that reads the tenant's activations by the index on them
+	// alone, costing it as an average tenant's few, is picked only while they are few.
+	others(50)
+	few := read()
+	for _, n := range []int{450, 4500} {
+		others(n)
+		for what, many := range read() {
+			if many > few[what]*3/2+deeper {
+				t.Errorf("%s read %d pages, and %d once %d more were in groups and activated", what, few[what], many, n)
+			}
 		}
 	}
 }

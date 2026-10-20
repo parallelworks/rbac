@@ -182,11 +182,15 @@ reach, to check one by one.
   `rbac.SourceActivation`, beside any it holds, with its justification and approver. It holds
   one activation of a role on a scope, recording the request its end rests on: activating again
   until later replaces it, one ending no later changes nothing, and once it has ended, activating
-  again makes a new grant. `Deactivate` ends it early. A change that ends the membership or the
-  place it rests on sooner, or removes it, as by leaving the group, cuts the activation short with
-  it, to when another place or eligibility still allows it, or ends it (`ChangeEvent.Shortened` and
-  `Revoked`), as an activation made then would last no longer. Setting the eligibility again or
-  deleting it bounds only the activations made from then on, and leaves those made to their ends.
+  again makes a new grant. `Deactivate` ends it early. An activation records the eligibility it
+  was made through, of those that allow it the one whose path from the activator lasts longest,
+  by its own membership or its places in groups, and its own of those lasting alike and needing
+  approval alike, and rests on its holder being that one's principal or in its group: a change
+  that ends the membership or a place on the way sooner, or removes it, as by leaving the group,
+  cuts the activation short to the latest end of the paths left, or ends it if none is left
+  (`ChangeEvent.Shortened` and `Revoked`), whatever another eligibility would allow. Setting the
+  eligibility again or deleting it bounds only the activations made from then on, and leaves
+  those made to their ends, or to their holders leaving its group.
 - **Host policy:** `Config.ValidateGrant` is asked about every grant with the role, the principal,
   the actor and how it is made, so the host decides who may hold what: members only, no
   privileged roles for service accounts or guests. `Config.Constraints` remove permissions above
@@ -379,7 +383,9 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   the table until it commits, so checks, lists and changes wait for the rebuild; one that builds
   an index, as `0011_tenant_keys` builds three on `rbac_eligibilities` and `rbac_denies`, keeps
   writes to the table waiting until it commits, though reads go on: on a large table, migrate when
-  that wait is acceptable.
+  that wait is acceptable. Code from before `0012_activation_through` must not run beside code
+  after it: an activation it extends keeps the eligibility recorded before, and can outlast the one
+  it was extended through. Stop the replicas running it before migrating.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
   between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows

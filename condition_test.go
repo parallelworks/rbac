@@ -800,13 +800,19 @@ func TestAnEligibilitySetPastTheBoundIsRefusedOnlyForARequirementItAdds(t *testi
 
 // Activate evaluates the cheapest requirement first, as a check does conditions, so one that holds
 // is reached however many costly ones stored around the bounds the subject is also eligible
-// through, whatever order the database's collation would put them in, and however many approvers
-// each names.
+// through, whatever order the database's collation would put them in, however many approvers each
+// names, and however much longer the paths to them last than the one to it.
 func TestActivateTriesTheCheapestRequirementFirst(t *testing.T) {
 	boss := identity("boss")
-	for name, approvers := range map[string]struct{ costly, cheap []rbac.Principal }{
-		"no approvers":         {},
-		"more approvers on it": {costly: []rbac.Principal{boss}, cheap: []rbac.Principal{boss, identity("lead")}},
+	for name, approvers := range map[string]struct {
+		costly, cheap []rbac.Principal
+		// group is whether the cheap one is a group's the subject is in for a while, rather than its
+		// own.
+		group bool
+	}{
+		"no approvers":                   {},
+		"more approvers on it":           {costly: []rbac.Principal{boss}, cheap: []rbac.Principal{boss, identity("lead")}},
+		"a group's it is in for a while": {group: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := setup(t)
@@ -831,9 +837,22 @@ func TestActivateTriesTheCheapestRequirementFirst(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			cheap := rbac.Eligibility{Role: "cluster.sudo", Principal: x.Principal, MaxDuration: time.Hour, Requires: "true", Approvers: approvers.cheap}
-			if err := h.authz.SetEligibility(ctx, owner, cluster, cheap); err != nil {
-				t.Fatal(err)
+			if approvers.group {
+				// Stored around the bounds too: setting it past the groups' bound is refused.
+				h.groups(t, "cheap")
+				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, expires_at)
+					VALUES ('t1', 'cheap', 'user', 'x', $1)`, h.now.Add(3*time.Hour)); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role,
+					max_seconds, requires) VALUES ('t1', 'cluster', 'c1', 'group', 'cheap', 'cluster.sudo', 3600, 'true')`); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				cheap := rbac.Eligibility{Role: "cluster.sudo", Principal: x.Principal, MaxDuration: time.Hour, Requires: "true", Approvers: approvers.cheap}
+				if err := h.authz.SetEligibility(ctx, owner, cluster, cheap); err != nil {
+					t.Fatal(err)
+				}
 			}
 			big := make([]any, 20000)
 			for i := range big {
