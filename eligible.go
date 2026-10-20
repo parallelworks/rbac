@@ -382,7 +382,9 @@ func seconds(d time.Duration) int64 {
 	return s
 }
 
-// Eligibilities lists the eligibilities that match the filter, as stored, expired ones aside.
+// Eligibilities lists the eligibilities that match the filter, as stored, expired ones aside. It
+// has no limit or cursor, so what it returns grows with what matches, as every eligibility on the
+// tenant's scope.
 func (a *Authorizer) Eligibilities(ctx context.Context, tenant string, f GrantFilter) ([]Eligibility, error) {
 	if !validID(tenant) || !f.valid(tenant) {
 		return nil, fmt.Errorf("%w: Eligibilities needs a tenant and valid scopes or principals", ErrInvalid)

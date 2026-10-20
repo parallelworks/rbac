@@ -436,7 +436,8 @@ type Holder struct {
 // marking one that a deny may bind: it reads the groups a deny names, and whom it exempts, as
 // checks do. Where a constraint may remove p, it marks each holder it may remove p from, asked
 // about as ConstraintInput says. An identity's record counts its own grants and its groups', not
-// the members' or the public's, which are records of their own.
+// the members' or the public's, which are records of their own. It has no limit or cursor, so what
+// it returns grows with the holders, as every identity in a group granted on the tenant.
 func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]Holder, error) {
 	if err := a.check(r); err != nil {
 		return nil, err
@@ -769,7 +770,9 @@ type Reach struct {
 }
 
 // Reachable says where the subject may do p to resources of a type in a tenant, for hosts that
-// list from a store other than this PostgreSQL. Hosts on the same database use Filter.
+// list from a store other than this PostgreSQL. Hosts on the same database use Filter. It has no
+// limit or cursor, so Reach.Scopes grows with the scopes the subject's grants are on, as one on
+// each resource it created.
 func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, tenant, resourceType string) (Reach, error) {
 	roles, removed, err := a.searchable(ctx, s, p, tenant, resourceType)
 	if err != nil || removed {
@@ -810,11 +813,11 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 		string(p), resourceType,
 	}, a.publicArgs(p, resourceType, custom)...), append([]any{broadKinds, a.privilegedRoles(roles)}, a.catalogArgs(custom)...)...)
 	rows, err := a.db.Query(ctx, `
-		SELECT scope, bool_and(conditional) FROM rbac_grants
-		WHERE tenant = $1 AND principal = ANY($2::text[]) AND role = ANY(`+givingSQL("$3", "$1", "$8", "$9", custom, "")+`)
-		  AND (expires_at IS NULL OR expires_at > $4) AND `+ofTypes("scope", "$5", len(reaching))+`
-		  AND (principal <> $6 OR role = ANY(`+givingSQL("$7", "$1", "$8", "$9", custom, publicOnly(catalogSQL{"$10", "$11", "$12"}))+`))
-		  AND (principal_kind <> ALL($13::text[]) OR role <> ALL(`+givingSQL("$14", "$1", "$8", "$9", custom, privilegedOnly(catalogSQL{"$15", "$16", "$17"}))+`))
+		SELECT scope, bool_and(conditional) FROM (`+byType("$5", "g.scope, g.conditional", `
+		  g.tenant = $1 AND g.principal = ANY($2::text[]) AND g.role = ANY(`+givingSQL("$3", "$1", "$8", "$9", custom, "")+`)
+		  AND (g.expires_at IS NULL OR g.expires_at > $4)
+		  AND (g.principal <> $6 OR g.role = ANY(`+givingSQL("$7", "$1", "$8", "$9", custom, publicOnly(catalogSQL{"$10", "$11", "$12"}))+`))
+		  AND (g.principal_kind <> ALL($13::text[]) OR g.role <> ALL(`+givingSQL("$14", "$1", "$8", "$9", custom, privilegedOnly(catalogSQL{"$15", "$16", "$17"}))+`))`)+`) g
 		GROUP BY scope ORDER BY scope`, args...)
 	if err != nil {
 		return Reach{}, err
@@ -915,7 +918,10 @@ type Predicate struct {
 
 // Filter returns a condition for the host's own query that keeps the resources of a type in a
 // tenant the subject may do p to. It reads the grants in the same statement as the rows, so
-// sorting and pagination work and nothing changes between deciding and reading. The host's
+// sorting and pagination work and nothing changes between deciding and reading. A condition holds
+// for the query it was built for: it fixes the time (Config.Now), the subject's label holding and
+// what the constraints answered when Filter was called, so a later query keeps rows Authorize then
+// refuses, as once a grant it counted has expired. Build one for each query. The host's
 // query must reach this package's tables (they are in the pool's schema), and column names are
 // trusted host code; every value is an argument. It counts only unconditional grants, and leaves
 // out every resource a deny covers, conditional ones included, so it never keeps one Authorize
@@ -945,56 +951,67 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	keys := func(of string) string {
 		return "ARRAY(WITH RECURSIVE " + keysSQL(arg(1)+"::text", arg(2)+"::text", arg(4)) + " " + of + ")"
 	}
-	// The subject's grants on the scopes `of` keeps, in the default collation, which a column's own
-	// collation overrides where a comparison doesn't name one.
-	grants := func(of string) string {
-		return fmt.Sprintf(`SELECT g.scope COLLATE "default" FROM rbac_grants g
-			WHERE g.tenant = %s::text AND g.principal = ANY(%s) AND g.role = ANY(%s)
-			  AND (g.expires_at IS NULL OR g.expires_at > %s) AND NOT g.conditional AND %s
+	// The subject's grants on the scopes of the types in the array types, in the default collation,
+	// which a column's own collation overrides where a comparison doesn't name one.
+	grants := func(types string) string {
+		return byType(types, `g.scope COLLATE "default"`, fmt.Sprintf(`g.tenant = %s::text AND g.principal = ANY(%s) AND g.role = ANY(%s)
+			  AND (g.expires_at IS NULL OR g.expires_at > %s) AND NOT g.conditional
 			  AND (g.principal <> %s::text OR g.role = ANY(%s))
 			  AND (g.principal_kind <> ALL(%s) OR g.role <> ALL(%s))`,
-			arg(1), keys(countedKeys(arg(13), arg(17))), givingSQL(arg(3), arg(1), arg(8), arg(9), custom, ""), arg(4), of, arg(6),
+			arg(1), keys(countedKeys(arg(13), arg(17))), givingSQL(arg(3), arg(1), arg(8), arg(9), custom, ""), arg(4), arg(6),
 			givingSQL(arg(7), arg(1), arg(8), arg(9), custom, publicOnly(catalogSQL{arg(10), arg(11), arg(12)})),
-			broadKindsSQL, givingSQL(arg(18), arg(1), arg(8), arg(9), custom, privilegedOnly(catalogSQL{arg(19), arg(20), arg(21)})))
+			broadKindsSQL, givingSQL(arg(18), arg(1), arg(8), arg(9), custom, privilegedOnly(catalogSQL{arg(19), arg(20), arg(21)}))))
+	}
+	// The denies on the scopes `of` keeps that bind the subject, by the primary key, which leads to
+	// a scope's type.
+	denies := func(of string) string {
+		return fmt.Sprintf(`SELECT d.scope FROM rbac_denies d
+			WHERE d.tenant = %s::text AND %s AND d.principals && %s AND NOT d.exempt && %s
+			  AND (%s::text = ANY(d.permissions) OR %s::text = ANY(d.permissions))`,
+			arg(1), of, keys("SELECT k FROM bound"), keys("SELECT k FROM exempted"), arg(14), arg(15))
 	}
 	// The grants' tenant is an argument of its own: the host's tenant column needn't be text,
 	// and one argument can't take two types. The grants overlap the path, which the host's GIN
 	// index serves. A subject can hold thousands on resources of the type, such as one on each it
 	// created, where an overlap would compare each with every key of every row: each reaches only
 	// its resource, whose key is its path's first, so then they are looked up in a hash of them,
-	// and only containers' and the tenant's overlap. That form can't use the GIN index, so a
-	// subject with few keeps the overlap.
-	above := a.reaching(resourceType)
-	var byKey string
-	if !a.contains(resourceType) {
-		many, err := a.manyResourceGrants(ctx, tenant, s, counts, resourceType)
-		if err != nil {
-			return Predicate{}, err
-		}
-		if many {
-			above = slices.DeleteFunc(above, func(t string) bool { return t == resourceType })
-			byKey = fmt.Sprintf(`(%s)[1] COLLATE "default" IN (%s) OR `, cols.Path, grants(ofType("g.scope", arg(9)+"::text")))
-		}
-	}
+	// and only containers' and the tenant's overlap. That form can't use an index, so a subject with
+	// few keeps the overlap: a test an index on the first key could serve, as `= ANY` of an array,
+	// compares each row with every grant wherever a plan reads rows without that index, and a host's
+	// sorted, limited query can. Denies on resources of the type are looked up so whatever their
+	// number, as a tenant's admins can put one on each of thousands.
+	//
 	// The host's columns can have a collation of their own, which would compare keys and tenants
 	// that differ, such as in case, as equal. A collation inside a subquery doesn't carry out of
 	// it, so each comparison that decides names the default one, the tenant's as text, as the
 	// column needn't be. The tenant and the path are compared in the column's own collation too,
 	// which its indexes are in, so they serve whatever it is.
-	overlap := "ARRAY(" + grants(ofTypes("g.scope", arg(5), len(above))) + ")"
-	reached := fmt.Sprintf(`(%s%s && %s AND %s && (%s COLLATE "default"))`, byKey, cols.Path, overlap, cols.Path, overlap)
+	overlap := "ARRAY(" + grants(arg(5)) + ")"
+	reached := fmt.Sprintf(`(%[1]s && %[2]s AND %[1]s && (%[2]s COLLATE "default"))`, cols.Path, overlap)
+	above, denied := a.reaching(resourceType), a.reaching(resourceType)
+	var deniedByKey string
+	if !a.contains(resourceType) {
+		denied = slices.DeleteFunc(denied, func(t string) bool { return t == resourceType })
+		deniedByKey = fmt.Sprintf(`NOT (%s)[1] COLLATE "default" IN (%s) AND `, cols.Path, denies("d.scope_type = "+arg(9)+"::text"))
+		many, err := a.manyResourceGrants(ctx, tenant, s, counts, resourceType)
+		if err != nil {
+			return Predicate{}, err
+		}
+		if many {
+			above = denied
+			reached = fmt.Sprintf(`((%[1]s)[1] COLLATE "default" IN (%[3]s) OR %[1]s && %[2]s AND %[1]s && (%[2]s COLLATE "default"))`,
+				cols.Path, overlap, grants("ARRAY["+arg(9)+"::text]"))
+		}
+	}
 	pred := Predicate{
 		SQL: fmt.Sprintf(`(%[1]s = %[2]s AND (%[1]s)::text = %[5]s::text COLLATE "default" AND %[3]s
-			AND NOT %[4]s && (ARRAY(SELECT d.scope FROM rbac_denies d
-			WHERE d.tenant = %[5]s::text AND d.scope_type = ANY(%[6]s::text[])
-			  AND d.principals && %[7]s AND NOT d.exempt && %[10]s
-			  AND (%[8]s::text = ANY(d.permissions) OR %[9]s::text = ANY(d.permissions))) COLLATE "default"))`,
-			cols.Tenant, arg(0), reached, cols.Path, arg(1), arg(16), keys("SELECT k FROM bound"), arg(14), arg(15), keys("SELECT k FROM exempted")),
+			AND %[7]sNOT %[4]s && (ARRAY(%[6]s) COLLATE "default"))`,
+			cols.Tenant, arg(0), reached, cols.Path, arg(1), denies("d.scope_type = ANY("+arg(16)+"::text[])"), deniedByKey),
 		Args: append(append([]any{
 			tenant, tenant, s.identityKey(), roles, a.cfg.Now(), above, publicKey, a.publicRoles(roles),
 			string(p), resourceType,
 		}, a.publicArgs(p, resourceType, custom)...), append([]any{
-			counts.public, perm, wildcard, a.reaching(resourceType), counts.members, a.privilegedRoles(roles),
+			counts.public, perm, wildcard, denied, counts.members, a.privilegedRoles(roles),
 		}, a.catalogArgs(custom)...)...),
 	}
 	// With no dimension declared too, as then any label is invalid, and Authorize refuses it.
@@ -1016,14 +1033,15 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	return pred, nil
 }
 
-// ofTypes is SQL keeping the rows whose scope, col, is of one of the n types in the array argument
-// types.
-func ofTypes(col, types string, n int) string {
-	ranges := make([]string, n)
-	for i := range n {
-		ranges[i] = ofType(col, fmt.Sprintf("(%s::text[])[%d]", types, i+1))
-	}
-	return "(" + strings.Join(ranges, " OR ") + ")"
+// byType is SQL selecting cols of the grants g for which where holds whose scope is of one of the
+// types in the array types, a type at a time: each one range of scopes, which the indexes leading
+// to a principal seek for each of its principals. Ranges ORed are none an index can seek, so a plan
+// reads every grant of the principals in the tenant, as a group's on thousands of resources of
+// another type. OFFSET 0 keeps the planner from flattening it into a join it could run the other
+// way round.
+func byType(types, cols, where string) string {
+	return fmt.Sprintf(`SELECT %[2]s FROM unnest(%[1]s::text[]) AS t(t) CROSS JOIN LATERAL (
+		SELECT %[2]s FROM rbac_grants g WHERE %[3]s AND %[4]s OFFSET 0) g`, types, cols, where, ofType("g.scope", "t.t"))
 }
 
 // ofType is SQL keeping the rows whose scope, col, is of the type t. A scope is `type:id`, and in
@@ -1073,11 +1091,13 @@ const (
 // heldOrDenied returns the grants on any of scopes, not expired, held by s's principals in a
 // tenant, counting broad ones as counts says, and the denies deniesOn reads for all its principals
 // and p, or any permission when p is empty, in one statement that reads its membership and groups
-// too, so a check is one round trip. The grants' part reads only what the key index holds, so it
-// is an index-only scan. Like Explain, it reads no deny for a subject none of whose grants count,
-// such as one that isn't a member or guest of the tenant. It reads the custom roles roles says in
-// the statement too, as SetRole changes one in place: read apart, a grant revoked and its role
-// widened meanwhile could give what no moment did.
+// too, so a check is one round trip. The grants' part reads only what the key index holds, and the
+// other indexes it could use lead to the principals and scopes too and hold the same, so whichever
+// a plan picks, a generic one too, it is an index-only scan of no more grants. Like Explain, it
+// reads no deny for a subject none of whose grants count, such as one that isn't a member or guest
+// of the tenant. It reads the custom roles roles says in the statement too, as SetRole changes one
+// in place: read apart, a grant revoked and its role widened meanwhile could give what no moment
+// did.
 func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Subject, counts broad, scopes []string, p Permission,
 	roles rolesRead,
 ) ([]holding, []denial, book, error) {
@@ -1164,20 +1184,24 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Su
 
 // conditionsOf reads the conditions of the conditional grants among held, in place.
 func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held []holding) error {
-	var ids, principals []string
+	var ids, principals, scopes []string
 	for _, h := range held {
 		if h.conditional {
 			ids = append(ids, h.ID)
 			principals = append(principals, h.Principal.key())
+			scopes = append(scopes, h.scope)
 		}
 	}
 	if len(ids) == 0 {
 		return nil
 	}
 	// Only the expression: a check reads nothing else of a condition. By principal too: as of a
-	// time, history finds a grant's versions by its principal, not by its id.
-	rows, err := q.Query(ctx, `SELECT id::text, condition FROM rbac_grants WHERE id = ANY($1::uuid[]) AND tenant = $2 AND principal = ANY($3::text[])`,
-		ids, tenant, principals)
+	// time, history finds a grant's versions by its principal, not by its id. And by scope, so every
+	// index a generic plan can pick seeks those grants: by the principals alone, it would read every
+	// grant of a group granted on thousands of resources.
+	rows, err := q.Query(ctx, `SELECT id::text, condition FROM rbac_grants
+		WHERE id = ANY($1::uuid[]) AND tenant = $2 AND principal = ANY($3::text[]) AND scope = ANY($4::text[])`,
+		ids, tenant, principals, scopes)
 	if err != nil {
 		return err
 	}

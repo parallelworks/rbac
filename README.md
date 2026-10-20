@@ -74,10 +74,14 @@ if err := authz.Authorize(ctx, subject, "cluster:login", cluster); err != nil {
 Store each resource's `authz.Path(resource)`, its own key first and then its containers' and the
 tenant's, in a `text[]` column with a GIN index. `Filter` returns a condition for the host's own
 query, which reads the grants in the same statement as the rows, so sorting and pagination work and
-nothing changes between deciding and reading. It compares the tenant and keys byte for byte, as
-`Authorize` does, whatever the columns' collation, in which their indexes still serve. A subject's
-grants on resources of the listed type are looked up by each row's own key, so one holding a grant
-on everything it created lists as fast as one holding a few. `Reachable` returns the same as
+nothing changes between deciding and reading. A condition holds for the query it was built for: it
+fixes the time, the subject's label holding and what the constraints answered, so build one for each
+query. It compares the tenant and keys byte for byte, as `Authorize` does, whatever the columns'
+collation, in which their indexes still serve. Past a few of a subject's grants on resources of the
+listed type, each row's own key is looked up in a hash of them, so a row costs one lookup however
+many it holds, as one holding a grant on everything it created does; no index serves that, so the
+query then reads every row of the tenant its other conditions keep. Denies on resources of the type
+are looked up so whatever their number. `Reachable` returns the same as
 scopes, for resources kept in another store. Both search one tenant, and count only unconditional
 grants: `Reach.Conditional` names the scopes conditional ones reach, to check one by one.
 
@@ -326,9 +330,14 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
 - **Tables:** `rbac.Migrate` creates them, prefixed `rbac_`, in the connection's current schema,
   in a database whose encoding is UTF8, and records what it applied in `rbac_migrations`. It never
   runs by itself; a host with a migration tool of its own can apply `rbac.Migrations()` instead.
+  A migration that rebuilds an index, as `0009_grant_seeks` rebuilds two of `rbac_grants`, locks
+  the table until it commits, so checks, lists and changes wait for the rebuild: on a large table,
+  migrate when that wait is acceptable.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
-  between host transactions, matches `rbac.ErrConflict`: try it again.
+  between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows
+  wait for each other by locks named for the schema holding the tables, so sessions reaching them
+  through different search_paths still do.
 - **What the host passes:** a check reads grants, memberships and groups as they are; only compiled
   conditions are cached. Read a resource's ancestors and attributes from where they are stored,
   never from request input, no earlier than the content they protect, and from the primary. A
@@ -347,7 +356,12 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   scope at most `rbac.MaxGrantsPerRole` times, and is in a group at most `rbac.MaxPlacesInGroup`
   times, by source, from each source the host owns apart; a scope holds at most `rbac.MaxDenies`
   denies; a tenant has at most `rbac.MaxCustomRoles` custom roles; an id is at most `rbac.MaxID`
-  bytes. The others are exported beside them.
+  bytes. The others are exported beside them. Lists have no limit or cursor, so what one returns
+  grows with what it lists: `Memberships` of a whole tenant with its members and guests, `Groups`
+  with its groups, `Members` with a group's members, `Holders` with who holds the permission,
+  `Grants` and `Eligibilities` on the tenant's scope with what is granted there, `Reach.Scopes`
+  with the scopes a subject's grants are on, and `Conflicts` with the identities in conflict. In a
+  large tenant, ask for less: `Memberships` of named principals, `Grants` of one principal.
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
   to run on a schedule, passing over what a change holds until the next run.
 

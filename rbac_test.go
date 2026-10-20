@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"maps"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -458,6 +459,56 @@ func TestListingsKeepToDeniesOnTheResourceItself(t *testing.T) {
 	listingsAgree(t, h, resources, h.as(t, "u"), login)
 	if allowed(t, h, h.as(t, "u"), login, resources[0]) || !allowed(t, h, h.as(t, "u"), login, resources[1]) {
 		t.Fatal("the deny should remove access to its own cluster only")
+	}
+}
+
+// Filter's condition leaves out the resources denies on thousands of them cover in about the time
+// it takes for a few: a row's own key is looked up in a hash of the denies on resources of its
+// type, and only those on containers and the tenant overlap its path. Overlapping each row with
+// every deny would cost it thousands of comparisons, and a tenant's admins can set them.
+func TestFilterLooksUpDeniesOnResourcesByEachRowsKey(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	const rows = 20000
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE fleet (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO fleet SELECT 't1', 'c' || i, ARRAY['cluster:c' || i, 'workspace:w' || (i % 50), 'org:o1', 'tenant:t1']
+		FROM generate_series(1, $1) i`, rows); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "u"))
+	u := h.as(t, "u")
+	denied := 0
+	// The time Filter's condition takes to count the rows once n of them are denied, the fastest of
+	// a few, so a stall of the database's in one doesn't count.
+	listed := func(n int) time.Duration {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+			SELECT 't1', 'cluster', 'c' || (i * 5), 'd', '{public:}', '{cluster:login}' FROM generate_series($1 + 1, $2) i`, denied, n); err != nil {
+			t.Fatal(err)
+		}
+		denied = n
+		pred, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fastest time.Duration
+		for i := range 3 {
+			start := time.Now()
+			var kept int
+			if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM fleet WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil || kept != rows-n {
+				t.Fatalf("Filter kept %d of %d rows with %d denied, %v", kept, rows, n, err)
+			}
+			if took := time.Since(start); i == 0 || took < fastest {
+				fastest = took
+			}
+		}
+		return fastest
+	}
+	few := listed(40)
+	if many := listed(4000); many > 10*few && many > 100*time.Millisecond {
+		t.Fatalf("Filter's condition took %v with 40 resources denied, and %v with 4000", few, many)
 	}
 }
 
@@ -1755,6 +1806,82 @@ func TestAPrincipalHoldsARoleABoundedNumberOfTimes(t *testing.T) {
 	}
 }
 
+// A change reaching the tables through a search_path that names another schema first takes the
+// same locks as one that names theirs alone, so it waits for them: two imports that each fill half
+// the bound on a role's grants can't both commit past it.
+func TestChangesThroughAnotherSearchPathWaitForTheSameLocks(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	var schema string
+	if err := h.pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	// A schema of the host's own, first in the other pool's search_path, holding none of the tables.
+	other := schema + "_host"
+	if _, err := h.pool.Exec(ctx, `CREATE SCHEMA `+pgx.Identifier{other}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = h.pool.Exec(context.WithoutCancel(ctx), `DROP SCHEMA IF EXISTS `+pgx.Identifier{other}.Sanitize()+` CASCADE`)
+	})
+	cfg, err := pgxpool.ParseConfig(os.Getenv(pgtest.URLEnv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = pgx.Identifier{other}.Sanitize() + ", " + pgx.Identifier{schema}.Sanitize()
+	cfg.ConnConfig.RuntimeParams["application_name"] = other
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	elsewhere, err := rbac.New(pool, h.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.as(t, "u")
+	half := func(from int) []rbac.Grant {
+		gs := make([]rbac.Grant, rbac.MaxGrantsPerRole/2+1)
+		for i := range gs {
+			gs[i] = grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+			gs[i].ExpiresAt = h.now.Add(time.Duration(from+i+1) * time.Hour)
+		}
+		return gs
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := h.authz.WithTx(tx).Import(ctx, host, "t1", half(0)); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- elsewhere.Import(ctx, host, "t1", half(100)) }()
+	// Commit once the other import has finished or waits on a lock.
+	for waiting := false; !waiting; {
+		select {
+		case err := <-done:
+			done <- err
+			waiting = true
+		default:
+			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity
+				WHERE application_name = $1 AND wait_event_type = 'Lock' AND wait_event = 'advisory')`, other).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("the other import, past the bound once the first committed: %v", err)
+	}
+	if got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{{Kind: rbac.User, ID: "u"}}}); err != nil || len(got) > rbac.MaxGrantsPerRole {
+		t.Fatalf("u holds cluster.login %d times: %v", len(got), err)
+	}
+}
+
 func TestTrustedWritesNameTheirActor(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -2539,12 +2666,57 @@ func TestHostTransactionsDeletingAPrincipalDontDeadlock(t *testing.T) {
 
 func TestChangesOnASerializableDatabase(t *testing.T) {
 	h := setupOn(t, pgtest.Open(t, "default_transaction_isolation=serializable"))
-	b := rbac.Binding{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: "u"}}
-	if err := h.authz.Apply(t.Context(), h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
-		t.Fatalf("a change where transactions default to SERIALIZABLE: %v", err)
+	// On the pool, and on a host's wrapper around it that is only a DB, whose Begin begins at the
+	// default.
+	wrapped, err := rbac.New(struct{ rbac.DB }{h.pool}, h.cfg)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !allowed(t, h, h.as(t, "u"), login, cluster) {
-		t.Fatal("the grant should be stored")
+	for i, a := range []*rbac.Authorizer{h.authz, wrapped} {
+		u := rbac.Principal{Kind: rbac.User, ID: fmt.Sprint("u", i)}
+		if err := a.Apply(t.Context(), h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: u}}}); err != nil {
+			t.Fatalf("a change where transactions default to SERIALIZABLE, on DB %d: %v", i, err)
+		}
+		if !allowed(t, h, h.as(t, u.ID), login, cluster) {
+			t.Fatal("the grant should be stored")
+		}
+	}
+}
+
+// On a host's wrapper around its own transaction, whose Begin gives a savepoint, which can't take
+// another isolation, changes and reads of several statements run in that transaction at its
+// isolation, as under WithTx: what a change makes, a read sees, and the host's rollback undoes.
+func TestAWrapperAroundAHostsTransaction(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	owner, u := h.as(t, "owner"), h.as(t, "u")
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	a, err := rbac.New(struct{ rbac.DB }{tx}, h.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: u.Principal}}}); err != nil {
+		t.Fatalf("a change: %v", err)
+	}
+	holders, err := a.Holders(ctx, login, cluster)
+	if err != nil || !slices.ContainsFunc(holders, func(x rbac.Holder) bool { return x.Principal == u.Principal }) {
+		t.Fatalf("Holders = %+v, %v", holders, err)
+	}
+	if reach, err := a.Reachable(ctx, u, login, "t1", "cluster"); err != nil || !slices.Contains(reach.Scopes, cluster.Scope()) {
+		t.Fatalf("Reachable = %+v, %v", reach, err)
+	}
+	if d, err := a.Explain(ctx, u, login, cluster); err != nil || !d.Allowed {
+		t.Fatalf("Explain = %+v, %v", d, err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if allowed(t, h, u, login, cluster) {
+		t.Fatal("the change outlived the host's transaction")
 	}
 }
 
@@ -5889,6 +6061,11 @@ func (r *racing) BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error
 	return &racingTx{Tx: tx, r: r}, err
 }
 
+func (r *racing) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := r.Pool.Begin(ctx)
+	return &racingTx{Tx: tx, r: r}, err
+}
+
 type racingTx struct {
 	pgx.Tx
 	r *racing
@@ -5948,27 +6125,34 @@ func TestAReadOfSeveralStatementsReadsOneSnapshot(t *testing.T) {
 			}
 		},
 	}} {
-		t.Run(c.name, func(t *testing.T) {
-			h := setup(t)
-			u := h.as(t, "u", "ops", "contractors")
-			if _, err := h.pool.Exec(t.Context(), c.before); err != nil {
-				t.Fatal(err)
-			}
-			db := &racing{Pool: h.pool}
-			db.change = func() {
-				if _, err := h.pool.Exec(t.Context(), c.after); err != nil {
-					t.Error(err)
+		// On a pool, and on a host's wrapper around one that is only a DB, as one tracing its
+		// statements can be, whose Begin begins at the database's default.
+		for name, wrap := range map[string]func(*racing) rbac.DB{
+			"pool":    func(r *racing) rbac.DB { return r },
+			"wrapper": func(r *racing) rbac.DB { return struct{ rbac.DB }{r} },
+		} {
+			t.Run(c.name+" on a "+name, func(t *testing.T) {
+				h := setup(t)
+				u := h.as(t, "u", "ops", "contractors")
+				if _, err := h.pool.Exec(t.Context(), c.before); err != nil {
+					t.Fatal(err)
 				}
-			}
-			a, err := rbac.New(db, h.cfg)
-			if err != nil {
-				t.Fatal(err)
-			}
-			c.read(t, a, u)
-			if db.change != nil {
-				t.Fatal("the read never read denies")
-			}
-		})
+				db := &racing{Pool: h.pool}
+				db.change = func() {
+					if _, err := h.pool.Exec(t.Context(), c.after); err != nil {
+						t.Error(err)
+					}
+				}
+				a, err := rbac.New(wrap(db), h.cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				c.read(t, a, u)
+				if db.change != nil {
+					t.Fatal("the read never read denies")
+				}
+			})
+		}
 	}
 }
 

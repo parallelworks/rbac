@@ -202,7 +202,10 @@ erDiagram
   only permissions and types the catalog has.
 - **A grant is one role to one principal on one scope**, from one source, until one time, under
   one condition. The key index `rbac_grants_key` holds what a check reads, so a check's read of
-  grants is an index-only scan.
+  grants is an index-only scan. The indexes by scope and by principal lead to both too and hold the
+  same, so a connection's cached statement, once PostgreSQL plans it generically by the tables'
+  averages, still reads only the subject's grants on the path, from the index alone, whichever
+  index it picks.
 - **Activations are grants** from the source `activation` (`SourceActivation`), made by
   `Activate` from an eligibility and ended by their expiry or `Deactivate`.
 - **Every write is recorded.** Each table above but `rbac_history` has the trigger
@@ -411,9 +414,11 @@ flowchart LR
 
 - **Filter** returns a condition for the host's own query, which reads the grants in the same
   statement as the rows, so sorting and pagination work and nothing changes between deciding and
-  reading. It never keeps a row Authorize would refuse. A subject's grants on resources of the
-  listed type are looked up by each row's own key, so one with a grant on everything it created
-  lists as fast as one with a few.
+  reading, for the query it was built for: build one for each. It never keeps a row Authorize would
+  refuse. Past a few of a subject's grants on resources of the listed type, each row's own key is
+  looked up in a hash of them, so one with a grant on everything it created costs a row one lookup;
+  no index serves that, so the query reads every row of the tenant its other conditions keep. Denies
+  on resources of the type are looked up so whatever their number.
 - **Reachable** returns the same as scopes, for a host that keeps its resources elsewhere.
   Conditional grants and conditional denies come back apart, to check one by one.
 - **Holders** lists who may do a permission on a resource, for an access review. That is each
@@ -454,7 +459,8 @@ flowchart TB
 
 ## Transactions and locks
 
-Changes take PostgreSQL advisory locks, keyed by the schema, so two changes to the same rows run
+Changes take PostgreSQL advisory locks, keyed by the schema holding the tables, as every session
+reaching them names it whatever its search_path, so two changes to the same rows run
 one after the other, each taking its locks in one order. The locks last until the transaction
 ends, so under `WithTx` two host transactions changing the same scopes or principals in opposite
 orders can still deadlock, as can a change that also writes rows it doesn't lock: PostgreSQL fails

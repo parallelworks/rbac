@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -306,10 +307,13 @@ func (a *Authorizer) changing(actor Subject, on Resource, cs *constrained) error
 // changes to the same rows run in turn. A change that also changes rows it doesn't lock, as
 // deleting groups changes denies and eligibilities on other scopes and SetMemberships removes an
 // ended membership's places in groups, can still deadlock with another change: PostgreSQL ends
-// one, which matches ErrConflict. The locks last until the
-// transaction ends. Advisory locks span the database, so the keys name the
-// schema: another application's grants are in a schema of their own.
-const lockKey = `hashtextextended(current_schema() || '/rbac/' || $1, 0)`
+// one, which matches ErrConflict. The locks last until the transaction ends. Advisory locks span
+// the database, so the keys name the schema holding the tables, as the session's statements reach
+// them: another application's grants are in a schema of their own. Not current_schema(), the first
+// in the search_path that exists, which two sessions reaching the same tables through paths that
+// differ before it name apart, so their changes would never wait for each other.
+const lockKey = `hashtextextended((SELECT n.nspname FROM pg_catalog.pg_class c
+	JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = 'rbac_grants'::regclass) || '/rbac/' || $1, 0)`
 
 // maxLocks is how many scopes and principals a change locks one by one; a larger one locks the
 // tenant, rather than fill PostgreSQL's lock table, which every session shares.
@@ -1230,15 +1234,21 @@ func (a *Authorizer) begin(ctx context.Context, fn func(pgx.Tx) error) error {
 }
 
 // begin runs fn in a transaction of its own at READ COMMITTED, whatever the database's default,
-// as a change's checks must read what committed before it took its locks; on any other DB, as a
-// pgx.Tx under WithTx, in a savepoint of that DB's transaction, whose isolation the locks check.
-// PostgreSQL refusing it for a race matches ErrConflict.
+// as a change's checks must read what committed before it took its locks; on a pgx.Tx, as under
+// WithTx, in a savepoint of its transaction, whose isolation the locks check; and on another DB,
+// as isolated says. PostgreSQL refusing it for a race matches ErrConflict.
 func begin(ctx context.Context, db DB, fn func(pgx.Tx) error) error {
 	var err error
-	if conn, ok := db.(ownTx); ok {
+	switch conn := db.(type) {
+	case ownTx:
 		err = pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, fn)
-	} else {
+	case pgx.Tx:
 		err = savepoint(ctx, db, fn)
+	default:
+		var nested bool
+		if nested, err = isolated(ctx, db, "READ COMMITTED", fn); nested {
+			err = savepoint(ctx, db, fn)
+		}
 	}
 	return conflicted(err)
 }
@@ -1246,6 +1256,52 @@ func begin(ctx context.Context, db DB, fn func(pgx.Tx) error) error {
 // ownTx is a DB that begin runs fn in a transaction of its own on, as a pool or a connection.
 type ownTx interface {
 	BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
+}
+
+// isolated runs fn in what db's Begin begins at level, on a DB that is neither an ownTx nor a
+// pgx.Tx, as a host's wrapper around a pool that traces its statements: its Begin begins at the
+// database's default, so the first statement sets it. Begin may give a savepoint of a transaction
+// under way, as a wrapper around a host's pgx.Tx does, which refuses that: then fn doesn't run, and
+// nested is set.
+func isolated(ctx context.Context, db DB, level string, fn func(pgx.Tx) error) (nested bool, err error) {
+	err = savepoint(ctx, db, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL "+level); err != nil {
+			nested = isolationRefused(err)
+			return err
+		}
+		return fn(tx)
+	})
+	if nested {
+		return true, nil
+	}
+	return false, err
+}
+
+// isolationRefused reports whether err is PostgreSQL refusing to set a transaction's isolation
+// once it is under way, as in a savepoint of a host's transaction.
+func isolationRefused(err error) bool {
+	var pg *pgconn.PgError
+	return errors.As(err, &pg) && pg.Code == "25001"
+}
+
+// repeatableRead begins on db, a DB that is neither an ownTx nor a pgx.Tx, a transaction at
+// REPEATABLE READ, as isolated does, so a read of several statements reads one snapshot; where its
+// Begin gives a savepoint of a transaction under way, which refuses that, a savepoint at that
+// transaction's isolation, as under WithTx.
+func repeatableRead(ctx context.Context, db DB) (pgx.Tx, error) {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err == nil {
+		return tx, nil
+	}
+	c, cancel := context.WithTimeout(context.WithoutCancel(ctx), savepointEnd)
+	defer cancel()
+	if rerr := tx.Rollback(c); rerr != nil || !isolationRefused(err) {
+		return nil, errors.Join(err, rerr)
+	}
+	return db.Begin(ctx)
 }
 
 // savepointEnd is how long a savepoint's release or rollback may take once its ctx is done.
@@ -1397,11 +1453,18 @@ func (a *Authorizer) revoke(ctx context.Context, tx pgx.Tx, tenant string, scope
 	return collectGrants(rows)
 }
 
+// revoking is revoke's statement. The grants are found from the bindings, each by its principal,
+// scope and role, which every index leading to them seeks: matched to the scope's grants instead,
+// a revoke reads every grant on it, which a busy scope holds thousands of, while it holds the
+// scope's lock. OFFSET 0 keeps the planner from flattening the lookup into such a join.
 const revoking = `
 	DELETE FROM rbac_grants g
-	WHERE tenant = $1 AND scope = $2
-	  AND EXISTS (SELECT FROM unnest($3::text[], $4::text[], $5::text[], $6::text[]) AS r(principal, role, source, id)
-	    WHERE r.principal = g.principal AND r.role = g.role AND (r.id = '' AND r.source = g.source OR r.id = g.id::text))
+	WHERE id = ANY(ARRAY(
+	    SELECT x.id FROM unnest($3::text[], $4::text[], $5::text[], $6::text[]) AS r(principal, role, source, id)
+	    CROSS JOIN LATERAL (
+	      SELECT id FROM rbac_grants WHERE tenant = $1 AND principal = r.principal AND scope = $2 AND role = r.role
+	        AND (r.id = '' AND source = r.source OR id::text = r.id)
+	      OFFSET 0) x))
 	  AND NOT EXISTS (SELECT FROM unnest($7::text[], $8::text[], $9::text[], $10::timestamptz[], $11::text[])
 	    AS k(principal, role, source, expires_at, condition)
 	    WHERE k.principal = g.principal AND k.role = g.role AND k.source = g.source
@@ -1462,7 +1525,8 @@ func (f GrantFilter) sql() (where string, scopes, principals []string) {
 // stored, so they can be revoked, even those that give less than their role or nothing: one to
 // a tenant's members or the public gives no `:grant` permission, and one of a role no longer in
 // the catalog, to a kind no longer declared, or to the public of a role no longer Public gives
-// nothing.
+// nothing. It has no limit or cursor, so what it returns grows with what matches, as every grant on
+// the tenant's scope, or of a group granted on each of its resources.
 func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) ([]Grant, error) {
 	if !validID(tenant) || !f.valid(tenant) {
 		return nil, fmt.Errorf("%w: Grants needs a tenant and valid scopes or principals", ErrInvalid)
