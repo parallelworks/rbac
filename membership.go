@@ -961,6 +961,19 @@ func (a *Authorizer) clearsAll(ctx context.Context, q DB, labels *constrained) (
 	return err == nil && h.clearsAll(), err
 }
 
+// stillClearsAll refuses, read on q in a change's transaction, a change that found the actor's
+// label values satisfying every label before it, which no longer do.
+func (a *Authorizer) stillClearsAll(ctx context.Context, q DB, labels *constrained) error {
+	all, err := a.clearsAll(ctx, q, labels)
+	if err != nil {
+		return err
+	}
+	if !all {
+		return fmt.Errorf("%w: the actor's label values changed while this change waited; try again", ErrConflict)
+	}
+	return nil
+}
+
 // groupKey is the scope key of a group, which changes to it lock.
 func groupKey(id string) string { return Scope{Type: GroupScope, ID: id}.Key() }
 
@@ -1943,12 +1956,8 @@ func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject
 	}
 	clearance := a.labelCheck(ctx, tx, labels)
 	if slices.ContainsFunc(checks, func(c *reachCheck) bool { return c.cleared }) {
-		all, err := a.clearsAll(ctx, tx, labels)
-		if err != nil {
+		if err := a.stillClearsAll(ctx, tx, labels); err != nil {
 			return err
-		}
-		if !all {
-			return fmt.Errorf("%w: the actor's label values changed while this change waited; try again", ErrConflict)
 		}
 	}
 	for i, c := range checks {

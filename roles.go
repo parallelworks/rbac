@@ -699,18 +699,21 @@ func (a *Authorizer) revalidate(ctx context.Context, actor Subject, tenant strin
 
 // labeling is what labelsAllow checked: the scopes a custom role's grants and eligibilities are
 // on, the resources of those whose label asks for values, and the constraints' answers about the
-// actor's, which stillLabeled reads back.
+// actor's, which stillLabeled reads back; or that the actor's satisfy every label, cleared.
 type labeling struct {
 	scopes  []Scope
 	labeled []Resource
 	cs      *constrained
+	cleared bool
 }
 
 // labelsAllow refuses changing what a custom role's grants and eligibilities give, or revoking
 // them, to an actor that a label of a scope they are on refuses, as Apply refuses changing grants
 // there: read before the change's transaction, as labels are the host's; with removing, as for
-// deleting the role, a scope the host no longer has (ErrNotFound) as unlabeled. It returns what it
-// checked, which stillLabeled reads again under the change's lock.
+// deleting the role, a scope the host no longer has (ErrNotFound) as unlabeled, and none asked
+// about where the actor's label values satisfy every label, as ChangeMembers asks about none a
+// removal alone reaches. It returns what it checked, which stillLabeled reads again under the
+// change's lock.
 func (a *Authorizer) labelsAllow(ctx context.Context, actor Subject, tenant string, id Role, removing bool) (labeling, error) {
 	if len(a.labels) == 0 {
 		return labeling{}, nil
@@ -720,6 +723,11 @@ func (a *Authorizer) labelsAllow(ctx context.Context, actor Subject, tenant stri
 		return labeling{}, err
 	}
 	l := labeling{scopes: scopes, cs: a.constrain(ctx, actor, tenantResource(tenant))}
+	if removing && len(scopes) > 0 {
+		if l.cleared, err = a.clearsAll(ctx, a.db, l.cs); err != nil || l.cleared {
+			return l, err
+		}
+	}
 	for _, s := range scopes {
 		on, err := a.resourceOf(ctx, tenant, s)
 		switch {
@@ -749,10 +757,15 @@ func (a *Authorizer) labelsHeld(ctx context.Context, q DB, l labeling) error {
 
 // stillLabeled refuses, under the tenant's lock, a change labelsAllow checked whose role is now
 // granted on a scope it didn't check, as one granted there while the change waited, or whose
-// actor no longer holds the values a label of one asks for, as one revoked meanwhile.
+// actor no longer holds the values a label of one asks for, as one revoked meanwhile, or, where
+// they satisfied every label, no longer does.
 func (a *Authorizer) stillLabeled(ctx context.Context, tx pgx.Tx, tenant string, id Role, checked labeling) error {
 	if len(a.labels) == 0 {
 		return nil
+	}
+	if checked.cleared {
+		checked.cs.seal()
+		return a.stillClearsAll(ctx, tx, checked.cs)
 	}
 	scopes, err := a.roleScopes(ctx, tx, tenant, id)
 	if err != nil {

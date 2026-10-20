@@ -1532,6 +1532,61 @@ func TestARemovalByOneClearedForEveryLabelAsksTheHostNothing(t *testing.T) {
 	}
 }
 
+// Deleting a role only takes access away, so where the actor's label values satisfy every label it
+// asks the host nothing about the scopes the role is granted on, and is tried again where they no
+// longer do once it holds the tenant's lock.
+func TestDeletingARoleByOneClearedForEveryLabelAsksTheHostNothing(t *testing.T) {
+	asked := 0
+	var meanwhile func(context.Context) error
+	h := labeled(t, func(c *rbac.Config) {
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s.Type == "cluster" {
+				asked++
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+		c.Constraints = []rbac.Constraint{{Name: "meanwhile", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if do := meanwhile; do != nil && in.Permission == "rel:fra" {
+				meanwhile = nil
+				return false, do(ctx)
+			}
+			return false, nil
+		}}}
+	})
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+		VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}'), ('t1', 'custom.other', '{cluster:view}', '{cluster}')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		SELECT 't1', 'cluster', 'c' || i, 'user', 'u', r FROM generate_series(1, 20) i, unnest('{custom.viewer,custom.other}'::text[]) r`); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.roles", rbac.User, "admin"))
+	admin := h.as(t, "admin")
+	h.hold(t, "admin", "level:high", "comp:alpha", "comp:bravo", "rel:usa", "rel:gbr", "rel:fra")
+	if err := h.authz.DeleteRole(ctx, admin, "t1", "custom.viewer"); err != nil {
+		t.Fatal(err)
+	}
+	if asked != 0 {
+		t.Errorf("deleting a role by one cleared for every label asked Config.ResourceOf about %d clusters", asked)
+	}
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(rbac.TenantRoot("t1"), "rel.fra", rbac.User, "admin")})
+	}
+	if err := h.authz.DeleteRole(ctx, admin, "t1", "custom.other"); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("deleting a role once the actor lost a label value meanwhile: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("the label value should have been revoked meanwhile")
+	}
+	// Tried again, it asks the host about each scope, whose labels ask nothing of it.
+	if err := h.authz.DeleteRole(ctx, admin, "t1", "custom.other"); err != nil || asked != 20 {
+		t.Fatalf("deleting it again asked about %d clusters: %v", asked, err)
+	}
+}
+
 // A removal is refused when, while the scopes its group holds access on are read from the host,
 // the group is granted a role on a labeled one, whose label it didn't check.
 func TestAGrantToAGroupMadeWhileARemovalIsCheckedIsTriedAgain(t *testing.T) {
