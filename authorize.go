@@ -268,7 +268,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 	if dim, err := a.unsatisfied(ctx, s, r); err != nil || dim != "" {
 		return nil, err
 	}
-	perms, _, excluded, err := a.permissionsOf(ctx, s, r, nil)
+	perms, _, excluded, err := a.permissionsOf(ctx, a.db, s, r, nil, a.constrain(ctx, s, r))
 	if err != nil {
 		return nil, err
 	}
@@ -279,11 +279,13 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 // keeps, or all where it is nil; and of them, those a condition decided, a grant's or a deny's,
 // or a constraint asked without the request's attributes, which a read without the request can't
 // settle; and the exclusive dimensions s holds none of, as its grants on the tenant could give it
-// two (excludedBy).
-func (a *Authorizer) permissionsOf(ctx context.Context, s Subject, r Resource, only func(Permission) bool) ([]Permission, map[Permission]bool, map[string]bool, error) {
+// two (excludedBy). It reads on q, and asks the constraints through cs, which is on r, so a change
+// reads them back in its transaction.
+func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resource, only func(Permission) bool, cs *constrained,
+) ([]Permission, map[Permission]bool, map[string]bool, error) {
 	kept := func(p Permission) bool { return only == nil || only(p) }
 	byCondition := map[Permission]bool{}
-	held, ds, roles, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), "", namedRoles, false)
+	held, ds, roles, err := a.heldOrDenied(ctx, q, r.Tenant, s, all, r.path(), "", namedRoles, false)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -309,12 +311,8 @@ func (a *Authorizer) permissionsOf(ctx context.Context, s Subject, r Resource, o
 	// What a constraint removes is settled first, so no budget is spent on conditions for it.
 	removed := map[Permission]bool{}
 	isRemoved := func(p Permission) (bool, error) {
-		if r, ok := removed[p]; ok {
-			return r, nil
-		}
-		name, err := a.denied(ctx, ConstraintInput{Tenant: r.Tenant, ResourceType: r.Type, Permission: p, Subject: &s, Resource: &r})
-		removed[p] = name != ""
-		return name != "", err
+		removed[p] = cs.removes(p, r.Type)
+		return removed[p], cs.failed()
 	}
 	// Each permission is decided as Authorize would decide it, on budgets of its own.
 	vars, spends := a.vars(ctx, s, "", r), map[Permission]*budget{}
@@ -346,7 +344,7 @@ func (a *Authorizer) permissionsOf(ctx context.Context, s Subject, r Resource, o
 	}
 	// Conditions are evaluated only for what no unconditional grant gives, as checks do, the
 	// cheapest first.
-	if err := a.conditionsOf(ctx, a.db, r.Tenant, conditional); err != nil {
+	if err := a.conditionsOf(ctx, q, r.Tenant, conditional); err != nil {
 		return nil, nil, nil, err
 	}
 	cheapestFirst(conditional, holding.expression)

@@ -176,12 +176,15 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, how
 		if err := a.stillStanding(ctx, tx, on.Tenant, stand); err != nil {
 			return ChangeEvent{}, err
 		}
-		// Decided again in the transaction, so the actor's access and the roles are read as the
-		// change is made: a custom role deleted or redefined since is granted only as it is now.
-		// The constraints aren't asked again, as hooks run outside it.
+		// Decided again in the transaction, so the actor's access, its label values and the roles
+		// are read as the change is made: a custom role deleted or redefined since is granted only as
+		// it is now. The constraints aren't asked again, as hooks run outside it.
 		cs.seal()
 		now, err := a.mayChange(ctx, tx, actor, on, handed, revokes, cs)
 		if err != nil {
+			return ChangeEvent{}, err
+		}
+		if err := a.cleared(ctx, tx, on, cs, GrantPermission(scope.Type)); err != nil {
 			return ChangeEvent{}, err
 		}
 		var bad []error
@@ -289,11 +292,28 @@ func (a *Authorizer) mayChangeGrants(ctx context.Context, actor Subject, on Reso
 	if err := a.changing(actor, on, cs); err != nil {
 		return authority{}, nil, err
 	}
-	if dim, err := a.unsatisfied(ctx, actor, on); err != nil || dim != "" {
-		return authority{}, nil, cmp.Or(err, error(&DeniedError{Permission: GrantPermission(on.Type), Scope: on.Scope(), Reason: labelRefusal(dim)}))
+	if err := a.cleared(ctx, a.db, on, cs, GrantPermission(on.Type)); err != nil {
+		return authority{}, nil, err
 	}
 	au, err := a.mayChange(ctx, a.db, actor, on, grants, revokes, cs)
 	return au, cs, err
+}
+
+// cleared refuses, as a DeniedError of p, a change on a scope whose label the actor's holding,
+// read on q, doesn't satisfy, asking the constraints about its values on the tenant through cs:
+// before the change's transaction, and again under its locks, which reads their answers back.
+func (a *Authorizer) cleared(ctx context.Context, q DB, on Resource, cs *constrained, p Permission) error {
+	if !on.Labels.asks() {
+		return nil
+	}
+	h, _, err := a.holdingOn(ctx, q, cs.actor, cs.ofTenant())
+	if err != nil {
+		return err
+	}
+	if dim := h.Unsatisfied(on.Labels); dim != "" {
+		return &DeniedError{Permission: p, Scope: on.Scope(), Reason: labelRefusal(dim)}
+	}
+	return nil
 }
 
 // changing refuses a change to grants on a scope of a type the host doesn't have, as a typo no
@@ -751,13 +771,30 @@ type constrained struct {
 	// sealed is set in the transaction, where a permission not asked about before is one the change
 	// came to need since, as for a role redefined meanwhile: missed refuses it, to be tried again.
 	sealed, missed bool
+	// tenant is what they remove of the actor's label values, asked about on the tenant, where it
+	// holds them, for a change on a labeled scope.
+	tenant *constrained
 }
 
 func (a *Authorizer) constrain(ctx context.Context, actor Subject, on Resource) *constrained {
 	return &constrained{a: a, ctx: ctx, actor: actor, on: on, asked: map[permissionOn]bool{}, by: map[Permission]string{}}
 }
 
-func (c *constrained) seal() { c.sealed = true }
+func (c *constrained) seal() {
+	c.sealed = true
+	if c.tenant != nil {
+		c.tenant.seal()
+	}
+}
+
+// ofTenant is what the constraints remove from the actor on its tenant, sealed as c is.
+func (c *constrained) ofTenant() *constrained {
+	if c.tenant == nil {
+		c.tenant = c.a.constrain(c.ctx, c.actor, Resource{Tenant: c.on.Tenant, Type: TenantScope, ID: c.on.Tenant})
+		c.tenant.sealed = c.sealed
+	}
+	return c.tenant
+}
 
 // removes reports whether a constraint removes p on resources of a type from the actor, failing
 // closed. The constraints are asked about the scope the change is on, a container or the tenant

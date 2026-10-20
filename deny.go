@@ -1,6 +1,7 @@
 package rbac
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -227,7 +228,8 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 		return err
 	}
 	d.Scope = on.Scope()
-	if err := a.mayDeny(ctx, actor, on); err != nil {
+	cs, err := a.denying(ctx, actor, on)
+	if err != nil {
 		return err
 	}
 	if err := a.checkDeny(on.Tenant, d); err != nil {
@@ -243,6 +245,10 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 			return ChangeEvent{}, err
 		}
 		if err := a.holdsDeny(ctx, tx, actor, on); err != nil {
+			return ChangeEvent{}, err
+		}
+		cs.seal()
+		if err := a.cleared(ctx, tx, on, cs, DenyPermission(on.Type)); err != nil {
 			return ChangeEvent{}, err
 		}
 		var others int
@@ -303,7 +309,8 @@ func (a *Authorizer) DeleteDeny(ctx context.Context, actor Subject, on Resource,
 	if err := a.subject(actor); err != nil {
 		return err
 	}
-	if err := a.mayDeny(ctx, actor, on); err != nil {
+	cs, err := a.denying(ctx, actor, on)
+	if err != nil {
 		return err
 	}
 	return a.inTx(ctx, on.Tenant, actor.Principal, "DeleteDeny", func(tx pgx.Tx) (ChangeEvent, error) {
@@ -311,6 +318,10 @@ func (a *Authorizer) DeleteDeny(ctx context.Context, actor Subject, on Resource,
 			return ChangeEvent{}, err
 		}
 		if err := a.holdsDeny(ctx, tx, actor, on); err != nil {
+			return ChangeEvent{}, err
+		}
+		cs.seal()
+		if err := a.cleared(ctx, tx, on, cs, DenyPermission(on.Type)); err != nil {
 			return ChangeEvent{}, err
 		}
 		rows, err := tx.Query(ctx, `DELETE FROM rbac_denies WHERE tenant = $1 AND scope = $2 AND id = $3 RETURNING `+denyColumns,
@@ -328,28 +339,29 @@ func (a *Authorizer) DeleteDeny(ctx context.Context, actor Subject, on Resource,
 // Apply: a hook that queries the pool while the transaction holds a connection can wait forever
 // on a busy pool.
 func (a *Authorizer) mayDeny(ctx context.Context, actor Subject, on Resource) error {
+	_, err := a.denying(ctx, actor, on)
+	return err
+}
+
+// denying is mayDeny, returning the constraints' answers, which the transaction reads back to
+// check the actor's label values again under its lock.
+func (a *Authorizer) denying(ctx context.Context, actor Subject, on Resource) (*constrained, error) {
 	if err := a.scopeOf(on); err != nil {
-		return err
+		return nil, err
 	}
 	perm := DenyPermission(on.Type)
 	if actor.Principal == (Principal{}) {
-		return &DeniedError{Permission: perm, Scope: on.Scope(), Reason: "an anonymous subject changes nothing"}
+		return nil, &DeniedError{Permission: perm, Scope: on.Scope(), Reason: "an anonymous subject changes nothing"}
 	}
-	name, err := a.denied(ctx, ConstraintInput{Tenant: on.Tenant, ResourceType: on.Type, Permission: perm, Subject: &actor, Resource: &on})
-	if err != nil {
-		return err
-	}
-	if name != "" {
-		return &DeniedError{Permission: perm, Scope: on.Scope(), Reason: "removed by " + name}
+	cs := a.constrain(ctx, actor, on)
+	if cs.removes(perm, on.Type) {
+		return nil, cmp.Or(cs.failed(), error(&DeniedError{Permission: perm, Scope: on.Scope(), Reason: "removed by " + cs.removedBy(perm)}))
 	}
 	// Who can't see a labeled scope sets no deny on it, nor lifts one, which would widen access.
-	if dim, err := a.unsatisfied(ctx, actor, on); err != nil || dim != "" {
-		if err != nil {
-			return err
-		}
-		return &DeniedError{Permission: perm, Scope: on.Scope(), Reason: labelRefusal(dim)}
+	if err := a.cleared(ctx, a.db, on, cs, perm); err != nil {
+		return nil, err
 	}
-	return a.holdsDeny(ctx, a.db, actor, on)
+	return cs, a.holdsDeny(ctx, a.db, actor, on)
 }
 
 // holdsDeny checks, on q, that actor holds DenyPermission(on's type) on a scope.

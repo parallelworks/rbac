@@ -111,7 +111,9 @@ grants: `Reach.Conditional` names the scopes conditional ones reach, to check on
   all apply to them. `Authorize`, `Explain`, `Permissions`, `Holders` and `Grantable` allow
   nothing of a labeled resource unless what the subject holds satisfies the label, whatever its
   grants give, nor do `Apply`, `SetEligibility` and `DeleteEligibility` change its grants, nor
-  `SetDeny` and `DeleteDeny` its denies; `Explain` names the dimension that failed. `Filter`
+  `SetDeny` and `DeleteDeny` its denies, nor `SetRole` and `DeleteRole` the grants of a role on it,
+  each reading the actor's values again under the change's locks; `Explain` names the dimension
+  that failed. `Filter`
   tests a `text[]` label column (`Columns.Labels`), `Reachable` returns the holding, and `Holding`
   with `Satisfies` checks data points in a feed without reading the database.
 - **Writing labeled data:** data read under one label is written under another only if

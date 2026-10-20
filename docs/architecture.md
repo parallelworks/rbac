@@ -372,6 +372,7 @@ sequenceDiagram
     A->>DB: lock: exclusive/tenant if a dimension is Exclusive, then the tenant<br/>shared and the scope and principals exclusive, or past 64 the tenant exclusive
     A->>DB: the groups named exist, and stillStanding:<br/>memberships unchanged since the host was asked
     A->>DB: authority again, under the locks, the constraints' answers read back
+    A->>DB: the actor's label values again, where the scope is labeled
     A->>DB: revoke and upsert
     DB->>DB: rbac_record writes rbac_history, as the actor
     A->>DB: exclusive values: no one can now hold two
