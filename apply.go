@@ -1884,19 +1884,24 @@ func (a *Authorizer) revoke(ctx context.Context, tx pgx.Tx, tenant string, scope
 // revoking is revoke's statement. The grants are found from the bindings, each by its principal,
 // scope and role, which every index leading to them seeks: matched to the scope's grants instead,
 // a revoke reads every grant on it, which a busy scope holds thousands of, while it holds the
-// scope's lock. OFFSET 0 keeps the planner from flattening the lookup into such a join.
+// scope's lock. OFFSET 0 keeps the planner from flattening the lookup into such a join. They are
+// locked in order (inOrder) before they are deleted: deleted as the plan finds them, by their ids
+// or where they are stored, they would deadlock with a change ending activations among them, which
+// holds no lock of the scope.
 const revoking = `
-	DELETE FROM rbac_grants g
-	WHERE id = ANY(ARRAY(
-	    SELECT x.id FROM unnest($3::text[], $4::text[], $5::text[], $6::text[]) AS r(principal, role, source, id)
-	    CROSS JOIN LATERAL (
-	      SELECT id FROM rbac_grants WHERE tenant = $1 AND principal = r.principal AND scope = $2 AND role = r.role
-	        AND (r.id = '' AND source = r.source OR id::text = r.id)
-	      OFFSET 0) x))
-	  AND NOT EXISTS (SELECT FROM unnest($7::text[], $8::text[], $9::text[], $10::timestamptz[], $11::text[])
-	    AS k(principal, role, source, expires_at, condition)
-	    WHERE k.principal = g.principal AND k.role = g.role AND k.source = g.source
-	      AND k.expires_at IS NOT DISTINCT FROM g.expires_at AND k.condition = g.condition)
+	DELETE FROM rbac_grants
+	WHERE id = ANY(ARRAY(SELECT id FROM rbac_grants g
+	  WHERE id = ANY(ARRAY(
+	      SELECT x.id FROM unnest($3::text[], $4::text[], $5::text[], $6::text[]) AS r(principal, role, source, id)
+	      CROSS JOIN LATERAL (
+	        SELECT id FROM rbac_grants WHERE tenant = $1 AND principal = r.principal AND scope = $2 AND role = r.role
+	          AND (r.id = '' AND source = r.source OR id::text = r.id)
+	        OFFSET 0) x))
+	    AND NOT EXISTS (SELECT FROM unnest($7::text[], $8::text[], $9::text[], $10::timestamptz[], $11::text[])
+	      AS k(principal, role, source, expires_at, condition)
+	      WHERE k.principal = g.principal AND k.role = g.role AND k.source = g.source
+	        AND k.expires_at IS NOT DISTINCT FROM g.expires_at AND k.condition = g.condition)
+	  ORDER BY ` + bindingOrder + ` FOR UPDATE))
 	RETURNING ` + grantColumns
 
 // revokeArgs are revoking's arguments.

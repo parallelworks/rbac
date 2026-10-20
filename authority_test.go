@@ -845,6 +845,112 @@ func TestEndingAPlaceAndChangingAnotherNeverDeadlocksWithAnActivation(t *testing
 	}
 }
 
+// Revoking activations locks them in the order a change ending their places locks them, which
+// holds no lock of their scope: deleted in the order of their ids or where they are stored, a
+// revoke would hold one the change locks last and wait on one it locks first.
+func TestRevokingActivationsAndEndingThemAtOnceNeverDeadlocks(t *testing.T) {
+	for name, revoke := range map[string]func(ctx context.Context, h *harness, revokes []rbac.Binding) error{
+		"Apply": func(ctx context.Context, h *harness, revokes []rbac.Binding) error {
+			return h.authz.Apply(ctx, rbac.Subject{Principal: identity("owner")}, cluster, rbac.Change{Revoke: revokes})
+		},
+		"DeleteGrants": func(ctx context.Context, h *harness, revokes []rbac.Binding) error {
+			grants := make([]rbac.Grant, len(revokes))
+			for i, b := range revokes {
+				grants[i] = rbac.Grant{Scope: cluster.Scope(), Binding: b}
+			}
+			return h.authz.DeleteGrants(ctx, host, "t1", grants)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := grouped(t)
+			ctx := t.Context()
+			h.groups(t, "g1", "x")
+			if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "g1", Principal: groupOf("x")}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: groupOf("g1"), MaxDuration: 8 * time.Hour}); err != nil {
+				t.Fatal(err)
+			}
+			// w's activation first by id and where it is stored, and u's, which the change locks
+			// first, last.
+			var revokes []rbac.Binding
+			for i, id := range []string{"w", "v", "u"} {
+				s := h.as(t, id, "x")
+				if _, err := h.authz.Activate(ctx, s, cluster, rbac.Activation{Role: "cluster.sudo", Duration: time.Hour, Justification: "incident"}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := h.pool.Exec(ctx, `UPDATE rbac_grants SET id = $1 WHERE principal = $2 AND source = 'activation'`,
+					fmt.Sprintf("00000000-0000-4000-8000-%012d", i+1), "user:"+id); err != nil {
+					t.Fatal(err)
+				}
+				revokes = append(revokes, rbac.Binding{Role: "cluster.sudo", Principal: s.Principal, Source: rbac.SourceActivation})
+			}
+			for _, order := range []string{"id", "ctid"} {
+				var first string
+				if err := h.pool.QueryRow(ctx, `SELECT principal FROM rbac_grants WHERE source = 'activation' ORDER BY `+order+` LIMIT 1`).Scan(&first); err != nil || first != "user:w" {
+					t.Fatalf("first activation by %s: %s, %v", order, first, err)
+				}
+			}
+			// Holding v's, so the change locks u's and waits, and the revoke waits behind it.
+			hold, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = hold.Rollback(ctx) }()
+			var pid int
+			if err := hold.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := hold.Exec(ctx, `SELECT FROM rbac_grants WHERE principal = 'user:v' AND source = 'activation' FOR UPDATE`); err != nil {
+				t.Fatal(err)
+			}
+			ended, revoked := make(chan error, 1), make(chan error, 1)
+			waiting := func(n int) {
+				t.Helper()
+				for {
+					var blocked int
+					if err := h.pool.QueryRow(ctx, `WITH RECURSIVE waiting(pid) AS (
+						SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))
+						UNION SELECT a.pid FROM pg_stat_activity a JOIN waiting w ON w.pid = ANY(pg_blocking_pids(a.pid)))
+						SELECT count(*) FROM waiting`, pid).Scan(&blocked); err != nil {
+						t.Fatal(err)
+					}
+					if blocked >= n {
+						return
+					}
+					select {
+					case err := <-ended:
+						t.Fatalf("DeleteMembers ran while v's activation was held: %v", err)
+					case err := <-revoked:
+						t.Fatalf("%s ran while v's activation was held: %v", name, err)
+					default:
+					}
+				}
+			}
+			go func() {
+				ended <- h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "g1", Principal: groupOf("x")}})
+			}()
+			waiting(1)
+			go func() { revoked <- revoke(ctx, h, revokes) }()
+			waiting(2)
+			if err := hold.Rollback(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-ended; err != nil {
+				t.Errorf("DeleteMembers: %v", err)
+			}
+			if err := <-revoked; err != nil {
+				t.Errorf("%s: %v", name, err)
+			}
+			if grants, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}}); err != nil || slices.ContainsFunc(grants, func(g rbac.Grant) bool {
+				return g.Source == rbac.SourceActivation
+			}) {
+				t.Errorf("activations left: %+v, %v", grants, err)
+			}
+		})
+	}
+}
+
 func TestAnActivationIsHandedOnNoLongerThanItLasts(t *testing.T) {
 	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), granter) })
 	ctx := t.Context()
