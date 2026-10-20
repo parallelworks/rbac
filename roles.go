@@ -184,14 +184,10 @@ func roleFrom(id, name, description string, perms, types []string, privileged, p
 	return r
 }
 
-// catalogSQL names the array arguments that Authorizer.publicArgs and Authorizer.catalogArgs fill:
-// the catalog's permissions, its types and the pairs of them a role that isn't privileged gives.
-type catalogSQL struct{ perms, types, pairs string }
-
 // givingSQL is SQL for the ids of the roles that give perm on a resource type in a tenant: the
 // built-in ones in the array argument builtin, and with custom the tenant's custom ones, read in
-// the same statement, of them only those only keeps, if any (publicOnly, privilegedOnly), so a
-// catalog change reaches searches as it reaches checks.
+// the same statement, of them only those only keeps, if any, so a role redefined reaches searches
+// as it reaches checks.
 func givingSQL(builtin, tenant, perm, resourceType string, custom bool, only string) string {
 	// Without custom the subquery stays, constant false, so the statement's arguments are the
 	// same and PostgreSQL plans it away.
@@ -199,40 +195,55 @@ func givingSQL(builtin, tenant, perm, resourceType string, custom bool, only str
 		AND %s::text = ANY(cr.permissions) AND %s::text = ANY(cr.resource_types)%s))`, builtin, custom, tenant, perm, resourceType, only)
 }
 
-// publicOnly keeps the custom roles public as Authorizer.current reads them: marked Public, and of
-// the permissions and types the catalog has, giving none that changes access and each only where
-// a role that isn't privileged gives it.
-func publicOnly(c catalogSQL) string {
-	return fmt.Sprintf(` AND cr.public AND NOT EXISTS (SELECT FROM unnest(cr.permissions) cp, unnest(cr.resource_types) ct
-		WHERE cp = ANY(%s::text[]) AND ct = ANY(%s::text[]) AND cp || ' ' || ct <> ALL(%s::text[]))`, c.perms, c.types, c.pairs)
-}
+// listedOnly keeps, of givingSQL's custom roles, those in the array argument ids.
+func listedOnly(ids string) string { return fmt.Sprintf(` AND cr.id = ANY(%s::text[])`, ids) }
 
-// privilegedOnly keeps the custom roles privileged as Authorizer.current reads them: of the
-// permissions and types the catalog has, giving one where only privileged roles give it, as every
-// permission that changes access is.
-func privilegedOnly(c catalogSQL) string {
-	return fmt.Sprintf(` AND EXISTS (SELECT FROM unnest(cr.permissions) cp, unnest(cr.resource_types) ct
-		WHERE cp = ANY(%s::text[]) AND ct = ANY(%s::text[]) AND cp || ' ' || ct <> ALL(%s::text[]))`, c.perms, c.types, c.pairs)
-}
+// publicOnly keeps, of givingSQL's custom roles, those in the array argument ids that are still
+// marked Public, as a search's statement can run after its ids were read.
+func publicOnly(ids string) string { return ` AND cr.public` + listedOnly(ids) }
 
-// publicArgs are the arguments of givingSQL's public check: the catalog's permissions, its types
-// and the pairs of them a public role may give. They are NULL where the check can't matter, so a
-// search doesn't send them: with no custom role in it, or where no grant to the public gives p,
-// as Filter and Reachable then read none and Holders drops the public.
-func (a *Authorizer) publicArgs(p Permission, resourceType string, custom bool) []any {
-	if !a.publicGives(p, resourceType) {
-		return []any{nil, nil, nil}
-	}
-	return a.catalogArgs(custom)
-}
-
-// catalogArgs are the arguments of privilegedOnly, NULL without custom, where it can't matter.
-func (a *Authorizer) catalogArgs(custom bool) []any {
+// broadArgs are a search's arguments for the roles giving p on a resource type that give it
+// through grants to the public and the tenant's members: the custom ones that are public, NULL
+// where no grant to the public gives p, as Filter and Reachable then read none and Holders drops
+// the public; of roles, the built-in ones that aren't privileged; and the custom ones that aren't.
+// The custom ones are those giving p there that grants to the public or the tenant's members name
+// on the scopes grants selects, SQL whose arguments, args, start at $4: only for those grants does
+// it matter. They are decided as Authorizer.current reads them, as checks read them; pairing each
+// one's permissions and types with the catalog's in SQL took a search seconds.
+func (a *Authorizer) broadArgs(ctx context.Context, q DB, tenant string, p Permission, resourceType string, roles []string, custom bool,
+	grants string, args ...any,
+) ([]any, error) {
+	unprivileged := slices.DeleteFunc(slices.Clone(roles), func(id string) bool { return a.roles[Role(id)].Privileged })
 	if !custom {
-		return []any{nil, nil, nil}
+		return []any{nil, unprivileged, nil}, nil
 	}
-	return []any{a.catalogPermissions, a.catalogTypes, a.publicPairs}
+	rows, err := q.Query(ctx, `SELECT `+roleColumns+` FROM rbac_roles
+		WHERE tenant = $1 AND $2::text = ANY(permissions) AND $3::text = ANY(resource_types) AND id IN (`+grants+`)
+		ORDER BY id`, append([]any{tenant, string(p), resourceType}, args...)...)
+	if err != nil {
+		return nil, err
+	}
+	defs, err := collectRoles(rows)
+	if err != nil {
+		return nil, err
+	}
+	var public, unprivilegedCustom []string
+	for _, r := range a.current(defs) {
+		if r.Public {
+			public = append(public, string(r.ID))
+		}
+		if !r.Privileged {
+			unprivilegedCustom = append(unprivilegedCustom, string(r.ID))
+		}
+	}
+	if !a.publicGives(p, resourceType) {
+		public = nil
+	}
+	return []any{public, unprivileged, unprivilegedCustom}, nil
 }
+
+// broadKeys are the keys of a tenant's broad principals: the public and its members.
+func broadKeys(tenant string) []string { return []string{publicKey, TenantMembers(tenant).key()} }
 
 // checkCustom returns why a custom role's definition is malformed: its id, and permissions and
 // types that no built-in role gives or is for, so a tenant can't invent either. A public one

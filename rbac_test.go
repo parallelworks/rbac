@@ -4865,6 +4865,48 @@ func TestPublicCustomRoles(t *testing.T) {
 	}
 }
 
+// Filter reads which custom roles give through a grant to the public when it is called, and its
+// condition keeps of them those still public when the host's query runs, so one no longer public
+// by then gives nothing, as it gives Authorize nothing.
+func TestAFilterConditionKeepsNothingThroughACustomRoleNoLongerPublic(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	hostTable(t, h)
+	admin := roleAdmin(t, h)
+	viewer := rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
+	if err := h.authz.SetRole(ctx, admin, "t1", viewer); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(rbac.TenantRoot("t1"), viewer.ID, rbac.Public, ""))
+	anonymous := rbac.Subject{}
+	pred, err := h.authz.Filter(ctx, anonymous, view, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept := func() []string {
+		t.Helper()
+		rows, err := h.pool.Query(ctx, `SELECT id FROM clusters WHERE `+pred.SQL+` ORDER BY 1`, pred.Args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ids
+	}
+	if ids := kept(); len(ids) == 0 {
+		t.Fatal("a public custom role granted to the public should reach anonymous subjects")
+	}
+	viewer.Public = false
+	if err := h.authz.SetRole(ctx, admin, "t1", viewer); err != nil {
+		t.Fatal(err)
+	}
+	if ids := kept(); len(ids) > 0 || allowed(t, h, anonymous, view, cluster) {
+		t.Errorf("a condition built while its custom role was public kept %v once it wasn't", ids)
+	}
+}
+
 func TestDeleteRoleRemovesAGrantMadeWhileItWaits(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()

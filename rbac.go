@@ -152,18 +152,6 @@ func (p Principal) carries(role RoleDefinition, perm Permission) bool {
 	return p.Kind != Public || role.Public
 }
 
-// privilegedRoles keeps the privileged built-in roles, which a grant to the tenant's members or the
-// public never gives.
-func (a *Authorizer) privilegedRoles(roles []string) []string {
-	var privileged []string
-	for _, id := range roles {
-		if a.roles[Role(id)].Privileged {
-			privileged = append(privileged, id)
-		}
-	}
-	return privileged
-}
-
 // publicRoles keeps the built-in roles marked Public, the only built-in ones a grant to the
 // public gives.
 func (a *Authorizer) publicRoles(roles []string) []string {
@@ -779,11 +767,7 @@ type Authorizer struct {
 	// permissions are for.
 	checked      map[Permission]bool
 	checkedTypes map[string]bool
-	// The same, sorted, as searches pass them to SQL. publicPairs are the unprivileged pairs, as
-	// `permission type`, of permissions that don't change access: all a public role gives as
-	// Authorizer.current reads it.
-	catalogPermissions, catalogTypes, publicPairs []string
-	conds                                         *conditions
+	conds        *conditions
 	// labels are the label dimensions (Config.Labels), by name.
 	labels map[string]labelDimension
 }
@@ -876,21 +860,11 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 			}
 		}
 	}
-	var permList []string
-	// Empty, not nil, which pgx sends as NULL: `<> ALL(NULL)` is never true, so without an
-	// unprivileged pair, searches would read no custom role as privileged.
-	pairs := []string{}
 	permissionTypes := map[string]bool{}
 	for p := range perms {
-		permList = append(permList, string(p))
 		t, _ := p.parts()
 		permissionTypes[t] = true
 	}
-	for k := range unprivileged {
-		pairs = append(pairs, string(k.p)+" "+k.t)
-	}
-	slices.Sort(permList)
-	slices.Sort(pairs)
 	checked, checkedTypes, err := vocabulary(cfg.Permissions, perms, resourceTypes)
 	if err != nil {
 		return nil, err
@@ -902,7 +876,6 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 	return &Authorizer{
 		db: db, cfg: cfg, roles: roles, roleSets: setsOf(roles), containers: containers, containerTypes: slices.Sorted(maps.Keys(containers)),
 		kinds: kinds, owned: owned, permissions: perms, types: resourceTypes, permissionTypes: permissionTypes, unprivileged: unprivileged,
-		catalogPermissions: permList, catalogTypes: slices.Sorted(maps.Keys(resourceTypes)), publicPairs: pairs,
 		checked: checked, checkedTypes: checkedTypes, conds: conds, labels: labels,
 	}, nil
 }
