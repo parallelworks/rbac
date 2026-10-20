@@ -5722,6 +5722,8 @@ func TestADenyStoresOnlyPermissionsADenyRemoves(t *testing.T) {
 	for _, perms := range [][]*string{
 		text("-"), text("cluster:deny"), text("cluster:login", "workspace:deny"), text("cluster:Login"), text("cluster"),
 		text(":login"), text("cluster:login "), text(""), text("cluster:login", ""), append(text("cluster:login"), nil),
+		// One element that reads as two permissions joined, which no check matches.
+		text("cluster:login,cluster:root"), text("cluster:view", "cluster:login,workspace:*"),
 	} {
 		var pg *pgconn.PgError
 		if err := insert(perms); !errors.As(err, &pg) || pg.Code != "23514" {
