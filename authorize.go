@@ -951,11 +951,11 @@ type Predicate struct {
 // for the query it was built for: it fixes the time (Config.Now), the subject's label holding and
 // what the constraints answered when Filter was called, so a later query keeps rows Authorize then
 // refuses, as once a grant it counted has expired. Build one for each query. The host's
-// query must reach this package's tables (they are in the pool's schema), and column names are
-// trusted host code; every value is an argument. It counts only unconditional grants, and leaves
-// out every resource a deny covers, conditional ones included, so it never keeps one Authorize
-// refuses: Reachable's Conditional and ConditionalExcept name the scopes where that may be too
-// strict.
+// query must reach this package's tables and call its function rbac_tenant_keys (they are in the
+// pool's schema), and column names are trusted host code; every value is an argument. It counts
+// only unconditional grants, and leaves out every resource a deny covers, conditional ones
+// included, so it never keeps one Authorize refuses: Reachable's Conditional and
+// ConditionalExcept name the scopes where that may be too strict.
 func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant, resourceType string, cols Columns, firstArg int) (Predicate, error) {
 	if cols.Tenant == "" || cols.Path == "" || firstArg < 1 {
 		return Predicate{}, fmt.Errorf("%w: Filter needs the tenant and path columns and a first argument", ErrInvalid)

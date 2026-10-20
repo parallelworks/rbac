@@ -574,6 +574,10 @@ func TestFilterLooksUpDeniesByEachRowsKeys(t *testing.T) {
 				if over := overlapping(ctx, t, h, "rbac_denies", query, pred.Args...); len(over) > 0 {
 					t.Errorf("with %d %ss denied, Filter's condition overlaps each row with the denies: %q", n, on, over)
 				}
+				// u's one grant is overlapped with each row's path, so finding none above is the plan's.
+				if len(overlapping(ctx, t, h, "rbac_grants", query, pred.Args...)) == 0 {
+					t.Fatal("overlapping finds no overlap of the path with u's one grant")
+				}
 			}
 			listed(40)
 			listed(4000)

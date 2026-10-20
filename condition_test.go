@@ -499,6 +499,13 @@ func TestAConditionComparingMoreThanItsCostIsRefusedBeforeItRuns(t *testing.T) {
 		if n > 0 {
 			t.Errorf("%s: a check compared %d of the values of a comparison past its cost", id, n)
 		}
+		// Within its cost the comparison reads the leaf, so a count of none above is one refused.
+		few := grant(cluster.Scope(), "cluster.login", rbac.User, id+"-few")
+		few.Condition = rbac.Condition{Expression: doubling("resource.attributes.leaf", 1, compare)}
+		h.seed(t, few)
+		if !allowed(t, h, h.as(t, id+"-few"), login, r) || n == 0 {
+			t.Errorf("%s: a comparison within its cost compared %d values", id, n)
+		}
 	}
 }
 
@@ -761,7 +768,7 @@ func TestAChangeHandingOnUnderAConditionParsesItOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Once as the change is decided, and once as it is decided again in its transaction.
-	if parsed > 2 {
+	if parsed == 0 || parsed > 2 {
 		t.Errorf("handing on under one condition on %d bindings parsed it %d times", len(bs), parsed)
 	}
 }
