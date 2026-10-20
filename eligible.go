@@ -524,9 +524,21 @@ func (a *Authorizer) restingOn(ctx context.Context, tx pgx.Tx, tenant string, id
 // whatever another eligibility would allow. One that records no principal, stored before Activate
 // recorded them and that migrating couldn't tie to one eligibility, ends, as which of its holder's
 // paths it rested on can't be told. It returns those it cut short and those it ended.
+//
+// It holds them all until the change commits before it reads the paths left, in a later statement:
+// two changes that share no lock, each ending one of an activation's paths, would otherwise each
+// read the other's as left, and neither cut it. Held, the second waits for the first and reads what
+// it left. Grants are the last rows a change holds, after its places and memberships, as Activate
+// holds an activation's places before its grant, and in the order the grants a change removes are
+// locked in (inOrder), so none of this waits out of order.
 func (a *Authorizer) unrest(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, r resting, now time.Time) (short, ended []Grant, err error) {
 	if len(r.ids) == 0 {
 		return nil, nil, nil
+	}
+	// By id alone, which restingOn found in the tenant: beside tenant = $1, a generic plan could read
+	// the tenant's grants by it (byKey).
+	if _, err := tx.Exec(ctx, lockedInOrder("rbac_grants", "", bindingOrder, "id = ANY($1::text[]::uuid[])"), r.ids); err != nil {
+		return nil, nil, err
 	}
 	// Each by its id alone, kept to the tenant's activations in force outside the lookup: beside
 	// tenant = $1 and the source, a generic plan reads every activation in the tenant by the index
@@ -559,15 +571,6 @@ func (a *Authorizer) unrest(ctx context.Context, tx pgx.Tx, tenant string, actor
 		}
 		return nil
 	}); err != nil {
-		return nil, nil, err
-	}
-	if len(gone)+len(cut) == 0 {
-		return nil, nil, nil
-	}
-	// In the order the grants a change removes are locked in (inOrder), as two changes ending places
-	// can each cut short the other's. By id alone, which act found in the tenant: beside tenant = $1,
-	// a generic plan could read the tenant's grants by it (byKey).
-	if _, err := tx.Exec(ctx, lockedInOrder("rbac_grants", "", bindingOrder, "id = ANY($1::text[]::uuid[])"), slices.Concat(gone, cut)); err != nil {
 		return nil, nil, err
 	}
 	if len(gone) > 0 {

@@ -624,6 +624,105 @@ func TestEndingAPlaceWaitsForAnActivationThroughIt(t *testing.T) {
 	}
 }
 
+// Two changes that share no lock, each ending or shortening one of the two paths an activation
+// rests on, end it or cut it short as they would one after the other: the second waits for the
+// first, which holds the activation, and reads the path it left, rather than each read the other's
+// as it was, and neither cut it.
+func TestChangesEndingEachOfAnActivationsPathsAtOnceEndIt(t *testing.T) {
+	type change func(ctx context.Context, h *harness, a *rbac.Authorizer) error
+	// u's place in m, or m's or n's in g1, which u activated through.
+	leaveM := func(ctx context.Context, _ *harness, a *rbac.Authorizer) error {
+		return a.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "m", Principal: identity("u")}})
+	}
+	takeOutOfM := func(ctx context.Context, _ *harness, a *rbac.Authorizer) error {
+		return a.ChangeMembers(ctx, rbac.Subject{Principal: identity("manager")}, "t1", nil, []rbac.Member{{Group: "m", Principal: identity("u")}})
+	}
+	takeOverM := func(ctx context.Context, _ *harness, a *rbac.Authorizer) error {
+		return a.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "m", Source: "directory"}})
+	}
+	shortenM := func(ctx context.Context, h *harness, a *rbac.Authorizer) error {
+		return a.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "m", Principal: identity("u"), ExpiresAt: h.now.Add(time.Hour)}})
+	}
+	leaveN := func(ctx context.Context, _ *harness, a *rbac.Authorizer) error {
+		return a.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "g1", Principal: groupOf("n")}})
+	}
+	deleteN := func(ctx context.Context, _ *harness, a *rbac.Authorizer) error {
+		return a.DeletePrincipal(ctx, host, "t1", groupOf("n"))
+	}
+	deleteGroupN := func(ctx context.Context, _ *harness, a *rbac.Authorizer) error {
+		return a.DeleteGroups(ctx, host, "t1", []string{"n"})
+	}
+	for name, c := range map[string]struct {
+		m, n change
+		// shortened is whether the change to m leaves u in g1 for an hour more.
+		shortened bool
+	}{
+		"DeleteMembers and DeleteMembers":                    {m: leaveM, n: leaveN},
+		"ChangeMembers and DeleteMembers":                    {m: takeOutOfM, n: leaveN},
+		"ChangeMembers and DeletePrincipal":                  {m: takeOutOfM, n: deleteN},
+		"ChangeMembers and DeleteGroups":                     {m: takeOutOfM, n: deleteGroupN},
+		"ImportGroups taking a group over and DeleteMembers": {m: takeOverM, n: leaveN},
+		"ImportMembers shortening a place and DeleteGroups":  {m: shortenM, n: deleteGroupN, shortened: true},
+	} {
+		for _, order := range []string{"serially", "at once", "at once the other way"} {
+			t.Run(name+" "+order, func(t *testing.T) {
+				h := grouped(t, func(c *rbac.Config) { c.Sources = []string{"directory"} })
+				ctx := t.Context()
+				h.groups(t, "g1", "m", "n")
+				h.as(t, "manager")
+				u := h.as(t, "u", "m", "n")
+				if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "g1", Principal: groupOf("m")}, {Group: "g1", Principal: groupOf("n")}}); err != nil {
+					t.Fatal(err)
+				}
+				if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: groupOf("g1"), MaxDuration: 8 * time.Hour}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := h.authz.Activate(ctx, u, cluster, rbac.Activation{Role: "cluster.sudo", Duration: 8 * time.Hour, Justification: "incident"}); err != nil {
+					t.Fatal(err)
+				}
+				first, second := c.m, c.n
+				if order == "at once the other way" {
+					first, second = c.n, c.m
+				}
+				if order == "serially" {
+					if err := first(ctx, h, h.authz); err != nil {
+						t.Fatal(err)
+					}
+					if err := second(ctx, h, h.authz); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					tx, err := h.pool.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = tx.Rollback(ctx) }()
+					if err := first(ctx, h, h.authz.WithTx(tx)); err != nil {
+						t.Fatal(err)
+					}
+					done := make(chan error, 1)
+					go func() { done <- second(ctx, h, h.authz) }()
+					commitOnceWaitedOn(t, h, tx, done)
+					if err := <-done; err != nil {
+						t.Fatal(err)
+					}
+				}
+				if c.shortened {
+					h.now = h.now.Add(59 * time.Minute)
+					if !allowed(t, h, u, root, cluster) {
+						t.Fatal("u lost sudo while still in g1 through m")
+					}
+				}
+				h.now = h.now.Add(time.Hour)
+				if allowed(t, h, u, root, cluster) {
+					of, err := h.authz.GroupsOf(ctx, "t1", u.Principal)
+					t.Errorf("u, in groups %v (%v) and none of them in g1, holds sudo it activated through g1", of, err)
+				}
+			})
+		}
+	}
+}
+
 // Activate finds its subject eligible only through the places in groups it holds: through a place
 // nested once it holds them, which no change removing it waits for, the activation would outlast
 // the place, removed before it commits.

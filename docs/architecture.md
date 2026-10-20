@@ -454,13 +454,15 @@ sequenceDiagram
   last alike it is by their approvers, requirements and keys, so leaving one can still end an
   activation another would keep. A change ending a membership or a place sooner, or removing it,
   holds it, in order, reads the activations of the identities it ends it for, and once it has
-  ended it cuts each short to the latest end of the paths left to its principal, or ends it,
-  whatever another eligibility would allow: worked out again from every eligibility the holder
-  reaches, one whose requirement or approver it never met would count. `Activate` holds the
-  places it can rest on until it commits, in the statement that reads the keys it finds its
-  subject eligible through, so the two wait for each other, and a place nested between them makes
-  no one eligible. Setting the eligibility again or deleting it leaves its activations to their
-  own ends, or to their holders leaving its group.
+  ended it holds them and, in a later statement, cuts each short to the latest end of the paths
+  left to its principal, or ends it, whatever another eligibility would allow: worked out again
+  from every eligibility the holder reaches, one whose requirement or approver it never met would
+  count. Held, a change ending another of an activation's paths at once waits for it, and reads
+  the paths it left: each reading them first would read the other's as left, and neither cut it.
+  `Activate` holds the places it can rest on until it commits, in the statement that reads the
+  keys it finds its subject eligible through, so the two wait for each other, and a place nested
+  between them makes no one eligible. Setting the eligibility again or deleting it leaves its
+  activations to their own ends, or to their holders leaving its group.
 - **Activations stored before migration 0012** record what migrating found: the one eligibility
   for their role on their scope whose principal their holder reached then, or, where it reached
   several or none, nothing. The first change re-checking one that records nothing ends it, as which
@@ -566,7 +568,8 @@ flowchart TB
 - **Rows in one order.** `DeleteScopes` holds its scopes' locks and `DeletePrincipal` its
   principal's, so neither waits for the other, and both delete the principal's grants and
   eligibilities on those scopes: each locks them in the order of their scopes first, eligibilities
-  before grants, so they don't deadlock.
+  before grants, so they don't deadlock. Every change holds grants last, after its places and
+  memberships, as `Activate` holds the places an activation rests on before its grant.
 - **One snapshot for reads in several statements.** Explain, Reachable, Holders and Conflicts read
   in one REPEATABLE READ, READ ONLY transaction of their own on a pool, and AsOf in a REPEATABLE
   READ one it rolls back; the label values Explain, Reachable and Holders need are read after it.
