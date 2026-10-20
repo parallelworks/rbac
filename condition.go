@@ -61,9 +61,11 @@ import (
 // (SetRole), is refused as invalid, so no grant, deny or eligibility stored changes what the others
 // decide, but one adding none isn't: conditions stored past a bound before there were bounds can be
 // rewritten in place, as by a restore over the rows still stored, though restored where those are
-// gone, they are added, and refused. A check may not reach all of those, or of those of a role a
-// catalog change widened since: it evaluates the cheapest first, and past its budget a grant's
-// condition is false and a deny's applies.
+// gone, they are added, and refused. An upgrade of CEL can leave conditions stored past a bound in
+// the same way: each process bounds a condition by what the CEL it is built with makes of it, its
+// macros and types, and another version may bound one stored more. A check may not reach all of
+// those, or of those of a role a catalog change widened since: it evaluates the cheapest first, and
+// past its budget a grant's condition is false and a deny's applies.
 //
 // Searches (Filter, Reachable, Holders) can't evaluate one: Filter and Reachable count only
 // unconditional grants, Filter counts a conditional deny as denying, and Reach.Conditional and
@@ -457,28 +459,62 @@ type worst struct {
 }
 
 // extent is the most an expression's value can be: its valueSize and textSize, the elements of a
-// list or the keys of a map, the bytes of a string, and what each element or key can be, nil for
-// what their type bounds.
+// list or the keys of a map, the bytes of a string, what each element or key can be, nil for no
+// more than the value (inside), and whether it is a map when it runs.
 type extent struct {
 	value, text, length, bytes uint64
 	elem                       *extent
+	form                       form
 }
+
+// form is whether a value is a map when it runs, whatever CEL checks it as (typed): `in` finds a
+// key in a map by reading the key, and in anything else reads what it searches. The zero form may
+// be either.
+type form uint8
+
+const (
+	// notMap is a list, a scalar, a string or bytes.
+	notMap form = iota + 1
+	// isMap is a map, as a map literal and a variable declared one are.
+	isMap
+)
 
 // unbounded is a cost or a size a condition doesn't bound.
 const unbounded = math.MaxUint64
 
 var anything = extent{value: unbounded, text: unbounded, length: unbounded, bytes: unbounded}
 
+// inside is the most a value inside one x bounds can be, as an element, a key or a field: no more
+// than x, whose valueSize counts each of them whole.
+func inside(x extent) extent {
+	if x.value == unbounded {
+		return anything
+	}
+	// A string's valueSize is a tenth of its bytes, and a list's or a map's at least its length.
+	return extent{value: x.value, text: x.value, length: x.value, bytes: cost.SafeMultiply(x.value, 10)}
+}
+
 func (x extent) union(y extent) extent {
 	u := extent{value: max(x.value, y.value), text: max(x.text, y.text), length: max(x.length, y.length), bytes: max(x.bytes, y.bytes)}
-	if x.elem != nil && y.elem != nil {
+	if x.form == y.form {
+		u.form = x.form
+	}
+	// A value of no elements, as the empty list map() and filter() start from, has none to bound.
+	switch {
+	case x.length == 0:
+		u.elem = y.elem
+	case y.length == 0:
+		u.elem = x.elem
+	case x.elem != nil && y.elem != nil:
 		e := x.elem.union(*y.elem)
 		u.elem = &e
 	}
 	return u
 }
 
-// worstCost is what evaluating checked can cost at most, no more than maxCost.
+// worstCost is what evaluating checked can cost at most, no more than maxCost. It reads the macros
+// as CEL expands them and the types it checks, so another version of CEL can bound a condition
+// already stored otherwise (TestStoredConditionsKeepTheirBounds).
 func worstCost(checked *cel.Ast, patterns map[string]uint64) uint64 {
 	w := worst{costs: costs{patterns}, checked: checked.NativeRep(), vars: map[string][]*extent{}}
 	n, _ := w.walk(w.checked.Expr())
@@ -489,7 +525,7 @@ func (w worst) walk(e ast.Expr) (uint64, extent) {
 	switch e.Kind() {
 	case ast.LiteralKind:
 		v := e.AsLiteral()
-		x := extent{value: valueSize(v, unbounded), text: textSize(v), length: 0, bytes: 0}
+		x := extent{value: valueSize(v, unbounded), text: textSize(v), form: notMap}
 		switch v := v.(type) {
 		case types.String:
 			x.bytes = uint64(len(v))
@@ -503,10 +539,14 @@ func (w worst) walk(e ast.Expr) (uint64, extent) {
 		}
 		return 2, w.typed(e)
 	case ast.SelectKind:
-		n, _ := w.walk(e.AsSelect().Operand())
-		return cost.SafeAdd(n, 2), w.typed(e)
+		n, x := w.walk(e.AsSelect().Operand())
+		// A presence test is a bool; a field may be what its type isn't (typed).
+		if e.AsSelect().IsTestOnly() {
+			return cost.SafeAdd(n, 2), w.typed(e)
+		}
+		return cost.SafeAdd(n, 2), inside(x)
 	case ast.ListKind:
-		n, x := uint64(10), extent{value: 1, text: 1, length: uint64(len(e.AsList().Elements()))}
+		n, x := uint64(10), extent{value: 1, text: 1, length: uint64(len(e.AsList().Elements())), form: notMap}
 		for i, el := range e.AsList().Elements() {
 			c, ex := w.walk(el)
 			n, x.value = cost.SafeAdd(n, c), cost.SafeAdd(x.value, ex.value)
@@ -519,7 +559,7 @@ func (w worst) walk(e ast.Expr) (uint64, extent) {
 		}
 		return n, x
 	case ast.MapKind:
-		n, x := uint64(30), extent{value: 1, text: 1, length: uint64(len(e.AsMap().Entries()))}
+		n, x := uint64(30), extent{value: 1, text: 1, length: uint64(len(e.AsMap().Entries())), form: isMap}
 		for i, entry := range e.AsMap().Entries() {
 			ck, k := w.walk(entry.AsMapEntry().Key())
 			cv, v := w.walk(entry.AsMapEntry().Value())
@@ -549,15 +589,22 @@ func (w worst) walk(e ast.Expr) (uint64, extent) {
 }
 
 // typed is the most a value of e's type can be: one for a scalar, and for a string, a list or a map
-// past any bound.
+// past any bound. It is only for what can't be another type than CEL checks it as, as a variable, a
+// function's result or a presence test: where a dyn() value meets another, in a choice, a sum or a
+// literal, CEL checks it as of the other's type, and so what reads it, a field, an element or a
+// loop's variable, whatever it is when it runs.
 func (w worst) typed(e ast.Expr) extent {
 	switch w.checked.GetType(e.ID()).Kind() {
 	case types.BoolKind, types.IntKind, types.UintKind, types.DoubleKind, types.DurationKind, types.TimestampKind,
 		types.NullTypeKind, types.TypeKind:
-		return extent{value: 1, text: 1}
-	case types.ListKind, types.MapKind:
+		return extent{value: 1, text: 1, form: notMap}
+	case types.ListKind:
 		x := anything
-		x.text = 1
+		x.text, x.form = 1, notMap
+		return x
+	case types.MapKind:
+		x := anything
+		x.text, x.form = 1, isMap
 		return x
 	default:
 		return anything
@@ -567,14 +614,37 @@ func (w worst) typed(e ast.Expr) extent {
 func (w worst) comprehension(e ast.Expr) (uint64, extent) {
 	comp := e.AsComprehension()
 	n, over := w.walk(comp.IterRange())
-	init, _ := w.walk(comp.AccuInit())
-	w.vars[comp.IterVar()] = append(w.vars[comp.IterVar()], over.elem)
-	if comp.HasIterVar2() {
-		w.vars[comp.IterVar2()] = append(w.vars[comp.IterVar2()], nil)
+	init, start := w.walk(comp.AccuInit())
+	// A macro making a list, as map() and filter() do, starts from an empty one, and each loop's step
+	// adds to it what it would add to that: one element, transformed or as it is, which reads no
+	// other, as no condition can name the list being made. CEL names it @result, which no
+	// identifier can be: where it names it otherwise, as a version of it may, a step could read it
+	// and grow it by more each loop.
+	making := comp.AccuInit().Kind() == ast.ListKind && strings.HasPrefix(comp.AccuVar(), "@")
+	var accu *extent
+	if making {
+		accu = &start
 	}
-	w.vars[comp.AccuVar()] = append(w.vars[comp.AccuVar()], nil)
+	// Each element is what the range's bound says, or no more than the range, whatever CEL checks
+	// it as (typed).
+	each := over.elem
+	if each == nil {
+		in := inside(over)
+		each = &in
+	}
+	w.vars[comp.IterVar()] = append(w.vars[comp.IterVar()], each)
+	if comp.HasIterVar2() {
+		a := anything
+		w.vars[comp.IterVar2()] = append(w.vars[comp.IterVar2()], &a)
+	}
+	w.vars[comp.AccuVar()] = append(w.vars[comp.AccuVar()], accu)
 	cond, _ := w.walk(comp.LoopCondition())
-	step, _ := w.walk(comp.LoopStep())
+	step, once := w.walk(comp.LoopStep())
+	x := w.typed(e)
+	if making {
+		x = grown(start, once, over.length)
+		w.vars[comp.AccuVar()][len(w.vars[comp.AccuVar()])-1] = &x
+	}
 	result, _ := w.walk(comp.Result())
 	for _, v := range []string{comp.IterVar(), comp.IterVar2(), comp.AccuVar()} {
 		if xs := w.vars[v]; len(xs) > 0 && (v != comp.IterVar2() || comp.HasIterVar2()) {
@@ -583,12 +653,17 @@ func (w worst) comprehension(e ast.Expr) (uint64, extent) {
 	}
 	// Each element evaluates the condition, and the step while it holds.
 	loops := cost.SafeMultiply(over.length, cost.SafeAdd(cond, step))
-	x := w.typed(e)
-	// A macro making a list, as map() and filter() do, makes one of at most as many elements.
-	if comp.AccuInit().Kind() == ast.ListKind {
-		x.length = over.length
-	}
 	return cost.SafeAdd(cost.SafeAdd(n, init), cost.SafeAdd(loops, result)), x
+}
+
+// grown is the most a list can be that starts as start and grows, each of n loops, by as much as
+// once, a loop's step from start, grew it.
+func grown(start, once extent, n uint64) extent {
+	more := func(from, to uint64) uint64 { return cost.SafeAdd(from, cost.SafeMultiply(n, to-min(to, from))) }
+	return extent{
+		value: more(start.value, once.value), text: 1, length: more(start.length, once.length), elem: start.union(once).elem,
+		form: notMap,
+	}
 }
 
 func (w worst) call(e ast.Expr) (uint64, extent) {
@@ -619,9 +694,13 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 			x = xs[0]
 		}
 	case operators.Index:
-		own = 2
-		if len(xs) == 2 && xs[0].elem != nil && args[0].Kind() == ast.ListKind {
-			x = *xs[0].elem
+		own, x = 2, anything
+		if len(xs) == 2 {
+			// A map's elem bounds its keys, not what they index.
+			x = inside(xs[0])
+			if xs[0].elem != nil && xs[0].form == notMap {
+				x = *xs[0].elem
+			}
 		}
 	case overloads.Matches:
 		own = unbounded
@@ -632,12 +711,13 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 		if len(xs) != 2 {
 			return unbounded, x
 		}
-		switch t := w.checked.GetType(args[1].ID()).Kind(); {
+		// Finding x in a map reads x, and in anything else what it is found in.
+		switch {
 		case fn != operators.In:
 			own = cost.SafeAdd(1, min(xs[0].value, xs[1].value))
-		case t == types.MapKind:
+		case xs[1].form == isMap:
 			own = cost.SafeAdd(1, xs[0].value)
-		case t == types.ListKind:
+		case xs[1].form == notMap:
 			own = cost.SafeAdd(1, xs[1].value)
 		default:
 			own = cost.SafeAdd(1, max(xs[0].value, xs[1].value))
@@ -648,9 +728,8 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 		for _, a := range xs {
 			own = cost.SafeAdd(own, a.text)
 		}
-		if t := w.checked.GetType(e.ID()); fn == operators.Add && len(xs) == 2 &&
-			(t.Kind() == types.ListKind || t.Kind() == types.StringKind || t.Kind() == types.BytesKind) {
-			x = added(t, xs[0], xs[1])
+		if fn == operators.Add && len(xs) == 2 {
+			x = added(xs[0], xs[1])
 		}
 	case overloads.TimeGetFullYear, overloads.TimeGetMonth, overloads.TimeGetDayOfYear, overloads.TimeGetDate,
 		overloads.TimeGetDayOfMonth, overloads.TimeGetDayOfWeek, overloads.TimeGetHours, overloads.TimeGetMinutes,
@@ -659,39 +738,34 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 			own = zoneCost
 		}
 	case overloads.StartsWith, overloads.EndsWith:
-		// CEL charges a tenth of the prefix's characters, rounded up.
+		// CEL charges a tenth of the prefix's size, rounded up.
 		if len(xs) == 2 {
-			own = cost.SafeAdd(xs[1].bytes/10, 1)
+			own = cost.SafeAdd(sized(xs[1])/10, 1)
 		}
 	case overloads.Contains:
-		// And a tenth of each string's characters, multiplied.
+		// And a tenth of each one's size, multiplied.
 		if len(xs) == 2 {
-			own = cost.SafeMultiply(cost.SafeAdd(xs[0].bytes/10, 1), cost.SafeAdd(xs[1].bytes/10, 1))
+			own = cost.SafeMultiply(cost.SafeAdd(sized(xs[0])/10, 1), cost.SafeAdd(sized(xs[1])/10, 1))
 		}
 	}
 	return cost.SafeAdd(n, own), x
 }
 
-// added is the most what adding x and y makes can be, of type t: a list of both's elements, or a
-// string or bytes of both's.
-func added(t *types.Type, x, y extent) extent {
-	switch t.Kind() {
-	case types.ListKind:
-		sum := extent{value: cost.SafeAdd(x.value, y.value), text: 1, length: cost.SafeAdd(x.length, y.length)}
-		if x.elem != nil && y.elem != nil {
-			u := x.elem.union(*y.elem)
-			sum.elem = &u
-		}
-		return sum
-	case types.StringKind, types.BytesKind:
-		if b := cost.SafeAdd(x.bytes, y.bytes); b != unbounded {
-			return extent{value: 1 + b/10, text: 1 + b/10, bytes: b}
-		}
-		return anything
-	default:
-		return anything
+// added is the most what adding x and y makes can be, whatever their types, as CEL may check a sum
+// as of another type than it is (typed): a list of both's elements, a string or bytes of both's, or
+// a number or a time.
+func added(x, y extent) extent {
+	return extent{
+		value: cost.SafeAdd(x.value, y.value), text: cost.SafeAdd(x.text, y.text),
+		length: cost.SafeAdd(x.length, y.length), bytes: cost.SafeAdd(x.bytes, y.bytes), elem: x.union(y).elem,
+		// CEL adds no maps.
+		form: notMap,
 	}
 }
+
+// sized is what CEL counts as the size of a value x bounds: a string's characters, no more than its
+// bytes, or a list's or a map's elements, as where it reads a dyn() value as a string.
+func sized(x extent) uint64 { return max(x.bytes, x.length) }
 
 // comparing is what comparing x with y, or finding x in y, reads, counted no further than past
 // maxCost. Comparing stops at the smaller value; a map finds a key without reading the rest.

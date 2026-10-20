@@ -10,8 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"cel.dev/cel-go/cel"
 	"cel.dev/cel-go/common/types"
 	"cel.dev/cel-go/common/types/ref"
+	"cel.dev/cel-go/ext"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -651,6 +653,17 @@ func TestAConditionCostsNoMoreThanItsBound(t *testing.T) {
 		{`(request.attributes.mfa ? request.attributes.team : "none") == "sre"`, true},
 		{`[1, 2, 3].all(i, i > 0) && [request.attributes.x] == [1] && {"a": request.attributes.x} == {"a": 1}`, true},
 		{`[1, 2] + [3] == [1, 2, 3] && "a" + "b" == "ab" && size("abc") == 3 && action == "cluster:login"`, true},
+		// What map() and filter() make of literals is bounded by them, so looping over it is cheap too.
+		{`[1, 2].map(x, "ab").all(s, s.contains("a"))`, true},
+		{`[1, 2, 3].map(x, [x, x]).all(l, l.all(y, y > 0))`, true},
+		{`["abc"].map(s, s + s + s).all(s, s.matches("c$")) && [[1], []].map(l, l + l).all(l, 1 in l)`, true},
+		{`["10.0.0.1", "10.0.0.2"].filter(ip, ip.startsWith("10.")).exists(ip, request.attributes.ip == ip)`, true},
+		{`[1, 2, 3].filter(x, x > 1).map(x, [x]) == [2, 3].map(x, [x]) && [[], ["ab"]].all(l, l.all(s, s.contains("a")))`, true},
+		// What a literal holds is bounded by it, wherever a condition reads it from.
+		{`[["10.0.0.1"], ["10.0.0.2"]].exists(g, request.attributes.ip in g) && "time" in request`, true},
+		{`{"dev": 1, "prod": 2}[resource.attributes.env] <= request.attributes.n && [{"n": 2}].exists(r, r.n == request.attributes.n)`, true},
+		{`[[1, 2], [3]][0][1] == request.attributes.x && [1].map(x, {"a": request.attributes.tags}).exists(m, "zz" in m)`, true},
+		{"[[" + strings.Repeat("0, ", 499) + "0]].all(l, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(i, \"a\".startsWith(dyn(l))))", true},
 		{`"gpu" in request.attributes.tags`, false},
 		{`request.attributes.team in {"sre": true}`, false},
 		{`size(request.attributes.tags) > 0`, false},
@@ -660,6 +673,18 @@ func TestAConditionCostsNoMoreThanItsBound(t *testing.T) {
 		{`string(request.attributes.n) == "3" || int(request.attributes.n) > 2`, false},
 		{`request.attributes.ip + request.attributes.team == "ab"`, false},
 		{`[1,2,3,4,5,6,7,8].all(a, [1,2,3,4,5,6,7,8].all(b, [1,2,3,4,5,6,7,8].all(c, [1,2,3,4,5,6,7,8].all(d, a > 0))))`, false},
+		{`request.attributes.tags.map(t, "gpu").exists(t, t == "gpu")`, false},
+		{`["a", "b"].map(x, request.attributes.team).exists(t, t.contains("s"))`, false},
+		{`request.attributes.tags.filter(t, t != "").exists(t, t == "gpu")`, false},
+		// CEL checks a dyn() value that meets another as of the other's type, which it needn't have.
+		{`(dyn([{"a": 1}]) + [[]]).exists(m, request.attributes.n in m)`, false},
+		{`(dyn([request.attributes.tags]) + [1])[0] == request.attributes.tags`, false},
+		{`(dyn([{"a": request.attributes.tags}]) + [{"a": 1}]).exists(m, m.a == request.attributes.tags)`, false},
+		{`(dyn([[request.attributes.tags]]) + [""]).exists(s, s + s == request.attributes.tags)`, false},
+		{"[[" + strings.Repeat("0, ", 499) + "0]].all(l, dyn(l).contains(dyn(l)))", false},
+		// A map's keys don't bound what they index, and what may be a map or a list finds a key by it.
+		{`{"a": request.attributes.tags}["a"] == request.attributes.tags`, false},
+		{`[[1], {"a": 1}].exists(v, request.attributes.ip in v)`, false},
 	} {
 		for i, attributes := range requests {
 			limit, actual := rbac.ConditionCost(t, c.expr, attributes)
@@ -669,6 +694,63 @@ func TestAConditionCostsNoMoreThanItsBound(t *testing.T) {
 			if c.cheap != (limit < 1000) {
 				t.Errorf("%s is bounded at %d", c.expr, limit)
 			}
+		}
+	}
+}
+
+// Another version of CEL may expand macros otherwise: name the list map() makes so a condition can
+// read it and grow it by more each loop, or give a loop a second variable, which CEL checks as a
+// type it needn't have. A condition still costs no more than its bound.
+func TestAConditionCostsNoMoreThanItsBoundWhereCELExpandsMacrosOtherwise(t *testing.T) {
+	ones := strings.Repeat("1, ", 11) + "1"
+	for _, c := range []struct {
+		expr string
+		opt  cel.EnvOption
+	}{
+		{"[" + ones + "].map(x, dyn(__result__.map(y, y))) == [" + ones + "].map(x, dyn(__result__.map(y, y)))", cel.EnableHiddenAccumulatorName(false)},
+		{"(dyn([[" + strings.Repeat("0, ", 499) + "0]]) + [1]).all(i, v, v == v)", ext.TwoVarComprehensions()},
+	} {
+		if limit, actual := rbac.ConditionCost(t, c.expr, nil, c.opt); actual > limit {
+			t.Errorf("%s cost %d, past its bound, %d", c.expr, actual, limit)
+		}
+	}
+}
+
+// A stored condition's bound is computed again in each process, from what the CEL it is built with
+// makes of it, so another version of CEL can move the bounds of conditions already stored and leave
+// what a check reads together past one. These pin the bounds of conditions of common shapes, so an
+// upgrade that moves one shows.
+func TestStoredConditionsKeepTheirBounds(t *testing.T) {
+	for _, c := range []struct {
+		expr  string
+		bound uint64
+	}{
+		{`request.attributes.mfa == true`, 8},
+		{`request.attributes.ip == "10.0.0.1" || request.attributes.ip == "10.0.0.2"`, 16},
+		{`resource.attributes.env != "prod" && subject.id in ["a", "b", "c"]`, 27},
+		{`request.time < timestamp("2027-01-01T00:00:00Z") && request.time.getHours("America/New_York") >= 9`, 116},
+		{`request.attributes.ip.startsWith("10.") && "abcdefghijk".contains("bc")`, 9},
+		{`"abc".matches("^a(b|c){2}$")`, 11},
+		{`has(request.attributes.mfa) && request.attributes.x != null`, 14},
+		{`dyn(request.attributes)["team"] == "sre" && [1, 2, 3][1] == 2`, 23},
+		{`(request.attributes.mfa ? request.attributes.team : "none") == "sre"`, 14},
+		{`[request.attributes.x] == [1] && {"a": request.attributes.x} == {"a": 1}`, 99},
+		{`[1, 2] + [3] == [1, 2, 3] && "a" + "b" == "ab" && size("abc") == 3 && action == "cluster:login"`, 52},
+		{`int("12") == 12 && string(1) == "1" && duration("1h") > duration("1m")`, 14},
+		{`google.protobuf.Struct{fields: {"a": 1.0}} == {"a": 1.0}`, 104},
+		{`[1, 2, 3].all(i, i > 0) && [1, 2, 3].exists_one(i, i == 2) && {"a": 1}.exists(k, k == "a")`, 128},
+		{`[[1, 2], [3]].all(l, l.all(i, i > 0))`, 86},
+		{`[1, 2, 3].map(x, x > 1, x * 2) == [4, 6]`, 108},
+		{`[1, 2].map(x, "ab").all(s, s.contains("a"))`, 70},
+		{`["10.0.0.1", "10.0.0.2"].filter(ip, ip.startsWith("10.")).exists(ip, request.attributes.ip == ip)`, 100},
+		{`[["10.0.0.1"], ["10.0.0.2"]].exists(g, request.attributes.ip in g) && "time" in request`, 70},
+		{`{"dev": 1, "prod": 2}[resource.attributes.env] <= request.attributes.n`, 50},
+		{`[{"level": 2}, {"level": 3}].exists(r, r.level == request.attributes.n)`, 112},
+		{`"gpu" in request.attributes.tags`, 10000},
+		{`request.attributes.tags.exists(t, t == "gpu")`, 10000},
+	} {
+		if limit, _ := rbac.ConditionCost(t, c.expr, nil); limit != c.bound {
+			t.Errorf("%s is bounded at %d, not %d", c.expr, limit, c.bound)
 		}
 	}
 }

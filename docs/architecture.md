@@ -366,9 +366,12 @@ sequenceDiagram
   apart, the conditional denies, and the requirements of groups' eligibilities for a role, and a
   change adding a condition past one is refused as invalid. A check's budget is that for each
   scope on its path, so it evaluates every condition it reads, and no grant made beside another
-  changes what that one decides. Conditions stored before there were bounds may be past one: a
-  change adding none to them isn't refused, and a check evaluates them cheapest first within its
-  budget.
+  changes what that one decides. Conditions stored before there were bounds may be past one, and
+  so may those another version of CEL bounds: each process bounds a stored condition again by what
+  the CEL it is built with makes of it, its macros and types, so an upgrade can bound one more.
+  `TestStoredConditionsKeepTheirBounds` pins the bounds of conditions of common shapes, so that one an
+  upgrade moves shows in review. A change adding no condition to them isn't refused, and a check
+  evaluates them cheapest first within its budget.
 
 ## A change
 

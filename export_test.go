@@ -116,12 +116,17 @@ func CountEvaluations(t *testing.T) *int {
 
 // ConditionCost is the most evaluating expr can cost, which a check runs it within, and what
 // evaluating it on a request with attributes, which the resource carries too, costs, up to
-// maxCost.
-func ConditionCost(t *testing.T, expr string, attributes map[string]any) (limit, actual uint64) {
+// maxCost, built with the package's CEL environment extended by opts.
+func ConditionCost(t *testing.T, expr string, attributes map[string]any, opts ...cel.EnvOption) (limit, actual uint64) {
 	t.Helper()
 	c, err := newConditions(Attributes{})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(opts) > 0 {
+		if c.env, err = c.env.Extend(opts...); err != nil {
+			t.Fatal(err)
+		}
 	}
 	prg, err := c.build(expr)
 	if err != nil {

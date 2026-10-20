@@ -171,7 +171,11 @@ names the scopes conditional ones reach, to check one by one.
   another, as by someone who can't revoke it, never changes what that one decides. A change adding
   no condition isn't refused, so what was stored past a bound before there were bounds can be
   rewritten in place, as by a restore over the rows still stored, though not restored where they
-  are gone, and a check may not reach all of it: it evaluates the cheapest first within its budget. To hand a permission on, the actor holds it unconditionally or
+  are gone, and a check may not reach all of it: it evaluates the cheapest first within its budget.
+  An upgrade of CEL can leave conditions stored past a bound in the same way: each process bounds
+  a stored condition again by what the CEL it is built with makes of it, so another version can
+  bound one more, and the package's tests pin the bounds of conditions of common shapes, so that one
+  an upgrade moves fails them. To hand a permission on, the actor holds it unconditionally or
   under the same condition, one that doesn't read the subject: that one decides for each holder,
   so the actor's holding says nothing of another's.
 - **Deny policies:** `SetDeny` puts a deny on a scope: under it, it removes permissions
