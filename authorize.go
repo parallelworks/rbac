@@ -1089,11 +1089,13 @@ func byType(types, cols, where string) string {
 }
 
 // byKey is SQL selecting cols of the rows of table for which where holds whose col is one of the
-// distinct keys in the array keys, a key at a time: each an equality the indexes leading to col, or
-// to the tenant and col, seek. A generic plan costs col = ANY(keys) as ten seeks, and a read of the
-// tenant by an index leading to it alone, which it costs as an average tenant's few rows, as
-// cheaper, so it reads every row of a large tenant. OFFSET 0 keeps the planner from flattening it
-// into a join it could run the other way round.
+// keys in the array keys, a key at a time: each an equality the indexes leading to col, or to the
+// tenant and col, seek. A generic plan costs col = ANY(keys) as ten seeks, and a read of the tenant
+// by an index leading to it alone, which it costs as an average tenant's few rows, as cheaper, so
+// it reads every row of a large tenant. OFFSET 0 keeps the planner from flattening it into a join
+// it could run the other way round. A key listed twice selects its rows twice, so each caller lists
+// a key once, as a path and a sorted, compacted list do, or reads them through = ANY, EXISTS or
+// DISTINCT, which a repeat changes nothing in.
 func byKey(keys, table, col, cols, where string) string {
 	return fmt.Sprintf(`SELECT r.* FROM unnest(%[1]s::text[]) AS keyed(k) CROSS JOIN LATERAL (
 		SELECT %[4]s FROM %[2]s WHERE (%[5]s) AND %[3]s = keyed.k OFFSET 0) r`, keys, table, col, cols, where)
