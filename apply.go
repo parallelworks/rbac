@@ -1764,11 +1764,11 @@ func removed[T any](ctx context.Context, a *Authorizer, tx pgx.Tx, table, column
 
 // DeleteExpired removes grants, eligibilities, group members and tenant memberships that have
 // expired, which no longer give or allow anything, and returns how many: those expired by
-// Config.Now and by the database's clock both, so history records each as an expiry. It passes
-// over those a change is holding, rather than wait on it, so the next run removes them. It
-// removes a batch at a time, on a pool each in a transaction of its own, so none holds many
-// locks, and on an error those it removed before stay removed. A race PostgreSQL refuses matches
-// ErrConflict.
+// Config.Now and by the database's clock both, so history records each as an expiry. It passes over
+// those a change is holding, and a membership one of whose places in groups a change holds, rather
+// than wait on it, so the next run removes them. It removes a batch at a time, on a pool each in a
+// transaction of its own, so none holds many locks, and on an error those it removed before stay
+// removed. A race PostgreSQL refuses matches ErrConflict.
 func (a *Authorizer) DeleteExpired(ctx context.Context) (n int64, err error) {
 	defer a.refused(ctx, &err, "", Principal{}, "DeleteExpired")
 	if err := a.writable(); err != nil {
@@ -1787,8 +1787,8 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 	// As of one time, so rows expiring meanwhile can't keep it deleting.
 	now := a.cfg.Now()
 	// Each batch in a transaction of its own, which history records as expiries no one made. A
-	// statement returns how many of its table's rows it deleted, and how many in all.
-	expire := func(sql string) (n, all int64, err error) {
+	// batch returns how many of its table's rows it picked, and how many rows it removed in all.
+	expire := func(batch func(pgx.Tx) (n, all int64, err error)) (n, all int64, err error) {
 		err = a.begin(ctx, func(tx pgx.Tx) error {
 			// It takes no lock, but as a change it reads what committed before it, which only
 			// READ COMMITTED reads: an older snapshot would leave an ended member's newer places.
@@ -1801,49 +1801,102 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 			if err != nil {
 				return err
 			}
-			if err := tx.QueryRow(ctx, sql, now, expiryBatch).Scan(&n, &all); err != nil {
+			if n, all, err = batch(tx); err != nil {
 				return err
 			}
 			return done()
 		})
 		return n, all, err
 	}
+	statement := func(sql string) func(pgx.Tx) (int64, int64, error) {
+		return func(tx pgx.Tx) (n, all int64, err error) {
+			err = tx.QueryRow(ctx, sql, now, expiryBatch).Scan(&n, &all)
+			return n, all, err
+		}
+	}
 	var total int64
 	// By the database's clock too, which history records an expiry by: a row expired by Config.Now
 	// alone, which can run ahead of it, would be recorded as deleted.
-	for _, sql := range []string{
-		`WITH d AS (DELETE FROM rbac_grants WHERE id IN (
+	for _, batch := range []func(pgx.Tx) (int64, int64, error){
+		statement(`WITH d AS (DELETE FROM rbac_grants WHERE id IN (
 			SELECT id FROM rbac_grants WHERE expires_at <= least($1, statement_timestamp()) LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING 1)
-		SELECT count(*), count(*) FROM d`,
-		`WITH d AS (DELETE FROM rbac_eligibilities WHERE id IN (
+		SELECT count(*), count(*) FROM d`),
+		statement(`WITH d AS (DELETE FROM rbac_eligibilities WHERE id IN (
 			SELECT id FROM rbac_eligibilities WHERE expires_at <= least($1, statement_timestamp()) LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING 1)
-		SELECT count(*), count(*) FROM d`,
-		`WITH d AS (DELETE FROM rbac_members WHERE (tenant, group_id, principal, source) IN (
+		SELECT count(*), count(*) FROM d`),
+		statement(`WITH d AS (DELETE FROM rbac_members WHERE (tenant, group_id, principal, source) IN (
 			SELECT tenant, group_id, principal, source FROM rbac_members WHERE expires_at <= least($1, statement_timestamp()) LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING 1)
-		SELECT count(*), count(*) FROM d`,
-		// An identity whose membership ended leaves the tenant's groups with it, as one that leaves
-		// the tenant does, so joining again gives back none of the groups it was in. Its own grants
-		// and eligibilities stay, as they do for an identity granted roles in a tenant it isn't in.
-		`WITH ended AS (
-		  DELETE FROM rbac_memberships WHERE (tenant, principal) IN (
-		    SELECT tenant, principal FROM rbac_memberships WHERE expires_at <= least($1, statement_timestamp()) LIMIT $2 FOR UPDATE SKIP LOCKED)
-		  RETURNING tenant, principal
-		), left_groups AS (
-		  DELETE FROM rbac_members m USING ended e WHERE m.tenant = e.tenant AND m.principal = e.principal RETURNING 1
-		)
-		SELECT (SELECT count(*) FROM ended), (SELECT count(*) FROM ended) + (SELECT count(*) FROM left_groups)`,
+		SELECT count(*), count(*) FROM d`),
+		func(tx pgx.Tx) (int64, int64, error) { return endMemberships(ctx, tx, now) },
 	} {
 		for {
 			// A batch that failed, even once its statement ran, removed nothing.
-			n, all, err := expire(sql)
+			n, all, err := expire(batch)
 			if err != nil {
 				return total, err
 			}
 			total += all
-			if n < int64(expiryBatch) {
+			// One that removed nothing passed over every membership it picked, which the next would
+			// pick again.
+			if n < int64(expiryBatch) || all == 0 {
 				break
 			}
 		}
 	}
 	return total, nil
+}
+
+// endMemberships ends, in tx, a batch of the memberships expired by now, and returns how many it
+// picked and how many rows it removed in all. An identity whose membership ended leaves the
+// tenant's groups with it, as one that leaves the tenant does, so joining again gives back none
+// of the groups it was in. Its own grants and eligibilities stay, as they do for an identity
+// granted roles in a tenant it isn't in.
+//
+// It reads the places in a statement after the one taking the memberships, whose snapshot would
+// predate a join that committed, releasing a membership, while that statement ran, and leave the
+// place it made. Holding the membership, it waits on no change holding a place, which may roll
+// back the place's removal: it passes over that membership, for the next run.
+func endMemberships(ctx context.Context, tx pgx.Tx, now time.Time) (picked, all int64, err error) {
+	rows, err := tx.Query(ctx, `SELECT tenant, principal FROM rbac_memberships
+		WHERE expires_at <= least($1, statement_timestamp()) LIMIT $2 FOR UPDATE SKIP LOCKED`, now, expiryBatch)
+	if err != nil {
+		return 0, 0, err
+	}
+	tenants, principals, err := tenantPrincipals(rows)
+	if err != nil || len(tenants) == 0 {
+		return 0, 0, err
+	}
+	picked = int64(len(tenants))
+	// Those whose every place it now holds: no change can add one while it holds the membership,
+	// as a join holds the membership it joins with.
+	rows, err = tx.Query(ctx, `SELECT p.tenant, p.principal FROM unnest($1::text[], $2::text[]) AS p(tenant, principal)
+		WHERE (SELECT count(*) FROM rbac_members m WHERE m.tenant = p.tenant AND m.principal = p.principal) = (SELECT count(*) FROM (
+		  SELECT FROM rbac_members m WHERE m.tenant = p.tenant AND m.principal = p.principal FOR UPDATE SKIP LOCKED) held)`,
+		tenants, principals)
+	if err != nil {
+		return 0, 0, err
+	}
+	if tenants, principals, err = tenantPrincipals(rows); err != nil || len(tenants) == 0 {
+		return picked, 0, err
+	}
+	err = tx.QueryRow(ctx, `
+		WITH ended AS (
+		  DELETE FROM rbac_memberships ms USING unnest($1::text[], $2::text[]) AS p(tenant, principal)
+		  WHERE ms.tenant = p.tenant AND ms.principal = p.principal
+		  RETURNING ms.tenant, ms.principal
+		), left_groups AS (
+		  DELETE FROM rbac_members m USING ended e WHERE m.tenant = e.tenant AND m.principal = e.principal RETURNING 1
+		)
+		SELECT (SELECT count(*) FROM ended) + (SELECT count(*) FROM left_groups)`, tenants, principals).Scan(&all)
+	return picked, all, err
+}
+
+// tenantPrincipals collects rows of a tenant and a principal's key.
+func tenantPrincipals(rows pgx.Rows) (tenants, principals []string, err error) {
+	var tenant, principal string
+	_, err = pgx.ForEachRow(rows, []any{&tenant, &principal}, func() error {
+		tenants, principals = append(tenants, tenant), append(principals, principal)
+		return nil
+	})
+	return tenants, principals, err
 }

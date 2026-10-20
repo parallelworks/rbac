@@ -2,6 +2,7 @@ package rbac_test
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"slices"
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/rbac"
+	"github.com/parallelworks/rbac/internal/pgtest"
 )
 
 // grouped sets up a host whose catalog lets "groups" manage the tenant's groups, and "manager" the
@@ -300,6 +302,45 @@ func TestGroupsNestAtMostMaxGroupDepthDeep(t *testing.T) {
 	}
 }
 
+func TestAPrincipalIsInAGroupABoundedNumberOfTimes(t *testing.T) {
+	h := grouped(t, func(c *rbac.Config) { c.Sources = []string{"directory"} })
+	ctx := t.Context()
+	h.groups(t, "devs")
+	h.join(t, "u")
+	manager := h.as(t, "manager")
+	until := func(from, n int) []rbac.Member {
+		ms := make([]rbac.Member, n)
+		for i := range ms {
+			ms[i] = rbac.Member{Group: "devs", Principal: identity("u"), Source: fmt.Sprint("s", from+i), ExpiresAt: h.now.Add(time.Duration(from+i+1) * time.Hour)}
+		}
+		return ms
+	}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", until(0, rbac.MaxPlacesInGroup), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", until(rbac.MaxPlacesInGroup, 1), nil); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("a place past the limit: %v", err)
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t1", until(rbac.MaxPlacesInGroup, 1)); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("an import past the limit: %v", err)
+	}
+	// The host's own count apart, so the tenant's admins can't keep them from being made.
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "devs", Principal: identity("u"), Source: "directory"}}); err != nil {
+		t.Fatalf("a place from the host's source at the limit: %v", err)
+	}
+	// Adding one it has again stays possible at the limit.
+	again := until(0, 1)
+	again[0].Note = "renewed"
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", again, nil); err != nil {
+		t.Fatalf("a new note at the limit: %v", err)
+	}
+	// Places that have ended don't count.
+	h.now = h.now.Add(time.Duration(rbac.MaxPlacesInGroup) * time.Hour)
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", until(rbac.MaxPlacesInGroup, 1), nil); err != nil {
+		t.Fatalf("a place once the others ended: %v", err)
+	}
+}
+
 func TestLeavingATenantRemovesWhatItHeldThere(t *testing.T) {
 	h := grouped(t)
 	ctx := t.Context()
@@ -451,6 +492,53 @@ func TestAConstraintStopsManagingGroups(t *testing.T) {
 	}
 }
 
+func TestManagingGroupsReadsTheTenantFromTheHost(t *testing.T) {
+	groups := rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}
+	given := func(tenant rbac.Resource) func(*rbac.Config) {
+		return func(c *rbac.Config) {
+			c.Catalog = append(slices.Clone(c.Catalog), groups)
+			resourceOf := c.ResourceOf
+			c.ResourceOf = func(ctx context.Context, t string, s rbac.Scope) (rbac.Resource, error) {
+				if s == tenant.Scope() {
+					return tenant, nil
+				}
+				return resourceOf(ctx, t, s)
+			}
+		}
+	}
+	manage := func(t *testing.T, h *harness, want error) {
+		t.Helper()
+		ctx := t.Context()
+		if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "ops"}}); err != nil {
+			t.Fatal(err)
+		}
+		actor := h.as(t, "groups")
+		if err := h.authz.SetGroup(ctx, actor, "t1", rbac.GroupDefinition{ID: "ops", Name: "Operations"}); !errors.Is(err, want) {
+			t.Errorf("SetGroup: %v", err)
+		}
+		if err := h.authz.DeleteGroup(ctx, actor, "t1", "ops"); !errors.Is(err, want) {
+			t.Errorf("DeleteGroup: %v", err)
+		}
+	}
+	t.Run("a constraint", func(t *testing.T) {
+		locked := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1", Attributes: map[string]any{"locked": true}}
+		h := setup(t, given(locked), func(c *rbac.Config) {
+			c.Constraints = []rbac.Constraint{{Name: "locked", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+				return in.Permission == rbac.ManageGroups && in.Resource != nil && in.Resource.Attributes["locked"] == true, nil
+			}}}
+		})
+		h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "groups"))
+		manage(t, h, rbac.ErrDenied)
+	})
+	t.Run("a label", func(t *testing.T) {
+		h := labeled(t, given(rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1", Labels: rbac.Label{"level": {"high"}}}))
+		h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "groups"))
+		manage(t, h, rbac.ErrDenied)
+		h.hold(t, "groups", "level:high")
+		manage(t, h, nil)
+	})
+}
+
 func TestNewRefusesAContainerNamedGroup(t *testing.T) {
 	ok := func(context.Context, rbac.DB, rbac.GrantInput) error { return nil }
 	if _, err := rbac.New(&pgxpool.Pool{}, rbac.Config{Catalog: catalog, ContainerTypes: []string{rbac.GroupScope}, ValidateGrant: ok}); err == nil {
@@ -535,6 +623,122 @@ func TestDeleteExpiredPassesOverAMembershipAChangeJoinsGroupsWith(t *testing.T) 
 
 // DeleteExpired removes what has expired a batch at a time, each in a transaction of its own,
 // until none is left.
+// A join holds the membership it joins with, so DeleteExpired passes over it until the join
+// commits; one committing while DeleteExpired is taking the memberships, before it reaches that
+// one, made a place the statement taking them can't see, which it removes with the membership.
+func TestDeleteExpiredRemovesAPlaceAJoinMadeWhileItRan(t *testing.T) {
+	rbac.SetExpiryBatch(t, 1_000_000)
+	// Named, to watch its own statements among those of other tests on the server.
+	app := "rbac_" + strings.ToLower(rand.Text())
+	h := setupOn(t, pgtest.Open(t, "application_name="+app))
+	ctx := t.Context()
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "a"}}); err != nil {
+		t.Fatal(err)
+	}
+	// Many memberships that end before u's, ahead of it in the table and its expiry index, which
+	// the statement taking them reads first.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_memberships (tenant, principal_kind, principal_id, expires_at)
+		SELECT 't1', 'user', 'other' || i, $1 FROM generate_series(1, 20000) i`, h.now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("u"), ExpiresAt: h.now.Add(time.Hour)}}); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := h.authz.WithTx(tx).ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "a", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	h.now = h.now.Add(2 * time.Hour)
+	expired := make(chan error, 1)
+	go func() {
+		_, err := h.authz.DeleteExpired(ctx)
+		expired <- err
+	}()
+	for taking := false; !taking; {
+		select {
+		case err := <-expired:
+			expired <- err
+			taking = true
+		default:
+			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE application_name = $1 AND state = 'active'
+				AND query LIKE '%FROM rbac_memberships%expires_at <= least%' AND pid <> pg_backend_pid())`, app).Scan(&taking); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-expired; err != nil {
+		t.Fatal(err)
+	}
+	var memberships, places int
+	if err := h.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM rbac_memberships WHERE principal = 'user:u'),
+		(SELECT count(*) FROM rbac_members WHERE principal = 'user:u')`).Scan(&memberships, &places); err != nil {
+		t.Fatal(err)
+	}
+	if memberships == 0 && places > 0 {
+		t.Errorf("u's membership ended, but %d places of it stay", places)
+	}
+}
+
+// A change holding a place in a group, as one removing it, may roll back: DeleteExpired, holding
+// the memberships it picked, doesn't wait on it, but passes over that place's membership for the
+// next run, rather than end it and leave the place.
+func TestDeleteExpiredPassesOverAMembershipAChangeHoldsAPlaceOf(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	ending := h.now.Add(time.Hour)
+	if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("u"), ExpiresAt: ending}, {Principal: identity("v"), ExpiresAt: ending}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "a"}, {ID: "b"}}); err != nil {
+		t.Fatal(err)
+	}
+	places := []rbac.Member{{Group: "a", Principal: identity("u")}, {Group: "b", Principal: identity("u")}, {Group: "a", Principal: identity("v")}}
+	if err := h.authz.ImportMembers(ctx, host, "t1", places); err != nil {
+		t.Fatal(err)
+	}
+	h.now = h.now.Add(2 * time.Hour)
+	held, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Rollback(context.WithoutCancel(ctx)) }()
+	if err := h.authz.WithTx(held).DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "a", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	// A wait on held fails past lock_timeout.
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '100ms'`); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := h.authz.WithTx(tx).DeleteExpired(ctx); err != nil || n != 2 {
+		t.Fatalf("DeleteExpired while a change holds a place of u's = %d, %v", n, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := held.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := h.authz.DeleteExpired(ctx); err != nil || n != 3 {
+		t.Fatalf("DeleteExpired once the change rolled back = %d, %v", n, err)
+	}
+	var left int
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM rbac_members`).Scan(&left); err != nil || left != 0 {
+		t.Fatalf("%d members left, %v", left, err)
+	}
+}
+
 func TestDeleteExpiredRemovesABatchAtATime(t *testing.T) {
 	rbac.SetExpiryBatch(t, 2)
 	h := setup(t)
@@ -611,27 +815,17 @@ func TestDeleteExpiredCountsOnlyTheBatchesItRemoved(t *testing.T) {
 }
 
 func TestDeleteExpiredRefusedForARaceConflicts(t *testing.T) {
-	h := grouped(t)
+	h := setup(t)
 	ctx := t.Context()
-	if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("u"), ExpiresAt: h.now.Add(time.Hour)}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "a"}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "a", Principal: identity("u")}}); err != nil {
-		t.Fatal(err)
-	}
-	h.now = h.now.Add(2 * time.Hour)
-	// Another transaction holds u's place in a, which DeleteExpired waits for once it ends u's
-	// membership: PostgreSQL refuses the wait past lock_timeout, as it refuses one side of a
-	// deadlock.
+	// Another transaction holds the grants table, as a migration of the host's can, which
+	// DeleteExpired waits for: PostgreSQL refuses the wait past lock_timeout, as it refuses one side
+	// of a deadlock.
 	held, err := h.pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = held.Rollback(context.WithoutCancel(ctx)) }()
-	if _, err := held.Exec(ctx, `SELECT FROM rbac_members FOR UPDATE`); err != nil {
+	if _, err := held.Exec(ctx, `LOCK TABLE rbac_grants IN SHARE MODE`); err != nil {
 		t.Fatal(err)
 	}
 	tx, err := h.pool.Begin(ctx)
@@ -971,6 +1165,79 @@ func TestJoiningAgainBeforeDeleteExpiredGivesBackNoGroups(t *testing.T) {
 	// It is a membership made now, by whoever made it again.
 	if len(h.events) != 1 || len(h.events[0].Memberships) != 1 || len(h.events[0].Left) != 1 || h.events[0].Memberships[0].CreatedBy != admin {
 		t.Fatalf("events = %+v", h.events)
+	}
+}
+
+func TestJoiningRemovesPlacesLeftWithoutAMembership(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "a"))
+	// A place of an identity with no membership, as a write around the package can leave.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'a', 'user', 'u')`); err != nil {
+		t.Fatal(err)
+	}
+	h.events = nil
+	if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	if of, err := h.authz.GroupsOf(ctx, "t1", identity("u")); err != nil || len(of) != 0 {
+		t.Fatalf("GroupsOf once it joined = %v, %v", of, err)
+	}
+	if allowed(t, h, rbac.Subject{Principal: identity("u")}, login, cluster) {
+		t.Error("joining gave u what group a holds")
+	}
+	if len(h.events) != 1 || len(h.events[0].Left) != 1 {
+		t.Fatalf("events = %+v", h.events)
+	}
+}
+
+// SetMemberships tells whether a membership it renews had ended as of one time, so one ending
+// while it runs is renewed either as it was, in its groups, or anew, in none.
+func TestRenewingAMembershipAsItEndsReadsTheClockOnce(t *testing.T) {
+	var stepping bool
+	h := grouped(t)
+	cfg := h.cfg
+	// A minute later each time it is read.
+	cfg.Now = func() time.Time {
+		now := h.now
+		if stepping {
+			h.now = h.now.Add(time.Minute)
+		}
+		return now
+	}
+	a, err := rbac.New(h.pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := t.Context()
+	ends := h.now.Add(time.Hour)
+	if err := a.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("u"), ExpiresAt: ends}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "a"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "a", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	// It ends between the clock's second read and its third.
+	h.now = ends.Add(-90 * time.Second)
+	stepping = true
+	renewer := identity("admin")
+	if err := a.SetMemberships(ctx, renewer, "t1", []rbac.Membership{{Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	stepping = false
+	ms, err := a.Memberships(ctx, "t1", []rbac.Principal{identity("u")})
+	if err != nil || len(ms) != 1 {
+		t.Fatalf("Memberships = %+v, %v", ms, err)
+	}
+	of, err := a.GroupsOf(ctx, "t1", identity("u"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if anew := ms[0].CreatedBy == renewer; anew != (len(of) == 0) {
+		t.Errorf("renewed as made by %v, in groups %v", ms[0].CreatedBy, of)
 	}
 }
 
@@ -1633,6 +1900,64 @@ func TestAMemberGainsWhatTheGroupsItsGroupIsInHold(t *testing.T) {
 	}
 }
 
+// A member added below a group the same change nests in another gains what that one holds: the
+// host is asked about it as the member's, as it is when two changes make them, in either order.
+func TestAChangeNestingAGroupAsksAboutWhatTheMembersItAddsReach(t *testing.T) {
+	bot := rbac.Principal{Kind: "service_account", ID: "ci"}
+	in := func(group string, p rbac.Principal) rbac.Member { return rbac.Member{Group: group, Principal: p} }
+	for _, how := range []string{"ChangeMembers", "ImportMembers"} {
+		for name, c := range map[string]struct {
+			stored []rbac.Member
+			add    func(rbac.Principal) []rbac.Member
+		}{
+			"in the group": {add: func(p rbac.Principal) []rbac.Member {
+				return []rbac.Member{in("devs", p), in("admins", groupOf("devs"))}
+			}},
+			"below the group": {stored: []rbac.Member{in("admins", groupOf("ops"))}, add: func(p rbac.Principal) []rbac.Member {
+				return []rbac.Member{in("devs", p), in("ops", groupOf("devs"))}
+			}},
+			"through a chain": {add: func(p rbac.Principal) []rbac.Member {
+				return []rbac.Member{in("devs", p), in("ops", groupOf("devs")), in("admins", groupOf("ops"))}
+			}},
+		} {
+			t.Run(how+"/"+name, func(t *testing.T) {
+				h := grouped(t, func(c *rbac.Config) {
+					validate := c.ValidateGrant
+					c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+						if in.Binding.Principal.Kind == bot.Kind && in.Role.Privileged {
+							return fmt.Errorf("%w: service accounts hold no privileged role", rbac.ErrInvalid)
+						}
+						return validate(ctx, q, in)
+					}
+				})
+				ctx := t.Context()
+				h.groups(t, "devs", "ops")
+				h.seed(t, grant(cluster.Scope(), "cluster.sudo", rbac.Group, "admins"))
+				if err := h.authz.ImportMembers(ctx, host, "t1", c.stored); err != nil {
+					t.Fatal(err)
+				}
+				h.member(t, bot)
+				u := h.as(t, "u")
+				change := func(add []rbac.Member) error {
+					if how == "ImportMembers" {
+						return h.authz.ImportMembers(ctx, host, "t1", add)
+					}
+					return h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", add, nil)
+				}
+				if err := change(c.add(bot)); !errors.Is(err, rbac.ErrInvalid) {
+					t.Fatalf("the bot below admins in one change: %v", err)
+				}
+				if err := change(c.add(u.Principal)); err != nil {
+					t.Fatalf("u below admins in one change: %v", err)
+				}
+				if !allowed(t, h, u, root, cluster) {
+					t.Error("u gained nothing from admins")
+				}
+			})
+		}
+	}
+}
+
 func TestChangingMembersIsCheckedAsTheDeniesAndApprovalsItChanges(t *testing.T) {
 	h := grouped(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), guardRole) })
 	ctx := t.Context()
@@ -1883,6 +2208,38 @@ func TestAGrantToAGroupMadeWhileMembersAreAskedAboutIsTriedAgain(t *testing.T) {
 	}
 	if err := h.authz.ChangeMembers(ctx, manager, "t1", add, nil); err != nil {
 		t.Fatalf("tried again: %v", err)
+	}
+}
+
+// A group nested above one a change reaches while the host is asked about the change is one whose
+// lock the change doesn't hold, so it is tried again, rather than let a grant to that group commit
+// before it, unasked about the members it adds.
+func TestAGroupNestedAboveWhileMembersAreAskedAboutIsTriedAgain(t *testing.T) {
+	for _, how := range []string{"ChangeMembers", "ImportMembers"} {
+		t.Run(how, func(t *testing.T) {
+			var meanwhile func(context.Context) error
+			h := meanwhileAsked(t, rbac.ViaMembership, &meanwhile)
+			ctx := t.Context()
+			h.groups(t, "admins")
+			h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "devs"))
+			h.join(t, "u")
+			add := []rbac.Member{{Group: "devs", Principal: identity("u")}}
+			change := func() error {
+				if how == "ImportMembers" {
+					return h.authz.ImportMembers(ctx, host, "t1", add)
+				}
+				return h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", add, nil)
+			}
+			meanwhile = func(ctx context.Context) error {
+				return h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "admins", Principal: groupOf("devs")}})
+			}
+			if err := change(); !errors.Is(err, rbac.ErrConflict) {
+				t.Fatalf("a change reaching a group nested above while the host was asked: %v", err)
+			}
+			if err := change(); err != nil {
+				t.Fatalf("tried again: %v", err)
+			}
+		})
 	}
 }
 

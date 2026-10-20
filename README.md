@@ -161,9 +161,10 @@ grants: `Reach.Conditional` names the scopes conditional ones reach, to check on
   role a role it holds lists in `GrantableRoles`, which it grants without holding. The host is
   asked before a change takes its locks, so a change is tried again (`rbac.ErrConflict`) when the
   memberships its answers rest on, of an identity it grants to or of a group's members, changed
-  in between. A change to a group member's own membership takes that member's lock alone, so one
-  committing after the change reads them again isn't seen: a host whose policy rests on a group's
-  members checks the group's grants when it changes a membership, as `SetMemberships` says.
+  in between, or a group a change to members reaches was nested in another. A change to a group
+  member's own membership takes that member's lock alone, so one committing after the change reads
+  them again isn't seen: a host whose policy rests on a group's members checks the group's grants
+  when it changes a membership, as `SetMemberships` says.
 
 ## Principals
 
@@ -186,15 +187,18 @@ grants: `Reach.Conditional` names the scopes conditional ones reach, to check on
 - **Changing members is granting:** a group's members hold what it and the groups it is in hold,
   so `ChangeMembers`, with `rbac.GroupMembers` on the group and its label, checks a change to its members as the
   changes to access it makes, each as `Apply` or `SetDeny` checks one on its scope. An added member
-  gains the group's grants and eligibilities, which the actor must be able to grant it, and
-  `ValidateGrant` is asked about each as the member's (`rbac.ViaMembership`); it approves what the
-  group approves, which the actor must be able to set; and it is exempt from the denies the group
-  is exempt from, as a removed member, or one whose membership is made to end sooner, is from
-  those naming it, which the actor must be able to set. So whoever manages a group that holds,
-  approves and is in no deny changes its members freely, and one holding a role only if they could
-  grant that role themselves. `Config.ResourceOf` gives the package the containers, label and
-  attributes of the scopes a group's access is on; a host without it declares no labels and
-  resource attributes as none, and for access below the tenant, no containers.
+  gains the grants and eligibilities of the group and the groups it is in, those the same change
+  nests it in too, which the actor must be able to grant it, and `ValidateGrant` is asked about
+  each as the member's (`rbac.ViaMembership`); it approves what the group approves, which the
+  actor must be able to set; and it is exempt from the denies the group is exempt from, as a
+  removed member, or one whose membership is made to end sooner, is from those naming it, which
+  the actor must be able to set. So whoever manages a group that holds, approves and is in no deny
+  changes its members freely, and one holding a role only if they could grant that role
+  themselves. `Config.ResourceOf` gives the package the tenant and the groups, which `SetGroup`
+  and `DeleteGroup` check `rbac.ManageGroups` on, with their constraints and labels, as
+  `ChangeMembers` does `rbac.GroupMembers`, and the containers, label and attributes of the scopes
+  a group's access is on; a host without it declares no labels and resource attributes as none,
+  and for access below the tenant, no containers.
 - **Privileged roles:** a role the catalog marks `Privileged`, or one that changes access, is
   privileged: it is never granted to the tenant's members, and gives nothing through them, as
   after a catalog change.
@@ -327,11 +331,12 @@ through which it could write `rbac_history` itself; and:
   permission the host checks, which a catalog an operator configures can leave out of every role:
   then it is denied like any other.
 - **Limits:** a change takes at most `rbac.MaxBindings` bindings; a principal holds a role on a
-  scope at most `rbac.MaxGrantsPerRole` times, from each source the host owns apart; a scope holds
-  at most `rbac.MaxDenies` denies; a tenant has at most `rbac.MaxCustomRoles` custom roles; an id
-  is at most `rbac.MaxID` bytes. The others are exported beside them.
+  scope at most `rbac.MaxGrantsPerRole` times, and is in a group at most `rbac.MaxPlacesInGroup`
+  times, by source, from each source the host owns apart; a scope holds at most `rbac.MaxDenies`
+  denies; a tenant has at most `rbac.MaxCustomRoles` custom roles; an id is at most `rbac.MaxID`
+  bytes. The others are exported beside them.
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
-  to run on a schedule.
+  to run on a schedule, passing over what a change holds until the next run.
 
 ## Development
 

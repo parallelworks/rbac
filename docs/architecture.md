@@ -245,7 +245,9 @@ flowchart BT
   grants, and the identity's own (`exempted`).
 - **Changing a group's members is granting.** Adding an identity to a group gives it what the
   group holds, so `ChangeMembers` needs the authority to grant all of it, and the host's
-  `ValidateGrant` is asked as for a grant. The same holds for nesting one group in another.
+  `ValidateGrant` is asked as for a grant. The same holds for nesting one group in another, and a
+  change that adds a member and nests its group asks about the member against every group it
+  will be in.
 - **Expanding down** from groups to their identities, for lists and changes, is `insideSQL`. It
   finds nested groups in the statement and their identities through `rbac_group_members`, which
   plans its query for the groups reached, so a small group's members are read alone however large
@@ -545,6 +547,7 @@ chose to store beyond these.
 | `MaxCustomRoles`, `MaxGrantableRoles` | 300, 64 | Custom roles in a tenant, and roles one lists in `GrantableRoles`. |
 | `MaxApprovers`, `MaxActivation` | 16, 366 days | An eligibility's approvers, and its longest activation. |
 | `MaxGroupDepth` | 8 | How deeply groups nest. |
+| `MaxPlacesInGroup` | 20 | Places in force of one principal in one group, each from another source. Those from each source the host owns count apart. |
 | `MaxExpression` | 2,048 bytes | A condition's or requirement's expression. Its cost is bounded too. |
 | `MaxConditionBytes` | 128 KiB | The conditions one `Apply` or `Import` carries, each distinct one counted once. |
 | `MaxName`, `MaxDescription`, `MaxNote` | 128, 2,048, 2,048 characters | Names, titles and group ids, descriptions, and notes and justifications. |
