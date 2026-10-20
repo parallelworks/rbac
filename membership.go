@@ -2011,12 +2011,12 @@ func (a *Authorizer) resourceOf(ctx context.Context, tenant string, s Scope) (Re
 }
 
 // membersCanJoin refuses members of groups that don't exist, or identities that aren't members or
-// guests of the tenant, read under the change's locks. It holds the memberships until the change
-// ends, so DeleteExpired passes over one expiring meanwhile, rather than end it without seeing
-// the groups this change joins.
+// guests of the tenant, read under the change's locks, each on its own, as groupsExist reads them.
+// It holds the memberships until the change ends, so DeleteExpired passes over one expiring
+// meanwhile, rather than end it without seeing the groups this change joins.
 func (a *Authorizer) membersCanJoin(ctx context.Context, tx pgx.Tx, tenant string, groups, identities []string) error {
 	rows, err := tx.Query(ctx, `
-		SELECT 'group ' || g FROM unnest($2::text[]) AS g WHERE NOT EXISTS (SELECT FROM rbac_groups WHERE tenant = $1 AND id = g)
+		SELECT 'group ' || g FROM unnest($2::text[]) AS g WHERE NOT EXISTS (SELECT FROM rbac_groups WHERE tenant = $1 AND id = g OFFSET 0)
 		UNION ALL
 		SELECT 'identity ' || p FROM unnest($3::text[]) AS p WHERE NOT EXISTS (
 		  SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = p AND (expires_at IS NULL OR expires_at > $4) FOR KEY SHARE)
@@ -2288,14 +2288,16 @@ func groupScopes(scopes []Scope) []string {
 
 // groupsExist refuses a change naming, by key, a group the tenant doesn't have, read under the
 // change's locks on them: what it names, or makes on one's scope, would pass to a group made later
-// with that id.
+// with that id. Each is looked up on its own: OFFSET 0 keeps the planner from flattening the test
+// into an anti-join, which a generic plan, costing the tenant's groups as an average tenant's few,
+// runs by reading every one.
 func groupsExist(ctx context.Context, q DB, tenant string, keys []string) error {
 	if len(keys) == 0 {
 		return nil
 	}
 	var missing string
 	err := q.QueryRow(ctx, `SELECT k FROM unnest($2::text[]) AS k
-		WHERE NOT EXISTS (SELECT FROM rbac_groups WHERE tenant = $1 AND id = substr(k, length('group:') + 1))
+		WHERE NOT EXISTS (SELECT FROM rbac_groups WHERE tenant = $1 AND id = substr(k, length('group:') + 1) OFFSET 0)
 		ORDER BY k LIMIT 1`, tenant, keys).Scan(&missing)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):

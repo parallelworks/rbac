@@ -2811,6 +2811,82 @@ func TestReadsByScopeOrPrincipalReadOnlyTheirRows(t *testing.T) {
 	}
 }
 
+// A change naming groups, granting to one, a deny or an eligibility naming one, or members put in
+// one, reads of the groups only those it names, under a generic plan too: tested for each whether
+// it exists, flattened into an anti-join, which a generic plan, costing the tenant's groups as an
+// average tenant's few, runs by reading every one.
+func TestChangesNamingGroupsReadOnlyThoseGroups(t *testing.T) {
+	for _, plan := range []string{"custom", "generic"} {
+		t.Run(plan, func(t *testing.T) {
+			roles := func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), groupMembers, guardRole) }
+			var h *harness
+			if plan == "generic" {
+				h = generic(t, roles)
+			} else {
+				h = custom(t, roles)
+			}
+			ctx := t.Context()
+			h.groups(t, "oncall", "pager")
+			h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "owner"), grant(cluster.Scope(), "guard", rbac.User, "owner"))
+			owner := h.as(t, "owner")
+			ann := h.as(t, "ann")
+			oncall, pager := groupOf("oncall"), groupOf("pager")
+			// The pages of the groups each reads, in a transaction it rolls back.
+			read := func() map[string]int64 {
+				t.Helper()
+				pages := map[string]int64{}
+				for what, f := range map[string]func(a *rbac.Authorizer) error{
+					"Apply": func(a *rbac.Authorizer) error {
+						return a.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: oncall}}})
+					},
+					"Import": func(a *rbac.Authorizer) error {
+						return a.Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.Group, "oncall")})
+					},
+					"SetDeny": func(a *rbac.Authorizer) error {
+						return a.SetDeny(ctx, owner, cluster, rbac.Deny{ID: "d", Principals: []rbac.Principal{oncall}, Exempt: []rbac.Principal{pager}, Permissions: []rbac.Permission{root}})
+					},
+					"SetEligibility": func(a *rbac.Authorizer) error {
+						return a.SetEligibility(ctx, owner, cluster, rbac.Eligibility{Role: "cluster.login", Principal: oncall, MaxDuration: time.Hour, Approvers: []rbac.Principal{pager}})
+					},
+					"ImportMembers": func(a *rbac.Authorizer) error {
+						return a.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "oncall", Principal: ann.Principal}, {Group: "oncall", Principal: pager}})
+					},
+					"ChangeMembers": func(a *rbac.Authorizer) error {
+						return a.ChangeMembers(ctx, owner, "t1", []rbac.Member{{Group: "oncall", Principal: ann.Principal}}, nil)
+					},
+				} {
+					func() {
+						tx, err := h.pool.Begin(ctx)
+						if err != nil {
+							t.Fatal(err)
+						}
+						defer func() { _ = tx.Rollback(ctx) }()
+						start := pagesRead(ctx, t, tx, "rbac_groups")
+						if err := f(h.authz.WithTx(tx)); err != nil {
+							t.Fatalf("%s: %v", what, err)
+						}
+						pages[what] = pagesRead(ctx, t, tx, "rbac_groups") - start
+					}()
+				}
+				return pages
+			}
+			// Others each have a group of their own.
+			others := func(n int) {
+				t.Helper()
+				manyMembers(t, h, n, `INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'g' || id FROM others`, "rbac_groups")
+			}
+			others(500)
+			few := read()
+			others(4500)
+			for what, many := range read() {
+				if many > few[what]*3/2+deeper {
+					t.Errorf("%s read %d pages of groups, and %d once 4500 more had a group of their own", what, few[what], many)
+				}
+			}
+		})
+	}
+}
+
 // Under PostgreSQL's default plan_cache_mode, a connection's statement may turn generic from its
 // sixth run, and a change by an actor in a nested group, GroupsOf, and a change to a group's members
 // read on each later call about as many pages as on the first, as they do under a generic plan.
