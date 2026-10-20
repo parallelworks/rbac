@@ -251,7 +251,7 @@ func unmet(spend *budget) string {
 // exists gives nothing.
 func gives(roles book, h holding, p Permission, resourceType string) bool {
 	def, ok := roles.role(h.Role)
-	return ok && def.GrantableOn(resourceType) && def.Gives(p) && h.carries(def, p)
+	return ok && roles.gives(h.Role, def, p, resourceType) && h.carries(def, p)
 }
 
 // carries reports whether a grant held as h gives p, which def gives: as its principal carries
@@ -1276,7 +1276,7 @@ const (
 func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Subject, counts broad, scopes []string, p Permission,
 	roles rolesRead, ending bool,
 ) ([]holding, []denial, book, error) {
-	b := book{builtin: a.roles}
+	b := a.builtinBook()
 	// The anonymous are the public alone.
 	if s.Principal == (Principal{}) && !counts.public {
 		return nil, nil, b, nil

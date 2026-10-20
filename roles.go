@@ -25,6 +25,10 @@ const DefineRoles Permission = "tenant:define-roles"
 type book struct {
 	builtin map[Role]RoleDefinition
 	custom  map[Role]RoleDefinition
+	// sets are the built-in roles' permissions and types as sets, and customSets the custom ones'
+	// gives has read, each made the first time it does, where a decision keeps them: a role can
+	// give a thousand permissions, and a change asks of each it decides for each of its types.
+	sets, customSets map[Role]roleSet
 }
 
 func (b book) role(id Role) (RoleDefinition, bool) {
@@ -35,12 +39,70 @@ func (b book) role(id Role) (RoleDefinition, bool) {
 	return r, ok
 }
 
+// roleSet is a role's permissions and types as sets.
+type roleSet struct {
+	permissions map[Permission]bool
+	types       map[string]bool
+}
+
+func setOf(r RoleDefinition) roleSet {
+	readingEntries(len(r.Permissions) + len(r.ResourceTypes))
+	s := roleSet{permissions: make(map[Permission]bool, len(r.Permissions)), types: make(map[string]bool, len(r.ResourceTypes))}
+	for _, p := range r.Permissions {
+		s.permissions[p] = true
+	}
+	for _, t := range r.ResourceTypes {
+		s.types[t] = true
+	}
+	return s
+}
+
+func setsOf(roles map[Role]RoleDefinition) map[Role]roleSet {
+	sets := make(map[Role]roleSet, len(roles))
+	for id, r := range roles {
+		sets[id] = setOf(r)
+	}
+	return sets
+}
+
+// gives reports whether role id, defined as def, gives p on a resource type.
+func (b book) gives(id Role, def RoleDefinition, p Permission, resourceType string) bool {
+	s, ok := b.sets[id]
+	if _, builtin := b.builtin[id]; !builtin && b.customSets != nil {
+		if s, ok = b.customSets[id]; !ok {
+			s, ok = setOf(def), true
+			b.customSets[id] = s
+		}
+	}
+	if !ok {
+		readingEntries(len(def.Permissions) + len(def.ResourceTypes))
+		return def.GrantableOn(resourceType) && def.Gives(p)
+	}
+	readingEntries(1)
+	return s.types[resourceType] && s.permissions[p]
+}
+
+// keepingSets is b keeping the custom roles' sets as gives makes them, for a decision that asks
+// gives about them many times.
+func (b book) keepingSets() book {
+	if b.customSets == nil {
+		b.customSets = map[Role]roleSet{}
+	}
+	return b
+}
+
+// readingEntries runs as a decision reads n entries: of a role's permissions and types, to make
+// sets of them, which each later read takes one of, to look for one without them, or to compare two
+// definitions, or one of what the constraints answered. A test counts the work deciding many roles
+// takes.
+var readingEntries = func(n int) {}
+
 func isCustom(id Role) bool { return strings.HasPrefix(string(id), CustomPrefix) }
 
 // book reads, on q, the definitions of the custom roles among ids in a tenant. Without one
 // among them it reads nothing.
 func (a *Authorizer) book(ctx context.Context, q DB, tenant string, ids []Role) (book, error) {
-	b := book{builtin: a.roles}
+	b := a.builtinBook()
 	var want []string
 	for _, id := range ids {
 		if isCustom(id) && !slices.Contains(want, string(id)) {
@@ -65,7 +127,7 @@ func (a *Authorizer) book(ctx context.Context, q DB, tenant string, ids []Role) 
 // role's GrantableRoles can name any.
 func (a *Authorizer) tenantBook(ctx context.Context, q DB, tenant string, ids []Role) (book, error) {
 	if !slices.ContainsFunc(ids, isCustom) {
-		return book{builtin: a.roles}, nil
+		return a.builtinBook(), nil
 	}
 	custom, err := a.customRoles(ctx, q, tenant)
 	if err != nil {
@@ -74,9 +136,13 @@ func (a *Authorizer) tenantBook(ctx context.Context, q DB, tenant string, ids []
 	return a.bookOf(custom), nil
 }
 
+// builtinBook resolves the built-in roles.
+func (a *Authorizer) builtinBook() book { return book{builtin: a.roles, sets: a.roleSets} }
+
 // bookOf resolves the built-in roles and the custom ones given.
 func (a *Authorizer) bookOf(custom []RoleDefinition) book {
-	b := book{builtin: a.roles, custom: make(map[Role]RoleDefinition, len(custom))}
+	b := a.builtinBook()
+	b.custom = make(map[Role]RoleDefinition, len(custom))
 	for _, r := range custom {
 		b.custom[r.ID] = r
 	}
@@ -584,7 +650,17 @@ func givesMore(was, now RoleDefinition) bool {
 }
 
 func subset[T comparable](xs, of []T) bool {
-	return !slices.ContainsFunc(xs, func(x T) bool { return !slices.Contains(of, x) })
+	// Past a few, looked up in a set: a role can give a thousand permissions.
+	if len(of) <= 16 {
+		readingEntries(len(xs) * len(of))
+		return !slices.ContainsFunc(xs, func(x T) bool { return !slices.Contains(of, x) })
+	}
+	readingEntries(len(xs) + len(of))
+	in := make(map[T]bool, len(of))
+	for _, x := range of {
+		in[x] = true
+	}
+	return !slices.ContainsFunc(xs, func(x T) bool { return !in[x] })
 }
 
 // redefinedSince refuses a change granting roles that, now, give more than the host was asked
@@ -693,7 +769,8 @@ func (a *Authorizer) revalidate(ctx context.Context, actor Subject, tenant strin
 	if err != nil {
 		return nil, standing{}, err
 	}
-	roles := book{builtin: a.roles, custom: widened}
+	roles := a.builtinBook()
+	roles.custom = widened
 	asked := make(map[revalidated]RoleDefinition, len(need))
 	var refused []error
 	for _, v := range need {

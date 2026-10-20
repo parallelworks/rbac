@@ -755,8 +755,10 @@ type Authorizer struct {
 	db  DB
 	cfg Config
 	// asOf is set on an Authorizer AsOf gave, which reads the past and changes nothing.
-	asOf       bool
-	roles      map[Role]RoleDefinition
+	asOf  bool
+	roles map[Role]RoleDefinition
+	// roleSets are the built-in roles' permissions and types as sets.
+	roleSets   map[Role]roleSet
 	containers map[string]bool
 	// containerTypes are the containers' types, sorted.
 	containerTypes []string
@@ -898,7 +900,7 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 		return nil, err
 	}
 	return &Authorizer{
-		db: db, cfg: cfg, roles: roles, containers: containers, containerTypes: slices.Sorted(maps.Keys(containers)),
+		db: db, cfg: cfg, roles: roles, roleSets: setsOf(roles), containers: containers, containerTypes: slices.Sorted(maps.Keys(containers)),
 		kinds: kinds, owned: owned, permissions: perms, types: resourceTypes, permissionTypes: permissionTypes, unprivileged: unprivileged,
 		catalogPermissions: permList, catalogTypes: slices.Sorted(maps.Keys(resourceTypes)), publicPairs: pairs,
 		checked: checked, checkedTypes: checkedTypes, conds: conds, labels: labels,

@@ -843,6 +843,17 @@ type authority struct {
 	// proven is holdsRole's checks of the grants decided by this authority, and by those on other
 	// scopes read with it that hand on just as it does.
 	proven *checked
+	// given is what heldFor found the actor's grants give, which doesn't turn on the role a check
+	// asks about, so a decision checking many roles that give the same reads its grants once.
+	given map[heldKey]int
+}
+
+// heldKey is what heldFor is asked: a permission for a list of types, under a condition until a
+// time.
+type heldKey struct {
+	p                Permission
+	types, condition string
+	until            time.Time
 }
 
 // constrained is what the constraints remove from an actor handing permissions on through a
@@ -855,6 +866,8 @@ type constrained struct {
 	actor Subject
 	on    Resource
 	asked map[permissionOn]bool
+	// listed are removesAny's answers.
+	listed map[typesAsked]bool
 	// by names the constraint that removed each permission, for a refusal to say.
 	by  map[Permission]string
 	err error
@@ -870,7 +883,10 @@ type constrained struct {
 }
 
 func (a *Authorizer) constrain(ctx context.Context, actor Subject, on Resource) *constrained {
-	return &constrained{a: a, ctx: ctx, actor: actor, on: on, asked: map[permissionOn]bool{}, by: map[Permission]string{}}
+	return &constrained{
+		a: a, ctx: ctx, actor: actor, on: on,
+		asked: map[permissionOn]bool{}, listed: map[typesAsked]bool{}, by: map[Permission]string{},
+	}
 }
 
 // holding is the actor's label values, read on q through c, which is on the tenant, the first time
@@ -914,6 +930,7 @@ func (c *constrained) removes(p Permission, resourceType string) bool {
 	if c == nil {
 		return true
 	}
+	readingEntries(1)
 	k := permissionOn{p, resourceType}
 	if removed, ok := c.asked[k]; ok {
 		return removed
@@ -945,6 +962,32 @@ func (c *constrained) removes(p Permission, resourceType string) bool {
 	}
 	c.asked[k] = name != "" || err != nil
 	return c.asked[k]
+}
+
+// removesAny reports whether a constraint removes p on resources of one of types, which typesKey
+// names with the types after them, asking about each in order up to one that does, once for each
+// list of them, as a change decides many roles for the same types.
+func (c *constrained) removesAny(p Permission, types []string, typesKey string) bool {
+	if len(types) == 0 {
+		return false
+	}
+	if c == nil {
+		return true
+	}
+	k := typesAsked{p: p, types: typesKey, n: len(types)}
+	if removed, ok := c.listed[k]; ok {
+		return removed
+	}
+	removed := slices.ContainsFunc(types, func(t string) bool { return c.removes(p, t) })
+	c.listed[k] = removed
+	return removed
+}
+
+// typesAsked is what removesAny is asked: a permission for the first n of a list of types.
+type typesAsked struct {
+	p     Permission
+	types string
+	n     int
 }
 
 // removedBy names the constraint that removed p from the actor, or "".
@@ -1051,6 +1094,7 @@ func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []
 	// deciding a grant on one proved holds on the other, so a change reaching many, as one to the
 	// members of a group granted a role on each, walks the roles a role lists once.
 	proven := map[string]*checked{}
+	b = b.keepingSets()
 	aus := make([]authority, len(on))
 	for i, r := range on {
 		heldOn := make([]holding, len(heldAt[i]))
@@ -1145,7 +1189,7 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 		denied, handsOn = orDenied(denied, out), orDenied(handsOn, out)
 	}
 	return authority{
-		held: held, roles: b,
+		held: held, roles: b.keepingSets(), given: map[heldKey]int{},
 		allows: func(h holding, action Permission) bool {
 			return !h.conditional || a.conds.holds(spend(action), h.Condition.Expression, with(vars, action))
 		},
@@ -1248,12 +1292,40 @@ func (au authority) decidedAs(condition string, until time.Time) (string, time.T
 	return condition, at.UTC()
 }
 
-// holds reports whether the actor holds p for resources of a type, to hand it on with condition
-// until until: neither a deny nor a constraint removes it.
-func (au authority) holds(p Permission, resourceType, condition string, until time.Time) bool {
-	return !au.handsOn(p) && slices.ContainsFunc(au.held, func(g holding) bool {
-		return gives(au.roles, g, p, resourceType) && g.under(au.subjects, condition) && g.lasts(until)
-	}) && !au.constrained.removes(p, resourceType)
+// holdsFor reports whether the actor holds p for resources of each of types, which typesKey names,
+// to hand it on with condition until until: neither a deny nor a constraint removes it. A
+// constraint is asked about each type in order that the actor's grants give p for, up to one that
+// removes it, as asking of each type in turn would.
+func (au authority) holdsFor(p Permission, types []string, typesKey, condition string, until time.Time) bool {
+	if len(types) == 0 {
+		return true
+	}
+	if au.handsOn(p) {
+		return false
+	}
+	n := au.heldFor(p, types, typesKey, condition, until)
+	return !au.constrained.removesAny(p, types[:n], typesKey) && n == len(types)
+}
+
+// heldFor is how many of types, in order, the actor's grants give p for under condition until
+// until, before the first they don't.
+func (au authority) heldFor(p Permission, types []string, typesKey, condition string, until time.Time) int {
+	k := heldKey{p: p, types: typesKey, condition: condition, until: until}
+	if n, ok := au.given[k]; ok {
+		return n
+	}
+	n := slices.IndexFunc(types, func(rt string) bool {
+		return !slices.ContainsFunc(au.held, func(g holding) bool {
+			return gives(au.roles, g, p, rt) && g.under(au.subjects, condition) && g.lasts(until)
+		})
+	})
+	if n < 0 {
+		n = len(types)
+	}
+	if au.given != nil {
+		au.given[k] = n
+	}
+	return n
 }
 
 // may reports whether the actor may do p, on resources of a type, in this request.
@@ -1299,7 +1371,8 @@ func (a *Authorizer) mayGrant(au authority, pw power, scopeType string, def Role
 func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string, condition string, until time.Time,
 	seen *checked,
 ) (Permission, bool) {
-	key := string(def.ID) + " " + strings.Join(types, ",") + " " + until.UTC().Format(time.RFC3339Nano) + " " + condition
+	typesKey := strings.Join(types, ",")
+	key := string(def.ID) + " " + typesKey + " " + until.UTC().Format(time.RFC3339Nano) + " " + condition
 	if seen.keys[key] {
 		return "", true
 	}
@@ -1311,10 +1384,8 @@ func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string,
 		// Where the grant doesn't reach scopes of t, its t:grant changes no grants there: it is a
 		// permission like any other.
 		if verb != "grant" || !slices.Contains(types, t) {
-			for _, rt := range types {
-				if !au.holds(p, rt, condition, until) {
-					return p, false
-				}
+			if !au.holdsFor(p, types, typesKey, condition, until) {
+				return p, false
 			}
 			continue
 		}
@@ -1829,7 +1900,7 @@ func (a *Authorizer) conditionsIn(ctx context.Context, tx pgx.Tx, tenant string,
 		return nil, err
 	}
 	// What the roles give matters only for counting label values.
-	defs := book{builtin: a.roles}
+	defs := a.builtinBook()
 	if len(a.labels) > 0 {
 		if defs, err = a.book(ctx, tx, tenant, ids); err != nil {
 			return nil, err

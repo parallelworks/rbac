@@ -4335,6 +4335,69 @@ func TestARefusedGrantProvesNothingForTheNext(t *testing.T) {
 	}
 }
 
+// Grantable and Apply read what the actor holds for each permission and type once, whatever the
+// number of roles they decide that give it, and a role it holds giving many permissions once too,
+// rather than for each role, permission and type.
+func TestDecidingManyLargeRolesReadsWhatTheActorHoldsOnce(t *testing.T) {
+	const types, verbs, roles = 10, 10, 30
+	var ts []string
+	var perms []rbac.Permission
+	for i := range types {
+		ty := fmt.Sprintf("t%02d", i)
+		ts = append(ts, ty)
+		for v := range verbs {
+			perms = append(perms, rbac.Permission(fmt.Sprintf("%s:v%02d", ty, v)))
+		}
+	}
+	all := append([]rbac.Permission{rbac.GrantPermission(rbac.TenantScope)}, perms...)
+	for _, ty := range ts {
+		all = append(all, rbac.GrantPermission(ty))
+	}
+	everything := rbac.RoleDefinition{ID: "everything", Permissions: all, ResourceTypes: append(slices.Clone(ts), rbac.TenantScope), Privileged: true}
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = []rbac.RoleDefinition{everything}
+		c.ContainerTypes = []string{"org"}
+		c.Constraints = []rbac.Constraint{{Name: "none", Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) { return false, nil }}}
+	})
+	ctx := t.Context()
+	tenant := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}
+	h.seed(t, grant(tenant.Scope(), everything.ID, rbac.User, "boss"))
+	boss := h.as(t, "boss")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+		SELECT 't1', 'custom.r' || i, $1::text[], $2::text[] FROM generate_series(1, $3) i`, perms, ts, roles); err != nil {
+		t.Fatal(err)
+	}
+	read := 0
+	rbac.SetReadingEntries(t, func(n int) { read += n })
+	offered, err := h.authz.Grantable(ctx, boss, tenant)
+	if err != nil || len(offered) != roles+1 {
+		t.Fatalf("Grantable offered %d roles: %v", len(offered), err)
+	}
+	// Each permission for each list of types its roles are for: what the actor's grants give, and
+	// what the constraints answered; and the held role's entries once.
+	once := len(perms)*types + len(all)*(types+1)
+	if read > 3*once {
+		t.Errorf("Grantable read %d entries deciding %d roles of %d permissions for %d types", read, roles+1, len(perms), types)
+	}
+	var c rbac.Change
+	for _, r := range offered[1:] {
+		c.Grant = append(c.Grant, rbac.Binding{Role: r.ID, Principal: identity("target")})
+	}
+	h.as(t, "target")
+	read = 0
+	if err := h.authz.Apply(ctx, boss, tenant, c); err != nil {
+		t.Fatal(err)
+	}
+	// Its roles' permissions and types again in its transaction, but what the constraints answered,
+	// and each role as it is then with the role as it was.
+	if read > 3*once+4*roles*(len(perms)+types) {
+		t.Errorf("Apply read %d entries granting %d roles of %d permissions for %d types", read, roles, len(perms), types)
+	}
+	if !allowed(t, h, h.as(t, "target"), perms[len(perms)-1], rbac.Resource{Tenant: "t1", Type: ts[types-1], ID: "x"}) {
+		t.Error("the roles granted give nothing")
+	}
+}
+
 func TestManyGrantsOfARoleAreDecidedOnce(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
