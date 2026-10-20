@@ -836,7 +836,7 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 			return authority{}, fmt.Errorf("%w: role %q: grantable role %q doesn't exist", ErrInvalid, r.ID, id)
 		}
 	}
-	seen := map[string]bool{}
+	seen := newChecked()
 	// A definition never ends, so what the actor holds only until a time can't stand in.
 	if p, ok := a.holdsRole(au, *r, r.ResourceTypes, "", time.Time{}, seen); !ok {
 		reason := cs.refusal("define "+string(r.ID), p, fmt.Sprintf("the actor can't define %s without holding %s here", r.ID, p))

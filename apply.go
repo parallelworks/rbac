@@ -1090,7 +1090,7 @@ func (au authority) may(p Permission, resourceType string) bool {
 // actor makes, and under for one a grant it makes would let others make. seen is holdsRole's:
 // fresh for each grant decided, or what grants already allowed proved.
 func (a *Authorizer) mayGrant(au authority, pw power, scopeType string, def RoleDefinition, condition string, until time.Time,
-	seen map[string]bool,
+	seen *checked,
 ) (Permission, bool) {
 	if pw.lists(def.ID, condition) {
 		return "", true
@@ -1118,13 +1118,14 @@ func (a *Authorizer) mayGrant(au authority, pw power, scopeType string, def Role
 // as for a role that lists itself or one that lists it back, adds nothing. Without it, roles
 // listing each other would be checked along every order they can be reached in.
 func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string, condition string, until time.Time,
-	seen map[string]bool,
+	seen *checked,
 ) (Permission, bool) {
 	key := string(def.ID) + " " + strings.Join(types, ",") + " " + until.UTC().Format(time.RFC3339Nano) + " " + condition
-	if seen[key] {
+	if seen.keys[key] {
 		return "", true
 	}
-	seen[key] = true
+	seen.keys[key] = true
+	seen.order = append(seen.order, key)
 	for _, p := range def.Permissions {
 		t, verb := p.parts()
 		// Where the grant doesn't reach scopes of t, its t:grant changes no grants there: it is a
@@ -1164,6 +1165,34 @@ func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string,
 	return "", true
 }
 
+// checked are holdsRole's checks, each a role with what its grant reaches, its end and condition,
+// done or under way for the grants a decision makes, in the order they began: what a grant allowed
+// proved holds for the next, and a refused one's are dropped, as some passed only while it was in
+// progress.
+type checked struct {
+	keys  map[string]bool
+	order []string
+}
+
+func newChecked() *checked { return &checked{keys: map[string]bool{}} }
+
+// mark is how many checks have begun, for drop to forget those begun since.
+func (c *checked) mark() int { return len(c.order) }
+
+func (c *checked) drop(mark int) {
+	for _, k := range c.order[mark:] {
+		delete(c.keys, k)
+	}
+	c.order = c.order[:mark]
+}
+
+// grantAsked is a grant as mayChange decides it: its role, under a condition, until a time.
+type grantAsked struct {
+	role      Role
+	condition string
+	until     time.Time
+}
+
 // mayChange checks the actor's own access on the scope against the change, once Apply has
 // checked the constraints on changing it, and returns what it read; cs are those on what the
 // actor hands on.
@@ -1185,13 +1214,28 @@ func (a *Authorizer) mayChange(ctx context.Context, q DB, actor Subject, on Reso
 			errs = append(errs, &DeniedError{Permission: manage, Scope: scope, Reason: fmt.Sprintf("the actor may not revoke %s here", b.Role)})
 		}
 	}
+	// A role is decided once for each condition and end, by what it lacks then, if anything, or a
+	// change granting it to many would walk what it lists for each; and what a grant allowed proved
+	// holds for the others, as Grantable keeps it: a refused one's checks are dropped, as some passed
+	// only while it was in progress.
+	lacks, proven := map[grantAsked]Permission{}, newChecked()
 	for _, b := range grants {
 		def, known := au.roles.role(b.Role)
 		if !known || !a.grantableOn(def, scope.Type) {
 			// validate reports it as invalid rather than as an escalation.
 			continue
 		}
-		if p, ok := a.mayGrant(au, pw, scope.Type, def, b.Condition.Expression, b.ExpiresAt, map[string]bool{}); !ok {
+		k := grantAsked{role: b.Role, condition: b.Condition.Expression, until: b.ExpiresAt.UTC()}
+		p, decided := lacks[k]
+		if !decided {
+			mark := proven.mark()
+			var ok bool
+			if p, ok = a.mayGrant(au, pw, scope.Type, def, b.Condition.Expression, b.ExpiresAt, proven); !ok {
+				proven.drop(mark)
+			}
+			lacks[k] = p
+		}
+		if p != "" {
 			reason := cs.refusal("grant "+string(b.Role), p, fmt.Sprintf("the actor can't grant %s without holding %s here", b.Role, p))
 			switch {
 			case !pw.any && len(pw.listed[b.Role]) > 0:
@@ -1248,12 +1292,13 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 	var roles []RoleDefinition
 	// Everything checked for a role the actor may grant holds, so later roles needn't check it
 	// again. A refused role's checks are dropped: some passed only while it was in progress.
-	proven := map[string]bool{}
+	proven := newChecked()
 	for _, def := range a.rolesIn(r.Type, custom) {
-		seen := maps.Clone(proven)
-		if _, ok := a.mayGrant(au, pw, r.Type, def, "", time.Time{}, seen); ok {
-			proven = seen
+		mark := proven.mark()
+		if _, ok := a.mayGrant(au, pw, r.Type, def, "", time.Time{}, proven); ok {
 			roles = append(roles, def)
+		} else {
+			proven.drop(mark)
 		}
 	}
 	if err := cs.failed(); err != nil {

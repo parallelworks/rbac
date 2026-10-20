@@ -3787,6 +3787,107 @@ func TestRolesListingEachOtherAreDecidedOnce(t *testing.T) {
 	}
 }
 
+func TestManyGrantsOfARoleAreDecidedOnce(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	// Roles each listing many of the others, whose power to grant them a grant of one hands on, the
+	// last giving root too; one listing none; and one for whoever may grant them all but that.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles)
+		SELECT 't1', 'custom.r' || i, '{cluster:view,cluster:login,cluster:grant}'::text[] || CASE WHEN i = 199 THEN '{cluster:root}' ELSE '{}' END::text[],
+		  '{cluster}'::text[], ARRAY(SELECT 'custom.r' || ((i + j) % 200) FROM generate_series(1, 64) j)
+		FROM generate_series(0, 199) i
+		UNION ALL SELECT 't1', 'custom.flat', '{cluster:view,cluster:login}', '{cluster}', '{}'
+		UNION ALL SELECT 't1', 'custom.lead', '{cluster:view,cluster:login,cluster:grant}', '{cluster}', '{}'`); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), "custom.lead", rbac.User, "lead"))
+	owner, lead := h.as(t, "owner"), h.as(t, "lead")
+	n := 0
+	// The time granting role(i) to each of count principals takes, the fastest of a few, so a stall
+	// of the database's in one doesn't count.
+	apply := func(actor rbac.Subject, role func(i int) rbac.Role, count int) time.Duration {
+		t.Helper()
+		var fastest time.Duration
+		for i := range 3 {
+			var c rbac.Change
+			for j := range count {
+				n++
+				c.Grant = append(c.Grant, rbac.Binding{Role: role(j), Principal: identity(fmt.Sprintf("p%d", n))})
+			}
+			start := time.Now()
+			if err := h.authz.Apply(ctx, actor, cluster, c); err != nil && (actor.Principal != lead.Principal || !errors.Is(err, rbac.ErrDenied)) {
+				t.Fatal(err)
+			}
+			if took := time.Since(start); i == 0 || took < fastest {
+				fastest = took
+			}
+		}
+		return fastest
+	}
+	first := func(int) rbac.Role { return "custom.r0" }
+	one, flat := apply(owner, first, 1), apply(owner, func(int) rbac.Role { return "custom.flat" }, 200)
+	for name, role := range map[string]func(int) rbac.Role{
+		"one role":  first,
+		"each role": func(i int) rbac.Role { return rbac.Role(fmt.Sprintf("custom.r%d", i)) },
+	} {
+		if many := apply(owner, role, 200); many > 5*(one+flat) {
+			t.Errorf("granting %s listing many to 200 principals took %v, once %v, and a role listing none %v", name, many, one, flat)
+		}
+	}
+	// A refusal, found once all the others are checked, is found once too.
+	if once, many := apply(lead, first, 1), apply(lead, first, rbac.MaxBindings); many > 10*once {
+		t.Errorf("refusing a role listing many took %v once and %v for %d principals", once, many, rbac.MaxBindings)
+	}
+}
+
+// Grants of a role each ending at its own time are each decided, as what the actor holds until
+// then differs, but what each proved is kept without copying what the others did: deciding them
+// costs about as much as refusing them, whose checks are dropped.
+func TestGrantsEndingApartAreDecidedInTimeAsTheyAreMany(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	// A chain of roles, each listing the next, the last giving root too; one listing none; and one
+	// for whoever may grant all of them but that.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles)
+		SELECT 't1', 'custom.s' || i, '{cluster:view,cluster:login,cluster:grant}'::text[] || CASE WHEN i = 99 THEN '{cluster:root}' ELSE '{}' END::text[],
+		  '{cluster}'::text[], ARRAY['custom.s' || ((i + 1) % 100)]
+		FROM generate_series(0, 99) i
+		UNION ALL SELECT 't1', 'custom.flat', '{cluster:view,cluster:login}', '{cluster}', '{}'
+		UNION ALL SELECT 't1', 'custom.lead', '{cluster:view,cluster:login,cluster:grant}', '{cluster}', '{}'`); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), "custom.lead", rbac.User, "lead"))
+	owner, lead := h.as(t, "owner"), h.as(t, "lead")
+	n := 0
+	// The time granting role to MaxBindings principals, each until an hour later than the last,
+	// takes, the fastest of a few.
+	apply := func(actor rbac.Subject, role rbac.Role) time.Duration {
+		t.Helper()
+		var fastest time.Duration
+		for i := range 3 {
+			var c rbac.Change
+			for j := range rbac.MaxBindings {
+				n++
+				c.Grant = append(c.Grant, rbac.Binding{Role: role, Principal: identity(fmt.Sprintf("p%d", n)), ExpiresAt: h.now.Add(time.Duration(j+1) * time.Hour)})
+			}
+			start := time.Now()
+			if err := h.authz.Apply(ctx, actor, cluster, c); err != nil && (actor.Principal != lead.Principal || !errors.Is(err, rbac.ErrDenied)) {
+				t.Fatal(err)
+			}
+			if took := time.Since(start); i == 0 || took < fastest {
+				fastest = took
+			}
+		}
+		return fastest
+	}
+	flat, refused, granted := apply(owner, "custom.flat"), apply(lead, "custom.s0"), apply(owner, "custom.s0")
+	// Granted, it is decided twice, before its transaction and in it, and written.
+	if granted > 4*refused+2*flat {
+		t.Errorf("granting a role listing others until %d times took %v, refusing it %v, and granting one listing none %v",
+			rbac.MaxBindings, granted, refused, flat)
+	}
+}
+
 func TestDeletePrincipalEverywhereAcrossManyTenants(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
