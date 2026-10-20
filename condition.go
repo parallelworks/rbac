@@ -514,7 +514,11 @@ func (w worst) walk(e ast.Expr) (uint64, extent) {
 		return 2, w.typed(e)
 	case ast.SelectKind:
 		n, _ := w.walk(e.AsSelect().Operand())
-		return cost.SafeAdd(n, 2), w.typed(e)
+		// A presence test is a bool; a field may be what its type isn't (typed).
+		if e.AsSelect().IsTestOnly() {
+			return cost.SafeAdd(n, 2), w.typed(e)
+		}
+		return cost.SafeAdd(n, 2), anything
 	case ast.ListKind:
 		n, x := uint64(10), extent{value: 1, text: 1, length: uint64(len(e.AsList().Elements()))}
 		for i, el := range e.AsList().Elements() {
@@ -559,7 +563,10 @@ func (w worst) walk(e ast.Expr) (uint64, extent) {
 }
 
 // typed is the most a value of e's type can be: one for a scalar, and for a string, a list or a map
-// past any bound.
+// past any bound. It is only for what can't be another type than CEL checks it as, as a variable, a
+// function's result or a presence test: where a dyn() value meets another, in a choice, a sum or a
+// literal, CEL checks it as of the other's type, and so what reads it, a field, an element or a
+// loop's variable, whatever it is when it runs.
 func (w worst) typed(e ast.Expr) extent {
 	switch w.checked.GetType(e.ID()).Kind() {
 	case types.BoolKind, types.IntKind, types.UintKind, types.DoubleKind, types.DurationKind, types.TimestampKind,
@@ -586,7 +593,13 @@ func (w worst) comprehension(e ast.Expr) (uint64, extent) {
 	if making {
 		accu = &start
 	}
-	w.vars[comp.IterVar()] = append(w.vars[comp.IterVar()], over.elem)
+	// Each element is what the range's bound says, or anything (typed).
+	each := over.elem
+	if each == nil {
+		a := anything
+		each = &a
+	}
+	w.vars[comp.IterVar()] = append(w.vars[comp.IterVar()], each)
 	if comp.HasIterVar2() {
 		w.vars[comp.IterVar2()] = append(w.vars[comp.IterVar2()], nil)
 	}
@@ -644,8 +657,8 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 			x = xs[0]
 		}
 	case operators.Index:
-		own = 2
-		if len(xs) == 2 && xs[0].elem != nil && args[0].Kind() == ast.ListKind {
+		own, x = 2, anything
+		if len(xs) == 2 && xs[0].elem != nil && listing(args[0]) {
 			x = *xs[0].elem
 		}
 	case overloads.Matches:
@@ -657,12 +670,13 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 		if len(xs) != 2 {
 			return unbounded, x
 		}
-		switch t := w.checked.GetType(args[1].ID()).Kind(); {
+		// Finding x in a map reads x, and in anything else what it is found in.
+		switch {
 		case fn != operators.In:
 			own = cost.SafeAdd(1, min(xs[0].value, xs[1].value))
-		case t == types.MapKind:
+		case args[1].Kind() == ast.MapKind:
 			own = cost.SafeAdd(1, xs[0].value)
-		case t == types.ListKind:
+		case listing(args[1]):
 			own = cost.SafeAdd(1, xs[1].value)
 		default:
 			own = cost.SafeAdd(1, max(xs[0].value, xs[1].value))
@@ -673,9 +687,8 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 		for _, a := range xs {
 			own = cost.SafeAdd(own, a.text)
 		}
-		if t := w.checked.GetType(e.ID()); fn == operators.Add && len(xs) == 2 &&
-			(t.Kind() == types.ListKind || t.Kind() == types.StringKind || t.Kind() == types.BytesKind) {
-			x = added(t, xs[0], xs[1])
+		if fn == operators.Add && len(xs) == 2 {
+			x = added(xs[0], xs[1])
 		}
 	case overloads.TimeGetFullYear, overloads.TimeGetMonth, overloads.TimeGetDayOfYear, overloads.TimeGetDate,
 		overloads.TimeGetDayOfMonth, overloads.TimeGetDayOfWeek, overloads.TimeGetHours, overloads.TimeGetMinutes,
@@ -684,34 +697,58 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 			own = zoneCost
 		}
 	case overloads.StartsWith, overloads.EndsWith:
-		// CEL charges a tenth of the prefix's characters, rounded up.
+		// CEL charges a tenth of the prefix's size, rounded up.
 		if len(xs) == 2 {
-			own = cost.SafeAdd(xs[1].bytes/10, 1)
+			own = cost.SafeAdd(sized(xs[1])/10, 1)
 		}
 	case overloads.Contains:
-		// And a tenth of each string's characters, multiplied.
+		// And a tenth of each one's size, multiplied.
 		if len(xs) == 2 {
-			own = cost.SafeMultiply(cost.SafeAdd(xs[0].bytes/10, 1), cost.SafeAdd(xs[1].bytes/10, 1))
+			own = cost.SafeMultiply(cost.SafeAdd(sized(xs[0])/10, 1), cost.SafeAdd(sized(xs[1])/10, 1))
 		}
 	}
 	return cost.SafeAdd(n, own), x
 }
 
-// added is the most what adding x and y makes can be, of type t: a list of both's elements, or a
-// string or bytes of both's.
-func added(t *types.Type, x, y extent) extent {
-	switch t.Kind() {
-	case types.ListKind:
-		return extent{value: cost.SafeAdd(x.value, y.value), text: 1, length: cost.SafeAdd(x.length, y.length), elem: x.union(y).elem}
-	case types.StringKind, types.BytesKind:
-		if b := cost.SafeAdd(x.bytes, y.bytes); b != unbounded {
-			return extent{value: 1 + b/10, text: 1 + b/10, bytes: b}
-		}
-		return anything
-	default:
-		return anything
+// added is the most what adding x and y makes can be, whatever their types, as CEL may check a sum
+// as of another type than it is (typed): a list of both's elements, a string or bytes of both's, or
+// a number or a time.
+func added(x, y extent) extent {
+	return extent{
+		value: cost.SafeAdd(x.value, y.value), text: cost.SafeAdd(x.text, y.text),
+		length: cost.SafeAdd(x.length, y.length), bytes: cost.SafeAdd(x.bytes, y.bytes), elem: x.union(y).elem,
 	}
 }
+
+// listing reports whether e is a list when it runs, or what neither an index nor `in` reads, as a sum
+// of strings, whatever CEL checks it as (typed): a list literal, one map() or filter() makes, a sum,
+// or a dyn() or a choice of those.
+func listing(e ast.Expr) bool {
+	switch e.Kind() {
+	case ast.ListKind:
+		return true
+	case ast.ComprehensionKind:
+		return e.AsComprehension().AccuInit().Kind() == ast.ListKind
+	case ast.CallKind:
+		args := e.AsCall().Args()
+		switch e.AsCall().FunctionName() {
+		case operators.Add:
+			return true
+		case "dyn":
+			return len(args) == 1 && listing(args[0])
+		case operators.Conditional:
+			return len(args) == 3 && listing(args[1]) && listing(args[2])
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+}
+
+// sized is what CEL counts as the size of a value x bounds: a string's characters, no more than its
+// bytes, or a list's or a map's elements, as where it reads a dyn() value as a string.
+func sized(x extent) uint64 { return max(x.bytes, x.length) }
 
 // comparing is what comparing x with y, or finding x in y, reads, counted no further than past
 // maxCost. Comparing stops at the smaller value; a map finds a key without reading the rest.

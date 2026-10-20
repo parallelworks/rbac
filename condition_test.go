@@ -669,6 +669,12 @@ func TestAConditionCostsNoMoreThanItsBound(t *testing.T) {
 		{`request.attributes.tags.map(t, "gpu").exists(t, t == "gpu")`, false},
 		{`["a", "b"].map(x, request.attributes.team).exists(t, t.contains("s"))`, false},
 		{`request.attributes.tags.filter(t, t != "").exists(t, t == "gpu")`, false},
+		// CEL checks a dyn() value that meets another as of the other's type, which it needn't have.
+		{`(dyn([{"a": 1}]) + [[]]).exists(m, request.attributes.n in m)`, false},
+		{`(dyn([request.attributes.tags]) + [1])[0] == request.attributes.tags`, false},
+		{`(dyn([{"a": request.attributes.tags}]) + [{"a": 1}]).exists(m, m.a == request.attributes.tags)`, false},
+		{`(dyn([[request.attributes.tags]]) + [""]).exists(s, s + s == request.attributes.tags)`, false},
+		{"[[" + strings.Repeat("0, ", 499) + "0]].all(l, dyn(l).contains(dyn(l)))", false},
 	} {
 		for i, attributes := range requests {
 			limit, actual := rbac.ConditionCost(t, c.expr, attributes)
