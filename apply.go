@@ -332,23 +332,18 @@ func (a *Authorizer) authorityOr(ctx context.Context, q DB, actor Subject, on Re
 	return a.authorityOn(ctx, q, actor, on, roles)
 }
 
-// labelAllows is cleared, reading the actor's label values through labels, or where nil, cs on the
-// tenant.
+// labelAllows refuses, as a DeniedError of p, a change on a scope whose label the actor's holding,
+// read on q, doesn't satisfy, asking the constraints about its values through labels, or where nil,
+// through cs on the tenant: before the change's transaction, and again under its locks, which reads
+// their answers back.
 func (a *Authorizer) labelAllows(ctx context.Context, q DB, on Resource, cs, labels *constrained, p Permission) error {
-	if labels == nil {
-		return a.cleared(ctx, q, on, cs, p)
-	}
-	return a.labelCheck(ctx, q, labels)(on, p)
-}
-
-// cleared refuses, as a DeniedError of p, a change on a scope whose label the actor's holding,
-// read on q, doesn't satisfy, asking the constraints about its values on the tenant through cs:
-// before the change's transaction, and again under its locks, which reads their answers back.
-func (a *Authorizer) cleared(ctx context.Context, q DB, on Resource, cs *constrained, p Permission) error {
 	if !on.Labels.asks() {
 		return nil
 	}
-	return a.labelCheck(ctx, q, cs.ofTenant())(on, p)
+	if labels == nil {
+		labels = cs.ofTenant()
+	}
+	return a.labelCheck(ctx, q, labels)(on, p)
 }
 
 // labelCheck returns a check refusing, as a DeniedError of p, a change on a resource whose label
@@ -608,7 +603,7 @@ func keyOf(b Binding) grantKey {
 	return grantKey{b.Role, b.Principal, b.Source, expires, b.Condition.Expression}
 }
 
-// validate checks the bindings against the roles mayChange read, and asks the host about each
+// validate checks the bindings against the roles grantsAllowed read, and asks the host about each
 // grant otherwise valid.
 func (a *Authorizer) validate(ctx context.Context, roles book, actor Subject, via Via, tenant string, scope Scope, grants, revokes []Binding) error {
 	var errs []error
@@ -1276,11 +1271,18 @@ func (c *checked) drop(mark int) {
 	c.order = c.order[:mark]
 }
 
-// grantAsked is a grant as mayChange decides it: its role, under a condition, until a time.
+// grantAsked is a grant as mayChangeBy decides it: its role, under a condition, until a time.
 type grantAsked struct {
 	role      Role
 	condition string
 	until     time.Time
+}
+
+// grantDecided is what mayGrant decided of a grantAsked: whether the actor may grant it, and if
+// not, a permission it lacks.
+type grantDecided struct {
+	lacks Permission
+	ok    bool
 }
 
 // mayChangeBy checks the actor's own access on the scope against the change, by au, its authority
@@ -1304,7 +1306,7 @@ func (a *Authorizer) mayChangeBy(au authority, on Resource, grants, revokes []Bi
 	// change granting it to many would walk what it lists for each; and what a grant allowed proved
 	// holds for the others, as Grantable keeps it: a refused one's checks are dropped, as some passed
 	// only while it was in progress.
-	lacks, proven := map[grantAsked]Permission{}, newChecked()
+	decisions, proven := map[grantAsked]grantDecided{}, newChecked()
 	for _, b := range grants {
 		def, known := au.roles.role(b.Role)
 		if !known || !a.grantableOn(def, scope.Type) {
@@ -1312,16 +1314,15 @@ func (a *Authorizer) mayChangeBy(au authority, on Resource, grants, revokes []Bi
 			continue
 		}
 		k := grantAsked{role: b.Role, condition: b.Condition.Expression, until: b.ExpiresAt.UTC()}
-		p, decided := lacks[k]
+		d, decided := decisions[k]
 		if !decided {
 			mark := proven.mark()
-			var ok bool
-			if p, ok = a.mayGrant(au, pw, scope.Type, def, b.Condition.Expression, b.ExpiresAt, proven); !ok {
+			if d.lacks, d.ok = a.mayGrant(au, pw, scope.Type, def, b.Condition.Expression, b.ExpiresAt, proven); !d.ok {
 				proven.drop(mark)
 			}
-			lacks[k] = p
+			decisions[k] = d
 		}
-		if p != "" {
+		if p := d.lacks; !d.ok {
 			reason := cs.refusal("grant "+string(b.Role), p, fmt.Sprintf("the actor can't grant %s without holding %s here", b.Role, p))
 			switch {
 			case !pw.any && len(pw.listed[b.Role]) > 0:
