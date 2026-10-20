@@ -706,19 +706,22 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 	for i, id := range ids {
 		principals[i], scopes[i] = groupPrincipal(id).key(), groupKey(id)
 	}
-	// The group's grants, and those on the group, as its managers', which would pass to a group
-	// made later with its id.
-	const ofGroups = "(principal = ANY($2::text[]) OR scope = ANY($3::text[]))"
 	// DeleteScopes and DeletePrincipal hold other scopes' and principals' locks and change some of
 	// these rows too, so each table is changed in the order delete changes them, grants last, and
-	// the rows changed in it are locked in order first: otherwise they would deadlock.
-	if err := lockInOrder(ctx, tx, "rbac_eligibilities", bindingOrder, "("+ofGroups+" OR approvers && $2::text[])",
-		tenant, principals, scopes); err != nil {
+	// the rows changed in it are locked in order first: otherwise they would deadlock. Each is found
+	// by key on its own (byKeys), or by the keys it names (naming), and deleted by key: ORed, the
+	// conditions are none an index seeks, and beside tenant = $1 a generic plan, costing the tenant
+	// as an average tenant's few rows, finds them by reading every row in the tenant. The
+	// eligibilities of the groups and on them, as their managers', which would pass to a group made
+	// later with an id of theirs, and those they approve.
+	if err := lockByKeys(ctx, tx, "rbac_eligibilities", "id", bindingOrder, []string{"principal", "scope"},
+		[]string{"SELECT id FROM rbac_eligibilities WHERE " + naming("approvers", "$2")}, tenant, principals, scopes); err != nil {
 		return ChangeEvent{}, err
 	}
 	now := a.cfg.Now()
 	var err error
-	if e.Ineligible, err = a.removeEligible(ctx, tx, tenant, ofGroups, principals, scopes); err != nil {
+	if e.Ineligible, err = removedWhere(ctx, a, tx, "rbac_eligibilities", eligibilityColumns, collectEligibilities,
+		lockedByKeys("rbac_eligibilities", "id", bindingOrder, "principal", "scope"), tenant, principals, scopes); err != nil {
 		return ChangeEvent{}, err
 	}
 	unapproved, changed, err := a.unapprove(ctx, tx, tenant, principals)
@@ -726,16 +729,23 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 		return ChangeEvent{}, err
 	}
 	e.Ineligible, e.Eligible = append(e.Ineligible, unapproved...), changed
-	if err := lockInOrder(ctx, tx, "rbac_denies", denyOrder, "(scope = ANY($3::text[]) OR principals && $2::text[] OR exempt && $2::text[])",
-		tenant, principals, scopes); err != nil {
+	// The denies on the groups, and those that name or exempt them.
+	if err := lockDenies(ctx, tx, []string{
+		byKeys("rbac_denies", denyKey, "scope", "$2"),
+		"SELECT " + denyKey + " FROM rbac_denies WHERE " + naming("principals", "$3"),
+		"SELECT " + denyKey + " FROM rbac_denies WHERE " + naming("exempt", "$3"),
+	}, tenant, scopes, principals); err != nil {
 		return ChangeEvent{}, err
 	}
-	if e.DeletedDenies, err = removed(ctx, a, tx, "rbac_denies", denyColumns, collectDenies, tenant, "scope = ANY($2::text[])", scopes); err != nil {
+	if e.DeletedDenies, err = removedWhere(ctx, a, tx, "rbac_denies", denyColumns, collectDenies,
+		anyOf("ctid", byKeys("rbac_denies", "ctid", "scope", "$2")), tenant, scopes); err != nil {
 		return ChangeEvent{}, err
 	}
 	// A deny that names or exempts the groups would name or exempt a group made later with one's
-	// id: one naming only them denies no one, and goes.
-	unnamed, err := removed(ctx, a, tx, "rbac_denies", denyColumns, collectDenies, tenant, "principals <@ $2::text[]", principals)
+	// id: one naming only them denies no one, and goes. Each found by the keys it names, so it names
+	// one of them: none of them is empty.
+	unnamed, err := removedWhere(ctx, a, tx, "rbac_denies", denyColumns, collectDenies,
+		naming("principals", "$2")+" AND principals <@ $2::text[]", tenant, principals)
 	if err != nil {
 		return ChangeEvent{}, err
 	}
@@ -743,11 +753,8 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 	if e.Denies, err = unexempt(ctx, tx, tenant, actor, principals, true); err != nil {
 		return ChangeEvent{}, err
 	}
-	// The places in the groups and of them, and the grants of the groups and on them, are each found
-	// by key on its own, locked in order as inOrder and placesInOrder lock them, and deleted by key:
-	// ORed, the conditions are none an index seeks, and matched to the rows to delete in a join, or
-	// beside tenant = $1, a generic plan can find them by reading every row in the tenant. Places in
-	// groups have no id, so a ctid keys them: no change moves one meanwhile, as each takes its
+	// The places in the groups and of them, and the grants of the groups and on them, so too. Places
+	// in groups have no id, so a ctid keys them: no change moves one meanwhile, as each takes its
 	// group's lock or its principal's, which this change holds. The places are held before the
 	// activations resting on them are read.
 	if err := lockByKeys(ctx, tx, "rbac_members", "ctid", placeOrder, []string{"group_id", "principal"}, nil, tenant, ids, principals); err != nil {
@@ -819,6 +826,21 @@ func byKeys(table, key, col, keys string) string {
 func anyOf(key string, selects ...string) string {
 	return key + " = ANY(ARRAY(" + strings.Join(selects, " UNION ALL ") + "))"
 }
+
+// lockDenies locks, in tx, in order, the denies any of selects picks by their keys, a deny's
+// tenant, scope and id (denyKey), each looked up by its key on its own, for a change that changes
+// them in later statements, which can then find them by a ctid. A deny has no column of its own
+// that keys it, and its ctid moves as a change takes a principal out of its exemptions, which
+// takes no lock of its scope's: a lock by ctid that waited for that change would pass over it.
+// Matched to the denies in a semi-join instead, a plan can read the table whole.
+func lockDenies(ctx context.Context, tx pgx.Tx, selects []string, args ...any) error {
+	_, err := tx.Exec(ctx, `SELECT FROM (SELECT DISTINCT `+denyKey+` FROM (`+strings.Join(selects, " UNION ALL ")+`) u ORDER BY `+denyOrder+`) k
+		CROSS JOIN LATERAL (SELECT FROM rbac_denies d WHERE d.tenant = k.tenant AND d.scope = k.scope AND d.id = k.id FOR UPDATE) d`, args...)
+	return err
+}
+
+// denyKey is what keys a deny, in the order of denyOrder.
+const denyKey = "tenant, scope, id"
 
 // notOwnedGroups refuses, on q, changing groups from a source the host owns, which only it changes.
 func (a *Authorizer) notOwnedGroups(ctx context.Context, q DB, tenant string, ids []string) error {

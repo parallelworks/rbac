@@ -2242,13 +2242,6 @@ func scopesInOrder(table, key, order string) string {
 		" WHERE tenant = $1 AND scope = keyed.k ORDER BY " + order + " FOR UPDATE) r)"
 }
 
-// lockInOrder locks, in tx, the rows of table in tenant $1 that where picks, in order, for a
-// change that changes them in several statements.
-func lockInOrder(ctx context.Context, tx pgx.Tx, table, order, where string, args ...any) error {
-	_, err := tx.Exec(ctx, lockedInOrder(table, "", order, "tenant = $1 AND "+where), args...)
-	return err
-}
-
 // delete removes what del picks in a tenant as actor, by how, once lock holds.
 func (a *Authorizer) delete(ctx context.Context, actor Principal, tenant, how string, lock func(pgx.Tx) error, del deletion, args ...any) error {
 	if !validID(tenant) {
