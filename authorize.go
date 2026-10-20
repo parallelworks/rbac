@@ -1189,11 +1189,11 @@ func (a *Authorizer) grantCounts(ctx context.Context, custom, container bool, ar
 	}
 	onResources := "0"
 	if !container {
-		onResources = fmt.Sprintf(`(SELECT count(*) FROM (%s LIMIT %d) g)`, filterGrants(arg, custom, "ARRAY["+arg(9)+"::text]"), maxContainerOverlap+1)
+		onResources = fmt.Sprintf(`(SELECT count(*) FROM (%s LIMIT %d) g)`, filterGrants(arg, custom, "ARRAY["+arg(9)+"::text]"), maxOverlap+1)
 	}
 	// The containers' and the tenant's are of the types Filter reads denies on by each key (16).
 	query := fmt.Sprintf(`SELECT %s, (SELECT count(*) FROM (%s LIMIT %d) g)`,
-		onResources, filterGrants(arg, custom, arg(16)), maxContainerOverlap+1)
+		onResources, filterGrants(arg, custom, arg(16)), max(maxOverlap, maxContainerOverlap)+1)
 	err = a.db.QueryRow(ctx, query, read...).Scan(&resources, &containers)
 	return resources, containers, err
 }

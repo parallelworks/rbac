@@ -821,6 +821,32 @@ func TestFilterIsFormedByTheGrantsItCounts(t *testing.T) {
 	})
 }
 
+// Lowering how many grants on containers Filter overlaps, as a test does to compare the forms it
+// takes past that, leaves a subject with many grants on resources of the type and none on
+// containers looking those up in a hash: counted only as far as the lowered bound, they never
+// passed the few the hash takes.
+func TestLoweringTheContainerBoundKeepsTheHashOfGrantsOnResources(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE fleet (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	var grants []rbac.Grant
+	for i := range 9 {
+		grants = append(grants, grant(rbac.Scope{Type: "cluster", ID: fmt.Sprint("x", i)}, "cluster.login", rbac.User, "ann"))
+	}
+	h.seed(t, grants...)
+	ann := h.as(t, "ann")
+	rbac.SetMaxContainerOverlap(t, 0)
+	pred, err := h.authz.Filter(ctx, ann, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hashing(ctx, t, h, "rbac_grants", "SELECT count(*) FROM fleet WHERE "+pred.SQL, pred.Args...)) == 0 {
+		t.Error("with SetMaxContainerOverlap(0), Filter doesn't look 9 grants on clusters up in a hash")
+	}
+}
+
 func TestListingContainersUnderOthersOfTheirType(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
