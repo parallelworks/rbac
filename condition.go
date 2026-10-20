@@ -33,9 +33,11 @@ import (
 //	action                                                    // the permission asked for
 //
 // such as `request.time < timestamp("2027-01-01T00:00:00Z") && resource.attributes.env != "prod"`.
-// A grant with one gives its role only where the expression is true. An expression that fails,
-// as one reading an attribute the host didn't pass does, or comparing a double that isn't finite,
-// as dividing by zero makes, is false. The zero Condition is none, and one with a title or
+// A grant with one gives its role only where the expression is true. An expression that fails, as
+// one reading an attribute the host didn't pass does, or comparing a double that isn't finite, as
+// dividing by zero makes, is false. A label value and a power to release are decided on the tenant
+// with no attributes, whatever a check passes (Holding), so there resource.attributes is empty, and
+// one reading an attribute of it fails. The zero Condition is none, and one with a title or
 // description has an expression. A pattern it matches is a string literal, of bounded size; it
 // nests at most 32 deep; and a comparison, or a search of a list, that would read more than a
 // condition may spend fails before it runs.

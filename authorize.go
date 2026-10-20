@@ -53,6 +53,7 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 	if err != nil || !d.Allowed {
 		return d, err
 	}
+	r = a.decidedOn(p, r)
 	value, exclusive := a.exclusiveValue(p)
 	if !exclusive && !r.Labels.asks() {
 		return d, nil
@@ -85,6 +86,8 @@ func (a *Authorizer) decideGrants(ctx context.Context, s Subject, p Permission, 
 	if err := a.subject(s); err != nil {
 		return Decision{}, err
 	}
+	// Checked as passed, and decided as a labeled check decides it.
+	r = a.decidedOn(p, r)
 	name, err := a.denied(ctx, ConstraintInput{Tenant: r.Tenant, ResourceType: r.Type, Permission: p, Subject: &s, Resource: &r})
 	if err != nil {
 		return Decision{}, err
@@ -268,11 +271,18 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 	if err := a.subject(s); err != nil {
 		return nil, err
 	}
-	// A label the subject doesn't satisfy leaves it nothing, whatever its grants give.
-	if dim, err := a.unsatisfied(ctx, s, r); err != nil || dim != "" {
+	// A label the subject doesn't satisfy leaves it nothing, whatever its grants give, but on the
+	// tenant the label values and powers to release it holds, which no label of the tenant's decides
+	// (decidedOn).
+	dim, err := a.unsatisfied(ctx, s, r)
+	if err != nil || dim != "" && r.Type != TenantScope {
 		return nil, err
 	}
-	perms, _, excluded, err := a.permissionsOf(ctx, a.db, s, r, nil, a.constrain(ctx, s, r))
+	var only func(Permission) bool
+	if dim != "" {
+		only = a.labelPermission
+	}
+	perms, _, excluded, err := a.permissionsOf(ctx, a.db, s, r, only, a.constrain(ctx, s, r))
 	if err != nil {
 		return nil, err
 	}
@@ -284,7 +294,8 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 // or a constraint asked without the request's attributes, which a read without the request can't
 // settle; and the exclusive dimensions s holds none of, as its grants on the tenant could give it
 // two (excludedBy). It reads on q, and asks the constraints through cs, which is on r, so a change
-// reads them back in its transaction.
+// reads them back in its transaction; about a label value or a power to release on a tenant passed
+// with attributes, ancestors or a label, through cs.ofTenant(), as decidedOn decides it.
 func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resource, only func(Permission) bool, cs *constrained,
 ) ([]Permission, map[Permission]bool, map[string]bool, error) {
 	kept := func(p Permission) bool { return only == nil || only(p) }
@@ -312,18 +323,36 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 			}
 		}
 	}
+	// Each permission is decided as Authorize would decide it, on r as decidedOn makes it, on
+	// budgets of its own, which share what conditions came to there: one that doesn't read the
+	// action runs once for them all.
+	type deciding struct {
+		vars map[string]any
+		ran  map[string]run
+		cs   *constrained
+	}
+	resource := &deciding{a.vars(ctx, s, "", r), map[string]run{}, cs}
+	values := resource
+	if r.Type == TenantScope && len(a.labels) > 0 && !bare(r) {
+		values = &deciding{a.vars(ctx, s, "", tenantResource(r.Tenant)), map[string]run{}, cs.ofTenant()}
+	}
+	on := func(p Permission) *deciding {
+		if a.labelPermission(p) {
+			return values
+		}
+		return resource
+	}
 	// What a constraint removes is settled first, so no budget is spent on conditions for it.
 	removed := map[Permission]bool{}
 	isRemoved := func(p Permission) (bool, error) {
+		cs := on(p).cs
 		removed[p] = cs.removes(p, r.Type)
 		return removed[p], cs.failed()
 	}
-	// Each permission is decided as Authorize would decide it, on budgets of its own, which share
-	// what conditions came to: one that doesn't read the action runs once for them all.
-	vars, spends, ran := a.vars(ctx, s, "", r), map[Permission]*budget{}, map[string]run{}
+	spends := map[Permission]*budget{}
 	spendOn := func(p Permission) *budget {
 		if spends[p] == nil {
-			spends[p] = a.grantBudget(r.path()).sharing(ran)
+			spends[p] = a.grantBudget(r.path()).sharing(on(p).ran)
 		}
 		return spends[p]
 	}
@@ -334,8 +363,9 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 		if d, ok := denied[p]; ok {
 			return d
 		}
+		vars := on(p).vars
 		vars["action"] = string(p)
-		d, ok := a.deniedBy(ds, p, newDenyBudget(r.path()).sharing(ran), vars)
+		d, ok := a.deniedBy(ds, p, newDenyBudget(r.path()).sharing(on(p).ran), vars)
 		denied[p], always[p] = ok, ok && d.condition == ""
 		return ok
 	}
@@ -376,6 +406,7 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 			}
 			byCondition[p] = true
 			// A condition reads the action, so it is evaluated for each permission.
+			vars := on(p).vars
 			vars["action"] = string(p)
 			given[p] = a.conds.holds(spendOn(p), h.Condition.Expression, vars)
 		}
@@ -450,6 +481,7 @@ func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]H
 	if err := a.askable(p, r.Type); err != nil {
 		return nil, err
 	}
+	r = a.decidedOn(p, r)
 	removed, err := a.denied(ctx, ConstraintInput{Tenant: r.Tenant, ResourceType: r.Type, Permission: p, Resource: &r})
 	if err != nil {
 		return nil, err

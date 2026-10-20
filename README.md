@@ -109,19 +109,24 @@ names the scopes conditional ones reach, to check one by one.
   gives what only privileged roles do, or changes access.
 - **Labels on data:** a mandatory layer above every grant. A host declares label dimensions
   (`Config.Labels`), each `Ordered` (a level), `AllOf` (compartments) or `AnyOf` (releasable to
-  these partners), and a resource carries its label (`Resource.Labels`), stored with it as its
-  path is. A subject holds a dimension's values as permissions, `dimension:value`, which roles for
-  the tenant give, so groups, eligibilities, expiry, conditions, denies on the tenant and history
-  all apply to them. `Authorize`, `Explain`, `Permissions`, `Holders` and `Grantable` allow
-  nothing of a labeled resource unless what the subject holds satisfies the label, whatever its
-  grants give, nor do `Apply`, `SetEligibility` and `DeleteEligibility` change its grants, nor
-  `SetDeny` and `DeleteDeny` its denies, nor `SetRole` and `DeleteRole` the grants of a role on it,
-  nor `ChangeMembers` the members of a labeled group, or of one holding access or exempt from a deny
-  on a labeled scope, nor `SetGroup` and `DeleteGroup` a labeled group or the groups of a labeled
-  tenant, each reading the actor's values again under the change's locks; `Explain` names the
-  dimension that failed. `Filter` tests a `text[]` label column (`Columns.Labels`), which needs no
-  index, as the path's drives the query; `Reachable` returns the holding, and `Holding` with
-  `Satisfies` checks data points in a feed without reading the database.
+  these partners), and a resource carries its label (`Resource.Labels`), stored with it as its path
+  is. A subject holds a dimension's values as permissions, `dimension:value`, which roles for the
+  tenant give, so groups, eligibilities, expiry, conditions, denies on the tenant and history all
+  apply to them. Every check decides them, and the powers to release, on the tenant with no
+  attributes or label, whatever tenant it is passed, as a check of a labeled resource reads them: a
+  condition of theirs reads the tenant's type and id alone, so one reading `resource.attributes`
+  gives nothing and a deny's applies, and a constraint is asked about that bare tenant, so one
+  deciding them by the tenant's state reads it through its `q`. `Authorize`, `Explain`,
+  `Permissions`, `Holders` and `Grantable` allow nothing of a labeled resource unless what the
+  subject holds satisfies the label, whatever its grants give, nor do `Apply`, `SetEligibility` and
+  `DeleteEligibility` change its grants, nor `SetDeny` and `DeleteDeny` its denies, nor `SetRole`
+  and `DeleteRole` the grants of a role on it, nor `ChangeMembers` the members of a labeled group,
+  or of one holding access or exempt from a deny on a labeled scope, nor `SetGroup` and
+  `DeleteGroup` a labeled group or the groups of a labeled tenant, each reading the actor's values
+  again under the change's locks; `Explain` names the dimension that failed. `Filter` tests a
+  `text[]` label column (`Columns.Labels`), which needs no index, as the path's drives the query;
+  `Reachable` returns the holding, and `Holding` with `Satisfies` checks data points in a feed
+  without reading the database.
 - **Writing labeled data:** data read under one label is written under another only if
   `Holding.MayWrite` allows it: the writer satisfies the label it read, and the new one is at
   least as restrictive in every dimension (a level as high, every compartment kept, partners

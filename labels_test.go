@@ -990,3 +990,75 @@ func TestHoldersMarksAHolderAConstraintMayRemoveALabelValueFrom(t *testing.T) {
 		t.Fatalf("Holders = %+v, %v", holders, err)
 	}
 }
+
+// A subject's label values are decided on the tenant as Holding reads them for every labeled check,
+// without the attributes or label a check passes with the tenant, for conditions and constraints
+// alike: so a check of a value, Explain, Permissions and Holders agree with a check of a label.
+func TestALabelValueIsDecidedOnTheTenantAsALabeledCheckReadsIt(t *testing.T) {
+	var asked []rbac.Resource
+	h := labeled(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "lockdown", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if in.Permission != "level:high" || in.Resource == nil {
+				return false, nil
+			}
+			asked = append(asked, *in.Resource)
+			// Clearances frozen while the tenant is locked down.
+			return in.Resource.Attributes["lockdown"] == true, nil
+		}}}
+	})
+	ctx := t.Context()
+	h.hold(t, "ann", "level:high")
+	cleared := grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "bob")
+	cleared.Condition = rbac.Condition{Expression: `resource.attributes.cleared == true`}
+	h.seed(t, cleared, grant(rbac.TenantRoot("t1"), "tenant.admin", rbac.User, "ann"),
+		grant(cluster.Scope(), "cluster.login", rbac.User, "ann"), grant(cluster.Scope(), "cluster.login", rbac.User, "bob"))
+	ann, bob := h.as(t, "ann"), h.as(t, "bob")
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	tenants := map[string]rbac.Resource{
+		"locked down": {Tenant: "t1", Type: rbac.TenantScope, ID: "t1", Attributes: map[string]any{"lockdown": true}},
+		"cleared":     {Tenant: "t1", Type: rbac.TenantScope, ID: "t1", Attributes: map[string]any{"cleared": true}},
+		"labeled":     {Tenant: "t1", Type: rbac.TenantScope, ID: "t1", Labels: rbac.Label{"comp": {"alpha"}}},
+	}
+	for name, tenant := range tenants {
+		for _, s := range []rbac.Subject{ann, bob} {
+			holding, err := h.authz.Holding(ctx, "t1", s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			held := slices.Contains(holding.Values(), "level:high")
+			if held != (s.Principal == ann.Principal) || allowed(t, h, s, view, secret) != held {
+				t.Fatalf("%s: Holding %v, and a check of the label disagrees", s.Principal.ID, holding.Values())
+			}
+			if allowed(t, h, s, "level:high", tenant) != held {
+				t.Errorf("%s, %s: Authorize of the value allows it: %v, though Holding holds it: %v", name, s.Principal.ID, !held, held)
+			}
+			d, err := h.authz.Explain(ctx, s, "level:high", tenant)
+			if err != nil || d.Allowed != held {
+				t.Errorf("%s, %s: Explain = %+v, %v", name, s.Principal.ID, d, err)
+			}
+			perms, err := h.authz.Permissions(ctx, s, tenant)
+			if err != nil || slices.Contains(perms, "level:high") != held {
+				t.Errorf("%s, %s: Permissions = %v, %v", name, s.Principal.ID, perms, err)
+			}
+		}
+		holders, err := h.authz.Holders(ctx, "level:high", tenant)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i := slices.IndexFunc(holders, func(x rbac.Holder) bool { return x.Principal == ann.Principal }); i < 0 || holders[i].MaybeDenied {
+			t.Errorf("%s: Holders = %+v", name, holders)
+		}
+	}
+	if i := slices.IndexFunc(asked, func(r rbac.Resource) bool { return len(r.Attributes) > 0 || len(r.Labels) > 0 }); i >= 0 {
+		t.Errorf("a constraint was asked about a label value on the tenant as passed: %+v", asked[i])
+	}
+	// The tenant's other permissions are decided on it as passed.
+	if allowed(t, h, ann, "tenant:view", tenants["labeled"]) {
+		t.Error("the tenant's label no longer binds its other permissions")
+	}
+	perms, err := h.authz.Permissions(ctx, ann, tenants["labeled"])
+	if err != nil || !slices.Equal(perms, []rbac.Permission{"level:high"}) {
+		t.Errorf("Permissions on the labeled tenant = %v, %v", perms, err)
+	}
+}

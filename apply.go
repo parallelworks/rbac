@@ -887,7 +887,7 @@ func (c *constrained) seal() {
 // ofTenant is what the constraints remove from the actor on its tenant, sealed as c is.
 func (c *constrained) ofTenant() *constrained {
 	if c.tenant == nil {
-		c.tenant = c.a.constrain(c.ctx, c.actor, Resource{Tenant: c.on.Tenant, Type: TenantScope, ID: c.on.Tenant})
+		c.tenant = c.a.constrain(c.ctx, c.actor, tenantResource(c.on.Tenant))
 		c.tenant.sealed = c.sealed
 	}
 	return c.tenant

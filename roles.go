@@ -268,7 +268,7 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 	if err := a.subject(actor); err != nil {
 		return err
 	}
-	root := Resource{Tenant: tenant, Type: TenantScope, ID: tenant}
+	root := tenantResource(tenant)
 	// Whether the actor may define roles at all, before the definition, so a refused actor
 	// learns nothing of the catalog from what is invalid.
 	if _, err := a.mayDefineRoles(ctx, actor, root); err != nil {
@@ -405,7 +405,7 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 	if err := a.subject(actor); err != nil {
 		return err
 	}
-	root := Resource{Tenant: tenant, Type: TenantScope, ID: tenant}
+	root := tenantResource(tenant)
 	au, err := a.mayDefineRoles(ctx, actor, root)
 	if err != nil {
 		return err
@@ -669,7 +669,7 @@ func (a *Authorizer) labelsAllow(ctx context.Context, actor Subject, tenant stri
 	if err != nil {
 		return labeling{}, err
 	}
-	l := labeling{scopes: scopes, cs: a.constrain(ctx, actor, Resource{Tenant: tenant, Type: TenantScope, ID: tenant})}
+	l := labeling{scopes: scopes, cs: a.constrain(ctx, actor, tenantResource(tenant))}
 	for _, s := range scopes {
 		on, err := a.resourceOf(ctx, tenant, s)
 		switch {
