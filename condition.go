@@ -43,10 +43,13 @@ import (
 // tenant's members and the public, which reach many, as much again; those of a scope's denies
 // (SetDeny); and the requirements of the eligibilities of groups for a role on a scope. Each
 // distinct condition counts once, as what compiling it and evaluating it to its bound cost: about
-// seven short ones, or three of the longest. A change past one is refused, so no grant, deny or
-// eligibility stored changes what the others decide. A condition stored around them a check may
-// not reach: it evaluates the cheapest first, and past its budget a grant's condition is false and
-// a deny's applies.
+// seven short ones, or three of the longest. A check of a labeled resource decides each of the
+// subject's label values as a check of it would, and evaluates a condition that doesn't read the
+// action once for them all, so on the tenant one that does counts once for each label value its
+// grants give or its denies deny. A change past one is refused, so no grant, deny or eligibility
+// stored changes what the others decide. A condition stored around them, as on a custom role
+// widened since, a check may not reach: it evaluates the cheapest first, and past its budget a
+// grant's condition is false and a deny's applies.
 //
 // Searches (Filter, Reachable, Holders) can't evaluate one: Filter and Reachable count only
 // unconditional grants, Filter counts a conditional deny as denying, and Reach.Conditional and
@@ -99,10 +102,28 @@ type budget struct {
 	exhausted bool
 	compiled  map[string]bool
 	decided   map[string]decision
+	// ran is what conditions came to, evaluated on the same request but for its action, which a
+	// listing's budgets for each permission share: each pays for a condition as if it evaluated it,
+	// so it decides as a check of its permission would, but one that doesn't read the action runs
+	// once for them all.
+	ran map[string]run
 }
 
 // decision is what evaluating a condition decided.
 type decision struct{ held, evaluated bool }
+
+// run is what evaluating a condition came to, and what it cost.
+type run struct {
+	held, evaluated bool
+	cost            uint64
+}
+
+// sharing is b, which shares what conditions came to with the budgets of others, ran, on the same
+// request but for its action.
+func (b *budget) sharing(ran map[string]run) *budget {
+	b.ran = ran
+	return b
+}
 
 // newGrantBudget is a check's budget for its grants' conditions on a path of scopes: the subject's
 // own on a scope and those of the scope's grants that reach many each cost at most maxCheckCost
@@ -117,22 +138,29 @@ func newGrantBudget(path []string) *budget { return budgetOf(uint64(len(path)) *
 func newDenyBudget(path []string) *budget { return budgetOf(uint64(len(path)) * maxCheckCost) }
 
 func budgetOf(left uint64) *budget {
-	return &budget{left: left, compiled: map[string]bool{}, decided: map[string]decision{}}
+	return &budget{left: left, compiled: map[string]bool{}, decided: map[string]decision{}, ran: map[string]run{}}
 }
 
-// worstCost is the most a condition can cost a check: compiling it, and evaluating it to its bound.
-func worstCost(expr string) uint64 { return uint64(len(expr))*compilePerByte + maxCost }
-
-// affordable reports whether a check can evaluate the conditions exprs whole, each distinct one
-// once, within maxCheckCost.
-func affordable(exprs []string) bool {
+// affordable reports whether a check can evaluate conditions whole within maxCheckCost, each the
+// most it can cost: compiling it once, and evaluating it to its bound as many times as evaluations
+// has it, and at least once.
+func affordable(evaluations map[string]int) bool {
 	var cost uint64
-	for _, e := range slices.Compact(slices.Sorted(slices.Values(exprs))) {
-		if e != "" {
-			cost += worstCost(e)
-		}
+	for e, n := range evaluations {
+		cost += uint64(len(e))*compilePerByte + maxCost*uint64(max(n, 1))
 	}
 	return cost <= maxCheckCost
+}
+
+// once is each of exprs evaluated once, as a check of one permission evaluates them.
+func once(exprs []string) map[string]int {
+	evaluations := map[string]int{}
+	for _, e := range exprs {
+		if e != "" {
+			evaluations[e] = 1
+		}
+	}
+	return evaluations
 }
 
 // cheapestFirst sorts xs in the order checks evaluate their conditions, which expression reads: by
@@ -167,6 +195,8 @@ type conditions struct {
 type program struct {
 	cel.Program
 	typed error
+	// readsAction is whether it reads the action, or might, so it can decide apart for each.
+	readsAction bool
 }
 
 func newConditions(attrs Attributes) (*conditions, error) {
@@ -257,12 +287,12 @@ func (c *conditions) build(expr string) (program, error) {
 	if err != nil {
 		return program{}, fmt.Errorf("%w: %w", errCondition, err)
 	}
-	run, err := c.env.Program(checked, cel.CostLimit(maxCost), cel.CostTracking(costs{patterns}),
+	prg, err := c.env.Program(checked, cel.CostLimit(maxCost), cel.CostTracking(costs{patterns}),
 		cel.OptimizeRegex(matching(patterns)), cel.CustomDecorator(bounded))
 	if err != nil {
 		return program{}, fmt.Errorf("%w: %w", errCondition, err)
 	}
-	return program{Program: run, typed: c.typeCheck(expr)}, nil
+	return program{Program: prg, typed: c.typeCheck(expr), readsAction: reading(checked.NativeRep(), "action")}, nil
 }
 
 // typeCheck returns why expr doesn't check against the declared attributes: it reads one they
@@ -624,7 +654,31 @@ func (c *conditions) decide(b *budget, expr string, vars map[string]any) (held, 
 	if err != nil || prg.typed != nil {
 		return false, false
 	}
+	ranKey := expr
+	if prg.readsAction {
+		ranKey = key
+	}
+	r, ok := b.ran[ranKey]
+	if !ok {
+		r = evaluate(prg, vars)
+		b.ran[ranKey] = r
+	}
 	left := b.left
+	b.spend(r.cost)
+	// One that cost more than was left is past the budget too.
+	if r.cost > left {
+		b.exhausted = true
+		return false, false
+	}
+	return r.held, r.evaluated
+}
+
+// evaluating runs as a condition is evaluated, as a test's counter.
+var evaluating = func() {}
+
+// evaluate runs a condition's program on a request.
+func evaluate(prg program, vars map[string]any) run {
+	evaluating()
 	out, details, err := prg.Eval(vars)
 	// One stopped at its limit costs at most that, past the call that took it there, so a single
 	// condition can't spend what the check's others need.
@@ -632,30 +686,31 @@ func (c *conditions) decide(b *budget, expr string, vars map[string]any) (held, 
 	if details != nil && details.ActualCost() != nil {
 		cost = min(*details.ActualCost(), maxCost)
 	}
-	b.spend(cost)
-	// One that cost more than was left is past the budget too.
-	if cost > left {
-		b.exhausted = true
-	}
-	if err != nil || cost > left {
-		return false, false
+	if err != nil {
+		return run{cost: cost}
 	}
 	ok, isBool := out.Value().(bool)
-	return isBool && ok, isBool
+	return run{held: isBool && ok, evaluated: isBool, cost: cost}
 }
 
 // parsing parses conditions for what they read, which needs no declarations.
 var parsing, _ = cel.NewEnv()
 
 // readsSubject reports whether expr reads the subject, or might: one that doesn't parse might.
-func readsSubject(expr string) bool {
+func readsSubject(expr string) bool { return reads(expr, "subject") }
+
+// reads reports whether expr reads the variable name, or might: one that doesn't parse might.
+func reads(expr, name string) bool {
 	parsed, iss := parsing.Parse(expr)
-	if iss.Err() != nil {
-		return true
-	}
-	// `.subject` names it from the root, as `subject` does.
-	return len(ast.MatchDescendants(ast.NavigateAST(parsed.NativeRep()), func(e ast.NavigableExpr) bool {
-		return e.Kind() == ast.IdentKind && strings.TrimPrefix(e.AsIdent(), ".") == "subject"
+	return iss.Err() != nil || reading(parsed.NativeRep(), name)
+}
+
+// reading reports whether an expression names the variable name, as a variable of a macro of its
+// own does too.
+func reading(e *ast.AST, name string) bool {
+	// `.name` names it from the root, as `name` does.
+	return len(ast.MatchDescendants(ast.NavigateAST(e), func(e ast.NavigableExpr) bool {
+		return e.Kind() == ast.IdentKind && strings.TrimPrefix(e.AsIdent(), ".") == name
 	})) > 0
 }
 

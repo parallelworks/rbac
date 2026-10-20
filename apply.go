@@ -1655,13 +1655,14 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 	return granted, nil
 }
 
-// conditionsBounded refuses conditional grants just stored that leave the conditions a check reads on
-// their scope costing more together than it may spend on them: those of an identity's grants, and
-// those of the grants to groups, the tenant's members and the public, which reach many, whatever
-// their roles. A check evaluates them whole, so a grant made beside another, as by an actor who
-// can't revoke it, never changes what that one decides. It reads them under the change's locks,
-// which every change of a scope's grants takes, once they are stored, the grants in force the change
-// didn't touch included.
+// conditionsBounded refuses conditional grants just stored that leave the conditions a check reads
+// on their scope costing more together than it may spend on them: those of an identity's grants,
+// and those of the grants to groups, the tenant's members and the public, which reach many,
+// whatever their roles, one that reads the action counted once for each label value its grants
+// give, as a read of label values decides each apart. A check evaluates them whole, so a grant
+// made beside another, as by an actor who can't revoke it, never changes what that one decides. It
+// reads them under the change's locks, which every change of a scope's grants takes, once they are
+// stored, the grants in force the change didn't touch included.
 func (a *Authorizer) conditionsBounded(ctx context.Context, tx pgx.Tx, tenant string, stored []Grant) error {
 	type bucket struct{ scope, principal string }
 	seen := map[bucket]bool{}
@@ -1682,38 +1683,64 @@ func (a *Authorizer) conditionsBounded(ctx context.Context, tx pgx.Tx, tenant st
 	// The grants that reach many by their keys, the groups' a range, each of which the scope's index
 	// seeks: '' is no principal's key.
 	rows, err := tx.Query(ctx, `
-		SELECT b.scope, b.principal, array_agg(DISTINCT g.condition) FROM unnest($2::text[], $3::text[]) AS b(scope, principal)
+		SELECT b.scope, b.principal, g.condition, array_agg(DISTINCT g.role) FROM unnest($2::text[], $3::text[]) AS b(scope, principal)
 		CROSS JOIN LATERAL (
-		  SELECT condition FROM rbac_grants WHERE scope = b.scope AND tenant = $1 AND principal = b.principal
+		  SELECT condition, role FROM rbac_grants WHERE scope = b.scope AND tenant = $1 AND principal = b.principal
 		    AND conditional AND (expires_at IS NULL OR expires_at > $4)
 		  UNION ALL
-		  SELECT condition FROM rbac_grants WHERE b.principal = '' AND scope = b.scope AND tenant = $1
+		  SELECT condition, role FROM rbac_grants WHERE b.principal = '' AND scope = b.scope AND tenant = $1
 		    AND principal >= 'group:' AND principal < 'group;' AND conditional AND (expires_at IS NULL OR expires_at > $4)
 		  UNION ALL
-		  SELECT condition FROM rbac_grants WHERE b.principal = '' AND scope = b.scope AND tenant = $1
+		  SELECT condition, role FROM rbac_grants WHERE b.principal = '' AND scope = b.scope AND tenant = $1
 		    AND principal = ANY(ARRAY[$5, $6]::text[]) AND conditional AND (expires_at IS NULL OR expires_at > $4)
 		) g
-		GROUP BY b.scope, b.principal ORDER BY b.scope, b.principal`,
+		GROUP BY b.scope, b.principal, g.condition`,
 		tenant, scopes, principals, a.cfg.Now(), TenantMembers(tenant).key(), publicKey)
 	if err != nil {
 		return err
 	}
-	var over []error
-	var scope, principal string
-	var conditions []string
-	if _, err := pgx.ForEachRow(rows, []any{&scope, &principal, &conditions}, func() error {
-		if affordable(conditions) {
-			return nil
+	carried := map[bucket]map[string][]Role{}
+	var ids []Role
+	var scope, principal, condition string
+	var roles []Role
+	if _, err := pgx.ForEachRow(rows, []any{&scope, &principal, &condition, &roles}, func() error {
+		b := bucket{scope, principal}
+		if carried[b] == nil {
+			carried[b] = map[string][]Role{}
 		}
-		whose := principal + "'s grants"
-		if principal == "" {
+		carried[b][condition] = roles
+		ids = append(ids, roles...)
+		return nil
+	}); err != nil {
+		return err
+	}
+	// What the roles give matters only for counting label values.
+	b := book{builtin: a.roles}
+	if len(a.labels) > 0 {
+		if b, err = a.book(ctx, tx, tenant, ids); err != nil {
+			return err
+		}
+	}
+	var over []error
+	for i, scope := range scopes {
+		gives := map[string][]Permission{}
+		for expr, roles := range carried[bucket{scope, principals[i]}] {
+			gives[expr] = nil
+			for _, id := range roles {
+				if def, ok := b.role(id); ok {
+					gives[expr] = append(gives[expr], def.Permissions...)
+				}
+			}
+		}
+		if affordable(a.evaluations(gives)) {
+			continue
+		}
+		whose := principals[i] + "'s grants"
+		if principals[i] == "" {
 			whose = "the grants to groups, the tenant's members and the public"
 		}
 		over = append(over, fmt.Errorf("%w: the conditions of %s on %s cost more together than a check may spend evaluating them",
 			ErrInvalid, whose, scope))
-		return nil
-	}); err != nil {
-		return err
 	}
 	return errors.Join(over...)
 }

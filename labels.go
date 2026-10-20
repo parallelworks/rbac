@@ -359,6 +359,44 @@ func (a *Authorizer) holdingOn(ctx context.Context, q DB, s Subject, cs *constra
 	return h, byCondition, nil
 }
 
+// evaluations is how many times a read of a subject's label values may evaluate each of
+// conditions, given the permissions of the grants or denies that carry each: one that reads the
+// action once for each label value and power to release among them, as it decides each apart, and
+// any other once.
+func (a *Authorizer) evaluations(carried map[string][]Permission) map[string]int {
+	n := map[string]int{}
+	for expr, ps := range carried {
+		if expr == "" {
+			continue
+		}
+		n[expr] = 1
+		if len(a.labels) > 0 && reads(expr, "action") {
+			n[expr] = len(a.labelPermissions(ps))
+		}
+	}
+	return n
+}
+
+// labelPermissions are the label values and powers to release among ps, for `dim:*` each of dim's.
+func (a *Authorizer) labelPermissions(ps []Permission) map[Permission]bool {
+	out := map[Permission]bool{}
+	for _, p := range ps {
+		t, verb := p.parts()
+		ld, ok := a.labels[t]
+		switch {
+		case !ok:
+		case verb == "*":
+			for v := range ld.rank {
+				out[Permission(t+":"+v)] = true
+			}
+			out[ReleasePermission(t)] = true
+		default:
+			out[p] = true
+		}
+	}
+	return out
+}
+
 // labelColumn is SQL keeping the rows whose label column, col, of `dimension:value` values, the
 // holding satisfies, with its arguments numbered from arg: every value declared, none the holding
 // doesn't satisfy alone, as an AllOf or Ordered one, and in each AnyOf dimension none or one held.

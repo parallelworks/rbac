@@ -609,7 +609,7 @@ row a few lookups among them however many there are.
 | `MaxGroupDepth` | 8 | How deeply groups nest. |
 | `MaxPlacesInGroup` | 20 | Places in force of one principal in one group, each from another source. Those from each source the host owns count apart. |
 | `MaxExpression` | 2,048 bytes | A condition's or requirement's expression. Its cost is bounded too. |
-| What a check reads together | About seven short conditions, or three of the longest | The distinct conditions of an identity's conditional grants on a scope; of a scope's conditional grants to groups, the tenant's members and the public; of a scope's conditional denies; and the requirements of groups' eligibilities for a role on a scope. |
+| What a check reads together | About seven short conditions, or three of the longest | The distinct conditions of an identity's conditional grants on a scope; of a scope's conditional grants to groups, the tenant's members and the public; of a scope's conditional denies; and the requirements of groups' eligibilities for a role on a scope. On the tenant, one reading the action counts once for each label value it gives or denies. |
 | `MaxConditionBytes` | 32 KiB | The conditions one `Apply` or `Import` carries, each distinct one counted once. |
 | `MaxName`, `MaxDescription`, `MaxNote` | 128, 2,048, 2,048 characters | Names, titles and group ids, descriptions, and notes and justifications. |
 | `MaxRequest` | 256 characters | A request id in `Audit`. |

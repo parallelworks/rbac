@@ -77,3 +77,12 @@ func Compiled(a *Authorizer) int {
 	defer a.conds.mu.RUnlock()
 	return len(a.conds.programs)
 }
+
+// CountEvaluations counts the conditions evaluated until t ends.
+func CountEvaluations(t *testing.T) *int {
+	t.Helper()
+	old, n := evaluating, new(int)
+	evaluating = func() { *n++ }
+	t.Cleanup(func() { evaluating = old })
+	return n
+}
