@@ -160,8 +160,8 @@ reach, to check one by one.
   refused as invalid. So a check evaluates every condition it reads, and a grant made beside
   another, as by someone who can't revoke it, never changes what that one decides. A change adding
   no condition isn't refused, so what was stored past a bound before there were bounds can be
-  stored again as it is, as by a restore, though a check may not reach all of it: it evaluates the
-  cheapest first within its budget. To hand a permission on, the actor holds it unconditionally or
+  rewritten in place, as by a restore over the rows still stored, though not restored where they
+  are gone, and a check may not reach all of it: it evaluates the cheapest first within its budget. To hand a permission on, the actor holds it unconditionally or
   under the same condition, one that doesn't read the subject: that one decides for each holder,
   so the actor's holding says nothing of another's.
 - **Deny policies:** `SetDeny` puts a deny on a scope: under it, it removes permissions

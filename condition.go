@@ -56,9 +56,10 @@ import (
 // does counts once for each label value its grants give or its denies deny. A change adding a
 // condition past a bound, or one evaluated more, is refused as invalid, so no grant, deny or
 // eligibility stored changes what the others decide, but one adding none isn't: conditions stored
-// past a bound before there were bounds can be stored again as they are, as by a restore. A check
-// may not reach all of those, or of those of a custom role widened since: it evaluates the
-// cheapest first, and past its budget a grant's condition is false and a deny's applies.
+// past a bound before there were bounds can be rewritten in place, as by a restore over the rows
+// still stored, though restored where those are gone, they are added, and refused. A check may not
+// reach all of those, or of those of a custom role widened since: it evaluates the cheapest first,
+// and past its budget a grant's condition is false and a deny's applies.
 //
 // Searches (Filter, Reachable, Holders) can't evaluate one: Filter and Reachable count only
 // unconditional grants, Filter counts a conditional deny as denying, and Reach.Conditional and
