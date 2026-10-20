@@ -3086,6 +3086,75 @@ func TestChangingMembersReadsOnlyWhatTheGroupsReach(t *testing.T) {
 	}
 }
 
+// Without declared labels, a member leaving loses nothing a change checks but the denies naming its
+// groups, so removing one, or ending its place sooner, reads nothing else of what they hold: as few
+// pages however much the groups it is in hold.
+func TestRemovingAMemberReadsNothingItsGroupsHold(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	h.groups(t, "big", "inner")
+	h.as(t, "ann", "inner")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'big', 'group', 'inner')`); err != nil {
+		t.Fatal(err)
+	}
+	manager := h.as(t, "manager")
+	tables := []string{"rbac_grants", "rbac_eligibilities"}
+	from := 0
+	// The pages of the grants and eligibilities each removal reads, in a transaction it rolls back,
+	// once big holds n more of each on clusters, and approves n more activations.
+	read := func(n int) map[string]int64 {
+		t.Helper()
+		for _, q := range []string{
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			 SELECT 't1', 'cluster', 'c' || i, 'group', 'big', 'cluster.login' FROM generate_series($1::int + 1, $1::int + $2::int) i`,
+			`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+			 SELECT 't1', 'cluster', 'c' || i, 'group', 'big', 'cluster.sudo', 3600, '{}'::text[] FROM generate_series($1::int + 1, $1::int + $2::int) i
+			 UNION ALL SELECT 't1', 'cluster', 'c' || i, 'user', 'v' || i, 'cluster.sudo', 3600, '{group:big}' FROM generate_series($1::int + 1, $1::int + $2::int) i`,
+		} {
+			if _, err := h.pool.Exec(ctx, q, from, n); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants, rbac_eligibilities`); err != nil {
+			t.Fatal(err)
+		}
+		from += n
+		pages := map[string]int64{}
+		for what, change := range map[string][]rbac.Member{
+			"removing ann":              nil,
+			"ending ann's place sooner": {{Group: "inner", Principal: identity("ann"), ExpiresAt: h.now.Add(time.Hour)}},
+		} {
+			func() {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				for _, table := range tables {
+					pages[what+" of "+table] -= pagesRead(ctx, t, tx, table)
+				}
+				var remove []rbac.Member
+				if change == nil {
+					remove = []rbac.Member{{Group: "inner", Principal: identity("ann")}}
+				}
+				if err := h.authz.WithTx(tx).ChangeMembers(ctx, manager, "t1", change, remove); err != nil {
+					t.Fatalf("%s: %v", what, err)
+				}
+				for _, table := range tables {
+					pages[what+" of "+table] += pagesRead(ctx, t, tx, table)
+				}
+			}()
+		}
+		return pages
+	}
+	few := read(500)
+	for what, many := range read(9500) {
+		if many > few[what]*3/2+deeper {
+			t.Errorf("%s read %d pages, and %d once its groups held 9500 more grants and eligibilities", what, few[what], many)
+		}
+	}
+}
+
 // Of the grants, eligibilities and denies, a list by scope or by principal, a check's and Holders'
 // read of the denies on a path, Activate's of the eligibilities, a write's count of a role's grants
 // toward its bound, and DeleteScopes read only those of their scopes or principals, and Holders, of

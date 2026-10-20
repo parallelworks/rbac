@@ -1416,7 +1416,8 @@ type approving struct {
 }
 
 // reachOf reads, on q, what adding add and removing remove reaches, in force at now, which of add
-// end a membership sooner and which members leave their groups.
+// end a membership sooner and which members leave their groups: of what the groups hold, approve
+// and are named or exempt in, all a change checks.
 func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remove []Member) (reach, error) {
 	r := reach{up: map[string]map[string]bool{}, labeled: len(a.labels) > 0}
 	groups := memberGroups(slices.Concat(add, remove))
@@ -1448,6 +1449,22 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 	}
 	r.stored, r.up = r.up, r.nested(add)
 	keys := slices.Sorted(maps.Keys(reached))
+	if r.ending, r.leaves, err = a.placesLeft(ctx, q, tenant, add, remove); err != nil {
+		return reach{}, err
+	}
+	// Without declared labels, a member leaving loses nothing a change checks but the denies naming
+	// its groups, which then no longer bind it: where none gains, as none is added but to end a place
+	// sooner, those alone are read, not what the groups hold.
+	if !r.labeled && len(r.gaining(add)) == 0 {
+		rows, err = q.Query(ctx, `SELECT `+denyColumns+` FROM rbac_denies WHERE `+naming("principals", "$2")+` ORDER BY scope, id`, tenant, keys)
+		if err != nil {
+			return reach{}, err
+		}
+		if r.denies, err = collectDenies(rows); err != nil {
+			return reach{}, err
+		}
+		return r, nil
+	}
 	rows, err = q.Query(ctx, `SELECT `+grantColumns+` FROM rbac_grants
 		WHERE tenant = $1 AND principal = ANY($2::text[]) AND (expires_at IS NULL OR expires_at > $3) ORDER BY id`, tenant, keys, now)
 	if err != nil {
@@ -1509,9 +1526,6 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 		if slices.ContainsFunc(e.Approvers, func(p Principal) bool { return reached[p.key()] }) {
 			r.approving = append(r.approving, approving{v, e.Approvers})
 		}
-	}
-	if r.ending, r.leaves, err = a.placesLeft(ctx, q, tenant, add, remove); err != nil {
-		return reach{}, err
 	}
 	return r, nil
 }
