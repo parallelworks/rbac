@@ -15,10 +15,11 @@ ALTER TABLE rbac_grants ADD COLUMN activated_through text COLLATE "C", ADD COLUM
 -- on. Where it reaches the principals of several, which made it can't be told; where it reaches
 -- none, as once the eligibility it was made through is deleted, nothing says what it rested on.
 -- Those record neither, as do those that code from before this migration activates while a host
--- upgrades, and the first change that ends or removes a membership or place of their holder's ends
--- them, rather than leave one through a path it may not have rested on: activating again records
--- the eligibility. The package has had no release, so only a developer's database holds any, and
--- none lasts past a year.
+-- upgrades, and the first change that re-checks their holder's activations ends them, one setting
+-- an end on or removing a membership or place of its holder's, even an end no sooner, rather than
+-- leave one through a path it may not have rested on: activating again until later records the
+-- eligibility. The package has had no release, so only a developer's database holds any, and none
+-- lasts past a year.
 SELECT set_config('rbac.change', '{"how": "Migrate"}', true);
 WITH RECURSIVE activations AS (
     SELECT id, tenant, principal, scope, role FROM rbac_grants WHERE source = 'activation' AND expires_at > now()

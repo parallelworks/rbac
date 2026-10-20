@@ -451,8 +451,9 @@ sequenceDiagram
 - **Activations stored before migration 0012** record what migrating found: the one eligibility
   for their role on their scope whose principal their holder reached then, or, where it reached
   several or none, nothing. The first change re-checking one that records nothing ends it, as which
-  path it rested on can't be told; activating again records it. The package had no release before
-  it, so only a developer's database holds them, and none lasts past `MaxActivation`.
+  path it rested on can't be told; activating again until later records it. The package had no
+  release before it, so only a developer's database holds them, and none lasts past
+  `MaxActivation`.
 
 ## Lists and searches
 

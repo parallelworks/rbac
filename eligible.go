@@ -485,16 +485,17 @@ func (a *Authorizer) unrest(ctx context.Context, tx pgx.Tx, tenant string, actor
 	}
 	// Each by its id alone, kept to the tenant's activations in force outside the lookup: beside
 	// tenant = $1 and the source, a generic plan reads every activation in the tenant by the index
-	// on them, which it costs as an average tenant's few.
+	// on them, which it costs as an average tenant's few. Each joined to its paths, not a subquery
+	// per activation, which scans every holder's paths for each, once for each use of until.
 	rows, err := tx.Query(ctx, `
 		WITH RECURSIVE act AS (
 		  SELECT g.id, g.principal, g.expires_at, g.activated_through FROM unnest($2::text[]) AS w(i) CROSS JOIN LATERAL (
-		    SELECT * FROM rbac_grants WHERE id = w.i::uuid OFFSET 0) g
+		    SELECT id, tenant, source, principal, expires_at, activated_through FROM rbac_grants WHERE id = w.i::uuid OFFSET 0) g
 		  WHERE g.tenant = $1 AND g.source = 'activation' AND g.expires_at > $3
 		), `+reachingSQL("ARRAY(SELECT DISTINCT principal FROM act)", "$3")+`, rests(id, expires_at, until) AS (
-		  SELECT a.id, a.expires_at, (SELECT max(coalesce(r.ends, 'infinity')) FROM reaching r
-		    WHERE r.holder = a.principal AND r.k = a.activated_through)
-		  FROM act a
+		  SELECT a.id, a.expires_at, max(coalesce(r.ends, 'infinity')) FILTER (WHERE r.k IS NOT NULL)
+		  FROM act a LEFT JOIN reaching r ON r.holder = a.principal AND r.k = a.activated_through
+		  GROUP BY a.id, a.expires_at
 		)
 		SELECT id::text, until FROM rests WHERE until IS NULL OR until < expires_at ORDER BY id`,
 		tenant, r.ids, now)
