@@ -928,9 +928,10 @@ type Columns struct {
 	// compared byte for byte, whatever its collation, which the index serves in.
 	Path string
 	// Labels is a text[] holding the resource's label as `dimension:value` values, never NULL: '{}'
-	// for none. With a GIN index in the default collation, in which the test compares them, it
-	// serves the label's test, which keeps only the rows the subject's holding satisfies. With
-	// labels declared it is needed, so Filter refuses a call without it as invalid: pass
+	// for none. The label's test, which keeps only the rows the subject's holding satisfies,
+	// compares them in the default collation and needs no index: an index on the column could serve
+	// it only by reading every row it holds, so the path's index drives the query. With labels
+	// declared the column is needed, so Filter refuses a call without it as invalid: pass
 	// '{}'::text[] for a type whose resources carry no label.
 	Labels string
 }
@@ -1002,20 +1003,24 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	}
 	// The grants' tenant is an argument of its own: the host's tenant column needn't be text,
 	// and one argument can't take two types. The grants overlap the path, which the host's GIN
-	// index serves. A subject can hold thousands on resources of the type, such as one on each it
-	// created, where an overlap would compare each with every key of every row: each reaches only
-	// its resource, whose key is its path's first, so then they are looked up in a hash of them,
-	// and only containers' and the tenant's overlap. That form can't use an index, so a subject with
+	// index serves. A subject can hold thousands, such as one on each resource or workspace it
+	// created, where an overlap would compare each with every key of every row, and the index merge
+	// what each finds for every row it finds. So past a few on resources of the type, each of which
+	// reaches only its resource, whose key is its path's first, they are looked up in a hash of
+	// them, and past more on containers and the tenant (maxContainerOverlap), each of a row's keys
+	// is looked up in one object of them all (keyed). Neither can use an index, so a subject with
 	// few keeps the overlap: a test an index on the first key could serve, as `= ANY` of an array,
-	// compares each row with every grant wherever a plan reads rows without that index, and a host's
-	// sorted, limited query can. Denies on resources of the type are looked up so whatever their
-	// number, as a tenant's admins can put one on each of thousands.
+	// compares each row with every grant wherever a plan reads rows without that index, and a
+	// host's sorted, limited query can.
+	// Denies are looked up so whatever their number, as a tenant's admins can put one on each of
+	// thousands of resources or workspaces, and no index serves a test that a row has none.
 	//
 	// The host's columns can have a collation of their own, which would compare keys and tenants
 	// that differ, such as in case, as equal. A collation inside a subquery doesn't carry out of
 	// it, so each comparison that decides names the default one, the tenant's as text, as the
-	// column needn't be. The tenant and the path are compared in the column's own collation too,
-	// which its indexes are in, so they serve whatever it is.
+	// column needn't be, or compares keys as an object does, byte for byte. The tenant and the path
+	// are compared in the column's own collation too, which its indexes are in, so they serve
+	// whatever it is.
 	overlap := "ARRAY(" + grants(arg(5)) + ")"
 	reached := fmt.Sprintf(`(%[1]s && %[2]s AND %[1]s && (%[2]s COLLATE "default"))`, cols.Path, overlap)
 	above, denied := a.reaching(resourceType), a.reaching(resourceType)
@@ -1023,20 +1028,26 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	if !a.contains(resourceType) {
 		denied = slices.DeleteFunc(denied, func(t string) bool { return t == resourceType })
 		deniedByKey = fmt.Sprintf(`NOT (%s)[1] COLLATE "default" IN (%s) AND `, cols.Path, denies("d.scope_type = "+arg(9)+"::text"))
-		many, err := a.manyResourceGrants(ctx, tenant, s, counts, resourceType)
-		if err != nil {
-			return Predicate{}, err
-		}
-		if many {
-			above = denied
-			reached = fmt.Sprintf(`((%[1]s)[1] COLLATE "default" IN (%[3]s) OR %[1]s && %[2]s AND %[1]s && (%[2]s COLLATE "default"))`,
-				cols.Path, overlap, grants("ARRAY["+arg(9)+"::text]"))
-		}
+	}
+	resources, containers, err := a.grantCounts(ctx, tenant, s, p, roles, custom, counts, resourceType)
+	if err != nil {
+		return Predicate{}, err
+	}
+	switch {
+	// Past a few on resources of the type no index serves the condition, so the overlap would
+	// compare every row of the tenant with each grant on containers: past a few of those too, each
+	// key is looked up.
+	case containers > maxContainerOverlap || resources > maxOverlap && containers > maxOverlap:
+		reached = keyed(cols.Path, grants(arg(5)))
+	case resources > maxOverlap:
+		above = denied
+		reached = fmt.Sprintf(`((%[1]s)[1] COLLATE "default" IN (%[3]s) OR %[1]s && %[2]s AND %[1]s && (%[2]s COLLATE "default"))`,
+			cols.Path, overlap, grants("ARRAY["+arg(9)+"::text]"))
 	}
 	pred := Predicate{
 		SQL: fmt.Sprintf(`(%[1]s = %[2]s AND (%[1]s)::text = %[5]s::text COLLATE "default" AND %[3]s
-			AND %[7]sNOT %[4]s && (ARRAY(%[6]s) COLLATE "default"))`,
-			cols.Tenant, arg(0), reached, cols.Path, arg(1), denies("d.scope_type = ANY("+arg(16)+"::text[])"), deniedByKey),
+			AND %[7]sNOT %[6]s)`,
+			cols.Tenant, arg(0), reached, cols.Path, arg(1), keyed(cols.Path, denies("d.scope_type = ANY("+arg(16)+"::text[])")), deniedByKey),
 		Args: append(append([]any{
 			tenant, tenant, s.identityKey(), roles, a.cfg.Now(), above, publicKey, a.publicRoles(roles),
 			string(p), resourceType,
@@ -1092,21 +1103,42 @@ func ofType(col, t string) string {
 	return fmt.Sprintf("(%s >= (%s || ':') AND %s < (%s || ';'))", col, t, col, t)
 }
 
+// keyed is SQL for whether one of the keys of a path, col, is a scope scopes selects: each is
+// looked up in one object of them, built once for the statement, so a key costs a few comparisons
+// however many there are, and compares byte for byte. A hashed subquery for each key would need one
+// for each depth a path can have, which has no bound, and one inside a subquery over a row's keys
+// is built again for every row. jsonb_exists_any is the operator `?|`, which a host's query builder
+// could read as a placeholder.
+func keyed(col, scopes string) string {
+	return fmt.Sprintf(`jsonb_exists_any((SELECT coalesce(jsonb_object_agg(s, true), '{}') FROM (%s) AS k(s)), %s)`, scopes, col)
+}
+
 // maxOverlap is how many grants on resources of a type Filter overlaps with each row's path:
 // about where comparing each with every key of a row costs as much as a lookup in a hash.
 const maxOverlap = 8
 
-// manyResourceGrants reports whether s's principals hold more than maxOverlap unconditional grants
-// in force on resources of a type, of any role, counting broad ones as counts says: it only picks
-// the form of Filter's condition.
-func (a *Authorizer) manyResourceGrants(ctx context.Context, tenant string, s Subject, counts broad, resourceType string) (bool, error) {
-	var n int
-	err := a.db.QueryRow(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$4")+`
-		SELECT count(*) FROM (SELECT FROM rbac_grants
-		WHERE tenant = $1 AND principal = ANY(ARRAY(`+countedKeys("$6", "$7")+`)) AND `+ofType("scope", "$3::text")+` AND NOT conditional
-		  AND (expires_at IS NULL OR expires_at > $4) LIMIT $5) g`,
-		tenant, s.identityKey(), resourceType, a.cfg.Now(), maxOverlap+1, counts.public, counts.members).Scan(&n)
-	return n > maxOverlap, err
+// maxContainerOverlap is how many grants on containers and the tenant Filter overlaps with each
+// row's path where the host's index serves the overlap; where none does, it is maxOverlap. The
+// index finds the rows under them, merging what each finds, which costs each row it finds a
+// comparison for every one: about where that costs as much as reading a row and looking up its
+// keys. A test lowers it.
+var maxContainerOverlap = 128
+
+// grantCounts counts s's principals' unconditional grants in force on resources of a type, and on
+// the containers, a container type's own among them, and the tenant, of the roles that give p on
+// the type, the built-in ones in roles and with custom the tenant's, counting broad ones as counts
+// says, of each type only until they pass maxContainerOverlap: it only picks the form of Filter's
+// condition. Grants of other roles aren't in the condition, and counted they would trade an index
+// that finds the few rows its grants reach for a read of every row of the tenant.
+func (a *Authorizer) grantCounts(ctx context.Context, tenant string, s Subject, p Permission, roles []string, custom bool, counts broad, resourceType string) (resources, containers int, err error) {
+	err = a.db.QueryRow(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$5")+`
+		SELECT coalesce(sum(n) FILTER (WHERE t = $3 AND NOT $4), 0)::int, coalesce(sum(n) FILTER (WHERE t <> $3 OR $4), 0)::int
+		FROM unnest($6::text[]) AS t(t) CROSS JOIN LATERAL (SELECT count(*) AS n FROM (SELECT FROM rbac_grants
+		  WHERE tenant = $1 AND principal = ANY(ARRAY(`+countedKeys("$8", "$9")+`)) AND `+ofType("scope", "t.t")+` AND NOT conditional
+		    AND (expires_at IS NULL OR expires_at > $5) AND role = ANY(`+givingSQL("$10", "$1", "$11", "$3", custom, "")+`) LIMIT $7) g) g`,
+		tenant, s.identityKey(), resourceType, a.contains(resourceType), a.cfg.Now(), a.reaching(resourceType), maxContainerOverlap+1,
+		counts.public, counts.members, roles, string(p)).Scan(&resources, &containers)
+	return resources, containers, err
 }
 
 // holding is a grant as a check reads it from the key index: whether it has a condition, not

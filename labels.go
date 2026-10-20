@@ -349,7 +349,8 @@ func (a *Authorizer) holdingOn(ctx context.Context, q DB, s Subject, cs *constra
 // labelColumn is SQL keeping the rows whose label column, col, of `dimension:value` values, the
 // holding satisfies, with its arguments numbered from arg: every value declared, none the holding
 // doesn't satisfy alone, as an AllOf or Ordered one, and in each AnyOf dimension none or one held.
-// Each test is an array operator, which a GIN index on col serves.
+// No index on col serves it: a GIN index finds the rows whose values are all declared only by
+// reading every row, as nearly every one's are, and no index finds those an overlap leaves out.
 func (h Holding) labelColumn(col string, arg func(int) string, first int) (string, []any) {
 	// In the default collation, which compares values as Satisfies does: in one that isn't
 	// deterministic, col's own could find a value equal to another it holds that differs only in

@@ -30,6 +30,15 @@ func SetExpiryBatch(t *testing.T, n int) {
 	t.Cleanup(func() { expiryBatch = old })
 }
 
+// SetMaxContainerOverlap makes Filter look up the grants on containers and the tenant of a subject
+// that holds more than n of them, rather than overlap them with each row's path, until t ends.
+func SetMaxContainerOverlap(t *testing.T, n int) {
+	t.Helper()
+	old := maxContainerOverlap
+	maxContainerOverlap = n
+	t.Cleanup(func() { maxContainerOverlap = old })
+}
+
 // SetReadingRoles runs f once a read has read grants and the custom roles with them, until t
 // ends.
 func SetReadingRoles(t *testing.T, f func()) {

@@ -429,10 +429,14 @@ flowchart LR
 - **Filter** returns a condition for the host's own query, which reads the grants in the same
   statement as the rows, so sorting and pagination work and nothing changes between deciding and
   reading, for the query it was built for: build one for each. It never keeps a row Authorize would
-  refuse. Past a few of a subject's grants on resources of the listed type, each row's own key is
-  looked up in a hash of them, so one with a grant on everything it created costs a row one lookup;
-  no index serves that, so the query reads every row of the tenant its other conditions keep. Denies
-  on resources of the type are looked up so whatever their number.
+  refuse. The subject's grants are matched through the path's GIN index, which merges the rows each
+  finds, so its cost for each row grows with their number. Past a few on resources of the listed
+  type, each row's own key is looked up in a hash of them, and past 128 on containers and the tenant,
+  or past a few alongside those, each of its keys in one object of them all, so one with a grant on
+  everything it created costs a row a few lookups; no index serves that, so the query reads every
+  row of the tenant its other conditions keep. Denies are looked up so whatever their number: those
+  on resources of the type by the row's own key, and those on containers and the tenant by each of
+  its keys.
 - **Reachable** returns the same as scopes, for a host that keeps its resources elsewhere.
   Conditional grants and conditional denies come back apart, to check one by one.
 - **Holders** lists who may do a permission on a resource, for an access review. That is each
@@ -566,7 +570,9 @@ flowchart LR
 ## Bounds
 
 Every input that could grow without limit is bounded, so no call's cost depends on what a tenant
-chose to store beyond these.
+chose to store beyond these, but for the lists, which read what they list: `Filter` reads the
+subject's grants on the scopes that can reach the listed type and the denies on them, and costs each
+row a few lookups among them however many there are.
 
 | Bound | Value | What it limits |
 |---|---|---|
