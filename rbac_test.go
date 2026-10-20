@@ -2502,6 +2502,79 @@ func TestDeleteScopeRemovesAGrantMadeWhileItWaits(t *testing.T) {
 	}
 }
 
+func TestDeletingScopesAndAPrincipalOnThemAtOnceNeverDeadlocks(t *testing.T) {
+	for name, deletePrincipal := range map[string]func(ctx context.Context, h *harness) error{
+		"DeletePrincipal": func(ctx context.Context, h *harness) error {
+			return h.authz.DeletePrincipal(ctx, host, "t1", identity("p"))
+		},
+		"DeletePrincipalEverywhere": func(ctx context.Context, h *harness) error {
+			return h.authz.DeletePrincipalEverywhere(ctx, host, identity("p"))
+		},
+	} {
+		for _, held := range []string{"rbac_grants", "rbac_eligibilities"} {
+			for rows, both := range map[string]bool{"in it alone": false, "in both tables": true} {
+				t.Run(fmt.Sprintf("%s, %s held, rows %s", name, held, rows), func(t *testing.T) {
+					h := setup(t)
+					ctx := t.Context()
+					scopes := make([]rbac.Scope, 60)
+					for i := range scopes {
+						scopes[i] = rbac.Scope{Type: "cluster", ID: fmt.Sprintf("c%02d", i)}
+					}
+					// p's grants and eligibilities on each scope, written in the reverse of the scopes'
+					// order, so reading them by principal meets them the other way round.
+					for i := range slices.Backward(scopes) {
+						if held == "rbac_grants" || both {
+							if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+								VALUES ('t1', 'cluster', $1, 'user', 'p', 'cluster.login')`, scopes[i].ID); err != nil {
+								t.Fatal(err)
+							}
+						}
+						if held == "rbac_eligibilities" || both {
+							if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+								VALUES ('t1', 'cluster', $1, 'user', 'p', 'cluster.login', 60)`, scopes[i].ID); err != nil {
+								t.Fatal(err)
+							}
+						}
+					}
+					// A transaction holding the row on the middle scope stops both deletes there, each
+					// holding what it deleted before it, until it ends.
+					hold, err := h.pool.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = hold.Rollback(ctx) }()
+					var pid int
+					if err := hold.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := hold.Exec(ctx, `SELECT FROM `+held+` WHERE tenant = 't1' AND scope = 'cluster:c30' FOR UPDATE`); err != nil {
+						t.Fatal(err)
+					}
+					errs := make(chan error, 2)
+					go func() { errs <- h.authz.DeleteScopes(ctx, host, "t1", scopes) }()
+					go func() { errs <- deletePrincipal(ctx, h) }()
+					for waiting := 0; waiting < 2; {
+						if err := h.pool.QueryRow(ctx, `WITH RECURSIVE waiting(pid) AS (
+							SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))
+							UNION SELECT a.pid FROM pg_stat_activity a JOIN waiting w ON w.pid = ANY(pg_blocking_pids(a.pid)))
+							SELECT count(*) FROM waiting`, pid).Scan(&waiting); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := hold.Rollback(ctx); err != nil {
+						t.Fatal(err)
+					}
+					for range 2 {
+						if err := <-errs; err != nil {
+							t.Errorf("deleting the scopes and a principal on them at once: %v", err)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestDeleteScopesHoldsBoundedLocks(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()

@@ -483,6 +483,10 @@ flowchart TB
 - **READ COMMITTED.** A change runs at READ COMMITTED, as its checks under the locks must read what
   committed before the locks were taken. Under `WithTx` the host's transaction must be at READ
   COMMITTED too.
+- **Rows in one order.** `DeleteScopes` holds its scopes' locks and `DeletePrincipal` its
+  principal's, so neither waits for the other, and both delete the principal's grants and
+  eligibilities on those scopes: each locks them in the order of their scopes first, eligibilities
+  before grants, so they don't deadlock.
 - **One snapshot for reads in several statements.** Explain, Reachable, Holders and Conflicts read
   in one REPEATABLE READ, READ ONLY transaction of their own on a pool, and AsOf in a REPEATABLE
   READ one it rolls back; the label values Explain, Reachable and Holders need are read after it.
