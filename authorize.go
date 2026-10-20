@@ -436,7 +436,8 @@ type Holder struct {
 // marking one that a deny may bind: it reads the groups a deny names, and whom it exempts, as
 // checks do. Where a constraint may remove p, it marks each holder it may remove p from, asked
 // about as ConstraintInput says. An identity's record counts its own grants and its groups', not
-// the members' or the public's, which are records of their own.
+// the members' or the public's, which are records of their own. It has no limit or cursor, so what
+// it returns grows with the holders, as every identity in a group granted on the tenant.
 func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]Holder, error) {
 	if err := a.check(r); err != nil {
 		return nil, err
@@ -769,7 +770,9 @@ type Reach struct {
 }
 
 // Reachable says where the subject may do p to resources of a type in a tenant, for hosts that
-// list from a store other than this PostgreSQL. Hosts on the same database use Filter.
+// list from a store other than this PostgreSQL. Hosts on the same database use Filter. It has no
+// limit or cursor, so Reach.Scopes grows with the scopes the subject's grants are on, as one on
+// each resource it created.
 func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, tenant, resourceType string) (Reach, error) {
 	roles, removed, err := a.searchable(ctx, s, p, tenant, resourceType)
 	if err != nil || removed {
@@ -915,7 +918,10 @@ type Predicate struct {
 
 // Filter returns a condition for the host's own query that keeps the resources of a type in a
 // tenant the subject may do p to. It reads the grants in the same statement as the rows, so
-// sorting and pagination work and nothing changes between deciding and reading. The host's
+// sorting and pagination work and nothing changes between deciding and reading. A condition holds
+// for the query it was built for: it fixes the time (Config.Now), the subject's label holding and
+// what the constraints answered when Filter was called, so a later query keeps rows Authorize then
+// refuses, as once a grant it counted has expired. Build one for each query. The host's
 // query must reach this package's tables (they are in the pool's schema), and column names are
 // trusted host code; every value is an argument. It counts only unconditional grants, and leaves
 // out every resource a deny covers, conditional ones included, so it never keeps one Authorize

@@ -413,9 +413,11 @@ flowchart LR
 
 - **Filter** returns a condition for the host's own query, which reads the grants in the same
   statement as the rows, so sorting and pagination work and nothing changes between deciding and
-  reading. It never keeps a row Authorize would refuse. A subject's grants on resources of the
-  listed type are looked up by each row's own key, so one with a grant on everything it created
-  lists as fast as one with a few.
+  reading, for the query it was built for: build one for each. It never keeps a row Authorize would
+  refuse. Past a few of a subject's grants on resources of the listed type, each row's own key is
+  looked up in a hash of them, so one with a grant on everything it created costs a row one lookup;
+  no index serves that, so the query reads every row of the tenant its other conditions keep. Denies
+  on resources of the type are looked up so whatever their number.
 - **Reachable** returns the same as scopes, for a host that keeps its resources elsewhere.
   Conditional grants and conditional denies come back apart, to check one by one.
 - **Holders** lists who may do a permission on a resource, for an access review. That is each

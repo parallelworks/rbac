@@ -1499,7 +1499,8 @@ func (f GrantFilter) sql() (where string, scopes, principals []string) {
 // stored, so they can be revoked, even those that give less than their role or nothing: one to
 // a tenant's members or the public gives no `:grant` permission, and one of a role no longer in
 // the catalog, to a kind no longer declared, or to the public of a role no longer Public gives
-// nothing.
+// nothing. It has no limit or cursor, so what it returns grows with what matches, as every grant on
+// the tenant's scope, or of a group granted on each of its resources.
 func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) ([]Grant, error) {
 	if !validID(tenant) || !f.valid(tenant) {
 		return nil, fmt.Errorf("%w: Grants needs a tenant and valid scopes or principals", ErrInvalid)

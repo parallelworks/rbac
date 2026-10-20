@@ -255,7 +255,8 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 }
 
 // Memberships lists a tenant's memberships in force, by principal: of those principals, or with
-// none, all.
+// none, all. It has no limit or cursor, so with none, what it returns grows with the tenant's
+// members and guests.
 func (a *Authorizer) Memberships(ctx context.Context, tenant string, principals []Principal) ([]Membership, error) {
 	// The zero principal, the anonymous subject's, which a constraint may ask about, has none.
 	if !validID(tenant) || slices.ContainsFunc(principals, func(p Principal) bool { return p != (Principal{}) && !p.wellFormed(tenant) }) {
@@ -709,7 +710,8 @@ func (a *Authorizer) mayManageGroups(ctx context.Context, q DB, actor Subject, p
 	return nil
 }
 
-// Groups lists a tenant's groups, by id.
+// Groups lists a tenant's groups, by id. It has no limit or cursor, so what it returns grows with
+// them.
 func (a *Authorizer) Groups(ctx context.Context, tenant string) ([]GroupDefinition, error) {
 	if !validID(tenant) {
 		return nil, fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -1671,7 +1673,8 @@ func (a *Authorizer) leave(ctx context.Context, tx pgx.Tx, tenant string, member
 }
 
 // Members lists a group's members in force, as stored: identities and groups, not the members of
-// the groups in it. An identity whose membership of the tenant ended is in none of its groups.
+// the groups in it. An identity whose membership of the tenant ended is in none of its groups. It
+// has no limit or cursor, so what it returns grows with the group.
 func (a *Authorizer) Members(ctx context.Context, tenant, group string) ([]Member, error) {
 	if !validID(tenant) || !validGroupID(group) {
 		return nil, fmt.Errorf("%w: Members needs a tenant and a valid group", ErrInvalid)

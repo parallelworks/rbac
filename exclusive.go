@@ -194,7 +194,9 @@ type Conflict struct {
 }
 
 // Conflicts lists the identities in a tenant able to hold two values of an exclusive dimension,
-// as a catalog change or a dimension made Exclusive leaves them, by principal and dimension.
+// as a catalog change or a dimension made Exclusive leaves them, by principal and dimension. It
+// has no limit or cursor, so what it returns grows with them, as after a catalog change that makes
+// a role the tenant's members hold give two.
 func (a *Authorizer) Conflicts(ctx context.Context, tenant string) ([]Conflict, error) {
 	if !validID(tenant) {
 		return nil, fmt.Errorf("%w: no tenant", ErrInvalid)
