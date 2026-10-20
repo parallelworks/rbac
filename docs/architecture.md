@@ -369,7 +369,7 @@ sequenceDiagram
   changes what that one decides. Conditions stored before there were bounds may be past one, and
   so may those another version of CEL bounds: each process bounds a stored condition again by what
   the CEL it is built with makes of it, its macros and types, so an upgrade can bound one more.
-  `TestStoredConditionsKeepTheirBounds` pins the bounds of conditions of each shape, so that one an
+  `TestStoredConditionsKeepTheirBounds` pins the bounds of conditions of common shapes, so that one an
   upgrade moves shows in review. A change adding no condition to them isn't refused, and a check
   evaluates them cheapest first within its budget.
 

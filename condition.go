@@ -459,20 +459,46 @@ type worst struct {
 }
 
 // extent is the most an expression's value can be: its valueSize and textSize, the elements of a
-// list or the keys of a map, the bytes of a string, and what each element or key can be, nil for
-// what their type bounds.
+// list or the keys of a map, the bytes of a string, what each element or key can be, nil for no
+// more than the value (inside), and whether it is a map when it runs.
 type extent struct {
 	value, text, length, bytes uint64
 	elem                       *extent
+	form                       form
 }
+
+// form is whether a value is a map when it runs, whatever CEL checks it as (typed): `in` finds a
+// key in a map by reading the key, and in anything else reads what it searches. The zero form may
+// be either.
+type form uint8
+
+const (
+	// notMap is a list, a scalar, a string or bytes.
+	notMap form = iota + 1
+	// isMap is a map, as a map literal and a variable declared one are.
+	isMap
+)
 
 // unbounded is a cost or a size a condition doesn't bound.
 const unbounded = math.MaxUint64
 
 var anything = extent{value: unbounded, text: unbounded, length: unbounded, bytes: unbounded}
 
+// inside is the most a value inside one x bounds can be, as an element, a key or a field: no more
+// than x, whose valueSize counts each of them whole.
+func inside(x extent) extent {
+	if x.value == unbounded {
+		return anything
+	}
+	// A string's valueSize is a tenth of its bytes, and a list's or a map's at least its length.
+	return extent{value: x.value, text: x.value, length: x.value, bytes: cost.SafeMultiply(x.value, 10)}
+}
+
 func (x extent) union(y extent) extent {
 	u := extent{value: max(x.value, y.value), text: max(x.text, y.text), length: max(x.length, y.length), bytes: max(x.bytes, y.bytes)}
+	if x.form == y.form {
+		u.form = x.form
+	}
 	// A value of no elements, as the empty list map() and filter() start from, has none to bound.
 	switch {
 	case x.length == 0:
@@ -499,7 +525,7 @@ func (w worst) walk(e ast.Expr) (uint64, extent) {
 	switch e.Kind() {
 	case ast.LiteralKind:
 		v := e.AsLiteral()
-		x := extent{value: valueSize(v, unbounded), text: textSize(v), length: 0, bytes: 0}
+		x := extent{value: valueSize(v, unbounded), text: textSize(v), form: notMap}
 		switch v := v.(type) {
 		case types.String:
 			x.bytes = uint64(len(v))
@@ -513,14 +539,14 @@ func (w worst) walk(e ast.Expr) (uint64, extent) {
 		}
 		return 2, w.typed(e)
 	case ast.SelectKind:
-		n, _ := w.walk(e.AsSelect().Operand())
+		n, x := w.walk(e.AsSelect().Operand())
 		// A presence test is a bool; a field may be what its type isn't (typed).
 		if e.AsSelect().IsTestOnly() {
 			return cost.SafeAdd(n, 2), w.typed(e)
 		}
-		return cost.SafeAdd(n, 2), anything
+		return cost.SafeAdd(n, 2), inside(x)
 	case ast.ListKind:
-		n, x := uint64(10), extent{value: 1, text: 1, length: uint64(len(e.AsList().Elements()))}
+		n, x := uint64(10), extent{value: 1, text: 1, length: uint64(len(e.AsList().Elements())), form: notMap}
 		for i, el := range e.AsList().Elements() {
 			c, ex := w.walk(el)
 			n, x.value = cost.SafeAdd(n, c), cost.SafeAdd(x.value, ex.value)
@@ -533,7 +559,7 @@ func (w worst) walk(e ast.Expr) (uint64, extent) {
 		}
 		return n, x
 	case ast.MapKind:
-		n, x := uint64(30), extent{value: 1, text: 1, length: uint64(len(e.AsMap().Entries()))}
+		n, x := uint64(30), extent{value: 1, text: 1, length: uint64(len(e.AsMap().Entries())), form: isMap}
 		for i, entry := range e.AsMap().Entries() {
 			ck, k := w.walk(entry.AsMapEntry().Key())
 			cv, v := w.walk(entry.AsMapEntry().Value())
@@ -571,10 +597,14 @@ func (w worst) typed(e ast.Expr) extent {
 	switch w.checked.GetType(e.ID()).Kind() {
 	case types.BoolKind, types.IntKind, types.UintKind, types.DoubleKind, types.DurationKind, types.TimestampKind,
 		types.NullTypeKind, types.TypeKind:
-		return extent{value: 1, text: 1}
-	case types.ListKind, types.MapKind:
+		return extent{value: 1, text: 1, form: notMap}
+	case types.ListKind:
 		x := anything
-		x.text = 1
+		x.text, x.form = 1, notMap
+		return x
+	case types.MapKind:
+		x := anything
+		x.text, x.form = 1, isMap
 		return x
 	default:
 		return anything
@@ -587,21 +617,25 @@ func (w worst) comprehension(e ast.Expr) (uint64, extent) {
 	init, start := w.walk(comp.AccuInit())
 	// A macro making a list, as map() and filter() do, starts from an empty one, and each loop's step
 	// adds to it what it would add to that: one element, transformed or as it is, which reads no
-	// other, as no condition can name the list being made.
-	making := comp.AccuInit().Kind() == ast.ListKind
+	// other, as no condition can name the list being made. CEL names it @result, which no
+	// identifier can be: where it names it otherwise, as a version of it may, a step could read it
+	// and grow it by more each loop.
+	making := comp.AccuInit().Kind() == ast.ListKind && strings.HasPrefix(comp.AccuVar(), "@")
 	var accu *extent
 	if making {
 		accu = &start
 	}
-	// Each element is what the range's bound says, or anything (typed).
+	// Each element is what the range's bound says, or no more than the range, whatever CEL checks
+	// it as (typed).
 	each := over.elem
 	if each == nil {
-		a := anything
-		each = &a
+		in := inside(over)
+		each = &in
 	}
 	w.vars[comp.IterVar()] = append(w.vars[comp.IterVar()], each)
 	if comp.HasIterVar2() {
-		w.vars[comp.IterVar2()] = append(w.vars[comp.IterVar2()], nil)
+		a := anything
+		w.vars[comp.IterVar2()] = append(w.vars[comp.IterVar2()], &a)
 	}
 	w.vars[comp.AccuVar()] = append(w.vars[comp.AccuVar()], accu)
 	cond, _ := w.walk(comp.LoopCondition())
@@ -626,7 +660,10 @@ func (w worst) comprehension(e ast.Expr) (uint64, extent) {
 // once, a loop's step from start, grew it.
 func grown(start, once extent, n uint64) extent {
 	more := func(from, to uint64) uint64 { return cost.SafeAdd(from, cost.SafeMultiply(n, to-min(to, from))) }
-	return extent{value: more(start.value, once.value), text: 1, length: more(start.length, once.length), elem: start.union(once).elem}
+	return extent{
+		value: more(start.value, once.value), text: 1, length: more(start.length, once.length), elem: start.union(once).elem,
+		form: notMap,
+	}
 }
 
 func (w worst) call(e ast.Expr) (uint64, extent) {
@@ -658,8 +695,12 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 		}
 	case operators.Index:
 		own, x = 2, anything
-		if len(xs) == 2 && xs[0].elem != nil && listing(args[0]) {
-			x = *xs[0].elem
+		if len(xs) == 2 {
+			// A map's elem bounds its keys, not what they index.
+			x = inside(xs[0])
+			if xs[0].elem != nil && xs[0].form == notMap {
+				x = *xs[0].elem
+			}
 		}
 	case overloads.Matches:
 		own = unbounded
@@ -674,9 +715,9 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 		switch {
 		case fn != operators.In:
 			own = cost.SafeAdd(1, min(xs[0].value, xs[1].value))
-		case args[1].Kind() == ast.MapKind:
+		case xs[1].form == isMap:
 			own = cost.SafeAdd(1, xs[0].value)
-		case listing(args[1]):
+		case xs[1].form == notMap:
 			own = cost.SafeAdd(1, xs[1].value)
 		default:
 			own = cost.SafeAdd(1, max(xs[0].value, xs[1].value))
@@ -717,32 +758,8 @@ func added(x, y extent) extent {
 	return extent{
 		value: cost.SafeAdd(x.value, y.value), text: cost.SafeAdd(x.text, y.text),
 		length: cost.SafeAdd(x.length, y.length), bytes: cost.SafeAdd(x.bytes, y.bytes), elem: x.union(y).elem,
-	}
-}
-
-// listing reports whether e is a list when it runs, or what neither an index nor `in` reads, as a sum
-// of strings, whatever CEL checks it as (typed): a list literal, one map() or filter() makes, a sum,
-// or a dyn() or a choice of those.
-func listing(e ast.Expr) bool {
-	switch e.Kind() {
-	case ast.ListKind:
-		return true
-	case ast.ComprehensionKind:
-		return e.AsComprehension().AccuInit().Kind() == ast.ListKind
-	case ast.CallKind:
-		args := e.AsCall().Args()
-		switch e.AsCall().FunctionName() {
-		case operators.Add:
-			return true
-		case "dyn":
-			return len(args) == 1 && listing(args[0])
-		case operators.Conditional:
-			return len(args) == 3 && listing(args[1]) && listing(args[2])
-		default:
-			return false
-		}
-	default:
-		return false
+		// CEL adds no maps.
+		form: notMap,
 	}
 }
 

@@ -174,7 +174,7 @@ names the scopes conditional ones reach, to check one by one.
   are gone, and a check may not reach all of it: it evaluates the cheapest first within its budget.
   An upgrade of CEL can leave conditions stored past a bound in the same way: each process bounds
   a stored condition again by what the CEL it is built with makes of it, so another version can
-  bound one more, and the package's tests pin the bounds of conditions of each shape, so that one
+  bound one more, and the package's tests pin the bounds of conditions of common shapes, so that one
   an upgrade moves fails them. To hand a permission on, the actor holds it unconditionally or
   under the same condition, one that doesn't read the subject: that one decides for each holder,
   so the actor's holding says nothing of another's.

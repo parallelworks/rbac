@@ -10,8 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"cel.dev/cel-go/cel"
 	"cel.dev/cel-go/common/types"
 	"cel.dev/cel-go/common/types/ref"
+	"cel.dev/cel-go/ext"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -657,6 +659,11 @@ func TestAConditionCostsNoMoreThanItsBound(t *testing.T) {
 		{`["abc"].map(s, s + s + s).all(s, s.matches("c$")) && [[1], []].map(l, l + l).all(l, 1 in l)`, true},
 		{`["10.0.0.1", "10.0.0.2"].filter(ip, ip.startsWith("10.")).exists(ip, request.attributes.ip == ip)`, true},
 		{`[1, 2, 3].filter(x, x > 1).map(x, [x]) == [2, 3].map(x, [x]) && [[], ["ab"]].all(l, l.all(s, s.contains("a")))`, true},
+		// What a literal holds is bounded by it, wherever a condition reads it from.
+		{`[["10.0.0.1"], ["10.0.0.2"]].exists(g, request.attributes.ip in g) && "time" in request`, true},
+		{`{"dev": 1, "prod": 2}[resource.attributes.env] <= request.attributes.n && [{"n": 2}].exists(r, r.n == request.attributes.n)`, true},
+		{`[[1, 2], [3]][0][1] == request.attributes.x && [1].map(x, {"a": request.attributes.tags}).exists(m, "zz" in m)`, true},
+		{"[[" + strings.Repeat("0, ", 499) + "0]].all(l, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(i, \"a\".startsWith(dyn(l))))", true},
 		{`"gpu" in request.attributes.tags`, false},
 		{`request.attributes.team in {"sre": true}`, false},
 		{`size(request.attributes.tags) > 0`, false},
@@ -675,6 +682,9 @@ func TestAConditionCostsNoMoreThanItsBound(t *testing.T) {
 		{`(dyn([{"a": request.attributes.tags}]) + [{"a": 1}]).exists(m, m.a == request.attributes.tags)`, false},
 		{`(dyn([[request.attributes.tags]]) + [""]).exists(s, s + s == request.attributes.tags)`, false},
 		{"[[" + strings.Repeat("0, ", 499) + "0]].all(l, dyn(l).contains(dyn(l)))", false},
+		// A map's keys don't bound what they index, and what may be a map or a list finds a key by it.
+		{`{"a": request.attributes.tags}["a"] == request.attributes.tags`, false},
+		{`[[1], {"a": 1}].exists(v, request.attributes.ip in v)`, false},
 	} {
 		for i, attributes := range requests {
 			limit, actual := rbac.ConditionCost(t, c.expr, attributes)
@@ -688,9 +698,27 @@ func TestAConditionCostsNoMoreThanItsBound(t *testing.T) {
 	}
 }
 
+// Another version of CEL may expand macros otherwise: name the list map() makes so a condition can
+// read it and grow it by more each loop, or give a loop a second variable, which CEL checks as a
+// type it needn't have. A condition still costs no more than its bound.
+func TestAConditionCostsNoMoreThanItsBoundWhereCELExpandsMacrosOtherwise(t *testing.T) {
+	ones := strings.Repeat("1, ", 11) + "1"
+	for _, c := range []struct {
+		expr string
+		opt  cel.EnvOption
+	}{
+		{"[" + ones + "].map(x, dyn(__result__.map(y, y))) == [" + ones + "].map(x, dyn(__result__.map(y, y)))", cel.EnableHiddenAccumulatorName(false)},
+		{"(dyn([[" + strings.Repeat("0, ", 499) + "0]]) + [1]).all(i, v, v == v)", ext.TwoVarComprehensions()},
+	} {
+		if limit, actual := rbac.ConditionCost(t, c.expr, nil, c.opt); actual > limit {
+			t.Errorf("%s cost %d, past its bound, %d", c.expr, actual, limit)
+		}
+	}
+}
+
 // A stored condition's bound is computed again in each process, from what the CEL it is built with
 // makes of it, so another version of CEL can move the bounds of conditions already stored and leave
-// what a check reads together past one. These pin the bound of a condition of each shape, so an
+// what a check reads together past one. These pin the bounds of conditions of common shapes, so an
 // upgrade that moves one shows.
 func TestStoredConditionsKeepTheirBounds(t *testing.T) {
 	for _, c := range []struct {
@@ -715,6 +743,9 @@ func TestStoredConditionsKeepTheirBounds(t *testing.T) {
 		{`[1, 2, 3].map(x, x > 1, x * 2) == [4, 6]`, 108},
 		{`[1, 2].map(x, "ab").all(s, s.contains("a"))`, 70},
 		{`["10.0.0.1", "10.0.0.2"].filter(ip, ip.startsWith("10.")).exists(ip, request.attributes.ip == ip)`, 100},
+		{`[["10.0.0.1"], ["10.0.0.2"]].exists(g, request.attributes.ip in g) && "time" in request`, 70},
+		{`{"dev": 1, "prod": 2}[resource.attributes.env] <= request.attributes.n`, 50},
+		{`[{"level": 2}, {"level": 3}].exists(r, r.level == request.attributes.n)`, 112},
 		{`"gpu" in request.attributes.tags`, 10000},
 		{`request.attributes.tags.exists(t, t == "gpu")`, 10000},
 	} {
