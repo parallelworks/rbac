@@ -44,8 +44,8 @@ func Migrate(ctx context.Context, db DB) error {
 		if err := tx.QueryRow(ctx, `SELECT current_schema(), current_setting('transaction_isolation')`).Scan(&schema, &level); err != nil {
 			return err
 		}
-		if level != "read committed" {
-			return fmt.Errorf("rbac: Migrate runs at READ COMMITTED, not %s", strings.ToUpper(level))
+		if err := readCommitted("Migrate", level); err != nil {
+			return err
 		}
 		if schema == nil {
 			return errors.New("rbac: no schema in the search_path exists to migrate in")

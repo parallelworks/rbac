@@ -307,7 +307,9 @@ floor is at least a year.
 A role that owns a table can change it whatever its triggers say, and a schema's owner can drop
 any table in it. So that the application's database role can't rewrite history or write around
 it, that role is no superuser, nor a member of `pg_write_all_data` or `pg_create_subscription`,
-through which it could write `rbac_history` itself; and:
+through which it could write `rbac_history` itself, and before PostgreSQL 16 has no `CREATEROLE`,
+with which it could make itself a member of any role but a superuser, such as those or the roles
+below; and:
 
 1. `Migrate` runs as an administrator's role the application's isn't a member of, with only the
    package's schema in its search_path, so that role owns the package's tables: their owner can

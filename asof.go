@@ -73,11 +73,8 @@ func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read
 	}
 	// Once ctx is done, a rollback on it isn't sent: a savepoint of the host's left standing keeps
 	// the views in its transaction, which then reads the past, and in its session once it commits.
-	// Bounded, as savepoint's end is, so a dead connection can't hold AsOf for good.
 	defer func() {
-		c, cancel := context.WithTimeout(context.WithoutCancel(ctx), savepointEnd)
-		defer cancel()
-		if rerr := tx.Rollback(c); rerr != nil {
+		if rerr := finish(ctx, tx.Rollback); rerr != nil {
 			err = errors.Join(err, rerr)
 		}
 	}()
@@ -200,9 +197,7 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	// At READ COMMITTED, as a host's transaction under WithTx is, each of read's queries reads what
 	// has committed by then, so one after a prune that committed since the check read what it
 	// removed. Checked once ctx is done too, as read's answers stand only if this passes.
-	c, cancel := context.WithTimeout(context.WithoutCancel(ctx), savepointEnd)
-	defer cancel()
-	return unpruned(c, tx, schema, at)
+	return finish(ctx, func(c context.Context) error { return unpruned(c, tx, schema, at) })
 }
 
 // unpruned refuses at, on tx, once a prune has run past it: of each row a prune keeps only its

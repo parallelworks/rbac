@@ -392,8 +392,13 @@ func locked(br pgx.BatchResults) error {
 	if err := br.Close(); err != nil {
 		return err
 	}
+	return readCommitted("a change", level)
+}
+
+// readCommitted refuses, for what, a transaction at any level but READ COMMITTED.
+func readCommitted(what, level string) error {
 	if level != "read committed" {
-		return fmt.Errorf("rbac: a change runs at READ COMMITTED, not %s", strings.ToUpper(level))
+		return fmt.Errorf("rbac: %s runs at READ COMMITTED, not %s", what, strings.ToUpper(level))
 	}
 	return nil
 }
@@ -1359,9 +1364,7 @@ func repeatableRead(ctx context.Context, db DB) (pgx.Tx, error) {
 	if _, err = tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err == nil {
 		return tx, nil
 	}
-	c, cancel := context.WithTimeout(context.WithoutCancel(ctx), savepointEnd)
-	defer cancel()
-	if rerr := tx.Rollback(c); rerr != nil || !isolationRefused(err) {
+	if rerr := finish(ctx, tx.Rollback); rerr != nil || !isolationRefused(err) {
 		return nil, errors.Join(err, rerr)
 	}
 	return db.Begin(ctx)
@@ -1369,6 +1372,15 @@ func repeatableRead(ctx context.Context, db DB) (pgx.Tx, error) {
 
 // savepointEnd is how long a savepoint's release or rollback may take once its ctx is done.
 var savepointEnd = 10 * time.Second
+
+// finish runs f, a transaction's or savepoint's end or a check before it, on ctx even once it is
+// done, as pgx sends nothing on a done ctx; bounded by savepointEnd from the call, as a done ctx's
+// deadline no longer is, so a dead connection can't hold it for good.
+func finish(ctx context.Context, f func(context.Context) error) error {
+	c, cancel := context.WithTimeout(context.WithoutCancel(ctx), savepointEnd)
+	defer cancel()
+	return f(c)
+}
 
 // savepoint runs fn in a savepoint, which it releases or rolls back even once ctx is done: pgx
 // sends nothing on a done ctx, which would leave the savepoint open, and the host's transaction
@@ -1378,19 +1390,13 @@ func savepoint(ctx context.Context, db DB, fn func(pgx.Tx) error) error {
 	if err != nil {
 		return err
 	}
-	// Bounded, as a done ctx's deadline no longer is, so a dead connection can't hold it for good;
-	// from when fn returns, or a change that took as long would leave it open.
-	end := func(f func(context.Context) error) error {
-		c, cancel := context.WithTimeout(context.WithoutCancel(ctx), savepointEnd)
-		defer cancel()
-		return f(c)
-	}
-	// After the release, a no-op.
-	defer func() { _ = end(tx.Rollback) }()
+	// Bounded from when fn returns, or a change that took as long would leave it open. After the
+	// release, a no-op.
+	defer func() { _ = finish(ctx, tx.Rollback) }()
 	if err := fn(tx); err != nil {
 		return err
 	}
-	return end(tx.Commit)
+	return finish(ctx, tx.Commit)
 }
 
 // report hands a change to Config.OnChange in its transaction, unless it changed nothing.
