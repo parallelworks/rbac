@@ -145,6 +145,16 @@ func CountEvaluations(t *testing.T) *int {
 // maxCost, built with the package's CEL environment extended by opts.
 func ConditionCost(t *testing.T, expr string, attributes map[string]any, opts ...cel.EnvOption) (limit, actual uint64) {
 	t.Helper()
+	return ConditionCostOn(t, expr, Subject{Principal: Principal{Kind: User, ID: "u"}}, "cluster:login",
+		Resource{Tenant: "t", Type: "cluster", ID: "c", Attributes: attributes}, attributes, opts...)
+}
+
+// MaxPermission is the longest action conditions are bounded for.
+const MaxPermission = maxPermission
+
+// ConditionCostOn is ConditionCost for s asking to do p to r, on a request with attributes.
+func ConditionCostOn(t *testing.T, expr string, s Subject, p Permission, r Resource, attributes map[string]any, opts ...cel.EnvOption) (limit, actual uint64) {
+	t.Helper()
 	c, err := newConditions(Attributes{})
 	if err != nil {
 		t.Fatal(err)
@@ -172,8 +182,7 @@ func ConditionCost(t *testing.T, expr string, attributes map[string]any, opts ..
 		t.Fatal(err)
 	}
 	a := &Authorizer{cfg: Config{Now: time.Now}, conds: c}
-	vars := a.vars(WithRequest(t.Context(), attributes), Subject{Principal: Principal{Kind: User, ID: "u"}},
-		"cluster:login", Resource{Tenant: "t", Type: "cluster", ID: "c", Attributes: attributes})
+	vars := a.vars(WithRequest(t.Context(), attributes), s, p, r)
 	_, details, _ := unlimited.Eval(vars)
 	return prg.limit, *details.ActualCost()
 }

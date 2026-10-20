@@ -298,6 +298,43 @@ func TestDeclaredAttributesChangedAfterNewAreReadAsDeclaredAtNew(t *testing.T) {
 	}
 }
 
+// A map's entries are named for it beside its kind's attributes, so names that are each an
+// identifier can name one thing between them, or a map's entries no identifier: New refuses them,
+// naming the attributes, where declaring them would fail with an error naming neither.
+func TestDeclaredAttributesNamingAMapsEntriesAreRefusedByName(t *testing.T) {
+	h := setup(t)
+	for _, c := range []struct {
+		attrs rbac.Attributes
+		names []string
+	}{
+		{rbac.Attributes{Subject: map[string]rbac.AttributeType{"a_b": rbac.AttrStringMap, "aB": rbac.AttrStringMap}}, []string{`"aB"`, `"a_b"`}},
+		{rbac.Attributes{Resource: map[string]rbac.AttributeType{"tags": rbac.AttrStringMap, "TagsEntry": rbac.AttrString}}, []string{`"tags"`, `"TagsEntry"`}},
+		{rbac.Attributes{Request: map[string]rbac.AttributeType{"_1": rbac.AttrStringMap}}, []string{`"_1"`}},
+	} {
+		cfg := h.cfg
+		cfg.Attributes = c.attrs
+		_, err := rbac.New(h.pool, cfg)
+		if err == nil {
+			t.Errorf("%v declared", c.attrs)
+			continue
+		}
+		for _, name := range c.names {
+			if !strings.Contains(err.Error(), name) {
+				t.Errorf("%v refused without naming %s: %v", c.attrs, name, err)
+			}
+		}
+	}
+	// Names alike that name nothing twice in a kind are declared.
+	cfg := h.cfg
+	cfg.Attributes = rbac.Attributes{
+		Resource: map[string]rbac.AttributeType{"a_b": rbac.AttrStringMap, "aEntry": rbac.AttrStringMap, "AEntry": rbac.AttrString, "__": rbac.AttrStringMap},
+		Request:  map[string]rbac.AttributeType{"aB": rbac.AttrStringMap, "a_1": rbac.AttrStringMap},
+	}
+	if _, err := rbac.New(h.pool, cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // A grant's condition, a deny's and a requirement, stored while env and level were declared strings,
 // read once the host declares them lists of strings: none passes the declarations now, so each
 // fails, rather than run as if they hadn't changed, where a list is unequal to any string.
@@ -716,6 +753,49 @@ func TestAConditionCostsNoMoreThanItsBoundWhereCELExpandsMacrosOtherwise(t *test
 	}
 }
 
+// A check passes ids, a kind, a type and a tenant of at most MaxID bytes, and a permission as the
+// action, so a condition comparing an attribute with one, as an owner's does, or finding one in a
+// map, costs little, and no more than its bound however long they are. A comprehension's variable
+// of the same name is what it ranges over, which the request decides.
+func TestAConditionReadingTheIDsACheckPassesCostsLittle(t *testing.T) {
+	longest := strings.Repeat("x", rbac.MaxID)
+	name := "k" + strings.Repeat("x", 62)
+	// The action is bounded at the longest permission, so a pattern admitting longer ones fails here.
+	action := rbac.Permission(name + ":" + name)
+	if !action.Valid() || len(action) != rbac.MaxPermission || rbac.Permission(name+"x:"+name).Valid() ||
+		rbac.Permission(name+":"+name+"x").Valid() {
+		t.Fatalf("the longest permission isn't the %d bytes an action is bounded at", rbac.MaxPermission)
+	}
+	big := strings.Repeat("y", 20000)
+	attributes := map[string]any{"owner": big, "dept": big, "id": big, "tags": []any{big, big}}
+	s := rbac.Subject{Principal: rbac.Principal{Kind: rbac.PrincipalKind(name), ID: longest}, Attributes: attributes}
+	r := rbac.Resource{Tenant: longest, Type: name, ID: longest, Attributes: attributes}
+	for _, c := range []struct {
+		expr  string
+		cheap bool
+	}{
+		{`resource.attributes.owner == subject.id`, true},
+		{`subject.id == resource.attributes.owner && resource.tenant != subject.attributes.dept`, true},
+		{`resource.id.startsWith(subject.id) && subject.id.endsWith(resource.tenant)`, true},
+		{`subject.kind + ":" + resource.type + ":" + resource.id == action + subject.id`, true},
+		{`subject.id in {"alice": true} || action in {"cluster:login": true} || resource.type in {"cluster": 1}`, true},
+		{`subject.id.matches("^svc-") && size(resource.id) > 0 && string(resource.tenant) == subject.id`, true},
+		{`[resource.attributes].exists(subject, subject.owner == .subject.id)`, true},
+		{`[resource.attributes.owner].exists(action, action.startsWith(.action))`, true},
+		{`subject.id in resource.attributes.tags`, false},
+		{`[resource.attributes].exists(subject, subject.id == resource.attributes.owner)`, false},
+		{`resource.attributes.tags.exists(action, action == resource.attributes.owner)`, false},
+	} {
+		limit, actual := rbac.ConditionCostOn(t, c.expr, s, action, r, attributes)
+		if actual > limit {
+			t.Errorf("%s cost %d, past its bound, %d", c.expr, actual, limit)
+		}
+		if c.cheap != (limit < 1000) {
+			t.Errorf("%s is bounded at %d", c.expr, limit)
+		}
+	}
+}
+
 // A stored condition's bound is computed again in each process, from what the CEL it is built with
 // makes of it, so another version of CEL can move the bounds of conditions already stored and leave
 // what a check reads together past one. These pin the bounds of conditions of common shapes, so an
@@ -746,6 +826,13 @@ func TestStoredConditionsKeepTheirBounds(t *testing.T) {
 		{`[["10.0.0.1"], ["10.0.0.2"]].exists(g, request.attributes.ip in g) && "time" in request`, 70},
 		{`{"dev": 1, "prod": 2}[resource.attributes.env] <= request.attributes.n`, 50},
 		{`[{"level": 2}, {"level": 3}].exists(r, r.level == request.attributes.n)`, 112},
+		// The ids, kinds, types and tenant a check passes are of at most MaxID bytes, and its action a
+		// permission's.
+		{`resource.attributes.owner == subject.id`, 63},
+		{`resource.id.startsWith(subject.id) && resource.tenant == subject.attributes.dept`, 123},
+		{`subject.kind + ":" + resource.type in {"user:cluster": true} && subject.id.matches("^svc-")`, 672},
+		{`action in {"cluster:login": true, "cluster:read": true}`, 46},
+		{`[resource.attributes].exists(subject, subject.owner == .subject.id)`, 83},
 		{`"gpu" in request.attributes.tags`, 10000},
 		{`request.attributes.tags.exists(t, t == "gpu")`, 10000},
 	} {
@@ -780,6 +867,33 @@ func TestCheapConditionsFitAScopeByTheHundreds(t *testing.T) {
 	s := h.as(t, "u", groups...)
 	if err := h.authz.Authorize(rbac.WithRequest(ctx, map[string]any{"ip": "10.0.249.1"}), s, login, cluster); err != nil {
 		t.Fatalf("the last group's address: %v", err)
+	}
+}
+
+// Conditions comparing an attribute with the subject's id, as an owner's, cost little too, as ids
+// are bounded, so the grants a check reads together on a scope may carry a hundred.
+func TestOwnerConditionsFitAScopeByTheHundred(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	var groups []string
+	var grants []rbac.Grant
+	for i := range 100 {
+		g := fmt.Sprintf("g%02d", i)
+		groups = append(groups, g)
+		b := rbac.Binding{Role: "cluster.login", Principal: groupOf(g), Condition: rbac.Condition{
+			Expression: fmt.Sprintf(`resource.attributes.owner == subject.id && resource.attributes.team == "t%02d"`, i),
+		}}
+		grants = append(grants, rbac.Grant{Scope: cluster.Scope(), Binding: b})
+	}
+	h.groups(t, groups...)
+	if err := h.authz.Import(ctx, host, "t1", grants); err != nil {
+		t.Fatalf("100 owner conditions: %v", err)
+	}
+	// A check of a subject in every group evaluates them all.
+	r := cluster
+	r.Attributes = map[string]any{"owner": "u", "team": "t99"}
+	if err := h.authz.Authorize(ctx, h.as(t, "u", groups...), login, r); err != nil {
+		t.Fatalf("the last group's team: %v", err)
 	}
 }
 
