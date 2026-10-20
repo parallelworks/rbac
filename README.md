@@ -194,11 +194,11 @@ grants: `Reach.Conditional` names the scopes conditional ones reach, to check on
   removed member, or one whose membership is made to end sooner, is from those naming it, which
   the actor must be able to set. So whoever manages a group that holds, approves and is in no deny
   changes its members freely, and one holding a role only if they could grant that role
-  themselves. `Config.ResourceOf` gives the package the tenant and the groups, which `SetGroup`
-  and `DeleteGroup` check `rbac.ManageGroups` on, with their constraints and labels, as
-  `ChangeMembers` does `rbac.GroupMembers`, and the containers, label and attributes of the scopes
-  a group's access is on; a host without it declares no labels and resource attributes as none,
-  and for access below the tenant, no containers.
+  themselves. `Config.ResourceOf` gives the package the tenant, which `SetGroup` and `DeleteGroup`
+  check `rbac.ManageGroups` on, and the groups, which `ChangeMembers` checks `rbac.GroupMembers` on,
+  each with its constraints and label, and the containers, label and attributes of the scopes a
+  group's access is on; a host without it declares no labels and resource attributes as none, and
+  for access below the tenant, no containers.
 - **Privileged roles:** a role the catalog marks `Privileged`, or one that changes access, is
   privileged: it is never granted to the tenant's members, and gives nothing through them, as
   after a catalog change.

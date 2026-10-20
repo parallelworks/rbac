@@ -1050,11 +1050,12 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 // approve, whose activations it then approves; and the denies that name or exempt them.
 type reach struct {
 	// up is each group's key and those of the groups it is in, by group, as the change will store
-	// them: so with the nestings it adds too.
-	up        map[string]map[string]bool
-	held      []revalidation
-	approving []approving
-	denies    []Deny
+	// them: so with the nestings it adds too. stored is as they are stored, which a member leaving
+	// a group leaves: not those the change nests the group in, which it was never in.
+	up, stored map[string]map[string]bool
+	held       []revalidation
+	approving  []approving
+	denies     []Deny
 	// ending is the members added, by memberKey, that end a membership in force sooner than it
 	// would: they leave the group then, as removing them does now.
 	ending map[string]bool
@@ -1101,7 +1102,7 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 	}); err != nil {
 		return reach{}, err
 	}
-	r.nest(add)
+	r.stored, r.up = r.up, r.nested(add)
 	keys := slices.Sorted(maps.Keys(reached))
 	rows, err = q.Query(ctx, `SELECT `+grantColumns+` FROM rbac_grants
 		WHERE tenant = $1 AND principal = ANY($2::text[]) AND (expires_at IS NULL OR expires_at > $3) ORDER BY id`, tenant, keys, now)
@@ -1168,12 +1169,12 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 	return r, nil
 }
 
-// nest extends each group's up over the groups add nests in others, as the change will store them:
-// a member it adds below one reaches what the group it nests that one in holds, which as stored
-// it doesn't yet, and the host would be asked about it only for the nested group, without the
-// member. Each group a nesting is in, its outer group's up, is read already, as it is a group the
-// change changes.
-func (r reach) nest(add []Member) {
+// nested is each group's up extended over the groups add nests in others, as the change will store
+// them: a member it adds below one reaches what the group it nests that one in holds, which as
+// stored it doesn't yet, and the host would be asked about it only for the nested group, without
+// the member. Each group a nesting is in, its outer group's up, is read already, as it is a group
+// the change changes.
+func (r reach) nested(add []Member) map[string]map[string]bool {
 	outer := map[string][]string{}
 	for _, m := range add {
 		if m.Principal.Kind == Group {
@@ -1181,9 +1182,12 @@ func (r reach) nest(add []Member) {
 		}
 	}
 	if len(outer) == 0 {
-		return
+		return r.up
 	}
-	for _, up := range r.up {
+	nested := make(map[string]map[string]bool, len(r.up))
+	for group, stored := range r.up {
+		up := maps.Clone(stored)
+		nested[group] = up
 		next := slices.Collect(maps.Keys(up))
 		for len(next) > 0 {
 			k := next[len(next)-1]
@@ -1198,6 +1202,7 @@ func (r reach) nest(add []Member) {
 			}
 		}
 	}
+	return nested
 }
 
 // endingSooner reads, on q, which of the members add sets, by memberKey, end a membership in force
@@ -1243,16 +1248,16 @@ func (r reach) leaving(add, remove []Member) []Member {
 	return out
 }
 
-// in reports whether ps names group or a group it is in.
-func (r reach) in(group string, ps ...Principal) bool {
-	return slices.ContainsFunc(ps, func(p Principal) bool { return r.up[group][p.key()] })
+// in reports whether ps names group or a group it is in, by up.
+func in(up map[string]map[string]bool, group string, ps ...Principal) bool {
+	return slices.ContainsFunc(ps, func(p Principal) bool { return up[group][p.key()] })
 }
 
 // heldBy is what a member of group gains: the grants and eligibilities of it and those it is in.
 func (r reach) heldBy(group string) []revalidation {
 	var vs []revalidation
 	for _, v := range r.held {
-		if r.in(group, v.binding.Principal) {
+		if in(r.up, group, v.binding.Principal) {
 			vs = append(vs, v)
 		}
 	}
@@ -1263,19 +1268,19 @@ func (r reach) heldBy(group string) []revalidation {
 func (r reach) approvedBy(group string) []revalidation {
 	var vs []revalidation
 	for _, v := range r.approving {
-		if r.in(group, v.approvers...) {
+		if in(r.up, group, v.approvers...) {
 			vs = append(vs, v.revalidation)
 		}
 	}
 	return vs
 }
 
-// lifted is the denies that no longer bind a member that joins group, exempting it or one it is
-// in, or with leaving, that leaves it, naming it or one it is in.
+// lifted is the denies that no longer bind a member that joins group, exempting it or one it will
+// be in, or with leaving, that leaves it, naming it or one it is in.
 func (r reach) lifted(group string, leaving bool) []Deny {
 	var ds []Deny
 	for _, d := range r.denies {
-		if !leaving && r.in(group, d.Exempt...) || leaving && r.in(group, d.Principals...) {
+		if !leaving && in(r.up, group, d.Exempt...) || leaving && in(r.stored, group, d.Principals...) {
 			ds = append(ds, d)
 		}
 	}

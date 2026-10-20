@@ -2007,6 +2007,45 @@ func TestChangingMembersIsCheckedAsTheDeniesAndApprovalsItChanges(t *testing.T) 
 	}
 }
 
+// A member leaving a group the same change nests in another leaves only the groups it was in, so a
+// deny naming the other binds it neither before nor after: nothing is lifted. One joining it is
+// exempt as the group it will be in is.
+func TestLeavingAGroupAChangeNestsLiftsNoDenyOnWhereItIsNested(t *testing.T) {
+	h := grouped(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), guardRole) })
+	ctx := t.Context()
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "contractors"}, {ID: "admins"}, {ID: "oncall"}}); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "lead"), grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+	h.join(t, "u")
+	d := rbac.Deny{ID: "d", Principals: []rbac.Principal{groupOf("admins")}, Exempt: []rbac.Principal{groupOf("oncall")}, Permissions: []rbac.Permission{login}}
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, d); err != nil {
+		t.Fatal(err)
+	}
+	lead := h.as(t, "lead")
+	u := rbac.Member{Group: "contractors", Principal: identity("u")}
+	in := func(group string) rbac.Member { return rbac.Member{Group: group, Principal: groupOf("contractors")} }
+	sooner := u
+	sooner.ExpiresAt = h.now.Add(time.Hour)
+	for name, c := range map[string]struct{ add, remove []rbac.Member }{
+		"removed":       {add: []rbac.Member{in("admins")}, remove: []rbac.Member{u}},
+		"ending sooner": {add: []rbac.Member{in("admins"), sooner}},
+	} {
+		if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{u}); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.authz.ChangeMembers(ctx, lead, "t1", c.add, c.remove); err != nil {
+			t.Errorf("%s while nesting its group in a denied one: %v", name, err)
+		}
+		if err := h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{u, in("admins")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.authz.ChangeMembers(ctx, lead, "t1", []rbac.Member{u, in("oncall")}, nil); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("joining while nesting its group in an exempt one: %v", err)
+	}
+}
+
 func TestChangingMembersReadsTheScopesItReachesFromTheHost(t *testing.T) {
 	workspaceGuard := rbac.RoleDefinition{ID: "workspace.guard", Permissions: []rbac.Permission{rbac.DenyPermission("workspace")}, ResourceTypes: []string{"workspace"}}
 	h := grouped(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), workspaceGuard) })
