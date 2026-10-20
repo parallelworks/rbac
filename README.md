@@ -263,11 +263,13 @@ names the scopes conditional ones reach, to check one by one.
 
 ## Why
 
-`Explain` names the grants that allow, or the deny or constraint that denied; `Permissions` lists
-what a subject may do; `Holders` lists who may, for an access review: each identity, through its own
-grants and its groups', and the tenant's members and the public as one holder each, marking those
-that hold only under a condition or that a deny or constraint may bind. A `DeniedError`'s message
-names only the permission, so an error shown to a user shows no policy; its fields say why.
+`Explain` names the grants that allow, or the deny, the constraint or the label's dimension that
+denied, or for a value of an exclusive dimension the subject holds none of, that dimension;
+`Permissions` lists what a subject may do; `Holders` lists who may, for an access review: each
+identity, through its own grants and its groups', and the tenant's members and the public as one
+holder each, marking those that hold only under a condition or that a deny or constraint may bind. A
+`DeniedError`'s message names only the permission, so an error shown to a user shows no policy; its
+fields say why.
 
 ## History
 

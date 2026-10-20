@@ -353,7 +353,7 @@ sequenceDiagram
 ```
 
 - **Explain** decides the same way and says why: every grant that allows, or the deny, constraint
-  or label that refused. It reads the subject's keys, grants and denies in one snapshot, and its
+  or label that refused, a label's or an exclusive value's dimension in `Decision.Label`. It reads the subject's keys, grants and denies in one snapshot, and its
   label values after it.
 - **Permissions** lists everything a subject may do on a resource, deciding each as Authorize
   would.
@@ -522,7 +522,7 @@ flowchart TB
     sat -->|"every dimension satisfied"| ok(["allowed, if the grants allow"])
     sat -->|"one not"| no(["refused, Decision.Label names it"])
     holding --> two{"Two values of an<br/>Exclusive dimension?"}
-    two -->|yes| none(["holds none of them"])
+    two -->|yes| none(["holds none of them,<br/>Decision.Label names it"])
 ```
 
 - **Values are decided on the bare tenant.** Every check decides a label value or a power to

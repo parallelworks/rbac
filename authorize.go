@@ -20,7 +20,8 @@ type Decision struct {
 	// DeniedBy names the constraint or deny policy that removed the permission.
 	DeniedBy string
 	// Label is the dimension of the resource's label the subject's holding doesn't satisfy, which
-	// denied what its grants allowed.
+	// denied what its grants allowed; or for a value of an exclusive dimension, that dimension, of
+	// which the subject holds none, as its grants could give it two.
 	Label string
 	// Reason says why it was denied, in English, for logs.
 	Reason string
@@ -63,7 +64,7 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 		return Decision{}, err
 	}
 	if h.excludes(p) {
-		return Decision{Reason: exclusiveRefusal(value)}, nil
+		return Decision{Label: value, Reason: exclusiveRefusal(value)}, nil
 	}
 	if dim := h.Unsatisfied(r.Labels); dim != "" {
 		return Decision{Label: dim, Reason: labelRefusal(dim)}, nil

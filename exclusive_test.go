@@ -304,6 +304,28 @@ func TestASubjectWhoseGrantsCouldGiveTwoExclusiveValuesHoldsNone(t *testing.T) {
 	}
 }
 
+// Explain names the exclusive dimension of a value it refuses because the subject's grants could
+// give it two, as it names the dimension of a label the subject's holding doesn't satisfy.
+func TestExplainNamesTheExclusiveDimensionOfAValueItRefuses(t *testing.T) {
+	h := labeled(t, banks)
+	ctx := t.Context()
+	ann := h.as(t, "ann")
+	// As a catalog change leaves them: written around the change check.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'tenant', 't1', 'user', 'ann', 'bank.a'), ('t1', 'tenant', 't1', 'user', 'ann', 'bank.b')`); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "ann"))
+	partner := cluster
+	partner.Labels = rbac.Label{"bank": {"a"}}
+	for p, r := range map[rbac.Permission]rbac.Resource{"bank:a": tenantT1, view: partner} {
+		d, err := h.authz.Explain(ctx, ann, p, r)
+		if err != nil || d.Allowed || d.Label != "bank" || d.DeniedBy != "" {
+			t.Errorf("Explain %s = %+v, %v", p, d, err)
+		}
+	}
+}
+
 func TestConflictsListsThePublic(t *testing.T) {
 	h := labeled(t, func(c *rbac.Config) {
 		banks(c)
