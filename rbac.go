@@ -921,12 +921,13 @@ func vocabulary(declared []Permission, given map[Permission]bool, roleTypes map[
 // any row locks: PostgreSQL fails one, to be retried. DeleteTenant, SetRole and DeleteRole lock the
 // whole tenant, as does any other call that would lock more than 64 scopes and principals: a change
 // by an actor, as Apply or ChangeMembers, and Import, DeleteGrants, DeleteScopes, SetMemberships,
-// ImportGroups, ImportMembers and DeleteMembers, and so SetDeny from 64 groups named, and
-// DeleteGroups from 32 groups, which it locks as scopes and principals both. Make such a call the
-// first change in tx: after another, it waits for every change in the tenant while holding locks
-// they may wait for, and PostgreSQL fails one as a deadlock. Where a label dimension is Exclusive,
-// every change takes a lock of its tenant's first, which the tenant's other changes wait for, so
-// two transactions changing two tenants in opposite orders can deadlock too. Explain, Reachable and
+// ImportGroups, ImportMembers and DeleteMembers, and so SetDeny from 64 groups named, DeleteGroups
+// from 32 groups, which it locks as scopes and principals both, and DeleteGroup from 62 groups the
+// group is in, through those they are in, whose locks it holds. Make such a call the first change
+// in tx: after another, it waits for every change in the tenant while holding locks they may wait
+// for, and PostgreSQL fails one as a deadlock. Where a label dimension is Exclusive, every change
+// takes a lock of its tenant's first, which the tenant's other changes wait for, so two
+// transactions changing two tenants in opposite orders can deadlock too. Explain, Reachable and
 // Holders read in several statements, on tx at its isolation: at READ COMMITTED each reads a
 // snapshot of its own, so a change committing between them can mix two states.
 func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
