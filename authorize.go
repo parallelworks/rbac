@@ -869,15 +869,15 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 		return Reach{}, nil
 	}
 	// Denies on scopes a resource of the type can have on its path: those of the type, the
-	// containers and the tenant, that bind the subject, found by the keys they bind it by (naming),
-	// as Filter finds them.
+	// containers and the tenant, that bind the subject (bindingDenies), as Filter finds them.
 	if perm, wildcard, deniable := matchable(p); deniable {
+		narrow := countedOf(binding, broad{})
+		wide := slices.DeleteFunc(slices.Clone(binding), func(k string) bool { return slices.Contains(narrow, k) })
 		rows, err = a.db.Query(ctx, `
-			SELECT scope, bool_or(condition = '') FROM rbac_denies
-			WHERE `+naming("principals", "$3")+` AND scope_type = ANY($2::text[])
-			  AND NOT exempt && $6::text[] AND ($4 = ANY(permissions) OR $5 = ANY(permissions))
+			SELECT scope, bool_or(condition = '') FROM (`+bindingDenies("$1", "$2", "$3", "$7", "scope, condition, exempt, permissions")+`) d
+			WHERE NOT exempt && $6::text[] AND ($4 = ANY(permissions) OR $5 = ANY(permissions))
 			GROUP BY scope ORDER BY scope`,
-			tenant, reaching, binding, perm, wildcard, exempting(keys, s))
+			tenant, reaching, narrow, perm, wildcard, exempting(keys, s), wide)
 		if err != nil {
 			return Reach{}, err
 		}
@@ -995,14 +995,14 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 			givingSQL(arg(7), arg(1), arg(8), arg(9), custom, publicOnly(catalogSQL{arg(10), arg(11), arg(12)})),
 			broadKindsSQL, givingSQL(arg(18), arg(1), arg(8), arg(9), custom, privilegedOnly(catalogSQL{arg(19), arg(20), arg(21)}))))
 	}
-	// The denies on the scopes `of` keeps that bind the subject, found by the keys they bind it by
-	// (naming): by the scope's type, a list would read every deny on resources of the type in the
-	// tenant, whoever it names, as its admins can put one on each of thousands.
-	denies := func(of string) string {
-		return fmt.Sprintf(`SELECT d.scope FROM rbac_denies d
-			WHERE %s AND %s AND NOT d.exempt && %s
-			  AND (%s::text = ANY(d.permissions) OR %s::text = ANY(d.permissions))`,
-			namingIn(arg(1)+"::text", "d.principals", keys("SELECT k FROM bound")), of, keys("SELECT k FROM exempted"), arg(14), arg(15))
+	// The denies on scopes of the types in the array types that bind the subject (bindingDenies).
+	narrow := counted("FALSE", "FALSE")
+	denies := func(types string) string {
+		return fmt.Sprintf(`SELECT d.scope FROM (%s) d
+			WHERE NOT d.exempt && %s AND (%s::text = ANY(d.permissions) OR %s::text = ANY(d.permissions))`,
+			bindingDenies(arg(1)+"::text", types, keys("SELECT k FROM bound WHERE "+narrow), keys("SELECT k FROM bound WHERE NOT ("+narrow+")"),
+				"scope, exempt, permissions"),
+			keys("SELECT k FROM exempted"), arg(14), arg(15))
 	}
 	// The grants' tenant is an argument of its own: the host's tenant column needn't be text,
 	// and one argument can't take two types. The grants overlap the path, which the host's GIN
@@ -1030,7 +1030,7 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	var deniedByKey string
 	if !a.contains(resourceType) {
 		denied = slices.DeleteFunc(denied, func(t string) bool { return t == resourceType })
-		deniedByKey = fmt.Sprintf(`NOT (%s)[1] COLLATE "default" IN (%s) AND `, cols.Path, denies("d.scope_type = "+arg(9)+"::text"))
+		deniedByKey = fmt.Sprintf(`NOT (%s)[1] COLLATE "default" IN (%s) AND `, cols.Path, denies("ARRAY["+arg(9)+"::text]"))
 	}
 	resources, containers, err := a.grantCounts(ctx, tenant, s, p, roles, custom, counts, resourceType)
 	if err != nil {
@@ -1050,7 +1050,7 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	pred := Predicate{
 		SQL: fmt.Sprintf(`(%[1]s = %[2]s AND (%[1]s)::text = %[5]s::text COLLATE "default" AND %[3]s
 			AND %[7]sNOT %[6]s)`,
-			cols.Tenant, arg(0), reached, cols.Path, arg(1), keyed(cols.Path, denies("d.scope_type = ANY("+arg(16)+"::text[])")), deniedByKey),
+			cols.Tenant, arg(0), reached, cols.Path, arg(1), keyed(cols.Path, denies(arg(16))), deniedByKey),
 		Args: append(append([]any{
 			tenant, tenant, s.identityKey(), roles, a.cfg.Now(), above, publicKey, a.publicRoles(roles),
 			string(p), resourceType,
@@ -1100,6 +1100,35 @@ func byKey(keys, table, col, cols, where string) string {
 	return fmt.Sprintf(`SELECT r.* FROM unnest(%[1]s::text[]) AS keyed(k) CROSS JOIN LATERAL (
 		SELECT %[4]s FROM %[2]s WHERE (%[5]s) AND %[3]s = keyed.k OFFSET 0) r`, keys, table, col, cols, where)
 }
+
+// bindingDenies is SQL selecting cols of the denies in a tenant, SQL for its text, on scopes of the
+// types in the array types, that name one of the keys in the array narrow, an identity's or a
+// group's, or in the array broad, the public's or the tenant's members'. Those naming narrow are
+// found by those keys (naming). Any number of the tenant's denies can name broad, on scopes of any
+// type, and no index finds those of a type alone: so while fewer than manyTypedDenies of the
+// tenant's denies are on scopes of the types, they are read a type at a time, each a range of the
+// scopes (ofType), and past that they are found by those keys too. Each way reads every deny the
+// other passes over, so with many of both a list reads every deny in the tenant naming broad. The
+// count reads at most manyTypedDenies entries of the scopes' index, once for the statement, in its
+// snapshot. A deny naming both narrow and broad is selected twice.
+func bindingDenies(tenant, types, narrow, broad, cols string) string {
+	ofTypes := func(cols, where string) string {
+		return `SELECT d.* FROM unnest(` + types + `::text[]) AS t(t) CROSS JOIN LATERAL (SELECT ` + cols + ` FROM rbac_denies
+			WHERE tenant = ` + tenant + ` AND ` + where + ofType("scope", "t.t") + ` OFFSET 0) d`
+	}
+	return fmt.Sprintf(`WITH typed(few) AS MATERIALIZED (SELECT count(*) < %[5]d FROM (%[6]s LIMIT %[5]d) c)
+		SELECT %[4]s FROM rbac_denies WHERE %[2]s AND scope_type = ANY(%[1]s::text[])
+		UNION ALL
+		SELECT %[4]s FROM rbac_denies WHERE %[3]s AND scope_type = ANY(%[1]s::text[]) AND NOT (SELECT few FROM typed)
+		UNION ALL
+		SELECT * FROM (%[7]s) d WHERE (SELECT few FROM typed)`,
+		types, namingIn(tenant, "principals", narrow), namingIn(tenant, "principals", broad), cols, manyTypedDenies,
+		ofTypes("1", ""), ofTypes(cols, "principals && "+broad+"::text[] AND "))
+}
+
+// manyTypedDenies is how many denies on scopes of the types a list reads bindingDenies reads by type
+// to find those naming the public or the tenant's members, before it finds them by those keys.
+const manyTypedDenies = 16
 
 // ofType is SQL keeping the rows whose scope, col, is of the type t. A scope is `type:id`, and in
 // the C collation the scopes of a type sort from `type:` to just before `type;`, so a btree on the

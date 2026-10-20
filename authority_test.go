@@ -3003,83 +3003,95 @@ func TestDeletingGroupsReadsOnlyWhatNamesThem(t *testing.T) {
 // Filter's condition and Reachable read, of the denies on the scopes a resource of the type can
 // have on its path, only those binding the subject, under a generic plan too: by the scopes' type,
 // they read every deny on resources of the type and on containers in the tenant, whoever it names,
-// as its admins can put one on each of thousands.
+// as its admins can put one on each of thousands; and by the keys binding the subject alone, every
+// deny in the tenant naming the public or its members, on scopes of any type, as owners keeping
+// groups to themselves set.
 func TestListingsReadOnlyTheDeniesBindingTheirSubject(t *testing.T) {
 	for _, plan := range []string{"custom", "generic"} {
-		t.Run(plan, func(t *testing.T) {
-			var h *harness
-			if plan == "generic" {
-				h = generic(t)
-			} else {
-				h = custom(t)
-			}
-			ctx := t.Context()
-			resources := hostTable(t, h)
-			ann := h.as(t, "ann", "oncall")
-			h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "ann"))
-			// ann is denied on a cluster, and oncall on a workspace.
-			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
-				VALUES ('t1', 'cluster', 'c0', 'd', '{user:ann}', '{cluster:login}'), ('t1', 'workspace', 'w2', 'd', '{group:oncall}', '{cluster:*}')`); err != nil {
-				t.Fatal(err)
-			}
-			// The pages of the denies and their indexes each reads, in a transaction it rolls back.
-			read := func() map[string]int64 {
-				t.Helper()
-				pages := map[string]int64{}
-				for what, f := range map[string]func(tx pgx.Tx, a *rbac.Authorizer) error{
-					"Reachable": func(_ pgx.Tx, a *rbac.Authorizer) error {
-						reach, err := a.Reachable(ctx, ann, login, "t1", "cluster")
-						if err == nil && (!reach.All || len(reach.Except) != 2) {
-							err = fmt.Errorf("reach %+v", reach)
-						}
-						return err
-					},
-					"Filter": func(tx pgx.Tx, a *rbac.Authorizer) error {
-						pred, err := a.Filter(ctx, ann, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
-						if err != nil {
-							return err
-						}
-						var kept int
-						if err := tx.QueryRow(ctx, `SELECT count(*) FROM clusters WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil {
-							return err
-						}
-						if kept != len(resources)-2 {
-							return fmt.Errorf("Filter kept %d of %d clusters", kept, len(resources))
-						}
-						return nil
-					},
-				} {
-					func() {
-						tx, err := h.pool.Begin(ctx)
-						if err != nil {
-							t.Fatal(err)
-						}
-						defer func() { _ = tx.Rollback(ctx) }()
-						start := pagesRead(ctx, t, tx, "rbac_denies")
-						if err := f(tx, h.authz.WithTx(tx)); err != nil {
-							t.Fatalf("%s: %v", what, err)
-						}
-						pages[what] = pagesRead(ctx, t, tx, "rbac_denies") - start
-					}()
-				}
-				return pages
-			}
+		for shape, others := range map[string]string{
 			// Others are each denied on a cluster or a workspace of their own.
-			others := func(n int) {
-				t.Helper()
-				manyMembers(t, h, n, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
-					SELECT 't1', CASE WHEN id < '8' THEN 'cluster' ELSE 'workspace' END, id, 'd', ARRAY['user:' || id], '{cluster:login}'::text[]
-					FROM others`, "rbac_denies")
-			}
-			others(500)
-			few := read()
-			others(4500)
-			for what, many := range read() {
-				if many > few[what]*3/2+deeper {
-					t.Errorf("%s read %d pages of denies, and %d once 4500 more were denied on a cluster or a workspace", what, few[what], many)
+			"named on the listed types": `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+				SELECT 't1', CASE WHEN id < '8' THEN 'cluster' ELSE 'workspace' END, id, 'd', ARRAY['user:' || id], '{cluster:login}'::text[]
+				FROM others`,
+			// Others each deny everyone, the public or the tenant's members, all but themselves on a
+			// group of their own.
+			"everyone on another type": `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+				SELECT 't1', 'group', id, 'd', ARRAY[CASE WHEN id < '8' THEN 'public:' ELSE 'members:t1' END], ARRAY['user:' || id],
+				  '{cluster:login}'::text[]
+				FROM others`,
+		} {
+			t.Run(plan+", "+shape, func(t *testing.T) {
+				var h *harness
+				if plan == "generic" {
+					h = generic(t)
+				} else {
+					h = crowded(t, pgtest.Open(t, "plan_cache_mode=force_custom_plan"))
 				}
-			}
-		})
+				ctx := t.Context()
+				resources := hostTable(t, h)
+				ann := h.as(t, "ann", "oncall")
+				h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "ann"))
+				// ann is denied on a cluster, oncall on a workspace and the public on another cluster;
+				// the tenant's members are on another workspace, but ann is exempt there.
+				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+					VALUES ('t1', 'cluster', 'c0', 'd', '{user:ann}', '{}', '{cluster:login}'),
+					       ('t1', 'workspace', 'w2', 'd', '{group:oncall}', '{}', '{cluster:*}'),
+					       ('t1', 'cluster', 'c3', 'd', '{public:}', '{}', '{cluster:login}'),
+					       ('t1', 'workspace', 'w3', 'd', '{members:t1}', '{user:ann}', '{cluster:login}')`); err != nil {
+					t.Fatal(err)
+				}
+				// The pages of the denies and their indexes each reads, in a transaction it rolls back.
+				read := func() map[string]int64 {
+					t.Helper()
+					pages := map[string]int64{}
+					for what, f := range map[string]func(tx pgx.Tx, a *rbac.Authorizer) error{
+						"Reachable": func(_ pgx.Tx, a *rbac.Authorizer) error {
+							reach, err := a.Reachable(ctx, ann, login, "t1", "cluster")
+							if err == nil && (!reach.All || len(reach.Except) != 3) {
+								err = fmt.Errorf("reach %+v", reach)
+							}
+							return err
+						},
+						"Filter": func(tx pgx.Tx, a *rbac.Authorizer) error {
+							pred, err := a.Filter(ctx, ann, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+							if err != nil {
+								return err
+							}
+							var kept int
+							if err := tx.QueryRow(ctx, `SELECT count(*) FROM clusters WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil {
+								return err
+							}
+							if kept != len(resources)-3 {
+								return fmt.Errorf("Filter kept %d of %d clusters", kept, len(resources))
+							}
+							return nil
+						},
+					} {
+						func() {
+							tx, err := h.pool.Begin(ctx)
+							if err != nil {
+								t.Fatal(err)
+							}
+							defer func() { _ = tx.Rollback(ctx) }()
+							start := pagesRead(ctx, t, tx, "rbac_denies")
+							if err := f(tx, h.authz.WithTx(tx)); err != nil {
+								t.Fatalf("%s: %v", what, err)
+							}
+							pages[what] = pagesRead(ctx, t, tx, "rbac_denies") - start
+						}()
+					}
+					return pages
+				}
+				manyMembers(t, h, 500, others, "rbac_denies")
+				few := read()
+				manyMembers(t, h, 4500, others, "rbac_denies")
+				for what, many := range read() {
+					if many > few[what]*3/2+deeper {
+						t.Errorf("%s read %d pages of denies, and %d once 4500 more were denied", what, few[what], many)
+					}
+				}
+			})
+		}
 	}
 }
 

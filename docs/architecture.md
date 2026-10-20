@@ -217,10 +217,10 @@ erDiagram
   a removal locks in order it then deletes by key, never matched to the tenant's in a semi-join,
   which such a plan runs by reading every one. The eligibilities a group approves and the
   denies that name or exempt it, which a change to its members and `DeleteGroup`'s check read,
-  those an identity or group leaving the tenant is taken out of, and the denies binding a list's
-  subject, which `Filter` and `Reachable` read, are found through GIN indexes on those arrays of
-  keys, each key prefixed by its tenant (`rbac_tenant_keys`), so neither the tenant's other rows
-  nor another tenant's group of the same id are read.
+  those an identity or group leaving the tenant is taken out of, and the denies naming a list's
+  subject or its groups, which `Filter` and `Reachable` read, are found through GIN indexes on
+  those arrays of keys, each key prefixed by its tenant (`rbac_tenant_keys`), so neither the
+  tenant's other rows nor another tenant's group of the same id are read.
 - **Activations are grants** from the source `activation` (`SourceActivation`), made by
   `Activate` from an eligibility, which they record, and ended by their expiry, `Deactivate`, or a
   change ending the membership or a place in a group on their holder's paths to that eligibility's
@@ -490,7 +490,11 @@ flowchart LR
   everything it created costs a row a few lookups; no index serves that, so the query reads every
   row of the tenant its other conditions keep. Denies are looked up so whatever their number: those
   on resources of the type by the row's own key, and those on containers and the tenant by each of
-  its keys. Only those binding the subject are read, found by the keys it is bound by.
+  its keys. Those naming the subject or its groups are read by those keys alone. Those naming the
+  public or the tenant's members bind everyone, and any number of them can be on scopes of other
+  types, which no index tells apart: while fewer than 16 denies are on scopes of the types a list
+  reads, it reads those by type, and otherwise finds the ones naming everyone by those keys, so a
+  tenant with many of both has every list read every deny naming everyone.
 - **Reachable** returns the same as scopes, for a host that keeps its resources elsewhere.
   Conditional grants and conditional denies come back apart, to check one by one.
 - **Holders** lists who may do a permission on a resource, for an access review. That is each
