@@ -358,8 +358,18 @@ sequenceDiagram
 
 `Apply` grants and revokes on one scope as an actor. Every change an actor makes follows the same
 shape: it is decided once before its transaction, so `ValidateGrant`, the constraints and
-`ResourceOf` run outside it, then again under its locks, so nothing it read can change before it
-commits.
+`ResourceOf` run outside it, then again under its locks. The locks hold what the change writes, but
+not what its actor's access rests on: the actor's grants, its membership and places in groups, and
+those groups' grants. So two changes that each take away what the other's actor acts by can both
+commit, a write skew: a manager removing another from the group that lets it change members, while
+that one removes the first from theirs, both succeed, though either after the other is refused, and
+no one is left to change members. Such a race only takes access away, as each change is one its
+actor could make when it was decided, and the two leave nothing granted that one after the other
+wouldn't: it locks the tenant's admins out, never lets anyone in. The host undoes it with its own
+writes, as `ImportMembers`, `Import` or `SetMemberships`, which no actor's access decides. Locking
+what each actor acts by would close it, at the price of taking, for every change, a lock for each
+group the actor acts through, which past 64 would lock the whole tenant for every change by an
+actor in that many.
 
 ```mermaid
 sequenceDiagram
