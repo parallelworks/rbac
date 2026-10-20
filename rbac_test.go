@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"maps"
 	"os"
+	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -466,11 +467,57 @@ func TestListingsKeepToDeniesOnTheResourceItself(t *testing.T) {
 	}
 }
 
+// overlapping returns the conditions in the plan of query, on h's pool, that overlap an array with
+// what a subquery reading table selects (`&&`): each compares a row with every value the subquery
+// selects, rather than look the row's keys up in a hash or an object of them.
+func overlapping(ctx context.Context, t *testing.T, h *harness, table, query string, args ...any) []string {
+	t.Helper()
+	var plans []struct{ Plan map[string]any }
+	if err := h.pool.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+query, args...).Scan(&plans); err != nil || len(plans) != 1 {
+		t.Fatalf("EXPLAIN %d plans, %v", len(plans), err)
+	}
+	// Each subquery's name, as conditions read it, and whether it reads table; every condition.
+	reads := map[string]bool{}
+	var conditions []string
+	var walk func(node map[string]any) bool
+	walk = func(node map[string]any) bool {
+		found := node["Relation Name"] == table
+		for _, k := range []string{"Filter", "Index Cond", "Recheck Cond", "Join Filter", "Hash Cond", "One-Time Filter"} {
+			if c, ok := node[k].(string); ok {
+				conditions = append(conditions, c)
+			}
+		}
+		children, _ := node["Plans"].([]any)
+		for _, c := range children {
+			child, _ := c.(map[string]any)
+			below := walk(child)
+			if name, ok := child["Subplan Name"].(string); ok {
+				reads[name] = below
+			}
+			found = found || below
+		}
+		return found
+	}
+	walk(plans[0].Plan)
+	var over []string
+	for _, c := range conditions {
+		for _, m := range overlap.FindAllStringSubmatch(c, -1) {
+			if reads[m[1]] {
+				over = append(over, c)
+			}
+		}
+	}
+	return over
+}
+
+// overlap finds an array overlapped with a subquery's in a plan's condition.
+var overlap = regexp.MustCompile(`&& \(*(InitPlan \d+)\)`)
+
 // Filter's condition leaves out the resources denies on thousands of them, or of the workspaces
-// they are in, cover in about the time it takes for a few: a row's own key is looked up in a hash of
-// the denies on resources of its type, and each of its keys in one object of those on containers and
-// the tenant. Overlapping each row with every deny would cost it thousands of comparisons, and a
-// tenant's admins can set them.
+// they are in, cover by looking each row's keys up: its own in a hash of the denies on resources of
+// its type, and each of its keys in one object of those on containers and the tenant. Overlapping
+// each row with every deny would cost it thousands of comparisons, and a tenant's admins can set
+// them.
 func TestFilterLooksUpDeniesByEachRowsKeys(t *testing.T) {
 	for _, on := range []string{"cluster", "workspace"} {
 		t.Run(on, func(t *testing.T) {
@@ -487,9 +534,9 @@ func TestFilterLooksUpDeniesByEachRowsKeys(t *testing.T) {
 			h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "u"))
 			u := h.as(t, "u")
 			denied := 0
-			// The time Filter's condition takes to count the rows once n of them are denied, the
-			// fastest of a few, so a stall of the database's in one doesn't count.
-			listed := func(n int) time.Duration {
+			// Filter's condition, with what it keeps and how its plan reads the denies, once n of the
+			// rows are denied.
+			listed := func(n int) {
 				t.Helper()
 				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
 					SELECT 't1', $3, left($3, 1) || (i * 5), 'd', '{public:}', '{cluster:login}' FROM generate_series($1 + 1, $2) i`, denied, n, on); err != nil {
@@ -500,32 +547,25 @@ func TestFilterLooksUpDeniesByEachRowsKeys(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				var fastest time.Duration
-				for i := range 3 {
-					start := time.Now()
-					var kept int
-					if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM fleet WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil || kept != rows-n {
-						t.Fatalf("Filter kept %d of %d rows with %d denied, %v", kept, rows, n, err)
-					}
-					if took := time.Since(start); i == 0 || took < fastest {
-						fastest = took
-					}
+				query := `SELECT count(*) FROM fleet WHERE ` + pred.SQL
+				var kept int
+				if err := h.pool.QueryRow(ctx, query, pred.Args...).Scan(&kept); err != nil || kept != rows-n {
+					t.Fatalf("Filter kept %d of %d rows with %d denied, %v", kept, rows, n, err)
 				}
-				return fastest
+				if over := overlapping(ctx, t, h, "rbac_denies", query, pred.Args...); len(over) > 0 {
+					t.Errorf("with %d %ss denied, Filter's condition overlaps each row with the denies: %q", n, on, over)
+				}
 			}
-			few := listed(40)
-			if many := listed(4000); many > 10*few && many > 100*time.Millisecond {
-				t.Fatalf("Filter's condition took %v with 40 %ss denied, and %v with 4000", few, on, many)
-			}
+			listed(40)
+			listed(4000)
 		})
 	}
 }
 
 // A subject holding a grant on each of thousands of workspaces, as one on each it created, lists a
-// page of them, or of the clusters in them, in about the time it takes for a few: past 128 grants,
-// each of a row's keys is looked up in one object of them. Overlapping each row with every grant
-// would cost it thousands of comparisons, and the index, which merges the rows each finds, as many
-// for each row it finds.
+// page of them, or of the clusters in them, by looking each of a row's keys up in one object of
+// them, past 128 grants. Overlapping each row with every grant would cost it thousands of
+// comparisons, and the index, which merges the rows each finds, as many for each row it finds.
 func TestFilterLooksUpGrantsOnContainersByEachRowsKeys(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -539,67 +579,44 @@ func TestFilterLooksUpGrantsOnContainersByEachRowsKeys(t *testing.T) {
 		`CREATE INDEX ON fleet USING gin (path)`,
 		`CREATE INDEX ON fleet (tenant, id)`,
 		`ANALYZE spaces, fleet`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'workspace', 'w' || i, 'user', 'u', r FROM generate_series(1, 4000) i, unnest('{workspace.admin,cluster.login}'::text[]) r`,
 	} {
 		if _, err := h.pool.Exec(ctx, q); err != nil {
 			t.Fatal(err)
 		}
 	}
 	u := h.as(t, "u")
-	lists := []struct {
+	for _, l := range []struct {
 		resourceType, table string
 		p                   rbac.Permission
-	}{{"workspace", "spaces", "workspace:view"}, {"cluster", "fleet", login}}
-	held := 0
-	// The time a page of 50 of each table's rows takes once u holds n workspaces, the fastest of a
-	// few, so a stall of the database's in one doesn't count.
-	pages := func(n int) []time.Duration {
-		t.Helper()
-		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
-			SELECT 't1', 'workspace', 'w' || i, 'user', 'u', r FROM generate_series($1 + 1, $2) i, unnest('{workspace.admin,cluster.login}'::text[]) r`,
-			held, n); err != nil {
+	}{{"workspace", "spaces", "workspace:view"}, {"cluster", "fleet", login}} {
+		pred, err := h.authz.Filter(ctx, u, l.p, "t1", l.resourceType, rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+		if err != nil {
 			t.Fatal(err)
 		}
-		held = n
-		var took []time.Duration
-		for _, l := range lists {
-			pred, err := h.authz.Filter(ctx, u, l.p, "t1", l.resourceType, rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var kept int
-			if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM `+l.table+` WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil || kept != n {
-				t.Fatalf("Filter kept %d %ss of %d, %v", kept, l.resourceType, n, err)
-			}
-			var fastest time.Duration
-			for i := range 3 {
-				start := time.Now()
-				rows, err := h.pool.Query(ctx, `SELECT id FROM `+l.table+` WHERE `+pred.SQL+` ORDER BY id LIMIT 50`, pred.Args...)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if ids, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || len(ids) != min(n, 50) {
-					t.Fatalf("a page of %d %ss, %v", len(ids), l.resourceType, err)
-				}
-				if d := time.Since(start); i == 0 || d < fastest {
-					fastest = d
-				}
-			}
-			took = append(took, fastest)
+		var kept int
+		if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM `+l.table+` WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil || kept != 4000 {
+			t.Fatalf("Filter kept %d %ss of 4000, %v", kept, l.resourceType, err)
 		}
-		return took
-	}
-	few := pages(40)
-	for i, many := range pages(4000) {
-		if many > 10*few[i] && many > 100*time.Millisecond {
-			t.Errorf("a page of %ss took %v with 40 workspaces granted, and %v with 4000", lists[i].resourceType, few[i], many)
+		page := `SELECT id FROM ` + l.table + ` WHERE ` + pred.SQL + ` ORDER BY id LIMIT 50`
+		rows, err := h.pool.Query(ctx, page, pred.Args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ids, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || len(ids) != 50 {
+			t.Fatalf("a page of %d %ss, %v", len(ids), l.resourceType, err)
+		}
+		if over := overlapping(ctx, t, h, "rbac_grants", page, pred.Args...); len(over) > 0 {
+			t.Errorf("a page of %ss overlaps each row with the 4000 workspaces granted: %q", l.resourceType, over)
 		}
 	}
 }
 
 // A subject holding grants on many clusters and on dozens of workspaces, as one on each it created,
-// is listed about as fast as when every grant is looked up by each of a row's keys: with those on
-// clusters in a hash, no index serves the condition, so overlapping each row with every grant on
-// the workspaces would cost every row of the tenant a comparison for each.
+// is listed by looking every grant up by each of a row's keys: with those on clusters in a hash, no
+// index serves the condition, so overlapping each row with every grant on the workspaces would cost
+// every row of the tenant a comparison for each.
 func TestFilterLooksUpGrantsOnContainersAlongsideManyOnResources(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -617,32 +634,18 @@ func TestFilterLooksUpGrantsOnContainersAlongsideManyOnResources(t *testing.T) {
 		}
 	}
 	u := h.as(t, "u")
-	// The time Filter's condition takes to count what it keeps, the fastest of a few, so a stall of
-	// the database's in one doesn't count.
-	counted := func() time.Duration {
-		t.Helper()
-		pred, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var fastest time.Duration
-		for i := range 3 {
-			start := time.Now()
-			// The ten clusters in each of w1 to w100, and those of c7 to c700 in none of them.
-			var kept int
-			if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM fleet WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil || kept != 1086 {
-				t.Fatalf("Filter kept %d clusters, %v", kept, err)
-			}
-			if took := time.Since(start); i == 0 || took < fastest {
-				fastest = took
-			}
-		}
-		return fastest
+	pred, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
 	}
-	took := counted()
-	rbac.SetMaxContainerOverlap(t, 0)
-	if keyed := counted(); took > 3*keyed && took > 100*time.Millisecond {
-		t.Errorf("Filter's condition took %v, and %v with every grant looked up", took, keyed)
+	// The ten clusters in each of w1 to w100, and those of c7 to c700 in none of them.
+	query := `SELECT count(*) FROM fleet WHERE ` + pred.SQL
+	var kept int
+	if err := h.pool.QueryRow(ctx, query, pred.Args...).Scan(&kept); err != nil || kept != 1086 {
+		t.Fatalf("Filter kept %d clusters, %v", kept, err)
+	}
+	if over := overlapping(ctx, t, h, "rbac_grants", query, pred.Args...); len(over) > 0 {
+		t.Errorf("Filter's condition overlaps each row with the grants on workspaces: %q", over)
 	}
 }
 
