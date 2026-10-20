@@ -318,7 +318,7 @@ func (a *Authorizer) grantsAllowed(ctx context.Context, q DB, actor Subject, on 
 	if err != nil {
 		return authority{}, err
 	}
-	checkLabel := func() error { return a.labelAllows(ctx, q, on, cs, labels, GrantPermission(on.Type), held) }
+	checkLabel := func() error { return a.labelAllows(ctx, q, on, cs, labels, GrantPermission(on.Type), held.values) }
 	if !cs.sealed {
 		if err := checkLabel(); err != nil {
 			return authority{}, err
@@ -345,17 +345,17 @@ func (a *Authorizer) authorityOr(ctx context.Context, q DB, actor Subject, on Re
 }
 
 // labelAllows refuses, as a DeniedError of p, a change on a scope whose label the actor's holding
-// doesn't satisfy, decided by au, its authority there, as of the read of its grants, asking the
-// constraints about its values through labels, or where nil, through cs on the tenant: before the
-// change's transaction, and again under its locks, which reads their answers back.
-func (a *Authorizer) labelAllows(ctx context.Context, q DB, on Resource, cs, labels *constrained, p Permission, au authority) error {
+// doesn't satisfy, decided by values, read with its authority there, asking the constraints about
+// its values through labels, or where nil, through cs on the tenant: before the change's
+// transaction, and again under its locks, which reads their answers back.
+func (a *Authorizer) labelAllows(ctx context.Context, q DB, on Resource, cs, labels *constrained, p Permission, values *valuesRead) error {
 	if !on.Labels.asks() {
 		return nil
 	}
 	if labels == nil {
 		labels = cs.ofTenant()
 	}
-	held, err := labels.holdingBy(ctx, q, au.values)
+	held, err := labels.holdingBy(ctx, q, values)
 	if err != nil {
 		return err
 	}

@@ -1562,6 +1562,77 @@ func TestAnApproverIsCheckedAsOneOfTheApproversHoldingTheValuesAtOnce(t *testing
 	}
 }
 
+// Under its locks a change to a labeled group, or to its members, checks its actor's power over
+// groups and the group's label values as of one moment. Here the actor's own value is revoked once
+// the change has checked it before its transaction, and once the transaction has read its power,
+// it moves from the group giving that power to the group holding the value: at no moment did it
+// hold both, so the change is refused.
+func TestAChangeToALabeledGroupChecksItsLabelByTheValuesHeldWithThePower(t *testing.T) {
+	vault := rbac.Resource{Tenant: "t1", Type: rbac.GroupScope, ID: "vault", Labels: rbac.Label{"level": {"high"}}}
+	for name, change := range map[string]func(h *harness, x rbac.Subject) error{
+		"ChangeMembers": func(h *harness, x rbac.Subject) error {
+			return h.authz.ChangeMembers(h.ctx, x, "t1", []rbac.Member{{Group: "vault", Principal: identity("u")}}, nil)
+		},
+		"SetGroup": func(h *harness, x rbac.Subject) error {
+			return h.authz.SetGroup(h.ctx, x, "t1", rbac.GroupDefinition{ID: "vault", Name: "Vault"})
+		},
+		"DeleteGroup": func(h *harness, x rbac.Subject) error { return h.authz.DeleteGroup(h.ctx, x, "t1", "vault") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			var revoke func()
+			h := labeled(t, func(c *rbac.Config) {
+				c.Catalog = append(slices.Clone(c.Catalog), groupMembers,
+					rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}})
+				resourceOf := c.ResourceOf
+				c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+					if s == vault.Scope() {
+						return vault, nil
+					}
+					return resourceOf(ctx, tenant, s)
+				}
+				// Asked about x's value before the transaction alone, once the change has read it.
+				c.Constraints = []rbac.Constraint{{Name: "meanwhile", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+					if do := revoke; do != nil && in.Permission == "level:high" {
+						do()
+					}
+					return false, nil
+				}}}
+			})
+			h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.Group, "leads"), grant(rbac.TenantRoot("t1"), "group.members", rbac.Group, "leads"),
+				grant(rbac.TenantRoot("t1"), "level.high", rbac.Group, "cleared"))
+			h.groups(t, "vault")
+			x := h.as(t, "x", "leads")
+			h.hold(t, "x", "level:high")
+			h.as(t, "u")
+			revoke = func() {
+				if _, err := h.pool.Exec(h.ctx, `DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:x' AND role = 'level.high'`); err != nil {
+					t.Error(err)
+				}
+			}
+			moved := false
+			rbac.SetReadingRoles(t, func() {
+				// The change's transaction holds a connection of the test's pool; its reads before it
+				// hold none once read.
+				if h.pool.Stat().AcquiredConns() == 0 || moved {
+					return
+				}
+				moved = true
+				if _, err := h.pool.Exec(h.ctx, `WITH gone AS (DELETE FROM rbac_members WHERE tenant = 't1' AND group_id = 'leads' AND principal = 'user:x')
+					INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'cleared', 'user', 'x')`); err != nil {
+					t.Error(err)
+				}
+			})
+			err := change(h, x)
+			if !moved {
+				t.Fatal("the change read its power in its transaction without reaching the hook")
+			}
+			if !errors.Is(err, rbac.ErrDenied) {
+				t.Errorf("the change was made, by an actor that held its power and the group's label value at no moment: %v", err)
+			}
+		})
+	}
+}
+
 // A deny of a label value reads the tenant as checks decide the value, its type, id and tenant
 // included, when the actor hands the value on as when it uses it: one whose condition is false
 // there takes nothing the actor hands on, as it takes nothing it uses, and one that holds there, or

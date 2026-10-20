@@ -369,7 +369,7 @@ func (a *Authorizer) denyAllowed(ctx context.Context, q DB, actor Subject, on Re
 	if err != nil {
 		return err
 	}
-	checkLabel := func() error { return a.labelAllows(ctx, q, on, cs, labels, DenyPermission(on.Type), held) }
+	checkLabel := func() error { return a.labelAllows(ctx, q, on, cs, labels, DenyPermission(on.Type), held.values) }
 	// Who can't see a labeled scope sets no deny on it, nor lifts one, which would widen access.
 	if !cs.sealed {
 		if err := checkLabel(); err != nil {
