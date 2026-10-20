@@ -504,6 +504,7 @@ func overlapping(ctx context.Context, t *testing.T, h *harness, table, query str
 		for _, m := range overlap.FindAllStringSubmatch(c, -1) {
 			if reads[m[1]] {
 				over = append(over, c)
+				break
 			}
 		}
 	}
