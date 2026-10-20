@@ -1098,6 +1098,14 @@ func generic(t *testing.T, mutate ...func(*rbac.Config)) *harness {
 	return crowded(t, pgtest.Open(t, "plan_cache_mode=force_generic_plan"), mutate...)
 }
 
+// custom is setup on a pool whose sessions plan every statement for its arguments: at the default
+// plan_cache_mode, a statement a connection runs a sixth time can turn generic, as a test that
+// repeats a call on a pool's connections does.
+func custom(t *testing.T, mutate ...func(*rbac.Config)) *harness {
+	t.Helper()
+	return setupOn(t, pgtest.Open(t, "plan_cache_mode=force_custom_plan"), mutate...)
+}
+
 // crowded is setupOn in a database of many small tenants beside t1, where a principal and a scope
 // hold a grant or two, a group has a member or two, and a scope has an eligibility and a deny or
 // two, which name a group.
@@ -1411,7 +1419,7 @@ func TestChangingMembersReadsOnlyWhatTheGroupsReach(t *testing.T) {
 			if plan == "generic" {
 				h = generic(t, roles)
 			} else {
-				h = setup(t, roles)
+				h = custom(t, roles)
 			}
 			ctx := t.Context()
 			h.groups(t, "oncall", "everyone", "pager")
@@ -1447,6 +1455,9 @@ func TestChangingMembersReadsOnlyWhatTheGroupsReach(t *testing.T) {
 					},
 					"ChangeMembers": func(a *rbac.Authorizer) error {
 						return a.ChangeMembers(ctx, manager, "t1", bob, []rbac.Member{{Group: "oncall", Principal: identity("ann")}})
+					},
+					"ChangeMembers ending a place sooner": func(a *rbac.Authorizer) error {
+						return a.ChangeMembers(ctx, manager, "t1", []rbac.Member{{Group: "oncall", Principal: identity("ann"), ExpiresAt: h.now.Add(time.Hour)}}, nil)
 					},
 				} {
 					func() {
@@ -1511,7 +1522,7 @@ func TestReadsByScopeOrPrincipalReadOnlyTheirRows(t *testing.T) {
 			if plan == "generic" {
 				h = generic(t)
 			} else {
-				h = setup(t)
+				h = custom(t)
 			}
 			ctx := t.Context()
 			h.groups(t, "oncall", "pager", "everyone")
@@ -1627,7 +1638,7 @@ func TestReadsStayBoundedOnceAConnectionsStatementsTurnGeneric(t *testing.T) {
 		  SELECT 't1', 'cluster', id, 'user', id, 'cluster.sudo', 3600, '{group:everyone}'::text[] FROM others)
 		INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
 		SELECT 't1', 'cluster', id, 'd', ARRAY['user:' || id], '{group:everyone}'::text[], '{cluster:root}'::text[] FROM others`,
-		"rbac_members", "rbac_eligibilities", "rbac_denies")
+		"rbac_grants", "rbac_members", "rbac_eligibilities", "rbac_denies")
 	tables := []string{"rbac_grants", "rbac_eligibilities", "rbac_denies", "rbac_members"}
 	for what, f := range map[string]func(a *rbac.Authorizer) error{
 		"Apply in a nested group": func(a *rbac.Authorizer) error {

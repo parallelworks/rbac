@@ -562,12 +562,12 @@ func (a *Authorizer) holders(ctx context.Context, p Permission, r Resource, role
 	}
 	// A grant to the public gives nothing where no public role can give p, as checks read it.
 	public := a.publicGives(p, r.Type)
-	byKey := map[string]*Holder{}
+	byPrincipal := map[string]*Holder{}
 	holder := func(p Principal) *Holder {
-		if byKey[p.key()] == nil {
-			byKey[p.key()] = &Holder{Principal: p, Conditional: true}
+		if byPrincipal[p.key()] == nil {
+			byPrincipal[p.key()] = &Holder{Principal: p, Conditional: true}
 		}
-		return byKey[p.key()]
+		return byPrincipal[p.key()]
 	}
 	add := func(h *Holder, g held) {
 		if !slices.Contains(h.Grants, g.id) {
@@ -632,10 +632,10 @@ func (a *Authorizer) holders(ctx context.Context, p Permission, r Resource, role
 	}); err != nil {
 		return nil, err
 	}
-	if err := a.boundByDenies(ctx, p, r, now, byKey, guests); err != nil {
+	if err := a.boundByDenies(ctx, p, r, now, byPrincipal, guests); err != nil {
 		return nil, err
 	}
-	found := slices.SortedFunc(maps.Values(byKey), func(x, y *Holder) int { return strings.Compare(x.Principal.key(), y.Principal.key()) })
+	found := slices.SortedFunc(maps.Values(byPrincipal), func(x, y *Holder) int { return strings.Compare(x.Principal.key(), y.Principal.key()) })
 	holders := make([]Holder, 0, len(found))
 	for _, h := range found {
 		slices.Sort(h.Groups)
@@ -764,6 +764,14 @@ func insideSQL(groups, now, principals string, standing bool) string {
 func groupsIn(g string) string {
 	return fmt.Sprintf(`group_id = %[1]s AND principal >= 'group:' AND principal < 'group;'
 		AND (group_id, principal) >= (%[1]s, 'group:') AND (group_id, principal) < (%[1]s, 'group;')`, g)
+}
+
+// groupsAbove is SQL joining, as m, cols of the places in tenant $1 in force at now of the group
+// whose id is g, a group at a time, as keysSQL reads them.
+func groupsAbove(g, now, cols string) string {
+	return fmt.Sprintf(`CROSS JOIN LATERAL (
+		SELECT %[3]s FROM rbac_members WHERE tenant = $1 AND principal = 'group:' || %[1]s
+		  AND (expires_at IS NULL OR expires_at > %[2]s) OFFSET 0) m`, g, now, cols)
 }
 
 // Reach is where a subject may do something. A resource, by its path (Authorizer.Path), is
@@ -1073,8 +1081,8 @@ func byType(types, cols, where string) string {
 // cheaper, so it reads every row of a large tenant. OFFSET 0 keeps the planner from flattening it
 // into a join it could run the other way round.
 func byKey(keys, table, col, cols, where string) string {
-	return fmt.Sprintf(`SELECT %[4]s FROM unnest(%[1]s::text[]) AS keyed(k) CROSS JOIN LATERAL (
-		SELECT %[4]s FROM %[2]s WHERE %[5]s AND %[3]s = keyed.k OFFSET 0) r`, keys, table, col, cols, where)
+	return fmt.Sprintf(`SELECT r.* FROM unnest(%[1]s::text[]) AS keyed(k) CROSS JOIN LATERAL (
+		SELECT %[4]s FROM %[2]s WHERE (%[5]s) AND %[3]s = keyed.k OFFSET 0) r`, keys, table, col, cols, where)
 }
 
 // ofType is SQL keeping the rows whose scope, col, is of the type t. A scope is `type:id`, and in
@@ -1172,10 +1180,7 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Su
 		  SELECT group_id, expires_at FROM rbac_members WHERE tenant = $1 AND principal = $2::text
 		    AND (expires_at IS NULL OR expires_at > $4) AND EXISTS (SELECT FROM membership)
 		  UNION
-		  -- Each group's own, as keysSQL reads them.
-		  SELECT m.group_id, least(p.ends, m.expires_at) FROM placed p CROSS JOIN LATERAL (
-		    SELECT group_id, expires_at FROM rbac_members WHERE tenant = $1 AND principal = 'group:' || p.id
-		      AND (expires_at IS NULL OR expires_at > $4) OFFSET 0) m
+		  SELECT m.group_id, least(p.ends, m.expires_at) FROM placed p ` + groupsAbove("p.id", "$4", "group_id, expires_at") + `
 		), ends(k, e) AS (
 		  SELECT 'group:' || id, CASE WHEN bool_or(ends IS NULL) THEN NULL ELSE max(ends) END FROM placed GROUP BY id
 		  UNION ALL

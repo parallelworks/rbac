@@ -1174,10 +1174,7 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 		WITH RECURSIVE up(root, id) AS (
 		  SELECT g, g COLLATE "C" FROM unnest($2::text[]) AS g
 		  UNION
-		  -- Each group's own, as keysSQL reads them.
-		  SELECT u.root, m.group_id FROM up u CROSS JOIN LATERAL (
-		    SELECT group_id FROM rbac_members WHERE tenant = $1 AND principal = 'group:' || u.id
-		      AND (expires_at IS NULL OR expires_at > $3) OFFSET 0) m
+		  SELECT u.root, m.group_id FROM up u `+groupsAbove("u.id", "$3", "group_id")+`
 		)
 		SELECT root, id FROM up`, tenant, groups, now)
 	if err != nil {
@@ -1325,11 +1322,12 @@ func (a *Authorizer) endingSooner(ctx context.Context, q DB, tenant string, add 
 	if len(groups) == 0 {
 		return nil, nil
 	}
+	// Each found on its own, as leave finds its rows.
 	rows, err := q.Query(ctx, `
-		SELECT m.group_id, m.principal, m.source FROM rbac_members m
-		JOIN unnest($2::text[], $3::text[], $4::text[], $5::timestamptz[]) AS t(g, p, s, e)
-		  ON m.group_id = t.g AND m.principal = t.p AND m.source = t.s
-		WHERE m.tenant = $1 AND (m.expires_at IS NULL OR m.expires_at > t.e AND m.expires_at > $6)`,
+		SELECT m.group_id, m.principal, m.source FROM unnest($2::text[], $3::text[], $4::text[], $5::timestamptz[]) AS t(g, p, s, e)
+		CROSS JOIN LATERAL (
+		  SELECT group_id, principal, source FROM rbac_members WHERE tenant = $1 AND group_id = t.g AND principal = t.p AND source = t.s
+		    AND (expires_at IS NULL OR expires_at > t.e AND expires_at > $6) OFFSET 0) m`,
 		tenant, groups, principals, sources, ends, a.cfg.Now())
 	if err != nil {
 		return nil, err
@@ -1727,9 +1725,7 @@ var nestingDepths = `
 	), up(id, depth) AS (
 	  SELECT $2::text COLLATE "C", 0
 	  UNION
-	  SELECT m.group_id, u.depth + 1 FROM up u CROSS JOIN LATERAL (
-	    SELECT group_id FROM rbac_members WHERE tenant = $1 AND principal = 'group:' || u.id
-	      AND (expires_at IS NULL OR expires_at > $4) OFFSET 0) m
+	  SELECT m.group_id, u.depth + 1 FROM up u ` + groupsAbove("u.id", "$4", "group_id") + `
 	  WHERE u.depth <= $5
 	)
 	SELECT (SELECT max(depth) FROM down), (SELECT max(depth) FROM up), EXISTS (SELECT FROM down WHERE id = $2)`
@@ -1809,10 +1805,7 @@ func (a *Authorizer) GroupsOf(ctx context.Context, tenant string, p Principal) (
 		  SELECT group_id FROM rbac_members WHERE tenant = $1 AND principal = $2 AND (expires_at IS NULL OR expires_at > $3)
 		    AND ($4 OR `+inTenant("$2", "$1", "$3")+`)
 		  UNION
-		  -- Each group's own, as keysSQL reads them.
-		  SELECT m.group_id FROM g CROSS JOIN LATERAL (
-		    SELECT group_id FROM rbac_members WHERE tenant = $1 AND principal = 'group:' || g.id
-		      AND (expires_at IS NULL OR expires_at > $3) OFFSET 0) m
+		  SELECT m.group_id FROM g `+groupsAbove("g.id", "$3", "group_id")+`
 		)
 		SELECT id FROM g ORDER BY id`, tenant, p.key(), a.cfg.Now(), p.Kind == Group)
 	if err != nil {

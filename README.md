@@ -353,8 +353,10 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   On a host's transaction it refuses any isolation but READ COMMITTED: a stricter one's snapshot
   would miss the writes it waits for.
   A migration that rebuilds an index, as `0009_grant_seeks` rebuilds two of `rbac_grants`, locks
-  the table until it commits, so checks, lists and changes wait for the rebuild: on a large table,
-  migrate when that wait is acceptable.
+  the table until it commits, so checks, lists and changes wait for the rebuild; one that builds
+  an index, as `0011_tenant_keys` builds three on `rbac_eligibilities` and `rbac_denies`, keeps
+  writes to the table waiting until it commits, though reads go on: on a large table, migrate when
+  that wait is acceptable.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
   between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows
