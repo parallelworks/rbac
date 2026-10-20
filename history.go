@@ -163,7 +163,8 @@ const (
 // so AsOf answers as it did for any time from then on, and refuses an earlier one, and it removes
 // every version of a row whose last one then was its delete or expiry, unless an earlier one stays.
 // It deletes nothing at or past through, the cursor of the last export the host has checkpointed,
-// so that export goes on from it, and it records the prune in history. Run it as a role with the
+// so that export goes on from it, and it records in history a prune that deleted any: one that
+// deleted none changed nothing, and AsOf reads every time as it did. Run it as a role with the
 // rights of history's owner, as the README's administrator's, never the application's; keep at
 // least as much as the host's audit retention requires. It refuses a before yet to come or before
 // year 1, earlier than history dates anything, and, like AsOf, history whose ids can't order a
@@ -251,6 +252,12 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 		// Under a host's transaction, which goes on past the prune.
 		if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', '', true), set_config('enable_sort', $1, true)`, sorting); err != nil {
 			return err
+		}
+		// One that deleted none left history as it was, and reached no further than the last of
+		// the same: its record would account for no record gone, refuse AsOf times history still
+		// holds, and grow history with each call of a host that prunes on a schedule.
+		if n == 0 {
+			return nil
 		}
 		_, err = tx.Exec(ctx, `INSERT INTO `+history+` (effective_at, tenant, entity, key, op, after, how)
 			VALUES (now(), '', 'history', `+pruneKey+`, 'prune',

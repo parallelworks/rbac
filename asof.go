@@ -38,9 +38,9 @@ var asOfEntities = []struct {
 // Hooks run as for any read, and a constraint that reads the package's tables through the DB it
 // is given reads them as of the time too; one that reads the host's reads them as they are now.
 // A Filter condition reads as of the time only in a query on the transaction read runs in: under
-// WithTx, the host's, before read returns. It refuses a time earlier than any PruneHistory's
-// before, since the prune removed versions such a time would read, and fails once read returns
-// if such a prune committed while it ran.
+// WithTx, the host's, before read returns. It refuses a time earlier than the before of any
+// PruneHistory that deleted records, as they can be versions such a time would read, and fails
+// once read returns if such a prune committed while it ran.
 //
 // WithTx on the Authorizer read is given returns it as it is, reading the past on its own
 // transaction.

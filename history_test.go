@@ -1763,13 +1763,16 @@ func TestPruningHistoryKeepsWhatAsOfReads(t *testing.T) {
 		}
 		return got
 	}
-	notes(start)
-	before, now := notes(then), notes(dbNow(t, h))
+	early, before, now := notes(start), notes(then), notes(dbNow(t, h))
 	through := exported(t, h)
 	// Only what an export read past goes: nothing at or past the cursor.
 	first := cursorAt(t, h, `SELECT txid, id, recorded_at FROM rbac_history ORDER BY txid, id LIMIT 1`)
 	if n, err := rbac.PruneHistory(ctx, h.pool, then, first); err != nil || n != 0 {
 		t.Fatalf("pruning through the first record: %d, %v", n, err)
+	}
+	// Which deleted nothing, so history still reads as of before then.
+	if got, err := notesAt(t, h, start); err != nil || !maps.Equal(got, early) {
+		t.Errorf("as of before a prune that deleted nothing: %v, %v", got, err)
 	}
 	// u's first version, which its second superseded before then, and d, whose delete ended it.
 	if n, err := rbac.PruneHistory(ctx, h.pool, then, through); err != nil || n != 3 {
@@ -1785,14 +1788,11 @@ func TestPruningHistoryKeepsWhatAsOfReads(t *testing.T) {
 	if got, err := notesAt(t, h, start); !errors.Is(err, rbac.ErrInvalid) {
 		t.Errorf("as of before the prune's time: %v, %v", got, err)
 	}
-	// The export goes on from its cursor, and reads both prunes, each with what it deleted.
+	// The export goes on from its cursor, and reads the prune that deleted, with what it deleted.
 	cursor := through
-	for i, r := range drain(t, h, &cursor, 2) {
-		deleted := []string{`"deleted": 0`, `"deleted": 3`}[i]
-		if r.Entity != "history" || r.Op != "prune" || r.How != "PruneHistory" || !strings.Contains(string(r.After), deleted) ||
-			r.Key != then.UTC().Format("2006-01-02T15:04:05.000000Z") {
-			t.Errorf("prune %d: %+v", i, r)
-		}
+	if r := drain(t, h, &cursor, 1)[0]; r.Entity != "history" || r.Op != "prune" || r.How != "PruneHistory" ||
+		!strings.Contains(string(r.After), `"deleted": 3`) || r.Key != then.UTC().Format("2006-01-02T15:04:05.000000Z") {
+		t.Errorf("prune: %+v", r)
 	}
 	// A prune needs an export's cursor, of this generation, and a time that has passed: AsOf would
 	// refuse the present until one to come.
