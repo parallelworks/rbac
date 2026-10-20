@@ -212,10 +212,13 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 		// A suspended member's membership widens what its identity will hold once lifted where no
 		// member's was in force: it is new, ended or a guest's. A suspended guest's never does, as the
 		// exclusive values count an identity's own grants before it joins. Read before the upsert.
+		// Here and below, each key's membership is looked up on its own: as an anti-join, a generic
+		// plan, costing the tenant's memberships by averages, reads every one. OFFSET 0 keeps the
+		// planner from making it one.
 		var widened []string
 		if a.exclusive() && len(suspendedMembers) > 0 {
 			rows, err := tx.Query(ctx, `SELECT k FROM unnest($2::text[]) AS k WHERE NOT EXISTS (SELECT FROM rbac_memberships m
-				WHERE m.tenant = $1 AND m.principal = k AND NOT m.guest AND (m.expires_at IS NULL OR m.expires_at > $3))`,
+				WHERE m.tenant = $1 AND m.principal = k AND NOT m.guest AND (m.expires_at IS NULL OR m.expires_at > $3) OFFSET 0)`,
 				tenant, suspendedMembers, at)
 			if err != nil {
 				return ChangeEvent{}, nil, err
@@ -226,7 +229,7 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 		}
 		left, err := removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant, `principal = ANY(
 			ARRAY(SELECT principal FROM rbac_memberships WHERE tenant = $1 AND principal = ANY($2::text[]) AND expires_at <= $3 FOR UPDATE)
-			|| ARRAY(SELECT k FROM unnest($2::text[]) AS k WHERE NOT EXISTS (SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = k)))`,
+			|| ARRAY(SELECT k FROM unnest($2::text[]) AS k WHERE NOT EXISTS (SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = k OFFSET 0)))`,
 			keys, at)
 		if err != nil {
 			return ChangeEvent{}, nil, err
@@ -261,12 +264,14 @@ func (a *Authorizer) Memberships(ctx context.Context, tenant string, principals 
 	if !validID(tenant) || slices.ContainsFunc(principals, func(p Principal) bool { return p != (Principal{}) && !p.wellFormed(tenant) }) {
 		return nil, fmt.Errorf("%w: Memberships needs a tenant and valid principals", ErrInvalid)
 	}
-	var keys []string
+	// A statement of its own for each shape, as GrantFilter's: one plan for both, cached generic
+	// once a connection has listed the tenant, reads every membership to find the principals'.
+	which, keys := "$2::text[] IS NULL", []string(nil)
 	if len(principals) > 0 {
-		keys = keysOf(principals)
+		which, keys = "principal = ANY($2::text[])", keysOf(principals)
 	}
 	rows, err := a.db.Query(ctx, `SELECT `+membershipColumns+` FROM rbac_memberships
-		WHERE tenant = $1 AND ($2::text[] IS NULL OR principal = ANY($2::text[])) AND (expires_at IS NULL OR expires_at > $3)
+		WHERE tenant = $1 AND `+which+` AND (expires_at IS NULL OR expires_at > $3)
 		ORDER BY principal`, tenant, keys, a.cfg.Now())
 	if err != nil {
 		return nil, err

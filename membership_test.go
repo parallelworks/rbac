@@ -122,6 +122,91 @@ func TestSettingMemberships(t *testing.T) {
 	}
 }
 
+// Memberships of named principals, and SetMemberships, read only their memberships under a generic
+// plan: one plan for a tenant's every membership and for a few principals' reads every one to find
+// theirs, and the keys a change sets, joined to the tenant's memberships to find those it makes or
+// widens, read every one.
+func TestMembershipsOfNamedPrincipalsUnderAGenericPlanReadOnlyTheirs(t *testing.T) {
+	h := generic(t, banks)
+	ctx := t.Context()
+	ann := h.as(t, "ann")
+	// The pages of memberships each reads, in a transaction it rolls back.
+	read := func() map[string]int64 {
+		t.Helper()
+		pages := map[string]int64{}
+		for what, f := range map[string]func(a *rbac.Authorizer) error{
+			"Memberships": func(a *rbac.Authorizer) error {
+				ms, err := a.Memberships(ctx, "t1", []rbac.Principal{ann.Principal, identity("new")})
+				if err == nil && len(ms) != 1 {
+					err = fmt.Errorf("Memberships = %+v", ms)
+				}
+				return err
+			},
+			// A suspended member's, which widens what it holds once lifted where none was, and one made.
+			"SetMemberships": func(a *rbac.Authorizer) error {
+				return a.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: ann.Principal, Suspended: true}, {Principal: identity("new")}})
+			},
+		} {
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			start := pagesRead(ctx, t, tx, "rbac_memberships")
+			if err := f(h.authz.WithTx(tx)); err != nil {
+				t.Fatalf("%s: %v", what, err)
+			}
+			pages[what] = pagesRead(ctx, t, tx, "rbac_memberships") - start
+			_ = tx.Rollback(ctx)
+		}
+		return pages
+	}
+	others := func(n int) {
+		t.Helper()
+		manyMembers(t, h, n, `SELECT 1`)
+	}
+	others(500)
+	few := read()
+	others(4500)
+	for what, many := range read() {
+		if many > few[what]*3/2+deeper {
+			t.Errorf("%s read %d pages of memberships, and %d once 4500 more were members", what, few[what], many)
+		}
+	}
+}
+
+// Memberships of a principal reads only its own once its connection has listed the tenant's: as
+// one statement, the plan PostgreSQL caches for the listing, generic once it has run five times,
+// would read a principal's too, reading every membership.
+func TestMembershipsOfAPrincipalReadOnlyItsOwnOnceItsConnectionListedEvery(t *testing.T) {
+	h := setupOn(t, pgtest.Open(t, "pool_max_conns=1"))
+	ctx := t.Context()
+	ann := h.as(t, "ann")
+	manyMembers(t, h, 5000, `SELECT 1`)
+	// The pages of memberships reading ann's reads, in a transaction it rolls back.
+	read := func() int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		start := pagesRead(ctx, t, tx, "rbac_memberships")
+		if ms, err := h.authz.WithTx(tx).Memberships(ctx, "t1", []rbac.Principal{ann.Principal}); err != nil || len(ms) != 1 {
+			t.Fatalf("Memberships = %+v, %v", ms, err)
+		}
+		return pagesRead(ctx, t, tx, "rbac_memberships") - start
+	}
+	before := read()
+	for range 5 {
+		if _, err := h.authz.Memberships(ctx, "t1", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if after := read(); after > 2*before {
+		t.Errorf("reading ann's membership read %d pages, and %d once the tenant's were listed five times", before, after)
+	}
+}
+
 func TestManagingGroups(t *testing.T) {
 	h := grouped(t, func(c *rbac.Config) { c.Sources = []string{"directory"} })
 	ctx := t.Context()
