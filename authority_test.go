@@ -1769,9 +1769,22 @@ func TestARemovalReadsAScopeTheHostNoLongerHasAsUnlabeled(t *testing.T) {
 	if err := h.authz.SetRole(ctx, admin, "t1", ops); !errors.Is(err, rbac.ErrNotFound) {
 		t.Errorf("widening it: %v", err)
 	}
-	// So with a group the host no longer has: its members are removed, but none added.
+	// So with a group the host no longer has: its members are removed, and their places made to end
+	// sooner, but none added, nor any place made to last longer.
 	if err := h.authz.ChangeMembers(ctx, admin, "t1", []rbac.Member{{Group: "lost", Principal: identity("v")}}, nil); !errors.Is(err, rbac.ErrNotFound) {
 		t.Errorf("adding a member to a group the host no longer has: %v", err)
+	}
+	sooner := []rbac.Member{{Group: "lost", Principal: identity("u"), ExpiresAt: h.now.Add(time.Hour)}}
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", sooner, nil); err != nil {
+		t.Errorf("making a place in a group the host no longer has end sooner: %v", err)
+	}
+	sooner[0].Note = "leaving"
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", sooner, nil); err != nil {
+		t.Errorf("changing the note of a place in a group the host no longer has: %v", err)
+	}
+	sooner[0].ExpiresAt = h.now.Add(2 * time.Hour)
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", sooner, nil); !errors.Is(err, rbac.ErrNotFound) {
+		t.Errorf("making a place in a group the host no longer has last longer: %v", err)
 	}
 	if err := h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "lost", Principal: identity("u")}}); err != nil {
 		t.Errorf("removing a member of a group the host no longer has: %v", err)
@@ -1781,6 +1794,42 @@ func TestARemovalReadsAScopeTheHostNoLongerHasAsUnlabeled(t *testing.T) {
 	}
 	if err := h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "ops", Principal: identity("u")}}); !errors.Is(err, errDown) {
 		t.Errorf("removing a member of a group with access on a scope the host fails to read: %v", err)
+	}
+}
+
+// A place a change makes end sooner in a group the host no longer has, which it reads as unlabeled,
+// is tried again where the place was removed while the change waited: it joins the group then.
+func TestAPlaceEndingSoonerInAGroupTheHostLostRemovedMeanwhileIsTriedAgain(t *testing.T) {
+	var meanwhile func(context.Context) error
+	h := grouped(t, func(c *rbac.Config) {
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s != (rbac.Scope{Type: rbac.GroupScope, ID: "lost"}) {
+				return resourceOf(ctx, tenant, s)
+			}
+			if do := meanwhile; do != nil {
+				meanwhile = nil
+				if err := do(ctx); err != nil {
+					return rbac.Resource{}, err
+				}
+			}
+			return rbac.Resource{}, fmt.Errorf("%w: %s", rbac.ErrNotFound, s.Key())
+		}
+	})
+	ctx := t.Context()
+	h.as(t, "u", "lost")
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "lost", Principal: identity("u")}})
+	}
+	sooner := []rbac.Member{{Group: "lost", Principal: identity("u"), ExpiresAt: h.now.Add(time.Hour)}}
+	if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", sooner, nil); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("ending sooner a place in a group the host no longer has, removed meanwhile: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("u's place should have been removed meanwhile")
+	}
+	if of, err := h.authz.GroupsOf(ctx, "t1", identity("u")); err != nil || len(of) != 0 {
+		t.Fatalf("u is in %v, %v", of, err)
 	}
 }
 

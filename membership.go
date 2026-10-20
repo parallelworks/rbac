@@ -958,7 +958,7 @@ func (a *Authorizer) groupLabeled(ctx context.Context, tenant, id string, labels
 	if len(a.labels) == 0 {
 		return Resource{Tenant: tenant, Type: GroupScope, ID: id}, nil
 	}
-	group, err := a.groupOf(ctx, tenant, id, removing)
+	group, _, err := a.groupOf(ctx, tenant, id, removing)
 	if err != nil {
 		return Resource{}, err
 	}
@@ -967,13 +967,13 @@ func (a *Authorizer) groupLabeled(ctx context.Context, tenant, id string, labels
 
 // groupOf returns a group as Config.ResourceOf gives it: with removing, as for a change that only
 // takes access away from its members, one the host no longer has (ErrNotFound) as unlabeled, as a
-// removal reads any scope.
-func (a *Authorizer) groupOf(ctx context.Context, tenant, id string, removing bool) (Resource, error) {
-	group, _, err := a.hostResource(ctx, tenant, Scope{Type: GroupScope, ID: id})
+// removal reads any scope, and gone set.
+func (a *Authorizer) groupOf(ctx context.Context, tenant, id string, removing bool) (group Resource, gone bool, err error) {
+	group, _, err = a.hostResource(ctx, tenant, Scope{Type: GroupScope, ID: id})
 	if removing && errors.Is(err, ErrNotFound) {
-		return Resource{Tenant: tenant, Type: GroupScope, ID: id}, nil
+		return Resource{Tenant: tenant, Type: GroupScope, ID: id}, true, nil
 	}
-	return group, err
+	return group, false, err
 }
 
 // tenantLabels is what the constraints remove of actor's label values in a tenant, for
@@ -1103,7 +1103,7 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 	if err != nil {
 		return err
 	}
-	rc, err := a.reachOf(ctx, a.db, tenant, set, nil)
+	rc, err := a.reachOf(ctx, a.db, tenant, set, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -1324,7 +1324,7 @@ func (a *Authorizer) placesBounded(ctx context.Context, tx pgx.Tx, tenant string
 // each scope it is on refuses the actor, as Apply refuses a revoke there; a place made to end
 // sooner gains nothing: it is a removal then, checked as one now; nor does one whose note alone
 // changes. Each group changed, and each scope reached, is checked as Config.ResourceOf returns it,
-// a group the change adds no member to that the host no longer has (ErrNotFound) as unlabeled.
+// a group no member gains a place in that the host no longer has (ErrNotFound) as unlabeled.
 // Members from a source the host owns, and the members of a group from one, only the host changes,
 // and what ImportMembers refuses, this does.
 func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant string, add, remove []Member) (err error) {
@@ -1357,14 +1357,18 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 	if err := errors.Join(owned...); err != nil {
 		return err
 	}
-	groups, adding := memberGroups(slices.Concat(set, remove)), memberGroups(set)
+	left, err := a.placesLeft(ctx, a.db, tenant, set, remove)
+	if err != nil {
+		return err
+	}
+	groups, gaining := memberGroups(slices.Concat(set, remove)), memberGroups(left.gaining(set))
 	// As Config.ResourceOf gives them, so a constraint or deny reading a group's attributes sees
-	// what the host's own check of GroupMembers would; a group the change only removes members from,
-	// as a removal reads it.
-	targets := make([]Resource, len(groups))
+	// what the host's own check of GroupMembers would; a group no member gains a place in, as a
+	// removal reads it.
+	targets, gone := make([]Resource, len(groups)), map[string]bool{}
 	for i, g := range groups {
-		_, adds := slices.BinarySearch(adding, g)
-		if targets[i], err = a.groupOf(ctx, tenant, g, !adds); err != nil {
+		_, gains := slices.BinarySearch(gaining, g)
+		if targets[i], gone[g], err = a.groupOf(ctx, tenant, g, !gains); err != nil {
 			return err
 		}
 	}
@@ -1376,7 +1380,7 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 	if err := a.notOwnedGroups(ctx, a.db, tenant, groups); err != nil {
 		return err
 	}
-	rc, err := a.reachOf(ctx, a.db, tenant, set, remove)
+	rc, err := a.reachOf(ctx, a.db, tenant, set, remove, &left)
 	if err != nil {
 		return err
 	}
@@ -1397,6 +1401,12 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 		locked, err := a.stillReached(ctx, tx, tenant, set, remove, rc, false)
 		if err != nil {
 			return ChangeEvent{}, nil, err
+		}
+		// A group the host no longer has was read as unlabeled, as no member gained a place in it.
+		for _, m := range locked.gaining(set) {
+			if gone[m.Group] {
+				return ChangeEvent{}, nil, fmt.Errorf("%w: group %q, which the host no longer has, gains a member: a place this change keeps ended while it waited; try again", ErrConflict, m.Group)
+			}
 		}
 		if err := a.stillStanding(ctx, tx, tenant, stand); err != nil {
 			return ChangeEvent{}, nil, err
@@ -1477,9 +1487,9 @@ type approving struct {
 }
 
 // reachOf reads, on q, what adding add and removing remove reaches, in force at now, what they
-// leave of their members' places, and of what the groups hold, approve and are named or exempt in,
-// all a change checks.
-func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remove []Member) (reach, error) {
+// leave of their members' places, as left gives it or where nil as read, and of what the groups
+// hold, approve and are named or exempt in, all a change checks.
+func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remove []Member, left *placed) (reach, error) {
 	r := reach{up: map[string]map[string]bool{}, labeled: len(a.labels) > 0}
 	groups := memberGroups(slices.Concat(add, remove))
 	if len(groups) == 0 {
@@ -1510,9 +1520,14 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 	}
 	r.stored, r.up = r.up, r.nested(add)
 	keys := slices.Sorted(maps.Keys(reached))
-	if r.placed, err = a.placesLeft(ctx, q, tenant, add, remove); err != nil {
-		return reach{}, err
+	if left == nil {
+		read, err := a.placesLeft(ctx, q, tenant, add, remove)
+		if err != nil {
+			return reach{}, err
+		}
+		left = &read
 	}
+	r.placed = *left
 	// Without declared labels, a member leaving loses nothing a change checks but the denies naming
 	// its groups, which then no longer bind it: where none gains, as none is added but to end a place
 	// sooner or change its note, those alone are read, not what the groups hold.
@@ -1881,7 +1896,7 @@ func (r reach) footprint(add, remove []Member, gains bool) map[reachKey]RoleDefi
 // write, which is checked only as the host is asked about what members gain, it compares only
 // those. It returns what the change reaches under the locks.
 func (a *Authorizer) stillReached(ctx context.Context, tx pgx.Tx, tenant string, add, remove []Member, was reach, gains bool) (reach, error) {
-	now, err := a.reachOf(ctx, tx, tenant, add, remove)
+	now, err := a.reachOf(ctx, tx, tenant, add, remove, nil)
 	if err != nil {
 		return reach{}, err
 	}

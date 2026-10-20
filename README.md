@@ -259,9 +259,10 @@ names the scopes conditional ones reach, to check one by one.
   access is on; a host without it declares no labels and resource attributes as none, and for
   access below the tenant, no containers. For a scope the host no longer has, as a resource deleted
   without `DeleteScopes`, it returns `rbac.ErrNotFound`, or an error wrapping it: a change that only
-  takes access away there, as a member leaving a group with access on it or the group itself,
-  `DeleteGroup`, or `DeleteRole` deleting, or `SetRole` narrowing, a role granted on it, reads it
-  as unlabeled, and any other change fails with the error.
+  takes access away there, as a member leaving a group with access on it or the group itself, a
+  place in the group made to end sooner, `DeleteGroup`, or `DeleteRole` deleting, or `SetRole`
+  narrowing, a role granted on it, reads it as unlabeled, and any other change fails with the
+  error.
 - **Privileged roles:** a role the catalog marks `Privileged`, or one that changes access, is
   privileged: it is never granted to the tenant's members, and gives nothing through them, as
   after a catalog change.
