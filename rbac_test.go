@@ -472,6 +472,20 @@ func TestListingsKeepToDeniesOnTheResourceItself(t *testing.T) {
 // selects, rather than look the row's keys up in a hash or an object of them.
 func overlapping(ctx context.Context, t *testing.T, h *harness, table, query string, args ...any) []string {
 	t.Helper()
+	return planConditions(ctx, t, h, overlap, table, query, args...)
+}
+
+// hashing returns the conditions in the plan of query, on h's pool, that look a row's key up in a
+// hash of what a subquery reading table selects.
+func hashing(ctx context.Context, t *testing.T, h *harness, table, query string, args ...any) []string {
+	t.Helper()
+	return planConditions(ctx, t, h, hashed, table, query, args...)
+}
+
+// planConditions returns the conditions in the plan of query, on h's pool, where use, which
+// captures a subquery's name, finds one reading table.
+func planConditions(ctx context.Context, t *testing.T, h *harness, use *regexp.Regexp, table, query string, args ...any) []string {
+	t.Helper()
 	var plans []struct{ Plan map[string]any }
 	if err := h.pool.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+query, args...).Scan(&plans); err != nil || len(plans) != 1 {
 		t.Fatalf("EXPLAIN %d plans, %v", len(plans), err)
@@ -499,20 +513,24 @@ func overlapping(ctx context.Context, t *testing.T, h *harness, table, query str
 		return found
 	}
 	walk(plans[0].Plan)
-	var over []string
+	var found []string
 	for _, c := range conditions {
-		for _, m := range overlap.FindAllStringSubmatch(c, -1) {
+		for _, m := range use.FindAllStringSubmatch(c, -1) {
 			if reads[m[1]] {
-				over = append(over, c)
+				found = append(found, c)
 				break
 			}
 		}
 	}
-	return over
+	return found
 }
 
-// overlap finds an array overlapped with a subquery's in a plan's condition.
-var overlap = regexp.MustCompile(`&& \(*(InitPlan \d+)\)`)
+// overlap finds an array overlapped with a subquery's in a plan's condition, and hashed a key
+// looked up in a hashed subquery.
+var (
+	overlap = regexp.MustCompile(`&& \(*(InitPlan \d+)\)`)
+	hashed  = regexp.MustCompile(`hashed (SubPlan \d+)`)
+)
 
 // Filter's condition leaves out the resources denies on thousands of them, or of the workspaces
 // they are in, cover by looking each row's keys up: its own in a hash of the denies on resources of
@@ -703,6 +721,104 @@ func TestFilterCountsOnlyTheGrantsGivingThePermission(t *testing.T) {
 	if indexed("op", 200) {
 		t.Error("Filter overlaps each cluster with 200 grants of a custom role")
 	}
+}
+
+// A list keeps to the path's index whatever grants giving nothing are stored, as a privileged
+// role's to the tenant's members, or the public's of a role that isn't public, as one a tenant's
+// admin made no longer public leaves: its condition counts none of them, so they don't pick its
+// form, where counted they would move every subject's list to a read of every row.
+func TestFilterIsFormedByTheGrantsItCounts(t *testing.T) {
+	public := rbac.RoleDefinition{ID: "cluster.public", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}, Public: true}
+	// A harness with a table of clusters whose path is indexed, and ann granted on one, where the
+	// public's grants count for logging in.
+	fleet := func(t *testing.T) (*harness, rbac.Subject) {
+		t.Helper()
+		h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), public) })
+		for _, q := range []string{
+			`CREATE TABLE fleet (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL)`,
+			`INSERT INTO fleet SELECT 't1', 'c' || i, ARRAY['cluster:c' || i, 'workspace:w' || (i % 500), 'org:o1', 'tenant:t1']
+				FROM generate_series(1, 20000) i`,
+			`CREATE INDEX fleet_path ON fleet USING gin (path)`,
+			`ANALYZE fleet`,
+		} {
+			if _, err := h.pool.Exec(t.Context(), q); err != nil {
+				t.Fatal(err)
+			}
+		}
+		h.seed(t, grant(rbac.Scope{Type: "cluster", ID: "c7"}, "cluster.login", rbac.User, "ann"))
+		return h, h.as(t, "ann")
+	}
+	// Whether s's list of clusters, keeping n, is served by the path's index.
+	indexed := func(t *testing.T, h *harness, s rbac.Subject, n int) bool {
+		t.Helper()
+		ctx := t.Context()
+		pred, err := h.authz.Filter(ctx, s, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var kept int
+		if err := h.pool.QueryRow(ctx, "SELECT count(*) FROM fleet WHERE "+pred.SQL, pred.Args...).Scan(&kept); err != nil || kept != n {
+			t.Fatalf("Filter kept %d clusters, %v", kept, err)
+		}
+		rows, err := h.pool.Query(ctx, "EXPLAIN SELECT count(*) FROM fleet WHERE "+pred.SQL, pred.Args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Contains(strings.Join(plan, "\n"), "Bitmap Index Scan on fleet_path")
+	}
+	for name, inert := range map[string]string{
+		"a privileged role's on 200 workspaces to the members": `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'workspace', 'w' || i, 'members', 't1', 'cluster.sudo' FROM generate_series(1, 200) i`,
+		"a privileged role's on 9 clusters to the members": `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', 'x' || i, 'members', 't1', 'cluster.sudo' FROM generate_series(1, 9) i`,
+		"the public's on 9 clusters of a role that isn't public": `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', 'x' || i, 'public', '', 'cluster.login' FROM generate_series(1, 9) i`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, ann := fleet(t)
+			// Stored around the package, as a catalog change leaves them.
+			if _, err := h.pool.Exec(t.Context(), inert); err != nil {
+				t.Fatal(err)
+			}
+			if !indexed(t, h, ann, 1) {
+				t.Error("grants giving nothing move a list off the path's index")
+			}
+		})
+	}
+	t.Run("a custom role made no longer public, the public's on 9 clusters", func(t *testing.T) {
+		h, ann := fleet(t)
+		ctx := t.Context()
+		h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.roles", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "cluster.admin", rbac.User, "admin"))
+		admin := h.as(t, "admin")
+		shared := rbac.RoleDefinition{ID: "custom.shared", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}, Public: true}
+		if err := h.authz.SetRole(ctx, admin, "t1", shared); err != nil {
+			t.Fatal(err)
+		}
+		var grants []rbac.Grant
+		for i := range 9 {
+			grants = append(grants, grant(rbac.Scope{Type: "cluster", ID: fmt.Sprint("c", 100+i)}, "custom.shared", rbac.Public, ""))
+		}
+		h.seed(t, grants...)
+		shared.Public = false
+		if err := h.authz.SetRole(ctx, admin, "t1", shared); err != nil {
+			t.Fatalf("SetRole making it not public: %v", err)
+		}
+		if allowed(t, h, rbac.Subject{}, login, rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c100"}) {
+			t.Fatal("the public's grant of a role no longer public gives")
+		}
+		for name, c := range map[string]struct {
+			s rbac.Subject
+			n int
+		}{"ann": {ann, 1}, "the anonymous": {rbac.Subject{}, 0}} {
+			if !indexed(t, h, c.s, c.n) {
+				t.Errorf("%s: grants giving nothing move a list off the path's index", name)
+			}
+		}
+	})
 }
 
 func TestListingContainersUnderOthersOfTheirType(t *testing.T) {
