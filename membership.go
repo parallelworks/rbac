@@ -35,6 +35,11 @@ const MaxGroupDepth = 8
 // (Config.Sources) counted apart.
 const MaxPlacesInGroup = 20
 
+// MaxGroupsOfPrincipal is how many groups a principal, an identity or a group, is in directly, by
+// places in force, as every check reads each group its subject is in: those it is in from each
+// source the host owns (Config.Sources) counted apart, as for MaxPlacesInGroup.
+const MaxGroupsOfPrincipal = 1000
+
 // Membership is an identity's membership of a tenant. A member holds what it is granted there and
 // what is granted to the tenant's members; a guest only what it is granted; and a suspended one
 // keeps its grants and groups but holds only what the public does until the suspension is lifted,
@@ -1074,9 +1079,10 @@ func keyedAll(members []Member) error {
 // ImportMembers adds members to a tenant's groups, from their sources, or changes their expiry or
 // note, as actor: the host's own write, as for a directory it syncs from. A member identity is a
 // member or guest of the tenant, and a member group exists; nesting a group can't make one contain
-// itself, nor a chain of more than MaxGroupDepth groups. Config.ValidateGrant is asked about each
-// grant and eligibility a member gains, as with ChangeMembers, so about none of a place made to end
-// sooner.
+// itself, nor a chain of more than MaxGroupDepth groups; and a principal is in a group at most
+// MaxPlacesInGroup times, and in at most MaxGroupsOfPrincipal groups. Config.ValidateGrant is asked
+// about each grant and eligibility a member gains, as with ChangeMembers, so about none of a place
+// made to end sooner.
 func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant string, members []Member) (err error) {
 	defer a.refused(ctx, &err, tenant, actor, "ImportMembers")
 	if !validID(tenant) {
@@ -1214,7 +1220,53 @@ func (a *Authorizer) join(ctx context.Context, tx pgx.Tx, tenant string, actor P
 	if err := a.placesBounded(ctx, tx, tenant, joined); err != nil {
 		return nil, err
 	}
+	if err := a.groupsBounded(ctx, tx, tenant, joined); err != nil {
+		return nil, err
+	}
 	return joined, a.nestable(ctx, tx, tenant, nested)
+}
+
+// groupsBounded refuses places just stored that leave a principal in more than MaxGroupsOfPrincipal
+// groups: under the change's locks, which every change to the principal's places takes, once they
+// are stored, those in force the change didn't touch included. Those from each source the host
+// owns count apart, as placesBounded counts, so neither the tenant's admins nor the host can fill
+// the bound to keep the other's from being made.
+func (a *Authorizer) groupsBounded(ctx context.Context, tx pgx.Tx, tenant string, stored []Member) error {
+	if len(stored) == 0 {
+		return nil
+	}
+	principals, sources := make([]string, len(stored)), make([]string, len(stored))
+	for i, m := range stored {
+		principals[i], sources[i] = m.Principal.key(), m.Source
+	}
+	// Each principal's places by source, the others' together, counted on its own, as byKey reads
+	// its rows.
+	rows, err := tx.Query(ctx, `
+		SELECT t.p, t.s FROM (SELECT DISTINCT p, CASE WHEN s = ANY($4::text[]) THEN s ELSE '' END
+		  FROM unnest($2::text[], $3::text[]) AS u(p, s)) AS t(p, s) CROSS JOIN LATERAL (
+		  SELECT count(DISTINCT group_id) AS n FROM rbac_members WHERE tenant = $1 AND principal = t.p
+		    AND (expires_at IS NULL OR expires_at > $5)
+		    AND CASE WHEN t.s = '' THEN (source = ANY($4::text[])) IS NOT TRUE ELSE source = t.s END) m
+		WHERE m.n > $6
+		ORDER BY t.p COLLATE "C", t.s COLLATE "C"`,
+		tenant, principals, sources, slices.Sorted(maps.Keys(a.owned)), a.cfg.Now(), MaxGroupsOfPrincipal)
+	if err != nil {
+		return err
+	}
+	over, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (error, error) {
+		var principal, source string
+		if err := row.Scan(&principal, &source); err != nil {
+			return nil, err
+		}
+		if source != "" {
+			return fmt.Errorf("%w: %s is in at most %d groups from %s", ErrInvalid, principal, MaxGroupsOfPrincipal, source), nil
+		}
+		return fmt.Errorf("%w: %s is in at most %d groups", ErrInvalid, principal, MaxGroupsOfPrincipal), nil
+	})
+	if err != nil {
+		return err
+	}
+	return errors.Join(over...)
 }
 
 // placesBounded refuses places just stored that leave a principal in their group more than

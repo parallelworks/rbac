@@ -447,14 +447,15 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   grants on any type.
 - **Limits:** a change takes at most `rbac.MaxBindings` bindings; a principal holds a role on a
   scope at most `rbac.MaxGrantsPerRole` times, and is in a group at most `rbac.MaxPlacesInGroup`
-  times, by source, from each source the host owns apart; a scope holds at most `rbac.MaxDenies`
-  denies; a tenant has at most `rbac.MaxCustomRoles` custom roles; an id is at most `rbac.MaxID`
-  bytes. The others are exported beside them. Lists have no limit or cursor, so what one returns
-  grows with what it lists: `Memberships` of a whole tenant with its members and guests, `Groups`
-  with its groups, `Members` with a group's members, `Holders` with who holds the permission,
-  `Grants` and `Eligibilities` on the tenant's scope with what is granted there, `Reach.Scopes`
-  with the scopes a subject's grants are on, and `Conflicts` with the identities in conflict. In a
-  large tenant, ask for less: `Memberships` of named principals, `Grants` of one principal.
+  times, by source, and in at most `rbac.MaxGroupsOfPrincipal` groups, from each source the host
+  owns apart; a scope holds at most `rbac.MaxDenies` denies; a tenant has at most
+  `rbac.MaxCustomRoles` custom roles; an id is at most `rbac.MaxID` bytes. The others are exported
+  beside them. Lists have no limit or cursor, so what one returns grows with what it lists:
+  `Memberships` of a whole tenant with its members and guests, `Groups` with its groups, `Members`
+  with a group's members, `Holders` with who holds the permission, `Grants` and `Eligibilities` on
+  the tenant's scope with what is granted there, `Reach.Scopes` with the scopes a subject's grants
+  are on, and `Conflicts` with the identities in conflict. In a large tenant, ask for less:
+  `Memberships` of named principals, `Grants` of one principal.
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
   to run on a schedule, passing over what a change holds until the next run.
 

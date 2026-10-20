@@ -430,6 +430,45 @@ func TestAPrincipalIsInAGroupABoundedNumberOfTimes(t *testing.T) {
 	}
 }
 
+func TestAPrincipalIsInABoundedNumberOfGroups(t *testing.T) {
+	h := grouped(t, func(c *rbac.Config) { c.Sources = []string{"directory"} })
+	ctx := t.Context()
+	h.groups(t, "inner", "more")
+	h.join(t, "u")
+	// u and inner are each in as many groups as they may be, for an hour, written around the hooks.
+	if _, err := h.pool.Exec(ctx, `WITH g AS (INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'g' || i FROM generate_series(1, $1::int) i RETURNING id)
+		INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, expires_at)
+		SELECT 't1', id, k, p, $2 FROM g, (VALUES ('user', 'u'), ('group', 'inner')) AS m(k, p)`, rbac.MaxGroupsOfPrincipal, h.now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	manager := h.as(t, "manager")
+	in := func(group string, p rbac.Principal, source string) []rbac.Member {
+		return []rbac.Member{{Group: group, Principal: p, Source: source}}
+	}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", in("more", identity("u"), ""), nil); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("joining a group past the limit: %v", err)
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t1", in("more", identity("u"), "")); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("an import past the limit: %v", err)
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t1", in("more", groupOf("inner"), "")); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("nesting a group past the limit: %v", err)
+	}
+	// The host's own count apart, so the tenant's admins can't keep them from being made.
+	if err := h.authz.ImportMembers(ctx, host, "t1", in("more", identity("u"), "directory")); err != nil {
+		t.Errorf("a place from the host's source at the limit: %v", err)
+	}
+	// Another place in a group it is in is in no more groups.
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", in("g1", identity("u"), "other"), nil); err != nil {
+		t.Errorf("another place in a group at the limit: %v", err)
+	}
+	// Places that have ended don't count.
+	h.now = h.now.Add(time.Hour)
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", in("more", identity("u"), ""), nil); err != nil {
+		t.Errorf("a group once the others' places ended: %v", err)
+	}
+}
+
 func TestLeavingATenantRemovesWhatItHeldThere(t *testing.T) {
 	h := grouped(t)
 	ctx := t.Context()
