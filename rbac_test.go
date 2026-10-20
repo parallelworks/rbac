@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/parallelworks/rbac"
 	"github.com/parallelworks/rbac/internal/pgtest"
@@ -1897,6 +1898,51 @@ func TestAConstraintWritingToAStructItIsGivenChangesNothing(t *testing.T) {
 	}
 	if o, _ := r.Attributes["owner"].(owner); seen || o.Tags["team"] != "dev" {
 		t.Fatalf("a constraint's write to a struct's map reached another or the host: %v, %v", seen, r.Attributes)
+	}
+}
+
+// session is a host's type embedding a generated message, as a host wraps one to add fields.
+type session struct {
+	*timestamppb.Timestamp
+	Frozen bool
+}
+
+type sessions struct{ Current *session }
+
+// A constraint is given a host's type that embeds a protobuf message as that type, wherever it is
+// held: cloned as the message it embeds, it would read as another type, or not fit where it is.
+func TestAConstraintIsGivenAHostTypeEmbeddingAMessageAsItIs(t *testing.T) {
+	frozen := func(v any) bool {
+		switch v := v.(type) {
+		case *session:
+			return v.Frozen
+		case []*session:
+			return len(v) == 1 && v[0].Frozen
+		case sessions:
+			return v.Current.Frozen
+		}
+		return false
+	}
+	h := setup(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "frozen", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			return in.Subject != nil && frozen(in.Subject.Attributes["session"]), nil
+		}}}
+	})
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	s := &session{Timestamp: timestamppb.Now(), Frozen: true}
+	for name, v := range map[string]any{"itself": s, "in a typed slice": []*session{s}, "in a struct": sessions{Current: s}} {
+		u := h.as(t, "u")
+		u.Attributes = map[string]any{"session": v}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("%s: the check panicked: %v", name, r)
+				}
+			}()
+			if allowed(t, h, u, login, cluster) {
+				t.Errorf("%s: the constraint was given another type than the frozen session", name)
+			}
+		}()
 	}
 }
 

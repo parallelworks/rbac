@@ -336,7 +336,9 @@ func (c copier) copy(v reflect.Value) reflect.Value {
 		if v.IsNil() {
 			return v
 		}
-		if m, ok := v.Interface().(proto.Message); ok {
+		// A message is cloned only as itself: a host's type embedding one is a message by the methods
+		// it promotes, and Clone would return the embedded message in its place.
+		if m, ok := v.Interface().(proto.Message); ok && m.ProtoReflect().Interface() == m {
 			return reflect.ValueOf(proto.Clone(m))
 		}
 		k := copiedKey{v.Type(), v.Pointer(), 0}
