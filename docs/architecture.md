@@ -181,7 +181,7 @@ erDiagram
         text tenant
         text entity
         text key
-        text op "create, update, delete, expire, prune"
+        text op "create, update, delete, expire, baseline, prune"
         jsonb before
         jsonb after
         text actor
@@ -493,10 +493,14 @@ flowchart LR
 
 - **What a record holds.** Each holds the row as it was and as it became, when it took effect,
   the database role that wrote it, and the actor and call it was made through, with what the host
-  attached. A write that bypassed the package is recorded too, with no actor.
+  attached. A write that bypassed the package is recorded too, with no actor. A row written
+  before history was installed has one record from migrating, its baseline, dated when it was
+  created.
 - **History's order.** `History` reads records in transaction order, and only those of
   transactions older than every transaction still running, which have all ended. So a cursor
-  never passes a record that commits later.
+  never passes a record that commits later. It, `Export` and `PruneHistory` name history by its
+  schema, as `AsOf` does, and their types by pg_catalog's, so a session's temporary table or type
+  stands in for none of it.
 - **Generations.** A cursor names its generation: the database cluster, by its system and
   timeline, and the database and schema. Failing over or recovering to a point in time starts a
   new generation, which an export starts again from `Genesis`. A restore that starts none, as

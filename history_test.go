@@ -7,8 +7,10 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -329,6 +331,83 @@ func role(t *testing.T, tx pgx.Tx) (name, schema string) {
 	return name, schema
 }
 
+// Any role may make a temporary table or type, which a search_path that doesn't name pg_temp reads
+// before any schema's, pg_catalog's too, and a pool keeps it on its connection: one named as
+// history's, empty or holding records history never held, as a catalog its generation is read
+// from, or as a type its reads name, stands in for none of it, to History, its generation and
+// cursor, PruneHistory, or AsOf's check of what a prune removed. A search_path naming pg_temp
+// first, which makes it the current schema, is refused.
+func TestHistoryReadsItselfWhateverTablesASessionMakes(t *testing.T) {
+	h := setupOn(t, pgtest.Open(t, "pool_max_conns=1"))
+	ctx := t.Context()
+	var schema string
+	if err := h.pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `UPDATE rbac_grants SET note = 'changed' WHERE principal = 'user:owner'`); err != nil {
+		t.Fatal(err)
+	}
+	var through rbac.Cursor
+	want := drain(t, h, &through, 2)
+	before := dbNow(t, h)
+	// Types named as those history's reads cast to: as a date, a time compares by its day, so a
+	// prune's time, and AsOf's check of it, would be its day's start.
+	const types = `CREATE DOMAIN pg_temp.xid8 AS pg_catalog.xid8 CHECK (VALUE <> '0');
+		 CREATE DOMAIN pg_temp.text AS pg_catalog.varchar(1);
+		 CREATE DOMAIN pg_temp.regclass AS pg_catalog.oid;
+		 CREATE DOMAIN pg_temp.timestamptz AS pg_catalog.date;`
+	for _, shadow := range []string{
+		`CREATE TEMP TABLE rbac_history (LIKE rbac_history INCLUDING ALL)`,
+		`CREATE TEMP TABLE pg_class AS SELECT oid, 0::oid AS relnamespace FROM pg_catalog.pg_class;
+		 CREATE TEMP TABLE pg_database AS SELECT 0::oid AS oid, datname FROM pg_catalog.pg_database`,
+		types,
+		// The last, beside which history is pruned.
+		types + `CREATE TEMP TABLE rbac_history AS SELECT * FROM rbac_history;
+		 INSERT INTO pg_temp.rbac_history (id, txid, recorded_at, effective_at, tenant, entity, key, op)
+		 VALUES (0, '1', now(), now(), 't1', 'grant', 'forged', 'create')`,
+	} {
+		// Each on a session of its own, which has planned none of History's statements.
+		h.pool.Reset()
+		if _, err := h.pool.Exec(ctx, shadow); err != nil {
+			t.Fatal(err)
+		}
+		got, cursor, err := h.authz.History(ctx, rbac.Cursor{}, rbac.MaxHistory)
+		if err != nil || !reflect.DeepEqual(got, want) || cursor.Generation != through.Generation || cursor.ID != through.ID {
+			t.Errorf("History beside a session's own history = %+v, %+v, %v", got, cursor, err)
+		}
+		if more, _, err := h.authz.History(ctx, through, 1); err != nil || len(more) != 0 {
+			t.Errorf("History after its cursor, beside a session's own history = %+v, %v", more, err)
+		}
+	}
+	// The owner's grant's first version, which its second supersedes.
+	if n, err := rbac.PruneHistory(ctx, h.pool, before, through); err != nil || n != 1 {
+		t.Errorf("PruneHistory beside a session's own history = %d, %v", n, err)
+	}
+	var pruned, prunes int
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE id = $1), count(*) FILTER (WHERE entity = 'history')
+		FROM `+pgx.Identifier{schema, "rbac_history"}.Sanitize(), want[0].ID).Scan(&pruned, &prunes); err != nil || pruned != 0 || prunes != 1 {
+		t.Errorf("history holds %d of the version pruned and %d prunes, %v", pruned, prunes, err)
+	}
+	if err := h.authz.AsOf(ctx, "t1", before.Add(-time.Microsecond), func(*rbac.Authorizer) error { return nil }); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("AsOf just before the prune's time, beside a session's own types: %v", err)
+	}
+	if err := h.authz.AsOf(ctx, "t1", dbNow(t, h), func(*rbac.Authorizer) error { return nil }); err != nil {
+		t.Errorf("AsOf now, beside a session's own types: %v", err)
+	}
+	if _, err := h.pool.Exec(ctx, `SELECT set_config('search_path', 'pg_temp, ' || quote_ident(current_schema()), false)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h.authz.History(ctx, rbac.Cursor{}, 1); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("History with pg_temp first in the search_path: %v", err)
+	}
+	if _, err := rbac.PruneHistory(ctx, h.pool, before, through); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("PruneHistory with pg_temp first in the search_path: %v", err)
+	}
+	if err := h.authz.AsOf(ctx, "t1", dbNow(t, h), func(*rbac.Authorizer) error { return nil }); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("AsOf with pg_temp first in the search_path: %v", err)
+	}
+}
+
 func TestHistoryKeysTellMembersApart(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -417,8 +496,8 @@ func TestHistoryWritesAsJSONInAnyTimeZone(t *testing.T) {
 	}
 }
 
-// The tables refuse an expiry a time.Time or JSON can't hold, which a role that may write them can
-// try.
+// The tables refuse an expiry a time.Time or JSON can't hold, or one a time.Time holds as its zero,
+// which a Record reads as none, which a role that may write them can try.
 func TestNoExpiryIsInfinite(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -431,7 +510,7 @@ func TestNoExpiryIsInfinite(t *testing.T) {
 		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id, expires_at) VALUES ('t1', 'user', 'u', $1)`,
 		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, expires_at) VALUES ('t1', 'g', 'user', 'u', $1)`,
 	} {
-		for _, at := range []string{"infinity", "-infinity", "10000-01-01 00:00:00+00", "0001-12-31 23:59:59+00 BC"} {
+		for _, at := range []string{"infinity", "-infinity", "10000-01-01 00:00:00+00", "0001-12-31 23:59:59+00 BC", "0001-01-01 00:00:00+00"} {
 			_, err := h.pool.Exec(ctx, sql, at)
 			if pgErr := (*pgconn.PgError)(nil); !errors.As(err, &pgErr) || pgErr.Code != "23514" {
 				t.Errorf("%s, expiring at %s: %v", sql, at, err)
@@ -440,36 +519,62 @@ func TestNoExpiryIsInfinite(t *testing.T) {
 	}
 }
 
-// Migrating a database whose tables hold an infinite expiry, or one outside the years 1 to 9999, as
-// before they refused one, ends none early or late: one at infinity never expires, one past 9999
-// expires at its end, and one at -infinity or before year 1 has expired.
+// migrateFiles applies the migrations named from from up to to, or past the last when to is empty,
+// as a host's own migration tool would: each once, in order, in a transaction of its own.
+func migrateFiles(t *testing.T, pool *pgxpool.Pool, from, to string) {
+	t.Helper()
+	if err := applyMigrations(t.Context(), pool, pgx.ReadCommitted, from, to); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// applyMigrations is migrateFiles, each in a transaction at iso, returning why it failed, for a
+// test's goroutine.
+func applyMigrations(ctx context.Context, pool *pgxpool.Pool, iso pgx.TxIsoLevel, from, to string) error {
+	files, err := fs.Glob(rbac.Migrations(), "*.sql")
+	if err != nil {
+		return err
+	}
+	for _, name := range files {
+		if name < from || to != "" && name >= to {
+			continue
+		}
+		sql, err := fs.ReadFile(rbac.Migrations(), name)
+		if err != nil {
+			return err
+		}
+		if err := pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{IsoLevel: iso}, func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, string(sql))
+			return err
+		}); err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// migrated is a harness on pool, which migrateFiles migrated.
+func migrated(t *testing.T, pool *pgxpool.Pool) *harness {
+	t.Helper()
+	authz, err := rbac.New(pool, rbac.Config{
+		Catalog: catalog, ContainerTypes: []string{"org", "workspace"},
+		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &harness{ctx: t.Context(), pool: pool, authz: authz}
+}
+
+// Migrating a database whose tables hold an infinite expiry, or one outside the years 1 to 9999 or
+// at the first instant of year 1, which a time.Time holds as its zero, as before they refused one,
+// ends none early or late: one at infinity never expires, one past 9999 expires at its end, and one
+// at -infinity, before year 1 or at its first instant has expired.
 func TestMigratingKeepsWhatAnInfiniteExpiryMeant(t *testing.T) {
 	pool := pgtest.Open(t, "")
 	ctx := t.Context()
-	// As a host's own migration tool would, up to the one that refuses them.
-	apply := func(newer bool) {
-		t.Helper()
-		files, err := fs.Glob(rbac.Migrations(), "*.sql")
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, name := range files {
-			if (name >= "0006") != newer {
-				continue
-			}
-			sql, err := fs.ReadFile(rbac.Migrations(), name)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
-				_, err := tx.Exec(ctx, string(sql))
-				return err
-			}); err != nil {
-				t.Fatalf("%s: %v", name, err)
-			}
-		}
-	}
-	apply(false)
+	// Up to the first that refuses them.
+	migrateFiles(t, pool, "", "0006")
 	for _, sql := range []string{
 		`INSERT INTO rbac_groups (tenant, id) VALUES ('t1', 'g')`,
 		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
@@ -479,18 +584,23 @@ func TestMigratingKeepsWhatAnInfiniteExpiryMeant(t *testing.T) {
 		   ('t1', 'cluster', 'c1', 'user', 'far', 'cluster.login', '20000-01-01 00:00:00+00'),
 		   ('t1', 'cluster', 'c1', 'user', 'ancient', 'cluster.login', '0044-03-15 12:00:00+00 BC'),
 		   ('t1', 'cluster', 'c1', 'user', 'ancient', 'cluster.login', '0100-01-01 00:00:00+00 BC'),
-		   ('t1', 'cluster', 'c1', 'user', 'ancient', 'cluster.login', 'epoch')`,
+		   ('t1', 'cluster', 'c1', 'user', 'ancient', 'cluster.login', 'epoch'),
+		   ('t1', 'cluster', 'c1', 'user', 'first', 'cluster.login', '0001-01-01 00:00:00+00'),
+		   ('t1', 'cluster', 'c1', 'user', 'first', 'cluster.login', 'epoch')`,
 		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, expires_at)
 		 VALUES ('t1', 'cluster', 'c1', 'user', 'standing', 'cluster.sudo', 60, 'infinity'),
 		   ('t1', 'cluster', 'c1', 'user', 'ended', 'cluster.sudo', 60, '-infinity'),
 		   ('t1', 'cluster', 'c1', 'user', 'far', 'cluster.sudo', 60, '10000-01-01 00:00:00+00'),
-		   ('t1', 'cluster', 'c1', 'user', 'ancient', 'cluster.sudo', 60, '0044-03-15 12:00:00+00 BC')`,
+		   ('t1', 'cluster', 'c1', 'user', 'ancient', 'cluster.sudo', 60, '0044-03-15 12:00:00+00 BC'),
+		   ('t1', 'cluster', 'c1', 'user', 'first', 'cluster.sudo', 60, '0001-01-01 00:00:00+00')`,
 		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id, expires_at)
 		 VALUES ('t1', 'user', 'standing', 'infinity'), ('t1', 'user', 'ended', '-infinity'),
-		   ('t1', 'user', 'far', '10000-01-01 00:00:00+00'), ('t1', 'user', 'ancient', '0044-03-15 12:00:00+00 BC')`,
+		   ('t1', 'user', 'far', '10000-01-01 00:00:00+00'), ('t1', 'user', 'ancient', '0044-03-15 12:00:00+00 BC'),
+		   ('t1', 'user', 'first', '0001-01-01 00:00:00+00')`,
 		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, expires_at)
 		 VALUES ('t1', 'g', 'user', 'standing', 'infinity'), ('t1', 'g', 'user', 'ended', '-infinity'),
-		   ('t1', 'g', 'user', 'far', '10000-01-01 00:00:00+00'), ('t1', 'g', 'user', 'ancient', '0044-03-15 12:00:00+00 BC')`,
+		   ('t1', 'g', 'user', 'far', '10000-01-01 00:00:00+00'), ('t1', 'g', 'user', 'ancient', '0044-03-15 12:00:00+00 BC'),
+		   ('t1', 'g', 'user', 'first', '0001-01-01 00:00:00+00')`,
 	} {
 		if _, err := pool.Exec(ctx, sql); err != nil {
 			t.Fatal(err)
@@ -500,12 +610,12 @@ func TestMigratingKeepsWhatAnInfiniteExpiryMeant(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&before); err != nil {
 		t.Fatal(err)
 	}
-	apply(true)
+	migrateFiles(t, pool, "0006", "")
 	var wrong []string
 	for _, table := range []string{"rbac_grants", "rbac_eligibilities", "rbac_memberships", "rbac_members"} {
 		rows, err := pool.Query(ctx, `SELECT principal || ' ' || coalesce(expires_at::text, 'never') FROM `+table+`
 			WHERE NOT (principal = 'user:standing' AND expires_at IS NULL
-			  OR principal IN ('user:ended', 'user:ancient') AND expires_at = 'epoch'
+			  OR principal IN ('user:ended', 'user:ancient', 'user:first') AND expires_at = 'epoch'
 			  OR principal = 'user:far' AND expires_at = '9999-12-30 23:59:59.999999+00')`)
 		if err != nil {
 			t.Fatal(err)
@@ -520,21 +630,23 @@ func TestMigratingKeepsWhatAnInfiniteExpiryMeant(t *testing.T) {
 		t.Fatalf("after migrating: %v", wrong)
 	}
 	// Grants that differed only in expiries that became one are one grant: the far one past the
-	// first is revoked, and the ancient ones before year 1 expire, as the one at the epoch has.
+	// first is revoked, and the ancient ones before year 1, and the first one at it, expire, as the
+	// one at the epoch has.
 	gone, err := pool.Query(ctx, `SELECT principal || ' ' || op || ' ' || how FROM rbac_history
 		WHERE entity = 'grant' AND op IN ('delete', 'expire') ORDER BY 1`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got, err := pgx.CollectRows(gone, pgx.RowTo[string]); err != nil ||
-		!slices.Equal(got, []string{"user:ancient expire Migrate", "user:ancient expire Migrate", "user:far delete Migrate"}) {
+		!slices.Equal(got, []string{"user:ancient expire Migrate", "user:ancient expire Migrate", "user:far delete Migrate", "user:first expire Migrate"}) {
 		t.Fatalf("grants ended by migrating: %v, %v", got, err)
 	}
-	// What migrating records holds no time the tables refuse, which JSON can't write.
+	// What migrating records holds no time the tables refuse, which JSON can't write, or a Record
+	// reads as none.
 	var outside int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM rbac_history WHERE how = 'Migrate'
-		AND (expires_at NOT BETWEEN '0001-01-01 00:00:00+00' AND '9999-12-30 23:59:59.999999+00'
-		  OR effective_at NOT BETWEEN '0001-01-01 00:00:00+00' AND '9999-12-30 23:59:59.999999+00')`).Scan(&outside); err != nil || outside != 0 {
+		AND (expires_at <= '0001-01-01 00:00:00+00' OR expires_at > '9999-12-30 23:59:59.999999+00'
+		  OR effective_at <= '0001-01-01 00:00:00+00' OR effective_at > '9999-12-30 23:59:59.999999+00')`).Scan(&outside); err != nil || outside != 0 {
 		t.Fatalf("migrating recorded %d times outside the years 1 to 9999, %v", outside, err)
 	}
 	rows, err := pool.Query(ctx, `SELECT DISTINCT how FROM rbac_history WHERE op = 'update'`)
@@ -580,6 +692,171 @@ func TestMigratingKeepsWhatAnInfiniteExpiryMeant(t *testing.T) {
 		return err
 	}); err != nil {
 		t.Fatalf("as of before migrating: %v", err)
+	}
+}
+
+// A row written before history was installed, as by a host that applied the first migrations on
+// their own, has no record, so migrating records each as it found it, as rbac_record records a
+// row, dated when it was created, or a role, when it last changed: AsOf reads it from then, and a
+// prune keeps it until a later version supersedes it. A row history has recorded gets none.
+func TestMigratingRecordsARowWrittenBeforeHistory(t *testing.T) {
+	// In a time zone of its own, as rbac_record writes a row's times in UTC whatever the session's.
+	pool := pgtest.Open(t, "timezone=Asia/Kolkata")
+	ctx := t.Context()
+	migrateFiles(t, pool, "", "0003")
+	for _, sql := range []string{
+		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id, created_at) VALUES ('t1', 'user', 'old', '2020-01-01 00:00:00+00')`,
+		`INSERT INTO rbac_groups (tenant, id, created_at) VALUES ('t1', 'g', '2020-01-01 00:00:00+00')`,
+		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, source, expires_at, created_at)
+		 VALUES ('t1', 'g', 'user', 'old', 'sync', '9999-01-01 00:00:00+00', '2020-01-01 00:00:00+00')`,
+		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types, updated_at)
+		 VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}', '2021-01-01 00:00:00+00')`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, note, created_at)
+		 VALUES ('t1', 'cluster', 'c1', 'user', 'old', 'cluster.login', 'first', '2020-01-01 00:00:00+00'),
+		   ('t1', 'cluster', 'c1', 'group', 'g', 'custom.viewer', '', '2021-01-01 00:00:00+00')`,
+		`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions, created_at)
+		 VALUES ('t1', 'cluster', 'c1', 'd', '{user:x}', '{cluster:root}', '2020-01-01 00:00:00+00')`,
+		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, created_at)
+		 VALUES ('t1', 'cluster', 'c1', 'user', 'old', 'cluster.sudo', 3600, '2020-01-01 00:00:00+00')`,
+	} {
+		if _, err := pool.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	migrateFiles(t, pool, "0003", "0008")
+	if _, err := pool.Exec(ctx, `INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'new')`); err != nil {
+		t.Fatal(err)
+	}
+	migrateFiles(t, pool, "0008", "")
+	h := migrated(t, pool)
+	var cursor rbac.Cursor
+	var baselines []rbac.Record
+	for _, r := range drain(t, h, &cursor, 9) {
+		if r.Key == "user:new" {
+			if r.Op != "create" {
+				t.Errorf("a row history recorded: %+v", r)
+			}
+			continue
+		}
+		var row struct {
+			CreatedAt *time.Time `json:"created_at"`
+			UpdatedAt *time.Time `json:"updated_at"`
+		}
+		if err := json.Unmarshal(r.After, &row); err != nil {
+			t.Fatal(err)
+		}
+		dated := row.CreatedAt
+		if r.Entity == "role" {
+			dated = row.UpdatedAt
+		}
+		if r.Op != "baseline" || r.How != "Migrate" || r.Actor != (rbac.Principal{}) || r.Before != nil || dated == nil || !r.EffectiveAt.Equal(*dated) {
+			t.Errorf("a row written before history: %+v", r)
+		}
+		baselines = append(baselines, r)
+	}
+	old := rbac.Subject{Principal: rbac.Principal{Kind: rbac.User, ID: "old"}}
+	for _, c := range []struct {
+		at   time.Time
+		want bool
+	}{{time.Date(2019, 1, 1, 0, 0, 0, 0, time.UTC), false}, {time.Date(2022, 1, 1, 0, 0, 0, 0, time.UTC), true}} {
+		if err := h.authz.AsOf(ctx, "t1", c.at, func(a *rbac.Authorizer) error {
+			err := a.Authorize(ctx, old, login, cluster)
+			if err != nil && !errors.Is(err, rbac.ErrDenied) {
+				return err
+			}
+			if (err == nil) != c.want {
+				t.Errorf("as of %v, Authorize(old) = %v", c.at, err)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rebuilt(t, h, dbNow(t, h))
+	// The grant's next version supersedes its baseline, which a prune past both deletes, alone.
+	if _, err := pool.Exec(ctx, `UPDATE rbac_grants SET note = 'second' WHERE principal = 'user:old'`); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := rbac.PruneHistory(ctx, pool, dbNow(t, h), exported(t, h)); err != nil || n != 1 {
+		t.Fatalf("PruneHistory = %d, %v", n, err)
+	}
+	if notes, err := notesAt(t, h, dbNow(t, h)); err != nil || !maps.Equal(notes, map[string]string{"old": "second", "g": ""}) {
+		t.Fatalf("as of after the prune: %v, %v", notes, err)
+	}
+	// Each holds what rbac_record records of its row: the record of the row's next change holds as
+	// Before what the baseline holds as After, beside the same columns.
+	for _, table := range []string{"rbac_members", "rbac_grants", "rbac_eligibilities", "rbac_denies", "rbac_roles", "rbac_memberships", "rbac_groups"} {
+		if _, err := pool.Exec(ctx, `DELETE FROM `+table); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM rbac_history WHERE (txid, id) > ($1::xid8, $2)`, cursor.TxID, cursor.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	next := map[[3]string]rbac.Record{}
+	for _, r := range drain(t, h, &cursor, n) {
+		if k := [3]string{r.Tenant, r.Entity, r.Key}; next[k].ID == 0 {
+			next[k] = r
+		}
+	}
+	for _, b := range baselines {
+		r := next[[3]string{b.Tenant, b.Entity, b.Key}]
+		if r.Principal != b.Principal || r.Role != b.Role || r.Scope != b.Scope || r.Group != b.Group ||
+			!r.ExpiresAt.Equal(b.ExpiresAt) || string(r.Before) != string(b.After) {
+			t.Errorf("%s %s: baseline %+v, next record %+v", b.Entity, b.Key, b, r)
+		}
+	}
+}
+
+// A change in flight to a row written before history, as migrating records the row, is the row's
+// record: migrating waits for it rather than record the row as it was before, after the change,
+// in a transaction of its own at any isolation.
+func TestMigratingRecordsNoRowAsItWasBeforeAChangeInFlight(t *testing.T) {
+	for _, iso := range []pgx.TxIsoLevel{pgx.ReadCommitted, pgx.RepeatableRead} {
+		t.Run(string(iso), func(t *testing.T) {
+			pool := pgtest.Open(t, "")
+			ctx := t.Context()
+			migrateFiles(t, pool, "", "0003")
+			if _, err := pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, note)
+				VALUES ('t1', 'cluster', 'c1', 'user', 'old', 'cluster.login', 'first')`); err != nil {
+				t.Fatal(err)
+			}
+			migrateFiles(t, pool, "0003", "0008")
+			h := migrated(t, pool)
+			writer, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = writer.Rollback(ctx) }()
+			var pid int
+			if err := writer.QueryRow(ctx, `UPDATE rbac_grants SET note = 'second' WHERE principal = 'user:old' RETURNING pg_backend_pid()`).Scan(&pid); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- applyMigrations(ctx, pool, iso, "0008", "") }()
+			for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+				var blocked bool
+				if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))`, pid).Scan(&blocked); err != nil {
+					t.Fatal(err)
+				}
+				if blocked {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("migrating never waited for the write")
+				}
+			}
+			if err := writer.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if notes, err := notesAt(t, h, dbNow(t, h)); err != nil || notes["old"] != "second" {
+				t.Fatalf("as of now: %v, %v", notes, err)
+			}
+		})
 	}
 }
 

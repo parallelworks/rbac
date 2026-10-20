@@ -49,8 +49,9 @@ var asOfEntities = []struct {
 // views named as the package's tables stand in for them, and rolls it back, even once ctx is
 // done. It needs a transaction that may write, on a primary, as a role that may create temporary
 // tables. A search_path that names pg_temp after the package's schema would read the tables as
-// they are now, so AsOf refuses it. It orders a row's changes by their ids in rbac_history, which
-// sessions take out of order once its id sequence caches more than one, so AsOf refuses that too.
+// they are now, and one that names it first the session's own tables as history, so AsOf refuses
+// both. It orders a row's changes by their ids in rbac_history, which sessions take out of order
+// once its id sequence caches more than one, so AsOf refuses that too.
 func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read func(*Authorizer) error) (err error) {
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -77,18 +78,18 @@ func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read
 	return a.readAsOf(ctx, tx, tenant, at, read)
 }
 
-// historySchema returns the schema tx reads history in, refusing it where history's ids can't
-// order a row's changes.
+// historySchema returns the schema tx reads history in, as packageSchema does, refusing it where
+// history's ids can't order a row's changes.
 func historySchema(ctx context.Context, tx pgx.Tx) (string, error) {
-	var schema string
-	if err := tx.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+	schema, err := packageSchema(ctx, tx)
+	if err != nil {
 		return "", err
 	}
 	// A cached sequence hands each session a block of ids of its own, so a change made after
 	// another can take the lower id.
 	var ordered bool
 	if err := tx.QueryRow(ctx, `SELECT s.seqcache = 1 FROM pg_catalog.pg_sequence s
-		WHERE s.seqrelid = pg_catalog.pg_get_serial_sequence(pg_catalog.quote_ident($1) || '.rbac_history', 'id')::regclass`,
+		WHERE s.seqrelid = pg_catalog.pg_get_serial_sequence(pg_catalog.quote_ident($1) || '.rbac_history', 'id')::pg_catalog.regclass`,
 		schema).Scan(&ordered); err != nil {
 		return "", err
 	}
@@ -107,7 +108,7 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	if err := unpruned(ctx, tx, schema, at); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.as_of_tenant', $1, true), set_config('rbac.as_of', $2::timestamptz::text, true)`,
+	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.as_of_tenant', $1, true), set_config('rbac.as_of', $2::pg_catalog.timestamptz::pg_catalog.text, true)`,
 		tenant, at); err != nil {
 		return err
 	}
@@ -125,10 +126,10 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	for i, e := range asOfEntities {
 		names[i] = e.table
 	}
-	rows, err := tx.Query(ctx, `SELECT c.relname::text, array_agg(a.attname::text ORDER BY a.attnum)
+	rows, err := tx.Query(ctx, `SELECT c.relname::pg_catalog.text, array_agg(a.attname::pg_catalog.text ORDER BY a.attnum)
 		FROM pg_catalog.pg_class c JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
 		WHERE c.relnamespace = (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = $1)
-		  AND c.relname = ANY($2::text[]) AND a.attnum > 0 AND NOT a.attisdropped
+		  AND c.relname = ANY($2::pg_catalog.text[]) AND a.attnum > 0 AND NOT a.attisdropped
 		GROUP BY c.relname`, schema, names)
 	if err != nil {
 		return err
@@ -152,16 +153,16 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 			// A version recorded before the tables refused an infinite expiry reads as migrating
 			// rewrote its row: a time.Time holds no infinity.
 			if name == "expires_at" {
-				selected[i] = `CASE r.expires_at WHEN 'infinity' THEN NULL WHEN '-infinity' THEN timestamptz 'epoch' ELSE r.expires_at END AS expires_at`
+				selected[i] = `CASE r.expires_at WHEN 'infinity' THEN NULL WHEN '-infinity' THEN pg_catalog.timestamptz 'epoch' ELSE r.expires_at END AS expires_at`
 			}
 		}
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`CREATE TEMP VIEW %[2]s AS
 			SELECT %[4]s FROM %[1]s.rbac_history h, LATERAL pg_catalog.jsonb_populate_record(NULL::%[1]s.%[2]s, h.after) r
 			WHERE h.tenant = current_setting('rbac.as_of_tenant') AND h.entity = '%[3]s'
-			  AND h.effective_at <= current_setting('rbac.as_of')::timestamptz AND h.op NOT IN ('delete', 'expire')
+			  AND h.effective_at <= current_setting('rbac.as_of')::pg_catalog.timestamptz AND h.op NOT IN ('delete', 'expire')
 			  AND NOT EXISTS (SELECT FROM %[1]s.rbac_history n
 			    WHERE n.tenant = h.tenant AND n.entity = h.entity AND n.key = h.key
-			      AND n.effective_at <= current_setting('rbac.as_of')::timestamptz AND n.id > h.id)`,
+			      AND n.effective_at <= current_setting('rbac.as_of')::pg_catalog.timestamptz AND n.id > h.id)`,
 			pgx.Identifier{schema}.Sanitize(), e.table, e.entity, strings.Join(selected, ", "))); err != nil {
 			return err
 		}
@@ -175,7 +176,7 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	// Unless the search_path names pg_temp after the package's schema, its tables' names are
 	// the views'.
 	var shadowed bool
-	if err := tx.QueryRow(ctx, `SELECT 'rbac_grants'::regclass = 'pg_temp.rbac_grants'::regclass`).Scan(&shadowed); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT 'rbac_grants'::pg_catalog.regclass = 'pg_temp.rbac_grants'::pg_catalog.regclass`).Scan(&shadowed); err != nil {
 		return err
 	}
 	if !shadowed {
@@ -203,8 +204,8 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 // then, or as no row.
 func unpruned(ctx context.Context, tx pgx.Tx, schema string, at time.Time) error {
 	var pruned bool
-	if err := tx.QueryRow(ctx, fmt.Sprintf(`SELECT coalesce($1::timestamptz < max((h.after->>'before')::timestamptz), false)
-		FROM %s.rbac_history h WHERE h.tenant = '' AND h.entity = 'history' AND h.op = 'prune'`, pgx.Identifier{schema}.Sanitize()),
+	if err := tx.QueryRow(ctx, `SELECT coalesce($1::pg_catalog.timestamptz < max((h.after->>'before')::pg_catalog.timestamptz), false)
+		FROM `+historyTable(schema)+` h WHERE h.tenant = '' AND h.entity = 'history' AND h.op = 'prune'`,
 		at).Scan(&pruned); err != nil {
 		return err
 	}
