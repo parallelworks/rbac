@@ -517,8 +517,10 @@ type Constraint struct {
 // the constraint removes the permission for any, so that a search never keeps what a check
 // refuses. Holders then asks again about each identity it lists, which it marks MaybeDenied where
 // the constraint answers true. Each constraint is given copies of its own of the subject and the
-// resource, their attributes, ancestors and label too, so one writing to them changes nothing
-// decided.
+// resource, their attributes, ancestors and label too, however deep, so one writing to them
+// changes nothing decided. A host's struct among the attributes is copied by its exported fields
+// and those an unexported struct it embeds promotes: the rest, a pointer it embeds unexported and
+// the fields that promotes among them, reflection can't set, so they are shared.
 type ConstraintInput struct {
 	Tenant       string
 	ResourceType string

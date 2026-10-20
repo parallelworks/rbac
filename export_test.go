@@ -67,3 +67,6 @@ func SetDecidingGrants(t *testing.T, f func() func()) {
 
 // StandSQL is the statement a change reads the standing of its principals with.
 var StandSQL = standSQL
+
+// DeepCopy is the copy of attributes each hook is given.
+func DeepCopy(attributes map[string]any) map[string]any { return deepCopy(attributes) }

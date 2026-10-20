@@ -1901,6 +1901,58 @@ func TestAConstraintWritingToAStructItIsGivenChangesNothing(t *testing.T) {
 	}
 }
 
+type claims struct{ Roles []string }
+
+// account embeds claims unexported, so its Roles is a field of account's to whoever holds one.
+type account struct {
+	claims
+	Name string
+}
+
+func TestAConstraintWritingAFieldAnEmbeddedStructPromotesChangesNothing(t *testing.T) {
+	var seen bool
+	h := setup(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{
+			{Name: "careless", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+				if a, ok := in.Subject.Attributes["account"].(account); ok {
+					a.Roles[0] = "admin"
+				}
+				return false, nil
+			}},
+			{Name: "after", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+				if a, ok := in.Subject.Attributes["account"].(account); ok && a.Roles[0] == "admin" {
+					seen = true
+				}
+				return false, nil
+			}},
+		}
+	})
+	owner := h.as(t, "owner")
+	owner.Attributes = map[string]any{"account": account{claims: claims{Roles: []string{"viewer"}}, Name: "o"}}
+	if !allowed(t, h, owner, login, cluster) {
+		t.Fatal("the owner should log in")
+	}
+	if a, _ := owner.Attributes["account"].(account); seen || a.Roles[0] != "viewer" {
+		t.Fatalf("a constraint's write to a promoted field reached another or the host: %v, %v", seen, owner.Attributes)
+	}
+}
+
+// A hook's copy of a list decoded from JSON costs an allocation for the list, not one for each of
+// its strings: every constraint is given one in every check.
+func TestCopyingAListOfStringsForAHookAllocatesOnce(t *testing.T) {
+	groups := make([]any, 1000)
+	for i := range groups {
+		groups[i] = fmt.Sprintf("group-%04d", i)
+	}
+	attributes := map[string]any{"groups": groups}
+	if n := testing.AllocsPerRun(20, func() { rbac.DeepCopy(attributes) }); n > 10 {
+		t.Errorf("copying a list of %d strings took %.0f allocations", len(groups), n)
+	}
+	if c, ok := rbac.DeepCopy(attributes)["groups"].([]any); !ok || &c[0] == &groups[0] {
+		t.Error("the copy shares the list")
+	}
+}
+
 // session is a host's type embedding a generated message, as a host wraps one to add fields.
 type session struct {
 	*timestamppb.Timestamp

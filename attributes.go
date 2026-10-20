@@ -256,7 +256,9 @@ func typing(attrs Attributes) (*cel.Env, error) {
 
 // deepCopy is a copy of v whose maps, slices, arrays, pointers and structs' exported fields are its
 // own, however deep, a protobuf message among them cloned, and a value reached twice copied once,
-// so a cycle ends.
+// so a cycle ends. A struct's fields an unexported struct it embeds promotes are its own too, but
+// its other unexported fields are shared, a pointer it embeds unexported among them, and so the
+// fields that one promotes: reflection can't set them.
 func deepCopy[T any](v T) T {
 	out := reflect.ValueOf(&v).Elem()
 	out.Set(copier{}.copy(out))
@@ -276,7 +278,7 @@ type copiedKey struct {
 func (c copier) copy(v reflect.Value) reflect.Value {
 	switch v.Kind() {
 	case reflect.Interface:
-		if v.IsNil() {
+		if unreachable(v) {
 			return v
 		}
 		out := reflect.New(v.Type()).Elem()
@@ -307,24 +309,20 @@ func (c copier) copy(v reflect.Value) reflect.Value {
 		out := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
 		c[k] = out
 		// Each hook is given its own, so elements no write could reach through are copied at once.
+		reflect.Copy(out, v)
 		if flat(v.Type().Elem()) {
-			reflect.Copy(out, v)
 			return out
 		}
 		for i := range v.Len() {
-			out.Index(i).Set(c.copy(v.Index(i)))
+			if e := v.Index(i); !unreachable(e) {
+				out.Index(i).Set(c.copy(e))
+			}
 		}
 		return out
 	case reflect.Struct:
-		// Its exported fields, which a hook can write to: an unexported one is out of its reach, as
-		// out of reflection's to set.
 		out := reflect.New(v.Type()).Elem()
 		out.Set(v)
-		for i := range v.NumField() {
-			if f := out.Field(i); f.CanSet() {
-				f.Set(c.copy(v.Field(i)))
-			}
-		}
+		c.fields(out, v)
 		return out
 	case reflect.Array:
 		out := reflect.New(v.Type()).Elem()
@@ -352,6 +350,27 @@ func (c copier) copy(v reflect.Value) reflect.Value {
 	default:
 		return v
 	}
+}
+
+// fields copies into out, a copy of the struct v, the fields a hook can write to: its exported
+// ones, and those an unexported struct it embeds promotes, which reflection sets as the language
+// does. Its other unexported fields a hook reaches only through the type's methods.
+func (c copier) fields(out, v reflect.Value) {
+	for i := range v.NumField() {
+		switch f := out.Field(i); {
+		case f.CanSet():
+			f.Set(c.copy(v.Field(i)))
+		case v.Type().Field(i).Anonymous && f.Kind() == reflect.Struct:
+			c.fields(f, v.Field(i))
+		}
+	}
+}
+
+// unreachable reports whether no write could reach through v, an interface: nil, or holding a value
+// of a flat type, as each of an []any of strings decoded from JSON does, which boxing again would
+// cost an allocation for each.
+func unreachable(v reflect.Value) bool {
+	return v.Kind() == reflect.Interface && (v.IsNil() || flat(v.Elem().Type()))
 }
 
 // flat reports whether a value of type t holds no map, slice or pointer a copy would share.
