@@ -320,13 +320,13 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 		return Principal{}, err
 	}
 	// Those needing no approval first, so an approver passed where none is needed isn't recorded,
-	// and of them the cheapest requirement first, as cheapestFirst orders conditions, so which
-	// allows doesn't rest on the database's collation.
+	// and of each the cheapest requirement first, as cheapestFirst orders conditions, so which
+	// allows doesn't rest on the database's collation, nor on how many approvers one names.
 	rows, err := q.Query(ctx, `
 		SELECT requires, approvers FROM rbac_eligibilities
 		WHERE tenant = $1 AND scope = $2 AND role = $3 AND principal = ANY($4::text[]) AND max_seconds >= $5
 		  AND (expires_at IS NULL OR expires_at > $6 AND expires_at >= $7)
-		ORDER BY cardinality(approvers), octet_length(requires), requires COLLATE "C"`,
+		ORDER BY cardinality(approvers) > 0, octet_length(requires), requires COLLATE "C"`,
 		on.Tenant, scope.Key(), act.Role, countedOf(keys, broad{}), seconds(act.Duration), a.cfg.Now(), until)
 	if err != nil {
 		return Principal{}, err

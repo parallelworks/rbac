@@ -121,6 +121,8 @@ func TestADeclaredAttributePassedAsAnotherTypeFailsAPresenceTest(t *testing.T) {
 		"listed":   `"mfa_at" in dyn(request.attributes)`,
 		"counted":  `size(dyn(request.attributes)) == 2`,
 		"iterated": `dyn(request.attributes).exists(k, k == "mfa_at")`,
+		// By its size alone, the map would compare as one holding mfa_at.
+		"compared": `dyn(request.attributes) != {"team": "sre"}`,
 	}
 	gs := []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "v"), grant(cluster.Scope(), "guard", rbac.User, "guardian")}
 	sibling := grant(cluster.Scope(), "cluster.login", rbac.User, "sibling")
@@ -392,41 +394,75 @@ func TestAChangeCarriesBoundedConditions(t *testing.T) {
 	if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: distinct(rbac.MaxBindings, true)}); err != nil {
 		t.Errorf("Apply of one condition on every binding: %v", err)
 	}
+	// And is compiled once, though one that doesn't compile isn't cached, whatever titles it has.
+	broken := distinct(rbac.MaxBindings, true)
+	for i := range broken {
+		broken[i].Condition = rbac.Condition{Title: fmt.Sprintf("t%d", i), Expression: strings.Repeat(`"x" != "" && `, 150) + "1"}
+	}
+	imported := make([]rbac.Grant, len(broken))
+	for i, b := range broken {
+		imported[i] = rbac.Grant{Scope: cluster.Scope(), Binding: b}
+	}
+	for how, change := range map[string]func() error{
+		"Apply":  func() error { return h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: broken}) },
+		"Import": func() error { return h.authz.Import(ctx, host, "t1", imported) },
+	} {
+		start := time.Now()
+		if err := change(); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s of one condition that doesn't compile on every binding: %v", how, err)
+		}
+		if took := time.Since(start); took > time.Second {
+			t.Errorf("%s of one condition that doesn't compile on every binding took %s", how, took)
+		}
+	}
 }
 
 // Activate evaluates the cheapest requirement first, as a check does conditions, so one that holds
 // is reached however many costly ones the subject is also eligible through, whatever order the
-// database's collation would put them in.
+// database's collation would put them in, and however many approvers each names.
 func TestActivateTriesTheCheapestRequirementFirst(t *testing.T) {
-	h := setup(t)
-	ctx := t.Context()
-	owner := h.as(t, "owner")
-	// Each runs up to its cost on the request's list, which spends it all, and together they spend
-	// what activating may.
-	var groups []string
-	for i := range 9 {
-		groups = append(groups, fmt.Sprintf("g%d", i))
-	}
-	h.groups(t, groups...)
-	x := h.as(t, "x", groups...)
-	for i, g := range groups {
-		e := rbac.Eligibility{
-			Role: "cluster.sudo", Principal: groupOf(g), MaxDuration: time.Hour,
-			Requires: fmt.Sprintf(`request.attributes.big.map(x, x + %d).size() < 0`, i),
-		}
-		if err := h.authz.SetEligibility(ctx, owner, cluster, e); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := h.authz.SetEligibility(ctx, owner, cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: x.Principal, MaxDuration: time.Hour, Requires: "true"}); err != nil {
-		t.Fatal(err)
-	}
-	big := make([]any, 20000)
-	for i := range big {
-		big[i] = i
-	}
-	req := rbac.WithRequest(ctx, map[string]any{"big": big})
-	if _, err := h.authz.Activate(req, x, cluster, rbac.Activation{Role: "cluster.sudo", Duration: time.Minute, Justification: "INC-1"}); err != nil {
-		t.Fatalf("Activate: %v", err)
+	boss := identity("boss")
+	for name, approvers := range map[string]struct{ costly, cheap []rbac.Principal }{
+		"no approvers":         {},
+		"more approvers on it": {costly: []rbac.Principal{boss}, cheap: []rbac.Principal{boss, identity("lead")}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := setup(t)
+			ctx := t.Context()
+			owner := h.as(t, "owner")
+			// Each runs up to its cost on the request's list, which spends it all, and together they
+			// spend what activating may.
+			var groups []string
+			for i := range 9 {
+				groups = append(groups, fmt.Sprintf("g%d", i))
+			}
+			h.groups(t, groups...)
+			x := h.as(t, "x", groups...)
+			for i, g := range groups {
+				e := rbac.Eligibility{
+					Role: "cluster.sudo", Principal: groupOf(g), MaxDuration: time.Hour, Approvers: approvers.costly,
+					Requires: fmt.Sprintf(`request.attributes.big.map(x, x + %d).size() < 0`, i),
+				}
+				if err := h.authz.SetEligibility(ctx, owner, cluster, e); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cheap := rbac.Eligibility{Role: "cluster.sudo", Principal: x.Principal, MaxDuration: time.Hour, Requires: "true", Approvers: approvers.cheap}
+			if err := h.authz.SetEligibility(ctx, owner, cluster, cheap); err != nil {
+				t.Fatal(err)
+			}
+			big := make([]any, 20000)
+			for i := range big {
+				big[i] = i
+			}
+			req := rbac.WithRequest(ctx, map[string]any{"big": big})
+			act := rbac.Activation{Role: "cluster.sudo", Duration: time.Minute, Justification: "INC-1"}
+			if len(approvers.cheap) > 0 {
+				act.Approver = h.as(t, "boss")
+			}
+			if _, err := h.authz.Activate(req, x, cluster, act); err != nil {
+				t.Fatalf("Activate: %v", err)
+			}
+		})
 	}
 }

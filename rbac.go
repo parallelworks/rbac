@@ -769,7 +769,7 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 			return nil, fmt.Errorf("rbac: container type %q is not valid", t)
 		}
 		// Its permissions would read as the dimension's values, so none could change its grants.
-		if slices.ContainsFunc(cfg.Labels, func(d LabelDimension) bool { return d.Name == t }) {
+		if _, dimension := labels[t]; dimension {
 			return nil, fmt.Errorf("rbac: container type %q is named as a label dimension", t)
 		}
 		containers[t] = true

@@ -80,7 +80,7 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 	if len(grants)+len(revokes) > MaxBindings {
 		return fmt.Errorf("%w: a change grants and revokes at most %d bindings", ErrInvalid, MaxBindings)
 	}
-	if err := conditionsWithin(grants); err != nil {
+	if err := conditionsWithin(grants, Binding.expression); err != nil {
 		return err
 	}
 	for _, b := range grants {
@@ -381,21 +381,18 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 	if len(grants) > MaxBindings {
 		return fmt.Errorf("%w: an import stores at most %d grants", ErrInvalid, MaxBindings)
 	}
-	grants = slices.Clone(grants)
-	bindings := make([]Binding, len(grants))
-	for i, g := range grants {
-		bindings[i] = g.Binding
-	}
-	if err := conditionsWithin(bindings); err != nil {
+	if err := conditionsWithin(grants, Grant.expression); err != nil {
 		return err
 	}
+	grants = slices.Clone(grants)
 	var conditions []error
+	checked := map[string]error{}
 	for i := range grants {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		grants[i].ExpiresAt = stored(grants[i].ExpiresAt)
-		conditions = append(conditions, a.checkCondition(grants[i].Binding)...)
+		conditions = append(conditions, a.checkCondition(checked, grants[i].Binding)...)
 		if grants[i].Source == SourceActivation {
 			conditions = append(conditions, &InvalidError{Binding: grants[i].Binding, Reason: "only Activate grants from " + SourceActivation})
 		}
@@ -518,12 +515,13 @@ func keyOf(b Binding) grantKey {
 func (a *Authorizer) validate(ctx context.Context, roles book, actor Subject, via Via, tenant string, scope Scope, grants, revokes []Binding) error {
 	var errs []error
 	now := a.cfg.Now()
+	checked := map[string]error{}
 	for _, b := range grants {
 		// Compiling a condition takes milliseconds, which a canceled change shouldn't go on spending.
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		bad := append(a.checkBinding(roles, tenant, scope, b, now), a.checkCondition(b)...)
+		bad := append(a.checkBinding(roles, tenant, scope, b, now), a.checkCondition(checked, b)...)
 		if a.owned[b.Source] {
 			bad = append(bad, &InvalidError{Binding: b, Reason: "only the host grants from " + b.Source + ", through Import"})
 		}
@@ -642,12 +640,12 @@ func reservedSource(s string) bool { return strings.HasPrefix(s, "rbac") }
 
 func validNote(s string) bool { return utf8.RuneCountInString(s) <= MaxNote && validText(s) }
 
-// conditionsWithin refuses bindings whose conditions, each counted once, are more than
-// MaxConditionBytes.
-func conditionsWithin(bindings []Binding) error {
+// conditionsWithin refuses bindings whose conditions, which expression reads, each counted once,
+// are more than MaxConditionBytes.
+func conditionsWithin[T any](bindings []T, expression func(T) string) error {
 	seen, n := map[string]bool{}, 0
 	for _, b := range bindings {
-		if e := b.Condition.Expression; !seen[e] {
+		if e := expression(b); !seen[e] {
 			seen[e], n = true, n+len(e)
 		}
 	}
@@ -659,17 +657,21 @@ func conditionsWithin(bindings []Binding) error {
 
 // checkCondition returns why a binding's condition can't be stored. It reads nothing stored, so a
 // change checks it once, before its transaction: compiling a condition can take milliseconds,
-// which a change of many shouldn't spend holding its locks.
-func (a *Authorizer) checkCondition(b Binding) []error {
+// which a change of many shouldn't spend holding its locks. checked is what the change's bindings
+// found of each expression so far.
+func (a *Authorizer) checkCondition(checked map[string]error, b Binding) []error {
 	var errs []error
-	for _, reason := range a.conditionFaults(b.Condition) {
+	for _, reason := range a.conditionFaults(checked, b.Condition) {
 		errs = append(errs, &InvalidError{Binding: b, Reason: reason})
 	}
 	return errs
 }
 
-// conditionFaults returns why a condition, of a grant or a deny, can't be stored.
-func (a *Authorizer) conditionFaults(c Condition) []string {
+// conditionFaults returns why a condition, of a grant or a deny, can't be stored. Each expression
+// is compiled once in checked, nil for one condition alone: one that doesn't compile isn't cached,
+// so a change of many bindings carrying it would otherwise compile it for each, past what
+// MaxConditionBytes, which counts it once, lets it spend.
+func (a *Authorizer) conditionFaults(checked map[string]error, c Condition) []string {
 	var faults []string
 	bad := func(reason string) { faults = append(faults, reason) }
 	switch {
@@ -677,7 +679,14 @@ func (a *Authorizer) conditionFaults(c Condition) []string {
 	case !validText(c.Title) || !validText(c.Description) || !validText(c.Expression):
 		bad("a condition is UTF-8 text without NUL")
 	case c.Expression != "":
-		if err := a.conds.check(c.Expression); err != nil {
+		err, ok := checked[c.Expression]
+		if !ok {
+			err = a.conds.check(c.Expression)
+			if checked != nil {
+				checked[c.Expression] = err
+			}
+		}
+		if err != nil {
 			bad(err.Error())
 		}
 	case c != Condition{}:

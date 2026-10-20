@@ -351,6 +351,10 @@ func equal(x, y ref.Val) ref.Val {
 	if types.IsUnknownOrError(y) {
 		return y
 	}
+	// By their sizes alone, CEL's comparison would tell a refused name from one never passed.
+	if refusing(x) || refusing(y) {
+		return refusal()
+	}
 	var failed ref.Val
 	same := func(a, b ref.Val) bool {
 		eq := equal(a, b)
@@ -674,8 +678,8 @@ func declared(declares map[string]AttributeType, attributes map[string]any) any 
 // refusedAttributes are a kind's attributes with some refused, as conditions read them. A refused
 // one fails what reads it by name, as CEL fails a value that is an error, and so does a test of
 // its presence, which CEL reads from a map's keys alone and which would otherwise hold. Whatever
-// reads the map as a whole, in, size() and the macros, fails too, as it could tell a refused name
-// from one never passed.
+// reads the map as a whole, in, size(), the macros and comparing it, fails too, as it could tell a
+// refused name from one never passed.
 type refusedAttributes struct {
 	traits.Mapper
 }
@@ -686,9 +690,15 @@ var refusedAttributesType = types.NewOpaqueType("rbac.RefusedAttributes")
 func (refusedAttributes) Type() ref.Type { return refusedAttributesType }
 
 // Contains fails, for the bounded decorator, which finds in by a map's own method.
-func (refusedAttributes) Contains(ref.Val) ref.Val {
-	return types.NewErr("rbac: the attributes hold one refused")
+func (refusedAttributes) Contains(ref.Val) ref.Val { return refusal() }
+
+func refusing(v ref.Val) bool {
+	_, ok := v.(refusedAttributes)
+	return ok
 }
+
+// refusal is a new error each time, as CEL labels an error with the node it was raised at.
+func refusal() ref.Val { return types.NewErr("rbac: the attributes hold one refused") }
 
 func orEmpty(m map[string]any) map[string]any {
 	if m == nil {
