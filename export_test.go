@@ -1,6 +1,7 @@
 package rbac
 
 import (
+	"runtime"
 	"testing"
 	"time"
 
@@ -219,6 +220,30 @@ func ConditionCostOn(t *testing.T, expr string, s Subject, p Permission, r Resou
 	return prg.limit, evaluate(program{Program: unlimited, limit: maxCost}, vars).cost
 }
 
+// EvaluateCondition evaluates expr as a check does, on a request with attributes, which the
+// resource carries too, and reports whether it held, whether it could be evaluated and the bytes
+// evaluating it allocated, or why it isn't a condition.
+func EvaluateCondition(t *testing.T, expr string, attributes map[string]any) (held, evaluated bool, allocated uint64, err error) {
+	t.Helper()
+	c, err := newConditions(Attributes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prg, err := c.build(expr)
+	if err != nil {
+		return false, false, 0, err
+	}
+	a := &Authorizer{cfg: Config{Now: time.Now}, conds: c}
+	vars := a.vars(WithRequest(t.Context(), attributes), Subject{Principal: Principal{Kind: User, ID: "u"}}, "cluster:login",
+		Resource{Tenant: "t", Type: "cluster", ID: "c", Attributes: attributes})
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	r := evaluate(prg, vars)
+	runtime.ReadMemStats(&after)
+	return r.held, r.evaluated, after.TotalAlloc - before.TotalAlloc, nil
+}
+
 // compiled is expr as c compiles it, and the sizes of its patterns.
 func compiled(t *testing.T, c *conditions, expr string) (*cel.Ast, map[string]uint64) {
 	t.Helper()
@@ -271,6 +296,28 @@ func PlanLoopsOtherwise(t *testing.T, expr string, ranges bool, replan func(inte
 	}
 	_, err = plan(c.env, checked, patterns, maxCost, cel.CustomDecoratorV2(func(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
 		if replanned[i.ID()] {
+			return replan(i), nil
+		}
+		return i, nil
+	}))
+	return err
+}
+
+// PlanKeysOtherwise is why expr can't be planned as a condition where CEL plans each key it
+// computes as replan makes it, as another version of CEL may, or nil.
+func PlanKeysOtherwise(t *testing.T, expr string, replan func(interpreter.InterpretableV2) interpreter.InterpretableV2) error {
+	t.Helper()
+	c, err := newConditions(Attributes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked, patterns := compiled(t, c, expr)
+	keys := newKeying(c.env, checked.NativeRep(), maxCost).keys
+	if len(keys) == 0 {
+		t.Fatalf("%s computes no key", expr)
+	}
+	_, err = plan(c.env, checked, patterns, maxCost, cel.CustomDecoratorV2(func(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
+		if keys[i.ID()] {
 			return replan(i), nil
 		}
 		return i, nil

@@ -2,9 +2,12 @@ package rbac_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
@@ -13,6 +16,7 @@ import (
 	"cel.dev/cel-go/cel"
 	"cel.dev/cel-go/common/types"
 	"cel.dev/cel-go/common/types/ref"
+	"cel.dev/cel-go/common/types/traits"
 	"cel.dev/cel-go/ext"
 	"cel.dev/cel-go/interpreter"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -564,6 +568,107 @@ func TestAConditionNestedTooDeeplyIsRefused(t *testing.T) {
 	}
 }
 
+// A message literal converts the values its fields are given whole, as an Any unpacks its bytes,
+// which CEL charges a constant for however large they are: a deny converting a list the request
+// passes held a check for seconds, though within its bound. Building one is no condition, declared
+// attributes or not, and one stored before fails: a grant's gives nothing, and a deny's applies.
+func TestAConditionBuildingAMessageIsRefused(t *testing.T) {
+	declared := rbac.Attributes{Request: map[string]rbac.AttributeType{"l": rbac.AttrStrings, "m": rbac.AttrStringMap, "s": rbac.AttrString}}
+	for _, declares := range []rbac.Attributes{{}, declared} {
+		h := setup(t, func(c *rbac.Config) {
+			c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
+			c.Attributes = declares
+		})
+		ctx := t.Context()
+		h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+		for _, expr := range []string{
+			`google.protobuf.ListValue{values: request.attributes.l} != []`,
+			`google.protobuf.Struct{fields: request.attributes.m} != {}`,
+			`google.protobuf.Value{list_value: google.protobuf.ListValue{values: request.attributes.l}} != null`,
+			`google.protobuf.Any{type_url: "type.googleapis.com/google.protobuf.ListValue", value: bytes(request.attributes.s)} != []`,
+			`[1, 2, 3].all(i, google.protobuf.ListValue{values: request.attributes.l} != [])`,
+			`google.protobuf.Struct{fields: {"a": 1.0}} == {"a": 1.0} && .google.protobuf.Timestamp{seconds: 1} < request.time`,
+		} {
+			c := rbac.Condition{Expression: expr}
+			g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+			g.Condition = c
+			if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{g}); !errors.Is(err, rbac.ErrInvalid) {
+				t.Errorf("Import of %s: %v", expr, err)
+			}
+			if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{g.Binding}}); !errors.Is(err, rbac.ErrInvalid) {
+				t.Errorf("Apply of %s: %v", expr, err)
+			}
+			d := rbac.Deny{ID: "d", Principals: []rbac.Principal{identity("v")}, Permissions: []rbac.Permission{login}, Condition: c}
+			if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, d); !errors.Is(err, rbac.ErrInvalid) {
+				t.Errorf("SetDeny of %s: %v", expr, err)
+			}
+			e := rbac.Eligibility{Role: "cluster.login", Principal: identity("w"), MaxDuration: time.Hour, Requires: expr}
+			if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, e); !errors.Is(err, rbac.ErrInvalid) {
+				t.Errorf("SetEligibility of %s: %v", expr, err)
+			}
+		}
+	}
+	// Written directly, as stored before.
+	h := setup(t)
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "v"))
+	for _, stmt := range []string{
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+		 VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'cluster.login', 'google.protobuf.ListValue{values: request.attributes.l} != []')`,
+		`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions, condition)
+		 VALUES ('t1', 'cluster', 'c1', 'd', '{user:v}', '{cluster:login}', 'google.protobuf.ListValue{values: request.attributes.l} == []')`,
+	} {
+		if _, err := h.pool.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request := rbac.WithRequest(ctx, map[string]any{"l": []any{"a"}})
+	if err := h.authz.Authorize(request, h.as(t, "u"), login, cluster); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("a grant whose condition builds a message: %v", err)
+	}
+	if err := h.authz.Authorize(request, h.as(t, "v"), login, cluster); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("a deny whose condition builds a message: %v", err)
+	}
+}
+
+// A value the host passes that holds itself, as a graph of objects it converts may, fails each
+// condition reading it whole, as a comparison or a loop does, rather than recursing until the stack
+// overflows, which kills the process: no recover catches it. A message literal converted one so.
+// Each runs in a child process, so one that overflows fails this test rather than the test binary.
+func TestAValueHoldingItselfFailsItsConditions(t *testing.T) {
+	if expr := os.Getenv("RBAC_CONDITION_OF_A_CYCLE"); expr != "" {
+		m := map[string]any{"a": "b"}
+		m["self"] = m
+		l := []any{"x", nil}
+		l[1] = l
+		refused := os.Getenv("RBAC_CONDITION_OF_A_CYCLE_REFUSED") != ""
+		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"m": m, "l": l}); evaluated || (err != nil) != refused {
+			t.Errorf("%s evaluated %t, %v", expr, evaluated, err)
+		}
+		return
+	}
+	for expr, refused := range map[string]bool{
+		`google.protobuf.Struct{fields: request.attributes.m} != {}`:                                                     true,
+		`google.protobuf.ListValue{values: request.attributes.l} != []`:                                                  true,
+		`request.attributes.m == request.attributes.m`:                                                                   false,
+		`request.attributes.l != request.attributes.l`:                                                                   false,
+		`request.attributes.m in [request.attributes.m]`:                                                                 false,
+		`[request.attributes.l] == [request.attributes.l] || {"a": request.attributes.m} == {"a": request.attributes.m}`: false,
+		`request.attributes.l.all(x, x == x)`:                                                                            false,
+		`request.attributes.m.exists(k, request.attributes.m[k] == request.attributes.m)`:                                false,
+		`{"a": 1}[request.attributes.l] == 1 || {request.attributes.m: 1}[request.attributes.m] == 1`:                    false,
+	} {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestAValueHoldingItselfFailsItsConditions$")
+		cmd.Env = append(os.Environ(), "RBAC_CONDITION_OF_A_CYCLE="+expr)
+		if refused {
+			cmd.Env = append(cmd.Env, "RBAC_CONDITION_OF_A_CYCLE_REFUSED=1")
+		}
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Errorf("%s: %v\n%.2000s", expr, err, out)
+		}
+	}
+}
+
 func TestAConditionPastItsCostSpendsNoMoreThanItsOwnBound(t *testing.T) {
 	h := setup(t)
 	// Evaluated first, as it is the shorter: it reads a list it can't afford to.
@@ -699,7 +804,7 @@ func TestAConditionCostsNoMoreThanItsBound(t *testing.T) {
 		{`[1, 2, 3].filter(x, x > 1).map(x, [x]) == [2, 3].map(x, [x]) && [[], ["ab"]].all(l, l.all(s, s.contains("a")))`, true},
 		// What a literal holds is bounded by it, wherever a condition reads it from.
 		{`[["10.0.0.1"], ["10.0.0.2"]].exists(g, request.attributes.ip in g) && "time" in request`, true},
-		{`{"dev": 1, "prod": 2}[resource.attributes.env] <= request.attributes.n && [{"n": 2}].exists(r, r.n == request.attributes.n)`, true},
+		{`{"dev": 1, "prod": 2}["dev"] <= request.attributes.n && [{"n": 2}].exists(r, r.n == request.attributes.n)`, true},
 		{`[[1, 2], [3]][0][1] == request.attributes.x && [1].map(x, {"a": request.attributes.tags}).exists(m, "zz" in m)`, true},
 		{"[[" + strings.Repeat("0, ", 499) + "0]].all(l, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(i, \"a\".startsWith(dyn(l))))", true},
 		{`"gpu" in request.attributes.tags`, false},
@@ -723,6 +828,10 @@ func TestAConditionCostsNoMoreThanItsBound(t *testing.T) {
 		// A map's keys don't bound what they index, and what may be a map or a list finds a key by it.
 		{`{"a": request.attributes.tags}["a"] == request.attributes.tags`, false},
 		{`[[1], {"a": 1}].exists(v, request.attributes.ip in v)`, false},
+		// A map hashes a key it looks up, or a map literal's, whole, as `in` reads what it finds.
+		{`{"dev": 1, "prod": 2}[resource.attributes.env] <= request.attributes.n`, false},
+		{`{request.attributes.ip: 1, "a": request.attributes.ip}[request.attributes.ip] == 1`, false},
+		{`request.attributes.m[dyn(request.attributes.ip)] == "v" || request.attributes.m[request.attributes.team] == 1`, false},
 	} {
 		for i, attributes := range requests {
 			limit, actual := rbac.ConditionCost(t, c.expr, attributes)
@@ -862,6 +971,265 @@ func TestALoopOverAMapCostsEachOfItsKeys(t *testing.T) {
 	}
 }
 
+// A map hashes a key it looks up, or a map literal's, whole, which CEL charges as 1 however long
+// the key is, so a loop looking up a long string the request passes took time growing with its
+// length, charged only for the steps. A key a condition computes costs a tenth of its bytes more,
+// once however CEL plans it: an index whose key isn't an attribute it plans twice where the index
+// is itself a key.
+func TestAKeyCostsItsLength(t *testing.T) {
+	long := strings.Repeat("k", 10000)
+	for expr, keys := range map[string]uint64{
+		`request.attributes.m[request.attributes.s] == 1`:                                                    1,
+		`{request.attributes.s: 1} != {}`:                                                                    1,
+		`[1, 2, 3].all(i, request.attributes.m[request.attributes.s] == 1)`:                                  3,
+		`request.attributes.m[{"k": request.attributes.s}["k"]] == 1`:                                        1,
+		`{request.attributes.s: 1}[request.attributes.s] == 1`:                                               2,
+		`request.attributes.m[true ? request.attributes.s : ""] == 1`:                                        1,
+		`request.attributes.m[{request.attributes.s: request.attributes.s}[dyn(request.attributes.s)]] == 1`: 3,
+		`request.attributes.m["k"] == 1 && {"k": request.attributes.s}["k"] != ""`:                           0,
+	} {
+		_, short := rbac.ConditionCost(t, expr, map[string]any{"s": "", "m": map[string]any{"": 1, "k": 1}})
+		_, cost := rbac.ConditionCost(t, expr, map[string]any{"s": long, "m": map[string]any{long: 1, "k": 1}})
+		if cost-short != keys*uint64(len(long))/10 {
+			t.Errorf("%s with a key of %d bytes cost %d, and with an empty one %d", expr, len(long), cost, short)
+		}
+	}
+	// A map literal reads a key the host passes as another Go value as the string CEL converts it to.
+	type name string
+	for _, s := range []any{&long, name(long), json.RawMessage(`"` + long + `"`)} {
+		expr := `{request.attributes.s: 1} != {}`
+		_, short := rbac.ConditionCost(t, expr, map[string]any{"s": ""})
+		if _, cost := rbac.ConditionCost(t, expr, map[string]any{"s": s}); cost-short != uint64(len(long))/10 {
+			t.Errorf("%s with a key of %d bytes as a %T cost %d, and with an empty one %d", expr, len(long), s, cost, short)
+		}
+	}
+	// And an optional value the host passes, whose keys CEL finds only if they are present.
+	expr := `dyn(request.attributes.o)[request.attributes.s] == 1`
+	optional := func(key string) map[string]any {
+		return map[string]any{"s": key, "o": types.OptionalOf(types.DefaultTypeAdapter.NativeToValue(map[string]any{key: 1}))}
+	}
+	_, short := rbac.ConditionCost(t, expr, optional(""))
+	if _, cost := rbac.ConditionCost(t, expr, optional(long)); cost-short != uint64(len(long))/10 {
+		t.Errorf("%s with a key of %d bytes in an optional cost %d, and with an empty one %d", expr, len(long), cost, short)
+	}
+}
+
+// finds counts the keys a map is asked for.
+type finds struct {
+	traits.Mapper
+	n *int
+}
+
+func (f finds) Find(key ref.Val) (ref.Val, bool) {
+	*f.n++
+	return f.Mapper.Find(key)
+}
+
+// longKeys counts the lookups of a map by a key of more than past bytes.
+type longKeys struct {
+	traits.Mapper
+	n    *int
+	past int
+}
+
+func (m longKeys) Find(key ref.Val) (ref.Val, bool) {
+	m.count(key)
+	return m.Mapper.Find(key)
+}
+
+func (m longKeys) Get(key ref.Val) ref.Val {
+	m.count(key)
+	return m.Mapper.Get(key)
+}
+
+func (m longKeys) count(key ref.Val) {
+	if s, ok := key.(types.String); ok && len(s) > m.past {
+		*m.n++
+	}
+}
+
+// Finding a key in a map hashes it whole, and comparing maps finds the keys of one in the other,
+// though comparing them is charged only as far as the smaller reads: a long key of the larger,
+// found in a map literal or a large map the host passes, was hashed uncharged each time a loop
+// compared them, as was a key past what reading a map may cost, found in it to read its value.
+func TestComparingMapsFindsNoKeyLongerThanTheSmallerHolds(t *testing.T) {
+	long := strings.Repeat("k", 10*10000+1)
+	for expr, holds := range map[string]bool{
+		`request.attributes.long != request.attributes.short`:               true,
+		`request.attributes.short != request.attributes.long`:               true,
+		`request.attributes.long in [request.attributes.short]`:             false,
+		`[request.attributes.long] == [request.attributes.short]`:           false,
+		`{"a": request.attributes.long} != {"a": request.attributes.short}`: true,
+	} {
+		n := 0
+		attributes := map[string]any{
+			"long":  longKeys{types.NewStringInterfaceMap(types.DefaultTypeAdapter, map[string]any{long: 1}), &n, len(long) - 1},
+			"short": longKeys{types.NewStringInterfaceMap(types.DefaultTypeAdapter, map[string]any{"a": 1}), &n, len(long) - 1},
+		}
+		if held, evaluated, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || !evaluated || held != holds {
+			t.Errorf("%s: held %t, evaluated %t, %v", expr, held, evaluated, err)
+		}
+		if n > 0 {
+			t.Errorf("%s found a key of %d bytes %d times", expr, len(long), n)
+		}
+	}
+	// Nor does a search find a key once for each of many maps smaller than it, which it is charged
+	// for reading together.
+	n, key := 0, strings.Repeat("k", 5000)
+	small := make([]any, 2000)
+	for i := range small {
+		small[i] = longKeys{types.NewStringInterfaceMap(types.DefaultTypeAdapter, map[string]any{"a": 1}), &n, len(key) - 1}
+	}
+	expr := `request.attributes.long in request.attributes.small`
+	if held, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"long": map[string]any{key: 1}, "small": small}); err != nil || !evaluated || held {
+		t.Errorf("%s: held %t, evaluated %t, %v", expr, held, evaluated, err)
+	}
+	if n > 0 {
+		t.Errorf("%s found a key of %d bytes %d times", expr, len(key), n)
+	}
+}
+
+// Comparing maps decides as CEL does, though it finds no key longer than the smaller value holds:
+// it finds the keys of the left in the right. Where a map holds keys CEL counts as equal, as 1 and
+// 1u, or a double, which finds an int key though no int finds a double key, finding the right's
+// keys in the left instead decided otherwise, and a grant's comparison held where CEL's doesn't.
+func TestComparingMapsDecidesAsCELDoes(t *testing.T) {
+	env, err := cel.NewEnv(cel.Variable("request", cel.MapType(cel.StringType, cel.DynType)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	same := map[any]any{int64(1): "aaaaaaaaaaaa", uint64(1): "aaaaaaaaaaaa"}
+	for _, c := range []struct {
+		expr string
+		m    any
+	}{
+		{`{1: "aaaaaaaaaaaa", dyn(1u): "aaaaaaaaaaaa"} == {1: "aaaaaaaaaaaa", 2: "b"}`, nil},
+		{`{1: "a", 2: "bbbbbbbbbbbb"} == {1: "a", dyn(1u): "a"}`, nil},
+		{`{1: "a", 2: "bbbbbbbbbbbb"} != {1: "a", dyn(1u): "a"}`, nil},
+		{`[{1: "a", 2: "bbbbbbbbbbbb"}] == [{1: "a", dyn(1u): "a"}]`, nil},
+		{`{"k": {1: "a", 2: "bbbbbbbbbbbb"}} == {"k": {1: "a", dyn(1u): "a"}}`, nil},
+		{`{1: "a", 2: "bbbbbbbbbbbb"} in [{1: "a", dyn(1u): "a"}]`, nil},
+		{`request.attributes.m == {1: "aaaaaaaaaaaa", 2: "b"}`, same},
+		{`request.attributes.m in [{1: "aaaaaaaaaaaa", 2: "b"}]`, same},
+		{`request.attributes.m in [{1: "a"}]`, map[float64]any{1: "a"}},
+	} {
+		checked, iss := env.Compile(c.expr)
+		if iss.Err() != nil {
+			t.Fatal(iss.Err())
+		}
+		prg, err := env.Program(checked)
+		if err != nil {
+			t.Fatal(err)
+		}
+		attributes := map[string]any{"m": c.m}
+		out, _, err := prg.Eval(map[string]any{"request": map[string]any{"attributes": attributes}})
+		if err != nil {
+			t.Fatalf("%s: %v", c.expr, err)
+		}
+		if held, evaluated, _, err := rbac.EvaluateCondition(t, c.expr, attributes); err != nil || !evaluated || held != out.Value() {
+			t.Errorf("%s: held %t, evaluated %t, %v; CEL decides %v", c.expr, held, evaluated, err, out)
+		}
+	}
+}
+
+// iterated counts the elements a loop over a list takes.
+type iterated struct {
+	traits.Lister
+	n *int
+}
+
+func (l iterated) Iterator() traits.Iterator { return iterating{l.Lister.Iterator(), l.n} }
+
+type iterating struct {
+	traits.Iterator
+	n *int
+}
+
+func (i iterating) Next() ref.Val {
+	*i.n++
+	return i.Iterator.Next()
+}
+
+// CEL doesn't count what a condition's keys cost past its own charge: one whose keys cost more
+// than its limit stops before a map reads the next, as one CEL charges more stops, and one they
+// take past its limit, though CEL charges it less, fails as if it had stopped.
+func TestAConditionsKeysPastItsLimitFailIt(t *testing.T) {
+	key := strings.Repeat("k", 2000)
+	n := 0
+	m := finds{types.NewStringInterfaceMap(types.DefaultTypeAdapter, map[string]any{key: 1}), &n}
+	steps := "[" + strings.Repeat("0, ", 99) + "0]"
+	expr := steps + `.all(i, request.attributes.m[request.attributes.key] == 1)`
+	if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"m": m, "key": key}); err != nil || evaluated {
+		t.Errorf("a hundred keys of %d bytes: evaluated %t, %v", len(key), evaluated, err)
+	}
+	// 10,000 is all a condition may cost, and each key costs 200.
+	if n > 50 {
+		t.Errorf("a condition whose keys cost more than its limit looked up %d", n)
+	}
+	// Nor does a loop after keys costing all but a step of the limit take more than that step.
+	n = 0
+	l := iterated{types.NewDynamicList(types.DefaultTypeAdapter, make([]any, 20000)), &n}
+	key = strings.Repeat("k", 99990)
+	expr = `request.attributes.m[request.attributes.key] == 1 && request.attributes.l.all(i, true)`
+	if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"m": map[string]any{key: 1}, "key": key, "l": l}); err != nil || evaluated {
+		t.Errorf("a loop after a key of %d bytes: evaluated %t, %v", len(key), evaluated, err)
+	}
+	if n > 2 {
+		t.Errorf("a loop after keys costing the limit took %d steps", n)
+	}
+	key = strings.Repeat("k", 60000)
+	attributes := map[string]any{"m": map[string]any{key: 1}, "key": key, "t": key}
+	for expr, evaluates := range map[string]bool{
+		`request.attributes.m[request.attributes.key] == 1`:                                   true,
+		`size(request.attributes.t) > 0`:                                                      true,
+		`request.attributes.m[request.attributes.key] == 1 && size(request.attributes.t) > 0`: false,
+	} {
+		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || evaluated != evaluates {
+			t.Errorf("%s: evaluated %t, %v", expr, evaluated, err)
+		}
+	}
+}
+
+// A key that CEL plans as neither an attribute nor a call, or where no decorator sees it, as
+// another version of CEL may, isn't a condition: a map would read it uncharged.
+func TestAKeyPlannedOtherwiseIsNoCondition(t *testing.T) {
+	for _, expr := range []string{
+		`request.attributes.m[request.attributes.k] == 1`, `{request.attributes.k + "x": 1} != {}`,
+		`{"a": 1}[dyn(request.attributes.k)] == 1`, `{int: 1} != {}`,
+	} {
+		for how, replan := range map[string]func(interpreter.InterpretableV2) interpreter.InterpretableV2{
+			"as something else": func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, i.ID()} },
+			"under another id":  func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, -i.ID()} },
+		} {
+			if err := rbac.PlanKeysOtherwise(t, expr, replan); err == nil {
+				t.Errorf("%s with its key planned %s is a condition", expr, how)
+			}
+		}
+		if err := rbac.PlanKeysOtherwise(t, expr, func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return i }); err != nil {
+			t.Errorf("%s planned as CEL plans it: %v", expr, err)
+		}
+	}
+}
+
+// Loading a time zone copies its name for each place it looks for it, which zoneCost doesn't count
+// however long the name is, so a condition reading a time in a zone the request names, in a loop,
+// took time growing with its length, charged as a short one. A zone is at most 64 bytes, longer
+// than any zone's name: reading a time in a longer one fails before it loads it.
+func TestATimeInAZoneLongerThanAnyFailsBeforeLoadingIt(t *testing.T) {
+	expr := `request.time.getHours(request.attributes.zone) >= 0`
+	for zone, evaluated := range map[string]bool{
+		"America/New_York": true, "+05:00": true, strings.Repeat("A", 64): false, strings.Repeat("A", 1<<20): false,
+	} {
+		_, ok, allocated, err := rbac.EvaluateCondition(t, expr, map[string]any{"zone": zone})
+		if err != nil || ok != evaluated {
+			t.Errorf("a zone of %d bytes: evaluated %t, %v", len(zone), ok, err)
+		}
+		if allocated > 1<<20 {
+			t.Errorf("a zone of %d bytes allocated %d", len(zone), allocated)
+		}
+	}
+}
+
 // A loop taking more steps than its condition may cost fails, however little CEL charges them: a
 // grant's condition gives nothing, and a deny's applies.
 func TestALoopOfMoreStepsThanItsConditionMayCostFails(t *testing.T) {
@@ -960,6 +1328,8 @@ func TestAConditionReadingTheIDsACheckPassesCostsLittle(t *testing.T) {
 		{`subject.id.matches("^svc-") && size(resource.id) > 0 && string(resource.tenant) == subject.id`, true},
 		{`[resource.attributes].exists(subject, subject.owner == .subject.id)`, true},
 		{`[resource.attributes.owner].exists(action, action.startsWith(.action))`, true},
+		{`{"alice": true}[subject.id] || {subject.id: 1, resource.id: 2}[dyn(resource.tenant)] == 1`, true},
+		{`{"x": 1}[{subject.id: "x"}[dyn(resource.id)]] == 1 && {subject.kind + ":" + resource.type: 1}[action] == 1`, true},
 		{`subject.id in resource.attributes.tags`, false},
 		{`[resource.attributes].exists(subject, subject.id == resource.attributes.owner)`, false},
 		{`resource.attributes.tags.exists(action, action == resource.attributes.owner)`, false},
@@ -995,14 +1365,14 @@ func TestStoredConditionsKeepTheirBounds(t *testing.T) {
 		{`[request.attributes.x] == [1] && {"a": request.attributes.x} == {"a": 1}`, 99},
 		{`[1, 2] + [3] == [1, 2, 3] && "a" + "b" == "ab" && size("abc") == 3 && action == "cluster:login"`, 52},
 		{`int("12") == 12 && string(1) == "1" && duration("1h") > duration("1m")`, 14},
-		{`google.protobuf.Struct{fields: {"a": 1.0}} == {"a": 1.0}`, 104},
 		{`[1, 2, 3].all(i, i > 0) && [1, 2, 3].exists_one(i, i == 2) && {"a": 1}.exists(k, k == "a")`, 128},
 		{`[[1, 2], [3]].all(l, l.all(i, i > 0))`, 86},
 		{`[1, 2, 3].map(x, x > 1, x * 2) == [4, 6]`, 108},
 		{`[1, 2].map(x, "ab").all(s, s.contains("a"))`, 70},
 		{`["10.0.0.1", "10.0.0.2"].filter(ip, ip.startsWith("10.")).exists(ip, request.attributes.ip == ip)`, 100},
 		{`[["10.0.0.1"], ["10.0.0.2"]].exists(g, request.attributes.ip in g) && "time" in request`, 70},
-		{`{"dev": 1, "prod": 2}[resource.attributes.env] <= request.attributes.n`, 50},
+		{`{"dev": 1, "prod": 2}["dev"] <= request.attributes.n`, 44},
+		{`request.time.getHours(subject.attributes.zone) >= 9`, 112},
 		{`[{"level": 2}, {"level": 3}].exists(r, r.level == request.attributes.n)`, 112},
 		// The ids, kinds, types and tenant a check passes are of at most MaxID bytes, and its action a
 		// permission's.
@@ -1011,7 +1381,9 @@ func TestStoredConditionsKeepTheirBounds(t *testing.T) {
 		{`subject.kind + ":" + resource.type in {"user:cluster": true} && subject.id.matches("^svc-")`, 672},
 		{`action in {"cluster:login": true, "cluster:read": true}`, 46},
 		{`[resource.attributes].exists(subject, subject.owner == .subject.id)`, 83},
+		{`{"alice": true, "bob": false}[subject.id]`, 87},
 		{`"gpu" in request.attributes.tags`, 10000},
+		{`{"dev": 1, "prod": 2}[resource.attributes.env] <= request.attributes.n`, 10000},
 		{`request.attributes.tags.exists(t, t == "gpu")`, 10000},
 	} {
 		if limit, _ := rbac.ConditionCost(t, c.expr, nil); limit != c.bound {
