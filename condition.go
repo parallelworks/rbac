@@ -48,7 +48,8 @@ import (
 // the resource's type, id or tenant, or the action, which a check refuses past MaxID bytes,
 // whatever it passes, and all a condition may for one reading the size of a value the request
 // decides, as a list or a long string, or looping over one, each element of which costs at least 1
-// however little its step evaluates. What a check may spend on conditions is bounded, for each
+// however little its step evaluates, and each key of a map 1 more each time a loop over it starts,
+// however few steps it takes. What a check may spend on conditions is bounded, for each
 // scope on its path, and so are the conditions stored, so that a check evaluates whole every one it
 // reads: those of an identity's grants on a scope cost at most so much together, and those of a
 // scope's grants to groups, the tenant's members and the public, which reach many, as much again,
@@ -441,9 +442,11 @@ func (c costs) CallCost(function, _ string, args []ref.Val, _ ref.Val) *uint64 {
 			n = 0
 		}
 		// A loop's first step finds the loop's range where each after finds the step before
-		// (stepping). CEL copies a map's keys before a loop over it takes a step, however few it
-		// takes, so a loop over a map the host passes, inside another, would otherwise take time
-		// growing with the map's size and the outer loop's steps, charged only for the steps.
+		// (stepping). CEL copies the keys of a map the host passes, as a map[string]any, before a
+		// loop over it takes a step, however few it takes, so a loop over one inside another would
+		// otherwise take time growing with the map's size and the outer loop's steps, charged only
+		// for the steps. It walks others, as a literal or a map[string]int, without copying, but
+		// each is charged alike, so what a loop costs doesn't depend on how the host passed it.
 		if len(args) > 0 {
 			if m, ok := args[0].(traits.Mapper); ok && m.Type().HasTrait(traits.IterableType) {
 				n += count(m)

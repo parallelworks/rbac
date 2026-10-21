@@ -830,28 +830,31 @@ func TestALoopsStepsCostAtLeastOneEach(t *testing.T) {
 	}
 }
 
-// CEL copies a map's keys before a loop over it takes its first step, however few it takes, so a
-// loop over a map the host passes, inside another loop, took time growing with the map's size and
-// the outer loop's steps, charged only for the steps. Such a loop costs 1 for each key, and one
-// over a literal map no more than its bound.
+// CEL copies the keys of a map the host passes before a loop over it takes its first step, however
+// few it takes, so a loop over one, inside another loop, took time growing with the map's size and
+// the outer loop's steps, charged only for the steps. Such a loop costs 1 for each key, however the
+// host passed the map, and one over a literal map no more than its bound, though the bound counts a
+// step of map() whose transform is a literal only 1 more than it costs.
 func TestALoopOverAMapCostsEachOfItsKeys(t *testing.T) {
-	m := map[string]any{}
+	m, n := map[string]any{}, map[string]int{}
 	for i := range 3000 {
-		m[fmt.Sprint(i)] = i
+		m[fmt.Sprint(i)], n[fmt.Sprint(i)] = i, i
 	}
 	for expr, least := range map[string]uint64{
 		`request.attributes.m.exists(k, true)`:                   3000,
 		`!request.attributes.m.all(k, false)`:                    3000,
 		`[1, 2, 3].all(i, request.attributes.m.exists(k, true))`: 9000,
+		`request.attributes.n.exists(k, true)`:                   3000,
 	} {
-		if _, cost := rbac.ConditionCost(t, expr, map[string]any{"m": m}); cost < least {
+		if _, cost := rbac.ConditionCost(t, expr, map[string]any{"m": m, "n": n}); cost < least {
 			t.Errorf("%s over %d keys cost %d", expr, len(m), cost)
 		}
 	}
 	literal := `{"a": 1, "b": 2, "c": 3}`
 	for _, expr := range []string{
 		literal + `.exists(k, true)`, literal + `.exists_one(k, false) || true`, literal + `.map(k, k).size() == 3`,
-		`[1, 2].all(i, ` + literal + `.all(k, true))`,
+		`[1, 2].all(i, ` + literal + `.all(k, true))`, literal + `.map(k, 1).size() == 3`,
+		`[` + literal + `][0].map(k, 1).size() == 3`,
 	} {
 		if limit, cost := rbac.ConditionCost(t, expr, nil); cost > limit {
 			t.Errorf("%s cost %d, past its bound, %d", expr, cost, limit)
