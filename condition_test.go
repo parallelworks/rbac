@@ -14,6 +14,7 @@ import (
 	"cel.dev/cel-go/common/types"
 	"cel.dev/cel-go/common/types/ref"
 	"cel.dev/cel-go/ext"
+	"cel.dev/cel-go/interpreter"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -749,6 +750,183 @@ func TestAConditionCostsNoMoreThanItsBoundWhereCELExpandsMacrosOtherwise(t *test
 	} {
 		if limit, actual := rbac.ConditionCost(t, c.expr, nil, c.opt); actual > limit {
 			t.Errorf("%s cost %d, past its bound, %d", c.expr, actual, limit)
+		}
+	}
+}
+
+// CEL's cost tracking holds what a loop's steps evaluate until they are charged, and a loop's own
+// values until it ends, and reads all it holds in search of what a step didn't evaluate, as the
+// argument a failing call never reached: each step of a loop over a list the host passes would
+// take longer than the one before, past what it is charged, and one failing, charged little, the
+// most. It holds no more for a step than the step evaluates, whatever came before.
+func TestALoopsStepsTakeNoLongerForTheStepsBefore(t *testing.T) {
+	l := make([]any, 3000)
+	for i := range l {
+		l[i] = strings.Repeat("q", i%50)
+	}
+	attributes := map[string]any{"l": l, "zero": uint(0), "m": map[string]any{"a": uint(1)}, "secret": 1}
+	declares := rbac.Attributes{Resource: map[string]rbac.AttributeType{"secret": rbac.AttrString}}
+	for name, expr := range map[string]string{
+		"indexing a string":     `request.attributes.l.exists_one(z, 1u == z[0])`,
+		"an index out of range": `request.attributes.l.exists_one(z, [1u, z][2] == z)`,
+		"a missing key":         `request.attributes.l.exists_one(z, 1u == request.attributes.m[z])`,
+		"a type mismatch":       `request.attributes.l.exists_one(z, 1u < z)`,
+		"a division by zero":    `request.attributes.l.exists_one(z, 1u / request.attributes.zero == 1u)`,
+		"a refused attribute":   `request.attributes.l.exists_one(z, 1u == resource.attributes.secret)`,
+		"failing in map()":      `request.attributes.l.map(z, 1u > 0u, 1u + z).size() == 0`,
+		"failing in filter()":   `request.attributes.l.filter(z, 1u < z).size() == 0`,
+		"failing in all()":      `request.attributes.l.all(z, 1u < z)`,
+		"failing in exists()":   `request.attributes.l.exists(z, 1u < z)`,
+		"failing in a nested":   `request.attributes.l.exists(y, [y, y].exists_one(z, 1u < z))`,
+		"steps that don't fail": `request.attributes.l.all(z, uint(size(z)) < 100u) && request.attributes.l.exists_one(z, 1u > uint(size(z)))`,
+	} {
+		cost, most, reached := rbac.TrackedValues(t, declares, expr, attributes)
+		if reached < 500 {
+			t.Fatalf("%s: %s reached a uint literal %d times, costing %d", name, expr, reached, cost)
+		}
+		if most > 16 {
+			t.Errorf("%s: %s held %d values, costing %d", name, expr, most, cost)
+		}
+	}
+}
+
+// CEL charges a loop's step only what it evaluates, which can be nothing, as for a step reading
+// only literals, or what it loops over only in the branch it takes, so a loop over a list the host
+// passes cost nothing for each element, however long. Each step costs at least 1, and a loop
+// taking more steps than its condition may cost stops as one costing more does. A loop whose steps
+// are charged costs as it did.
+func TestALoopsStepsCostAtLeastOneEach(t *testing.T) {
+	falses := func(n int) map[string]any { return map[string]any{"l": make([]any, n)} }
+	for _, expr := range []string{
+		`request.attributes.l.filter(z, false).size() == 0`,
+		`!request.attributes.l.exists_one(z, false)`,
+		`request.attributes.l.map(z, false, z).size() == 0`,
+		`request.attributes.l.exists_one(z, false ? true : z) || true`,
+		`[1, 2].all(x, request.attributes.l.filter(z, false).size() == 0)`,
+	} {
+		for _, n := range []int{3000, 20000} {
+			limit, cost := rbac.ConditionCost(t, expr, falses(n))
+			if cost < min(uint64(n), limit) {
+				t.Errorf("%s over %d elements cost %d", expr, n, cost)
+			}
+		}
+	}
+	l := make([]any, 1000)
+	for i := range l {
+		l[i] = i%2 == 0
+	}
+	for _, c := range []struct {
+		expr string
+		cost uint64
+	}{
+		{`request.attributes.l.all(z, z || !z)`, 5004},
+		{`request.attributes.l.exists(z, z && !z)`, 6004},
+		{`request.attributes.l.exists_one(z, z) || true`, 3006},
+		{`request.attributes.l.filter(z, z).size() == 500`, 8518},
+	} {
+		if _, cost := rbac.ConditionCost(t, c.expr, map[string]any{"l": l}); cost != c.cost {
+			t.Errorf("%s cost %d, not %d", c.expr, cost, c.cost)
+		}
+	}
+}
+
+// CEL copies the keys of a map the host passes before a loop over it takes its first step, however
+// few it takes, so a loop over one, inside another loop, took time growing with the map's size and
+// the outer loop's steps, charged only for the steps. Such a loop costs 1 for each key, however the
+// host passed the map, and one over a literal map no more than its bound, though the bound counts a
+// step of map() whose transform is a literal only 1 more than it costs.
+func TestALoopOverAMapCostsEachOfItsKeys(t *testing.T) {
+	m, n := map[string]any{}, map[string]int{}
+	for i := range 3000 {
+		m[fmt.Sprint(i)], n[fmt.Sprint(i)] = i, i
+	}
+	for expr, least := range map[string]uint64{
+		`request.attributes.m.exists(k, true)`:                   3000,
+		`!request.attributes.m.all(k, false)`:                    3000,
+		`[1, 2, 3].all(i, request.attributes.m.exists(k, true))`: 9000,
+		`request.attributes.n.exists(k, true)`:                   3000,
+	} {
+		if _, cost := rbac.ConditionCost(t, expr, map[string]any{"m": m, "n": n}); cost < least {
+			t.Errorf("%s over %d keys cost %d", expr, len(m), cost)
+		}
+	}
+	literal := `{"a": 1, "b": 2, "c": 3}`
+	for _, expr := range []string{
+		literal + `.exists(k, true)`, literal + `.exists_one(k, false) || true`, literal + `.map(k, k).size() == 3`,
+		`[1, 2].all(i, ` + literal + `.all(k, true))`, literal + `.map(k, 1).size() == 3`,
+		`[` + literal + `][0].map(k, 1).size() == 3`,
+	} {
+		if limit, cost := rbac.ConditionCost(t, expr, nil); cost > limit {
+			t.Errorf("%s cost %d, past its bound, %d", expr, cost, limit)
+		}
+	}
+}
+
+// A loop taking more steps than its condition may cost fails, however little CEL charges them: a
+// grant's condition gives nothing, and a deny's applies.
+func TestALoopOfMoreStepsThanItsConditionMayCostFails(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
+	})
+	ctx := t.Context()
+	free := `resource.attributes.l.filter(z, false).size() == 0`
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	g.Condition = rbac.Condition{Expression: free}
+	h.seed(t, g, grant(cluster.Scope(), "cluster.login", rbac.User, "v"), grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+	u, v := h.as(t, "u"), h.as(t, "v")
+	d := rbac.Deny{
+		ID: "loop", Principals: []rbac.Principal{v.Principal}, Permissions: []rbac.Permission{login},
+		Condition: rbac.Condition{Expression: "!(" + free + ")"},
+	}
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, d); err != nil {
+		t.Fatal(err)
+	}
+	for n, within := range map[int]bool{3000: true, 20000: false} {
+		r := cluster
+		r.Attributes = map[string]any{"l": make([]any, n)}
+		if allowed(t, h, u, login, r) != within {
+			t.Errorf("a grant's condition looping over %d elements held: %t", n, !within)
+		}
+		if allowed(t, h, v, login, r) != within {
+			t.Errorf("a deny's condition looping over %d elements applied: %t", n, within)
+		}
+	}
+}
+
+// otherwise is a loop's condition or range as another version of CEL may plan it, under the id it
+// gives it.
+type otherwise struct {
+	interpreter.InterpretableV2
+	id int64
+}
+
+func (o otherwise) ID() int64 { return o.id }
+
+// A loop whose condition CEL plans as neither of those of its macros, or where no decorator sees
+// it, as another version of CEL may, isn't a condition: its steps would be neither counted nor
+// dropped, so it would run unbounded. Nor is one whose range it plans under another id: its first
+// step wouldn't find the range, so a loop over a map would copy its keys uncharged.
+func TestALoopPlannedOtherwiseIsNoCondition(t *testing.T) {
+	somethingElse := func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, i.ID()} }
+	anotherID := func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, -i.ID()} }
+	for _, expr := range []string{`[1, 2].all(x, x > 0)`, `[1, 2].exists_one(x, x > 1)`, `{"a": 1}.exists(k, k == "a")`} {
+		for how, c := range map[string]struct {
+			ranges bool
+			replan func(interpreter.InterpretableV2) interpreter.InterpretableV2
+		}{
+			"its condition planned as something else": {false, somethingElse},
+			"its condition planned under another id":  {false, anotherID},
+			"its range planned under another id":      {true, anotherID},
+		} {
+			if err := rbac.PlanLoopsOtherwise(t, expr, c.ranges, c.replan); err == nil {
+				t.Errorf("%s with %s is a condition", expr, how)
+			}
+		}
+		same := func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return i }
+		for _, ranges := range []bool{false, true} {
+			if err := rbac.PlanLoopsOtherwise(t, expr, ranges, same); err != nil {
+				t.Errorf("%s planned as CEL plans it: %v", expr, err)
+			}
 		}
 	}
 }

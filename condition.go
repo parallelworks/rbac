@@ -47,15 +47,17 @@ import (
 // little for one comparing what a request passes with literals, or with the subject's kind or id,
 // the resource's type, id or tenant, or the action, which a check refuses past MaxID bytes,
 // whatever it passes, and all a condition may for one reading the size of a value the request
-// decides, as a list or a long string, or looping over one. What a check may spend on conditions is
-// bounded, for each scope on its path, and so are the conditions stored, so that a check evaluates
-// whole every one it reads: those of an identity's grants on a scope cost at most so much together,
-// and those of a scope's grants to groups, the tenant's members and the public, which reach many,
-// as much again, those from each source the host owns (Config.Sources) apart from the rest; those
-// of a scope's denies (SetDeny); and the requirements of the eligibilities of groups for a role on
-// a scope. Each distinct condition counts once, as what compiling it and the most evaluating it can
-// cost: hundreds of comparisons with literals, a hundred of an attribute with the subject's id, or
-// three of the longest that read a list or loop. A check of a labeled resource decides each of the
+// decides, as a list or a long string, or looping over one, each element of which costs at least 1
+// however little its step evaluates, and each key of a map 1 more each time a loop over it starts,
+// however few steps it takes. What a check may spend on conditions is bounded, for each
+// scope on its path, and so are the conditions stored, so that a check evaluates whole every one it
+// reads: those of an identity's grants on a scope cost at most so much together, and those of a
+// scope's grants to groups, the tenant's members and the public, which reach many, as much again,
+// those from each source the host owns (Config.Sources) apart from the rest; those of a scope's
+// denies (SetDeny); and the requirements of the eligibilities of groups for a role on a scope. Each
+// distinct condition counts once, as what compiling it and the most evaluating it can cost:
+// hundreds of comparisons with literals, a hundred of an attribute with the subject's id, or three
+// of the longest that read a list or loop. A check of a labeled resource decides each of the
 // subject's label values as a check of it would, and evaluates a condition that doesn't read the
 // action once for them all, so on the tenant one that does counts once for each label value its
 // grants give or its denies deny. A change adding a condition past a bound, or one evaluated more,
@@ -383,12 +385,30 @@ func (c *conditions) build(expr string) (program, error) {
 		return program{}, fmt.Errorf("%w: %w", errCondition, err)
 	}
 	limit := worstCost(checked, patterns)
-	prg, err := c.env.Program(checked, cel.CostLimit(limit), cel.CostTracking(costs{patterns}),
-		cel.OptimizeRegex(matching(patterns)), cel.CustomDecorator(bounded))
+	prg, err := plan(c.env, checked, patterns, limit)
 	if err != nil {
 		return program{}, fmt.Errorf("%w: %w", errCondition, err)
 	}
 	return program{Program: prg, typed: c.typeCheck(expr), readsAction: reading(checked.NativeRep(), "action"), limit: limit}, nil
+}
+
+// plan plans checked to run within limit, as costs charges its calls, once the options before
+// have, as a test plans a loop as another version of CEL may.
+func plan(env *cel.Env, checked *cel.Ast, patterns map[string]uint64, limit uint64, before ...cel.ProgramOption) (cel.Program, error) {
+	s := newStepping(checked.NativeRep(), limit)
+	prg, err := env.Program(checked, slices.Concat(before, []cel.ProgramOption{
+		cel.CostLimit(limit), cel.CostTracking(costs{patterns}), cel.OptimizeRegex(matching(patterns)),
+		cel.CustomDecorator(bounded), cel.CustomDecoratorV2(s.decorate),
+	})...)
+	if err != nil {
+		return nil, err
+	}
+	// Another version of CEL may plan a loop's condition where no decorator sees it, which would
+	// run unbounded too.
+	if len(s.stepped) != len(s.ranges) {
+		return nil, errors.New("a loop's condition is planned where this package can't bound it")
+	}
+	return prg, nil
 }
 
 // typeCheck returns why expr doesn't check against the declared attributes: it reads one they
@@ -417,6 +437,21 @@ type costs struct{ patterns map[string]uint64 }
 func (c costs) CallCost(function, _ string, args []ref.Val, _ ref.Val) *uint64 {
 	n := uint64(1)
 	switch function {
+	case looping, operators.NotStrictlyFalse:
+		if function == looping {
+			n = 0
+		}
+		// A loop's first step finds the loop's range where each after finds the step before
+		// (stepping). CEL copies the keys of a map the host passes, as a map[string]any, before a
+		// loop over it takes a step, however few it takes, so a loop over one inside another would
+		// otherwise take time growing with the map's size and the outer loop's steps, charged only
+		// for the steps. It walks others, as a literal or a map[string]int, without copying, but
+		// each is charged alike, so what a loop costs doesn't depend on how the host passed it.
+		if len(args) > 0 {
+			if m, ok := args[0].(traits.Mapper); ok && m.Type().HasTrait(traits.IterableType) {
+				n += count(m)
+			}
+		}
 	case overloads.Matches:
 		if len(args) != 2 {
 			return nil
@@ -867,6 +902,121 @@ func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 	}), nil
 }
 
+// looping is what costs charges a loop's literal condition as: nothing, as CEL charges a literal.
+const looping = "@looping"
+
+// stepping keeps CEL's cost tracking from holding what each step of checked's loops evaluated
+// until the loop ends. The tracking holds each value evaluated, to charge a call by its arguments,
+// and drops it once what reads it is charged, but nothing reads a step's value or its condition's,
+// so it drops what a loop's steps kept only once the loop ends, and each search for a value that
+// wasn't evaluated, as a branch not taken, an identifier's own or the argument a failing call
+// never reached, reads all of it. A loop over a list the host passes would take time growing with
+// the square of its length, past what it is charged, and one whose steps fail, charged little, the
+// most. Each step evaluates its condition first, so a loop's condition is planned instead as a call
+// whose first argument is the loop's range: charging it drops what the steps before kept, and
+// costs what charging the condition did, and at a loop's first step 1 more for each key of a map
+// it ranges over (costs). It counts the steps too, which limit bounds (counting).
+type stepping struct {
+	// ranges are the ids of the ranges of checked's loops, by those of their conditions, planned
+	// whether each range has been planned, by its id, and stepped those of the conditions planned
+	// as steps.
+	ranges           map[int64]int64
+	planned, stepped map[int64]bool
+	limit            uint64
+}
+
+func newStepping(checked *ast.AST, limit uint64) *stepping {
+	s := &stepping{ranges: map[int64]int64{}, planned: map[int64]bool{}, stepped: map[int64]bool{}, limit: limit}
+	for _, e := range ast.MatchDescendants(ast.NavigateAST(checked), ast.KindMatcher(ast.ComprehensionKind)) {
+		s.ranges[e.AsComprehension().LoopCondition().ID()] = e.AsComprehension().IterRange().ID()
+		s.planned[e.AsComprehension().IterRange().ID()] = false
+	}
+	return s
+}
+
+func (s *stepping) decorate(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
+	if _, ok := s.planned[i.ID()]; ok {
+		s.planned[i.ID()] = true
+	}
+	over, ok := s.ranges[i.ID()]
+	if !ok {
+		return i, nil
+	}
+	// A loop's first step finds its range by this id to charge a map's keys (costs). Another
+	// version of CEL may plan the range under another id, or after the condition, and a loop over
+	// a map the host passes, inside another, would copy its keys uncharged again.
+	if !s.planned[over] {
+		return nil, errors.New("a loop's range is planned where this package can't charge its keys")
+	}
+	// The tracking finds what it holds by id, the range's before the steps', and drops it with all
+	// held after it.
+	st := &step{cond: i, over: over, function: looping, args: []interpreter.InterpretableV2{interpreter.NewConstValue(over, types.NullValue)}, limit: s.limit}
+	switch cond := i.(type) {
+	case interpreter.InterpretableConst:
+	case interpreter.InterpretableCall:
+		// The macros' other condition, which CEL charges 1 whatever its arguments.
+		if cond.Function() != operators.NotStrictlyFalse {
+			return nil, fmt.Errorf("a loop's condition is planned as %s, which this package doesn't bound", cond.Function())
+		}
+		st.function, st.overload, st.args = cond.Function(), cond.OverloadID(), append(st.args, cond.Args()...)
+	default:
+		// Another version of CEL may plan a loop otherwise, which would run unbounded.
+		return nil, fmt.Errorf("a loop's condition is planned as %T, which this package doesn't bound", i)
+	}
+	s.stepped[i.ID()] = true
+	return st, nil
+}
+
+// step is a loop's condition as stepping plans it. It has the id of the loop's range, so the
+// tracking holds its value as the range's, which the next step's condition drops.
+type step struct {
+	cond               interpreter.InterpretableV2
+	over               int64
+	function, overload string
+	args               []interpreter.InterpretableV2
+	// limit is the condition's, which its loops' steps together may not pass.
+	limit uint64
+}
+
+func (s *step) ID() int64                             { return s.over }
+func (s *step) Function() string                      { return s.function }
+func (s *step) OverloadID() string                    { return s.overload }
+func (s *step) Args() []interpreter.InterpretableV2   { return s.args }
+func (s *step) Eval(a interpreter.Activation) ref.Val { return s.Exec(interpreter.AsFrame(a)) }
+
+// Exec counts the step, and cancels the evaluation past its limit, as CEL cancels one costing more.
+func (s *step) Exec(frame *interpreter.ExecutionFrame) ref.Val {
+	c, _ := frame.ResolveName(stepsName)
+	n, ok := c.(*counting)
+	if !ok || n.steps >= s.limit {
+		panic(interpreter.EvalCancelledError{Cause: interpreter.CostLimitExceeded, Message: "rbac: a condition's loops take more steps than it may cost"})
+	}
+	n.steps++
+	return s.cond.Exec(frame)
+}
+
+// counting is what a condition reads, and how many steps its loops have taken, which it costs at
+// least: CEL charges a step only what it evaluates, which can be nothing, as for a step reading
+// only literals, so a loop over a long list the host passes would cost nothing for each element.
+type counting struct {
+	vars  map[string]any
+	steps uint64
+}
+
+// stepsName is what a condition's steps find their count by, which no condition can name, as no
+// identifier starts with @.
+const stepsName = "@steps"
+
+func (c *counting) ResolveName(name string) (any, bool) {
+	if name == stepsName {
+		return c, true
+	}
+	v, ok := c.vars[name]
+	return v, ok
+}
+
+func (*counting) Parent() interpreter.Activation { return nil }
+
 // ordering is x compared with y by an ordering operator, as CEL orders them, once bounded has
 // refused a double that isn't finite.
 func ordering(function string) func(x, y ref.Val) ref.Val {
@@ -1183,12 +1333,13 @@ var evaluating = func() {}
 // evaluate runs a condition's program on a request.
 func evaluate(prg program, vars map[string]any) run {
 	evaluating()
-	out, details, err := prg.Eval(vars)
-	// One stopped at its limit costs at most that, past the call that took it there, so a single
-	// condition can't spend what the check's others need.
+	in := &counting{vars: vars}
+	out, details, err := prg.Eval(in)
+	// One stopped at its limit costs at most that, past the call or step that took it there, so a
+	// single condition can't spend what the check's others need.
 	cost := prg.limit
 	if details != nil && details.ActualCost() != nil {
-		cost = min(*details.ActualCost(), prg.limit)
+		cost = min(max(*details.ActualCost(), in.steps), prg.limit)
 	}
 	if err != nil {
 		return run{cost: cost}
