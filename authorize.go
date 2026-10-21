@@ -748,9 +748,7 @@ func (a *Authorizer) holders(ctx context.Context, p Permission, r Resource, role
 	// One time for every statement, as one snapshot, so a grant, a membership or a group's member
 	// ending between them can't leave a holder that no single moment had.
 	now := a.cfg.Now()
-	through, err := a.broadArgs(ctx, a.db, r.Tenant, p, r.Type, roles, custom,
-		byKey("$4", "rbac_grants", "scope", "role", `tenant = $1 AND principal = ANY($5::text[]) AND role LIKE 'custom.%'`),
-		r.path(), broadKeys(r.Tenant))
+	through, err := a.broadArgs(ctx, a.db, r.Tenant, p, r.Type, roles, custom, broadAt, r.path())
 	if err != nil {
 		return nil, err
 	}
@@ -1091,7 +1089,7 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 		return Reach{}, nil
 	}
 	reaching := a.reaching(resourceType)
-	through, err := a.broadArgs(ctx, a.db, tenant, p, resourceType, roles, custom, broadOn("$4", "$5"), reaching, broadKeys(tenant))
+	through, err := a.broadArgs(ctx, a.db, tenant, p, resourceType, roles, custom, broadOn, reaching)
 	if err != nil {
 		return Reach{}, err
 	}
@@ -1293,7 +1291,7 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	// Which custom roles give p through the public and the tenant's members is read now, and the
 	// statement keeps of them those that still give it, and through the public those still public:
 	// one first granted to them later gives nothing through them.
-	through, err := a.broadArgs(ctx, a.db, tenant, p, resourceType, roles, custom, broadOn("$4", "$5"), a.reaching(resourceType), broadKeys(tenant))
+	through, err := a.broadArgs(ctx, a.db, tenant, p, resourceType, roles, custom, broadOn, a.reaching(resourceType))
 	if err != nil {
 		return Predicate{}, err
 	}
@@ -1354,10 +1352,15 @@ func byType(types, cols, where string) string {
 		SELECT %[2]s FROM rbac_grants g WHERE %[3]s AND %[4]s OFFSET 0) g`, types, cols, where, ofType("g.scope", "t.t"))
 }
 
-// broadOn is SQL selecting the custom roles of the grants in force to the principals whose keys
-// are in the array keys on scopes of the types in the array types, in the tenant $1.
-func broadOn(types, keys string) string {
-	return byType(types, "g.role", `g.tenant = $1 AND g.principal = ANY(`+keys+`::text[]) AND g.role LIKE 'custom.%'`)
+// broadOn is SQL selecting, for broadArgs, the roles of the grants in the tenant $1 to the principal
+// whose key is principal on scopes of the types in the array $4.
+func broadOn(principal string) string {
+	return byType("$4", "g.role", "g.tenant = $1 AND g.principal = "+principal)
+}
+
+// broadAt is broadOn for the scopes in the array $4.
+func broadAt(principal string) string {
+	return byKey("$4", "rbac_grants", "scope", "role", "tenant = $1 AND principal = "+principal)
 }
 
 // byKey is SQL selecting cols of the rows of table for which where holds whose col is one of the
