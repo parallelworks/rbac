@@ -35,15 +35,15 @@ import (
 // such as `request.time < timestamp("2027-01-01T00:00:00Z") && resource.attributes.env != "prod"`.
 // A grant with one gives its role only where the expression is true. An expression that fails, as
 // one reading an attribute the host didn't pass does, or comparing a double that isn't finite, as
-// dividing by zero makes, is false. A label value and a power to release are decided on the tenant
-// with no attributes, whatever a check passes (Holding), and their conditions can't read the
-// tenant's: any read of resource.attributes fails, a test of an attribute's presence, in, size(), a
-// macro and a comparison included, so a grant's gives nothing and a deny's applies. The zero
-// Condition is none, and one with a title or description has an expression. A pattern it matches is
-// a string literal, of bounded size; it nests at most 32 deep; it builds no message, as
-// `google.protobuf.Struct{}`; and a comparison, or a search of a list, that would read more than a
-// condition may spend, or reading a time in a zone whose name is longer than 64 bytes, fails before
-// it runs.
+// dividing by zero makes, or keying a map by one, is false. A label value and a power to release
+// are decided on the tenant with no attributes, whatever a check passes (Holding), and their
+// conditions can't read the tenant's: any read of resource.attributes fails, a test of an
+// attribute's presence, in, size(), a macro and a comparison included, so a grant's gives nothing
+// and a deny's applies. The zero Condition is none, and one with a title or description has an
+// expression. A pattern it matches is a string literal, of bounded size; it nests at most 32 deep;
+// it builds no message, as `google.protobuf.Struct{}`; and a comparison, or a search of a list,
+// that would read more than a condition may spend, or reading a time in a zone whose name is longer
+// than 64 bytes, fails before it runs.
 //
 // Each condition runs within the most evaluating it can cost, which its literals and types bound:
 // little for one comparing what a request passes with literals, or with the subject's kind or id,
@@ -1079,7 +1079,8 @@ func (*counting) Parent() interpreter.Activation { return nil }
 // literal of it does, by its length: the map hashes it whole, which CEL charges as 1 however long
 // it is, so a loop looking up a long string the host passes would take time growing with its
 // length, charged only for the steps. Each costs a tenth of its bytes more, as reading it does
-// (textSize), counted beside the steps (counting).
+// (textSize), counted beside the steps (counting). A double that isn't finite fails as a key
+// (finiteKey).
 type keying struct {
 	// keys are the ids of the keys checked computes, and planned what CEL planned each as last,
 	// which is what it reads: it plans an index whose key isn't an attribute as an attribute under
@@ -1198,7 +1199,7 @@ func (a *keyedAttribute) Exec(frame *interpreter.ExecutionFrame) ref.Val {
 	}
 	key := a.Adapter().NativeToValue(v)
 	a.k.charge(frame, a, key)
-	return key
+	return finiteKey(key)
 }
 
 func (a *keyedAttribute) Eval(vars interpreter.Activation) ref.Val {
@@ -1235,6 +1236,17 @@ func (a *keyedAttribute) qualifier(vars interpreter.Activation) (interpreter.Qua
 	return a.k.fac.NewQualifier(nil, attr.ID(), v, attr.IsOptional())
 }
 
+// finiteKey is key, failing for a double that isn't finite, as comparing one does (nonFinite): CEL
+// finds no key equal to NaN, so a map keyed by one would equal no map and hold no value, and a
+// deny's `{failed / total: 1} == {0.5: 1}` would lift where both are 0.0. A condition computes
+// every key that can be one, since none is written.
+func finiteKey(key ref.Val) ref.Val {
+	if nonFinite(key) {
+		return types.NewErr("rbac: a double that isn't finite can't be a key")
+	}
+	return key
+}
+
 // keyedCall is a key CEL plans as a call, charged once it has run.
 type keyedCall struct {
 	interpreter.InterpretableCall
@@ -1244,7 +1256,7 @@ type keyedCall struct {
 func (c *keyedCall) Exec(frame *interpreter.ExecutionFrame) ref.Val {
 	v := c.InterpretableCall.Exec(frame)
 	c.k.charge(frame, c, v)
-	return v
+	return finiteKey(v)
 }
 
 func (c *keyedCall) Eval(vars interpreter.Activation) ref.Val {

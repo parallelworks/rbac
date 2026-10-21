@@ -104,7 +104,8 @@ func TestADeclaredDoubleThatIsntFiniteFailsItsConditions(t *testing.T) {
 }
 
 // A condition can make a double that isn't finite of finite ones, dividing by zero or converting
-// "NaN", which CEL orders and equates as false with anything: so comparing one fails too.
+// "NaN", which CEL orders and equates as false with anything: so comparing one fails too, and so
+// does keying a map by one, which CEL finds no key equal to, whatever the map holds.
 func TestADoubleAConditionMakesThatIsntFiniteFailsWhatComparesIt(t *testing.T) {
 	h := setup(t, func(c *rbac.Config) {
 		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
@@ -114,8 +115,17 @@ func TestADoubleAConditionMakesThatIsntFiniteFailsWhatComparesIt(t *testing.T) {
 	})
 	ctx := t.Context()
 	const ratio = `request.attributes.failed / request.attributes.total`
-	grants := []string{ratio + ` < 0.5`, `!(` + ratio + ` >= 0.5)`, ratio + ` != 1.0`}
-	denies := []string{ratio + ` >= 0.5`, ratio + ` == 1.0`, `double(request.attributes.score) >= 0.5`}
+	keyed := `{` + ratio + `: 1}`
+	grants := []string{
+		ratio + ` < 0.5`, `!(` + ratio + ` >= 0.5)`, ratio + ` != 1.0`,
+		keyed + ` != {0.5: 1}`, `[` + keyed + `] != [{0.5: 1}]`, `!(0.5 in ` + keyed + `)`,
+		`[` + ratio + `].all(r, {r: 1} != {0.5: 1})`,
+	}
+	denies := []string{
+		ratio + ` >= 0.5`, ratio + ` == 1.0`, `double(request.attributes.score) >= 0.5`,
+		keyed + ` == {0.5: 1}`, `{0.5: 1} == ` + keyed, `0.5 in {double(request.attributes.score): 1}`,
+		`[` + ratio + `].exists(r, {r: 1} == {0.5: 1})`,
+	}
 	seeded := []rbac.Grant{grant(cluster.Scope(), "guard", rbac.User, "guardian")}
 	for i, expr := range grants {
 		g := grant(cluster.Scope(), "cluster.login", rbac.User, fmt.Sprint("u", i))
@@ -141,7 +151,7 @@ func TestADoubleAConditionMakesThatIsntFiniteFailsWhatComparesIt(t *testing.T) {
 		return err == nil
 	}
 	finite := map[string]any{"failed": 0.0, "total": 1.0, "score": "0.1"}
-	for i := range 3 {
+	for i := range grants {
 		if !is(fmt.Sprint("u", i), finite) || !is(fmt.Sprint("v", i), finite) {
 			t.Fatalf("finite doubles: %s, %s", grants[i], denies[i])
 		}
@@ -151,7 +161,7 @@ func TestADoubleAConditionMakesThatIsntFiniteFailsWhatComparesIt(t *testing.T) {
 		"infinity":  {"failed": 1.0, "total": 0.0, "score": "inf"},
 		"-infinity": {"failed": -1.0, "total": 0.0, "score": "-inf"},
 	} {
-		for i := range 3 {
+		for i := range grants {
 			if is(fmt.Sprint("u", i), request) {
 				t.Errorf("a grant's condition %s held for %s", grants[i], name)
 			}
