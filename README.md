@@ -432,10 +432,11 @@ have the server load a library or run a program of its choosing; and:
    as it; `EXECUTE` on the functions `rbac_tenant_keys` and `rbac_text_array`, which history's
    index of the keys denies name calls for each record, and which every role has unless it is
    revoked; and `CREATE` there to be given them, unless a superuser gives them.
-3. The application's role has `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the package's tables
-   but `rbac_history` and `rbac_migrations`, and on any a later migration adds, `EXECUTE` on the
-   functions `rbac_group_members`, `rbac_tenant_keys` and `rbac_text_array`, which every role has
-   unless it is revoked, and only `SELECT` on `rbac_history`, with no `UPDATE` on its id sequence,
+3. The application's role has `USAGE` on the package's schema, without which it reads none of its
+   tables; `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the package's tables but `rbac_history` and
+   `rbac_migrations`, and on any a later migration adds; `EXECUTE` on the functions
+   `rbac_group_members`, `rbac_tenant_keys` and `rbac_text_array`, which every role has unless it
+   is revoked; and only `SELECT` on `rbac_history`, with no `UPDATE` on its id sequence,
    which a grant on all the schema's sequences can give: `setval` could number a change below the
    one before it, and `AsOf` would read the row as it was before the change. Never `TRIGGER`, which
    `ALL` includes: a trigger runs its function as whoever writes the table, and one on

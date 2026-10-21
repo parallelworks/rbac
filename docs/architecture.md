@@ -676,7 +676,7 @@ file, nor `SET` or `ALTER SYSTEM` on a parameter only a superuser may set. The R
 flowchart LR
     admin["Administrator's role<br/>runs Migrate, owns the tables"]
     histrole["History's role<br/>owns rbac_history and rbac_record"]
-    app["Application's role<br/>DML on the tables, SELECT on history,<br/>EXECUTE rbac_group_members,<br/>rbac_tenant_keys and rbac_text_array"]
+    app["Application's role<br/>USAGE on the schema, DML on the tables,<br/>SELECT on history, EXECUTE rbac_group_members,<br/>rbac_tenant_keys and rbac_text_array"]
     admin -->|"member of"| histrole
     app -->|"writes"| tables[("rbac_* tables")]
     tables -->|"rbac_record runs as"| histrole
