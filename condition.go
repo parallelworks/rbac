@@ -486,15 +486,11 @@ func (c costs) CallCost(function, _ string, args []ref.Val, _ ref.Val) *uint64 {
 		for _, v := range args {
 			n += textSize(v)
 		}
-	case overloads.TimeGetFullYear, overloads.TimeGetMonth, overloads.TimeGetDayOfYear, overloads.TimeGetDate,
-		overloads.TimeGetDayOfMonth, overloads.TimeGetDayOfWeek, overloads.TimeGetHours, overloads.TimeGetMinutes,
-		overloads.TimeGetSeconds, overloads.TimeGetMilliseconds:
-		if len(args) < 2 {
+	default:
+		if !timePart(function) || len(args) < 2 {
 			return nil
 		}
 		n = zoneCost
-	default:
-		return nil
 	}
 	return &n
 }
@@ -815,12 +811,6 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 		if fn == operators.Add && len(xs) == 2 {
 			x = added(xs[0], xs[1])
 		}
-	case overloads.TimeGetFullYear, overloads.TimeGetMonth, overloads.TimeGetDayOfYear, overloads.TimeGetDate,
-		overloads.TimeGetDayOfMonth, overloads.TimeGetDayOfWeek, overloads.TimeGetHours, overloads.TimeGetMinutes,
-		overloads.TimeGetSeconds, overloads.TimeGetMilliseconds:
-		if len(xs) >= 2 {
-			own = zoneCost
-		}
 	case overloads.StartsWith, overloads.EndsWith:
 		// CEL charges a tenth of the prefix's size, rounded up.
 		if len(xs) == 2 {
@@ -830,6 +820,10 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 		// And a tenth of each one's size, multiplied.
 		if len(xs) == 2 {
 			own = cost.SafeMultiply(cost.SafeAdd(sized(xs[0])/10, 1), cost.SafeAdd(sized(xs[1])/10, 1))
+		}
+	default:
+		if timePart(fn) && len(xs) >= 2 {
+			own = zoneCost
 		}
 	}
 	return cost.SafeAdd(n, own), x
@@ -882,15 +876,14 @@ func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 	if !ok {
 		return i, nil
 	}
-	var op func(x, y ref.Val) ref.Val
-	switch call.Function() {
-	case overloads.TimeGetFullYear, overloads.TimeGetMonth, overloads.TimeGetDayOfYear, overloads.TimeGetDate,
-		overloads.TimeGetDayOfMonth, overloads.TimeGetDayOfWeek, overloads.TimeGetHours, overloads.TimeGetMinutes,
-		overloads.TimeGetSeconds, overloads.TimeGetMilliseconds:
+	if timePart(call.Function()) {
 		if len(call.Args()) != 2 {
 			return i, nil
 		}
 		return inZone(call), nil
+	}
+	var op func(x, y ref.Val) ref.Val
+	switch call.Function() {
 	case operators.Equals:
 		op = equal
 	case operators.NotEquals:
@@ -949,6 +942,17 @@ func inZone(call interpreter.InterpretableCall) interpreter.InterpretableCall {
 		}
 		return t.Receive(function, overload, args[1:])
 	})
+}
+
+// timePart reports whether function reads a part of a time, in a zone where it is given one.
+func timePart(function string) bool {
+	switch function {
+	case overloads.TimeGetFullYear, overloads.TimeGetMonth, overloads.TimeGetDayOfYear, overloads.TimeGetDate,
+		overloads.TimeGetDayOfMonth, overloads.TimeGetDayOfWeek, overloads.TimeGetHours, overloads.TimeGetMinutes,
+		overloads.TimeGetSeconds, overloads.TimeGetMilliseconds:
+		return true
+	}
+	return false
 }
 
 // looping is what costs charges a loop's literal condition as: nothing, as CEL charges a literal.
@@ -1094,14 +1098,16 @@ func newKeying(env *cel.Env, checked *ast.AST, limit uint64) *keying {
 			k.keys[e.ID()] = true
 		}
 	}
-	for _, e := range ast.MatchDescendants(ast.NavigateAST(checked), ast.FunctionMatcher(operators.Index)) {
-		if args := e.AsCall().Args(); len(args) == 2 {
+	index := ast.FunctionMatcher(operators.Index)
+	for _, e := range ast.MatchDescendants(ast.NavigateAST(checked), func(e ast.NavigableExpr) bool {
+		return e.Kind() == ast.MapKind || index(e)
+	}) {
+		if e.Kind() == ast.MapKind {
+			for _, entry := range e.AsMap().Entries() {
+				key(entry.AsMapEntry().Key())
+			}
+		} else if args := e.AsCall().Args(); len(args) == 2 {
 			key(args[1])
-		}
-	}
-	for _, e := range ast.MatchDescendants(ast.NavigateAST(checked), ast.KindMatcher(ast.MapKind)) {
-		for _, entry := range e.AsMap().Entries() {
-			key(entry.AsMapEntry().Key())
 		}
 	}
 	return k
