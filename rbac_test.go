@@ -3298,22 +3298,7 @@ func TestDeleteScopeRemovesAGrantMadeWhileItWaits(t *testing.T) {
 			}
 			done := make(chan error, 1)
 			go func() { done <- h.authz.DeleteScopes(ctx, host, "t1", scopes) }()
-			// Commit only once DeleteScopes has either finished or is waiting on a lock.
-			for waiting := false; !waiting; {
-				select {
-				case err := <-done:
-					done <- err
-					waiting = true
-				default:
-					if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
-						WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE '%/rbac/%')`).Scan(&waiting); err != nil {
-						t.Fatal(err)
-					}
-				}
-			}
-			if err := tx.Commit(ctx); err != nil {
-				t.Fatal(err)
-			}
+			commitOnceWaitedOn(t, h, tx, done)
 			if err := <-done; err != nil {
 				t.Fatal(err)
 			}
@@ -4976,21 +4961,7 @@ func TestDeleteRoleRemovesAGrantMadeWhileItWaits(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() { done <- h.authz.DeleteRole(ctx, admin, "t1", operator.ID) }()
-	for waiting := false; !waiting; {
-		select {
-		case err := <-done:
-			done <- err
-			waiting = true
-		default:
-			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
-				WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE '%/rbac/%')`).Scan(&waiting); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
+	commitOnceWaitedOn(t, h, tx, done)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
@@ -5033,6 +5004,10 @@ func applyWhileTheRoleChanges(t *testing.T, operator rbac.RoleDefinition, change
 		t.Fatal(err)
 	}
 	b := rbac.Binding{Role: operator.ID, Principal: rbac.Principal{Kind: rbac.User, ID: "op"}}
+	var pid int32
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
 	done := make(chan error, 1)
 	go func() { done <- h.authz.Apply(ctx, admin, cluster, rbac.Change{Grant: []rbac.Binding{b}}) }()
 	for waiting := false; !waiting; {
@@ -5040,8 +5015,7 @@ func applyWhileTheRoleChanges(t *testing.T, operator rbac.RoleDefinition, change
 		case err := <-done:
 			t.Fatalf("Apply didn't wait for the role's change: %v", err)
 		default:
-			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
-				WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE '%/rbac/%')`).Scan(&waiting); err != nil {
+			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -7455,21 +7429,7 @@ func TestADenySetWhileADeletionWaitsStopsIt(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() { done <- h.authz.DeleteRole(ctx, x, "t1", r.ID) }()
-	for waiting := false; !waiting; {
-		select {
-		case err := <-done:
-			done <- err
-			waiting = true
-		default:
-			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
-				WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE '%/rbac/%')`).Scan(&waiting); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
+	commitOnceWaitedOn(t, h, tx, done)
 	if err := <-done; !errors.Is(err, rbac.ErrConflict) || !allowed(t, h, y, view, cluster) {
 		t.Fatalf("deleting a role while a deny below the tenant is set: %v", err)
 	}
@@ -7550,21 +7510,7 @@ func TestADenySetWhileARedefinitionHandedOnByARoleListingItWaitsStopsIt(t *testi
 	wider.Permissions = []rbac.Permission{view, root}
 	done := make(chan error, 1)
 	go func() { done <- h.authz.SetRole(ctx, x, "t1", wider) }()
-	for waiting := false; !waiting; {
-		select {
-		case err := <-done:
-			done <- err
-			waiting = true
-		default:
-			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
-				WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE '%/rbac/%')`).Scan(&waiting); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
+	commitOnceWaitedOn(t, h, tx, done)
 	if err := <-done; !errors.Is(err, rbac.ErrConflict) {
 		t.Fatalf("widening a role that one granted under the workspace lists while a deny is set there: %v", err)
 	}

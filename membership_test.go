@@ -1727,21 +1727,7 @@ func TestDeletingGroupsAtOnceLeavesNoEligibilityWithoutItsApprovers(t *testing.T
 	// then none: it waits for that deletion, and so deletes the eligibility rather than keep it.
 	done := make(chan error, 1)
 	go func() { done <- h.authz.DeleteGroups(ctx, host, "t1", []string{"sre"}) }()
-	for waiting := false; !waiting; {
-		select {
-		case err := <-done:
-			done <- err
-			waiting = true
-		default:
-			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE wait_event_type = 'Lock'
-				AND (query LIKE '%/rbac/%' OR query LIKE 'UPDATE rbac_eligibilities%'))`).Scan(&waiting); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
+	commitOnceWaitedOn(t, h, tx, done)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
@@ -1788,21 +1774,7 @@ func TestAChangeNamingAGroupWaitsForItsDeletion(t *testing.T) {
 			owner := h.as(t, "owner")
 			done := make(chan error, 1)
 			go func() { done <- change(ctx, h.authz, owner) }()
-			for waiting := false; !waiting; {
-				select {
-				case err := <-done:
-					done <- err
-					waiting = true
-				default:
-					if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
-						WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE '%/rbac/%')`).Scan(&waiting); err != nil {
-						t.Fatal(err)
-					}
-				}
-			}
-			if err := tx.Commit(ctx); err != nil {
-				t.Fatal(err)
-			}
+			commitOnceWaitedOn(t, h, tx, done)
 			if err := <-done; !errors.Is(err, rbac.ErrInvalid) {
 				t.Fatalf("naming a group deleted meanwhile: %v", err)
 			}
@@ -2203,17 +2175,30 @@ func TestEndingMembershipsNeverDeadlocksWithDeleteExpired(t *testing.T) {
 			if _, err := tx.Exec(ctx, `SELECT FROM rbac_members WHERE group_id = 'b' FOR UPDATE`); err != nil {
 				t.Fatal(err)
 			}
+			var pid int
+			if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+				t.Fatal(err)
+			}
+			// Whether a session running query waits on tx, directly or through one another.
 			waiting := func(query string) bool {
 				var w bool
-				if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE $1)`,
-					query).Scan(&w); err != nil {
+				if err := h.pool.QueryRow(ctx, `WITH RECURSIVE waiting(pid) AS (
+					SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))
+					UNION SELECT a.pid FROM pg_stat_activity a JOIN waiting w ON w.pid = ANY(pg_blocking_pids(a.pid)))
+					SELECT EXISTS (SELECT FROM pg_stat_activity JOIN waiting USING (pid) WHERE query LIKE $2)`, pid, query).Scan(&w); err != nil {
 					t.Fatal(err)
 				}
 				return w
 			}
 			ended := make(chan error, 1)
 			go func() { ended <- end(ctx, h.authz) }()
-			for !waiting("DELETE FROM rbac_members%") {
+			for blocked := false; !blocked; {
+				select {
+				case err := <-ended:
+					t.Fatalf("%s didn't wait for the held place: %v", name, err)
+				default:
+					blocked = waiting("DELETE FROM rbac_members%")
+				}
 			}
 			expired := make(chan error, 1)
 			go func() {

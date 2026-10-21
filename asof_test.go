@@ -33,14 +33,16 @@ func TestAsOfReadsATenantAsItWas(t *testing.T) {
 	u, v := h.as(t, "u", "sre"), h.as(t, "v")
 	h.groups(t, "sre")
 	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"), grant(cluster.Scope(), "cluster.sudo", rbac.Group, "sre"))
-	// x's login expires between the two times.
+	// x's login expires between the two times. Then is when its grant's statement began, which
+	// history dates the grant by, and its expiry is set from that same instant, so however slow the
+	// machine, then is before it.
 	x := h.as(t, "x")
-	expires := dbNow(t, h).Add(200 * time.Millisecond)
-	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
-		VALUES ('t1', 'cluster', 'c1', 'user', 'x', 'cluster.login', $1)`, expires); err != nil {
+	var then, expires time.Time
+	if err := h.pool.QueryRow(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'x', 'cluster.login', statement_timestamp() + interval '200 milliseconds')
+		RETURNING statement_timestamp(), expires_at`).Scan(&then, &expires); err != nil {
 		t.Fatal(err)
 	}
-	then := dbNow(t, h)
 	// Since: u left sre, a deny took login from u, and v was granted login.
 	if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_members WHERE principal = 'user:u'`); err != nil {
 		t.Fatal(err)
@@ -49,7 +51,10 @@ func TestAsOfReadsATenantAsItWas(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "v"))
-	time.Sleep(time.Until(expires) + 50*time.Millisecond)
+	// Until x's login expires by the database's clock, which dates it, not this machine's.
+	if _, err := h.pool.Exec(ctx, `SELECT pg_sleep(extract(epoch FROM $1 - clock_timestamp()))`, expires); err != nil {
+		t.Fatal(err)
+	}
 	now := dbNow(t, h)
 	for _, c := range []struct {
 		name        string
@@ -57,17 +62,18 @@ func TestAsOfReadsATenantAsItWas(t *testing.T) {
 		uRoot       bool
 		uLogin      bool
 		vLogin      bool
+		xLogin      bool
 		loginHeldBy []rbac.Principal
 	}{
-		{"then", then, true, true, false, []rbac.Principal{u.Principal, x.Principal}},
-		{"now", now, false, false, true, []rbac.Principal{v.Principal}},
+		{"then", then, true, true, false, true, []rbac.Principal{u.Principal, x.Principal}},
+		{"now", now, false, false, true, false, []rbac.Principal{v.Principal}},
 	} {
 		if err := h.authz.AsOf(ctx, "t1", c.at, func(a *rbac.Authorizer) error {
 			for _, check := range []struct {
 				s    rbac.Subject
 				p    rbac.Permission
 				want bool
-			}{{u, root, c.uRoot}, {u, login, c.uLogin}, {v, login, c.vLogin}, {x, login, c.at.Before(expires)}} {
+			}{{u, root, c.uRoot}, {u, login, c.uLogin}, {v, login, c.vLogin}, {x, login, c.xLogin}} {
 				err := a.Authorize(ctx, check.s, check.p, cluster)
 				if err != nil && !errors.Is(err, rbac.ErrDenied) {
 					return err
