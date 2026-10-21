@@ -366,7 +366,9 @@ func canonical(r RoleDefinition) RoleDefinition {
 // its grants on scopes of types it is no longer for, or a deny that removes the actor's power to
 // change them there or on the path of a scope they are on, stops it, as it stops DeleteRole and
 // Apply there; so does, where they will give more, a deny on that path that removes a permission
-// the role gives, which the actor would hand on there. The scopes are as Config.ResourceOf gives
+// the role gives, which the actor would hand on there. Renaming it or rewriting its description
+// changes no grant, so needs only the power to define it: a role's name and description are part
+// of its definition, not of the data its grants are on. The scopes are as Config.ResourceOf gives
 // them. A role another change redefined or created while this one waited for the tenant is
 // refused, to be tried again: the constraints were asked about it as it was, as is one granted
 // meanwhile on a scope of a type they weren't asked about, or, it or a role listing it, on a scope
@@ -428,26 +430,26 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 	if err != nil {
 		return err
 	}
-	return a.inTx(ctx, tenant, actor.Principal, "SetRole", func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTxGaining(ctx, tenant, actor.Principal, "SetRole", func(tx pgx.Tx) (ChangeEvent, gains, error) {
 		// Alone in the tenant, so a change in progress checks and commits against one
 		// definition of the role.
 		if err := lockTenant(ctx, tx, tenant); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
 		cs.seal()
 		au, err := a.mayDefine(ctx, tx, actor, root, &r, cs)
 		if err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
 		old, ok := au.roles.custom[r.ID]
 		if ok && !sameAccess(old, r) && (!existed || !sameAccess(old, checked)) {
-			return ChangeEvent{}, changedMeanwhile(r.ID)
+			return ChangeEvent{}, gains{}, changedMeanwhile(r.ID)
 		}
 		// Again on the denies read under the lock, which a deny set meanwhile is among, and on the
 		// scopes its grants are on now, which roleReachOf checked as they were.
 		if ok && !sameAccess(old, r) {
 			if err := a.stillReaches(ctx, tx, actor, au, tenant, r.ID, slices.Concat(old.ResourceTypes, r.ResourceTypes), reach, change); err != nil {
-				return ChangeEvent{}, err
+				return ChangeEvent{}, gains{}, err
 			}
 		}
 		// Privileged as the roles that give its permissions on its types are, or as changing
@@ -457,30 +459,30 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 		r.Privileged = after.Privileged
 		if was := au.roles.custom[r.ID]; r.Privileged && !was.Privileged {
 			if err := heldByMembers(ctx, tx, tenant, r.ID, a.cfg.Now()); err != nil {
-				return ChangeEvent{}, err
+				return ChangeEvent{}, gains{}, err
 			}
 		}
 		// The grants it widens are the ones the host was asked about, of the roles as it was asked
 		// about them, or one was made or a role redefined meanwhile.
 		need, err := a.revalidations(ctx, tx, tenant, widened)
 		if err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
 		for _, v := range need {
 			if as, ok := asked[v.key()]; !ok || widens(as, v.role) {
-				return ChangeEvent{}, fmt.Errorf("%w: grants %s's definition widens changed while it waited; try again", ErrConflict, r.ID)
+				return ChangeEvent{}, gains{}, fmt.Errorf("%w: grants %s's definition widens changed while it waited; try again", ErrConflict, r.ID)
 			}
 		}
 		// The holders asked about, not need's: a grant revoked or ended meanwhile is no conflict.
 		if err := a.stillStanding(ctx, tx, tenant, stand); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
 		others := len(au.roles.custom)
 		if ok {
 			others--
 		}
 		if others >= MaxCustomRoles {
-			return ChangeEvent{}, fmt.Errorf("%w: a tenant has at most %d custom roles", ErrInvalid, MaxCustomRoles)
+			return ChangeEvent{}, gains{}, fmt.Errorf("%w: a tenant has at most %d custom roles", ErrInvalid, MaxCustomRoles)
 		}
 		// A condition of its grants that reads the action counts once for each label value and power
 		// to release they give (conditionsIn), so giving more can leave a bucket on the tenant past
@@ -489,10 +491,10 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 		var before map[conditionBucket]map[string]int
 		if a.givesMoreLabels(old, after) {
 			if buckets, err = a.tenantBuckets(ctx, tx, tenant, r.ID); err != nil {
-				return ChangeEvent{}, err
+				return ChangeEvent{}, gains{}, err
 			}
 			if before, err = a.conditionsIn(ctx, tx, tenant, buckets); err != nil {
-				return ChangeEvent{}, err
+				return ChangeEvent{}, gains{}, err
 			}
 		}
 		perms := make([]string, len(r.Permissions))
@@ -516,13 +518,25 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 			  EXCLUDED.privileged, EXCLUDED.public, EXCLUDED.grantable_roles)`,
 			tenant, r.ID, r.Name, r.Description, perms, r.ResourceTypes, r.Privileged, r.Public, grantable, actorKey(actor.Principal))
 		if err != nil || tag.RowsAffected() == 0 {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
 		if err := a.conditionsBounded(ctx, tx, tenant, buckets, before); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
-		return ChangeEvent{Roles: []RoleDefinition{r}}, nil
+		var g gains
+		if ok && !a.addsExclusive(old, after) {
+			g.rewrote = map[string]bool{string(r.ID): true}
+		}
+		return ChangeEvent{Roles: []RoleDefinition{r}}, g, nil
 	})
+}
+
+// addsExclusive reports whether grants and eligibilities of a role defined as now can give an
+// exclusive value they couldn't as was: one it didn't give, or any it gives once newly public or
+// for more types, which brings back what its grants to the public or on those types gave.
+func (a *Authorizer) addsExclusive(was, now RoleDefinition) bool {
+	values := a.exclusiveValues([]RoleDefinition{now})[now.ID]
+	return len(values) > 0 && (!subset(values, was.Permissions) || now.Public && !was.Public || !subset(now.ResourceTypes, was.ResourceTypes))
 }
 
 // givesMoreLabels reports whether a role defined as now gives a label value or a power to release

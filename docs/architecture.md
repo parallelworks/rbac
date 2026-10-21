@@ -235,7 +235,12 @@ erDiagram
   principal sooner.
 - **Every write is recorded.** Each table above but `rbac_history` has the trigger
   `rbac_record`, which writes the change into `rbac_history`. Nothing updates or truncates that
-  table, and only `PruneHistory`, as a role with the rights of its owner, deletes from it.
+  table, and only `PruneHistory`, as a role with the rights of its owner, deletes from it. Each
+  record reads its key's last by history's index of each entity's keys, in a generic plan with
+  sequential scans off: a plan its session made while history was small would otherwise scan all
+  of it for each row, and one made for each row, until history is analyzed, read all of the
+  tenant's records of the entity, so a statement writing many would take time growing with the
+  square of their number.
 
 ## Principals, groups and keys
 
@@ -271,11 +276,17 @@ flowchart BT
   a deny (`bound`). A deny's exemptions are matched against every key the subject is in, the
   tenant's members too where a check of a permission that changes access counts none of their
   grants, and the identity's own (`exempted`).
-- **Changing a group's members is granting.** Adding an identity to a group gives it what the
-  group holds, so `ChangeMembers` needs the authority to grant all of it, and the host's
-  `ValidateGrant` is asked as for a grant. The same holds for nesting one group in another, and a
-  change that adds a member and nests its group asks about the member against every group it
-  will be in.
+- **Changing a group's members is granting.** Adding an identity to a group gives it what the group
+  holds, so `ChangeMembers` needs the authority to grant all of it, and the host's `ValidateGrant`
+  is asked as for a grant. The same holds for nesting one group in another, and a change that adds a
+  member and nests its group asks about the member against every group it will be in. What a change
+  reaches is read once (`reach`, indexed by the keys it names), however many members of a group
+  change and however many of the groups are in one that reaches it, and its grants are decided once
+  for each role, condition and end on a scope, as the member a grant names decides nothing of the
+  actor's power to make it; only the host is asked about each member's, which `MaxBindings` bounds
+  for `ChangeMembers` but for one member alone. `ImportMembers`, the host's own write, which no
+  actor's access decides, asks it once for each member and each grant or eligibility the member
+  gains, with no bound on them, so its cost grows with that.
 - **Expanding down** from groups to their identities, for lists and changes, is `insideSQL`. It
   finds nested groups in the statement and their identities through `rbac_group_members`, which
   plans its query for the groups reached, so a small group's members are read alone however large
@@ -322,7 +333,7 @@ flowchart TB
     grant -->|no| refused
     grant -->|yes| asks{"Labeled resource, or an<br/>exclusive value?"}
     asks -->|no| allowed(["nil"])
-    asks -->|yes| holding["The subject's label values,<br/>from what the statement read<br/>(holdingFrom, permissionsOf)"]
+    asks -->|yes| holding["The values the label asks for<br/>that the subject holds, each asked<br/>of the constraints, from what the<br/>statement read (holdingFor, permissionsOf)"]
     holding --> sat{"Holds no two exclusive values,<br/>and satisfies the label?"}
     sat -->|yes| allowed
     sat -->|no| refused
@@ -356,7 +367,9 @@ sequenceDiagram
     A->>DB: conditionsOf (only where a conditional grant is all that's left)
     A->>E: grant conditions, cheapest first, within a budget
     opt labeled resource or exclusive value
-        A->>A: the subject's values from what it read (holdingFrom)
+        A->>A: the values the label asks for, from what it read (holdingFor)
+        A->>C: Deny(ConstraintInput), once for each of them its grants give
+        C-->>A: false
         A->>A: excludes, then Unsatisfied
     end
     A-->>H: nil, or DeniedError
@@ -414,8 +427,8 @@ sequenceDiagram
     H->>A: Apply(ctx, actor, resource, change)
     A->>A: validate inputs, MaxBindings
     A->>C: changing: Deny of type:grant on the scope
-    A->>DB: the actor's label values, where the scope is labeled
     A->>DB: authorityOn: the actor's grants, denies and roles<br/>in one statement, then their conditions
+    A->>C: where the scope is labeled, Deny of each value its label<br/>asks for that the actor's grants give
     A->>C: hand-on rules: Deny of each permission it hands on
     A->>DB: stand: the standing of the principals named
     A->>V: each grant, as it will be
@@ -425,7 +438,7 @@ sequenceDiagram
     A->>DB: lock: exclusive/tenant if a dimension is Exclusive, then the tenant<br/>shared and the scope and principals exclusive, or past 64 the tenant exclusive
     A->>DB: the groups named exist, and stillStanding:<br/>memberships unchanged since the host was asked
     A->>DB: authority again, under the locks, the constraints' answers read back
-    A->>DB: the actor's label values again, where the scope is labeled
+    A->>A: the actor's label values again, where the scope is labeled, the answers read back
     A->>DB: revoke and upsert
     DB->>DB: rbac_record writes rbac_history, as the actor
     A->>DB: exclusive values: no one can now hold two
@@ -698,17 +711,21 @@ Every input that could grow without limit is bounded, so no call's cost depends 
 chose to store beyond these, but for the groups a subject is in through others (below) and for the
 lists, which read what they list: `Filter` reads the subject's grants on the scopes that can reach
 the listed type and the denies on them, and costs each row a few lookups among them however many
-there are. The tables hold rows within the same bounds, but for the ids in a deny's principals and
-exemptions and an eligibility's approvers: a check can count an array element's bytes only with a
-function of the package's own, which every role writing the table would need `EXECUTE` on, so the
-tables count those in characters, to `MaxID`, and a role that writes around the package can store
-them at up to four times as many bytes. History refuses a row of more than 1 MiB as jsonb all the
-same.
+there are; and for the changes that check, once each, every scope what they change has access on:
+`ChangeMembers` every scope the groups whose members change have access on, approve eligibilities on
+or are named or exempt in a deny on, and `SetRole` changing what a role gives, and `DeleteRole`,
+every scope it is granted on; and for `ImportMembers`, which asks `ValidateGrant` once for each
+member it adds and each grant or eligibility that member gains. The tables hold rows within the same
+bounds, but for the ids in a deny's principals and exemptions and an eligibility's approvers: a
+check can count an array element's bytes only with a function of the package's own, which every role
+writing the table would need `EXECUTE` on, so the tables count those in characters, to `MaxID`, and
+a role that writes around the package can store them at up to four times as many bytes. History
+refuses a row of more than 1 MiB as jsonb all the same.
 
 | Bound | Value | What it limits |
 |---|---|---|
 | `MaxID` | 512 bytes | A tenant's, scope's or principal's id. |
-| `MaxBindings` | 1,000 | Bindings in one `Apply`, and the grants, memberships, groups or members one `Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`, `DeleteGroups`, `ImportMembers`, `ChangeMembers` or `DeleteMembers` takes. |
+| `MaxBindings` | 1,000 | Bindings in one `Apply`, and the grants, memberships, groups or members one `Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`, `DeleteGroups`, `ImportMembers`, `ChangeMembers` or `DeleteMembers` takes, and the grants and eligibilities the members one `ChangeMembers` adds gain, each member's counted apart, as `ValidateGrant` is asked about each, but one member alone, which gains whatever its groups hold. The host's own `ImportMembers` is asked about each with no such bound. |
 | `MaxGrantsPerRole` | 20 | Grants in force of one role to one principal on one scope, differing by source, expiry or condition. Those from each source the host owns count apart. |
 | `MaxDenies`, `MaxDenyEntries` | 100, 256 | Denies on a scope, and the principals, exemptions or permissions one names. |
 | `MaxCustomRoles`, `MaxRoleEntries`, `MaxGrantableRoles` | 300, 1,000, 64 | Custom roles in a tenant, the permissions one gives and the types it is for, and roles one lists in `GrantableRoles`. |

@@ -2494,6 +2494,57 @@ func TestRedefiningARoleGrantedOnALabeledScopeNeedsItsLabel(t *testing.T) {
 	}
 }
 
+// A role's name and description are its definition's, which the power to define it governs, not
+// the data its grants are on: an actor the label of the scope a role is granted on refuses, or a
+// deny on that scope's path keeps from changing grants there, renames it and rewrites its
+// description, though it can neither narrow nor delete it, which changes the grants there.
+func TestRenamingARoleGrantedWhereTheActorMayNotChangeGrantsNeedsOnlyThePowerToDefineIt(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	h := labeled(t, func(c *rbac.Config) {
+		c.Catalog = append(c.Catalog, rbac.RoleDefinition{ID: "guard", Permissions: []rbac.Permission{rbac.DenyPermission("workspace")}, ResourceTypes: []string{"workspace"}})
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s == secret.Scope() {
+				return secret, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	r := rbac.RoleDefinition{ID: "custom.viewer", Name: "Viewer", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), r.ID, rbac.User, "pilot"), grant(rbac.TenantRoot("t1"), "guard", rbac.User, "guardian"))
+	narrowed := r
+	narrowed.Permissions = []rbac.Permission{view}
+	stopped := func(why string) {
+		t.Helper()
+		if err := h.authz.SetRole(ctx, admin, "t1", narrowed); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("narrowing the role where %s: %v", why, err)
+		}
+		if err := h.authz.DeleteRole(ctx, admin, "t1", r.ID); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("deleting the role where %s: %v", why, err)
+		}
+		r.Name, r.Description = "Viewer "+why, "Renamed where "+why
+		if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
+			t.Errorf("renaming the role where %s: %v", why, err)
+		}
+	}
+	stopped("the label refuses the actor")
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), workspace, rbac.Deny{ID: "freeze", Permissions: []rbac.Permission{grantC}, Principals: []rbac.Principal{admin.Principal}}); err != nil {
+		t.Fatal(err)
+	}
+	h.hold(t, "admin", "level:high")
+	stopped("a deny stops the actor changing grants")
+	roles, err := h.authz.CustomRoles(ctx, "t1")
+	if err != nil || len(roles) != 1 || roles[0].Name != r.Name || roles[0].Description != r.Description || !slices.Equal(roles[0].Permissions, []rbac.Permission{login, view}) {
+		t.Errorf("CustomRoles = %+v, %v", roles, err)
+	}
+}
+
 // A role granted on a labeled cluster that lists another lets its holders grant that one there, so
 // widening it hands more on there: an actor the label refuses can't.
 func TestWideningARoleThatOneGrantedOnALabeledScopeListsNeedsItsLabel(t *testing.T) {
@@ -3272,6 +3323,10 @@ func TestChecksUnderAGenericPlanReadOnlyTheirSubjectsGrants(t *testing.T) {
 			"Grantable":                   func(a *rbac.Authorizer) error { return second(a.Grantable(ctx, owner, cluster)) },
 			"Apply": func(a *rbac.Authorizer) error {
 				return a.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: ann.Principal}}})
+			},
+			// Granted again as it is stored, which the change looks up by its whole key.
+			"Apply under a condition": func(a *rbac.Authorizer) error {
+				return a.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{sudo.Binding}})
 			},
 			"Grantable in a nested group": func(a *rbac.Authorizer) error { return second(a.Grantable(ctx, boss, cluster)) },
 			"Apply in a nested group": func(a *rbac.Authorizer) error {

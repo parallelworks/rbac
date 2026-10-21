@@ -346,10 +346,11 @@ func (a *Authorizer) authorityOr(ctx context.Context, q DB, actor Subject, on Re
 }
 
 // labelAllows refuses, as a DeniedError of p, a change on a scope whose label the actor's holding
-// doesn't satisfy, decided by values, read with its authority there, or where nil read on q the
-// first time in each phase (constrained.holding), asking the constraints about its values through
-// labels, or where nil, through cs on the tenant: before the change's transaction, and again under
-// its locks, which reads their answers back.
+// doesn't satisfy, decided by values, read with its authority there, of the values the label asks
+// about, or where nil read on q the first time in each phase (constrained.holding), asking the
+// constraints about its values through labels, or where nil, through cs on the tenant: before the
+// change's transaction, and again under its locks, which reads their answers back, of the same
+// label.
 func (a *Authorizer) labelAllows(ctx context.Context, q DB, on Resource, cs, labels *constrained, p Permission, values *valuesRead) error {
 	if !on.Labels.asks() {
 		return nil
@@ -357,7 +358,7 @@ func (a *Authorizer) labelAllows(ctx context.Context, q DB, on Resource, cs, lab
 	if labels == nil {
 		labels = cs.ofTenant()
 	}
-	held, err := labels.holdingBy(ctx, q, values)
+	held, err := labels.holdingFor(ctx, q, values, on.Labels)
 	if err != nil {
 		return err
 	}
@@ -909,24 +910,70 @@ func (c *constrained) holdingAndKeys(ctx context.Context, q DB) (Holding, []stri
 	return *c.held[phase], c.keys[phase], nil
 }
 
-// holdingBy is the actor's label values decided through c by v, read with its other grants, once
-// for each read; or where v is nil, read on q (holding).
+// holdingBy is the actor's label values decided through c by v, read with its other grants, each
+// once for each read; or where v is nil, read on q (holding).
 func (c *constrained) holdingBy(ctx context.Context, q DB, v *valuesRead) (Holding, error) {
 	if v == nil {
 		return c.holding(ctx, q)
 	}
-	if h, ok := v.decided[c]; ok {
-		return h, nil
+	return c.decidedBy(ctx, q, v, nil)
+}
+
+// holdingFor is holdingBy of only the values that decide whether the actor satisfies l (askedBy),
+// but where v is nil, of every one, as read once in each phase for every label a change checks.
+func (c *constrained) holdingFor(ctx context.Context, q DB, v *valuesRead, l Label) (Holding, error) {
+	if v == nil {
+		return c.holding(ctx, q)
 	}
-	h, _, err := c.a.holdingFrom(ctx, q, c.actor, c, v)
+	return c.decidedBy(ctx, q, v, c.a.askedBy(l))
+}
+
+// decidedHolding is a holding decided by a read through a constrained, of the values in asked, or
+// of every one where all.
+type decidedHolding struct {
+	h     Holding
+	asked map[Permission]bool
+	all   bool
+}
+
+// covers reports whether d decided every value in asked, or where nil, every one.
+func (d *decidedHolding) covers(asked map[Permission]bool) bool {
+	if d.all || asked == nil {
+		return d.all
+	}
+	for p := range asked {
+		if !d.asked[p] {
+			return false
+		}
+	}
+	return true
+}
+
+// decidedBy is the actor's holding decided through c by v of the values in asked, or of every one
+// where nil, deciding each value once for each read however many labels a change checks by it.
+func (c *constrained) decidedBy(ctx context.Context, q DB, v *valuesRead, asked map[Permission]bool) (Holding, error) {
+	d := v.decided[c]
+	if d != nil && d.covers(asked) {
+		return d.h, nil
+	}
+	h, _, err := c.a.holdingFrom(ctx, q, c.actor, c, v, func(p Permission) bool {
+		return c.a.labelPermission(p) && (asked == nil || asked[p]) && (d == nil || !d.asked[p])
+	})
 	if err != nil {
 		return Holding{}, err
 	}
-	if v.decided == nil {
-		v.decided = map[*constrained]Holding{}
+	if d == nil {
+		d = &decidedHolding{h: h, asked: map[Permission]bool{}}
+		if v.decided == nil {
+			v.decided = map[*constrained]*decidedHolding{}
+		}
+		v.decided[c] = d
+	} else {
+		d.h.add(h)
 	}
-	v.decided[c] = h
-	return h, nil
+	d.all = asked == nil
+	maps.Copy(d.asked, asked)
+	return d.h, nil
 }
 
 func (c *constrained) seal() {
@@ -1581,7 +1628,7 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 		return nil, err
 	}
 	if r.Labels.asks() {
-		h, _, err := a.holdingOf(ctx, r.Tenant, s, onTenant(r.Tenant, held, ds, b))
+		h, _, err := a.holdingFor(ctx, r.Tenant, s, onTenant(r.Tenant, held, ds, b), r.Labels)
 		if err != nil || h.Unsatisfied(r.Labels) != "" {
 			return nil, err
 		}
@@ -1662,10 +1709,12 @@ func (a *Authorizer) inTxReaching(ctx context.Context, tenant string, actor Prin
 type gains struct {
 	// widened are the identities, by key, whose memberships or places in groups it widened.
 	widened []string
-	// rewrote are the grants of the event, by id, and its eligibilities, by eligibilityKey, it only
-	// rewrote, gaining nothing: a grant granted again, which changes only its note and its
-	// condition's title and description, and an eligibility in force set again to end no later,
-	// which every value it gives counts by already, whatever it requires.
+	// rewrote are the grants of the event, by id, its eligibilities, by eligibilityKey, and its
+	// custom roles, by id, it only rewrote, gaining nothing: a grant granted again, which changes
+	// only its note and its condition's title and description, an eligibility in force set again
+	// to end no later, which every value it gives counts by already, whatever it requires, and a
+	// role redefined so that its grants give no exclusive value they couldn't (addsExclusive), as
+	// one renamed or narrowed.
 	rewrote map[string]bool
 }
 
@@ -1710,11 +1759,20 @@ func (a *Authorizer) begin(ctx context.Context, fn func(pgx.Tx) error) error {
 	if err := a.writable(); err != nil {
 		return err
 	}
-	// The transaction decides again under its locks, so at a time it reads then (callClock).
-	if a.clock != nil {
-		a.clock.read = false
+	if a.clock == nil {
+		return begin(ctx, a.db, fn)
 	}
-	return begin(ctx, a.db, fn)
+	// The transaction decides again under its locks, so at a time it reads then (callClock). One that
+	// fails before needing the time reads it there too, so its refusal is dated where it decided: a
+	// reading from before the locks can predate a change it waited for.
+	a.clock.read = false
+	return begin(ctx, a.db, func(tx pgx.Tx) error {
+		err := fn(tx)
+		if err != nil {
+			a.clock.now()
+		}
+		return err
+	})
 }
 
 // begin runs fn in a transaction of its own at READ COMMITTED, whatever the database's default,
@@ -1834,7 +1892,8 @@ func (a *Authorizer) report(ctx context.Context, tx pgx.Tx, e ChangeEvent) error
 // upsert stores grants in one statement, sorted so concurrent changes lock rows in the same
 // order, and returns those it added or whose note it changed, and of them, by id, those stored
 // already, which it rewrote. Of grants that are one grant it stores the last, since one statement
-// can't change a row twice. before is conditionsBefore the change.
+// can't change a row twice. One it can't store beside another, stored or among grants, whose
+// condition shares its length and hash, is invalid. before is conditionsBefore the change.
 func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, grants []Grant,
 	before map[conditionBucket]map[string]int,
 ) ([]Grant, map[string]bool, error) {
@@ -1850,6 +1909,9 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 	slices.Reverse(grants)
 	slices.SortStableFunc(grants, byKey)
 	grants = slices.CompactFunc(grants, func(x, y Grant) bool { return byKey(x, y) == 0 })
+	if err := conditionsApart(ctx, tx, grants); err != nil {
+		return nil, nil, err
+	}
 	n := len(grants)
 	scopeTypes, scopeIDs, kinds, ids, roles := make([]string, n), make([]string, n), make([]string, n), make([]string, n), make([]string, n)
 	sources, expires := make([]string, n), make([]pgtype.Timestamptz, n)
@@ -1863,8 +1925,8 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 	}
 	// The same grant again changes only its note and its condition's title and description. The
 	// condition's length and hash pick it, and its text must match, so a hash shared by two
-	// conditions changes neither. The statement's snapshot holds a grant it rewrites as it was, and
-	// none it adds.
+	// conditions changes neither, and the grant is refused below. The statement's snapshot holds a
+	// grant it rewrites as it was, and none it adds.
 	rows, err := tx.Query(ctx, `
 		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at,
 		  condition_title, condition_description, condition, note, created_by, updated_by)
@@ -1884,14 +1946,51 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 		return nil, nil, err
 	}
 	rewrote := map[string]bool{}
+	written := map[scopedKey]bool{}
 	granted, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Grant, error) {
 		var stored bool
 		g, err := scanGrantWith(row, &stored)
-		rewrote[g.ID] = stored
+		rewrote[g.ID], written[scopedKeyOf(g)] = stored, true
 		return g, err
 	})
 	if err != nil {
 		return nil, nil, err
+	}
+	// One it neither added nor rewrote is stored as it is, unless a stored grant shares its key but
+	// for a condition of its length and hash, which the key index can't tell from its own: then the
+	// statement stored nothing. No other condition has an empty one's length, so an unconditional
+	// one, as most are, is never looked up. Each is looked up by the whole key, which OFFSET 0 keeps
+	// a lookup of its own: as an anti-join, a generic plan can read every grant in the tenant.
+	var left []int64
+	for i, g := range grants {
+		if g.Condition.Expression != "" && !written[scopedKeyOf(g)] {
+			left = append(left, int64(i+1))
+		}
+	}
+	if len(left) > 0 {
+		rows, err := tx.Query(ctx, `
+			SELECT i FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::timestamptz[], $9::text[])
+			  WITH ORDINALITY AS t(st, si, pk, pi, r, src, e, c, i)
+			WHERE i = ANY($10::bigint[]) AND NOT EXISTS (SELECT FROM rbac_grants g WHERE g.tenant = $1
+			  AND g.principal = t.pk || ':' || t.pi AND g.scope = t.st || ':' || t.si AND g.role = t.r AND g.source = t.src
+			  AND coalesce(g.expires_at, 'infinity') = coalesce(t.e, 'infinity') AND length(g.condition) = length(t.c)
+			  AND hashtextextended(g.condition, 0) = hashtextextended(t.c, 0) AND g.condition = t.c OFFSET 0)
+			ORDER BY i`, tenant, scopeTypes, scopeIDs, kinds, ids, roles, sources, expires, conditions, left)
+		if err != nil {
+			return nil, nil, err
+		}
+		unstored, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+		if err != nil {
+			return nil, nil, err
+		}
+		var errs []error
+		for _, i := range unstored {
+			errs = append(errs, &InvalidError{Binding: grants[i-1].Binding, Reason: "a grant of it here, from its source until its end, is " +
+				"stored under another condition of the length and hash grants are told apart by, so the two can't stand side by side: revoke that one first"})
+		}
+		if err := errors.Join(errs...); err != nil {
+			return nil, nil, err
+		}
 	}
 	if err := a.bounded(ctx, tx, tenant, granted); err != nil {
 		return nil, nil, err
@@ -1900,6 +1999,64 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 		return nil, nil, err
 	}
 	return granted, rewrote, nil
+}
+
+// scopedKey is what makes a grant on a scope one grant: its scope and grantKey.
+type scopedKey struct {
+	scope Scope
+	grantKey
+}
+
+func scopedKeyOf(g Grant) scopedKey { return scopedKey{g.Scope, keyOf(g.Binding)} }
+
+// conditionsApart refuses grants, sorted as upsert sorts them, two of which differ only in
+// conditions that share their length and hash, which the key index on grants tells conditions
+// apart by: one statement can't store both, as both name one row. The hashes are read only where
+// grants differ only in their conditions, as a change seldom holds.
+func conditionsApart(ctx context.Context, q DB, grants []Grant) error {
+	slot := func(g Grant) scopedKey {
+		k := scopedKeyOf(g)
+		k.condition = ""
+		return k
+	}
+	var at []int
+	var conditions []string
+	for i, g := range grants {
+		if i > 0 && slot(grants[i-1]) == slot(g) || i+1 < len(grants) && slot(grants[i+1]) == slot(g) {
+			at, conditions = append(at, i), append(conditions, g.Condition.Expression)
+		}
+	}
+	if len(at) == 0 {
+		return nil
+	}
+	rows, err := q.Query(ctx, `SELECT length(c), hashtextextended(c COLLATE "C", 0) FROM unnest($1::text[]) WITH ORDINALITY AS t(c, i) ORDER BY i`, conditions)
+	if err != nil {
+		return err
+	}
+	type indexed struct {
+		slot   scopedKey
+		length int
+		hash   int64
+	}
+	seen := map[indexed]bool{}
+	var errs []error
+	var length int
+	var hash int64
+	next := 0
+	if _, err := pgx.ForEachRow(rows, []any{&length, &hash}, func() error {
+		g := grants[at[next]]
+		next++
+		k := indexed{slot(g), length, hash}
+		if seen[k] {
+			errs = append(errs, &InvalidError{Binding: g.Binding, Reason: "the change grants it here, from its source until its end, under another " +
+				"condition of the length and hash grants are told apart by, so the two can't stand side by side"})
+		}
+		seen[k] = true
+		return nil
+	}); err != nil {
+		return err
+	}
+	return errors.Join(errs...)
 }
 
 // conditionsBefore is conditionsIn the buckets of grants a change stores, read under its locks

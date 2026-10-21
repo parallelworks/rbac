@@ -51,14 +51,15 @@ func (a *Authorizer) Explain(ctx context.Context, s Subject, p Permission, r Res
 
 // decide decides as Authorize does, and with explain, says why: the grants, and then the
 // resource's label, which allows nothing its holding doesn't satisfy, decided by the label values
-// read with the grants, so a check allows only what one moment did.
+// read with the grants, so a check allows only what one moment did; of them only those the label
+// asks about.
 func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Resource, explain bool) (Decision, error) {
 	d, values, err := a.decideGrants(ctx, s, p, r, explain)
 	if err != nil || !d.Allowed || values == nil {
 		return d, err
 	}
 	r = a.decidedOn(p, r)
-	h, _, err := a.holdingOf(ctx, r.Tenant, s, values)
+	h, _, err := a.holdingFor(ctx, r.Tenant, s, values, r.Labels)
 	if err != nil {
 		return Decision{}, err
 	}
@@ -313,7 +314,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 	// (decidedOn).
 	var only func(Permission) bool
 	if r.Labels.asks() {
-		h, _, err := a.holdingOf(ctx, r.Tenant, s, onTenant(r.Tenant, held, ds, roles))
+		h, _, err := a.holdingFor(ctx, r.Tenant, s, onTenant(r.Tenant, held, ds, roles), r.Labels)
 		switch {
 		case err != nil:
 			return nil, err
@@ -613,7 +614,7 @@ func (a *Authorizer) labeled(ctx context.Context, p Permission, r Resource, hold
 			continue
 		}
 		s := Subject{Principal: h.Principal}
-		holding, byCondition, err := a.holdingOf(ctx, r.Tenant, s, values[h.Principal.key()])
+		holding, byCondition, err := a.holdingFor(ctx, r.Tenant, s, values[h.Principal.key()], r.Labels)
 		if err != nil {
 			return nil, err
 		}
@@ -1621,9 +1622,9 @@ type valuesRead struct {
 	held  []holding
 	ds    []denial
 	roles book
-	// decided is the holding decided by it through each constrained, so a change's checks decide it
-	// once for each read.
-	decided map[*constrained]Holding
+	// decided is the holding decided by it through each constrained, so a change's checks decide
+	// each value once for each read.
+	decided map[*constrained]*decidedHolding
 }
 
 // onTenant is what of grants and denies read on scopes holding the tenant's, with roles, a subject's

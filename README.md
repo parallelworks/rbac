@@ -50,8 +50,9 @@ if err := authz.Authorize(ctx, subject, "cluster:login", cluster); err != nil {
 - **One grant, or several:** a grant is one role to one principal on one scope, from one source,
   until one time, under one condition. Granting the same again changes only its note and its
   condition's title and description; one that differs in any of these stands beside the others,
-  so granting never narrows what a principal holds. Each has an `ID`, who made it and when, and
-  who last changed it.
+  so granting never narrows what a principal holds. Conditions are told apart by their length and
+  64-bit hash, so one whose condition shares both with another's of the same grant otherwise is
+  refused with `ErrInvalid`. Each has an `ID`, who made it and when, and who last changed it.
 - **Changes:** `Apply` grants and revokes on one scope in one transaction. A revoke removes a
   role's grants to a principal from a source, or with an `ID`, still naming the role, one grant;
   revoking and granting a role at once replaces its grants, keeping those granted again as they
@@ -106,10 +107,11 @@ conditional ones reach, to check one by one.
   refusing one refuses the redefinition, as is one giving more label values where a condition of its
   grants on the tenant reading the action would then cost a check more than it may spend; an actor a
   label of a scope its grants are on, as `Config.ResourceOf` gives it, refuses, or a deny on that
-  scope's path keeps from changing grants there, can neither redefine nor delete it, nor widen it
-  where a deny there, or where a role listing it, or listing one that does, is granted, removes a
-  permission it would give or the power to grant it, or the label of a scope such a role is granted
-  on refuses it.
+  scope's path keeps from changing grants there, can neither change what its grants give nor
+  delete it, nor widen it where a deny there, or where a role listing it, or listing one that does,
+  is granted, removes a permission it would give or the power to grant it, or the label of a scope
+  such a role is granted on refuses it. Renaming a role or rewriting its description changes no
+  grant, so needs only the power to define it.
   `DeleteRole` removes one with its grants; `Roles` lists the built-in and custom roles a scope type
   takes. Custom roles follow the catalog: one gives only what the catalog still has, and is
   privileged when it gives what only privileged roles do, or changes access.
@@ -124,7 +126,11 @@ conditional ones reach, to check one by one.
   tenant's attributes, only `resource.type`, `.id` and `.tenant`, and any read of
   `resource.attributes`, a test of an attribute's presence, `in`, `size()`, a macro or a comparison
   included, fails, so a grant's gives nothing and a deny's applies; and a constraint is asked about
-  that bare tenant, so one deciding them by the tenant's state reads it through its `q`.
+  that bare tenant, so one deciding them by the tenant's state reads it through its `q`. A check of
+  a labeled resource asks it once about each value the label asks for that the subject's grants
+  give, of an `Ordered` dimension those as high as the label's, and nothing about the rest;
+  `Holding`, `Filter` and `Reachable`, which test any label, ask about every one, as do the changes
+  and the approval `Config.Constraints` names.
   `Authorize`, `Explain`, `Permissions`, `Holders` and `Grantable` allow nothing else of a labeled
   resource unless what the subject holds satisfies the label, whatever its grants give, its values
   read with its grants, so none allows what no moment did, nor do
@@ -154,47 +160,54 @@ conditional ones reach, to check one by one.
   any grant or eligibility on the tenant and under any condition, directly, through its groups, as
   one of the tenant's members or the public, or by its own grants before it joins, is refused with
   `ErrInvalid`; denies don't count, and removing a grant, an eligibility, a membership or a place in
-  a group, making a membership or a place end sooner, making a member a guest, or suspending a
-  membership, is never refused. Where a dimension is exclusive, a tenant's changes run in turn, so
-  two can't each give one value. The check reads every identity a change reaches, so a grant to the
-  tenant's members or the public reads every member. A subject whose grants could give it two
-  anyway, as after a catalog change, holds none of them, whatever the request, a constraint or a
-  deny removes: checks and searches of its labels and of the values themselves refuse it, and it
-  can't hand them on, but for those a role it holds lists in `GrantableRoles`, which it grants
-  without holding, as any such role: the identity it grants one to is checked as in any change, so
-  no one comes to hold two. A change reaching it is refused until a removal leaves it one;
-  `Conflicts` lists them. A role giving two of them is refused. An `Ordered` dimension's higher
-  values include the lower, so it isn't exclusive, and in an `AllOf` one a label naming two is one
-  no one can read, as data that joins two parties is.
+  a group, making a membership or a place end sooner, making a member a guest, suspending a
+  membership, granting a grant again, setting an eligibility in force again to end no later, or
+  redefining a custom role so that its grants give no value they couldn't, as renaming or narrowing
+  it, is never refused. Where a dimension is exclusive, a tenant's changes run in turn, so two can't
+  each give one value. The check reads every identity a change reaches, so a grant to the tenant's
+  members or the public reads every member. A subject whose grants could give it two anyway, as
+  after a catalog change, holds none of them, whatever the request, a constraint or a deny removes:
+  checks and searches of its labels and of the values themselves refuse it, and it can't hand them
+  on, but for those a role it holds lists in `GrantableRoles`, which it grants without holding, as
+  any such role: the identity it grants one to is checked as in any change, so no one comes to hold
+  two. Any other change reaching it is refused until a removal leaves it one; `Conflicts` lists
+  them. A role giving two of them is refused. An `Ordered` dimension's higher values include the
+  lower, so it isn't exclusive, and in an `AllOf` one a label naming two is one no one can read, as
+  data that joins two parties is.
 - **Conditions:** a grant can carry a CEL expression over the subject's, the resource's and the
   request's attributes (`Subject.Attributes`, `Resource.Attributes`, `rbac.WithRequest`), the time
   and the action. It gives its role only where the expression holds; one that fails is false.
   `Config.Attributes` declares the attributes and their types, so a condition reading one
   misnamed, or as another type, is refused when stored, and one stored under other declarations
-  fails where it no longer passes them. Each condition runs within the most evaluating it can
-  cost, which its literals and types bound: little for comparing what a request passes with
-  literals, or with the ids, kinds, types and tenant a check passes or its action, which are no
-  longer than `MaxID`, and all a condition may for reading the size of, or looping over, a list
-  the request passes. Cost is bounded per check too, for each scope on its path, and the
-  conditions a check reads together are bounded where they are stored: an identity's grants' on a
-  scope, those of a scope's grants to groups, the tenant's members and the public, each the
-  tenant's and those from each source the host owns apart, a scope's denies', and the requirements
-  of groups' eligibilities for a role on a scope. Each holds hundreds of comparisons with
-  literals, a hundred of an attribute with the subject's id, or three of the longest conditions
-  that read a list or loop, and a change adding a condition past one is refused as invalid. So a
-  check evaluates every condition it reads, and a grant made beside another, as by someone who
-  can't revoke it, never changes what that one decides. A change adding no condition isn't
-  refused, so what was stored past a bound before there were bounds can be rewritten in place, as
-  by a restore over the rows still stored, though not restored where they are gone, and a check
-  may not reach all of it: it evaluates the cheapest first within its budget. An upgrade of CEL
-  can leave conditions stored past a bound in the same way: each process bounds a stored condition
-  again by what the CEL it is built with makes of it, so another version can bound one more, and
-  the package's tests pin the bounds of conditions of common shapes, so that one an upgrade moves
-  fails them. Going back to an earlier release of this package does the same where that release
-  bounds a shape more, so while old and new replicas run side by side, the old ones may refuse
-  changes adding a condition to a scope the new ones filled. To hand a permission on, the actor
-  holds it unconditionally or under the same condition, one that doesn't read the subject: that
-  one decides for each holder, so the actor's holding says nothing of another's.
+  fails where it no longer passes them. A condition building a message, as
+  `google.protobuf.Struct{...}`, is refused, and one stored before fails: a grant's gives nothing
+  and a deny's applies. Each condition runs within the most evaluating it can cost, which its
+  literals and types bound: little for comparing what a request passes with literals, or with the
+  ids, kinds, types and tenant a check passes or its action, which are no longer than `MaxID`, and
+  all a condition may for reading the size of, or looping over, a list the request passes, or for
+  looking up a key the request passes in a map, which hashes the key whole, as
+  `{"dev": 1, "prod": 2}[resource.attributes.env]` does. Cost is bounded per check too, for each
+  scope on its path, and the conditions a check reads together are bounded where they are stored:
+  an identity's grants' on a scope, those of a scope's grants to groups, the tenant's members and
+  the public, each the tenant's and those from each source the host owns apart, a scope's denies',
+  and the requirements of groups' eligibilities for a role on a scope. Each holds hundreds of
+  comparisons with literals, a hundred of an attribute with the subject's id, or three of the
+  longest conditions that read a list, look up a key the request passes or loop, and a change
+  adding a condition past one is refused as invalid. So a check evaluates every condition it
+  reads, and a grant made beside another, as by someone who can't revoke it, never changes what
+  that one decides. A change adding no condition isn't refused, so what was stored past a bound
+  before there were bounds can be rewritten in place, as by a restore over the rows still stored,
+  though not restored where they are gone, and a check may not reach all of it: it evaluates the
+  cheapest first within its budget. An upgrade of CEL, or of this package where it bounds a shape
+  more, can leave conditions stored past a bound in the same way: each process bounds a stored
+  condition again by what it and the CEL it is built with make of it, so another version can bound
+  one more, and the package's tests pin the bounds of conditions of common shapes, so that one an
+  upgrade moves fails them. Going back to an earlier release of this package does the same where
+  that release bounds a shape more, so while replicas of two releases run side by side, those
+  bounding a shape more may refuse changes adding a condition to a scope the others filled. To
+  hand a permission on, the actor holds it unconditionally or under the same condition, one that
+  doesn't read the subject: that one decides for each holder, so the actor's holding says nothing
+  of another's.
 - **Deny policies:** `SetDeny` puts a deny on a scope: under it, it removes permissions
   (`type:verb`, or `type:*` for a type's every one) from the principals it names, those it exempts
   aside, whatever their grants give. It names and exempts principals a grant could name, so not
@@ -271,7 +284,17 @@ conditional ones reach, to check one by one.
   sooner gains nothing: it is a removal then, checked as one now; nor does one whose note alone
   changes. So whoever manages a group that holds, approves and is in no deny, and that no member
   activated through, changes its members freely, and one holding a role only if they could grant
-  that role themselves.
+  that role themselves. Whether the actor may make a grant is decided once for each end, however
+  many members gain it, but the host is asked about each as each member's, so the members one
+  `ChangeMembers` adds gain at most `rbac.MaxBindings` grants and eligibilities in all, each
+  member's counted apart, but one member alone, which gains whatever its groups hold.
+  `ImportMembers`, the host's own write, which no actor's access decides, has no such bound: it asks
+  `ValidateGrant` once for each member and each grant or eligibility the member gains, so its cost
+  grows with how many they gain. The rest is the groups', read once however many of their members
+  change, and what a group many of them are in reaches, once for all of them, and grows with what
+  the groups hold, approve and are named or exempt in, so grant a group on a container rather than
+  on each resource in it: with labels declared, a removal asks `Config.ResourceOf` about each scope
+  its members lose access on, but where the actor's label values satisfy every label.
   `Config.ResourceOf` gives the package the tenant, which `SetGroup` and `DeleteGroup` check
   `rbac.ManageGroups` on, and the groups, which `ChangeMembers` checks `rbac.GroupMembers` on and
   `SetGroup` and `DeleteGroup` the label of, each with its constraints and label, and the
@@ -543,18 +566,22 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   can leave out of every role: then it is denied like any other. To retire a type, keep one of its
   permissions there until its scopes are deleted; `DeletePrincipal` and `DeleteTenant` remove
   grants on any type.
-- **Limits:** a change takes at most `rbac.MaxBindings` bindings; a principal holds a role on a
-  scope at most `rbac.MaxGrantsPerRole` times, and is in a group at most `rbac.MaxPlacesInGroup`
-  times, by source, and directly in at most `rbac.MaxGroupsOfPrincipal` groups, from each source
-  the host owns apart, which bounds the groups a check reads through others only level by level, so
-  keep nesting narrow; a scope holds at most `rbac.MaxDenies` denies; a tenant has at most
-  `rbac.MaxCustomRoles` custom roles; an id is at most `rbac.MaxID` bytes. The others are exported
-  beside them. Lists have no limit or cursor, so what one returns grows with what it lists:
-  `Memberships` of a whole tenant with its members and guests, `Groups` with its groups, `Members`
-  with a group's members, `Holders` with who holds the permission, `Grants` and `Eligibilities` on
-  the tenant's scope with what is granted there, `Reach.Scopes` with the scopes a subject's grants
-  are on, and `Conflicts` with the identities in conflict. In a large tenant, ask for less:
-  `Memberships` of named principals, `Grants` of one principal.
+- **Limits:** a change takes at most `rbac.MaxBindings` bindings, and the members one
+  `ChangeMembers` adds gain at most as many grants and eligibilities, each member's counted apart,
+  but one alone, while `ImportMembers` asks `ValidateGrant` about each one its members gain; a
+  principal holds a role on a scope at most `rbac.MaxGrantsPerRole` times, and is in a group at most
+  `rbac.MaxPlacesInGroup` times, by source, and directly in at most `rbac.MaxGroupsOfPrincipal`
+  groups, from each source the host owns apart, which bounds the groups a check reads through others
+  only level by level, so keep nesting narrow; a scope holds at most `rbac.MaxDenies` denies; a
+  tenant has at most `rbac.MaxCustomRoles` custom roles; an id is at most `rbac.MaxID` bytes. The
+  others are exported beside them. Lists have no limit or cursor, so what one returns grows with
+  what it lists: `Memberships` of a whole tenant with its members and guests, `MembershipsOf` with
+  the tenants an identity is a member or guest of, `Groups` with its groups, `Members` with a
+  group's members, `GroupsOf` with the groups a principal is in, through others too, `Holders` with
+  who holds the permission, `Grants` and `Eligibilities` on the tenant's scope with what is granted
+  there, `Reach.Scopes` with the scopes a subject's grants are on, and `Conflicts` with the
+  identities in conflict. In a large tenant, ask for less: `Memberships` of named principals,
+  `Grants` of one principal.
 - **JIT:** turn JIT compilation off for the application's role, as in
   `ALTER ROLE app SET jit = off`, which a session takes as it starts, so a pool's connections take
   it once they reconnect. The planner can't tell how far a walk of a subject's groups goes, so for

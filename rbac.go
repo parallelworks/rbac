@@ -439,10 +439,12 @@ type Grant struct {
 // A grant is one role to one principal from one source, until one time, under one condition, as
 // in cloud IAM: granting the same again changes only its note and its condition's title and
 // description, and a grant that differs in any of these is another, beside it, so granting never
-// narrows what a principal holds. A revoke removes every grant of its role to its principal from
-// its source, whatever their expiry and condition, or with an ID that one grant. Revokes apply
-// first, sparing grants the change makes again, so revoking and granting a role at once replaces
-// its grants with those granted.
+// narrows what a principal holds. Conditions are told apart by their length and 64-bit hash, so a
+// grant whose condition shares both with another's, stored or granted with it, of the same role,
+// principal, source and end can't stand beside it, and is invalid. A revoke removes every grant of
+// its role to its principal from its source, whatever their expiry and condition, or with an ID
+// that one grant. Revokes apply first, sparing grants the change makes again, so revoking and
+// granting a role at once replaces its grants with those granted.
 type Change struct {
 	Grant  []Binding
 	Revoke []Binding
@@ -589,9 +591,12 @@ func conflicted(err error) error {
 // Lengths are in characters, but an expression's, in bytes.
 const (
 	// MaxBindings is how many bindings one Apply, grants and revokes together, or one Import takes,
-	// and MaxGrantsPerRole how many grants in force of one role a principal holds on one scope,
-	// differing by source, expiry or condition, as cloud IAM bounds bindings of one role: those from
-	// each source the host owns (Config.Sources) counted apart.
+	// and how many grants and eligibilities of their groups the members one ChangeMembers adds gain
+	// in all, each member's counted apart, as the host is asked about each, but one member alone,
+	// which gains whatever its groups hold, and not the host's own ImportMembers; and
+	// MaxGrantsPerRole how many grants in force of one role a principal holds on one scope,
+	// differing by source, expiry or condition, as cloud IAM bounds bindings of one role: those
+	// from each source the host owns (Config.Sources) counted apart.
 	MaxBindings      = 1000
 	MaxGrantsPerRole = 20
 	// MaxDenies is how many deny policies a scope holds, and MaxDenyEntries how many principals,
@@ -649,8 +654,9 @@ type DB interface {
 type Config struct {
 	// Catalog is the built-in roles.
 	Catalog []RoleDefinition
-	// ContainerTypes are scope types that hold resources, such as a workspace. Any role can
-	// be granted on one, and applies to the resources under it.
+	// ContainerTypes are scope types that hold resources, such as a workspace. Any role but one
+	// giving a label value or a power to release, which is for the tenant alone, can be granted on
+	// one, and applies to the resources under it.
 	ContainerTypes []string
 	// PrincipalKinds are the kinds of identity besides users that act and are granted roles,
 	// such as service accounts. Groups, a tenant's members and the public need no declaring, and
@@ -671,7 +677,16 @@ type Config struct {
 	// a guest, refuses the group's grant too while the group holds one that may not.
 	// Required: a grant to a principal the tenant doesn't let in must never be stored.
 	ValidateGrant func(ctx context.Context, q DB, in GrantInput) error
-	Constraints   []Constraint
+	// Constraints are the host's policy above every grant and deny, asked about each permission a
+	// call decides. A check asks about its permission, and for a labeled resource once about each
+	// value its label asks for that the subject's grants give: in an Ordered dimension those as
+	// high as the label's, and in another those it names, so a hook failing on another value fails
+	// no check of it. Explain, Permissions, Grantable, Holders for each identity it lists, and a
+	// change on a labeled scope ask the same. Holding, Filter and Reachable, which test any label,
+	// ask about every value and power to release the subject's grants give, as do SetRole and
+	// DeleteRole of a role granted somewhere, ChangeMembers where only a removal reaches a scope,
+	// and Activate about an approver on a labeled scope.
+	Constraints []Constraint
 	// ResourceOf returns the resource a scope is, with its ancestors, attributes and label, as the
 	// host passes it to a check. SetGroup and DeleteGroup check ManageGroups on the tenant, and,
 	// where Labels are declared, the group's label, a group SetGroup creates included, and
