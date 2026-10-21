@@ -914,25 +914,36 @@ const looping = "@looping"
 // costs what charging the condition did, and at a loop's first step 1 more for each key of a map
 // it ranges over (costs). It counts the steps too, which limit bounds (counting).
 type stepping struct {
-	// ranges are the ids of the ranges of checked's loops, by those of their conditions, and
-	// stepped those of the conditions planned as steps.
-	ranges  map[int64]int64
-	stepped map[int64]bool
-	limit   uint64
+	// ranges are the ids of the ranges of checked's loops, by those of their conditions, planned
+	// whether each range has been planned, by its id, and stepped those of the conditions planned
+	// as steps.
+	ranges           map[int64]int64
+	planned, stepped map[int64]bool
+	limit            uint64
 }
 
 func newStepping(checked *ast.AST, limit uint64) *stepping {
-	s := &stepping{ranges: map[int64]int64{}, stepped: map[int64]bool{}, limit: limit}
+	s := &stepping{ranges: map[int64]int64{}, planned: map[int64]bool{}, stepped: map[int64]bool{}, limit: limit}
 	for _, e := range ast.MatchDescendants(ast.NavigateAST(checked), ast.KindMatcher(ast.ComprehensionKind)) {
 		s.ranges[e.AsComprehension().LoopCondition().ID()] = e.AsComprehension().IterRange().ID()
+		s.planned[e.AsComprehension().IterRange().ID()] = false
 	}
 	return s
 }
 
 func (s *stepping) decorate(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
+	if _, ok := s.planned[i.ID()]; ok {
+		s.planned[i.ID()] = true
+	}
 	over, ok := s.ranges[i.ID()]
 	if !ok {
 		return i, nil
+	}
+	// A loop's first step finds its range by this id to charge a map's keys (costs). Another
+	// version of CEL may plan the range under another id, or after the condition, and a loop over
+	// a map the host passes, inside another, would copy its keys uncharged again.
+	if !s.planned[over] {
+		return nil, errors.New("a loop's range is planned where this package can't charge its keys")
 	}
 	// The tracking finds what it holds by id, the range's before the steps', and drops it with all
 	// held after it.

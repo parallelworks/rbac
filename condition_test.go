@@ -890,7 +890,8 @@ func TestALoopOfMoreStepsThanItsConditionMayCostFails(t *testing.T) {
 	}
 }
 
-// otherwise is a loop's condition as another version of CEL may plan it, under the id it gives it.
+// otherwise is a loop's condition or range as another version of CEL may plan it, under the id it
+// gives it.
 type otherwise struct {
 	interpreter.InterpretableV2
 	id int64
@@ -900,20 +901,29 @@ func (o otherwise) ID() int64 { return o.id }
 
 // A loop whose condition CEL plans as neither of those of its macros, or where no decorator sees
 // it, as another version of CEL may, isn't a condition: its steps would be neither counted nor
-// dropped, so it would run unbounded.
+// dropped, so it would run unbounded. Nor is one whose range it plans under another id: its first
+// step wouldn't find the range, so a loop over a map would copy its keys uncharged.
 func TestALoopPlannedOtherwiseIsNoCondition(t *testing.T) {
-	for _, expr := range []string{`[1, 2].all(x, x > 0)`, `[1, 2].exists_one(x, x > 1)`} {
-		for how, replan := range map[string]func(interpreter.InterpretableV2) interpreter.InterpretableV2{
-			"as something else": func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, i.ID()} },
-			"under another id":  func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, -i.ID()} },
+	somethingElse := func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, i.ID()} }
+	anotherID := func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, -i.ID()} }
+	for _, expr := range []string{`[1, 2].all(x, x > 0)`, `[1, 2].exists_one(x, x > 1)`, `{"a": 1}.exists(k, k == "a")`} {
+		for how, c := range map[string]struct {
+			ranges bool
+			replan func(interpreter.InterpretableV2) interpreter.InterpretableV2
+		}{
+			"its condition planned as something else": {false, somethingElse},
+			"its condition planned under another id":  {false, anotherID},
+			"its range planned under another id":      {true, anotherID},
 		} {
-			if err := rbac.PlanLoopsOtherwise(t, expr, replan); err == nil {
-				t.Errorf("%s with its loop's condition planned %s is a condition", expr, how)
+			if err := rbac.PlanLoopsOtherwise(t, expr, c.ranges, c.replan); err == nil {
+				t.Errorf("%s with %s is a condition", expr, how)
 			}
 		}
 		same := func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return i }
-		if err := rbac.PlanLoopsOtherwise(t, expr, same); err != nil {
-			t.Errorf("%s planned as CEL plans it: %v", expr, err)
+		for _, ranges := range []bool{false, true} {
+			if err := rbac.PlanLoopsOtherwise(t, expr, ranges, same); err != nil {
+				t.Errorf("%s planned as CEL plans it: %v", expr, err)
+			}
 		}
 	}
 }

@@ -247,17 +247,21 @@ func TrackedValues(t *testing.T, declares Attributes, expr string, attributes ma
 }
 
 // PlanLoopsOtherwise is why expr can't be planned as a condition where CEL plans each of its loops'
-// conditions as replan makes it, as another version of CEL may, or nil.
-func PlanLoopsOtherwise(t *testing.T, expr string, replan func(interpreter.InterpretableV2) interpreter.InterpretableV2) error {
+// conditions, or with ranges each of their ranges, as replan makes it, as another version of CEL
+// may, or nil.
+func PlanLoopsOtherwise(t *testing.T, expr string, ranges bool, replan func(interpreter.InterpretableV2) interpreter.InterpretableV2) error {
 	t.Helper()
 	c, err := newConditions(Attributes{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	checked, patterns := compiled(t, c, expr)
-	conds := newStepping(checked.NativeRep(), maxCost).ranges
+	replanned := map[int64]bool{}
+	for cond, over := range newStepping(checked.NativeRep(), maxCost).ranges {
+		replanned[cond], replanned[over] = !ranges, ranges
+	}
 	_, err = plan(c.env, checked, patterns, maxCost, cel.CustomDecoratorV2(func(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
-		if _, ok := conds[i.ID()]; ok {
+		if replanned[i.ID()] {
 			return replan(i), nil
 		}
 		return i, nil
