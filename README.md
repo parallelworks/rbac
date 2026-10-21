@@ -371,23 +371,33 @@ and each row as JSON text, not parsed into a store's own form, which can reorder
 
 `AsOf(ctx, tenant, at, read)` reads a tenant as it was at a time, from its history: every check,
 list and search the read makes answers as it would have then, with the catalog as it is now, as for
-an access review of a past date. A change counts from when the statement that made it began, but
-never before its row's change before it, as the writer's snapshot holds it: at READ COMMITTED, as
-the package changes the tables, a statement that waited for another's lock on the row reads the
-change it waited for, but at REPEATABLE READ or SERIALIZABLE its transaction's snapshot is older,
-and it is dated before that change. Write around the package at READ COMMITTED. `AsOf` makes no
-change: one tried is no actor's attempt, and `Config.OnRefused` isn't told of it. A statement
-reads the history of the rows it names, as a check does its subject's grants, groups and the
-denies on its resource's path, a search the custom roles its grants name, and `Holders` the
-members of the groups it lists, not the whole tenant's: `AsOf` plans every statement in its
-transaction for its arguments, the host's too, since a connection's cached plan of a statement it
-has run often counts any tenant as an average one. A list counts the denies on scopes of its types
-by history's versions of them, at most a few, and `Grantable`, which can offer any custom role,
-reads each version of every one once. It orders a row's changes by their ids in `rbac_history`,
-which sessions take out of order once that table's id sequence caches more than one, so `AsOf`
-refuses that. Its read's hooks run in its transaction, which holds one of the pool's connections:
-a constraint there queries the `DB` it is given, as one that queries the pool waits for another
-connection, which a busy pool may never free.
+an access review of a past date. A change counts from when the statement that made it began, or its
+transaction, where that began later, as each one a procedure or a `DO` block starts as it commits
+does; an expiry from when it expired; and none from before its row's change before it, as the
+writer's snapshot holds it: at READ COMMITTED, as the package changes the tables, a statement that
+waited for another's lock on the row reads the change it waited for, but at REPEATABLE READ or
+SERIALIZABLE its transaction's snapshot is older, and it is dated before that change. Write around
+the package at READ COMMITTED. So no change but an expiry, which ends only what every read already
+counted as expired, counts from before the transaction that made it began, and what a time reads is
+final once every transaction that had begun by then has ended: `pg_stat_activity` lists each
+session's `xact_start`, which for a block that commits as it goes is when its current transaction
+began, what its changes count from, though its `query_start` is when the block began. Neither
+`backend_xid` nor an export that has read past the time shows it final: a transaction that has only
+read holds no transaction id, which neither shows nor holds `History` back, and can still make a
+change that counts from its start. A prepared transaction, which `pg_stat_activity` no longer lists,
+has ended only once it is committed or rolled back: `pg_prepared_xacts` lists it until then, by when
+it was prepared, not when it began. `AsOf` makes no change: one tried is no actor's attempt, and
+`Config.OnRefused` isn't told of it. A statement reads the history of the rows it names, as a check
+does its subject's grants, groups and the denies on its resource's path, a search the custom roles
+its grants name, and `Holders` the members of the groups it lists, not the whole tenant's: `AsOf`
+plans every statement in its transaction for its arguments, the host's too, since a connection's
+cached plan of a statement it has run often counts any tenant as an average one. A list counts the
+denies on scopes of its types by history's versions of them, at most a few, and `Grantable`, which
+can offer any custom role, reads each version of every one once. It orders a row's changes by their
+ids in `rbac_history`, which sessions take out of order once that table's id sequence caches more
+than one, so `AsOf` refuses that. Its read's hooks run in its transaction, which holds one of the
+pool's connections: a constraint there queries the `DB` it is given, as one that queries the pool
+waits for another connection, which a busy pool may never free.
 
 `rbac.PruneHistory(ctx, db, before, through)` deletes what an export has read past (`through`, its
 cursor) and later records supersede: of each row, the last version at or before `before` stays, so
@@ -424,10 +434,11 @@ have the server load a library or run a program of its choosing; and:
    as it; `EXECUTE` on the functions `rbac_tenant_keys` and `rbac_text_array`, which history's
    index of the keys denies name calls for each record, and which every role has unless it is
    revoked; and `CREATE` there to be given them, unless a superuser gives them.
-3. The application's role has `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the package's tables
-   but `rbac_history` and `rbac_migrations`, and on any a later migration adds, `EXECUTE` on the
-   functions `rbac_group_members`, `rbac_tenant_keys` and `rbac_text_array`, which every role has
-   unless it is revoked, and only `SELECT` on `rbac_history`, with no `UPDATE` on its id sequence,
+3. The application's role has `USAGE` on the package's schema, without which it reads none of its
+   tables; `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the package's tables but `rbac_history` and
+   `rbac_migrations`, and on any a later migration adds; `EXECUTE` on the functions
+   `rbac_group_members`, `rbac_tenant_keys` and `rbac_text_array`, which every role has unless it
+   is revoked; and only `SELECT` on `rbac_history`, with no `UPDATE` on its id sequence,
    which a grant on all the schema's sequences can give: `setval` could number a change below the
    one before it, and `AsOf` would read the row as it was before the change. Never `TRIGGER`, which
    `ALL` includes: a trigger runs its function as whoever writes the table, and one on
@@ -457,6 +468,25 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   runs by itself; a host with a migration tool of its own can apply `rbac.Migrations()` instead.
   On a host's transaction it refuses any isolation but READ COMMITTED: a stricter one's snapshot
   would miss the writes it waits for.
+  A migration locks what it changes until it commits, and while it waits for a lock, every check,
+  list and change of that table queues behind it, and of those it locked already. So `Migrate` has
+  it wait at most 100 ms for any lock: a change that reads the tables in another order than a
+  migration locks them would otherwise deadlock with it, as no order suits every change
+  (`ChangeMembers` reads eligibilities and denies before custom roles, `DeleteRole` custom roles
+  before eligibilities), and a transaction holding a table for long would stall them all. It then
+  rolls back and tries again, waiting longer each time, up to 10 times over about 20 seconds, and
+  then fails as `rbac.ErrConflict`: migrate again once what held the table, as a long export or
+  host transaction, has ended. A transaction waiting for a lock a migration holds, which holds one
+  the migration then waits for, is still ended as a deadlock where its `deadlock_timeout`, 1 second
+  by default, passes before the migration's wait does, and a change ended so is refused as
+  `rbac.ErrConflict`. A tool of the host's own gets none of this: apply each migration with a
+  short `lock_timeout`, and on SQLSTATE 55P03 or 40P01 roll it back and apply it again. Nor does
+  `Migrate` on a host's transaction, as rolling back to its savepoint frees nothing the host's
+  transaction took before, which what the migration waits for can be waiting for in turn, as a
+  request that read the package's tables and then reads a table of the host's that transaction
+  altered: it waits as that transaction's `lock_timeout` says, for PostgreSQL to end such a wait as
+  a deadlock. On any connection, it waits for another replica's migration as long as the session's
+  `lock_timeout` lets it.
   A migration that rebuilds an index, as `0009_grant_seeks` rebuilds two of `rbac_grants`, locks
   the table until it commits, so checks, lists and changes wait for the rebuild; one that builds
   an index, as `0011_tenant_keys` builds three on `rbac_eligibilities` and `rbac_denies`, keeps
@@ -479,9 +509,11 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   while it holds them, though reads of history go on; but where one holds its keys in more
   dimensions, it rebuilds history's index of them, which reads all of history, and as a read of a
   table locks each of its indexes, the rebuild waits for the reads of history running, as an
-  export, and every read of history then waits until migrating commits. A transaction that read
-  history and then reads one of those tables deadlocks with the rebuild, and PostgreSQL ends one
-  of the two: migrate again.
+  export, every read of history waiting behind it until migrating commits, and gives way where one
+  runs past the wait. A transaction that read history and then reads one of those tables waits for
+  migrating while it holds what the rebuild waits for: the rebuild gives way, unless the
+  transaction began waiting long enough before it, as while migrating reads a long history's deny
+  records, for its `deadlock_timeout` to pass first, and PostgreSQL ends the transaction.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
   between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows

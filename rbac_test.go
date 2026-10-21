@@ -3047,6 +3047,27 @@ func TestMigrateReadsItsMigrationsAsStandardSQL(t *testing.T) {
 	}
 }
 
+// Migrate bounds the locks its migrations wait for only in a transaction of its own, and leaves a
+// host's transaction with its lock_timeout as it was.
+func TestMigrateLeavesAHostsLockTimeoutAsItWas(t *testing.T) {
+	ctx := t.Context()
+	tx, err := pgtest.Open(t, "").Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '7s'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := rbac.Migrate(ctx, tx); err != nil {
+		t.Fatal(err)
+	}
+	var after string
+	if err := tx.QueryRow(ctx, `SHOW lock_timeout`).Scan(&after); err != nil || after != "7s" {
+		t.Errorf("after Migrate, the host's transaction has lock_timeout %q, %v", after, err)
+	}
+}
+
 // settingTracer records, as each statement of those in of is sent, the setting as the server last
 // reported it.
 type settingTracer struct {

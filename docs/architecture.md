@@ -621,14 +621,19 @@ flowchart LR
     hist -->|"PruneHistory(before, through)"| prune["superseded versions, and rows<br/>ended, that an export has read"]
 ```
 
-- **What a record holds.** Each holds the row as it was and as it became, when it took effect,
-  the database role that wrote it, and the actor and call it was made through, with what the host
-  attached. A write that bypassed the package is recorded too, with no actor. The tables bound its
-  row as the package bounds what it writes, but for the ids in a deny's or an eligibility's lists
-  of principals, which they count in characters rather than bytes. A row of more than 1 MiB as
-  jsonb, or a context of more than 1 MiB, fails its write, so no record is one `History` can't
-  return. A row written before history was installed has one record from migrating, its baseline,
-  dated when it was created, or at the epoch where that was before year 1 or at its first instant.
+- **What a record holds.** Each holds the row as it was and as it became, when it took effect, the
+  database role that wrote it, and the actor and call it was made through, with what the host
+  attached. A change takes effect when its statement began, or its transaction where that began
+  later, as in a procedure that commits as it goes, and an expiry when it expired, but never before
+  the row's last record: so none but an expiry, which ends only what reads counted as expired
+  already, takes effect before its transaction began, and what AsOf reads of a time is final once
+  every transaction begun by then has ended. A write that bypassed the package is recorded too, with
+  no actor. The tables bound its row as the package bounds what it writes, but for the ids in a
+  deny's or an eligibility's lists of principals, which they count in characters rather than bytes.
+  A row of more than 1 MiB as jsonb, or a context of more than 1 MiB, fails its write, so no record
+  is one `History` can't return. A row written before history was installed has one record from
+  migrating, its baseline, dated when it was created, or at the epoch where that was before year 1
+  or at its first instant.
 - **History's order.** `History` reads records in transaction order, and only those of
   transactions older than every transaction still running, which have all ended. So a cursor
   never passes a record that commits later. It, `Export` and `PruneHistory` name history by its
@@ -672,7 +677,7 @@ file, nor `SET` or `ALTER SYSTEM` on a parameter only a superuser may set. The R
 flowchart LR
     admin["Administrator's role<br/>runs Migrate, owns the tables"]
     histrole["History's role<br/>owns rbac_history and rbac_record"]
-    app["Application's role<br/>DML on the tables, SELECT on history,<br/>EXECUTE rbac_group_members,<br/>rbac_tenant_keys and rbac_text_array"]
+    app["Application's role<br/>USAGE on the schema, DML on the tables,<br/>SELECT on history, EXECUTE rbac_group_members,<br/>rbac_tenant_keys and rbac_text_array"]
     admin -->|"member of"| histrole
     app -->|"writes"| tables[("rbac_* tables")]
     tables -->|"rbac_record runs as"| histrole

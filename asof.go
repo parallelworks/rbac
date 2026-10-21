@@ -36,8 +36,11 @@ var asOfEntities = []struct {
 // host passes: pass it as it was then. A change made on it is refused, as no actor's attempt, which
 // Config.OnRefused isn't told of, and its reads see no change made since, but for History, which
 // reads the whole record as it does outside. A change counts from when the statement that made it
-// began, but never before its row's change before it, so what a time reads can still change until
-// every transaction running then has ended.
+// began, or its transaction, where that began later, as one a procedure that commits as it goes
+// starts does, but never before its row's change before it: none but an expiry, which ends only
+// what reads counted as expired already, counts from before the transaction that made it began, so
+// what a time reads can still change until every transaction running then has ended, one that
+// holds no transaction id yet too.
 // Hooks run as for any read, but in its transaction, which holds one of the pool's connections
 // until read returns: a constraint that reads the package's tables through the DB it is given reads
 // them as of the time too, and one that reads the host's reads them as they are now. A hook that
@@ -67,6 +70,9 @@ func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read
 	}
 	if a.asOf {
 		return fmt.Errorf("%w: a read as of a time is read as of one time", ErrInvalid)
+	}
+	if read == nil {
+		return fmt.Errorf("%w: a read as of a time has a read to run", ErrInvalid)
 	}
 	var tx pgx.Tx
 	switch conn := a.db.(type) {

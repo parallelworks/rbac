@@ -1722,16 +1722,24 @@ func (a *Authorizer) begin(ctx context.Context, fn func(pgx.Tx) error) error {
 // WithTx, in a savepoint of its transaction, whose isolation the locks check; and on another DB,
 // as isolated says. PostgreSQL refusing it for a race matches ErrConflict.
 func begin(ctx context.Context, db DB, fn func(pgx.Tx) error) error {
+	return beginOwn(ctx, db, func(tx pgx.Tx, _ bool) error { return fn(tx) })
+}
+
+// beginOwn is begin, telling fn whether tx is a transaction of its own, which frees all it holds
+// as it rolls back, rather than a savepoint of the host's.
+func beginOwn(ctx context.Context, db DB, fn func(tx pgx.Tx, own bool) error) error {
+	own := func(tx pgx.Tx) error { return fn(tx, true) }
+	host := func(tx pgx.Tx) error { return fn(tx, false) }
 	var err error
 	switch conn := db.(type) {
 	case ownTx:
-		err = pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, fn)
+		err = pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, own)
 	case pgx.Tx:
-		err = savepoint(ctx, db, fn)
+		err = savepoint(ctx, db, host)
 	default:
 		var nested bool
-		if nested, err = isolated(ctx, db, "READ COMMITTED", fn); nested {
-			err = savepoint(ctx, db, fn)
+		if nested, err = isolated(ctx, db, "READ COMMITTED", own); nested {
+			err = savepoint(ctx, db, host)
 		}
 	}
 	return conflicted(err)

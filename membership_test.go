@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/rbac"
@@ -611,6 +612,208 @@ func TestMigratingTheMembersIndexWaitsForAChangeInFlight(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("migrating while a change that read the places writes one: %v", err)
+	}
+}
+
+// rolesAfterDenies is a pool whose transactions run fire, once, just before the first statement
+// naming rbac_roles that follows one naming rbac_denies or rbac_eligibilities.
+type rolesAfterDenies struct {
+	*pgxpool.Pool
+	fire func()
+}
+
+func (p *rolesAfterDenies) BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error) {
+	tx, err := p.Pool.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &rolesAfterDeniesTx{Tx: tx, p: p}, nil
+}
+
+type rolesAfterDeniesTx struct {
+	pgx.Tx
+	p      *rolesAfterDenies
+	denies bool
+}
+
+func (tx *rolesAfterDeniesTx) see(sql string) {
+	if roles := strings.Contains(sql, "rbac_roles"); roles && tx.denies && tx.p.fire != nil {
+		fire := tx.p.fire
+		tx.p.fire = nil
+		fire()
+	} else if !roles && (strings.Contains(sql, "rbac_denies") || strings.Contains(sql, "rbac_eligibilities")) {
+		tx.denies = true
+	}
+}
+
+func (tx *rolesAfterDeniesTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	tx.see(sql)
+	return tx.Tx.Exec(ctx, sql, args...)
+}
+
+func (tx *rolesAfterDeniesTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	tx.see(sql)
+	return tx.Tx.Query(ctx, sql, args...)
+}
+
+func (tx *rolesAfterDeniesTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	tx.see(sql)
+	return tx.Tx.QueryRow(ctx, sql, args...)
+}
+
+// A migration locking a custom role's tables, rbac_roles first, as 0016 does, while ChangeMembers
+// has read the denies and eligibilities and is to read the custom roles, waits a moment for the
+// denies and gives way, so the change goes on, and Migrate tries again once it has: neither
+// deadlocks, which PostgreSQL would end one of the two for.
+func TestMigrateGivesWayToAChangeReadingItsTablesInAnotherOrder(t *testing.T) {
+	ctx := t.Context()
+	pool := pgtest.Open(t, "")
+	migrateFiles(t, pool, "", "0016")
+	recordMigrations(t, pool, "0016")
+	db := &rolesAfterDenies{Pool: pool}
+	cfg := rbac.Config{
+		Catalog:        append(slices.Clone(catalog), groupMembers),
+		ContainerTypes: []string{"org", "workspace"},
+		ValidateGrant:  func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+	}
+	authz, err := rbac.New(db, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &harness{ctx: ctx, pool: pool, authz: authz, cfg: cfg}
+	h.groups(t, "g")
+	h.as(t, "u")
+	manager := h.as(t, "manager")
+	if _, err := pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'tenant', 't1', 'user', 'manager', 'group.members')`); err != nil {
+		t.Fatal(err)
+	}
+	migrated := make(chan error, 1)
+	db.fire = func() {
+		go func() { migrated <- rbac.Migrate(context.WithoutCancel(ctx), pool) }()
+		// Until the migration, holding rbac_roles, waits for a table this transaction read.
+		for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+			var waiting bool
+			if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+				WHERE NOT l.granted AND c.relname IN ('rbac_denies', 'rbac_eligibilities') AND c.relnamespace = current_schema()::regnamespace)`).Scan(&waiting); err != nil {
+				t.Error(err)
+				return
+			}
+			if waiting {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Error("the migration never waited for the change")
+				return
+			}
+		}
+	}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", []rbac.Member{{Group: "g", Principal: identity("u")}}, nil); err != nil {
+		t.Errorf("ChangeMembers while migrating: %v", err)
+	}
+	if db.fire != nil {
+		t.Fatal("ChangeMembers never read the custom roles after the denies in its transaction")
+	}
+	if err := <-migrated; err != nil {
+		t.Errorf("Migrate while a change reads the tables: %v", err)
+	}
+}
+
+// Migrate gives up on a lock it can't take, after as many tries as it makes, rather than wait as
+// long as what holds it runs, while every statement reading the tables it locked meanwhile waits.
+func TestMigrateGivesUpOnALockHeldTooLong(t *testing.T) {
+	ctx := t.Context()
+	pool := pgtest.Open(t, "")
+	migrateFiles(t, pool, "", "0016")
+	recordMigrations(t, pool, "0016")
+	rbac.SetMigrateAttempts(t, 3, time.Millisecond)
+	// A read holds rbac_denies, which 0016 locks, until it ends, holding no transaction id.
+	reader, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reader.Rollback(ctx) }()
+	if _, err := reader.Exec(ctx, `SELECT FROM rbac_denies LIMIT 1`); err != nil {
+		t.Fatal(err)
+	}
+	waited, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	var pg *pgconn.PgError
+	if err := rbac.Migrate(waited, pool); !errors.Is(err, rbac.ErrConflict) || !errors.As(err, &pg) || pg.Code != "55P03" {
+		t.Fatalf("Migrate while a read holds a table it locks: %v", err)
+	}
+	if err := reader.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := rbac.Migrate(ctx, pool); err != nil {
+		t.Fatalf("Migrate once the read has ended: %v", err)
+	}
+}
+
+// On a host's transaction, a table the migration waits for can be held by a transaction waiting
+// for what the host's transaction holds, which rolling back to Migrate's savepoint doesn't free:
+// Migrate waits there, so PostgreSQL ends the other as a deadlock, rather than give way until it
+// gives up while the other waits on.
+func TestMigrateOnAHostsTransactionLetsPostgreSQLEndADeadlockWithIt(t *testing.T) {
+	ctx := t.Context()
+	pool := pgtest.Open(t, "")
+	migrateFiles(t, pool, "", "0016")
+	recordMigrations(t, pool, "0016")
+	// So a Migrate that gave way would give up at once.
+	rbac.SetMigrateAttempts(t, 2, time.Millisecond)
+	if _, err := pool.Exec(ctx, `INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'u')`); err != nil {
+		t.Fatal(err)
+	}
+	host, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = host.Rollback(ctx) }()
+	if _, err := host.Exec(ctx, `UPDATE rbac_memberships SET note = 'host' WHERE principal = 'user:u'`); err != nil {
+		t.Fatal(err)
+	}
+	// Another has read rbac_denies, which 0016 locks, and waits for the row the host's changed.
+	other, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = other.Rollback(ctx) }()
+	if _, err := other.Exec(ctx, `SELECT FROM rbac_denies LIMIT 1`); err != nil {
+		t.Fatal(err)
+	}
+	pid := other.Conn().PgConn().PID()
+	done := make(chan struct{})
+	var waited error
+	go func() {
+		defer close(done)
+		_, waited = other.Exec(ctx, `UPDATE rbac_memberships SET note = 'other' WHERE principal = 'user:u'`)
+	}()
+	// Before other's rollback, its wait ends with the host's.
+	defer func() { _ = host.Rollback(ctx); <-done }()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		var waiting bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock')`, pid).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the other transaction never waited for the host's")
+		}
+	}
+	bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	migrated := rbac.Migrate(bounded, host)
+	if err := host.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	if migrated != nil {
+		t.Errorf("Migrate on the host's transaction: %v", migrated)
+	}
+	if pg := (*pgconn.PgError)(nil); !errors.As(waited, &pg) || pg.Code != "40P01" {
+		t.Errorf("the transaction waiting for the host's: %v", waited)
 	}
 }
 
