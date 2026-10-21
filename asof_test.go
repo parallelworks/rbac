@@ -1029,14 +1029,13 @@ func TestAsOfReadsACustomRoleAsItsLastVersionThen(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
 	u := h.as(t, "u")
-	define := func(qs ...string) time.Time {
+	define := func(qs ...string) {
 		t.Helper()
 		for _, q := range qs {
 			if _, err := h.pool.Exec(ctx, q); err != nil {
 				t.Fatal(err)
 			}
 		}
-		return dbNow(t, h)
 	}
 	define(`INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES
 		('t1', 'custom.widened', '{cluster:view}', '{cluster}'),
@@ -1050,9 +1049,10 @@ func TestAsOfReadsACustomRoleAsItsLastVersionThen(t *testing.T) {
 		h.seed(t, grant(r.Scope(), id, rbac.User, "u"))
 	}
 	then := dbNow(t, h)
-	now := define(`UPDATE rbac_roles SET permissions = '{cluster:view,cluster:login}' WHERE tenant = 't1' AND id = 'custom.widened'`,
+	define(`UPDATE rbac_roles SET permissions = '{cluster:view,cluster:login}' WHERE tenant = 't1' AND id = 'custom.widened'`,
 		`DELETE FROM rbac_roles WHERE tenant = 't1' AND id IN ('custom.deleted', 'custom.again')`,
 		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.again', '{cluster:view}', '{cluster}')`)
+	now := dbNow(t, h)
 	for _, at := range []struct {
 		name   string
 		at     time.Time
