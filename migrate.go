@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
 //go:embed migrations/*.sql
@@ -47,12 +46,16 @@ func Migrations() fs.FS {
 // in another order than the migration locks them would deadlock with it, and a transaction holding
 // one for long would stall every other. Migrate then rolls back and tries again, waiting longer
 // each time, up to 10 times over about 20 seconds, and then fails as ErrConflict: migrate again
-// once what held the table has ended. It waits for another replica's migration as long as it takes.
+// once what held the table has ended. On a host's transaction it does neither, as rolling back to
+// its savepoint frees nothing the host's transaction took before, which what the migration waits
+// for can be waiting for in turn: it waits as that transaction's lock_timeout says, for PostgreSQL
+// to end such a wait as a deadlock, and fails as ErrConflict where it ends the migration's. It
+// waits for another replica's migration as long as the session's lock_timeout lets it.
 func Migrate(ctx context.Context, db DB) error {
 	wait := migrateBackoff
 	for attempt := 1; ; attempt++ {
-		err := migrateOnce(ctx, db)
-		if attempt == migrateAttempts || !lockRefused(err) {
+		own, err := migrateOnce(ctx, db)
+		if !own || attempt >= migrateAttempts || !errors.Is(err, ErrConflict) {
 			return err
 		}
 		timer := time.NewTimer(wait)
@@ -77,22 +80,17 @@ var (
 	maxMigrateBackoff = 5 * time.Second
 )
 
-// lockRefused reports whether err is PostgreSQL refusing a lock: one waited for past lock_timeout,
-// or a deadlock it ended.
-func lockRefused(err error) bool {
-	var pg *pgconn.PgError
-	return errors.As(err, &pg) && (pg.Code == "55P03" || pg.Code == "40P01")
-}
-
-// migrateOnce applies what is pending in a transaction.
-func migrateOnce(ctx context.Context, db DB) error {
+// migrateOnce applies what is pending in a transaction, and reports whether it was one of its own
+// rather than a savepoint of the host's.
+func migrateOnce(ctx context.Context, db DB) (own bool, err error) {
 	// At READ COMMITTED, so a replica that waited for the lock reads the versions another applied
 	// meanwhile: a stricter snapshot, taken before the lock, would apply them again.
-	return begin(ctx, db, func(tx pgx.Tx) error {
+	err = beginOwn(ctx, db, func(tx pgx.Tx, fresh bool) error {
+		own = fresh
 		var schema *string
-		var level, conforming, lockTimeout string
+		var level, conforming string
 		if err := tx.QueryRow(ctx, `SELECT current_schema(), current_setting('transaction_isolation'),
-			current_setting('standard_conforming_strings'), current_setting('lock_timeout')`).Scan(&schema, &level, &conforming, &lockTimeout); err != nil {
+			current_setting('standard_conforming_strings')`).Scan(&schema, &level, &conforming); err != nil {
 			return err
 		}
 		if err := readCommitted("Migrate", level); err != nil {
@@ -135,9 +133,13 @@ func migrateOnce(ctx context.Context, db DB) error {
 		if err := tx.QueryRow(ctx, `SELECT coalesce(max(version), 0) FROM rbac_migrations`).Scan(&applied); err != nil {
 			return err
 		}
-		// From here, a lock it waits for is one the tables' readers and writers can hold.
-		if _, err := tx.Exec(ctx, `SELECT set_config('lock_timeout', $1, true)`, strconv.FormatInt(migrateLockWait.Milliseconds(), 10)+"ms"); err != nil {
-			return err
+		// From here, a lock it waits for is one the tables' readers and writers can hold. Bounded only
+		// in a transaction of its own, where giving way frees what it holds, and where the setting
+		// ends with it.
+		if own {
+			if _, err := tx.Exec(ctx, `SELECT set_config('lock_timeout', $1, true)`, strconv.FormatInt(migrateLockWait.Milliseconds(), 10)+"ms"); err != nil {
+				return err
+			}
 		}
 		fsys := Migrations()
 		names, err := fs.Glob(fsys, "*.sql")
@@ -164,13 +166,12 @@ func migrateOnce(ctx context.Context, db DB) error {
 				return err
 			}
 		}
-		// As they were, for what a host's transaction runs after.
-		if !standard {
-			if _, err := tx.Exec(ctx, `SELECT set_config('standard_conforming_strings', $1, true)`, conforming); err != nil {
-				return err
-			}
+		if standard {
+			return nil
 		}
-		_, err = tx.Exec(ctx, `SELECT set_config('lock_timeout', $1, true)`, lockTimeout)
+		// As it was, for what a host's transaction runs after.
+		_, err = tx.Exec(ctx, `SELECT set_config('standard_conforming_strings', $1, true)`, conforming)
 		return err
 	})
+	return own, err
 }

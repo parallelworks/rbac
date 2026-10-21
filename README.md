@@ -478,7 +478,13 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   the migration then waits for, is still ended as a deadlock where its `deadlock_timeout`, 1 second
   by default, passes before the migration's wait does, and a change ended so is refused as
   `rbac.ErrConflict`. A tool of the host's own gets none of this: apply each migration with a
-  short `lock_timeout`, and on SQLSTATE 55P03 or 40P01 roll it back and apply it again.
+  short `lock_timeout`, and on SQLSTATE 55P03 or 40P01 roll it back and apply it again. Nor does
+  `Migrate` on a host's transaction, as rolling back to its savepoint frees nothing the host's
+  transaction took before, which what the migration waits for can be waiting for in turn, as a
+  request that read the package's tables and then reads a table of the host's that transaction
+  altered: it waits as that transaction's `lock_timeout` says, for PostgreSQL to end such a wait as
+  a deadlock. On any connection, it waits for another replica's migration as long as the session's
+  `lock_timeout` lets it.
   A migration that rebuilds an index, as `0009_grant_seeks` rebuilds two of `rbac_grants`, locks
   the table until it commits, so checks, lists and changes wait for the rebuild; one that builds
   an index, as `0011_tenant_keys` builds three on `rbac_eligibilities` and `rbac_denies`, keeps

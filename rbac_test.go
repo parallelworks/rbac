@@ -3047,8 +3047,8 @@ func TestMigrateReadsItsMigrationsAsStandardSQL(t *testing.T) {
 	}
 }
 
-// Migrate bounds each lock its migrations wait for, whatever the session's lock_timeout, and leaves
-// a host's transaction with it as it was.
+// Migrate bounds the locks its migrations wait for only in a transaction of its own, and leaves a
+// host's transaction with its lock_timeout as it was.
 func TestMigrateLeavesAHostsLockTimeoutAsItWas(t *testing.T) {
 	ctx := t.Context()
 	tx, err := pgtest.Open(t, "").Begin(ctx)

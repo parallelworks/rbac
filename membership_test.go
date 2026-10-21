@@ -750,6 +750,73 @@ func TestMigrateGivesUpOnALockHeldTooLong(t *testing.T) {
 	}
 }
 
+// On a host's transaction, a table the migration waits for can be held by a transaction waiting
+// for what the host's transaction holds, which rolling back to Migrate's savepoint doesn't free:
+// Migrate waits there, so PostgreSQL ends the other as a deadlock, rather than give way until it
+// gives up while the other waits on.
+func TestMigrateOnAHostsTransactionLetsPostgreSQLEndADeadlockWithIt(t *testing.T) {
+	ctx := t.Context()
+	pool := pgtest.Open(t, "")
+	migrateFiles(t, pool, "", "0016")
+	recordMigrations(t, pool, "0016")
+	// So a Migrate that gave way would give up at once.
+	rbac.SetMigrateAttempts(t, 2, time.Millisecond)
+	if _, err := pool.Exec(ctx, `INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'u')`); err != nil {
+		t.Fatal(err)
+	}
+	host, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = host.Rollback(ctx) }()
+	if _, err := host.Exec(ctx, `UPDATE rbac_memberships SET note = 'host' WHERE principal = 'user:u'`); err != nil {
+		t.Fatal(err)
+	}
+	// Another has read rbac_denies, which 0016 locks, and waits for the row the host's changed.
+	other, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = other.Rollback(ctx) }()
+	if _, err := other.Exec(ctx, `SELECT FROM rbac_denies LIMIT 1`); err != nil {
+		t.Fatal(err)
+	}
+	pid := other.Conn().PgConn().PID()
+	done := make(chan struct{})
+	var waited error
+	go func() {
+		defer close(done)
+		_, waited = other.Exec(ctx, `UPDATE rbac_memberships SET note = 'other' WHERE principal = 'user:u'`)
+	}()
+	// Before other's rollback, its wait ends with the host's.
+	defer func() { _ = host.Rollback(ctx); <-done }()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		var waiting bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock')`, pid).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the other transaction never waited for the host's")
+		}
+	}
+	bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	migrated := rbac.Migrate(bounded, host)
+	if err := host.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	if migrated != nil {
+		t.Errorf("Migrate on the host's transaction: %v", migrated)
+	}
+	if pg := (*pgconn.PgError)(nil); !errors.As(waited, &pg) || pg.Code != "40P01" {
+		t.Errorf("the transaction waiting for the host's: %v", waited)
+	}
+}
+
 func TestLeavingATenantRemovesWhatItHeldThere(t *testing.T) {
 	h := grouped(t)
 	ctx := t.Context()
