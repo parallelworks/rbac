@@ -105,7 +105,8 @@ func TestADeclaredDoubleThatIsntFiniteFailsItsConditions(t *testing.T) {
 
 // A condition can make a double that isn't finite of finite ones, dividing by zero or converting
 // "NaN", which CEL orders and equates as false with anything: so comparing one fails too, and so
-// does keying a map by one, which CEL finds no key equal to, whatever the map holds.
+// do keying a map by one, which CEL finds no key equal to, whatever the map holds, and converting
+// one to a string, which compares as any string does.
 func TestADoubleAConditionMakesThatIsntFiniteFailsWhatComparesIt(t *testing.T) {
 	h := setup(t, func(c *rbac.Config) {
 		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
@@ -119,12 +120,12 @@ func TestADoubleAConditionMakesThatIsntFiniteFailsWhatComparesIt(t *testing.T) {
 	grants := []string{
 		ratio + ` < 0.5`, `!(` + ratio + ` >= 0.5)`, ratio + ` != 1.0`,
 		keyed + ` != {0.5: 1}`, `[` + keyed + `] != [{0.5: 1}]`, `!(0.5 in ` + keyed + `)`,
-		`[` + ratio + `].all(r, {r: 1} != {0.5: 1})`,
+		`[` + ratio + `].all(r, {r: 1} != {0.5: 1})`, `string(` + ratio + `) != "0.5"`,
 	}
 	denies := []string{
 		ratio + ` >= 0.5`, ratio + ` == 1.0`, `double(request.attributes.score) >= 0.5`,
 		keyed + ` == {0.5: 1}`, `{0.5: 1} == ` + keyed, `0.5 in {double(request.attributes.score): 1}`,
-		`[` + ratio + `].exists(r, {r: 1} == {0.5: 1})`,
+		`[` + ratio + `].exists(r, {r: 1} == {0.5: 1})`, `string(double(request.attributes.score)) == "0.5"`,
 	}
 	seeded := []rbac.Grant{grant(cluster.Scope(), "guard", rbac.User, "guardian")}
 	for i, expr := range grants {

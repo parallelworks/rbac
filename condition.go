@@ -35,16 +35,16 @@ import (
 // such as `request.time < timestamp("2027-01-01T00:00:00Z") && resource.attributes.env != "prod"`.
 // A grant with one gives its role only where the expression is true. An expression that fails, as
 // one reading an attribute the host didn't pass does, or comparing a double that isn't finite, as
-// dividing by zero makes, keying a map by one or comparing a map keyed by one, is false, though a
-// key not found `in` a map the host passes keyed by one is not found (Attributes). A label value
-// and a power to release are decided on the tenant with no attributes, whatever a check passes
-// (Holding), and their conditions can't read the tenant's: any read of resource.attributes fails,
-// a test of an attribute's presence, in, size(), a macro and a comparison included, so a grant's
-// gives nothing and a deny's applies. The zero Condition is none, and one with a title or
-// description has an expression. A pattern it matches is a string literal, of bounded size; it
-// nests at most 32 deep; it builds no message, as `google.protobuf.Struct{}`; and a comparison, or
-// a search of a list, that would read more than a condition may spend, or reading a time in a zone
-// whose name is longer than 64 bytes, fails before it runs.
+// dividing by zero makes, converting one to a string, keying a map by one or comparing a map keyed
+// by one, is false, though a key not found `in` a map the host passes keyed by one is not found
+// (Attributes). A label value and a power to release are decided on the tenant with no attributes,
+// whatever a check passes (Holding), and their conditions can't read the tenant's: any read of
+// resource.attributes fails, a test of an attribute's presence, in, size(), a macro and a
+// comparison included, so a grant's gives nothing and a deny's applies. The zero Condition is none,
+// and one with a title or description has an expression. A pattern it matches is a string literal,
+// of bounded size; it nests at most 32 deep; it builds no message, as `google.protobuf.Struct{}`;
+// and a comparison, or a search of a list, that would read more than a condition may spend, or
+// reading a time in a zone whose name is longer than 64 bytes, fails before it runs.
 //
 // Each condition runs within the most evaluating it can cost, which its literals and types bound:
 // little for one comparing what a request passes with literals, or with the subject's kind or id,
@@ -870,8 +870,8 @@ func comparing(function string, x, y ref.Val) uint64 {
 // bounded refuses, before running it, a comparison or a search in a list that would read more than
 // a condition may: one call reads it all, and a call's cost is counted only once it has run, so a
 // list a condition doubles cheaply would otherwise hold a check for as long as walking it takes.
-// It refuses a comparison of a double that isn't finite too (nonFinite), and a time read in a zone
-// of more than maxZone bytes (inZone).
+// It refuses a comparison of a double that isn't finite too (nonFinite), converting one to a string
+// (finiteString), and a time read in a zone of more than maxZone bytes (inZone).
 func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 	call, ok := i.(interpreter.InterpretableCall)
 	if !ok {
@@ -882,6 +882,9 @@ func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 			return i, nil
 		}
 		return inZone(call), nil
+	}
+	if call.Function() == overloads.TypeConvertString {
+		return finiteString(call), nil
 	}
 	// read is what comparing reads of the values.
 	var op func(x, y ref.Val, read uint64) ref.Val
@@ -945,6 +948,29 @@ func inZone(call interpreter.InterpretableCall) interpreter.InterpretableCall {
 			return types.MaybeNoSuchOverloadErr(args[0])
 		}
 		return t.Receive(function, overload, args[1:])
+	})
+}
+
+// finiteString is call, converting a value to a string as CEL does, failing for a double that isn't
+// finite, as int() and uint() of one do: "NaN" compares as any string does, so a deny's
+// `string(failed / total) == "0.5"` would lift where both are 0.0.
+func finiteString(call interpreter.InterpretableCall) interpreter.InterpretableCall {
+	return interpreter.NewCall(call.ID(), call.Function(), call.OverloadID(), call.Args(), func(args ...ref.Val) ref.Val {
+		if len(args) != 1 {
+			return types.NoSuchOverloadErr()
+		}
+		switch v := args[0].(type) {
+		case types.String:
+			return v
+		case types.Double:
+			if nonFinite(v) {
+				return types.NewErr("rbac: a double that isn't finite can't be converted to a string")
+			}
+		case types.Bool, types.Bytes, types.Duration, types.Int, types.Timestamp, types.Uint:
+		default:
+			return types.MaybeNoSuchOverloadErr(v)
+		}
+		return args[0].ConvertToType(types.StringType)
 	})
 }
 
