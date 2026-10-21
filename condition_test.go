@@ -1025,10 +1025,11 @@ func (f finds) Find(key ref.Val) (ref.Val, bool) {
 	return f.Mapper.Find(key)
 }
 
-// longKeys counts the lookups of a map by a key longer than a condition may cost to read.
+// longKeys counts the lookups of a map by a key of more than past bytes.
 type longKeys struct {
 	traits.Mapper
-	n *int
+	n    *int
+	past int
 }
 
 func (m longKeys) Find(key ref.Val) (ref.Val, bool) {
@@ -1042,7 +1043,7 @@ func (m longKeys) Get(key ref.Val) ref.Val {
 }
 
 func (m longKeys) count(key ref.Val) {
-	if s, ok := key.(types.String); ok && len(s) > 10*10000 {
+	if s, ok := key.(types.String); ok && len(s) > m.past {
 		*m.n++
 	}
 }
@@ -1051,7 +1052,7 @@ func (m longKeys) count(key ref.Val) {
 // though comparing them is charged only as far as the smaller reads: a long key of the larger,
 // found in a map literal or a large map the host passes, was hashed uncharged each time a loop
 // compared them, as was a key past what reading a map may cost, found in it to read its value.
-func TestComparingMapsFindsOnlyTheKeysOfTheSmaller(t *testing.T) {
+func TestComparingMapsFindsNoKeyLongerThanTheSmallerHolds(t *testing.T) {
 	long := strings.Repeat("k", 10*10000+1)
 	for expr, holds := range map[string]bool{
 		`request.attributes.long != request.attributes.short`:               true,
@@ -1062,14 +1063,71 @@ func TestComparingMapsFindsOnlyTheKeysOfTheSmaller(t *testing.T) {
 	} {
 		n := 0
 		attributes := map[string]any{
-			"long":  longKeys{types.NewStringInterfaceMap(types.DefaultTypeAdapter, map[string]any{long: 1}), &n},
-			"short": longKeys{types.NewStringInterfaceMap(types.DefaultTypeAdapter, map[string]any{"a": 1}), &n},
+			"long":  longKeys{types.NewStringInterfaceMap(types.DefaultTypeAdapter, map[string]any{long: 1}), &n, len(long) - 1},
+			"short": longKeys{types.NewStringInterfaceMap(types.DefaultTypeAdapter, map[string]any{"a": 1}), &n, len(long) - 1},
 		}
 		if held, evaluated, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || !evaluated || held != holds {
 			t.Errorf("%s: held %t, evaluated %t, %v", expr, held, evaluated, err)
 		}
 		if n > 0 {
 			t.Errorf("%s found a key of %d bytes %d times", expr, len(long), n)
+		}
+	}
+	// Nor does a search find a key once for each of many maps smaller than it, which it is charged
+	// for reading together.
+	n, key := 0, strings.Repeat("k", 5000)
+	small := make([]any, 2000)
+	for i := range small {
+		small[i] = longKeys{types.NewStringInterfaceMap(types.DefaultTypeAdapter, map[string]any{"a": 1}), &n, len(key) - 1}
+	}
+	expr := `request.attributes.long in request.attributes.small`
+	if held, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"long": map[string]any{key: 1}, "small": small}); err != nil || !evaluated || held {
+		t.Errorf("%s: held %t, evaluated %t, %v", expr, held, evaluated, err)
+	}
+	if n > 0 {
+		t.Errorf("%s found a key of %d bytes %d times", expr, len(key), n)
+	}
+}
+
+// Comparing maps decides as CEL does, though it finds no key longer than the smaller value holds:
+// it finds the keys of the left in the right. Where a map holds keys CEL counts as equal, as 1 and
+// 1u, or a double, which finds an int key though no int finds a double key, finding the right's
+// keys in the left instead decided otherwise, and a grant's comparison held where CEL's doesn't.
+func TestComparingMapsDecidesAsCELDoes(t *testing.T) {
+	env, err := cel.NewEnv(cel.Variable("request", cel.MapType(cel.StringType, cel.DynType)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	same := map[any]any{int64(1): "aaaaaaaaaaaa", uint64(1): "aaaaaaaaaaaa"}
+	for _, c := range []struct {
+		expr string
+		m    any
+	}{
+		{`{1: "aaaaaaaaaaaa", dyn(1u): "aaaaaaaaaaaa"} == {1: "aaaaaaaaaaaa", 2: "b"}`, nil},
+		{`{1: "a", 2: "bbbbbbbbbbbb"} == {1: "a", dyn(1u): "a"}`, nil},
+		{`{1: "a", 2: "bbbbbbbbbbbb"} != {1: "a", dyn(1u): "a"}`, nil},
+		{`[{1: "a", 2: "bbbbbbbbbbbb"}] == [{1: "a", dyn(1u): "a"}]`, nil},
+		{`{"k": {1: "a", 2: "bbbbbbbbbbbb"}} == {"k": {1: "a", dyn(1u): "a"}}`, nil},
+		{`{1: "a", 2: "bbbbbbbbbbbb"} in [{1: "a", dyn(1u): "a"}]`, nil},
+		{`request.attributes.m == {1: "aaaaaaaaaaaa", 2: "b"}`, same},
+		{`request.attributes.m in [{1: "aaaaaaaaaaaa", 2: "b"}]`, same},
+		{`request.attributes.m in [{1: "a"}]`, map[float64]any{1: "a"}},
+	} {
+		checked, iss := env.Compile(c.expr)
+		if iss.Err() != nil {
+			t.Fatal(iss.Err())
+		}
+		prg, err := env.Program(checked)
+		if err != nil {
+			t.Fatal(err)
+		}
+		attributes := map[string]any{"m": c.m}
+		out, _, err := prg.Eval(map[string]any{"request": map[string]any{"attributes": attributes}})
+		if err != nil {
+			t.Fatalf("%s: %v", c.expr, err)
+		}
+		if held, evaluated, _, err := rbac.EvaluateCondition(t, c.expr, attributes); err != nil || !evaluated || held != out.Value() {
+			t.Errorf("%s: held %t, evaluated %t, %v; CEL decides %v", c.expr, held, evaluated, err, out)
 		}
 	}
 }
