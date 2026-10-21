@@ -75,6 +75,7 @@ func (e *InvalidError) Unwrap() error { return e.Err }
 // Config.ValidateGrant run before the transaction, on what the Authorizer runs on;
 // Config.OnChange runs in it with the grants that changed.
 func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Change) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, on.Tenant, actor.Principal, "Apply")
 	if err := a.check(on); err != nil {
 		return err
@@ -469,6 +470,7 @@ func readCommitted(what, level string) error {
 // bounded as Apply bounds them. Grants from SourceActivation are refused, as only Activate makes
 // them: a restore leaves them out.
 func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string, grants []Grant) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "Import")
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -1556,6 +1558,7 @@ func (a *Authorizer) mayChangeBy(au authority, on Resource, grants, revokes []Bi
 // Grantable lists the roles the subject may grant on r, unconditionally and for good, built-in
 // ones in catalog order and then the tenant's custom ones, for an access screen to offer.
 func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]RoleDefinition, error) {
+	a = a.still()
 	if err := a.check(r); err != nil {
 		return nil, err
 	}
@@ -1706,6 +1709,10 @@ func (a *Authorizer) inTxGaining(ctx context.Context, tenant string, actor Princ
 func (a *Authorizer) begin(ctx context.Context, fn func(pgx.Tx) error) error {
 	if err := a.writable(); err != nil {
 		return err
+	}
+	// The transaction decides again under its locks, so at a time it reads then (callClock).
+	if a.clock != nil {
+		a.clock.read = false
 	}
 	return begin(ctx, a.db, fn)
 }
@@ -2190,6 +2197,7 @@ func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) (
 // and principals until the transaction ends, or past 64 the tenant, as Import does. A scope of a
 // type the host doesn't have is refused as invalid, as DeleteScopes refuses it.
 func (a *Authorizer) DeleteGrants(ctx context.Context, actor Principal, tenant string, grants []Grant) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "DeleteGrants")
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -2255,6 +2263,7 @@ func (a *Authorizer) DeleteGrants(ctx context.Context, actor Principal, tenant s
 
 // DeleteScope removes every grant, eligibility and deny on a scope, as DeleteScopes does.
 func (a *Authorizer) DeleteScope(ctx context.Context, actor Principal, tenant string, s Scope) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "DeleteScope")
 	return a.deleteScopes(ctx, actor, tenant, "DeleteScope", []Scope{s})
 }
@@ -2274,6 +2283,7 @@ func (a *Authorizer) DeleteScope(ctx context.Context, actor Principal, tenant st
 // lists a permission of it, so to retire a type, keep one listed there until its scopes are
 // deleted; DeletePrincipal, DeletePrincipalEverywhere and DeleteTenant remove grants on any type.
 func (a *Authorizer) DeleteScopes(ctx context.Context, actor Principal, tenant string, scopes []Scope) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "DeleteScopes")
 	return a.deleteScopes(ctx, actor, tenant, "DeleteScopes", scopes)
 }
@@ -2304,6 +2314,7 @@ func (a *Authorizer) deleteScopes(ctx context.Context, actor Principal, tenant, 
 // groups out of them: an eligibility only it approves goes too, rather than activate without
 // approval. A deny naming it still binds it, as it would if it joined again.
 func (a *Authorizer) DeletePrincipal(ctx context.Context, actor Principal, tenant string, p Principal) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "DeletePrincipal")
 	if !p.wellFormed(tenant) {
 		return fmt.Errorf("%w: principal %q is not valid", ErrInvalid, p.key())
@@ -2337,6 +2348,7 @@ func leaving(p Principal) deletion {
 // removes the rest. Under WithTx every batch is in the host's transaction, and its locks last until
 // that ends.
 func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Principal) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, "", actor, "DeletePrincipalEverywhere")
 	// A group is its tenant's alone: one with its id elsewhere is another.
 	if p.broad() || p.Kind == Group || !p.wellFormed("") {
@@ -2410,6 +2422,7 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Pri
 // DeleteTenant removes every grant, eligibility, custom role, deny, membership and group in a
 // tenant, as actor, so a tenant created later with its id starts with none.
 func (a *Authorizer) DeleteTenant(ctx context.Context, actor Principal, tenant string) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "DeleteTenant")
 	return a.delete(ctx, actor, tenant, "DeleteTenant", func(tx pgx.Tx) error { return lockTenant(ctx, tx, tenant) },
 		deletion{roles: true, groups: true, denies: true, where: "TRUE", members: "TRUE"})

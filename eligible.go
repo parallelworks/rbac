@@ -106,6 +106,7 @@ func (a *Authorizer) checkEligibility(e Eligibility) error {
 // a role on a scope are bounded together, as activating evaluates those of each group it is in
 // (Condition): a group's past that is refused as invalid.
 func (a *Authorizer) SetEligibility(ctx context.Context, actor Subject, on Resource, e Eligibility) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, on.Tenant, actor.Principal, "SetEligibility")
 	if err := a.check(on); err != nil {
 		return err
@@ -200,6 +201,7 @@ func (a *Authorizer) requirementsBounded(ctx context.Context, tx pgx.Tx, tenant 
 // DeleteEligibility ends a principal's eligibility to activate a role on a scope, as actor, who
 // needs what revoking the role there would. Grants activated from it keep their own ends.
 func (a *Authorizer) DeleteEligibility(ctx context.Context, actor Subject, on Resource, role Role, p Principal) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, on.Tenant, actor.Principal, "DeleteEligibility")
 	if err := a.check(on); err != nil {
 		return err
@@ -258,6 +260,7 @@ type Activation struct {
 // through those alone, so a change ending one of them sooner waits for it, and cuts the activation
 // short if it rests on that place.
 func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act Activation) (g Grant, err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, on.Tenant, s.Principal, "Activate")
 	if err := a.check(on); err != nil {
 		return Grant{}, err
@@ -367,7 +370,6 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 			return ChangeEvent{}, err
 		}
 		if len(granted) == 0 {
-			// By its key, not through Grants, which reads the clock again and could find it ended since.
 			rows, err := tx.Query(ctx, `SELECT `+grantColumns+` FROM rbac_grants
 				WHERE tenant = $1 AND principal = $2 AND scope = $3 AND role = $4 AND source = $5`,
 				on.Tenant, s.Principal.key(), scope.Key(), act.Role, SourceActivation)
@@ -393,6 +395,7 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 // needs no permission, and no constraint stops it: s gives up only access it activated. A scope of
 // a type the host doesn't have is refused as invalid, as a typo, as Activate refuses it.
 func (a *Authorizer) Deactivate(ctx context.Context, s Subject, on Resource, role Role) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, on.Tenant, s.Principal, "Deactivate")
 	if err := a.check(on); err != nil {
 		return err

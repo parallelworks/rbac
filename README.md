@@ -519,7 +519,10 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   identity in 1,000 groups, a check took 550 ms, and 120 ms with JIT off, and Activate's statement
   spent 500 of its 650 ms compiling.
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
-  to run on a schedule, passing over what a change holds until the next run.
+  to run on a schedule, passing over what a change holds until the next run. A call reads
+  `Config.Now` once, which every expiry it compares and every condition's `request.time` read, so a
+  grant or a membership ending as it runs can't meet a deny, a condition or label values of a later
+  moment; a change reads it again under its locks, where it decides again.
 
 ## Development
 

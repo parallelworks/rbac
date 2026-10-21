@@ -737,7 +737,11 @@ type Config struct {
 	// host's transaction, which is still open, with its locks. Record it on a connection of the
 	// host's own, which the host's transaction rolling back leaves.
 	OnRefused func(ctx context.Context, r Refusal)
-	// Now is the clock that grant expiry is compared with; time.Now when nil.
+	// Now is the clock that expiry is compared with and conditions read as request.time; time.Now
+	// when nil. A call reads it once, where it first needs the time, so every statement it makes and
+	// every condition it evaluates are of one moment: read apart, a grant or a membership ending as
+	// the call runs could meet a deny, a condition or label values of a later moment. A change reads
+	// it once more in its transaction, under its locks, where it decides again.
 	Now func() time.Time
 }
 
@@ -773,6 +777,8 @@ type Authorizer struct {
 	conds        *conditions
 	// labels are the label dimensions (Config.Labels), by name.
 	labels map[string]labelDimension
+	// clock is the time the call under way decides at (still), nil outside one.
+	clock *callClock
 }
 
 // permissionOn is a permission on a type of resource.
@@ -935,6 +941,36 @@ func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 	b := *a
 	b.db = tx
 	return &b
+}
+
+// still returns a for one call, deciding at one time (callClock); under a call already, a.
+func (a *Authorizer) still() *Authorizer {
+	if a.clock != nil {
+		return a
+	}
+	b := *a
+	b.clock = &callClock{host: a.cfg.Now}
+	b.cfg.Now = b.clock.now
+	return &b
+}
+
+// callClock is the time a call decides at: the host's clock read once, where the call first needs
+// the time, so every statement it makes and the request.time of every condition it evaluates are
+// of one moment. Read apart, a grant or a membership expiring between two readings could meet a
+// condition, a deny or label values of a later moment in an answer no single moment gave. A change
+// reads it again in its transaction (begin), which first needs it under its locks, where it decides
+// again by what committed before them.
+type callClock struct {
+	host func() time.Time
+	at   time.Time
+	read bool
+}
+
+func (c *callClock) now() time.Time {
+	if !c.read {
+		c.at, c.read = c.host(), true
+	}
+	return c.at
 }
 
 // GrantInput is a grant Config.ValidateGrant is asked about.

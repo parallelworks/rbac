@@ -354,6 +354,7 @@ func canonical(r RoleDefinition) RoleDefinition {
 // counts once for each (Condition), would leave theirs costing more than a check may spend, as
 // granting it so would be refused.
 func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, r RoleDefinition) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "SetRole")
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -539,6 +540,7 @@ func (a *Authorizer) tenantBuckets(ctx context.Context, q DB, tenant string, id 
 // tenant, or granted meanwhile on a scope of a type the constraints weren't asked about, is
 // refused, as in SetRole.
 func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant string, id Role) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "DeleteRole")
 	if !validID(tenant) || !isCustom(id) || !validText(string(id)) {
 		return fmt.Errorf("%w: only a tenant's custom role can be deleted", ErrInvalid)

@@ -174,6 +174,7 @@ func (a *Authorizer) checkMembership(m Membership, now time.Time) error {
 // whose policy decides by membership, as none privileged for a guest, checks what one holds when
 // it makes it a guest or lifts its suspension.
 func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant string, ms []Membership) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "SetMemberships")
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -406,6 +407,7 @@ func checkGroup(g GroupDefinition) error {
 // by its label, nor by the group's, as Config.ResourceOf gives the group. A group from a source the
 // host owns (Config.Sources) only the host changes, with ImportGroups.
 func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string, g GroupDefinition) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "SetGroup")
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -457,6 +459,7 @@ func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string,
 // the tenant made, from one of Config.Sources, removes the members it has from no source of the
 // host's, which ChangeEvent.Left reports.
 func (a *Authorizer) ImportGroups(ctx context.Context, actor Principal, tenant string, groups []GroupDefinition) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "ImportGroups")
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -577,6 +580,7 @@ func upsertGroups(ctx context.Context, tx pgx.Tx, tenant string, actor Principal
 // exist does nothing, and asks Config.ResourceOf nothing of it; one the host no longer has
 // (ErrNotFound) it reads as unlabeled, as a removal reads any scope.
 func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id string) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "DeleteGroup")
 	if !validID(tenant) || !validGroupID(id) {
 		return fmt.Errorf("%w: DeleteGroup needs a tenant and a valid group", ErrInvalid)
@@ -746,6 +750,7 @@ func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string
 // rather than activate without approval. The activations its members made through it, or a group
 // it is in, are cut short or end, as by their leaving it, which DeleteGroup refuses instead.
 func (a *Authorizer) DeleteGroups(ctx context.Context, actor Principal, tenant string, ids []string) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "DeleteGroups")
 	if len(ids) > MaxBindings {
 		return fmt.Errorf("%w: a deletion names at most %d groups", ErrInvalid, MaxBindings)
@@ -1123,6 +1128,7 @@ func keyedAll(members []Member) error {
 // about each grant and eligibility a member gains, as with ChangeMembers, so about none of a place
 // made to end sooner, or whose note alone changes.
 func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant string, members []Member) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "ImportMembers")
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -1371,6 +1377,7 @@ func (a *Authorizer) placesBounded(ctx context.Context, tx pgx.Tx, tenant string
 // (ErrNotFound) as unlabeled. Members from a source the host owns, and the members of a group from
 // one, only the host changes, and what ImportMembers refuses, this does.
 func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant string, add, remove []Member) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "ChangeMembers")
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -2407,6 +2414,7 @@ var nestingDepths = `
 // DeleteMembers removes members from a tenant's groups, each by its group, principal and source,
 // as actor: the host's own write, as for a directory it syncs from.
 func (a *Authorizer) DeleteMembers(ctx context.Context, actor Principal, tenant string, members []Member) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "DeleteMembers")
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
