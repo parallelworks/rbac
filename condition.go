@@ -478,7 +478,8 @@ func (c costs) CallCost(function, _ string, args []ref.Val, _ ref.Val) *uint64 {
 		if len(args) != 2 {
 			return nil
 		}
-		n += comparing(function, args[0], args[1])
+		c, _ := comparing(function, args[0], args[1])
+		n += c
 	case operators.Add, overloads.Size, overloads.TypeConvertInt, overloads.TypeConvertUint, overloads.TypeConvertDouble,
 		overloads.TypeConvertBool, overloads.TypeConvertString, overloads.TypeConvertBytes,
 		overloads.TypeConvertTimestamp, overloads.TypeConvertDuration:
@@ -855,15 +856,16 @@ func added(x, y extent) extent {
 func sized(x extent) uint64 { return max(x.bytes, x.length) }
 
 // comparing is what comparing x with y, or finding x in y, reads, counted no further than past
-// maxCost. Comparing stops at the smaller value; a map finds a key without reading the rest.
-func comparing(function string, x, y ref.Val) uint64 {
+// maxCost, and for a comparison whether y is the smaller. Comparing stops at the smaller value; a
+// map finds a key without reading the rest.
+func comparing(function string, x, y ref.Val) (uint64, bool) {
 	if function != operators.In {
 		return smaller(x, y, maxCost)
 	}
 	if _, isMap := y.(traits.Mapper); isMap {
-		return valueSize(x, maxCost)
+		return valueSize(x, maxCost), false
 	}
-	return valueSize(y, maxCost)
+	return valueSize(y, maxCost), false
 }
 
 // bounded refuses, before running it, a comparison or a search in a list that would read more than
@@ -882,20 +884,21 @@ func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 		}
 		return inZone(call), nil
 	}
-	var op func(x, y ref.Val) ref.Val
+	// byY is whether y is the smaller of two values compared.
+	var op func(x, y ref.Val, byY bool) ref.Val
 	switch call.Function() {
 	case operators.Equals:
 		op = equal
 	case operators.NotEquals:
-		op = func(x, y ref.Val) ref.Val {
-			eq := equal(x, y)
+		op = func(x, y ref.Val, byY bool) ref.Val {
+			eq := equal(x, y, byY)
 			if b, ok := eq.(types.Bool); ok {
 				return !b
 			}
 			return eq
 		}
 	case operators.In:
-		op = func(x, y ref.Val) ref.Val {
+		op = func(x, y ref.Val, _ bool) ref.Val {
 			if l, ok := y.(traits.Lister); ok {
 				return contains(l, x)
 			}
@@ -905,7 +908,8 @@ func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 			return types.NoSuchOverloadErr()
 		}
 	case operators.Less, operators.LessEquals, operators.Greater, operators.GreaterEquals:
-		op = ordering(call.Function())
+		order := ordering(call.Function())
+		op = func(x, y ref.Val, _ bool) ref.Val { return order(x, y) }
 	default:
 		return i, nil
 	}
@@ -914,13 +918,14 @@ func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 		if len(args) != 2 {
 			return types.NoSuchOverloadErr()
 		}
-		if comparing(function, args[0], args[1]) > maxCost {
+		n, byY := comparing(function, args[0], args[1])
+		if n > maxCost {
 			return types.NewErr("rbac: comparing values this large costs more than a condition may")
 		}
 		if nonFinite(args[0]) || nonFinite(args[1]) {
 			return incomparable()
 		}
-		return op(args[0], args[1])
+		return op(args[0], args[1], byY)
 	}), nil
 }
 
@@ -1289,8 +1294,11 @@ func incomparable() ref.Val {
 
 // equal is x == y, failing where comparing values a map or list holds fails, as reading a
 // declared attribute passed as another type does: CEL's own comparison of maps and lists counts
-// such a value as equal, so that a map holding one would equal any map with its keys.
-func equal(x, y ref.Val) ref.Val {
+// such a value as equal, so that a map holding one would equal any map with its keys. It finds the
+// keys of y's maps in x's where byY, as y is the smaller, rather than x's in y's: finding a key
+// hashes it whole, and a comparison is charged only as far as the smaller value reads, so a long
+// key of the larger would be hashed uncharged.
+func equal(x, y ref.Val, byY bool) ref.Val {
 	if types.IsUnknownOrError(x) {
 		return x
 	}
@@ -1307,7 +1315,7 @@ func equal(x, y ref.Val) ref.Val {
 	}
 	var failed ref.Val
 	same := func(a, b ref.Val) bool {
-		eq := equal(a, b)
+		eq := equal(a, b, byY)
 		if eq != types.False && eq != types.True && failed == nil {
 			failed = eq
 		}
@@ -1319,13 +1327,21 @@ func equal(x, y ref.Val) ref.Val {
 		if !ok || xs.Size() != ys.Size() {
 			return types.Equal(x, y)
 		}
-		for it := xs.Iterator(); it.HasNext() == types.True; {
+		from, in := xs, ys
+		if byY {
+			from, in = ys, xs
+		}
+		for it := from.Iterator(); it.HasNext() == types.True; {
 			k := it.Next()
-			b, found := ys.Find(k)
+			b, found := in.Find(k)
 			if !found {
 				return types.False
 			}
-			if a, _ := xs.Find(k); !same(a, b) {
+			a, _ := from.Find(k)
+			if byY {
+				a, b = b, a
+			}
+			if !same(a, b) {
 				return types.False
 			}
 		}
@@ -1349,11 +1365,12 @@ func equal(x, y ref.Val) ref.Val {
 	return types.True
 }
 
-// contains is x in l, failing where comparing x with a value l holds fails and none equals it.
+// contains is x in l, failing where comparing x with a value l holds fails and none equals it. It
+// finds the keys of l's values in x, as it is charged for reading l.
 func contains(l traits.Lister, x ref.Val) ref.Val {
 	var failed ref.Val
 	for it := l.Iterator(); it.HasNext() == types.True; {
-		switch eq := equal(x, it.Next()); {
+		switch eq := equal(x, it.Next(), true); {
 		case eq == types.True:
 			return eq
 		case eq != types.False && failed == nil:
@@ -1366,14 +1383,14 @@ func contains(l traits.Lister, x ref.Val) ref.Val {
 	return types.False
 }
 
-// smaller is the smaller of two values' sizes, counted no further than past limit. It reads both
-// as far as each other, doubling how far until one is read whole, so that charging for comparing a
-// large value with a small one, which is cheap, is cheap too.
-func smaller(x, y ref.Val, limit uint64) uint64 {
+// smaller is the smaller of two values' sizes, counted no further than past limit, and whether it
+// is y's. It reads both as far as each other, doubling how far until one is read whole, so that
+// charging for comparing a large value with a small one, which is cheap, is cheap too.
+func smaller(x, y ref.Val, limit uint64) (uint64, bool) {
 	for l := uint64(1); ; l = min(2*l, limit) {
 		sx, sy := valueSize(x, l), valueSize(y, l)
 		if sx <= l || sy <= l || l == limit {
-			return min(sx, sy)
+			return min(sx, sy), sy < sx
 		}
 	}
 }
@@ -1391,7 +1408,10 @@ func valueSize(v ref.Val, limit uint64) uint64 {
 		}
 		for it := v.Iterator(); n <= limit && it.HasNext() == types.True; {
 			k := it.Next()
-			n += valueSize(k, limit-n) + valueSize(v.Get(k), limit-n)
+			// Finding the value hashes the key whole, so a key past limit is left unfound.
+			if n += valueSize(k, limit-n); n <= limit {
+				n += valueSize(v.Get(k), limit-n)
+			}
 		}
 	case traits.Lister:
 		if least := n + count(v); least > limit {

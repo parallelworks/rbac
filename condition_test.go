@@ -1021,6 +1021,55 @@ func (f finds) Find(key ref.Val) (ref.Val, bool) {
 	return f.Mapper.Find(key)
 }
 
+// longKeys counts the lookups of a map by a key longer than a condition may cost to read.
+type longKeys struct {
+	traits.Mapper
+	n *int
+}
+
+func (m longKeys) Find(key ref.Val) (ref.Val, bool) {
+	m.count(key)
+	return m.Mapper.Find(key)
+}
+
+func (m longKeys) Get(key ref.Val) ref.Val {
+	m.count(key)
+	return m.Mapper.Get(key)
+}
+
+func (m longKeys) count(key ref.Val) {
+	if s, ok := key.(types.String); ok && len(s) > 10*10000 {
+		*m.n++
+	}
+}
+
+// Finding a key in a map hashes it whole, and comparing maps finds the keys of one in the other,
+// though comparing them is charged only as far as the smaller reads: a long key of the larger,
+// found in a map literal or a large map the host passes, was hashed uncharged each time a loop
+// compared them, as was a key past what reading a map may cost, found in it to read its value.
+func TestComparingMapsFindsOnlyTheKeysOfTheSmaller(t *testing.T) {
+	long := strings.Repeat("k", 10*10000+1)
+	for expr, holds := range map[string]bool{
+		`request.attributes.long != request.attributes.short`:               true,
+		`request.attributes.short != request.attributes.long`:               true,
+		`request.attributes.long in [request.attributes.short]`:             false,
+		`[request.attributes.long] == [request.attributes.short]`:           false,
+		`{"a": request.attributes.long} != {"a": request.attributes.short}`: true,
+	} {
+		n := 0
+		attributes := map[string]any{
+			"long":  longKeys{types.NewStringInterfaceMap(types.DefaultTypeAdapter, map[string]any{long: 1}), &n},
+			"short": longKeys{types.NewStringInterfaceMap(types.DefaultTypeAdapter, map[string]any{"a": 1}), &n},
+		}
+		if held, evaluated, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || !evaluated || held != holds {
+			t.Errorf("%s: held %t, evaluated %t, %v", expr, held, evaluated, err)
+		}
+		if n > 0 {
+			t.Errorf("%s found a key of %d bytes %d times", expr, len(long), n)
+		}
+	}
+}
+
 // iterated counts the elements a loop over a list takes.
 type iterated struct {
 	traits.Lister
