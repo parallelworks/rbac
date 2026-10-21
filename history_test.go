@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2647,6 +2648,131 @@ func TestAChangeAsOfATimeIsNotReportedRefused(t *testing.T) {
 	}
 	if len(refused) != 0 {
 		t.Fatalf("reported %+v", refused)
+	}
+}
+
+// transactions is a tracer telling of each statement beginning or rolling back a transaction.
+type transactions func(sql string)
+
+func (f transactions) TraceQueryStart(ctx context.Context, _ *pgx.Conn, d pgx.TraceQueryStartData) context.Context {
+	if strings.HasPrefix(d.SQL, "begin") || strings.HasPrefix(d.SQL, "rollback") {
+		f(strings.Fields(d.SQL)[0])
+	}
+	return ctx
+}
+
+func (transactions) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+// A change refused under its locks before it reads the clock there is dated by a reading it takes
+// there, where it decided: not its reading from before them, nor one taken once its transaction
+// ended.
+func TestARefusalIsDatedTheTimeTheChangeDecidedAt(t *testing.T) {
+	var mu sync.Mutex
+	var log, told []string
+	var refused []rbac.Refusal
+	readings := 0
+	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	pool := pgtest.Open(t, "")
+	cfg := pool.Config()
+	cfg.ConnConfig.Tracer = transactions(func(sql string) {
+		mu.Lock()
+		defer mu.Unlock()
+		log = append(log, sql)
+	})
+	traced, err := pgxpool.NewWithConfig(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(traced.Close)
+	h := setupOn(t, traced, func(c *rbac.Config) {
+		c.Now = func() time.Time {
+			mu.Lock()
+			defer mu.Unlock()
+			at := base.Add(time.Duration(readings) * time.Minute)
+			readings++
+			log = append(log, at.Format(time.Kitchen))
+			return at
+		}
+		c.OnRefused = func(_ context.Context, r rbac.Refusal) {
+			mu.Lock()
+			defer mu.Unlock()
+			refused, told = append(refused, r), slices.Clone(log)
+		}
+	})
+	owner := h.as(t, "owner")
+	// The group is looked for under the locks, which need no time.
+	nosuch := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.Group, ID: "nosuch"}}}}
+	if err := h.authz.Apply(t.Context(), owner, cluster, nosuch); !errors.Is(err, rbac.ErrInvalid) || len(refused) != 1 {
+		t.Fatalf("Apply = %v, reported %+v", err, refused)
+	}
+	if n := len(told); n < 3 || told[n-3] != "begin" || told[n-2] != refused[0].At.Format(time.Kitchen) || told[n-1] != "rollback" {
+		t.Errorf("the refusal is dated %s, by the clock read and transactions begun and rolled back %v", refused[0].At.Format(time.Kitchen), told)
+	}
+}
+
+// A change refused under its locks by what committed while it waited for them is dated no earlier
+// than that: its reading from before them can be.
+func TestARefusalIsDatedAfterWhatTheChangeWaitedFor(t *testing.T) {
+	var mu sync.Mutex
+	var refused []rbac.Refusal
+	readings := 0
+	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	now := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		readings++
+		return base.Add(time.Duration(readings) * time.Minute)
+	}
+	h := setup(t, func(c *rbac.Config) {
+		c.Now = now
+		c.OnRefused = func(_ context.Context, r rbac.Refusal) {
+			mu.Lock()
+			defer mu.Unlock()
+			refused = append(refused, r)
+		}
+	})
+	ctx := t.Context()
+	owner := h.as(t, "owner")
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "ops"}}); err != nil {
+		t.Fatal(err)
+	}
+	// The group is deleted in a transaction that holds it until it commits.
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := h.authz.WithTx(tx).DeleteGroups(ctx, host, "t1", []string{"ops"}); err != nil {
+		t.Fatal(err)
+	}
+	var pid int
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	ops := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.Group, ID: "ops"}}}}
+	go func() { done <- h.authz.Apply(ctx, owner, cluster, ops) }()
+	for waiting := false; !waiting; {
+		select {
+		case err := <-done:
+			t.Fatalf("Apply waited for nothing the deletion holds: %v", err)
+		default:
+		}
+		if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deleted := now()
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("Apply to a group deleted while it waited = %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(refused) != 1 || refused[0].At.Before(deleted) {
+		t.Errorf("a change refused once the group was deleted at %v is dated %+v", deleted, refused)
 	}
 }
 

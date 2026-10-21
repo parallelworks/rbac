@@ -429,6 +429,35 @@ func TestALabelValueIsDeniedOnTheTenantAlone(t *testing.T) {
 	}
 }
 
+// A container takes every role but those giving a label value or a power to release, which are
+// held on the tenant alone, as BuiltinRoles lists them and a grant is checked; the tenant takes
+// every one.
+func TestAContainerTakesEveryRoleButThoseGivingLabelValues(t *testing.T) {
+	h := labeled(t, banks)
+	ids := func(roles []rbac.RoleDefinition) []rbac.Role {
+		var ids []rbac.Role
+		for _, r := range roles {
+			ids = append(ids, r.ID)
+		}
+		return ids
+	}
+	if got, want := ids(h.authz.BuiltinRoles("workspace")), ids(catalog); !slices.Equal(got, want) {
+		t.Errorf("BuiltinRoles(workspace) = %v, not every role but those giving label values, %v", got, want)
+	}
+	if got, want := ids(h.authz.BuiltinRoles(rbac.TenantScope)), ids(h.cfg.Catalog); !slices.Equal(got, want) {
+		t.Errorf("BuiltinRoles(tenant) = %v, not every role, %v", got, want)
+	}
+	ctx := t.Context()
+	for _, role := range []rbac.Role{"level.low", "bank.release"} {
+		if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{grant(workspace.Scope(), role, rbac.User, "u")}); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("granting %s on a workspace: %v", role, err)
+		}
+		if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{grant(rbac.TenantRoot("t1"), role, rbac.User, "u")}); err != nil {
+			t.Errorf("granting %s on the tenant: %v", role, err)
+		}
+	}
+}
+
 func TestFilterKeepsWhatTheLabelAllows(t *testing.T) {
 	h := labeled(t)
 	ctx := t.Context()

@@ -436,10 +436,12 @@ type Grant struct {
 // A grant is one role to one principal from one source, until one time, under one condition, as
 // in cloud IAM: granting the same again changes only its note and its condition's title and
 // description, and a grant that differs in any of these is another, beside it, so granting never
-// narrows what a principal holds. A revoke removes every grant of its role to its principal from
-// its source, whatever their expiry and condition, or with an ID that one grant. Revokes apply
-// first, sparing grants the change makes again, so revoking and granting a role at once replaces
-// its grants with those granted.
+// narrows what a principal holds. Conditions are told apart by their length and 64-bit hash, so a
+// grant whose condition shares both with another's, stored or granted with it, of the same role,
+// principal, source and end can't stand beside it, and is invalid. A revoke removes every grant of
+// its role to its principal from its source, whatever their expiry and condition, or with an ID
+// that one grant. Revokes apply first, sparing grants the change makes again, so revoking and
+// granting a role at once replaces its grants with those granted.
 type Change struct {
 	Grant  []Binding
 	Revoke []Binding
@@ -646,8 +648,9 @@ type DB interface {
 type Config struct {
 	// Catalog is the built-in roles.
 	Catalog []RoleDefinition
-	// ContainerTypes are scope types that hold resources, such as a workspace. Any role can
-	// be granted on one, and applies to the resources under it.
+	// ContainerTypes are scope types that hold resources, such as a workspace. Any role but one
+	// giving a label value or a power to release, which is for the tenant alone, can be granted on
+	// one, and applies to the resources under it.
 	ContainerTypes []string
 	// PrincipalKinds are the kinds of identity besides users that act and are granted roles,
 	// such as service accounts. Groups, a tenant's members and the public need no declaring, and

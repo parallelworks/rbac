@@ -556,5 +556,6 @@ func (a *Authorizer) refused(ctx context.Context, err *error, tenant string, act
 		return
 	}
 	audit, _ := ctx.Value(auditKey{}).(Audit)
+	// The call's clock, which a change's transaction refusing it read under its locks (begin).
 	a.cfg.OnRefused(ctx, Refusal{Tenant: tenant, Actor: actor, How: how, Audit: audit, Err: *err, At: a.cfg.Now()})
 }

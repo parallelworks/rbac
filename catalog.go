@@ -152,7 +152,8 @@ func (a *Authorizer) BuiltinRole(id Role) (RoleDefinition, bool) {
 }
 
 // BuiltinRoles lists the built-in roles that can be granted on a scope type, in catalog order: on
-// a container type or the tenant, every role.
+// the tenant, every role, and on a container type, every one but those giving a label value or a
+// power to release, which are for the tenant alone.
 func (a *Authorizer) BuiltinRoles(scopeType string) []RoleDefinition {
 	var roles []RoleDefinition
 	for _, r := range a.cfg.Catalog {
