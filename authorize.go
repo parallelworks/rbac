@@ -1134,7 +1134,7 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 		narrow := countedOf(binding, broad{})
 		wide := slices.DeleteFunc(slices.Clone(binding), func(k string) bool { return slices.Contains(narrow, k) })
 		rows, err = a.db.Query(ctx, `
-			SELECT scope, bool_or(condition = '') FROM (`+bindingDenies("$1", "$2", "$3", "$7", "scope, condition, exempt, permissions")+`) d
+			SELECT scope, bool_or(condition = '') FROM (`+bindingDenies("$1", "$2", "$3", "$7", "scope, condition, exempt, permissions", a.history)+`) d
 			WHERE NOT exempt && $6::text[] AND ($4 = ANY(permissions) OR $5 = ANY(permissions))
 			GROUP BY scope ORDER BY scope`,
 			tenant, reaching, narrow, perm, wildcard, exempting(keys, s), wide)
@@ -1252,7 +1252,7 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 		return fmt.Sprintf(`SELECT d.scope FROM (%s) d
 			WHERE NOT d.exempt && %s AND (%s::text = ANY(d.permissions) OR %s::text = ANY(d.permissions))`,
 			bindingDenies(arg(1)+"::text", types, keys("SELECT k FROM bound WHERE "+narrow), keys("SELECT k FROM bound WHERE NOT ("+narrow+")"),
-				"scope, exempt, permissions"),
+				"scope, exempt, permissions", a.history),
 			keys("SELECT k FROM exempted"), arg(14), arg(15))
 	}
 	// The grants' tenant is an argument of its own: the host's tenant column needn't be text,
@@ -1385,11 +1385,19 @@ func byKey(keys, table, col, cols, where string) string {
 // scopes (ofType), and past that they are found by those keys too. Each way reads every deny the
 // other passes over, so with many of both a list reads every deny in the tenant naming broad. The
 // count reads at most manyTypedDenies entries of the scopes' index, once for the statement, in its
-// snapshot. A deny naming both narrow and broad is selected twice.
-func bindingDenies(tenant, types, narrow, broad, cols string) string {
-	ofTypes := func(cols, where string) string {
-		return `SELECT d.* FROM unnest(` + types + `::text[]) AS t(t) CROSS JOIN LATERAL (SELECT ` + cols + ` FROM rbac_denies
+// snapshot. As of a time, history being the table of it, by its schema, the count is of the
+// versions history holds of denies on the scopes, deleted ones' too: a count of the denies the
+// views give read every version, as the views read each to find a deny's last, and with fewer than
+// manyTypedDenies live, read them all again by type. A deny naming both narrow and broad is
+// selected twice.
+func bindingDenies(tenant, types, narrow, broad, cols, history string) string {
+	ofTypes := func(table, cols, where string) string {
+		return `SELECT d.* FROM unnest(` + types + `::text[]) AS t(t) CROSS JOIN LATERAL (SELECT ` + cols + ` FROM ` + table + `
 			WHERE tenant = ` + tenant + ` AND ` + where + ofType("scope", "t.t") + ` OFFSET 0) d`
+	}
+	counted := ofTypes("rbac_denies", "1", "")
+	if history != "" {
+		counted = ofTypes(history, "1", "entity = 'deny' AND ")
 	}
 	return fmt.Sprintf(`WITH typed(few) AS MATERIALIZED (SELECT count(*) < %[5]d FROM (%[6]s LIMIT %[5]d) c)
 		SELECT %[4]s FROM rbac_denies WHERE %[2]s AND scope_type = ANY(%[1]s::text[])
@@ -1398,11 +1406,12 @@ func bindingDenies(tenant, types, narrow, broad, cols string) string {
 		UNION ALL
 		SELECT * FROM (%[7]s) d WHERE (SELECT few FROM typed)`,
 		types, namingIn(tenant, "principals", narrow), namingIn(tenant, "principals", broad), cols, manyTypedDenies,
-		ofTypes("1", ""), ofTypes(cols, "principals && "+broad+"::text[] AND "))
+		counted, ofTypes("rbac_denies", cols, "principals && "+broad+"::text[] AND "))
 }
 
 // manyTypedDenies is how many denies on scopes of the types a list reads bindingDenies reads by type
-// to find those naming the public or the tenant's members, before it finds them by those keys.
+// to find those naming the public or the tenant's members, before it finds them by those keys; as of
+// a time, how many versions of them history holds.
 const manyTypedDenies = 16
 
 // ofType is SQL keeping the rows whose scope, col, is of the type t. A scope is `type:id`, and in

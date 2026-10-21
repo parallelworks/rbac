@@ -221,7 +221,10 @@ erDiagram
   subject or its groups, which `Filter` and `Reachable` read, are found through GIN indexes on
   those arrays of keys, each key prefixed by its tenant (`rbac_tenant_keys`), so neither the
   tenant's other rows nor another tenant's group of the same id are read. History indexes the keys
-  each version of a deny names so too, so as of a time those lists find them the same way.
+  each version of a deny names so too, so as of a time those lists find them the same way, and
+  they count the denies on their types by history's versions of them, at most a few: through the
+  views, which read every version of a deny to find its last, counting read every one, deleted
+  denies' too.
 - **Activations are grants** from the source `activation` (`SourceActivation`), made by
   `Activate` from an eligibility, which they record, and ended by their expiry, `Deactivate`, or a
   change ending the membership or a place in a group on their holder's paths to that eligibility's

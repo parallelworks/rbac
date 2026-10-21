@@ -220,7 +220,7 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 		return fmt.Errorf("%w: the search_path names pg_temp after %s, so history can't stand in for the package's tables", ErrInvalid, schema)
 	}
 	b := *a
-	b.db, b.asOf = tx, true
+	b.db, b.asOf, b.history = tx, true, historyTable(schema)
 	b.cfg.Now = func() time.Time { return at }
 	// A change is refused before its transaction, so the host is never asked about one that can't
 	// be made.
