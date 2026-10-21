@@ -10,14 +10,18 @@
 -- dimensions go: in lax mode, a [*] past an element's own depth takes it as it is, so a record's
 -- other values, which history's owner can write, read as their text as before. History's index of
 -- the keys denies name, built on it, is rebuilt where a record holds such an array: only those
--- records' keys change, and rebuilding reads all of history.
+-- records' keys change. Finding them reads every deny record, and rebuilding all of history. A read
+-- of a table locks each of its indexes, so the rebuild waits for the reads of history running, as
+-- an export, while the tables below stay locked, and every read of history then waits until
+-- migrating commits: a transaction that read history and then reads one of the tables deadlocks
+-- with it.
 --
 -- And the tables hold each list as history gives it back: in one dimension, from 1, or empty, which
 -- has none. A row holding one in another shape is rewritten so, its elements in order, as every
 -- read but that one took them, which history records as Migrate's change; then each list is
 -- checked, which reads each table once more. The tables are locked first, history last, as 0013
 -- locks them, but history only against writes, which every change to a table makes: reads of
--- history go on.
+-- history go on, unless its index is rebuilt.
 LOCK TABLE rbac_roles, rbac_denies, rbac_eligibilities IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE rbac_history IN SHARE ROW EXCLUSIVE MODE;
 

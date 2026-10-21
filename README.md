@@ -469,9 +469,14 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   eligibility holds in more than one dimension, or from a subscript other than 1, as a write
   around the package could store, in one dimension from 1, keeping its elements in order, which
   history records as `Migrate`'s change, and then refuses another shape. It locks those three
-  tables until it commits and reads each twice, and keeps changes to every table waiting, as each
-  writes history, though reads of history go on; where history holds a deny recorded with its keys
-  in more dimensions, it rebuilds history's index of them, which reads all of history.
+  tables until it commits, so checks, lists and changes wait for it, reads each twice, and keeps
+  changes to every table waiting, as each writes history. It reads every deny record in history
+  while it holds them, though reads of history go on; but where one holds its keys in more
+  dimensions, it rebuilds history's index of them, which reads all of history, and as a read of a
+  table locks each of its indexes, the rebuild waits for the reads of history running, as an
+  export, and every read of history then waits until migrating commits. A transaction that read
+  history and then reads one of those tables deadlocks with the rebuild, and PostgreSQL ends one
+  of the two: migrate again.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
   between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows
