@@ -1276,6 +1276,64 @@ func TestMigratingLetsHistorysRoleCallWhatItsIndexCalls(t *testing.T) {
 	}
 }
 
+// Migrating to 0018 locks history before it builds the grants' index, so a change that starts while
+// it builds and writes history before a grant, as DeleteScope removes a scope's eligibilities and
+// then its grants, waits for it to commit: locked once the index was built, history was the change's
+// while the change waited for the grants, and PostgreSQL ended one of the two as a deadlock.
+func TestMigratingThePrincipalSeeksWaitsForAChangeStartedAsItBuilds(t *testing.T) {
+	// Little memory to sort in, so building the index takes a while.
+	pool := pgtest.Open(t, "maintenance_work_mem=64kB")
+	ctx := t.Context()
+	migrateFiles(t, pool, "", "0018")
+	for _, q := range []string{
+		`ALTER TABLE rbac_grants DISABLE TRIGGER USER`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		  SELECT 't1', 'cluster', 'k' || i, 'user', 'u' || i, 'custom.r' FROM generate_series(1, 100000) i`,
+		`ALTER TABLE rbac_grants ENABLE TRIGGER USER`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		  VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'cluster.login')`,
+		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+		  VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'cluster.sudo', 3600)`,
+	} {
+		if _, err := pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	authz, err := rbac.New(pool, rbac.Config{
+		Catalog:        catalog,
+		ContainerTypes: []string{"org", "workspace"},
+		ValidateGrant:  func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	migrated := make(chan error, 1)
+	go func() { migrated <- applyMigrations(ctx, pool, pgx.ReadCommitted, "0018", "") }()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		var building bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_progress_create_index WHERE relid = 'rbac_grants'::regclass)`).Scan(&building); err != nil {
+			t.Fatal(err)
+		}
+		if building {
+			break
+		}
+		select {
+		case err := <-migrated:
+			t.Fatalf("migrated before the grants' index was seen building: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("migrating never built the grants' index")
+		}
+	}
+	if err := authz.DeleteScope(ctx, host, "t1", cluster.Scope()); err != nil {
+		t.Errorf("deleting a scope while migrating builds the grants' index: %v", err)
+	}
+	if err := <-migrated; err != nil {
+		t.Errorf("migrating while a scope is deleted: %v", err)
+	}
+}
+
 // As of a time, Filter, its condition, Reachable and Holders seek their subject's grants, and the
 // public's and the members' they count, on each listed type, in a history of one tenant or of many,
 // however their statements are planned: history's index of a principal's versions held no scope, so
@@ -1289,9 +1347,11 @@ func TestAsOfSearchesSeekTheirPrincipalsGrantsOnEachType(t *testing.T) {
 	for _, tenants := range []string{"one tenant", "many tenants"} {
 		for _, plans := range []string{"", "force_generic_plan"} {
 			t.Run(tenants+"/"+cmp.Or(plans, "as AsOf plans"), func(t *testing.T) {
-				h := setup(t, withVolumes)
+				var h *harness
 				if tenants == "many tenants" {
 					h = crowded(t, pgtest.Open(t, ""), withVolumes)
+				} else {
+					h = setup(t, withVolumes)
 				}
 				ctx := t.Context()
 				c0 := hostTable(t, h)[0]

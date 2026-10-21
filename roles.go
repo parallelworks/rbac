@@ -209,12 +209,13 @@ func givingSQL(builtin, tenant, perm, resourceType string, custom bool, ids stri
 // on name of the broad principals in keys, those whose grants the search counts. Only for those
 // grants does it matter, and either principal's can be on thousands of resources, though the
 // anonymous and a guest count none of the members', and a search of a permission no public role
-// gives none of the public's. With identity, the tenant's members in keys are read only while the subject of that key
-// is one of them at now, as keysSQL counts them, for a search that reads its subject's keys in its
-// own statement (Filter). grants is SQL selecting the roles of the grants in the tenant $1 to the
-// principal whose key is the SQL it is given there, on is the array $4 (Authorizer.broadOn,
-// Authorizer.broadAt). They are decided as Authorizer.current reads them, as checks read them;
-// pairing each one's permissions and types with the catalog's in SQL took a search seconds.
+// gives none of the public's. With identity, the tenant's members in keys are read only while the
+// subject of that key is one of them at now, as keysSQL counts them, for a search that reads its
+// subject's keys in its own statement (Filter). grants is SQL selecting the roles of the grants in
+// the tenant $1 to the principal whose key is the SQL it is given there, on is the array $4
+// (Authorizer.broadOn, Authorizer.broadAt). They are decided as Authorizer.current reads them, as
+// checks read them; pairing each one's permissions and types with the catalog's in SQL took a
+// search seconds.
 func (a *Authorizer) broadArgs(ctx context.Context, q DB, tenant string, p Permission, resourceType string, roles []string, custom bool,
 	grants func(principal string) string, on, keys []string, identity string, now time.Time,
 ) ([]any, error) {

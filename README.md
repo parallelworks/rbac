@@ -461,12 +461,13 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   A migration that rebuilds an index, as `0009_grant_seeks` rebuilds two of `rbac_grants`, locks
   the table until it commits, so checks, lists and changes wait for the rebuild; one that builds
   an index, as `0011_tenant_keys` builds three on `rbac_eligibilities` and `rbac_denies` and
-  `0019_principal_seeks` one on `rbac_grants`, keeps writes to the table waiting until it
-  commits, though reads go on: on a large table, migrate when that wait is acceptable. Code from before `0012_activation_through` must not run beside code
-  after it: an activation it extends keeps the eligibility recorded before, and can outlast the one
-  it was extended through. Stop the replicas running it before migrating. `0013_bounded_rows`
-  locks every table, history too, until it commits, and reads each once for each check it adds,
-  so checks, lists, changes and reads of history wait for it. `0015_history_seeks` builds two
+  `0018_principal_seeks` one on `rbac_grants`, keeps writes to the table waiting until it
+  commits, though reads go on: on a large table, migrate when that wait is acceptable. Code from
+  before `0012_activation_through` must not run beside code after it: an activation it extends
+  keeps the eligibility recorded before, and can outlast the one it was extended through. Stop the
+  replicas running it before migrating. `0013_bounded_rows` locks every table, history too, until
+  it commits, and reads each once for each check it adds, so checks, lists, changes and reads of
+  history wait for it. `0015_history_seeks` builds two
   indexes on `rbac_history`, which every change writes, and analyzes it, so changes wait until it
   commits. Building one calls `rbac_tenant_keys` and `rbac_text_array` as history's role, as
   recording each deny does from then on, so it grants that role `EXECUTE` on both where it lacks
@@ -482,10 +483,11 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   table locks each of its indexes, the rebuild waits for the reads of history running, as an
   export, and every read of history then waits until migrating commits. A transaction that read
   history and then reads one of those tables deadlocks with the rebuild, and PostgreSQL ends one
-  of the two: migrate again. `0019_principal_seeks` rebuilds history's index of a principal's
+  of the two: migrate again. `0018_principal_seeks` rebuilds history's index of a principal's
   versions, which reads all of history, and analyzes it: reads of history, and every change, as each
-  writes history, wait until it commits, and a transaction that read history and then writes a
-  grant deadlocks with it, as above.
+  writes history, wait until it commits, and a transaction under way as it starts that read
+  history, or changed a table, as deleting a scope's eligibilities and then its grants does, and
+  then writes a grant deadlocks with it, as above.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
   between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows
