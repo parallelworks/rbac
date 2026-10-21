@@ -339,10 +339,10 @@ func canonical(r RoleDefinition) RoleDefinition {
 // change them there or on the path of a scope they are on, stops it, as it stops DeleteRole and
 // Apply there; so does, where they will give more, a deny on that path that removes a permission
 // the role gives, which the actor would hand on there. The scopes are as Config.ResourceOf gives
-// them. A role another change redefined or created while
-// this one waited for the tenant is refused, to be tried again: the constraints were asked about
-// it as it was, as is one granted meanwhile, or a role listing it, on a scope the host wasn't asked
-// about. One deleted meanwhile is created, as its grants went with it.
+// them. A role another change redefined or created while this one waited for the tenant is
+// refused, to be tried again: the constraints were asked about it as it was, as is one granted
+// meanwhile on a scope of a type they weren't asked about, or, it or a role listing it, on a scope
+// the host wasn't asked about. One deleted meanwhile is created, as its grants went with it.
 //
 // Redefining a role so that its grants give more, or so that it becomes privileged, changes what
 // grants already made give: Config.ValidateGrant is asked about each of its grants and
@@ -536,7 +536,8 @@ func (a *Authorizer) tenantBuckets(ctx context.Context, q DB, tenant string, id 
 // off, or a deny on the path of a scope it is granted on that removes the actor's power to change
 // grants there, stops it, as in SetRole.
 // Deleting a role that doesn't exist does nothing; one changed while the deletion waited for the
-// tenant is refused, as in SetRole.
+// tenant, or granted meanwhile on a scope of a type the constraints weren't asked about, is
+// refused, as in SetRole.
 func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant string, id Role) (err error) {
 	defer a.refused(ctx, &err, tenant, actor.Principal, "DeleteRole")
 	if !validID(tenant) || !isCustom(id) || !validText(string(id)) {
