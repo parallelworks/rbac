@@ -280,6 +280,192 @@ func TestHistoryRecordsRowsWhateverItsSchemaHolds(t *testing.T) {
 	}
 }
 
+// readmeRoles are the README's database roles, made for a test and dropped when it ends: the
+// administrator's, which owns a schema of its own and is a member of history's, and the
+// application's, each with a pool on that schema.
+type readmeRoles struct {
+	admin, history, app, schema string
+	super                       *pgx.Conn
+	adminPool, appPool          *pgxpool.Pool
+}
+
+func newReadmeRoles(t *testing.T) *readmeRoles {
+	t.Helper()
+	ctx := t.Context()
+	base := pgtest.URL(t)
+	suffix := strings.ToLower(rand.Text())
+	r := &readmeRoles{admin: "rbac_admin_" + suffix, history: "rbac_history_" + suffix, app: "rbac_app_" + suffix, schema: "rbac_" + suffix}
+	super, err := pgx.Connect(ctx, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.super = super
+	t.Cleanup(func() { _ = super.Close(context.WithoutCancel(ctx)) })
+	if err := pgx.BeginFunc(ctx, super, func(tx pgx.Tx) error {
+		for _, sql := range []string{
+			`CREATE ROLE ` + r.admin + ` LOGIN`, `CREATE ROLE ` + r.history, `CREATE ROLE ` + r.app + ` LOGIN`,
+			`GRANT ` + r.history + ` TO ` + r.admin,
+			`CREATE SCHEMA ` + r.schema + ` AUTHORIZATION ` + r.admin,
+		} {
+			if _, err := tx.Exec(ctx, sql); err != nil {
+				return fmt.Errorf("%s: %w", sql, err)
+			}
+		}
+		return nil
+	}); err != nil {
+		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "42501" {
+			t.Skip("the test database's role can't create roles")
+		}
+		t.Fatal(err)
+	}
+	// Before the pools close, as cleanups run last first.
+	t.Cleanup(func() {
+		ctx := context.WithoutCancel(ctx)
+		for _, sql := range []string{
+			`DROP SCHEMA ` + r.schema + ` CASCADE`,
+			`DROP OWNED BY ` + r.admin + `, ` + r.history + `, ` + r.app + ` CASCADE`,
+			`DROP ROLE ` + r.app + `, ` + r.admin + `, ` + r.history,
+		} {
+			if _, err := super.Exec(ctx, sql); err != nil {
+				t.Errorf("%s: %v", sql, err)
+			}
+		}
+	})
+	for _, p := range []struct {
+		pool **pgxpool.Pool
+		user string
+	}{{&r.adminPool, r.admin}, {&r.appPool, r.app}} {
+		cfg, err := pgxpool.ParseConfig(base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.ConnConfig.User = p.user
+		cfg.ConnConfig.RuntimeParams["search_path"] = r.schema
+		if *p.pool, err = pgxpool.NewWithConfig(ctx, cfg); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup((*p.pool).Close)
+	}
+	return r
+}
+
+// harden gives history to history's role, and the application's role its privileges, exactly as
+// the README's steps 2 and 3 say, with no role executing a function of the package's that they
+// don't list, as every role may unless it is revoked. The application's makes no schema and
+// creates in none, as step 4 says, unless the database's owner or a grant lets it.
+func (r *readmeRoles) harden(t *testing.T) {
+	t.Helper()
+	s := r.schema
+	for _, sql := range []string{
+		`REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA ` + s + ` FROM PUBLIC`,
+		// 2. History's role owns history and rbac_record, given them by a superuser, and needs
+		// USAGE on the schema and EXECUTE on rbac_tenant_keys and rbac_text_array.
+		`ALTER TABLE ` + s + `.rbac_history OWNER TO ` + r.history,
+		`ALTER FUNCTION ` + s + `.rbac_record() OWNER TO ` + r.history,
+		`GRANT USAGE ON SCHEMA ` + s + ` TO ` + r.history,
+		`GRANT EXECUTE ON FUNCTION ` + s + `.rbac_tenant_keys, ` + s + `.rbac_text_array TO ` + r.history,
+		// 3. The application's role has USAGE on the schema, SELECT, INSERT, UPDATE and DELETE on
+		// its tables but rbac_history and rbac_migrations, EXECUTE on rbac_group_members,
+		// rbac_tenant_keys and rbac_text_array, and only SELECT on rbac_history.
+		`GRANT USAGE ON SCHEMA ` + s + ` TO ` + r.app,
+		`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ` + s + ` TO ` + r.app,
+		`REVOKE ALL ON ` + s + `.rbac_migrations FROM ` + r.app,
+		`GRANT EXECUTE ON FUNCTION ` + s + `.rbac_group_members, ` + s + `.rbac_tenant_keys, ` + s + `.rbac_text_array TO ` + r.app,
+		`REVOKE INSERT, UPDATE, DELETE ON ` + s + `.rbac_history FROM ` + r.app,
+	} {
+		if _, err := r.super.Exec(t.Context(), sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+}
+
+// The README's database roles, set up as its steps say and given nothing more, run the package: as
+// the administrator's role, Migrate, on a new schema or one history's role took history over in
+// before the last migration, and PruneHistory; and as the application's, changes to every table,
+// checks, lists, a read as of a time, History and Export.
+func TestThePackageRunsAsTheReadmesDatabaseRoles(t *testing.T) {
+	names, err := fs.Glob(rbac.Migrations(), "*.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := names[len(names)-1]
+	for _, upgrade := range []bool{false, true} {
+		t.Run(fmt.Sprintf("upgrade=%t", upgrade), func(t *testing.T) {
+			ctx := t.Context()
+			r := newReadmeRoles(t)
+			if upgrade {
+				if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", last); err != nil {
+					t.Fatal(err)
+				}
+				recordMigrations(t, r.adminPool, last)
+				r.harden(t)
+			}
+			if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+				t.Fatalf("Migrate as the administrator's role: %v", err)
+			}
+			if !upgrade {
+				r.harden(t)
+			}
+			cfg := rbac.Config{
+				Catalog:        append(slices.Clone(catalog), guardRole, groupMembers, rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}),
+				ContainerTypes: []string{"org", "workspace"},
+				ValidateGrant:  func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+			}
+			authz, err := rbac.New(r.appPool, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := &harness{ctx: ctx, pool: r.appPool, authz: authz, cfg: cfg}
+			creator(t, r.appPool)
+			owner, boss, u := h.as(t, "owner"), h.as(t, "boss"), h.as(t, "u")
+			tenant := rbac.TenantRoot("t1")
+			h.seed(t, grant(tenant, "cluster.admin", rbac.User, "boss"), grant(tenant, guardRole.ID, rbac.User, "boss"),
+				grant(tenant, "tenant.roles", rbac.User, "boss"), grant(tenant, "tenant.groups", rbac.User, "boss"),
+				grant(tenant, groupMembers.ID, rbac.User, "boss"))
+			before := dbNow(t, h)
+			check := func(what string, err error) {
+				t.Helper()
+				if err != nil {
+					t.Errorf("%s as the application's role: %v", what, err)
+				}
+			}
+			check("Apply", authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: u.Principal}}}))
+			check("SetRole", authz.SetRole(ctx, boss, "t1", rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}))
+			check("SetDeny", authz.SetDeny(ctx, boss, cluster, rbac.Deny{ID: "d", Principals: []rbac.Principal{identity("v")}, Permissions: []rbac.Permission{root}}))
+			check("SetEligibility", authz.SetEligibility(ctx, owner, cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: u.Principal, MaxDuration: time.Hour}))
+			check("SetMemberships", authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("v")}}))
+			check("SetGroup", authz.SetGroup(ctx, boss, "t1", rbac.GroupDefinition{ID: "ops"}))
+			check("ChangeMembers", authz.ChangeMembers(ctx, boss, "t1", []rbac.Member{{Group: "ops", Principal: u.Principal}}, nil))
+			check("Authorize", authz.Authorize(ctx, u, login, cluster))
+			_, err = authz.Holders(ctx, login, cluster)
+			check("Holders", err)
+			check("AsOf", authz.AsOf(ctx, "t1", dbNow(t, h), func(a *rbac.Authorizer) error {
+				if err := a.Authorize(ctx, u, login, cluster); err != nil {
+					return err
+				}
+				_, err := a.Denies(ctx, "t1", []rbac.Scope{cluster.Scope()})
+				return err
+			}))
+			var n int
+			if err := r.appPool.QueryRow(ctx, `SELECT count(*) FROM rbac_history`).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			var cursor rbac.Cursor
+			drain(t, h, &cursor, n)
+			key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, err = authz.Export(ctx, rbac.Checkpoint{}, rbac.MaxHistory, key)
+			check("Export", err)
+			if _, err := rbac.PruneHistory(ctx, r.adminPool, before, cursor); err != nil {
+				t.Errorf("PruneHistory as the administrator's role: %v", err)
+			}
+			check("DeleteTenant", authz.DeleteTenant(ctx, host, "t1"))
+		})
+	}
+}
+
 // History is written by its triggers alone: a role that may write the package's tables but not
 // history still records what it writes, a session's own table named as history's takes none of
 // it, and no one may attach the function that writes it to a table of their own.
@@ -990,6 +1176,29 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool, iso pgx.TxIsoLevel
 	return nil
 }
 
+// recordMigrations records in rbac_migrations, as Migrate does, every migration named before to,
+// as migrateFiles applies them up to to, so Migrate applies those from to on.
+func recordMigrations(t *testing.T, pool *pgxpool.Pool, to string) {
+	t.Helper()
+	ctx := t.Context()
+	files, err := fs.Glob(rbac.Migrations(), "*.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `CREATE TABLE rbac_migrations (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range files {
+		if name >= to {
+			break
+		}
+		prefix, _, _ := strings.Cut(name, "_")
+		if _, err := pool.Exec(ctx, `INSERT INTO rbac_migrations (version) VALUES ($1::text::integer)`, prefix); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 // migrated is a harness on pool, which migrateFiles migrated.
 func migrated(t *testing.T, pool *pgxpool.Pool) *harness {
 	t.Helper()
@@ -1366,11 +1575,7 @@ func TestMigratingOnAHostsTransactionRecordsWhatHasCommitted(t *testing.T) {
 				t.Fatal(err)
 			}
 			migrateFiles(t, pool, "0003", "0008")
-			// As Migrate records what it applied.
-			if _, err := pool.Exec(ctx, `CREATE TABLE rbac_migrations (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now());
-				INSERT INTO rbac_migrations (version) SELECT generate_series(1, 7)`); err != nil {
-				t.Fatal(err)
-			}
+			recordMigrations(t, pool, "0008")
 			host, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: iso})
 			if err != nil {
 				t.Fatal(err)

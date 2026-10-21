@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -20,7 +21,10 @@ var migrations embed.FS
 // transaction of its own or at READ COMMITTED, in a database whose encoding is UTF8: one that
 // waits for the writes in flight to the tables reads them once they end, which a stricter
 // transaction's snapshot, taken by an earlier statement, doesn't. They hold no backslash, so they
-// mean the same whatever the session's standard_conforming_strings. Migrate applies them itself.
+// mean the same whatever the session's standard_conforming_strings. Apply each with a short
+// lock_timeout, and where it is refused as SQLSTATE 55P03 or 40P01, roll it back and apply it
+// again, as Migrate does: a migration that waits for a lock holds those it took meanwhile, and so
+// can deadlock with a change, or stall every other. Migrate applies them itself.
 func Migrations() fs.FS {
 	sub, err := fs.Sub(migrations, "migrations")
 	if err != nil {
@@ -36,10 +40,53 @@ func Migrations() fs.FS {
 // transaction's isolation, and refuses any but READ COMMITTED: a stricter one's snapshot, taken by
 // an earlier statement, reads the versions from before it waited for another replica, and the rows
 // it records as they were before the writes it waited for.
+//
+// A migration waits at most 100 ms for any lock it takes on the package's tables, as it holds those
+// it took before meanwhile, which every statement reading them waits for: a change that reads them
+// in another order than the migration locks them would deadlock with it, and a transaction holding
+// one for long would stall every other. Migrate then rolls back and tries again, waiting longer
+// each time, up to 10 times over about 20 seconds, and then fails as ErrConflict: migrate again
+// once what held the table has ended. On a host's transaction it does neither, as rolling back to
+// its savepoint frees nothing the host's transaction took before, which what the migration waits
+// for can be waiting for in turn: it waits as that transaction's lock_timeout says, for PostgreSQL
+// to end such a wait as a deadlock, and fails as ErrConflict where it ends the migration's. It
+// waits for another replica's migration as long as the session's lock_timeout lets it.
 func Migrate(ctx context.Context, db DB) error {
+	wait := migrateBackoff
+	for attempt := 1; ; attempt++ {
+		own, err := migrateOnce(ctx, db)
+		if !own || attempt >= migrateAttempts || !errors.Is(err, ErrConflict) {
+			return err
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return errors.Join(err, ctx.Err())
+		case <-timer.C:
+		}
+		wait = min(2*wait, maxMigrateBackoff)
+	}
+}
+
+// migrateAttempts is how many times Migrate runs its transaction before it gives up on a lock;
+// migrateLockWait is the longest a migration waits for any one lock, and migrateBackoff how long
+// Migrate waits before it tries again, doubling with each try up to maxMigrateBackoff. A test
+// lowers them.
+var (
+	migrateAttempts   = 10
+	migrateLockWait   = 100 * time.Millisecond
+	migrateBackoff    = 100 * time.Millisecond
+	maxMigrateBackoff = 5 * time.Second
+)
+
+// migrateOnce applies what is pending in a transaction, and reports whether it was one of its own
+// rather than a savepoint of the host's.
+func migrateOnce(ctx context.Context, db DB) (own bool, err error) {
 	// At READ COMMITTED, so a replica that waited for the lock reads the versions another applied
 	// meanwhile: a stricter snapshot, taken before the lock, would apply them again.
-	return begin(ctx, db, func(tx pgx.Tx) error {
+	err = beginOwn(ctx, db, func(tx pgx.Tx, fresh bool) error {
+		own = fresh
 		var schema *string
 		var level, conforming string
 		if err := tx.QueryRow(ctx, `SELECT current_schema(), current_setting('transaction_isolation'),
@@ -86,6 +133,14 @@ func Migrate(ctx context.Context, db DB) error {
 		if err := tx.QueryRow(ctx, `SELECT coalesce(max(version), 0) FROM rbac_migrations`).Scan(&applied); err != nil {
 			return err
 		}
+		// From here, a lock it waits for is one the tables' readers and writers can hold. Bounded only
+		// in a transaction of its own, where giving way frees what it holds, and where the setting
+		// ends with it.
+		if own {
+			if _, err := tx.Exec(ctx, `SELECT set_config('lock_timeout', $1, true)`, strconv.FormatInt(migrateLockWait.Milliseconds(), 10)+"ms"); err != nil {
+				return err
+			}
+		}
 		fsys := Migrations()
 		names, err := fs.Glob(fsys, "*.sql")
 		if err != nil {
@@ -118,4 +173,5 @@ func Migrate(ctx context.Context, db DB) error {
 		_, err = tx.Exec(ctx, `SELECT set_config('standard_conforming_strings', $1, true)`, conforming)
 		return err
 	})
+	return own, err
 }

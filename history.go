@@ -335,8 +335,9 @@ type Record struct {
 	ID   int64
 	TxID uint64
 	// RecordedAt is when it was written, and EffectiveAt when it took effect: when the statement
-	// that made it began, or for an expiry, when it expired, but never before the row's record
-	// before it.
+	// that made it began, or its transaction, where that began later, as one a procedure that
+	// commits as it goes starts does; or for an expiry, when it expired; but never before the row's
+	// record before it.
 	RecordedAt, EffectiveAt time.Time
 	Tenant                  string
 	// Entity is what changed: grant, role, deny, eligibility, membership, group or member, or

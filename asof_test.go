@@ -151,6 +151,14 @@ func TestAsOfChangesNothing(t *testing.T) {
 	}
 }
 
+// AsOf refuses a nil read, as it has nothing to run, rather than fail in its transaction.
+func TestAsOfRefusesNoRead(t *testing.T) {
+	h := setup(t)
+	if err := h.authz.AsOf(t.Context(), "t1", dbNow(t, h), nil); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("AsOf with a nil read: %v", err)
+	}
+}
+
 // AsOf on a host's DB that has no BeginTx reads the past at REPEATABLE READ, as on a pool, so a
 // read of several statements reads one snapshot; on a wrapper around the host's transaction, at
 // that transaction's isolation, as under WithTx.
@@ -494,6 +502,70 @@ func TestAsOfReadsARevokeInAnOlderTransactionAfterItsGrant(t *testing.T) {
 	written, err := pgx.CollectRows(rows, pgx.RowTo[time.Time])
 	if err != nil || len(written) != 2 || !written[0].Before(written[1]) {
 		t.Fatalf("written at %v, %v", written, err)
+	}
+}
+
+// A procedure or a DO block that commits as it goes starts a transaction with each COMMIT: what one
+// of its later transactions changes counts from when that transaction began, not the block, so as
+// of a moment while an earlier one ran, every transaction then running having ended before the
+// change was made, a revoke and a move read as yet to come. A delete is an expiry, and a row an
+// update moves ended with its expiry, where the row had expired by when the change took effect.
+func TestAsOfCountsAChangeInABlockThatCommitsFromItsOwnTransaction(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	u, v := h.as(t, "u"), h.as(t, "v")
+	w, x := identity("w"), identity("x")
+	h.as(t, w.ID)
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	// The block's first transaction gives v a login and y a membership, both ending 100 ms after it
+	// began, and runs 200 ms. Its second revokes u's login, moves w's membership to x and y's to z,
+	// and deletes v's login as DeleteExpired does.
+	if _, err := h.pool.Exec(ctx, `DO $$ BEGIN
+		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+		  VALUES ('t1', 'cluster', 'c1', 'user', 'v', 'cluster.login', statement_timestamp() + interval '100 milliseconds');
+		INSERT INTO rbac_memberships (tenant, principal_kind, principal_id, expires_at)
+		  VALUES ('t1', 'user', 'y', statement_timestamp() + interval '100 milliseconds');
+		PERFORM pg_sleep(0.2);
+		COMMIT;
+		DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:u';
+		UPDATE rbac_memberships SET principal_id = 'x' WHERE tenant = 't1' AND principal = 'user:w';
+		UPDATE rbac_memberships SET principal_id = 'z' WHERE tenant = 't1' AND principal = 'user:y';
+		PERFORM set_config('rbac.change', '{"op": "expire"}', true);
+		DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:v';
+	END $$`, pgx.QueryExecModeSimpleProtocol); err != nil {
+		t.Fatal(err)
+	}
+	// v's login is dated by when the block began.
+	var began time.Time
+	if err := h.pool.QueryRow(ctx, `SELECT effective_at FROM rbac_history WHERE principal = 'user:v' AND op = 'create'`).Scan(&began); err != nil {
+		t.Fatal(err)
+	}
+	during := began.Add(50 * time.Millisecond)
+	if err := h.authz.AsOf(ctx, "t1", during, func(a *rbac.Authorizer) error {
+		for _, s := range []rbac.Subject{u, v} {
+			if err := a.Authorize(ctx, s, login, cluster); err != nil {
+				t.Errorf("as of %v, while the block's first transaction ran, %s's login: %v", during, s.Principal.ID, err)
+			}
+		}
+		ms, err := a.Memberships(ctx, "t1", []rbac.Principal{w, x})
+		if err != nil {
+			return err
+		}
+		if len(ms) != 1 || ms[0].Principal != w {
+			t.Errorf("as of %v, while the block's first transaction ran, w and x are members by %+v", during, ms)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := h.pool.Query(ctx, `SELECT principal || ' ' || op FROM rbac_history
+		WHERE principal IN ('user:v', 'user:y') AND op IN ('delete', 'expire') ORDER BY principal`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ends, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil || !slices.Equal(ends, []string{"user:v expire", "user:y expire"}) {
+		t.Errorf("v's login and y's membership ended by %q, %v", ends, err)
 	}
 }
 

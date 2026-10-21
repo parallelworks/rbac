@@ -22,7 +22,7 @@ const URLEnv = "RBAC_TEST_DATABASE_URL"
 // params are added to the URL's query, such as "pool_max_conns=1".
 func Open(tb testing.TB, params string) *pgxpool.Pool {
 	tb.Helper()
-	return OpenIn(tb, testURL(tb), params)
+	return OpenIn(tb, URL(tb), params)
 }
 
 // OpenIn is Open in the database that database, a URL, names.
@@ -79,7 +79,7 @@ func OpenIn(tb testing.TB, database, params string) *pgxpool.Pool {
 func Database(tb testing.TB, options string) (name, database string) {
 	tb.Helper()
 	ctx := tb.Context()
-	base := testURL(tb)
+	base := URL(tb)
 	id := "rbac_test_" + strings.ToLower(rand.Text())
 	name = pgx.Identifier{id}.Sanitize()
 	conn, err := pgx.Connect(ctx, base)
@@ -113,8 +113,8 @@ func Database(tb testing.TB, options string) (name, database string) {
 	return name, u.String()
 }
 
-// testURL is the test database's URL, or skips the test without one.
-func testURL(tb testing.TB) string {
+// URL is the test database's URL, or skips the test without one.
+func URL(tb testing.TB) string {
 	tb.Helper()
 	database := os.Getenv(URLEnv)
 	if database == "" {
