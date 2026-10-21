@@ -1021,6 +1021,108 @@ func TestAsOfGrantableReadsEachVersionOfTheCustomRolesOnce(t *testing.T) {
 	}
 }
 
+// As of a time, a custom role is its last version by then, however its statements are planned: one
+// redefined since, one deleted, and one deleted and made again, as a check reads each by its id, a
+// search those its grants name, and CustomRoles every one. Their view takes each role's newest
+// version apart from the other tables', and a deleted role's last version is its delete.
+func TestAsOfReadsACustomRoleAsItsLastVersionThen(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	u := h.as(t, "u")
+	define := func(qs ...string) time.Time {
+		t.Helper()
+		for _, q := range qs {
+			if _, err := h.pool.Exec(ctx, q); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return dbNow(t, h)
+	}
+	define(`INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES
+		('t1', 'custom.widened', '{cluster:view}', '{cluster}'),
+		('t1', 'custom.deleted', '{cluster:view,cluster:login}', '{cluster}'),
+		('t1', 'custom.again', '{cluster:view,cluster:login}', '{cluster}')`)
+	on := map[rbac.Role]rbac.Resource{}
+	for i, id := range []rbac.Role{"custom.widened", "custom.deleted", "custom.again"} {
+		r := cluster
+		r.ID = fmt.Sprint("c", i+1)
+		on[id] = r
+		h.seed(t, grant(r.Scope(), id, rbac.User, "u"))
+	}
+	then := dbNow(t, h)
+	now := define(`UPDATE rbac_roles SET permissions = '{cluster:view,cluster:login}' WHERE tenant = 't1' AND id = 'custom.widened'`,
+		`DELETE FROM rbac_roles WHERE tenant = 't1' AND id IN ('custom.deleted', 'custom.again')`,
+		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.again', '{cluster:view}', '{cluster}')`)
+	for _, at := range []struct {
+		name   string
+		at     time.Time
+		logins []rbac.Role
+	}{
+		{"then", then, []rbac.Role{"custom.again", "custom.deleted"}},
+		{"now", now, []rbac.Role{"custom.widened"}},
+	} {
+		for _, plans := range []string{"", "force_generic_plan"} {
+			t.Run(at.name+" "+plans, func(t *testing.T) {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at.at, func(a *rbac.Authorizer) error {
+					if plans != "" {
+						if _, err := tx.Exec(ctx, `SELECT set_config('plan_cache_mode', $1, true)`, plans); err != nil {
+							return err
+						}
+					}
+					var checked, defined []rbac.Role
+					for id, r := range on {
+						err := a.Authorize(ctx, u, login, r)
+						if err != nil && !errors.Is(err, rbac.ErrDenied) {
+							return err
+						}
+						if err == nil {
+							checked = append(checked, id)
+						}
+					}
+					slices.Sort(checked)
+					if !slices.Equal(checked, at.logins) {
+						t.Errorf("u may log in through %v", checked)
+					}
+					reach, err := a.Reachable(ctx, u, login, "t1", "cluster")
+					if err != nil {
+						return err
+					}
+					var reached []rbac.Role
+					for id, r := range on {
+						if slices.Contains(reach.Scopes, r.Scope()) {
+							reached = append(reached, id)
+						}
+					}
+					slices.Sort(reached)
+					if !slices.Equal(reached, at.logins) {
+						t.Errorf("Reachable = %+v", reach)
+					}
+					roles, err := a.CustomRoles(ctx, "t1")
+					if err != nil {
+						return err
+					}
+					for _, r := range roles {
+						if slices.Contains(r.Permissions, login) {
+							defined = append(defined, r.ID)
+						}
+					}
+					if !slices.Equal(defined, at.logins) {
+						t.Errorf("the custom roles giving login are %v", defined)
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+}
+
 // Migrating counts the history recorded before it by tenant and entity together, rather than once
 // autovacuum next analyzes it, which on a large history is long after.
 func TestMigratingCountsHistoryByTenantAndEntity(t *testing.T) {
