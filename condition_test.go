@@ -14,6 +14,7 @@ import (
 	"cel.dev/cel-go/common/types"
 	"cel.dev/cel-go/common/types/ref"
 	"cel.dev/cel-go/ext"
+	"cel.dev/cel-go/interpreter"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -856,6 +857,34 @@ func TestALoopOfMoreStepsThanItsConditionMayCostFails(t *testing.T) {
 		}
 		if allowed(t, h, v, login, r) != within {
 			t.Errorf("a deny's condition looping over %d elements applied: %t", n, within)
+		}
+	}
+}
+
+// otherwise is a loop's condition as another version of CEL may plan it, under the id it gives it.
+type otherwise struct {
+	interpreter.InterpretableV2
+	id int64
+}
+
+func (o otherwise) ID() int64 { return o.id }
+
+// A loop whose condition CEL plans as neither of those of its macros, or where no decorator sees
+// it, as another version of CEL may, isn't a condition: its steps would be neither counted nor
+// dropped, so it would run unbounded.
+func TestALoopPlannedOtherwiseIsNoCondition(t *testing.T) {
+	for _, expr := range []string{`[1, 2].all(x, x > 0)`, `[1, 2].exists_one(x, x > 1)`} {
+		for how, replan := range map[string]func(interpreter.InterpretableV2) interpreter.InterpretableV2{
+			"as something else": func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, i.ID()} },
+			"under another id":  func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, -i.ID()} },
+		} {
+			if err := rbac.PlanLoopsOtherwise(t, expr, replan); err == nil {
+				t.Errorf("%s with its loop's condition planned %s is a condition", expr, how)
+			}
+		}
+		same := func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return i }
+		if err := rbac.PlanLoopsOtherwise(t, expr, same); err != nil {
+			t.Errorf("%s planned as CEL plans it: %v", expr, err)
 		}
 	}
 }

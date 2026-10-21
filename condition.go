@@ -384,19 +384,30 @@ func (c *conditions) build(expr string) (program, error) {
 		return program{}, fmt.Errorf("%w: %w", errCondition, err)
 	}
 	limit := worstCost(checked, patterns)
-	prg, err := c.env.Program(checked, planning(checked, patterns, limit)...)
+	prg, err := plan(c.env, checked, patterns, limit)
 	if err != nil {
 		return program{}, fmt.Errorf("%w: %w", errCondition, err)
 	}
 	return program{Program: prg, typed: c.typeCheck(expr), readsAction: reading(checked.NativeRep(), "action"), limit: limit}, nil
 }
 
-// planning plans checked to run within limit, as costs charges its calls.
-func planning(checked *cel.Ast, patterns map[string]uint64, limit uint64) []cel.ProgramOption {
-	return []cel.ProgramOption{
+// plan plans checked to run within limit, as costs charges its calls, once the options before
+// have, as a test plans a loop as another version of CEL may.
+func plan(env *cel.Env, checked *cel.Ast, patterns map[string]uint64, limit uint64, before ...cel.ProgramOption) (cel.Program, error) {
+	s := newStepping(checked.NativeRep(), limit)
+	prg, err := env.Program(checked, slices.Concat(before, []cel.ProgramOption{
 		cel.CostLimit(limit), cel.CostTracking(costs{patterns}), cel.OptimizeRegex(matching(patterns)),
-		cel.CustomDecorator(bounded), cel.CustomDecoratorV2(stepping(checked.NativeRep(), limit)),
+		cel.CustomDecorator(bounded), cel.CustomDecoratorV2(s.decorate),
+	})...)
+	if err != nil {
+		return nil, err
 	}
+	// Another version of CEL may plan a loop's condition where no decorator sees it, which would
+	// run unbounded too.
+	if len(s.stepped) != len(s.ranges) {
+		return nil, errors.New("a loop's condition is planned where this package can't bound it")
+	}
+	return prg, nil
 }
 
 // typeCheck returns why expr doesn't check against the declared attributes: it reads one they
@@ -890,32 +901,44 @@ const looping = "@looping"
 // most. Each step evaluates its condition first, so a loop's condition is planned instead as a call
 // whose first argument is the loop's range: charging it drops what the steps before kept, and
 // costs what charging the condition did. It counts the steps too, which limit bounds (counting).
-func stepping(checked *ast.AST, limit uint64) interpreter.InterpretableDecoratorV2 {
-	ranges := map[int64]int64{}
+type stepping struct {
+	// ranges are the ids of the ranges of checked's loops, by those of their conditions, and
+	// stepped those of the conditions planned as steps.
+	ranges  map[int64]int64
+	stepped map[int64]bool
+	limit   uint64
+}
+
+func newStepping(checked *ast.AST, limit uint64) *stepping {
+	s := &stepping{ranges: map[int64]int64{}, stepped: map[int64]bool{}, limit: limit}
 	for _, e := range ast.MatchDescendants(ast.NavigateAST(checked), ast.KindMatcher(ast.ComprehensionKind)) {
-		ranges[e.AsComprehension().LoopCondition().ID()] = e.AsComprehension().IterRange().ID()
+		s.ranges[e.AsComprehension().LoopCondition().ID()] = e.AsComprehension().IterRange().ID()
 	}
-	return func(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
-		over, ok := ranges[i.ID()]
-		if !ok {
-			return i, nil
+	return s
+}
+
+func (s *stepping) decorate(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
+	over, ok := s.ranges[i.ID()]
+	if !ok {
+		return i, nil
+	}
+	// The tracking finds what it holds by id, the range's before the steps', and drops it with all
+	// held after it.
+	st := &step{cond: i, over: over, function: looping, args: []interpreter.InterpretableV2{interpreter.NewConstValue(over, types.NullValue)}, limit: s.limit}
+	switch cond := i.(type) {
+	case interpreter.InterpretableConst:
+	case interpreter.InterpretableCall:
+		// The macros' other condition, which CEL charges 1 whatever its arguments.
+		if cond.Function() != operators.NotStrictlyFalse {
+			return nil, fmt.Errorf("a loop's condition is planned as %s, which this package doesn't bound", cond.Function())
 		}
-		// The tracking finds what it holds by id, the range's before the steps', and drops it with
-		// all held after it.
-		from := interpreter.NewConstValue(over, types.NullValue)
-		switch cond := i.(type) {
-		case interpreter.InterpretableConst:
-			return &step{cond: i, over: over, function: looping, args: []interpreter.InterpretableV2{from}, limit: limit}, nil
-		case interpreter.InterpretableCall:
-			// The macros' other condition, which CEL charges 1 whatever its arguments.
-			if cond.Function() == operators.NotStrictlyFalse {
-				args := append([]interpreter.InterpretableV2{from}, cond.Args()...)
-				return &step{cond: i, over: over, function: cond.Function(), overload: cond.OverloadID(), args: args, limit: limit}, nil
-			}
-		}
+		st.function, st.overload, st.args = cond.Function(), cond.OverloadID(), append(st.args, cond.Args()...)
+	default:
 		// Another version of CEL may plan a loop otherwise, which would run unbounded.
 		return nil, fmt.Errorf("a loop's condition is planned as %T, which this package doesn't bound", i)
 	}
+	s.stepped[i.ID()] = true
+	return st, nil
 }
 
 // step is a loop's condition as stepping plans it. It has the id of the loop's range, so the
@@ -939,12 +962,10 @@ func (s *step) Eval(a interpreter.Activation) ref.Val { return s.Exec(interprete
 func (s *step) Exec(frame *interpreter.ExecutionFrame) ref.Val {
 	c, _ := frame.ResolveName(stepsName)
 	n, ok := c.(*counting)
-	if ok {
-		n.steps++
-	}
-	if !ok || n.steps > s.limit {
+	if !ok || n.steps >= s.limit {
 		panic(interpreter.EvalCancelledError{Cause: interpreter.CostLimitExceeded, Message: "rbac: a condition's loops take more steps than it may cost"})
 	}
+	n.steps++
 	return s.cond.Exec(frame)
 }
 

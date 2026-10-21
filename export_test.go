@@ -200,6 +200,19 @@ func ConditionCostOn(t *testing.T, expr string, s Subject, p Permission, r Resou
 	if err != nil {
 		t.Fatal(err)
 	}
+	checked, patterns := compiled(t, c, expr)
+	unlimited, err := plan(c.env, checked, patterns, maxCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Authorizer{cfg: Config{Now: time.Now}, conds: c}
+	vars := a.vars(WithRequest(t.Context(), attributes), s, p, r)
+	return prg.limit, evaluate(program{Program: unlimited, limit: maxCost}, vars).cost
+}
+
+// compiled is expr as c compiles it, and the sizes of its patterns.
+func compiled(t *testing.T, c *conditions, expr string) (*cel.Ast, map[string]uint64) {
+	t.Helper()
 	checked, iss := c.env.Compile(expr)
 	if iss.Err() != nil {
 		t.Fatal(iss.Err())
@@ -208,13 +221,7 @@ func ConditionCostOn(t *testing.T, expr string, s Subject, p Permission, r Resou
 	if err != nil {
 		t.Fatal(err)
 	}
-	unlimited, err := c.env.Program(checked, planning(checked, patterns, maxCost)...)
-	if err != nil {
-		t.Fatal(err)
-	}
-	a := &Authorizer{cfg: Config{Now: time.Now}, conds: c}
-	vars := a.vars(WithRequest(t.Context(), attributes), s, p, r)
-	return prg.limit, evaluate(program{Program: unlimited, limit: maxCost}, vars).cost
+	return checked, patterns
 }
 
 // TrackedValues is what evaluating expr costs, on a request with attributes, which the resource
@@ -226,17 +233,10 @@ func TrackedValues(t *testing.T, declares Attributes, expr string, attributes ma
 	if err != nil {
 		t.Fatal(err)
 	}
-	checked, iss := c.env.Compile(expr)
-	if iss.Err() != nil {
-		t.Fatal(iss.Err())
-	}
-	patterns, err := checkPatterns(checked)
-	if err != nil {
-		t.Fatal(err)
-	}
+	checked, patterns := compiled(t, c, expr)
 	limit := worstCost(checked, patterns)
 	p := &probing{}
-	prg, err := c.env.Program(checked, append(planning(checked, patterns, limit), cel.CustomDecoratorV2(p.decorate))...)
+	prg, err := plan(c.env, checked, patterns, limit, cel.CustomDecoratorV2(p.decorate))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,6 +244,25 @@ func TrackedValues(t *testing.T, declares Attributes, expr string, attributes ma
 	vars := a.vars(WithRequest(t.Context(), attributes), Subject{Principal: Principal{Kind: User, ID: "u"}}, "cluster:login",
 		Resource{Tenant: "t", Type: "cluster", ID: "c", Attributes: attributes})
 	return evaluate(program{Program: prg, limit: limit}, vars).cost, p.most, p.reached
+}
+
+// PlanLoopsOtherwise is why expr can't be planned as a condition where CEL plans each of its loops'
+// conditions as replan makes it, as another version of CEL may, or nil.
+func PlanLoopsOtherwise(t *testing.T, expr string, replan func(interpreter.InterpretableV2) interpreter.InterpretableV2) error {
+	t.Helper()
+	c, err := newConditions(Attributes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked, patterns := compiled(t, c, expr)
+	conds := newStepping(checked.NativeRep(), maxCost).ranges
+	_, err = plan(c.env, checked, patterns, maxCost, cel.CustomDecoratorV2(func(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
+		if _, ok := conds[i.ID()]; ok {
+			return replan(i), nil
+		}
+		return i, nil
+	}))
+	return err
 }
 
 // probing plans each uint literal as a probe, which evaluates and is charged as the literal, but
