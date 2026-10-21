@@ -713,9 +713,7 @@ func (a *Authorizer) revalidations(ctx context.Context, q DB, tenant string, wid
 	for id := range widened {
 		ids = append(ids, string(id))
 	}
-	// The LIKE matches the partial indexes on custom roles' grants and eligibilities.
-	const ofRoles = `tenant = $1 AND role = ANY($2::text[]) AND role LIKE 'custom.%' AND (expires_at IS NULL OR expires_at > $3)`
-	rows, err := q.Query(ctx, `SELECT `+grantColumns+` FROM rbac_grants WHERE `+ofRoles+` ORDER BY id`, tenant, ids, a.cfg.Now())
+	rows, err := q.Query(ctx, `SELECT `+grantColumns+` FROM (`+customRoleRows("rbac_grants", "*")+`) g ORDER BY id`, tenant, ids, a.cfg.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -723,7 +721,8 @@ func (a *Authorizer) revalidations(ctx context.Context, q DB, tenant string, wid
 	if err != nil {
 		return nil, err
 	}
-	rows, err = q.Query(ctx, `SELECT `+eligibilityColumns+` FROM rbac_eligibilities WHERE `+ofRoles+` ORDER BY scope, principal, role`, tenant, ids, a.cfg.Now())
+	rows, err = q.Query(ctx, `SELECT `+eligibilityColumns+` FROM (`+customRoleRows("rbac_eligibilities", "*")+`) e
+		ORDER BY scope, principal, role`, tenant, ids, a.cfg.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -1259,6 +1258,14 @@ func (a *Authorizer) stillLabeled(ctx context.Context, tx pgx.Tx, checked labeli
 	return a.labelsHeld(ctx, tx, checked)
 }
 
+// customRoleRows is SQL selecting cols of the rows in force at $3 of table, rbac_grants or
+// rbac_eligibilities, in the tenant $1 of the custom roles in the array $2, a role at a time
+// (byKey), each through the partial index on custom roles' rows, which the LIKE matches. A generic
+// plan reads role = ANY($2) by the key index, skipping over the tenant's every principal and scope.
+func customRoleRows(table, cols string) string {
+	return byKey("$2", table, "role", cols, "tenant = $1 AND role LIKE 'custom.%' AND (expires_at IS NULL OR expires_at > $3)")
+}
+
 // roleScope is a scope a custom role's grants or eligibilities are on.
 type roleScope struct {
 	role Role
@@ -1272,14 +1279,10 @@ func (a *Authorizer) rolesScopes(ctx context.Context, q DB, tenant string, ids [
 	for i, id := range ids {
 		names[i] = string(id)
 	}
-	// The LIKE matches the partial indexes on custom roles' grants and eligibilities. Those ended
-	// give nothing, so changing what they give changes no access.
-	rows, err := q.Query(ctx, `
-		SELECT role, scope_type, scope_id FROM rbac_grants WHERE tenant = $1 AND role = ANY($2::text[]) AND role LIKE 'custom.%'
-		  AND (expires_at IS NULL OR expires_at > $3)
+	// Those ended give nothing, so changing what they give changes no access.
+	rows, err := q.Query(ctx, customRoleRows("rbac_grants", "role, scope_type, scope_id")+`
 		UNION
-		SELECT role, scope_type, scope_id FROM rbac_eligibilities WHERE tenant = $1 AND role = ANY($2::text[]) AND role LIKE 'custom.%'
-		  AND (expires_at IS NULL OR expires_at > $3)
+		`+customRoleRows("rbac_eligibilities", "role, scope_type, scope_id")+`
 		ORDER BY 2, 3, 1`, tenant, names, a.cfg.Now())
 	if err != nil {
 		return nil, err

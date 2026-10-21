@@ -7530,6 +7530,65 @@ func TestADenySetWhileARedefinitionWaitsStopsIt(t *testing.T) {
 	}
 }
 
+// changingRoles are SetRole widening custom.r and DeleteRole deleting it, by admin (roleAdmin), on
+// a, each as a change a test counts the pages of.
+func changingRoles(ctx context.Context, admin rbac.Subject) map[string]func(a *rbac.Authorizer) error {
+	return map[string]func(a *rbac.Authorizer) error{
+		"widening": func(a *rbac.Authorizer) error {
+			return a.SetRole(ctx, admin, "t1", rbac.RoleDefinition{ID: "custom.r", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}})
+		},
+		"deleting": func(a *rbac.Authorizer) error { return a.DeleteRole(ctx, admin, "t1", "custom.r") },
+	}
+}
+
+// pagesChanging is how many pages of table change reads, in a transaction it rolls back.
+func pagesChanging(t *testing.T, h *harness, table string, change func(a *rbac.Authorizer) error) int64 {
+	t.Helper()
+	ctx := t.Context()
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	start := pagesRead(ctx, t, tx, table)
+	if err := change(h.authz.WithTx(tx)); err != nil {
+		t.Fatal(err)
+	}
+	return pagesRead(ctx, t, tx, table) - start
+}
+
+// SetRole and DeleteRole read, of the grants, those of the role they change under a generic plan
+// too, where role = ANY(ids) is a skip scan of the key index across the tenant's every grant.
+func TestChangingARoleUnderAGenericPlanReadsOnlyItsGrants(t *testing.T) {
+	h := generic(t)
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	h.as(t, "u")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+		VALUES ('t1', 'custom.r', '{cluster:view}', '{cluster}'), ('t1', 'custom.other', '{cluster:view}', '{cluster}')`); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), "custom.r", rbac.User, "u"))
+	// Others hold the other custom role on a cluster each.
+	others := func(n int) {
+		t.Helper()
+		manyMembers(t, h, n, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', id, 'user', id, 'custom.other' FROM others`, "rbac_grants")
+	}
+	changes := changingRoles(ctx, admin)
+	others(500)
+	few := map[string]int64{}
+	for what, change := range changes {
+		few[what] = pagesChanging(t, h, "rbac_grants", change)
+	}
+	others(4500)
+	for what, change := range changes {
+		if many := pagesChanging(t, h, "rbac_grants", change); many > few[what]*3/2+deeper {
+			t.Errorf("%s a role read %d pages of grants beside 500 grants of another custom role, and %d beside 5000", what, few[what], many)
+		}
+	}
+}
+
 func TestADenySetWhileADeletionWaitsStopsIt(t *testing.T) {
 	h, guardian := guarded(t)
 	ctx := t.Context()
