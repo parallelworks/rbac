@@ -49,20 +49,20 @@ import (
 // little for one comparing what a request passes with literals, or with the subject's kind or id,
 // the resource's type, id or tenant, or the action, which a check refuses past MaxID bytes,
 // whatever it passes, and all a condition may for one reading the size of a value the request
-// decides, as a list or a long string, or looping over one, each element of which costs at least 1
-// however little its step evaluates, and each key of a map 1 more each time a loop over it starts,
-// however few steps it takes. What a check may spend on conditions is bounded, for each
-// scope on its path, and so are the conditions stored, so that a check evaluates whole every one it
-// reads: those of an identity's grants on a scope cost at most so much together, and those of a
-// scope's grants to groups, the tenant's members and the public, which reach many, as much again,
-// those from each source the host owns (Config.Sources) apart from the rest; those of a scope's
-// denies (SetDeny); and the requirements of the eligibilities of groups for a role on a scope. Each
-// distinct condition counts once, as what compiling it and the most evaluating it can cost:
-// hundreds of comparisons with literals, a hundred of an attribute with the subject's id, or three
-// of the longest that read a list or loop. A check of a labeled resource decides each value its
-// label asks for, and Holding, Filter and Reachable each of the subject's label values, as a check
-// of it would, evaluating a condition that doesn't read the action once for them all, so on the
-// tenant one that does counts once for each label value its grants give or its denies deny. A
+// decides, as a list or a long string, looking one up in a map, or looping over one, each element
+// of which costs at least 1 however little its step evaluates, and each key of a map 1 more each
+// time a loop over it starts, however few steps it takes. What a check may spend on conditions is
+// bounded, for each scope on its path, and so are the conditions stored, so that a check evaluates
+// whole every one it reads: those of an identity's grants on a scope cost at most so much together,
+// and those of a scope's grants to groups, the tenant's members and the public, which reach many,
+// as much again, those from each source the host owns (Config.Sources) apart from the rest; those
+// of a scope's denies (SetDeny); and the requirements of the eligibilities of groups for a role on
+// a scope. Each distinct condition counts once, as what compiling it and the most evaluating it can
+// cost: hundreds of comparisons with literals, a hundred of an attribute with the subject's id, or
+// three of the longest that read a list or loop. A check of a labeled resource decides each value
+// its label asks for, and Holding, Filter and Reachable each of the subject's label values, as a
+// check of it would, evaluating a condition that doesn't read the action once for them all, so on
+// the tenant one that does counts once for each label value its grants give or its denies deny. A
 // change adding a condition past a bound, or one evaluated more, as by redefining a role to give
 // more label values (SetRole), is refused as invalid, so no grant, deny or eligibility stored
 // changes what the others decide, but one adding none isn't: conditions
@@ -409,18 +409,21 @@ func (c *conditions) build(expr string) (program, error) {
 // plan plans checked to run within limit, as costs charges its calls, once the options before
 // have, as a test plans a loop as another version of CEL may.
 func plan(env *cel.Env, checked *cel.Ast, patterns map[string]uint64, limit uint64, before ...cel.ProgramOption) (cel.Program, error) {
-	s := newStepping(checked.NativeRep(), limit)
+	s, k := newStepping(checked.NativeRep(), limit), newKeying(env, checked.NativeRep(), limit)
 	prg, err := env.Program(checked, slices.Concat(before, []cel.ProgramOption{
 		cel.CostLimit(limit), cel.CostTracking(costs{patterns}), cel.OptimizeRegex(matching(patterns)),
-		cel.CustomDecorator(bounded), cel.CustomDecoratorV2(s.decorate),
+		cel.CustomDecorator(bounded), cel.CustomDecoratorV2(s.decorate), cel.CustomDecoratorV2(k.decorate),
 	})...)
 	if err != nil {
 		return nil, err
 	}
-	// Another version of CEL may plan a loop's condition where no decorator sees it, which would
-	// run unbounded too.
+	// Another version of CEL may plan a loop's condition, or a key, where no decorator sees it,
+	// which would run unbounded too.
 	if len(s.stepped) != len(s.ranges) {
 		return nil, errors.New("a loop's condition is planned where this package can't bound it")
+	}
+	if len(k.planned) != len(k.keys) {
+		return nil, errors.New("a key is planned where this package can't charge it")
 	}
 	return prg, nil
 }
@@ -623,6 +626,7 @@ func (w worst) walk(e ast.Expr) (uint64, extent) {
 		for i, entry := range e.AsMap().Entries() {
 			ck, k := w.walk(entry.AsMapEntry().Key())
 			cv, v := w.walk(entry.AsMapEntry().Value())
+			ck = cost.SafeAdd(ck, keyCost(entry.AsMapEntry().Key(), k))
 			n, x.value = cost.SafeAdd(n, cost.SafeAdd(ck, cv)), cost.SafeAdd(x.value, cost.SafeAdd(k.value, v.value))
 			if i == 0 {
 				x.elem = &k
@@ -775,6 +779,7 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 	case operators.Index:
 		own, x = 2, anything
 		if len(xs) == 2 {
+			own = cost.SafeAdd(own, keyCost(args[1], xs[1]))
 			// A map's elem bounds its keys, not what they index.
 			x = inside(xs[0])
 			if xs[0].elem != nil && xs[0].form == notMap {
@@ -828,6 +833,15 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 		}
 	}
 	return cost.SafeAdd(n, own), x
+}
+
+// keyCost is what a map reading key, which x bounds, costs past what CEL charges, as keying
+// charges it.
+func keyCost(key ast.Expr, x extent) uint64 {
+	if !computed(key) {
+		return 0
+	}
+	return x.text - min(x.text, 1)
 }
 
 // added is the most what adding x and y makes can be, whatever their types, as CEL may check a sum
@@ -1033,9 +1047,10 @@ func (s *step) Exec(frame *interpreter.ExecutionFrame) ref.Val {
 // counting is what a condition reads, and how many steps its loops have taken, which it costs at
 // least: CEL charges a step only what it evaluates, which can be nothing, as for a step reading
 // only literals, so a loop over a long list the host passes would cost nothing for each element.
+// keys is what the keys it computes cost past what CEL charges (keying), on top of the rest.
 type counting struct {
-	vars  map[string]any
-	steps uint64
+	vars        map[string]any
+	steps, keys uint64
 }
 
 // stepsName is what a condition's steps find their count by, which no condition can name, as no
@@ -1051,6 +1066,162 @@ func (c *counting) ResolveName(name string) (any, bool) {
 }
 
 func (*counting) Parent() interpreter.Activation { return nil }
+
+// keying charges a map reading a key a condition computes, as looking one up or making a map
+// literal of it does, by its length: the map hashes it whole, which CEL charges as 1 however long
+// it is, so a loop looking up a long string the host passes would take time growing with its
+// length, charged only for the steps. Each costs a tenth of its bytes more, as reading it does
+// (textSize), counted beside the steps (counting).
+type keying struct {
+	// keys are the ids of the keys checked computes, and planned what CEL planned each as last,
+	// which is what it reads: it plans an index whose key isn't an attribute as an attribute under
+	// the index's id before the index, so the key of an index that is itself a key is planned
+	// twice under its id.
+	keys    map[int64]bool
+	planned map[int64]interpreter.InterpretableV2
+	// fac qualifies a map by a key, as CEL's own attributes do.
+	fac   interpreter.AttributeFactory
+	limit uint64
+}
+
+func newKeying(env *cel.Env, checked *ast.AST, limit uint64) *keying {
+	k := &keying{
+		keys: map[int64]bool{}, planned: map[int64]interpreter.InterpretableV2{}, limit: limit,
+		fac: interpreter.NewAttributeFactory(env.Container, env.CELTypeAdapter(), env.CELTypeProvider()),
+	}
+	key := func(e ast.Expr) {
+		if computed(e) {
+			k.keys[e.ID()] = true
+		}
+	}
+	for _, e := range ast.MatchDescendants(ast.NavigateAST(checked), ast.FunctionMatcher(operators.Index)) {
+		if args := e.AsCall().Args(); len(args) == 2 {
+			key(args[1])
+		}
+	}
+	for _, e := range ast.MatchDescendants(ast.NavigateAST(checked), ast.KindMatcher(ast.MapKind)) {
+		for _, entry := range e.AsMap().Entries() {
+			key(entry.AsMapEntry().Key())
+		}
+	}
+	return k
+}
+
+// computed reports whether key may be a string a condition doesn't spell out: not a literal, no
+// longer than the condition, nor a list, a map, a test, a loop or a logical operator, none of
+// which is a string.
+func computed(key ast.Expr) bool {
+	switch key.Kind() {
+	case ast.LiteralKind, ast.ListKind, ast.MapKind, ast.ComprehensionKind:
+		return false
+	case ast.SelectKind:
+		return !key.AsSelect().IsTestOnly()
+	case ast.CallKind:
+		fn := key.AsCall().FunctionName()
+		return fn != operators.LogicalAnd && fn != operators.LogicalOr
+	default:
+		return true
+	}
+}
+
+func (k *keying) decorate(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
+	if !k.keys[i.ID()] {
+		return i, nil
+	}
+	planned := i
+	switch i := i.(type) {
+	case interpreter.InterpretableConst:
+	case interpreter.InterpretableAttribute:
+		planned = &keyedAttribute{InterpretableAttribute: i, k: k}
+	case interpreter.InterpretableCall:
+		planned = &keyedCall{InterpretableCall: i, k: k}
+	default:
+		// Another version of CEL may plan a key otherwise, which would run uncharged: plan refuses
+		// one not planned.
+		delete(k.planned, i.ID())
+		return i, nil
+	}
+	k.planned[i.ID()] = planned
+	return planned, nil
+}
+
+// charge charges key, which planned evaluated, before a map reads it, and cancels the evaluation
+// once the condition's steps and keys cost more than its limit, as CEL cancels one costing more.
+func (k *keying) charge(vars interpreter.Activation, planned interpreter.InterpretableV2, key any) {
+	if k.planned[planned.ID()] != planned {
+		return
+	}
+	var n uint64
+	switch key := key.(type) {
+	case string:
+		n = uint64(len(key)) / 10
+	case types.String:
+		n = uint64(len(key)) / 10
+	}
+	if n == 0 {
+		return
+	}
+	c, _ := vars.ResolveName(stepsName)
+	counted, ok := c.(*counting)
+	if ok {
+		counted.keys = cost.SafeAdd(counted.keys, n)
+	}
+	if !ok || cost.SafeAdd(counted.steps, counted.keys) > k.limit {
+		panic(interpreter.EvalCancelledError{Cause: interpreter.CostLimitExceeded, Message: "rbac: a condition's keys cost more than it may"})
+	}
+}
+
+// keyedAttribute is a key CEL plans as an attribute: an index qualifies a map by it, and a map
+// literal evaluates it, each as CEL does, once charged. CEL qualifies an optional index by it
+// otherwise, which no condition can write.
+type keyedAttribute struct {
+	interpreter.InterpretableAttribute
+	k *keying
+}
+
+func (a *keyedAttribute) Exec(frame *interpreter.ExecutionFrame) ref.Val {
+	v, err := a.Attr().Resolve(frame)
+	if err != nil {
+		return types.LabelErrNode(a.ID(), types.WrapErr(err))
+	}
+	a.k.charge(frame, a, v)
+	return a.Adapter().NativeToValue(v)
+}
+
+func (a *keyedAttribute) Eval(vars interpreter.Activation) ref.Val {
+	return a.Exec(interpreter.AsFrame(vars))
+}
+
+// Qualify qualifies obj by the key, as CEL qualifies a map by an attribute.
+func (a *keyedAttribute) Qualify(vars interpreter.Activation, obj any) (any, error) {
+	attr := a.Attr()
+	v, err := attr.Resolve(vars)
+	if err != nil {
+		return nil, err
+	}
+	a.k.charge(vars, a, v)
+	q, err := a.k.fac.NewQualifier(nil, attr.ID(), v, attr.IsOptional())
+	if err != nil {
+		return nil, err
+	}
+	return q.Qualify(vars, obj)
+}
+
+// keyedCall is a key CEL plans as a call, charged once it has run.
+type keyedCall struct {
+	interpreter.InterpretableCall
+	k *keying
+}
+
+func (c *keyedCall) Exec(frame *interpreter.ExecutionFrame) ref.Val {
+	v := c.InterpretableCall.Exec(frame)
+	c.k.charge(frame, c, v)
+	return v
+}
+
+func (c *keyedCall) Eval(vars interpreter.Activation) ref.Val {
+	return c.Exec(interpreter.AsFrame(vars))
+}
 
 // ordering is x compared with y by an ordering operator, as CEL orders them, once bounded has
 // refused a double that isn't finite.
@@ -1371,16 +1542,17 @@ func evaluate(prg program, vars map[string]any) run {
 	in := &counting{vars: vars}
 	out, details, err := prg.Eval(in)
 	// One stopped at its limit costs at most that, past the call or step that took it there, so a
-	// single condition can't spend what the check's others need.
-	cost := prg.limit
+	// single condition can't spend what the check's others need. CEL doesn't stop one its keys
+	// take past its limit, which fails as if it had.
+	spent := prg.limit
 	if details != nil && details.ActualCost() != nil {
-		cost = min(max(*details.ActualCost(), in.steps), prg.limit)
+		spent = cost.SafeAdd(max(*details.ActualCost(), in.steps), in.keys)
 	}
-	if err != nil {
-		return run{cost: cost}
+	if err != nil || spent > prg.limit {
+		return run{cost: min(spent, prg.limit)}
 	}
 	ok, isBool := out.Value().(bool)
-	return run{held: isBool && ok, evaluated: isBool, cost: cost}
+	return run{held: isBool && ok, evaluated: isBool, cost: spent}
 }
 
 // parsing parses conditions for what they read, which needs no declarations.

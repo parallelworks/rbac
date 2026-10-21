@@ -303,6 +303,28 @@ func PlanLoopsOtherwise(t *testing.T, expr string, ranges bool, replan func(inte
 	return err
 }
 
+// PlanKeysOtherwise is why expr can't be planned as a condition where CEL plans each key it
+// computes as replan makes it, as another version of CEL may, or nil.
+func PlanKeysOtherwise(t *testing.T, expr string, replan func(interpreter.InterpretableV2) interpreter.InterpretableV2) error {
+	t.Helper()
+	c, err := newConditions(Attributes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked, patterns := compiled(t, c, expr)
+	keys := newKeying(c.env, checked.NativeRep(), maxCost).keys
+	if len(keys) == 0 {
+		t.Fatalf("%s computes no key", expr)
+	}
+	_, err = plan(c.env, checked, patterns, maxCost, cel.CustomDecoratorV2(func(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
+		if keys[i.ID()] {
+			return replan(i), nil
+		}
+		return i, nil
+	}))
+	return err
+}
+
 // probing plans each uint literal as a probe, which evaluates and is charged as the literal, but
 // which CEL's cost tracking reads as a call of an argument none of the values it holds is of, so
 // it reads them all.
