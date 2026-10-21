@@ -2,6 +2,7 @@ package rbac_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -987,6 +988,15 @@ func TestAKeyCostsItsLength(t *testing.T) {
 		_, cost := rbac.ConditionCost(t, expr, map[string]any{"s": long, "m": map[string]any{long: 1, "k": 1}})
 		if cost-short != keys*uint64(len(long))/10 {
 			t.Errorf("%s with a key of %d bytes cost %d, and with an empty one %d", expr, len(long), cost, short)
+		}
+	}
+	// A map literal reads a key the host passes as another Go value as the string CEL converts it to.
+	type name string
+	for _, s := range []any{&long, name(long), json.RawMessage(`"` + long + `"`)} {
+		expr := `{request.attributes.s: 1} != {}`
+		_, short := rbac.ConditionCost(t, expr, map[string]any{"s": ""})
+		if _, cost := rbac.ConditionCost(t, expr, map[string]any{"s": s}); cost-short != uint64(len(long))/10 {
+			t.Errorf("%s with a key of %d bytes as a %T cost %d, and with an empty one %d", expr, len(long), s, cost, short)
 		}
 	}
 }

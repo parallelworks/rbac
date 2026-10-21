@@ -1185,13 +1185,17 @@ type keyedAttribute struct {
 	k *keying
 }
 
+// Exec charges the key once converted, as the map reads it: a host's *string, or a string of a
+// named type or of JSON, is a string only then. It resolves the attribute itself, as CEL plans a
+// select already watched, whose tracking would charge the key twice.
 func (a *keyedAttribute) Exec(frame *interpreter.ExecutionFrame) ref.Val {
 	v, err := a.Attr().Resolve(frame)
 	if err != nil {
 		return types.LabelErrNode(a.ID(), types.WrapErr(err))
 	}
-	a.k.charge(frame, a, v)
-	return a.Adapter().NativeToValue(v)
+	key := a.Adapter().NativeToValue(v)
+	a.k.charge(frame, a, key)
+	return key
 }
 
 func (a *keyedAttribute) Eval(vars interpreter.Activation) ref.Val {
