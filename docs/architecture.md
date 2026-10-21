@@ -231,7 +231,11 @@ erDiagram
   principal sooner.
 - **Every write is recorded.** Each table above but `rbac_history` has the trigger
   `rbac_record`, which writes the change into `rbac_history`. Nothing updates or truncates that
-  table, and only `PruneHistory`, as a role with the rights of its owner, deletes from it.
+  table, and only `PruneHistory`, as a role with the rights of its owner, deletes from it. Each
+  record reads its key's last by history's index of each entity's keys, in a generic plan with
+  sequential scans off: a plan its session made while history was small would otherwise scan it,
+  or the tenant's records of the entity, for each row, so a statement writing many would take
+  time growing with the square of their number.
 
 ## Principals, groups and keys
 

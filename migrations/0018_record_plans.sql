@@ -1,0 +1,14 @@
+-- Recording a row reads its key's last record from history. PL/pgSQL keeps each statement's plan
+-- for as long as its session lasts, and after five runs plans it generically, by how large history
+-- was then: a session that first records rows while history is small, as a new deployment's or a
+-- restore's does, scanned all of history for each row from then on, until history was analyzed,
+-- so a statement writing many rows, as importing members or deleting a busy scope does, took time
+-- growing with the square of their number: 20,000 grants took 24 seconds to write and 29 to
+-- delete. Planned for each row instead, it read all of the tenant's records of the entity, by the
+-- smaller index of a scope's grants and eligibilities, which history's statistics, until it is
+-- analyzed, don't tell from the index of each entity's keys. A generic plan can't use an index
+-- that holds only some entities, as it doesn't know which entity it reads, so with sequential
+-- scans off the lookup has the one plan: history's index of each entity's keys, whatever history's
+-- size or statistics. A migration replacing the function sets these again, as it does its
+-- search_path.
+ALTER FUNCTION rbac_record() SET plan_cache_mode = force_generic_plan SET enable_seqscan = off;
