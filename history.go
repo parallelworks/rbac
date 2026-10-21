@@ -155,10 +155,16 @@ var maxPrune = MaxPrune
 // prunedWindow runs at the end of each of PruneHistory's transactions, on it, which a test sets.
 var prunedWindow = func(pgx.Tx) {}
 
+// inUTC puts a timestamptz in UTC by an offset, whatever the session's TimeZone: from PostgreSQL 18
+// a zone's name is first read as one of the TimeZone's own abbreviations, so under UTC+5, AT TIME
+// ZONE 'UTC' puts it five hours west.
+const inUTC = `AT TIME ZONE pg_catalog.interval '00:00'`
+
 // pruneKey and pruneThrough are a prune's time, $1, and cursor, $2 and $3, as its record holds
-// them, by which a prune of the same finds where the last stopped.
+// them, by which a prune of the same finds where the last stopped, and AsOf the latest prune: in
+// UTC, as text that sorts as its time, as every prune's key has been.
 const (
-	pruneKey     = `to_char($1::pg_catalog.timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`
+	pruneKey     = `to_char($1::pg_catalog.timestamptz ` + inUTC + `, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`
 	pruneThrough = `jsonb_build_object('txid', $2::pg_catalog.xid8::pg_catalog.text, 'id', $3::bigint)`
 )
 

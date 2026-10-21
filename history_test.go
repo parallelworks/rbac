@@ -3307,6 +3307,55 @@ func TestPruningALongHistoryReadsAsMuchInEachTransaction(t *testing.T) {
 	}
 }
 
+// AsOf finds the latest prune by its record's key, its time in UTC, whatever the TimeZone of the
+// session that pruned: from PostgreSQL 18 one of UTC+5 makes AT TIME ZONE 'UTC' five hours west, so
+// a later prune made there was keyed before an earlier one, and AsOf read a time it had pruned. The
+// key is as one written before in UTC, which a prune of the same time goes on from.
+func TestAsOfRefusesATimeAPruneInAnotherTimeZonePruned(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'a', 'cluster.login')`)
+	exec(`UPDATE rbac_grants SET note = 'first' WHERE principal = 'user:a'`)
+	first := dbNow(t, h)
+	exec(`UPDATE rbac_grants SET note = 'second' WHERE principal = 'user:a'`)
+	second := dbNow(t, h)
+	exec(`UPDATE rbac_grants SET note = 'third' WHERE principal = 'user:a'`)
+	through := exported(t, h)
+	if n, err := rbac.PruneHistory(ctx, h.pool, first, through); err != nil || n == 0 {
+		t.Fatalf("PruneHistory as of first = %d, %v", n, err)
+	}
+	conn, err := h.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `SET TimeZone = 'UTC+5'`); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = conn.Exec(context.WithoutCancel(ctx), `RESET TimeZone`) }()
+	if n, err := rbac.PruneHistory(ctx, conn.Conn(), second, through); err != nil || n == 0 {
+		t.Fatalf("PruneHistory as of second under UTC+5 = %d, %v", n, err)
+	}
+	if got, err := notesAt(t, h, first); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("as of first, which the prune as of second pruned: %v, %v", got, err)
+	}
+	if got, err := notesAt(t, h, second); err != nil || got["a"] != "second" {
+		t.Errorf("as of second: %v, %v", got, err)
+	}
+	var keyed bool
+	if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM rbac_history WHERE entity = 'history' AND op = 'prune'
+		AND key = to_char($1::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'))`, second).Scan(&keyed); err != nil || !keyed {
+		t.Errorf("the prune as of second is keyed as a UTC session keyed one before: %t, %v", keyed, err)
+	}
+}
+
 // AsOf reads the latest prune's time from one record, which history's index finds by its key: what
 // it reads of history doesn't grow with the prunes recorded, which no prune removes, and a prune
 // recorded later can be of an earlier time.

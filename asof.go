@@ -135,10 +135,10 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	// or before PostgreSQL 18 timezone_abbreviations, reads as another zone's, hours off, and one of
 	// another field order reads its month as its day. From PostgreSQL 18 a TimeZone's own
 	// abbreviations name zones too, before any other, as UTC+5 makes UTC one five hours west, in
-	// AT TIME ZONE 'UTC' as in a time's text, and <AD>-2 makes its era one: so UTC is an offset here,
-	// and the format reads the era as its own field.
+	// AT TIME ZONE 'UTC' as in a time's text, and <AD>-2 makes its era one: so UTC is an offset here
+	// (inUTC), and the format reads the era as its own field.
 	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.as_of_tenant', $1, true),
-		set_config('rbac.as_of', pg_catalog.to_char($2::pg_catalog.timestamptz AT TIME ZONE pg_catalog.interval '00:00', '`+asOfTime+`'), true),
+		set_config('rbac.as_of', pg_catalog.to_char($2::pg_catalog.timestamptz `+inUTC+`, '`+asOfTime+`'), true),
 		set_config('plan_cache_mode', 'force_custom_plan', true)`,
 		tenant, at); err != nil {
 		return err
