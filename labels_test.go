@@ -7,6 +7,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1222,6 +1223,131 @@ func TestHoldersMarksAHolderAConstraintMayRemoveALabelValueFrom(t *testing.T) {
 	holders, err := h.authz.Holders(t.Context(), view, secret)
 	if err != nil || len(holders) != 1 || holders[0].Principal != owner.Principal || !holders[0].MaybeDenied {
 		t.Fatalf("Holders = %+v, %v", holders, err)
+	}
+}
+
+// A decision about a labeled resource asks the constraints about the values its label asks for
+// that the subject's grants give, once each, and not about the rest of what it holds: so a hook
+// failing on a value the label doesn't name fails none of them.
+func TestALabeledDecisionAsksTheConstraintsOnlyAboutTheValuesItsLabelAsksFor(t *testing.T) {
+	errDown := errors.New("the policy service is down")
+	var mu sync.Mutex
+	var asked []rbac.Permission
+	failing := false
+	h := setup(t, compartments, func(c *rbac.Config) {
+		c.Labels = append(c.Labels, rbac.LabelDimension{Name: "level", Rule: rbac.Ordered, Values: []string{"low", "mid", "high"}})
+		c.Catalog = append(c.Catalog, rbac.RoleDefinition{ID: "level.mid", Permissions: []rbac.Permission{"level:mid"}, ResourceTypes: []string{rbac.TenantScope}})
+		c.Constraints = []rbac.Constraint{{Name: "policy", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if dim, _, _ := strings.Cut(string(in.Permission), ":"); dim == "comp" || dim == "level" {
+				asked = append(asked, in.Permission)
+			}
+			if failing && in.Permission == "comp:c42" {
+				return false, errDown
+			}
+			return false, nil
+		}}}
+	})
+	ctx := t.Context()
+	tenant := rbac.TenantRoot("t1")
+	// Each holds sixty compartments and a level; all but the owner, whose admin role setup grants,
+	// may log in.
+	var grants []rbac.Grant
+	for _, id := range []string{"owner", "u0", "u1", "u2"} {
+		h.as(t, id)
+		grants = append(grants, grant(tenant, "compartments", rbac.User, id), grant(tenant, "level.mid", rbac.User, id))
+		if id != "owner" {
+			grants = append(grants, grant(cluster.Scope(), "cluster.login", rbac.User, id))
+		}
+	}
+	h.seed(t, grants...)
+	u, owner := h.as(t, "u0"), h.as(t, "owner")
+	// The label values the constraint is asked about while call runs, which succeeds.
+	askedIn := func(name string, call func() error) []rbac.Permission {
+		t.Helper()
+		mu.Lock()
+		asked = nil
+		mu.Unlock()
+		if err := call(); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Sorted(slices.Values(asked))
+	}
+	labeledCluster := func(l rbac.Label) rbac.Resource {
+		r := cluster
+		r.Labels = l
+		return r
+	}
+	// An Ordered label asks about the values as high as its own, and an AllOf one about its own.
+	mid := []rbac.Permission{"level:mid"}
+	for _, c := range []struct {
+		label rbac.Label
+		want  []rbac.Permission
+	}{
+		{rbac.Label{"level": {"low"}}, mid},
+		{rbac.Label{"level": {"mid"}}, mid},
+		{rbac.Label{"comp": {"c59", "c00"}}, []rbac.Permission{"comp:c00", "comp:c59"}},
+		{rbac.Label{"level": {"mid"}, "comp": {"c07"}}, []rbac.Permission{"comp:c07", "level:mid"}},
+	} {
+		got := askedIn("Authorize", func() error { return h.authz.Authorize(ctx, u, login, labeledCluster(c.label)) })
+		if !slices.Equal(got, c.want) {
+			t.Errorf("a check labeled %v asks about %v, not %v", c.label, got, c.want)
+		}
+	}
+	secret := labeledCluster(rbac.Label{"level": {"mid"}})
+	for _, c := range []struct {
+		name string
+		call func() error
+	}{
+		{"Explain", func() error {
+			d, err := h.authz.Explain(ctx, u, login, secret)
+			if err == nil && !d.Allowed {
+				err = fmt.Errorf("refused: %+v", d)
+			}
+			return err
+		}},
+		{"Permissions", func() error {
+			perms, err := h.authz.Permissions(ctx, u, secret)
+			if err == nil && !slices.Contains(perms, login) {
+				err = fmt.Errorf("lists %v", perms)
+			}
+			return err
+		}},
+		{"Grantable", func() error {
+			roles, err := h.authz.Grantable(ctx, owner, secret)
+			if err == nil && len(roles) == 0 {
+				err = errors.New("offers nothing")
+			}
+			return err
+		}},
+		{"Apply", func() error {
+			return h.authz.Apply(ctx, owner, secret, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: u.Principal}}})
+		}},
+	} {
+		if got := askedIn(c.name, c.call); !slices.Equal(got, mid) {
+			t.Errorf("%s on a resource labeled %v asks about %v", c.name, secret.Labels, got)
+		}
+	}
+	var holders []rbac.Holder
+	got := askedIn("Holders", func() (err error) {
+		holders, err = h.authz.Holders(ctx, login, secret)
+		return err
+	})
+	if len(holders) != 4 || len(got) != len(holders) || slices.ContainsFunc(got, func(p rbac.Permission) bool { return p != "level:mid" }) {
+		t.Errorf("Holders of %d asks about %v", len(holders), got)
+	}
+
+	mu.Lock()
+	failing = true
+	mu.Unlock()
+	if err := h.authz.Authorize(ctx, u, login, secret); err != nil {
+		t.Errorf("a hook failing on a value the label doesn't name: %v", err)
+	}
+	if err := h.authz.Authorize(ctx, u, login, labeledCluster(rbac.Label{"comp": {"c42"}})); !errors.Is(err, errDown) {
+		t.Errorf("a hook failing on a value the label names: %v", err)
 	}
 }
 
