@@ -1709,10 +1709,12 @@ func (a *Authorizer) inTxReaching(ctx context.Context, tenant string, actor Prin
 type gains struct {
 	// widened are the identities, by key, whose memberships or places in groups it widened.
 	widened []string
-	// rewrote are the grants of the event, by id, and its eligibilities, by eligibilityKey, it only
-	// rewrote, gaining nothing: a grant granted again, which changes only its note and its
-	// condition's title and description, and an eligibility in force set again to end no later,
-	// which every value it gives counts by already, whatever it requires.
+	// rewrote are the grants of the event, by id, its eligibilities, by eligibilityKey, and its
+	// custom roles, by id, it only rewrote, gaining nothing: a grant granted again, which changes
+	// only its note and its condition's title and description, an eligibility in force set again
+	// to end no later, which every value it gives counts by already, whatever it requires, and a
+	// role redefined so that its grants give no exclusive value they couldn't (addsExclusive), as
+	// one renamed or narrowed.
 	rewrote map[string]bool
 }
 

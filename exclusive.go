@@ -227,12 +227,13 @@ func (a *Authorizer) Conflicts(ctx context.Context, tenant string) ([]Conflict, 
 // exclusive dimension: those whose grants or eligibilities it set, those holding a custom role it
 // redefined, and those, by key, whose memberships or places in groups it widened (g). Denies don't
 // count, so lifting one is no change to check, and neither does a membership or place it only
-// made end sooner, a removal then, nor a grant or an eligibility it only rewrote. One able to hold
-// two before the change, as after a catalog change, is refused too, as the check reads the tenant
-// as the change leaves it.
+// made end sooner, a removal then, nor a grant, an eligibility or a role it only rewrote. One able
+// to hold two before the change, as after a catalog change, is refused too, as the check reads the
+// tenant as the change leaves it.
 func (a *Authorizer) excludes(ctx context.Context, tx pgx.Tx, tenant string, e ChangeEvent, g gains) error {
 	e.Granted = slices.DeleteFunc(slices.Clone(e.Granted), func(gr Grant) bool { return g.rewrote[gr.ID] })
 	e.Eligible = slices.DeleteFunc(slices.Clone(e.Eligible), func(el Eligibility) bool { return g.rewrote[eligibilityKey(el)] })
+	e.Roles = slices.DeleteFunc(slices.Clone(e.Roles), func(r RoleDefinition) bool { return g.rewrote[string(r.ID)] })
 	widened := g.widened
 	gives := a.exclusiveValues(a.cfg.Catalog)
 	// The tenant's custom roles are read only for a change that can reach someone, so one granting

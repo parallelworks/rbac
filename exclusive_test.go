@@ -1130,3 +1130,48 @@ func TestRewritingAGrantOrAnEligibilityIsNotCheckedForExclusiveValues(t *testing
 	excluded(t, h.authz.SetEligibility(ctx, admin, tenantT1, eligibility))
 	excluded(t, h.authz.Apply(ctx, admin, tenantT1, rbac.Change{Grant: []rbac.Binding{{Role: "bank.a", Principal: x.Principal, ExpiresAt: ends}}}))
 }
+
+// Renaming a custom role, or narrowing it off a permission that is no exclusive value, gives no
+// one a value, as rewriting a grant's note doesn't: in a tenant where a catalog change left a
+// holder of the role able to hold two of bank's values, each is made, while redefining it to give
+// a value it didn't, or to be public, which its grants to the public then give, is refused.
+func TestRenamingOrNarrowingARoleIsNotRefusedForAConflictItFound(t *testing.T) {
+	h := labeled(t, func(c *rbac.Config) {
+		banks(c)
+		c.Labels[len(c.Labels)-1].Exclusive = false
+	})
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	h.hold(t, "admin", "bank:a", "comp:alpha")
+	r := rbac.RoleDefinition{ID: "custom.liaison", Name: "Liaison", Permissions: []rbac.Permission{"bank:a", "comp:alpha"}, ResourceTypes: []string{rbac.TenantScope}}
+	if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
+		t.Fatal(err)
+	}
+	h.as(t, "ann")
+	h.seed(t, grant(rbac.TenantRoot("t1"), r.ID, rbac.User, "ann"))
+	h.hold(t, "ann", "bank:b")
+	cfg := h.cfg
+	cfg.Labels = slices.Clone(cfg.Labels)
+	cfg.Labels[len(cfg.Labels)-1].Exclusive = true
+	authz, err := rbac.New(h.pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Name, r.Description = "Partner liaison", "Speaks for the bank"
+	if err := authz.SetRole(ctx, admin, "t1", r); err != nil {
+		t.Errorf("renaming the role: %v", err)
+	}
+	r.Permissions = []rbac.Permission{"bank:a"}
+	if err := authz.SetRole(ctx, admin, "t1", r); err != nil {
+		t.Errorf("narrowing the role off a permission that is no exclusive value: %v", err)
+	}
+	public := r
+	public.Public = true
+	excluded(t, authz.SetRole(ctx, admin, "t1", public))
+	// By one holding bank:c, as a definer holds what the role gives.
+	root := rbac.TenantRoot("t1")
+	h.seed(t, grant(root, "tenant.roles", rbac.User, "definer"), grant(root, "tenant.admin", rbac.User, "definer"))
+	h.hold(t, "definer", "bank:c")
+	r.Permissions = []rbac.Permission{"bank:c"}
+	excluded(t, authz.SetRole(ctx, h.as(t, "definer"), "t1", r))
+}
