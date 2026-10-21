@@ -658,9 +658,9 @@ flowchart LR
   the label dimensions as they are now. Each statement reads history by the rows it names, through
   history's indexes, as a search the custom roles its grants name, by their ids, and its principals'
   grants by principal and type, which history's index of a principal's versions holds beside the
-  scope, as a check seeks them on its resource's path. The view of
-  custom roles takes each one's newest version, testing none for a later one, so `Grantable`,
-  which can offer any, reads each version once.
+  scope, as a check seeks them on its resource's path. The view of custom roles takes each one's
+  newest version, testing none for a later one, so `Grantable`, which can offer any, reads each
+  version once.
 - **PruneHistory** deletes only what an export has read and later versions supersede. It keeps
   each row's last version at or before its time, so AsOf answers as before for any later time,
   and refuses an earlier one; of a row whose last version by then ended it, it deletes every
