@@ -378,8 +378,9 @@ change it waited for, but at REPEATABLE READ or SERIALIZABLE its transaction's s
 and it is dated before that change. Write around the package at READ COMMITTED. `AsOf` makes no
 change: one tried is no actor's attempt, and `Config.OnRefused` isn't told of it. A statement
 reads the history of the rows it names, as a check does its subject's grants, groups and the
-denies on its resource's path, a search the custom roles its grants name, and `Holders` the
-members of the groups it lists, not the whole tenant's: `AsOf` plans every statement in its
+denies on its resource's path, a search its subject's grants, and the public's and the members' it
+counts, on each type it lists, and the custom roles they name, and `Holders` the members of the
+groups it lists, not the whole tenant's: `AsOf` plans every statement in its
 transaction for its arguments, the host's too, since a connection's cached plan of a statement it
 has run often counts any tenant as an average one. A list counts the denies on scopes of its types
 by history's versions of them, at most a few, and `Grantable`, which can offer any custom role,
@@ -460,7 +461,7 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   A migration that rebuilds an index, as `0009_grant_seeks` rebuilds two of `rbac_grants`, locks
   the table until it commits, so checks, lists and changes wait for the rebuild; one that builds
   an index, as `0011_tenant_keys` builds three on `rbac_eligibilities` and `rbac_denies` and
-  `0019_custom_grant_principals` one on `rbac_grants`, keeps writes to the table waiting until it
+  `0019_principal_seeks` one on `rbac_grants`, keeps writes to the table waiting until it
   commits, though reads go on: on a large table, migrate when that wait is acceptable. Code from before `0012_activation_through` must not run beside code
   after it: an activation it extends keeps the eligibility recorded before, and can outlast the one
   it was extended through. Stop the replicas running it before migrating. `0013_bounded_rows`
@@ -481,7 +482,10 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   table locks each of its indexes, the rebuild waits for the reads of history running, as an
   export, and every read of history then waits until migrating commits. A transaction that read
   history and then reads one of those tables deadlocks with the rebuild, and PostgreSQL ends one
-  of the two: migrate again.
+  of the two: migrate again. `0019_principal_seeks` rebuilds history's index of a principal's
+  versions, which reads all of history, and analyzes it: reads of history, and every change, as each
+  writes history, wait until it commits, and a transaction that read history and then writes a
+  grant deadlocks with it, as above.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
   between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows

@@ -651,7 +651,9 @@ flowchart LR
 - **AsOf** stands temporary views of history in for the tables, in a transaction it rolls back,
   so every check, list and search answers as it would have at a past time, with the catalog and
   the label dimensions as they are now. Each statement reads history by the rows it names, through
-  history's indexes, as a search the custom roles its grants name, by their ids. The view of
+  history's indexes, as a search the custom roles its grants name, by their ids, and its principals'
+  grants by principal and type, which history's index of a principal's versions holds beside the
+  scope, as a check seeks them on its resource's path. The view of
   custom roles takes each one's newest version, testing none for a later one, so `Grantable`,
   which can offer any, reads each version once.
 - **PruneHistory** deletes only what an export has read and later versions supersede. It keeps
