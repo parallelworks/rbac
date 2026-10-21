@@ -1297,9 +1297,13 @@ func (a *keyedAttribute) qualifier(vars interpreter.Activation) (interpreter.Qua
 	}
 	a.k.charge(vars, a, v)
 	// An index never runs the key, so finiteKey doesn't see it: a map the host passes would find
-	// an infinite key, where `in` refuses one.
-	if nonFinite(a.Adapter().NativeToValue(v)) {
-		return nil, errNonFiniteKey
+	// an infinite key, where `in` refuses one. CEL indexes by a double only for these, and
+	// converting any other again would parse a JSON attribute a second time.
+	switch d := v.(type) {
+	case float32, float64, types.Double:
+		if nonFinite(a.Adapter().NativeToValue(d)) {
+			return nil, errNonFiniteKey
+		}
 	}
 	return a.k.fac.NewQualifier(nil, attr.ID(), v, attr.IsOptional())
 }
