@@ -428,11 +428,13 @@ var maxUnsized = 100
 // rows' JSON and their text past MaxHistoryBytes, unless it is the first: a read of fewer than limit
 // records doesn't mean history holds no more, so read until one reads none. It orders records by
 // the transaction that wrote them and reads only those of transactions older than any still
-// running, so a transaction that commits after a later one is read after it, never skipped. Transaction ids are the database cluster's, so a
-// transaction running anywhere in it, in any database, holds the read back until it ends: a long
-// one, or a prepared transaction left open, delays the export. A record can be read twice, as when
-// a host retries a read whose result it lost: dedupe on ID and RecordedAt, since a restore can
-// give another record the ID of one it lost.
+// running, so a transaction that commits after a later one is read after it, never skipped.
+// Transaction ids are the database cluster's, so a transaction running anywhere in it, in any
+// database, holds the read back until it ends: a long one, or a prepared transaction left open,
+// delays the export. A session may turn off the timeouts that would end one it leaves open, so
+// watch pg_stat_activity for one held too long and end it, as the README says. A record can be
+// read twice, as when a host retries a read whose result it lost: dedupe on ID and RecordedAt,
+// since a restore can give another record the ID of one it lost.
 //
 // It reads the primary, and fails on a replica, which can't tell which timeline it follows until
 // long after a failover. A failover or a recovery to a point in time starts a new generation, and
