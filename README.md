@@ -448,7 +448,11 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   it was extended through. Stop the replicas running it before migrating. `0013_bounded_rows`
   locks every table, history too, until it commits, and reads each once for each check it adds,
   so checks, lists, changes and reads of history wait for it. `0015_history_seeks` builds two
-  indexes on `rbac_history`, which every change writes, so changes wait until it commits.
+  indexes on `rbac_history`, which every change writes, and analyzes it, so changes wait until it
+  commits. Building one calls `rbac_tenant_keys` and `rbac_text_array` as history's role, as
+  recording each deny does from then on, so it grants that role `EXECUTE` on both where it lacks
+  it. Where new functions give PUBLIC no `EXECUTE`, grant it on `rbac_text_array` to the
+  application's role too, as `AsOf` calls it.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
   between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows

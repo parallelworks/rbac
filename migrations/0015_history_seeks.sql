@@ -27,6 +27,32 @@ CREATE FUNCTION rbac_text_array(a jsonb) RETURNS text[]
     RETURN ARRAY(SELECT e FROM pg_catalog.jsonb_array_elements_text(
         CASE WHEN pg_catalog.jsonb_typeof(a) OPERATOR(pg_catalog.=) 'array' THEN a END) AS e);
 
+-- Building the index and analyzing history call both functions as history's owner, and recording a
+-- deny from then on calls them as rbac_record's. Where a host revoked EXECUTE on them from PUBLIC
+-- and granted it to the application's role alone, migrating would fail on a history holding a
+-- deny, and every change to a deny after it.
+DO $$
+DECLARE
+    here  pg_catalog.text := pg_catalog.current_schema();
+    keys  pg_catalog.regprocedure := pg_catalog.format('%I.rbac_tenant_keys(pg_catalog.text, pg_catalog.text[])', here);
+    texts pg_catalog.regprocedure := pg_catalog.format('%I.rbac_text_array(pg_catalog.jsonb)', here);
+    owner pg_catalog.text;
+BEGIN
+    FOR owner IN SELECT r.rolname FROM pg_catalog.pg_roles r
+        WHERE r.oid IN ((SELECT c.relowner FROM pg_catalog.pg_class c
+                         WHERE c.oid = pg_catalog.format('%I.rbac_history', here)::pg_catalog.regclass),
+                        (SELECT p.proowner FROM pg_catalog.pg_proc p
+                         WHERE p.oid = pg_catalog.format('%I.rbac_record()', here)::pg_catalog.regprocedure))
+          AND NOT (pg_catalog.has_function_privilege(r.oid, keys, 'EXECUTE') AND pg_catalog.has_function_privilege(r.oid, texts, 'EXECUTE'))
+    LOOP
+        EXECUTE pg_catalog.format('GRANT EXECUTE ON FUNCTION %s, %s TO %I', keys, texts, owner);
+    END LOOP;
+END $$;
+
 CREATE INDEX rbac_history_deny_principals ON rbac_history
     USING gin (rbac_tenant_keys(tenant, rbac_text_array(after -> 'principals') COLLATE "C")) WITH (fastupdate = off)
     WHERE entity = 'deny';
+
+-- The statistics are empty until history is next analyzed, which autovacuum does of a table only
+-- once a tenth of its rows are new since the last time: on a large history, long after migrating.
+ANALYZE rbac_history;

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"slices"
 	"strings"
 	"testing"
@@ -783,8 +784,9 @@ func TestAsOfListsAPrincipalsMembershipsAloneWhateverTheSessionsPlans(t *testing
 }
 
 // customRolesAsOf is how many pages of history a check by s reads as of now, beside many tenants'
-// history, before the tenant has other custom roles and once it has 200, each defined twice.
-func customRolesAsOf(t *testing.T, h *harness, s rbac.Subject) (few, many int64) {
+// history, before the tenant has other custom roles and once it has 200, each defined twice. With
+// plans, the read sets its transaction's plan_cache_mode to it first.
+func customRolesAsOf(t *testing.T, h *harness, s rbac.Subject, plans string) (few, many int64) {
 	t.Helper()
 	ctx := t.Context()
 	read := func(at time.Time) int64 {
@@ -796,6 +798,11 @@ func customRolesAsOf(t *testing.T, h *harness, s rbac.Subject) (few, many int64)
 		defer func() { _ = tx.Rollback(ctx) }()
 		var read int64
 		if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+			if plans != "" {
+				if _, err := tx.Exec(ctx, `SELECT set_config('plan_cache_mode', $1, true)`, plans); err != nil {
+					return err
+				}
+			}
 			start := historyPages(ctx, t, tx)
 			err := a.Authorize(ctx, s, login, cluster)
 			read = historyPages(ctx, t, tx) - start
@@ -822,36 +829,139 @@ func customRolesAsOf(t *testing.T, h *harness, s rbac.Subject) (few, many int64)
 	return few, read(dbNow(t, h))
 }
 
+// heldCustomRoleAsOf is customRolesAsOf for a subject whose grant names a custom role.
+func heldCustomRoleAsOf(t *testing.T, h *harness) (few, many int64) {
+	t.Helper()
+	u := h.as(t, "u")
+	if _, err := h.pool.Exec(t.Context(), `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.login', '{cluster:login}', '{cluster}')`); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), "custom.login", rbac.User, "u"))
+	return customRolesAsOf(t, h, u, "")
+}
+
+// skewed is crowded where history's statistics leave out the tenant's custom roles: they hold
+// only the commonest tenant and entity, another tenant's grants.
+func skewed(t *testing.T) *harness {
+	t.Helper()
+	h := crowded(t, pgtest.Open(t, "default_statistics_target=1"))
+	if _, err := h.pool.Exec(t.Context(), `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		SELECT 'large', 'cluster', 'c' || i, 'user', 'u' || i, 'cluster.login' FROM generate_series(1, 5000) i`); err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
 // As of a time, a check reads the custom role its grant names by its id, however few of history's
 // records, among many tenants', are the tenant's custom roles: counted as a row, they would all be
 // read for each version of the one it holds.
 func TestAsOfReadsACheckersCustomRoleAloneAmongManyTenants(t *testing.T) {
-	h := crowded(t, pgtest.Open(t, ""))
-	ctx := t.Context()
-	u := h.as(t, "u")
-	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.login', '{cluster:login}', '{cluster}')`); err != nil {
-		t.Fatal(err)
-	}
-	h.seed(t, grant(cluster.Scope(), "custom.login", rbac.User, "u"))
-	if few, many := customRolesAsOf(t, h, u); many > few*3/2+deeper {
+	if few, many := heldCustomRoleAsOf(t, crowded(t, pgtest.Open(t, ""))); many > few*3/2+deeper {
 		t.Errorf("a check as of a time read %d pages of history beside no other custom role, and %d beside 200", few, many)
 	}
 }
 
-// As of a time, a check reads no custom role its grants don't name, as history's statistics can
-// leave out the tenant's: here they hold only the commonest tenant and entity, another tenant's
-// grants.
+// As of a time, a check seeks the custom role its grant names by its key where history's
+// statistics leave out the tenant's: by its role column, which every grant of the role shares too,
+// a plan counting the tenant's roles as a few reads every version of each.
+func TestAsOfReadsAHeldCustomRoleByItsKey(t *testing.T) {
+	if few, many := heldCustomRoleAsOf(t, skewed(t)); many > few*3/2+deeper {
+		t.Errorf("a check as of a time read %d pages of history beside no other custom role, and %d beside 200", few, many)
+	}
+}
+
+// As of a time, a check reads no custom role its grants don't name, however its statements are
+// planned: a read may plan its transaction's generically, which, matching the roles to the grants,
+// reads every version of the tenant's custom roles again for each.
 func TestAsOfReadsNoCustomRoleACheckDoesntName(t *testing.T) {
-	h := crowded(t, pgtest.Open(t, "default_statistics_target=1"))
-	ctx := t.Context()
+	h := crowded(t, pgtest.Open(t, ""))
 	u := h.as(t, "u")
 	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
-	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
-		SELECT 'large', 'cluster', 'c' || i, 'user', 'u' || i, 'cluster.login' FROM generate_series(1, 5000) i`); err != nil {
+	if few, many := customRolesAsOf(t, h, u, "force_generic_plan"); many > few*3/2+deeper {
+		t.Errorf("a check as of a time read %d pages of history beside no custom role, and %d beside 200", few, many)
+	}
+}
+
+// Migrating counts the history recorded before it by tenant and entity together, rather than once
+// autovacuum next analyzes it, which on a large history is long after.
+func TestMigratingCountsHistoryByTenantAndEntity(t *testing.T) {
+	pool := pgtest.Open(t, "")
+	ctx := t.Context()
+	migrateFiles(t, pool, "", "0015")
+	if _, err := pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+		SELECT 't1', 'custom.r' || i, '{cluster:login}', '{cluster}' FROM generate_series(1, 100) i`); err != nil {
 		t.Fatal(err)
 	}
-	if few, many := customRolesAsOf(t, h, u); many > few*3/2+deeper {
-		t.Errorf("a check as of a time read %d pages of history beside no custom role, and %d beside 200", few, many)
+	migrateFiles(t, pool, "0015", "")
+	var counted bool
+	if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_catalog.pg_stats_ext WHERE statistics_schemaname = current_schema()
+		AND statistics_name = 'rbac_history_tenant_entity' AND most_common_vals IS NOT NULL)`).Scan(&counted); err != nil {
+		t.Fatal(err)
+	}
+	if !counted {
+		t.Error("once migrated, history's statistics of tenant and entity together are empty")
+	}
+}
+
+// History's index of the keys denies name reads each deny record's principals, which a record
+// written as history's owner can hold as any JSON: one that isn't an array is indexed as naming
+// none, an array's other values as their text, and history takes each, as it takes any record.
+func TestHistoryTakesADenyRecordWhosePrincipalsArentStrings(t *testing.T) {
+	h := setup(t)
+	for _, principals := range []string{`"user:u"`, `1`, `null`, `{"user": "u"}`, `[1, null, {"a": "b"}, ["user:u"]]`} {
+		if _, err := h.pool.Exec(t.Context(), `INSERT INTO rbac_history (effective_at, tenant, entity, key, op, after)
+			VALUES (now(), 't1', 'deny', 'cluster:c1 d', 'create', jsonb_build_object('principals', $1::jsonb))`, principals); err != nil {
+			t.Errorf("history refuses a deny record whose principals are %s: %v", principals, err)
+		}
+	}
+}
+
+// History's index of the keys denies name calls rbac_tenant_keys and rbac_text_array as history's
+// owner, as migrating builds it and each time a deny is recorded. Where history's role holds no
+// EXECUTE on them, as a host that revoked it from PUBLIC and granted it to the application's role
+// alone has it, migrating gives it that, so neither migrating nor a change to a deny fails.
+func TestMigratingLetsHistorysRoleCallWhatItsIndexCalls(t *testing.T) {
+	pool := pgtest.Open(t, "")
+	ctx := t.Context()
+	migrateFiles(t, pool, "", "0015")
+	if _, err := pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+		VALUES ('t1', 'cluster', 'c1', 'd', '{user:u}', '{cluster:login}')`); err != nil {
+		t.Fatal(err)
+	}
+	migration, err := fs.ReadFile(rbac.Migrations(), "0015_history_seeks.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	history, schema := role(t, tx)
+	app, _ := role(t, tx)
+	for _, sql := range []string{
+		`GRANT USAGE ON SCHEMA ` + pgx.Identifier{schema}.Sanitize() + ` TO ` + history + `, ` + app,
+		`ALTER TABLE rbac_history OWNER TO ` + history,
+		`ALTER FUNCTION rbac_record() OWNER TO ` + history,
+		`REVOKE EXECUTE ON FUNCTION rbac_tenant_keys(text, text[]) FROM PUBLIC`,
+		`GRANT EXECUTE ON FUNCTION rbac_tenant_keys(text, text[]) TO ` + app,
+		`GRANT INSERT ON rbac_denies TO ` + app,
+	} {
+		if _, err := tx.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	if _, err := tx.Exec(ctx, string(migration)); err != nil {
+		t.Fatalf("migrating where history's role may not call rbac_tenant_keys: %v", err)
+	}
+	for _, sql := range []string{
+		`SET LOCAL ROLE ` + app,
+		`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+		  VALUES ('t1', 'cluster', 'c2', 'd', '{user:u}', '{cluster:login}')`,
+	} {
+		if _, err := tx.Exec(ctx, sql); err != nil {
+			t.Fatalf("once migrated, %s: %v", sql, err)
+		}
 	}
 }
 
