@@ -112,12 +112,15 @@ var publicKey = Principal{Kind: Public}.key()
 // public.
 func (p Principal) broad() bool { return p.Kind == Members || p.Kind == Public }
 
-// broadKinds are the kinds of the broad principals, as a statement's argument, and broadKindsSQL
-// as SQL.
-var (
-	broadKinds    = []string{string(Members), string(Public)}
-	broadKindsSQL = fmt.Sprintf(`ARRAY['%s', '%s']::text[]`, Members, Public)
-)
+// broadKinds are the kinds of the broad principals, as a statement's argument.
+var broadKinds = []string{string(Members), string(Public)}
+
+// narrowKey is SQL for whether the principal key col is neither the public's nor a tenant's
+// members', as its kind would say: the indexes leading to a principal hold its key, not its kind, so
+// a read testing the kind fetches each grant's row.
+func narrowKey(col string) string {
+	return fmt.Sprintf(`(%[1]s <> '%[2]s' AND %[1]s NOT LIKE '%[3]s:%%')`, col, publicKey, Members)
+}
 
 // wellFormed reports whether p could hold grants in a tenant, whether or not its kind is
 // declared, as a revoke needs.

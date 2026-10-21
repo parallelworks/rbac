@@ -3342,43 +3342,107 @@ func TestChecksReadTheirGrantsFromAnIndexAlone(t *testing.T) {
 						SELECT 't1', 'tenant', 't1', 'user', id, 'cluster.login' FROM others`, "rbac_grants")
 				}
 			}
-			// So the visibility map lets a scan of an index skip the rows. VACUUM marks none visible to
-			// all while an older snapshot elsewhere in the database, such as another run's, is open.
-			for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(time.Second) {
-				if _, err := h.pool.Exec(ctx, `VACUUM rbac_grants`); err != nil {
-					t.Fatal(err)
-				}
-				var visible bool
-				if err := h.pool.QueryRow(ctx, `SELECT relallvisible >= relpages FROM pg_class WHERE oid = 'rbac_grants'::regclass`).Scan(&visible); err != nil {
-					t.Fatal(err)
-				}
-				if visible {
-					break
-				}
-				if time.Now().After(deadline) {
-					t.Skip("an older snapshot elsewhere in the database keeps rbac_grants' rows from being visible to all")
-				}
-			}
+			grantsVisibleToAll(t, h)
 			tx, err := h.pool.Begin(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer func() { _ = tx.Rollback(ctx) }()
-			// The pages of the table itself, not its indexes: its rows and its visibility map.
-			rows := func() int64 {
-				t.Helper()
-				var n int64
-				if err := tx.QueryRow(ctx, `SELECT pg_stat_get_xact_blocks_fetched('rbac_grants'::regclass)`).Scan(&n); err != nil {
-					t.Fatal(err)
-				}
-				return n
-			}
-			start := rows()
+			start := grantRowsRead(ctx, t, tx)
 			if err := h.authz.WithTx(tx).Authorize(ctx, ann, login, cluster); err != nil {
 				t.Fatal(err)
 			}
-			if read := rows() - start; read > int64(held/4) {
+			if read := grantRowsRead(ctx, t, tx) - start; read > int64(held/4) {
 				t.Errorf("a check of a subject holding %d grants read %d pages of the table's rows", held, read)
+			}
+		})
+	}
+}
+
+// grantsVisibleToAll vacuums rbac_grants until its visibility map marks every row visible to all, so
+// a scan of an index can skip the rows. VACUUM marks none so while an older snapshot elsewhere in
+// the database, such as another run's, is open: then it skips the test.
+func grantsVisibleToAll(t *testing.T, h *harness) {
+	t.Helper()
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(time.Second) {
+		if _, err := h.pool.Exec(t.Context(), `VACUUM rbac_grants`); err != nil {
+			t.Fatal(err)
+		}
+		var visible bool
+		if err := h.pool.QueryRow(t.Context(), `SELECT relallvisible >= relpages FROM pg_class WHERE oid = 'rbac_grants'::regclass`).Scan(&visible); err != nil {
+			t.Fatal(err)
+		}
+		if visible {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Skip("an older snapshot elsewhere in the database keeps rbac_grants' rows from being visible to all")
+		}
+	}
+}
+
+// grantRowsRead is how many pages of rbac_grants itself, not its indexes, tx has read: its rows and
+// its visibility map.
+func grantRowsRead(ctx context.Context, t *testing.T, tx pgx.Tx) int64 {
+	t.Helper()
+	var n int64
+	if err := tx.QueryRow(ctx, `SELECT pg_stat_get_xact_blocks_fetched('rbac_grants'::regclass)`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// Filter, its condition in the host's query, and Reachable read their subject's grants from an index
+// alone, under a generic plan too, as a check does: they told the broad principals' grants by their
+// kind, which no index of the grants holds, so they read the row of each grant of the subject's on
+// the listed types, as one on each of thousands of clusters it created, which grants made at
+// different times have on pages of their own.
+func TestListingsReadTheirGrantsFromAnIndexAlone(t *testing.T) {
+	for _, plan := range []string{"force_custom_plan", "force_generic_plan"} {
+		t.Run(plan, func(t *testing.T) {
+			h := crowded(t, pgtest.Open(t, "plan_cache_mode="+plan))
+			ctx := t.Context()
+			hostTable(t, h)
+			u := h.as(t, "u")
+			// u's grants, each made beside others' grants, as grants made over time are.
+			const held = 1000
+			manyMembers(t, h, held, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+				SELECT 't1', 'cluster', id, 'user', id, 'cluster.login' FROM others
+				UNION ALL SELECT 't1', 'cluster', id, 'user', 'u', 'cluster.login' FROM others`, "rbac_grants")
+			grantsVisibleToAll(t, h)
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			a := h.authz.WithTx(tx)
+			for _, c := range []struct {
+				what string
+				f    func() error
+			}{
+				{"Filter and its condition", func() error {
+					pred, err := a.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+					if err != nil {
+						return err
+					}
+					var n int
+					return tx.QueryRow(ctx, `SELECT count(*) FROM clusters WHERE `+pred.SQL, pred.Args...).Scan(&n)
+				}},
+				{"Reachable", func() error {
+					reach, err := a.Reachable(ctx, u, login, "t1", "cluster")
+					if err == nil && len(reach.Scopes) != held {
+						err = fmt.Errorf("Reachable reached %d scopes", len(reach.Scopes))
+					}
+					return err
+				}},
+			} {
+				start := grantRowsRead(ctx, t, tx)
+				if err := c.f(); err != nil {
+					t.Fatalf("%s: %v", c.what, err)
+				}
+				if read := grantRowsRead(ctx, t, tx) - start; read > held/100 {
+					t.Errorf("%s of a subject holding %d grants read %d pages of the table's rows", c.what, held, read)
+				}
 			}
 		})
 	}

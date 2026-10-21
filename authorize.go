@@ -1097,19 +1097,19 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 	if err != nil {
 		return Reach{}, err
 	}
-	args := append(append([]any{
+	args := append([]any{
 		tenant, principals, roles, a.cfg.Now(), reaching, publicKey, a.publicRoles(roles),
 		string(p), resourceType,
-	}, through...), broadKinds)
+	}, through...)
 	// The subject's grants on scopes of the types are read once, and of the custom roles those that
 	// they name (namedCustom).
 	rows, err := a.db.Query(ctx, `
-		WITH held AS MATERIALIZED (`+byType("$5", "g.scope, g.conditional, g.role, g.principal, g.principal_kind", `
+		WITH held AS MATERIALIZED (`+byType("$5", "g.scope, g.conditional, g.role, g.principal", `
 		  g.tenant = $1 AND g.principal = ANY($2::text[]) AND (g.expires_at IS NULL OR g.expires_at > $4)`)+`)
 		SELECT scope, bool_and(conditional) FROM held
 		WHERE role = ANY(`+givingSQL("$3", "$1", "$8", "$9", custom, namedCustom("SELECT role FROM held"), false)+`)
 		  AND (principal <> $6 OR role = ANY(`+givingSQL("$7", "$1", "$8", "$9", custom, "$10", true)+`))
-		  AND (principal_kind <> ALL($13::text[]) OR role = ANY(`+givingSQL("$11", "$1", "$8", "$9", custom, "$12", false)+`))
+		  AND (`+narrowKey("principal")+` OR role = ANY(`+givingSQL("$11", "$1", "$8", "$9", custom, "$12", false)+`))
 		GROUP BY scope ORDER BY scope`, args...)
 	if err != nil {
 		return Reach{}, err
@@ -1489,7 +1489,7 @@ func filterGrants(arg func(int) string, custom bool, types string) string {
 
 // filterHeld is SQL selecting the subject's grants filterGrants reads, as held.
 func filterHeld(arg func(int) string, types string) string {
-	return byType(types, "g.scope, g.role, g.principal, g.principal_kind", fmt.Sprintf(`g.tenant = %s::text AND g.principal = ANY(%s)
+	return byType(types, "g.scope, g.role, g.principal", fmt.Sprintf(`g.tenant = %s::text AND g.principal = ANY(%s)
 		  AND (g.expires_at IS NULL OR g.expires_at > %s) AND NOT g.conditional`, arg(1), filterKeys(arg, countedKeys(arg(13), arg(17))), arg(4)))
 }
 
@@ -1497,10 +1497,10 @@ func filterHeld(arg func(int) string, types string) string {
 func filterCounted(arg func(int) string, custom bool) string {
 	return fmt.Sprintf(`role = ANY(%s)
 		  AND (principal <> %s::text OR role = ANY(%s))
-		  AND (principal_kind <> ALL(%s) OR role = ANY(%s))`,
+		  AND (%s OR role = ANY(%s))`,
 		givingSQL(arg(3), arg(1), arg(8), arg(9), custom, namedCustom("SELECT role FROM held"), false), arg(6),
 		givingSQL(arg(7), arg(1), arg(8), arg(9), custom, arg(10), true),
-		broadKindsSQL, givingSQL(arg(11), arg(1), arg(8), arg(9), custom, arg(12), false))
+		narrowKey("principal"), givingSQL(arg(11), arg(1), arg(8), arg(9), custom, arg(12), false))
 }
 
 // grantCounts counts, with Filter's arguments args, the grants its condition counts (filterGrants)
