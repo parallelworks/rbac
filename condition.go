@@ -383,12 +383,19 @@ func (c *conditions) build(expr string) (program, error) {
 		return program{}, fmt.Errorf("%w: %w", errCondition, err)
 	}
 	limit := worstCost(checked, patterns)
-	prg, err := c.env.Program(checked, cel.CostLimit(limit), cel.CostTracking(costs{patterns}),
-		cel.OptimizeRegex(matching(patterns)), cel.CustomDecorator(bounded))
+	prg, err := c.env.Program(checked, planning(checked, patterns, limit)...)
 	if err != nil {
 		return program{}, fmt.Errorf("%w: %w", errCondition, err)
 	}
 	return program{Program: prg, typed: c.typeCheck(expr), readsAction: reading(checked.NativeRep(), "action"), limit: limit}, nil
+}
+
+// planning plans checked to run within limit, as costs charges its calls.
+func planning(checked *cel.Ast, patterns map[string]uint64, limit uint64) []cel.ProgramOption {
+	return []cel.ProgramOption{
+		cel.CostLimit(limit), cel.CostTracking(costs{patterns}), cel.OptimizeRegex(matching(patterns)),
+		cel.CustomDecorator(bounded), cel.CustomDecoratorV2(stepping(checked.NativeRep())),
+	}
 }
 
 // typeCheck returns why expr doesn't check against the declared attributes: it reads one they
@@ -417,6 +424,8 @@ type costs struct{ patterns map[string]uint64 }
 func (c costs) CallCost(function, _ string, args []ref.Val, _ ref.Val) *uint64 {
 	n := uint64(1)
 	switch function {
+	case looping:
+		n = 0
 	case overloads.Matches:
 		if len(args) != 2 {
 			return nil
@@ -866,6 +875,63 @@ func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 		return op(args[0], args[1])
 	}), nil
 }
+
+// looping is what costs charges a loop's literal condition as: nothing, as CEL charges a literal.
+const looping = "@looping"
+
+// stepping keeps CEL's cost tracking from holding what each step of checked's loops evaluated
+// until the loop ends. The tracking holds each value evaluated, to charge a call by its arguments,
+// and drops it once what reads it is charged, but nothing reads a step's value or its condition's,
+// so it drops what a loop's steps kept only once the loop ends, and each search for a value that
+// wasn't evaluated, as a branch not taken, an identifier's own or the argument a failing call
+// never reached, reads all of it. A loop over a list the host passes would take time growing with
+// the square of its length, past what it is charged, and one whose steps fail, charged little, the
+// most. Each step evaluates its condition first, so a loop's condition is planned instead as a call
+// whose first argument is the loop's range: charging it drops what the steps before kept, and
+// costs what charging the condition did.
+func stepping(checked *ast.AST) interpreter.InterpretableDecoratorV2 {
+	ranges := map[int64]int64{}
+	for _, e := range ast.MatchDescendants(ast.NavigateAST(checked), ast.KindMatcher(ast.ComprehensionKind)) {
+		ranges[e.AsComprehension().LoopCondition().ID()] = e.AsComprehension().IterRange().ID()
+	}
+	return func(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
+		over, ok := ranges[i.ID()]
+		if !ok {
+			return i, nil
+		}
+		// The tracking finds what it holds by id, the range's before the steps', and drops it with
+		// all held after it.
+		from := interpreter.NewConstValue(over, types.NullValue)
+		switch cond := i.(type) {
+		case interpreter.InterpretableConst:
+			return &step{cond: i, over: over, function: looping, args: []interpreter.InterpretableV2{from}}, nil
+		case interpreter.InterpretableCall:
+			// The macros' other condition, which CEL charges 1 whatever its arguments.
+			if cond.Function() == operators.NotStrictlyFalse {
+				args := append([]interpreter.InterpretableV2{from}, cond.Args()...)
+				return &step{cond: i, over: over, function: cond.Function(), overload: cond.OverloadID(), args: args}, nil
+			}
+		}
+		// Another version of CEL may plan a loop otherwise, which would run unbounded.
+		return nil, fmt.Errorf("a loop's condition is planned as %T, which this package doesn't bound", i)
+	}
+}
+
+// step is a loop's condition as stepping plans it. It has the id of the loop's range, so the
+// tracking holds its value as the range's, which the next step's condition drops.
+type step struct {
+	cond               interpreter.InterpretableV2
+	over               int64
+	function, overload string
+	args               []interpreter.InterpretableV2
+}
+
+func (s *step) ID() int64                                      { return s.over }
+func (s *step) Function() string                               { return s.function }
+func (s *step) OverloadID() string                             { return s.overload }
+func (s *step) Args() []interpreter.InterpretableV2            { return s.args }
+func (s *step) Exec(frame *interpreter.ExecutionFrame) ref.Val { return s.cond.Exec(frame) }
+func (s *step) Eval(a interpreter.Activation) ref.Val          { return s.Exec(interpreter.AsFrame(a)) }
 
 // ordering is x compared with y by an ordering operator, as CEL orders them, once bounded has
 // refused a double that isn't finite.

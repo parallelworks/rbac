@@ -5,6 +5,9 @@ import (
 	"time"
 
 	"cel.dev/cel-go/cel"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
+	"cel.dev/cel-go/interpreter"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -205,16 +208,86 @@ func ConditionCostOn(t *testing.T, expr string, s Subject, p Permission, r Resou
 	if err != nil {
 		t.Fatal(err)
 	}
-	unlimited, err := c.env.Program(checked, cel.CostLimit(maxCost), cel.CostTracking(costs{patterns}),
-		cel.OptimizeRegex(matching(patterns)), cel.CustomDecorator(bounded))
+	unlimited, err := c.env.Program(checked, planning(checked, patterns, maxCost)...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	a := &Authorizer{cfg: Config{Now: time.Now}, conds: c}
 	vars := a.vars(WithRequest(t.Context(), attributes), s, p, r)
-	_, details, _ := unlimited.Eval(vars)
-	return prg.limit, *details.ActualCost()
+	return prg.limit, evaluate(program{Program: unlimited, limit: maxCost}, vars).cost
 }
+
+// TrackedValues is what evaluating expr costs, on a request with attributes, which the resource
+// carries too, as declares declares them, and how many values CEL's cost tracking holds at most as
+// the evaluation reaches a uint literal, and how many times it does.
+func TrackedValues(t *testing.T, declares Attributes, expr string, attributes map[string]any) (cost uint64, most, reached int) {
+	t.Helper()
+	c, err := newConditions(declares)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked, iss := c.env.Compile(expr)
+	if iss.Err() != nil {
+		t.Fatal(iss.Err())
+	}
+	patterns, err := checkPatterns(checked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	limit := worstCost(checked, patterns)
+	p := &probing{}
+	prg, err := c.env.Program(checked, append(planning(checked, patterns, limit), cel.CustomDecoratorV2(p.decorate))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Authorizer{cfg: Config{Now: time.Now, Attributes: declares}, conds: c}
+	vars := a.vars(WithRequest(t.Context(), attributes), Subject{Principal: Principal{Kind: User, ID: "u"}}, "cluster:login",
+		Resource{Tenant: "t", Type: "cluster", ID: "c", Attributes: attributes})
+	return evaluate(program{Program: prg, limit: limit}, vars).cost, p.most, p.reached
+}
+
+// probing plans each uint literal as a probe, which evaluates and is charged as the literal, but
+// which CEL's cost tracking reads as a call of an argument none of the values it holds is of, so
+// it reads them all.
+type probing struct{ read, most, reached int }
+
+func (p *probing) decorate(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
+	if c, ok := i.(interpreter.InterpretableConst); ok {
+		if _, isUint := c.Value().(types.Uint); isUint {
+			return &probe{InterpretableV2: i, p: p}, nil
+		}
+	}
+	return i, nil
+}
+
+type probe struct {
+	interpreter.InterpretableV2
+	p *probing
+}
+
+func (*probe) Function() string   { return "@probe" }
+func (*probe) OverloadID() string { return "" }
+func (r *probe) Args() []interpreter.InterpretableV2 {
+	return []interpreter.InterpretableV2{unheld{r.p}}
+}
+
+func (r *probe) Exec(frame *interpreter.ExecutionFrame) ref.Val {
+	r.p.read = 0
+	r.p.reached++
+	return r.InterpretableV2.Exec(frame)
+}
+
+// unheld counts each value the tracking reads in search of it.
+type unheld struct{ p *probing }
+
+func (u unheld) ID() int64 {
+	u.p.read++
+	u.p.most = max(u.p.most, u.p.read)
+	return -1
+}
+
+func (unheld) Eval(interpreter.Activation) ref.Val      { return types.NullValue }
+func (unheld) Exec(*interpreter.ExecutionFrame) ref.Val { return types.NullValue }
 
 // SetHoldingPlaces runs f as Activate begins holding the places in groups it can rest on, and what
 // f returns once it holds them, until t ends.

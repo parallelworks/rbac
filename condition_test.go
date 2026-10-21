@@ -753,6 +753,42 @@ func TestAConditionCostsNoMoreThanItsBoundWhereCELExpandsMacrosOtherwise(t *test
 	}
 }
 
+// CEL's cost tracking holds what a loop's steps evaluate until they are charged, and a loop's own
+// values until it ends, and reads all it holds in search of what a step didn't evaluate, as the
+// argument a failing call never reached: each step of a loop over a list the host passes would
+// take longer than the one before, past what it is charged, and one failing, charged little, the
+// most. It holds no more for a step than the step evaluates, whatever came before.
+func TestALoopsStepsTakeNoLongerForTheStepsBefore(t *testing.T) {
+	l := make([]any, 3000)
+	for i := range l {
+		l[i] = strings.Repeat("q", i%50)
+	}
+	attributes := map[string]any{"l": l, "zero": uint(0), "m": map[string]any{"a": uint(1)}, "secret": 1}
+	declares := rbac.Attributes{Resource: map[string]rbac.AttributeType{"secret": rbac.AttrString}}
+	for name, expr := range map[string]string{
+		"indexing a string":     `request.attributes.l.exists_one(z, 1u == z[0])`,
+		"an index out of range": `request.attributes.l.exists_one(z, [1u, z][2] == z)`,
+		"a missing key":         `request.attributes.l.exists_one(z, 1u == request.attributes.m[z])`,
+		"a type mismatch":       `request.attributes.l.exists_one(z, 1u < z)`,
+		"a division by zero":    `request.attributes.l.exists_one(z, 1u / request.attributes.zero == 1u)`,
+		"a refused attribute":   `request.attributes.l.exists_one(z, 1u == resource.attributes.secret)`,
+		"failing in map()":      `request.attributes.l.map(z, 1u > 0u, 1u + z).size() == 0`,
+		"failing in filter()":   `request.attributes.l.filter(z, 1u < z).size() == 0`,
+		"failing in all()":      `request.attributes.l.all(z, 1u < z)`,
+		"failing in exists()":   `request.attributes.l.exists(z, 1u < z)`,
+		"failing in a nested":   `request.attributes.l.exists(y, [y, y].exists_one(z, 1u < z))`,
+		"steps that don't fail": `request.attributes.l.all(z, uint(size(z)) < 100u) && request.attributes.l.exists_one(z, 1u > uint(size(z)))`,
+	} {
+		cost, most, reached := rbac.TrackedValues(t, declares, expr, attributes)
+		if reached < 500 {
+			t.Fatalf("%s: %s reached a uint literal %d times, costing %d", name, expr, reached, cost)
+		}
+		if most > 16 {
+			t.Errorf("%s: %s held %d values, costing %d", name, expr, most, cost)
+		}
+	}
+}
+
 // A check passes ids, a kind, a type and a tenant of at most MaxID bytes, and a permission as the
 // action, so a condition comparing an attribute with one, as an owner's does, or finding one in a
 // map, costs little, and no more than its bound however long they are. A comprehension's variable
