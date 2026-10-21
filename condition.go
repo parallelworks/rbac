@@ -1027,7 +1027,7 @@ type step struct {
 	over               int64
 	function, overload string
 	args               []interpreter.InterpretableV2
-	// limit is the condition's, which its loops' steps together may not pass.
+	// limit is the condition's, which its loops' steps and its keys together may not pass.
 	limit uint64
 }
 
@@ -1038,10 +1038,11 @@ func (s *step) Args() []interpreter.InterpretableV2   { return s.args }
 func (s *step) Eval(a interpreter.Activation) ref.Val { return s.Exec(interpreter.AsFrame(a)) }
 
 // Exec counts the step, and cancels the evaluation past its limit, as CEL cancels one costing more.
+// The keys charged count too: a loop after them would take a limit of steps more, past it already.
 func (s *step) Exec(frame *interpreter.ExecutionFrame) ref.Val {
 	c, _ := frame.ResolveName(stepsName)
 	n, ok := c.(*counting)
-	if !ok || n.steps >= s.limit {
+	if !ok || cost.SafeAdd(n.steps, n.keys) >= s.limit {
 		panic(interpreter.EvalCancelledError{Cause: interpreter.CostLimitExceeded, Message: "rbac: a condition's loops take more steps than it may cost"})
 	}
 	n.steps++

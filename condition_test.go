@@ -1012,6 +1012,24 @@ func (f finds) Find(key ref.Val) (ref.Val, bool) {
 	return f.Mapper.Find(key)
 }
 
+// iterated counts the elements a loop over a list takes.
+type iterated struct {
+	traits.Lister
+	n *int
+}
+
+func (l iterated) Iterator() traits.Iterator { return iterating{l.Lister.Iterator(), l.n} }
+
+type iterating struct {
+	traits.Iterator
+	n *int
+}
+
+func (i iterating) Next() ref.Val {
+	*i.n++
+	return i.Iterator.Next()
+}
+
 // CEL doesn't count what a condition's keys cost past its own charge: one whose keys cost more
 // than its limit stops before a map reads the next, as one CEL charges more stops, and one they
 // take past its limit, though CEL charges it less, fails as if it had stopped.
@@ -1027,6 +1045,17 @@ func TestAConditionsKeysPastItsLimitFailIt(t *testing.T) {
 	// 10,000 is all a condition may cost, and each key costs 200.
 	if n > 50 {
 		t.Errorf("a condition whose keys cost more than its limit looked up %d", n)
+	}
+	// Nor does a loop after keys costing all but a step of the limit take more than that step.
+	n = 0
+	l := iterated{types.NewDynamicList(types.DefaultTypeAdapter, make([]any, 20000)), &n}
+	key = strings.Repeat("k", 99990)
+	expr = `request.attributes.m[request.attributes.key] == 1 && request.attributes.l.all(i, true)`
+	if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"m": map[string]any{key: 1}, "key": key, "l": l}); err != nil || evaluated {
+		t.Errorf("a loop after a key of %d bytes: evaluated %t, %v", len(key), evaluated, err)
+	}
+	if n > 2 {
+		t.Errorf("a loop after keys costing the limit took %d steps", n)
 	}
 	key = strings.Repeat("k", 60000)
 	attributes := map[string]any{"m": map[string]any{key: 1}, "key": key, "t": key}
