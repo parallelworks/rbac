@@ -166,6 +166,17 @@ func (a *Authorizer) checkMembership(m Membership, now time.Time) error {
 	return nil
 }
 
+// keptAgain checks, under a change's locks, the memberships or members it checked before its
+// transaction, at the time it reads there, as a change checks a grant's end again: one ending while
+// it waited would be stored and reported already ended.
+func keptAgain[T any](set []T, now time.Time, check func(T, time.Time) error) error {
+	errs := make([]error, len(set))
+	for i, m := range set {
+		errs[i] = check(m, now)
+	}
+	return errors.Join(errs...)
+}
+
 // SetMemberships makes identities members or guests of a tenant, or changes how, as actor: the
 // host's own write, without the checks a change by a tenant's admins has, as Import is for grants.
 // It reports the memberships it set or changed. An identity whose membership had ended joins again
@@ -174,6 +185,7 @@ func (a *Authorizer) checkMembership(m Membership, now time.Time) error {
 // whose policy decides by membership, as none privileged for a guest, checks what one holds when
 // it makes it a guest or lifts its suspension.
 func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant string, ms []Membership) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "SetMemberships")
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -223,6 +235,9 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 		// would remove them, each membership held before its members as there, so the two never
 		// deadlock; and any places of an identity with no membership, which joins in none.
 		at := a.cfg.Now()
+		if err := keptAgain(set, at, a.checkMembership); err != nil {
+			return ChangeEvent{}, nil, err
+		}
 		var widened []string
 		if a.exclusive() {
 			if widened, err = widening(ctx, tx, tenant, set, keys, at); err != nil {
@@ -406,6 +421,7 @@ func checkGroup(g GroupDefinition) error {
 // by its label, nor by the group's, as Config.ResourceOf gives the group. A group from a source the
 // host owns (Config.Sources) only the host changes, with ImportGroups.
 func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string, g GroupDefinition) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "SetGroup")
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -457,6 +473,7 @@ func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string,
 // the tenant made, from one of Config.Sources, removes the members it has from no source of the
 // host's, which ChangeEvent.Left reports.
 func (a *Authorizer) ImportGroups(ctx context.Context, actor Principal, tenant string, groups []GroupDefinition) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "ImportGroups")
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -577,6 +594,7 @@ func upsertGroups(ctx context.Context, tx pgx.Tx, tenant string, actor Principal
 // exist does nothing, and asks Config.ResourceOf nothing of it; one the host no longer has
 // (ErrNotFound) it reads as unlabeled, as a removal reads any scope.
 func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id string) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "DeleteGroup")
 	if !validID(tenant) || !validGroupID(id) {
 		return fmt.Errorf("%w: DeleteGroup needs a tenant and a valid group", ErrInvalid)
@@ -746,6 +764,7 @@ func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string
 // rather than activate without approval. The activations its members made through it, or a group
 // it is in, are cut short or end, as by their leaving it, which DeleteGroup refuses instead.
 func (a *Authorizer) DeleteGroups(ctx context.Context, actor Principal, tenant string, ids []string) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "DeleteGroups")
 	if len(ids) > MaxBindings {
 		return fmt.Errorf("%w: a deletion names at most %d groups", ErrInvalid, MaxBindings)
@@ -1123,6 +1142,7 @@ func keyedAll(members []Member) error {
 // about each grant and eligibility a member gains, as with ChangeMembers, so about none of a place
 // made to end sooner, or whose note alone changes.
 func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant string, members []Member) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "ImportMembers")
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -1162,6 +1182,9 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 			return ChangeEvent{}, nil, err
 		}
 		now := a.cfg.Now()
+		if err := keptAgain(set, now, a.checkMember); err != nil {
+			return ChangeEvent{}, nil, err
+		}
 		r, err := a.restingIn(ctx, tx, tenant, set, expiring(set), now)
 		if err != nil {
 			return ChangeEvent{}, nil, err
@@ -1371,6 +1394,7 @@ func (a *Authorizer) placesBounded(ctx context.Context, tx pgx.Tx, tenant string
 // (ErrNotFound) as unlabeled. Members from a source the host owns, and the members of a group from
 // one, only the host changes, and what ImportMembers refuses, this does.
 func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant string, add, remove []Member) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "ChangeMembers")
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -1468,6 +1492,9 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 			return ChangeEvent{}, nil, err
 		}
 		now := a.cfg.Now()
+		if err := keptAgain(set, now, a.checkMember); err != nil {
+			return ChangeEvent{}, nil, err
+		}
 		r, err := a.restingIn(ctx, tx, tenant, slices.Concat(remove, set), slices.Concat(remove, expiring(set)), now)
 		if err != nil {
 			return ChangeEvent{}, nil, err
@@ -2407,6 +2434,7 @@ var nestingDepths = `
 // DeleteMembers removes members from a tenant's groups, each by its group, principal and source,
 // as actor: the host's own write, as for a directory it syncs from.
 func (a *Authorizer) DeleteMembers(ctx context.Context, actor Principal, tenant string, members []Member) (err error) {
+	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "DeleteMembers")
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)

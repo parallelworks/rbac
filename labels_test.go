@@ -1849,3 +1849,195 @@ func TestHoldersOfALabeledResourceReadEveryHoldersValuesAtOnce(t *testing.T) {
 		t.Errorf("Holders read grants %d times among 7 members, and %d among 207", n, m)
 	}
 }
+
+// lapsingMember is labeled with a public role giving level:low, which the public holds on the
+// tenant, and a deny there of level:low to the group g. u is a member of t1 until ends, in g,
+// granted cluster.login on low, the cluster labeled level:low. Before ends the deny takes the value
+// the label asks for, and after it u's grant no longer counts, so at no moment may u log in to low.
+func lapsingMember(t *testing.T, mutate ...func(*rbac.Config)) (h *harness, u rbac.Subject, low rbac.Resource, ends time.Time) {
+	t.Helper()
+	public := rbac.RoleDefinition{ID: "level.public", Permissions: []rbac.Permission{"level:low"}, ResourceTypes: []string{rbac.TenantScope}, Public: true}
+	h = labeled(t, append([]func(*rbac.Config){func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), public, tenantGuard) }}, mutate...)...)
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), public.ID, rbac.Public, ""), grant(cluster.Scope(), "cluster.login", rbac.User, "u"),
+		grant(rbac.TenantRoot("t1"), tenantGuard.ID, rbac.User, "guardian"))
+	u = h.as(t, "u", "g")
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), tenantT1, rbac.Deny{
+		ID: "g-low", Principals: []rbac.Principal{groupOf("g")}, Permissions: []rbac.Permission{"level:low"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	start := h.now
+	ends = start.Add(time.Minute)
+	if _, err := h.pool.Exec(ctx, `UPDATE rbac_memberships SET expires_at = $1 WHERE tenant = 't1' AND principal = 'user:u'`, ends); err != nil {
+		t.Fatal(err)
+	}
+	low = cluster
+	low.Labels = rbac.Label{"level": {"low"}}
+	for _, at := range []time.Time{start, ends} {
+		h.now = at
+		if allowed(t, h, u, login, low) {
+			t.Fatalf("at %v u may log in to the labeled cluster", at)
+		}
+	}
+	h.now = start
+	return h, u, low, ends
+}
+
+// A read of several statements decides at one time, so a membership ending as it runs can't leave
+// the subject's grants of one moment and its label values of another. Here the clock passes the
+// end of u's membership once the read has read u's grants.
+func TestALabeledReadDecidesAtOneTime(t *testing.T) {
+	for name, read := range map[string]func(t *testing.T, h *harness, u rbac.Subject, low rbac.Resource) bool{
+		"Explain": func(t *testing.T, h *harness, u rbac.Subject, low rbac.Resource) bool {
+			t.Helper()
+			d, err := h.authz.Explain(t.Context(), u, login, low)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return d.Allowed
+		},
+		"Reachable": func(t *testing.T, h *harness, u rbac.Subject, low rbac.Resource) bool {
+			t.Helper()
+			reach, err := h.authz.Reachable(t.Context(), u, login, "t1", "cluster")
+			if err != nil {
+				t.Fatal(err)
+			}
+			return (reach.All || slices.Contains(reach.Scopes, low.Scope())) && reach.Labels.Satisfies(low.Labels)
+		},
+		"Holders": func(t *testing.T, h *harness, u rbac.Subject, low rbac.Resource) bool {
+			t.Helper()
+			holders, err := h.authz.Holders(t.Context(), login, low)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return slices.ContainsFunc(holders, func(hd rbac.Holder) bool { return hd.Principal == u.Principal })
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, u, low, ends := lapsingMember(t)
+			start := h.now
+			for _, at := range []time.Time{start, ends} {
+				h.now = at
+				if read(t, h, u, low) {
+					t.Fatalf("at %v, with the clock still, u may log in to the labeled cluster", at)
+				}
+			}
+			h.now = start
+			passed := false
+			rbac.SetReadingRoles(t, func() {
+				if !passed {
+					passed = true
+					h.now = ends
+				}
+			})
+			if read(t, h, u, low) {
+				t.Error("u may log in to the labeled cluster, which no moment allowed")
+			}
+			if !passed {
+				t.Fatal("the read reached no hook")
+			}
+		})
+	}
+}
+
+// Filter decides at one time, so a membership ending as it builds its condition can't leave the
+// grants it counts of one moment and the holding it tests the label against of another. Here the
+// clock passes the end of u's membership once Filter has first read it.
+func TestFilterDecidesALabelAtOneTime(t *testing.T) {
+	var h *harness
+	var ends time.Time
+	passing := false
+	h, u, low, ends := lapsingMember(t, func(c *rbac.Config) {
+		now := c.Now
+		c.Now = func() time.Time {
+			at := now()
+			if passing {
+				passing, h.now = false, ends
+			}
+			return at
+		}
+	})
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE points (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL, labels text[] NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO points VALUES ('t1', $1, $2, '{level:low}')`, low.ID, h.path(t, low)); err != nil {
+		t.Fatal(err)
+	}
+	kept := func() bool {
+		t.Helper()
+		pred, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var n int
+		if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM points WHERE `+pred.SQL, pred.Args...).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n > 0
+	}
+	start := h.now
+	for _, at := range []time.Time{start, ends} {
+		h.now = at
+		if kept() {
+			t.Fatalf("at %v, with the clock still, Filter keeps the labeled cluster", at)
+		}
+	}
+	h.now, passing = start, true
+	if kept() {
+		t.Error("Filter keeps the labeled cluster, which no moment allowed")
+	}
+	if passing {
+		t.Fatal("Filter read no clock")
+	}
+}
+
+// Holding compares the expiry of the grants giving label values, and gives their denies'
+// conditions request.time, at one time: here u's grant of level:low ends 30 seconds in, and a deny
+// of it binds u for a minute, so at no moment does u hold it. Once Holding has read the grant, the
+// clock passes the deny's end.
+func TestHoldingComparesExpiryAndRequestTimeAtOneTime(t *testing.T) {
+	h := labeled(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), tenantGuard) })
+	ctx := t.Context()
+	start := h.now
+	ends, lifts := start.Add(30*time.Second), start.Add(time.Minute)
+	u := h.as(t, "u")
+	low := grant(rbac.TenantRoot("t1"), "level.low", rbac.User, "u")
+	low.ExpiresAt = ends
+	h.seed(t, low, grant(rbac.TenantRoot("t1"), tenantGuard.ID, rbac.User, "guardian"))
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), tenantT1, rbac.Deny{
+		ID: "freeze", Principals: []rbac.Principal{u.Principal}, Permissions: []rbac.Permission{"level:low"},
+		Condition: rbac.Condition{Expression: `request.time < timestamp("` + lifts.Format(time.RFC3339) + `")`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	holds := func() bool {
+		t.Helper()
+		held, err := h.authz.Holding(ctx, "t1", u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return held.Satisfies(rbac.Label{"level": {"low"}})
+	}
+	for _, at := range []time.Time{start, ends, lifts} {
+		h.now = at
+		if holds() {
+			t.Fatalf("at %v, with the clock still, u holds level:low", at)
+		}
+	}
+	h.now = start
+	passed := false
+	rbac.SetReadingRoles(t, func() {
+		if !passed {
+			passed = true
+			h.now = lifts
+		}
+	})
+	if holds() {
+		t.Error("u holds level:low, which it held at no moment")
+	}
+	if !passed {
+		t.Fatal("Holding reached no hook")
+	}
+}

@@ -31,6 +31,7 @@ type Decision struct {
 // ErrDenied, or ErrInvalid for malformed input, such as a permission or resource type the host
 // doesn't check (Config.Permissions), which can only be a mistake. Any error means no.
 func (a *Authorizer) Authorize(ctx context.Context, s Subject, p Permission, r Resource) error {
+	a = a.still()
 	d, err := a.decide(ctx, s, p, r, false)
 	if err != nil {
 		return err
@@ -44,6 +45,7 @@ func (a *Authorizer) Authorize(ctx context.Context, s Subject, p Permission, r R
 // Explain decides as Authorize does and says why: the grants that give the permission, or what
 // denied it.
 func (a *Authorizer) Explain(ctx context.Context, s Subject, p Permission, r Resource) (Decision, error) {
+	a = a.still()
 	return a.decide(ctx, s, p, r, true)
 }
 
@@ -289,6 +291,7 @@ func (h holding) carries(def RoleDefinition, p Permission) bool {
 
 // Permissions lists what the subject may do to r, sorted: the AuthZEN action search.
 func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]Permission, error) {
+	a = a.still()
 	if err := a.check(r); err != nil {
 		return nil, err
 	}
@@ -510,6 +513,7 @@ type Holder struct {
 // reads every grant on the path, of any role, so it takes longer with those that don't give p too,
 // as many to other members on the tenant.
 func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]Holder, error) {
+	a = a.still()
 	if err := a.check(r); err != nil {
 		return nil, err
 	}
@@ -1021,6 +1025,7 @@ type Reach struct {
 // limit or cursor, so Reach.Scopes grows with the scopes the subject's grants are on, as one on
 // each resource it created.
 func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, tenant, resourceType string) (Reach, error) {
+	a = a.still()
 	roles, removed, err := a.searchable(ctx, s, p, tenant, resourceType)
 	if err != nil || removed {
 		return Reach{}, err
@@ -1218,6 +1223,7 @@ type Predicate struct {
 // resource a deny covers, conditional ones included, so it never keeps one Authorize refuses:
 // Reachable's Conditional and ConditionalExcept name the scopes where that may be too strict.
 func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant, resourceType string, cols Columns, firstArg int) (Predicate, error) {
+	a = a.still()
 	if cols.Tenant == "" || cols.Path == "" || firstArg < 1 {
 		return Predicate{}, fmt.Errorf("%w: Filter needs the tenant and path columns and a first argument", ErrInvalid)
 	}

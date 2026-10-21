@@ -715,13 +715,16 @@ type Config struct {
 	// Labels declares the dimensions of the labels on data (Resource.Labels): a mandatory layer
 	// above every grant. A subject holds a dimension's values as permissions, `dimension:value`,
 	// which roles for the tenant give, and a check allows anything of a labeled resource only
-	// when what it holds satisfies the label. None, nothing is labeled. A check reads the
-	// subject's grants and its values in two statements, so changes committing between them can
-	// meet in an answer no single moment gave. Holders reads each holder's values, one after
-	// another. A deny of an Ordered value takes that value alone: to cap a level, deny it and every
-	// value above. Values are held on the tenant, so they are denied there: SetDeny refuses a deny
-	// of one on any other scope, which would bind no one. The conditions of a value's grants and
-	// denies read the tenant as their resource, never the labeled one.
+	// when what it holds satisfies the label. None, nothing is labeled. Checks, Permissions and
+	// Grantable read the subject's values in the statement that reads its grants, Explain and
+	// Reachable in the read's snapshot, and Holders every holder's at once, in its snapshot, so a
+	// label is decided by values of the moment the grants are; but under WithTx at READ COMMITTED,
+	// where each statement reads a snapshot of its own, Explain, Reachable and Holders can mix two
+	// states, as WithTx says. Filter fixes the holding when it is called. A deny of an Ordered value
+	// takes that value alone: to cap a level, deny it and every value above. Values are held on the
+	// tenant, so they are denied there: SetDeny refuses a deny of one on any other scope, which would
+	// bind no one. The conditions of a value's grants and denies read the tenant as their resource,
+	// never the labeled one.
 	Labels []LabelDimension
 	// OnChange runs in the transaction of every change but DeleteExpired, whose grants already
 	// gave nothing, once the change is written; an error rolls the change back. History records
@@ -737,7 +740,13 @@ type Config struct {
 	// host's transaction, which is still open, with its locks. Record it on a connection of the
 	// host's own, which the host's transaction rolling back leaves.
 	OnRefused func(ctx context.Context, r Refusal)
-	// Now is the clock that grant expiry is compared with; time.Now when nil.
+	// Now is the clock that expiry is compared with and conditions read as request.time; time.Now
+	// when nil. A call reads it once, where it first needs the time, so every statement it makes and
+	// every condition it evaluates are of one moment: read apart, a grant or a membership ending as
+	// the call runs could meet a deny, a condition or label values of a later moment. A change reads
+	// it once more in its transaction, under its locks, where it decides again, the ends of what it
+	// writes included. A call a hook makes, as a constraint's of GroupsOf, is a call of its own and
+	// reads it apart, so what the hook decides by is of its own moment, not the asking call's.
 	Now func() time.Time
 }
 
@@ -773,6 +782,8 @@ type Authorizer struct {
 	conds        *conditions
 	// labels are the label dimensions (Config.Labels), by name.
 	labels map[string]labelDimension
+	// clock is the time the call under way decides at (still), nil outside one.
+	clock *callClock
 }
 
 // permissionOn is a permission on a type of resource.
@@ -935,6 +946,36 @@ func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 	b := *a
 	b.db = tx
 	return &b
+}
+
+// still returns a for one call, deciding at one time (callClock); under a call already, a.
+func (a *Authorizer) still() *Authorizer {
+	if a.clock != nil {
+		return a
+	}
+	b := *a
+	b.clock = &callClock{host: a.cfg.Now}
+	b.cfg.Now = b.clock.now
+	return &b
+}
+
+// callClock is the time a call decides at: the host's clock read once, where the call first needs
+// the time, so every statement it makes and the request.time of every condition it evaluates are
+// of one moment. Read apart, a grant or a membership expiring between two readings could meet a
+// condition, a deny or label values of a later moment in an answer no single moment gave. A change
+// reads it again in its transaction (begin), which first needs it under its locks, where it decides
+// again by what committed before them.
+type callClock struct {
+	host func() time.Time
+	at   time.Time
+	read bool
+}
+
+func (c *callClock) now() time.Time {
+	if !c.read {
+		c.at, c.read = c.host(), true
+	}
+	return c.at
 }
 
 // GrantInput is a grant Config.ValidateGrant is asked about.

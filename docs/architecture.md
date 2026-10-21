@@ -597,6 +597,11 @@ flowchart TB
   READ one it rolls back. Explain, Reachable and Holders read what label values are decided by in
   it, and decide them after it, as the constraints are asked outside it.
   Under `WithTx` they read on the host's transaction at its isolation, AsOf in a savepoint.
+- **One time for a call.** A call reads `Config.Now` once, where it first needs the time: every
+  statement it makes compares expiry with it, and every condition reads it as `request.time`, so a
+  grant or a membership ending as the call runs can't meet a deny, a condition or label values of a
+  later moment. A change reads it again in its transaction, which first needs it under its locks,
+  where it decides again by what committed before them. As of a time, it is that time.
 - **Races** PostgreSQL refuses, such as a serialization failure or a deadlock between host
   transactions, match `ErrConflict`: try again.
 

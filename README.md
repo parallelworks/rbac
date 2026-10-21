@@ -159,10 +159,12 @@ names the scopes conditional ones reach, to check one by one.
   tenant's members or the public reads every member. A subject whose grants could give it two
   anyway, as after a catalog change, holds none of them, whatever the request, a constraint or a
   deny removes: checks and searches of its labels and of the values themselves refuse it, and it
-  can't hand them on. A change reaching it is refused until a removal leaves it one; `Conflicts`
-  lists them. A role giving two of them is refused. An `Ordered` dimension's higher values include
-  the lower, so it isn't exclusive, and in an `AllOf` one a label naming two is one no one can read,
-  as data that joins two parties is.
+  can't hand them on, but for those a role it holds lists in `GrantableRoles`, which it grants
+  without holding, as any such role: the identity it grants one to is checked as in any change, so
+  no one comes to hold two. A change reaching it is refused until a removal leaves it one;
+  `Conflicts` lists them. A role giving two of them is refused. An `Ordered` dimension's higher
+  values include the lower, so it isn't exclusive, and in an `AllOf` one a label naming two is one
+  no one can read, as data that joins two parties is.
 - **Conditions:** a grant can carry a CEL expression over the subject's, the resource's and the
   request's attributes (`Subject.Attributes`, `Resource.Attributes`, `rbac.WithRequest`), the time
   and the action. It gives its role only where the expression holds; one that fails is false.
@@ -519,7 +521,10 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   identity in 1,000 groups, a check took 550 ms, and 120 ms with JIT off, and Activate's statement
   spent 500 of its 650 ms compiling.
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
-  to run on a schedule, passing over what a change holds until the next run.
+  to run on a schedule, passing over what a change holds until the next run. A call reads
+  `Config.Now` once, which every expiry it compares and every condition's `request.time` read, so a
+  grant or a membership ending as it runs can't meet a deny, a condition or label values of a later
+  moment; a change reads it again under its locks, where it decides again.
 
 ## Development
 

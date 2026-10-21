@@ -8841,3 +8841,283 @@ func TestGrantableReadsAGrantAndItsCustomRoleAsOfOneMoment(t *testing.T) {
 		t.Fatalf("Grantable = %+v: a revoked grant offered what its role was widened to list after", roles)
 	}
 }
+
+// A check compares expiry and gives conditions request.time at one time, so a grant ending as it
+// runs can't meet a condition of a later moment. Here u's grant ends 30 seconds in, and a deny
+// binds u for a minute, so at no moment may u log in. Once the check has read the grant, the clock
+// passes the deny's end.
+func TestACheckComparesExpiryAndRequestTimeAtOneTime(t *testing.T) {
+	for name, may := range map[string]func(t *testing.T, h *harness, u rbac.Subject) bool{
+		"Authorize": func(t *testing.T, h *harness, u rbac.Subject) bool {
+			t.Helper()
+			return allowed(t, h, u, login, cluster)
+		},
+		"Permissions": func(t *testing.T, h *harness, u rbac.Subject) bool {
+			t.Helper()
+			perms, err := h.authz.Permissions(t.Context(), u, cluster)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return slices.Contains(perms, login)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), guardRole) })
+			start := h.now
+			ends, lifts := start.Add(30*time.Second), start.Add(time.Minute)
+			u := h.as(t, "u")
+			held := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+			held.ExpiresAt = ends
+			h.seed(t, held, grant(cluster.Scope(), guardRole.ID, rbac.User, "guardian"))
+			if err := h.authz.SetDeny(t.Context(), h.as(t, "guardian"), cluster, rbac.Deny{
+				ID: "freeze", Principals: []rbac.Principal{u.Principal}, Permissions: []rbac.Permission{login},
+				Condition: rbac.Condition{Expression: `request.time < timestamp("` + lifts.Format(time.RFC3339) + `")`},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for _, at := range []time.Time{start, ends, lifts} {
+				h.now = at
+				if may(t, h, u) {
+					t.Fatalf("at %v, with the clock still, u may log in", at)
+				}
+			}
+			h.now = start
+			passed := false
+			rbac.SetReadingRoles(t, func() {
+				if !passed {
+					passed = true
+					h.now = lifts
+				}
+			})
+			if may(t, h, u) {
+				t.Error("u may log in, which no moment allowed")
+			}
+			if !passed {
+				t.Fatal("the check reached no hook")
+			}
+		})
+	}
+}
+
+// timedChanges are changes x makes by a power, on c1 or the tenant, giving the permission denied
+// names: Apply granting v cluster.sudo, which the power's role lists, so it hands it on for good
+// whatever the power's end; and ChangeMembers adding v to crew, a group holding nothing.
+var timedChanges = map[string]struct {
+	power  rbac.Grant
+	denied rbac.Permission
+	change func(h *harness, x rbac.Subject) error
+}{
+	"Apply": {grant(cluster.Scope(), lister.ID, rbac.User, "x"), grantC, func(h *harness, x rbac.Subject) error {
+		return h.authz.Apply(h.ctx, x, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: identity("v")}}})
+	}},
+	"ChangeMembers": {grant(rbac.TenantRoot("t1"), groupMembers.ID, rbac.User, "x"), rbac.GroupMembers, func(h *harness, x rbac.Subject) error {
+		return h.authz.ChangeMembers(h.ctx, x, "t1", []rbac.Member{{Group: "crew", Principal: identity("v")}}, nil)
+	}},
+}
+
+// timedChange is setup for x to make a timed change by power, which ends 30 seconds in.
+func timedChange(t *testing.T, power rbac.Grant) (h *harness, x rbac.Subject, ends time.Time) {
+	t.Helper()
+	h = setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), lister, groupMembers) })
+	ends = h.now.Add(30 * time.Second)
+	power.ExpiresAt = ends
+	h.seed(t, power)
+	h.groups(t, "crew")
+	h.as(t, "v")
+	return h, h.as(t, "x"), ends
+}
+
+// A change compares expiry and gives conditions request.time at one time under its locks, so the
+// actor's power ending as it runs can't meet a condition of a later moment. Here x's power ends 30
+// seconds in, and a deny of it binding x for a minute commits once the change has checked x before
+// its transaction, so from then on no moment allows the change. Once the transaction has read x's
+// power, the clock passes the deny's end.
+func TestAChangeComparesExpiryAndRequestTimeAtOneTime(t *testing.T) {
+	for name, c := range timedChanges {
+		t.Run(name, func(t *testing.T) {
+			h, x, ends := timedChange(t, c.power)
+			ctx := t.Context()
+			start := h.now
+			lifts := start.Add(time.Minute)
+			freeze := func() {
+				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions, condition)
+					VALUES ('t1', 'tenant', 't1', 'freeze', '{user:x}', $1, $2)`,
+					[]string{string(c.denied)}, `request.time < timestamp("`+lifts.Format(time.RFC3339)+`")`); err != nil {
+					t.Error(err)
+				}
+			}
+			freeze()
+			for _, at := range []time.Time{start, ends, lifts} {
+				h.now = at
+				if err := c.change(h, x); !errors.Is(err, rbac.ErrDenied) {
+					t.Fatalf("at %v, with the clock still: %v", at, err)
+				}
+			}
+			if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_denies WHERE tenant = 't1' AND id = 'freeze'`); err != nil {
+				t.Fatal(err)
+			}
+			h.now = start
+			committed, passed := false, false
+			rbac.SetReadingRoles(t, func() {
+				// The change's transaction holds a connection of the test's pool; its reads before it
+				// hold none once read.
+				switch {
+				case h.pool.Stat().AcquiredConns() == 0:
+					if !committed {
+						committed = true
+						freeze()
+					}
+				case !passed:
+					passed = true
+					h.now = lifts
+				}
+			})
+			err := c.change(h, x)
+			if !passed {
+				t.Fatalf("the change read x's power in its transaction without reaching the hook: %v", err)
+			}
+			if !errors.Is(err, rbac.ErrDenied) {
+				t.Errorf("the change was made, which no moment since the deny allowed: %v", err)
+			}
+		})
+	}
+}
+
+// A change decides again under its locks at the time it is made, not the time it began: here x's
+// power ends once the change has checked it before its transaction, so the change is refused.
+func TestAChangeDecidesUnderItsLocksAtTheTimeItIsMade(t *testing.T) {
+	for name, c := range timedChanges {
+		t.Run(name, func(t *testing.T) {
+			h, x, ends := timedChange(t, c.power)
+			passed := false
+			rbac.SetReadingRoles(t, func() {
+				if h.pool.Stat().AcquiredConns() == 0 && !passed {
+					passed = true
+					h.now = ends
+				}
+			})
+			err := c.change(h, x)
+			if !passed {
+				t.Fatalf("the change read x's power before its transaction without reaching the hook: %v", err)
+			}
+			if !errors.Is(err, rbac.ErrDenied) {
+				t.Errorf("the change was made once x's power had ended: %v", err)
+			}
+		})
+	}
+}
+
+// Each call reads the host's clock once, where it first needs the time, so every statement it makes
+// and every condition it evaluates are of one moment, and a change once more in each of its
+// transactions, under its locks. The count is exact: a change that reads it before its transaction
+// and only once would decide under its locks at the time it began. Each call here reads through
+// several statements, conditions and label values; one that needs no time reads none.
+func TestEachCallReadsTheClockOnceAndAChangeAgainUnderItsLocks(t *testing.T) {
+	reads := 0
+	tenantGroups := rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}
+	h := labeled(t, banks, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), tenantGuard, groupMembers, tenantGroups, guardRole)
+		now := c.Now
+		c.Now = func() time.Time {
+			reads++
+			return now()
+		}
+	})
+	ctx := t.Context()
+	tenant := rbac.TenantRoot("t1")
+	admin := roleAdmin(t, h)
+	h.seed(t, grant(tenant, tenantGuard.ID, rbac.User, "admin"), grant(tenant, groupMembers.ID, rbac.User, "admin"),
+		grant(tenant, tenantGroups.ID, rbac.User, "admin"), grant(cluster.Scope(), guardRole.ID, rbac.User, "admin"))
+	h.hold(t, "admin", "level:high")
+	since := `timestamp("2000-01-01T00:00:00Z")`
+	high := grant(tenant, "level.high", rbac.User, "u")
+	high.Condition = rbac.Condition{Expression: `request.time > ` + since}
+	h.seed(t, high, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
+	u := h.as(t, "u", "crew")
+	v := h.as(t, "v")
+	if err := h.authz.SetDeny(ctx, admin, tenantT1, rbac.Deny{
+		ID: "past", Principals: []rbac.Principal{rbac.TenantMembers("t1")}, Permissions: []rbac.Permission{"level:mid"},
+		Condition: rbac.Condition{Expression: `request.time < ` + since},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	second := func(_ any, err error) error { return err }
+	for _, c := range []struct {
+		name  string
+		reads int
+		call  func() error
+	}{
+		{"Authorize", 1, func() error { return h.authz.Authorize(ctx, u, login, secret) }},
+		{"Explain", 1, func() error { return second(h.authz.Explain(ctx, u, login, secret)) }},
+		{"Permissions", 1, func() error { return second(h.authz.Permissions(ctx, u, secret)) }},
+		{"Holders", 1, func() error { return second(h.authz.Holders(ctx, login, secret)) }},
+		{"Reachable", 1, func() error { return second(h.authz.Reachable(ctx, u, login, "t1", "cluster")) }},
+		{"Filter", 1, func() error {
+			return second(h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1))
+		}},
+		{"Holding", 1, func() error { return second(h.authz.Holding(ctx, "t1", u)) }},
+		{"Grantable", 1, func() error { return second(h.authz.Grantable(ctx, admin, secret)) }},
+		{"Conflicts", 1, func() error { return second(h.authz.Conflicts(ctx, "t1")) }},
+		{"Grants", 1, func() error {
+			return second(h.authz.Grants(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}}))
+		}},
+		{"Memberships", 1, func() error { return second(h.authz.Memberships(ctx, "t1", nil)) }},
+		{"Members", 1, func() error { return second(h.authz.Members(ctx, "t1", "crew")) }},
+		{"GroupsOf", 1, func() error { return second(h.authz.GroupsOf(ctx, "t1", u.Principal)) }},
+		{"Apply", 2, func() error {
+			return h.authz.Apply(ctx, admin, secret, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: v.Principal}}})
+		}},
+		{"Import", 2, func() error {
+			return h.authz.Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "v")})
+		}},
+		{"DeleteGrants", 0, func() error {
+			return h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "v")})
+		}},
+		{"SetEligibility", 2, func() error {
+			return h.authz.SetEligibility(ctx, admin, secret, rbac.Eligibility{Role: "cluster.login", Principal: v.Principal, MaxDuration: time.Hour})
+		}},
+		{"Activate", 2, func() error {
+			return second(h.authz.Activate(ctx, v, secret, rbac.Activation{Role: "cluster.login", Duration: time.Minute, Justification: "on call"}))
+		}},
+		{"Deactivate", 0, func() error { return h.authz.Deactivate(ctx, v, secret, "cluster.login") }},
+		{"DeleteEligibility", 2, func() error { return h.authz.DeleteEligibility(ctx, admin, secret, "cluster.login", v.Principal) }},
+		{"SetDeny", 2, func() error {
+			return h.authz.SetDeny(ctx, admin, secret, rbac.Deny{ID: "d", Principals: []rbac.Principal{v.Principal}, Permissions: []rbac.Permission{root}})
+		}},
+		{"DeleteDeny", 2, func() error { return h.authz.DeleteDeny(ctx, admin, secret, "d") }},
+		{"SetRole", 2, func() error {
+			return h.authz.SetRole(ctx, admin, "t1", rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{login}, ResourceTypes: []string{"cluster"}})
+		}},
+		{"DeleteRole", 2, func() error { return h.authz.DeleteRole(ctx, admin, "t1", "custom.op") }},
+		{"SetGroup", 2, func() error { return h.authz.SetGroup(ctx, admin, "t1", rbac.GroupDefinition{ID: "team"}) }},
+		{"ImportGroups", 0, func() error { return h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "squad"}}) }},
+		{"ChangeMembers", 2, func() error {
+			return h.authz.ChangeMembers(ctx, admin, "t1", []rbac.Member{{Group: "team", Principal: v.Principal}}, nil)
+		}},
+		{"ImportMembers", 2, func() error {
+			return h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "squad", Principal: v.Principal}})
+		}},
+		{"DeleteMembers", 1, func() error {
+			return h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "squad", Principal: v.Principal}})
+		}},
+		{"DeleteGroup", 2, func() error { return h.authz.DeleteGroup(ctx, admin, "t1", "team") }},
+		{"DeleteGroups", 1, func() error { return h.authz.DeleteGroups(ctx, host, "t1", []string{"squad"}) }},
+		{"SetMemberships", 2, func() error {
+			return h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("w")}})
+		}},
+		{"DeleteScopes", 0, func() error { return h.authz.DeleteScopes(ctx, host, "t1", []rbac.Scope{workspace.Scope()}) }},
+		{"DeletePrincipal", 0, func() error { return h.authz.DeletePrincipal(ctx, host, "t1", v.Principal) }},
+		{"DeletePrincipalEverywhere", 0, func() error { return h.authz.DeletePrincipalEverywhere(ctx, host, identity("w")) }},
+		{"DeleteExpired", 1, func() error { return second(h.authz.DeleteExpired(ctx)) }},
+	} {
+		reads = 0
+		if err := c.call(); err != nil {
+			t.Errorf("%s: %v", c.name, err)
+		}
+		if reads != c.reads {
+			t.Errorf("%s read the clock %d times, not %d", c.name, reads, c.reads)
+		}
+	}
+}

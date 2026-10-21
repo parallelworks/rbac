@@ -299,6 +299,7 @@ func (h Holding) changed(ps map[Permission]bool, held bool) Holding {
 // decided as Permissions decides them, with ctx's request for their conditions, on the tenant
 // without attributes or a label (decidedOn).
 func (a *Authorizer) Holding(ctx context.Context, tenant string, s Subject) (Holding, error) {
+	a = a.still()
 	if !validID(tenant) {
 		return Holding{}, fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
