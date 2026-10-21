@@ -2192,7 +2192,13 @@ func TestEndingMembershipsNeverDeadlocksWithDeleteExpired(t *testing.T) {
 			}
 			ended := make(chan error, 1)
 			go func() { ended <- end(ctx, h.authz) }()
-			for !waiting("DELETE FROM rbac_members%") {
+			for blocked := false; !blocked; {
+				select {
+				case err := <-ended:
+					t.Fatalf("%s didn't wait for the held place: %v", name, err)
+				default:
+					blocked = waiting("DELETE FROM rbac_members%")
+				}
 			}
 			expired := make(chan error, 1)
 			go func() {
