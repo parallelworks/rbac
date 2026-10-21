@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -3908,6 +3909,111 @@ func TestAnEligibilityChangedWhileMembersAreAskedAboutIsTriedAgain(t *testing.T)
 	}
 }
 
+// A join is tried again when, while the host is asked about what the member gains, its group, or
+// another group the change adds a member to, comes to approve an eligibility's activations, or to
+// be exempt from a deny, on a scope the change didn't check: those are checked on their scopes, for
+// whichever of the groups reaches them, so they are compared for all of them.
+func TestAnApprovalOrExemptionMadeWhileMembersAreAskedAboutIsTriedAgain(t *testing.T) {
+	for name, meanwhile := range map[string]string{
+		"an approval": `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+			VALUES ('t1', 'cluster', 'c2', 'user', 'x', 'cluster.login', 3600, ARRAY['group:' || $1])`,
+		"an exemption": `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+			VALUES ('t1', 'cluster', 'c2', 'd', '{user:z}', ARRAY['group:' || $1], '{cluster:login}')`,
+	} {
+		// crew is the group whose member the host is asked about, and deck the other the change
+		// joins, which holds nothing, and comes after it.
+		for _, given := range []string{"crew", "deck"} {
+			t.Run(name+" to "+given, func(t *testing.T) {
+				var do func(context.Context) error
+				h := grouped(t, func(c *rbac.Config) {
+					c.ValidateGrant = func(ctx context.Context, _ rbac.DB, in rbac.GrantInput) error {
+						if f := do; f != nil && in.Via == rbac.ViaMembership {
+							do = nil
+							return f(ctx)
+						}
+						return nil
+					}
+				})
+				ctx := t.Context()
+				// crew holds a role on the cluster, so the join asks the host about it.
+				h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
+				h.groups(t, "deck")
+				h.join(t, "u", "v")
+				do = func(ctx context.Context) error {
+					_, err := h.pool.Exec(ctx, meanwhile, given)
+					return err
+				}
+				add := []rbac.Member{{Group: "crew", Principal: identity("u")}, {Group: "deck", Principal: identity("v")}}
+				if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", add, nil); !errors.Is(err, rbac.ErrConflict) {
+					t.Fatalf("a join to groups, %s given %s meanwhile: %v", given, name, err)
+				}
+				if do != nil {
+					t.Fatalf("the host should have been asked, and %s made meanwhile", name)
+				}
+			})
+		}
+	}
+}
+
+// What a change of members checks on a scope for whichever group reaches it is found once for all
+// the groups the change reaches, so it is checked for each: an actor that can't set the eligibility
+// one of them approves, or set the deny one is exempt from or named in, is refused a change of
+// their members, whichever comes first, and whether the others gain or leave.
+func TestChangingMembersOfManyGroupsChecksWhatEachReaches(t *testing.T) {
+	for _, c := range []struct {
+		name, reach string
+		joins       bool
+	}{
+		{"members joining groups, one approving", `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+			VALUES ('t1', 'cluster', 'k2', 'user', 'x', 'cluster.login', 3600, '{group:b}')`, true},
+		{"members joining groups, one exempt", `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+			VALUES ('t1', 'cluster', 'k2', 'd', '{user:z}', '{group:b}', '{cluster:login}')`, true},
+		{"members leaving groups, one named in a deny", `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+			VALUES ('t1', 'cluster', 'k2', 'd', '{group:b}', '{}', '{cluster:login}')`, false},
+	} {
+		for _, mixed := range []bool{false, true} {
+			name := c.name
+			if mixed {
+				name += ", while another group's members change the other way"
+			}
+			t.Run(name, func(t *testing.T) {
+				h := grouped(t)
+				ctx := t.Context()
+				h.groups(t, "a", "b")
+				h.join(t, "u", "v")
+				if _, err := h.pool.Exec(ctx, c.reach); err != nil {
+					t.Fatal(err)
+				}
+				// b reaches k2, where the manager may change nothing; a reaches nothing.
+				u, v := rbac.Member{Group: "a", Principal: identity("u")}, rbac.Member{Group: "b", Principal: identity("v")}
+				// Whether each joins its group, rather than leaves it.
+				joins := map[string]bool{"a": c.joins != mixed, "b": c.joins}
+				var add, remove []rbac.Member
+				for _, m := range []rbac.Member{u, v} {
+					if joins[m.Group] {
+						add = append(add, m)
+						continue
+					}
+					if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', $1, 'user', $2)`,
+						m.Group, m.Principal.ID); err != nil {
+						t.Fatal(err)
+					}
+					remove = append(remove, m)
+				}
+				manager := h.as(t, "manager")
+				if err := h.authz.ChangeMembers(ctx, manager, "t1", add, remove); !errors.Is(err, rbac.ErrDenied) {
+					t.Fatalf("a change of the members of a and b, which reaches k2: %v", err)
+				}
+				// a's member alone changes, as a reaches nothing.
+				add, remove = slices.DeleteFunc(add, func(m rbac.Member) bool { return m.Group == "b" }), slices.DeleteFunc(remove, func(m rbac.Member) bool { return m.Group == "b" })
+				if err := h.authz.ChangeMembers(ctx, manager, "t1", add, remove); err != nil {
+					t.Fatalf("a change of the members of a alone: %v", err)
+				}
+			})
+		}
+	}
+}
+
 func TestSearchesReadCustomRolesPrivilegedWhereEveryBuiltInRoleIs(t *testing.T) {
 	h := setup(t, func(c *rbac.Config) {
 		c.Catalog = slices.Clone(c.Catalog)
@@ -4305,6 +4411,340 @@ func TestChangingMembersReadsTheActorsAuthorityOnceForAllItReaches(t *testing.T)
 	}
 	if few, many := joinEach(2), joinEach(40); many != few {
 		t.Errorf("joining 2 groups read the actor's grants %d times, and 40, %d", few, many)
+	}
+}
+
+// The member a grant it gains names decides nothing of the actor's power to make it, so members
+// gaining the same grant are decided as one: an actor that changes access on the scope but may not
+// make it is refused it once, however many gain it, having allocated no more for them.
+func TestMembersGainingAGrantAreDecidedAsOne(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	h.groups(t, "crew")
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "lead"))
+	for _, q := range []string{
+		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.granter', '{cluster:view,cluster:grant}', '{cluster}')`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		 SELECT 't1', 'cluster', 'k' || i, p, id, r FROM generate_series(1, 25) i,
+		   (VALUES ('group', 'crew', 'cluster.login'), ('user', 'lead', 'custom.granter')) AS g(p, id, r)`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lead := h.as(t, "lead")
+	var allocated uint64
+	rbac.SetDecidingGrants(t, func() func() {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		before := m.TotalAlloc
+		return func() {
+			runtime.ReadMemStats(&m)
+			allocated += m.TotalAlloc - before
+		}
+	})
+	n := 0
+	// How many refusals adding count members to the group holds, and what deciding them allocated.
+	refuse := func(count int) (int, uint64) {
+		t.Helper()
+		var add []rbac.Member
+		var ms []rbac.Membership
+		for range count {
+			n++
+			p := identity(fmt.Sprintf("m%d", n))
+			add, ms = append(add, rbac.Member{Group: "crew", Principal: p}), append(ms, rbac.Membership{Principal: p})
+		}
+		if err := h.authz.SetMemberships(ctx, host, "t1", ms); err != nil {
+			t.Fatal(err)
+		}
+		allocated = 0
+		err := h.authz.ChangeMembers(ctx, lead, "t1", add, nil)
+		if !errors.Is(err, rbac.ErrDenied) {
+			t.Fatalf("adding %d members, by one who may not grant what they gain: %v", count, err)
+		}
+		return denials(err), allocated
+	}
+	oneRefused, oneAllocated := refuse(1)
+	manyRefused, manyAllocated := refuse(40)
+	if manyRefused != oneRefused {
+		t.Errorf("adding one member was refused %d times, and forty %d", oneRefused, manyRefused)
+	}
+	if manyAllocated > 2*oneAllocated {
+		t.Errorf("deciding what one member gains allocated %d bytes, and forty %d", oneAllocated, manyAllocated)
+	}
+}
+
+// denials is how many refusals err holds.
+func denials(err error) int {
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		n := 0
+		for _, e := range joined.Unwrap() {
+			n += denials(e)
+		}
+		return n
+	}
+	var denied *rbac.DeniedError
+	if errors.As(err, &denied) {
+		return 1
+	}
+	return 0
+}
+
+// What a member gains, loses or approves is its group's, so a change finds it once for each group,
+// however many members it changes: the members leaving a group granted on many scopes, with labels
+// declared, and those joining one that approves eligibilities on many, cost each scope as much
+// whether one changes or many.
+func TestChangingManyMembersReadsWhatTheirGroupReachesOnce(t *testing.T) {
+	const few, many, small, large = 1, 100, 10, 500
+	h := grouped(t, withLabels)
+	ctx := t.Context()
+	h.groups(t, "held-small", "held-large", "approving-small", "approving-large")
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) SELECT 't1', 'user', 'm' || i FROM generate_series(1, $1::int) i`,
+		4*(few+many))
+	for group, n := range map[string]int{"small": small, "large": large} {
+		exec(`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', $1 || i, 'group', $1, 'cluster.login' FROM generate_series(1, $2::int) i`, "held-"+group, n)
+		exec(`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+			SELECT 't1', 'cluster', $1 || i, 'user', 'x', 'cluster.login', 3600, ARRAY['group:' || $1] FROM generate_series(1, $2::int) i`,
+			"approving-"+group, n)
+	}
+	// The manager may set the eligibilities joining a group that approves them hands on.
+	exec(`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		SELECT tenant, scope_type, scope_id, 'user', 'manager', 'cluster.admin' FROM rbac_eligibilities WHERE tenant = 't1'`)
+	// Those leaving are members of the groups granted access, each of its own.
+	exec(`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+		SELECT 't1', CASE WHEN i <= $1 THEN 'held-small' ELSE 'held-large' END, 'user', 'm' || i FROM generate_series(1, 2 * $1::int) i`,
+		few+many)
+	manager := h.as(t, "manager")
+	next := map[string]int{"held-small": 0, "held-large": few + many, "approving-small": 2 * (few + many), "approving-large": 3 * (few + many)}
+	// The bytes a change of count members of group, joining or leaving it, allocates.
+	change := func(group string, count int, leaving bool) uint64 {
+		t.Helper()
+		var ms []rbac.Member
+		for range count {
+			next[group]++
+			ms = append(ms, rbac.Member{Group: group, Principal: identity(fmt.Sprintf("m%d", next[group]))})
+		}
+		add, remove := ms, []rbac.Member(nil)
+		if leaving {
+			add, remove = nil, ms
+		}
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		if err := h.authz.ChangeMembers(ctx, manager, "t1", add, remove); err != nil {
+			t.Fatal(err)
+		}
+		runtime.ReadMemStats(&after)
+		return after.TotalAlloc - before.TotalAlloc
+	}
+	for _, c := range []struct {
+		name    string
+		of      string
+		leaving bool
+	}{
+		{"leaving a group granted on many scopes", "held", true},
+		{"joining a group approving eligibilities on many scopes", "approving", false},
+	} {
+		// What the larger group's scopes add to a change of count members.
+		grows := func(count int) uint64 {
+			t.Helper()
+			s := change(c.of+"-small", count, c.leaving)
+			return change(c.of+"-large", count, c.leaving) - s
+		}
+		one, all := grows(few), grows(many)
+		if all > one+one/2 {
+			t.Errorf("%s: %d more scopes cost a change of %d members %d bytes, and of %d, %d", c.name, large-small, few, one, many, all)
+		}
+	}
+}
+
+// What the members of many groups reach through a group those are all in is that group's, so a
+// change finds it once, however many of the groups change: members leaving many groups in one
+// granted on many scopes, with labels declared, those joining many in one that approves
+// eligibilities on many, and those joining many in one granted on more than MaxBindings, which are
+// refused, cost each scope as much whether few groups change or many.
+func TestChangingMembersOfManyGroupsReadsWhatAGroupTheyAreInReachesOnce(t *testing.T) {
+	const few, many = 2, 100
+	h := grouped(t, withLabels)
+	ctx := t.Context()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cases := []struct {
+		name, of         string
+		small, large     int
+		leaving, refused bool
+	}{
+		{"leaving groups in one granted on many scopes", "held", 10, 500, true, false},
+		{"joining groups in one approving eligibilities on many scopes", "approving", 10, 500, false, false},
+		{"joining groups in one granted on more scopes than a change gains", "over", rbac.MaxBindings + 1, 2 * rbac.MaxBindings, false, true},
+	}
+	// Each of few+many groups in an outer one has a member, which a change adds or removes.
+	identities := 0
+	member := map[string]rbac.Principal{}
+	for _, c := range cases {
+		for size, n := range map[string]int{"small": c.small, "large": c.large} {
+			outer := c.of + "-" + size
+			exec(`INSERT INTO rbac_groups (tenant, id) SELECT 't1', $1 UNION ALL SELECT 't1', $1 || '-' || i FROM generate_series(1, $2::int) i`,
+				outer, few+many)
+			exec(`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+				SELECT 't1', $1, 'group', $1 || '-' || i FROM generate_series(1, $2::int) i`, outer, few+many)
+			if c.of == "approving" {
+				exec(`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+					SELECT 't1', 'cluster', $1 || '-k' || i, 'user', 'x', 'cluster.login', 3600, ARRAY['group:' || $1]
+					FROM generate_series(1, $2::int) i`, outer, n)
+			} else {
+				exec(`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+					SELECT 't1', 'cluster', $1 || '-k' || i, 'group', $1, 'cluster.login' FROM generate_series(1, $2::int) i`, outer, n)
+			}
+			for i := range few + many {
+				identities++
+				group := fmt.Sprintf("%s-%d", outer, i+1)
+				member[group] = identity(fmt.Sprintf("m%d", identities))
+				if c.leaving {
+					exec(`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', $1, 'user', $2)`,
+						group, member[group].ID)
+				}
+			}
+		}
+	}
+	exec(`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) SELECT 't1', 'user', 'm' || i FROM generate_series(1, $1::int) i`,
+		identities)
+	// The manager may set the eligibilities joining a group that approves them hands on.
+	exec(`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		SELECT tenant, scope_type, scope_id, 'user', 'manager', 'cluster.admin' FROM rbac_eligibilities WHERE tenant = 't1'`)
+	manager := h.as(t, "manager")
+	next := map[string]int{}
+	for _, c := range cases {
+		// The bytes a change of the members of count groups in outer allocates.
+		change := func(outer string, count int) uint64 {
+			t.Helper()
+			var ms []rbac.Member
+			for range count {
+				next[outer]++
+				g := fmt.Sprintf("%s-%d", outer, next[outer])
+				ms = append(ms, rbac.Member{Group: g, Principal: member[g]})
+			}
+			add, remove := ms, []rbac.Member(nil)
+			if c.leaving {
+				add, remove = nil, ms
+			}
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			err := h.authz.ChangeMembers(ctx, manager, "t1", add, remove)
+			runtime.ReadMemStats(&after)
+			if c.refused && !errors.Is(err, rbac.ErrInvalid) || !c.refused && err != nil {
+				t.Fatalf("%s: the members of %d groups in %s: %v", c.name, count, outer, err)
+			}
+			return after.TotalAlloc - before.TotalAlloc
+		}
+		// What the larger outer group's scopes add to a change of the members of count groups in it.
+		grows := func(count int) uint64 {
+			t.Helper()
+			s := change(c.of+"-small", count)
+			return change(c.of+"-large", count) - s
+		}
+		one, all := grows(few), grows(many)
+		if all > one+one/2 {
+			t.Errorf("%s: %d more scopes cost a change of %d groups %d bytes, and of %d, %d", c.name, c.large-c.small, few, one, many, all)
+		}
+	}
+}
+
+// The host is asked about each grant and eligibility a member gains as the member's, so the members
+// one ChangeMembers adds gain at most MaxBindings of them, each member's counted apart, as one Apply
+// makes at most as many grants: past it, it is refused before the host is asked about any, or the
+// actor's power to make them decided. A member whose place lasts as long already gains nothing, so
+// counts for nothing, and one alone gains whatever its group holds, or a group holding more could
+// never gain one. The host's own ImportMembers, which no actor's access decides, takes the same
+// change, asking about each grant each member gains.
+func TestMembersGainAtMostMaxBindingsGrantsInAChange(t *testing.T) {
+	const grants = 100
+	members := rbac.MaxBindings / grants
+	var validated, resourceOf, decided int
+	h := grouped(t, func(c *rbac.Config) {
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			if in.Via == rbac.ViaMembership {
+				validated++
+			}
+			return validate(ctx, q, in)
+		}
+		of := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s.Type == "cluster" {
+				resourceOf++
+			}
+			return of(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	h.groups(t, "crew", "synced", "all", "empty")
+	// Each group holds a role on each of n clusters, which the manager may grant there.
+	for group, n := range map[string]int{"crew": grants, "synced": grants, "all": rbac.MaxBindings + 1} {
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', $1 || i, p, id, r FROM generate_series(1, $2::int) i,
+			  (VALUES ('group', $1, 'cluster.login'), ('user', 'manager', 'cluster.admin')) AS g(p, id, r)`, group, n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rbac.SetDecidingGrants(t, func() func() {
+		decided++
+		return func() {}
+	})
+	var ids []string
+	var add []rbac.Member
+	for i := range members + 1 {
+		ids = append(ids, fmt.Sprintf("m%d", i))
+		add = append(add, rbac.Member{Group: "crew", Principal: identity(ids[i])})
+	}
+	h.join(t, ids...)
+	manager := h.as(t, "manager")
+	synced := slices.Clone(add)
+	for i := range synced {
+		synced[i].Group = "synced"
+	}
+	validated, resourceOf, decided = 0, 0, 0
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", synced, nil); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("ChangeMembers: %d members gaining %d grants each: %v", len(synced), grants, err)
+	}
+	if validated+resourceOf+decided > 0 {
+		t.Fatalf("ChangeMembers: refused having asked Config.ValidateGrant %d times and Config.ResourceOf %d, and decided grants on %d scopes",
+			validated, resourceOf, decided)
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t1", synced); err != nil || validated != len(synced)*grants {
+		t.Fatalf("ImportMembers: %d members gaining %d grants each: %v, Config.ValidateGrant asked %d times", len(synced), grants, err, validated)
+	}
+	validated = 0
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", add[:members], nil); err != nil || validated != rbac.MaxBindings {
+		t.Fatalf("%d members gaining %d grants each: %v, Config.ValidateGrant asked %d times", members, grants, err, validated)
+	}
+	for i := range members {
+		add[i].Note = "kept"
+	}
+	validated = 0
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", add, nil); err != nil || validated != grants {
+		t.Fatalf("one member gaining %d grants, and %d whose notes alone change: %v, Config.ValidateGrant asked %d times", grants, members, err, validated)
+	}
+	h.join(t, "x", "y")
+	two := []rbac.Member{{Group: "all", Principal: identity("x")}, {Group: "all", Principal: identity("y")}}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", two, nil); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("two members each gaining %d grants: %v", rbac.MaxBindings+1, err)
+	}
+	validated = 0
+	// Joining a group holding nothing gains nothing, so it leaves the other member alone in gaining.
+	alone := []rbac.Member{two[0], {Group: "empty", Principal: identity("y")}}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", alone, nil); err != nil || validated != rbac.MaxBindings+1 {
+		t.Fatalf("one member alone gaining %d grants, and one gaining none: %v, Config.ValidateGrant asked %d times", rbac.MaxBindings+1, err, validated)
 	}
 }
 
