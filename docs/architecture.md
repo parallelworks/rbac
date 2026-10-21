@@ -271,10 +271,11 @@ flowchart BT
   group holds, so `ChangeMembers` needs the authority to grant all of it, and the host's
   `ValidateGrant` is asked as for a grant. The same holds for nesting one group in another, and a
   change that adds a member and nests its group asks about the member against every group it
-  will be in. What a change reaches is read once for each group (`reach`, indexed by the keys it
-  names), and its grants are decided once for each role, condition and end on a scope, as the
-  member a grant names decides nothing of the actor's power to make it; only the host is asked
-  about each member's, which `MaxBindings` bounds but for one member alone.
+  will be in. What a change reaches is read once (`reach`, indexed by the keys it names), however
+  many members of a group change and however many of the groups are in one that reaches it, and
+  its grants are decided once for each role, condition and end on a scope, as the member a grant
+  names decides nothing of the actor's power to make it; only the host is asked about each
+  member's, which `MaxBindings` bounds but for one member alone.
 - **Expanding down** from groups to their identities, for lists and changes, is `insideSQL`. It
   finds nested groups in the statement and their identities through `rbac_group_members`, which
   plans its query for the groups reached, so a small group's members are read alone however large

@@ -279,14 +279,15 @@ conditional ones reach, to check one by one.
   sooner gains nothing: it is a removal then, checked as one now; nor does one whose note alone
   changes. So whoever manages a group that holds, approves and is in no deny, and that no member
   activated through, changes its members freely, and one holding a role only if they could grant
-  that role themselves. Whether the actor may make a grant is decided once, however many members
-  gain it, but the host is asked about each as each member's, so the members one `ChangeMembers` or
-  `ImportMembers` adds gain at most `rbac.MaxBindings` grants and eligibilities in all, each
-  member's counted apart, but one member alone, which gains whatever its groups hold. The rest is
-  each group's, read once however many of its members change, and grows with what the group holds,
-  approves and is named or exempt in, so grant a group on a container rather than on each resource
-  in it: with labels declared, a removal asks `Config.ResourceOf` about each scope its members lose
-  access on, but where the actor's label values satisfy every label.
+  that role themselves. Whether the actor may make a grant is decided once for each end, however
+  many members gain it, but the host is asked about each as each member's, so the members one
+  `ChangeMembers` or `ImportMembers` adds gain at most `rbac.MaxBindings` grants and eligibilities
+  in all, each member's counted apart, but one member alone, which gains whatever its groups hold.
+  The rest is the groups', read once however many of their members change, and what a group many of
+  them are in reaches, once for all of them, and grows with what the groups hold, approve and are
+  named or exempt in, so grant a group on a container rather than on each resource in it: with
+  labels declared, a removal asks `Config.ResourceOf` about each scope its members lose access on,
+  but where the actor's label values satisfy every label.
   `Config.ResourceOf` gives the package the tenant, which `SetGroup` and `DeleteGroup` check
   `rbac.ManageGroups` on, and the groups, which `ChangeMembers` checks `rbac.GroupMembers` on and
   `SetGroup` and `DeleteGroup` the label of, each with its constraints and label, and the
