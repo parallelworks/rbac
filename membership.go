@@ -688,18 +688,35 @@ func groupExists(ctx context.Context, q DB, tenant, id string) (bool, error) {
 // them to revoke, so they go with it.
 func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string, above []string) error {
 	var held, denied, approves, owned bool
+	// What is from a source only the host changes is read only where the host owns one: in the
+	// statement's text, which then plans no read of it. The group's members and its own places are
+	// read apart, each by the index leading to it: their OR no index seeks. A generic plan costs the
+	// tenant's places as an average tenant's few, and an index holding every column a test reads,
+	// read by the tenant alone, as cheaper than one leading to the group or the scope that doesn't, so
+	// it reads every place, or grant, in the tenant to find the group's. So the group's members and
+	// the grants on its scope are found by what the index leading to them holds, behind OFFSET 0, and
+	// each found then tested by its key.
+	sources := "FALSE"
+	if len(a.owned) > 0 {
+		sources = "TRUE"
+	}
 	if err := tx.QueryRow(ctx, `
 		SELECT
 		  EXISTS (`+byKey("$7", "rbac_grants", "principal", "1", "tenant = $1 AND (expires_at IS NULL OR expires_at > $3)")+`)
 		    OR EXISTS (`+byKey("$7", "rbac_eligibilities", "principal", "1", "tenant = $1 AND (expires_at IS NULL OR expires_at > $3)")+`),
 		  EXISTS (SELECT FROM rbac_denies WHERE `+naming("principals", "$7")+` OR `+naming("exempt", "$7")+`),
 		  EXISTS (SELECT FROM rbac_eligibilities WHERE `+naming("approvers", "$7")+` AND (expires_at IS NULL OR expires_at > $3)),
-		  EXISTS (SELECT FROM rbac_members WHERE tenant = $1 AND (group_id = $4 OR principal = $2) AND source = ANY($5::text[])
+		  `+sources+` AND (EXISTS (SELECT FROM (SELECT principal, source FROM rbac_members
+		        WHERE tenant = $1 AND group_id = $4 AND source = ANY($5::text[]) OFFSET 0) k
+		      JOIN rbac_members m ON m.tenant = $1 AND m.group_id = $4 AND m.principal = k.principal AND m.source = k.source
+		      WHERE m.expires_at IS NULL OR m.expires_at > $3)
+		    OR EXISTS (SELECT FROM rbac_members WHERE tenant = $1 AND principal = $2 AND source = ANY($5::text[])
 		      AND (expires_at IS NULL OR expires_at > $3))
 		    OR EXISTS (SELECT FROM rbac_members m JOIN rbac_groups g ON g.tenant = m.tenant AND g.id = m.group_id
 		      WHERE m.tenant = $1 AND m.principal = $2 AND g.source = ANY($5::text[]) AND (m.expires_at IS NULL OR m.expires_at > $3))
-		    OR EXISTS (SELECT FROM rbac_grants WHERE tenant = $1 AND scope = $6 AND source = ANY($5::text[])
-		      AND (expires_at IS NULL OR expires_at > $3))`,
+		    OR EXISTS (SELECT FROM (SELECT id FROM rbac_grants WHERE scope = $6 AND tenant = $1
+		        AND (expires_at IS NULL OR expires_at > $3) OFFSET 0) k
+		      JOIN rbac_grants g ON g.id = k.id WHERE g.source = ANY($5::text[])))`,
 		tenant, groupPrincipal(id).key(), a.cfg.Now(), id, slices.Sorted(maps.Keys(a.owned)), groupKey(id), above).Scan(&held, &denied, &approves, &owned); err != nil {
 		return err
 	}

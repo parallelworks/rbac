@@ -1992,10 +1992,19 @@ func TestDeletingAGroupNestedMeanwhileIsTriedAgain(t *testing.T) {
 // grants, eligibilities and denies, only those of the groups it reaches: joined to the tenant's
 // members, the groups a group is in would read every one, and beside tenant = $1 a plan, costing
 // the tenant's rows by averages, would read every grant and eligibility of them, and every deny
-// and approver, which no btree finds by a key in an array.
+// and approver, which no btree finds by a key in an array. Of its places, its members' and the
+// grants on it, it reads those from a source the host owns only where it owns one, each by the
+// index leading to it, rather than every place or grant in the tenant.
 func TestDeleteGroupUnderAGenericPlanReadsOnlyTheGroupsItIsIn(t *testing.T) {
+	for name, sources := range map[string][]string{"owning no source": nil, "owning a source": {"directory"}} {
+		t.Run(name, func(t *testing.T) { deletingReadsOnlyTheGroupsItIsIn(t, sources) })
+	}
+}
+
+func deletingReadsOnlyTheGroupsItIsIn(t *testing.T, sources []string) {
+	t.Helper()
 	groups := rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}
-	h := generic(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), groups) })
+	h := generic(t, func(c *rbac.Config) { c.Catalog, c.Sources = append(slices.Clone(c.Catalog), groups), sources })
 	ctx := t.Context()
 	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "groups"), grant(cluster.Scope(), "cluster.login", rbac.Group, "outer"))
 	manager := h.as(t, "groups")
@@ -2037,9 +2046,19 @@ func TestDeleteGroupUnderAGenericPlanReadsOnlyTheGroupsItIsIn(t *testing.T) {
 			INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
 			SELECT 't1', 'cluster', id, 'd', '{public:}', ARRAY['user:' || id], '{cluster:root}' FROM others`, tables...)
 	}
+	// Vacuumed and analyzed, as autovacuum may leave the tables at any moment: a plan then costs an
+	// index-only scan, of an index holding every column a test reads, at its least.
+	settle := func() {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, `VACUUM (ANALYZE) `+strings.Join(tables, ", ")); err != nil {
+			t.Fatal(err)
+		}
+	}
 	others(500)
+	settle()
 	few := read()
 	others(9500)
+	settle()
 	for what, many := range read() {
 		if many > few[what]*3/2+deeper {
 			t.Errorf("deleting a group read %d pages of %s, and %d once 9500 more were in another group, granted, approving and exempt", few[what], what, many)
