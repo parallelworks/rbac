@@ -7594,6 +7594,42 @@ func TestChangingARoleUnderAGenericPlanReadsOnlyItsGrants(t *testing.T) {
 	}
 }
 
+// SetRole and DeleteRole of a role granted somewhere read, of the denies, only those naming the
+// actor, for whether one below the tenant binds it, under a generic plan and planned for their
+// arguments alike: no btree finds a key in an array, so they read every deny in the tenant.
+func TestChangingARoleReadsOnlyTheDeniesNamingTheActor(t *testing.T) {
+	for _, plan := range []string{"generic", "custom"} {
+		t.Run(plan, func(t *testing.T) {
+			h := crowded(t, pgtest.Open(t, "plan_cache_mode=force_"+plan+"_plan"))
+			ctx := t.Context()
+			admin := roleAdmin(t, h)
+			h.as(t, "u")
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.r', '{cluster:view}', '{cluster}')`); err != nil {
+				t.Fatal(err)
+			}
+			h.seed(t, grant(cluster.Scope(), "custom.r", rbac.User, "u"))
+			// Others are denied root on a cluster each.
+			others := func(n int) {
+				t.Helper()
+				manyMembers(t, h, n, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+					SELECT 't1', 'cluster', id, 'd', ARRAY['user:' || id], '{cluster:root}' FROM others`, "rbac_denies")
+			}
+			changes := changingRoles(ctx, admin)
+			others(500)
+			few := map[string]int64{}
+			for what, change := range changes {
+				few[what] = pagesChanging(ctx, t, h, change, "rbac_denies")["rbac_denies"]
+			}
+			others(4500)
+			for what, change := range changes {
+				if many := pagesChanging(ctx, t, h, change, "rbac_denies")["rbac_denies"]; many > few[what]*3/2+deeper {
+					t.Errorf("%s a role read %d pages of denies beside 500 denying others, and %d beside 5000", what, few[what], many)
+				}
+			}
+		})
+	}
+}
+
 func TestADenySetWhileADeletionWaitsStopsIt(t *testing.T) {
 	h, guardian := guarded(t)
 	ctx := t.Context()

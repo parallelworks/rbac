@@ -1080,12 +1080,13 @@ func (a *Authorizer) stillReaches(ctx context.Context, tx pgx.Tx, actor Subject,
 }
 
 // deniedBelow reports, reading on q, whether a deny on a scope other than the tenant binds the
-// actor, as heldOrDenied reads the denies on a path.
+// actor, as heldOrDenied reads the denies on a path. They are found by the keys it is bound by
+// (naming), so the tenant's denies of others aren't read.
 func (a *Authorizer) deniedBelow(ctx context.Context, q DB, tenant string, actor Subject) (bool, error) {
 	var denied bool
 	err := q.QueryRow(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`
-		SELECT EXISTS (SELECT FROM rbac_denies WHERE tenant = $1 AND scope_type <> $4
-		  AND principals && ARRAY(SELECT k FROM bound) AND NOT exempt && ARRAY(SELECT k FROM exempted))`,
+		SELECT EXISTS (SELECT FROM rbac_denies WHERE `+naming("principals", "ARRAY(SELECT k FROM bound)")+` AND scope_type <> $4
+		  AND NOT exempt && ARRAY(SELECT k FROM exempted))`,
 		tenant, actor.identityKey(), a.cfg.Now(), TenantScope).Scan(&denied)
 	return denied, err
 }
