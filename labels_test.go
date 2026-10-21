@@ -1351,6 +1351,54 @@ func TestALabeledDecisionAsksTheConstraintsOnlyAboutTheValuesItsLabelAsksFor(t *
 	}
 }
 
+// A change that checks the labels of many scopes by one read of the actor's values, as one to the
+// members of many groups, decides each label by every value it asks for, asking the constraints
+// once about each value the labels ask for, however many ask for it, and nothing about the rest.
+func TestAChangeCheckingManyLabelsByOneReadAsksAboutEachValueOnce(t *testing.T) {
+	labels := map[string]rbac.Label{
+		"alpha": {"comp": {"alpha"}},
+		"both":  {"comp": {"alpha", "bravo"}},
+		"high":  {"level": {"high"}},
+	}
+	var mu sync.Mutex
+	asked := map[rbac.Permission]int{}
+	h := labeled(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if l, ok := labels[s.ID]; ok && s.Type == rbac.GroupScope {
+				return rbac.Resource{Tenant: tenant, Type: rbac.GroupScope, ID: s.ID, Labels: l}, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+		c.Constraints = []rbac.Constraint{{Name: "counting", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			dim, _, _ := strings.Cut(string(in.Permission), ":")
+			if slices.ContainsFunc(labelDimensions, func(d rbac.LabelDimension) bool { return d.Name == dim }) {
+				mu.Lock()
+				asked[in.Permission]++
+				mu.Unlock()
+			}
+			return false, nil
+		}}}
+	})
+	groups := slices.Sorted(maps.Keys(labels))
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "x"))
+	h.groups(t, groups...)
+	x := h.as(t, "x")
+	h.hold(t, "x", "comp:alpha", "comp:bravo", "level:high", "rel:usa")
+	h.as(t, "u")
+	var add []rbac.Member
+	for _, g := range groups {
+		add = append(add, rbac.Member{Group: g, Principal: identity("u")})
+	}
+	if err := h.authz.ChangeMembers(h.ctx, x, "t1", add, nil); err != nil {
+		t.Fatalf("a change to groups whose labels the actor's values satisfy: %v", err)
+	}
+	if want := map[rbac.Permission]int{"comp:alpha": 1, "comp:bravo": 1, "level:high": 1}; !maps.Equal(asked, want) {
+		t.Errorf("the change asks the constraints about %v, not %v", asked, want)
+	}
+}
+
 // A subject's label values are decided on the tenant as Holding reads them for every labeled check,
 // without the attributes or label a check passes with the tenant, for conditions and constraints
 // alike: so a check of a value, Explain, Permissions and Holders agree with a check of a label.
