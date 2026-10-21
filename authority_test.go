@@ -2530,61 +2530,65 @@ func TestWideningARoleThatOneGrantedOnALabeledScopeListsNeedsItsLabel(t *testing
 }
 
 // Where the actor's label values satisfy every label, widening a role asks the host nothing about
-// the scopes roles listing it are granted on, and is tried again where they no longer do once it
-// holds the tenant's lock.
-func TestWideningARoleByOneClearedForEveryLabelAsksTheHostNothingAboutRolesListingIt(t *testing.T) {
-	asked := 0
-	var meanwhile func(context.Context) error
-	h := labeled(t, func(c *rbac.Config) {
-		resourceOf := c.ResourceOf
-		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
-			if s.Type == "cluster" {
-				asked++
+// the scopes it, or a role listing it, is granted on, and is tried again where they no longer do
+// once it holds the tenant's lock.
+func TestWideningARoleByOneClearedForEveryLabelAsksTheHostNothingAboutItsScopes(t *testing.T) {
+	for _, on := range []string{"custom.viewer", "custom.lister"} {
+		t.Run(on, func(t *testing.T) {
+			asked := 0
+			var meanwhile func(context.Context) error
+			h := labeled(t, func(c *rbac.Config) {
+				resourceOf := c.ResourceOf
+				c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+					if s.Type == "cluster" {
+						asked++
+					}
+					return resourceOf(ctx, tenant, s)
+				}
+				c.Constraints = []rbac.Constraint{{Name: "meanwhile", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+					if do := meanwhile; do != nil && in.Permission == "rel:fra" {
+						meanwhile = nil
+						return false, do(ctx)
+					}
+					return false, nil
+				}}}
+			})
+			ctx := t.Context()
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles)
+				VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}', '{}'),
+				  ('t1', 'custom.lister', '{cluster:grant}', '{cluster}', '{custom.viewer}')`); err != nil {
+				t.Fatal(err)
 			}
-			return resourceOf(ctx, tenant, s)
-		}
-		c.Constraints = []rbac.Constraint{{Name: "meanwhile", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
-			if do := meanwhile; do != nil && in.Permission == "rel:fra" {
-				meanwhile = nil
-				return false, do(ctx)
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+				SELECT 't1', 'cluster', 'c' || i, 'user', 'u', $1 FROM generate_series(1, 20) i`, on); err != nil {
+				t.Fatal(err)
 			}
-			return false, nil
-		}}}
-	})
-	ctx := t.Context()
-	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles)
-		VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}', '{}'),
-		  ('t1', 'custom.lister', '{cluster:grant}', '{cluster}', '{custom.viewer}')`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
-		SELECT 't1', 'cluster', 'c' || i, 'user', 'u', 'custom.lister' FROM generate_series(1, 20) i`); err != nil {
-		t.Fatal(err)
-	}
-	tenant := rbac.TenantRoot("t1")
-	h.seed(t, grant(tenant, "tenant.roles", rbac.User, "admin"), grant(tenant, "cluster.admin", rbac.User, "admin"))
-	admin := h.as(t, "admin")
-	h.hold(t, "admin", "level:high", "comp:alpha", "comp:bravo", "rel:usa", "rel:gbr", "rel:fra")
-	r := rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
-	if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
-		t.Fatal(err)
-	}
-	if asked != 0 {
-		t.Errorf("widening a role by one cleared for every label asked Config.ResourceOf about %d clusters", asked)
-	}
-	meanwhile = func(ctx context.Context) error {
-		return h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(tenant, "rel.fra", rbac.User, "admin")})
-	}
-	r.Permissions = []rbac.Permission{view, login, root}
-	if err := h.authz.SetRole(ctx, admin, "t1", r); !errors.Is(err, rbac.ErrConflict) {
-		t.Fatalf("widening a role once the actor lost a label value meanwhile: %v", err)
-	}
-	if meanwhile != nil {
-		t.Fatal("the label value should have been revoked meanwhile")
-	}
-	// Tried again, it asks the host about each scope, whose labels ask nothing of it.
-	if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil || asked != 20 {
-		t.Fatalf("widening it again asked about %d clusters: %v", asked, err)
+			tenant := rbac.TenantRoot("t1")
+			h.seed(t, grant(tenant, "tenant.roles", rbac.User, "admin"), grant(tenant, "cluster.admin", rbac.User, "admin"))
+			admin := h.as(t, "admin")
+			h.hold(t, "admin", "level:high", "comp:alpha", "comp:bravo", "rel:usa", "rel:gbr", "rel:fra")
+			r := rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
+			if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
+				t.Fatal(err)
+			}
+			if asked != 0 {
+				t.Errorf("widening a role by one cleared for every label asked Config.ResourceOf about %d clusters", asked)
+			}
+			meanwhile = func(ctx context.Context) error {
+				return h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(tenant, "rel.fra", rbac.User, "admin")})
+			}
+			r.Permissions = []rbac.Permission{view, login, root}
+			if err := h.authz.SetRole(ctx, admin, "t1", r); !errors.Is(err, rbac.ErrConflict) {
+				t.Fatalf("widening a role once the actor lost a label value meanwhile: %v", err)
+			}
+			if meanwhile != nil {
+				t.Fatal("the label value should have been revoked meanwhile")
+			}
+			// Tried again, it asks the host about each scope, whose labels ask nothing of it.
+			if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil || asked != 20 {
+				t.Fatalf("widening it again asked about %d clusters: %v", asked, err)
+			}
+		})
 	}
 }
 

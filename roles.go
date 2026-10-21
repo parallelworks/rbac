@@ -928,13 +928,13 @@ func (a *Authorizer) handingOn(custom map[Role]RoleDefinition, id Role, def Role
 // it gives, or where its label refuses the actor (labelsHeld). With grows, it refuses too where a
 // deny on the path of a scope a role whose holders may grant it without holding it is granted on
 // (handingOn) keeps the actor from granting it there as it will be, as they then may
-// (scopesDenied), or where that scope's label refuses the actor, unless the actor's label values
-// satisfy every label. Only a deny on a scope other than the tenant can remove more there than the
-// tenant's, which mayDefine and changesDenied check, so only where one binds the actor, or a label
-// could refuse it, is the host asked about the scopes. Without grows, as for deleting or narrowing
-// the role, which only takes access away, a scope the host no longer has (ErrNotFound) is read as
-// stored, with no containers or label. au is the actor's authority on the tenant, which mayDefine
-// checked the role on.
+// (scopesDenied), or where that scope's label refuses the actor. Only a deny on a scope other than
+// the tenant can remove more there than the tenant's, which mayDefine and changesDenied check, so
+// only where one binds the actor, or a label could refuse it, as none can where the actor's label
+// values satisfy every label, is the host asked about the scopes. Without grows, as for deleting
+// or narrowing the role, which only takes access away, a scope the host no longer has (ErrNotFound)
+// is read as stored, with no containers or label. au is the actor's authority on the tenant, which
+// mayDefine checked the role on.
 func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authority, tenant string, id Role, types []string, grows *RoleDefinition,
 	change string,
 ) (roleReach, error) {
@@ -958,8 +958,7 @@ func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authorit
 	}
 	// Granted nowhere yet, it has no label to clear, so one granted while the change waits is
 	// refused, to be tried again.
-	removing := grows == nil
-	if reach.labels, err = a.labelsAsked(ctx, actor, tenant, removing && len(scopes.own) > 0); err != nil {
+	if reach.labels, err = a.labelsAsked(ctx, actor, tenant, len(scopes.own) > 0); err != nil {
 		return roleReach{}, err
 	}
 	// Widened, it gives the holders of a role listing it more to grant there, which a label of the
@@ -991,7 +990,7 @@ func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authorit
 		}
 		r, err := a.resourceOf(ctx, tenant, s)
 		switch {
-		case removing && errors.Is(err, ErrNotFound):
+		case grows == nil && errors.Is(err, ErrNotFound):
 			r = Resource{Tenant: tenant, Type: s.Type, ID: s.ID}
 		case err != nil:
 			return roleReach{}, err
@@ -1215,16 +1214,16 @@ func (l labeling) asks() bool { return l.cs != nil && !l.cleared }
 
 // labelsAsked is what a label of a scope a custom role's grants and eligibilities are on asks of a
 // change to what they give, or revoking them, as Apply's label check asks of changing grants there:
-// nothing without labels, and with removing, as for deleting or narrowing the role, nothing where
-// the actor's label values satisfy every label, as ChangeMembers asks nothing about a scope a
-// removal alone reaches, so the host isn't asked about the scopes. Labels are the host's, so they
-// are read before the change's transaction, and the actor's values again in it (stillLabeled).
-func (a *Authorizer) labelsAsked(ctx context.Context, actor Subject, tenant string, removing bool) (labeling, error) {
+// nothing without labels, and where they are on some scope (granted), nothing where the actor's
+// label values satisfy every label, as ChangeMembers asks nothing about a scope only a label checks,
+// so the host isn't asked about the scopes. Labels are the host's, so they are read before the
+// change's transaction, and the actor's values again in it (stillLabeled).
+func (a *Authorizer) labelsAsked(ctx context.Context, actor Subject, tenant string, granted bool) (labeling, error) {
 	if len(a.labels) == 0 {
 		return labeling{}, nil
 	}
 	l := labeling{cs: a.constrain(ctx, actor, tenantResource(tenant))}
-	if !removing {
+	if !granted {
 		return l, nil
 	}
 	var err error
