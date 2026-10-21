@@ -221,7 +221,10 @@ erDiagram
   subject or its groups, which `Filter` and `Reachable` read, are found through GIN indexes on
   those arrays of keys, each key prefixed by its tenant (`rbac_tenant_keys`), so neither the
   tenant's other rows nor another tenant's group of the same id are read. History indexes the keys
-  each version of a deny names so too, so as of a time those lists find them the same way.
+  each version of a deny names so too, so as of a time those lists find them the same way, and
+  they count the denies on their types by history's versions of them, at most a few: through the
+  views, which read every version of a deny to find its last, counting read every one, deleted
+  denies' too.
 - **Activations are grants** from the source `activation` (`SourceActivation`), made by
   `Activate` from an eligibility, which they record, and ended by their expiry, `Deactivate`, or a
   change ending the membership or a place in a group on their holder's paths to that eligibility's
@@ -644,7 +647,9 @@ flowchart LR
 - **AsOf** stands temporary views of history in for the tables, in a transaction it rolls back,
   so every check, list and search answers as it would have at a past time, with the catalog and
   the label dimensions as they are now. Each statement reads history by the rows it names, through
-  history's indexes.
+  history's indexes, as a search the custom roles its grants name, by their ids. The view of
+  custom roles takes each one's newest version, testing none for a later one, so `Grantable`,
+  which can offer any, reads each version once.
 - **PruneHistory** deletes only what an export has read and later versions supersede. It keeps
   each row's last version at or before its time, so AsOf answers as before for any later time,
   and refuses an earlier one; of a row whose last version by then ended it, it deletes every

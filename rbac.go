@@ -754,9 +754,11 @@ type Config struct {
 type Authorizer struct {
 	db  DB
 	cfg Config
-	// asOf is set on an Authorizer AsOf gave, which reads the past and changes nothing.
-	asOf  bool
-	roles map[Role]RoleDefinition
+	// asOf is set on an Authorizer AsOf gave, which reads the past and changes nothing, and history
+	// is then the table its views read, by its schema.
+	asOf    bool
+	history string
+	roles   map[Role]RoleDefinition
 	// roleSets are the built-in roles' permissions and types as sets.
 	roleSets   map[Role]roleSet
 	containers map[string]bool

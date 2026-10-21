@@ -91,10 +91,11 @@ created does, each of a row's keys is looked up among them instead, so a row cos
 however many it holds; no index serves that, so the query then reads every row of the tenant its
 other conditions keep. Denies, on resources and containers alike, are looked up so whatever their
 number, and of those naming the subject or its groups only theirs are read; denies naming the
-public or the tenant's members are read by type while the listed types hold few denies, and
-otherwise every one in the tenant is. `Reachable` returns the same as scopes, for resources kept in
-another store. Both search one tenant, and count only unconditional grants: `Reach.Conditional`
-names the scopes conditional ones reach, to check one by one.
+public or the tenant's members are read by type while the listed types hold few denies, or as of
+a time while history holds few versions of denies there, deleted ones too, and otherwise every one
+in the tenant is. `Reachable` returns the same as scopes, for resources kept in another store.
+Both search one tenant, and count only unconditional grants: `Reach.Conditional` names the scopes
+conditional ones reach, to check one by one.
 
 ## Policies
 
@@ -377,14 +378,16 @@ change it waited for, but at REPEATABLE READ or SERIALIZABLE its transaction's s
 and it is dated before that change. Write around the package at READ COMMITTED. `AsOf` makes no
 change: one tried is no actor's attempt, and `Config.OnRefused` isn't told of it. A statement
 reads the history of the rows it names, as a check does its subject's grants, groups and the
-denies on its resource's path, and `Holders` the members of the groups it lists, not the whole
-tenant's: `AsOf` plans every statement in its transaction for its arguments, the host's too, since
-a connection's cached plan of a statement it has run often counts any tenant as an average one. It
-orders a row's changes by their ids in `rbac_history`, which sessions take out of order once that
-table's id sequence caches more than one, so `AsOf` refuses that. Its read's hooks run in its
-transaction, which holds one of the pool's connections: a constraint there queries the `DB` it is
-given, as one that queries the pool waits for another connection, which a busy pool may never
-free.
+denies on its resource's path, a search the custom roles its grants name, and `Holders` the
+members of the groups it lists, not the whole tenant's: `AsOf` plans every statement in its
+transaction for its arguments, the host's too, since a connection's cached plan of a statement it
+has run often counts any tenant as an average one. A list counts the denies on scopes of its types
+by history's versions of them, at most a few, and `Grantable`, which can offer any custom role,
+reads each version of every one once. It orders a row's changes by their ids in `rbac_history`,
+which sessions take out of order once that table's id sequence caches more than one, so `AsOf`
+refuses that. Its read's hooks run in its transaction, which holds one of the pool's connections:
+a constraint there queries the `DB` it is given, as one that queries the pool waits for another
+connection, which a busy pool may never free.
 
 `rbac.PruneHistory(ctx, db, before, through)` deletes what an export has read past (`through`, its
 cursor) and later records supersede: of each row, the last version at or before `before` stays, so

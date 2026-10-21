@@ -192,13 +192,25 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 				selected[i] = `CASE r.expires_at WHEN 'infinity' THEN NULL WHEN '-infinity' THEN pg_catalog.timestamptz 'epoch' ELSE r.expires_at END AS expires_at`
 			}
 		}
-		if _, err := tx.Exec(ctx, fmt.Sprintf(`CREATE TEMP VIEW %[2]s AS
-			SELECT %[4]s FROM %[1]s.rbac_history h, LATERAL pg_catalog.jsonb_populate_record(NULL::%[1]s.%[2]s, h.after) r
+		view := `SELECT %[4]s FROM %[1]s.rbac_history h, LATERAL pg_catalog.jsonb_populate_record(NULL::%[1]s.%[2]s, h.after) r
 			WHERE h.tenant = current_setting('rbac.as_of_tenant') AND h.entity = '%[3]s'
 			  AND h.effective_at <= %[5]s AND h.op NOT IN ('delete', 'expire')
 			  AND NOT EXISTS (SELECT FROM %[1]s.rbac_history n
 			    WHERE n.tenant = h.tenant AND n.entity = h.entity AND n.key = h.key
-			      AND n.effective_at <= %[5]s AND n.id > h.id)`,
+			      AND n.effective_at <= %[5]s AND n.id > h.id)`
+		// Roles are read by their ids, the key, or all at once, as Grantable reads them: their view
+		// takes each one's newest version dated by then, which a condition on the key reaches into,
+		// so each version is read once, where the test for a later one, joined to every version of
+		// the tenant's roles, is planned generically by reading them all again for each. One on
+		// another column, as a grant's principal, wouldn't reach in.
+		if e.entity == "role" {
+			view = `SELECT %[4]s FROM (SELECT DISTINCT ON (h.key) h.* FROM %[1]s.rbac_history h
+			    WHERE h.tenant = current_setting('rbac.as_of_tenant') AND h.entity = '%[3]s'
+			      AND h.effective_at <= %[5]s
+			    ORDER BY h.key, h.id DESC) h, LATERAL pg_catalog.jsonb_populate_record(NULL::%[1]s.%[2]s, h.after) r
+			WHERE h.op NOT IN ('delete', 'expire')`
+		}
+		if _, err := tx.Exec(ctx, fmt.Sprintf(`CREATE TEMP VIEW %[2]s AS `+view,
 			pgx.Identifier{schema}.Sanitize(), e.table, e.entity, strings.Join(selected, ", "),
 			`pg_catalog.to_timestamp(current_setting('rbac.as_of'), '`+asOfTime+`')`)); err != nil {
 			return err
@@ -220,7 +232,7 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 		return fmt.Errorf("%w: the search_path names pg_temp after %s, so history can't stand in for the package's tables", ErrInvalid, schema)
 	}
 	b := *a
-	b.db, b.asOf = tx, true
+	b.db, b.asOf, b.history = tx, true, historyTable(schema)
 	b.cfg.Now = func() time.Time { return at }
 	// A change is refused before its transaction, so the host is never asked about one that can't
 	// be made.

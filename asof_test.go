@@ -1,6 +1,7 @@
 package rbac_test
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -789,34 +790,38 @@ func TestAsOfListsAPrincipalsMembershipsAloneWhateverTheSessionsPlans(t *testing
 	}
 }
 
-// customRolesAsOf is how many pages of history a check by s reads as of now, beside many tenants'
-// history, before the tenant has other custom roles and once it has 200, each defined twice. With
-// plans, the read sets its transaction's plan_cache_mode to it first.
-func customRolesAsOf(t *testing.T, h *harness, s rbac.Subject, plans string) (few, many int64) {
+// customRolesAsOf is how many pages of history each of reads reads as of now, beside many tenants'
+// history, before the tenant has other custom roles and once it has 200, each defined four times.
+// With plans, the reads set their transaction's plan_cache_mode to it first.
+func customRolesAsOf(t *testing.T, h *harness, plans string, reads map[string]func(tx pgx.Tx, a *rbac.Authorizer) error) (few, many map[string]int64) {
 	t.Helper()
 	ctx := t.Context()
-	read := func(at time.Time) int64 {
+	read := func(at time.Time) map[string]int64 {
 		t.Helper()
 		tx, err := h.pool.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer func() { _ = tx.Rollback(ctx) }()
-		var read int64
+		pages := map[string]int64{}
 		if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
 			if plans != "" {
 				if _, err := tx.Exec(ctx, `SELECT set_config('plan_cache_mode', $1, true)`, plans); err != nil {
 					return err
 				}
 			}
-			start := historyPages(ctx, t, tx)
-			err := a.Authorize(ctx, s, login, cluster)
-			read = historyPages(ctx, t, tx) - start
-			return err
+			for what, f := range reads {
+				start := historyPages(ctx, t, tx)
+				if err := f(tx, a); err != nil {
+					return fmt.Errorf("%s: %w", what, err)
+				}
+				pages[what] = historyPages(ctx, t, tx) - start
+			}
+			return nil
 		}); err != nil {
 			t.Fatal(err)
 		}
-		return read
+		return pages
 	}
 	if _, err := h.pool.Exec(ctx, `ANALYZE rbac_history, rbac_roles`); err != nil {
 		t.Fatal(err)
@@ -826,6 +831,8 @@ func customRolesAsOf(t *testing.T, h *harness, s rbac.Subject, plans string) (fe
 		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
 		  SELECT 't1', 'custom.other' || i, '{cluster:view}', '{cluster}' FROM generate_series(1, 200) i`,
 		`UPDATE rbac_roles SET name = 'again' WHERE tenant = 't1' AND id LIKE 'custom.other%'`,
+		`UPDATE rbac_roles SET name = 'and again' WHERE tenant = 't1' AND id LIKE 'custom.other%'`,
+		`UPDATE rbac_roles SET name = 'once more' WHERE tenant = 't1' AND id LIKE 'custom.other%'`,
 		`ANALYZE rbac_history, rbac_roles`,
 	} {
 		if _, err := h.pool.Exec(ctx, q); err != nil {
@@ -835,7 +842,16 @@ func customRolesAsOf(t *testing.T, h *harness, s rbac.Subject, plans string) (fe
 	return few, read(dbNow(t, h))
 }
 
-// heldCustomRoleAsOf is customRolesAsOf for a subject whose grant names a custom role.
+// checkAsOf is customRolesAsOf of a check by s.
+func checkAsOf(t *testing.T, h *harness, s rbac.Subject, plans string) (few, many int64) {
+	t.Helper()
+	f, m := customRolesAsOf(t, h, plans, map[string]func(pgx.Tx, *rbac.Authorizer) error{
+		"a check": func(_ pgx.Tx, a *rbac.Authorizer) error { return a.Authorize(t.Context(), s, login, cluster) },
+	})
+	return f["a check"], m["a check"]
+}
+
+// heldCustomRoleAsOf is checkAsOf for a subject whose grant names a custom role.
 func heldCustomRoleAsOf(t *testing.T, h *harness) (few, many int64) {
 	t.Helper()
 	u := h.as(t, "u")
@@ -843,7 +859,7 @@ func heldCustomRoleAsOf(t *testing.T, h *harness) (few, many int64) {
 		t.Fatal(err)
 	}
 	h.seed(t, grant(cluster.Scope(), "custom.login", rbac.User, "u"))
-	return customRolesAsOf(t, h, u, "")
+	return checkAsOf(t, h, u, "")
 }
 
 // skewed is crowded where history's statistics leave out the tenant's custom roles: they hold
@@ -883,8 +899,227 @@ func TestAsOfReadsNoCustomRoleACheckDoesntName(t *testing.T) {
 	h := crowded(t, pgtest.Open(t, ""))
 	u := h.as(t, "u")
 	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
-	if few, many := customRolesAsOf(t, h, u, "force_generic_plan"); many > few*3/2+deeper {
+	if few, many := checkAsOf(t, h, u, "force_generic_plan"); many > few*3/2+deeper {
 		t.Errorf("a check as of a time read %d pages of history beside no custom role, and %d beside 200", few, many)
+	}
+}
+
+// As of a time, Filter, Reachable and Holders, of a labeled resource too, read of the custom roles
+// only those the grants they read name, by key, however their statements are planned: they read
+// every version of each of the tenant's giving the permission, and Holders, for its holders' label
+// values, every version of each their grants on the tenant name, matched to the grants, which a
+// generic plan does by reading every version of the tenant's roles again for each.
+func TestAsOfSearchesReadOnlyTheCustomRolesTheirGrantsName(t *testing.T) {
+	for _, plans := range []string{"", "force_generic_plan"} {
+		t.Run(cmp.Or(plans, "as AsOf plans"), func(t *testing.T) {
+			h := crowded(t, pgtest.Open(t, ""), withLabels, banks)
+			ctx := t.Context()
+			c0 := hostTable(t, h)[0]
+			u, v := h.as(t, "u"), h.as(t, "v")
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+				VALUES ('t1', 'custom.cleared', '{level:high}', '{tenant}'), ('t1', 'custom.bank', '{bank:a}', '{tenant}')`); err != nil {
+				t.Fatal(err)
+			}
+			// The members, whose label values Holders reads apart, hold bank a and login on c0 too.
+			members := rbac.TenantMembers("t1")
+			h.seed(t, grant(c0.Scope(), "cluster.login", rbac.User, "u"), grant(c0.Scope(), "cluster.login", rbac.User, "v"),
+				grant(rbac.TenantRoot("t1"), "custom.cleared", rbac.User, "u"),
+				grant(c0.Scope(), "cluster.login", members.Kind, members.ID), grant(rbac.TenantRoot("t1"), "custom.bank", members.Kind, members.ID))
+			secret := c0
+			secret.Labels = rbac.Label{"level": {"high"}, "bank": {"a"}}
+			holders := func(r rbac.Resource, want ...rbac.Principal) func(pgx.Tx, *rbac.Authorizer) error {
+				return func(_ pgx.Tx, a *rbac.Authorizer) error {
+					hs, err := a.Holders(ctx, login, r)
+					if err == nil && !slices.Equal(holderPrincipals(hs), want) {
+						err = fmt.Errorf("Holders of %+v = %+v", r, hs)
+					}
+					return err
+				}
+			}
+			few, many := customRolesAsOf(t, h, plans, map[string]func(pgx.Tx, *rbac.Authorizer) error{
+				"Filter": func(tx pgx.Tx, a *rbac.Authorizer) error {
+					pred, err := a.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path", Labels: "'{}'::text[]"}, 1)
+					if err != nil {
+						return err
+					}
+					rows, err := tx.Query(ctx, `SELECT id FROM clusters WHERE `+pred.SQL, pred.Args...)
+					if err != nil {
+						return err
+					}
+					ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+					if err == nil && !slices.Equal(ids, []string{c0.ID}) {
+						err = fmt.Errorf("Filter kept %v", ids)
+					}
+					return err
+				},
+				"Reachable": func(_ pgx.Tx, a *rbac.Authorizer) error {
+					reach, err := a.Reachable(ctx, u, login, "t1", "cluster")
+					if err == nil && !slices.Equal(reach.Scopes, []rbac.Scope{c0.Scope()}) {
+						err = fmt.Errorf("Reachable = %+v", reach)
+					}
+					return err
+				},
+				"Holders":                       holders(c0, members, u.Principal, v.Principal),
+				"Holders of a labeled resource": holders(secret, members, u.Principal),
+			})
+			for what, n := range many {
+				if n > few[what]*3/2+deeper {
+					t.Errorf("as of a time, %s read %d pages of history beside no other custom role, and %d beside 200", what, few[what], n)
+				}
+			}
+		})
+	}
+}
+
+// As of a time, Grantable reads each version of the tenant's custom roles once, however its
+// statements are planned, as it reads every role, any of which can be grantable: whether a later
+// version replaced each, planned generically, read every version of them again for each.
+func TestAsOfGrantableReadsEachVersionOfTheCustomRolesOnce(t *testing.T) {
+	h := crowded(t, pgtest.Open(t, ""))
+	ctx := t.Context()
+	owner := h.as(t, "owner")
+	for _, q := range []string{
+		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+		  SELECT 't1', 'custom.other' || i, '{cluster:view}', '{cluster}' FROM generate_series(1, 200) i`,
+		`UPDATE rbac_roles SET name = 'again' WHERE tenant = 't1'`,
+		`ANALYZE rbac_history, rbac_roles`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	at := dbNow(t, h)
+	read := func(plans string) int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		var pages int64
+		if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+			if plans != "" {
+				if _, err := tx.Exec(ctx, `SELECT set_config('plan_cache_mode', $1, true)`, plans); err != nil {
+					return err
+				}
+			}
+			start := historyPages(ctx, t, tx)
+			roles, err := a.Grantable(ctx, owner, cluster)
+			pages = historyPages(ctx, t, tx) - start
+			custom := slices.DeleteFunc(roles, func(r rbac.RoleDefinition) bool { return !strings.HasPrefix(string(r.ID), rbac.CustomPrefix) })
+			if err == nil && len(custom) != 200 {
+				err = fmt.Errorf("Grantable offers %d custom roles of 200", len(custom))
+			}
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return pages
+	}
+	if custom, generic := read(""), read("force_generic_plan"); generic > custom*3/2+deeper {
+		t.Errorf("as of a time, Grantable read %d pages of history planned as AsOf plans it, and %d planned generically", custom, generic)
+	}
+}
+
+// As of a time, a custom role is its last version by then, however its statements are planned: one
+// redefined since, one deleted, and one deleted and made again, as a check reads each by its id, a
+// search those its grants name, and CustomRoles every one. Their view takes each role's newest
+// version apart from the other tables', and a deleted role's last version is its delete.
+func TestAsOfReadsACustomRoleAsItsLastVersionThen(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	u := h.as(t, "u")
+	define := func(qs ...string) {
+		t.Helper()
+		for _, q := range qs {
+			if _, err := h.pool.Exec(ctx, q); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	define(`INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES
+		('t1', 'custom.widened', '{cluster:view}', '{cluster}'),
+		('t1', 'custom.deleted', '{cluster:view,cluster:login}', '{cluster}'),
+		('t1', 'custom.again', '{cluster:view,cluster:login}', '{cluster}')`)
+	on := map[rbac.Role]rbac.Resource{}
+	for i, id := range []rbac.Role{"custom.widened", "custom.deleted", "custom.again"} {
+		r := cluster
+		r.ID = fmt.Sprint("c", i+1)
+		on[id] = r
+		h.seed(t, grant(r.Scope(), id, rbac.User, "u"))
+	}
+	then := dbNow(t, h)
+	define(`UPDATE rbac_roles SET permissions = '{cluster:view,cluster:login}' WHERE tenant = 't1' AND id = 'custom.widened'`,
+		`DELETE FROM rbac_roles WHERE tenant = 't1' AND id IN ('custom.deleted', 'custom.again')`,
+		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.again', '{cluster:view}', '{cluster}')`)
+	now := dbNow(t, h)
+	for _, at := range []struct {
+		name   string
+		at     time.Time
+		logins []rbac.Role
+	}{
+		{"then", then, []rbac.Role{"custom.again", "custom.deleted"}},
+		{"now", now, []rbac.Role{"custom.widened"}},
+	} {
+		for _, plans := range []string{"", "force_generic_plan"} {
+			t.Run(at.name+" "+plans, func(t *testing.T) {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at.at, func(a *rbac.Authorizer) error {
+					if plans != "" {
+						if _, err := tx.Exec(ctx, `SELECT set_config('plan_cache_mode', $1, true)`, plans); err != nil {
+							return err
+						}
+					}
+					var checked, defined []rbac.Role
+					for id, r := range on {
+						err := a.Authorize(ctx, u, login, r)
+						if err != nil && !errors.Is(err, rbac.ErrDenied) {
+							return err
+						}
+						if err == nil {
+							checked = append(checked, id)
+						}
+					}
+					slices.Sort(checked)
+					if !slices.Equal(checked, at.logins) {
+						t.Errorf("u may log in through %v", checked)
+					}
+					reach, err := a.Reachable(ctx, u, login, "t1", "cluster")
+					if err != nil {
+						return err
+					}
+					var reached []rbac.Role
+					for id, r := range on {
+						if slices.Contains(reach.Scopes, r.Scope()) {
+							reached = append(reached, id)
+						}
+					}
+					slices.Sort(reached)
+					if !slices.Equal(reached, at.logins) {
+						t.Errorf("Reachable = %+v", reach)
+					}
+					roles, err := a.CustomRoles(ctx, "t1")
+					if err != nil {
+						return err
+					}
+					for _, r := range roles {
+						if slices.Contains(r.Permissions, login) {
+							defined = append(defined, r.ID)
+						}
+					}
+					if !slices.Equal(defined, at.logins) {
+						t.Errorf("the custom roles giving login are %v", defined)
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
 	}
 }
 
@@ -1051,85 +1286,103 @@ func TestAsOfListsAScopesGrantsAndEligibilitiesAlone(t *testing.T) {
 }
 
 // As of a time, Filter and Reachable find the denies binding their subject by the keys those name,
-// as they do now: thousands of denies naming others on other clusters cost them nothing, and the
-// one naming the subject's group still leaves its cluster out.
+// as they do now, and count those on scopes of the types they read by the versions history holds of
+// them: thousands of denies naming others on other clusters cost them nothing, nor do thousands set
+// there and deleted, which, counted through the views, as those read every version of each to find
+// its last, were all read, and for want of live ones read again by type; nor do thousands denying
+// everyone on scopes of another type, which history's few versions on the types leave them to find
+// by type. The one naming the subject's group still leaves its cluster out.
 func TestAsOfListsFindTheDeniesNamingTheirSubjectByItsKeys(t *testing.T) {
-	h, guardian := guarded(t)
-	ctx := t.Context()
-	resources := hostTable(t, h)
-	ann := h.as(t, "ann", "oncall")
-	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "ann"))
-	if err := h.authz.SetDeny(ctx, guardian, resources[1], rbac.Deny{ID: "d", Principals: []rbac.Principal{{Kind: rbac.Group, ID: "oncall"}}, Permissions: []rbac.Permission{login}}); err != nil {
-		t.Fatal(err)
-	}
-	denies := 0
-	others := func(n int) {
-		t.Helper()
-		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
-			SELECT 't1', 'cluster', 'other' || i, 'd', ARRAY['user:other' || i], '{cluster:login}' FROM generate_series($1::int + 1, $2::int) i`, denies, n); err != nil {
-			t.Fatal(err)
-		}
-		denies = n
-		if _, err := h.pool.Exec(ctx, `ANALYZE rbac_history`); err != nil {
-			t.Fatal(err)
-		}
-	}
-	lists := []struct {
-		what string
-		list func(tx pgx.Tx, a *rbac.Authorizer) error
-	}{
-		{"Reachable", func(_ pgx.Tx, a *rbac.Authorizer) error {
-			reach, err := a.Reachable(ctx, ann, login, "t1", "cluster")
-			if err == nil && (!reach.All || !slices.Equal(reach.Except, []rbac.Scope{resources[1].Scope()})) {
-				err = fmt.Errorf("reach %+v", reach)
+	set := `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+		SELECT 't1', 'cluster', 'other' || i, 'd', ARRAY['user:other' || i], '{cluster:login}' FROM generate_series($1::int + 1, $2::int) i`
+	for shape, others := range map[string][]string{
+		"naming others on other clusters": {set},
+		"set and deleted on other clusters": {set, `DELETE FROM rbac_denies
+			WHERE tenant = 't1' AND scope_type = 'cluster' AND scope_id IN (SELECT 'other' || i FROM generate_series($1::int + 1, $2::int) i)`},
+		"denying everyone on another type": {`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+			SELECT 't1', 'group', 'other' || i, 'd', ARRAY[CASE WHEN i % 2 = 0 THEN 'public:' ELSE 'members:t1' END], '{cluster:login}'
+			FROM generate_series($1::int + 1, $2::int) i`},
+	} {
+		t.Run(shape, func(t *testing.T) {
+			h, guardian := guarded(t)
+			ctx := t.Context()
+			resources := hostTable(t, h)
+			ann := h.as(t, "ann", "oncall")
+			h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "ann"))
+			if err := h.authz.SetDeny(ctx, guardian, resources[1], rbac.Deny{ID: "d", Principals: []rbac.Principal{{Kind: rbac.Group, ID: "oncall"}}, Permissions: []rbac.Permission{login}}); err != nil {
+				t.Fatal(err)
 			}
-			return err
-		}},
-		{"Filter", func(tx pgx.Tx, a *rbac.Authorizer) error {
-			pred, err := a.Filter(ctx, ann, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
-			if err != nil {
-				return err
-			}
-			rows, err := tx.Query(ctx, `SELECT id FROM clusters WHERE `+pred.SQL+` ORDER BY id`, pred.Args...)
-			if err != nil {
-				return err
-			}
-			ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
-			if err == nil && !slices.Equal(ids, []string{"c0", "c2", "c3"}) {
-				err = fmt.Errorf("kept %v", ids)
-			}
-			return err
-		}},
-	}
-	read := func(at time.Time) map[string]int64 {
-		t.Helper()
-		pages := map[string]int64{}
-		for _, l := range lists {
-			func() {
-				tx, err := h.pool.Begin(ctx)
-				if err != nil {
+			denies := 0
+			more := func(n int) {
+				t.Helper()
+				for _, q := range others {
+					if _, err := h.pool.Exec(ctx, q, denies, n); err != nil {
+						t.Fatal(err)
+					}
+				}
+				denies = n
+				if _, err := h.pool.Exec(ctx, `ANALYZE rbac_history`); err != nil {
 					t.Fatal(err)
 				}
-				defer func() { _ = tx.Rollback(ctx) }()
-				if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
-					start := historyPages(ctx, t, tx)
-					err := l.list(tx, a)
-					pages[l.what] = historyPages(ctx, t, tx) - start
+			}
+			lists := []struct {
+				what string
+				list func(tx pgx.Tx, a *rbac.Authorizer) error
+			}{
+				{"Reachable", func(_ pgx.Tx, a *rbac.Authorizer) error {
+					reach, err := a.Reachable(ctx, ann, login, "t1", "cluster")
+					if err == nil && (!reach.All || !slices.Equal(reach.Except, []rbac.Scope{resources[1].Scope()})) {
+						err = fmt.Errorf("reach %+v", reach)
+					}
 					return err
-				}); err != nil {
-					t.Fatalf("%s: %v", l.what, err)
+				}},
+				{"Filter", func(tx pgx.Tx, a *rbac.Authorizer) error {
+					pred, err := a.Filter(ctx, ann, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+					if err != nil {
+						return err
+					}
+					rows, err := tx.Query(ctx, `SELECT id FROM clusters WHERE `+pred.SQL+` ORDER BY id`, pred.Args...)
+					if err != nil {
+						return err
+					}
+					ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+					if err == nil && !slices.Equal(ids, []string{"c0", "c2", "c3"}) {
+						err = fmt.Errorf("kept %v", ids)
+					}
+					return err
+				}},
+			}
+			read := func(at time.Time) map[string]int64 {
+				t.Helper()
+				pages := map[string]int64{}
+				for _, l := range lists {
+					func() {
+						tx, err := h.pool.Begin(ctx)
+						if err != nil {
+							t.Fatal(err)
+						}
+						defer func() { _ = tx.Rollback(ctx) }()
+						if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+							start := historyPages(ctx, t, tx)
+							err := l.list(tx, a)
+							pages[l.what] = historyPages(ctx, t, tx) - start
+							return err
+						}); err != nil {
+							t.Fatalf("%s: %v", l.what, err)
+						}
+					}()
 				}
-			}()
-		}
-		return pages
-	}
-	others(500)
-	few := read(dbNow(t, h))
-	others(5000)
-	for what, many := range read(dbNow(t, h)) {
-		if many > few[what]*3/2+deeper {
-			t.Errorf("as of a time, %s read %d pages of history beside 500 denies naming others, and %d beside 5000", what, few[what], many)
-		}
+				return pages
+			}
+			more(500)
+			few := read(dbNow(t, h))
+			more(5000)
+			for what, many := range read(dbNow(t, h)) {
+				if many > few[what]*3/2+deeper {
+					t.Errorf("as of a time, %s read %d pages of history beside 500 denies %s, and %d beside 5000", what, few[what], shape, many)
+				}
+			}
+		})
 	}
 }
 

@@ -185,42 +185,49 @@ func roleFrom(id, name, description string, perms, types []string, privileged, p
 }
 
 // givingSQL is SQL for the ids of the roles that give perm on a resource type in a tenant: the
-// built-in ones in the array argument builtin, and with custom the tenant's custom ones, read in
-// the same statement, of them only those only keeps, if any, so a role redefined reaches searches
-// as it reaches checks.
-func givingSQL(builtin, tenant, perm, resourceType string, custom bool, only string) string {
+// built-in ones in the array argument builtin, and with custom the custom ones among ids, SQL for an
+// array, of them with public only those still marked Public, as a search's statement can run after
+// its ids were read. The custom ones are read in the same statement, so a role redefined reaches
+// searches as it reaches checks, and by key: a search's ids are those its grants name (namedCustom)
+// or broadArgs read, and read by the tenant, every custom role of it was, as of a time every version.
+func givingSQL(builtin, tenant, perm, resourceType string, custom bool, ids string, public bool) string {
 	// Without custom the subquery stays, constant false, so the statement's arguments are the
 	// same and PostgreSQL plans it away.
-	return fmt.Sprintf(`(%s::text[] || ARRAY(SELECT cr.id FROM rbac_roles cr WHERE %t AND cr.tenant = %s::text
-		AND %s::text = ANY(cr.permissions) AND %s::text = ANY(cr.resource_types)%s))`, builtin, custom, tenant, perm, resourceType, only)
+	where := fmt.Sprintf(`%t AND cr.tenant = %s::text AND %s::text = ANY(cr.permissions) AND %s::text = ANY(cr.resource_types)`,
+		custom, tenant, perm, resourceType)
+	if public {
+		where += " AND cr.public"
+	}
+	return fmt.Sprintf(`(%s::text[] || ARRAY(%s))`, builtin, byKey(ids, "rbac_roles cr", "cr.id", "cr.id", where))
 }
-
-// listedOnly keeps, of givingSQL's custom roles, those in the array argument ids.
-func listedOnly(ids string) string { return fmt.Sprintf(` AND cr.id = ANY(%s::text[])`, ids) }
-
-// publicOnly keeps, of givingSQL's custom roles, those in the array argument ids that are still
-// marked Public, as a search's statement can run after its ids were read.
-func publicOnly(ids string) string { return ` AND cr.public` + listedOnly(ids) }
 
 // broadArgs are a search's arguments for the roles giving p on a resource type that give it
 // through grants to the public and the tenant's members: the custom ones that are public, NULL
 // where no grant to the public gives p, as Filter and Reachable then read none and Holders drops
 // the public; of roles, the built-in ones that aren't privileged; and the custom ones that aren't.
 // The custom ones are those giving p there that grants to the public or the tenant's members name
-// on the scopes grants selects, SQL whose arguments, args, start at $4: only for those grants does
-// it matter. They are decided as Authorizer.current reads them, as checks read them; pairing each
-// one's permissions and types with the catalog's in SQL took a search seconds.
+// on the scopes, or scopes of the types, on: only for those grants does it matter. grants is SQL
+// selecting the roles of the grants in the tenant $1 to the principal whose key is the SQL it is
+// given there, on is the array $4 (broadOn, broadAt). They are decided as Authorizer.current reads
+// them, as checks read them; pairing each one's permissions and types with the catalog's in SQL
+// took a search seconds.
 func (a *Authorizer) broadArgs(ctx context.Context, q DB, tenant string, p Permission, resourceType string, roles []string, custom bool,
-	grants string, args ...any,
+	grants func(principal string) string, on []string,
 ) ([]any, error) {
 	unprivileged := slices.DeleteFunc(slices.Clone(roles), func(id string) bool { return a.roles[Role(id)].Privileged })
 	// A grant to either never gives a permission to change access, so no search counts one for it.
 	if !custom || p.managesAccess() {
 		return []any{nil, unprivileged, nil}, nil
 	}
-	rows, err := q.Query(ctx, `SELECT `+roleColumns+` FROM rbac_roles
-		WHERE tenant = $1 AND $2::text = ANY(permissions) AND $3::text = ANY(resource_types) AND id IN (`+grants+`)
-		ORDER BY id`, append([]any{tenant, string(p), resourceType}, args...)...)
+	// A broad key and a scope or a type at a time, the prefix tested apart (namedCustom), and the
+	// roles they name by key: matched to both keys at once, and tested for the prefix there, a
+	// generic plan read the grants by the custom roles' index on the tenant alone, every grant of one
+	// in the tenant for each scope or type; and as of a time, roles tested against the ids rather
+	// than read by them are each read at its newest version.
+	rows, err := q.Query(ctx, `SELECT `+roleColumns+` FROM (`+byKey(namedCustom(`SELECT g.role FROM unnest($5::text[]) AS b(k)
+		CROSS JOIN LATERAL (`+grants("b.k")+`) g`), "rbac_roles", "id", roleColumns,
+		"tenant = $1 AND $2::text = ANY(permissions) AND $3::text = ANY(resource_types)")+`) r
+		ORDER BY id`, tenant, string(p), resourceType, on, broadKeys(tenant))
 	if err != nil {
 		return nil, err
 	}
@@ -245,6 +252,14 @@ func (a *Authorizer) broadArgs(ctx context.Context, q DB, tenant string, p Permi
 
 // broadKeys are the keys of a tenant's broad principals: the public and its members.
 func broadKeys(tenant string) []string { return []string{publicKey, TenantMembers(tenant).key()} }
+
+// namedCustom is SQL for an array of the custom roles, each once, among those grants selects, SQL
+// for a column role. It tests the prefix outside grants, behind OFFSET 0 or a materialized CTE
+// there, which it isn't pushed past: inside, a plan could read the grants by the custom roles'
+// index on the tenant alone, which a generic one costs as an average tenant's few.
+func namedCustom(grants string) string {
+	return `ARRAY(SELECT DISTINCT c.role FROM (` + grants + `) c WHERE c.role LIKE '` + CustomPrefix + `%')`
+}
 
 // checkCustom returns why a custom role's definition is malformed: its id, and permissions and
 // types that no built-in role gives or is for, so a tenant can't invent either. A public one

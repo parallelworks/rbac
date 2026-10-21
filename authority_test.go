@@ -3448,6 +3448,180 @@ func TestListingsUnderAGenericPlanReadOnlyTheirSubjectsGrants(t *testing.T) {
 	}
 }
 
+// customSearches are Filter, Reachable and Holders by u on c0 of the host's table, each with what it
+// read of rbac_grants, on a's transaction tx.
+func customSearches(ctx context.Context, t *testing.T, tx pgx.Tx, a *rbac.Authorizer, u rbac.Subject, c0 rbac.Resource) map[string]int64 {
+	t.Helper()
+	pages := map[string]int64{}
+	for what, f := range map[string]func() error{
+		"Filter": func() error {
+			return second(a.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1))
+		},
+		"Reachable": func() error { return second(a.Reachable(ctx, u, login, "t1", "cluster")) },
+		"Holders": func() error {
+			hs, err := a.Holders(ctx, login, c0)
+			if err == nil && !slices.Equal(holderPrincipals(hs), []rbac.Principal{u.Principal}) {
+				err = fmt.Errorf("Holders = %+v", hs)
+			}
+			return err
+		},
+	} {
+		start := pagesRead(ctx, t, tx, "rbac_grants")
+		if err := f(); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		pages[what] = pagesRead(ctx, t, tx, "rbac_grants") - start
+	}
+	return pages
+}
+
+// grantedCustomly is h with the host's table, u holding login on its c0, and a custom role giving
+// login on clusters that n others hold, each on a cluster of its own, as others grants more.
+func grantedCustomly(t *testing.T, h *harness, n int) (u rbac.Subject, c0 rbac.Resource, others func(n int)) {
+	t.Helper()
+	resources := hostTable(t, h)
+	u = h.as(t, "u")
+	h.seed(t, grant(resources[0].Scope(), "cluster.login", rbac.User, "u"))
+	if _, err := h.pool.Exec(t.Context(), `INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+		VALUES ('t1', 'custom.view', '{cluster:view,cluster:login}', '{cluster}')`); err != nil {
+		t.Fatal(err)
+	}
+	others = func(n int) {
+		t.Helper()
+		manyMembers(t, h, n, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', id, 'user', id, 'custom.view' FROM others`, "rbac_grants")
+	}
+	others(n)
+	return u, resources[0], others
+}
+
+// Filter, Reachable and Holders read, of the grants of custom roles, only the public's and the
+// tenant's members' on the scopes they read, which of those roles give through them, under a
+// generic plan too: tested for the custom prefix as they were read, the grants were read by the
+// custom roles' index on the tenant alone, which a generic plan costs as an average tenant's few,
+// so each search read every grant of a custom role in the tenant, once for each type or scope.
+func TestSearchesUnderAGenericPlanReadOnlyTheBroadGrantsOfCustomRoles(t *testing.T) {
+	h := generic(t)
+	ctx := t.Context()
+	u, c0, others := grantedCustomly(t, h, 500)
+	read := func() map[string]int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		return customSearches(ctx, t, tx, h.authz.WithTx(tx), u, c0)
+	}
+	few := read()
+	others(4500)
+	for what, many := range read() {
+		if many > few[what]*3/2+deeper {
+			t.Errorf("%s read %d pages of grants, and %d once 4500 more held a custom role on clusters", what, few[what], many)
+		}
+	}
+}
+
+// At the default plan_cache_mode, a connection that has run a search five times reads no more on its
+// sixth, in a tenant whose members and the public hold custom roles on thousands of scopes: there
+// PostgreSQL planned which custom roles those grants name generically, by the custom roles' index
+// on the tenant alone, and read every grant of one in the tenant, once for each type.
+func TestSearchesReadAsMuchOnceAConnectionPlansThemGenerically(t *testing.T) {
+	h := crowded(t, pgtest.Open(t, "pool_max_conns=1"))
+	ctx := t.Context()
+	c0 := hostTable(t, h)[0]
+	u := h.as(t, "u")
+	h.seed(t, grant(c0.Scope(), "cluster.login", rbac.User, "u"))
+	for _, q := range []string{
+		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+		  SELECT 't1', 'custom.r' || i, '{cluster:view,cluster:login}', '{cluster}' FROM generate_series(1, 300) i`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		  SELECT 't1', 'cluster', 'k' || i, 'members', 't1', 'custom.r' || (i % 300 + 1) FROM generate_series(1, 3000) i`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		  SELECT 't1', 'workspace', 'ws' || i, 'public', '', 'custom.r' || (i % 300 + 1) FROM generate_series(1, 3000) i`,
+		`ANALYZE rbac_grants, rbac_roles`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var first map[string]int64
+	for run := range 8 {
+		func() {
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			pages := customSearches(ctx, t, tx, h.authz.WithTx(tx), u, c0)
+			if first == nil {
+				first = pages
+			}
+			for what, n := range pages {
+				if n > first[what]*3/2+deeper {
+					t.Errorf("%s read %d pages of grants on its first run on a connection, and %d on run %d", what, first[what], n, run+1)
+				}
+			}
+		}()
+	}
+}
+
+// Filter's count of the grants that pick its form stops a little past where the form changes,
+// however many of a built-in role its subject holds, and beside a grant of a custom role read
+// before them: counted with the custom roles the grants name, which it reads from every one, the
+// count read all of them, as many as the condition then reads.
+func TestFilterCountsAFewOfItsSubjectsGrantsOfBuiltInRoles(t *testing.T) {
+	h := crowded(t, pgtest.Open(t, ""))
+	ctx := t.Context()
+	c0 := hostTable(t, h)[0]
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+		VALUES ('t1', 'custom.login', '{cluster:view,cluster:login}', '{cluster}')`); err != nil {
+		t.Fatal(err)
+	}
+	for _, plan := range []string{"force_custom_plan", "force_generic_plan"} {
+		for _, custom := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s custom %t", plan, custom), func(t *testing.T) {
+				ctx := t.Context()
+				id := fmt.Sprintf("%s-%t", plan, custom)
+				u := h.as(t, id)
+				h.seed(t, grant(c0.Scope(), "cluster.login", rbac.User, id))
+				if custom {
+					// On a cluster whose scope sorts before the others'.
+					h.seed(t, grant(rbac.Scope{Type: "cluster", ID: "0"}, "custom.login", rbac.User, id))
+				}
+				granted := 0
+				read := func(n int) int64 {
+					t.Helper()
+					if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+						SELECT 't1', 'cluster', 'other' || i, 'user', $3, 'cluster.login' FROM generate_series($1::int + 1, $2::int) i`, granted, n, id); err != nil {
+						t.Fatal(err)
+					}
+					granted = n
+					if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants`); err != nil {
+						t.Fatal(err)
+					}
+					tx, err := h.pool.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = tx.Rollback(ctx) }()
+					if _, err := tx.Exec(ctx, `SELECT set_config('plan_cache_mode', $1, true)`, plan); err != nil {
+						t.Fatal(err)
+					}
+					start := pagesRead(ctx, t, tx, "rbac_grants")
+					if _, err := h.authz.WithTx(tx).Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1); err != nil {
+						t.Fatal(err)
+					}
+					return pagesRead(ctx, t, tx, "rbac_grants") - start
+				}
+				if few, many := read(100), read(10000); many > few*3/2+deeper {
+					t.Errorf("Filter read %d pages of grants for a subject holding 100 more on clusters, and %d for one holding 10000", few, many)
+				}
+			})
+		}
+	}
+}
+
 // Revoking a grant on a scope many hold grants on reads only the revoked principal's, under its
 // lock, by Apply and by DeleteGrants, under a generic plan too: matched to the scope's grants, a
 // revoke reads each of them.
