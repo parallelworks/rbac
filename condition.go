@@ -1169,6 +1169,10 @@ func (k *keying) decorate(i interpreter.InterpretableV2) (interpreter.Interpreta
 	planned := i
 	switch i := i.(type) {
 	case interpreter.InterpretableConst:
+		// Another version of CEL may fold a key, as `0.0 / 0.0`, which finiteKey wouldn't see.
+		if nonFinite(i.Value()) {
+			return nil, errors.New("a key is a double that isn't finite")
+		}
 	case interpreter.InterpretableAttribute:
 		planned = &keyedAttribute{InterpretableAttribute: i, k: k}
 	case interpreter.InterpretableCall:

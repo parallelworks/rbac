@@ -1274,6 +1274,21 @@ func TestAKeyPlannedOtherwiseIsNoCondition(t *testing.T) {
 	}
 }
 
+// A key folded into a double that isn't finite, as another version of CEL may fold one, isn't a
+// condition: no key it computes is left to fail.
+func TestAKeyFoldedIntoADoubleThatIsntFiniteIsNoCondition(t *testing.T) {
+	fold := func(i interpreter.InterpretableV2) interpreter.InterpretableV2 {
+		return interpreter.NewConstValue(i.ID(), i.Eval(interpreter.EmptyActivation()))
+	}
+	for expr, isCondition := range map[string]bool{
+		`{0.0 / 0.0: 1} != {0.5: 1}`: false, `{1.0 / 0.0: 1} != {0.5: 1}`: false, `{1.0 / 2.0: 1} == {0.5: 1}`: true,
+	} {
+		if err := rbac.PlanKeysOtherwise(t, expr, fold); (err == nil) != isCondition {
+			t.Errorf("%s with its key folded: %v", expr, err)
+		}
+	}
+}
+
 // Loading a time zone copies its name for each place it looks for it, which zoneCost doesn't count
 // however long the name is, so a condition reading a time in a zone the request names, in a loop,
 // took time growing with its length, charged as a short one. A zone is at most 64 bytes, longer
