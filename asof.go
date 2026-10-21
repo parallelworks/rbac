@@ -111,6 +111,10 @@ func historySchema(ctx context.Context, tx pgx.Tx) (string, error) {
 	return schema, nil
 }
 
+// asOfTime is the format AsOf writes its time in, and reads it back by, in rbac.as_of: TZH writes
+// a timestamp without a time zone, as UTC's here, as +00.
+const asOfTime = `YYYY-MM-DD HH24:MI:SS.US TZH BC`
+
 // readAsOf runs read on tx, with history standing in for the package's tables.
 func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at time.Time, read func(*Authorizer) error) error {
 	schema, err := historySchema(ctx, tx)
@@ -124,13 +128,17 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	// statement once, as of a time and now alike, and from its sixth run can plan it generically,
 	// costing history's indexes by an average tenant's few rows: a check would then read every
 	// version of the tenant's custom roles again for each it read, and a list of a principal's
-	// memberships every member's. The time is written in UTC as ISO 8601, with its era, which a
-	// statement reads back as it is whatever its DateStyle and TimeZone, as a host's read can change
-	// them: a time's text in the session's DateStyle can name its zone by an abbreviation, which
-	// another TimeZone, or before PostgreSQL 18 timezone_abbreviations, reads as another zone's,
-	// hours off, and one of another field order reads its month as its day.
+	// memberships every member's. The time is written in UTC, to the microsecond and with its era,
+	// and read back by the format it was written in (asOfTime), not as a time's text, which each
+	// statement reads by its own DateStyle and TimeZone, as a host's read can change them: a time's
+	// text in the session's DateStyle can name its zone by an abbreviation, which another TimeZone,
+	// or before PostgreSQL 18 timezone_abbreviations, reads as another zone's, hours off, and one of
+	// another field order reads its month as its day. From PostgreSQL 18 a TimeZone's own
+	// abbreviations name zones too, before any other, as UTC+5 makes UTC one five hours west, in
+	// AT TIME ZONE 'UTC' as in a time's text, and <AD>-2 makes its era one: so UTC is an offset here,
+	// and the format reads the era as its own field.
 	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.as_of_tenant', $1, true),
-		set_config('rbac.as_of', pg_catalog.to_char($2::pg_catalog.timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z" AD'), true),
+		set_config('rbac.as_of', pg_catalog.to_char($2::pg_catalog.timestamptz AT TIME ZONE pg_catalog.interval '00:00', '`+asOfTime+`'), true),
 		set_config('plan_cache_mode', 'force_custom_plan', true)`,
 		tenant, at); err != nil {
 		return err
@@ -187,11 +195,12 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`CREATE TEMP VIEW %[2]s AS
 			SELECT %[4]s FROM %[1]s.rbac_history h, LATERAL pg_catalog.jsonb_populate_record(NULL::%[1]s.%[2]s, h.after) r
 			WHERE h.tenant = current_setting('rbac.as_of_tenant') AND h.entity = '%[3]s'
-			  AND h.effective_at <= current_setting('rbac.as_of')::pg_catalog.timestamptz AND h.op NOT IN ('delete', 'expire')
+			  AND h.effective_at <= %[5]s AND h.op NOT IN ('delete', 'expire')
 			  AND NOT EXISTS (SELECT FROM %[1]s.rbac_history n
 			    WHERE n.tenant = h.tenant AND n.entity = h.entity AND n.key = h.key
-			      AND n.effective_at <= current_setting('rbac.as_of')::pg_catalog.timestamptz AND n.id > h.id)`,
-			pgx.Identifier{schema}.Sanitize(), e.table, e.entity, strings.Join(selected, ", "))); err != nil {
+			      AND n.effective_at <= %[5]s AND n.id > h.id)`,
+			pgx.Identifier{schema}.Sanitize(), e.table, e.entity, strings.Join(selected, ", "),
+			`pg_catalog.to_timestamp(current_setting('rbac.as_of'), '`+asOfTime+`')`)); err != nil {
 			return err
 		}
 	}

@@ -1219,7 +1219,9 @@ func TestAsOfReadsAListOfMoreDimensionsAsChecksDid(t *testing.T) {
 // AsOf reads history as of its time to the microsecond, whatever the session's DateStyle and
 // TimeZone and whatever its read sets them to: a time's text in a DateStyle but ISO names its
 // zone by an abbreviation, which another TimeZone reads as its own zone's, and one of another
-// field order reads its month as its day.
+// field order reads its month as its day. From PostgreSQL 18 a TimeZone's own abbreviations name
+// zones too, as UTC+5's UTC, five hours west, does in AT TIME ZONE 'UTC', and in a time's text
+// as Z or AD would.
 func TestAsOfReadsItsTimeWhateverTheSessionsDateStyle(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -1237,6 +1239,9 @@ func TestAsOfReadsItsTimeWhateverTheSessionsDateStyle(t *testing.T) {
 		{"Postgres, YMD", "Pacific/Chatham", ""},
 		{"Postgres, MDY", "XYZ-3", `SET LOCAL TimeZone = 'XYZ+5'`},
 		{"SQL, MDY", "Australia/Lord_Howe", `SET LOCAL DateStyle = 'SQL, DMY'`},
+		{"ISO, MDY", "UTC+5", ""},
+		{"ISO, MDY", "UTC", `SET LOCAL TimeZone = '<Z>+5'`},
+		{"SQL, DMY", "<AD>-2", ""},
 	} {
 		for _, at := range []time.Time{granted, granted.Add(-time.Microsecond), time.Date(-100, time.March, 15, 12, 0, 0, 0, time.UTC)} {
 			func() {
