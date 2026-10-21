@@ -683,8 +683,9 @@ type Config struct {
 	// on a scope other than the tenant or a group, no ContainerTypes. For any other, that change is
 	// refused. SetRole changing what a custom role's grants give, and DeleteRole, check the label of
 	// each scope the role is granted on, and where a deny on a scope other than the tenant binds the
-	// actor, the denies on its path, as it returns it, so with Labels declared, or such a deny, they
-	// need it too. A removal reads a scope it reports as ErrNotFound as stored and unlabeled, and
+	// actor, the denies on its path, and SetRole widening it those on the path of each scope a role
+	// listing it is granted on, as it returns it, so with Labels declared, or such a deny, they need
+	// it too. A removal reads a scope it reports as ErrNotFound as stored and unlabeled, and
 	// ChangeMembers and DeleteRole ask nothing of the scopes only a removal reaches where the actor's
 	// label values satisfy every label and, for DeleteRole, no such deny binds it.
 	ResourceOf func(ctx context.Context, tenant string, s Scope) (Resource, error)
