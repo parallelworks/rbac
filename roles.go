@@ -214,7 +214,8 @@ func (a *Authorizer) broadArgs(ctx context.Context, q DB, tenant string, p Permi
 	grants string, args ...any,
 ) ([]any, error) {
 	unprivileged := slices.DeleteFunc(slices.Clone(roles), func(id string) bool { return a.roles[Role(id)].Privileged })
-	if !custom {
+	// A grant to either never gives a permission to change access, so no search counts one for it.
+	if !custom || p.managesAccess() {
 		return []any{nil, unprivileged, nil}, nil
 	}
 	rows, err := q.Query(ctx, `SELECT `+roleColumns+` FROM rbac_roles
@@ -329,9 +330,10 @@ func canonical(r RoleDefinition) RoleDefinition {
 // need: a definition never ends, so what the actor holds only until a time can't stand in. Each
 // of its GrantableRoles must be a role the actor may grant on the tenant. Replacing a role
 // another custom role lists needs the power to grant it as defined wherever that one lists it,
-// and where it will give more, under the denies on the path of each scope that one is granted on,
-// as that one's holders there may then grant it, and with that scope's label, unless the actor's
-// label values satisfy every label. Replacing one so that its grants give something
+// and where it will give more, under the denies on the path of each scope that one, or a role
+// listing that one, is granted on, as their holders there may then grant it, the latter's by
+// granting that one first, and with that scope's label, unless the actor's label values satisfy
+// every label. Replacing one so that its grants give something
 // else changes them, so a constraint that stops changes to grants where it can be granted, or a
 // deny that removes the actor's power to change them there or on the path of a scope they are on,
 // stops it, as it stops DeleteRole and Apply there; so does, where they will give more, a deny on
@@ -817,8 +819,8 @@ type roleReach struct {
 }
 
 // reached are the scopes a change to a custom role reaches: those its grants and eligibilities are
-// on, own, and where they will give more, those of the roles listing it, whose holders may grant it
-// as it will be without holding it, listed, each with the types of scope the grants there let them
+// on, own, and where they will give more, those of the roles whose holders may grant it as it will
+// be without holding it (handingOn), listed, each with the types of scope the grants there let them
 // grant it on.
 type reached struct {
 	own    []Scope
@@ -831,22 +833,14 @@ func (r reached) any() bool { return len(r.own)+len(r.listed) > 0 }
 // will be where its grants will give more, and custom the tenant's custom roles, as read.
 func (a *Authorizer) reachedBy(ctx context.Context, q DB, tenant string, id Role, custom map[Role]RoleDefinition, grows *RoleDefinition) (reached, error) {
 	ids := []Role{id}
-	types := map[Role][]string{}
+	var handing map[listedAt][]string
 	if grows != nil {
-		for _, lid := range slices.Sorted(maps.Keys(custom)) {
-			l := custom[lid]
-			if lid == id || !slices.Contains(l.GrantableRoles, id) {
-				continue
-			}
-			for _, p := range l.Permissions {
-				if t, _ := p.parts(); p.changesGrants() && a.grantableOn(*grows, t) {
-					types[lid] = append(types[lid], t)
-				}
-			}
-			if len(types[lid]) > 0 {
-				ids = append(ids, lid)
-			}
+		handing = a.handingOn(custom, id, *grows)
+		listers := map[Role]bool{}
+		for at := range handing {
+			listers[at.role] = true
 		}
+		ids = append(ids, slices.Sorted(maps.Keys(listers))...)
 	}
 	scopes, err := a.rolesScopes(ctx, q, tenant, ids)
 	if err != nil {
@@ -858,9 +852,8 @@ func (a *Authorizer) reachedBy(ctx context.Context, q DB, tenant string, id Role
 			r.own = append(r.own, s.Scope)
 			continue
 		}
-		// A t:grant on a scope of another type, not holding resources, lets its holders grant nothing.
-		for _, t := range types[s.role] {
-			if (a.contains(s.Type) || s.Type == t) && !slices.Contains(r.listed[s.Scope], t) {
+		for _, t := range handing[listedAt{s.role, s.Type}] {
+			if !slices.Contains(r.listed[s.Scope], t) {
 				r.listed[s.Scope] = append(r.listed[s.Scope], t)
 			}
 		}
@@ -868,15 +861,77 @@ func (a *Authorizer) reachedBy(ctx context.Context, q DB, tenant string, id Role
 	return r, nil
 }
 
+// listedAt is a custom role granted on a scope of a type.
+type listedAt struct {
+	role      Role
+	scopeType string
+}
+
+// handingOn is, for each custom role granted on a scope of a type, the types of scope on which its
+// holders may grant custom role id, defined as def, without holding it: through a role listing it,
+// and through one listing such a role, as its holders may grant that one to others, who may then
+// grant id. A t:grant reaches scopes of t from a container, the tenant or a scope of t itself
+// (grantedOn), and lets its holders grant a role it lists only where that role can be granted. It is
+// found back from id, a type at a time, so a tenant's roles listing one another are each read once.
+func (a *Authorizer) handingOn(custom map[Role]RoleDefinition, id Role, def RoleDefinition) map[listedAt][]string {
+	// The roles listing each role, with the type each one's t:grant lets its holders grant it on.
+	listedBy := map[Role][]listedAt{}
+	for _, lid := range slices.Sorted(maps.Keys(custom)) {
+		if lid == id {
+			continue
+		}
+		l := custom[lid]
+		for _, p := range l.Permissions {
+			if t, _ := p.parts(); p.changesGrants() {
+				for _, g := range l.GrantableRoles {
+					listedBy[g] = append(listedBy[g], listedAt{lid, t})
+				}
+			}
+		}
+	}
+	handing := map[listedAt][]string{}
+	for _, t := range a.grantedOn(def.ResourceTypes) {
+		if !a.grantableOn(def, t) {
+			continue
+		}
+		seen := map[listedAt]bool{}
+		var next []listedAt
+		// Those granted on scopes of which types may grant g on a scope of type on.
+		listing := func(g Role, on string) {
+			for _, l := range listedBy[g] {
+				if l.scopeType != on {
+					continue
+				}
+				for _, st := range a.grantedOn([]string{on}) {
+					if at := (listedAt{l.role, st}); !seen[at] {
+						seen[at] = true
+						next = append(next, at)
+					}
+				}
+			}
+		}
+		listing(id, t)
+		for len(next) > 0 {
+			at := next[0]
+			next = next[1:]
+			handing[at] = append(handing[at], t)
+			if a.grantableOn(custom[at.role], at.scopeType) {
+				listing(at.role, at.scopeType)
+			}
+		}
+	}
+	return handing
+}
+
 // roleReachOf refuses changing what a custom role's grants and eligibilities give, or revoking
 // them, where Apply would refuse the actor changing them: on a scope they are on, as
 // Config.ResourceOf gives it, where a deny on its path removes the actor's power to change grants
 // there or, with grows, the role as it will be when they will give more, a permission it gives, or
 // where its label refuses the actor (labelsHeld). With grows, it refuses too where a deny on the
-// path of a scope a role listing it is granted on keeps the actor from granting it there as it will
-// be, as that role's holders there then may (scopesDenied), or where that scope's label refuses the
-// actor, unless the actor's label values satisfy every label. Only a deny on a scope other than the
-// tenant can remove more there than the tenant's, which mayDefine and changesDenied check, so only
+// path of a scope a role whose holders may grant it without holding it is granted on (handingOn)
+// keeps the actor from granting it there as it will be, as they then may (scopesDenied), or where
+// that scope's label refuses the actor, unless the actor's label values satisfy every label. Only a
+// deny on a scope other than the tenant can remove more there than the tenant's, which mayDefine and changesDenied check, so only
 // where one binds the actor, or a label could refuse it, is the host asked about the scopes.
 // Without grows, as for deleting or narrowing the role, which only takes access away, a scope the
 // host no longer has (ErrNotFound) is read as stored, with no containers or label. au is the
@@ -936,7 +991,7 @@ func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authorit
 		reach.on[s] = r
 	}
 	if denied {
-		if err := a.scopesDenied(ctx, a.db, actor, au, tenant, id, scopes, reach, change); err != nil {
+		if err := a.scopesDenied(ctx, a.db, actor, au, tenant, scopes, reach, change); err != nil {
 			return roleReach{}, err
 		}
 	}
@@ -998,7 +1053,7 @@ func (a *Authorizer) stillReaches(ctx context.Context, tx pgx.Tx, actor Subject,
 		}
 	}
 	if denied {
-		if err := a.scopesDenied(ctx, tx, actor, au, tenant, id, scopes, checked, change); err != nil {
+		if err := a.scopesDenied(ctx, tx, actor, au, tenant, scopes, checked, change); err != nil {
 			return err
 		}
 	}
@@ -1023,24 +1078,22 @@ func (a *Authorizer) deniedBelow(ctx context.Context, q DB, tenant string, actor
 // paths of the scopes the change reaches, each as reach resolved it, as one would stop Apply there:
 // on a scope its grants and eligibilities are on, one that removes the actor's power to change
 // grants there, or where they will give more, one that removes there a permission the role as it
-// will be gives, which the actor would hand on there; and on a scope a role listing it is granted
-// on, one that keeps the actor from granting the role as it will be there, as that role's holders
-// there then may. au is the actor's authority on the tenant, which mayDefine checked the role on.
-func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au authority, tenant string, id Role, scopes reached, reach roleReach,
+// will be gives, which the actor would hand on there; and on a scope of those listed, one that keeps
+// the actor from granting the role as it will be there, as the holders of a role granted there then
+// may. au is the actor's authority on the tenant, which mayDefine checked the role on.
+func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au authority, tenant string, scopes reached, reach roleReach,
 	change string,
 ) error {
-	listed := slices.SortedFunc(maps.Keys(scopes.listed), scopeOrder)
-	if reach.grows == nil {
-		listed = nil
-	}
 	var on []Resource
-	for _, s := range slices.Concat(scopes.own, listed) {
+	for _, s := range slices.Concat(scopes.own, slices.SortedFunc(maps.Keys(scopes.listed), scopeOrder)) {
 		on = append(on, reach.on[s])
 	}
 	if len(on) == 0 {
 		return nil
 	}
-	aus, err := a.authorities(ctx, q, actor, on, []Role{id})
+	// Only the denies on their paths are read of these, not the roles a check names: what the role
+	// gives is decided by au.
+	aus, err := a.authorities(ctx, q, actor, on, nil)
 	if err != nil {
 		return err
 	}
@@ -1085,8 +1138,9 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 		reason := fmt.Sprintf("removed by a deny there, which stops %s, as the actor can't hand %s on there", change, p)
 		return cmp.Or(au.constrained.failed(), error(&DeniedError{Permission: p, Scope: scope, Reason: reason}))
 	}
-	// Where a role listing it is granted, its holders may grant it on scopes of each type there as it
-	// will be: so must the actor, under the denies there, as mayDefine checks across the tenant.
+	// Where a role listing it, or listing one that does, is granted, its holders may grant it on
+	// scopes of each type there as it will be: so must the actor, under the denies there, as mayDefine
+	// checks across the tenant.
 	asked := map[string]bool{}
 	for i, at := range listing {
 		r := on[len(own)+i]
@@ -1099,7 +1153,7 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 			there := au
 			there.handsOn = orDenied(au.handsOn, at.handsOn)
 			if missing, ok := a.mayGrant(there, there.under(t, "", time.Time{}), t, def, "", time.Time{}, newChecked()); !ok {
-				reason := fmt.Sprintf("removed by a deny there, which stops %s, as a role listing it lets its holders there grant it on a %s, which the actor can't", change, t)
+				reason := fmt.Sprintf("removed by a deny there, which stops %s, as the holders of a role granted there may grant it on a %s without holding it, which the actor can't", change, t)
 				return cmp.Or(au.constrained.failed(), error(&DeniedError{Permission: missing, Scope: r.Scope(), Reason: reason}))
 			}
 		}

@@ -7523,6 +7523,50 @@ func TestADenySetWhileARedefinitionHandedOnByARoleListingItWaitsStopsIt(t *testi
 	}
 }
 
+// A role listing one that lists r lets its holders grant that one, whose holders may then grant r,
+// so widening r hands on through it too, wherever it is granted: a deny there that removes from x
+// what r will give stops it.
+func TestADenyBelowTheTenantStopsARedefinitionHandedOnThroughARoleListingOneListingIt(t *testing.T) {
+	for _, on := range []rbac.Scope{workspace.Scope(), {Type: "cluster", ID: "c2"}} {
+		t.Run(on.Key(), func(t *testing.T) {
+			h, guardian := guarded(t)
+			ctx := t.Context()
+			x, r := definer(t, h)
+			l := listing(t, h, x, r)
+			outer := rbac.RoleDefinition{ID: "custom.outer", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{l.ID}}
+			if err := h.authz.SetRole(ctx, x, "t1", outer); err != nil {
+				t.Fatal(err)
+			}
+			y, z, w := h.as(t, "y"), h.as(t, "z"), h.as(t, "w")
+			h.seed(t, grant(on, outer.ID, rbac.User, "y"))
+			if err := h.authz.SetDeny(ctx, guardian, workspace, rbac.Deny{ID: "no-root", Permissions: []rbac.Permission{root}, Principals: []rbac.Principal{x.Principal}}); err != nil {
+				t.Fatal(err)
+			}
+			wider := r
+			wider.Permissions = []rbac.Permission{view, root}
+			err := h.authz.SetRole(ctx, x, "t1", wider)
+			if on != workspace.Scope() {
+				if err != nil {
+					t.Fatalf("widening a role listed through one granted only outside the deny: %v", err)
+				}
+				return
+			}
+			for _, c := range []struct {
+				by   rbac.Subject
+				role rbac.Role
+				to   rbac.Principal
+			}{{y, l.ID, z.Principal}, {z, r.ID, w.Principal}} {
+				if applied := h.authz.Apply(ctx, c.by, cluster, rbac.Change{Grant: []rbac.Binding{{Role: c.role, Principal: c.to}}}); applied != nil {
+					t.Fatal(applied)
+				}
+			}
+			if !errors.Is(err, rbac.ErrDenied) || allowed(t, h, w, root, cluster) {
+				t.Fatalf("widening a role listed by one that a role granted under the deny lists: %v", err)
+			}
+		})
+	}
+}
+
 func TestExplainNamesTheDenyAuthorizeDoes(t *testing.T) {
 	h, guardian := guarded(t)
 	ctx := t.Context()
