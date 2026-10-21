@@ -35,15 +35,16 @@ import (
 // such as `request.time < timestamp("2027-01-01T00:00:00Z") && resource.attributes.env != "prod"`.
 // A grant with one gives its role only where the expression is true. An expression that fails, as
 // one reading an attribute the host didn't pass does, or comparing a double that isn't finite, as
-// dividing by zero makes, or keying a map by one, is false. A label value and a power to release
-// are decided on the tenant with no attributes, whatever a check passes (Holding), and their
-// conditions can't read the tenant's: any read of resource.attributes fails, a test of an
-// attribute's presence, in, size(), a macro and a comparison included, so a grant's gives nothing
-// and a deny's applies. The zero Condition is none, and one with a title or description has an
-// expression. A pattern it matches is a string literal, of bounded size; it nests at most 32 deep;
-// it builds no message, as `google.protobuf.Struct{}`; and a comparison, or a search of a list,
-// that would read more than a condition may spend, or reading a time in a zone whose name is longer
-// than 64 bytes, fails before it runs.
+// dividing by zero makes, keying a map by one or comparing a map keyed by one, is false, though a
+// key not found `in` a map the host passes keyed by one is not found (Attributes). A label value
+// and a power to release are decided on the tenant with no attributes, whatever a check passes
+// (Holding), and their conditions can't read the tenant's: any read of resource.attributes fails,
+// a test of an attribute's presence, in, size(), a macro and a comparison included, so a grant's
+// gives nothing and a deny's applies. The zero Condition is none, and one with a title or
+// description has an expression. A pattern it matches is a string literal, of bounded size; it
+// nests at most 32 deep; it builds no message, as `google.protobuf.Struct{}`; and a comparison, or
+// a search of a list, that would read more than a condition may spend, or reading a time in a zone
+// whose name is longer than 64 bytes, fails before it runs.
 //
 // Each condition runs within the most evaluating it can cost, which its literals and types bound:
 // little for one comparing what a request passes with literals, or with the subject's kind or id,
@@ -1233,16 +1234,25 @@ func (a *keyedAttribute) qualifier(vars interpreter.Activation) (interpreter.Qua
 		return nil, err
 	}
 	a.k.charge(vars, a, v)
+	// An index never runs the key, so finiteKey doesn't see it: a map the host passes would find
+	// an infinite key, where `in` refuses one.
+	if nonFinite(a.Adapter().NativeToValue(v)) {
+		return nil, errNonFiniteKey
+	}
 	return a.k.fac.NewQualifier(nil, attr.ID(), v, attr.IsOptional())
 }
+
+var errNonFiniteKey = errors.New("rbac: a double that isn't finite can't be a key")
 
 // finiteKey is key, failing for a double that isn't finite, as comparing one does (nonFinite): CEL
 // finds no key equal to NaN, so a map keyed by one would equal no map and hold no value, and a
 // deny's `{failed / total: 1} == {0.5: 1}` would lift where both are 0.0. A condition computes
-// every key that can be one, since none is written.
+// every key it can make one of, since none is written. A map the host passes can be keyed by one:
+// comparing it fails (equal), as does indexing it by one (qualifier), but a key not found `in` it
+// is false, as finding whether it holds one that isn't finite would read every key, uncharged.
 func finiteKey(key ref.Val) ref.Val {
 	if nonFinite(key) {
-		return types.NewErr("rbac: a double that isn't finite can't be a key")
+		return types.WrapErr(errNonFiniteKey)
 	}
 	return key
 }
@@ -1302,6 +1312,16 @@ func incomparable() ref.Val {
 	return types.NewErr("rbac: a double that isn't finite can't be compared")
 }
 
+// nonFiniteKey reports whether m holds a key that is a double that isn't finite.
+func nonFiniteKey(m traits.Mapper) bool {
+	for it := m.Iterator(); it.HasNext() == types.True; {
+		if nonFinite(it.Next()) {
+			return true
+		}
+	}
+	return false
+}
+
 // equal is x == y, failing where comparing values a map or list holds fails, as reading a
 // declared attribute passed as another type does: CEL's own comparison of maps and lists counts
 // such a value as equal, so that a map holding one would equal any map with its keys. It finds the
@@ -1336,6 +1356,12 @@ func equal(x, y ref.Val, read uint64) ref.Val {
 		ys, ok := y.(traits.Mapper)
 		if !ok || xs.Size() != ys.Size() {
 			return types.Equal(x, y)
+		}
+		// A map the host passes can be keyed by one, which finiteKey doesn't see, and no key is found
+		// equal to NaN, so it would equal no map. Comparing is charged for each key of either, as
+		// they hold as many.
+		if nonFiniteKey(xs) || nonFiniteKey(ys) {
+			return incomparable()
 		}
 		for it := xs.Iterator(); it.HasNext() == types.True; {
 			k := it.Next()

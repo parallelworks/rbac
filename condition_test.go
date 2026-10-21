@@ -172,6 +172,30 @@ func TestADoubleAConditionMakesThatIsntFiniteFailsWhatComparesIt(t *testing.T) {
 	}
 }
 
+// A map the host passes can be keyed by a double that isn't finite, a key no condition computes:
+// comparing one keyed by NaN decided it equal to no map, and looking up its infinite key by one a
+// condition reads found it, where `in` fails.
+func TestAMapTheHostPassesKeyedByADoubleThatIsntFiniteFailsWhatComparesOrIndexesIt(t *testing.T) {
+	attributes := map[string]any{
+		"nan": map[float64]any{math.NaN(): 1}, "inf": map[float64]any{math.Inf(1): 1}, "y": math.Inf(1),
+		"finite": map[float64]any{0.5: 1}, "half": 0.5,
+	}
+	for _, expr := range []string{
+		`request.attributes.nan != {0.5: 1}`, `{0.5: 1} != request.attributes.nan`, `[request.attributes.nan] != [{0.5: 1}]`,
+		`request.attributes.inf == request.attributes.inf`, `request.attributes.inf[request.attributes.y] == 1`,
+		`[request.attributes.y].all(r, request.attributes.inf[r] == 1)`,
+	} {
+		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || evaluated {
+			t.Errorf("%s: evaluated %t, %v", expr, evaluated, err)
+		}
+	}
+	for _, expr := range []string{`request.attributes.finite == {0.5: 1}`, `request.attributes.finite[request.attributes.half] == 1`} {
+		if held, _, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || !held {
+			t.Errorf("%s: held %t, %v", expr, held, err)
+		}
+	}
+}
+
 func TestADeclaredAttributePassedAsAnotherTypeFailsAComparisonOfWhatHoldsIt(t *testing.T) {
 	h := setup(t, func(c *rbac.Config) {
 		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
