@@ -743,7 +743,8 @@ func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string
 // DeleteGroups deletes a tenant's groups, as actor: the host's own write, as for a directory it
 // syncs from. With each go its members, its place in other groups, its grants and eligibilities,
 // and its place in denies and among approvers: an eligibility only the groups approve goes too,
-// rather than activate without approval.
+// rather than activate without approval. The activations its members made through it, or a group
+// it is in, are cut short or end, as by their leaving it, which DeleteGroup refuses instead.
 func (a *Authorizer) DeleteGroups(ctx context.Context, actor Principal, tenant string, ids []string) (err error) {
 	defer a.refused(ctx, &err, tenant, actor, "DeleteGroups")
 	if len(ids) > MaxBindings {
@@ -1509,8 +1510,9 @@ type reach struct {
 	// short or end (unrest).
 	activations []activated
 	placed
-	// labeled is whether the host declares labels, which alone check what a member leaving loses:
-	// without them, a grant made to its group meanwhile changes nothing the change checked.
+	// labeled is whether the host declares labels, which alone check what a member leaving loses,
+	// and what one joining loses to the denies that then bind it: without them, a grant made to its
+	// group meanwhile changes nothing the change checked.
 	labeled bool
 }
 

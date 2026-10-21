@@ -220,7 +220,7 @@ names the scopes conditional ones reach, to check one by one.
   eligibility again or deleting it bounds only the activations made from then on, and leaves
   those made to their ends, or to their holders leaving its group: on a labeled scope,
   `ChangeMembers` ends them so only for an actor holding what the label asks for, as revoking them
-  there needs, and `DeleteGroup` refuses a group they rest on. On a labeled scope, only an
+  there needs; on any scope, `DeleteGroup` refuses a group they rest on. On a labeled scope, only an
   approver holding what its label asks for approves.
 - **Host policy:** `Config.ValidateGrant` is asked about every grant with the role, the principal,
   the actor and how it is made, so the host decides who may hold what: members only, no
@@ -266,8 +266,9 @@ names the scopes conditional ones reach, to check one by one.
   activations made through the group, and an added one is bound by the denies naming the group,
   which only the label of each scope refuses the actor, as for a revoke there. A place made to end
   sooner gains nothing: it is a removal then, checked as one now; nor does one whose note alone
-  changes. So whoever manages a group that holds, approves and is in no deny changes its members
-  freely, and one holding a role only if they could grant that role themselves.
+  changes. So whoever manages a group that holds, approves and is in no deny, and that no member
+  activated through, changes its members freely, and one holding a role only if they could grant
+  that role themselves.
   `Config.ResourceOf` gives the package the tenant, which `SetGroup` and `DeleteGroup` check
   `rbac.ManageGroups` on, and the groups, which `ChangeMembers` checks `rbac.GroupMembers` on and
   `SetGroup` and `DeleteGroup` the label of, each with its constraints and label, and the
