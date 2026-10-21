@@ -571,6 +571,37 @@ func TestAnActorHoldingNoneOfTwoExclusiveValuesHandsNeitherOn(t *testing.T) {
 	}
 }
 
+// An actor holding none of an exclusive dimension's values, as its grants could give it two, still
+// hands one on through a role it holds that lists it, which grants without holding; the identity it
+// grants to is checked as in any change, so no one comes to hold two.
+func TestAnActorHoldingNoneOfTwoExclusiveValuesHandsOnOneARoleListsIt(t *testing.T) {
+	valuer := rbac.RoleDefinition{
+		ID: "valuer", Permissions: []rbac.Permission{rbac.GrantPermission(rbac.TenantScope)}, ResourceTypes: []string{rbac.TenantScope},
+		GrantableRoles: []rbac.Role{"bank.a", "bank.b"},
+	}
+	h := labeled(t, banks, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), valuer) })
+	ctx := t.Context()
+	root := rbac.TenantRoot("t1")
+	admin, bob := h.as(t, "admin"), h.as(t, "bob")
+	h.as(t, "carol")
+	h.seed(t, grant(root, valuer.ID, rbac.User, "admin"), grant(root, "bank.b", rbac.User, "carol"))
+	// As a catalog change leaves it: admin's grants give it bank:a and bank:b.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'tenant', 't1', 'user', 'admin', 'bank.a'), ('t1', 'tenant', 't1', 'user', 'admin', 'bank.b')`); err != nil {
+		t.Fatal(err)
+	}
+	if allowed(t, h, admin, "bank:a", tenantT1) {
+		t.Fatal("admin, whose grants give it two of bank's values, holds bank:a")
+	}
+	if err := h.authz.Apply(ctx, admin, tenantT1, rbac.Change{Grant: []rbac.Binding{{Role: "bank.a", Principal: bob.Principal}}}); err != nil {
+		t.Fatalf("handing on a value a role it holds lists: %v", err)
+	}
+	if !allowed(t, h, bob, "bank:a", tenantT1) {
+		t.Error("bob doesn't hold bank:a, handed on")
+	}
+	excluded(t, h.authz.Apply(ctx, admin, tenantT1, rbac.Change{Grant: []rbac.Binding{{Role: "bank.a", Principal: identity("carol")}}}))
+}
+
 func TestEveryGrantCountsTowardTwoExclusiveValues(t *testing.T) {
 	h := labeled(t, func(c *rbac.Config) {
 		banks(c)
