@@ -371,23 +371,31 @@ and each row as JSON text, not parsed into a store's own form, which can reorder
 
 `AsOf(ctx, tenant, at, read)` reads a tenant as it was at a time, from its history: every check,
 list and search the read makes answers as it would have then, with the catalog as it is now, as for
-an access review of a past date. A change counts from when the statement that made it began, but
-never before its row's change before it, as the writer's snapshot holds it: at READ COMMITTED, as
-the package changes the tables, a statement that waited for another's lock on the row reads the
-change it waited for, but at REPEATABLE READ or SERIALIZABLE its transaction's snapshot is older,
-and it is dated before that change. Write around the package at READ COMMITTED. `AsOf` makes no
-change: one tried is no actor's attempt, and `Config.OnRefused` isn't told of it. A statement
-reads the history of the rows it names, as a check does its subject's grants, groups and the
-denies on its resource's path, a search the custom roles its grants name, and `Holders` the
-members of the groups it lists, not the whole tenant's: `AsOf` plans every statement in its
-transaction for its arguments, the host's too, since a connection's cached plan of a statement it
-has run often counts any tenant as an average one. A list counts the denies on scopes of its types
-by history's versions of them, at most a few, and `Grantable`, which can offer any custom role,
-reads each version of every one once. It orders a row's changes by their ids in `rbac_history`,
-which sessions take out of order once that table's id sequence caches more than one, so `AsOf`
-refuses that. Its read's hooks run in its transaction, which holds one of the pool's connections:
-a constraint there queries the `DB` it is given, as one that queries the pool waits for another
-connection, which a busy pool may never free.
+an access review of a past date. A change counts from when the statement that made it began, or its
+transaction, where that began later, as each one a procedure or a `DO` block starts as it commits
+does; an expiry from when it expired; and none from before its row's change before it, as the
+writer's snapshot holds it: at READ COMMITTED, as the package changes the tables, a statement that
+waited for another's lock on the row reads the change it waited for, but at REPEATABLE READ or
+SERIALIZABLE its transaction's snapshot is older, and it is dated before that change. Write around
+the package at READ COMMITTED. So no change counts from before the transaction that made it began,
+and what a time reads is final once every transaction that had begun by then has ended:
+`pg_stat_activity` lists each session's `xact_start`, which for a block that commits as it goes is
+when its current transaction began, what its changes count from, though its `query_start` is when
+the block began. Neither `backend_xid` nor an export that has read past the time shows it final: a
+transaction that has only read holds no transaction id, which neither shows nor holds `History`
+back, and can still make a change that counts from its start. A prepared transaction's changes count
+once it is committed, as `pg_prepared_xacts` lists. `AsOf` makes no change: one tried is no actor's
+attempt, and `Config.OnRefused` isn't told of it. A statement reads the history of the rows it
+names, as a check does its subject's grants, groups and the denies on its resource's path, a search
+the custom roles its grants name, and `Holders` the members of the groups it lists, not the whole
+tenant's: `AsOf` plans every statement in its transaction for its arguments, the host's too, since a
+connection's cached plan of a statement it has run often counts any tenant as an average one. A list
+counts the denies on scopes of its types by history's versions of them, at most a few, and
+`Grantable`, which can offer any custom role, reads each version of every one once. It orders a
+row's changes by their ids in `rbac_history`, which sessions take out of order once that table's id
+sequence caches more than one, so `AsOf` refuses that. Its read's hooks run in its transaction,
+which holds one of the pool's connections: a constraint there queries the `DB` it is given, as one
+that queries the pool waits for another connection, which a busy pool may never free.
 
 `rbac.PruneHistory(ctx, db, before, through)` deletes what an export has read past (`through`, its
 cursor) and later records supersede: of each row, the last version at or before `before` stays, so
