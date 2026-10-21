@@ -1350,13 +1350,14 @@ func (a *Authorizer) placesBounded(ctx context.Context, tx pgx.Tx, tenant string
 // Config.ValidateGrant is asked about each as the member's (ViaMembership); it approves the
 // activations of the eligibilities those approve, which the actor must be able to set; and it is
 // exempt from the denies those are exempt from, as a removed member is from the denies those name,
-// which the actor must be able to set. A removed member loses the rest, which only the label of
-// each scope it is on refuses the actor, as Apply refuses a revoke there; a place made to end
-// sooner gains nothing: it is a removal then, checked as one now; nor does one whose note alone
-// changes. Each group changed, and each scope reached, is checked as Config.ResourceOf returns it,
-// a group no member gains a place in that the host no longer has (ErrNotFound) as unlabeled.
-// Members from a source the host owns, and the members of a group from one, only the host changes,
-// and what ImportMembers refuses, this does.
+// which the actor must be able to set. A removed member loses the rest, and an added one is bound
+// by the denies those are named in, which only the label of each scope they are on refuses the
+// actor, as Apply refuses a revoke there; a place made to end sooner gains nothing: it is a removal
+// then, checked as one now; nor does one whose note alone changes. Each group changed, and each
+// scope reached, is checked as Config.ResourceOf returns it, a group no member gains a place in
+// that the host no longer has (ErrNotFound) as unlabeled. Members from a source the host owns, and
+// the members of a group from one, only the host changes, and what ImportMembers refuses, this
+// does.
 func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant string, add, remove []Member) (err error) {
 	defer a.refused(ctx, &err, tenant, actor.Principal, "ChangeMembers")
 	if !validID(tenant) {
@@ -1841,6 +1842,22 @@ func (r reach) lifted(group string, leaving bool) []Deny {
 	return ds
 }
 
+// boundBy is the scopes a member joining group, or staying in it longer, loses access on, as the
+// change will store them: those of the denies that name it or one it will be in, which then bind
+// the member; none where no label checks them.
+func (r reach) boundBy(group string) []Scope {
+	if !r.labeled {
+		return nil
+	}
+	var ss []Scope
+	for _, d := range r.denies {
+		if in(r.up, group, d.Principals...) {
+			ss = append(ss, d.Scope)
+		}
+	}
+	return ss
+}
+
 // leftBy is the scopes a member leaving group loses access on, as stored: those of the grants and
 // eligibilities of it and those it is in, of the eligibilities they approve, and of the denies that
 // exempt them; none where no label checks them.
@@ -1881,7 +1898,7 @@ func (r reach) locks() []string {
 
 // reachKey is one change to access a change to members makes for a member of group: a grant or
 // eligibility gained, or one whose activations it approves, a deny on a scope lifted, or access on
-// a scope left.
+// a scope left or lost to a deny binding it.
 type reachKey struct {
 	group    string
 	approves bool
@@ -1906,6 +1923,9 @@ func (r reach) footprint(add, remove []Member, gains bool) map[reachKey]RoleDefi
 		}
 		for _, d := range r.lifted(m.Group, false) {
 			f[reachKey{group: m.Group, deny: d.Scope}] = RoleDefinition{}
+		}
+		for _, s := range r.boundBy(m.Group) {
+			f[reachKey{group: m.Group, left: s}] = RoleDefinition{}
 		}
 	}
 	if gains {
@@ -2015,10 +2035,10 @@ type reachCheck struct {
 // mayReach checks, before ChangeMembers' transaction, that actor may make each change to access a
 // change to members makes, by scope: grant each grant and eligibility an added member gains, as
 // Apply would; set each eligibility it would approve; set each deny lifted for a member; and take
-// away what a member leaving loses, which only a scope's label refuses, as Apply refuses a revoke
-// there. The actor's label values are asked about through labels, and for what a member leaving
-// loses decided by values, which mayManageGroups read with its power over the members, so it held
-// both at one moment.
+// away what a member leaving loses, and what one joining loses to the denies that then bind it,
+// which only a scope's label refuses, as Apply refuses a revoke there. The actor's label values
+// are asked about through labels, and for what a member loses decided by values, which
+// mayManageGroups read with its power over the members, so it held both at one moment.
 func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string, add, remove []Member, rc reach, labels *constrained,
 	values *valuesRead,
 ) ([]*reachCheck, error) {
@@ -2058,6 +2078,9 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 		}
 		for _, d := range rc.lifted(m.Group, false) {
 			at(d.Scope).denies = true
+		}
+		for _, s := range rc.boundBy(m.Group) {
+			at(s).leaves = true
 		}
 	}
 	for _, m := range rc.leaving(add, remove) {

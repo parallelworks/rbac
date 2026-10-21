@@ -1652,6 +1652,114 @@ func TestRemovingAMemberNeedsTheLabelOfWhereItsGroupsHoldAccess(t *testing.T) {
 	}
 }
 
+// Joining a group a deny on a labeled scope names, or one in it, binds the member there, as leaving
+// one it exempts does: either takes access away, which the scope's label refuses the actor, as for
+// a revoke there. So do nesting a group in one, and making a place in one last longer.
+func TestJoiningAGroupADenyNamesNeedsTheLabelOfItsScope(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	h := labeled(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s == secret.Scope() {
+				return secret, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"), grant(secret.Scope(), "cluster.login", rbac.User, "u"))
+	h.hold(t, "u", "level:high")
+	h.groups(t, "named", "inner", "team", "fresh", "plain")
+	// A deny on the labeled cluster names named, which inner is in; one on the unlabeled workspace
+	// names plain.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+		VALUES ('t1', 'cluster', 'c1', 'd', '{group:named}', '{}', '{cluster:login}'),
+		  ('t1', 'workspace', 'w1', 'd', '{group:plain}', '{}', '{cluster:root}')`); err != nil {
+		t.Fatal(err)
+	}
+	h.join(t, "u", "w")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{
+		{Group: "named", Principal: groupOf("inner")},
+		{Group: "team", Principal: identity("u")},
+		{Group: "named", Principal: identity("w"), ExpiresAt: h.now.Add(time.Minute)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	admin := h.as(t, "admin")
+	u := rbac.Subject{Principal: identity("u")}
+	for what, add := range map[string][]rbac.Member{
+		"joining a group a deny names":        {{Group: "named", Principal: u.Principal}},
+		"joining a group in one":              {{Group: "inner", Principal: u.Principal}},
+		"nesting a group in one":              {{Group: "named", Principal: groupOf("team")}},
+		"nesting a group and joining it":      {{Group: "inner", Principal: groupOf("fresh")}, {Group: "fresh", Principal: u.Principal}},
+		"making a place in one last longer":   {{Group: "named", Principal: identity("w"), ExpiresAt: h.now.Add(time.Hour)}},
+		"making a place in one last for good": {{Group: "named", Principal: identity("w")}},
+	} {
+		if err := h.authz.ChangeMembers(ctx, admin, "t1", add, nil); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("%s without the cluster's label: %v", what, err)
+		}
+	}
+	if !allowed(t, h, u, login, secret) {
+		t.Fatal("u should still log in to the labeled cluster")
+	}
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", []rbac.Member{{Group: "plain", Principal: u.Principal}}, nil); err != nil {
+		t.Errorf("joining a group a deny on an unlabeled scope names: %v", err)
+	}
+	h.hold(t, "admin", "level:high")
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", []rbac.Member{{Group: "named", Principal: u.Principal}}, nil); err != nil {
+		t.Fatalf("joining a group a deny names with the cluster's label: %v", err)
+	}
+	if allowed(t, h, u, login, secret) {
+		t.Error("the deny should bind u once it joined the group it names")
+	}
+}
+
+// A join is tried again when, while the scopes it reaches are read from the host, a deny on a
+// labeled scope comes to name the group, whose label it didn't check.
+func TestADenyNamingAGroupSetWhileAJoinIsCheckedIsTriedAgain(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	var meanwhile func(ctx context.Context) error
+	h := labeled(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if do := meanwhile; do != nil && s == workspace.Scope() {
+				meanwhile = nil
+				if err := do(ctx); err != nil {
+					return rbac.Resource{}, err
+				}
+			}
+			if s == secret.Scope() {
+				return secret, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"))
+	h.groups(t, "crew")
+	// A deny on the unlabeled workspace names crew, so the join asks the host about it.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+		VALUES ('t1', 'workspace', 'w1', 'd', '{group:crew}', '{}', '{cluster:root}')`); err != nil {
+		t.Fatal(err)
+	}
+	h.join(t, "u")
+	meanwhile = func(ctx context.Context) error {
+		_, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+			VALUES ('t1', 'cluster', 'c1', 'd', '{group:crew}', '{}', '{cluster:login}')`)
+		return err
+	}
+	if err := h.authz.ChangeMembers(ctx, h.as(t, "admin"), "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}}, nil); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("a join to a group a deny on a labeled scope came to name meanwhile: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("a deny on the cluster should have named crew meanwhile")
+	}
+}
+
 // A removal a label refuses is refused before its transaction, waiting for no lock another
 // change holds.
 func TestARemovalALabelRefusesWaitsForNoLock(t *testing.T) {
