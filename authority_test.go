@@ -2251,6 +2251,100 @@ func TestRedefiningARoleGrantedOnALabeledScopeNeedsItsLabel(t *testing.T) {
 	}
 }
 
+// A role granted on a labeled cluster that lists another lets its holders grant that one there, so
+// widening it hands more on there: an actor the label refuses can't.
+func TestWideningARoleThatOneGrantedOnALabeledScopeListsNeedsItsLabel(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	h := labeled(t, func(c *rbac.Config) {
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s == secret.Scope() {
+				return secret, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	r := rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	l := rbac.RoleDefinition{ID: "custom.lister", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{r.ID}}
+	for _, d := range []rbac.RoleDefinition{r, l} {
+		if err := h.authz.SetRole(ctx, admin, "t1", d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.seed(t, grant(secret.Scope(), l.ID, rbac.User, "pilot"))
+	widened := r
+	widened.Permissions = []rbac.Permission{view, login}
+	if err := h.authz.SetRole(ctx, admin, "t1", widened); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("widening a role that one granted on a labeled scope lists, without its label: %v", err)
+	}
+	h.hold(t, "admin", "level:high")
+	if err := h.authz.SetRole(ctx, admin, "t1", widened); err != nil {
+		t.Fatalf("with its label: %v", err)
+	}
+}
+
+// Where the actor's label values satisfy every label, widening a role asks the host nothing about
+// the scopes roles listing it are granted on, and is tried again where they no longer do once it
+// holds the tenant's lock.
+func TestWideningARoleByOneClearedForEveryLabelAsksTheHostNothingAboutRolesListingIt(t *testing.T) {
+	asked := 0
+	var meanwhile func(context.Context) error
+	h := labeled(t, func(c *rbac.Config) {
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s.Type == "cluster" {
+				asked++
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+		c.Constraints = []rbac.Constraint{{Name: "meanwhile", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if do := meanwhile; do != nil && in.Permission == "rel:fra" {
+				meanwhile = nil
+				return false, do(ctx)
+			}
+			return false, nil
+		}}}
+	})
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles)
+		VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}', '{}'),
+		  ('t1', 'custom.lister', '{cluster:grant}', '{cluster}', '{custom.viewer}')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		SELECT 't1', 'cluster', 'c' || i, 'user', 'u', 'custom.lister' FROM generate_series(1, 20) i`); err != nil {
+		t.Fatal(err)
+	}
+	tenant := rbac.TenantRoot("t1")
+	h.seed(t, grant(tenant, "tenant.roles", rbac.User, "admin"), grant(tenant, "cluster.admin", rbac.User, "admin"))
+	admin := h.as(t, "admin")
+	h.hold(t, "admin", "level:high", "comp:alpha", "comp:bravo", "rel:usa", "rel:gbr", "rel:fra")
+	r := rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
+		t.Fatal(err)
+	}
+	if asked != 0 {
+		t.Errorf("widening a role by one cleared for every label asked Config.ResourceOf about %d clusters", asked)
+	}
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(tenant, "rel.fra", rbac.User, "admin")})
+	}
+	r.Permissions = []rbac.Permission{view, login, root}
+	if err := h.authz.SetRole(ctx, admin, "t1", r); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("widening a role once the actor lost a label value meanwhile: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("the label value should have been revoked meanwhile")
+	}
+	// Tried again, it asks the host about each scope, whose labels ask nothing of it.
+	if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil || asked != 20 {
+		t.Fatalf("widening it again asked about %d clusters: %v", asked, err)
+	}
+}
+
 func TestASuspendedMembersGroupsCountTowardTwoExclusiveValues(t *testing.T) {
 	h := labeled(t, banks)
 	ctx := t.Context()
@@ -3938,5 +4032,126 @@ func TestReadsStayBoundedOnceAConnectionsStatementsTurnGeneric(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// statementsKept is a transaction that keeps the statements Query and QueryRow run on it, with
+// their arguments.
+type statementsKept struct {
+	pgx.Tx
+	statements []statement
+}
+
+type statement struct {
+	sql  string
+	args []any
+}
+
+func (r *statementsKept) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	r.statements = append(r.statements, statement{sql, args})
+	return r.Tx.Query(ctx, sql, args...)
+}
+
+func (r *statementsKept) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	r.statements = append(r.statements, statement{sql, args})
+	return r.Tx.QueryRow(ctx, sql, args...)
+}
+
+// planRows is how many rows the plans of statements pass, with those their filters remove, each
+// run again under EXPLAIN ANALYZE on tx.
+func planRows(ctx context.Context, t *testing.T, tx pgx.Tx, statements []statement) float64 {
+	t.Helper()
+	type node struct {
+		Rows       float64 `json:"Actual Rows"`
+		Filtered   float64 `json:"Rows Removed by Filter"`
+		JoinFilter float64 `json:"Rows Removed by Join Filter"`
+		Loops      float64 `json:"Actual Loops"`
+		Plans      []node
+	}
+	var rows func(node) float64
+	rows = func(p node) float64 {
+		sum := (p.Rows + p.Filtered + p.JoinFilter) * p.Loops
+		for _, c := range p.Plans {
+			sum += rows(c)
+		}
+		return sum
+	}
+	var sum float64
+	for _, s := range statements {
+		var plan []struct{ Plan node }
+		if err := tx.QueryRow(ctx, `EXPLAIN (ANALYZE, FORMAT JSON) `+s.sql, s.args...).Scan(&plan); err != nil {
+			t.Fatalf("%v: %s", err, s.sql)
+		}
+		sum += rows(plan[0].Plan)
+	}
+	return sum
+}
+
+// Searches decide which custom roles granted to the public or the tenant's members give through
+// them without pairing each one's permissions and types with the catalog's in their statements, so
+// the rows those pass don't grow with the roles' permissions and types.
+func TestSearchesDecideCustomRolesGrantedToBroadPrincipalsWithoutPairingTheirPermissions(t *testing.T) {
+	rowsOf := func(t *testing.T, types, verbs int) float64 {
+		t.Helper()
+		var ts []string
+		var perms []rbac.Permission
+		for i := range types {
+			ty := fmt.Sprintf("t%02d", i)
+			ts = append(ts, ty)
+			for v := range verbs {
+				perms = append(perms, rbac.Permission(fmt.Sprintf("%s:v%02d", ty, v)))
+			}
+		}
+		viewer := rbac.RoleDefinition{ID: "viewer", Permissions: perms, ResourceTypes: ts}
+		admin := rbac.RoleDefinition{ID: "admin", Permissions: []rbac.Permission{rbac.GrantPermission(rbac.TenantScope)}, ResourceTypes: []string{rbac.TenantScope}}
+		h := setup(t, func(c *rbac.Config) {
+			c.Catalog = []rbac.RoleDefinition{viewer, admin}
+			c.ContainerTypes = []string{"org"}
+		})
+		ctx := t.Context()
+		ann := h.as(t, "ann")
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, public)
+			SELECT 't1', 'custom.r' || i, $1::text[], $2::text[], i = 1 FROM generate_series(1, 5) i`, perms, ts); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			VALUES ('t1', 'tenant', 't1', 'public', '', 'custom.r1'), ('t1', 'tenant', 't1', 'members', 't1', 'custom.r2')`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.pool.Exec(ctx, `CREATE TABLE things (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL);
+			INSERT INTO things SELECT 't1', 'x' || i, ARRAY['t00:x' || i, 'tenant:t1'] FROM generate_series(1, 10) i`); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		rec := &statementsKept{Tx: tx}
+		a := h.authz.WithTx(rec)
+		p, r := perms[0], rbac.Resource{Tenant: "t1", Type: "t00", ID: "x1"}
+		holders, err := a.Holders(ctx, p, r)
+		if err != nil || len(holders) != 2 {
+			t.Fatalf("Holders = %+v, %v", holders, err)
+		}
+		if reach, err := a.Reachable(ctx, ann, p, "t1", "t00"); err != nil || !reach.All {
+			t.Fatalf("Reachable = %+v, %v", reach, err)
+		}
+		pred, err := a.Filter(ctx, ann, p, "t1", "t00", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := rec.Query(ctx, `SELECT id FROM things WHERE `+pred.SQL, pred.Args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ids, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || len(ids) != 10 {
+			t.Fatalf("Filter kept %v: %v", ids, err)
+		}
+		return planRows(ctx, t, tx, rec.statements)
+	}
+	small, large := rowsOf(t, 1, 1), rowsOf(t, 20, 10)
+	if large > 2*small {
+		t.Errorf("searches passed %.0f rows with custom roles of one permission on one type, and %.0f with roles of 200 on 20", small, large)
 	}
 }

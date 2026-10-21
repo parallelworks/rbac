@@ -152,18 +152,6 @@ func (p Principal) carries(role RoleDefinition, perm Permission) bool {
 	return p.Kind != Public || role.Public
 }
 
-// privilegedRoles keeps the privileged built-in roles, which a grant to the tenant's members or the
-// public never gives.
-func (a *Authorizer) privilegedRoles(roles []string) []string {
-	var privileged []string
-	for _, id := range roles {
-		if a.roles[Role(id)].Privileged {
-			privileged = append(privileged, id)
-		}
-	}
-	return privileged
-}
-
 // publicRoles keeps the built-in roles marked Public, the only built-in ones a grant to the
 // public gives.
 func (a *Authorizer) publicRoles(roles []string) []string {
@@ -694,10 +682,14 @@ type Config struct {
 	// no Labels, and resource Attributes as none (an empty map, as nil lets conditions read any), and
 	// on a scope other than the tenant or a group, no ContainerTypes. For any other, that change is
 	// refused. SetRole changing what a custom role's grants give, and DeleteRole, check the label of
-	// each scope the role is granted on as it returns it, so with Labels declared they need it too. A
-	// removal reads a scope it reports as ErrNotFound as unlabeled, and ChangeMembers and DeleteRole
-	// ask nothing of the scopes only a removal reaches where the actor's label values satisfy every
-	// label.
+	// each scope the role is granted on, and where a deny on a scope other than the tenant binds the
+	// actor, the denies on its path, and SetRole widening it the label of each scope a role listing it,
+	// or listing one that does, is granted on, and the denies on its path, as it returns it, so with
+	// Labels declared, or such a deny, they need it too. A removal reads a scope it reports as
+	// ErrNotFound as stored and unlabeled, and ChangeMembers and DeleteRole ask nothing of the scopes
+	// only a removal reaches where the actor's label values satisfy every label and, for DeleteRole,
+	// no such deny binds it, as SetRole asks nothing of the scopes roles listing the role are granted
+	// on then.
 	ResourceOf func(ctx context.Context, tenant string, s Scope) (Resource, error)
 	// Permissions are every permission the host checks, whether or not a role gives it, so that a
 	// catalog leaving one out, as one an operator configures may, refuses it like any permission
@@ -754,8 +746,10 @@ type Authorizer struct {
 	db  DB
 	cfg Config
 	// asOf is set on an Authorizer AsOf gave, which reads the past and changes nothing.
-	asOf       bool
-	roles      map[Role]RoleDefinition
+	asOf  bool
+	roles map[Role]RoleDefinition
+	// roleSets are the built-in roles' permissions and types as sets.
+	roleSets   map[Role]roleSet
 	containers map[string]bool
 	// containerTypes are the containers' types, sorted.
 	containerTypes []string
@@ -776,11 +770,7 @@ type Authorizer struct {
 	// permissions are for.
 	checked      map[Permission]bool
 	checkedTypes map[string]bool
-	// The same, sorted, as searches pass them to SQL. publicPairs are the unprivileged pairs, as
-	// `permission type`, of permissions that don't change access: all a public role gives as
-	// Authorizer.current reads it.
-	catalogPermissions, catalogTypes, publicPairs []string
-	conds                                         *conditions
+	conds        *conditions
 	// labels are the label dimensions (Config.Labels), by name.
 	labels map[string]labelDimension
 }
@@ -873,21 +863,11 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 			}
 		}
 	}
-	var permList []string
-	// Empty, not nil, which pgx sends as NULL: `<> ALL(NULL)` is never true, so without an
-	// unprivileged pair, searches would read no custom role as privileged.
-	pairs := []string{}
 	permissionTypes := map[string]bool{}
 	for p := range perms {
-		permList = append(permList, string(p))
 		t, _ := p.parts()
 		permissionTypes[t] = true
 	}
-	for k := range unprivileged {
-		pairs = append(pairs, string(k.p)+" "+k.t)
-	}
-	slices.Sort(permList)
-	slices.Sort(pairs)
 	checked, checkedTypes, err := vocabulary(cfg.Permissions, perms, resourceTypes)
 	if err != nil {
 		return nil, err
@@ -897,9 +877,8 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 		return nil, err
 	}
 	return &Authorizer{
-		db: db, cfg: cfg, roles: roles, containers: containers, containerTypes: slices.Sorted(maps.Keys(containers)),
+		db: db, cfg: cfg, roles: roles, roleSets: setsOf(roles), containers: containers, containerTypes: slices.Sorted(maps.Keys(containers)),
 		kinds: kinds, owned: owned, permissions: perms, types: resourceTypes, permissionTypes: permissionTypes, unprivileged: unprivileged,
-		catalogPermissions: permList, catalogTypes: slices.Sorted(maps.Keys(resourceTypes)), publicPairs: pairs,
 		checked: checked, checkedTypes: checkedTypes, conds: conds, labels: labels,
 	}, nil
 }

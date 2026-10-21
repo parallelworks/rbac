@@ -84,6 +84,15 @@ func SetCheckingRole(t *testing.T, f func()) {
 	t.Cleanup(func() { checkingRole = old })
 }
 
+// SetReadingEntries runs f each time a decision reads n entries of a role's permissions and types, or of
+// what the constraints answered, until t ends.
+func SetReadingEntries(t *testing.T, f func(n int)) {
+	t.Helper()
+	old := readingEntries
+	readingEntries = f
+	t.Cleanup(func() { readingEntries = old })
+}
+
 // SetCheckingCondition runs f each time a change begins checking a condition it hasn't, until t
 // ends.
 func SetCheckingCondition(t *testing.T, f func()) {

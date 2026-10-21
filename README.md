@@ -104,10 +104,14 @@ names the scopes conditional ones reach, to check one by one.
   `ValidateGrant` about each grant and eligibility it widens, as the role will be, and the host
   refusing one refuses the redefinition, as is one giving more label values where a condition of its
   grants on the tenant reading the action would then cost a check more than it may spend; an actor a
-  label of a scope its grants are on, as `Config.ResourceOf` gives it, refuses can neither redefine
-  nor delete it. `DeleteRole` removes one with its grants; `Roles` lists the built-in and custom
-  roles a scope type takes. Custom roles follow the catalog: one gives only what the catalog still
-  has, and is privileged when it gives what only privileged roles do, or changes access.
+  label of a scope its grants are on, as `Config.ResourceOf` gives it, refuses, or a deny on that
+  scope's path keeps from changing grants there, can neither redefine nor delete it, nor widen it
+  where a deny there, or where a role listing it, or listing one that does, is granted, removes a
+  permission it would give or the power to grant it, or the label of a scope such a role is granted
+  on refuses it.
+  `DeleteRole` removes one with its grants; `Roles` lists the built-in and custom roles a scope type
+  takes. Custom roles follow the catalog: one gives only what the catalog still has, and is
+  privileged when it gives what only privileged roles do, or changes access.
 - **Labels on data:** a mandatory layer above every grant. A host declares label dimensions
   (`Config.Labels`), each `Ordered` (a level), `AllOf` (compartments) or `AnyOf` (releasable to
   these partners), and a resource carries its label (`Resource.Labels`), stored with it as its path

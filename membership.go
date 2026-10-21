@@ -1961,7 +1961,7 @@ func (a *Authorizer) askMemberships(ctx context.Context, actor Subject, tenant s
 	var refused []error
 	for _, m := range gaining {
 		for _, v := range rc.heldBy(m.Group) {
-			roles := book{builtin: a.roles, custom: map[Role]RoleDefinition{v.role.ID: v.role}}
+			roles := a.bookOf([]RoleDefinition{v.role})
 			bad, err := a.allowed(ctx, roles, actor, ViaMembership, tenant, v.scope, v.as(m))
 			if err != nil {
 				return standing{}, err

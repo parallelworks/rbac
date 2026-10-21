@@ -4335,6 +4335,69 @@ func TestARefusedGrantProvesNothingForTheNext(t *testing.T) {
 	}
 }
 
+// Grantable and Apply read what the actor holds for each permission and type once, whatever the
+// number of roles they decide that give it, and a role it holds giving many permissions once too,
+// rather than for each role, permission and type.
+func TestDecidingManyLargeRolesReadsWhatTheActorHoldsOnce(t *testing.T) {
+	const types, verbs, roles = 10, 10, 30
+	var ts []string
+	var perms []rbac.Permission
+	for i := range types {
+		ty := fmt.Sprintf("t%02d", i)
+		ts = append(ts, ty)
+		for v := range verbs {
+			perms = append(perms, rbac.Permission(fmt.Sprintf("%s:v%02d", ty, v)))
+		}
+	}
+	all := append([]rbac.Permission{rbac.GrantPermission(rbac.TenantScope)}, perms...)
+	for _, ty := range ts {
+		all = append(all, rbac.GrantPermission(ty))
+	}
+	everything := rbac.RoleDefinition{ID: "everything", Permissions: all, ResourceTypes: append(slices.Clone(ts), rbac.TenantScope), Privileged: true}
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = []rbac.RoleDefinition{everything}
+		c.ContainerTypes = []string{"org"}
+		c.Constraints = []rbac.Constraint{{Name: "none", Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) { return false, nil }}}
+	})
+	ctx := t.Context()
+	tenant := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}
+	h.seed(t, grant(tenant.Scope(), everything.ID, rbac.User, "boss"))
+	boss := h.as(t, "boss")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+		SELECT 't1', 'custom.r' || i, $1::text[], $2::text[] FROM generate_series(1, $3) i`, perms, ts, roles); err != nil {
+		t.Fatal(err)
+	}
+	read := 0
+	rbac.SetReadingEntries(t, func(n int) { read += n })
+	offered, err := h.authz.Grantable(ctx, boss, tenant)
+	if err != nil || len(offered) != roles+1 {
+		t.Fatalf("Grantable offered %d roles: %v", len(offered), err)
+	}
+	// Each permission for each list of types its roles are for: what the actor's grants give, and
+	// what the constraints answered; and the held role's entries once.
+	once := len(perms)*types + len(all)*(types+1)
+	if read > 3*once {
+		t.Errorf("Grantable read %d entries deciding %d roles of %d permissions for %d types", read, roles+1, len(perms), types)
+	}
+	var c rbac.Change
+	for _, r := range offered[1:] {
+		c.Grant = append(c.Grant, rbac.Binding{Role: r.ID, Principal: identity("target")})
+	}
+	h.as(t, "target")
+	read = 0
+	if err := h.authz.Apply(ctx, boss, tenant, c); err != nil {
+		t.Fatal(err)
+	}
+	// Its roles' permissions and types again in its transaction, but what the constraints answered,
+	// and each role as it is then with the role as it was.
+	if read > 3*once+4*roles*(len(perms)+types) {
+		t.Errorf("Apply read %d entries granting %d roles of %d permissions for %d types", read, roles, len(perms), types)
+	}
+	if !allowed(t, h, h.as(t, "target"), perms[len(perms)-1], rbac.Resource{Tenant: "t1", Type: ts[types-1], ID: "x"}) {
+		t.Error("the roles granted give nothing")
+	}
+}
+
 func TestManyGrantsOfARoleAreDecidedOnce(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -4799,6 +4862,48 @@ func TestPublicCustomRoles(t *testing.T) {
 	listingsAgree(t, h, resources, anonymous, view)
 	if holders, err := h.authz.Holders(ctx, view, cluster); err != nil || slices.Contains(holderPrincipals(holders), rbac.Principal{Kind: rbac.Public}) {
 		t.Fatalf("Holders = %v, %v", holders, err)
+	}
+}
+
+// Filter reads which custom roles give through a grant to the public when it is called, and its
+// condition keeps of them those still public when the host's query runs, so one no longer public
+// by then gives nothing, as it gives Authorize nothing.
+func TestAFilterConditionKeepsNothingThroughACustomRoleNoLongerPublic(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	hostTable(t, h)
+	admin := roleAdmin(t, h)
+	viewer := rbac.RoleDefinition{ID: "custom.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
+	if err := h.authz.SetRole(ctx, admin, "t1", viewer); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(rbac.TenantRoot("t1"), viewer.ID, rbac.Public, ""))
+	anonymous := rbac.Subject{}
+	pred, err := h.authz.Filter(ctx, anonymous, view, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept := func() []string {
+		t.Helper()
+		rows, err := h.pool.Query(ctx, `SELECT id FROM clusters WHERE `+pred.SQL+` ORDER BY 1`, pred.Args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ids
+	}
+	if ids := kept(); len(ids) == 0 {
+		t.Fatal("a public custom role granted to the public should reach anonymous subjects")
+	}
+	viewer.Public = false
+	if err := h.authz.SetRole(ctx, admin, "t1", viewer); err != nil {
+		t.Fatal(err)
+	}
+	if ids := kept(); len(ids) > 0 || allowed(t, h, anonymous, view, cluster) {
+		t.Errorf("a condition built while its custom role was public kept %v once it wasn't", ids)
 	}
 }
 
@@ -6761,14 +6866,14 @@ func TestAConditionIsTextPostgreSQLStores(t *testing.T) {
 	}
 }
 
-// guarded sets up a guardian who may set denies anywhere in the tenant.
-func guarded(t *testing.T) (*harness, rbac.Subject) {
+// guarded sets up a guardian who may set denies anywhere in the tenant, configured as mutate says.
+func guarded(t *testing.T, mutate ...func(*rbac.Config)) (*harness, rbac.Subject) {
 	t.Helper()
 	guard := rbac.RoleDefinition{
 		ID: "guard", Permissions: []rbac.Permission{rbac.DenyPermission("tenant"), rbac.DenyPermission("workspace"), rbac.DenyPermission("cluster")},
 		ResourceTypes: []string{"tenant", "workspace", "cluster"},
 	}
-	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), guard) })
+	h := setup(t, append([]func(*rbac.Config){func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), guard) }}, mutate...)...)
 	h.seed(t, grant(rbac.TenantRoot("t1"), "guard", rbac.User, "guardian"))
 	return h, h.as(t, "guardian")
 }
@@ -7126,6 +7231,339 @@ func TestADenyOnChangingGrantsStopsRedefiningRoles(t *testing.T) {
 	other := rbac.RoleDefinition{ID: "custom.other", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
 	if err := h.authz.SetRole(ctx, h.as(t, "x"), "t1", other); err != nil {
 		t.Fatalf("defining a role no grant has yet: %v", err)
+	}
+}
+
+// definer is x, who may define roles and holds sudo and admin on every cluster, for good, and a
+// custom role giving view on clusters it defined.
+func definer(t *testing.T, h *harness) (rbac.Subject, rbac.RoleDefinition) {
+	t.Helper()
+	tenant := rbac.TenantRoot("t1")
+	h.seed(t, grant(tenant, "tenant.roles", rbac.User, "x"), grant(tenant, "cluster.sudo", rbac.User, "x"), grant(tenant, "cluster.admin", rbac.User, "x"))
+	x := h.as(t, "x")
+	r := rbac.RoleDefinition{ID: "custom.view", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(t.Context(), x, "t1", r); err != nil {
+		t.Fatal(err)
+	}
+	return x, r
+}
+
+// A deny on a workspace keeps x from handing on root under it, as granting there; redefining a role
+// granted there to give root would hand it on just the same.
+func TestADenyBelowTheTenantStopsARedefinitionHandingOnWhatItRemoves(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	x, r := definer(t, h)
+	y := h.as(t, "y")
+	if err := h.authz.SetDeny(ctx, guardian, workspace, rbac.Deny{ID: "no-root", Permissions: []rbac.Permission{root}, Principals: []rbac.Principal{x.Principal}}); err != nil {
+		t.Fatal(err)
+	}
+	elsewhere := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c2"}
+	other := rbac.RoleDefinition{ID: "custom.other", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(ctx, x, "t1", other); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), r.ID, rbac.User, "y"), grant(elsewhere.Scope(), other.ID, rbac.User, "y"))
+	if err := h.authz.Apply(ctx, x, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: y.Principal}}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("granting root under the deny: %v", err)
+	}
+	wider := r
+	wider.Permissions = []rbac.Permission{view, root}
+	if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.Is(err, rbac.ErrDenied) || allowed(t, h, y, root, cluster) {
+		t.Fatalf("redefining a role granted under the deny to give root: %v", err)
+	}
+	// Granted where no deny removes root, it gives root.
+	other.Permissions = []rbac.Permission{view, root}
+	if err := h.authz.SetRole(ctx, x, "t1", other); err != nil || !allowed(t, h, y, root, elsewhere) {
+		t.Fatalf("redefining a role granted outside the deny to give root: %v", err)
+	}
+	// Widened by what the deny doesn't remove, it gives that.
+	wider.Permissions = []rbac.Permission{view, login}
+	if err := h.authz.SetRole(ctx, x, "t1", wider); err != nil || !allowed(t, h, y, login, cluster) {
+		t.Fatalf("redefining a role granted under the deny to give login: %v", err)
+	}
+}
+
+// A deny on a container, or on the resource itself, that removes x's power to change grants there
+// stops x changing what a role granted there gives, or revoking it by deleting the role, as it
+// stops Apply there.
+func TestADenyBelowTheTenantOnChangingGrantsStopsRedefiningAndDeletingARoleGrantedThere(t *testing.T) {
+	for _, on := range []rbac.Resource{workspace, cluster} {
+		t.Run(on.Type, func(t *testing.T) {
+			h, guardian := guarded(t)
+			ctx := t.Context()
+			x, r := definer(t, h)
+			y := h.as(t, "y")
+			h.seed(t, grant(cluster.Scope(), r.ID, rbac.User, "y"))
+			if err := h.authz.SetDeny(ctx, guardian, on, rbac.Deny{ID: "freeze", Permissions: []rbac.Permission{grantC}, Principals: []rbac.Principal{x.Principal}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.authz.Apply(ctx, x, cluster, rbac.Change{Revoke: []rbac.Binding{{Role: r.ID, Principal: y.Principal}}}); !errors.Is(err, rbac.ErrDenied) {
+				t.Fatalf("revoking under the freeze: %v", err)
+			}
+			wider := r
+			wider.Permissions = []rbac.Permission{view, root}
+			if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.Is(err, rbac.ErrDenied) || allowed(t, h, y, root, cluster) {
+				t.Fatalf("widening a role granted under the freeze: %v", err)
+			}
+			narrower := r
+			narrower.Permissions = []rbac.Permission{login}
+			if err := h.authz.SetRole(ctx, x, "t1", narrower); !errors.Is(err, rbac.ErrDenied) || !allowed(t, h, y, view, cluster) {
+				t.Fatalf("narrowing a role granted under the freeze: %v", err)
+			}
+			if err := h.authz.DeleteRole(ctx, x, "t1", r.ID); !errors.Is(err, rbac.ErrDenied) || !allowed(t, h, y, view, cluster) {
+				t.Fatalf("deleting a role granted under the freeze: %v", err)
+			}
+		})
+	}
+}
+
+// A deny whose condition reads the resource removes root under a workspace from x on one cluster
+// only: a role granted on that cluster and on another under the same workspace can't be widened to
+// give it, as x can't grant root on that one.
+func TestADenyOnOneResourceStopsARedefinitionGrantedOnItAndOnOthers(t *testing.T) {
+	c2 := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c2", Ancestors: cluster.Ancestors}
+	h, guardian := guarded(t, func(c *rbac.Config) {
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s == c2.Scope() {
+				return c2, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	x, r := definer(t, h)
+	y := h.as(t, "y")
+	h.seed(t, grant(cluster.Scope(), r.ID, rbac.User, "y"), grant(c2.Scope(), r.ID, rbac.User, "y"))
+	d := rbac.Deny{ID: "no-root-on-c2", Permissions: []rbac.Permission{root}, Principals: []rbac.Principal{x.Principal}, Condition: rbac.Condition{Expression: `resource.id == "c2"`}}
+	if err := h.authz.SetDeny(ctx, guardian, workspace, d); err != nil {
+		t.Fatal(err)
+	}
+	sudo := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: y.Principal}}}
+	if err := h.authz.Apply(ctx, x, c2, sudo); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("granting root on c2: %v", err)
+	}
+	wider := r
+	wider.Permissions = []rbac.Permission{view, root}
+	var denied *rbac.DeniedError
+	if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.As(err, &denied) || denied.Scope != c2.Scope() || allowed(t, h, y, root, c2) {
+		t.Fatalf("widening a role granted on c1 and c2 to give root: %v", err)
+	}
+}
+
+// What SetRole and DeleteRole checked of the scopes a role is granted on before their transactions
+// they check again under the tenant's lock, so a deny below the tenant set meanwhile stops them.
+func TestADenySetWhileARedefinitionWaitsStopsIt(t *testing.T) {
+	var meanwhile func(context.Context) error
+	h, guardian := guarded(t, func(c *rbac.Config) {
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			if do := meanwhile; do != nil && in.Via == rbac.ViaRedefinition {
+				meanwhile = nil
+				if err := do(ctx); err != nil {
+					return err
+				}
+			}
+			return validate(ctx, q, in)
+		}
+	})
+	ctx := t.Context()
+	x, r := definer(t, h)
+	y := h.as(t, "y")
+	h.seed(t, grant(cluster.Scope(), r.ID, rbac.User, "y"))
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.SetDeny(ctx, guardian, workspace, rbac.Deny{ID: "no-root", Permissions: []rbac.Permission{root}, Principals: []rbac.Principal{x.Principal}})
+	}
+	wider := r
+	wider.Permissions = []rbac.Permission{view, root}
+	if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.Is(err, rbac.ErrConflict) || allowed(t, h, y, root, cluster) {
+		t.Fatalf("widening a role while a deny below the tenant is set: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("the deny should have been set meanwhile")
+	}
+	if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("tried again: %v", err)
+	}
+}
+
+func TestADenySetWhileADeletionWaitsStopsIt(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	x, r := definer(t, h)
+	y := h.as(t, "y")
+	h.seed(t, grant(cluster.Scope(), r.ID, rbac.User, "y"))
+	// The deny is set in a transaction that holds the tenant until it commits.
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := h.authz.WithTx(tx).SetDeny(ctx, guardian, workspace, rbac.Deny{ID: "freeze", Permissions: []rbac.Permission{grantC}, Principals: []rbac.Principal{x.Principal}}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- h.authz.DeleteRole(ctx, x, "t1", r.ID) }()
+	for waiting := false; !waiting; {
+		select {
+		case err := <-done:
+			done <- err
+			waiting = true
+		default:
+			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+				WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE '%/rbac/%')`).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, rbac.ErrConflict) || !allowed(t, h, y, view, cluster) {
+		t.Fatalf("deleting a role while a deny below the tenant is set: %v", err)
+	}
+	if err := h.authz.DeleteRole(ctx, x, "t1", r.ID); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("tried again: %v", err)
+	}
+}
+
+// listing is a custom role x defines whose holders may grant r on clusters without holding it.
+func listing(t *testing.T, h *harness, x rbac.Subject, r rbac.RoleDefinition) rbac.RoleDefinition {
+	t.Helper()
+	l := rbac.RoleDefinition{ID: "custom.lister", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{r.ID}}
+	if err := h.authz.SetRole(t.Context(), x, "t1", l); err != nil {
+		t.Fatal(err)
+	}
+	return l
+}
+
+// A role granted under a workspace that lists r lets its holders grant r there without holding it,
+// so widening r hands on there what r will give, as granting r there would: a deny on the
+// workspace that removes it from x, or x's power to change grants there, stops it.
+func TestADenyBelowTheTenantStopsARedefinitionHandedOnByARoleListingIt(t *testing.T) {
+	for name, removed := range map[string]rbac.Permission{"root": root, "the power to change grants": grantC} {
+		t.Run(name, func(t *testing.T) {
+			h, guardian := guarded(t)
+			ctx := t.Context()
+			x, r := definer(t, h)
+			l := listing(t, h, x, r)
+			y, z := h.as(t, "y"), h.as(t, "z")
+			h.seed(t, grant(workspace.Scope(), l.ID, rbac.User, "y"))
+			if err := h.authz.SetDeny(ctx, guardian, workspace, rbac.Deny{ID: "d", Permissions: []rbac.Permission{removed}, Principals: []rbac.Principal{x.Principal}}); err != nil {
+				t.Fatal(err)
+			}
+			wider := r
+			wider.Permissions = []rbac.Permission{view, root}
+			err := h.authz.SetRole(ctx, x, "t1", wider)
+			if applied := h.authz.Apply(ctx, y, cluster, rbac.Change{Grant: []rbac.Binding{{Role: r.ID, Principal: z.Principal}}}); applied != nil {
+				t.Fatal(applied)
+			}
+			if !errors.Is(err, rbac.ErrDenied) || allowed(t, h, z, root, cluster) {
+				t.Fatalf("widening a role that one granted under the deny lists: %v", err)
+			}
+		})
+	}
+	// Listed by a role granted where no deny binds x, it is widened.
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	x, r := definer(t, h)
+	l := listing(t, h, x, r)
+	h.seed(t, grant(rbac.Scope{Type: "cluster", ID: "c2"}, l.ID, rbac.User, "y"))
+	if err := h.authz.SetDeny(ctx, guardian, workspace, rbac.Deny{ID: "d", Permissions: []rbac.Permission{root}, Principals: []rbac.Principal{x.Principal}}); err != nil {
+		t.Fatal(err)
+	}
+	r.Permissions = []rbac.Permission{view, root}
+	if err := h.authz.SetRole(ctx, x, "t1", r); err != nil {
+		t.Fatalf("widening a role listed only outside the deny: %v", err)
+	}
+}
+
+// What SetRole checked of the scopes a role listing the one it redefines is granted on it checks
+// again under the tenant's lock, so a deny set there meanwhile stops it.
+func TestADenySetWhileARedefinitionHandedOnByARoleListingItWaitsStopsIt(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	x, r := definer(t, h)
+	l := listing(t, h, x, r)
+	h.seed(t, grant(workspace.Scope(), l.ID, rbac.User, "y"))
+	// The deny is set in a transaction that holds the tenant until it commits.
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := h.authz.WithTx(tx).SetDeny(ctx, guardian, workspace, rbac.Deny{ID: "no-root", Permissions: []rbac.Permission{root}, Principals: []rbac.Principal{x.Principal}}); err != nil {
+		t.Fatal(err)
+	}
+	wider := r
+	wider.Permissions = []rbac.Permission{view, root}
+	done := make(chan error, 1)
+	go func() { done <- h.authz.SetRole(ctx, x, "t1", wider) }()
+	for waiting := false; !waiting; {
+		select {
+		case err := <-done:
+			done <- err
+			waiting = true
+		default:
+			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+				WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE '%/rbac/%')`).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("widening a role that one granted under the workspace lists while a deny is set there: %v", err)
+	}
+	if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("tried again: %v", err)
+	}
+}
+
+// A role listing one that lists r lets its holders grant that one, whose holders may then grant r,
+// so widening r hands on through it too, wherever it is granted: a deny there that removes from x
+// what r will give stops it.
+func TestADenyBelowTheTenantStopsARedefinitionHandedOnThroughARoleListingOneListingIt(t *testing.T) {
+	for _, on := range []rbac.Scope{workspace.Scope(), {Type: "cluster", ID: "c2"}} {
+		t.Run(on.Key(), func(t *testing.T) {
+			h, guardian := guarded(t)
+			ctx := t.Context()
+			x, r := definer(t, h)
+			l := listing(t, h, x, r)
+			outer := rbac.RoleDefinition{ID: "custom.outer", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{l.ID}}
+			if err := h.authz.SetRole(ctx, x, "t1", outer); err != nil {
+				t.Fatal(err)
+			}
+			y, z, w := h.as(t, "y"), h.as(t, "z"), h.as(t, "w")
+			h.seed(t, grant(on, outer.ID, rbac.User, "y"))
+			if err := h.authz.SetDeny(ctx, guardian, workspace, rbac.Deny{ID: "no-root", Permissions: []rbac.Permission{root}, Principals: []rbac.Principal{x.Principal}}); err != nil {
+				t.Fatal(err)
+			}
+			wider := r
+			wider.Permissions = []rbac.Permission{view, root}
+			err := h.authz.SetRole(ctx, x, "t1", wider)
+			if on != workspace.Scope() {
+				if err != nil {
+					t.Fatalf("widening a role listed through one granted only outside the deny: %v", err)
+				}
+				return
+			}
+			for _, c := range []struct {
+				by   rbac.Subject
+				role rbac.Role
+				to   rbac.Principal
+			}{{y, l.ID, z.Principal}, {z, r.ID, w.Principal}} {
+				if applied := h.authz.Apply(ctx, c.by, cluster, rbac.Change{Grant: []rbac.Binding{{Role: c.role, Principal: c.to}}}); applied != nil {
+					t.Fatal(applied)
+				}
+			}
+			if !errors.Is(err, rbac.ErrDenied) || allowed(t, h, w, root, cluster) {
+				t.Fatalf("widening a role listed by one that a role granted under the deny lists: %v", err)
+			}
+		})
 	}
 }
 
