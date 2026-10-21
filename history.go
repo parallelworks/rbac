@@ -155,10 +155,16 @@ var maxPrune = MaxPrune
 // prunedWindow runs at the end of each of PruneHistory's transactions, on it, which a test sets.
 var prunedWindow = func(pgx.Tx) {}
 
+// inUTC puts a timestamptz in UTC by an offset, whatever the session's TimeZone: from PostgreSQL 18
+// a zone's name is first read as one of the TimeZone's own abbreviations, so under UTC+5, AT TIME
+// ZONE 'UTC' puts it five hours west.
+const inUTC = `AT TIME ZONE pg_catalog.interval '00:00'`
+
 // pruneKey and pruneThrough are a prune's time, $1, and cursor, $2 and $3, as its record holds
-// them, by which a prune of the same finds where the last stopped.
+// them, by which a prune of the same finds where the last stopped, and AsOf the latest prune: in
+// UTC, as text that sorts as its time, as every prune's key has been.
 const (
-	pruneKey     = `to_char($1::pg_catalog.timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`
+	pruneKey     = `to_char($1::pg_catalog.timestamptz ` + inUTC + `, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`
 	pruneThrough = `jsonb_build_object('txid', $2::pg_catalog.xid8::pg_catalog.text, 'id', $3::bigint)`
 )
 
@@ -428,11 +434,13 @@ var maxUnsized = 100
 // rows' JSON and their text past MaxHistoryBytes, unless it is the first: a read of fewer than limit
 // records doesn't mean history holds no more, so read until one reads none. It orders records by
 // the transaction that wrote them and reads only those of transactions older than any still
-// running, so a transaction that commits after a later one is read after it, never skipped. Transaction ids are the database cluster's, so a
-// transaction running anywhere in it, in any database, holds the read back until it ends: a long
-// one, or a prepared transaction left open, delays the export. A record can be read twice, as when
-// a host retries a read whose result it lost: dedupe on ID and RecordedAt, since a restore can
-// give another record the ID of one it lost.
+// running, so a transaction that commits after a later one is read after it, never skipped.
+// Transaction ids are the database cluster's, so a transaction running anywhere in it, in any
+// database, holds the read back until it ends: a long one, or a prepared transaction left open,
+// delays the export. A session may turn off the timeouts that would end one it leaves open, so
+// watch pg_stat_activity for one held too long and end it, as the README says. A record can be
+// read twice, as when a host retries a read whose result it lost: dedupe on ID and RecordedAt,
+// since a restore can give another record the ID of one it lost.
 //
 // It reads the primary, and fails on a replica, which can't tell which timeline it follows until
 // long after a failover. A failover or a recovery to a point in time starts a new generation, and

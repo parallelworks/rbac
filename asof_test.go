@@ -911,7 +911,8 @@ func TestMigratingCountsHistoryByTenantAndEntity(t *testing.T) {
 
 // History's index of the keys denies name reads each deny record's principals, which a record
 // written as history's owner can hold as any JSON: one that isn't an array is indexed as naming
-// none, an array's other values as their text, and history takes each, as it takes any record.
+// none, an array's arrays as their values and its other values as their text, and history takes
+// each, as it takes any record.
 func TestHistoryTakesADenyRecordWhosePrincipalsArentStrings(t *testing.T) {
 	h := setup(t)
 	for _, principals := range []string{`"user:u"`, `1`, `null`, `{"user": "u"}`, `[1, null, {"a": "b"}, ["user:u"]]`} {
@@ -1128,6 +1129,145 @@ func TestAsOfListsFindTheDeniesNamingTheirSubjectByItsKeys(t *testing.T) {
 	for what, many := range read(dbNow(t, h)) {
 		if many > few[what]*3/2+deeper {
 			t.Errorf("as of a time, %s read %d pages of history beside 500 denies naming others, and %d beside 5000", what, few[what], many)
+		}
+	}
+}
+
+// Before 0016 the tables took a list in more than one dimension, as a write around the package with
+// the application's rights could store, and every check and list took its elements in order: a
+// deny naming '{{user:u}}' bound u. As of a time, history's reads took the inner array as one key,
+// its JSON, so the deny bound no one. Migrating writes its row in one dimension, and as of a time
+// before, every check and list reads the deny as they did then, as they read it now: by history's
+// index of the keys denies name too, past enough denies naming others that lists find theirs by it.
+func TestAsOfReadsAListOfMoreDimensionsAsChecksDid(t *testing.T) {
+	pool := pgtest.Open(t, "")
+	ctx := t.Context()
+	migrateFiles(t, pool, "", "0016")
+	h := migrated(t, pool)
+	hostTable(t, h)
+	u := h.as(t, "u")
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "u"))
+	for _, sql := range []string{
+		`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+		 VALUES ('t1', 'workspace', 'w1', 'd', '{{user:u}}', '{{user:x}}', '{{cluster:login}}')`,
+		`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+		 SELECT 't1', 'cluster', 'other' || i, 'd', ARRAY['user:other' || i], '{cluster:login}' FROM generate_series(1, 2000) i`,
+		`ANALYZE rbac_history`,
+	} {
+		if _, err := pool.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := dbNow(t, h)
+	migrateFiles(t, pool, "0016", "")
+	answers := func(a *rbac.Authorizer, q pgx.Tx) []string {
+		t.Helper()
+		err := a.Authorize(ctx, u, login, cluster)
+		out := []string{fmt.Sprintf("Authorize: %v", err)}
+		reach, err := a.Reachable(ctx, u, login, "t1", "cluster")
+		out = append(out, fmt.Sprintf("Reachable: all %t except %v, %v", reach.All, reach.Except, err))
+		pred, err := a.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+		var kept []string
+		if err == nil {
+			var rows pgx.Rows
+			if rows, err = q.Query(ctx, `SELECT id FROM clusters WHERE `+pred.SQL+` ORDER BY id`, pred.Args...); err == nil {
+				kept, err = pgx.CollectRows(rows, pgx.RowTo[string])
+			}
+		}
+		out = append(out, fmt.Sprintf("Filter: %v, %v", kept, err))
+		holders, err := a.Holders(ctx, login, cluster)
+		var who []string
+		for _, x := range holders {
+			who = append(who, x.Principal.ID)
+		}
+		out = append(out, fmt.Sprintf("Holders: %v, %v", who, err))
+		denies, err := a.Denies(ctx, "t1", []rbac.Scope{{Type: "workspace", ID: "w1"}})
+		for _, d := range denies {
+			out = append(out, fmt.Sprintf("Denies: %+v %+v %v", d.Principals, d.Exempt, d.Permissions))
+		}
+		return append(out, fmt.Sprintf("Denies: %v", err))
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	now := answers(h.authz.WithTx(tx), tx)
+	want := []string{
+		"Authorize: rbac: cluster:login denied",
+		"Reachable: all true except [{workspace w1}], <nil>",
+		"Filter: [c1 c2 c3], <nil>",
+		"Holders: [], <nil>",
+		"Denies: [{Kind:user ID:u}] [{Kind:user ID:x}] [cluster:login]",
+		"Denies: <nil>",
+	}
+	if !slices.Equal(now, want) {
+		t.Fatalf("now:\n%s", strings.Join(now, "\n"))
+	}
+	var then []string
+	if err := h.authz.WithTx(tx).AsOf(ctx, "t1", before, func(a *rbac.Authorizer) error {
+		then = answers(a, tx)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(then, now) {
+		t.Errorf("as of a time before migrating:\n%s\nnow:\n%s", strings.Join(then, "\n"), strings.Join(now, "\n"))
+	}
+}
+
+// AsOf reads history as of its time to the microsecond, whatever the session's DateStyle and
+// TimeZone and whatever its read sets them to: a time's text in a DateStyle but ISO names its
+// zone by an abbreviation, which another TimeZone reads as its own zone's, and one of another
+// field order reads its month as its day. From PostgreSQL 18 a TimeZone's own abbreviations name
+// zones too, as UTC+5's UTC, five hours west, does in AT TIME ZONE 'UTC', and in a time's text
+// as Z or AD would.
+func TestAsOfReadsItsTimeWhateverTheSessionsDateStyle(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	u := h.as(t, "u")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	var granted time.Time
+	if err := h.pool.QueryRow(ctx, `SELECT effective_at FROM rbac_history WHERE entity = 'grant' AND principal = 'user:u'`).Scan(&granted); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ dateStyle, timeZone, inRead string }{
+		{"ISO, MDY", "UTC", ""},
+		{"Postgres, DMY", "America/Los_Angeles", ""},
+		{"SQL, MDY", "Europe/Dublin", ""},
+		{"German", "Asia/Kolkata", ""},
+		{"Postgres, YMD", "Pacific/Chatham", ""},
+		{"Postgres, MDY", "XYZ-3", `SET LOCAL TimeZone = 'XYZ+5'`},
+		{"SQL, MDY", "Australia/Lord_Howe", `SET LOCAL DateStyle = 'SQL, DMY'`},
+		{"ISO, MDY", "UTC+5", ""},
+		{"ISO, MDY", "UTC", `SET LOCAL TimeZone = '<Z>+5'`},
+		{"SQL, DMY", "<AD>-2", ""},
+	} {
+		for _, at := range []time.Time{granted, granted.Add(-time.Microsecond), time.Date(-100, time.March, 15, 12, 0, 0, 0, time.UTC)} {
+			func() {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				if _, err := tx.Exec(ctx, `SELECT set_config('DateStyle', $1, true), set_config('TimeZone', $2, true)`, c.dateStyle, c.timeZone); err != nil {
+					t.Fatal(err)
+				}
+				var held error
+				if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+					if c.inRead != "" {
+						if _, err := tx.Exec(ctx, c.inRead); err != nil {
+							return err
+						}
+					}
+					held = a.Authorize(ctx, u, login, cluster)
+					return nil
+				}); err != nil {
+					t.Errorf("%s, %s, %s: as of %v: %v", c.dateStyle, c.timeZone, c.inRead, at, err)
+				} else if (held == nil) != at.Equal(granted) {
+					t.Errorf("%s, %s, %s: as of %v, granted at %v: %v", c.dateStyle, c.timeZone, c.inRead, at, granted, held)
+				}
+			}()
 		}
 	}
 }

@@ -18,6 +18,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/rbac"
@@ -549,9 +550,10 @@ func longestKeys(kind string, n int) []string {
 
 // The tables refuse what the package never writes, as a role that may write them can try: an id of
 // more than MaxID bytes, an actor's key that is no key, a role that is no role's id, and a list past
-// its bound or holding what is no element of it. Unbounded, one row a hundred megabytes long, built
-// on the server, was recorded as JSON no read of history could return, and every export stopped
-// there.
+// its bound, holding what is no element of it, or in another shape than one dimension from 1, which
+// history gives back. Unbounded, one row a hundred megabytes long, built on the server, was recorded
+// as JSON no read of history could return, and every export stopped there; and as of a time, a deny
+// naming its keys in two dimensions named none.
 func TestTheTablesRefuseWhatThePackageNeverWrites(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -668,7 +670,32 @@ func TestTheTablesRefuseWhatThePackageNeverWrites(t *testing.T) {
 		bound{"rbac_denies", "principals", keys, notKeys(rbac.MaxDenyEntries)},
 		bound{"rbac_denies", "exempt", append([]any{[]string{}}, keys...), notKeys(rbac.MaxDenyEntries)},
 		bound{"rbac_eligibilities", "approvers", []any{[]string{}, longestKeys("group", rbac.MaxApprovers)}, notKeys(rbac.MaxApprovers)},
+		bound{"rbac_denies", "permissions", []any{[]string{"cluster:login", "cluster:*"}}, []any{[]string{"cluster:deny"}, []string{"cluster:login,cluster:view"}}},
 	)
+	// A list the package can write, in more dimensions than one or from another subscript than 1,
+	// which history, holding it as JSON, gives back in one from 1: every list the tables hold.
+	shaped := map[string]bool{}
+	for i, b := range bounds {
+		if v, ok := b.ok[len(b.ok)-1].([]string); ok && len(v) > 0 {
+			bounds[i].bad = append(bounds[i].bad, [][]string{v}, [][]string{v[:1], v[len(v)-1:]},
+				pgtype.Array[string]{Elements: v, Dims: []pgtype.ArrayDimension{{Length: int32(len(v)), LowerBound: 0}}, Valid: true})
+			shaped[b.table+"."+b.column] = true
+		}
+	}
+	lists, err := h.pool.Query(ctx, `SELECT c.relname || '.' || a.attname FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+		WHERE c.relnamespace = current_schema()::regnamespace AND c.relkind = 'r' AND a.atttypid = 'text[]'::regtype AND NOT a.attisdropped`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	columns, err := pgx.CollectRows(lists, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range columns {
+		if !shaped[c] {
+			t.Errorf("list %s is shaped by no bound here", c)
+		}
+	}
 	for _, b := range bounds {
 		for i, v := range b.ok {
 			if err := insert(b.table, b.column, v); err != nil {
@@ -719,6 +746,59 @@ func TestMigratingNamesARowTheTablesRefuse(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT convalidated FROM pg_constraint WHERE conrelid = 'rbac_grants'::regclass
 		AND conname = 'rbac_grants_host_check'`).Scan(&checked); err != nil || checked {
 		t.Fatalf("a check left unchecked: checked %t, %v", checked, err)
+	}
+}
+
+// Migrating rewrites each list a row holds in more dimensions than one, or from another subscript
+// than 1, as before 0016 the tables took, in one dimension from 1, its elements in the order every
+// read took them, and history records it as Migrate's change; a row whose lists are so already is
+// left as it is.
+func TestMigratingWritesEveryListInOneDimension(t *testing.T) {
+	pool := pgtest.Open(t, "")
+	ctx := t.Context()
+	migrateFiles(t, pool, "", "0016")
+	for _, sql := range []string{
+		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles)
+		 VALUES ('t1', 'custom.r', '{{cluster:view,cluster:login},{cluster:root,cluster:grant}}', '[0:0]={cluster}', '{{cluster.login},{cluster.sudo}}'),
+		   ('t1', 'custom.flat', '{cluster:view}', '{cluster}', '{}')`,
+		`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+		 VALUES ('t1', 'cluster', 'c1', 'd', '[0:1]={user:a,user:b}', '{{user:c}}', '{{cluster:login},{cluster:view}}'),
+		   ('t1', 'cluster', 'c1', 'flat', '{user:a}', '{}', '{cluster:login}')`,
+		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+		 VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'cluster.sudo', 60, '{{user:a,group:g}}'),
+		   ('t1', 'cluster', 'c1', 'user', 'flat', 'cluster.sudo', 60, '{user:a}')`,
+	} {
+		if _, err := pool.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	migrateFiles(t, pool, "0016", "")
+	rows, err := pool.Query(ctx, `
+		SELECT id || ' ' || permissions::text || ' ' || resource_types::text || ' ' || grantable_roles::text FROM rbac_roles
+		UNION ALL SELECT id || ' ' || principals::text || ' ' || exempt::text || ' ' || permissions::text FROM rbac_denies
+		UNION ALL SELECT principal_id || ' ' || approvers::text FROM rbac_eligibilities
+		ORDER BY 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"custom.flat {cluster:view} {cluster} {}",
+		"custom.r {cluster:view,cluster:login,cluster:root,cluster:grant} {cluster} {cluster.login,cluster.sudo}",
+		"d {user:a,user:b} {user:c} {cluster:login,cluster:view}",
+		"flat {user:a}",
+		"flat {user:a} {} {cluster:login}",
+		"u {user:a,group:g}",
+	}
+	if got, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || !slices.Equal(got, want) {
+		t.Fatalf("lists once migrated: %q, %v", got, err)
+	}
+	recorded, err := pool.Query(ctx, `SELECT entity || ' ' || key FROM rbac_history WHERE op = 'update' AND how = 'Migrate' ORDER BY 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := pgx.CollectRows(recorded, pgx.RowTo[string]); err != nil ||
+		len(got) != 3 || got[0] != "deny cluster:c1 d" || !strings.HasPrefix(got[1], "eligibility ") || got[2] != "role custom.r" {
+		t.Fatalf("changes migrating recorded: %q, %v", got, err)
 	}
 }
 
@@ -3224,6 +3304,55 @@ func TestPruningALongHistoryReadsAsMuchInEachTransaction(t *testing.T) {
 	}
 	if few, many := most(t, 1000), most(t, 4000); many > few*11/10 {
 		t.Fatalf("a prune's transactions read up to %d pages of history behind 1000 grants, and %d behind 4000", few, many)
+	}
+}
+
+// AsOf finds the latest prune by its record's key, its time in UTC, whatever the TimeZone of the
+// session that pruned: from PostgreSQL 18 one of UTC+5 makes AT TIME ZONE 'UTC' five hours west, so
+// a later prune made there was keyed before an earlier one, and AsOf read a time it had pruned. The
+// key is as one written before in UTC, which a prune of the same time goes on from.
+func TestAsOfRefusesATimeAPruneInAnotherTimeZonePruned(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'a', 'cluster.login')`)
+	exec(`UPDATE rbac_grants SET note = 'first' WHERE principal = 'user:a'`)
+	first := dbNow(t, h)
+	exec(`UPDATE rbac_grants SET note = 'second' WHERE principal = 'user:a'`)
+	second := dbNow(t, h)
+	exec(`UPDATE rbac_grants SET note = 'third' WHERE principal = 'user:a'`)
+	through := exported(t, h)
+	if n, err := rbac.PruneHistory(ctx, h.pool, first, through); err != nil || n == 0 {
+		t.Fatalf("PruneHistory as of first = %d, %v", n, err)
+	}
+	conn, err := h.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `SET TimeZone = 'UTC+5'`); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = conn.Exec(context.WithoutCancel(ctx), `RESET TimeZone`) }()
+	if n, err := rbac.PruneHistory(ctx, conn.Conn(), second, through); err != nil || n == 0 {
+		t.Fatalf("PruneHistory as of second under UTC+5 = %d, %v", n, err)
+	}
+	if got, err := notesAt(t, h, first); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("as of first, which the prune as of second pruned: %v, %v", got, err)
+	}
+	if got, err := notesAt(t, h, second); err != nil || got["a"] != "second" {
+		t.Errorf("as of second: %v, %v", got, err)
+	}
+	var keyed bool
+	if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM rbac_history WHERE entity = 'history' AND op = 'prune'
+		AND key = to_char($1::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'))`, second).Scan(&keyed); err != nil || !keyed {
+		t.Errorf("the prune as of second is keyed as a UTC session keyed one before: %t, %v", keyed, err)
 	}
 }
 

@@ -323,12 +323,19 @@ records, and past the first, at most `rbac.MaxHistoryBytes` of their rows' JSON 
 read of fewer than its limit doesn't mean history holds no more: read until one returns none.
 History written before `0013_bounded_rows` counted no bytes, so a read measures each such record by
 writing out its rows, and reads at most 100 of them. Any transaction still running in the database
-cluster, in any of its databases, holds `History` back until it ends, so bound how long one runs
-where a role can leave one open, as with `idle_in_transaction_session_timeout`, or from PostgreSQL
-17 on with `transaction_timeout`. A prepared transaction outlives its session, and neither
-timeout ends it: it holds `History`, and `Export` with it, back until it is committed or rolled
-back, so keep `max_prepared_transactions` at 0, the default, or watch `pg_prepared_xacts` and
-resolve any left there. A time a record holds as PostgreSQL's infinity, which the tables
+cluster, in any of its databases, that has written or otherwise taken a transaction id holds
+`History`, and `Export` with it, back until it ends. `idle_in_transaction_session_timeout`, and
+from PostgreSQL 17 on `transaction_timeout`, end one a session leaves open by mistake, but every
+session may set both for itself, whatever the role's or the server's defaults, so they bound only
+an accident: a session of a role that may be hostile, as the application's, turns them off and
+holds every export back for as long as it stays open. Watch for one: `pg_stat_activity`, read as a
+role with `pg_read_all_stats`, as `pg_monitor`'s members have it, lists every session's
+`backend_xid`, whose `age()` grows while it holds `History` back, and `xact_start`; end one held
+too long with `pg_terminate_backend(pid)` as a role with `pg_signal_backend`, which can end any
+session but a superuser's, and find out why it was held. A prepared transaction outlives its
+session, and no timeout or termination ends it: it holds `History` back until it is committed or
+rolled back, so keep `max_prepared_transactions` at 0, the default, or watch `pg_prepared_xacts`
+and resolve any left there. A time a record holds as PostgreSQL's infinity, which the tables
 refuse but an older record can hold, reads as an instant just past either end of PostgreSQL's range,
 as `Record` says, so `History` reads on past it. `History` reads the primary, and fails on a
 replica. A generation (`Cursor.Generation`) names the cluster, and the database and schema history
@@ -458,7 +465,18 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   commits. Building one calls `rbac_tenant_keys` and `rbac_text_array` as history's role, as
   recording each deny does from then on, so it grants that role `EXECUTE` on both where it lacks
   it. Where new functions give PUBLIC no `EXECUTE`, grant it on `rbac_text_array` to the
-  application's role too, as `AsOf` calls it.
+  application's role too, as `AsOf` calls it. `0016_flat_lists` rewrites a list a role, deny or
+  eligibility holds in more than one dimension, or from a subscript other than 1, as a write
+  around the package could store, in one dimension from 1, keeping its elements in order, which
+  history records as `Migrate`'s change, and then refuses another shape. It locks those three
+  tables until it commits, so checks, lists and changes wait for it, reads each twice, and keeps
+  changes to every table waiting, as each writes history. It reads every deny record in history
+  while it holds them, though reads of history go on; but where one holds its keys in more
+  dimensions, it rebuilds history's index of them, which reads all of history, and as a read of a
+  table locks each of its indexes, the rebuild waits for the reads of history running, as an
+  export, and every read of history then waits until migrating commits. A transaction that read
+  history and then reads one of those tables deadlocks with the rebuild, and PostgreSQL ends one
+  of the two: migrate again.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
   between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows

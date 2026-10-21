@@ -1185,7 +1185,9 @@ type Columns struct {
 	Tenant string
 	// Path is a text[] holding the resource's Authorizer.Path, with a GIN index. Its keys are
 	// compared byte for byte, whatever its collation, which the index serves in. Its first element,
-	// at whatever subscript the array starts from, is the resource's own key.
+	// at whatever subscript the array starts from, is the resource's own key. It is one-dimensional,
+	// as Path gives it: an array of more has no element at one subscript, so Filter can leave out a
+	// row of one that Authorize allows, but keeps none it refuses.
 	Path string
 	// Labels is a text[] holding the resource's label as `dimension:value` values, never NULL: '{}'
 	// for none. The label's test, which keeps only the rows the subject's holding satisfies,
