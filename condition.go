@@ -436,8 +436,19 @@ type costs struct{ patterns map[string]uint64 }
 func (c costs) CallCost(function, _ string, args []ref.Val, _ ref.Val) *uint64 {
 	n := uint64(1)
 	switch function {
-	case looping:
-		n = 0
+	case looping, operators.NotStrictlyFalse:
+		if function == looping {
+			n = 0
+		}
+		// A loop's first step finds the loop's range where each after finds the step before
+		// (stepping). CEL copies a map's keys before a loop over it takes a step, however few it
+		// takes, so a loop over a map the host passes, inside another, would otherwise take time
+		// growing with the map's size and the outer loop's steps, charged only for the steps.
+		if len(args) > 0 {
+			if m, ok := args[0].(traits.Mapper); ok && m.Type().HasTrait(traits.IterableType) {
+				n += count(m)
+			}
+		}
 	case overloads.Matches:
 		if len(args) != 2 {
 			return nil
@@ -900,7 +911,8 @@ const looping = "@looping"
 // the square of its length, past what it is charged, and one whose steps fail, charged little, the
 // most. Each step evaluates its condition first, so a loop's condition is planned instead as a call
 // whose first argument is the loop's range: charging it drops what the steps before kept, and
-// costs what charging the condition did. It counts the steps too, which limit bounds (counting).
+// costs what charging the condition did, and at a loop's first step 1 more for each key of a map
+// it ranges over (costs). It counts the steps too, which limit bounds (counting).
 type stepping struct {
 	// ranges are the ids of the ranges of checked's loops, by those of their conditions, and
 	// stepped those of the conditions planned as steps.

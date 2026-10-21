@@ -830,6 +830,35 @@ func TestALoopsStepsCostAtLeastOneEach(t *testing.T) {
 	}
 }
 
+// CEL copies a map's keys before a loop over it takes its first step, however few it takes, so a
+// loop over a map the host passes, inside another loop, took time growing with the map's size and
+// the outer loop's steps, charged only for the steps. Such a loop costs 1 for each key, and one
+// over a literal map no more than its bound.
+func TestALoopOverAMapCostsEachOfItsKeys(t *testing.T) {
+	m := map[string]any{}
+	for i := range 3000 {
+		m[fmt.Sprint(i)] = i
+	}
+	for expr, least := range map[string]uint64{
+		`request.attributes.m.exists(k, true)`:                   3000,
+		`!request.attributes.m.all(k, false)`:                    3000,
+		`[1, 2, 3].all(i, request.attributes.m.exists(k, true))`: 9000,
+	} {
+		if _, cost := rbac.ConditionCost(t, expr, map[string]any{"m": m}); cost < least {
+			t.Errorf("%s over %d keys cost %d", expr, len(m), cost)
+		}
+	}
+	literal := `{"a": 1, "b": 2, "c": 3}`
+	for _, expr := range []string{
+		literal + `.exists(k, true)`, literal + `.exists_one(k, false) || true`, literal + `.map(k, k).size() == 3`,
+		`[1, 2].all(i, ` + literal + `.all(k, true))`,
+	} {
+		if limit, cost := rbac.ConditionCost(t, expr, nil); cost > limit {
+			t.Errorf("%s cost %d, past its bound, %d", expr, cost, limit)
+		}
+	}
+}
+
 // A loop taking more steps than its condition may cost fails, however little CEL charges them: a
 // grant's condition gives nothing, and a deny's applies.
 func TestALoopOfMoreStepsThanItsConditionMayCostFails(t *testing.T) {
