@@ -1134,7 +1134,8 @@ func TestRewritingAGrantOrAnEligibilityIsNotCheckedForExclusiveValues(t *testing
 // Renaming a custom role, or narrowing it off a permission that is no exclusive value, gives no
 // one a value, as rewriting a grant's note doesn't: in a tenant where a catalog change left a
 // holder of the role able to hold two of bank's values, each is made, while redefining it to give
-// a value it didn't, or to be public, which its grants to the public then give, is refused.
+// a value it didn't, to be public, which its grants to the public then give, or for the tenant,
+// which its grants there then give, is refused.
 func TestRenamingOrNarrowingARoleIsNotRefusedForAConflictItFound(t *testing.T) {
 	h := labeled(t, func(c *rbac.Config) {
 		banks(c)
@@ -1174,4 +1175,15 @@ func TestRenamingOrNarrowingARoleIsNotRefusedForAConflictItFound(t *testing.T) {
 	h.hold(t, "definer", "bank:c")
 	r.Permissions = []rbac.Permission{"bank:c"}
 	excluded(t, authz.SetRole(ctx, h.as(t, "definer"), "t1", r))
+	// Stored for a cluster, as before bank was a dimension, giving ann nothing through its grant on
+	// the tenant.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.legacy', '{bank:a}', '{cluster}')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'tenant', 't1', 'user', 'ann', 'custom.legacy')`); err != nil {
+		t.Fatal(err)
+	}
+	legacy := rbac.RoleDefinition{ID: "custom.legacy", Permissions: []rbac.Permission{"bank:a"}, ResourceTypes: []string{rbac.TenantScope}}
+	excluded(t, authz.SetRole(ctx, admin, "t1", legacy))
 }
