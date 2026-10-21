@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io/fs"
 	"maps"
-	"os"
 	"reflect"
 	"slices"
 	"strings"
@@ -293,10 +292,7 @@ type readmeRoles struct {
 func newReadmeRoles(t *testing.T) *readmeRoles {
 	t.Helper()
 	ctx := t.Context()
-	base := os.Getenv(pgtest.URLEnv)
-	if base == "" {
-		t.Skip(pgtest.URLEnv + " not set")
-	}
+	base := pgtest.URL(t)
 	suffix := strings.ToLower(rand.Text())
 	r := &readmeRoles{admin: "rbac_admin_" + suffix, history: "rbac_history_" + suffix, app: "rbac_app_" + suffix, schema: "rbac_" + suffix}
 	super, err := pgx.Connect(ctx, base)
@@ -354,23 +350,27 @@ func newReadmeRoles(t *testing.T) *readmeRoles {
 }
 
 // harden gives history to history's role, and the application's role its privileges, exactly as
-// the README's steps 2 and 3 say. Every role may execute the package's functions unless it is
-// revoked, and the application's makes no schema and creates in none, as step 4 says, unless the
-// database's owner or a grant lets it.
+// the README's steps 2 and 3 say, with no role executing a function of the package's that they
+// don't list, as every role may unless it is revoked. The application's makes no schema and
+// creates in none, as step 4 says, unless the database's owner or a grant lets it.
 func (r *readmeRoles) harden(t *testing.T) {
 	t.Helper()
 	s := r.schema
 	for _, sql := range []string{
+		`REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA ` + s + ` FROM PUBLIC`,
 		// 2. History's role owns history and rbac_record, given them by a superuser, and needs
-		// USAGE on the schema.
+		// USAGE on the schema and EXECUTE on rbac_tenant_keys and rbac_text_array.
 		`ALTER TABLE ` + s + `.rbac_history OWNER TO ` + r.history,
 		`ALTER FUNCTION ` + s + `.rbac_record() OWNER TO ` + r.history,
 		`GRANT USAGE ON SCHEMA ` + s + ` TO ` + r.history,
+		`GRANT EXECUTE ON FUNCTION ` + s + `.rbac_tenant_keys, ` + s + `.rbac_text_array TO ` + r.history,
 		// 3. The application's role has USAGE on the schema, SELECT, INSERT, UPDATE and DELETE on
-		// its tables but rbac_history and rbac_migrations, and only SELECT on rbac_history.
+		// its tables but rbac_history and rbac_migrations, EXECUTE on rbac_group_members,
+		// rbac_tenant_keys and rbac_text_array, and only SELECT on rbac_history.
 		`GRANT USAGE ON SCHEMA ` + s + ` TO ` + r.app,
 		`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ` + s + ` TO ` + r.app,
 		`REVOKE ALL ON ` + s + `.rbac_migrations FROM ` + r.app,
+		`GRANT EXECUTE ON FUNCTION ` + s + `.rbac_group_members, ` + s + `.rbac_tenant_keys, ` + s + `.rbac_text_array TO ` + r.app,
 		`REVOKE INSERT, UPDATE, DELETE ON ` + s + `.rbac_history FROM ` + r.app,
 	} {
 		if _, err := r.super.Exec(t.Context(), sql); err != nil {
@@ -1575,11 +1575,7 @@ func TestMigratingOnAHostsTransactionRecordsWhatHasCommitted(t *testing.T) {
 				t.Fatal(err)
 			}
 			migrateFiles(t, pool, "0003", "0008")
-			// As Migrate records what it applied.
-			if _, err := pool.Exec(ctx, `CREATE TABLE rbac_migrations (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now());
-				INSERT INTO rbac_migrations (version) SELECT generate_series(1, 7)`); err != nil {
-				t.Fatal(err)
-			}
+			recordMigrations(t, pool, "0008")
 			host, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: iso})
 			if err != nil {
 				t.Fatal(err)
