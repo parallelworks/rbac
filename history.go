@@ -542,7 +542,7 @@ type Refusal struct {
 	Audit Audit
 	// Err is why: it matches ErrDenied or ErrInvalid.
 	Err error
-	// At is when, by Config.Now.
+	// At is when, by Config.Now: the time the call decided at.
 	At time.Time
 }
 

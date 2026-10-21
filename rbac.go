@@ -718,11 +718,13 @@ type Config struct {
 	// when what it holds satisfies the label. None, nothing is labeled. Checks, Permissions and
 	// Grantable read the subject's values in the statement that reads its grants, Explain and
 	// Reachable in the read's snapshot, and Holders every holder's at once, in its snapshot, so a
-	// label is decided by values of the moment the grants are. Filter fixes the holding when it is
-	// called. A deny of an Ordered value takes that value alone: to cap a level, deny it and every
-	// value above. Values are held on the tenant, so they are denied there: SetDeny refuses a deny
-	// of one on any other scope, which would bind no one. The conditions of a value's grants and
-	// denies read the tenant as their resource, never the labeled one.
+	// label is decided by values of the moment the grants are; but under WithTx at READ COMMITTED,
+	// where each statement reads a snapshot of its own, Explain, Reachable and Holders can mix two
+	// states, as WithTx says. Filter fixes the holding when it is called. A deny of an Ordered value
+	// takes that value alone: to cap a level, deny it and every value above. Values are held on the
+	// tenant, so they are denied there: SetDeny refuses a deny of one on any other scope, which would
+	// bind no one. The conditions of a value's grants and denies read the tenant as their resource,
+	// never the labeled one.
 	Labels []LabelDimension
 	// OnChange runs in the transaction of every change but DeleteExpired, whose grants already
 	// gave nothing, once the change is written; an error rolls the change back. History records
@@ -742,7 +744,9 @@ type Config struct {
 	// when nil. A call reads it once, where it first needs the time, so every statement it makes and
 	// every condition it evaluates are of one moment: read apart, a grant or a membership ending as
 	// the call runs could meet a deny, a condition or label values of a later moment. A change reads
-	// it once more in its transaction, under its locks, where it decides again.
+	// it once more in its transaction, under its locks, where it decides again, the ends of what it
+	// writes included. A call a hook makes, as a constraint's of GroupsOf, is a call of its own and
+	// reads it apart, so what the hook decides by is of its own moment, not the asking call's.
 	Now func() time.Time
 }
 
