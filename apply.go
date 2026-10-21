@@ -98,17 +98,17 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 			return &InvalidError{Binding: b, Reason: "only Activate grants from " + SourceActivation}
 		}
 	}
-	return a.change(ctx, actor, on, "Apply", ViaApply, grants, revokes, nil, nil, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.change(ctx, actor, on, "Apply", ViaApply, grants, revokes, nil, nil, func(tx pgx.Tx) (ChangeEvent, gains, error) {
 		// Read before the change's revokes too, so one moving a condition from a grant it revokes to
 		// one it grants adds none.
 		stored := scopeGrants(scope, grants)
 		before, err := a.conditionsBefore(ctx, tx, on.Tenant, stored)
 		if err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
 		revoked, err := a.revoke(ctx, tx, on.Tenant, scope, revokes, grants)
 		if err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
 		// A revoke by ID removes a grant from any source: refusing one from a source the host owns
 		// rolls the removal back.
@@ -119,10 +119,10 @@ func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Ch
 			}
 		}
 		if err := errors.Join(owned...); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
-		granted, err := a.upsert(ctx, tx, on.Tenant, actor.Principal, stored, before)
-		return ChangeEvent{Granted: granted, Revoked: revoked}, err
+		granted, rewrote, err := a.upsert(ctx, tx, on.Tenant, actor.Principal, stored, before)
+		return ChangeEvent{Granted: granted, Revoked: revoked}, gains{rewrote: rewrote}, err
 	})
 }
 
@@ -137,7 +137,7 @@ func ownedRevoke(b Binding) error {
 // bindings', such as an eligibility's approvers, and check is what else the change needs, run
 // once the actor may make it.
 func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, how string, via Via, grants, revokes []Binding,
-	named []Principal, check func() error, write func(pgx.Tx) (ChangeEvent, error),
+	named []Principal, check func() error, write func(pgx.Tx) (ChangeEvent, gains, error),
 ) error {
 	scope := on.Scope()
 	handed := grants
@@ -163,7 +163,7 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, how
 	if err := a.validate(ctx, au.roles, actor, via, on.Tenant, scope, grants, revokes); err != nil {
 		return err
 	}
-	return a.inTx(ctx, on.Tenant, actor.Principal, how, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTxGaining(ctx, on.Tenant, actor.Principal, how, func(tx pgx.Tx) (ChangeEvent, gains, error) {
 		// One change to a scope at a time, so two changes can't deadlock on its rows.
 		principals := map[string]bool{}
 		for _, b := range slices.Concat(grants, revokes) {
@@ -174,17 +174,17 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, how
 			principals[k] = true
 		}
 		if err := lockAll(ctx, tx, on.Tenant, []string{scope.Key()}, slices.Collect(maps.Keys(principals))); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
 		exist := groups
 		if len(grants) > 0 {
 			exist = slices.Concat(groups, groupScopes([]Scope{scope}))
 		}
 		if err := groupsExist(ctx, tx, on.Tenant, exist); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
 		if err := a.stillStanding(ctx, tx, on.Tenant, stand); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
 		// Decided again in the transaction, so the actor's access, its label values and the roles
 		// are read as the change is made: a custom role deleted or redefined since is granted only as
@@ -192,17 +192,17 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, how
 		cs.seal()
 		now, err := a.grantsAllowed(ctx, tx, actor, on, handed, revokes, cs, nil, nil)
 		if err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
 		var bad []error
 		for _, b := range grants {
 			bad = append(bad, a.checkBinding(now.roles, on.Tenant, scope, b, a.cfg.Now())...)
 		}
 		if err := errors.Join(bad...); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
 		if err := redefinedSince(au.roles, now.roles, roleIDs(grants)); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
 		return write(tx)
 	})
@@ -303,24 +303,26 @@ func (a *Authorizer) mayChangeGrants(ctx context.Context, actor Subject, on Reso
 // grantsAllowed is what a change to the grants on on checks, Apply's and one to members' alike:
 // before its transaction, the constraints on changing them, asked through cs, then on's label and
 // what the actor holds there, as mayChangeBy decides; and once cs is sealed, under its locks, what
-// it holds and the label again. The actor's label values are read through labels, or where nil, cs
-// on the tenant, and what it holds on q, or is au, where read already. It returns the authority it
-// decided by.
+// it holds and the label again. What it holds is read on q, or is au, where read already, and its
+// label values are decided by that read, asking the constraints through labels, or where nil, cs on
+// the tenant. It returns the authority it decided by.
 func (a *Authorizer) grantsAllowed(ctx context.Context, q DB, actor Subject, on Resource, grants, revokes []Binding, cs, labels *constrained,
 	au *authority,
 ) (authority, error) {
-	checkLabel := func() error { return a.labelAllows(ctx, q, on, cs, labels, GrantPermission(on.Type)) }
 	if !cs.sealed {
 		if err := a.changing(actor, on, cs); err != nil {
-			return authority{}, err
-		}
-		if err := checkLabel(); err != nil {
 			return authority{}, err
 		}
 	}
 	held, err := a.authorityOr(ctx, q, actor, on, roleIDs(grants), au)
 	if err != nil {
 		return authority{}, err
+	}
+	checkLabel := func() error { return a.labelAllows(ctx, q, on, cs, labels, GrantPermission(on.Type), held.values) }
+	if !cs.sealed {
+		if err := checkLabel(); err != nil {
+			return authority{}, err
+		}
 	}
 	held.constrained = cs
 	if err := a.mayChangeBy(held, on, grants, revokes); err != nil {
@@ -342,38 +344,26 @@ func (a *Authorizer) authorityOr(ctx context.Context, q DB, actor Subject, on Re
 	return a.authorityOn(ctx, q, actor, on, roles)
 }
 
-// labelAllows refuses, as a DeniedError of p, a change on a scope whose label the actor's holding,
-// read on q, doesn't satisfy, asking the constraints about its values through labels, or where nil,
-// through cs on the tenant: before the change's transaction, and again under its locks, which reads
-// their answers back.
-func (a *Authorizer) labelAllows(ctx context.Context, q DB, on Resource, cs, labels *constrained, p Permission) error {
+// labelAllows refuses, as a DeniedError of p, a change on a scope whose label the actor's holding
+// doesn't satisfy, decided by values, read with its authority there, or where nil read on q the
+// first time in each phase (constrained.holding), asking the constraints about its values through
+// labels, or where nil, through cs on the tenant: before the change's transaction, and again under
+// its locks, which reads their answers back.
+func (a *Authorizer) labelAllows(ctx context.Context, q DB, on Resource, cs, labels *constrained, p Permission, values *valuesRead) error {
 	if !on.Labels.asks() {
 		return nil
 	}
 	if labels == nil {
 		labels = cs.ofTenant()
 	}
-	return a.labelCheck(ctx, q, labels)(on, p)
-}
-
-// labelCheck returns a check refusing, as a DeniedError of p, a change on a resource whose label
-// the actor's holding doesn't satisfy, read on q through labels the first time a label asks for
-// values in each phase (constrained.holding), asking the constraints about them on the tenant:
-// before the change's transaction, and again under its locks, which reads their answers back.
-func (a *Authorizer) labelCheck(ctx context.Context, q DB, labels *constrained) func(on Resource, p Permission) error {
-	return func(on Resource, p Permission) error {
-		if !on.Labels.asks() {
-			return nil
-		}
-		held, err := labels.holding(ctx, q)
-		if err != nil {
-			return err
-		}
-		if dim := held.Unsatisfied(on.Labels); dim != "" {
-			return &DeniedError{Permission: p, Scope: on.Scope(), Reason: labelRefusal(dim)}
-		}
-		return nil
+	held, err := labels.holdingBy(ctx, q, values)
+	if err != nil {
+		return err
 	}
+	if dim := held.Unsatisfied(on.Labels); dim != "" {
+		return &DeniedError{Permission: p, Scope: on.Scope(), Reason: labelRefusal(dim)}
+	}
+	return nil
 }
 
 // changing refuses a change to grants on a scope of a type the host doesn't have, as a typo no
@@ -552,31 +542,31 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 		principals[g.Principal.key()] = true
 		on[i] = g.Scope
 	}
-	return a.inTx(ctx, tenant, actor, "Import", func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.inTxGaining(ctx, tenant, actor, "Import", func(tx pgx.Tx) (ChangeEvent, gains, error) {
 		if err := lockAll(ctx, tx, tenant, slices.Collect(maps.Keys(scopes)), slices.Collect(maps.Keys(principals))); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
 		if err := groupsExist(ctx, tx, tenant, slices.Concat(groupKeys(named), groupScopes(on))); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
 		if err := a.stillStanding(ctx, tx, tenant, stand); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
 		// Again under the locks, so a custom role deleted since isn't granted, nor one redefined
 		// since the host was asked about it.
 		now, err := check(a.tenantBook, tx)
 		if err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
 		if err := redefinedSince(roles, now, roleIDs(grants)); err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
 		before, err := a.conditionsBefore(ctx, tx, tenant, grants)
 		if err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
-		granted, err := a.upsert(ctx, tx, tenant, actor, grants, before)
-		return ChangeEvent{Granted: granted}, err
+		granted, rewrote, err := a.upsert(ctx, tx, tenant, actor, grants, before)
+		return ChangeEvent{Granted: granted}, gains{rewrote: rewrote}, err
 	})
 }
 
@@ -846,6 +836,9 @@ type authority struct {
 	// given is what heldFor found the actor's grants give, which doesn't turn on the role a check
 	// asks about, so a decision checking many roles that give the same reads its grants once.
 	given map[heldKey]int
+	// values is what the actor's label values are decided by, read with its grants, so a change
+	// checks a label by what it held as it held its power there.
+	values *valuesRead
 }
 
 // heldKey is what heldFor is asked: a permission for a list of types, under a condition until a
@@ -878,8 +871,9 @@ type constrained struct {
 	// holds them, for a change on a labeled scope.
 	tenant *constrained
 	// held is the actor's label values read through c, once before the transaction and once in it,
-	// for every label a change checks.
+	// for every label a change checks, and keys its keys in the tenant read with them.
 	held [2]*Holding
+	keys [2][]string
 }
 
 func (a *Authorizer) constrain(ctx context.Context, actor Subject, on Resource) *constrained {
@@ -892,18 +886,45 @@ func (a *Authorizer) constrain(ctx context.Context, actor Subject, on Resource) 
 // holding is the actor's label values, read on q through c, which is on the tenant, the first time
 // a change asks for them before its transaction, and again the first time in it.
 func (c *constrained) holding(ctx context.Context, q DB) (Holding, error) {
+	h, _, err := c.holdingAndKeys(ctx, q)
+	return h, err
+}
+
+// holdingAndKeys is holding, and the actor's keys in the tenant, read with its values, so whom it
+// is a member of, as an approver, is of the moment they are.
+func (c *constrained) holdingAndKeys(ctx context.Context, q DB) (Holding, []string, error) {
 	phase := 0
 	if c.sealed {
 		phase = 1
 	}
 	if c.held[phase] == nil {
-		h, _, err := c.a.holdingOn(ctx, q, c.actor, c)
+		h, _, keys, err := c.a.holdingRead(ctx, q, c.actor, c, true)
 		if err != nil {
-			return Holding{}, err
+			return Holding{}, nil, err
 		}
-		c.held[phase] = &h
+		c.held[phase], c.keys[phase] = &h, keys
 	}
-	return *c.held[phase], nil
+	return *c.held[phase], c.keys[phase], nil
+}
+
+// holdingBy is the actor's label values decided through c by v, read with its other grants, once
+// for each read; or where v is nil, read on q (holding).
+func (c *constrained) holdingBy(ctx context.Context, q DB, v *valuesRead) (Holding, error) {
+	if v == nil {
+		return c.holding(ctx, q)
+	}
+	if h, ok := v.decided[c]; ok {
+		return h, nil
+	}
+	h, _, err := c.a.holdingFrom(ctx, q, c.actor, c, v)
+	if err != nil {
+		return Holding{}, err
+	}
+	if v.decided == nil {
+		v.decided = map[*constrained]Holding{}
+	}
+	v.decided[c] = h
+	return h, nil
 }
 
 func (c *constrained) seal() {
@@ -1075,7 +1096,7 @@ func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []
 			keys[k] = true
 		}
 	}
-	held, ds, b, err := a.heldOrDenied(ctx, q, tenant, actor, all, slices.Sorted(maps.Keys(keys)), "", which, true)
+	held, ds, b, err := a.heldOrDenied(ctx, q, tenant, actor, all, slices.Sorted(maps.Keys(keys)), which, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1095,6 +1116,8 @@ func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []
 	// members of a group granted a role on each, walks the roles a role lists once.
 	proven := map[string]*checked{}
 	b = b.keepingSets()
+	// Every path holds the tenant's scope, so the read holds what the actor's values are decided by.
+	values := onTenant(tenant, held, ds, b)
 	aus := make([]authority, len(on))
 	for i, r := range on {
 		heldOn := make([]holding, len(heldAt[i]))
@@ -1102,6 +1125,7 @@ func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []
 			heldOn[j] = held[k]
 		}
 		aus[i] = a.authorityOf(ctx, actor, r, heldOn, deniedOn[i], b)
+		aus[i].values = values
 		if len(a.cfg.Constraints) > 0 || len(deniedOn[i]) > 0 {
 			continue
 		}
@@ -1148,7 +1172,18 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 	// out decides doesn't rest on ids.
 	held = slices.Clone(held)
 	cheapestFirst(held, holding.expression)
+	// A label value or a power to release on the tenant is decided on the bare tenant, as checks
+	// decide it (decidedOn), what the actor hands on too: it is held there alone, so a condition
+	// reading the resource reads that tenant, as it does for every check of it.
+	var valued map[string]any
+	if on.Type == TenantScope {
+		valued = maps.Clone(vars)
+		valued["resource"] = valueResource(on.Tenant)
+	}
 	with := func(vars map[string]any, action Permission) map[string]any {
+		if valued != nil && a.labelPermission(action) {
+			vars = valued
+		}
 		v := maps.Clone(vars)
 		v["action"] = string(action)
 		return v
@@ -1530,23 +1565,27 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 	if err := a.subject(s); err != nil {
 		return nil, err
 	}
-	if dim, err := a.unsatisfied(ctx, s, r); err != nil || dim != "" {
-		return nil, err
-	}
-	cs := a.constrain(ctx, s, r)
-	if cs.removes(GrantPermission(r.Type), r.Type) {
-		return nil, cs.failed()
-	}
 	// Every custom role, read once: the candidates, and those their GrantableRoles name. In the
 	// statement that reads the grants, as a check reads them: read apart, a grant revoked and its
-	// role widened meanwhile could offer what no moment would.
-	held, ds, b, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), "", tenantRoles, true)
+	// role widened meanwhile could offer what no moment would. Its label values too, which its
+	// grants on the tenant give.
+	held, ds, b, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), tenantRoles, true)
 	if err != nil || len(held) == 0 {
 		return nil, err
 	}
 	readingRoles()
 	if err := a.conditionsOf(ctx, a.db, r.Tenant, held); err != nil {
 		return nil, err
+	}
+	if r.Labels.asks() {
+		h, _, err := a.holdingOf(ctx, r.Tenant, s, onTenant(r.Tenant, held, ds, b))
+		if err != nil || h.Unsatisfied(r.Labels) != "" {
+			return nil, err
+		}
+	}
+	cs := a.constrain(ctx, s, r)
+	if cs.removes(GrantPermission(r.Type), r.Type) {
+		return nil, cs.failed()
 	}
 	au := a.authorityOf(ctx, s, r, held, ds, b)
 	custom := slices.SortedFunc(maps.Values(b.custom), func(x, y RoleDefinition) int { return strings.Compare(string(x.ID), string(y.ID)) })
@@ -1607,9 +1646,33 @@ func (a *Authorizer) inTx(ctx context.Context, tenant string, actor Principal, h
 
 // inTxReaching is inTx for a change to memberships or places in groups, whose exclusive values are
 // checked for the identities, by key, fn returns as those whose memberships or places it widened,
-// besides those its grants and eligibilities name: kept out of the event, so OnChange is handed
-// only what a host can build and compare.
+// besides those its grants and eligibilities name.
 func (a *Authorizer) inTxReaching(ctx context.Context, tenant string, actor Principal, how string, fn func(pgx.Tx) (ChangeEvent, []string, error)) error {
+	return a.inTxGaining(ctx, tenant, actor, how, func(tx pgx.Tx) (ChangeEvent, gains, error) {
+		e, reached, err := fn(tx)
+		return e, gains{widened: reached}, err
+	})
+}
+
+// gains is what a change's check of exclusive values reads beside its event (excludes), kept out
+// of it, so OnChange is handed only what a host can build and compare.
+type gains struct {
+	// widened are the identities, by key, whose memberships or places in groups it widened.
+	widened []string
+	// rewrote are the grants of the event, by id, and its eligibilities, by eligibilityKey, it only
+	// rewrote, gaining nothing: a grant granted again, which changes only its note and its
+	// condition's title and description, and an eligibility in force set again to end no later,
+	// which every value it gives counts by already, whatever it requires.
+	rewrote map[string]bool
+}
+
+// eligibilityKey is what makes an eligibility one: its scope, principal and role.
+func eligibilityKey(e Eligibility) string {
+	return e.Scope.Key() + "\x00" + e.Principal.key() + "\x00" + string(e.Role)
+}
+
+// inTxGaining is inTx for a change whose check of exclusive values reads g, which fn returns too.
+func (a *Authorizer) inTxGaining(ctx context.Context, tenant string, actor Principal, how string, fn func(pgx.Tx) (ChangeEvent, gains, error)) error {
 	return a.begin(ctx, func(tx pgx.Tx) error {
 		// Taken by every change, removals too, so changes in one host transaction take their locks in
 		// one order.
@@ -1623,12 +1686,12 @@ func (a *Authorizer) inTxReaching(ctx context.Context, tenant string, actor Prin
 		if err != nil {
 			return err
 		}
-		e, reached, err := fn(tx)
+		e, g, err := fn(tx)
 		if err != nil {
 			return err
 		}
 		if exclusive && !removals[how] {
-			if err := a.excludes(ctx, tx, tenant, e, reached); err != nil {
+			if err := a.excludes(ctx, tx, tenant, e, g); err != nil {
 				return err
 			}
 		}
@@ -1754,14 +1817,14 @@ func (a *Authorizer) report(ctx context.Context, tx pgx.Tx, e ChangeEvent) error
 }
 
 // upsert stores grants in one statement, sorted so concurrent changes lock rows in the same
-// order, and returns those it added or whose note it changed. Of grants that are one grant it
-// stores the last, since one statement can't change a row twice. before is conditionsBefore the
-// change.
+// order, and returns those it added or whose note it changed, and of them, by id, those stored
+// already, which it rewrote. Of grants that are one grant it stores the last, since one statement
+// can't change a row twice. before is conditionsBefore the change.
 func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, grants []Grant,
 	before map[conditionBucket]map[string]int,
-) ([]Grant, error) {
+) ([]Grant, map[string]bool, error) {
 	if len(grants) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	byKey := func(x, y Grant) int {
 		return cmp.Or(cmp.Compare(x.Principal.key(), y.Principal.key()), cmp.Compare(x.Scope.Key(), y.Scope.Key()),
@@ -1785,7 +1848,8 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 	}
 	// The same grant again changes only its note and its condition's title and description. The
 	// condition's length and hash pick it, and its text must match, so a hash shared by two
-	// conditions changes neither.
+	// conditions changes neither. The statement's snapshot holds a grant it rewrites as it was, and
+	// none it adds.
 	rows, err := tx.Query(ctx, `
 		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at,
 		  condition_title, condition_description, condition, note, created_by, updated_by)
@@ -1799,22 +1863,28 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 		WHERE rbac_grants.condition = EXCLUDED.condition
 		  AND (rbac_grants.condition_title, rbac_grants.condition_description, rbac_grants.note)
 		  IS DISTINCT FROM (EXCLUDED.condition_title, EXCLUDED.condition_description, EXCLUDED.note)
-		RETURNING `+grantColumns,
+		RETURNING `+grantColumns+`, EXISTS (SELECT FROM rbac_grants o WHERE o.id = rbac_grants.id)`,
 		tenant, scopeTypes, scopeIDs, kinds, ids, roles, sources, expires, actorKey(actor), titles, descriptions, conditions, notes)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	granted, err := collectGrants(rows)
+	rewrote := map[string]bool{}
+	granted, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Grant, error) {
+		var stored bool
+		g, err := scanGrantWith(row, &stored)
+		rewrote[g.ID] = stored
+		return g, err
+	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := a.bounded(ctx, tx, tenant, granted); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := a.conditionsBounded(ctx, tx, tenant, a.bucketsOf(grants), before); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return granted, nil
+	return granted, rewrote, nil
 }
 
 // conditionsBefore is conditionsIn the buckets of grants a change stores, read under its locks

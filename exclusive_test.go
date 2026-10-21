@@ -1014,3 +1014,47 @@ func TestASuspendedJoinReportsOnlyWhatChanged(t *testing.T) {
 		t.Fatalf("OnChange was handed %+v, not %+v", got, want)
 	}
 }
+
+// Granting a grant again with only a new note, or setting an eligibility in force again to end no
+// later, gains nothing, as setting a place in a group again with only a new note doesn't: in a
+// tenant where a catalog change left an identity able to hold two exclusive values, each is made,
+// while a grant or an eligibility that gains is refused.
+func TestRewritingAGrantOrAnEligibilityIsNotCheckedForExclusiveValues(t *testing.T) {
+	valuer := rbac.RoleDefinition{
+		ID: "valuer", Permissions: []rbac.Permission{rbac.GrantPermission(rbac.TenantScope)}, ResourceTypes: []string{rbac.TenantScope},
+		GrantableRoles: []rbac.Role{"bank.a", "bank.b", "bank.c"},
+	}
+	h := labeled(t, banks, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), valuer, groupMembers) })
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), valuer.ID, rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"))
+	admin := h.as(t, "admin")
+	x := h.as(t, "x", "g")
+	// As a catalog change leaves them: x holds bank:a itself and bank:b through g, and is eligible
+	// for bank:c.
+	ends := h.now.Add(48 * time.Hour)
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, note)
+		VALUES ('t1', 'tenant', 't1', 'user', 'x', 'bank.a', 'old'), ('t1', 'tenant', 't1', 'group', 'g', 'bank.b', '')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, expires_at)
+		VALUES ('t1', 'tenant', 't1', 'user', 'x', 'bank.c', 3600, $1)`, ends); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", []rbac.Member{{Group: "g", Principal: x.Principal, Note: "renamed"}}, nil); err != nil {
+		t.Fatalf("a place's note: %v", err)
+	}
+	if err := h.authz.Apply(ctx, admin, tenantT1, rbac.Change{Grant: []rbac.Binding{{Role: "bank.a", Principal: x.Principal, Note: "renamed"}}}); err != nil {
+		t.Errorf("a grant's note: %v", err)
+	}
+	eligibility := rbac.Eligibility{Role: "bank.c", Principal: x.Principal, MaxDuration: 2 * time.Hour, ExpiresAt: ends, Requires: `request.attributes.mfa == true`, Note: "renamed"}
+	if err := h.authz.SetEligibility(ctx, admin, tenantT1, eligibility); err != nil {
+		t.Errorf("an eligibility set again to end as it did: %v", err)
+	}
+	eligibility.ExpiresAt = ends.Add(-time.Hour)
+	if err := h.authz.SetEligibility(ctx, admin, tenantT1, eligibility); err != nil {
+		t.Errorf("an eligibility set again to end sooner: %v", err)
+	}
+	eligibility.ExpiresAt = ends
+	excluded(t, h.authz.SetEligibility(ctx, admin, tenantT1, eligibility))
+	excluded(t, h.authz.Apply(ctx, admin, tenantT1, rbac.Change{Grant: []rbac.Binding{{Role: "bank.a", Principal: x.Principal, ExpiresAt: ends}}}))
+}

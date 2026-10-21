@@ -116,13 +116,13 @@ func (a *Authorizer) SetEligibility(ctx context.Context, actor Subject, on Resou
 	e.Scope, e.ExpiresAt = on.Scope(), stored(e.ExpiresAt)
 	e.Approvers = canonicalPrincipals(e.Approvers)
 	check := func() error { return a.checkEligibility(e) }
-	return a.change(ctx, actor, on, "SetEligibility", ViaEligibility, []Binding{e.binding()}, nil, e.Approvers, check, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.change(ctx, actor, on, "SetEligibility", ViaEligibility, []Binding{e.binding()}, nil, e.Approvers, check, func(tx pgx.Tx) (ChangeEvent, gains, error) {
 		was, err := a.requirementOf(ctx, tx, on.Tenant, e)
 		if err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
 		// An expired eligibility that is still stored allowed nothing, so setting it again records
-		// the new actor and time.
+		// the new actor and time. The statement's snapshot holds the one it replaces as it was.
 		rows, err := tx.Query(ctx, `
 			INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds,
 			  expires_at, requires, approvers, note, created_by)
@@ -134,22 +134,30 @@ func (a *Authorizer) SetEligibility(ctx context.Context, actor Subject, on Resou
 			WHERE (rbac_eligibilities.max_seconds, rbac_eligibilities.expires_at, rbac_eligibilities.requires,
 			  rbac_eligibilities.approvers, rbac_eligibilities.note)
 			  IS DISTINCT FROM (EXCLUDED.max_seconds, EXCLUDED.expires_at, EXCLUDED.requires, EXCLUDED.approvers, EXCLUDED.note)
-			RETURNING `+eligibilityColumns,
+			RETURNING `+eligibilityColumns+`, EXISTS (SELECT FROM rbac_eligibilities o WHERE o.id = rbac_eligibilities.id
+			  AND (o.expires_at IS NULL OR o.expires_at > $13)
+			  AND coalesce(rbac_eligibilities.expires_at, 'infinity') <= coalesce(o.expires_at, 'infinity'))`,
 			on.Tenant, e.Scope.Type, e.Scope.ID, e.Principal.Kind, e.Principal.ID, e.Role, int64(e.MaxDuration/time.Second),
 			pgtype.Timestamptz{Time: e.ExpiresAt, Valid: !e.ExpiresAt.IsZero()}, e.Requires, keysOf(e.Approvers), e.Note,
 			actorKey(actor.Principal), a.cfg.Now())
 		if err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
-		set, err := collectEligibilities(rows)
+		rewrote := map[string]bool{}
+		set, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Eligibility, error) {
+			var kept bool
+			el, err := scanEligibilityWith(row, &kept)
+			rewrote[eligibilityKey(el)] = kept
+			return el, err
+		})
 		if err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
 		// Set again as it is, it adds nothing activating reads, as a grant granted again doesn't.
 		if len(set) == 0 {
-			return ChangeEvent{}, nil
+			return ChangeEvent{}, gains{}, nil
 		}
-		return ChangeEvent{Eligible: set}, a.requirementsBounded(ctx, tx, on.Tenant, e, was)
+		return ChangeEvent{Eligible: set}, gains{rewrote: rewrote}, a.requirementsBounded(ctx, tx, on.Tenant, e, was)
 	})
 }
 
@@ -200,14 +208,14 @@ func (a *Authorizer) DeleteEligibility(ctx context.Context, actor Subject, on Re
 		return err
 	}
 	scope := on.Scope()
-	return a.change(ctx, actor, on, "DeleteEligibility", ViaEligibility, nil, []Binding{{Role: role, Principal: p}}, nil, nil, func(tx pgx.Tx) (ChangeEvent, error) {
+	return a.change(ctx, actor, on, "DeleteEligibility", ViaEligibility, nil, []Binding{{Role: role, Principal: p}}, nil, nil, func(tx pgx.Tx) (ChangeEvent, gains, error) {
 		rows, err := tx.Query(ctx, `DELETE FROM rbac_eligibilities WHERE tenant = $1 AND scope = $2 AND principal = $3 AND role = $4
 			RETURNING `+eligibilityColumns, on.Tenant, scope.Key(), p.key(), role)
 		if err != nil {
-			return ChangeEvent{}, err
+			return ChangeEvent{}, gains{}, err
 		}
 		gone, err := collectEligibilities(rows)
-		return ChangeEvent{Ineligible: gone}, err
+		return ChangeEvent{Ineligible: gone}, gains{}, err
 	})
 }
 
@@ -639,7 +647,8 @@ type madeThrough struct {
 // eligible. It returns the eligibility that allows it and who approved: one of s's identity or of
 // one of its groups there, lasting act.Duration or longer and in force until then, whose
 // requirement holds in the request, failing closed, and whose approvers, if it names any, include
-// act.Approver, who isn't s, holding what on's label asks for, read through approving. Of those,
+// act.Approver, who isn't s, holding what on's label asks for, read through approving with the
+// groups it is in, so it is one of them as it holds the values. Of those,
 // the one whose path from s lasts longest, and of those lasting alike and needing approval alike
 // s's own, as the activation rests on it. approved is zero when the eligibility allowing it names
 // none. A privileged role's counts only through s's identity or its groups, as its grants do, never
@@ -652,6 +661,7 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 	if err != nil {
 		return madeThrough{}, Principal{}, err
 	}
+	readingKeys()
 	rows, err := q.Query(ctx, byKey("$4", "rbac_eligibilities", "principal", "id, principal, requires, approvers", `tenant = $1 AND scope = $2 AND role = $3
 		  AND max_seconds >= $5 AND (expires_at IS NULL OR expires_at > $6 AND expires_at >= $7)`),
 		on.Tenant, scope.Key(), act.Role, countedOf(slices.Sorted(maps.Keys(reached)), broad{}), seconds(act.Duration), a.cfg.Now(), until)
@@ -703,10 +713,15 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 		// approves first there, and its values must have been asked about before it.
 		if len(e.approvers) > 0 && on.Labels.asks() {
 			// Read the first time in each phase, with none of a request's attributes, as approving
-			// asks the constraints.
-			held, err := approving.holding(withoutRequest(ctx), q)
+			// asks the constraints; and its keys with them, so it approves as one of the approvers
+			// holding the values at one moment.
+			held, keys, err := approving.holdingAndKeys(withoutRequest(ctx), q)
 			if err != nil {
 				return madeThrough{}, Principal{}, err
+			}
+			if !approves(act.Approver, s, countedOf(keys, broad{}), e.approvers) {
+				reason = fmt.Sprintf("activating %s here needs one of its approvers to approve", act.Role)
+				continue
 			}
 			if dim := held.Unsatisfied(on.Labels); dim != "" {
 				reason = "the resource's label asks for values in " + dim + " its approver doesn't hold"
@@ -730,6 +745,10 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 	}
 	return chosen.madeThrough, Principal{}, nil
 }
+
+// readingKeys runs once an activation has read its approver's keys, apart from its label values, as
+// a test's change that commits there.
+var readingKeys = func() {}
 
 // approves reports whether approver, by one of its keys in the tenant, its identity or a group it
 // is in there, is among an eligibility's approvers, and isn't s, who can't approve its own
@@ -769,22 +788,27 @@ const eligibilityColumns = `scope_type, scope_id, principal_kind, principal_id, 
 	note, created_by, created_at`
 
 func collectEligibilities(rows pgx.Rows) ([]Eligibility, error) {
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Eligibility, error) {
-		var e Eligibility
-		var seconds int64
-		var expires *time.Time
-		var createdBy string
-		var approvers []string
-		err := row.Scan(&e.Scope.Type, &e.Scope.ID, &e.Principal.Kind, &e.Principal.ID, &e.Role, &seconds, &expires,
-			&e.Requires, &approvers, &e.Note, &createdBy, &e.CreatedAt)
-		for _, k := range approvers {
-			e.Approvers = append(e.Approvers, parsePrincipal(k))
-		}
-		e.MaxDuration = time.Duration(seconds) * time.Second
-		if expires != nil {
-			e.ExpiresAt = *expires
-		}
-		e.CreatedBy = parsePrincipal(createdBy)
-		return e, err
-	})
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Eligibility, error) { return scanEligibilityWith(row) })
+}
+
+// scanEligibilityWith scans a row of eligibilityColumns, and after them, more.
+func scanEligibilityWith(row pgx.CollectableRow, more ...any) (Eligibility, error) {
+	var e Eligibility
+	var seconds int64
+	var expires *time.Time
+	var createdBy string
+	var approvers []string
+	err := row.Scan(append([]any{
+		&e.Scope.Type, &e.Scope.ID, &e.Principal.Kind, &e.Principal.ID, &e.Role, &seconds, &expires,
+		&e.Requires, &approvers, &e.Note, &createdBy, &e.CreatedAt,
+	}, more...)...)
+	for _, k := range approvers {
+		e.Approvers = append(e.Approvers, parsePrincipal(k))
+	}
+	e.MaxDuration = time.Duration(seconds) * time.Second
+	if expires != nil {
+		e.ExpiresAt = *expires
+	}
+	e.CreatedBy = parsePrincipal(createdBy)
+	return e, err
 }

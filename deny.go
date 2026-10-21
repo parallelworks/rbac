@@ -356,22 +356,25 @@ func (a *Authorizer) mayDeny(ctx context.Context, actor Subject, on Resource) (*
 // denyAllowed is what setting or deleting a deny on on checks, and a change to members lifting one
 // there: before the change's transaction, the constraints on it, asked through cs, then on's label
 // and that the actor holds DenyPermission(on's type) there; and once cs is sealed, under its locks,
-// what it holds and the label again. The actor's label values are read through labels, or where
-// nil, cs on the tenant, and what it holds on q, or is au, where read already.
+// what it holds and the label again. What it holds is read on q, or is au, where read already, and
+// its label values are decided by that read, asking the constraints through labels, or where nil, cs
+// on the tenant.
 func (a *Authorizer) denyAllowed(ctx context.Context, q DB, actor Subject, on Resource, cs, labels *constrained, au *authority) error {
-	checkLabel := func() error { return a.labelAllows(ctx, q, on, cs, labels, DenyPermission(on.Type)) }
 	if !cs.sealed {
 		if err := a.denying(actor, on, cs); err != nil {
-			return err
-		}
-		// Who can't see a labeled scope sets no deny on it, nor lifts one, which would widen access.
-		if err := checkLabel(); err != nil {
 			return err
 		}
 	}
 	held, err := a.authorityOr(ctx, q, actor, on, nil, au)
 	if err != nil {
 		return err
+	}
+	checkLabel := func() error { return a.labelAllows(ctx, q, on, cs, labels, DenyPermission(on.Type), held.values) }
+	// Who can't see a labeled scope sets no deny on it, nor lifts one, which would widen access.
+	if !cs.sealed {
+		if err := checkLabel(); err != nil {
+			return err
+		}
 	}
 	if err := held.setsDenies(on); err != nil {
 		return err

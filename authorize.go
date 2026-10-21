@@ -48,22 +48,19 @@ func (a *Authorizer) Explain(ctx context.Context, s Subject, p Permission, r Res
 }
 
 // decide decides as Authorize does, and with explain, says why: the grants, and then the
-// resource's label, which allows nothing its holding doesn't satisfy.
+// resource's label, which allows nothing its holding doesn't satisfy, decided by the label values
+// read with the grants, so a check allows only what one moment did.
 func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Resource, explain bool) (Decision, error) {
-	d, err := a.decideGrants(ctx, s, p, r, explain)
-	if err != nil || !d.Allowed {
+	d, values, err := a.decideGrants(ctx, s, p, r, explain)
+	if err != nil || !d.Allowed || values == nil {
 		return d, err
 	}
 	r = a.decidedOn(p, r)
-	value, exclusive := a.exclusiveValue(p)
-	if !exclusive && !r.Labels.asks() {
-		return d, nil
-	}
-	h, _, err := a.holding(ctx, r.Tenant, s)
+	h, _, err := a.holdingOf(ctx, r.Tenant, s, values)
 	if err != nil {
 		return Decision{}, err
 	}
-	if h.excludes(p) {
+	if value, _ := a.exclusiveValue(p); h.excludes(p) {
 		return Decision{Label: value, Reason: exclusiveRefusal(value)}, nil
 	}
 	if dim := h.Unsatisfied(r.Labels); dim != "" {
@@ -72,39 +69,60 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 	return d, nil
 }
 
+// asksValues reports whether a check of p on r, as decidedOn gives it, reads the subject's label
+// values: r's label asks for some, or p is a value of an exclusive dimension.
+func (a *Authorizer) asksValues(p Permission, r Resource) bool {
+	_, exclusive := a.exclusiveValue(p)
+	return exclusive || r.Labels.asks()
+}
+
 // exclusiveRefusal is why a check refuses a value of dim, an exclusive dimension.
 func exclusiveRefusal(dim string) string {
 	return "its grants could give it two values of " + dim + ", whose values are exclusive, so it holds none"
 }
 
-func (a *Authorizer) decideGrants(ctx context.Context, s Subject, p Permission, r Resource, explain bool) (Decision, error) {
+// decideGrants is decide's decision by s's grants and denies, and where the check reads label
+// values (asksValues), what they are decided by, read with the grants.
+func (a *Authorizer) decideGrants(ctx context.Context, s Subject, p Permission, r Resource, explain bool) (Decision, *valuesRead, error) {
 	if err := a.check(r); err != nil {
-		return Decision{}, err
+		return Decision{}, nil, err
 	}
 	if err := a.askable(p, r.Type); err != nil {
-		return Decision{}, err
+		return Decision{}, nil, err
 	}
 	if err := a.subject(s); err != nil {
-		return Decision{}, err
+		return Decision{}, nil, err
 	}
 	// Checked as passed, and decided as a labeled check decides it.
 	r = a.decidedOn(p, r)
 	name, err := a.denied(ctx, ConstraintInput{Tenant: r.Tenant, ResourceType: r.Type, Permission: p, Subject: &s, Resource: &r})
 	if err != nil {
-		return Decision{}, err
+		return Decision{}, nil, err
 	}
 	if name != "" {
-		return Decision{DeniedBy: name, Reason: "removed by " + name}, nil
+		return Decision{DeniedBy: name, Reason: "removed by " + name}, nil, nil
 	}
 
-	counts := a.counting(p, r.Type)
+	counts, values := a.counting(p, r.Type), a.asksValues(p, r)
 	if !explain {
-		return a.decideHeld(ctx, s, p, r, counts)
+		return a.decideHeld(ctx, s, p, r, counts, values)
 	}
 
 	// Explain reads the subject's groups apart from its grants and denies, so in one snapshot, as
-	// Authorize reads them in one statement.
-	return snapshot(ctx, a, func(a *Authorizer) (Decision, error) { return a.explain(ctx, s, p, r, counts) })
+	// Authorize reads them in one statement; and its label values in it too.
+	type explained struct {
+		d      Decision
+		values *valuesRead
+	}
+	got, err := snapshot(ctx, a, func(a *Authorizer) (explained, error) {
+		d, err := a.explain(ctx, s, p, r, counts)
+		if err != nil || !d.Allowed || !values {
+			return explained{d: d}, err
+		}
+		v, err := a.valuesOn(ctx, a.db, r.Tenant, s)
+		return explained{d, v}, err
+	})
+	return got.d, got.values, err
 }
 
 // readingRoles runs once a read has read grants and the custom roles with them, as a
@@ -112,13 +130,20 @@ func (a *Authorizer) decideGrants(ctx context.Context, s Subject, p Permission, 
 var readingRoles = func() {}
 
 // decideHeld is Authorize's decision once no constraint removes p, from s's grants and denies and
-// the custom roles they name, read in one statement.
-func (a *Authorizer) decideHeld(ctx context.Context, s Subject, p Permission, r Resource, counts broad) (Decision, error) {
-	held, ds, roles, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, counts, r.path(), p, namedRoles, false)
+// the custom roles they name, read in one statement; with values, what its label values are decided
+// by, read in it too.
+func (a *Authorizer) decideHeld(ctx context.Context, s Subject, p Permission, r Resource, counts broad, values bool) (Decision, *valuesRead, error) {
+	got, err := a.readHeld(ctx, a.db, r.Tenant, s, counts, r.path(), p, namedRoles, alsoRead{values: values})
 	if err != nil {
-		return Decision{}, err
+		return Decision{}, nil, err
 	}
 	readingRoles()
+	d, err := a.decideBy(ctx, s, p, r, got.held, got.ds, got.roles)
+	return d, got.values, err
+}
+
+// decideBy is decideHeld's decision by what it read.
+func (a *Authorizer) decideBy(ctx context.Context, s Subject, p Permission, r Resource, held []holding, ds []denial, roles book) (Decision, error) {
 	// What conditions read is built only for a check that reads one, so one a grant decides
 	// builds none of it.
 	var vars map[string]any
@@ -186,6 +211,7 @@ func (a *Authorizer) explain(ctx context.Context, s Subject, p Permission, r Res
 	if err != nil {
 		return Decision{}, err
 	}
+	readingRoles()
 	d := Decision{Reason: "no grant gives it"}
 	grants = slices.DeleteFunc(grants, func(g Grant) bool {
 		return !gives(roles, holding{Binding: g.Binding}, p, r.Type)
@@ -272,18 +298,30 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 	if err := a.subject(s); err != nil {
 		return nil, err
 	}
+	// Its label values are those its grants on the tenant give, read with these, so a label is
+	// decided by what it held as it held them.
+	held, ds, roles, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), namedRoles, false)
+	if err != nil {
+		return nil, err
+	}
+	readingRoles()
 	// A label the subject doesn't satisfy leaves it nothing, whatever its grants give, but on the
 	// tenant the label values and powers to release it holds, which no label of the tenant's decides
 	// (decidedOn).
-	dim, err := a.unsatisfied(ctx, s, r)
-	if err != nil || dim != "" && r.Type != TenantScope {
-		return nil, err
-	}
 	var only func(Permission) bool
-	if dim != "" {
-		only = a.labelPermission
+	if r.Labels.asks() {
+		h, _, err := a.holdingOf(ctx, r.Tenant, s, onTenant(r.Tenant, held, ds, roles))
+		switch {
+		case err != nil:
+			return nil, err
+		case h.Unsatisfied(r.Labels) == "":
+		case r.Type != TenantScope:
+			return nil, nil
+		default:
+			only = a.labelPermission
+		}
 	}
-	perms, _, excluded, err := a.permissionsOf(ctx, a.db, s, r, only, a.constrain(ctx, s, r))
+	perms, _, excluded, err := a.permissionsOf(ctx, a.db, s, r, only, a.constrain(ctx, s, r), held, ds, roles)
 	if err != nil {
 		return nil, err
 	}
@@ -291,20 +329,17 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 }
 
 // permissionsOf is what Permissions lists, once its input is checked, of the permissions only
-// keeps, or all where it is nil; and of them, those a condition decided, a grant's or a deny's,
+// keeps, or all where it is nil, decided by held and ds, s's grants and denies on r's path, and the
+// roles they name, read together; and of them, those a condition decided, a grant's or a deny's,
 // or a constraint asked without the request's attributes, which a read without the request can't
 // settle; and the exclusive dimensions s holds none of, as its grants on the tenant could give it
-// two (excludedBy). It reads on q, and asks the constraints through cs, which is on r, so a change
-// reads them back in its transaction.
+// two (excludedBy). It reads on q the conditions not read with the grants, and asks the
+// constraints through cs, which is on r, so a change reads them back in its transaction.
 func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resource, only func(Permission) bool, cs *constrained,
+	held []holding, ds []denial, roles book,
 ) ([]Permission, map[Permission]bool, map[string]bool, error) {
 	kept := func(p Permission) bool { return only == nil || only(p) }
 	byCondition := map[Permission]bool{}
-	held, ds, roles, err := a.heldOrDenied(ctx, q, r.Tenant, s, all, r.path(), "", namedRoles, false)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	readingRoles()
 	given := map[Permission]bool{}
 	var conditional []holding
 	for _, h := range held {
@@ -490,14 +525,32 @@ func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]H
 	if len(roles) == 0 && !custom {
 		return nil, nil
 	}
-	holders, err := snapshot(ctx, a, func(a *Authorizer) ([]Holder, error) { return a.holders(ctx, p, r, roles, custom) })
+	// What the holders' label values are decided by is read in the list's snapshot, so each is of
+	// the moment its grants are.
+	type listed struct {
+		holders []Holder
+		values  map[string]*valuesRead
+	}
+	asks := a.asksValues(p, r)
+	got, err := snapshot(ctx, a, func(a *Authorizer) (listed, error) {
+		holders, err := a.holders(ctx, p, r, roles, custom)
+		if err != nil || !asks {
+			return listed{holders: holders}, err
+		}
+		if holders, err = a.broadLabeled(ctx, p, r, holders); err != nil {
+			return listed{}, err
+		}
+		values, err := a.valuesOfEach(ctx, a.db, r.Tenant, holders)
+		return listed{holders, values}, err
+	})
+	holders := got.holders
 	if err == nil && removed != "" {
 		holders, err = a.constrained(ctx, p, r, holders)
 	}
-	if _, exclusive := a.exclusiveValue(p); err != nil || !r.Labels.asks() && !exclusive {
+	if err != nil || !asks {
 		return holders, err
 	}
-	return a.labeled(ctx, p, r, holders)
+	return a.labeled(ctx, p, r, holders, got.values)
 }
 
 // constrained marks MaybeDenied the holders a constraint may remove p from, where one may remove
@@ -521,14 +574,10 @@ func (a *Authorizer) constrained(ctx context.Context, p Permission, r Resource, 
 	return holders, nil
 }
 
-// labeled keeps of holders those whose holding satisfies r's label whatever the request, and
-// where p is a value of an exclusive dimension, holds it: one that satisfies it only with the
-// values a condition or a constraint decided, which a read without the request can't settle, is
-// marked MaybeDenied, as the members and the public are, whose people hold apart, unless their own
-// grants leave none of them able to (broadExcludes); and one that doesn't even then, or holds none
-// of p's dimension, is left out. Each identity's holding is read after the list, as its
-// constraints run as for any read.
-func (a *Authorizer) labeled(ctx context.Context, p Permission, r Resource, holders []Holder) ([]Holder, error) {
+// broadLabeled leaves out of holders the tenant's members and the public where their own grants
+// leave none of them able to do p to r (broadExcludes), and otherwise marks them MaybeDenied, as
+// their people hold values each their own.
+func (a *Authorizer) broadLabeled(ctx context.Context, p Permission, r Resource, holders []Holder) ([]Holder, error) {
 	kept := holders[:0]
 	for _, h := range holders {
 		if h.Principal.broad() {
@@ -536,13 +585,31 @@ func (a *Authorizer) labeled(ctx context.Context, p Permission, r Resource, hold
 			if err != nil {
 				return nil, err
 			}
-			if !out {
-				h.MaybeDenied = true
-				kept = append(kept, h)
+			if out {
+				continue
 			}
+			h.MaybeDenied = true
+		}
+		kept = append(kept, h)
+	}
+	return kept, nil
+}
+
+// labeled keeps of holders the identities whose holding, decided by values, read with the list,
+// satisfies r's label whatever the request, and where p is a value of an exclusive dimension, holds
+// it: one that satisfies it only with the values a condition or a constraint decided, which a read
+// without the request can't settle, is marked MaybeDenied; and one that doesn't even then, or holds
+// none of p's dimension, is left out. The members and the public broadLabeled kept stay. Each
+// identity's holding is decided after the list's snapshot, as its constraints run as for any read.
+func (a *Authorizer) labeled(ctx context.Context, p Permission, r Resource, holders []Holder, values map[string]*valuesRead) ([]Holder, error) {
+	kept := holders[:0]
+	for _, h := range holders {
+		if h.Principal.broad() {
+			kept = append(kept, h)
 			continue
 		}
-		holding, byCondition, err := a.holding(ctx, r.Tenant, Subject{Principal: h.Principal})
+		s := Subject{Principal: h.Principal}
+		holding, byCondition, err := a.holdingOf(ctx, r.Tenant, s, values[h.Principal.key()])
 		if err != nil {
 			return nil, err
 		}
@@ -556,6 +623,119 @@ func (a *Authorizer) labeled(ctx context.Context, p Permission, r Resource, hold
 		}
 	}
 	return kept, nil
+}
+
+// valuesOfEach reads on q, in one statement, what the label values in a tenant of each identity
+// among holders are decided by (valuesRead), by its key, with their conditions: each one's keys
+// apart, as conflicts reads them, and the grants on the tenant and the denies there binding any of
+// them once, as many share a group.
+func (a *Authorizer) valuesOfEach(ctx context.Context, q DB, tenant string, holders []Holder) (map[string]*valuesRead, error) {
+	var identities []string
+	for _, h := range holders {
+		if !h.Principal.broad() {
+			identities = append(identities, h.Principal.key())
+		}
+	}
+	if len(identities) == 0 {
+		return nil, nil
+	}
+	// Each identity's keys cost the planner as a walk of many groups, which across many identities is
+	// past JIT's thresholds.
+	return withoutJIT(ctx, q, func() (map[string]*valuesRead, error) { return a.valuesOfAll(ctx, q, tenant, identities) })
+}
+
+// valuesOfAll is valuesOfEach's read of identities, by key.
+func (a *Authorizer) valuesOfAll(ctx context.Context, q DB, tenant string, identities []string) (map[string]*valuesRead, error) {
+	rows, err := q.Query(ctx, `
+		WITH idents AS MATERIALIZED (
+		  SELECT t.identity, ks.keys, ks.bound, ks.exempted FROM (SELECT unnest($2::text[]) COLLATE "C" AS identity) t
+		  CROSS JOIN LATERAL (WITH RECURSIVE `+keysSQL("$1::text", "t.identity", "$3")+`
+		    SELECT ARRAY(SELECT k FROM keys) AS keys, ARRAY(SELECT k FROM bound) AS bound, ARRAY(SELECT k FROM exempted) AS exempted) ks
+		), held AS (
+		  SELECT g.* FROM (SELECT DISTINCT unnest(keys) AS k FROM idents) k CROSS JOIN LATERAL (
+		    SELECT id::text, principal, role, expires_at, condition FROM rbac_grants
+		    WHERE tenant = $1 AND principal = k.k AND scope = 'tenant:' || $1 AND (expires_at IS NULL OR expires_at > $3) OFFSET 0) g
+		)
+		SELECT 0, identity, '', '', NULL::timestamptz, '', keys, bound, exempted, false, false, '', '' FROM idents
+		UNION ALL
+		SELECT 1, id, principal, role, expires_at, condition, NULL, NULL, NULL, false, false, '', '' FROM held
+		UNION ALL
+		SELECT 2, id, '', '', NULL, condition, permissions, principals, exempt, false, false, '', '' FROM rbac_denies
+		WHERE tenant = $1 AND scope = 'tenant:' || $1 AND principals && ARRAY(SELECT DISTINCT unnest(bound) FROM idents)
+		UNION ALL
+		SELECT 3, id, '', '', NULL, '', permissions, resource_types, grantable_roles, privileged, public, name, description
+		FROM rbac_roles WHERE tenant = $1 AND id IN (SELECT role FROM held WHERE role LIKE '`+CustomPrefix+`%')
+		ORDER BY 1, 3, 4, 2`, tenant, identities, a.cfg.Now())
+	if err != nil {
+		return nil, err
+	}
+	// Grants by principal, role and id, and denies by id, as a read of one identity's orders them.
+	type keyed struct{ keys, bound, exempted []string }
+	byIdentity := map[string]keyed{}
+	var grants []holding
+	at := map[string][]int{}
+	var ds []denial
+	var custom []RoleDefinition
+	scope := TenantRoot(tenant).Key()
+	var kind int
+	var id, principal, role, condition, name, description string
+	var expires *time.Time
+	var first, second, third []string
+	var privileged, public bool
+	if _, err := pgx.ForEachRow(rows, []any{&kind, &id, &principal, &role, &expires, &condition, &first, &second, &third, &privileged, &public, &name, &description}, func() error {
+		switch kind {
+		case 0:
+			byIdentity[id] = keyed{first, second, third}
+		case 1:
+			h := holding{
+				Binding: Binding{ID: id, Principal: parsePrincipal(principal), Role: Role(role), Condition: Condition{Expression: condition}},
+				scope:   scope, conditional: condition != "",
+			}
+			if expires != nil {
+				h.ExpiresAt = *expires
+			}
+			at[principal] = append(at[principal], len(grants))
+			grants = append(grants, h)
+		case 2:
+			d := denial{id: id, scope: scope, condition: condition, principals: second, exempt: third}
+			for _, x := range first {
+				d.permissions = append(d.permissions, Permission(x))
+			}
+			ds = append(ds, d)
+		default:
+			custom = append(custom, roleFrom(id, name, description, first, second, privileged, public, third))
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	readingRoles()
+	roles := a.builtinBook()
+	if len(custom) > 0 {
+		roles = a.bookOf(a.current(custom))
+	}
+	overlaps := func(xs, ys []string) bool {
+		return slices.ContainsFunc(xs, func(x string) bool { return slices.Contains(ys, x) })
+	}
+	values := make(map[string]*valuesRead, len(byIdentity))
+	for identity, k := range byIdentity {
+		v := &valuesRead{roles: roles}
+		var is []int
+		for _, key := range slices.Compact(slices.Sorted(slices.Values(k.keys))) {
+			is = append(is, at[key]...)
+		}
+		slices.Sort(is)
+		for _, i := range is {
+			v.held = append(v.held, grants[i])
+		}
+		for _, d := range ds {
+			if overlaps(d.principals, k.bound) && !overlaps(d.exempt, k.exempted) {
+				v.ds = append(v.ds, d)
+			}
+		}
+		values[identity] = v
+	}
+	return values, nil
 }
 
 // holders is Holders' list once no constraint removes p, for the built-in roles that give it, and
@@ -599,6 +779,7 @@ func (a *Authorizer) holders(ctx context.Context, p Permission, r Resource, role
 	if err != nil {
 		return nil, err
 	}
+	readingRoles()
 	// A grant to the public gives nothing where no public role can give p, as checks read it.
 	public := a.publicGives(p, r.Type)
 	byPrincipal := map[string]*Holder{}
@@ -846,14 +1027,26 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 	if len(roles) == 0 && !custom {
 		return Reach{}, nil
 	}
-	reach, err := snapshot(ctx, a, func(a *Authorizer) (Reach, error) {
-		return a.reachable(ctx, s, p, tenant, resourceType, roles, custom)
+	// With what its label values are decided by, in the snapshot, so they are of the moment its
+	// grants are.
+	type reached struct {
+		reach  Reach
+		values *valuesRead
+	}
+	got, err := snapshot(ctx, a, func(a *Authorizer) (reached, error) {
+		reach, err := a.reachable(ctx, s, p, tenant, resourceType, roles, custom)
+		if err != nil || !reach.All && len(reach.Scopes)+len(reach.Conditional) == 0 {
+			return reached{reach: reach}, err
+		}
+		v, err := a.valuesOn(ctx, a.db, tenant, s)
+		return reached{reach, v}, err
 	})
-	if err != nil || !reach.All && len(reach.Scopes)+len(reach.Conditional) == 0 {
+	reach := got.reach
+	if err != nil || got.values == nil {
 		return reach, err
 	}
-	// Outside the snapshot, as its constraints run as for any read.
-	reach.Labels, _, err = a.holding(ctx, tenant, s)
+	// Decided outside the snapshot, as its constraints run as for any read.
+	reach.Labels, _, err = a.holdingOf(ctx, tenant, s, got.values)
 	if err != nil || reach.Labels.excludes(p) {
 		return Reach{}, err
 	}
@@ -906,6 +1099,7 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 	}); err != nil {
 		return Reach{}, err
 	}
+	readingRoles()
 	// A deny only takes away: where no grant reaches, there is nothing to take.
 	if !reach.All && len(reach.Scopes)+len(reach.Conditional) == 0 {
 		return Reach{}, nil
@@ -1284,24 +1478,89 @@ const (
 	heldTenantRoles
 )
 
-// heldOrDenied returns the grants on any of scopes, not expired, held by s's principals in a
-// tenant, counting broad ones as counts says, and the denies deniesOn reads for all its principals
-// and p, or any permission when p is empty, in one statement that reads its membership and groups
-// too, so a check is one round trip. The grants' part reads only what the key index holds, and the
-// other indexes it could use lead to the principals and scopes too and hold the same, so whichever
-// a plan picks, a generic one too, it is an index-only scan of no more grants. Like Explain, it
-// reads no deny for a subject none of whose grants count, such as one that isn't a member or guest
-// of the tenant. It reads the custom roles roles says in the statement too, as SetRole changes one
-// in place: read apart, a grant revoked and its role widened meanwhile could give what no moment
-// did. With ending, it reads when each grant's holding ends too, as a change hands on nothing past
-// it.
-func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Subject, counts broad, scopes []string, p Permission,
-	roles rolesRead, ending bool,
+// heldOrDenied is readHeld of the grants, the denies of any permission and the roles alone, and
+// with ending, when each grant's holding ends.
+func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Subject, counts broad, scopes []string, roles rolesRead,
+	ending bool,
 ) ([]holding, []denial, book, error) {
-	b := a.builtinBook()
-	// The anonymous are the public alone.
+	got, err := a.readHeld(ctx, q, tenant, s, counts, scopes, "", roles, alsoRead{ending: ending})
+	return got.held, got.ds, got.roles, err
+}
+
+// alsoRead is what else readHeld reads in its statement.
+type alsoRead struct {
+	// ending is when each grant's holding ends, as a change hands on nothing past it.
+	ending bool
+	// values is what the subject's label values are decided by (valuesRead), whatever counts and p
+	// are, so they are of the moment its other grants are. The scopes hold the tenant's.
+	values bool
+	// keys are the subject's keys in the tenant, as keysOf reads them.
+	keys bool
+}
+
+// grantsRead is what readHeld reads.
+type grantsRead struct {
+	held  []holding
+	ds    []denial
+	roles book
+	// values is set with alsoRead.values, and keys read with alsoRead.keys.
+	values *valuesRead
+	keys   []string
+}
+
+// valuesRead is what a subject's label values are decided by: its grants on its tenant, and the
+// denies binding it there, of any permission, with the custom roles they name; read with its other
+// grants, in one statement or one snapshot, so a check of a label decides by what it held as it
+// held them. The grants' conditions are read with them, or later where a decision needs them.
+type valuesRead struct {
+	held  []holding
+	ds    []denial
+	roles book
+	// decided is the holding decided by it through each constrained, so a change's checks decide it
+	// once for each read.
+	decided map[*constrained]Holding
+}
+
+// onTenant is what of grants and denies read on scopes holding the tenant's, with roles, a subject's
+// label values are decided by: those on the tenant's own scope. The others' denies don't bind its
+// values, and their grants give none.
+func onTenant(tenant string, held []holding, ds []denial, roles book) *valuesRead {
+	key := TenantRoot(tenant).Key()
+	v := &valuesRead{roles: roles}
+	for _, h := range held {
+		if h.scope == key {
+			v.held = append(v.held, h)
+		}
+	}
+	for _, d := range ds {
+		if d.scope == key {
+			v.ds = append(v.ds, d)
+		}
+	}
+	return v
+}
+
+// readHeld returns the grants on any of scopes, not expired, held by s's principals in a tenant,
+// counting broad ones as counts says, and the denies deniesOn reads for all its principals and p, or
+// any permission when p is empty, in one statement that reads its membership and groups too, so a
+// check is one round trip. The grants' part reads only what the key index holds, and the other
+// indexes it could use lead to the principals and scopes too and hold the same, so whichever a plan
+// picks, a generic one too, it is an index-only scan of no more grants. Like Explain, it reads no
+// deny for a subject none of whose grants count, such as one that isn't a member or guest of the
+// tenant. It reads the custom roles roles says in the statement too, as SetRole changes one in
+// place: read apart, a grant revoked and its role widened meanwhile could give what no moment did.
+// It reads what with says too.
+func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subject, counts broad, scopes []string, p Permission,
+	roles rolesRead, with alsoRead,
+) (grantsRead, error) {
+	got := grantsRead{roles: a.builtinBook()}
+	if with.values {
+		got.values = &valuesRead{roles: got.roles}
+	}
+	// The anonymous are the public alone: where it doesn't count, nothing gives the anonymous p, so
+	// no label of it is decided either.
 	if s.Principal == (Principal{}) && !counts.public {
-		return nil, nil, b, nil
+		return got, nil
 	}
 	var perm, wildcard string
 	deniable := true
@@ -1314,13 +1573,24 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Su
 	if !deniable {
 		read = "FALSE"
 	}
+	// With values, the grants on the tenant of the broad principals counts leaves out, and every
+	// deny binding the subject there: in the statement's text, which otherwise plans no read of them.
+	// Each grant and deny says whether it is one for p.
+	values, keyed := "FALSE", "FALSE"
+	if with.values {
+		values = "TRUE"
+	}
+	if with.keys {
+		keyed = "TRUE"
+	}
+	forP := read + ` AND ($5 = '' OR $5 = ANY(permissions) OR $6 = ANY(permissions)) AND EXISTS (SELECT FROM keys WHERE ` + counted("$7", "$8") + `)`
 	// In the statement, so they are of the moment its grants are.
 	var places, ends string
-	if ending {
+	if with.ending {
 		places = `, ` + endsSQL("$2::text", "$4")
 		ends = `
 		UNION ALL
-		SELECT 3, k, '', '', '', e, false, NULL, '', NULL, false, false, NULL, '', '' FROM ends`
+		SELECT 3, k, '', '', '', e, false, NULL, '', NULL, false, false, NULL, '', '', false FROM ends`
 	}
 	// In the statement's text rather than an argument: a generic plan can't tell from one whether
 	// to read every role of the tenant or look up those the grants name.
@@ -1333,48 +1603,58 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Su
 	case heldTenantRoles:
 		which = "EXISTS (SELECT FROM held WHERE role LIKE '" + CustomPrefix + "%')"
 	}
-	// Grants, denies and roles in that order; grants by principal, scope, role and id, denies by id
-	// and scope, as deniesOn.
-	const deny, role, end = 1, 2, 3
+	// Grants, denies, roles and keys in that order; grants by principal, scope, role and id, denies
+	// by id and scope, as deniesOn.
+	const deny, role, end, key = 1, 2, 3, 4
 	rows, err := q.Query(ctx, `
 		WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$4")+`, held AS (
-		  SELECT id::text, principal, scope, role, expires_at, conditional FROM rbac_grants
+		  SELECT id::text, principal, scope, role, expires_at, conditional, true AS counts FROM rbac_grants
 		  WHERE tenant = $1 AND principal = ANY(ARRAY(`+countedKeys("$7", "$8")+`)) AND scope = ANY($3::text[])
 		    AND (expires_at IS NULL OR expires_at > $4)
+		  UNION ALL
+		  SELECT id::text, principal, scope, role, expires_at, conditional, false FROM rbac_grants
+		  WHERE `+values+` AND tenant = $1 AND principal = ANY(ARRAY(SELECT k FROM keys WHERE NOT (`+counted("$7", "$8")+`) ORDER BY k))
+		    AND scope = 'tenant:' || $1 AND (expires_at IS NULL OR expires_at > $4)
 		)`+places+`
-		SELECT 0, id, principal, scope, role, expires_at, conditional, NULL::text[], '', NULL::text[], false, false, NULL::text[], '', ''
+		SELECT 0, id, principal, scope, role, expires_at, conditional, NULL::text[], '', NULL::text[], false, false, NULL::text[], '', '', counts
 		FROM held
 		UNION ALL
-		SELECT 1, id, id, scope, '', NULL, condition <> '', permissions, condition, NULL, false, false, NULL, '', ''
-		FROM (`+byKey("$3", "rbac_denies", "scope", "id, scope, permissions, condition", read+` AND tenant = $1
+		SELECT 1, id, id, scope, '', NULL, condition <> '', permissions, condition, NULL, false, false, NULL, '', '', counts
+		FROM (`+byKey("$3", "rbac_denies", "scope", "id, scope, permissions, condition, "+forP+" AS counts", `tenant = $1
 		  AND principals && ARRAY(SELECT k FROM bound) AND NOT exempt && ARRAY(SELECT k FROM exempted)
-		  AND ($5 = '' OR $5 = ANY(permissions) OR $6 = ANY(permissions)) AND EXISTS (SELECT FROM keys WHERE `+counted("$7", "$8")+`)`)+`) d
+		  AND (`+forP+` OR `+values+` AND scope = 'tenant:' || $1)`)+`) d
 		UNION ALL
-		SELECT 2, id, '', '', id, NULL, false, permissions, '', resource_types, privileged, public, grantable_roles, name, description
+		SELECT 2, id, '', '', id, NULL, false, permissions, '', resource_types, privileged, public, grantable_roles, name, description, false
 		FROM rbac_roles
 		WHERE tenant = $1 AND `+which+ends+`
+		UNION ALL
+		SELECT 4, k, '', '', '', NULL, false, NULL, '', NULL, false, false, NULL, '', '', false FROM keys WHERE `+keyed+`
 		ORDER BY 1, 3, 4, 5, 2`,
 		tenant, s.identityKey(), scopes, a.cfg.Now(), perm, wildcard, counts.public, counts.members)
 	if err != nil {
-		return nil, nil, book{}, err
+		return grantsRead{}, err
 	}
-	var held []holding
-	var ds []denial
 	var custom []RoleDefinition
 	placeEnds := map[string]time.Time{}
+	tenantKey := TenantRoot(tenant).Key()
 	var kind int
 	var id, principal, scope, roleID, condition, name, description string
 	var expires *time.Time
-	var conditional, privileged, public bool
+	var conditional, privileged, public, ofP bool
 	var perms, types, grantable []string
-	_, err = pgx.ForEachRow(rows, []any{&kind, &id, &principal, &scope, &roleID, &expires, &conditional, &perms, &condition, &types, &privileged, &public, &grantable, &name, &description}, func() error {
+	_, err = pgx.ForEachRow(rows, []any{&kind, &id, &principal, &scope, &roleID, &expires, &conditional, &perms, &condition, &types, &privileged, &public, &grantable, &name, &description, &ofP}, func() error {
 		switch kind {
 		case deny:
 			d := denial{id: id, scope: scope, condition: condition}
 			for _, x := range perms {
 				d.permissions = append(d.permissions, Permission(x))
 			}
-			ds = append(ds, d)
+			if ofP {
+				got.ds = append(got.ds, d)
+			}
+			if with.values && scope == tenantKey {
+				got.values.ds = append(got.values.ds, d)
+			}
 		case role:
 			custom = append(custom, roleFrom(id, name, description, perms, types, privileged, public, grantable))
 		case end:
@@ -1383,42 +1663,53 @@ func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Su
 			} else {
 				placeEnds[id] = *expires
 			}
+		case key:
+			got.keys = append(got.keys, id)
 		default:
 			h := holding{Binding: Binding{ID: id, Principal: parsePrincipal(principal), Role: Role(roleID)}, scope: scope, conditional: conditional}
 			if expires != nil {
 				h.ExpiresAt = *expires
 			}
-			held = append(held, h)
+			if ofP {
+				got.held = append(got.held, h)
+			}
+			if with.values && scope == tenantKey {
+				got.values.held = append(got.values.held, h)
+			}
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, nil, book{}, err
+		return grantsRead{}, err
 	}
-	if ending {
+	if with.ending {
 		tenure := placeEnds[s.identityKey()]
-		for i, h := range held {
-			held[i].ends = h.ExpiresAt
+		for i, h := range got.held {
+			got.held[i].ends = h.ExpiresAt
 			// A grant to the public reaches the subject whatever it is a member of.
 			if h.Principal.Kind != Public {
-				held[i].ends = sooner(held[i].ends, tenure)
+				got.held[i].ends = sooner(got.held[i].ends, tenure)
 			}
 			if h.Principal.Kind == Group {
-				held[i].ends = sooner(held[i].ends, placeEnds[h.Principal.key()])
+				got.held[i].ends = sooner(got.held[i].ends, placeEnds[h.Principal.key()])
 			}
 		}
 	}
 	if len(custom) > 0 {
-		b = a.bookOf(a.current(custom))
+		got.roles = a.bookOf(a.current(custom))
+		if with.values {
+			got.values.roles = got.roles
+		}
 	}
-	return held, ds, b, nil
+	return got, nil
 }
 
-// conditionsOf reads the conditions of the conditional grants among held, in place.
+// conditionsOf reads the conditions of the conditional grants among held not read already, in
+// place.
 func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held []holding) error {
 	var ids, principals, scopes []string
 	for _, h := range held {
-		if h.conditional {
+		if h.conditional && h.Condition.Expression == "" {
 			ids = append(ids, h.ID)
 			principals = append(principals, h.Principal.key())
 			scopes = append(scopes, h.scope)
@@ -1447,7 +1738,7 @@ func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held
 		return err
 	}
 	for i, h := range held {
-		if h.conditional {
+		if h.conditional && h.Condition.Expression == "" {
 			// One gone since is read as a condition nothing meets.
 			held[i].Condition.Expression = cmp.Or(found[h.ID], "false")
 		}
@@ -1481,13 +1772,18 @@ func collectGrants(rows pgx.Rows) ([]Grant, error) {
 	return pgx.CollectRows(rows, scanGrant)
 }
 
-func scanGrant(row pgx.CollectableRow) (Grant, error) {
+func scanGrant(row pgx.CollectableRow) (Grant, error) { return scanGrantWith(row) }
+
+// scanGrantWith scans a row of grantColumns, and after them, more.
+func scanGrantWith(row pgx.CollectableRow, more ...any) (Grant, error) {
 	var g Grant
 	var expires *time.Time
 	var approvedBy, createdBy, updatedBy string
-	err := row.Scan(&g.ID, &g.Scope.Type, &g.Scope.ID, &g.Principal.Kind, &g.Principal.ID, &g.Role, &g.Source, &expires,
+	err := row.Scan(append([]any{
+		&g.ID, &g.Scope.Type, &g.Scope.ID, &g.Principal.Kind, &g.Principal.ID, &g.Role, &g.Source, &expires,
 		&g.Condition.Title, &g.Condition.Description, &g.Condition.Expression, &g.Note,
-		&approvedBy, &createdBy, &g.CreatedAt, &updatedBy, &g.UpdatedAt)
+		&approvedBy, &createdBy, &g.CreatedAt, &updatedBy, &g.UpdatedAt,
+	}, more...)...)
 	if expires != nil {
 		g.ExpiresAt = *expires
 	}

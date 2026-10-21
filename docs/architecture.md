@@ -287,8 +287,9 @@ flowchart LR
 ```
 
 - **The host passes the ancestors** on every call, read from where it stores them. The package
-  never looks a resource up for a check, so a check costs one statement, and more only where it
-  needs its grants' conditions or the subject's label values. `ResourceOf` is asked only
+  never looks a resource up for a check, so a check costs one statement, the subject's label
+  values' grants and denies among what it reads, and more only where it needs its grants'
+  conditions. `ResourceOf` is asked only
   when a change needs a scope's own ancestors, labels or attributes.
 - **For lists, the host stores the path** in a `text[]` column with a GIN index, and `Filter`
   matches it.
@@ -296,8 +297,9 @@ flowchart LR
 ## A check
 
 `Authorize` answers whether a subject may do one permission on one resource. It reads in one
-statement, apart from the conditions of conditional grants, read only when no unconditional grant
-allows, and the subject's label values, and refuses unless something allows.
+statement, the grants and denies on the tenant its label values are decided by too, apart from the
+conditions of conditional grants, read only when no unconditional grant allows, and refuses unless
+something allows. So a label is decided by the values the subject held as it held its grants.
 
 ```mermaid
 flowchart TB
@@ -305,14 +307,14 @@ flowchart TB
     valid -->|no| invalid(["ErrInvalid"])
     valid -->|yes| cons{"A constraint<br/>removes it?"}
     cons -->|yes| refused(["DeniedError"])
-    cons -->|no| read["One statement: the subject's keys,<br/>its grants on the path, the denies on the path<br/>and the custom roles the grants name<br/>(heldOrDenied)"]
+    cons -->|no| read["One statement: the subject's keys,<br/>its grants on the path, the denies on the path<br/>and the custom roles the grants name,<br/>and for a labeled check its grants and denies<br/>on the tenant (readHeld)"]
     read --> deny{"A deny binds it?<br/>conditions evaluated"}
     deny -->|yes| refused
     deny -->|no| grant{"A grant gives it?<br/>any unconditional one, then conditional"}
     grant -->|no| refused
     grant -->|yes| asks{"Labeled resource, or an<br/>exclusive value?"}
     asks -->|no| allowed(["nil"])
-    asks -->|yes| holding["The subject's label values<br/>(holding, permissionsOf)"]
+    asks -->|yes| holding["The subject's label values,<br/>from what the statement read<br/>(holdingFrom, permissionsOf)"]
     holding --> sat{"Holds no two exclusive values,<br/>and satisfies the label?"}
     sat -->|yes| allowed
     sat -->|no| refused
@@ -339,14 +341,14 @@ sequenceDiagram
     A->>A: validate (check, askable, subject)
     A->>C: Deny(ConstraintInput)
     C-->>A: false
-    A->>DB: heldOrDenied: keys, grants, denies, custom roles
+    A->>DB: readHeld: keys, grants, denies, custom roles, and the tenant's for its values
     DB-->>A: holdings, denials, roles
     A->>E: deny conditions, within a deny budget
     A->>A: an unconditional grant, of a built-in or custom role, that gives it?
     A->>DB: conditionsOf (only where a conditional grant is all that's left)
     A->>E: grant conditions, cheapest first, within a budget
     opt labeled resource or exclusive value
-        A->>DB: the subject's values on the tenant (permissionsOf)
+        A->>A: the subject's values from what it read (holdingFrom)
         A->>A: excludes, then Unsatisfied
     end
     A-->>H: nil, or DeniedError
@@ -354,7 +356,8 @@ sequenceDiagram
 
 - **Explain** decides the same way and says why: every grant that allows, or the deny, constraint
   or label that refused, a label's or an exclusive value's dimension in `Decision.Label`. It reads
-  the subject's keys, grants and denies in one snapshot, and its label values after it.
+  the subject's keys, grants and denies in one snapshot, and what its label values are decided by
+  in it too.
 - **Permissions** lists everything a subject may do on a resource, deciding each as Authorize
   would.
 - **Conditions** are CEL over `subject`, `resource`, `request` and `action`, typed by
@@ -514,7 +517,8 @@ flowchart LR
 - **Holders** lists who may do a permission on a resource, for an access review. That is each
   identity, through its own grants and its groups', with the tenant's members and the public as
   one holder each. It marks holders that hold only under a condition, or that a deny, a
-  constraint or a label may refuse.
+  constraint or a label may refuse. For a labeled resource it reads every identity's label values'
+  grants and denies in one statement in the list's snapshot.
 
 ## Labels and exclusive values
 
@@ -586,7 +590,8 @@ flowchart TB
   `DeleteExpired`, which waits on no row.
 - **One snapshot for reads in several statements.** Explain, Reachable, Holders and Conflicts read
   in one REPEATABLE READ, READ ONLY transaction of their own on a pool, and AsOf in a REPEATABLE
-  READ one it rolls back; the label values Explain, Reachable and Holders need are read after it.
+  READ one it rolls back. Explain, Reachable and Holders read what label values are decided by in
+  it, and decide them after it, as the constraints are asked outside it.
   Under `WithTx` they read on the host's transaction at its isolation, AsOf in a savepoint.
 - **Races** PostgreSQL refuses, such as a serialization failure or a deadlock between host
   transactions, match `ErrConflict`: try again.

@@ -1353,3 +1353,449 @@ func TestALabelValuesConditionsCantReadTheTenantsAttributes(t *testing.T) {
 		t.Fatalf("handing on level:high, which a deny takes: %v", err)
 	}
 }
+
+// A read decides a resource's label by the label values the subject held as it held its grants:
+// one moved, in one statement, between the group granted on a labeled cluster and the group
+// holding the label's value never held both, so no read made while it moves lets it see the
+// cluster, whichever way it moves, whatever a read reads first.
+func TestReadsDecideALabelByTheValuesHeldWithTheGrants(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	reads := map[string]func(t *testing.T, h *harness, x rbac.Subject) bool{
+		"Authorize": func(t *testing.T, h *harness, x rbac.Subject) bool { t.Helper(); return allowed(t, h, x, view, secret) },
+		"Explain": func(t *testing.T, h *harness, x rbac.Subject) bool {
+			t.Helper()
+			d, err := h.authz.Explain(t.Context(), x, view, secret)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return d.Allowed
+		},
+		"Permissions": func(t *testing.T, h *harness, x rbac.Subject) bool {
+			t.Helper()
+			perms, err := h.authz.Permissions(t.Context(), x, secret)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return slices.Contains(perms, view)
+		},
+		"Grantable": func(t *testing.T, h *harness, x rbac.Subject) bool {
+			t.Helper()
+			roles, err := h.authz.Grantable(t.Context(), x, secret)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return len(roles) > 0
+		},
+		"Reachable": func(t *testing.T, h *harness, x rbac.Subject) bool {
+			t.Helper()
+			reach, err := h.authz.Reachable(t.Context(), x, view, "t1", "cluster")
+			if err != nil {
+				t.Fatal(err)
+			}
+			return (reach.All || slices.Contains(reach.Scopes, cluster.Scope())) && reach.Labels.Satisfies(secret.Labels)
+		},
+		"Holders": func(t *testing.T, h *harness, x rbac.Subject) bool {
+			t.Helper()
+			holders, err := h.authz.Holders(t.Context(), view, secret)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return slices.ContainsFunc(holders, func(hd rbac.Holder) bool { return hd.Principal == x.Principal })
+		},
+	}
+	world := func(t *testing.T, groups ...string) (*harness, rbac.Subject) {
+		t.Helper()
+		h := labeled(t)
+		h.seed(t, grant(cluster.Scope(), "cluster.admin", rbac.Group, "readers"), grant(rbac.TenantRoot("t1"), "level.high", rbac.Group, "cleared"))
+		return h, h.as(t, "x", groups...)
+	}
+	for name, read := range reads {
+		t.Run(name, func(t *testing.T) {
+			if h, x := world(t, "readers", "cleared"); !read(t, h, x) {
+				t.Fatal("in both groups, x may see the cluster")
+			}
+			for from, to := range map[string]string{"readers": "cleared", "cleared": "readers"} {
+				h, x := world(t, from)
+				moved := false
+				rbac.SetReadingRoles(t, func() {
+					if moved {
+						return
+					}
+					moved = true
+					if _, err := h.pool.Exec(h.ctx, `WITH gone AS (DELETE FROM rbac_members WHERE tenant = 't1' AND group_id = $1 AND principal_kind = 'user' AND principal_id = 'x')
+						INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', $2, 'user', 'x')`, from, to); err != nil {
+						t.Error(err)
+					}
+				})
+				if read(t, h, x) {
+					t.Errorf("moved from %s to %s as it read, x may see the labeled cluster, though it never held both its grant and its value", from, to)
+				}
+				if !moved {
+					t.Fatal("the read reached no hook")
+				}
+			}
+		})
+	}
+}
+
+// Under its locks a change checks its actor's power on a labeled scope and the label's values as
+// of one moment. Here the actor's own value is revoked before the change's transaction, and once
+// the transaction has read its power, it moves from the group giving that power to the group
+// holding the value: at no moment there did it hold both, so the change is refused.
+func TestAChangeChecksALabelByTheValuesHeldWithItsPower(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	guard := rbac.RoleDefinition{ID: "cluster.guard", Permissions: []rbac.Permission{rbac.DenyPermission("cluster")}, ResourceTypes: []string{"cluster"}}
+	for name, change := range map[string]func(h *harness, x rbac.Subject, to string) error{
+		"Apply": func(h *harness, x rbac.Subject, to string) error {
+			return h.authz.Apply(h.ctx, x, secret, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity(to)}}})
+		},
+		"SetDeny": func(h *harness, x rbac.Subject, to string) error {
+			return h.authz.SetDeny(h.ctx, x, secret, rbac.Deny{ID: to, Principals: []rbac.Principal{identity(to)}, Permissions: []rbac.Permission{root}})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := labeled(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), guard) })
+			h.seed(t, grant(cluster.Scope(), "cluster.admin", rbac.Group, "leads"), grant(cluster.Scope(), guard.ID, rbac.Group, "leads"),
+				grant(rbac.TenantRoot("t1"), "level.high", rbac.Group, "cleared"))
+			x := h.as(t, "x", "leads")
+			h.hold(t, "x", "level:high")
+			h.as(t, "u")
+			h.as(t, "v")
+			if err := change(h, x, "v"); err != nil {
+				t.Fatalf("x holds the power and the value: %v", err)
+			}
+			moved := false
+			rbac.SetReadingRoles(t, func() {
+				// The change's transaction holds a connection of the test's pool; its reads before it
+				// hold none once read.
+				if h.pool.Stat().AcquiredConns() == 0 {
+					if _, err := h.pool.Exec(h.ctx, `DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:x' AND role = 'level.high'`); err != nil {
+						t.Error(err)
+					}
+					return
+				}
+				if moved {
+					return
+				}
+				moved = true
+				if _, err := h.pool.Exec(h.ctx, `WITH gone AS (DELETE FROM rbac_members WHERE tenant = 't1' AND group_id = 'leads' AND principal = 'user:x')
+					INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'cleared', 'user', 'x')`); err != nil {
+					t.Error(err)
+				}
+			})
+			err := change(h, x, "u")
+			if !moved {
+				t.Fatal("the change read its power in its transaction without reaching the hook")
+			}
+			if !errors.Is(err, rbac.ErrDenied) {
+				t.Errorf("the change was made, by an actor that held its power and the label's value at no moment: %v", err)
+			}
+		})
+	}
+}
+
+// Under the activation's locks an approver is checked as one of the approvers and as holding the
+// label's values as of one moment. Here its own value is revoked before the transaction, and once
+// the transaction has read its groups, it moves from the approving group to the group holding the
+// value: it never was both, so it approves nothing.
+func TestAnApproverIsCheckedAsOneOfTheApproversHoldingTheValuesAtOnce(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	h := labeled(t, func(c *rbac.Config) {
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s == secret.Scope() {
+				return secret, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	h.hold(t, "owner", "level:high")
+	u := h.as(t, "u")
+	h.hold(t, "u", "level:high")
+	h.seed(t, grant(rbac.TenantRoot("t1"), "level.high", rbac.Group, "cleared"))
+	approver := h.as(t, "approver", "approvers")
+	h.hold(t, "approver", "level:high")
+	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), secret, rbac.Eligibility{
+		Role: "cluster.login", Principal: u.Principal, MaxDuration: time.Hour, Approvers: []rbac.Principal{groupOf("approvers")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	activate := func() error {
+		_, err := h.authz.Activate(ctx, u, secret, rbac.Activation{Role: "cluster.login", Duration: time.Minute, Justification: "on call", Approver: approver})
+		return err
+	}
+	if err := activate(); err != nil {
+		t.Fatalf("approved by one of the approvers holding the value: %v", err)
+	}
+	if err := h.authz.Deactivate(ctx, u, secret, "cluster.login"); err != nil {
+		t.Fatal(err)
+	}
+	inTx := func() bool { return h.pool.Stat().AcquiredConns() > 0 }
+	rbac.SetReadingRoles(t, func() {
+		if !inTx() {
+			if _, err := h.pool.Exec(h.ctx, `DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:approver' AND role = 'level.high'`); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	moved := false
+	rbac.SetReadingKeys(t, func() {
+		if !inTx() || moved {
+			return
+		}
+		moved = true
+		if _, err := h.pool.Exec(h.ctx, `WITH gone AS (DELETE FROM rbac_members WHERE tenant = 't1' AND group_id = 'approvers' AND principal = 'user:approver')
+			INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'cleared', 'user', 'approver')`); err != nil {
+			t.Error(err)
+		}
+	})
+	err := activate()
+	if !moved {
+		t.Fatal("the activation read its approver's groups in its transaction without reaching the hook")
+	}
+	if !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("approved by one that never was an approver holding the label's value: %v", err)
+	}
+}
+
+// Under its locks a change to a labeled group, or to its members, checks its actor's power over
+// groups and the group's label values as of one moment. Here the actor's own value is revoked once
+// the change has checked it before its transaction, and once the transaction has read its power,
+// it moves from the group giving that power to the group holding the value: at no moment did it
+// hold both, so the change is refused.
+func TestAChangeToALabeledGroupChecksItsLabelByTheValuesHeldWithThePower(t *testing.T) {
+	vault := rbac.Resource{Tenant: "t1", Type: rbac.GroupScope, ID: "vault", Labels: rbac.Label{"level": {"high"}}}
+	for name, change := range map[string]func(h *harness, x rbac.Subject) error{
+		"ChangeMembers": func(h *harness, x rbac.Subject) error {
+			return h.authz.ChangeMembers(h.ctx, x, "t1", []rbac.Member{{Group: "vault", Principal: identity("u")}}, nil)
+		},
+		"SetGroup": func(h *harness, x rbac.Subject) error {
+			return h.authz.SetGroup(h.ctx, x, "t1", rbac.GroupDefinition{ID: "vault", Name: "Vault"})
+		},
+		"DeleteGroup": func(h *harness, x rbac.Subject) error { return h.authz.DeleteGroup(h.ctx, x, "t1", "vault") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			var revoke func()
+			h := labeled(t, func(c *rbac.Config) {
+				c.Catalog = append(slices.Clone(c.Catalog), groupMembers,
+					rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}})
+				resourceOf := c.ResourceOf
+				c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+					if s == vault.Scope() {
+						return vault, nil
+					}
+					return resourceOf(ctx, tenant, s)
+				}
+				// Asked about x's value before the transaction alone, once the change has read it.
+				c.Constraints = []rbac.Constraint{{Name: "meanwhile", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+					if do := revoke; do != nil && in.Permission == "level:high" {
+						do()
+					}
+					return false, nil
+				}}}
+			})
+			h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.Group, "leads"), grant(rbac.TenantRoot("t1"), "group.members", rbac.Group, "leads"),
+				grant(rbac.TenantRoot("t1"), "level.high", rbac.Group, "cleared"))
+			h.groups(t, "vault")
+			x := h.as(t, "x", "leads")
+			h.hold(t, "x", "level:high")
+			h.as(t, "u")
+			revoke = func() {
+				if _, err := h.pool.Exec(h.ctx, `DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:x' AND role = 'level.high'`); err != nil {
+					t.Error(err)
+				}
+			}
+			moved := false
+			rbac.SetReadingRoles(t, func() {
+				// The change's transaction holds a connection of the test's pool; its reads before it
+				// hold none once read.
+				if h.pool.Stat().AcquiredConns() == 0 || moved {
+					return
+				}
+				moved = true
+				if _, err := h.pool.Exec(h.ctx, `WITH gone AS (DELETE FROM rbac_members WHERE tenant = 't1' AND group_id = 'leads' AND principal = 'user:x')
+					INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'cleared', 'user', 'x')`); err != nil {
+					t.Error(err)
+				}
+			})
+			err := change(h, x)
+			if !moved {
+				t.Fatal("the change read its power in its transaction without reaching the hook")
+			}
+			if !errors.Is(err, rbac.ErrDenied) {
+				t.Errorf("the change was made, by an actor that held its power and the group's label value at no moment: %v", err)
+			}
+		})
+	}
+}
+
+// Under its locks a removal from a group granted on a labeled scope checks the scope's label by the
+// actor's values as it held its power over the group's members. Here the actor's own value is
+// revoked once the removal has checked it before its transaction, and once the transaction has read
+// its power, it moves from the group giving that power to the group holding the value: at no moment
+// did it hold both, so the removal is refused.
+func TestARemovalChecksTheLabelItReachesByTheValuesHeldWithThePower(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	var revoke func()
+	h := labeled(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s == secret.Scope() {
+				return secret, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+		// Asked about x's value before the transaction alone, once the removal has read it.
+		c.Constraints = []rbac.Constraint{{Name: "meanwhile", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if do := revoke; do != nil && in.Permission == "level:high" {
+				do()
+			}
+			return false, nil
+		}}}
+	})
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.Group, "leads"), grant(rbac.TenantRoot("t1"), "level.high", rbac.Group, "cleared"),
+		grant(cluster.Scope(), "cluster.login", rbac.Group, "readers"))
+	x := h.as(t, "x", "leads")
+	h.hold(t, "x", "level:high")
+	h.as(t, "u", "readers")
+	revoke = func() {
+		if _, err := h.pool.Exec(h.ctx, `DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:x' AND role = 'level.high'`); err != nil {
+			t.Error(err)
+		}
+	}
+	moved := false
+	rbac.SetReadingRoles(t, func() {
+		// The removal's transaction holds a connection of the test's pool; its reads before it hold
+		// none once read.
+		if h.pool.Stat().AcquiredConns() == 0 || moved {
+			return
+		}
+		moved = true
+		if _, err := h.pool.Exec(h.ctx, `WITH gone AS (DELETE FROM rbac_members WHERE tenant = 't1' AND group_id = 'leads' AND principal = 'user:x')
+			INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'cleared', 'user', 'x')`); err != nil {
+			t.Error(err)
+		}
+	})
+	err := h.authz.ChangeMembers(h.ctx, x, "t1", nil, []rbac.Member{{Group: "readers", Principal: identity("u")}})
+	if !moved {
+		t.Fatal("the removal read its power in its transaction without reaching the hook")
+	}
+	if !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("the removal was made, by an actor that held its power and the scope's label value at no moment: %v", err)
+	}
+}
+
+// A deny of a label value reads the tenant as checks decide the value, its type, id and tenant
+// included, when the actor hands the value on as when it uses it: one whose condition is false
+// there takes nothing the actor hands on, as it takes nothing it uses, and one that holds there, or
+// reads the tenant's attributes, takes both, whatever tenant a change passes.
+func TestALabelValuesDenyReadsTheTenantAsChecksDoWhenTheValueIsHandedOn(t *testing.T) {
+	h := labeled(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), tenantGuard) })
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.guard", rbac.User, "guardian"))
+	guardian, bob := h.as(t, "guardian"), h.as(t, "bob")
+	passed := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1", Attributes: map[string]any{"region": "eu"}}
+	for i, c := range []struct {
+		expr string
+		held bool
+	}{
+		{`resource.id == "t2"`, true},
+		{`resource.tenant != "t1"`, true},
+		{`resource.type != "tenant"`, true},
+		{`resource.id == "t1"`, false},
+		{`resource.attributes.region == "eu"`, false},
+	} {
+		actor := h.as(t, fmt.Sprint("actor", i))
+		h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.admin", rbac.User, actor.Principal.ID))
+		h.hold(t, actor.Principal.ID, "level:high")
+		if err := h.authz.SetDeny(ctx, guardian, tenantT1, rbac.Deny{
+			ID: fmt.Sprint("deny", i), Principals: []rbac.Principal{actor.Principal}, Permissions: []rbac.Permission{"level:high"},
+			Condition: rbac.Condition{Expression: c.expr},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		for _, tenant := range []rbac.Resource{tenantT1, passed} {
+			if allowed(t, h, actor, "level:high", tenant) != c.held {
+				t.Fatalf("%s: a check of the value allows it: %v", c.expr, !c.held)
+			}
+			roles, err := h.authz.Grantable(ctx, actor, tenant)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if slices.ContainsFunc(roles, func(r rbac.RoleDefinition) bool { return r.ID == "level.high" }) != c.held {
+				t.Errorf("%s, on %v: Grantable offers level.high: %v, though the actor holds it: %v", c.expr, tenant.Attributes, !c.held, c.held)
+			}
+			err = h.authz.Apply(ctx, actor, tenant, rbac.Change{Grant: []rbac.Binding{{Role: "level.high", Principal: bob.Principal}}})
+			if (err == nil) != c.held || err != nil && !errors.Is(err, rbac.ErrDenied) {
+				t.Errorf("%s, on %v: handing on level:high, which the actor holds: %v: %v", c.expr, tenant.Attributes, c.held, err)
+			}
+		}
+	}
+}
+
+// Holders of a labeled resource reads the label values of every identity it lists in one
+// statement, however many they are, and decides each as a read of one decides it: by its grants
+// on the tenant and its groups', through those they are in, under the denies binding it there,
+// marking one a condition decides.
+func TestHoldersOfALabeledResourceReadEveryHoldersValuesAtOnce(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	list := func(t *testing.T, others int) (map[string]bool, int) {
+		t.Helper()
+		h := labeled(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), tenantGuard) })
+		ctx := t.Context()
+		h.groups(t, "big", "cleared", "inner")
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'cleared', 'group', 'inner')`); err != nil {
+			t.Fatal(err)
+		}
+		conditional := grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "conditional")
+		conditional.Condition = rbac.Condition{Expression: `request.attributes.mfa == true`}
+		h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "big"), grant(rbac.TenantRoot("t1"), "level.high", rbac.Group, "cleared"),
+			grant(rbac.TenantRoot("t1"), "tenant.guard", rbac.User, "guardian"), conditional)
+		for id, groups := range map[string][]string{
+			"direct": {"big"}, "nested": {"big", "inner"}, "lower": {"big"}, "none": {"big"}, "conditional": {"big"},
+			"denied": {"big", "cleared"}, "exempt": {"big", "cleared"},
+		} {
+			h.as(t, id, groups...)
+		}
+		h.hold(t, "direct", "level:high")
+		h.hold(t, "lower", "level:mid")
+		if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), tenantT1, rbac.Deny{
+			ID: "cleared", Principals: []rbac.Principal{groupOf("cleared")}, Exempt: []rbac.Principal{identity("exempt"), groupOf("inner")},
+			Permissions: []rbac.Permission{"level:*"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		manyMembers(t, h, others, `, places AS (INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) SELECT 't1', 'big', 'user', id FROM others)
+			SELECT 1`, "rbac_members")
+		reads := 0
+		rbac.SetReadingRoles(t, func() { reads++ })
+		holders, err := h.authz.Holders(ctx, view, secret)
+		if err != nil {
+			t.Fatal(err)
+		}
+		listed := map[string]bool{}
+		for _, hd := range holders {
+			listed[hd.Principal.ID] = hd.MaybeDenied
+		}
+		return listed, reads
+	}
+	want := map[string]bool{"direct": false, "nested": false, "exempt": false, "conditional": true}
+	few, n := list(t, 0)
+	if !maps.Equal(few, want) {
+		t.Errorf("Holders = %v, by MaybeDenied, of %v", few, want)
+	}
+	many, m := list(t, 200)
+	if !maps.Equal(many, want) {
+		t.Errorf("among 200 more members: Holders = %v, by MaybeDenied, of %v", many, want)
+	}
+	if m != n {
+		t.Errorf("Holders read grants %d times among 7 members, and %d among 207", n, m)
+	}
+}

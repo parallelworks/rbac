@@ -56,18 +56,6 @@ func labelRefusal(dim string) string {
 	return "the resource's label asks for values in " + dim + " the subject doesn't hold"
 }
 
-// unsatisfied returns the dimension of r's label that s's holding doesn't satisfy, or "".
-func (a *Authorizer) unsatisfied(ctx context.Context, s Subject, r Resource) (string, error) {
-	if !r.Labels.asks() {
-		return "", nil
-	}
-	h, _, err := a.holding(ctx, r.Tenant, s)
-	if err != nil {
-		return "", err
-	}
-	return h.Unsatisfied(r.Labels), nil
-}
-
 // labelDimension is a dimension as checks read it: each value's rank, lowest 0.
 type labelDimension struct {
 	rule      LabelRule
@@ -328,6 +316,11 @@ func (a *Authorizer) holding(ctx context.Context, tenant string, s Subject) (Hol
 	return a.holdingOn(ctx, a.db, s, a.constrain(ctx, s, tenantResource(tenant)))
 }
 
+// holdingOf is holding decided by v, read with s's other grants.
+func (a *Authorizer) holdingOf(ctx context.Context, tenant string, s Subject, v *valuesRead) (Holding, map[Permission]bool, error) {
+	return a.holdingFrom(ctx, a.db, s, a.constrain(ctx, s, tenantResource(tenant)), v)
+}
+
 // tenantResource is the tenant as a resource with no attributes, ancestors or label.
 func tenantResource(tenant string) Resource {
 	return Resource{Tenant: tenant, Type: TenantScope, ID: tenant}
@@ -353,14 +346,54 @@ func (a *Authorizer) decidedOn(p Permission, r Resource) Resource {
 
 // holdingOn is holding read on q, asking the constraints through cs, which is on the tenant.
 func (a *Authorizer) holdingOn(ctx context.Context, q DB, s Subject, cs *constrained) (Holding, map[Permission]bool, error) {
+	h, byCondition, _, err := a.holdingRead(ctx, q, s, cs, false)
+	return h, byCondition, err
+}
+
+// holdingRead is holdingOn, and with keys and labels declared, s's keys in the tenant, as keysOf
+// reads them, in the statement that reads what its values are decided by, so they are of one
+// moment.
+func (a *Authorizer) holdingRead(ctx context.Context, q DB, s Subject, cs *constrained, keys bool) (Holding, map[Permission]bool, []string, error) {
+	if len(a.labels) == 0 {
+		h, byCondition, err := a.holdingFrom(ctx, q, s, cs, nil)
+		return h, byCondition, nil, err
+	}
 	tenant := cs.on.Tenant
-	h := Holding{tenant: tenant, dims: a.labels, values: map[string]map[string]bool{}, releases: map[string]bool{}, excluded: map[string]bool{}}
+	got, err := a.readHeld(ctx, q, tenant, s, all, []string{TenantRoot(tenant).Key()}, "", namedRoles, alsoRead{keys: keys})
+	if err != nil {
+		return Holding{}, nil, nil, err
+	}
+	readingRoles()
+	h, byCondition, err := a.holdingFrom(ctx, q, s, cs, &valuesRead{held: got.held, ds: got.ds, roles: got.roles})
+	return h, byCondition, got.keys, err
+}
+
+// valuesOn reads on q what s's label values in a tenant are decided by, the conditions of its
+// conditional grants too, so a read of one snapshot decides them as of it.
+func (a *Authorizer) valuesOn(ctx context.Context, q DB, tenant string, s Subject) (*valuesRead, error) {
+	if len(a.labels) == 0 {
+		return &valuesRead{roles: a.builtinBook()}, nil
+	}
+	held, ds, roles, err := a.heldOrDenied(ctx, q, tenant, s, all, []string{TenantRoot(tenant).Key()}, namedRoles, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.conditionsOf(ctx, q, tenant, held); err != nil {
+		return nil, err
+	}
+	return &valuesRead{held: held, ds: ds, roles: roles}, nil
+}
+
+// holdingFrom is holdingOn deciding by v, read with s's other grants, reading on q the conditions
+// not read with it.
+func (a *Authorizer) holdingFrom(ctx context.Context, q DB, s Subject, cs *constrained, v *valuesRead) (Holding, map[Permission]bool, error) {
+	h := Holding{tenant: cs.on.Tenant, dims: a.labels, values: map[string]map[string]bool{}, releases: map[string]bool{}, excluded: map[string]bool{}}
 	if len(a.labels) == 0 {
 		return h, nil, nil
 	}
 	// Only the values and the powers to release, so neither the constraints nor the conditions of
 	// the tenant's other permissions are asked about.
-	perms, byCondition, excluded, err := a.permissionsOf(ctx, q, s, cs.on, a.labelPermission, cs)
+	perms, byCondition, excluded, err := a.permissionsOf(ctx, q, s, cs.on, a.labelPermission, cs, v.held, v.ds, v.roles)
 	if err != nil {
 		return Holding{}, nil, err
 	}
