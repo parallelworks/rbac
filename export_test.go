@@ -1,6 +1,7 @@
 package rbac
 
 import (
+	"runtime"
 	"testing"
 	"time"
 
@@ -217,6 +218,30 @@ func ConditionCostOn(t *testing.T, expr string, s Subject, p Permission, r Resou
 	a := &Authorizer{cfg: Config{Now: time.Now}, conds: c}
 	vars := a.vars(WithRequest(t.Context(), attributes), s, p, r)
 	return prg.limit, evaluate(program{Program: unlimited, limit: maxCost}, vars).cost
+}
+
+// EvaluateCondition evaluates expr as a check does, on a request with attributes, which the
+// resource carries too, and reports whether it held, whether it could be evaluated and the bytes
+// evaluating it allocated, or why it isn't a condition.
+func EvaluateCondition(t *testing.T, expr string, attributes map[string]any) (held, evaluated bool, allocated uint64, err error) {
+	t.Helper()
+	c, err := newConditions(Attributes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prg, err := c.build(expr)
+	if err != nil {
+		return false, false, 0, err
+	}
+	a := &Authorizer{cfg: Config{Now: time.Now}, conds: c}
+	vars := a.vars(WithRequest(t.Context(), attributes), Subject{Principal: Principal{Kind: User, ID: "u"}}, "cluster:login",
+		Resource{Tenant: "t", Type: "cluster", ID: "c", Attributes: attributes})
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	r := evaluate(prg, vars)
+	runtime.ReadMemStats(&after)
+	return r.held, r.evaluated, after.TotalAlloc - before.TotalAlloc, nil
 }
 
 // compiled is expr as c compiles it, and the sizes of its patterns.

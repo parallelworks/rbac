@@ -40,8 +40,9 @@ import (
 // tenant's: any read of resource.attributes fails, a test of an attribute's presence, in, size(), a
 // macro and a comparison included, so a grant's gives nothing and a deny's applies. The zero
 // Condition is none, and one with a title or description has an expression. A pattern it matches is
-// a string literal, of bounded size; it nests at most 32 deep; and a comparison, or a search of a
-// list, that would read more than a condition may spend fails before it runs.
+// a string literal, of bounded size; it nests at most 32 deep; it builds no message, as
+// `google.protobuf.Struct{}`; and a comparison, or a search of a list, that would read more than a
+// condition may spend fails before it runs.
 //
 // Each condition runs within the most evaluating it can cost, which its literals and types bound:
 // little for one comparing what a request passes with literals, or with the subject's kind or id,
@@ -381,6 +382,14 @@ func (c *conditions) build(expr string) (program, error) {
 	if checked.OutputType() != cel.BoolType {
 		return program{}, fmt.Errorf("%w: is %s, not a bool", errCondition, checked.OutputType())
 	}
+	// A message literal, as google.protobuf.ListValue{values: ...}, converts the values its fields
+	// are given whole, and an Any unpacks its bytes, though CEL charges either a constant however
+	// large they are; a value the host passes that holds itself it converts until the stack
+	// overflows, which no recover catches. What a condition reads is maps, lists, strings and
+	// times, which need none.
+	if len(ast.MatchDescendants(ast.NavigateAST(checked.NativeRep()), ast.KindMatcher(ast.StructKind))) > 0 {
+		return program{}, fmt.Errorf("%w: it builds a message", errCondition)
+	}
 	patterns, err := checkPatterns(checked)
 	if err != nil {
 		return program{}, fmt.Errorf("%w: %w", errCondition, err)
@@ -619,13 +628,6 @@ func (w worst) walk(e ast.Expr) (uint64, extent) {
 			}
 		}
 		return n, x
-	case ast.StructKind:
-		n := uint64(40)
-		for _, f := range e.AsStruct().Fields() {
-			c, _ := w.walk(f.AsStructField().Value())
-			n = cost.SafeAdd(n, c)
-		}
-		return n, w.typed(e)
 	case ast.ComprehensionKind:
 		return w.comprehension(e)
 	case ast.CallKind:

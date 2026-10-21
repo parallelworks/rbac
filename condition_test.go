@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
@@ -564,6 +566,103 @@ func TestAConditionNestedTooDeeplyIsRefused(t *testing.T) {
 	}
 }
 
+// A message literal converts the values its fields are given whole, as an Any unpacks its bytes,
+// which CEL charges a constant for however large they are: a deny converting a list the request
+// passes held a check for seconds, though within its bound. Building one is no condition, declared
+// attributes or not, and one stored before fails: a grant's gives nothing, and a deny's applies.
+func TestAConditionBuildingAMessageIsRefused(t *testing.T) {
+	declared := rbac.Attributes{Request: map[string]rbac.AttributeType{"l": rbac.AttrStrings, "m": rbac.AttrStringMap, "s": rbac.AttrString}}
+	for _, declares := range []rbac.Attributes{{}, declared} {
+		h := setup(t, func(c *rbac.Config) {
+			c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
+			c.Attributes = declares
+		})
+		ctx := t.Context()
+		h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+		for _, expr := range []string{
+			`google.protobuf.ListValue{values: request.attributes.l} != []`,
+			`google.protobuf.Struct{fields: request.attributes.m} != {}`,
+			`google.protobuf.Value{list_value: google.protobuf.ListValue{values: request.attributes.l}} != null`,
+			`google.protobuf.Any{type_url: "type.googleapis.com/google.protobuf.ListValue", value: bytes(request.attributes.s)} != []`,
+			`[1, 2, 3].all(i, google.protobuf.ListValue{values: request.attributes.l} != [])`,
+			`google.protobuf.Struct{fields: {"a": 1.0}} == {"a": 1.0} && .google.protobuf.Timestamp{seconds: 1} < request.time`,
+		} {
+			c := rbac.Condition{Expression: expr}
+			g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+			g.Condition = c
+			if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{g}); !errors.Is(err, rbac.ErrInvalid) {
+				t.Errorf("Import of %s: %v", expr, err)
+			}
+			if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{g.Binding}}); !errors.Is(err, rbac.ErrInvalid) {
+				t.Errorf("Apply of %s: %v", expr, err)
+			}
+			d := rbac.Deny{ID: "d", Principals: []rbac.Principal{identity("v")}, Permissions: []rbac.Permission{login}, Condition: c}
+			if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, d); !errors.Is(err, rbac.ErrInvalid) {
+				t.Errorf("SetDeny of %s: %v", expr, err)
+			}
+			e := rbac.Eligibility{Role: "cluster.login", Principal: identity("w"), MaxDuration: time.Hour, Requires: expr}
+			if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, e); !errors.Is(err, rbac.ErrInvalid) {
+				t.Errorf("SetEligibility of %s: %v", expr, err)
+			}
+		}
+	}
+	// Written directly, as stored before.
+	h := setup(t)
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "v"))
+	for _, stmt := range []string{
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+		 VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'cluster.login', 'google.protobuf.ListValue{values: request.attributes.l} != []')`,
+		`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions, condition)
+		 VALUES ('t1', 'cluster', 'c1', 'd', '{user:v}', '{cluster:login}', 'google.protobuf.ListValue{values: request.attributes.l} == []')`,
+	} {
+		if _, err := h.pool.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request := rbac.WithRequest(ctx, map[string]any{"l": []any{"a"}})
+	if err := h.authz.Authorize(request, h.as(t, "u"), login, cluster); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("a grant whose condition builds a message: %v", err)
+	}
+	if err := h.authz.Authorize(request, h.as(t, "v"), login, cluster); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("a deny whose condition builds a message: %v", err)
+	}
+}
+
+// A value the host passes that holds itself, as a graph of objects it converts may, fails each
+// condition reading it whole, as a comparison or a loop does, rather than recursing until the stack
+// overflows, which kills the process: no recover catches it. A message literal converted one so.
+// Each runs in a child process, so one that overflows fails this test rather than the test binary.
+func TestAValueHoldingItselfFailsItsConditions(t *testing.T) {
+	if expr := os.Getenv("RBAC_CONDITION_OF_A_CYCLE"); expr != "" {
+		m := map[string]any{"a": "b"}
+		m["self"] = m
+		l := []any{"x", nil}
+		l[1] = l
+		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"m": m, "l": l}); evaluated {
+			t.Errorf("%s evaluated, %v", expr, err)
+		}
+		return
+	}
+	for _, expr := range []string{
+		`google.protobuf.Struct{fields: request.attributes.m} != {}`,
+		`google.protobuf.ListValue{values: request.attributes.l} != []`,
+		`request.attributes.m == request.attributes.m`,
+		`request.attributes.l != request.attributes.l`,
+		`request.attributes.m in [request.attributes.m]`,
+		`[request.attributes.l] == [request.attributes.l] || {"a": request.attributes.m} == {"a": request.attributes.m}`,
+		`request.attributes.l.all(x, x == x)`,
+		`request.attributes.m.exists(k, request.attributes.m[k] == request.attributes.m)`,
+		`{"a": 1}[request.attributes.l] == 1 || {request.attributes.m: 1}[request.attributes.m] == 1`,
+	} {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestAValueHoldingItselfFailsItsConditions$")
+		cmd.Env = append(os.Environ(), "RBAC_CONDITION_OF_A_CYCLE="+expr)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Errorf("%s: %v\n%.2000s", expr, err, out)
+		}
+	}
+}
+
 func TestAConditionPastItsCostSpendsNoMoreThanItsOwnBound(t *testing.T) {
 	h := setup(t)
 	// Evaluated first, as it is the shorter: it reads a list it can't afford to.
@@ -995,7 +1094,6 @@ func TestStoredConditionsKeepTheirBounds(t *testing.T) {
 		{`[request.attributes.x] == [1] && {"a": request.attributes.x} == {"a": 1}`, 99},
 		{`[1, 2] + [3] == [1, 2, 3] && "a" + "b" == "ab" && size("abc") == 3 && action == "cluster:login"`, 52},
 		{`int("12") == 12 && string(1) == "1" && duration("1h") > duration("1m")`, 14},
-		{`google.protobuf.Struct{fields: {"a": 1.0}} == {"a": 1.0}`, 104},
 		{`[1, 2, 3].all(i, i > 0) && [1, 2, 3].exists_one(i, i == 2) && {"a": 1}.exists(k, k == "a")`, 128},
 		{`[[1, 2], [3]].all(l, l.all(i, i > 0))`, 86},
 		{`[1, 2, 3].map(x, x > 1, x * 2) == [4, 6]`, 108},
