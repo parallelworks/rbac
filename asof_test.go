@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"slices"
 	"strings"
 	"testing"
@@ -617,6 +618,74 @@ func TestAsOfReadsARowChangedInPlaceAsItsLastVersion(t *testing.T) {
 			return nil
 		}); err != nil {
 			t.Fatal(err)
+		}
+	}
+}
+
+// As of a time, a check, Permissions and Grantable seek their subject's grants on the resource's
+// path, however their statements are planned, beside thousands of its grants elsewhere, as one on
+// each cluster it created: history's index of a principal's versions held no scope, so in a history
+// of many tenants a plan read every version of the subject's grants to find the few on the path.
+func TestAsOfChecksSeekTheirSubjectsGrantsOnThePath(t *testing.T) {
+	h := crowded(t, pgtest.Open(t, ""))
+	ctx := t.Context()
+	u := h.as(t, "u")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	granted := 0
+	more := func(n int) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', 'k' || i, 'user', 'u', 'cluster.login' FROM generate_series($1::int + 1, $2::int) i`, granted, n); err != nil {
+			t.Fatal(err)
+		}
+		granted = n
+		if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants, rbac_history`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(at time.Time, plans string) map[string]int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		pages := map[string]int64{}
+		if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+			if _, err := tx.Exec(ctx, `SELECT set_config('plan_cache_mode', $1, true)`, plans); err != nil {
+				return err
+			}
+			for what, f := range map[string]func() error{
+				"Authorize":   func() error { return a.Authorize(ctx, u, login, cluster) },
+				"Permissions": func() error { return second(a.Permissions(ctx, u, cluster)) },
+				"Grantable":   func() error { return second(a.Grantable(ctx, u, cluster)) },
+			} {
+				start := historyPages(ctx, t, tx)
+				if err := f(); err != nil {
+					return fmt.Errorf("%s: %w", what, err)
+				}
+				pages[what+" planned "+plans] = historyPages(ctx, t, tx) - start
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return pages
+	}
+	plans := []string{"force_custom_plan", "force_generic_plan"}
+	more(500)
+	few := map[string]int64{}
+	at := dbNow(t, h)
+	for _, p := range plans {
+		maps.Copy(few, read(at, p))
+	}
+	more(5000)
+	at = dbNow(t, h)
+	for _, p := range plans {
+		for what, many := range read(at, p) {
+			if many > few[what]*3/2+deeper {
+				t.Errorf("as of a time, %s read %d pages of history beside 500 grants of its subject's on other clusters, and %d beside 5000", what, few[what], many)
+			}
 		}
 	}
 }
@@ -1275,6 +1344,174 @@ func TestMigratingLetsHistorysRoleCallWhatItsIndexCalls(t *testing.T) {
 	} {
 		if _, err := tx.Exec(ctx, sql); err != nil {
 			t.Fatalf("once migrated, %s: %v", sql, err)
+		}
+	}
+}
+
+// Migrating to 0019 locks history before it builds the grants' index, so a change that starts while
+// it builds and writes history before a grant, as DeleteScope removes a scope's eligibilities and
+// then its grants, waits for it to commit: locked once the index was built, history was the change's
+// while the change waited for the grants, so migrating gave way, having built the index, or
+// PostgreSQL ended one of the two as a deadlock.
+func TestMigratingThePrincipalSeeksWaitsForAChangeStartedAsItBuilds(t *testing.T) {
+	// Little memory to sort in, so building the index takes a while.
+	pool := pgtest.Open(t, "maintenance_work_mem=64kB")
+	ctx := t.Context()
+	migrateFiles(t, pool, "", "0019")
+	recordMigrations(t, pool, "0019")
+	// So a Migrate that gave way would give up at once.
+	rbac.SetMigrateAttempts(t, 1, time.Millisecond)
+	for _, q := range []string{
+		`ALTER TABLE rbac_grants DISABLE TRIGGER USER`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		  SELECT 't1', 'cluster', 'k' || i, 'user', 'u' || i, 'custom.r' FROM generate_series(1, 100000) i`,
+		`ALTER TABLE rbac_grants ENABLE TRIGGER USER`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		  VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'cluster.login')`,
+		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+		  VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'cluster.sudo', 3600)`,
+	} {
+		if _, err := pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := migrated(t, pool)
+	done := make(chan error, 1)
+	go func() { done <- rbac.Migrate(ctx, pool) }()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		var building bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_progress_create_index WHERE relid = 'rbac_grants'::regclass)`).Scan(&building); err != nil {
+			t.Fatal(err)
+		}
+		if building {
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("migrated before the grants' index was seen building: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("migrating never built the grants' index")
+		}
+	}
+	if err := h.authz.DeleteScope(ctx, host, "t1", cluster.Scope()); err != nil {
+		t.Errorf("deleting a scope while migrating builds the grants' index: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Errorf("Migrate while a scope is deleted: %v", err)
+	}
+}
+
+// As of a time, Filter, its condition, Reachable and Holders seek their subject's grants, and the
+// public's and the members' they count, on each listed type, in a history of one tenant or of many,
+// however their statements are planned: history's index of a principal's versions held no scope, so
+// a plan read every version of a principal's grants once for each type, a group's on thousands of
+// volumes for a list of clusters; and by history's index of scopes, every version on a type's
+// scopes in the tenant, the members' grants on thousands of clusters for the anonymous or a guest,
+// who count none of them.
+func TestAsOfSearchesSeekTheirPrincipalsGrantsOnEachType(t *testing.T) {
+	volumes := rbac.RoleDefinition{ID: "volume.admin", Permissions: []rbac.Permission{"volume:view"}, ResourceTypes: []string{"volume"}}
+	withVolumes := func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), volumes) }
+	for _, tenants := range []string{"one tenant", "many tenants"} {
+		for _, plans := range []string{"", "force_generic_plan"} {
+			t.Run(tenants+"/"+cmp.Or(plans, "as AsOf plans"), func(t *testing.T) {
+				var h *harness
+				if tenants == "many tenants" {
+					h = crowded(t, pgtest.Open(t, ""), withVolumes)
+				} else {
+					h = setup(t, withVolumes)
+				}
+				ctx := t.Context()
+				c0 := hostTable(t, h)[0]
+				g := h.guest(t, "g", "builders")
+				h.seed(t, grant(c0.Scope(), "cluster.login", rbac.User, "g"))
+				granted := 0
+				more := func(n int) {
+					t.Helper()
+					if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+						SELECT 't1', 'cluster', 'k' || i, 'members', 't1', 'cluster.login' FROM generate_series($1::int + 1, $2::int) i
+						UNION ALL SELECT 't1', 'volume', 'v' || i, 'group', 'builders', 'volume.admin' FROM generate_series($1::int + 1, $2::int) i`,
+						granted, n); err != nil {
+						t.Fatal(err)
+					}
+					granted = n
+					if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants, rbac_history`); err != nil {
+						t.Fatal(err)
+					}
+				}
+				read := func(at time.Time) map[string]int64 {
+					t.Helper()
+					pages := map[string]int64{}
+					searches := map[string]func(pgx.Tx, *rbac.Authorizer) error{
+						"Holders": func(_ pgx.Tx, a *rbac.Authorizer) error {
+							hs, err := a.Holders(ctx, view, c0)
+							if err == nil && !slices.Equal(holderPrincipals(hs), []rbac.Principal{g.Principal}) {
+								err = fmt.Errorf("Holders = %+v", hs)
+							}
+							return err
+						},
+					}
+					for who, c := range map[string]struct {
+						s    rbac.Subject
+						kept []string
+					}{"anonymous": {rbac.Subject{}, nil}, "guest": {g, []string{c0.ID}}} {
+						searches[who+" Filter"] = func(tx pgx.Tx, a *rbac.Authorizer) error {
+							pred, err := a.Filter(ctx, c.s, view, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+							if err != nil {
+								return err
+							}
+							rows, err := tx.Query(ctx, `SELECT id FROM clusters WHERE `+pred.SQL+` ORDER BY id`, pred.Args...)
+							if err != nil {
+								return err
+							}
+							ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+							if err == nil && !slices.Equal(ids, c.kept) {
+								err = fmt.Errorf("Filter kept %v", ids)
+							}
+							return err
+						}
+						searches[who+" Reachable"] = func(_ pgx.Tx, a *rbac.Authorizer) error {
+							reach, err := a.Reachable(ctx, c.s, view, "t1", "cluster")
+							if err == nil && len(reach.Scopes) != len(c.kept) {
+								err = fmt.Errorf("Reachable = %+v", reach)
+							}
+							return err
+						}
+					}
+					for what, f := range searches {
+						func() {
+							tx, err := h.pool.Begin(ctx)
+							if err != nil {
+								t.Fatal(err)
+							}
+							defer func() { _ = tx.Rollback(ctx) }()
+							if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+								if plans != "" {
+									if _, err := tx.Exec(ctx, `SELECT set_config('plan_cache_mode', $1, true)`, plans); err != nil {
+										return err
+									}
+								}
+								start := historyPages(ctx, t, tx)
+								err := f(tx, a)
+								pages[what] = historyPages(ctx, t, tx) - start
+								return err
+							}); err != nil {
+								t.Fatalf("%s: %v", what, err)
+							}
+						}()
+					}
+					return pages
+				}
+				more(500)
+				few := read(dbNow(t, h))
+				more(5000)
+				for what, many := range read(dbNow(t, h)) {
+					if many > few[what]*3/2+deeper {
+						t.Errorf("as of a time, %s read %d pages of history beside 500 grants of the members' on clusters and of a group of the guest's on volumes, and %d beside 5000", what, few[what], many)
+					}
+				}
+			})
 		}
 	}
 }

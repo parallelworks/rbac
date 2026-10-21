@@ -411,16 +411,17 @@ change that counts from its start. A prepared transaction, which `pg_stat_activi
 has ended only once it is committed or rolled back: `pg_prepared_xacts` lists it until then, by when
 it was prepared, not when it began. `AsOf` makes no change: one tried is no actor's attempt, and
 `Config.OnRefused` isn't told of it. A statement reads the history of the rows it names, as a check
-does its subject's grants, groups and the denies on its resource's path, a search the custom roles
-its grants name, and `Holders` the members of the groups it lists, not the whole tenant's: `AsOf`
-plans every statement in its transaction for its arguments, the host's too, since a connection's
-cached plan of a statement it has run often counts any tenant as an average one. A list counts the
-denies on scopes of its types by history's versions of them, at most a few, and `Grantable`, which
-can offer any custom role, reads each version of every one once. It orders a row's changes by their
-ids in `rbac_history`, which sessions take out of order once that table's id sequence caches more
-than one, so `AsOf` refuses that. Its read's hooks run in its transaction, which holds one of the
-pool's connections: a constraint there queries the `DB` it is given, as one that queries the pool
-waits for another connection, which a busy pool may never free.
+does its subject's grants, groups and the denies on its resource's path, a search its subject's
+grants, and the public's and the members' it counts, on each type it lists, and the custom roles
+they name, and `Holders` the members of the groups it lists, not the whole tenant's: `AsOf` plans
+every statement in its transaction for its arguments, the host's too, since a connection's cached
+plan of a statement it has run often counts any tenant as an average one. A list counts the denies
+on scopes of its types by history's versions of them, at most a few, and `Grantable`, which can
+offer any custom role, reads each version of every one once. It orders a row's changes by their ids
+in `rbac_history`, which sessions take out of order once that table's id sequence caches more than
+one, so `AsOf` refuses that. Its read's hooks run in its transaction, which holds one of the pool's
+connections: a constraint there queries the `DB` it is given, as one that queries the pool waits
+for another connection, which a busy pool may never free.
 
 `rbac.PruneHistory(ctx, db, before, through)` deletes what an export has read past (`through`, its
 cursor) and later records supersede: of each row, the last version at or before `before` stays, so
@@ -537,6 +538,12 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   migrating while it holds what the rebuild waits for: the rebuild gives way, unless the
   transaction began waiting long enough before it, as while migrating reads a long history's deny
   records, for its `deadlock_timeout` to pass first, and PostgreSQL ends the transaction.
+  `0019_principal_seeks` builds an index on `rbac_grants`, which keeps writes to it waiting until it
+  commits, though reads go on, and rebuilds history's index of a principal's versions, which reads
+  all of history, and analyzes it. It locks `rbac_grants` and then history before it builds either,
+  so reads of history, and every change, as each writes history, wait until it commits too, and only
+  a transaction under way as it starts that read history or made a change, as deleting a scope's
+  eligibilities and then its grants does, and then writes a grant can make it give way.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
   between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows

@@ -208,7 +208,11 @@ erDiagram
   grants is an index-only scan. The indexes by scope and by principal lead to both too and hold the
   same, so a connection's cached statement, once PostgreSQL plans it generically by the tables'
   averages, still reads only the subject's grants on the path, from the index alone, whichever
-  index it picks.
+  index it picks. A search decides which custom roles the public's and the tenant's members' grants
+  name before its statement, from `rbac_grants_custom_principal`, which holds only grants of custom
+  roles, by principal and scope, and reads only those its subject counts: the anonymous and a guest
+  read none of the members', and a search of a permission no public role gives none of the
+  public's, so their grants of built-in roles on thousands of resources cost it nothing.
 - **A read of a list of keys reads each key's rows on its own** (`byKey`), as of a list's scopes
   or principals, of the denies on a check's path, of `Activate`'s eligibilities and of the rows
   `DeleteScopes`, `DeletePrincipal` and `DeleteGroups` remove, and so does a walk through nested
@@ -665,9 +669,11 @@ flowchart LR
 - **AsOf** stands temporary views of history in for the tables, in a transaction it rolls back,
   so every check, list and search answers as it would have at a past time, with the catalog and
   the label dimensions as they are now. Each statement reads history by the rows it names, through
-  history's indexes, as a search the custom roles its grants name, by their ids. The view of
-  custom roles takes each one's newest version, testing none for a later one, so `Grantable`,
-  which can offer any, reads each version once.
+  history's indexes, as a search the custom roles its grants name, by their ids, and its principals'
+  grants by principal and type, which history's index of a principal's versions holds beside the
+  scope, as a check seeks them on its resource's path. The view of custom roles takes each one's
+  newest version, testing none for a later one, so `Grantable`, which can offer any, reads each
+  version once.
 - **PruneHistory** deletes only what an export has read and later versions supersede. It keeps
   each row's last version at or before its time, so AsOf answers as before for any later time,
   and refuses an earlier one; of a row whose last version by then ended it, it deletes every

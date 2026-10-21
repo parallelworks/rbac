@@ -3397,43 +3397,107 @@ func TestChecksReadTheirGrantsFromAnIndexAlone(t *testing.T) {
 						SELECT 't1', 'tenant', 't1', 'user', id, 'cluster.login' FROM others`, "rbac_grants")
 				}
 			}
-			// So the visibility map lets a scan of an index skip the rows. VACUUM marks none visible to
-			// all while an older snapshot elsewhere in the database, such as another run's, is open.
-			for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(time.Second) {
-				if _, err := h.pool.Exec(ctx, `VACUUM rbac_grants`); err != nil {
-					t.Fatal(err)
-				}
-				var visible bool
-				if err := h.pool.QueryRow(ctx, `SELECT relallvisible >= relpages FROM pg_class WHERE oid = 'rbac_grants'::regclass`).Scan(&visible); err != nil {
-					t.Fatal(err)
-				}
-				if visible {
-					break
-				}
-				if time.Now().After(deadline) {
-					t.Skip("an older snapshot elsewhere in the database keeps rbac_grants' rows from being visible to all")
-				}
-			}
+			grantsVisibleToAll(t, h)
 			tx, err := h.pool.Begin(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer func() { _ = tx.Rollback(ctx) }()
-			// The pages of the table itself, not its indexes: its rows and its visibility map.
-			rows := func() int64 {
-				t.Helper()
-				var n int64
-				if err := tx.QueryRow(ctx, `SELECT pg_stat_get_xact_blocks_fetched('rbac_grants'::regclass)`).Scan(&n); err != nil {
-					t.Fatal(err)
-				}
-				return n
-			}
-			start := rows()
+			start := grantRowsRead(ctx, t, tx)
 			if err := h.authz.WithTx(tx).Authorize(ctx, ann, login, cluster); err != nil {
 				t.Fatal(err)
 			}
-			if read := rows() - start; read > int64(held/4) {
+			if read := grantRowsRead(ctx, t, tx) - start; read > int64(held/4) {
 				t.Errorf("a check of a subject holding %d grants read %d pages of the table's rows", held, read)
+			}
+		})
+	}
+}
+
+// grantsVisibleToAll vacuums rbac_grants until its visibility map marks every row visible to all, so
+// a scan of an index can skip the rows. VACUUM marks none so while an older snapshot elsewhere in
+// the database, such as another run's, is open: then it skips the test.
+func grantsVisibleToAll(t *testing.T, h *harness) {
+	t.Helper()
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(time.Second) {
+		if _, err := h.pool.Exec(t.Context(), `VACUUM rbac_grants`); err != nil {
+			t.Fatal(err)
+		}
+		var visible bool
+		if err := h.pool.QueryRow(t.Context(), `SELECT relallvisible >= relpages FROM pg_class WHERE oid = 'rbac_grants'::regclass`).Scan(&visible); err != nil {
+			t.Fatal(err)
+		}
+		if visible {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Skip("an older snapshot elsewhere in the database keeps rbac_grants' rows from being visible to all")
+		}
+	}
+}
+
+// grantRowsRead is how many pages of rbac_grants itself, not its indexes, tx has read: its rows and
+// its visibility map.
+func grantRowsRead(ctx context.Context, t *testing.T, tx pgx.Tx) int64 {
+	t.Helper()
+	var n int64
+	if err := tx.QueryRow(ctx, `SELECT pg_stat_get_xact_blocks_fetched('rbac_grants'::regclass)`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// Filter, its condition in the host's query, and Reachable read their subject's grants from an index
+// alone, under a generic plan too, as a check does: they told the broad principals' grants by their
+// kind, which no index of the grants holds, so they read the row of each grant of the subject's on
+// the listed types, as one on each of thousands of clusters it created, which grants made at
+// different times have on pages of their own.
+func TestListingsReadTheirGrantsFromAnIndexAlone(t *testing.T) {
+	for _, plan := range []string{"force_custom_plan", "force_generic_plan"} {
+		t.Run(plan, func(t *testing.T) {
+			h := crowded(t, pgtest.Open(t, "plan_cache_mode="+plan))
+			ctx := t.Context()
+			hostTable(t, h)
+			u := h.as(t, "u")
+			// u's grants, each made beside others' grants, as grants made over time are.
+			const held = 1000
+			manyMembers(t, h, held, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+				SELECT 't1', 'cluster', id, 'user', id, 'cluster.login' FROM others
+				UNION ALL SELECT 't1', 'cluster', id, 'user', 'u', 'cluster.login' FROM others`, "rbac_grants")
+			grantsVisibleToAll(t, h)
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			a := h.authz.WithTx(tx)
+			for _, c := range []struct {
+				what string
+				f    func() error
+			}{
+				{"Filter and its condition", func() error {
+					pred, err := a.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+					if err != nil {
+						return err
+					}
+					var n int
+					return tx.QueryRow(ctx, `SELECT count(*) FROM clusters WHERE `+pred.SQL, pred.Args...).Scan(&n)
+				}},
+				{"Reachable", func() error {
+					reach, err := a.Reachable(ctx, u, login, "t1", "cluster")
+					if err == nil && len(reach.Scopes) != held {
+						err = fmt.Errorf("Reachable reached %d scopes", len(reach.Scopes))
+					}
+					return err
+				}},
+			} {
+				start := grantRowsRead(ctx, t, tx)
+				if err := c.f(); err != nil {
+					t.Fatalf("%s: %v", c.what, err)
+				}
+				if read := grantRowsRead(ctx, t, tx) - start; read > held/100 {
+					t.Errorf("%s of a subject holding %d grants read %d pages of the table's rows", c.what, held, read)
+				}
 			}
 		})
 	}
@@ -3618,6 +3682,120 @@ func TestSearchesReadAsMuchOnceAConnectionPlansThemGenerically(t *testing.T) {
 				}
 			}
 		}()
+	}
+}
+
+// Filter, Reachable and Holders read, of the grants to the tenant's members and the public, only
+// those of custom roles that their subject counts, under a generic plan and one for their arguments,
+// and as of a time: which custom roles those grants name was read from each of them on scopes of the
+// listed types, of built-in roles too, so beside the members' grants on thousands of clusters a
+// member's search read them all, and those of the anonymous and a guest, who count none of them; and
+// a search of a permission no public role gives read the public's.
+func TestSearchesReadOnlyTheBroadGrantsTheyCount(t *testing.T) {
+	for _, plan := range []string{"force_custom_plan", "force_generic_plan"} {
+		for _, broad := range []struct {
+			what string
+			// grants are the grants on clusters, of the numbers from $1 to $2.
+			grants string
+			p      rbac.Permission
+			// counting are the searches that count the grants, and so read them.
+			counting []string
+		}{
+			// Read by the members' key, or by the custom roles' index, either reads all of one or the
+			// other.
+			{
+				what: "the members' of a built-in role and others' of a custom role",
+				grants: `SELECT 't1', 'cluster', 'k' || i, 'members', 't1', 'cluster.login' FROM generate_series($1::int + 1, $2::int) i
+					UNION ALL SELECT 't1', 'cluster', 'o' || i, 'user', 'o' || i, 'custom.view' FROM generate_series($1::int + 1, $2::int) i`,
+				p: login, counting: []string{"member Reachable"},
+			},
+			{
+				what:   "the members' of a custom role",
+				grants: `SELECT 't1', 'cluster', 'k' || i, 'members', 't1', 'custom.view' FROM generate_series($1::int + 1, $2::int) i`,
+				p:      login, counting: []string{"member Filter", "member Reachable"},
+			},
+			{
+				what:   "the public's of a public custom role, searched for a permission no public role gives",
+				grants: `SELECT 't1', 'cluster', 'k' || i, 'public', '', 'custom.open' FROM generate_series($1::int + 1, $2::int) i`,
+				p:      root,
+			},
+		} {
+			t.Run(plan+"/"+broad.what, func(t *testing.T) {
+				h := crowded(t, pgtest.Open(t, "plan_cache_mode="+plan))
+				ctx := t.Context()
+				c0 := hostTable(t, h)[0]
+				g, m := h.guest(t, "g"), h.as(t, "m")
+				h.seed(t, grant(c0.Scope(), "cluster.login", rbac.User, "g"), grant(c0.Scope(), "cluster.login", rbac.User, "m"))
+				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, public)
+					VALUES ('t1', 'custom.view', '{cluster:view,cluster:login}', '{cluster}', false), ('t1', 'custom.open', '{cluster:view}', '{cluster}', true)`); err != nil {
+					t.Fatal(err)
+				}
+				searches := map[string]func(pgx.Tx, *rbac.Authorizer) error{
+					"Holders": func(_ pgx.Tx, a *rbac.Authorizer) error { return second(a.Holders(ctx, broad.p, c0)) },
+				}
+				for who, s := range map[string]rbac.Subject{"anonymous": {}, "guest": g, "member": m} {
+					if !slices.Contains(broad.counting, who+" Filter") {
+						searches[who+" Filter"] = func(_ pgx.Tx, a *rbac.Authorizer) error {
+							return second(a.Filter(ctx, s, broad.p, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1))
+						}
+					}
+					if !slices.Contains(broad.counting, who+" Reachable") {
+						searches[who+" Reachable"] = func(_ pgx.Tx, a *rbac.Authorizer) error { return second(a.Reachable(ctx, s, broad.p, "t1", "cluster")) }
+					}
+				}
+				granted := 0
+				more := func(n int) {
+					t.Helper()
+					if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) `+broad.grants, granted, n); err != nil {
+						t.Fatal(err)
+					}
+					granted = n
+					if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants, rbac_history`); err != nil {
+						t.Fatal(err)
+					}
+				}
+				// The pages of the grants each reads now, and, planned for its arguments as AsOf plans
+				// it, of history as of now.
+				read := func(at time.Time) map[string]int64 {
+					t.Helper()
+					pages := map[string]int64{}
+					for what, f := range searches {
+						func() {
+							tx, err := h.pool.Begin(ctx)
+							if err != nil {
+								t.Fatal(err)
+							}
+							defer func() { _ = tx.Rollback(ctx) }()
+							start := pagesRead(ctx, t, tx, "rbac_grants")
+							if err := f(tx, h.authz.WithTx(tx)); err != nil {
+								t.Fatalf("%s: %v", what, err)
+							}
+							pages[what] = pagesRead(ctx, t, tx, "rbac_grants") - start
+							if plan != "force_custom_plan" || strings.HasSuffix(what, "Filter") {
+								return
+							}
+							if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+								start := historyPages(ctx, t, tx)
+								err := f(tx, a)
+								pages[what+" as of a time"] = historyPages(ctx, t, tx) - start
+								return err
+							}); err != nil {
+								t.Fatalf("%s as of a time: %v", what, err)
+							}
+						}()
+					}
+					return pages
+				}
+				more(500)
+				few := read(dbNow(t, h))
+				more(5000)
+				for what, many := range read(dbNow(t, h)) {
+					if many > few[what]*3/2+deeper {
+						t.Errorf("%s read %d pages beside 500 grants on clusters that are %s, and %d beside 5000", what, few[what], broad.what, many)
+					}
+				}
+			})
+		}
 	}
 }
 
