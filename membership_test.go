@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -4305,6 +4306,156 @@ func TestChangingMembersReadsTheActorsAuthorityOnceForAllItReaches(t *testing.T)
 	}
 	if few, many := joinEach(2), joinEach(40); many != few {
 		t.Errorf("joining 2 groups read the actor's grants %d times, and 40, %d", few, many)
+	}
+}
+
+// The member a grant it gains names decides nothing of the actor's power to make it, so members
+// gaining the same grant are decided as one: an actor that changes access on the scope but may not
+// make it is refused it once, however many gain it, having allocated no more for them.
+func TestMembersGainingAGrantAreDecidedAsOne(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	h.groups(t, "crew")
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "lead"))
+	for _, q := range []string{
+		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.granter', '{cluster:view,cluster:grant}', '{cluster}')`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		 SELECT 't1', 'cluster', 'k' || i, p, id, r FROM generate_series(1, 25) i,
+		   (VALUES ('group', 'crew', 'cluster.login'), ('user', 'lead', 'custom.granter')) AS g(p, id, r)`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lead := h.as(t, "lead")
+	var allocated uint64
+	rbac.SetDecidingGrants(t, func() func() {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		before := m.TotalAlloc
+		return func() {
+			runtime.ReadMemStats(&m)
+			allocated += m.TotalAlloc - before
+		}
+	})
+	n := 0
+	// How many refusals adding count members to the group holds, and what deciding them allocated.
+	refuse := func(count int) (int, uint64) {
+		t.Helper()
+		var add []rbac.Member
+		var ms []rbac.Membership
+		for range count {
+			n++
+			p := identity(fmt.Sprintf("m%d", n))
+			add, ms = append(add, rbac.Member{Group: "crew", Principal: p}), append(ms, rbac.Membership{Principal: p})
+		}
+		if err := h.authz.SetMemberships(ctx, host, "t1", ms); err != nil {
+			t.Fatal(err)
+		}
+		allocated = 0
+		err := h.authz.ChangeMembers(ctx, lead, "t1", add, nil)
+		if !errors.Is(err, rbac.ErrDenied) {
+			t.Fatalf("adding %d members, by one who may not grant what they gain: %v", count, err)
+		}
+		return denials(err), allocated
+	}
+	oneRefused, oneAllocated := refuse(1)
+	manyRefused, manyAllocated := refuse(40)
+	if manyRefused != oneRefused {
+		t.Errorf("adding one member was refused %d times, and forty %d", oneRefused, manyRefused)
+	}
+	if manyAllocated > 2*oneAllocated {
+		t.Errorf("deciding what one member gains allocated %d bytes, and forty %d", oneAllocated, manyAllocated)
+	}
+}
+
+// denials is how many refusals err holds.
+func denials(err error) int {
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		n := 0
+		for _, e := range joined.Unwrap() {
+			n += denials(e)
+		}
+		return n
+	}
+	var denied *rbac.DeniedError
+	if errors.As(err, &denied) {
+		return 1
+	}
+	return 0
+}
+
+// What a member gains, loses or approves is its group's, so a change finds it once for each group,
+// however many members it changes: the members leaving a group granted on many scopes, with labels
+// declared, and those joining one that approves eligibilities on many, cost each scope as much
+// whether one changes or many.
+func TestChangingManyMembersReadsWhatTheirGroupReachesOnce(t *testing.T) {
+	const few, many, small, large = 1, 100, 10, 500
+	h := grouped(t, withLabels)
+	ctx := t.Context()
+	h.groups(t, "held-small", "held-large", "approving-small", "approving-large")
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) SELECT 't1', 'user', 'm' || i FROM generate_series(1, $1::int) i`,
+		4*(few+many))
+	for group, n := range map[string]int{"small": small, "large": large} {
+		exec(`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', $1 || i, 'group', $1, 'cluster.login' FROM generate_series(1, $2::int) i`, "held-"+group, n)
+		exec(`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+			SELECT 't1', 'cluster', $1 || i, 'user', 'x', 'cluster.login', 3600, ARRAY['group:' || $1] FROM generate_series(1, $2::int) i`,
+			"approving-"+group, n)
+	}
+	// The manager may set the eligibilities joining a group that approves them hands on.
+	exec(`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		SELECT tenant, scope_type, scope_id, 'user', 'manager', 'cluster.admin' FROM rbac_eligibilities WHERE tenant = 't1'`)
+	// Those leaving are members of the groups granted access, each of its own.
+	exec(`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+		SELECT 't1', CASE WHEN i <= $1 THEN 'held-small' ELSE 'held-large' END, 'user', 'm' || i FROM generate_series(1, 2 * $1::int) i`,
+		few+many)
+	manager := h.as(t, "manager")
+	next := map[string]int{"held-small": 0, "held-large": few + many, "approving-small": 2 * (few + many), "approving-large": 3 * (few + many)}
+	// The bytes a change of count members of group, joining or leaving it, allocates.
+	change := func(group string, count int, leaving bool) uint64 {
+		t.Helper()
+		var ms []rbac.Member
+		for range count {
+			next[group]++
+			ms = append(ms, rbac.Member{Group: group, Principal: identity(fmt.Sprintf("m%d", next[group]))})
+		}
+		add, remove := ms, []rbac.Member(nil)
+		if leaving {
+			add, remove = nil, ms
+		}
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		if err := h.authz.ChangeMembers(ctx, manager, "t1", add, remove); err != nil {
+			t.Fatal(err)
+		}
+		runtime.ReadMemStats(&after)
+		return after.TotalAlloc - before.TotalAlloc
+	}
+	for _, c := range []struct {
+		name    string
+		of      string
+		leaving bool
+	}{
+		{"leaving a group granted on many scopes", "held", true},
+		{"joining a group approving eligibilities on many scopes", "approving", false},
+	} {
+		// What the larger group's scopes add to a change of count members.
+		grows := func(count int) uint64 {
+			t.Helper()
+			s := change(c.of+"-small", count, c.leaving)
+			return change(c.of+"-large", count, c.leaving) - s
+		}
+		one, all := grows(few), grows(many)
+		if all > one+one/2 {
+			t.Errorf("%s: %d more scopes cost a change of %d members %d bytes, and of %d, %d", c.name, large-small, few, one, many, all)
+		}
 	}
 }
 

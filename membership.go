@@ -1541,6 +1541,56 @@ type reach struct {
 	// and what one joining loses to the denies that then bind it: without them, a grant made to its
 	// group meanwhile changes nothing the change checked.
 	labeled bool
+	// heldOf, approvedOf, namedIn and exemptFrom are where in held, approving and denies those
+	// naming each key are, as holder, approver, principal and exemption, and activatedOf where in
+	// activations each member's are: so what a member of a group reaches is found through the keys
+	// of the groups it is in, rather than by reading every one of them for each member.
+	heldOf, approvedOf, namedIn, exemptFrom, activatedOf positions
+}
+
+// positions are, by key, where in a list the elements naming it are, in order.
+type positions map[string][]int
+
+// positionsOf returns, for each key keys gives an element of xs, where those are.
+func positionsOf[T any](xs []T, keys func(T) []string) positions {
+	at := positions{}
+	for i, x := range xs {
+		for _, k := range keys(x) {
+			if n := len(at[k]); n == 0 || at[k][n-1] != i {
+				at[k] = append(at[k], i)
+			}
+		}
+	}
+	return at
+}
+
+// of is where the elements naming group or a group it is in, by up, are, in order, each once.
+func (at positions) of(up map[string]map[string]bool, group string) []int {
+	var is []int
+	for k := range up[group] {
+		is = append(is, at[k]...)
+	}
+	slices.Sort(is)
+	return slices.Compact(is)
+}
+
+// pick is the elements of xs at is.
+func pick[T any](xs []T, is []int) []T {
+	out := make([]T, len(is))
+	for i, j := range is {
+		out[i] = xs[j]
+	}
+	return out
+}
+
+// indexed is r with what it reaches found by key.
+func (r reach) indexed() reach {
+	r.heldOf = positionsOf(r.held, func(v revalidation) []string { return []string{v.binding.Principal.key()} })
+	r.approvedOf = positionsOf(r.approving, func(v approving) []string { return keysOf(v.approvers) })
+	r.namedIn = positionsOf(r.denies, func(d Deny) []string { return keysOf(d.Principals) })
+	r.exemptFrom = positionsOf(r.denies, func(d Deny) []string { return keysOf(d.Exempt) })
+	r.activatedOf = positionsOf(r.activations, func(x activated) []string { return []string{x.member} })
+	return r
 }
 
 // placed is what a change leaves of the places in force of the members it names (placesLeft).
@@ -1626,7 +1676,7 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 		if r.denies, err = collectDenies(rows); err != nil {
 			return reach{}, err
 		}
-		return r, nil
+		return r.indexed(), nil
 	}
 	rows, err = q.Query(ctx, `SELECT `+grantColumns+` FROM rbac_grants
 		WHERE tenant = $1 AND principal = ANY($2::text[]) AND (expires_at IS NULL OR expires_at > $3) ORDER BY id`, tenant, keys, now)
@@ -1695,7 +1745,7 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 			r.approving = append(r.approving, approving{v, e.Approvers})
 		}
 	}
-	return r, nil
+	return r.indexed(), nil
 }
 
 // activationsLeaving reads, on q, at now, the activations in force of members leaving their groups,
@@ -1896,29 +1946,14 @@ func (r reach) leaving(add, remove []Member) []Member {
 	return out
 }
 
-// in reports whether ps names group or a group it is in, by up.
-func in(up map[string]map[string]bool, group string, ps ...Principal) bool {
-	return slices.ContainsFunc(ps, func(p Principal) bool { return up[group][p.key()] })
-}
-
 // heldBy is what a member of group gains: the grants and eligibilities of it and those it is in.
-func (r reach) heldBy(group string) []revalidation {
-	var vs []revalidation
-	for _, v := range r.held {
-		if in(r.up, group, v.binding.Principal) {
-			vs = append(vs, v)
-		}
-	}
-	return vs
-}
+func (r reach) heldBy(group string) []revalidation { return pick(r.held, r.heldOf.of(r.up, group)) }
 
 // approvedBy is the eligibilities whose activations a member of group approves.
 func (r reach) approvedBy(group string) []revalidation {
 	var vs []revalidation
-	for _, v := range r.approving {
-		if in(r.up, group, v.approvers...) {
-			vs = append(vs, v.revalidation)
-		}
+	for _, v := range pick(r.approving, r.approvedOf.of(r.up, group)) {
+		vs = append(vs, v.revalidation)
 	}
 	return vs
 }
@@ -1926,13 +1961,10 @@ func (r reach) approvedBy(group string) []revalidation {
 // lifted is the denies that no longer bind a member that joins group, exempting it or one it will
 // be in, or with leaving, that leaves it, naming it or one it is in.
 func (r reach) lifted(group string, leaving bool) []Deny {
-	var ds []Deny
-	for _, d := range r.denies {
-		if !leaving && in(r.up, group, d.Exempt...) || leaving && in(r.stored, group, d.Principals...) {
-			ds = append(ds, d)
-		}
+	if leaving {
+		return pick(r.denies, r.namedIn.of(r.stored, group))
 	}
-	return ds
+	return pick(r.denies, r.exemptFrom.of(r.up, group))
 }
 
 // boundBy is the scopes a member joining group, or staying in it longer, loses access on, as the
@@ -1943,45 +1975,57 @@ func (r reach) boundBy(group string) []Scope {
 		return nil
 	}
 	var ss []Scope
-	for _, d := range r.denies {
-		if in(r.up, group, d.Principals...) {
-			ss = append(ss, d.Scope)
+	for _, d := range pick(r.denies, r.namedIn.of(r.up, group)) {
+		ss = append(ss, d.Scope)
+	}
+	return ss
+}
+
+// leftBy is the scopes a member leaving group loses access on, as stored: those of the grants and
+// eligibilities of the group and those it is in, of the eligibilities they approve, and of the
+// denies that exempt them; none where no label checks them. Those of its activations through them
+// are the member's own (activatedBy).
+func (r reach) leftBy(group string) []Scope {
+	if !r.labeled {
+		return nil
+	}
+	var ss []Scope
+	for _, v := range pick(r.held, r.heldOf.of(r.stored, group)) {
+		ss = append(ss, v.scope)
+	}
+	for _, v := range pick(r.approving, r.approvedOf.of(r.stored, group)) {
+		ss = append(ss, v.scope)
+	}
+	for _, d := range pick(r.denies, r.exemptFrom.of(r.stored, group)) {
+		ss = append(ss, d.Scope)
+	}
+	return ss
+}
+
+// activatedBy is the scopes m, a member leaving its group, loses access on through its activations,
+// or those of the identities in it, made through the group or one it is in, as stored; none where no
+// label checks them.
+func (r reach) activatedBy(m Member) []Scope {
+	if !r.labeled {
+		return nil
+	}
+	var ss []Scope
+	for _, x := range pick(r.activations, r.activatedOf[m.Principal.key()]) {
+		if r.stored[m.Group][x.through] {
+			ss = append(ss, x.scope)
 		}
 	}
 	return ss
 }
 
-// leftBy is the scopes m, a member leaving its group, loses access on, as stored: those of the
-// grants and eligibilities of the group and those it is in, of the eligibilities they approve, of
-// the denies that exempt them, and of the activations of m, or of the identities in it, made
-// through one of them; none where no label checks them.
-func (r reach) leftBy(m Member) []Scope {
-	if !r.labeled {
-		return nil
+// byGroup is the members of ms by their group, each group's in order: what a member gains, but for
+// its end, is its group's, so it is found once for each group, however many members it gains.
+func byGroup(ms []Member) map[string][]Member {
+	groups := map[string][]Member{}
+	for _, m := range ms {
+		groups[m.Group] = append(groups[m.Group], m)
 	}
-	group := m.Group
-	var ss []Scope
-	for _, v := range r.held {
-		if in(r.stored, group, v.binding.Principal) {
-			ss = append(ss, v.scope)
-		}
-	}
-	for _, v := range r.approving {
-		if in(r.stored, group, v.approvers...) {
-			ss = append(ss, v.scope)
-		}
-	}
-	for _, d := range r.denies {
-		if in(r.stored, group, d.Exempt...) {
-			ss = append(ss, d.Scope)
-		}
-	}
-	for _, x := range r.activations {
-		if x.member == m.Principal.key() && r.stored[group][x.through] {
-			ss = append(ss, x.scope)
-		}
-	}
-	return ss
+	return groups
 }
 
 // locks are the principal locks of every group the change reaches: a grant, an eligibility or a
@@ -2008,34 +2052,41 @@ type reachKey struct {
 }
 
 // footprint is the changes to access adding add and removing remove make, with the role of each
-// grant or eligibility; with gains, only the grants and eligibilities added members gain.
+// grant or eligibility; with gains, only the grants and eligibilities added members gain. Each is
+// keyed by group, so it is read once for each group, and for each member only its activations.
 func (r reach) footprint(add, remove []Member, gains bool) map[reachKey]RoleDefinition {
 	f := map[reachKey]RoleDefinition{}
-	for _, m := range r.gaining(add) {
-		for _, v := range r.heldBy(m.Group) {
-			f[reachKey{group: m.Group, gained: v.key()}] = v.role
+	for _, g := range memberGroups(r.gaining(add)) {
+		for _, v := range r.heldBy(g) {
+			f[reachKey{group: g, gained: v.key()}] = v.role
 		}
 		if gains {
 			continue
 		}
-		for _, v := range r.approvedBy(m.Group) {
-			f[reachKey{group: m.Group, approves: true, gained: v.key()}] = v.role
+		for _, v := range r.approvedBy(g) {
+			f[reachKey{group: g, approves: true, gained: v.key()}] = v.role
 		}
-		for _, d := range r.lifted(m.Group, false) {
-			f[reachKey{group: m.Group, deny: d.Scope}] = RoleDefinition{}
+		for _, d := range r.lifted(g, false) {
+			f[reachKey{group: g, deny: d.Scope}] = RoleDefinition{}
 		}
-		for _, s := range r.boundBy(m.Group) {
-			f[reachKey{group: m.Group, left: s}] = RoleDefinition{}
+		for _, s := range r.boundBy(g) {
+			f[reachKey{group: g, left: s}] = RoleDefinition{}
 		}
 	}
 	if gains {
 		return f
 	}
-	for _, m := range r.leaving(add, remove) {
-		for _, d := range r.lifted(m.Group, true) {
-			f[reachKey{group: m.Group, deny: d.Scope}] = RoleDefinition{}
+	leaving := r.leaving(add, remove)
+	for _, g := range memberGroups(leaving) {
+		for _, d := range r.lifted(g, true) {
+			f[reachKey{group: g, deny: d.Scope}] = RoleDefinition{}
 		}
-		for _, s := range r.leftBy(m) {
+		for _, s := range r.leftBy(g) {
+			f[reachKey{group: g, left: s}] = RoleDefinition{}
+		}
+	}
+	for _, m := range leaving {
+		for _, s := range r.activatedBy(m) {
 			f[reachKey{group: m.Group, left: s}] = RoleDefinition{}
 		}
 	}
@@ -2093,9 +2144,15 @@ func (v revalidation) as(m Member) Binding {
 // it asked about, which the answers rest on.
 func (a *Authorizer) askMemberships(ctx context.Context, actor Subject, tenant string, set []Member, rc reach) (standing, error) {
 	gaining := rc.gaining(set)
+	held := map[string][]revalidation{}
 	var asked []Principal
 	for _, m := range gaining {
-		if len(rc.heldBy(m.Group)) > 0 {
+		vs, ok := held[m.Group]
+		if !ok {
+			vs = rc.heldBy(m.Group)
+			held[m.Group] = vs
+		}
+		if len(vs) > 0 {
 			asked = append(asked, m.Principal)
 		}
 	}
@@ -2105,7 +2162,7 @@ func (a *Authorizer) askMemberships(ctx context.Context, actor Subject, tenant s
 	}
 	var refused []error
 	for _, m := range gaining {
-		for _, v := range rc.heldBy(m.Group) {
+		for _, v := range held[m.Group] {
 			roles := a.bookOf([]RoleDefinition{v.role})
 			bad, err := a.allowed(ctx, roles, actor, ViaMembership, tenant, v.scope, v.as(m))
 			if err != nil {
@@ -2157,37 +2214,60 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 		}
 		return fmt.Errorf("%w: %s holds %s on %s, which can't be granted there now: revoke it first", ErrInvalid, v.binding.Principal.key(), v.role.ID, v.scope.Key())
 	}
-	for _, m := range rc.gaining(add) {
-		for _, v := range rc.heldBy(m.Group) {
-			if err := stale(v); err != nil {
-				return nil, err
-			}
-			b := v.as(m)
-			if v.eligibility {
-				b = handedOn(b)
-			}
-			c := at(v.scope)
+	// The member a grant names decides nothing of the actor's power to make it, as mayChangeBy
+	// decides it, so each is decided once, by its role, condition and end, however many members gain
+	// it: the host is asked about each as each member's (askMemberships).
+	granted := map[Scope]map[grantKey]bool{}
+	grant := func(s Scope, b Binding) {
+		k := keyOf(b)
+		k.p, k.source = Principal{}, ""
+		if granted[s] == nil {
+			granted[s] = map[grantKey]bool{}
+		}
+		if !granted[s][k] {
+			granted[s][k] = true
+			c := at(s)
 			c.grants = append(c.grants, b)
 		}
-		for _, v := range rc.approvedBy(m.Group) {
+	}
+	gaining := byGroup(rc.gaining(add))
+	for _, g := range slices.Sorted(maps.Keys(gaining)) {
+		for _, v := range rc.heldBy(g) {
 			if err := stale(v); err != nil {
 				return nil, err
 			}
-			c := at(v.scope)
-			c.grants = append(c.grants, handedOn(v.binding))
+			for _, m := range gaining[g] {
+				b := v.as(m)
+				if v.eligibility {
+					b = handedOn(b)
+				}
+				grant(v.scope, b)
+			}
 		}
-		for _, d := range rc.lifted(m.Group, false) {
+		for _, v := range rc.approvedBy(g) {
+			if err := stale(v); err != nil {
+				return nil, err
+			}
+			grant(v.scope, handedOn(v.binding))
+		}
+		for _, d := range rc.lifted(g, false) {
 			at(d.Scope).denies = true
 		}
-		for _, s := range rc.boundBy(m.Group) {
+		for _, s := range rc.boundBy(g) {
 			at(s).leaves = true
 		}
 	}
-	for _, m := range rc.leaving(add, remove) {
-		for _, d := range rc.lifted(m.Group, true) {
+	leaving := rc.leaving(add, remove)
+	for _, g := range memberGroups(leaving) {
+		for _, d := range rc.lifted(g, true) {
 			at(d.Scope).denies = true
 		}
-		for _, s := range rc.leftBy(m) {
+		for _, s := range rc.leftBy(g) {
+			at(s).leaves = true
+		}
+	}
+	for _, m := range leaving {
+		for _, s := range rc.activatedBy(m) {
 			at(s).leaves = true
 		}
 	}
