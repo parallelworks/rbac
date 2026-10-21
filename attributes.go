@@ -44,8 +44,9 @@ import (
 // the kind's attributes as a whole, by `in`, size(), a macro or comparing them. A name a declared
 // kind doesn't declare, which a condition reads only through dyn(), fails so too. An undeclared
 // kind's are read as passed, and CEL compares values of different types as unequal. A map passed
-// there may be keyed by a double that isn't finite, as no declared one may: comparing it fails,
-// but `in` it is false for any key it doesn't hold, as CEL finds none equal to NaN.
+// there may be keyed by a double that isn't finite, as no declared one may: comparing it with a map
+// of as many entries fails, but `in` it is false for any key it doesn't hold, as CEL finds none
+// equal to NaN.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }

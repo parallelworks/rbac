@@ -37,15 +37,16 @@ import (
 // A grant with one gives its role only where the expression is true. An expression that fails, as
 // one reading an attribute the host didn't pass does, or comparing a double that isn't finite, as
 // dividing by zero makes, converting one to a string, keying a map by one or comparing a map keyed
-// by one, is false, though `in` a map the host passes keyed by one is false for a key it doesn't
-// hold (Attributes). A label value and a power to release are decided on the tenant with no
-// attributes, whatever a check passes (Holding), and their conditions can't read the tenant's: any
-// read of resource.attributes fails, a test of an attribute's presence, in, size(), a macro and a
-// comparison included, so a grant's gives nothing and a deny's applies. The zero Condition is none,
-// and one with a title or description has an expression. A pattern it matches is a string literal,
-// of bounded size; it nests at most 32 deep; it builds no message, as `google.protobuf.Struct{}`;
-// and a comparison, or a search of a list, that would read more than a condition may spend, or
-// reading a time in a zone whose name is longer than 64 bytes, fails before it runs.
+// by one with another of as many entries, is false, though `in` a map the host passes keyed by one
+// is false for a key it doesn't hold (Attributes). A label value and a power to release are decided
+// on the tenant with no attributes, whatever a check passes (Holding), and their conditions can't
+// read the tenant's: any read of resource.attributes fails, a test of an attribute's presence, in,
+// size(), a macro and a comparison included, so a grant's gives nothing and a deny's applies. The
+// zero Condition is none, and one with a title or description has an expression. A pattern it
+// matches is a string literal, of bounded size; it nests at most 32 deep; it builds no message, as
+// `google.protobuf.Struct{}`; and a comparison, or a search of a list, that would read more than a
+// condition may spend, or reading a time in a zone whose name is longer than 64 bytes, fails before
+// it runs.
 //
 // Each condition runs within the most evaluating it can cost, which its literals and types bound:
 // little for one comparing what a request passes with literals, or with the subject's kind or id,
@@ -1309,8 +1310,9 @@ var errNonFiniteKey = errors.New("rbac: a double that isn't finite can't be a ke
 // finds no key equal to NaN, so a map keyed by one would equal no map and hold no value, and a
 // deny's `{failed / total: 1} == {0.5: 1}` would lift where both are 0.0. A condition computes
 // every key it can make one of, since none is written. A map the host passes can be keyed by one:
-// comparing it fails (equal), as does indexing it by one (qualifier), but a key not found `in` it
-// is false, as finding whether it holds one that isn't finite would read every key, uncharged.
+// comparing it with a map of as many entries fails (equal), as does indexing it by one
+// (qualifier), but a key not found `in` it is false, as finding whether it holds one that isn't
+// finite would read every key, uncharged.
 func finiteKey(key ref.Val) ref.Val {
 	if nonFinite(key) {
 		return types.WrapErr(errNonFiniteKey)
