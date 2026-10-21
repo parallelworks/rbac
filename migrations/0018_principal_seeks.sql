@@ -1,8 +1,8 @@
 -- Both tables are locked first, history last, as 0013 locks them: locked as each statement reached
 -- it, history would be locked only once the grants' index was built, and a change that wrote history
 -- meanwhile, as each change to a table does, and then wrote a grant, as deleting a scope's
--- eligibilities and then its grants does, would wait for migrating while migrating waited for it.
--- Reads of rbac_grants go on.
+-- eligibilities and then its grants does, would wait for migrating while migrating waited for it, so
+-- migrating would give way, or deadlock, having built the index. Reads of rbac_grants go on.
 LOCK TABLE rbac_grants IN SHARE MODE;
 LOCK TABLE rbac_history IN ACCESS EXCLUSIVE MODE;
 
@@ -28,9 +28,10 @@ CREATE INDEX rbac_grants_custom_principal ON rbac_grants (principal, tenant, sco
 -- bounds are another table's, as a search's types are, a plan counts as a few rows, so where it
 -- counts a principal's versions as many, as in a history of a few principals, it took the index of
 -- scopes. Reads of history, and every change, each of which writes history, wait until the
--- migration commits, and a transaction under way as it starts that read history, or changed a table,
--- and then writes a grant deadlocks with it. Building it reads all of history; the analysis after it
--- gives a plan the statistics of the types, which autovacuum would take long after migrating.
+-- migration commits, and only a transaction under way as it starts that read history, or changed a
+-- table, and then writes a grant makes it give way, before it builds either index. Building it reads
+-- all of history; the analysis after it gives a plan the statistics of the types, which autovacuum
+-- would take long after migrating.
 DROP INDEX rbac_history_principal;
 CREATE INDEX rbac_history_principal ON rbac_history (tenant, principal, entity, (split_part(scope, ':', 1)), scope, effective_at DESC)
     WHERE principal IS NOT NULL;

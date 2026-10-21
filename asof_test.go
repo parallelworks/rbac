@@ -1351,12 +1351,16 @@ func TestMigratingLetsHistorysRoleCallWhatItsIndexCalls(t *testing.T) {
 // Migrating to 0018 locks history before it builds the grants' index, so a change that starts while
 // it builds and writes history before a grant, as DeleteScope removes a scope's eligibilities and
 // then its grants, waits for it to commit: locked once the index was built, history was the change's
-// while the change waited for the grants, and PostgreSQL ended one of the two as a deadlock.
+// while the change waited for the grants, so migrating gave way, having built the index, or
+// PostgreSQL ended one of the two as a deadlock.
 func TestMigratingThePrincipalSeeksWaitsForAChangeStartedAsItBuilds(t *testing.T) {
 	// Little memory to sort in, so building the index takes a while.
 	pool := pgtest.Open(t, "maintenance_work_mem=64kB")
 	ctx := t.Context()
 	migrateFiles(t, pool, "", "0018")
+	recordMigrations(t, pool, "0018")
+	// So a Migrate that gave way would give up at once.
+	rbac.SetMigrateAttempts(t, 1, time.Millisecond)
 	for _, q := range []string{
 		`ALTER TABLE rbac_grants DISABLE TRIGGER USER`,
 		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
@@ -1371,16 +1375,9 @@ func TestMigratingThePrincipalSeeksWaitsForAChangeStartedAsItBuilds(t *testing.T
 			t.Fatal(err)
 		}
 	}
-	authz, err := rbac.New(pool, rbac.Config{
-		Catalog:        catalog,
-		ContainerTypes: []string{"org", "workspace"},
-		ValidateGrant:  func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	migrated := make(chan error, 1)
-	go func() { migrated <- applyMigrations(ctx, pool, pgx.ReadCommitted, "0018", "") }()
+	h := migrated(t, pool)
+	done := make(chan error, 1)
+	go func() { done <- rbac.Migrate(ctx, pool) }()
 	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
 		var building bool
 		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_progress_create_index WHERE relid = 'rbac_grants'::regclass)`).Scan(&building); err != nil {
@@ -1390,7 +1387,7 @@ func TestMigratingThePrincipalSeeksWaitsForAChangeStartedAsItBuilds(t *testing.T
 			break
 		}
 		select {
-		case err := <-migrated:
+		case err := <-done:
 			t.Fatalf("migrated before the grants' index was seen building: %v", err)
 		default:
 		}
@@ -1398,11 +1395,11 @@ func TestMigratingThePrincipalSeeksWaitsForAChangeStartedAsItBuilds(t *testing.T
 			t.Fatal("migrating never built the grants' index")
 		}
 	}
-	if err := authz.DeleteScope(ctx, host, "t1", cluster.Scope()); err != nil {
+	if err := h.authz.DeleteScope(ctx, host, "t1", cluster.Scope()); err != nil {
 		t.Errorf("deleting a scope while migrating builds the grants' index: %v", err)
 	}
-	if err := <-migrated; err != nil {
-		t.Errorf("migrating while a scope is deleted: %v", err)
+	if err := <-done; err != nil {
+		t.Errorf("Migrate while a scope is deleted: %v", err)
 	}
 }
 
