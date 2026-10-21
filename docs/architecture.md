@@ -467,7 +467,10 @@ sequenceDiagram
   `Activate` holds the places it can rest on until it commits, in the statement that reads the
   keys it finds its subject eligible through, so the two wait for each other, and a place nested
   between them makes no one eligible. Setting the eligibility again or deleting it leaves its
-  activations to their own ends, or to their holders leaving its group.
+  activations to their own ends, or to their holders leaving its group: where labels are declared,
+  `ChangeMembers` reads the activations of the members leaving made through the groups it reaches
+  and checks the label of each one's scope as a revoke there, and `DeleteGroup` refuses a group
+  they rest on.
 - **Approvals.** Approving decides access on the scope, so on a labeled one an approval counts
   only from an approver whose own label values satisfy the label: read before the transaction and
   again under its locks, with the constraints' answers on them sealed, as an actor's are, and
