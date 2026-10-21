@@ -3566,6 +3566,57 @@ func TestSearchesReadAsMuchOnceAConnectionPlansThemGenerically(t *testing.T) {
 	}
 }
 
+// Filter's count of the grants that pick its form stops a little past where the form changes,
+// however many of a built-in role its subject holds, and beside a grant of a custom role read
+// before them: counted with the custom roles the grants name, which it reads from every one, the
+// count read all of them, as many as the condition then reads.
+func TestFilterCountsAFewOfItsSubjectsGrantsOfBuiltInRoles(t *testing.T) {
+	for _, params := range []string{"", "plan_cache_mode=force_generic_plan"} {
+		for _, custom := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s custom %t", params, custom), func(t *testing.T) {
+				h := crowded(t, pgtest.Open(t, params))
+				ctx := t.Context()
+				c0 := hostTable(t, h)[0]
+				u := h.as(t, "u")
+				h.seed(t, grant(c0.Scope(), "cluster.login", rbac.User, "u"))
+				if custom {
+					if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+						VALUES ('t1', 'custom.login', '{cluster:view,cluster:login}', '{cluster}')`); err != nil {
+						t.Fatal(err)
+					}
+					// On a cluster whose scope sorts before the others'.
+					h.seed(t, grant(rbac.Scope{Type: "cluster", ID: "0"}, "custom.login", rbac.User, "u"))
+				}
+				granted := 0
+				read := func(n int) int64 {
+					t.Helper()
+					if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+						SELECT 't1', 'cluster', 'other' || i, 'user', 'u', 'cluster.login' FROM generate_series($1::int + 1, $2::int) i`, granted, n); err != nil {
+						t.Fatal(err)
+					}
+					granted = n
+					if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants`); err != nil {
+						t.Fatal(err)
+					}
+					tx, err := h.pool.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = tx.Rollback(ctx) }()
+					start := pagesRead(ctx, t, tx, "rbac_grants")
+					if _, err := h.authz.WithTx(tx).Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1); err != nil {
+						t.Fatal(err)
+					}
+					return pagesRead(ctx, t, tx, "rbac_grants") - start
+				}
+				if few, many := read(100), read(10000); many > few*3/2+deeper {
+					t.Errorf("Filter read %d pages of grants for a subject holding 100 more on clusters, and %d for one holding 10000", few, many)
+				}
+			})
+		}
+	}
+}
+
 // Revoking a grant on a scope many hold grants on reads only the revoked principal's, under its
 // lock, by Apply and by DeleteGrants, under a generic plan too: matched to the scope's grants, a
 // revoke reads each of them.

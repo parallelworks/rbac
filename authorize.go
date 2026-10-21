@@ -1457,15 +1457,24 @@ func filterKeys(arg func(int) string, of string) string {
 // on scopes of the types in the array types, in the default collation, which a column's own
 // collation overrides where a comparison doesn't name one: unconditional, in force, of the roles
 // that give the permission, the public's only of public ones and the broad principals' of none
-// privileged. It reads the subject's grants there once, and of the custom roles those that they
-// name (namedCustom). arg numbers Filter's arguments.
+// privileged. It reads the subject's grants there once (filterHeld), and of the custom roles those
+// that they name (namedCustom). arg numbers Filter's arguments.
 func filterGrants(arg func(int) string, custom bool, types string) string {
-	return fmt.Sprintf(`WITH held AS MATERIALIZED (%s)
-		SELECT scope COLLATE "default" FROM held WHERE role = ANY(%s)
+	return `WITH held AS MATERIALIZED (` + filterHeld(arg, types) + `)
+		SELECT scope COLLATE "default" FROM held WHERE ` + filterCounted(arg, custom)
+}
+
+// filterHeld is SQL selecting the subject's grants filterGrants reads, as held.
+func filterHeld(arg func(int) string, types string) string {
+	return byType(types, "g.scope, g.role, g.principal, g.principal_kind", fmt.Sprintf(`g.tenant = %s::text AND g.principal = ANY(%s)
+		  AND (g.expires_at IS NULL OR g.expires_at > %s) AND NOT g.conditional`, arg(1), filterKeys(arg, countedKeys(arg(13), arg(17))), arg(4)))
+}
+
+// filterCounted is SQL for whether filterGrants counts a grant of held.
+func filterCounted(arg func(int) string, custom bool) string {
+	return fmt.Sprintf(`role = ANY(%s)
 		  AND (principal <> %s::text OR role = ANY(%s))
 		  AND (principal_kind <> ALL(%s) OR role = ANY(%s))`,
-		byType(types, "g.scope, g.role, g.principal, g.principal_kind", fmt.Sprintf(`g.tenant = %s::text AND g.principal = ANY(%s)
-		  AND (g.expires_at IS NULL OR g.expires_at > %s) AND NOT g.conditional`, arg(1), filterKeys(arg, countedKeys(arg(13), arg(17))), arg(4))),
 		givingSQL(arg(3), arg(1), arg(8), arg(9), custom, namedCustom("SELECT role FROM held"), false), arg(6),
 		givingSQL(arg(7), arg(1), arg(8), arg(9), custom, arg(10), true),
 		broadKindsSQL, givingSQL(arg(11), arg(1), arg(8), arg(9), custom, arg(12), false))
@@ -1488,13 +1497,25 @@ func (a *Authorizer) grantCounts(ctx context.Context, custom, container bool, ar
 		}
 		return fmt.Sprintf("$%d", at[i])
 	}
+	// Those of built-in roles are counted first, and only short of the limit those of custom roles
+	// too: which custom roles the grants name is read from every one of them, and a subject can hold
+	// thousands, as one on each resource it created, where a few of built-in roles already pick the
+	// form. Both counts read one materialized held, so the subject's grants are read once.
+	count := func(types string, limit int) string {
+		if !custom {
+			return fmt.Sprintf(`(SELECT count(*) FROM (%s LIMIT %d) g)`, filterGrants(arg, false, types), limit)
+		}
+		return fmt.Sprintf(`(WITH held AS MATERIALIZED (%[1]s) SELECT CASE
+			WHEN (SELECT count(*) FROM (SELECT FROM held WHERE %[2]s LIMIT %[4]d) g) = %[4]d THEN %[4]d
+			ELSE (SELECT count(*) FROM (SELECT FROM held WHERE %[3]s LIMIT %[4]d) g) END)`,
+			filterHeld(arg, types), filterCounted(arg, false), filterCounted(arg, true), limit)
+	}
 	onResources := "0"
 	if !container {
-		onResources = fmt.Sprintf(`(SELECT count(*) FROM (%s LIMIT %d) g)`, filterGrants(arg, custom, "ARRAY["+arg(9)+"::text]"), maxOverlap+1)
+		onResources = count("ARRAY["+arg(9)+"::text]", maxOverlap+1)
 	}
 	// The containers' and the tenant's are of the types Filter reads denies on by each key (16).
-	query := fmt.Sprintf(`SELECT %s, (SELECT count(*) FROM (%s LIMIT %d) g)`,
-		onResources, filterGrants(arg, custom, arg(16)), max(maxOverlap, maxContainerOverlap)+1)
+	query := fmt.Sprintf(`SELECT %s, %s`, onResources, count(arg(16), max(maxOverlap, maxContainerOverlap)+1))
 	err = a.db.QueryRow(ctx, query, read...).Scan(&resources, &containers)
 	return resources, containers, err
 }
