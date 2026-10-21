@@ -161,18 +161,19 @@ conditional ones reach, to check one by one.
   one of the tenant's members or the public, or by its own grants before it joins, is refused with
   `ErrInvalid`; denies don't count, and removing a grant, an eligibility, a membership or a place in
   a group, making a membership or a place end sooner, making a member a guest, suspending a
-  membership, or redefining a custom role so that its grants give no value they couldn't, as
-  renaming or narrowing it, is never refused. Where a dimension is exclusive, a tenant's changes run
-  in turn, so two can't each give one value. The check reads every identity a change reaches, so a
-  grant to the tenant's members or the public reads every member. A subject whose grants could give
-  it two anyway, as after a catalog change, holds none of them, whatever the request, a constraint
-  or a deny removes: checks and searches of its labels and of the values themselves refuse it, and
-  it can't hand them on, but for those a role it holds lists in `GrantableRoles`, which it grants
-  without holding, as any such role: the identity it grants one to is checked as in any change, so
-  no one comes to hold two. A change reaching it is refused until a removal leaves it one;
-  `Conflicts` lists them. A role giving two of them is refused. An `Ordered` dimension's higher
-  values include the lower, so it isn't exclusive, and in an `AllOf` one a label naming two is one
-  no one can read, as data that joins two parties is.
+  membership, granting a grant again, setting an eligibility in force again to end no later, or
+  redefining a custom role so that its grants give no value they couldn't, as renaming or narrowing
+  it, is never refused. Where a dimension is exclusive, a tenant's changes run in turn, so two can't
+  each give one value. The check reads every identity a change reaches, so a grant to the tenant's
+  members or the public reads every member. A subject whose grants could give it two anyway, as
+  after a catalog change, holds none of them, whatever the request, a constraint or a deny removes:
+  checks and searches of its labels and of the values themselves refuse it, and it can't hand them
+  on, but for those a role it holds lists in `GrantableRoles`, which it grants without holding, as
+  any such role: the identity it grants one to is checked as in any change, so no one comes to hold
+  two. Any other change reaching it is refused until a removal leaves it one; `Conflicts` lists
+  them. A role giving two of them is refused. An `Ordered` dimension's higher values include the
+  lower, so it isn't exclusive, and in an `AllOf` one a label naming two is one no one can read, as
+  data that joins two parties is.
 - **Conditions:** a grant can carry a CEL expression over the subject's, the resource's and the
   request's attributes (`Subject.Attributes`, `Resource.Attributes`, `rbac.WithRequest`), the time
   and the action. It gives its role only where the expression holds; one that fails is false.

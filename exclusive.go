@@ -187,9 +187,9 @@ func (a *Authorizer) broadExcludes(ctx context.Context, tenant string, b Princip
 
 // Conflict is an identity able to hold two or more values of an exclusive dimension, through any
 // grant or eligibility on the tenant, whatever its condition, and its own grants while it is no
-// member or guest: a change reaching it is refused until a removal leaves it one, and where its
-// grants could give it two now, it holds none of them. The public, for what it holds, is
-// Principal{Kind: Public}.
+// member or guest: a change reaching it, but one that only rewrites what it holds (excludes), is
+// refused until a removal leaves it one, and where its grants could give it two now, it holds
+// none of them. The public, for what it holds, is Principal{Kind: Public}.
 type Conflict struct {
 	Principal Principal
 	Dimension string
