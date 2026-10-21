@@ -2175,6 +2175,47 @@ func deletingReadsOnlyTheGroupsItIsIn(t *testing.T, sources []string) {
 	}
 }
 
+// A place in a group made again once it has ended, while it is still stored, is made by whoever
+// made it again, then, as a membership or an eligibility set again once it has ended is, and
+// history records it so; one renewed before it ends keeps who made it.
+func TestAPlaceMadeAgainOnceEndedIsMadeByWhoeverMadeItAgain(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "lead"))
+	h.groups(t, "crew", "team", "kept")
+	h.join(t, "u")
+	manager, lead, sync := h.as(t, "manager"), h.as(t, "lead"), identity("sync")
+	u := identity("u")
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", []rbac.Member{
+		{Group: "crew", Principal: u, ExpiresAt: h.now.Add(time.Minute)},
+		{Group: "team", Principal: u, ExpiresAt: h.now.Add(time.Minute)},
+		{Group: "kept", Principal: u, ExpiresAt: h.now.Add(2 * time.Hour)},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	h.now = h.now.Add(time.Hour)
+	if err := h.authz.ImportMembers(ctx, sync, "t1", []rbac.Member{{Group: "crew", Principal: u}, {Group: "kept", Principal: u}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.ChangeMembers(ctx, lead, "t1", []rbac.Member{{Group: "team", Principal: u}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	for group, want := range map[string]rbac.Principal{"crew": sync, "team": lead.Principal, "kept": manager.Principal} {
+		ms, err := h.authz.Members(ctx, "t1", group)
+		if err != nil || len(ms) != 1 {
+			t.Fatalf("Members of %s = %+v, %v", group, ms, err)
+		}
+		if m := ms[0]; m.CreatedBy != want || m.CreatedAt.Equal(m.UpdatedAt) != (want != manager.Principal) {
+			t.Errorf("u's place in %s made by %v at %v, updated at %v, want made by %v", group, m.CreatedBy, m.CreatedAt, m.UpdatedAt, want)
+		}
+		var recorded string
+		if err := h.pool.QueryRow(ctx, `SELECT after->>'created_by' FROM rbac_history WHERE entity = 'member' AND group_id = $1 ORDER BY id DESC LIMIT 1`,
+			group).Scan(&recorded); err != nil || recorded != string(want.Kind)+":"+want.ID {
+			t.Errorf("history records u's place in %s as made by %q, %v", group, recorded, err)
+		}
+	}
+}
+
 func TestJoiningAgainBeforeDeleteExpiredGivesBackNoGroups(t *testing.T) {
 	h := grouped(t)
 	ctx := t.Context()

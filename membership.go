@@ -1166,7 +1166,7 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 			return ChangeEvent{}, nil, err
 		}
 		e := ChangeEvent{}
-		if e.Joined, err = a.join(ctx, tx, tenant, actor, set, locked.placed); err != nil {
+		if e.Joined, err = a.join(ctx, tx, tenant, actor, set, locked.placed, now); err != nil {
 			return ChangeEvent{}, nil, err
 		}
 		e.Shortened, e.Revoked, err = a.unrest(ctx, tx, tenant, actor, r, now)
@@ -1214,11 +1214,11 @@ func memberLocks(members []Member) (scopes, principals []string) {
 	return slices.Sorted(maps.Keys(ss)), slices.Sorted(maps.Keys(ps))
 }
 
-// join stores members memberSet checked, under the change's locks, and returns those it added or
-// changed: refusing an identity that isn't a member or guest of the tenant, a group that doesn't
-// exist, nesting that makes a cycle or too long a chain, and places past the bounds, but those kept
-// (placed.kept), which last no longer than they did.
-func (a *Authorizer) join(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, set []Member, kept placed) ([]Member, error) {
+// join stores members memberSet checked, under the change's locks, at now, and returns those it
+// added or changed: refusing an identity that isn't a member or guest of the tenant, a group that
+// doesn't exist, nesting that makes a cycle or too long a chain, and places past the bounds, but
+// those kept (placed.kept), which last no longer than they did.
+func (a *Authorizer) join(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, set []Member, kept placed, now time.Time) ([]Member, error) {
 	groups, identities := map[string]bool{}, map[string]bool{}
 	var nested []Member
 	for _, m := range set {
@@ -1240,15 +1240,19 @@ func (a *Authorizer) join(ctx context.Context, tx pgx.Tx, tenant string, actor P
 		ids[i], kinds[i], pids[i], sources[i], notes[i] = m.Group, string(m.Principal.Kind), m.Principal.ID, m.Source, m.Note
 		expires[i] = pgtype.Timestamptz{Time: m.ExpiresAt, Valid: !m.ExpiresAt.IsZero()}
 	}
+	// A place that has ended and is still stored gave nothing, so making it again records the new
+	// actor and time, as SetMemberships does a membership's.
 	rows, err := tx.Query(ctx, `
 		INSERT INTO rbac_members AS m (tenant, group_id, principal_kind, principal_id, source, expires_at, note, created_by, updated_by)
 		SELECT $1, g, k, i, s, e, n, $8, $8 FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::timestamptz[], $7::text[])
 		  AS t(g, k, i, s, e, n)
 		ON CONFLICT (tenant, group_id, principal, source) DO UPDATE SET expires_at = EXCLUDED.expires_at, note = EXCLUDED.note,
+		  created_by = CASE WHEN m.expires_at <= $9 THEN EXCLUDED.created_by ELSE m.created_by END,
+		  created_at = CASE WHEN m.expires_at <= $9 THEN EXCLUDED.created_at ELSE m.created_at END,
 		  updated_by = EXCLUDED.updated_by, updated_at = now()
 		WHERE (m.expires_at, m.note) IS DISTINCT FROM (EXCLUDED.expires_at, EXCLUDED.note)
 		RETURNING `+memberColumns,
-		tenant, ids, kinds, pids, sources, expires, notes, actorKey(actor))
+		tenant, ids, kinds, pids, sources, expires, notes, actorKey(actor), now)
 	if err != nil {
 		return nil, err
 	}
@@ -1474,7 +1478,7 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 			}
 		}
 		if len(set) > 0 {
-			if e.Joined, err = a.join(ctx, tx, tenant, actor.Principal, set, locked.placed); err != nil {
+			if e.Joined, err = a.join(ctx, tx, tenant, actor.Principal, set, locked.placed, now); err != nil {
 				return ChangeEvent{}, nil, err
 			}
 		}
