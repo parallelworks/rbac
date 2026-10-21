@@ -316,6 +316,11 @@ func (a *Authorizer) holding(ctx context.Context, tenant string, s Subject) (Hol
 	return a.holdingOn(ctx, a.db, s, a.constrain(ctx, s, tenantResource(tenant)))
 }
 
+// holdingOf is holding decided by v, read with s's other grants.
+func (a *Authorizer) holdingOf(ctx context.Context, tenant string, s Subject, v *valuesRead) (Holding, map[Permission]bool, error) {
+	return a.holdingFrom(ctx, a.db, s, a.constrain(ctx, s, tenantResource(tenant)), v)
+}
+
 // tenantResource is the tenant as a resource with no attributes, ancestors or label.
 func tenantResource(tenant string) Resource {
 	return Resource{Tenant: tenant, Type: TenantScope, ID: tenant}

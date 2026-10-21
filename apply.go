@@ -345,9 +345,10 @@ func (a *Authorizer) authorityOr(ctx context.Context, q DB, actor Subject, on Re
 }
 
 // labelAllows refuses, as a DeniedError of p, a change on a scope whose label the actor's holding
-// doesn't satisfy, decided by values, read with its authority there, asking the constraints about
-// its values through labels, or where nil, through cs on the tenant: before the change's
-// transaction, and again under its locks, which reads their answers back.
+// doesn't satisfy, decided by values, read with its authority there, or where nil read on q the
+// first time in each phase (constrained.holding), asking the constraints about its values through
+// labels, or where nil, through cs on the tenant: before the change's transaction, and again under
+// its locks, which reads their answers back.
 func (a *Authorizer) labelAllows(ctx context.Context, q DB, on Resource, cs, labels *constrained, p Permission, values *valuesRead) error {
 	if !on.Labels.asks() {
 		return nil
@@ -359,28 +360,6 @@ func (a *Authorizer) labelAllows(ctx context.Context, q DB, on Resource, cs, lab
 	if err != nil {
 		return err
 	}
-	return labelRefused(held, on, p)
-}
-
-// labelCheck returns a check refusing, as a DeniedError of p, a change on a resource whose label
-// the actor's holding doesn't satisfy, read on q through labels the first time a label asks for
-// values in each phase (constrained.holding), asking the constraints about them on the tenant:
-// before the change's transaction, and again under its locks, which reads their answers back.
-func (a *Authorizer) labelCheck(ctx context.Context, q DB, labels *constrained) func(on Resource, p Permission) error {
-	return func(on Resource, p Permission) error {
-		if !on.Labels.asks() {
-			return nil
-		}
-		held, err := labels.holding(ctx, q)
-		if err != nil {
-			return err
-		}
-		return labelRefused(held, on, p)
-	}
-}
-
-// labelRefused refuses, as a DeniedError of p, a change on on whose label held doesn't satisfy.
-func labelRefused(held Holding, on Resource, p Permission) error {
 	if dim := held.Unsatisfied(on.Labels); dim != "" {
 		return &DeniedError{Permission: p, Scope: on.Scope(), Reason: labelRefusal(dim)}
 	}
@@ -1599,7 +1578,7 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 		return nil, err
 	}
 	if r.Labels.asks() {
-		h, _, err := a.holdingFrom(ctx, a.db, s, a.constrain(ctx, s, tenantResource(r.Tenant)), onTenant(r.Tenant, held, ds, b))
+		h, _, err := a.holdingOf(ctx, r.Tenant, s, onTenant(r.Tenant, held, ds, b))
 		if err != nil || h.Unsatisfied(r.Labels) != "" {
 			return nil, err
 		}

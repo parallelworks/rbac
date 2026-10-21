@@ -1019,17 +1019,17 @@ func collectGroups(rows pgx.Rows) ([]GroupDefinition, error) {
 	})
 }
 
-// clearsAll reports whether the actor's label values, read on q through labels, satisfy every label
-// a resource can have.
-func (a *Authorizer) clearsAll(ctx context.Context, q DB, labels *constrained) (bool, error) {
-	h, err := labels.holding(ctx, q)
+// clearsAll reports whether the actor's label values, decided through labels by values, or where
+// nil read on q, satisfy every label a resource can have.
+func (a *Authorizer) clearsAll(ctx context.Context, q DB, labels *constrained, values *valuesRead) (bool, error) {
+	h, err := labels.holdingBy(ctx, q, values)
 	return err == nil && h.clearsAll(), err
 }
 
-// stillClearsAll refuses, read on q in a change's transaction, a change that found the actor's
-// label values satisfying every label before it, which no longer do.
-func (a *Authorizer) stillClearsAll(ctx context.Context, q DB, labels *constrained) error {
-	all, err := a.clearsAll(ctx, q, labels)
+// stillClearsAll refuses, in a change's transaction, a change that found the actor's label values
+// satisfying every label before it, which no longer do, as clearsAll decides them.
+func (a *Authorizer) stillClearsAll(ctx context.Context, q DB, labels *constrained, values *valuesRead) error {
+	all, err := a.clearsAll(ctx, q, labels, values)
 	if err != nil {
 		return err
 	}
@@ -1386,7 +1386,8 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 		}
 	}
 	labels := a.tenantLabels(ctx, actor, tenant)
-	if _, err := a.mayManageGroups(ctx, a.db, actor, GroupMembers, targets, labels); err != nil {
+	values, err := a.mayManageGroups(ctx, a.db, actor, GroupMembers, targets, labels)
+	if err != nil {
 		return err
 	}
 	// Refused before the host is asked about what the members would gain, and again under the locks.
@@ -1397,7 +1398,7 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 	if err != nil {
 		return err
 	}
-	checks, err := a.mayReach(ctx, actor, tenant, set, remove, rc, labels)
+	checks, err := a.mayReach(ctx, actor, tenant, set, remove, rc, labels, values)
 	if err != nil {
 		return err
 	}
@@ -1429,10 +1430,11 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 			return ChangeEvent{}, nil, err
 		}
 		labels.seal()
-		if _, err := a.mayManageGroups(ctx, tx, actor, GroupMembers, targets, labels); err != nil {
+		values, err := a.mayManageGroups(ctx, tx, actor, GroupMembers, targets, labels)
+		if err != nil {
 			return ChangeEvent{}, nil, err
 		}
-		if err := a.mayReachAgain(ctx, tx, actor, checks, labels); err != nil {
+		if err := a.mayReachAgain(ctx, tx, actor, checks, labels, values); err != nil {
 			return ChangeEvent{}, nil, err
 		}
 		now := a.cfg.Now()
@@ -1997,8 +1999,12 @@ type reachCheck struct {
 // change to members makes, by scope: grant each grant and eligibility an added member gains, as
 // Apply would; set each eligibility it would approve; set each deny lifted for a member; and take
 // away what a member leaving loses, which only a scope's label refuses, as Apply refuses a revoke
-// there. The actor's label values are read through labels.
-func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string, add, remove []Member, rc reach, labels *constrained) ([]*reachCheck, error) {
+// there. The actor's label values are asked about through labels, and for what a member leaving
+// loses decided by values, which mayManageGroups read with its power over the members, so it held
+// both at one moment.
+func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string, add, remove []Member, rc reach, labels *constrained,
+	values *valuesRead,
+) ([]*reachCheck, error) {
 	byScope := map[Scope]*reachCheck{}
 	at := func(s Scope) *reachCheck {
 		if byScope[s] == nil {
@@ -2055,7 +2061,7 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 		c := byScope[s]
 		leaving := len(c.grants) == 0 && !c.denies
 		if leaving && cleared == nil {
-			all, err := a.clearsAll(ctx, a.db, labels)
+			all, err := a.clearsAll(ctx, a.db, labels, values)
 			if err != nil {
 				return nil, err
 			}
@@ -2080,7 +2086,6 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 	if err != nil {
 		return nil, err
 	}
-	clearance := a.labelCheck(ctx, a.db, labels)
 	for i, c := range checks {
 		// As Apply checks grants there, and SetDeny a deny.
 		if len(c.grants) > 0 {
@@ -2096,7 +2101,7 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 			}
 		}
 		if c.leaves && !c.cleared {
-			if err := clearance(c.on, GrantPermission(c.on.Type)); err != nil {
+			if err := a.labelAllows(ctx, a.db, c.on, nil, labels, GrantPermission(c.on.Type), values); err != nil {
 				return nil, err
 			}
 		}
@@ -2105,15 +2110,15 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 }
 
 // mayReachAgain checks what mayReach checked again, in a change's transaction, reading the
-// constraints' answers from before it rather than ask them again, the actor's label values too.
-func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject, checks []*reachCheck, labels *constrained) error {
+// constraints' answers from before it rather than ask them again, the actor's label values too,
+// decided by values as mayReach decided them.
+func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject, checks []*reachCheck, labels *constrained, values *valuesRead) error {
 	granting, denying, err := a.reachAuthority(ctx, tx, actor, checks)
 	if err != nil {
 		return err
 	}
-	clearance := a.labelCheck(ctx, tx, labels)
 	if slices.ContainsFunc(checks, func(c *reachCheck) bool { return c.cleared }) {
-		if err := a.stillClearsAll(ctx, tx, labels); err != nil {
+		if err := a.stillClearsAll(ctx, tx, labels, values); err != nil {
 			return err
 		}
 	}
@@ -2131,7 +2136,7 @@ func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject
 			}
 		}
 		if c.leaves && !c.cleared {
-			if err := clearance(c.on, GrantPermission(c.on.Type)); err != nil {
+			if err := a.labelAllows(ctx, tx, c.on, nil, labels, GrantPermission(c.on.Type), values); err != nil {
 				return err
 			}
 		}

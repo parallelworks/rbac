@@ -961,7 +961,7 @@ func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authorit
 	if grows != nil && reach.labels.cs != nil {
 		reach.listing = labeling{cs: reach.labels.cs}
 		if len(scopes.listed) > 0 {
-			if reach.listing.cleared, err = a.clearsAll(ctx, a.db, reach.listing.cs); err != nil {
+			if reach.listing.cleared, err = a.clearsAll(ctx, a.db, reach.listing.cs, nil); err != nil {
 				return roleReach{}, err
 			}
 		}
@@ -1210,7 +1210,7 @@ func (a *Authorizer) labelsAsked(ctx context.Context, actor Subject, tenant stri
 		return l, nil
 	}
 	var err error
-	l.cleared, err = a.clearsAll(ctx, a.db, l.cs)
+	l.cleared, err = a.clearsAll(ctx, a.db, l.cs, nil)
 	return l, err
 }
 
@@ -1220,9 +1220,8 @@ func (a *Authorizer) labelsHeld(ctx context.Context, q DB, l labeling) error {
 	if !l.asks() {
 		return nil
 	}
-	clearance := a.labelCheck(ctx, q, l.cs)
 	for _, on := range l.labeled {
-		if err := clearance(on, GrantPermission(on.Type)); err != nil {
+		if err := a.labelAllows(ctx, q, on, nil, l.cs, GrantPermission(on.Type), nil); err != nil {
 			return err
 		}
 	}
@@ -1238,7 +1237,7 @@ func (a *Authorizer) stillLabeled(ctx context.Context, tx pgx.Tx, checked labeli
 	}
 	checked.cs.seal()
 	if checked.cleared {
-		return a.stillClearsAll(ctx, tx, checked.cs)
+		return a.stillClearsAll(ctx, tx, checked.cs, nil)
 	}
 	return a.labelsHeld(ctx, tx, checked)
 }

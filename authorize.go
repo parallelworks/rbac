@@ -56,7 +56,7 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 		return d, err
 	}
 	r = a.decidedOn(p, r)
-	h, _, err := a.holdingFrom(ctx, a.db, s, a.constrain(ctx, s, tenantResource(r.Tenant)), values)
+	h, _, err := a.holdingOf(ctx, r.Tenant, s, values)
 	if err != nil {
 		return Decision{}, err
 	}
@@ -310,7 +310,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 	// (decidedOn).
 	var only func(Permission) bool
 	if r.Labels.asks() {
-		h, _, err := a.holdingFrom(ctx, a.db, s, a.constrain(ctx, s, tenantResource(r.Tenant)), onTenant(r.Tenant, held, ds, roles))
+		h, _, err := a.holdingOf(ctx, r.Tenant, s, onTenant(r.Tenant, held, ds, roles))
 		switch {
 		case err != nil:
 			return nil, err
@@ -609,7 +609,7 @@ func (a *Authorizer) labeled(ctx context.Context, p Permission, r Resource, hold
 			continue
 		}
 		s := Subject{Principal: h.Principal}
-		holding, byCondition, err := a.holdingFrom(ctx, a.db, s, a.constrain(ctx, s, tenantResource(r.Tenant)), values[h.Principal.key()])
+		holding, byCondition, err := a.holdingOf(ctx, r.Tenant, s, values[h.Principal.key()])
 		if err != nil {
 			return nil, err
 		}
@@ -1046,7 +1046,7 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 		return reach, err
 	}
 	// Decided outside the snapshot, as its constraints run as for any read.
-	reach.Labels, _, err = a.holdingFrom(ctx, a.db, s, a.constrain(ctx, s, tenantResource(tenant)), got.values)
+	reach.Labels, _, err = a.holdingOf(ctx, tenant, s, got.values)
 	if err != nil || reach.Labels.excludes(p) {
 		return Reach{}, err
 	}
@@ -1557,8 +1557,9 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 	if with.values {
 		got.values = &valuesRead{roles: got.roles}
 	}
-	// The anonymous are the public alone.
-	if s.Principal == (Principal{}) && !counts.public && !with.values {
+	// The anonymous are the public alone: where it doesn't count, nothing gives the anonymous p, so
+	// no label of it is decided either.
+	if s.Principal == (Principal{}) && !counts.public {
 		return got, nil
 	}
 	var perm, wildcard string
