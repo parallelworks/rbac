@@ -3324,6 +3324,10 @@ func TestChecksUnderAGenericPlanReadOnlyTheirSubjectsGrants(t *testing.T) {
 			"Apply": func(a *rbac.Authorizer) error {
 				return a.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: ann.Principal}}})
 			},
+			// Granted again as it is stored, which the change looks up by its whole key.
+			"Apply under a condition": func(a *rbac.Authorizer) error {
+				return a.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{sudo.Binding}})
+			},
 			"Grantable in a nested group": func(a *rbac.Authorizer) error { return second(a.Grantable(ctx, boss, cluster)) },
 			"Apply in a nested group": func(a *rbac.Authorizer) error {
 				return a.Apply(ctx, boss, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: owner.Principal}}})

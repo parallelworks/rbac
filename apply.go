@@ -1958,11 +1958,12 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 	}
 	// One it neither added nor rewrote is stored as it is, unless a stored grant shares its key but
 	// for a condition of its length and hash, which the key index can't tell from its own: then the
-	// statement stored nothing. Each is looked up by the whole key, which OFFSET 0 keeps a lookup
-	// of its own: as an anti-join, a generic plan can read every grant in the tenant.
+	// statement stored nothing. No other condition has an empty one's length, so an unconditional
+	// one, as most are, is never looked up. Each is looked up by the whole key, which OFFSET 0 keeps
+	// a lookup of its own: as an anti-join, a generic plan can read every grant in the tenant.
 	var left []int64
 	for i, g := range grants {
-		if !written[scopedKeyOf(g)] {
+		if g.Condition.Expression != "" && !written[scopedKeyOf(g)] {
 			left = append(left, int64(i+1))
 		}
 	}
