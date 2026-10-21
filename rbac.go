@@ -588,7 +588,9 @@ func conflicted(err error) error {
 // Lengths are in characters, but an expression's, in bytes.
 const (
 	// MaxBindings is how many bindings one Apply, grants and revokes together, or one Import takes,
-	// and MaxGrantsPerRole how many grants in force of one role a principal holds on one scope,
+	// and how many grants and eligibilities of their groups the members one ChangeMembers or
+	// ImportMembers adds gain in all, each member's counted apart, as the host is asked about each,
+	// but one member alone, which gains whatever its groups hold; and MaxGrantsPerRole how many grants in force of one role a principal holds on one scope,
 	// differing by source, expiry or condition, as cloud IAM bounds bindings of one role: those from
 	// each source the host owns (Config.Sources) counted apart.
 	MaxBindings      = 1000

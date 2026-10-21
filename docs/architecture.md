@@ -271,7 +271,10 @@ flowchart BT
   group holds, so `ChangeMembers` needs the authority to grant all of it, and the host's
   `ValidateGrant` is asked as for a grant. The same holds for nesting one group in another, and a
   change that adds a member and nests its group asks about the member against every group it
-  will be in.
+  will be in. What a change reaches is read once for each group (`reach`, indexed by the keys it
+  names), and its grants are decided once for each role, condition and end on a scope, as the
+  member a grant names decides nothing of the actor's power to make it; only the host is asked
+  about each member's, which `MaxBindings` bounds.
 - **Expanding down** from groups to their identities, for lists and changes, is `insideSQL`. It
   finds nested groups in the statement and their identities through `rbac_group_members`, which
   plans its query for the groups reached, so a small group's members are read alone however large
@@ -694,7 +697,10 @@ Every input that could grow without limit is bounded, so no call's cost depends 
 chose to store beyond these, but for the groups a subject is in through others (below) and for the
 lists, which read what they list: `Filter` reads the subject's grants on the scopes that can reach
 the listed type and the denies on them, and costs each row a few lookups among them however many
-there are. The tables hold rows within the same bounds, but for the ids in a deny's principals and
+there are; and for the changes that check, once each, every scope what they change has access on:
+`ChangeMembers` every scope the groups whose members change have access on, approve eligibilities
+on or are named or exempt in a deny on, and `SetRole` and `DeleteRole` every scope a role is
+granted on. The tables hold rows within the same bounds, but for the ids in a deny's principals and
 exemptions and an eligibility's approvers: a check can count an array element's bytes only with a
 function of the package's own, which every role writing the table would need `EXECUTE` on, so the
 tables count those in characters, to `MaxID`, and a role that writes around the package can store
@@ -704,7 +710,7 @@ same.
 | Bound | Value | What it limits |
 |---|---|---|
 | `MaxID` | 512 bytes | A tenant's, scope's or principal's id. |
-| `MaxBindings` | 1,000 | Bindings in one `Apply`, and the grants, memberships, groups or members one `Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`, `DeleteGroups`, `ImportMembers`, `ChangeMembers` or `DeleteMembers` takes. |
+| `MaxBindings` | 1,000 | Bindings in one `Apply`, and the grants, memberships, groups or members one `Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`, `DeleteGroups`, `ImportMembers`, `ChangeMembers` or `DeleteMembers` takes, and the grants and eligibilities the members one `ImportMembers` or `ChangeMembers` adds gain, each member's counted apart, as `ValidateGrant` is asked about each, but one member alone, which gains whatever its groups hold. |
 | `MaxGrantsPerRole` | 20 | Grants in force of one role to one principal on one scope, differing by source, expiry or condition. Those from each source the host owns count apart. |
 | `MaxDenies`, `MaxDenyEntries` | 100, 256 | Denies on a scope, and the principals, exemptions or permissions one names. |
 | `MaxCustomRoles`, `MaxRoleEntries`, `MaxGrantableRoles` | 300, 1,000, 64 | Custom roles in a tenant, the permissions one gives and the types it is for, and roles one lists in `GrantableRoles`. |

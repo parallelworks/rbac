@@ -4459,6 +4459,89 @@ func TestChangingManyMembersReadsWhatTheirGroupReachesOnce(t *testing.T) {
 	}
 }
 
+// The host is asked about each grant and eligibility a member gains as the member's, so the members
+// one change adds gain at most MaxBindings of them, each member's counted apart, as one Apply makes
+// at most as many grants: past it, ChangeMembers and ImportMembers are refused before the host is
+// asked about any, or the actor's power to make them decided. A member whose place lasts as long
+// already gains nothing, so counts for nothing, and one alone gains whatever its group holds, or a
+// group holding more could never gain one.
+func TestMembersGainAtMostMaxBindingsGrantsInAChange(t *testing.T) {
+	const grants = 100
+	members := rbac.MaxBindings / grants
+	var validated, resourceOf, decided int
+	h := grouped(t, func(c *rbac.Config) {
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			if in.Via == rbac.ViaMembership {
+				validated++
+			}
+			return validate(ctx, q, in)
+		}
+		of := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s.Type == "cluster" {
+				resourceOf++
+			}
+			return of(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	h.groups(t, "crew", "all")
+	// Each group holds a role on each of n clusters, which the manager may grant there.
+	for group, n := range map[string]int{"crew": grants, "all": rbac.MaxBindings + 1} {
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', $1 || i, p, id, r FROM generate_series(1, $2::int) i,
+			  (VALUES ('group', $1, 'cluster.login'), ('user', 'manager', 'cluster.admin')) AS g(p, id, r)`, group, n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rbac.SetDecidingGrants(t, func() func() {
+		decided++
+		return func() {}
+	})
+	var ids []string
+	var add []rbac.Member
+	for i := range members + 1 {
+		ids = append(ids, fmt.Sprintf("m%d", i))
+		add = append(add, rbac.Member{Group: "crew", Principal: identity(ids[i])})
+	}
+	h.join(t, ids...)
+	manager := h.as(t, "manager")
+	for name, change := range map[string]func([]rbac.Member) error{
+		"ChangeMembers": func(ms []rbac.Member) error { return h.authz.ChangeMembers(ctx, manager, "t1", ms, nil) },
+		"ImportMembers": func(ms []rbac.Member) error { return h.authz.ImportMembers(ctx, host, "t1", ms) },
+	} {
+		validated, resourceOf, decided = 0, 0, 0
+		if err := change(add); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s: %d members gaining %d grants each: %v", name, len(add), grants, err)
+		}
+		if validated+resourceOf+decided > 0 {
+			t.Errorf("%s: refused having asked Config.ValidateGrant %d times and Config.ResourceOf %d, and decided grants on %d scopes",
+				name, validated, resourceOf, decided)
+		}
+	}
+	validated = 0
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", add[:members], nil); err != nil || validated != rbac.MaxBindings {
+		t.Fatalf("%d members gaining %d grants each: %v, Config.ValidateGrant asked %d times", members, grants, err, validated)
+	}
+	for i := range members {
+		add[i].Note = "kept"
+	}
+	validated = 0
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", add, nil); err != nil || validated != grants {
+		t.Fatalf("one member gaining %d grants, and %d whose notes alone change: %v, Config.ValidateGrant asked %d times", grants, members, err, validated)
+	}
+	h.join(t, "x", "y")
+	two := []rbac.Member{{Group: "all", Principal: identity("x")}, {Group: "all", Principal: identity("y")}}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", two, nil); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("two members each gaining %d grants: %v", rbac.MaxBindings+1, err)
+	}
+	validated = 0
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", two[:1], nil); err != nil || validated != rbac.MaxBindings+1 {
+		t.Fatalf("one member alone gaining %d grants: %v, Config.ValidateGrant asked %d times", rbac.MaxBindings+1, err, validated)
+	}
+}
+
 // A change to members is checked again in its transaction: an actor that lost the power to make
 // what it makes while the host was asked about it is refused.
 func TestChangingMembersIsCheckedAgainUnderItsLocks(t *testing.T) {

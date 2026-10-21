@@ -279,7 +279,15 @@ conditional ones reach, to check one by one.
   sooner gains nothing: it is a removal then, checked as one now; nor does one whose note alone
   changes. So whoever manages a group that holds, approves and is in no deny, and that no member
   activated through, changes its members freely, and one holding a role only if they could grant
-  that role themselves.
+  that role themselves. Whether the actor may make a grant is decided once, however many members
+  gain it, but the host is asked about each as each member's, so the members one `ChangeMembers` or
+  `ImportMembers` adds gain at most `rbac.MaxBindings` grants and eligibilities in all, each
+  member's counted apart, but one member alone, which gains whatever its groups hold. The rest is
+  each group's, read once however many of its members change, and grows with what the group holds,
+  approves and is named or exempt in, so grant a group on a container rather than on each resource
+  in it: with labels declared, a removal asks
+  `Config.ResourceOf` about each scope its members lose access on, but where the actor's label
+  values satisfy every label.
   `Config.ResourceOf` gives the package the tenant, which `SetGroup` and `DeleteGroup` check
   `rbac.ManageGroups` on, and the groups, which `ChangeMembers` checks `rbac.GroupMembers` on and
   `SetGroup` and `DeleteGroup` the label of, each with its constraints and label, and the
@@ -544,18 +552,19 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   can leave out of every role: then it is denied like any other. To retire a type, keep one of its
   permissions there until its scopes are deleted; `DeletePrincipal` and `DeleteTenant` remove
   grants on any type.
-- **Limits:** a change takes at most `rbac.MaxBindings` bindings; a principal holds a role on a
-  scope at most `rbac.MaxGrantsPerRole` times, and is in a group at most `rbac.MaxPlacesInGroup`
-  times, by source, and directly in at most `rbac.MaxGroupsOfPrincipal` groups, from each source
-  the host owns apart, which bounds the groups a check reads through others only level by level, so
-  keep nesting narrow; a scope holds at most `rbac.MaxDenies` denies; a tenant has at most
-  `rbac.MaxCustomRoles` custom roles; an id is at most `rbac.MaxID` bytes. The others are exported
-  beside them. Lists have no limit or cursor, so what one returns grows with what it lists:
-  `Memberships` of a whole tenant with its members and guests, `Groups` with its groups, `Members`
-  with a group's members, `Holders` with who holds the permission, `Grants` and `Eligibilities` on
-  the tenant's scope with what is granted there, `Reach.Scopes` with the scopes a subject's grants
-  are on, and `Conflicts` with the identities in conflict. In a large tenant, ask for less:
-  `Memberships` of named principals, `Grants` of one principal.
+- **Limits:** a change takes at most `rbac.MaxBindings` bindings, and the members one adds gain at
+  most as many grants and eligibilities, each member's counted apart, but one alone; a principal
+  holds a role on a scope at most `rbac.MaxGrantsPerRole` times, and is in a group at most
+  `rbac.MaxPlacesInGroup` times, by source, and directly in at most `rbac.MaxGroupsOfPrincipal`
+  groups, from each source the host owns apart, which bounds the groups a check reads through others
+  only level by level, so keep nesting narrow; a scope holds at most `rbac.MaxDenies` denies; a
+  tenant has at most `rbac.MaxCustomRoles` custom roles; an id is at most `rbac.MaxID` bytes. The
+  others are exported beside them. Lists have no limit or cursor, so what one returns grows with
+  what it lists: `Memberships` of a whole tenant with its members and guests, `Groups` with its
+  groups, `Members` with a group's members, `Holders` with who holds the permission, `Grants` and
+  `Eligibilities` on the tenant's scope with what is granted there, `Reach.Scopes` with the scopes a
+  subject's grants are on, and `Conflicts` with the identities in conflict. In a large tenant, ask
+  for less: `Memberships` of named principals, `Grants` of one principal.
 - **JIT:** turn JIT compilation off for the application's role, as in
   `ALTER ROLE app SET jit = off`, which a session takes as it starts, so a pool's connections take
   it once they reconnect. The planner can't tell how far a walk of a subject's groups goes, so for

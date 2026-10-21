@@ -1140,7 +1140,8 @@ func keyedAll(members []Member) error {
 // itself, nor a chain of more than MaxGroupDepth groups; and a principal is in a group at most
 // MaxPlacesInGroup times, and in at most MaxGroupsOfPrincipal groups. Config.ValidateGrant is asked
 // about each grant and eligibility a member gains, as with ChangeMembers, so about none of a place
-// made to end sooner, or whose note alone changes.
+// made to end sooner, or whose note alone changes, and the members gain at most MaxBindings in all,
+// but one alone.
 func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant string, members []Member) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "ImportMembers")
@@ -1162,6 +1163,9 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 	}
 	rc, err := a.reachOf(ctx, a.db, tenant, set, nil, nil, true)
 	if err != nil {
+		return err
+	}
+	if err := rc.gainsWithin(set); err != nil {
 		return err
 	}
 	stand, err := a.askMemberships(ctx, Subject{Principal: actor}, tenant, set, rc)
@@ -1393,6 +1397,14 @@ func (a *Authorizer) placesBounded(ctx context.Context, tx pgx.Tx, tenant string
 // Config.ResourceOf returns it, a group no member gains a place in that the host no longer has
 // (ErrNotFound) as unlabeled. Members from a source the host owns, and the members of a group from
 // one, only the host changes, and what ImportMembers refuses, this does.
+//
+// The members a change adds gain at most MaxBindings grants and eligibilities in all, each member's
+// counted apart, as the host is asked about each, but one alone, which gains whatever its groups
+// hold; whether the actor may make one is decided once, however many members gain it. The rest of
+// what a change checks is its groups', read once for each group however many of its members
+// change, so it grows with what the groups hold, approve and are named or exempt in, as SetRole's
+// does with a role's grants: with Labels declared, a removal asks Config.ResourceOf about each scope
+// its members lose access on, but where the actor's label values satisfy every label.
 func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant string, add, remove []Member) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "ChangeMembers")
@@ -1450,6 +1462,9 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 	}
 	rc, err := a.reachOf(ctx, a.db, tenant, set, remove, &left, false)
 	if err != nil {
+		return err
+	}
+	if err := rc.gainsWithin(set); err != nil {
 		return err
 	}
 	checks, err := a.mayReach(ctx, actor, tenant, set, remove, rc, labels, values)
@@ -2016,6 +2031,30 @@ func (r reach) activatedBy(m Member) []Scope {
 		}
 	}
 	return ss
+}
+
+// gainsWithin refuses members added that gain more than MaxBindings grants and eligibilities in
+// all, each member's counted apart, as many as one Apply makes: the host is asked about each as the
+// member's. One member gaining anything alone gains whatever its groups hold, as a grant to a group
+// reaches each member, or a group holding more could never gain one. Refused before anything is
+// asked about them, and never more under the locks, where stillReached refuses a group holding more
+// than was read.
+func (r reach) gainsWithin(add []Member) error {
+	n, gainers, held := 0, 0, map[string]int{}
+	for _, m := range r.gaining(add) {
+		k, ok := held[m.Group]
+		if !ok {
+			k = len(r.heldOf.of(r.up, m.Group))
+			held[m.Group] = k
+		}
+		if k > 0 {
+			n, gainers = n+k, gainers+1
+		}
+		if n > MaxBindings && gainers > 1 {
+			return fmt.Errorf("%w: the members a change adds gain at most %d grants and eligibilities of their groups in all, each member's counted apart, but for one alone: add fewer at a time", ErrInvalid, MaxBindings)
+		}
+	}
+	return nil
 }
 
 // byGroup is the members of ms by their group, each group's in order: what a member gains, but for
