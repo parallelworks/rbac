@@ -2650,6 +2650,32 @@ func TestAChangeAsOfATimeIsNotReportedRefused(t *testing.T) {
 	}
 }
 
+// A change refused under its locks before it reads the clock there is dated the time it decided
+// at, its last reading, not one taken once its transaction ended.
+func TestARefusalIsDatedTheTimeTheChangeDecidedAt(t *testing.T) {
+	var readings []time.Time
+	var refused []rbac.Refusal
+	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	h := setup(t, func(c *rbac.Config) {
+		c.Now = func() time.Time {
+			at := base.Add(time.Duration(len(readings)) * time.Minute)
+			readings = append(readings, at)
+			return at
+		}
+		c.OnRefused = func(_ context.Context, r rbac.Refusal) { refused = append(refused, r) }
+	})
+	owner := h.as(t, "owner")
+	readings = nil
+	// The group is looked for under the locks, which need no time.
+	nosuch := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.Group, ID: "nosuch"}}}}
+	if err := h.authz.Apply(t.Context(), owner, cluster, nosuch); !errors.Is(err, rbac.ErrInvalid) || len(refused) != 1 {
+		t.Fatalf("Apply = %v, reported %+v", err, refused)
+	}
+	if len(readings) != 1 || !refused[0].At.Equal(readings[0]) {
+		t.Errorf("the change read the clock at %v, and its refusal is dated %v", readings, refused[0].At)
+	}
+}
+
 // cursorAt is a cursor at the record query finds, as an export that read up to it. Not one History
 // gives, which a transaction running anywhere in the cluster holds back.
 func cursorAt(t *testing.T, h *harness, query string, args ...any) rbac.Cursor {

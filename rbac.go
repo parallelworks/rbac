@@ -979,12 +979,23 @@ func (a *Authorizer) still() *Authorizer {
 type callClock struct {
 	host func() time.Time
 	at   time.Time
-	read bool
+	// read is cleared by a change's transaction, which reads the clock again, leaving at the last
+	// reading till then; taken is set once at is one.
+	read, taken bool
 }
 
 func (c *callClock) now() time.Time {
 	if !c.read {
-		c.at, c.read = c.host(), true
+		c.at, c.read, c.taken = c.host(), true, true
+	}
+	return c.at
+}
+
+// decided is the time the call decided at: the clock's last reading, which a change refused under
+// its locks before it read the clock there decided by too, or one now where the call read none.
+func (c *callClock) decided() time.Time {
+	if !c.taken {
+		return c.now()
 	}
 	return c.at
 }
