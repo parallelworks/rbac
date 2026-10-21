@@ -333,15 +333,16 @@ func canonical(r RoleDefinition) RoleDefinition {
 // and where it will give more, under the denies on the path of each scope that one, or a role
 // listing that one, is granted on, as their holders there may then grant it, the latter's by
 // granting that one first, and with that scope's label, unless the actor's label values satisfy
-// every label. Replacing one so that its grants give something
-// else changes them, so a constraint that stops changes to grants where it can be granted, or a
-// deny that removes the actor's power to change them there or on the path of a scope they are on,
-// stops it, as it stops DeleteRole and Apply there; so does, where they will give more, a deny on
-// that path that removes a permission the role gives, which the actor would hand on there. The
-// scopes are as Config.ResourceOf gives them. A role another change redefined or created while
-// this one waited for the tenant is refused, to be tried again: the constraints were asked about
-// it as it was, as is one granted meanwhile, or a role listing it, on a scope the host wasn't asked
-// about. One deleted meanwhile is created, as its grants went with it.
+// every label. Replacing one so that its grants give something else changes them, so a
+// constraint that stops changes to grants where it can be granted or is, as narrowing it leaves
+// its grants on scopes of types it is no longer for, or a deny that removes the actor's power to
+// change them there or on the path of a scope they are on, stops it, as it stops DeleteRole and
+// Apply there; so does, where they will give more, a deny on that path that removes a permission
+// the role gives, which the actor would hand on there. The scopes are as Config.ResourceOf gives
+// them. A role another change redefined or created while this one waited for the tenant is
+// refused, to be tried again: the constraints were asked about it as it was, as is one granted
+// meanwhile on a scope of a type they weren't asked about, or, it or a role listing it, on a scope
+// the host wasn't asked about. One deleted meanwhile is created, as its grants went with it.
 //
 // Redefining a role so that its grants give more, or so that it becomes privileged, changes what
 // grants already made give: Config.ValidateGrant is asked about each of its grants and
@@ -383,21 +384,14 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 	change := fmt.Sprintf("changing what %s's grants give", r.ID)
 	var reach roleReach
 	if existed && !sameAccess(checked, r) {
-		// Its grants are on scopes of the types it is for, and on those it was for before and is
-		// for again, whose grants it brings back.
-		types := slices.Concat(checked.ResourceTypes, r.ResourceTypes)
-		if err := a.changesStopped(ctx, actor, tenant, types, change); err != nil {
-			return err
-		}
-		if err := a.changesDenied(au, tenant, types, change); err != nil {
-			return err
-		}
 		// Narrowed, it only takes access away, as deleting it does.
 		var grows *RoleDefinition
 		if givesMore(checked, r) {
 			grows = &r
 		}
-		if reach, err = a.roleReachOf(ctx, actor, au, tenant, r.ID, grows, change); err != nil {
+		// Its grants are on scopes of the types it is for, and on those it was for before and is
+		// for again, whose grants it brings back.
+		if reach, err = a.roleReachOf(ctx, actor, au, tenant, r.ID, slices.Concat(checked.ResourceTypes, r.ResourceTypes), grows, change); err != nil {
 			return err
 		}
 	}
@@ -423,10 +417,7 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 		// Again on the denies read under the lock, which a deny set meanwhile is among, and on the
 		// scopes its grants are on now, which roleReachOf checked as they were.
 		if ok && !sameAccess(old, r) {
-			if err := a.changesDenied(au, tenant, slices.Concat(old.ResourceTypes, r.ResourceTypes), change); err != nil {
-				return ChangeEvent{}, err
-			}
-			if err := a.stillReaches(ctx, tx, actor, au, tenant, r.ID, reach, change); err != nil {
+			if err := a.stillReaches(ctx, tx, actor, au, tenant, r.ID, slices.Concat(old.ResourceTypes, r.ResourceTypes), reach, change); err != nil {
 				return ChangeEvent{}, err
 			}
 		}
@@ -541,10 +532,12 @@ func (a *Authorizer) tenantBuckets(ctx context.Context, q DB, tenant string, id 
 // GrantableRoles: redefine that one first, or a role later defined with the id would be handed
 // out through it. It refuses a role granted from a source the host owns (Config.Sources), whose
 // grants only the host removes. Deleting it revokes its grants, so a constraint or deny that stops
-// the actor changing grants where it can be granted, or a deny on the path of a scope it is
-// granted on that removes the actor's power to change grants there, stops it, as in SetRole.
+// the actor changing grants where it can be granted or is, as on scopes of a type it was narrowed
+// off, or a deny on the path of a scope it is granted on that removes the actor's power to change
+// grants there, stops it, as in SetRole.
 // Deleting a role that doesn't exist does nothing; one changed while the deletion waited for the
-// tenant is refused, as in SetRole.
+// tenant, or granted meanwhile on a scope of a type the constraints weren't asked about, is
+// refused, as in SetRole.
 func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant string, id Role) (err error) {
 	defer a.refused(ctx, &err, tenant, actor.Principal, "DeleteRole")
 	if !validID(tenant) || !isCustom(id) || !validText(string(id)) {
@@ -559,7 +552,7 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		return err
 	}
 	// Deleting it revokes its grants, so a constraint or deny that stops changes to grants where it
-	// can be granted stops deleting it, as it would revoking one by one.
+	// can be granted, or is, stops deleting it, as it would revoking one by one.
 	roles, err := a.book(ctx, a.db, tenant, []Role{id})
 	if err != nil {
 		return err
@@ -568,13 +561,7 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 	change := "revoking " + string(id)
 	var reach roleReach
 	if existed {
-		if err := a.changesStopped(ctx, actor, tenant, checked.ResourceTypes, change); err != nil {
-			return err
-		}
-		if err := a.changesDenied(au, tenant, checked.ResourceTypes, change); err != nil {
-			return err
-		}
-		if reach, err = a.roleReachOf(ctx, actor, au, tenant, id, nil, change); err != nil {
+		if reach, err = a.roleReachOf(ctx, actor, au, tenant, id, checked.ResourceTypes, nil, change); err != nil {
 			return err
 		}
 	}
@@ -594,10 +581,7 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 			return ChangeEvent{}, changedMeanwhile(id)
 		}
 		if existed {
-			if err := a.changesDenied(au, tenant, checked.ResourceTypes, change); err != nil {
-				return ChangeEvent{}, err
-			}
-			if err := a.stillReaches(ctx, tx, actor, au, tenant, id, reach, change); err != nil {
+			if err := a.stillReaches(ctx, tx, actor, au, tenant, id, checked.ResourceTypes, reach, change); err != nil {
 				return ChangeEvent{}, err
 			}
 		}
@@ -730,9 +714,7 @@ func (a *Authorizer) revalidations(ctx context.Context, q DB, tenant string, wid
 	for id := range widened {
 		ids = append(ids, string(id))
 	}
-	// The LIKE matches the partial indexes on custom roles' grants and eligibilities.
-	const ofRoles = `tenant = $1 AND role = ANY($2::text[]) AND role LIKE 'custom.%' AND (expires_at IS NULL OR expires_at > $3)`
-	rows, err := q.Query(ctx, `SELECT `+grantColumns+` FROM rbac_grants WHERE `+ofRoles+` ORDER BY id`, tenant, ids, a.cfg.Now())
+	rows, err := q.Query(ctx, `SELECT `+grantColumns+` FROM (`+customRoleRows("$2", "rbac_grants", "*", inForce)+`) g ORDER BY id`, tenant, ids, a.cfg.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -740,7 +722,8 @@ func (a *Authorizer) revalidations(ctx context.Context, q DB, tenant string, wid
 	if err != nil {
 		return nil, err
 	}
-	rows, err = q.Query(ctx, `SELECT `+eligibilityColumns+` FROM rbac_eligibilities WHERE `+ofRoles+` ORDER BY scope, principal, role`, tenant, ids, a.cfg.Now())
+	rows, err = q.Query(ctx, `SELECT `+eligibilityColumns+` FROM (`+customRoleRows("$2", "rbac_eligibilities", "*", inForce)+`) e
+		ORDER BY scope, principal, role`, tenant, ids, a.cfg.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -809,10 +792,12 @@ func (a *Authorizer) revalidate(ctx context.Context, actor Subject, tenant strin
 
 // roleReach is what a change to what a custom role's grants and eligibilities give, or deleting
 // the role, checked of the scopes it reaches before its transaction, which stillReaches checks
-// again under the tenant's lock: each scope as Config.ResourceOf gives it, where a deny or a label
-// needed it, the role as it will be where its grants will give more, and the labels of the scopes
-// they are on and, where they will, of those roles listing it are granted on (listing).
+// again under the tenant's lock: the types of scope the constraints were asked about, each scope as
+// Config.ResourceOf gives it, where a deny or a label needed it, the role as it will be where its
+// grants will give more, and the labels of the scopes they are on and, where they will, of those
+// roles listing it are granted on (listing).
 type roleReach struct {
+	types           []string
 	on              map[Scope]Resource
 	grows           *RoleDefinition
 	labels, listing labeling
@@ -828,6 +813,17 @@ type reached struct {
 }
 
 func (r reached) any() bool { return len(r.own)+len(r.listed) > 0 }
+
+// types are the types of the scopes its grants and eligibilities are on.
+func (r reached) types() []string {
+	var types []string
+	for _, s := range r.own {
+		if !slices.Contains(types, s.Type) {
+			types = append(types, s.Type)
+		}
+	}
+	return types
+}
 
 // reachedBy reads, on q, the scopes a change to custom role id reaches, with grows the role as it
 // will be where its grants will give more, and custom the tenant's custom roles, as read.
@@ -924,22 +920,34 @@ func (a *Authorizer) handingOn(custom map[Role]RoleDefinition, id Role, def Role
 }
 
 // roleReachOf refuses changing what a custom role's grants and eligibilities give, or revoking
-// them, where Apply would refuse the actor changing them: on a scope they are on, as
-// Config.ResourceOf gives it, where a deny on its path removes the actor's power to change grants
-// there or, with grows, the role as it will be when they will give more, a permission it gives, or
-// where its label refuses the actor (labelsHeld). With grows, it refuses too where a deny on the
-// path of a scope a role whose holders may grant it without holding it is granted on (handingOn)
-// keeps the actor from granting it there as it will be, as they then may (scopesDenied), or where
-// that scope's label refuses the actor, unless the actor's label values satisfy every label. Only a
-// deny on a scope other than the tenant can remove more there than the tenant's, which mayDefine and changesDenied check, so only
-// where one binds the actor, or a label could refuse it, is the host asked about the scopes.
-// Without grows, as for deleting or narrowing the role, which only takes access away, a scope the
-// host no longer has (ErrNotFound) is read as stored, with no containers or label. au is the
-// actor's authority on the tenant, which mayDefine checked the role on.
-func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authority, tenant string, id Role, grows *RoleDefinition, change string) (roleReach, error) {
+// them, where Apply would refuse the actor changing them: where a constraint, or a deny on the
+// tenant, removes its power to change grants on scopes of a type they can be on, as the role is for
+// types, or are on, as narrowing it leaves them on scopes of types it is no longer for; on a scope
+// they are on, as Config.ResourceOf gives it, where a deny on its path removes the actor's power to
+// change grants there or, with grows, the role as it will be when they will give more, a permission
+// it gives, or where its label refuses the actor (labelsHeld). With grows, it refuses too where a
+// deny on the path of a scope a role whose holders may grant it without holding it is granted on
+// (handingOn) keeps the actor from granting it there as it will be, as they then may
+// (scopesDenied), or where that scope's label refuses the actor. Only a deny on a scope other than
+// the tenant can remove more there than the tenant's, which mayDefine and changesDenied check, so
+// only where one binds the actor, or a label could refuse it, as none can where the actor's label
+// values satisfy every label, is the host asked about the scopes. Without grows, as for deleting
+// or narrowing the role, which only takes access away, a scope the host no longer has (ErrNotFound)
+// is read as stored, with no containers or label. au is the actor's authority on the tenant, which
+// mayDefine checked the role on.
+func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authority, tenant string, id Role, types []string, grows *RoleDefinition,
+	change string,
+) (roleReach, error) {
 	reach := roleReach{grows: grows}
 	scopes, err := a.reachedBy(ctx, a.db, tenant, id, au.roles.custom, grows)
 	if err != nil {
+		return roleReach{}, err
+	}
+	reach.types = a.grantedOn(slices.Concat(types, scopes.types()))
+	if err := a.changesStopped(ctx, actor, tenant, reach.types, change); err != nil {
+		return roleReach{}, err
+	}
+	if err := a.changesDenied(au, tenant, reach.types, change); err != nil {
 		return roleReach{}, err
 	}
 	denied := false
@@ -950,8 +958,7 @@ func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authorit
 	}
 	// Granted nowhere yet, it has no label to clear, so one granted while the change waits is
 	// refused, to be tried again.
-	removing := grows == nil
-	if reach.labels, err = a.labelsAsked(ctx, actor, tenant, removing && len(scopes.own) > 0); err != nil {
+	if reach.labels, err = a.labelsAsked(ctx, actor, tenant, len(scopes.own) > 0); err != nil {
 		return roleReach{}, err
 	}
 	// Widened, it gives the holders of a role listing it more to grant there, which a label of the
@@ -983,7 +990,7 @@ func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authorit
 		}
 		r, err := a.resourceOf(ctx, tenant, s)
 		switch {
-		case removing && errors.Is(err, ErrNotFound):
+		case grows == nil && errors.Is(err, ErrNotFound):
 			r = Resource{Tenant: tenant, Type: s.Type, ID: s.ID}
 		case err != nil:
 			return roleReach{}, err
@@ -1018,14 +1025,24 @@ func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authorit
 func scopeOrder(x, y Scope) int { return strings.Compare(x.Key(), y.Key()) }
 
 // stillReaches checks again, under the tenant's lock, what roleReachOf checked, on the scopes a
-// change to a custom role reaches now: the denies on their paths and the actor's label values,
-// read again, as one set or revoked meanwhile. Where a deny below the tenant now binds the actor,
-// or a label asks, a scope roleReachOf didn't ask the host about, as one the role, or one listing
-// it, was granted on while the change waited, refuses the change, to be tried again. au is the
-// actor's authority on the tenant read under the lock, with the tenant's custom roles as they are.
-func (a *Authorizer) stillReaches(ctx context.Context, tx pgx.Tx, actor Subject, au authority, tenant string, id Role, checked roleReach, change string) error {
+// change to a custom role for types reaches now: the denies on the tenant and on their paths and
+// the actor's label values, read again, as one set or revoked meanwhile. A scope of a type the
+// constraints weren't asked about, or, where a deny below the tenant now binds the actor or a label
+// asks, one roleReachOf didn't ask the host about, as one the role, or one listing it, was granted
+// on while the change waited, refuses the change, to be tried again. au is the actor's authority on
+// the tenant read under the lock, with the tenant's custom roles as they are.
+func (a *Authorizer) stillReaches(ctx context.Context, tx pgx.Tx, actor Subject, au authority, tenant string, id Role, types []string,
+	checked roleReach, change string,
+) error {
 	scopes, err := a.reachedBy(ctx, tx, tenant, id, au.roles.custom, checked.grows)
 	if err != nil {
+		return err
+	}
+	types = a.grantedOn(slices.Concat(types, scopes.types()))
+	if slices.ContainsFunc(types, func(t string) bool { return !slices.Contains(checked.types, t) }) {
+		return fmt.Errorf("%w: %s is granted on a type of scope this change didn't check, as through a grant made while it waited; try again", ErrConflict, id)
+	}
+	if err := a.changesDenied(au, tenant, types, change); err != nil {
 		return err
 	}
 	denied := false
@@ -1064,12 +1081,13 @@ func (a *Authorizer) stillReaches(ctx context.Context, tx pgx.Tx, actor Subject,
 }
 
 // deniedBelow reports, reading on q, whether a deny on a scope other than the tenant binds the
-// actor, as heldOrDenied reads the denies on a path.
+// actor, as heldOrDenied reads the denies on a path. They are found by the keys it is bound by
+// (naming), so the tenant's denies of others aren't read.
 func (a *Authorizer) deniedBelow(ctx context.Context, q DB, tenant string, actor Subject) (bool, error) {
 	var denied bool
 	err := q.QueryRow(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`
-		SELECT EXISTS (SELECT FROM rbac_denies WHERE tenant = $1 AND scope_type <> $4
-		  AND principals && ARRAY(SELECT k FROM bound) AND NOT exempt && ARRAY(SELECT k FROM exempted))`,
+		SELECT EXISTS (SELECT FROM rbac_denies WHERE `+naming("principals", "ARRAY(SELECT k FROM bound)")+` AND scope_type <> $4
+		  AND NOT exempt && ARRAY(SELECT k FROM exempted))`,
 		tenant, actor.identityKey(), a.cfg.Now(), TenantScope).Scan(&denied)
 	return denied, err
 }
@@ -1197,16 +1215,16 @@ func (l labeling) asks() bool { return l.cs != nil && !l.cleared }
 
 // labelsAsked is what a label of a scope a custom role's grants and eligibilities are on asks of a
 // change to what they give, or revoking them, as Apply's label check asks of changing grants there:
-// nothing without labels, and with removing, as for deleting or narrowing the role, nothing where
-// the actor's label values satisfy every label, as ChangeMembers asks nothing about a scope a
-// removal alone reaches, so the host isn't asked about the scopes. Labels are the host's, so they
-// are read before the change's transaction, and the actor's values again in it (stillLabeled).
-func (a *Authorizer) labelsAsked(ctx context.Context, actor Subject, tenant string, removing bool) (labeling, error) {
+// nothing without labels, and where they are on some scope (granted), nothing where the actor's
+// label values satisfy every label, as ChangeMembers asks nothing about a scope only a label checks,
+// so the host isn't asked about the scopes. Labels are the host's, so they are read before the
+// change's transaction, and the actor's values again in it (stillLabeled).
+func (a *Authorizer) labelsAsked(ctx context.Context, actor Subject, tenant string, granted bool) (labeling, error) {
 	if len(a.labels) == 0 {
 		return labeling{}, nil
 	}
 	l := labeling{cs: a.constrain(ctx, actor, tenantResource(tenant))}
-	if !removing {
+	if !granted {
 		return l, nil
 	}
 	var err error
@@ -1242,6 +1260,17 @@ func (a *Authorizer) stillLabeled(ctx context.Context, tx pgx.Tx, checked labeli
 	return a.labelsHeld(ctx, tx, checked)
 }
 
+// customRoleRows is SQL selecting cols of the rows of table, rbac_grants or rbac_eligibilities, in
+// the tenant $1 of the custom roles in the array ids for which where holds, a role at a time
+// (byKey), each through the partial index on custom roles' rows, which the LIKE matches. A generic
+// plan reads role = ANY(ids) by the key index, skipping over the tenant's every principal and scope.
+func customRoleRows(ids, table, cols, where string) string {
+	return byKey(ids, table, "role", cols, "tenant = $1 AND role LIKE 'custom.%' AND "+where)
+}
+
+// inForce is SQL for whether a grant or eligibility is in force at $3.
+const inForce = "(expires_at IS NULL OR expires_at > $3)"
+
 // roleScope is a scope a custom role's grants or eligibilities are on.
 type roleScope struct {
 	role Role
@@ -1255,14 +1284,10 @@ func (a *Authorizer) rolesScopes(ctx context.Context, q DB, tenant string, ids [
 	for i, id := range ids {
 		names[i] = string(id)
 	}
-	// The LIKE matches the partial indexes on custom roles' grants and eligibilities. Those ended
-	// give nothing, so changing what they give changes no access.
-	rows, err := q.Query(ctx, `
-		SELECT role, scope_type, scope_id FROM rbac_grants WHERE tenant = $1 AND role = ANY($2::text[]) AND role LIKE 'custom.%'
-		  AND (expires_at IS NULL OR expires_at > $3)
+	// Those ended give nothing, so changing what they give changes no access.
+	rows, err := q.Query(ctx, customRoleRows("$2", "rbac_grants", "role, scope_type, scope_id", inForce)+`
 		UNION
-		SELECT role, scope_type, scope_id FROM rbac_eligibilities WHERE tenant = $1 AND role = ANY($2::text[]) AND role LIKE 'custom.%'
-		  AND (expires_at IS NULL OR expires_at > $3)
+		`+customRoleRows("$2", "rbac_eligibilities", "role, scope_type, scope_id", inForce)+`
 		ORDER BY 2, 3, 1`, tenant, names, a.cfg.Now())
 	if err != nil {
 		return nil, err
@@ -1276,10 +1301,10 @@ func (a *Authorizer) rolesScopes(ctx context.Context, q DB, tenant string, ids [
 	return scopes, err
 }
 
-// changesStopped returns why a constraint stops changing every grant of a custom role: one that
-// stops changes to grants on scopes of one of the role's types, a container or the tenant.
-func (a *Authorizer) changesStopped(ctx context.Context, actor Subject, tenant string, roleTypes []string, change string) error {
-	for _, t := range a.grantedOn(roleTypes) {
+// changesStopped returns why a constraint stops changing a custom role's grants: one that stops
+// changes to grants on scopes of one of types, those they can be or are on.
+func (a *Authorizer) changesStopped(ctx context.Context, actor Subject, tenant string, types []string, change string) error {
+	for _, t := range types {
 		name, err := a.denied(ctx, ConstraintInput{Tenant: tenant, ResourceType: t, Permission: GrantPermission(t), Subject: &actor})
 		if err != nil {
 			return err
@@ -1291,11 +1316,11 @@ func (a *Authorizer) changesStopped(ctx context.Context, actor Subject, tenant s
 	return nil
 }
 
-// changesDenied returns why a deny stops the actor changing every grant of a custom role, as
-// changesStopped does for a constraint: one that removes its power to change grants on scopes of
-// one of the role's types, a container or the tenant.
-func (a *Authorizer) changesDenied(au authority, tenant string, roleTypes []string, change string) error {
-	for _, t := range a.grantedOn(roleTypes) {
+// changesDenied returns why a deny on the tenant, whose authority au is, stops the actor changing a
+// custom role's grants, as changesStopped does for a constraint: one that removes its power to
+// change grants on scopes of one of types.
+func (a *Authorizer) changesDenied(au authority, tenant string, types []string, change string) error {
+	for _, t := range types {
 		if au.handsOn(GrantPermission(t)) {
 			return &DeniedError{Permission: GrantPermission(t), Scope: TenantRoot(tenant), Reason: "removed by a deny, which stops " + change}
 		}
