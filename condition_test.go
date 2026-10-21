@@ -641,24 +641,28 @@ func TestAValueHoldingItselfFailsItsConditions(t *testing.T) {
 		m["self"] = m
 		l := []any{"x", nil}
 		l[1] = l
-		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"m": m, "l": l}); evaluated {
-			t.Errorf("%s evaluated, %v", expr, err)
+		refused := os.Getenv("RBAC_CONDITION_OF_A_CYCLE_REFUSED") != ""
+		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"m": m, "l": l}); evaluated || (err != nil) != refused {
+			t.Errorf("%s evaluated %t, %v", expr, evaluated, err)
 		}
 		return
 	}
-	for _, expr := range []string{
-		`google.protobuf.Struct{fields: request.attributes.m} != {}`,
-		`google.protobuf.ListValue{values: request.attributes.l} != []`,
-		`request.attributes.m == request.attributes.m`,
-		`request.attributes.l != request.attributes.l`,
-		`request.attributes.m in [request.attributes.m]`,
-		`[request.attributes.l] == [request.attributes.l] || {"a": request.attributes.m} == {"a": request.attributes.m}`,
-		`request.attributes.l.all(x, x == x)`,
-		`request.attributes.m.exists(k, request.attributes.m[k] == request.attributes.m)`,
-		`{"a": 1}[request.attributes.l] == 1 || {request.attributes.m: 1}[request.attributes.m] == 1`,
+	for expr, refused := range map[string]bool{
+		`google.protobuf.Struct{fields: request.attributes.m} != {}`:                                                     true,
+		`google.protobuf.ListValue{values: request.attributes.l} != []`:                                                  true,
+		`request.attributes.m == request.attributes.m`:                                                                   false,
+		`request.attributes.l != request.attributes.l`:                                                                   false,
+		`request.attributes.m in [request.attributes.m]`:                                                                 false,
+		`[request.attributes.l] == [request.attributes.l] || {"a": request.attributes.m} == {"a": request.attributes.m}`: false,
+		`request.attributes.l.all(x, x == x)`:                                                                            false,
+		`request.attributes.m.exists(k, request.attributes.m[k] == request.attributes.m)`:                                false,
+		`{"a": 1}[request.attributes.l] == 1 || {request.attributes.m: 1}[request.attributes.m] == 1`:                    false,
 	} {
 		cmd := exec.Command(os.Args[0], "-test.run=^TestAValueHoldingItselfFailsItsConditions$")
 		cmd.Env = append(os.Environ(), "RBAC_CONDITION_OF_A_CYCLE="+expr)
+		if refused {
+			cmd.Env = append(cmd.Env, "RBAC_CONDITION_OF_A_CYCLE_REFUSED=1")
+		}
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Errorf("%s: %v\n%.2000s", expr, err, out)
 		}
