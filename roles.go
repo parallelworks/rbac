@@ -205,29 +205,38 @@ func givingSQL(builtin, tenant, perm, resourceType string, custom bool, ids stri
 // through grants to the public and the tenant's members: the custom ones that are public, NULL
 // where no grant to the public gives p, as Filter and Reachable then read none and Holders drops
 // the public; of roles, the built-in ones that aren't privileged; and the custom ones that aren't.
-// The custom ones are those giving p there that grants to the public or the tenant's members name
-// on the scopes, or scopes of the types, on: only for those grants does it matter. grants is SQL
-// selecting the roles of the grants in the tenant $1 to the principal whose key is the SQL it is
-// given there, on is the array $4 (broadOn, broadAt). They are decided as Authorizer.current reads
-// them, as checks read them; pairing each one's permissions and types with the catalog's in SQL
-// took a search seconds.
+// The custom ones are those giving p there that the grants on the scopes, or scopes of the types,
+// on name of the broad principals in keys, those whose grants the search counts. Only for those
+// grants does it matter, and either principal's can be on thousands of resources, though the
+// anonymous and a guest count none of the members', and a search of a permission no public role
+// gives none of the public's. With identity, the tenant's members in keys are read only while the subject of that key
+// is one of them at now, as keysSQL counts them, for a search that reads its subject's keys in its
+// own statement (Filter). grants is SQL selecting the roles of the grants in the tenant $1 to the
+// principal whose key is the SQL it is given there, on is the array $4 (Authorizer.broadOn,
+// Authorizer.broadAt). They are decided as Authorizer.current reads them, as checks read them;
+// pairing each one's permissions and types with the catalog's in SQL took a search seconds.
 func (a *Authorizer) broadArgs(ctx context.Context, q DB, tenant string, p Permission, resourceType string, roles []string, custom bool,
-	grants func(principal string) string, on []string,
+	grants func(principal string) string, on, keys []string, identity string, now time.Time,
 ) ([]any, error) {
 	unprivileged := slices.DeleteFunc(slices.Clone(roles), func(id string) bool { return a.roles[Role(id)].Privileged })
 	// A grant to either never gives a permission to change access, so no search counts one for it.
-	if !custom || p.managesAccess() {
+	if !custom || p.managesAccess() || len(keys) == 0 {
 		return []any{nil, unprivileged, nil}, nil
 	}
-	// A broad key and a scope or a type at a time, the prefix tested apart (namedCustom), and the
-	// roles they name by key: matched to both keys at once, and tested for the prefix there, a
-	// generic plan read the grants by the custom roles' index on the tenant alone, every grant of one
-	// in the tenant for each scope or type; and as of a time, roles tested against the ids rather
-	// than read by them are each read at its newest version.
-	rows, err := q.Query(ctx, `SELECT `+roleColumns+` FROM (`+byKey(namedCustom(`SELECT g.role FROM unnest($5::text[]) AS b(k)
+	in, args := "$5::text[]", []any{tenant, string(p), resourceType, on, keys}
+	if identity != "" {
+		in = `ARRAY(SELECT k FROM unnest($5::text[]) AS c(k) WHERE k NOT LIKE 'members:%' OR EXISTS (SELECT FROM rbac_memberships
+			WHERE tenant = $1 AND principal = $6 AND (expires_at IS NULL OR expires_at > $7) AND NOT guest AND NOT suspended))`
+		args = append(args, identity, now)
+	}
+	// A broad key and a scope or a type at a time, and the roles they name by key: matched to both
+	// keys at once, a generic plan read the grants by the custom roles' index on the tenant alone,
+	// every grant of one in the tenant for each scope or type; and as of a time, roles tested
+	// against the ids rather than read by them are each read at its newest version.
+	rows, err := q.Query(ctx, `SELECT `+roleColumns+` FROM (`+byKey(namedCustom(`SELECT g.role FROM unnest(`+in+`) AS b(k)
 		CROSS JOIN LATERAL (`+grants("b.k")+`) g`), "rbac_roles", "id", roleColumns,
 		"tenant = $1 AND $2::text = ANY(permissions) AND $3::text = ANY(resource_types)")+`) r
-		ORDER BY id`, tenant, string(p), resourceType, on, broadKeys(tenant))
+		ORDER BY id`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -250,8 +259,11 @@ func (a *Authorizer) broadArgs(ctx context.Context, q DB, tenant string, p Permi
 	return []any{public, unprivileged, unprivilegedCustom}, nil
 }
 
-// broadKeys are the keys of a tenant's broad principals: the public and its members.
-func broadKeys(tenant string) []string { return []string{publicKey, TenantMembers(tenant).key()} }
+// broadKeys are the keys of a tenant's broad principals, the public and its members, whose grants a
+// read counts.
+func broadKeys(tenant string, b broad) []string {
+	return countedOf([]string{publicKey, TenantMembers(tenant).key()}, b)
+}
 
 // namedCustom is SQL for an array of the custom roles, each once, among those grants selects, SQL
 // for a column role. It tests the prefix outside grants, behind OFFSET 0 or a materialized CTE

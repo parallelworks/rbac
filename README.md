@@ -459,9 +459,9 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   would miss the writes it waits for.
   A migration that rebuilds an index, as `0009_grant_seeks` rebuilds two of `rbac_grants`, locks
   the table until it commits, so checks, lists and changes wait for the rebuild; one that builds
-  an index, as `0011_tenant_keys` builds three on `rbac_eligibilities` and `rbac_denies`, keeps
-  writes to the table waiting until it commits, though reads go on: on a large table, migrate when
-  that wait is acceptable. Code from before `0012_activation_through` must not run beside code
+  an index, as `0011_tenant_keys` builds three on `rbac_eligibilities` and `rbac_denies` and
+  `0019_custom_grant_principals` one on `rbac_grants`, keeps writes to the table waiting until it
+  commits, though reads go on: on a large table, migrate when that wait is acceptable. Code from before `0012_activation_through` must not run beside code
   after it: an activation it extends keeps the eligibility recorded before, and can outlast the one
   it was extended through. Stop the replicas running it before migrating. `0013_bounded_rows`
   locks every table, history too, until it commits, and reads each once for each check it adds,
