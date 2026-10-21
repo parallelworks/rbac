@@ -668,7 +668,7 @@ func (a *Authorizer) valuesOfAll(ctx context.Context, q DB, tenant string, ident
 		WHERE tenant = $1 AND scope = 'tenant:' || $1 AND principals && ARRAY(SELECT DISTINCT unnest(bound) FROM idents)
 		UNION ALL
 		SELECT 3, id, '', '', NULL, '', permissions, resource_types, grantable_roles, privileged, public, name, description
-		FROM rbac_roles WHERE tenant = $1 AND id IN (SELECT role FROM held WHERE role LIKE '`+CustomPrefix+`%')
+		FROM (`+byKey(namedCustom("SELECT role FROM held"), "rbac_roles", "id", roleColumns, "tenant = $1")+`) r
 		ORDER BY 1, 3, 4, 2`, tenant, identities, a.cfg.Now())
 	if err != nil {
 		return nil, err
@@ -757,13 +757,14 @@ func (a *Authorizer) holders(ctx context.Context, p Permission, r Resource, role
 		broadKinds,
 		string(p), r.Type, a.publicRoles(roles), string(Public),
 	}, through...)
-	// A privileged role gives nothing through the tenant's members or the public.
-	rows, err := a.db.Query(ctx, byKey("$2", "rbac_grants", "scope", "id::text, principal_kind, principal_id, conditional", `
-		  tenant = $1 AND role = ANY(`+givingSQL("$3", "$1", "$7", "$8", custom, "")+`)
-		  AND (expires_at IS NULL OR expires_at > $4) AND (NOT $5 OR principal_kind <> ALL($6::text[]))
-		  AND (principal_kind <> $10 OR role = ANY(`+givingSQL("$9", "$1", "$7", "$8", custom, publicOnly("$11"))+`))
-		  AND (principal_kind <> ALL($6::text[])
-		    OR role = ANY(`+givingSQL("$12", "$1", "$7", "$8", custom, listedOnly("$13"))+`))`)+`
+	// A privileged role gives nothing through the tenant's members or the public. The grants on the
+	// path are read once, and of the custom roles those that they name (namedCustom).
+	rows, err := a.db.Query(ctx, `WITH held AS MATERIALIZED (`+byKey("$2", "rbac_grants", "scope", "id::text AS id, principal_kind, principal_id, conditional, role", `
+		  tenant = $1 AND (expires_at IS NULL OR expires_at > $4) AND (NOT $5 OR principal_kind <> ALL($6::text[]))`)+`)
+		SELECT id, principal_kind, principal_id, conditional FROM held
+		WHERE role = ANY(`+givingSQL("$3", "$1", "$7", "$8", custom, namedCustom("SELECT role FROM held"), false)+`)
+		  AND (principal_kind <> $10 OR role = ANY(`+givingSQL("$9", "$1", "$7", "$8", custom, "$11", true)+`))
+		  AND (principal_kind <> ALL($6::text[]) OR role = ANY(`+givingSQL("$12", "$1", "$7", "$8", custom, "$13", false)+`))
 		ORDER BY principal_kind, principal_id, id`, args...)
 	if err != nil {
 		return nil, err
@@ -1097,12 +1098,15 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 		tenant, principals, roles, a.cfg.Now(), reaching, publicKey, a.publicRoles(roles),
 		string(p), resourceType,
 	}, through...), broadKinds)
+	// The subject's grants on scopes of the types are read once, and of the custom roles those that
+	// they name (namedCustom).
 	rows, err := a.db.Query(ctx, `
-		SELECT scope, bool_and(conditional) FROM (`+byType("$5", "g.scope, g.conditional", `
-		  g.tenant = $1 AND g.principal = ANY($2::text[]) AND g.role = ANY(`+givingSQL("$3", "$1", "$8", "$9", custom, "")+`)
-		  AND (g.expires_at IS NULL OR g.expires_at > $4)
-		  AND (g.principal <> $6 OR g.role = ANY(`+givingSQL("$7", "$1", "$8", "$9", custom, publicOnly("$10"))+`))
-		  AND (g.principal_kind <> ALL($13::text[]) OR g.role = ANY(`+givingSQL("$11", "$1", "$8", "$9", custom, listedOnly("$12"))+`))`)+`) g
+		WITH held AS MATERIALIZED (`+byType("$5", "g.scope, g.conditional, g.role, g.principal, g.principal_kind", `
+		  g.tenant = $1 AND g.principal = ANY($2::text[]) AND (g.expires_at IS NULL OR g.expires_at > $4)`)+`)
+		SELECT scope, bool_and(conditional) FROM held
+		WHERE role = ANY(`+givingSQL("$3", "$1", "$8", "$9", custom, namedCustom("SELECT role FROM held"), false)+`)
+		  AND (principal <> $6 OR role = ANY(`+givingSQL("$7", "$1", "$8", "$9", custom, "$10", true)+`))
+		  AND (principal_kind <> ALL($13::text[]) OR role = ANY(`+givingSQL("$11", "$1", "$8", "$9", custom, "$12", false)+`))
 		GROUP BY scope ORDER BY scope`, args...)
 	if err != nil {
 		return Reach{}, err
@@ -1453,15 +1457,18 @@ func filterKeys(arg func(int) string, of string) string {
 // on scopes of the types in the array types, in the default collation, which a column's own
 // collation overrides where a comparison doesn't name one: unconditional, in force, of the roles
 // that give the permission, the public's only of public ones and the broad principals' of none
-// privileged. arg numbers Filter's arguments.
+// privileged. It reads the subject's grants there once, and of the custom roles those that they
+// name (namedCustom). arg numbers Filter's arguments.
 func filterGrants(arg func(int) string, custom bool, types string) string {
-	return byType(types, `g.scope COLLATE "default"`, fmt.Sprintf(`g.tenant = %s::text AND g.principal = ANY(%s) AND g.role = ANY(%s)
-		  AND (g.expires_at IS NULL OR g.expires_at > %s) AND NOT g.conditional
-		  AND (g.principal <> %s::text OR g.role = ANY(%s))
-		  AND (g.principal_kind <> ALL(%s) OR g.role = ANY(%s))`,
-		arg(1), filterKeys(arg, countedKeys(arg(13), arg(17))), givingSQL(arg(3), arg(1), arg(8), arg(9), custom, ""), arg(4), arg(6),
-		givingSQL(arg(7), arg(1), arg(8), arg(9), custom, publicOnly(arg(10))),
-		broadKindsSQL, givingSQL(arg(11), arg(1), arg(8), arg(9), custom, listedOnly(arg(12)))))
+	return fmt.Sprintf(`WITH held AS MATERIALIZED (%s)
+		SELECT scope COLLATE "default" FROM held WHERE role = ANY(%s)
+		  AND (principal <> %s::text OR role = ANY(%s))
+		  AND (principal_kind <> ALL(%s) OR role = ANY(%s))`,
+		byType(types, "g.scope, g.role, g.principal, g.principal_kind", fmt.Sprintf(`g.tenant = %s::text AND g.principal = ANY(%s)
+		  AND (g.expires_at IS NULL OR g.expires_at > %s) AND NOT g.conditional`, arg(1), filterKeys(arg, countedKeys(arg(13), arg(17))), arg(4))),
+		givingSQL(arg(3), arg(1), arg(8), arg(9), custom, namedCustom("SELECT role FROM held"), false), arg(6),
+		givingSQL(arg(7), arg(1), arg(8), arg(9), custom, arg(10), true),
+		broadKindsSQL, givingSQL(arg(11), arg(1), arg(8), arg(9), custom, arg(12), false))
 }
 
 // grantCounts counts, with Filter's arguments args, the grants its condition counts (filterGrants)
@@ -1645,7 +1652,7 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 	customRoles := "rbac_roles WHERE tenant = $1"
 	switch roles {
 	case namedRoles:
-		customRoles = "(" + byKey("ARRAY(SELECT DISTINCT role FROM held WHERE role LIKE '"+CustomPrefix+"%')", "rbac_roles", "id", roleColumns, "tenant = $1") + ") r"
+		customRoles = "(" + byKey(namedCustom("SELECT role FROM held"), "rbac_roles", "id", roleColumns, "tenant = $1") + ") r"
 	case tenantRoles:
 	case heldTenantRoles:
 		customRoles += " AND EXISTS (SELECT FROM held WHERE role LIKE '" + CustomPrefix + "%')"

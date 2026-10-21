@@ -185,22 +185,21 @@ func roleFrom(id, name, description string, perms, types []string, privileged, p
 }
 
 // givingSQL is SQL for the ids of the roles that give perm on a resource type in a tenant: the
-// built-in ones in the array argument builtin, and with custom the tenant's custom ones, read in
-// the same statement, of them only those only keeps, if any, so a role redefined reaches searches
-// as it reaches checks.
-func givingSQL(builtin, tenant, perm, resourceType string, custom bool, only string) string {
+// built-in ones in the array argument builtin, and with custom the custom ones among ids, SQL for an
+// array, of them with public only those still marked Public, as a search's statement can run after
+// its ids were read. The custom ones are read in the same statement, so a role redefined reaches
+// searches as it reaches checks, and by key: a search's ids are those its grants name (namedCustom)
+// or broadArgs read, and read by the tenant, every custom role of it was, as of a time every version.
+func givingSQL(builtin, tenant, perm, resourceType string, custom bool, ids string, public bool) string {
 	// Without custom the subquery stays, constant false, so the statement's arguments are the
 	// same and PostgreSQL plans it away.
-	return fmt.Sprintf(`(%s::text[] || ARRAY(SELECT cr.id FROM rbac_roles cr WHERE %t AND cr.tenant = %s::text
-		AND %s::text = ANY(cr.permissions) AND %s::text = ANY(cr.resource_types)%s))`, builtin, custom, tenant, perm, resourceType, only)
+	where := fmt.Sprintf(`%t AND cr.tenant = %s::text AND %s::text = ANY(cr.permissions) AND %s::text = ANY(cr.resource_types)`,
+		custom, tenant, perm, resourceType)
+	if public {
+		where += " AND cr.public"
+	}
+	return fmt.Sprintf(`(%s::text[] || ARRAY(%s))`, builtin, byKey(ids, "rbac_roles cr", "cr.id", "cr.id", where))
 }
-
-// listedOnly keeps, of givingSQL's custom roles, those in the array argument ids.
-func listedOnly(ids string) string { return fmt.Sprintf(` AND cr.id = ANY(%s::text[])`, ids) }
-
-// publicOnly keeps, of givingSQL's custom roles, those in the array argument ids that are still
-// marked Public, as a search's statement can run after its ids were read.
-func publicOnly(ids string) string { return ` AND cr.public` + listedOnly(ids) }
 
 // broadArgs are a search's arguments for the roles giving p on a resource type that give it
 // through grants to the public and the tenant's members: the custom ones that are public, NULL
@@ -220,13 +219,14 @@ func (a *Authorizer) broadArgs(ctx context.Context, q DB, tenant string, p Permi
 	if !custom || p.managesAccess() {
 		return []any{nil, unprivileged, nil}, nil
 	}
-	// A broad key and a scope or a type at a time, the prefix tested apart (namedCustom): matched to
-	// both keys at once, and tested for the prefix there, a generic plan read the grants by the
-	// custom roles' index on the tenant alone, every grant of one in the tenant for each scope or
-	// type.
-	rows, err := q.Query(ctx, `SELECT `+roleColumns+` FROM rbac_roles
-		WHERE tenant = $1 AND $2::text = ANY(permissions) AND $3::text = ANY(resource_types) AND id = ANY(`+namedCustom(`SELECT g.role
-		  FROM unnest($5::text[]) AS b(k) CROSS JOIN LATERAL (`+grants("b.k")+`) g`)+`)
+	// A broad key and a scope or a type at a time, the prefix tested apart (namedCustom), and the
+	// roles they name by key: matched to both keys at once, and tested for the prefix there, a
+	// generic plan read the grants by the custom roles' index on the tenant alone, every grant of one
+	// in the tenant for each scope or type; and as of a time, roles tested against the ids rather
+	// than read by them are each read at its newest version.
+	rows, err := q.Query(ctx, `SELECT `+roleColumns+` FROM (`+byKey(namedCustom(`SELECT g.role FROM unnest($5::text[]) AS b(k)
+		CROSS JOIN LATERAL (`+grants("b.k")+`) g`), "rbac_roles", "id", roleColumns,
+		"tenant = $1 AND $2::text = ANY(permissions) AND $3::text = ANY(resource_types)")+`) r
 		ORDER BY id`, tenant, string(p), resourceType, on, broadKeys(tenant))
 	if err != nil {
 		return nil, err

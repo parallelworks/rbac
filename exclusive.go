@@ -149,16 +149,17 @@ func (a *Authorizer) broadExcludes(ctx context.Context, tenant string, b Princip
 	}
 	// With the custom roles they name, in one statement, as a check reads them: read apart, a grant
 	// revoked and its role widened meanwhile could give two values no moment did. Only their
-	// permissions, which alone exclusiveGiven reads. By the tenant's scope, which the indexes seek
-	// beside the principal: by its type, which none holds, it reads every grant they hold in the
-	// tenant.
+	// permissions, which alone exclusiveGiven reads, and by key: as of a time, a join to them reads
+	// every role's newest version. By the tenant's scope, which the indexes seek beside the
+	// principal: by its type, which none holds, it reads every grant they hold in the tenant.
 	rows, err := a.db.Query(ctx, `
 		WITH held AS (
 		  SELECT DISTINCT role FROM rbac_grants WHERE tenant = $1 AND scope = 'tenant:' || $1
 		    AND principal = ANY($2::text[]) AND (expires_at IS NULL OR expires_at > $3)
 		)
 		SELECT h.role, r.id IS NOT NULL, coalesce(r.permissions, '{}')
-		FROM held h LEFT JOIN rbac_roles r ON r.tenant = $1 AND r.id = h.role`, tenant, keys, a.cfg.Now())
+		FROM held h LEFT JOIN (`+byKey(namedCustom("SELECT role FROM held"), "rbac_roles", "id", "id, permissions", "tenant = $1")+`) r
+		  ON r.id = h.role`, tenant, keys, a.cfg.Now())
 	if err != nil {
 		return false, err
 	}

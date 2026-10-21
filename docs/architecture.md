@@ -647,7 +647,9 @@ flowchart LR
 - **AsOf** stands temporary views of history in for the tables, in a transaction it rolls back,
   so every check, list and search answers as it would have at a past time, with the catalog and
   the label dimensions as they are now. Each statement reads history by the rows it names, through
-  history's indexes.
+  history's indexes, as a search the custom roles its grants name, by their ids. The view of
+  custom roles takes each one's newest version, testing none for a later one, so `Grantable`,
+  which can offer any, reads each version once.
 - **PruneHistory** deletes only what an export has read and later versions supersede. It keeps
   each row's last version at or before its time, so AsOf answers as before for any later time,
   and refuses an earlier one; of a row whose last version by then ended it, it deletes every
