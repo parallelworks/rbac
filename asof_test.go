@@ -33,14 +33,26 @@ func TestAsOfReadsATenantAsItWas(t *testing.T) {
 	u, v := h.as(t, "u", "sre"), h.as(t, "v")
 	h.groups(t, "sre")
 	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"), grant(cluster.Scope(), "cluster.sudo", rbac.Group, "sre"))
-	// x's login expires between the two times.
+	// x's login expires between the two times. On a loaded machine it can expire before then is
+	// read, so that takes a longer window.
 	x := h.as(t, "x")
-	expires := dbNow(t, h).Add(200 * time.Millisecond)
-	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
-		VALUES ('t1', 'cluster', 'c1', 'user', 'x', 'cluster.login', $1)`, expires); err != nil {
-		t.Fatal(err)
+	var expires, then time.Time
+	for window := 200 * time.Millisecond; ; window *= 2 {
+		expires = dbNow(t, h).Add(window)
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+			VALUES ('t1', 'cluster', 'c1', 'user', 'x', 'cluster.login', $1)`, expires); err != nil {
+			t.Fatal(err)
+		}
+		if then = dbNow(t, h); then.Before(expires) {
+			break
+		}
+		if window > 10*time.Second {
+			t.Fatalf("x's login expired %v before then was read", then.Sub(expires))
+		}
+		if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_grants WHERE tenant = 't1' AND principal_id = 'x'`); err != nil {
+			t.Fatal(err)
+		}
 	}
-	then := dbNow(t, h)
 	// Since: u left sre, a deny took login from u, and v was granted login.
 	if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_members WHERE principal = 'user:u'`); err != nil {
 		t.Fatal(err)
