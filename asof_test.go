@@ -150,6 +150,14 @@ func TestAsOfChangesNothing(t *testing.T) {
 	}
 }
 
+// AsOf refuses a nil read, as it has nothing to run, rather than fail in its transaction.
+func TestAsOfRefusesNoRead(t *testing.T) {
+	h := setup(t)
+	if err := h.authz.AsOf(t.Context(), "t1", dbNow(t, h), nil); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("AsOf with a nil read: %v", err)
+	}
+}
+
 // AsOf on a host's DB that has no BeginTx reads the past at REPEATABLE READ, as on a pool, so a
 // read of several statements reads one snapshot; on a wrapper around the host's transaction, at
 // that transaction's isolation, as under WithTx.

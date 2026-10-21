@@ -70,6 +70,9 @@ func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read
 	if a.asOf {
 		return fmt.Errorf("%w: a read as of a time is read as of one time", ErrInvalid)
 	}
+	if read == nil {
+		return fmt.Errorf("%w: a read as of a time has a read to run", ErrInvalid)
+	}
 	var tx pgx.Tx
 	switch conn := a.db.(type) {
 	case ownTx:
