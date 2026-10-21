@@ -353,7 +353,9 @@ func canonical(r RoleDefinition) RoleDefinition {
 // its grants on scopes of types it is no longer for, or a deny that removes the actor's power to
 // change them there or on the path of a scope they are on, stops it, as it stops DeleteRole and
 // Apply there; so does, where they will give more, a deny on that path that removes a permission
-// the role gives, which the actor would hand on there. The scopes are as Config.ResourceOf gives
+// the role gives, which the actor would hand on there. Renaming it or rewriting its description
+// changes no grant, so needs only the power to define it: a role's name and description are part
+// of its definition, not of the data its grants are on. The scopes are as Config.ResourceOf gives
 // them. A role another change redefined or created while this one waited for the tenant is
 // refused, to be tried again: the constraints were asked about it as it was, as is one granted
 // meanwhile on a scope of a type they weren't asked about, or, it or a role listing it, on a scope
