@@ -4596,11 +4596,12 @@ func TestChangingMembersOfManyGroupsReadsWhatAGroupTheyAreInReachesOnce(t *testi
 }
 
 // The host is asked about each grant and eligibility a member gains as the member's, so the members
-// one change adds gain at most MaxBindings of them, each member's counted apart, as one Apply makes
-// at most as many grants: past it, ChangeMembers and ImportMembers are refused before the host is
-// asked about any, or the actor's power to make them decided. A member whose place lasts as long
-// already gains nothing, so counts for nothing, and one alone gains whatever its group holds, or a
-// group holding more could never gain one.
+// one ChangeMembers adds gain at most MaxBindings of them, each member's counted apart, as one Apply
+// makes at most as many grants: past it, it is refused before the host is asked about any, or the
+// actor's power to make them decided. A member whose place lasts as long already gains nothing, so
+// counts for nothing, and one alone gains whatever its group holds, or a group holding more could
+// never gain one. The host's own ImportMembers, which no actor's access decides, takes the same
+// change, asking about each grant each member gains.
 func TestMembersGainAtMostMaxBindingsGrantsInAChange(t *testing.T) {
 	const grants = 100
 	members := rbac.MaxBindings / grants
@@ -4622,9 +4623,9 @@ func TestMembersGainAtMostMaxBindingsGrantsInAChange(t *testing.T) {
 		}
 	})
 	ctx := t.Context()
-	h.groups(t, "crew", "all", "empty")
+	h.groups(t, "crew", "synced", "all", "empty")
 	// Each group holds a role on each of n clusters, which the manager may grant there.
-	for group, n := range map[string]int{"crew": grants, "all": rbac.MaxBindings + 1} {
+	for group, n := range map[string]int{"crew": grants, "synced": grants, "all": rbac.MaxBindings + 1} {
 		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
 			SELECT 't1', 'cluster', $1 || i, p, id, r FROM generate_series(1, $2::int) i,
 			  (VALUES ('group', $1, 'cluster.login'), ('user', 'manager', 'cluster.admin')) AS g(p, id, r)`, group, n); err != nil {
@@ -4643,18 +4644,20 @@ func TestMembersGainAtMostMaxBindingsGrantsInAChange(t *testing.T) {
 	}
 	h.join(t, ids...)
 	manager := h.as(t, "manager")
-	for name, change := range map[string]func([]rbac.Member) error{
-		"ChangeMembers": func(ms []rbac.Member) error { return h.authz.ChangeMembers(ctx, manager, "t1", ms, nil) },
-		"ImportMembers": func(ms []rbac.Member) error { return h.authz.ImportMembers(ctx, host, "t1", ms) },
-	} {
-		validated, resourceOf, decided = 0, 0, 0
-		if err := change(add); !errors.Is(err, rbac.ErrInvalid) {
-			t.Errorf("%s: %d members gaining %d grants each: %v", name, len(add), grants, err)
-		}
-		if validated+resourceOf+decided > 0 {
-			t.Errorf("%s: refused having asked Config.ValidateGrant %d times and Config.ResourceOf %d, and decided grants on %d scopes",
-				name, validated, resourceOf, decided)
-		}
+	synced := slices.Clone(add)
+	for i := range synced {
+		synced[i].Group = "synced"
+	}
+	validated, resourceOf, decided = 0, 0, 0
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", synced, nil); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("ChangeMembers: %d members gaining %d grants each: %v", len(synced), grants, err)
+	}
+	if validated+resourceOf+decided > 0 {
+		t.Fatalf("ChangeMembers: refused having asked Config.ValidateGrant %d times and Config.ResourceOf %d, and decided grants on %d scopes",
+			validated, resourceOf, decided)
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t1", synced); err != nil || validated != len(synced)*grants {
+		t.Fatalf("ImportMembers: %d members gaining %d grants each: %v, Config.ValidateGrant asked %d times", len(synced), grants, err, validated)
 	}
 	validated = 0
 	if err := h.authz.ChangeMembers(ctx, manager, "t1", add[:members], nil); err != nil || validated != rbac.MaxBindings {

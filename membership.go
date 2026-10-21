@@ -1141,8 +1141,9 @@ func keyedAll(members []Member) error {
 // itself, nor a chain of more than MaxGroupDepth groups; and a principal is in a group at most
 // MaxPlacesInGroup times, and in at most MaxGroupsOfPrincipal groups. Config.ValidateGrant is asked
 // about each grant and eligibility a member gains, as with ChangeMembers, so about none of a place
-// made to end sooner, or whose note alone changes, and the members gain at most MaxBindings in all,
-// but one alone.
+// made to end sooner, or whose note alone changes: once for each member and each it gains, with no
+// bound on them, as no actor's access decides the host's own write, so the cost of one grows with
+// how many its members gain.
 func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant string, members []Member) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "ImportMembers")
@@ -1164,9 +1165,6 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 	}
 	rc, err := a.reachOf(ctx, a.db, tenant, set, nil, nil, true)
 	if err != nil {
-		return err
-	}
-	if err := rc.gainsWithin(set); err != nil {
 		return err
 	}
 	stand, err := a.askMemberships(ctx, Subject{Principal: actor}, tenant, set, rc)
@@ -2047,12 +2045,13 @@ func (r reach) activatedBy(m Member) []Scope {
 	return ss
 }
 
-// gainsWithin refuses members added that gain more than MaxBindings grants and eligibilities in
-// all, each member's counted apart, as many as one Apply makes: the host is asked about each as the
-// member's. One member gaining anything alone gains whatever its groups hold, as a grant to a group
-// reaches each member, or a group holding more could never gain one. Refused before anything is
-// asked about them, and never more under the locks, where stillReached refuses a group holding more
-// than was read.
+// gainsWithin refuses members ChangeMembers adds that gain more than MaxBindings grants and
+// eligibilities in all, each member's counted apart, as many as one Apply makes: the host is asked
+// about each as the member's, so an actor that may change members would otherwise multiply what
+// the host and the change do. One member gaining anything alone gains whatever its groups hold, as
+// a grant to a group reaches each member, or a group holding more could never gain one. Refused
+// before anything is asked about them, and never more under the locks, where stillReached refuses
+// a group holding more than was read.
 func (r reach) gainsWithin(add []Member) error {
 	n, gainers := 0, 0
 	for _, m := range r.gaining(add) {
@@ -2120,8 +2119,8 @@ type reachKey struct {
 
 // footprint is the changes to access adding add and removing remove make, with the role of each
 // grant or eligibility; with gains, only the grants and eligibilities added members gain. Those
-// are keyed by group, read once for each, as gainsWithin bounds them; the rest are read once for
-// all the groups, however many reach them, and for each member only its activations.
+// are keyed by group, read once for each, no more than the host is asked about; the rest are read
+// once for all the groups, however many reach them, and for each member only its activations.
 func (r reach) footprint(add, remove []Member, gains bool) map[reachKey]RoleDefinition {
 	f := map[reachKey]RoleDefinition{}
 	gaining := memberGroups(r.gaining(add))

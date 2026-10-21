@@ -281,13 +281,15 @@ conditional ones reach, to check one by one.
   activated through, changes its members freely, and one holding a role only if they could grant
   that role themselves. Whether the actor may make a grant is decided once for each end, however
   many members gain it, but the host is asked about each as each member's, so the members one
-  `ChangeMembers` or `ImportMembers` adds gain at most `rbac.MaxBindings` grants and eligibilities
-  in all, each member's counted apart, but one member alone, which gains whatever its groups hold.
-  The rest is the groups', read once however many of their members change, and what a group many of
-  them are in reaches, once for all of them, and grows with what the groups hold, approve and are
-  named or exempt in, so grant a group on a container rather than on each resource in it: with
-  labels declared, a removal asks `Config.ResourceOf` about each scope its members lose access on,
-  but where the actor's label values satisfy every label.
+  `ChangeMembers` adds gain at most `rbac.MaxBindings` grants and eligibilities in all, each
+  member's counted apart, but one member alone, which gains whatever its groups hold.
+  `ImportMembers`, the host's own write, which no actor's access decides, has no such bound: it asks
+  `ValidateGrant` once for each member and each grant or eligibility the member gains, so its cost
+  grows with how many they gain. The rest is the groups', read once however many of their members
+  change, and what a group many of them are in reaches, once for all of them, and grows with what
+  the groups hold, approve and are named or exempt in, so grant a group on a container rather than
+  on each resource in it: with labels declared, a removal asks `Config.ResourceOf` about each scope
+  its members lose access on, but where the actor's label values satisfy every label.
   `Config.ResourceOf` gives the package the tenant, which `SetGroup` and `DeleteGroup` check
   `rbac.ManageGroups` on, and the groups, which `ChangeMembers` checks `rbac.GroupMembers` on and
   `SetGroup` and `DeleteGroup` the label of, each with its constraints and label, and the
@@ -552,9 +554,10 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   can leave out of every role: then it is denied like any other. To retire a type, keep one of its
   permissions there until its scopes are deleted; `DeletePrincipal` and `DeleteTenant` remove
   grants on any type.
-- **Limits:** a change takes at most `rbac.MaxBindings` bindings, and the members one adds gain at
-  most as many grants and eligibilities, each member's counted apart, but one alone; a principal
-  holds a role on a scope at most `rbac.MaxGrantsPerRole` times, and is in a group at most
+- **Limits:** a change takes at most `rbac.MaxBindings` bindings, and the members one
+  `ChangeMembers` adds gain at most as many grants and eligibilities, each member's counted apart,
+  but one alone, while `ImportMembers` asks `ValidateGrant` about each one its members gain; a
+  principal holds a role on a scope at most `rbac.MaxGrantsPerRole` times, and is in a group at most
   `rbac.MaxPlacesInGroup` times, by source, and directly in at most `rbac.MaxGroupsOfPrincipal`
   groups, from each source the host owns apart, which bounds the groups a check reads through others
   only level by level, so keep nesting narrow; a scope holds at most `rbac.MaxDenies` denies; a
