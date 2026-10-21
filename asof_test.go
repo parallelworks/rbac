@@ -1348,7 +1348,7 @@ func TestMigratingLetsHistorysRoleCallWhatItsIndexCalls(t *testing.T) {
 	}
 }
 
-// Migrating to 0018 locks history before it builds the grants' index, so a change that starts while
+// Migrating to 0019 locks history before it builds the grants' index, so a change that starts while
 // it builds and writes history before a grant, as DeleteScope removes a scope's eligibilities and
 // then its grants, waits for it to commit: locked once the index was built, history was the change's
 // while the change waited for the grants, so migrating gave way, having built the index, or
@@ -1357,8 +1357,8 @@ func TestMigratingThePrincipalSeeksWaitsForAChangeStartedAsItBuilds(t *testing.T
 	// Little memory to sort in, so building the index takes a while.
 	pool := pgtest.Open(t, "maintenance_work_mem=64kB")
 	ctx := t.Context()
-	migrateFiles(t, pool, "", "0018")
-	recordMigrations(t, pool, "0018")
+	migrateFiles(t, pool, "", "0019")
+	recordMigrations(t, pool, "0019")
 	// So a Migrate that gave way would give up at once.
 	rbac.SetMigrateAttempts(t, 1, time.Millisecond)
 	for _, q := range []string{

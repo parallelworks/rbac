@@ -515,7 +515,7 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   migrating while it holds what the rebuild waits for: the rebuild gives way, unless the
   transaction began waiting long enough before it, as while migrating reads a long history's deny
   records, for its `deadlock_timeout` to pass first, and PostgreSQL ends the transaction.
-  `0018_principal_seeks` builds an index on `rbac_grants`, which keeps writes to it waiting until it
+  `0019_principal_seeks` builds an index on `rbac_grants`, which keeps writes to it waiting until it
   commits, though reads go on, and rebuilds history's index of a principal's versions, which reads
   all of history, and analyzes it. It locks `rbac_grants` and then history before it builds either,
   so reads of history, and every change, as each writes history, wait until it commits too, and only
