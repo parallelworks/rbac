@@ -362,7 +362,8 @@ func (a *Authorizer) Memberships(ctx context.Context, tenant string, principals 
 	return collectMemberships(rows)
 }
 
-// MembershipsOf lists an identity's memberships in force in every tenant, by tenant.
+// MembershipsOf lists an identity's memberships in force in every tenant, by tenant. It has no
+// limit or cursor, so what it returns grows with the tenants the identity is a member or guest of.
 func (a *Authorizer) MembershipsOf(ctx context.Context, p Principal) ([]Membership, error) {
 	// The zero principal, the anonymous subject's, which a constraint may ask about, has none.
 	if p == (Principal{}) {
@@ -2679,7 +2680,9 @@ func (a *Authorizer) Members(ctx context.Context, tenant, group string) ([]Membe
 // those they are in, to the top, as memberships are in force now. An identity whose membership of
 // the tenant ended is in none. One whose membership is suspended is listed in its groups, which a
 // check counts then only to bind it to denies, never to give it their grants: a constraint that
-// lets a group's members through should check the membership too (Memberships).
+// lets a group's members through should check the membership too (Memberships). It has no limit or
+// cursor, so what it returns grows with the groups the principal is in, through others too, which
+// MaxGroupsOfPrincipal bounds only level by level.
 func (a *Authorizer) GroupsOf(ctx context.Context, tenant string, p Principal) ([]string, error) {
 	// The zero principal, the anonymous subject's, which a constraint may ask about, is in none.
 	if !validID(tenant) || p != (Principal{}) && !p.wellFormed(tenant) {
