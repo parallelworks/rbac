@@ -16,6 +16,7 @@ import (
 	"cel.dev/cel-go/cel"
 	"cel.dev/cel-go/common/ast"
 	"cel.dev/cel-go/common/cost"
+	"cel.dev/cel-go/common/functions"
 	"cel.dev/cel-go/common/operators"
 	"cel.dev/cel-go/common/overloads"
 	"cel.dev/cel-go/common/types"
@@ -411,9 +412,14 @@ func (c *conditions) build(expr string) (program, error) {
 // have, as a test plans a loop as another version of CEL may.
 func plan(env *cel.Env, checked *cel.Ast, patterns map[string]uint64, limit uint64, before ...cel.ProgramOption) (cel.Program, error) {
 	s, k := newStepping(checked.NativeRep(), limit), newKeying(env, checked.NativeRep(), limit)
+	str, err := newStringing(env)
+	if err != nil {
+		return nil, err
+	}
 	prg, err := env.Program(checked, slices.Concat(before, []cel.ProgramOption{
 		cel.CostLimit(limit), cel.CostTracking(costs{patterns}), cel.OptimizeRegex(matching(patterns)),
-		cel.CustomDecorator(bounded), cel.CustomDecoratorV2(s.decorate), cel.CustomDecoratorV2(k.decorate),
+		cel.CustomDecorator(bounded), cel.CustomDecorator(str.decorate), cel.CustomDecoratorV2(s.decorate),
+		cel.CustomDecoratorV2(k.decorate),
 	})...)
 	if err != nil {
 		return nil, err
@@ -870,8 +876,8 @@ func comparing(function string, x, y ref.Val) uint64 {
 // bounded refuses, before running it, a comparison or a search in a list that would read more than
 // a condition may: one call reads it all, and a call's cost is counted only once it has run, so a
 // list a condition doubles cheaply would otherwise hold a check for as long as walking it takes.
-// It refuses a comparison of a double that isn't finite too (nonFinite), converting one to a string
-// (finiteString), and a time read in a zone of more than maxZone bytes (inZone).
+// It refuses a comparison of a double that isn't finite too (nonFinite), and a time read in a zone
+// of more than maxZone bytes (inZone).
 func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 	call, ok := i.(interpreter.InterpretableCall)
 	if !ok {
@@ -882,9 +888,6 @@ func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 			return i, nil
 		}
 		return inZone(call), nil
-	}
-	if call.Function() == overloads.TypeConvertString {
-		return finiteString(call), nil
 	}
 	// read is what comparing reads of the values.
 	var op func(x, y ref.Val, read uint64) ref.Val
@@ -951,27 +954,55 @@ func inZone(call interpreter.InterpretableCall) interpreter.InterpretableCall {
 	})
 }
 
-// finiteString is call, converting a value to a string as CEL does, failing for a double that isn't
-// finite, as int() and uint() of one do: "NaN" compares as any string does, so a deny's
-// `string(failed / total) == "0.5"` would lift where both are 0.0.
-func finiteString(call interpreter.InterpretableCall) interpreter.InterpretableCall {
+// stringing converts a value to a string as CEL does, failing for a double that isn't finite, as
+// int() and uint() of one do: "NaN" compares as any string does, so a deny's
+// `string(failed / total) == "0.5"` would lift where both are 0.0. It holds the environment's own
+// overloads of string(), each by its id and, by the function's name, the one choosing among them by
+// a value's type, and runs the one a program would: CEL picks one by the type it checked, which a
+// value it checks as of another's type, as `(dyn([true]) + [""])[0]`, needn't have.
+type stringing map[string]*functions.Overload
+
+func newStringing(env *cel.Env) (stringing, error) {
+	s := stringing{}
+	fn, ok := env.Functions()[overloads.TypeConvertString]
+	if !ok {
+		return s, nil
+	}
+	bindings, err := fn.Bindings()
+	if err != nil {
+		return nil, err
+	}
+	for _, o := range bindings {
+		s[o.Operator] = o
+	}
+	return s, nil
+}
+
+func (s stringing) decorate(i interpreter.Interpretable) (interpreter.Interpretable, error) {
+	call, ok := i.(interpreter.InterpretableCall)
+	if !ok || call.Function() != overloads.TypeConvertString {
+		return i, nil
+	}
+	impl := s[call.OverloadID()]
+	if impl == nil {
+		impl = s[call.Function()]
+	}
+	// Another version of CEL may bind it otherwise, which this can't run as CEL would.
+	if impl == nil || impl.Unary == nil && impl.Function == nil {
+		return nil, errors.New("a conversion to a string is planned where this package can't check it")
+	}
 	return interpreter.NewCall(call.ID(), call.Function(), call.OverloadID(), call.Args(), func(args ...ref.Val) ref.Val {
 		if len(args) != 1 {
 			return types.NoSuchOverloadErr()
 		}
-		switch v := args[0].(type) {
-		case types.String:
-			return v
-		case types.Double:
-			if nonFinite(v) {
-				return types.NewErr("rbac: a double that isn't finite can't be converted to a string")
-			}
-		case types.Bool, types.Bytes, types.Duration, types.Int, types.Timestamp, types.Uint:
-		default:
-			return types.MaybeNoSuchOverloadErr(v)
+		if nonFinite(args[0]) {
+			return types.NewErr("rbac: a double that isn't finite can't be converted to a string")
 		}
-		return args[0].ConvertToType(types.StringType)
-	})
+		if impl.Unary != nil {
+			return impl.Unary(args[0])
+		}
+		return impl.Function(args...)
+	}), nil
 }
 
 // timePart reports whether function reads a part of a time, in a zone where it is given one.

@@ -22,6 +22,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/parallelworks/rbac"
 )
@@ -1191,6 +1192,88 @@ func TestComparingMapsDecidesAsCELDoes(t *testing.T) {
 		}
 		if held, evaluated, _, err := rbac.EvaluateCondition(t, c.expr, attributes); err != nil || !evaluated || held != out.Value() {
 			t.Errorf("%s: held %t, evaluated %t, %v; CEL decides %v", c.expr, held, evaluated, err, out)
+		}
+	}
+}
+
+// Converting a finite value to a string, comparing optional values the host passes and comparing
+// maps keyed by numbers of different types decide as CEL does. A conversion ran CEL's own for the
+// Go type of the value, not the overload CEL picks by the type it checked, which a value CEL
+// checks as of another's type needn't have: converting `(dyn([true]) + [""])[0]` made "true" where
+// CEL's conversion fails, and a grant's `!=` held.
+func TestFiniteValuesDecideAsCELDoes(t *testing.T) {
+	env, err := cel.NewEnv(cel.Variable("request", cel.MapType(cel.StringType, cel.DynType)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	celEval := func(expr string, attributes map[string]any) (ref.Val, error) {
+		checked, iss := env.Compile(expr)
+		if iss.Err() != nil {
+			t.Fatal(iss.Err())
+		}
+		prg, err := env.Program(checked)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, _, err := prg.Eval(map[string]any{"request": map[string]any{"attributes": attributes}})
+		return out, err
+	}
+	decides := func(expr string, attributes map[string]any) {
+		t.Helper()
+		out, err := celEval(expr, attributes)
+		held, evaluated, _, rerr := rbac.EvaluateCondition(t, expr, attributes)
+		if rerr != nil {
+			t.Fatalf("%s: %v", expr, rerr)
+		}
+		if evaluated != (err == nil) || evaluated && held != out.Value() {
+			t.Errorf("%s: held %t, evaluated %t; CEL decides %v, %v", expr, held, evaluated, out, err)
+		}
+	}
+	strs := map[string]any{
+		"string": "a", "bytes": []byte("a"), "invalid UTF-8": []byte{0xff}, "bool": true, "int": -1, "uint": uint(1),
+		"double": 0.5, "negative zero": math.Copysign(0, -1), "large double": 1e300,
+		"timestamp": time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC), "duration": 90 * time.Minute, "null": nil,
+		"type": types.IntType, "optional": types.OptionalOf(types.String("a")), "list": []any{"a"}, "map": map[string]any{"a": "a"},
+		"string wrapper": wrapperspb.String("a"), "double wrapper": wrapperspb.Double(0.5), "bytes wrapper": wrapperspb.Bytes([]byte("a")),
+		"JSON string": structpb.NewStringValue("a"), "JSON number": structpb.NewNumberValue(0.5), "JSON number text": json.Number("1.5"),
+	}
+	for name, v := range strs {
+		for _, of := range []string{
+			"%s", "dyn(%s)", `(dyn([%s]) + [""])[0]`, `(dyn([%s]) + [b""])[0]`, `(dyn([%s]) + [true])[0]`, `(dyn([%s]) + [1])[0]`,
+			`(dyn([%s]) + [1u])[0]`, `(dyn([%s]) + [1.0])[0]`, `(dyn([%s]) + [duration("1s")])[0]`, `(dyn([%s]) + [timestamp(0)])[0]`,
+		} {
+			conversion := "string(" + fmt.Sprintf(of, "request.attributes.v") + ")"
+			attributes := map[string]any{"v": v, "want": ""}
+			if s, err := celEval(conversion, attributes); err == nil {
+				attributes["want"] = s.Value()
+			}
+			for _, op := range []string{" == ", " != "} {
+				decides(conversion+op+"request.attributes.want", attributes)
+			}
+		}
+		if t.Failed() {
+			t.Fatalf("converting a %s", name)
+		}
+	}
+	values := map[string]any{
+		"none": types.OptionalNone, "1": types.OptionalOf(types.Int(1)), "1u": types.OptionalOf(types.Uint(1)),
+		"1.0": types.OptionalOf(types.Double(1)), "2": types.OptionalOf(types.Int(2)), "null": types.OptionalOf(types.NullValue),
+		"[1]":  types.OptionalOf(types.NewDynamicList(types.DefaultTypeAdapter, []any{1})),
+		"[1u]": types.OptionalOf(types.NewDynamicList(types.DefaultTypeAdapter, []any{uint(1)})),
+		"of 1": types.OptionalOf(types.OptionalOf(types.Int(1))), "of 1u": types.OptionalOf(types.OptionalOf(types.Uint(1))),
+		"bare 1": 1, "bare null": nil,
+		"{1}": map[int64]any{1: "a"}, "{1u}": map[uint64]any{1: "a"}, "{1.0}": map[float64]any{1: "a"},
+		"{1, 2u}": map[any]any{int64(1): "a", uint64(2): "a"}, "{1.0, 2.0}": map[float64]any{1: "a", 2: "a"},
+	}
+	for x := range values {
+		for y := range values {
+			for _, of := range []string{"%s == %s", "%s in [%s]"} {
+				decides(fmt.Sprintf(of, "request.attributes.x", "request.attributes.y"), map[string]any{"x": values[x], "y": values[y]})
+			}
+		}
+		for _, literal := range []string{`{1: "a"}`, `{1u: "a"}`, `{1.0: "a"}`, `{1: "a", 2u: "a"}`, `{1.0: "a", 2.0: "a"}`} {
+			decides("request.attributes.x == "+literal, map[string]any{"x": values[x]})
+			decides(literal+" == request.attributes.x", map[string]any{"x": values[x]})
 		}
 	}
 }
