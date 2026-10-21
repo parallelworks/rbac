@@ -8,7 +8,7 @@
 -- smaller index of a scope's grants and eligibilities, which history's statistics, until it is
 -- analyzed, don't tell from the index of each entity's keys. A generic plan can't use an index
 -- that holds only some entities, as it doesn't know which entity it reads, so with sequential
--- scans off the lookup has the one plan: history's index of each entity's keys, whatever history's
+-- scans off the lookup reads history by its index of each entity's keys alone, whatever history's
 -- size or statistics. A migration replacing the function sets these again, as it does its
 -- search_path.
 ALTER FUNCTION rbac_record() SET plan_cache_mode = force_generic_plan SET enable_seqscan = off;
