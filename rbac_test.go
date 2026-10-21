@@ -9007,9 +9007,11 @@ func TestAChangeDecidesUnderItsLocksAtTheTimeItIsMade(t *testing.T) {
 	}
 }
 
-// Each call reads the host's clock once, so every statement it makes and every condition it
-// evaluates are of one moment, and a change once more in each of its transactions, under its
-// locks. Each call here reads through several statements, conditions and label values.
+// Each call reads the host's clock once, where it first needs the time, so every statement it makes
+// and every condition it evaluates are of one moment, and a change once more in each of its
+// transactions, under its locks. The count is exact: a change that reads it before its transaction
+// and only once would decide under its locks at the time it began. Each call here reads through
+// several statements, conditions and label values; one that needs no time reads none.
 func TestEachCallReadsTheClockOnceAndAChangeAgainUnderItsLocks(t *testing.T) {
 	reads := 0
 	tenantGroups := rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}
@@ -9043,9 +9045,9 @@ func TestEachCallReadsTheClockOnceAndAChangeAgainUnderItsLocks(t *testing.T) {
 	secret.Labels = rbac.Label{"level": {"high"}}
 	second := func(_ any, err error) error { return err }
 	for _, c := range []struct {
-		name string
-		most int
-		call func() error
+		name  string
+		reads int
+		call  func() error
 	}{
 		{"Authorize", 1, func() error { return h.authz.Authorize(ctx, u, login, secret) }},
 		{"Explain", 1, func() error { return second(h.authz.Explain(ctx, u, login, secret)) }},
@@ -9070,7 +9072,7 @@ func TestEachCallReadsTheClockOnceAndAChangeAgainUnderItsLocks(t *testing.T) {
 		{"Import", 2, func() error {
 			return h.authz.Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "v")})
 		}},
-		{"DeleteGrants", 2, func() error {
+		{"DeleteGrants", 0, func() error {
 			return h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "v")})
 		}},
 		{"SetEligibility", 2, func() error {
@@ -9079,7 +9081,7 @@ func TestEachCallReadsTheClockOnceAndAChangeAgainUnderItsLocks(t *testing.T) {
 		{"Activate", 2, func() error {
 			return second(h.authz.Activate(ctx, v, secret, rbac.Activation{Role: "cluster.login", Duration: time.Minute, Justification: "on call"}))
 		}},
-		{"Deactivate", 2, func() error { return h.authz.Deactivate(ctx, v, secret, "cluster.login") }},
+		{"Deactivate", 0, func() error { return h.authz.Deactivate(ctx, v, secret, "cluster.login") }},
 		{"DeleteEligibility", 2, func() error { return h.authz.DeleteEligibility(ctx, admin, secret, "cluster.login", v.Principal) }},
 		{"SetDeny", 2, func() error {
 			return h.authz.SetDeny(ctx, admin, secret, rbac.Deny{ID: "d", Principals: []rbac.Principal{v.Principal}, Permissions: []rbac.Permission{root}})
@@ -9090,32 +9092,32 @@ func TestEachCallReadsTheClockOnceAndAChangeAgainUnderItsLocks(t *testing.T) {
 		}},
 		{"DeleteRole", 2, func() error { return h.authz.DeleteRole(ctx, admin, "t1", "custom.op") }},
 		{"SetGroup", 2, func() error { return h.authz.SetGroup(ctx, admin, "t1", rbac.GroupDefinition{ID: "team"}) }},
-		{"ImportGroups", 2, func() error { return h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "squad"}}) }},
+		{"ImportGroups", 0, func() error { return h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "squad"}}) }},
 		{"ChangeMembers", 2, func() error {
 			return h.authz.ChangeMembers(ctx, admin, "t1", []rbac.Member{{Group: "team", Principal: v.Principal}}, nil)
 		}},
 		{"ImportMembers", 2, func() error {
 			return h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "squad", Principal: v.Principal}})
 		}},
-		{"DeleteMembers", 2, func() error {
+		{"DeleteMembers", 1, func() error {
 			return h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "squad", Principal: v.Principal}})
 		}},
 		{"DeleteGroup", 2, func() error { return h.authz.DeleteGroup(ctx, admin, "t1", "team") }},
-		{"DeleteGroups", 2, func() error { return h.authz.DeleteGroups(ctx, host, "t1", []string{"squad"}) }},
+		{"DeleteGroups", 1, func() error { return h.authz.DeleteGroups(ctx, host, "t1", []string{"squad"}) }},
 		{"SetMemberships", 2, func() error {
 			return h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("w")}})
 		}},
-		{"DeleteScopes", 2, func() error { return h.authz.DeleteScopes(ctx, host, "t1", []rbac.Scope{workspace.Scope()}) }},
-		{"DeletePrincipal", 2, func() error { return h.authz.DeletePrincipal(ctx, host, "t1", v.Principal) }},
-		{"DeletePrincipalEverywhere", 2, func() error { return h.authz.DeletePrincipalEverywhere(ctx, host, identity("w")) }},
+		{"DeleteScopes", 0, func() error { return h.authz.DeleteScopes(ctx, host, "t1", []rbac.Scope{workspace.Scope()}) }},
+		{"DeletePrincipal", 0, func() error { return h.authz.DeletePrincipal(ctx, host, "t1", v.Principal) }},
+		{"DeletePrincipalEverywhere", 0, func() error { return h.authz.DeletePrincipalEverywhere(ctx, host, identity("w")) }},
 		{"DeleteExpired", 1, func() error { return second(h.authz.DeleteExpired(ctx)) }},
 	} {
 		reads = 0
 		if err := c.call(); err != nil {
 			t.Errorf("%s: %v", c.name, err)
 		}
-		if reads > c.most {
-			t.Errorf("%s read the clock %d times, not at most %d", c.name, reads, c.most)
+		if reads != c.reads {
+			t.Errorf("%s read the clock %d times, not %d", c.name, reads, c.reads)
 		}
 	}
 }
