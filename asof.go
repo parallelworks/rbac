@@ -124,8 +124,13 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	// statement once, as of a time and now alike, and from its sixth run can plan it generically,
 	// costing history's indexes by an average tenant's few rows: a check would then read every
 	// version of the tenant's custom roles again for each it read, and a list of a principal's
-	// memberships every member's.
-	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.as_of_tenant', $1, true), set_config('rbac.as_of', $2::pg_catalog.timestamptz::pg_catalog.text, true),
+	// memberships every member's. The time is written in UTC as ISO 8601, with its era, which a
+	// statement reads back as it is whatever its DateStyle and TimeZone, as a host's read can change
+	// them: a time's text in the session's DateStyle can name its zone by an abbreviation, which
+	// another TimeZone, or before PostgreSQL 18 timezone_abbreviations, reads as another zone's,
+	// hours off, and one of another field order reads its month as its day.
+	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.as_of_tenant', $1, true),
+		set_config('rbac.as_of', pg_catalog.to_char($2::pg_catalog.timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z" AD'), true),
 		set_config('plan_cache_mode', 'force_custom_plan', true)`,
 		tenant, at); err != nil {
 		return err

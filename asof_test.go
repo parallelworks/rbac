@@ -1215,3 +1215,54 @@ func TestAsOfReadsAListOfMoreDimensionsAsChecksDid(t *testing.T) {
 		t.Errorf("as of a time before migrating:\n%s\nnow:\n%s", strings.Join(then, "\n"), strings.Join(now, "\n"))
 	}
 }
+
+// AsOf reads history as of its time to the microsecond, whatever the session's DateStyle and
+// TimeZone and whatever its read sets them to: a time's text in a DateStyle but ISO names its
+// zone by an abbreviation, which another TimeZone reads as its own zone's, and one of another
+// field order reads its month as its day.
+func TestAsOfReadsItsTimeWhateverTheSessionsDateStyle(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	u := h.as(t, "u")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	var granted time.Time
+	if err := h.pool.QueryRow(ctx, `SELECT effective_at FROM rbac_history WHERE entity = 'grant' AND principal = 'user:u'`).Scan(&granted); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ dateStyle, timeZone, inRead string }{
+		{"ISO, MDY", "UTC", ""},
+		{"Postgres, DMY", "America/Los_Angeles", ""},
+		{"SQL, MDY", "Europe/Dublin", ""},
+		{"German", "Asia/Kolkata", ""},
+		{"Postgres, YMD", "Pacific/Chatham", ""},
+		{"Postgres, MDY", "XYZ-3", `SET LOCAL TimeZone = 'XYZ+5'`},
+		{"SQL, MDY", "Australia/Lord_Howe", `SET LOCAL DateStyle = 'SQL, DMY'`},
+	} {
+		for _, at := range []time.Time{granted, granted.Add(-time.Microsecond), time.Date(-100, time.March, 15, 12, 0, 0, 0, time.UTC)} {
+			func() {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				if _, err := tx.Exec(ctx, `SELECT set_config('DateStyle', $1, true), set_config('TimeZone', $2, true)`, c.dateStyle, c.timeZone); err != nil {
+					t.Fatal(err)
+				}
+				var held error
+				if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+					if c.inRead != "" {
+						if _, err := tx.Exec(ctx, c.inRead); err != nil {
+							return err
+						}
+					}
+					held = a.Authorize(ctx, u, login, cluster)
+					return nil
+				}); err != nil {
+					t.Errorf("%s, %s, %s: as of %v: %v", c.dateStyle, c.timeZone, c.inRead, at, err)
+				} else if (held == nil) != at.Equal(granted) {
+					t.Errorf("%s, %s, %s: as of %v, granted at %v: %v", c.dateStyle, c.timeZone, c.inRead, at, granted, held)
+				}
+			}()
+		}
+	}
+}
