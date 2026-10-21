@@ -646,8 +646,9 @@ type DB interface {
 type Config struct {
 	// Catalog is the built-in roles.
 	Catalog []RoleDefinition
-	// ContainerTypes are scope types that hold resources, such as a workspace. Any role can
-	// be granted on one, and applies to the resources under it.
+	// ContainerTypes are scope types that hold resources, such as a workspace. Any role but one
+	// giving a label value or a power to release, which is for the tenant alone, can be granted on
+	// one, and applies to the resources under it.
 	ContainerTypes []string
 	// PrincipalKinds are the kinds of identity besides users that act and are granted roles,
 	// such as service accounts. Groups, a tenant's members and the public need no declaring, and
