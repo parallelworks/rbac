@@ -606,6 +606,11 @@ func TestTheTablesRefuseWhatThePackageNeverWrites(t *testing.T) {
 	} {
 		bounds = append(bounds, bound{c[0], c[1], []any{id}, []any{id + "x"}})
 	}
+	// MaxExpression bytes, as the package counts a condition's or requirement's.
+	expr := strings.Repeat("é", rbac.MaxExpression/2)
+	for _, c := range [][2]string{{"rbac_grants", "condition"}, {"rbac_denies", "condition"}, {"rbac_eligibilities", "requires"}} {
+		bounds = append(bounds, bound{c[0], c[1], []any{expr}, []any{expr + "x"}})
+	}
 	kind := "k" + strings.Repeat("x", 62)
 	actors := []any{"", "user:" + id, kind + ":" + id, "user:a:b"}
 	notActors := []any{"user:" + id + "x", "user", "user:", ":u", "User:u", "user\n:u", strings.Repeat("\x01", 600)}

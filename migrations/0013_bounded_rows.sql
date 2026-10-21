@@ -5,10 +5,12 @@
 -- server at no cost on the wire, stopped every History and Export call from then on. Each is
 -- bounded here as the package bounds what it writes, so nothing it writes is refused: an id to
 -- MaxID bytes; an actor's key, none or `kind:id`, to a kind's name and an id, as 0012 bounds an
--- activation's principal; a role to a role's id; and a list to its number of elements and each
--- one's form. A check can't count an element's bytes without a function of the package's own, which
--- every role writing the table would need EXECUTE on, so it counts its characters, to MaxID, and
--- refuses a NULL.
+-- activation's principal; a role to a role's id; a condition or a requirement to MaxExpression
+-- bytes, a deny's too, where 0001 counted characters and let a deny's hold twice as many; and a list
+-- to its number of elements and each one's form. A check can't count an element's bytes without a
+-- function of the package's own, which every role writing the table would need EXECUTE on, so it
+-- counts its characters, to MaxID, and refuses a NULL: an element written around the package can
+-- hold four times the bytes the package writes, and history's bound on a row, below, still holds.
 --
 -- The package never wrote a row these refuse, so none is rewritten: a row written around it that
 -- one refuses stops the migration, which names the table, the check and a query that finds the row.
@@ -38,6 +40,8 @@ BEGIN
         ADD CONSTRAINT rbac_grants_scope_id_check CHECK (pg_catalog.octet_length(scope_id) <= 512) NOT VALID,
         ADD CONSTRAINT rbac_grants_principal_id_check CHECK (pg_catalog.octet_length(principal_id) <= 512) NOT VALID,
         ADD CONSTRAINT rbac_grants_role_check CHECK (role ~ '^[a-z][a-z0-9._-]{0,127}$') NOT VALID,
+        DROP CONSTRAINT rbac_grants_condition_check,
+        ADD CONSTRAINT rbac_grants_condition_check CHECK (pg_catalog.octet_length(condition) <= 2048) NOT VALID,
         ADD CONSTRAINT rbac_grants_approved_by_check CHECK (approved_by = '' OR approved_by ~ '^[a-z][a-z0-9_-]{0,62}:'
             AND pg_catalog.octet_length(pg_catalog.substr(approved_by, pg_catalog.strpos(approved_by, ':') + 1)) BETWEEN 1 AND 512) NOT VALID,
         ADD CONSTRAINT rbac_grants_created_by_check CHECK (created_by = '' OR created_by ~ '^[a-z][a-z0-9_-]{0,62}:'
@@ -69,6 +73,8 @@ BEGIN
         DROP CONSTRAINT rbac_denies_tenant_check,
         ADD CONSTRAINT rbac_denies_tenant_check CHECK (tenant <> '' AND pg_catalog.octet_length(tenant) <= 512) NOT VALID,
         ADD CONSTRAINT rbac_denies_scope_id_check CHECK (pg_catalog.octet_length(scope_id) <= 512) NOT VALID,
+        DROP CONSTRAINT rbac_denies_condition_check,
+        ADD CONSTRAINT rbac_denies_condition_check CHECK (pg_catalog.octet_length(condition) <= 2048) NOT VALID,
         DROP CONSTRAINT rbac_denies_principals_check,
         ADD CONSTRAINT rbac_denies_principals_check CHECK (pg_catalog.cardinality(principals) BETWEEN 1 AND 256
             AND NOT pg_catalog.jsonb_path_exists(pg_catalog.to_jsonb(principals),
@@ -89,6 +95,8 @@ BEGIN
         DROP CONSTRAINT rbac_eligibilities_principal_id_check,
         ADD CONSTRAINT rbac_eligibilities_principal_id_check CHECK (principal_id <> '' AND pg_catalog.octet_length(principal_id) <= 512) NOT VALID,
         ADD CONSTRAINT rbac_eligibilities_role_check CHECK (role ~ '^[a-z][a-z0-9._-]{0,127}$') NOT VALID,
+        DROP CONSTRAINT rbac_eligibilities_requires_check,
+        ADD CONSTRAINT rbac_eligibilities_requires_check CHECK (pg_catalog.octet_length(requires) <= 2048) NOT VALID,
         DROP CONSTRAINT rbac_eligibilities_approvers_check,
         ADD CONSTRAINT rbac_eligibilities_approvers_check CHECK (pg_catalog.cardinality(approvers) <= 16
             AND NOT pg_catalog.jsonb_path_exists(pg_catalog.to_jsonb(approvers),

@@ -295,8 +295,11 @@ and the call that made it (`Record.How`), and what the host attaches with `rbac.
 behalf it was made, the request and the reason. An expiry `DeleteExpired` removes is recorded as
 one, made by no one. Triggers write it, so a write that bypasses the package is recorded too, as no
 one's. That context is what the session that wrote it says; the database role is what the database
-knows. The tables hold only what the package could write, and a write whose row is more than 1 MiB
-as jsonb, or whose context is more than 1 MiB, fails rather than record what `History` couldn't
+knows. The tables bound what they hold as the package bounds what it writes, but for the ids in
+a deny's principals and exemptions and an eligibility's approvers, which they count to
+`rbac.MaxID` characters rather than bytes, so a write around the package can store those at up
+to four times the bytes the package writes; and a write whose row is more than 1 MiB as jsonb,
+or whose context is more than 1 MiB, fails rather than record what `History` couldn't
 return. A row written before history was installed, as by a host that applied the first migrations
 on their own, is recorded by migrating as it found it, its `baseline`, dated when it was created, or
 a role when it last changed. Nothing updates or truncates history, only `PruneHistory` deletes from
@@ -310,7 +313,10 @@ History written before `0013_bounded_rows` counted no bytes, so a read measures 
 writing out its rows, and reads at most 100 of them. Any transaction still running in the database
 cluster, in any of its databases, holds `History` back until it ends, so bound how long one runs
 where a role can leave one open, as with `idle_in_transaction_session_timeout`, or from PostgreSQL
-17 on with `transaction_timeout`. A time a record holds as PostgreSQL's infinity, which the tables
+17 on with `transaction_timeout`. A prepared transaction outlives its session, and neither
+timeout ends it: it holds `History`, and `Export` with it, back until it is committed or rolled
+back, so keep `max_prepared_transactions` at 0, the default, or watch `pg_prepared_xacts` and
+resolve any left there. A time a record holds as PostgreSQL's infinity, which the tables
 refuse but an older record can hold, reads as an instant just past either end of PostgreSQL's range,
 as `Record` says, so `History` reads on past it. `History` reads the primary, and fails on a
 replica. A generation (`Cursor.Generation`) names the cluster, and the database and schema history
@@ -377,7 +383,10 @@ itself, nor `pg_execute_server_program`, `pg_write_server_files` or `pg_read_ser
 which it could run any program as the server's operating system user, write any of its files, or
 read any, as one that holds a superuser's password; before PostgreSQL 16 it has no `CREATEROLE`,
 with which it could make itself a member of any role but a superuser, such as those or the roles
-below; and:
+below; it has no `REPLICATION` attribute, with which it could read every data file over a base
+backup, as `pg_read_server_files` can; from PostgreSQL 15 on, it has no `SET` or `ALTER SYSTEM`
+privilege on a parameter only a superuser may set (`GRANT ... ON PARAMETER`), with which it could
+have the server load a library or run a program of its choosing; and:
 
 1. `Migrate` runs as an administrator's role the application's isn't a member of, with only the
    package's schema in its search_path, so that role owns the package's tables: their owner can
