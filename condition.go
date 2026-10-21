@@ -57,12 +57,13 @@ import (
 // denies (SetDeny); and the requirements of the eligibilities of groups for a role on a scope. Each
 // distinct condition counts once, as what compiling it and the most evaluating it can cost:
 // hundreds of comparisons with literals, a hundred of an attribute with the subject's id, or three
-// of the longest that read a list or loop. A check of a labeled resource decides each of the
-// subject's label values as a check of it would, and evaluates a condition that doesn't read the
-// action once for them all, so on the tenant one that does counts once for each label value its
-// grants give or its denies deny. A change adding a condition past a bound, or one evaluated more,
-// as by redefining a role to give more label values (SetRole), is refused as invalid, so no grant,
-// deny or eligibility stored changes what the others decide, but one adding none isn't: conditions
+// of the longest that read a list or loop. A check of a labeled resource decides each value its
+// label asks for, and Holding, Filter and Reachable each of the subject's label values, as a check
+// of it would, evaluating a condition that doesn't read the action once for them all, so on the
+// tenant one that does counts once for each label value its grants give or its denies deny. A
+// change adding a condition past a bound, or one evaluated more, as by redefining a role to give
+// more label values (SetRole), is refused as invalid, so no grant, deny or eligibility stored
+// changes what the others decide, but one adding none isn't: conditions
 // stored past a bound before there were bounds can be rewritten in place, as by a restore over the
 // rows still stored, though restored where those are gone, they are added, and refused. An upgrade
 // of CEL can leave conditions stored past a bound in the same way: each process bounds a condition

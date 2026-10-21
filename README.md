@@ -127,8 +127,8 @@ conditional ones reach, to check one by one.
   that bare tenant, so one deciding them by the tenant's state reads it through its `q`. A check of
   a labeled resource asks it once about each value the label asks for that the subject's grants
   give, of an `Ordered` dimension those as high as the label's, and nothing about the rest;
-  `Holding`, `Filter` and `Reachable`, which test any label, ask about every one
-  (`Config.Constraints`).
+  `Holding`, `Filter` and `Reachable`, which test any label, ask about every one, as do the changes
+  and the approval `Config.Constraints` names.
   `Authorize`, `Explain`, `Permissions`, `Holders` and `Grantable` allow nothing else of a labeled
   resource unless what the subject holds satisfies the label, whatever its grants give, its values
   read with its grants, so none allows what no moment did, nor do
