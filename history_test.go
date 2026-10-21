@@ -18,6 +18,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/rbac"
@@ -549,9 +550,10 @@ func longestKeys(kind string, n int) []string {
 
 // The tables refuse what the package never writes, as a role that may write them can try: an id of
 // more than MaxID bytes, an actor's key that is no key, a role that is no role's id, and a list past
-// its bound or holding what is no element of it. Unbounded, one row a hundred megabytes long, built
-// on the server, was recorded as JSON no read of history could return, and every export stopped
-// there.
+// its bound, holding what is no element of it, or in another shape than one dimension from 1, which
+// history gives back. Unbounded, one row a hundred megabytes long, built on the server, was recorded
+// as JSON no read of history could return, and every export stopped there; and as of a time, a deny
+// naming its keys in two dimensions named none.
 func TestTheTablesRefuseWhatThePackageNeverWrites(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -668,7 +670,32 @@ func TestTheTablesRefuseWhatThePackageNeverWrites(t *testing.T) {
 		bound{"rbac_denies", "principals", keys, notKeys(rbac.MaxDenyEntries)},
 		bound{"rbac_denies", "exempt", append([]any{[]string{}}, keys...), notKeys(rbac.MaxDenyEntries)},
 		bound{"rbac_eligibilities", "approvers", []any{[]string{}, longestKeys("group", rbac.MaxApprovers)}, notKeys(rbac.MaxApprovers)},
+		bound{"rbac_denies", "permissions", []any{[]string{"cluster:login", "cluster:*"}}, []any{[]string{"cluster:deny"}, []string{"cluster:login,cluster:view"}}},
 	)
+	// A list the package can write, in more dimensions than one or from another subscript than 1,
+	// which history, holding it as JSON, gives back in one from 1: every list the tables hold.
+	shaped := map[string]bool{}
+	for i, b := range bounds {
+		if v, ok := b.ok[len(b.ok)-1].([]string); ok && len(v) > 0 {
+			bounds[i].bad = append(bounds[i].bad, [][]string{v}, [][]string{v[:1], v[len(v)-1:]},
+				pgtype.Array[string]{Elements: v, Dims: []pgtype.ArrayDimension{{Length: int32(len(v)), LowerBound: 0}}, Valid: true})
+			shaped[b.table+"."+b.column] = true
+		}
+	}
+	lists, err := h.pool.Query(ctx, `SELECT c.relname || '.' || a.attname FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+		WHERE c.relnamespace = current_schema()::regnamespace AND c.relkind = 'r' AND a.atttypid = 'text[]'::regtype AND NOT a.attisdropped`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	columns, err := pgx.CollectRows(lists, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range columns {
+		if !shaped[c] {
+			t.Errorf("list %s is shaped by no bound here", c)
+		}
+	}
 	for _, b := range bounds {
 		for i, v := range b.ok {
 			if err := insert(b.table, b.column, v); err != nil {
@@ -719,6 +746,59 @@ func TestMigratingNamesARowTheTablesRefuse(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT convalidated FROM pg_constraint WHERE conrelid = 'rbac_grants'::regclass
 		AND conname = 'rbac_grants_host_check'`).Scan(&checked); err != nil || checked {
 		t.Fatalf("a check left unchecked: checked %t, %v", checked, err)
+	}
+}
+
+// Migrating rewrites each list a row holds in more dimensions than one, or from another subscript
+// than 1, as before 0016 the tables took, in one dimension from 1, its elements in the order every
+// read took them, and history records it as Migrate's change; a row whose lists are so already is
+// left as it is.
+func TestMigratingWritesEveryListInOneDimension(t *testing.T) {
+	pool := pgtest.Open(t, "")
+	ctx := t.Context()
+	migrateFiles(t, pool, "", "0016")
+	for _, sql := range []string{
+		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles)
+		 VALUES ('t1', 'custom.r', '{{cluster:view,cluster:login},{cluster:root,cluster:grant}}', '[0:0]={cluster}', '{{cluster.login},{cluster.sudo}}'),
+		   ('t1', 'custom.flat', '{cluster:view}', '{cluster}', '{}')`,
+		`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+		 VALUES ('t1', 'cluster', 'c1', 'd', '[0:1]={user:a,user:b}', '{{user:c}}', '{{cluster:login},{cluster:view}}'),
+		   ('t1', 'cluster', 'c1', 'flat', '{user:a}', '{}', '{cluster:login}')`,
+		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+		 VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'cluster.sudo', 60, '{{user:a,group:g}}'),
+		   ('t1', 'cluster', 'c1', 'user', 'flat', 'cluster.sudo', 60, '{user:a}')`,
+	} {
+		if _, err := pool.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	migrateFiles(t, pool, "0016", "")
+	rows, err := pool.Query(ctx, `
+		SELECT id || ' ' || permissions::text || ' ' || resource_types::text || ' ' || grantable_roles::text FROM rbac_roles
+		UNION ALL SELECT id || ' ' || principals::text || ' ' || exempt::text || ' ' || permissions::text FROM rbac_denies
+		UNION ALL SELECT principal_id || ' ' || approvers::text FROM rbac_eligibilities
+		ORDER BY 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"custom.flat {cluster:view} {cluster} {}",
+		"custom.r {cluster:view,cluster:login,cluster:root,cluster:grant} {cluster} {cluster.login,cluster.sudo}",
+		"d {user:a,user:b} {user:c} {cluster:login,cluster:view}",
+		"flat {user:a}",
+		"flat {user:a} {} {cluster:login}",
+		"u {user:a,group:g}",
+	}
+	if got, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || !slices.Equal(got, want) {
+		t.Fatalf("lists once migrated: %q, %v", got, err)
+	}
+	recorded, err := pool.Query(ctx, `SELECT entity || ' ' || key FROM rbac_history WHERE op = 'update' AND how = 'Migrate' ORDER BY 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := pgx.CollectRows(recorded, pgx.RowTo[string]); err != nil ||
+		len(got) != 3 || got[0] != "deny cluster:c1 d" || !strings.HasPrefix(got[1], "eligibility ") || got[2] != "role custom.r" {
+		t.Fatalf("changes migrating recorded: %q, %v", got, err)
 	}
 }
 

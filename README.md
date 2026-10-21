@@ -458,7 +458,13 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   commits. Building one calls `rbac_tenant_keys` and `rbac_text_array` as history's role, as
   recording each deny does from then on, so it grants that role `EXECUTE` on both where it lacks
   it. Where new functions give PUBLIC no `EXECUTE`, grant it on `rbac_text_array` to the
-  application's role too, as `AsOf` calls it.
+  application's role too, as `AsOf` calls it. `0016_flat_lists` rewrites a list a role, deny or
+  eligibility holds in more than one dimension, or from a subscript other than 1, as a write
+  around the package could store, in one dimension from 1, keeping its elements in order, which
+  history records as `Migrate`'s change, and then refuses another shape. It locks those three
+  tables until it commits and reads each twice, and keeps changes to every table waiting, as each
+  writes history, though reads of history go on; where history holds a deny recorded with its keys
+  in more dimensions, it rebuilds history's index of them, which reads all of history.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
   between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows
