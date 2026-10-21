@@ -4320,3 +4320,51 @@ func TestWithoutResourceOfTheTenantIsAsStoredOnlyWhereResourcesHaveNoAttributes(
 		})
 	}
 }
+
+// A change checks the end of a membership or a place in a group again under its locks, at the time
+// it reads there, as it checks a grant's: here each reading of the clock is an hour after the last,
+// so an end half an hour after the change's first reading passes while it waits, and the change is
+// refused rather than store and report what has already ended.
+func TestAnEndPassingWhileAMembershipChangeWaitsIsRefused(t *testing.T) {
+	for name, change := range map[string]func(h *harness, x rbac.Subject, ends time.Time) error{
+		"SetMemberships": func(h *harness, _ rbac.Subject, ends time.Time) error {
+			return h.authz.SetMemberships(h.ctx, host, "t1", []rbac.Membership{{Principal: identity("v"), ExpiresAt: ends}})
+		},
+		"ImportMembers": func(h *harness, _ rbac.Subject, ends time.Time) error {
+			return h.authz.ImportMembers(h.ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("v"), ExpiresAt: ends}})
+		},
+		"ChangeMembers": func(h *harness, x rbac.Subject, ends time.Time) error {
+			return h.authz.ChangeMembers(h.ctx, x, "t1", []rbac.Member{{Group: "crew", Principal: identity("v"), ExpiresAt: ends}}, nil)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			stepping := false
+			var h *harness
+			h = setup(t, func(c *rbac.Config) {
+				c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
+				c.Now = func() time.Time {
+					at := h.now
+					if stepping {
+						h.now = h.now.Add(time.Hour)
+					}
+					return at
+				}
+			})
+			h.seed(t, grant(rbac.TenantRoot("t1"), groupMembers.ID, rbac.User, "x"))
+			h.groups(t, "crew")
+			h.as(t, "v")
+			x := h.as(t, "x")
+			start := h.now
+			h.events = nil
+			stepping = true
+			err := change(h, x, start.Add(30*time.Minute))
+			stepping = false
+			if read := h.now.Sub(start) / time.Hour; read != 2 {
+				t.Fatalf("the change read the clock %d times, not once before its transaction and once in it: %v", read, err)
+			}
+			if !errors.Is(err, rbac.ErrInvalid) {
+				t.Errorf("the change stored what ended while it waited: %v, events %+v", err, h.events)
+			}
+		})
+	}
+}

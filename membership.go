@@ -166,6 +166,17 @@ func (a *Authorizer) checkMembership(m Membership, now time.Time) error {
 	return nil
 }
 
+// keptAgain checks, under a change's locks, the memberships or members it checked before its
+// transaction, at the time it reads there, as a change checks a grant's end again: one ending while
+// it waited would be stored and reported already ended.
+func keptAgain[T any](set []T, now time.Time, check func(T, time.Time) error) error {
+	errs := make([]error, len(set))
+	for i, m := range set {
+		errs[i] = check(m, now)
+	}
+	return errors.Join(errs...)
+}
+
 // SetMemberships makes identities members or guests of a tenant, or changes how, as actor: the
 // host's own write, without the checks a change by a tenant's admins has, as Import is for grants.
 // It reports the memberships it set or changed. An identity whose membership had ended joins again
@@ -224,6 +235,9 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 		// would remove them, each membership held before its members as there, so the two never
 		// deadlock; and any places of an identity with no membership, which joins in none.
 		at := a.cfg.Now()
+		if err := keptAgain(set, at, a.checkMembership); err != nil {
+			return ChangeEvent{}, nil, err
+		}
 		var widened []string
 		if a.exclusive() {
 			if widened, err = widening(ctx, tx, tenant, set, keys, at); err != nil {
@@ -1168,6 +1182,9 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 			return ChangeEvent{}, nil, err
 		}
 		now := a.cfg.Now()
+		if err := keptAgain(set, now, a.checkMember); err != nil {
+			return ChangeEvent{}, nil, err
+		}
 		r, err := a.restingIn(ctx, tx, tenant, set, expiring(set), now)
 		if err != nil {
 			return ChangeEvent{}, nil, err
@@ -1475,6 +1492,9 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 			return ChangeEvent{}, nil, err
 		}
 		now := a.cfg.Now()
+		if err := keptAgain(set, now, a.checkMember); err != nil {
+			return ChangeEvent{}, nil, err
+		}
 		r, err := a.restingIn(ctx, tx, tenant, slices.Concat(remove, set), slices.Concat(remove, expiring(set)), now)
 		if err != nil {
 			return ChangeEvent{}, nil, err
