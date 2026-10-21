@@ -7258,6 +7258,124 @@ func TestADenyOnChangingGrantsStopsRedefiningRoles(t *testing.T) {
 	}
 }
 
+// viewing gives view on clusters and workspaces, on either.
+var viewing = rbac.RoleDefinition{ID: "viewing", Permissions: []rbac.Permission{view, "workspace:view"}, ResourceTypes: []string{"cluster", "workspace"}}
+
+func withViewing(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), viewing) }
+
+// narrowedOff is x, who may define roles and holds what they give on clusters and workspaces, and
+// custom.r, which x granted y on c1 and then narrowed to give only on workspaces, so that grant
+// gives nothing. The catalog has viewing (withViewing).
+func narrowedOff(t *testing.T, h *harness) (rbac.Subject, rbac.RoleDefinition) {
+	t.Helper()
+	ctx := t.Context()
+	tenant := rbac.TenantRoot("t1")
+	h.seed(t, grant(tenant, "tenant.roles", rbac.User, "x"), grant(tenant, "cluster.admin", rbac.User, "x"), grant(tenant, "workspace.admin", rbac.User, "x"),
+		grant(tenant, viewing.ID, rbac.User, "x"))
+	x, y := h.as(t, "x"), h.as(t, "y")
+	r := rbac.RoleDefinition{ID: "custom.r", Permissions: []rbac.Permission{view, "workspace:view"}, ResourceTypes: []string{"cluster", "workspace"}}
+	if err := h.authz.SetRole(ctx, x, "t1", r); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.Apply(ctx, x, cluster, rbac.Change{Grant: []rbac.Binding{{Role: r.ID, Principal: y.Principal}}}); err != nil {
+		t.Fatal(err)
+	}
+	r.ResourceTypes = []string{"workspace"}
+	if err := h.authz.SetRole(ctx, x, "t1", r); err != nil {
+		t.Fatal(err)
+	}
+	return x, r
+}
+
+// Revoking a grant of a role on a cluster is a change to grants there even once the role, narrowed
+// off clusters, gives nothing through it: a deny on the tenant, or a constraint, that stops x
+// changing grants on clusters stops x deleting the role or redefining it, as it stops Apply
+// revoking that grant.
+func TestAFreezeOnChangingGrantsOnATypeARoleWasNarrowedOffStopsChangingIt(t *testing.T) {
+	for _, by := range []string{"deny", "constraint"} {
+		t.Run(by, func(t *testing.T) {
+			frozen := false
+			h, guardian := guarded(t, withViewing, func(c *rbac.Config) {
+				c.Constraints = []rbac.Constraint{{Name: "freeze", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+					return frozen && in.Permission == grantC, nil
+				}}}
+			})
+			ctx := t.Context()
+			x, r := narrowedOff(t, h)
+			if by == "deny" {
+				tenant := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}
+				if err := h.authz.SetDeny(ctx, guardian, tenant, rbac.Deny{ID: "freeze", Permissions: []rbac.Permission{grantC}, Principals: []rbac.Principal{x.Principal}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			frozen = by == "constraint"
+			y := rbac.Principal{Kind: rbac.User, ID: "y"}
+			if err := h.authz.Apply(ctx, x, cluster, rbac.Change{Revoke: []rbac.Binding{{Role: r.ID, Principal: y}}}); !errors.Is(err, rbac.ErrDenied) {
+				t.Fatalf("revoking the grant on c1 under the freeze: %v", err)
+			}
+			narrower := r
+			narrower.Permissions = []rbac.Permission{"workspace:view"}
+			if err := h.authz.SetRole(ctx, x, "t1", narrower); !errors.Is(err, rbac.ErrDenied) {
+				t.Errorf("redefining a role granted on c1 under the freeze: %v", err)
+			}
+			if err := h.authz.DeleteRole(ctx, x, "t1", r.ID); !errors.Is(err, rbac.ErrDenied) {
+				t.Errorf("deleting a role granted on c1 under the freeze: %v", err)
+			}
+			grants, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{y}})
+			if err != nil || len(grants) != 1 || grants[0].Scope != cluster.Scope() {
+				t.Fatalf("y's grants: %+v, %v", grants, err)
+			}
+		})
+	}
+}
+
+// The constraints are asked before a change's transaction alone, so a role deleted while it is
+// granted on a cluster, the constraints not asked about clusters, as it was redefined for them and
+// back meanwhile, is tried again, and then stopped where they freeze changes to grants there.
+func TestARoleGrantedMeanwhileOnATypeTheConstraintsWerentAskedAboutIsTriedAgain(t *testing.T) {
+	frozen := false
+	var meanwhile func(context.Context) error
+	h := setup(t, withViewing, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "freeze", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if do := meanwhile; do != nil && in.Permission == "workspace:grant" {
+				meanwhile = nil
+				if err := do(ctx); err != nil {
+					return false, err
+				}
+			}
+			return frozen && in.Permission == grantC, nil
+		}}}
+	})
+	ctx := t.Context()
+	x, r := narrowedOff(t, h)
+	y := rbac.Principal{Kind: rbac.User, ID: "y"}
+	if err := h.authz.Apply(ctx, x, cluster, rbac.Change{Revoke: []rbac.Binding{{Role: r.ID, Principal: y}}}); err != nil {
+		t.Fatal(err)
+	}
+	meanwhile = func(ctx context.Context) error {
+		wide := r
+		wide.ResourceTypes = []string{"cluster", "workspace"}
+		if err := h.authz.SetRole(ctx, x, "t1", wide); err != nil {
+			return err
+		}
+		if err := h.authz.Apply(ctx, x, cluster, rbac.Change{Grant: []rbac.Binding{{Role: r.ID, Principal: y}}}); err != nil {
+			return err
+		}
+		err := h.authz.SetRole(ctx, x, "t1", r)
+		frozen = true
+		return err
+	}
+	if err := h.authz.DeleteRole(ctx, x, "t1", r.ID); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("deleting a role granted on c1 meanwhile: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("the role should have been granted on c1 meanwhile")
+	}
+	if err := h.authz.DeleteRole(ctx, x, "t1", r.ID); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("tried again under the freeze: %v", err)
+	}
+}
+
 // definer is x, who may define roles and holds sudo and admin on every cluster, for good, and a
 // custom role giving view on clusters it defined.
 func definer(t *testing.T, h *harness) (rbac.Subject, rbac.RoleDefinition) {
