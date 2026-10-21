@@ -1759,11 +1759,20 @@ func (a *Authorizer) begin(ctx context.Context, fn func(pgx.Tx) error) error {
 	if err := a.writable(); err != nil {
 		return err
 	}
-	// The transaction decides again under its locks, so at a time it reads then (callClock).
-	if a.clock != nil {
-		a.clock.read = false
+	if a.clock == nil {
+		return begin(ctx, a.db, fn)
 	}
-	return begin(ctx, a.db, fn)
+	// The transaction decides again under its locks, so at a time it reads then (callClock). One that
+	// fails before needing the time reads it there too, so its refusal is dated where it decided: a
+	// reading from before the locks can predate a change it waited for.
+	a.clock.read = false
+	return begin(ctx, a.db, func(tx pgx.Tx) error {
+		err := fn(tx)
+		if err != nil {
+			a.clock.now()
+		}
+		return err
+	})
 }
 
 // begin runs fn in a transaction of its own at READ COMMITTED, whatever the database's default,
