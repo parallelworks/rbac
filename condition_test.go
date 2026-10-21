@@ -197,6 +197,34 @@ func TestAMapTheHostPassesKeyedByADoubleThatIsntFiniteFailsWhatComparesOrIndexes
 	}
 }
 
+// A host can pass an optional value, which CEL compares by its own comparison of what it holds:
+// one holding NaN compared as unequal to any, and one holding a long list was read whole, charged
+// as a single value.
+func TestAnOptionalTheHostPassesComparesAsWhatItHolds(t *testing.T) {
+	attributes := map[string]any{
+		"nan": types.OptionalOf(types.Double(math.NaN())), "half": types.OptionalOf(types.Double(0.5)),
+		"long":  types.OptionalOf(types.DefaultTypeAdapter.NativeToValue(make([]string, 100000))),
+		"keyed": types.OptionalOf(types.DefaultTypeAdapter.NativeToValue(map[string]any{strings.Repeat("k", 100): 1})),
+		"none":  types.OptionalNone,
+	}
+	for _, expr := range []string{
+		`request.attributes.nan != request.attributes.half`, `[request.attributes.nan] != [request.attributes.half]`,
+		`request.attributes.long == request.attributes.long`,
+	} {
+		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || evaluated {
+			t.Errorf("%s: evaluated %t, %v", expr, evaluated, err)
+		}
+	}
+	for _, expr := range []string{
+		`request.attributes.half == request.attributes.half`, `request.attributes.keyed == request.attributes.keyed`,
+		`request.attributes.none != request.attributes.half`,
+	} {
+		if held, _, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || !held {
+			t.Errorf("%s: held %t, %v", expr, held, err)
+		}
+	}
+}
+
 func TestADeclaredAttributePassedAsAnotherTypeFailsAComparisonOfWhatHoldsIt(t *testing.T) {
 	h := setup(t, func(c *rbac.Config) {
 		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)

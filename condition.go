@@ -1378,6 +1378,13 @@ func equal(x, y ref.Val, read uint64) ref.Val {
 		return eq != types.False
 	}
 	switch xs := x.(type) {
+	case *types.Optional:
+		// A host can pass one, which CEL compares by its own comparison of what it holds.
+		ys, ok := y.(*types.Optional)
+		if !ok || !xs.HasValue() || !ys.HasValue() {
+			return types.Equal(x, y)
+		}
+		return equal(xs.GetValue(), ys.GetValue(), read)
 	case traits.Mapper:
 		ys, ok := y.(traits.Mapper)
 		if !ok || xs.Size() != ys.Size() {
@@ -1459,6 +1466,11 @@ func smaller(x, y ref.Val, limit uint64) uint64 {
 func valueSize(v ref.Val, limit uint64) uint64 {
 	n := textSize(v)
 	switch v := v.(type) {
+	case *types.Optional:
+		// One a host passes, which CEL compares by what it holds, whole.
+		if v.HasValue() && n <= limit {
+			n += valueSize(v.GetValue(), limit-n)
+		}
 	case traits.Mapper:
 		// Each entry is at least a key and a value.
 		if least := n + 2*count(v); least > limit {
