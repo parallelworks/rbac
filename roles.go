@@ -330,7 +330,8 @@ func canonical(r RoleDefinition) RoleDefinition {
 // of its GrantableRoles must be a role the actor may grant on the tenant. Replacing a role
 // another custom role lists needs the power to grant it as defined wherever that one lists it,
 // and where it will give more, under the denies on the path of each scope that one is granted on,
-// as that one's holders there may then grant it. Replacing one so that its grants give something
+// as that one's holders there may then grant it, and with that scope's label, unless the actor's
+// label values satisfy every label. Replacing one so that its grants give something
 // else changes them, so a constraint that stops changes to grants where it can be granted, or a
 // deny that removes the actor's power to change them there or on the path of a scope they are on,
 // stops it, as it stops DeleteRole and Apply there; so does, where they will give more, a deny on
@@ -807,11 +808,12 @@ func (a *Authorizer) revalidate(ctx context.Context, actor Subject, tenant strin
 // roleReach is what a change to what a custom role's grants and eligibilities give, or deleting
 // the role, checked of the scopes it reaches before its transaction, which stillReaches checks
 // again under the tenant's lock: each scope as Config.ResourceOf gives it, where a deny or a label
-// needed it, the role as it will be where its grants will give more, and their labels.
+// needed it, the role as it will be where its grants will give more, and the labels of the scopes
+// they are on and, where they will, of those roles listing it are granted on (listing).
 type roleReach struct {
-	on     map[Scope]Resource
-	grows  *RoleDefinition
-	labels labeling
+	on              map[Scope]Resource
+	grows           *RoleDefinition
+	labels, listing labeling
 }
 
 // reached are the scopes a change to a custom role reaches: those its grants and eligibilities are
@@ -872,7 +874,8 @@ func (a *Authorizer) reachedBy(ctx context.Context, q DB, tenant string, id Role
 // there or, with grows, the role as it will be when they will give more, a permission it gives, or
 // where its label refuses the actor (labelsHeld). With grows, it refuses too where a deny on the
 // path of a scope a role listing it is granted on keeps the actor from granting it there as it will
-// be, as that role's holders there then may (scopesDenied). Only a deny on a scope other than the
+// be, as that role's holders there then may (scopesDenied), or where that scope's label refuses the
+// actor, unless the actor's label values satisfy every label. Only a deny on a scope other than the
 // tenant can remove more there than the tenant's, which mayDefine and changesDenied check, so only
 // where one binds the actor, or a label could refuse it, is the host asked about the scopes.
 // Without grows, as for deleting or narrowing the role, which only takes access away, a scope the
@@ -896,11 +899,26 @@ func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authorit
 	if reach.labels, err = a.labelsAsked(ctx, actor, tenant, removing && len(scopes.own) > 0); err != nil {
 		return roleReach{}, err
 	}
-	if !denied && !reach.labels.asks() {
+	// Widened, it gives the holders of a role listing it more to grant there, which a label of the
+	// scope can refuse the actor handing on, as granting it there would; so it is asked about the
+	// scopes only where the actor's values don't satisfy every label, which the constraints were
+	// asked about for its own.
+	if grows != nil && reach.labels.cs != nil {
+		reach.listing = labeling{cs: reach.labels.cs}
+		if len(scopes.listed) > 0 {
+			if reach.listing.cleared, err = a.clearsAll(ctx, a.db, reach.listing.cs); err != nil {
+				return roleReach{}, err
+			}
+		}
+	}
+	if !denied && !reach.labels.asks() && !reach.listing.asks() {
 		return reach, nil
 	}
-	resolve := slices.Clone(scopes.own)
-	if denied {
+	var resolve []Scope
+	if denied || reach.labels.asks() {
+		resolve = slices.Clone(scopes.own)
+	}
+	if denied || reach.listing.asks() {
 		resolve = append(resolve, slices.SortedFunc(maps.Keys(scopes.listed), scopeOrder)...)
 	}
 	reach.on = make(map[Scope]Resource, len(resolve))
@@ -922,14 +940,23 @@ func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authorit
 			return roleReach{}, err
 		}
 	}
-	if reach.labels.asks() {
-		for _, s := range scopes.own {
+	for _, l := range []struct {
+		labels *labeling
+		scopes []Scope
+	}{{&reach.labels, scopes.own}, {&reach.listing, slices.SortedFunc(maps.Keys(scopes.listed), scopeOrder)}} {
+		if !l.labels.asks() {
+			continue
+		}
+		for _, s := range l.scopes {
 			if r := reach.on[s]; r.Labels.asks() {
-				reach.labels.labeled = append(reach.labels.labeled, r)
+				l.labels.labeled = append(l.labels.labeled, r)
 			}
 		}
+		if err := a.labelsHeld(ctx, a.db, *l.labels); err != nil {
+			return roleReach{}, err
+		}
 	}
-	return reach, a.labelsHeld(ctx, a.db, reach.labels)
+	return reach, nil
 }
 
 // scopeOrder orders scopes by key.
@@ -965,15 +992,20 @@ func (a *Authorizer) stillReaches(ctx context.Context, tx pgx.Tx, actor Subject,
 			return err
 		}
 	}
-	if denied {
+	if denied || checked.listing.asks() {
 		if err := unchecked(slices.SortedFunc(maps.Keys(scopes.listed), scopeOrder)); err != nil {
 			return err
 		}
+	}
+	if denied {
 		if err := a.scopesDenied(ctx, tx, actor, au, tenant, id, scopes, checked, change); err != nil {
 			return err
 		}
 	}
-	return a.stillLabeled(ctx, tx, checked.labels)
+	if err := a.stillLabeled(ctx, tx, checked.labels); err != nil {
+		return err
+	}
+	return a.stillLabeled(ctx, tx, checked.listing)
 }
 
 // deniedBelow reports, reading on q, whether a deny on a scope other than the tenant binds the
