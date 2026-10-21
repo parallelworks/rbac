@@ -12,13 +12,16 @@ import (
 )
 
 // asOfEntities are the tables history records, by the entity it records each as, and the columns
-// history records beside each of a table's rows, by the table's column each copies.
+// history records beside each of a table's rows, by the table's column each copies. A role's id is
+// its key, which history's index of an entity's versions seeks with its tenant: its role column is
+// indexed beside every grant and eligibility of the role, and a plan that counts the tenant's
+// roles as a few reads them all rather than seek that index.
 var asOfEntities = []struct {
 	table, entity string
 	columns       map[string]string
 }{
 	{"rbac_grants", "grant", map[string]string{"tenant": "tenant", "principal": "principal", "role": "role", "scope": "scope"}},
-	{"rbac_roles", "role", map[string]string{"tenant": "tenant", "id": "role"}},
+	{"rbac_roles", "role", map[string]string{"tenant": "tenant", "id": "key"}},
 	{"rbac_denies", "deny", map[string]string{"tenant": "tenant", "scope": "scope"}},
 	{"rbac_eligibilities", "eligibility", map[string]string{"tenant": "tenant", "principal": "principal", "role": "role", "scope": "scope"}},
 	{"rbac_memberships", "membership", map[string]string{"tenant": "tenant", "principal": "principal"}},
@@ -51,11 +54,13 @@ var asOfEntities = []struct {
 //
 // It reads in one transaction, or a savepoint of the host's under WithTx, in which temporary
 // views named as the package's tables stand in for them, and rolls it back, even once ctx is
-// done. It needs a transaction that may write, on a primary, as a role that may create temporary
-// tables. A search_path that names pg_temp after the package's schema would read the tables as
-// they are now, and one that names it first the session's own tables as history, so AsOf refuses
-// both. It orders a row's changes by their ids in rbac_history, which sessions take out of order
-// once its id sequence caches more than one, so AsOf refuses that too.
+// done. Every statement there is planned for its arguments, the host's under WithTx too, as
+// plan_cache_mode force_custom_plan plans them, until the rollback restores the setting. It needs
+// a transaction that may write, on a primary, as a role that may create temporary tables. A
+// search_path that names pg_temp after the package's schema would read the tables as they are
+// now, and one that names it first the session's own tables as history, so AsOf refuses both. It
+// orders a row's changes by their ids in rbac_history, which sessions take out of order once its
+// id sequence caches more than one, so AsOf refuses that too.
 func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read func(*Authorizer) error) (err error) {
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -115,7 +120,13 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	if err := unpruned(ctx, tx, schema, at); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.as_of_tenant', $1, true), set_config('rbac.as_of', $2::pg_catalog.timestamptz::pg_catalog.text, true)`,
+	// Each statement is planned for its arguments until AsOf rolls back. A connection prepares a
+	// statement once, as of a time and now alike, and from its sixth run can plan it generically,
+	// costing history's indexes by an average tenant's few rows: a check would then read every
+	// version of the tenant's custom roles again for each it read, and a list of a principal's
+	// memberships every member's.
+	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.as_of_tenant', $1, true), set_config('rbac.as_of', $2::pg_catalog.timestamptz::pg_catalog.text, true),
+		set_config('plan_cache_mode', 'force_custom_plan', true)`,
 		tenant, at); err != nil {
 		return err
 	}
@@ -156,6 +167,11 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 			selected[i] = "r." + pgx.Identifier{name}.Sanitize()
 			if h, ok := e.columns[name]; ok {
 				selected[i] = "h." + h + " AS " + pgx.Identifier{name}.Sanitize()
+			}
+			// The keys a deny names, by the expression history's index on them reads them by
+			// (0015), so a list finds the denies naming its subject as it does now, by that index.
+			if e.table == "rbac_denies" && name == "principals" {
+				selected[i] = pgx.Identifier{schema}.Sanitize() + `.rbac_text_array(h.after -> 'principals') COLLATE "C" AS principals`
 			}
 			// A version recorded before the tables refused an infinite expiry reads as migrating
 			// rewrote its row: a time.Time holds no infinity.

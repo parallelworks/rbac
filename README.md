@@ -363,11 +363,13 @@ and it is dated before that change. Write around the package at READ COMMITTED. 
 change: one tried is no actor's attempt, and `Config.OnRefused` isn't told of it. A statement
 reads the history of the rows it names, as a check does its subject's grants, groups and the
 denies on its resource's path, and `Holders` the members of the groups it lists, not the whole
-tenant's. It orders a row's changes by their ids in `rbac_history`, which sessions take out of
-order once that table's id sequence caches more than one, so `AsOf` refuses that. Its read's hooks
-run in its transaction, which holds one of the pool's connections: a constraint there queries the
-`DB` it is given, as one that queries the pool waits for another connection, which a busy pool may
-never free.
+tenant's: `AsOf` plans every statement in its transaction for its arguments, the host's too, since
+a connection's cached plan of a statement it has run often counts any tenant as an average one. It
+orders a row's changes by their ids in `rbac_history`, which sessions take out of order once that
+table's id sequence caches more than one, so `AsOf` refuses that. Its read's hooks run in its
+transaction, which holds one of the pool's connections: a constraint there queries the `DB` it is
+given, as one that queries the pool waits for another connection, which a busy pool may never
+free.
 
 `rbac.PruneHistory(ctx, db, before, through)` deletes what an export has read past (`through`, its
 cursor) and later records supersede: of each row, the last version at or before `before` stays, so
@@ -401,13 +403,15 @@ have the server load a library or run a program of its choosing; and:
 2. A role of history's own, which the administrator's role is a member of and the application's
    isn't, owns `rbac_history` and the function `rbac_record`: transfer them to it after migrating.
    It needs `USAGE` on the schema, since every write to the package's tables runs `rbac_record`
-   as it, and `CREATE` there to be given them, unless a superuser gives them.
+   as it; `EXECUTE` on the functions `rbac_tenant_keys` and `rbac_text_array`, which history's
+   index of the keys denies name calls for each record, and which every role has unless it is
+   revoked; and `CREATE` there to be given them, unless a superuser gives them.
 3. The application's role has `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the package's tables
    but `rbac_history` and `rbac_migrations`, and on any a later migration adds, `EXECUTE` on the
-   functions `rbac_group_members` and `rbac_tenant_keys`, which every role has unless it is
-   revoked, and only `SELECT` on `rbac_history`, with no `UPDATE` on its id sequence, which a
-   grant on all the schema's sequences can give: `setval` could number a change below the one
-   before it, and `AsOf` would read the row as it was before the change. Never `TRIGGER`, which
+   functions `rbac_group_members`, `rbac_tenant_keys` and `rbac_text_array`, which every role has
+   unless it is revoked, and only `SELECT` on `rbac_history`, with no `UPDATE` on its id sequence,
+   which a grant on all the schema's sequences can give: `setval` could number a change below the
+   one before it, and `AsOf` would read the row as it was before the change. Never `TRIGGER`, which
    `ALL` includes: a trigger runs its function as whoever writes the table, and one on
    `rbac_history` can drop each record, as history's owner.
 4. The application's role can make no schema and create in none: it neither owns the database nor
@@ -443,7 +447,12 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   after it: an activation it extends keeps the eligibility recorded before, and can outlast the one
   it was extended through. Stop the replicas running it before migrating. `0013_bounded_rows`
   locks every table, history too, until it commits, and reads each once for each check it adds,
-  so checks, lists, changes and reads of history wait for it.
+  so checks, lists, changes and reads of history wait for it. `0015_history_seeks` builds two
+  indexes on `rbac_history`, which every change writes, and analyzes it, so changes wait until it
+  commits. Building one calls `rbac_tenant_keys` and `rbac_text_array` as history's role, as
+  recording each deny does from then on, so it grants that role `EXECUTE` on both where it lacks
+  it. Where new functions give PUBLIC no `EXECUTE`, grant it on `rbac_text_array` to the
+  application's role too, as `AsOf` calls it.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
   between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows

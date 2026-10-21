@@ -1,0 +1,58 @@
+-- As of a time, a statement reads history by the rows it names through an index leading to the
+-- tenant, or every version of an entity in the tenant. The planner counted a tenant's versions of an
+-- entity as history's rows times the tenant's share of them times the entity's: in a history of many
+-- tenants, a tenant of hundreds of custom roles holds a small share of every record and its roles a
+-- small share of every tenant's, so it counted them as a row. Reading them all looked as cheap as
+-- seeking the few a check names, and a plan read them all again for each version it found, which for
+-- 200 roles was about 20,000 pages. Statistics of the two columns together count each pair common
+-- enough to matter as it is.
+CREATE STATISTICS rbac_history_tenant_entity (mcv) ON tenant, entity FROM rbac_history;
+
+-- As of a time, a list of the grants or the eligibilities on a scope read every version of every
+-- one in the tenant: history had an index by scope for denies alone. This one finds an entity's
+-- versions on a scope. Denies keep theirs, which holds no grant: in this one, every grant's version
+-- would deepen each lookup of a scope's denies, which a check makes for each scope on its path.
+-- Building it reads all of history, and every write to the package's tables, each of which writes
+-- history, waits until the migration commits.
+CREATE INDEX rbac_history_scope ON rbac_history (tenant, entity, scope, effective_at DESC) WHERE entity IN ('grant', 'eligibility');
+
+-- As of a time, Filter and Reachable find the denies naming their subject by the keys they name,
+-- as rbac_denies_principals finds them now, but history held those keys in each version's record
+-- alone, so they read every version of every deny in the tenant. This index holds them as that
+-- one does, and AsOf reads a deny's keys by the same expression, which a plan matches to it.
+-- rbac_text_array is the strings of a JSON array; its body, as rbac_tenant_keys', is parsed now and
+-- names pg_catalog's functions and operators.
+CREATE FUNCTION rbac_text_array(a jsonb) RETURNS text[]
+    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+    RETURN ARRAY(SELECT e FROM pg_catalog.jsonb_array_elements_text(
+        CASE WHEN pg_catalog.jsonb_typeof(a) OPERATOR(pg_catalog.=) 'array' THEN a END) AS e);
+
+-- Building the index and analyzing history call both functions as history's owner, and recording a
+-- deny from then on calls them as rbac_record's. Where a host revoked EXECUTE on them from PUBLIC
+-- and granted it to the application's role alone, migrating would fail on a history holding a
+-- deny, and every change to a deny after it.
+DO $$
+DECLARE
+    here  pg_catalog.text := pg_catalog.current_schema();
+    keys  pg_catalog.regprocedure := pg_catalog.format('%I.rbac_tenant_keys(pg_catalog.text, pg_catalog.text[])', here);
+    texts pg_catalog.regprocedure := pg_catalog.format('%I.rbac_text_array(pg_catalog.jsonb)', here);
+    owner pg_catalog.text;
+BEGIN
+    FOR owner IN SELECT r.rolname FROM pg_catalog.pg_roles r
+        WHERE r.oid IN ((SELECT c.relowner FROM pg_catalog.pg_class c
+                         WHERE c.oid = pg_catalog.format('%I.rbac_history', here)::pg_catalog.regclass),
+                        (SELECT p.proowner FROM pg_catalog.pg_proc p
+                         WHERE p.oid = pg_catalog.format('%I.rbac_record()', here)::pg_catalog.regprocedure))
+          AND NOT (pg_catalog.has_function_privilege(r.oid, keys, 'EXECUTE') AND pg_catalog.has_function_privilege(r.oid, texts, 'EXECUTE'))
+    LOOP
+        EXECUTE pg_catalog.format('GRANT EXECUTE ON FUNCTION %s, %s TO %I', keys, texts, owner);
+    END LOOP;
+END $$;
+
+CREATE INDEX rbac_history_deny_principals ON rbac_history
+    USING gin (rbac_tenant_keys(tenant, rbac_text_array(after -> 'principals') COLLATE "C")) WITH (fastupdate = off)
+    WHERE entity = 'deny';
+
+-- The statistics are empty until history is next analyzed, which autovacuum does of a table only
+-- once a tenth of its rows are new since the last time: on a large history, long after migrating.
+ANALYZE rbac_history;

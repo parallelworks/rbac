@@ -1010,7 +1010,9 @@ type Reach struct {
 	// otherwise reachable is checked on its own.
 	ConditionalExcept []Scope
 	// Labels is the subject's holding (Config.Labels): of what the scopes reach, it may do p only
-	// to resources whose label the holding satisfies.
+	// to resources whose label the holding satisfies. For a label value or a power to release on the
+	// tenant, which a check decides on the tenant without its label, it holds every value, so it
+	// satisfies any label whose values are declared.
 	Labels Holding
 }
 
@@ -1046,11 +1048,30 @@ func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, ten
 		return reach, err
 	}
 	// Decided outside the snapshot, as its constraints run as for any read.
-	reach.Labels, _, err = a.holdingOf(ctx, tenant, s, got.values)
-	if err != nil || reach.Labels.excludes(p) {
+	h, _, err := a.holdingOf(ctx, tenant, s, got.values)
+	if err != nil || h.excludes(p) {
 		return Reach{}, err
 	}
+	reach.Labels = a.listedBy(h, p, resourceType)
 	return reach, nil
+}
+
+// listedBy is the holding a list of resources of a type by p keeps those by whose label it
+// satisfies: h, but for a label value or a power to release on the tenant, which a check decides
+// on the tenant without its label (decidedOn), every value, which satisfies any label whose values
+// are declared, as a check refuses one whose values aren't.
+func (a *Authorizer) listedBy(h Holding, p Permission, resourceType string) Holding {
+	if resourceType != TenantScope || !a.labelPermission(p) {
+		return h
+	}
+	every := Holding{tenant: h.tenant, dims: h.dims, values: map[string]map[string]bool{}, releases: map[string]bool{}, excluded: map[string]bool{}}
+	for dim, ld := range h.dims {
+		every.values[dim] = map[string]bool{}
+		for v := range ld.rank {
+			every.values[dim][v] = true
+		}
+	}
+	return every
 }
 
 // reachable is Reachable's answer once no constraint removes p, for the built-in roles that give
@@ -1163,7 +1184,8 @@ type Columns struct {
 	// a column of another type, such as uuid, matches the tenant its text names.
 	Tenant string
 	// Path is a text[] holding the resource's Authorizer.Path, with a GIN index. Its keys are
-	// compared byte for byte, whatever its collation, which the index serves in.
+	// compared byte for byte, whatever its collation, which the index serves in. Its first element,
+	// at whatever subscript the array starts from, is the resource's own key.
 	Path string
 	// Labels is a text[] holding the resource's label as `dimension:value` values, never NULL: '{}'
 	// for none. The label's test, which keeps only the rows the subject's holding satisfies,
@@ -1250,10 +1272,14 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	overlap := "ARRAY(" + grants(arg(5)) + ")"
 	reached := fmt.Sprintf(`(%[1]s && %[2]s AND %[1]s && (%[2]s COLLATE "default"))`, cols.Path, overlap)
 	above, denied := a.reaching(resourceType), a.reaching(resourceType)
+	// A row's own key is its path's first, at the array's lower bound: an array can start from any
+	// subscript, and one stored from 0 holds its second key, a container's, at 1, which no deny or
+	// grant on a resource of the type names.
+	own := fmt.Sprintf(`(%[1]s)[array_lower(%[1]s, 1)] COLLATE "default"`, cols.Path)
 	var deniedByKey string
 	if !a.contains(resourceType) {
 		denied = slices.DeleteFunc(denied, func(t string) bool { return t == resourceType })
-		deniedByKey = fmt.Sprintf(`NOT (%s)[1] COLLATE "default" IN (%s) AND `, cols.Path, denies("ARRAY["+arg(9)+"::text]"))
+		deniedByKey = fmt.Sprintf(`NOT %s IN (%s) AND `, own, denies("ARRAY["+arg(9)+"::text]"))
 	}
 	now := a.cfg.Now()
 	// Which custom roles give p through the public and the tenant's members is read now, and the
@@ -1281,8 +1307,8 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 		reached = keyed(cols.Path, grants(arg(5)))
 	case resources > maxOverlap:
 		above = denied
-		reached = fmt.Sprintf(`((%[1]s)[1] COLLATE "default" IN (%[3]s) OR %[1]s && %[2]s AND %[1]s && (%[2]s COLLATE "default"))`,
-			cols.Path, overlap, grants("ARRAY["+arg(9)+"::text]"))
+		reached = fmt.Sprintf(`(%[4]s IN (%[3]s) OR %[1]s && %[2]s AND %[1]s && (%[2]s COLLATE "default"))`,
+			cols.Path, overlap, grants("ARRAY["+arg(9)+"::text]"), own)
 	}
 	pred := Predicate{
 		SQL: fmt.Sprintf(`(%[1]s = %[2]s AND (%[1]s)::text = %[5]s::text COLLATE "default" AND %[3]s
@@ -1303,7 +1329,7 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	if h.excludes(p) {
 		return Predicate{SQL: "FALSE"}, nil
 	}
-	labels, args := h.labelColumn(cols.Labels, arg, len(pred.Args))
+	labels, args := a.listedBy(h, p, resourceType).labelColumn(cols.Labels, arg, len(pred.Args))
 	pred.SQL = "(" + pred.SQL + " AND " + labels + ")"
 	pred.Args = append(pred.Args, args...)
 	return pred, nil
@@ -1593,15 +1619,16 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 		SELECT 3, k, '', '', '', e, false, NULL, '', NULL, false, false, NULL, '', '', false FROM ends`
 	}
 	// In the statement's text rather than an argument: a generic plan can't tell from one whether
-	// to read every role of the tenant or look up those the grants name.
-	var which string
+	// to read every role of the tenant or look up those the grants name. Those are looked up a key at
+	// a time (byKey): matched to the grants, a plan counting the tenant's roles as a few reads them
+	// all, and as of a time each one's every version, again for each version.
+	customRoles := "rbac_roles WHERE tenant = $1"
 	switch roles {
 	case namedRoles:
-		which = "id IN (SELECT role FROM held WHERE role LIKE '" + CustomPrefix + "%')"
+		customRoles = "(" + byKey("ARRAY(SELECT DISTINCT role FROM held WHERE role LIKE '"+CustomPrefix+"%')", "rbac_roles", "id", roleColumns, "tenant = $1") + ") r"
 	case tenantRoles:
-		which = "TRUE"
 	case heldTenantRoles:
-		which = "EXISTS (SELECT FROM held WHERE role LIKE '" + CustomPrefix + "%')"
+		customRoles += " AND EXISTS (SELECT FROM held WHERE role LIKE '" + CustomPrefix + "%')"
 	}
 	// Grants, denies, roles and keys in that order; grants by principal, scope, role and id, denies
 	// by id and scope, as deniesOn.
@@ -1625,8 +1652,7 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 		  AND (`+forP+` OR `+values+` AND scope = 'tenant:' || $1)`)+`) d
 		UNION ALL
 		SELECT 2, id, '', '', id, NULL, false, permissions, '', resource_types, privileged, public, grantable_roles, name, description, false
-		FROM rbac_roles
-		WHERE tenant = $1 AND `+which+ends+`
+		FROM `+customRoles+ends+`
 		UNION ALL
 		SELECT 4, k, '', '', '', NULL, false, NULL, '', NULL, false, false, NULL, '', '', false FROM keys WHERE `+keyed+`
 		ORDER BY 1, 3, 4, 5, 2`,

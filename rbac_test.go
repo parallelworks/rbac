@@ -467,6 +467,56 @@ func TestListingsKeepToDeniesOnTheResourceItself(t *testing.T) {
 	}
 }
 
+// Filter reads a row's own key as its path's first element whatever subscript the array starts
+// from: a path stored from 0 holds the same keys in the same order, and read at 1, its second key,
+// the workspace's, would stand for the cluster's, so Filter would keep a cluster a deny on it
+// leaves out and, for a subject of many grants on clusters, leave out one a grant on it reaches.
+func TestFilterReadsARowsOwnKeyWhereverItsPathStarts(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE clusters (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	var resources []rbac.Resource
+	for i := range 10 {
+		r := rbac.Resource{Tenant: "t1", Type: "cluster", ID: fmt.Sprintf("c%d", i), Ancestors: []rbac.Scope{{Type: "workspace", ID: "w1"}}}
+		if _, err := h.pool.Exec(ctx, `INSERT INTO clusters VALUES ($1, $2, ('[0:' || cardinality($3::text[]) - 1 || ']=' || $3::text[]::text)::text[])`,
+			r.Tenant, r.ID, h.path(t, r)); err != nil {
+			t.Fatal(err)
+		}
+		resources = append(resources, r)
+	}
+	// One holds the role on the workspace, the other on each cluster, past the grants Filter
+	// overlaps with each row's path; a deny on the last cluster names both.
+	broad, many := h.as(t, "broad"), h.as(t, "many")
+	grants := []rbac.Grant{grant(rbac.Scope{Type: "workspace", ID: "w1"}, "cluster.login", rbac.User, "broad")}
+	for _, r := range resources {
+		grants = append(grants, grant(r.Scope(), "cluster.login", rbac.User, "many"))
+	}
+	h.seed(t, grants...)
+	if err := h.authz.SetDeny(ctx, guardian, resources[9], rbac.Deny{ID: "d", Principals: []rbac.Principal{broad.Principal, many.Principal}, Permissions: []rbac.Permission{login}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []rbac.Subject{broad, many} {
+		pred, err := h.authz.Filter(ctx, s, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := h.pool.Query(ctx, `SELECT id FROM clusters WHERE `+pred.SQL+` ORDER BY id`, pred.Args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		kept, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			t.Fatal(err)
+		}
+		slices.Sort(kept)
+		if want := allowedOf(t, h, resources, s, login); !slices.Equal(kept, want) {
+			t.Errorf("%s: Filter keeps %v of clusters whose paths start from 0, Authorize allows %v", s.Principal.ID, kept, want)
+		}
+	}
+}
+
 // overlapping returns the conditions in the plan of query, on h's pool, that overlap an array with
 // what a subquery reading table selects (`&&`): each compares a row with every value the subquery
 // selects, rather than look the row's keys up in a hash or an object of them.
