@@ -128,6 +128,50 @@ func TestHistoryRecordsEveryWrite(t *testing.T) {
 	}
 }
 
+// Recording a row reads its key's last record: a plan its session keeps, made while history was
+// small, as a new deployment's first rows are recorded, scans history, and one made for each row
+// reads, until history is analyzed, all of the tenant's records of the entity, so a statement
+// writing many rows would read nearly all of history for each. A statement writing many rows reads
+// as much of history for each as one writing few, however a session plans its statements.
+func TestRecordingARowReadsAsMuchOfHistoryHoweverManyItsStatementWrites(t *testing.T) {
+	for _, mode := range []string{"auto", "force_generic_plan", "force_custom_plan"} {
+		t.Run(mode, func(t *testing.T) {
+			// The pages of history and its indexes read for each row a statement writes then
+			// deletes, all in one tenant, in a session of its own that has recorded only the harness's
+			// one grant until then.
+			perRow := func(n int) float64 {
+				t.Helper()
+				h := setupOn(t, pgtest.Open(t, "pool_max_conns=1&plan_cache_mode="+mode))
+				ctx := t.Context()
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				start := pagesRead(ctx, t, tx, "rbac_history")
+				for _, sql := range []string{
+					`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+					 SELECT 't1', 'cluster', 'c' || i, 'user', 'u' || i, 'cluster.admin' FROM generate_series(1, $1) i`,
+					`DELETE FROM rbac_grants WHERE $1 > 0`,
+				} {
+					if _, err := tx.Exec(ctx, sql, n); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return float64(pagesRead(ctx, t, tx, "rbac_history")-start) / float64(n)
+			}
+			few, many := perRow(500), perRow(5000)
+			// Both ways: another session making or dropping a schema, as each test does, has every
+			// session plan its statements anew, so a plan that scans history, made again partway
+			// through the larger statement by history's size then, reads less for each of its rows
+			// than the smaller statement's.
+			if many > few*3/2 || few > many*3/2 {
+				t.Errorf("writing 500 grants then deleting them read %.0f pages of history for each, and %.0f for 5,000", few, many)
+			}
+		})
+	}
+}
+
 // The change's context says whether a delete is an expiry, and nothing more about what was done.
 func TestHistoryRecordsADeleteAsOne(t *testing.T) {
 	h := setup(t)
