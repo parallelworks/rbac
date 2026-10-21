@@ -346,10 +346,11 @@ func (a *Authorizer) authorityOr(ctx context.Context, q DB, actor Subject, on Re
 }
 
 // labelAllows refuses, as a DeniedError of p, a change on a scope whose label the actor's holding
-// doesn't satisfy, decided by values, read with its authority there, or where nil read on q the
-// first time in each phase (constrained.holding), asking the constraints about its values through
-// labels, or where nil, through cs on the tenant: before the change's transaction, and again under
-// its locks, which reads their answers back.
+// doesn't satisfy, decided by values, read with its authority there, of the values the label asks
+// about, or where nil read on q the first time in each phase (constrained.holding), asking the
+// constraints about its values through labels, or where nil, through cs on the tenant: before the
+// change's transaction, and again under its locks, which reads their answers back, of the same
+// label.
 func (a *Authorizer) labelAllows(ctx context.Context, q DB, on Resource, cs, labels *constrained, p Permission, values *valuesRead) error {
 	if !on.Labels.asks() {
 		return nil
@@ -357,7 +358,7 @@ func (a *Authorizer) labelAllows(ctx context.Context, q DB, on Resource, cs, lab
 	if labels == nil {
 		labels = cs.ofTenant()
 	}
-	held, err := labels.holdingBy(ctx, q, values)
+	held, err := labels.holdingFor(ctx, q, values, on.Labels)
 	if err != nil {
 		return err
 	}
@@ -909,24 +910,70 @@ func (c *constrained) holdingAndKeys(ctx context.Context, q DB) (Holding, []stri
 	return *c.held[phase], c.keys[phase], nil
 }
 
-// holdingBy is the actor's label values decided through c by v, read with its other grants, once
-// for each read; or where v is nil, read on q (holding).
+// holdingBy is the actor's label values decided through c by v, read with its other grants, each
+// once for each read; or where v is nil, read on q (holding).
 func (c *constrained) holdingBy(ctx context.Context, q DB, v *valuesRead) (Holding, error) {
 	if v == nil {
 		return c.holding(ctx, q)
 	}
-	if h, ok := v.decided[c]; ok {
-		return h, nil
+	return c.decidedBy(ctx, q, v, nil)
+}
+
+// holdingFor is holdingBy of only the values that decide whether the actor satisfies l (askedBy),
+// but where v is nil, of every one, as read once in each phase for every label a change checks.
+func (c *constrained) holdingFor(ctx context.Context, q DB, v *valuesRead, l Label) (Holding, error) {
+	if v == nil {
+		return c.holding(ctx, q)
 	}
-	h, _, err := c.a.holdingFrom(ctx, q, c.actor, c, v)
+	return c.decidedBy(ctx, q, v, c.a.askedBy(l))
+}
+
+// decidedHolding is a holding decided by a read through a constrained, of the values in asked, or
+// of every one where all.
+type decidedHolding struct {
+	h     Holding
+	asked map[Permission]bool
+	all   bool
+}
+
+// covers reports whether d decided every value in asked, or where nil, every one.
+func (d *decidedHolding) covers(asked map[Permission]bool) bool {
+	if d.all || asked == nil {
+		return d.all
+	}
+	for p := range asked {
+		if !d.asked[p] {
+			return false
+		}
+	}
+	return true
+}
+
+// decidedBy is the actor's holding decided through c by v of the values in asked, or of every one
+// where nil, deciding each value once for each read however many labels a change checks by it.
+func (c *constrained) decidedBy(ctx context.Context, q DB, v *valuesRead, asked map[Permission]bool) (Holding, error) {
+	d := v.decided[c]
+	if d != nil && d.covers(asked) {
+		return d.h, nil
+	}
+	h, _, err := c.a.holdingFrom(ctx, q, c.actor, c, v, func(p Permission) bool {
+		return c.a.labelPermission(p) && (asked == nil || asked[p]) && (d == nil || !d.asked[p])
+	})
 	if err != nil {
 		return Holding{}, err
 	}
-	if v.decided == nil {
-		v.decided = map[*constrained]Holding{}
+	if d == nil {
+		d = &decidedHolding{h: h, asked: map[Permission]bool{}}
+		if v.decided == nil {
+			v.decided = map[*constrained]*decidedHolding{}
+		}
+		v.decided[c] = d
+	} else {
+		d.h.add(h)
 	}
-	v.decided[c] = h
-	return h, nil
+	d.all = asked == nil
+	maps.Copy(d.asked, asked)
+	return d.h, nil
 }
 
 func (c *constrained) seal() {
@@ -1581,7 +1628,7 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 		return nil, err
 	}
 	if r.Labels.asks() {
-		h, _, err := a.holdingOf(ctx, r.Tenant, s, onTenant(r.Tenant, held, ds, b))
+		h, _, err := a.holdingFor(ctx, r.Tenant, s, onTenant(r.Tenant, held, ds, b), r.Labels)
 		if err != nil || h.Unsatisfied(r.Labels) != "" {
 			return nil, err
 		}

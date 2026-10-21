@@ -318,7 +318,7 @@ flowchart TB
     grant -->|no| refused
     grant -->|yes| asks{"Labeled resource, or an<br/>exclusive value?"}
     asks -->|no| allowed(["nil"])
-    asks -->|yes| holding["The subject's label values,<br/>from what the statement read<br/>(holdingFrom, permissionsOf)"]
+    asks -->|yes| holding["The values the label asks for<br/>that the subject holds, each asked<br/>of the constraints, from what the<br/>statement read (holdingFor, permissionsOf)"]
     holding --> sat{"Holds no two exclusive values,<br/>and satisfies the label?"}
     sat -->|yes| allowed
     sat -->|no| refused
@@ -352,7 +352,9 @@ sequenceDiagram
     A->>DB: conditionsOf (only where a conditional grant is all that's left)
     A->>E: grant conditions, cheapest first, within a budget
     opt labeled resource or exclusive value
-        A->>A: the subject's values from what it read (holdingFrom)
+        A->>A: the values the label asks for, from what it read (holdingFor)
+        A->>C: Deny(ConstraintInput), once for each of them its grants give
+        C-->>A: false
         A->>A: excludes, then Unsatisfied
     end
     A-->>H: nil, or DeniedError
@@ -410,8 +412,8 @@ sequenceDiagram
     H->>A: Apply(ctx, actor, resource, change)
     A->>A: validate inputs, MaxBindings
     A->>C: changing: Deny of type:grant on the scope
-    A->>DB: the actor's label values, where the scope is labeled
     A->>DB: authorityOn: the actor's grants, denies and roles<br/>in one statement, then their conditions
+    A->>C: where the scope is labeled, Deny of each value its label<br/>asks for that the actor's grants give
     A->>C: hand-on rules: Deny of each permission it hands on
     A->>DB: stand: the standing of the principals named
     A->>V: each grant, as it will be
@@ -421,7 +423,7 @@ sequenceDiagram
     A->>DB: lock: exclusive/tenant if a dimension is Exclusive, then the tenant<br/>shared and the scope and principals exclusive, or past 64 the tenant exclusive
     A->>DB: the groups named exist, and stillStanding:<br/>memberships unchanged since the host was asked
     A->>DB: authority again, under the locks, the constraints' answers read back
-    A->>DB: the actor's label values again, where the scope is labeled
+    A->>A: the actor's label values again, where the scope is labeled, the answers read back
     A->>DB: revoke and upsert
     DB->>DB: rbac_record writes rbac_history, as the actor
     A->>DB: exclusive values: no one can now hold two

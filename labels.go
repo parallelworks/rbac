@@ -295,6 +295,17 @@ func (h Holding) changed(ps map[Permission]bool, held bool) Holding {
 	return c
 }
 
+// add makes the holding hold what o holds too, o decided by the same read, of other values.
+func (h Holding) add(o Holding) {
+	for dim, vs := range o.values {
+		if h.values[dim] == nil {
+			h.values[dim] = map[string]bool{}
+		}
+		maps.Copy(h.values[dim], vs)
+	}
+	maps.Copy(h.releases, o.releases)
+}
+
 // Holding returns the label values s holds in a tenant: those its grants give it on the tenant,
 // decided as Permissions decides them, with ctx's request for their conditions, on the tenant
 // without attributes or a label (decidedOn).
@@ -319,7 +330,44 @@ func (a *Authorizer) holding(ctx context.Context, tenant string, s Subject) (Hol
 
 // holdingOf is holding decided by v, read with s's other grants.
 func (a *Authorizer) holdingOf(ctx context.Context, tenant string, s Subject, v *valuesRead) (Holding, map[Permission]bool, error) {
-	return a.holdingFrom(ctx, a.db, s, a.constrain(ctx, s, tenantResource(tenant)), v)
+	return a.holdingFrom(ctx, a.db, s, a.constrain(ctx, s, tenantResource(tenant)), v, a.labelPermission)
+}
+
+// holdingFor is holdingOf of only the values that decide whether s satisfies l (askedBy), for a
+// decision about one resource, so the constraints and the conditions aren't asked about the rest.
+func (a *Authorizer) holdingFor(ctx context.Context, tenant string, s Subject, v *valuesRead, l Label) (Holding, map[Permission]bool, error) {
+	asked := a.askedBy(l)
+	return a.holdingFrom(ctx, a.db, s, a.constrain(ctx, s, tenantResource(tenant)), v, func(p Permission) bool { return asked[p] })
+}
+
+// askedBy is the label values whose holding decides whether a holding satisfies l: in each
+// dimension it has values in, for an Ordered one those as high as its highest, and otherwise its
+// own. One that names a dimension or a value not declared asks none there, as no holding satisfies
+// it; nor is any needed to exclude a value, as excludedBy decides that from the grants alone.
+func (a *Authorizer) askedBy(l Label) map[Permission]bool {
+	asked := map[Permission]bool{}
+	for dim, want := range l {
+		ld, ok := a.labels[dim]
+		if !ok || len(want) == 0 || !ld.declares(want) {
+			continue
+		}
+		if ld.rule != Ordered {
+			for _, v := range want {
+				asked[Permission(dim+":"+v)] = true
+			}
+			continue
+		}
+		top := 0
+		for _, v := range want {
+			top = max(top, ld.rank[v])
+		}
+		for v, rank := range ld.rank {
+			if rank >= top {
+				asked[Permission(dim+":"+v)] = true
+			}
+		}
+	}
+	return asked
 }
 
 // tenantResource is the tenant as a resource with no attributes, ancestors or label.
@@ -356,7 +404,7 @@ func (a *Authorizer) holdingOn(ctx context.Context, q DB, s Subject, cs *constra
 // moment.
 func (a *Authorizer) holdingRead(ctx context.Context, q DB, s Subject, cs *constrained, keys bool) (Holding, map[Permission]bool, []string, error) {
 	if len(a.labels) == 0 {
-		h, byCondition, err := a.holdingFrom(ctx, q, s, cs, nil)
+		h, byCondition, err := a.holdingFrom(ctx, q, s, cs, nil, a.labelPermission)
 		return h, byCondition, nil, err
 	}
 	tenant := cs.on.Tenant
@@ -365,7 +413,7 @@ func (a *Authorizer) holdingRead(ctx context.Context, q DB, s Subject, cs *const
 		return Holding{}, nil, nil, err
 	}
 	readingRoles()
-	h, byCondition, err := a.holdingFrom(ctx, q, s, cs, &valuesRead{held: got.held, ds: got.ds, roles: got.roles})
+	h, byCondition, err := a.holdingFrom(ctx, q, s, cs, &valuesRead{held: got.held, ds: got.ds, roles: got.roles}, a.labelPermission)
 	return h, byCondition, got.keys, err
 }
 
@@ -386,15 +434,17 @@ func (a *Authorizer) valuesOn(ctx context.Context, q DB, tenant string, s Subjec
 }
 
 // holdingFrom is holdingOn deciding by v, read with s's other grants, reading on q the conditions
-// not read with it.
-func (a *Authorizer) holdingFrom(ctx context.Context, q DB, s Subject, cs *constrained, v *valuesRead) (Holding, map[Permission]bool, error) {
+// not read with it, of the values and powers to release only keeps, which keeps no other
+// permission.
+func (a *Authorizer) holdingFrom(ctx context.Context, q DB, s Subject, cs *constrained, v *valuesRead, only func(Permission) bool) (Holding, map[Permission]bool, error) {
 	h := Holding{tenant: cs.on.Tenant, dims: a.labels, values: map[string]map[string]bool{}, releases: map[string]bool{}, excluded: map[string]bool{}}
 	if len(a.labels) == 0 {
 		return h, nil, nil
 	}
-	// Only the values and the powers to release, so neither the constraints nor the conditions of
-	// the tenant's other permissions are asked about.
-	perms, byCondition, excluded, err := a.permissionsOf(ctx, q, s, cs.on, a.labelPermission, cs, v.held, v.ds, v.roles)
+	// Only those values and powers to release, so neither the constraints nor the conditions of
+	// the tenant's other permissions are asked about. Each is decided apart, on a budget of its own,
+	// so one is decided the same whichever others are.
+	perms, byCondition, excluded, err := a.permissionsOf(ctx, q, s, cs.on, only, cs, v.held, v.ds, v.roles)
 	if err != nil {
 		return Holding{}, nil, err
 	}

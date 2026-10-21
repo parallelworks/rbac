@@ -668,7 +668,16 @@ type Config struct {
 	// a guest, refuses the group's grant too while the group holds one that may not.
 	// Required: a grant to a principal the tenant doesn't let in must never be stored.
 	ValidateGrant func(ctx context.Context, q DB, in GrantInput) error
-	Constraints   []Constraint
+	// Constraints are the host's policy above every grant and deny, asked about each permission a
+	// call decides. A check asks about its permission, and for a labeled resource once about each
+	// value its label asks for that the subject's grants give: in an Ordered dimension those as
+	// high as the label's, and in another those it names, so a hook failing on another value fails
+	// no check of it. Explain, Permissions, Grantable, Holders for each identity it lists, and a
+	// change on a labeled scope ask the same. Holding, Filter and Reachable, which test any label,
+	// ask about every value and power to release the subject's grants give, as do SetRole and
+	// DeleteRole of a role granted somewhere, ChangeMembers where only a removal reaches a scope,
+	// and Activate about an approver on a labeled scope.
+	Constraints []Constraint
 	// ResourceOf returns the resource a scope is, with its ancestors, attributes and label, as the
 	// host passes it to a check. SetGroup and DeleteGroup check ManageGroups on the tenant, and,
 	// where Labels are declared, the group's label, a group SetGroup creates included, and
