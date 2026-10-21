@@ -1179,8 +1179,7 @@ func (k *keying) charge(vars interpreter.Activation, planned interpreter.Interpr
 }
 
 // keyedAttribute is a key CEL plans as an attribute: an index qualifies a map by it, and a map
-// literal evaluates it, each as CEL does, once charged. CEL qualifies an optional index by it
-// otherwise, which no condition can write.
+// literal evaluates it, each as CEL does, once charged.
 type keyedAttribute struct {
 	interpreter.InterpretableAttribute
 	k *keying
@@ -1205,17 +1204,32 @@ func (a *keyedAttribute) Eval(vars interpreter.Activation) ref.Val {
 
 // Qualify qualifies obj by the key, as CEL qualifies a map by an attribute.
 func (a *keyedAttribute) Qualify(vars interpreter.Activation, obj any) (any, error) {
+	q, err := a.qualifier(vars)
+	if err != nil {
+		return nil, err
+	}
+	return q.Qualify(vars, obj)
+}
+
+// QualifyIfPresent is Qualify where obj may lack the key, as CEL qualifies an optional value, which
+// a host can pass.
+func (a *keyedAttribute) QualifyIfPresent(vars interpreter.Activation, obj any, presenceOnly bool) (any, bool, error) {
+	q, err := a.qualifier(vars)
+	if err != nil {
+		return nil, false, err
+	}
+	return q.QualifyIfPresent(vars, obj, presenceOnly)
+}
+
+// qualifier is the key, charged, as CEL qualifies a map by an attribute.
+func (a *keyedAttribute) qualifier(vars interpreter.Activation) (interpreter.Qualifier, error) {
 	attr := a.Attr()
 	v, err := attr.Resolve(vars)
 	if err != nil {
 		return nil, err
 	}
 	a.k.charge(vars, a, v)
-	q, err := a.k.fac.NewQualifier(nil, attr.ID(), v, attr.IsOptional())
-	if err != nil {
-		return nil, err
-	}
-	return q.Qualify(vars, obj)
+	return a.k.fac.NewQualifier(nil, attr.ID(), v, attr.IsOptional())
 }
 
 // keyedCall is a key CEL plans as a call, charged once it has run.

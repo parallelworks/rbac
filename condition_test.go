@@ -999,6 +999,15 @@ func TestAKeyCostsItsLength(t *testing.T) {
 			t.Errorf("%s with a key of %d bytes as a %T cost %d, and with an empty one %d", expr, len(long), s, cost, short)
 		}
 	}
+	// And an optional value the host passes, whose keys CEL finds only if they are present.
+	expr := `dyn(request.attributes.o)[request.attributes.s] == 1`
+	optional := func(key string) map[string]any {
+		return map[string]any{"s": key, "o": types.OptionalOf(types.DefaultTypeAdapter.NativeToValue(map[string]any{key: 1}))}
+	}
+	_, short := rbac.ConditionCost(t, expr, optional(""))
+	if _, cost := rbac.ConditionCost(t, expr, optional(long)); cost-short != uint64(len(long))/10 {
+		t.Errorf("%s with a key of %d bytes in an optional cost %d, and with an empty one %d", expr, len(long), cost, short)
+	}
 }
 
 // finds counts the keys a map is asked for.
