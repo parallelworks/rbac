@@ -961,6 +961,25 @@ func TestALoopOverAMapCostsEachOfItsKeys(t *testing.T) {
 	}
 }
 
+// Loading a time zone copies its name for each place it looks for it, which zoneCost doesn't count
+// however long the name is, so a condition reading a time in a zone the request names, in a loop,
+// took time growing with its length, charged as a short one. A zone is at most 64 bytes, longer
+// than any zone's name: reading a time in a longer one fails before it loads it.
+func TestATimeInAZoneLongerThanAnyFailsBeforeLoadingIt(t *testing.T) {
+	expr := `request.time.getHours(request.attributes.zone) >= 0`
+	for zone, evaluated := range map[string]bool{
+		"America/New_York": true, "+05:00": true, strings.Repeat("A", 64): false, strings.Repeat("A", 1<<20): false,
+	} {
+		_, ok, allocated, err := rbac.EvaluateCondition(t, expr, map[string]any{"zone": zone})
+		if err != nil || ok != evaluated {
+			t.Errorf("a zone of %d bytes: evaluated %t, %v", len(zone), ok, err)
+		}
+		if allocated > 1<<20 {
+			t.Errorf("a zone of %d bytes allocated %d", len(zone), allocated)
+		}
+	}
+}
+
 // A loop taking more steps than its condition may cost fails, however little CEL charges them: a
 // grant's condition gives nothing, and a deny's applies.
 func TestALoopOfMoreStepsThanItsConditionMayCostFails(t *testing.T) {
@@ -1101,6 +1120,7 @@ func TestStoredConditionsKeepTheirBounds(t *testing.T) {
 		{`["10.0.0.1", "10.0.0.2"].filter(ip, ip.startsWith("10.")).exists(ip, request.attributes.ip == ip)`, 100},
 		{`[["10.0.0.1"], ["10.0.0.2"]].exists(g, request.attributes.ip in g) && "time" in request`, 70},
 		{`{"dev": 1, "prod": 2}[resource.attributes.env] <= request.attributes.n`, 50},
+		{`request.time.getHours(subject.attributes.zone) >= 9`, 112},
 		{`[{"level": 2}, {"level": 3}].exists(r, r.level == request.attributes.n)`, 112},
 		// The ids, kinds, types and tenant a check passes are of at most MaxID bytes, and its action a
 		// permission's.

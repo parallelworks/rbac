@@ -42,7 +42,8 @@ import (
 // Condition is none, and one with a title or description has an expression. A pattern it matches is
 // a string literal, of bounded size; it nests at most 32 deep; it builds no message, as
 // `google.protobuf.Struct{}`; and a comparison, or a search of a list, that would read more than a
-// condition may spend fails before it runs.
+// condition may spend, or reading a time in a zone whose name is longer than 64 bytes, fails before
+// it runs.
 //
 // Each condition runs within the most evaluating it can cost, which its literals and types bound:
 // little for one comparing what a request passes with literals, or with the subject's kind or id,
@@ -96,8 +97,11 @@ const (
 	// hold gigabytes. maxLimits bounds the limits kept so.
 	maxCached = 256 << 10
 	maxLimits = 2 << 20
-	// zoneCost is what reading a time in a named zone costs: it loads the zone each time.
+	// zoneCost is what reading a time in a named zone costs: it loads the zone each time, copying
+	// its name for each place it looks, so a zone is at most maxZone bytes, more than the longest
+	// name a time zone has.
 	zoneCost = 100
+	maxZone  = 64
 	// maxCheckCost is what the conditions a check reads cost together where they are bounded: an
 	// identity's grants on a scope, a scope's grants that reach many, each the tenant's and from
 	// each source the host owns, its denies, and the requirements of groups' eligibilities for a
@@ -857,7 +861,8 @@ func comparing(function string, x, y ref.Val) uint64 {
 // bounded refuses, before running it, a comparison or a search in a list that would read more than
 // a condition may: one call reads it all, and a call's cost is counted only once it has run, so a
 // list a condition doubles cheaply would otherwise hold a check for as long as walking it takes.
-// It refuses a comparison of a double that isn't finite too (nonFinite).
+// It refuses a comparison of a double that isn't finite too (nonFinite), and a time read in a zone
+// of more than maxZone bytes (inZone).
 func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 	call, ok := i.(interpreter.InterpretableCall)
 	if !ok {
@@ -865,6 +870,13 @@ func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 	}
 	var op func(x, y ref.Val) ref.Val
 	switch call.Function() {
+	case overloads.TimeGetFullYear, overloads.TimeGetMonth, overloads.TimeGetDayOfYear, overloads.TimeGetDate,
+		overloads.TimeGetDayOfMonth, overloads.TimeGetDayOfWeek, overloads.TimeGetHours, overloads.TimeGetMinutes,
+		overloads.TimeGetSeconds, overloads.TimeGetMilliseconds:
+		if len(call.Args()) != 2 {
+			return i, nil
+		}
+		return inZone(call), nil
 	case operators.Equals:
 		op = equal
 	case operators.NotEquals:
@@ -903,6 +915,26 @@ func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 		}
 		return op(args[0], args[1])
 	}), nil
+}
+
+// inZone is call, reading a part of a time in a zone, failing before it runs for a zone of more
+// than maxZone bytes: loading one copies its name for each place it looks, which zoneCost doesn't
+// count however long it is. It reads the time as CEL does.
+func inZone(call interpreter.InterpretableCall) interpreter.InterpretableCall {
+	function, overload := call.Function(), call.OverloadID()
+	return interpreter.NewCall(call.ID(), function, overload, call.Args(), func(args ...ref.Val) ref.Val {
+		if len(args) != 2 {
+			return types.NoSuchOverloadErr()
+		}
+		if zone, ok := args[1].(types.String); ok && len(zone) > maxZone {
+			return types.NewErr("rbac: a time zone is at most %d bytes", maxZone)
+		}
+		t, ok := args[0].(types.Timestamp)
+		if !ok {
+			return types.MaybeNoSuchOverloadErr(args[0])
+		}
+		return t.Receive(function, overload, args[1:])
+	})
 }
 
 // looping is what costs charges a loop's literal condition as: nothing, as CEL charges a literal.
