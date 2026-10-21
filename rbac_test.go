@@ -7541,20 +7541,25 @@ func changingRoles(ctx context.Context, admin rbac.Subject) map[string]func(a *r
 	}
 }
 
-// pagesChanging is how many pages of table change reads, in a transaction it rolls back.
-func pagesChanging(t *testing.T, h *harness, table string, change func(a *rbac.Authorizer) error) int64 {
+// pagesChanging is how many pages of each of tables change reads, in a transaction it rolls back.
+func pagesChanging(ctx context.Context, t *testing.T, h *harness, change func(a *rbac.Authorizer) error, tables ...string) map[string]int64 {
 	t.Helper()
-	ctx := t.Context()
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	start := pagesRead(ctx, t, tx, table)
+	pages := map[string]int64{}
+	for _, table := range tables {
+		pages[table] -= pagesRead(ctx, t, tx, table)
+	}
 	if err := change(h.authz.WithTx(tx)); err != nil {
 		t.Fatal(err)
 	}
-	return pagesRead(ctx, t, tx, table) - start
+	for _, table := range tables {
+		pages[table] += pagesRead(ctx, t, tx, table)
+	}
+	return pages
 }
 
 // SetRole and DeleteRole read, of the grants, those of the role they change under a generic plan
@@ -7579,11 +7584,11 @@ func TestChangingARoleUnderAGenericPlanReadsOnlyItsGrants(t *testing.T) {
 	others(500)
 	few := map[string]int64{}
 	for what, change := range changes {
-		few[what] = pagesChanging(t, h, "rbac_grants", change)
+		few[what] = pagesChanging(ctx, t, h, change, "rbac_grants")["rbac_grants"]
 	}
 	others(4500)
 	for what, change := range changes {
-		if many := pagesChanging(t, h, "rbac_grants", change); many > few[what]*3/2+deeper {
+		if many := pagesChanging(ctx, t, h, change, "rbac_grants")["rbac_grants"]; many > few[what]*3/2+deeper {
 			t.Errorf("%s a role read %d pages of grants beside 500 grants of another custom role, and %d beside 5000", what, few[what], many)
 		}
 	}

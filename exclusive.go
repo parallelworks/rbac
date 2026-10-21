@@ -298,23 +298,30 @@ func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives m
 		limited = fmt.Sprintf(" LIMIT %d", limit)
 	}
 	// The holders of roles are read only where holdersOf names some: in the statement's text, which
-	// then plans no read of them. A generic plan can't tell from an empty array to read none, and no
-	// index leads to a role, so it would read every grant and eligibility in the tenant each change.
-	holders := "FALSE"
-	if len(holdersOf) > 0 {
+	// then plans no read of them. A generic plan can't tell from an empty array to read none. Of
+	// custom roles alone, as a redefinition names, they are read a role at a time, through the index
+	// leading to custom roles; no index leads to a built-in one, so with one among them, as where every
+	// conflict is listed, every grant and eligibility in the tenant is read.
+	holders, custom := "FALSE", "FALSE"
+	switch {
+	case slices.ContainsFunc(holdersOf, func(r string) bool { return !isCustom(Role(r)) }):
 		holders = "TRUE"
+	case len(holdersOf) > 0:
+		custom = "TRUE"
 	}
 	// The planner can't tell which of targets' branches the seeds reach, so it costs a change's
 	// check as if it read every identity in the tenant, past JIT's thresholds where they are in
 	// groups: compiling then takes a second for a plan that runs in milliseconds.
 	return withoutJIT(ctx, q, func() ([]Conflict, error) {
-		return a.conflictsIn(ctx, q, tenant, seeds, holdersOf, roles, values, holders, limited)
+		return a.conflictsIn(ctx, q, tenant, seeds, holdersOf, roles, values, holders, custom, limited)
 	})
 }
 
 // conflictsIn is conflicts' statement: of the roles giving values, the holders of holdersOf read
-// where holders is TRUE, and limited its LIMIT clause.
-func (a *Authorizer) conflictsIn(ctx context.Context, q DB, tenant string, seeds, holdersOf, roles, values []string, holders, limited string) ([]Conflict, error) {
+// across the tenant where holders is TRUE, or a role at a time where custom is, and limited its
+// LIMIT clause.
+func (a *Authorizer) conflictsIn(ctx context.Context, q DB, tenant string, seeds, holdersOf, roles, values []string, holders, custom, limited string,
+) ([]Conflict, error) {
 	// Each key's values are looked up by key, so a change reads what the identities it reaches
 	// hold, not every value held in the tenant, and stops at the first conflict it finds.
 	rows, err := q.Query(ctx, `
@@ -322,6 +329,8 @@ func (a *Authorizer) conflictsIn(ctx context.Context, q DB, tenant string, seeds
 		  SELECT unnest($2::text[]) COLLATE "C"
 		  UNION SELECT principal FROM rbac_grants WHERE `+holders+` AND tenant = $1 AND role = ANY($3::text[])
 		  UNION SELECT principal FROM rbac_eligibilities WHERE `+holders+` AND tenant = $1 AND role = ANY($3::text[])
+		  UNION SELECT principal FROM (`+customRoleRows("$3", "rbac_grants", "principal", custom)+`) g
+		  UNION SELECT principal FROM (`+customRoleRows("$3", "rbac_eligibilities", "principal", custom)+`) e
 		), `+insideSQL(`ARRAY(SELECT substr(k, 7) FROM seeds WHERE k LIKE 'group:%')`, "$4", "NULL", false)+`,
 		targets(identity) AS (
 		  SELECT k FROM seeds WHERE k NOT LIKE 'group:%' AND k NOT LIKE 'members:%' AND k <> 'public:'

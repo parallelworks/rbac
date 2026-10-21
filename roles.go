@@ -713,7 +713,7 @@ func (a *Authorizer) revalidations(ctx context.Context, q DB, tenant string, wid
 	for id := range widened {
 		ids = append(ids, string(id))
 	}
-	rows, err := q.Query(ctx, `SELECT `+grantColumns+` FROM (`+customRoleRows("rbac_grants", "*")+`) g ORDER BY id`, tenant, ids, a.cfg.Now())
+	rows, err := q.Query(ctx, `SELECT `+grantColumns+` FROM (`+customRoleRows("$2", "rbac_grants", "*", inForce)+`) g ORDER BY id`, tenant, ids, a.cfg.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -721,7 +721,7 @@ func (a *Authorizer) revalidations(ctx context.Context, q DB, tenant string, wid
 	if err != nil {
 		return nil, err
 	}
-	rows, err = q.Query(ctx, `SELECT `+eligibilityColumns+` FROM (`+customRoleRows("rbac_eligibilities", "*")+`) e
+	rows, err = q.Query(ctx, `SELECT `+eligibilityColumns+` FROM (`+customRoleRows("$2", "rbac_eligibilities", "*", inForce)+`) e
 		ORDER BY scope, principal, role`, tenant, ids, a.cfg.Now())
 	if err != nil {
 		return nil, err
@@ -1258,13 +1258,16 @@ func (a *Authorizer) stillLabeled(ctx context.Context, tx pgx.Tx, checked labeli
 	return a.labelsHeld(ctx, tx, checked)
 }
 
-// customRoleRows is SQL selecting cols of the rows in force at $3 of table, rbac_grants or
-// rbac_eligibilities, in the tenant $1 of the custom roles in the array $2, a role at a time
+// customRoleRows is SQL selecting cols of the rows of table, rbac_grants or rbac_eligibilities, in
+// the tenant $1 of the custom roles in the array ids for which where holds, a role at a time
 // (byKey), each through the partial index on custom roles' rows, which the LIKE matches. A generic
-// plan reads role = ANY($2) by the key index, skipping over the tenant's every principal and scope.
-func customRoleRows(table, cols string) string {
-	return byKey("$2", table, "role", cols, "tenant = $1 AND role LIKE 'custom.%' AND (expires_at IS NULL OR expires_at > $3)")
+// plan reads role = ANY(ids) by the key index, skipping over the tenant's every principal and scope.
+func customRoleRows(ids, table, cols, where string) string {
+	return byKey(ids, table, "role", cols, "tenant = $1 AND role LIKE 'custom.%' AND "+where)
 }
+
+// inForce is SQL for whether a grant or eligibility is in force at $3.
+const inForce = "(expires_at IS NULL OR expires_at > $3)"
 
 // roleScope is a scope a custom role's grants or eligibilities are on.
 type roleScope struct {
@@ -1280,9 +1283,9 @@ func (a *Authorizer) rolesScopes(ctx context.Context, q DB, tenant string, ids [
 		names[i] = string(id)
 	}
 	// Those ended give nothing, so changing what they give changes no access.
-	rows, err := q.Query(ctx, customRoleRows("rbac_grants", "role, scope_type, scope_id")+`
+	rows, err := q.Query(ctx, customRoleRows("$2", "rbac_grants", "role, scope_type, scope_id", inForce)+`
 		UNION
-		`+customRoleRows("rbac_eligibilities", "role, scope_type, scope_id")+`
+		`+customRoleRows("$2", "rbac_eligibilities", "role, scope_type, scope_id", inForce)+`
 		ORDER BY 2, 3, 1`, tenant, names, a.cfg.Now())
 	if err != nil {
 		return nil, err

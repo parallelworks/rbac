@@ -698,6 +698,47 @@ func TestExclusiveValuesUnderAGenericPlanReadOnlyWhomAChangeReaches(t *testing.T
 	}
 }
 
+// Redefining a custom role that gives an exclusive value checks its holders, and reads, of the
+// grants and eligibilities, only theirs under a generic plan too: role = ANY(ids) there reads every
+// one in the tenant.
+func TestRedefiningARoleGivingAnExclusiveValueUnderAGenericPlanReadsOnlyItsHolders(t *testing.T) {
+	h := generic(t, banks)
+	ctx := t.Context()
+	tenant := rbac.TenantRoot("t1")
+	h.seed(t, grant(tenant, "tenant.roles", rbac.User, "boss"), grant(tenant, "bank.a", rbac.User, "boss"))
+	boss := h.as(t, "boss")
+	h.as(t, "u")
+	r := rbac.RoleDefinition{ID: "custom.bank", Permissions: []rbac.Permission{"bank:a"}, ResourceTypes: []string{rbac.TenantScope}}
+	if err := h.authz.SetRole(ctx, boss, "t1", r); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(tenant, r.ID, rbac.User, "u"))
+	tables := []string{"rbac_grants", "rbac_eligibilities"}
+	// The pages of each that renaming the role reads.
+	read := func(name string) map[string]int64 {
+		t.Helper()
+		renamed := r
+		renamed.Name = name
+		return pagesChanging(ctx, t, h, func(a *rbac.Authorizer) error { return a.SetRole(ctx, boss, "t1", renamed) }, tables...)
+	}
+	// Others hold a role on a cluster each, and are eligible for it.
+	others := func(n int) {
+		t.Helper()
+		manyMembers(t, h, n, `, eligibilities AS (INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+			  SELECT 't1', 'cluster', id, 'user', id, 'cluster.login', 60 FROM others)
+			INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', id, 'user', id, 'cluster.login' FROM others`, tables...)
+	}
+	others(500)
+	few := read("renamed")
+	others(4500)
+	for what, many := range read("renamed again") {
+		if many > few[what]*3/2+deeper {
+			t.Errorf("renaming a role giving an exclusive value read %d pages of %s, and %d once 4500 more held another role", few[what], what, many)
+		}
+	}
+}
+
 // The check of a change's exclusive values runs without JIT, but leaves the host's transaction
 // its own setting.
 func TestAChangeLeavesTheHostItsJITSetting(t *testing.T) {
