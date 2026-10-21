@@ -36,10 +36,10 @@ import (
 // A grant with one gives its role only where the expression is true. An expression that fails, as
 // one reading an attribute the host didn't pass does, or comparing a double that isn't finite, as
 // dividing by zero makes, converting one to a string, keying a map by one or comparing a map keyed
-// by one, is false, though a key not found `in` a map the host passes keyed by one is not found
-// (Attributes). A label value and a power to release are decided on the tenant with no attributes,
-// whatever a check passes (Holding), and their conditions can't read the tenant's: any read of
-// resource.attributes fails, a test of an attribute's presence, in, size(), a macro and a
+// by one, is false, though `in` a map the host passes keyed by one is false for a key it doesn't
+// hold (Attributes). A label value and a power to release are decided on the tenant with no
+// attributes, whatever a check passes (Holding), and their conditions can't read the tenant's: any
+// read of resource.attributes fails, a test of an attribute's presence, in, size(), a macro and a
 // comparison included, so a grant's gives nothing and a deny's applies. The zero Condition is none,
 // and one with a title or description has an expression. A pattern it matches is a string literal,
 // of bounded size; it nests at most 32 deep; it builds no message, as `google.protobuf.Struct{}`;
