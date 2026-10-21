@@ -789,6 +789,77 @@ func TestALoopsStepsTakeNoLongerForTheStepsBefore(t *testing.T) {
 	}
 }
 
+// CEL charges a loop's step only what it evaluates, which can be nothing, as for a step reading
+// only literals, or what it loops over only in the branch it takes, so a loop over a list the host
+// passes cost nothing for each element, however long. Each step costs at least 1, and a loop
+// taking more steps than its condition may cost stops as one costing more does. A loop whose steps
+// are charged costs as it did.
+func TestALoopsStepsCostAtLeastOneEach(t *testing.T) {
+	falses := func(n int) map[string]any { return map[string]any{"l": make([]any, n)} }
+	for _, expr := range []string{
+		`request.attributes.l.filter(z, false).size() == 0`,
+		`!request.attributes.l.exists_one(z, false)`,
+		`request.attributes.l.map(z, false, z).size() == 0`,
+		`request.attributes.l.exists_one(z, false ? true : z) || true`,
+		`[1, 2].all(x, request.attributes.l.filter(z, false).size() == 0)`,
+	} {
+		for _, n := range []int{3000, 20000} {
+			limit, cost := rbac.ConditionCost(t, expr, falses(n))
+			if cost < min(uint64(n), limit) {
+				t.Errorf("%s over %d elements cost %d", expr, n, cost)
+			}
+		}
+	}
+	l := make([]any, 1000)
+	for i := range l {
+		l[i] = i%2 == 0
+	}
+	for _, c := range []struct {
+		expr string
+		cost uint64
+	}{
+		{`request.attributes.l.all(z, z || !z)`, 5004},
+		{`request.attributes.l.exists(z, z && !z)`, 6004},
+		{`request.attributes.l.exists_one(z, z) || true`, 3006},
+		{`request.attributes.l.filter(z, z).size() == 500`, 8518},
+	} {
+		if _, cost := rbac.ConditionCost(t, c.expr, map[string]any{"l": l}); cost != c.cost {
+			t.Errorf("%s cost %d, not %d", c.expr, cost, c.cost)
+		}
+	}
+}
+
+// A loop taking more steps than its condition may cost fails, however little CEL charges them: a
+// grant's condition gives nothing, and a deny's applies.
+func TestALoopOfMoreStepsThanItsConditionMayCostFails(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
+	})
+	ctx := t.Context()
+	free := `resource.attributes.l.filter(z, false).size() == 0`
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	g.Condition = rbac.Condition{Expression: free}
+	h.seed(t, g, grant(cluster.Scope(), "cluster.login", rbac.User, "v"), grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+	u, v := h.as(t, "u"), h.as(t, "v")
+	d := rbac.Deny{
+		ID: "loop", Principals: []rbac.Principal{v.Principal}, Permissions: []rbac.Permission{login},
+		Condition: rbac.Condition{Expression: "!(" + free + ")"},
+	}
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, d); err != nil {
+		t.Fatal(err)
+	}
+	for n, within := range map[int]bool{3000: true, 20000: false} {
+		r := cluster
+		r.Attributes = map[string]any{"l": make([]any, n)}
+		if allowed(t, h, u, login, r) != within {
+			t.Errorf("a grant's condition looping over %d elements held: %t", n, !within)
+		}
+		if allowed(t, h, v, login, r) != within {
+			t.Errorf("a deny's condition looping over %d elements applied: %t", n, within)
+		}
+	}
+}
+
 // A check passes ids, a kind, a type and a tenant of at most MaxID bytes, and a permission as the
 // action, so a condition comparing an attribute with one, as an owner's does, or finding one in a
 // map, costs little, and no more than its bound however long they are. A comprehension's variable
