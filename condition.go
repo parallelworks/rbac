@@ -68,11 +68,11 @@ import (
 // changes what the others decide, but one adding none isn't: conditions
 // stored past a bound before there were bounds can be rewritten in place, as by a restore over the
 // rows still stored, though restored where those are gone, they are added, and refused. An upgrade
-// of CEL can leave conditions stored past a bound in the same way: each process bounds a condition
-// by what the CEL it is built with makes of it, its macros and types, and another version may bound
-// one stored more. A check may not reach all of those, or of those of a role a catalog change
-// widened since: it evaluates the cheapest first, and past its budget a grant's condition is false
-// and a deny's applies.
+// of CEL, or of this package where it bounds a shape more, can leave conditions stored past a bound
+// in the same way: each process bounds a condition by what it and the CEL it is built with make of
+// it, its macros and types, and another version may bound one stored more. A check may not reach
+// all of those, or of those of a role a catalog change widened since: it evaluates the cheapest
+// first, and past its budget a grant's condition is false and a deny's applies.
 //
 // Searches (Filter, Reachable, Holders) can't evaluate one: Filter and Reachable count only
 // unconditional grants, Filter counts a conditional deny as denying, and Reach.Conditional and
