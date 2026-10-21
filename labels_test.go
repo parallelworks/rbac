@@ -26,17 +26,20 @@ var labelDimensions = []rbac.LabelDimension{
 // labeled is setup with the label dimensions, and a role for the tenant giving each value.
 func labeled(t *testing.T, mutate ...func(*rbac.Config)) *harness {
 	t.Helper()
-	return setup(t, append([]func(*rbac.Config){func(c *rbac.Config) {
-		c.Labels = labelDimensions
-		c.Catalog = slices.Clone(c.Catalog)
-		for _, d := range labelDimensions {
-			for _, v := range d.Values {
-				c.Catalog = append(c.Catalog, rbac.RoleDefinition{
-					ID: rbac.Role(d.Name + "." + v), Permissions: []rbac.Permission{rbac.Permission(d.Name + ":" + v)}, ResourceTypes: []string{rbac.TenantScope},
-				})
-			}
+	return setup(t, append([]func(*rbac.Config){withLabels}, mutate...)...)
+}
+
+// withLabels declares the label dimensions, and a role for the tenant giving each value.
+func withLabels(c *rbac.Config) {
+	c.Labels = labelDimensions
+	c.Catalog = slices.Clone(c.Catalog)
+	for _, d := range labelDimensions {
+		for _, v := range d.Values {
+			c.Catalog = append(c.Catalog, rbac.RoleDefinition{
+				ID: rbac.Role(d.Name + "." + v), Permissions: []rbac.Permission{rbac.Permission(d.Name + ":" + v)}, ResourceTypes: []string{rbac.TenantScope},
+			})
 		}
-	}}, mutate...)...)
+	}
 }
 
 // hold grants id roles giving label values on the tenant.

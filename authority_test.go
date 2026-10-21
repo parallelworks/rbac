@@ -1760,6 +1760,141 @@ func TestADenyNamingAGroupSetWhileAJoinIsCheckedIsTriedAgain(t *testing.T) {
 	}
 }
 
+// An activation rests on its holder's place in the group of the eligibility it was made through,
+// or in one in it, and outlasts the eligibility's deletion: a change to members ending it on a
+// labeled scope, by removing the holder, ending its place sooner, or taking a group it is in out of
+// another, is checked by the scope's label, as a revoke of it there is. Another member leaving the
+// group takes nothing away there, and isn't.
+func TestLeavingAGroupNeedsTheLabelOfWhereActivationsMadeThroughItAre(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	for what, c := range map[string]struct {
+		// places are u's, and through is the group whose eligibility on the cluster u activates by.
+		places  []rbac.Member
+		through string
+		leaving rbac.Member
+		sooner  bool
+	}{
+		"removing its holder": {
+			places: []rbac.Member{{Group: "crew", Principal: identity("u")}}, through: "crew",
+			leaving: rbac.Member{Group: "crew", Principal: identity("u")},
+		},
+		"ending its holder's place sooner": {
+			places: []rbac.Member{{Group: "crew", Principal: identity("u")}}, through: "crew",
+			leaving: rbac.Member{Group: "crew", Principal: identity("u")}, sooner: true,
+		},
+		"removing a group its holder is in": {
+			places: []rbac.Member{{Group: "inner", Principal: identity("u")}, {Group: "crew", Principal: groupOf("inner")}}, through: "crew",
+			leaving: rbac.Member{Group: "crew", Principal: groupOf("inner")},
+		},
+		"removing its holder's group from one above": {
+			places: []rbac.Member{{Group: "crew", Principal: identity("u")}, {Group: "outer", Principal: groupOf("crew")}}, through: "outer",
+			leaving: rbac.Member{Group: "outer", Principal: groupOf("crew")},
+		},
+	} {
+		t.Run(what, func(t *testing.T) {
+			h := labeled(t, func(c *rbac.Config) {
+				c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
+				resourceOf := c.ResourceOf
+				c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+					if s == secret.Scope() {
+						return secret, nil
+					}
+					return resourceOf(ctx, tenant, s)
+				}
+			})
+			ctx := t.Context()
+			h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"))
+			h.hold(t, "owner", "level:high")
+			h.hold(t, "u", "level:high")
+			h.groups(t, "crew", "inner", "outer")
+			h.join(t, "u", "v")
+			if err := h.authz.ImportMembers(ctx, host, "t1", append(c.places, rbac.Member{Group: "crew", Principal: identity("v")})); err != nil {
+				t.Fatal(err)
+			}
+			owner := h.as(t, "owner")
+			if err := h.authz.SetEligibility(ctx, owner, secret, rbac.Eligibility{Role: "cluster.sudo", Principal: groupOf(c.through), MaxDuration: 8 * time.Hour}); err != nil {
+				t.Fatal(err)
+			}
+			u := rbac.Subject{Principal: identity("u")}
+			if _, err := h.authz.Activate(ctx, u, secret, rbac.Activation{Role: "cluster.sudo", Duration: 8 * time.Hour, Justification: "INC-1"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.authz.DeleteEligibility(ctx, owner, secret, "cluster.sudo", groupOf(c.through)); err != nil {
+				t.Fatal(err)
+			}
+			admin := h.as(t, "admin")
+			change := func() error {
+				if c.sooner {
+					m := c.leaving
+					m.ExpiresAt = h.now.Add(time.Minute)
+					return h.authz.ChangeMembers(ctx, admin, "t1", []rbac.Member{m}, nil)
+				}
+				return h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{c.leaving})
+			}
+			if err := change(); !errors.Is(err, rbac.ErrDenied) {
+				t.Fatalf("without the cluster's label: %v", err)
+			}
+			if !allowed(t, h, u, root, secret) {
+				t.Fatal("u's activation should still give it root on the cluster")
+			}
+			if err := h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "crew", Principal: identity("v")}}); err != nil {
+				t.Errorf("removing a member holding no activation there: %v", err)
+			}
+			h.hold(t, "admin", "level:high")
+			h.events = nil
+			if err := change(); err != nil {
+				t.Fatalf("with the cluster's label: %v", err)
+			}
+			if e := lastEvent(t, h); len(e.Revoked)+len(e.Shortened) != 1 {
+				t.Errorf("the change ended or cut short %d activations and %d grants", len(e.Shortened), len(e.Revoked))
+			}
+		})
+	}
+}
+
+// A removal is tried again when, while the scopes it reaches are read from the host, an activation
+// on a labeled scope comes to rest on the place it ends, whose label it didn't check.
+func TestAnActivationMadeWhileARemovalIsCheckedIsTriedAgain(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	var meanwhile func(ctx context.Context) error
+	h := labeled(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if do := meanwhile; do != nil && s == workspace.Scope() {
+				meanwhile = nil
+				if err := do(ctx); err != nil {
+					return rbac.Resource{}, err
+				}
+			}
+			if s == secret.Scope() {
+				return secret, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"), grant(workspace.Scope(), "workspace.admin", rbac.Group, "crew"))
+	h.join(t, "u")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	// u activates on the cluster through an eligibility of crew's, which is then deleted.
+	meanwhile = func(ctx context.Context) error {
+		_, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at, activated_through)
+			VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'cluster.sudo', 'activation', $1, 'group:crew')`, h.now.Add(time.Hour))
+		return err
+	}
+	if err := h.authz.ChangeMembers(ctx, h.as(t, "admin"), "t1", nil, []rbac.Member{{Group: "crew", Principal: identity("u")}}); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("a removal ending an activation on a labeled scope made meanwhile: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("u should have activated on the cluster meanwhile")
+	}
+}
+
 // A removal a label refuses is refused before its transaction, waiting for no lock another
 // change holds.
 func TestARemovalALabelRefusesWaitsForNoLock(t *testing.T) {

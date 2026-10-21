@@ -932,6 +932,88 @@ func TestActivationsUnderAGenericPlanReadOnlyTheirHoldersPaths(t *testing.T) {
 	}
 }
 
+// Where labels are declared, a change to members reads, of the activations whose scopes' labels it
+// checks, only those of the identities leaving and of those in the groups leaving, under a generic
+// plan too: found by the group they were made through, or beside the tenant, a plan costing them by
+// averages would read every activation in the tenant.
+func TestLeavingUnderAGenericPlanReadsOnlyTheLeaversActivations(t *testing.T) {
+	h := generic(t, withLabels, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), groupMembers) })
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"))
+	h.groups(t, "oncall")
+	admin := h.as(t, "admin")
+	bob := h.as(t, "bob", "inner")
+	h.as(t, "ann", "inner")
+	// inner is in oncall, through which bob activated on the cluster.
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'oncall', 'group', 'inner')`, nil},
+		{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at, activated_through)
+		  VALUES ('t1', 'cluster', 'c1', 'user', 'bob', 'cluster.sudo', 'activation', $1, 'group:oncall')`, []any{h.now.Add(time.Hour)}},
+	} {
+		if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tables := []string{"rbac_grants", "rbac_members"}
+	// The pages of each, and their indexes, each reads, in a transaction it rolls back.
+	read := func() map[string]int64 {
+		t.Helper()
+		pages := map[string]int64{}
+		for what, f := range map[string]func(a *rbac.Authorizer) error{
+			"removing bob": func(a *rbac.Authorizer) error {
+				return a.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "inner", Principal: bob.Principal}})
+			},
+			"ending bob's place sooner": func(a *rbac.Authorizer) error {
+				return a.ChangeMembers(ctx, admin, "t1", []rbac.Member{{Group: "inner", Principal: bob.Principal, ExpiresAt: h.now.Add(time.Minute)}}, nil)
+			},
+			"removing bob's group": func(a *rbac.Authorizer) error {
+				return a.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "oncall", Principal: groupOf("inner")}})
+			},
+		} {
+			func() {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				for _, table := range tables {
+					pages[what+" of "+table] -= pagesRead(ctx, t, tx, table)
+				}
+				if err := f(h.authz.WithTx(tx)); err != nil {
+					t.Fatalf("%s: %v", what, err)
+				}
+				for _, table := range tables {
+					pages[what+" of "+table] += pagesRead(ctx, t, tx, table)
+				}
+			}()
+		}
+		return pages
+	}
+	// Others are in oncall, and each activated through it on a cluster of its own.
+	others := func(n int) {
+		t.Helper()
+		manyMembers(t, h, n, `, members AS (INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+			  SELECT 't1', 'oncall', 'user', id FROM others)
+			INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at, activated_through)
+			SELECT 't1', 'cluster', id, 'user', id, 'cluster.sudo', 'activation', '2026-01-01 13:00:00+00', 'group:oncall' FROM others`, tables...)
+	}
+	// Measured at three sizes, as a plan that reads the tenant's activations by the index on them
+	// alone, costing it as an average tenant's few, is picked only while they are few.
+	others(50)
+	few := read()
+	for _, n := range []int{450, 4500} {
+		others(n)
+		for what, many := range read() {
+			if many > few[what]*3/2+deeper {
+				t.Errorf("%s read %d pages, and %d once %d more were in oncall and activated through it", what, few[what], many, n)
+			}
+		}
+	}
+}
+
 // A group removed from a tenant's grants and groups leaves the denies that exempt it too, but the
 // tenant's members, whose grants are removed, stay exempt: they leave nothing.
 func TestDeletingAPrincipalTakesOnlyAGroupOrIdentityOutOfExemptions(t *testing.T) {
@@ -1110,6 +1192,56 @@ func TestDeleteGroupLeavesAccessAndTheHostsMembersAsTheyAre(t *testing.T) {
 	}
 	if len(h.events) != 1 || len(h.events[0].DeletedGroups) != 1 || len(h.events[0].Revoked) != 1 {
 		t.Fatalf("events = %+v", h.events)
+	}
+}
+
+// An activation outlasts the eligibility it was made through, resting on its holder's place in
+// that one's group, or in one in it: deleting either group would end it, so DeleteGroup refuses
+// both while it lasts, as it refuses a group holding a grant, but not a group whose members hold
+// none.
+func TestDeleteGroupRefusesAGroupAnActivationRestsOn(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	h.groups(t, "crew", "outer", "spare")
+	h.join(t, "u", "v")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{
+		{Group: "crew", Principal: identity("u")},
+		{Group: "outer", Principal: groupOf("crew")},
+		{Group: "spare", Principal: identity("v")},
+		{Group: "outer", Principal: groupOf("spare")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	owner := h.as(t, "owner")
+	if err := h.authz.SetEligibility(ctx, owner, cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: groupOf("outer"), MaxDuration: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	u := rbac.Subject{Principal: identity("u")}
+	if _, err := h.authz.Activate(ctx, u, cluster, rbac.Activation{Role: "cluster.sudo", Duration: time.Hour, Justification: "INC-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.DeleteEligibility(ctx, owner, cluster, "cluster.sudo", groupOf("outer")); err != nil {
+		t.Fatal(err)
+	}
+	groupManager := h.as(t, "groups")
+	for _, id := range []string{"crew", "outer"} {
+		if err := h.authz.DeleteGroup(ctx, groupManager, "t1", id); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("deleting %s while an activation made through outer rests on it: %v", id, err)
+		}
+	}
+	if !allowed(t, h, u, root, cluster) {
+		t.Fatal("u's activation should still give it root on the cluster")
+	}
+	if err := h.authz.DeleteGroup(ctx, groupManager, "t1", "spare"); err != nil {
+		t.Errorf("deleting a group in outer whose members hold no activation: %v", err)
+	}
+	if err := h.authz.Deactivate(ctx, u, cluster, "cluster.sudo"); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"crew", "outer"} {
+		if err := h.authz.DeleteGroup(ctx, groupManager, "t1", id); err != nil {
+			t.Errorf("deleting %s once the activation ended: %v", id, err)
+		}
 	}
 }
 
@@ -1961,12 +2093,13 @@ func TestDeletingAGroupNestedMeanwhileIsTriedAgain(t *testing.T) {
 }
 
 // Deleting a group reads, of the groups it is in, only those under a generic plan, and of the
-// grants, eligibilities and denies, only those of the groups it reaches: joined to the tenant's
-// members, the groups a group is in would read every one, and beside tenant = $1 a plan, costing
-// the tenant's rows by averages, would read every grant and eligibility of them, and every deny
-// and approver, which no btree finds by a key in an array. Of its places, its members' and the
-// grants on it, it reads those from a source the host owns only where it owns one, each by the
-// index leading to it, rather than every place or grant in the tenant.
+// grants, eligibilities and denies, only those of the groups it reaches, and of the activations,
+// only its members': joined to the tenant's members, the groups a group is in would read every
+// one, and beside tenant = $1 a plan, costing the tenant's rows by averages, would read every grant
+// and eligibility of them, every activation, and every deny and approver, which no btree finds by
+// a key in an array. Of its places, its members' and the grants on it, it reads those from a
+// source the host owns only where it owns one, each by the index leading to it, rather than every
+// place or grant in the tenant.
 func TestDeleteGroupUnderAGenericPlanReadsOnlyTheGroupsItIsIn(t *testing.T) {
 	for name, sources := range map[string][]string{"owning no source": nil, "owning a source": {"directory"}} {
 		t.Run(name, func(t *testing.T) { deletingReadsOnlyTheGroupsItIsIn(t, sources) })
@@ -1981,6 +2114,7 @@ func deletingReadsOnlyTheGroupsItIsIn(t *testing.T, sources []string) {
 	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "groups"), grant(cluster.Scope(), "cluster.login", rbac.Group, "outer"))
 	manager := h.as(t, "groups")
 	h.groups(t, "inner", "everyone")
+	h.as(t, "ann", "inner")
 	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'outer', 'group', 'inner')`); err != nil {
 		t.Fatal(err)
 	}
@@ -2006,13 +2140,16 @@ func deletingReadsOnlyTheGroupsItIsIn(t *testing.T, sources []string) {
 		}
 		return pages
 	}
-	// Others are in another group, hold a grant, approve an eligibility and are exempt from a deny.
+	// Others are in another group, hold a grant and an activation made through outer, approve an
+	// eligibility and are exempt from a deny.
 	others := func(n int) {
 		t.Helper()
 		manyMembers(t, h, n, `, members AS (INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
 			  SELECT 't1', 'everyone', 'user', id FROM others),
 			granted AS (INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
 			  SELECT 't1', 'cluster', id, 'user', id, 'cluster.login' FROM others),
+			activated AS (INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at, activated_through)
+			  SELECT 't1', 'cluster', id, 'user', id, 'cluster.sudo', 'activation', '2026-01-01 13:00:00+00', 'group:outer' FROM others),
 			eligible AS (INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
 			  SELECT 't1', 'cluster', id, 'user', id, 'cluster.sudo', 3600, ARRAY['user:' || id] FROM others)
 			INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
@@ -2033,7 +2170,7 @@ func deletingReadsOnlyTheGroupsItIsIn(t *testing.T, sources []string) {
 	settle()
 	for what, many := range read() {
 		if many > few[what]*3/2+deeper {
-			t.Errorf("deleting a group read %d pages of %s, and %d once 9500 more were in another group, granted, approving and exempt", few[what], what, many)
+			t.Errorf("deleting a group read %d pages of %s, and %d once 9500 more were in another group, granted, activated, approving and exempt", few[what], what, many)
 		}
 	}
 }
