@@ -3909,43 +3909,108 @@ func TestAnEligibilityChangedWhileMembersAreAskedAboutIsTriedAgain(t *testing.T)
 	}
 }
 
-// A join is tried again when, while the host is asked about what the member gains, its group comes
-// to approve an eligibility's activations, or to be exempt from a deny, on a scope the change
-// didn't check: those are checked on their scopes, for whichever group reaches them.
+// A join is tried again when, while the host is asked about what the member gains, its group, or
+// another group the change adds a member to, comes to approve an eligibility's activations, or to
+// be exempt from a deny, on a scope the change didn't check: those are checked on their scopes, for
+// whichever of the groups reaches them, so they are compared for all of them.
 func TestAnApprovalOrExemptionMadeWhileMembersAreAskedAboutIsTriedAgain(t *testing.T) {
 	for name, meanwhile := range map[string]string{
 		"an approval": `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
-			VALUES ('t1', 'cluster', 'c2', 'user', 'x', 'cluster.login', 3600, '{group:crew}')`,
+			VALUES ('t1', 'cluster', 'c2', 'user', 'x', 'cluster.login', 3600, ARRAY['group:' || $1])`,
 		"an exemption": `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
-			VALUES ('t1', 'cluster', 'c2', 'd', '{user:z}', '{group:crew}', '{cluster:login}')`,
+			VALUES ('t1', 'cluster', 'c2', 'd', '{user:z}', ARRAY['group:' || $1], '{cluster:login}')`,
 	} {
-		t.Run(name, func(t *testing.T) {
-			var do func(context.Context) error
-			h := grouped(t, func(c *rbac.Config) {
-				c.ValidateGrant = func(ctx context.Context, _ rbac.DB, in rbac.GrantInput) error {
-					if f := do; f != nil && in.Via == rbac.ViaMembership {
-						do = nil
-						return f(ctx)
+		// crew is the group whose member the host is asked about, and deck the other the change
+		// joins, which holds nothing, and comes after it.
+		for _, given := range []string{"crew", "deck"} {
+			t.Run(name+" to "+given, func(t *testing.T) {
+				var do func(context.Context) error
+				h := grouped(t, func(c *rbac.Config) {
+					c.ValidateGrant = func(ctx context.Context, _ rbac.DB, in rbac.GrantInput) error {
+						if f := do; f != nil && in.Via == rbac.ViaMembership {
+							do = nil
+							return f(ctx)
+						}
+						return nil
 					}
-					return nil
+				})
+				ctx := t.Context()
+				// crew holds a role on the cluster, so the join asks the host about it.
+				h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
+				h.groups(t, "deck")
+				h.join(t, "u", "v")
+				do = func(ctx context.Context) error {
+					_, err := h.pool.Exec(ctx, meanwhile, given)
+					return err
+				}
+				add := []rbac.Member{{Group: "crew", Principal: identity("u")}, {Group: "deck", Principal: identity("v")}}
+				if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", add, nil); !errors.Is(err, rbac.ErrConflict) {
+					t.Fatalf("a join to groups, %s given %s meanwhile: %v", given, name, err)
+				}
+				if do != nil {
+					t.Fatalf("the host should have been asked, and %s made meanwhile", name)
 				}
 			})
-			ctx := t.Context()
-			// crew holds a role on the cluster, so the join asks the host about it.
-			h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
-			h.join(t, "u")
-			do = func(ctx context.Context) error {
-				_, err := h.pool.Exec(ctx, meanwhile)
-				return err
+		}
+	}
+}
+
+// What a change of members checks on a scope for whichever group reaches it is found once for all
+// the groups the change reaches, so it is checked for each: an actor that can't set the eligibility
+// one of them approves, or set the deny one is exempt from or named in, is refused a change of
+// their members, whichever comes first, and whether the others gain or leave.
+func TestChangingMembersOfManyGroupsChecksWhatEachReaches(t *testing.T) {
+	for _, c := range []struct {
+		name, reach string
+		joins       bool
+	}{
+		{"members joining groups, one approving", `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+			VALUES ('t1', 'cluster', 'k2', 'user', 'x', 'cluster.login', 3600, '{group:b}')`, true},
+		{"members joining groups, one exempt", `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+			VALUES ('t1', 'cluster', 'k2', 'd', '{user:z}', '{group:b}', '{cluster:login}')`, true},
+		{"members leaving groups, one named in a deny", `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+			VALUES ('t1', 'cluster', 'k2', 'd', '{group:b}', '{}', '{cluster:login}')`, false},
+	} {
+		for _, mixed := range []bool{false, true} {
+			name := c.name
+			if mixed {
+				name += ", while another group's members change the other way"
 			}
-			add := []rbac.Member{{Group: "crew", Principal: identity("u")}}
-			if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", add, nil); !errors.Is(err, rbac.ErrConflict) {
-				t.Fatalf("a join to a group given %s meanwhile: %v", name, err)
-			}
-			if do != nil {
-				t.Fatalf("the host should have been asked, and %s made meanwhile", name)
-			}
-		})
+			t.Run(name, func(t *testing.T) {
+				h := grouped(t)
+				ctx := t.Context()
+				h.groups(t, "a", "b")
+				h.join(t, "u", "v")
+				if _, err := h.pool.Exec(ctx, c.reach); err != nil {
+					t.Fatal(err)
+				}
+				// b reaches k2, where the manager may change nothing; a reaches nothing.
+				u, v := rbac.Member{Group: "a", Principal: identity("u")}, rbac.Member{Group: "b", Principal: identity("v")}
+				// Whether each joins its group, rather than leaves it.
+				joins := map[string]bool{"a": c.joins != mixed, "b": c.joins}
+				var add, remove []rbac.Member
+				for _, m := range []rbac.Member{u, v} {
+					if joins[m.Group] {
+						add = append(add, m)
+						continue
+					}
+					if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', $1, 'user', $2)`,
+						m.Group, m.Principal.ID); err != nil {
+						t.Fatal(err)
+					}
+					remove = append(remove, m)
+				}
+				manager := h.as(t, "manager")
+				if err := h.authz.ChangeMembers(ctx, manager, "t1", add, remove); !errors.Is(err, rbac.ErrDenied) {
+					t.Fatalf("a change of the members of a and b, which reaches k2: %v", err)
+				}
+				// a's member alone changes, as a reaches nothing.
+				add, remove = slices.DeleteFunc(add, func(m rbac.Member) bool { return m.Group == "b" }), slices.DeleteFunc(remove, func(m rbac.Member) bool { return m.Group == "b" })
+				if err := h.authz.ChangeMembers(ctx, manager, "t1", add, remove); err != nil {
+					t.Fatalf("a change of the members of a alone: %v", err)
+				}
+			})
+		}
 	}
 }
 
