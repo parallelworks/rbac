@@ -50,8 +50,9 @@ if err := authz.Authorize(ctx, subject, "cluster:login", cluster); err != nil {
 - **One grant, or several:** a grant is one role to one principal on one scope, from one source,
   until one time, under one condition. Granting the same again changes only its note and its
   condition's title and description; one that differs in any of these stands beside the others,
-  so granting never narrows what a principal holds. Each has an `ID`, who made it and when, and
-  who last changed it.
+  so granting never narrows what a principal holds. Conditions are told apart by their length and
+  64-bit hash, so one whose condition shares both with another's of the same grant otherwise is
+  refused with `ErrInvalid`. Each has an `ID`, who made it and when, and who last changed it.
 - **Changes:** `Apply` grants and revokes on one scope in one transaction. A revoke removes a
   role's grants to a principal from a source, or with an `ID`, still naming the role, one grant;
   revoking and granting a role at once replaces its grants, keeping those granted again as they

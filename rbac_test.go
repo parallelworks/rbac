@@ -2772,6 +2772,87 @@ func TestApplyIsIdempotentAndReportsOnlyChanges(t *testing.T) {
 	}
 }
 
+// colliding is setup on a pool whose statements find hashtextextended in the test's schema before
+// PostgreSQL's, where it gives a text's length: the key index on grants, made with it, tells no
+// two conditions of one length apart, as it can't two whose hashes collide.
+func colliding(t *testing.T) *harness {
+	t.Helper()
+	ctx := t.Context()
+	pool := pgtest.Open(t, "")
+	var schema string
+	if err := pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `CREATE FUNCTION hashtextextended(text, bigint) RETURNS bigint
+		LANGUAGE sql IMMUTABLE PARALLEL SAFE RETURN pg_catalog.length($1)`); err != nil {
+		t.Fatal(err)
+	}
+	cfg := pool.Config()
+	cfg.ConnConfig.RuntimeParams["search_path"] = pgx.Identifier{schema}.Sanitize() + ", pg_catalog"
+	shadowed, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(shadowed.Close)
+	return setupOn(t, shadowed)
+}
+
+// Two grants of one role to one principal on one scope, from one source until one time, whose
+// conditions differ but share the length and hash the store tells grants apart by, can't stand
+// side by side: granting one beside the other stored, or both at once, is refused as invalid,
+// never made as nothing or failed as the store's error, while granting one again as it is stored,
+// or one whose condition is of another length, is made.
+func TestAGrantWhoseConditionTheStoreCantTellFromAnothersIsInvalid(t *testing.T) {
+	h := colliding(t)
+	ctx := t.Context()
+	owner := h.as(t, "owner")
+	on := func(condition string) rbac.Binding {
+		return rbac.Binding{Role: "cluster.login", Principal: identity("u"), Condition: rbac.Condition{Expression: condition}}
+	}
+	sre, dev := on(`subject.attributes.team == "sre"`), on(`subject.attributes.team == "dev"`)
+	if err := h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{sre}}); err != nil {
+		t.Fatal(err)
+	}
+	invalid := func(what string, err error, of rbac.Principal) {
+		t.Helper()
+		var bad *rbac.InvalidError
+		if !errors.As(err, &bad) || bad.Binding.Principal != of || !strings.Contains(bad.Reason, "length and hash") {
+			t.Errorf("%s: %v", what, err)
+		}
+	}
+	invalid("granting one beside the other stored", h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{dev}}), dev.Principal)
+	invalid("importing one beside the other stored", h.authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: dev}}), dev.Principal)
+	v := func(b rbac.Binding) rbac.Binding {
+		b.Principal = identity("v")
+		return b
+	}
+	invalid("granting both at once", h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{v(dev), v(sre)}}), identity("v"))
+	h.events = nil
+	sre.Note = "again"
+	if err := h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{sre}}); err != nil || len(h.events) != 1 {
+		t.Errorf("granting one again with a new note: %v, %+v", err, h.events)
+	}
+	if err := h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{sre}}); err != nil || len(h.events) != 1 {
+		t.Errorf("granting one again as it is stored: %v, %+v", err, h.events)
+	}
+	longer := on(`subject.attributes.team == "infra"`)
+	if err := h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{longer}}); err != nil {
+		t.Errorf("granting one of another length: %v", err)
+	}
+	grants, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{identity("u"), identity("v")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var conditions []string
+	for _, g := range grants {
+		conditions = append(conditions, g.Principal.ID+" "+g.Condition.Expression)
+	}
+	slices.Sort(conditions)
+	if want := []string{"u " + longer.Condition.Expression, "u " + sre.Condition.Expression}; !slices.Equal(conditions, want) {
+		t.Errorf("the grants are %q, not %q", conditions, want)
+	}
+}
+
 func TestOnChangeErrorRollsBack(t *testing.T) {
 	h := setup(t, func(c *rbac.Config) {
 		c.OnChange = func(context.Context, pgx.Tx, rbac.ChangeEvent) error { return errors.New("audit down") }

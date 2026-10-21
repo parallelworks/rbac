@@ -1883,7 +1883,8 @@ func (a *Authorizer) report(ctx context.Context, tx pgx.Tx, e ChangeEvent) error
 // upsert stores grants in one statement, sorted so concurrent changes lock rows in the same
 // order, and returns those it added or whose note it changed, and of them, by id, those stored
 // already, which it rewrote. Of grants that are one grant it stores the last, since one statement
-// can't change a row twice. before is conditionsBefore the change.
+// can't change a row twice. One it can't store beside another, stored or among grants, whose
+// condition shares its length and hash, is invalid. before is conditionsBefore the change.
 func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, grants []Grant,
 	before map[conditionBucket]map[string]int,
 ) ([]Grant, map[string]bool, error) {
@@ -1899,6 +1900,9 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 	slices.Reverse(grants)
 	slices.SortStableFunc(grants, byKey)
 	grants = slices.CompactFunc(grants, func(x, y Grant) bool { return byKey(x, y) == 0 })
+	if err := conditionsApart(ctx, tx, grants); err != nil {
+		return nil, nil, err
+	}
 	n := len(grants)
 	scopeTypes, scopeIDs, kinds, ids, roles := make([]string, n), make([]string, n), make([]string, n), make([]string, n), make([]string, n)
 	sources, expires := make([]string, n), make([]pgtype.Timestamptz, n)
@@ -1912,8 +1916,8 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 	}
 	// The same grant again changes only its note and its condition's title and description. The
 	// condition's length and hash pick it, and its text must match, so a hash shared by two
-	// conditions changes neither. The statement's snapshot holds a grant it rewrites as it was, and
-	// none it adds.
+	// conditions changes neither, and the grant is refused below. The statement's snapshot holds a
+	// grant it rewrites as it was, and none it adds.
 	rows, err := tx.Query(ctx, `
 		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at,
 		  condition_title, condition_description, condition, note, created_by, updated_by)
@@ -1933,14 +1937,50 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 		return nil, nil, err
 	}
 	rewrote := map[string]bool{}
+	written := map[scopedKey]bool{}
 	granted, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Grant, error) {
 		var stored bool
 		g, err := scanGrantWith(row, &stored)
-		rewrote[g.ID] = stored
+		rewrote[g.ID], written[scopedKeyOf(g)] = stored, true
 		return g, err
 	})
 	if err != nil {
 		return nil, nil, err
+	}
+	// One it neither added nor rewrote is stored as it is, unless a stored grant shares its key but
+	// for a condition of its length and hash, which the key index can't tell from its own: then the
+	// statement stored nothing. Each is looked up by the whole key, which OFFSET 0 keeps a lookup
+	// of its own: as an anti-join, a generic plan can read every grant in the tenant.
+	var left []int64
+	for i, g := range grants {
+		if !written[scopedKeyOf(g)] {
+			left = append(left, int64(i+1))
+		}
+	}
+	if len(left) > 0 {
+		rows, err := tx.Query(ctx, `
+			SELECT i FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::timestamptz[], $9::text[])
+			  WITH ORDINALITY AS t(st, si, pk, pi, r, src, e, c, i)
+			WHERE i = ANY($10::bigint[]) AND NOT EXISTS (SELECT FROM rbac_grants g WHERE g.tenant = $1
+			  AND g.principal = t.pk || ':' || t.pi AND g.scope = t.st || ':' || t.si AND g.role = t.r AND g.source = t.src
+			  AND coalesce(g.expires_at, 'infinity') = coalesce(t.e, 'infinity') AND length(g.condition) = length(t.c)
+			  AND hashtextextended(g.condition, 0) = hashtextextended(t.c, 0) AND g.condition = t.c OFFSET 0)
+			ORDER BY i`, tenant, scopeTypes, scopeIDs, kinds, ids, roles, sources, expires, conditions, left)
+		if err != nil {
+			return nil, nil, err
+		}
+		unstored, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+		if err != nil {
+			return nil, nil, err
+		}
+		var errs []error
+		for _, i := range unstored {
+			errs = append(errs, &InvalidError{Binding: grants[i-1].Binding, Reason: "a grant of it here, from its source until its end, is " +
+				"stored under another condition of the length and hash grants are told apart by, so the two can't stand side by side: revoke that one first"})
+		}
+		if err := errors.Join(errs...); err != nil {
+			return nil, nil, err
+		}
 	}
 	if err := a.bounded(ctx, tx, tenant, granted); err != nil {
 		return nil, nil, err
@@ -1949,6 +1989,64 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 		return nil, nil, err
 	}
 	return granted, rewrote, nil
+}
+
+// scopedKey is what makes a grant on a scope one grant: its scope and grantKey.
+type scopedKey struct {
+	scope Scope
+	grantKey
+}
+
+func scopedKeyOf(g Grant) scopedKey { return scopedKey{g.Scope, keyOf(g.Binding)} }
+
+// conditionsApart refuses grants, sorted as upsert sorts them, two of which differ only in
+// conditions that share their length and hash, which the key index on grants tells conditions
+// apart by: one statement can't store both, as both name one row. The hashes are read only where
+// grants differ only in their conditions, as a change seldom holds.
+func conditionsApart(ctx context.Context, q DB, grants []Grant) error {
+	slot := func(g Grant) scopedKey {
+		k := scopedKeyOf(g)
+		k.condition = ""
+		return k
+	}
+	var at []int
+	var conditions []string
+	for i, g := range grants {
+		if i > 0 && slot(grants[i-1]) == slot(g) || i+1 < len(grants) && slot(grants[i+1]) == slot(g) {
+			at, conditions = append(at, i), append(conditions, g.Condition.Expression)
+		}
+	}
+	if len(at) == 0 {
+		return nil
+	}
+	rows, err := q.Query(ctx, `SELECT length(c), hashtextextended(c COLLATE "C", 0) FROM unnest($1::text[]) WITH ORDINALITY AS t(c, i) ORDER BY i`, conditions)
+	if err != nil {
+		return err
+	}
+	type indexed struct {
+		slot   scopedKey
+		length int
+		hash   int64
+	}
+	seen := map[indexed]bool{}
+	var errs []error
+	var length int
+	var hash int64
+	next := 0
+	if _, err := pgx.ForEachRow(rows, []any{&length, &hash}, func() error {
+		g := grants[at[next]]
+		next++
+		k := indexed{slot(g), length, hash}
+		if seen[k] {
+			errs = append(errs, &InvalidError{Binding: g.Binding, Reason: "the change grants it here, from its source until its end, under another " +
+				"condition of the length and hash grants are told apart by, so the two can't stand side by side"})
+		}
+		seen[k] = true
+		return nil
+	}); err != nil {
+		return err
+	}
+	return errors.Join(errs...)
 }
 
 // conditionsBefore is conditionsIn the buckets of grants a change stores, read under its locks
