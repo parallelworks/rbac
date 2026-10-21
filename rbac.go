@@ -715,10 +715,11 @@ type Config struct {
 	// Labels declares the dimensions of the labels on data (Resource.Labels): a mandatory layer
 	// above every grant. A subject holds a dimension's values as permissions, `dimension:value`,
 	// which roles for the tenant give, and a check allows anything of a labeled resource only
-	// when what it holds satisfies the label. None, nothing is labeled. A check reads the
-	// subject's grants and its values in two statements, so changes committing between them can
-	// meet in an answer no single moment gave. Holders reads each holder's values, one after
-	// another. A deny of an Ordered value takes that value alone: to cap a level, deny it and every
+	// when what it holds satisfies the label. None, nothing is labeled. Checks, Permissions and
+	// Grantable read the subject's values in the statement that reads its grants, Explain and
+	// Reachable in the read's snapshot, and Holders every holder's at once, in its snapshot, so a
+	// label is decided by values of the moment the grants are. Filter fixes the holding when it is
+	// called. A deny of an Ordered value takes that value alone: to cap a level, deny it and every
 	// value above. Values are held on the tenant, so they are denied there: SetDeny refuses a deny
 	// of one on any other scope, which would bind no one. The conditions of a value's grants and
 	// denies read the tenant as their resource, never the labeled one.
