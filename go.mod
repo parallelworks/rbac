@@ -2,7 +2,7 @@ module github.com/parallelworks/rbac
 
 go 1.26.0
 
-toolchain go1.27.2
+toolchain go1.27.3
 
 // Enforce FIPS 140-3 mode everywhere, including `go test`: non-approved
 // algorithms fail at runtime.
