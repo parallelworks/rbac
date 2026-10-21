@@ -19,6 +19,15 @@ func SetSavepointEnd(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { savepointEnd = old })
 }
 
+// SetMigrateAttempts has Migrate run its transaction at most n times, waiting backoff before the
+// second, until t ends.
+func SetMigrateAttempts(t *testing.T, n int, backoff time.Duration) {
+	t.Helper()
+	oldAttempts, oldBackoff := migrateAttempts, migrateBackoff
+	migrateAttempts, migrateBackoff = n, backoff
+	t.Cleanup(func() { migrateAttempts, migrateBackoff = oldAttempts, oldBackoff })
+}
+
 // SetMaxPrune bounds what one PruneHistory deletes to n until t ends.
 func SetMaxPrune(t *testing.T, n int) {
 	t.Helper()

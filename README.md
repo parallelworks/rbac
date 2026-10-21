@@ -466,6 +466,19 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   runs by itself; a host with a migration tool of its own can apply `rbac.Migrations()` instead.
   On a host's transaction it refuses any isolation but READ COMMITTED: a stricter one's snapshot
   would miss the writes it waits for.
+  A migration locks what it changes until it commits, and while it waits for a lock, every check,
+  list and change of that table queues behind it, and of those it locked already. So `Migrate` has
+  it wait at most 100 ms for any lock: a change that reads the tables in another order than a
+  migration locks them would otherwise deadlock with it, as no order suits every change
+  (`ChangeMembers` reads eligibilities and denies before custom roles, `DeleteRole` custom roles
+  before eligibilities), and a transaction holding a table for long would stall them all. It then
+  rolls back and tries again, waiting longer each time, up to 10 times over about 20 seconds, and
+  then fails as `rbac.ErrConflict`: migrate again once what held the table, as a long export or
+  host transaction, has ended. A transaction waiting for a lock a migration holds, which holds one
+  the migration then waits for, is still ended as a deadlock where its `deadlock_timeout`, 1 second
+  by default, passes before the migration's wait does, and a change ended so is refused as
+  `rbac.ErrConflict`. A tool of the host's own gets none of this: apply each migration with a
+  short `lock_timeout`, and on SQLSTATE 55P03 or 40P01 roll it back and apply it again.
   A migration that rebuilds an index, as `0009_grant_seeks` rebuilds two of `rbac_grants`, locks
   the table until it commits, so checks, lists and changes wait for the rebuild; one that builds
   an index, as `0011_tenant_keys` builds three on `rbac_eligibilities` and `rbac_denies`, keeps
@@ -488,9 +501,11 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   while it holds them, though reads of history go on; but where one holds its keys in more
   dimensions, it rebuilds history's index of them, which reads all of history, and as a read of a
   table locks each of its indexes, the rebuild waits for the reads of history running, as an
-  export, and every read of history then waits until migrating commits. A transaction that read
-  history and then reads one of those tables deadlocks with the rebuild, and PostgreSQL ends one
-  of the two: migrate again.
+  export, every read of history waiting behind it until migrating commits, and gives way where one
+  runs past the wait. A transaction that read history and then reads one of those tables waits for
+  migrating while it holds what the rebuild waits for: the rebuild gives way, unless the
+  transaction began waiting long enough before it, as while migrating reads a long history's deny
+  records, for its `deadlock_timeout` to pass first, and PostgreSQL ends the transaction.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
   between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows

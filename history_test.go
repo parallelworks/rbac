@@ -394,17 +394,10 @@ func TestThePackageRunsAsTheReadmesDatabaseRoles(t *testing.T) {
 			ctx := t.Context()
 			r := newReadmeRoles(t)
 			if upgrade {
-				if _, err := r.adminPool.Exec(ctx, `CREATE TABLE rbac_migrations (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
-					t.Fatal(err)
-				}
 				if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", last); err != nil {
 					t.Fatal(err)
 				}
-				for _, name := range names[:len(names)-1] {
-					if _, err := r.adminPool.Exec(ctx, `INSERT INTO rbac_migrations (version) VALUES ($1::text::integer)`, strings.SplitN(name, "_", 2)[0]); err != nil {
-						t.Fatal(err)
-					}
-				}
+				recordMigrations(t, r.adminPool, last)
 				r.harden(t)
 			}
 			if err := rbac.Migrate(ctx, r.adminPool); err != nil {
@@ -1181,6 +1174,29 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool, iso pgx.TxIsoLevel
 		}
 	}
 	return nil
+}
+
+// recordMigrations records in rbac_migrations, as Migrate does, every migration named before to,
+// as migrateFiles applies them up to to, so Migrate applies those from to on.
+func recordMigrations(t *testing.T, pool *pgxpool.Pool, to string) {
+	t.Helper()
+	ctx := t.Context()
+	files, err := fs.Glob(rbac.Migrations(), "*.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `CREATE TABLE rbac_migrations (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range files {
+		if name >= to {
+			break
+		}
+		prefix, _, _ := strings.Cut(name, "_")
+		if _, err := pool.Exec(ctx, `INSERT INTO rbac_migrations (version) VALUES ($1::text::integer)`, prefix); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 // migrated is a harness on pool, which migrateFiles migrated.
