@@ -4785,8 +4785,8 @@ func TestGrantsEndingApartReadEachOfTheActorsGrantsOnceForWhatTheyAsk(t *testing
 				{`INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
 				SELECT 't1', 'custom.k' || i, '{cluster:view,cluster:login,cluster:grant}', '{cluster}' FROM generate_series(1, $1::int) i`, []any{kinds}},
 				{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
-				SELECT 't1', 'cluster', 'c1', 'user', 'boss', 'custom.k' || i, $2::timestamptz + i * interval '1 hour' FROM generate_series(1, $1::int) i`,
-					[]any{kinds, h.now}},
+				SELECT 't1', 'cluster', 'c1', 'user', 'boss', 'custom.k' || i, $2::timestamptz + i * interval '1 hour'
+				FROM generate_series(1, $1::int) i`, []any{kinds, h.now}},
 				{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
 				SELECT 't1', 'workspace', 'w1', 'user', 'boss', 'workspace.admin', $2::timestamptz + (1000 + i) * interval '1 hour'
 				FROM generate_series(1, $1::int) i`, []any{others, h.now}},
