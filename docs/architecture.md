@@ -465,6 +465,13 @@ sequenceDiagram
 - **Custom roles.** `SetRole` redefines a role in place for every grant of it, so it asks
   `ValidateGrant` about every grant and eligibility the new definition widens, before its
   transaction, and under the tenant's lock refuses with `ErrConflict` if those changed meanwhile.
+  A grant widens by what it gives through its principal, as checks read it
+  (`redefinition.widensTo`): one to the tenant's members of a privileged role, or to the public of
+  a role not marked `Public`, gives nothing, and widens once the role gives it something, however
+  the role changed, as narrowing it so that it is no longer privileged does. On each scope a grant
+  that widens is on, the denies on its path that remove from the actor a permission the role will
+  give refuse the change, as they would refuse `Apply` granting it there; on the others, only those
+  removing its power to change grants there do.
 - **Eligibilities.** `SetEligibility` lets a principal `Activate` a role for a while, perhaps
   only with approvers or a `requires` condition. An activation is a grant that ends no later than
   its eligibility expires, or its holder's membership or place in the group the eligibility names

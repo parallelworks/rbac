@@ -7576,6 +7576,86 @@ func TestADenyBelowTheTenantStopsARedefinitionHandingOnWhatItRemoves(t *testing.
 	}
 }
 
+// A grant to the tenant's members of a privileged role gives nothing, so narrowing the role so that
+// it no longer is gives them what it gives, as granting it to them would: a deny on the workspace
+// that grant is on, which keeps x from handing on what it gives there, stops it, as it stops Apply
+// there. A deny where only a grant to an identity is, which gives no more, stops nothing.
+func TestADenyWhereTheMembersHoldARoleNoLongerPrivilegedStopsNarrowingIt(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	x, r := definer(t, h)
+	member := h.as(t, "m")
+	elsewhere := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c2"}
+	// Privileged, as it gives root, and granted to the members, as a catalog change would leave it.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.op', '{cluster:view,cluster:root}', '{cluster}');
+		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES
+		  ('t1', 'workspace', 'w1', 'members', 't1', 'custom.op'), ('t1', 'cluster', 'c2', 'user', 'y', 'custom.op')`); err != nil {
+		t.Fatal(err)
+	}
+	noView := rbac.Deny{ID: "no-view", Permissions: []rbac.Permission{view}, Principals: []rbac.Principal{x.Principal}}
+	if err := h.authz.SetDeny(ctx, guardian, workspace, noView); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.Apply(ctx, x, workspace, rbac.Change{Grant: []rbac.Binding{{Role: r.ID, Principal: rbac.TenantMembers("t1")}}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("granting view to the members under the deny: %v", err)
+	}
+	narrowed := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	var denied *rbac.DeniedError
+	if err := h.authz.SetRole(ctx, x, "t1", narrowed); !errors.As(err, &denied) || denied.Scope != workspace.Scope() || allowed(t, h, member, view, cluster) {
+		t.Fatalf("narrowing a role the members hold under the deny so that it is no longer privileged: %v", err)
+	}
+	if err := h.authz.DeleteDeny(ctx, guardian, workspace, noView.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.SetDeny(ctx, guardian, elsewhere, noView); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.SetRole(ctx, x, "t1", narrowed); err != nil || !allowed(t, h, member, view, cluster) {
+		t.Fatalf("narrowing it under a deny only where a grant to an identity is: %v", err)
+	}
+}
+
+// What the narrowing checked of the denies where the members' grant is before its transaction it
+// checks again under the tenant's lock, so a deny set there while the host is asked about that
+// grant stops it. A deny elsewhere binds x, so the workspace was read before the transaction.
+func TestADenySetWhileANarrowingTheMembersGainByWaitsStopsIt(t *testing.T) {
+	var meanwhile func(context.Context) error
+	h, guardian := guarded(t, func(c *rbac.Config) {
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			if do := meanwhile; do != nil && in.Via == rbac.ViaRedefinition {
+				meanwhile = nil
+				if err := do(ctx); err != nil {
+					return err
+				}
+			}
+			return validate(ctx, q, in)
+		}
+	})
+	ctx := t.Context()
+	x, _ := definer(t, h)
+	member := h.as(t, "m")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.op', '{cluster:view,cluster:root}', '{cluster}');
+		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'workspace', 'w1', 'members', 't1', 'custom.op')`); err != nil {
+		t.Fatal(err)
+	}
+	elsewhere := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c2"}
+	if err := h.authz.SetDeny(ctx, guardian, elsewhere, rbac.Deny{ID: "no-root", Permissions: []rbac.Permission{root}, Principals: []rbac.Principal{x.Principal}}); err != nil {
+		t.Fatal(err)
+	}
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.SetDeny(ctx, guardian, workspace, rbac.Deny{ID: "no-view", Permissions: []rbac.Permission{view}, Principals: []rbac.Principal{x.Principal}})
+	}
+	narrowed := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	var denied *rbac.DeniedError
+	if err := h.authz.SetRole(ctx, x, "t1", narrowed); !errors.As(err, &denied) || denied.Scope != workspace.Scope() || allowed(t, h, member, view, cluster) {
+		t.Fatalf("narrowing a role the members hold while a deny is set where they hold it: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("the deny should have been set meanwhile")
+	}
+}
+
 // A deny on a container, or on the resource itself, that removes x's power to change grants there
 // stops x changing what a role granted there gives, or revoking it by deleting the role, as it
 // stops Apply there.

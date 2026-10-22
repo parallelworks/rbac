@@ -365,24 +365,31 @@ func canonical(r RoleDefinition) RoleDefinition {
 // constraint that stops changes to grants where it can be granted or is, as narrowing it leaves
 // its grants on scopes of types it is no longer for, or a deny that removes the actor's power to
 // change them there or on the path of a scope they are on, stops it, as it stops DeleteRole and
-// Apply there; so does, where they will give more, a deny on that path that removes a permission
-// the role gives, which the actor would hand on there. Renaming it or rewriting its description
-// changes no grant, so needs only the power to define it: a role's name and description are part
-// of its definition, not of the data its grants are on. The scopes are as Config.ResourceOf gives
-// them. A role another change redefined or created while this one waited for the tenant is
-// refused, to be tried again: the constraints were asked about it as it was, as is one granted
-// meanwhile on a scope of a type they weren't asked about, or, it or a role listing it, on a scope
-// the host wasn't asked about. One deleted meanwhile is created, as its grants went with it.
+// Apply there; so does, where they will give more, as a grant to the tenant's members does once
+// the role is no longer privileged, however it was narrowed, a deny on that path that removes a
+// permission the role gives, which the actor would hand on there. Renaming it or rewriting its
+// description changes no grant, so needs only the power to define it: a role's name and
+// description are part of its definition, not of the data its grants are on. The scopes are as
+// Config.ResourceOf gives them. A role another change redefined or created while this one waited
+// for the tenant is refused, to be tried again: the constraints were asked about it as it was, as
+// is one granted meanwhile on a scope of a type they weren't asked about, or, it or a role listing
+// it, on a scope the host wasn't asked about. One deleted meanwhile is created, as its grants went
+// with it.
 //
 // Redefining a role so that its grants give more, or so that it becomes privileged, changes what
 // grants already made give: Config.ValidateGrant is asked about each of its grants and
-// eligibilities in force that gives anything as the role will be (ViaRedefinition), and refusing
-// any refuses the redefinition, as granting the role so would be refused. Narrowing a role asks
-// about none. One made while this waited for the tenant refuses it too, to be tried again, as the
-// host wasn't asked about it. Redefining it to give more label values or powers to release is
-// refused as invalid where a condition of its grants on the tenant that reads the action, which
-// counts once for each (Condition), would leave theirs costing more than a check may spend, as
-// granting it so would be refused.
+// eligibilities in force that gives more as the role will be than it gave (ViaRedefinition), as
+// checks read what a grant gives through its principal, and refusing any refuses the
+// redefinition, as granting the role so would be refused. A grant to the tenant's members of a
+// privileged role gives nothing, nor does one to the public of a role not marked Public, so
+// widening the role asks nothing about them while they still give nothing; redefining it so that
+// they give something, as narrowing it so that it is no longer privileged does, asks about them as
+// the role will be, what was added to it while they gave nothing too. Narrowing a role so that no
+// grant of it gives more asks about none. One made while this waited for the tenant refuses it
+// too, to be tried again, as the host wasn't asked about it. Redefining it to give more label
+// values or powers to release is refused as invalid where a condition of its grants on the tenant
+// that reads the action, which counts once for each (Condition), would leave theirs costing more
+// than a check may spend, as granting it so would be refused.
 func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, r RoleDefinition) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "SetRole")
@@ -413,20 +420,18 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 	}
 	checked, existed := au.roles.custom[r.ID]
 	change := fmt.Sprintf("changing what %s's grants give", r.ID)
+	d := a.redefining(au.roles.custom, r)
 	var reach roleReach
 	if existed && !sameAccess(checked, r) {
-		// Narrowed, it only takes access away, as deleting it does.
-		var grows *RoleDefinition
-		if givesMore(checked, r) {
-			grows = &r
-		}
 		// Its grants are on scopes of the types it is for, and on those it was for before and is
-		// for again, whose grants it brings back.
-		if reach, err = a.roleReachOf(ctx, actor, au, tenant, r.ID, slices.Concat(checked.ResourceTypes, r.ResourceTypes), grows, change); err != nil {
+		// for again, whose grants it brings back. Narrowed, it takes access away, as deleting it
+		// does, but where a grant of it gives more, as one to the tenant's members does once it is
+		// no longer privileged.
+		if reach, err = a.roleReachOf(ctx, actor, au, tenant, r.ID, slices.Concat(checked.ResourceTypes, r.ResourceTypes), &d, change); err != nil {
 			return err
 		}
 	}
-	asked, stand, err := a.revalidate(ctx, actor, tenant, au.roles.custom, r)
+	asked, stand, err := a.revalidate(ctx, actor, tenant, d)
 	if err != nil {
 		return err
 	}
@@ -455,16 +460,17 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 		// Privileged as the roles that give its permissions on its types are, or as changing
 		// access is, so a host that confirms privileged grants asks about one that gives root
 		// however it was defined. Derived as a read derives it.
-		after, widened := a.redefining(au.roles.custom, r)
+		redefined := a.redefining(au.roles.custom, r)
+		after := redefined.now
 		r.Privileged = after.Privileged
-		if was := au.roles.custom[r.ID]; r.Privileged && !was.Privileged {
+		if r.Privileged && !redefined.was.Privileged {
 			if err := heldByMembers(ctx, tx, tenant, r.ID, a.cfg.Now()); err != nil {
 				return ChangeEvent{}, gains{}, err
 			}
 		}
 		// The grants it widens are the ones the host was asked about, of the roles as it was asked
 		// about them, or one was made or a role redefined meanwhile.
-		need, err := a.revalidations(ctx, tx, tenant, widened)
+		need, err := a.revalidations(ctx, tx, tenant, redefined)
 		if err != nil {
 			return ChangeEvent{}, gains{}, err
 		}
@@ -672,21 +678,67 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 	})
 }
 
-// redefining returns r as checks will read it once it replaces its definition among custom, as
-// read, and, when its grants will give more than they gave, r as the one role that widens. A
+// redefinition is a custom role as it was, the zero role where it didn't exist, and as it will be,
+// both as checks read them, for a change to what its grants and eligibilities give.
+type redefinition struct{ was, now RoleDefinition }
+
+// redefining is r replacing its definition among custom, as read, with r as checks will read it: a
 // copy, as current trims it.
-func (a *Authorizer) redefining(custom map[Role]RoleDefinition, r RoleDefinition) (after RoleDefinition, widened map[Role]RoleDefinition) {
-	after = a.current([]RoleDefinition{r.clone()})[0]
-	if widens(custom[r.ID], after) {
-		return after, map[Role]RoleDefinition{r.ID: after}
-	}
-	return after, nil
+func (a *Authorizer) redefining(custom map[Role]RoleDefinition, r RoleDefinition) redefinition {
+	return redefinition{was: custom[r.ID], now: a.current([]RoleDefinition{r.clone()})[0]}
 }
 
-// givesMore reports whether grants of a role defined as now give anything they didn't as was, so
-// that narrowing a role is never refused for grants it already has. An empty GrantableRoles lets
-// holders grant any role they hold, and a listed role needn't be held, so only dropping roles from
-// a list that stays non-empty gives no more.
+// more reports whether the role gives anything it didn't to whomever it is granted (givesMore), as
+// the holders of a role listing it then hand on. It is false for no redefinition, as deleting a
+// role is.
+func (d *redefinition) more() bool { return d != nil && givesMore(d.was, d.now) }
+
+// widensTo reports whether a grant of the role to p gives more as it will be than the host was
+// asked about as it was, as checks read what a grant gives through its principal
+// (givesThrough): anything, where it gave nothing, as a grant to the tenant's members does once
+// the role is no longer privileged, or one to the public once the role is Public again, however
+// the role changed, narrowed too; or, where it gave something, more than it gave (widens). One that
+// gives nothing as the role will be widens nothing, however the role grows, as a grant to the
+// tenant's members of a privileged role: what was added to the role while it gave nothing is asked
+// about once it gives it.
+func (d redefinition) widensTo(p Principal) bool {
+	return givesThrough(d.now, p) && (!givesThrough(d.was, p) || widens(d.was, d.now))
+}
+
+// widenedTo is whether a redefinition widens grants to the tenant's members, to the public and to
+// the principals named one by one, by the kind of the broad ones and "" for the others, each
+// decided once however many grants each has.
+type widenedTo map[PrincipalKind]bool
+
+func (d redefinition) widened() widenedTo {
+	return widenedTo{"": d.widensTo(Principal{}), Members: d.widensTo(Principal{Kind: Members}), Public: d.widensTo(Principal{Kind: Public})}
+}
+
+// of reports whether the redefinition widens a grant or eligibility to p.
+func (w widenedTo) of(p Principal) bool {
+	if p.broad() {
+		return w[p.Kind]
+	}
+	return w[""]
+}
+
+// any reports whether it widens a grant to any principal.
+func (w widenedTo) any() bool { return w[""] || w[Members] || w[Public] }
+
+// givesThrough reports whether a grant of a role defined as def to p gives anything, as checks read
+// it (holding.carries): one to the tenant's members or the public gives nothing of a privileged
+// role, nor one to the public of a role not marked Public.
+func givesThrough(def RoleDefinition, p Principal) bool {
+	h := holding{Binding: Binding{Principal: p}}
+	return slices.ContainsFunc(def.Permissions, func(perm Permission) bool { return h.carries(def, perm) })
+}
+
+// givesMore reports whether grants of a role defined as now give anything they didn't as was, to
+// whomever they are, so that narrowing a role is never refused for what its grants already give.
+// What a grant to the tenant's members or the public gives turns on more than this
+// (redefinition.widensTo): narrowing a privileged role so that it no longer is gives theirs what
+// they didn't. An empty GrantableRoles lets holders grant any role they hold, and a listed role
+// needn't be held, so only dropping roles from a list that stays non-empty gives no more.
 func givesMore(was, now RoleDefinition) bool {
 	return !subset(now.Permissions, was.Permissions) || !subset(now.ResourceTypes, was.ResourceTypes) ||
 		now.Public && !was.Public ||
@@ -722,7 +774,9 @@ func redefinedSince(asked, now book, roles []Role) error {
 }
 
 // widens reports whether grants of a role defined as now give more than the host was asked about
-// as was: what it gives, or newly privileged, as a catalog change can make it.
+// as was: what it gives, or newly privileged, as a catalog change can make it. That is so of grants
+// that gave something; of those to the tenant's members and the public, which can give nothing,
+// redefinition.widensTo decides.
 func widens(was, now RoleDefinition) bool {
 	return givesMore(was, now) || now.Privileged && !was.Privileged
 }
@@ -748,16 +802,17 @@ func (v revalidation) key() revalidated {
 	return revalidated{grantKey: keyOf(v.binding), scope: v.scope, id: v.binding.ID, note: v.binding.Note}
 }
 
-// revalidations reads, on q, the grants and eligibilities in force of the roles widened, leaving
-// out those that give nothing as the roles will be, as checks read them: they widen nothing.
-func (a *Authorizer) revalidations(ctx context.Context, q DB, tenant string, widened map[Role]RoleDefinition) ([]revalidation, error) {
-	if len(widened) == 0 {
+// revalidations reads, on q, the grants and eligibilities in force of the role d redefines that the
+// redefinition widens (redefinition.widensTo), as the role will be, as checks read what they give:
+// those that give nothing as it will be, or no more than they gave, widen nothing, but one that gave
+// nothing and will give something does, however the role changed, as a grant to the tenant's
+// members of a role narrowed so that it is no longer privileged.
+func (a *Authorizer) revalidations(ctx context.Context, q DB, tenant string, d redefinition) ([]revalidation, error) {
+	w := d.widened()
+	if !w.any() {
 		return nil, nil
 	}
-	var ids []string
-	for id := range widened {
-		ids = append(ids, string(id))
-	}
+	ids := []string{string(d.now.ID)}
 	rows, err := q.Query(ctx, `SELECT `+grantColumns+` FROM (`+customRoleRows("$2", "rbac_grants", "*", inForce)+`) g ORDER BY id`, tenant, ids, a.cfg.Now())
 	if err != nil {
 		return nil, err
@@ -777,12 +832,8 @@ func (a *Authorizer) revalidations(ctx context.Context, q DB, tenant string, wid
 	}
 	need := make([]revalidation, 0, len(grants)+len(eligible))
 	add := func(scope Scope, b Binding) {
-		def := widened[b.Role]
-		gives := slices.ContainsFunc(def.Permissions, func(p Permission) bool { return b.Principal.carries(def, p) })
-		// A privileged role gives nothing through the tenant's members or the public.
-		weak := def.Privileged && b.Principal.broad()
-		if gives && !weak && a.known(tenant, b.Principal) && a.grantableOn(def, scope.Type) {
-			need = append(need, revalidation{scope: scope, binding: b, role: def})
+		if w.of(b.Principal) && a.known(tenant, b.Principal) && a.grantableOn(d.now, scope.Type) {
+			need = append(need, revalidation{scope: scope, binding: b, role: d.now})
 		}
 	}
 	for _, g := range grants {
@@ -795,12 +846,10 @@ func (a *Authorizer) revalidations(ctx context.Context, q DB, tenant string, wid
 }
 
 // revalidate asks Config.ValidateGrant, before SetRole's transaction, about each grant and
-// eligibility of a role that redefining r as actor widens, and returns those it asked about, with
-// the role as it asked, and the standing of their holders. custom are the tenant's custom roles,
-// as read.
-func (a *Authorizer) revalidate(ctx context.Context, actor Subject, tenant string, custom map[Role]RoleDefinition, r RoleDefinition) (map[revalidated]RoleDefinition, standing, error) {
-	_, widened := a.redefining(custom, r)
-	need, err := a.revalidations(ctx, a.db, tenant, widened)
+// eligibility of a role that redefining it as actor, d, widens, and returns those it asked about,
+// with the role as it asked, and the standing of their holders.
+func (a *Authorizer) revalidate(ctx context.Context, actor Subject, tenant string, d redefinition) (map[revalidated]RoleDefinition, standing, error) {
+	need, err := a.revalidations(ctx, a.db, tenant, d)
 	if err != nil {
 		return nil, standing{}, err
 	}
@@ -813,7 +862,7 @@ func (a *Authorizer) revalidate(ctx context.Context, actor Subject, tenant strin
 		return nil, standing{}, err
 	}
 	roles := a.builtinBook()
-	roles.custom = widened
+	roles.custom = map[Role]RoleDefinition{d.now.ID: d.now}
 	asked := make(map[revalidated]RoleDefinition, len(need))
 	var refused []error
 	for _, v := range need {
@@ -837,23 +886,25 @@ func (a *Authorizer) revalidate(ctx context.Context, actor Subject, tenant strin
 // roleReach is what a change to what a custom role's grants and eligibilities give, or deleting
 // the role, checked of the scopes it reaches before its transaction, which stillReaches checks
 // again under the tenant's lock: the types of scope the constraints were asked about, each scope as
-// Config.ResourceOf gives it, where a deny or a label needed it, the role as it will be where its
-// grants will give more, and the labels of the scopes they are on and, where they will, of those
-// roles listing it are granted on (listing).
+// Config.ResourceOf gives it, where a deny or a label needed it, the role as it was and as it will
+// be where a change redefines it, and the labels of the scopes they are on and, where it will give
+// more, of those roles listing it are granted on (listing).
 type roleReach struct {
 	types           []string
 	on              map[Scope]Resource
-	grows           *RoleDefinition
+	redefined       *redefinition
 	labels, listing labeling
 }
 
 // reached are the scopes a change to a custom role reaches: those its grants and eligibilities are
-// on, own, and where they will give more, those of the roles whose holders may grant it as it will
-// be without holding it (handingOn), listed, each with the types of scope the grants there let them
+// on, own, of which widened are those where one of them will give more (redefinition.widensTo),
+// and where the role will give more, those of the roles whose holders may grant it as it will be
+// without holding it (handingOn), listed, each with the types of scope the grants there let them
 // grant it on.
 type reached struct {
-	own    []Scope
-	listed map[Scope][]string
+	own     []Scope
+	widened map[Scope]bool
+	listed  map[Scope][]string
 }
 
 func (r reached) any() bool { return len(r.own)+len(r.listed) > 0 }
@@ -869,27 +920,37 @@ func (r reached) types() []string {
 	return types
 }
 
-// reachedBy reads, on q, the scopes a change to custom role id reaches, with grows the role as it
-// will be where its grants will give more, and custom the tenant's custom roles, as read.
-func (a *Authorizer) reachedBy(ctx context.Context, q DB, tenant string, id Role, custom map[Role]RoleDefinition, grows *RoleDefinition) (reached, error) {
+// reachedBy reads, on q, the scopes a change to custom role id reaches, with d the role as it was
+// and as it will be where the change redefines it, and custom the tenant's custom roles, as read.
+func (a *Authorizer) reachedBy(ctx context.Context, q DB, tenant string, id Role, custom map[Role]RoleDefinition, d *redefinition) (reached, error) {
 	ids := []Role{id}
 	var handing map[listedAt][]string
-	if grows != nil {
-		handing = a.handingOn(custom, id, *grows)
+	if d.more() {
+		handing = a.handingOn(custom, id, d.now)
 		listers := map[Role]bool{}
 		for at := range handing {
 			listers[at.role] = true
 		}
 		ids = append(ids, slices.Sorted(maps.Keys(listers))...)
 	}
+	var w widenedTo
+	if d != nil {
+		w = d.widened()
+	}
 	scopes, err := a.rolesScopes(ctx, q, tenant, ids)
 	if err != nil {
 		return reached{}, err
 	}
-	r := reached{listed: map[Scope][]string{}}
+	r := reached{widened: map[Scope]bool{}, listed: map[Scope][]string{}}
 	for _, s := range scopes {
 		if s.role == id {
-			r.own = append(r.own, s.Scope)
+			// A scope's rows are read in order, one for each kind of principal they are to.
+			if n := len(r.own); n == 0 || r.own[n-1] != s.Scope {
+				r.own = append(r.own, s.Scope)
+			}
+			if w.of(Principal{Kind: s.broad}) && a.grantableOn(d.now, s.Type) {
+				r.widened[s.Scope] = true
+			}
 			continue
 		}
 		for _, t := range handing[listedAt{s.role, s.Type}] {
@@ -968,22 +1029,24 @@ func (a *Authorizer) handingOn(custom map[Role]RoleDefinition, id Role, def Role
 // tenant, removes its power to change grants on scopes of a type they can be on, as the role is for
 // types, or are on, as narrowing it leaves them on scopes of types it is no longer for; on a scope
 // they are on, as Config.ResourceOf gives it, where a deny on its path removes the actor's power to
-// change grants there or, with grows, the role as it will be when they will give more, a permission
-// it gives, or where its label refuses the actor (labelsHeld). With grows, it refuses too where a
-// deny on the path of a scope a role whose holders may grant it without holding it is granted on
+// change grants there or, where d redefines the role so that one of them gives more there
+// (redefinition.widensTo), a permission it gives as it will be, or where its label refuses the
+// actor (labelsHeld). Where the role will give more to whomever it is granted, it refuses too where
+// a deny on the path of a scope a role whose holders may grant it without holding it is granted on
 // (handingOn) keeps the actor from granting it there as it will be, as they then may
 // (scopesDenied), or where that scope's label refuses the actor. Only a deny on a scope other than
 // the tenant can remove more there than the tenant's, which mayDefine and changesDenied check, so
 // only where one binds the actor, or a label could refuse it, as none can where the actor's label
-// values satisfy every label, is the host asked about the scopes. Without grows, as for deleting
-// or narrowing the role, which only takes access away, a scope the host no longer has (ErrNotFound)
-// is read as stored, with no containers or label. au is the actor's authority on the tenant, which
-// mayDefine checked the role on.
-func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authority, tenant string, id Role, types []string, grows *RoleDefinition,
+// values satisfy every label, is the host asked about the scopes. Where none of the grants and
+// eligibilities on a scope will give more, as for deleting or narrowing the role, which there only
+// takes access away, a scope the host no longer has (ErrNotFound) is read as stored, with no
+// containers or label. au is the actor's authority on the tenant, which mayDefine checked the role
+// on.
+func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authority, tenant string, id Role, types []string, d *redefinition,
 	change string,
 ) (roleReach, error) {
-	reach := roleReach{grows: grows}
-	scopes, err := a.reachedBy(ctx, a.db, tenant, id, au.roles.custom, grows)
+	reach := roleReach{redefined: d}
+	scopes, err := a.reachedBy(ctx, a.db, tenant, id, au.roles.custom, d)
 	if err != nil {
 		return roleReach{}, err
 	}
@@ -1009,7 +1072,7 @@ func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authorit
 	// scope can refuse the actor handing on, as granting it there would; so it is asked about the
 	// scopes only where the actor's values don't satisfy every label, which the constraints were
 	// asked about for its own.
-	if grows != nil && reach.labels.cs != nil {
+	if d.more() && reach.labels.cs != nil {
 		reach.listing = labeling{cs: reach.labels.cs}
 		if len(scopes.listed) > 0 {
 			if reach.listing.cleared, err = a.clearsAll(ctx, a.db, reach.listing.cs, nil); err != nil {
@@ -1034,7 +1097,7 @@ func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authorit
 		}
 		r, err := a.resourceOf(ctx, tenant, s)
 		switch {
-		case grows == nil && errors.Is(err, ErrNotFound):
+		case !scopes.widened[s] && scopes.listed[s] == nil && errors.Is(err, ErrNotFound):
 			r = Resource{Tenant: tenant, Type: s.Type, ID: s.ID}
 		case err != nil:
 			return roleReach{}, err
@@ -1078,7 +1141,7 @@ func scopeOrder(x, y Scope) int { return strings.Compare(x.Key(), y.Key()) }
 func (a *Authorizer) stillReaches(ctx context.Context, tx pgx.Tx, actor Subject, au authority, tenant string, id Role, types []string,
 	checked roleReach, change string,
 ) error {
-	scopes, err := a.reachedBy(ctx, tx, tenant, id, au.roles.custom, checked.grows)
+	scopes, err := a.reachedBy(ctx, tx, tenant, id, au.roles.custom, checked.redefined)
 	if err != nil {
 		return err
 	}
@@ -1139,10 +1202,11 @@ func (a *Authorizer) deniedBelow(ctx context.Context, q DB, tenant string, actor
 // scopesDenied returns why a deny stops the actor changing a custom role, reading the denies on the
 // paths of the scopes the change reaches, each as reach resolved it, as one would stop Apply there:
 // on a scope its grants and eligibilities are on, one that removes the actor's power to change
-// grants there, or where they will give more, one that removes there a permission the role as it
-// will be gives, which the actor would hand on there; and on a scope of those listed, one that keeps
-// the actor from granting the role as it will be there, as the holders of a role granted there then
-// may. au is the actor's authority on the tenant, which mayDefine checked the role on.
+// grants there, or where one of them will give more (reached.widened), as a grant to the tenant's
+// members does once the role is no longer privileged, one that removes there a permission the role
+// as it will be gives, which the actor would hand on there; and on a scope of those listed, one that
+// keeps the actor from granting the role as it will be there, as the holders of a role granted there
+// then may. au is the actor's authority on the tenant, which mayDefine checked the role on.
 func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au authority, tenant string, scopes reached, reach roleReach,
 	change string,
 ) error {
@@ -1165,16 +1229,19 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 			return &DeniedError{Permission: manage, Scope: on[i].Scope(), Reason: "removed by a deny, which stops " + change}
 		}
 	}
-	if reach.grows == nil {
+	if reach.redefined == nil || len(scopes.widened)+len(scopes.listed) == 0 {
 		return nil
 	}
-	def := *reach.grows
+	def := reach.redefined.now
 	// Each scope that what the actor holds and the denies on its path can't tell apart from another
 	// removes what that one does, so a role granted on thousands of resources is decided against a
-	// few.
+	// few. Where no grant or eligibility will give more, the role hands nothing more on.
 	var distinct []int
 	seen := map[string]bool{}
 	for i, at := range own {
+		if !scopes.widened[scopes.own[i]] {
+			continue
+		}
 		if k := a.alike(at, on[i]); !seen[k] {
 			seen[k] = true
 			distinct = append(distinct, i)
@@ -1315,30 +1382,35 @@ func customRoleRows(ids, table, cols, where string) string {
 // inForce is SQL for whether a grant or eligibility is in force at $3.
 const inForce = "(expires_at IS NULL OR expires_at > $3)"
 
-// roleScope is a scope a custom role's grants or eligibilities are on.
+// roleScope is a scope a custom role's grants or eligibilities are on, to a broad principal of
+// kind broad, the tenant's members or the public, or to others, "".
 type roleScope struct {
 	role Role
 	Scope
+	broad PrincipalKind
 }
 
 // rolesScopes reads, on q, the scopes the grants and eligibilities in force of custom roles ids
-// are on, each once for each role, sorted by scope.
+// are on, each once for each role and kind of broad principal they are to, or none, as what a
+// grant gives turns on it, sorted by scope, role and kind.
 func (a *Authorizer) rolesScopes(ctx context.Context, q DB, tenant string, ids []Role) ([]roleScope, error) {
 	names := make([]string, len(ids))
 	for i, id := range ids {
 		names[i] = string(id)
 	}
-	// Those ended give nothing, so changing what they give changes no access.
-	rows, err := q.Query(ctx, customRoleRows("$2", "rbac_grants", "role, scope_type, scope_id", inForce)+`
+	// Those ended give nothing, so changing what they give changes no access. An eligibility is
+	// never a broad principal's.
+	rows, err := q.Query(ctx, customRoleRows("$2", "rbac_grants",
+		"role, scope_type, scope_id, CASE WHEN principal_kind = ANY($4::text[]) THEN principal_kind ELSE '' END", inForce)+`
 		UNION
-		`+customRoleRows("$2", "rbac_eligibilities", "role, scope_type, scope_id", inForce)+`
-		ORDER BY 2, 3, 1`, tenant, names, a.cfg.Now())
+		`+customRoleRows("$2", "rbac_eligibilities", "role, scope_type, scope_id, ''::text", inForce)+`
+		ORDER BY 2, 3, 1, 4`, tenant, names, a.cfg.Now(), broadKinds)
 	if err != nil {
 		return nil, err
 	}
 	var scopes []roleScope
 	var s roleScope
-	_, err = pgx.ForEachRow(rows, []any{&s.role, &s.Type, &s.ID}, func() error {
+	_, err = pgx.ForEachRow(rows, []any{&s.role, &s.Type, &s.ID, &s.broad}, func() error {
 		scopes = append(scopes, s)
 		return nil
 	})
