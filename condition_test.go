@@ -1372,6 +1372,32 @@ func TestAKeyFoldedIntoADoubleThatIsntFiniteIsNoCondition(t *testing.T) {
 	}
 }
 
+// A conversion to a string where string() has no binding a program can find, as another version of
+// CEL may bind one only once it runs, isn't a condition: it would convert a double that isn't finite
+// unchecked.
+func TestAConversionToAStringBoundOtherwiseIsNoCondition(t *testing.T) {
+	declared := func(opts ...cel.OverloadOpt) *cel.Env {
+		env, err := cel.NewCustomEnv(cel.Variable("x", cel.DoubleType),
+			cel.Function("string", cel.Overload("double_to_string", []*cel.Type{cel.DoubleType}, cel.StringType, opts...)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return env
+	}
+	converts := cel.UnaryBinding(func(v ref.Val) ref.Val { return v.ConvertToType(types.StringType) })
+	for how, c := range map[string]struct {
+		env         *cel.Env
+		isCondition bool
+	}{
+		"unbound": {declared(), false}, "bound once it runs": {declared(cel.LateFunctionBinding()), false},
+		"bound": {declared(converts), true},
+	} {
+		if err := rbac.PlanIn(t, c.env, `string(x)`); (err == nil) != c.isCondition {
+			t.Errorf("string() %s: %v", how, err)
+		}
+	}
+}
+
 // Loading a time zone copies its name for each place it looks for it, which zoneCost doesn't count
 // however long the name is, so a condition reading a time in a zone the request names, in a loop,
 // took time growing with its length, charged as a short one. A zone is at most 64 bytes, longer

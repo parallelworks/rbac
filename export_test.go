@@ -325,6 +325,15 @@ func PlanKeysOtherwise(t *testing.T, expr string, replan func(interpreter.Interp
 	return err
 }
 
+// PlanIn is why expr can't be planned as a condition in env, which may bind its functions as
+// another version of CEL does, or nil.
+func PlanIn(t *testing.T, env *cel.Env, expr string) error {
+	t.Helper()
+	checked, patterns := compiled(t, &conditions{env: env}, expr)
+	_, err := plan(env, checked, patterns, maxCost)
+	return err
+}
+
 // probing plans each uint literal as a probe, which evaluates and is charged as the literal, but
 // which CEL's cost tracking reads as a call of an argument none of the values it holds is of, so
 // it reads them all.
