@@ -200,6 +200,45 @@ func LabelValuesDecided(t *testing.T, ctx context.Context, a *Authorizer, actor 
 	return together, alone
 }
 
+// GrantsDecided is, for each of grants actor makes on r, the permission it lacks to make it, or ""
+// where it may: as a change granting them all decides them, by one read of its authority there, a
+// role once for each condition and end its grants tell apart; and as deciding each alone does, by a
+// read of its own, under the grant's own condition, by those of its grants that each last until the
+// grant ends (holding.lasts), as though they lasted for good, and the grant were made for good.
+func GrantsDecided(t *testing.T, a *Authorizer, actor Subject, r Resource, grants []Binding) (together, alone []Permission) {
+	t.Helper()
+	ctx := t.Context()
+	a = a.still()
+	authority := func(grants []Binding) authority {
+		au, err := a.authorityOn(ctx, a.db, actor, r, roleIDs(grants))
+		if err != nil {
+			t.Fatal(err)
+		}
+		au.constrained = a.constrain(ctx, actor, r)
+		return au
+	}
+	au := authority(grants)
+	for _, d := range a.grantsDecided(au, au.over(r.Type), r.Type, grants) {
+		together = append(together, d.lacks)
+	}
+	for _, b := range grants {
+		au := authority([]Binding{b})
+		def, known := au.roles.role(b.Role)
+		var lacks Permission
+		if known && a.grantableOn(def, r.Type) {
+			// Its power to change grants now is what all its grants give, whenever they end.
+			pw := au.over(r.Type)
+			au.held = slices.DeleteFunc(slices.Clone(au.held), func(g holding) bool { return !g.lasts(b.ExpiresAt) })
+			for i := range au.held {
+				au.held[i].ends = time.Time{}
+			}
+			lacks, _ = a.mayGrant(au, pw, r.Type, def, b.Condition.Expression, time.Time{}, newChecked())
+		}
+		alone = append(alone, lacks)
+	}
+	return together, alone
+}
+
 // StandSQL is the statement a change reads the standing of its principals with.
 var StandSQL = standSQL
 
