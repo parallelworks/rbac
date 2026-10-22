@@ -174,7 +174,9 @@ func (c Checkpoint) Verify(pub crypto.PublicKey) error {
 }
 
 // VerifyChain checks that records, chained onto from, end at to, and that to is signed by pub:
-// the records an export kept between two checkpoints are those history held, as it held them.
+// the records an export kept between two checkpoints are those history held, as it held them, none
+// dropped, as History refuses a cursor after which a prune deleted any, or whose own record is
+// gone.
 // from is the generation's Genesis or a checkpoint verified already, as VerifyChain checks no
 // signature of its. It shows nothing of the records after to: an audit verifies up to the latest
 // checkpoint kept, and checks that it is as recent as the host exports, since Export signs one on
@@ -199,7 +201,9 @@ func VerifyChain(from Checkpoint, records []Record, to Checkpoint, pub crypto.Pu
 // the zero Checkpoint, which starts the current generation's export from its genesis, or one
 // Export returned. On an error it returns from, as History returns its cursor, so an export goes
 // on from where it was. Keep each checkpoint, and the records, where they can't be rewritten:
-// PruneHistory deletes only what a checkpoint's cursor has passed.
+// PruneHistory deletes only what the cursor it is given has passed, and History refuses a cursor
+// before what a prune deleted, so where several exports read history, prune through the cursor of
+// the one furthest behind.
 //
 // A generation exported from the start again, as after History refuses a cursor, is chained
 // anew from its genesis: the last export's records are what history held up to its last

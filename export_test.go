@@ -45,6 +45,14 @@ func SetPrunedWindow(t *testing.T, f func(pgx.Tx)) {
 	t.Cleanup(func() { prunedWindow = old })
 }
 
+// SetFollowed runs f in History once it has checked its cursor, on its transaction, until t ends.
+func SetFollowed(t *testing.T, f func(pgx.Tx)) {
+	t.Helper()
+	old := followed
+	followed = f
+	t.Cleanup(func() { followed = old })
+}
+
 // SetMaxHistoryBytes bounds the bytes one History call reads to n until t ends.
 func SetMaxHistoryBytes(t *testing.T, n int) {
 	t.Helper()

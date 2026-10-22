@@ -132,7 +132,7 @@ func checkExpiry(expires, now time.Time) string {
 		return ""
 	case !expires.After(now):
 		return "already expired"
-	case expires.After(time.Date(9999, time.December, 30, 23, 59, 59, 999999000, time.UTC)):
+	case expires.After(latest):
 		return "expires after 9999-12-30"
 	}
 	return ""

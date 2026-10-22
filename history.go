@@ -116,33 +116,65 @@ func historyTable(schema string) string {
 	return pgx.Identifier{schema, "rbac_history"}.Sanitize()
 }
 
-// followable refuses, on tx, a cursor of another generation, or whose last record history in schema
-// no longer holds, and returns the generation tx reads. The zero Cursor, or one from a read that
-// found nothing, is followable from any.
+// followable refuses, on tx, a cursor of another generation, whose last record history in schema
+// no longer holds, or after which a prune deleted records, and returns the generation tx reads. The
+// zero Cursor, or one from a read that found nothing, is followable from any.
 func followable(ctx context.Context, tx pgx.Tx, schema string, after Cursor) (generation string, err error) {
+	// A record holds a time PostgreSQL holds, or reads as one just past either end of them.
+	if after.RecordedAt.Before(beforeEarliest) || after.RecordedAt.After(pastLatest) {
+		return "", fmt.Errorf("%w: the cursor's last record is dated past the times history holds", ErrInvalid)
+	}
 	history := historyTable(schema)
 	// The timeline WAL is written on, which promotion changes at once; the last checkpoint's
 	// changes only once the next completes, minutes later. And the database and schema of the
 	// history read, by OIDs, which a physical copy keeps: every database and schema in a cluster
 	// would otherwise share a generation, and with one key, checkpoints. The catalogs by schema
 	// too, as a temporary table is read before them.
-	var held bool
+	var held, pruned bool
 	if err := tx.QueryRow(ctx, `SELECT s.system_identifier::pg_catalog.text || '/' || left(pg_walfile_name(pg_current_wal_lsn()), 8)
 		    || '/' || d.oid::pg_catalog.text || '/' || c.relnamespace::pg_catalog.text,
-		  EXISTS (SELECT 1 FROM `+history+` WHERE txid = $1::pg_catalog.xid8 AND id = $2 AND recorded_at = $3)
+		  EXISTS (SELECT 1 FROM `+history+` WHERE txid = $1::pg_catalog.xid8 AND id = $2 AND recorded_at = $3),
+		  $5::boolean AND `+prunedPast(history, "$1::pg_catalog.xid8", "$2")+`
 		FROM pg_control_system() s, pg_catalog.pg_database d, pg_catalog.pg_class c
 		WHERE d.datname = current_database() AND c.oid = $4::pg_catalog.text::pg_catalog.regclass`,
-		after.TxID, after.ID, storedTime(after.RecordedAt), history).Scan(&generation, &held); err != nil {
+		after.TxID, after.ID, storedTime(after.RecordedAt), history, after.following()).Scan(&generation, &held, &pruned); err != nil {
 		return "", err
 	}
 	if after != (Cursor{}) && after.Generation != generation {
 		return "", fmt.Errorf("%w: the cursor is another generation's, as before a failover: export this one from the start", ErrInvalid)
 	}
-	if (after.TxID != 0 || after.ID != 0) && !held {
+	if after.following() && !held {
 		return "", fmt.Errorf("%w: the database no longer holds the cursor's last record, as after a restore or a prune past it: export it again from the start", ErrInvalid)
+	}
+	if pruned {
+		return "", errPrunedPast()
 	}
 	return generation, nil
 }
+
+// following reports whether c is past history's start, as a cursor History returned after reading
+// a record is.
+func (c Cursor) following() bool { return c.TxID != 0 || c.ID != 0 }
+
+// prunedPast is SQL for whether a prune recorded in history, SQL for its table, deleted a record
+// after the cursor at txid and id, SQL for them: by the last it deleted, or for one recorded before
+// migration 0020, the cursor it went through, past which it deleted none. A prune is recorded after
+// what it deletes, as rbac_history_pruned holds each to, so of the prunes, which are never pruned,
+// only those after the cursor can have, and history's index of them finds those alone.
+func prunedPast(history, txid, id string) string {
+	return `EXISTS (SELECT FROM ` + history + ` g WHERE g.entity = 'history' AND g.op = 'prune' AND (g.txid, g.id) > (` + txid + `, ` + id + `)
+		AND ((coalesce(g.after->'last', g.after->'through')->>'txid')::pg_catalog.xid8,
+		     (coalesce(g.after->'last', g.after->'through')->>'id')::bigint) > (` + txid + `, ` + id + `))`
+}
+
+// errPrunedPast is why History refuses a cursor after which a prune deleted records.
+func errPrunedPast() error {
+	return fmt.Errorf("%w: a prune deleted records after the cursor, which an export from it hasn't read, as one through the cursor of an export further on does: export it again from the start", ErrInvalid)
+}
+
+// followed runs in History once followable has checked the cursor, on its transaction, which a
+// test sets.
+var followed = func(pgx.Tx) {}
 
 // MaxPrune is the most records one PruneHistory call deletes, and the most of history each of its
 // transactions reads, so each, which holds every export in the cluster back while it runs, stays
@@ -174,15 +206,20 @@ const (
 // every version of a row whose last one then was its delete or expiry, unless an earlier one stays.
 // It deletes nothing at or past through, the cursor of the last export the host has checkpointed,
 // so that export goes on from it, and it records in history each of its transactions that deleted
-// any: one that deleted none changed nothing, and AsOf reads every time as it did. Run it as a role with the
-// rights of history's owner, as the README's administrator's, never the application's; keep at
-// least as much as the host's audit retention requires. It refuses a before yet to come or before
-// year 1, earlier than history dates anything, and, like AsOf, history whose ids can't order a
-// row's changes. It deletes at most MaxPrune records: call it again while it deletes as many, and
-// it goes on from where the last prune of the same before and through stopped. It reads history
-// MaxPrune records at a time, on a pool or a connection each in a transaction of its own, so none
-// holds exports back for long, and on an error what those before deleted stays deleted; on a
-// host's transaction, all in it.
+// any, with the last record it deleted in History's order: one that deleted none changed nothing,
+// and AsOf reads every time as it did. History refuses a cursor before the last record a prune
+// deleted, as an export from it would read on past what the prune deleted: where several exports
+// read history, through is the cursor of the one furthest behind. Run it as a role with the rights
+// of history's owner, as the README's administrator's, never the application's: a delete from
+// history that no prune its transaction records reaches is refused as the transaction commits, and
+// that role can delete otherwise only by disabling history's triggers. Keep at least as much as the
+// host's audit retention requires. It refuses a before yet to come or before year 1, earlier than
+// history dates anything, and, like AsOf, history whose ids can't order a row's changes. It
+// deletes at most MaxPrune records: call it again while it deletes as many, and it goes on from
+// where the last prune of the same before and through stopped. It reads history MaxPrune records
+// at a time, on a pool or a connection each in a transaction of its own, so none holds exports back
+// for long, and on an error what those before deleted stays deleted; on a host's transaction, all
+// in it.
 func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) (int64, error) {
 	if through.TxID == 0 && through.ID == 0 {
 		return 0, fmt.Errorf("%w: a prune goes only as far as an export has read: through is the export's cursor", ErrInvalid)
@@ -191,6 +228,11 @@ func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) 
 	// time only from year 1: a year BC is written as the year AD of the same number.
 	if before.Before(time.Date(1, time.January, 1, 0, 0, 0, 0, time.UTC)) {
 		return 0, fmt.Errorf("%w: a prune is of history up to a time in year 1 or later", ErrInvalid)
+	}
+	// Past the times the package stores, it is yet to come, which pruneWindow refuses in the
+	// database, but which pgx would send as another time from year 294,000 or so on.
+	if before.After(latest) {
+		return 0, fmt.Errorf("%w: a prune is of history up to a time that has passed", ErrInvalid)
 	}
 	// Where the next window starts, once the first has read where the last prune stopped.
 	from := int64(-1)
@@ -273,6 +315,10 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 	// last AsOf finds. Each record is judged by its own row's versions, not every row's, and only
 	// those of the window, the next MaxPrune records by id, so a transaction reads no more of
 	// history however few records it finds to delete.
+	//
+	// The window's record is written in the statement that deletes, and only where it deleted any. It
+	// holds the last record it deleted in History's order, before which History refuses a cursor: an
+	// export further behind than through would otherwise read on past what it deleted.
 	var picked int64
 	var last, end *int64
 	if err := tx.QueryRow(ctx, `
@@ -294,7 +340,18 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 		  ORDER BY h.id LIMIT $4
 		), pruned AS (
 		  -- By id, from the batch: a join could read all of history to find it.
-		  DELETE FROM `+history+` WHERE id = ANY (ARRAY(SELECT id FROM doomed)) RETURNING id
+		  DELETE FROM `+history+` WHERE id = ANY (ARRAY(SELECT id FROM doomed)) RETURNING txid, id
+		), latest AS (
+		  SELECT txid, id FROM pruned ORDER BY txid DESC, id DESC LIMIT 1
+		), recorded AS (
+		  INSERT INTO `+history+` (effective_at, tenant, entity, key, op, after, how)
+		  SELECT now(), '', 'history', `+pruneKey+`, 'prune',
+		    jsonb_build_object('before', $1::pg_catalog.timestamptz, 'through', `+pruneThrough+`,
+		      'deleted', (SELECT count(*) FROM pruned),
+		      'reached', CASE WHEN (SELECT count(*) FROM doomed) = $4 THEN (SELECT max(id) FROM doomed) ELSE (SELECT last FROM win) END,
+		      'last', jsonb_build_object('txid', l.txid::pg_catalog.text, 'id', l.id)),
+		    'PruneHistory'
+		  FROM latest l
 		)
 		SELECT (SELECT count(*) FROM pruned), (SELECT count(*) FROM doomed), (SELECT max(id) FROM doomed), (SELECT last FROM win)`,
 		before, through.TxID, through.ID, most, from, maxPrune).Scan(&n, &picked, &last, &end); err != nil {
@@ -311,17 +368,10 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 	if picked == most {
 		next = last
 	}
-	// One that deleted none left history as it was, and the call goes on to the next window itself:
-	// its record would account for no record gone, refuse AsOf times history still holds, and grow
-	// history with each window of each call of a host that prunes on a schedule.
-	if n == 0 {
-		return 0, next, nil
-	}
-	_, err = tx.Exec(ctx, `INSERT INTO `+history+` (effective_at, tenant, entity, key, op, after, how)
-		VALUES (now(), '', 'history', `+pruneKey+`, 'prune',
-		  jsonb_build_object('before', $1::pg_catalog.timestamptz, 'through', `+pruneThrough+`, 'deleted', $4::bigint, 'reached', $5::bigint),
-		  'PruneHistory')`, before, through.TxID, through.ID, n, *next)
-	return n, next, err
+	// One that deleted none left history as it was, and recorded nothing, and the call goes on to the
+	// next window itself: a record would account for no record gone, refuse AsOf times history still
+	// holds, and grow history with each window of each call of a host that prunes on a schedule.
+	return n, next, nil
 }
 
 // Record is one change to a row the package keeps, as its history recorded it, its times in UTC.
@@ -346,8 +396,9 @@ type Record struct {
 	// Op is create, update, delete or expire; baseline, a row written before history was installed,
 	// as migrating found it, dated when it was created, or a role when it last changed, or at the
 	// epoch where that was before year 1 or at its first instant; or prune, whose After is what
-	// PruneHistory was given, how many records one of its transactions deleted, and the id it
-	// reached, which a prune of the same goes on from.
+	// PruneHistory was given, how many records one of its transactions deleted, the last of them in
+	// History's order, before which History refuses a cursor, and the id it reached, which a prune
+	// of the same goes on from. A prune recorded before migration 0020 holds no last record.
 	Op string
 	// Principal, Role, Scope, Group and ExpiresAt are those of the row, where it has them.
 	Principal Principal
@@ -372,7 +423,17 @@ type Record struct {
 // The instants a Record reads PostgreSQL's infinity and -infinity as, which no time it holds is.
 var (
 	pastLatest     = time.Date(294277, time.January, 1, 0, 0, 0, 0, time.UTC)
-	beforeEarliest = time.Date(-4713, time.November, 24, 0, 0, 0, 0, time.UTC).Add(-time.Microsecond)
+	beforeEarliest = earliest.Add(-time.Microsecond)
+)
+
+// earliest is the earliest time PostgreSQL holds, the first instant of 24 November 4714 BC, and
+// latest the last the package stores: the end of 9999-12-30, which is in 9999 in every time zone,
+// the last year JSON and RFC 3339 write. pgx sends a time as 64 bits of microseconds, which a time
+// past year 294,000 or so wraps, so that it reaches PostgreSQL as another time, or one it refuses:
+// a time a caller passes is checked against these first.
+var (
+	earliest = time.Date(-4713, time.November, 24, 0, 0, 0, 0, time.UTC)
+	latest   = time.Date(9999, time.December, 30, 23, 59, 59, 999999000, time.UTC)
 )
 
 // recordTime is t as a Record holds it: the zero time for none, and in UTC, so a record reads the
@@ -410,7 +471,8 @@ type Cursor struct {
 	TxID       uint64
 	ID         int64
 	// RecordedAt is the last record's, to the microsecond: a restore numbers a record it lost again,
-	// with the same transaction and id, but not at the same time.
+	// with the same transaction and id, but not at the same time. History refuses one past the
+	// times history holds.
 	RecordedAt time.Time
 }
 
@@ -434,23 +496,34 @@ var maxUnsized = 100
 // to storage of the host's own, but stops short of the record that would bring the bytes of their
 // rows' JSON and their text past MaxHistoryBytes, unless it is the first: a read of fewer than limit
 // records doesn't mean history holds no more, so read until one reads none. It orders records by
-// the transaction that wrote them and reads only those of transactions older than any still
-// running, so a transaction that commits after a later one is read after it, never skipped.
-// Transaction ids are the database cluster's, so a transaction running anywhere in it, in any
-// database, holds the read back until it ends: a long one, or a prepared transaction left open,
-// delays the export. A session may turn off the timeouts that would end one it leaves open, so
-// watch pg_stat_activity for one held too long and end it, as the README says. A record can be
-// read twice, as when a host retries a read whose result it lost: dedupe on ID and RecordedAt,
-// since a restore can give another record the ID of one it lost.
+// the transaction that wrote them, by the id each takes at its first write, and reads only those
+// of transactions older than any still running, so one that commits after a transaction that took
+// its id later is read before it all the same, never skipped. That is the order of transactions,
+// not of each row's changes: a transaction that took its id first and changed a row after another
+// committed a change to it is read before that one, though its change came after. So a row's
+// versions are in the order of their IDs, in which they were written, as AsOf reads them: a
+// consumer replaying an export applies a row's versions by ID, not in the order read, or it ends
+// with one the row no longer held. Transaction ids are the database cluster's, so a transaction
+// running anywhere in it, in any database, that has taken one holds the read back until it ends: a
+// long one, an AsOf whose read runs long, or a prepared transaction left open, delays the export.
+// A session may turn off the timeouts that would end one it leaves open, so watch pg_stat_activity
+// for one held too long and end it, as the README says. A record can be read twice, as when a host
+// retries a read whose result it lost: dedupe on ID and RecordedAt, since a restore can give
+// another record the ID of one it lost.
 //
 // It reads the primary, and fails on a replica, which can't tell which timeline it follows until
 // long after a failover. A failover or a recovery to a point in time starts a new generation, and
 // a restore that starts none, as from a disk snapshot, loses what came after it: either can use
 // again ids and transactions the last one used past what it kept. History refuses a cursor from
-// another generation, or whose last record the database no longer holds, and history is exported
-// again from the start, kept apart from the last export. A logical dump restored into another
-// cluster numbers its transactions anew, which a cursor can't follow: move history with physical
-// backups and replicas.
+// another generation, whose last record the database no longer holds, or after which a prune
+// deleted records, as one through the cursor of an export further on does, and history is
+// exported again from the start, kept apart from the last export: an export from it would read on
+// past what is gone, and its chain vouch for history without it. A restore that keeps a cursor's
+// record but not what came after it, as one from a disk snapshot taken since the cursor was read,
+// leaves no mark the database can tell from a crash's recovery, which loses nothing that
+// committed: restore by recovering to a point in time, which starts a generation, or export from
+// the start after one. A logical dump restored into another cluster numbers its transactions anew,
+// which a cursor can't follow: move history with physical backups and replicas.
 //
 // It reads history in the current schema by name, so a session's temporary table or type named
 // as history's or a catalog's stands in for none of it, and refuses a search_path that names
@@ -473,14 +546,21 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 		if generation, err = followable(ctx, tx, schema, after); err != nil {
 			return err
 		}
+		followed(tx)
 		// Of the records up to limit, those within the bytes, counted by what rbac_record counted of
 		// their rows, so the rows of those past them are never read; or, for one it didn't count, by
 		// its rows, of at most maxUnsized such records, the next counted as past the bytes. Each text
 		// column is measured on its own, which reads a stored value's length without detoasting it,
 		// as joining them would.
+		//
+		// And whether a prune deleted a record after the cursor, as followable read, again in the
+		// statement that reads the records, which is of a snapshot of its own at READ COMMITTED: a
+		// prune committing since would otherwise delete what it reads past unseen. A read that finds
+		// no record chains nothing, and the next refuses the cursor in followable.
 		rows, err := tx.Query(ctx, `
 			SELECT id, txid, recorded_at, effective_at, tenant, entity, key, op, coalesce(principal, ''), coalesce(role, ''),
-			  coalesce(scope, ''), coalesce(group_id, ''), expires_at, before, after, actor, on_behalf_of, how, request, reason, db_user
+			  coalesce(scope, ''), coalesce(group_id, ''), expires_at, before, after, actor, on_behalf_of, how, request, reason, db_user,
+			  $6::boolean AND `+prunedPast(historyTable(schema), "$1::pg_catalog.xid8", "$2")+`
 			FROM (
 			  SELECT h.*, row_number() OVER w AS n,
 			    sum(CASE WHEN h.bytes IS NOT NULL THEN h.bytes
@@ -502,22 +582,26 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 			  WINDOW w AS (ORDER BY h.txid, h.id ROWS UNBOUNDED PRECEDING)
 			) p
 			WHERE n = 1 OR reached <= $4
-			ORDER BY txid, id`, after.TxID, after.ID, limit, maxHistoryBytes, maxUnsized)
+			ORDER BY txid, id`, after.TxID, after.ID, limit, maxHistoryBytes, maxUnsized, after.following())
 		if err != nil {
 			return err
 		}
+		var skipped bool
 		records, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (Record, error) {
 			var r Record
 			var principal, role, scope, actor, onBehalfOf string
 			var recorded, effective, expires pgtype.Timestamptz
 			var before, afterRow []byte
 			err := row.Scan(&r.ID, &r.TxID, &recorded, &effective, &r.Tenant, &r.Entity, &r.Key, &r.Op, &principal, &role,
-				&scope, &r.Group, &expires, &before, &afterRow, &actor, &onBehalfOf, &r.How, &r.Request, &r.Reason, &r.DBUser)
+				&scope, &r.Group, &expires, &before, &afterRow, &actor, &onBehalfOf, &r.How, &r.Request, &r.Reason, &r.DBUser, &skipped)
 			r.RecordedAt, r.EffectiveAt, r.ExpiresAt = recordTime(recorded), recordTime(effective), recordTime(expires)
 			r.Principal, r.Scope, r.Actor, r.OnBehalfOf = parsePrincipal(principal), parseScope(scope), parsePrincipal(actor), parsePrincipal(onBehalfOf)
 			r.Role, r.Before, r.After = Role(role), before, afterRow
 			return r, err
 		})
+		if err == nil && skipped {
+			return errPrunedPast()
+		}
 		return err
 	})
 	if err != nil {

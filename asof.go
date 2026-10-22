@@ -58,12 +58,19 @@ var asOfEntities = []struct {
 // It reads in one transaction, or a savepoint of the host's under WithTx, in which temporary
 // views named as the package's tables stand in for them, and rolls it back, even once ctx is
 // done. Every statement there is planned for its arguments, the host's under WithTx too, as
-// plan_cache_mode force_custom_plan plans them, until the rollback restores the setting. It needs
-// a transaction that may write, on a primary, as a role that may create temporary tables. A
+// plan_cache_mode force_custom_plan plans them, and without JIT, until the rollback restores both
+// settings: planned so over history, a check or a host's query of a Filter condition costs past
+// jit_above_cost for an ordinary subject, and compiling it took several times as long as running
+// it. It needs a transaction that may write, on a primary, as a role that may create temporary
+// tables. Making the views takes a transaction id, which AsOf's transaction holds until it rolls
+// back, and under WithTx the host's until it ends: as any transaction holding one does, it holds
+// History and Export back, in every database of the cluster, for as long as read runs. So keep
+// read short, as an access review of many subjects reads them in several calls rather than one. A
 // search_path that names pg_temp after the package's schema would read the tables as they are
 // now, and one that names it first the session's own tables as history, so AsOf refuses both. It
 // orders a row's changes by their ids in rbac_history, which sessions take out of order once its
-// id sequence caches more than one, so AsOf refuses that too.
+// id sequence caches more than one, so AsOf refuses that too. It refuses a time before 4714 BC,
+// the earliest PostgreSQL holds, or after 9999-12-30, the last the package stores.
 func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read func(*Authorizer) error) (err error) {
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -73,6 +80,11 @@ func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read
 	}
 	if read == nil {
 		return fmt.Errorf("%w: a read as of a time has a read to run", ErrInvalid)
+	}
+	// The time is every statement's clock, which pgx would send from year 294,000 or so on as
+	// another, one the read would answer as of, or one PostgreSQL refuses.
+	if at.Before(earliest) || at.After(latest) {
+		return fmt.Errorf("%w: a read as of a time is of one from 4714 BC to 9999-12-30", ErrInvalid)
 	}
 	var tx pgx.Tx
 	switch conn := a.db.(type) {
@@ -142,10 +154,13 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	// another field order reads its month as its day. From PostgreSQL 18 a TimeZone's own
 	// abbreviations name zones too, before any other, as UTC+5 makes UTC one five hours west, in
 	// AT TIME ZONE 'UTC' as in a time's text, and <AD>-2 makes its era one: so UTC is an offset here
-	// (inUTC), and the format reads the era as its own field.
+	// (inUTC), and the format reads the era as its own field. JIT is off: planned for their
+	// arguments over history's views, statements cost past jit_above_cost though they read little,
+	// and a host's query of a Filter condition for a subject of a few hundred grants spent most of
+	// its time compiling.
 	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.as_of_tenant', $1, true),
 		set_config('rbac.as_of', pg_catalog.to_char($2::pg_catalog.timestamptz `+inUTC+`, '`+asOfTime+`'), true),
-		set_config('plan_cache_mode', 'force_custom_plan', true)`,
+		set_config('plan_cache_mode', 'force_custom_plan', true), set_config('jit', 'off', true)`,
 		tenant, at); err != nil {
 		return err
 	}
