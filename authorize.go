@@ -325,11 +325,51 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 			only = a.labelPermission
 		}
 	}
-	perms, _, excluded, err := a.permissionsOf(ctx, a.db, s, r, only, a.constrain(ctx, s, r), held, ds, roles)
+	perms, _, excluded, err := a.permissionsOf(ctx, a.db, s, r, only, a.constrain(ctx, s, r), held, ds, roles, nil)
 	if err != nil {
 		return nil, err
 	}
 	return slices.DeleteFunc(perms, func(p Permission) bool { t, ok := a.exclusiveValue(p); return ok && excluded[t] }), nil
+}
+
+// deciding is what conditions read deciding permissions on a resource for a request, but for its
+// action, and what each that ran came to (budget.ran).
+type deciding struct {
+	vars map[string]any
+	ran  map[string]run
+}
+
+// runs is what permissionsOf decides s's permissions on r by, made by the first decision that
+// reads it: what conditions came to on r, and for label values and powers to release on the tenant
+// on the bare tenant, and the exclusive dimensions s holds none of. A later decision by the same
+// grants and denies, on the same request, shares it, so a change checking the labels of many scopes
+// by one read of the actor's values evaluates a condition that doesn't read the action once for all
+// of them, however many labels ask for values no label before did. Each value is still decided on
+// budgets of its own, which pay for every condition they read as if they had run it, so what one
+// decides doesn't turn on what was decided before it.
+type runs struct {
+	resource, values *deciding
+	excluded         map[string]bool
+}
+
+// of is what decisions of s's permissions on r, by held and roles, read: rs, or where nil, a runs
+// of their own, made the first time they read it.
+func (rs *runs) of(ctx context.Context, a *Authorizer, s Subject, r Resource, held []holding, roles book) *runs {
+	if rs == nil {
+		rs = &runs{}
+	}
+	if rs.resource != nil {
+		return rs
+	}
+	rs.resource = &deciding{a.vars(ctx, s, "", r), map[string]run{}}
+	rs.values = rs.resource
+	if r.Type == TenantScope && len(a.labels) > 0 {
+		vars := a.vars(ctx, s, "", r)
+		vars["resource"] = valueResource(r.Tenant)
+		rs.values = &deciding{vars, map[string]run{}}
+	}
+	rs.excluded = a.excludedBy(roles, held)
+	return rs
 }
 
 // permissionsOf is what Permissions lists, once its input is checked, of the permissions only
@@ -338,9 +378,11 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]
 // or a constraint asked without the request's attributes, which a read without the request can't
 // settle; and the exclusive dimensions s holds none of, as its grants on the tenant could give it
 // two (excludedBy). It reads on q the conditions not read with the grants, and asks the
-// constraints through cs, which is on r, so a change reads them back in its transaction.
+// constraints through cs, which is on r, so a change reads them back in its transaction. It shares
+// shared, where not nil, with the decisions before and after it by the same grants and denies on
+// the same request (runs).
 func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resource, only func(Permission) bool, cs *constrained,
-	held []holding, ds []denial, roles book,
+	held []holding, ds []denial, roles book, shared *runs,
 ) ([]Permission, map[Permission]bool, map[string]bool, error) {
 	kept := func(p Permission) bool { return only == nil || only(p) }
 	byCondition := map[Permission]bool{}
@@ -365,17 +407,8 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 	// Each permission is decided as Authorize would decide it, a label value or a power to release
 	// on the tenant as valueResource, on budgets of its own, which share what conditions came to on
 	// the same resource: one that doesn't read the action runs once for them all.
-	type deciding struct {
-		vars map[string]any
-		ran  map[string]run
-	}
-	resource := &deciding{a.vars(ctx, s, "", r), map[string]run{}}
-	values := resource
-	if r.Type == TenantScope && len(a.labels) > 0 {
-		vars := a.vars(ctx, s, "", r)
-		vars["resource"] = valueResource(r.Tenant)
-		values = &deciding{vars, map[string]run{}}
-	}
+	shared = shared.of(ctx, a, s, r, held, roles)
+	resource, values := shared.resource, shared.values
 	on := func(p Permission) *deciding {
 		if a.labelPermission(p) {
 			return values
@@ -476,7 +509,7 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 			}
 		}
 	}
-	return perms, byCondition, a.excludedBy(roles, held), nil
+	return perms, byCondition, shared.excluded, nil
 }
 
 // Holder is one who may do p to r, as Holders finds it.

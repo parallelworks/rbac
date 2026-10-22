@@ -57,20 +57,40 @@ func (a *Authorizer) exclusiveValue(p Permission) (string, bool) {
 func (a *Authorizer) exclusiveValues(roles []RoleDefinition) map[Role][]Permission {
 	gives := map[Role][]Permission{}
 	for _, r := range roles {
-		for _, p := range r.Permissions {
-			if _, ok := a.exclusiveValue(p); ok {
-				gives[r.ID] = append(gives[r.ID], p)
-			}
+		if vs := a.exclusiveIn(r); len(vs) > 0 {
+			gives[r.ID] = vs
 		}
 	}
 	return gives
 }
 
+// exclusiveIn returns the values of exclusive dimensions r gives, reading each of its permissions.
+func (a *Authorizer) exclusiveIn(r RoleDefinition) []Permission {
+	readingEntries(len(r.Permissions))
+	var vs []Permission
+	for _, p := range r.Permissions {
+		if _, ok := a.exclusiveValue(p); ok {
+			vs = append(vs, p)
+		}
+	}
+	return vs
+}
+
 // excludedBy returns the exclusive dimensions whose values held grants, as roles defines them,
-// could give two of (exclusiveGiven).
+// could give two of (exclusiveGiven). Where no dimension is exclusive there are none, and it reads
+// no role.
 func (a *Authorizer) excludedBy(roles book, held []holding) map[string]bool {
+	if !a.exclusive() {
+		return nil
+	}
+	return excludedOf(a.exclusiveOf(roles, held), held)
+}
+
+// excludedOf is excludedBy of held by of, the values of exclusive dimensions each role of held
+// gives (exclusiveOf), so a decision about many paths reads each role once for all of them.
+func excludedOf(of map[Role][]Permission, held []holding) map[string]bool {
 	excluded := map[string]bool{}
-	for t, vs := range a.exclusiveGiven(roles, held) {
+	for t, vs := range givenOf(of, held) {
 		if len(vs) > 1 {
 			excluded[t] = true
 		}
@@ -84,21 +104,38 @@ func (a *Authorizer) excludedBy(roles book, held []holding) map[string]bool {
 // Conflicts count it, so whether a value is held never turns on the request or the subject's
 // attributes, and reading it asks no hook.
 func (a *Authorizer) exclusiveGiven(roles book, held []holding) map[string]map[string]bool {
-	given := map[string]map[string]bool{}
+	return givenOf(a.exclusiveOf(roles, held), held)
+}
+
+// exclusiveOf returns, by role, the values of exclusive dimensions each role held grants name
+// gives, as roles defines it, and none for one roles doesn't have. Each role's permissions are read
+// once however many grants name it: a role can give a thousand, and an actor hold it many times,
+// each grant ending at another time.
+func (a *Authorizer) exclusiveOf(roles book, held []holding) map[Role][]Permission {
+	of := map[Role][]Permission{}
 	for _, h := range held {
-		def, ok := roles.role(h.Role)
-		if !ok {
+		if _, read := of[h.Role]; read {
 			continue
 		}
-		for _, p := range def.Permissions {
-			t, ok := a.exclusiveValue(p)
-			if !ok {
-				continue
-			}
+		var vs []Permission
+		if def, ok := roles.role(h.Role); ok {
+			vs = a.exclusiveIn(def)
+		}
+		of[h.Role] = vs
+	}
+	return of
+}
+
+// givenOf is exclusiveGiven of held by of, the values of exclusive dimensions each role of held
+// gives (exclusiveOf).
+func givenOf(of map[Role][]Permission, held []holding) map[string]map[string]bool {
+	given := map[string]map[string]bool{}
+	for _, h := range held {
+		for _, p := range of[h.Role] {
+			t, v := p.parts()
 			if given[t] == nil {
 				given[t] = map[string]bool{}
 			}
-			_, v := p.parts()
 			given[t][v] = true
 		}
 	}

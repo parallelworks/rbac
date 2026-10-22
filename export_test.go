@@ -1,7 +1,10 @@
 package rbac
 
 import (
+	"context"
+	"maps"
 	"runtime"
+	"slices"
 	"testing"
 	"time"
 
@@ -139,6 +142,62 @@ func SetDecidingGrants(t *testing.T, f func() func()) {
 	old := decidingGrants
 	decidingGrants = f
 	t.Cleanup(func() { decidingGrants = old })
+}
+
+// ExcludedOn is, for each of on, resources of one tenant, the exclusive dimensions whose values
+// actor's grants on its path could give two of, as a change's authorities on all of them decide
+// them together, and as excludedBy decides them from that path's grants alone, as each authority
+// once decided its own.
+func ExcludedOn(t *testing.T, a *Authorizer, actor Subject, on []Resource) (together, alone []map[string]bool) {
+	t.Helper()
+	a = a.still()
+	aus, err := a.authorities(t.Context(), a.db, actor, on, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, au := range aus {
+		together = append(together, au.excluded)
+		alone = append(alone, a.excludedBy(au.roles, au.held))
+	}
+	return together, alone
+}
+
+// LabelValuesDecided is, for each of labels, the values it asks for that actor holds in tenant on
+// ctx's request: decided together, as a change checking them all by one read of what the actor's
+// values are decided by decides them, label after label; and each alone, as a check of it decides
+// them by a read of its own.
+func LabelValuesDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subject, tenant string, labels []Label) (together, alone [][]Permission) {
+	t.Helper()
+	a = a.still()
+	v, err := a.valuesOn(ctx, a.db, tenant, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	asked := func(h Holding, l Label) []Permission {
+		var held []Permission
+		for _, p := range slices.Sorted(maps.Keys(a.askedBy(l))) {
+			if dim, value := p.parts(); h.values[dim][value] {
+				held = append(held, p)
+			}
+		}
+		return held
+	}
+	c := a.constrain(ctx, actor, tenantResource(tenant))
+	for _, l := range labels {
+		h, err := c.decidedBy(ctx, a.db, v, a.askedBy(l))
+		if err != nil {
+			t.Fatal(err)
+		}
+		together = append(together, asked(h, l))
+	}
+	for _, l := range labels {
+		h, _, err := a.holdingFor(ctx, tenant, actor, &valuesRead{held: v.held, ds: v.ds, roles: v.roles}, l)
+		if err != nil {
+			t.Fatal(err)
+		}
+		alone = append(alone, asked(h, l))
+	}
+	return together, alone
 }
 
 // StandSQL is the statement a change reads the standing of its principals with.

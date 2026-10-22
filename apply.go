@@ -827,6 +827,9 @@ type authority struct {
 	denied, handsOn func(p Permission) bool
 	// denials are the denies on the path that bind the actor, which denied and handsOn read.
 	denials []denial
+	// excluded are the exclusive dimensions whose values its grants on the path could give two of,
+	// which denied and handsOn remove too.
+	excluded map[string]bool
 	// defining is a custom role SetRole checks: the roles a check names resolve to it, but the
 	// actor's own grants of it give what it gives now.
 	defining *RoleDefinition
@@ -929,11 +932,13 @@ func (c *constrained) holdingFor(ctx context.Context, q DB, v *valuesRead, l Lab
 }
 
 // decidedHolding is a holding decided by a read through a constrained, of the values in asked, or
-// of every one where all.
+// of every one where all, and what its decisions came to, which a decision of more values by the
+// read shares (runs): each is of the change's one request, by the same grants and denies.
 type decidedHolding struct {
 	h     Holding
 	asked map[Permission]bool
 	all   bool
+	runs  *runs
 }
 
 // covers reports whether d decided every value in asked, or where nil, every one.
@@ -950,20 +955,25 @@ func (d *decidedHolding) covers(asked map[Permission]bool) bool {
 }
 
 // decidedBy is the actor's holding decided through c by v of the values in asked, or of every one
-// where nil, deciding each value once for each read however many labels a change checks by it.
+// where nil, deciding each value once for each read however many labels a change checks by it,
+// and a condition that doesn't read the action once for all of them (runs).
 func (c *constrained) decidedBy(ctx context.Context, q DB, v *valuesRead, asked map[Permission]bool) (Holding, error) {
 	d := v.decided[c]
 	if d != nil && d.covers(asked) {
 		return d.h, nil
 	}
+	shared := &runs{}
+	if d != nil {
+		shared = d.runs
+	}
 	h, _, err := c.a.holdingFrom(ctx, q, c.actor, c, v, func(p Permission) bool {
 		return c.a.labelPermission(p) && (asked == nil || asked[p]) && (d == nil || !d.asked[p])
-	})
+	}, shared)
 	if err != nil {
 		return Holding{}, err
 	}
 	if d == nil {
-		d = &decidedHolding{h: h, asked: map[Permission]bool{}}
+		d = &decidedHolding{h: h, asked: map[Permission]bool{}, runs: shared}
 		if v.decided == nil {
 			v.decided = map[*constrained]*decidedHolding{}
 		}
@@ -1167,13 +1177,28 @@ func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []
 	b = b.keepingSets()
 	// Every path holds the tenant's scope, so the read holds what the actor's values are decided by.
 	values := onTenant(tenant, held, ds, b)
+	// And what its grants could give two values of an exclusive dimension of, so that is decided
+	// once for every path, each role's permissions read once: a path's grants below the tenant add
+	// to it only where one is of a role giving such a value, as a role stored for another type and
+	// redefined for the tenant leaves its grants there.
+	var of map[Role][]Permission
+	var excluded map[string]bool
+	if a.exclusive() {
+		of = a.exclusiveOf(b, held)
+		excluded = excludedOf(of, values.held)
+	}
+	tenantKey := TenantRoot(tenant).Key()
 	aus := make([]authority, len(on))
 	for i, r := range on {
 		heldOn := make([]holding, len(heldAt[i]))
 		for j, k := range heldAt[i] {
 			heldOn[j] = held[k]
 		}
-		aus[i] = a.authorityOf(ctx, actor, r, heldOn, deniedOn[i], b)
+		excludedOn := excluded
+		if slices.ContainsFunc(heldOn, func(h holding) bool { return h.scope != tenantKey && len(of[h.Role]) > 0 }) {
+			excludedOn = excludedOf(of, heldOn)
+		}
+		aus[i] = a.authorityOf(ctx, actor, r, heldOn, deniedOn[i], b, excludedOn)
 		aus[i].values = values
 		if len(a.cfg.Constraints) > 0 || len(deniedOn[i]) > 0 {
 			continue
@@ -1214,8 +1239,8 @@ func orDenied(denied, more func(Permission) bool) func(Permission) bool {
 }
 
 // authorityOf is the authority of held grants, their conditions read, under the denies on the
-// path.
-func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource, held []holding, ds []denial, b book) authority {
+// path, where they could give two values of each dimension of excluded (excludedBy).
+func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource, held []holding, ds []denial, b book, excluded map[string]bool) authority {
 	vars := a.vars(ctx, actor, "", on)
 	// The cheapest conditions first, as callers evaluate them in this order, so what a budget run
 	// out decides doesn't rest on ids.
@@ -1268,7 +1293,7 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 	// The values of an exclusive dimension it holds none of, as its grants could give it two, it
 	// can't use or hand on either, as checks refuse it them. Read from its grants on the path, which
 	// hold its tenant's, so a change's recheck in its transaction asks no constraint.
-	if excluded := a.excludedBy(b, held); len(excluded) > 0 {
+	if len(excluded) > 0 {
 		out := func(p Permission) bool { t, ok := a.exclusiveValue(p); return ok && excluded[t] }
 		denied, handsOn = orDenied(denied, out), orDenied(handsOn, out)
 	}
@@ -1277,7 +1302,7 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 		allows: func(h holding, action Permission) bool {
 			return !h.conditional || a.conds.holds(spend(action), h.Condition.Expression, with(vars, action))
 		},
-		denied: denied, handsOn: handsOn, denials: ds, subjects: subjects{},
+		denied: denied, handsOn: handsOn, denials: ds, excluded: excluded, subjects: subjects{},
 	}
 }
 
@@ -1637,7 +1662,7 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]Ro
 	if cs.removes(GrantPermission(r.Type), r.Type) {
 		return nil, cs.failed()
 	}
-	au := a.authorityOf(ctx, s, r, held, ds, b)
+	au := a.authorityOf(ctx, s, r, held, ds, b, a.excludedBy(b, held))
 	custom := slices.SortedFunc(maps.Values(b.custom), func(x, y RoleDefinition) int { return strings.Compare(string(x.ID), string(y.ID)) })
 	au.constrained = cs
 	pw := au.over(r.Type)
