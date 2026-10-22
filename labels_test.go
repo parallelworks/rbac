@@ -1507,7 +1507,9 @@ func TestAChangeCheckingManyLabelsDecidesEachAsACheckOfItAlone(t *testing.T) {
 		func(*rand.Rand) string { return "" },
 		func(*rand.Rand) string { return `request.attributes.mfa == true` },
 		func(*rand.Rand) string { return `request.attributes.mfa == false` },
-		func(rng *rand.Rand) string { return fmt.Sprintf(`action != "comp:c%02d" && request.attributes.mfa == true`, rng.IntN(10)) },
+		func(rng *rand.Rand) string {
+			return fmt.Sprintf(`action != "comp:c%02d" && request.attributes.mfa == true`, rng.IntN(10))
+		},
 		func(rng *rand.Rand) string { return fmt.Sprintf(`action.endsWith("%d")`, rng.IntN(10)) },
 		func(rng *rand.Rand) string { return costly(rng.IntN(30)) },
 		func(rng *rand.Rand) string {
