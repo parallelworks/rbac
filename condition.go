@@ -413,10 +413,7 @@ func (c *conditions) build(expr string) (program, error) {
 // have, as a test plans a loop as another version of CEL may.
 func plan(env *cel.Env, checked *cel.Ast, patterns map[string]uint64, limit uint64, before ...cel.ProgramOption) (cel.Program, error) {
 	s, k := newStepping(checked.NativeRep(), limit), newKeying(env, checked.NativeRep(), limit)
-	str, err := newStringing(env)
-	if err != nil {
-		return nil, err
-	}
+	str := &stringing{env: env}
 	prg, err := env.Program(checked, slices.Concat(before, []cel.ProgramOption{
 		cel.CostLimit(limit), cel.CostTracking(costs{patterns}), cel.OptimizeRegex(matching(patterns)),
 		cel.CustomDecorator(bounded), cel.CustomDecorator(str.decorate), cel.CustomDecoratorV2(s.decorate),
@@ -960,33 +957,34 @@ func inZone(call interpreter.InterpretableCall) interpreter.InterpretableCall {
 // `string(failed / total) == "0.5"` would lift where both are 0.0. It holds the environment's own
 // overloads of string(), each by its id and, by the function's name, the one choosing among them by
 // a value's type, and runs the one a program would: CEL picks one by the type it checked, which a
-// value it checks as of another's type, as `(dyn([true]) + [""])[0]`, needn't have.
-type stringing map[string]*functions.Overload
-
-func newStringing(env *cel.Env) (stringing, error) {
-	s := stringing{}
-	fn, ok := env.Functions()[overloads.TypeConvertString]
-	if !ok {
-		return s, nil
-	}
-	bindings, err := fn.Bindings()
-	if err != nil {
-		return nil, err
-	}
-	for _, o := range bindings {
-		s[o.Operator] = o
-	}
-	return s, nil
+// value it checks as of another's type, as `(dyn([true]) + [""])[0]`, needn't have. It reads them
+// once a program converts a value to a string: reading them copies every function the environment
+// declares, which takes about a tenth as long as planning a short condition.
+type stringing struct {
+	env       *cel.Env
+	overloads map[string]*functions.Overload
 }
 
-func (s stringing) decorate(i interpreter.Interpretable) (interpreter.Interpretable, error) {
+func (s *stringing) decorate(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 	call, ok := i.(interpreter.InterpretableCall)
 	if !ok || call.Function() != overloads.TypeConvertString {
 		return i, nil
 	}
-	impl := s[call.OverloadID()]
+	if s.overloads == nil {
+		s.overloads = map[string]*functions.Overload{}
+		if fn, ok := s.env.Functions()[overloads.TypeConvertString]; ok {
+			bindings, err := fn.Bindings()
+			if err != nil {
+				return nil, err
+			}
+			for _, o := range bindings {
+				s.overloads[o.Operator] = o
+			}
+		}
+	}
+	impl := s.overloads[call.OverloadID()]
 	if impl == nil {
-		impl = s[call.Function()]
+		impl = s.overloads[call.Function()]
 	}
 	// Another version of CEL may bind it otherwise, which this can't run as CEL would.
 	if impl == nil || impl.Unary == nil && impl.Function == nil {
