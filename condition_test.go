@@ -22,6 +22,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/parallelworks/rbac"
 )
@@ -104,7 +105,9 @@ func TestADeclaredDoubleThatIsntFiniteFailsItsConditions(t *testing.T) {
 }
 
 // A condition can make a double that isn't finite of finite ones, dividing by zero or converting
-// "NaN", which CEL orders and equates as false with anything: so comparing one fails too.
+// "NaN", which CEL orders and equates as false with anything: so comparing one fails too, and so
+// do keying a map by one, which CEL finds no key equal to, whatever the map holds, and converting
+// one to a string, which compares as any string does.
 func TestADoubleAConditionMakesThatIsntFiniteFailsWhatComparesIt(t *testing.T) {
 	h := setup(t, func(c *rbac.Config) {
 		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
@@ -114,8 +117,17 @@ func TestADoubleAConditionMakesThatIsntFiniteFailsWhatComparesIt(t *testing.T) {
 	})
 	ctx := t.Context()
 	const ratio = `request.attributes.failed / request.attributes.total`
-	grants := []string{ratio + ` < 0.5`, `!(` + ratio + ` >= 0.5)`, ratio + ` != 1.0`}
-	denies := []string{ratio + ` >= 0.5`, ratio + ` == 1.0`, `double(request.attributes.score) >= 0.5`}
+	keyed := `{` + ratio + `: 1}`
+	grants := []string{
+		ratio + ` < 0.5`, `!(` + ratio + ` >= 0.5)`, ratio + ` != 1.0`,
+		keyed + ` != {0.5: 1}`, `[` + keyed + `] != [{0.5: 1}]`, `!(0.5 in ` + keyed + `)`,
+		`[` + ratio + `].all(r, {r: 1} != {0.5: 1})`, `string(` + ratio + `) != "0.5"`,
+	}
+	denies := []string{
+		ratio + ` >= 0.5`, ratio + ` == 1.0`, `double(request.attributes.score) >= 0.5`,
+		keyed + ` == {0.5: 1}`, `{0.5: 1} == ` + keyed, `0.5 in {double(request.attributes.score): 1}`,
+		`[` + ratio + `].exists(r, {r: 1} == {0.5: 1})`, `string(double(request.attributes.score)) == "0.5"`,
+	}
 	seeded := []rbac.Grant{grant(cluster.Scope(), "guard", rbac.User, "guardian")}
 	for i, expr := range grants {
 		g := grant(cluster.Scope(), "cluster.login", rbac.User, fmt.Sprint("u", i))
@@ -141,7 +153,7 @@ func TestADoubleAConditionMakesThatIsntFiniteFailsWhatComparesIt(t *testing.T) {
 		return err == nil
 	}
 	finite := map[string]any{"failed": 0.0, "total": 1.0, "score": "0.1"}
-	for i := range 3 {
+	for i := range grants {
 		if !is(fmt.Sprint("u", i), finite) || !is(fmt.Sprint("v", i), finite) {
 			t.Fatalf("finite doubles: %s, %s", grants[i], denies[i])
 		}
@@ -151,13 +163,65 @@ func TestADoubleAConditionMakesThatIsntFiniteFailsWhatComparesIt(t *testing.T) {
 		"infinity":  {"failed": 1.0, "total": 0.0, "score": "inf"},
 		"-infinity": {"failed": -1.0, "total": 0.0, "score": "-inf"},
 	} {
-		for i := range 3 {
+		for i := range grants {
 			if is(fmt.Sprint("u", i), request) {
 				t.Errorf("a grant's condition %s held for %s", grants[i], name)
 			}
 			if is(fmt.Sprint("v", i), request) {
 				t.Errorf("a deny's condition %s was lifted for %s", denies[i], name)
 			}
+		}
+	}
+}
+
+// A map the host passes can be keyed by a double that isn't finite, a key no condition computes:
+// comparing one keyed by NaN decided it equal to no map, and looking up its infinite key by one a
+// condition reads found it, where `in` fails.
+func TestAMapTheHostPassesKeyedByADoubleThatIsntFiniteFailsWhatComparesOrIndexesIt(t *testing.T) {
+	attributes := map[string]any{
+		"nan": map[float64]any{math.NaN(): 1}, "inf": map[float64]any{math.Inf(1): 1}, "y": math.Inf(1),
+		"finite": map[float64]any{0.5: 1}, "half": 0.5,
+	}
+	for _, expr := range []string{
+		`request.attributes.nan != {0.5: 1}`, `{0.5: 1} != request.attributes.nan`, `[request.attributes.nan] != [{0.5: 1}]`,
+		`request.attributes.inf == request.attributes.inf`, `request.attributes.inf[request.attributes.y] == 1`,
+		`[request.attributes.y].all(r, request.attributes.inf[r] == 1)`,
+	} {
+		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || evaluated {
+			t.Errorf("%s: evaluated %t, %v", expr, evaluated, err)
+		}
+	}
+	for _, expr := range []string{`request.attributes.finite == {0.5: 1}`, `request.attributes.finite[request.attributes.half] == 1`} {
+		if held, _, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || !held {
+			t.Errorf("%s: held %t, %v", expr, held, err)
+		}
+	}
+}
+
+// A host can pass an optional value, which CEL compares by its own comparison of what it holds:
+// one holding NaN compared as unequal to any, and one holding a long list was read whole, charged
+// as a single value.
+func TestAnOptionalTheHostPassesComparesAsWhatItHolds(t *testing.T) {
+	attributes := map[string]any{
+		"nan": types.OptionalOf(types.Double(math.NaN())), "half": types.OptionalOf(types.Double(0.5)),
+		"long":  types.OptionalOf(types.DefaultTypeAdapter.NativeToValue(make([]string, 100000))),
+		"keyed": types.OptionalOf(types.DefaultTypeAdapter.NativeToValue(map[string]any{strings.Repeat("k", 100): 1})),
+		"none":  types.OptionalNone,
+	}
+	for _, expr := range []string{
+		`request.attributes.nan != request.attributes.half`, `[request.attributes.nan] != [request.attributes.half]`,
+		`request.attributes.long == request.attributes.long`,
+	} {
+		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || evaluated {
+			t.Errorf("%s: evaluated %t, %v", expr, evaluated, err)
+		}
+	}
+	for _, expr := range []string{
+		`request.attributes.half == request.attributes.half`, `request.attributes.keyed == request.attributes.keyed`,
+		`request.attributes.none != request.attributes.half`,
+	} {
+		if held, _, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || !held {
+			t.Errorf("%s: held %t, %v", expr, held, err)
 		}
 	}
 }
@@ -1132,6 +1196,88 @@ func TestComparingMapsDecidesAsCELDoes(t *testing.T) {
 	}
 }
 
+// Converting a finite value to a string, comparing optional values the host passes and comparing
+// maps keyed by numbers of different types decide as CEL does. A conversion ran CEL's own for the
+// Go type of the value, not the overload CEL picks by the type it checked, which a value CEL
+// checks as of another's type needn't have: converting `(dyn([true]) + [""])[0]` made "true" where
+// CEL's conversion fails, and a grant's `!=` held.
+func TestFiniteValuesDecideAsCELDoes(t *testing.T) {
+	env, err := cel.NewEnv(cel.Variable("request", cel.MapType(cel.StringType, cel.DynType)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	celEval := func(expr string, attributes map[string]any) (ref.Val, error) {
+		checked, iss := env.Compile(expr)
+		if iss.Err() != nil {
+			t.Fatal(iss.Err())
+		}
+		prg, err := env.Program(checked)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, _, err := prg.Eval(map[string]any{"request": map[string]any{"attributes": attributes}})
+		return out, err
+	}
+	decides := func(expr string, attributes map[string]any) {
+		t.Helper()
+		out, err := celEval(expr, attributes)
+		held, evaluated, _, rerr := rbac.EvaluateCondition(t, expr, attributes)
+		if rerr != nil {
+			t.Fatalf("%s: %v", expr, rerr)
+		}
+		if evaluated != (err == nil) || evaluated && held != out.Value() {
+			t.Errorf("%s: held %t, evaluated %t; CEL decides %v, %v", expr, held, evaluated, out, err)
+		}
+	}
+	strs := map[string]any{
+		"string": "a", "bytes": []byte("a"), "invalid UTF-8": []byte{0xff}, "bool": true, "int": -1, "uint": uint(1),
+		"double": 0.5, "negative zero": math.Copysign(0, -1), "large double": 1e300,
+		"timestamp": time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC), "duration": 90 * time.Minute, "null": nil,
+		"type": types.IntType, "optional": types.OptionalOf(types.String("a")), "list": []any{"a"}, "map": map[string]any{"a": "a"},
+		"string wrapper": wrapperspb.String("a"), "double wrapper": wrapperspb.Double(0.5), "bytes wrapper": wrapperspb.Bytes([]byte("a")),
+		"JSON string": structpb.NewStringValue("a"), "JSON number": structpb.NewNumberValue(0.5), "JSON number text": json.Number("1.5"),
+	}
+	for name, v := range strs {
+		for _, of := range []string{
+			"%s", "dyn(%s)", `(dyn([%s]) + [""])[0]`, `(dyn([%s]) + [b""])[0]`, `(dyn([%s]) + [true])[0]`, `(dyn([%s]) + [1])[0]`,
+			`(dyn([%s]) + [1u])[0]`, `(dyn([%s]) + [1.0])[0]`, `(dyn([%s]) + [duration("1s")])[0]`, `(dyn([%s]) + [timestamp(0)])[0]`,
+		} {
+			conversion := "string(" + fmt.Sprintf(of, "request.attributes.v") + ")"
+			attributes := map[string]any{"v": v, "want": ""}
+			if s, err := celEval(conversion, attributes); err == nil {
+				attributes["want"] = s.Value()
+			}
+			for _, op := range []string{" == ", " != "} {
+				decides(conversion+op+"request.attributes.want", attributes)
+			}
+		}
+		if t.Failed() {
+			t.Fatalf("converting a %s", name)
+		}
+	}
+	values := map[string]any{
+		"none": types.OptionalNone, "1": types.OptionalOf(types.Int(1)), "1u": types.OptionalOf(types.Uint(1)),
+		"1.0": types.OptionalOf(types.Double(1)), "2": types.OptionalOf(types.Int(2)), "null": types.OptionalOf(types.NullValue),
+		"[1]":  types.OptionalOf(types.NewDynamicList(types.DefaultTypeAdapter, []any{1})),
+		"[1u]": types.OptionalOf(types.NewDynamicList(types.DefaultTypeAdapter, []any{uint(1)})),
+		"of 1": types.OptionalOf(types.OptionalOf(types.Int(1))), "of 1u": types.OptionalOf(types.OptionalOf(types.Uint(1))),
+		"bare 1": 1, "bare null": nil,
+		"{1}": map[int64]any{1: "a"}, "{1u}": map[uint64]any{1: "a"}, "{1.0}": map[float64]any{1: "a"},
+		"{1, 2u}": map[any]any{int64(1): "a", uint64(2): "a"}, "{1.0, 2.0}": map[float64]any{1: "a", 2: "a"},
+	}
+	for x := range values {
+		for y := range values {
+			for _, of := range []string{"%s == %s", "%s in [%s]"} {
+				decides(fmt.Sprintf(of, "request.attributes.x", "request.attributes.y"), map[string]any{"x": values[x], "y": values[y]})
+			}
+		}
+		for _, literal := range []string{`{1: "a"}`, `{1u: "a"}`, `{1.0: "a"}`, `{1: "a", 2u: "a"}`, `{1.0: "a", 2.0: "a"}`} {
+			decides("request.attributes.x == "+literal, map[string]any{"x": values[x]})
+			decides(literal+" == request.attributes.x", map[string]any{"x": values[x]})
+		}
+	}
+}
+
 // iterated counts the elements a loop over a list takes.
 type iterated struct {
 	traits.Lister
@@ -1207,6 +1353,47 @@ func TestAKeyPlannedOtherwiseIsNoCondition(t *testing.T) {
 		}
 		if err := rbac.PlanKeysOtherwise(t, expr, func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return i }); err != nil {
 			t.Errorf("%s planned as CEL plans it: %v", expr, err)
+		}
+	}
+}
+
+// A key folded into a double that isn't finite, as another version of CEL may fold one, isn't a
+// condition: no key it computes is left to fail.
+func TestAKeyFoldedIntoADoubleThatIsntFiniteIsNoCondition(t *testing.T) {
+	fold := func(i interpreter.InterpretableV2) interpreter.InterpretableV2 {
+		return interpreter.NewConstValue(i.ID(), i.Eval(interpreter.EmptyActivation()))
+	}
+	for expr, isCondition := range map[string]bool{
+		`{0.0 / 0.0: 1} != {0.5: 1}`: false, `{1.0 / 0.0: 1} != {0.5: 1}`: false, `{1.0 / 2.0: 1} == {0.5: 1}`: true,
+	} {
+		if err := rbac.PlanKeysOtherwise(t, expr, fold); (err == nil) != isCondition {
+			t.Errorf("%s with its key folded: %v", expr, err)
+		}
+	}
+}
+
+// A conversion to a string where string() has no binding a program can find, as another version of
+// CEL may bind one only once it runs, isn't a condition: it would convert a double that isn't finite
+// unchecked.
+func TestAConversionToAStringBoundOtherwiseIsNoCondition(t *testing.T) {
+	declared := func(opts ...cel.OverloadOpt) *cel.Env {
+		env, err := cel.NewCustomEnv(cel.Variable("x", cel.DoubleType),
+			cel.Function("string", cel.Overload("double_to_string", []*cel.Type{cel.DoubleType}, cel.StringType, opts...)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return env
+	}
+	converts := cel.UnaryBinding(func(v ref.Val) ref.Val { return v.ConvertToType(types.StringType) })
+	for how, c := range map[string]struct {
+		env         *cel.Env
+		isCondition bool
+	}{
+		"unbound": {declared(), false}, "bound once it runs": {declared(cel.LateFunctionBinding()), false},
+		"bound": {declared(converts), true},
+	} {
+		if err := rbac.PlanIn(t, c.env, `string(x)`); (err == nil) != c.isCondition {
+			t.Errorf("string() %s: %v", how, err)
 		}
 	}
 }

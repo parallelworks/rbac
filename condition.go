@@ -16,6 +16,7 @@ import (
 	"cel.dev/cel-go/cel"
 	"cel.dev/cel-go/common/ast"
 	"cel.dev/cel-go/common/cost"
+	"cel.dev/cel-go/common/functions"
 	"cel.dev/cel-go/common/operators"
 	"cel.dev/cel-go/common/overloads"
 	"cel.dev/cel-go/common/types"
@@ -35,12 +36,14 @@ import (
 // such as `request.time < timestamp("2027-01-01T00:00:00Z") && resource.attributes.env != "prod"`.
 // A grant with one gives its role only where the expression is true. An expression that fails, as
 // one reading an attribute the host didn't pass does, or comparing a double that isn't finite, as
-// dividing by zero makes, is false. A label value and a power to release are decided on the tenant
-// with no attributes, whatever a check passes (Holding), and their conditions can't read the
-// tenant's: any read of resource.attributes fails, a test of an attribute's presence, in, size(), a
-// macro and a comparison included, so a grant's gives nothing and a deny's applies. The zero
-// Condition is none, and one with a title or description has an expression. A pattern it matches is
-// a string literal, of bounded size; it nests at most 32 deep; it builds no message, as
+// dividing by zero makes, converting one to a string, keying a map by one or comparing a map keyed
+// by one with another of as many entries, is false, though `in` a map the host passes keyed by one
+// is false for a key it doesn't hold (Attributes). A label value and a power to release are decided
+// on the tenant with no attributes, whatever a check passes (Holding), and their conditions can't
+// read the tenant's: any read of resource.attributes fails, a test of an attribute's presence, in,
+// size(), a macro and a comparison included, so a grant's gives nothing and a deny's applies. The
+// zero Condition is none, and one with a title or description has an expression. A pattern it
+// matches is a string literal, of bounded size; it nests at most 32 deep; it builds no message, as
 // `google.protobuf.Struct{}`; and a comparison, or a search of a list, that would read more than a
 // condition may spend, or reading a time in a zone whose name is longer than 64 bytes, fails before
 // it runs.
@@ -410,9 +413,11 @@ func (c *conditions) build(expr string) (program, error) {
 // have, as a test plans a loop as another version of CEL may.
 func plan(env *cel.Env, checked *cel.Ast, patterns map[string]uint64, limit uint64, before ...cel.ProgramOption) (cel.Program, error) {
 	s, k := newStepping(checked.NativeRep(), limit), newKeying(env, checked.NativeRep(), limit)
+	str := &stringing{env: env}
 	prg, err := env.Program(checked, slices.Concat(before, []cel.ProgramOption{
 		cel.CostLimit(limit), cel.CostTracking(costs{patterns}), cel.OptimizeRegex(matching(patterns)),
-		cel.CustomDecorator(bounded), cel.CustomDecoratorV2(s.decorate), cel.CustomDecoratorV2(k.decorate),
+		cel.CustomDecorator(bounded), cel.CustomDecorator(str.decorate), cel.CustomDecoratorV2(s.decorate),
+		cel.CustomDecoratorV2(k.decorate),
 	})...)
 	if err != nil {
 		return nil, err
@@ -947,6 +952,58 @@ func inZone(call interpreter.InterpretableCall) interpreter.InterpretableCall {
 	})
 }
 
+// stringing converts a value to a string as CEL does, failing for a double that isn't finite, as
+// int() and uint() of one do: "NaN" compares as any string does, so a deny's
+// `string(failed / total) == "0.5"` would lift where both are 0.0. It holds the environment's own
+// overloads of string(), each by its id and, by the function's name, the one choosing among them by
+// a value's type, and runs the one a program would: CEL picks one by the type it checked, which a
+// value it checks as of another's type, as `(dyn([true]) + [""])[0]`, needn't have. It reads them
+// once a program converts a value to a string: reading them copies every function the environment
+// declares, which takes about a tenth as long as planning a short condition.
+type stringing struct {
+	env       *cel.Env
+	overloads map[string]*functions.Overload
+}
+
+func (s *stringing) decorate(i interpreter.Interpretable) (interpreter.Interpretable, error) {
+	call, ok := i.(interpreter.InterpretableCall)
+	if !ok || call.Function() != overloads.TypeConvertString {
+		return i, nil
+	}
+	if s.overloads == nil {
+		s.overloads = map[string]*functions.Overload{}
+		if fn, ok := s.env.Functions()[overloads.TypeConvertString]; ok {
+			bindings, err := fn.Bindings()
+			if err != nil {
+				return nil, err
+			}
+			for _, o := range bindings {
+				s.overloads[o.Operator] = o
+			}
+		}
+	}
+	impl := s.overloads[call.OverloadID()]
+	if impl == nil {
+		impl = s.overloads[call.Function()]
+	}
+	// Another version of CEL may bind it otherwise, which this can't run as CEL would.
+	if impl == nil || impl.Unary == nil && impl.Function == nil {
+		return nil, errors.New("a conversion to a string is planned where this package can't check it")
+	}
+	return interpreter.NewCall(call.ID(), call.Function(), call.OverloadID(), call.Args(), func(args ...ref.Val) ref.Val {
+		if len(args) != 1 {
+			return types.NoSuchOverloadErr()
+		}
+		if nonFinite(args[0]) {
+			return types.NewErr("rbac: a double that isn't finite can't be converted to a string")
+		}
+		if impl.Unary != nil {
+			return impl.Unary(args[0])
+		}
+		return impl.Function(args...)
+	}), nil
+}
+
 // timePart reports whether function reads a part of a time, in a zone where it is given one.
 func timePart(function string) bool {
 	switch function {
@@ -1079,7 +1136,8 @@ func (*counting) Parent() interpreter.Activation { return nil }
 // literal of it does, by its length: the map hashes it whole, which CEL charges as 1 however long
 // it is, so a loop looking up a long string the host passes would take time growing with its
 // length, charged only for the steps. Each costs a tenth of its bytes more, as reading it does
-// (textSize), counted beside the steps (counting).
+// (textSize), counted beside the steps (counting). A double that isn't finite fails as a key
+// (finiteKey).
 type keying struct {
 	// keys are the ids of the keys checked computes, and planned what CEL planned each as last,
 	// which is what it reads: it plans an index whose key isn't an attribute as an attribute under
@@ -1141,6 +1199,10 @@ func (k *keying) decorate(i interpreter.InterpretableV2) (interpreter.Interpreta
 	planned := i
 	switch i := i.(type) {
 	case interpreter.InterpretableConst:
+		// Another version of CEL may fold a key, as `0.0 / 0.0`, which finiteKey wouldn't see.
+		if nonFinite(i.Value()) {
+			return nil, errors.New("a key is a double that isn't finite")
+		}
 	case interpreter.InterpretableAttribute:
 		planned = &keyedAttribute{InterpretableAttribute: i, k: k}
 	case interpreter.InterpretableCall:
@@ -1198,7 +1260,7 @@ func (a *keyedAttribute) Exec(frame *interpreter.ExecutionFrame) ref.Val {
 	}
 	key := a.Adapter().NativeToValue(v)
 	a.k.charge(frame, a, key)
-	return key
+	return finiteKey(key)
 }
 
 func (a *keyedAttribute) Eval(vars interpreter.Activation) ref.Val {
@@ -1232,7 +1294,32 @@ func (a *keyedAttribute) qualifier(vars interpreter.Activation) (interpreter.Qua
 		return nil, err
 	}
 	a.k.charge(vars, a, v)
+	// An index never runs the key, so finiteKey doesn't see it: a map the host passes would find
+	// an infinite key, where `in` refuses one. CEL indexes by a double only for these, and
+	// converting any other again would parse a JSON attribute a second time.
+	switch d := v.(type) {
+	case float32, float64, types.Double:
+		if nonFinite(a.Adapter().NativeToValue(d)) {
+			return nil, errNonFiniteKey
+		}
+	}
 	return a.k.fac.NewQualifier(nil, attr.ID(), v, attr.IsOptional())
+}
+
+var errNonFiniteKey = errors.New("rbac: a double that isn't finite can't be a key")
+
+// finiteKey is key, failing for a double that isn't finite, as comparing one does (nonFinite): CEL
+// finds no key equal to NaN, so a map keyed by one would equal no map and hold no value, and a
+// deny's `{failed / total: 1} == {0.5: 1}` would lift where both are 0.0. A condition computes
+// every key it can make one of, since none is written. A map the host passes can be keyed by one:
+// comparing it with a map of as many entries fails (equal), as does indexing it by one
+// (qualifier), but a key not found `in` it is false, as finding whether it holds one that isn't
+// finite would read every key, uncharged.
+func finiteKey(key ref.Val) ref.Val {
+	if nonFinite(key) {
+		return types.WrapErr(errNonFiniteKey)
+	}
+	return key
 }
 
 // keyedCall is a key CEL plans as a call, charged once it has run.
@@ -1244,7 +1331,7 @@ type keyedCall struct {
 func (c *keyedCall) Exec(frame *interpreter.ExecutionFrame) ref.Val {
 	v := c.InterpretableCall.Exec(frame)
 	c.k.charge(frame, c, v)
-	return v
+	return finiteKey(v)
 }
 
 func (c *keyedCall) Eval(vars interpreter.Activation) ref.Val {
@@ -1290,6 +1377,16 @@ func incomparable() ref.Val {
 	return types.NewErr("rbac: a double that isn't finite can't be compared")
 }
 
+// nonFiniteKey reports whether m holds a key that is a double that isn't finite.
+func nonFiniteKey(m traits.Mapper) bool {
+	for it := m.Iterator(); it.HasNext() == types.True; {
+		if nonFinite(it.Next()) {
+			return true
+		}
+	}
+	return false
+}
+
 // equal is x == y, failing where comparing values a map or list holds fails, as reading a
 // declared attribute passed as another type does: CEL's own comparison of maps and lists counts
 // such a value as equal, so that a map holding one would equal any map with its keys. It finds the
@@ -1320,10 +1417,23 @@ func equal(x, y ref.Val, read uint64) ref.Val {
 		return eq != types.False
 	}
 	switch xs := x.(type) {
+	case *types.Optional:
+		// A host can pass one, which CEL compares by its own comparison of what it holds.
+		ys, ok := y.(*types.Optional)
+		if !ok || !xs.HasValue() || !ys.HasValue() {
+			return types.Equal(x, y)
+		}
+		return equal(xs.GetValue(), ys.GetValue(), read)
 	case traits.Mapper:
 		ys, ok := y.(traits.Mapper)
 		if !ok || xs.Size() != ys.Size() {
 			return types.Equal(x, y)
+		}
+		// A map the host passes can be keyed by one, which finiteKey doesn't see, and no key is found
+		// equal to NaN, so it would equal no map. Comparing is charged for each key of either, as
+		// they hold as many.
+		if nonFiniteKey(xs) || nonFiniteKey(ys) {
+			return incomparable()
 		}
 		for it := xs.Iterator(); it.HasNext() == types.True; {
 			k := it.Next()
@@ -1395,6 +1505,11 @@ func smaller(x, y ref.Val, limit uint64) uint64 {
 func valueSize(v ref.Val, limit uint64) uint64 {
 	n := textSize(v)
 	switch v := v.(type) {
+	case *types.Optional:
+		// One a host passes, which CEL compares by what it holds, whole.
+		if v.HasValue() && n <= limit {
+			n += valueSize(v.GetValue(), limit-n)
+		}
 	case traits.Mapper:
 		// Each entry is at least a key and a value.
 		if least := n + 2*count(v); least > limit {
