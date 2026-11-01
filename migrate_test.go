@@ -101,14 +101,10 @@ func TestMigratingSeveralLocksEachAsItWouldAlone(t *testing.T) {
 				scope := rbac.Scope{Type: "cluster", ID: fmt.Sprintf("k%d", fired)}
 				fired++
 				go func() { done <- c.write(context.WithoutCancel(ctx), h, scope) }()
+				// One result in wrote for each change, however the wait for it ends, as one is read for each.
+				defer func() { go func() { wrote <- <-done }() }()
 				// Until the change has written, or waits for a lock, as for history a migration holds.
-				for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
-					select {
-					case err := <-done:
-						wrote <- err
-						return
-					default:
-					}
+				for deadline := time.Now().Add(10 * time.Second); len(done) == 0; time.Sleep(time.Millisecond) {
 					var waiting bool
 					if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
 						WHERE NOT l.granted AND c.relnamespace = current_schema()::regnamespace)`).Scan(&waiting); err != nil {
@@ -116,7 +112,6 @@ func TestMigratingSeveralLocksEachAsItWouldAlone(t *testing.T) {
 						return
 					}
 					if waiting {
-						go func() { wrote <- <-done }()
 						return
 					}
 					if time.Now().After(deadline) {
@@ -277,6 +272,15 @@ func historyToVacuum(t *testing.T, pool *pgxpool.Pool) {
 func TestMigrateWaitsForPostgreSQLToCancelAutovacuum(t *testing.T) {
 	ctx := t.Context()
 	r := newReadmeRoles(t)
+	var on bool
+	var naptime int64
+	if err := r.super.QueryRow(ctx, `SELECT current_setting('autovacuum')::bool AND current_setting('track_counts')::bool,
+		(SELECT setting::bigint FROM pg_settings WHERE name = 'autovacuum_naptime')`).Scan(&on, &naptime); err != nil {
+		t.Fatal(err)
+	}
+	if !on {
+		t.Skip("autovacuum is off")
+	}
 	historyToVacuum(t, r.adminPool)
 	// Table-level settings alone: autovacuum vacuums history for the records inserted, slowly, and
 	// doesn't analyze it.
@@ -285,8 +289,10 @@ func TestMigrateWaitsForPostgreSQLToCancelAutovacuum(t *testing.T) {
 		autovacuum_analyze_threshold = 1000000000)`); err != nil {
 		t.Fatal(err)
 	}
+	// The launcher starts a worker in the database once each naptime, which can be busy with other
+	// tables first.
 	var pid int
-	for deadline := time.Now().Add(5 * time.Minute); ; time.Sleep(200 * time.Millisecond) {
+	for deadline := time.Now().Add(2*time.Duration(naptime)*time.Second + 30*time.Second); ; time.Sleep(200 * time.Millisecond) {
 		err := r.super.QueryRow(ctx, `SELECT pid FROM pg_stat_activity WHERE backend_type = 'autovacuum worker'
 			AND query LIKE '%' || $1 || '.rbac_history%'`, r.schema).Scan(&pid)
 		if err == nil {
@@ -322,6 +328,11 @@ func TestMigrateDoesntWaitOutAClientsVacuum(t *testing.T) {
 	ctx := t.Context()
 	pool := pgtest.Open(t, "")
 	historyToVacuum(t, pool)
+	// So no autovacuum worker on the tables just filled has Migrate wait past deadlock_timeout.
+	if _, err := pool.Exec(ctx, `ALTER TABLE rbac_grants SET (autovacuum_enabled = off);
+		ALTER TABLE rbac_history SET (autovacuum_enabled = off)`); err != nil {
+		t.Fatal(err)
+	}
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		t.Fatal(err)
