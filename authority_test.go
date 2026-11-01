@@ -2078,7 +2078,7 @@ func TestARemovalReadsAScopeTheHostNoLongerHasAsUnlabeled(t *testing.T) {
 	}
 	gone, down := rbac.Scope{Type: "cluster", ID: "gone"}, rbac.Scope{Type: "cluster", ID: "down"}
 	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "tenant.roles", rbac.User, "admin"),
-		grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "admin"),
+		grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "cluster.sudo", rbac.User, "admin"),
 		grant(gone, "cluster.login", rbac.Group, "crew"), grant(secret.Scope(), "cluster.login", rbac.Group, "crew"),
 		grant(down, "cluster.login", rbac.Group, "ops"), grant(gone, "custom.viewer", rbac.User, "u"), grant(gone, "custom.ops", rbac.User, "u"))
 	h.join(t, "u", "v")
@@ -2108,9 +2108,15 @@ func TestARemovalReadsAScopeTheHostNoLongerHasAsUnlabeled(t *testing.T) {
 	if err := h.authz.SetRole(ctx, admin, "t1", ops); !errors.Is(err, rbac.ErrNotFound) {
 		t.Errorf("widening it: %v", err)
 	}
-	// Narrowed so that it is no longer privileged, a role gives the members' grant there what it
-	// gives then, so the host must read the scope for that too.
-	priv := rbac.RoleDefinition{ID: "custom.priv", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	// Widened while it is privileged, a role gives the members' grant there nothing, but a catalog
+	// change that has it no longer be privileged gives them what it gives then, and asks no one, so
+	// the host must read the scope for that too; and narrowed so that it is no longer privileged, it
+	// gives them what it gives then.
+	priv := rbac.RoleDefinition{ID: "custom.priv", Permissions: []rbac.Permission{view, login, root}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(ctx, admin, "t1", priv); !errors.Is(err, rbac.ErrNotFound) {
+		t.Errorf("widening a privileged role the members hold there: %v", err)
+	}
+	priv.Permissions = []rbac.Permission{view}
 	if err := h.authz.SetRole(ctx, admin, "t1", priv); !errors.Is(err, rbac.ErrNotFound) {
 		t.Errorf("narrowing a role the members hold there so that it is no longer privileged: %v", err)
 	}

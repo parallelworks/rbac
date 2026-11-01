@@ -7656,6 +7656,43 @@ func TestADenySetWhileANarrowingTheMembersGainByWaitsStopsIt(t *testing.T) {
 	}
 }
 
+// A grant to the tenant's members of a privileged role gives nothing, but a catalog change that has
+// the role no longer be privileged gives them what it gives then, and asks no one: so a deny on the
+// workspace that grant is on, which keeps x from handing on login there, stops x widening the role
+// to give login, as it would were the role not privileged, and the members never log in there.
+func TestADenyWhereTheMembersHoldAPrivilegedRoleStopsWideningIt(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	x, _ := definer(t, h)
+	member := h.as(t, "m")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.op', '{cluster:view,cluster:root}', '{cluster}');
+		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'workspace', 'w1', 'members', 't1', 'custom.op')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.SetDeny(ctx, guardian, workspace, rbac.Deny{ID: "no-login", Permissions: []rbac.Permission{login}, Principals: []rbac.Principal{x.Principal}}); err != nil {
+		t.Fatal(err)
+	}
+	wider := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view, login, root}, ResourceTypes: []string{"cluster"}}
+	var denied *rbac.DeniedError
+	if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.As(err, &denied) || denied.Scope != workspace.Scope() || denied.Permission != login {
+		t.Fatalf("widening a privileged role the members hold under the deny: %v", err)
+	}
+	cfg := h.cfg
+	cfg.Catalog = slices.Clone(cfg.Catalog)
+	for i, r := range cfg.Catalog {
+		if r.ID == "cluster.sudo" {
+			cfg.Catalog[i].Privileged = false
+		}
+	}
+	authz, err := rbac.New(h.pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := authz.Authorize(ctx, member, login, cluster); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("a member logs in under the deny once the catalog has the role no longer be privileged: %v", err)
+	}
+}
+
 // A deny on a container, or on the resource itself, that removes x's power to change grants there
 // stops x changing what a role granted there gives, or revoking it by deleting the role, as it
 // stops Apply there.

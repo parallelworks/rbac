@@ -366,15 +366,16 @@ func canonical(r RoleDefinition) RoleDefinition {
 // its grants on scopes of types it is no longer for, or a deny that removes the actor's power to
 // change them there or on the path of a scope they are on, stops it, as it stops DeleteRole and
 // Apply there; so does, where they will give more, as a grant to the tenant's members does once
-// the role is no longer privileged, however it was narrowed, a deny on that path that removes a
-// permission the role gives, which the actor would hand on there. Renaming it or rewriting its
-// description changes no grant, so needs only the power to define it: a role's name and
-// description are part of its definition, not of the data its grants are on. The scopes are as
-// Config.ResourceOf gives them. A role another change redefined or created while this one waited
-// for the tenant is refused, to be tried again: the constraints were asked about it as it was, as
-// is one granted meanwhile on a scope of a type they weren't asked about, or, it or a role listing
-// it, on a scope the host wasn't asked about. One deleted meanwhile is created, as its grants went
-// with it.
+// the role is no longer privileged, however it was narrowed, or would, as one to them of a
+// privileged role does once a catalog change has it no longer be, which asks no one, a deny on
+// that path that removes a permission the role gives, which the actor would hand on there.
+// Renaming it or rewriting its description changes no grant, so needs only the power to define
+// it: a role's name and description are part of its definition, not of the data its grants are
+// on. The scopes are as Config.ResourceOf gives them. A role another change redefined or created
+// while this one waited for the tenant is refused, to be tried again: the constraints were asked
+// about it as it was, as is one granted meanwhile on a scope of a type they weren't asked about,
+// or, it or a role listing it, on a scope the host wasn't asked about. One deleted meanwhile is
+// created, as its grants went with it.
 //
 // Redefining a role so that its grants give more, or so that it becomes privileged, changes what
 // grants already made give: Config.ValidateGrant is asked about each of its grants and
@@ -729,6 +730,14 @@ func (w widenedTo) of(p Principal) bool {
 // any reports whether it widens a grant to any principal.
 func (w widenedTo) any() bool { return w[""] || w[Members] || w[Public] }
 
+// reaches reports whether the denies on the scope of a grant to a principal of kind, "" for one
+// named one by one, are checked against the role as it will be: where the grant widens, and, for
+// one to the tenant's members, where one to a principal named one by one does. A catalog change
+// that has a privileged role no longer be gives them what it gives, what the redefinition added
+// too, and asks no one, as a host declaring a kind does of a grant to it. One to the public of a
+// role not marked Public gives nothing until a redefinition makes it Public, which checks it then.
+func (w widenedTo) reaches(kind PrincipalKind) bool { return w[kind] || kind == Members && w[""] }
+
 // givesThrough reports whether a grant of a role defined as def to p gives anything, as checks read
 // it (holding.carries): one to the tenant's members or the public gives nothing of a privileged
 // role, nor one to the public of a role not marked Public.
@@ -902,8 +911,9 @@ type roleReach struct {
 }
 
 // reached are the scopes a change to a custom role reaches: those its grants and eligibilities are
-// on, own, of which widened are those where one of them will give more (redefinition.widensTo),
-// and where the role will give more, those of the roles whose holders may grant it as it will be
+// on, own, of which widened are those where one of them will give more (redefinition.widensTo), or
+// would once a change that asks no one has it give what the role gives (widenedTo.reaches), and
+// where the role will give more, those of the roles whose holders may grant it as it will be
 // without holding it (handingOn), listed, each with the types of scope the grants there let them
 // grant it on.
 type reached struct {
@@ -954,7 +964,7 @@ func (a *Authorizer) reachedBy(ctx context.Context, q DB, tenant string, id Role
 			if n := len(r.own); n == 0 || r.own[n-1] != s.Scope {
 				r.own = append(r.own, s.Scope)
 			}
-			if w.of(Principal{Kind: s.broad}) && widenOn[s.Type] {
+			if w.reaches(s.broad) && widenOn[s.Type] {
 				r.widened[s.Scope] = true
 			}
 			continue
@@ -1035,19 +1045,20 @@ func (a *Authorizer) handingOn(custom map[Role]RoleDefinition, id Role, def Role
 // tenant, removes its power to change grants on scopes of a type they can be on, as the role is for
 // types, or are on, as narrowing it leaves them on scopes of types it is no longer for; on a scope
 // they are on, as Config.ResourceOf gives it, where a deny on its path removes the actor's power to
-// change grants there or, where d redefines the role so that one of them gives more there
-// (redefinition.widensTo), a permission it gives as it will be, or where its label refuses the
-// actor (labelsHeld). Where the role will give more to whomever it is granted, it refuses too where
-// a deny on the path of a scope a role whose holders may grant it without holding it is granted on
-// (handingOn) keeps the actor from granting it there as it will be, as they then may
-// (scopesDenied), or where that scope's label refuses the actor. Only a deny on a scope other than
-// the tenant can remove more there than the tenant's, which mayDefine and changesDenied check, so
-// only where one binds the actor, or a label could refuse it, as none can where the actor's label
-// values satisfy every label, is the host asked about the scopes. Where none of the grants and
-// eligibilities on a scope will give more, as for deleting or narrowing the role, which there only
-// takes access away, and no role listing it is granted there to hand it on, a scope the host no
-// longer has (ErrNotFound) is read as stored, with no containers or label. au is the actor's
-// authority on the tenant, which mayDefine checked the role on.
+// change grants there or, where d redefines the role so that one of them gives more there, or would
+// once a change that asks no one has it give what the role gives (widenedTo.reaches), a permission
+// it gives as it will be, or where its label refuses the actor (labelsHeld). Where the role will
+// give more to whomever it is granted, it refuses too where a deny on the path of a scope a role
+// whose holders may grant it without holding it is granted on (handingOn) keeps the actor from
+// granting it there as it will be, as they then may (scopesDenied), or where that scope's label
+// refuses the actor. Only a deny on a scope other than the tenant can remove more there than the
+// tenant's, which mayDefine and changesDenied check, so only where one binds the actor, or a label
+// could refuse it, as none can where the actor's label values satisfy every label, is the host
+// asked about the scopes. Where none of the grants and eligibilities on a scope will give more, nor
+// would so, as for deleting or narrowing the role, which there only takes access away, and no role
+// listing it is granted there to hand it on, a scope the host no longer has (ErrNotFound) is read
+// as stored, with no containers or label. au is the actor's authority on the tenant, which
+// mayDefine checked the role on.
 func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authority, tenant string, id Role, types []string, d *redefinition,
 	change string,
 ) (roleReach, error) {
@@ -1208,11 +1219,12 @@ func (a *Authorizer) deniedBelow(ctx context.Context, q DB, tenant string, actor
 // scopesDenied returns why a deny stops the actor changing a custom role, reading the denies on the
 // paths of the scopes the change reaches, each as reach resolved it, as one would stop Apply there:
 // on a scope its grants and eligibilities are on, one that removes the actor's power to change
-// grants there, or where one of them will give more (reached.widened), as a grant to the tenant's
-// members does once the role is no longer privileged, one that removes there a permission the role
-// as it will be gives, which the actor would hand on there; and on a scope of those listed, one that
-// keeps the actor from granting the role as it will be there, as the holders of a role granted there
-// then may. au is the actor's authority on the tenant, which mayDefine checked the role on.
+// grants there, or where one of them will give more, or would (reached.widened), as a grant to the
+// tenant's members does once the role is no longer privileged, one that removes there a permission
+// the role as it will be gives, which the actor would hand on there; and on a scope of those
+// listed, one that keeps the actor from granting the role as it will be there, as the holders of a
+// role granted there then may. au is the actor's authority on the tenant, which mayDefine checked
+// the role on.
 func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au authority, tenant string, scopes reached, reach roleReach,
 	change string,
 ) error {

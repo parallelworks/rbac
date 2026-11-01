@@ -114,7 +114,9 @@ conditional ones reach, to check one by one.
   checks read it: one to the tenant's members of a privileged role, or to the public of a role not
   marked `Public`, gives nothing, so widening the role asks nothing about it, and a redefinition
   that has it give something, as narrowing the role so that it is no longer privileged does, widens
-  it, with what was added to the role while it gave nothing. Renaming a role or rewriting its
+  it, with what was added to the role while it gave nothing. A deny where the tenant's members hold
+  a privileged role still stops widening it, as a catalog change that has the role no longer be
+  privileged gives them what it gives then, and asks no one. Renaming a role or rewriting its
   description changes no grant, so needs only the power to define it.
   `DeleteRole` removes one with its grants; `Roles` lists the built-in and custom roles a scope type
   takes. Custom roles follow the catalog: one gives only what the catalog still has, and is
@@ -308,8 +310,9 @@ conditional ones reach, to check one by one.
   `rbac.ErrNotFound`, or an error wrapping it: a change that only takes access away there, as a
   member leaving a group with access on it or the group itself, or joining one a deny there names, a
   place in the group made to end sooner, `DeleteGroup`, or `DeleteRole` deleting, or `SetRole`
-  redefining so that no grant of it there gives more, a role granted on it, reads it as unlabeled,
-  and any other change fails with the error.
+  redefining so that no grant of it there gives more, nor would once the catalog has it no longer be
+  privileged, a role granted on it, reads it as unlabeled, and any other change fails with the
+  error.
 - **Privileged roles:** a role the catalog marks `Privileged`, or one that changes access, is
   privileged: it is never granted to the tenant's members, and gives nothing through them, as
   after a catalog change. Their grants of it give what it gives once it no longer is: `SetRole`
