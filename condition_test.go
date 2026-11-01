@@ -1230,9 +1230,13 @@ func TestAValueNestedDeepFailsItsConditions(t *testing.T) {
 	}
 }
 
+// hostByte is a byte type of the host's own.
+type hostByte byte
+
 // CEL copies an array of bytes whole each time a condition reads it, and a list or a map holding
 // arrays or structs copies each it reads, though it charges the read as one value. A check copies
-// an array of bytes once, however long, and fails a struct.
+// an array of bytes once, however long, and fails a struct. Copying an array of a byte type of the
+// host's own panicked outside any condition, ending the check.
 func TestAnArrayOfBytesIsCopiedOnceForACheck(t *testing.T) {
 	id := [16]byte{1}
 	for name, c := range map[string]struct {
@@ -1242,13 +1246,17 @@ func TestAnArrayOfBytesIsCopiedOnceForACheck(t *testing.T) {
 		"an id": {id, true}, "a list of ids": {[][16]byte{id}, true}, "a map of ids": {map[string][16]byte{"a": id}, true},
 		"a long array of bytes": {[2 << 10]byte{1}, true}, "a list of long arrays": {[][2 << 10]byte{{1}}, true},
 		"a map of long arrays": {map[string][1 << 10]int{"a": {1}}, true}, "a pointer to a long array": {&[2 << 10]byte{1}, true},
-		"a long array of other kinds": {[2 << 10]int16{1}, true},
-		"a map keyed by ids":          {map[[16]byte]int{id: 1}, false}, "a list of small structs": {[]struct{ A int }{{1}}, false},
+		"a long array of other kinds": {[2 << 10]int16{1}, true}, "an array of a byte type of the host's": {[4]hostByte{1}, true},
+		"a list of arrays of a byte type of the host's": {[][2 << 10]hostByte{{1}}, true},
+		"a map keyed by ids":                            {map[[16]byte]int{id: 1}, false}, "a list of small structs": {[]struct{ A int }{{1}}, false},
 		"a list of large structs": {[]struct{ A [2 << 10]byte }{{}}, false},
 	} {
 		if _, evaluated, _, err := rbac.EvaluateCondition(t, `request.attributes.v == request.attributes.v`, map[string]any{"v": c.v}); err != nil || evaluated != c.reads {
 			t.Errorf("%s: evaluated %t, %v", name, evaluated, err)
 		}
+	}
+	if held, _, _, err := rbac.EvaluateCondition(t, `request.attributes.v == b"\x01\x02"`, map[string]any{"v": [2]hostByte{1, 2}}); err != nil || !held {
+		t.Errorf("an array of a byte type of the host's: held %t, %v", held, err)
 	}
 	held, evaluated, allocated, err := rbac.EvaluateCondition(t, `request.attributes.l.all(x, request.attributes.v[0] != b"")`,
 		map[string]any{"l": make([]any, 1000), "v": [][64 << 10]byte{{1}}})

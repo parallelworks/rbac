@@ -312,7 +312,9 @@ func (c *converter) once(v reflect.Value, convert func() ref.Val) ref.Val {
 	return out
 }
 
-// bytes is v, a slice or an array of bytes, as bytes, an array's copied.
+// bytes is v, a slice or an array of bytes, as bytes, an array's copied into one of its own type:
+// reflection copies only between arrays of one element type, and panicked, outside any condition,
+// copying an array of a byte type of the host's own into a []byte.
 func (c *converter) bytes(v reflect.Value) ref.Val {
 	if !c.pay(length(v.Len()) / 10) {
 		return tooLarge()
@@ -320,9 +322,9 @@ func (c *converter) bytes(v reflect.Value) ref.Val {
 	if v.Kind() == reflect.Slice {
 		return types.Bytes(v.Bytes())
 	}
-	b := make([]byte, v.Len())
-	reflect.Copy(reflect.ValueOf(b), v)
-	return types.Bytes(b)
+	b := reflect.New(v.Type()).Elem()
+	b.Set(v)
+	return types.Bytes(b.Bytes())
 }
 
 // list is v, a slice or an array, as a list of what it holds.
