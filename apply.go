@@ -2468,7 +2468,7 @@ func revokeArgs(tenant string, scope Scope, bindings, kept []Binding) []any {
 
 // GrantFilter picks grants or eligibilities by scope, by principal, or both; at least one is
 // required. The zero principal, the anonymous subject's, which a constraint may ask about, holds
-// none, as it has no membership and is in no group.
+// none.
 type GrantFilter struct {
 	Scopes     []Scope
 	Principals []Principal
