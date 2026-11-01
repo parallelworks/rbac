@@ -1460,7 +1460,7 @@ func equal(x, y ref.Val, read uint64) ref.Val {
 		if nonFiniteKey(xs) || nonFiniteKey(ys) {
 			return incomparable()
 		}
-		for it := xs.Iterator(); it.HasNext() == types.True; {
+		for it := asHeld(xs).Iterator(); it.HasNext() == types.True; {
 			k := it.Next()
 			// A key a condition can't read, which finding would find in no map, fails as a value
 			// does.
@@ -1551,7 +1551,7 @@ func measuring(v ref.Val, limit uint64, each func(ref.Val)) uint64 {
 		if least := n + 2*count(v); least > limit {
 			return least
 		}
-		for it := v.Iterator(); n <= limit && it.HasNext() == types.True; {
+		for it := asHeld(v).Iterator(); n <= limit && it.HasNext() == types.True; {
 			k := it.Next()
 			// Finding the value hashes the key whole, so a key past limit is left unfound.
 			if n += measuring(k, limit-n, each); n <= limit {
@@ -1874,17 +1874,22 @@ func declared(declares map[string]AttributeType, attributes map[ref.Val]ref.Val)
 	if len(attributes) == 0 {
 		return noAttributes
 	}
+	if declares == nil {
+		unreadable := false
+		for _, v := range attributes {
+			unreadable = unreadable || types.IsError(v)
+		}
+		return mapOf(attributes, unreadable)
+	}
 	refused := false
-	if declares != nil {
-		for k, v := range attributes {
-			name, _ := k.(types.String)
-			// One it doesn't declare a condition reads only through dyn(), which no type is checked
-			// by when stored, so it fails as one of another type does.
-			if t, ok := declares[string(name)]; !ok {
-				attributes[k], refused = types.NewErr("rbac: attribute %q is not declared", string(name)), true
-			} else if !t.takes(v) {
-				attributes[k], refused = types.NewErr("rbac: attribute %q is not a %s", string(name), t), true
-			}
+	for k, v := range attributes {
+		name, _ := k.(types.String)
+		// One it doesn't declare a condition reads only through dyn(), which no type is checked
+		// by when stored, so it fails as one of another type does.
+		if t, ok := declares[string(name)]; !ok {
+			attributes[k], refused = types.NewErr("rbac: attribute %q is not declared", string(name)), true
+		} else if !t.takes(v) {
+			attributes[k], refused = types.NewErr("rbac: attribute %q is not a %s", string(name), t), true
 		}
 	}
 	attrs := types.NewRefValMap(types.DefaultTypeAdapter, attributes)

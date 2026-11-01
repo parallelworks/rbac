@@ -66,13 +66,14 @@ import (
 //   - the protobuf well-known types: a Struct, a ListValue, a Value or a NullValue, a wrapper, a
 //     Timestamp, a Duration, and an Any packing one of them but another Any.
 //
-// Anything else fails whatever condition reads it, a test of its presence, has() or `in` the map
-// holding it, included: a ref.Val of the host's own, though it says it is of one of CEL's types, a
-// list, a map or an optional of CEL's a host makes, a struct, a channel, a func, a complex number,
-// a uintptr, any other message, a map keyed by any other value, as a double or an array, a map
-// holding two keys read as the same value, as 1 and 1u, or "a" twice of two string types, invalid
-// JSON, a value nested deeper than JSON text may, 10,000 deep, and a value holding itself, and each
-// it holds that holds it. A list or a map holding one reads the rest. A value reached twice, as a
+// Anything else fails whatever condition reads it, a test of its presence, has(), `in` the map
+// holding it or a loop over that map's keys, included: a ref.Val of the host's own, though it says
+// it is of one of CEL's types, a list, a map or an optional of CEL's a host makes, a struct, a
+// channel, a func, a complex number, a uintptr, any other message, a map keyed by any other value,
+// as a double or an array, a map holding two keys read as the same value, as 1 and 1u, or "a" twice
+// of two string types, invalid JSON, a value nested deeper than JSON text may, 10,000 deep, and a
+// value holding itself, and each it holds that holds it. A list or a map holding one reads the
+// rest. A value reached twice, as a
 // map two lists hold, is converted once. A check converts at most maxConverted of what the host
 // passes, counted as reading it costs a condition, one for each value and a tenth of each string's,
 // bytes', JSON number's, JSON text's or packed type URL's length, and half a packed message's, as a
@@ -407,6 +408,7 @@ func (c *converter) dict(v reflect.Value) ref.Val {
 		return tooLarge()
 	}
 	out := make(map[ref.Val]ref.Val, v.Len())
+	unreadable := false
 	// Each entry is read into the same two values, as reading it into new ones allocates for each,
 	// a string key or an interface value too: nothing converting reads keeps them.
 	key, value := reflect.New(v.Type().Key()).Elem(), reflect.New(v.Type().Elem()).Elem()
@@ -423,8 +425,48 @@ func (c *converter) dict(v reflect.Value) ref.Val {
 		if out[k] = c.of(value); c.over {
 			return tooLarge()
 		}
+		unreadable = unreadable || types.IsError(out[k])
 	}
-	return types.NewRefValMap(types.DefaultTypeAdapter, out)
+	return mapOf(out, unreadable)
+}
+
+// mapOf is out, a map a check converted, as conditions read it, where unreadable, holding a value
+// no condition can read. A loop over a map's keys reads none of its values, so it would find that
+// one's key, as `in` and has() of it don't (bounded), and a deny's
+// `!request.attributes.exists(k, k == "mfa")` would lift where the host passes mfa as a struct: a
+// loop over such a map finds the value's error in place of its key, and reads the rest.
+func mapOf(out map[ref.Val]ref.Val, unreadable bool) ref.Val {
+	m := types.NewRefValMap(types.DefaultTypeAdapter, out)
+	if !unreadable {
+		return m
+	}
+	keys := make([]ref.Val, 0, len(out))
+	for k, v := range out {
+		if types.IsError(v) {
+			k = v
+		}
+		keys = append(keys, k)
+	}
+	return holdingUnreadable{Mapper: m, keys: types.NewRefValList(types.DefaultTypeAdapter, keys)}
+}
+
+// holdingUnreadable is a map holding a value no condition can read, whose keys a loop finds as
+// keys holds them, that value's error in place of its key (mapOf).
+type holdingUnreadable struct {
+	traits.Mapper
+	keys traits.Lister
+}
+
+func (m holdingUnreadable) Iterator() traits.Iterator { return m.keys.Iterator() }
+
+// asHeld is m by the keys it holds, that of a value no condition can read too, as measuring and
+// equal read it: what reading a map costs, and whether two are equal, is of what they hold, not of
+// what a loop over them finds.
+func asHeld(m traits.Mapper) traits.Mapper {
+	if h, ok := m.(holdingUnreadable); ok {
+		return h.Mapper
+	}
+	return m
 }
 
 // key is k, a map's key, as a condition reads it: a bool, a string, an int or a uint, or an error.
@@ -566,13 +608,15 @@ func (c *converter) message(v reflect.Value) ref.Val {
 				return tooLarge()
 			}
 			out := make(map[ref.Val]ref.Val, len(m.GetFields()))
+			unreadable := false
 			for k, field := range m.GetFields() {
 				key := c.spend(textLength(len(k)), types.String(k))
 				if out[key] = c.of(reflect.ValueOf(field)); c.over {
 					return tooLarge()
 				}
+				unreadable = unreadable || types.IsError(out[key])
 			}
-			return types.NewRefValMap(types.DefaultTypeAdapter, out)
+			return mapOf(out, unreadable)
 		})
 	case *structpb.ListValue:
 		return c.once(v, func() ref.Val {
