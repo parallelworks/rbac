@@ -627,27 +627,33 @@ flowchart TB
 - **Migrating.** `Migrate` applies each pending migration in a transaction of its own, under an
   advisory lock on the schema that holds another replica's migration back, and records it as it
   commits: so a migration takes its locks in the order it names them, the tables before history,
-  whatever was pending before it, and a failure leaves the database at the last migration recorded.
-  A migration waits at most 100 ms for any lock on the tables, as it holds those it took meanwhile,
-  and gives way: `Migrate` rolls it back and tries it again, up to 10 times. That wait ends before
-  PostgreSQL's deadlock check, which alone cancels an autovacuum worker blocking a lock, once a wait
-  passes `deadlock_timeout`: where an autovacuum worker holds one of the tables as a migration gives
-  way (`vacuumHolds`, from `pg_locks` and the vacuum and analysis progress views, which any role
-  reads), the next try waits a second past `deadlock_timeout`. A wait for another replica's
+  whatever was pending before it, and a failure leaves the database at the last migration recorded,
+  where code from before it can run on, so each migration must leave the tables as that code can
+  use them. A migration waits at most 100 ms for any lock on the tables, as it holds those it took
+  meanwhile, and gives way: `Migrate` rolls it back and tries it again, up to 10 times. That wait
+  ends before PostgreSQL's deadlock check, which alone cancels an autovacuum worker blocking a lock,
+  once a wait passes `deadlock_timeout`: where an autovacuum worker holds one of the tables as a
+  migration gives way, the next try first takes each such table's `SHARE UPDATE EXCLUSIVE` lock,
+  waiting a second past `deadlock_timeout` (`outwaitVacuum`, from `pg_locks` and the vacuum and
+  analysis progress views, which any role reads), and then the migration's own. That lock conflicts
+  with none a check, list or change takes, so none waits behind it while the migration holds none
+  of its own; where the wait ends, as for a vacuum to prevent wraparound, which PostgreSQL never
+  cancels, the try rolls back to a savepoint and goes on without it. A wait for another replica's
   migration is bounded by the session's `lock_timeout` alone, and not tried again. On a host's
   transaction `Migrate` applies them all in one savepoint, with neither the bound nor the tries, as
   rolling back to the savepoint frees nothing the host took before.
 
 ```mermaid
 flowchart TB
-    start(["Migrate on a pool or a connection"]) --> tx["migrateOnce: a transaction of its own,<br/>the schema's advisory lock, then lock_timeout<br/>100 ms, or a second past deadlock_timeout"]
+    start(["Migrate on a pool or a connection"]) --> tx["migrateOnce: a transaction of its own,<br/>the schema's advisory lock, lock_timeout 100 ms"]
+    tx -->|"the last try gave way"| vac["outwaitVacuum: SHARE UPDATE EXCLUSIVE on each<br/>table an autovacuum worker holds, waiting a second<br/>past deadlock_timeout, or none where that ends"]
     tx --> one["The first pending migration,<br/>recorded in rbac_migrations"]
+    vac --> one
     one -->|"commits, more pending"| tx
     one -->|"commits, none pending"| done(["nil"])
     tx -->|"the advisory lock's wait<br/>ends (errReplica)"| conflict(["ErrConflict"])
-    one -->|"55P03 or 40P01"| vac{"vacuumHolds: an autovacuum<br/>worker holds a table?"}
-    vac -->|"the next try waits past deadlock_timeout,<br/>or not; after a backoff"| tx
-    vac -->|"its 10th try"| conflict
+    one -->|"55P03 or 40P01, after a backoff"| tx
+    one -->|"its 10th try"| conflict
 ```
 
 ## History, export and AsOf

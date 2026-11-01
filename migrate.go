@@ -28,7 +28,8 @@ var migrations embed.FS
 // can deadlock with a change, or stall every other. A wait shorter than deadlock_timeout never ends
 // an autovacuum worker holding the table, as PostgreSQL cancels one only once a wait for its lock
 // passes that: where one holds a table of the package's as a migration gives way, apply it again
-// with a lock_timeout past deadlock_timeout, as Migrate does. Migrate applies them itself.
+// having first locked that table IN SHARE UPDATE EXCLUSIVE MODE with a lock_timeout past
+// deadlock_timeout, as Migrate does. Migrate applies them itself.
 func Migrations() fs.FS {
 	sub, err := fs.Sub(migrations, "migrations")
 	if err != nil {
@@ -55,50 +56,57 @@ func Migrations() fs.FS {
 // longer each time, up to 10 times over about 20 seconds, and then fails as ErrConflict: migrate
 // again once what held the table has ended. A wait that short ends before PostgreSQL's deadlock
 // check, deadlock_timeout into it, which alone cancels an autovacuum worker holding the table the
-// wait is for: where one holds any of the package's tables as a migration gives way, as one
-// vacuuming a large history can for minutes, the next try waits a second past deadlock_timeout,
-// so PostgreSQL cancels the worker, unless it vacuums to prevent wraparound, which PostgreSQL never
-// cancels. A role that can't read other sessions' backend types, as one without pg_read_all_stats,
-// can't tell autovacuum's vacuums and analyses from a client's, and counts them all. On a host's
-// transaction it does none of this, as rolling back to its savepoint frees nothing the host's
-// transaction took before, which what the migration waits for can be waiting for in turn: it waits
-// as that transaction's lock_timeout says, for PostgreSQL to end such a wait as a deadlock, and
-// fails as ErrConflict where it ends the migration's. On any connection it waits for another
-// replica's migration as long as the session's lock_timeout lets it, and fails as ErrConflict where
-// that ends the wait, without trying again.
+// wait is for, as one vacuuming a large history can for minutes. So where a try gave way, the next
+// first takes the SHARE UPDATE EXCLUSIVE lock of each of the package's tables an autovacuum worker
+// holds, waiting a second past deadlock_timeout, whatever the session's lock_timeout, for
+// PostgreSQL to cancel the worker, and then the migration's own locks: no check, list or change
+// takes a lock that one conflicts with, so none waits behind it, and none of the migration's is
+// held yet. Where that wait ends, as for a vacuum to prevent wraparound, which PostgreSQL never
+// cancels, the try goes on without those locks. The worker can hold a table the migration doesn't
+// lock, which it then cancels too. A role that can't read other sessions' backend types, as one
+// without pg_read_all_stats, can't tell autovacuum's vacuums and analyses from a client's, and
+// waits so for them all. On a host's transaction it does none of this, as rolling back to its
+// savepoint frees nothing the host's transaction took before, which what the migration waits for
+// can be waiting for in turn: it waits as that transaction's lock_timeout says, for PostgreSQL to
+// end such a wait as a deadlock, and fails as ErrConflict where it ends the migration's. On any
+// connection it waits for another replica's migration as long as the session's lock_timeout lets
+// it, and fails as ErrConflict where that ends the wait, without trying again.
 func Migrate(ctx context.Context, db DB) error {
-	wait, attempt, vacuumed := migrateBackoff, 1, false
 	for {
-		own, more, err := migrateOnce(ctx, db, vacuumed)
-		switch {
-		case err == nil && more:
-			// The next migration, with tries of its own.
-			wait, attempt, vacuumed = migrateBackoff, 1, false
-			continue
-		case err == nil, !own, attempt >= migrateAttempts, !errors.Is(err, ErrConflict), errors.Is(err, errReplica):
+		more, err := migrateNext(ctx, db)
+		if err != nil || !more {
 			return err
 		}
-		var verr error
-		if vacuumed, verr = vacuumHolds(ctx, db, err); verr != nil {
-			return errors.Join(err, verr)
+	}
+}
+
+// migrateNext applies the first pending migration, or on a host's transaction every one, trying it
+// again as it gives way, and reports whether more are pending after it.
+func migrateNext(ctx context.Context, db DB) (bool, error) {
+	wait, gaveWay := migrateBackoff, false
+	for attempt := 1; ; attempt++ {
+		own, more, err := migrateOnce(ctx, db, gaveWay)
+		if err == nil || !own || attempt >= migrateAttempts || !errors.Is(err, ErrConflict) || errors.Is(err, errReplica) {
+			return more, err
 		}
+		pg := (*pgconn.PgError)(nil)
+		gaveWay = errors.As(err, &pg) && pg.Code == "55P03"
 		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return errors.Join(err, ctx.Err())
+			return false, errors.Join(err, ctx.Err())
 		case <-timer.C:
 		}
 		wait = min(2*wait, maxMigrateBackoff)
-		attempt++
 	}
 }
 
 // migrateAttempts is how many times Migrate tries a migration before it gives up on a lock;
 // migrateLockWait is the longest a migration waits for any one lock, and migrateBackoff how long
 // Migrate waits before it tries again, doubling with each try up to maxMigrateBackoff;
-// migrateVacuumWait is how much longer than deadlock_timeout a try waits once an autovacuum worker
-// held a table as the last gave way. A test lowers the first and third.
+// migrateVacuumWait is how much longer than deadlock_timeout a try that follows one giving way
+// waits for the tables an autovacuum worker holds. A test lowers the first and third.
 var (
 	migrateAttempts   = 10
 	migrateLockWait   = 100 * time.Millisecond
@@ -111,33 +119,56 @@ var (
 // which Migrate doesn't try again: each try would wait as long again, past what the host set.
 var errReplica = errors.New("rbac: waiting for another migration of the schema")
 
-// vacuumHolds reports whether err is a migration giving up on a lock while an autovacuum worker
-// holds one of the package's tables in the current schema, as its vacuum or analysis does. Where
-// the role can't read a vacuum's backend type, the vacuum counts as autovacuum's, as a client's
-// can't be told from it; where it can, only autovacuum's, as PostgreSQL cancels no other. The
-// worker can hold another table than the migration waited for, which costs the next try only its
-// longer wait.
-func vacuumHolds(ctx context.Context, db DB, err error) (bool, error) {
-	if pg := (*pgconn.PgError)(nil); !errors.As(err, &pg) || pg.Code != "55P03" {
-		return false, nil
-	}
-	var held bool
-	err = db.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_locks l
-		JOIN pg_class c ON c.oid = l.relation
-		LEFT JOIN pg_stat_activity a ON a.pid = l.pid
-		WHERE l.locktype = 'relation' AND l.granted AND l.mode = 'ShareUpdateExclusiveLock'
-		  AND l.database = (SELECT d.oid FROM pg_database d WHERE d.datname = current_database())
-		  AND c.relnamespace = (SELECT n.oid FROM pg_namespace n WHERE n.nspname = current_schema())
-		  AND starts_with(c.relname, 'rbac_')
-		  AND l.pid IN (SELECT v.pid FROM pg_stat_progress_vacuum v UNION ALL SELECT z.pid FROM pg_stat_progress_analyze z)
-		  AND coalesce(a.backend_type, 'autovacuum worker') = 'autovacuum worker')`).Scan(&held)
-	return held, err
+// outwaitVacuum locks, in a savepoint of tx, each of the package's tables in schema an autovacuum
+// worker holds, as its vacuum or analysis does, in the mode it holds them, waiting
+// migrateVacuumWait past deadlock_timeout, so PostgreSQL's deadlock check cancels the worker, and
+// then has the migration's own locks wait migrateLockWait again. Where the role can't read a
+// vacuum's backend type, the vacuum counts as autovacuum's, as a client's can't be told from it;
+// where it can, only autovacuum's, as PostgreSQL cancels no other. Where the wait ends, or the role
+// can't read what holds the tables, it rolls back to the savepoint, which frees what it locked and
+// sets lock_timeout back, so the try goes on as it would without it.
+func outwaitVacuum(ctx context.Context, tx pgx.Tx, schema string) {
+	_ = savepoint(ctx, tx, func(tx pgx.Tx) error {
+		var held []string
+		var deadlock int64
+		if err := tx.QueryRow(ctx, `SELECT ARRAY(SELECT DISTINCT c.relname FROM pg_locks l
+			JOIN pg_class c ON c.oid = l.relation
+			LEFT JOIN pg_stat_activity a ON a.pid = l.pid
+			WHERE l.locktype = 'relation' AND l.granted AND l.mode = 'ShareUpdateExclusiveLock'
+			  AND l.database = (SELECT d.oid FROM pg_database d WHERE d.datname = current_database())
+			  AND c.relnamespace = (SELECT n.oid FROM pg_namespace n WHERE n.nspname = $1)
+			  AND starts_with(c.relname, 'rbac_')
+			  AND l.pid IN (SELECT v.pid FROM pg_stat_progress_vacuum v UNION ALL SELECT z.pid FROM pg_stat_progress_analyze z)
+			  AND coalesce(a.backend_type, 'autovacuum worker') = 'autovacuum worker'
+			ORDER BY 1),
+			(SELECT setting::bigint FROM pg_settings WHERE name = 'deadlock_timeout')`, schema).Scan(&held, &deadlock); err != nil || len(held) == 0 {
+			return err
+		}
+		tables := make([]string, len(held))
+		for i, name := range held {
+			tables[i] = pgx.Identifier{schema, name}.Sanitize()
+		}
+		// Past the deadlock check: only a superuser can set deadlock_timeout lower.
+		if _, err := tx.Exec(ctx, `SELECT set_config('lock_timeout', $1, true)`, milliseconds(time.Duration(deadlock)*time.Millisecond+migrateVacuumWait)); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `LOCK TABLE `+strings.Join(tables, ", ")+` IN SHARE UPDATE EXCLUSIVE MODE`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `SELECT set_config('lock_timeout', $1, true)`, milliseconds(migrateLockWait))
+		return err
+	})
+}
+
+// milliseconds is d as a setting such as lock_timeout reads it.
+func milliseconds(d time.Duration) string {
+	return strconv.FormatInt(d.Milliseconds(), 10) + "ms"
 }
 
 // migrateOnce applies the first pending migration in a transaction of its own, reporting whether
 // more are pending after it, or every one in a savepoint of the host's, and reports whether it was
-// one of its own. vacuumed has a migration wait for a lock past deadlock_timeout.
-func migrateOnce(ctx context.Context, db DB, vacuumed bool) (own, more bool, err error) {
+// one of its own. gaveWay, that the last try of it gave way, has it first outwait autovacuum.
+func migrateOnce(ctx context.Context, db DB, gaveWay bool) (own, more bool, err error) {
 	// At READ COMMITTED, so a replica that waited for the lock reads the versions another applied
 	// meanwhile: a stricter snapshot, taken before the lock, would apply them again.
 	err = beginOwn(ctx, db, func(tx pgx.Tx, fresh bool) error {
@@ -192,17 +223,7 @@ func migrateOnce(ctx context.Context, db DB, vacuumed bool) (own, more bool, err
 		// in a transaction of its own, where giving way frees what it holds, and where the setting
 		// ends with it.
 		if own {
-			wait := migrateLockWait.Milliseconds()
-			if vacuumed {
-				// Past the deadlock check, which alone cancels an autovacuum worker blocking the wait:
-				// only a superuser can set deadlock_timeout lower.
-				var deadlock int64
-				if err := tx.QueryRow(ctx, `SELECT setting::bigint FROM pg_settings WHERE name = 'deadlock_timeout'`).Scan(&deadlock); err != nil {
-					return err
-				}
-				wait = deadlock + migrateVacuumWait.Milliseconds()
-			}
-			if _, err := tx.Exec(ctx, `SELECT set_config('lock_timeout', $1, true)`, strconv.FormatInt(wait, 10)+"ms"); err != nil {
+			if _, err := tx.Exec(ctx, `SELECT set_config('lock_timeout', $1, true)`, milliseconds(migrateLockWait)); err != nil {
 				return err
 			}
 		}
@@ -227,6 +248,9 @@ func migrateOnce(ctx context.Context, db DB, vacuumed bool) (own, more bool, err
 			if own && done {
 				more = true
 				break
+			}
+			if own && gaveWay {
+				outwaitVacuum(ctx, tx, *schema)
 			}
 			sql, err := fs.ReadFile(fsys, name)
 			if err != nil {

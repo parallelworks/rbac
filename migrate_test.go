@@ -240,16 +240,6 @@ func TestMigrateWaitsForAReplicaAsLongAsTheSessionsLockTimeout(t *testing.T) {
 	}
 }
 
-// deadlockTimeout is the session's deadlock_timeout.
-func deadlockTimeout(t *testing.T, db rbac.DB) time.Duration {
-	t.Helper()
-	var ms int64
-	if err := db.QueryRow(t.Context(), `SELECT setting::bigint FROM pg_settings WHERE name = 'deadlock_timeout'`).Scan(&ms); err != nil {
-		t.Fatal(err)
-	}
-	return time.Duration(ms) * time.Millisecond
-}
-
 // historyToVacuum migrates pool's schema up to 0019 and fills history with enough records that a
 // vacuum slowed to a crawl takes minutes over it.
 func historyToVacuum(t *testing.T, pool *pgxpool.Pool) {
@@ -264,11 +254,93 @@ func historyToVacuum(t *testing.T, pool *pgxpool.Pool) {
 	}
 }
 
+// vacuumSlowly has a session of pool vacuum table, slowed to a crawl, until t ends, and returns once
+// it has started.
+func vacuumSlowly(t *testing.T, pool *pgxpool.Pool, table string) {
+	t.Helper()
+	ctx := t.Context()
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid := conn.Conn().PgConn().PID()
+	if _, err := conn.Exec(ctx, `SET vacuum_cost_delay = 100; SET vacuum_cost_limit = 1`); err != nil {
+		conn.Release()
+		t.Fatal(err)
+	}
+	vacuumed := make(chan error, 1)
+	go func() {
+		_, err := conn.Exec(context.WithoutCancel(ctx), `VACUUM `+table)
+		vacuumed <- err
+	}()
+	t.Cleanup(func() {
+		if _, err := pool.Exec(context.WithoutCancel(ctx), `SELECT pg_cancel_backend($1)`, pid); err != nil {
+			t.Error(err)
+		}
+		<-vacuumed
+		conn.Release()
+	})
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		var running bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_progress_vacuum WHERE pid = $1 AND relid = $2::regclass)`, pid, table).Scan(&running); err != nil {
+			t.Fatal(err)
+		}
+		if running {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the vacuum never started")
+		}
+	}
+}
+
+// superuserOn is a pool of the test database's role, which the README's roles are made by, on
+// schema.
+func superuserOn(t *testing.T, schema string) *pgxpool.Pool {
+	t.Helper()
+	cfg, err := pgxpool.ParseConfig(pgtest.URL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+// outwaiting returns once a session of role has waited for a lock past what a migration's own
+// locks wait, as Migrate does for what an autovacuum worker holds, or fails t if migrated ends
+// first.
+func outwaiting(t *testing.T, super *pgxpool.Pool, role string, migrated <-chan error) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		var waiting bool
+		if err := super.QueryRow(t.Context(), `SELECT EXISTS (SELECT FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+			WHERE NOT l.granted AND a.usename = $1 AND l.waitstart < now() - interval '300 ms')`, role).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			return
+		}
+		select {
+		case err := <-migrated:
+			t.Fatalf("Migrate ended without waiting out the vacuum: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Migrate never waited out the vacuum")
+		}
+	}
+}
+
 // An autovacuum worker holding history, as one vacuuming a large history does for minutes, holds
 // 0019 back only until PostgreSQL cancels it, which it does once a wait for its lock passes
-// deadlock_timeout: Migrate waits that long once the worker held the table as a try gave way, as
-// the README's administrator's role, which can't read the worker's backend type. Waiting at most
-// 100 ms each time, it gave way on every try while the worker ran on.
+// deadlock_timeout: Migrate waits that long for the worker's lock once the worker held the table as
+// a try gave way, as the README's administrator's role, which can't read the worker's backend type.
+// Waiting at most 100 ms each time, it gave way on every try while the worker ran on.
 func TestMigrateWaitsForPostgreSQLToCancelAutovacuum(t *testing.T) {
 	ctx := t.Context()
 	r := newReadmeRoles(t)
@@ -322,6 +394,84 @@ func TestMigrateWaitsForPostgreSQLToCancelAutovacuum(t *testing.T) {
 	}
 }
 
+// While Migrate waits for PostgreSQL to cancel what holds a table, as a client's vacuum of history
+// that a role without pg_read_all_stats can't tell from autovacuum's, it holds none of the locks the
+// migration takes: a write to rbac_grants goes on. Waiting so with 0019's lock on rbac_grants, taken
+// before history's, held every write to grants back until the wait ended.
+func TestMigrateOutwaitingAVacuumHoldsNoWriteBack(t *testing.T) {
+	ctx := t.Context()
+	r := newReadmeRoles(t)
+	historyToVacuum(t, r.adminPool)
+	// So no autovacuum worker on the tables just filled holds them as well.
+	if _, err := r.adminPool.Exec(ctx, `ALTER TABLE rbac_grants SET (autovacuum_enabled = off);
+		ALTER TABLE rbac_history SET (autovacuum_enabled = off)`); err != nil {
+		t.Fatal(err)
+	}
+	super := superuserOn(t, r.schema)
+	vacuumSlowly(t, super, "rbac_history")
+	rbac.SetMigrateAttempts(t, 2, time.Millisecond)
+	migrated := make(chan error, 1)
+	go func() { migrated <- rbac.Migrate(ctx, r.adminPool) }()
+	outwaiting(t, super, r.admin, migrated)
+	began := time.Now()
+	if _, err := r.adminPool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'w', 'user', 'w', 'cluster.admin')`); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(began); took > 500*time.Millisecond {
+		t.Errorf("a grant written while Migrate waited out a vacuum took %v", took)
+	}
+	var pg *pgconn.PgError
+	if err := <-migrated; !errors.Is(err, rbac.ErrConflict) || !errors.As(err, &pg) || pg.Code != "55P03" {
+		t.Fatalf("Migrate while a client vacuums history: %v", err)
+	}
+}
+
+// Where what Migrate waits for as autovacuum's isn't, as a client's vacuum of rbac_memberships that
+// a role without pg_read_all_stats can't tell from autovacuum's, outlasts the wait, the try goes on
+// without it, and 0019, which doesn't lock that table, migrates once the read that held history
+// back has ended.
+func TestMigrateGoesOnWhereAVacuumOutlastsItsWait(t *testing.T) {
+	ctx := t.Context()
+	r := newReadmeRoles(t)
+	if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", "0019"); err != nil {
+		t.Fatal(err)
+	}
+	recordMigrations(t, r.adminPool, "0019")
+	for _, sql := range []string{
+		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) SELECT 't1', 'user', 'u' || i FROM generate_series(1, 10000) i`,
+		`ALTER TABLE rbac_memberships SET (autovacuum_enabled = off); ALTER TABLE rbac_history SET (autovacuum_enabled = off)`,
+	} {
+		if _, err := r.adminPool.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	super := superuserOn(t, r.schema)
+	vacuumSlowly(t, super, "rbac_memberships")
+	// A read holds history, which 0019 locks, so its first try gives way.
+	reader, err := r.adminPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reader.Rollback(ctx) }()
+	if _, err := reader.Exec(ctx, `SELECT FROM rbac_history LIMIT 1`); err != nil {
+		t.Fatal(err)
+	}
+	rbac.SetMigrateAttempts(t, 2, time.Millisecond)
+	migrated := make(chan error, 1)
+	go func() { migrated <- rbac.Migrate(ctx, r.adminPool) }()
+	outwaiting(t, super, r.admin, migrated)
+	if err := reader.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-migrated; err != nil {
+		t.Fatalf("Migrate once the read has ended, beside a client's vacuum of another table: %v", err)
+	}
+	if v := migratedTo(t, r.adminPool); v != 19 {
+		t.Errorf("migrated to %d", v)
+	}
+}
+
 // A vacuum a client runs, which PostgreSQL never cancels for a lock, doesn't have Migrate wait
 // past deadlock_timeout for it, where its role can tell the vacuum from autovacuum's.
 func TestMigrateDoesntWaitOutAClientsVacuum(t *testing.T) {
@@ -333,47 +483,20 @@ func TestMigrateDoesntWaitOutAClientsVacuum(t *testing.T) {
 		ALTER TABLE rbac_history SET (autovacuum_enabled = off)`); err != nil {
 		t.Fatal(err)
 	}
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
+	vacuumSlowly(t, pool, "rbac_history")
+	var ms int64
+	if err := pool.QueryRow(ctx, `SELECT setting::bigint FROM pg_settings WHERE name = 'deadlock_timeout'`).Scan(&ms); err != nil {
 		t.Fatal(err)
-	}
-	defer conn.Release()
-	pid := conn.Conn().PgConn().PID()
-	if _, err := conn.Exec(ctx, `SET vacuum_cost_delay = 100; SET vacuum_cost_limit = 1`); err != nil {
-		t.Fatal(err)
-	}
-	vacuumed := make(chan error, 1)
-	go func() {
-		_, err := conn.Exec(ctx, `VACUUM rbac_history`)
-		vacuumed <- err
-	}()
-	defer func() {
-		if _, err := pool.Exec(context.WithoutCancel(ctx), `SELECT pg_cancel_backend($1)`, pid); err != nil {
-			t.Error(err)
-		}
-		<-vacuumed
-	}()
-	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
-		var running bool
-		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_progress_vacuum WHERE pid = $1 AND relid = 'rbac_history'::regclass)`, pid).Scan(&running); err != nil {
-			t.Fatal(err)
-		}
-		if running {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the vacuum never started")
-		}
 	}
 	rbac.SetMigrateAttempts(t, 2, time.Millisecond)
 	began := time.Now()
-	err = rbac.Migrate(ctx, pool)
+	err := rbac.Migrate(ctx, pool)
 	took := time.Since(began)
 	var pg *pgconn.PgError
 	if !errors.Is(err, rbac.ErrConflict) || !errors.As(err, &pg) || pg.Code != "55P03" {
 		t.Fatalf("Migrate while a client vacuums history: %v", err)
 	}
-	if limit := deadlockTimeout(t, pool); took >= limit {
+	if limit := time.Duration(ms) * time.Millisecond; took >= limit {
 		t.Errorf("Migrate took %v beside a client's vacuum, past deadlock_timeout's %v", took, limit)
 	}
 }
