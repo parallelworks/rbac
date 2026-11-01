@@ -362,16 +362,24 @@ or whose context is more than 1 MiB, fails rather than record what `History` cou
 return. A row written before history was installed, as by a host that applied the first migrations
 on their own, is recorded by migrating as it found it, its `baseline`, dated when it was created, or
 a role when it last changed. Nothing updates or truncates history, only `PruneHistory` deletes from
-it, and the package's tables can be deleted from but not truncated. `History` reads it in order, to
-export it to storage of the host's own: a transaction that commits after a later one is read after
-it, never skipped, and a record can be read twice, so dedupe on `Record.ID` and `RecordedAt`: a
-restore can give another record the ID of one it lost. One call reads at most `rbac.MaxHistory`
+it, and the package's tables can be deleted from but not truncated. `History` reads it in the
+order of the transactions that wrote it, by the id each takes at its first write, to export it to
+storage of the host's own: a transaction that commits after one that took its id later is read
+before it all the same, never skipped. That is the order of transactions, not of each row's
+changes: one that took its id first and changed a row after another committed a change to it is
+read before that one, though its change came after. So a consumer replaying an export applies each
+row's versions in the order of their `Record.ID`, in which they were written while history's id
+sequence caches one, as `AsOf` reads them and requires, not in the order read, or it ends with a
+version the row no longer held. A record can be read
+twice, so dedupe on `Record.ID` and `RecordedAt`: a restore can give another record the ID of one
+it lost. One call reads at most `rbac.MaxHistory`
 records, and past the first, at most `rbac.MaxHistoryBytes` of their rows' JSON and their text, so a
 read of fewer than its limit doesn't mean history holds no more: read until one returns none.
 History written before `0013_bounded_rows` counted no bytes, so a read measures each such record by
 writing out its rows, and reads at most 100 of them. Any transaction still running in the database
-cluster, in any of its databases, that has written or otherwise taken a transaction id holds
-`History`, and `Export` with it, back until it ends. `idle_in_transaction_session_timeout`, and
+cluster, in any of its databases, that has written or otherwise taken a transaction id, as `AsOf`'s
+has while its read runs, holds `History`, and `Export` with it, back until it ends.
+`idle_in_transaction_session_timeout`, and
 from PostgreSQL 17 on `transaction_timeout`, end one a session leaves open by mistake, but every
 session may set both for itself, whatever the role's or the server's defaults, so they bound only
 an accident: a session of a role that may be hostile, as the application's, turns them off and
@@ -389,9 +397,15 @@ replica. A generation (`Cursor.Generation`) names the cluster, and the database 
 is in, so no two installations in a cluster share one. A failover or a recovery to a point in time
 starts a new one, and a restore that starts none, as from a disk snapshot, loses what came after it:
 either can number again what the last one numbered past what it kept. `History` refuses a cursor
-from another generation, or whose last record the database no longer holds, and history is exported
-again from the start, kept apart from the last export. Move history with physical backups and
-replicas; a logical dump restored into another cluster numbers its transactions anew.
+from another generation, whose last record the database no longer holds, or after which a prune
+since its export began deleted records, as below, and history is exported again from the start, kept
+apart from the last export: an export from it would read on past what is gone. A restore that keeps
+a cursor's last record but loses what came after it, as one from a disk snapshot taken since that
+cursor was read, leaves nothing the database can tell from recovering from a crash, which loses
+nothing that committed, so its export would read on: restore by recovering to a point in time, which
+starts a new generation, or export each generation from the start again after a restore. Move
+history with physical backups and replicas; a logical dump restored into another cluster numbers its
+transactions anew.
 
 A change refused, as `ErrDenied` or `ErrInvalid`, writes nothing, so history doesn't record it:
 `Config.OnRefused` is told of each, with its actor, the call and the host's audit, to record the
@@ -400,10 +414,15 @@ change was made in (`WithTx`) rolls back.
 
 `Export(ctx, from, limit, signer)` reads as `History` does and chains what it reads onto `from`,
 a `Checkpoint`: a SHA-256 hash chain over every record of the generation in order, signed by the
-host's `crypto.Signer`, such as a key in a key management service. Keep the records and each
+host's `crypto.Signer`, such as a key in a key management service. `from` is the zero `Checkpoint`,
+or one `Export` returned that the signer's key verifies: one whose cursor was moved ahead would skip
+the records between with a chain that verifies. To change keys, `Sign` the latest checkpoint, once
+the old key verifies it, with the new one, and go on from that. Keep the records and each
 checkpoint where they can't be rewritten, as write-once storage. `VerifyChain` then shows that the
 records between two checkpoints are those history held, none dropped, changed or reordered, which
-a database's superuser couldn't forge past the last checkpoint stored. A checkpoint vouches for
+a database's superuser couldn't forge past the last checkpoint stored: `History` refuses a cursor
+after which a prune since its export began, or any delete through history's triggers, removed
+records, so no export reads on past them. A checkpoint vouches for
 the records before it, not after: an audit verifies a generation from its `Genesis` to the latest
 checkpoint kept, and checks that checkpoint's `At` is as recent as the host exports, since
 `Export` signs one on every call, even one that reads nothing, so records dropped from the end
@@ -431,12 +450,25 @@ read holds no transaction id, which neither shows nor holds `History` back, and 
 change that counts from its start. A prepared transaction, which `pg_stat_activity` no longer lists,
 has ended only once it is committed or rolled back: `pg_prepared_xacts` lists it until then, by when
 it was prepared, not when it began. `AsOf` makes no change: one tried is no actor's attempt, and
-`Config.OnRefused` isn't told of it. A statement reads the history of the rows it names, as a check
+`Config.OnRefused` isn't told of it. It writes all the same: the temporary views it reads history
+through are rows of the catalog, for which its transaction takes a transaction id and holds it until
+it rolls back, as under `WithTx` the host's transaction does until it ends, so while its read runs,
+`History` and `Export` anywhere in the cluster read no record of a transaction that took its id
+after it. Keep each read short, as an access review of many subjects reads them in several calls,
+not one. Without views, so that the transaction could be read only, every statement would name
+history in place of each table, and a hook's query through the `DB` it is given would read the
+tables as they are now. `AsOf` takes a time from 4714 BC, the earliest PostgreSQL holds, to
+9999-12-30, the last the package stores: pgx sends a time as 64 bits of microseconds from 2000,
+which a time past year 294,000 or so wraps, so the database would read it as another, or refuse it.
+A statement reads the history of the rows it names, as a check
 does its subject's grants, groups and the denies on its resource's path, a search its subject's
 grants, and the public's and the members' it counts, on each type it lists, and the custom roles
 they name, and `Holders` the members of the groups it lists, not the whole tenant's: `AsOf` plans
 every statement in its transaction for its arguments, the host's too, since a connection's cached
-plan of a statement it has run often counts any tenant as an average one. A list counts the denies
+plan of a statement it has run often counts any tenant as an average one, and without JIT, as so
+planned over history, they cost past `jit_above_cost` for an ordinary subject: a host's query of a
+`Filter` condition for a subject of 249 grants on containers took 760 ms with JIT, almost all of it
+compiling, and 110 ms without. A list counts the denies
 on scopes of its types by history's versions of them, at most a few, and `Grantable`, which can
 offer any custom role, reads each version of every one once. It orders a row's changes by their ids
 in `rbac_history`, which sessions take out of order once that table's id sequence caches more than
@@ -451,10 +483,26 @@ ended by then goes, once no version before its end stays. One call deletes at mo
 records: call it again while it deletes as many, and each goes on from where the last stopped. It
 reads history that many records at a time, on a pool or a connection each in a transaction of its
 own, so however long history is, none holds exports back for long. A transaction that deletes
-records is recorded in history; one that deletes none changes nothing, and is not. Run it on a
-connection of the administrator's role below, which has the rights of history's owner, as the
-application's hasn't, and keep what the host's audit retention requires: the federal floor is at
-least a year.
+records is recorded in history, with the last record it deleted in `History`'s order; one that
+deletes none changes nothing, and is not. `History` refuses the cursor of an export that began
+before a prune where it is before the last record the prune deleted, as that export would read on
+past what the prune deleted, so where several exports read history, `through` is the cursor of the
+one furthest behind. An export that began after the prune, as one from the start after a refusal
+or a failover, reads history as the prune left it and isn't refused for it. Where a cursor stands
+can't tell the two apart; `Cursor.Horizon`, the oldest transaction running as its export began,
+does, so keep it with the cursor and each checkpoint, whose signature covers it, and never set it: a
+later one would hide a prune since the export began. A cursor without it, as one kept from an
+earlier release, is refused for any prune recorded after it that deleted a record after it, and its
+export starts again from the start. While a transaction that took its id before a prune is still
+running, a read from the start reads nothing, as its export would count the prune as one since it
+began: while prunes that delete records come faster than the longest transactions end, as they can
+while working through a long backlog, no export from the start begins. Run it on a connection of the
+administrator's role below, which has the rights of history's owner, as the application's hasn't,
+and keep what the host's audit retention requires: the federal floor is at least a year. A delete
+from history that no prune its transaction records reaches, as one by hand, is refused as the
+transaction commits, so no delete through history's triggers leaves an export reading on past what
+it removed; disabling them takes a role with the rights of history's owner, which the signed chain
+is kept against.
 
 A role that owns a table can change it whatever its triggers say, and a schema's owner can drop
 any table in it. So that the application's database role can't rewrite history or write around
@@ -590,6 +638,15 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   change, as each writes history, wait until it commits too, and only a transaction under way as it
   starts that read history or made a change, as deleting a scope's eligibilities and then its grants
   does, and then writes a grant can make it give way.
+  `0020_recorded_prunes` builds an index of prunes' records on history, which reads all of history,
+  and adds the trigger that refuses a delete from history no prune records. It locks history against
+  writes before either, so every change, as each writes history, waits until it commits, though
+  reads of history go on, and a transaction under way as it starts that made a change can make it
+  give way. A prune by an earlier release records itself without the last record it deleted, in a
+  statement after its delete: it still deletes, but not in a transaction that sets constraints
+  immediate, and `History` refuses an export's cursor before the one it went through. The trigger
+  checks each record a prune deletes as its transaction commits, which took a window of 10,000
+  records about twice as long to delete.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A call PostgreSQL refuses for a race, as a
   serialization failure, a deadlock between host transactions, or a lock it waited for past the
@@ -642,7 +699,9 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   a subject in many groups it costs every check, and Activate, far past `jit_above_cost`, and each
   call then compiles its statement before running it, which takes longer than running it: for an
   identity in 1,000 groups, a check took 550 ms, and 120 ms with JIT off, and Activate's statement
-  spent 500 of its 650 ms compiling.
+  spent 500 of its 650 ms compiling. As of a time, every statement costs so for any subject, as
+  planned for its arguments over history: `AsOf` turns JIT off in its own transaction, which the
+  rollback puts back, whatever the role's setting.
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
   to run on a schedule, passing over what a change holds until the next run. A call reads
   `Config.Now` once, which every expiry it compares and every condition's `request.time` read, so a

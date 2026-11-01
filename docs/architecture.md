@@ -235,7 +235,8 @@ erDiagram
   principal sooner.
 - **Every write is recorded.** Each table above but `rbac_history` has the trigger
   `rbac_record`, which writes the change into `rbac_history`. Nothing updates or truncates that
-  table, and only `PruneHistory`, as a role with the rights of its owner, deletes from it. Each
+  table, and only `PruneHistory`, as a role with the rights of its owner, deletes from it, each
+  delete reached by a prune its transaction records. Each
   record reads its key's last by history's index of each entity's keys, in a generic plan with
   sequential scans off: a plan its session made while history was small would otherwise scan all
   of it for each row, and one made for each row, until history is analyzed, read all of the
@@ -700,6 +701,7 @@ flowchart LR
     store -->|"VerifyChain(from, records, to, key)"| verify(["records unaltered,<br/>none dropped"])
     hist -->|"temporary views of each table<br/>as it was at a time"| asof["AsOf(tenant, time, read)"]
     hist -->|"PruneHistory(before, through)"| prune["superseded versions, and rows<br/>ended, that an export has read"]
+    prune -->|"records the last it deleted;<br/>History refuses an earlier export's cursor before it"| hist
 ```
 
 - **What a record holds.** Each holds the row as it was and as it became, when it took effect, the
@@ -715,9 +717,15 @@ flowchart LR
   is one `History` can't return. A row written before history was installed has one record from
   migrating, its baseline, dated when it was created, or at the epoch where that was before year 1
   or at its first instant.
-- **History's order.** `History` reads records in transaction order, and only those of
-  transactions older than every transaction still running, which have all ended. So a cursor
-  never passes a record that commits later. It, `Export` and `PruneHistory` name history by its
+- **History's order.** `History` reads records in transaction order, by the id each transaction
+  takes at its first write, and only those of transactions older than every transaction still
+  running, which have all ended. So a cursor never passes a record that commits later. That is
+  not each row's order: a transaction that took its id first and changed a row after another
+  committed a change to it is read first, though its change came after. A row's versions are in
+  the order of their records' ids, in which they were written, as AsOf and PruneHistory read
+  them, and a consumer replaying an export applies them so. Any transaction holding an id holds
+  every read back, AsOf's too, whose views take one. It, `Export` and `PruneHistory` name history
+  by its
   schema, as `AsOf` does, and their types by pg_catalog's, so a session's temporary table or type
   stands in for none of it. A schema the application's role made or can create in, first on its
   search_path, would: that role can do neither.
@@ -725,14 +733,37 @@ flowchart LR
   timeline, and the database and schema. Failing over or recovering to a point in time starts a
   new generation, which an export starts again from `Genesis`. A restore that starts none, as
   from a disk snapshot, keeps the generation: where it lost a cursor's last record, `History`
-  refuses that cursor, and history is exported again from the start.
+  refuses that cursor, and history is exported again from the start. Where it kept that record
+  and lost what came after, nothing in the database tells it from recovering from a crash, so a
+  restore that should start a generation is a recovery to a point in time.
+- **No record goes from under a cursor.** A prune records, for each of its transactions that
+  deleted any, the last record it deleted in `History`'s order, and `History` refuses the cursor
+  of an export that began before the prune where it is before that record, in the statement that
+  checks the cursor and again in the one that reads after it, as a prune can commit between them:
+  an export further behind than the cursor a prune went through would otherwise read on past what
+  it deleted, and chain the rest as all history held. An export that began after the prune reads
+  history as it left it, and stands where an earlier one could: its cursor's `Horizon`, the oldest
+  transaction running as its first read from the start began, tells them apart, as a prune of an
+  earlier transaction had ended by then. A read from the start reads nothing while a prune it sees
+  is of a transaction no older than the oldest running, which it would count as one since.
+  History's index of prunes (`rbac_history_prunes`) finds those recorded after a cursor and from
+  its horizon on, which are few; a prune is recorded after what it deletes, so no earlier one can
+  have deleted past the cursor. A delete from history, which only a role with the rights of
+  history's owner gets past the append-only trigger, is refused as its transaction commits
+  (`rbac_history_pruned`) unless a prune that transaction records reaches the record, by the last
+  it deleted or, for a prune recorded before 0020, the cursor it went through, and the record is of
+  an earlier transaction.
 - **The export chain.** `Export` hashes each record onto the last checkpoint with SHA-256 and signs
   the checkpoint with the host's `crypto.Signer`: ECDSA on P-256, P-384 or P-521, Ed25519, or RSA
   of at least 3072 bits, each verified with the Go standard library. `VerifyChain` checks a run of
   records between two checkpoints.
 - **AsOf** stands temporary views of history in for the tables, in a transaction it rolls back,
   so every check, list and search answers as it would have at a past time, with the catalog and
-  the label dimensions as they are now. Each statement reads history by the rows it names, through
+  the label dimensions as they are now. Making the views takes a transaction id, which holds every
+  export in the cluster back while the read runs. Every statement is planned for its arguments and
+  runs without JIT, which such plans over history cost past `jit_above_cost` for any subject. It
+  takes a time from PostgreSQL's earliest to 9999-12-30, as pgx sends a later one as another.
+  Each statement reads history by the rows it names, through
   history's indexes, as a search the custom roles its grants name, by their ids, and its principals'
   grants by principal and type, which history's index of a principal's versions holds beside the
   scope, as a check seeks them on its resource's path. The view of custom roles takes each one's
@@ -743,7 +774,9 @@ flowchart LR
   and refuses an earlier one; of a row whose last version by then ended it, it deletes every
   version, the end last. It reads history `MaxPrune` records at a time, each in a transaction of
   its own, so none holds exports back for long however long history is. Each that deleted records
-  is recorded in history, and AsOf finds the latest prune's time by history's index.
+  is recorded in history, in the statement that deletes, with the last record it deleted, and AsOf
+  finds the latest prune's time by history's index. With several exports, it prunes through the
+  cursor of the one furthest behind.
 
 ## Database roles
 
