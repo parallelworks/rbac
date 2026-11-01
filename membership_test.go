@@ -4292,6 +4292,45 @@ func TestAGrantToAGroupMadeWhileMembersAreAskedAboutIsTriedAgain(t *testing.T) {
 	}
 }
 
+// A change adding members to two groups is tried again when, while the host is asked about what
+// one's member gains through the group it is in, the other is nested in that group too: the change
+// holds its lock already, and what it holds was asked about for the first member alone, so the
+// other's would gain it unasked.
+func TestAGroupNestedMeanwhileInOneAnotherJoinedGroupIsInIsTriedAgain(t *testing.T) {
+	for _, how := range []string{"ChangeMembers", "ImportMembers"} {
+		t.Run(how, func(t *testing.T) {
+			var meanwhile func(context.Context) error
+			h := meanwhileAsked(t, rbac.ViaMembership, &meanwhile)
+			ctx := t.Context()
+			h.groups(t, "devs", "ops")
+			h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "staff"))
+			if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "staff", Principal: groupOf("ops")}}); err != nil {
+				t.Fatal(err)
+			}
+			h.join(t, "u", "v")
+			add := []rbac.Member{{Group: "devs", Principal: identity("u")}, {Group: "ops", Principal: identity("v")}}
+			change := func() error {
+				if how == "ImportMembers" {
+					return h.authz.ImportMembers(ctx, host, "t1", add)
+				}
+				return h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", add, nil)
+			}
+			meanwhile = func(ctx context.Context) error {
+				return h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "staff", Principal: groupOf("devs")}})
+			}
+			if err := change(); !errors.Is(err, rbac.ErrConflict) {
+				t.Fatalf("a change adding to a group nested meanwhile in one another it adds to is in: %v", err)
+			}
+			if meanwhile != nil {
+				t.Fatal("devs should have been nested in staff meanwhile")
+			}
+			if err := change(); err != nil {
+				t.Fatalf("tried again: %v", err)
+			}
+		})
+	}
+}
+
 // A group nested above one a change reaches while the host is asked about the change is one whose
 // lock the change doesn't hold, so it is tried again, rather than let a grant to that group commit
 // before it, unasked about the members it adds.
