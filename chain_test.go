@@ -301,10 +301,29 @@ func TestTheChainsEncodingIsFixed(t *testing.T) {
 	}
 }
 
+// exportNext exports up to limit records after from until it reads one, as another session's open
+// transaction can hold an export back, and returns them and their checkpoint.
+func exportNext(t *testing.T, h *harness, from rbac.Checkpoint, limit int, signer crypto.Signer) ([]rbac.Record, rbac.Checkpoint) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		records, next, err := h.authz.Export(t.Context(), from, limit, signer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(records) > 0 {
+			return records, next
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("read 0 records")
+		}
+	}
+}
+
 // A checkpoint's Horizon tells History which prunes to refuse its cursor for: one moved past a
-// prune that deleted records the export hadn't read would read on past them, and Export sign a
-// chain without them. So the signature covers it, and VerifyChain refuses a checkpoint whose
-// Horizon isn't that of the one it goes on from, which Export signed from a checkpoint it was given.
+// prune that deleted records the export hadn't read would read on past them. So the signature
+// covers it, Export refuses a checkpoint whose Horizon was moved, and VerifyChain refuses to go on
+// from an export begun before the prune with a checkpoint of one begun after it, which can stand at
+// a record with the same chain but goes on past what the prune deleted.
 func TestACheckpointVouchesForItsHorizon(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -314,17 +333,7 @@ func TestACheckpointVouchesForItsHorizon(t *testing.T) {
 		t.Fatal(err)
 	}
 	// An export that has read the first record, behind what a prune through the end deletes.
-	var behind rbac.Checkpoint
-	for deadline := time.Now().Add(10 * time.Second); behind.Count == 0; {
-		_, next, err := h.authz.Export(ctx, rbac.Checkpoint{}, 1, key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if next.Count == 0 && time.Now().After(deadline) {
-			t.Fatal("read 0 records")
-		}
-		behind = next
-	}
+	_, behind := exportNext(t, h, rbac.Checkpoint{}, 1, key)
 	if behind.Cursor.Horizon == 0 {
 		t.Fatalf("an export from the start has no Horizon: %+v", behind.Cursor)
 	}
@@ -334,27 +343,73 @@ func TestACheckpointVouchesForItsHorizon(t *testing.T) {
 	if _, _, err := h.authz.Export(ctx, behind, 10, key); !errors.Is(err, rbac.ErrInvalid) {
 		t.Fatalf("Export from before what a prune deleted: %v", err)
 	}
-	moved := behind
-	moved.Cursor.Horizon = math.MaxUint64
 	for _, horizon := range []uint64{0, behind.Cursor.Horizon + 1, math.MaxUint64} {
 		c := behind
 		c.Cursor.Horizon = horizon
 		if err := c.Verify(key.Public()); !errors.Is(err, rbac.ErrUnverified) {
 			t.Errorf("a checkpoint whose Horizon was moved to %d: %v", horizon, err)
 		}
+		if got, next, err := h.authz.Export(ctx, c, 10, key); !errors.Is(err, rbac.ErrUnverified) || !reflect.DeepEqual(next, c) {
+			t.Errorf("Export from a checkpoint whose Horizon was moved to %d: %d records, %v", horizon, len(got), err)
+		}
 	}
-	var records []rbac.Record
-	var next rbac.Checkpoint
-	for deadline := time.Now().Add(10 * time.Second); len(records) == 0; {
-		if records, next, err = h.authz.Export(ctx, moved, 10, key); err != nil {
-			t.Fatalf("Export from a checkpoint whose Horizon was moved: %v", err)
-		}
-		if len(records) == 0 && time.Now().After(deadline) {
-			t.Fatal("read 0 records")
-		}
+	// An export from the start after the prune reads the same first record, which the prune kept.
+	_, again := exportNext(t, h, rbac.Checkpoint{}, 1, key)
+	if again.Hash != behind.Hash || again.Count != behind.Count || again.Cursor.Horizon <= behind.Cursor.Horizon {
+		t.Fatalf("an export from the start after a prune = %+v, before it %+v", again, behind)
+	}
+	records, next := exportNext(t, h, again, 10, key)
+	if err := rbac.VerifyChain(again, records, next, key.Public()); err != nil {
+		t.Fatalf("an export begun after a prune: %v", err)
 	}
 	if err := rbac.VerifyChain(behind, records, next, key.Public()); !errors.Is(err, rbac.ErrUnverified) {
-		t.Errorf("records exported past what a prune deleted, from a checkpoint whose Horizon was moved: %v", err)
+		t.Errorf("records exported past what a prune deleted, after a checkpoint of an export begun before it: %v", err)
+	}
+}
+
+// Export reads on from a checkpoint's cursor and chains onto its hash, which VerifyChain checks
+// against the checkpoint kept: given one whose cursor was moved ahead, its hash kept, it would skip
+// the records between with a chain that verifies. So it goes on only from a checkpoint its signer's
+// key verifies, and a host changing keys signs the latest with the new one.
+func TestAnExportGoesOnOnlyFromACheckpointItsKeyVerifies(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	interleaved(t, h)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, at := exportNext(t, h, rbac.Checkpoint{}, 1, key)
+	_, ahead := exportNext(t, h, at, 2, key)
+	moved := at
+	moved.Cursor = ahead.Cursor
+	unsigned := rbac.Genesis(at.Cursor.Generation)
+	for what, from := range map[string]struct {
+		rbac.Checkpoint
+		crypto.Signer
+	}{
+		"whose cursor was moved ahead": {moved, key},
+		"another key signed":           {at, newKey},
+		"no key signed":                {unsigned, key},
+	} {
+		if got, next, err := h.authz.Export(ctx, from.Checkpoint, 10, from.Signer); !errors.Is(err, rbac.ErrUnverified) || !reflect.DeepEqual(next, from.Checkpoint) {
+			t.Errorf("Export from a checkpoint %s: %d records, %v", what, len(got), err)
+		}
+	}
+	rotated, err := at.Sign(newKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, next := exportNext(t, h, rotated, 10, newKey)
+	if err := rbac.VerifyChain(rbac.Genesis(at.Cursor.Generation), first, rotated, newKey.Public()); err != nil {
+		t.Errorf("a checkpoint signed again with a new key: %v", err)
+	}
+	if err := rbac.VerifyChain(rotated, records, next, newKey.Public()); err != nil {
+		t.Errorf("an export from a checkpoint signed again with a new key: %v", err)
 	}
 }
 

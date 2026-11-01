@@ -1965,7 +1965,10 @@ func TestHistoryRefusesACursorAPruneWentPast(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	from := rbac.Checkpoint{Cursor: behind, Count: 7, Hash: sha256.Sum256([]byte("the chain so far"))}
+	from, err := rbac.Checkpoint{Cursor: behind, Count: 7, Hash: sha256.Sum256([]byte("the chain so far"))}.Sign(key)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got, next, err := h.authz.Export(ctx, from, rbac.MaxHistory, key); !errors.Is(err, rbac.ErrInvalid) || !reflect.DeepEqual(next, from) {
 		t.Errorf("Export from a checkpoint a prune went past: %d records, %+v, %v", len(got), next, err)
 	}

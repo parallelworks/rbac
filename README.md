@@ -393,7 +393,10 @@ change was made in (`WithTx`) rolls back.
 
 `Export(ctx, from, limit, signer)` reads as `History` does and chains what it reads onto `from`,
 a `Checkpoint`: a SHA-256 hash chain over every record of the generation in order, signed by the
-host's `crypto.Signer`, such as a key in a key management service. Keep the records and each
+host's `crypto.Signer`, such as a key in a key management service. `from` is the zero `Checkpoint`,
+or one `Export` returned that the signer's key verifies: one whose cursor was moved ahead would skip
+the records between with a chain that verifies. To change keys, `Sign` the latest checkpoint, once
+the old key verifies it, with the new one, and go on from that. Keep the records and each
 checkpoint where they can't be rewritten, as write-once storage. `VerifyChain` then shows that the
 records between two checkpoints are those history held, none dropped, changed or reordered, which
 a database's superuser couldn't forge past the last checkpoint stored: `History` refuses a cursor
