@@ -236,8 +236,10 @@ type Conflict struct {
 // Conflicts lists the identities in a tenant able to hold two values of an exclusive dimension,
 // as a catalog change or a dimension made Exclusive leaves them, by principal and dimension. It
 // has no limit or cursor, so what it returns grows with them, as after a catalog change that makes
-// a role the tenant's members hold give two.
-func (a *Authorizer) Conflicts(ctx context.Context, tenant string) ([]Conflict, error) {
+// a role the tenant's members hold give two. It reads the custom roles in the statement that reads
+// their grants, so what it lists one moment held, under WithTx at READ COMMITTED too.
+func (a *Authorizer) Conflicts(ctx context.Context, tenant string) (_ []Conflict, err error) {
+	defer conflicting(&err)
 	a = a.still()
 	if !validID(tenant) {
 		return nil, fmt.Errorf("%w: no tenant", ErrInvalid)
@@ -245,18 +247,16 @@ func (a *Authorizer) Conflicts(ctx context.Context, tenant string) ([]Conflict, 
 	if !a.exclusive() {
 		return nil, nil
 	}
+	gives := a.exclusiveValues(a.cfg.Catalog)
+	// Only those holding a role that gives a value can hold two, so they alone are read: the
+	// built-in ones here, and the custom ones in the statement.
+	roles := []string{}
+	for r := range gives {
+		roles = append(roles, string(r))
+	}
+	// In a transaction, which holds JIT off for the statement (withoutJIT).
 	return snapshot(ctx, a, func(a *Authorizer) ([]Conflict, error) {
-		custom, err := a.customRoles(ctx, a.db, tenant)
-		if err != nil {
-			return nil, err
-		}
-		gives := a.exclusiveValues(slices.Concat(a.cfg.Catalog, custom))
-		// Only those holding a role that gives a value can hold two, so they alone are read.
-		roles := []string{}
-		for r := range gives {
-			roles = append(roles, string(r))
-		}
-		return a.conflicts(ctx, a.db, tenant, gives, []string{}, roles, 0)
+		return a.conflicts(ctx, a.db, tenant, gives, []string{}, roles, true, 0)
 	})
 }
 
@@ -307,7 +307,7 @@ func (a *Authorizer) excludes(ctx context.Context, tx pgx.Tx, tenant string, e C
 	if len(seeds)+len(redefined) == 0 {
 		return nil
 	}
-	found, err := a.conflicts(ctx, tx, tenant, gives, seeds, redefined, 1)
+	found, err := a.conflicts(ctx, tx, tenant, gives, seeds, redefined, false, 1)
 	if err != nil || len(found) == 0 {
 		return err
 	}
@@ -320,11 +320,16 @@ func (a *Authorizer) excludes(ctx context.Context, tx pgx.Tx, tenant string, e C
 
 // conflicts returns up to limit, or with 0 every, conflict of the identities the seeds reach, as
 // principal keys, and the holders of the roles in holdersOf, by gives, the exclusive values each
-// role gives. Each is read up to its keys as checks read them, and its own grants even while it is
-// no member or guest, which it holds once it is one; the anonymous, which holds what the public
-// does, is read where the public is reached, as are those no member whose own grants or
-// eligibilities give a value, which they hold beside the public's.
-func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives map[Role][]Permission, seeds, holdersOf []string, limit int) ([]Conflict, error) {
+// role gives, and with readCustom, by the tenant's custom roles too, each a giver of the values it
+// gives and its holders read, in the statement that reads their grants: read apart, as under WithTx
+// at READ COMMITTED each statement reads a moment of its own, a role narrowed and a value granted
+// meanwhile would read as a conflict no moment held. Each is read up to its keys as checks read
+// them, and its own grants even while it is no member or guest, which it holds once it is one; the
+// anonymous, which holds what the public does, is read where the public is reached, as are those
+// no member whose own grants or eligibilities give a value, which they hold beside the public's.
+func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives map[Role][]Permission, seeds, holdersOf []string, readCustom bool,
+	limit int,
+) ([]Conflict, error) {
 	roles, values := []string{}, []string{}
 	for r, ps := range gives {
 		for _, p := range ps {
@@ -341,7 +346,8 @@ func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives m
 	// then plans no read of them. A generic plan can't tell from an empty array to read none. Of
 	// custom roles alone, as a redefinition names, they are read a role at a time, through the index
 	// leading to custom roles; no index leads to a built-in one, so with one among them, as where every
-	// conflict is listed, every grant and eligibility in the tenant is read.
+	// conflict is listed, every grant and eligibility in the tenant is read. Those the statement reads
+	// itself (readCustom) are read a role at a time beside them.
 	holders, custom := "FALSE", "FALSE"
 	switch {
 	case slices.ContainsFunc(holdersOf, func(r string) bool { return !isCustom(Role(r)) }):
@@ -349,28 +355,74 @@ func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives m
 	case len(holdersOf) > 0:
 		custom = "TRUE"
 	}
+	given, args := givenArgs, []any{tenant, seeds, holdersOf, a.cfg.Now(), roles, values}
+	if readCustom {
+		given, custom = givenWithCustom, "TRUE"
+	}
 	// The planner can't tell which of targets' branches the seeds reach, so it costs a change's
 	// check as if it read every identity in the tenant, past JIT's thresholds where they are in
 	// groups: compiling then takes a second for a plan that runs in milliseconds.
 	return withoutJIT(ctx, q, func() ([]Conflict, error) {
-		return a.conflictsIn(ctx, q, tenant, seeds, holdersOf, roles, values, holders, custom, limited)
+		return conflictsIn(ctx, q, given, args, holders, custom, limited)
 	})
 }
 
-// conflictsIn is conflicts' statement: of the roles giving values, the holders of holdersOf read
-// across the tenant where holders is TRUE, or a role at a time where custom is, and limited its
-// LIMIT clause.
-func (a *Authorizer) conflictsIn(ctx context.Context, q DB, tenant string, seeds, holdersOf, roles, values []string, holders, custom, limited string,
-) ([]Conflict, error) {
+// valuesGiven is SQL for the roles giving exclusive values as conflictsIn reads them: with, the
+// WITH entry they need, or none; pairs, each role and a value it gives, as v(role, value); gives,
+// whether the role of a row read among the tenant's is one of them, and held, one whose holders are
+// read; alsoGives, the principals of the rows of those gives leaves out, or none; givesKeys,
+// whether the role of a row read by its key is one; and holders, an array of the custom roles
+// whose holders are read.
+type valuesGiven struct{ with, pairs, gives, held, alsoGives, givesKeys, holders string }
+
+var (
+	// givenArgs are the roles and values conflicts is passed, $5 and $6, and the holders of $3, as
+	// arrays a statement planned for its arguments reads the elements of, and finds a row's role in
+	// by a hash of them.
+	givenArgs = valuesGiven{
+		pairs: "unnest($5::text[], $6::text[]) AS v(role, value)", gives: "role = ANY($5::text[])", held: "role = ANY($3::text[])",
+		givesKeys: "role = ANY($5::text[])", holders: "$3",
+	}
+	// givenWithCustom are those, with $5 and $6 every built-in role giving a value, and the tenant's
+	// custom roles giving any of $6, all a custom role can give of them as current reads it, read
+	// with their grants, each a role whose holders are read beside those of $3. The custom ones' rows
+	// are read a role at a time (customRoleRows): matched against roles the statement reads, even by
+	// IN, which hashes them, a row's role is found by no index, so as of a time every version of every
+	// grant in the tenant would be read, not those history's index on roles finds. For each key,
+	// whose rows are few, a role is looked up in an array of them all, which IN would hash for each.
+	givenWithCustom = valuesGiven{
+		with: `custom_given(role, value) AS (
+		  SELECT r.id, p.value FROM rbac_roles r CROSS JOIN LATERAL unnest(r.permissions) AS p(value)
+		  WHERE r.tenant = $1 AND p.value = ANY($6::text[])
+		), given(role, value) AS (
+		  SELECT * FROM unnest($5::text[], $6::text[]) UNION ALL SELECT * FROM custom_given
+		), `,
+		pairs: "given AS v", gives: givenArgs.gives, held: givenArgs.held,
+		alsoGives: `
+		    UNION ALL
+		    SELECT principal FROM (` + customRoleRows(customGiving, "rbac_grants", "principal", "TRUE") + `) cg
+		    UNION ALL
+		    SELECT principal FROM (` + customRoleRows(customGiving, "rbac_eligibilities", "principal", "TRUE") + `) ce`,
+		givesKeys: "role = ANY(ARRAY(SELECT role FROM given))", holders: customGiving,
+	}
+)
+
+// customGiving is the custom roles givenWithCustom reads as giving values, each once.
+const customGiving = "ARRAY(SELECT DISTINCT role FROM custom_given)"
+
+// conflictsIn is conflicts' statement, run with args: of the roles giving values, as given reads
+// them, the holders read across the tenant where holders is TRUE, or a role at a time where custom
+// is, and limited its LIMIT clause.
+func conflictsIn(ctx context.Context, q DB, given valuesGiven, args []any, holders, custom, limited string) ([]Conflict, error) {
 	// Each key's values are looked up by key, so a change reads what the identities it reaches
 	// hold, not every value held in the tenant, and stops at the first conflict it finds.
 	rows, err := q.Query(ctx, `
-		WITH RECURSIVE seeds(k) AS (
+		WITH RECURSIVE `+given.with+`seeds(k) AS (
 		  SELECT unnest($2::text[]) COLLATE "C"
-		  UNION SELECT principal FROM rbac_grants WHERE `+holders+` AND tenant = $1 AND role = ANY($3::text[])
-		  UNION SELECT principal FROM rbac_eligibilities WHERE `+holders+` AND tenant = $1 AND role = ANY($3::text[])
-		  UNION SELECT principal FROM (`+customRoleRows("$3", "rbac_grants", "principal", custom)+`) g
-		  UNION SELECT principal FROM (`+customRoleRows("$3", "rbac_eligibilities", "principal", custom)+`) e
+		  UNION SELECT principal FROM rbac_grants WHERE `+holders+` AND tenant = $1 AND `+given.held+`
+		  UNION SELECT principal FROM rbac_eligibilities WHERE `+holders+` AND tenant = $1 AND `+given.held+`
+		  UNION SELECT principal FROM (`+customRoleRows(given.holders, "rbac_grants", "principal", custom)+`) g
+		  UNION SELECT principal FROM (`+customRoleRows(given.holders, "rbac_eligibilities", "principal", custom)+`) e
 		), `+insideSQL(`ARRAY(SELECT substr(k, 7) FROM seeds WHERE k LIKE 'group:%')`, "$4", "NULL", false)+`,
 		targets(identity) AS (
 		  SELECT k FROM seeds WHERE k NOT LIKE 'group:%' AND k NOT LIKE 'members:%' AND k <> 'public:'
@@ -378,9 +430,9 @@ func (a *Authorizer) conflictsIn(ctx context.Context, q DB, tenant string, seeds
 		  UNION SELECT principal FROM rbac_memberships WHERE tenant = $1
 		    AND EXISTS (SELECT FROM seeds WHERE k IN ('members:' || $1, 'public:'))
 		  UNION SELECT o.principal FROM (
-		    SELECT principal FROM rbac_grants WHERE tenant = $1 AND role = ANY($5::text[])
+		    SELECT principal FROM rbac_grants WHERE tenant = $1 AND `+given.gives+`
 		    UNION ALL
-		    SELECT principal FROM rbac_eligibilities WHERE tenant = $1 AND role = ANY($5::text[])
+		    SELECT principal FROM rbac_eligibilities WHERE tenant = $1 AND `+given.gives+given.alsoGives+`
 		  ) o WHERE o.principal NOT LIKE 'group:%' AND o.principal NOT LIKE 'members:%' AND o.principal <> 'public:'
 		    AND EXISTS (SELECT FROM seeds WHERE k = 'public:')
 		  UNION SELECT '' WHERE EXISTS (SELECT FROM seeds WHERE k = 'public:')
@@ -388,17 +440,16 @@ func (a *Authorizer) conflictsIn(ctx context.Context, q DB, tenant string, seeds
 		  SELECT t.identity, v.value COLLATE "C" FROM targets t
 		  CROSS JOIN LATERAL (WITH RECURSIVE `+keysSQL("$1::text", "t.identity", "$4")+` SELECT k FROM bound) ks
 		  CROSS JOIN LATERAL (
-		    SELECT role FROM rbac_grants WHERE tenant = $1 AND principal = ks.k AND scope = 'tenant:' || $1 AND role = ANY($5::text[])
+		    SELECT role FROM rbac_grants WHERE tenant = $1 AND principal = ks.k AND scope = 'tenant:' || $1 AND `+given.givesKeys+`
 		      AND (expires_at IS NULL OR expires_at > $4)
 		    UNION ALL
-		    SELECT role FROM rbac_eligibilities WHERE tenant = $1 AND principal = ks.k AND scope = 'tenant:' || $1 AND role = ANY($5::text[])
+		    SELECT role FROM rbac_eligibilities WHERE tenant = $1 AND principal = ks.k AND scope = 'tenant:' || $1 AND `+given.givesKeys+`
 		      AND (expires_at IS NULL OR expires_at > $4)
 		  ) g
-		  JOIN unnest($5::text[], $6::text[]) AS v(role, value) ON v.role = g.role
+		  JOIN `+given.pairs+` ON v.role = g.role
 		)
 		SELECT identity, split_part(value, ':', 1), array_agg(DISTINCT value ORDER BY value) FROM held
-		GROUP BY 1, 2 HAVING count(DISTINCT value) > 1 ORDER BY 1, 2`+limited,
-		tenant, seeds, holdersOf, a.cfg.Now(), roles, values)
+		GROUP BY 1, 2 HAVING count(DISTINCT value) > 1 ORDER BY 1, 2`+limited, args...)
 	if err != nil {
 		return nil, err
 	}

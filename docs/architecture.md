@@ -235,7 +235,8 @@ erDiagram
   principal sooner.
 - **Every write is recorded.** Each table above but `rbac_history` has the trigger
   `rbac_record`, which writes the change into `rbac_history`. Nothing updates or truncates that
-  table, and only `PruneHistory`, as a role with the rights of its owner, deletes from it. Each
+  table, and only `PruneHistory`, as a role with the rights of its owner, deletes from it, each
+  delete reached by a prune its transaction records. Each
   record reads its key's last by history's index of each entity's keys, in a generic plan with
   sequential scans off: a plan its session made while history was small would otherwise scan all
   of it for each row, and one made for each row, until history is analyzed, read all of the
@@ -311,7 +312,7 @@ flowchart LR
   conditions. `ResourceOf` is asked only
   when a change needs a scope's own ancestors, labels or attributes.
 - **For lists, the host stores the path** in a `text[]` column with a GIN index, and `Filter`
-  matches it.
+  matches it and tests its first key's type, so one table can hold resources of several types.
 
 ## A check
 
@@ -473,6 +474,17 @@ sequenceDiagram
 - **Custom roles.** `SetRole` redefines a role in place for every grant of it, so it asks
   `ValidateGrant` about every grant and eligibility the new definition widens, before its
   transaction, and under the tenant's lock refuses with `ErrConflict` if those changed meanwhile.
+  A grant widens by what it gives through its principal, as checks read it
+  (`redefinition.widensTo`): one to the tenant's members of a privileged role, or to the public of
+  a role not marked `Public`, gives nothing, and widens once the role gives it something, however
+  the role changed, as narrowing it so that it is no longer privileged does. On each scope a grant
+  that widens is on, the denies on its path that remove from the actor a permission the role will
+  give refuse the change, as they would refuse `Apply` granting it there; on the others, only those
+  removing its power to change grants there do. A grant to the tenant's members of a privileged
+  role is read there as one to a principal named one by one (`widenedTo.reaches`): a catalog
+  change that has the role no longer be privileged gives them what it gives, what the redefinition
+  added too, and asks no one. A scope read as stored, as the host no longer has it, that the change
+  comes to give more on while it waits refuses it with `ErrConflict`.
 - **Eligibilities.** `SetEligibility` lets a principal `Activate` a role for a while, perhaps
   only with approvers or a `requires` condition. An activation is a grant that ends no later than
   its eligibility expires, or its holder's membership or place in the group the eligibility names
@@ -532,20 +544,29 @@ flowchart LR
 - **Filter** returns a condition for the host's own query, which reads the grants in the same
   statement as the rows, so sorting and pagination work and nothing changes between deciding and
   reading, for the query it was built for: build one for each. It never keeps a row Authorize would
-  refuse. The subject's grants are matched through the path's GIN index, which merges the rows each
-  finds, so its cost for each row grows with their number. Past a few on resources of the listed
-  type, each row's own key is looked up in a hash of them, and past 128 on containers and the tenant,
-  or past a few alongside those, each of its keys in one object of them all, so one with a grant on
-  everything it created costs a row a few lookups; no index serves that, so the query reads every
-  row of the tenant its other conditions keep. Denies are looked up so whatever their number: those
-  on resources of the type by the row's own key, and those on containers and the tenant by each of
-  its keys. Those naming the subject or its groups are read by those keys alone. Those naming the
-  public or the tenant's members bind everyone, and any number of them can be on scopes of other
-  types, which no index tells apart: while fewer than 16 denies are on scopes of the types a list
-  reads, it reads those by type, and otherwise finds the ones naming everyone by those keys, so a
-  tenant with many of both has every list read every deny naming everyone.
-- **Reachable** returns the same as scopes, for a host that keeps its resources elsewhere.
-  Conditional grants and conditional denies come back apart, to check one by one.
+  refuse. It keeps only the rows whose own key is of the listed type, as a grant on a container
+  reaches every row under it, of any type, so one table can hold several. The planner has no
+  statistics of a path's first key and counts a test of it alone as keeping one row in 200, which
+  would turn a sorted page of a table of one type, whose condition no index serves, into a read and
+  sort of the whole tenant. So the type picks the keys a row's denies are looked up by, which the
+  planner counts alike whatever they are: a row of another type has none, so its lookup is unknown
+  rather than false, and the row is left out. The subject's grants are matched through the path's
+  GIN index, which merges the rows each finds, so its cost for each row grows with their number.
+  Past a few on resources of the listed type, each row's own key is looked up in a hash of them, and
+  past 128 on containers and the tenant, or past a few alongside those, each of its keys in one
+  object of them all, so one with a grant on everything it created costs a row a few lookups; no
+  index serves that, so the query reads every row of the tenant its other conditions keep. Denies
+  are looked up so whatever their number: those on resources of the type by the row's own key, and
+  those on containers and the tenant by each of its keys. Those naming the subject or its groups are
+  read by those keys alone. Those naming the public or the tenant's members bind everyone, and any
+  number of them can be on scopes of other types, which no index tells apart: while fewer than 16
+  denies are on scopes of the types a list reads, it reads those by type, and otherwise finds the
+  ones naming everyone by those keys, so a tenant with many of both has every list read every deny
+  naming everyone.
+- **Reachable** returns the same as scopes, for a host that keeps its resources elsewhere. They hold
+  for resources of the listed type alone: a scope reaches everything under it, of any type, so a
+  store holding several keeps to the type itself. Conditional grants and conditional denies come
+  back apart, to check one by one.
 - **Holders** lists who may do a permission on a resource, for an access review. That is each
   identity, through its own grants and its groups', with the tenant's members and the public as
   one holder each. It marks holders that hold only under a condition, or that a deny, a
@@ -630,18 +651,62 @@ flowchart TB
   activation rests on before its grant. `DeleteRole` removes a role's grants before its
   eligibilities, but holds the tenant's lock exclusive, so no change runs beside it but
   `DeleteExpired`, which waits on no row.
-- **One snapshot for reads in several statements.** Explain, Reachable, Holders and Conflicts read
-  in one REPEATABLE READ, READ ONLY transaction of their own on a pool, and AsOf in a REPEATABLE
-  READ one it rolls back. Explain, Reachable and Holders read what label values are decided by in
-  it, and decide them after it, as the constraints are asked outside it.
-  Under `WithTx` they read on the host's transaction at its isolation, AsOf in a savepoint.
+- **One snapshot for reads in several statements.** Explain, Reachable and Holders read in one
+  REPEATABLE READ, READ ONLY transaction of their own on a pool, and AsOf in a REPEATABLE READ one
+  it rolls back. Explain, Reachable and Holders read what label values are decided by in it, and
+  decide them after it, as the constraints are asked outside it. Under `WithTx` they read on the
+  host's transaction at its isolation, AsOf in a savepoint: at READ COMMITTED each statement reads
+  a moment of its own, so a change committing between two can mix two states, and for AsOf, history
+  of a time not yet final. Conflicts reads in one statement, the custom roles with their grants, as
+  a check and `broadExcludes` read them, so it lists what one moment held under `WithTx` too: it
+  runs in such a transaction of its own only to hold JIT off for it (`withoutJIT`).
 - **One time for a call.** A call reads `Config.Now` once, where it first needs the time: every
   statement it makes compares expiry with it, and every condition reads it as `request.time`, so a
   grant or a membership ending as the call runs can't meet a deny, a condition or label values of a
   later moment. A change reads it again in its transaction, which first needs it under its locks,
   where it decides again by what committed before them. As of a time, it is that time.
-- **Races** PostgreSQL refuses, such as a serialization failure or a deadlock between host
-  transactions, match `ErrConflict`: try again.
+- **Races** PostgreSQL refuses, such as a serialization failure, a deadlock between host
+  transactions, or a lock waited for past `lock_timeout`, as one a migration holds, match
+  `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them, as it
+  returns (`conflicting`) where it queries outside `begin`, which maps its own, so one refused
+  before a change's transaction, as in the reads that decide a change first, which under `WithTx`
+  run on the host's transaction itself and can deadlock with a migration, in a read, or in a hook's
+  statement, whose error a call returns as it is, matches too. Under `WithTx` the host runs its
+  transaction again from its start: a statement refused on it outside a savepoint aborts it, and a
+  savepoint, rolled back to, frees nothing taken before it, which the race can be over.
+- **Migrating.** `Migrate` applies each pending migration in a transaction of its own, under an
+  advisory lock on the schema that holds another replica's migration back, and records it as it
+  commits: so a migration takes its locks in the order it names them, the tables before history,
+  whatever was pending before it, and a failure leaves the database at the last migration recorded,
+  where code from before it can run on, so each migration must leave the tables as that code can
+  use them. A migration waits at most 100 ms for any lock on the tables, as it holds those it took
+  meanwhile, and gives way: `Migrate` rolls it back and tries it again, up to 10 times. That wait
+  ends before PostgreSQL's deadlock check, which alone cancels an autovacuum worker blocking a lock,
+  once a wait passes `deadlock_timeout`: where an autovacuum worker holds one of the tables as a
+  migration gives way, the next try first takes each such table's `SHARE UPDATE EXCLUSIVE` lock,
+  waiting a second past `deadlock_timeout` (`outwaitVacuum`, from `pg_locks` and the vacuum and
+  analysis progress views, which any role reads), and then the migration's own. That lock conflicts
+  with none a check, list or change takes, so none waits behind it while the migration holds none of
+  its own. Each table is locked in a savepoint of its own: where its wait ends, as for a vacuum to
+  prevent wraparound, which PostgreSQL never cancels, the try rolls back to that savepoint and goes
+  on without that table's lock, to the next table's wait, and each try after waits so again, some 20
+  seconds more over the 10 tries for each such table with the default `deadlock_timeout`. A wait for
+  another replica's migration is bounded by the session's `lock_timeout` alone, and not tried again.
+  On a host's transaction `Migrate` applies them all in one savepoint, with neither the bound nor
+  the tries, as rolling back to the savepoint frees nothing the host took before.
+
+```mermaid
+flowchart TB
+    start(["Migrate on a pool or a connection"]) --> tx["migrateOnce: a transaction of its own,<br/>the schema's advisory lock, lock_timeout 100 ms"]
+    tx -->|"the last try gave way"| vac["outwaitVacuum: SHARE UPDATE EXCLUSIVE on each<br/>table an autovacuum worker holds, waiting a second<br/>past deadlock_timeout, without each whose wait ends"]
+    tx --> one["The first pending migration,<br/>recorded in rbac_migrations"]
+    vac --> one
+    one -->|"commits, more pending"| tx
+    one -->|"commits, none pending"| done(["nil"])
+    tx -->|"the advisory lock's wait<br/>ends (errReplica)"| conflict(["ErrConflict"])
+    one -->|"55P03 or 40P01, after a backoff"| tx
+    one -->|"its 10th try"| conflict
+```
 
 ## History, export and AsOf
 
@@ -654,6 +719,7 @@ flowchart LR
     store -->|"VerifyChain(from, records, to, key)"| verify(["records unaltered,<br/>none dropped"])
     hist -->|"temporary views of each table<br/>as it was at a time"| asof["AsOf(tenant, time, read)"]
     hist -->|"PruneHistory(before, through)"| prune["superseded versions, and rows<br/>ended, that an export has read"]
+    prune -->|"records the last it deleted;<br/>History refuses an earlier export's cursor before it"| hist
 ```
 
 - **What a record holds.** Each holds the row as it was and as it became, when it took effect, the
@@ -669,9 +735,15 @@ flowchart LR
   is one `History` can't return. A row written before history was installed has one record from
   migrating, its baseline, dated when it was created, or at the epoch where that was before year 1
   or at its first instant.
-- **History's order.** `History` reads records in transaction order, and only those of
-  transactions older than every transaction still running, which have all ended. So a cursor
-  never passes a record that commits later. It, `Export` and `PruneHistory` name history by its
+- **History's order.** `History` reads records in transaction order, by the id each transaction
+  takes at its first write, and only those of transactions older than every transaction still
+  running, which have all ended. So a cursor never passes a record that commits later. That is
+  not each row's order: a transaction that took its id first and changed a row after another
+  committed a change to it is read first, though its change came after. A row's versions are in
+  the order of their records' ids, in which they were written, as AsOf and PruneHistory read
+  them, and a consumer replaying an export applies them so. Any transaction holding an id holds
+  every read back, AsOf's too, whose views take one. It, `Export` and `PruneHistory` name history
+  by its
   schema, as `AsOf` does, and their types by pg_catalog's, so a session's temporary table or type
   stands in for none of it. A schema the application's role made or can create in, first on its
   search_path, would: that role can do neither.
@@ -679,14 +751,37 @@ flowchart LR
   timeline, and the database and schema. Failing over or recovering to a point in time starts a
   new generation, which an export starts again from `Genesis`. A restore that starts none, as
   from a disk snapshot, keeps the generation: where it lost a cursor's last record, `History`
-  refuses that cursor, and history is exported again from the start.
+  refuses that cursor, and history is exported again from the start. Where it kept that record
+  and lost what came after, nothing in the database tells it from recovering from a crash, so a
+  restore that should start a generation is a recovery to a point in time.
+- **No record goes from under a cursor.** A prune records, for each of its transactions that
+  deleted any, the last record it deleted in `History`'s order, and `History` refuses the cursor
+  of an export that began before the prune where it is before that record, in the statement that
+  checks the cursor and again in the one that reads after it, as a prune can commit between them:
+  an export further behind than the cursor a prune went through would otherwise read on past what
+  it deleted, and chain the rest as all history held. An export that began after the prune reads
+  history as it left it, and stands where an earlier one could: its cursor's `Horizon`, the oldest
+  transaction running as its first read from the start began, tells them apart, as a prune of an
+  earlier transaction had ended by then. A read from the start reads nothing while a prune it sees
+  is of a transaction no older than the oldest running, which it would count as one since.
+  History's index of prunes (`rbac_history_prunes`) finds those recorded after a cursor and from
+  its horizon on, which are few; a prune is recorded after what it deletes, so no earlier one can
+  have deleted past the cursor. A delete from history, which only a role with the rights of
+  history's owner gets past the append-only trigger, is refused as its transaction commits
+  (`rbac_history_pruned`) unless a prune that transaction records reaches the record, by the last
+  it deleted or, for a prune recorded before 0020, the cursor it went through, and the record is of
+  an earlier transaction.
 - **The export chain.** `Export` hashes each record onto the last checkpoint with SHA-256 and signs
   the checkpoint with the host's `crypto.Signer`: ECDSA on P-256, P-384 or P-521, Ed25519, or RSA
   of at least 3072 bits, each verified with the Go standard library. `VerifyChain` checks a run of
   records between two checkpoints.
 - **AsOf** stands temporary views of history in for the tables, in a transaction it rolls back,
   so every check, list and search answers as it would have at a past time, with the catalog and
-  the label dimensions as they are now. Each statement reads history by the rows it names, through
+  the label dimensions as they are now. Making the views takes a transaction id, which holds every
+  export in the cluster back while the read runs. Every statement is planned for its arguments and
+  runs without JIT, which such plans over history cost past `jit_above_cost` for any subject. It
+  takes a time from PostgreSQL's earliest to 9999-12-30, as pgx sends a later one as another.
+  Each statement reads history by the rows it names, through
   history's indexes, as a search the custom roles its grants name, by their ids, and its principals'
   grants by principal and type, which history's index of a principal's versions holds beside the
   scope, as a check seeks them on its resource's path. The view of custom roles takes each one's
@@ -697,7 +792,9 @@ flowchart LR
   and refuses an earlier one; of a row whose last version by then ended it, it deletes every
   version, the end last. It reads history `MaxPrune` records at a time, each in a transaction of
   its own, so none holds exports back for long however long history is. Each that deleted records
-  is recorded in history, and AsOf finds the latest prune's time by history's index.
+  is recorded in history, in the statement that deletes, with the last record it deleted, and AsOf
+  finds the latest prune's time by history's index. With several exports, it prunes through the
+  cursor of the one furthest behind.
 
 ## Database roles
 

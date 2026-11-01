@@ -108,6 +108,7 @@ func (a *Authorizer) checkEligibility(e Eligibility) error {
 func (a *Authorizer) SetEligibility(ctx context.Context, actor Subject, on Resource, e Eligibility) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, on.Tenant, actor.Principal, "SetEligibility")
+	defer conflicting(&err)
 	if err := a.check(on); err != nil {
 		return err
 	}
@@ -203,6 +204,7 @@ func (a *Authorizer) requirementsBounded(ctx context.Context, tx pgx.Tx, tenant 
 func (a *Authorizer) DeleteEligibility(ctx context.Context, actor Subject, on Resource, role Role, p Principal) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, on.Tenant, actor.Principal, "DeleteEligibility")
+	defer conflicting(&err)
 	if err := a.check(on); err != nil {
 		return err
 	}
@@ -262,6 +264,7 @@ type Activation struct {
 func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act Activation) (g Grant, err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, on.Tenant, s.Principal, "Activate")
+	defer conflicting(&err)
 	if err := a.check(on); err != nil {
 		return Grant{}, err
 	}
@@ -397,6 +400,7 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 func (a *Authorizer) Deactivate(ctx context.Context, s Subject, on Resource, role Role) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, on.Tenant, s.Principal, "Deactivate")
+	defer conflicting(&err)
 	if err := a.check(on); err != nil {
 		return err
 	}
@@ -775,7 +779,8 @@ func seconds(d time.Duration) int64 {
 // Eligibilities lists the eligibilities that match the filter, as stored, expired ones aside. It
 // has no limit or cursor, so what it returns grows with what matches, as every eligibility on the
 // tenant's scope.
-func (a *Authorizer) Eligibilities(ctx context.Context, tenant string, f GrantFilter) ([]Eligibility, error) {
+func (a *Authorizer) Eligibilities(ctx context.Context, tenant string, f GrantFilter) (_ []Eligibility, err error) {
+	defer conflicting(&err)
 	if !validID(tenant) || !f.valid(tenant) {
 		return nil, fmt.Errorf("%w: Eligibilities needs a tenant and valid scopes or principals", ErrInvalid)
 	}

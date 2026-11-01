@@ -225,6 +225,7 @@ func (a *Authorizer) checkDeny(tenant string, d Deny) error {
 func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d Deny) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, on.Tenant, actor.Principal, "SetDeny")
+	defer conflicting(&err)
 	if err := a.check(on); err != nil {
 		return err
 	}
@@ -314,6 +315,7 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 func (a *Authorizer) DeleteDeny(ctx context.Context, actor Subject, on Resource, id string) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, on.Tenant, actor.Principal, "DeleteDeny")
+	defer conflicting(&err)
 	if err := a.check(on); err != nil {
 		return err
 	}
@@ -413,7 +415,8 @@ func (au authority) setsDenies(on Resource) error {
 }
 
 // Denies lists the deny policies on scopes in a tenant, as stored.
-func (a *Authorizer) Denies(ctx context.Context, tenant string, scopes []Scope) ([]Deny, error) {
+func (a *Authorizer) Denies(ctx context.Context, tenant string, scopes []Scope) (_ []Deny, err error) {
+	defer conflicting(&err)
 	if !validID(tenant) || len(scopes) == 0 || slices.ContainsFunc(scopes, func(s Scope) bool { return !s.valid() }) {
 		return nil, fmt.Errorf("%w: Denies needs a tenant and valid scopes", ErrInvalid)
 	}
