@@ -612,20 +612,20 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   grants on any type.
 - **Limits:** a change takes at most `rbac.MaxBindings` bindings, and the members one
   `ChangeMembers` adds gain at most as many grants and eligibilities, each member's counted apart,
-  but one alone, while `ImportMembers` asks `ValidateGrant` about each one its members gain; a
-  principal holds a role on a scope at most `rbac.MaxGrantsPerRole` times, and is in a group at most
-  `rbac.MaxPlacesInGroup` times, by source, and directly in at most `rbac.MaxGroupsOfPrincipal`
-  groups, from each source the host owns apart, which bounds the groups a check reads through others
-  only level by level, so keep nesting narrow; a scope holds at most `rbac.MaxDenies` denies; a
-  tenant has at most `rbac.MaxCustomRoles` custom roles; an id is at most `rbac.MaxID` bytes. The
-  others are exported beside them. Lists have no limit or cursor, so what one returns grows with
-  what it lists: `Memberships` of a whole tenant with its members and guests, `MembershipsOf` with
-  the tenants an identity is a member or guest of, `Groups` with its groups, `Members` with a
-  group's members, `GroupsOf` with the groups a principal is in, through others too, `Holders` with
-  who holds the permission, `Grants` and `Eligibilities` on the tenant's scope with what is granted
-  there, `Reach.Scopes` with the scopes a subject's grants are on, and `Conflicts` with the
-  identities in conflict. In a large tenant, ask for less: `Memberships` of named principals,
-  `Grants` of one principal.
+  by its principal, but no more than one place alone gains, while `ImportMembers` asks
+  `ValidateGrant` about each one its members gain; a principal holds a role on a scope at most
+  `rbac.MaxGrantsPerRole` times, and is in a group at most `rbac.MaxPlacesInGroup` times, by source,
+  and directly in at most `rbac.MaxGroupsOfPrincipal` groups, from each source the host owns apart,
+  which bounds the groups a check reads through others only level by level, so keep nesting narrow;
+  a scope holds at most `rbac.MaxDenies` denies; a tenant has at most `rbac.MaxCustomRoles` custom
+  roles; an id is at most `rbac.MaxID` bytes. The others are exported beside them. Lists have no
+  limit or cursor, so what one returns grows with what it lists: `Memberships` of a whole tenant
+  with its members and guests, `MembershipsOf` with the tenants an identity is a member or guest of,
+  `Groups` with its groups, `Members` with a group's members, `GroupsOf` with the groups a principal
+  is in, through others too, `Holders` with who holds the permission, `Grants` and `Eligibilities`
+  on the tenant's scope with what is granted there, `Reach.Scopes` with the scopes a subject's
+  grants are on, and `Conflicts` with the identities in conflict. In a large tenant, ask for less:
+  `Memberships` of named principals, `Grants` of one principal.
 - **JIT:** turn JIT compilation off for the application's role, as in
   `ALTER ROLE app SET jit = off`, which a session takes as it starts, so a pool's connections take
   it once they reconnect. The planner can't tell how far a walk of a subject's groups goes, so for
