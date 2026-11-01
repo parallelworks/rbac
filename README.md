@@ -263,8 +263,11 @@ conditional ones reach, to check one by one.
   holding access there, making its place end sooner, ending an activation made there through the
   group, or adding a member to a group a deny there names, and `DeleteGroup` deleting a group with
   grants or eligibilities in force on its own scope. Each is stopped by what it ends there, not by
-  what the members hold after it, so one ending what a member holds through another place or grant
-  too is stopped, as `Apply` revoking a grant held twice is.
+  what the members hold after it: a member leaving a group ends there what the group and those it
+  is in give it, a grant, eligibility, approval or exemption, so one that another group or a grant
+  of its own gives the same is stopped too, as `Apply` revoking a grant held twice is, and so is
+  one ending only an eligibility, as `DeleteEligibility` there is; but a place that ends while
+  another, from another source, keeps the member in its group as long ends nothing there.
   The host's own writes (`Import`, `DeleteGrants`, `SetMemberships`, `ImportMembers`,
   `DeleteMembers`, `DeleteGroups` and the host's deletes) make none of the checks an actor's change
   makes, so a freeze stops none of them: the host freezes those itself. The host is

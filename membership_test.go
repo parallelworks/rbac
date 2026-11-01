@@ -3925,6 +3925,35 @@ func TestAFreezeStopsTakingAccessAwayThroughMembers(t *testing.T) {
 	}
 }
 
+// A freeze judges a change to members by what it ends there: a member leaving a group ends what the
+// group gives it there, though another group gives it the same, as Apply revoking a grant held twice
+// is stopped; but a place that ends, or ends sooner, while another, from another source, keeps the
+// member in its group as long ends nothing.
+func TestAFreezeStopsALeavingByWhatItsGroupGives(t *testing.T) {
+	frozen := false
+	h := grouped(t, freezingUnder(workspace.Scope(), &frozen))
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"), grant(cluster.Scope(), "cluster.login", rbac.Group, "oncall"))
+	h.join(t, "u")
+	crew, synced := rbac.Member{Group: "crew", Principal: identity("u")}, rbac.Member{Group: "crew", Principal: identity("u"), Source: "ops"}
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{crew, synced, {Group: "oncall", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	manager := h.as(t, "manager")
+	frozen = true
+	sooner := synced
+	sooner.ExpiresAt = h.now.Add(time.Minute)
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", []rbac.Member{sooner}, nil); err != nil {
+		t.Errorf("ending sooner a place in crew, another of which keeps u in it, under the freeze: %v", err)
+	}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", nil, []rbac.Member{synced}); err != nil {
+		t.Errorf("removing a place in crew, another of which keeps u in it, under the freeze: %v", err)
+	}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", nil, []rbac.Member{crew}); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("removing u from crew, though oncall gives it the same, under the freeze: %v", err)
+	}
+}
+
 // A scope the host no longer has is read as stored, as a revoke there reads it, so a freeze on every
 // scope of its type stops a member losing access there.
 func TestAFreezeStopsTakingAccessAwayOnAScopeTheHostNoLongerHas(t *testing.T) {

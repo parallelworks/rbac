@@ -463,12 +463,15 @@ sequenceDiagram
   changes under a container, or a deny on its path doing so, stops `Apply` changing grants there,
   revoking them too.
   Every change an actor makes that takes access away there is stopped alike, whatever the actor's
-  grants, as it needn't hold what it takes away, and by what it ends there, not by what the members
-  hold after it, as `Apply` revoking a grant held twice is stopped: `SetRole` narrowing and `DeleteRole` deleting a
+  grants, as it needn't hold what it takes away: `SetRole` narrowing and `DeleteRole` deleting a
   role granted there (`changesStopped`, `scopesDenied`); `ChangeMembers` removing a member of a
   group holding access there, ending its place sooner, ending an activation made through the group
   there, or adding a member to a group a deny there names (`reachCheck.stopped`); and
-  `DeleteGroup` with grants or eligibilities in force on the group's scope. `ChangeMembers` asks the
+  `DeleteGroup` with grants or eligibilities in force on the group's scope. Each is stopped by what
+  it ends there, not by what the members hold after it, as `Apply` revoking a grant held twice is:
+  a member leaving a group ends what the group and those it is in give it there, though another
+  group gives it the same, but a place ending while another, from another source, keeps the member
+  in the group as long leaves nothing (`placesLeft`). `ChangeMembers` asks the
   constraints once about each type of scope a member only loses access on, of no resource
   (`freezes`), and reads the types whose power to change grants a deny binding the actor lists
   (`grantsDenied`); only for a scope of a type either names, or whose label can refuse the actor, is
