@@ -616,8 +616,10 @@ func TestFilterCostsALabeledRowItsOwnValuesInEveryPlan(t *testing.T) {
 // the tenant's members and the public, of custom roles for the tenant alone and for other types
 // too, of denies of values and of a constraint removing values, in an Ordered, an AllOf, an AnyOf
 // dimension of forty values and an exclusive one. Of rows whose label has a value no dimension
-// declares or a NULL one, or is NULL, Filter keeps none, and of one whose label is an array of two
-// dimensions, those of it.
+// declares or a NULL one, or is NULL, Filter keeps none, as of those whose values differ from
+// declared ones only in case or punctuation, or are quoted, escaped or JSON, and of one whose label
+// is an array of two dimensions, those of it; and it keeps the same of a column in a collation that
+// isn't deterministic, which finds such values equal to declared ones.
 func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 	var projects []string
 	for i := range 40 {
@@ -643,8 +645,11 @@ func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 		subjects[u] = h.as(t, u, [][]string{{"g"}, {"h"}, {}, {"g", "h"}, {"outer"}, {}}[i]...)
 	}
 	h.guest(t, "u5")
+	// Case and punctuation ignored.
 	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'outer', 'group', 'g');
-		CREATE TABLE points (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL, labels text[])`); err != nil {
+		CREATE TABLE points (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL, labels text[]);
+		CREATE COLLATION loose (provider = icu, locale = 'und-u-ka-shifted-ks-level2', deterministic = false);
+		CREATE TABLE loose_points (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL, labels text[] COLLATE loose)`); err != nil {
 		t.Fatal(err)
 	}
 	var values []string
@@ -676,11 +681,12 @@ func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 		}
 		return l, column
 	}
-	kept, refused, listed := 0, 0, 0
+	// The rows refused by a dimension the holding holds no value of, AnyOf ones and the others apart.
+	kept, refused, listed, noneOfAnyOf, noneOfOther := 0, 0, 0, 0, 0
 	for seed := range uint64(48) {
 		rng := rand.New(rand.NewPCG(seed, seed+17))
 		b := &pgx.Batch{}
-		for _, q := range []string{`DELETE FROM rbac_grants WHERE tenant = 't1'`, `DELETE FROM rbac_denies WHERE tenant = 't1'`, `DELETE FROM rbac_roles WHERE tenant = 't1'`, `DELETE FROM points`} {
+		for _, q := range []string{`DELETE FROM rbac_grants WHERE tenant = 't1'`, `DELETE FROM rbac_denies WHERE tenant = 't1'`, `DELETE FROM rbac_roles WHERE tenant = 't1'`, `DELETE FROM points`, `DELETE FROM loose_points`} {
 			b.Queue(q)
 		}
 		for i := range 3 {
@@ -741,9 +747,15 @@ func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 		flatRow.Labels = flat
 		rows = append(rows, flatRow)
 		p00 := "proj:p00"
-		for id, column := range map[string]any{"undeclared": []string{p00, "proj:p99"}, "nullValue": []*string{&p00, nil}, "null": nil} {
+		for id, column := range map[string]any{
+			"undeclared": []string{p00, "proj:p99"}, "nullValue": []*string{&p00, nil}, "null": nil,
+			"case": []string{"proj:P00"}, "typeCase": []string{"PROJ:p00"}, "beside": []string{p00, "Proj:P00"}, "punctuated": []string{"proj:p-00"},
+			"spaced": []string{p00 + " "}, "quoted": []string{`"` + p00 + `"`}, "json": []string{`{"` + p00 + `": true}`},
+			"backslash": []string{p00 + `\`}, "escaped": []string{p00 + `\u0000`}, "escapedQuote": []string{`proj:p00\"`},
+		} {
 			b.Queue(`INSERT INTO points VALUES ('t1', $1, $2, $3::text[])`, id, h.path(t, at(id)), column)
 		}
+		b.Queue(`INSERT INTO loose_points SELECT * FROM points`)
 		if err := h.pool.SendBatch(ctx, b).Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -766,8 +778,25 @@ func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 			if got := listPoints(t, h, pred.SQL, pred.Args...); !slices.Equal(got, want) {
 				t.Errorf("seed %d, %s: Filter keeps %v, Authorize allows %v", seed, name, got, want)
 			}
+			if got := listRows(t, h, "loose_points", pred.SQL, pred.Args...); !slices.Equal(got, want) {
+				t.Errorf("seed %d, %s: Filter keeps %v of a column in a collation that isn't deterministic, Authorize allows %v", seed, name, got, want)
+			}
 			kept += len(want)
 			refused += len(rows) - len(want)
+			held, err := h.authz.Holding(request, "t1", s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, r := range rows {
+				dim := held.Unsatisfied(r.Labels)
+				switch {
+				case dim == "" || slices.ContainsFunc(held.Values(), func(p rbac.Permission) bool { return strings.HasPrefix(string(p), dim+":") }):
+				case slices.ContainsFunc(h.cfg.Labels, func(d rbac.LabelDimension) bool { return d.Name == dim && d.Rule == rbac.AnyOf }):
+					noneOfAnyOf++
+				default:
+					noneOfOther++
+				}
+			}
 			reach, err := h.authz.Reachable(request, s, login, "t1", "cluster")
 			if err != nil {
 				t.Fatal(err)
@@ -817,16 +846,24 @@ func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 			}
 		}
 	}
-	// So that rows kept and refused, and holders listed, are each compared.
-	if kept == 0 || refused == 0 || listed == 0 {
-		t.Errorf("Filter kept %d rows and refused %d, and Holders listed %d", kept, refused, listed)
+	// So that rows kept and refused, and holders listed, are each compared, and refusals by a
+	// dimension of no value held.
+	if kept == 0 || refused == 0 || listed == 0 || noneOfAnyOf == 0 || noneOfOther == 0 {
+		t.Errorf("Filter kept %d rows and refused %d, %d by an AnyOf dimension and %d by another of no value held, and Holders listed %d",
+			kept, refused, noneOfAnyOf, noneOfOther, listed)
 	}
 }
 
 // listPoints lists the ids of the rows of points where holds, in order.
 func listPoints(t *testing.T, h *harness, where string, args ...any) []string {
 	t.Helper()
-	rows, err := h.pool.Query(t.Context(), `SELECT id FROM points WHERE `+where+` ORDER BY id`, args...)
+	return listRows(t, h, "points", where, args...)
+}
+
+// listRows lists the ids of the rows of table where holds, in order.
+func listRows(t *testing.T, h *harness, table, where string, args ...any) []string {
+	t.Helper()
+	rows, err := h.pool.Query(t.Context(), `SELECT id FROM `+table+` WHERE `+where+` ORDER BY id`, args...)
 	if err != nil {
 		t.Fatal(err)
 	}
