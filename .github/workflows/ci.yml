@@ -203,8 +203,10 @@ jobs:
         with:
           pattern: test-results-*
           path: test-results
+      # Into the job's summary too, which then names a test that skipped or ran in no shard.
       - name: Check the shards ran every test between them
-        run: go run ./internal/shards check test-results
+        shell: bash
+        run: go run ./internal/shards check test-results 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
       # Each shard's coverage counts only what its own tests reach.
       - name: Coverage of every shard's tests
         shell: bash

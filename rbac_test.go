@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -4474,16 +4475,20 @@ func TestAChangeDeadlockedBeforeItsSavepointConflicts(t *testing.T) {
 // A hook's error that wraps PostgreSQL's refusal of a statement for a race, as a deadlock of a query
 // it ran, matches ErrConflict too, wherever the hook runs, still wrapping the host's own error, and
 // OnRefused isn't told of it: ValidateGrant, asked before a change's transaction, and a constraint a
-// check asks.
+// check asks. So does one that wraps or joins the race after another of PostgreSQL's errors, where
+// errors.As finds only that one, and one that holds it as errors.As reads it, through an As method;
+// one holding no race doesn't.
 func TestAHooksErrorForARaceConflicts(t *testing.T) {
 	errPolicy := errors.New("policy lookup failed")
-	race := fmt.Errorf("%w: %w", errPolicy, &pgconn.PgError{Code: "40P01", Message: "deadlock detected"})
+	deadlock := &pgconn.PgError{Code: "40P01", Message: "deadlock detected"}
+	duplicate := &pgconn.PgError{Code: "23505", Message: "duplicate key value violates unique constraint"}
+	var hookErr error
 	var refusals []rbac.Refusal
 	h := setup(t, func(c *rbac.Config) {
-		c.ValidateGrant = func(context.Context, rbac.DB, rbac.GrantInput) error { return race }
+		c.ValidateGrant = func(context.Context, rbac.DB, rbac.GrantInput) error { return hookErr }
 		c.Constraints = []rbac.Constraint{{Name: "policy", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
 			if in.Permission == view {
-				return false, race
+				return false, hookErr
 			}
 			return false, nil
 		}}}
@@ -4491,18 +4496,82 @@ func TestAHooksErrorForARaceConflicts(t *testing.T) {
 	})
 	ctx := t.Context()
 	ann := h.as(t, "ann")
-	for name, err := range map[string]error{
-		"Apply":     h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: ann.Principal}}}),
-		"Authorize": h.authz.Authorize(ctx, ann, view, cluster),
+	calls := func() map[string]error {
+		return map[string]error{
+			"Apply":     h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: ann.Principal}}}),
+			"Authorize": h.authz.Authorize(ctx, ann, view, cluster),
+		}
+	}
+	for how, race := range map[string]error{
+		"wrapped":               fmt.Errorf("%w: %w", errPolicy, deadlock),
+		"wrapped after another": fmt.Errorf("%w: %w; %w", errPolicy, duplicate, deadlock),
+		"joined after another":  errors.Join(errPolicy, duplicate, deadlock),
+		"joined before another": errors.Join(deadlock, duplicate, errPolicy),
+		"nested after another":  errors.Join(errPolicy, duplicate, fmt.Errorf("retrying: %w", deadlock)),
+		"held through As":       errors.Join(duplicate, heldAsError{errPolicy, deadlock}),
 	} {
-		if !errors.Is(err, rbac.ErrConflict) || !errors.Is(err, errPolicy) || errors.Is(err, rbac.ErrDenied) || errors.Is(err, rbac.ErrInvalid) {
-			t.Errorf("%s, whose hook failed for a race: %v", name, err)
+		hookErr = race
+		for name, err := range calls() {
+			if !errors.Is(err, rbac.ErrConflict) || !errors.Is(err, errPolicy) || errors.Is(err, rbac.ErrDenied) || errors.Is(err, rbac.ErrInvalid) {
+				t.Errorf("%s, whose hook failed for a race %s: %v", name, how, err)
+			}
 		}
 	}
 	if len(refusals) > 0 {
 		t.Errorf("OnRefused was told of a race: %+v", refusals)
 	}
+	hookErr = errors.Join(errPolicy, duplicate)
+	for name, err := range calls() {
+		if errors.Is(err, rbac.ErrConflict) || !errors.Is(err, errPolicy) {
+			t.Errorf("%s, whose hook failed for no race: %v", name, err)
+		}
+	}
 }
+
+// heldAsError is a host's error that holds PostgreSQL's as errors.As reads it, through its As
+// method, rather than by wrapping it.
+type heldAsError struct {
+	error
+	pg *pgconn.PgError
+}
+
+func (e heldAsError) Unwrap() error { return e.error }
+
+func (e heldAsError) As(target any) bool {
+	pg, ok := target.(**pgconn.PgError)
+	if ok {
+		*pg = e.pg
+	}
+	return ok
+}
+
+// An error that wraps itself, as a host's own type can by mistake, is read for a race only so far,
+// so an exported call returns it as it is, holding none there, rather than read it until the stack
+// overflows.
+func TestAnErrorThatWrapsItselfIsReadSoFar(t *testing.T) {
+	// So that reading it forever overflows the stack in a moment rather than a gigabyte.
+	defer debug.SetMaxStack(debug.SetMaxStack(64 << 20))
+	chain := &wrapsItselfError{}
+	chain.next = chain
+	joined := &joinsItselfError{}
+	joined.errs = []error{&pgconn.PgError{Code: "23505"}, joined}
+	for _, err := range []error{chain, joined} {
+		// The very error: errors.Is would read it forever.
+		if got := rbac.Conflicted(err); got != err { //nolint:errorlint // as above
+			t.Errorf("%T: %v", err, got)
+		}
+	}
+}
+
+type wrapsItselfError struct{ next error }
+
+func (*wrapsItselfError) Error() string   { return "wraps itself" }
+func (e *wrapsItselfError) Unwrap() error { return e.next }
+
+type joinsItselfError struct{ errs []error }
+
+func (*joinsItselfError) Error() string     { return "joins itself" }
+func (e *joinsItselfError) Unwrap() []error { return e.errs }
 
 func TestPublicAccess(t *testing.T) {
 	viewer := rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
@@ -6129,6 +6198,136 @@ func applyWhileTheRoleChanges(t *testing.T, operator rbac.RoleDefinition, change
 	}
 }
 
+// A custom role lists only roles one of its `<type>:grant` permissions, on a type it is for, lets
+// its holders grant, as roles that can be granted on that type. One none reaches would hand nothing
+// on, so the actor's power to grant it went unchecked, though the listing kept it from being
+// deleted: an actor who may grant on clusters alone listed a workspace role.
+func TestARoleListsOnlyRolesItsGrantPermissionsReach(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	tenant := rbac.TenantRoot("t1")
+	h.seed(t, grant(tenant, "tenant.roles", rbac.User, "lead"), grant(tenant, "cluster.admin", rbac.User, "lead"))
+	lead := h.as(t, "lead")
+	if err := h.authz.Apply(ctx, lead, workspace, rbac.Change{Grant: []rbac.Binding{{Role: "workspace.admin", Principal: identity("x")}}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("granting a workspace role with the power to grant on clusters alone: %v", err)
+	}
+	for name, r := range map[string]rbac.RoleDefinition{
+		"a role for clusters listing a workspace role": {
+			ID: "custom.x", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"workspace.admin"},
+		},
+		"a role whose power to grant is on a type it isn't for": {
+			ID: "custom.y", Permissions: []rbac.Permission{view, "workspace:grant"}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.login"},
+		},
+	} {
+		if err := h.authz.SetRole(ctx, lead, "t1", r); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	live := rbac.RoleDefinition{ID: "custom.z", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.login"}}
+	if err := h.authz.SetRole(ctx, lead, "t1", live); err != nil {
+		t.Errorf("a role for clusters listing a cluster role: %v", err)
+	}
+}
+
+// A role keeps a listing that already hands nothing on as it is stored, as one of a role narrowed
+// since, one a catalog change left so, or one written around the package: setting it again as it is
+// read changes nothing, and renaming it needs only the power to define it. A listing that hands
+// nothing on and that the change adds, or makes so by changing the role, is refused.
+func TestARoleKeepsAListingThatAlreadyHandsNothingOn(t *testing.T) {
+	later := rbac.RoleDefinition{ID: "custom.later", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	lister := rbac.RoleDefinition{ID: "custom.lister", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}}
+	for how, inert := range map[string]func(t *testing.T, h *harness) *rbac.Authorizer{
+		"the role it lists narrowed": func(t *testing.T, h *harness) *rbac.Authorizer {
+			t.Helper()
+			admin := roleAdmin(t, h)
+			listing := lister
+			listing.GrantableRoles = []rbac.Role{later.ID}
+			narrowed := later
+			narrowed.Permissions, narrowed.ResourceTypes = []rbac.Permission{rbac.DefineRoles}, []string{"tenant"}
+			for _, r := range []rbac.RoleDefinition{later, listing, narrowed} {
+				if err := h.authz.SetRole(t.Context(), admin, "t1", r); err != nil {
+					t.Fatal(err)
+				}
+			}
+			return h.authz
+		},
+		"a catalog change": func(t *testing.T, h *harness) *rbac.Authorizer {
+			t.Helper()
+			listing := lister
+			listing.GrantableRoles = []rbac.Role{"cluster.login"}
+			if err := h.authz.SetRole(t.Context(), roleAdmin(t, h), "t1", listing); err != nil {
+				t.Fatal(err)
+			}
+			moved := slices.Clone(catalog)
+			for i, r := range moved {
+				if r.ID == "cluster.login" {
+					moved[i].ResourceTypes = []string{"workspace"}
+				}
+			}
+			authz, err := rbac.New(h.pool, func() rbac.Config { c := h.cfg; c.Catalog = moved; return c }())
+			if err != nil {
+				t.Fatal(err)
+			}
+			return authz
+		},
+		"written around the package": func(t *testing.T, h *harness) *rbac.Authorizer {
+			t.Helper()
+			if _, err := h.pool.Exec(t.Context(), `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, privileged, grantable_roles)
+				VALUES ('t1', 'custom.lister', '{cluster:view,cluster:grant}', '{cluster}', true, '{workspace.admin}')`); err != nil {
+				t.Fatal(err)
+			}
+			return h.authz
+		},
+	} {
+		t.Run(how, func(t *testing.T) {
+			h := setup(t)
+			ctx := t.Context()
+			tenant := rbac.TenantRoot("t1")
+			h.seed(t, grant(tenant, "tenant.roles", rbac.User, "lead"), grant(tenant, "cluster.admin", rbac.User, "lead"))
+			lead := h.as(t, "lead")
+			authz := inert(t, h)
+			roles, err := authz.CustomRoles(ctx, "t1")
+			i := slices.IndexFunc(roles, func(r rbac.RoleDefinition) bool { return r.ID == lister.ID })
+			if err != nil || i < 0 {
+				t.Fatalf("CustomRoles = %+v, %v", roles, err)
+			}
+			h.events = nil
+			if err := authz.SetRole(ctx, lead, "t1", roles[i]); err != nil || len(h.events) != 0 {
+				t.Errorf("setting the role again as it is read: %v, %+v", err, h.events)
+			}
+			renamed := roles[i]
+			renamed.Name = "Lister"
+			if err := authz.SetRole(ctx, lead, "t1", renamed); err != nil || len(h.events) != 1 {
+				t.Errorf("renaming the role: %v, %+v", err, h.events)
+			}
+			adding := renamed
+			adding.GrantableRoles = append(slices.Clone(adding.GrantableRoles), "tenant.admin")
+			if err := authz.SetRole(ctx, lead, "t1", adding); !errors.Is(err, rbac.ErrInvalid) {
+				t.Errorf("adding a listing that hands nothing on beside it: %v", err)
+			}
+		})
+	}
+	// Listed through a power to grant on workspaces, which narrowing the role takes away.
+	h := setup(t)
+	ctx := t.Context()
+	tenant := rbac.TenantRoot("t1")
+	h.seed(t, grant(tenant, "tenant.roles", rbac.User, "lead"), grant(tenant, "cluster.admin", rbac.User, "lead"))
+	lead := h.as(t, "lead")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, privileged, grantable_roles)
+		VALUES ('t1', 'custom.lister', '{cluster:grant,cluster:view,workspace:grant}', '{cluster,workspace}', true, '{workspace.admin}')`); err != nil {
+		t.Fatal(err)
+	}
+	narrowed := lister
+	narrowed.GrantableRoles = []rbac.Role{"workspace.admin"}
+	if err := h.authz.SetRole(ctx, lead, "t1", narrowed); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("narrowing a role so that a role it lists is handed on nowhere: %v", err)
+	}
+	narrowed.GrantableRoles = nil
+	if err := h.authz.SetRole(ctx, lead, "t1", narrowed); err != nil {
+		t.Errorf("narrowing a role and the roles it lists: %v", err)
+	}
+}
+
 func TestRedefiningAListedRoleNeedsThePowerToGrantIt(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -6137,14 +6336,18 @@ func TestRedefiningAListedRoleNeedsThePowerToGrantIt(t *testing.T) {
 	// May define roles and holds root on every cluster, but may change no grants.
 	h.seed(t, grant(tenant, "tenant.roles", rbac.User, "definer"), grant(tenant, "cluster.sudo", rbac.User, "definer"))
 	definer := h.as(t, "definer")
-	// Clusters can't take it yet, so listing it for clusters needs no power over it.
-	later := rbac.RoleDefinition{ID: "custom.later", Permissions: []rbac.Permission{rbac.DefineRoles}, ResourceTypes: []string{"tenant"}}
-	if err := h.authz.SetRole(ctx, definer, "t1", later); err != nil {
-		t.Fatal(err)
-	}
+	// Listed for clusters while they take it, and then narrowed so that they no longer do: the
+	// listing hands nothing on until it is redefined for clusters again.
+	later := rbac.RoleDefinition{ID: "custom.later", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
 	lister := rbac.RoleDefinition{ID: "custom.lister", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{later.ID}}
-	if err := h.authz.SetRole(ctx, admin, "t1", lister); err != nil {
-		t.Fatal(err)
+	for _, r := range []rbac.RoleDefinition{later, lister} {
+		if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	later.Permissions, later.ResourceTypes = []rbac.Permission{rbac.DefineRoles}, []string{"tenant"}
+	if err := h.authz.SetRole(ctx, definer, "t1", later); err != nil {
+		t.Fatalf("narrowing a listed role so that the role listing it hands it out nowhere: %v", err)
 	}
 	h.seed(t, grant(cluster.Scope(), lister.ID, rbac.User, "manager"))
 	sudo := later
@@ -6373,6 +6576,79 @@ func TestDeletingARoleRespectsConstraints(t *testing.T) {
 	}
 	if err := h.authz.DeleteRole(ctx, admin, "t1", op.ID); err != nil {
 		t.Fatalf("deleting a role that doesn't exist: %v", err)
+	}
+}
+
+// A role, a deny and an eligibility stored around the package, as a seed or a restore can write
+// them, with their lists in another order than the package sorts them into, or with a repeat, are
+// the ones the package would store: renaming the role is no redefinition, so a freeze of changes to
+// its grants doesn't stop it, and setting each again as it is read changes nothing. Compared element
+// by element with the sorted request, the rename was refused, and each set again was a change.
+func TestListsStoredInAnotherOrderAreTheSame(t *testing.T) {
+	for _, stored := range []string{`{cluster:view,cluster:login}`, `{cluster:login,cluster:view,cluster:login}`} {
+		t.Run(stored, func(t *testing.T) {
+			frozen := false
+			h := setup(t, func(c *rbac.Config) {
+				c.Catalog = append(slices.Clone(c.Catalog), guardRole)
+				c.Constraints = []rbac.Constraint{{Name: "freeze", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+					return frozen && in.Permission == grantC, nil
+				}}}
+			})
+			ctx := t.Context()
+			h.seed(t, grant(tenantT1.Scope(), "tenant.roles", rbac.User, "definer"), grant(tenantT1.Scope(), "cluster.login", rbac.User, "definer"),
+				grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+			definer, guardian, owner := h.as(t, "definer"), h.as(t, "guardian"), h.as(t, "owner")
+			h.as(t, "m")
+			h.as(t, "lead")
+			for _, sql := range []string{
+				`INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.ops', '` + stored + `', '{cluster,cluster}')`,
+				`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+					VALUES ('t1', 'cluster', 'c1', 'd', '{user:m,user:lead,user:m}', '{}', '` + stored + `')`,
+				`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+					VALUES ('t1', 'cluster', 'c1', 'user', 'm', 'cluster.login', 3600, '{user:owner,user:lead,user:owner}')`,
+			} {
+				if _, err := h.pool.Exec(ctx, sql); err != nil {
+					t.Fatal(err)
+				}
+			}
+			h.seed(t, grant(cluster.Scope(), "custom.ops", rbac.User, "m"))
+			roles, err := h.authz.CustomRoles(ctx, "t1")
+			if err != nil || len(roles) != 1 {
+				t.Fatalf("CustomRoles = %+v, %v", roles, err)
+			}
+			denies, err := h.authz.Denies(ctx, "t1", []rbac.Scope{cluster.Scope()})
+			if err != nil || len(denies) != 1 {
+				t.Fatalf("Denies = %+v, %v", denies, err)
+			}
+			eligible, err := h.authz.Eligibilities(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}})
+			if err != nil || len(eligible) != 1 {
+				t.Fatalf("Eligibilities = %+v, %v", eligible, err)
+			}
+			h.events = nil
+			if err := h.authz.SetDeny(ctx, guardian, cluster, denies[0]); err != nil {
+				t.Errorf("setting the deny again as it is read: %v", err)
+			}
+			if err := h.authz.SetEligibility(ctx, owner, cluster, eligible[0]); err != nil {
+				t.Errorf("setting the eligibility again as it is read: %v", err)
+			}
+			frozen = true
+			if err := h.authz.SetRole(ctx, definer, "t1", roles[0]); err != nil {
+				t.Errorf("setting the role again as it is read, under a freeze of its grants: %v", err)
+			}
+			if len(h.events) != 0 {
+				t.Errorf("setting them again as they are read changed %+v", h.events)
+			}
+			renamed := roles[0]
+			renamed.Name = "Operations"
+			if err := h.authz.SetRole(ctx, definer, "t1", renamed); err != nil || len(h.events) != 1 {
+				t.Errorf("renaming the role under a freeze of its grants: %v, %+v", err, h.events)
+			}
+			narrowed := renamed
+			narrowed.Permissions = []rbac.Permission{view}
+			if err := h.authz.SetRole(ctx, definer, "t1", narrowed); !errors.Is(err, rbac.ErrDenied) {
+				t.Errorf("narrowing the role under a freeze of its grants: %v", err)
+			}
+		})
 	}
 }
 
@@ -9250,6 +9526,33 @@ func TestNotesOnGrants(t *testing.T) {
 		bad.Note = note
 		if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{bad}}); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("a note %q: %v", note[:min(len(note), 8)], err)
+		}
+	}
+}
+
+// An eligibility's MaxDuration is in whole seconds, rounded down, and bounded as it is stored: a
+// year and a fraction of a second is a year, which was refused as longer, and less than a second is
+// none.
+func TestAnEligibilitysLongestActivationIsBoundedAsStored(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	owner := h.as(t, "owner")
+	set := func(i int, d time.Duration) error {
+		return h.authz.SetEligibility(ctx, owner, cluster, rbac.Eligibility{Role: "cluster.login", Principal: h.as(t, fmt.Sprint("e", i)).Principal, MaxDuration: d})
+	}
+	for i, c := range []struct{ d, stored time.Duration }{
+		{rbac.MaxActivation, rbac.MaxActivation},
+		{rbac.MaxActivation + 999*time.Millisecond, rbac.MaxActivation},
+		{1500 * time.Millisecond, time.Second},
+	} {
+		h.events = nil
+		if err := set(i, c.d); err != nil || len(h.events) != 1 || h.events[0].Eligible[0].MaxDuration != c.stored {
+			t.Errorf("an eligibility for %v: %v, events %+v", c.d, err, h.events)
+		}
+	}
+	for i, d := range []time.Duration{999 * time.Millisecond, rbac.MaxActivation + time.Second, -1500 * time.Millisecond} {
+		if err := set(10+i, d); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("an eligibility for %v: %v", d, err)
 		}
 	}
 }

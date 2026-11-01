@@ -25,13 +25,20 @@ with `go test -run`. So a test whose own body reads what its subtests did runs a
   each test alike. Each shard's `go test -json` output is its job's `test-results-N` artifact.
 - The `go` job, which branch protection requires, passes once the checks and every shard have, and
   `go run ./internal/shards check` finds that the shards ran each test `go test -list` names once
-  between them, and nothing else. It runs in a cancelled run too, and fails it, as a required job its
-  `if` skips counts as passed.
+  between them, none of them skipped, and nothing else, which it writes in the job's summary. It
+  runs in a cancelled run too, and fails it, as a required job its `if` skips counts as passed.
+  `select` and `check` read a test's name by go test's own rule, any letters and digits, and fail on
+  a line of `go test -list` that names neither a test nor its package, so no test runs in no shard.
 - Each job has a 20-minute timeout. When a shard's Test step nears half of that, add a shard to the
   matrix in `.github/workflows/ci.yml`; nothing else names their number.
 - The tests that wait for VACUUM to mark rows visible to all skip where another session's snapshot
   keeps it from doing so, as on a database other runs share, but fail in CI (where `CI` is true), as
   there only the run's own sessions hold snapshots.
+- A test that can't run where it is, as without autovacuum or a role that may create roles, skips
+  with `pgtest.Skip`, which fails it in CI, where every test can run, and so the `go` job fails on
+  a top-level test that skipped. The test that migrates beside an autovacuum worker waits two of
+  `autovacuum_naptime` and 30 seconds for one, which in CI has come within a minute; a shorter
+  naptime there has autovacuum analyze a crowded copy before its test reads that nothing had.
 - The coverage each shard prints counts only the statements its own tests reach, so it reads low.
   The `go` job merges every shard's profile into the whole suite's, as `make test` prints it.
 - `crowded` copies its tenants from a schema each test process fills once, as writing their 46,000

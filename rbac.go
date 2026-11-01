@@ -583,7 +583,8 @@ var (
 	// serialization failure, a deadlock, as between host transactions, or a lock it couldn't take,
 	// as one a migration holds past the session's lock_timeout. It is so wherever in the call
 	// PostgreSQL refused it: in a change's transaction or the reads it makes before it, in a read, or
-	// in a statement a hook ran, where the error the hook returns wraps PostgreSQL's. Try it again:
+	// in a statement a hook ran, where the error the hook returns wraps PostgreSQL's, alone or
+	// beside others, as errors.Join holds them, or holds it as errors.As reads it. Try it again:
 	// under WithTx, the host's whole transaction, as WithTx says.
 	ErrConflict = errors.New("rbac: conflict")
 	// ErrNotFound is what Config.ResourceOf returns, or wraps, for a scope the host no longer has,
@@ -594,14 +595,48 @@ var (
 )
 
 // conflicted makes PostgreSQL's refusals for a race match ErrConflict, keeping the error: a
-// serialization failure, a deadlock, or a lock it couldn't take.
+// serialization failure, a deadlock, or a lock it couldn't take, wherever err holds one.
 func conflicted(err error) error {
-	var pg *pgconn.PgError
-	if errors.As(err, &pg) && !errors.Is(err, ErrConflict) && (pg.Code == "40001" || pg.Code == "40P01" || pg.Code == "55P03") {
+	if raced(err) && !errors.Is(err, ErrConflict) {
 		return fmt.Errorf("%w: %w", ErrConflict, err)
 	}
 	return err
 }
+
+// raced reports whether err, or any error it wraps, is PostgreSQL's refusal for a race, as
+// errors.As reads one, through an As method too. It reads the whole tree, as a hook's error can
+// join another of PostgreSQL's before the race, or wrap both, and errors.As stops at the first; but
+// at most maxWrapped of its errors, in errors.As's order, as one a host's type has wrap itself
+// would be read forever.
+func raced(err error) bool {
+	next := []error{err}
+	for read := 0; len(next) > 0 && read < maxWrapped; read++ {
+		err, next = next[len(next)-1], next[:len(next)-1]
+		var pg *pgconn.PgError
+		switch e := err.(type) { //nolint:errorlint // each error of the tree is read, not only the first PostgreSQL's
+		case *pgconn.PgError:
+			pg = e
+		case interface{ As(any) bool }:
+			e.As(&pg)
+		}
+		if pg != nil && (pg.Code == "40001" || pg.Code == "40P01" || pg.Code == "55P03") {
+			return true
+		}
+		switch e := err.(type) { //nolint:errorlint // as above
+		case interface{ Unwrap() error }:
+			next = append(next, e.Unwrap())
+		case interface{ Unwrap() []error }:
+			wrapped := e.Unwrap()
+			for i := len(wrapped) - 1; i >= 0; i-- {
+				next = append(next, wrapped[i])
+			}
+		}
+	}
+	return false
+}
+
+// maxWrapped is how many errors of a tree raced reads.
+const maxWrapped = 1000
 
 // conflicting makes *err match ErrConflict as conflicted does, for an exported call to defer, so
 // that wherever in the call PostgreSQL refused it for a race, the host meets one error: not only in
@@ -726,17 +761,19 @@ type Config struct {
 	// ChangeMembers GroupMembers on each group it changes, on the resource it returns, and a change
 	// to a group's members as the grants and denies it amounts to, and a removal by the label, on
 	// each scope the group's access is on, the tenant's and groups' included, which the package knows
-	// only by type and id, on the resource it returns for each. Without it, a scope is taken as
-	// stored, its type and id directly under the tenant, with no attributes or label, as constraints
-	// see it too. GroupMembers is checked on a group as group management checks its permissions; the
-	// grants and denies a change amounts to only where that is all of the scope: for a host declaring
-	// no Labels, and resource Attributes as none (an empty map, as nil lets conditions read any), and
-	// on a scope other than the tenant or a group, no ContainerTypes. For any other, that change is
-	// refused. SetRole changing what a custom role's grants give, and DeleteRole, check the label of
-	// each scope the role is granted on, and where a deny on a scope other than the tenant binds the
-	// actor, the denies on its path, and SetRole widening it the label of each scope a role listing it,
-	// or listing one that does, is granted on, and the denies on its path, as it returns it, so with
-	// Labels declared, or such a deny, they need it too. A removal reads a scope it reports as
+	// only by type and id, on the resource it returns for each, as DeleteGroup checks revoking what
+	// is granted on the group where a constraint or a deny binding the actor may stop that. Without
+	// it, a scope is taken as stored, its type and id directly under the tenant, with no attributes or
+	// label, as constraints see it too. GroupMembers is checked on a group as group management checks
+	// its permissions; the grants and denies a change amounts to, DeleteGroup's revoking included,
+	// only where that is all of the scope: for a host declaring no Labels, and resource Attributes as
+	// none (an empty map, as nil lets conditions read any), and on a scope other than the tenant or a
+	// group, no ContainerTypes. For any other, that change is refused. SetRole changing what a custom
+	// role's grants give, and DeleteRole, check the label of each scope the role is granted on, and
+	// where a deny on a scope other than the tenant binds the actor, the denies on its path, and
+	// SetRole widening it the label of each scope a role listing it, or listing one that does, is
+	// granted on, and the denies on its path, as it returns it, so with Labels declared, or such a
+	// deny, they need it too. A removal reads a scope it reports as
 	// ErrNotFound as stored and unlabeled, and ChangeMembers and DeleteRole ask nothing of the scopes
 	// only a removal reaches where the actor's label values satisfy every label and, for DeleteRole,
 	// no such deny binds it, as SetRole asks nothing of the scopes roles listing the role are granted

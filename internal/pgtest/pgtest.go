@@ -86,7 +86,7 @@ func poolIn(ctx context.Context, database, schema, params string) (*pgxpool.Pool
 // Database makes a database in the test database's cluster, with options as CREATE DATABASE
 // takes them, such as "TEMPLATE template0 ENCODING 'SQL_ASCII' LOCALE 'C'", drops it when the test
 // ends, and returns its name, quoted, and its URL. It skips the test where the test database's role
-// can't make one.
+// can't make one, as Skip does.
 func Database(tb testing.TB, options string) (name, database string) {
 	tb.Helper()
 	ctx := tb.Context()
@@ -100,7 +100,7 @@ func Database(tb testing.TB, options string) (name, database string) {
 	defer func() { _ = conn.Close(ctx) }()
 	if _, err := conn.Exec(ctx, "CREATE DATABASE "+name+" "+options); err != nil {
 		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "42501" {
-			tb.Skip("the test database's role can't create databases")
+			Skip(tb, "the test database's role can't create databases")
 		}
 		tb.Fatal(err)
 	}
@@ -124,18 +124,25 @@ func Database(tb testing.TB, options string) (name, database string) {
 	return name, u.String()
 }
 
-// URL is the test database's URL, or skips the test without one; in CI it fails it, as a run that
-// skipped every test of the database would pass.
+// URL is the test database's URL, or skips the test without one, as Skip does.
 func URL(tb testing.TB) string {
 	tb.Helper()
 	database := os.Getenv(URLEnv)
 	if database == "" {
-		if os.Getenv("CI") != "" {
-			tb.Fatal(URLEnv + " not set in CI")
-		}
-		tb.Skip(URLEnv + " not set")
+		Skip(tb, URLEnv+" not set")
 	}
 	return database
+}
+
+// Skip skips the test for why, as what it needs isn't there, but in CI fails it: CI gives each run
+// a database of its own, set up for every test, so one that skipped there would pass the run
+// without testing what it is for.
+func Skip(tb testing.TB, why string) {
+	tb.Helper()
+	if os.Getenv("CI") != "" {
+		tb.Fatal(why + ", in CI")
+	}
+	tb.Skip(why)
 }
 
 var templates struct {
