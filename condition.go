@@ -1376,8 +1376,9 @@ func ordering(function string) func(x, y ref.Val) ref.Val {
 // deny's `failed / total >= 0.5` would lift where both are 0.0, and -Inf orders below every
 // bound, so comparing either fails, as a declared double that isn't finite does. So does a value of
 // a type of the host's own CEL reads as a double holding one: a check reads such a value as CEL's
-// own double, but where it is a map's key, or a value a list or a map keying one yields, which it
-// reads as the map holds it (converting.key), so a grant's `k[0] != 0.5` held for NaN there.
+// own double, but where it is a key of a map whose keys it reads as the map holds them, or a value
+// a list or a map keying one yields, which it reads so too (hostMap.key), so a grant's
+// `k[0] != 0.5` held for NaN there.
 func nonFinite(v ref.Val) bool {
 	if d, ok := v.(types.Double); ok {
 		return math.IsNaN(float64(d)) || math.IsInf(float64(d), 0)

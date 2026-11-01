@@ -77,13 +77,21 @@ import (
 // this package: it decodes JSON text and writes out a struct whole each time, uncharged, and one
 // holding itself, as a message of a dynamic type reaching itself does, without end, which ends the
 // process, as no recover catches it. So a host is to make none over the values above. A key a map
-// yields of such a type of the host's, or a list or a map it is keyed by, is read as the map holds
-// it, so the map finds it, and so is what such a list or map yields, but a double of the host's
-// there that isn't finite fails what compares it. A value a condition indexes a map or a list by is
-// read as any other, as in `m[k]`: CEL indexes by the Go value the host passed, and fails for one
-// of a type it doesn't index by, as an int8, a pointer, JSON or a wrapper, though it reads it as
-// one of its own everywhere else. A value holding itself fails whatever reads it whole, but in a
-// list or a map of CEL's made over it.
+// yields of such a type of the host's is read as the value it holds too, and the map finds it by
+// that value, as by a value of that type a condition reads, so the map compares as one of CEL's own
+// does, from either side, and equal to itself; a map holding two keys read as the same value, as a
+// host's string "a" and CEL's own, fails what finds either. A check reads a map's keys to find them
+// so once, the first time a condition reads a key of it, but in a map of more keys than a condition
+// may cost, 10,000, which none compares or loops over, or of the host's own type that is neither a
+// pointer nor a comparable value of at most 1 KiB, which it can't tell apart from another: in one,
+// a key is read as the map holds it, and found by the map's own methods alone, so a value of the
+// host's own type a condition reads finds no key of that type. A list or a map a map is keyed by is
+// read as the map holds it, and so is what it yields, but a double of the host's there that isn't
+// finite fails what compares it. A value a condition indexes a map or a list by is read as any
+// other, as in `m[k]`: CEL indexes by the Go value the host passed, and fails for one of a type it
+// doesn't index by, as an int8, a pointer, JSON or a wrapper, though it reads it as one of its own
+// everywhere else. A value holding itself fails whatever reads it whole, but in a list or a map of
+// CEL's made over it.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
@@ -189,14 +197,20 @@ const maxCopied = 1 << 10
 //     double is one of CEL's own, which comparing fails where it isn't finite, and a string's length
 //     counts in what reading it costs; one holding no such value fails. Any other, an opaque value,
 //     is read as it is.
-//   - A key a map yields, where the map can be keyed by values of the host's own types, is read as
-//     the map holds it (key): read as CEL's own, a map holding it wouldn't find it, so a map would
-//     compare unequal to itself. So is a list or a map it is keyed by, and what it yields, so a
+//   - A key of such a type a map yields is read as that value too, and the map finds it by that
+//     value (hostMap.Find): read as the map holds it, the map found no value of CEL's own it
+//     holds, so not the host's value of the same type either, which this reads as CEL's own, and a
+//     deny's `request.attributes.role in request.attributes.blocked` lifted; read as CEL's own, but
+//     found by the map as it holds it, a map would compare unequal to itself. In a map of more keys
+//     than a condition may cost, or of the host's own type it can't tell apart (readsKeys), it is
+//     read as the map holds it (key). So is a list or a map a key is, and what it yields, so a
 //     double of the host's there that isn't finite fails what compares it by nonFinite alone.
 //
 // Each check makes its own, which keeps what it converted only while the check runs.
 type converting struct {
 	once map[copiedKey]converted
+	// keys are the keys of the host's own types each map holds, by the map (hostMap.heldKeys).
+	keys map[any]heldKeys
 	// base is the adapter the conditions run with, which reads the rest as CEL does: the well-known
 	// messages it knows past those of DefaultTypeAdapter, as google.protobuf.Empty, among them.
 	base types.Adapter
@@ -239,7 +253,7 @@ func (c *converting) NativeToValue(v any) ref.Val {
 		return types.NewRefValList(c, v)
 	case map[ref.Val]ref.Val:
 		// Found by the keys themselves, as CEL finds them.
-		return hostMap{types.NewRefValMap(types.DefaultTypeAdapter, v), c}
+		return c.keyed(types.NewRefValMap(types.DefaultTypeAdapter, v), reflect.ValueOf(v))
 	case json.RawMessage, json.Number, *anypb.Any:
 		return c.decoded(v)
 	// Before protoreflect.Message: a dynamic message, as dynamicpb's, is its own reflection, so
@@ -289,8 +303,8 @@ func (c *converting) NativeToValue(v any) ref.Val {
 		if large(rv.Type().Key()) || large(rv.Type().Elem()) {
 			return copiedWhole(v)
 		}
-		if k := rv.Type().Key(); k.Kind() == reflect.Interface || k.Implements(refValType) {
-			return hostMap{types.NewDynamicMap(asHeld{c}, v), c}
+		if keyedByHost(rv.Type()) {
+			return c.keyed(types.NewDynamicMap(asHeld{c}, v), rv)
 		}
 		return types.NewDynamicMap(c, v)
 	default:
@@ -346,7 +360,14 @@ func (c *converting) own(v ref.Val) ref.Val {
 		// hostList.
 		return hostList{v.ToImmutableList(), c}
 	case traits.Mapper:
-		return hostMap{v, c}
+		if !ofCEL(v) {
+			return hostMap{v, c, mapID(v)}
+		}
+		// One of CEL's own over a Go map no value of the host's own type can key holds none.
+		if held := reflect.ValueOf(v.Value()); held.IsValid() && keyedByHost(held.Type()) {
+			return c.keyed(v, held)
+		}
+		return hostMap{Mapper: v, c: c}
 	case traits.Lister:
 		return hostList{v, c}
 	}
@@ -432,21 +453,157 @@ func (l hostList) Add(other ref.Val) ref.Val {
 
 // hostMap is a map a host makes, of a type of its own or of CEL's, or one that can be keyed by
 // values of the host's own types, as a map[any]any can, read as hostList reads a list, but for the
-// keys it yields, read as it holds them (key).
+// keys it yields and finds (key, Find).
 type hostMap struct {
 	traits.Mapper
 	c *converting
+	// id is how c knows the map (mapID), so it reads the map's keys once for the check (heldKeys);
+	// nil where it can't, as for a map of the host's own type that is neither a pointer nor
+	// comparable, or needn't, as for one of CEL's over a Go map no value of the host's own type can
+	// key, which holds none.
+	id any
 }
 
-func (m hostMap) Get(k ref.Val) ref.Val     { return m.c.own(m.Mapper.Get(k)) }
-func (m hostMap) Iterator() traits.Iterator { return keyIterator{m.Mapper.Iterator(), m.c} }
+// keyed is m, which is or holds the Go map of, read as hostMap reads one c knows by of.
+func (c *converting) keyed(m traits.Mapper, of reflect.Value) hostMap {
+	return hostMap{m, c, mapID(of.Interface())}
+}
 
+// mapID is how a check knows v, a map: by where it points, its length and its type, or, where it
+// points nowhere, as a struct, as itself, if it is comparable and no larger than maxCopied, which
+// hashing it reads whole; nil otherwise.
+func mapID(v any) any {
+	rv := reflect.ValueOf(v)
+	if k, ok := copiedKeyOf(rv); ok {
+		return k
+	}
+	if rv.Comparable() && rv.Type().Size() <= maxCopied {
+		return v
+	}
+	return nil
+}
+
+// keyedByHost reports whether a map of type t can be keyed by values of the host's own types.
+func keyedByHost(t reflect.Type) bool {
+	return t.Kind() == reflect.Map && (t.Key().Kind() == reflect.Interface || t.Key().Implements(refValType))
+}
+
+// readsKeys reports whether m reads its keys of the host's own types as the values of CEL's own
+// they hold, and finds them by those: where c knows it, and it holds no more keys than a condition
+// may cost, as no condition compares, or loops over, one holding more. One holding more is read as
+// it holds its keys, and finds them by its own methods alone.
+func (m hostMap) readsKeys() bool { return m.id != nil && count(m.Mapper) <= maxCost }
+
+func (m hostMap) Get(k ref.Val) ref.Val {
+	if v, found := m.Find(k); found {
+		return v
+	}
+	return m.c.own(m.Mapper.Get(k))
+}
+
+func (m hostMap) Iterator() traits.Iterator {
+	return keyIterator{m.Mapper.Iterator(), m, m.readsKeys()}
+}
+
+// Find finds k, where m reads its keys (readsKeys), by its key of the host's own type holding k,
+// if one does, and fails for k two of its keys are read as.
 func (m hostMap) Find(k ref.Val) (ref.Val, bool) {
+	if m.readsKeys() && scalar(k) {
+		if held := m.heldKeys(); held != nil {
+			if key, found := held.Find(k); found {
+				if types.IsError(key) {
+					return key, true
+				}
+				k = key
+			}
+		}
+	}
 	v, found := m.Mapper.Find(k)
 	if found {
 		v = m.c.own(v)
 	}
 	return v, found
+}
+
+// Contains is whether Find finds k, for the bounded decorator, which finds `in` a map by its own
+// method.
+func (m hostMap) Contains(k ref.Val) ref.Val {
+	if !m.readsKeys() {
+		return m.Mapper.Contains(k)
+	}
+	v, found := m.Find(k)
+	if found && types.IsError(v) {
+		return v
+	}
+	return types.Bool(found)
+}
+
+// heldKeys is CEL's own map of the values of CEL's own m's keys are read as to those keys, read
+// once for the check, or nil where none is of the host's own type. A value two of them are read as,
+// of the host's own type or of CEL's own, maps to an error, as finding it couldn't tell which it
+// names. It reads no more keys than readsKeys allows, and none past them, as a host's iterator
+// yielding more than its size says.
+func (m hostMap) heldKeys() traits.Mapper {
+	if done, ok := m.c.keys[m.id]; ok {
+		return done.held
+	}
+	read := func(each func(k, v ref.Val)) {
+		n := 0
+		for it := m.Mapper.Iterator(); n <= maxCost && it.HasNext() == types.True; n++ {
+			k := it.Next()
+			v := k
+			if hostScalar(k) {
+				v = m.c.held(k)
+			}
+			// One read as a value CEL's own finds none by, as bytes or NaN, is none.
+			if scalar(v) && !nonFinite(v) {
+				each(k, v)
+			}
+		}
+	}
+	hosts := false
+	read(func(k, _ ref.Val) { hosts = hosts || hostScalar(k) })
+	var out traits.Mapper
+	if hosts {
+		held := map[ref.Val]ref.Val{}
+		read(func(k, v ref.Val) {
+			if _, twice := held[v]; twice {
+				held[v] = ambiguousKey()
+			} else {
+				held[v] = k
+			}
+		})
+		out = types.NewRefValMap(types.DefaultTypeAdapter, held)
+	}
+	if m.c.keys == nil {
+		m.c.keys = map[any]heldKeys{}
+	}
+	m.c.keys[m.id] = heldKeys{m.Mapper, out}
+	return out
+}
+
+// heldKeys is what hostMap.heldKeys read of a map, and the map, kept so that no other comes to be
+// where it was while what was read of it is kept.
+type heldKeys struct {
+	of   traits.Mapper
+	held traits.Mapper
+}
+
+func ambiguousKey() ref.Val {
+	return types.NewErr("rbac: a map holds two keys a condition reads as the same value")
+}
+
+// scalar reports whether v is one of CEL's own values of a type a host's own value can be read as,
+// but bytes, which no Go map is keyed by.
+func scalar(v ref.Val) bool {
+	_, isBytes := v.(types.Bytes)
+	return !isBytes && ofCEL(v) && holdsNone(v) && slices.Contains(celScalars, v.Type().TypeName())
+}
+
+// hostScalar reports whether v is of a type of the host's own CEL reads as a value of a type of
+// its own that holds no other.
+func hostScalar(v ref.Val) bool {
+	return !holdsNone(v) && !ofCEL(v) && slices.Contains(celScalars, v.Type().TypeName())
 }
 
 type hostIterator struct {
@@ -458,22 +615,32 @@ func (it hostIterator) Next() ref.Val { return it.c.own(it.Iterator.Next()) }
 
 type keyIterator struct {
 	traits.Iterator
-	c *converting
+	m     hostMap
+	reads bool
 }
 
-func (it keyIterator) Next() ref.Val { return it.c.key(it.Iterator.Next()) }
+func (it keyIterator) Next() ref.Val { return it.m.key(it.Iterator.Next(), it.reads) }
 
-// key is k, a key a map that can be keyed by values of the host's own types yields, as conditions
-// read it: as the map holds it, so that finding it in a map holding it finds it, as finding it read
-// as one of CEL's own wouldn't, and a map compares equal to itself. One of the host's own type CEL
-// reads as a value of its own holding a double that isn't finite is read as that double, which
-// comparing fails, and one holding no such value fails.
-func (c *converting) key(k ref.Val) ref.Val {
-	if holdsNone(k) || ofCEL(k) || !slices.Contains(celScalars, k.Type().TypeName()) {
-		return k
+// key is k, a key m yields, as conditions read it. One of the host's own type CEL reads as a value
+// of its own is read as the value it holds where m reads its keys so (readsKeys), so it compares as
+// CEL's own does, from either side, and the map finds it by that value; a value two of its keys are
+// read as fails. Where m doesn't, it is read as the map holds it, so the map finds it, as read as
+// one of CEL's own it wouldn't, and compares equal to itself, but for one holding a double that
+// isn't finite, read as that double, which comparing fails. One holding no such value fails.
+func (m hostMap) key(k ref.Val, reads bool) ref.Val {
+	if hostScalar(k) {
+		held := m.c.held(k)
+		if !reads && !types.IsError(held) && !nonFinite(held) {
+			return k
+		}
+		k = held
 	}
-	if held := c.held(k); types.IsError(held) || nonFinite(held) {
-		return held
+	if reads && scalar(k) {
+		if held := m.heldKeys(); held != nil {
+			if key, _ := held.Find(k); key != nil && types.IsError(key) {
+				return key
+			}
+		}
 	}
 	return k
 }

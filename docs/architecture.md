@@ -389,8 +389,10 @@ sequenceDiagram
   converted once for the check, and one CEL unpacks in turn, a packed message packing another,
   fails; one CEL would write out whole into an error, as a struct, or copy whole on each read, as an
   array of more than 1 KiB of bytes, fails, a test of its presence too; and one of the host's type
-  CEL reads as one of its own, as a double, is read as the value it holds, but as a map's key, which
-  is read as the map holds it, so the map finds it. A key a condition indexes by is read as any
+  CEL reads as one of its own, as a double, is read as the value it holds, a map's key too, which
+  the map finds by that value (`hostMap.Find`), reading the map's keys once for the check, but in a
+  map of more keys than a condition may cost, or of the host's type the check can't tell apart from
+  another, which finds its keys by its own methods alone. A key a condition indexes by is read as any
   value is, where CEL indexes only by Go values of the types it names, failing for an `int8` or
   JSON. What is converted once is converted
   whole, uncharged: charging the check would let what one condition reads fail the others, so the

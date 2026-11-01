@@ -187,8 +187,11 @@ conditional ones reach, to check one by one.
   condition reads it, and a packed message packing another fails; one it can't read, as a struct,
   or copies whole on each read, an array of more than 1 KiB of bytes or a list or map holding arrays
   or structs of more than 1 KiB, fails, a test of its presence with `has()` too; and one of the
-  host's own type CEL reads as a double or a string is read as the value it holds, but as a map's
-  key, which is read as the map holds it so the map finds it. A key a condition indexes a map or a
+  host's own type CEL reads as a double or a string is read as the value it holds, a map's key
+  too, which the map finds by that value, so a map holding two keys read as the same value fails
+  what finds either; but in a map of more than 10,000 keys, or of the host's own type that is
+  neither a pointer nor a comparable value of at most 1 KiB, a key is read as the map holds it and
+  found by the map's own methods alone. A key a condition indexes a map or a
   list by, as an `int8`, a pointer or JSON, is read as any value is, though CEL fails to index by
   one as passed. Each value converted once is converted whole, so pass no two that share what they
   hold, as messages reaching one message or JSON texts sharing bytes, which decoding never makes: a

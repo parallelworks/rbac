@@ -1673,22 +1673,15 @@ func TestFiniteValuesDecideAsCELDoes(t *testing.T) {
 		"a message's field":  text.ProtoReflect().Get(text.ProtoReflect().Descriptor().Fields().ByName("string_value")),
 		"a list":             []any{"a", 0.5}, "a map": map[string]any{"a": "a"}, "an id": [16]byte{1}, "ids": [][16]byte{{1}},
 		"a struct": struct{ A string }{"a"},
-		// Keyed by values of a type of the host's own, which a map finds as the map holds them: read
-		// as CEL's own, each map compared unequal to itself, so a grant's `!=` held.
-		"a map keyed by a host's double": map[ref.Val]ref.Val{hostDouble(0.5): types.String("a")},
-		"a map of CEL's keyed so":        types.NewRefValMap(types.DefaultTypeAdapter, map[ref.Val]ref.Val{hostDouble(0.5): types.String("a")}),
-		"a host's map keyed so":          ownMap{types.NewRefValMap(types.DefaultTypeAdapter, map[ref.Val]ref.Val{hostDouble(0.5): types.String("a")})},
-		"a map of Go's keyed so":         map[any]any{heldKey{0.5}: "a"},
 		// CEL's own lists and maps a host makes, which read what they hold as they were made to: read
 		// again from the Go value each holds, a map of a map[string]any or of ref.Vals found no key of
 		// the host's own type where CEL's finds it, a list of bytes or of JSON text was read as bytes or
 		// as the text, and a list made by adding lists as the values its elements hold, so a type as
 		// its name, and a grant's `!=` held where CEL finds them equal.
-		"a map keyed by a host's string": map[ref.Val]ref.Val{hostString("a"): types.String("a")},
-		"a map of CEL's of Go's":         types.NewDynamicMap(types.DefaultTypeAdapter, map[string]any{"a": "a"}),
-		"a map of CEL's of strings":      types.NewDynamicMap(types.DefaultTypeAdapter, map[string]string{"a": "a"}),
-		"a map of CEL's of ref.Vals":     types.NewDynamicMap(types.DefaultTypeAdapter, map[ref.Val]ref.Val{types.Double(0.5): types.String("a")}),
-		"bytes":                          []byte("a"), "a list of CEL's of bytes": types.NewDynamicList(types.DefaultTypeAdapter, []byte("a")),
+		"a map of CEL's of Go's":     types.NewDynamicMap(types.DefaultTypeAdapter, map[string]any{"a": "a"}),
+		"a map of CEL's of strings":  types.NewDynamicMap(types.DefaultTypeAdapter, map[string]string{"a": "a"}),
+		"a map of CEL's of ref.Vals": types.NewDynamicMap(types.DefaultTypeAdapter, map[ref.Val]ref.Val{types.Double(0.5): types.String("a")}),
+		"bytes":                      []byte("a"), "a list of CEL's of bytes": types.NewDynamicList(types.DefaultTypeAdapter, []byte("a")),
 		"a list of CEL's of JSON text": types.NewDynamicList(types.DefaultTypeAdapter, json.RawMessage(`"a"`)),
 		"a list of CEL's it added to":  typed.Add(types.NewRefValList(types.DefaultTypeAdapter, []ref.Val{types.String("a")})),
 		"a list of a type's name":      []any{"int", "a"},
@@ -1724,6 +1717,40 @@ func TestFiniteValuesDecideAsCELDoes(t *testing.T) {
 			out, err := celEval(expr, map[string]any{"x": own[x][1]})
 			if held, evaluated, _, rerr := rbac.EvaluateCondition(t, expr, map[string]any{"x": own[x][0]}); rerr != nil || evaluated != (err == nil) || evaluated && held != out.Value() {
 				t.Errorf("%s of %s: held %t, evaluated %t, %v; CEL decides %v, %v of what it holds", expr, x, held, evaluated, rerr, out, err)
+			}
+		}
+	}
+	// A map keyed by values of a type of the host's own decides as the map keyed by the values they
+	// hold, as a value of that type does (TestAHostsValueIsFoundAmongKeysOfItsType): read as it holds
+	// them, each was found by what held the same value as itself and by no value of CEL's own, so it
+	// equaled no map CEL makes. Read as CEL's own, but not found by them, it compared unequal to
+	// itself, so a grant's `!=` held.
+	keyed := map[string][3]any{
+		"a host's map keyed so": {
+			ownMap{types.NewRefValMap(types.DefaultTypeAdapter, map[ref.Val]ref.Val{hostDouble(0.5): types.String("a")})}, map[any]any{0.5: "a"}, hostDouble(0.5),
+		},
+		"a map keyed by a host's double": {map[ref.Val]ref.Val{hostDouble(0.5): types.String("a")}, map[any]any{0.5: "a"}, hostDouble(0.5)},
+		"a map of CEL's keyed so": {
+			types.NewRefValMap(types.DefaultTypeAdapter, map[ref.Val]ref.Val{hostDouble(0.5): types.String("a")}), map[any]any{0.5: "a"}, hostDouble(0.5),
+		},
+		"a map of Go's keyed so":         {map[any]any{heldKey{0.5}: "a"}, map[any]any{0.5: "a"}, hostDouble(0.5)},
+		"a map keyed by a host's string": {map[ref.Val]ref.Val{hostString("a"): types.String("a")}, map[string]any{"a": "a"}, hostString("a")},
+		"a map of CEL's of Go's keyed so": {
+			types.NewDynamicMap(types.DefaultTypeAdapter, map[any]any{heldKey{0.5}: "a"}), map[any]any{0.5: "a"}, hostDouble(0.5),
+		},
+	}
+	for x := range keyed {
+		for _, of := range []string{
+			"%[1]s == %[1]s", "%[1]s != %[1]s", "%[1]s == %[2]s", "%[2]s == %[1]s", "%[1]s != %[2]s", "%[1]s in [%[2]s]",
+			`{0.5: "a"} == %[1]s`, `%[1]s == {"a": "a"}`, `0.5 in %[1]s`, `"a" in %[1]s`, `%[1]s.exists(k, k == 0.5)`,
+			`%[1]s.exists(k, 0.5 == k)`, `%[1]s.exists(k, "a" == k)`, `%[1]s.all(k, k in %[1]s)`, `%[1]s.exists(k, %[1]s[k] == "a")`,
+			`%[1]s.a == "a"`, `%[1]s[0.5] == "a"`, `has(%[1]s.a)`, `size(%[1]s) == 1`, `%[3]s in %[1]s`, `%[1]s[%[3]s] == "a"`,
+			`!(%[3]s in %[1]s)`,
+		} {
+			expr := fmt.Sprintf(of, "request.attributes.x", "request.attributes.y", "request.attributes.k")
+			out, err := celEval(expr, map[string]any{"x": keyed[x][1], "y": keyed[x][1], "k": types.DefaultTypeAdapter.NativeToValue(keyed[x][2]).Value()})
+			if held, evaluated, _, rerr := rbac.EvaluateCondition(t, expr, map[string]any{"x": keyed[x][0], "y": keyed[x][1], "k": keyed[x][2]}); rerr != nil || evaluated != (err == nil) || evaluated && held != out.Value() {
+				t.Errorf("%s of %s: held %t, evaluated %t, %v; CEL decides %v, %v of the map keyed by what its keys hold", expr, x, held, evaluated, rerr, out, err)
 			}
 		}
 	}
@@ -1778,6 +1805,138 @@ func TestAHostsDoubleInAKeyFailsWhereItIsntFinite(t *testing.T) {
 			}
 		}
 	}
+}
+
+// A value of a host's own type CEL reads as a string is read as the string it holds, but a key of
+// that type a map of Go's or of CEL's holds was read as the map holds it, so the map found no value
+// of CEL's own, the host's included: where the host passed both, a grant's
+// `!(request.attributes.role in request.attributes.blocked)` held for a blocked role, and a deny's
+// `request.attributes.role in request.attributes.blocked` lifted, where CEL finds the role. A key
+// of the host's own type is read as the value it holds, and found by it, and a map holding two keys
+// read as the same value fails what finds it.
+func TestAHostsValueIsFoundAmongKeysOfItsType(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
+	})
+	ctx := t.Context()
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	g.Condition = rbac.Condition{Expression: `!(request.attributes.role in request.attributes.blocked)`}
+	h.seed(t, g, grant(cluster.Scope(), "cluster.login", rbac.User, "v"), grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+	u, v := h.as(t, "u"), h.as(t, "v")
+	d := rbac.Deny{
+		ID: "blocked", Principals: []rbac.Principal{v.Principal}, Permissions: []rbac.Permission{login},
+		Condition: rbac.Condition{Expression: `request.attributes.role in request.attributes.blocked`},
+	}
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, d); err != nil {
+		t.Fatal(err)
+	}
+	is := func(s rbac.Subject, blocked any) bool {
+		t.Helper()
+		err := h.authz.Authorize(rbac.WithRequest(ctx, map[string]any{"role": hostString("admin"), "blocked": blocked}), s, login, cluster)
+		if err != nil && !errors.Is(err, rbac.ErrDenied) {
+			t.Fatal(err)
+		}
+		return err == nil
+	}
+	for name, blocked := range map[string]any{
+		"a map of ref.Vals":      map[ref.Val]ref.Val{hostString("admin"): types.True},
+		"a map of CEL's":         types.NewRefValMap(types.DefaultTypeAdapter, map[ref.Val]ref.Val{hostString("admin"): types.True}),
+		"holding the role twice": map[ref.Val]ref.Val{hostString("admin"): types.True, types.String("admin"): types.True},
+	} {
+		if is(u, blocked) {
+			t.Errorf("a grant's condition held for a role %s blocks", name)
+		}
+		if is(v, blocked) {
+			t.Errorf("a deny's condition was lifted for a role %s blocks", name)
+		}
+	}
+	free := map[ref.Val]ref.Val{hostString("user"): types.True}
+	if !is(u, free) || !is(v, free) {
+		t.Error("a role no map blocks")
+	}
+	// A map holding a key of the host's own type and one of CEL's own read as the same value can't
+	// tell which a condition names, so whatever finds either fails.
+	twice := map[string]any{"m": map[ref.Val]ref.Val{hostString("a"): types.String("ok"), types.String("a"): types.String("bad")}}
+	for _, expr := range []string{
+		`request.attributes.m["a"] == "ok"`, `request.attributes.m.all(k, request.attributes.m[k] == "ok")`,
+		`!request.attributes.m.exists(k, request.attributes.m[k] == "bad")`,
+	} {
+		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, twice); err != nil || evaluated {
+			t.Errorf("%s of a map holding a key twice: evaluated %t, %v", expr, evaluated, err)
+		}
+	}
+	// Each finds its keys by the values they hold, so maps of either kind holding the same compare
+	// equal, as CEL compares them.
+	keyed := map[string]any{
+		"a map of ref.Vals": map[ref.Val]ref.Val{hostString("a"): types.True},
+		"a map of CEL's":    types.NewRefValMap(types.DefaultTypeAdapter, map[ref.Val]ref.Val{hostString("a"): types.True}),
+		"a host's map":      ownMap{types.NewRefValMap(types.DefaultTypeAdapter, map[ref.Val]ref.Val{hostString("a"): types.True})},
+	}
+	for x := range keyed {
+		for y := range keyed {
+			attributes := map[string]any{"x": keyed[x], "y": keyed[y]}
+			for expr, want := range map[string]bool{`request.attributes.x == request.attributes.y`: true, `request.attributes.x != request.attributes.y`: false} {
+				if held, evaluated, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || !evaluated || held != want {
+					t.Errorf("%s of %s and %s: held %t, evaluated %t, %v", expr, x, y, held, evaluated, err)
+				}
+			}
+		}
+	}
+}
+
+// A check reads the keys of a map keyed by values of the host's own types to find them by the
+// values they hold (TestAHostsValueIsFoundAmongKeysOfItsType), once for the check, and no more of
+// them than a condition may cost, whatever the map's size says, so finding a key costs no more for
+// each condition finding one than it did, and reading one of a host's own type yielding keys
+// without end ends.
+func TestAMapsKeysAreReadOnceForACheckAndNoMoreThanAConditionMayCost(t *testing.T) {
+	for name, c := range map[string]struct {
+		keys, most int
+		size       types.Int
+		expr       string
+	}{
+		"a map of more keys than its size says": {keys: 1 << 17, size: 1, most: 2 * 10001, expr: `!("x" in request.attributes.m)`},
+		"a map found in by each step of a loop": {keys: 5000, size: 5000, most: 2 * 5000, expr: `request.attributes.l.all(v, !(v in request.attributes.m))`},
+	} {
+		n := 0
+		m := &keysRead{Mapper: types.NewRefValMap(types.DefaultTypeAdapter, map[ref.Val]ref.Val{hostString("a"): types.True}), keys: c.keys, size: c.size, n: &n}
+		held, evaluated, _, err := rbac.EvaluateCondition(t, c.expr, map[string]any{"m": m, "l": make([]any, 300)})
+		if err != nil || !evaluated || !held {
+			t.Errorf("%s: held %t, evaluated %t, %v", name, held, evaluated, err)
+		}
+		if n > c.most {
+			t.Errorf("%s: read %d keys", name, n)
+		}
+	}
+}
+
+// keysRead is a host's map whose iterator yields keys values of the host's own type, whatever its
+// size says, counting each.
+type keysRead struct {
+	traits.Mapper
+	keys int
+	size types.Int
+	n    *int
+}
+
+func (m *keysRead) Size() ref.Val { return m.size }
+
+func (m *keysRead) Iterator() traits.Iterator {
+	return &readingKeys{Iterator: m.Mapper.Iterator(), m: m}
+}
+
+type readingKeys struct {
+	traits.Iterator
+	m *keysRead
+	i int
+}
+
+func (it *readingKeys) HasNext() ref.Val { return types.Bool(it.i < it.m.keys) }
+
+func (it *readingKeys) Next() ref.Val {
+	it.i++
+	*it.m.n++
+	return hostString(fmt.Sprint(it.i))
 }
 
 // CEL adds to a mutable list of its own in place, so a condition adding to one the host passes
