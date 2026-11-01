@@ -799,7 +799,7 @@ func TestAConditionBuildingAMessageIsRefused(t *testing.T) {
 type holder struct{ M map[string]any }
 
 // A value the host passes that holds itself, as a graph of objects it converts may, fails each
-// condition reading it whole, as a comparison or a loop does, rather than recursing until the stack
+// condition reading it, as a comparison or a loop does, rather than recursing until the stack
 // overflows, which kills the process: no recover catches it. A message literal converted one so,
 // and so did reading a value CEL can't read that holds one, as a struct, which it writes out in its
 // error, or a message of a dynamic type, which it merges into one of its own. One that is its own
@@ -858,6 +858,38 @@ func TestAValueHoldingItselfFailsItsConditions(t *testing.T) {
 		}
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Errorf("%s: %v\n%.2000s", expr, err, out)
+		}
+	}
+}
+
+// Values holding each other, as a node and its parent, each fail whatever reads them, whichever a
+// check reaches first. Only the one converting reached again failed, so where a holds b and b holds
+// a, a.b or b.a failed by the order the attributes came in, and a grant's
+// `has(request.attributes.a.b)` held for one check and not the next. One holding them reads the rest.
+func TestValuesHoldingEachOtherFailWhicheverIsReachedFirst(t *testing.T) {
+	a, b := map[string]any{"x": 1}, map[string]any{"x": 1}
+	a["b"], b["a"] = b, a
+	parent := map[string]any{"name": "p"}
+	child := map[string]any{"name": "c", "parent": parent}
+	parent["children"] = []any{child}
+	self := map[string]any{"x": 1}
+	self["self"] = self
+	attributes := map[string]any{
+		"a": a, "b": b, "parent": parent, "child": child, "self": self,
+		"holding": map[string]any{"a": a, "y": 1}, "ok": true,
+	}
+	for range 20 {
+		for _, expr := range []string{
+			`has(request.attributes.a.b)`, `has(request.attributes.b.a)`, `request.attributes.a.x == 1`, `request.attributes.b.x == 1`,
+			`request.attributes.child.name == "c"`, `request.attributes.parent.name == "p"`, `size(request.attributes.parent.children) == 1`,
+			`request.attributes.self.x == 1`, `has(request.attributes.holding.a)`, `"a" in request.attributes.holding`,
+		} {
+			if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || evaluated {
+				t.Fatalf("%s: evaluated %t, %v", expr, evaluated, err)
+			}
+		}
+		if held, _, _, err := rbac.EvaluateCondition(t, `request.attributes.ok && request.attributes.holding.y == 1`, attributes); err != nil || !held {
+			t.Fatalf("attributes beside values holding each other: held %t, %v", held, err)
 		}
 	}
 }

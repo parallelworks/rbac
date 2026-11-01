@@ -233,17 +233,17 @@ scopes conditional ones reach, to check one by one.
   `ref.Val` of the host's own, though it says it is one of CEL's types, a list, map or optional of
   CEL's a host makes, a struct, a channel, a func, any other message, a map keyed by anything else,
   as a double or an array, a map holding two keys read as the same value, as `1` and `1u`, invalid
-  JSON, a value nested more than 10,000 deep, as JSON text can't be, and a value holding itself. A
-  list or map holding one reads the rest, and a value reached twice is converted once. A check
-  converts no more than `2 × 80,000` of them, counted as reading them costs a condition, one for
-  each value and a tenth of each string's, bytes', JSON number's or JSON text's length, and half an
-  `Any`'s packed bytes, about a map of 50,000 short strings: past that every condition reading an
-  attribute fails. Comparing a value holding a double that isn't finite fails, in a list or a map
-  too. Each condition runs within the most evaluating it can cost, which its literals and types
-  bound: little for comparing what a request passes with literals, or with the ids, kinds, types and
-  tenant a check passes or its action, which are no longer than `MaxID`, and all a condition may for
-  reading the size of, or looping over, a list the request passes, or for looking up a key the
-  request passes in a map, which hashes the key whole, as
+  JSON, a value nested more than 10,000 deep, as JSON text can't be, and a value holding itself, and
+  each it holds that holds it. A list or map holding one reads the rest, and a value reached twice
+  is converted once. A check converts no more than `2 × 80,000` of them, counted as reading them
+  costs a condition, one for each value and a tenth of each string's, bytes', JSON number's or JSON
+  text's length, and half an `Any`'s packed bytes, about a map of 50,000 short strings: past that
+  every condition reading an attribute fails. Comparing a value holding a double that isn't finite
+  fails, in a list or a map too. Each condition runs within the most evaluating it can cost, which
+  its literals and types bound: little for comparing what a request passes with literals, or with
+  the ids, kinds, types and tenant a check passes or its action, which are no longer than `MaxID`,
+  and all a condition may for reading the size of, or looping over, a list the request passes, or
+  for looking up a key the request passes in a map, which hashes the key whole, as
   `{"dev": 1, "prod": 2}[resource.attributes.env]` does. Cost is bounded per check too, for each
   scope on its path, and the conditions a check reads together are bounded where they are stored:
   an identity's grants' on a scope, those of a scope's grants to groups, the tenant's members and

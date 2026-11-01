@@ -71,14 +71,14 @@ import (
 // list, a map or an optional of CEL's a host makes, a struct, a channel, a func, a complex number,
 // a uintptr, any other message, a map keyed by any other value, as a double or an array, a map
 // holding two keys read as the same value, as 1 and 1u, or "a" twice of two string types, invalid
-// JSON, a value nested deeper than JSON text may, 10,000 deep, and a value holding itself. A list
-// or a map holding one reads the rest. A value reached twice, as a map two lists hold, is converted
-// once. A check converts at most maxConverted of what the host passes, counted as reading it costs
-// a condition, one for each value and a tenth of each string's, bytes', JSON number's, JSON text's
-// or packed type URL's length, and half a packed message's, as a packed value takes as few as two
-// bytes: past that, every condition reading an attribute of any kind fails, and JSON text that may
-// hold more values than are left isn't parsed. A declared attribute is a value of its type as
-// converted, so a named string type is a string.
+// JSON, a value nested deeper than JSON text may, 10,000 deep, and a value holding itself, and each
+// it holds that holds it. A list or a map holding one reads the rest. A value reached twice, as a
+// map two lists hold, is converted once. A check converts at most maxConverted of what the host
+// passes, counted as reading it costs a condition, one for each value and a tenth of each string's,
+// bytes', JSON number's, JSON text's or packed type URL's length, and half a packed message's, as a
+// packed value takes as few as two bytes: past that, every condition reading an attribute of any
+// kind fails, and JSON text that may hold more values than are left isn't parsed. A declared
+// attribute is a value of its type as converted, so a named string type is a string.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
@@ -143,18 +143,34 @@ const maxNested = 10000
 // converter converts what a host passes for a check into CEL's own values (Attributes), spending
 // no more than left, and keeping each list, map, pointer, message and JSON text it converts by
 // where it points, its length and its type, so one reached twice is converted once, and one
-// reached from itself fails.
+// holding itself fails, and so does each it holds that holds it.
 type converter struct {
 	left uint64
 	// over is set once converting cost more than was left, which fails every attribute.
 	over bool
 	// depth is how deep converting is in the value it converts.
 	depth int
-	// done is what each was converted to, or nil while it is being converted.
-	done map[copiedKey]ref.Val
+	// done is where in converted each it converted is, by where it points (copiedKey).
+	done      map[copiedKey]int
+	converted []conversion
+	// open are those converted that may yet be found to reach one that reaches them, by where they
+	// are in converted, the first first, and low is the first of them the one being converted
+	// reaches, as Tarjan's search for the strongly connected components of a graph keeps them: once
+	// one is done converting reaching none open before it, it and those open after it reach each
+	// other, if there are any, and each holds itself.
+	open []int
+	low  int
 }
 
-func newConverter() *converter { return &converter{left: maxConverted} }
+// conversion is a value a converter converted, or is converting while to is nil.
+type conversion struct {
+	to   ref.Val
+	open bool
+	// itself is set once converting it reached it.
+	itself bool
+}
+
+func newConverter() *converter { return &converter{left: maxConverted, low: math.MaxInt} }
 
 // attributes is each of attributes as conditions read it, nil for none.
 func (c *converter) attributes(attributes map[string]any) map[string]ref.Val {
@@ -296,22 +312,56 @@ func (c *converter) spend(n uint64, v ref.Val) ref.Val {
 }
 
 // once is what convert makes of v, which points somewhere, converted once for the check, and an
-// error where converting it reaches it again, from itself.
+// error where v holds itself, or holds one that holds v. Failing only where converting reached one it
+// was converting, as a map's value holding the map, would fail another of those holding each other
+// depending on which was reached first: where a holds b and b holds a, either a.b or b.a, by the
+// order a map's entries came in, so a grant's has(request.attributes.a.b) held for one check and
+// not the next.
 func (c *converter) once(v reflect.Value, convert func() ref.Val) ref.Val {
 	k, _ := copiedKeyOf(v)
-	if done, ok := c.done[k]; ok {
-		if done == nil {
-			return types.NewErr("rbac: a condition can't read a %s holding itself", v.Type())
+	if i, ok := c.done[k]; ok {
+		d := &c.converted[i]
+		if d.open {
+			c.low = min(c.low, i)
+			if d.to == nil {
+				d.itself = true
+				return holdingItself()
+			}
 		}
-		return done
+		return d.to
 	}
 	if c.done == nil {
-		c.done = map[copiedKey]ref.Val{}
+		c.done = map[copiedKey]int{}
 	}
-	c.done[k] = nil
+	i := len(c.converted)
+	c.done[k] = i
+	c.converted = append(c.converted, conversion{open: true})
+	c.open = append(c.open, i)
+	outer := c.low
+	c.low = i
 	out := convert()
-	c.done[k] = out
+	c.converted[i].to = out
+	if c.low == i {
+		j := len(c.open) - 1
+		for c.open[j] != i {
+			j--
+		}
+		cycle := len(c.open)-j > 1 || c.converted[i].itself
+		for _, held := range c.open[j:] {
+			c.converted[held].open = false
+			if cycle {
+				c.converted[held].to = holdingItself()
+			}
+		}
+		c.open = c.open[:j]
+		out = c.converted[i].to
+	}
+	c.low = min(outer, c.low)
 	return out
+}
+
+func holdingItself() ref.Val {
+	return types.NewErr("rbac: a condition can't read a value holding itself")
 }
 
 // bytes is v, a slice or an array of bytes, as bytes, an array's copied into one of its own type:
