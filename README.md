@@ -82,21 +82,28 @@ if err := authz.Authorize(ctx, subject, "cluster:login", cluster); err != nil {
 Store each resource's `authz.Path(resource)`, its own key first and then its containers' and the
 tenant's, in a `text[]` column with a GIN index. `Filter` returns a condition for the host's own
 query, which reads the grants in the same statement as the rows, so sorting and pagination work and
-nothing changes between deciding and reading. A condition holds for the query it was built for: it
-fixes the time, the subject's label holding and what the constraints answered, so build one for each
-query. It compares the tenant and keys byte for byte, as `Authorize` does, whatever the columns'
-collation, in which their indexes still serve. The subject's grants are matched through the path's
-index, whose cost for each row it finds grows with their number. Past a few on resources of the
-listed type, or past 128 on containers and the tenant, as one holding a grant on everything it
-created does, each of a row's keys is looked up among them instead, so a row costs a few lookups
-however many it holds; no index serves that, so the query then reads every row of the tenant its
-other conditions keep. Denies, on resources and containers alike, are looked up so whatever their
-number, and of those naming the subject or its groups only theirs are read; denies naming the
-public or the tenant's members are read by type while the listed types hold few denies, or as of
-a time while history holds few versions of denies there, deleted ones too, and otherwise every one
-in the tenant is. `Reachable` returns the same as scopes, for resources kept in another store.
-Both search one tenant, and count only unconditional grants: `Reach.Conditional` names the scopes
-conditional ones reach, to check one by one.
+nothing changes between deciding and reading. It keeps only the rows whose own key is of the listed
+type, so one table can hold resources of several types, where a grant on a container reaches every
+row under it, of any type. The planner can't count a type's rows by their paths, and counts the
+condition as keeping as many as of a table of one type: listing a type from a table of several, test
+a column of the type too, whose statistics count them, and index it after the tenant and before what
+pages sort by, as `(tenant, type, id)`, or a sorted page of a type of few rows reads the rows of
+every type until it is full. A condition holds for the query it was built for: it fixes the time,
+the subject's label holding and what the constraints answered, so build one for each query. It
+compares the tenant and keys byte for byte, as `Authorize` does, whatever the columns' collation, in
+which their indexes still serve. The subject's grants are matched through the path's index, whose
+cost for each row it finds grows with their number. Past a few on resources of the listed type, or
+past 128 on containers and the tenant, as one holding a grant on everything it created does, each of
+a row's keys is looked up among them instead, so a row costs a few lookups however many it holds; no
+index serves that, so the query then reads every row of the tenant its other conditions keep.
+Denies, on resources and containers alike, are looked up so whatever their number, and of those
+naming the subject or its groups only theirs are read; denies naming the public or the tenant's
+members are read by type while the listed types hold few denies, or as of a time while history holds
+few versions of denies there, deleted ones too, and otherwise every one in the tenant is.
+`Reachable` returns the same as scopes, for resources kept in another store, and of the listed type
+alone: a scope reaches everything under it, so a store holding several types keeps to that type
+itself. Both search one tenant, and count only unconditional grants: `Reach.Conditional` names the
+scopes conditional ones reach, to check one by one.
 
 ## Policies
 
@@ -179,9 +186,10 @@ conditional ones reach, to check one by one.
   on, but for those a role it holds lists in `GrantableRoles`, which it grants without holding, as
   any such role: the identity it grants one to is checked as in any change, so no one comes to hold
   two. Any other change reaching it is refused until a removal leaves it one; `Conflicts` lists
-  them. A role giving two of them is refused. An `Ordered` dimension's higher values include the
-  lower, so it isn't exclusive, and in an `AllOf` one a label naming two is one no one can read, as
-  data that joins two parties is.
+  them, reading the custom roles in the statement that reads their grants, so what it lists one
+  moment held, under `WithTx` too. A role giving two of them is refused. An `Ordered` dimension's
+  higher values include the lower, so it isn't exclusive, and in an `AllOf` one a label naming two
+  is one no one can read, as data that joins two parties is.
 - **Conditions:** a grant can carry a CEL expression over the subject's, the resource's and the
   request's attributes (`Subject.Attributes`, `Resource.Attributes`, `rbac.WithRequest`), the time
   and the action. It gives its role only where the expression holds; one that fails is false.
@@ -385,16 +393,24 @@ or whose context is more than 1 MiB, fails rather than record what `History` cou
 return. A row written before history was installed, as by a host that applied the first migrations
 on their own, is recorded by migrating as it found it, its `baseline`, dated when it was created, or
 a role when it last changed. Nothing updates or truncates history, only `PruneHistory` deletes from
-it, and the package's tables can be deleted from but not truncated. `History` reads it in order, to
-export it to storage of the host's own: a transaction that commits after a later one is read after
-it, never skipped, and a record can be read twice, so dedupe on `Record.ID` and `RecordedAt`: a
-restore can give another record the ID of one it lost. One call reads at most `rbac.MaxHistory`
+it, and the package's tables can be deleted from but not truncated. `History` reads it in the
+order of the transactions that wrote it, by the id each takes at its first write, to export it to
+storage of the host's own: a transaction that commits after one that took its id later is read
+before it all the same, never skipped. That is the order of transactions, not of each row's
+changes: one that took its id first and changed a row after another committed a change to it is
+read before that one, though its change came after. So a consumer replaying an export applies each
+row's versions in the order of their `Record.ID`, in which they were written while history's id
+sequence caches one, as `AsOf` reads them and requires, not in the order read, or it ends with a
+version the row no longer held. A record can be read
+twice, so dedupe on `Record.ID` and `RecordedAt`: a restore can give another record the ID of one
+it lost. One call reads at most `rbac.MaxHistory`
 records, and past the first, at most `rbac.MaxHistoryBytes` of their rows' JSON and their text, so a
 read of fewer than its limit doesn't mean history holds no more: read until one returns none.
 History written before `0013_bounded_rows` counted no bytes, so a read measures each such record by
 writing out its rows, and reads at most 100 of them. Any transaction still running in the database
-cluster, in any of its databases, that has written or otherwise taken a transaction id holds
-`History`, and `Export` with it, back until it ends. `idle_in_transaction_session_timeout`, and
+cluster, in any of its databases, that has written or otherwise taken a transaction id, as `AsOf`'s
+has while its read runs, holds `History`, and `Export` with it, back until it ends.
+`idle_in_transaction_session_timeout`, and
 from PostgreSQL 17 on `transaction_timeout`, end one a session leaves open by mistake, but every
 session may set both for itself, whatever the role's or the server's defaults, so they bound only
 an accident: a session of a role that may be hostile, as the application's, turns them off and
@@ -412,9 +428,15 @@ replica. A generation (`Cursor.Generation`) names the cluster, and the database 
 is in, so no two installations in a cluster share one. A failover or a recovery to a point in time
 starts a new one, and a restore that starts none, as from a disk snapshot, loses what came after it:
 either can number again what the last one numbered past what it kept. `History` refuses a cursor
-from another generation, or whose last record the database no longer holds, and history is exported
-again from the start, kept apart from the last export. Move history with physical backups and
-replicas; a logical dump restored into another cluster numbers its transactions anew.
+from another generation, whose last record the database no longer holds, or after which a prune
+since its export began deleted records, as below, and history is exported again from the start, kept
+apart from the last export: an export from it would read on past what is gone. A restore that keeps
+a cursor's last record but loses what came after it, as one from a disk snapshot taken since that
+cursor was read, leaves nothing the database can tell from recovering from a crash, which loses
+nothing that committed, so its export would read on: restore by recovering to a point in time, which
+starts a new generation, or export each generation from the start again after a restore. Move
+history with physical backups and replicas; a logical dump restored into another cluster numbers its
+transactions anew.
 
 A change refused, as `ErrDenied` or `ErrInvalid`, writes nothing, so history doesn't record it:
 `Config.OnRefused` is told of each, with its actor, the call and the host's audit, to record the
@@ -423,10 +445,15 @@ change was made in (`WithTx`) rolls back.
 
 `Export(ctx, from, limit, signer)` reads as `History` does and chains what it reads onto `from`,
 a `Checkpoint`: a SHA-256 hash chain over every record of the generation in order, signed by the
-host's `crypto.Signer`, such as a key in a key management service. Keep the records and each
+host's `crypto.Signer`, such as a key in a key management service. `from` is the zero `Checkpoint`,
+or one `Export` returned that the signer's key verifies: one whose cursor was moved ahead would skip
+the records between with a chain that verifies. To change keys, `Sign` the latest checkpoint, once
+the old key verifies it, with the new one, and go on from that. Keep the records and each
 checkpoint where they can't be rewritten, as write-once storage. `VerifyChain` then shows that the
 records between two checkpoints are those history held, none dropped, changed or reordered, which
-a database's superuser couldn't forge past the last checkpoint stored. A checkpoint vouches for
+a database's superuser couldn't forge past the last checkpoint stored: `History` refuses a cursor
+after which a prune since its export began, or any delete through history's triggers, removed
+records, so no export reads on past them. A checkpoint vouches for
 the records before it, not after: an audit verifies a generation from its `Genesis` to the latest
 checkpoint kept, and checks that checkpoint's `At` is as recent as the host exports, since
 `Export` signs one on every call, even one that reads nothing, so records dropped from the end
@@ -454,12 +481,25 @@ read holds no transaction id, which neither shows nor holds `History` back, and 
 change that counts from its start. A prepared transaction, which `pg_stat_activity` no longer lists,
 has ended only once it is committed or rolled back: `pg_prepared_xacts` lists it until then, by when
 it was prepared, not when it began. `AsOf` makes no change: one tried is no actor's attempt, and
-`Config.OnRefused` isn't told of it. A statement reads the history of the rows it names, as a check
+`Config.OnRefused` isn't told of it. It writes all the same: the temporary views it reads history
+through are rows of the catalog, for which its transaction takes a transaction id and holds it until
+it rolls back, as under `WithTx` the host's transaction does until it ends, so while its read runs,
+`History` and `Export` anywhere in the cluster read no record of a transaction that took its id
+after it. Keep each read short, as an access review of many subjects reads them in several calls,
+not one. Without views, so that the transaction could be read only, every statement would name
+history in place of each table, and a hook's query through the `DB` it is given would read the
+tables as they are now. `AsOf` takes a time from 4714 BC, the earliest PostgreSQL holds, to
+9999-12-30, the last the package stores: pgx sends a time as 64 bits of microseconds from 2000,
+which a time past year 294,000 or so wraps, so the database would read it as another, or refuse it.
+A statement reads the history of the rows it names, as a check
 does its subject's grants, groups and the denies on its resource's path, a search its subject's
 grants, and the public's and the members' it counts, on each type it lists, and the custom roles
 they name, and `Holders` the members of the groups it lists, not the whole tenant's: `AsOf` plans
 every statement in its transaction for its arguments, the host's too, since a connection's cached
-plan of a statement it has run often counts any tenant as an average one. A list counts the denies
+plan of a statement it has run often counts any tenant as an average one, and without JIT, as so
+planned over history, they cost past `jit_above_cost` for an ordinary subject: a host's query of a
+`Filter` condition for a subject of 249 grants on containers took 760 ms with JIT, almost all of it
+compiling, and 110 ms without. A list counts the denies
 on scopes of its types by history's versions of them, at most a few, and `Grantable`, which can
 offer any custom role, reads each version of every one once. It orders a row's changes by their ids
 in `rbac_history`, which sessions take out of order once that table's id sequence caches more than
@@ -474,10 +514,26 @@ ended by then goes, once no version before its end stays. One call deletes at mo
 records: call it again while it deletes as many, and each goes on from where the last stopped. It
 reads history that many records at a time, on a pool or a connection each in a transaction of its
 own, so however long history is, none holds exports back for long. A transaction that deletes
-records is recorded in history; one that deletes none changes nothing, and is not. Run it on a
-connection of the administrator's role below, which has the rights of history's owner, as the
-application's hasn't, and keep what the host's audit retention requires: the federal floor is at
-least a year.
+records is recorded in history, with the last record it deleted in `History`'s order; one that
+deletes none changes nothing, and is not. `History` refuses the cursor of an export that began
+before a prune where it is before the last record the prune deleted, as that export would read on
+past what the prune deleted, so where several exports read history, `through` is the cursor of the
+one furthest behind. An export that began after the prune, as one from the start after a refusal
+or a failover, reads history as the prune left it and isn't refused for it. Where a cursor stands
+can't tell the two apart; `Cursor.Horizon`, the oldest transaction running as its export began,
+does, so keep it with the cursor and each checkpoint, whose signature covers it, and never set it: a
+later one would hide a prune since the export began. A cursor without it, as one kept from an
+earlier release, is refused for any prune recorded after it that deleted a record after it, and its
+export starts again from the start. While a transaction that took its id before a prune is still
+running, a read from the start reads nothing, as its export would count the prune as one since it
+began: while prunes that delete records come faster than the longest transactions end, as they can
+while working through a long backlog, no export from the start begins. Run it on a connection of the
+administrator's role below, which has the rights of history's owner, as the application's hasn't,
+and keep what the host's audit retention requires: the federal floor is at least a year. A delete
+from history that no prune its transaction records reaches, as one by hand, is refused as the
+transaction commits, so no delete through history's triggers leaves an export reading on past what
+it removed; disabling them takes a role with the rights of history's owner, which the signed chain
+is kept against.
 
 A role that owns a table can change it whatever its triggers say, and a schema's owner can drop
 any table in it. So that the application's database role can't rewrite history or write around
@@ -534,36 +590,60 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
 - **Tables:** `rbac.Migrate` creates them, prefixed `rbac_`, in the connection's current schema,
   in a database whose encoding is UTF8, and records what it applied in `rbac_migrations`. It never
   runs by itself; a host with a migration tool of its own can apply `rbac.Migrations()` instead.
-  On a host's transaction it refuses any isolation but READ COMMITTED: a stricter one's snapshot
-  would miss the writes it waits for.
+  It applies each pending migration in a transaction of its own, which records it as it commits:
+  so a migration takes its locks in the order it names them, whatever was pending before it, and a
+  failure leaves the database at the last migration recorded, from which migrating again goes on.
+  The package's calls don't check what the database was migrated to: make them from a replica only
+  once its own migrations are applied, as `Migrate` returning nil says.
+  On a host's transaction it applies them all in one savepoint, and refuses any isolation but READ
+  COMMITTED: a stricter one's snapshot would miss the writes it waits for.
   A migration locks what it changes until it commits, and while it waits for a lock, every check,
   list and change of that table queues behind it, and of those it locked already. So `Migrate` has
   it wait at most 100 ms for any lock: a change that reads the tables in another order than a
   migration locks them would otherwise deadlock with it, as no order suits every change
   (`ChangeMembers` reads eligibilities and denies before custom roles, `DeleteRole` custom roles
   before eligibilities), and a transaction holding a table for long would stall them all. It then
-  rolls back and tries again, waiting longer each time, up to 10 times over about 20 seconds, and
-  then fails as `rbac.ErrConflict`: migrate again once what held the table, as a long export or
-  host transaction, has ended. A transaction waiting for a lock a migration holds, which holds one
-  the migration then waits for, is still ended as a deadlock where its `deadlock_timeout`, 1 second
-  by default, passes before the migration's wait does, and a change ended so is refused as
-  `rbac.ErrConflict`. A tool of the host's own gets none of this: apply each migration with a
-  short `lock_timeout`, and on SQLSTATE 55P03 or 40P01 roll it back and apply it again. Nor does
-  `Migrate` on a host's transaction, as rolling back to its savepoint frees nothing the host's
-  transaction took before, which what the migration waits for can be waiting for in turn, as a
-  request that read the package's tables and then reads a table of the host's that transaction
-  altered: it waits as that transaction's `lock_timeout` says, for PostgreSQL to end such a wait as
-  a deadlock. On any connection, it waits for another replica's migration as long as the session's
-  `lock_timeout` lets it.
+  rolls it back and tries it again, waiting longer each time, up to 10 times over about 20 seconds,
+  and then fails as `rbac.ErrConflict`: migrate again once what held the table, as a long export or
+  host transaction, has ended. A wait that short ends before PostgreSQL's deadlock check, which runs
+  once a wait passes `deadlock_timeout` and alone cancels an autovacuum worker holding the table, as
+  one vacuuming a large history can for minutes: where one holds a table of the package's as a
+  migration gives way, the next try first takes that table's `SHARE UPDATE EXCLUSIVE` lock, waiting
+  a second past `deadlock_timeout` whatever the session's `lock_timeout`, so PostgreSQL cancels the
+  worker, and only then the migration's own locks. No check, list or change takes a lock that one
+  conflicts with, so none waits behind it, and none of the migration's is held yet. A worker on a
+  table the migration doesn't lock is canceled too; one vacuuming to prevent wraparound, which
+  PostgreSQL never cancels, holds the table until it ends, and the try goes on without that table's
+  lock once the wait ends, to the other tables' waits and then the migration, and each try after
+  waits so again: some 20 seconds more over the 10 tries for each such table, with the default
+  `deadlock_timeout`. A role without `pg_read_all_stats` can't read other sessions' backend types,
+  so it can't tell autovacuum's vacuums and analyses from a client's, and a client's `VACUUM` of a
+  table has it wait so too. A transaction waiting for a lock a migration holds, which holds one the
+  migration then waits for, is still ended as a deadlock where its `deadlock_timeout`, 1 second by
+  default, passes before the migration's wait does, and a call ended so, or by its session's
+  `lock_timeout`, a read or a change, before its transaction or in it, is refused as
+  `rbac.ErrConflict`. A tool of the host's own gets none of this: apply each migration in a
+  transaction of its own with a short `lock_timeout`, on SQLSTATE 55P03 or 40P01 roll it back and
+  apply it again, and where an autovacuum worker holds one of the package's tables as it gives way,
+  first lock that table `IN SHARE UPDATE EXCLUSIVE MODE` with a `lock_timeout` past
+  `deadlock_timeout`, and then apply the migration with the short one. Nor does `Migrate` on a
+  host's transaction, as rolling back to its savepoint frees nothing the host's transaction took
+  before, which what the migration waits for can be waiting for in turn, as a request that read the
+  package's tables and then reads a table of the host's that transaction altered: it waits as that
+  transaction's `lock_timeout` says, for PostgreSQL to end such a wait as a deadlock. On any
+  connection, it waits for another replica's migration as long as the session's `lock_timeout` lets
+  it, and where that ends the wait fails as `rbac.ErrConflict` without trying again.
   A migration that rebuilds an index, as `0009_grant_seeks` rebuilds two of `rbac_grants`, locks
   the table until it commits, so checks, lists and changes wait for the rebuild; one that builds
   an index, as `0011_tenant_keys` builds three on `rbac_eligibilities` and `rbac_denies`, keeps
   writes to the table waiting until it commits, though reads go on: on a large table, migrate when
   that wait is acceptable. Code from before `0012_activation_through` must not run beside code
   after it: an activation it extends keeps the eligibility recorded before, and can outlast the one
-  it was extended through. Stop the replicas running it before migrating. `0013_bounded_rows`
-  locks every table, history too, until it commits, and reads each once for each check it adds,
-  so checks, lists, changes and reads of history wait for it. `0015_history_seeks` builds two
+  it was extended through. Stop the replicas running it before migrating, and don't start them
+  again once `rbac_migrations` records 12, even where `Migrate` failed on a later migration, as it
+  records each as it commits. `0013_bounded_rows` locks every table, history too, until it
+  commits, and reads each once for each check it adds, so checks, lists, changes and reads of
+  history wait for it. `0015_history_seeks` builds two
   indexes on `rbac_history`, which every change writes, and analyzes it, so changes wait until it
   commits. Building one calls `rbac_tenant_keys` and `rbac_text_array` as history's role, as
   recording each deny does from then on, so it grants that role `EXECUTE` on both where it lacks
@@ -585,14 +665,32 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   `0019_principal_seeks` builds an index on `rbac_grants`, which keeps writes to it waiting until it
   commits, though reads go on, and rebuilds history's index of a principal's versions, which reads
   all of history, and analyzes it. It locks `rbac_grants` and then history before it builds either,
-  so reads of history, and every change, as each writes history, wait until it commits too, and only
-  a transaction under way as it starts that read history or made a change, as deleting a scope's
-  eligibilities and then its grants does, and then writes a grant can make it give way.
+  in a transaction of its own, whatever was pending before it, so reads of history, and every
+  change, as each writes history, wait until it commits too, and only a transaction under way as it
+  starts that read history or made a change, as deleting a scope's eligibilities and then its grants
+  does, and then writes a grant can make it give way.
+  `0020_recorded_prunes` builds an index of prunes' records on history, which reads all of history,
+  and adds the trigger that refuses a delete from history no prune records. It locks history against
+  writes before either, so every change, as each writes history, waits until it commits, though
+  reads of history go on, and a transaction under way as it starts that made a change can make it
+  give way. A prune by an earlier release records itself without the last record it deleted, in a
+  statement after its delete: it still deletes, but not in a transaction that sets constraints
+  immediate, and `History` refuses an export's cursor before the one it went through. The trigger
+  checks each record a prune deletes as its transaction commits, which took a window of 10,000
+  records about twice as long to delete.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
-  the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
-  between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows
-  wait for each other by locks named for the schema holding the tables, so sessions reaching them
-  through different search_paths still do.
+  the host's, which must be READ COMMITTED too. A call PostgreSQL refuses for a race, as a
+  serialization failure, a deadlock between host transactions, or a lock it waited for past the
+  session's `lock_timeout`, matches `rbac.ErrConflict`, still wrapping PostgreSQL's error, as does a
+  change refused because what it rests on changed while it waited: try it again. It does wherever in
+  the call PostgreSQL refused it: in a change's transaction or the reads it makes before it, in a
+  read, or in a statement a hook ran, where the hook's error wraps PostgreSQL's. Under `WithTx`,
+  roll the host's transaction back and run it again from its start, not the call alone in it: a
+  statement refused on that transaction itself, as most reads', a hook's or one a change makes
+  before its savepoint, aborts it, and one refused in a savepoint, as a change's, `AsOf`'s or
+  `History`'s, leaves it holding what it took before the call, which the race can be over. Changes
+  to the same rows wait for each other by locks named for the schema holding the tables, so
+  sessions reaching them through different search_paths still do.
 - **What the host passes:** a check reads grants, memberships and groups as they are; only compiled
   conditions are cached. Read a resource's ancestors and attributes from where they are stored,
   never from request input, no earlier than the content they protect, and from the primary. A
@@ -632,7 +730,9 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   a subject in many groups it costs every check, and Activate, far past `jit_above_cost`, and each
   call then compiles its statement before running it, which takes longer than running it: for an
   identity in 1,000 groups, a check took 550 ms, and 120 ms with JIT off, and Activate's statement
-  spent 500 of its 650 ms compiling.
+  spent 500 of its 650 ms compiling. As of a time, every statement costs so for any subject, as
+  planned for its arguments over history: `AsOf` turns JIT off in its own transaction, which the
+  rollback puts back, whatever the role's setting.
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
   to run on a schedule, passing over what a change holds until the next run. A call reads
   `Config.Now` once, which every expiry it compares and every condition's `request.time` read, so a

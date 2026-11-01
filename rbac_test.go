@@ -1,12 +1,17 @@
 package rbac_test
 
 import (
+	"cmp"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io/fs"
 	"maps"
 	"os"
+	"reflect"
 	"regexp"
 	"runtime"
 	"slices"
@@ -514,6 +519,235 @@ func TestFilterReadsARowsOwnKeyWhereverItsPathStarts(t *testing.T) {
 		if want := allowedOf(t, h, resources, s, login); !slices.Equal(kept, want) {
 			t.Errorf("%s: Filter keeps %v of clusters whose paths start from 0, Authorize allows %v", s.Principal.ID, kept, want)
 		}
+	}
+}
+
+// One table can hold resources of several types, as one store of every resource does, and a grant
+// on a container reaches every row under it, of any type: Filter keeps of them only those whose own
+// key is of the type it lists, not of one whose name starts with its name, as Authorize refuses p
+// on the rest, in each form its condition takes, overlapping the path with the subject's grants,
+// looking its own key up in a hash of those on resources of the type, and looking each of its keys
+// up in one object of them all. Its condition is false for the rest, not unknown, for a host that
+// selects it as a column.
+func TestFilterKeepsOnlyTheRowsOfTheListedType(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE resources (tenant text NOT NULL, type text NOT NULL, id text NOT NULL, path text[] NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	o1 := rbac.Scope{Type: "org", ID: "o1"}
+	w1 := rbac.Resource{Tenant: "t1", Type: "workspace", ID: "w1", Ancestors: []rbac.Scope{o1}}
+	w2 := rbac.Resource{Tenant: "t1", Type: "workspace", ID: "w2", Ancestors: []rbac.Scope{w1.Scope(), o1}}
+	resources := []rbac.Resource{
+		{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"},
+		w1,
+		w2,
+		{Tenant: "t1", Type: "cluster", ID: "c1", Ancestors: []rbac.Scope{w1.Scope(), o1}},
+		{Tenant: "t1", Type: "cluster", ID: "c2", Ancestors: []rbac.Scope{w2.Scope(), w1.Scope(), o1}},
+		{Tenant: "t1", Type: "cluster", ID: "c3", Ancestors: []rbac.Scope{o1}},
+		{Tenant: "t1", Type: "clusterx", ID: "c1", Ancestors: []rbac.Scope{w1.Scope(), o1}},
+	}
+	for _, r := range resources {
+		if _, err := h.pool.Exec(ctx, `INSERT INTO resources VALUES ($1, $2, $3, $4)`, r.Tenant, r.Type, r.ID, h.path(t, r)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// org may view the clusters of o1 but those a deny on w2 covers, lead administers w1 and the
+	// workspace in it, many holds the role on w1 and on more clusters than Filter overlaps, and admin
+	// holds every role on the tenant.
+	grants := []rbac.Grant{
+		grant(o1, "cluster.login", rbac.User, "org"),
+		grant(w1.Scope(), "workspace.admin", rbac.User, "lead"),
+		grant(w1.Scope(), "cluster.login", rbac.User, "many"),
+	}
+	for i := range 12 {
+		grants = append(grants, grant(rbac.Scope{Type: "cluster", ID: fmt.Sprint("c", i+1)}, "cluster.login", rbac.User, "many"))
+	}
+	for _, role := range []rbac.Role{"cluster.login", "workspace.admin", "tenant.admin"} {
+		grants = append(grants, grant(rbac.TenantRoot("t1"), role, rbac.User, "admin"))
+	}
+	h.seed(t, grants...)
+	org, many := h.as(t, "org"), h.as(t, "many")
+	if err := h.authz.SetDeny(ctx, guardian, w2, rbac.Deny{ID: "d", Principals: []rbac.Principal{org.Principal}, Permissions: []rbac.Permission{view}}); err != nil {
+		t.Fatal(err)
+	}
+	subjects := []rbac.Subject{org, h.as(t, "lead"), many, h.as(t, "admin")}
+	// The keys of the rows Filter keeps listing resourceType for s, and those of the resources of
+	// the type Authorize allows.
+	kept := func(t *testing.T, s rbac.Subject, p rbac.Permission, resourceType string) (got, want []string) {
+		t.Helper()
+		pred, err := h.authz.Filter(ctx, s, p, "t1", resourceType, rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := h.pool.Query(ctx, `SELECT type || ':' || id COLLATE "C" FROM resources WHERE `+pred.SQL+` ORDER BY 1`, pred.Args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
+			t.Fatal(err)
+		}
+		var unknown []string
+		if err := h.pool.QueryRow(ctx, `SELECT coalesce(array_agg(type || ':' || id COLLATE "C"), '{}') FROM resources WHERE `+pred.SQL+` IS NULL`,
+			pred.Args...).Scan(&unknown); err != nil {
+			t.Fatal(err)
+		}
+		if len(unknown) > 0 {
+			t.Errorf("%s listing %ss: Filter's condition is unknown for %v", s.Principal.ID, resourceType, unknown)
+		}
+		for _, r := range resources {
+			if r.Type != resourceType {
+				continue
+			}
+			switch err := h.authz.Authorize(ctx, s, p, r); {
+			case err == nil:
+				want = append(want, r.Scope().Key())
+			case !errors.Is(err, rbac.ErrDenied):
+				t.Fatalf("Authorize: %v", err)
+			}
+		}
+		slices.Sort(want)
+		return got, want
+	}
+	listings := []struct {
+		resourceType string
+		p            rbac.Permission
+	}{{"cluster", view}, {"workspace", "workspace:view"}, {rbac.TenantScope, "tenant:view"}}
+	agree := func(t *testing.T) {
+		t.Helper()
+		for _, l := range listings {
+			for _, s := range subjects {
+				if got, want := kept(t, s, l.p, l.resourceType); !slices.Equal(got, want) {
+					t.Errorf("%s listing %ss: Filter keeps %v, Authorize allows %v", s.Principal.ID, l.resourceType, got, want)
+				}
+			}
+		}
+	}
+	agree(t)
+	pred, err := h.authz.Filter(ctx, many, view, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hashing(ctx, t, h, "rbac_grants", `SELECT count(*) FROM resources WHERE `+pred.SQL, pred.Args...)) == 0 {
+		t.Fatal("Filter doesn't look many's grants on clusters up in a hash")
+	}
+	t.Run("looking up grants on containers", func(t *testing.T) {
+		rbac.SetMaxContainerOverlap(t, 0)
+		pred, err := h.authz.Filter(ctx, org, view, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if over := overlapping(ctx, t, h, "rbac_grants", `SELECT count(*) FROM resources WHERE `+pred.SQL, pred.Args...); len(over) > 0 {
+			t.Fatalf("with SetMaxContainerOverlap(0), Filter overlaps each row with org's grant: %q", over)
+		}
+		agree(t)
+	})
+}
+
+// A table holding several types is listed through its path's index as one of a type is: each row's
+// type is tested among the rows the index finds, so a list of the clusters in one workspace reads
+// those and the workspace's own row, not the tenant's.
+func TestFilterReadsATableOfSeveralTypesThroughThePathIndex(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	for _, q := range []string{
+		`CREATE TABLE resources (tenant text NOT NULL, type text NOT NULL, id text NOT NULL, path text[] NOT NULL)`,
+		`INSERT INTO resources SELECT 't1', 'workspace', 'w' || i, ARRAY['workspace:w' || i, 'org:o' || (i % 50), 'tenant:t1']
+			FROM generate_series(1, 2000) i`,
+		`INSERT INTO resources SELECT 't1', 'cluster', 'c' || i, ARRAY['cluster:c' || i, 'workspace:w' || (i % 2000 + 1), 'org:o' || ((i % 2000 + 1) % 50), 'tenant:t1']
+			FROM generate_series(1, 20000) i`,
+		`CREATE INDEX resources_path ON resources USING gin (path)`,
+		`ANALYZE resources`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.seed(t, grant(rbac.Scope{Type: "workspace", ID: "w7"}, "cluster.login", rbac.User, "u"))
+	pred, err := h.authz.Filter(ctx, h.as(t, "u"), login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := `SELECT count(*) FROM resources WHERE ` + pred.SQL
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var n, pages int64
+	if err := tx.QueryRow(ctx, `SELECT relpages FROM pg_class WHERE oid = 'resources'::regclass`).Scan(&pages); err != nil {
+		t.Fatal(err)
+	}
+	start := pagesRead(ctx, t, tx, "resources")
+	if err := tx.QueryRow(ctx, query, pred.Args...).Scan(&n); err != nil || n != 10 {
+		t.Fatalf("Filter kept %d of w7's 10 clusters, %v", n, err)
+	}
+	if read := pagesRead(ctx, t, tx, "resources") - start; read*10 > pages {
+		t.Errorf("a list of w7's 10 clusters read %d pages of a table of %d", read, pages)
+	}
+	rows, err := tx.Query(ctx, "EXPLAIN "+query, pred.Args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text := strings.Join(plan, "\n"); !strings.Contains(text, "Bitmap Index Scan on resources_path") {
+		t.Errorf("Filter's plan on a table of several types:\n%s", text)
+	}
+}
+
+// Testing a row's type leaves the planner's count of the rows Filter's condition keeps as it was,
+// so a sorted, limited page of a table of one type whose condition no index serves, as for a subject
+// holding grants on hundreds of workspaces, is still read in the order of the host's index until
+// it is full, under a generic plan too. The planner has no statistics of a path's first key, and
+// counts a test of it alone as keeping one row in 200, so a plain test would read and sort every
+// row of the tenant.
+func TestFilterTestsARowsTypeWithoutMovingAPageOffTheHostsIndex(t *testing.T) {
+	for _, plan := range []string{"force_custom_plan", "force_generic_plan"} {
+		t.Run(plan, func(t *testing.T) {
+			h := setupOn(t, pgtest.Open(t, "plan_cache_mode="+plan))
+			ctx := t.Context()
+			for _, q := range []string{
+				`CREATE TABLE fleet (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL)`,
+				`INSERT INTO fleet SELECT 't1', 'c' || i, ARRAY['cluster:c' || i, 'workspace:w' || (i % 500), 'org:o' || (i % 50), 'tenant:t1']
+					FROM generate_series(1, 20000) i`,
+				`CREATE INDEX ON fleet USING gin (path)`,
+				`CREATE INDEX ON fleet (tenant, id)`,
+				`ANALYZE fleet`,
+				`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+					SELECT 't1', 'workspace', 'w' || i, 'user', 'u', 'cluster.login' FROM generate_series(1, 200) i`,
+			} {
+				if _, err := h.pool.Exec(ctx, q); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pred, err := h.authz.Filter(ctx, h.as(t, "u"), login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			var pages int64
+			if err := tx.QueryRow(ctx, `SELECT relpages FROM pg_class WHERE oid = 'fleet'::regclass`).Scan(&pages); err != nil {
+				t.Fatal(err)
+			}
+			start := pagesRead(ctx, t, tx, "fleet")
+			rows, err := tx.Query(ctx, `SELECT id FROM fleet WHERE `+pred.SQL+` ORDER BY id LIMIT 50`, pred.Args...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ids, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || len(ids) != 50 {
+				t.Fatalf("a page of %d clusters, %v", len(ids), err)
+			}
+			if read := pagesRead(ctx, t, tx, "fleet") - start; read*3 > pages {
+				t.Errorf("a page of 50 clusters read %d pages of a table of %d", read, pages)
+			}
+		})
 	}
 }
 
@@ -4015,6 +4249,233 @@ func TestDeadlockedHostTransactionsConflict(t *testing.T) {
 	}
 	if conflicts != 1 {
 		t.Fatalf("%d transactions refused for the deadlock, want 1", conflicts)
+	}
+}
+
+// waitedFor waits until some session waits for a lock on table, in the test's schema.
+func waitedFor(t *testing.T, h *harness, table string) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		var waiting bool
+		if err := h.pool.QueryRow(t.Context(), `SELECT EXISTS (SELECT FROM pg_locks WHERE NOT granted AND relation = $1::regclass)`, table).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no session waited for %s", table)
+		}
+	}
+}
+
+// PostgreSQL refusing a call for a race matches ErrConflict wherever in the call it refused it, not
+// only in a change's transaction: here every call waits for a lock past its session's
+// lock_timeout, as for a migration holding every table, in the reads a change makes before its
+// transaction, in a read, and in a change's transaction alike.
+func TestEveryCallRefusedForALockItCouldntTakeConflicts(t *testing.T) {
+	// So Migrate gives way at once, rather than try again for seconds.
+	rbac.SetMigrateAttempts(t, 1, 0)
+	h := setupOn(t, pgtest.Open(t, "lock_timeout=10"), withLabels, banks)
+	ctx := t.Context()
+	owner, ann := h.as(t, "owner"), h.as(t, "ann")
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	granted := []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "ann")}
+	members := []rbac.Member{{Group: "g", Principal: ann.Principal}}
+	onCluster := rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}}
+	calls := []struct {
+		name string
+		call func() error
+	}{
+		{"Apply", func() error {
+			return h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: ann.Principal}}})
+		}},
+		{"Import", func() error { return h.authz.Import(ctx, host, "t1", granted) }},
+		{"SetDeny", func() error {
+			return h.authz.SetDeny(ctx, owner, cluster, rbac.Deny{ID: "d", Principals: []rbac.Principal{ann.Principal}, Permissions: []rbac.Permission{login}})
+		}},
+		{"DeleteDeny", func() error { return h.authz.DeleteDeny(ctx, owner, cluster, "d") }},
+		{"SetEligibility", func() error {
+			return h.authz.SetEligibility(ctx, owner, cluster, rbac.Eligibility{Role: "cluster.login", Principal: ann.Principal, MaxDuration: time.Hour})
+		}},
+		{"DeleteEligibility", func() error { return h.authz.DeleteEligibility(ctx, owner, cluster, "cluster.login", ann.Principal) }},
+		{"Activate", func() error {
+			return second(h.authz.Activate(ctx, ann, cluster, rbac.Activation{Role: "cluster.login", Duration: time.Minute, Justification: "on call"}))
+		}},
+		{"Deactivate", func() error { return h.authz.Deactivate(ctx, ann, cluster, "cluster.login") }},
+		{"DeleteGrants", func() error { return h.authz.DeleteGrants(ctx, host, "t1", granted) }},
+		{"DeleteScope", func() error { return h.authz.DeleteScope(ctx, host, "t1", cluster.Scope()) }},
+		{"DeleteScopes", func() error { return h.authz.DeleteScopes(ctx, host, "t1", []rbac.Scope{cluster.Scope()}) }},
+		{"DeletePrincipal", func() error { return h.authz.DeletePrincipal(ctx, host, "t1", ann.Principal) }},
+		{"DeletePrincipalEverywhere", func() error { return h.authz.DeletePrincipalEverywhere(ctx, host, ann.Principal) }},
+		{"DeleteTenant", func() error { return h.authz.DeleteTenant(ctx, host, "t1") }},
+		{"DeleteExpired", func() error { return second(h.authz.DeleteExpired(ctx)) }},
+		{"SetMemberships", func() error {
+			return h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: ann.Principal}})
+		}},
+		{"SetGroup", func() error { return h.authz.SetGroup(ctx, owner, "t1", rbac.GroupDefinition{ID: "g"}) }},
+		{"ImportGroups", func() error { return h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "g"}}) }},
+		{"DeleteGroup", func() error { return h.authz.DeleteGroup(ctx, owner, "t1", "g") }},
+		{"DeleteGroups", func() error { return h.authz.DeleteGroups(ctx, host, "t1", []string{"g"}) }},
+		{"ImportMembers", func() error { return h.authz.ImportMembers(ctx, host, "t1", members) }},
+		{"ChangeMembers", func() error { return h.authz.ChangeMembers(ctx, owner, "t1", members, nil) }},
+		{"DeleteMembers", func() error { return h.authz.DeleteMembers(ctx, host, "t1", members) }},
+		{"SetRole", func() error {
+			return h.authz.SetRole(ctx, owner, "t1", rbac.RoleDefinition{ID: "custom.r", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}})
+		}},
+		{"DeleteRole", func() error { return h.authz.DeleteRole(ctx, owner, "t1", "custom.r") }},
+		{"Authorize", func() error { return h.authz.Authorize(ctx, ann, view, cluster) }},
+		{"Explain", func() error { return second(h.authz.Explain(ctx, ann, view, cluster)) }},
+		{"Permissions", func() error { return second(h.authz.Permissions(ctx, ann, cluster)) }},
+		{"Holders", func() error { return second(h.authz.Holders(ctx, view, cluster)) }},
+		{"Reachable", func() error { return second(h.authz.Reachable(ctx, ann, view, "t1", "cluster")) }},
+		{"Filter", func() error {
+			return second(h.authz.Filter(ctx, ann, view, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1))
+		}},
+		{"Holding", func() error { return second(h.authz.Holding(ctx, "t1", ann)) }},
+		{"Grantable", func() error { return second(h.authz.Grantable(ctx, owner, cluster)) }},
+		{"Grants", func() error { return second(h.authz.Grants(ctx, "t1", onCluster)) }},
+		{"Denies", func() error { return second(h.authz.Denies(ctx, "t1", []rbac.Scope{cluster.Scope()})) }},
+		{"Eligibilities", func() error { return second(h.authz.Eligibilities(ctx, "t1", onCluster)) }},
+		{"Conflicts", func() error { return second(h.authz.Conflicts(ctx, "t1")) }},
+		{"Memberships", func() error { return second(h.authz.Memberships(ctx, "t1", nil)) }},
+		{"MembershipsOf", func() error { return second(h.authz.MembershipsOf(ctx, ann.Principal)) }},
+		{"Groups", func() error { return second(h.authz.Groups(ctx, "t1")) }},
+		{"Members", func() error { return second(h.authz.Members(ctx, "t1", "g")) }},
+		{"GroupsOf", func() error { return second(h.authz.GroupsOf(ctx, "t1", ann.Principal)) }},
+		{"CustomRoles", func() error { return second(h.authz.CustomRoles(ctx, "t1")) }},
+		{"Roles", func() error { return second(h.authz.Roles(ctx, "t1", "cluster")) }},
+		{"AsOf", func() error { return h.authz.AsOf(ctx, "t1", h.now, func(*rbac.Authorizer) error { return nil }) }},
+		{"History", func() error {
+			_, _, err := h.authz.History(ctx, rbac.Cursor{}, 10)
+			return err
+		}},
+		{"Export", func() error {
+			_, _, err := h.authz.Export(ctx, rbac.Checkpoint{}, 10, key)
+			return err
+		}},
+		{"PruneHistory", func() error { return second(rbac.PruneHistory(ctx, h.pool, h.now, rbac.Cursor{TxID: 1, ID: 1})) }},
+		{"Migrate", func() error { return rbac.Migrate(ctx, h.pool) }},
+	}
+	// Every exported call that reads the database is here, so one added without mapping its races
+	// fails below.
+	checked := map[string]bool{}
+	for _, c := range calls {
+		checked[c.name] = true
+	}
+	authz := reflect.TypeFor[*rbac.Authorizer]()
+	for i := range authz.NumMethod() {
+		if m := authz.Method(i); m.Type.NumIn() > 1 && m.Type.In(1) == reflect.TypeFor[context.Context]() && !checked[m.Name] {
+			t.Errorf("Authorizer.%s isn't checked for a lock it couldn't take", m.Name)
+		}
+	}
+	for _, c := range calls {
+		t.Run(c.name, func(t *testing.T) {
+			// Held for this call alone, so no lock stands for longer than its wait.
+			held, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = held.Rollback(context.WithoutCancel(ctx)) }()
+			if _, err := held.Exec(ctx, `SET LOCAL lock_timeout = 0; LOCK TABLE rbac_grants, rbac_roles, rbac_denies, rbac_eligibilities,
+				rbac_memberships, rbac_groups, rbac_members, rbac_history, rbac_migrations IN ACCESS EXCLUSIVE MODE`); err != nil {
+				t.Fatal(err)
+			}
+			err = c.call()
+			if pg := (*pgconn.PgError)(nil); !errors.Is(err, rbac.ErrConflict) || !errors.As(err, &pg) || pg.Code != "55P03" {
+				t.Errorf("%s refused for a lock it couldn't take: %v", c.name, err)
+			}
+		})
+	}
+}
+
+// Under WithTx, the reads a change makes before its savepoint run on the host's transaction itself,
+// so they can deadlock with a migration holding the package's tables that waits for a table the
+// host's transaction holds: PostgreSQL ends the change, which matches ErrConflict as one it ends in
+// the savepoint does, and the host's transaction is left aborted, to be run again from its start.
+func TestAChangeDeadlockedBeforeItsSavepointConflicts(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	owner, ann := h.as(t, "owner"), h.as(t, "ann")
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE host_rows (id int)`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx, `LOCK TABLE host_rows IN EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+	migration, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = migration.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := migration.Exec(ctx, `LOCK TABLE rbac_grants IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+	applied := make(chan error, 1)
+	go func() {
+		applied <- h.authz.WithTx(tx).Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: ann.Principal}}})
+	}()
+	// The change waits for the migration first, so its deadlock_timeout passes first and PostgreSQL
+	// ends it, not the migration.
+	waitedFor(t, h, "rbac_grants")
+	locked := make(chan error, 1)
+	go func() {
+		_, err := migration.Exec(ctx, `LOCK TABLE host_rows IN ACCESS EXCLUSIVE MODE`)
+		locked <- err
+	}()
+	err = <-applied
+	if pg := (*pgconn.PgError)(nil); !errors.Is(err, rbac.ErrConflict) || !errors.As(err, &pg) || pg.Code != "40P01" {
+		t.Fatalf("a change PostgreSQL ended as a deadlock before its savepoint: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT 1`); err == nil {
+		t.Error("the host's transaction ran a statement after the deadlock")
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-locked; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A hook's error that wraps PostgreSQL's refusal of a statement for a race, as a deadlock of a query
+// it ran, matches ErrConflict too, wherever the hook runs, still wrapping the host's own error, and
+// OnRefused isn't told of it: ValidateGrant, asked before a change's transaction, and a constraint a
+// check asks.
+func TestAHooksErrorForARaceConflicts(t *testing.T) {
+	errPolicy := errors.New("policy lookup failed")
+	race := fmt.Errorf("%w: %w", errPolicy, &pgconn.PgError{Code: "40P01", Message: "deadlock detected"})
+	var refusals []rbac.Refusal
+	h := setup(t, func(c *rbac.Config) {
+		c.ValidateGrant = func(context.Context, rbac.DB, rbac.GrantInput) error { return race }
+		c.Constraints = []rbac.Constraint{{Name: "policy", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if in.Permission == view {
+				return false, race
+			}
+			return false, nil
+		}}}
+		c.OnRefused = func(_ context.Context, r rbac.Refusal) { refusals = append(refusals, r) }
+	})
+	ctx := t.Context()
+	ann := h.as(t, "ann")
+	for name, err := range map[string]error{
+		"Apply":     h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: ann.Principal}}}),
+		"Authorize": h.authz.Authorize(ctx, ann, view, cluster),
+	} {
+		if !errors.Is(err, rbac.ErrConflict) || !errors.Is(err, errPolicy) || errors.Is(err, rbac.ErrDenied) || errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("%s, whose hook failed for a race: %v", name, err)
+		}
+	}
+	if len(refusals) > 0 {
+		t.Errorf("OnRefused was told of a race: %+v", refusals)
 	}
 }
 
@@ -8776,15 +9237,17 @@ func TestDeletingARoleEndsItsEligibilities(t *testing.T) {
 	}
 }
 
-// racing is a pool on which change commits just before the first statement that reads denies, as
-// another session's change would commit between two of a read's statements.
+// racing is a pool on which change commits just before the first statement that reads the table
+// reading names, or denies where it names none, as another session's change would commit between
+// two of a read's statements.
 type racing struct {
 	*pgxpool.Pool
-	change func()
+	reading string
+	change  func()
 }
 
 func (r *racing) race(sql string) {
-	if do := r.change; do != nil && strings.Contains(sql, "rbac_denies") {
+	if do := r.change; do != nil && strings.Contains(sql, cmp.Or(r.reading, "rbac_denies")) {
 		r.change = nil
 		do()
 	}

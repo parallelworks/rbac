@@ -396,6 +396,7 @@ func canonical(r RoleDefinition) RoleDefinition {
 func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, r RoleDefinition) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "SetRole")
+	defer conflicting(&err)
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -593,6 +594,7 @@ func (a *Authorizer) tenantBuckets(ctx context.Context, q DB, tenant string, id 
 func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant string, id Role) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "DeleteRole")
+	defer conflicting(&err)
 	if !validID(tenant) || !isCustom(id) || !validText(string(id)) {
 		return fmt.Errorf("%w: only a tenant's custom role can be deleted", ErrInvalid)
 	}
@@ -1605,7 +1607,8 @@ func (a *Authorizer) privileged(r RoleDefinition) bool {
 }
 
 // CustomRoles lists a tenant's custom roles, by id.
-func (a *Authorizer) CustomRoles(ctx context.Context, tenant string) ([]RoleDefinition, error) {
+func (a *Authorizer) CustomRoles(ctx context.Context, tenant string) (_ []RoleDefinition, err error) {
+	defer conflicting(&err)
 	if !validID(tenant) {
 		return nil, fmt.Errorf("%w: no tenant", ErrInvalid)
 	}

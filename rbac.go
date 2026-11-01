@@ -568,8 +568,12 @@ var (
 	// host doesn't have (Config.Permissions).
 	ErrInvalid = errors.New("rbac: invalid")
 	// ErrConflict is matched by a change refused because another changed what it rests on while
-	// it waited, or that PostgreSQL refused for a race, as a deadlock between host transactions:
-	// try it again.
+	// it waited, and by any call PostgreSQL refused for a race, still wrapping its error: a
+	// serialization failure, a deadlock, as between host transactions, or a lock it couldn't take,
+	// as one a migration holds past the session's lock_timeout. It is so wherever in the call
+	// PostgreSQL refused it: in a change's transaction or the reads it makes before it, in a read, or
+	// in a statement a hook ran, where the error the hook returns wraps PostgreSQL's. Try it again:
+	// under WithTx, the host's whole transaction, as WithTx says.
 	ErrConflict = errors.New("rbac: conflict")
 	// ErrNotFound is what Config.ResourceOf returns, or wraps, for a scope the host no longer has,
 	// as a resource deleted without DeleteScopes: a change that only takes access away there, as
@@ -587,6 +591,13 @@ func conflicted(err error) error {
 	}
 	return err
 }
+
+// conflicting makes *err match ErrConflict as conflicted does, for an exported call to defer, so
+// that wherever in the call PostgreSQL refused it for a race, the host meets one error: not only in
+// a change's transaction, which begin maps, but in the reads a change makes before it, which under
+// WithTx run on the host's transaction itself and so can deadlock with a migration holding the
+// package's tables, in a read's statements, and in a hook's, whose error a call returns as it is.
+func conflicting(err *error) { *err = conflicted(*err) }
 
 // Limits on what is stored and what one call takes, so that what a check, a search or a change
 // reads stays bounded. Input past one is refused as invalid; a host can check against them first.
@@ -674,11 +685,12 @@ type Config struct {
 	// every grant and eligibility that SetRole redefining a custom role makes give more, and every
 	// one a member ChangeMembers or ImportMembers adds gains (ViaMembership), once each is
 	// otherwise valid; the change's InvalidError for it wraps the error, so errors.Is and
-	// errors.As find the host's own in it. Any other error fails the change as it is. q is what
-	// the change runs on, so under WithTx it sees a member added earlier in the transaction. A
-	// grant to a group reaches whoever is in it, now and later: it is asked about with the group,
-	// and about each member as it joins, so a policy on who may hold a role, as none privileged for
-	// a guest, refuses the group's grant too while the group holds one that may not.
+	// errors.As find the host's own in it. Any other error fails the change as it is, matching
+	// ErrConflict too where it wraps PostgreSQL's refusal of a statement for a race, as a deadlock
+	// on q. q is what the change runs on, so under WithTx it sees a member added earlier in the
+	// transaction. A grant to a group reaches whoever is in it, now and later: it is asked about
+	// with the group, and about each member as it joins, so a policy on who may hold a role, as none
+	// privileged for a guest, refuses the group's grant too while the group holds one that may not.
 	// Required: a grant to a principal the tenant doesn't let in must never be stored.
 	ValidateGrant func(ctx context.Context, q DB, in GrantInput) error
 	// Constraints are the host's policy above every grant and deny, asked about each permission a
@@ -964,9 +976,16 @@ func vocabulary(declared []Permission, given map[Permission]bool, roleTypes map[
 // in tx: after another, it waits for every change in the tenant while holding locks they may wait
 // for, and PostgreSQL fails one as a deadlock. Where a label dimension is Exclusive, every change
 // takes a lock of its tenant's first, which the tenant's other changes wait for, so two
-// transactions changing two tenants in opposite orders can deadlock too. Explain, Reachable and
-// Holders read in several statements, on tx at its isolation: at READ COMMITTED each reads a
-// snapshot of its own, so a change committing between them can mix two states.
+// transactions changing two tenants in opposite orders can deadlock too. A call PostgreSQL refuses
+// for a race matches ErrConflict, and is retried by rolling tx back and running the host's
+// transaction again from its start, not by making the call again in it: a statement refused on tx
+// itself, as most reads' are, a hook's on the q it is given, and those a change makes before its
+// savepoint, aborts tx, which then runs nothing until it rolls back; and one refused in a savepoint
+// the call rolls back to, as a change's, AsOf's or History's, leaves tx holding what it took before
+// the call, which the race can be over. Explain, Reachable and Holders read in several statements,
+// on tx at its isolation: at READ COMMITTED each reads a snapshot of its own, so a change committing
+// between them can mix two states, as can AsOf's read, in a savepoint of tx, of a time not yet final
+// (AsOf).
 func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 	// One AsOf gave reads its own transaction, whose views are the past: on another, it would read
 	// the tables as they are now.

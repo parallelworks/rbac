@@ -106,12 +106,19 @@ func rawOrNull(b json.RawMessage) json.RawMessage {
 	return b
 }
 
-// Digest is what Sign signs: the checkpoint's generation, cursor, count, hash and time.
+// Digest is what Sign signs: the checkpoint's generation, the record its cursor is at, its count,
+// hash and time, and its cursor's Horizon, which tells History which prunes to refuse the cursor
+// for, so one moved to hide a prune doesn't verify. A checkpoint without a Horizon, as one signed
+// before Cursor had one, is signed as it was.
 func (c Checkpoint) Digest() [sha256.Size]byte {
-	b, _ := json.Marshal([]any{
+	fields := []any{
 		chainVersion + " checkpoint", c.Cursor.Generation, c.Cursor.TxID, c.Cursor.ID, c.Cursor.RecordedAt.UTC().Format(time.RFC3339Nano),
 		c.Count, c.Hash[:], c.At.UTC().Format(time.RFC3339Nano),
-	})
+	}
+	if c.Cursor.Horizon != 0 {
+		fields = append(fields, c.Cursor.Horizon)
+	}
+	b, _ := json.Marshal(fields)
 	return sha256.Sum256(b)
 }
 
@@ -174,11 +181,16 @@ func (c Checkpoint) Verify(pub crypto.PublicKey) error {
 }
 
 // VerifyChain checks that records, chained onto from, end at to, and that to is signed by pub:
-// the records an export kept between two checkpoints are those history held, as it held them.
+// the records an export kept between two checkpoints are those history held, as it held them, none
+// dropped, as History refuses a cursor after which a prune since the export began deleted any, or
+// whose own record is gone.
 // from is the generation's Genesis or a checkpoint verified already, as VerifyChain checks no
 // signature of its. It shows nothing of the records after to: an audit verifies up to the latest
 // checkpoint kept, and checks that it is as recent as the host exports, since Export signs one on
-// every call.
+// every call. An export's first read from the start that finds a record sets its Horizon, which no
+// later read changes, so where from is past a record, to holds its Horizon: an export from the
+// start begun after a prune can stand at a record with the chain of one begun before it, and read
+// on past what the prune deleted, which History refuses the earlier one for.
 func VerifyChain(from Checkpoint, records []Record, to Checkpoint, pub crypto.PublicKey) error {
 	if err := to.Verify(pub); err != nil {
 		return err
@@ -191,15 +203,23 @@ func VerifyChain(from Checkpoint, records []Record, to Checkpoint, pub crypto.Pu
 	if got.Hash != to.Hash || got.Count != to.Count || !got.Cursor.equal(to.Cursor) {
 		return fmt.Errorf("%w: the records don't chain from one checkpoint to the other", ErrUnverified)
 	}
+	if from.Cursor.following() && to.Cursor.Horizon != from.Cursor.Horizon {
+		return fmt.Errorf("%w: the checkpoints are of exports begun at different horizons", ErrUnverified)
+	}
 	return nil
 }
 
 // Export reads up to limit records after from's cursor, as History does, and returns them with
 // the checkpoint they chain to, signed by signer and dated now, even when it read none. from is
 // the zero Checkpoint, which starts the current generation's export from its genesis, or one
-// Export returned. On an error it returns from, as History returns its cursor, so an export goes
-// on from where it was. Keep each checkpoint, and the records, where they can't be rewritten:
-// PruneHistory deletes only what a checkpoint's cursor has passed.
+// Export returned, which it refuses unless signer's key verifies it: to change keys, sign the
+// latest checkpoint, once the old key verifies it, with the new one (Sign), and go on from that.
+// On an error it returns from, as History returns its cursor, so an export goes on from where it
+// was. Keep each checkpoint, and the records, where they can't be rewritten, with
+// its cursor's Horizon, which the signature covers: PruneHistory deletes only what the cursor it is
+// given has passed, and History refuses the cursor of an export begun before a prune where it is
+// before what the prune deleted, so where several exports read history, prune through the cursor
+// of the one furthest behind.
 //
 // A generation exported from the start again, as after History refuses a cursor, is chained
 // anew from its genesis: the last export's records are what history held up to its last
@@ -217,6 +237,14 @@ func (a *Authorizer) Export(ctx context.Context, from Checkpoint, limit int, sig
 	case !zero && from.Hash == [sha256.Size]byte{}:
 		return nil, from, fmt.Errorf("%w: an export goes on from the zero checkpoint or one it returned", ErrInvalid)
 	}
+	// It reads on from from's cursor and chains onto its hash, which VerifyChain checks against the
+	// checkpoint kept: one whose cursor was moved ahead would skip what lay between unseen, and one
+	// whose Horizon was moved would read on past what a prune deleted.
+	if !zero {
+		if err := from.Verify(signer.Public()); err != nil {
+			return nil, from, err
+		}
+	}
 	records, cursor, err := a.History(ctx, from.Cursor, limit)
 	if err != nil {
 		return nil, from, err
@@ -229,6 +257,8 @@ func (a *Authorizer) Export(ctx context.Context, from Checkpoint, limit int, sig
 	if err != nil {
 		return nil, from, err
 	}
+	// The export's, which a read from the start begins: Chain can't know it from the records.
+	next.Cursor.Horizon = cursor.Horizon
 	next.At = a.cfg.Now().Truncate(time.Microsecond)
 	if next, err = next.Sign(signer); err != nil {
 		return nil, from, err
