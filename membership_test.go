@@ -5291,10 +5291,11 @@ func TestMembersGainAtMostMaxBindingsGrantsInAChange(t *testing.T) {
 	}
 }
 
-// A member is its principal: added to several groups, or to one from several sources, it gains
-// what they reach, and the host is asked about each grant it gains once, a group two of them are in
-// too, so one member alone is never refused for what its groups hold, however many it joins. Two
-// members are refused for what each gains past MaxBindings in all.
+// A member is its principal: added to a group from several sources, and to a group that one is in,
+// it gains what they reach, and the host is asked about each grant it gains once, so it gains no
+// more than one of those places alone, whatever its group holds. Past MaxBindings, a change gains no
+// more than one place alone does: one member joining two groups that hold more in all, or two
+// members, are refused before the host is asked about any of it.
 func TestAMemberAddedToSeveralGroupsIsOneMember(t *testing.T) {
 	var validated int
 	h := grouped(t, func(c *rbac.Config) {
@@ -5312,7 +5313,7 @@ func TestAMemberAddedToSeveralGroupsIsOneMember(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Each group holds a role on each of n clusters, which the manager may grant there.
-	held := map[string]int{"g1": 400, "g2": 400, "top": 300}
+	held := map[string]int{"g1": 800, "g2": 400, "top": 300}
 	for group, n := range held {
 		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
 			SELECT 't1', 'cluster', $1 || i, p, id, r FROM generate_series(1, $2::int) i,
@@ -5320,18 +5321,22 @@ func TestAMemberAddedToSeveralGroupsIsOneMember(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	h.join(t, "ann", "bob", "carol")
+	h.join(t, "ann", "bob", "carol", "dan")
 	manager := h.as(t, "manager")
-	ann := []rbac.Member{{Group: "g1", Principal: identity("ann")}, {Group: "g1", Principal: identity("ann"), Source: "ops"}, {Group: "g2", Principal: identity("ann")}}
-	gains := held["g1"] + held["g2"] + held["top"]
+	ann := []rbac.Member{{Group: "g1", Principal: identity("ann")}, {Group: "g1", Principal: identity("ann"), Source: "ops"}, {Group: "top", Principal: identity("ann")}}
+	gains := held["g1"] + held["top"]
 	if err := h.authz.ChangeMembers(ctx, manager, "t1", ann, nil); err != nil || validated != gains {
-		t.Fatalf("one member added to two groups, and to one of them from two sources, gaining %d grants: %v, Config.ValidateGrant asked %d times",
+		t.Fatalf("one member added to a group from two sources, and to the group it is in, gaining %d grants: %v, Config.ValidateGrant asked %d times",
 			gains, err, validated)
 	}
-	validated = 0
-	two := []rbac.Member{{Group: "g1", Principal: identity("bob")}, {Group: "g2", Principal: identity("carol")}}
-	if err := h.authz.ChangeMembers(ctx, manager, "t1", two, nil); !errors.Is(err, rbac.ErrInvalid) || validated != 0 {
-		t.Fatalf("two members each gaining %d grants: %v, Config.ValidateGrant asked %d times", held["g1"]+held["top"], err, validated)
+	for what, add := range map[string][]rbac.Member{
+		"one member added to two groups":    {{Group: "g1", Principal: identity("dan")}, {Group: "g2", Principal: identity("dan")}},
+		"two members added to a group each": {{Group: "g1", Principal: identity("bob")}, {Group: "g2", Principal: identity("carol")}},
+	} {
+		validated = 0
+		if err := h.authz.ChangeMembers(ctx, manager, "t1", add, nil); !errors.Is(err, rbac.ErrInvalid) || validated != 0 {
+			t.Errorf("%s, gaining more than MaxBindings in all and than either place alone: %v, Config.ValidateGrant asked %d times", what, err, validated)
+		}
 	}
 }
 

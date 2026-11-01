@@ -1477,20 +1477,20 @@ func (a *Authorizer) placesBounded(ctx context.Context, tx pgx.Tx, tenant string
 // ended unchecked.
 //
 // The members a change adds gain at most MaxBindings grants and eligibilities in all, each member's
-// counted apart, as the host is asked about each, but one alone, which gains whatever its groups
-// hold: a member is its principal, whatever it gains through all the groups, and places in one,
-// the change gives it, each grant or eligibility counted once for each end its places give it, as
-// the host is asked about it once. Whether the actor may make one is decided once for each end,
-// however many members gain it. The rest of what a change checks is its groups', read once however
-// many of their members change, and what a group many of them are in reaches, once for all of them,
-// so it grows with what the groups hold, approve and are named or exempt in, as SetRole's does with
-// a role's grants: with Labels or Config.Constraints declared, or a deny binding the actor, a
-// removal reads what its members lose. It asks the constraints about changing grants on each type
-// of scope they lose access on, and Config.ResourceOf about each such scope only where the actor's
-// label values don't satisfy every label, a constraint answered that it may stop the actor changing
-// grants on some scope of the type, or a deny binding the actor removes that power on scopes of it:
-// then the constraints again about the scope, and the actor's grants and denies on its path, all
-// such scopes' in one read.
+// counted apart, as the host is asked about each, but no more than one place alone gains, which
+// gains whatever its group and those it is in hold: a member is its principal, whatever it gains
+// through all the groups, and places in one, the change gives it, each grant or eligibility counted
+// once for each end its places give it, as the host is asked about it once. Whether the actor may
+// make one is decided once for each end, however many members gain it. The rest of what a change
+// checks is its groups', read once however many of their members change, and what a group many of
+// them are in reaches, once for all of them, so it grows with what the groups hold, approve and are
+// named or exempt in, as SetRole's does with a role's grants: with Labels or Config.Constraints
+// declared, or a deny binding the actor, a removal reads what its members lose. It asks the
+// constraints about changing grants on each type of scope they lose access on, and
+// Config.ResourceOf about each such scope only where the actor's label values don't satisfy every
+// label, a constraint answered that it may stop the actor changing grants on some scope of the
+// type, or a deny binding the actor removes that power on scopes of it: then the constraints again
+// about the scope, and the actor's grants and denies on its path, all such scopes' in one read.
 func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant string, add, remove []Member) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "ChangeMembers")
@@ -2148,42 +2148,49 @@ func (r reach) activatedBy(m Member) []Scope {
 }
 
 // gainsWithin refuses members ChangeMembers adds that gain more than MaxBindings grants and
-// eligibilities in all, each member's counted apart, as many as one Apply makes: the host is asked
-// about each as the member's, so an actor that may change members would otherwise multiply what
-// the host and the change do. A member is its principal, however many groups, or places in one, it
-// gains: what they reach is counted once for each end its places give it, as the host is asked
-// about each once (askMemberships), so a group two of its groups are in counts once. One member
-// gaining anything alone gains whatever its groups hold, as a grant to a group reaches each member,
-// or a group holding more could never gain one. Refused before anything is asked about them, and
-// never more under the locks, where stillReached refuses a group holding more than was read.
+// eligibilities in all, as many as one Apply makes, and more than one place alone gains: the host
+// is asked about each as the member's, so an actor that may change members would otherwise
+// multiply what the host and the change do. A member is its principal, however many groups, or
+// places in one, it gains: what they reach is counted once for each end its places give it, as
+// the host is asked about each once (askMemberships), so a group two of its groups are in counts
+// once. One place gains whatever its group and those it is in hold, as a grant to a group reaches
+// each member, or a group holding more could never gain one; but a change gaining more than that,
+// as one principal joining several groups, does no more than MaxBindings allows. Refused before
+// anything is asked about them, and never more under the locks, where stillReached refuses a group
+// holding more than was read.
 func (r reach) gainsWithin(add []Member) error {
 	type reached struct {
 		key   string
 		until int64
 	}
 	members := map[Principal]map[reached]bool{}
+	// Each of held names one holder, so what a group holds is counted by the keys it reaches,
+	// without reading it: many groups in one holding many are refused for as little as one.
+	held := func(key string) int { return len(r.heldOf[key]) }
+	alone := 0
 	for _, m := range r.gaining(add) {
 		if members[m.Principal] == nil {
 			members[m.Principal] = map[reached]bool{}
 		}
+		k := 0
 		for key := range r.up[m.Group] {
 			members[m.Principal][reached{key, m.ExpiresAt.UnixMicro()}] = true
+			k += held(key)
 		}
+		alone = max(alone, k)
 	}
 	n, gainers := 0, 0
 	for _, keys := range members {
-		// Each of held names one holder, so what a group holds is counted by the keys it reaches,
-		// without reading it: many groups in one holding many are refused for as little as one.
 		k := 0
 		for x := range keys {
-			k += len(r.heldOf[x.key])
+			k += held(x.key)
 		}
 		if k > 0 {
 			n, gainers = n+k, gainers+1
 		}
 	}
-	if n > MaxBindings && gainers > 1 {
-		return fmt.Errorf("%w: the members a change adds gain at most %d grants and eligibilities of their groups in all, each member's counted apart, but for one alone, and these %d gain %d: add fewer at a time",
+	if n > MaxBindings && n > alone {
+		return fmt.Errorf("%w: the members a change adds gain at most %d grants and eligibilities of their groups in all, each principal's counted apart, or what one place gains alone, and these %d gain %d: add fewer at a time",
 			ErrInvalid, MaxBindings, gainers, n)
 	}
 	return nil

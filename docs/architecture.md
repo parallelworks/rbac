@@ -284,12 +284,14 @@ flowchart BT
   change and however many of the groups are in one that reaches it, and its grants are decided once
   for each role, condition and end on a scope, as the member a grant names decides nothing of the
   actor's power to make it; only the host is asked about each member's, which `MaxBindings` bounds
-  for `ChangeMembers` but for one member alone. A member is its principal: what all the groups,
-  and places in one, a change gives it reach is counted, and asked about, once for each end its
-  places give it (`gainsWithin`, `askMemberships`), so a group two of them are in counts once and
-  one member is never refused for joining several. `ImportMembers`, the host's own write, which no
-  actor's access decides, asks it once for each member and each grant or eligibility the member
-  gains, with no bound on them, so its cost grows with that.
+  for `ChangeMembers` but for what one place alone gains. A member is its principal: what all the
+  groups, and places in one, a change gives it reach is counted, and asked about, once for each end
+  its places give it (`gainsWithin`, `askMemberships`), so a group two of them are in counts once,
+  as does a group it is placed in from two sources until one end; past `MaxBindings`, a change
+  gains no more than its largest place alone does, so joining several groups never multiplies what
+  one change asks. `ImportMembers`, the host's own write, which no actor's access decides, asks it
+  once for each member and each grant or eligibility the member gains, with no bound on them, so
+  its cost grows with that.
 - **Expanding down** from groups to their identities, for lists and changes, is `insideSQL`. It
   finds nested groups in the statement and their identities through `rbac_group_members`, which
   plans its query for the groups reached, so a small group's members are read alone however large
@@ -762,7 +764,7 @@ refuses a row of more than 1 MiB as jsonb all the same.
 | Bound | Value | What it limits |
 |---|---|---|
 | `MaxID` | 512 bytes | A tenant's, scope's or principal's id. |
-| `MaxBindings` | 1,000 | Bindings in one `Apply`, and the grants, memberships, groups or members one `Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`, `DeleteGroups`, `ImportMembers`, `ChangeMembers` or `DeleteMembers` takes, and the grants and eligibilities the members one `ChangeMembers` adds gain, each member's counted apart, by its principal, as `ValidateGrant` is asked about each, but one member alone, which gains whatever its groups hold. The host's own `ImportMembers` is asked about each with no such bound. |
+| `MaxBindings` | 1,000 | Bindings in one `Apply`, and the grants, memberships, groups or members one `Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`, `DeleteGroups`, `ImportMembers`, `ChangeMembers` or `DeleteMembers` takes, and the grants and eligibilities the members one `ChangeMembers` adds gain, each member's counted apart, by its principal, as `ValidateGrant` is asked about each, but no more than one place alone gains, whatever its group and those it is in hold. The host's own `ImportMembers` is asked about each with no such bound. |
 | `MaxGrantsPerRole` | 20 | Grants in force of one role to one principal on one scope, differing by source, expiry or condition. Those from each source the host owns count apart. |
 | `MaxDenies`, `MaxDenyEntries` | 100, 256 | Denies on a scope, and the principals, exemptions or permissions one names. |
 | `MaxCustomRoles`, `MaxRoleEntries`, `MaxGrantableRoles` | 300, 1,000, 64 | Custom roles in a tenant, the permissions one gives and the types it is for, and roles one lists in `GrantableRoles`. |

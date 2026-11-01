@@ -594,10 +594,10 @@ func conflicted(err error) error {
 const (
 	// MaxBindings is how many bindings one Apply, grants and revokes together, or one Import takes,
 	// and how many grants and eligibilities of their groups the members one ChangeMembers adds gain
-	// in all, each member's counted apart, as the host is asked about each, but one member alone,
-	// which gains whatever its groups hold, and not the host's own ImportMembers: a member is its
-	// principal, however many groups, or places in one, the change gives it, and what they reach
-	// counts once for each end its places give it; and
+	// in all, each member's counted apart, as the host is asked about each, but no more than one
+	// place alone gains, whatever its group and those it is in hold, and not the host's own
+	// ImportMembers: a member is its principal, however many groups, or places in one, the change
+	// gives it, and what they reach counts once for each end its places give it; and
 	// MaxGrantsPerRole how many grants in force of one role a principal holds on one scope,
 	// differing by source, expiry or condition, as cloud IAM bounds bindings of one role: those
 	// from each source the host owns (Config.Sources) counted apart.
