@@ -1458,7 +1458,7 @@ func (a *Authorizer) rolesScopes(ctx context.Context, q DB, tenant string, ids [
 // changes to grants on scopes of one of types, those they can be or are on.
 func (a *Authorizer) changesStopped(ctx context.Context, actor Subject, tenant string, types []string, change string) error {
 	for _, t := range types {
-		name, err := a.denied(ctx, ConstraintInput{Tenant: tenant, ResourceType: t, Permission: GrantPermission(t), Subject: &actor})
+		name, err := a.freezes(ctx, actor, tenant, t)
 		if err != nil {
 			return err
 		}

@@ -261,14 +261,33 @@ scopes conditional ones reach, to check one by one.
   eligibility again or deleting it bounds only the activations made from then on, and leaves
   those made to their ends, or to their holders leaving its group: on a labeled scope,
   `ChangeMembers` ends them so only for an actor holding what the label asks for, as revoking them
-  there needs; on any scope, `DeleteGroup` refuses a group they rest on. On a labeled scope, only an
-  approver holding what its label asks for approves.
+  there needs, and on a frozen one not at all; on any scope, `DeleteGroup` refuses a group they rest
+  on. `Activate` holds the places in groups an activation rests on until it commits, and each of
+  these reads the activations once it holds the places it ends, so one made while it waits is
+  checked as one made before: `ChangeMembers` is tried again (`rbac.ErrConflict`), and
+  `DeleteGroup` refuses it. On a labeled scope, only an approver holding what its label asks for
+  approves.
 - **Host policy:** `Config.ValidateGrant` is asked about every grant with the role, the principal,
   the actor and how it is made, so the host decides who may hold what: members only, no
   privileged roles for service accounts or guests. `Config.Constraints` remove permissions above
   anything a tenant grants or denies, seeing copies of the subject and the resource, such as
   freezing changes under a container. What one removes from an actor the actor can't hand on, but for a
-  role a role it holds lists in `GrantableRoles`, which it grants without holding. The host is
+  role a role it holds lists in `GrantableRoles`, which it grants without holding. A freeze stops
+  every change an actor makes to grants under it, and every change taking access away there: one
+  removing `<type>:grant` from the actor, or a deny on the path doing so, stops `Apply` granting and
+  revoking there, and so it stops any change taking access away there, whatever the actor's grants,
+  as `DeleteRole` deleting a role granted there, `ChangeMembers` removing a member of a group
+  holding access there, making its place end sooner, ending an activation made there through the
+  group, or adding a member to a group a deny there names, and `DeleteGroup` deleting a group with
+  grants or eligibilities in force on its own scope. Each is stopped by what it ends there, not by
+  what the members hold after it: a member leaving a group ends there what the group and those it
+  is in give it, a grant, eligibility, approval or exemption, so one that another group or a grant
+  of its own gives the same is stopped too, as `Apply` revoking a grant held twice is, and so is
+  one ending only an eligibility, as `DeleteEligibility` there is; but a place that ends while
+  another, from another source, keeps the member in its group as long ends nothing there.
+  The host's own writes (`Import`, `DeleteGrants`, `SetMemberships`, `ImportMembers`,
+  `DeleteMembers`, `DeleteGroups` and the host's deletes) make none of the checks an actor's change
+  makes, so a freeze stops none of them: the host freezes those itself. The host is
   asked before a change takes its locks, so a change is tried again (`rbac.ErrConflict`) when the
   memberships its answers rest on, of an identity it grants to or of a group's members, changed
   in between, or a group a change to members reaches was nested in another. A change to a group
@@ -305,21 +324,32 @@ scopes conditional ones reach, to check one by one.
   and it is exempt from the denies the group is exempt from, as a removed member is from those
   naming it, which the actor must be able to set. A removed member loses the rest, and the
   activations made through the group, and an added one is bound by the denies naming the group,
-  which only the label of each scope refuses the actor, as for a revoke there. A place made to end
-  sooner gains nothing: it is a removal then, checked as one now; nor does one whose note alone
-  changes. So whoever manages a group that holds, approves and is in no deny, and that no member
-  activated through, changes its members freely, and one holding a role only if they could grant
-  that role themselves. Whether the actor may make a grant is decided once for each end, however
-  many members gain it, but the host is asked about each as each member's, so the members one
-  `ChangeMembers` adds gain at most `rbac.MaxBindings` grants and eligibilities in all, each
-  member's counted apart, but one member alone, which gains whatever its groups hold.
+  which the actor needn't be able to grant, but which the label of each scope, and a freeze there,
+  refuse it, as each refuses a revoke there. A place made to end sooner gains nothing: it is a
+  removal then, checked as one now; nor does one whose note alone changes. So whoever manages a
+  group that holds, approves and is in no deny, and that no member activated through, changes its
+  members freely, and one holding a role only if they could grant that role themselves. Whether
+  the actor may make a grant is decided once for each end, however many members gain it, but the
+  host is asked about each as each member's, so the members one `ChangeMembers` adds gain at most
+  `rbac.MaxBindings` grants and eligibilities in all, each member's counted apart, but no more
+  than one place alone gains, whatever its group and those it is in hold. A member is its
+  principal, however many groups, or places in one, the change gives it: what they reach counts,
+  and the host is asked about it, once for each end its places give it, so a group two of them are
+  in counts once, as does a group it is placed in from two sources until one end; but a member
+  joining several groups that give more than `rbac.MaxBindings` together, and more than any one of
+  them alone, joins them in more than one change.
   `ImportMembers`, the host's own write, which no actor's access decides, has no such bound: it asks
   `ValidateGrant` once for each member and each grant or eligibility the member gains, so its cost
   grows with how many they gain. The rest is the groups', read once however many of their members
   change, and what a group many of them are in reaches, once for all of them, and grows with what
   the groups hold, approve and are named or exempt in, so grant a group on a container rather than
-  on each resource in it: with labels declared, a removal asks `Config.ResourceOf` about each scope
-  its members lose access on, but where the actor's label values satisfy every label.
+  on each resource in it: with labels or constraints declared, or a deny binding the actor, a
+  removal reads what its members lose. It asks the constraints once about changing grants on each
+  type of scope they lose access on, of no resource, and `Config.ResourceOf` about each such scope
+  only where the actor's label values don't satisfy every label, a constraint answered that it may
+  stop the actor on some scope of the type, or a deny binding the actor removes `<type>:grant` or
+  `<type>:*`: then the constraints again about each, and the denies on all their paths in one
+  read.
   `Config.ResourceOf` gives the package the tenant, which `SetGroup` and `DeleteGroup` check
   `rbac.ManageGroups` on, and the groups, which `ChangeMembers` checks `rbac.GroupMembers` on and
   `SetGroup` and `DeleteGroup` the label of, each with its constraints and label, and the
@@ -331,8 +361,9 @@ scopes conditional ones reach, to check one by one.
   place in the group made to end sooner, `DeleteGroup`, or `DeleteRole` deleting, or `SetRole`
   redefining so that no grant of it there widens, nor would once the catalog has it no longer be
   privileged or the host declares the kind it is to, nor may the holders of a role listing it
-  granted there hand on more, a role granted on it, reads it as unlabeled, and any other change
-  fails with the error.
+  granted there hand on more, a role granted on it, reads it as stored, unlabeled and under no
+  container, which a freeze on its type or the tenant still stops, and any other change fails with
+  the error.
 - **Privileged roles:** a role the catalog marks `Privileged`, or one that changes access, is
   privileged: it is never granted to the tenant's members, and gives nothing through them, as
   after a catalog change. Their grants of it give what it gives once it no longer is: `SetRole`
@@ -688,20 +719,20 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   grants on any type.
 - **Limits:** a change takes at most `rbac.MaxBindings` bindings, and the members one
   `ChangeMembers` adds gain at most as many grants and eligibilities, each member's counted apart,
-  but one alone, while `ImportMembers` asks `ValidateGrant` about each one its members gain; a
-  principal holds a role on a scope at most `rbac.MaxGrantsPerRole` times, and is in a group at most
-  `rbac.MaxPlacesInGroup` times, by source, and directly in at most `rbac.MaxGroupsOfPrincipal`
-  groups, from each source the host owns apart, which bounds the groups a check reads through others
-  only level by level, so keep nesting narrow; a scope holds at most `rbac.MaxDenies` denies; a
-  tenant has at most `rbac.MaxCustomRoles` custom roles; an id is at most `rbac.MaxID` bytes. The
-  others are exported beside them. Lists have no limit or cursor, so what one returns grows with
-  what it lists: `Memberships` of a whole tenant with its members and guests, `MembershipsOf` with
-  the tenants an identity is a member or guest of, `Groups` with its groups, `Members` with a
-  group's members, `GroupsOf` with the groups a principal is in, through others too, `Holders` with
-  who holds the permission, `Grants` and `Eligibilities` on the tenant's scope with what is granted
-  there, `Reach.Scopes` with the scopes a subject's grants are on, and `Conflicts` with the
-  identities in conflict. In a large tenant, ask for less: `Memberships` of named principals,
-  `Grants` of one principal.
+  by its principal, but no more than one place alone gains, while `ImportMembers` asks
+  `ValidateGrant` about each one its members gain; a principal holds a role on a scope at most
+  `rbac.MaxGrantsPerRole` times, and is in a group at most `rbac.MaxPlacesInGroup` times, by source,
+  and directly in at most `rbac.MaxGroupsOfPrincipal` groups, from each source the host owns apart,
+  which bounds the groups a check reads through others only level by level, so keep nesting narrow;
+  a scope holds at most `rbac.MaxDenies` denies; a tenant has at most `rbac.MaxCustomRoles` custom
+  roles; an id is at most `rbac.MaxID` bytes. The others are exported beside them. Lists have no
+  limit or cursor, so what one returns grows with what it lists: `Memberships` of a whole tenant
+  with its members and guests, `MembershipsOf` with the tenants an identity is a member or guest of,
+  `Groups` with its groups, `Members` with a group's members, `GroupsOf` with the groups a principal
+  is in, through others too, `Holders` with who holds the permission, `Grants` and `Eligibilities`
+  on the tenant's scope with what is granted there, `Reach.Scopes` with the scopes a subject's
+  grants are on, and `Conflicts` with the identities in conflict. In a large tenant, ask for less:
+  `Memberships` of named principals, `Grants` of one principal.
 - **JIT:** turn JIT compilation off for the application's role, as in
   `ALTER ROLE app SET jit = off`, which a session takes as it starts, so a pool's connections take
   it once they reconnect. The planner can't tell how far a walk of a subject's groups goes, so for
