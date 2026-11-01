@@ -7576,6 +7576,199 @@ func TestADenyBelowTheTenantStopsARedefinitionHandingOnWhatItRemoves(t *testing.
 	}
 }
 
+// A grant to the tenant's members of a privileged role gives nothing, so narrowing the role so that
+// it no longer is gives them what it gives, as granting it to them would: a deny on the workspace
+// that grant is on, which keeps x from handing on what it gives there, stops it, as it stops Apply
+// there. A deny where only a grant to an identity is, which gives no more, stops nothing.
+func TestADenyWhereTheMembersHoldARoleNoLongerPrivilegedStopsNarrowingIt(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	x, r := definer(t, h)
+	member := h.as(t, "m")
+	elsewhere := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c2"}
+	// Privileged, as it gives root, and granted to the members, as a catalog change would leave it.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.op', '{cluster:view,cluster:root}', '{cluster}');
+		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES
+		  ('t1', 'workspace', 'w1', 'members', 't1', 'custom.op'), ('t1', 'cluster', 'c2', 'user', 'y', 'custom.op')`); err != nil {
+		t.Fatal(err)
+	}
+	noView := rbac.Deny{ID: "no-view", Permissions: []rbac.Permission{view}, Principals: []rbac.Principal{x.Principal}}
+	if err := h.authz.SetDeny(ctx, guardian, workspace, noView); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.Apply(ctx, x, workspace, rbac.Change{Grant: []rbac.Binding{{Role: r.ID, Principal: rbac.TenantMembers("t1")}}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("granting view to the members under the deny: %v", err)
+	}
+	narrowed := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	var denied *rbac.DeniedError
+	if err := h.authz.SetRole(ctx, x, "t1", narrowed); !errors.As(err, &denied) || denied.Scope != workspace.Scope() || allowed(t, h, member, view, cluster) {
+		t.Fatalf("narrowing a role the members hold under the deny so that it is no longer privileged: %v", err)
+	}
+	if err := h.authz.DeleteDeny(ctx, guardian, workspace, noView.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.SetDeny(ctx, guardian, elsewhere, noView); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.SetRole(ctx, x, "t1", narrowed); err != nil || !allowed(t, h, member, view, cluster) {
+		t.Fatalf("narrowing it under a deny only where a grant to an identity is: %v", err)
+	}
+}
+
+// What the narrowing checked of the denies where the members' grant is before its transaction it
+// checks again under the tenant's lock, so a deny set there while the host is asked about that
+// grant stops it. A deny elsewhere binds x, so the workspace was read before the transaction.
+func TestADenySetWhileANarrowingTheMembersGainByWaitsStopsIt(t *testing.T) {
+	var meanwhile func(context.Context) error
+	h, guardian := guarded(t, func(c *rbac.Config) {
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			if do := meanwhile; do != nil && in.Via == rbac.ViaRedefinition {
+				meanwhile = nil
+				if err := do(ctx); err != nil {
+					return err
+				}
+			}
+			return validate(ctx, q, in)
+		}
+	})
+	ctx := t.Context()
+	x, _ := definer(t, h)
+	member := h.as(t, "m")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.op', '{cluster:view,cluster:root}', '{cluster}');
+		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'workspace', 'w1', 'members', 't1', 'custom.op')`); err != nil {
+		t.Fatal(err)
+	}
+	elsewhere := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c2"}
+	if err := h.authz.SetDeny(ctx, guardian, elsewhere, rbac.Deny{ID: "no-root", Permissions: []rbac.Permission{root}, Principals: []rbac.Principal{x.Principal}}); err != nil {
+		t.Fatal(err)
+	}
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.SetDeny(ctx, guardian, workspace, rbac.Deny{ID: "no-view", Permissions: []rbac.Permission{view}, Principals: []rbac.Principal{x.Principal}})
+	}
+	narrowed := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	var denied *rbac.DeniedError
+	if err := h.authz.SetRole(ctx, x, "t1", narrowed); !errors.As(err, &denied) || denied.Scope != workspace.Scope() || allowed(t, h, member, view, cluster) {
+		t.Fatalf("narrowing a role the members hold while a deny is set where they hold it: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("the deny should have been set meanwhile")
+	}
+}
+
+// A grant to the tenant's members of a privileged role gives nothing, but a catalog change that has
+// the role no longer be privileged gives them what it gives then, and asks no one: so a deny on the
+// workspace that grant is on, which keeps x from handing on login there, stops x widening the role
+// to give login, as it would were the role not privileged, and the members never log in there.
+func TestADenyWhereTheMembersHoldAPrivilegedRoleStopsWideningIt(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	x, _ := definer(t, h)
+	member := h.as(t, "m")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.op', '{cluster:view,cluster:root}', '{cluster}');
+		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'workspace', 'w1', 'members', 't1', 'custom.op')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.SetDeny(ctx, guardian, workspace, rbac.Deny{ID: "no-login", Permissions: []rbac.Permission{login}, Principals: []rbac.Principal{x.Principal}}); err != nil {
+		t.Fatal(err)
+	}
+	wider := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view, login, root}, ResourceTypes: []string{"cluster"}}
+	var denied *rbac.DeniedError
+	if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.As(err, &denied) || denied.Scope != workspace.Scope() || denied.Permission != login {
+		t.Fatalf("widening a privileged role the members hold under the deny: %v", err)
+	}
+	cfg := h.cfg
+	cfg.Catalog = slices.Clone(cfg.Catalog)
+	for i, r := range cfg.Catalog {
+		if r.ID == "cluster.sudo" {
+			cfg.Catalog[i].Privileged = false
+		}
+	}
+	authz, err := rbac.New(h.pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := authz.Authorize(ctx, member, login, cluster); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("a member logs in under the deny once the catalog has the role no longer be privileged: %v", err)
+	}
+}
+
+// A scope the host no longer has is read as stored, before the transaction, only where the change
+// gives nothing more: where a role listing the role is granted there while the change waits, its
+// holders may hand the role on there as it will be, and where the tenant's members are granted it
+// there, as a host whose catalog has it not be privileged may, a catalog change that has it no
+// longer be gives them what it will give, so the change is refused under the tenant's lock, to be
+// tried again, and trying again fails with the host's error.
+func TestAScopeTheHostNoLongerHasThatARedefinitionComesToReachRefusesIt(t *testing.T) {
+	gone := rbac.Scope{Type: "cluster", ID: "gone"}
+	for _, tc := range []struct {
+		name string
+		// permissions are what custom.op gives, and wider what it is redefined to give.
+		permissions string
+		wider       []rbac.Permission
+		// meanwhile is the grant made while the change waits.
+		meanwhile string
+	}{
+		{"a role listing it is granted there", "{cluster:view}", []rbac.Permission{view, login}, `('t1', 'cluster', 'gone', 'user', 'z', 'custom.lister')`},
+		// It gives root, so is privileged, and a grant of it to the members gives them nothing.
+		{"the members are granted it there", "{cluster:view,cluster:root}", []rbac.Permission{view, login, root}, `('t1', 'cluster', 'gone', 'members', 't1', 'custom.op')`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var meanwhile func(context.Context) error
+			h, guardian := guarded(t, func(c *rbac.Config) {
+				resourceOf := c.ResourceOf
+				c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+					if s == gone {
+						return rbac.Resource{}, fmt.Errorf("%w: %s", rbac.ErrNotFound, s.Key())
+					}
+					return resourceOf(ctx, tenant, s)
+				}
+				validate := c.ValidateGrant
+				c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+					if do := meanwhile; do != nil && in.Via == rbac.ViaRedefinition {
+						meanwhile = nil
+						if err := do(ctx); err != nil {
+							return err
+						}
+					}
+					return validate(ctx, q, in)
+				}
+			})
+			ctx := t.Context()
+			x, _ := definer(t, h)
+			// custom.op isn't Public, so its grant to the public on gone gives nothing, before or after;
+			// custom.lister lets its holders grant it, and is granted nowhere yet.
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles) VALUES
+				('t1', 'custom.op', $1, '{cluster}', '{}'), ('t1', 'custom.lister', '{cluster:grant,cluster:view}', '{cluster}', '{custom.op}')`, tc.permissions); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES
+				('t1', 'cluster', 'gone', 'public', '', 'custom.op'), ('t1', 'cluster', 'c2', 'user', 'y', 'custom.op')`); err != nil {
+				t.Fatal(err)
+			}
+			// A deny elsewhere binds x, so the scopes are read before the transaction.
+			elsewhere := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c3"}
+			if err := h.authz.SetDeny(ctx, guardian, elsewhere, rbac.Deny{ID: "no-root", Permissions: []rbac.Permission{root}, Principals: []rbac.Principal{x.Principal}}); err != nil {
+				t.Fatal(err)
+			}
+			meanwhile = func(ctx context.Context) error {
+				_, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES `+tc.meanwhile)
+				return err
+			}
+			wider := rbac.RoleDefinition{ID: "custom.op", Permissions: tc.wider, ResourceTypes: []string{"cluster"}}
+			if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.Is(err, rbac.ErrConflict) {
+				t.Fatalf("widening a role granted on a scope the host no longer has, where %s while it waits: %v", tc.name, err)
+			}
+			if meanwhile != nil {
+				t.Fatal("the grant should have been made meanwhile")
+			}
+			if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.Is(err, rbac.ErrNotFound) {
+				t.Fatalf("trying again: %v", err)
+			}
+		})
+	}
+}
+
 // A deny on a container, or on the resource itself, that removes x's power to change grants there
 // stops x changing what a role granted there gives, or revoking it by deleting the role, as it
 // stops Apply there.

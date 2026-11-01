@@ -110,8 +110,16 @@ conditional ones reach, to check one by one.
   scope's path keeps from changing grants there, can neither change what its grants give nor
   delete it, nor widen it where a deny there, or where a role listing it, or listing one that does,
   is granted, removes a permission it would give or the power to grant it, or the label of a scope
-  such a role is granted on refuses it. Renaming a role or rewriting its description changes no
-  grant, so needs only the power to define it.
+  such a role is granted on refuses it. A grant widens by what it gives through its principal, as
+  checks read it: one to the tenant's members of a privileged role, or to the public of a role not
+  marked `Public`, gives nothing, so widening the role asks nothing about it, and a redefinition
+  that has it give something, as narrowing the role so that it is no longer privileged does, widens
+  it, with what was added to the role while it gave nothing; where the role gives more to whomever
+  it is granted, each grant giving anything through its principal widens, whatever its scope takes
+  of what was added. A deny where the tenant's members hold a privileged role still stops widening
+  it, as a catalog change that has the role no longer be privileged gives them what it gives then,
+  and asks no one. Renaming a role or rewriting its description changes no grant, so needs only the
+  power to define it.
   `DeleteRole` removes one with its grants; `Roles` lists the built-in and custom roles a scope type
   takes. Custom roles follow the catalog: one gives only what the catalog still has, and is
   privileged when it gives what only privileged roles do, or changes access.
@@ -304,10 +312,15 @@ conditional ones reach, to check one by one.
   `rbac.ErrNotFound`, or an error wrapping it: a change that only takes access away there, as a
   member leaving a group with access on it or the group itself, or joining one a deny there names, a
   place in the group made to end sooner, `DeleteGroup`, or `DeleteRole` deleting, or `SetRole`
-  narrowing, a role granted on it, reads it as unlabeled, and any other change fails with the error.
+  redefining so that no grant of it there widens, nor would once the catalog has it no longer be
+  privileged or the host declares the kind it is to, nor may the holders of a role listing it
+  granted there hand on more, a role granted on it, reads it as unlabeled, and any other change
+  fails with the error.
 - **Privileged roles:** a role the catalog marks `Privileged`, or one that changes access, is
   privileged: it is never granted to the tenant's members, and gives nothing through them, as
-  after a catalog change.
+  after a catalog change. Their grants of it give what it gives once it no longer is: `SetRole`
+  checks a redefinition doing so as widening them, but a catalog change doing so is the host's, and
+  asks nothing.
 - **Public access:** the zero `Subject` is anonymous and holds only what is granted to the public.
   Only a role marked `Public` can be granted to the public, and a grant to the public gives
   nothing once its role no longer is.
