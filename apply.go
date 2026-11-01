@@ -2855,11 +2855,11 @@ func removedWhere[T any](ctx context.Context, a *Authorizer, tx pgx.Tx, table, c
 // removed. A race PostgreSQL refuses matches ErrConflict.
 func (a *Authorizer) DeleteExpired(ctx context.Context) (n int64, err error) {
 	defer a.refused(ctx, &err, "", Principal{}, "DeleteExpired")
+	defer conflicting(&err)
 	if err := a.writable(); err != nil {
 		return 0, err
 	}
-	n, err = a.deleteExpired(ctx)
-	return n, conflicted(err)
+	return a.deleteExpired(ctx)
 }
 
 // expiryBatch is the most rows of a table one of DeleteExpired's transactions picks, so none
