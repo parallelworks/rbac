@@ -347,8 +347,9 @@ storage of the host's own: a transaction that commits after one that took its id
 before it all the same, never skipped. That is the order of transactions, not of each row's
 changes: one that took its id first and changed a row after another committed a change to it is
 read before that one, though its change came after. So a consumer replaying an export applies each
-row's versions in the order of their `Record.ID`, in which they were written, as `AsOf` reads them,
-not in the order read, or it ends with a version the row no longer held. A record can be read
+row's versions in the order of their `Record.ID`, in which they were written while history's id
+sequence caches one, as `AsOf` reads them and requires, not in the order read, or it ends with a
+version the row no longer held. A record can be read
 twice, so dedupe on `Record.ID` and `RecordedAt`: a restore can give another record the ID of one
 it lost. One call reads at most `rbac.MaxHistory`
 records, and past the first, at most `rbac.MaxHistoryBytes` of their rows' JSON and their text, so a

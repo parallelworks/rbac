@@ -1883,8 +1883,9 @@ func TestHistoryRefusesACursorItCantFollow(t *testing.T) {
 		t.Fatalf("a cursor of a record the database doesn't hold: %v", err)
 	}
 	// And one dated past the times history holds, which pgx would send as another, or PostgreSQL
-	// refuse as out of range: 2^64 microseconds on, it reaches the database as the record's own time.
-	for _, at := range []time.Time{wrapped(cursor.RecordedAt), time.Date(300000, time.January, 1, 0, 0, 0, 0, time.UTC)} {
+	// refuse as out of range: 2^64 microseconds on or back, it reaches the database as the record's
+	// own time.
+	for _, at := range []time.Time{wrapped(cursor.RecordedAt, 1), wrapped(cursor.RecordedAt, -1), time.Date(300000, time.January, 1, 0, 0, 0, 0, time.UTC)} {
 		far := cursor
 		far.RecordedAt = at
 		if _, _, err := h.authz.History(ctx, far, 1); !errors.Is(err, rbac.ErrInvalid) {
@@ -1896,12 +1897,11 @@ func TestHistoryRefusesACursorItCantFollow(t *testing.T) {
 	}
 }
 
-// wrapped is a time 2^64 microseconds after t, past the times PostgreSQL holds, which pgx writes in
-// microseconds from 2000 in 64 bits, so sends as t.
-func wrapped(t time.Time) time.Time {
+// wrapped is a time laps times 2^64 microseconds after t, past the times PostgreSQL holds, which pgx
+// writes in microseconds from 2000 in 64 bits, so sends as t.
+func wrapped(t time.Time, laps int64) time.Time {
 	const seconds, micros = 18446744073709, 551616
-	ns := int64(t.Nanosecond()) + micros*1000
-	return time.Unix(t.Unix()+seconds+ns/1e9, ns%1e9).UTC()
+	return time.Unix(t.Unix()+laps*seconds, int64(t.Nanosecond())+laps*micros*1000).UTC()
 }
 
 const grantLogin = `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
@@ -3279,7 +3279,7 @@ func TestPruningHistoryKeepsWhatAsOfReads(t *testing.T) {
 	// Nor one past the times the package stores, yet to come: 2^64 microseconds on, pgx would send it
 	// as a time that has passed, and past PostgreSQL's times, as one it refuses as out of range.
 	h.as(t, "since")
-	for _, before := range []time.Time{wrapped(dbNow(t, h)), time.Date(300000, time.January, 1, 0, 0, 0, 0, time.UTC)} {
+	for _, before := range []time.Time{wrapped(dbNow(t, h), 1), time.Date(300000, time.January, 1, 0, 0, 0, 0, time.UTC)} {
 		if n, err := rbac.PruneHistory(ctx, h.pool, before, exported(t, h)); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("a prune of history up to year %d: %d, %v", before.Year(), n, err)
 		}
@@ -3431,7 +3431,8 @@ func TestPruningHistoryKeepsAnEndWhileAnUnreadOrLaterVersionStays(t *testing.T) 
 
 // Under a host's transaction, history is append only again for what the host writes after a prune.
 // A prune is recorded in the statement that deletes, so one in a transaction that checks
-// constraints at the end of each statement, rather than as it commits, is recorded by then.
+// constraints at the end of each statement, rather than as it commits, is recorded by then. The
+// host's transaction gets back the sorting and JIT the prune turned off.
 func TestPruningHistoryOnAHostsTransaction(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -3445,11 +3446,16 @@ func TestPruningHistoryOnAHostsTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, `SET CONSTRAINTS ALL IMMEDIATE`); err != nil {
+	if _, err := tx.Exec(ctx, `SET CONSTRAINTS ALL IMMEDIATE; SET LOCAL jit = on; SET LOCAL enable_sort = on`); err != nil {
 		t.Fatal(err)
 	}
 	if n, err := rbac.PruneHistory(ctx, tx, dbNow(t, h), through); err != nil || n != 1 {
 		t.Fatalf("PruneHistory = %d, %v", n, err)
+	}
+	var jit, sorting string
+	if err := tx.QueryRow(ctx, `SELECT current_setting('jit'), current_setting('enable_sort')`).Scan(&jit, &sorting); err != nil ||
+		jit != "on" || sorting != "on" {
+		t.Errorf("after the prune, jit %q and enable_sort %q, %v", jit, sorting, err)
 	}
 	_, err = tx.Exec(ctx, `DELETE FROM rbac_history WHERE id = (SELECT min(id) FROM rbac_history)`)
 	if pgErr := (*pgconn.PgError)(nil); !errors.As(err, &pgErr) || pgErr.Code != "42501" {

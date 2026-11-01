@@ -300,12 +300,14 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 	}
 	// The planner can't know that what a batch deletes is history's oldest, and would rather
 	// read all of it and sort what it finds: by history's ids, a call reads only as far as its
-	// batch reaches.
-	var sorting string
-	if err := tx.QueryRow(ctx, `SELECT current_setting('enable_sort')`).Scan(&sorting); err != nil {
+	// batch reaches. Finding the last record deleted still sorts, which with sorting off costs
+	// past jit_above_cost before PostgreSQL 18, and compiling took far longer than the prune.
+	var sorting, jit string
+	if err := tx.QueryRow(ctx, `SELECT current_setting('enable_sort'), current_setting('jit')`).Scan(&sorting, &jit); err != nil {
 		return 0, nil, err
 	}
-	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', 'on', true), set_config('enable_sort', 'off', true)`); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', 'on', true), set_config('enable_sort', 'off', true),
+		set_config('jit', 'off', true)`); err != nil {
 		return 0, nil, err
 	}
 	// Of each row's versions at or before the time, the last, by when it was written, as AsOf
@@ -319,8 +321,11 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 	// The window's record is written in the statement that deletes, and only where it deleted any. It
 	// holds the last record it deleted in History's order, before which History refuses a cursor: an
 	// export further behind than through would otherwise read on past what it deleted.
-	var picked int64
-	var last, end *int64
+	//
+	// It judged its window to the end, unless its batch filled first: by what it picked, not what it
+	// deleted, as a prune of the same that deleted some of them meanwhile leaves fewer to delete,
+	// and the rest of the window, which it never judged, is the next's. The window's record and the
+	// call go on from the same.
 	if err := tx.QueryRow(ctx, `
 		WITH win AS (
 		  SELECT max(id) AS last FROM (SELECT id FROM `+history+` WHERE id > $5 ORDER BY id LIMIT $6) w
@@ -341,32 +346,27 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 		), pruned AS (
 		  -- By id, from the batch: a join could read all of history to find it.
 		  DELETE FROM `+history+` WHERE id = ANY (ARRAY(SELECT id FROM doomed)) RETURNING txid, id
+		), reach AS (
+		  SELECT CASE WHEN (SELECT count(*) FROM doomed) = $4 THEN (SELECT max(id) FROM doomed) ELSE (SELECT last FROM win) END AS id
 		), latest AS (
 		  SELECT txid, id FROM pruned ORDER BY txid DESC, id DESC LIMIT 1
 		), recorded AS (
 		  INSERT INTO `+history+` (effective_at, tenant, entity, key, op, after, how)
 		  SELECT now(), '', 'history', `+pruneKey+`, 'prune',
 		    jsonb_build_object('before', $1::pg_catalog.timestamptz, 'through', `+pruneThrough+`,
-		      'deleted', (SELECT count(*) FROM pruned),
-		      'reached', CASE WHEN (SELECT count(*) FROM doomed) = $4 THEN (SELECT max(id) FROM doomed) ELSE (SELECT last FROM win) END,
+		      'deleted', (SELECT count(*) FROM pruned), 'reached', (SELECT id FROM reach),
 		      'last', jsonb_build_object('txid', l.txid::pg_catalog.text, 'id', l.id)),
 		    'PruneHistory'
 		  FROM latest l
 		)
-		SELECT (SELECT count(*) FROM pruned), (SELECT count(*) FROM doomed), (SELECT max(id) FROM doomed), (SELECT last FROM win)`,
-		before, through.TxID, through.ID, most, from, maxPrune).Scan(&n, &picked, &last, &end); err != nil {
+		SELECT (SELECT count(*) FROM pruned), (SELECT id FROM reach)`,
+		before, through.TxID, through.ID, most, from, maxPrune).Scan(&n, &next); err != nil {
 		return 0, nil, err
 	}
 	// Under a host's transaction, which goes on past the prune.
-	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', '', true), set_config('enable_sort', $1, true)`, sorting); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', '', true), set_config('enable_sort', $1, true),
+		set_config('jit', $2, true)`, sorting, jit); err != nil {
 		return 0, nil, err
-	}
-	// It judged its window to the end, unless its batch filled first: by what it picked, not what
-	// it deleted, as a prune of the same that deleted some of them meanwhile leaves fewer to delete,
-	// and the rest of the window, which it never judged, is the next's.
-	next = end
-	if picked == most {
-		next = last
 	}
 	// One that deleted none left history as it was, and recorded nothing, and the call goes on to the
 	// next window itself: a record would account for no record gone, refuse AsOf times history still
@@ -501,15 +501,15 @@ var maxUnsized = 100
 // its id later is read before it all the same, never skipped. That is the order of transactions,
 // not of each row's changes: a transaction that took its id first and changed a row after another
 // committed a change to it is read before that one, though its change came after. So a row's
-// versions are in the order of their IDs, in which they were written, as AsOf reads them: a
-// consumer replaying an export applies a row's versions by ID, not in the order read, or it ends
-// with one the row no longer held. Transaction ids are the database cluster's, so a transaction
-// running anywhere in it, in any database, that has taken one holds the read back until it ends: a
-// long one, an AsOf whose read runs long, or a prepared transaction left open, delays the export.
-// A session may turn off the timeouts that would end one it leaves open, so watch pg_stat_activity
-// for one held too long and end it, as the README says. A record can be read twice, as when a host
-// retries a read whose result it lost: dedupe on ID and RecordedAt, since a restore can give
-// another record the ID of one it lost.
+// versions are in the order of their IDs, in which they were written while history's id sequence
+// caches one, as AsOf reads them and requires: a consumer replaying an export applies a row's
+// versions by ID, not in the order read, or it ends with one the row no longer held. Transaction
+// ids are the database cluster's, so a transaction running anywhere in it, in any database, that
+// has taken one holds the read back until it ends: a long one, an AsOf whose read runs long, or a
+// prepared transaction left open, delays the export. A session may turn off the timeouts that
+// would end one it leaves open, so watch pg_stat_activity for one held too long and end it, as the
+// README says. A record can be read twice, as when a host retries a read whose result it lost:
+// dedupe on ID and RecordedAt, since a restore can give another record the ID of one it lost.
 //
 // It reads the primary, and fails on a replica, which can't tell which timeline it follows until
 // long after a failover. A failover or a recovery to a point in time starts a new generation, and

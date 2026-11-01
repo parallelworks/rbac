@@ -314,7 +314,7 @@ func TestAsOfRefusesATimePastThoseItReads(t *testing.T) {
 	}
 	earliest := time.Date(-4713, time.November, 24, 0, 0, 0, 0, time.UTC)
 	latest := time.Date(9999, time.December, 30, 23, 59, 59, 999999000, time.UTC)
-	past := []time.Time{wrapped(held), time.Date(300000, time.January, 1, 0, 0, 0, 0, time.UTC), latest.Add(time.Microsecond), earliest.Add(-time.Microsecond)}
+	past := []time.Time{wrapped(held, 1), time.Date(300000, time.January, 1, 0, 0, 0, 0, time.UTC), latest.Add(time.Microsecond), earliest.Add(-time.Microsecond)}
 	for _, at := range past {
 		if err := read(at); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("as of %v: %v", at, err)
