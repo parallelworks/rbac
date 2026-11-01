@@ -1354,9 +1354,9 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 			cols.Path, overlap, grants("ARRAY["+arg(9)+"::text]"), own)
 	}
 	pred := Predicate{
-		SQL: fmt.Sprintf(`(%[1]s = %[2]s AND (%[1]s)::text = %[5]s::text COLLATE "default" AND %[3]s
-			AND %[7]s%[6]s IS FALSE)`,
-			cols.Tenant, arg(0), reached, cols.Path, arg(1), keyed(typed, denies(arg(16))), deniedByKey),
+		SQL: fmt.Sprintf(`(%[1]s = %[2]s AND (%[1]s)::text = %[4]s::text COLLATE "default" AND %[3]s
+			AND %[6]s%[5]s IS FALSE)`,
+			cols.Tenant, arg(0), reached, arg(1), keyed(typed, denies(arg(16))), deniedByKey),
 		Args: filterArgs(above),
 	}
 	// With no dimension declared too, as then any label is invalid, and Authorize refuses it.
