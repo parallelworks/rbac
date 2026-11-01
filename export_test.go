@@ -200,13 +200,20 @@ func LabelValuesDecided(t *testing.T, ctx context.Context, a *Authorizer, actor 
 	return together, alone
 }
 
-// GrantsDecided is, for each of grants actor makes on r on ctx's request, the permission it lacks to
-// make it, or "" where it may: as a change granting them all decides them, by one read of its
-// authority there, a role once for each condition and end its grants tell apart; and as deciding
-// each alone does, by a read of its own, under the grant's own condition, by those of its grants
-// that each last until the grant ends (holding.lasts), as though they lasted for good, and the grant
-// were made for good.
-func GrantsDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subject, r Resource, grants []Binding) (together, alone []Permission) {
+// GrantDecision is what deciding a grant found: the permission the actor lacks to make it, ""
+// where it may, and the constraint whose removal of it refused it, if one did.
+type GrantDecision struct {
+	Lacks Permission
+	By    string
+}
+
+// GrantsDecided is, for each of grants actor makes on r on ctx's request, what deciding it found
+// (GrantDecision): as a change granting them all decides them, by one read of its authority there
+// and one ask of each constraint, a role once for each condition and end its grants tell apart; and
+// as deciding each alone does, by a read and asks of its own, under the grant's own condition, by
+// those of its grants that each last until the grant ends (holding.lasts), as though they lasted
+// for good, and the grant were made for good.
+func GrantsDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subject, r Resource, grants []Binding) (together, alone []GrantDecision) {
 	t.Helper()
 	a = a.still()
 	authority := func(grants []Binding) authority {
@@ -219,12 +226,12 @@ func GrantsDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subje
 	}
 	au := authority(grants)
 	for _, d := range a.grantsDecided(au, au.over(r.Type), r.Type, grants) {
-		together = append(together, d.lacks)
+		together = append(together, GrantDecision{d.lacks, d.by})
 	}
 	for _, b := range grants {
 		au := authority([]Binding{b})
 		def, known := au.roles.role(b.Role)
-		var lacks Permission
+		var decided GrantDecision
 		if known && a.grantableOn(def, r.Type) {
 			// Its power to change grants now is what all its grants give, whenever they end.
 			pw := au.over(r.Type)
@@ -232,9 +239,9 @@ func GrantsDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subje
 			for i := range au.held {
 				au.held[i].ends = time.Time{}
 			}
-			lacks, _, _ = a.mayGrant(au, pw, r.Type, def, b.Condition.Expression, time.Time{}, newChecked())
+			decided.Lacks, decided.By, _ = a.mayGrant(au, pw, r.Type, def, b.Condition.Expression, time.Time{}, newChecked())
 		}
-		alone = append(alone, lacks)
+		alone = append(alone, decided)
 	}
 	return together, alone
 }

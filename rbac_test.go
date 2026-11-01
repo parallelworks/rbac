@@ -4977,9 +4977,9 @@ func TestGrantsDecidedTogetherAreDecidedAsEachAlone(t *testing.T) {
 			together, alone := rbac.GrantsDecided(t, ctx, h.authz, boss, r, grants)
 			for i, b := range grants {
 				if together[i] != alone[i] {
-					t.Errorf("seed %d, %s on %s: decided with the others, it lacks %q; alone, %q", seed, b.Role, r.Scope().Key(), together[i], alone[i])
+					t.Errorf("seed %d, %s on %s: decided with the others, it lacks %+v; alone, %+v", seed, b.Role, r.Scope().Key(), together[i], alone[i])
 				}
-				if alone[i] == "" {
+				if alone[i].Lacks == "" {
 					allowed++
 				} else {
 					refused++
@@ -5002,14 +5002,18 @@ func TestGrantsDecidedTogetherAreDecidedAsEachAlone(t *testing.T) {
 // the subject; and denies on the path binding it, a group it is in or the members, some exempting
 // it, some under a condition. Each grant is made until an end of the actor's grants, a microsecond
 // either side of one, another time or for good, on each scope of the path, on requests meeting one
-// condition or another.
+// condition or another; and of a grant refused as a constraint removes what it lacks, that one,
+// where two remove root on types of their own, which the actor's roles list in any order.
 func TestGrantsDecidedTogetherAreDecidedAsEachAloneWhateverTheActorHolds(t *testing.T) {
 	viewer := rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
+	removing := func(on string) rbac.Constraint {
+		return rbac.Constraint{Name: "no root on " + on, Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			return in.Permission == root && in.ResourceType == on, nil
+		}}
+	}
 	h := setup(t, compartments, banks, func(c *rbac.Config) {
 		c.Catalog = append(slices.Clone(c.Catalog), granter, lister, viewer)
-		c.Constraints = []rbac.Constraint{{Name: "no root on workspaces", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
-			return in.Permission == root && in.ResourceType == "workspace", nil
-		}}}
+		c.Constraints = []rbac.Constraint{removing("workspace"), removing(rbac.TenantScope)}
 	})
 	ctx := t.Context()
 	// boss is in g1, g2 and g4, and in g3 through g4.
@@ -5050,7 +5054,7 @@ func TestGrantsDecidedTogetherAreDecidedAsEachAloneWhateverTheActorHolds(t *test
 		}
 		return pgtype.Timestamptz{Time: h.now.Add(time.Duration(1+rng.IntN(8)) * time.Hour), Valid: true}
 	}
-	allowed, refused, apart := 0, 0, 0
+	allowed, refused, apart, named := 0, 0, 0, map[string]bool{}
 	for seed := range uint64(200) {
 		rng := rand.New(rand.NewPCG(seed, seed))
 		for _, clear := range []string{`DELETE FROM rbac_grants WHERE tenant = 't1'`, `DELETE FROM rbac_roles WHERE tenant = 't1'`, `DELETE FROM rbac_denies WHERE tenant = 't1'`} {
@@ -5090,12 +5094,14 @@ func TestGrantsDecidedTogetherAreDecidedAsEachAloneWhateverTheActorHolds(t *test
 					ts = append(ts, rt)
 				}
 			}
+			ts = append(ts, "cluster")
+			rng.Shuffle(len(ts), func(i, j int) { ts[i], ts[j] = ts[j], ts[i] })
 			lists := []string{}
 			if i > 0 && rng.IntN(2) == 0 {
 				lists = append(lists, string(roles[rng.IntN(len(roles))]))
 			}
 			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles, privileged, public)
-				VALUES ('t1', $1, $2, $3, $4, $5, $6)`, id, append(ps, "cluster:grant"), append(ts, "cluster"), lists, rng.IntN(4) == 0, rng.IntN(3) == 0); err != nil {
+				VALUES ('t1', $1, $2, $3, $4, $5, $6)`, id, append(ps, "cluster:grant"), ts, lists, rng.IntN(4) == 0, rng.IntN(3) == 0); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -5187,19 +5193,20 @@ func TestGrantsDecidedTogetherAreDecidedAsEachAloneWhateverTheActorHolds(t *test
 			byEnd := map[string]map[rbac.Permission]bool{}
 			for i, b := range grants {
 				if together[i] != alone[i] {
-					t.Errorf("seed %d, %s under %q until %v on %s: decided with the others, it lacks %q; alone, %q",
+					t.Errorf("seed %d, %s under %q until %v on %s: decided with the others, it lacks %+v; alone, %+v",
 						seed, b.Role, b.Condition.Expression, b.ExpiresAt, r.Scope().Key(), together[i], alone[i])
 				}
-				if alone[i] == "" {
+				if alone[i].Lacks == "" {
 					allowed++
 				} else {
 					refused++
 				}
+				named[alone[i].By] = true
 				k := string(b.Role) + " " + b.Condition.Expression
 				if byEnd[k] == nil {
 					byEnd[k] = map[rbac.Permission]bool{}
 				}
-				byEnd[k][alone[i]] = true
+				byEnd[k][alone[i].Lacks] = true
 			}
 			for _, decided := range byEnd {
 				if len(decided) > 1 {
@@ -5208,10 +5215,11 @@ func TestGrantsDecidedTogetherAreDecidedAsEachAloneWhateverTheActorHolds(t *test
 			}
 		}
 	}
-	// So that grants allowed and refused are compared, and grants of a role under one condition that
-	// the actor's grants decide apart for their ends.
-	if allowed == 0 || refused == 0 || apart == 0 {
-		t.Errorf("of the grants decided, %d were allowed and %d refused, and %d roles were decided apart for their ends", allowed, refused, apart)
+	// So that grants allowed and refused are compared, grants of a role under one condition that the
+	// actor's grants decide apart for their ends, and refusals by each constraint.
+	if allowed == 0 || refused == 0 || apart == 0 || !named["no root on workspace"] || !named["no root on tenant"] {
+		t.Errorf("of the grants decided, %d were allowed and %d refused, and %d roles were decided apart for their ends; refused by %v",
+			allowed, refused, apart, named)
 	}
 }
 
