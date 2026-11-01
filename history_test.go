@@ -2476,16 +2476,18 @@ func placeOf(c rbac.Cursor) place { return place{c.TxID, c.ID} }
 
 // Exports at random cursors, among random writes, a transaction that took its id early, and prunes
 // through a random export's cursor, of this release alone, two in a host's transaction, or one in a
-// host's that took its id early, as an export reads, or of a release before migration 0020: each
-// export reads every record history holds after its cursor, and is refused exactly where a prune
-// since it began deleted a record after its cursor, or for one recorded before 0020, went through a
-// cursor after it, or deleted its cursor's record. One that began after a prune, as an export from
-// the start again, is never refused for it, unless its cursor lost its Horizon, as one kept from
-// before Cursor had one: then it is refused where a prune since it began deleted a record after it,
-// and may be where an earlier one did.
+// host's that took its id early, as an export reads, of a release before migration 0020, or by hand
+// as a role with the rights of history's owner, whose record holds an id that role chose, 0, below
+// it or past every other, alone or in a host's transaction that took its id early: each export
+// reads every record history holds after its cursor, and is refused exactly where a prune since it
+// began deleted a record after its cursor, or for one recorded before 0020, went through a cursor
+// after it, or deleted its cursor's record. One that began after a prune, as an export from the
+// start again, is never refused for it, unless its cursor lost its Horizon, as one kept from before
+// Cursor had one: then it is refused where a prune since it began deleted a record after it, and
+// may be where an earlier one did.
 func TestHistoryRefusesExactlyTheExportsAPruneDeletedFrom(t *testing.T) {
 	var refusals int
-	for seed := range uint64(6) {
+	for seed := range uint64(60) {
 		t.Run(fmt.Sprint("seed", seed), func(t *testing.T) { refusals += randomExports(t, seed) })
 	}
 	if refusals == 0 {
@@ -2499,6 +2501,7 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 	t.Helper()
 	h := setup(t)
 	ctx := t.Context()
+	admin := ownersRights(t, h)
 	rng := mrand.New(mrand.NewPCG(seed, seed))
 	users := []string{"p0", "p1", "p2", "p3", "p4", "p5"}
 	for _, id := range users {
@@ -2598,6 +2601,73 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 			t.Fatalf("PruneHistory through %+v: %v", c, err)
 		}
 	}
+	// forged counts forge's prunes, whose records' ids it keeps apart; zero is whether one is 0.
+	var forged int64
+	var zero bool
+	// forge deletes on tx by hand, as admin, up to two random records before c, and records a prune
+	// of them as PruneHistory never would: its record's id is one admin chose, 0, below it or past
+	// every other, and it reaches them by the last it deleted or, as one recorded before 0020, by c,
+	// the cursor it went through, which it returns, and otherwise nil. It records the prune before
+	// its delete, or after, as the trigger checks the delete as tx commits, unless tx checks
+	// constraints at each statement.
+	forge := func(tx pgx.Tx, c rbac.Cursor) (through *rbac.Cursor) {
+		t.Helper()
+		forged++
+		ids := []int64{-forged, 1<<60 + forged}
+		if !zero {
+			ids = append(ids, 0)
+		}
+		id := ids[rng.IntN(len(ids))]
+		zero = zero || id == 0
+		immediate := rng.IntN(2) == 0
+		settings := []string{`SELECT set_config('rbac.prune', 'on', true)`}
+		if admin != "" {
+			settings = append(settings, `SET LOCAL ROLE `+admin)
+		}
+		if immediate {
+			settings = append(settings, `SET CONSTRAINTS ALL IMMEDIATE`)
+		}
+		for _, sql := range settings {
+			if _, err := tx.Exec(ctx, sql); err != nil {
+				t.Fatalf("%s: %v", sql, err)
+			}
+		}
+		var victims []int64
+		if err := tx.QueryRow(ctx, `SELECT ARRAY(SELECT id FROM rbac_history WHERE (txid, id) < ($1::xid8, $2) ORDER BY random() LIMIT 2)`,
+			fmt.Sprint(c.TxID), c.ID).Scan(&victims); err != nil {
+			t.Fatal(err)
+		}
+		if len(victims) == 0 {
+			return nil
+		}
+		var reached place
+		if err := tx.QueryRow(ctx, `SELECT txid, id FROM rbac_history WHERE id = ANY ($1) ORDER BY txid DESC, id DESC LIMIT 1`, victims).
+			Scan(&reached.txid, &reached.id); err != nil {
+			t.Fatal(err)
+		}
+		reach := "last"
+		if rng.IntN(3) == 0 {
+			reach, reached, through = "through", placeOf(c), &c
+		}
+		statements := []struct {
+			sql  string
+			args []any
+		}{
+			{`INSERT INTO rbac_history (id, effective_at, tenant, entity, key, op, after, how) OVERRIDING SYSTEM VALUE
+			  VALUES ($1, now(), '', 'history', '0001-01-01T00:00:00.000000Z', 'prune', jsonb_build_object('before', timestamptz '0001-01-01 00:00:00+00',
+			    $2::text, jsonb_build_object('txid', $3::text, 'id', $4::bigint), 'deleted', $5::int), '')`, []any{id, reach, fmt.Sprint(reached.txid), reached.id, len(victims)}},
+			{`DELETE FROM rbac_history WHERE id = ANY ($1)`, []any{victims}},
+		}
+		if !immediate && rng.IntN(2) == 0 {
+			slices.Reverse(statements)
+		}
+		for _, s := range statements {
+			if _, err := tx.Exec(ctx, s.sql, s.args...); err != nil {
+				t.Fatalf("%s: %v", s.sql, err)
+			}
+		}
+		return through
+	}
 	// read reads a random few records from e's cursor, on its own transaction or a host's, with arm
 	// set to run between checking the cursor and reading, and checks that it read every record
 	// history holds between its cursor and the next, or that it was refused, as only a harmed or
@@ -2673,7 +2743,7 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 			}
 			early = nil
 		}
-		switch op := rng.IntN(22); {
+		switch op := rng.IntN(23); {
 		case op < 6:
 			// A grant, its change or its revoke; or in the transaction that took its id early, a
 			// membership no other write touches, so none waits for it.
@@ -2707,7 +2777,8 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 		case op < 8:
 			// A host's transaction that takes its id now, and later prunes and commits: it deletes
 			// records of earlier transactions, and its record comes before those written since, so an
-			// export that began meanwhile, with a Horizon no later than it, counts it.
+			// export that began meanwhile, with a Horizon no later than it, counts it, as it does one
+			// by hand whose record's id puts it before every other of that transaction.
 			if pruner == nil {
 				tx := begin(pgx.ReadCommitted)
 				if _, err := tx.Exec(ctx, `SELECT pg_current_xact_id()`); err != nil {
@@ -2716,12 +2787,17 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 				pruner = tx
 			} else if c := through(); c != nil {
 				was := held()
-				prune(pruner, *c)
+				var went *rbac.Cursor
+				if rng.IntN(2) == 0 {
+					prune(pruner, *c)
+				} else {
+					went = forge(pruner, *c)
+				}
 				if err := pruner.Commit(ctx); err != nil {
 					t.Fatal(err)
 				}
 				pruner = nil
-				pruned(was, held(), nil)
+				pruned(was, held(), went)
 			}
 		case op < 10:
 			exports = append(exports, &exporter{})
@@ -2770,6 +2846,17 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 			// Cursor had one.
 			if e := exports[rng.IntN(len(exports))]; e.begun {
 				e.cursor.Horizon, e.stale = 0, true
+			}
+		case op < 21:
+			// A prune by hand, in a transaction of its own.
+			if c := through(); c != nil {
+				was := held()
+				tx := begin(pgx.ReadCommitted)
+				went := forge(tx, *c)
+				if err := tx.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+				pruned(was, held(), went)
 			}
 		default:
 			// A prune of a release before 0020: its record, written in a statement after its delete,
@@ -2820,6 +2907,49 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 		}
 	}
 	return refusals
+}
+
+// ownersRights gives history in h's schema to a role of its own, as the README's step 2 does, and
+// returns, quoted, a role that is a member of it and no superuser, as the README's administrator's
+// role is, both dropped when the test ends; or "" where the test database's role can't make roles,
+// so that role, which owns history, acts for it.
+func ownersRights(t *testing.T, h *harness) string {
+	t.Helper()
+	ctx := t.Context()
+	var schema string
+	if err := h.pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	suffix := strings.ToLower(rand.Text())
+	owner, admin := pgx.Identifier{"rbac_history_" + suffix}.Sanitize(), pgx.Identifier{"rbac_admin_" + suffix}.Sanitize()
+	if err := pgx.BeginFunc(ctx, h.pool, func(tx pgx.Tx) error {
+		for _, sql := range []string{
+			`CREATE ROLE ` + owner, `CREATE ROLE ` + admin, `GRANT ` + owner + ` TO ` + admin,
+			`GRANT USAGE ON SCHEMA ` + pgx.Identifier{schema}.Sanitize() + ` TO ` + admin,
+			`ALTER TABLE rbac_history OWNER TO ` + owner,
+		} {
+			if _, err := tx.Exec(ctx, sql); err != nil {
+				return fmt.Errorf("%s: %w", sql, err)
+			}
+		}
+		return nil
+	}); err != nil {
+		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "42501" {
+			return ""
+		}
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx := context.WithoutCancel(ctx)
+		for _, sql := range []string{
+			`REASSIGN OWNED BY ` + owner + ` TO CURRENT_USER`, `DROP OWNED BY ` + owner + `, ` + admin, `DROP ROLE ` + admin + `, ` + owner,
+		} {
+			if _, err := h.pool.Exec(ctx, sql); err != nil {
+				t.Errorf("%s: %v", sql, err)
+			}
+		}
+	})
+	return admin
 }
 
 // A read of history stops short of the record that would bring what it read past MaxHistoryBytes,
