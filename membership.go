@@ -1697,15 +1697,6 @@ func (at positions) of(up map[string]map[string]bool, groups ...string) []int {
 	return slices.Compact(is)
 }
 
-// pick is the elements of xs at is.
-func pick[T any](xs []T, is []int) []T {
-	out := make([]T, len(is))
-	for i, j := range is {
-		out[i] = xs[j]
-	}
-	return out
-}
-
 // indexed is r with what it reaches found by key.
 func (r reach) indexed() reach {
 	r.heldOf = positionsOf(r.held, func(v revalidation) []string { return []string{v.binding.Principal.key()} })
@@ -2070,9 +2061,6 @@ func (r reach) leaving(add, remove []Member) []Member {
 	return out
 }
 
-// heldBy is what a member of group gains: the grants and eligibilities of it and those it is in.
-func (r reach) heldBy(group string) []revalidation { return pick(r.held, r.heldOf.of(r.up, group)) }
-
 // approvedBy is the eligibilities whose activations a member of one of groups approves.
 func (r reach) approvedBy(groups ...string) []revalidation {
 	var vs []revalidation
@@ -2159,62 +2147,70 @@ func (r reach) activatedBy(m Member) []Scope {
 // anything is asked about them, and never more under the locks, where stillReached refuses a group
 // holding more than was read.
 func (r reach) gainsWithin(add []Member) error {
-	type reached struct {
-		key   string
-		until int64
-	}
-	members := map[Principal]map[reached]bool{}
+	places := r.gaining(add)
+	n, gainers := 0, map[Principal]bool{}
 	// Each of held names one holder, so what a group holds is counted by the keys it reaches,
 	// without reading it: many groups in one holding many are refused for as little as one.
-	held := func(key string) int { return len(r.heldOf[key]) }
-	alone := 0
-	for _, m := range r.gaining(add) {
-		if members[m.Principal] == nil {
-			members[m.Principal] = map[reached]bool{}
+	for i, keys := range r.reached(places) {
+		for _, key := range keys {
+			n += len(r.heldOf[key])
 		}
+		if len(keys) > 0 {
+			gainers[places[i].Principal] = true
+		}
+	}
+	alone := 0
+	for _, m := range places {
 		k := 0
 		for key := range r.up[m.Group] {
-			members[m.Principal][reached{key, m.ExpiresAt.UnixMicro()}] = true
-			k += held(key)
+			k += len(r.heldOf[key])
 		}
 		alone = max(alone, k)
 	}
-	n, gainers := 0, 0
-	for _, keys := range members {
-		k := 0
-		for x := range keys {
-			k += held(x.key)
-		}
-		if k > 0 {
-			n, gainers = n+k, gainers+1
-		}
-	}
 	if n > MaxBindings && n > alone {
 		return fmt.Errorf("%w: the members a change adds gain at most %d grants and eligibilities of their groups in all, each principal's counted apart, or what one place gains alone, and these %d gain %d: add fewer at a time",
-			ErrInvalid, MaxBindings, gainers, n)
+			ErrInvalid, MaxBindings, len(gainers), n)
 	}
 	return nil
 }
 
-// gains is what each group a member of add gains a place in holds (heldBy), found once for each.
-func (r reach) gains(add []Member) map[string][]revalidation {
-	held := map[string][]revalidation{}
-	for _, m := range r.gaining(add) {
-		if _, ok := held[m.Group]; !ok {
-			held[m.Group] = r.heldBy(m.Group)
+// reached is, for each of places, members a change adds that gain a place (placed.gaining), the
+// keys of the groups it reaches that hold anything, but those reached by a place before it of its
+// principal that ends when it does: so what a principal gains through several groups, or places in
+// one, is found once for each end its places give it, however many of them reach it.
+func (r reach) reached(places []Member) [][]string {
+	type reaching struct {
+		p     Principal
+		key   string
+		until int64
+	}
+	seen := map[reaching]bool{}
+	keys := make([][]string, len(places))
+	for i, m := range places {
+		for key := range r.up[m.Group] {
+			x := reaching{m.Principal, key, m.ExpiresAt.UnixMicro()}
+			if len(r.heldOf[key]) > 0 && !seen[x] {
+				seen[x] = true
+				keys[i] = append(keys[i], key)
+			}
 		}
 	}
-	return held
+	return keys
 }
 
-// byGroup is the members of ms by their group, each group's in order: what a member gains, but for
-// its end, is its group's, so it is found once for each group, however many members it gains.
-func byGroup(ms []Member) map[string][]Member {
-	groups := map[string][]Member{}
-	for _, m := range ms {
-		groups[m.Group] = append(groups[m.Group], m)
+// gained is, for each of places, as for reached, where in held what it gains is, in order: each
+// grant and eligibility once for each principal and end, as gainsWithin counts them, so what one
+// change builds and asks the host about grows with that, not with how many of a principal's
+// groups, or places in one, reach it.
+func (r reach) gained(places []Member) [][]int {
+	held := make([][]int, len(places))
+	for i, keys := range r.reached(places) {
+		for _, key := range keys {
+			held[i] = append(held[i], r.heldOf[key]...)
+		}
+		slices.Sort(held[i])
 	}
-	return groups
+	return held
 }
 
 // locks are the principal locks of every group the change reaches: a grant, an eligibility or a
@@ -2229,28 +2225,39 @@ func (r reach) locks() []string {
 	return slices.Sorted(maps.Keys(keys))
 }
 
-// reachKey is one change to access a change to members makes: a grant or eligibility a member of
-// group gains, which the host is asked about as the member's; or, for whichever members, one whose
-// activations they approve, a deny on a scope lifted, or access on a scope left or lost to a deny
-// binding them, which mayReach checks on the scope whoever it is for, so with no group.
+// reachKey is one change to access a change to members makes: a group a member of group gains a
+// place in reaches, holder, that holds anything, and a grant or eligibility a holder holds, which
+// the host is asked about as the member's; or, for whichever members, one whose activations they
+// approve, a deny on a scope lifted, or access on a scope left or lost to a deny binding them,
+// which mayReach checks on the scope whoever it is for, so with no group.
 type reachKey struct {
-	group    string
-	approves bool
-	gained   revalidated
-	deny     Scope
-	left     Scope
+	group, holder string
+	approves      bool
+	gained        revalidated
+	deny          Scope
+	left          Scope
 }
 
 // footprint is the changes to access adding add and removing remove make, with the role of each
 // grant or eligibility; with gains, only the grants and eligibilities added members gain. Those
-// are keyed by group, read once for each, no more than the host is asked about; the rest are read
-// once for all the groups, however many reach them, and for each member only its activations.
+// are keyed by the group holding them, each once however many of the groups reach it, beside the
+// holders each group reaches, so what a member of a group gains is told apart as it would be
+// keyed by group, with no more read than the host is asked about; the rest are read once for all
+// the groups, however many reach them, and for each member only its activations.
 func (r reach) footprint(add, remove []Member, gains bool) map[reachKey]RoleDefinition {
 	f := map[reachKey]RoleDefinition{}
 	gaining := memberGroups(r.gaining(add))
+	holders := map[string]bool{}
 	for _, g := range gaining {
-		for _, v := range r.heldBy(g) {
-			f[reachKey{group: g, gained: v.key()}] = v.role
+		for k := range r.up[g] {
+			if len(r.heldOf[k]) > 0 {
+				f[reachKey{group: g, holder: k}], holders[k] = RoleDefinition{}, true
+			}
+		}
+	}
+	for k := range holders {
+		for _, i := range r.heldOf[k] {
+			f[reachKey{holder: k, gained: r.held[i].key()}] = r.held[i].role
 		}
 	}
 	if gains {
@@ -2307,10 +2314,12 @@ func (a *Authorizer) stillReached(ctx context.Context, tx pgx.Tx, tenant string,
 	for k, role := range now.footprint(add, remove, gains) {
 		switch old, ok := before[k]; {
 		case ok && !widens(old, role):
-		case k.group == "":
-			return reach{}, fmt.Errorf("%w: what the groups changed reach changed while this change waited for them; try again", ErrConflict)
-		default:
+		case k.group != "":
 			return reach{}, fmt.Errorf("%w: what group %q holds changed while this change waited for it; try again", ErrConflict, k.group)
+		case k.holder != "":
+			return reach{}, fmt.Errorf("%w: what group %q holds changed while this change waited for it; try again", ErrConflict, parsePrincipal(k.holder).ID)
+		default:
+			return reach{}, fmt.Errorf("%w: what the groups changed reach changed while this change waited for them; try again", ErrConflict)
 		}
 	}
 	return now, nil
@@ -2331,12 +2340,13 @@ func (v revalidation) as(m Member) Binding {
 // eligibility each member set adds gains, as the member's, and returns the standing of the members
 // it asked about, which the answers rest on. A member gaining one through several of its places
 // until the same end, as through two groups in one that holds it, is asked about it once, as
-// gainsWithin counts it.
+// gainsWithin counts it (gained).
 func (a *Authorizer) askMemberships(ctx context.Context, actor Subject, tenant string, set []Member, rc reach) (standing, error) {
-	gaining, held := rc.gaining(set), rc.gains(set)
+	gaining := rc.gaining(set)
+	held := rc.gained(gaining)
 	var asked []Principal
-	for _, m := range gaining {
-		if len(held[m.Group]) > 0 {
+	for i, m := range gaining {
+		if len(held[i]) > 0 {
 			asked = append(asked, m.Principal)
 		}
 	}
@@ -2351,8 +2361,9 @@ func (a *Authorizer) askMemberships(ctx context.Context, actor Subject, tenant s
 	}
 	seen := map[question]bool{}
 	var refused []error
-	for _, m := range gaining {
-		for _, v := range held[m.Group] {
+	for i, m := range gaining {
+		for _, j := range held[i] {
+			v := rc.held[j]
 			b := v.as(m)
 			q := question{m.Principal, v.key(), b.ExpiresAt.UnixMicro()}
 			if seen[q] {
@@ -2494,22 +2505,25 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 			c.grants = append(c.grants, b)
 		}
 	}
-	gaining := byGroup(rc.gaining(add))
-	groups := slices.Sorted(maps.Keys(gaining))
-	for _, g := range groups {
-		for _, v := range rc.heldBy(g) {
-			if err := stale(v); err != nil {
-				return nil, err
-			}
-			for _, m := range gaining[g] {
-				b := v.as(m)
-				if v.eligibility {
-					b = handedOn(b)
+	gaining := rc.gaining(add)
+	checked := make([]bool, len(rc.held))
+	for i, held := range rc.gained(gaining) {
+		for _, j := range held {
+			v := rc.held[j]
+			if !checked[j] {
+				if err := stale(v); err != nil {
+					return nil, err
 				}
-				grant(v.scope, b)
+				checked[j] = true
 			}
+			b := v.as(gaining[i])
+			if v.eligibility {
+				b = handedOn(b)
+			}
+			grant(v.scope, b)
 		}
 	}
+	groups := memberGroups(gaining)
 	// The rest is checked on its scope whoever it is for, so found once for all the groups, as what
 	// a group many of them are in reaches is.
 	for _, v := range rc.approvedBy(groups...) {

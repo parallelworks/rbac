@@ -5340,6 +5340,69 @@ func TestAMemberAddedToSeveralGroupsIsOneMember(t *testing.T) {
 	}
 }
 
+// A principal joining many groups that are all in one gains what that one holds once, so a change
+// gaining more than MaxBindings through it is no more than one place in it alone: what it builds,
+// and asks the host about, is that, not that for each group it joins, so it allocates about as
+// much as one member joining that group does.
+func TestAMemberJoiningManyGroupsInOneBuildsWhatOnePlaceGains(t *testing.T) {
+	var validated int
+	h := grouped(t, func(c *rbac.Config) {
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			if in.Via == rbac.ViaMembership {
+				validated++
+			}
+			return validate(ctx, q, in)
+		}
+	})
+	ctx := t.Context()
+	var groups []string
+	for i := range rbac.MaxBindings {
+		groups = append(groups, fmt.Sprintf("g%d", i))
+	}
+	h.groups(t, append(groups, "top")...)
+	// Each group is in top, which holds a role on more clusters than MaxBindings, which the manager
+	// may grant there.
+	grants := rbac.MaxBindings + 1
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+		SELECT 't1', 'top', 'group', unnest($1::text[])`, groups); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		SELECT 't1', 'cluster', 'top' || i, p, id, r FROM generate_series(1, $1::int) i,
+		  (VALUES ('group', 'top', 'cluster.login'), ('user', 'manager', 'cluster.admin')) AS g(p, id, r)`, grants); err != nil {
+		t.Fatal(err)
+	}
+	h.join(t, "ann", "bob")
+	manager := h.as(t, "manager")
+	// What a change adding add allocates, and how often it asks the host.
+	change := func(add []rbac.Member) (uint64, int) {
+		t.Helper()
+		validated = 0
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		before := m.TotalAlloc
+		if err := h.authz.ChangeMembers(ctx, manager, "t1", add, nil); err != nil {
+			t.Fatalf("adding %d members: %v", len(add), err)
+		}
+		runtime.ReadMemStats(&m)
+		return m.TotalAlloc - before, validated
+	}
+	one, asked := change([]rbac.Member{{Group: "top", Principal: identity("bob")}})
+	if asked != grants {
+		t.Fatalf("one member added to top, gaining %d grants: Config.ValidateGrant asked %d times", grants, asked)
+	}
+	var add []rbac.Member
+	for _, g := range groups {
+		add = append(add, rbac.Member{Group: g, Principal: identity("ann")})
+	}
+	many, asked := change(add)
+	if asked != grants || many > 8*one {
+		t.Fatalf("one member added to %d groups in top, gaining %d grants: Config.ValidateGrant asked %d times, and allocated %d MiB, one place in top %d MiB",
+			len(add), grants, asked, many>>20, one>>20)
+	}
+}
+
 // A change to members is checked again in its transaction: an actor that lost the power to make
 // what it makes while the host was asked about it is refused.
 func TestChangingMembersIsCheckedAgainUnderItsLocks(t *testing.T) {

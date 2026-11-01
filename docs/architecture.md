@@ -289,7 +289,9 @@ flowchart BT
   its places give it (`gainsWithin`, `askMemberships`), so a group two of them are in counts once,
   as does a group it is placed in from two sources until one end; past `MaxBindings`, a change
   gains no more than its largest place alone does, so joining several groups never multiplies what
-  one change asks. `ImportMembers`, the host's own write, which no actor's access decides, asks it
+  one change asks, nor what it builds: the grants it checks and the footprint `stillReached`
+  compares are found from what each principal gains (`gained`), and from the groups holding it,
+  not from each group that reaches them. `ImportMembers`, the host's own write, which no actor's access decides, asks it
   once for each member and each grant or eligibility the member gains, with no bound on them, so
   its cost grows with that.
 - **Expanding down** from groups to their identities, for lists and changes, is `insideSQL`. It
