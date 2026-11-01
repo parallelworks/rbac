@@ -583,11 +583,13 @@ var (
 	// serialization failure, a deadlock, as between host transactions, or a lock it couldn't take,
 	// as one a migration holds past the session's lock_timeout. It is so wherever in the call
 	// PostgreSQL refused it: in a change's transaction or the reads it makes before it, in a read, or
-	// in a statement a hook ran, where the error the hook returns wraps PostgreSQL's, alone or
-	// beside others, as errors.Join holds them, or holds it as errors.As reads it. Try it again:
-	// under WithTx, the host's whole transaction, as WithTx says. A hook's error is read whole,
-	// however many errors it holds, as errors.Is and errors.As read it: one whose tree holds itself,
-	// which they can read forever, is the host's bug, and a call can read it forever too.
+	// in a statement a hook ran, or the signer Export and Checkpoint.Sign are given, where the error
+	// it returns wraps PostgreSQL's, alone or beside others, as errors.Join holds them, or holds it
+	// as errors.As reads it. Try it again: under WithTx, the host's whole transaction, as WithTx
+	// says. A hook's error is read as errors.Is and errors.As read it, however many errors it holds,
+	// to the first race or ErrConflict in it: one whose tree holds itself, which they can read
+	// forever, is the host's bug, and a call can read it forever too, as can the host's own
+	// errors.Is of what a call returns.
 	ErrConflict = errors.New("rbac: conflict")
 	// ErrNotFound is what Config.ResourceOf returns, or wraps, for a scope the host no longer has,
 	// as a resource deleted without DeleteScopes: a change that only takes access away there, as
@@ -599,39 +601,55 @@ var (
 // conflicted makes PostgreSQL's refusals for a race match ErrConflict, keeping the error: a
 // serialization failure, a deadlock, or a lock it couldn't take, wherever err holds one.
 func conflicted(err error) error {
-	if raced(err) && !errors.Is(err, ErrConflict) {
+	if raced(err) {
 		return fmt.Errorf("%w: %w", ErrConflict, err)
 	}
 	return err
 }
 
-// raced reports whether err, or any error it wraps, is PostgreSQL's refusal for a race, as
-// errors.As reads one, through an As method too. It reads the whole tree, as a hook's error can
-// join another of PostgreSQL's before the race, or wrap both, and errors.As stops at the first,
-// and walks it as errors.As does: one that holds itself it can read forever, as errors.Is, which
-// conflicted and then the host read it with, can anyway.
+// raced reports whether err holds PostgreSQL's refusal for a race, as errors.As reads one, through
+// an As method too, before an error that matches ErrConflict, as errors.Is reads one, as conflicted
+// puts ErrConflict before the race it maps. It reads the whole tree, as a hook's error can join
+// another of PostgreSQL's before the race, or wrap both, and errors.As stops at the first; but only
+// to the first race or ErrConflict, in the order errors.Is reads it, so a tree that holds itself it
+// reads forever only where errors.Is would: where neither comes before the tree comes round again.
 func raced(err error) bool {
+	race, _ := racedFirst(err)
+	return race
+}
+
+// racedFirst is raced, and whether err holds a race or ErrConflict at all.
+func racedFirst(err error) (race, found bool) {
 	for err != nil {
+		//nolint:errorlint // each error of the tree is read, as errors.Is and errors.As read them
+		if is, ok := err.(interface{ Is(error) bool }); err == ErrConflict || ok && is.Is(ErrConflict) {
+			return false, true
+		}
 		var pg *pgconn.PgError
-		switch e := err.(type) { //nolint:errorlint // each error of the tree is read, not only the first PostgreSQL's
+		switch e := err.(type) { //nolint:errorlint // as above
 		case *pgconn.PgError:
 			pg = e
 		case interface{ As(any) bool }:
 			e.As(&pg)
 		}
 		if pg != nil && (pg.Code == "40001" || pg.Code == "40P01" || pg.Code == "55P03") {
-			return true
+			return true, true
 		}
 		switch e := err.(type) { //nolint:errorlint // as above
 		case interface{ Unwrap() error }:
 			err = e.Unwrap()
 		case interface{ Unwrap() []error }:
-			return slices.ContainsFunc(e.Unwrap(), raced)
+			for _, wrapped := range e.Unwrap() {
+				if race, found := racedFirst(wrapped); found {
+					return race, true
+				}
+			}
+			return false, false
 		default:
-			return false
+			return false, false
 		}
 	}
-	return false
+	return false, false
 }
 
 // conflicting makes *err match ErrConflict as conflicted does, for an exported call to defer, so

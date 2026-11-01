@@ -732,16 +732,18 @@ flowchart TB
   transactions, or a lock waited for past `lock_timeout`, as one a migration holds, match
   `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them, as it
   returns (`conflicting`) where it queries outside `begin`, which maps its own, wherever an error
-  holds one, beside others too, as `errors.As` reads one, reading the whole tree, however many
-  errors it holds (`raced`), so one refused before a change's transaction, as
+  holds one, beside others too, as `errors.As` reads one, reading the tree, however many errors it
+  holds, once, in the order `errors.Is` reads it, to the first race or `ErrConflict` (`raced`), so
+  one refused before a change's transaction, as
   in the reads that decide a change first, which under `WithTx` run on the host's transaction
   itself and can deadlock with a migration, in a read, or in a hook's statement, whose error a call
   returns as it is, matches too. Under `WithTx` the host runs its transaction again from its start:
   a statement refused on it outside a savepoint aborts it, and a savepoint, rolled back to, frees
-  nothing taken before it, which the race can be over. A hook's error is read only as `errors.Is`
-  and `errors.As` read it: one whose tree holds itself, as a host's type can by mistake, they can
-  read forever, and so can a call, as reading less of it would only leave it to the host's own
-  `errors.Is`, as of `ErrDenied` on what the call returns.
+  nothing taken before it, which the race can be over. The signer `Export` and `Checkpoint.Sign`
+  are given is a hook too. A hook's error is read only as `errors.Is` and `errors.As` read it: one
+  whose tree holds itself, as a host's type can by mistake, comes round again, and where it does
+  before a race or `ErrConflict`, a call reads it forever, as they do, rather than read less of it
+  and leave it to the host's own `errors.Is`, as of `ErrDenied` on what the call returns.
 - **Migrating.** `Migrate` applies each pending migration in a transaction of its own, under an
   advisory lock on the schema that holds another replica's migration back, and records it as it
   commits: so a migration takes its locks in the order it names them, the tables before history,

@@ -12,9 +12,11 @@ import (
 	"maps"
 	mathrand "math/rand/v2"
 	"os"
+	"os/exec"
 	"reflect"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -4544,6 +4546,61 @@ func (e heldAsError) As(target any) bool {
 	}
 	return ok
 }
+
+// A hook's error that holds a race before it comes round to itself, as a host's type wrapping
+// itself by mistake can, through an As method or joined beside itself, matches ErrConflict, and the
+// call returns: the error is read once, to the race, as errors.As reads it, and ErrConflict comes
+// first in what the call returns, so errors.Is finds it there. Each runs in a child process, so one
+// read forever, which never ends or overflows the stack, fails this test rather than the test
+// binary.
+func TestAHooksErrorHoldingARaceBeforeItselfConflicts(t *testing.T) {
+	if how := os.Getenv("RBAC_HOOK_ERROR_HOLDING_ITSELF"); how != "" {
+		// So that reading it forever overflows the stack in a moment rather than a gigabyte.
+		debug.SetMaxStack(64 << 20)
+		deadlock := &pgconn.PgError{Code: "40P01", Message: "deadlock detected"}
+		hookErr := map[string]error{"wrapping": &wrapsItselfError{deadlock}, "joined": &joinsItselfError{deadlock}}[how]
+		h := setup(t, func(c *rbac.Config) {
+			c.Constraints = []rbac.Constraint{{Name: "policy", Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) {
+				return false, hookErr
+			}}}
+		})
+		if err := h.authz.Authorize(t.Context(), h.as(t, "ann"), view, cluster); !errors.Is(err, rbac.ErrConflict) {
+			t.Errorf("Authorize, whose constraint's error %s itself holds a race: %v", how, err)
+		}
+		return
+	}
+	pgtest.URL(t)
+	for _, how := range []string{"wrapping", "joined"} {
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestAHooksErrorHoldingARaceBeforeItselfConflicts$")
+		cmd.Env = append(os.Environ(), "RBAC_HOOK_ERROR_HOLDING_ITSELF="+how)
+		out, err := cmd.CombinedOutput()
+		cancel()
+		if err != nil {
+			t.Errorf("%s: %v\n%.2000s", how, err, out)
+		}
+	}
+}
+
+// wrapsItselfError wraps itself, and holds PostgreSQL's error as errors.As reads it.
+type wrapsItselfError struct{ pg *pgconn.PgError }
+
+func (*wrapsItselfError) Error() string   { return "wraps itself" }
+func (e *wrapsItselfError) Unwrap() error { return e }
+
+func (e *wrapsItselfError) As(target any) bool {
+	pg, ok := target.(**pgconn.PgError)
+	if ok {
+		*pg = e.pg
+	}
+	return ok
+}
+
+// joinsItselfError joins PostgreSQL's error and itself.
+type joinsItselfError struct{ pg *pgconn.PgError }
+
+func (*joinsItselfError) Error() string     { return "joins itself" }
+func (e *joinsItselfError) Unwrap() []error { return []error{e.pg, e} }
 
 func TestPublicAccess(t *testing.T) {
 	viewer := rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
