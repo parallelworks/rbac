@@ -11,12 +11,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"maps"
 	"math"
 	"math/big"
+	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -183,9 +188,9 @@ type racedSigner struct {
 func (s racedSigner) Sign(io.Reader, []byte, crypto.SignerOpts) ([]byte, error) { return nil, s.err }
 
 // A signer's error holding PostgreSQL's refusal for a race, as of a read of its key, matches
-// ErrConflict, still wrapping the signer's own, from every call given a signer, as a hook's does:
-// reflection finds each, so one added without mapping it fails here, and History, which Export
-// reads first, doesn't map it for Export.
+// ErrConflict, still wrapping the signer's own, from every exported function or method given a
+// signer, as a hook's does: the package's source names each, so one added without mapping it fails
+// here, and History, which Export reads first, doesn't map it for Export.
 func TestASignersRaceConflicts(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -196,27 +201,143 @@ func TestASignersRaceConflicts(t *testing.T) {
 	errKey := errors.New("reading the signing key")
 	signer := racedSigner{key, fmt.Errorf("%w: %w", errKey, &pgconn.PgError{Code: "55P03", Message: "canceling statement due to lock timeout"})}
 	calls := map[string]func() error{
-		"Export": func() error {
+		"Authorizer.Export": func() error {
 			_, _, err := h.authz.Export(ctx, rbac.Checkpoint{}, 10, signer)
 			return err
 		},
-		"Sign": func() error { return second(rbac.Genesis("g").Sign(signer)) },
+		"Checkpoint.Sign": func() error { return second(rbac.Genesis("g").Sign(signer)) },
 	}
-	for _, of := range []reflect.Type{reflect.TypeFor[*rbac.Authorizer](), reflect.TypeFor[rbac.Checkpoint]()} {
-		for i := range of.NumMethod() {
-			m := of.Method(i)
-			for j := range m.Type.NumIn() {
-				if m.Type.In(j) == reflect.TypeFor[crypto.Signer]() && calls[m.Name] == nil {
-					t.Errorf("%s.%s isn't checked for a signer refused for a race", of, m.Name)
-				}
-			}
+	given := givenSigners(t)
+	for _, name := range given {
+		if calls[name] == nil {
+			t.Errorf("%s isn't checked for a signer refused for a race", name)
 		}
 	}
 	for name, call := range calls {
+		if !slices.Contains(given, name) {
+			t.Errorf("%s isn't found to be given a signer", name)
+		}
 		if err := call(); !errors.Is(err, rbac.ErrConflict) || !errors.Is(err, errKey) {
 			t.Errorf("%s, whose signer was refused for a race: %v", name, err)
 		}
 	}
+}
+
+// givenSigners names the package's exported functions, and the methods of its exported types, that
+// are given a crypto.Signer or crypto.MessageSigner by a parameter: as it is, or in a type of the
+// package's, a pointer, a list, a map, a variadic parameter, a function or an interface.
+// Reflection reads no function, and only the methods of the types it is given, so the source is
+// read.
+func givenSigners(t *testing.T) []string {
+	t.Helper()
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Each declaration with the name its file imports crypto by.
+	type declared struct {
+		of    ast.Expr
+		alias string
+	}
+	types := map[string]declared{}
+	type fn struct {
+		decl  *ast.FuncDecl
+		alias string
+	}
+	var funcs []fn
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(token.NewFileSet(), name, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatal(err)
+		}
+		alias := ""
+		for _, imp := range f.Imports {
+			if imp.Path.Value == `"crypto"` {
+				alias = "crypto"
+				if imp.Name != nil {
+					alias = imp.Name.Name
+				}
+			}
+		}
+		for _, d := range f.Decls {
+			switch d := d.(type) {
+			case *ast.GenDecl:
+				for _, s := range d.Specs {
+					if s, ok := s.(*ast.TypeSpec); ok {
+						types[s.Name.Name] = declared{s.Type, alias}
+					}
+				}
+			case *ast.FuncDecl:
+				funcs = append(funcs, fn{d, alias})
+			}
+		}
+	}
+	var holds func(e ast.Expr, alias string, seen map[string]bool) bool
+	fields := func(fl *ast.FieldList, alias string, seen map[string]bool) bool {
+		return fl != nil && slices.ContainsFunc(fl.List, func(f *ast.Field) bool { return holds(f.Type, alias, seen) })
+	}
+	holds = func(e ast.Expr, alias string, seen map[string]bool) bool {
+		switch x := e.(type) {
+		case *ast.SelectorExpr:
+			pkg, ok := x.X.(*ast.Ident)
+			return ok && alias != "" && pkg.Name == alias && (x.Sel.Name == "Signer" || x.Sel.Name == "MessageSigner")
+		case *ast.Ident:
+			d, ok := types[x.Name]
+			if !ok || seen[x.Name] {
+				return false
+			}
+			seen[x.Name] = true
+			return holds(d.of, d.alias, seen)
+		case *ast.StarExpr:
+			return holds(x.X, alias, seen)
+		case *ast.ParenExpr:
+			return holds(x.X, alias, seen)
+		case *ast.ArrayType:
+			return holds(x.Elt, alias, seen)
+		case *ast.Ellipsis:
+			return holds(x.Elt, alias, seen)
+		case *ast.MapType:
+			return holds(x.Key, alias, seen) || holds(x.Value, alias, seen)
+		case *ast.ChanType:
+			return holds(x.Value, alias, seen)
+		case *ast.StructType:
+			return fields(x.Fields, alias, seen)
+		case *ast.InterfaceType:
+			return fields(x.Methods, alias, seen)
+		case *ast.FuncType:
+			return fields(x.Params, alias, seen) || fields(x.Results, alias, seen)
+		case *ast.IndexExpr:
+			return holds(x.X, alias, seen) || holds(x.Index, alias, seen)
+		case *ast.IndexListExpr:
+			return holds(x.X, alias, seen) || slices.ContainsFunc(x.Indices, func(i ast.Expr) bool { return holds(i, alias, seen) })
+		}
+		return false
+	}
+	var names []string
+	for _, f := range funcs {
+		name := f.decl.Name.Name
+		if f.decl.Recv != nil {
+			recv := f.decl.Recv.List[0].Type
+			if star, ok := recv.(*ast.StarExpr); ok {
+				recv = star.X
+			}
+			if index, ok := recv.(*ast.IndexExpr); ok {
+				recv = index.X
+			}
+			id, ok := recv.(*ast.Ident)
+			if !ok || !id.IsExported() {
+				continue
+			}
+			name = id.Name + "." + name
+		}
+		if f.decl.Name.IsExported() && fields(f.decl.Type.Params, f.alias, map[string]bool{}) {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 // An export chains and signs history, not a session's temporary table named as it, which any role
