@@ -2,10 +2,10 @@
 -- deletes records another export, further behind, hasn't read, and keeps that one's last record
 -- where no later version supersedes it: that export went on past the records deleted with no
 -- error, and its chain vouched for history with them missing. A prune now records the last record
--- it deleted in History's order, and History refuses a cursor before the last a prune recorded after
--- it deleted. A prune's record is never pruned, so with history's ids, this index finds the prunes
--- recorded after a cursor, which are few or none, among all of history; only prunes have entries,
--- so other writes pay nothing for it.
+-- it deleted in History's order, and History refuses an export's cursor before the last that a prune
+-- recorded after it, and since the export began, deleted. A prune's record is never pruned, so with
+-- history's ids, this index finds the prunes recorded after a cursor, which are few or none, among
+-- all of history; only prunes have entries, so other writes pay nothing for it.
 --
 -- A prune's record is written in the transaction that deletes, so it follows what that deletes in
 -- History's order, and a cursor past it is past them too, only where the transaction took its id

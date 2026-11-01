@@ -377,13 +377,13 @@ is in, so no two installations in a cluster share one. A failover or a recovery 
 starts a new one, and a restore that starts none, as from a disk snapshot, loses what came after it:
 either can number again what the last one numbered past what it kept. `History` refuses a cursor
 from another generation, whose last record the database no longer holds, or after which a prune
-deleted records, as below, and history is exported again from the start, kept apart from the last
-export: an export from it would read on past what is gone. A restore that keeps a cursor's last
-record but loses what came after it, as one from a disk snapshot taken since that cursor was read,
-leaves nothing the database can tell from recovering from a crash, which loses nothing that
-committed, so its export would read on: restore by recovering to a point in time, which starts a
-new generation, or export each generation from the start again after a restore. Move history with
-physical backups and replicas; a logical dump restored into another cluster numbers its
+since its export began deleted records, as below, and history is exported again from the start, kept
+apart from the last export: an export from it would read on past what is gone. A restore that keeps
+a cursor's last record but loses what came after it, as one from a disk snapshot taken since that
+cursor was read, leaves nothing the database can tell from recovering from a crash, which loses
+nothing that committed, so its export would read on: restore by recovering to a point in time, which
+starts a new generation, or export each generation from the start again after a restore. Move
+history with physical backups and replicas; a logical dump restored into another cluster numbers its
 transactions anew.
 
 A change refused, as `ErrDenied` or `ErrInvalid`, writes nothing, so history doesn't record it:
@@ -397,8 +397,8 @@ host's `crypto.Signer`, such as a key in a key management service. Keep the reco
 checkpoint where they can't be rewritten, as write-once storage. `VerifyChain` then shows that the
 records between two checkpoints are those history held, none dropped, changed or reordered, which
 a database's superuser couldn't forge past the last checkpoint stored: `History` refuses a cursor
-after which a prune, or any delete through history's triggers, removed records, so no export reads
-on past them. A checkpoint vouches for
+after which a prune since its export began, or any delete through history's triggers, removed
+records, so no export reads on past them. A checkpoint vouches for
 the records before it, not after: an audit verifies a generation from its `Genesis` to the latest
 checkpoint kept, and checks that checkpoint's `At` is as recent as the host exports, since
 `Export` signs one on every call, even one that reads nothing, so records dropped from the end
@@ -460,15 +460,23 @@ records: call it again while it deletes as many, and each goes on from where the
 reads history that many records at a time, on a pool or a connection each in a transaction of its
 own, so however long history is, none holds exports back for long. A transaction that deletes
 records is recorded in history, with the last record it deleted in `History`'s order; one that
-deletes none changes nothing, and is not. `History` refuses a cursor before the last record a prune
-deleted, as an export from there would read on past what the prune deleted, so where several
-exports read history, `through` is the cursor of the one furthest behind. Run it on a connection of
-the administrator's role below, which has the rights of history's owner, as the application's
-hasn't, and keep what the host's audit retention requires: the federal floor is at least a year. A
-delete from history that no prune its transaction records reaches, as one by hand, is refused as
-the transaction commits, so no delete through history's triggers leaves an export reading on past
-what it removed; disabling them takes a role with the rights of history's owner, which the signed
-chain is kept against.
+deletes none changes nothing, and is not. `History` refuses the cursor of an export that began
+before a prune where it is before the last record the prune deleted, as that export would read on
+past what the prune deleted, so where several exports read history, `through` is the cursor of the
+one furthest behind. An export that began after the prune, as one from the start after a refusal
+or a failover, reads history as the prune left it and isn't refused for it. Where a cursor stands
+can't tell the two apart; `Cursor.Horizon`, the oldest transaction running as its export began,
+does, so keep it with the cursor and each checkpoint, though their signatures don't cover it. A
+cursor without it, as one kept from an earlier release, is refused for any prune recorded after it
+that deleted a record after it, and its export starts again from the start. While a transaction
+that took its id before a prune is still running, a read from the start reads nothing, as its
+export would count the prune as one since it began. Run it on a connection of the administrator's
+role below, which has the rights of history's owner, as the application's hasn't, and keep what
+the host's audit retention requires: the federal floor is at least a year. A delete from history
+that no prune its transaction records reaches, as one by hand, is refused as the transaction
+commits, so no delete through history's triggers leaves an export reading on past what it
+removed; disabling them takes a role with the rights of history's owner, which the signed chain is
+kept against.
 
 A role that owns a table can change it whatever its triggers say, and a schema's owner can drop
 any table in it. So that the application's database role can't rewrite history or write around
@@ -583,8 +591,11 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   and adds the trigger that refuses a delete from history no prune records. It locks history against
   writes before either, so every change, as each writes history, waits until it commits, though
   reads of history go on, and a transaction under way as it starts that made a change can make it
-  give way. A prune by an earlier release, which records it as this one does but without the last
-  record it deleted, still deletes, and `History` refuses a cursor before the one it went through.
+  give way. A prune by an earlier release records itself without the last record it deleted, in a
+  statement after its delete: it still deletes, but not in a transaction that sets constraints
+  immediate, and `History` refuses an export's cursor before the one it went through. The trigger
+  checks each record a prune deletes as its transaction commits, which took a window of 10,000
+  records about twice as long to delete.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
   between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows
