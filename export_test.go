@@ -176,6 +176,17 @@ func ExcludedOn(t *testing.T, a *Authorizer, actor Subject, on []Resource) (toge
 // them by a read of its own.
 func LabelValuesDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subject, tenant string, labels []Label) (together, alone [][]Permission) {
 	t.Helper()
+	together, alone, _, _ = HoldingDecided(t, ctx, a, actor, tenant, labels)
+	return together, alone
+}
+
+// HoldingDecided is LabelValuesDecided, and then all that actor holds: its label values and powers
+// to release, and "excluding <dimension>" for each exclusive dimension it holds none of. Decided by
+// the same read once the labels are, as a change checking them and then whether the actor's values
+// satisfy every label decides them (clearsAll); and alone, by a read of its own, as Holding decides
+// them.
+func HoldingDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subject, tenant string, labels []Label) (together, alone [][]Permission, all, whole []string) {
+	t.Helper()
 	a = a.still()
 	v, err := a.valuesOn(ctx, a.db, tenant, actor)
 	if err != nil {
@@ -190,6 +201,23 @@ func LabelValuesDecided(t *testing.T, ctx context.Context, a *Authorizer, actor 
 		}
 		return held
 	}
+	everything := func(h Holding) []string {
+		var held []string
+		for _, p := range h.Values() {
+			held = append(held, string(p))
+		}
+		for _, dim := range slices.Sorted(maps.Keys(h.releases)) {
+			if h.releases[dim] {
+				held = append(held, string(ReleasePermission(dim)))
+			}
+		}
+		for _, dim := range slices.Sorted(maps.Keys(h.excluded)) {
+			if h.excluded[dim] {
+				held = append(held, "excluding "+dim)
+			}
+		}
+		return held
+	}
 	c := a.constrain(ctx, actor, tenantResource(tenant))
 	for _, l := range labels {
 		h, err := c.decidedBy(ctx, a.db, v, a.askedBy(l))
@@ -198,6 +226,11 @@ func LabelValuesDecided(t *testing.T, ctx context.Context, a *Authorizer, actor 
 		}
 		together = append(together, asked(h, l))
 	}
+	h, err := c.decidedBy(ctx, a.db, v, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all = everything(h)
 	for _, l := range labels {
 		h, _, err := a.holdingFor(ctx, tenant, actor, &valuesRead{held: v.held, ds: v.ds, roles: v.roles}, l)
 		if err != nil {
@@ -205,7 +238,11 @@ func LabelValuesDecided(t *testing.T, ctx context.Context, a *Authorizer, actor 
 		}
 		alone = append(alone, asked(h, l))
 	}
-	return together, alone
+	h, _, err = a.holdingOf(ctx, tenant, actor, &valuesRead{held: v.held, ds: v.ds, roles: v.roles})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return together, alone, all, everything(h)
 }
 
 // GrantDecision is what deciding a grant found: the permission the actor lacks to make it, ""

@@ -434,6 +434,39 @@ func (a *Authorizer) valuesOn(ctx context.Context, q DB, tenant string, s Subjec
 	return &valuesRead{held: held, ds: ds, roles: roles}, nil
 }
 
+// labeling is v of what gives label values and powers to release alone: its grants of roles that
+// give any, each role giving only those but privileged and public as it is whole, its permissions
+// read once however many grants name it. A holding decides by nothing else, so it decides the same
+// by either, and a change deciding the values of many labels by one read walks only these for each,
+// however many grants of other roles, or other permissions of theirs, its actor holds.
+func (a *Authorizer) labeling(v *valuesRead) *valuesRead {
+	l := &valuesRead{ds: v.ds, roles: book{builtin: map[Role]RoleDefinition{}, custom: map[Role]RoleDefinition{}}}
+	gives := map[Role]bool{}
+	for _, h := range v.held {
+		g, read := gives[h.Role]
+		if !read {
+			def, ok := v.roles.role(h.Role)
+			if ok {
+				readingEntries(len(def.Permissions))
+				def.Permissions = slices.DeleteFunc(slices.Clone(def.Permissions), func(p Permission) bool { return !a.labelPermission(p) })
+			}
+			g = ok && len(def.Permissions) > 0
+			gives[h.Role] = g
+			switch _, builtin := v.roles.builtin[h.Role]; {
+			case !g:
+			case builtin:
+				l.roles.builtin[h.Role] = def
+			default:
+				l.roles.custom[h.Role] = def
+			}
+		}
+		if g {
+			l.held = append(l.held, h)
+		}
+	}
+	return l
+}
+
 // holdingFrom is holdingOn deciding by v, read with s's other grants, reading on q the conditions
 // not read with it, of the values and powers to release only keeps, which keeps no other
 // permission, sharing shared, where not nil, with other decisions by v on the same request (runs).

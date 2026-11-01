@@ -964,12 +964,14 @@ func (c *constrained) holdingFor(ctx context.Context, q DB, v *valuesRead, l Lab
 
 // decidedHolding is a holding decided by a read through a constrained, of the values in asked, or
 // of every one where all, and what its decisions came to, which a decision of more values by the
-// read shares (runs): each is of the change's one request, by the same grants and denies.
+// read shares (runs): each is of the change's one request, by the same grants and denies. by is the
+// read of what gives values alone (labeling), which the first decision makes and each walks.
 type decidedHolding struct {
 	h     Holding
 	asked map[Permission]bool
 	all   bool
 	runs  *runs
+	by    *valuesRead
 }
 
 // covers reports whether d decided every value in asked, or where nil, every one.
@@ -987,24 +989,29 @@ func (d *decidedHolding) covers(asked map[Permission]bool) bool {
 
 // decidedBy is the actor's holding decided through c by v of the values in asked, or of every one
 // where nil, deciding each value once for each read however many labels a change checks by it,
-// and a condition that doesn't read the action once for all of them (runs).
+// and a condition that doesn't read the action once for all of them (runs). Each walks only the
+// grants giving values, and of their roles only the values (labeling), so a label costs what they
+// give, not every permission of every grant the actor holds on the tenant.
 func (c *constrained) decidedBy(ctx context.Context, q DB, v *valuesRead, asked map[Permission]bool) (Holding, error) {
 	d := v.decided[c]
 	if d != nil && d.covers(asked) {
 		return d.h, nil
 	}
-	shared := &runs{}
+	var shared *runs
+	var by *valuesRead
 	if d != nil {
-		shared = d.runs
+		shared, by = d.runs, d.by
+	} else {
+		shared, by = &runs{}, c.a.labeling(v)
 	}
-	h, _, err := c.a.holdingFrom(ctx, q, c.actor, c, v, func(p Permission) bool {
-		return c.a.labelPermission(p) && (asked == nil || asked[p]) && (d == nil || !d.asked[p])
+	h, _, err := c.a.holdingFrom(ctx, q, c.actor, c, by, func(p Permission) bool {
+		return (asked == nil || asked[p]) && (d == nil || !d.asked[p]) && c.a.labelPermission(p)
 	}, shared)
 	if err != nil {
 		return Holding{}, err
 	}
 	if d == nil {
-		d = &decidedHolding{h: h, asked: map[Permission]bool{}, runs: shared}
+		d = &decidedHolding{h: h, asked: map[Permission]bool{}, runs: shared, by: by}
 		if v.decided == nil {
 			v.decided = map[*constrained]*decidedHolding{}
 		}
