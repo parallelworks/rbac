@@ -57,9 +57,10 @@ import (
 // however it is passed. A value CEL decodes or merges whole to read, JSON text (json.RawMessage), a
 // JSON number (json.Number), a packed message (anypb.Any), or a message of a dynamic type or of a
 // host's type embedding one, is converted once for each check, the first time a condition reads
-// it, at about what decoding it cost the host, rather than each time; such a message reaching one
-// message twice, itself included, fails, and so does a packed message packing another, which CEL
-// unpacks in turn, copying all each packs. So does a value CEL can't read, as a struct, which it
+// it, at about what decoding it cost the host, rather than each time, though messages reaching the
+// same message, or JSON texts sharing their bytes, are each converted whole; such a message
+// reaching one message twice, itself included, fails, and so does a packed message packing another,
+// which CEL unpacks in turn, copying all each packs. So does a value CEL can't read, as a struct, which it
 // would write out whole, and an array of more than 1 KiB of bytes, or a list or a map holding
 // arrays or structs of more than 1 KiB each, which it copies whole each time a condition reads it.
 // A value of a host's own type CEL reads as one of its own, as a double or a string, is read as
