@@ -82,21 +82,26 @@ if err := authz.Authorize(ctx, subject, "cluster:login", cluster); err != nil {
 Store each resource's `authz.Path(resource)`, its own key first and then its containers' and the
 tenant's, in a `text[]` column with a GIN index. `Filter` returns a condition for the host's own
 query, which reads the grants in the same statement as the rows, so sorting and pagination work and
-nothing changes between deciding and reading. A condition holds for the query it was built for: it
-fixes the time, the subject's label holding and what the constraints answered, so build one for each
-query. It compares the tenant and keys byte for byte, as `Authorize` does, whatever the columns'
-collation, in which their indexes still serve. The subject's grants are matched through the path's
-index, whose cost for each row it finds grows with their number. Past a few on resources of the
-listed type, or past 128 on containers and the tenant, as one holding a grant on everything it
+nothing changes between deciding and reading. It keeps only the rows whose own key is of the listed
+type, so one table can hold resources of several types, where a grant on a container reaches every
+row under it, of any type. The planner can't count a type's rows by their paths, and counts the
+condition as keeping as many as of a table of one type: listing a type from a table of several, test
+a column of the type too, whose statistics count them. A condition holds for the query it was built
+for: it fixes the time, the subject's label holding and what the constraints answered, so build one
+for each query. It compares the tenant and keys byte for byte, as `Authorize` does, whatever the
+columns' collation, in which their indexes still serve. The subject's grants are matched through the
+path's index, whose cost for each row it finds grows with their number. Past a few on resources of
+the listed type, or past 128 on containers and the tenant, as one holding a grant on everything it
 created does, each of a row's keys is looked up among them instead, so a row costs a few lookups
 however many it holds; no index serves that, so the query then reads every row of the tenant its
 other conditions keep. Denies, on resources and containers alike, are looked up so whatever their
-number, and of those naming the subject or its groups only theirs are read; denies naming the
-public or the tenant's members are read by type while the listed types hold few denies, or as of
-a time while history holds few versions of denies there, deleted ones too, and otherwise every one
-in the tenant is. `Reachable` returns the same as scopes, for resources kept in another store.
-Both search one tenant, and count only unconditional grants: `Reach.Conditional` names the scopes
-conditional ones reach, to check one by one.
+number, and of those naming the subject or its groups only theirs are read; denies naming the public
+or the tenant's members are read by type while the listed types hold few denies, or as of a time
+while history holds few versions of denies there, deleted ones too, and otherwise every one in the
+tenant is. `Reachable` returns the same as scopes, for resources kept in another store, and of the
+listed type alone: a scope reaches everything under it, so a store holding several types keeps to
+that type itself. Both search one tenant, and count only unconditional grants: `Reach.Conditional`
+names the scopes conditional ones reach, to check one by one.
 
 ## Policies
 
