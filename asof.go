@@ -83,8 +83,9 @@ func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read
 		return fmt.Errorf("%w: a read as of a time has a read to run", ErrInvalid)
 	}
 	// The time is every statement's clock, which pgx would send from year 294,000 or so on as
-	// another, one the read would answer as of, or one PostgreSQL refuses.
-	if at.Before(earliest) || at.After(latest) {
+	// another, one the read would answer as of, or one PostgreSQL refuses. It sends it to the
+	// microsecond, rounded down, as the package stores a time, so the bounds are those of that.
+	if s := stored(at); s.Before(earliest) || s.After(latest) {
 		return fmt.Errorf("%w: a read as of a time is of one from 4714 BC to 9999-12-30", ErrInvalid)
 	}
 	var tx pgx.Tx

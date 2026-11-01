@@ -511,7 +511,13 @@ sequenceDiagram
   role is read there as one to a principal named one by one (`widenedTo.reaches`): a catalog
   change that has the role no longer be privileged gives them what it gives, what the redefinition
   added too, and asks no one. A scope read as stored, as the host no longer has it, that the change
-  comes to give more on while it waits refuses it with `ErrConflict`.
+  comes to give more on while it waits refuses it with `ErrConflict`. A role's lists are compared
+  sorted and without repeats (`canonical`), as one written around the package can hold them in any
+  order, so renaming it is no redefinition, and setting a role, deny or eligibility again as it is
+  stored changes nothing (`canonicalSQL`). A role lists in `GrantableRoles` only roles one of its
+  `<type>:grant` permissions, on a type it is for, lets its holders grant (`lets`), so `holdsRole`
+  checks the actor's power to grant each. It keeps a listing that already hands nothing on as
+  stored, as once the role listed was narrowed, so renaming it needs only the power to define it.
 - **Eligibilities.** `SetEligibility` lets a principal `Activate` a role for a while, perhaps
   only with approvers or a `requires` condition. An activation is a grant that ends no later than
   its eligibility expires, or its holder's membership or place in the group the eligibility names
@@ -703,12 +709,14 @@ flowchart TB
 - **Races** PostgreSQL refuses, such as a serialization failure, a deadlock between host
   transactions, or a lock waited for past `lock_timeout`, as one a migration holds, match
   `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them, as it
-  returns (`conflicting`) where it queries outside `begin`, which maps its own, so one refused
-  before a change's transaction, as in the reads that decide a change first, which under `WithTx`
-  run on the host's transaction itself and can deadlock with a migration, in a read, or in a hook's
-  statement, whose error a call returns as it is, matches too. Under `WithTx` the host runs its
-  transaction again from its start: a statement refused on it outside a savepoint aborts it, and a
-  savepoint, rolled back to, frees nothing taken before it, which the race can be over.
+  returns (`conflicting`) where it queries outside `begin`, which maps its own, wherever an error
+  holds one, beside others too, as `errors.As` reads one, reading at most a thousand of its errors,
+  as one that wraps itself has no end (`raced`), so one refused before a change's transaction, as
+  in the reads that decide a change first, which under `WithTx` run on the host's transaction
+  itself and can deadlock with a migration, in a read, or in a hook's statement, whose error a call
+  returns as it is, matches too. Under `WithTx` the host runs its transaction again from its start:
+  a statement refused on it outside a savepoint aborts it, and a savepoint, rolled back to, frees
+  nothing taken before it, which the race can be over.
 - **Migrating.** `Migrate` applies each pending migration in a transaction of its own, under an
   advisory lock on the schema that holds another replica's migration back, and records it as it
   commits: so a migration takes its locks in the order it names them, the tables before history,
@@ -815,7 +823,8 @@ flowchart LR
   the label dimensions as they are now. Making the views takes a transaction id, which holds every
   export in the cluster back while the read runs. Every statement is planned for its arguments and
   runs without JIT, which such plans over history cost past `jit_above_cost` for any subject. It
-  takes a time from PostgreSQL's earliest to 9999-12-30, as pgx sends a later one as another.
+  takes a time from PostgreSQL's earliest to 9999-12-30, to the microsecond, rounded down, as pgx
+  sends it, and a later one as another.
   Each statement reads history by the rows it names, through
   history's indexes, as a search the custom roles its grants name, by their ids, and its principals'
   grants by principal and type, which history's index of a principal's versions holds beside the

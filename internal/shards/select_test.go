@@ -106,6 +106,51 @@ func TestReadTimingsTakesEachTopLevelTestsLongestRun(t *testing.T) {
 	}
 }
 
+// go test -list names a test by go test's own rule, of any letters, digits and underscores, and a
+// line of its output that names neither a test nor its package fails the read: a test of a name the
+// rule passed over would run in no shard, unseen.
+func TestReadListTakesEveryNameGoTestGivesATest(t *testing.T) {
+	list := func(lines ...string) string {
+		output := []string{`# example.com/p`, `{"Action":"build-output","ImportPath":"example.com/p","Output":"# example.com/p\n"}`}
+		for _, line := range lines {
+			output = append(output, fmt.Sprintf(`{"Action":"output","Package":"example.com/p","Output":%q}`, line+"\n"))
+		}
+		return strings.Join(output, "\n")
+	}
+	names := []string{"Test", "TestA", "Test_a", "TestCafé", "TestΣum", "Test٣", "FuzzΔ", "Example", "ExampleA_ünicode"}
+	listed, err := readList(strings.NewReader(list(slices.Concat(names, []string{
+		"Benchmark", "BenchmarkΣ", "ok  \texample.com/p\t0.01s", "?   \texample.com/q\t[no test files]", "program not built with -cover", "",
+		"\texample.com/p\t\tcoverage: 0.0% of statements", "\texample.com/p\t\t",
+	})...)))
+	want := map[test]bool{}
+	for _, name := range names {
+		want[test{"example.com/p", name}] = true
+	}
+	if err != nil || !maps.Equal(listed, want) {
+		t.Errorf("readList = %v, %v, want %v", listed, err, want)
+	}
+	for _, line := range []string{"hello from TestMain", "Testé", "Test-a", "FAIL\texample.com/p [build failed]"} {
+		if _, err := readList(strings.NewReader(list("TestA", line))); err == nil {
+			t.Errorf("readList read a list printing %q", line)
+		}
+	}
+}
+
+// Built with -cover, as make test builds the tests, go test -list prints of a package without test
+// files how much of it is covered, or only its name where it has no statements, and of one with
+// tests but no statements that it isn't built with -cover: readList reads them as the package's.
+func TestReadListTakesWhatGoTestListsOfEachPackageBuiltWithCover(t *testing.T) {
+	out, err := exec.CommandContext(t.Context(), "go", "test", "-json", "-list", ".", "-cover",
+		"./testdata/aggregate", "./testdata/untested", "./testdata/nostatements").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed, err := readList(bytes.NewReader(out))
+	if err != nil || len(listed) != 6 || !listed[test{"github.com/parallelworks/rbac/internal/shards/testdata/aggregate", "TestΣum"}] {
+		t.Errorf("readList = %v, %v, of:\n%s", listed, err, out)
+	}
+}
+
 // A pattern selects the top-level tests it names, and no other, however one's name begins or ends
 // another's.
 func TestAPatternSelectsTheTestsItNamesAlone(t *testing.T) {
@@ -155,7 +200,7 @@ func TestEachShardRunsItsTestsWholeAndNoOthers(t *testing.T) {
 	if len(problems) > 0 {
 		t.Fatalf("the shards ran: %q", problems)
 	}
-	const want = "the 3 shards ran each of the 5 tests go test -list names once"
+	const want = "the 3 shards ran each of the 6 tests go test -list names once"
 	if !strings.Contains(summary, want) {
 		t.Errorf("summary %q, want %q", summary, want)
 	}
