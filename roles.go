@@ -1132,7 +1132,7 @@ func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authorit
 		}
 		r, err := a.resourceOf(ctx, tenant, s)
 		switch {
-		case !scopes.widened[s] && scopes.listed[s] == nil && errors.Is(err, ErrNotFound):
+		case !scopes.widened[s] && scopes.listed[s] == nil && matches(err, ErrNotFound):
 			r = Resource{Tenant: tenant, Type: s.Type, ID: s.ID}
 			if reach.gone == nil {
 				reach.gone = map[Scope]bool{}

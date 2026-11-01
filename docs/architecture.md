@@ -736,17 +736,19 @@ flowchart TB
   `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them, as it
   returns (`conflicting`) where it queries outside `begin`, which maps its own, wherever an error
   holds one, beside others too, as `errors.As` reads one, reading the tree, however many errors it
-  holds, once, in the order `errors.Is` reads it, to the first race or `ErrConflict` (`raced`), so
-  one refused before a change's transaction, as
-  in the reads that decide a change first, which under `WithTx` run on the host's transaction
-  itself and can deadlock with a migration, in a read, or in a hook's statement, whose error a call
-  returns as it is, matches too. Under `WithTx` the host runs its transaction again from its start:
-  a statement refused on it outside a savepoint aborts it, and a savepoint, rolled back to, frees
-  nothing taken before it, which the race can be over. The signer `Export` and `Checkpoint.Sign`
-  are given is a hook too. A hook's error is read only as `errors.Is` and `errors.As` read it: one
-  whose tree holds itself, as a host's type can by mistake, comes round again, and where it does
-  before a race or `ErrConflict`, a call reads it forever, as they do, rather than read less of it
-  and leave it to the host's own `errors.Is`, as of `ErrDenied` on what the call returns.
+  holds, in the order `errors.Is` reads it, to the first race or `ErrConflict` (`conflicted`), so
+  one refused before a change's transaction, as in the reads that decide a change first, which under
+  `WithTx` run on the host's transaction itself and can deadlock with a migration, in a read, or in
+  a hook's statement, whose error a call returns as it is, matches too. Under `WithTx` the host runs
+  its transaction again from its start: a statement refused on it outside a savepoint aborts it, and
+  a savepoint, rolled back to, frees nothing taken before it, which the race can be over. The signer
+  `Export` and `Checkpoint.Sign` are given is a hook too. Wherever a call reads a hook's error, for
+  a race, for `ErrInvalid` or `ErrDenied`, as it reads `ValidateGrant`'s answer and decides what
+  `OnRefused` is told of, or for `ErrNotFound`, it reads the tree in the order `errors.Is` and
+  `errors.As` read it, each error it can compare once (`holds`): one whose tree holds itself, as a
+  host's type can by mistake, comes round again, which they read forever, so a call passes over what
+  it has read and returns, though the host's own `errors.Is` of what it returns can still read it
+  forever.
 - **Migrating.** `Migrate` applies each pending migration in a transaction of its own, under an
   advisory lock on the schema that holds another replica's migration back, and records it as it
   commits: so a migration takes its locks in the order it names them, the tables before history,

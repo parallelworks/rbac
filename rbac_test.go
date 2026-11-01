@@ -4547,42 +4547,132 @@ func (e heldAsError) As(target any) bool {
 	return ok
 }
 
-// A hook's error that holds a race before it comes round to itself, as a host's type wrapping
-// itself by mistake can, through an As method or joined beside itself, matches ErrConflict, and the
-// call returns: the error is read once, to the race, as errors.As reads it, and ErrConflict comes
-// first in what the call returns, so errors.Is finds it there. Each runs in a child process, so one
-// read forever, which never ends or overflows the stack, fails this test rather than the test
-// binary.
-func TestAHooksErrorHoldingARaceBeforeItselfConflicts(t *testing.T) {
+// A hook's error whose tree holds itself, as a host's type wrapping itself by mistake can, through
+// Unwrap or joined beside itself, is read once, each of its errors once, wherever a call reads it,
+// and the call returns: matching ErrConflict where it holds a race, as errors.As reads one,
+// ErrConflict first in what the call returns, so errors.Is finds it there; and a change ValidateGrant
+// refuses beside it is refused as invalid, which OnRefused is told of, but of no other. Each kind of
+// error runs in a child process, so one read forever, or until the stack overflows, which kills the
+// process, fails this test rather than the test binary, and each call there is given a while.
+func TestAHooksErrorHoldingItselfIsReadOnce(t *testing.T) {
 	if how := os.Getenv("RBAC_HOOK_ERROR_HOLDING_ITSELF"); how != "" {
 		// So that reading it forever overflows the stack in a moment rather than a gigabyte.
 		debug.SetMaxStack(64 << 20)
-		deadlock := &pgconn.PgError{Code: "40P01", Message: "deadlock detected"}
-		hookErr := map[string]error{"wrapping": &wrapsItselfError{deadlock}, "joined": &joinsItselfError{deadlock}}[how]
-		h := setup(t, func(c *rbac.Config) {
-			c.Constraints = []rbac.Constraint{{Name: "policy", Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) {
-				return false, hookErr
-			}}}
-		})
-		if err := h.authz.Authorize(t.Context(), h.as(t, "ann"), view, cluster); !errors.Is(err, rbac.ErrConflict) {
-			t.Errorf("Authorize, whose constraint's error %s itself holds a race: %v", how, err)
+		var pg *pgconn.PgError
+		race := strings.HasSuffix(how, "a race")
+		if race {
+			pg = &pgconn.PgError{Code: "40P01", Message: "deadlock detected"}
 		}
+		hookErr := error(&wrapsItselfError{pg})
+		if strings.HasPrefix(how, "joining") {
+			hookErr = &joinsItselfError{pg}
+		}
+		down, lost := rbac.Scope{Type: "cluster", ID: "down"}, rbac.Scope{Type: rbac.GroupScope, ID: "lost"}
+		manager := rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}
+		var constraintErr, validateErr error
+		refusals := 0
+		h := labeled(t, func(c *rbac.Config) {
+			c.Catalog = append(slices.Clone(c.Catalog), groupMembers, manager)
+			validate := c.ValidateGrant
+			c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+				return cmp.Or(validateErr, validate(ctx, q, in))
+			}
+			c.Constraints = append(c.Constraints, rbac.Constraint{Name: "policy", Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) {
+				return false, constraintErr
+			}})
+			resourceOf := c.ResourceOf
+			c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+				if s == down || s == lost {
+					return rbac.Resource{}, hookErr
+				}
+				return resourceOf(ctx, tenant, s)
+			}
+			c.OnRefused = func(context.Context, rbac.Refusal) { refusals++ }
+		})
+		ctx := t.Context()
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}')`); err != nil {
+			t.Fatal(err)
+		}
+		h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "tenant.roles", rbac.User, "admin"),
+			grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "cluster.sudo", rbac.User, "admin"),
+			grant(down, "cluster.login", rbac.Group, "ops"), grant(down, "custom.viewer", rbac.User, "u"))
+		h.join(t, "u")
+		h.groups(t, "lost")
+		if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "ops", Principal: identity("u")}, {Group: "lost", Principal: identity("u")}}); err != nil {
+			t.Fatal(err)
+		}
+		admin, ann, owner := h.as(t, "admin"), h.as(t, "ann"), h.as(t, "owner")
+		h.hold(t, "admin", "level:high")
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		apply := func() error {
+			return h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: ann.Principal}}})
+		}
+		// Each call's error is read by the test in the while it is given, as a call that returns it
+		// unmapped would have errors.Is read it forever.
+		read := func(name string, call func() error, refused bool) {
+			t.Log(name)
+			before := refusals
+			type got struct {
+				err                 error
+				conflicted, invalid bool
+			}
+			done := make(chan got, 1)
+			go func() {
+				err := call()
+				g := got{err: err}
+				if race {
+					g.conflicted = errors.Is(err, rbac.ErrConflict)
+				}
+				if refused {
+					g.invalid = errors.Is(err, rbac.ErrInvalid)
+				}
+				done <- g
+			}()
+			select {
+			case g := <-done:
+				if g.err == nil || g.conflicted != race || g.invalid != refused || (refusals > before) != refused {
+					t.Errorf("%s, whose hook's error is %s itself: %v", name, how, g.err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Errorf("%s, whose hook's error is %s itself, read it forever", name, how)
+			}
+			constraintErr, validateErr = nil, nil
+		}
+		constraintErr = hookErr
+		read("Authorize, through a constraint", func() error { return h.authz.Authorize(ctx, ann, view, cluster) }, false)
+		constraintErr = hookErr
+		read("Apply, through a constraint", apply, false)
+		validateErr = hookErr
+		read("Apply, through ValidateGrant", apply, false)
+		validateErr = errors.Join(rbac.ErrInvalid, hookErr)
+		read("Apply, refused by ValidateGrant", apply, true)
+		read("ChangeMembers, reading the group", func() error {
+			return h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "lost", Principal: identity("u")}})
+		}, false)
+		read("ChangeMembers, reading a scope the group has access on", func() error {
+			return h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "ops", Principal: identity("u")}})
+		}, false)
+		read("DeleteRole, reading a scope it is granted on", func() error { return h.authz.DeleteRole(ctx, admin, "t1", "custom.viewer") }, false)
+		read("Checkpoint.Sign, through the signer", func() error { return second(rbac.Genesis("g").Sign(racedSigner{key, hookErr})) }, false)
 		return
 	}
 	pgtest.URL(t)
-	for _, how := range []string{"wrapping", "joined"} {
-		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestAHooksErrorHoldingARaceBeforeItselfConflicts$")
+	for _, how := range []string{"wrapping a race", "joining a race", "wrapping", "joining"} {
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestAHooksErrorHoldingItselfIsReadOnce$", "-test.v")
 		cmd.Env = append(os.Environ(), "RBAC_HOOK_ERROR_HOLDING_ITSELF="+how)
 		out, err := cmd.CombinedOutput()
 		cancel()
 		if err != nil {
-			t.Errorf("%s: %v\n%.2000s", how, err, out)
+			t.Errorf("%s: %v\n%.4000s", how, err, out)
 		}
 	}
 }
 
-// wrapsItselfError wraps itself, and holds PostgreSQL's error as errors.As reads it.
+// wrapsItselfError wraps itself, and holds PostgreSQL's error as errors.As reads it, if any.
 type wrapsItselfError struct{ pg *pgconn.PgError }
 
 func (*wrapsItselfError) Error() string   { return "wraps itself" }
@@ -4590,17 +4680,24 @@ func (e *wrapsItselfError) Unwrap() error { return e }
 
 func (e *wrapsItselfError) As(target any) bool {
 	pg, ok := target.(**pgconn.PgError)
-	if ok {
+	if ok && e.pg != nil {
 		*pg = e.pg
+		return true
 	}
-	return ok
+	return false
 }
 
-// joinsItselfError joins PostgreSQL's error and itself.
+// joinsItselfError joins PostgreSQL's error, if any, and itself.
 type joinsItselfError struct{ pg *pgconn.PgError }
 
-func (*joinsItselfError) Error() string     { return "joins itself" }
-func (e *joinsItselfError) Unwrap() []error { return []error{e.pg, e} }
+func (*joinsItselfError) Error() string { return "joins itself" }
+
+func (e *joinsItselfError) Unwrap() []error {
+	if e.pg == nil {
+		return []error{e}
+	}
+	return []error{e.pg, e}
+}
 
 func TestPublicAccess(t *testing.T) {
 	viewer := rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}

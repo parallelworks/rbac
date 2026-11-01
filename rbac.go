@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -586,10 +587,11 @@ var (
 	// in a statement a hook ran, or the signer Export and Checkpoint.Sign are given, where the error
 	// it returns wraps PostgreSQL's, alone or beside others, as errors.Join holds them, or holds it
 	// as errors.As reads it. Try it again: under WithTx, the host's whole transaction, as WithTx
-	// says. A hook's error is read as errors.Is and errors.As read it, however many errors it holds,
-	// to the first race or ErrConflict in it: one whose tree holds itself, which they can read
-	// forever, is the host's bug, and a call can read it forever too, as can the host's own
-	// errors.Is of what a call returns.
+	// says. A hook's error is read in the order errors.Is and errors.As read it, however many errors
+	// it holds, to the first race or ErrConflict in it, and each of its errors once: one whose tree
+	// holds itself, as a host's type wrapping itself by mistake can, which they read forever, a call
+	// reads through once and returns, though the host's own errors.Is of what it returns, or of what
+	// Config.OnRefused is told, can still read it forever.
 	ErrConflict = errors.New("rbac: conflict")
 	// ErrNotFound is what Config.ResourceOf returns, or wraps, for a scope the host no longer has,
 	// as a resource deleted without DeleteScopes: a change that only takes access away there, as
@@ -599,57 +601,98 @@ var (
 )
 
 // conflicted makes PostgreSQL's refusals for a race match ErrConflict, keeping the error: a
-// serialization failure, a deadlock, or a lock it couldn't take, wherever err holds one.
+// serialization failure, a deadlock, or a lock it couldn't take, wherever err holds one, as
+// errors.As reads one, through an As method too. It reads the whole tree, as a hook's error can
+// join another of PostgreSQL's before the race, or wrap both, and errors.As stops at the first; but
+// only to the first race or error matching ErrConflict, as holds reads it, and maps none where that
+// matches ErrConflict, as conflicted puts it before the race it maps and errors.Is then finds it,
+// unless it comes only past an error read before, where errors.Is would read the tree round again.
 func conflicted(err error) error {
-	if raced(err) {
+	if err == nil {
+		return nil
+	}
+	var race, conflict bool
+	_, again := holds(err, func(e error) bool {
+		conflict = is(e, ErrConflict)
+		race = !conflict && raced(e)
+		return conflict || race
+	})
+	if race || conflict && again {
 		return fmt.Errorf("%w: %w", ErrConflict, err)
 	}
 	return err
 }
 
-// raced reports whether err holds PostgreSQL's refusal for a race, as errors.As reads one, through
-// an As method too, before an error that matches ErrConflict, as errors.Is reads one, as conflicted
-// puts ErrConflict before the race it maps. It reads the whole tree, as a hook's error can join
-// another of PostgreSQL's before the race, or wrap both, and errors.As stops at the first; but only
-// to the first race or ErrConflict, in the order errors.Is reads it, so a tree that holds itself it
-// reads forever only where errors.Is would: where neither comes before the tree comes round again.
-func raced(err error) bool {
-	race, _ := racedFirst(err)
-	return race
+// raced reports whether e itself is PostgreSQL's refusal for a race, or gives one through its As
+// method, as errors.As reads each error of a tree.
+func raced(e error) bool {
+	var pg *pgconn.PgError
+	switch x := e.(type) { //nolint:errorlint // one error of a tree, which holds reads
+	case *pgconn.PgError:
+		pg = x
+	case interface{ As(any) bool }:
+		x.As(&pg)
+	}
+	return pg != nil && (pg.Code == "40001" || pg.Code == "40P01" || pg.Code == "55P03")
 }
 
-// racedFirst is raced, and whether err holds a race or ErrConflict at all.
-func racedFirst(err error) (race, found bool) {
-	for err != nil {
-		//nolint:errorlint // each error of the tree is read, as errors.Is and errors.As read them
-		if is, ok := err.(interface{ Is(error) bool }); err == ErrConflict || ok && is.Is(ErrConflict) {
-			return false, true
+// matches reports whether err matches target, as errors.Is reports it, reading err's tree as holds
+// does: a hook's error, or one of the package's holding it.
+func matches(err, target error) bool {
+	found, _ := holds(err, func(e error) bool { return is(e, target) })
+	return found
+}
+
+// is reports whether e itself matches target, as errors.Is tests each error of a tree.
+func is(e, target error) bool {
+	if e == target { //nolint:errorlint // one error of a tree, which holds reads
+		return true
+	}
+	x, ok := e.(interface{ Is(error) bool })
+	return ok && x.Is(target)
+}
+
+// holds reports whether found is true of an error of err's tree, read in the order errors.Is and
+// errors.As read it, each error before those it wraps, through Unwrap() error, or each of
+// Unwrap() []error in turn, to the first found is true of; and whether it passed over an error it
+// had read before then. A host's type can hold itself by mistake, as one whose Unwrap returns it,
+// whose tree errors.Is reads forever, so holds reads each error it can compare once, however many
+// the tree holds. One it can't compare, as a value holding a slice, it reads each time the tree
+// comes round to it, and a tree that never ends, as one whose Unwrap makes another error each
+// time, forever, as errors.Is does.
+func holds(err error, found func(error) bool) (ok, again bool) {
+	var read map[error]bool
+	next := []error{err}
+	for len(next) > 0 {
+		e := next[len(next)-1]
+		next = next[:len(next)-1]
+		if e == nil {
+			continue
 		}
-		var pg *pgconn.PgError
-		switch e := err.(type) { //nolint:errorlint // as above
-		case *pgconn.PgError:
-			pg = e
-		case interface{ As(any) bool }:
-			e.As(&pg)
-		}
-		if pg != nil && (pg.Code == "40001" || pg.Code == "40P01" || pg.Code == "55P03") {
-			return true, true
-		}
-		switch e := err.(type) { //nolint:errorlint // as above
-		case interface{ Unwrap() error }:
-			err = e.Unwrap()
-		case interface{ Unwrap() []error }:
-			for _, wrapped := range e.Unwrap() {
-				if race, found := racedFirst(wrapped); found {
-					return race, true
-				}
+		if reflect.ValueOf(e).Comparable() {
+			if read[e] {
+				again = true
+				continue
 			}
-			return false, false
-		default:
-			return false, false
+			if read == nil {
+				read = map[error]bool{}
+			}
+			read[e] = true
+		}
+		if found(e) {
+			return true, again
+		}
+		switch x := e.(type) { //nolint:errorlint // as above
+		case interface{ Unwrap() error }:
+			next = append(next, x.Unwrap())
+		case interface{ Unwrap() []error }:
+			wrapped := x.Unwrap()
+			for i := len(wrapped) - 1; i >= 0; i-- {
+				next = append(next, wrapped[i])
+			}
 		}
 	}
-	return false, false
+	return false, again
 }
 
 // conflicting makes *err match ErrConflict as conflicted does, for an exported call to defer, so
