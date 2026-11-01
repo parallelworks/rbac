@@ -345,6 +345,45 @@ func TestALabelValueHeldUnderAConditionHoldsWhereItHolds(t *testing.T) {
 	}
 }
 
+// What conditions read is built, converting what the host passes whole, only for a decision a
+// condition takes part in. A labeled check built it to decide the subject's label values, though
+// every grant giving them held unconditionally, so a check passing a large lookup map, which no
+// condition read, took 14 ms where it took a third of one, and a change by an actor holding its
+// grants unconditionally built it for each scope it checked.
+func TestADecisionNoConditionTakesPartInConvertsNoAttributes(t *testing.T) {
+	h := labeled(t)
+	owner, pilot := h.as(t, "owner"), h.as(t, "pilot")
+	h.hold(t, "owner", "level:high", "rel:gbr")
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}, "rel": {"gbr"}}
+	ctx := rbac.WithRequest(t.Context(), map[string]any{"mission": true, "lookup": map[string]any{"a": "b"}})
+	n := rbac.CountConversions(t)
+	if err := h.authz.Authorize(ctx, owner, view, secret); err != nil {
+		t.Fatalf("Authorize: %v", err)
+	}
+	if ps, err := h.authz.Permissions(ctx, owner, secret); err != nil || len(ps) == 0 {
+		t.Fatalf("Permissions = %v, %v", ps, err)
+	}
+	if err := h.authz.Apply(ctx, owner, secret, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: pilot.Principal}}}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if *n != 0 {
+		t.Errorf("decisions no condition takes part in built what conditions read %d times", *n)
+	}
+	g := grant(rbac.TenantRoot("t1"), "rel.gbr", rbac.User, "pilot")
+	g.Condition = rbac.Condition{Expression: `request.attributes.mission == true`}
+	h.seed(t, g, grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "pilot"))
+	if err := h.authz.Authorize(ctx, pilot, view, secret); err != nil {
+		t.Fatalf("Authorize where a condition gives a label value: %v", err)
+	}
+	if allowed(t, h, pilot, view, secret) {
+		t.Error("without the request the condition reads")
+	}
+	if *n == 0 {
+		t.Error("a decision a condition takes part in built nothing for it to read")
+	}
+}
+
 func TestALabelValueAConditionalDenyTakesIsMarked(t *testing.T) {
 	h := labeled(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), tenantGuard) })
 	ctx := t.Context()

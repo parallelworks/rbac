@@ -154,7 +154,9 @@ func (a *Authorizer) decideBy(ctx context.Context, s Subject, p Permission, r Re
 	// builds none of it.
 	var vars map[string]any
 	if len(ds) > 0 {
-		vars = a.vars(ctx, s, p, r)
+		if conditionallyDenied(ds, p) {
+			vars = a.vars(ctx, s, p, r)
+		}
 		// A deny decides first, as it binds every grant.
 		if d, ok := a.deniedBy(ds, p, newDenyBudget(r.path()), vars); ok {
 			return Decision{DeniedBy: d.String(), Reason: d.removal()}, nil
@@ -337,10 +339,23 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) (_ 
 }
 
 // deciding is what conditions read deciding permissions on a resource for a request, but for its
-// action, and what each that ran came to (budget.ran).
+// action, made by build the first time a condition is evaluated (read), and what each that ran came
+// to (budget.ran).
 type deciding struct {
-	vars map[string]any
-	ran  map[string]run
+	vars  map[string]any
+	build func() map[string]any
+	ran   map[string]run
+}
+
+// read is what conditions read deciding p, building it the first time: it converts what the host
+// passes whole (Attributes), so a decision no condition takes part in, as of a label every grant
+// giving it holds unconditionally, converts none of it.
+func (d *deciding) read(p Permission) map[string]any {
+	if d.vars == nil {
+		d.vars = d.build()
+	}
+	d.vars["action"] = string(p)
+	return d.vars
 }
 
 // runs is what permissionsOf decides s's permissions on r by, made by the first decision that
@@ -365,13 +380,18 @@ func (rs *runs) of(ctx context.Context, a *Authorizer, s Subject, r Resource, he
 	if rs.resource != nil {
 		return rs
 	}
-	rs.resource = &deciding{a.vars(ctx, s, "", r), map[string]run{}}
-	rs.values = rs.resource
+	resource := &deciding{build: func() map[string]any { return a.vars(ctx, s, "", r) }, ran: map[string]run{}}
+	rs.resource, rs.values = resource, resource
 	if r.Type == TenantScope && len(a.labels) > 0 {
-		// A clone, so the subject's and the request's attributes are converted once for both.
-		vars := maps.Clone(rs.resource.vars)
-		vars["resource"] = valueResource(r.Tenant)
-		rs.values = &deciding{vars, map[string]run{}}
+		rs.values = &deciding{build: func() map[string]any {
+			// A clone, so the subject's and the request's attributes are converted once for both.
+			if resource.vars == nil {
+				resource.vars = resource.build()
+			}
+			vars := maps.Clone(resource.vars)
+			vars["resource"] = valueResource(r.Tenant)
+			return vars
+		}, ran: map[string]run{}}
 	}
 	rs.excluded = a.excludedBy(roles, held)
 	return rs
@@ -442,8 +462,10 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 		if d, ok := denied[p]; ok {
 			return d
 		}
-		vars := on(p).vars
-		vars["action"] = string(p)
+		var vars map[string]any
+		if conditionallyDenied(ds, p) {
+			vars = on(p).read(p)
+		}
 		d, ok := a.deniedBy(ds, p, newDenyBudget(r.path()).sharing(on(p).ran), vars)
 		denied[p], always[p] = ok, ok && d.condition == ""
 		return ok
@@ -486,9 +508,7 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 			}
 			byCondition[p] = true
 			// A condition reads the action, so it is evaluated for each permission.
-			vars := on(p).vars
-			vars["action"] = string(p)
-			given[p] = a.conds.holds(spendOn(p), h.Condition.Expression, vars)
+			given[p] = a.conds.holds(spendOn(p), h.Condition.Expression, on(p).read(p))
 		}
 	}
 	var perms []Permission

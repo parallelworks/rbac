@@ -335,6 +335,16 @@ func CountEvaluations(t *testing.T) *int {
 	return n
 }
 
+// CountConversions counts the times what conditions read is built, converting what the host
+// passes, until t ends.
+func CountConversions(t *testing.T) *int {
+	t.Helper()
+	old, n := converting, new(int)
+	converting = func() { *n++ }
+	t.Cleanup(func() { converting = old })
+	return n
+}
+
 // ConditionCost is the most evaluating expr can cost, which a check runs it within, and what
 // evaluating it on a request with attributes, which the resource carries too, costs, up to
 // maxCost, built with the package's CEL environment extended by opts.

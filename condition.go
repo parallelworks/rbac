@@ -1742,8 +1742,9 @@ func (c *conditions) decide(b *budget, expr string, vars map[string]any) (held, 
 	return r.held, r.evaluated
 }
 
-// evaluating runs as a condition is evaluated, as a test's counter.
-var evaluating = func() {}
+// evaluating runs as a condition is evaluated, and converting as what conditions read is built, as
+// a test's counters.
+var evaluating, converting = func() {}, func() {}
 
 // evaluate runs a condition's program on a request.
 func evaluate(prg program, vars map[string]any) run {
@@ -1820,6 +1821,7 @@ func withoutRequest(ctx context.Context) context.Context {
 // converter for them all (Attributes), so a value they share is converted once, and what converting
 // them all may cost is bounded together: past it, every kind's attributes refuse every read.
 func (a *Authorizer) vars(ctx context.Context, s Subject, p Permission, r Resource) map[string]any {
+	converting()
 	c := newConverter()
 	_, none := ctx.Value(requestKey{}).(unrequested)
 	var request map[string]ref.Val
