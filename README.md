@@ -194,8 +194,10 @@ conditional ones reach, to check one by one.
   hold, as messages reaching one message or JSON texts sharing bytes, which decoding never makes: a
   check converts each whole, uncharged. A list or map the host makes, of its own type or of CEL's,
   is read by its own methods, so one of CEL's made over such values converts them on each read, as
-  CEL does. Comparing a value holding a double that isn't finite fails, in a list or as a map's key
-  too. Each condition runs within the most evaluating it can cost, which its literals and types
+  CEL does: it decodes JSON text and writes out a struct each time, uncharged, and one holding
+  itself, or a dynamic message reaching itself, without end, which ends the process. Make none.
+  Comparing a value holding a double that isn't finite fails, in a list or as a map's key too.
+  Each condition runs within the most evaluating it can cost, which its literals and types
   bound: little for comparing what a request passes with literals, or with the ids, kinds, types and
   tenant a check passes or its action, which are no
   longer than `MaxID`, and all a condition may for reading the size of, or looping over, a list the

@@ -396,7 +396,9 @@ sequenceDiagram
   whole, uncharged: charging the check would let what one condition reads fail the others, so the
   host is to pass no two values sharing what they hold, as messages reaching one message or JSON
   texts sharing bytes. A list or map the host makes, of its own type or of CEL's, is read by its
-  own methods, each value it yields through the conversion. So a read costs what it is charged
+  own methods, each value it yields through the conversion; one of CEL's converts the Go values it
+  holds with its own adapter, which reads a struct or a dynamic message holding itself without end,
+  ending the process, so the host is to make none over them. So a read costs what it is charged
   however the host passes the value, but in a list or map of CEL's made over it, and a comparison
   that fails where either value holds a double that isn't finite, as a key too, sees every such
   double as CEL's own. Each runs within the most evaluating it can cost, which its literals and

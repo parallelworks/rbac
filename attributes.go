@@ -71,16 +71,19 @@ import (
 // condition is charged for. A value of a host's own type CEL reads as one of its own, as a double
 // or a string, is read as the value it holds (its Value), so it compares as CEL's own does, from
 // either side, and fails where it isn't finite; a list or a map the host makes, of its own type or
-// of CEL's, is read by its own methods, each value it yields read so, a mutable list of CEL's, which
-// CEL adds to in place, as the list it holds, and one of CEL's converts the
-// Go values it was made of as the adapter it was made with does, each time a condition reads one,
-// so a host should make none over the values above, as JSON text or a struct. A key a map yields of
-// such a type of the host's, or a list or a map it is keyed by, is read as the map holds it, so the
-// map finds it, and so is what such a list or map yields, but a double of the host's there that
-// isn't finite fails what compares it. A value a condition indexes a map or a list by is
+// of CEL's, is read by its own methods, each value it yields read so, a mutable list of CEL's,
+// which CEL adds to in place, as the list it holds. One of CEL's converts the Go values it was made
+// of as the adapter it was made with does, each time a condition reads one, as CEL does without
+// this package: it decodes JSON text and writes out a struct whole each time, uncharged, and one
+// holding itself, as a message of a dynamic type reaching itself does, without end, which ends the
+// process, as no recover catches it. So a host is to make none over the values above. A key a map
+// yields of such a type of the host's, or a list or a map it is keyed by, is read as the map holds
+// it, so the map finds it, and so is what such a list or map yields, but a double of the host's
+// there that isn't finite fails what compares it. A value a condition indexes a map or a list by is
 // read as any other, as in `m[k]`: CEL indexes by the Go value the host passed, and fails for one
 // of a type it doesn't index by, as an int8, a pointer, JSON or a wrapper, though it reads it as
-// one of its own everywhere else. A value holding itself fails whatever reads it whole.
+// one of its own everywhere else. A value holding itself fails whatever reads it whole, but in a
+// list or a map of CEL's made over it.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
@@ -177,9 +180,10 @@ const maxCopied = 1 << 10
 //   - A list or a map a host makes, of a type of its own or of CEL's, is read as it reads itself,
 //     by its own methods, which are the host's to bound, but each value it yields read through
 //     this: one of CEL's own converts the Go values it was made of with the adapter it was made
-//     with, each time a condition reads one, as CEL does. A mutable list of CEL's, which CEL adds to
-//     in place, is read as the list it holds, and an optional of CEL's own as what it holds, through
-//     this.
+//     with, each time a condition reads one, as CEL does, so it reads a struct or a message of a
+//     dynamic type that holds itself without end, ending the process, which no conversion of what
+//     it yields can catch (Attributes). A mutable list of CEL's, which CEL adds to in place, is
+//     read as the list it holds, and an optional of CEL's own as what it holds, through this.
 //   - A ref.Val of a type of the host's own that CEL reads as a double, a string or another value
 //     of a type of its own holding none is read as that value, what it holds (its Value), so a
 //     double is one of CEL's own, which comparing fails where it isn't finite, and a string's length
@@ -316,9 +320,8 @@ func copiedWhole(v any) ref.Val {
 // own is v as one of CEL's own values: v itself where it holds no other; for an optional of CEL's
 // own, what it holds, read through c; for a list or a map, of CEL's own or of the host's, itself,
 // read by its own methods, but each value it yields read through c, and a mutable list of CEL's as
-// the list it holds; for one of a type of the
-// host's own CEL reads as a value of a type of its own, what it holds; and any other, as a message,
-// itself, as CEL's adapter reads it.
+// the list it holds; for one of a type of the host's own CEL reads as a value of a type of its own,
+// what it holds; and any other, as a message, itself, as CEL's adapter reads it.
 //
 // A list or a map of CEL's own isn't read again from the Go value it holds (its Value): CEL makes
 // one of a map[string]any that finds a key of the host's own type, and one that finds none, and a
