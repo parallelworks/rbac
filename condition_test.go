@@ -1121,7 +1121,7 @@ func TestAValueOutsideWhatAttributesNamesFailsItsConditions(t *testing.T) {
 		"a list of CEL's":                   types.DefaultTypeAdapter.NativeToValue([]any{"a"}), "a list of CEL's of its own": own,
 		"a map of CEL's": types.DefaultTypeAdapter.NativeToValue(map[string]any{"a": "a"}),
 		"an optional":    types.OptionalOf(types.String("a")), "no optional": types.OptionalNone, "a mutable list": mutable,
-		"a type": types.StringType, "a list of the host's": ownList{own}, "a map of the host's": ownMap{types.NewRefValMap(types.DefaultTypeAdapter, nil)},
+		"a type": types.StringType, "a list of the host's": ownList{own}, "a pointer to a list of the host's": &ownList{own}, "a map of the host's": ownMap{types.NewRefValMap(types.DefaultTypeAdapter, nil)},
 		"a list indexing as itself": indexedAsItself{own}, "a struct": struct{ A string }{"a"}, "a pointer to a struct": &struct{ A string }{"a"},
 		"a channel": make(chan int), "a func": func() {}, "a complex number": complex(1, 2), "a uintptr": uintptr(1),
 		"a time zone": time.UTC, "an error": errors.New("a"),
@@ -1883,7 +1883,7 @@ func TestFiniteValuesDecideAsCELDoes(t *testing.T) {
 	}
 	listed := &structpb.ListValue{Values: []*structpb.Value{structpb.NewStringValue("a"), structpb.NewNumberValue(0.5)}}
 	at := time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)
-	text, nothing, id := "a", (*string)(nil), make([]byte, 16)
+	text, celText, nothing, id := "a", types.String("a"), (*string)(nil), make([]byte, 16)
 	id[0] = 1
 	converted := map[string][2]any{
 		"JSON text": {json.RawMessage(`{"a": "a"}`), map[string]any{"a": "a"}}, "a JSON list": {json.RawMessage(`["a", 0.5]`), []any{"a", 0.5}},
@@ -1900,7 +1900,8 @@ func TestFiniteValuesDecideAsCELDoes(t *testing.T) {
 		"a map of Go's keyed by ints":   {map[any]any{1: "a", 2: "b"}, map[int64]any{1: "a", 2: "b"}},
 		"a map keyed by a named string": {map[named]string{"a": "a"}, map[string]any{"a": "a"}},
 		"a map of ref.Vals":             {map[ref.Val]ref.Val{types.String("a"): types.String("a")}, map[string]any{"a": "a"}},
-		"CEL's own string":              {types.String("a"), "a"},
+		"CEL's own string":              {types.String("a"), "a"}, "a pointer to CEL's own string": {&celText, "a"},
+		"an array of a byte type of the host's": {[2]hostByte{1, 2}, []byte{1, 2}},
 	}
 	convertedDecides := func(expr, x, y string) {
 		t.Helper()

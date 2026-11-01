@@ -234,8 +234,9 @@ func (c *converter) of(v reflect.Value) ref.Val {
 		return types.NullValue
 	}
 	// A value of a type of the host's own CEL would read by its methods, as one saying it is a
-	// double or a list, is read so by none.
-	if t.Implements(refValType) {
+	// double or a list, is read so by none. A pointer has the methods of what it points to, so one to
+	// CEL's own string is read as the string, as any other pointer is read as what it points to.
+	if t.Implements(refValType) && (t.Kind() != reflect.Pointer || !t.Elem().Implements(refValType)) {
 		if v, ok := v.Interface().(ref.Val); ok && celScalar(v) {
 			return c.spend(textSize(v)-1, v)
 		}
