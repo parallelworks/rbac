@@ -519,9 +519,11 @@ func TestFilterReadsARowsOwnKeyWhereverItsPathStarts(t *testing.T) {
 
 // One table can hold resources of several types, as one store of every resource does, and a grant
 // on a container reaches every row under it, of any type: Filter keeps of them only those whose own
-// key is of the type it lists, as Authorize refuses p on the rest, in each form its condition takes,
-// overlapping the path with the subject's grants, looking its own key up in a hash of those on
-// resources of the type, and looking each of its keys up in one object of them all.
+// key is of the type it lists, not of one whose name starts with its name, as Authorize refuses p
+// on the rest, in each form its condition takes, overlapping the path with the subject's grants,
+// looking its own key up in a hash of those on resources of the type, and looking each of its keys
+// up in one object of them all. Its condition is false for the rest, not unknown, for a host that
+// selects it as a column.
 func TestFilterKeepsOnlyTheRowsOfTheListedType(t *testing.T) {
 	h, guardian := guarded(t)
 	ctx := t.Context()
@@ -538,6 +540,7 @@ func TestFilterKeepsOnlyTheRowsOfTheListedType(t *testing.T) {
 		{Tenant: "t1", Type: "cluster", ID: "c1", Ancestors: []rbac.Scope{w1.Scope(), o1}},
 		{Tenant: "t1", Type: "cluster", ID: "c2", Ancestors: []rbac.Scope{w2.Scope(), w1.Scope(), o1}},
 		{Tenant: "t1", Type: "cluster", ID: "c3", Ancestors: []rbac.Scope{o1}},
+		{Tenant: "t1", Type: "clusterx", ID: "c1", Ancestors: []rbac.Scope{w1.Scope(), o1}},
 	}
 	for _, r := range resources {
 		if _, err := h.pool.Exec(ctx, `INSERT INTO resources VALUES ($1, $2, $3, $4)`, r.Tenant, r.Type, r.ID, h.path(t, r)); err != nil {
@@ -578,6 +581,14 @@ func TestFilterKeepsOnlyTheRowsOfTheListedType(t *testing.T) {
 		}
 		if got, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
 			t.Fatal(err)
+		}
+		var unknown []string
+		if err := h.pool.QueryRow(ctx, `SELECT coalesce(array_agg(type || ':' || id COLLATE "C"), '{}') FROM resources WHERE `+pred.SQL+` IS NULL`,
+			pred.Args...).Scan(&unknown); err != nil {
+			t.Fatal(err)
+		}
+		if len(unknown) > 0 {
+			t.Errorf("%s listing %ss: Filter's condition is unknown for %v", s.Principal.ID, resourceType, unknown)
 		}
 		for _, r := range resources {
 			if r.Type != resourceType {
@@ -686,8 +697,8 @@ func TestFilterReadsATableOfSeveralTypesThroughThePathIndex(t *testing.T) {
 // so a sorted, limited page of a table of one type whose condition no index serves, as for a subject
 // holding grants on hundreds of workspaces, is still read in the order of the host's index until
 // it is full, under a generic plan too. The planner has no statistics of a path's first key, and
-// counted a test of it alone as keeping one row in 200, so it read and sorted every row of the
-// tenant.
+// counts a test of it alone as keeping one row in 200, so a plain test would read and sort every
+// row of the tenant.
 func TestFilterTestsARowsTypeWithoutMovingAPageOffTheHostsIndex(t *testing.T) {
 	for _, plan := range []string{"force_custom_plan", "force_generic_plan"} {
 		t.Run(plan, func(t *testing.T) {
