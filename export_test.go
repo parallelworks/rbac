@@ -1,7 +1,10 @@
 package rbac
 
 import (
+	"context"
+	"maps"
 	"runtime"
+	"slices"
 	"testing"
 	"time"
 
@@ -147,6 +150,108 @@ func SetDecidingGrants(t *testing.T, f func() func()) {
 	old := decidingGrants
 	decidingGrants = f
 	t.Cleanup(func() { decidingGrants = old })
+}
+
+// ExcludedOn is, for each of on, resources of one tenant, the exclusive dimensions whose values
+// actor's grants on its path could give two of, as a change's authorities on all of them decide
+// them together, and as excludedBy decides them from that path's grants alone, as each authority
+// once decided its own.
+func ExcludedOn(t *testing.T, a *Authorizer, actor Subject, on []Resource) (together, alone []map[string]bool) {
+	t.Helper()
+	a = a.still()
+	aus, err := a.authorities(t.Context(), a.db, actor, on, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, au := range aus {
+		together = append(together, au.excluded)
+		alone = append(alone, a.excludedBy(au.roles, au.held))
+	}
+	return together, alone
+}
+
+// LabelValuesDecided is, for each of labels, the values it asks for that actor holds in tenant on
+// ctx's request: decided together, as a change checking them all by one read of what the actor's
+// values are decided by decides them, label after label; and each alone, as a check of it decides
+// them by a read of its own.
+func LabelValuesDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subject, tenant string, labels []Label) (together, alone [][]Permission) {
+	t.Helper()
+	a = a.still()
+	v, err := a.valuesOn(ctx, a.db, tenant, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	asked := func(h Holding, l Label) []Permission {
+		var held []Permission
+		for _, p := range slices.Sorted(maps.Keys(a.askedBy(l))) {
+			if dim, value := p.parts(); h.values[dim][value] {
+				held = append(held, p)
+			}
+		}
+		return held
+	}
+	c := a.constrain(ctx, actor, tenantResource(tenant))
+	for _, l := range labels {
+		h, err := c.decidedBy(ctx, a.db, v, a.askedBy(l))
+		if err != nil {
+			t.Fatal(err)
+		}
+		together = append(together, asked(h, l))
+	}
+	for _, l := range labels {
+		h, _, err := a.holdingFor(ctx, tenant, actor, &valuesRead{held: v.held, ds: v.ds, roles: v.roles}, l)
+		if err != nil {
+			t.Fatal(err)
+		}
+		alone = append(alone, asked(h, l))
+	}
+	return together, alone
+}
+
+// GrantDecision is what deciding a grant found: the permission the actor lacks to make it, ""
+// where it may, and the constraint whose removal of it refused it, if one did.
+type GrantDecision struct {
+	Lacks Permission
+	By    string
+}
+
+// GrantsDecided is, for each of grants actor makes on r on ctx's request, what deciding it found
+// (GrantDecision): as a change granting them all decides them, by one read of its authority there
+// and one ask of each constraint, a role once for each condition and end its grants tell apart; and
+// as deciding each alone does, by a read and asks of its own, under the grant's own condition, by
+// those of its grants that each last until the grant ends (holding.lasts), as though they lasted
+// for good, and the grant were made for good.
+func GrantsDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subject, r Resource, grants []Binding) (together, alone []GrantDecision) {
+	t.Helper()
+	a = a.still()
+	authority := func(grants []Binding) authority {
+		au, err := a.authorityOn(ctx, a.db, actor, r, roleIDs(grants))
+		if err != nil {
+			t.Fatal(err)
+		}
+		au.constrained = a.constrain(ctx, actor, r)
+		return au
+	}
+	au := authority(grants)
+	for _, d := range a.grantsDecided(au, au.over(r.Type), r.Type, grants) {
+		together = append(together, GrantDecision{d.lacks, d.by})
+	}
+	for _, b := range grants {
+		au := authority([]Binding{b})
+		def, known := au.roles.role(b.Role)
+		var decided GrantDecision
+		if known && a.grantableOn(def, r.Type) {
+			// Its power to change grants now is what all its grants give, whenever they end.
+			pw := au.over(r.Type)
+			au.held = slices.DeleteFunc(slices.Clone(au.held), func(g holding) bool { return !g.lasts(b.ExpiresAt) })
+			for i := range au.held {
+				au.held[i].ends = time.Time{}
+			}
+			decided.Lacks, decided.By, _ = a.mayGrant(au, pw, r.Type, def, b.Condition.Expression, time.Time{}, newChecked())
+		}
+		alone = append(alone, decided)
+	}
+	return together, alone
 }
 
 // StandSQL is the statement a change reads the standing of its principals with.

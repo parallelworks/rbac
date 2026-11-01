@@ -149,10 +149,21 @@ func (a *Authorizer) acts(k PrincipalKind) bool { return k == User || a.kinds[k]
 // later: a grant to a tenant's members or the public never gives a permission to change grants,
 // and one to the public gives only while its role is marked Public.
 func (p Principal) carries(role RoleDefinition, perm Permission) bool {
-	if p.broad() && perm.managesAccess() {
+	c := p.carrier()
+	if c != "" && perm.managesAccess() {
 		return false
 	}
-	return p.Kind != Public || role.Public
+	return c != Public || role.Public
+}
+
+// carrier is all that carries and holding.carries read of p, so grants of a role to two principals
+// of one carrier give alike, as a change deciding grants by kinds of its actor's needs (decidedAs):
+// the kind of a broad principal, and none for an identity or a group.
+func (p Principal) carrier() PrincipalKind {
+	if p.broad() {
+		return p.Kind
+	}
+	return ""
 }
 
 // publicRoles keeps the built-in roles marked Public, the only built-in ones a grant to the
@@ -539,7 +550,9 @@ type ConstraintInput struct {
 	// on any of them: one that tells them apart by id or attributes sees only the scope, and would let
 	// the actor hand on what it can't use on them. It is nil in Filter and Reachable, and in SetRole
 	// and DeleteRole, which change grants on every scope of a type, but for what SetRole's role gives,
-	// asked about the tenant.
+	// asked about the tenant; and in the first ask of ChangeMembers and DeleteGroup about the power
+	// to change grants on scopes of a type they take access away on, which then ask again about each
+	// such scope where one answers true.
 	Resource *Resource
 }
 
@@ -603,8 +616,10 @@ func conflicting(err *error) { *err = conflicted(*err) }
 const (
 	// MaxBindings is how many bindings one Apply, grants and revokes together, or one Import takes,
 	// and how many grants and eligibilities of their groups the members one ChangeMembers adds gain
-	// in all, each member's counted apart, as the host is asked about each, but one member alone,
-	// which gains whatever its groups hold, and not the host's own ImportMembers; and
+	// in all, each member's counted apart, as the host is asked about each, but no more than one
+	// place alone gains, whatever its group and those it is in hold, and not the host's own
+	// ImportMembers: a member is its principal, however many groups, or places in one, the change
+	// gives it, and what they reach counts once for each end its places give it; and
 	// MaxGrantsPerRole how many grants in force of one role a principal holds on one scope,
 	// differing by source, expiry or condition, as cloud IAM bounds bindings of one role: those
 	// from each source the host owns (Config.Sources) counted apart.
@@ -697,7 +712,13 @@ type Config struct {
 	// change on a labeled scope ask the same. Holding, Filter and Reachable, which test any label,
 	// ask about every value and power to release the subject's grants give, as do SetRole and
 	// DeleteRole of a role granted somewhere, ChangeMembers where only a removal reaches a scope,
-	// and Activate about an approver on a labeled scope.
+	// and Activate about an approver on a labeled scope. A change that takes access away asks about
+	// the power to change grants as Apply's revoke does, so a constraint removing it, as a freeze
+	// under a container does, stops access being taken away there by any change an actor makes:
+	// ChangeMembers asks once about each type of scope only a removal reaches, of no resource, and
+	// again about each such scope where one answers true, and DeleteGroup likewise about groups, and
+	// then the group, where it exists. The host's own writes ask nothing, as Import and DeleteGrants
+	// don't.
 	Constraints []Constraint
 	// ResourceOf returns the resource a scope is, with its ancestors, attributes and label, as the
 	// host passes it to a check. SetGroup and DeleteGroup check ManageGroups on the tenant, and,

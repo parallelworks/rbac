@@ -1296,7 +1296,7 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 	// scope too: what one removes there, the actor can't hand on there.
 	there := au
 	there.handsOn = orDenied(au.handsOn, func(p Permission) bool { _, removed := removedOn(p); return removed })
-	if p, ok := a.holdsRole(there, def, def.ResourceTypes, "", time.Time{}, newChecked()); !ok {
+	if p, _, ok := a.holdsRole(there, def, def.ResourceTypes, "", time.Time{}, newChecked()); !ok {
 		scope, removed := removedOn(p)
 		if !removed {
 			scope = TenantRoot(tenant)
@@ -1318,7 +1318,7 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 			asked[k] = true
 			there := au
 			there.handsOn = orDenied(au.handsOn, at.handsOn)
-			if missing, ok := a.mayGrant(there, there.under(t, "", time.Time{}), t, def, "", time.Time{}, newChecked()); !ok {
+			if missing, _, ok := a.mayGrant(there, there.under(t, "", time.Time{}), t, def, "", time.Time{}, newChecked()); !ok {
 				reason := fmt.Sprintf("removed by a deny there, which stops %s, as the holders of a role granted there may grant it on a %s without holding it, which the actor can't", change, t)
 				return cmp.Or(au.constrained.failed(), error(&DeniedError{Permission: missing, Scope: r.Scope(), Reason: reason}))
 			}
@@ -1458,7 +1458,7 @@ func (a *Authorizer) rolesScopes(ctx context.Context, q DB, tenant string, ids [
 // changes to grants on scopes of one of types, those they can be or are on.
 func (a *Authorizer) changesStopped(ctx context.Context, actor Subject, tenant string, types []string, change string) error {
 	for _, t := range types {
-		name, err := a.denied(ctx, ConstraintInput{Tenant: tenant, ResourceType: t, Permission: GrantPermission(t), Subject: &actor})
+		name, err := a.freezes(ctx, actor, tenant, t)
 		if err != nil {
 			return err
 		}
@@ -1564,8 +1564,8 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 	}
 	seen := newChecked()
 	// A definition never ends, so what the actor holds only until a time can't stand in.
-	if p, ok := a.holdsRole(au, *r, r.ResourceTypes, "", time.Time{}, seen); !ok {
-		reason := cs.refusal("define "+string(r.ID), p, fmt.Sprintf("the actor can't define %s without holding %s here", r.ID, p))
+	if p, by, ok := a.holdsRole(au, *r, r.ResourceTypes, "", time.Time{}, seen); !ok {
+		reason := refusalBy(by, "define "+string(r.ID), p, fmt.Sprintf("the actor can't define %s without holding %s here", r.ID, p))
 		return authority{}, cmp.Or(cs.failed(), error(&DeniedError{Permission: p, Scope: scope, Reason: reason}))
 	}
 	// A role that lists r lets its holders grant r as it will be wherever it can be granted, a
@@ -1581,8 +1581,8 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 			if !p.changesGrants() || !a.grantableOn(*r, t) {
 				continue
 			}
-			if missing, ok := a.mayGrant(au, au.under(t, "", time.Time{}), t, *r, "", time.Time{}, seen); !ok {
-				reason := cs.refusal("define "+string(r.ID), missing, fmt.Sprintf("the actor can't define %s, which %s lists, without the power to grant it on a %s", r.ID, id, t))
+			if missing, by, ok := a.mayGrant(au, au.under(t, "", time.Time{}), t, *r, "", time.Time{}, seen); !ok {
+				reason := refusalBy(by, "define "+string(r.ID), missing, fmt.Sprintf("the actor can't define %s, which %s lists, without the power to grant it on a %s", r.ID, id, t))
 				return authority{}, cmp.Or(cs.failed(), error(&DeniedError{Permission: missing, Scope: scope, Reason: reason}))
 			}
 		}

@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1431,6 +1432,39 @@ func TestDeleteGroupRefusesAGroupAnActivationRestsOn(t *testing.T) {
 		if err := h.authz.DeleteGroup(ctx, groupManager, "t1", id); err != nil {
 			t.Errorf("deleting %s once the activation ended: %v", id, err)
 		}
+	}
+}
+
+// DeleteGroup holds the places in the group and of it before it reads the activations resting on
+// them, which Activate holds until it commits: one that commits while the deletion waits for them,
+// made through an eligibility of a group it is in that the host deleted meanwhile, refuses the
+// deletion, as one made before it does, rather than be ended by it.
+func TestDeleteGroupRefusesAnActivationThatCommitsWhileItWaitsForItsPlaces(t *testing.T) {
+	var armed atomic.Bool
+	paused := make(chan heldActivation, 1)
+	h := grouped(t, pausingActivation(&armed, paused))
+	ctx := t.Context()
+	h.groups(t, "crew", "oncall")
+	u := h.as(t, "u", "crew")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "oncall", Principal: groupOf("crew")}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: groupOf("oncall"), MaxDuration: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	a, activated := activateAsTheHostDeletes(t, h, &armed, paused, u, cluster, "cluster.sudo", groupOf("oncall"))
+	deleted := make(chan error, 1)
+	go func() { deleted <- h.authz.DeleteGroup(ctx, h.as(t, "groups"), "t1", "crew") }()
+	waitedOn(t, h, a.pid, deleted)
+	close(a.release)
+	if err := <-activated; err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	if err := <-deleted; !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("deleting crew while an activation made through oncall, which it is in, committed: %v", err)
+	}
+	if !allowed(t, h, u, root, cluster) {
+		t.Fatal("u's activation should still give it root on the cluster")
 	}
 }
 
@@ -3671,19 +3705,23 @@ func TestAKeptPlaceRemovedMeanwhileBesideAJoinIsTriedAgain(t *testing.T) {
 	}
 }
 
-// Without declared labels, only labels check what a member leaving loses, so a grant to its group
-// made while a removal is checked changes nothing the removal checked.
+// Without declared labels or constraints, or a deny binding the actor, nothing can refuse it what a
+// member leaving loses, so a grant to its group made while a removal is checked changes nothing the
+// removal checked.
 func TestARemovalWithoutLabelsIsNotTriedAgainForAGrantMadeMeanwhile(t *testing.T) {
 	var meanwhile func(ctx context.Context) error
 	h := grouped(t, func(c *rbac.Config) {
 		c.Catalog = append(slices.Clone(c.Catalog), guardRole)
-		c.Constraints = []rbac.Constraint{{Name: "meanwhile", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
-			if do := meanwhile; do != nil && in.Permission == rbac.DenyPermission("cluster") {
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if do := meanwhile; do != nil && s == cluster.Scope() {
 				meanwhile = nil
-				return false, do(ctx)
+				if err := do(ctx); err != nil {
+					return rbac.Resource{}, err
+				}
 			}
-			return false, nil
-		}}}
+			return resourceOf(ctx, tenant, s)
+		}
 	})
 	ctx := t.Context()
 	h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "manager"), grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
@@ -3692,7 +3730,7 @@ func TestARemovalWithoutLabelsIsNotTriedAgainForAGrantMadeMeanwhile(t *testing.T
 		t.Fatal(err)
 	}
 	manager := h.as(t, "manager")
-	// Leaving crew lifts this, which asks the constraints.
+	// Leaving crew lifts this, which asks the host for the cluster.
 	if err := h.authz.SetDeny(ctx, manager, cluster, rbac.Deny{ID: "d", Principals: []rbac.Principal{groupOf("crew")}, Permissions: []rbac.Permission{root}}); err != nil {
 		t.Fatal(err)
 	}
@@ -3794,6 +3832,420 @@ func TestAConstraintStopsChangingMembers(t *testing.T) {
 	}
 }
 
+// freezingUnder is a constraint that, while frozen, stops changes to grants on a container and the
+// scopes under it, as a host freezes changes under one; asked of no resource, it removes the power
+// to change grants on any scope, as one of them may be under the container.
+func freezingUnder(container rbac.Scope, frozen *bool) func(*rbac.Config) {
+	return func(c *rbac.Config) {
+		c.Constraints = append(slices.Clone(c.Constraints), rbac.Constraint{Name: "freeze", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if !*frozen || !strings.HasSuffix(string(in.Permission), ":grant") {
+				return false, nil
+			}
+			r := in.Resource
+			return r == nil || r.Scope() == container || slices.Contains(r.Ancestors, container), nil
+		}})
+	}
+}
+
+// A freeze under a container stops a change to members taking access away under it, as it stops
+// Apply revoking there: removing a member of a group holding access there, ending its place sooner,
+// adding a member to a group a deny there names, and removing a member whose activation there rests
+// on its place. Each scope is asked about as the host gives it, so taking access away outside the
+// container isn't stopped.
+func TestAFreezeStopsTakingAccessAwayThroughMembers(t *testing.T) {
+	frozen := false
+	h := grouped(t, freezingUnder(workspace.Scope(), &frozen), func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), guardRole) })
+	ctx := t.Context()
+	elsewhere := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c2"}
+	h.groups(t, "crew", "oncall", "denied", "outside")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"), grant(elsewhere.Scope(), "cluster.login", rbac.Group, "outside"),
+		grant(cluster.Scope(), "cluster.login", rbac.User, "v"), grant(cluster.Scope(), "cluster.login", rbac.User, "w"),
+		grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+	h.join(t, "u", "v", "w")
+	in := func(group string) rbac.Member { return rbac.Member{Group: group, Principal: identity("u")} }
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{in("crew"), in("oncall"), in("outside")}); err != nil {
+		t.Fatal(err)
+	}
+	// u activates through oncall, whose eligibility is then deleted: the activation alone rests on oncall.
+	owner := h.as(t, "owner")
+	if err := h.authz.SetEligibility(ctx, owner, cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: groupOf("oncall"), MaxDuration: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	u, w := rbac.Subject{Principal: identity("u")}, rbac.Subject{Principal: identity("w")}
+	if _, err := h.authz.Activate(ctx, u, cluster, rbac.Activation{Role: "cluster.sudo", Duration: time.Hour, Justification: "INC-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.DeleteEligibility(ctx, owner, cluster, "cluster.sudo", groupOf("oncall")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, rbac.Deny{ID: "d", Principals: []rbac.Principal{groupOf("denied")}, Permissions: []rbac.Permission{login}}); err != nil {
+		t.Fatal(err)
+	}
+	manager := h.as(t, "manager")
+	frozen = true
+	if err := h.authz.Apply(ctx, manager, cluster, rbac.Change{Revoke: []rbac.Binding{{Role: "cluster.login", Principal: identity("v")}}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("Apply revoking under the freeze: %v", err)
+	}
+	sooner := in("crew")
+	sooner.ExpiresAt = h.now.Add(time.Minute)
+	for what, c := range map[string]struct{ add, remove []rbac.Member }{
+		"removing a member of a group holding access there":           {remove: []rbac.Member{in("crew")}},
+		"ending its place sooner":                                     {add: []rbac.Member{sooner}},
+		"adding a member to a group a deny there names":               {add: []rbac.Member{{Group: "denied", Principal: identity("w")}}},
+		"removing a member whose activation there rests on its place": {remove: []rbac.Member{in("oncall")}},
+	} {
+		if err := h.authz.ChangeMembers(ctx, manager, "t1", c.add, c.remove); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("%s under the freeze: %v", what, err)
+		}
+	}
+	if !allowed(t, h, u, login, cluster) || !allowed(t, h, u, root, cluster) || !allowed(t, h, w, login, cluster) {
+		t.Fatal("u and w should keep their access on the frozen cluster")
+	}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", nil, []rbac.Member{in("outside")}); err != nil {
+		t.Errorf("removing a member of a group holding access only outside the frozen workspace: %v", err)
+	}
+	frozen = false
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", nil, []rbac.Member{in("crew"), in("oncall")}); err != nil {
+		t.Errorf("removing the members once the freeze is lifted: %v", err)
+	}
+}
+
+// A freeze judges a change to members by what it ends there: a member leaving a group ends what the
+// group gives it there, though another group gives it the same, as Apply revoking a grant held twice
+// is stopped; but a place that ends, or ends sooner, while another, from another source, keeps the
+// member in its group as long ends nothing.
+func TestAFreezeStopsALeavingByWhatItsGroupGives(t *testing.T) {
+	frozen := false
+	h := grouped(t, freezingUnder(workspace.Scope(), &frozen))
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"), grant(cluster.Scope(), "cluster.login", rbac.Group, "oncall"))
+	h.join(t, "u")
+	crew, synced := rbac.Member{Group: "crew", Principal: identity("u")}, rbac.Member{Group: "crew", Principal: identity("u"), Source: "ops"}
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{crew, synced, {Group: "oncall", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	manager := h.as(t, "manager")
+	frozen = true
+	sooner := synced
+	sooner.ExpiresAt = h.now.Add(time.Minute)
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", []rbac.Member{sooner}, nil); err != nil {
+		t.Errorf("ending sooner a place in crew, another of which keeps u in it, under the freeze: %v", err)
+	}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", nil, []rbac.Member{synced}); err != nil {
+		t.Errorf("removing a place in crew, another of which keeps u in it, under the freeze: %v", err)
+	}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", nil, []rbac.Member{crew}); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("removing u from crew, though oncall gives it the same, under the freeze: %v", err)
+	}
+}
+
+// A scope the host no longer has is read as stored, as a revoke there reads it, so a freeze on every
+// scope of its type stops a member losing access there.
+func TestAFreezeStopsTakingAccessAwayOnAScopeTheHostNoLongerHas(t *testing.T) {
+	gone := rbac.Scope{Type: "cluster", ID: "gone"}
+	h := grouped(t, constrain("freeze", grantC), func(c *rbac.Config) {
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s == gone {
+				return rbac.Resource{}, fmt.Errorf("cluster %s: %w", s.ID, rbac.ErrNotFound)
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	h.groups(t, "crew")
+	h.seed(t, grant(gone, "cluster.login", rbac.Group, "crew"))
+	h.join(t, "u")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", nil, []rbac.Member{{Group: "crew", Principal: identity("u")}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("removing a member of a group holding access on a frozen scope the host no longer has: %v", err)
+	}
+}
+
+// workspaceGuard sets denies on workspaces.
+var workspaceGuard = rbac.RoleDefinition{ID: "workspace.guard", Permissions: []rbac.Permission{rbac.DenyPermission("workspace")}, ResourceTypes: []string{"workspace"}}
+
+// A deny on a scope's path that removes the actor's power to change grants there stops a change to
+// members taking access away there, as it stops Apply revoking there; one removing another
+// permission doesn't, nor does one off the path of the scopes the access is on.
+func TestADenyOnChangingGrantsStopsTakingAccessAwayThroughMembers(t *testing.T) {
+	h := grouped(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), workspaceGuard) })
+	ctx := t.Context()
+	elsewhere := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c2"}
+	h.groups(t, "crew", "outside")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"), grant(elsewhere.Scope(), "cluster.login", rbac.Group, "outside"),
+		grant(cluster.Scope(), "cluster.login", rbac.User, "v"), grant(workspace.Scope(), "workspace.guard", rbac.User, "guardian"))
+	h.join(t, "u", "v")
+	crew, outside := rbac.Member{Group: "crew", Principal: identity("u")}, rbac.Member{Group: "outside", Principal: identity("u")}
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{crew, outside}); err != nil {
+		t.Fatal(err)
+	}
+	manager, guardian := h.as(t, "manager"), h.as(t, "guardian")
+	deny := func(id string, p rbac.Permission) {
+		t.Helper()
+		if err := h.authz.SetDeny(ctx, guardian, workspace, rbac.Deny{ID: id, Principals: []rbac.Principal{manager.Principal}, Permissions: []rbac.Permission{p}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deny("noroot", root)
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", nil, []rbac.Member{crew}); err != nil {
+		t.Fatalf("removing under a deny of another permission: %v", err)
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{crew}); err != nil {
+		t.Fatal(err)
+	}
+	deny("frozen", "cluster:*")
+	if err := h.authz.Apply(ctx, manager, cluster, rbac.Change{Revoke: []rbac.Binding{{Role: "cluster.login", Principal: identity("v")}}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("Apply revoking under the deny: %v", err)
+	}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", nil, []rbac.Member{crew}); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("removing a member of a group holding access where a deny removes the power to change grants: %v", err)
+	}
+	if !allowed(t, h, rbac.Subject{Principal: identity("u")}, login, cluster) {
+		t.Error("u should keep its login on the cluster")
+	}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", nil, []rbac.Member{outside}); err != nil {
+		t.Errorf("removing a member of a group holding access only off the deny's path: %v", err)
+	}
+}
+
+// A change to members that read no deny binding the actor before its transaction reads the denies
+// on none of the paths of the scopes it takes access away on, so it is tried again where one that
+// removes the actor's power to change grants was set while it was checked.
+func TestADenyOnChangingGrantsSetWhileMembersAreCheckedIsTriedAgain(t *testing.T) {
+	var meanwhile func(ctx context.Context) error
+	h := grouped(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), workspaceGuard)
+		c.Constraints = []rbac.Constraint{{Name: "meanwhile", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if do := meanwhile; do != nil && in.Resource == nil && in.Permission == grantC {
+				meanwhile = nil
+				return false, do(ctx)
+			}
+			return false, nil
+		}}}
+	})
+	ctx := t.Context()
+	h.groups(t, "crew")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"), grant(workspace.Scope(), "workspace.guard", rbac.User, "guardian"))
+	h.join(t, "u")
+	crew := rbac.Member{Group: "crew", Principal: identity("u")}
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{crew}); err != nil {
+		t.Fatal(err)
+	}
+	manager := h.as(t, "manager")
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.SetDeny(ctx, h.as(t, "guardian"), workspace, rbac.Deny{ID: "frozen", Principals: []rbac.Principal{manager.Principal}, Permissions: []rbac.Permission{grantC}})
+	}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", nil, []rbac.Member{crew}); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("removing while a deny on changing grants there was set: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("the deny should have been set meanwhile")
+	}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", nil, []rbac.Member{crew}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("tried again: %v", err)
+	}
+}
+
+// A deny removing the actor's power to change grants on the path of a scope a member loses access
+// on, set while the host is asked about what another member gains, stops the change under its
+// locks: where a deny binding the actor listed that power on the scope's type before, the denies on
+// its path are read again there and refuse it; where none did, as with nothing else that could
+// refuse taking access away, the change read none of them, and is tried again.
+func TestADenyOnChangingGrantsSetWhileTheHostIsAskedStopsARemoval(t *testing.T) {
+	for _, before := range []bool{false, true} {
+		t.Run(fmt.Sprintf("bound before %t", before), func(t *testing.T) {
+			var meanwhile func(ctx context.Context) error
+			h := grouped(t, func(c *rbac.Config) {
+				c.Catalog = append(slices.Clone(c.Catalog), guardRole, workspaceGuard)
+				validate := c.ValidateGrant
+				c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+					if do := meanwhile; do != nil && in.Via == rbac.ViaMembership {
+						meanwhile = nil
+						if err := do(ctx); err != nil {
+							return err
+						}
+					}
+					return validate(ctx, q, in)
+				}
+			})
+			ctx := t.Context()
+			elsewhere, far := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c2"}, rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c3"}
+			h.groups(t, "crew", "other")
+			h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"), grant(elsewhere.Scope(), "cluster.login", rbac.Group, "other"),
+				grant(elsewhere.Scope(), "cluster.admin", rbac.User, "manager"), grant(far.Scope(), "guard", rbac.User, "guardian"),
+				grant(workspace.Scope(), "workspace.guard", rbac.User, "guardian"))
+			h.join(t, "u", "v")
+			crew := rbac.Member{Group: "crew", Principal: identity("u")}
+			if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{crew}); err != nil {
+				t.Fatal(err)
+			}
+			manager, guardian := h.as(t, "manager"), h.as(t, "guardian")
+			deny := func(ctx context.Context, on rbac.Resource, id string) error {
+				return h.authz.SetDeny(ctx, guardian, on, rbac.Deny{ID: id, Principals: []rbac.Principal{manager.Principal}, Permissions: []rbac.Permission{grantC}})
+			}
+			// Off the path of the cluster u loses access on.
+			if before {
+				if err := deny(ctx, far, "far"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			meanwhile = func(ctx context.Context) error { return deny(ctx, workspace, "frozen") }
+			change := func() error {
+				return h.authz.ChangeMembers(ctx, manager, "t1", []rbac.Member{{Group: "other", Principal: identity("v")}}, []rbac.Member{crew})
+			}
+			want := rbac.ErrConflict
+			if before {
+				want = rbac.ErrDenied
+			}
+			if err := change(); !errors.Is(err, want) {
+				t.Fatalf("removing u from crew while a deny on its cluster's path was set: %v", err)
+			}
+			if meanwhile != nil {
+				t.Fatal("the deny should have been set meanwhile")
+			}
+			if err := change(); !errors.Is(err, rbac.ErrDenied) {
+				t.Fatalf("tried again: %v", err)
+			}
+			if !allowed(t, h, rbac.Subject{Principal: identity("u")}, login, cluster) {
+				t.Fatal("u should keep its login on the cluster")
+			}
+		})
+	}
+}
+
+// Deleting a group that doesn't exist does nothing, and asks Config.ResourceOf nothing of it, nor
+// the constraints, under a freeze on groups as where a label would be asked for, with labels
+// declared or not: a constraint that fails on a group the host doesn't know fails no deletion of
+// it. One that exists is asked about.
+func TestDeletingAGroupThatDoesntExistUnderAFreezeAsksTheHostNothing(t *testing.T) {
+	for _, labels := range []bool{false, true} {
+		t.Run(fmt.Sprintf("labels %t", labels), func(t *testing.T) {
+			var asked []string
+			mutate := []func(*rbac.Config){func(c *rbac.Config) {
+				resourceOf := c.ResourceOf
+				c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+					if s.Type == rbac.GroupScope {
+						asked = append(asked, "ResourceOf "+s.ID)
+						if s.ID == "ghost" {
+							return rbac.Resource{}, errors.New("no such group")
+						}
+					}
+					return resourceOf(ctx, tenant, s)
+				}
+				c.Constraints = []rbac.Constraint{{Name: "freeze", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+					if in.Permission != rbac.GrantPermission(rbac.GroupScope) {
+						return false, nil
+					}
+					if r := in.Resource; r != nil && r.Type == rbac.GroupScope {
+						asked = append(asked, "freeze "+r.ID)
+						if r.ID == "ghost" {
+							return false, errors.New("no such group")
+						}
+					}
+					return true, nil
+				}}}
+			}}
+			if labels {
+				mutate = append(mutate, withLabels)
+			}
+			h := grouped(t, mutate...)
+			if err := h.authz.DeleteGroup(t.Context(), h.as(t, "groups"), "t1", "ghost"); err != nil || len(asked) > 0 {
+				t.Fatalf("deleting a group that doesn't exist under a freeze: %v, asked %q", err, asked)
+			}
+			h.groups(t, "real")
+			if err := h.authz.DeleteGroup(t.Context(), h.as(t, "groups"), "t1", "real"); err != nil || !slices.Contains(asked, "freeze real") {
+				t.Fatalf("deleting a group that exists under a freeze: %v, asked %q", err, asked)
+			}
+		})
+	}
+}
+
+// Deleting a group revokes what is granted on its scope, so while anything is, a freeze there
+// stops it, as it stops Apply revoking there: a constraint, or a deny on its path, that removes the
+// actor's power to change grants on it.
+func TestAFreezeOnAGroupsScopeStopsDeletingIt(t *testing.T) {
+	tenantGuard := rbac.RoleDefinition{ID: "tenant.guard", Permissions: []rbac.Permission{rbac.DenyPermission(rbac.TenantScope)}, ResourceTypes: []string{rbac.TenantScope}}
+	h := grouped(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), groupAdmin, tenantGuard)
+		c.Constraints = []rbac.Constraint{{Name: "freeze", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			return in.Permission == rbac.GrantPermission(rbac.GroupScope) && (in.Resource == nil || in.Resource.ID == "ops"), nil
+		}}}
+	})
+	ctx := t.Context()
+	h.groups(t, "ops", "spare", "dev")
+	lead := func(group string) rbac.Grant {
+		return grant(rbac.Scope{Type: rbac.GroupScope, ID: group}, "group.members", rbac.User, "lead")
+	}
+	h.seed(t, lead("ops"), lead("spare"), lead("dev"), grant(rbac.TenantRoot("t1"), "group.admin", rbac.User, "admin"),
+		grant(rbac.TenantRoot("t1"), "tenant.guard", rbac.User, "guardian"))
+	groups := h.as(t, "groups")
+	ops := rbac.Resource{Tenant: "t1", Type: rbac.GroupScope, ID: "ops"}
+	if err := h.authz.Apply(ctx, h.as(t, "admin"), ops, rbac.Change{Revoke: []rbac.Binding{{Role: "group.members", Principal: identity("lead")}}}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("Apply revoking on the frozen group's scope: %v", err)
+	}
+	if err := h.authz.DeleteGroup(ctx, groups, "t1", "ops"); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("deleting a group a grant on whose frozen scope it would revoke: %v", err)
+	}
+	if !allowed(t, h, h.as(t, "lead"), rbac.GroupMembers, ops) {
+		t.Fatal("the lead should still manage ops's members")
+	}
+	if err := h.authz.DeleteGroup(ctx, groups, "t1", "spare"); err != nil {
+		t.Errorf("deleting a group whose scope isn't frozen: %v", err)
+	}
+	if err := h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{lead("ops")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.DeleteGroup(ctx, groups, "t1", "ops"); err != nil {
+		t.Errorf("deleting a frozen group nothing is granted on: %v", err)
+	}
+	tenant := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), tenant, rbac.Deny{
+		ID: "nogroups", Principals: []rbac.Principal{groups.Principal}, Permissions: []rbac.Permission{rbac.GrantPermission(rbac.GroupScope)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.DeleteGroup(ctx, groups, "t1", "dev"); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("deleting a group a grant on whose scope it would revoke, where a deny removes the power to change grants: %v", err)
+	}
+}
+
+// The host's own writes make none of the checks a change an actor makes does, so a freeze stops
+// none of them, as it stops no DeleteGrants: the host keeps its own state as it decides.
+func TestAFreezeStopsNoneOfTheHostsWrites(t *testing.T) {
+	h := grouped(t, constrain("freeze", grantC))
+	ctx := t.Context()
+	h.groups(t, "crew", "other")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"), grant(cluster.Scope(), "cluster.login", rbac.Group, "other"))
+	h.join(t, "u", "v", "w", "x")
+	in := func(group, id string) rbac.Member { return rbac.Member{Group: group, Principal: identity(id)} }
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{in("crew", "u"), in("crew", "v"), in("crew", "w"), in("other", "x")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", nil, []rbac.Member{in("crew", "u")}); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("an actor removing under the freeze: %v", err)
+	}
+	sooner := in("crew", "v")
+	sooner.ExpiresAt = h.now.Add(time.Minute)
+	for what, write := range map[string]func() error{
+		"DeleteMembers": func() error { return h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{in("crew", "u")}) },
+		"ImportMembers": func() error { return h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{sooner}) },
+		"SetMemberships": func() error {
+			return h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("w"), ExpiresAt: h.now.Add(time.Minute)}})
+		},
+		"DeleteGroups": func() error { return h.authz.DeleteGroups(ctx, host, "t1", []string{"other"}) },
+		"DeleteGrants": func() error {
+			return h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.Group, "crew")})
+		},
+	} {
+		if err := write(); err != nil {
+			t.Errorf("%s under the freeze: %v", what, err)
+		}
+	}
+}
+
 func TestAGrantToAGroupMadeWhileMembersAreAskedAboutIsTriedAgain(t *testing.T) {
 	var h *harness
 	var meanwhile func(ctx context.Context) error
@@ -3822,6 +4274,45 @@ func TestAGrantToAGroupMadeWhileMembersAreAskedAboutIsTriedAgain(t *testing.T) {
 	}
 	if err := h.authz.ChangeMembers(ctx, manager, "t1", add, nil); err != nil {
 		t.Fatalf("tried again: %v", err)
+	}
+}
+
+// A change adding members to two groups is tried again when, while the host is asked about what
+// one's member gains through the group it is in, the other is nested in that group too: the change
+// holds its lock already, and what it holds was asked about for the first member alone, so the
+// other's would gain it unasked.
+func TestAGroupNestedMeanwhileInOneAnotherJoinedGroupIsInIsTriedAgain(t *testing.T) {
+	for _, how := range []string{"ChangeMembers", "ImportMembers"} {
+		t.Run(how, func(t *testing.T) {
+			var meanwhile func(context.Context) error
+			h := meanwhileAsked(t, rbac.ViaMembership, &meanwhile)
+			ctx := t.Context()
+			h.groups(t, "devs", "ops")
+			h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "staff"))
+			if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "staff", Principal: groupOf("ops")}}); err != nil {
+				t.Fatal(err)
+			}
+			h.join(t, "u", "v")
+			add := []rbac.Member{{Group: "devs", Principal: identity("u")}, {Group: "ops", Principal: identity("v")}}
+			change := func() error {
+				if how == "ImportMembers" {
+					return h.authz.ImportMembers(ctx, host, "t1", add)
+				}
+				return h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", add, nil)
+			}
+			meanwhile = func(ctx context.Context) error {
+				return h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "staff", Principal: groupOf("devs")}})
+			}
+			if err := change(); !errors.Is(err, rbac.ErrConflict) {
+				t.Fatalf("a change adding to a group nested meanwhile in one another it adds to is in: %v", err)
+			}
+			if meanwhile != nil {
+				t.Fatal("devs should have been nested in staff meanwhile")
+			}
+			if err := change(); err != nil {
+				t.Fatalf("tried again: %v", err)
+			}
+		})
 	}
 }
 
@@ -4324,6 +4815,16 @@ func commitOnceWaitedOn(t *testing.T, h *harness, tx pgx.Tx, done chan error) {
 	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
 		t.Fatal(err)
 	}
+	waitedOn(t, h, pid, done)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// waitedOn returns once a session waits on the session pid, as the change reporting to done does
+// for a lock it holds, or that change has finished, leaving its result in done.
+func waitedOn(t *testing.T, h *harness, pid int32, done chan error) {
+	t.Helper()
 	for waiting := false; !waiting; {
 		select {
 		case err := <-done:
@@ -4331,14 +4832,84 @@ func commitOnceWaitedOn(t *testing.T, h *harness, tx pgx.Tx, done chan error) {
 			waiting = true
 		default:
 			// By the transaction it waits on, as other sessions on the server may wait on locks of their own.
-			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
+			if err := h.pool.QueryRow(t.Context(), `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
 				t.Fatal(err)
 			}
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
+}
+
+// heldActivation is an activation paused in its transaction once it has written its grant, holding
+// the places in groups it rests on: its session's pid, and release, which lets it commit.
+type heldActivation struct {
+	pid     int32
+	release chan struct{}
+}
+
+// pausingActivation has the next activation made once armed is set pause in its transaction, as
+// OnChange runs there, sending what it holds to paused, until it is released.
+func pausingActivation(armed *atomic.Bool, paused chan<- heldActivation) func(*rbac.Config) {
+	return func(c *rbac.Config) {
+		onChange := c.OnChange
+		c.OnChange = func(ctx context.Context, tx pgx.Tx, e rbac.ChangeEvent) error {
+			if len(e.Granted) == 1 && e.Granted[0].Source == rbac.SourceActivation && armed.CompareAndSwap(true, false) {
+				var pid int32
+				if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+					return err
+				}
+				release := make(chan struct{})
+				paused <- heldActivation{pid, release}
+				<-release
+			}
+			return onChange(ctx, tx, e)
+		}
+	}
+}
+
+// activateAsTheHostDeletes has s activate role on r through an eligibility of eligible's while the
+// host deletes eligible's grants and eligibilities: the activation reads the eligibility before the
+// host's deletion commits, and pauses before committing itself, holding the places it rests on,
+// once the deletion has (pausingActivation, armed with paused). So it outlasts the eligibility, as
+// one made just before its deletion does, and commits once released. It returns it, and what
+// Activate returns then.
+func activateAsTheHostDeletes(t *testing.T, h *harness, armed *atomic.Bool, paused <-chan heldActivation, s rbac.Subject, r rbac.Resource,
+	role rbac.Role, eligible rbac.Principal,
+) (heldActivation, chan error) {
+	t.Helper()
+	ctx := t.Context()
+	hostTx, err := h.pool.Begin(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = hostTx.Rollback(ctx) }()
+	if err := h.authz.WithTx(hostTx).DeletePrincipal(ctx, host, r.Tenant, eligible); err != nil {
+		t.Fatal(err)
+	}
+	armed.Store(true)
+	activated := make(chan error, 1)
+	go func() {
+		_, err := h.authz.Activate(ctx, s, r, rbac.Activation{Role: role, Duration: 30 * time.Minute, Justification: "INC-1"})
+		activated <- err
+	}()
+	var a heldActivation
+	select {
+	case a = <-paused:
+	case err := <-activated:
+		t.Fatalf("Activate: %v", err)
+	}
+	// A test that fails before releasing it would leave its transaction holding the places, and the
+	// test's cleanup waiting on it.
+	t.Cleanup(func() {
+		select {
+		case <-a.release:
+		default:
+			close(a.release)
+		}
+	})
+	if err := hostTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return a, activated
 }
 
 func TestWhatEndedGivesAChangeToMembersNothingToCheck(t *testing.T) {
@@ -4798,6 +5369,183 @@ func TestMembersGainAtMostMaxBindingsGrantsInAChange(t *testing.T) {
 	alone := []rbac.Member{two[0], {Group: "empty", Principal: identity("y")}}
 	if err := h.authz.ChangeMembers(ctx, manager, "t1", alone, nil); err != nil || validated != rbac.MaxBindings+1 {
 		t.Fatalf("one member alone gaining %d grants, and one gaining none: %v, Config.ValidateGrant asked %d times", rbac.MaxBindings+1, err, validated)
+	}
+}
+
+// A member is its principal: added to a group from several sources, and to a group that one is in,
+// it gains what they reach, and the host is asked about each grant it gains once, so it gains no
+// more than one of those places alone, whatever its group holds. Past MaxBindings, a change gains no
+// more than one place alone does: one member joining two groups that hold more in all, or two
+// members, are refused before the host is asked about any of it.
+func TestAMemberAddedToSeveralGroupsIsOneMember(t *testing.T) {
+	var validated int
+	h := grouped(t, func(c *rbac.Config) {
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			if in.Via == rbac.ViaMembership {
+				validated++
+			}
+			return validate(ctx, q, in)
+		}
+	})
+	ctx := t.Context()
+	h.groups(t, "g1", "g2", "top")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "top", Principal: groupOf("g1")}, {Group: "top", Principal: groupOf("g2")}}); err != nil {
+		t.Fatal(err)
+	}
+	// Each group holds a role on each of n clusters, which the manager may grant there.
+	held := map[string]int{"g1": 800, "g2": 400, "top": 300}
+	for group, n := range held {
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', $1 || i, p, id, r FROM generate_series(1, $2::int) i,
+			  (VALUES ('group', $1, 'cluster.login'), ('user', 'manager', 'cluster.admin')) AS g(p, id, r)`, group, n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.join(t, "ann", "bob", "carol", "dan")
+	manager := h.as(t, "manager")
+	ann := []rbac.Member{{Group: "g1", Principal: identity("ann")}, {Group: "g1", Principal: identity("ann"), Source: "ops"}, {Group: "top", Principal: identity("ann")}}
+	gains := held["g1"] + held["top"]
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", ann, nil); err != nil || validated != gains {
+		t.Fatalf("one member added to a group from two sources, and to the group it is in, gaining %d grants: %v, Config.ValidateGrant asked %d times",
+			gains, err, validated)
+	}
+	for what, add := range map[string][]rbac.Member{
+		"one member added to two groups":    {{Group: "g1", Principal: identity("dan")}, {Group: "g2", Principal: identity("dan")}},
+		"two members added to a group each": {{Group: "g1", Principal: identity("bob")}, {Group: "g2", Principal: identity("carol")}},
+	} {
+		validated = 0
+		if err := h.authz.ChangeMembers(ctx, manager, "t1", add, nil); !errors.Is(err, rbac.ErrInvalid) || validated != 0 {
+			t.Errorf("%s, gaining more than MaxBindings in all and than either place alone: %v, Config.ValidateGrant asked %d times", what, err, validated)
+		}
+	}
+}
+
+// A principal joining many groups that are all in one gains what that one holds once, so a change
+// gaining more than MaxBindings through it is no more than one place in it alone: what it builds,
+// and asks the host about, is that, not that for each group it joins, so it allocates about as
+// much as one member joining that group does.
+func TestAMemberJoiningManyGroupsInOneBuildsWhatOnePlaceGains(t *testing.T) {
+	var validated int
+	h := grouped(t, func(c *rbac.Config) {
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			if in.Via == rbac.ViaMembership {
+				validated++
+			}
+			return validate(ctx, q, in)
+		}
+	})
+	ctx := t.Context()
+	var groups []string
+	for i := range rbac.MaxBindings {
+		groups = append(groups, fmt.Sprintf("g%d", i))
+	}
+	h.groups(t, append(groups, "top")...)
+	// Each group is in top, which holds a role on more clusters than MaxBindings, which the manager
+	// may grant there.
+	grants := rbac.MaxBindings + 1
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+		SELECT 't1', 'top', 'group', unnest($1::text[])`, groups); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		SELECT 't1', 'cluster', 'top' || i, p, id, r FROM generate_series(1, $1::int) i,
+		  (VALUES ('group', 'top', 'cluster.login'), ('user', 'manager', 'cluster.admin')) AS g(p, id, r)`, grants); err != nil {
+		t.Fatal(err)
+	}
+	h.join(t, "ann", "bob")
+	manager := h.as(t, "manager")
+	// What a change adding add allocates, and how often it asks the host.
+	change := func(add []rbac.Member) (uint64, int) {
+		t.Helper()
+		validated = 0
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		before := m.TotalAlloc
+		if err := h.authz.ChangeMembers(ctx, manager, "t1", add, nil); err != nil {
+			t.Fatalf("adding %d members: %v", len(add), err)
+		}
+		runtime.ReadMemStats(&m)
+		return m.TotalAlloc - before, validated
+	}
+	one, asked := change([]rbac.Member{{Group: "top", Principal: identity("bob")}})
+	if asked != grants {
+		t.Fatalf("one member added to top, gaining %d grants: Config.ValidateGrant asked %d times", grants, asked)
+	}
+	var add []rbac.Member
+	for _, g := range groups {
+		add = append(add, rbac.Member{Group: g, Principal: identity("ann")})
+	}
+	many, asked := change(add)
+	if asked != grants || many > 8*one {
+		t.Fatalf("one member added to %d groups in top, gaining %d grants: Config.ValidateGrant asked %d times, and allocated %d MiB, one place in top %d MiB",
+			len(add), grants, asked, many>>20, one>>20)
+	}
+}
+
+// A principal leaving many groups that are all in one, through which it activated on many scopes,
+// loses access on each of those scopes once, so what the change builds for its activations is
+// found once for the principal, not once for each group it leaves: they cost it about what they
+// cost leaving one of the groups.
+func TestAMemberLeavingManyGroupsInOneReadsItsActivationsOnce(t *testing.T) {
+	h := grouped(t, func(c *rbac.Config) {
+		// Declared, so a removal reads what its members lose, as a freeze could stop it taking that
+		// away; it stops nothing.
+		c.Constraints = []rbac.Constraint{{Name: "thawed", Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) { return false, nil }}}
+	})
+	ctx := t.Context()
+	var groups []string
+	for i := range rbac.MaxBindings {
+		groups = append(groups, fmt.Sprintf("g%d", i))
+	}
+	h.groups(t, append(groups, "top")...)
+	h.join(t, "u")
+	// Each group is in top, and u in each, and in top itself, so it keeps what top gives, and its
+	// activations through top, however many of the others it leaves.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+		SELECT 't1', 'top', 'group', unnest($1::text[]) UNION ALL SELECT 't1', 'top', 'user', 'u'`, groups); err != nil {
+		t.Fatal(err)
+	}
+	activated := func(n int) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_grants WHERE tenant = 't1' AND source = 'activation'`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at, activated_through)
+			SELECT 't1', 'cluster', 'top' || i, 'user', 'u', 'cluster.login', 'activation', $2, 'group:top' FROM generate_series(1, $1::int) i`,
+			n, h.now.Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manager := h.as(t, "manager")
+	// What a change removing remove allocates, its places made again after it.
+	change := func(remove []rbac.Member) uint64 {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+			SELECT 't1', unnest($1::text[]), 'user', 'u' ON CONFLICT DO NOTHING`, groups); err != nil {
+			t.Fatal(err)
+		}
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		before := m.TotalAlloc
+		if err := h.authz.ChangeMembers(ctx, manager, "t1", nil, remove); err != nil {
+			t.Fatalf("removing %d members: %v", len(remove), err)
+		}
+		runtime.ReadMemStats(&m)
+		return m.TotalAlloc - before
+	}
+	var all []rbac.Member
+	for _, g := range groups {
+		all = append(all, rbac.Member{Group: g, Principal: identity("u")})
+	}
+	activated(1)
+	bare := change(all)
+	activated(rbac.MaxBindings)
+	one, many := change(all[:1]), change(all)
+	if many > bare+8*one {
+		t.Fatalf("a member with %d activations through top leaving %d groups in it allocated %d MiB, with one activation %d MiB, and leaving one of them %d MiB",
+			rbac.MaxBindings, len(all), many>>20, bare>>20, one>>20)
 	}
 }
 

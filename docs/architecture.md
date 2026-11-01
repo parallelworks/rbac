@@ -285,9 +285,16 @@ flowchart BT
   change and however many of the groups are in one that reaches it, and its grants are decided once
   for each role, condition and end on a scope, as the member a grant names decides nothing of the
   actor's power to make it; only the host is asked about each member's, which `MaxBindings` bounds
-  for `ChangeMembers` but for one member alone. `ImportMembers`, the host's own write, which no
-  actor's access decides, asks it once for each member and each grant or eligibility the member
-  gains, with no bound on them, so its cost grows with that.
+  for `ChangeMembers` but for what one place alone gains. A member is its principal: what all the
+  groups, and places in one, a change gives it reach is counted, and asked about, once for each end
+  its places give it (`gainsWithin`, `askMemberships`), so a group two of them are in counts once,
+  as does a group it is placed in from two sources until one end; past `MaxBindings`, a change
+  gains no more than its largest place alone does, so joining several groups never multiplies what
+  one change asks, nor what it builds: the grants it checks and the footprint `stillReached`
+  compares are found from what each principal gains (`gained`), and from the groups holding it,
+  not from each group that reaches them. `ImportMembers`, the host's own write, which no actor's access decides, asks it
+  once for each member and each grant or eligibility the member gains, with no bound on them, so
+  its cost grows with that.
 - **Expanding down** from groups to their identities, for lists and changes, is `insideSQL`. It
   finds nested groups in the statement and their identities through `rbac_group_members`, which
   plans its query for the groups reached, so a small group's members are read alone however large
@@ -453,11 +460,39 @@ sequenceDiagram
   `GrantableRoles`, it may grant only those roles, without holding them. Through any other role, it
   may grant a role only if it holds every permission of it, for every type the grant reaches.
   Either way, a limited grant permission can't mint a larger one.
+- **Freezes.** A constraint removing `<type>:grant` from the actor on a scope, as a host freezes
+  changes under a container, or a deny on its path doing so, stops `Apply` changing grants there,
+  revoking them too.
+  Every change an actor makes that takes access away there is stopped alike, whatever the actor's
+  grants, as it needn't hold what it takes away: `SetRole` narrowing and `DeleteRole` deleting a
+  role granted there (`changesStopped`, `scopesDenied`); `ChangeMembers` removing a member of a
+  group holding access there, ending its place sooner, ending an activation made through the group
+  there, or adding a member to a group a deny there names (`reachCheck.stopped`); and
+  `DeleteGroup` with grants or eligibilities in force on the group's scope. Each is stopped by what
+  it ends there, not by what the members hold after it, as `Apply` revoking a grant held twice is:
+  a member leaving a group ends what the group and those it is in give it there, though another
+  group gives it the same, but a place ending while another, from another source, keeps the member
+  in the group as long leaves nothing (`placesLeft`). `ChangeMembers` asks the
+  constraints once about each type of scope a member only loses access on, of no resource
+  (`freezes`), and reads the types whose power to change grants a deny binding the actor lists
+  (`grantsDenied`); only for a scope of a type either names, or whose label can refuse the actor, is
+  `Config.ResourceOf` asked, and then the constraints again about it and the denies on its path, in
+  one read with the rest (`reachAuthority`). In its transaction the denies are read again, and a
+  type one binding the actor now names that none did refuses the change with `ErrConflict`. The
+  host's own writes make no check of an actor, so no freeze stops them.
 - **Until when.** What the actor holds only until a time, through an expiring grant, an activation,
   or a membership or place in a group that ends, it hands on only until then: `authorityOn` reads
   when each grant's holding ends, in the statement that reads the grants, and a grant may end no
   later than the latest holding of each permission it hands on. An eligibility, a custom role's
   definition and a place in a group that gains an eligibility need what they hand on held for good.
+  Of the grants that count under a grant's condition, a decision reads only the role of each, how
+  its principal carries it and whether it lasts until the grant ends, so `decidedAs` decides a grant
+  until the soonest time at or after its end that the longest lasting of a kind of them ends, and
+  grants ending between two such times share a decision: grants of one role to the actor's many
+  groups, each ending at its own hour, are one kind, so a change granting a role to a thousand
+  principals, each until its own hour, walks the roles it lists once. `heldFor` and `under` read how
+  long the actor's grants give each permission, and the power to change grants, once for each
+  question, whatever end it asks about, so each later end is one comparison.
 - **Standing.** The host's answers rest on who is a member of what. `stand` fingerprints the
   memberships behind them, and `stillStanding` refuses the change with `ErrConflict` if any changed
   while the change waited for its locks.
@@ -499,10 +534,15 @@ sequenceDiagram
   `Activate` holds the places it can rest on until it commits, in the statement that reads the
   keys it finds its subject eligible through, so the two wait for each other, and a place nested
   between them makes no one eligible. Setting the eligibility again or deleting it leaves its
-  activations to their own ends, or to their holders leaving its group: where labels are declared,
-  `ChangeMembers` reads the activations of the members leaving made through the groups it reaches
-  and checks the label of each one's scope as a revoke there, and `DeleteGroup` refuses a group
-  they rest on.
+  activations to their own ends, or to their holders leaving its group: where labels or a freeze
+  can refuse it, `ChangeMembers` reads the activations of the members leaving made through the
+  groups it reaches, each principal's once however many of its places end (`activatedBy`), and
+  checks each one's scope as a revoke there, and `DeleteGroup` refuses a group
+  they rest on. Both read them only once they hold the places they end (`restingIn`, and
+  `unrested` once `removeGroups` holds them), so an activation `Activate` commits while one waits
+  for them, through an eligibility deleted meanwhile, is read as one made before: `ChangeMembers`
+  finds it in `stillReached`, which it hadn't checked, and is tried again (`ErrConflict`), and
+  `DeleteGroup` refuses it. Read before them, it would be ended unchecked.
 - **Approvals.** Approving decides access on the scope, so on a labeled one an approval counts
   only from an approver whose own label values satisfy the label: read before the transaction and
   again under its locks, with the constraints' answers on them sealed, as an actor's are, and
@@ -595,13 +635,23 @@ flowchart TB
   can't read the tenant's attributes: any read of them fails, a test of one's presence included, so
   a grant's gives nothing and a deny's denies, rather than hold or lift for what the bare tenant
   lacks. A constraint deciding them by the tenant's state reads it itself, through its `q`.
+- **A change decides each value once.** A change checking the labels of many scopes by one read of
+  the actor's values, as one to the members of many groups, decides each value once in each phase,
+  when a label first asks for it (`decidedBy`), and shares what the conditions it evaluated came to
+  across them (`runs`), so a condition that doesn't read the action runs once for all of them. Each
+  value is still decided on budgets of its own, which pay for every condition they read, whether
+  they ran it or a value before them did, so it decides as a check of it alone would, and what one
+  label asked for first never changes what another is decided by.
 - **Releasing and writing.** `ReleasePermission(dimension)`, held on the tenant, is the power to
   release data to a looser label in that dimension, so only a holder of it can downgrade data. A
   `Holding`'s `MayWrite` and `MayRelease` say whether data read under one label may be written, or
   released, under another.
 - **Exclusive values are checked when they change.** A change that would let anyone hold two
   values of an Exclusive dimension is refused, after its writes and under its locks. `Conflicts`
-  lists anyone left able to, as a catalog change can leave them.
+  lists anyone left able to, as a catalog change can leave them. Which values an actor holds none
+  of, and so can't hand on, a change reaching many scopes decides from each path's grants
+  (`authorities`), reading each of its roles' permissions once for all of them. Where no dimension
+  is exclusive, nothing is read.
 
 ## Transactions and locks
 
@@ -630,9 +680,12 @@ flowchart TB
   before grants, so they don't deadlock. A revoke locks the grants it deletes in that order too, as
   a change ending places in groups ends activations among them without their scope's lock. Every
   change holds grants last, after its places and memberships, as `Activate` holds the places an
-  activation rests on before its grant. `DeleteRole` removes a role's grants before its
-  eligibilities, but holds the tenant's lock exclusive, so no change runs beside it but
-  `DeleteExpired`, which waits on no row.
+  activation rests on before its grant. A change ending places holds them before it reads what
+  rests on them: `ChangeMembers` right after its advisory locks, before what it reaches is read
+  again, and `DeleteGroup` in `removeGroups`, after the eligibilities and denies it removes, in the
+  order the deletes take them, before it reads its members' activations. `DeleteRole` removes a
+  role's grants before its eligibilities, but holds the tenant's lock exclusive, so no change runs
+  beside it but `DeleteExpired`, which waits on no row.
 - **One snapshot for reads in several statements.** Explain, Reachable and Holders read in one
   REPEATABLE READ, READ ONLY transaction of their own on a pool, and AsOf in a REPEATABLE READ one
   it rolls back. Explain, Reachable and Holders read what label values are decided by in it, and
@@ -822,7 +875,7 @@ refuses a row of more than 1 MiB as jsonb all the same.
 | Bound | Value | What it limits |
 |---|---|---|
 | `MaxID` | 512 bytes | A tenant's, scope's or principal's id. |
-| `MaxBindings` | 1,000 | Bindings in one `Apply`, and the grants, memberships, groups or members one `Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`, `DeleteGroups`, `ImportMembers`, `ChangeMembers` or `DeleteMembers` takes, and the grants and eligibilities the members one `ChangeMembers` adds gain, each member's counted apart, as `ValidateGrant` is asked about each, but one member alone, which gains whatever its groups hold. The host's own `ImportMembers` is asked about each with no such bound. |
+| `MaxBindings` | 1,000 | Bindings in one `Apply`, and the grants, memberships, groups or members one `Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`, `DeleteGroups`, `ImportMembers`, `ChangeMembers` or `DeleteMembers` takes, and the grants and eligibilities the members one `ChangeMembers` adds gain, each member's counted apart, by its principal, as `ValidateGrant` is asked about each, but no more than one place alone gains, whatever its group and those it is in hold. The host's own `ImportMembers` is asked about each with no such bound. |
 | `MaxGrantsPerRole` | 20 | Grants in force of one role to one principal on one scope, differing by source, expiry or condition. Those from each source the host owns count apart. |
 | `MaxDenies`, `MaxDenyEntries` | 100, 256 | Denies on a scope, and the principals, exemptions or permissions one names. |
 | `MaxCustomRoles`, `MaxRoleEntries`, `MaxGrantableRoles` | 300, 1,000, 64 | Custom roles in a tenant, the permissions one gives and the types it is for, and roles one lists in `GrantableRoles`. |
