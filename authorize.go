@@ -1201,8 +1201,8 @@ type Columns struct {
 	// compared byte for byte, whatever its collation, which the index serves in. Its first element,
 	// at whatever subscript the array starts from, is the resource's own key, whose type Filter
 	// tests, so the table can hold resources of several types. It is one-dimensional, as Path gives
-	// it: an array of more has no element at one subscript, so Filter can leave out a row of one that
-	// Authorize allows, but keeps none it refuses.
+	// it: an array of more has no element at one subscript, so its row has no own key, and Filter
+	// leaves it out.
 	Path string
 	// Labels is a text[] holding the resource's label as `dimension:value` values, never NULL: '{}'
 	// for none. The label's test, which keeps only the rows the subject's holding satisfies,
@@ -1236,9 +1236,11 @@ type Predicate struct {
 // be too strict. It keeps only the rows whose own key, their path's first, is of the type, so the
 // host's table can hold resources of several types, as one store of every resource does, where a
 // grant on a container reaches every row under it. The planner can't tell how many of a table's
-// rows are of a type, and counts the condition as keeping as many as of a table of one type: a
-// host listing a type from a table of several tests its own column of the type too, whose
-// statistics count them.
+// rows are of a type, and counts the condition as keeping as many as of a table of one type: a host
+// listing a type from a table of several tests its own column of the type too, whose statistics
+// count them, and indexes it after the tenant and before what a page sorts by, as
+// (tenant, type, id): with an index of the tenant alone, a sorted page of a type of few rows reads
+// the rows of every type until it is full.
 func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant, resourceType string, cols Columns, firstArg int) (Predicate, error) {
 	a = a.still()
 	if cols.Tenant == "" || cols.Path == "" || firstArg < 1 {
@@ -1306,14 +1308,14 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	// keys of a type sort from `type:` to before `type;` only in the C collation. A grant on a
 	// container reaches every row under it, so without the test a table holding several types, as
 	// one store of every resource, keeps the rows of every type there, which Authorize refuses p on.
-	// The planner has no statistics of a path's first key and counts a test of it as keeping one row
-	// in 200, so where no index serves the condition, a sorted, limited page of a table of one type,
-	// where the test keeps every row, was planned to read and sort every row of the tenant, rather
-	// than read them in order until the page is full. So the test picks the keys the denies are
-	// looked up by, a lookup the planner counts alike whatever its keys: a row of another type has
-	// none, so its lookup is unknown rather than false, and the row is left out. IS FALSE, which the
-	// planner counts as it counts NOT, keeps the condition false there, not unknown, for a host that
-	// selects it as a column.
+	// The planner has no statistics of a path's first key and would count a plain test of it as
+	// keeping one row in 200, so where no index serves the condition, a sorted, limited page of a
+	// table of one type, where the test keeps every row, would be planned to read and sort every row
+	// of the tenant, rather than read them in order until the page is full. So the test picks the
+	// keys the denies are looked up by, a lookup the planner counts alike whatever its keys: a row of
+	// another type has none, so its lookup is unknown rather than false, and the row is left out. IS
+	// FALSE, which the planner counts as it counts NOT, keeps the condition false there, not unknown,
+	// for a host that selects it as a column.
 	typed := fmt.Sprintf(`CASE WHEN starts_with(%s, %s::text || ':') THEN %s END`, own, arg(9), cols.Path)
 	var deniedByKey string
 	if !a.contains(resourceType) {
@@ -1485,7 +1487,7 @@ func ofType(col, t string) string {
 // however many there are, and compares byte for byte. A hashed subquery for each key would need one
 // for each depth a path can have, which has no bound, and one inside a subquery over a row's keys
 // is built again for every row. jsonb_exists_any is the operator `?|`, which a host's query builder
-// could read as a placeholder.
+// could read as a placeholder. It is NULL where col is, which Filter's test of a row's type needs.
 func keyed(col, scopes string) string {
 	return fmt.Sprintf(`jsonb_exists_any((SELECT coalesce(jsonb_object_agg(s, true), '{}') FROM (%s) AS k(s)), %s)`, scopes, col)
 }

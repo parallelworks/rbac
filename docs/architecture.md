@@ -538,22 +538,22 @@ flowchart LR
   refuse. It keeps only the rows whose own key is of the listed type, as a grant on a container
   reaches every row under it, of any type, so one table can hold several. The planner has no
   statistics of a path's first key and counts a test of it alone as keeping one row in 200, which
-  turned a sorted page of a table of one type, whose condition no index serves, into a read and sort
-  of the whole tenant. So the type picks the keys a row's denies are looked up by, which the planner
-  counts alike whatever they are: a row of another type has none, so its lookup is unknown rather
-  than false, and the row is left out. The subject's grants are matched through the path's GIN
-  index, which merges the rows each finds, so its cost for each row grows with their number. Past a
-  few on resources of the listed type, each row's own key is looked up in a hash of them, and past
-  128 on containers and the tenant, or past a few alongside those, each of its keys in one object of
-  them all, so one with a grant on everything it created costs a row a few lookups; no index serves
-  that, so the query reads every row of the tenant its other conditions keep. Denies are looked up
-  so whatever their number: those on resources of the type by the row's own key, and those on
-  containers and the tenant by each of its keys. Those naming the subject or its groups are read by
-  those keys alone. Those naming the public or the tenant's members bind everyone, and any number of
-  them can be on scopes of other types, which no index tells apart: while fewer than 16 denies are
-  on scopes of the types a list reads, it reads those by type, and otherwise finds the ones naming
-  everyone by those keys, so a tenant with many of both has every list read every deny naming
-  everyone.
+  would turn a sorted page of a table of one type, whose condition no index serves, into a read and
+  sort of the whole tenant. So the type picks the keys a row's denies are looked up by, which the
+  planner counts alike whatever they are: a row of another type has none, so its lookup is unknown
+  rather than false, and the row is left out. The subject's grants are matched through the path's
+  GIN index, which merges the rows each finds, so its cost for each row grows with their number.
+  Past a few on resources of the listed type, each row's own key is looked up in a hash of them, and
+  past 128 on containers and the tenant, or past a few alongside those, each of its keys in one
+  object of them all, so one with a grant on everything it created costs a row a few lookups; no
+  index serves that, so the query reads every row of the tenant its other conditions keep. Denies
+  are looked up so whatever their number: those on resources of the type by the row's own key, and
+  those on containers and the tenant by each of its keys. Those naming the subject or its groups are
+  read by those keys alone. Those naming the public or the tenant's members bind everyone, and any
+  number of them can be on scopes of other types, which no index tells apart: while fewer than 16
+  denies are on scopes of the types a list reads, it reads those by type, and otherwise finds the
+  ones naming everyone by those keys, so a tenant with many of both has every list read every deny
+  naming everyone.
 - **Reachable** returns the same as scopes, for a host that keeps its resources elsewhere. They hold
   for resources of the listed type alone: a scope reaches everything under it, of any type, so a
   store holding several keeps to the type itself. Conditional grants and conditional denies come
