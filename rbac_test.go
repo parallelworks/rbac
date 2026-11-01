@@ -6178,6 +6178,105 @@ func TestARoleListsOnlyRolesItsGrantPermissionsReach(t *testing.T) {
 	}
 }
 
+// A role keeps a listing that already hands nothing on as it is stored, as one of a role narrowed
+// since, one a catalog change left so, or one written around the package: setting it again as it is
+// read changes nothing, and renaming it needs only the power to define it. A listing that hands
+// nothing on and that the change adds, or makes so by changing the role, is refused.
+func TestARoleKeepsAListingThatAlreadyHandsNothingOn(t *testing.T) {
+	later := rbac.RoleDefinition{ID: "custom.later", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	lister := rbac.RoleDefinition{ID: "custom.lister", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}}
+	for how, inert := range map[string]func(t *testing.T, h *harness) *rbac.Authorizer{
+		"the role it lists narrowed": func(t *testing.T, h *harness) *rbac.Authorizer {
+			t.Helper()
+			admin := roleAdmin(t, h)
+			listing := lister
+			listing.GrantableRoles = []rbac.Role{later.ID}
+			narrowed := later
+			narrowed.Permissions, narrowed.ResourceTypes = []rbac.Permission{rbac.DefineRoles}, []string{"tenant"}
+			for _, r := range []rbac.RoleDefinition{later, listing, narrowed} {
+				if err := h.authz.SetRole(t.Context(), admin, "t1", r); err != nil {
+					t.Fatal(err)
+				}
+			}
+			return h.authz
+		},
+		"a catalog change": func(t *testing.T, h *harness) *rbac.Authorizer {
+			t.Helper()
+			listing := lister
+			listing.GrantableRoles = []rbac.Role{"cluster.login"}
+			if err := h.authz.SetRole(t.Context(), roleAdmin(t, h), "t1", listing); err != nil {
+				t.Fatal(err)
+			}
+			moved := slices.Clone(catalog)
+			for i, r := range moved {
+				if r.ID == "cluster.login" {
+					moved[i].ResourceTypes = []string{"workspace"}
+				}
+			}
+			authz, err := rbac.New(h.pool, func() rbac.Config { c := h.cfg; c.Catalog = moved; return c }())
+			if err != nil {
+				t.Fatal(err)
+			}
+			return authz
+		},
+		"written around the package": func(t *testing.T, h *harness) *rbac.Authorizer {
+			t.Helper()
+			if _, err := h.pool.Exec(t.Context(), `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, privileged, grantable_roles)
+				VALUES ('t1', 'custom.lister', '{cluster:view,cluster:grant}', '{cluster}', true, '{workspace.admin}')`); err != nil {
+				t.Fatal(err)
+			}
+			return h.authz
+		},
+	} {
+		t.Run(how, func(t *testing.T) {
+			h := setup(t)
+			ctx := t.Context()
+			tenant := rbac.TenantRoot("t1")
+			h.seed(t, grant(tenant, "tenant.roles", rbac.User, "lead"), grant(tenant, "cluster.admin", rbac.User, "lead"))
+			lead := h.as(t, "lead")
+			authz := inert(t, h)
+			roles, err := authz.CustomRoles(ctx, "t1")
+			i := slices.IndexFunc(roles, func(r rbac.RoleDefinition) bool { return r.ID == lister.ID })
+			if err != nil || i < 0 {
+				t.Fatalf("CustomRoles = %+v, %v", roles, err)
+			}
+			h.events = nil
+			if err := authz.SetRole(ctx, lead, "t1", roles[i]); err != nil || len(h.events) != 0 {
+				t.Errorf("setting the role again as it is read: %v, %+v", err, h.events)
+			}
+			renamed := roles[i]
+			renamed.Name = "Lister"
+			if err := authz.SetRole(ctx, lead, "t1", renamed); err != nil || len(h.events) != 1 {
+				t.Errorf("renaming the role: %v, %+v", err, h.events)
+			}
+			adding := renamed
+			adding.GrantableRoles = append(slices.Clone(adding.GrantableRoles), "tenant.admin")
+			if err := authz.SetRole(ctx, lead, "t1", adding); !errors.Is(err, rbac.ErrInvalid) {
+				t.Errorf("adding a listing that hands nothing on beside it: %v", err)
+			}
+		})
+	}
+	// Listed through a power to grant on workspaces, which narrowing the role takes away.
+	h := setup(t)
+	ctx := t.Context()
+	tenant := rbac.TenantRoot("t1")
+	h.seed(t, grant(tenant, "tenant.roles", rbac.User, "lead"), grant(tenant, "cluster.admin", rbac.User, "lead"))
+	lead := h.as(t, "lead")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, privileged, grantable_roles)
+		VALUES ('t1', 'custom.lister', '{cluster:grant,cluster:view,workspace:grant}', '{cluster,workspace}', true, '{workspace.admin}')`); err != nil {
+		t.Fatal(err)
+	}
+	narrowed := lister
+	narrowed.GrantableRoles = []rbac.Role{"workspace.admin"}
+	if err := h.authz.SetRole(ctx, lead, "t1", narrowed); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("narrowing a role so that a role it lists is handed on nowhere: %v", err)
+	}
+	narrowed.GrantableRoles = nil
+	if err := h.authz.SetRole(ctx, lead, "t1", narrowed); err != nil {
+		t.Errorf("narrowing a role and the roles it lists: %v", err)
+	}
+}
+
 func TestRedefiningAListedRoleNeedsThePowerToGrantIt(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()

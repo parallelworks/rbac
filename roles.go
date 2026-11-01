@@ -366,7 +366,9 @@ func canonicalSQL(col string) string {
 // need: a definition never ends, so what the actor holds only until a time can't stand in. Each
 // of its GrantableRoles must be a role the actor may grant on the tenant, and one that a
 // `<type>:grant` the role gives, on a type it is for, lets its holders grant, as one that can be
-// granted on that type: one none does is refused as invalid. Replacing a role
+// granted on that type: one none does is refused as invalid, but where the role as stored lists it
+// and hands it on nowhere already, as once that role was narrowed or the catalog changed, it is
+// kept, and renaming the role still needs only the power to define it. Replacing a role
 // another custom role lists needs the power to grant it as defined wherever that one lists it,
 // and where it will give more, under the denies on the path of each scope that one, or a role
 // listing that one, is granted on, as their holders there may then grant it, the latter's by
@@ -1569,14 +1571,24 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 	// A role r lists is read as it will be, so one that lists itself is read as defined, while
 	// the actor's own grants of r give what r gives now: holding r is no license to widen it.
 	au.defining = r
+	was, existed := au.roles.custom[r.ID]
 	for _, id := range r.GrantableRoles {
 		listed, known := au.named(id)
 		if !known {
 			return authority{}, fmt.Errorf("%w: role %q: grantable role %q doesn't exist", ErrInvalid, r.ID, id)
 		}
+		if a.lets(*r, listed) {
+			continue
+		}
 		// One that none of its `:grant` permissions reaches would hand nothing on, so the actor's
-		// power to grant it would go unchecked, while the listing kept it from being deleted.
-		if !a.lets(*r, listed) {
+		// power to grant it would go unchecked, while the listing kept it from being deleted. One the
+		// role lists as stored, and hands on nowhere there already, as one narrowed since, it keeps:
+		// renaming the role needs only the power to define it.
+		listedWas := listed
+		if id == r.ID {
+			listedWas = was
+		}
+		if !existed || !slices.Contains(was.GrantableRoles, id) || a.lets(was, listedWas) {
 			return authority{}, fmt.Errorf("%w: role %q: grantable role %q can be granted on no type of the role's `:grant` permissions", ErrInvalid, r.ID, id)
 		}
 	}

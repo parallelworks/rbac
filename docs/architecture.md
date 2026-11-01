@@ -516,7 +516,8 @@ sequenceDiagram
   order, so renaming it is no redefinition, and setting a role, deny or eligibility again as it is
   stored changes nothing (`canonicalSQL`). A role lists in `GrantableRoles` only roles one of its
   `<type>:grant` permissions, on a type it is for, lets its holders grant (`lets`), so `holdsRole`
-  checks the actor's power to grant each.
+  checks the actor's power to grant each. It keeps a listing that already hands nothing on as
+  stored, as once the role listed was narrowed, so renaming it needs only the power to define it.
 - **Eligibilities.** `SetEligibility` lets a principal `Activate` a role for a while, perhaps
   only with approvers or a `requires` condition. An activation is a grant that ends no later than
   its eligibility expires, or its holder's membership or place in the group the eligibility names

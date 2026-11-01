@@ -136,7 +136,11 @@ scopes conditional ones reach, to check one by one.
   in `GrantableRoles` only roles that a `<type>:grant` it gives, on a type it is for, lets its
   holders grant, as roles that can be granted on that type, or it is refused as invalid: a listing
   none of them reaches would hand nothing on, and the actor's power to grant the role would go
-  unchecked.
+  unchecked. One the role already lists so as it is stored, as once the role listed is narrowed or
+  the catalog changes, it keeps, so renaming it still needs only the power to define it; one a
+  change adds, or leaves handing nothing on by changing the role, is refused, and dropping one needs
+  no power over the role listed. A listing, handing anything on or not, keeps the role listed from
+  being deleted.
   `DeleteRole` removes one with its grants; `Roles` lists the built-in and custom roles a scope type
   takes. Custom roles follow the catalog: one gives only what the catalog still has, and is
   privileged when it gives what only privileged roles do, or changes access.
