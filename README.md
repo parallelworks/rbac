@@ -523,12 +523,17 @@ ended by then goes, once no version before its end stays. One call deletes at mo
 records: call it again while it deletes as many, and each goes on from where the last stopped. It
 reads history that many records at a time, on a pool or a connection each in a transaction of its
 own, so however long history is, none holds exports back for long. A transaction that deletes
-records is recorded in history, with the last record it deleted in `History`'s order; one that
+records is recorded in history, with the last record it deleted in `History`'s order, dated when its
+statement began, as any change is, so never before its `before` or a record it deleted; one that
 deletes none changes nothing, and is not. `History` refuses the cursor of an export that began
 before a prune where it is before the last record the prune deleted, as that export would read on
 past what the prune deleted, so where several exports read history, `through` is the cursor of the
-one furthest behind. An export that began after the prune, as one from the start after a refusal
-or a failover, reads history as the prune left it and isn't refused for it. Where a cursor stands
+one furthest behind. It finds the prunes by the last record each deleted, so a prune through an
+export's cursor, which deletes nothing the export hasn't read, costs its reads nothing, however
+many there are while it catches up from the start or falls behind; an export from the start also
+reads the index's entries of the prunes before it began that deleted past its cursor, until it
+reads past them. An export that began after the prune, as one from the start after a refusal or a
+failover, reads history as the prune left it and isn't refused for it. Where a cursor stands
 can't tell the two apart; `Cursor.Horizon`, the oldest transaction running as its export began,
 does, so keep it with the cursor and each checkpoint, whose signature covers it, and never set it: a
 later one would hide a prune since the export began. A cursor without it, as one kept from an
@@ -541,7 +546,9 @@ administrator's role below, which has the rights of history's owner, as the appl
 and keep what the host's audit retention requires: the federal floor is at least a year. A delete
 from history that no prune its transaction records reaches, as one by hand, is refused as the
 transaction commits, so no delete through history's triggers leaves an export reading on past what
-it removed; disabling them takes a role with the rights of history's owner, which the signed chain
+it removed: `History` counts every prune of a transaction from an export's `Horizon` on, whatever
+the id its record holds, which history's owner can choose, as the trigger lets a delete through for
+any. Disabling the triggers takes a role with the rights of history's owner, which the signed chain
 is kept against.
 
 A role that owns a table can change it whatever its triggers say, and a schema's owner can drop
@@ -687,6 +694,13 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   immediate, and `History` refuses an export's cursor before the one it went through. The trigger
   checks each record a prune deletes as its transaction commits, which took a window of 10,000
   records about twice as long to delete.
+  `0022_prune_seeks` builds an index of prunes on history by the last record each deleted, which
+  reads all of history, so every change, as each writes history, waits until it commits, though
+  reads of history go on, and a transaction under way as it starts that made a change can make it
+  give way. Only prunes have entries. Without it, `History` read every prune recorded since a cursor
+  that fell behind, or since an export catching up from the start began, from history's rows, twice
+  in each call and once in each window of a prune: a read of one record from such a cursor took
+  1.2 ms with no prune since, 14 ms with 20,000 and 78 ms with 80,000, and with it 1.2 ms with any.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A call PostgreSQL refuses for a race, as a
   serialization failure, a deadlock between host transactions, or a lock it waited for past the

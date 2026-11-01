@@ -2037,7 +2037,7 @@ func TestHistoryRefusesACursorAPruneWentPastWhileItReadsNothing(t *testing.T) {
 	}
 }
 
-// History finds the prunes recorded after its cursor by history's index of them, so what it reads
+// History finds the prunes that reached past its cursor by history's index of them, so what it reads
 // to check a cursor grows neither with the prunes recorded before it, which no prune removes, nor
 // with the records after it, of however many tenants, as a cursor far behind has.
 func TestHistoryChecksACursorAsFastWhateverHistoryHolds(t *testing.T) {
@@ -2074,6 +2074,80 @@ func TestHistoryChecksACursorAsFastWhateverHistoryHolds(t *testing.T) {
 	}
 	if few, many := read(t, 1, 1), read(t, 1000, 20000); many > few+10 {
 		t.Fatalf("History read %d pages of history from a cursor between a prune and a record, and %d between 1,000 prunes and 20,000 records", few, many)
+	}
+}
+
+// History finds the prunes that reached past its cursor by the last record each deleted, so what it
+// reads to check a cursor grows with none of the prunes since its export began that went no further
+// than the cursor, as each through it does while its export is the one furthest behind: whether the
+// export catches up from the start, its cursor behind its Horizon, or has fallen behind past it. Found
+// by where each was recorded, every one of them was read from history's rows, twice in each read, as
+// in each window of a prune through it. It holds whether a statement is planned for its cursor or for
+// any.
+func TestHistoryChecksACursorAsFastWhateverPrunesWentThroughIt(t *testing.T) {
+	for _, plans := range []string{"force_custom_plan", "force_generic_plan"} {
+		t.Run(plans, func(t *testing.T) {
+			// One connection, so each read but the first finds history's indexes described already.
+			h := setupOn(t, pgtest.Open(t, "pool_max_conns=1&plan_cache_mode="+plans))
+			ctx := t.Context()
+			for _, id := range []string{"a", "b", "c"} {
+				h.as(t, id)
+			}
+			a := cursorAt(t, h, `SELECT txid, id, recorded_at FROM rbac_history WHERE principal = 'user:a'`)
+			c := cursorAt(t, h, `SELECT txid, id, recorded_at FROM rbac_history WHERE principal = 'user:c'`)
+			// Exports that have read b's membership: one from the start that began once c's was
+			// written, and one that began before b's and fell behind there.
+			catching := cursorAt(t, h, `SELECT txid, id, recorded_at FROM rbac_history WHERE principal = 'user:b'`)
+			behind := catching
+			catching.Horizon, behind.Horizon = c.TxID+1, catching.TxID
+			// n prunes through b's membership, each deleting up to a's, and then statistics as
+			// autovacuum's analyses keep them.
+			prune := func(n int) {
+				t.Helper()
+				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_history (effective_at, tenant, entity, key, op, after, how)
+					SELECT now(), '', 'history', to_char(now() - i * interval '1 second', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), 'prune',
+					  jsonb_build_object('through', jsonb_build_object('txid', $1::text, 'id', $2::bigint),
+					    'last', jsonb_build_object('txid', $3::text, 'id', $4::bigint)), 'PruneHistory'
+					FROM generate_series(1, $5) i`, fmt.Sprint(catching.TxID), catching.ID, fmt.Sprint(a.TxID), a.ID, n); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := h.pool.Exec(ctx, `ANALYZE rbac_history`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The pages of history and its indexes a read of a record from cursor reads, once the
+			// read before it has planned it as the statistics now say and the connection has read
+			// how history's indexes are laid out.
+			read := func(cursor rbac.Cursor) int64 {
+				t.Helper()
+				var pages int64
+				for range 2 {
+					tx, err := h.pool.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					start := historyPages(ctx, t, tx)
+					if _, _, err := h.authz.WithTx(tx).History(ctx, cursor, 1); err != nil {
+						t.Fatalf("History from a cursor no prune went past: %v", err)
+					}
+					pages = historyPages(ctx, t, tx) - start
+					if err := tx.Rollback(ctx); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return pages
+			}
+			// From prunes enough that history's indexes are as deep as they will be.
+			prune(500)
+			fewCatching, fewBehind := read(catching), read(behind)
+			prune(2500)
+			if many := read(catching); many > fewCatching+10 {
+				t.Errorf("History read %d pages of history from a cursor behind its Horizon after 500 prunes through it, and %d after 3,000", fewCatching, many)
+			}
+			if many := read(behind); many > fewBehind+10 {
+				t.Errorf("History read %d pages of history from a cursor past its Horizon after 500 prunes through it, and %d after 3,000", fewBehind, many)
+			}
+		})
 	}
 }
 
@@ -2192,6 +2266,56 @@ func TestHistoryRefusesADeleteNoPruneRecords(t *testing.T) {
 	}
 	if _, _, err := h.authz.History(ctx, behind, 1); !errors.Is(err, rbac.ErrInvalid) {
 		t.Errorf("History from before a delete a prune records: %v", err)
+	}
+}
+
+// rbac_history_pruned lets a delete through for any prune its transaction records, whatever the
+// record's id, which history's owner can choose, and History counts the prunes of every transaction
+// from its export's Horizon on, whatever theirs: so a prune numbered 0 or below, in the transaction
+// that was the oldest running as an export began, and so before any record of its own in History's
+// order, refuses the export's cursor before what it deleted, as one numbered after them does.
+func TestHistoryCountsAPruneWhateverItsRecordIsNumbered(t *testing.T) {
+	for _, id := range []int64{-1, 0, 1 << 60} {
+		t.Run(fmt.Sprint(id), func(t *testing.T) {
+			h := setup(t)
+			ctx := t.Context()
+			for _, p := range []string{"a", "b"} {
+				h.as(t, p)
+			}
+			var b int64
+			if err := h.pool.QueryRow(ctx, `SELECT id FROM rbac_history WHERE principal = 'user:b'`).Scan(&b); err != nil {
+				t.Fatal(err)
+			}
+			owner, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = owner.Rollback(context.WithoutCancel(ctx)) }()
+			// An export that has read a's membership, before b's, and began as owner's transaction
+			// was the oldest running.
+			cursor := cursorAt(t, h, `SELECT txid, id, recorded_at FROM rbac_history WHERE principal = 'user:a'`)
+			if err := owner.QueryRow(ctx, `SELECT pg_current_xact_id()`).Scan(&cursor.Horizon); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := owner.Exec(ctx, `SELECT set_config('rbac.prune', 'on', true)`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := owner.Exec(ctx, `INSERT INTO rbac_history (id, effective_at, tenant, entity, key, op, after, how) OVERRIDING SYSTEM VALUE
+				SELECT $1, now(), '', 'history', '0001-01-01T00:00:00.000000Z', 'prune', jsonb_build_object('before', timestamptz '0001-01-01 00:00:00+00',
+				  'last', jsonb_build_object('txid', txid::text, 'id', id), 'deleted', 1), ''
+				FROM rbac_history WHERE id = $2`, id, b); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := owner.Exec(ctx, `DELETE FROM rbac_history WHERE id = $1`, b); err != nil {
+				t.Fatal(err)
+			}
+			if err := owner.Commit(ctx); err != nil {
+				t.Fatalf("a delete a prune numbered %d records: %v", id, err)
+			}
+			if got, _, err := h.authz.History(ctx, cursor, rbac.MaxHistory); !errors.Is(err, rbac.ErrInvalid) {
+				t.Errorf("History from before a delete a prune numbered %d records: %d records, %v", id, len(got), err)
+			}
+		})
 	}
 }
 
@@ -3972,6 +4096,46 @@ func TestPruningHistoryOnAHostsTransaction(t *testing.T) {
 	_, err = tx.Exec(ctx, `DELETE FROM rbac_history WHERE id = (SELECT min(id) FROM rbac_history)`)
 	if pgErr := (*pgconn.PgError)(nil); !errors.As(err, &pgErr) || pgErr.Code != "42501" {
 		t.Fatalf("a delete from history after the prune: %v", err)
+	}
+}
+
+// A prune is dated as any change is, when its statement began, not when its transaction did: on a
+// host's transaction begun before the records it deletes were written, it was dated before them,
+// and before its own before.
+func TestAPruneIsDatedWhenItsStatementBegan(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.as(t, "u")
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// u's grant and its change, written after the host's transaction began, on other connections:
+	// the prune deletes the grant's first version.
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{{grantLogin, []any{"u"}}, {`UPDATE rbac_grants SET note = 'changed' WHERE principal = 'user:u'`, nil}} {
+		if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var deleted time.Time
+	if err := h.pool.QueryRow(ctx, `SELECT effective_at FROM rbac_history WHERE entity = 'grant' AND principal = 'user:u' AND op = 'create'`).Scan(&deleted); err != nil {
+		t.Fatal(err)
+	}
+	through, before := exported(t, h), dbNow(t, h)
+	if n, err := rbac.PruneHistory(ctx, tx, before, through); err != nil || n != 1 {
+		t.Fatalf("PruneHistory = %d, %v", n, err)
+	}
+	var began, effective, recorded time.Time
+	if err := tx.QueryRow(ctx, `SELECT transaction_timestamp(), effective_at, recorded_at FROM rbac_history WHERE entity = 'history' AND op = 'prune'`).
+		Scan(&began, &effective, &recorded); err != nil {
+		t.Fatal(err)
+	}
+	if effective.Before(deleted) || effective.Before(before) || effective.After(recorded) {
+		t.Errorf("a prune on a transaction begun at %v, of %v, deleting a version dated %v, is dated %v and recorded at %v", began, before, deleted, effective, recorded)
 	}
 }
 

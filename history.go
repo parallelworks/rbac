@@ -128,7 +128,6 @@ func followable(ctx context.Context, tx pgx.Tx, schema string, after Cursor) (ge
 		return "", fmt.Errorf("%w: the cursor's last record is dated past the times history holds", ErrInvalid)
 	}
 	history := historyTable(schema)
-	from := after.prunesFrom()
 	// The timeline WAL is written on, which promotion changes at once; the last checkpoint's
 	// changes only once the next completes, minutes later. And the database and schema of the
 	// history read, by OIDs, which a physical copy keeps: every database and schema in a cluster
@@ -138,10 +137,10 @@ func followable(ctx context.Context, tx pgx.Tx, schema string, after Cursor) (ge
 	if err := tx.QueryRow(ctx, `SELECT s.system_identifier::pg_catalog.text || '/' || left(pg_walfile_name(pg_current_wal_lsn()), 8)
 		    || '/' || d.oid::pg_catalog.text || '/' || c.relnamespace::pg_catalog.text,
 		  EXISTS (SELECT 1 FROM `+history+` WHERE txid = $1::pg_catalog.xid8 AND id = $2 AND recorded_at = $3),
-		  $5::boolean AND `+prunedPast(history, "$1::pg_catalog.xid8", "$2", "$6::pg_catalog.xid8", "$7")+`
+		  $5::boolean AND `+prunedPast(history, "$1::pg_catalog.xid8", "$2", "$6::pg_catalog.xid8")+`
 		FROM pg_control_system() s, pg_catalog.pg_database d, pg_catalog.pg_class c
 		WHERE d.datname = current_database() AND c.oid = $4::pg_catalog.text::pg_catalog.regclass`,
-		after.TxID, after.ID, storedTime(after.RecordedAt), history, after.following(), from.TxID, from.ID).Scan(&generation, &held, &pruned); err != nil {
+		after.TxID, after.ID, storedTime(after.RecordedAt), history, after.following(), after.prunesFrom()).Scan(&generation, &held, &pruned); err != nil {
 		return "", err
 	}
 	if after != (Cursor{}) && after.Generation != generation {
@@ -160,27 +159,45 @@ func followable(ctx context.Context, tx pgx.Tx, schema string, after Cursor) (ge
 // a record is.
 func (c Cursor) following() bool { return c.TxID != 0 || c.ID != 0 }
 
-// prunesFrom is where in History's order the prunes that can have deleted, after c, records its
-// export could have read start: after c, as a prune is recorded after what it deletes, and at its
-// export's Horizon, as one of an earlier transaction had ended before the export began, which read
-// none of what it deleted.
-func (c Cursor) prunesFrom() Cursor {
-	if c.Horizon > c.TxID {
-		return Cursor{TxID: c.Horizon}
-	}
-	return c
-}
+// prunesFrom is the first transaction whose prunes can have deleted, after c, records its export
+// could have read. A prune deletes only records of transactions before its own, as
+// rbac_history_pruned holds it to, so none of c's transaction or an earlier one deleted any after c;
+// and one of a transaction before its export's Horizon had ended before the export began, which read
+// none of what it deleted. By transaction alone, as rbac_history_pruned lets a delete through for any
+// prune its transaction records, whatever the record's id, which history's owner can choose: by where
+// a prune is recorded, one numbered 0 or below in the Horizon's transaction would come before the
+// Horizon's first record, and a delete it let through would be read past.
+func (c Cursor) prunesFrom() uint64 { return max(c.Horizon, c.TxID) }
 
-// prunedPast is SQL for whether a prune recorded in history, SQL for its table, after from, SQL for
-// its txid and id, deleted a record after the cursor at txid and id, SQL for them: by the last it
-// deleted, or for one recorded before migration 0020, the cursor it went through, past which it
-// deleted none. A prune is recorded after what it deletes, as rbac_history_pruned holds each to,
-// and from is no earlier than the cursor (prunesFrom), so of the prunes, which are never pruned,
-// only those after it can have, and history's index of them finds those alone.
-func prunedPast(history, txid, id, fromTxid, fromID string) string {
-	return `EXISTS (SELECT FROM ` + history + ` g WHERE g.entity = 'history' AND g.op = 'prune' AND (g.txid, g.id) > (` + fromTxid + `, ` + fromID + `)
-		AND ((coalesce(g.after->'last', g.after->'through')->>'txid')::pg_catalog.xid8,
-		     (coalesce(g.after->'last', g.after->'through')->>'id')::bigint) > (` + txid + `, ` + id + `))`
+// pruneLastTxid and pruneLastID are SQL for the last record a prune, g, deleted, by its txid and id,
+// or for one recorded before migration 0020, the cursor it went through, past which it deleted none:
+// written as history's index of prunes by it (rbac_history_prune_lasts) writes them, so a query
+// naming them reads that index.
+const (
+	pruneLastTxid = `(coalesce(g.after->'last', g.after->'through')->>'txid')::pg_catalog.xid8`
+	pruneLastID   = `(coalesce(g.after->'last', g.after->'through')->>'id')::bigint`
+)
+
+// prunedPast is SQL for whether a prune recorded in history, SQL for its table, by a transaction from
+// fromTxid on, SQL for it (prunesFrom), deleted a record after the cursor at txid and id, SQL for
+// them. Of the prunes, which are never pruned, history's index of them by the last record each
+// deleted finds those that reached past the cursor, and tests their transactions among its own
+// entries: for an export that has read past its Horizon, only those that refuse its cursor, as no
+// prune reaches past its own record. Found by where each was recorded, every prune since a cursor
+// that fell behind, or since an export catching up from the start began, would be read from
+// history's rows, though each through the cursor of the export furthest behind reaches past none.
+// For an export from the start, the prunes before it began that reached past its cursor are in that
+// index too, until it reads past them, and while those since it began are fewer, the planner finds
+// them by history's index of prunes by transaction (rbac_history_prunes) instead.
+//
+// The first in that index's order, rather than EXISTS: the planner has no statistics of a partial
+// index's expressions, so it counts a third of the prunes as reaching past any cursor, and would
+// scan history's rows for one, as if one would soon turn up, where none does. No scan of the rows
+// gives that order without reading them all.
+func prunedPast(history, txid, id, fromTxid string) string {
+	return `((SELECT true FROM ` + history + ` g WHERE g.entity = 'history' AND g.op = 'prune' AND g.txid >= ` + fromTxid + `
+		AND (` + pruneLastTxid + `, ` + pruneLastID + `) > (` + txid + `, ` + id + `)
+		ORDER BY ` + pruneLastTxid + `, ` + pruneLastID + ` LIMIT 1) IS NOT NULL)`
 }
 
 // unsettled is SQL for whether history, SQL for its table, holds a prune of a transaction no older
@@ -347,7 +364,11 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 	// The window's record is written in the statement that deletes, and only where it deleted any. It
 	// holds the last record it deleted in History's order, before which History refuses the cursor of
 	// an export begun before it: one further behind than through would otherwise read on past what
-	// it deleted.
+	// it deleted. It is dated as rbac_record dates a change, when the statement began, or its
+	// transaction, where that began later, not by now(), when the transaction began, which on a
+	// host's can be before its before and before the records it deletes were written. A record it
+	// deletes is dated no later than its before, and its before is no later than when the statement
+	// refusing one yet to come began, so it is dated before none of them.
 	//
 	// It judged its window to the end, unless its batch filled first: by what it picked, not what it
 	// deleted, as a prune of the same that deleted some of them meanwhile leaves fewer to delete,
@@ -379,7 +400,7 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 		  SELECT txid, id FROM pruned ORDER BY txid DESC, id DESC LIMIT 1
 		), recorded AS (
 		  INSERT INTO `+history+` (effective_at, tenant, entity, key, op, after, how)
-		  SELECT now(), '', 'history', `+pruneKey+`, 'prune',
+		  SELECT greatest(statement_timestamp(), transaction_timestamp()), '', 'history', `+pruneKey+`, 'prune',
 		    jsonb_build_object('before', $1::pg_catalog.timestamptz, 'through', `+pruneThrough+`,
 		      'deleted', (SELECT count(*) FROM pruned), 'reached', (SELECT id FROM reach),
 		      'last', jsonb_build_object('txid', l.txid::pg_catalog.text, 'id', l.id)),
@@ -425,8 +446,10 @@ type Record struct {
 	// epoch where that was before year 1 or at its first instant; or prune, whose After is what
 	// PruneHistory was given, how many records one of its transactions deleted, the last of them in
 	// History's order, before which History refuses the cursor of an export begun before it, and
-	// the id it reached, which a prune of the same goes on from. A prune recorded before migration
-	// 0020 holds no last record.
+	// the id it reached, which a prune of the same goes on from. A prune is dated when its statement
+	// began, so no earlier than its before or any record it deleted; one recorded before migration
+	// 0020 holds no last record, and one by an earlier release on a host's transaction is dated when
+	// that transaction began.
 	Op string
 	// Principal, Role, Scope, Group and ExpiresAt are those of the row, where it has them.
 	Principal Principal
@@ -606,11 +629,10 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 		// read that finds no record chains nothing, and the next refuses the cursor in followable. An
 		// export begins with the oldest transaction it sees running as its Horizon, and while a prune
 		// it sees is of one no older, reads nothing (unsettled).
-		from := after.prunesFrom()
 		rows, err := tx.Query(ctx, `
 			SELECT id, txid, recorded_at, effective_at, tenant, entity, key, op, coalesce(principal, ''), coalesce(role, ''),
 			  coalesce(scope, ''), coalesce(group_id, ''), expires_at, before, after, actor, on_behalf_of, how, request, reason, db_user,
-			  $6::boolean AND `+prunedPast(historyTable(schema), "$1::pg_catalog.xid8", "$2", "$7::pg_catalog.xid8", "$8")+`,
+			  $6::boolean AND `+prunedPast(historyTable(schema), "$1::pg_catalog.xid8", "$2", "$7::pg_catalog.xid8")+`,
 			  pg_snapshot_xmin(pg_current_snapshot())
 			FROM (
 			  SELECT h.*, row_number() OVER w AS n,
@@ -634,7 +656,7 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 			  WINDOW w AS (ORDER BY h.txid, h.id ROWS UNBOUNDED PRECEDING)
 			) p
 			WHERE n = 1 OR reached <= $4
-			ORDER BY txid, id`, after.TxID, after.ID, limit, maxHistoryBytes, maxUnsized, after.following(), from.TxID, from.ID)
+			ORDER BY txid, id`, after.TxID, after.ID, limit, maxHistoryBytes, maxUnsized, after.following(), after.prunesFrom())
 		if err != nil {
 			return err
 		}
