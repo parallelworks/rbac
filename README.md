@@ -71,7 +71,15 @@ if err := authz.Authorize(ctx, subject, "cluster:login", cluster); err != nil {
   grants that end, such as an activation, or through a membership or a place in a group that ends,
   it grants ending no later than the last of them, and never as an eligibility, a custom role's
   definition or a place in a group that outlasts it, so access approved for an hour stays an
-  hour's. A grant outlives the actor's power to change grants, though: a power held for an hour
+  hour's. An exemption from a deny is held so too: what a deny binding the actor removes, the actor
+  holds only while the deny exempts it, through the latest of its paths to the groups it exempts,
+  or its membership where it exempts the tenant's members, unless it binds the actor no longer by
+  then, and hands on no longer; an exemption by the actor's identity, or by a path that never ends,
+  bounds nothing. A deny's condition is decided as of the change, as every condition is: a grant's
+  can be handed on with it, as the actor hands on what it holds under one only under the same, but
+  a deny's can't, so one that holds only from a later time, as by reading `request.time`, bounds
+  nothing handed on before then. Time-limit an exception to a deny with a place that ends, not a
+  condition. A grant outlives the actor's power to change grants, though: a power held for an hour
   grants for good what the actor holds for good, and the roles a role it holds lists, which it
   needn't hold. Put expiries on roles that list none. A change granting a role until many times,
   as to many members each until its own, decides it once for each time that the longest lasting of

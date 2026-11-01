@@ -1272,6 +1272,345 @@ func TestChangingMembersHandsOnNoLongerThanTheActorHolds(t *testing.T) {
 	}
 }
 
+// onCall is a harness whose deny on w1 takes the permission removed from contractors, exempting
+// those on call, and u, a contractor for good holding sudo and changing grants on c1 for good, on
+// call until hour: it holds what the deny takes only until then. The catalog has granter, and what
+// mutate adds.
+func onCall(t *testing.T, removed rbac.Permission, mutate ...func(*rbac.Config)) (h *harness, u rbac.Subject, hour time.Time) {
+	t.Helper()
+	ctx := t.Context()
+	h, guardian := guarded(t, append([]func(*rbac.Config){func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), granter) }}, mutate...)...)
+	hour = h.now.Add(time.Hour)
+	h.seed(t, grant(cluster.Scope(), "cluster.sudo", rbac.User, "u"), grant(cluster.Scope(), "cluster.granter", rbac.User, "u"))
+	u = h.as(t, "u", "contractors")
+	h.groups(t, "oncall")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "oncall", Principal: u.Principal, ExpiresAt: hour}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.SetDeny(ctx, guardian, workspace, rbac.Deny{
+		ID: "on-call", Permissions: []rbac.Permission{removed},
+		Principals: []rbac.Principal{groupOf("contractors")}, Exempt: []rbac.Principal{groupOf("oncall")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return h, u, hour
+}
+
+// An actor exempt from a deny only while its place in an exempt group lasts holds what the deny
+// removes until then, as through a grant ending then: it hands that on no longer, as a grant, an
+// eligibility or what Grantable offers, and what it hands on until then ends as its exemption does.
+func TestWhatAnExemptionUntilATimeSparesIsHandedOnNoLongerThanIt(t *testing.T) {
+	h, u, hour := onCall(t, root)
+	ctx := t.Context()
+	v := h.as(t, "v")
+	sudo := func(until time.Time) rbac.Change {
+		return rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: v.Principal, ExpiresAt: until}}}
+	}
+	if !allowed(t, h, u, root, cluster) {
+		t.Fatal("u should hold root while on call")
+	}
+	for name, until := range map[string]time.Time{"for good": {}, "past its end": hour.Add(time.Second)} {
+		if err := h.authz.Apply(ctx, u, cluster, sudo(until)); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("sudo handed on %s: %v", name, err)
+		}
+	}
+	if err := h.authz.SetEligibility(ctx, u, cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: v.Principal, MaxDuration: time.Minute}); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("sudo handed on as an eligibility: %v", err)
+	}
+	roles, err := h.authz.Grantable(ctx, u, cluster)
+	offers := func(id rbac.Role) bool {
+		return slices.ContainsFunc(roles, func(r rbac.RoleDefinition) bool { return r.ID == id })
+	}
+	if err != nil || offers("cluster.sudo") || !offers("cluster.login") {
+		t.Errorf("Grantable offers what u may grant for good: %v, %v", roles, err)
+	}
+	// What the deny leaves, u hands on for good.
+	if err := h.authz.Apply(ctx, u, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: v.Principal}}}); err != nil {
+		t.Errorf("login handed on for good: %v", err)
+	}
+	if err := h.authz.Apply(ctx, u, cluster, sudo(hour)); err != nil {
+		t.Fatalf("sudo handed on until the exemption ends: %v", err)
+	}
+	h.now = hour
+	if allowed(t, h, u, root, cluster) || allowed(t, h, v, root, cluster) {
+		t.Fatal("what was handed on outlived the exemption")
+	}
+}
+
+// Grants of one role in one change are each decided by whether the actor's exemption lasts until
+// they end, however many share a decision: its end tells them apart as a grant's end does.
+func TestGrantsInOneChangeAreEachDecidedByWhetherAnExemptionLastsUntilThen(t *testing.T) {
+	h, u, hour := onCall(t, root)
+	ctx := t.Context()
+	var all, granted rbac.Change
+	refused := 0
+	for i, c := range []struct {
+		until   time.Time
+		granted bool
+	}{{hour.Add(-time.Minute), true}, {hour, true}, {hour.Add(time.Second), false}, {time.Time{}, false}} {
+		b := rbac.Binding{Role: "cluster.sudo", Principal: identity(fmt.Sprintf("p%d", i)), ExpiresAt: c.until}
+		all.Grant = append(all.Grant, b)
+		if c.granted {
+			granted.Grant = append(granted.Grant, b)
+		} else {
+			refused++
+		}
+	}
+	err := h.authz.Apply(ctx, u, cluster, all)
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok || len(joined.Unwrap()) != refused || !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("want %d of the grants refused, got %v", refused, err)
+	}
+	if err := h.authz.Apply(ctx, u, cluster, granted); err != nil {
+		t.Fatalf("the grants ending by the exemption's end: %v", err)
+	}
+}
+
+// What the deny removes is the power to change grants itself: the actor hands on a role giving it
+// no longer than its exemption lasts, though it grants for good through it what it holds for good,
+// as through any power it holds for a while.
+func TestAPowerToChangeGrantsAnExemptionSparesIsHandedOnNoLongerThanIt(t *testing.T) {
+	h, u, hour := onCall(t, grantC)
+	ctx := t.Context()
+	to := func(role rbac.Role, until time.Time) rbac.Change {
+		return rbac.Change{Grant: []rbac.Binding{{Role: role, Principal: identity("v"), ExpiresAt: until}}}
+	}
+	if err := h.authz.Apply(ctx, u, cluster, to("cluster.admin", time.Time{})); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("the power to change grants handed on for good: %v", err)
+	}
+	if err := h.authz.Apply(ctx, u, cluster, to("cluster.admin", hour)); err != nil {
+		t.Errorf("handed on until the exemption ends: %v", err)
+	}
+	if err := h.authz.Apply(ctx, u, cluster, to("cluster.sudo", time.Time{})); err != nil {
+		t.Errorf("what u holds for good granted for good through it: %v", err)
+	}
+}
+
+// An exemption lasts as the latest of the actor's paths to the keys exempting it: through a group
+// nested in an exempt one, the place that nests it; through two exempt groups, the later's; and
+// through the tenant's members, its membership. One that never ends, as by its identity or a place
+// that doesn't, or that the deny's binding of the actor ends no later than, changes nothing.
+func TestAnExemptionLastsAsTheLatestPathToWhatExemptsTheActor(t *testing.T) {
+	public := rbac.RoleDefinition{ID: "cluster.public", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}, Public: true}
+	h, guardian := guarded(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), granter, public) })
+	ctx := t.Context()
+	hour, later := h.now.Add(time.Hour), h.now.Add(3*time.Hour)
+	h.groups(t, "oncall", "night", "inner")
+	for _, id := range []string{"nested", "twice", "named", "permanent", "leaving"} {
+		h.seed(t, grant(cluster.Scope(), "cluster.sudo", rbac.User, id), grant(cluster.Scope(), "cluster.granter", rbac.User, id))
+	}
+	h.as(t, "nested", "contractors", "inner")
+	h.as(t, "twice", "contractors")
+	h.as(t, "named", "contractors", "oncall")
+	h.as(t, "permanent", "contractors")
+	h.as(t, "leaving")
+	h.join(t, "x")
+	// member holds login through the public, and changes grants through its membership, which ends.
+	h.seed(t, grant(cluster.Scope(), public.ID, rbac.Public, ""), grant(cluster.Scope(), "cluster.granter", rbac.User, "member"))
+	if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("member"), ExpiresAt: hour}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{
+		{Group: "oncall", Principal: groupOf("inner"), ExpiresAt: hour},
+		{Group: "oncall", Principal: identity("twice"), ExpiresAt: hour},
+		{Group: "night", Principal: identity("twice"), ExpiresAt: later},
+		{Group: "oncall", Principal: identity("named"), ExpiresAt: hour},
+		{Group: "oncall", Principal: identity("permanent")},
+		{Group: "contractors", Principal: identity("leaving"), ExpiresAt: hour},
+		{Group: "oncall", Principal: identity("leaving"), ExpiresAt: later},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []rbac.Deny{
+		{
+			ID: "on-call", Permissions: []rbac.Permission{root}, Principals: []rbac.Principal{groupOf("contractors")},
+			Exempt: []rbac.Principal{groupOf("oncall"), groupOf("night"), identity("named")},
+		},
+		{ID: "members-only", Permissions: []rbac.Permission{login}, Principals: []rbac.Principal{{Kind: rbac.Public}}, Exempt: []rbac.Principal{rbac.TenantMembers("t1")}},
+	} {
+		if err := h.authz.SetDeny(ctx, guardian, workspace, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, c := range []struct {
+		actor string
+		role  rbac.Role
+		ends  time.Time
+	}{
+		{"nested", "cluster.sudo", hour},
+		{"twice", "cluster.sudo", later},
+		{"member", public.ID, hour},
+		{"named", "cluster.sudo", time.Time{}},
+		{"permanent", "cluster.sudo", time.Time{}},
+		{"leaving", "cluster.sudo", time.Time{}},
+	} {
+		actor := rbac.Subject{Principal: identity(c.actor)}
+		to := func(until time.Time) rbac.Change {
+			return rbac.Change{Grant: []rbac.Binding{{Role: c.role, Principal: identity("x"), ExpiresAt: until}}}
+		}
+		if c.ends.IsZero() {
+			if err := h.authz.Apply(ctx, actor, cluster, to(time.Time{})); err != nil {
+				t.Errorf("%s handing %s on for good: %v", c.actor, c.role, err)
+			}
+			continue
+		}
+		for name, until := range map[string]time.Time{"for good": {}, "past its end": c.ends.Add(time.Second)} {
+			if err := h.authz.Apply(ctx, actor, cluster, to(until)); !errors.Is(err, rbac.ErrDenied) {
+				t.Errorf("%s handing %s on %s: %v", c.actor, c.role, name, err)
+			}
+		}
+		if err := h.authz.Apply(ctx, actor, cluster, to(c.ends)); err != nil {
+			t.Errorf("%s handing %s on until its exemption ends: %v", c.actor, c.role, err)
+		}
+	}
+}
+
+// A place in a group gains what the group holds, which an actor exempt from a deny only until a
+// time hands on no longer: a place lasting past then, or gaining an eligibility, is refused.
+func TestChangingMembersHandsOnNoLongerThanTheActorIsExempt(t *testing.T) {
+	h, u, hour := onCall(t, root, func(c *rbac.Config) { c.Catalog = append(c.Catalog, groupMembers) })
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), groupMembers.ID, rbac.User, "u"), grant(cluster.Scope(), "cluster.sudo", rbac.Group, "ops"))
+	h.groups(t, "standby")
+	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: groupOf("standby"), MaxDuration: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	h.join(t, "w")
+	in := func(group string, until time.Time) []rbac.Member {
+		return []rbac.Member{{Group: group, Principal: identity("w"), ExpiresAt: until}}
+	}
+	for name, add := range map[string][]rbac.Member{
+		"for good":                     in("ops", time.Time{}),
+		"past the exemption's end":     in("ops", hour.Add(time.Second)),
+		"eligible, ending before then": in("standby", hour.Add(-time.Minute)),
+	} {
+		if err := h.authz.ChangeMembers(ctx, u, "t1", add, nil); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("a place in a group handing sudo on %s: %v", name, err)
+		}
+	}
+	if err := h.authz.ChangeMembers(ctx, u, "t1", in("ops", hour), nil); err != nil {
+		t.Fatalf("a place ending with the exemption: %v", err)
+	}
+}
+
+// Scopes a change to members reaches decide together where the actor holds the same grants on each
+// and no deny tells them apart: one exempting it until a time on one's path does, so what the
+// change hands on there is decided there.
+func TestAScopeADenyExemptsTheActorOnUntilATimeIsDecidedApart(t *testing.T) {
+	h, u, _ := onCall(t, root, func(c *rbac.Config) { c.Catalog = append(c.Catalog, groupMembers) })
+	ctx := t.Context()
+	// u holds the same on the paths of a, under the tenant alone, and of c1, under the deny.
+	a := rbac.Scope{Type: "cluster", ID: "a"}
+	h.seed(t, grant(rbac.TenantRoot("t1"), groupMembers.ID, rbac.User, "u"), grant(rbac.TenantRoot("t1"), "cluster.admin", rbac.User, "u"),
+		grant(a, "cluster.sudo", rbac.Group, "crew"), grant(cluster.Scope(), "cluster.sudo", rbac.Group, "crew"))
+	if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_grants WHERE tenant = 't1' AND scope = 'cluster:c1' AND principal = 'user:u'`); err != nil {
+		t.Fatal(err)
+	}
+	h.join(t, "w")
+	join := []rbac.Member{{Group: "crew", Principal: identity("w")}}
+	if err := h.authz.ChangeMembers(ctx, u, "t1", join, nil); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("a place handing sudo on for good on c1 too: %v", err)
+	}
+	if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_grants WHERE tenant = 't1' AND scope = 'cluster:c1' AND principal = 'group:crew'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.ChangeMembers(ctx, u, "t1", join, nil); err != nil {
+		t.Fatalf("a place handing sudo on for good on a alone: %v", err)
+	}
+}
+
+// The deny an actor is exempt from until a time is decided as one binding it is, as of the change:
+// where its condition holds, it bounds what the actor hands on, and where it doesn't, as one reading
+// the resource's attributes that holds on others, or request.time that holds only later, it
+// doesn't, as one binding the actor wouldn't then stop it.
+func TestAnExemptionFromAConditionalDenyBoundsWhereTheConditionHolds(t *testing.T) {
+	h, u, hour := onCall(t, root)
+	ctx := t.Context()
+	guardian := rbac.Subject{Principal: identity("guardian")}
+	at := func(t time.Time) string { return `timestamp("` + t.Format(time.RFC3339) + `")` }
+	for _, c := range []struct {
+		name, condition string
+		bounds          bool
+	}{
+		{"of the resource", `resource.attributes.env == "prod"`, true},
+		{"of another resource", `resource.attributes.env == "dev"`, false},
+		{"of the time", `request.time < ` + at(hour.Add(time.Hour)), true},
+		{"of a later time", `request.time > ` + at(hour.Add(time.Hour)), false},
+	} {
+		if err := h.authz.SetDeny(ctx, guardian, workspace, rbac.Deny{
+			ID: "on-call", Permissions: []rbac.Permission{root}, Condition: rbac.Condition{Expression: c.condition},
+			Principals: []rbac.Principal{groupOf("contractors")}, Exempt: []rbac.Principal{groupOf("oncall")},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		prod := cluster
+		prod.Attributes = map[string]any{"env": "prod"}
+		err := h.authz.Apply(ctx, u, prod, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: identity("v")}}})
+		if bounded := errors.Is(err, rbac.ErrDenied); bounded != c.bounds || !bounded && err != nil {
+			t.Errorf("a deny whose condition is %s, sudo handed on for good: %v", c.name, err)
+		}
+	}
+}
+
+// A definition never ends, so a definer exempt from a deny only until a time defines no role giving
+// what the deny removes, as one on the tenant does wherever the role is granted; nor widens one to
+// give it that is granted under a deny below the tenant, or listed by one granted there. Deleting
+// one hands nothing on. Exempt for good, it defines and widens them.
+func TestDefiningARoleNeedsAnExemptionFromADenyHeldForGood(t *testing.T) {
+	for _, where := range []string{"on the tenant", "granted below it", "listed below it"} {
+		for _, expiring := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s, exempt until a time %t", where, expiring), func(t *testing.T) {
+				h, guardian := guarded(t)
+				ctx := t.Context()
+				x, r := definer(t, h)
+				h.as(t, "x", "contractors")
+				h.groups(t, "oncall")
+				place := rbac.Member{Group: "oncall", Principal: x.Principal}
+				if expiring {
+					place.ExpiresAt = h.now.Add(time.Hour)
+				}
+				if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{place}); err != nil {
+					t.Fatal(err)
+				}
+				denied := workspace
+				if where == "on the tenant" {
+					denied = tenantT1
+				}
+				if err := h.authz.SetDeny(ctx, guardian, denied, rbac.Deny{
+					ID: "on-call", Permissions: []rbac.Permission{root},
+					Principals: []rbac.Principal{groupOf("contractors")}, Exempt: []rbac.Principal{groupOf("oncall")},
+				}); err != nil {
+					t.Fatal(err)
+				}
+				y := h.as(t, "y")
+				wider := r
+				wider.Permissions = []rbac.Permission{view, root}
+				switch where {
+				case "on the tenant":
+					wider.ID = "custom.root"
+				case "granted below it":
+					// On a, outside the workspace, x holds what it does on c1, under it.
+					h.seed(t, grant(rbac.Scope{Type: "cluster", ID: "a"}, r.ID, rbac.User, "y"), grant(cluster.Scope(), r.ID, rbac.User, "y"))
+				case "listed below it":
+					h.seed(t, grant(workspace.Scope(), listing(t, h, x, r).ID, rbac.User, "y"))
+				}
+				err := h.authz.SetRole(ctx, x, "t1", wider)
+				if expiring && !errors.Is(err, rbac.ErrDenied) || !expiring && err != nil {
+					t.Fatalf("defining a role giving root: %v", err)
+				}
+				if where == "granted below it" {
+					if allowed(t, h, y, root, cluster) == expiring {
+						t.Errorf("y holds root on c1: %t", !expiring)
+					}
+					if err := h.authz.DeleteRole(ctx, x, "t1", r.ID); err != nil {
+						t.Errorf("deleting the role: %v", err)
+					}
+				}
+			})
+		}
+	}
+}
+
 // meanwhileAsked is a harness whose host runs meanwhile, once, the first time it is asked about a
 // grant made as via, as another change committing between a change's checks and its transaction.
 func meanwhileAsked(t *testing.T, via rbac.Via, meanwhile *func(context.Context) error) *harness {
