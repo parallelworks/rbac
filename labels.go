@@ -329,16 +329,17 @@ func (a *Authorizer) holding(ctx context.Context, tenant string, s Subject) (Hol
 	return a.holdingOn(ctx, a.db, s, a.constrain(ctx, s, tenantResource(tenant)))
 }
 
-// holdingOf is holding decided by v, read with s's other grants.
+// holdingOf is holding decided by v, read with s's other grants, of which it walks only those
+// giving values (labeling).
 func (a *Authorizer) holdingOf(ctx context.Context, tenant string, s Subject, v *valuesRead) (Holding, map[Permission]bool, error) {
-	return a.holdingFrom(ctx, a.db, s, a.constrain(ctx, s, tenantResource(tenant)), v, a.labelPermission, nil)
+	return a.holdingFrom(ctx, a.db, s, a.constrain(ctx, s, tenantResource(tenant)), a.labeling(v), a.labelPermission, nil)
 }
 
 // holdingFor is holdingOf of only the values that decide whether s satisfies l (askedBy), for a
 // decision about one resource, so the constraints and the conditions aren't asked about the rest.
 func (a *Authorizer) holdingFor(ctx context.Context, tenant string, s Subject, v *valuesRead, l Label) (Holding, map[Permission]bool, error) {
 	asked := a.askedBy(l)
-	return a.holdingFrom(ctx, a.db, s, a.constrain(ctx, s, tenantResource(tenant)), v, func(p Permission) bool { return asked[p] }, nil)
+	return a.holdingFrom(ctx, a.db, s, a.constrain(ctx, s, tenantResource(tenant)), a.labeling(v), func(p Permission) bool { return asked[p] }, nil)
 }
 
 // askedBy is the label values whose holding decides whether a holding satisfies l: in each
@@ -414,7 +415,7 @@ func (a *Authorizer) holdingRead(ctx context.Context, q DB, s Subject, cs *const
 		return Holding{}, nil, nil, err
 	}
 	readingRoles()
-	h, byCondition, err := a.holdingFrom(ctx, q, s, cs, &valuesRead{held: got.held, ds: got.ds, roles: got.roles}, a.labelPermission, nil)
+	h, byCondition, err := a.holdingFrom(ctx, q, s, cs, a.labeling(&valuesRead{held: got.held, ds: got.ds, roles: got.roles}), a.labelPermission, nil)
 	return h, byCondition, got.keys, err
 }
 
@@ -437,8 +438,9 @@ func (a *Authorizer) valuesOn(ctx context.Context, q DB, tenant string, s Subjec
 // labeling is v of what gives label values and powers to release alone: its grants of roles that
 // give any, each role giving only those but privileged and public as it is whole, its permissions
 // read once however many grants name it. A holding decides by nothing else, so it decides the same
-// by either, and a change deciding the values of many labels by one read walks only these for each,
-// however many grants of other roles, or other permissions of theirs, its actor holds.
+// by either, and every holding is decided by it: a check walks only these, and a change deciding
+// the values of many labels by one read only these for each, however many grants of other roles,
+// or other permissions of theirs, its subject holds.
 func (a *Authorizer) labeling(v *valuesRead) *valuesRead {
 	l := &valuesRead{ds: v.ds, roles: book{builtin: map[Role]RoleDefinition{}, custom: map[Role]RoleDefinition{}}}
 	gives := map[Role]bool{}
@@ -549,19 +551,23 @@ func (a *Authorizer) labelPermissions(ps []Permission) map[Permission]bool {
 }
 
 // labelColumn is SQL keeping the rows whose label column, col, of `dimension:value` values, the
-// holding satisfies, with its arguments numbered from arg: every value declared, none the holding
-// doesn't satisfy alone, as an AllOf or Ordered one, and in each AnyOf dimension none or one held.
-// No index on col serves it: a GIN index finds the rows whose values are all declared only by
-// reading every row, as nearly every one's are, and no index finds those an overlap leaves out.
+// holding satisfies, with its arguments numbered from arg: every value one the holding allows
+// alone, declared and, of an AllOf or Ordered dimension, satisfied, and in each AnyOf dimension
+// none or one held. Each of a row's values is looked up in objects of those, built once for the
+// statement (keyedWith), so a row costs a few comparisons for each of its values however many the
+// dimensions declare, in any plan: an array's containment or overlap compares each with every
+// value of the other, and `= ANY` hashes an array only where the plan holds it as a constant,
+// which a generic one doesn't. Keys compare byte for byte, as Satisfies does, whatever col's
+// collation: in one that isn't deterministic, its own could find a value equal to another that
+// differs only in case or punctuation. No index on col serves it: a GIN index finds the rows
+// whose values are all allowed only by reading every row, as nearly every one's are.
 func (h Holding) labelColumn(col string, arg func(int) string, first int) (string, []any) {
-	// In the default collation, which compares values as Satisfies does: in one that isn't
-	// deterministic, col's own could find a value equal to another it holds that differs only in
-	// case or punctuation.
-	array := func(i int) string { return arg(i) + `::text[] COLLATE "default"` }
-	// Empty, never nil, which pgx would send as NULL, and an array test of NULL keeps no row.
-	declared, refused := []string{}, []string{}
-	clauses := []string{col + " <@ " + array(first), "NOT " + col + " && " + array(first+1)}
-	args := []any{nil, nil}
+	keys := func(i int) string { return "SELECT unnest(" + arg(first+i) + "::text[])" }
+	anyOf := func(i int) string { return keyedWith("jsonb_exists_any", col, keys(i)) }
+	// Empty, never nil, which pgx would send as NULL, and a lookup in NULL keeps no row.
+	allowed := []string{}
+	var clauses []string
+	args := []any{nil}
 	for _, dim := range slices.Sorted(maps.Keys(h.dims)) {
 		ld := h.dims[dim]
 		all, held := []string{}, []string{}
@@ -572,34 +578,26 @@ func (h Holding) labelColumn(col string, arg func(int) string, first int) (strin
 		for v, r := range ld.rank {
 			key := dim + ":" + v
 			all = append(all, key)
-			switch ld.rule {
-			case Ordered:
-				if r > top {
-					refused = append(refused, key)
-				}
-			case AllOf:
-				if !h.values[dim][v] {
-					refused = append(refused, key)
-				}
-			case AnyOf:
-				if h.values[dim][v] {
-					held = append(held, key)
-				}
+			if ld.rule == AnyOf || ld.rule == Ordered && r <= top || ld.rule == AllOf && h.values[dim][v] {
+				allowed = append(allowed, key)
+			}
+			if ld.rule == AnyOf && h.values[dim][v] {
+				held = append(held, key)
 			}
 		}
-		slices.Sort(all)
-		declared = append(declared, all...)
 		if ld.rule == AnyOf {
+			slices.Sort(all)
 			slices.Sort(held)
-			n := first + len(args)
-			clauses = append(clauses, fmt.Sprintf("(NOT %s && %s OR %s && %s)", col, array(n), col, array(n+1)))
+			clauses = append(clauses, fmt.Sprintf("(NOT %s OR %s)", anyOf(len(args)), anyOf(len(args)+1)))
 			args = append(args, all, held)
 		}
 	}
-	slices.Sort(declared)
-	slices.Sort(refused)
-	args[0], args[1] = declared, refused
-	return "(" + strings.Join(clauses, " AND ") + ")", args
+	slices.Sort(allowed)
+	args[0] = allowed
+	// A lookup passes over a NULL value, which no holding allows, so it is looked up as '', which
+	// no dimension declares. Of a NULL column, it is NULL, as the column's test was.
+	every := keyedWith("jsonb_exists_all", "array_replace("+col+", NULL, '')", keys(0))
+	return "(" + strings.Join(append([]string{every}, clauses...), " AND ") + ")", args
 }
 
 // declares reports whether the holding's Authorizer declares every dimension and value a label

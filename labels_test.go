@@ -529,6 +529,286 @@ func TestFilterKeepsWhatTheLabelAllows(t *testing.T) {
 	}
 }
 
+// Filter looks each of a row's label values up in objects of the values the holding allows, built
+// once for the query, so a row costs a few comparisons for each of its values however many its
+// dimensions declare, in a custom plan and a generic one: 20,000 rows of two values each are listed
+// about as fast where their dimension declares 5,000 values as where it declares 10. An array's
+// containment and overlap compared each with every value declared, which took over a hundred times
+// as long, and `= ANY` hashes no array a generic plan holds.
+func TestFilterCostsALabeledRowItsOwnValuesInEveryPlan(t *testing.T) {
+	modes := []string{"force_custom_plan", "force_generic_plan"}
+	took := map[string]time.Duration{}
+	for _, n := range []int{10, 5000} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			var values []string
+			for i := range n {
+				values = append(values, fmt.Sprintf("v%04d", i))
+			}
+			h := setup(t, func(c *rbac.Config) {
+				c.Labels = []rbac.LabelDimension{{Name: "proj", Rule: rbac.AnyOf, Values: values}}
+				c.Catalog = append(slices.Clone(c.Catalog), rbac.RoleDefinition{ID: "proj.one", Permissions: []rbac.Permission{"proj:v0000"}, ResourceTypes: []string{rbac.TenantScope}})
+			})
+			ctx := t.Context()
+			u := h.as(t, "u")
+			h.seed(t, grant(rbac.TenantRoot("t1"), "proj.one", rbac.User, "u"), grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "u"))
+			for _, q := range []string{
+				`CREATE TABLE points (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL, labels text[] NOT NULL)`,
+				`INSERT INTO points SELECT 't1', 'c' || i, ARRAY['cluster:c' || i, 'tenant:t1'],
+					ARRAY['proj:v' || lpad(((i * 7) % ` + fmt.Sprint(n) + `)::text, 4, '0'), 'proj:v' || lpad(((i * 13) % ` + fmt.Sprint(n) + `)::text, 4, '0')]
+					FROM generate_series(1, 20000) AS i`,
+				`ANALYZE points`,
+			} {
+				if _, err := h.pool.Exec(ctx, q); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pred, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			for _, mode := range modes {
+				if _, err := tx.Exec(ctx, `SELECT set_config('plan_cache_mode', $1, true)`, mode); err != nil {
+					t.Fatal(err)
+				}
+				for range 3 {
+					start := time.Now()
+					var kept int
+					if err := tx.QueryRow(ctx, `SELECT count(*) FROM points WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil {
+						t.Fatal(err)
+					}
+					if d, key := time.Since(start), fmt.Sprint(mode, n); took[key] == 0 || d < took[key] {
+						took[key] = d
+					}
+				}
+			}
+		})
+	}
+	for _, mode := range modes {
+		if few, many := took[fmt.Sprint(mode, 10)], took[fmt.Sprint(mode, 5000)]; many > 20*few {
+			t.Errorf("under %s, Filter over 20,000 labeled rows took %v where 10 values are declared and %v where 5,000 are", mode, few, many)
+		}
+	}
+}
+
+// Filter keeps of labeled rows exactly those Authorize allows, Reachable's holding satisfies their
+// labels where Authorize allows, and Holders leaves out only identities Authorize refuses under
+// every request and lists for certain only those it allows under every one: in random tenants of
+// grants on the tenant of roles giving values, conditional ones among them, to identities, groups,
+// the tenant's members and the public, of custom roles for the tenant alone and for other types
+// too, of denies of values and of a constraint removing values, in an Ordered, an AllOf, an AnyOf
+// dimension of forty values and an exclusive one. Of rows whose label has a value no dimension
+// declares or a NULL one, or is NULL, Filter keeps none, and of one whose label is an array of two
+// dimensions, those of it.
+func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
+	var projects []string
+	for i := range 40 {
+		projects = append(projects, fmt.Sprintf("p%02d", i))
+	}
+	var removing map[rbac.Permission]bool
+	h := labeled(t, banks, func(c *rbac.Config) {
+		c.Labels = append(slices.Clone(c.Labels), rbac.LabelDimension{Name: "proj", Rule: rbac.AnyOf, Values: projects})
+		c.Catalog = append(slices.Clone(c.Catalog),
+			rbac.RoleDefinition{ID: "proj.few", Permissions: []rbac.Permission{"proj:p00", "proj:p01", "proj:p02", "proj:p03"}, ResourceTypes: []string{rbac.TenantScope}},
+			rbac.RoleDefinition{ID: "proj.one", Permissions: []rbac.Permission{"proj:p07"}, ResourceTypes: []string{rbac.TenantScope}, Public: true},
+			rbac.RoleDefinition{ID: "mixed", Permissions: []rbac.Permission{"tenant:view", "level:mid", "comp:alpha", "rel:gbr", "proj:p05", "bank:a"}, ResourceTypes: []string{rbac.TenantScope}},
+		)
+		c.Constraints = []rbac.Constraint{{Name: "removing", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			return removing[in.Permission], nil
+		}}}
+	})
+	ctx := t.Context()
+	h.groups(t, "g", "h", "outer")
+	subjects := map[string]rbac.Subject{"anonymous": {}}
+	users := []string{"u0", "u1", "u2", "u3", "u4", "u5"}
+	for i, u := range users {
+		subjects[u] = h.as(t, u, [][]string{{"g"}, {"h"}, {}, {"g", "h"}, {"outer"}, {}}[i]...)
+	}
+	h.guest(t, "u5")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'outer', 'group', 'g');
+		CREATE TABLE points (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL, labels text[])`); err != nil {
+		t.Fatal(err)
+	}
+	var values []string
+	for _, d := range h.cfg.Labels {
+		for _, v := range d.Values {
+			values = append(values, d.Name+":"+v)
+		}
+	}
+	conditions := []string{"", "", "", `request.attributes.mfa == true`, `action.startsWith("proj:")`, `action.endsWith("high")`, `subject.id == "u1"`}
+	roles := []string{"level.low", "level.mid", "level.high", "comp.alpha", "comp.bravo", "rel.usa", "rel.gbr", "bank.a", "bank.b", "proj.few", "proj.one", "mixed", "custom.s0", "custom.s1", "custom.s2"}
+	principals := []string{"user:u0", "user:u1", "user:u2", "user:u3", "user:u4", "user:u5", "group:g", "group:h", "group:outer", "members:t1", "public:"}
+	denied := []string{"level:*", "level:high", "comp:*", "comp:bravo", "rel:gbr", "proj:*", "proj:p01", "bank:a"}
+	// A random label of the dimensions, as a resource carries it and as its column holds it.
+	label := func(rng *rand.Rand) (rbac.Label, []string) {
+		l := rbac.Label{}
+		for _, d := range h.cfg.Labels {
+			if rng.IntN(3) > 0 {
+				continue
+			}
+			for range 1 + rng.IntN(2) {
+				l[d.Name] = append(l[d.Name], d.Values[rng.IntN(min(len(d.Values), 10))])
+			}
+		}
+		column := []string{}
+		for _, dim := range slices.Sorted(maps.Keys(l)) {
+			for _, v := range l[dim] {
+				column = append(column, dim+":"+v)
+			}
+		}
+		return l, column
+	}
+	kept, refused, listed := 0, 0, 0
+	for seed := range uint64(48) {
+		rng := rand.New(rand.NewPCG(seed, seed+17))
+		b := &pgx.Batch{}
+		for _, q := range []string{`DELETE FROM rbac_grants WHERE tenant = 't1'`, `DELETE FROM rbac_denies WHERE tenant = 't1'`, `DELETE FROM rbac_roles WHERE tenant = 't1'`, `DELETE FROM points`} {
+			b.Queue(q)
+		}
+		for i := range 3 {
+			var perms []string
+			for _, v := range values {
+				if rng.IntN(5) == 0 {
+					perms = append(perms, v)
+				}
+			}
+			// Some are for other types, as roles defined before a dimension was declared can be. None
+			// gives cluster:login, which Filter counts only unconditional grants of.
+			types := [][]string{{"tenant"}, {"tenant"}, {"tenant", "cluster"}, {"cluster"}}[rng.IntN(4)]
+			b.Queue(`INSERT INTO rbac_roles (tenant, id, permissions, resource_types, public) VALUES ('t1', $1, $2, $3, $4)`,
+				fmt.Sprint("custom.s", i), append(perms, "tenant:view"), types, rng.IntN(2) == 0)
+		}
+		insert := func(principal, scopeType, scopeID, role, condition string) {
+			kind, id, _ := strings.Cut(principal, ":")
+			b.Queue(`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+				VALUES ('t1', $1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`, scopeType, scopeID, kind, id, role, condition)
+		}
+		for range 2 + rng.IntN(5) {
+			insert(principals[rng.IntN(len(principals))], "org", "o1", "cluster.login", "")
+		}
+		for range 6 + rng.IntN(14) {
+			insert(principals[rng.IntN(len(principals))], "tenant", "t1", roles[rng.IntN(len(roles))], conditions[rng.IntN(len(conditions))])
+		}
+		for i := range rng.IntN(4) {
+			condition := []string{"", `request.attributes.mfa == false`, `action == "proj:p01"`}[rng.IntN(3)]
+			exempt := [][]string{{}, {}, {"group:g"}, {"user:u1"}}[rng.IntN(4)]
+			b.Queue(`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions, condition) VALUES ('t1', 'tenant', 't1', $1, $2, $3, $4, $5)`,
+				fmt.Sprint("d", i), []string{principals[rng.IntN(len(principals))]}, exempt, []string{denied[rng.IntN(len(denied))]}, condition)
+		}
+		removing = map[rbac.Permission]bool{}
+		for _, v := range values {
+			if rng.IntN(15) == 0 {
+				removing[rbac.Permission(v)] = true
+			}
+		}
+		at := func(id string) rbac.Resource {
+			return rbac.Resource{Tenant: "t1", Type: "cluster", ID: id, Ancestors: []rbac.Scope{{Type: "org", ID: "o1"}}}
+		}
+		var rows []rbac.Resource
+		for i := range 12 {
+			r := at(fmt.Sprint("r", i))
+			var column []string
+			r.Labels, column = label(rng)
+			b.Queue(`INSERT INTO points VALUES ('t1', $1, $2, $3)`, r.ID, h.path(t, r), column)
+			rows = append(rows, r)
+		}
+		// Kept only as their values are by a resource carrying them, which an array of two
+		// dimensions does with each.
+		flat, column := label(rng)
+		if len(column)%2 == 1 {
+			column = append(column, column[0])
+		}
+		b.Queue(`INSERT INTO points VALUES ('t1', 'flat', $1, ARRAY[$2::text[], $3::text[]])`, h.path(t, at("flat")), column[:len(column)/2], column[len(column)/2:])
+		flatRow := at("flat")
+		flatRow.Labels = flat
+		rows = append(rows, flatRow)
+		p00 := "proj:p00"
+		for id, column := range map[string]any{"undeclared": []string{p00, "proj:p99"}, "nullValue": []*string{&p00, nil}, "null": nil} {
+			b.Queue(`INSERT INTO points VALUES ('t1', $1, $2, $3::text[])`, id, h.path(t, at(id)), column)
+		}
+		if err := h.pool.SendBatch(ctx, b).Close(); err != nil {
+			t.Fatal(err)
+		}
+		request := rbac.WithRequest(ctx, map[string]any{"mfa": rng.IntN(2) == 0})
+		for _, name := range slices.Sorted(maps.Keys(subjects)) {
+			s := subjects[name]
+			var want []string
+			for _, r := range rows {
+				if err := h.authz.Authorize(request, s, login, r); err == nil {
+					want = append(want, r.ID)
+				} else if !errors.Is(err, rbac.ErrDenied) {
+					t.Fatalf("seed %d: Authorize: %v", seed, err)
+				}
+			}
+			slices.Sort(want)
+			pred, err := h.authz.Filter(request, s, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := listPoints(t, h, pred.SQL, pred.Args...); !slices.Equal(got, want) {
+				t.Errorf("seed %d, %s: Filter keeps %v, Authorize allows %v", seed, name, got, want)
+			}
+			kept += len(want)
+			refused += len(rows) - len(want)
+			reach, err := h.authz.Reachable(request, s, login, "t1", "cluster")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(reach.Conditional)+len(reach.ConditionalExcept) > 0 {
+				continue
+			}
+			var reached []string
+			for _, r := range rows {
+				if (reach.All || len(reach.Scopes) > 0) && reach.Labels.Satisfies(r.Labels) {
+					reached = append(reached, r.ID)
+				}
+			}
+			slices.Sort(reached)
+			if !slices.Equal(reached, want) {
+				t.Errorf("seed %d, %s: Reachable reaches %v, Authorize allows %v", seed, name, reached, want)
+			}
+		}
+		for _, r := range []rbac.Resource{rows[rng.IntN(len(rows))], rows[rng.IntN(len(rows))]} {
+			holders, err := h.authz.Holders(ctx, login, r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			byKey := map[rbac.Principal]rbac.Holder{}
+			for _, hd := range holders {
+				byKey[hd.Principal] = hd
+			}
+			_, public := byKey[rbac.Principal{Kind: rbac.Public}]
+			_, members := byKey[rbac.TenantMembers("t1")]
+			for _, u := range users {
+				var allows []bool
+				for _, mfa := range []bool{true, false} {
+					allows = append(allows, h.authz.Authorize(rbac.WithRequest(ctx, map[string]any{"mfa": mfa}), subjects[u], login, r) == nil)
+				}
+				hd, in := byKey[subjects[u].Principal]
+				// One the public's or the members' record may stand for, as they hold values each their own.
+				broad := public || members && u != "u5"
+				switch {
+				case !in && !broad && (allows[0] || allows[1]):
+					t.Errorf("seed %d, %v: Holders leaves %s out, whom Authorize allows (mfa %v)", seed, r.Labels, u, allows)
+				case in && !hd.Conditional && !hd.MaybeDenied && (!allows[0] || !allows[1]):
+					t.Errorf("seed %d, %v: Holders lists %s for certain, whom Authorize refuses (mfa %v)", seed, r.Labels, u, allows)
+				}
+				if in {
+					listed++
+				}
+			}
+		}
+	}
+	// So that rows kept and refused, and holders listed, are each compared.
+	if kept == 0 || refused == 0 || listed == 0 {
+		t.Errorf("Filter kept %d rows and refused %d, and Holders listed %d", kept, refused, listed)
+	}
+}
+
 // listPoints lists the ids of the rows of points where holds, in order.
 func listPoints(t *testing.T, h *harness, where string, args ...any) []string {
 	t.Helper()
@@ -1215,6 +1495,86 @@ func TestACustomRoleGivingALabelValueIsForTheTenantAlone(t *testing.T) {
 	}
 }
 
+// A custom role stored for any type but the tenant alone gives no label value, though one defined
+// before its dimension was declared is one, as SetRole would refuse it now: granted on a cluster, a
+// value would be decided by grants a check of the value doesn't read, and two of an exclusive
+// dimension held at once. So a check, Permissions, the searches and Conflicts agree that it gives
+// none, and it still gives the rest, privileged as it is whole. A role for the tenant alone gives
+// its values, which the public's grants of two exclusive ones leave the public none of.
+func TestACustomRoleStoredForAnotherTypeGivesNoLabelValue(t *testing.T) {
+	h := labeled(t, banks)
+	ctx := t.Context()
+	u, v := h.as(t, "u"), h.as(t, "v")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES
+		  ('t1', 'custom.tags', '{bank:a,bank:b,cluster:view}', '{cluster}'),
+		  ('t1', 'custom.wide', '{bank:c,rel:gbr,tenant:view}', '{tenant,cluster}');
+		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES
+		  ('t1', 'cluster', 'c1', 'user', 'v', 'custom.tags'), ('t1', 'tenant', 't1', 'user', 'u', 'custom.wide'),
+		  ('t1', 'tenant', 't1', 'user', 'u', 'bank.a')`); err != nil {
+		t.Fatal(err)
+	}
+	if allowed(t, h, v, "bank:a", cluster) {
+		t.Error("Authorize allows bank:a on the cluster a role for clusters gives it on")
+	}
+	if d, err := h.authz.Explain(ctx, v, "bank:a", cluster); err != nil || d.Allowed {
+		t.Errorf("Explain of bank:a on the cluster: %+v, %v", d, err)
+	}
+	for _, c := range []struct {
+		s    rbac.Subject
+		on   rbac.Resource
+		want []rbac.Permission
+	}{{v, cluster, []rbac.Permission{view}}, {u, tenantT1, []rbac.Permission{"bank:a", "tenant:view"}}} {
+		if got, err := h.authz.Permissions(ctx, c.s, c.on); err != nil || !slices.Equal(got, c.want) {
+			t.Errorf("Permissions of %s on %s = %v, %v; want %v", c.s.Principal.ID, c.on.Scope().Key(), got, err, c.want)
+		}
+	}
+	for _, p := range []rbac.Permission{"bank:c", "rel:gbr"} {
+		if allowed(t, h, u, p, tenantT1) {
+			t.Errorf("Authorize allows %s, which only a role for the tenant and clusters gives", p)
+		}
+	}
+	if held, err := h.authz.Holding(ctx, "t1", u); err != nil || !slices.Equal(held.Values(), []rbac.Permission{"bank:a"}) {
+		t.Errorf("Holding = %v, %v", held.Values(), err)
+	}
+	if holders, err := h.authz.Holders(ctx, "rel:gbr", tenantT1); err != nil || len(holders) > 0 {
+		t.Errorf("Holders of rel:gbr = %+v, %v", holders, err)
+	}
+	if reach, err := h.authz.Reachable(ctx, u, "rel:gbr", "t1", rbac.TenantScope); err != nil || reach.All || len(reach.Scopes) > 0 {
+		t.Errorf("Reachable by rel:gbr = %+v, %v", reach, err)
+	}
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE tenants (tenant text NOT NULL, path text[] NOT NULL, labels text[] NOT NULL);
+		INSERT INTO tenants VALUES ('t1', '{tenant:t1}', '{}')`); err != nil {
+		t.Fatal(err)
+	}
+	pred, err := h.authz.Filter(ctx, u, "rel:gbr", "t1", rbac.TenantScope, rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kept int
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM tenants WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil || kept != 0 {
+		t.Errorf("Filter by rel:gbr keeps %d tenants, %v", kept, err)
+	}
+	if conflicts, err := h.authz.Conflicts(ctx, "t1"); err != nil || len(conflicts) > 0 {
+		t.Errorf("Conflicts = %+v, %v", conflicts, err)
+	}
+	// The tags are privileged, as bank:a is given on clusters by no role that isn't.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'c1', 'members', 't1', 'custom.tags')`); err != nil {
+		t.Fatal(err)
+	}
+	if allowed(t, h, h.as(t, "ann"), view, cluster) {
+		t.Error("the tenant's members are given what a role privileged as stored gives")
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, public) VALUES ('t1', 'custom.pair', '{bank:a,bank:b}', '{tenant}', true);
+		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'tenant', 't1', 'public', '', 'bank.a'), ('t1', 'tenant', 't1', 'public', '', 'custom.pair')`); err != nil {
+		t.Fatal(err)
+	}
+	if holders, err := h.authz.Holders(ctx, "bank:a", tenantT1); err != nil || len(holders) > 0 {
+		t.Errorf("Holders of bank:a, of which the public's grants give two values, = %+v, %v", holders, err)
+	}
+}
+
 // A label value a custom role gives is read with the grant of the role, as of one moment, as a
 // check reads what its grants give.
 func TestALabelValueIsReadWithItsCustomRoleAsOfOneMoment(t *testing.T) {
@@ -1561,6 +1921,115 @@ func TestAChangeCheckingManyLabelsWalksOnlyTheGrantsGivingValues(t *testing.T) {
 	}
 }
 
+// A labeled check walks only the subject's grants giving values, and of their roles only the
+// values, each role read once, as a change checking many labels does: so for a subject in a hundred
+// groups, each granted on the tenant a role of five hundred other permissions, every check deciding
+// its label values reads fewer entries for each group beyond the first than the role has.
+func TestALabeledCheckWalksOnlyTheGrantsGivingValues(t *testing.T) {
+	var perms []rbac.Permission
+	for i := range 500 {
+		perms = append(perms, rbac.Permission(fmt.Sprintf("tenant:p%03d", i)))
+	}
+	big := rbac.RoleDefinition{ID: "big", Permissions: perms, ResourceTypes: []string{rbac.TenantScope}}
+	h := setup(t, compartments, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), big) })
+	ctx := t.Context()
+	u := h.as(t, "u")
+	h.seed(t, grant(rbac.TenantRoot("t1"), "compartments", rbac.User, "u"), grant(cluster.Scope(), "cluster.admin", rbac.User, "u"))
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE points (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL, labels text[] NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	// u in groups from to to, each granted the role on the tenant.
+	inGroups := func(from, to int) {
+		t.Helper()
+		for _, q := range []string{
+			`INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'big' || i FROM generate_series($1::int, $2) AS i`,
+			`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) SELECT 't1', 'big' || i, 'user', 'u' FROM generate_series($1::int, $2) AS i`,
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+				SELECT 't1', 'tenant', 't1', 'group', 'big' || i, 'big' FROM generate_series($1::int, $2) AS i`,
+		} {
+			if _, err := h.pool.Exec(ctx, q, from, to); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	secret := cluster
+	secret.Labels = rbac.Label{"comp": {"c01"}}
+	checks := []struct {
+		name string
+		call func() error
+	}{
+		{"Authorize", func() error { return h.authz.Authorize(ctx, u, login, secret) }},
+		{"Explain", func() error {
+			d, err := h.authz.Explain(ctx, u, login, secret)
+			if err == nil && !d.Allowed {
+				err = fmt.Errorf("refused: %+v", d)
+			}
+			return err
+		}},
+		{"Permissions", func() error {
+			ps, err := h.authz.Permissions(ctx, u, secret)
+			if err == nil && !slices.Contains(ps, login) {
+				err = fmt.Errorf("lists %v", ps)
+			}
+			return err
+		}},
+		{"Grantable", func() error {
+			roles, err := h.authz.Grantable(ctx, u, secret)
+			if err == nil && len(roles) == 0 {
+				err = errors.New("offers nothing")
+			}
+			return err
+		}},
+		{"Holders", func() error {
+			holders, err := h.authz.Holders(ctx, login, secret)
+			if err == nil && !slices.ContainsFunc(holders, func(hd rbac.Holder) bool { return hd.Principal == u.Principal }) {
+				err = fmt.Errorf("lists %+v", holders)
+			}
+			return err
+		}},
+		{"Holding", func() error {
+			held, err := h.authz.Holding(ctx, "t1", u)
+			if err == nil && !held.Satisfies(secret.Labels) {
+				err = fmt.Errorf("holds %v", held.Values())
+			}
+			return err
+		}},
+		{"Filter", func() error {
+			_, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1)
+			return err
+		}},
+		{"Reachable", func() error {
+			reach, err := h.authz.Reachable(ctx, u, login, "t1", "cluster")
+			if err == nil && !reach.Labels.Satisfies(secret.Labels) {
+				err = fmt.Errorf("reaches %+v", reach)
+			}
+			return err
+		}},
+	}
+	read := 0
+	rbac.SetReadingEntries(t, func(k int) { read += k })
+	reads := func() []int {
+		t.Helper()
+		var n []int
+		for _, c := range checks {
+			read = 0
+			if err := c.call(); err != nil {
+				t.Fatalf("%s: %v", c.name, err)
+			}
+			n = append(n, read)
+		}
+		return n
+	}
+	inGroups(1, 1)
+	one := reads()
+	inGroups(2, 100)
+	for i, n := range reads() {
+		if each := (n - one[i]) / 99; each >= len(perms) {
+			t.Errorf("%s of a labeled resource read %d entries more for each group granted a role of %d permissions giving no value", checks[i].name, each, len(perms))
+		}
+	}
+}
+
 // A change checking many labels by one read of the actor's values shares what its conditions came
 // to between the values it decides, and each value is still decided on budgets of its own, which
 // pay for every condition they read, run or shared: so each label's values are what a check of
@@ -1679,15 +2148,18 @@ func TestAChangeCheckingManyLabelsDecidesEachAsACheckOfItAlone(t *testing.T) {
 // group, a group that group is in, the tenant's members and the public, some under conditions
 // reading the action or failing, and for some of them enough costly ones that a value's budget
 // runs out; of denies, wildcards among them, and of a constraint removing values: in an Ordered
-// dimension, and an exclusive one.
+// dimension, and an exclusive one. A check of one label, and Holding, walk only those too, and
+// decide as walking every grant and permission does, there under a constraint failing on some
+// values as well, which fails the check that asks it about one.
 func TestAChangeWalkingOnlyTheGrantsGivingValuesDecidesEachLabelAsACheckOfItAlone(t *testing.T) {
 	var others []rbac.Permission
 	for i := range 40 {
 		others = append(others, rbac.Permission(fmt.Sprintf("tenant:p%02d", i)))
 	}
 	level := rbac.LabelDimension{Name: "lvl", Rule: rbac.Ordered, Values: []string{"low", "mid", "high"}}
-	// removing is what the constraint removes, drawn for each tenant.
-	var removing map[rbac.Permission]bool
+	// removing is what the constraint removes, drawn for each tenant, and failing what it fails on.
+	var removing, failing map[rbac.Permission]bool
+	errDown := errors.New("the policy service is down")
 	h := setup(t, compartments, banks, func(c *rbac.Config) {
 		c.Labels = append(slices.Clone(c.Labels), level)
 		c.Catalog = append(slices.Clone(c.Catalog),
@@ -1703,6 +2175,9 @@ func TestAChangeWalkingOnlyTheGrantsGivingValuesDecidesEachLabelAsACheckOfItAlon
 		)
 		c.Constraints = append(slices.Clone(c.Constraints), rbac.Constraint{
 			Name: "removing", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+				if failing[in.Permission] {
+					return false, errDown
+				}
 				return removing[in.Permission], nil
 			},
 		})
@@ -1756,7 +2231,7 @@ func TestAChangeWalkingOnlyTheGrantsGivingValuesDecidesEachLabelAsACheckOfItAlon
 	}
 	principals := []string{"user:u", "user:u", "group:g", "group:outer", "members:t1", "public:"}
 	denied := []string{"comp:*", "comp:c02", "comp:c07", "comp:release", "bank:*", "bank:a", "bank:release", "lvl:*", "lvl:mid", "tenant:*", "tenant:p00"}
-	held, missed, released, kept := 0, 0, 0, 0
+	held, missed, released, kept, failed := 0, 0, 0, 0, 0
 	// 128 tenants keep the suite's time; 512 passed when this was reviewed.
 	for seed := range uint64(128) {
 		rng := rand.New(rand.NewPCG(seed, seed))
@@ -1858,10 +2333,29 @@ func TestAChangeWalkingOnlyTheGrantsGivingValuesDecidesEachLabelAsACheckOfItAlon
 				kept++
 			}
 		}
+		if seed%2 == 1 {
+			failing = map[rbac.Permission]bool{}
+			for _, p := range append(slices.Clone(values), releases...) {
+				if rng.IntN(12) == 0 {
+					failing[rbac.Permission(p)] = true
+				}
+			}
+		}
+		narrowed, full := rbac.LabeledChecksDecided(t, request, h.authz, u, "t1", labels)
+		failing = nil
+		for i := range narrowed {
+			if narrowed[i] != full[i] {
+				t.Errorf("seed %d, check %d of %v: by the grants giving values the actor holds %s, and by every grant %s", seed, i, labels, narrowed[i], full[i])
+			}
+			if strings.HasPrefix(full[i], "error: ") {
+				failed++
+			}
+		}
 	}
-	// So that values and powers to release held and not are each compared.
-	if held == 0 || missed == 0 || released == 0 || kept == 0 {
-		t.Errorf("of the values asked for, %d were held and %d not, and of the powers to release, %d were held and %d not", held, missed, released, kept)
+	// So that values and powers to release held and not are each compared, and checks failing.
+	if held == 0 || missed == 0 || released == 0 || kept == 0 || failed == 0 {
+		t.Errorf("of the values asked for, %d were held and %d not, of the powers to release, %d were held and %d not, and %d checks failed",
+			held, missed, released, kept, failed)
 	}
 }
 
