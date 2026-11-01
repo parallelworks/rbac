@@ -337,7 +337,8 @@ type Resource struct {
 	ID        string
 	Ancestors []Scope
 	// Attributes are what conditions read as resource.attributes, of the values Attributes names:
-	// read them from where the resource is stored, as its path, never from request input.
+	// read them from where the resource is stored, as its path, never from request input, and
+	// bound what users may store there, as a check converts no more of them than Attributes says.
 	Attributes map[string]any
 	// Labels is its label, which a subject's holding must satisfy, whatever its grants give, for
 	// a check to allow anything (Config.Labels) but, on the tenant, a label value or a power to

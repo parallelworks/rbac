@@ -79,8 +79,11 @@ import (
 // each value and a tenth of each string's, bytes', JSON number's, JSON text's or packed type URL's
 // length, and half a packed message's, as a packed value takes as few as two bytes: past that,
 // every condition reading an attribute of any kind fails, and JSON text that may hold more values
-// than are left isn't parsed. A declared attribute is a value of its type as converted, so a named
-// string type is a string.
+// than are left isn't parsed. The subject's, the resource's and the request's attributes share it,
+// so attributes a tenant's users write, as a resource's tags, can take every check of the resource
+// past that, where a grant's condition reading an attribute gives nothing and a deny's applies,
+// whoever asks: bound what users may store, or pass conditions only what they read. A declared
+// attribute is a value of its type as converted, so a named string type is a string.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }

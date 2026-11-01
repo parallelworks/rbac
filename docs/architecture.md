@@ -406,7 +406,9 @@ sequenceDiagram
   converting costs a check at most `maxConverted`, counted as `valueSize` counts what a condition
   reads, about what a check may spend on a scope's grants' conditions, past which every condition
   reading an attribute fails: converting isn't charged to a condition, and charging the check would
-  let what one condition reads fail the others. So conditions run on CEL's own values alone, by
+  let what one condition reads fail the others. The subject's, the resource's and the request's
+  attributes share the bound, so ones users write, as a resource's tags, can fail the conditions of
+  every check of the resource, closed. So conditions run on CEL's own values alone, by
   CEL's own semantics, and a comparison that fails where either value holds a double that isn't
   finite sees every double there is. Each runs within the most evaluating it can cost, which its
   literals and types bound, and the ids, kinds, types and tenant a check passes and its action,
