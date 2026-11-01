@@ -3460,7 +3460,8 @@ func TestACrowdedCopyIsWhatWritingItAfreshMakes(t *testing.T) {
 	}
 	// The pages of each table and index are as many as the template's, and as a fresh writing's but
 	// for the few the times' lengths move, and those of the index of the grants' random ids, which
-	// leave its pages as full as the order they happen to come in.
+	// leave its pages as full as the order they happen to come in: two writings of its 20,000 keys
+	// came 12% apart, so it is held to a quarter; the copy is held to the template's exactly.
 	copies, templates, written := relationPages(t, copied, copySchema), relationPages(t, copied, template), relationPages(t, copied, afresh)
 	for relation, pages := range templates {
 		if copies[relation] != pages {
@@ -3468,7 +3469,7 @@ func TestACrowdedCopyIsWhatWritingItAfreshMakes(t *testing.T) {
 		}
 		within := max(1, pages/50)
 		if relation == "rbac_grants_pkey" {
-			within = pages / 10
+			within = pages / 4
 		}
 		if diff := written[relation] - pages; max(diff, -diff) > within {
 			t.Errorf("a fresh writing's %s has %d pages, and the template's %d", relation, written[relation], pages)
