@@ -64,7 +64,8 @@ import (
 //   - a pointer to any of these, read as what it points to;
 //   - JSON text (json.RawMessage) and a JSON number (json.Number), parsed;
 //   - the protobuf well-known types: a Struct, a ListValue, a Value or a NullValue, a wrapper, a
-//     Timestamp, a Duration, and an Any packing one of them but another Any.
+//     Timestamp, a Duration, and an Any packing one of them but another Any, by its type's name,
+//     as no packed message of another type is decoded.
 //
 // Anything else fails whatever condition reads it, a test of its presence, has(), `in` the map
 // holding it or a loop over that map's keys, included: a ref.Val of the host's own, though it says
@@ -710,18 +711,37 @@ func (c *converter) message(v reflect.Value) ref.Val {
 			if !c.pay(uint64(len(m.GetTypeUrl()))/10 + uint64(len(m.GetValue()))/2) {
 				return tooLarge()
 			}
-			packed, err := m.UnmarshalNew()
-			if err != nil {
+			unpacked, ok := packable[m.MessageName()]
+			if !ok {
 				return types.NewErr("rbac: a condition can't read a packed message of type %.256q", m.GetTypeUrl())
 			}
-			if _, ok := packed.(*anypb.Any); ok {
-				return types.NewErr("rbac: a condition can't read a packed message packing another")
+			packed := unpacked()
+			if err := proto.Unmarshal(m.GetValue(), packed); err != nil {
+				return types.NewErr("rbac: a condition can't read a packed message of type %.256q", m.GetTypeUrl())
 			}
 			return c.of(reflect.ValueOf(packed))
 		})
 	}
 	return cantRead(v.Type())
 }
+
+// packable makes a new message of each type a condition reads packed in an Any, by the type's
+// name, so no other is decoded: finding one of another type by the registry, as unpacking an Any
+// does, runs the host's own code, its type's New or a message's own Unmarshal, which can panic on
+// what it decodes, outside any condition, ending the check.
+var packable = func() map[protoreflect.FullName]func() proto.Message {
+	made := map[protoreflect.FullName]func() proto.Message{}
+	for _, m := range []proto.Message{
+		&structpb.Struct{}, &structpb.ListValue{}, &structpb.Value{}, &wrapperspb.BoolValue{}, &wrapperspb.BytesValue{},
+		&wrapperspb.DoubleValue{}, &wrapperspb.FloatValue{}, &wrapperspb.Int32Value{}, &wrapperspb.Int64Value{},
+		&wrapperspb.StringValue{}, &wrapperspb.UInt32Value{}, &wrapperspb.UInt64Value{}, &timestamppb.Timestamp{},
+		&durationpb.Duration{},
+	} {
+		t := m.ProtoReflect().Type()
+		made[t.Descriptor().FullName()] = func() proto.Message { return t.New().Interface() }
+	}
+	return made
+}()
 
 // cantRead fails a value of type t, naming no more of the type than its start, as every error
 // naming one does: each such value is charged one, whatever its type's name, which a type of many

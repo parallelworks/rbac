@@ -23,7 +23,9 @@ import (
 	"cel.dev/cel-go/ext"
 	"cel.dev/cel-go/interpreter"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -1132,6 +1134,49 @@ func TestAPackedMessagePackingAnotherFails(t *testing.T) {
 	}
 	if held, _, _, err := rbac.EvaluateCondition(t, `request.attributes.v == "a"`, map[string]any{"v": inner}); err != nil || !held {
 		t.Errorf("one packing a string: held %t, %v", held, err)
+	}
+}
+
+// hostMessageType is a message type of the host's own, whose New panics, as code of the host's
+// decoding what it can't read can.
+type hostMessageType struct{ protoreflect.MessageType }
+
+func (hostMessageType) New() protoreflect.Message {
+	panic("rbac_test: a host's message type made a message")
+}
+
+// registeringHostType registers a hostMessageType, rbac_test.Host, once for the test binary, as a
+// host registers its own.
+var registeringHostType = sync.OnceValue(func() error {
+	file, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Name: proto.String("rbac_test/host.proto"), Package: proto.String("rbac_test"), Syntax: proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{{Name: proto.String("Host")}},
+	}, nil)
+	if err != nil {
+		return err
+	}
+	return protoregistry.GlobalTypes.RegisterMessage(hostMessageType{dynamicpb.NewMessageType(file.Messages().Get(0))})
+})
+
+// An Any packing a message of another type than those a condition reads was unpacked through the
+// registry, which ran the host's own code for it, its type's New, or a message's own Unmarshal of
+// what it packs, outside any condition: one that panicked ended the check. It fails what reads it,
+// decoding nothing, and the attributes beside it are read.
+func TestAPackedMessageOfAnotherTypeIsntDecoded(t *testing.T) {
+	if err := registeringHostType(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("converting a packed message of the host's type: %v", r)
+		}
+	}()
+	packed := &anypb.Any{TypeUrl: "type.googleapis.com/rbac_test.Host"}
+	if held, _, _, err := rbac.EvaluateCondition(t, `request.attributes.ok == true`, map[string]any{"ok": true, "v": packed}); err != nil || !held {
+		t.Errorf("an attribute beside a packed message of the host's type: held %t, %v", held, err)
+	}
+	if _, evaluated, _, err := rbac.EvaluateCondition(t, `request.attributes.v != 1`, map[string]any{"v": packed}); err != nil || evaluated {
+		t.Errorf("a packed message of the host's type: evaluated %t, %v", evaluated, err)
 	}
 }
 
