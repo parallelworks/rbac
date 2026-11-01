@@ -42,7 +42,7 @@ flowchart LR
         tables[("rbac_grants, rbac_roles, rbac_denies,<br/>rbac_eligibilities, rbac_memberships,<br/>rbac_groups, rbac_members")]
         history[("rbac_history")]
         triggers["Triggers: rbac_record,<br/>append-only, no truncate"]
-        fn["rbac_group_members,<br/>rbac_tenant_keys,<br/>rbac_text_array"]
+        fn["rbac_group_members,<br/>rbac_tenant_keys,<br/>rbac_text_array,<br/>rbac_changes_grants"]
     end
     code -->|"Authorize, Filter, Apply, ..."| api
     api -->|"asks"| hooks
@@ -224,7 +224,11 @@ erDiagram
   those an identity or group leaving the tenant is taken out of, and the denies naming a list's
   subject or its groups, which `Filter` and `Reachable` read, are found through GIN indexes on
   those arrays of keys, each key prefixed by its tenant (`rbac_tenant_keys`), so neither the
-  tenant's other rows nor another tenant's group of the same id are read. History indexes the keys
+  tenant's other rows nor another tenant's group of the same id are read. The denies binding the
+  actor of a change to members or of `DeleteGroup` that remove a power to change grants, whose types
+  they read wherever in the tenant the denies are (`grantsDenied`), are found through such an index
+  holding only those (`rbac_denies_grants`, by `rbac_changes_grants`), so the other denies naming
+  the tenant's members or the public, which bind every actor, aren't read. History indexes the keys
   each version of a deny names so too, so as of a time those lists find them the same way, and
   they count the denies on their types by history's versions of them, at most a few: through the
   views, which read every version of a deny to find its last, counting read every one, deleted
@@ -472,14 +476,24 @@ sequenceDiagram
   it ends there, not by what the members hold after it, as `Apply` revoking a grant held twice is:
   a member leaving a group ends what the group and those it is in give it there, though another
   group gives it the same, but a place ending while another, from another source, keeps the member
-  in the group as long leaves nothing (`placesLeft`). `ChangeMembers` asks the
+  in the group as long leaves nothing (`placesLeft`). `SetRole` and `DeleteRole` ask the
+  constraints of no resource, and read the denies on the tenant as on the tenant, once for every type
+  of scope the role's grants can be on (`changesStopped`, `changesDenied`), where a deny's condition
+  reading the resource can't be evaluated and so denies (`handsOn`): stricter than `Apply` on a scope
+  such a condition spares, as the grants span scopes no one reads, but never weaker, and only for a
+  deny below the tenant or a label is each scope read from the host. `ChangeMembers` asks the
   constraints once about each type of scope a member only loses access on, of no resource
   (`freezes`), and reads the types whose power to change grants a deny binding the actor lists
   (`grantsDenied`); only for a scope of a type either names, or whose label can refuse the actor, is
   `Config.ResourceOf` asked, and then the constraints again about it and the denies on its path, in
   one read with the rest (`reachAuthority`). In its transaction the denies are read again, and a
-  type one binding the actor now names that none did refuses the change with `ErrConflict`. The
-  host's own writes make no check of an actor, so no freeze stops them.
+  type one binding the actor now names that none did refuses the change with `ErrConflict`.
+  `DeleteGroup` reads the group alike: from the host only where a constraint or such a deny may
+  stop it changing grants on groups, so a condition reading the group's attributes reads what the
+  host passes `Apply` there, and without `Config.ResourceOf`, where the group as stored isn't all of
+  it, refused once its transaction finds anything granted on it (`storedWhole`); and where no such
+  deny bound the actor before it, one that does under its locks has it tried again. The host's own
+  writes make no check of an actor, so no freeze stops them.
 - **Until when.** What the actor holds only until a time, through an expiring grant, an activation,
   or a membership or place in a group that ends, it hands on only until then: `authorityOn` reads
   when each grant's holding ends, in the statement that reads the grants, and a grant may end no
@@ -846,7 +860,7 @@ file, nor `SET` or `ALTER SYSTEM` on a parameter only a superuser may set. The R
 flowchart LR
     admin["Administrator's role<br/>runs Migrate, owns the tables"]
     histrole["History's role<br/>owns rbac_history and rbac_record"]
-    app["Application's role<br/>USAGE on the schema, DML on the tables,<br/>SELECT on history, EXECUTE rbac_group_members,<br/>rbac_tenant_keys and rbac_text_array"]
+    app["Application's role<br/>USAGE on the schema, DML on the tables,<br/>SELECT on history, EXECUTE rbac_group_members,<br/>rbac_tenant_keys, rbac_text_array<br/>and rbac_changes_grants"]
     admin -->|"member of"| histrole
     app -->|"writes"| tables[("rbac_* tables")]
     tables -->|"rbac_record runs as"| histrole
@@ -864,7 +878,11 @@ the listed type and the denies on them, and costs each row a few lookups among t
 there are; and for the changes that check, once each, every scope what they change has access on:
 `ChangeMembers` every scope the groups whose members change have access on, approve eligibilities on
 or are named or exempt in a deny on, and `SetRole` changing what a role gives, and `DeleteRole`,
-every scope it is granted on; and for `ImportMembers`, which asks `ValidateGrant` once for each
+every scope it is granted on; and for the denies binding the actor of `ChangeMembers` or
+`DeleteGroup` that remove a power to change grants, which they read wherever in the tenant they are,
+as a deny on the path of a scope of a type one lists can stop them taking access away there, through
+an index of those alone, so no other deny naming the actor, its groups, the tenant's members or the
+public costs them anything; and for `ImportMembers`, which asks `ValidateGrant` once for each
 member it adds and each grant or eligibility that member gains. The tables hold rows within the same
 bounds, but for the ids in a deny's principals and exemptions and an eligibility's approvers: a
 check can count an array element's bytes only with a function of the package's own, which every role
