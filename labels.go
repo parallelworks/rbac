@@ -552,15 +552,19 @@ func (a *Authorizer) labelPermissions(ps []Permission) map[Permission]bool {
 
 // labelColumn is SQL keeping the rows whose label column, col, of `dimension:value` values, the
 // holding satisfies, with its arguments numbered from arg: every value one the holding allows
-// alone, declared and, of an AllOf or Ordered dimension, satisfied, and in each AnyOf dimension
+// alone, declared and, of an AllOf or Ordered dimension, satisfied, and of an AnyOf one, of a
+// dimension it holds a value of; and in each AnyOf dimension it holds some values of but not all,
 // none or one held. Each of a row's values is looked up in objects of those, built once for the
 // statement (keyedWith), so a row costs a few comparisons for each of its values however many the
 // dimensions declare, in any plan: an array's containment or overlap compares each with every
 // value of the other, and `= ANY` hashes an array only where the plan holds it as a constant,
-// which a generic one doesn't. Keys compare byte for byte, as Satisfies does, whatever col's
-// collation: in one that isn't deterministic, its own could find a value equal to another that
-// differs only in case or punctuation. No index on col serves it: a GIN index finds the rows
-// whose values are all allowed only by reading every row, as nearly every one's are.
+// which a generic one doesn't. The planner counts each lookup as keeping a third of the rows, so
+// an AnyOf dimension held whole or not at all, whose values each say alone whether they satisfy
+// it, has no test of its own: with one for each, a tenant declaring a dozen had a sorted page
+// planned as keeping too few rows to read in order. Keys compare byte for byte, as Satisfies does,
+// whatever col's collation: in one that isn't deterministic, its own could find a value equal to
+// another that differs only in case or punctuation. No index on col serves it: a GIN index finds
+// the rows whose values are all allowed only by reading every row, as nearly every one's are.
 func (h Holding) labelColumn(col string, arg func(int) string, first int) (string, []any) {
 	keys := func(i int) string { return "SELECT unnest(" + arg(first+i) + "::text[])" }
 	anyOf := func(i int) string { return keyedWith("jsonb_exists_any", col, keys(i)) }
@@ -575,17 +579,19 @@ func (h Holding) labelColumn(col string, arg func(int) string, first int) (strin
 		for v := range h.values[dim] {
 			top = max(top, ld.rank[v])
 		}
+		for v := range ld.rank {
+			if ld.rule == AnyOf && h.values[dim][v] {
+				held = append(held, dim+":"+v)
+			}
+		}
 		for v, r := range ld.rank {
 			key := dim + ":" + v
 			all = append(all, key)
-			if ld.rule == AnyOf || ld.rule == Ordered && r <= top || ld.rule == AllOf && h.values[dim][v] {
+			if ld.rule == AnyOf && len(held) > 0 || ld.rule == Ordered && r <= top || ld.rule == AllOf && h.values[dim][v] {
 				allowed = append(allowed, key)
 			}
-			if ld.rule == AnyOf && h.values[dim][v] {
-				held = append(held, key)
-			}
 		}
-		if ld.rule == AnyOf {
+		if ld.rule == AnyOf && len(held) > 0 && len(held) < len(all) {
 			slices.Sort(all)
 			slices.Sort(held)
 			clauses = append(clauses, fmt.Sprintf("(NOT %s OR %s)", anyOf(len(args)), anyOf(len(args)+1)))

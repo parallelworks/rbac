@@ -609,6 +609,67 @@ func TestFilterCostsALabeledRowItsOwnValuesInEveryPlan(t *testing.T) {
 	}
 }
 
+// The planner counts a function as keeping a third of the rows it reads, so a test of each AnyOf
+// dimension would have it count fewer rows kept for each one declared: past a dozen, a sorted page
+// of a tenant of 100,000 rows read every row and sorted them, in 160 ms, where it read them in order
+// until the page was full, in 10. Only a dimension of which the holding holds some values and not
+// others is tested so: of one it holds none of, a value is one it doesn't allow, and of one it
+// holds every value of, any satisfies it. So where sixteen more dimensions are declared, half of
+// them held whole and half not at all, the planner counts as many rows kept, planning the query for
+// its arguments or generically.
+func TestFilterIsCountedAlikeHoweverManyDimensionsItsHoldingHoldsWholeOrNotAtAll(t *testing.T) {
+	// The page of a subject whose grants on containers are looked up, which no index serves.
+	rbac.SetMaxContainerOverlap(t, 0)
+	planned := func(extra int) []float64 {
+		h := setup(t, func(c *rbac.Config) {
+			c.Labels = []rbac.LabelDimension{{Name: "rel", Rule: rbac.AnyOf, Values: []string{"usa", "gbr", "fra"}}}
+			perms := []rbac.Permission{"rel:usa"}
+			for i := range extra {
+				dim := fmt.Sprint("ext", i)
+				c.Labels = append(c.Labels, rbac.LabelDimension{Name: dim, Rule: rbac.AnyOf, Values: []string{"x", "y"}})
+				if i%2 == 0 {
+					perms = append(perms, rbac.Permission(dim+":x"), rbac.Permission(dim+":y"))
+				}
+			}
+			c.Catalog = append(slices.Clone(c.Catalog), rbac.RoleDefinition{ID: "cleared", Permissions: perms, ResourceTypes: []string{rbac.TenantScope}})
+		})
+		ctx := t.Context()
+		u := h.as(t, "u")
+		h.seed(t, grant(rbac.TenantRoot("t1"), "cleared", rbac.User, "u"), grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "u"))
+		for _, q := range []string{
+			`CREATE TABLE points (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL, labels text[] NOT NULL)`,
+			`INSERT INTO points SELECT 't1', 'c' || i, ARRAY['cluster:c' || i, 'tenant:t1'],
+				CASE WHEN i % 2 = 0 THEN '{}' ELSE ARRAY['rel:' || (ARRAY['usa', 'gbr', 'fra'])[1 + i % 3]] END
+				FROM generate_series(1, 20000) AS i`,
+			`ANALYZE points`,
+		} {
+			if _, err := h.pool.Exec(ctx, q); err != nil {
+				t.Fatal(err)
+			}
+		}
+		pred, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var rows []float64
+		for _, options := range []string{"FORMAT JSON", "GENERIC_PLAN, FORMAT JSON"} {
+			var plan []map[string]map[string]any
+			if err := h.pool.QueryRow(ctx, `EXPLAIN (`+options+`) SELECT id FROM points WHERE `+pred.SQL, pred.Args...).Scan(&plan); err != nil {
+				t.Fatal(err)
+			}
+			n, _ := plan[0]["Plan"]["Plan Rows"].(float64)
+			rows = append(rows, n)
+		}
+		return rows
+	}
+	few, many := planned(0), planned(16)
+	for i, mode := range []string{"for its arguments", "generically"} {
+		if few[i] < 100 || many[i] < few[i]/2 {
+			t.Errorf("planned %s, Filter is counted as keeping %v rows of 20,000, and %v where sixteen more dimensions are declared", mode, few[i], many[i])
+		}
+	}
+}
+
 // Filter keeps of labeled rows exactly those Authorize allows, Reachable's holding satisfies their
 // labels where Authorize allows, and Holders leaves out only identities Authorize refuses under
 // every request and lists for certain only those it allows under every one: in random tenants of
@@ -632,6 +693,7 @@ func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 			rbac.RoleDefinition{ID: "proj.few", Permissions: []rbac.Permission{"proj:p00", "proj:p01", "proj:p02", "proj:p03"}, ResourceTypes: []string{rbac.TenantScope}},
 			rbac.RoleDefinition{ID: "proj.one", Permissions: []rbac.Permission{"proj:p07"}, ResourceTypes: []string{rbac.TenantScope}, Public: true},
 			rbac.RoleDefinition{ID: "mixed", Permissions: []rbac.Permission{"tenant:view", "level:mid", "comp:alpha", "rel:gbr", "proj:p05", "bank:a"}, ResourceTypes: []string{rbac.TenantScope}},
+			rbac.RoleDefinition{ID: "rel.all", Permissions: []rbac.Permission{"rel:usa", "rel:gbr", "rel:fra"}, ResourceTypes: []string{rbac.TenantScope}},
 		)
 		c.Constraints = []rbac.Constraint{{Name: "removing", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
 			return removing[in.Permission], nil
@@ -659,7 +721,7 @@ func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 		}
 	}
 	conditions := []string{"", "", "", `request.attributes.mfa == true`, `action.startsWith("proj:")`, `action.endsWith("high")`, `subject.id == "u1"`}
-	roles := []string{"level.low", "level.mid", "level.high", "comp.alpha", "comp.bravo", "rel.usa", "rel.gbr", "bank.a", "bank.b", "proj.few", "proj.one", "mixed", "custom.s0", "custom.s1", "custom.s2"}
+	roles := []string{"level.low", "level.mid", "level.high", "comp.alpha", "comp.bravo", "rel.usa", "rel.gbr", "rel.all", "bank.a", "bank.b", "proj.few", "proj.one", "mixed", "custom.s0", "custom.s1", "custom.s2"}
 	principals := []string{"user:u0", "user:u1", "user:u2", "user:u3", "user:u4", "user:u5", "group:g", "group:h", "group:outer", "members:t1", "public:"}
 	denied := []string{"level:*", "level:high", "comp:*", "comp:bravo", "rel:gbr", "proj:*", "proj:p01", "bank:a"}
 	// A random label of the dimensions, as a resource carries it and as its column holds it.
@@ -681,8 +743,9 @@ func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 		}
 		return l, column
 	}
-	// The rows refused by a dimension the holding holds no value of, AnyOf ones and the others apart.
-	kept, refused, listed, noneOfAnyOf, noneOfOther := 0, 0, 0, 0, 0
+	// The rows refused by a dimension the holding holds no value of, AnyOf ones and the others apart,
+	// and those labeled in an AnyOf dimension it holds every value of.
+	kept, refused, listed, noneOfAnyOf, noneOfOther, wholeAnyOf := 0, 0, 0, 0, 0, 0
 	for seed := range uint64(48) {
 		rng := rand.New(rand.NewPCG(seed, seed+17))
 		b := &pgx.Batch{}
@@ -788,6 +851,12 @@ func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, r := range rows {
+				for dim := range r.Labels {
+					if d := h.cfg.Labels[slices.IndexFunc(h.cfg.Labels, func(d rbac.LabelDimension) bool { return d.Name == dim })]; d.Rule == rbac.AnyOf &&
+						!slices.ContainsFunc(d.Values, func(v string) bool { return !slices.Contains(held.Values(), rbac.Permission(dim+":"+v)) }) {
+						wholeAnyOf++
+					}
+				}
 				dim := held.Unsatisfied(r.Labels)
 				switch {
 				case dim == "" || slices.ContainsFunc(held.Values(), func(p rbac.Permission) bool { return strings.HasPrefix(string(p), dim+":") }):
@@ -847,10 +916,10 @@ func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 		}
 	}
 	// So that rows kept and refused, and holders listed, are each compared, and refusals by a
-	// dimension of no value held.
-	if kept == 0 || refused == 0 || listed == 0 || noneOfAnyOf == 0 || noneOfOther == 0 {
-		t.Errorf("Filter kept %d rows and refused %d, %d by an AnyOf dimension and %d by another of no value held, and Holders listed %d",
-			kept, refused, noneOfAnyOf, noneOfOther, listed)
+	// dimension of no value held, and labels in one held whole.
+	if kept == 0 || refused == 0 || listed == 0 || noneOfAnyOf == 0 || noneOfOther == 0 || wholeAnyOf == 0 {
+		t.Errorf("Filter kept %d rows and refused %d, %d by an AnyOf dimension and %d by another of no value held, %d rows were labeled in an AnyOf dimension held whole, and Holders listed %d",
+			kept, refused, noneOfAnyOf, noneOfOther, wholeAnyOf, listed)
 	}
 }
 

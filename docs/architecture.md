@@ -617,10 +617,12 @@ flowchart LR
   ones naming everyone by those keys, so a tenant with many of both has every list read every deny
   naming everyone. A row's label is tested by looking each of its values up, byte for byte, in
   objects the statement builds once of the values the subject's holding allows, and of each `AnyOf`
-  dimension's values and those it holds, so a row costs a few comparisons for each of its values
-  however many the dimensions declare, in a custom plan or a generic one: an array's containment or
-  overlap would compare each with every value declared, and `= ANY` hashes only an array a plan
-  holds as a constant.
+  dimension it holds some values of but not all, that dimension's values and those it holds, so a
+  row costs a few comparisons for each of its values however many the dimensions declare, in a
+  custom plan or a generic one: an array's containment or overlap would compare each with every
+  value declared, and `= ANY` hashes only an array a plan holds as a constant. The planner counts
+  each lookup as keeping a third of the rows, so a dimension held whole or not at all has no test of
+  its own, which with many declared would have a sorted page planned to read every row.
 - **Reachable** returns the same as scopes, for a host that keeps its resources elsewhere. They hold
   for resources of the listed type alone: a scope reaches everything under it, of any type, so a
   store holding several keeps to the type itself. Conditional grants and conditional denies come
