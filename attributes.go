@@ -14,7 +14,6 @@ import (
 
 	"cel.dev/cel-go/cel"
 	"cel.dev/cel-go/common/types"
-	"cel.dev/cel-go/common/types/pb"
 	"cel.dev/cel-go/common/types/ref"
 	"cel.dev/cel-go/common/types/traits"
 	"google.golang.org/protobuf/proto"
@@ -23,11 +22,10 @@ import (
 	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/known/anypb"
-
-	// The well-known types the declarations refer to, registered by importing them.
-	_ "google.golang.org/protobuf/types/known/durationpb"
-	_ "google.golang.org/protobuf/types/known/structpb"
-	_ "google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/structpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 // Attributes declares the attributes conditions read, so that a condition reading one that isn't
@@ -48,50 +46,36 @@ import (
 // it with `!=`, testing it with has(), or a map or list holding it, included, and so does reading
 // the kind's attributes as a whole, by `in`, size(), a macro or comparing them. A name a declared
 // kind doesn't declare, which a condition reads only through dyn(), fails so too. An undeclared
-// kind's are read as passed, and CEL compares values of different types as unequal. A map passed
-// there may be keyed by a double that isn't finite, or by a list holding one, as an array of
-// doubles, as no declared one may: comparing it, or a value holding it, fails, but `in` it is false
-// for any key it doesn't hold, as CEL finds none equal to NaN.
+// kind's are read as converted, and CEL compares values of different types as unequal.
 //
-// Whatever a host passes is read as CEL reads it, at what reading any value of its size costs,
-// however it is passed, but in a list or a map of CEL's own it makes. A value CEL decodes or merges
-// whole to read, JSON text (json.RawMessage), a JSON number (json.Number), a packed message
-// (anypb.Any), or a message of a dynamic type or of a host's type embedding one, is converted once
-// for each check, the first time a condition reads it, at about what decoding it cost the host,
-// rather than each time; such a message reaching one message twice, itself included, fails, and so
-// does a packed message packing another, which CEL unpacks in turn, copying all each packs. So does
-// a value CEL can't read, as a struct, which it would write out whole, and an array of more than
-// 1 KiB of bytes, or a list or a map holding arrays or structs of more than 1 KiB each, which it
-// copies whole each time a condition reads it; a value that fails to read, so or as CEL fails to
-// read a nil pointer, invalid JSON or a packed message of a type it doesn't know, fails a test of
-// its presence, has(), too, which CEL answers without reading it. Each value converted once is
-// converted whole, what it shares with another too, so a host should pass no two sharing what they
-// hold, as decoding never makes them: a thousand messages of a dynamic type reaching one message of
-// a mebibyte, or JSON texts sharing a mebibyte of bytes, take a check a second or more, which no
-// condition is charged for. A value of a host's own type CEL reads as one of its own, as a double
-// or a string, is read as the value it holds (its Value), so it compares as CEL's own does, from
-// either side, and fails where it isn't finite; a list or a map the host makes, of its own type or
-// of CEL's, is read by its own methods, each value it yields read so, a mutable list of CEL's,
-// which CEL adds to in place, as the list it holds. One of CEL's converts the Go values it was made
-// of as the adapter it was made with does, each time a condition reads one, as CEL does without
-// this package: it decodes JSON text and writes out a struct whole each time, uncharged, and one
-// holding itself, as a message of a dynamic type reaching itself does, without end, which ends the
-// process, as no recover catches it. So a host is to make none over the values above. A key a map
-// yields of such a type of the host's is read as the value it holds too, and the map finds it by
-// that value, as by a value of that type a condition reads, so the map compares as one of CEL's own
-// does, from either side, and equal to itself; a map holding two keys read as the same value, as a
-// host's string "a" and CEL's own, fails what finds either. A check reads a map's keys to find them
-// so once, the first time a condition reads a key of it, but in a map of more keys than a condition
-// may cost, 10,000, which none compares or loops over, or of the host's own type that is neither a
-// pointer nor a comparable value of at most 1 KiB, which it can't tell apart from another: in one,
-// a key is read as the map holds it, and found by the map's own methods alone, so a value of the
-// host's own type a condition reads finds no key of that type. A list or a map a map is keyed by is
-// read as the map holds it, and so is what it yields, but a double of the host's there that isn't
-// finite fails what compares it. A value a condition indexes a map or a list by is read as any
-// other, as in `m[k]`: CEL indexes by the Go value the host passed, and fails for one of a type it
-// doesn't index by, as an int8, a pointer, JSON or a wrapper, though it reads it as one of its own
-// everywhere else. A value holding itself fails whatever reads it whole, but in a list or a map of
-// CEL's made over it.
+// What a host passes as a kind's attributes is converted, for each check that reads a condition,
+// once and whole, into CEL's own values, and conditions read only those, by CEL's own semantics: a
+// string, an int, a uint, a double, a bool, bytes, a timestamp, a duration, null, and lists and
+// maps of them. A host may pass, as an attribute or within one:
+//
+//   - nil, and a nil pointer, read as null;
+//   - a bool, a string, or an int, a uint or a float of any size, of a type of its own too, as a
+//     named string, read by its kind, as no method of the type runs;
+//   - a time.Time, a time.Duration, and CEL's own scalar values (types.String and the rest);
+//   - bytes ([]byte or an array of bytes), read as bytes;
+//   - a slice or an array of these, read as a list;
+//   - a map keyed by a bool, a string, an int or a uint, of a type of its own too, or by an
+//     interface holding one, of these, read as a map;
+//   - a pointer to any of these, read as what it points to;
+//   - JSON text (json.RawMessage) and a JSON number (json.Number), parsed;
+//   - the protobuf well-known types: a Struct, a ListValue, a Value or a NullValue, a wrapper, a
+//     Timestamp, a Duration, and an Any packing one of them but another Any.
+//
+// Anything else fails whatever condition reads it, a test of its presence, has(), included: a
+// ref.Val of the host's own, though it says it is of one of CEL's types, a list, a map or an
+// optional of CEL's a host makes, a struct, a channel, a func, a complex number, a uintptr, any
+// other message, a map keyed by any other value, as a double or an array, a map holding two keys
+// read as the same value, as 1 and 1u, or "a" twice of two string types, invalid JSON, and a value
+// holding itself. A list or a map holding one reads the rest. A value reached twice, as a map two
+// lists hold, is converted once. A check converts at most maxConverted of what the host passes,
+// counted as reading it costs a condition, one for each value and a tenth of each string's, bytes'
+// or JSON text's length: past that, every condition reading an attribute of any kind fails. A
+// declared attribute is a value of its type as converted, so a named string type is a string.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
@@ -99,29 +83,10 @@ type Attributes struct {
 // AttributeType is a declared attribute's type.
 type AttributeType string
 
-// takes reports whether CEL reads v as a value of type t, whatever Go type a host passes it as:
-// a named string type, or a []any of strings decoded from JSON, is a string or a list of them. It
-// reads v through c, as conditions do.
-func (t AttributeType) takes(c *converting, v any) (ok bool) {
-	// Converting some values panics, such as a pointer to a slice, held or not: a condition reading
-	// one fails, as CEL recovers it there, but this runs outside a condition, in the host's check.
-	defer func() {
-		if recover() != nil {
-			ok = false
-		}
-	}()
-	switch v.(type) {
-	case []string:
-		return t == AttrStrings
-	case map[string]string:
-		return t == AttrStringMap
-	}
-	// A nil pointer is none, though CEL reads a nil timestamp or duration message as zero, and a
-	// nil list or map message as empty.
-	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Pointer && rv.IsNil() {
-		return false
-	}
-	switch v := c.NativeToValue(v).(type) {
+// takes reports whether v, an attribute a check converted (Attributes), is a value of type t: a
+// []any of strings decoded from JSON is a list of strings, as a []string is.
+func (t AttributeType) takes(v ref.Val) bool {
+	switch v := v.(type) {
 	case types.String:
 		return t == AttrString
 	case types.Int:
@@ -160,620 +125,430 @@ func allStrings(it traits.Iterator, m traits.Mapper) bool {
 	return true
 }
 
-// maxCopied is the most bytes a value CEL copies whole each time a condition reads it may hold: an
-// array of bytes, which it copies into bytes of its own, or an array or a struct a list or a map
-// holds, which reading one of them copies. Copying 1 KiB takes about as long as a read is charged.
-const maxCopied = 1 << 10
+// maxConverted is the most a check converts of what the host passes (Attributes), counted as
+// valueSize counts what a condition reads. It is what a check reading a condition may spend at the
+// least on one scope's grants' conditions (grantBudget), as converting one costs about what reading
+// it does, so converting what a check passes costs no more than its conditions may.
+const maxConverted = 2 * maxCheckCost
 
-// converting is how the conditions of a check read what the host passes: as CEL's own adapter does,
-// each list and map a value holds read through it too, but for what that adapter reads whole each
-// time a condition reads it, which CEL charges as one value however large it is, so a loop reading
-// it would take time growing with its size and the loop's steps, charged only for the steps.
-//
-//   - A value CEL decodes, JSON text (json.RawMessage), a JSON number (json.Number) or a packed
-//     message (anypb.Any), or merges into a message of its own, as a message of a dynamic type or
-//     of a host's type embedding one, is converted once for the check, when a condition first
-//     reads it, at about what decoding it cost the host, and read from then on as any value is. A
-//     message it would merge that reaches a message twice, itself included, fails: merging one
-//     holding itself recurses until the stack overflows, which no recover catches, and copies one
-//     reached twice for each path to it. So does a packed message packing another (packsAnother).
-//     Messages that reach the same message, or JSON texts sharing their bytes, are each converted
-//     whole, which can take far longer than decoding what the host passed did, and isn't charged:
-//     charging the check would let what one condition reads fail the others, so a host is to pass
-//     none (Attributes).
-//   - A value CEL can't read, as a struct, fails without being written out: CEL writes it whole into
-//     its error, and without end where it holds itself.
-//   - An array of bytes of more than maxCopied, or a list or a map holding arrays or structs of more
-//     than maxCopied bytes each, fails: CEL copies each whole each time a condition reads it.
-//   - A list or a map a host makes, of a type of its own or of CEL's, is read as it reads itself,
-//     by its own methods, which are the host's to bound, but each value it yields read through
-//     this: one of CEL's own converts the Go values it was made of with the adapter it was made
-//     with, each time a condition reads one, as CEL does, so it reads a struct or a message of a
-//     dynamic type that holds itself without end, ending the process, which no conversion of what
-//     it yields can catch (Attributes). A mutable list of CEL's, which CEL adds to in place, is
-//     read as the list it holds, and an optional of CEL's own as what it holds, through this.
-//   - A ref.Val of a type of the host's own that CEL reads as a double, a string or another value
-//     of a type of its own holding none is read as that value, what it holds (its Value), so a
-//     double is one of CEL's own, which comparing fails where it isn't finite, and a string's length
-//     counts in what reading it costs; one holding no such value fails. Any other, an opaque value,
-//     is read as it is.
-//   - A key of such a type a map yields is read as that value too, and the map finds it by that
-//     value (hostMap.Find): read as the map holds it, the map found no value of CEL's own it
-//     holds, so not the host's value of the same type either, which this reads as CEL's own, and a
-//     deny's `request.attributes.role in request.attributes.blocked` lifted; read as CEL's own, but
-//     found by the map as it holds it, a map would compare unequal to itself. In a map of more keys
-//     than a condition may cost, or of the host's own type it can't tell apart (readsKeys), it is
-//     read as the map holds it (key). So is a list or a map a key is, and what it yields, so a
-//     double of the host's there that isn't finite fails what compares it by nonFinite alone.
-//
-// Each check makes its own, which keeps what it converted only while the check runs.
-type converting struct {
-	once map[copiedKey]converted
-	// keys are the keys of the host's own types each map holds, by the map (hostMap.heldKeys).
-	keys map[any]heldKeys
-	// base is the adapter the conditions run with, which reads the rest as CEL does: the well-known
-	// messages it knows past those of DefaultTypeAdapter, as google.protobuf.Empty, among them.
-	base types.Adapter
+// converter converts what a host passes for a check into CEL's own values (Attributes), spending
+// no more than left, and keeping each list, map, pointer, message and JSON text it converts by
+// where it points, its length and its type, so one reached twice is converted once, and one
+// reached from itself fails.
+type converter struct {
+	left uint64
+	// over is set once converting cost more than was left, which fails every attribute.
+	over bool
+	// done is what each was converted to, or nil while it is being converted.
+	done map[copiedKey]ref.Val
 }
 
-func (c *converting) adapter() types.Adapter {
-	if c.base == nil {
-		return types.DefaultTypeAdapter
+func newConverter() *converter { return &converter{left: maxConverted} }
+
+// attributes is each of attributes as conditions read it, nil for none.
+func (c *converter) attributes(attributes map[string]any) map[string]ref.Val {
+	if len(attributes) == 0 {
+		return nil
 	}
-	return c.base
-}
-
-// converted is what a value was converted to, and the value, kept so that no other comes to be
-// where it was while its conversion is kept.
-type converted struct {
-	from any
-	to   ref.Val
-}
-
-var byteType = reflect.TypeFor[byte]()
-
-func (c *converting) NativeToValue(v any) ref.Val {
-	switch v := v.(type) {
-	// What hosts pass most, read first, as CEL's adapter reads them.
-	case string:
-		return types.String(v)
-	case bool:
-		return types.Bool(v)
-	case int:
-		return types.Int(v)
-	case int64:
-		return types.Int(v)
-	case float64:
-		return types.Double(v)
-	case ref.Val:
-		return c.own(v)
-	case map[string]any:
-		return types.NewStringInterfaceMap(c, v)
-	case []ref.Val:
-		return types.NewRefValList(c, v)
-	case map[ref.Val]ref.Val:
-		// Found by the keys themselves, as CEL finds them.
-		return c.keyed(types.NewRefValMap(types.DefaultTypeAdapter, v), reflect.ValueOf(v))
-	case json.RawMessage, json.Number, *anypb.Any:
-		return c.decoded(v)
-	// Before protoreflect.Message: a dynamic message, as dynamicpb's, is its own reflection, so
-	// reading it by its reflection would never end.
-	case proto.Message:
-		if itself(v) && generated(v) {
-			return c.adapter().NativeToValue(v)
+	out := make(map[string]ref.Val, len(attributes))
+	for name, v := range attributes {
+		if !c.pay(textLength(len(name))) {
+			return nil
 		}
-		return c.merged(v)
-	case *pb.Map:
-		return types.NewProtoMap(c, v)
-	case protoreflect.List:
-		return types.NewProtoList(c, v)
-	case protoreflect.Message:
-		return c.NativeToValue(v.Interface())
-	case protoreflect.Value:
-		return c.NativeToValue(v.Interface())
-	case nil, time.Time, []byte, []string, map[string]string:
-		return c.adapter().NativeToValue(v)
+		out[name] = c.of(reflect.ValueOf(v))
 	}
-	rv := reflect.ValueOf(v)
-	switch rv.Kind() {
-	case reflect.Struct:
-		return unreadableValue(v)
+	return out
+}
+
+var (
+	timeType     = reflect.TypeFor[time.Time]()
+	durationType = reflect.TypeFor[time.Duration]()
+	rawType      = reflect.TypeFor[json.RawMessage]()
+	numberType   = reflect.TypeFor[json.Number]()
+	nullType     = reflect.TypeFor[structpb.NullValue]()
+	refValType   = reflect.TypeFor[ref.Val]()
+	messageType  = reflect.TypeFor[proto.Message]()
+)
+
+// of is v as a condition reads it: one of CEL's own values, or an error whatever reads it fails on.
+// It reads v by its kind, but for the types Attributes names, and calls no method of the host's.
+// Each value costs one, one that fails too, and a string, bytes or JSON text a tenth of its length
+// more, as reading it does, so converting reaches no more values, nor deeper, than it may cost.
+func (c *converter) of(v reflect.Value) ref.Val {
+	if !c.pay(1) {
+		return tooLarge()
+	}
+	if v.Kind() == reflect.Interface {
+		if v.IsNil() {
+			return types.NullValue
+		}
+		v = v.Elem()
+	}
+	if !v.IsValid() {
+		return types.NullValue
+	}
+	t := v.Type()
+	switch t {
+	case timeType:
+		at, _ := v.Interface().(time.Time)
+		return types.Timestamp{Time: at}
+	case durationType:
+		return types.Duration{Duration: time.Duration(v.Int())}
+	case rawType:
+		return c.json(v)
+	case numberType:
+		return c.number(v.String())
+	case nullType:
+		return types.NullValue
+	}
+	// A value of a type of the host's own CEL would read by its methods, as one saying it is a
+	// double or a list, is read so by none.
+	if t.Implements(refValType) {
+		if v, ok := v.Interface().(ref.Val); ok && celScalar(v) {
+			return c.spend(textSize(v)-1, v)
+		}
+		return cantRead(t)
+	}
+	if t.Implements(messageType) {
+		return c.message(v)
+	}
+	switch v.Kind() {
+	case reflect.Bool:
+		return types.Bool(v.Bool())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return types.Int(v.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return types.Uint(v.Uint())
+	case reflect.Float32, reflect.Float64:
+		return types.Double(v.Float())
+	case reflect.String:
+		s := v.String()
+		return c.spend(uint64(len(s))/10, types.String(s))
 	case reflect.Pointer:
-		// CEL reads a pointer to a list or a map by panicking, which fails the whole condition, as
-		// an error a logical operator could absorb wouldn't: so it still does.
-		if !rv.IsNil() && rv.Elem().Kind() == reflect.Struct {
-			return unreadableValue(v)
+		if v.IsNil() {
+			return types.NullValue
 		}
-	case reflect.Array:
-		if rv.Type().Elem() != byteType {
-			return types.NewDynamicList(c, v)
-		}
-		if rv.Len() > maxCopied {
-			return copiedWhole(v)
-		}
+		return c.once(v, func() ref.Val { return c.of(v.Elem()) })
 	case reflect.Slice:
-		if rv.Type().Elem() == byteType {
-			break
+		if t.Elem().Kind() == reflect.Uint8 {
+			return c.bytes(v)
 		}
-		if large(rv.Type().Elem()) {
-			return copiedWhole(v)
+		return c.once(v, func() ref.Val { return c.list(v) })
+	case reflect.Array:
+		if t.Elem().Kind() == reflect.Uint8 {
+			return c.bytes(v)
 		}
-		return types.NewDynamicList(c, v)
+		return c.list(v)
 	case reflect.Map:
-		if large(rv.Type().Key()) || large(rv.Type().Elem()) {
-			return copiedWhole(v)
-		}
-		if keyedByHost(rv.Type()) {
-			return c.keyed(types.NewDynamicMap(asHeld{c}, v), rv)
-		}
-		return types.NewDynamicMap(c, v)
+		return c.once(v, func() ref.Val { return c.dict(v) })
 	default:
 	}
-	return c.adapter().NativeToValue(v)
+	return cantRead(t)
 }
 
-// generated reports whether m is of the type protobuf generated for its message, which CEL reads
-// as it is: one of another type, as a dynamic one, it merges whole into one of that type to read.
-func generated(m proto.Message) bool {
-	mt, err := protoregistry.GlobalTypes.FindMessageByName(m.ProtoReflect().Descriptor().FullName())
-	return err == nil && reflect.TypeOf(mt.Zero().Interface()) == reflect.TypeOf(m)
-}
-
-// large reports whether reading a value of type t a list or a map holds copies more than maxCopied
-// bytes: an array or a struct, which it holds in place.
-func large(t reflect.Type) bool {
-	return (t.Kind() == reflect.Array || t.Kind() == reflect.Struct) && t.Size() > maxCopied
-}
-
-func unreadableValue(v any) ref.Val { return types.NewErr("rbac: a condition can't read a %T", v) }
-
-func copiedWhole(v any) ref.Val {
-	return types.NewErr("rbac: a condition can't read a %T: each read copies more than %d bytes", v, maxCopied)
-}
-
-// own is v as one of CEL's own values: v itself where it holds no other; for an optional of CEL's
-// own, what it holds, read through c; for a list or a map, of CEL's own or of the host's, itself,
-// read by its own methods, but each value it yields read through c, and a mutable list of CEL's as
-// the list it holds; for one of a type of the host's own CEL reads as a value of a type of its own,
-// what it holds; and any other, as a message, itself, as CEL's adapter reads it.
-//
-// A list or a map of CEL's own isn't read again from the Go value it holds (its Value): CEL makes
-// one of a map[string]any that finds a key of the host's own type, and one that finds none, and a
-// list of a []byte, which CEL's adapter reads as bytes, so read again a map compared unequal to
-// one CEL finds it equal to, and a list equal to bytes, and a grant's `!=` held.
-func (c *converting) own(v ref.Val) ref.Val {
-	if holdsNone(v) {
-		return v
-	}
-	switch v := v.(type) {
-	case *types.Optional:
-		return c.keep(v, func() ref.Val { return c.optional(v) })
-	case hostList, hostMap:
-		// One c made already reads what it yields through c: wrapped again, each value a list or a
-		// map d deep yields was read through a wrapper for each it is nested in, about 2d, so
-		// comparing a map[any]any nested 400 deep took 60 times what comparing a map[string]any did.
-		return v
-	case traits.MutableLister:
-		// As the list it holds: CEL adds to one in place, so a condition adding to one changed what
-		// it and the check's other conditions read after, and adding one to itself, which CEL appends
-		// once where it is passed as itself, appended it to itself until memory ran out, passed as a
-		// hostList.
-		return hostList{v.ToImmutableList(), c}
-	case traits.Mapper:
-		if !ofCEL(v) {
-			return hostMap{v, c, mapID(v)}
-		}
-		// One of CEL's own over a Go map no value of the host's own type can key holds none.
-		if held := reflect.ValueOf(v.Value()); held.IsValid() && keyedByHost(held.Type()) {
-			return c.keyed(v, held)
-		}
-		return hostMap{Mapper: v, c: c}
-	case traits.Lister:
-		return hostList{v, c}
-	}
-	if !ofCEL(v) && slices.Contains(celScalars, v.Type().TypeName()) {
-		return c.held(v)
-	}
-	return v
-}
-
-// optional is o, what it holds read through c, unwrapping the optionals it nests in a loop: a host
-// can nest them deep enough that recursing would overflow the stack, which no recover catches.
-func (c *converting) optional(o *types.Optional) ref.Val {
-	depth := 0
-	for o.HasValue() {
-		inner, ok := o.GetValue().(*types.Optional)
-		if !ok {
-			break
-		}
-		o, depth = inner, depth+1
-	}
-	var out ref.Val = o
-	if o.HasValue() {
-		out = types.OptionalOf(c.own(o.GetValue()))
-	}
-	for range depth {
-		out = types.OptionalOf(out)
-	}
-	return out
-}
-
-// held is what v, of a type of the host's own CEL reads as one of its own, holds, its Value, read
-// through c: one holding a ref.Val holding no other holds nothing more to read, and one holding any
-// other ref.Val fails, as reading one holding itself would never end. So does one holding a value
-// read as another type than v's: one CEL reads as a double was read as the string, the list or the
-// map it held, so a grant's `request.attributes.risk == "low"` held where CEL finds it unequal.
-func (c *converting) held(v ref.Val) ref.Val {
-	var out ref.Val
-	switch held := v.Value().(type) {
-	case ref.Val:
-		if !holdsNone(held) {
-			return unreadableValue(v)
-		}
-		out = held
-	default:
-		out = c.NativeToValue(held)
-	}
-	if !types.IsError(out) && out.Type().TypeName() != v.Type().TypeName() {
-		return unreadableValue(v)
-	}
-	return out
-}
-
-// ofCEL reports whether v is of one of CEL's own types, which are of the package celPackage names.
-func ofCEL(v ref.Val) bool {
-	t := reflect.TypeOf(v)
-	if t.Kind() == reflect.Pointer {
-		t = t.Elem()
-	}
-	return t.PkgPath() == celPackage
-}
-
-var celPackage = reflect.TypeFor[types.Bool]().PkgPath()
-
-// celScalars are the names of the types of CEL's own values that hold no other, which a host's own
-// can be read as: their costs and guards read CEL's own values alone.
-var celScalars = []string{
-	types.BoolType.TypeName(), types.BytesType.TypeName(), types.DoubleType.TypeName(), types.DurationType.TypeName(),
-	types.IntType.TypeName(), types.NullType.TypeName(), types.StringType.TypeName(), types.TimestampType.TypeName(),
-	types.UintType.TypeName(),
-}
-
-// hostList is a list a host makes, of a type of its own or of CEL's, read as it reads itself, but
-// each value it yields read through c, as the values of the lists c makes are.
-type hostList struct {
-	traits.Lister
-	c *converting
-}
-
-func (l hostList) Get(i ref.Val) ref.Val     { return l.c.own(l.Lister.Get(i)) }
-func (l hostList) Iterator() traits.Iterator { return hostIterator{l.Lister.Iterator(), l.c} }
-
-// Add is the list it makes, read so too.
-func (l hostList) Add(other ref.Val) ref.Val {
-	sum := l.Lister.Add(other)
-	if s, ok := sum.(traits.Lister); ok {
-		return hostList{s, l.c}
-	}
-	return sum
-}
-
-// hostMap is a map a host makes, of a type of its own or of CEL's, or one that can be keyed by
-// values of the host's own types, as a map[any]any can, read as hostList reads a list, but for the
-// keys it yields and finds (key, Find).
-type hostMap struct {
-	traits.Mapper
-	c *converting
-	// id is how c knows the map (mapID), so it reads the map's keys once for the check (heldKeys);
-	// nil where it can't, as for a map of the host's own type that is neither a pointer nor
-	// comparable, or needn't, as for one of CEL's over a Go map no value of the host's own type can
-	// key, which holds none.
-	id any
-}
-
-// keyed is m, which is or holds the Go map of, read as hostMap reads one c knows by of.
-func (c *converting) keyed(m traits.Mapper, of reflect.Value) hostMap {
-	return hostMap{m, c, mapID(of.Interface())}
-}
-
-// mapID is how a check knows v, a map: by where it points, its length and its type, or, where it
-// points nowhere, as a struct, as itself, if it is comparable and no larger than maxCopied, which
-// hashing it reads whole; nil otherwise.
-func mapID(v any) any {
-	rv := reflect.ValueOf(v)
-	if k, ok := copiedKeyOf(rv); ok {
-		return k
-	}
-	if rv.Comparable() && rv.Type().Size() <= maxCopied {
-		return v
-	}
-	return nil
-}
-
-// keyedByHost reports whether a map of type t can be keyed by values of the host's own types.
-func keyedByHost(t reflect.Type) bool {
-	return t.Kind() == reflect.Map && (t.Key().Kind() == reflect.Interface || t.Key().Implements(refValType))
-}
-
-// readsKeys reports whether m reads its keys of the host's own types as the values of CEL's own
-// they hold, and finds them by those: where c knows it, and it holds no more keys than a condition
-// may cost, as no condition compares, or loops over, one holding more. One holding more is read as
-// it holds its keys, and finds them by its own methods alone.
-func (m hostMap) readsKeys() bool { return m.id != nil && count(m.Mapper) <= maxCost }
-
-func (m hostMap) Get(k ref.Val) ref.Val {
-	if v, found := m.Find(k); found {
-		return v
-	}
-	return m.c.own(m.Mapper.Get(k))
-}
-
-func (m hostMap) Iterator() traits.Iterator {
-	return keyIterator{m.Mapper.Iterator(), m, m.readsKeys()}
-}
-
-// Find finds k, where m reads its keys (readsKeys), by its key of the host's own type holding k,
-// if one does, and fails for k two of its keys are read as.
-func (m hostMap) Find(k ref.Val) (ref.Val, bool) {
-	if m.readsKeys() && scalar(k) {
-		if held := m.heldKeys(); held != nil {
-			if key, found := held.Find(k); found {
-				if types.IsError(key) {
-					return key, true
-				}
-				k = key
-			}
-		}
-	}
-	v, found := m.Mapper.Find(k)
-	if found {
-		v = m.c.own(v)
-	}
-	return v, found
-}
-
-// Contains is whether Find finds k, for the bounded decorator, which finds `in` a map by its own
-// method.
-func (m hostMap) Contains(k ref.Val) ref.Val {
-	if !m.readsKeys() {
-		return m.Mapper.Contains(k)
-	}
-	v, found := m.Find(k)
-	if found && types.IsError(v) {
-		return v
-	}
-	return types.Bool(found)
-}
-
-// heldKeys is CEL's own map of the values of CEL's own m's keys are read as to those keys, read
-// once for the check, or nil where none is of the host's own type. A value two of them are read as,
-// of the host's own type or of CEL's own, maps to an error, as finding it couldn't tell which it
-// names. It reads no more keys than readsKeys allows, and none past them, as a host's iterator
-// yielding more than its size says.
-func (m hostMap) heldKeys() traits.Mapper {
-	if done, ok := m.c.keys[m.id]; ok {
-		return done.held
-	}
-	read := func(each func(k, v ref.Val)) {
-		n := 0
-		for it := m.Mapper.Iterator(); n <= maxCost && it.HasNext() == types.True; n++ {
-			k := it.Next()
-			v := k
-			if hostScalar(k) {
-				v = m.c.held(k)
-			}
-			// One read as a value CEL's own finds none by, as bytes or NaN, is none.
-			if scalar(v) && !nonFinite(v) {
-				each(k, v)
-			}
-		}
-	}
-	hosts := false
-	read(func(k, _ ref.Val) { hosts = hosts || hostScalar(k) })
-	var out traits.Mapper
-	if hosts {
-		held := map[ref.Val]ref.Val{}
-		read(func(k, v ref.Val) {
-			if _, twice := held[v]; twice {
-				held[v] = ambiguousKey()
-			} else {
-				held[v] = k
-			}
-		})
-		out = types.NewRefValMap(types.DefaultTypeAdapter, held)
-	}
-	if m.c.keys == nil {
-		m.c.keys = map[any]heldKeys{}
-	}
-	m.c.keys[m.id] = heldKeys{m.Mapper, out}
-	return out
-}
-
-// heldKeys is what hostMap.heldKeys read of a map, and the map, kept so that no other comes to be
-// where it was while what was read of it is kept.
-type heldKeys struct {
-	of   traits.Mapper
-	held traits.Mapper
-}
-
-func ambiguousKey() ref.Val {
-	return types.NewErr("rbac: a map holds two keys a condition reads as the same value")
-}
-
-// scalar reports whether v is one of CEL's own values of a type a host's own value can be read as,
-// but bytes, which no Go map is keyed by.
-func scalar(v ref.Val) bool {
-	_, isBytes := v.(types.Bytes)
-	return !isBytes && ofCEL(v) && holdsNone(v) && slices.Contains(celScalars, v.Type().TypeName())
-}
-
-// hostScalar reports whether v is of a type of the host's own CEL reads as a value of a type of
-// its own that holds no other.
-func hostScalar(v ref.Val) bool {
-	return !holdsNone(v) && !ofCEL(v) && slices.Contains(celScalars, v.Type().TypeName())
-}
-
-type hostIterator struct {
-	traits.Iterator
-	c *converting
-}
-
-func (it hostIterator) Next() ref.Val { return it.c.own(it.Iterator.Next()) }
-
-type keyIterator struct {
-	traits.Iterator
-	m     hostMap
-	reads bool
-}
-
-func (it keyIterator) Next() ref.Val { return it.m.key(it.Iterator.Next(), it.reads) }
-
-// key is k, a key m yields, as conditions read it. One of the host's own type CEL reads as a value
-// of its own is read as the value it holds where m reads its keys so (readsKeys), so it compares as
-// CEL's own does, from either side, and the map finds it by that value; a value two of its keys are
-// read as fails. Where m doesn't, it is read as the map holds it, so the map finds it, as read as
-// one of CEL's own it wouldn't, and compares equal to itself, but for one holding a double that
-// isn't finite, read as that double, which comparing fails. One holding no such value fails.
-func (m hostMap) key(k ref.Val, reads bool) ref.Val {
-	if hostScalar(k) {
-		held := m.c.held(k)
-		if !reads && !types.IsError(held) && !nonFinite(held) {
-			return k
-		}
-		k = held
-	}
-	if reads && scalar(k) {
-		if held := m.heldKeys(); held != nil {
-			if key, _ := held.Find(k); key != nil && types.IsError(key) {
-				return key
-			}
-		}
-	}
-	return k
-}
-
-// asHeld reads a value as c does, but for a ref.Val, which it reads as it is: hostMap reads each
-// value a map holds through c, and each key as the map holds it (key).
-type asHeld struct{ c *converting }
-
-func (a asHeld) NativeToValue(v any) ref.Val {
-	if v, ok := v.(ref.Val); ok {
-		return v
-	}
-	return a.c.NativeToValue(v)
-}
-
-var refValType = reflect.TypeFor[ref.Val]()
-
-// holdsNone reports whether v is one of CEL's own values that holds no other.
-func holdsNone(v ref.Val) bool {
+// celScalar reports whether v is one of CEL's own values that holds no other.
+func celScalar(v ref.Val) bool {
 	switch v.(type) {
 	case types.Bool, types.Bytes, types.Double, types.Duration, types.Int, types.Null, types.String, types.Timestamp,
-		types.Uint, *types.Err, *types.Unknown, *types.Type:
+		types.Uint:
 		return true
 	}
 	return false
 }
 
-// decoded is v, which CEL decodes whole to read, converted once, or failing where it is a packed
-// message packing another (packsAnother).
-func (c *converting) decoded(v any) ref.Val {
-	return c.keep(v, func() ref.Val {
-		if a, ok := v.(*anypb.Any); ok && packsAnother(a.ProtoReflect()) {
-			return packing(v)
-		}
-		return c.adapter().NativeToValue(v)
-	})
-}
+// textLength is what reading text of n bytes costs, as textSize counts it.
+func textLength(n int) uint64 { return 1 + length(n)/10 }
 
-// packsAnother reports whether m is a packed message packing another, which CEL unpacks in turn,
-// copying all that each packs: reading one packing others as deep as a mebibyte allows took two
-// seconds, charged as one value.
-func packsAnother(m protoreflect.Message) bool {
-	d := m.Descriptor()
-	if d.FullName() != anyName {
+func length(n int) uint64 { return uint64(max(n, 0)) }
+
+// pay spends n, or reports that it can't, once converting has cost more than maxConverted.
+func (c *converter) pay(n uint64) bool {
+	if c.over || n > c.left {
+		c.over, c.left = true, 0
 		return false
 	}
-	url := m.Get(d.Fields().ByName("type_url")).String()
-	return protoreflect.FullName(url[strings.LastIndexByte(url, '/')+1:]) == anyName
+	c.left -= n
+	return true
 }
 
-var anyName = (&anypb.Any{}).ProtoReflect().Descriptor().FullName()
-
-func packing(v any) ref.Val {
-	return types.NewErr("rbac: a condition can't read a %T packing another packed message", v)
+// spend is v, which converting cost n, or an error once it costs more than is left.
+func (c *converter) spend(n uint64, v ref.Val) ref.Val {
+	if !c.pay(n) {
+		return tooLarge()
+	}
+	return v
 }
 
-// merged is m, a message CEL merges whole into one of its own to read, converted once, or failing
-// where it reaches a message twice.
-func (c *converting) merged(m proto.Message) ref.Val {
-	r := m.ProtoReflect()
-	return c.keep(r.Interface(), func() ref.Val {
-		if !reachesOnce(r, map[proto.Message]bool{}) {
-			return types.NewErr("rbac: a condition can't read a %T that reaches a message twice", m)
+// once is what convert makes of v, which points somewhere, converted once for the check, and an
+// error where converting it reaches it again, from itself.
+func (c *converter) once(v reflect.Value, convert func() ref.Val) ref.Val {
+	k, _ := copiedKeyOf(v)
+	if done, ok := c.done[k]; ok {
+		if done == nil {
+			return types.NewErr("rbac: a condition can't read a %s holding itself", v.Type())
 		}
-		if packsAnother(r) {
-			return packing(m)
-		}
-		return c.adapter().NativeToValue(m)
-	})
+		return done
+	}
+	if c.done == nil {
+		c.done = map[copiedKey]ref.Val{}
+	}
+	c.done[k] = nil
+	out := convert()
+	c.done[k] = out
+	return out
 }
 
-// reachesOnce reports whether m reaches no message twice, itself included, by its fields, of those
-// not in seen, adding them to it. A nil message, as a list may hold, reaches none: each is the same
-// nil, but none is another's.
-func reachesOnce(m protoreflect.Message, seen map[proto.Message]bool) bool {
-	if !m.IsValid() {
+// bytes is v, a slice or an array of bytes, as bytes, an array's copied.
+func (c *converter) bytes(v reflect.Value) ref.Val {
+	if !c.pay(length(v.Len()) / 10) {
+		return tooLarge()
+	}
+	if v.Kind() == reflect.Slice {
+		return types.Bytes(v.Bytes())
+	}
+	b := make([]byte, v.Len())
+	reflect.Copy(reflect.ValueOf(b), v)
+	return types.Bytes(b)
+}
+
+// list is v, a slice or an array, as a list of what it holds.
+func (c *converter) list(v reflect.Value) ref.Val {
+	// Each costs at least one, so a list longer than is left can't be converted.
+	if length(v.Len()) > c.left {
+		c.over, c.left = true, 0
+		return tooLarge()
+	}
+	out := make([]ref.Val, v.Len())
+	for i := range out {
+		if out[i] = c.of(v.Index(i)); c.over {
+			return tooLarge()
+		}
+	}
+	return types.NewRefValList(types.DefaultTypeAdapter, out)
+}
+
+// dict is v, a map, as a map of what it holds by what its keys are read as, failing for a key of
+// another kind than Attributes names, or where two of them are read as the same value.
+func (c *converter) dict(v reflect.Value) ref.Val {
+	if kt := v.Type().Key(); kt.Kind() != reflect.Interface && !keyType(kt) {
+		return types.NewErr("rbac: a condition can't read a map keyed by a %s", kt)
+	}
+	if 2*length(v.Len()) > c.left {
+		c.over, c.left = true, 0
+		return tooLarge()
+	}
+	out := make(map[ref.Val]ref.Val, v.Len())
+	for it := v.MapRange(); it.Next(); {
+		k := c.key(it.Key())
+		if types.IsError(k) {
+			return k
+		}
+		if holdsKey(out, k) {
+			return types.NewErr("rbac: a condition can't read a %s holding two keys read as the same value", v.Type())
+		}
+		if out[k] = c.of(it.Value()); c.over {
+			return tooLarge()
+		}
+	}
+	return types.NewRefValMap(types.DefaultTypeAdapter, out)
+}
+
+// key is k, a map's key, as a condition reads it: a bool, a string, an int or a uint, or an error.
+func (c *converter) key(k reflect.Value) ref.Val {
+	if !c.pay(1) {
+		return tooLarge()
+	}
+	if k.Kind() == reflect.Interface {
+		if k.IsNil() {
+			return types.NewErr("rbac: a condition can't read a map keyed by nil")
+		}
+		k = k.Elem()
+	}
+	t := k.Type()
+	if t.Implements(refValType) {
+		if v, ok := k.Interface().(ref.Val); ok && keyType(t) {
+			return c.spend(textSize(v)-1, v)
+		}
+		return types.NewErr("rbac: a condition can't read a map keyed by a %s", t)
+	}
+	switch k.Kind() {
+	case reflect.Bool:
+		return types.Bool(k.Bool())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return types.Int(k.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return types.Uint(k.Uint())
+	case reflect.String:
+		s := k.String()
+		return c.spend(uint64(len(s))/10, types.String(s))
+	default:
+	}
+	return types.NewErr("rbac: a condition can't read a map keyed by a %s", t)
+}
+
+// keyType reports whether a map keyed by values of type t is keyed as Attributes names, empty too.
+func keyType(t reflect.Type) bool {
+	if t.Implements(refValType) {
+		switch t {
+		case reflect.TypeFor[types.Bool](), reflect.TypeFor[types.Int](), reflect.TypeFor[types.String](), reflect.TypeFor[types.Uint]():
+			return true
+		}
+		return false
+	}
+	switch t.Kind() {
+	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint8,
+		reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.String:
+		return true
+	default:
+	}
+	return false
+}
+
+// holdsKey reports whether m holds k, or a key CEL finds equal to it, as 1u for 1.
+func holdsKey(m map[ref.Val]ref.Val, k ref.Val) bool {
+	if _, ok := m[k]; ok {
 		return true
 	}
-	if seen[m.Interface()] {
-		return false
-	}
-	seen[m.Interface()] = true
-	once := true
-	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
-		switch {
-		case fd.IsMap():
-			if fd.MapValue().Message() != nil {
-				v.Map().Range(func(_ protoreflect.MapKey, v protoreflect.Value) bool {
-					once = reachesOnce(v.Message(), seen)
-					return once
-				})
-			}
-		case fd.Message() == nil:
-		case fd.IsList():
-			for i := 0; once && i < v.List().Len(); i++ {
-				once = reachesOnce(v.List().Get(i).Message(), seen)
-			}
-		default:
-			once = reachesOnce(v.Message(), seen)
+	var other ref.Val
+	switch k := k.(type) {
+	case types.Int:
+		if k >= 0 {
+			other = types.Uint(k)
 		}
-		return once
-	})
-	return once
+	case types.Uint:
+		if k <= math.MaxInt64 {
+			other = types.Int(k)
+		}
+	}
+	_, ok := m[other]
+	return other != nil && ok
 }
 
-// keep is what convert makes of v, converted once for the check: a value is known as copier knows
-// one (copiedKeyOf), so one held by value, which points nowhere, is converted each time.
-func (c *converting) keep(v any, convert func() ref.Val) ref.Val {
-	k, ok := copiedKeyOf(reflect.ValueOf(v))
-	if !ok {
-		return convert()
+// json is v, JSON text, parsed, at a tenth of its length, once for each text a check passes.
+func (c *converter) json(v reflect.Value) ref.Val {
+	return c.once(v, func() ref.Val {
+		if !c.pay(length(v.Len()) / 10) {
+			return tooLarge()
+		}
+		var parsed any
+		if err := json.Unmarshal(v.Bytes(), &parsed); err != nil {
+			return types.NewErr("rbac: a condition can't read invalid JSON text")
+		}
+		return c.of(reflect.ValueOf(parsed))
+	})
+}
+
+// number is n, a JSON number, an int where it is one and a double where it isn't, as CEL reads it.
+func (c *converter) number(n string) ref.Val {
+	if i, err := json.Number(n).Int64(); err == nil {
+		return c.spend(uint64(len(n))/10, types.Int(i))
 	}
-	if done, ok := c.once[k]; ok {
-		return done.to
+	if f, err := json.Number(n).Float64(); err == nil {
+		return c.spend(uint64(len(n))/10, types.Double(f))
 	}
-	to := convert()
-	if c.once == nil {
-		c.once = map[copiedKey]converted{}
+	return types.NewErr("rbac: a condition can't read the JSON number %.64q", n)
+}
+
+// message is v, a protobuf message, as a condition reads it: one of the well-known types Attributes
+// names, read by its fields, each as of reads it, or an error.
+func (c *converter) message(v reflect.Value) ref.Val {
+	if v.Kind() == reflect.Pointer && v.IsNil() {
+		return types.NullValue
 	}
-	c.once[k] = converted{v, to}
-	return to
+	switch m := v.Interface().(type) {
+	case *structpb.Struct:
+		return c.once(v, func() ref.Val {
+			if 2*uint64(len(m.GetFields())) > c.left {
+				c.over, c.left = true, 0
+				return tooLarge()
+			}
+			out := make(map[ref.Val]ref.Val, len(m.GetFields()))
+			for k, field := range m.GetFields() {
+				key := c.spend(textLength(len(k)), types.String(k))
+				if out[key] = c.of(reflect.ValueOf(field)); c.over {
+					return tooLarge()
+				}
+			}
+			return types.NewRefValMap(types.DefaultTypeAdapter, out)
+		})
+	case *structpb.ListValue:
+		return c.once(v, func() ref.Val {
+			if uint64(len(m.GetValues())) > c.left {
+				c.over, c.left = true, 0
+				return tooLarge()
+			}
+			out := make([]ref.Val, len(m.GetValues()))
+			for i, e := range m.GetValues() {
+				if out[i] = c.of(reflect.ValueOf(e)); c.over {
+					return tooLarge()
+				}
+			}
+			return types.NewRefValList(types.DefaultTypeAdapter, out)
+		})
+	case *structpb.Value:
+		switch k := m.GetKind().(type) {
+		case *structpb.Value_NumberValue:
+			return types.Double(k.NumberValue)
+		case *structpb.Value_StringValue:
+			return c.spend(uint64(len(k.StringValue))/10, types.String(k.StringValue))
+		case *structpb.Value_BoolValue:
+			return types.Bool(k.BoolValue)
+		case *structpb.Value_StructValue:
+			return c.of(reflect.ValueOf(k.StructValue))
+		case *structpb.Value_ListValue:
+			return c.of(reflect.ValueOf(k.ListValue))
+		}
+		return types.NullValue
+	case *wrapperspb.BoolValue:
+		return types.Bool(m.GetValue())
+	case *wrapperspb.BytesValue:
+		return c.spend(uint64(len(m.GetValue()))/10, types.Bytes(m.GetValue()))
+	case *wrapperspb.DoubleValue:
+		return types.Double(m.GetValue())
+	case *wrapperspb.FloatValue:
+		return types.Double(m.GetValue())
+	case *wrapperspb.Int32Value:
+		return types.Int(m.GetValue())
+	case *wrapperspb.Int64Value:
+		return types.Int(m.GetValue())
+	case *wrapperspb.StringValue:
+		return c.spend(uint64(len(m.GetValue()))/10, types.String(m.GetValue()))
+	case *wrapperspb.UInt32Value:
+		return types.Uint(m.GetValue())
+	case *wrapperspb.UInt64Value:
+		return types.Uint(m.GetValue())
+	case *timestamppb.Timestamp:
+		return types.Timestamp{Time: m.AsTime()}
+	case *durationpb.Duration:
+		return types.Duration{Duration: m.AsDuration()}
+	case *anypb.Any:
+		return c.once(v, func() ref.Val {
+			if !c.pay(uint64(len(m.GetValue())) / 10) {
+				return tooLarge()
+			}
+			packed, err := m.UnmarshalNew()
+			if err != nil {
+				return types.NewErr("rbac: a condition can't read a packed message of type %.256q", m.GetTypeUrl())
+			}
+			if _, ok := packed.(*anypb.Any); ok {
+				return types.NewErr("rbac: a condition can't read a packed message packing another")
+			}
+			return c.of(reflect.ValueOf(packed))
+		})
+	}
+	return cantRead(v.Type())
+}
+
+func cantRead(t reflect.Type) ref.Val { return types.NewErr("rbac: a condition can't read a %s", t) }
+
+func tooLarge() ref.Val {
+	return types.NewErr("rbac: the attributes a check passes are larger than a condition may read")
 }
 
 // The types an attribute can be declared as, with the Go value a host passes for each, or any
-// other CEL reads as that type, such as a pointer to a string, number or bool, a protobuf
-// timestamp or duration, or a []any or map[string]any of strings. A nil pointer is none.
+// other converted to that type (Attributes), such as a pointer to a string, number or bool, a
+// protobuf timestamp or duration, or a []any or map[string]any of strings. A nil pointer is null,
+// which is none.
 const (
 	AttrString    AttributeType = "string"              // string
 	AttrInt       AttributeType = "int"                 // int or int64
@@ -958,7 +733,7 @@ type copiedKey struct {
 	len int
 }
 
-// copiedKeyOf is how copier and converting know v: a map, pointer, slice or string by where it
+// copiedKeyOf is how copier and converter know v: a map, pointer, slice or string by where it
 // points, its length and its type. One held by value, which points nowhere, has no key.
 func copiedKeyOf(v reflect.Value) (copiedKey, bool) {
 	switch v.Kind() {

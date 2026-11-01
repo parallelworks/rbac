@@ -244,6 +244,33 @@ func EvaluateCondition(t *testing.T, expr string, attributes map[string]any) (he
 	return r.held, r.evaluated, after.TotalAlloc - before.TotalAlloc, nil
 }
 
+// MaxConverted is the most a check converts of what the host passes.
+const MaxConverted = maxConverted
+
+// EvaluateConditionOn is what evaluating expr costs, on a request whose attributes are as given,
+// none converted, as values no host can pass are, which a test reads a condition's work by, and
+// whether it held and could be evaluated.
+func EvaluateConditionOn(t *testing.T, expr string, attributes map[string]ref.Val) (held, evaluated bool, cost uint64) {
+	t.Helper()
+	c, err := newConditions(Attributes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prg, err := c.build(expr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Authorizer{cfg: Config{Now: time.Now}, conds: c}
+	vars := a.vars(t.Context(), Subject{Principal: Principal{Kind: User, ID: "u"}}, "cluster:login", Resource{Tenant: "t", Type: "cluster", ID: "c"})
+	given := map[ref.Val]ref.Val{}
+	for k, v := range attributes {
+		given[types.String(k)] = v
+	}
+	vars["request"] = map[string]any{"time": time.Now(), "attributes": types.NewRefValMap(types.DefaultTypeAdapter, given)}
+	r := evaluate(prg, vars)
+	return r.held, r.evaluated, r.cost
+}
+
 // compiled is expr as c compiles it, and the sizes of its patterns.
 func compiled(t *testing.T, c *conditions, expr string) (*cel.Ast, map[string]uint64) {
 	t.Helper()

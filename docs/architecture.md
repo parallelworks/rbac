@@ -383,27 +383,20 @@ sequenceDiagram
   would.
 - **Conditions** are CEL over `subject`, `resource`, `request` and `action`, typed by
   `Config.Attributes`. Each is compiled once, bounded in cost, and fails closed: a condition that
-  errors gives nothing, and a deny's that errors denies. A check reads what the host passes through
-  a conversion of its own (`converting`), each list and map it holds too: a value CEL decodes or
-  merges whole each time a condition reads it, as JSON text or a packed or dynamic message, is
-  converted once for the check, and one CEL unpacks in turn, a packed message packing another,
-  fails; one CEL would write out whole into an error, as a struct, or copy whole on each read, as an
-  array of more than 1 KiB of bytes, fails, a test of its presence too; and one of the host's type
-  CEL reads as one of its own, as a double, is read as the value it holds, a map's key too, which
-  the map finds by that value (`hostMap.Find`), reading the map's keys once for the check, but in a
-  map of more keys than a condition may cost, or of the host's type the check can't tell apart from
-  another, which finds its keys by its own methods alone. A key a condition indexes by is read as any
-  value is, where CEL indexes only by Go values of the types it names, failing for an `int8` or
-  JSON. What is converted once is converted
-  whole, uncharged: charging the check would let what one condition reads fail the others, so the
-  host is to pass no two values sharing what they hold, as messages reaching one message or JSON
-  texts sharing bytes. A list or map the host makes, of its own type or of CEL's, is read by its
-  own methods, each value it yields through the conversion; one of CEL's converts the Go values it
-  holds with its own adapter, which reads a struct or a dynamic message holding itself without end,
-  ending the process, so the host is to make none over them. So a read costs what it is charged
-  however the host passes the value, but in a list or map of CEL's made over it, and a comparison
-  that fails where either value holds a double that isn't finite, as a key too, sees every such
-  double as CEL's own. Each runs within the most evaluating it can cost, which its literals and
+  errors gives nothing, and a deny's that errors denies. A check converts what the host passes
+  into CEL's own values once (`converter`), deeply, from a closed set of Go values (`Attributes`):
+  bools, strings and numbers read by their kind, times, durations, bytes, slices, arrays, pointers,
+  maps keyed by bools, strings, ints or uints, JSON text and numbers, and the protobuf well-known
+  types. It calls no method of the host's, so a condition reads no value by one: anything else, a
+  `ref.Val` of the host's own, a list, map or optional of CEL's a host makes, a struct, another
+  message, a map keyed by a double or holding two keys read as the same value, or a value holding
+  itself, fails what reads it. A value reached twice is converted once, and converting costs a check
+  at most `maxConverted`, counted as `valueSize` counts what a condition reads, about what a check
+  may spend on a scope's grants' conditions, past which every condition reading an attribute
+  fails: converting isn't charged to a condition, and charging the check would let what one
+  condition reads fail the others. So conditions run on CEL's own values alone, by CEL's own
+  semantics, and a comparison that fails where either value holds a double that isn't finite sees
+  every double there is. Each runs within the most evaluating it can cost, which its literals and
   types bound, and the ids, kinds, types and tenant a
   check passes and its action, which are no longer than `MaxID`. What a check reads together is
   bounded where it is stored, for each scope: an identity's conditional grants, the conditional

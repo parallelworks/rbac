@@ -178,7 +178,8 @@ func (a *Authorizer) publicRoles(roles []string) []string {
 type Subject struct {
 	// Principal is a user, or a kind in Config.PrincipalKinds.
 	Principal Principal
-	// Attributes are what conditions read as subject.attributes, such as a department.
+	// Attributes are what conditions read as subject.attributes, such as a department, of the
+	// values Attributes names.
 	Attributes map[string]any
 }
 
@@ -324,8 +325,8 @@ type Resource struct {
 	Type      string
 	ID        string
 	Ancestors []Scope
-	// Attributes are what conditions read as resource.attributes: read them from where the
-	// resource is stored, as its path, never from request input.
+	// Attributes are what conditions read as resource.attributes, of the values Attributes names:
+	// read them from where the resource is stored, as its path, never from request input.
 	Attributes map[string]any
 	// Labels is its label, which a subject's holding must satisfy, whatever its grants give, for
 	// a check to allow anything (Config.Labels) but, on the tenant, a label value or a power to

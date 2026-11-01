@@ -181,25 +181,23 @@ conditional ones reach, to check one by one.
   misnamed, or as another type, is refused when stored, and one stored under other declarations
   fails where it no longer passes them. A condition building a message, as
   `google.protobuf.Struct{...}`, is refused, and one stored before fails: a grant's gives nothing
-  and a deny's applies. What the host passes is read as CEL reads it, at what reading any value of
-  its size costs however it is passed: a value CEL decodes or merges whole, JSON text, a JSON
-  number, or a packed or dynamic message, is converted once for each check, not each time a
-  condition reads it, and a packed message packing another fails; one it can't read, as a struct,
-  or copies whole on each read, an array of more than 1 KiB of bytes or a list or map holding arrays
-  or structs of more than 1 KiB, fails, a test of its presence with `has()` too; and one of the
-  host's own type CEL reads as a double or a string is read as the value it holds, a map's key
-  too, which the map finds by that value, so a map holding two keys read as the same value fails
-  what finds either; but in a map of more than 10,000 keys, or of the host's own type that is
-  neither a pointer nor a comparable value of at most 1 KiB, a key is read as the map holds it and
-  found by the map's own methods alone. A key a condition indexes a map or a
-  list by, as an `int8`, a pointer or JSON, is read as any value is, though CEL fails to index by
-  one as passed. Each value converted once is converted whole, so pass no two that share what they
-  hold, as messages reaching one message or JSON texts sharing bytes, which decoding never makes: a
-  check converts each whole, uncharged. A list or map the host makes, of its own type or of CEL's,
-  is read by its own methods, so one of CEL's made over such values converts them on each read, as
-  CEL does: it decodes JSON text and writes out a struct each time, uncharged, and one holding
-  itself, or a dynamic message reaching itself, without end, which ends the process. Make none.
-  Comparing a value holding a double that isn't finite fails, in a list or as a map's key too.
+  and a deny's applies. What the host passes as attributes is converted, once for each check that reads
+  a condition, into CEL's own values, and conditions read nothing else: `nil`; a `bool`, a string,
+  an int, a uint or a float of any size, of a type of the host's own too, as a named string, read by
+  its kind; `time.Time` and `time.Duration`; bytes, as `[]byte` or an array of bytes; slices,
+  arrays and pointers of these, a nil pointer read as null; maps of these keyed by a bool, a string,
+  an int or a uint, or by an interface holding one; JSON text (`json.RawMessage`) and
+  `json.Number`, parsed; the protobuf `Struct`, `ListValue`, `Value`, `NullValue`, wrappers,
+  `Timestamp` and `Duration`, and an `Any` packing one of them; and CEL's own scalar values.
+  Anything else fails whatever condition reads it, `has()` included: a `ref.Val` of the host's own,
+  though it says it is one of CEL's types, a list, map or optional of CEL's a host makes, a struct,
+  a channel, a func, any other message, a map keyed by anything else, as a double or an array, a
+  map holding two keys read as the same value, as `1` and `1u`, invalid JSON, and a value holding
+  itself. A list or map holding one reads the rest, and a value reached twice is converted once. A
+  check converts no more than `2 × 80,000` of them, counted as reading them costs a condition, one
+  for each value and a tenth of each string's, bytes' or JSON text's length, about a map of 50,000
+  short strings: past that every condition reading an attribute fails.
+  Comparing a value holding a double that isn't finite fails, in a list or a map too.
   Each condition runs within the most evaluating it can cost, which its literals and types
   bound: little for comparing what a request passes with literals, or with the ids, kinds, types and
   tenant a check passes or its action, which are no

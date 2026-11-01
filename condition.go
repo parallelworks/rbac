@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"maps"
 	"math"
-	"reflect"
 	"regexp"
 	"regexp/syntax"
 	"slices"
@@ -38,12 +37,11 @@ import (
 // A grant with one gives its role only where the expression is true. An expression that fails, as
 // one reading an attribute the host didn't pass does, or comparing a double that isn't finite, as
 // dividing by zero makes, or a value holding one, in a list, a map, as a key too, or an optional,
-// converting one to a string or keying a map by one, is false, though `in` a map the host passes
-// keyed by one, or by a list holding one, is false for a key it doesn't hold (Attributes). A value
-// the host passes is read as CEL reads it, but for what CEL would decode or copy whole each time a
-// condition reads it, which is decoded once for a check, or fails, a test of its presence too
-// (Attributes), so reading one costs what reading any value of its size does, however it is passed,
-// but in a list or a map of CEL's own the host makes. A label value and a power to release are
+// converting one to a string or keying a map by one, is false, though `in` a map a condition makes
+// keyed by a list holding one is false for a key it doesn't hold. What the host passes is
+// converted once for a check into CEL's own values, from the values Attributes names, and anything
+// else fails what reads it, a test of its presence too, so conditions read CEL's own values alone,
+// at what reading any value of its size costs. A label value and a power to release are
 // decided on the tenant with no attributes, whatever a check passes (Holding), and their conditions
 // can't read the tenant's: any read of resource.attributes fails, a test of an attribute's
 // presence, in, size(), a macro and a comparison included, so a grant's gives nothing and a deny's
@@ -1301,9 +1299,8 @@ func (a *keyedAttribute) qualifier(vars interpreter.Activation) (interpreter.Qua
 		return nil, err
 	}
 	a.k.charge(vars, a, v)
-	// An index never runs the key, so finiteKey doesn't see it: a map the host passes would find
-	// an infinite key, where `in` refuses one. CEL indexes by a double only for these, and
-	// converting any other again would parse a JSON attribute a second time.
+	// An index never runs the key, so finiteKey doesn't see it, and a double that isn't finite
+	// fails as a key here too. CEL indexes by a double only for these.
 	switch d := v.(type) {
 	case float32, float64, types.Double:
 		if nonFinite(a.Adapter().NativeToValue(d)) {
@@ -1318,10 +1315,10 @@ var errNonFiniteKey = errors.New("rbac: a double that isn't finite can't be a ke
 // finiteKey is key, failing for a double that isn't finite, as comparing one does (nonFinite): CEL
 // finds no key equal to NaN, so a map keyed by one would equal no map and hold no value, and a
 // deny's `{failed / total: 1} == {0.5: 1}` would lift where both are 0.0. A condition computes
-// every key it can make one of, since none is written. A map the host passes can be keyed by one:
-// comparing it with a map of as many entries fails (equal), as does indexing it by one
-// (qualifier), but a key not found `in` it is false, as finding whether it holds one that isn't
-// finite would read every key, uncharged.
+// every key it can make one of, since none is written, and no map the host passes is keyed by a
+// double (Attributes). One a condition makes can be keyed by a list holding one: comparing it
+// fails (holdsNonFinite), but a key not found `in` it is false, as finding whether it holds one
+// would read every key, uncharged.
 func finiteKey(key ref.Val) ref.Val {
 	if nonFinite(key) {
 		return types.WrapErr(errNonFiniteKey)
@@ -1374,20 +1371,11 @@ func ordering(function string) func(x, y ref.Val) ref.Val {
 // nonFinite reports whether v is a double that isn't finite, which a condition makes of finite ones
 // dividing by zero or converting "NaN". CEL orders and equates NaN as false with anything, so a
 // deny's `failed / total >= 0.5` would lift where both are 0.0, and -Inf orders below every
-// bound, so comparing either fails, as a declared double that isn't finite does. So does a value of
-// a type of the host's own CEL reads as a double holding one: a check reads such a value as CEL's
-// own double, but where it is a key of a map whose keys it reads as the map holds them, or a value
-// a list or a map keying one yields, which it reads so too (hostMap.key), so a grant's
-// `k[0] != 0.5` held for NaN there.
+// bound, so comparing either fails, as a declared double that isn't finite does. A condition reads
+// no double but CEL's own (Attributes).
 func nonFinite(v ref.Val) bool {
-	if d, ok := v.(types.Double); ok {
-		return math.IsNaN(float64(d)) || math.IsInf(float64(d), 0)
-	}
-	if v == nil || v.Type().TypeName() != types.DoubleType.TypeName() {
-		return false
-	}
-	f := reflect.ValueOf(v.Value())
-	return f.CanFloat() && (math.IsNaN(f.Float()) || math.IsInf(f.Float(), 0))
+	d, ok := v.(types.Double)
+	return ok && (math.IsNaN(float64(d)) || math.IsInf(float64(d), 0))
 }
 
 func incomparable() ref.Val {
@@ -1410,10 +1398,8 @@ func nonFiniteKey(m traits.Mapper) bool {
 // keys of x's maps in y's, as CEL does, which decides where a map holds keys CEL counts as equal,
 // as 1 and 1u, but not a key whose size is past read, as much of the smaller value as comparing
 // is charged for: the smaller holds none so large, and finding one would hash it whole uncharged.
-// What a value holds is compared within one less than read, as valueSize counts each value one: a
-// list of the host's own can yield itself when indexed though iterating it, as valueSize does,
-// yields nothing so large, and comparing it recursed until the stack overflowed, which no recover
-// catches.
+// What a value holds is compared within one less than read, as valueSize counts each value one, so
+// comparing recurses no deeper than it is charged for.
 func equal(x, y ref.Val, read uint64) ref.Val {
 	if read == 0 {
 		return types.NewErr("rbac: comparing values this large costs more than a condition may")
@@ -1453,9 +1439,9 @@ func equal(x, y ref.Val, read uint64) ref.Val {
 		if !ok || xs.Size() != ys.Size() {
 			return types.Equal(x, y)
 		}
-		// A map the host passes can be keyed by one, which finiteKey doesn't see, and no key is found
-		// equal to NaN, so it would equal no map. Comparing is charged for each key of either, as
-		// they hold as many.
+		// No key is found equal to NaN, so a map keyed by one would equal no map, though none a
+		// check reads is (finiteKey). Comparing is charged for each key of either, as they hold as
+		// many.
 		if nonFiniteKey(xs) || nonFiniteKey(ys) {
 			return incomparable()
 		}
@@ -1570,7 +1556,7 @@ func measuring(v ref.Val, limit uint64, each func(ref.Val)) uint64 {
 
 // holdsNonFinite reports whether v is a double that isn't finite, or holds one, in a list, a map,
 // as a key too, or an optional, however deep, read no further than limit, as valueSize counts: a
-// map the host passes can be keyed by a list holding NaN, which no key is found equal to, so a
+// map a condition makes can be keyed by a list holding NaN, which no key is found equal to, so a
 // map keyed by one equals none, and `in` it finds no key holding NaN. It finds none in a value
 // past limit, as finding it there would read uncharged and, in a map, as far as the order its keys
 // come in happens to reach, so what it reports differs from one check to the next. Comparing such
@@ -1796,8 +1782,10 @@ type requestKey struct{}
 
 // WithRequest returns ctx carrying the attributes of the request it serves, such as its
 // address or whether it passed a second factor, which conditions read as request.attributes.
-// Values are what CEL reads: strings, numbers, booleans, times, and lists and maps of them, as
-// Attributes says.
+// Values are those Attributes names, a check converting them once into CEL's own: strings,
+// numbers, booleans, bytes, times, durations, null, JSON and the protobuf well-known types, and
+// lists and maps of them. Anything else, as a struct or a value of the host's own CEL type, fails
+// whatever condition reads it.
 func WithRequest(ctx context.Context, attributes map[string]any) context.Context {
 	return context.WithValue(ctx, requestKey{}, maps.Clone(attributes))
 }
@@ -1813,26 +1801,34 @@ func withoutRequest(ctx context.Context) context.Context {
 	return context.WithValue(ctx, requestKey{}, unrequested{})
 }
 
-// vars is what a condition reads when s asks to do p to r, each kind's attributes read through one
-// converting for them all, so a value they share is converted once.
+// vars is what a condition reads when s asks to do p to r, each kind's attributes converted by one
+// converter for them all (Attributes), so a value they share is converted once, and what converting
+// them all may cost is bounded together: past it, every kind's attributes refuse every read.
 func (a *Authorizer) vars(ctx context.Context, s Subject, p Permission, r Resource) map[string]any {
-	c := &converting{}
-	if a.conds != nil {
-		c.base = a.conds.env.CELTypeAdapter()
+	c := newConverter()
+	_, none := ctx.Value(requestKey{}).(unrequested)
+	var request map[string]ref.Val
+	if !none {
+		passed, _ := ctx.Value(requestKey{}).(map[string]any)
+		request = c.attributes(passed)
 	}
-	var attributes any = unreadable
-	if _, none := ctx.Value(requestKey{}).(unrequested); !none {
-		request, _ := ctx.Value(requestKey{}).(map[string]any)
-		attributes = declared(c, a.cfg.Attributes.Request, request)
+	resourced, subjected := c.attributes(r.Attributes), c.attributes(s.Attributes)
+	var requestAttributes, resourceAttributes, subjectAttributes any = unreadable, unreadable, unreadable
+	if !c.over {
+		if !none {
+			requestAttributes = declared(a.cfg.Attributes.Request, request)
+		}
+		resourceAttributes = declared(a.cfg.Attributes.Resource, resourced)
+		subjectAttributes = declared(a.cfg.Attributes.Subject, subjected)
 	}
-	resource := map[string]any{"type": r.Type, "id": r.ID, "tenant": r.Tenant, "attributes": declared(c, a.cfg.Attributes.Resource, r.Attributes)}
+	resource := map[string]any{"type": r.Type, "id": r.ID, "tenant": r.Tenant, "attributes": resourceAttributes}
 	if r.Type == TenantScope && a.labelPermission(p) {
 		resource = valueResource(r.Tenant)
 	}
 	return map[string]any{
-		"subject":  map[string]any{"kind": string(s.Principal.Kind), "id": s.Principal.ID, "attributes": declared(c, a.cfg.Attributes.Subject, s.Attributes)},
+		"subject":  map[string]any{"kind": string(s.Principal.Kind), "id": s.Principal.ID, "attributes": subjectAttributes},
 		"resource": resource,
-		"request":  map[string]any{"time": a.cfg.Now(), "attributes": attributes},
+		"request":  map[string]any{"time": a.cfg.Now(), "attributes": requestAttributes},
 		"action":   string(p),
 	}
 }
@@ -1845,49 +1841,41 @@ func valueResource(tenant string) map[string]any {
 	return map[string]any{"type": TenantScope, "id": tenant, "tenant": tenant, "attributes": unreadable}
 }
 
-// unreadable are attributes a condition reads none of.
 // noAttributes are a kind's attributes where it has none, which every check can share.
-var noAttributes = types.NewStringInterfaceMap(types.DefaultTypeAdapter, map[string]any{})
+var noAttributes = types.NewRefValMap(types.DefaultTypeAdapter, map[ref.Val]ref.Val{})
 
-var unreadable = refusedAttributes{Mapper: types.NewStringInterfaceMap(types.DefaultTypeAdapter, map[string]any{}), all: true}
+// unreadable are attributes a condition reads none of.
+var unreadable = refusedAttributes{Mapper: noAttributes, all: true}
 
-// declared is attributes as conditions read them, through c: each one as declares it, passed as
-// another Go value than its type takes or as none, and each one a declared kind doesn't declare,
-// made an error that whatever reads it fails on, comparing it included, as one not passed is. CEL
-// compares values of different types as unequal rather than fail, so otherwise a `!=` would hold
-// for it, and a deny's `==` would lift. A kind not declared is as passed. Either is a map of CEL's,
-// not the host's map: CEL reads a field of a map of the host's map by indexing it, and converts
-// only what it finds, as its own adapter does, so a value it holds would be read past c. So a test
-// of an attribute's presence reads it, and fails where reading it fails, and a key a condition
-// indexes by is what c reads it as, which CEL indexes by where it fails for the Go value passed.
-func declared(c *converting, declares map[string]AttributeType, attributes map[string]any) any {
+// declared is attributes, as a check converted them, as conditions read them: each one as declares
+// it, converted to another type than it is declared, or failing to convert, and each one a declared
+// kind doesn't declare, made an error that whatever reads it fails on, comparing it included, as
+// one not passed is. CEL compares values of different types as unequal rather than fail, so
+// otherwise a `!=` would hold for it, and a deny's `==` would lift. A kind not declared is as
+// converted.
+func declared(declares map[string]AttributeType, attributes map[string]ref.Val) any {
 	if len(attributes) == 0 {
 		return noAttributes
 	}
-	if declares == nil {
-		return types.NewStringInterfaceMap(c, attributes)
-	}
-	var typed map[string]any
+	held := make(map[ref.Val]ref.Val, len(attributes))
+	refused := false
 	for name, v := range attributes {
-		t, ok := declares[name]
-		if ok && t.takes(c, v) {
-			continue
+		if declares != nil {
+			// One it doesn't declare a condition reads only through dyn(), which no type is checked
+			// by when stored, so it fails as one of another type does.
+			if t, ok := declares[name]; !ok {
+				v, refused = types.NewErr("rbac: attribute %q is not declared", name), true
+			} else if !t.takes(v) {
+				v, refused = types.NewErr("rbac: attribute %q is not a %s", name, t), true
+			}
 		}
-		if typed == nil {
-			typed = maps.Clone(attributes)
-		}
-		// One it doesn't declare a condition reads only through dyn(), which no type is checked by
-		// when stored, so it fails as one of another type does.
-		if ok {
-			typed[name] = types.NewErr("rbac: attribute %q is not a %s", name, t)
-		} else {
-			typed[name] = types.NewErr("rbac: attribute %q is not declared", name)
-		}
+		held[types.String(name)] = v
 	}
-	if typed == nil {
-		return types.NewStringInterfaceMap(c, attributes)
+	attrs := types.NewRefValMap(types.DefaultTypeAdapter, held)
+	if refused {
+		return refusedAttributes{Mapper: attrs}
 	}
-	return refusedAttributes{Mapper: types.NewStringInterfaceMap(c, typed)}
+	return attrs
 }
 
 // refusedAttributes are a kind's attributes with some refused, as conditions read them. A refused
