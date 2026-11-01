@@ -364,7 +364,7 @@ func (rs *runs) of(ctx context.Context, a *Authorizer, s Subject, r Resource, he
 	rs.resource = &deciding{a.vars(ctx, s, "", r), map[string]run{}}
 	rs.values = rs.resource
 	if r.Type == TenantScope && len(a.labels) > 0 {
-		vars := a.vars(ctx, s, "", r)
+		vars := maps.Clone(rs.resource.vars)
 		vars["resource"] = valueResource(r.Tenant)
 		rs.values = &deciding{vars, map[string]run{}}
 	}
