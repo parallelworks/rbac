@@ -77,6 +77,7 @@ func (e *InvalidError) Unwrap() error { return e.Err }
 func (a *Authorizer) Apply(ctx context.Context, actor Subject, on Resource, c Change) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, on.Tenant, actor.Principal, "Apply")
+	defer conflicting(&err)
 	if err := a.check(on); err != nil {
 		return err
 	}
@@ -473,6 +474,7 @@ func readCommitted(what, level string) error {
 func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string, grants []Grant) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "Import")
+	defer conflicting(&err)
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -1604,7 +1606,8 @@ func (a *Authorizer) mayChangeBy(au authority, on Resource, grants, revokes []Bi
 
 // Grantable lists the roles the subject may grant on r, unconditionally and for good, built-in
 // ones in catalog order and then the tenant's custom ones, for an access screen to offer.
-func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) ([]RoleDefinition, error) {
+func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) (_ []RoleDefinition, err error) {
+	defer conflicting(&err)
 	a = a.still()
 	if err := a.check(r); err != nil {
 		return nil, err
@@ -2341,7 +2344,8 @@ func (f GrantFilter) sql(table, cols, from, order string) (query string, scopes,
 // the catalog, to a kind no longer declared, or to the public of a role no longer Public gives
 // nothing. It has no limit or cursor, so what it returns grows with what matches, as every grant on
 // the tenant's scope, or of a group granted on each of its resources.
-func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) ([]Grant, error) {
+func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) (_ []Grant, err error) {
+	defer conflicting(&err)
 	if !validID(tenant) || !f.valid(tenant) {
 		return nil, fmt.Errorf("%w: Grants needs a tenant and valid scopes or principals", ErrInvalid)
 	}
@@ -2364,6 +2368,7 @@ func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) (
 func (a *Authorizer) DeleteGrants(ctx context.Context, actor Principal, tenant string, grants []Grant) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "DeleteGrants")
+	defer conflicting(&err)
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -2430,6 +2435,7 @@ func (a *Authorizer) DeleteGrants(ctx context.Context, actor Principal, tenant s
 func (a *Authorizer) DeleteScope(ctx context.Context, actor Principal, tenant string, s Scope) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "DeleteScope")
+	defer conflicting(&err)
 	return a.deleteScopes(ctx, actor, tenant, "DeleteScope", []Scope{s})
 }
 
@@ -2450,6 +2456,7 @@ func (a *Authorizer) DeleteScope(ctx context.Context, actor Principal, tenant st
 func (a *Authorizer) DeleteScopes(ctx context.Context, actor Principal, tenant string, scopes []Scope) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "DeleteScopes")
+	defer conflicting(&err)
 	return a.deleteScopes(ctx, actor, tenant, "DeleteScopes", scopes)
 }
 
@@ -2481,6 +2488,7 @@ func (a *Authorizer) deleteScopes(ctx context.Context, actor Principal, tenant, 
 func (a *Authorizer) DeletePrincipal(ctx context.Context, actor Principal, tenant string, p Principal) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "DeletePrincipal")
+	defer conflicting(&err)
 	if !p.wellFormed(tenant) {
 		return fmt.Errorf("%w: principal %q is not valid", ErrInvalid, p.key())
 	}
@@ -2515,6 +2523,7 @@ func leaving(p Principal) deletion {
 func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Principal) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, "", actor, "DeletePrincipalEverywhere")
+	defer conflicting(&err)
 	// A group is its tenant's alone: one with its id elsewhere is another.
 	if p.broad() || p.Kind == Group || !p.wellFormed("") {
 		return fmt.Errorf("%w: principal %q is not an identity", ErrInvalid, p.key())
@@ -2589,6 +2598,7 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Pri
 func (a *Authorizer) DeleteTenant(ctx context.Context, actor Principal, tenant string) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "DeleteTenant")
+	defer conflicting(&err)
 	return a.delete(ctx, actor, tenant, "DeleteTenant", func(tx pgx.Tx) error { return lockTenant(ctx, tx, tenant) },
 		deletion{roles: true, groups: true, denies: true, where: "TRUE", members: "TRUE"})
 }
@@ -2845,11 +2855,11 @@ func removedWhere[T any](ctx context.Context, a *Authorizer, tx pgx.Tx, table, c
 // removed. A race PostgreSQL refuses matches ErrConflict.
 func (a *Authorizer) DeleteExpired(ctx context.Context) (n int64, err error) {
 	defer a.refused(ctx, &err, "", Principal{}, "DeleteExpired")
+	defer conflicting(&err)
 	if err := a.writable(); err != nil {
 		return 0, err
 	}
-	n, err = a.deleteExpired(ctx)
-	return n, conflicted(err)
+	return a.deleteExpired(ctx)
 }
 
 // expiryBatch is the most rows of a table one of DeleteExpired's transactions picks, so none
