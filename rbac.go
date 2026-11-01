@@ -149,10 +149,21 @@ func (a *Authorizer) acts(k PrincipalKind) bool { return k == User || a.kinds[k]
 // later: a grant to a tenant's members or the public never gives a permission to change grants,
 // and one to the public gives only while its role is marked Public.
 func (p Principal) carries(role RoleDefinition, perm Permission) bool {
-	if p.broad() && perm.managesAccess() {
+	c := p.carrier()
+	if c != "" && perm.managesAccess() {
 		return false
 	}
-	return p.Kind != Public || role.Public
+	return c != Public || role.Public
+}
+
+// carrier is all that carries and holding.carries read of p, so grants of a role to two principals
+// of one carrier give alike, as a change deciding grants by kinds of its actor's needs (decidedAs):
+// the kind of a broad principal, and none for an identity or a group.
+func (p Principal) carrier() PrincipalKind {
+	if p.broad() {
+		return p.Kind
+	}
+	return ""
 }
 
 // publicRoles keeps the built-in roles marked Public, the only built-in ones a grant to the

@@ -383,7 +383,7 @@ func (a *Authorizer) changing(actor Subject, on Resource, cs *constrained) error
 		return &DeniedError{Permission: manage, Scope: on.Scope(), Reason: "an anonymous subject changes nothing"}
 	}
 	if cs.removes(manage, on.Type) {
-		return cmp.Or(cs.failed(), error(&DeniedError{Permission: manage, Scope: on.Scope(), Reason: "removed by " + cs.removedBy(manage)}))
+		return cmp.Or(cs.failed(), error(&DeniedError{Permission: manage, Scope: on.Scope(), Reason: "removed by " + cs.removedBy(manage, on.Type)}))
 	}
 	return nil
 }
@@ -829,6 +829,9 @@ type authority struct {
 	denied, handsOn func(p Permission) bool
 	// denials are the denies on the path that bind the actor, which denied and handsOn read.
 	denials []denial
+	// excluded are the exclusive dimensions whose values its grants on the path could give two of,
+	// which denied and handsOn remove too.
+	excluded map[string]bool
 	// defining is a custom role SetRole checks: the roles a check names resolve to it, but the
 	// actor's own grants of it give what it gives now.
 	defining *RoleDefinition
@@ -838,20 +841,49 @@ type authority struct {
 	// proven is holdsRole's checks of the grants decided by this authority, and by those on other
 	// scopes read with it that hand on just as it does.
 	proven *checked
-	// given is what heldFor found the actor's grants give, which doesn't turn on the role a check
-	// asks about, so a decision checking many roles that give the same reads its grants once.
-	given map[heldKey]int
+	// given is how long heldFor found the actor's grants give each permission, which turns neither
+	// on the role a check asks about nor on the end of the grant it decides, so a decision checking
+	// many roles that give the same, and a change deciding grants that end apart, read its grants
+	// once. powers is the same of what under found of its power to change grants, and kinds of how
+	// long each kind of its grants lasts (decidedAs).
+	given  map[heldKey][]lasting
+	powers map[heldKey]powerLasting
+	kinds  map[string][]lasting
 	// values is what the actor's label values are decided by, read with its grants, so a change
 	// checks a label by what it held as it held its power there.
 	values *valuesRead
 }
 
-// heldKey is what heldFor is asked: a permission for a list of types, under a condition until a
-// time.
+// heldKey is what heldFor is asked, a permission for a list of types under a condition, but for
+// the end it asks about; and what under is, the power on a type, as types, under a condition.
 type heldKey struct {
 	p                Permission
 	types, condition string
-	until            time.Time
+}
+
+// lasting is how long grants give something: until until, zero for good, where held.
+type lasting struct {
+	held  bool
+	until time.Time
+}
+
+// with is how long l's grants and h give it, together.
+func (l lasting) with(h holding) lasting {
+	switch {
+	case !l.held:
+		return lasting{held: true, until: h.ends}
+	case l.until.IsZero() || h.ends.IsZero():
+		return lasting{held: true}
+	case h.ends.After(l.until):
+		l.until = h.ends
+	}
+	return l
+}
+
+// lasts reports whether one of the grants l is of lasts until until, zero for never: the one that
+// lasts longest does, if any.
+func (l lasting) lasts(until time.Time) bool {
+	return l.held && holding{ends: l.until}.lasts(until)
 }
 
 // constrained is what the constraints remove from an actor handing permissions on through a
@@ -864,10 +896,10 @@ type constrained struct {
 	actor Subject
 	on    Resource
 	asked map[permissionOn]bool
-	// listed are removesAny's answers.
-	listed map[typesAsked]bool
-	// by names the constraint that removed each permission, for a refusal to say.
-	by  map[Permission]string
+	// listed are removesAny's answers: the first of the types each removes its permission on, or -1.
+	listed map[typesAsked]int
+	// by names the constraint that removed each permission on each type, for a refusal to say.
+	by  map[permissionOn]string
 	err error
 	// sealed is set in the transaction, where a permission not asked about before is one the change
 	// came to need since, as for a role redefined meanwhile: missed refuses it, to be tried again.
@@ -884,7 +916,7 @@ type constrained struct {
 func (a *Authorizer) constrain(ctx context.Context, actor Subject, on Resource) *constrained {
 	return &constrained{
 		a: a, ctx: ctx, actor: actor, on: on,
-		asked: map[permissionOn]bool{}, listed: map[typesAsked]bool{}, by: map[Permission]string{},
+		asked: map[permissionOn]bool{}, listed: map[typesAsked]int{}, by: map[permissionOn]string{},
 	}
 }
 
@@ -931,11 +963,13 @@ func (c *constrained) holdingFor(ctx context.Context, q DB, v *valuesRead, l Lab
 }
 
 // decidedHolding is a holding decided by a read through a constrained, of the values in asked, or
-// of every one where all.
+// of every one where all, and what its decisions came to, which a decision of more values by the
+// read shares (runs): each is of the change's one request, by the same grants and denies.
 type decidedHolding struct {
 	h     Holding
 	asked map[Permission]bool
 	all   bool
+	runs  *runs
 }
 
 // covers reports whether d decided every value in asked, or where nil, every one.
@@ -952,20 +986,25 @@ func (d *decidedHolding) covers(asked map[Permission]bool) bool {
 }
 
 // decidedBy is the actor's holding decided through c by v of the values in asked, or of every one
-// where nil, deciding each value once for each read however many labels a change checks by it.
+// where nil, deciding each value once for each read however many labels a change checks by it,
+// and a condition that doesn't read the action once for all of them (runs).
 func (c *constrained) decidedBy(ctx context.Context, q DB, v *valuesRead, asked map[Permission]bool) (Holding, error) {
 	d := v.decided[c]
 	if d != nil && d.covers(asked) {
 		return d.h, nil
 	}
+	shared := &runs{}
+	if d != nil {
+		shared = d.runs
+	}
 	h, _, err := c.a.holdingFrom(ctx, q, c.actor, c, v, func(p Permission) bool {
 		return c.a.labelPermission(p) && (asked == nil || asked[p]) && (d == nil || !d.asked[p])
-	})
+	}, shared)
 	if err != nil {
 		return Holding{}, err
 	}
 	if d == nil {
-		d = &decidedHolding{h: h, asked: map[Permission]bool{}}
+		d = &decidedHolding{h: h, asked: map[Permission]bool{}, runs: shared}
 		if v.decided == nil {
 			v.decided = map[*constrained]*decidedHolding{}
 		}
@@ -1030,7 +1069,7 @@ func (c *constrained) removes(p Permission, resourceType string) bool {
 		c.err = err
 	}
 	if name != "" {
-		c.by[p] = name
+		c.by[k] = name
 	}
 	c.asked[k] = name != "" || err != nil
 	return c.asked[k]
@@ -1038,21 +1077,25 @@ func (c *constrained) removes(p Permission, resourceType string) bool {
 
 // removesAny reports whether a constraint removes p on resources of one of types, which typesKey
 // names with the types after them, asking about each in order up to one that does, once for each
-// list of them, as a change decides many roles for the same types.
-func (c *constrained) removesAny(p Permission, types []string, typesKey string) bool {
+// list of them, as a change decides many roles for the same types; and the one that removes it on
+// that type, as removedBy names it.
+func (c *constrained) removesAny(p Permission, types []string, typesKey string) (string, bool) {
 	if len(types) == 0 {
-		return false
+		return "", false
 	}
 	if c == nil {
-		return true
+		return "", true
 	}
 	k := typesAsked{p: p, types: typesKey, n: len(types)}
-	if removed, ok := c.listed[k]; ok {
-		return removed
+	i, ok := c.listed[k]
+	if !ok {
+		i = slices.IndexFunc(types, func(t string) bool { return c.removes(p, t) })
+		c.listed[k] = i
 	}
-	removed := slices.ContainsFunc(types, func(t string) bool { return c.removes(p, t) })
-	c.listed[k] = removed
-	return removed
+	if i < 0 {
+		return "", false
+	}
+	return c.removedBy(p, types[i]), true
 }
 
 // typesAsked is what removesAny is asked: a permission for the first n of a list of types.
@@ -1062,17 +1105,18 @@ type typesAsked struct {
 	n     int
 }
 
-// removedBy names the constraint that removed p from the actor, or "".
-func (c *constrained) removedBy(p Permission) string {
+// removedBy names the constraint that removed p on resources of a type from the actor, or "".
+func (c *constrained) removedBy(p Permission, resourceType string) string {
 	if c == nil {
 		return ""
 	}
-	return c.by[p]
+	return c.by[permissionOn{p, resourceType}]
 }
 
-// refusal is why the actor can't do what, lacking p: the constraint that removed p, or otherwise.
-func (c *constrained) refusal(what string, p Permission, otherwise string) string {
-	if name := c.removedBy(p); name != "" {
+// refusalBy is why the actor can't do what, lacking p: name, the constraint whose removal of p
+// refused it, or otherwise where none did.
+func refusalBy(name, what string, p Permission, otherwise string) string {
+	if name != "" {
 		return fmt.Sprintf("the actor can't %s while %s removes %s from it", what, name, p)
 	}
 	return otherwise
@@ -1108,6 +1152,8 @@ type power struct {
 	// only by a conditional grant is the actor's to grant only under that condition, as a role
 	// held only under one is, or a grant could drop it.
 	listed map[Role][]string
+	// removedBy is the constraint that removed it, where one did.
+	removedBy string
 }
 
 func (p power) none() bool { return !p.any && len(p.listed) == 0 }
@@ -1169,13 +1215,24 @@ func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []
 	b = b.keepingSets()
 	// Every path holds the tenant's scope, so the read holds what the actor's values are decided by.
 	values := onTenant(tenant, held, ds, b)
+	// What its grants on each path could give two values of an exclusive dimension of reads each
+	// role's permissions once for every path: a role can give a thousand, and a change reach
+	// hundreds of scopes.
+	var of map[Role][]Permission
+	if a.exclusive() {
+		of = a.exclusiveOf(b, held)
+	}
 	aus := make([]authority, len(on))
 	for i, r := range on {
 		heldOn := make([]holding, len(heldAt[i]))
 		for j, k := range heldAt[i] {
 			heldOn[j] = held[k]
 		}
-		aus[i] = a.authorityOf(ctx, actor, r, heldOn, deniedOn[i], b)
+		var excluded map[string]bool
+		if of != nil {
+			excluded = excludedOf(of, heldOn)
+		}
+		aus[i] = a.authorityOf(ctx, actor, r, heldOn, deniedOn[i], b, excluded)
 		aus[i].values = values
 		if len(a.cfg.Constraints) > 0 || len(deniedOn[i]) > 0 {
 			continue
@@ -1216,8 +1273,8 @@ func orDenied(denied, more func(Permission) bool) func(Permission) bool {
 }
 
 // authorityOf is the authority of held grants, their conditions read, under the denies on the
-// path.
-func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource, held []holding, ds []denial, b book) authority {
+// path, where they could give two values of each dimension of excluded (excludedBy).
+func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource, held []holding, ds []denial, b book, excluded map[string]bool) authority {
 	vars := a.vars(ctx, actor, "", on)
 	// The cheapest conditions first, as callers evaluate them in this order, so what a budget run
 	// out decides doesn't rest on ids.
@@ -1270,16 +1327,16 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 	// The values of an exclusive dimension it holds none of, as its grants could give it two, it
 	// can't use or hand on either, as checks refuse it them. Read from its grants on the path, which
 	// hold its tenant's, so a change's recheck in its transaction asks no constraint.
-	if excluded := a.excludedBy(b, held); len(excluded) > 0 {
+	if len(excluded) > 0 {
 		out := func(p Permission) bool { t, ok := a.exclusiveValue(p); return ok && excluded[t] }
 		denied, handsOn = orDenied(denied, out), orDenied(handsOn, out)
 	}
 	return authority{
-		held: held, roles: b.keepingSets(), given: map[heldKey]int{},
+		held: held, roles: b.keepingSets(), given: map[heldKey][]lasting{}, powers: map[heldKey]powerLasting{}, kinds: map[string][]lasting{},
 		allows: func(h holding, action Permission) bool {
 			return !h.conditional || a.conds.holds(spend(action), h.Condition.Expression, with(vars, action))
 		},
-		denied: denied, handsOn: handsOn, denials: ds, subjects: subjects{},
+		denied: denied, handsOn: handsOn, denials: ds, excluded: excluded, subjects: subjects{},
 	}
 }
 
@@ -1287,37 +1344,74 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 // conditional grant gives its power only where its condition holds for the change.
 func (au authority) over(scopeType string) power {
 	manage := GrantPermission(scopeType)
-	return au.power(scopeType, au.denied, func(g holding) bool { return au.allows(g, manage) })
+	if au.denied(manage) {
+		return power{listed: map[Role][]string{}}
+	}
+	return au.powerOf(scopeType, func(g holding) bool { return au.allows(g, manage) }).power(func(l lasting) bool { return l.held })
 }
 
 // under is the power the actor may hand on with condition until until, as holds counts
 // permissions: a power held under a condition can't be handed on without it, nor one held until a
-// time past it, nor one a constraint removes.
+// time past it, nor one a constraint removes. How long its grants give it is read once for each
+// type and condition, whatever end each asks about.
 func (au authority) under(scopeType, condition string, until time.Time) power {
-	pw := au.power(scopeType, au.handsOn, func(g holding) bool { return g.under(au.subjects, condition) && g.lasts(until) })
-	// Asked only of a power the actor holds, as each ask calls the hooks.
-	if !pw.none() && au.constrained.removes(GrantPermission(scopeType), scopeType) {
+	if au.handsOn(GrantPermission(scopeType)) {
 		return power{listed: map[Role][]string{}}
+	}
+	k := heldKey{types: scopeType, condition: condition}
+	pl, ok := au.powers[k]
+	if !ok {
+		pl = au.powerOf(scopeType, func(g holding) bool { return g.under(au.subjects, condition) })
+		if au.powers != nil {
+			au.powers[k] = pl
+		}
+	}
+	pw := pl.power(func(l lasting) bool { return l.lasts(until) })
+	// Asked only of a power the actor holds, as each ask calls the hooks.
+	if manage := GrantPermission(scopeType); !pw.none() && au.constrained.removes(manage, scopeType) {
+		return power{listed: map[Role][]string{}, removedBy: au.constrained.removedBy(manage, scopeType)}
 	}
 	return pw
 }
 
-func (au authority) power(scopeType string, denied func(Permission) bool, counts func(holding) bool) power {
-	pw := power{listed: map[Role][]string{}}
+// powerLasting is how long grants give the power to change grants on scopes of a type: to grant
+// any role, and to grant each role listed, by the condition of each grant listing it.
+type powerLasting struct {
+	any    lasting
+	listed map[Role]map[string]lasting
+}
+
+// powerOf is how long the actor's grants that counts keeps give it the power to change grants on
+// scopes of a type.
+func (au authority) powerOf(scopeType string, counts func(holding) bool) powerLasting {
+	pl := powerLasting{listed: map[Role]map[string]lasting{}}
 	manage := GrantPermission(scopeType)
-	if denied(manage) {
-		return pw
-	}
 	for _, g := range au.held {
 		if !gives(au.roles, g, manage, scopeType) || !counts(g) {
 			continue
 		}
 		def, _ := au.roles.role(g.Role)
 		if len(def.GrantableRoles) == 0 {
-			pw.any = true
+			pl.any = pl.any.with(g)
 		}
 		for _, r := range def.GrantableRoles {
-			pw.listed[r] = append(pw.listed[r], g.Condition.Expression)
+			if pl.listed[r] == nil {
+				pl.listed[r] = map[string]lasting{}
+			}
+			pl.listed[r][g.Condition.Expression] = pl.listed[r][g.Condition.Expression].with(g)
+		}
+	}
+	return pl
+}
+
+// power is the power pl gives where its grants last as lasts says.
+func (pl powerLasting) power(lasts func(lasting) bool) power {
+	pw := power{any: lasts(pl.any), listed: map[Role][]string{}}
+	for r, by := range pl.listed {
+		for condition, l := range by {
+			if lasts(l) {
+				pw.listed[r] = append(pw.listed[r], condition)
+			}
 		}
 	}
 	return pw
@@ -1363,53 +1457,101 @@ func (h holding) lasts(until time.Time) bool {
 // same for every grant the actor's grants can't tell apart, so a change granting a role to many,
 // each until its own time, decides it once. A condition none of its conditional grants has gives
 // it what none does: its conditional grants give nothing under either, nor list a role for it,
-// and the others give under both what they give. And each of its grants lasts until until just as
-// it lasts until the soonest of their ends at or after it, or never where none ends then.
+// and the others give under both what they give. And of the grants that count under it, a decision
+// reads only the role of each, how its principal carries what the role gives, and whether it lasts
+// until until: so it decides until until just as until the soonest time at or after it that the
+// longest lasting of a kind of them ends, or for good where none ends then. Grants of one role to
+// the actor's many groups, each ending at its own time, are one kind, so grants made until any
+// time up to the last of their ends are decided as one.
 func (au authority) decidedAs(condition string, until time.Time) (string, time.Time) {
 	if !slices.ContainsFunc(au.held, func(g holding) bool { return g.conditional && g.Condition.Expression == condition }) {
 		condition = ""
 	}
+	if until.IsZero() {
+		return condition, time.Time{}
+	}
+	kinds, ok := au.kinds[condition]
+	if !ok {
+		kinds = au.kindsLasting(condition)
+		if au.kinds != nil {
+			au.kinds[condition] = kinds
+		}
+	}
 	var at time.Time
-	for _, g := range au.held {
-		if !until.IsZero() && !g.ends.IsZero() && !g.ends.Before(until) && (at.IsZero() || g.ends.Before(at)) {
-			at = g.ends
+	for _, l := range kinds {
+		if !l.until.IsZero() && !l.until.Before(until) && (at.IsZero() || l.until.Before(at)) {
+			at = l.until
 		}
 	}
 	return condition, at.UTC()
 }
 
+// kindsLasting is how long each kind of the actor's grants that count under condition lasts: those
+// of a role through principals of one carrier, which carry what it gives alike (Principal.carrier).
+func (au authority) kindsLasting(condition string) []lasting {
+	type kind struct {
+		role    Role
+		carrier PrincipalKind
+	}
+	by := map[kind]lasting{}
+	for _, g := range au.held {
+		if !g.under(au.subjects, condition) {
+			continue
+		}
+		k := kind{g.Role, g.Principal.carrier()}
+		by[k] = by[k].with(g)
+	}
+	return slices.Collect(maps.Values(by))
+}
+
 // holdsFor reports whether the actor holds p for resources of each of types, which typesKey names,
-// to hand it on with condition until until: neither a deny nor a constraint removes it. A
-// constraint is asked about each type in order that the actor's grants give p for, up to one that
-// removes it, as asking of each type in turn would.
-func (au authority) holdsFor(p Permission, types []string, typesKey, condition string, until time.Time) bool {
+// to hand it on with condition until until: neither a deny nor a constraint removes it, and where
+// one does, the constraint. A constraint is asked about each type in order that the actor's grants
+// give p for, up to one that removes it, as asking of each type in turn would.
+func (au authority) holdsFor(p Permission, types []string, typesKey, condition string, until time.Time) (string, bool) {
 	if len(types) == 0 {
-		return true
+		return "", true
 	}
 	if au.handsOn(p) {
-		return false
+		return "", false
 	}
 	n := au.heldFor(p, types, typesKey, condition, until)
-	return !au.constrained.removesAny(p, types[:n], typesKey) && n == len(types)
+	if by, removed := au.constrained.removesAny(p, types[:n], typesKey); removed {
+		return by, false
+	}
+	return "", n == len(types)
 }
 
 // heldFor is how many of types, in order, the actor's grants give p for under condition until
-// until, before the first they don't.
+// until, before the first they don't. How long they give it for each type is read once, whatever
+// end each asks about.
 func (au authority) heldFor(p Permission, types []string, typesKey, condition string, until time.Time) int {
-	k := heldKey{p: p, types: typesKey, condition: condition, until: until}
-	if n, ok := au.given[k]; ok {
-		return n
+	k := heldKey{p: p, types: typesKey, condition: condition}
+	given, ok := au.given[k]
+	if !ok {
+		given = make([]lasting, len(types))
+		for i, rt := range types {
+			for _, g := range au.held {
+				if !gives(au.roles, g, p, rt) || !g.under(au.subjects, condition) {
+					continue
+				}
+				// One held for good lasts as long as any can, so the rest needn't be read.
+				if given[i] = given[i].with(g); given[i].until.IsZero() {
+					break
+				}
+			}
+			// Nor the types after one none give it for, which no end gets past.
+			if !given[i].held {
+				break
+			}
+		}
+		if au.given != nil {
+			au.given[k] = given
+		}
 	}
-	n := slices.IndexFunc(types, func(rt string) bool {
-		return !slices.ContainsFunc(au.held, func(g holding) bool {
-			return gives(au.roles, g, p, rt) && g.under(au.subjects, condition) && g.lasts(until)
-		})
-	})
+	n := slices.IndexFunc(given, func(l lasting) bool { return !l.lasts(until) })
 	if n < 0 {
 		n = len(types)
-	}
-	if au.given != nil {
-		au.given[k] = n
 	}
 	return n
 }
@@ -1422,18 +1564,19 @@ func (au authority) may(p Permission, resourceType string) bool {
 }
 
 // mayGrant reports whether the actor may grant def on a scope of a type, with condition, until
-// until, zero for never, and if not, a permission it lacks: its power there, pw, lists def, or
-// lets it grant any role and it holds everything def gives until then. pw is over for a grant the
-// actor makes, and under for one a grant it makes would let others make. seen is holdsRole's:
-// fresh for each grant decided, or what grants already allowed proved.
+// until, zero for never, and if not, a permission it lacks, and the constraint whose removal of it
+// refused it, if one did: its power there, pw, lists def, or lets it grant any role and it holds
+// everything def gives until then. pw is over for a grant the actor makes, and under for one a
+// grant it makes would let others make. seen is holdsRole's: fresh for each grant decided, or what
+// grants already allowed proved.
 func (a *Authorizer) mayGrant(au authority, pw power, scopeType string, def RoleDefinition, condition string, until time.Time,
 	seen *checked,
-) (Permission, bool) {
+) (Permission, string, bool) {
 	if pw.lists(def.ID, condition) {
-		return "", true
+		return "", "", true
 	}
 	if !pw.any {
-		return GrantPermission(scopeType), false
+		return GrantPermission(scopeType), pw.removedBy, false
 	}
 	// On a container or the tenant the grant reaches every type the role is for; on a resource,
 	// its own type.
@@ -1445,10 +1588,12 @@ func (a *Authorizer) mayGrant(au authority, pw power, scopeType string, def Role
 }
 
 // holdsRole reports whether the actor holds everything def gives for each of types, under
-// condition until until, and if not, a permission it lacks. A permission to change grants on a
-// type gives a power there: to grant any role, or the listed ones. The actor must have as much, or
-// a grant could hand on more than it has: an unlimited one itself, or the power to grant each
-// listed role that can be granted there.
+// condition until until, and if not, a permission it lacks, and the constraint whose removal of it
+// refused it, if one did: a decision before it can have found one removing that permission on a
+// type this one doesn't need it for. A permission to change grants on a type gives a power there:
+// to grant any role, or the listed ones. The actor must have as much, or a grant could hand on more
+// than it has: an unlimited one itself, or the power to grant each listed role that can be granted
+// there.
 //
 // seen are the roles, with the types their grant reaches, already checked or being checked for
 // this grant. Each is checked once: the grant needs every check to pass, so checking one again,
@@ -1456,11 +1601,11 @@ func (a *Authorizer) mayGrant(au authority, pw power, scopeType string, def Role
 // listing each other would be checked along every order they can be reached in.
 func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string, condition string, until time.Time,
 	seen *checked,
-) (Permission, bool) {
+) (Permission, string, bool) {
 	typesKey := strings.Join(types, ",")
 	key := string(def.ID) + " " + typesKey + " " + until.UTC().Format(time.RFC3339Nano) + " " + condition
 	if seen.keys[key] {
-		return "", true
+		return "", "", true
 	}
 	seen.keys[key] = true
 	seen.order = append(seen.order, key)
@@ -1470,8 +1615,8 @@ func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string,
 		// Where the grant doesn't reach scopes of t, its t:grant changes no grants there: it is a
 		// permission like any other.
 		if verb != "grant" || !slices.Contains(types, t) {
-			if !au.holdsFor(p, types, typesKey, condition, until) {
-				return p, false
+			if by, ok := au.holdsFor(p, types, typesKey, condition, until); !ok {
+				return p, by, false
 			}
 			continue
 		}
@@ -1480,26 +1625,26 @@ func (a *Authorizer) holdsRole(au authority, def RoleDefinition, types []string,
 		pw := au.under(t, condition, until)
 		if len(def.GrantableRoles) == 0 {
 			if !pw.any {
-				return p, false
+				return p, pw.removedBy, false
 			}
 			continue
 		}
 		for _, id := range def.GrantableRoles {
 			listed, known := au.named(id)
 			if !known {
-				return p, false
+				return p, "", false
 			}
 			// Its holders can't grant a role on a scope that can't take it.
 			if !a.grantableOn(listed, t) {
 				continue
 			}
 			// Its holders may grant it under the grant's condition, or with any if it has none.
-			if missing, ok := a.mayGrant(au, pw, t, listed, condition, until, seen); !ok {
-				return missing, false
+			if missing, by, ok := a.mayGrant(au, pw, t, listed, condition, until, seen); !ok {
+				return missing, by, false
 			}
 		}
 	}
-	return "", true
+	return "", "", true
 }
 
 // checkingRole runs as holdsRole begins checking a role it hasn't for a decision, as a test counts
@@ -1539,10 +1684,11 @@ type grantAsked struct {
 }
 
 // grantDecided is what mayGrant decided of a grantAsked: whether the actor may grant it, and if
-// not, a permission it lacks.
+// not, a permission it lacks, and the constraint whose removal of it refused it, if one did.
 type grantDecided struct {
 	lacks Permission
 	ok    bool
+	by    string
 }
 
 // mayChangeBy checks the actor's own access on the scope against the change, by au, its authority
@@ -1563,32 +1709,10 @@ func (a *Authorizer) mayChangeBy(au authority, on Resource, grants, revokes []Bi
 			errs = append(errs, &DeniedError{Permission: manage, Scope: scope, Reason: fmt.Sprintf("the actor may not revoke %s here", b.Role)})
 		}
 	}
-	// A role is decided once for each condition and end the actor's grants tell apart, by what it
-	// lacks then, if anything, or a change granting it to many would walk what it lists for each;
-	// and what a grant allowed proved holds for the others, as Grantable keeps it: a refused one's
-	// checks are dropped, as some passed only while it was in progress.
-	decisions, proven := map[grantAsked]grantDecided{}, au.proven
-	if proven == nil {
-		proven = newChecked()
-	}
-	for _, b := range grants {
-		def, known := au.roles.role(b.Role)
-		if !known || !a.grantableOn(def, scope.Type) {
-			// validate reports it as invalid rather than as an escalation.
-			continue
-		}
-		condition, until := au.decidedAs(b.Condition.Expression, b.ExpiresAt)
-		k := grantAsked{role: b.Role, condition: condition, until: until}
-		d, decided := decisions[k]
-		if !decided {
-			mark := proven.mark()
-			if d.lacks, d.ok = a.mayGrant(au, pw, scope.Type, def, condition, until, proven); !d.ok {
-				proven.drop(mark)
-			}
-			decisions[k] = d
-		}
+	for i, d := range a.grantsDecided(au, pw, scope.Type, grants) {
 		if p := d.lacks; !d.ok {
-			reason := cs.refusal("grant "+string(b.Role), p, fmt.Sprintf("the actor can't grant %s without holding %s here", b.Role, p))
+			b := grants[i]
+			reason := refusalBy(d.by, "grant "+string(b.Role), p, fmt.Sprintf("the actor can't grant %s without holding %s here", b.Role, p))
 			switch {
 			case !pw.any && len(pw.listed[b.Role]) > 0:
 				reason = fmt.Sprintf("the actor may grant %s here only under the condition of a grant that lists it", b.Role)
@@ -1602,6 +1726,40 @@ func (a *Authorizer) mayChangeBy(au authority, on Resource, grants, revokes []Bi
 		return err
 	}
 	return errors.Join(errs...)
+}
+
+// grantsDecided is what mayGrant decides of each of grants on a scope of a type, by au, the actor's
+// authority there, and pw, its power there; one of a role it doesn't know, or that can't be granted
+// there, it doesn't refuse, as validate reports it as invalid rather than as an escalation. A role
+// is decided once for each condition and end the actor's grants tell apart (decidedAs), by what it
+// lacks then, if anything, or a change granting it to many would walk what it lists for each; and
+// what a grant allowed proved holds for the others, as Grantable keeps it: a refused one's checks
+// are dropped, as some passed only while it was in progress.
+func (a *Authorizer) grantsDecided(au authority, pw power, scopeType string, grants []Binding) []grantDecided {
+	decided := make([]grantDecided, len(grants))
+	decisions, proven := map[grantAsked]grantDecided{}, au.proven
+	if proven == nil {
+		proven = newChecked()
+	}
+	for i, b := range grants {
+		decided[i].ok = true
+		def, known := au.roles.role(b.Role)
+		if !known || !a.grantableOn(def, scopeType) {
+			continue
+		}
+		condition, until := au.decidedAs(b.Condition.Expression, b.ExpiresAt)
+		k := grantAsked{role: b.Role, condition: condition, until: until}
+		d, ok := decisions[k]
+		if !ok {
+			mark := proven.mark()
+			if d.lacks, d.by, d.ok = a.mayGrant(au, pw, scopeType, def, condition, until, proven); !d.ok {
+				proven.drop(mark)
+			}
+			decisions[k] = d
+		}
+		decided[i] = d
+	}
+	return decided
 }
 
 // Grantable lists the roles the subject may grant on r, unconditionally and for good, built-in
@@ -1640,7 +1798,7 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) (_ []
 	if cs.removes(GrantPermission(r.Type), r.Type) {
 		return nil, cs.failed()
 	}
-	au := a.authorityOf(ctx, s, r, held, ds, b)
+	au := a.authorityOf(ctx, s, r, held, ds, b, a.excludedBy(b, held))
 	custom := slices.SortedFunc(maps.Values(b.custom), func(x, y RoleDefinition) int { return strings.Compare(string(x.ID), string(y.ID)) })
 	au.constrained = cs
 	pw := au.over(r.Type)
@@ -1653,7 +1811,7 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) (_ []
 	proven := newChecked()
 	for _, def := range a.rolesIn(r.Type, custom) {
 		mark := proven.mark()
-		if _, ok := a.mayGrant(au, pw, r.Type, def, "", time.Time{}, proven); ok {
+		if _, _, ok := a.mayGrant(au, pw, r.Type, def, "", time.Time{}, proven); ok {
 			roles = append(roles, def)
 		} else {
 			proven.drop(mark)
