@@ -815,17 +815,25 @@ func typing(attrs Attributes) (*cel.Env, error) {
 }
 
 // deepCopy is a copy of v whose maps, slices, arrays, pointers and structs' exported fields are its
-// own, however deep, a protobuf message among them copied field by field, as cloning it would, and
-// a value reached twice copied once, a message too, so a cycle ends. A struct's fields an
+// own, to maxCopied deep, past which it holds their zero values, a protobuf message among them
+// copied field by field, as cloning it would, and a value reached twice copied once, a message too,
+// so a cycle ends. A struct's fields an
 // unexported struct it embeds promotes are its own too, but its other unexported fields are shared,
 // a pointer it embeds unexported among them, and so the fields that one promotes: reflection can't
 // set them. A map's keys are shared too, and what a pointer among them reaches: a copied key would
 // be another key, so the copy would find nothing under the one the host passed.
 func deepCopy[T any](v T) T {
 	out := reflect.ValueOf(&v).Elem()
-	out.Set(copier{}.copy(out))
+	out.Set(copier{}.copy(out, 0))
 	return v
 }
+
+// maxCopied is how deep deepCopy copies a value, past which the copy holds the zero value, or the
+// copy of one it copied less deep: copying recurses as deep as the value nests, and a list nested
+// three million deep overflowed the stack, which no recover catches, ending the process wherever a
+// hook was asked about it. No condition reads what lies deeper (maxNested), and sharing it would let
+// a hook write to what the host holds less deep too.
+const maxCopied = 2 * maxNested
 
 // copier copies values for deepCopy, keeping each map, slice and pointer it copied by where it
 // points, its length and its type.
@@ -850,14 +858,25 @@ func copiedKeyOf(v reflect.Value) (copiedKey, bool) {
 	}
 }
 
-func (c copier) copy(v reflect.Value) reflect.Value {
+// copy is a copy of v, which is depth deep, or past maxCopied deep its zero value, not kept, so a
+// copy reaching it less deep copies it.
+func (c copier) copy(v reflect.Value, depth int) reflect.Value {
+	if v.Kind() != reflect.Interface {
+		if depth >= maxCopied {
+			if k, ok := copiedKeyOf(v); ok && c[k].IsValid() {
+				return c[k]
+			}
+			return reflect.Zero(v.Type())
+		}
+		depth++
+	}
 	switch v.Kind() {
 	case reflect.Interface:
 		if unreachable(v) {
 			return v
 		}
 		out := reflect.New(v.Type()).Elem()
-		out.Set(c.copy(v.Elem()))
+		out.Set(c.copy(v.Elem(), depth))
 		return out
 	case reflect.Map:
 		if v.IsNil() {
@@ -870,7 +889,7 @@ func (c copier) copy(v reflect.Value) reflect.Value {
 		out := reflect.MakeMapWithSize(v.Type(), v.Len())
 		c[k] = out
 		for it := v.MapRange(); it.Next(); {
-			out.SetMapIndex(it.Key(), c.copy(it.Value()))
+			out.SetMapIndex(it.Key(), c.copy(it.Value(), depth))
 		}
 		return out
 	case reflect.Slice:
@@ -890,19 +909,19 @@ func (c copier) copy(v reflect.Value) reflect.Value {
 		}
 		for i := range v.Len() {
 			if e := v.Index(i); !unreachable(e) {
-				out.Index(i).Set(c.copy(e))
+				out.Index(i).Set(c.copy(e, depth))
 			}
 		}
 		return out
 	case reflect.Struct:
 		out := reflect.New(v.Type()).Elem()
 		out.Set(v)
-		c.fields(out, v)
+		c.fields(out, v, depth)
 		return out
 	case reflect.Array:
 		out := reflect.New(v.Type()).Elem()
 		for i := range v.Len() {
-			out.Index(i).Set(c.copy(v.Index(i)))
+			out.Index(i).Set(c.copy(v.Index(i), depth))
 		}
 		return out
 	case reflect.Pointer:
@@ -914,11 +933,11 @@ func (c copier) copy(v reflect.Value) reflect.Value {
 			return done
 		}
 		if m, ok := v.Interface().(proto.Message); ok && itself(m) {
-			return reflect.ValueOf(c.message(m.ProtoReflect()).Interface())
+			return reflect.ValueOf(c.message(m.ProtoReflect(), depth).Interface())
 		}
 		out := reflect.New(v.Type().Elem())
 		c[k] = out
-		out.Elem().Set(c.copy(v.Elem()))
+		out.Elem().Set(c.copy(v.Elem(), depth))
 		return out
 	default:
 		return v
@@ -930,11 +949,20 @@ func (c copier) copy(v reflect.Value) reflect.Value {
 // of whose fields holds it, recursed until the stack overflowed, which no recover catches, and one
 // reaching another twice copied it for each path to it. A nil message, as a list may hold, is copied
 // as a new one each time, as cloning copies it: each is the same nil, but none is another's.
-func (c copier) message(m protoreflect.Message) protoreflect.Message {
+func (c copier) message(m protoreflect.Message, depth int) protoreflect.Message {
 	if !m.IsValid() {
 		return m.New()
 	}
 	k, keyed := copiedKeyOf(reflect.ValueOf(m.Interface()))
+	if depth >= maxCopied {
+		if done, ok := c[k]; keyed && ok {
+			if d, ok := done.Interface().(proto.Message); ok {
+				return d.ProtoReflect()
+			}
+		}
+		return m.New()
+	}
+	depth++
 	if done, ok := c[k]; keyed && ok {
 		if d, ok := done.Interface().(proto.Message); ok {
 			return d.ProtoReflect()
@@ -949,16 +977,16 @@ func (c copier) message(m protoreflect.Message) protoreflect.Message {
 		case fd.IsList():
 			from, to := v.List(), out.Mutable(fd).List()
 			for i := range from.Len() {
-				to.Append(c.field(fd, from.Get(i)))
+				to.Append(c.field(fd, from.Get(i), depth))
 			}
 		case fd.IsMap():
 			to := out.Mutable(fd).Map()
 			v.Map().Range(func(key protoreflect.MapKey, v protoreflect.Value) bool {
-				to.Set(key, c.field(fd.MapValue(), v))
+				to.Set(key, c.field(fd.MapValue(), v, depth))
 				return true
 			})
 		default:
-			out.Set(fd, c.field(fd, v))
+			out.Set(fd, c.field(fd, v, depth))
 		}
 		return true
 	})
@@ -970,10 +998,10 @@ func (c copier) message(m protoreflect.Message) protoreflect.Message {
 
 // field is a copy of v, a value of a field fd describes or of one of its elements: a message as
 // message copies it, bytes as bytes of its own, and the rest as it is, which nothing writes to.
-func (c copier) field(fd protoreflect.FieldDescriptor, v protoreflect.Value) protoreflect.Value {
+func (c copier) field(fd protoreflect.FieldDescriptor, v protoreflect.Value, depth int) protoreflect.Value {
 	switch fd.Kind() {
 	case protoreflect.MessageKind, protoreflect.GroupKind:
-		return protoreflect.ValueOfMessage(c.message(v.Message()))
+		return protoreflect.ValueOfMessage(c.message(v.Message(), depth))
 	case protoreflect.BytesKind:
 		return protoreflect.ValueOfBytes(slices.Clone(v.Bytes()))
 	default:
@@ -996,13 +1024,13 @@ func itself(m proto.Message) (ok bool) {
 // fields copies into out, a copy of the struct v, the fields a hook can write to: its exported
 // ones, and those an unexported struct it embeds promotes, which reflection sets as the language
 // does. Its other unexported fields a hook reaches only through the type's methods.
-func (c copier) fields(out, v reflect.Value) {
+func (c copier) fields(out, v reflect.Value, depth int) {
 	for i := range v.NumField() {
 		switch f := out.Field(i); {
 		case f.CanSet():
-			f.Set(c.copy(v.Field(i)))
+			f.Set(c.copy(v.Field(i), depth))
 		case v.Type().Field(i).Anonymous && f.Kind() == reflect.Struct:
-			c.fields(f, v.Field(i))
+			c.fields(f, v.Field(i), depth)
 		}
 	}
 }

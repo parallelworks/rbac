@@ -523,17 +523,18 @@ type Constraint struct {
 
 // ConstraintInput is what a constraint is asked about. Searches ask once for every resource of a
 // type, and Holders first once for every holder: where Resource or Subject is nil, answer true if
-// the constraint removes the permission for any, so that a search never keeps what a check
-// refuses. Holders then asks again about each identity it lists, which it marks MaybeDenied where
-// the constraint answers true. Each constraint is given copies of its own of the subject and the
-// resource, their attributes, ancestors and label too, however deep, so one writing to them
-// changes nothing decided: a protobuf message among them copied by its fields, each message it
-// reaches once, so one holding itself is given as a copy holding itself, as a map holding itself
-// is. A host's struct among the attributes is copied by its exported fields and those an unexported
-// struct it embeds promotes: the rest, a pointer it embeds unexported and the fields that promotes
-// among them, reflection can't set, so they are shared. A map's keys are shared, and what a pointer
-// among them reaches, as a copied key would be another key: key a map among the attributes by
-// values, not pointers, or write through none.
+// the constraint removes the permission for any, so that a search never keeps what a check refuses.
+// Holders then asks again about each identity it lists, which it marks MaybeDenied where the
+// constraint answers true. Each constraint is given copies of its own of the subject and the
+// resource, their attributes, ancestors and label too, so one writing to them changes nothing
+// decided: a protobuf message among them copied by its fields, each message it reaches once, so one
+// holding itself is given as a copy holding itself, as a map holding itself is. Past 20,000 deep,
+// twice as deep as any condition reads, a copy holds zero values, but for what it copied less deep,
+// as copying deeper would overflow the stack. A host's struct among the attributes is copied by its
+// exported fields and those an unexported struct it embeds promotes: the rest, a pointer it embeds
+// unexported and the fields that promotes among them, reflection can't set, so they are shared. A
+// map's keys are shared, and what a pointer among them reaches, as a copied key would be another
+// key: key a map among the attributes by values, not pointers, or write through none.
 type ConstraintInput struct {
 	Tenant       string
 	ResourceType string

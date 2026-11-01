@@ -12,6 +12,7 @@ import (
 	"maps"
 	mathrand "math/rand/v2"
 	"os"
+	"os/exec"
 	"reflect"
 	"regexp"
 	"runtime"
@@ -2512,6 +2513,64 @@ func TestAHookIsAskedAboutAMessageHoldingItself(t *testing.T) {
 	}
 	if !asked["constraint"] || !asked["ValidateGrant"] {
 		t.Errorf("asked %v", asked)
+	}
+}
+
+// A hook is given copies of what the host passes, which copying recursed into as deep as it nests: a
+// list nested three million deep overflowed the stack, which no recover catches, ending the process
+// wherever a hook was asked about it, though no condition reads it past 10,000 deep. A copy is its
+// own twice as deep as any condition reads, and holds nothing of the host's deeper. It runs in a
+// child process, on a smaller stack, which copying a list or a message nested a hundred thousand
+// deep overflowed.
+func TestAHookIsAskedAboutAValueNestedDeep(t *testing.T) {
+	if os.Getenv("RBAC_HOOK_VALUE_NESTED_DEEP") != "" {
+		debug.SetMaxStack(32 << 20)
+		var listed any = "x"
+		var levels []any
+		for range 100_000 {
+			listed = []any{listed}
+			levels = append(levels, listed)
+		}
+		message := structpb.NewStringValue("x")
+		for range 100_000 {
+			message = structpb.NewListValue(&structpb.ListValue{Values: []*structpb.Value{message}})
+		}
+		copied := rbac.DeepCopy(map[string]any{"listed": listed, "message": message})
+		// Twice as deep as a condition reads, its own, and deeper, nothing of the host's.
+		held := map[*any]int{}
+		for i, l := range levels {
+			if l, ok := l.([]any); ok {
+				held[&l[0]] = len(levels) - i
+			}
+		}
+		at, depth := copied["listed"], 0
+		for l, _ := at.([]any); len(l) > 0; l, _ = at.([]any) {
+			if deep, ok := held[&l[0]]; ok {
+				t.Fatalf("a list %d deep was shared", deep)
+			}
+			at, depth = l[0], depth+1
+		}
+		if l, ok := at.([]any); !ok || l != nil || depth < 15_000 {
+			t.Errorf("the copy of a list nested deep ends %d deep in %#v", depth, at)
+		}
+		reached, _ := copied["message"].(*structpb.Value)
+		for v := reached; v != nil; v = v.GetListValue().GetValues()[0] {
+			if v == message {
+				t.Fatal("a message nested deep was shared")
+			}
+			if reached = v; len(v.GetListValue().GetValues()) == 0 {
+				break
+			}
+		}
+		if reached == nil || reached.GetKind() != nil {
+			t.Errorf("the copy of a message nested deep ends in %v", reached)
+		}
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestAHookIsAskedAboutAValueNestedDeep$")
+	cmd.Env = append(os.Environ(), "RBAC_HOOK_VALUE_NESTED_DEEP=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Errorf("%v\n%.2000s", err, out)
 	}
 }
 
