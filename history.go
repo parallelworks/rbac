@@ -506,9 +506,12 @@ type Cursor struct {
 	// start: a prune of an earlier one had ended by then, and the export read none of what it
 	// deleted. History refuses the cursor where a prune of a transaction from it on deleted a record
 	// after the cursor: by where it stands alone, a cursor of an export begun before a prune can't
-	// be told from one of an export begun after it. Keep it with the cursor: without it, as in one
-	// kept from before it was added, History counts every prune recorded after the cursor, and
-	// refuses an export that began after the prune too.
+	// be told from one of an export begun after it. Keep it with the cursor as History returns it,
+	// and never set it, or give one export's cursor another's: a later one would hide from History a
+	// prune since the export began, so a checkpoint's signature covers it. Without it, as in a
+	// cursor kept from before it was added, History counts every prune recorded after the cursor,
+	// and refuses one of an export that began after the prune too, as PruneHistory does given it as
+	// through: export again from the start.
 	Horizon uint64
 }
 

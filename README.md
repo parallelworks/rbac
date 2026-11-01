@@ -466,17 +466,17 @@ past what the prune deleted, so where several exports read history, `through` is
 one furthest behind. An export that began after the prune, as one from the start after a refusal
 or a failover, reads history as the prune left it and isn't refused for it. Where a cursor stands
 can't tell the two apart; `Cursor.Horizon`, the oldest transaction running as its export began,
-does, so keep it with the cursor and each checkpoint, though their signatures don't cover it. A
-cursor without it, as one kept from an earlier release, is refused for any prune recorded after it
-that deleted a record after it, and its export starts again from the start. While a transaction
-that took its id before a prune is still running, a read from the start reads nothing, as its
-export would count the prune as one since it began. Run it on a connection of the administrator's
-role below, which has the rights of history's owner, as the application's hasn't, and keep what
-the host's audit retention requires: the federal floor is at least a year. A delete from history
-that no prune its transaction records reaches, as one by hand, is refused as the transaction
-commits, so no delete through history's triggers leaves an export reading on past what it
-removed; disabling them takes a role with the rights of history's owner, which the signed chain is
-kept against.
+does, so keep it with the cursor and each checkpoint, whose signature covers it, and never set it: a
+later one would hide a prune since the export began. A cursor without it, as one kept from an
+earlier release, is refused for any prune recorded after it that deleted a record after it, and its
+export starts again from the start. While a transaction that took its id before a prune is still
+running, a read from the start reads nothing, as its export would count the prune as one since it
+began. Run it on a connection of the administrator's role below, which has the rights of history's
+owner, as the application's hasn't, and keep what the host's audit retention requires: the federal
+floor is at least a year. A delete from history that no prune its transaction records reaches, as
+one by hand, is refused as the transaction commits, so no delete through history's triggers leaves
+an export reading on past what it removed; disabling them takes a role with the rights of history's
+owner, which the signed chain is kept against.
 
 A role that owns a table can change it whatever its triggers say, and a schema's owner can drop
 any table in it. So that the application's database role can't rewrite history or write around

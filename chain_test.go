@@ -12,6 +12,7 @@ import (
 	"errors"
 	"io"
 	"maps"
+	"math"
 	"math/big"
 	"reflect"
 	"slices"
@@ -273,7 +274,7 @@ func TestAChainedRecordIsEveryField(t *testing.T) {
 }
 
 // The chain's encoding is fixed, so a checkpoint made with one Go, and verified with another or
-// in another language, holds.
+// in another language, holds. A checkpoint without a Horizon is signed as before Cursor had one.
 func TestTheChainsEncodingIsFixed(t *testing.T) {
 	c := rbac.Genesis("g")
 	genesis := hex.EncodeToString(c.Hash[:])
@@ -283,14 +284,77 @@ func TestTheChainsEncodingIsFixed(t *testing.T) {
 	}
 	c.At = time.Date(2026, 1, 2, 4, 0, 0, 0, time.UTC)
 	digest := c.Digest()
-	got := map[string]string{"genesis": genesis, "link": hex.EncodeToString(c.Hash[:]), "digest": hex.EncodeToString(digest[:])}
+	c.Cursor.Horizon = 3
+	horizon := c.Digest()
+	got := map[string]string{
+		"genesis": genesis, "link": hex.EncodeToString(c.Hash[:]), "digest": hex.EncodeToString(digest[:]),
+		"horizon": hex.EncodeToString(horizon[:]),
+	}
 	want := map[string]string{
 		"genesis": "928df9c16fcd6389159e046198b064eedcc7a780dfe164845c5fd47663f081ac",
 		"link":    "4079403bdbf717782762c3391d6a334dcc6f2fbda933e8ae01ffc57e7c16d31e",
 		"digest":  "7dab694ab96cc22d6be1a0dab37af4f06c9cb1931c533e0843ad365ff0a89b8b",
+		"horizon": "c4965b59b9651be1ddd59a15d7b4eb88949af51668d163ee1eeb6f6fc0cb2ce2",
 	}
 	if !maps.Equal(got, want) {
 		t.Errorf("%v, not %v", got, want)
+	}
+}
+
+// A checkpoint's Horizon tells History which prunes to refuse its cursor for: one moved past a
+// prune that deleted records the export hadn't read would read on past them, and Export sign a
+// chain without them. So the signature covers it, and VerifyChain refuses a checkpoint whose
+// Horizon isn't that of the one it goes on from, which Export signed from a checkpoint it was given.
+func TestACheckpointVouchesForItsHorizon(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	through := interleaved(t, h)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An export that has read the first record, behind what a prune through the end deletes.
+	var behind rbac.Checkpoint
+	for deadline := time.Now().Add(10 * time.Second); behind.Count == 0; {
+		_, next, err := h.authz.Export(ctx, rbac.Checkpoint{}, 1, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if next.Count == 0 && time.Now().After(deadline) {
+			t.Fatal("read 0 records")
+		}
+		behind = next
+	}
+	if behind.Cursor.Horizon == 0 {
+		t.Fatalf("an export from the start has no Horizon: %+v", behind.Cursor)
+	}
+	if n, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h), through); err != nil || n != 4 {
+		t.Fatalf("PruneHistory = %d, %v", n, err)
+	}
+	if _, _, err := h.authz.Export(ctx, behind, 10, key); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("Export from before what a prune deleted: %v", err)
+	}
+	moved := behind
+	moved.Cursor.Horizon = math.MaxUint64
+	for _, horizon := range []uint64{0, behind.Cursor.Horizon + 1, math.MaxUint64} {
+		c := behind
+		c.Cursor.Horizon = horizon
+		if err := c.Verify(key.Public()); !errors.Is(err, rbac.ErrUnverified) {
+			t.Errorf("a checkpoint whose Horizon was moved to %d: %v", horizon, err)
+		}
+	}
+	var records []rbac.Record
+	var next rbac.Checkpoint
+	for deadline := time.Now().Add(10 * time.Second); len(records) == 0; {
+		if records, next, err = h.authz.Export(ctx, moved, 10, key); err != nil {
+			t.Fatalf("Export from a checkpoint whose Horizon was moved: %v", err)
+		}
+		if len(records) == 0 && time.Now().After(deadline) {
+			t.Fatal("read 0 records")
+		}
+	}
+	if err := rbac.VerifyChain(behind, records, next, key.Public()); !errors.Is(err, rbac.ErrUnverified) {
+		t.Errorf("records exported past what a prune deleted, from a checkpoint whose Horizon was moved: %v", err)
 	}
 }
 
