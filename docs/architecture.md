@@ -640,7 +640,8 @@ dimension's values as permissions, `dimension:value`, which roles for the tenant
 on it, and a labeled resource is allowed only to a subject whose values satisfy its label. A custom
 role stored for another type too, as one defined before its dimension was declared can be, is read
 as giving none of them (`current`), privileged and public as the whole role is, so no grant below
-the tenant gives one, and a check of a value and `Permissions` decide it by the same grants.
+the tenant gives one, its grants count toward no exclusive dimension, and a check of a value and
+`Permissions` decide it by the same grants.
 
 ```mermaid
 flowchart TB

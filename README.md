@@ -152,7 +152,8 @@ scopes conditional ones reach, to check one by one.
   holds a dimension's values as permissions, `dimension:value`, which roles for the tenant alone
   give, so groups, eligibilities, expiry, conditions, denies on the tenant and history all apply to
   them. A custom role stored for another type too, as one defined before its dimension was declared
-  can be, gives none of them, only the rest, and is as privileged as though it did.
+  can be, gives none of them, only the rest, so its grants count toward no exclusive dimension, and
+  is as privileged as though it did.
   Every check decides them, and the powers to release, on the tenant with no attributes or label,
   whatever tenant it is passed, as a check of a labeled resource reads them,
   and a change hands one on only as the actor holds it there: a condition of theirs can't read the
