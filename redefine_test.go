@@ -107,9 +107,11 @@ func sortedStrings[T ~string](xs []T) []string {
 // is asked about each one whose access, as checks read it, grows, and its scope's denies are
 // checked, and about no other but where the role gives more to whomever it is granted. A deny
 // also stops a redefinition where a grant giving nothing through its principal, as one to the
-// tenant's members of a privileged role, would give more once a catalog change, or the host
-// declaring its kind, has it give what the role gives, which asks no one. What a grant gives is
-// read by checks of the grant alone in a tenant of its own, before and after.
+// tenant's members of a privileged role, would give more once a catalog change that has the role
+// no longer be privileged, or the host declaring its kind, has it give what the role gives, which
+// asks no one; and a scope the host no longer has is read as stored only where no grant there
+// gains, nor would so. What a grant gives is read by checks of the grant alone in a tenant of its
+// own, before and after, and again by a host that made both changes.
 func TestRedefinitionsAskAboutAndCheckTheDeniesOfWhatGrantsGain(t *testing.T) {
 	everything := rbac.RoleDefinition{
 		ID:            "everything",
@@ -117,6 +119,7 @@ func TestRedefinitionsAskAboutAndCheckTheDeniesOfWhatGrantsGain(t *testing.T) {
 		ResourceTypes: []string{"cluster", "workspace", rbac.TenantScope}, Privileged: true,
 	}
 	var asked []rbac.GrantInput
+	gone := map[rbac.Scope]bool{}
 	h, guardian := guarded(t, func(c *rbac.Config) {
 		c.Labels = []rbac.LabelDimension{{Name: "level", Rule: rbac.Ordered, Values: []string{"low", "high"}}}
 		c.PrincipalKinds = []rbac.PrincipalKind{"agent"}
@@ -129,6 +132,13 @@ func TestRedefinitionsAskAboutAndCheckTheDeniesOfWhatGrantsGain(t *testing.T) {
 			}
 			return nil
 		}
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if gone[s] {
+				return rbac.Resource{}, fmt.Errorf("%w: %s", rbac.ErrNotFound, s.Key())
+			}
+			return resourceOf(ctx, tenant, s)
+		}
 	})
 	ctx := t.Context()
 	tenant := rbac.TenantRoot("t1")
@@ -138,17 +148,31 @@ func TestRedefinitionsAskAboutAndCheckTheDeniesOfWhatGrantsGain(t *testing.T) {
 	h.groups(t, "g0", "g1")
 	// Each grant is read alone in o, by a subject it is to: a member of each group, so that a
 	// grant to a group with no members in t1 is read for whom it gives once the group has them, and
-	// pu for one to a principal no check reads it for, as if it were an identity's.
+	// r1 for one to a kind the host hasn't declared, once it has.
 	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES
-		('o', 'user', 'u1'), ('o', 'user', 'u2'), ('o', 'user', 'm0'), ('o', 'user', 'm1'), ('o', 'user', 'mm'), ('o', 'user', 'pu'), ('o', 'agent', 'a1');
+		('o', 'user', 'u1'), ('o', 'user', 'u2'), ('o', 'user', 'm0'), ('o', 'user', 'm1'), ('o', 'user', 'mm'), ('o', 'user', 'pu'), ('o', 'agent', 'a1'),
+		('o', 'robot', 'r1');
 		INSERT INTO rbac_groups (tenant, id) VALUES ('o', 'g0'), ('o', 'g1');
 		INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('o', 'g0', 'user', 'm0'), ('o', 'g1', 'user', 'm1')`); err != nil {
 		t.Fatal(err)
 	}
-	subjectOf := func(p rbac.Principal) (rbac.Subject, bool) {
+	// later is the host once a catalog change has every custom role no longer be privileged, as a
+	// role that isn't gives each permission on each type, and it declares robot.
+	cfg := h.cfg
+	cfg.Catalog = append(slices.Clone(cfg.Catalog), rbac.RoleDefinition{
+		ID: "open", Permissions: []rbac.Permission{view, login, root, "workspace:view", "tenant:view"}, ResourceTypes: []string{"cluster", "workspace", rbac.TenantScope},
+	})
+	cfg.PrincipalKinds = append(slices.Clone(cfg.PrincipalKinds), "robot")
+	later, err := rbac.New(h.pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subjectOf := func(az *rbac.Authorizer, p rbac.Principal) (rbac.Subject, bool) {
 		switch p.Kind {
 		case rbac.User, "agent":
 			return rbac.Subject{Principal: p}, true
+		case "robot":
+			return rbac.Subject{Principal: p}, az == later
 		case rbac.Group:
 			return rbac.Subject{Principal: rbac.Principal{Kind: rbac.User, ID: "m" + strings.TrimPrefix(p.ID, "g")}}, true
 		case rbac.Members:
@@ -218,16 +242,10 @@ func TestRedefinitionsAskAboutAndCheckTheDeniesOfWhatGrantsGain(t *testing.T) {
 		return id
 	}
 	// gives is what g, alone in o, gives through its principal with the role defined as def, as
-	// "resource permission" pairs; revived, what it gives once a change that asks no one has it
-	// give what the role gives: a catalog change one to the tenant's members of a privileged role,
-	// and the host declaring its kind one to a principal no check reads it for, read as pu's. One to
-	// the public gives more only once a redefinition makes the role Public, which checks it then.
-	gives := func(def rbac.RoleDefinition, g storedGrant, revived bool) map[string]bool {
+	// "resource permission" pairs, as az checks it.
+	gives := func(az *rbac.Authorizer, def rbac.RoleDefinition, g storedGrant) map[string]bool {
 		t.Helper()
-		if _, known := subjectOf(g.principal); revived && (g.principal.Kind == rbac.Members || !known) {
-			g.principal = rbac.Principal{Kind: rbac.User, ID: "pu"}
-		}
-		s, ok := subjectOf(g.principal)
+		s, ok := subjectOf(az, g.principal)
 		if !ok {
 			return nil
 		}
@@ -239,7 +257,7 @@ func TestRedefinitionsAskAboutAndCheckTheDeniesOfWhatGrantsGain(t *testing.T) {
 		store("o", def.ID, g)
 		got := map[string]bool{}
 		for _, r := range under(g.scope) {
-			ps, err := h.authz.Permissions(ctx, s, r)
+			ps, err := az.Permissions(ctx, s, r)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -357,7 +375,7 @@ func TestRedefinitionsAskAboutAndCheckTheDeniesOfWhatGrantsGain(t *testing.T) {
 		// public, gives more.
 		root := storedGrant{scope: tenant, principal: identity("pu")}
 		public := storedGrant{scope: tenant, principal: rbac.Principal{Kind: rbac.Public}}
-		more := grows(gives(was, root, false), gives(after, root, false)) || grows(gives(was, public, false), gives(after, public, false))
+		more := grows(gives(h.authz, was, root), gives(h.authz, after, root)) || grows(gives(h.authz, was, public), gives(h.authz, after, public))
 		isAsked := func(g storedGrant) bool {
 			return slices.ContainsFunc(asked, func(in rbac.GrantInput) bool {
 				if g.eligibility {
@@ -385,12 +403,16 @@ func TestRedefinitionsAskAboutAndCheckTheDeniesOfWhatGrantsGain(t *testing.T) {
 			if !inForce(g) {
 				continue
 			}
-			before, then := gives(was, g, false), gives(after, g, false)
-			asWas, asNow := gives(was, g, true), gives(after, g, true)
-			_, known := subjectOf(g.principal)
+			before, then := gives(h.authz, was, g), gives(h.authz, after, g)
+			// As the host reads it once it has made changes that ask no one: one to the tenant's
+			// members gives what the role gives, and one to robot what it gives an identity.
+			asWas, asNow := gives(later, was, g), gives(later, after, g)
+			_, known := subjectOf(h.authz, g.principal)
 			switch gained := grows(before, then); {
 			case gained && known && !isAsked(g):
 				t.Errorf("%s: %v gains %v but the host wasn't asked about it", describe, g, then)
+			case grows(asWas, asNow) && known && g.principal.Kind != rbac.Members && !isAsked(g):
+				t.Errorf("%s: %v gains %v once the catalog has the role no longer be privileged, but the host wasn't asked about it", describe, g, asNow)
 			case isAsked(g) && (len(then) == 0 && !reachesNothing(g) || !gained && !more):
 				t.Errorf("%s: asked about %v, which gives %v as it gave %v", describe, g, then, before)
 			}
@@ -409,9 +431,42 @@ func TestRedefinitionsAskAboutAndCheckTheDeniesOfWhatGrantsGain(t *testing.T) {
 			case gains[s] && !denied[s]:
 				t.Errorf("%s: a grant on %s gains, but a deny there doesn't stop it", describe, s.Key())
 			case dormant[s] && !denied[s]:
-				t.Errorf("%s: a grant on %s would gain once it gave what the role gives, but a deny there doesn't stop it", describe, s.Key())
+				t.Errorf("%s: a grant on %s gains once the catalog has the role no longer be privileged, or the host declares its kind, but a deny there doesn't stop it", describe, s.Key())
 			case denied[s] && !could[s]:
 				t.Errorf("%s: a deny on %s stops it, where no grant gains", describe, s.Key())
+			}
+		}
+		// With a deny elsewhere binding x, every scope is read: one the host no longer has fails the
+		// redefinition where a grant there gains, or would so, and where none could is read as stored.
+		var lost []rbac.Scope
+		for _, s := range scopes[:4] {
+			if rng.IntN(3) == 0 {
+				lost = append(lost, s)
+			}
+		}
+		if len(lost) > 0 {
+			writeRole("t1", was)
+			elsewhere := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "kz"}
+			if err := h.authz.SetDeny(ctx, guardian, elsewhere, rbac.Deny{ID: "elsewhere", Permissions: []rbac.Permission{view}, Principals: []rbac.Principal{x.Principal}}); err != nil {
+				t.Fatal(err)
+			}
+			for _, s := range lost {
+				gone[s] = true
+			}
+			err := h.authz.SetRole(ctx, x, "t1", now)
+			clear(gone)
+			if err := h.authz.DeleteDeny(ctx, guardian, elsewhere, "elsewhere"); err != nil {
+				t.Fatal(err)
+			}
+			switch {
+			case errors.Is(err, rbac.ErrNotFound):
+				if !slices.ContainsFunc(lost, func(s rbac.Scope) bool { return could[s] }) {
+					t.Errorf("%s: with %v gone, the redefinition fails with the host's error, where no grant there gains", describe, lost)
+				}
+			case err != nil:
+				t.Fatalf("%s: with %v gone: %v", describe, lost, err)
+			case slices.ContainsFunc(lost, func(s rbac.Scope) bool { return gains[s] || dormant[s] }):
+				t.Errorf("%s: with %v gone, a grant there gains, or would so, but the redefinition reads it as stored", describe, lost)
 			}
 		}
 		cleanup()
