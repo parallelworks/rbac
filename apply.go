@@ -1533,9 +1533,17 @@ func (au authority) heldFor(p Permission, types []string, typesKey, condition st
 		given = make([]lasting, len(types))
 		for i, rt := range types {
 			for _, g := range au.held {
-				if gives(au.roles, g, p, rt) && g.under(au.subjects, condition) {
-					given[i] = given[i].with(g)
+				if !gives(au.roles, g, p, rt) || !g.under(au.subjects, condition) {
+					continue
 				}
+				// One held for good lasts as long as any can, so the rest needn't be read.
+				if given[i] = given[i].with(g); given[i].until.IsZero() {
+					break
+				}
+			}
+			// Nor the types after one none give it for, which no end gets past.
+			if !given[i].held {
+				break
 			}
 		}
 		if au.given != nil {
