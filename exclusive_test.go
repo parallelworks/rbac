@@ -1250,11 +1250,11 @@ func TestAChangeReachingManyScopesReadsTheActorsRolesForExclusiveValuesOnce(t *t
 }
 
 // What a change's authorities on many scopes find its actor's grants could give two values of an
-// exclusive dimension of, decided once for all of them from the grants on the tenant, which every
-// path holds, is what each path's own grants give, in random tenants: grants of roles giving values,
-// conditional ones and those to its group, the tenant's members and the public among them, on the
-// tenant, and below it, written around the package, as a role stored for another type and redefined
-// for the tenant leaves its grants there.
+// exclusive dimension of, each role's permissions read once for all of them, is what each path's
+// own grants give, in random tenants: grants of roles giving values, conditional ones and those to
+// its group, the tenant's members and the public among them, on the tenant, and below it, written
+// around the package, as a role stored for another type and redefined for the tenant leaves its
+// grants there.
 func TestTheExclusiveValuesAChangesAuthoritiesShareAreThoseOfEachPath(t *testing.T) {
 	party := rbac.LabelDimension{Name: "party", Rule: rbac.AllOf, Values: []string{"x", "y"}, Exclusive: true}
 	h := setup(t, banks, func(c *rbac.Config) {

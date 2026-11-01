@@ -596,11 +596,9 @@ flowchart TB
 - **Exclusive values are checked when they change.** A change that would let anyone hold two
   values of an Exclusive dimension is refused, after its writes and under its locks. `Conflicts`
   lists anyone left able to, as a catalog change can leave them. Which values an actor holds none
-  of, and so can't hand on, a change reaching many scopes decides once for all of them
-  (`authorities`), from its grants on the tenant, which every path holds, reading each of its roles'
-  permissions once: a path's grants below the tenant add to it only where one is of a role giving
-  such a value, as a role stored for another type and redefined for the tenant leaves its grants
-  there. Where no dimension is exclusive, nothing is read.
+  of, and so can't hand on, a change reaching many scopes decides from each path's grants
+  (`authorities`), reading each of its roles' permissions once for all of them. Where no dimension
+  is exclusive, nothing is read.
 
 ## Transactions and locks
 

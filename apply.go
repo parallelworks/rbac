@@ -1211,28 +1211,24 @@ func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []
 	b = b.keepingSets()
 	// Every path holds the tenant's scope, so the read holds what the actor's values are decided by.
 	values := onTenant(tenant, held, ds, b)
-	// And what its grants could give two values of an exclusive dimension of, so that is decided
-	// once for every path, each role's permissions read once: a path's grants below the tenant add
-	// to it only where one is of a role giving such a value, as a role stored for another type and
-	// redefined for the tenant leaves its grants there.
+	// What its grants on each path could give two values of an exclusive dimension of reads each
+	// role's permissions once for every path: a role can give a thousand, and a change reach
+	// hundreds of scopes.
 	var of map[Role][]Permission
-	var excluded map[string]bool
 	if a.exclusive() {
 		of = a.exclusiveOf(b, held)
-		excluded = excludedOf(of, values.held)
 	}
-	tenantKey := TenantRoot(tenant).Key()
 	aus := make([]authority, len(on))
 	for i, r := range on {
 		heldOn := make([]holding, len(heldAt[i]))
 		for j, k := range heldAt[i] {
 			heldOn[j] = held[k]
 		}
-		excludedOn := excluded
-		if slices.ContainsFunc(heldOn, func(h holding) bool { return h.scope != tenantKey && len(of[h.Role]) > 0 }) {
-			excludedOn = excludedOf(of, heldOn)
+		var excluded map[string]bool
+		if of != nil {
+			excluded = excludedOf(of, heldOn)
 		}
-		aus[i] = a.authorityOf(ctx, actor, r, heldOn, deniedOn[i], b, excludedOn)
+		aus[i] = a.authorityOf(ctx, actor, r, heldOn, deniedOn[i], b, excluded)
 		aus[i].values = values
 		if len(a.cfg.Constraints) > 0 || len(deniedOn[i]) > 0 {
 			continue
