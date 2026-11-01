@@ -1838,7 +1838,9 @@ var unreadable = refusedAttributes{Mapper: types.NewStringInterfaceMap(types.Def
 // compares values of different types as unequal rather than fail, so otherwise a `!=` would hold
 // for it, and a deny's `==` would lift. A kind not declared is as passed. Either is a map of CEL's,
 // not the host's map: CEL reads a field of a map of the host's map by indexing it, and converts
-// only what it finds, as its own adapter does, so a value it holds would be read past c.
+// only what it finds, as its own adapter does, so a value it holds would be read past c. So a test
+// of an attribute's presence reads it, and fails where reading it fails, and a key a condition
+// indexes by is what c reads it as, which CEL indexes by where it fails for the Go value passed.
 func declared(c *converting, declares map[string]AttributeType, attributes map[string]any) any {
 	if len(attributes) == 0 {
 		return noAttributes
