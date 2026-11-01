@@ -473,6 +473,13 @@ func (w *frozenWorld) through(ctx context.Context, t *testing.T, tx pgx.Tx, a *r
 			var x row
 			return x, r.Scan(&x.scope, &x.principal, &x.role, &x.approvers)
 		})
+	// A grant or eligibility of a role the catalog doesn't have gives nothing, as checks read it.
+	catalog := map[string]bool{}
+	for _, r := range w.h.cfg.Catalog {
+		catalog[string(r.ID)] = true
+	}
+	givesNothing := func(r row) bool { return !catalog[r.role] }
+	grants, eligible = slices.DeleteFunc(grants, givesNothing), slices.DeleteFunc(eligible, givesNothing)
 	var principals []rbac.Principal
 	for _, u := range w.identities {
 		principals = append(principals, identity(u))
