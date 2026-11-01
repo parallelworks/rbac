@@ -681,22 +681,13 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 			}
 		}
 	}
-	// Without Config.ResourceOf the group is as stored, which isn't all of it where the host
-	// declares labels or resource attributes other than as none: revoking on it is refused then, as
-	// ChangeMembers refuses taking access away there, but only once the transaction finds anything
-	// granted there to revoke. Its label, unread, can refuse the actor too, unless the actor's label
-	// values satisfy every label, which the transaction reads again (cleared).
+	// Without Config.ResourceOf, which New requires where labels are declared, the group is as
+	// stored, which isn't all of it where the host declares resource attributes other than as none:
+	// revoking on it is refused then, as ChangeMembers refuses taking access away there, but only
+	// once the transaction finds anything granted there to revoke.
 	var partial error
-	cleared := false
-	if existed && a.cfg.ResourceOf == nil {
-		if !stops && len(a.labels) > 0 {
-			if cleared, err = a.clearsAll(ctx, a.db, labels, values); err != nil {
-				return err
-			}
-		}
-		if stops || len(a.labels) > 0 && !cleared {
-			partial = a.storedWhole(revoking.on.Scope())
-		}
+	if existed && a.cfg.ResourceOf == nil && stops {
+		partial = a.storedWhole(revoking.on.Scope())
 	}
 	if revoking.frozen && existed && partial == nil {
 		revoking.cs = a.constrain(ctx, actor, revoking.on)
@@ -749,11 +740,6 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 		if scoped {
 			if partial != nil {
 				return ChangeEvent{}, partial
-			}
-			if cleared {
-				if err := a.stillClearsAll(ctx, tx, labels, values); err != nil {
-					return ChangeEvent{}, err
-				}
 			}
 			revoking.seal()
 			_, _, au, err := a.reachAuthority(ctx, tx, actor, []*reachCheck{revoking})
