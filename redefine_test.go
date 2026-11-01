@@ -109,8 +109,9 @@ func sortedStrings[T ~string](xs []T) []string {
 // also stops a redefinition where a grant giving nothing through its principal, as one to the
 // tenant's members of a privileged role, would give more once a catalog change that has the role
 // no longer be privileged, or the host declaring its kind, has it give what the role gives, which
-// asks no one; and a scope the host no longer has is read as stored only where no grant there
-// gains, nor would so. What a grant gives is read by checks of the grant alone in a tenant of its
+// asks no one, or where the role gives more and a role listing it is granted, whose holders may
+// then grant it as it will be; and a scope the host no longer has is read as stored only where
+// none of these is so. What a grant gives is read by checks of the grant alone in a tenant of its
 // own, before and after, and again by a host that made both changes.
 func TestRedefinitionsAskAboutAndCheckTheDeniesOfWhatGrantsGain(t *testing.T) {
 	everything := rbac.RoleDefinition{
@@ -145,6 +146,7 @@ func TestRedefinitionsAskAboutAndCheckTheDeniesOfWhatGrantsGain(t *testing.T) {
 	h.seed(t, grant(tenant, "tenant.roles", rbac.User, "x"), grant(tenant, "everything", rbac.User, "x"),
 		grant(tenant, "level.low", rbac.User, "x"), grant(tenant, "level.high", rbac.User, "x"))
 	x := h.as(t, "x")
+	lh := h.as(t, "lh")
 	h.groups(t, "g0", "g1")
 	// Each grant is read alone in o, by a subject it is to: a member of each group, so that a
 	// grant to a group with no members in t1 is read for whom it gives once the group has them, and
@@ -307,8 +309,30 @@ func TestRedefinitionsAskAboutAndCheckTheDeniesOfWhatGrantsGain(t *testing.T) {
 		for i := range stored {
 			stored[i].id = store("t1", id, stored[i])
 		}
-		describe := fmt.Sprintf("seed %d: %v%v public %t to %v%v public %t, %v", seed, was.Permissions, was.ResourceTypes, was.Public, now.Permissions, now.ResourceTypes, now.Public, stored)
+		// Sometimes a role listing it is granted to lh, whose holders may grant it on clusters and
+		// workspaces without holding it.
+		lister := rbac.Role(fmt.Sprint("custom.l", seed))
+		var listedOn []rbac.Scope
+		if rng.IntN(3) == 0 {
+			listedOn = append(listedOn, scopes[rng.IntN(len(scopes))])
+			on := listedOn[0]
+			if on.Type == rbac.TenantScope {
+				on.ID = "t1"
+			}
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles) VALUES ('t1', $1, '{cluster:grant,workspace:grant}', '{cluster,workspace}', $2)`, lister, []string{string(id)}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', $1, $2, 'user', 'lh', $3)`, on.Type, on.ID, lister); err != nil {
+				t.Fatal(err)
+			}
+		}
+		describe := fmt.Sprintf("seed %d: %v%v public %t to %v%v public %t, %v, listed on %v", seed, was.Permissions, was.ResourceTypes, was.Public, now.Permissions, now.ResourceTypes, now.Public, stored, listedOn)
 		cleanup := func() {
+			for _, q := range []string{`DELETE FROM rbac_grants WHERE tenant = 't1' AND role = $1`, `DELETE FROM rbac_roles WHERE tenant = 't1' AND id = $1`} {
+				if _, err := h.pool.Exec(ctx, q, lister); err != nil {
+					t.Fatal(err)
+				}
+			}
 			for _, table := range []string{"rbac_grants", "rbac_eligibilities"} {
 				if _, err := h.pool.Exec(ctx, `DELETE FROM `+table+` WHERE tenant = 't1' AND role = $1`, id); err != nil {
 					t.Fatal(err)
@@ -426,8 +450,36 @@ func TestRedefinitionsAskAboutAndCheckTheDeniesOfWhatGrantsGain(t *testing.T) {
 				could[g.scope] = true
 			}
 		}
+		// Where it gives more, lh may grant it as it will be on what is under the scope the role
+		// listing it is granted on, which a deny there stops as it stops granting it there.
+		handsOn := map[rbac.Scope]bool{}
+		for _, s := range listedOn {
+			if !more {
+				continue
+			}
+			var on []rbac.Resource
+			switch s.Type {
+			case "cluster":
+				on = []rbac.Resource{{Tenant: "t1", Type: "cluster", ID: s.ID}}
+			case "workspace":
+				on = []rbac.Resource{{Tenant: "t1", Type: "workspace", ID: s.ID}, {Tenant: "t1", Type: "cluster", ID: "in-" + s.ID, Ancestors: []rbac.Scope{s}}}
+			default:
+				on = []rbac.Resource{{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}, {Tenant: "t1", Type: "cluster", ID: "kr"}, {Tenant: "t1", Type: "workspace", ID: "vr"}}
+			}
+			for _, r := range on {
+				roles, err := h.authz.Grantable(ctx, lh, r)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if slices.ContainsFunc(roles, func(d rbac.RoleDefinition) bool { return d.ID == id }) {
+					handsOn[s], could[s] = true, true
+				}
+			}
+		}
 		for s := range observed {
 			switch {
+			case handsOn[s] && !denied[s]:
+				t.Errorf("%s: a role listing it is granted on %s, whose holders may grant it there as it will be, but a deny there doesn't stop it", describe, s.Key())
 			case gains[s] && !denied[s]:
 				t.Errorf("%s: a grant on %s gains, but a deny there doesn't stop it", describe, s.Key())
 			case dormant[s] && !denied[s]:
@@ -465,8 +517,8 @@ func TestRedefinitionsAskAboutAndCheckTheDeniesOfWhatGrantsGain(t *testing.T) {
 				}
 			case err != nil:
 				t.Fatalf("%s: with %v gone: %v", describe, lost, err)
-			case slices.ContainsFunc(lost, func(s rbac.Scope) bool { return gains[s] || dormant[s] }):
-				t.Errorf("%s: with %v gone, a grant there gains, or would so, but the redefinition reads it as stored", describe, lost)
+			case slices.ContainsFunc(lost, func(s rbac.Scope) bool { return gains[s] || dormant[s] || handsOn[s] }):
+				t.Errorf("%s: with %v gone, a grant there gains, or would so, or a role listing it there hands it on, but the redefinition reads it as stored", describe, lost)
 			}
 		}
 		cleanup()
