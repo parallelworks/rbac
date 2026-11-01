@@ -40,8 +40,10 @@ type frozenWorld struct {
 // exemption or activation there, binds a principal to a deny there, or changes a place whose group,
 // or one it is in, holds one of these there that the principal holds through another place too, as
 // Apply revoking a grant held twice is refused; none it allows takes access away there, or gives a
-// grant, eligibility or approval. Checked against random worlds, each change made first without
-// the freeze, and rolled back, to see what it changes.
+// grant, eligibility or approval. The host's own writes, DeleteMembers and ImportMembers, make
+// every change it allows or refuses under the freeze, as none of them checks an actor. Checked
+// against random worlds, each change made first without the freeze, and rolled back, to see what it
+// changes.
 func TestAFreezeRefusesOnlyTheChangesToMembersThatChangeWhatGroupsGiveUnderIt(t *testing.T) {
 	for _, by := range []string{"constraint", "deny"} {
 		for seed := range uint64(3) {
@@ -81,6 +83,9 @@ func freezeDifferential(t *testing.T, by string, seed uint64) {
 			continue
 		}
 		taken := slices.Concat(d.lost, d.held, d.named)
+		if err := w.hostChange(t, by, add, remove); err != nil {
+			t.Errorf("%s: as the host's own writes under the freeze: %v", what, err)
+		}
 		err := w.frozenChange(t, by, add, remove)
 		switch {
 		case err == nil && len(taken)+len(d.granted) > 0:
@@ -535,9 +540,35 @@ func (w *frozenWorld) through(ctx context.Context, t *testing.T, tx pgx.Tx, a *r
 	return held, named
 }
 
-// frozenChange makes the change under the freeze, in a transaction it rolls back: a constraint
-// removing the power to change grants under the workspace, or a deny there removing the manager's.
+// frozenChange makes the change under the freeze, in a transaction it rolls back.
 func (w *frozenWorld) frozenChange(t *testing.T, by string, add, remove []rbac.Member) error {
+	t.Helper()
+	return w.underFreeze(t, by, func(ctx context.Context, a *rbac.Authorizer) error {
+		return a.ChangeMembers(ctx, w.manager, "t1", add, remove)
+	})
+}
+
+// hostChange makes the change as the host's own writes under the freeze, in a transaction it rolls
+// back: DeleteMembers removing what it removes, and then ImportMembers adding what it adds, as
+// ChangeMembers removes before it adds.
+func (w *frozenWorld) hostChange(t *testing.T, by string, add, remove []rbac.Member) error {
+	t.Helper()
+	return w.underFreeze(t, by, func(ctx context.Context, a *rbac.Authorizer) error {
+		if len(remove) > 0 {
+			if err := a.DeleteMembers(ctx, host, "t1", remove); err != nil {
+				return err
+			}
+		}
+		if len(add) > 0 {
+			return a.ImportMembers(ctx, host, "t1", add)
+		}
+		return nil
+	})
+}
+
+// underFreeze runs change in a transaction it rolls back, under the freeze: a constraint removing
+// the power to change grants under the workspace, or a deny there removing the manager's.
+func (w *frozenWorld) underFreeze(t *testing.T, by string, change func(context.Context, *rbac.Authorizer) error) error {
 	t.Helper()
 	h, ctx := w.h, t.Context()
 	tx, err := h.pool.Begin(ctx)
@@ -553,5 +584,5 @@ func (w *frozenWorld) frozenChange(t *testing.T, by string, add, remove []rbac.M
 	}
 	*w.frozen = true
 	defer func() { *w.frozen = false }()
-	return h.authz.WithTx(tx).ChangeMembers(ctx, w.manager, "t1", add, remove)
+	return change(ctx, h.authz.WithTx(tx))
 }
