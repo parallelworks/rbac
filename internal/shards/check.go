@@ -89,9 +89,9 @@ func readShard(fsys fs.FS, dir string) (shard, error) {
 	return s, err
 }
 
-// check is what is wrong with what the shards ran between them, and else a line saying what they
-// ran. A shard runs its top-level tests whole, subtests and all, so each subtest runs once where its
-// top-level test does.
+// check is what is wrong with what the shards ran between them, a top-level test that skipped too,
+// and else a line saying what they ran. A shard runs its top-level tests whole, subtests and all,
+// so each subtest runs once where its top-level test does.
 func check(shards []shard) (problems []string, summary string) {
 	count := shards[0].count
 	by := make([]*shard, count+1)
@@ -129,9 +129,14 @@ func check(shards []shard) (problems []string, summary string) {
 				problems = append(problems, fmt.Sprintf("%s: go test -list names it in shard 1, not in shard %d", t, s.index))
 			}
 		}
-		for t := range s.ran {
+		for t, action := range s.ran {
 			ranIn[t] = append(ranIn[t], s.index)
 			ran[s.index]++
+			// A skip tests nothing, and CI is where every test can run: one that can't fails there,
+			// as pgtest.Skip has it, rather than pass the run unseen.
+			if action == "skip" {
+				problems = append(problems, fmt.Sprintf("%s skipped in shard %d", t, s.index))
+			}
 		}
 	}
 	for t := range listed {

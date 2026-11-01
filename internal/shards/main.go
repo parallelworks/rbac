@@ -14,7 +14,8 @@
 // checks the shards' results: dir holds a directory for each, with "shard", its i/n, "test-list.json",
 // the go test -json -list output of every test, and "test-results.json", the go test -json output of
 // its run. It fails unless the shards are numbered 1 to n, once each, list the same tests, and
-// between them ran each listed test once, in a single shard, and ran nothing else.
+// between them ran each listed test once, in a single shard, without skipping it, and ran nothing
+// else. Both fail where go test -list prints a line that names neither a test nor its package.
 package main
 
 import (
@@ -99,17 +100,46 @@ func events(r io.Reader, f func(event)) error {
 	}
 }
 
-// The names go test -list prints that go test -run selects: it lists benchmarks too, which run
-// only with -bench.
-var listedName = regexp.MustCompile(`^(Test|Fuzz|Example)\w*$`)
+// The names go test -list prints, by go test's own rule for them: a prefix, then nothing or the rest
+// of an identifier, of any letters, digits and underscores, whose first isn't a lowercase letter.
+// go test -run selects tests, fuzz tests and examples; benchmarks run only with -bench.
+var (
+	listedName    = regexp.MustCompile(`^(Test|Fuzz|Example)` + nameRest)
+	benchmarkName = regexp.MustCompile(`^Benchmark` + nameRest)
+	// What go test -list prints of a package, not of a test: how it ended, that it has no test
+	// files, or, of one without statements, that it isn't built with -cover.
+	packageLine = regexp.MustCompile(`^(ok  \t|\?   \t|program not built with -cover$)`)
+)
 
-// readList reads the top-level tests of each package from go test -json -list output.
+const nameRest = `([\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{Nd}_][\pL\p{Nd}_]*)?$`
+
+// readList reads the top-level tests of each package from go test -json -list output. A line of
+// its output that is neither a name nor one of a package's fails it, so a test of a name the rule
+// doesn't foresee is never left out of every shard.
 func readList(r io.Reader) (map[test]bool, error) {
 	listed := map[test]bool{}
+	var unknown []string
 	err := events(r, func(e event) {
-		if name := strings.TrimSpace(e.Output); e.Action == "output" && listedName.MatchString(name) {
+		if e.Action != "output" {
+			return
+		}
+		switch name := strings.TrimSpace(e.Output); {
+		case listedName.MatchString(name):
 			listed[test{e.Package, name}] = true
+		case name != "" && !benchmarkName.MatchString(name) && !packageLine.MatchString(name) && !untestedCover(e.Package, e.Output):
+			unknown = append(unknown, fmt.Sprintf("%s: %q", e.Package, name))
 		}
 	})
+	if err == nil && len(unknown) > 0 {
+		err = fmt.Errorf("go test -list printed lines that name no test: %s", strings.Join(unknown, ", "))
+	}
 	return listed, err
+}
+
+// untestedCover reports whether output is the line go test -cover prints of a package without test
+// files, as make test builds the tests: how much of it is covered, or nothing past its name where it
+// has no statements, in place of saying it has no test files.
+func untestedCover(pkg, output string) bool {
+	rest, ok := strings.CutPrefix(output, "\t"+pkg+"\t\t")
+	return ok && (strings.TrimSpace(rest) == "" || strings.HasPrefix(rest, "coverage: "))
 }

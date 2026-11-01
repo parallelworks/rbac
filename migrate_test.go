@@ -256,13 +256,19 @@ func TestMigrateWaitsForAReplicaAsLongAsTheSessionsLockTimeout(t *testing.T) {
 }
 
 // historyToVacuum migrates pool's schema up to 0019 and fills history with enough records that a
-// vacuum slowed to a crawl takes minutes over it.
+// vacuum slowed to a crawl takes minutes over it. Autovacuum is off for history and rbac_grants,
+// whose rows the records are of, from before they fill: a worker that vacuumed history as it
+// filled, before a test slowed it, would leave nothing for the test's worker to vacuum.
 func historyToVacuum(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	if err := applyMigrations(t.Context(), pool, pgx.ReadCommitted, "", "0019"); err != nil {
 		t.Fatal(err)
 	}
 	recordMigrations(t, pool, "0019")
+	if _, err := pool.Exec(t.Context(), `ALTER TABLE rbac_grants SET (autovacuum_enabled = off);
+		ALTER TABLE rbac_history SET (autovacuum_enabled = off)`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(t.Context(), `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
 		SELECT 't1', 'cluster', 'c' || i, 'user', 'u' || i, 'cluster.admin' FROM generate_series(1, 10000) i`); err != nil {
 		t.Fatal(err)
@@ -367,18 +373,20 @@ func TestMigrateWaitsForPostgreSQLToCancelAutovacuum(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !on {
-		t.Skip("autovacuum is off")
+		pgtest.Skip(t, "autovacuum is off")
 	}
 	historyToVacuum(t, r.adminPool)
 	// Table-level settings alone: autovacuum vacuums history for the records inserted, slowly, and
 	// doesn't analyze it.
-	if _, err := r.adminPool.Exec(ctx, `ALTER TABLE rbac_history SET (autovacuum_vacuum_insert_threshold = 1,
+	if _, err := r.adminPool.Exec(ctx, `ALTER TABLE rbac_history SET (autovacuum_enabled = on, autovacuum_vacuum_insert_threshold = 1,
 		autovacuum_vacuum_insert_scale_factor = 0, autovacuum_vacuum_cost_delay = 100, autovacuum_vacuum_cost_limit = 1,
 		autovacuum_analyze_threshold = 1000000000)`); err != nil {
 		t.Fatal(err)
 	}
 	// The launcher starts a worker in the database once each naptime, which can be busy with other
-	// tables first.
+	// tables first. In CI only the run's own tables keep it busy, and one has come within a minute, so
+	// there the test fails rather than skip. A naptime of a second had autovacuum analyze a crowded
+	// copy before TestACrowdedCopyIsWhatWritingItAfreshMakes read that nothing had.
 	var pid int
 	for deadline := time.Now().Add(2*time.Duration(naptime)*time.Second + 30*time.Second); ; time.Sleep(200 * time.Millisecond) {
 		err := r.super.QueryRow(ctx, `SELECT pid FROM pg_stat_activity WHERE backend_type = 'autovacuum worker'
@@ -390,7 +398,7 @@ func TestMigrateWaitsForPostgreSQLToCancelAutovacuum(t *testing.T) {
 			t.Fatal(err)
 		}
 		if time.Now().After(deadline) {
-			t.Skip("no autovacuum worker reached history in time")
+			pgtest.Skip(t, "no autovacuum worker reached history in time")
 		}
 	}
 	rbac.SetMigrateAttempts(t, 3, time.Millisecond)
@@ -419,11 +427,6 @@ func TestMigrateOutwaitingAVacuumHoldsNoWriteBack(t *testing.T) {
 	ctx := t.Context()
 	r := newReadmeRoles(t)
 	historyToVacuum(t, r.adminPool)
-	// So no autovacuum worker on the tables just filled holds them as well.
-	if _, err := r.adminPool.Exec(ctx, `ALTER TABLE rbac_grants SET (autovacuum_enabled = off);
-		ALTER TABLE rbac_history SET (autovacuum_enabled = off)`); err != nil {
-		t.Fatal(err)
-	}
 	super := superuserOn(t, r.schema)
 	vacuumSlowly(t, super, "rbac_history")
 	seeks, err := fs.ReadFile(rbac.Migrations(), "0019_principal_seeks.sql")
@@ -464,10 +467,10 @@ func TestMigrateOutwaitsEachTableAVacuumHolds(t *testing.T) {
 	ctx := t.Context()
 	r := newReadmeRoles(t)
 	historyToVacuum(t, r.adminPool)
+	// So no autovacuum worker on the table filled holds it as well, from before it fills.
 	for _, sql := range []string{
+		`ALTER TABLE rbac_groups SET (autovacuum_enabled = off)`,
 		`INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'g' || i FROM generate_series(1, 10000) i`,
-		`ALTER TABLE rbac_grants SET (autovacuum_enabled = off); ALTER TABLE rbac_groups SET (autovacuum_enabled = off);
-			ALTER TABLE rbac_history SET (autovacuum_enabled = off)`,
 	} {
 		if _, err := r.adminPool.Exec(ctx, sql); err != nil {
 			t.Fatal(err)
@@ -503,9 +506,10 @@ func TestMigrateGoesOnWhereAVacuumOutlastsItsWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	recordMigrations(t, r.adminPool, "0019")
+	// So no autovacuum worker on the tables filled holds them as well, from before they fill.
 	for _, sql := range []string{
-		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) SELECT 't1', 'user', 'u' || i FROM generate_series(1, 10000) i`,
 		`ALTER TABLE rbac_memberships SET (autovacuum_enabled = off); ALTER TABLE rbac_history SET (autovacuum_enabled = off)`,
+		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) SELECT 't1', 'user', 'u' || i FROM generate_series(1, 10000) i`,
 	} {
 		if _, err := r.adminPool.Exec(ctx, sql); err != nil {
 			t.Fatal(err)
@@ -542,12 +546,8 @@ func TestMigrateGoesOnWhereAVacuumOutlastsItsWait(t *testing.T) {
 func TestMigrateDoesntWaitOutAClientsVacuum(t *testing.T) {
 	ctx := t.Context()
 	pool := pgtest.Open(t, "")
+	// No autovacuum worker on the tables it fills has Migrate wait past deadlock_timeout.
 	historyToVacuum(t, pool)
-	// So no autovacuum worker on the tables just filled has Migrate wait past deadlock_timeout.
-	if _, err := pool.Exec(ctx, `ALTER TABLE rbac_grants SET (autovacuum_enabled = off);
-		ALTER TABLE rbac_history SET (autovacuum_enabled = off)`); err != nil {
-		t.Fatal(err)
-	}
 	vacuumSlowly(t, pool, "rbac_history")
 	var ms int64
 	if err := pool.QueryRow(ctx, `SELECT setting::bigint FROM pg_settings WHERE name = 'deadlock_timeout'`).Scan(&ms); err != nil {

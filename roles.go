@@ -345,6 +345,14 @@ func canonical(r RoleDefinition) RoleDefinition {
 	return r
 }
 
+// canonicalSQL is SQL for the stored list col as canonical lists are: sorted byte by byte and
+// without repeats. A change writing a canonical list compares the stored one so, as one stored
+// around the package in another order, or with a repeat, is the same: written again as it is, it
+// changes nothing.
+func canonicalSQL(col string) string {
+	return `ARRAY(SELECT e FROM unnest(` + col + `) AS l(e) GROUP BY e ORDER BY e COLLATE "C")`
+}
+
 // SetRole creates a custom role in a tenant, or replaces one, as actor; grants of a replaced
 // role give what it gives now. Its id starts with CustomPrefix, and it gives only permissions
 // some built-in role gives, on types some built-in role is for. It is Privileged when it gives
@@ -356,7 +364,11 @@ func canonical(r RoleDefinition) RoleDefinition {
 // right reads the tenant as a resource with no attributes), and every permission
 // the role gives there, for each type it is for, as granting it on the tenant for good would
 // need: a definition never ends, so what the actor holds only until a time can't stand in. Each
-// of its GrantableRoles must be a role the actor may grant on the tenant. Replacing a role
+// of its GrantableRoles must be a role the actor may grant on the tenant, and one that a
+// `<type>:grant` the role gives, on a type it is for, lets its holders grant, as one that can be
+// granted on that type: one none does is refused as invalid, but where the role as stored lists it
+// and hands it on nowhere already, as once that role was narrowed or the catalog changed, it is
+// kept, and renaming the role still needs only the power to define it. Replacing a role
 // another custom role lists needs the power to grant it as defined wherever that one lists it,
 // and where it will give more, under the denies on the path of each scope that one, or a role
 // listing that one, is granted on, as their holders there may then grant it, the latter's by
@@ -522,8 +534,8 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 			  permissions = EXCLUDED.permissions, resource_types = EXCLUDED.resource_types,
 			  privileged = EXCLUDED.privileged, public = EXCLUDED.public,
 			  grantable_roles = EXCLUDED.grantable_roles, updated_by = EXCLUDED.updated_by, updated_at = now()
-			WHERE (rbac_roles.name, rbac_roles.description, rbac_roles.permissions, rbac_roles.resource_types,
-			  rbac_roles.privileged, rbac_roles.public, rbac_roles.grantable_roles) IS DISTINCT FROM
+			WHERE (rbac_roles.name, rbac_roles.description, `+canonicalSQL("rbac_roles.permissions")+`, `+canonicalSQL("rbac_roles.resource_types")+`,
+			  rbac_roles.privileged, rbac_roles.public, `+canonicalSQL("rbac_roles.grantable_roles")+`) IS DISTINCT FROM
 			  (EXCLUDED.name, EXCLUDED.description, EXCLUDED.permissions, EXCLUDED.resource_types,
 			  EXCLUDED.privileged, EXCLUDED.public, EXCLUDED.grantable_roles)`,
 			tenant, r.ID, r.Name, r.Description, perms, r.ResourceTypes, r.Privileged, r.Public, grantable, actorKey(actor.Principal))
@@ -1508,8 +1520,10 @@ func changedMeanwhile(id Role) error {
 	return fmt.Errorf("%w: role %q changed while this change waited for it; try again", ErrConflict, id)
 }
 
-// sameAccess reports whether two definitions of a role give the same through its grants.
+// sameAccess reports whether two definitions of a role give the same through its grants, however
+// their lists are ordered or repeat, as a role stored around the package can hold them.
 func sameAccess(x, y RoleDefinition) bool {
+	x, y = canonical(x), canonical(y)
 	return x.Public == y.Public && slices.Equal(x.Permissions, y.Permissions) &&
 		slices.Equal(x.ResourceTypes, y.ResourceTypes) && slices.Equal(x.GrantableRoles, y.GrantableRoles)
 }
@@ -1557,9 +1571,25 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 	// A role r lists is read as it will be, so one that lists itself is read as defined, while
 	// the actor's own grants of r give what r gives now: holding r is no license to widen it.
 	au.defining = r
+	was, existed := au.roles.custom[r.ID]
 	for _, id := range r.GrantableRoles {
-		if _, known := au.named(id); !known {
+		listed, known := au.named(id)
+		if !known {
 			return authority{}, fmt.Errorf("%w: role %q: grantable role %q doesn't exist", ErrInvalid, r.ID, id)
+		}
+		if a.lets(*r, listed) {
+			continue
+		}
+		// One that none of its `:grant` permissions reaches would hand nothing on, so the actor's
+		// power to grant it would go unchecked, while the listing kept it from being deleted. One the
+		// role lists as stored, and hands on nowhere there already, as one narrowed since, it keeps:
+		// renaming the role needs only the power to define it.
+		listedWas := listed
+		if id == r.ID {
+			listedWas = was
+		}
+		if !existed || !slices.Contains(was.GrantableRoles, id) || a.lets(was, listedWas) {
+			return authority{}, fmt.Errorf("%w: role %q: grantable role %q can be granted on no type of the role's `:grant` permissions", ErrInvalid, r.ID, id)
 		}
 	}
 	seen := newChecked()
@@ -1591,6 +1621,16 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 		return authority{}, err
 	}
 	return au, nil
+}
+
+// lets reports whether the holders of a role defined as r may grant listed through it, as
+// holdsRole reads it: by a `<type>:grant` it gives on a type it is for, which listed can be granted
+// on.
+func (a *Authorizer) lets(r, listed RoleDefinition) bool {
+	return slices.ContainsFunc(r.Permissions, func(p Permission) bool {
+		t, _ := p.parts()
+		return p.changesGrants() && r.GrantableOn(t) && a.grantableOn(listed, t)
+	})
 }
 
 // privileged reports whether a custom role gives a permission on a type that only privileged

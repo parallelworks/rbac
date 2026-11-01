@@ -294,7 +294,8 @@ func TestAsOfReadsWithoutJIT(t *testing.T) {
 // pgx sends a time in microseconds from 2000 in 64 bits, which wrap: 2^64 microseconds after a
 // time reaches PostgreSQL as that time, and one past PostgreSQL's times as one it refuses as out of
 // range. AsOf refuses one past the last the package stores, or before PostgreSQL's earliest, and
-// reads those between.
+// reads those between, each as pgx sends it, to the microsecond, rounded down: the last
+// microsecond's every nanosecond is the last time, which it read as one past it.
 func TestAsOfRefusesATimePastThoseItReads(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -314,13 +315,16 @@ func TestAsOfRefusesATimePastThoseItReads(t *testing.T) {
 	}
 	earliest := time.Date(-4713, time.November, 24, 0, 0, 0, 0, time.UTC)
 	latest := time.Date(9999, time.December, 30, 23, 59, 59, 999999000, time.UTC)
-	past := []time.Time{wrapped(held, 1), time.Date(300000, time.January, 1, 0, 0, 0, 0, time.UTC), latest.Add(time.Microsecond), earliest.Add(-time.Microsecond)}
+	past := []time.Time{
+		wrapped(held, 1), time.Date(300000, time.January, 1, 0, 0, 0, 0, time.UTC), latest.Add(time.Microsecond),
+		earliest.Add(-time.Microsecond), earliest.Add(-time.Nanosecond),
+	}
 	for _, at := range past {
 		if err := read(at); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("as of %v: %v", at, err)
 		}
 	}
-	for _, at := range []time.Time{earliest, latest} {
+	for _, at := range []time.Time{earliest, earliest.Add(999 * time.Nanosecond), latest, latest.Add(999 * time.Nanosecond)} {
 		if err := read(at); err != nil {
 			t.Errorf("as of %v: %v", at, err)
 		}
