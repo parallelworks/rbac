@@ -4065,6 +4065,74 @@ func TestWideningAPrivilegedRoleAsksNothingOfGrantsThatGiveNothing(t *testing.T)
 	}
 }
 
+// A role the catalog makes privileged gives the tenant's members nothing through a grant to them,
+// so widening it asks the host nothing about that grant. Narrowing it so that it is no longer
+// privileged gives them what it gives then, what was added while it gave them nothing too, so the
+// host is asked about that grant, as the role will be, and refusing it refuses the narrowing.
+func TestNarrowingARoleSoItIsNoLongerPrivilegedAsksAboutTheMembersGrant(t *testing.T) {
+	viewer := rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), viewer) })
+	ctx := t.Context()
+	admin := roleAdmin(t, h)
+	x := rbac.RoleDefinition{ID: "custom.x", Permissions: []rbac.Permission{login}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(ctx, admin, "t1", x); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(rbac.TenantRoot("t1"), x.ID, rbac.Members, "t1"))
+	member := h.as(t, "m")
+	// The catalog makes logging in privileged, so x is, and the members' grant gives nothing.
+	cfg := h.cfg
+	cfg.Catalog = slices.Clone(cfg.Catalog)
+	for i, r := range cfg.Catalog {
+		if r.ID == "cluster.login" {
+			cfg.Catalog[i].Privileged = true
+		}
+	}
+	var asked []rbac.GrantInput
+	refuseMembers := true
+	cfg.ValidateGrant = func(_ context.Context, _ rbac.DB, in rbac.GrantInput) error {
+		asked = append(asked, in)
+		if refuseMembers && in.Binding.Principal.Kind == rbac.Members {
+			return fmt.Errorf("%w: not through the members", rbac.ErrInvalid)
+		}
+		return nil
+	}
+	authz, err := rbac.New(h.pool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := authz.Authorize(ctx, member, login, cluster); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("a privileged role through the members: %v", err)
+	}
+	x.Permissions = []rbac.Permission{login, view}
+	if err := authz.SetRole(ctx, admin, "t1", x); err != nil || len(asked) != 0 {
+		t.Fatalf("widening a privileged role the members hold: %v, asked %+v", err, asked)
+	}
+	// Narrowed to what a role that isn't privileged gives, the members' grant would give every
+	// member view on every cluster.
+	x.Permissions = []rbac.Permission{view}
+	err = authz.SetRole(ctx, admin, "t1", x)
+	var ie *rbac.InvalidError
+	if !errors.As(err, &ie) || ie.Binding.Principal != rbac.TenantMembers("t1") {
+		t.Fatalf("narrowing a role the members hold so that it is no longer privileged: %v", err)
+	}
+	if len(asked) != 1 || asked[0].Via != rbac.ViaRedefinition || asked[0].Scope != rbac.TenantRoot("t1") ||
+		asked[0].Role.Privileged || !slices.Equal(asked[0].Role.Permissions, x.Permissions) || asked[0].Actor.Principal != admin.Principal {
+		t.Fatalf("asked = %+v", asked)
+	}
+	if err := authz.Authorize(ctx, member, view, cluster); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("a refused narrowing gave the members view: %v", err)
+	}
+	// Once the host lets the members hold it, it gives them what it gives.
+	refuseMembers, asked = false, nil
+	if err := authz.SetRole(ctx, admin, "t1", x); err != nil || len(asked) != 1 {
+		t.Fatalf("narrowing it once the host lets the members hold it: %v, asked %+v", err, asked)
+	}
+	if err := authz.Authorize(ctx, member, view, cluster); err != nil {
+		t.Fatalf("the members' grant of a role no longer privileged: %v", err)
+	}
+}
+
 func TestAPrivilegedRoleForTheMembersIsRefusedBeforeTheHostIsAsked(t *testing.T) {
 	var asked []rbac.GrantInput
 	h := setup(t, func(c *rbac.Config) {
