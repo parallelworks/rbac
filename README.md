@@ -75,8 +75,9 @@ if err := authz.Authorize(ctx, subject, "cluster:login", cluster); err != nil {
   grants for good what the actor holds for good, and the roles a role it holds lists, which it
   needn't hold. Put expiries on roles that list none. A change granting a role until many times,
   as to many members each until its own, decides it once for each time that the longest lasting of
-  a kind of the actor's grants, a role through one kind of principal, ends among them, not for each
-  grant: grants of one role to its many groups, each ending at its own hour, are one kind.
+  a kind of the actor's grants ends among them, not for each grant: a kind is a role held through
+  the actor or any of its groups, through the tenant's members, or through the public, so grants
+  of one role to its many groups, each ending at its own hour, are one kind.
 - **Creators:** nothing is owned. The host gives whoever creates a resource a role on it with
   `Import`, as an actor it names, in the same transaction through `WithTx`.
 
