@@ -70,12 +70,13 @@ import (
 // ref.Val of the host's own, though it says it is of one of CEL's types, a list, a map or an
 // optional of CEL's a host makes, a struct, a channel, a func, a complex number, a uintptr, any
 // other message, a map keyed by any other value, as a double or an array, a map holding two keys
-// read as the same value, as 1 and 1u, or "a" twice of two string types, invalid JSON, and a value
-// holding itself. A list or a map holding one reads the rest. A value reached twice, as a map two
-// lists hold, is converted once. A check converts at most maxConverted of what the host passes,
-// counted as reading it costs a condition, one for each value and a tenth of each string's, bytes'
-// or JSON text's length: past that, every condition reading an attribute of any kind fails. A
-// declared attribute is a value of its type as converted, so a named string type is a string.
+// read as the same value, as 1 and 1u, or "a" twice of two string types, invalid JSON, a value
+// nested deeper than JSON text may, 10,000 deep, and a value holding itself. A list or a map
+// holding one reads the rest. A value reached twice, as a map two lists hold, is converted once. A
+// check converts at most maxConverted of what the host passes, counted as reading it costs a
+// condition, one for each value and a tenth of each string's, bytes' or JSON text's length: past
+// that, every condition reading an attribute of any kind fails. A declared attribute is a value of
+// its type as converted, so a named string type is a string.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
@@ -131,6 +132,12 @@ func allStrings(it traits.Iterator, m traits.Mapper) bool {
 // it does, so converting what a check passes costs no more than its conditions may.
 const maxConverted = 2 * maxCheckCost
 
+// maxNested is how deep a value a host passes may nest, as JSON text may (encoding/json): one
+// nested deeper fails there, so converting it recurses no deeper, though each level would cost
+// one, a hundred thousand levels took a check a fifth of a second, growing the stack to a hundred
+// mebibytes.
+const maxNested = 10000
+
 // converter converts what a host passes for a check into CEL's own values (Attributes), spending
 // no more than left, and keeping each list, map, pointer, message and JSON text it converts by
 // where it points, its length and its type, so one reached twice is converted once, and one
@@ -139,6 +146,8 @@ type converter struct {
 	left uint64
 	// over is set once converting cost more than was left, which fails every attribute.
 	over bool
+	// depth is how deep converting is in the value it converts.
+	depth int
 	// done is what each was converted to, or nil while it is being converted.
 	done map[copiedKey]ref.Val
 }
@@ -178,6 +187,11 @@ func (c *converter) of(v reflect.Value) ref.Val {
 	if !c.pay(1) {
 		return tooLarge()
 	}
+	if c.depth >= maxNested {
+		return types.NewErr("rbac: a condition can't read a value nested more than %d deep", maxNested)
+	}
+	c.depth++
+	defer func() { c.depth-- }()
 	if v.Kind() == reflect.Interface {
 		if v.IsNil() {
 			return types.NullValue

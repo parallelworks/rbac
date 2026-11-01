@@ -192,8 +192,8 @@ conditional ones reach, to check one by one.
   Anything else fails whatever condition reads it, `has()` included: a `ref.Val` of the host's own,
   though it says it is one of CEL's types, a list, map or optional of CEL's a host makes, a struct,
   a channel, a func, any other message, a map keyed by anything else, as a double or an array, a
-  map holding two keys read as the same value, as `1` and `1u`, invalid JSON, and a value holding
-  itself. A list or map holding one reads the rest, and a value reached twice is converted once. A
+  map holding two keys read as the same value, as `1` and `1u`, invalid JSON, a value nested more
+  than 10,000 deep, as JSON text can't be, and a value holding itself. A list or map holding one reads the rest, and a value reached twice is converted once. A
   check converts no more than `2 × 80,000` of them, counted as reading them costs a condition, one
   for each value and a tenth of each string's, bytes' or JSON text's length, about a map of 50,000
   short strings: past that every condition reading an attribute fails.

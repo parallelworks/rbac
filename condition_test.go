@@ -1187,13 +1187,6 @@ func TestAttributesLargerThanACheckConvertsFailEveryCondition(t *testing.T) {
 	for name, large := range map[string]any{
 		"a long list": make([]int, rbac.MaxConverted), "a long string": strings.Repeat("x", 10*rbac.MaxConverted),
 		"overlapping JSON texts": overlapping, "a list longer than memory holds": make([]struct{}, 1<<40),
-		"a deep list": func() any {
-			var v any = "x"
-			for range rbac.MaxConverted {
-				v = []any{v}
-			}
-			return v
-		}(),
 	} {
 		held, evaluated, allocated, err := rbac.EvaluateCondition(t, expr, map[string]any{"mfa": true, "l": large})
 		if err != nil || evaluated {
@@ -1205,22 +1198,27 @@ func TestAttributesLargerThanACheckConvertsFailEveryCondition(t *testing.T) {
 	}
 }
 
-// A host can nest a value as deep as it likes, which converting it recurses into, and a chain of
-// pointers cost nothing, so converting one two million deep overflowed the stack, which no recover
-// catches. Each level costs one, a pointer too, so converting reaches no deeper than a check may
-// convert, and the condition fails. It runs in a child process, on a smaller stack, in which
-// converting the most a check may takes a little more than half.
+// A host can nest a value as deep as it likes, which converting it recurses into: a chain of
+// pointers two million deep, which cost nothing, overflowed the stack, which no recover catches,
+// and a list a hundred thousand deep, each level costing one, took a check a fifth of a second
+// and a hundred mebibytes of stack. A value nested deeper than JSON text may fails there, and the
+// condition reading it with it. It runs in a child process, on a smaller stack, which converting a
+// value as deep as a check may afford, but no deeper than JSON, overflows.
 func TestAValueNestedDeepFailsItsConditions(t *testing.T) {
 	if os.Getenv("RBAC_VALUE_NESTED_DEEP") != "" {
-		debug.SetMaxStack(128 << 20)
+		debug.SetMaxStack(32 << 20)
 		var pointed, listed, mapped any = "x", "x", "x"
 		for range 2_000_000 {
 			p := pointed
 			pointed, listed, mapped = &p, []any{listed}, map[string]any{"a": mapped}
 		}
 		for name, v := range map[string]any{"pointers": pointed, "lists": listed, "maps": mapped} {
-			if _, evaluated, _, err := rbac.EvaluateCondition(t, `request.attributes.v != "x"`, map[string]any{"v": v}); err != nil || evaluated {
+			if _, evaluated, _, err := rbac.EvaluateCondition(t, `request.attributes.v == request.attributes.v`, map[string]any{"v": v}); err != nil || evaluated {
 				t.Errorf("%s nested deep: evaluated %t, %v", name, evaluated, err)
+			}
+			// The rest is read.
+			if held, _, _, err := rbac.EvaluateCondition(t, `request.attributes.ok == true`, map[string]any{"v": v, "ok": true}); err != nil || !held {
+				t.Errorf("an attribute beside %s nested deep: held %t, %v", name, held, err)
 			}
 		}
 		return
