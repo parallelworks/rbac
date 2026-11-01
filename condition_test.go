@@ -19,6 +19,9 @@ import (
 	"cel.dev/cel-go/common/types/traits"
 	"cel.dev/cel-go/ext"
 	"cel.dev/cel-go/interpreter"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/dynamicpb"
+	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -174,24 +177,127 @@ func TestADoubleAConditionMakesThatIsntFiniteFailsWhatComparesIt(t *testing.T) {
 	}
 }
 
-// A map the host passes can be keyed by a double that isn't finite, a key no condition computes:
-// comparing one keyed by NaN decided it equal to no map, and looking up its infinite key by one a
-// condition reads found it, where `in` fails.
-func TestAMapTheHostPassesKeyedByADoubleThatIsntFiniteFailsWhatComparesOrIndexesIt(t *testing.T) {
+// hostDouble is a host's own type CEL reads as a double, which compares as CEL's own does.
+type hostDouble float64
+
+func (d hostDouble) ConvertToNative(t reflect.Type) (any, error) {
+	return types.Double(d).ConvertToNative(t)
+}
+func (d hostDouble) ConvertToType(t ref.Type) ref.Val { return types.Double(d).ConvertToType(t) }
+func (d hostDouble) Equal(other ref.Val) ref.Val      { return types.Double(d).Equal(other) }
+func (d hostDouble) Compare(other ref.Val) ref.Val    { return types.Double(d).Compare(other) }
+func (d hostDouble) Type() ref.Type                   { return types.DoubleType }
+func (d hostDouble) Value() any                       { return float64(d) }
+
+// selfDouble is a host's own type CEL reads as a double that holds no value but itself.
+type selfDouble struct{ hostDouble }
+
+func (d selfDouble) Value() any { return d }
+
+// ownList is a host's own list type, which yields what the list it embeds holds.
+type ownList struct{ traits.Lister }
+
+// CEL reads a value of the host's own type as a double where its type says it is one, but the
+// guards against a double that isn't finite knew only CEL's own: of an undeclared kind, a deny's
+// `request.attributes.risk >= 0.5` was false for NaN and -Inf and lifted, and so were its equality,
+// `in`, a map keyed by one and converting one to a string. A host's own double is read as CEL's
+// own, wherever the host holds it, so each fails, and a finite one decides as CEL's own does.
+func TestADoubleOfAHostsOwnTypeThatIsntFiniteFailsWhatComparesIt(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
+	})
+	ctx := t.Context()
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	g.Condition = rbac.Condition{Expression: `request.attributes.risk < 0.5`}
+	h.seed(t, g, grant(cluster.Scope(), "cluster.login", rbac.User, "v"), grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+	u, v := h.as(t, "u"), h.as(t, "v")
+	d := rbac.Deny{
+		ID: "risky", Principals: []rbac.Principal{v.Principal}, Permissions: []rbac.Permission{login},
+		Condition: rbac.Condition{Expression: `request.attributes.risk >= 0.5`},
+	}
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, d); err != nil {
+		t.Fatal(err)
+	}
+	is := func(s rbac.Subject, risk hostDouble) bool {
+		t.Helper()
+		err := h.authz.Authorize(rbac.WithRequest(ctx, map[string]any{"risk": risk}), s, login, cluster)
+		if err != nil && !errors.Is(err, rbac.ErrDenied) {
+			t.Fatal(err)
+		}
+		return err == nil
+	}
+	if !is(u, 0.1) || !is(v, 0.1) || is(u, 0.9) || is(v, 0.9) {
+		t.Fatal("finite risks the conditions order")
+	}
+	for _, risk := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		if is(u, hostDouble(risk)) {
+			t.Errorf("a grant's condition held for risk %v", risk)
+		}
+		if is(v, hostDouble(risk)) {
+			t.Errorf("a deny's condition was lifted for risk %v", risk)
+		}
+	}
+	nan := hostDouble(math.NaN())
 	attributes := map[string]any{
-		"nan": map[float64]any{math.NaN(): 1}, "inf": map[float64]any{math.Inf(1): 1}, "y": math.Inf(1),
-		"finite": map[float64]any{0.5: 1}, "half": 0.5,
+		"nan": nan, "inf": hostDouble(math.Inf(-1)), "half": hostDouble(0.5), "in a list": []any{nan},
+		"in a host's list": ownList{types.NewRefValList(types.DefaultTypeAdapter, []ref.Val{nan})},
+		"in an optional":   types.OptionalOf(nan), "keying": map[any]any{nan: 1}, "self": selfDouble{0.5},
 	}
 	for _, expr := range []string{
-		`request.attributes.nan != {0.5: 1}`, `{0.5: 1} != request.attributes.nan`, `[request.attributes.nan] != [{0.5: 1}]`,
-		`request.attributes.inf == request.attributes.inf`, `request.attributes.inf[request.attributes.y] == 1`,
-		`[request.attributes.y].all(r, request.attributes.inf[r] == 1)`,
+		`request.attributes.nan != request.attributes.nan`, `!(request.attributes.nan == 0.5)`, `request.attributes.inf < 0.5`,
+		`!(request.attributes.inf >= 0.5)`, `!(request.attributes.nan in [0.5])`, `{request.attributes.nan: 1} != {0.5: 1}`,
+		`string(request.attributes.nan) != "0.5"`, `request.attributes["in a list"] != [0.5]`,
+		`request.attributes["in a host's list"] != [0.5]`, `request.attributes["in a host's list"].all(r, r != 0.5)`,
+		`request.attributes["in an optional"] != request.attributes["in an optional"]`, `request.attributes.keying != {0.5: 1}`,
+		`request.attributes.self < 1.0`,
 	} {
 		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || evaluated {
 			t.Errorf("%s: evaluated %t, %v", expr, evaluated, err)
 		}
 	}
-	for _, expr := range []string{`request.attributes.finite == {0.5: 1}`, `request.attributes.finite[request.attributes.half] == 1`} {
+	for _, expr := range []string{
+		`request.attributes.half == 0.5`, `request.attributes.half < 1.0`, `request.attributes.half in [0.5]`,
+		`string(request.attributes.half) == "0.5"`, `{request.attributes.half: 1} == {0.5: 1}`, `request.attributes.half + 1.0 == 1.5`,
+	} {
+		if held, _, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || !held {
+			t.Errorf("%s: held %t, %v", expr, held, err)
+		}
+	}
+}
+
+// A map the host passes can be keyed by a double that isn't finite, a key no condition computes:
+// comparing one keyed by NaN decided it equal to no map, and looking up its infinite key by one a
+// condition reads found it, where `in` fails.
+//
+// One can be keyed by a list holding one too, as by arrays of doubles, which only a comparison of
+// the keys themselves refused: comparing two such maps decided them unequal, and `in` one found no
+// key holding NaN, a list a condition makes. A comparison, or `in`, of a value holding one
+// anywhere, as a key too, fails, and so does `in` a list holding one.
+func TestAMapTheHostPassesKeyedByADoubleThatIsntFiniteFailsWhatComparesOrIndexesIt(t *testing.T) {
+	attributes := map[string]any{
+		"nan": map[float64]any{math.NaN(): 1}, "inf": map[float64]any{math.Inf(1): 1}, "y": math.Inf(1),
+		"finite": map[float64]any{0.5: 1}, "half": 0.5,
+		"listed": map[[1]float64]int{{math.NaN()}: 1}, "listed too": map[[1]float64]int{{math.NaN()}: 1},
+		"finitely listed": map[[1]float64]int{{0.5}: 1}, "finitely listed too": map[[1]float64]int{{0.5}: 1},
+	}
+	for _, expr := range []string{
+		`request.attributes.nan != {0.5: 1}`, `{0.5: 1} != request.attributes.nan`, `[request.attributes.nan] != [{0.5: 1}]`,
+		`request.attributes.inf == request.attributes.inf`, `request.attributes.inf[request.attributes.y] == 1`,
+		`[request.attributes.y].all(r, request.attributes.inf[r] == 1)`,
+		`request.attributes.listed != request.attributes["listed too"]`, `!(request.attributes.listed == request.attributes["listed too"])`,
+		`[request.attributes.listed] != [request.attributes["listed too"]]`, `{"k": request.attributes.listed} != {"k": request.attributes["listed too"]}`,
+		`request.attributes.listed != request.attributes["finitely listed"]`, `!([0.0 / 0.0] in request.attributes["finitely listed"])`,
+		`!([[0.0 / 0.0]] in [request.attributes.listed])`, `!(dyn("a") in [[0.0 / 0.0]])`,
+	} {
+		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || evaluated {
+			t.Errorf("%s: evaluated %t, %v", expr, evaluated, err)
+		}
+	}
+	for _, expr := range []string{
+		`request.attributes.finite == {0.5: 1}`, `request.attributes.finite[request.attributes.half] == 1`,
+		`request.attributes["finitely listed"] == request.attributes["finitely listed too"]`, `[0.5] in request.attributes["finitely listed"]`,
+		`!([0.5] in request.attributes.listed)`,
+	} {
 		if held, _, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || !held {
 			t.Errorf("%s: held %t, %v", expr, held, err)
 		}
@@ -695,9 +801,14 @@ func TestAConditionBuildingAMessageIsRefused(t *testing.T) {
 	}
 }
 
+// holder is a host's type CEL can't read, which it writes out whole in its error.
+type holder struct{ M map[string]any }
+
 // A value the host passes that holds itself, as a graph of objects it converts may, fails each
 // condition reading it whole, as a comparison or a loop does, rather than recursing until the stack
-// overflows, which kills the process: no recover catches it. A message literal converted one so.
+// overflows, which kills the process: no recover catches it. A message literal converted one so,
+// and so did reading a value CEL can't read that holds one, as a struct, which it writes out in its
+// error, or a message of a dynamic type, which it merges into one of its own.
 // Each runs in a child process, so one that overflows fails this test rather than the test binary.
 func TestAValueHoldingItselfFailsItsConditions(t *testing.T) {
 	if expr := os.Getenv("RBAC_CONDITION_OF_A_CYCLE"); expr != "" {
@@ -706,12 +817,15 @@ func TestAValueHoldingItselfFailsItsConditions(t *testing.T) {
 		l := []any{"x", nil}
 		l[1] = l
 		refused := os.Getenv("RBAC_CONDITION_OF_A_CYCLE_REFUSED") != ""
-		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"m": m, "l": l}); evaluated || (err != nil) != refused {
+		attributes := map[string]any{"m": m, "l": l, "s": holder{m}, "p": &holder{m}, "d": dynamicStruct()}
+		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, attributes); evaluated || (err != nil) != refused {
 			t.Errorf("%s evaluated %t, %v", expr, evaluated, err)
 		}
 		return
 	}
 	for expr, refused := range map[string]bool{
+		`request.attributes.s == request.attributes.p || [request.attributes.s] != []`:                                   false,
+		`request.attributes.d.self.self != {}`:                                                                           false,
 		`google.protobuf.Struct{fields: request.attributes.m} != {}`:                                                     true,
 		`google.protobuf.ListValue{values: request.attributes.l} != []`:                                                  true,
 		`request.attributes.m == request.attributes.m`:                                                                   false,
@@ -729,6 +843,142 @@ func TestAValueHoldingItselfFailsItsConditions(t *testing.T) {
 		}
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Errorf("%s: %v\n%.2000s", expr, err, out)
+		}
+	}
+}
+
+// dynamicStruct is a Struct of a dynamic type one of whose fields, self, holds it.
+func dynamicStruct() *dynamicpb.Message {
+	s := dynamicpb.NewMessage((&structpb.Struct{}).ProtoReflect().Descriptor())
+	v := dynamicpb.NewMessage((&structpb.Value{}).ProtoReflect().Descriptor())
+	v.Set(v.Descriptor().Fields().ByName("struct_value"), protoreflect.ValueOfMessage(s))
+	s.Mutable(s.Descriptor().Fields().ByName("fields")).Map().Set(protoreflect.ValueOfString("self").MapKey(), protoreflect.ValueOfMessage(v))
+	return s
+}
+
+// CEL decodes JSON text, a JSON number or a packed message whole each time a condition reads it,
+// and merges a message of a dynamic type whole into one of its own, though it charges the read as
+// one value: a loop of a thousand steps reading JSON text of a mebibyte took three seconds and was
+// charged 8,004. A check decodes each once, however many times its conditions read it, wherever
+// the host holds it, and reads it as CEL does.
+func TestAValueCELDecodesWholeIsDecodedOnceForACheck(t *testing.T) {
+	long := strings.Repeat("x", 1<<16)
+	raw := json.RawMessage(`"` + long + `"`)
+	packed, err := anypb.New(wrapperspb.String(long))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dynamic := dynamicpb.NewMessage((&structpb.Struct{}).ProtoReflect().Descriptor())
+	fields := dynamic.Mutable(dynamic.Descriptor().Fields().ByName("fields")).Map()
+	for i := range 1000 {
+		fields.Set(protoreflect.ValueOfString(fmt.Sprint(i)).MapKey(), protoreflect.ValueOfMessage(structpb.NewBoolValue(true).ProtoReflect()))
+	}
+	for name, v := range map[string]any{
+		"JSON text": raw, "a JSON number": json.Number("0.5" + strings.Repeat("0", 1<<16)), "a packed message": packed,
+		"a message of a dynamic type": dynamic, "a message of a host's type embedding one": envelope{Message: dynamic},
+		"JSON text in a list": []any{raw}, "JSON text in a map": map[string]any{"v": raw}, "JSON text in a typed list": []json.RawMessage{raw},
+		"JSON text in a list of CEL's":                      types.DefaultTypeAdapter.NativeToValue([]any{raw}),
+		"a message of a dynamic type in a list of messages": messages(dynamic),
+	} {
+		read := "request.attributes.v"
+		switch v.(type) {
+		case []any, []json.RawMessage, traits.Lister, protoreflect.List:
+			read += "[0]"
+		case map[string]any:
+			read += ".v"
+		}
+		expr := `request.attributes.l.all(x, ` + read + ` != "a")`
+		held, evaluated, allocated, err := rbac.EvaluateCondition(t, expr, map[string]any{"l": make([]any, 1000), "v": v})
+		if err != nil || !evaluated || !held {
+			t.Errorf("%s: held %t, evaluated %t, %v", name, held, evaluated, err)
+		}
+		if allocated > 32<<16 {
+			t.Errorf("%s read a thousand times allocated %d bytes", name, allocated)
+		}
+	}
+}
+
+// messages is a list of messages of a dynamic type, a ListValue's values, of which the first's
+// struct_value is s.
+func messages(s *dynamicpb.Message) protoreflect.List {
+	listed := dynamicpb.NewMessage((&structpb.ListValue{}).ProtoReflect().Descriptor())
+	v := dynamicpb.NewMessage((&structpb.Value{}).ProtoReflect().Descriptor())
+	v.Set(v.Descriptor().Fields().ByName("struct_value"), protoreflect.ValueOfMessage(s))
+	l := listed.Mutable(listed.Descriptor().Fields().ByName("values")).List()
+	l.Append(protoreflect.ValueOfMessage(v))
+	return l
+}
+
+// formatted counts the times it is written out.
+type formatted struct{ n *int }
+
+func (f formatted) String() string {
+	*f.n++
+	return "formatted"
+}
+
+// CEL writes a value it can't read, as a struct, into its error, whole, each time a condition
+// reads it, as declaring its type does once for a check: a struct holding a long list took as
+// long to write out as it is long each time, though the read was charged as one value, and one
+// holding a map holding itself recursed until the stack overflowed (TestAValueHoldingItselfFailsItsConditions).
+// Each fails unwritten.
+func TestAValueCELCantReadFailsUnwritten(t *testing.T) {
+	n := 0
+	for expr, v := range map[string]any{
+		`request.attributes.v != 1`:                    formatted{&n},
+		`request.attributes.v != "a"`:                  &formatted{&n},
+		`request.attributes.v[0] != 1`:                 []any{formatted{&n}},
+		`request.attributes.v.v != 1`:                  map[string]any{"v": formatted{&n}},
+		`request.attributes.v.exists(k, k != 1)`:       map[formatted]int{{&n}: 1},
+		`request.attributes.v.all(k, k.n == 1)`:        []formatted{{&n}},
+		`request.attributes.v == request.attributes.v`: types.OptionalOf(types.NewDynamicList(types.DefaultTypeAdapter, []any{formatted{&n}})),
+	} {
+		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"v": v}); err != nil || evaluated {
+			t.Errorf("%s on a %T: evaluated %t, %v", expr, v, evaluated, err)
+		}
+	}
+	h := setup(t, func(c *rbac.Config) {
+		c.Attributes = rbac.Attributes{Resource: map[string]rbac.AttributeType{"v": rbac.AttrString}}
+	})
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	g.Condition = rbac.Condition{Expression: `resource.attributes.v != "x"`}
+	h.seed(t, g)
+	r := cluster
+	r.Attributes = map[string]any{"v": formatted{&n}}
+	if allowed(t, h, h.as(t, "u"), login, r) {
+		t.Error("a struct declared a string held")
+	}
+	if n > 0 {
+		t.Errorf("values a condition can't read were written out %d times", n)
+	}
+}
+
+// CEL copies an array of bytes whole into bytes of its own each time a condition reads it, and an
+// array or a struct a list or a map holds each time a condition reads one, though it charges the
+// read as one value: a loop reading an element of a list of arrays of 512 KiB took sixty times
+// longer than its charge. Those of more than 1 KiB fail; smaller ones, as an id of 16 bytes, are
+// read as CEL reads them.
+func TestAValueCELCopiesWholeEachTimeItIsReadIsAtMostAKibibyte(t *testing.T) {
+	id := [16]byte{1}
+	for name, c := range map[string]struct {
+		v     any
+		reads bool
+	}{
+		"an id":                       {id, true},
+		"a list of ids":               {[][16]byte{id}, true},
+		"a map of ids":                {map[string][16]byte{"a": id}, true},
+		"a map keyed by ids":          {map[[16]byte]int{id: 1}, true},
+		"a list of small structs":     {[]struct{ A int }{{1}}, true},
+		"a long array of bytes":       {[2 << 10]byte{1}, false},
+		"a list of long arrays":       {[][2 << 10]byte{{1}}, false},
+		"a map of long arrays":        {map[string][1 << 10]int{"a": {1}}, false},
+		"a map keyed by long arrays":  {map[[2 << 10]byte]int{{1}: 1}, false},
+		"a list of large structs":     {[]struct{ A [2 << 10]byte }{{}}, false},
+		"a pointer to a long array":   {&[2 << 10]byte{1}, true},
+		"a long array of other kinds": {[2 << 10]int16{1}, true},
+	} {
+		if _, evaluated, _, err := rbac.EvaluateCondition(t, `size(request.attributes.v) > 0`, map[string]any{"v": c.v}); err != nil || evaluated != c.reads {
+			t.Errorf("%s: evaluated %t, %v", name, evaluated, err)
 		}
 	}
 }
@@ -1276,7 +1526,63 @@ func TestFiniteValuesDecideAsCELDoes(t *testing.T) {
 			decides(literal+" == request.attributes.x", map[string]any{"x": values[x]})
 		}
 	}
+	// What a check converts once, or reads through its own conversion, as what CEL decodes, merges
+	// or holds in a list or a map of its own, decides as CEL decides it.
+	packed, err := anypb.New(structpb.NewStringValue("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dynamic := dynamicpb.NewMessage((&structpb.Struct{}).ProtoReflect().Descriptor())
+	dynamic.Mutable(dynamic.Descriptor().Fields().ByName("fields")).Map().Set(protoreflect.ValueOfString("a").MapKey(),
+		protoreflect.ValueOfMessage(structpb.NewStringValue("a").ProtoReflect()))
+	listed := &structpb.ListValue{Values: []*structpb.Value{structpb.NewStringValue("a"), structpb.NewNumberValue(0.5)}}
+	text := structpb.NewStringValue("a")
+	hosted := map[string]any{
+		"JSON text": json.RawMessage(`{"a": "a"}`), "a JSON list": json.RawMessage(`["a", 0.5]`), "a JSON string": json.RawMessage(`"a"`),
+		"a JSON number": json.Number("0.5"), "a packed message": packed, "a message of a dynamic type": dynamic,
+		"a list of CEL's":    types.DefaultTypeAdapter.NativeToValue([]any{"a", 0.5}),
+		"a map of CEL's":     types.DefaultTypeAdapter.NativeToValue(map[string]any{"a": "a"}),
+		"an optional":        types.OptionalOf(types.DefaultTypeAdapter.NativeToValue([]any{"a", 0.5})),
+		"a list of messages": listed.ProtoReflect().Get(listed.ProtoReflect().Descriptor().Fields().ByName("values")).List(),
+		"a message's field":  text.ProtoReflect().Get(text.ProtoReflect().Descriptor().Fields().ByName("string_value")),
+		"a list":             []any{"a", 0.5}, "a map": map[string]any{"a": "a"}, "an id": [16]byte{1}, "ids": [][16]byte{{1}},
+		"a struct": struct{ A string }{"a"},
+	}
+	// A value of a type of the host's own CEL reads as a double decides as the double it holds, as
+	// do the lists and maps of the host's own holding one: CEL found one equal to its own double only
+	// where it came first, and to no other, itself included, so a deny's `0.5 == request.attributes.risk`
+	// lifted for a risk of 0.5, and `request.attributes.risk != request.attributes.risk` held.
+	own := map[string][2]any{
+		"a host's double": {hostDouble(0.5), 0.5},
+		"a host's list":   {ownList{types.NewRefValList(types.DefaultTypeAdapter, []ref.Val{hostDouble(0.5)})}, []any{0.5}},
+		"a host's map":    {ownMap{types.NewRefValMap(types.DefaultTypeAdapter, map[ref.Val]ref.Val{types.String("a"): hostDouble(0.5)})}, map[string]any{"a": 0.5}},
+	}
+	for x := range hosted {
+		for y := range hosted {
+			for _, of := range []string{"%s == %s", "%s != %s", "%s in [%s]"} {
+				decides(fmt.Sprintf(of, "request.attributes.x", "request.attributes.y"), map[string]any{"x": hosted[x], "y": hosted[y]})
+			}
+		}
+		for _, of := range []string{`%s.a == "a"`, `%s[0] == "a"`, `size(%s) == 2`, `%s.exists(v, v == "a")`, `"a" in %s`, `string(%s) == "a"`} {
+			decides(fmt.Sprintf(of, "request.attributes.x"), map[string]any{"x": hosted[x]})
+		}
+	}
+	for x := range own {
+		for _, of := range []string{
+			"%s == %[1]s", "%s != %[1]s", "%s in [%[1]s]", "0.5 == %s", "[0.5] == %s", `{"a": 0.5} == %s`, "%s.a == 0.5", "%s[0] == 0.5",
+			"%s.exists(v, v != 0.5)", "size(%s) == 1", "%s + 1.0 == 1.5", "0.5 == (%s + [1.0])[0]",
+		} {
+			expr := fmt.Sprintf(of, "request.attributes.x")
+			out, err := celEval(expr, map[string]any{"x": own[x][1]})
+			if held, evaluated, _, rerr := rbac.EvaluateCondition(t, expr, map[string]any{"x": own[x][0]}); rerr != nil || evaluated != (err == nil) || evaluated && held != out.Value() {
+				t.Errorf("%s of %s: held %t, evaluated %t, %v; CEL decides %v, %v of what it holds", expr, x, held, evaluated, rerr, out, err)
+			}
+		}
+	}
 }
+
+// ownMap is a host's own map type, which yields what the map it embeds holds.
+type ownMap struct{ traits.Mapper }
 
 // iterated counts the elements a loop over a list takes.
 type iterated struct {

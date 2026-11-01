@@ -181,12 +181,18 @@ conditional ones reach, to check one by one.
   misnamed, or as another type, is refused when stored, and one stored under other declarations
   fails where it no longer passes them. A condition building a message, as
   `google.protobuf.Struct{...}`, is refused, and one stored before fails: a grant's gives nothing
-  and a deny's applies. Each condition runs within the most evaluating it can cost, which its
-  literals and types bound: little for comparing what a request passes with literals, or with the
-  ids, kinds, types and tenant a check passes or its action, which are no longer than `MaxID`, and
-  all a condition may for reading the size of, or looping over, a list the request passes, or for
-  looking up a key the request passes in a map, which hashes the key whole, as
-  `{"dev": 1, "prod": 2}[resource.attributes.env]` does. Cost is bounded per check too, for each
+  and a deny's applies. What the host passes is read as CEL reads it, at what reading any value of
+  its size costs however it is passed: a value CEL decodes or merges whole, JSON text, a JSON
+  number, or a packed or dynamic message, is converted once for each check, not each time a
+  condition reads it; one it can't read, as a struct, or copies whole on each read, an array of more
+  than 1 KiB or a list or map holding them, fails; and one of the host's own type CEL reads as a
+  double or a string is read as the value it holds. Comparing a value holding a double that isn't
+  finite fails, in a list or as a map's key too. Each condition runs within the most evaluating it
+  can cost, which its literals and types bound: little for comparing what a request passes with
+  literals, or with the ids, kinds, types and tenant a check passes or its action, which are no
+  longer than `MaxID`, and all a condition may for reading the size of, or looping over, a list the
+  request passes, or for looking up a key the request passes in a map, which hashes the key whole,
+  as `{"dev": 1, "prod": 2}[resource.attributes.env]` does. Cost is bounded per check too, for each
   scope on its path, and the conditions a check reads together are bounded where they are stored:
   an identity's grants' on a scope, those of a scope's grants to groups, the tenant's members and
   the public, each the tenant's and those from each source the host owns apart, a scope's denies',

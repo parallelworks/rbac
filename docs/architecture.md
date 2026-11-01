@@ -383,16 +383,23 @@ sequenceDiagram
   would.
 - **Conditions** are CEL over `subject`, `resource`, `request` and `action`, typed by
   `Config.Attributes`. Each is compiled once, bounded in cost, and fails closed: a condition that
-  errors gives nothing, and a deny's that errors denies. Each runs within the most evaluating it
-  can cost, which its literals and types bound, and the ids, kinds, types and tenant a check
-  passes and its action, which are no longer than `MaxID`. What a check reads together is bounded
-  where it is stored, for each scope: an identity's conditional grants, the conditional grants to
-  groups, the tenant's members and the public, each the tenant's and those from each source the
-  host owns apart, the conditional denies, and the requirements of groups' eligibilities for a
-  role, and a change adding a condition past one is refused as invalid. A check's budget is that
-  for each scope on its path, so it evaluates every condition it reads, and no grant made beside
-  another changes what that one decides. Conditions stored before there were bounds may be past
-  one, and so may those another version of CEL bounds: each process bounds a stored condition
+  errors gives nothing, and a deny's that errors denies. A check reads what the host passes through
+  a conversion of its own (`converting`), each list and map it holds too: a value CEL decodes or
+  merges whole each time a condition reads it, as JSON text or a packed or dynamic message, is
+  converted once for the check; one CEL would write out whole into an error, as a struct, or copy
+  whole on each read, as an array of more than 1 KiB, fails; and a value of the host's own type CEL
+  reads as one of its own, as a double, is read as the value it holds. So a read costs what it is
+  charged however the host passes the value, and a comparison that fails where either value holds a
+  double that isn't finite, as a key too, sees every double as CEL's own. Each runs within the most
+  evaluating it can cost, which its literals and types bound, and the ids, kinds, types and tenant a
+  check passes and its action, which are no longer than `MaxID`. What a check reads together is
+  bounded where it is stored, for each scope: an identity's conditional grants, the conditional
+  grants to groups, the tenant's members and the public, each the tenant's and those from each
+  source the host owns apart, the conditional denies, and the requirements of groups' eligibilities
+  for a role, and a change adding a condition past one is refused as invalid. A check's budget is
+  that for each scope on its path, so it evaluates every condition it reads, and no grant made
+  beside another changes what that one decides. Conditions stored before there were bounds may be
+  past one, and so may those another version of CEL bounds: each process bounds a stored condition
   again by what the CEL it is built with makes of it, its macros and types, so an upgrade can
   bound one more. `TestStoredConditionsKeepTheirBounds` pins the bounds of conditions of common
   shapes, so that one an upgrade moves shows in review. A change adding no condition to them isn't

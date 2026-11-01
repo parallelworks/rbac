@@ -18,8 +18,14 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/dynamicpb"
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/parallelworks/rbac"
 	"github.com/parallelworks/rbac/internal/pgtest"
@@ -2151,6 +2157,96 @@ func TestCopyingAListOfStringsForAHookAllocatesOnce(t *testing.T) {
 	}
 	if c, ok := rbac.DeepCopy(attributes)["groups"].([]any); !ok || &c[0] == &groups[0] {
 		t.Error("the copy shares the list")
+	}
+}
+
+// holdingItself is a Struct one of whose fields, self, holds it.
+func holdingItself() *structpb.Struct {
+	s := &structpb.Struct{Fields: map[string]*structpb.Value{"a": structpb.NewStringValue("b")}}
+	s.Fields["self"] = structpb.NewStructValue(s)
+	return s
+}
+
+// A hook is given a copy of a protobuf message among the attributes, as of anything else, which
+// cloning it made: but cloning keeps no record of what it copied, so a message holding itself, as
+// a Struct one of whose fields holds it, recursed until the stack overflowed, which ends the
+// process, and one reaching another twice copied it for each path to it. The copy keeps each
+// message it copies, as it keeps maps, lists and pointers, so it holds itself where the original
+// does and is otherwise what cloning makes: equal, and its own, its bytes and unknown fields too.
+func TestCopyingAMessageForAHookCopiesEachMessageItReachesOnce(t *testing.T) {
+	self, shared := holdingItself(), structpb.NewStringValue("x")
+	unknown := &structpb.Struct{}
+	unknown.ProtoReflect().SetUnknown(protowire.AppendVarint(protowire.AppendTag(nil, 99, protowire.VarintType), 1))
+	packed, err := anypb.New(wrapperspb.Bytes([]byte("b")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attributes := map[string]any{
+		"self": self, "twice": &structpb.ListValue{Values: []*structpb.Value{shared, shared}}, "dynamic": dynamicStruct(),
+		"packed": packed, "bytes": wrapperspb.Bytes([]byte("b")), "at": timestamppb.Now(), "unknown": unknown,
+	}
+	copied := rbac.DeepCopy(attributes)
+	if s, ok := copied["self"].(*structpb.Struct); !ok || s == self || s.Fields["self"].GetStructValue() != s {
+		t.Error("a Struct holding itself was copied as another")
+	} else if s.Fields["a"] = structpb.NewStringValue("c"); self.Fields["a"].GetStringValue() != "b" {
+		t.Error("a write to the copy reached the original")
+	}
+	if l, ok := copied["twice"].(*structpb.ListValue); !ok || l.Values[0] != l.Values[1] || l.Values[0] == shared {
+		t.Error("a value a list holds twice was copied but once")
+	}
+	if d, ok := copied["dynamic"].(*dynamicpb.Message); !ok || d == attributes["dynamic"] {
+		t.Error("a message of a dynamic type holding itself was copied as another")
+	} else {
+		fields, value := d.Descriptor().Fields().ByName("fields"), (&structpb.Value{}).ProtoReflect().Descriptor().Fields().ByName("struct_value")
+		if v := d.Get(fields).Map().Get(protoreflect.ValueOfString("self").MapKey()).Message(); v.Get(value).Message().Interface() != d {
+			t.Error("a copied message of a dynamic type doesn't hold itself")
+		}
+	}
+	for _, name := range []string{"packed", "bytes", "at", "unknown"} {
+		m, _ := attributes[name].(proto.Message)
+		if c, ok := copied[name].(proto.Message); !ok || c == m || !proto.Equal(c, m) || len(m.ProtoReflect().GetUnknown()) != len(c.ProtoReflect().GetUnknown()) {
+			t.Errorf("%s copied as %v", name, copied[name])
+		}
+	}
+	b, _ := copied["bytes"].(*wrapperspb.BytesValue)
+	if was, _ := attributes["bytes"].(*wrapperspb.BytesValue); b == nil || &b.Value[0] == &was.Value[0] {
+		t.Error("the copy shares the bytes")
+	}
+}
+
+// A check asks each constraint, and a change ValidateGrant, about copies of the attributes, a
+// message holding itself among them too: each is asked, rather than the process ending as copying
+// it overflowed the stack.
+func TestAHookIsAskedAboutAMessageHoldingItself(t *testing.T) {
+	asked := map[string]bool{}
+	holds := func(attributes map[string]any) bool {
+		m, ok := attributes["meta"].(*structpb.Struct)
+		return ok && m.Fields["self"].GetStructValue() == m
+	}
+	h := setup(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "meta", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			asked["constraint"] = asked["constraint"] || in.Resource != nil && holds(in.Resource.Attributes)
+			return false, nil
+		}}}
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			asked["ValidateGrant"] = asked["ValidateGrant"] || holds(in.Actor.Attributes)
+			return validate(ctx, q, in)
+		}
+	})
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "alice"))
+	r := cluster
+	r.Attributes = map[string]any{"meta": holdingItself()}
+	if !allowed(t, h, h.as(t, "alice"), login, r) {
+		t.Error("a check whose resource holds a message holding itself")
+	}
+	owner := h.as(t, "owner")
+	owner.Attributes = map[string]any{"meta": holdingItself()}
+	if err := h.authz.Apply(t.Context(), owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("bob")}}}); err != nil {
+		t.Fatal(err)
+	}
+	if !asked["constraint"] || !asked["ValidateGrant"] {
+		t.Errorf("asked %v", asked)
 	}
 }
 
