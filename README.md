@@ -511,37 +511,60 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
 - **Tables:** `rbac.Migrate` creates them, prefixed `rbac_`, in the connection's current schema,
   in a database whose encoding is UTF8, and records what it applied in `rbac_migrations`. It never
   runs by itself; a host with a migration tool of its own can apply `rbac.Migrations()` instead.
-  On a host's transaction it refuses any isolation but READ COMMITTED: a stricter one's snapshot
-  would miss the writes it waits for.
+  It applies each pending migration in a transaction of its own, which records it as it commits:
+  so a migration takes its locks in the order it names them, whatever was pending before it, and a
+  failure leaves the database at the last migration recorded, from which migrating again goes on.
+  The package's calls don't check what the database was migrated to: make them from a replica only
+  once its own migrations are applied, as `Migrate` returning nil says.
+  On a host's transaction it applies them all in one savepoint, and refuses any isolation but READ
+  COMMITTED: a stricter one's snapshot would miss the writes it waits for.
   A migration locks what it changes until it commits, and while it waits for a lock, every check,
   list and change of that table queues behind it, and of those it locked already. So `Migrate` has
   it wait at most 100 ms for any lock: a change that reads the tables in another order than a
   migration locks them would otherwise deadlock with it, as no order suits every change
   (`ChangeMembers` reads eligibilities and denies before custom roles, `DeleteRole` custom roles
   before eligibilities), and a transaction holding a table for long would stall them all. It then
-  rolls back and tries again, waiting longer each time, up to 10 times over about 20 seconds, and
-  then fails as `rbac.ErrConflict`: migrate again once what held the table, as a long export or
-  host transaction, has ended. A transaction waiting for a lock a migration holds, which holds one
-  the migration then waits for, is still ended as a deadlock where its `deadlock_timeout`, 1 second
-  by default, passes before the migration's wait does, and a call ended so, or by its session's
+  rolls it back and tries it again, waiting longer each time, up to 10 times over about 20 seconds,
+  and then fails as `rbac.ErrConflict`: migrate again once what held the table, as a long export or
+  host transaction, has ended. A wait that short ends before PostgreSQL's deadlock check, which runs
+  once a wait passes `deadlock_timeout` and alone cancels an autovacuum worker holding the table, as
+  one vacuuming a large history can for minutes: where one holds a table of the package's as a
+  migration gives way, the next try first takes that table's `SHARE UPDATE EXCLUSIVE` lock, waiting
+  a second past `deadlock_timeout` whatever the session's `lock_timeout`, so PostgreSQL cancels the
+  worker, and only then the migration's own locks. No check, list or change takes a lock that one
+  conflicts with, so none waits behind it, and none of the migration's is held yet. A worker on a
+  table the migration doesn't lock is canceled too; one vacuuming to prevent wraparound, which
+  PostgreSQL never cancels, holds the table until it ends, and the try goes on without that table's
+  lock once the wait ends, to the other tables' waits and then the migration, and each try after
+  waits so again: some 20 seconds more over the 10 tries for each such table, with the default
+  `deadlock_timeout`. A role without `pg_read_all_stats` can't read other sessions' backend types,
+  so it can't tell autovacuum's vacuums and analyses from a client's, and a client's `VACUUM` of a
+  table has it wait so too. A transaction waiting for a lock a migration holds, which holds one the
+  migration then waits for, is still ended as a deadlock where its `deadlock_timeout`, 1 second by
+  default, passes before the migration's wait does, and a call ended so, or by its session's
   `lock_timeout`, a read or a change, before its transaction or in it, is refused as
-  `rbac.ErrConflict`. A tool of the host's own gets none of this: apply each migration with a
-  short `lock_timeout`, and on SQLSTATE 55P03 or 40P01 roll it back and apply it again. Nor does
-  `Migrate` on a host's transaction, as rolling back to its savepoint frees nothing the host's
-  transaction took before, which what the migration waits for can be waiting for in turn, as a
-  request that read the package's tables and then reads a table of the host's that transaction
-  altered: it waits as that transaction's `lock_timeout` says, for PostgreSQL to end such a wait as
-  a deadlock. On any connection, it waits for another replica's migration as long as the session's
-  `lock_timeout` lets it.
+  `rbac.ErrConflict`. A tool of the host's own gets none of this: apply each migration in a
+  transaction of its own with a short `lock_timeout`, on SQLSTATE 55P03 or 40P01 roll it back and
+  apply it again, and where an autovacuum worker holds one of the package's tables as it gives way,
+  first lock that table `IN SHARE UPDATE EXCLUSIVE MODE` with a `lock_timeout` past
+  `deadlock_timeout`, and then apply the migration with the short one. Nor does `Migrate` on a
+  host's transaction, as rolling back to its savepoint frees nothing the host's transaction took
+  before, which what the migration waits for can be waiting for in turn, as a request that read the
+  package's tables and then reads a table of the host's that transaction altered: it waits as that
+  transaction's `lock_timeout` says, for PostgreSQL to end such a wait as a deadlock. On any
+  connection, it waits for another replica's migration as long as the session's `lock_timeout` lets
+  it, and where that ends the wait fails as `rbac.ErrConflict` without trying again.
   A migration that rebuilds an index, as `0009_grant_seeks` rebuilds two of `rbac_grants`, locks
   the table until it commits, so checks, lists and changes wait for the rebuild; one that builds
   an index, as `0011_tenant_keys` builds three on `rbac_eligibilities` and `rbac_denies`, keeps
   writes to the table waiting until it commits, though reads go on: on a large table, migrate when
   that wait is acceptable. Code from before `0012_activation_through` must not run beside code
   after it: an activation it extends keeps the eligibility recorded before, and can outlast the one
-  it was extended through. Stop the replicas running it before migrating. `0013_bounded_rows`
-  locks every table, history too, until it commits, and reads each once for each check it adds,
-  so checks, lists, changes and reads of history wait for it. `0015_history_seeks` builds two
+  it was extended through. Stop the replicas running it before migrating, and don't start them
+  again once `rbac_migrations` records 12, even where `Migrate` failed on a later migration, as it
+  records each as it commits. `0013_bounded_rows` locks every table, history too, until it
+  commits, and reads each once for each check it adds, so checks, lists, changes and reads of
+  history wait for it. `0015_history_seeks` builds two
   indexes on `rbac_history`, which every change writes, and analyzes it, so changes wait until it
   commits. Building one calls `rbac_tenant_keys` and `rbac_text_array` as history's role, as
   recording each deny does from then on, so it grants that role `EXECUTE` on both where it lacks
@@ -563,9 +586,10 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   `0019_principal_seeks` builds an index on `rbac_grants`, which keeps writes to it waiting until it
   commits, though reads go on, and rebuilds history's index of a principal's versions, which reads
   all of history, and analyzes it. It locks `rbac_grants` and then history before it builds either,
-  so reads of history, and every change, as each writes history, wait until it commits too, and only
-  a transaction under way as it starts that read history or made a change, as deleting a scope's
-  eligibilities and then its grants does, and then writes a grant can make it give way.
+  in a transaction of its own, whatever was pending before it, so reads of history, and every
+  change, as each writes history, wait until it commits too, and only a transaction under way as it
+  starts that read history or made a change, as deleting a scope's eligibilities and then its grants
+  does, and then writes a grant can make it give way.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A call PostgreSQL refuses for a race, as a
   serialization failure, a deadlock between host transactions, or a lock it waited for past the

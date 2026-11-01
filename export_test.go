@@ -20,7 +20,7 @@ func SetSavepointEnd(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { savepointEnd = old })
 }
 
-// SetMigrateAttempts has Migrate run its transaction at most n times, waiting backoff before the
+// SetMigrateAttempts has Migrate try each migration at most n times, waiting backoff before the
 // second, until t ends.
 func SetMigrateAttempts(t *testing.T, n int, backoff time.Duration) {
 	t.Helper()
