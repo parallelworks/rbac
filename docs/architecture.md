@@ -643,9 +643,10 @@ flowchart TB
   value is still decided on budgets of its own, which pay for every condition they read, whether
   they ran it or a value before them did, so it decides as a check of it alone would, and what one
   label asked for first never changes what another is decided by. Each walks only the read's grants
-  of roles giving values, and of each role its values, which the first decision narrows the read
-  to, reading each role once (`labeling`): a holding decides by nothing else, so the actor's grants
-  of other roles, however many or large, cost a label nothing.
+  of roles giving values or powers to release, and of each role only those, privileged and public
+  as the whole role is, which the first decision narrows the read to, reading each role once
+  (`labeling`): a holding decides by nothing else, so the actor's grants of other roles, however
+  many or large, cost a label nothing.
 - **Releasing and writing.** `ReleasePermission(dimension)`, held on the tenant, is the power to
   release data to a looser label in that dimension, so only a holder of it can downgrade data. A
   `Holding`'s `MayWrite` and `MayRelease` say whether data read under one label may be written, or

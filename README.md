@@ -137,10 +137,12 @@ scopes conditional ones reach, to check one by one.
 - **Labels on data:** a mandatory layer above every grant. A host declares label dimensions
   (`Config.Labels`), each `Ordered` (a level), `AllOf` (compartments) or `AnyOf` (releasable to
   these partners), and a resource carries its label (`Resource.Labels`), stored with it as its path
-  is. A subject holds a dimension's values as permissions, `dimension:value`, which roles for the
-  tenant give, so groups, eligibilities, expiry, conditions, denies on the tenant and history all
-  apply to them. Every check decides them, and the powers to release, on the tenant with no
-  attributes or label, whatever tenant it is passed, as a check of a labeled resource reads them,
+  is. A host declaring them supplies `Config.ResourceOf`, which gives the labels of the tenant, its
+  groups and the other scopes changes reach: `New` refuses them without it, as invalid. A subject
+  holds a dimension's values as permissions, `dimension:value`, which roles for the tenant give, so
+  groups, eligibilities, expiry, conditions, denies on the tenant and history all apply to them.
+  Every check decides them, and the powers to release, on the tenant with no attributes or label,
+  whatever tenant it is passed, as a check of a labeled resource reads them,
   and a change hands one on only as the actor holds it there: a condition of theirs can't read the
   tenant's attributes, only `resource.type`, `.id` and `.tenant`, and any read of
   `resource.attributes`, a test of an attribute's presence, `in`, `size()`, a macro or a comparison
@@ -165,8 +167,9 @@ scopes conditional ones reach, to check one by one.
   the members of many groups, decides each of the actor's values once in each phase, when a label
   first asks for it, and evaluates a condition of the actor's that doesn't read the action once for
   all of them, each value still on a budget of its own, as a check of it is. For each it walks only
-  the actor's grants giving values, and of their roles only the values, each role read once in each
-  phase, so the actor's grants of other roles, however many or large, cost a label nothing.
+  the actor's grants giving values or powers to release, and of their roles only those, each role
+  read once in each phase, so the actor's grants of other roles, however many or large, cost a label
+  nothing.
   `Filter` tests a `text[]` label column (`Columns.Labels`), which needs no
   index, as the path's drives the query; `Reachable` returns the holding, and `Holding` with
   `Satisfies` checks data points in a feed without reading the database.
