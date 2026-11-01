@@ -398,7 +398,7 @@ func (a *Authorizer) denying(actor Subject, on Resource, cs *constrained) error 
 		return &DeniedError{Permission: perm, Scope: on.Scope(), Reason: "an anonymous subject changes nothing"}
 	}
 	if cs.removes(perm, on.Type) {
-		return cmp.Or(cs.failed(), error(&DeniedError{Permission: perm, Scope: on.Scope(), Reason: "removed by " + cs.removedBy(perm)}))
+		return cmp.Or(cs.failed(), error(&DeniedError{Permission: perm, Scope: on.Scope(), Reason: "removed by " + cs.removedBy(perm, on.Type)}))
 	}
 	return nil
 }

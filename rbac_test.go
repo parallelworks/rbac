@@ -4474,45 +4474,83 @@ func TestARefusedGrantProvesNothingForTheNext(t *testing.T) {
 	}
 }
 
-// A refused grant's reason is what was found as it was decided: a later grant in the same change,
-// that a constraint refuses the same permission on another type, doesn't make the earlier refusal
-// the constraint's, as the actor never held it there.
+// A refused grant's reason names the constraint its own decision found removing what it lacks,
+// whatever order the change lists its grants in: not one that a grant before or after it found
+// removing the same permission on another type, where the actor never held it for this one's, nor,
+// where two constraints each remove it on a type of their own, the other; and one removing the
+// power to change grants that a role it grants gives, where the actor holds that power.
 func TestARefusalNamesOnlyTheConstraintThatRemovedWhatItLacks(t *testing.T) {
-	const constraint = "no root on workspaces"
+	onWorkspaces, onClusters, granting := "no root on workspaces", "no root on clusters", "no granting on clusters"
+	removing := func(name string, p rbac.Permission, on string) rbac.Constraint {
+		return rbac.Constraint{Name: name, Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			return in.Permission == p && in.ResourceType == on, nil
+		}}
+	}
 	h := setup(t, func(c *rbac.Config) {
-		c.Constraints = []rbac.Constraint{{Name: constraint, Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
-			return in.Permission == root && in.ResourceType == "workspace", nil
-		}}}
+		c.Constraints = []rbac.Constraint{removing(onWorkspaces, root, "workspace"), removing(onClusters, root, "cluster"), removing(granting, grantC, "cluster")}
 	})
 	ctx := t.Context()
-	// lead holds root for workspaces alone: custom.c needs it for clusters, custom.w for workspaces.
+	// custom.c needs root for clusters, custom.w and custom.v for workspaces, and custom.g the power
+	// to change grants on clusters.
 	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES
 		('t1', 'custom.hold', '{workspace:view,workspace:grant,cluster:root}', '{workspace}'),
+		('t1', 'custom.both', '{workspace:view,workspace:grant,cluster:root,cluster:grant}', '{workspace,cluster}'),
 		('t1', 'custom.c', '{cluster:root}', '{cluster}'),
-		('t1', 'custom.w', '{cluster:root}', '{workspace}')`); err != nil {
+		('t1', 'custom.w', '{cluster:root}', '{workspace}'),
+		('t1', 'custom.v', '{workspace:view,cluster:root}', '{workspace}'),
+		('t1', 'custom.g', '{cluster:grant}', '{cluster}')`); err != nil {
 		t.Fatal(err)
 	}
-	lead := h.as(t, "lead")
+	// lead holds root for workspaces alone, and boss for clusters too, and the power there.
+	lead, boss := h.as(t, "lead"), h.as(t, "boss")
 	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
-		VALUES ('t1', 'workspace', 'w1', 'user', 'lead', 'custom.hold')`); err != nil {
+		VALUES ('t1', 'workspace', 'w1', 'user', 'lead', 'custom.hold'), ('t1', 'workspace', 'w1', 'user', 'boss', 'custom.both')`); err != nil {
 		t.Fatal(err)
 	}
-	err := h.authz.Apply(ctx, lead, workspace, rbac.Change{Grant: []rbac.Binding{
-		{Role: "custom.c", Principal: identity("p1")}, {Role: "custom.w", Principal: identity("p2")},
-	}})
-	joined, ok := err.(interface{ Unwrap() []error })
-	if !ok {
-		t.Fatalf("want both grants refused, got %v", err)
-	}
-	var refused []string
-	for _, e := range joined.Unwrap() {
-		var denied *rbac.DeniedError
-		if errors.As(e, &denied) {
-			refused = append(refused, denied.Reason)
+	orders := [][]rbac.Role{{}}
+	for range 4 {
+		var longer [][]rbac.Role
+		for _, order := range orders {
+			for _, role := range []rbac.Role{"custom.c", "custom.w", "custom.v", "custom.g"} {
+				if !slices.Contains(order, role) {
+					longer = append(longer, append(slices.Clone(order), role))
+				}
+			}
 		}
+		orders = longer
 	}
-	if len(refused) != 2 || strings.Contains(refused[0], constraint) || !strings.Contains(refused[1], constraint) {
-		t.Fatalf("granting custom.c, needing root on clusters lead never held, then custom.w, needing it on workspaces %s removes: %q", constraint, refused)
+	for _, actor := range []struct {
+		s rbac.Subject
+		// clusters is what custom.c's refusal names, and grants custom.g's.
+		clusters, grants string
+	}{{lead, "", ""}, {boss, onClusters, granting}} {
+		want := map[rbac.Role]string{"custom.c": actor.clusters, "custom.w": onWorkspaces, "custom.v": onWorkspaces, "custom.g": actor.grants}
+		for _, order := range orders {
+			var grants []rbac.Binding
+			for i, role := range order {
+				grants = append(grants, rbac.Binding{Role: role, Principal: identity(fmt.Sprint("p", i))})
+			}
+			err := h.authz.Apply(ctx, actor.s, workspace, rbac.Change{Grant: grants})
+			joined, ok := err.(interface{ Unwrap() []error })
+			if !ok || len(joined.Unwrap()) != len(order) {
+				t.Fatalf("%s granting %v: want each refused, got %v", actor.s.Principal.ID, order, err)
+			}
+			for i, e := range joined.Unwrap() {
+				var denied *rbac.DeniedError
+				if !errors.As(e, &denied) {
+					t.Fatalf("%s granting %v: %v", actor.s.Principal.ID, order, e)
+				}
+				named := ""
+				for _, c := range []string{onWorkspaces, onClusters, granting} {
+					if strings.Contains(denied.Reason, c) {
+						named = c
+					}
+				}
+				if named != want[order[i]] {
+					t.Errorf("%s granting %v, %s refused naming %q, not %q: %s", actor.s.Principal.ID, order, order[i], named, want[order[i]], denied.Reason)
+				}
+			}
+		}
 	}
 }
 

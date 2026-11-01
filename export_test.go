@@ -232,7 +232,7 @@ func GrantsDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subje
 			for i := range au.held {
 				au.held[i].ends = time.Time{}
 			}
-			lacks, _ = a.mayGrant(au, pw, r.Type, def, b.Condition.Expression, time.Time{}, newChecked())
+			lacks, _, _ = a.mayGrant(au, pw, r.Type, def, b.Condition.Expression, time.Time{}, newChecked())
 		}
 		alone = append(alone, lacks)
 	}
