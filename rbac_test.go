@@ -10379,7 +10379,19 @@ func TestAnIDThatIsNoTextIsInvalid(t *testing.T) {
 			}
 		}
 	}
-	// A constraint can ask about the anonymous, who are in no group and no tenant.
+	// A constraint can ask about the anonymous, who are in no group and no tenant, and are granted
+	// nothing and eligible for nothing of their own, alone or beside others.
+	anonymous := rbac.GrantFilter{Principals: []rbac.Principal{{}}}
+	if grants, err := h.authz.Grants(ctx, "t1", anonymous); err != nil || len(grants) > 0 {
+		t.Errorf("Grants of the anonymous = %v, %v", grants, err)
+	}
+	if es, err := h.authz.Eligibilities(ctx, "t1", anonymous); err != nil || len(es) > 0 {
+		t.Errorf("Eligibilities of the anonymous = %v, %v", es, err)
+	}
+	beside := rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}, Principals: []rbac.Principal{{}, owner.Principal}}
+	if grants, err := h.authz.Grants(ctx, "t1", beside); err != nil || len(grants) != 1 || grants[0].Principal != owner.Principal {
+		t.Errorf("Grants of the anonymous and the owner = %v, %v", grants, err)
+	}
 	if groups, err := h.authz.GroupsOf(ctx, "t1", rbac.Principal{}); err != nil || len(groups) > 0 {
 		t.Errorf("GroupsOf the anonymous = %v, %v", groups, err)
 	}

@@ -2467,18 +2467,19 @@ func revokeArgs(tenant string, scope Scope, bindings, kept []Binding) []any {
 }
 
 // GrantFilter picks grants or eligibilities by scope, by principal, or both; at least one is
-// required.
+// required. The zero principal, the anonymous subject's, which a constraint may ask about, holds
+// none, as it has no membership and is in no group.
 type GrantFilter struct {
 	Scopes     []Scope
 	Principals []Principal
 }
 
 // valid reports whether the filter picks something, by scopes and principals that could be
-// stored in a tenant.
+// stored in a tenant, or the zero principal, whose key no row holds.
 func (f GrantFilter) valid(tenant string) bool {
 	return len(f.Scopes)+len(f.Principals) > 0 &&
 		!slices.ContainsFunc(f.Scopes, func(s Scope) bool { return !s.valid() }) &&
-		!slices.ContainsFunc(f.Principals, func(p Principal) bool { return !p.wellFormed(tenant) })
+		!slices.ContainsFunc(f.Principals, func(p Principal) bool { return p != (Principal{}) && !p.wellFormed(tenant) })
 }
 
 // sql is SQL selecting cols, in order, of the rows of table in tenant $1 in force at $4 that the

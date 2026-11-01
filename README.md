@@ -400,7 +400,8 @@ scopes conditional ones reach, to check one by one.
   asks nothing.
 - **Public access:** the zero `Subject` is anonymous and holds only what is granted to the public.
   Only a role marked `Public` can be granted to the public, and a grant to the public gives
-  nothing once its role no longer is.
+  nothing once its role no longer is. `Grants`, `Eligibilities`, `Memberships`, `MembershipsOf` and
+  `GroupsOf` take its zero principal, as a constraint may ask about it, and list nothing of it.
 - **Broad grants:** a grant to a tenant's members (`rbac.TenantMembers`) or the public never gives
   a privileged role, nor any permission that changes access, so changing access always takes a
   named identity or group.
