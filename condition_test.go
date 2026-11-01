@@ -1213,7 +1213,8 @@ func TestAValueReachedTwiceIsConvertedOnce(t *testing.T) {
 // Converting what the host passes isn't charged to a condition, so a check converts no more of it
 // than it may (MaxConverted), or every condition reading an attribute of any kind fails, as no
 // condition can then read the rest of what the host passed: JSON texts sharing a mebibyte of bytes
-// each took the check as long as decoding a mebibyte did.
+// each took the check as long as decoding a mebibyte did, and a kind's attributes were gathered
+// into a map made for as many as the host passed, a million taking 80 MB.
 func TestAttributesLargerThanACheckConvertsFailEveryCondition(t *testing.T) {
 	expr := `request.attributes.mfa == true`
 	small := map[string]any{"mfa": true, "l": make([]int, rbac.MaxConverted/4)}
@@ -1236,6 +1237,14 @@ func TestAttributesLargerThanACheckConvertsFailEveryCondition(t *testing.T) {
 		if allocated > 64<<20 {
 			t.Errorf("attributes holding %s allocated %d bytes", name, allocated)
 		}
+	}
+	// A kind's own map, as the host passes it, too.
+	many := make(map[string]any, 1<<20)
+	for i := range 1 << 20 {
+		many[fmt.Sprint(i)] = true
+	}
+	if allocated, over := rbac.Converting(t, many); !over || allocated > 16<<20 {
+		t.Errorf("a million attributes: past what a check converts %t, allocated %d bytes", over, allocated)
 	}
 }
 

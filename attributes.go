@@ -178,6 +178,12 @@ func (c *converter) attributes(attributes map[string]any) map[ref.Val]ref.Val {
 	if len(attributes) == 0 {
 		return nil
 	}
+	// Each costs at least its name and its value, so a map for more than are left isn't made, as
+	// one for a million took 80 MB, only to find them past it.
+	if 2*length(len(attributes)) > c.left {
+		c.over, c.left = true, 0
+		return nil
+	}
 	out := make(map[ref.Val]ref.Val, len(attributes))
 	for name, v := range attributes {
 		if !c.pay(textLength(len(name))) {
