@@ -710,7 +710,11 @@ func (d redefinition) widensTo(p Principal) bool {
 // decided once however many grants each has.
 type widenedTo map[PrincipalKind]bool
 
-func (d redefinition) widened() widenedTo {
+// widened is what d widens: nothing for no redefinition, as deleting a role is.
+func (d *redefinition) widened() widenedTo {
+	if d == nil {
+		return nil
+	}
 	return widenedTo{"": d.widensTo(Principal{}), Members: d.widensTo(Principal{Kind: Members}), Public: d.widensTo(Principal{Kind: Public})}
 }
 
@@ -831,8 +835,9 @@ func (a *Authorizer) revalidations(ctx context.Context, q DB, tenant string, d r
 		return nil, err
 	}
 	need := make([]revalidation, 0, len(grants)+len(eligible))
+	on := a.grantableTypes(d.now)
 	add := func(scope Scope, b Binding) {
-		if w.of(b.Principal) && a.known(tenant, b.Principal) && a.grantableOn(d.now, scope.Type) {
+		if w.of(b.Principal) && a.known(tenant, b.Principal) && on[scope.Type] {
 			need = append(need, revalidation{scope: scope, binding: b, role: d.now})
 		}
 	}
@@ -933,9 +938,10 @@ func (a *Authorizer) reachedBy(ctx context.Context, q DB, tenant string, id Role
 		}
 		ids = append(ids, slices.Sorted(maps.Keys(listers))...)
 	}
-	var w widenedTo
-	if d != nil {
-		w = d.widened()
+	w := d.widened()
+	var widenOn map[string]bool
+	if w.any() {
+		widenOn = a.grantableTypes(d.now)
 	}
 	scopes, err := a.rolesScopes(ctx, q, tenant, ids)
 	if err != nil {
@@ -948,7 +954,7 @@ func (a *Authorizer) reachedBy(ctx context.Context, q DB, tenant string, id Role
 			if n := len(r.own); n == 0 || r.own[n-1] != s.Scope {
 				r.own = append(r.own, s.Scope)
 			}
-			if w.of(Principal{Kind: s.broad}) && a.grantableOn(d.now, s.Type) {
+			if w.of(Principal{Kind: s.broad}) && widenOn[s.Type] {
 				r.widened[s.Scope] = true
 			}
 			continue
@@ -1039,9 +1045,9 @@ func (a *Authorizer) handingOn(custom map[Role]RoleDefinition, id Role, def Role
 // only where one binds the actor, or a label could refuse it, as none can where the actor's label
 // values satisfy every label, is the host asked about the scopes. Where none of the grants and
 // eligibilities on a scope will give more, as for deleting or narrowing the role, which there only
-// takes access away, a scope the host no longer has (ErrNotFound) is read as stored, with no
-// containers or label. au is the actor's authority on the tenant, which mayDefine checked the role
-// on.
+// takes access away, and no role listing it is granted there to hand it on, a scope the host no
+// longer has (ErrNotFound) is read as stored, with no containers or label. au is the actor's
+// authority on the tenant, which mayDefine checked the role on.
 func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authority, tenant string, id Role, types []string, d *redefinition,
 	change string,
 ) (roleReach, error) {
@@ -1450,6 +1456,19 @@ func (a *Authorizer) grantedOn(roleTypes []string) []string {
 	types := slices.Concat(roleTypes, a.containerTypes, []string{TenantScope})
 	slices.Sort(types)
 	return slices.Compact(types)
+}
+
+// grantableTypes are the scope types a custom role defined as def can be granted on (grantableOn),
+// decided once for a change that reads each of thousands of its grants: on a container,
+// grantableOn reads every permission the role gives, and it can give a thousand.
+func (a *Authorizer) grantableTypes(def RoleDefinition) map[string]bool {
+	types := map[string]bool{}
+	for _, t := range a.grantedOn(def.ResourceTypes) {
+		if a.grantableOn(def, t) {
+			types[t] = true
+		}
+	}
+	return types
 }
 
 // changedMeanwhile refuses a change to a role that another change redefined or created after
