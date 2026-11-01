@@ -83,6 +83,16 @@ type harness struct {
 	events []rbac.ChangeEvent
 }
 
+func TestMain(m *testing.M) {
+	code := m.Run()
+	//nolint:forbidigo // TestMain is the tests' main: once they have run, no test's context is left.
+	if err := pgtest.DropTemplates(context.Background()); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		code = max(code, 1)
+	}
+	os.Exit(code)
+}
+
 func setup(t *testing.T, mutate ...func(*rbac.Config)) *harness {
 	t.Helper()
 	return setupOn(t, pgtest.Open(t, ""), mutate...)
@@ -90,6 +100,14 @@ func setup(t *testing.T, mutate ...func(*rbac.Config)) *harness {
 
 // setupOn is setup on a pool of the test's own.
 func setupOn(t *testing.T, pool *pgxpool.Pool, mutate ...func(*rbac.Config)) *harness {
+	t.Helper()
+	h := harnessOn(t, pool, mutate...)
+	creator(t, pool)
+	return h
+}
+
+// harnessOn is setupOn without the creator's grant.
+func harnessOn(t *testing.T, pool *pgxpool.Pool, mutate ...func(*rbac.Config)) *harness {
 	t.Helper()
 	if err := rbac.Migrate(t.Context(), pool); err != nil {
 		t.Fatal(err)
@@ -131,15 +149,17 @@ func setupOn(t *testing.T, pool *pgxpool.Pool, mutate ...func(*rbac.Config)) *ha
 		t.Fatal(err)
 	}
 	h.authz, h.cfg = authz, cfg
-	creator(t, pool)
 	return h
 }
 
-// creator grants "owner" the cluster's admin role, around the hooks a test configures.
+// creatorGrant grants "owner" the cluster's admin role.
+const creatorGrant = `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+	VALUES ('t1', 'cluster', 'c1', 'user', 'owner', 'cluster.admin')`
+
+// creator writes creatorGrant, around the hooks a test configures.
 func creator(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
-	if _, err := pool.Exec(t.Context(), `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
-		VALUES ('t1', 'cluster', 'c1', 'user', 'owner', 'cluster.admin')`); err != nil {
+	if _, err := pool.Exec(t.Context(), creatorGrant); err != nil {
 		t.Fatal(err)
 	}
 }

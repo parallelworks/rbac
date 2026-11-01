@@ -12,11 +12,88 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  go:
+  # What needs no database runs once, beside the test shards.
+  checks:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read # checkout
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        id: setup-go
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Locate Go caches
+        id: go-paths
+        run: |
+          echo "build=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+          echo "modules=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+      # setup-go restores only an exact key, so a dependency bump would start lint
+      # and tests from nothing. A prefix match reuses most of the last build; Go
+      # trims stale builds itself, and each Go release starts a fresh cache. Lint
+      # and the tests build different things, so each keeps a cache of its own.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: go-cache
+        with:
+          path: |
+            ${{ steps.go-paths.outputs.build }}
+            ${{ steps.go-paths.outputs.modules }}
+          key: go-checks-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum', 'tools/go.sum') }}
+          restore-keys: go-checks-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-
+      - name: Verify go.mod is tidy
+        run: make tidy-check
+      - name: Lint
+        run: make lint
+      - name: Check dependencies for known vulnerabilities
+        run: make vulncheck
+      # Only canary saves: PRs can read canary's caches, while caches saved by
+      # PRs are visible to no other branch and crowd canary's out of the quota.
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.event_name == 'push' && steps.go-cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ${{ steps.go-paths.outputs.build }}
+            ${{ steps.go-paths.outputs.modules }}
+          key: ${{ steps.go-cache.outputs.cache-primary-key }}
+
+  # Names the newest test timings this branch or canary saved, which every shard
+  # then restores by that name: shards that read different timings could each
+  # leave out a test the others place with them, or run one they run.
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      timings: ${{ steps.timings.outputs.cache-matched-key }}
+    steps:
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: timings
+        with:
+          path: test-timings.json
+          # No entry is saved under the bare prefix, so this finds the newest.
+          key: test-timings-
+          restore-keys: test-timings-
+          lookup-only: true
+
+  # Each shard runs the top-level tests of its own share of the time, selected
+  # with -run, against a database of its own; see CONTRIBUTING.md.
+  test:
+    name: test (${{ matrix.shard }}/${{ strategy.job-total }})
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read # checkout
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      TEST_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
     services:
       postgres:
         image: postgres:18@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
@@ -43,9 +120,6 @@ jobs:
         run: |
           echo "build=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
           echo "modules=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
-      # setup-go restores only an exact key, so a dependency bump would start lint
-      # and tests from nothing. A prefix match reuses most of the last build; Go
-      # trims stale builds itself, and each Go release starts a fresh cache.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: go-cache
         with:
@@ -54,28 +128,101 @@ jobs:
             ${{ steps.go-paths.outputs.modules }}
           key: go-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.sum', 'tools/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}-
-      - name: Verify go.mod is tidy
-        run: make tidy-check
-      - name: Lint
-        run: make lint
-      - name: Check dependencies for known vulnerabilities
-        run: make vulncheck
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: needs.plan.outputs.timings != ''
+        with:
+          path: test-timings.json
+          key: ${{ needs.plan.outputs.timings }}
+          fail-on-cache-miss: true
       - name: Test
         env:
           # go.mod also sets fips140=only; the environment makes the mode explicit
           # so that a future go.mod edit cannot silently drop it.
           GODEBUG: fips140=only
           RBAC_TEST_DATABASE_URL: postgres://postgres@localhost:5432/rbac_test?sslmode=disable
-        run: make test
-      # Only canary saves: PRs can read canary's caches, while caches saved by
-      # PRs are visible to no other branch and crowd canary's out of the quota.
+          TEST_TIMINGS: ${{ needs.plan.outputs.timings != '' && format('{0}/test-timings.json', github.workspace) || '' }}
+        shell: bash
+        # The JSON keeps each test's time; the log shows its output.
+        run: >-
+          make -s test "SHARD=$TEST_SHARD" "TIMINGS=$TEST_TIMINGS" 'TESTFLAGS=-json -coverprofile=coverage.out' | tee test-results.json |
+          jq -Rrj --unbuffered '. as $line | try (fromjson | .Output // empty) catch "\($line)\n"'
+      # For the go job to check the shards ran every test between them.
+      - name: List the tests
+        run: |
+          echo "$TEST_SHARD" > shard
+          make -s test 'TESTFLAGS=-json -list .' > test-list.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: test-results-${{ matrix.shard }}
+          path: |
+            test-results.json
+            coverage.out
+            shard
+            test-list.json
+          retention-days: 7
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.event_name == 'push' && steps.go-cache.outputs.cache-hit != 'true'
+        if: github.event_name == 'push' && matrix.shard == 1 && steps.go-cache.outputs.cache-hit != 'true'
         with:
           path: |
             ${{ steps.go-paths.outputs.build }}
             ${{ steps.go-paths.outputs.modules }}
           key: ${{ steps.go-cache.outputs.cache-primary-key }}
+
+  # Passes once every check and shard has, and the shards ran every test between
+  # them, and then saves the tests' times, by which the next runs balance their
+  # shards. They take a few kilobytes, so unlike the Go caches, a PR's can't
+  # crowd canary's out. It runs even in a cancelled run, and fails it: branch
+  # protection passes a required job its if skips.
+  go:
+    if: ${{ always() }}
+    needs: [checks, plan, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # checkout, for the shard check
+    steps:
+      - name: Require every check and shard
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            if [ "$result" != success ]; then
+              echo "::error::a job this needs ended $result"
+              exit 1
+            fi
+          done
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: test-results-*
+          path: test-results
+      - name: Check the shards ran every test between them
+        run: go run ./internal/shards check test-results
+      # Each shard's coverage counts only what its own tests reach.
+      - name: Coverage of every shard's tests
+        shell: bash
+        run: >-
+          awk 'FNR == 1 { next } { package = $1; sub(/\/[^\/]*$/, "", package); of[$1] = package; statements[$1] = $2; if ($3 > 0) reached[$1] = 1 }
+          END { for (b in of) { all[of[b]] += statements[b]; if (b in reached) covered[of[b]] += statements[b] };
+          for (p in all) printf "%s coverage: %.1f%% of statements\n", p, 100 * covered[p] / all[p] }'
+          test-results/*/coverage.out | sort | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Keep each top-level test's time
+        shell: bash
+        run: >-
+          cat test-results/*/test-results.json |
+          jq -Rc 'fromjson? | select(.Test and (.Test | contains("/") | not) and (.Action == "pass" or .Action == "fail"))
+          | {Action, Package, Test, Elapsed}' > test-timings.json
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: test-timings.json
+          key: test-timings-${{ github.run_id }}-${{ github.run_attempt }}
 
   # Audits the workflows themselves: unpinned actions, template injection,
   # excessive permissions, cache poisoning in release jobs.

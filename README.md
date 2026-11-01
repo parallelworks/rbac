@@ -751,5 +751,6 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
 ## Development
 
 `make check` runs every linter and test. The tests need a PostgreSQL database they may create
-schemas in, named by `RBAC_TEST_DATABASE_URL`; without it they are skipped. See
+schemas in, named by `RBAC_TEST_DATABASE_URL`; without it they are skipped. CI runs them in shards,
+each running its own top-level tests whole, and `make test SHARD=i/n` runs one; see
 [CONTRIBUTING.md](CONTRIBUTING.md).

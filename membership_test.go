@@ -534,23 +534,8 @@ func TestCountingAPrincipalsGroupsReadsTheIndexAlone(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// So the visibility map lets a scan of an index skip the rows. VACUUM marks none visible to all
-	// while an older snapshot elsewhere in the database, such as another run's, is open.
-	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(time.Second) {
-		if _, err := h.pool.Exec(ctx, `VACUUM (ANALYZE) rbac_members`); err != nil {
-			t.Fatal(err)
-		}
-		var visible bool
-		if err := h.pool.QueryRow(ctx, `SELECT relallvisible >= relpages FROM pg_class WHERE oid = 'rbac_members'::regclass`).Scan(&visible); err != nil {
-			t.Fatal(err)
-		}
-		if visible {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Skip("an older snapshot elsewhere in the database keeps rbac_members' rows from being visible to all")
-		}
-	}
+	// So the visibility map lets a scan of an index skip the rows.
+	visibleToAll(t, h, "rbac_members", `VACUUM (ANALYZE) rbac_members`)
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)

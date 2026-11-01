@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -3330,30 +3333,248 @@ func custom(t *testing.T, mutate ...func(*rbac.Config)) *harness {
 
 // crowded is setupOn in a database of many small tenants beside t1, where a principal and a scope
 // hold a grant or two, a group has a member or two, and a scope has an eligibility and a deny or
-// two, which name a group.
+// two, which name a group. Writing them through history's trigger takes seconds, so a test process
+// writes them once, in a template, and each test copies it: the rows and history's records of them,
+// in the same places, with no statistics and no row visible to all, as writing them leaves.
 func crowded(t *testing.T, pool *pgxpool.Pool, mutate ...func(*rbac.Config)) *harness {
 	t.Helper()
-	h := setupOn(t, pool, mutate...)
-	for _, q := range []string{
-		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
-		 SELECT 's' || j, 'cluster', 'c' || i, 'user', 'u' || j || '-' || i, 'cluster.admin' FROM generate_series(1, 2000) j, generate_series(1, 10) i`,
-		`INSERT INTO rbac_groups (tenant, id) SELECT 's' || j, 'g' || i FROM generate_series(1, 2000) j, generate_series(1, 3) i`,
-		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id)
-		 SELECT 's' || j, 'user', 'u' || j || '-' || i FROM generate_series(1, 2000) j, generate_series(1, 3) i`,
-		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
-		 SELECT 's' || j, 'g' || i, 'user', 'u' || j || '-' || i FROM generate_series(1, 2000) j, generate_series(1, 3) i`,
-		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
-		 SELECT 's' || j, 'cluster', 'c' || i, 'user', 'u' || j || '-' || i, 'cluster.sudo', 3600, ARRAY['group:g' || i]
-		 FROM generate_series(1, 2000) j, generate_series(1, 2) i`,
-		`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
-		 SELECT 's' || j, 'cluster', 'c' || i, 'd', ARRAY['group:g' || i], ARRAY['user:u' || j || '-' || i], '{cluster:root}'
-		 FROM generate_series(1, 2000) j, generate_series(1, 2) i`,
-	} {
-		if _, err := h.pool.Exec(t.Context(), q); err != nil {
+	h := harnessOn(t, pool, mutate...)
+	pgtest.Copy(t, pool, pgtest.Template(t, "crowded", crowd), crowdedTables...)
+	return h
+}
+
+// crowdedTables are the tables crowd writes, history last, as it records the others.
+var crowdedTables = []string{
+	"rbac_grants", "rbac_roles", "rbac_groups", "rbac_memberships", "rbac_members", "rbac_eligibilities", "rbac_denies", "rbac_history",
+}
+
+// crowd writes what crowded holds, as setupOn and crowding do.
+func crowd(ctx context.Context, pool *pgxpool.Pool) error {
+	if err := rbac.Migrate(ctx, pool); err != nil {
+		return err
+	}
+	for _, q := range append([]string{creatorGrant}, crowding...) {
+		if _, err := pool.Exec(ctx, q); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// crowding writes crowded's tenants beside t1.
+var crowding = []string{
+	`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+	 SELECT 's' || j, 'cluster', 'c' || i, 'user', 'u' || j || '-' || i, 'cluster.admin' FROM generate_series(1, 2000) j, generate_series(1, 10) i`,
+	`INSERT INTO rbac_groups (tenant, id) SELECT 's' || j, 'g' || i FROM generate_series(1, 2000) j, generate_series(1, 3) i`,
+	`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id)
+	 SELECT 's' || j, 'user', 'u' || j || '-' || i FROM generate_series(1, 2000) j, generate_series(1, 3) i`,
+	`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+	 SELECT 's' || j, 'g' || i, 'user', 'u' || j || '-' || i FROM generate_series(1, 2000) j, generate_series(1, 3) i`,
+	`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+	 SELECT 's' || j, 'cluster', 'c' || i, 'user', 'u' || j || '-' || i, 'cluster.sudo', 3600, ARRAY['group:g' || i]
+	 FROM generate_series(1, 2000) j, generate_series(1, 2) i`,
+	`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+	 SELECT 's' || j, 'cluster', 'c' || i, 'd', ARRAY['group:g' || i], ARRAY['user:u' || j || '-' || i], '{cluster:root}'
+	 FROM generate_series(1, 2000) j, generate_series(1, 2) i`,
+}
+
+// A crowded copy is what writing it afresh makes. It holds the template's every row at the same
+// place, and as many pages of each table and index; the template holds the rows writing afresh
+// does, history's records of them among them, in the order they were written, but for what each
+// writing makes anew: the grants' random ids, the times and the transactions. The copy has no
+// statistics and no row visible to all, as nothing has vacuumed or analyzed it, its triggers are as
+// migrating left them, and what is written next is recorded after what it copied.
+func TestACrowdedCopyIsWhatWritingItAfreshMakes(t *testing.T) {
+	ctx := t.Context()
+	copied := crowded(t, pgtest.Open(t, ""))
+	copySchema := currentSchema(t, copied)
+	// Checked first, as autovacuum may analyze and vacuum the tables once they are written.
+	empty := currentSchema(t, setup(t))
+	if got, want := relationStats(t, copied, copySchema), relationStats(t, copied, empty); !maps.Equal(got, want) {
+		t.Errorf("a copy's statistics are %v, not as migrating left them: %v", got, want)
+	}
+	if got, want := triggersOf(t, copied, copySchema), triggersOf(t, copied, empty); !slices.Equal(got, want) {
+		t.Errorf("a copy's triggers are %v, not as migrating left them: %v", got, want)
+	}
+	for _, table := range crowdedTables {
+		if fetched, rows := heapFetches(t, copied, copySchema+"."+table); fetched != rows {
+			t.Errorf("an index-only scan of a copy's %s read %v of its %v rows from the table: some are visible to all", table, fetched, rows)
+		}
+	}
+
+	template := pgtest.Template(t, "crowded", crowd)
+	fresh := setupOn(t, pgtest.Open(t, ""))
+	for _, q := range crowding {
+		if _, err := fresh.pool.Exec(ctx, q); err != nil {
 			t.Fatal(err)
 		}
 	}
-	return h
+	afresh := currentSchema(t, fresh)
+	for _, table := range crowdedTables {
+		var rows, misplaced int
+		if err := copied.pool.QueryRow(ctx, fmt.Sprintf(`SELECT (SELECT count(*) FROM %[1]s.%[3]s), (SELECT count(*) FROM (
+			  (SELECT ctid, * FROM %[1]s.%[3]s EXCEPT ALL SELECT ctid, * FROM %[2]s.%[3]s)
+			  UNION ALL (SELECT ctid, * FROM %[2]s.%[3]s EXCEPT ALL SELECT ctid, * FROM %[1]s.%[3]s)) d)`, copySchema, template, table)).Scan(&rows, &misplaced); err != nil {
+			t.Fatal(err)
+		}
+		if misplaced != 0 {
+			t.Errorf("%d of the %d rows of the template's %s aren't at the same place in its copy", misplaced, rows, table)
+		}
+		// But for what each writing makes anew: the grants' random ids, the times, the transactions,
+		// and the bytes the times take as JSON.
+		row := `to_jsonb(r) - '{created_at,updated_at}'::text[]`
+		order := "r.ctid"
+		switch table {
+		case "rbac_grants":
+			row = `to_jsonb(r) - '{id,created_at,updated_at}'::text[]`
+		case "rbac_eligibilities":
+			order = "r.id"
+		case "rbac_history":
+			row = `to_jsonb(r) - '{txid,recorded_at,effective_at,bytes,key,after}'::text[] || jsonb_build_object(
+				'key', CASE WHEN r.entity = 'grant' THEN NULL ELSE r.key END,
+				'after', CASE WHEN r.entity = 'grant' THEN r.after - 'id' ELSE r.after END - '{created_at,updated_at}'::text[])`
+			order = "r.id"
+		}
+		written := func(schema string) string {
+			return `SELECT row_number() OVER (ORDER BY ` + order + `), ` + row + ` FROM ` + schema + `.` + table + ` r`
+		}
+		var differ int
+		var example *string
+		if err := copied.pool.QueryRow(ctx, `SELECT count(*), min(d.row::text) FROM ((`+written(template)+` EXCEPT ALL `+written(afresh)+`)
+			UNION ALL (`+written(afresh)+` EXCEPT ALL `+written(template)+`)) d (n, row)`).Scan(&differ, &example); err != nil {
+			t.Fatal(err)
+		}
+		if differ != 0 || rows == 0 && table != "rbac_roles" {
+			t.Errorf("%d of the %d rows of the template's %s differ from writing it afresh, such as %v", differ, rows, table, example)
+		}
+	}
+	for _, sequence := range []string{"rbac_eligibilities_id_seq", "rbac_history_id_seq"} {
+		var inCopy, inTemplate string
+		if err := fresh.pool.QueryRow(ctx, `SELECT (SELECT row(last_value, is_called)::text FROM `+copySchema+`.`+sequence+`),
+			(SELECT row(last_value, is_called)::text FROM `+template+`.`+sequence+`)`).Scan(&inCopy, &inTemplate); err != nil {
+			t.Fatal(err)
+		}
+		if inCopy != inTemplate {
+			t.Errorf("a copy's %s is %s, and the template's %s", sequence, inCopy, inTemplate)
+		}
+	}
+	// The pages of each table and index are as many as the template's, and as a fresh writing's but
+	// for the few the times' lengths move, and those of the index of the grants' random ids, which
+	// leave its pages as full as the order they happen to come in: two writings of its 20,000 keys
+	// came 12% apart, so it is held to a quarter; the copy is held to the template's exactly.
+	copies, templates, written := relationPages(t, copied, copySchema), relationPages(t, copied, template), relationPages(t, copied, afresh)
+	for relation, pages := range templates {
+		if copies[relation] != pages {
+			t.Errorf("a copy's %s has %d pages, and the template's %d", relation, copies[relation], pages)
+		}
+		within := max(1, pages/50)
+		if relation == "rbac_grants_pkey" {
+			within = pages / 4
+		}
+		if diff := written[relation] - pages; max(diff, -diff) > within {
+			t.Errorf("a fresh writing's %s has %d pages, and the template's %d", relation, written[relation], pages)
+		}
+	}
+	// What is written next is recorded after what the copy holds, by the triggers it left enabled.
+	if _, err := copied.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'next', 'cluster.login')`); err != nil {
+		t.Fatal(err)
+	}
+	var id int64
+	if err := copied.pool.QueryRow(ctx, `SELECT id FROM rbac_history WHERE principal = 'user:next'`).Scan(&id); err != nil || id != 46002 {
+		t.Errorf("a grant written to a copy was recorded as %d, not after its 46001 records: %v", id, err)
+	}
+}
+
+// currentSchema is the schema of h's pool's connections, quoted.
+func currentSchema(t *testing.T, h *harness) string {
+	t.Helper()
+	var schema string
+	if err := h.pool.QueryRow(t.Context(), `SELECT quote_ident(current_schema())`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	return schema
+}
+
+// relationPages is how many pages each table and index of schema has, by name.
+func relationPages(t *testing.T, h *harness, schema string) map[string]int64 {
+	t.Helper()
+	return relationValues[int64](t, h, `SELECT relname::text, pg_relation_size(oid) / current_setting('block_size')::int FROM pg_class
+		WHERE relnamespace = $1::regnamespace AND relkind IN ('r', 'i')`, schema)
+}
+
+// relationStats is what the statistics say of each table and index of schema, by name: its rows,
+// its pages and those visible to all, and how many of its columns were analyzed.
+func relationStats(t *testing.T, h *harness, schema string) map[string]string {
+	t.Helper()
+	return relationValues[string](t, h, `SELECT c.relname::text, concat_ws(' ', c.reltuples, c.relpages, c.relallvisible,
+		  (SELECT count(*) FROM pg_statistic s WHERE s.starelid = c.oid))
+		FROM pg_class c WHERE c.relnamespace = $1::regnamespace AND c.relkind IN ('r', 'i')`, schema)
+}
+
+func relationValues[V any](t *testing.T, h *harness, query, schema string) map[string]V {
+	t.Helper()
+	rows, err := h.pool.Query(t.Context(), query, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := map[string]V{}
+	var name string
+	var value V
+	if _, err := pgx.ForEachRow(rows, []any{&name, &value}, func() error {
+		values[name] = value
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return values
+}
+
+// triggersOf is each trigger of schema's tables and how it is enabled.
+func triggersOf(t *testing.T, h *harness, schema string) []string {
+	t.Helper()
+	rows, err := h.pool.Query(t.Context(), `SELECT concat_ws(' ', c.relname, g.tgname, g.tgenabled) FROM pg_trigger g
+		JOIN pg_class c ON c.oid = g.tgrelid WHERE c.relnamespace = $1::regnamespace AND NOT g.tgisinternal ORDER BY 1`, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	triggers, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return triggers
+}
+
+// heapFetches is how many rows an index-only scan of every row of table read from the table, as
+// the visibility map doesn't mark their pages visible to all, and how many it scanned.
+func heapFetches(t *testing.T, h *harness, table string) (fetched, rows float64) {
+	t.Helper()
+	ctx := t.Context()
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off`); err != nil {
+		t.Fatal(err)
+	}
+	var plan []struct {
+		Plan struct {
+			Plans []struct {
+				NodeType    string  `json:"Node Type"`
+				HeapFetches float64 `json:"Heap Fetches"`
+				ActualRows  float64 `json:"Actual Rows"`
+			}
+		}
+	}
+	if err := tx.QueryRow(ctx, `EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM `+table).Scan(&plan); err != nil {
+		t.Fatal(err)
+	}
+	if len(plan) != 1 || len(plan[0].Plan.Plans) != 1 || plan[0].Plan.Plans[0].NodeType != "Index Only Scan" {
+		t.Fatalf("counting %s's rows was planned as %+v, not as an index-only scan", table, plan)
+	}
+	scan := plan[0].Plan.Plans[0]
+	return scan.HeapFetches, scan.ActualRows
 }
 
 // A check, a list of what a subject may do and a change's authority read, of the grants, only the
@@ -3481,23 +3702,74 @@ func TestChecksReadTheirGrantsFromAnIndexAlone(t *testing.T) {
 }
 
 // grantsVisibleToAll vacuums rbac_grants until its visibility map marks every row visible to all, so
-// a scan of an index can skip the rows. VACUUM marks none so while an older snapshot elsewhere in
-// the database, such as another run's, is open: then it skips the test.
+// a scan of an index can skip the rows.
 func grantsVisibleToAll(t *testing.T, h *harness) {
 	t.Helper()
-	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(time.Second) {
-		if _, err := h.pool.Exec(t.Context(), `VACUUM rbac_grants`); err != nil {
+	visibleToAll(t, h, "rbac_grants", `VACUUM rbac_grants`)
+}
+
+// visibleToAll runs vacuum until the visibility map marks every page of table visible to all.
+// VACUUM marks none so while a snapshot older than its rows is open elsewhere in the database, such
+// as another run's: it waits up to 30 seconds for that to end, and then skips the test, or fails it
+// in CI, as outwaited says.
+func visibleToAll(t *testing.T, h *harness, table, vacuum string) {
+	t.Helper()
+	ctx := t.Context()
+	const wait = 30 * time.Second
+	ci, _ := strconv.ParseBool(os.Getenv("CI"))
+	for deadline := time.Now().Add(wait); ; time.Sleep(50 * time.Millisecond) {
+		if _, err := h.pool.Exec(ctx, vacuum); err != nil {
 			t.Fatal(err)
 		}
 		var visible bool
-		if err := h.pool.QueryRow(t.Context(), `SELECT relallvisible >= relpages FROM pg_class WHERE oid = 'rbac_grants'::regclass`).Scan(&visible); err != nil {
+		var open time.Duration
+		var session string
+		if err := h.pool.QueryRow(ctx, `SELECT c.relallvisible >= c.relpages, coalesce(s.open, '0'), coalesce(s.session, '')
+			FROM pg_class c LEFT JOIN LATERAL (
+			  SELECT now() - xact_start AS open, format('pid %s, %s: %s', pid, state, left(query, 200)) AS session
+			  FROM pg_stat_activity
+			  WHERE datname = current_database() AND pid <> pg_backend_pid()
+			    AND age(backend_xmin) >= (SELECT min(age(xmin)) FROM `+table+`)
+			  ORDER BY xact_start LIMIT 1) s ON true
+			WHERE c.oid = $1::regclass`, table).Scan(&visible, &open, &session); err != nil {
 			t.Fatal(err)
 		}
 		if visible {
 			return
 		}
-		if time.Now().After(deadline) {
-			t.Skip("an older snapshot elsewhere in the database keeps rbac_grants' rows from being visible to all")
+		if giveUp, skip := outwaited(open, wait, time.Now().After(deadline), ci); giveUp {
+			why := fmt.Sprintf("a snapshot open for %v elsewhere in the database keeps the rows of %s from being visible to all: %s", open.Round(time.Second), table, session)
+			if skip {
+				t.Skip(why)
+			}
+			t.Fatal(why)
+		}
+	}
+}
+
+// outwaited is whether visibleToAll stops waiting for a snapshot open for open, whether or not it
+// is late past its wait, and whether it then skips the test rather than failing it. On a database
+// other runs share, it skips at once where the snapshot has been open longer than the wait already,
+// as one left open so long, such as an idle session's, seldom ends meanwhile. In CI, where each run
+// has a database of its own, only the run's own sessions hold snapshots, so one it can't wait out
+// is a session a test left open, which a skip would hide: it fails, once it has waited.
+func outwaited(open, wait time.Duration, late, ci bool) (giveUp, skip bool) {
+	if ci {
+		return late, false
+	}
+	return late || open > wait, true
+}
+
+func TestVisibilityWaitsFailInCIRatherThanSkip(t *testing.T) {
+	const wait = 30 * time.Second
+	for _, open := range []time.Duration{0, wait, time.Hour} {
+		for _, late := range []bool{false, true} {
+			if giveUp, skip := outwaited(open, wait, late, true); giveUp != late || skip {
+				t.Errorf("in CI, for a snapshot open for %v, late %t, it gives up %t and skips %t", open, late, giveUp, skip)
+			}
+			if giveUp, skip := outwaited(open, wait, late, false); giveUp != (late || open > wait) || !skip {
+				t.Errorf("on a shared database, for a snapshot open for %v, late %t, it gives up %t and skips %t", open, late, giveUp, skip)
+			}
 		}
 	}
 }

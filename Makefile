@@ -7,6 +7,13 @@ SHELL := /bin/bash
 GOTOOL := go tool -modfile=tools/go.mod
 # Keep local tests in the same mode as CI, even if go.mod's default changes.
 export GODEBUG := fips140=only
+# `make test` runs every test, and TESTFLAGS adds flags to go test, such as -json or -run.
+# `make test SHARD=i/n` runs only the top-level tests of the ith of n shards, as CI does, placed by
+# the times in TIMINGS, a file of `go test -json` output, where it is given; see CONTRIBUTING.md.
+# Its -run comes after TESTFLAGS, so it replaces theirs.
+# The flags the tests build with: shards select lists them built alike, so they build once.
+TESTBUILD := -race -cover
+GOTEST := go test $(TESTBUILD) -shuffle=on -timeout 30m
 
 .PHONY: help
 help: ## Show this help
@@ -29,5 +36,10 @@ vulncheck: ## Check Go dependencies for vulnerabilities
 	$(GOTOOL) govulncheck ./...
 
 .PHONY: test
-test: ## Run the tests with race detection and coverage
-	go test -race -shuffle=on -cover -timeout 30m ./...
+test: ## Run the tests with race detection and coverage; SHARD=i/n runs one shard
+ifdef SHARD
+	run="$$(go run ./internal/shards select -shard '$(SHARD)' -timings '$(TIMINGS)' -- $(TESTBUILD) ./...)" && \
+	$(GOTEST) $(TESTFLAGS) -run "$$run" ./...
+else
+	$(GOTEST) $(TESTFLAGS) ./...
+endif
