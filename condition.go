@@ -69,6 +69,10 @@ import (
 // its label asks for, and Holding, Filter and Reachable each of the subject's label values, as a
 // check of it would, evaluating a condition that doesn't read the action once for them all, so on
 // the tenant one that does counts once for each label value its grants give or its denies deny. A
+// change checking the labels of many scopes by one read of its actor's values decides each value
+// once, when a label first asks for it, and evaluates such a condition once for all of them in each
+// of its phases: each value is still decided on a budget of its own, which pays for every condition
+// it reads, whether it ran it or a value before it did, so it decides as a check of it would. A
 // change adding a condition past a bound, or one evaluated more, as by redefining a role to give
 // more label values (SetRole), is refused as invalid, so no grant, deny or eligibility stored
 // changes what the others decide, but one adding none isn't: conditions
@@ -137,9 +141,10 @@ type budget struct {
 	compiled  map[string]bool
 	decided   map[string]decision
 	// ran is what conditions came to, evaluated on the same request but for its action, which a
-	// listing's budgets for each permission share: each pays for a condition as if it evaluated it,
-	// so it decides as a check of its permission would, but one that doesn't read the action runs
-	// once for them all. nil for a budget that shares none, whose one request decided covers.
+	// listing's budgets for each permission share, and a change's for each label value it decides by
+	// one read of its actor's (runs): each pays for a condition as if it evaluated it, so it decides
+	// as a check of its permission would, but one that doesn't read the action runs once for them
+	// all. nil for a budget that shares none, whose one request decided covers.
 	ran map[string]run
 }
 

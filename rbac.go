@@ -149,10 +149,21 @@ func (a *Authorizer) acts(k PrincipalKind) bool { return k == User || a.kinds[k]
 // later: a grant to a tenant's members or the public never gives a permission to change grants,
 // and one to the public gives only while its role is marked Public.
 func (p Principal) carries(role RoleDefinition, perm Permission) bool {
-	if p.broad() && perm.managesAccess() {
+	c := p.carrier()
+	if c != "" && perm.managesAccess() {
 		return false
 	}
-	return p.Kind != Public || role.Public
+	return c != Public || role.Public
+}
+
+// carrier is all that carries and holding.carries read of p, so grants of a role to two principals
+// of one carrier give alike, as a change deciding grants by kinds of its actor's needs (decidedAs):
+// the kind of a broad principal, and none for an identity or a group.
+func (p Principal) carrier() PrincipalKind {
+	if p.broad() {
+		return p.Kind
+	}
+	return ""
 }
 
 // publicRoles keeps the built-in roles marked Public, the only built-in ones a grant to the
@@ -542,7 +553,9 @@ type ConstraintInput struct {
 	// on any of them: one that tells them apart by id or attributes sees only the scope, and would let
 	// the actor hand on what it can't use on them. It is nil in Filter and Reachable, and in SetRole
 	// and DeleteRole, which change grants on every scope of a type, but for what SetRole's role gives,
-	// asked about the tenant.
+	// asked about the tenant; and in the first ask of ChangeMembers and DeleteGroup about the power
+	// to change grants on scopes of a type they take access away on, which then ask again about each
+	// such scope where one answers true.
 	Resource *Resource
 }
 
@@ -569,8 +582,13 @@ var (
 	// host doesn't have (Config.Permissions).
 	ErrInvalid = errors.New("rbac: invalid")
 	// ErrConflict is matched by a change refused because another changed what it rests on while
-	// it waited, or that PostgreSQL refused for a race, as a deadlock between host transactions:
-	// try it again.
+	// it waited, and by any call PostgreSQL refused for a race, still wrapping its error: a
+	// serialization failure, a deadlock, as between host transactions, or a lock it couldn't take,
+	// as one a migration holds past the session's lock_timeout. It is so wherever in the call
+	// PostgreSQL refused it: in a change's transaction or the reads it makes before it, in a read, or
+	// in a statement a hook ran, where the error the hook returns wraps PostgreSQL's, alone or
+	// beside others, as errors.Join holds them, or holds it as errors.As reads it. Try it again:
+	// under WithTx, the host's whole transaction, as WithTx says.
 	ErrConflict = errors.New("rbac: conflict")
 	// ErrNotFound is what Config.ResourceOf returns, or wraps, for a scope the host no longer has,
 	// as a resource deleted without DeleteScopes: a change that only takes access away there, as
@@ -580,14 +598,55 @@ var (
 )
 
 // conflicted makes PostgreSQL's refusals for a race match ErrConflict, keeping the error: a
-// serialization failure, a deadlock, or a lock it couldn't take.
+// serialization failure, a deadlock, or a lock it couldn't take, wherever err holds one.
 func conflicted(err error) error {
-	var pg *pgconn.PgError
-	if errors.As(err, &pg) && !errors.Is(err, ErrConflict) && (pg.Code == "40001" || pg.Code == "40P01" || pg.Code == "55P03") {
+	if raced(err) && !errors.Is(err, ErrConflict) {
 		return fmt.Errorf("%w: %w", ErrConflict, err)
 	}
 	return err
 }
+
+// raced reports whether err, or any error it wraps, is PostgreSQL's refusal for a race, as
+// errors.As reads one, through an As method too. It reads the whole tree, as a hook's error can
+// join another of PostgreSQL's before the race, or wrap both, and errors.As stops at the first; but
+// at most maxWrapped of its errors, in errors.As's order, as one a host's type has wrap itself
+// would be read forever.
+func raced(err error) bool {
+	next := []error{err}
+	for read := 0; len(next) > 0 && read < maxWrapped; read++ {
+		err, next = next[len(next)-1], next[:len(next)-1]
+		var pg *pgconn.PgError
+		switch e := err.(type) { //nolint:errorlint // each error of the tree is read, not only the first PostgreSQL's
+		case *pgconn.PgError:
+			pg = e
+		case interface{ As(any) bool }:
+			e.As(&pg)
+		}
+		if pg != nil && (pg.Code == "40001" || pg.Code == "40P01" || pg.Code == "55P03") {
+			return true
+		}
+		switch e := err.(type) { //nolint:errorlint // as above
+		case interface{ Unwrap() error }:
+			next = append(next, e.Unwrap())
+		case interface{ Unwrap() []error }:
+			wrapped := e.Unwrap()
+			for i := len(wrapped) - 1; i >= 0; i-- {
+				next = append(next, wrapped[i])
+			}
+		}
+	}
+	return false
+}
+
+// maxWrapped is how many errors of a tree raced reads.
+const maxWrapped = 1000
+
+// conflicting makes *err match ErrConflict as conflicted does, for an exported call to defer, so
+// that wherever in the call PostgreSQL refused it for a race, the host meets one error: not only in
+// a change's transaction, which begin maps, but in the reads a change makes before it, which under
+// WithTx run on the host's transaction itself and so can deadlock with a migration holding the
+// package's tables, in a read's statements, and in a hook's, whose error a call returns as it is.
+func conflicting(err *error) { *err = conflicted(*err) }
 
 // Limits on what is stored and what one call takes, so that what a check, a search or a change
 // reads stays bounded. Input past one is refused as invalid; a host can check against them first.
@@ -595,8 +654,10 @@ func conflicted(err error) error {
 const (
 	// MaxBindings is how many bindings one Apply, grants and revokes together, or one Import takes,
 	// and how many grants and eligibilities of their groups the members one ChangeMembers adds gain
-	// in all, each member's counted apart, as the host is asked about each, but one member alone,
-	// which gains whatever its groups hold, and not the host's own ImportMembers; and
+	// in all, each member's counted apart, as the host is asked about each, but no more than one
+	// place alone gains, whatever its group and those it is in hold, and not the host's own
+	// ImportMembers: a member is its principal, however many groups, or places in one, the change
+	// gives it, and what they reach counts once for each end its places give it; and
 	// MaxGrantsPerRole how many grants in force of one role a principal holds on one scope,
 	// differing by source, expiry or condition, as cloud IAM bounds bindings of one role: those
 	// from each source the host owns (Config.Sources) counted apart.
@@ -673,11 +734,12 @@ type Config struct {
 	// every grant and eligibility that SetRole redefining a custom role makes give more, and every
 	// one a member ChangeMembers or ImportMembers adds gains (ViaMembership), once each is
 	// otherwise valid; the change's InvalidError for it wraps the error, so errors.Is and
-	// errors.As find the host's own in it. Any other error fails the change as it is. q is what
-	// the change runs on, so under WithTx it sees a member added earlier in the transaction. A
-	// grant to a group reaches whoever is in it, now and later: it is asked about with the group,
-	// and about each member as it joins, so a policy on who may hold a role, as none privileged for
-	// a guest, refuses the group's grant too while the group holds one that may not.
+	// errors.As find the host's own in it. Any other error fails the change as it is, matching
+	// ErrConflict too where it wraps PostgreSQL's refusal of a statement for a race, as a deadlock
+	// on q. q is what the change runs on, so under WithTx it sees a member added earlier in the
+	// transaction. A grant to a group reaches whoever is in it, now and later: it is asked about
+	// with the group, and about each member as it joins, so a policy on who may hold a role, as none
+	// privileged for a guest, refuses the group's grant too while the group holds one that may not.
 	// Required: a grant to a principal the tenant doesn't let in must never be stored.
 	ValidateGrant func(ctx context.Context, q DB, in GrantInput) error
 	// Constraints are the host's policy above every grant and deny, asked about each permission a
@@ -688,7 +750,13 @@ type Config struct {
 	// change on a labeled scope ask the same. Holding, Filter and Reachable, which test any label,
 	// ask about every value and power to release the subject's grants give, as do SetRole and
 	// DeleteRole of a role granted somewhere, ChangeMembers where only a removal reaches a scope,
-	// and Activate about an approver on a labeled scope.
+	// and Activate about an approver on a labeled scope. A change that takes access away asks about
+	// the power to change grants as Apply's revoke does, so a constraint removing it, as a freeze
+	// under a container does, stops access being taken away there by any change an actor makes:
+	// ChangeMembers asks once about each type of scope only a removal reaches, of no resource, and
+	// again about each such scope where one answers true, and DeleteGroup likewise about groups, and
+	// then the group, where it exists. The host's own writes ask nothing, as Import and DeleteGrants
+	// don't.
 	Constraints []Constraint
 	// ResourceOf returns the resource a scope is, with its ancestors, attributes and label, as the
 	// host passes it to a check. SetGroup and DeleteGroup check ManageGroups on the tenant, and,
@@ -696,21 +764,24 @@ type Config struct {
 	// ChangeMembers GroupMembers on each group it changes, on the resource it returns, and a change
 	// to a group's members as the grants and denies it amounts to, and a removal by the label, on
 	// each scope the group's access is on, the tenant's and groups' included, which the package knows
-	// only by type and id, on the resource it returns for each. Without it, a scope is taken as
-	// stored, its type and id directly under the tenant, with no attributes or label, as constraints
-	// see it too. GroupMembers is checked on a group as group management checks its permissions; the
-	// grants and denies a change amounts to only where that is all of the scope: for a host declaring
-	// no Labels, and resource Attributes as none (an empty map, as nil lets conditions read any), and
-	// on a scope other than the tenant or a group, no ContainerTypes. For any other, that change is
-	// refused. SetRole changing what a custom role's grants give, and DeleteRole, check the label of
-	// each scope the role is granted on, and where a deny on a scope other than the tenant binds the
-	// actor, the denies on its path, and SetRole widening it the label of each scope a role listing it,
-	// or listing one that does, is granted on, and the denies on its path, as it returns it, so with
-	// Labels declared, or such a deny, they need it too. A removal reads a scope it reports as
+	// only by type and id, on the resource it returns for each, as DeleteGroup checks revoking what
+	// is granted on the group where a constraint or a deny binding the actor may stop that. Without
+	// it, a scope is taken as stored, its type and id directly under the tenant, with no attributes or
+	// label, as constraints see it too. GroupMembers is checked on a group as group management checks
+	// its permissions; the grants and denies a change amounts to, DeleteGroup's revoking included,
+	// only where that is all of the scope: for a host declaring no Labels, and resource Attributes as
+	// none (an empty map, as nil lets conditions read any), and on a scope other than the tenant or a
+	// group, no ContainerTypes. For any other, that change is refused. SetRole changing what a custom
+	// role's grants give, and DeleteRole, check the label of each scope the role is granted on, and
+	// where a deny on a scope other than the tenant binds the actor, the denies on its path, and
+	// SetRole widening it the label of each scope a role listing it, or listing one that does, is
+	// granted on, and the denies on its path, as it returns it, so with Labels declared, or such a
+	// deny, they need it too. A removal reads a scope it reports as
 	// ErrNotFound as stored and unlabeled, and ChangeMembers and DeleteRole ask nothing of the scopes
 	// only a removal reaches where the actor's label values satisfy every label and, for DeleteRole,
 	// no such deny binds it, as SetRole asks nothing of the scopes roles listing the role are granted
-	// on then.
+	// on then. New refuses Labels without it, as group management would read the tenant and every
+	// group as unlabeled.
 	ResourceOf func(ctx context.Context, tenant string, s Scope) (Resource, error)
 	// Permissions are every permission the host checks, whether or not a role gives it, so that a
 	// catalog leaving one out, as one an operator configures may, refuses it like any permission
@@ -745,7 +816,8 @@ type Config struct {
 	// takes that value alone: to cap a level, deny it and every value above. Values are held on the
 	// tenant, so they are denied there: SetDeny refuses a deny of one on any other scope, which would
 	// bind no one. The conditions of a value's grants and denies read the tenant as their resource,
-	// never the labeled one.
+	// never the labeled one. They need ResourceOf, which gives the labels of the scopes changes
+	// reach, the tenant and its groups among them: New refuses them without it, as invalid.
 	Labels []LabelDimension
 	// OnChange runs in the transaction of every change but DeleteExpired, whose grants already
 	// gave nothing, once the change is written; an error rolls the change back. History records
@@ -830,6 +902,11 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 	labels, err := indexLabels(cfg.Labels, cfg.Catalog)
 	if err != nil {
 		return nil, err
+	}
+	// Group management reads the tenant's label and each group's through ResourceOf: without it, it
+	// would read them all as unlabeled, and an actor a label refuses would manage groups and members.
+	if len(labels) > 0 && cfg.ResourceOf == nil {
+		return nil, fmt.Errorf("%w: Config.Labels needs Config.ResourceOf, which gives the labels of the tenant and its groups", ErrInvalid)
 	}
 	// The listings read the catalog in order: from the copies, so that a caller changing its
 	// slices after New can't make them disagree with checks or clear a Deny checked here.
@@ -957,9 +1034,16 @@ func vocabulary(declared []Permission, given map[Permission]bool, roleTypes map[
 // in tx: after another, it waits for every change in the tenant while holding locks they may wait
 // for, and PostgreSQL fails one as a deadlock. Where a label dimension is Exclusive, every change
 // takes a lock of its tenant's first, which the tenant's other changes wait for, so two
-// transactions changing two tenants in opposite orders can deadlock too. Explain, Reachable and
-// Holders read in several statements, on tx at its isolation: at READ COMMITTED each reads a
-// snapshot of its own, so a change committing between them can mix two states.
+// transactions changing two tenants in opposite orders can deadlock too. A call PostgreSQL refuses
+// for a race matches ErrConflict, and is retried by rolling tx back and running the host's
+// transaction again from its start, not by making the call again in it: a statement refused on tx
+// itself, as most reads' are, a hook's on the q it is given, and those a change makes before its
+// savepoint, aborts tx, which then runs nothing until it rolls back; and one refused in a savepoint
+// the call rolls back to, as a change's, AsOf's or History's, leaves tx holding what it took before
+// the call, which the race can be over. Explain, Reachable and Holders read in several statements,
+// on tx at its isolation: at READ COMMITTED each reads a snapshot of its own, so a change committing
+// between them can mix two states, as can AsOf's read, in a savepoint of tx, of a time not yet final
+// (AsOf).
 func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 	// One AsOf gave reads its own transaction, whose views are the past: on another, it would read
 	// the tables as they are now.

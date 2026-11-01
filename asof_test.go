@@ -227,6 +227,110 @@ func TestAsOfLeavesTheHostsTransactionAsItWas(t *testing.T) {
 	}
 }
 
+// Planned for their arguments over history's views, statements as of a time cost past
+// jit_above_cost though they read little, and compiling one takes far longer than running it: a
+// read as of a time runs without JIT, and leaves the host its own setting, on its own transaction
+// and under WithTx, whether read returns, fails or panics.
+func TestAsOfReadsWithoutJIT(t *testing.T) {
+	var seen []string
+	h := setupOn(t, pgtest.Open(t, "pool_max_conns=2&jit=on"), func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "jit", Deny: func(ctx context.Context, q rbac.DB, _ rbac.ConstraintInput) (bool, error) {
+			var jit string
+			err := q.QueryRow(ctx, `SELECT current_setting('jit')`).Scan(&jit)
+			seen = append(seen, jit)
+			return false, err
+		}}}
+	})
+	ctx := t.Context()
+	owner := h.as(t, "owner")
+	at := dbNow(t, h)
+	failed := errors.New("read failed")
+	for _, onHosts := range []bool{false, true} {
+		for _, end := range []string{"returns", "fails", "panics"} {
+			func() {
+				q, a := rbac.DB(h.pool), h.authz
+				if onHosts {
+					tx, err := h.pool.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+					if _, err := tx.Exec(ctx, `SET LOCAL jit = on`); err != nil {
+						t.Fatal(err)
+					}
+					q, a = tx, h.authz.WithTx(tx)
+				}
+				seen = nil
+				func() {
+					defer func() { _ = recover() }()
+					err := a.AsOf(ctx, "t1", at, func(b *rbac.Authorizer) error {
+						if err := b.Authorize(ctx, owner, login, cluster); err != nil {
+							return err
+						}
+						switch end {
+						case "fails":
+							return failed
+						case "panics":
+							panic(failed)
+						}
+						return nil
+					})
+					if want := map[string]error{"returns": nil, "fails": failed}[end]; !errors.Is(err, want) {
+						t.Errorf("on the host's transaction %t, a read that %s: %v", onHosts, end, err)
+					}
+				}()
+				if !slices.Equal(seen, []string{"off"}) {
+					t.Errorf("on the host's transaction %t, a read that %s: jit as of a time %v", onHosts, end, seen)
+				}
+				var jit string
+				if err := q.QueryRow(ctx, `SELECT current_setting('jit')`).Scan(&jit); err != nil || jit != "on" {
+					t.Errorf("on the host's transaction %t, after a read that %s: jit %q, %v", onHosts, end, jit, err)
+				}
+			}()
+		}
+	}
+}
+
+// pgx sends a time in microseconds from 2000 in 64 bits, which wrap: 2^64 microseconds after a
+// time reaches PostgreSQL as that time, and one past PostgreSQL's times as one it refuses as out of
+// range. AsOf refuses one past the last the package stores, or before PostgreSQL's earliest, and
+// reads those between, each as pgx sends it, to the microsecond, rounded down: the last
+// microsecond's every nanosecond is the last time, which it read as one past it.
+func TestAsOfRefusesATimePastThoseItReads(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	u := h.as(t, "u")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	held := dbNow(t, h)
+	if err := h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "u")}); err != nil {
+		t.Fatal(err)
+	}
+	read := func(at time.Time) error {
+		return h.authz.AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+			if err := a.Authorize(ctx, u, login, cluster); err == nil {
+				t.Errorf("as of %v, u holds what it held at %v alone", at, held)
+			}
+			return nil
+		})
+	}
+	earliest := time.Date(-4713, time.November, 24, 0, 0, 0, 0, time.UTC)
+	latest := time.Date(9999, time.December, 30, 23, 59, 59, 999999000, time.UTC)
+	past := []time.Time{
+		wrapped(held, 1), time.Date(300000, time.January, 1, 0, 0, 0, 0, time.UTC), latest.Add(time.Microsecond),
+		earliest.Add(-time.Microsecond), earliest.Add(-time.Nanosecond),
+	}
+	for _, at := range past {
+		if err := read(at); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("as of %v: %v", at, err)
+		}
+	}
+	for _, at := range []time.Time{earliest, earliest.Add(999 * time.Nanosecond), latest, latest.Add(999 * time.Nanosecond)} {
+		if err := read(at); err != nil {
+			t.Errorf("as of %v: %v", at, err)
+		}
+	}
+}
+
 func TestAsOfRefusesASearchPathThatReadsTheTablesFirst(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()

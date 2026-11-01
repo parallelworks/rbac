@@ -3,6 +3,9 @@ package rbac_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"maps"
+	"math/rand/v2"
 	"reflect"
 	"slices"
 	"strings"
@@ -844,6 +847,100 @@ func TestThePublicsValuesAreReadWithTheirCustomRolesAsOfOneMoment(t *testing.T) 
 	}
 }
 
+// Conflicts reads the custom roles in the statement that reads their grants, so under WithTx at
+// READ COMMITTED, where each statement reads a moment of its own, it lists only what one moment
+// held: ann holds custom.ra, which gives bank:a, and then custom.ra is narrowed to give no value
+// and ann is granted bank.b, so at no moment could she hold two.
+func TestConflictsUnderWithTxListsOnlyWhatOneMomentHeld(t *testing.T) {
+	h := labeled(t, banks)
+	ctx := t.Context()
+	h.as(t, "ann")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.ra', '{bank:a}', '{tenant}')`); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(rbac.TenantRoot("t1"), "custom.ra", rbac.User, "ann"))
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	race := &racing{reading: "rbac_grants", change: func() {
+		for _, q := range []string{
+			`UPDATE rbac_roles SET permissions = '{cluster:view}', resource_types = '{cluster}' WHERE id = 'custom.ra'`,
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'tenant', 't1', 'user', 'ann', 'bank.b')`,
+		} {
+			if _, err := h.pool.Exec(ctx, q); err != nil {
+				t.Error(err)
+			}
+		}
+	}}
+	conflicts, err := h.authz.WithTx(&racingTx{Tx: tx, r: race}).Conflicts(ctx, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if race.change != nil {
+		t.Fatal("Conflicts read no grants")
+	}
+	if len(conflicts) > 0 {
+		t.Errorf("Conflicts under WithTx = %+v, which no moment held", conflicts)
+	}
+	if now, err := h.authz.Conflicts(ctx, "t1"); err != nil || len(now) > 0 {
+		t.Fatalf("Conflicts once both committed = %+v, %v", now, err)
+	}
+}
+
+// As of a time, Conflicts reads, of history, the versions of the grants and eligibilities of the
+// roles giving values, the custom ones it reads in its statement too, by history's index on roles:
+// matched against roles the statement reads, a role is found by no index, so it would read every
+// version of every grant and eligibility in the tenant.
+func TestConflictsAsOfATimeReadsOnlyTheRolesGivingValues(t *testing.T) {
+	h := labeled(t, banks)
+	ctx := t.Context()
+	h.as(t, "ann")
+	h.as(t, "bob")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.rb', '{bank:b}', '{tenant}');
+		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'tenant', 't1', 'user', 'ann', 'bank.a'), ('t1', 'tenant', 't1', 'user', 'ann', 'custom.rb'),
+		  ('t1', 'tenant', 't1', 'user', 'bob', 'custom.rb')`); err != nil {
+		t.Fatal(err)
+	}
+	read := func(at time.Time) int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		var pages int64
+		if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+			start := historyPages(ctx, t, tx)
+			conflicts, err := a.Conflicts(ctx, "t1")
+			if err == nil && (len(conflicts) != 1 || conflicts[0].Principal != identity("ann")) {
+				err = fmt.Errorf("conflicts as of now: %+v", conflicts)
+			}
+			pages = historyPages(ctx, t, tx) - start
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return pages
+	}
+	// Others hold a role on a cluster each, and are eligible for it.
+	others := func(n int) {
+		t.Helper()
+		manyMembers(t, h, n, `, eligibilities AS (INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+			  SELECT 't1', 'cluster', id, 'user', id, 'cluster.login', 60 FROM others)
+			INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', id, 'user', id, 'cluster.login' FROM others`, "rbac_history")
+	}
+	others(500)
+	few := read(dbNow(t, h))
+	others(4500)
+	if many := read(dbNow(t, h)); many > few*3/2+deeper {
+		t.Errorf("Conflicts as of a time read %d pages of history, and %d once 4500 more held another role", few, many)
+	}
+}
+
 // Holders leaves out the tenant's members or the public where their own grants could give two
 // values of a dimension the resource's label asks of: then none of them holds any, so none passes
 // the label. Where their grants give one, they are listed, as some may pass it.
@@ -1186,4 +1283,134 @@ func TestRenamingOrNarrowingARoleIsNotRefusedForAConflictItFound(t *testing.T) {
 	}
 	legacy := rbac.RoleDefinition{ID: "custom.legacy", Permissions: []rbac.Permission{"bank:a"}, ResourceTypes: []string{rbac.TenantScope}}
 	excluded(t, authz.SetRole(ctx, admin, "t1", legacy))
+}
+
+// Which exclusive dimensions an actor's grants could give two values of, whose values it then uses
+// and hands on none of, is decided once for all the scopes a change reaches, each role's
+// permissions read once for them, and with no dimension exclusive not at all: so the members of a
+// group granted on hundreds of clusters are changed by an actor holding on the tenant, many times
+// over, a role of a thousand permissions as by one holding a role of four, but for reading that
+// role's permissions a few times where a dimension is exclusive.
+func TestAChangeReachingManyScopesReadsTheActorsRolesForExclusiveValuesOnce(t *testing.T) {
+	const scopes = 300
+	var perms []rbac.Permission
+	for i := range 990 {
+		perms = append(perms, rbac.Permission(fmt.Sprintf("cluster:p%03d", i)))
+	}
+	perms = append(perms, view, login, root, grantC)
+	big := rbac.RoleDefinition{ID: "cluster.big", Permissions: perms, ResourceTypes: []string{"cluster"}, Privileged: true}
+	for _, exclusive := range []bool{false, true} {
+		read := map[rbac.Role]int{}
+		for _, role := range []rbac.Role{"cluster.admin", big.ID} {
+			t.Run(fmt.Sprintf("%s, exclusive %t", role, exclusive), func(t *testing.T) {
+				h := setup(t, func(c *rbac.Config) {
+					c.Catalog = append(slices.Clone(c.Catalog), big, groupMembers)
+					if exclusive {
+						banks(c)
+					}
+				})
+				ctx := t.Context()
+				h.groups(t, "g")
+				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+					SELECT 't1', 'cluster', 'k' || i, 'group', 'g', 'cluster.login' FROM generate_series(1, $1) i`, scopes); err != nil {
+					t.Fatal(err)
+				}
+				grants := []rbac.Grant{grant(rbac.TenantRoot("t1"), groupMembers.ID, rbac.User, "x")}
+				for i := range 8 {
+					g := grant(rbac.TenantRoot("t1"), role, rbac.User, "x")
+					g.Note, g.ExpiresAt = fmt.Sprint(i), h.now.Add(time.Duration(i+1)*time.Hour)
+					grants = append(grants, g)
+				}
+				h.seed(t, grants...)
+				x := h.as(t, "x")
+				h.as(t, "u")
+				n := 0
+				rbac.SetReadingEntries(t, func(k int) { n += k })
+				if err := h.authz.ChangeMembers(ctx, x, "t1", []rbac.Member{{Group: "g", Principal: identity("u"), ExpiresAt: h.now.Add(30 * time.Minute)}}, nil); err != nil {
+					t.Fatal(err)
+				}
+				read[role] = n
+			})
+		}
+		more := read[big.ID] - read["cluster.admin"]
+		switch {
+		case !exclusive && more != 0:
+			t.Errorf("with no dimension exclusive, a change reaching %d scopes read %d entries more for an actor holding a role of %d permissions than one of 4",
+				scopes, more, len(perms))
+		case exclusive && more > 8*len(perms):
+			t.Errorf("a change reaching %d scopes read %d entries more for an actor holding a role of %d permissions than one of 4", scopes, more, len(perms))
+		}
+	}
+}
+
+// What a change's authorities on many scopes find its actor's grants could give two values of an
+// exclusive dimension of, each role's permissions read once for all of them, is what each path's
+// own grants give, in random tenants: grants of roles giving values, conditional ones and those to
+// its group, the tenant's members and the public among them, on the tenant, and below it, written
+// around the package, as a role stored for another type and redefined for the tenant leaves its
+// grants there.
+func TestTheExclusiveValuesAChangesAuthoritiesShareAreThoseOfEachPath(t *testing.T) {
+	party := rbac.LabelDimension{Name: "party", Rule: rbac.AllOf, Values: []string{"x", "y"}, Exclusive: true}
+	h := setup(t, banks, func(c *rbac.Config) {
+		c.Labels = append(c.Labels, party)
+		for _, v := range party.Values {
+			c.Catalog = append(c.Catalog, rbac.RoleDefinition{
+				ID: rbac.Role("party." + v), Permissions: []rbac.Permission{rbac.Permission("party:" + v)}, ResourceTypes: []string{rbac.TenantScope},
+			})
+		}
+	})
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES
+		('t1', 'custom.liaison', '{bank:a,party:y}', '{tenant}'), ('t1', 'custom.legacy', '{bank:c,cluster:view}', '{cluster}')`); err != nil {
+		t.Fatal(err)
+	}
+	h.groups(t, "g")
+	x := h.as(t, "x", "g")
+	orgs := []rbac.Scope{{Type: "org", ID: "o1"}, {Type: "org", ID: "o2"}}
+	spaces := []rbac.Scope{{Type: "workspace", ID: "w1"}, {Type: "workspace", ID: "w2"}}
+	on := []rbac.Resource{{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}}
+	for i, o := range orgs {
+		on = append(on, rbac.Resource{Tenant: "t1", Type: o.Type, ID: o.ID},
+			rbac.Resource{Tenant: "t1", Type: spaces[i].Type, ID: spaces[i].ID, Ancestors: []rbac.Scope{o}})
+		for j := range 4 {
+			on = append(on, rbac.Resource{Tenant: "t1", Type: "cluster", ID: fmt.Sprintf("c%d%d", i, j), Ancestors: []rbac.Scope{spaces[i], o}})
+		}
+	}
+	roles := []rbac.Role{"bank.a", "bank.b", "bank.c", "party.x", "party.y", "custom.liaison", "custom.legacy", "cluster.login"}
+	principals := []rbac.Principal{x.Principal, {Kind: rbac.Group, ID: "g"}, rbac.TenantMembers("t1"), {Kind: rbac.Public}}
+	differ := 0
+	for seed := range uint64(60) {
+		rng := rand.New(rand.NewPCG(seed, seed))
+		if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_grants WHERE tenant = 't1'`); err != nil {
+			t.Fatal(err)
+		}
+		for range 1 + rng.IntN(8) {
+			scope := rbac.TenantRoot("t1")
+			if rng.IntN(2) == 0 {
+				scope = on[1+rng.IntN(len(on)-1)].Scope()
+			}
+			p := principals[rng.IntN(len(principals))]
+			condition := ""
+			if rng.IntN(3) == 0 {
+				condition = `request.attributes.mfa == true`
+			}
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+				VALUES ('t1', $1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`, scope.Type, scope.ID, p.Kind, p.ID, roles[rng.IntN(len(roles))], condition); err != nil {
+				t.Fatal(err)
+			}
+		}
+		together, alone := rbac.ExcludedOn(t, h.authz, x, on)
+		for i := range on {
+			if !maps.Equal(together[i], alone[i]) {
+				t.Errorf("seed %d, %s: the authorities together found %v excluded, the path's grants alone %v", seed, on[i].Scope().Key(), together[i], alone[i])
+			}
+			if !maps.Equal(alone[i], alone[0]) {
+				differ++
+			}
+		}
+	}
+	// So that the grants below the tenant are compared too, where they add to the tenant's.
+	if differ == 0 {
+		t.Error("no path's grants below the tenant changed what was excluded")
+	}
 }

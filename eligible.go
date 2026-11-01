@@ -33,8 +33,8 @@ type Eligibility struct {
 	Scope     Scope
 	Role      Role
 	Principal Principal
-	// MaxDuration is the longest an activation lasts, in whole seconds, rounded down, and at most
-	// a year.
+	// MaxDuration is the longest an activation lasts, in whole seconds, rounded down, and once
+	// rounded at most a year.
 	MaxDuration time.Duration
 	// ExpiresAt ends the eligibility, which no activation made from it outlasts; zero never does.
 	// Setting it sooner, or revoking the eligibility, leaves the grants activated from it to their
@@ -108,13 +108,15 @@ func (a *Authorizer) checkEligibility(e Eligibility) error {
 func (a *Authorizer) SetEligibility(ctx context.Context, actor Subject, on Resource, e Eligibility) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, on.Tenant, actor.Principal, "SetEligibility")
+	defer conflicting(&err)
 	if err := a.check(on); err != nil {
 		return err
 	}
 	if err := a.subject(actor); err != nil {
 		return err
 	}
-	e.Scope, e.ExpiresAt = on.Scope(), stored(e.ExpiresAt)
+	// As they are stored, so their bounds are checked on what is stored.
+	e.Scope, e.ExpiresAt, e.MaxDuration = on.Scope(), stored(e.ExpiresAt), e.MaxDuration.Truncate(time.Second)
 	e.Approvers = canonicalPrincipals(e.Approvers)
 	check := func() error { return a.checkEligibility(e) }
 	return a.change(ctx, actor, on, "SetEligibility", ViaEligibility, []Binding{e.binding()}, nil, e.Approvers, check, func(tx pgx.Tx) (ChangeEvent, gains, error) {
@@ -133,7 +135,7 @@ func (a *Authorizer) SetEligibility(ctx context.Context, actor Subject, on Resou
 			  created_by = CASE WHEN rbac_eligibilities.expires_at <= $13 THEN EXCLUDED.created_by ELSE rbac_eligibilities.created_by END,
 			  created_at = CASE WHEN rbac_eligibilities.expires_at <= $13 THEN EXCLUDED.created_at ELSE rbac_eligibilities.created_at END
 			WHERE (rbac_eligibilities.max_seconds, rbac_eligibilities.expires_at, rbac_eligibilities.requires,
-			  rbac_eligibilities.approvers, rbac_eligibilities.note)
+			  `+canonicalSQL("rbac_eligibilities.approvers")+`, rbac_eligibilities.note)
 			  IS DISTINCT FROM (EXCLUDED.max_seconds, EXCLUDED.expires_at, EXCLUDED.requires, EXCLUDED.approvers, EXCLUDED.note)
 			RETURNING `+eligibilityColumns+`, EXISTS (SELECT FROM rbac_eligibilities o WHERE o.id = rbac_eligibilities.id
 			  AND (o.expires_at IS NULL OR o.expires_at > $13)
@@ -203,6 +205,7 @@ func (a *Authorizer) requirementsBounded(ctx context.Context, tx pgx.Tx, tenant 
 func (a *Authorizer) DeleteEligibility(ctx context.Context, actor Subject, on Resource, role Role, p Principal) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, on.Tenant, actor.Principal, "DeleteEligibility")
+	defer conflicting(&err)
 	if err := a.check(on); err != nil {
 		return err
 	}
@@ -262,6 +265,7 @@ type Activation struct {
 func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act Activation) (g Grant, err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, on.Tenant, s.Principal, "Activate")
+	defer conflicting(&err)
 	if err := a.check(on); err != nil {
 		return Grant{}, err
 	}
@@ -397,6 +401,7 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 func (a *Authorizer) Deactivate(ctx context.Context, s Subject, on Resource, role Role) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, on.Tenant, s.Principal, "Deactivate")
+	defer conflicting(&err)
 	if err := a.check(on); err != nil {
 		return err
 	}
@@ -775,7 +780,8 @@ func seconds(d time.Duration) int64 {
 // Eligibilities lists the eligibilities that match the filter, as stored, expired ones aside. It
 // has no limit or cursor, so what it returns grows with what matches, as every eligibility on the
 // tenant's scope.
-func (a *Authorizer) Eligibilities(ctx context.Context, tenant string, f GrantFilter) ([]Eligibility, error) {
+func (a *Authorizer) Eligibilities(ctx context.Context, tenant string, f GrantFilter) (_ []Eligibility, err error) {
+	defer conflicting(&err)
 	if !validID(tenant) || !f.valid(tenant) {
 		return nil, fmt.Errorf("%w: Eligibilities needs a tenant and valid scopes or principals", ErrInvalid)
 	}

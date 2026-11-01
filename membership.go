@@ -1,6 +1,7 @@
 package rbac
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -132,7 +133,7 @@ func checkExpiry(expires, now time.Time) string {
 		return ""
 	case !expires.After(now):
 		return "already expired"
-	case expires.After(time.Date(9999, time.December, 30, 23, 59, 59, 999999000, time.UTC)):
+	case expires.After(latest):
 		return "expires after 9999-12-30"
 	}
 	return ""
@@ -178,7 +179,8 @@ func keptAgain[T any](set []T, now time.Time, check func(T, time.Time) error) er
 }
 
 // SetMemberships makes identities members or guests of a tenant, or changes how, as actor: the
-// host's own write, without the checks a change by a tenant's admins has, as Import is for grants.
+// host's own write, without the checks a change by a tenant's admins has, as Import is for grants,
+// so no constraint or deny freezing changes to grants stops it ending or suspending a membership.
 // It reports the memberships it set or changed. An identity whose membership had ended joins again
 // in none of the groups it was in, whether or not DeleteExpired has run since, as a membership
 // made by actor now. Config.ValidateGrant is asked about none of what an identity holds: a host
@@ -187,6 +189,7 @@ func keptAgain[T any](set []T, now time.Time, check func(T, time.Time) error) er
 func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant string, ms []Membership) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "SetMemberships")
+	defer conflicting(&err)
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -342,7 +345,8 @@ func outlasts(end, was time.Time) bool {
 // Memberships lists a tenant's memberships in force, by principal: of those principals, or with
 // none, all. It has no limit or cursor, so with none, what it returns grows with the tenant's
 // members and guests.
-func (a *Authorizer) Memberships(ctx context.Context, tenant string, principals []Principal) ([]Membership, error) {
+func (a *Authorizer) Memberships(ctx context.Context, tenant string, principals []Principal) (_ []Membership, err error) {
+	defer conflicting(&err)
 	// The zero principal, the anonymous subject's, which a constraint may ask about, has none.
 	if !validID(tenant) || slices.ContainsFunc(principals, func(p Principal) bool { return p != (Principal{}) && !p.wellFormed(tenant) }) {
 		return nil, fmt.Errorf("%w: Memberships needs a tenant and valid principals", ErrInvalid)
@@ -364,7 +368,8 @@ func (a *Authorizer) Memberships(ctx context.Context, tenant string, principals 
 
 // MembershipsOf lists an identity's memberships in force in every tenant, by tenant. It has no
 // limit or cursor, so what it returns grows with the tenants the identity is a member or guest of.
-func (a *Authorizer) MembershipsOf(ctx context.Context, p Principal) ([]Membership, error) {
+func (a *Authorizer) MembershipsOf(ctx context.Context, p Principal) (_ []Membership, err error) {
+	defer conflicting(&err)
 	// The zero principal, the anonymous subject's, which a constraint may ask about, has none.
 	if p == (Principal{}) {
 		return nil, nil
@@ -424,6 +429,7 @@ func checkGroup(g GroupDefinition) error {
 func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string, g GroupDefinition) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "SetGroup")
+	defer conflicting(&err)
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -476,6 +482,7 @@ func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string,
 func (a *Authorizer) ImportGroups(ctx context.Context, actor Principal, tenant string, groups []GroupDefinition) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "ImportGroups")
+	defer conflicting(&err)
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -589,14 +596,25 @@ func upsertGroups(ctx context.Context, tx pgx.Tx, tenant string, actor Principal
 // made through (Eligibility), which revoking first shows, that a deny names or exempts, or that
 // approves an eligibility's activations: deleting one never changes access as a side effect. It
 // holds the locks of the groups it is in, as a change to their members does, so a grant,
-// eligibility or deny naming one waits for it, or it reads that one. It refuses one from a source
-// the host owns, in a group from one, or with members, a place in a group or grants on it from
-// one, in force: those that have ended give nothing, and go with it. Deleting a group that doesn't
-// exist does nothing, and asks Config.ResourceOf nothing of it; one the host no longer has
-// (ErrNotFound) it reads as unlabeled, as a removal reads any scope.
+// eligibility or deny naming one waits for it, or it reads that one; and it holds the places in the
+// group and of it before it reads the activations resting on them, as Activate holds those an
+// activation rests on until it commits, so one made meanwhile is refused as one made before. It
+// refuses one from a source the host owns, in a group from one, or with members, a place in a group
+// or grants on it from one, in force: those that have ended give nothing, and go with it. What is
+// granted on the group's own scope goes with it, its grants and eligibilities there revoked, so a
+// constraint or a deny on its path that stops the actor changing grants there stops it, as it
+// would revoking them with Apply, while any is in force. Where one may, or its label may refuse the
+// actor, it reads the group as ChangeMembers reads a scope it takes access away on: as
+// Config.ResourceOf gives it, so a condition reading the group's attributes reads what the host
+// passes Apply there; and without Config.ResourceOf, as stored, which is all of the group only
+// where the host declares no labels and resource attributes as none, or the deletion is refused
+// while any is in force. Deleting a group that doesn't exist does nothing, and asks
+// Config.ResourceOf and the constraints nothing of it; one the host no longer has (ErrNotFound) it
+// reads as unlabeled, as a removal reads any scope.
 func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id string) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "DeleteGroup")
+	defer conflicting(&err)
 	if !validID(tenant) || !validGroupID(id) {
 		return fmt.Errorf("%w: DeleteGroup needs a tenant and a valid group", ErrInvalid)
 	}
@@ -622,7 +640,8 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 		return err
 	}
 	// A group that doesn't exist has no label to ask the host for, and deleting it does nothing.
-	// Without declared labels none is asked for, so one made meanwhile needs no new check.
+	// Without declared labels, a freeze, or a deny binding the actor that may stop it, none is asked
+	// for, so one made meanwhile needs no new check.
 	existed, group := true, Resource{Tenant: tenant, Type: GroupScope, ID: id}
 	if len(a.labels) > 0 {
 		if existed, err = groupExists(ctx, a.db, tenant, id); err != nil {
@@ -632,6 +651,49 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 			if group, err = a.groupLabeled(ctx, tenant, id, labels, values, true); err != nil {
 				return err
 			}
+		}
+	}
+	// Asked before the transaction, as hooks run outside it, whether or not anything is granted on
+	// its scope, which only the transaction reads under the group's lock; and about the group as the
+	// host gives it only where a constraint, or a deny binding the actor that removes its power to
+	// change grants on groups, may stop it, and it exists, as for its label: one that doesn't is
+	// deleted as nothing, so no answer about it could refuse that. For either, the group is read as
+	// ChangeMembers reads a scope it only takes access away on where one may stop it there
+	// (mayReach), so a condition of either that reads the group's attributes sees what Apply
+	// revoking there is passed.
+	bound, err := a.grantsDenied(ctx, a.db, tenant, actor)
+	if err != nil {
+		return err
+	}
+	freeze, err := a.freezes(ctx, actor, tenant, GroupScope)
+	if err != nil {
+		return err
+	}
+	revoking := &reachCheck{on: group, leaves: true, frozen: freeze != "", bound: bound[GroupScope]}
+	stops := revoking.frozen || revoking.bound
+	if stops && len(a.labels) == 0 {
+		if existed, err = groupExists(ctx, a.db, tenant, id); err != nil {
+			return err
+		}
+		if existed {
+			if revoking.on, _, err = a.groupOf(ctx, tenant, id, true); err != nil {
+				return err
+			}
+		}
+	}
+	// Without Config.ResourceOf, which New requires where labels are declared, the group is as
+	// stored, which isn't all of it where the host declares resource attributes other than as none:
+	// revoking on it is refused then, as ChangeMembers refuses taking access away there, but only
+	// once the transaction finds anything granted there to revoke.
+	var partial error
+	if existed && a.cfg.ResourceOf == nil && stops {
+		partial = a.storedWhole(revoking.on.Scope())
+	}
+	if revoking.frozen && existed && partial == nil {
+		revoking.cs = a.constrain(ctx, actor, revoking.on)
+		revoking.cs.removes(GrantPermission(GroupScope), GroupScope)
+		if err := revoking.cs.failed(); err != nil {
+			return err
 		}
 	}
 	return a.inTx(ctx, tenant, actor.Principal, "DeleteGroup", func(tx pgx.Tx) (ChangeEvent, error) {
@@ -671,10 +733,38 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 				}
 			}
 		}
-		if err := a.deletable(ctx, tx, tenant, id, reached); err != nil {
+		scoped, err := a.deletable(ctx, tx, tenant, id, reached)
+		if err != nil {
 			return ChangeEvent{}, err
 		}
-		return a.removeGroups(ctx, tx, tenant, actor.Principal, []string{id})
+		if scoped {
+			if partial != nil {
+				return ChangeEvent{}, partial
+			}
+			revoking.seal()
+			_, _, au, err := a.reachAuthority(ctx, tx, actor, []*reachCheck{revoking})
+			if err != nil {
+				return ChangeEvent{}, err
+			}
+			if err := revoking.stopped(au[0], "revoking what is granted on the group"); err != nil {
+				return ChangeEvent{}, err
+			}
+			// Where no deny binding the actor removed its power to change grants on groups, the denies
+			// on the group's path weren't read, and the group perhaps not from the host: one set
+			// meanwhile has the deletion tried again, as mayReachAgain has a change to members.
+			if !revoking.bound {
+				now, err := a.grantsDenied(ctx, tx, tenant, actor)
+				if err != nil {
+					return ChangeEvent{}, err
+				}
+				if now[GroupScope] {
+					return ChangeEvent{}, fmt.Errorf("%w: a deny binding the actor was set while this change waited; try again", ErrConflict)
+				}
+			}
+		}
+		return a.removeGroups(ctx, tx, tenant, actor.Principal, []string{id}, func() error {
+			return a.unrested(ctx, tx, tenant, id, reached)
+		})
 	})
 }
 
@@ -705,10 +795,11 @@ func groupExists(ctx context.Context, q DB, tenant, id string) (bool, error) {
 // deletable refuses deleting a group an actor asks to delete when that would change access, its
 // members' through the groups it is in too, above, as upOf reads them, or what the host
 // keeps. Expired grants, eligibilities and places in groups give nothing, and Grants doesn't list
-// them to revoke, so they go with it. Its members' activations are found by each identity's key,
-// as restingOn finds those removeGroups would end.
-func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string, above []string) error {
-	var held, resting, denied, approves, owned bool
+// them to revoke, so they go with it. It reports whether grants or eligibilities in force are on the
+// group's own scope, which go with it too. Its members' activations it leaves to unrested, which
+// reads them once the places they rest on are held.
+func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string, above []string) (scoped bool, err error) {
+	var held, denied, approves, owned bool
 	// What is from a source only the host changes is read only where the host owns one: in the
 	// statement's text, which then plans no read of it. The group's members and its own places are
 	// read apart, each by the index leading to it: their OR no index seeks. A generic plan costs the
@@ -725,9 +816,8 @@ func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string
 		SELECT
 		  EXISTS (`+byKey("$7", "rbac_grants", "principal", "1", "tenant = $1 AND (expires_at IS NULL OR expires_at > $3)")+`)
 		    OR EXISTS (`+byKey("$7", "rbac_eligibilities", "principal", "1", "tenant = $1 AND (expires_at IS NULL OR expires_at > $3)")+`),
-		  EXISTS (WITH RECURSIVE `+insideSQL("ARRAY[$4::text]", "$3", "NULL", false)+`
-		    `+byKey("ARRAY(SELECT DISTINCT principal FROM inside)", "rbac_grants", "principal", "1",
-		"tenant = $1 AND source = 'activation' AND expires_at > $3 AND activated_through = ANY($7::text[])")+`),
+		  EXISTS (SELECT FROM rbac_grants WHERE scope = $6 AND tenant = $1 AND (expires_at IS NULL OR expires_at > $3))
+		    OR EXISTS (SELECT FROM rbac_eligibilities WHERE tenant = $1 AND scope = $6 AND (expires_at IS NULL OR expires_at > $3)),
 		  EXISTS (SELECT FROM rbac_denies WHERE `+naming("principals", "$7")+` OR `+naming("exempt", "$7")+`),
 		  EXISTS (SELECT FROM rbac_eligibilities WHERE `+naming("approvers", "$7")+` AND (expires_at IS NULL OR expires_at > $3)),
 		  `+sources+` AND (EXISTS (SELECT FROM (SELECT principal, source FROM rbac_members
@@ -741,20 +831,40 @@ func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string
 		    OR EXISTS (SELECT FROM (SELECT id FROM rbac_grants WHERE scope = $6 AND tenant = $1
 		        AND (expires_at IS NULL OR expires_at > $3) OFFSET 0) k
 		      JOIN rbac_grants g ON g.id = k.id WHERE g.source = ANY($5::text[])))`,
-		tenant, groupPrincipal(id).key(), a.cfg.Now(), id, slices.Sorted(maps.Keys(a.owned)), groupKey(id), above).Scan(&held, &resting, &denied, &approves, &owned); err != nil {
-		return err
+		tenant, groupPrincipal(id).key(), a.cfg.Now(), id, slices.Sorted(maps.Keys(a.owned)), groupKey(id), above).Scan(&held, &scoped, &denied, &approves, &owned); err != nil {
+		return false, err
 	}
 	switch {
 	case held:
-		return fmt.Errorf("%w: group %q, or a group it is in, holds grants or eligibilities: revoke them first", ErrInvalid, id)
-	case resting:
-		return fmt.Errorf("%w: members of group %q hold activations made through it, or a group it is in: revoke them first", ErrInvalid, id)
+		return false, fmt.Errorf("%w: group %q, or a group it is in, holds grants or eligibilities: revoke them first", ErrInvalid, id)
 	case denied:
-		return fmt.Errorf("%w: a deny names or exempts group %q, or a group it is in: change it first", ErrInvalid, id)
+		return false, fmt.Errorf("%w: a deny names or exempts group %q, or a group it is in: change it first", ErrInvalid, id)
 	case approves:
-		return fmt.Errorf("%w: an eligibility names group %q, or a group it is in, as an approver: change it first", ErrInvalid, id)
+		return false, fmt.Errorf("%w: an eligibility names group %q, or a group it is in, as an approver: change it first", ErrInvalid, id)
 	case owned:
-		return fmt.Errorf("%w: group %q is in a group of the host's, or has members, a place in a group or grants on it from a source only the host changes", ErrInvalid, id)
+		return false, fmt.Errorf("%w: group %q is in a group of the host's, or has members, a place in a group or grants on it from a source only the host changes", ErrInvalid, id)
+	}
+	return scoped, nil
+}
+
+// unrested refuses deleting a group an actor asks to delete, once its places in groups and its
+// members' are held, while activations in force of its members, the identities in it through the
+// groups in it too, were made through it or one of above, the groups it is in, as upOf reads them:
+// deleting it would cut them short or end them. Activate holds the places an activation rests on
+// until it commits, so read here, after the deletion holds them, no activation resting on one is
+// made unseen; read before, as deletable reads the rest, one committing in between would be ended.
+// Each identity's are found by its key, as restingOn finds those removeGroups would end.
+func (a *Authorizer) unrested(ctx context.Context, tx pgx.Tx, tenant, id string, above []string) error {
+	var resting bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (WITH RECURSIVE `+insideSQL("ARRAY[$2::text]", "$3", "NULL", false)+`
+		  `+byKey("ARRAY(SELECT DISTINCT principal FROM inside)", "rbac_grants", "principal", "1",
+		"tenant = $1 AND source = 'activation' AND expires_at > $3 AND activated_through = ANY($4::text[])")+`)`,
+		tenant, id, a.cfg.Now(), above).Scan(&resting); err != nil {
+		return err
+	}
+	if resting {
+		return fmt.Errorf("%w: members of group %q hold activations made through it, or a group it is in: revoke them first", ErrInvalid, id)
 	}
 	return nil
 }
@@ -767,6 +877,7 @@ func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string
 func (a *Authorizer) DeleteGroups(ctx context.Context, actor Principal, tenant string, ids []string) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "DeleteGroups")
+	defer conflicting(&err)
 	if len(ids) > MaxBindings {
 		return fmt.Errorf("%w: a deletion names at most %d groups", ErrInvalid, MaxBindings)
 	}
@@ -791,13 +902,15 @@ func (a *Authorizer) DeleteGroups(ctx context.Context, actor Principal, tenant s
 		if err := lockAll(ctx, tx, tenant, scopes, principals); err != nil {
 			return ChangeEvent{}, err
 		}
-		return a.removeGroups(ctx, tx, tenant, actor, ids)
+		return a.removeGroups(ctx, tx, tenant, actor, ids, nil)
 	})
 }
 
 // removeGroups deletes groups with their grants and eligibilities, the members they have, their
 // places in other groups, in denies and among approvers, and returns what it changed for OnChange.
-func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, ids []string) (ChangeEvent, error) {
+// held, where not nil, runs once the places in the groups and of them are held, before anything is
+// read of what rests on them, and refuses the deletion with what it returns.
+func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, ids []string, held func() error) (ChangeEvent, error) {
 	var e ChangeEvent
 	principals, scopes := make([]string, len(ids)), make([]string, len(ids))
 	for i, id := range ids {
@@ -856,6 +969,11 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 	// activations resting on them are read.
 	if err := lockByKeys(ctx, tx, "rbac_members", "ctid", placeOrder, []string{"group_id", "principal"}, nil, tenant, ids, principals); err != nil {
 		return ChangeEvent{}, err
+	}
+	if held != nil {
+		if err := held(); err != nil {
+			return ChangeEvent{}, err
+		}
 	}
 	r, err := a.restingOn(ctx, tx, tenant, nil, ids, now)
 	if err != nil {
@@ -1041,7 +1159,8 @@ func (a *Authorizer) tenantLabels(ctx context.Context, actor Subject, tenant str
 
 // Groups lists a tenant's groups, by id. It has no limit or cursor, so what it returns grows with
 // them.
-func (a *Authorizer) Groups(ctx context.Context, tenant string) ([]GroupDefinition, error) {
+func (a *Authorizer) Groups(ctx context.Context, tenant string) (_ []GroupDefinition, err error) {
+	defer conflicting(&err)
 	if !validID(tenant) {
 		return nil, fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -1147,6 +1266,7 @@ func keyedAll(members []Member) error {
 func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant string, members []Member) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "ImportMembers")
+	defer conflicting(&err)
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -1163,7 +1283,7 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 	if err != nil {
 		return err
 	}
-	rc, err := a.reachOf(ctx, a.db, tenant, set, nil, nil, true)
+	rc, err := a.reachOf(ctx, a.db, tenant, set, nil, nil, true, false)
 	if err != nil {
 		return err
 	}
@@ -1390,24 +1510,39 @@ func (a *Authorizer) placesBounded(ctx context.Context, tx pgx.Tx, tenant string
 // exempt from the denies those are exempt from, as a removed member is from the denies those name,
 // which the actor must be able to set. A removed member loses the rest, and the activations made
 // through those (Eligibility), and an added one is bound by the denies those are named in, which
-// only the label of each scope they are on refuses the actor, as Apply refuses a revoke there; a
-// place made to end sooner gains nothing: it is a removal then, checked as one now; nor does one
-// whose note alone changes. Each group changed, and each scope reached, is checked as
-// Config.ResourceOf returns it, a group no member gains a place in that the host no longer has
-// (ErrNotFound) as unlabeled. Members from a source the host owns, and the members of a group from
-// one, only the host changes, and what ImportMembers refuses, this does.
+// the actor needn't be able to grant, as a revoke needs no power to grant what it revokes, but
+// which each scope's label, and a constraint or a deny on its path that removes the actor's power
+// to change grants there, refuses, as each refuses Apply revoking there: a freeze stops access
+// being taken away under it by this as by Apply. A place made to end sooner gains nothing: it is a
+// removal then, checked as one now; nor does one whose note alone changes. Each group changed, and
+// each scope reached, is checked as Config.ResourceOf returns it, a group no member gains a place
+// in that the host no longer has (ErrNotFound) as unlabeled, and a scope a member only loses
+// access on as stored. Members from a source the host owns, and the members of a group from one,
+// only the host changes, and what ImportMembers refuses, this does. It holds the places it ends,
+// or makes end sooner, before it reads the activations resting on them, which Activate holds until
+// it commits, so one made meanwhile is checked, the change tried again (ErrConflict), rather than
+// ended unchecked.
 //
 // The members a change adds gain at most MaxBindings grants and eligibilities in all, each member's
-// counted apart, as the host is asked about each, but one alone, which gains whatever its groups
-// hold; whether the actor may make one is decided once for each end, however many members gain it.
-// The rest of what a change checks is its groups', read once however many of their members change,
-// and what a group many of them are in reaches, once for all of them, so it grows with what the
-// groups hold, approve and are named or exempt in, as SetRole's does with a role's grants: with
-// Labels declared, a removal asks Config.ResourceOf about each scope its members lose access on,
-// but where the actor's label values satisfy every label.
+// counted apart, as the host is asked about each, but no more than one place alone gains, which
+// gains whatever its group and those it is in hold: a member is its principal, whatever it gains
+// through all the groups, and places in one, the change gives it, each grant or eligibility counted
+// once for each end its places give it, as the host is asked about it once. Whether the actor may
+// make one is decided once for each end, however many members gain it. The rest of what a change
+// checks is its groups', read once however many of their members change, and what a group many of
+// them are in reaches, once for all of them, so it grows with what the groups hold, approve and are
+// named or exempt in, as SetRole's does with a role's grants: with Labels or Config.Constraints
+// declared, or a deny binding the actor that removes a power to change grants, a removal reads what
+// its members lose. It asks the constraints about changing grants on each type of scope they lose
+// access on, and Config.ResourceOf about each such scope only where the actor's label values don't
+// satisfy every label, a constraint answered that it may stop the actor changing grants on some
+// scope of the type, or a deny binding the actor removes that power on scopes of it: then the
+// constraints again about the scope, and the actor's grants and denies on its path, all such
+// scopes' in one read.
 func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant string, add, remove []Member) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "ChangeMembers")
+	defer conflicting(&err)
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -1460,14 +1595,20 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 	if err := a.notOwnedGroups(ctx, a.db, tenant, groups); err != nil {
 		return err
 	}
-	rc, err := a.reachOf(ctx, a.db, tenant, set, remove, &left, false)
+	// What a member loses is read where a label, or a freeze, by a constraint or a deny binding the
+	// actor, can refuse the actor taking it away.
+	bound, err := a.grantsDenied(ctx, a.db, tenant, actor)
+	if err != nil {
+		return err
+	}
+	rc, err := a.reachOf(ctx, a.db, tenant, set, remove, &left, false, len(a.labels) > 0 || len(a.cfg.Constraints) > 0 || len(bound) > 0)
 	if err != nil {
 		return err
 	}
 	if err := rc.gainsWithin(set); err != nil {
 		return err
 	}
-	checks, err := a.mayReach(ctx, actor, tenant, set, remove, rc, labels, values)
+	checks, err := a.mayReach(ctx, actor, tenant, set, remove, rc, labels, values, bound)
 	if err != nil {
 		return err
 	}
@@ -1479,6 +1620,14 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 	principals = append(principals, rc.locks()...)
 	return a.inTxReaching(ctx, tenant, actor.Principal, "ChangeMembers", func(tx pgx.Tx) (ChangeEvent, []string, error) {
 		if err := lockAll(ctx, tx, tenant, scopes, principals); err != nil {
+			return ChangeEvent{}, nil, err
+		}
+		// The places it ends are held before what rests on them is read: an activation through one,
+		// which holds them until it commits, is read by stillReached, and the change tried again to
+		// check it, rather than ended unchecked by unrest.
+		now := a.cfg.Now()
+		r, err := a.restingIn(ctx, tx, tenant, slices.Concat(remove, set), slices.Concat(remove, expiring(set)), now)
+		if err != nil {
 			return ChangeEvent{}, nil, err
 		}
 		locked, err := a.stillReached(ctx, tx, tenant, set, remove, rc, false)
@@ -1503,15 +1652,14 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 		if err != nil {
 			return ChangeEvent{}, nil, err
 		}
-		if err := a.mayReachAgain(ctx, tx, actor, checks, labels, values); err != nil {
+		// It takes access away from a member where it checked a scope it only loses access on, or,
+		// where it read nothing a member loses, wherever one leaves or joins a group a deny names.
+		taking := slices.ContainsFunc(checks, func(c *reachCheck) bool { return c.leaves && len(c.grants) == 0 }) ||
+			!rc.losing && (len(locked.leaving(set, remove)) > 0 || len(locked.namedIn.of(locked.up, memberGroups(locked.gaining(set))...)) > 0)
+		if err := a.mayReachAgain(ctx, tx, actor, tenant, checks, labels, values, bound, taking); err != nil {
 			return ChangeEvent{}, nil, err
 		}
-		now := a.cfg.Now()
 		if err := keptAgain(set, now, a.checkMember); err != nil {
-			return ChangeEvent{}, nil, err
-		}
-		r, err := a.restingIn(ctx, tx, tenant, slices.Concat(remove, set), slices.Concat(remove, expiring(set)), now)
-		if err != nil {
 			return ChangeEvent{}, nil, err
 		}
 		var e ChangeEvent
@@ -1552,10 +1700,12 @@ type reach struct {
 	// short or end (unrest).
 	activations []activated
 	placed
-	// labeled is whether the host declares labels, which alone check what a member leaving loses,
-	// and what one joining loses to the denies that then bind it: without them, a grant made to its
-	// group meanwhile changes nothing the change checked.
-	labeled bool
+	// losing is whether the change checks what a member leaving loses, and what one joining loses to
+	// the denies that then bind it: where a label of a scope can refuse the actor that, as where the
+	// host declares labels, or a freeze can, as where it declares constraints or a deny binds the
+	// actor. Otherwise nothing refuses it, and a grant made to its group meanwhile changes nothing the
+	// change checked.
+	losing bool
 	// heldOf, approvedOf, namedIn and exemptFrom are where in held, approving and denies those
 	// naming each key are, as holder, approver, principal and exemption, and activatedOf where in
 	// activations each member's are: so what a member of a group reaches is found through the keys
@@ -1594,15 +1744,6 @@ func (at positions) of(up map[string]map[string]bool, groups ...string) []int {
 	}
 	slices.Sort(is)
 	return slices.Compact(is)
-}
-
-// pick is the elements of xs at is.
-func pick[T any](xs []T, is []int) []T {
-	out := make([]T, len(is))
-	for i, j := range is {
-		out[i] = xs[j]
-	}
-	return out
 }
 
 // indexed is r with what it reaches found by key.
@@ -1645,11 +1786,11 @@ type activated struct {
 
 // reachOf reads, on q, what adding add and removing remove reaches, in force at now, what they
 // leave of their members' places, as left gives it or where nil as read, and of what the groups
-// hold, approve and are named or exempt in, all a change checks; and, but with gains, as for the
-// host's write, which checks nothing a member leaving loses, the activations of the members leaving
-// that rest on them.
-func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remove []Member, left *placed, gains bool) (reach, error) {
-	r := reach{up: map[string]map[string]bool{}, labeled: len(a.labels) > 0}
+// hold, approve and are named or exempt in, all a change checks; and, with losing but not gains, as
+// for the host's write, which checks nothing a member leaving loses, the activations of the members
+// leaving that rest on them.
+func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remove []Member, left *placed, gains, losing bool) (reach, error) {
+	r := reach{up: map[string]map[string]bool{}, losing: losing && !gains}
 	groups := memberGroups(slices.Concat(add, remove))
 	if len(groups) == 0 {
 		return r, nil
@@ -1687,10 +1828,11 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 		left = &read
 	}
 	r.placed = *left
-	// Without declared labels, a member leaving loses nothing a change checks but the denies naming
-	// its groups, which then no longer bind it: where none gains, as none is added but to end a place
-	// sooner or change its note, those alone are read, not what the groups hold.
-	if !r.labeled && len(r.gaining(add)) == 0 {
+	// Where neither a label nor a freeze can refuse it, a member leaving loses nothing a change checks
+	// but the denies naming its groups, which then no longer bind it: where none gains, as none is
+	// added but to end a place sooner or change its note, those alone are read, not what the groups
+	// hold.
+	if !r.losing && len(r.gaining(add)) == 0 {
 		rows, err = q.Query(ctx, `SELECT `+denyColumns+` FROM rbac_denies WHERE `+naming("principals", "$2")+` ORDER BY scope, id`, tenant, keys)
 		if err != nil {
 			return reach{}, err
@@ -1732,7 +1874,7 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 	if r.denies, err = collectDenies(rows); err != nil {
 		return reach{}, err
 	}
-	if r.labeled && !gains {
+	if r.losing {
 		if r.activations, err = activationsLeaving(ctx, q, tenant, r.leaving(add, remove), keys, now); err != nil {
 			return reach{}, err
 		}
@@ -1786,6 +1928,10 @@ func activationsLeaving(ctx context.Context, q DB, tenant string, leaving []Memb
 	if len(identities)+len(groups) == 0 {
 		return nil, nil
 	}
+	// Each once, however many groups it leaves, as holders would otherwise join each of its
+	// activations once for each of them.
+	identities = slices.Compact(slices.Sorted(slices.Values(identities)))
+	groups = slices.Compact(slices.Sorted(slices.Values(groups)))
 	rows, err := q.Query(ctx, `
 		WITH RECURSIVE `+insideSQL("$3", "$5", "NULL", false)+`, holders(member, k) AS (
 		  SELECT k, k COLLATE "C" FROM unnest($2::text[]) AS k
@@ -1968,9 +2114,6 @@ func (r reach) leaving(add, remove []Member) []Member {
 	return out
 }
 
-// heldBy is what a member of group gains: the grants and eligibilities of it and those it is in.
-func (r reach) heldBy(group string) []revalidation { return pick(r.held, r.heldOf.of(r.up, group)) }
-
 // approvedBy is the eligibilities whose activations a member of one of groups approves.
 func (r reach) approvedBy(groups ...string) []revalidation {
 	var vs []revalidation
@@ -1996,9 +2139,9 @@ func (r reach) lifted(leaving bool, groups ...string) []Scope {
 
 // boundBy is the scopes a member joining one of groups, or staying in it longer, loses access on,
 // as the change will store them: those of the denies that name it or one it will be in, which then
-// bind the member; none where no label checks them.
+// bind the member; none where nothing checks them (losing).
 func (r reach) boundBy(groups ...string) []Scope {
-	if !r.labeled {
+	if !r.losing {
 		return nil
 	}
 	var ss []Scope
@@ -2010,10 +2153,10 @@ func (r reach) boundBy(groups ...string) []Scope {
 
 // leftBy is the scopes a member leaving one of groups loses access on, as stored: those of the
 // grants and eligibilities of the group and those it is in, of the eligibilities they approve, and
-// of the denies that exempt them; none where no label checks them. Those of its activations
-// through them are the member's own (activatedBy).
+// of the denies that exempt them; none where nothing checks them (losing). Those of its
+// activations through them are the member's own (activatedBy).
 func (r reach) leftBy(groups ...string) []Scope {
-	if !r.labeled {
+	if !r.losing {
 		return nil
 	}
 	var ss []Scope
@@ -2029,68 +2172,114 @@ func (r reach) leftBy(groups ...string) []Scope {
 	return ss
 }
 
-// activatedBy is the scopes m, a member leaving its group, loses access on through its activations,
-// or those of the identities in it, made through the group or one it is in, as stored; none where no
-// label checks them.
-func (r reach) activatedBy(m Member) []Scope {
-	if !r.labeled {
+// activatedBy is the scopes the members leaving their groups lose access on through their
+// activations, or those of the identities in them, made through one of the groups a member leaves
+// or one it is in, as stored; none where nothing checks them (losing). What each principal leaves
+// is found first, so its activations are read once, however many of its places end.
+func (r reach) activatedBy(leaving []Member) []Scope {
+	if !r.losing {
 		return nil
 	}
+	through := map[string]map[string]bool{}
+	for _, m := range leaving {
+		k := m.Principal.key()
+		if len(r.activatedOf[k]) == 0 {
+			continue
+		}
+		if through[k] == nil {
+			through[k] = map[string]bool{}
+		}
+		for g := range r.stored[m.Group] {
+			through[k][g] = true
+		}
+	}
 	var ss []Scope
-	for _, i := range r.activatedOf[m.Principal.key()] {
-		if x := r.activations[i]; r.stored[m.Group][x.through] {
-			ss = append(ss, x.scope)
+	for _, k := range slices.Sorted(maps.Keys(through)) {
+		for _, i := range r.activatedOf[k] {
+			if x := r.activations[i]; through[k][x.through] {
+				ss = append(ss, x.scope)
+			}
 		}
 	}
 	return ss
 }
 
 // gainsWithin refuses members ChangeMembers adds that gain more than MaxBindings grants and
-// eligibilities in all, each member's counted apart, as many as one Apply makes: the host is asked
-// about each as the member's, so an actor that may change members would otherwise multiply what
-// the host and the change do. One member gaining anything alone gains whatever its groups hold, as
-// a grant to a group reaches each member, or a group holding more could never gain one. Refused
-// before anything is asked about them, and never more under the locks, where stillReached refuses
-// a group holding more than was read.
+// eligibilities in all, as many as one Apply makes, and more than one place alone gains: the host
+// is asked about each as the member's, so an actor that may change members would otherwise
+// multiply what the host and the change do. A member is its principal, however many groups, or
+// places in one, it gains: what they reach is counted once for each end its places give it, as
+// the host is asked about each once (askMemberships), so a group two of its groups are in counts
+// once. One place gains whatever its group and those it is in hold, as a grant to a group reaches
+// each member, or a group holding more could never gain one; but a change gaining more than that,
+// as one principal joining several groups, does no more than MaxBindings allows. Refused before
+// anything is asked about them, and never more under the locks, where stillReached refuses a group
+// holding more than was read.
 func (r reach) gainsWithin(add []Member) error {
-	n, gainers := 0, 0
-	for _, m := range r.gaining(add) {
-		// Each of held names one holder, so what a group holds is counted by the keys it reaches,
-		// without reading it: many groups in one holding many are refused for as little as one.
+	places := r.gaining(add)
+	n, gainers := 0, map[Principal]bool{}
+	// Each of held names one holder, so what a group holds is counted by the keys it reaches,
+	// without reading it: many groups in one holding many are refused for as little as one.
+	for i, keys := range r.reached(places) {
+		for _, key := range keys {
+			n += len(r.heldOf[key])
+		}
+		if len(keys) > 0 {
+			gainers[places[i].Principal] = true
+		}
+	}
+	alone := 0
+	for _, m := range places {
 		k := 0
 		for key := range r.up[m.Group] {
 			k += len(r.heldOf[key])
 		}
-		if k > 0 {
-			n, gainers = n+k, gainers+1
-		}
+		alone = max(alone, k)
 	}
-	if n > MaxBindings && gainers > 1 {
-		return fmt.Errorf("%w: the members a change adds gain at most %d grants and eligibilities of their groups in all, each member's counted apart, but for one alone, and these %d gain %d: add fewer at a time",
-			ErrInvalid, MaxBindings, gainers, n)
+	if n > MaxBindings && n > alone {
+		return fmt.Errorf("%w: the members a change adds gain at most %d grants and eligibilities of their groups in all, each principal's counted apart, or what one place gains alone, and these %d gain %d: add fewer at a time",
+			ErrInvalid, MaxBindings, len(gainers), n)
 	}
 	return nil
 }
 
-// gains is what each group a member of add gains a place in holds (heldBy), found once for each.
-func (r reach) gains(add []Member) map[string][]revalidation {
-	held := map[string][]revalidation{}
-	for _, m := range r.gaining(add) {
-		if _, ok := held[m.Group]; !ok {
-			held[m.Group] = r.heldBy(m.Group)
+// reached is, for each of places, members a change adds that gain a place (placed.gaining), the
+// keys of the groups it reaches that hold anything, but those reached by a place before it of its
+// principal that ends when it does: so what a principal gains through several groups, or places in
+// one, is found once for each end its places give it, however many of them reach it.
+func (r reach) reached(places []Member) [][]string {
+	type reaching struct {
+		p     Principal
+		key   string
+		until int64
+	}
+	seen := map[reaching]bool{}
+	keys := make([][]string, len(places))
+	for i, m := range places {
+		for key := range r.up[m.Group] {
+			x := reaching{m.Principal, key, m.ExpiresAt.UnixMicro()}
+			if len(r.heldOf[key]) > 0 && !seen[x] {
+				seen[x] = true
+				keys[i] = append(keys[i], key)
+			}
 		}
 	}
-	return held
+	return keys
 }
 
-// byGroup is the members of ms by their group, each group's in order: what a member gains, but for
-// its end, is its group's, so it is found once for each group, however many members it gains.
-func byGroup(ms []Member) map[string][]Member {
-	groups := map[string][]Member{}
-	for _, m := range ms {
-		groups[m.Group] = append(groups[m.Group], m)
+// gained is, for each of places, as for reached, where in held what it gains is, in order: each
+// grant and eligibility once for each principal and end, as gainsWithin counts them, so what one
+// change builds and asks the host about grows with that, not with how many of a principal's
+// groups, or places in one, reach it.
+func (r reach) gained(places []Member) [][]int {
+	held := make([][]int, len(places))
+	for i, keys := range r.reached(places) {
+		for _, key := range keys {
+			held[i] = append(held[i], r.heldOf[key]...)
+		}
+		slices.Sort(held[i])
 	}
-	return groups
+	return held
 }
 
 // locks are the principal locks of every group the change reaches: a grant, an eligibility or a
@@ -2105,28 +2294,39 @@ func (r reach) locks() []string {
 	return slices.Sorted(maps.Keys(keys))
 }
 
-// reachKey is one change to access a change to members makes: a grant or eligibility a member of
-// group gains, which the host is asked about as the member's; or, for whichever members, one whose
-// activations they approve, a deny on a scope lifted, or access on a scope left or lost to a deny
-// binding them, which mayReach checks on the scope whoever it is for, so with no group.
+// reachKey is one change to access a change to members makes: a group a member of group gains a
+// place in reaches, holder, that holds anything, and a grant or eligibility a holder holds, which
+// the host is asked about as the member's; or, for whichever members, one whose activations they
+// approve, a deny on a scope lifted, or access on a scope left or lost to a deny binding them,
+// which mayReach checks on the scope whoever it is for, so with no group.
 type reachKey struct {
-	group    string
-	approves bool
-	gained   revalidated
-	deny     Scope
-	left     Scope
+	group, holder string
+	approves      bool
+	gained        revalidated
+	deny          Scope
+	left          Scope
 }
 
 // footprint is the changes to access adding add and removing remove make, with the role of each
 // grant or eligibility; with gains, only the grants and eligibilities added members gain. Those
-// are keyed by group, read once for each, no more than the host is asked about; the rest are read
-// once for all the groups, however many reach them, and for each member only its activations.
+// are keyed by the group holding them, each once however many of the groups reach it, beside the
+// holders each group reaches, so what a member of a group gains is told apart as it would be
+// keyed by group, with no more read than the host is asked about; the rest are read once for all
+// the groups, however many reach them, and for each member only its activations.
 func (r reach) footprint(add, remove []Member, gains bool) map[reachKey]RoleDefinition {
 	f := map[reachKey]RoleDefinition{}
 	gaining := memberGroups(r.gaining(add))
+	holders := map[string]bool{}
 	for _, g := range gaining {
-		for _, v := range r.heldBy(g) {
-			f[reachKey{group: g, gained: v.key()}] = v.role
+		for k := range r.up[g] {
+			if len(r.heldOf[k]) > 0 {
+				f[reachKey{group: g, holder: k}], holders[k] = RoleDefinition{}, true
+			}
+		}
+	}
+	for k := range holders {
+		for _, i := range r.heldOf[k] {
+			f[reachKey{holder: k, gained: r.held[i].key()}] = r.held[i].role
 		}
 	}
 	if gains {
@@ -2143,10 +2343,8 @@ func (r reach) footprint(add, remove []Member, gains bool) map[reachKey]RoleDefi
 	for _, s := range slices.Concat(r.boundBy(gaining...), r.leftBy(left...)) {
 		f[reachKey{left: s}] = RoleDefinition{}
 	}
-	for _, m := range leaving {
-		for _, s := range r.activatedBy(m) {
-			f[reachKey{left: s}] = RoleDefinition{}
-		}
+	for _, s := range r.activatedBy(leaving) {
+		f[reachKey{left: s}] = RoleDefinition{}
 	}
 	return f
 }
@@ -2155,9 +2353,11 @@ func (r reach) footprint(add, remove []Member, gains bool) map[reachKey]RoleDefi
 // access it didn't when it was checked and the host asked about it before the transaction, or one
 // of a role widened since, or that reaches a group it didn't then. With gains, as for the host's
 // write, which is checked only as the host is asked about what members gain, it compares only
-// those. It returns what the change reaches under the locks.
+// those. It returns what the change reaches under the locks. A change ending places reads it once
+// it holds them (restingIn), so an activation committing meanwhile through one, which Activate makes
+// holding the places it rests on, is read here, and the change tried again to check it.
 func (a *Authorizer) stillReached(ctx context.Context, tx pgx.Tx, tenant string, add, remove []Member, was reach, gains bool) (reach, error) {
-	now, err := a.reachOf(ctx, tx, tenant, add, remove, nil, gains)
+	now, err := a.reachOf(ctx, tx, tenant, add, remove, nil, gains, was.losing)
 	if err != nil {
 		return reach{}, err
 	}
@@ -2181,10 +2381,12 @@ func (a *Authorizer) stillReached(ctx context.Context, tx pgx.Tx, tenant string,
 	for k, role := range now.footprint(add, remove, gains) {
 		switch old, ok := before[k]; {
 		case ok && !widens(old, role):
-		case k.group == "":
-			return reach{}, fmt.Errorf("%w: what the groups changed reach changed while this change waited for them; try again", ErrConflict)
-		default:
+		case k.group != "":
 			return reach{}, fmt.Errorf("%w: what group %q holds changed while this change waited for it; try again", ErrConflict, k.group)
+		case k.holder != "":
+			return reach{}, fmt.Errorf("%w: what group %q holds changed while this change waited for it; try again", ErrConflict, parsePrincipal(k.holder).ID)
+		default:
+			return reach{}, fmt.Errorf("%w: what the groups changed reach changed while this change waited for them; try again", ErrConflict)
 		}
 	}
 	return now, nil
@@ -2203,12 +2405,15 @@ func (v revalidation) as(m Member) Binding {
 
 // askMemberships asks Config.ValidateGrant, before a change's transaction, about each grant and
 // eligibility each member set adds gains, as the member's, and returns the standing of the members
-// it asked about, which the answers rest on.
+// it asked about, which the answers rest on. A member gaining one through several of its places
+// until the same end, as through two groups in one that holds it, is asked about it once, as
+// gainsWithin counts it (gained).
 func (a *Authorizer) askMemberships(ctx context.Context, actor Subject, tenant string, set []Member, rc reach) (standing, error) {
-	gaining, held := rc.gaining(set), rc.gains(set)
+	gaining := rc.gaining(set)
+	held := rc.gained(gaining)
 	var asked []Principal
-	for _, m := range gaining {
-		if len(held[m.Group]) > 0 {
+	for i, m := range gaining {
+		if len(held[i]) > 0 {
 			asked = append(asked, m.Principal)
 		}
 	}
@@ -2216,11 +2421,24 @@ func (a *Authorizer) askMemberships(ctx context.Context, actor Subject, tenant s
 	if err != nil {
 		return standing{}, err
 	}
+	type question struct {
+		member Principal
+		gained revalidated
+		until  int64
+	}
+	seen := map[question]bool{}
 	var refused []error
-	for _, m := range gaining {
-		for _, v := range held[m.Group] {
+	for i, m := range gaining {
+		for _, j := range held[i] {
+			v := rc.held[j]
+			b := v.as(m)
+			q := question{m.Principal, v.key(), b.ExpiresAt.UnixMicro()}
+			if seen[q] {
+				continue
+			}
+			seen[q] = true
 			roles := a.bookOf([]RoleDefinition{v.role})
-			bad, err := a.allowed(ctx, roles, actor, ViaMembership, tenant, v.scope, v.as(m))
+			bad, err := a.allowed(ctx, roles, actor, ViaMembership, tenant, v.scope, b)
 			if err != nil {
 				return standing{}, err
 			}
@@ -2241,19 +2459,92 @@ type reachCheck struct {
 	// cleared is set where only a member leaving is checked, by the label alone, and the actor's
 	// label values satisfied every label, so the host wasn't asked: they must still.
 	cleared bool
-	// cs and ds are the constraints' answers on granting and on lifting denies there.
+	// frozen is set where a member only loses access, granting nothing there, and a constraint may
+	// stop the actor changing grants on scopes of its type (freezes): cs asks it about this one. bound
+	// is set there where a deny binding the actor may remove that power on scopes of its type
+	// (grantsDenied), whose authority there is read for the denies on its path. Either stops the
+	// change there, as it would stop Apply revoking (stopped).
+	frozen, bound bool
+	// cs and ds are the constraints' answers on granting, or where frozen on changing grants, and on
+	// lifting denies there.
 	cs, ds *constrained
+}
+
+// seal has the constraints' answers c asked for before a change's transaction read back in it.
+func (c *reachCheck) seal() {
+	for _, cs := range []*constrained{c.cs, c.ds} {
+		if cs != nil {
+			cs.seal()
+		}
+	}
+}
+
+// stopped refuses, as a DeniedError of the power to change grants on c's scope, a change that only
+// takes access away there, where a constraint removes that power from the actor, as asked through
+// cs where frozen, or where bound, a deny on the scope's path does, by au, the actor's authority
+// there: as either refuses Apply revoking there, whatever the actor's grants.
+func (c *reachCheck) stopped(au authority, change string) error {
+	manage := GrantPermission(c.on.Type)
+	if c.frozen && c.cs.removes(manage, c.on.Type) {
+		reason := fmt.Sprintf("removed by %s, which stops %s", c.cs.removedBy(manage, c.on.Type), change)
+		return cmp.Or(c.cs.failed(), error(&DeniedError{Permission: manage, Scope: c.on.Scope(), Reason: reason}))
+	}
+	if c.bound && au.denied(manage) {
+		return &DeniedError{Permission: manage, Scope: c.on.Scope(), Reason: "removed by a deny, which stops " + change}
+	}
+	return nil
+}
+
+// freezes names the constraint that may stop actor changing grants on scopes of a type in a
+// tenant, or "": asked of no resource, as one answers true that removes the power on any of them,
+// as SetRole and DeleteRole ask. A change taking access away on scopes of the type then asks it
+// again about each, as Config.ResourceOf gives it, as Apply asks about the scope it revokes on.
+func (a *Authorizer) freezes(ctx context.Context, actor Subject, tenant, scopeType string) (string, error) {
+	if len(a.cfg.Constraints) == 0 {
+		return "", nil
+	}
+	return a.denied(ctx, ConstraintInput{Tenant: tenant, ResourceType: scopeType, Permission: GrantPermission(scopeType), Subject: &actor})
+}
+
+// grantsDenied reads, on q, the scope types whose power to change grants a deny on some scope of a
+// tenant binding actor lists, as `<type>:grant` or `<type>:*`, as deniedBelow reads those below
+// the tenant: only on a scope of one can a deny on its path stop the actor taking access away there,
+// which its authority on each such scope is then read for. They are found by the keys it is bound
+// by (naming), so the tenant's denies of others aren't read, and of those, through
+// rbac_denies_grants, only the denies that list such a power (rbac_changes_grants): a change to
+// members reads them before its transaction and again under its locks, so the denies binding the
+// actor that remove anything else, as root to the tenant's members on each of thousands of
+// resources, cost it nothing.
+func (a *Authorizer) grantsDenied(ctx context.Context, q DB, tenant string, actor Subject) (map[string]bool, error) {
+	rows, err := q.Query(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`
+		SELECT DISTINCT p FROM rbac_denies d CROSS JOIN LATERAL unnest(d.permissions) AS p
+		WHERE `+naming("d.principals", "ARRAY(SELECT k FROM bound)")+` AND rbac_changes_grants(d.permissions)
+		  AND NOT d.exempt && ARRAY(SELECT k FROM exempted)`,
+		tenant, actor.identityKey(), a.cfg.Now())
+	if err != nil {
+		return nil, err
+	}
+	types := map[string]bool{}
+	var p Permission
+	_, err = pgx.ForEachRow(rows, []any{&p}, func() error {
+		if t, verb := p.parts(); verb == "grant" || verb == "*" {
+			types[t] = true
+		}
+		return nil
+	})
+	return types, err
 }
 
 // mayReach checks, before ChangeMembers' transaction, that actor may make each change to access a
 // change to members makes, by scope: grant each grant and eligibility an added member gains, as
 // Apply would; set each eligibility it would approve; set each deny lifted for a member; and take
 // away what a member leaving loses, and what one joining loses to the denies that then bind it,
-// which only a scope's label refuses, as Apply refuses a revoke there. The actor's label values
+// which a scope's label, a constraint stopping the actor changing grants there or, where bound, a
+// deny on its path doing so refuses, as each refuses Apply revoking there. The actor's label values
 // are asked about through labels, and for what a member loses decided by values, which
 // mayManageGroups read with its power over the members, so it held both at one moment.
 func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string, add, remove []Member, rc reach, labels *constrained,
-	values *valuesRead,
+	values *valuesRead, bound map[string]bool,
 ) ([]*reachCheck, error) {
 	byScope := map[Scope]*reachCheck{}
 	at := func(s Scope) *reachCheck {
@@ -2286,22 +2577,25 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 			c.grants = append(c.grants, b)
 		}
 	}
-	gaining := byGroup(rc.gaining(add))
-	groups := slices.Sorted(maps.Keys(gaining))
-	for _, g := range groups {
-		for _, v := range rc.heldBy(g) {
-			if err := stale(v); err != nil {
-				return nil, err
-			}
-			for _, m := range gaining[g] {
-				b := v.as(m)
-				if v.eligibility {
-					b = handedOn(b)
+	gaining := rc.gaining(add)
+	checked := make([]bool, len(rc.held))
+	for i, held := range rc.gained(gaining) {
+		for _, j := range held {
+			v := rc.held[j]
+			if !checked[j] {
+				if err := stale(v); err != nil {
+					return nil, err
 				}
-				grant(v.scope, b)
+				checked[j] = true
 			}
+			b := v.as(gaining[i])
+			if v.eligibility {
+				b = handedOn(b)
+			}
+			grant(v.scope, b)
 		}
 	}
+	groups := memberGroups(gaining)
 	// The rest is checked on its scope whoever it is for, so found once for all the groups, as what
 	// a group many of them are in reaches is.
 	for _, v := range rc.approvedBy(groups...) {
@@ -2318,43 +2612,61 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 	for _, s := range slices.Concat(rc.boundBy(groups...), rc.leftBy(left...)) {
 		at(s).leaves = true
 	}
-	for _, m := range leaving {
-		for _, s := range rc.activatedBy(m) {
-			at(s).leaves = true
-		}
+	for _, s := range rc.activatedBy(leaving) {
+		at(s).leaves = true
 	}
 	// Each as Config.ResourceOf gives it, and then the actor's authority on all of them in one read,
-	// so a group with access on many scopes doesn't cost a read on each. Where only its label checks
-	// a scope, the host is asked about it only if a label could refuse the actor, and one it no
-	// longer has, as for a revoke there, has none.
+	// so a group with access on many scopes doesn't cost a read on each. Where only a member losing
+	// access checks a scope, the host is asked about it only if a label could refuse the actor, or a
+	// constraint or a deny binding it may stop it changing grants on scopes of its type; and one the
+	// host no longer has, as for a revoke there, is as stored, unlabeled. Where a member gains a grant
+	// there, grantsAllowed checks the actor's power to change grants as Apply does.
 	var cleared *bool
 	var checks []*reachCheck
+	frozen := map[string]bool{}
 	for _, s := range slices.SortedFunc(maps.Keys(byScope), func(x, y Scope) int { return strings.Compare(x.Key(), y.Key()) }) {
 		c := byScope[s]
 		leaving := len(c.grants) == 0 && !c.denies
-		if leaving && cleared == nil {
-			all, err := a.clearsAll(ctx, a.db, labels, values)
-			if err != nil {
-				return nil, err
+		if c.leaves && len(c.grants) == 0 {
+			f, asked := frozen[s.Type]
+			if !asked {
+				freeze, err := a.freezes(ctx, actor, tenant, s.Type)
+				if err != nil {
+					return nil, err
+				}
+				f = freeze != ""
+				frozen[s.Type] = f
 			}
-			cleared = &all
+			c.frozen, c.bound = f, bound[s.Type]
 		}
-		if leaving && *cleared {
-			c.cleared = true
-			checks = append(checks, c)
-			continue
+		if leaving && !c.frozen && !c.bound {
+			if cleared == nil {
+				all, err := a.clearsAll(ctx, a.db, labels, values)
+				if err != nil {
+					return nil, err
+				}
+				cleared = &all
+			}
+			if *cleared {
+				c.cleared = true
+				checks = append(checks, c)
+				continue
+			}
 		}
 		var err error
 		c.on, err = a.resourceOf(ctx, tenant, s)
 		switch {
 		case leaving && errors.Is(err, ErrNotFound):
-			continue
+			c.on = Resource{Tenant: tenant, Type: s.Type, ID: s.ID}
 		case err != nil:
 			return nil, err
 		}
+		if c.frozen {
+			c.cs = a.constrain(ctx, actor, c.on)
+		}
 		checks = append(checks, c)
 	}
-	granting, denying, err := a.reachAuthority(ctx, a.db, actor, checks)
+	granting, denying, revoking, err := a.reachAuthority(ctx, a.db, actor, checks)
 	if err != nil {
 		return nil, err
 	}
@@ -2377,15 +2689,27 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 				return nil, err
 			}
 		}
+		if err := c.stopped(revoking[i], takingAway); err != nil {
+			return nil, err
+		}
 	}
 	return checks, nil
 }
 
+// takingAway is what a freeze stops a change to members doing on a scope where a member only loses
+// access, for a refusal to say.
+const takingAway = "taking access away here"
+
 // mayReachAgain checks what mayReach checked again, in a change's transaction, reading the
 // constraints' answers from before it rather than ask them again, the actor's label values too,
-// decided by values as mayReach decided them.
-func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject, checks []*reachCheck, labels *constrained, values *valuesRead) error {
-	granting, denying, err := a.reachAuthority(ctx, tx, actor, checks)
+// decided by values as mayReach decided them. A change that takes access away from a member, or
+// may (taking), and passes them is tried again where a deny binding the actor now may remove its
+// power to change grants on scopes of a type none did, as grantsDenied read before it, bound: it
+// read the denies on the paths of none of those scopes.
+func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject, tenant string, checks []*reachCheck, labels *constrained,
+	values *valuesRead, bound map[string]bool, taking bool,
+) error {
+	granting, denying, revoking, err := a.reachAuthority(ctx, tx, actor, checks)
 	if err != nil {
 		return err
 	}
@@ -2395,14 +2719,13 @@ func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject
 		}
 	}
 	for i, c := range checks {
+		c.seal()
 		if len(c.grants) > 0 {
-			c.cs.seal()
 			if _, err := a.grantsAllowed(ctx, tx, actor, c.on, c.grants, nil, c.cs, labels, &granting[i]); err != nil {
 				return err
 			}
 		}
 		if c.denies {
-			c.ds.seal()
 			if err := a.denyAllowed(ctx, tx, actor, c.on, c.ds, labels, &denying[i]); err != nil {
 				return err
 			}
@@ -2412,14 +2735,30 @@ func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject
 				return err
 			}
 		}
+		if err := c.stopped(revoking[i], takingAway); err != nil {
+			return err
+		}
+	}
+	if !taking {
+		return nil
+	}
+	now, err := a.grantsDenied(ctx, tx, tenant, actor)
+	if err != nil {
+		return err
+	}
+	for t := range now {
+		if !bound[t] {
+			return fmt.Errorf("%w: a deny binding the actor was set while this change waited; try again", ErrConflict)
+		}
 	}
 	return nil
 }
 
 // reachAuthority reads, on q, the actor's authority on each scope checks reach, in one read: for
 // the grants a change to members amounts to there, and apart for the denies it lifts, as Apply and
-// SetDeny each read their own, the conditions of the grants it holds spending a budget of its own.
-func (a *Authorizer) reachAuthority(ctx context.Context, q DB, actor Subject, checks []*reachCheck) (granting, denying []authority, err error) {
+// SetDeny each read their own, the conditions of the grants it holds spending a budget of its own,
+// and for the denies on its path where a member only loses access and a deny binds the actor.
+func (a *Authorizer) reachAuthority(ctx context.Context, q DB, actor Subject, checks []*reachCheck) (granting, denying, revoking []authority, err error) {
 	var on []Resource
 	var roles []Role
 	for _, c := range checks {
@@ -2429,12 +2768,15 @@ func (a *Authorizer) reachAuthority(ctx context.Context, q DB, actor Subject, ch
 		if c.denies {
 			on = append(on, c.on)
 		}
+		if c.bound {
+			on = append(on, c.on)
+		}
 	}
 	aus, err := a.authorities(ctx, q, actor, on, roles)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	granting, denying = make([]authority, len(checks)), make([]authority, len(checks))
+	granting, denying, revoking = make([]authority, len(checks)), make([]authority, len(checks)), make([]authority, len(checks))
 	for i, c := range checks {
 		if len(c.grants) > 0 {
 			granting[i], aus = aus[0], aus[1:]
@@ -2442,8 +2784,11 @@ func (a *Authorizer) reachAuthority(ctx context.Context, q DB, actor Subject, ch
 		if c.denies {
 			denying[i], aus = aus[0], aus[1:]
 		}
+		if c.bound {
+			revoking[i], aus = aus[0], aus[1:]
+		}
 	}
-	return granting, denying, nil
+	return granting, denying, revoking, nil
 }
 
 // hostResource is a scope as Config.ResourceOf returns it, and true, or without it, as stored: its
@@ -2470,14 +2815,24 @@ func (a *Authorizer) hostResource(ctx context.Context, tenant string, s Scope) (
 // `has(resource.attributes.frozen)` does.
 func (a *Authorizer) resourceOf(ctx context.Context, tenant string, s Scope) (Resource, error) {
 	r, given, err := a.hostResource(ctx, tenant, s)
-	switch {
-	case err != nil || given:
+	if err != nil || given {
 		return r, err
-	case len(a.labels) > 0 || a.cfg.Attributes.Resource == nil || len(a.cfg.Attributes.Resource) > 0,
-		s.Type != TenantScope && s.Type != GroupScope && len(a.containers) > 0:
-		return Resource{}, fmt.Errorf("%w: the change reaches %s, whose containers, label and attributes only Config.ResourceOf gives", ErrInvalid, s.Key())
+	}
+	if err := a.storedWhole(s); err != nil {
+		return Resource{}, err
 	}
 	return r, nil
+}
+
+// storedWhole refuses checking a change on a scope as stored, without Config.ResourceOf, where that
+// isn't all of it, as resourceOf does: where the host declares labels, or resource attributes other
+// than as none, or for a scope other than the tenant or a group, containers.
+func (a *Authorizer) storedWhole(s Scope) error {
+	if len(a.labels) > 0 || a.cfg.Attributes.Resource == nil || len(a.cfg.Attributes.Resource) > 0 ||
+		s.Type != TenantScope && s.Type != GroupScope && len(a.containers) > 0 {
+		return fmt.Errorf("%w: the change reaches %s, whose containers, label and attributes only Config.ResourceOf gives", ErrInvalid, s.Key())
+	}
+	return nil
 }
 
 // membersCanJoin refuses members of groups that don't exist, or identities that aren't members or
@@ -2564,10 +2919,13 @@ var nestingDepths = `
 	SELECT (SELECT max(depth) FROM down), (SELECT max(depth) FROM up), EXISTS (SELECT FROM down WHERE id = $2)`
 
 // DeleteMembers removes members from a tenant's groups, each by its group, principal and source,
-// as actor: the host's own write, as for a directory it syncs from.
+// as actor: the host's own write, as for a directory it syncs from, without the checks ChangeMembers
+// makes of an actor, so no constraint or deny freezing changes to grants stops it, as none stops
+// DeleteGrants.
 func (a *Authorizer) DeleteMembers(ctx context.Context, actor Principal, tenant string, members []Member) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "DeleteMembers")
+	defer conflicting(&err)
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -2674,7 +3032,8 @@ func endingPlaces(ctx context.Context, tx pgx.Tx, query string, args ...any) (id
 // Members lists a group's members in force, as stored: identities and groups, not the members of
 // the groups in it. An identity whose membership of the tenant ended is in none of its groups. It
 // has no limit or cursor, so what it returns grows with the group.
-func (a *Authorizer) Members(ctx context.Context, tenant, group string) ([]Member, error) {
+func (a *Authorizer) Members(ctx context.Context, tenant, group string) (_ []Member, err error) {
+	defer conflicting(&err)
 	if !validID(tenant) || !validGroupID(group) {
 		return nil, fmt.Errorf("%w: Members needs a tenant and a valid group", ErrInvalid)
 	}
@@ -2695,7 +3054,8 @@ func (a *Authorizer) Members(ctx context.Context, tenant, group string) ([]Membe
 // lets a group's members through should check the membership too (Memberships). It has no limit or
 // cursor, so what it returns grows with the groups the principal is in, through others too, which
 // MaxGroupsOfPrincipal bounds only level by level.
-func (a *Authorizer) GroupsOf(ctx context.Context, tenant string, p Principal) ([]string, error) {
+func (a *Authorizer) GroupsOf(ctx context.Context, tenant string, p Principal) (_ []string, err error) {
+	defer conflicting(&err)
 	// The zero principal, the anonymous subject's, which a constraint may ask about, is in none.
 	if !validID(tenant) || p != (Principal{}) && !p.wellFormed(tenant) {
 		return nil, fmt.Errorf("%w: GroupsOf needs a tenant and a valid principal", ErrInvalid)
