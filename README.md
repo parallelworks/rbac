@@ -186,9 +186,10 @@ scopes conditional ones reach, to check one by one.
   on, but for those a role it holds lists in `GrantableRoles`, which it grants without holding, as
   any such role: the identity it grants one to is checked as in any change, so no one comes to hold
   two. Any other change reaching it is refused until a removal leaves it one; `Conflicts` lists
-  them. A role giving two of them is refused. An `Ordered` dimension's higher values include the
-  lower, so it isn't exclusive, and in an `AllOf` one a label naming two is one no one can read, as
-  data that joins two parties is.
+  them, reading the custom roles in the statement that reads their grants, so what it lists one
+  moment held, under `WithTx` too. A role giving two of them is refused. An `Ordered` dimension's
+  higher values include the lower, so it isn't exclusive, and in an `AllOf` one a label naming two
+  is one no one can read, as data that joins two parties is.
 - **Conditions:** a grant can carry a CEL expression over the subject's, the resource's and the
   request's attributes (`Subject.Attributes`, `Resource.Attributes`, `rbac.WithRequest`), the time
   and the action. It gives its role only where the expression holds; one that fails is false.
@@ -522,7 +523,8 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   then fails as `rbac.ErrConflict`: migrate again once what held the table, as a long export or
   host transaction, has ended. A transaction waiting for a lock a migration holds, which holds one
   the migration then waits for, is still ended as a deadlock where its `deadlock_timeout`, 1 second
-  by default, passes before the migration's wait does, and a change ended so is refused as
+  by default, passes before the migration's wait does, and a call ended so, or by its session's
+  `lock_timeout`, a read or a change, before its transaction or in it, is refused as
   `rbac.ErrConflict`. A tool of the host's own gets none of this: apply each migration with a
   short `lock_timeout`, and on SQLSTATE 55P03 or 40P01 roll it back and apply it again. Nor does
   `Migrate` on a host's transaction, as rolling back to its savepoint frees nothing the host's
@@ -565,10 +567,17 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   a transaction under way as it starts that read history or made a change, as deleting a scope's
   eligibilities and then its grants does, and then writes a grant can make it give way.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
-  the host's, which must be READ COMMITTED too. A change refused for a race, such as a deadlock
-  between host transactions, matches `rbac.ErrConflict`: try it again. Changes to the same rows
-  wait for each other by locks named for the schema holding the tables, so sessions reaching them
-  through different search_paths still do.
+  the host's, which must be READ COMMITTED too. A call PostgreSQL refuses for a race, as a
+  serialization failure, a deadlock between host transactions, or a lock it waited for past the
+  session's `lock_timeout`, matches `rbac.ErrConflict`, still wrapping PostgreSQL's error, as does a
+  change refused because what it rests on changed while it waited: try it again. It does wherever in
+  the call PostgreSQL refused it: in a change's transaction or the reads it makes before it, in a
+  read, or in a statement a hook ran, whose error matches too. Under `WithTx`, roll the host's
+  transaction back and run it again from its start, not the call alone in it: a statement refused
+  on that transaction itself, as a read's, a hook's or one a change makes before its savepoint,
+  aborts it, and one refused in the change's savepoint leaves it holding what it took before the
+  call, which the race can be over. Changes to the same rows wait for each other by locks named for
+  the schema holding the tables, so sessions reaching them through different search_paths still do.
 - **What the host passes:** a check reads grants, memberships and groups as they are; only compiled
   conditions are cached. Read a resource's ancestors and attributes from where they are stored,
   never from request input, no earlier than the content they protect, and from the primary. A

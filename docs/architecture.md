@@ -632,18 +632,29 @@ flowchart TB
   activation rests on before its grant. `DeleteRole` removes a role's grants before its
   eligibilities, but holds the tenant's lock exclusive, so no change runs beside it but
   `DeleteExpired`, which waits on no row.
-- **One snapshot for reads in several statements.** Explain, Reachable, Holders and Conflicts read
-  in one REPEATABLE READ, READ ONLY transaction of their own on a pool, and AsOf in a REPEATABLE
-  READ one it rolls back. Explain, Reachable and Holders read what label values are decided by in
-  it, and decide them after it, as the constraints are asked outside it.
-  Under `WithTx` they read on the host's transaction at its isolation, AsOf in a savepoint.
+- **One snapshot for reads in several statements.** Explain, Reachable and Holders read in one
+  REPEATABLE READ, READ ONLY transaction of their own on a pool, and AsOf in a REPEATABLE READ one
+  it rolls back. Explain, Reachable and Holders read what label values are decided by in it, and
+  decide them after it, as the constraints are asked outside it. Under `WithTx` they read on the
+  host's transaction at its isolation, AsOf in a savepoint: at READ COMMITTED each statement reads
+  a moment of its own, so a change committing between two can mix two states, and for AsOf, history
+  of a time not yet final. Conflicts reads in one statement, the custom roles with their grants, as
+  a check and `broadExcludes` read them, so it lists what one moment held under `WithTx` too: it
+  runs in such a transaction of its own only to hold JIT off for it (`withoutJIT`).
 - **One time for a call.** A call reads `Config.Now` once, where it first needs the time: every
   statement it makes compares expiry with it, and every condition reads it as `request.time`, so a
   grant or a membership ending as the call runs can't meet a deny, a condition or label values of a
   later moment. A change reads it again in its transaction, which first needs it under its locks,
   where it decides again by what committed before them. As of a time, it is that time.
-- **Races** PostgreSQL refuses, such as a serialization failure or a deadlock between host
-  transactions, match `ErrConflict`: try again.
+- **Races** PostgreSQL refuses, such as a serialization failure, a deadlock between host
+  transactions, or a lock waited for past `lock_timeout`, as one a migration holds, match
+  `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them as it
+  returns (`conflicting`), not only a change's transaction (`begin`), so one refused before the
+  transaction, as in the reads that decide a change first, which under `WithTx` run on the host's
+  transaction itself and can deadlock with a migration, in a read, or in a hook's statement, whose
+  error a call returns as it is, matches too. Under `WithTx` the host runs its transaction again
+  from its start: a statement refused on it outside a savepoint aborts it, and the change's
+  savepoint, rolled back to, frees nothing taken before it, which the race can be over.
 
 ## History, export and AsOf
 

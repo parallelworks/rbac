@@ -844,6 +844,48 @@ func TestThePublicsValuesAreReadWithTheirCustomRolesAsOfOneMoment(t *testing.T) 
 	}
 }
 
+// Conflicts reads the custom roles in the statement that reads their grants, so under WithTx at
+// READ COMMITTED, where each statement reads a moment of its own, it lists only what one moment
+// held: ann holds custom.ra, which gives bank:a, and then custom.ra is narrowed to give no value
+// and ann is granted bank.b, so at no moment could she hold two.
+func TestConflictsUnderWithTxListsOnlyWhatOneMomentHeld(t *testing.T) {
+	h := labeled(t, banks)
+	ctx := t.Context()
+	h.as(t, "ann")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.ra', '{bank:a}', '{tenant}')`); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(rbac.TenantRoot("t1"), "custom.ra", rbac.User, "ann"))
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	race := &racing{reading: "rbac_grants", change: func() {
+		for _, q := range []string{
+			`UPDATE rbac_roles SET permissions = '{cluster:view}', resource_types = '{cluster}' WHERE id = 'custom.ra'`,
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'tenant', 't1', 'user', 'ann', 'bank.b')`,
+		} {
+			if _, err := h.pool.Exec(ctx, q); err != nil {
+				t.Error(err)
+			}
+		}
+	}}
+	conflicts, err := h.authz.WithTx(&racingTx{Tx: tx, r: race}).Conflicts(ctx, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if race.change != nil {
+		t.Fatal("Conflicts read no grants")
+	}
+	if len(conflicts) > 0 {
+		t.Errorf("Conflicts under WithTx = %+v, which no moment held", conflicts)
+	}
+	if now, err := h.authz.Conflicts(ctx, "t1"); err != nil || len(now) > 0 {
+		t.Fatalf("Conflicts once both committed = %+v, %v", now, err)
+	}
+}
+
 // Holders leaves out the tenant's members or the public where their own grants could give two
 // values of a dimension the resource's label asks of: then none of them holds any, so none passes
 // the label. Where their grants give one, they are listed, as some may pass it.

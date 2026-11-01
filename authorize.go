@@ -30,7 +30,8 @@ type Decision struct {
 // Authorize returns nil when the subject may do p to r, and otherwise an error matching
 // ErrDenied, or ErrInvalid for malformed input, such as a permission or resource type the host
 // doesn't check (Config.Permissions), which can only be a mistake. Any error means no.
-func (a *Authorizer) Authorize(ctx context.Context, s Subject, p Permission, r Resource) error {
+func (a *Authorizer) Authorize(ctx context.Context, s Subject, p Permission, r Resource) (err error) {
+	defer conflicting(&err)
 	a = a.still()
 	d, err := a.decide(ctx, s, p, r, false)
 	if err != nil {
@@ -44,7 +45,8 @@ func (a *Authorizer) Authorize(ctx context.Context, s Subject, p Permission, r R
 
 // Explain decides as Authorize does and says why: the grants that give the permission, or what
 // denied it.
-func (a *Authorizer) Explain(ctx context.Context, s Subject, p Permission, r Resource) (Decision, error) {
+func (a *Authorizer) Explain(ctx context.Context, s Subject, p Permission, r Resource) (_ Decision, err error) {
+	defer conflicting(&err)
 	a = a.still()
 	return a.decide(ctx, s, p, r, true)
 }
@@ -291,7 +293,8 @@ func (h holding) carries(def RoleDefinition, p Permission) bool {
 }
 
 // Permissions lists what the subject may do to r, sorted: the AuthZEN action search.
-func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]Permission, error) {
+func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) (_ []Permission, err error) {
+	defer conflicting(&err)
 	a = a.still()
 	if err := a.check(r); err != nil {
 		return nil, err
@@ -513,7 +516,8 @@ type Holder struct {
 // it returns grows with the holders, as every identity in a group granted on the tenant; and it
 // reads every grant on the path, of any role, so it takes longer with those that don't give p too,
 // as many to other members on the tenant.
-func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]Holder, error) {
+func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) (_ []Holder, err error) {
+	defer conflicting(&err)
 	a = a.still()
 	if err := a.check(r); err != nil {
 		return nil, err
@@ -1028,7 +1032,8 @@ type Reach struct {
 // alone (Reach), for hosts that list from a store other than this PostgreSQL. Hosts on the same
 // database use Filter. It has no limit or cursor, so Reach.Scopes grows with the scopes the
 // subject's grants are on, as one on each resource it created.
-func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, tenant, resourceType string) (Reach, error) {
+func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, tenant, resourceType string) (_ Reach, err error) {
+	defer conflicting(&err)
 	a = a.still()
 	roles, removed, err := a.searchable(ctx, s, p, tenant, resourceType)
 	if err != nil || removed {
@@ -1241,7 +1246,8 @@ type Predicate struct {
 // count them, and indexes it after the tenant and before what a page sorts by, as
 // (tenant, type, id): with an index of the tenant alone, a sorted page of a type of few rows reads
 // the rows of every type until it is full.
-func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant, resourceType string, cols Columns, firstArg int) (Predicate, error) {
+func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant, resourceType string, cols Columns, firstArg int) (_ Predicate, err error) {
+	defer conflicting(&err)
 	a = a.still()
 	if cols.Tenant == "" || cols.Path == "" || firstArg < 1 {
 		return Predicate{}, fmt.Errorf("%w: Filter needs the tenant and path columns and a first argument", ErrInvalid)
