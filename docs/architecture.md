@@ -474,7 +474,8 @@ sequenceDiagram
   removing its power to change grants there do. A grant to the tenant's members of a privileged
   role is read there as one to a principal named one by one (`widenedTo.reaches`): a catalog
   change that has the role no longer be privileged gives them what it gives, what the redefinition
-  added too, and asks no one.
+  added too, and asks no one. A scope read as stored, as the host no longer has it, that the change
+  comes to give more on while it waits refuses it with `ErrConflict`.
 - **Eligibilities.** `SetEligibility` lets a principal `Activate` a role for a while, perhaps
   only with approvers or a `requires` condition. An activation is a grant that ends no later than
   its eligibility expires, or its holder's membership or place in the group the eligibility names

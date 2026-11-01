@@ -900,12 +900,14 @@ func (a *Authorizer) revalidate(ctx context.Context, actor Subject, tenant strin
 // roleReach is what a change to what a custom role's grants and eligibilities give, or deleting
 // the role, checked of the scopes it reaches before its transaction, which stillReaches checks
 // again under the tenant's lock: the types of scope the constraints were asked about, each scope as
-// Config.ResourceOf gives it, where a deny or a label needed it, the role as it was and as it will
-// be where a change redefines it, and the labels of the scopes they are on and, where it will give
-// more, of those roles listing it are granted on (listing).
+// Config.ResourceOf gives it, where a deny or a label needed it, or as stored, gone, where the host
+// no longer has it, the role as it was and as it will be where a change redefines it, and the
+// labels of the scopes they are on and, where it will give more, of those roles listing it are
+// granted on (listing).
 type roleReach struct {
 	types           []string
 	on              map[Scope]Resource
+	gone            map[Scope]bool
 	redefined       *redefinition
 	labels, listing labeling
 }
@@ -1057,8 +1059,8 @@ func (a *Authorizer) handingOn(custom map[Role]RoleDefinition, id Role, def Role
 // asked about the scopes. Where none of the grants and eligibilities on a scope will give more, nor
 // would so, as for deleting or narrowing the role, which there only takes access away, and no role
 // listing it is granted there to hand it on, a scope the host no longer has (ErrNotFound) is read
-// as stored, with no containers or label. au is the actor's authority on the tenant, which
-// mayDefine checked the role on.
+// as stored, with no containers or label, which stillReaches refuses once the change gives more
+// there. au is the actor's authority on the tenant, which mayDefine checked the role on.
 func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authority, tenant string, id Role, types []string, d *redefinition,
 	change string,
 ) (roleReach, error) {
@@ -1116,6 +1118,10 @@ func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authorit
 		switch {
 		case !scopes.widened[s] && scopes.listed[s] == nil && errors.Is(err, ErrNotFound):
 			r = Resource{Tenant: tenant, Type: s.Type, ID: s.ID}
+			if reach.gone == nil {
+				reach.gone = map[Scope]bool{}
+			}
+			reach.gone[s] = true
 		case err != nil:
 			return roleReach{}, err
 		}
@@ -1153,8 +1159,9 @@ func scopeOrder(x, y Scope) int { return strings.Compare(x.Key(), y.Key()) }
 // the actor's label values, read again, as one set or revoked meanwhile. A scope of a type the
 // constraints weren't asked about, or, where a deny below the tenant now binds the actor or a label
 // asks, one roleReachOf didn't ask the host about, as one the role, or one listing it, was granted
-// on while the change waited, refuses the change, to be tried again. au is the actor's authority on
-// the tenant read under the lock, with the tenant's custom roles as they are.
+// on while the change waited, refuses the change, to be tried again, as does one it read as stored
+// that the change now gives more on. au is the actor's authority on the tenant read under the lock,
+// with the tenant's custom roles as they are.
 func (a *Authorizer) stillReaches(ctx context.Context, tx pgx.Tx, actor Subject, au authority, tenant string, id Role, types []string,
 	checked roleReach, change string,
 ) error {
@@ -1191,6 +1198,14 @@ func (a *Authorizer) stillReaches(ctx context.Context, tx pgx.Tx, actor Subject,
 	if denied || checked.listing.asks() {
 		if err := unchecked(slices.SortedFunc(maps.Keys(scopes.listed), scopeOrder)); err != nil {
 			return err
+		}
+	}
+	// A scope read as stored was checked, without its containers or label, as one the change gives
+	// nothing more on: where a grant made meanwhile has it give more there, it is tried again, which
+	// fails with the host's error.
+	for _, s := range slices.SortedFunc(maps.Keys(checked.gone), scopeOrder) {
+		if scopes.widened[s] || scopes.listed[s] != nil {
+			return fmt.Errorf("%w: %s gives more on %s, which the host no longer has, as through a grant made while this change waited; try again", ErrConflict, id, s.Key())
 		}
 	}
 	if denied {

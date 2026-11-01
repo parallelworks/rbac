@@ -7693,6 +7693,63 @@ func TestADenyWhereTheMembersHoldAPrivilegedRoleStopsWideningIt(t *testing.T) {
 	}
 }
 
+// A scope the host no longer has is read as stored, before the transaction, only where the change
+// gives nothing more: where a role listing the role is granted there while the change waits, its
+// holders may hand the role on there as it will be, so the change is refused under the tenant's
+// lock, to be tried again, and trying again fails with the host's error.
+func TestAScopeTheHostNoLongerHasThatARedefinitionComesToReachRefusesIt(t *testing.T) {
+	gone := rbac.Scope{Type: "cluster", ID: "gone"}
+	var meanwhile func(context.Context) error
+	h, guardian := guarded(t, func(c *rbac.Config) {
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s == gone {
+				return rbac.Resource{}, fmt.Errorf("%w: %s", rbac.ErrNotFound, s.Key())
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			if do := meanwhile; do != nil && in.Via == rbac.ViaRedefinition {
+				meanwhile = nil
+				if err := do(ctx); err != nil {
+					return err
+				}
+			}
+			return validate(ctx, q, in)
+		}
+	})
+	ctx := t.Context()
+	x, _ := definer(t, h)
+	// custom.op isn't Public, so its grant to the public on gone gives nothing, before or after;
+	// custom.lister lets its holders grant it, and is granted nowhere yet.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles) VALUES
+		('t1', 'custom.op', '{cluster:view}', '{cluster}', '{}'), ('t1', 'custom.lister', '{cluster:grant,cluster:view}', '{cluster}', '{custom.op}');
+		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES
+		  ('t1', 'cluster', 'gone', 'public', '', 'custom.op'), ('t1', 'cluster', 'c2', 'user', 'y', 'custom.op')`); err != nil {
+		t.Fatal(err)
+	}
+	// A deny elsewhere binds x, so the scopes are read before the transaction.
+	elsewhere := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c3"}
+	if err := h.authz.SetDeny(ctx, guardian, elsewhere, rbac.Deny{ID: "no-root", Permissions: []rbac.Permission{root}, Principals: []rbac.Principal{x.Principal}}); err != nil {
+		t.Fatal(err)
+	}
+	meanwhile = func(ctx context.Context) error {
+		_, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'cluster', 'gone', 'user', 'z', 'custom.lister')`)
+		return err
+	}
+	wider := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("widening a role a role listing it was granted on, on a scope the host no longer has, while it waited: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("the role listing it should have been granted meanwhile")
+	}
+	if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.Is(err, rbac.ErrNotFound) {
+		t.Fatalf("trying again: %v", err)
+	}
+}
+
 // A deny on a container, or on the resource itself, that removes x's power to change grants there
 // stops x changing what a role granted there gives, or revoking it by deleting the role, as it
 // stops Apply there.
