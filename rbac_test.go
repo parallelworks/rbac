@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"maps"
 	"os"
+	"reflect"
 	"regexp"
 	"runtime"
 	"slices"
@@ -4275,7 +4276,7 @@ func waitedFor(t *testing.T, h *harness, table string) {
 func TestEveryCallRefusedForALockItCouldntTakeConflicts(t *testing.T) {
 	// So Migrate gives way at once, rather than try again for seconds.
 	rbac.SetMigrateAttempts(t, 1, 0)
-	h := setupOn(t, pgtest.Open(t, "lock_timeout=100"), withLabels, banks)
+	h := setupOn(t, pgtest.Open(t, "lock_timeout=10"), withLabels, banks)
 	ctx := t.Context()
 	owner, ann := h.as(t, "owner"), h.as(t, "ann")
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -4285,7 +4286,7 @@ func TestEveryCallRefusedForALockItCouldntTakeConflicts(t *testing.T) {
 	granted := []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "ann")}
 	members := []rbac.Member{{Group: "g", Principal: ann.Principal}}
 	onCluster := rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}}
-	for _, c := range []struct {
+	calls := []struct {
 		name string
 		call func() error
 	}{
@@ -4358,7 +4359,20 @@ func TestEveryCallRefusedForALockItCouldntTakeConflicts(t *testing.T) {
 		}},
 		{"PruneHistory", func() error { return second(rbac.PruneHistory(ctx, h.pool, h.now, rbac.Cursor{TxID: 1, ID: 1})) }},
 		{"Migrate", func() error { return rbac.Migrate(ctx, h.pool) }},
-	} {
+	}
+	// Every exported call that reads the database is here, so one added without mapping its races
+	// fails below.
+	checked := map[string]bool{}
+	for _, c := range calls {
+		checked[c.name] = true
+	}
+	authz := reflect.TypeFor[*rbac.Authorizer]()
+	for i := range authz.NumMethod() {
+		if m := authz.Method(i); m.Type.NumIn() > 1 && m.Type.In(1) == reflect.TypeFor[context.Context]() && !checked[m.Name] {
+			t.Errorf("Authorizer.%s isn't checked for a lock it couldn't take", m.Name)
+		}
+	}
+	for _, c := range calls {
 		t.Run(c.name, func(t *testing.T) {
 			// Held for this call alone, so no lock stands for longer than its wait.
 			held, err := h.pool.Begin(ctx)
