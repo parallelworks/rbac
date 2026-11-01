@@ -4035,6 +4035,73 @@ func TestADenyOnChangingGrantsSetWhileMembersAreCheckedIsTriedAgain(t *testing.T
 	}
 }
 
+// A deny removing the actor's power to change grants on the path of a scope a member loses access
+// on, set while the host is asked about what another member gains, stops the change under its
+// locks: where a deny binding the actor listed that power on the scope's type before, the denies on
+// its path are read again there and refuse it; where none did, as with nothing else that could
+// refuse taking access away, the change read none of them, and is tried again.
+func TestADenyOnChangingGrantsSetWhileTheHostIsAskedStopsARemoval(t *testing.T) {
+	for _, before := range []bool{false, true} {
+		t.Run(fmt.Sprintf("bound before %t", before), func(t *testing.T) {
+			var meanwhile func(ctx context.Context) error
+			h := grouped(t, func(c *rbac.Config) {
+				c.Catalog = append(slices.Clone(c.Catalog), guardRole, workspaceGuard)
+				validate := c.ValidateGrant
+				c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+					if do := meanwhile; do != nil && in.Via == rbac.ViaMembership {
+						meanwhile = nil
+						if err := do(ctx); err != nil {
+							return err
+						}
+					}
+					return validate(ctx, q, in)
+				}
+			})
+			ctx := t.Context()
+			elsewhere, far := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c2"}, rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c3"}
+			h.groups(t, "crew", "other")
+			h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"), grant(elsewhere.Scope(), "cluster.login", rbac.Group, "other"),
+				grant(elsewhere.Scope(), "cluster.admin", rbac.User, "manager"), grant(far.Scope(), "guard", rbac.User, "guardian"),
+				grant(workspace.Scope(), "workspace.guard", rbac.User, "guardian"))
+			h.join(t, "u", "v")
+			crew := rbac.Member{Group: "crew", Principal: identity("u")}
+			if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{crew}); err != nil {
+				t.Fatal(err)
+			}
+			manager, guardian := h.as(t, "manager"), h.as(t, "guardian")
+			deny := func(ctx context.Context, on rbac.Resource, id string) error {
+				return h.authz.SetDeny(ctx, guardian, on, rbac.Deny{ID: id, Principals: []rbac.Principal{manager.Principal}, Permissions: []rbac.Permission{grantC}})
+			}
+			// Off the path of the cluster u loses access on.
+			if before {
+				if err := deny(ctx, far, "far"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			meanwhile = func(ctx context.Context) error { return deny(ctx, workspace, "frozen") }
+			change := func() error {
+				return h.authz.ChangeMembers(ctx, manager, "t1", []rbac.Member{{Group: "other", Principal: identity("v")}}, []rbac.Member{crew})
+			}
+			want := rbac.ErrConflict
+			if before {
+				want = rbac.ErrDenied
+			}
+			if err := change(); !errors.Is(err, want) {
+				t.Fatalf("removing u from crew while a deny on its cluster's path was set: %v", err)
+			}
+			if meanwhile != nil {
+				t.Fatal("the deny should have been set meanwhile")
+			}
+			if err := change(); !errors.Is(err, rbac.ErrDenied) {
+				t.Fatalf("tried again: %v", err)
+			}
+			if !allowed(t, h, rbac.Subject{Principal: identity("u")}, login, cluster) {
+				t.Fatal("u should keep its login on the cluster")
+			}
+		})
+	}
+}
+
 // Deleting a group that doesn't exist does nothing, and asks Config.ResourceOf nothing of it, under
 // a freeze on groups as where a label would be asked for.
 func TestDeletingAGroupThatDoesntExistUnderAFreezeAsksTheHostNothing(t *testing.T) {
@@ -4749,6 +4816,15 @@ func activateAsTheHostDeletes(t *testing.T, h *harness, armed *atomic.Bool, paus
 	case err := <-activated:
 		t.Fatalf("Activate: %v", err)
 	}
+	// A test that fails before releasing it would leave its transaction holding the places, and the
+	// test's cleanup waiting on it.
+	t.Cleanup(func() {
+		select {
+		case <-a.release:
+		default:
+			close(a.release)
+		}
+	})
 	if err := hostTx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
