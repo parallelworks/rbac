@@ -517,6 +517,235 @@ func TestFilterReadsARowsOwnKeyWhereverItsPathStarts(t *testing.T) {
 	}
 }
 
+// One table can hold resources of several types, as one store of every resource does, and a grant
+// on a container reaches every row under it, of any type: Filter keeps of them only those whose own
+// key is of the type it lists, not of one whose name starts with its name, as Authorize refuses p
+// on the rest, in each form its condition takes, overlapping the path with the subject's grants,
+// looking its own key up in a hash of those on resources of the type, and looking each of its keys
+// up in one object of them all. Its condition is false for the rest, not unknown, for a host that
+// selects it as a column.
+func TestFilterKeepsOnlyTheRowsOfTheListedType(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE resources (tenant text NOT NULL, type text NOT NULL, id text NOT NULL, path text[] NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	o1 := rbac.Scope{Type: "org", ID: "o1"}
+	w1 := rbac.Resource{Tenant: "t1", Type: "workspace", ID: "w1", Ancestors: []rbac.Scope{o1}}
+	w2 := rbac.Resource{Tenant: "t1", Type: "workspace", ID: "w2", Ancestors: []rbac.Scope{w1.Scope(), o1}}
+	resources := []rbac.Resource{
+		{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"},
+		w1,
+		w2,
+		{Tenant: "t1", Type: "cluster", ID: "c1", Ancestors: []rbac.Scope{w1.Scope(), o1}},
+		{Tenant: "t1", Type: "cluster", ID: "c2", Ancestors: []rbac.Scope{w2.Scope(), w1.Scope(), o1}},
+		{Tenant: "t1", Type: "cluster", ID: "c3", Ancestors: []rbac.Scope{o1}},
+		{Tenant: "t1", Type: "clusterx", ID: "c1", Ancestors: []rbac.Scope{w1.Scope(), o1}},
+	}
+	for _, r := range resources {
+		if _, err := h.pool.Exec(ctx, `INSERT INTO resources VALUES ($1, $2, $3, $4)`, r.Tenant, r.Type, r.ID, h.path(t, r)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// org may view the clusters of o1 but those a deny on w2 covers, lead administers w1 and the
+	// workspace in it, many holds the role on w1 and on more clusters than Filter overlaps, and admin
+	// holds every role on the tenant.
+	grants := []rbac.Grant{
+		grant(o1, "cluster.login", rbac.User, "org"),
+		grant(w1.Scope(), "workspace.admin", rbac.User, "lead"),
+		grant(w1.Scope(), "cluster.login", rbac.User, "many"),
+	}
+	for i := range 12 {
+		grants = append(grants, grant(rbac.Scope{Type: "cluster", ID: fmt.Sprint("c", i+1)}, "cluster.login", rbac.User, "many"))
+	}
+	for _, role := range []rbac.Role{"cluster.login", "workspace.admin", "tenant.admin"} {
+		grants = append(grants, grant(rbac.TenantRoot("t1"), role, rbac.User, "admin"))
+	}
+	h.seed(t, grants...)
+	org, many := h.as(t, "org"), h.as(t, "many")
+	if err := h.authz.SetDeny(ctx, guardian, w2, rbac.Deny{ID: "d", Principals: []rbac.Principal{org.Principal}, Permissions: []rbac.Permission{view}}); err != nil {
+		t.Fatal(err)
+	}
+	subjects := []rbac.Subject{org, h.as(t, "lead"), many, h.as(t, "admin")}
+	// The keys of the rows Filter keeps listing resourceType for s, and those of the resources of
+	// the type Authorize allows.
+	kept := func(t *testing.T, s rbac.Subject, p rbac.Permission, resourceType string) (got, want []string) {
+		t.Helper()
+		pred, err := h.authz.Filter(ctx, s, p, "t1", resourceType, rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := h.pool.Query(ctx, `SELECT type || ':' || id COLLATE "C" FROM resources WHERE `+pred.SQL+` ORDER BY 1`, pred.Args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
+			t.Fatal(err)
+		}
+		var unknown []string
+		if err := h.pool.QueryRow(ctx, `SELECT coalesce(array_agg(type || ':' || id COLLATE "C"), '{}') FROM resources WHERE `+pred.SQL+` IS NULL`,
+			pred.Args...).Scan(&unknown); err != nil {
+			t.Fatal(err)
+		}
+		if len(unknown) > 0 {
+			t.Errorf("%s listing %ss: Filter's condition is unknown for %v", s.Principal.ID, resourceType, unknown)
+		}
+		for _, r := range resources {
+			if r.Type != resourceType {
+				continue
+			}
+			switch err := h.authz.Authorize(ctx, s, p, r); {
+			case err == nil:
+				want = append(want, r.Scope().Key())
+			case !errors.Is(err, rbac.ErrDenied):
+				t.Fatalf("Authorize: %v", err)
+			}
+		}
+		slices.Sort(want)
+		return got, want
+	}
+	listings := []struct {
+		resourceType string
+		p            rbac.Permission
+	}{{"cluster", view}, {"workspace", "workspace:view"}, {rbac.TenantScope, "tenant:view"}}
+	agree := func(t *testing.T) {
+		t.Helper()
+		for _, l := range listings {
+			for _, s := range subjects {
+				if got, want := kept(t, s, l.p, l.resourceType); !slices.Equal(got, want) {
+					t.Errorf("%s listing %ss: Filter keeps %v, Authorize allows %v", s.Principal.ID, l.resourceType, got, want)
+				}
+			}
+		}
+	}
+	agree(t)
+	pred, err := h.authz.Filter(ctx, many, view, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hashing(ctx, t, h, "rbac_grants", `SELECT count(*) FROM resources WHERE `+pred.SQL, pred.Args...)) == 0 {
+		t.Fatal("Filter doesn't look many's grants on clusters up in a hash")
+	}
+	t.Run("looking up grants on containers", func(t *testing.T) {
+		rbac.SetMaxContainerOverlap(t, 0)
+		pred, err := h.authz.Filter(ctx, org, view, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if over := overlapping(ctx, t, h, "rbac_grants", `SELECT count(*) FROM resources WHERE `+pred.SQL, pred.Args...); len(over) > 0 {
+			t.Fatalf("with SetMaxContainerOverlap(0), Filter overlaps each row with org's grant: %q", over)
+		}
+		agree(t)
+	})
+}
+
+// A table holding several types is listed through its path's index as one of a type is: each row's
+// type is tested among the rows the index finds, so a list of the clusters in one workspace reads
+// those and the workspace's own row, not the tenant's.
+func TestFilterReadsATableOfSeveralTypesThroughThePathIndex(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	for _, q := range []string{
+		`CREATE TABLE resources (tenant text NOT NULL, type text NOT NULL, id text NOT NULL, path text[] NOT NULL)`,
+		`INSERT INTO resources SELECT 't1', 'workspace', 'w' || i, ARRAY['workspace:w' || i, 'org:o' || (i % 50), 'tenant:t1']
+			FROM generate_series(1, 2000) i`,
+		`INSERT INTO resources SELECT 't1', 'cluster', 'c' || i, ARRAY['cluster:c' || i, 'workspace:w' || (i % 2000 + 1), 'org:o' || ((i % 2000 + 1) % 50), 'tenant:t1']
+			FROM generate_series(1, 20000) i`,
+		`CREATE INDEX resources_path ON resources USING gin (path)`,
+		`ANALYZE resources`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.seed(t, grant(rbac.Scope{Type: "workspace", ID: "w7"}, "cluster.login", rbac.User, "u"))
+	pred, err := h.authz.Filter(ctx, h.as(t, "u"), login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := `SELECT count(*) FROM resources WHERE ` + pred.SQL
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var n, pages int64
+	if err := tx.QueryRow(ctx, `SELECT relpages FROM pg_class WHERE oid = 'resources'::regclass`).Scan(&pages); err != nil {
+		t.Fatal(err)
+	}
+	start := pagesRead(ctx, t, tx, "resources")
+	if err := tx.QueryRow(ctx, query, pred.Args...).Scan(&n); err != nil || n != 10 {
+		t.Fatalf("Filter kept %d of w7's 10 clusters, %v", n, err)
+	}
+	if read := pagesRead(ctx, t, tx, "resources") - start; read*10 > pages {
+		t.Errorf("a list of w7's 10 clusters read %d pages of a table of %d", read, pages)
+	}
+	rows, err := tx.Query(ctx, "EXPLAIN "+query, pred.Args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text := strings.Join(plan, "\n"); !strings.Contains(text, "Bitmap Index Scan on resources_path") {
+		t.Errorf("Filter's plan on a table of several types:\n%s", text)
+	}
+}
+
+// Testing a row's type leaves the planner's count of the rows Filter's condition keeps as it was,
+// so a sorted, limited page of a table of one type whose condition no index serves, as for a subject
+// holding grants on hundreds of workspaces, is still read in the order of the host's index until
+// it is full, under a generic plan too. The planner has no statistics of a path's first key, and
+// counts a test of it alone as keeping one row in 200, so a plain test would read and sort every
+// row of the tenant.
+func TestFilterTestsARowsTypeWithoutMovingAPageOffTheHostsIndex(t *testing.T) {
+	for _, plan := range []string{"force_custom_plan", "force_generic_plan"} {
+		t.Run(plan, func(t *testing.T) {
+			h := setupOn(t, pgtest.Open(t, "plan_cache_mode="+plan))
+			ctx := t.Context()
+			for _, q := range []string{
+				`CREATE TABLE fleet (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL)`,
+				`INSERT INTO fleet SELECT 't1', 'c' || i, ARRAY['cluster:c' || i, 'workspace:w' || (i % 500), 'org:o' || (i % 50), 'tenant:t1']
+					FROM generate_series(1, 20000) i`,
+				`CREATE INDEX ON fleet USING gin (path)`,
+				`CREATE INDEX ON fleet (tenant, id)`,
+				`ANALYZE fleet`,
+				`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+					SELECT 't1', 'workspace', 'w' || i, 'user', 'u', 'cluster.login' FROM generate_series(1, 200) i`,
+			} {
+				if _, err := h.pool.Exec(ctx, q); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pred, err := h.authz.Filter(ctx, h.as(t, "u"), login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			var pages int64
+			if err := tx.QueryRow(ctx, `SELECT relpages FROM pg_class WHERE oid = 'fleet'::regclass`).Scan(&pages); err != nil {
+				t.Fatal(err)
+			}
+			start := pagesRead(ctx, t, tx, "fleet")
+			rows, err := tx.Query(ctx, `SELECT id FROM fleet WHERE `+pred.SQL+` ORDER BY id LIMIT 50`, pred.Args...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ids, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || len(ids) != 50 {
+				t.Fatalf("a page of %d clusters, %v", len(ids), err)
+			}
+			if read := pagesRead(ctx, t, tx, "fleet") - start; read*3 > pages {
+				t.Errorf("a page of 50 clusters read %d pages of a table of %d", read, pages)
+			}
+		})
+	}
+}
+
 // overlapping returns the conditions in the plan of query, on h's pool, that overlap an array with
 // what a subquery reading table selects (`&&`): each compares a row with every value the subquery
 // selects, rather than look the row's keys up in a hash or an object of them.
