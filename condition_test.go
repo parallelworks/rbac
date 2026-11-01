@@ -1245,7 +1245,7 @@ func TestAttributesLargerThanACheckConvertsFailEveryCondition(t *testing.T) {
 // charged nothing; and JSON text or a packed message of a mebibyte holding more values than a check
 // may convert, as a list of zeros, were decoded whole, taking a tenth of a second and 80 MB, before
 // converting found them past it. A value of a type whose name is long, as a struct of many fields,
-// was named in its error whole, though charged one.
+// was named in its error whole, though charged one, and so was a map keyed by one, or of them.
 func TestDecodingWhatAHostPassesCostsWhatItIsCharged(t *testing.T) {
 	notNumbers, outOfRange, packedFar := make([]any, 1000), make([]any, 1000), make([]any, 1000)
 	url := "type.googleapis.com/" + strings.Repeat("x", 1<<20)
@@ -1275,9 +1275,23 @@ func TestDecodingWhatAHostPassesCostsWhatItIsCharged(t *testing.T) {
 	for i := range fields {
 		fields[i] = reflect.StructField{Name: fmt.Sprintf("Field%d", i), Type: reflect.TypeFor[struct{}]()}
 	}
-	long := reflect.MakeSlice(reflect.SliceOf(reflect.StructOf(fields)), 5000, 5000).Interface()
-	if allocated, over := rbac.Converting(t, map[string]any{"v": long}); over || allocated > 16<<20 {
-		t.Errorf("values of a long-named type: past what a check converts %t, allocated %d bytes", over, allocated)
+	named := reflect.StructOf(fields)
+	keyed, held, twice := make([]any, 5000), make([]any, 5000), make([]any, 5000)
+	for i := range keyed {
+		keyed[i] = reflect.MakeMap(reflect.MapOf(named, reflect.TypeFor[int]())).Interface()
+		held[i] = map[any]int{reflect.Zero(named).Interface(): 1}
+		m := reflect.MakeMap(reflect.MapOf(reflect.TypeFor[any](), named))
+		m.SetMapIndex(reflect.ValueOf(any(1)), reflect.Zero(named))
+		m.SetMapIndex(reflect.ValueOf(any(uint(1))), reflect.Zero(named))
+		twice[i] = m.Interface()
+	}
+	for name, v := range map[string]any{
+		"values of a long-named type": reflect.MakeSlice(reflect.SliceOf(named), 5000, 5000).Interface(), "maps keyed by one": keyed,
+		"maps keyed by an interface holding one": held, "maps of them holding two keys read as one": twice,
+	} {
+		if allocated, over := rbac.Converting(t, map[string]any{"v": v}); over || allocated > 16<<20 {
+			t.Errorf("%s: past what a check converts %t, allocated %d bytes", name, over, allocated)
+		}
 	}
 	small, err := anypb.New(&structpb.ListValue{Values: []*structpb.Value{{}, {}}})
 	if err != nil {

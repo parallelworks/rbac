@@ -401,7 +401,7 @@ func (c *converter) list(v reflect.Value) ref.Val {
 // another kind than Attributes names, or where two of them are read as the same value.
 func (c *converter) dict(v reflect.Value) ref.Val {
 	if kt := v.Type().Key(); kt.Kind() != reflect.Interface && !keyType(kt) {
-		return types.NewErr("rbac: a condition can't read a map keyed by a %s", kt)
+		return cantKey(kt)
 	}
 	if 2*length(v.Len()) > c.left {
 		c.over, c.left = true, 0
@@ -420,7 +420,7 @@ func (c *converter) dict(v reflect.Value) ref.Val {
 			return k
 		}
 		if holdsKey(out, k) {
-			return types.NewErr("rbac: a condition can't read a %s holding two keys read as the same value", v.Type())
+			return types.NewErr("rbac: a condition can't read a %.64s holding two keys read as the same value", v.Type())
 		}
 		if out[k] = c.of(value); c.over {
 			return tooLarge()
@@ -485,7 +485,7 @@ func (c *converter) key(k reflect.Value) ref.Val {
 		if v, ok := k.Interface().(ref.Val); ok && keyType(t) {
 			return c.spend(textSize(v)-1, v)
 		}
-		return types.NewErr("rbac: a condition can't read a map keyed by a %s", t)
+		return cantKey(t)
 	}
 	switch k.Kind() {
 	case reflect.Bool:
@@ -499,7 +499,7 @@ func (c *converter) key(k reflect.Value) ref.Val {
 		return c.spend(uint64(len(s))/10, types.String(s))
 	default:
 	}
-	return types.NewErr("rbac: a condition can't read a map keyed by a %s", t)
+	return cantKey(t)
 }
 
 // keyType reports whether a map keyed by values of type t is keyed as Attributes names, empty too.
@@ -690,9 +690,15 @@ func (c *converter) message(v reflect.Value) ref.Val {
 	return cantRead(v.Type())
 }
 
-// cantRead fails a value of type t, naming no more of the type than its start: each such value is
-// charged one, whatever its type's name, which a type of many fields spells out whole.
+// cantRead fails a value of type t, naming no more of the type than its start, as every error
+// naming one does: each such value is charged one, whatever its type's name, which a type of many
+// fields spells out whole, and so does a map's of its key's and its values' types.
 func cantRead(t reflect.Type) ref.Val { return types.NewErr("rbac: a condition can't read a %.64s", t) }
+
+// cantKey fails a map keyed by values of type t, naming no more of t than cantRead does.
+func cantKey(t reflect.Type) ref.Val {
+	return types.NewErr("rbac: a condition can't read a map keyed by a %.64s", t)
+}
 
 func tooLarge() ref.Val {
 	return types.NewErr("rbac: the attributes a check passes are larger than a condition may read")
