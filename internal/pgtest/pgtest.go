@@ -160,6 +160,7 @@ func URL(tb testing.TB) string {
 		}
 		test, _, _ := strings.Cut(tb.Name(), "/")
 		if in := s.of(test); in != index {
+			// internal/shardcheck reads this message to tell which shard each test was left to.
 			tb.Skipf("%s is in shard %d of %d", test, in, count)
 		}
 	}

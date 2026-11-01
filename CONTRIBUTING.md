@@ -22,6 +22,10 @@ every shard.
   longest first, each test in the shard with the least time so far, so that the few tests of a
   minute are spread apart. A test no run has timed yet, such as a new one, is placed by its name
   until one does. Each shard's `go test -json` output is its job's `test-results-N` artifact.
+- The `go` job, which branch protection requires, passes once the checks and every shard have, and
+  `internal/shardcheck` finds that the shards ran every test `go test -list` names between them:
+  each test the others skipped as one shard's ran in that one alone. It runs in a cancelled run too,
+  and fails it, as a required job its `if` skips counts as passed.
 - Each job has a 20-minute timeout. When a shard's Test step nears half of that, add a shard to the
   matrix in `.github/workflows/ci.yml`; nothing else names their number.
 - The coverage each shard prints counts only the statements its own tests reach, so it reads low.
