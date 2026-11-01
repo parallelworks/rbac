@@ -4936,7 +4936,7 @@ func TestGrantsDecidedTogetherAreDecidedAsEachAlone(t *testing.T) {
 			grants = append(grants, b)
 		}
 		for _, r := range on {
-			together, alone := rbac.GrantsDecided(t, h.authz, boss, r, grants)
+			together, alone := rbac.GrantsDecided(t, ctx, h.authz, boss, r, grants)
 			for i, b := range grants {
 				if together[i] != alone[i] {
 					t.Errorf("seed %d, %s on %s: decided with the others, it lacks %q; alone, %q", seed, b.Role, r.Scope().Key(), together[i], alone[i])
@@ -4952,6 +4952,228 @@ func TestGrantsDecidedTogetherAreDecidedAsEachAlone(t *testing.T) {
 	// So that grants allowed and grants refused are both compared.
 	if allowed == 0 || refused == 0 {
 		t.Errorf("of the grants decided, %d were allowed and %d refused", allowed, refused)
+	}
+}
+
+// What a change granting many decides of each grant is what deciding it alone decides by those of
+// the actor's grants that each last until it ends, in random tenants of more than its grants: its
+// places in groups, one through another, and its membership of the tenant, each ending at an hour
+// of its own or never; its grants and activations through itself, its groups, the tenant's members
+// and the public, of roles privileged, public, listing others, or giving label values and an
+// exclusive dimension's, some under conditions reading the request, the action, the resource or
+// the subject; and denies on the path binding it, a group it is in or the members, some exempting
+// it, some under a condition. Each grant is made until an end of the actor's grants, a microsecond
+// either side of one, another time or for good, on each scope of the path, on requests meeting one
+// condition or another.
+func TestGrantsDecidedTogetherAreDecidedAsEachAloneWhateverTheActorHolds(t *testing.T) {
+	viewer := rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
+	h := setup(t, compartments, banks, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), granter, lister, viewer)
+		c.Constraints = []rbac.Constraint{{Name: "no root on workspaces", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			return in.Permission == root && in.ResourceType == "workspace", nil
+		}}}
+	})
+	ctx := t.Context()
+	// boss is in g1, g2 and g4, and in g3 through g4.
+	boss := h.as(t, "boss", "g1", "g2", "g4")
+	h.groups(t, "g3")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'g3', 'group', 'g4')`); err != nil {
+		t.Fatal(err)
+	}
+	places := [][2]string{{"g1", "user:boss"}, {"g2", "user:boss"}, {"g4", "user:boss"}, {"g3", "group:g4"}}
+	mfa, lab := `request.attributes.mfa == true`, `request.attributes.site == "lab"`
+	heldUnder := []string{"", "", "", mfa, lab, `subject.id == "boss"`, `action != "cluster:root"`, `resource.type == "cluster"`}
+	grantedUnder := []string{"", "", mfa, lab, `subject.id == "boss"`, `action != "cluster:root"`, `request.attributes.n == 1`}
+	perms := []string{
+		"cluster:view", "cluster:login", "cluster:root", "cluster:grant", "workspace:view", "workspace:grant", "tenant:view", "tenant:grant",
+		"comp:c00", "comp:c01", "bank:a", "bank:b",
+	}
+	types := []string{"cluster", "workspace", rbac.TenantScope}
+	custom := []rbac.Role{"custom.a", "custom.b", "custom.c", "custom.d", "custom.e"}
+	roles := append([]rbac.Role{
+		"cluster.admin", "cluster.sudo", "cluster.login", "cluster.granter", "cluster.lister", "cluster.viewer", "workspace.admin",
+		"tenant.admin", "compartment", "bank.a", "bank.b", "bank.release",
+	}, custom...)
+	powers := []rbac.Role{"cluster.admin", "cluster.granter", "cluster.lister", "workspace.admin", "tenant.admin", "custom.a", "custom.b"}
+	principals := []rbac.Principal{
+		boss.Principal, boss.Principal,
+		{Kind: rbac.Group, ID: "g1"},
+		{Kind: rbac.Group, ID: "g2"},
+		{Kind: rbac.Group, ID: "g3"},
+		{Kind: rbac.Group, ID: "g4"},
+		rbac.TenantMembers("t1"),
+		{Kind: rbac.Public},
+	}
+	path := []rbac.Scope{cluster.Scope(), workspace.Scope(), {Type: "org", ID: "o1"}, rbac.TenantRoot("t1")}
+	on := []rbac.Resource{cluster, workspace, tenantT1}
+	someHours := func(rng *rand.Rand) pgtype.Timestamptz {
+		if rng.IntN(3) == 0 {
+			return pgtype.Timestamptz{}
+		}
+		return pgtype.Timestamptz{Time: h.now.Add(time.Duration(1+rng.IntN(8)) * time.Hour), Valid: true}
+	}
+	allowed, refused, apart := 0, 0, 0
+	for seed := range uint64(200) {
+		rng := rand.New(rand.NewPCG(seed, seed))
+		for _, clear := range []string{`DELETE FROM rbac_grants WHERE tenant = 't1'`, `DELETE FROM rbac_roles WHERE tenant = 't1'`, `DELETE FROM rbac_denies WHERE tenant = 't1'`} {
+			if _, err := h.pool.Exec(ctx, clear); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var ends []time.Time
+		ending := func(at pgtype.Timestamptz) pgtype.Timestamptz {
+			if at.Valid {
+				ends = append(ends, at.Time)
+			}
+			return at
+		}
+		for _, p := range places {
+			if _, err := h.pool.Exec(ctx, `UPDATE rbac_members SET expires_at = $3 WHERE tenant = 't1' AND group_id = $1 AND principal = $2`,
+				p[0], p[1], ending(someHours(rng))); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := h.pool.Exec(ctx, `UPDATE rbac_memberships SET expires_at = $1 WHERE tenant = 't1' AND principal = 'user:boss'`, ending(someHours(rng))); err != nil {
+			t.Fatal(err)
+		}
+		for i, id := range custom {
+			var ps, ts []string
+			// The first may grant any role on every type, giving more or less.
+			if i == 0 {
+				ps, ts = []string{"workspace:grant", "tenant:grant"}, types
+			}
+			for _, p := range perms {
+				if rng.IntN(3) == 0 {
+					ps = append(ps, p)
+				}
+			}
+			for _, rt := range types {
+				if rng.IntN(2) == 0 {
+					ts = append(ts, rt)
+				}
+			}
+			lists := []string{}
+			if i > 0 && rng.IntN(2) == 0 {
+				lists = append(lists, string(roles[rng.IntN(len(roles))]))
+			}
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles, privileged, public)
+				VALUES ('t1', $1, $2, $3, $4, $5, $6)`, id, append(ps, "cluster:grant"), append(ts, "cluster"), lists, rng.IntN(4) == 0, rng.IntN(3) == 0); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// The power to change grants on every scope, through boss or a group it is in, so what it may
+		// grant there turns on what else it holds, and until when.
+		// In one tenant in four, the actor holds little else, and that power for good, so a role held
+		// through the members and the public below is what decides.
+		sparse := seed%4 == 0
+		power, powerEnds, others := principals[1+rng.IntN(5)], someHours(rng), 6+rng.IntN(15)
+		if sparse {
+			powerEnds, others = pgtype.Timestamptz{}, rng.IntN(3)
+		}
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+			VALUES ('t1', 'tenant', 't1', $1, $2, 'custom.a', $3)`, power.Kind, power.ID, ending(powerEnds)); err != nil {
+			t.Fatal(err)
+		}
+		var holds []rbac.Role
+		var paired []time.Time
+		for range others {
+			s, p, role := path[rng.IntN(len(path))], principals[rng.IntN(len(principals))], roles[rng.IntN(len(roles))]
+			if rng.IntN(2) == 0 {
+				role = powers[rng.IntN(len(powers))]
+			}
+			holds = append(holds, role)
+			expires, source := ending(someHours(rng)), ""
+			if p == boss.Principal && expires.Valid && rng.IntN(3) == 0 {
+				source = rbac.SourceActivation
+			}
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at, condition)
+				VALUES ('t1', $1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING`, s.Type, s.ID, p.Kind, p.ID, role, source, expires,
+				heldUnder[rng.IntN(len(heldUnder))]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// A role through the tenant's members and the public, each until its own time: the public
+		// carries only a public one, and the members no privileged one.
+		if sparse || rng.IntN(2) == 0 {
+			s, role := path[rng.IntN(len(path))], []rbac.Role{"cluster.login", "workspace.admin", "tenant.admin", "compartment", roles[rng.IntN(len(roles))]}[rng.IntN(5)]
+			holds = append(holds, role)
+			for _, p := range principals[6:] {
+				expires := ending(someHours(rng))
+				if expires.Valid {
+					paired = append(paired, expires.Time)
+				}
+				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+					VALUES ('t1', $1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`, s.Type, s.ID, p.Kind, p.ID, role, expires); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		for i := range rng.IntN(4) {
+			s := path[rng.IntN(len(path))]
+			bound := []string{"user:boss", "group:g1", "group:g3", "members:t1", "public:"}[rng.IntN(5)]
+			exempt := []string{}
+			if bound != "user:boss" && rng.IntN(3) == 0 {
+				exempt = []string{[]string{"user:boss", "group:g2"}[rng.IntN(2)]}
+			}
+			removes := []string{"cluster:root", "cluster:grant", "cluster:*", "workspace:grant", "tenant:grant", "bank:*", "comp:c00", "comp:*"}
+			condition := []string{"", "", `request.attributes.mfa == false`, `action == "cluster:login"`}[rng.IntN(4)]
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions, condition)
+				VALUES ('t1', $1, $2, $3, $4, $5, $6, $7)`, s.Type, s.ID, fmt.Sprint("d", i), []string{bound}, exempt,
+				[]string{removes[rng.IntN(len(removes))], removes[rng.IntN(len(removes))]}, condition); err != nil {
+				t.Fatal(err)
+			}
+		}
+		until := func() time.Time {
+			switch n := rng.IntN(8); {
+			case n == 0:
+				return time.Time{}
+			case n == 1 || len(ends) == 0:
+				return h.now.Add(time.Duration(1+rng.IntN(10*60)) * time.Minute)
+			case sparse && len(paired) > 0 && n < 5:
+				return paired[rng.IntN(len(paired))].Add(time.Duration(rng.IntN(3)-1) * time.Microsecond)
+			}
+			return ends[rng.IntN(len(ends))].Add(time.Duration(rng.IntN(3)-1) * time.Microsecond)
+		}
+		var grants []rbac.Binding
+		for i := range 16 {
+			b := rbac.Binding{Role: roles[rng.IntN(len(roles))], Principal: identity(fmt.Sprint("p", i)), ExpiresAt: until()}
+			if rng.IntN(2) == 0 {
+				b.Role = holds[rng.IntN(len(holds))]
+			}
+			b.Condition.Expression = grantedUnder[rng.IntN(len(grantedUnder))]
+			grants = append(grants, b)
+		}
+		request := rbac.WithRequest(ctx, map[string]any{"mfa": rng.IntN(2) == 0, "site": []string{"lab", "home"}[rng.IntN(2)]})
+		for _, r := range on {
+			together, alone := rbac.GrantsDecided(t, request, h.authz, boss, r, grants)
+			byEnd := map[string]map[rbac.Permission]bool{}
+			for i, b := range grants {
+				if together[i] != alone[i] {
+					t.Errorf("seed %d, %s under %q until %v on %s: decided with the others, it lacks %q; alone, %q",
+						seed, b.Role, b.Condition.Expression, b.ExpiresAt, r.Scope().Key(), together[i], alone[i])
+				}
+				if alone[i] == "" {
+					allowed++
+				} else {
+					refused++
+				}
+				k := string(b.Role) + " " + b.Condition.Expression
+				if byEnd[k] == nil {
+					byEnd[k] = map[rbac.Permission]bool{}
+				}
+				byEnd[k][alone[i]] = true
+			}
+			for _, decided := range byEnd {
+				if len(decided) > 1 {
+					apart++
+				}
+			}
+		}
+	}
+	// So that grants allowed and refused are compared, and grants of a role under one condition that
+	// the actor's grants decide apart for their ends.
+	if allowed == 0 || refused == 0 || apart == 0 {
+		t.Errorf("of the grants decided, %d were allowed and %d refused, and %d roles were decided apart for their ends", allowed, refused, apart)
 	}
 }
 

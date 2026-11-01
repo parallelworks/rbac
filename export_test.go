@@ -200,14 +200,14 @@ func LabelValuesDecided(t *testing.T, ctx context.Context, a *Authorizer, actor 
 	return together, alone
 }
 
-// GrantsDecided is, for each of grants actor makes on r, the permission it lacks to make it, or ""
-// where it may: as a change granting them all decides them, by one read of its authority there, a
-// role once for each condition and end its grants tell apart; and as deciding each alone does, by a
-// read of its own, under the grant's own condition, by those of its grants that each last until the
-// grant ends (holding.lasts), as though they lasted for good, and the grant were made for good.
-func GrantsDecided(t *testing.T, a *Authorizer, actor Subject, r Resource, grants []Binding) (together, alone []Permission) {
+// GrantsDecided is, for each of grants actor makes on r on ctx's request, the permission it lacks to
+// make it, or "" where it may: as a change granting them all decides them, by one read of its
+// authority there, a role once for each condition and end its grants tell apart; and as deciding
+// each alone does, by a read of its own, under the grant's own condition, by those of its grants
+// that each last until the grant ends (holding.lasts), as though they lasted for good, and the grant
+// were made for good.
+func GrantsDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subject, r Resource, grants []Binding) (together, alone []Permission) {
 	t.Helper()
-	ctx := t.Context()
 	a = a.still()
 	authority := func(grants []Binding) authority {
 		au, err := a.authorityOn(ctx, a.db, actor, r, roleIDs(grants))
