@@ -20,7 +20,7 @@ func SetSavepointEnd(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { savepointEnd = old })
 }
 
-// SetMigrateAttempts has Migrate run its transaction at most n times, waiting backoff before the
+// SetMigrateAttempts has Migrate try each migration at most n times, waiting backoff before the
 // second, until t ends.
 func SetMigrateAttempts(t *testing.T, n int, backoff time.Duration) {
 	t.Helper()
@@ -43,6 +43,14 @@ func SetPrunedWindow(t *testing.T, f func(pgx.Tx)) {
 	old := prunedWindow
 	prunedWindow = f
 	t.Cleanup(func() { prunedWindow = old })
+}
+
+// SetFollowed runs f in History once it has checked its cursor, on its transaction, until t ends.
+func SetFollowed(t *testing.T, f func(pgx.Tx)) {
+	t.Helper()
+	old := followed
+	followed = f
+	t.Cleanup(func() { followed = old })
 }
 
 // SetMaxHistoryBytes bounds the bytes one History call reads to n until t ends.

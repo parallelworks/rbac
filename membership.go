@@ -132,7 +132,7 @@ func checkExpiry(expires, now time.Time) string {
 		return ""
 	case !expires.After(now):
 		return "already expired"
-	case expires.After(time.Date(9999, time.December, 30, 23, 59, 59, 999999000, time.UTC)):
+	case expires.After(latest):
 		return "expires after 9999-12-30"
 	}
 	return ""
@@ -187,6 +187,7 @@ func keptAgain[T any](set []T, now time.Time, check func(T, time.Time) error) er
 func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant string, ms []Membership) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "SetMemberships")
+	defer conflicting(&err)
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -342,7 +343,8 @@ func outlasts(end, was time.Time) bool {
 // Memberships lists a tenant's memberships in force, by principal: of those principals, or with
 // none, all. It has no limit or cursor, so with none, what it returns grows with the tenant's
 // members and guests.
-func (a *Authorizer) Memberships(ctx context.Context, tenant string, principals []Principal) ([]Membership, error) {
+func (a *Authorizer) Memberships(ctx context.Context, tenant string, principals []Principal) (_ []Membership, err error) {
+	defer conflicting(&err)
 	// The zero principal, the anonymous subject's, which a constraint may ask about, has none.
 	if !validID(tenant) || slices.ContainsFunc(principals, func(p Principal) bool { return p != (Principal{}) && !p.wellFormed(tenant) }) {
 		return nil, fmt.Errorf("%w: Memberships needs a tenant and valid principals", ErrInvalid)
@@ -364,7 +366,8 @@ func (a *Authorizer) Memberships(ctx context.Context, tenant string, principals 
 
 // MembershipsOf lists an identity's memberships in force in every tenant, by tenant. It has no
 // limit or cursor, so what it returns grows with the tenants the identity is a member or guest of.
-func (a *Authorizer) MembershipsOf(ctx context.Context, p Principal) ([]Membership, error) {
+func (a *Authorizer) MembershipsOf(ctx context.Context, p Principal) (_ []Membership, err error) {
+	defer conflicting(&err)
 	// The zero principal, the anonymous subject's, which a constraint may ask about, has none.
 	if p == (Principal{}) {
 		return nil, nil
@@ -424,6 +427,7 @@ func checkGroup(g GroupDefinition) error {
 func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string, g GroupDefinition) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "SetGroup")
+	defer conflicting(&err)
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -476,6 +480,7 @@ func (a *Authorizer) SetGroup(ctx context.Context, actor Subject, tenant string,
 func (a *Authorizer) ImportGroups(ctx context.Context, actor Principal, tenant string, groups []GroupDefinition) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "ImportGroups")
+	defer conflicting(&err)
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -597,6 +602,7 @@ func upsertGroups(ctx context.Context, tx pgx.Tx, tenant string, actor Principal
 func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id string) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "DeleteGroup")
+	defer conflicting(&err)
 	if !validID(tenant) || !validGroupID(id) {
 		return fmt.Errorf("%w: DeleteGroup needs a tenant and a valid group", ErrInvalid)
 	}
@@ -767,6 +773,7 @@ func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string
 func (a *Authorizer) DeleteGroups(ctx context.Context, actor Principal, tenant string, ids []string) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "DeleteGroups")
+	defer conflicting(&err)
 	if len(ids) > MaxBindings {
 		return fmt.Errorf("%w: a deletion names at most %d groups", ErrInvalid, MaxBindings)
 	}
@@ -1041,7 +1048,8 @@ func (a *Authorizer) tenantLabels(ctx context.Context, actor Subject, tenant str
 
 // Groups lists a tenant's groups, by id. It has no limit or cursor, so what it returns grows with
 // them.
-func (a *Authorizer) Groups(ctx context.Context, tenant string) ([]GroupDefinition, error) {
+func (a *Authorizer) Groups(ctx context.Context, tenant string) (_ []GroupDefinition, err error) {
+	defer conflicting(&err)
 	if !validID(tenant) {
 		return nil, fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -1147,6 +1155,7 @@ func keyedAll(members []Member) error {
 func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant string, members []Member) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "ImportMembers")
+	defer conflicting(&err)
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -1408,6 +1417,7 @@ func (a *Authorizer) placesBounded(ctx context.Context, tx pgx.Tx, tenant string
 func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant string, add, remove []Member) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "ChangeMembers")
+	defer conflicting(&err)
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -2568,6 +2578,7 @@ var nestingDepths = `
 func (a *Authorizer) DeleteMembers(ctx context.Context, actor Principal, tenant string, members []Member) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "DeleteMembers")
+	defer conflicting(&err)
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
@@ -2674,7 +2685,8 @@ func endingPlaces(ctx context.Context, tx pgx.Tx, query string, args ...any) (id
 // Members lists a group's members in force, as stored: identities and groups, not the members of
 // the groups in it. An identity whose membership of the tenant ended is in none of its groups. It
 // has no limit or cursor, so what it returns grows with the group.
-func (a *Authorizer) Members(ctx context.Context, tenant, group string) ([]Member, error) {
+func (a *Authorizer) Members(ctx context.Context, tenant, group string) (_ []Member, err error) {
+	defer conflicting(&err)
 	if !validID(tenant) || !validGroupID(group) {
 		return nil, fmt.Errorf("%w: Members needs a tenant and a valid group", ErrInvalid)
 	}
@@ -2695,7 +2707,8 @@ func (a *Authorizer) Members(ctx context.Context, tenant, group string) ([]Membe
 // lets a group's members through should check the membership too (Memberships). It has no limit or
 // cursor, so what it returns grows with the groups the principal is in, through others too, which
 // MaxGroupsOfPrincipal bounds only level by level.
-func (a *Authorizer) GroupsOf(ctx context.Context, tenant string, p Principal) ([]string, error) {
+func (a *Authorizer) GroupsOf(ctx context.Context, tenant string, p Principal) (_ []string, err error) {
+	defer conflicting(&err)
 	// The zero principal, the anonymous subject's, which a constraint may ask about, is in none.
 	if !validID(tenant) || p != (Principal{}) && !p.wellFormed(tenant) {
 		return nil, fmt.Errorf("%w: GroupsOf needs a tenant and a valid principal", ErrInvalid)

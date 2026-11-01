@@ -309,7 +309,8 @@ func (h Holding) add(o Holding) {
 // Holding returns the label values s holds in a tenant: those its grants give it on the tenant,
 // decided as Permissions decides them, with ctx's request for their conditions, on the tenant
 // without attributes or a label (decidedOn).
-func (a *Authorizer) Holding(ctx context.Context, tenant string, s Subject) (Holding, error) {
+func (a *Authorizer) Holding(ctx context.Context, tenant string, s Subject) (_ Holding, err error) {
+	defer conflicting(&err)
 	a = a.still()
 	if !validID(tenant) {
 		return Holding{}, fmt.Errorf("%w: no tenant", ErrInvalid)

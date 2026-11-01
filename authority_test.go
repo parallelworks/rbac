@@ -2072,13 +2072,16 @@ func TestARemovalReadsAScopeTheHostNoLongerHasAsUnlabeled(t *testing.T) {
 		}
 	})
 	ctx := t.Context()
+	// custom.priv is privileged, as it gives root, and granted to the members on gone, as a catalog
+	// change would leave it.
 	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}'),
-		('t1', 'custom.ops', '{cluster:view,cluster:login}', '{cluster}')`); err != nil {
+		('t1', 'custom.ops', '{cluster:view,cluster:login}', '{cluster}'), ('t1', 'custom.priv', '{cluster:view,cluster:root}', '{cluster}');
+		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'cluster', 'gone', 'members', 't1', 'custom.priv')`); err != nil {
 		t.Fatal(err)
 	}
 	gone, down := rbac.Scope{Type: "cluster", ID: "gone"}, rbac.Scope{Type: "cluster", ID: "down"}
 	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "tenant.roles", rbac.User, "admin"),
-		grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "admin"),
+		grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "cluster.sudo", rbac.User, "admin"),
 		grant(gone, "cluster.login", rbac.Group, "crew"), grant(secret.Scope(), "cluster.login", rbac.Group, "crew"),
 		grant(down, "cluster.login", rbac.Group, "ops"), grant(gone, "custom.viewer", rbac.User, "u"), grant(gone, "custom.ops", rbac.User, "u"))
 	h.join(t, "u", "v")
@@ -2107,6 +2110,18 @@ func TestARemovalReadsAScopeTheHostNoLongerHasAsUnlabeled(t *testing.T) {
 	ops.Permissions = []rbac.Permission{view, login}
 	if err := h.authz.SetRole(ctx, admin, "t1", ops); !errors.Is(err, rbac.ErrNotFound) {
 		t.Errorf("widening it: %v", err)
+	}
+	// Widened while it is privileged, a role gives the members' grant there nothing, but a catalog
+	// change that has it no longer be privileged gives them what it gives then, and asks no one, so
+	// the host must read the scope for that too; and narrowed so that it is no longer privileged, it
+	// gives them what it gives then.
+	priv := rbac.RoleDefinition{ID: "custom.priv", Permissions: []rbac.Permission{view, login, root}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(ctx, admin, "t1", priv); !errors.Is(err, rbac.ErrNotFound) {
+		t.Errorf("widening a privileged role the members hold there: %v", err)
+	}
+	priv.Permissions = []rbac.Permission{view}
+	if err := h.authz.SetRole(ctx, admin, "t1", priv); !errors.Is(err, rbac.ErrNotFound) {
+		t.Errorf("narrowing a role the members hold there so that it is no longer privileged: %v", err)
 	}
 	// So with a group the host no longer has: its members are removed, and their places made to end
 	// sooner, but none added, nor any place made to last longer.
