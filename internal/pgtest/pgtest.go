@@ -2,20 +2,12 @@
 package pgtest
 
 import (
-	"bufio"
-	"cmp"
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
-	"io"
-	"maps"
 	"net/url"
 	"os"
-	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -27,15 +19,6 @@ import (
 
 // URLEnv names the database the tests run against; without it they are skipped.
 const URLEnv = "RBAC_TEST_DATABASE_URL"
-
-// ShardEnv names the shard of the tests that need the database to run, as "i/n", the ith of n, so
-// that n runs, each against a database of its own, run each of them once between them. A test is in
-// its top-level test's shard, so its subtests run together.
-const ShardEnv = "RBAC_TEST_SHARD"
-
-// TimingsEnv names go test -json output of an earlier run, or of every shard of one, whose times
-// balance the shards. A test it doesn't time is placed by a hash of its name.
-const TimingsEnv = "RBAC_TEST_TIMINGS"
 
 // Open returns a pool whose connections use a fresh, empty schema, dropped when the test ends.
 // params are added to the URL's query, such as "pool_max_conns=1".
@@ -141,141 +124,14 @@ func Database(tb testing.TB, options string) (name, database string) {
 	return name, u.String()
 }
 
-// URL is the test database's URL, or skips the test without one, or where ShardEnv puts its
-// top-level test in another shard.
+// URL is the test database's URL, or skips the test without one.
 func URL(tb testing.TB) string {
 	tb.Helper()
 	database := os.Getenv(URLEnv)
 	if database == "" {
 		tb.Skip(URLEnv + " not set")
 	}
-	if spec := os.Getenv(ShardEnv); spec != "" {
-		index, count, err := parseShard(spec)
-		if err != nil {
-			tb.Fatal(err)
-		}
-		s, err := shardsOf(os.Getenv(TimingsEnv), count)
-		if err != nil {
-			tb.Fatal(err)
-		}
-		test, _, _ := strings.Cut(tb.Name(), "/")
-		if in := s.of(test); in != index {
-			// internal/shardcheck reads this message to tell which shard each test was left to.
-			tb.Skipf("%s is in shard %d of %d", test, in, count)
-		}
-	}
 	return database
-}
-
-// parseShard reads "i/n", the ith of n shards, counting from 1.
-func parseShard(spec string) (index, count int, err error) {
-	i, n, ok := strings.Cut(spec, "/")
-	index, errIndex := strconv.Atoi(i)
-	count, errCount := strconv.Atoi(n)
-	if !ok || errIndex != nil || errCount != nil || count < 1 || index < 1 || index > count {
-		return 0, 0, fmt.Errorf("%s=%q: want i/n, the ith of n shards, counting from 1", ShardEnv, spec)
-	}
-	return index, count, nil
-}
-
-// shards places top-level tests in count shards, numbered from 1.
-type shards struct {
-	count int
-	timed map[string]int
-}
-
-// newShards places the tests timings times, in seconds, longest first, each in the shard with the
-// least so far, which leaves the longest shard at most a third longer than the least it could be;
-// a hash leaves the few tests that take a minute wherever it happens to put them.
-func newShards(count int, timings map[string]float64) shards {
-	tests := slices.SortedFunc(maps.Keys(timings), func(a, b string) int {
-		return cmp.Or(cmp.Compare(timings[b], timings[a]), strings.Compare(a, b))
-	})
-	loads := make([]float64, count)
-	timed := make(map[string]int, len(tests))
-	for _, test := range tests {
-		least := 0
-		for i := range loads {
-			if loads[i] < loads[least] {
-				least = i
-			}
-		}
-		loads[least] += timings[test]
-		timed[test] = least + 1
-	}
-	return shards{count: count, timed: timed}
-}
-
-// of is the shard of the top-level test named test.
-func (s shards) of(test string) int {
-	if i, ok := s.timed[test]; ok {
-		return i
-	}
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(test))
-	return int(h.Sum64()%uint64(s.count)) + 1 //nolint:gosec // count is positive, so neither conversion overflows
-}
-
-var shardCache struct {
-	sync.Mutex
-	m map[shardKey]shards
-}
-
-type shardKey struct {
-	timings string
-	count   int
-}
-
-// shardsOf is newShards of the times in the file timings names, if any, read once.
-func shardsOf(timings string, count int) (shards, error) {
-	shardCache.Lock()
-	defer shardCache.Unlock()
-	key := shardKey{timings, count}
-	if s, ok := shardCache.m[key]; ok {
-		return s, nil
-	}
-	var times map[string]float64
-	if timings != "" {
-		f, err := os.Open(timings) //nolint:gosec // the person running the tests names the file
-		if err != nil {
-			return shards{}, fmt.Errorf("%s: %w", TimingsEnv, err)
-		}
-		defer func() { _ = f.Close() }()
-		if times, err = readTimings(f); err != nil {
-			return shards{}, fmt.Errorf("%s: %w", TimingsEnv, err)
-		}
-	}
-	s := newShards(count, times)
-	if shardCache.m == nil {
-		shardCache.m = map[shardKey]shards{}
-	}
-	shardCache.m[key] = s
-	return s, nil
-}
-
-// readTimings reads the seconds each top-level test took from go test -json output: the longest of
-// its runs, as a test that needs no database runs in every shard, and one that does, in its own,
-// skipped in a moment in the others. Lines that aren't JSON, such as a build's, are passed over.
-func readTimings(r io.Reader) (map[string]float64, error) {
-	times := map[string]float64{}
-	lines := bufio.NewReader(r)
-	for {
-		line, err := lines.ReadBytes('\n')
-		var event struct {
-			Action, Test string
-			Elapsed      float64
-		}
-		if json.Unmarshal(line, &event) == nil && event.Test != "" && !strings.Contains(event.Test, "/") &&
-			(event.Action == "pass" || event.Action == "fail") {
-			times[event.Test] = max(times[event.Test], event.Elapsed)
-		}
-		if errors.Is(err, io.EOF) {
-			return times, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-	}
 }
 
 var templates struct {

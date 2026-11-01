@@ -62,7 +62,7 @@ jobs:
 
   # Names the newest test timings this branch or canary saved, which every shard
   # then restores by that name: shards that read different timings could each
-  # leave out a test the others place with them.
+  # leave out a test the others place with them, or run one they run.
   plan:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -79,8 +79,8 @@ jobs:
           restore-keys: test-timings-
           lookup-only: true
 
-  # Each shard runs the tests of its own share of the time, against a database
-  # of its own; see CONTRIBUTING.md.
+  # Each shard runs the top-level tests of its own share of the time, selected
+  # with -run, against a database of its own; see CONTRIBUTING.md.
   test:
     name: test (${{ matrix.shard }}/${{ strategy.job-total }})
     needs: plan
@@ -93,7 +93,7 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4]
     env:
-      RBAC_TEST_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
+      TEST_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
     services:
       postgres:
         image: postgres:18@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
@@ -140,16 +140,16 @@ jobs:
           # so that a future go.mod edit cannot silently drop it.
           GODEBUG: fips140=only
           RBAC_TEST_DATABASE_URL: postgres://postgres@localhost:5432/rbac_test?sslmode=disable
-          RBAC_TEST_TIMINGS: ${{ needs.plan.outputs.timings != '' && format('{0}/test-timings.json', github.workspace) || '' }}
+          TEST_TIMINGS: ${{ needs.plan.outputs.timings != '' && format('{0}/test-timings.json', github.workspace) || '' }}
         shell: bash
         # The JSON keeps each test's time; the log shows its output.
         run: >-
-          make -s test 'TESTFLAGS=-json -coverprofile=coverage.out' | tee test-results.json |
+          make -s test "SHARD=$TEST_SHARD" "TIMINGS=$TEST_TIMINGS" 'TESTFLAGS=-json -coverprofile=coverage.out' | tee test-results.json |
           jq -Rrj --unbuffered '. as $line | try (fromjson | .Output // empty) catch "\($line)\n"'
       # For the go job to check the shards ran every test between them.
       - name: List the tests
         run: |
-          echo "$RBAC_TEST_SHARD" > shard
+          echo "$TEST_SHARD" > shard
           make -s test 'TESTFLAGS=-json -list .' > test-list.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
@@ -176,7 +176,7 @@ jobs:
   # protection passes a required job its if skips.
   go:
     if: ${{ always() }}
-    needs: [checks, test]
+    needs: [checks, plan, test]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -204,7 +204,7 @@ jobs:
           pattern: test-results-*
           path: test-results
       - name: Check the shards ran every test between them
-        run: go run ./internal/shardcheck test-results
+        run: go run ./internal/shards check test-results
       # Each shard's coverage counts only what its own tests reach.
       - name: Coverage of every shard's tests
         shell: bash

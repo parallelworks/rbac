@@ -10,22 +10,23 @@
 ## Tests in CI
 
 `make test` runs every test in one run. CI runs tidiness, lint and govulncheck once, in a job of
-their own, and splits the tests that need the database into shards, each a job with a PostgreSQL of
-its own. A test is in its top-level test's shard: `pgtest.URL`, which every test that needs the
-database passes through, skips it in the others. Tests that need no database take seconds and run in
-every shard.
+their own, and splits the tests into shards, each a job with a PostgreSQL of its own. Each shard
+runs its own top-level tests, of every package, whole, subtests and all, and no others: `go run
+./internal/shards select` places every test `go test -list` names, and `make test` runs the shard's
+with `go test -run`. So a test whose own body reads what its subtests did runs as it does unsharded.
 
 - `make test SHARD=2/4` runs the second of four shards. With `TIMINGS=results.json`, a file of
   `go test -json` output, the shards are balanced by its times as CI balances them; without it, each
-  test is placed by a hash of its name.
+  test is placed by a hash of its name. Tests of the same name in two packages are placed together.
 - CI balances its shards by the times of the latest passing run of the branch, or else of canary:
   longest first, each test in the shard with the least time so far, so that the few tests of a
   minute are spread apart. A test no run has timed yet, such as a new one, is placed by its name
-  until one does. Each shard's `go test -json` output is its job's `test-results-N` artifact.
+  until one does. Every shard restores the same timings, which the `plan` job names, so they place
+  each test alike. Each shard's `go test -json` output is its job's `test-results-N` artifact.
 - The `go` job, which branch protection requires, passes once the checks and every shard have, and
-  `internal/shardcheck` finds that the shards ran every test `go test -list` names between them:
-  each test the others skipped as one shard's ran in that one alone. It runs in a cancelled run too,
-  and fails it, as a required job its `if` skips counts as passed.
+  `go run ./internal/shards check` finds that the shards ran each test `go test -list` names once
+  between them, and nothing else. It runs in a cancelled run too, and fails it, as a required job its
+  `if` skips counts as passed.
 - Each job has a 20-minute timeout. When a shard's Test step nears half of that, add a shard to the
   matrix in `.github/workflows/ci.yml`; nothing else names their number.
 - The tests that wait for VACUUM to mark rows visible to all skip where another session's snapshot
