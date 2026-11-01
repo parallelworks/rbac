@@ -1785,6 +1785,9 @@ func withoutRequest(ctx context.Context) context.Context {
 // converting for them all, so a value they share is converted once.
 func (a *Authorizer) vars(ctx context.Context, s Subject, p Permission, r Resource) map[string]any {
 	c := &converting{}
+	if a.conds != nil {
+		c.base = a.conds.env.CELTypeAdapter()
+	}
 	var attributes any = unreadable
 	if _, none := ctx.Value(requestKey{}).(unrequested); !none {
 		request, _ := ctx.Value(requestKey{}).(map[string]any)

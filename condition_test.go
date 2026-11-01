@@ -9,20 +9,25 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
 
 	"cel.dev/cel-go/cel"
 	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/pb"
 	"cel.dev/cel-go/common/types/ref"
 	"cel.dev/cel-go/common/types/traits"
 	"cel.dev/cel-go/ext"
 	"cel.dev/cel-go/interpreter"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -272,7 +277,8 @@ func TestADoubleOfAHostsOwnTypeThatIsntFiniteFailsWhatComparesIt(t *testing.T) {
 // One can be keyed by a list holding one too, as by arrays of doubles, which only a comparison of
 // the keys themselves refused: comparing two such maps decided them unequal, and `in` one found no
 // key holding NaN, a list a condition makes. A comparison, or `in`, of a value holding one
-// anywhere, as a key too, fails, and so does `in` a list holding one.
+// anywhere, as a key too, fails, and so does `in` a list holding one, but not `in` a map holding
+// one as a value, which finding a key reads none of.
 func TestAMapTheHostPassesKeyedByADoubleThatIsntFiniteFailsWhatComparesOrIndexesIt(t *testing.T) {
 	attributes := map[string]any{
 		"nan": map[float64]any{math.NaN(): 1}, "inf": map[float64]any{math.Inf(1): 1}, "y": math.Inf(1),
@@ -296,7 +302,7 @@ func TestAMapTheHostPassesKeyedByADoubleThatIsntFiniteFailsWhatComparesOrIndexes
 	for _, expr := range []string{
 		`request.attributes.finite == {0.5: 1}`, `request.attributes.finite[request.attributes.half] == 1`,
 		`request.attributes["finitely listed"] == request.attributes["finitely listed too"]`, `[0.5] in request.attributes["finitely listed"]`,
-		`!([0.5] in request.attributes.listed)`,
+		`!([0.5] in request.attributes.listed)`, `!("a key longer than the map it is looked up in" in {"k": 0.0 / 0.0})`,
 	} {
 		if held, _, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || !held {
 			t.Errorf("%s: held %t, %v", expr, held, err)
@@ -808,7 +814,8 @@ type holder struct{ M map[string]any }
 // condition reading it whole, as a comparison or a loop does, rather than recursing until the stack
 // overflows, which kills the process: no recover catches it. A message literal converted one so,
 // and so did reading a value CEL can't read that holds one, as a struct, which it writes out in its
-// error, or a message of a dynamic type, which it merges into one of its own.
+// error, or a message of a dynamic type, which it merges into one of its own. One that is its own
+// reflection, as dynamic types other than dynamicpb's are, was read by its reflection without end.
 // Each runs in a child process, so one that overflows fails this test rather than the test binary.
 func TestAValueHoldingItselfFailsItsConditions(t *testing.T) {
 	if expr := os.Getenv("RBAC_CONDITION_OF_A_CYCLE"); expr != "" {
@@ -817,7 +824,7 @@ func TestAValueHoldingItselfFailsItsConditions(t *testing.T) {
 		l := []any{"x", nil}
 		l[1] = l
 		refused := os.Getenv("RBAC_CONDITION_OF_A_CYCLE_REFUSED") != ""
-		attributes := map[string]any{"m": m, "l": l, "s": holder{m}, "p": &holder{m}, "d": dynamicStruct()}
+		attributes := map[string]any{"m": m, "l": l, "s": holder{m}, "p": &holder{m}, "d": dynamicStruct(), "r": &reflecting{dynamicStruct()}}
 		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, attributes); evaluated || (err != nil) != refused {
 			t.Errorf("%s evaluated %t, %v", expr, evaluated, err)
 		}
@@ -826,6 +833,7 @@ func TestAValueHoldingItselfFailsItsConditions(t *testing.T) {
 	for expr, refused := range map[string]bool{
 		`request.attributes.s == request.attributes.p || [request.attributes.s] != []`:                                   false,
 		`request.attributes.d.self.self != {}`:                                                                           false,
+		`request.attributes.r.self.self != {}`:                                                                           false,
 		`google.protobuf.Struct{fields: request.attributes.m} != {}`:                                                     true,
 		`google.protobuf.ListValue{values: request.attributes.l} != []`:                                                  true,
 		`request.attributes.m == request.attributes.m`:                                                                   false,
@@ -844,6 +852,38 @@ func TestAValueHoldingItselfFailsItsConditions(t *testing.T) {
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Errorf("%s: %v\n%.2000s", expr, err, out)
 		}
+	}
+}
+
+// reflecting is a message of a dynamic type that is its own reflection, as dynamic types other than
+// dynamicpb's are.
+type reflecting struct{ *dynamicpb.Message }
+
+func (m *reflecting) Interface() protoreflect.ProtoMessage { return m }
+func (m *reflecting) ProtoReflect() protoreflect.Message   { return m }
+
+// hostListValue is a host's type embedding a ListValue.
+type hostListValue struct{ *structpb.ListValue }
+
+// A host can nest optionals as deep as it likes, which a check read by recursing until the stack
+// overflowed, which kills the process: no recover catches it. It runs in a child process, as
+// TestAValueHoldingItselfFailsItsConditions does, on a smaller stack, so recursing overflows it.
+func TestAnOptionalNestedDeepIsRead(t *testing.T) {
+	if os.Getenv("RBAC_DEEP_OPTIONAL") != "" {
+		debug.SetMaxStack(64 << 20)
+		o := types.OptionalOf(types.String("a"))
+		for range 1 << 20 {
+			o = types.OptionalOf(o)
+		}
+		if held, _, _, err := rbac.EvaluateCondition(t, `has(request.attributes.o)`, map[string]any{"o": o}); err != nil || !held {
+			t.Errorf("held %t, %v", held, err)
+		}
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestAnOptionalNestedDeepIsRead$")
+	cmd.Env = append(os.Environ(), "RBAC_DEEP_OPTIONAL=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Errorf("%v\n%.2000s", err, out)
 	}
 }
 
@@ -876,7 +916,8 @@ func TestAValueCELDecodesWholeIsDecodedOnceForACheck(t *testing.T) {
 	for name, v := range map[string]any{
 		"JSON text": raw, "a JSON number": json.Number("0.5" + strings.Repeat("0", 1<<16)), "a packed message": packed,
 		"a message of a dynamic type": dynamic, "a message of a host's type embedding one": envelope{Message: dynamic},
-		"JSON text in a list": []any{raw}, "JSON text in a map": map[string]any{"v": raw}, "JSON text in a typed list": []json.RawMessage{raw},
+		"a message of another dynamic type": &reflecting{dynamic},
+		"JSON text in a list":               []any{raw}, "JSON text in a map": map[string]any{"v": raw}, "JSON text in a typed list": []json.RawMessage{raw},
 		"JSON text in a list of CEL's":                      types.DefaultTypeAdapter.NativeToValue([]any{raw}),
 		"a message of a dynamic type in a list of messages": messages(dynamic),
 	} {
@@ -1537,7 +1578,26 @@ func TestFiniteValuesDecideAsCELDoes(t *testing.T) {
 		protoreflect.ValueOfMessage(structpb.NewStringValue("a").ProtoReflect()))
 	listed := &structpb.ListValue{Values: []*structpb.Value{structpb.NewStringValue("a"), structpb.NewNumberValue(0.5)}}
 	text := structpb.NewStringValue("a")
+	// CEL's own message and map of a message, as a host's registry makes them, which CEL reads by
+	// their own adapter: read through the conversion, CEL's adapter knew neither.
+	registry, err := types.NewRegistry(&descriptorpb.FileDescriptorProto{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := pb.NewDb()
+	if _, err := db.RegisterMessage(&structpb.Struct{}); err != nil {
+		t.Fatal(err)
+	}
+	described, _ := db.DescribeType("google.protobuf.Struct")
+	object, _ := types.NewObject(registry, described, types.NewObjectType("google.protobuf.Struct"),
+		&structpb.Struct{Fields: map[string]*structpb.Value{"a": structpb.NewStringValue("a")}}).(traits.Indexer)
+	if object == nil {
+		t.Fatal("a message of CEL's can't be indexed")
+	}
 	hosted := map[string]any{
+		"a message of CEL's":          registry.NativeToValue(&descriptorpb.FileDescriptorProto{Name: proto.String("a")}),
+		"a map of a message of CEL's": object.Get(types.String("fields")),
+		"a message CEL knows":         &emptypb.Empty{}, "a host's list of nil values": hostListValue{&structpb.ListValue{Values: []*structpb.Value{nil, nil}}},
 		"JSON text": json.RawMessage(`{"a": "a"}`), "a JSON list": json.RawMessage(`["a", 0.5]`), "a JSON string": json.RawMessage(`"a"`),
 		"a JSON number": json.Number("0.5"), "a packed message": packed, "a message of a dynamic type": dynamic,
 		"a list of CEL's":    types.DefaultTypeAdapter.NativeToValue([]any{"a", 0.5}),

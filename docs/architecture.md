@@ -387,7 +387,7 @@ sequenceDiagram
   a conversion of its own (`converting`), each list and map it holds too: a value CEL decodes or
   merges whole each time a condition reads it, as JSON text or a packed or dynamic message, is
   converted once for the check; one CEL would write out whole into an error, as a struct, or copy
-  whole on each read, as an array of more than 1 KiB, fails; and a value of the host's own type CEL
+  whole on each read, as an array of more than 1 KiB of bytes, fails; and one of the host's type CEL
   reads as one of its own, as a double, is read as the value it holds. So a read costs what it is
   charged however the host passes the value, and a comparison that fails where either value holds a
   double that isn't finite, as a key too, sees every double as CEL's own. Each runs within the most

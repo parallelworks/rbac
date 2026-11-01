@@ -14,6 +14,7 @@ import (
 
 	"cel.dev/cel-go/cel"
 	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/pb"
 	"cel.dev/cel-go/common/types/ref"
 	"cel.dev/cel-go/common/types/traits"
 	"google.golang.org/protobuf/proto"
@@ -21,7 +22,6 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/descriptorpb"
-	"google.golang.org/protobuf/types/dynamicpb"
 	"google.golang.org/protobuf/types/known/anypb"
 
 	// The well-known types the declarations refer to, registered by importing them.
@@ -166,6 +166,16 @@ const maxCopied = 1 << 10
 // Each check makes its own, which keeps what it converted only while the check runs.
 type converting struct {
 	once map[copiedKey]converted
+	// base is the adapter the conditions run with, which reads the rest as CEL does: the well-known
+	// messages it knows past those of DefaultTypeAdapter, as google.protobuf.Empty, among them.
+	base types.Adapter
+}
+
+func (c *converting) adapter() types.Adapter {
+	if c.base == nil {
+		return types.DefaultTypeAdapter
+	}
+	return c.base
 }
 
 // converted is what a value was converted to, and the value, kept so that no other comes to be
@@ -187,21 +197,23 @@ func (c *converting) NativeToValue(v any) ref.Val {
 		return types.NewRefValList(c, v)
 	case json.RawMessage, json.Number, *anypb.Any:
 		return c.decoded(v)
-	case *dynamicpb.Message:
+	// Before protoreflect.Message: a dynamic message, as dynamicpb's, is its own reflection, so
+	// reading it by its reflection would never end.
+	case proto.Message:
+		if itself(v) && generated(v) {
+			return c.adapter().NativeToValue(v)
+		}
 		return c.merged(v)
+	case *pb.Map:
+		return types.NewProtoMap(c, v)
 	case protoreflect.List:
 		return types.NewProtoList(c, v)
 	case protoreflect.Message:
 		return c.NativeToValue(v.Interface())
 	case protoreflect.Value:
 		return c.NativeToValue(v.Interface())
-	case proto.Message:
-		if !itself(v) {
-			return c.merged(v)
-		}
-		return types.DefaultTypeAdapter.NativeToValue(v)
 	case nil, time.Time, []byte, []string, map[string]string:
-		return types.DefaultTypeAdapter.NativeToValue(v)
+		return c.adapter().NativeToValue(v)
 	}
 	rv := reflect.ValueOf(v)
 	switch rv.Kind() {
@@ -235,7 +247,14 @@ func (c *converting) NativeToValue(v any) ref.Val {
 		return types.NewDynamicMap(c, v)
 	default:
 	}
-	return types.DefaultTypeAdapter.NativeToValue(v)
+	return c.adapter().NativeToValue(v)
+}
+
+// generated reports whether m is of the type protobuf generated for its message, which CEL reads
+// as it is: one of another type, as a dynamic one, it merges whole into one of that type to read.
+func generated(m proto.Message) bool {
+	mt, err := protoregistry.GlobalTypes.FindMessageByName(m.ProtoReflect().Descriptor().FullName())
+	return err == nil && reflect.TypeOf(mt.Zero().Interface()) == reflect.TypeOf(m)
 }
 
 // large reports whether reading a value of type t a list or a map holds copies more than maxCopied
@@ -250,24 +269,24 @@ func copiedWhole(v any) ref.Val {
 	return types.NewErr("rbac: a condition can't read a %T: each read copies more than %d bytes", v, maxCopied)
 }
 
-// own is v as one of CEL's own values: v itself where it holds no other; for one of CEL's own types
-// holding others, what it holds, read through c; and for one of a type of the host's own, what it
-// holds where CEL reads it as a value of a type of its own, and otherwise itself, reading through c
-// each value it yields.
+// own is v as one of CEL's own values: v itself where it holds no other; for a list, a map or an
+// optional of CEL's own, what it holds, read through c, and any other of CEL's own, as a message,
+// itself, as CEL's adapter reads it; and for one of a type of the host's own, what it holds where
+// CEL reads it as a value of a type of its own, and otherwise itself, reading through c each value
+// it yields.
 func (c *converting) own(v ref.Val) ref.Val {
 	if holdsNone(v) {
 		return v
 	}
 	if o, ok := v.(*types.Optional); ok {
-		return c.keep(v, func() ref.Val {
-			if !o.HasValue() {
-				return o
-			}
-			return types.OptionalOf(c.own(o.GetValue()))
-		})
+		return c.keep(v, func() ref.Val { return c.optional(o) })
 	}
 	if ofCEL(v) {
-		return c.keep(v, func() ref.Val { return c.held(v, v) })
+		switch v.(type) {
+		case traits.Lister, traits.Mapper:
+			return c.keep(v, func() ref.Val { return c.held(v, true) })
+		}
+		return v
 	}
 	switch v := v.(type) {
 	case traits.Mapper:
@@ -276,20 +295,45 @@ func (c *converting) own(v ref.Val) ref.Val {
 		return hostList{v, c}
 	}
 	if slices.Contains(celScalars, v.Type().TypeName()) {
-		return c.held(v, unreadableValue(v))
+		return c.held(v, false)
 	}
 	return v
 }
 
+// optional is o, what it holds read through c, unwrapping the optionals it nests in a loop: a host
+// can nest them deep enough that recursing would overflow the stack, which no recover catches.
+func (c *converting) optional(o *types.Optional) ref.Val {
+	depth := 0
+	for o.HasValue() {
+		inner, ok := o.GetValue().(*types.Optional)
+		if !ok {
+			break
+		}
+		o, depth = inner, depth+1
+	}
+	var out ref.Val = o
+	if o.HasValue() {
+		out = types.OptionalOf(c.own(o.GetValue()))
+	}
+	for range depth {
+		out = types.OptionalOf(out)
+	}
+	return out
+}
+
 // held is what v holds, its Value, read through c: what holds only a ref.Val holds nothing more
-// to read, and else stands for it, as reading one holding itself would never end.
-func (c *converting) held(v, otherwise ref.Val) ref.Val {
+// to read, and else stands for v where it is of CEL's own, and fails where it is the host's, as
+// reading one holding itself would never end.
+func (c *converting) held(v ref.Val, ofCEL bool) ref.Val {
 	switch held := v.Value().(type) {
 	case ref.Val:
 		if holdsNone(held) {
 			return held
 		}
-		return otherwise
+		if ofCEL {
+			return v
+		}
+		return unreadableValue(v)
 	default:
 		return c.NativeToValue(held)
 	}
@@ -326,10 +370,11 @@ func (l hostList) Iterator() traits.Iterator { return hostIterator{l.Lister.Iter
 
 // Add is the list it makes, read so too.
 func (l hostList) Add(other ref.Val) ref.Val {
-	if sum, ok := l.Lister.Add(other).(traits.Lister); ok {
-		return hostList{sum, l.c}
+	sum := l.Lister.Add(other)
+	if s, ok := sum.(traits.Lister); ok {
+		return hostList{s, l.c}
 	}
-	return l.Lister.Add(other)
+	return sum
 }
 
 // hostMap is a map of a type of the host's own, read as hostList reads a list.
@@ -368,7 +413,7 @@ func holdsNone(v ref.Val) bool {
 
 // decoded is v, which CEL decodes whole to read, converted once.
 func (c *converting) decoded(v any) ref.Val {
-	return c.keep(v, func() ref.Val { return types.DefaultTypeAdapter.NativeToValue(v) })
+	return c.keep(v, func() ref.Val { return c.adapter().NativeToValue(v) })
 }
 
 // merged is m, a message CEL merges whole into one of its own to read, converted once, or failing
@@ -379,13 +424,17 @@ func (c *converting) merged(m proto.Message) ref.Val {
 		if !reachesOnce(r, map[proto.Message]bool{}) {
 			return types.NewErr("rbac: a condition can't read a %T that reaches a message twice", m)
 		}
-		return types.DefaultTypeAdapter.NativeToValue(m)
+		return c.adapter().NativeToValue(m)
 	})
 }
 
 // reachesOnce reports whether m reaches no message twice, itself included, by its fields, of those
-// not in seen, adding them to it.
+// not in seen, adding them to it. A nil message, as a list may hold, reaches none: each is the same
+// nil, but none is another's.
 func reachesOnce(m protoreflect.Message, seen map[proto.Message]bool) bool {
+	if !m.IsValid() {
+		return true
+	}
 	if seen[m.Interface()] {
 		return false
 	}
@@ -413,18 +462,11 @@ func reachesOnce(m protoreflect.Message, seen map[proto.Message]bool) bool {
 	return once
 }
 
-// keep is what convert makes of v, converted once for the check: a value is known by where it
-// points, its length and its type, as copier knows one, so one held by value, which points
-// nowhere, is converted each time.
+// keep is what convert makes of v, converted once for the check: a value is known as copier knows
+// one (copiedKeyOf), so one held by value, which points nowhere, is converted each time.
 func (c *converting) keep(v any, convert func() ref.Val) ref.Val {
-	rv := reflect.ValueOf(v)
-	var k copiedKey
-	switch rv.Kind() {
-	case reflect.Pointer:
-		k = copiedKey{rv.Type(), rv.Pointer(), 0}
-	case reflect.Slice, reflect.String:
-		k = copiedKey{rv.Type(), rv.Pointer(), rv.Len()}
-	default:
+	k, ok := copiedKeyOf(reflect.ValueOf(v))
+	if !ok {
 		return convert()
 	}
 	if done, ok := c.once[k]; ok {
@@ -625,6 +667,19 @@ type copiedKey struct {
 	len int
 }
 
+// copiedKeyOf is how copier and converting know v: a map, pointer, slice or string by where it
+// points, its length and its type. One held by value, which points nowhere, has no key.
+func copiedKeyOf(v reflect.Value) (copiedKey, bool) {
+	switch v.Kind() {
+	case reflect.Map, reflect.Pointer:
+		return copiedKey{v.Type(), v.Pointer(), 0}, true
+	case reflect.Slice, reflect.String:
+		return copiedKey{v.Type(), v.Pointer(), v.Len()}, true
+	default:
+		return copiedKey{}, false
+	}
+}
+
 func (c copier) copy(v reflect.Value) reflect.Value {
 	switch v.Kind() {
 	case reflect.Interface:
@@ -638,7 +693,7 @@ func (c copier) copy(v reflect.Value) reflect.Value {
 		if v.IsNil() {
 			return v
 		}
-		k := copiedKey{v.Type(), v.Pointer(), 0}
+		k, _ := copiedKeyOf(v)
 		if done, ok := c[k]; ok {
 			return done
 		}
@@ -652,7 +707,7 @@ func (c copier) copy(v reflect.Value) reflect.Value {
 		if v.IsNil() {
 			return v
 		}
-		k := copiedKey{v.Type(), v.Pointer(), v.Len()}
+		k, _ := copiedKeyOf(v)
 		if done, ok := c[k]; ok {
 			return done
 		}
@@ -684,7 +739,7 @@ func (c copier) copy(v reflect.Value) reflect.Value {
 		if v.IsNil() {
 			return v
 		}
-		k := copiedKey{v.Type(), v.Pointer(), 0}
+		k, _ := copiedKeyOf(v)
 		if done, ok := c[k]; ok {
 			return done
 		}
@@ -703,17 +758,22 @@ func (c copier) copy(v reflect.Value) reflect.Value {
 // message is a copy of m, as cloning it would make, but keeping each message it copies by where it
 // points, as copy keeps pointers: cloning keeps none, so a message holding itself, as a Struct one
 // of whose fields holds it, recursed until the stack overflowed, which no recover catches, and one
-// reaching another twice copied it for each path to it.
+// reaching another twice copied it for each path to it. A nil message, as a list may hold, is copied
+// as a new one each time, as cloning copies it: each is the same nil, but none is another's.
 func (c copier) message(m protoreflect.Message) protoreflect.Message {
-	p := reflect.ValueOf(m.Interface())
-	k := copiedKey{p.Type(), p.Pointer(), 0}
-	if done, ok := c[k]; ok {
+	if !m.IsValid() {
+		return m.New()
+	}
+	k, keyed := copiedKeyOf(reflect.ValueOf(m.Interface()))
+	if done, ok := c[k]; keyed && ok {
 		if d, ok := done.Interface().(proto.Message); ok {
 			return d.ProtoReflect()
 		}
 	}
 	out := m.New()
-	c[k] = reflect.ValueOf(out.Interface())
+	if keyed {
+		c[k] = reflect.ValueOf(out.Interface())
+	}
 	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
 		switch {
 		case fd.IsList():

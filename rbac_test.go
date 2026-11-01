@@ -2172,7 +2172,8 @@ func holdingItself() *structpb.Struct {
 // a Struct one of whose fields holds it, recursed until the stack overflowed, which ends the
 // process, and one reaching another twice copied it for each path to it. The copy keeps each
 // message it copies, as it keeps maps, lists and pointers, so it holds itself where the original
-// does and is otherwise what cloning makes: equal, and its own, its bytes and unknown fields too.
+// does and is otherwise what cloning makes: equal, and its own, its bytes and unknown fields too,
+// and each nil message a list holds a new one of its own, though each is the same nil.
 func TestCopyingAMessageForAHookCopiesEachMessageItReachesOnce(t *testing.T) {
 	self, shared := holdingItself(), structpb.NewStringValue("x")
 	unknown := &structpb.Struct{}
@@ -2184,6 +2185,7 @@ func TestCopyingAMessageForAHookCopiesEachMessageItReachesOnce(t *testing.T) {
 	attributes := map[string]any{
 		"self": self, "twice": &structpb.ListValue{Values: []*structpb.Value{shared, shared}}, "dynamic": dynamicStruct(),
 		"packed": packed, "bytes": wrapperspb.Bytes([]byte("b")), "at": timestamppb.Now(), "unknown": unknown,
+		"nils": &structpb.ListValue{Values: []*structpb.Value{nil, nil}},
 	}
 	copied := rbac.DeepCopy(attributes)
 	if s, ok := copied["self"].(*structpb.Struct); !ok || s == self || s.Fields["self"].GetStructValue() != s {
@@ -2193,6 +2195,9 @@ func TestCopyingAMessageForAHookCopiesEachMessageItReachesOnce(t *testing.T) {
 	}
 	if l, ok := copied["twice"].(*structpb.ListValue); !ok || l.Values[0] != l.Values[1] || l.Values[0] == shared {
 		t.Error("a value a list holds twice was copied but once")
+	}
+	if l, ok := copied["nils"].(*structpb.ListValue); !ok || len(l.Values) != 2 || l.Values[0] == l.Values[1] {
+		t.Error("nil values a list holds were copied as one")
 	}
 	if d, ok := copied["dynamic"].(*dynamicpb.Message); !ok || d == attributes["dynamic"] {
 		t.Error("a message of a dynamic type holding itself was copied as another")

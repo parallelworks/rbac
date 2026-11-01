@@ -185,7 +185,7 @@ conditional ones reach, to check one by one.
   its size costs however it is passed: a value CEL decodes or merges whole, JSON text, a JSON
   number, or a packed or dynamic message, is converted once for each check, not each time a
   condition reads it; one it can't read, as a struct, or copies whole on each read, an array of more
-  than 1 KiB or a list or map holding them, fails; and one of the host's own type CEL reads as a
+  than 1 KiB of bytes or a list or map of such, fails; and one of the host's own type CEL reads as a
   double or a string is read as the value it holds. Comparing a value holding a double that isn't
   finite fails, in a list or as a map's key too. Each condition runs within the most evaluating it
   can cost, which its literals and types bound: little for comparing what a request passes with

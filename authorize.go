@@ -372,7 +372,8 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 	resource := &deciding{a.vars(ctx, s, "", r), map[string]run{}}
 	values := resource
 	if r.Type == TenantScope && len(a.labels) > 0 {
-		vars := a.vars(ctx, s, "", r)
+		// A clone, so the subject's and the request's attributes are converted once for both.
+		vars := maps.Clone(resource.vars)
 		vars["resource"] = valueResource(r.Tenant)
 		values = &deciding{vars, map[string]run{}}
 	}
