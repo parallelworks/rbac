@@ -2,6 +2,8 @@ package pgtest
 
 import (
 	"context"
+	"os"
+	"os/exec"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -40,5 +42,21 @@ func TestATemplateIsFilledOnce(t *testing.T) {
 	var left bool
 	if err := conn.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_namespace WHERE quote_ident(nspname) = $1)`, first).Scan(&left); err != nil || left {
 		t.Errorf("a dropped template's schema is left: %v, %v", left, err)
+	}
+}
+
+// Without the database's URL, a test is skipped, but in CI it fails.
+func TestURLFailsWithoutTheDatabaseInCI(t *testing.T) {
+	if os.Getenv("PGTEST_URL_CHILD") != "" {
+		URL(t)
+		return
+	}
+	for _, ci := range []string{"", "true"} {
+		cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestURLFailsWithoutTheDatabaseInCI$")
+		cmd.Env = append(os.Environ(), "PGTEST_URL_CHILD=1", URLEnv+"=", "CI="+ci)
+		out, err := cmd.CombinedOutput()
+		if failed := err != nil; failed != (ci != "") {
+			t.Errorf("CI=%q: failed %t, want %t:\n%s", ci, failed, ci != "", out)
+		}
 	}
 }

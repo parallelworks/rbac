@@ -124,11 +124,15 @@ func Database(tb testing.TB, options string) (name, database string) {
 	return name, u.String()
 }
 
-// URL is the test database's URL, or skips the test without one.
+// URL is the test database's URL, or skips the test without one; in CI it fails it, as a run that
+// skipped every test of the database would pass.
 func URL(tb testing.TB) string {
 	tb.Helper()
 	database := os.Getenv(URLEnv)
 	if database == "" {
+		if os.Getenv("CI") != "" {
+			tb.Fatal(URLEnv + " not set in CI")
+		}
 		tb.Skip(URLEnv + " not set")
 	}
 	return database
