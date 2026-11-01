@@ -147,10 +147,12 @@ scopes conditional ones reach, to check one by one.
 - **Labels on data:** a mandatory layer above every grant. A host declares label dimensions
   (`Config.Labels`), each `Ordered` (a level), `AllOf` (compartments) or `AnyOf` (releasable to
   these partners), and a resource carries its label (`Resource.Labels`), stored with it as its path
-  is. A subject holds a dimension's values as permissions, `dimension:value`, which roles for the
-  tenant give, so groups, eligibilities, expiry, conditions, denies on the tenant and history all
-  apply to them. Every check decides them, and the powers to release, on the tenant with no
-  attributes or label, whatever tenant it is passed, as a check of a labeled resource reads them,
+  is. A host declaring them supplies `Config.ResourceOf`, which gives the labels of the tenant, its
+  groups and the other scopes changes reach: `New` refuses them without it, as invalid. A subject
+  holds a dimension's values as permissions, `dimension:value`, which roles for the tenant give, so
+  groups, eligibilities, expiry, conditions, denies on the tenant and history all apply to them.
+  Every check decides them, and the powers to release, on the tenant with no attributes or label,
+  whatever tenant it is passed, as a check of a labeled resource reads them,
   and a change hands one on only as the actor holds it there: a condition of theirs can't read the
   tenant's attributes, only `resource.type`, `.id` and `.tenant`, and any read of
   `resource.attributes`, a test of an attribute's presence, `in`, `size()`, a macro or a comparison
@@ -174,7 +176,10 @@ scopes conditional ones reach, to check one by one.
   `Explain` names the dimension that failed. A change checking the labels of many scopes, as one to
   the members of many groups, decides each of the actor's values once in each phase, when a label
   first asks for it, and evaluates a condition of the actor's that doesn't read the action once for
-  all of them, each value still on a budget of its own, as a check of it is.
+  all of them, each value still on a budget of its own, as a check of it is. For each it walks only
+  the actor's grants giving values or powers to release, and of their roles only those, each role
+  read once in each phase, so the actor's grants of other roles, however many or large, cost a label
+  nothing.
   `Filter` tests a `text[]` label column (`Columns.Labels`), which needs no
   index, as the path's drives the query; `Reachable` returns the holding, and `Holding` with
   `Satisfies` checks data points in a feed without reading the database.
@@ -375,12 +380,12 @@ scopes conditional ones reach, to check one by one.
   `SetGroup` and `DeleteGroup` the label of, each with its constraints and label, and the
   containers, label and attributes of the scopes a group's access is on, and of a group whose own
   scope `DeleteGroup` revokes grants on where a constraint, a deny binding the actor or its label
-  may stop that; a host without it declares no labels and resource attributes as none, and for
-  access below the tenant, no containers: otherwise a change checked on such a scope as stored is
-  refused, as `DeleteGroup` is once it finds anything granted on the group's own. A label can't stop
-  it where the actor's label values satisfy every label. For a scope the host no longer has, as a
-  resource deleted without `DeleteScopes`, it returns `rbac.ErrNotFound`, or an error wrapping it:
-  a change that only takes access away there, as a
+  may stop that; a host declaring labels needs it, and `New` refuses them without it as invalid; one
+  without it declares resource attributes as none, and for access below the tenant, no containers:
+  otherwise a change checked on such a scope as stored is refused, as `DeleteGroup` is once it finds
+  anything granted on the group's own. For a scope the host no longer has, as a resource deleted without `DeleteScopes`, it
+  returns `rbac.ErrNotFound`, or an error wrapping it: a change that only takes access away there,
+  as a
   member leaving a group with access on it or the group itself, or joining one a deny there names, a
   place in the group made to end sooner, `DeleteGroup`, or `DeleteRole` deleting, or `SetRole`
   redefining so that no grant of it there widens, nor would once the catalog has it no longer be

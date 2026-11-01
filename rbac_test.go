@@ -291,6 +291,9 @@ func TestNewRejectsBadConfiguration(t *testing.T) {
 		"a container named as a dimension": {
 			Catalog: catalog, ContainerTypes: []string{"rel"}, ValidateGrant: ok,
 			Labels: []rbac.LabelDimension{{Name: "rel", Rule: rbac.AnyOf, Values: []string{"gbr"}}},
+			ResourceOf: func(_ context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+				return rbac.Resource{Tenant: tenant, Type: s.Type, ID: s.ID}, nil
+			},
 		},
 		"a kind every host has": {Catalog: catalog, PrincipalKinds: []rbac.PrincipalKind{rbac.Group}, ValidateGrant: ok},
 		"a malformed kind":      {Catalog: catalog, PrincipalKinds: []rbac.PrincipalKind{"Service Account"}, ValidateGrant: ok},
