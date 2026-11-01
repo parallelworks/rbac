@@ -448,6 +448,7 @@ sequenceDiagram
     rect rgb(240, 240, 240)
     note over A,DB: one transaction, or a savepoint under WithTx
     A->>DB: lock: exclusive/tenant if a dimension is Exclusive, then the tenant<br/>shared and the scope and principals exclusive, or past 64 the tenant exclusive
+    A->>DB: holdRevoked: the grants it revokes, in order, before it reads the time
     A->>DB: the groups named exist, and stillStanding:<br/>memberships unchanged since the host was asked
     A->>DB: authority again, under the locks, the constraints' answers read back
     A->>A: the actor's label values again, where the scope is labeled, the answers read back
@@ -546,21 +547,21 @@ sequenceDiagram
   check's conditions are, and the choice is made of those that hold. Between groups whose paths
   last alike it is by their approvers, requirements and keys, so leaving one can still end an
   activation another would keep. A change ending a membership or a place sooner, or removing it,
-  holds it, in order, reads the activations of the identities it ends it for, and once it has
-  ended it holds them and, in a later statement, cuts each short to the latest end of the paths
-  left to its principal, or ends it, whatever another eligibility would allow: worked out again
-  from every eligibility the holder reaches, one whose requirement or approver it never met would
-  count. Held, a change ending another of an activation's paths at once waits for it, and reads
-  the paths it left: each reading them first would read the other's as left, and neither cut it.
-  `Activate` holds the places it can rest on until it commits, in the statement that reads the
-  keys it finds its subject eligible through, so the two wait for each other, and a place nested
-  between them makes no one eligible. Setting the eligibility again or deleting it leaves its
-  activations to their own ends, or to their holders leaving its group: where labels or a freeze
-  can refuse it, `ChangeMembers` reads the activations of the members leaving made through the
-  groups it reaches, each principal's once however many of its places end (`activatedBy`), and
-  checks each one's scope as a revoke there, and `DeleteGroup` refuses a group
+  holds it, in order, reads the activations of the identities it ends it for and holds them, before
+  it reads the time it decides at, and once it has ended it, in a later statement, cuts each short
+  to the latest end of the paths left to its principal, or ends it, whatever another eligibility
+  would allow: worked out again from every eligibility the holder reaches, one whose requirement or
+  approver it never met would count. Held, a change ending another of an activation's paths at
+  once waits for it, and reads the paths it left: each reading them first would read the other's as
+  left, and neither cut it. `Activate` holds the places it can rest on until it commits, in the
+  statement that reads the keys it finds its subject eligible through, so the two wait for each
+  other, and a place nested between them makes no one eligible. Setting the eligibility again or
+  deleting it leaves its activations to their own ends, or to their holders leaving its group:
+  where labels or a freeze can refuse it, `ChangeMembers` reads the activations of the members
+  leaving made through the groups it reaches, each principal's once however many of its places end
+  (`activatedBy`), and checks each one's scope as a revoke there, and `DeleteGroup` refuses a group
   they rest on. Both read them only once they hold the places they end (`restingIn`, and
-  `unrested` once `removeGroups` holds them), so an activation `Activate` commits while one waits
+  `unrested` once `holdGroups` holds them), so an activation `Activate` commits while one waits
   for them, through an eligibility deleted meanwhile, is read as one made before: `ChangeMembers`
   finds it in `stillReached`, which it hadn't checked, and is tried again (`ErrConflict`), and
   `DeleteGroup` refuses it. Read before them, it would be ended unchecked.
@@ -707,11 +708,12 @@ flowchart TB
   a change ending places in groups ends activations among them without their scope's lock. Every
   change holds grants last, after its places and memberships, as `Activate` holds the places an
   activation rests on before its grant. A change ending places holds them before it reads what
-  rests on them: `ChangeMembers` right after its advisory locks, before what it reaches is read
-  again, and `DeleteGroup` in `removeGroups`, after the eligibilities and denies it removes, in the
-  order the deletes take them, before it reads its members' activations. `DeleteRole` removes a
-  role's grants before its eligibilities, but holds the tenant's lock exclusive, so no change runs
-  beside it but `DeleteExpired`, which waits on no row.
+  rests on them: `ChangeMembers` right after its advisory locks, and the memberships it joins with
+  before them, before what it reaches is read again, and `DeleteGroup` in `holdGroups`, after the
+  eligibilities and denies it removes, in the order the deletes take them, before it reads its
+  members' activations. `DeleteRole` removes a role's grants before its eligibilities, but holds
+  the tenant's lock exclusive, so no change runs beside it but `DeleteExpired`, which waits on no
+  row.
 - **One snapshot for reads in several statements.** Explain, Reachable and Holders read in one
   REPEATABLE READ, READ ONLY transaction of their own on a pool, and AsOf in a REPEATABLE READ one
   it rolls back. Explain, Reachable and Holders read what label values are decided by in it, and
@@ -724,8 +726,18 @@ flowchart TB
 - **One time for a call.** A call reads `Config.Now` once, where it first needs the time: every
   statement it makes compares expiry with it, and every condition reads it as `request.time`, so a
   grant or a membership ending as the call runs can't meet a deny, a condition or label values of a
-  later moment. A change reads it again in its transaction, which first needs it under its locks,
-  where it decides again by what committed before them. As of a time, it is that time.
+  later moment. A change reads it again in its transaction, once it holds every lock it waits for,
+  advisory and on rows, where it decides again by what committed before them: read before a wait,
+  it would decide at a time the wait left behind, as by an actor's power that ended while it
+  waited, and store a place, a membership or an activation already ended. So a change holds first
+  what it may wait for, the activations it may cut short and the grants it revokes, the
+  eligibility or the deny it sets too, and picks what is in force to hold by its reading before the
+  transaction (`callClock.earlier`), which is no later, so what was in force then is all that is
+  when it decides, and perhaps more: `Activate` holds the places it can rest on as of then, and
+  keeps of the paths through them those lasting until the activation's end from the time it reads
+  once it holds them. A write's own locks take again what the change holds. In the tests, a
+  statement holding rows or taking an advisory lock once a change has read its time panics
+  (`watched`). As of a time, it is that time.
 - **Races** PostgreSQL refuses, such as a serialization failure, a deadlock between host
   transactions, or a lock waited for past `lock_timeout`, as one a migration holds, match
   `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them, as it

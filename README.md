@@ -796,7 +796,9 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   to run on a schedule, passing over what a change holds until the next run. A call reads
   `Config.Now` once, which every expiry it compares and every condition's `request.time` read, so a
   grant or a membership ending as it runs can't meet a deny, a condition or label values of a later
-  moment; a change reads it again under its locks, where it decides again.
+  moment; a change reads it again once it holds every lock it waits for, where it decides again:
+  read before a wait, as for an `Activate` holding the places a change ends, it would decide at a
+  time the wait left behind, as by an actor's power that ended while it waited.
 
 ## Development
 

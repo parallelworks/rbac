@@ -233,10 +233,30 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 		if err := lockAll(ctx, tx, tenant, nil, keys); err != nil {
 			return ChangeEvent{}, nil, err
 		}
-		// One time for both statements, under the locks: a membership ending between two reads
-		// would be made anew yet keep its groups. An ended membership's groups go, as DeleteExpired
-		// would remove them, each membership held before its members as there, so the two never
-		// deadlock; and any places of an identity with no membership, which joins in none.
+		// An ended membership's groups go, as DeleteExpired would remove them, each membership held
+		// before its members as there, so the two never deadlock; and any places of an identity with no
+		// membership, which joins in none. The places of each key leaving are found on its own and
+		// locked in order, as removeGroups finds and locks its own; each key's membership is looked up
+		// on its own, as in widening, and OFFSET 0 keeps a generic plan from making that an anti-join
+		// that reads every one.
+		leaving := lockedAnyOf("rbac_members", "ctid", placeOrder, byKeys("rbac_members", "ctid", "principal", `(
+			  ARRAY(SELECT principal FROM rbac_memberships WHERE tenant = $1 AND principal = ANY($2::text[]) AND expires_at <= $3 FOR UPDATE)
+			  || ARRAY(SELECT k FROM unnest($2::text[]) AS k WHERE NOT EXISTS (SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = k OFFSET 0)))`))
+		// The places of every membership with an end, which may have ended by the time the change
+		// decides at, are held before it reads that time, as are the activations resting on a
+		// membership it makes end: a wait for them would leave the time behind.
+		if _, err := tx.Exec(ctx, `SELECT FROM rbac_members WHERE `+leaving, tenant, keys, storedTime(pastLatest)); err != nil {
+			return ChangeEvent{}, nil, err
+		}
+		r, err := a.restingOn(ctx, tx, tenant, ending, nil, a.clock.earlier())
+		if err != nil {
+			return ChangeEvent{}, nil, err
+		}
+		if err := holdResting(ctx, tx, r); err != nil {
+			return ChangeEvent{}, nil, err
+		}
+		// One time for every statement, under the locks: a membership ending between two reads would
+		// be made anew yet keep its groups.
 		at := a.cfg.Now()
 		if err := keptAgain(set, at, a.checkMembership); err != nil {
 			return ChangeEvent{}, nil, err
@@ -247,20 +267,7 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 				return ChangeEvent{}, nil, err
 			}
 		}
-		// A membership with an end may end one in force sooner, which the activations resting on it
-		// end with.
-		r, err := a.restingOn(ctx, tx, tenant, ending, nil, at)
-		if err != nil {
-			return ChangeEvent{}, nil, err
-		}
-		// The places of each key leaving are found on its own and locked in order, as removeGroups
-		// finds and locks its own; each key's membership is looked up on its own, as in widening, and
-		// OFFSET 0 keeps a generic plan from making that an anti-join that reads every one.
-		left, err := removedWhere(ctx, a, tx, "rbac_members", memberColumns, collectMembers, lockedAnyOf("rbac_members", "ctid", placeOrder,
-			byKeys("rbac_members", "ctid", "principal", `(
-			  ARRAY(SELECT principal FROM rbac_memberships WHERE tenant = $1 AND principal = ANY($2::text[]) AND expires_at <= $3 FOR UPDATE)
-			  || ARRAY(SELECT k FROM unnest($2::text[]) AS k WHERE NOT EXISTS (SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = k OFFSET 0)))`)),
-			tenant, keys, at)
+		left, err := removedWhere(ctx, a, tx, "rbac_members", memberColumns, collectMembers, leaving, tenant, keys, at)
 		if err != nil {
 			return ChangeEvent{}, nil, err
 		}
@@ -525,7 +532,6 @@ func (a *Authorizer) ImportGroups(ctx context.Context, actor Principal, tenant s
 		// what the host grants its own, as it may once it holds the group.
 		const tenants = "tenant = $1 AND source <> ALL($3::text[])"
 		owned := slices.Sorted(maps.Keys(a.owned))
-		now := a.cfg.Now()
 		identities, groups, err := endingPlaces(ctx, tx, `
 			SELECT m.principal FROM unnest($2::text[]) AS k(g) CROSS JOIN LATERAL (
 			  SELECT principal FROM rbac_members WHERE `+tenants+` AND group_id = k.g
@@ -533,10 +539,15 @@ func (a *Authorizer) ImportGroups(ctx context.Context, actor Principal, tenant s
 		if err != nil {
 			return ChangeEvent{}, err
 		}
-		r, err := a.restingOn(ctx, tx, tenant, identities, groups, now)
+		// Held with the places, before the time they are cut short at is read.
+		r, err := a.restingOn(ctx, tx, tenant, identities, groups, a.clock.earlier())
 		if err != nil {
 			return ChangeEvent{}, err
 		}
+		if err := holdResting(ctx, tx, r); err != nil {
+			return ChangeEvent{}, err
+		}
+		now := a.cfg.Now()
 		e := ChangeEvent{Groups: changed}
 		// Each group's found on its own, as removeGroups finds them.
 		if e.Left, err = removedWhere(ctx, a, tx, "rbac_members", memberColumns, collectMembers,
@@ -700,6 +711,12 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 		if err := lockAll(ctx, tx, tenant, scopes, above); err != nil {
 			return ChangeEvent{}, err
 		}
+		// All it removes, before it reads the time it decides at, as by the actor's power: a wait for
+		// it, as for an Activate holding the places, would leave that behind.
+		r, err := a.holdGroups(ctx, tx, tenant, []string{id})
+		if err != nil {
+			return ChangeEvent{}, err
+		}
 		exists, err := groupExists(ctx, tx, tenant, id)
 		if err != nil {
 			return ChangeEvent{}, err
@@ -762,9 +779,10 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 				}
 			}
 		}
-		return a.removeGroups(ctx, tx, tenant, actor.Principal, []string{id}, func() error {
-			return a.unrested(ctx, tx, tenant, id, reached)
-		})
+		if err := a.unrested(ctx, tx, tenant, id, reached); err != nil {
+			return ChangeEvent{}, err
+		}
+		return a.removeGroups(ctx, tx, tenant, actor.Principal, []string{id}, r)
 	})
 }
 
@@ -902,20 +920,21 @@ func (a *Authorizer) DeleteGroups(ctx context.Context, actor Principal, tenant s
 		if err := lockAll(ctx, tx, tenant, scopes, principals); err != nil {
 			return ChangeEvent{}, err
 		}
-		return a.removeGroups(ctx, tx, tenant, actor, ids, nil)
+		r, err := a.holdGroups(ctx, tx, tenant, ids)
+		if err != nil {
+			return ChangeEvent{}, err
+		}
+		return a.removeGroups(ctx, tx, tenant, actor, ids, r)
 	})
 }
 
-// removeGroups deletes groups with their grants and eligibilities, the members they have, their
-// places in other groups, in denies and among approvers, and returns what it changed for OnChange.
-// held, where not nil, runs once the places in the groups and of them are held, before anything is
-// read of what rests on them, and refuses the deletion with what it returns.
-func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, ids []string, held func() error) (ChangeEvent, error) {
-	var e ChangeEvent
-	principals, scopes := make([]string, len(ids)), make([]string, len(ids))
-	for i, id := range ids {
-		principals[i], scopes[i] = groupPrincipal(id).key(), groupKey(id)
-	}
+// holdGroups holds, in tx, in order, what removeGroups changes of groups: their grants and
+// eligibilities, the members they have, their places in other groups, in denies and among
+// approvers, with the activations resting on those places, which it returns. A change holds them
+// before it reads the time it decides at, as a wait for any of them would leave it behind, and
+// before it reads anything of what rests on the places.
+func (a *Authorizer) holdGroups(ctx context.Context, tx pgx.Tx, tenant string, ids []string) (resting, error) {
+	principals, scopes := groupKeysOf(ids)
 	// DeleteScopes and DeletePrincipal hold other scopes' and principals' locks and change some of
 	// these rows too, so each table is changed in the order delete changes them, grants last, and
 	// the rows changed in it are locked in order first: otherwise they would deadlock. Each is found
@@ -926,9 +945,47 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 	// later with an id of theirs, and those they approve.
 	if err := lockByKeys(ctx, tx, "rbac_eligibilities", "id", bindingOrder, []string{"principal", "scope"},
 		[]string{"SELECT id FROM rbac_eligibilities WHERE " + naming("approvers", "$2")}, tenant, principals, scopes); err != nil {
-		return ChangeEvent{}, err
+		return resting{}, err
 	}
-	now := a.cfg.Now()
+	// The denies on the groups, and those that name or exempt them.
+	if err := lockDenies(ctx, tx, []string{
+		byKeys("rbac_denies", denyKey, "scope", "$2"),
+		"SELECT " + denyKey + " FROM rbac_denies WHERE " + naming("principals", "$3"),
+		"SELECT " + denyKey + " FROM rbac_denies WHERE " + naming("exempt", "$3"),
+	}, tenant, scopes, principals); err != nil {
+		return resting{}, err
+	}
+	// The places in the groups and of them, and the grants of the groups and on them, so too. Places
+	// in groups have no id, so a ctid keys them: no change moves one meanwhile, as each takes its
+	// group's lock or its principal's, which this change holds. The places are held before the
+	// activations resting on them are read.
+	if err := lockByKeys(ctx, tx, "rbac_members", "ctid", placeOrder, []string{"group_id", "principal"}, nil, tenant, ids, principals); err != nil {
+		return resting{}, err
+	}
+	r, err := a.restingOn(ctx, tx, tenant, nil, ids, a.clock.earlier())
+	if err != nil {
+		return resting{}, err
+	}
+	// With the activations it may cut short, in one order.
+	return r, lockByKeys(ctx, tx, "rbac_grants", "id", bindingOrder, []string{"principal", "scope"}, []string{"SELECT unnest($4::text[]::uuid[])"},
+		tenant, principals, scopes, r.ids)
+}
+
+// groupKeysOf returns the keys of groups as principals and as scopes.
+func groupKeysOf(ids []string) (principals, scopes []string) {
+	principals, scopes = make([]string, len(ids)), make([]string, len(ids))
+	for i, id := range ids {
+		principals[i], scopes[i] = groupPrincipal(id).key(), groupKey(id)
+	}
+	return principals, scopes
+}
+
+// removeGroups deletes groups with their grants and eligibilities, the members they have, their
+// places in other groups, in denies and among approvers, all of which holdGroups holds, and cuts
+// short r, the activations it found resting; it returns what it changed for OnChange.
+func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, ids []string, r resting) (ChangeEvent, error) {
+	var e ChangeEvent
+	principals, scopes := groupKeysOf(ids)
 	var err error
 	if e.Ineligible, err = removedWhere(ctx, a, tx, "rbac_eligibilities", eligibilityColumns, collectEligibilities,
 		lockedByKeys("rbac_eligibilities", "id", bindingOrder, "principal", "scope"), tenant, principals, scopes); err != nil {
@@ -939,14 +996,6 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 		return ChangeEvent{}, err
 	}
 	e.Ineligible, e.Eligible = append(e.Ineligible, unapproved...), changed
-	// The denies on the groups, and those that name or exempt them.
-	if err := lockDenies(ctx, tx, []string{
-		byKeys("rbac_denies", denyKey, "scope", "$2"),
-		"SELECT " + denyKey + " FROM rbac_denies WHERE " + naming("principals", "$3"),
-		"SELECT " + denyKey + " FROM rbac_denies WHERE " + naming("exempt", "$3"),
-	}, tenant, scopes, principals); err != nil {
-		return ChangeEvent{}, err
-	}
 	if e.DeletedDenies, err = removedWhere(ctx, a, tx, "rbac_denies", denyColumns, collectDenies,
 		anyOf("ctid", byKeys("rbac_denies", "ctid", "scope", "$2")), tenant, scopes); err != nil {
 		return ChangeEvent{}, err
@@ -963,22 +1012,6 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 	if e.Denies, err = unexempt(ctx, tx, tenant, actor, principals, true); err != nil {
 		return ChangeEvent{}, err
 	}
-	// The places in the groups and of them, and the grants of the groups and on them, so too. Places
-	// in groups have no id, so a ctid keys them: no change moves one meanwhile, as each takes its
-	// group's lock or its principal's, which this change holds. The places are held before the
-	// activations resting on them are read.
-	if err := lockByKeys(ctx, tx, "rbac_members", "ctid", placeOrder, []string{"group_id", "principal"}, nil, tenant, ids, principals); err != nil {
-		return ChangeEvent{}, err
-	}
-	if held != nil {
-		if err := held(); err != nil {
-			return ChangeEvent{}, err
-		}
-	}
-	r, err := a.restingOn(ctx, tx, tenant, nil, ids, now)
-	if err != nil {
-		return ChangeEvent{}, err
-	}
 	if e.Left, err = removedWhere(ctx, a, tx, "rbac_members", memberColumns, collectMembers,
 		lockedByKeys("rbac_members", "ctid", placeOrder, "group_id", "principal"), tenant, ids, principals); err != nil {
 		return ChangeEvent{}, err
@@ -986,18 +1019,11 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 	if e.DeletedGroups, err = removed(ctx, a, tx, "rbac_groups", groupColumns, collectGroups, tenant, "id = ANY($2::text[])", ids); err != nil {
 		return ChangeEvent{}, err
 	}
-	if len(r.ids) > 0 {
-		// With the activations it may cut short, in one order.
-		if err := lockByKeys(ctx, tx, "rbac_grants", "id", bindingOrder, []string{"principal", "scope"}, []string{"SELECT unnest($4::text[]::uuid[])"},
-			tenant, principals, scopes, r.ids); err != nil {
-			return ChangeEvent{}, err
-		}
-	}
 	if e.Revoked, err = removedWhere(ctx, a, tx, "rbac_grants", grantColumns, collectGrants,
 		lockedByKeys("rbac_grants", "id", bindingOrder, "principal", "scope"), tenant, principals, scopes); err != nil {
 		return ChangeEvent{}, err
 	}
-	short, ended, err := a.unrest(ctx, tx, tenant, actor, r, now)
+	short, ended, err := a.unrest(ctx, tx, tenant, actor, r, a.cfg.Now())
 	e.Shortened, e.Revoked = short, append(e.Revoked, ended...)
 	return e, err
 }
@@ -1297,6 +1323,14 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 		if err := lockAll(ctx, tx, tenant, scopes, principals); err != nil {
 			return ChangeEvent{}, nil, err
 		}
+		// What it waits for, before it reads the time it decides at, as ChangeMembers holds it.
+		if err := a.holdJoining(ctx, tx, tenant, set); err != nil {
+			return ChangeEvent{}, nil, err
+		}
+		r, err := a.restingIn(ctx, tx, tenant, set, expiring(set))
+		if err != nil {
+			return ChangeEvent{}, nil, err
+		}
 		locked, err := a.stillReached(ctx, tx, tenant, set, nil, rc, true)
 		if err != nil {
 			return ChangeEvent{}, nil, err
@@ -1306,10 +1340,6 @@ func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant 
 		}
 		now := a.cfg.Now()
 		if err := keptAgain(set, now, a.checkMember); err != nil {
-			return ChangeEvent{}, nil, err
-		}
-		r, err := a.restingIn(ctx, tx, tenant, set, expiring(set), now)
-		if err != nil {
 			return ChangeEvent{}, nil, err
 		}
 		e := ChangeEvent{}
@@ -1624,12 +1654,17 @@ func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant st
 		}
 		// The places it ends are held before what rests on them is read: an activation through one,
 		// which holds them until it commits, is read by stillReached, and the change tried again to
-		// check it, rather than ended unchecked by unrest.
-		now := a.cfg.Now()
-		r, err := a.restingIn(ctx, tx, tenant, slices.Concat(remove, set), slices.Concat(remove, expiring(set)), now)
+		// check it, rather than ended unchecked by unrest. They, the memberships it joins with and the
+		// activations it may cut short are held before it reads the time it decides at, which a wait
+		// for them would leave behind.
+		if err := a.holdJoining(ctx, tx, tenant, set); err != nil {
+			return ChangeEvent{}, nil, err
+		}
+		r, err := a.restingIn(ctx, tx, tenant, slices.Concat(remove, set), slices.Concat(remove, expiring(set)))
 		if err != nil {
 			return ChangeEvent{}, nil, err
 		}
+		now := a.cfg.Now()
 		locked, err := a.stillReached(ctx, tx, tenant, set, remove, rc, false)
 		if err != nil {
 			return ChangeEvent{}, nil, err
@@ -2836,15 +2871,14 @@ func (a *Authorizer) storedWhole(s Scope) error {
 }
 
 // membersCanJoin refuses members of groups that don't exist, or identities that aren't members or
-// guests of the tenant, read under the change's locks, each on its own, as groupsExist reads them.
-// It holds the memberships until the change ends, so DeleteExpired passes over one expiring
-// meanwhile, rather than end it without seeing the groups this change joins.
+// guests of the tenant, read under the change's locks, each on its own, as groupsExist reads them:
+// the memberships the change holds (holdJoining).
 func (a *Authorizer) membersCanJoin(ctx context.Context, tx pgx.Tx, tenant string, groups, identities []string) error {
 	rows, err := tx.Query(ctx, `
 		SELECT 'group ' || g FROM unnest($2::text[]) AS g WHERE NOT EXISTS (SELECT FROM rbac_groups WHERE tenant = $1 AND id = g OFFSET 0)
 		UNION ALL
 		SELECT 'identity ' || p FROM unnest($3::text[]) AS p WHERE NOT EXISTS (
-		  SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = p AND (expires_at IS NULL OR expires_at > $4) FOR KEY SHARE)
+		  SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = p AND (expires_at IS NULL OR expires_at > $4))
 		ORDER BY 1`, tenant, groups, identities, a.cfg.Now())
 	if err != nil {
 		return err
@@ -2863,6 +2897,27 @@ func (a *Authorizer) membersCanJoin(ctx context.Context, tx pgx.Tx, tenant strin
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// holdJoining holds, in tx, until the change ends, the memberships in force of the identities set
+// adds to groups, each on its own, so DeleteExpired passes over one expiring meanwhile, rather than
+// end it without seeing the groups the change joins (membersCanJoin). Held as the change's other
+// locks are, before it reads the time it decides at: those in force as of the time it picks what it
+// holds by (earlier), which are all that are then.
+func (a *Authorizer) holdJoining(ctx context.Context, tx pgx.Tx, tenant string, set []Member) error {
+	identities := map[string]bool{}
+	for _, m := range set {
+		if m.Principal.Kind != Group {
+			identities[m.Principal.key()] = true
+		}
+	}
+	if len(identities) == 0 {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `SELECT FROM unnest($2::text[]) AS p WHERE EXISTS (
+		  SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = p AND (expires_at IS NULL OR expires_at > $3) FOR KEY SHARE)`,
+		tenant, slices.Sorted(maps.Keys(identities)), a.clock.earlier())
+	return err
 }
 
 // nestable refuses each group nested in another, as stored, that makes a group contain itself, or a
@@ -2946,11 +3001,11 @@ func (a *Authorizer) DeleteMembers(ctx context.Context, actor Principal, tenant 
 		if err := lockAll(ctx, tx, tenant, scopes, principals); err != nil {
 			return ChangeEvent{}, err
 		}
-		now := a.cfg.Now()
-		r, err := a.restingIn(ctx, tx, tenant, members, members, now)
+		r, err := a.restingIn(ctx, tx, tenant, members, members)
 		if err != nil {
 			return ChangeEvent{}, err
 		}
+		now := a.cfg.Now()
 		e := ChangeEvent{}
 		if e.Left, err = a.leave(ctx, tx, tenant, members); err != nil {
 			return ChangeEvent{}, err
@@ -2981,13 +3036,12 @@ func (a *Authorizer) leave(ctx context.Context, tx pgx.Tx, tenant string, member
 
 // restingIn holds, in tx, in order, the places members name, by group, principal and source: every
 // one the change writes, as an upsert of one it doesn't end, once those it ends are held, would wait
-// out of order on an Activate holding both. It reads at now the activations resting (restingOn) of
-// the identities among ending, the places the change ends or may end sooner, and in the groups among
-// them.
-func (a *Authorizer) restingIn(ctx context.Context, tx pgx.Tx, tenant string, members, ending []Member, now time.Time) (resting, error) {
-	if len(ending) == 0 {
-		return resting{}, nil
-	}
+// out of order on an Activate holding both, and of one an Activate holds, once the change has read
+// the time it decides at. It reads the activations resting (restingOn) of the identities among
+// ending, the places the change ends or may end sooner, and in the groups among them, and holds them
+// too (holdResting): all before the change reads that time, so as of the time it picks what it holds
+// by (earlier).
+func (a *Authorizer) restingIn(ctx context.Context, tx pgx.Tx, tenant string, members, ending []Member) (resting, error) {
 	members = slices.SortedFunc(slices.Values(members), func(x, y Member) int { return strings.Compare(memberKey(x), memberKey(y)) })
 	members = slices.CompactFunc(members, func(x, y Member) bool { return memberKey(x) == memberKey(y) })
 	identities, groups, err := endingPlaces(ctx, tx, `
@@ -3003,7 +3057,14 @@ func (a *Authorizer) restingIn(ctx context.Context, tx pgx.Tx, tenant string, me
 	}
 	identities = slices.DeleteFunc(identities, func(k string) bool { return !ends[k] })
 	groups = slices.DeleteFunc(groups, func(id string) bool { return !ends[groupPrincipal(id).key()] })
-	return a.restingOn(ctx, tx, tenant, identities, groups, now)
+	if len(identities)+len(groups) == 0 {
+		return resting{}, nil
+	}
+	r, err := a.restingOn(ctx, tx, tenant, identities, groups, a.clock.earlier())
+	if err != nil {
+		return resting{}, err
+	}
+	return r, holdResting(ctx, tx, r)
 }
 
 // endingPlaces holds, in tx, the places in groups query picks, in the order of their groups,

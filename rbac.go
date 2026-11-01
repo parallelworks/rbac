@@ -1067,12 +1067,16 @@ func (a *Authorizer) still() *Authorizer {
 // the time, so every statement it makes and the request.time of every condition it evaluates are
 // of one moment. Read apart, a grant or a membership expiring between two readings could meet a
 // condition, a deny or label values of a later moment in an answer no single moment gave. A change
-// reads it again in its transaction (begin), which first needs it under its locks, where it decides
-// again by what committed before them.
+// reads it again in its transaction (begin), once it holds every lock it waits for, where it
+// decides again by what committed before them: read before a wait, it would decide at a time the
+// wait has left behind, as by an actor's power that ended meanwhile.
 type callClock struct {
 	host func() time.Time
 	at   time.Time
 	read bool
+	// before is the time a change's transaction picks what it locks by (earlier), once began.
+	before time.Time
+	began  bool
 }
 
 func (c *callClock) now() time.Time {
@@ -1080,6 +1084,20 @@ func (c *callClock) now() time.Time {
 		c.at, c.read = c.host(), true
 	}
 	return c.at
+}
+
+// earlier is the time by which a change's transaction picks, of what is in force, what it holds
+// before it reads the time it decides at: the call's reading before the transaction or, where it
+// made none, one made now. It is no later than the time the change then decides at, so what is in
+// force at it is all that is in force then, and perhaps more.
+func (c *callClock) earlier() time.Time {
+	if !c.began {
+		c.before, c.began = c.at, true
+		if !c.read {
+			c.before = c.host()
+		}
+	}
+	return c.before
 }
 
 // GrantInput is a grant Config.ValidateGrant is asked about.

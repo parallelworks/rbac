@@ -3,8 +3,10 @@ package rbac
 import (
 	"context"
 	"maps"
+	"regexp"
 	"runtime"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,7 +15,63 @@ import (
 	"cel.dev/cel-go/common/types/ref"
 	"cel.dev/cel-go/interpreter"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// Every change a test makes holds all it waits for before it reads the time it decides at.
+func init() {
+	watched = func(tx pgx.Tx, c *callClock) pgx.Tx { return clockWatched{tx, c} }
+}
+
+// clockWatched is a change's transaction, which panics on a statement that may wait for a lock once
+// the change has read the time it decides at (callClock): a wait would leave that time behind.
+type clockWatched struct {
+	pgx.Tx
+	clock *callClock
+}
+
+var (
+	// rowLock is a row-locking clause, and noWait what after one keeps it from waiting.
+	rowLock = regexp.MustCompile(`(?i)\bFOR\s+(NO\s+KEY\s+UPDATE|UPDATE|KEY\s+SHARE|SHARE)\b`)
+	noWait  = regexp.MustCompile(`(?i)^\s+(NOWAIT|SKIP\s+LOCKED)\b`)
+	// write is a statement that writes, whose own locks take again what the change holds.
+	write = regexp.MustCompile(`(?i)\b(DELETE\s+FROM|INSERT\s+INTO|UPDATE\s+\w+(\s+AS\s+\w+)?\s+SET)\b`)
+)
+
+func (w clockWatched) check(sql string) {
+	if !w.clock.read || write.MatchString(sql) {
+		return
+	}
+	waits := strings.Contains(sql, "pg_advisory_xact_lock")
+	for _, at := range rowLock.FindAllStringIndex(sql, -1) {
+		waits = waits || !noWait.MatchString(sql[at[1]:])
+	}
+	if waits {
+		panic("rbac: a change locks once it has read the time it decides at: " + strings.Join(strings.Fields(sql), " "))
+	}
+}
+
+func (w clockWatched) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	w.check(sql)
+	return w.Tx.Exec(ctx, sql, args...)
+}
+
+func (w clockWatched) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	w.check(sql)
+	return w.Tx.Query(ctx, sql, args...)
+}
+
+func (w clockWatched) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	w.check(sql)
+	return w.Tx.QueryRow(ctx, sql, args...)
+}
+
+func (w clockWatched) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	for _, q := range b.QueuedQueries {
+		w.check(q.SQL)
+	}
+	return w.Tx.SendBatch(ctx, b)
+}
 
 // SetSavepointEnd bounds a savepoint's release or rollback by d until t ends.
 func SetSavepointEnd(t *testing.T, d time.Duration) {
