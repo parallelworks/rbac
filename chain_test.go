@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"math"
@@ -19,6 +20,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/parallelworks/rbac"
 	"github.com/parallelworks/rbac/internal/pgtest"
@@ -168,6 +171,51 @@ func TestAnExportIsSigned(t *testing.T) {
 		return err
 	}); !errors.Is(err, rbac.ErrInvalid) {
 		t.Errorf("an export as of a time: %v", err)
+	}
+}
+
+// racedSigner is a signer whose key is read from PostgreSQL, which refused the read: its error.
+type racedSigner struct {
+	*ecdsa.PrivateKey
+	err error
+}
+
+func (s racedSigner) Sign(io.Reader, []byte, crypto.SignerOpts) ([]byte, error) { return nil, s.err }
+
+// A signer's error holding PostgreSQL's refusal for a race, as of a read of its key, matches
+// ErrConflict, still wrapping the signer's own, from every call given a signer, as a hook's does:
+// reflection finds each, so one added without mapping it fails here, and History, which Export
+// reads first, doesn't map it for Export.
+func TestASignersRaceConflicts(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	errKey := errors.New("reading the signing key")
+	signer := racedSigner{key, fmt.Errorf("%w: %w", errKey, &pgconn.PgError{Code: "55P03", Message: "canceling statement due to lock timeout"})}
+	calls := map[string]func() error{
+		"Export": func() error {
+			_, _, err := h.authz.Export(ctx, rbac.Checkpoint{}, 10, signer)
+			return err
+		},
+		"Sign": func() error { return second(rbac.Genesis("g").Sign(signer)) },
+	}
+	for _, of := range []reflect.Type{reflect.TypeFor[*rbac.Authorizer](), reflect.TypeFor[rbac.Checkpoint]()} {
+		for i := range of.NumMethod() {
+			m := of.Method(i)
+			for j := range m.Type.NumIn() {
+				if m.Type.In(j) == reflect.TypeFor[crypto.Signer]() && calls[m.Name] == nil {
+					t.Errorf("%s.%s isn't checked for a signer refused for a race", of, m.Name)
+				}
+			}
+		}
+	}
+	for name, call := range calls {
+		if err := call(); !errors.Is(err, rbac.ErrConflict) || !errors.Is(err, errKey) {
+			t.Errorf("%s, whose signer was refused for a race: %v", name, err)
+		}
 	}
 }
 
