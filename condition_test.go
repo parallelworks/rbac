@@ -247,6 +247,7 @@ func TestADoubleOfAHostsOwnTypeThatIsntFiniteFailsWhatComparesIt(t *testing.T) {
 		"nan": nan, "inf": hostDouble(math.Inf(-1)), "half": hostDouble(0.5), "in a list": []any{nan},
 		"in a host's list": ownList{types.NewRefValList(types.DefaultTypeAdapter, []ref.Val{nan})},
 		"in an optional":   types.OptionalOf(nan), "keying": map[any]any{nan: 1}, "self": selfDouble{0.5},
+		"self keyed": map[ref.Val]ref.Val{selfDouble{0.5}: types.Int(1)},
 	}
 	for _, expr := range []string{
 		`request.attributes.nan != request.attributes.nan`, `!(request.attributes.nan == 0.5)`, `request.attributes.inf < 0.5`,
@@ -254,7 +255,7 @@ func TestADoubleOfAHostsOwnTypeThatIsntFiniteFailsWhatComparesIt(t *testing.T) {
 		`string(request.attributes.nan) != "0.5"`, `request.attributes["in a list"] != [0.5]`,
 		`request.attributes["in a host's list"] != [0.5]`, `request.attributes["in a host's list"].all(r, r != 0.5)`,
 		`request.attributes["in an optional"] != request.attributes["in an optional"]`, `request.attributes.keying != {0.5: 1}`,
-		`request.attributes.self < 1.0`,
+		`request.attributes.self < 1.0`, `request.attributes["self keyed"] != request.attributes["self keyed"]`,
 	} {
 		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || evaluated {
 			t.Errorf("%s: evaluated %t, %v", expr, evaluated, err)
@@ -815,8 +816,10 @@ type holder struct{ M map[string]any }
 // overflows, which kills the process: no recover catches it. A message literal converted one so,
 // and so did reading a value CEL can't read that holds one, as a struct, which it writes out in its
 // error, or a message of a dynamic type, which it merges into one of its own. One that is its own
-// reflection, as dynamic types other than dynamicpb's are, was read by its reflection without end.
-// Each runs in a child process, so one that overflows fails this test rather than the test binary.
+// reflection, as dynamic types other than dynamicpb's are, was read by its reflection without end,
+// and comparing a list of the host's own that yields itself when indexed, though iterating it yields
+// none, recursed without end. Each runs in a child process, so one that overflows fails this test
+// rather than the test binary.
 func TestAValueHoldingItselfFailsItsConditions(t *testing.T) {
 	if expr := os.Getenv("RBAC_CONDITION_OF_A_CYCLE"); expr != "" {
 		m := map[string]any{"a": "b"}
@@ -824,7 +827,10 @@ func TestAValueHoldingItselfFailsItsConditions(t *testing.T) {
 		l := []any{"x", nil}
 		l[1] = l
 		refused := os.Getenv("RBAC_CONDITION_OF_A_CYCLE_REFUSED") != ""
-		attributes := map[string]any{"m": m, "l": l, "s": holder{m}, "p": &holder{m}, "d": dynamicStruct(), "r": &reflecting{dynamicStruct()}}
+		attributes := map[string]any{
+			"m": m, "l": l, "s": holder{m}, "p": &holder{m}, "d": dynamicStruct(), "r": &reflecting{dynamicStruct()},
+			"g": indexedAsItself{types.NewDynamicList(types.DefaultTypeAdapter, []any{"x", "y"})},
+		}
 		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, attributes); evaluated || (err != nil) != refused {
 			t.Errorf("%s evaluated %t, %v", expr, evaluated, err)
 		}
@@ -834,6 +840,7 @@ func TestAValueHoldingItselfFailsItsConditions(t *testing.T) {
 		`request.attributes.s == request.attributes.p || [request.attributes.s] != []`:                                   false,
 		`request.attributes.d.self.self != {}`:                                                                           false,
 		`request.attributes.r.self.self != {}`:                                                                           false,
+		`request.attributes.g == request.attributes.g || [request.attributes.g] != [request.attributes.g]`:               false,
 		`google.protobuf.Struct{fields: request.attributes.m} != {}`:                                                     true,
 		`google.protobuf.ListValue{values: request.attributes.l} != []`:                                                  true,
 		`request.attributes.m == request.attributes.m`:                                                                   false,
@@ -854,6 +861,11 @@ func TestAValueHoldingItselfFailsItsConditions(t *testing.T) {
 		}
 	}
 }
+
+// indexedAsItself is a host's own list that yields itself when indexed, though not when iterated.
+type indexedAsItself struct{ traits.Lister }
+
+func (l indexedAsItself) Get(ref.Val) ref.Val { return l }
 
 // reflecting is a message of a dynamic type that is its own reflection, as dynamic types other than
 // dynamicpb's are.
@@ -999,6 +1011,37 @@ func TestAValueCELCantReadFailsUnwritten(t *testing.T) {
 // read as one value: a loop reading an element of a list of arrays of 512 KiB took sixty times
 // longer than its charge. Those of more than 1 KiB fail; smaller ones, as an id of 16 bytes, are
 // read as CEL reads them.
+// CEL unpacks a packed message packing another in turn, copying all each packs, though it charges
+// the read as one value: reading one packing others as deep as a mebibyte allows took two seconds,
+// once for each check. One packing another fails, whether of its generated type, of a dynamic type
+// or embedded in a host's type; one packing any other message is read as CEL reads it.
+func TestAPackedMessagePackingAnotherFails(t *testing.T) {
+	inner, err := anypb.New(wrapperspb.String("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	outer, err := anypb.New(inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := proto.Marshal(outer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dynamic := dynamicpb.NewMessage(outer.ProtoReflect().Descriptor())
+	if err := proto.Unmarshal(b, dynamic); err != nil {
+		t.Fatal(err)
+	}
+	for name, v := range map[string]any{"its type": outer, "a dynamic type": dynamic, "a host's type": envelope{Message: outer}} {
+		if _, evaluated, _, err := rbac.EvaluateCondition(t, `request.attributes.v != "b"`, map[string]any{"v": v}); err != nil || evaluated {
+			t.Errorf("one of %s: evaluated %t, %v", name, evaluated, err)
+		}
+	}
+	if held, _, _, err := rbac.EvaluateCondition(t, `request.attributes.v == "a"`, map[string]any{"v": inner}); err != nil || !held {
+		t.Errorf("one packing a string: held %t, %v", held, err)
+	}
+}
+
 func TestAValueCELCopiesWholeEachTimeItIsReadIsAtMostAKibibyte(t *testing.T) {
 	id := [16]byte{1}
 	for name, c := range map[string]struct {
@@ -1607,6 +1650,12 @@ func TestFiniteValuesDecideAsCELDoes(t *testing.T) {
 		"a message's field":  text.ProtoReflect().Get(text.ProtoReflect().Descriptor().Fields().ByName("string_value")),
 		"a list":             []any{"a", 0.5}, "a map": map[string]any{"a": "a"}, "an id": [16]byte{1}, "ids": [][16]byte{{1}},
 		"a struct": struct{ A string }{"a"},
+		// Keyed by values of a type of the host's own, which a map finds as the map holds them: read
+		// as CEL's own, each map compared unequal to itself, so a grant's `!=` held.
+		"a map keyed by a host's double": map[ref.Val]ref.Val{hostDouble(0.5): types.String("a")},
+		"a map of CEL's keyed so":        types.NewRefValMap(types.DefaultTypeAdapter, map[ref.Val]ref.Val{hostDouble(0.5): types.String("a")}),
+		"a host's map keyed so":          ownMap{types.NewRefValMap(types.DefaultTypeAdapter, map[ref.Val]ref.Val{hostDouble(0.5): types.String("a")})},
+		"a map of Go's keyed so":         map[any]any{heldKey{0.5}: "a"},
 	}
 	// A value of a type of the host's own CEL reads as a double decides as the double it holds, as
 	// do the lists and maps of the host's own holding one: CEL found one equal to its own double only
@@ -1623,7 +1672,10 @@ func TestFiniteValuesDecideAsCELDoes(t *testing.T) {
 				decides(fmt.Sprintf(of, "request.attributes.x", "request.attributes.y"), map[string]any{"x": hosted[x], "y": hosted[y]})
 			}
 		}
-		for _, of := range []string{`%s.a == "a"`, `%s[0] == "a"`, `size(%s) == 2`, `%s.exists(v, v == "a")`, `"a" in %s`, `string(%s) == "a"`} {
+		for _, of := range []string{
+			`%s.a == "a"`, `%s[0] == "a"`, `size(%s) == 2`, `%s.exists(v, v == "a")`, `"a" in %s`, `string(%s) == "a"`,
+			`%s.all(k, k in %[1]s)`, `%s.exists(k, %[1]s[k] == "a")`,
+		} {
 			decides(fmt.Sprintf(of, "request.attributes.x"), map[string]any{"x": hosted[x]})
 		}
 	}
@@ -1643,6 +1695,17 @@ func TestFiniteValuesDecideAsCELDoes(t *testing.T) {
 
 // ownMap is a host's own map type, which yields what the map it embeds holds.
 type ownMap struct{ traits.Mapper }
+
+// heldKey is a host's own type CEL reads as a double, which a map of Go's keyed by an interface finds
+// as itself.
+type heldKey struct{ hostDouble }
+
+func (k heldKey) ConvertToNative(t reflect.Type) (any, error) {
+	if t.Kind() == reflect.Interface && reflect.TypeOf(k).Implements(t) {
+		return k, nil
+	}
+	return k.hostDouble.ConvertToNative(t)
+}
 
 // iterated counts the elements a loop over a list takes.
 type iterated struct {

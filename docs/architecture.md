@@ -386,11 +386,13 @@ sequenceDiagram
   errors gives nothing, and a deny's that errors denies. A check reads what the host passes through
   a conversion of its own (`converting`), each list and map it holds too: a value CEL decodes or
   merges whole each time a condition reads it, as JSON text or a packed or dynamic message, is
-  converted once for the check; one CEL would write out whole into an error, as a struct, or copy
-  whole on each read, as an array of more than 1 KiB of bytes, fails; and one of the host's type CEL
-  reads as one of its own, as a double, is read as the value it holds. So a read costs what it is
-  charged however the host passes the value, and a comparison that fails where either value holds a
-  double that isn't finite, as a key too, sees every double as CEL's own. Each runs within the most
+  converted once for the check, and one CEL unpacks in turn, a packed message packing another,
+  fails; one CEL would write out whole into an error, as a struct, or copy whole on each read, as an
+  array of more than 1 KiB of bytes, fails; and one of the host's type CEL reads as one of its own,
+  as a double, is read as the value it holds, but as a map's key, which is read as the map holds it,
+  so the map finds it. So a read costs what it is charged however the host passes the value, and a
+  comparison that fails where either value holds a double that isn't finite, as a key too, sees
+  every such double as CEL's own. Each runs within the most
   evaluating it can cost, which its literals and types bound, and the ids, kinds, types and tenant a
   check passes and its action, which are no longer than `MaxID`. What a check reads together is
   bounded where it is stored, for each scope: an identity's conditional grants, the conditional

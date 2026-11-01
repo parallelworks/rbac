@@ -58,13 +58,16 @@ import (
 // JSON number (json.Number), a packed message (anypb.Any), or a message of a dynamic type or of a
 // host's type embedding one, is converted once for each check, the first time a condition reads
 // it, at about what decoding it cost the host, rather than each time; such a message reaching one
-// message twice, itself included, fails. So does a value CEL can't read, as a struct, which it
+// message twice, itself included, fails, and so does a packed message packing another, which CEL
+// unpacks in turn, copying all each packs. So does a value CEL can't read, as a struct, which it
 // would write out whole, and an array of more than 1 KiB of bytes, or a list or a map holding
 // arrays or structs of more than 1 KiB each, which it copies whole each time a condition reads it.
 // A value of a host's own type CEL reads as one of its own, as a double or a string, is read as
 // the value it holds (its Value), so it compares as CEL's own does, from either side, and fails
 // where it isn't finite; a list or a map of the host's own is read by its own methods, each value
-// it yields read so. A value holding itself fails whatever reads it whole.
+// it holds read so. A key a map yields that is of such a type is read as the map holds it, so the
+// map finds it, but for one that isn't finite, which fails what compares it. A value holding
+// itself fails whatever reads it whole.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
@@ -149,7 +152,9 @@ const maxCopied = 1 << 10
 //     reads it, at about what decoding it cost the host, and read from then on as any value is. A
 //     message it would merge that reaches a message twice, itself included, fails: merging one
 //     holding itself recurses until the stack overflows, which no recover catches, and copies one
-//     reached twice for each path to it.
+//     reached twice for each path to it. So does a packed message packing another (packsAnother).
+//     Messages that reach the same message, or JSON texts sharing their bytes, are each converted
+//     whole, which can take longer than decoding what the host passed did.
 //   - A value CEL can't read, as a struct, fails without being written out: CEL writes it whole into
 //     its error, and without end where it holds itself.
 //   - An array of bytes of more than maxCopied, or a list or a map holding arrays or structs of more
@@ -161,7 +166,10 @@ const maxCopied = 1 << 10
 //     double is one of CEL's own, which comparing fails where it isn't finite, and a string's length
 //     counts in what reading it costs; one holding no such value fails. A list or a map of the
 //     host's own is read as it reads itself, by its own methods, which are the host's to bound, but
-//     each value it yields read through this. Any other, an opaque value, is read as it is.
+//     each value it holds read through this. Any other, an opaque value, is read as it is.
+//   - A key a map yields, where the map can be keyed by values of the host's own types, is read as
+//     the map holds it (key): read as CEL's own, a map holding it wouldn't find it, so a map would
+//     compare unequal to itself.
 //
 // Each check makes its own, which keeps what it converted only while the check runs.
 type converting struct {
@@ -195,6 +203,9 @@ func (c *converting) NativeToValue(v any) ref.Val {
 		return types.NewStringInterfaceMap(c, v)
 	case []ref.Val:
 		return types.NewRefValList(c, v)
+	case map[ref.Val]ref.Val:
+		// Found by the keys themselves, as CEL finds them.
+		return hostMap{types.NewRefValMap(types.DefaultTypeAdapter, v), c}
 	case json.RawMessage, json.Number, *anypb.Any:
 		return c.decoded(v)
 	// Before protoreflect.Message: a dynamic message, as dynamicpb's, is its own reflection, so
@@ -243,6 +254,9 @@ func (c *converting) NativeToValue(v any) ref.Val {
 	case reflect.Map:
 		if large(rv.Type().Key()) || large(rv.Type().Elem()) {
 			return copiedWhole(v)
+		}
+		if k := rv.Type().Key(); k.Kind() == reflect.Interface || k.Implements(refValType) {
+			return hostMap{types.NewDynamicMap(asHeld{c}, v), c}
 		}
 		return types.NewDynamicMap(c, v)
 	default:
@@ -377,14 +391,15 @@ func (l hostList) Add(other ref.Val) ref.Val {
 	return sum
 }
 
-// hostMap is a map of a type of the host's own, read as hostList reads a list.
+// hostMap is a map that can be keyed by values of the host's own types, as a map of the host's own
+// type can, read as hostList reads a list, but for the keys it yields, read as it holds them (key).
 type hostMap struct {
 	traits.Mapper
 	c *converting
 }
 
 func (m hostMap) Get(k ref.Val) ref.Val     { return m.c.own(m.Mapper.Get(k)) }
-func (m hostMap) Iterator() traits.Iterator { return hostIterator{m.Mapper.Iterator(), m.c} }
+func (m hostMap) Iterator() traits.Iterator { return keyIterator{m.Mapper.Iterator(), m.c} }
 
 func (m hostMap) Find(k ref.Val) (ref.Val, bool) {
 	v, found := m.Mapper.Find(k)
@@ -401,6 +416,41 @@ type hostIterator struct {
 
 func (it hostIterator) Next() ref.Val { return it.c.own(it.Iterator.Next()) }
 
+type keyIterator struct {
+	traits.Iterator
+	c *converting
+}
+
+func (it keyIterator) Next() ref.Val { return it.c.key(it.Iterator.Next()) }
+
+// key is k, a key a map that can be keyed by values of the host's own types yields, as conditions
+// read it: as the map holds it, so that finding it in a map holding it finds it, as finding it read
+// as one of CEL's own wouldn't, and a map compares equal to itself. One of the host's own type CEL
+// reads as a value of its own holding a double that isn't finite is read as that double, which
+// comparing fails, and one holding no such value fails.
+func (c *converting) key(k ref.Val) ref.Val {
+	if holdsNone(k) || ofCEL(k) || !slices.Contains(celScalars, k.Type().TypeName()) {
+		return k
+	}
+	if held := c.held(k, false); types.IsError(held) || nonFinite(held) {
+		return held
+	}
+	return k
+}
+
+// asHeld reads a value as c does, but for a ref.Val, which it reads as it is: hostMap reads each
+// value a map holds through c, and each key as the map holds it (key).
+type asHeld struct{ c *converting }
+
+func (a asHeld) NativeToValue(v any) ref.Val {
+	if v, ok := v.(ref.Val); ok {
+		return v
+	}
+	return a.c.NativeToValue(v)
+}
+
+var refValType = reflect.TypeFor[ref.Val]()
+
 // holdsNone reports whether v is one of CEL's own values that holds no other.
 func holdsNone(v ref.Val) bool {
 	switch v.(type) {
@@ -411,9 +461,33 @@ func holdsNone(v ref.Val) bool {
 	return false
 }
 
-// decoded is v, which CEL decodes whole to read, converted once.
+// decoded is v, which CEL decodes whole to read, converted once, or failing where it is a packed
+// message packing another (packsAnother).
 func (c *converting) decoded(v any) ref.Val {
-	return c.keep(v, func() ref.Val { return c.adapter().NativeToValue(v) })
+	return c.keep(v, func() ref.Val {
+		if a, ok := v.(*anypb.Any); ok && packsAnother(a.ProtoReflect()) {
+			return packing(v)
+		}
+		return c.adapter().NativeToValue(v)
+	})
+}
+
+// packsAnother reports whether m is a packed message packing another, which CEL unpacks in turn,
+// copying all that each packs: reading one packing others as deep as a mebibyte allows took two
+// seconds, charged as one value.
+func packsAnother(m protoreflect.Message) bool {
+	d := m.Descriptor()
+	if d.FullName() != anyName {
+		return false
+	}
+	url := m.Get(d.Fields().ByName("type_url")).String()
+	return protoreflect.FullName(url[strings.LastIndexByte(url, '/')+1:]) == anyName
+}
+
+var anyName = (&anypb.Any{}).ProtoReflect().Descriptor().FullName()
+
+func packing(v any) ref.Val {
+	return types.NewErr("rbac: a condition can't read a %T packing another packed message", v)
 }
 
 // merged is m, a message CEL merges whole into one of its own to read, converted once, or failing
@@ -423,6 +497,9 @@ func (c *converting) merged(m proto.Message) ref.Val {
 	return c.keep(r.Interface(), func() ref.Val {
 		if !reachesOnce(r, map[proto.Message]bool{}) {
 			return types.NewErr("rbac: a condition can't read a %T that reaches a message twice", m)
+		}
+		if packsAnother(r) {
+			return packing(m)
 		}
 		return c.adapter().NativeToValue(m)
 	})

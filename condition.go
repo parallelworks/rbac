@@ -1398,7 +1398,14 @@ func nonFiniteKey(m traits.Mapper) bool {
 // keys of x's maps in y's, as CEL does, which decides where a map holds keys CEL counts as equal,
 // as 1 and 1u, but not a key whose size is past read, as much of the smaller value as comparing
 // is charged for: the smaller holds none so large, and finding one would hash it whole uncharged.
+// What a value holds is compared within one less than read, as valueSize counts each value one: a
+// list of the host's own can yield itself when indexed though iterating it, as valueSize does,
+// yields nothing so large, and comparing it recursed until the stack overflowed, which no recover
+// catches.
 func equal(x, y ref.Val, read uint64) ref.Val {
+	if read == 0 {
+		return types.NewErr("rbac: comparing values this large costs more than a condition may")
+	}
 	if types.IsUnknownOrError(x) {
 		return x
 	}
@@ -1415,7 +1422,7 @@ func equal(x, y ref.Val, read uint64) ref.Val {
 	}
 	var failed ref.Val
 	same := func(a, b ref.Val) bool {
-		eq := equal(a, b, read)
+		eq := equal(a, b, read-1)
 		if eq != types.False && eq != types.True && failed == nil {
 			failed = eq
 		}
@@ -1428,7 +1435,7 @@ func equal(x, y ref.Val, read uint64) ref.Val {
 		if !ok || !xs.HasValue() || !ys.HasValue() {
 			return types.Equal(x, y)
 		}
-		return equal(xs.GetValue(), ys.GetValue(), read)
+		return equal(xs.GetValue(), ys.GetValue(), read-1)
 	case traits.Mapper:
 		ys, ok := y.(traits.Mapper)
 		if !ok || xs.Size() != ys.Size() {
@@ -1442,6 +1449,11 @@ func equal(x, y ref.Val, read uint64) ref.Val {
 		}
 		for it := xs.Iterator(); it.HasNext() == types.True; {
 			k := it.Next()
+			// A key a condition can't read, which finding would find in no map, fails as a value
+			// does.
+			if types.IsUnknownOrError(k) {
+				return k
+			}
 			if valueSize(k, read) > read {
 				return types.False
 			}
