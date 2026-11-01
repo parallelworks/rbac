@@ -2284,13 +2284,55 @@ func TestExportingFromTheStartWaitsForATransactionOlderThanAPrune(t *testing.T) 
 	drain(t, h, &cursor, 10)
 }
 
+// A prune in a transaction that took its id before an export's first read from the start, and
+// commits after it, is of one the read saw running, no older than the export's Horizon: History
+// refuses the export's cursor before the last record the prune deleted.
+func TestHistoryRefusesAnExportBegunAsAPrunesTransactionRan(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	through := interleaved(t, h)
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var txid uint64
+	if err := tx.QueryRow(ctx, `SELECT pg_current_xact_id()`).Scan(&txid); err != nil {
+		t.Fatal(err)
+	}
+	var cursor rbac.Cursor
+	for deadline := time.Now().Add(10 * time.Second); cursor.ID == 0; {
+		got, next, err := h.authz.History(ctx, cursor, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) == 0 && time.Now().After(deadline) {
+			t.Fatal("read 0 records")
+		}
+		cursor = next
+	}
+	if cursor.Horizon == 0 || cursor.Horizon > txid {
+		t.Fatalf("an export begun as transaction %d ran has Horizon %d", txid, cursor.Horizon)
+	}
+	if n, err := rbac.PruneHistory(ctx, tx, dbNow(t, h), through); err != nil || n != 4 {
+		t.Fatalf("PruneHistory = %d, %v", n, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h.authz.History(ctx, cursor, 10); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("History from before what a prune of a transaction running as its export began deleted: %v", err)
+	}
+}
+
 // exporter is an export in TestHistoryRefusesExactlyTheExportsAPruneDeletedFrom: where it stands,
 // whether it has begun, by a read from the start that found records, whether a prune has since
 // deleted a record after its cursor, which it then never reads, and whether one deleted the
-// cursor's own record, which History refuses too, as it can't tell that from a restore.
+// cursor's own record, which History refuses too, as it can't tell that from a restore; and whether
+// its cursor has no Horizon, as one kept from before Cursor had one.
 type exporter struct {
-	cursor               rbac.Cursor
-	begun, harmed, unmet bool
+	cursor                      rbac.Cursor
+	begun, harmed, unmet, stale bool
 }
 
 // place is a record's place in History's order.
@@ -2306,11 +2348,14 @@ func (p place) compare(q place) int {
 func placeOf(c rbac.Cursor) place { return place{c.TxID, c.ID} }
 
 // Exports at random cursors, among random writes, a transaction that took its id early, and prunes
-// through a random export's cursor, of this release alone or two in a host's transaction, as an
-// export reads, or of a release before migration 0020: each export reads every record history holds
-// after its cursor, and is refused exactly where a prune since it began deleted a record after its
-// cursor, or for one recorded before 0020, went through a cursor after it, or deleted its cursor's
-// record. One that began after a prune, as an export from the start again, is never refused for it.
+// through a random export's cursor, of this release alone, two in a host's transaction, or one in a
+// host's that took its id early, as an export reads, or of a release before migration 0020: each
+// export reads every record history holds after its cursor, and is refused exactly where a prune
+// since it began deleted a record after its cursor, or for one recorded before 0020, went through a
+// cursor after it, or deleted its cursor's record. One that began after a prune, as an export from
+// the start again, is never refused for it, unless its cursor lost its Horizon, as one kept from
+// before Cursor had one: then it is refused where a prune since it began deleted a record after it,
+// and may be where an earlier one did.
 func TestHistoryRefusesExactlyTheExportsAPruneDeletedFrom(t *testing.T) {
 	var refusals int
 	for seed := range uint64(6) {
@@ -2361,6 +2406,9 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 		return tx
 	}
 	exports := []*exporter{{}, {}}
+	// bygone is every record a prune deleted, and for one of a release before 0020, the cursor it
+	// went through, whenever it ran.
+	var bygone []place
 	// pruned marks harmed each export begun before a prune that, from what history held, was, to
 	// what it holds, now, deleted a record after its cursor, or for one of a release before 0020,
 	// went through a cursor after it; and unmet one whose cursor's record it deleted.
@@ -2369,6 +2417,10 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 			_, ok := slices.BinarySearchFunc(now, p, place.compare)
 			return ok
 		})
+		bygone = append(bygone, gone...)
+		if through != nil {
+			bygone = append(bygone, placeOf(*through))
+		}
 		for _, e := range exports {
 			if !e.begun {
 				continue
@@ -2379,9 +2431,15 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 			e.unmet = e.unmet || slices.ContainsFunc(gone, func(p place) bool { return p.compare(c) == 0 })
 		}
 	}
+	// mayRefuse reports whether History may refuse e: harmed or unmet, or without a Horizon, after a
+	// cursor a prune went past at any time.
+	mayRefuse := func(e *exporter) bool {
+		c := placeOf(e.cursor)
+		return e.harmed || e.unmet || e.stale && slices.ContainsFunc(bygone, func(p place) bool { return p.compare(c) > 0 })
+	}
 	// refusable reports whether History may refuse the export at c.
 	refusable := func(c rbac.Cursor) bool {
-		return slices.ContainsFunc(exports, func(e *exporter) bool { return e.cursor == c && (e.harmed || e.unmet) })
+		return slices.ContainsFunc(exports, func(e *exporter) bool { return e.cursor == c && mayRefuse(e) })
 	}
 	// through is the cursor of a random export that has begun, or nil.
 	through := func() *rbac.Cursor {
@@ -2443,7 +2501,7 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 			}
 			rbac.SetFollowed(t, func(pgx.Tx) {})
 			switch {
-			case (e.harmed || e.unmet) && errors.Is(err, rbac.ErrInvalid):
+			case mayRefuse(e) && errors.Is(err, rbac.ErrInvalid):
 				refusals++
 				*e = exporter{}
 				return 0
@@ -2480,7 +2538,7 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 			return len(got)
 		}
 	}
-	var early pgx.Tx
+	var early, pruner pgx.Tx
 	for step := range 200 {
 		if early != nil && rng.IntN(4) == 0 {
 			if err := early.Commit(ctx); err != nil {
@@ -2488,7 +2546,7 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 			}
 			early = nil
 		}
-		switch op := rng.IntN(20); {
+		switch op := rng.IntN(22); {
 		case op < 6:
 			// A grant, its change or its revoke; or in the transaction that took its id early, a
 			// membership no other write touches, so none waits for it.
@@ -2519,9 +2577,28 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 				}
 				early = tx
 			}
-		case op < 9:
+		case op < 8:
+			// A host's transaction that takes its id now, and later prunes and commits: it deletes
+			// records of earlier transactions, and its record comes before those written since, so an
+			// export that began meanwhile, with a Horizon no later than it, counts it.
+			if pruner == nil {
+				tx := begin(pgx.ReadCommitted)
+				if _, err := tx.Exec(ctx, `SELECT pg_current_xact_id()`); err != nil {
+					t.Fatal(err)
+				}
+				pruner = tx
+			} else if c := through(); c != nil {
+				was := held()
+				prune(pruner, *c)
+				if err := pruner.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+				pruner = nil
+				pruned(was, held(), nil)
+			}
+		case op < 10:
 			exports = append(exports, &exporter{})
-		case op < 15:
+		case op < 16:
 			// At times as a prune through another export's cursor commits between its checking the
 			// cursor and reading.
 			arm := func(pgx.Tx) {}
@@ -2533,8 +2610,8 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 					pruned(was, held(), nil)
 				}
 			}
-			read(exports[rng.IntN(len(exports))], early == nil, arm)
-		case op < 18:
+			read(exports[rng.IntN(len(exports))], early == nil && pruner == nil, arm)
+		case op < 19:
 			c := through()
 			if c == nil {
 				continue
@@ -2561,6 +2638,12 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 				was = between
 			}
 			pruned(was, held(), nil)
+		case op < 20:
+			// An export that goes on from its cursor kept without its Horizon, as one kept from before
+			// Cursor had one.
+			if e := exports[rng.IntN(len(exports))]; e.begun {
+				e.cursor.Horizon, e.stale = 0, true
+			}
 		default:
 			// A prune of a release before 0020: its record, written in a statement after its delete,
 			// holds the cursor it went through, not the last record it deleted, and it refused a
@@ -2592,9 +2675,11 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 			pruned(was, held(), c)
 		}
 	}
-	if early != nil {
-		if err := early.Commit(ctx); err != nil {
-			t.Fatal(err)
+	for _, tx := range []pgx.Tx{early, pruner} {
+		if tx != nil {
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	// Each reads to the end of history, or is refused and then does.
