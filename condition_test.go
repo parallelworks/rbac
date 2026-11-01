@@ -963,6 +963,30 @@ func TestAValueCELDecodesWholeIsDecodedOnceForACheck(t *testing.T) {
 	}
 }
 
+// A map of Go's keyed by an interface, as a map[any]any, is read through the check's conversion,
+// and so is each value it holds, but reading a value one held wrapped what the conversion had
+// already wrapped again, so a value d maps deep was read through about 2d wrappers: comparing one
+// nested 400 deep with itself took 60 times as long as comparing a map[string]any nested as deep,
+// charged alike. Each is wrapped once.
+func TestAMapKeyedByAnInterfaceNestedDeepCostsWhatAnyMapDoes(t *testing.T) {
+	var keyed, listed, named, namedListed any = "x", "x", "x", "x"
+	for range 400 {
+		keyed, named = map[any]any{"a": keyed}, map[string]any{"a": named}
+		listed, namedListed = map[any]any{"a": []any{listed}}, map[string]any{"a": []any{namedListed}}
+	}
+	expr := `request.attributes.v == request.attributes.v`
+	for name, v := range map[string][2]any{"maps": {keyed, named}, "maps of lists": {listed, namedListed}} {
+		_, _, want, _ := rbac.EvaluateCondition(t, expr, map[string]any{"v": v[1]})
+		held, evaluated, allocated, err := rbac.EvaluateCondition(t, expr, map[string]any{"v": v[0]})
+		if err != nil || !evaluated || !held {
+			t.Errorf("%s: held %t, evaluated %t, %v", name, held, evaluated, err)
+		}
+		if allocated > 4*want {
+			t.Errorf("%s nested 400 deep compared allocated %d bytes, map[string]any nested so %d", name, allocated, want)
+		}
+	}
+}
+
 // messages is a list of messages of a dynamic type, a ListValue's values, of which the first's
 // struct_value is s.
 func messages(s *dynamicpb.Message) protoreflect.List {

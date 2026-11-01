@@ -334,6 +334,11 @@ func (c *converting) own(v ref.Val) ref.Val {
 	switch v := v.(type) {
 	case *types.Optional:
 		return c.keep(v, func() ref.Val { return c.optional(v) })
+	case hostList, hostMap:
+		// One c made already reads what it yields through c: wrapped again, each value a list or a
+		// map d deep yields was read through a wrapper for each it is nested in, about 2d, so
+		// comparing a map[any]any nested 400 deep took 60 times what comparing a map[string]any did.
+		return v
 	case traits.MutableLister:
 		// As the list it holds: CEL adds to one in place, so a condition adding to one changed what
 		// it and the check's other conditions read after, and adding one to itself, which CEL appends
