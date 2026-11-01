@@ -397,10 +397,12 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 		switch {
 		case !ok || !def.GrantableOn(r.Type):
 		case h.conditional:
+			readingEntries(len(def.Permissions))
 			if slices.ContainsFunc(def.Permissions, kept) {
 				conditional = append(conditional, h)
 			}
 		default:
+			readingEntries(len(def.Permissions))
 			for _, p := range def.Permissions {
 				if kept(p) {
 					given[p] = given[p] || h.carries(def, p)
@@ -461,6 +463,7 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 	cheapestFirst(conditional, holding.expression)
 	for _, h := range conditional {
 		def, _ := roles.role(h.Role)
+		readingEntries(len(def.Permissions))
 		for _, p := range def.Permissions {
 			if given[p] || !kept(p) || !h.carries(def, p) {
 				continue

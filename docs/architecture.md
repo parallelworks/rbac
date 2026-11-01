@@ -608,9 +608,10 @@ flowchart LR
 ## Labels and exclusive values
 
 A label is mandatory access control above every grant. The host declares dimensions in
-`Config.Labels`. A subject holds a dimension's values as permissions, `dimension:value`, which
-roles granted on the tenant give, and a labeled resource is allowed only to a subject whose values
-satisfy its label.
+`Config.Labels`, with `Config.ResourceOf`, through which changes read the labels of the scopes they
+reach, the tenant's and its groups' among them: `New` refuses labels without it. A subject holds a
+dimension's values as permissions, `dimension:value`, which roles granted on the tenant give, and a
+labeled resource is allowed only to a subject whose values satisfy its label.
 
 ```mermaid
 flowchart TB
@@ -641,7 +642,10 @@ flowchart TB
   across them (`runs`), so a condition that doesn't read the action runs once for all of them. Each
   value is still decided on budgets of its own, which pay for every condition they read, whether
   they ran it or a value before them did, so it decides as a check of it alone would, and what one
-  label asked for first never changes what another is decided by.
+  label asked for first never changes what another is decided by. Each walks only the read's grants
+  of roles giving values, and of each role its values, which the first decision narrows the read
+  to, reading each role once (`labeling`): a holding decides by nothing else, so the actor's grants
+  of other roles, however many or large, cost a label nothing.
 - **Releasing and writing.** `ReleasePermission(dimension)`, held on the tenant, is the power to
   release data to a looser label in that dimension, so only a holder of it can downgrade data. A
   `Holding`'s `MayWrite` and `MayRelease` say whether data read under one label may be written, or

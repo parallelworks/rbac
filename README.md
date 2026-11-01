@@ -164,7 +164,9 @@ scopes conditional ones reach, to check one by one.
   `Explain` names the dimension that failed. A change checking the labels of many scopes, as one to
   the members of many groups, decides each of the actor's values once in each phase, when a label
   first asks for it, and evaluates a condition of the actor's that doesn't read the action once for
-  all of them, each value still on a budget of its own, as a check of it is.
+  all of them, each value still on a budget of its own, as a check of it is. For each it walks only
+  the actor's grants giving values, and of their roles only the values, each role read once in each
+  phase, so the actor's grants of other roles, however many or large, cost a label nothing.
   `Filter` tests a `text[]` label column (`Columns.Labels`), which needs no
   index, as the path's drives the query; `Reachable` returns the holding, and `Holding` with
   `Satisfies` checks data points in a feed without reading the database.
@@ -353,8 +355,9 @@ scopes conditional ones reach, to check one by one.
   `Config.ResourceOf` gives the package the tenant, which `SetGroup` and `DeleteGroup` check
   `rbac.ManageGroups` on, and the groups, which `ChangeMembers` checks `rbac.GroupMembers` on and
   `SetGroup` and `DeleteGroup` the label of, each with its constraints and label, and the
-  containers, label and attributes of the scopes a group's access is on; a host without it declares
-  no labels and resource attributes as none, and for access below the tenant, no containers. For a
+  containers, label and attributes of the scopes a group's access is on; a host declaring labels
+  needs it, and `New` refuses them without it as invalid; one without it declares resource
+  attributes as none, and for access below the tenant, no containers. For a
   scope the host no longer has, as a resource deleted without `DeleteScopes`, it returns
   `rbac.ErrNotFound`, or an error wrapping it: a change that only takes access away there, as a
   member leaving a group with access on it or the group itself, or joining one a deny there names, a

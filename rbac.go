@@ -740,7 +740,8 @@ type Config struct {
 	// ErrNotFound as stored and unlabeled, and ChangeMembers and DeleteRole ask nothing of the scopes
 	// only a removal reaches where the actor's label values satisfy every label and, for DeleteRole,
 	// no such deny binds it, as SetRole asks nothing of the scopes roles listing the role are granted
-	// on then.
+	// on then. New refuses Labels without it, as group management would read the tenant and every
+	// group as unlabeled.
 	ResourceOf func(ctx context.Context, tenant string, s Scope) (Resource, error)
 	// Permissions are every permission the host checks, whether or not a role gives it, so that a
 	// catalog leaving one out, as one an operator configures may, refuses it like any permission
@@ -775,7 +776,8 @@ type Config struct {
 	// takes that value alone: to cap a level, deny it and every value above. Values are held on the
 	// tenant, so they are denied there: SetDeny refuses a deny of one on any other scope, which would
 	// bind no one. The conditions of a value's grants and denies read the tenant as their resource,
-	// never the labeled one.
+	// never the labeled one. They need ResourceOf, which gives the labels of the scopes changes
+	// reach, the tenant and its groups among them: New refuses them without it, as invalid.
 	Labels []LabelDimension
 	// OnChange runs in the transaction of every change but DeleteExpired, whose grants already
 	// gave nothing, once the change is written; an error rolls the change back. History records
@@ -860,6 +862,11 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 	labels, err := indexLabels(cfg.Labels, cfg.Catalog)
 	if err != nil {
 		return nil, err
+	}
+	// Group management reads the tenant's label and each group's through ResourceOf: without it, it
+	// would read them all as unlabeled, and an actor a label refuses would manage groups and members.
+	if len(labels) > 0 && cfg.ResourceOf == nil {
+		return nil, fmt.Errorf("%w: Config.Labels needs Config.ResourceOf, which gives the labels of the tenant and its groups", ErrInvalid)
 	}
 	// The listings read the catalog in order: from the copies, so that a caller changing its
 	// slices after New can't make them disagree with checks or clear a Deny checked here.
