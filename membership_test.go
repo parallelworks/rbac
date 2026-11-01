@@ -4308,13 +4308,15 @@ func deniedAsGiven(t *testing.T, frozen, declared bool) {
 }
 
 // Without Config.ResourceOf a group is as stored, which is all of it only where the host declares
-// resource attributes as none. Where a deny binding the actor, or a constraint, may stop it changing
-// grants on groups, ChangeMembers refuses taking access away on a group's scope rather than read the
-// group so, and DeleteGroup revoking what is granted there is refused too; a group nothing is
-// granted on it deletes, revoking nothing.
+// no labels and resource attributes as none. Where a deny binding the actor, or a constraint, may
+// stop it changing grants on groups, or the group's label refuse it, as one can where the actor's
+// label values don't satisfy every label, ChangeMembers refuses taking access away on a group's
+// scope rather than read the group so, and DeleteGroup revoking what is granted there is refused
+// too; a group nothing is granted on it deletes, revoking nothing.
 func TestWithoutResourceOfDeletingAGroupWithGrantsOnItIsRefusedWhereItCouldBeStopped(t *testing.T) {
 	for name, mutate := range map[string]func(*rbac.Config){
-		"a deny": func(*rbac.Config) {},
+		"a deny":  func(*rbac.Config) {},
+		"a label": withLabels,
 		"a constraint": func(c *rbac.Config) {
 			c.Constraints = []rbac.Constraint{{Name: "freeze", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
 				return in.Permission == rbac.GrantPermission(rbac.GroupScope) && (in.Resource == nil || in.Resource.Attributes["frozen"] == true), nil
@@ -4357,6 +4359,46 @@ func TestWithoutResourceOfDeletingAGroupWithGrantsOnItIsRefusedWhereItCouldBeSto
 				t.Errorf("DeleteGroup of a group nothing is granted on: %v", err)
 			}
 		})
+	}
+}
+
+// Without Config.ResourceOf, deleting a group with grants on it reads none of its label only where
+// the actor's label values satisfy every label: a value revoked while DeleteGroup asks the
+// constraints whether the actor may manage groups has the deletion tried again under its locks,
+// and refused then, as ChangeMembers taking access away there is.
+func TestALabelValueRevokedWhileDeleteGroupWaitsHasItTriedAgain(t *testing.T) {
+	var meanwhile func(context.Context) error
+	h := grouped(t, withLabels, func(c *rbac.Config) {
+		c.ResourceOf = nil
+		c.Constraints = []rbac.Constraint{{Name: "none", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if do := meanwhile; do != nil && in.Permission == rbac.ManageGroups {
+				meanwhile = nil
+				return false, do(ctx)
+			}
+			return false, nil
+		}}}
+	})
+	ctx := t.Context()
+	ops := rbac.Resource{Tenant: "t1", Type: rbac.GroupScope, ID: "ops"}
+	h.groups(t, "ops")
+	h.seed(t, grant(ops.Scope(), "group.members", rbac.User, "lead"))
+	h.hold(t, "groups", "level:high", "comp:alpha", "comp:bravo", "rel:usa", "rel:gbr", "rel:fra")
+	groups := h.as(t, "groups")
+	meanwhile = func(ctx context.Context) error {
+		_, err := h.pool.Exec(ctx, `DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:groups' AND role = 'rel.fra'`)
+		return err
+	}
+	if err := h.authz.DeleteGroup(ctx, groups, "t1", "ops"); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("deleting a group while a label value of the actor's was revoked: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("the value should have been revoked meanwhile")
+	}
+	if err := h.authz.DeleteGroup(ctx, groups, "t1", "ops"); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("tried again: %v", err)
+	}
+	if !allowed(t, h, h.as(t, "lead"), rbac.GroupMembers, ops) {
+		t.Fatal("the lead should still manage ops's members")
 	}
 }
 

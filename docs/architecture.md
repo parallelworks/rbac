@@ -488,12 +488,14 @@ sequenceDiagram
   `Config.ResourceOf` asked, and then the constraints again about it and the denies on its path, in
   one read with the rest (`reachAuthority`). In its transaction the denies are read again, and a
   type one binding the actor now names that none did refuses the change with `ErrConflict`.
-  `DeleteGroup` reads the group alike: from the host only where a constraint or such a deny may
-  stop it changing grants on groups, so a condition reading the group's attributes reads what the
-  host passes `Apply` there, and without `Config.ResourceOf`, where the group as stored isn't all of
-  it, refused once its transaction finds anything granted on it (`storedWhole`); and where no such
-  deny bound the actor before it, one that does under its locks has it tried again. The host's own
-  writes make no check of an actor, so no freeze stops them.
+  `DeleteGroup` reads the group alike: from the host only where labels are declared, or a
+  constraint or such a deny may stop it changing grants on groups, so a condition reading the
+  group's attributes reads what the host passes `Apply` there, and without `Config.ResourceOf`,
+  where the group as stored isn't all of it, refused once its transaction finds anything granted on
+  it (`storedWhole`), but for a label alone where the actor's label values satisfy every label,
+  which its transaction reads again (`stillClearsAll`); and where no such deny bound the actor
+  before it, one that does under its locks has it tried again. The host's own writes make no check
+  of an actor, so no freeze stops them.
 - **Until when.** What the actor holds only until a time, through an expiring grant, an activation,
   or a membership or place in a group that ends, it hands on only until then: `authorityOn` reads
   when each grant's holding ends, in the statement that reads the grants, and a grant may end no

@@ -364,12 +364,13 @@ scopes conditional ones reach, to check one by one.
   `rbac.ManageGroups` on, and the groups, which `ChangeMembers` checks `rbac.GroupMembers` on and
   `SetGroup` and `DeleteGroup` the label of, each with its constraints and label, and the
   containers, label and attributes of the scopes a group's access is on, and of a group whose own
-  scope `DeleteGroup` revokes grants on where a constraint or a deny binding the actor may stop that;
-  a host without it declares no labels and resource attributes as none, and for access below the
-  tenant, no containers: otherwise a change checked on such a scope as stored is refused, as
-  `DeleteGroup` is once it finds anything granted on the group's own. For a
-  scope the host no longer has, as a resource deleted without `DeleteScopes`, it returns
-  `rbac.ErrNotFound`, or an error wrapping it: a change that only takes access away there, as a
+  scope `DeleteGroup` revokes grants on where a constraint, a deny binding the actor or its label
+  may stop that; a host without it declares no labels and resource attributes as none, and for
+  access below the tenant, no containers: otherwise a change checked on such a scope as stored is
+  refused, as `DeleteGroup` is once it finds anything granted on the group's own. A label can't stop
+  it where the actor's label values satisfy every label. For a scope the host no longer has, as a
+  resource deleted without `DeleteScopes`, it returns `rbac.ErrNotFound`, or an error wrapping it:
+  a change that only takes access away there, as a
   member leaving a group with access on it or the group itself, or joining one a deny there names, a
   place in the group made to end sooner, `DeleteGroup`, or `DeleteRole` deleting, or `SetRole`
   redefining so that no grant of it there widens, nor would once the catalog has it no longer be
@@ -703,7 +704,8 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   `0021_grant_denies` builds an index on `rbac_denies` of the denies that remove a power to change
   grants, which keeps writes to it waiting until it commits, though reads go on. Its predicate calls
   the function `rbac_changes_grants`, which it adds, so every role writing a deny calls it from then
-  on: where new functions give PUBLIC no `EXECUTE`, grant it to the application's role.
+  on, as `ChangeMembers` and `DeleteGroup` do reading the denies: where new functions give PUBLIC no
+  `EXECUTE`, grant it to the application's role.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A call PostgreSQL refuses for a race, as a
   serialization failure, a deadlock between host transactions, or a lock it waited for past the

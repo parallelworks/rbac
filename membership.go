@@ -603,13 +603,14 @@ func upsertGroups(ctx context.Context, tx pgx.Tx, tenant string, actor Principal
 // or grants on it from one, in force: those that have ended give nothing, and go with it. What is
 // granted on the group's own scope goes with it, its grants and eligibilities there revoked, so a
 // constraint or a deny on its path that stops the actor changing grants there stops it, as it
-// would revoking them with Apply, while any is in force. Where one may, it reads the group as
-// ChangeMembers reads a scope it takes access away on: as Config.ResourceOf gives it, so a
-// condition reading the group's attributes reads what the host passes Apply there; and without
-// Config.ResourceOf, as stored, which is all of the group only where the host declares no labels
-// and resource attributes as none, or the deletion is refused while any is in force. Deleting a
-// group that doesn't exist does nothing, and asks Config.ResourceOf and the constraints nothing of
-// it; one the host no longer has (ErrNotFound) it reads as unlabeled, as a removal reads any scope.
+// would revoking them with Apply, while any is in force. Where one may, or its label may refuse the
+// actor, it reads the group as ChangeMembers reads a scope it takes access away on: as
+// Config.ResourceOf gives it, so a condition reading the group's attributes reads what the host
+// passes Apply there; and without Config.ResourceOf, as stored, which is all of the group only
+// where the host declares no labels and resource attributes as none, or the deletion is refused
+// while any is in force. Deleting a group that doesn't exist does nothing, and asks
+// Config.ResourceOf and the constraints nothing of it; one the host no longer has (ErrNotFound) it
+// reads as unlabeled, as a removal reads any scope.
 func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id string) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "DeleteGroup")
@@ -683,10 +684,19 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 	// Without Config.ResourceOf the group is as stored, which isn't all of it where the host
 	// declares labels or resource attributes other than as none: revoking on it is refused then, as
 	// ChangeMembers refuses taking access away there, but only once the transaction finds anything
-	// granted there to revoke.
+	// granted there to revoke. Its label, unread, can refuse the actor too, unless the actor's label
+	// values satisfy every label, which the transaction reads again (cleared).
 	var partial error
-	if stops && existed && a.cfg.ResourceOf == nil {
-		partial = a.storedWhole(revoking.on.Scope())
+	cleared := false
+	if existed && a.cfg.ResourceOf == nil {
+		if !stops && len(a.labels) > 0 {
+			if cleared, err = a.clearsAll(ctx, a.db, labels, values); err != nil {
+				return err
+			}
+		}
+		if stops || len(a.labels) > 0 && !cleared {
+			partial = a.storedWhole(revoking.on.Scope())
+		}
 	}
 	if revoking.frozen && existed && partial == nil {
 		revoking.cs = a.constrain(ctx, actor, revoking.on)
@@ -739,6 +749,11 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 		if scoped {
 			if partial != nil {
 				return ChangeEvent{}, partial
+			}
+			if cleared {
+				if err := a.stillClearsAll(ctx, tx, labels, values); err != nil {
+					return ChangeEvent{}, err
+				}
 			}
 			revoking.seal()
 			_, _, au, err := a.reachAuthority(ctx, tx, actor, []*reachCheck{revoking})
