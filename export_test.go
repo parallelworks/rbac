@@ -257,6 +257,9 @@ func GrantsDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subje
 // StandSQL is the statement a change reads the standing of its principals with.
 var StandSQL = standSQL
 
+// Conflicted is err as an exported call returns it: matching ErrConflict where it holds a race.
+var Conflicted = conflicted
+
 // HoldSQL is the statement Activate holds the places it rests on and reads its subject's paths
 // with: tenant $1, the identity's key $2, now $3, until $4.
 var HoldSQL = holdSQL

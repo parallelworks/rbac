@@ -584,8 +584,8 @@ var (
 	// as one a migration holds past the session's lock_timeout. It is so wherever in the call
 	// PostgreSQL refused it: in a change's transaction or the reads it makes before it, in a read, or
 	// in a statement a hook ran, where the error the hook returns wraps PostgreSQL's, alone or
-	// beside others, as errors.Join holds them. Try it again: under WithTx, the host's whole
-	// transaction, as WithTx says.
+	// beside others, as errors.Join holds them, or holds it as errors.As reads it. Try it again:
+	// under WithTx, the host's whole transaction, as WithTx says.
 	ErrConflict = errors.New("rbac: conflict")
 	// ErrNotFound is what Config.ResourceOf returns, or wraps, for a scope the host no longer has,
 	// as a resource deleted without DeleteScopes: a change that only takes access away there, as
@@ -603,20 +603,40 @@ func conflicted(err error) error {
 	return err
 }
 
-// raced reports whether err, or any error it wraps, is PostgreSQL's refusal for a race. It reads
-// the whole tree, as a hook's error can join another of PostgreSQL's before the race, or wrap both,
-// and errors.As stops at the first.
+// raced reports whether err, or any error it wraps, is PostgreSQL's refusal for a race, as
+// errors.As reads one, through an As method too. It reads the whole tree, as a hook's error can
+// join another of PostgreSQL's before the race, or wrap both, and errors.As stops at the first; but
+// at most maxWrapped of its errors, in errors.As's order, as one a host's type has wrap itself
+// would be read forever.
 func raced(err error) bool {
-	switch e := err.(type) { //nolint:errorlint // each error of the tree is read, not only the first PostgreSQL's
-	case *pgconn.PgError:
-		return e.Code == "40001" || e.Code == "40P01" || e.Code == "55P03"
-	case interface{ Unwrap() error }:
-		return raced(e.Unwrap())
-	case interface{ Unwrap() []error }:
-		return slices.ContainsFunc(e.Unwrap(), raced)
+	next := []error{err}
+	for read := 0; len(next) > 0 && read < maxWrapped; read++ {
+		err, next = next[len(next)-1], next[:len(next)-1]
+		var pg *pgconn.PgError
+		switch e := err.(type) { //nolint:errorlint // each error of the tree is read, not only the first PostgreSQL's
+		case *pgconn.PgError:
+			pg = e
+		case interface{ As(any) bool }:
+			e.As(&pg)
+		}
+		if pg != nil && (pg.Code == "40001" || pg.Code == "40P01" || pg.Code == "55P03") {
+			return true
+		}
+		switch e := err.(type) { //nolint:errorlint // as above
+		case interface{ Unwrap() error }:
+			next = append(next, e.Unwrap())
+		case interface{ Unwrap() []error }:
+			wrapped := e.Unwrap()
+			for i := len(wrapped) - 1; i >= 0; i-- {
+				next = append(next, wrapped[i])
+			}
+		}
 	}
 	return false
 }
+
+// maxWrapped is how many errors of a tree raced reads.
+const maxWrapped = 1000
 
 // conflicting makes *err match ErrConflict as conflicted does, for an exported call to defer, so
 // that wherever in the call PostgreSQL refused it for a race, the host meets one error: not only in
