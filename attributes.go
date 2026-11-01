@@ -400,17 +400,24 @@ func (c *converting) optional(o *types.Optional) ref.Val {
 
 // held is what v, of a type of the host's own CEL reads as one of its own, holds, its Value, read
 // through c: one holding a ref.Val holding no other holds nothing more to read, and one holding any
-// other ref.Val fails, as reading one holding itself would never end.
+// other ref.Val fails, as reading one holding itself would never end. So does one holding a value
+// read as another type than v's: one CEL reads as a double was read as the string, the list or the
+// map it held, so a grant's `request.attributes.risk == "low"` held where CEL finds it unequal.
 func (c *converting) held(v ref.Val) ref.Val {
+	var out ref.Val
 	switch held := v.Value().(type) {
 	case ref.Val:
-		if holdsNone(held) {
-			return held
+		if !holdsNone(held) {
+			return unreadableValue(v)
 		}
-		return unreadableValue(v)
+		out = held
 	default:
-		return c.NativeToValue(held)
+		out = c.NativeToValue(held)
 	}
+	if !types.IsError(out) && out.Type().TypeName() != v.Type().TypeName() {
+		return unreadableValue(v)
+	}
+	return out
 }
 
 // ofCEL reports whether v is of one of CEL's own types, which are of the package celPackage names.

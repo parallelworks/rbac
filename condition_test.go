@@ -211,6 +211,35 @@ type selfDouble struct{ hostDouble }
 
 func (d selfDouble) Value() any { return d }
 
+// holding is a host's own type CEL reads as a double that holds held.
+type holding struct {
+	hostDouble
+	held any
+}
+
+func (h holding) Value() any { return h.held }
+
+// A value of a host's own type CEL reads as one of its own is read as what it holds, and one CEL
+// reads as a double holding a string, a list or a map was read as that, so a grant's
+// `request.attributes.risk == "low"` held, though CEL finds it unequal, and a deny's
+// `request.attributes.risk != "high"` lifted. Each fails what reads it, as one holding no value does.
+func TestAHostsValueHoldingAnotherTypeThanItsOwnFailsItsConditions(t *testing.T) {
+	for _, held := range []any{"low", []any{0.5}, map[string]any{"admin": true}, int64(1), types.String("low")} {
+		for _, expr := range []string{
+			`request.attributes.risk == "low"`, `request.attributes.risk != "high"`, `request.attributes.risk == [0.5]`,
+			`size(request.attributes.risk) == 1`, `request.attributes.risk["admin"] == true`, `request.attributes.risk == 1`,
+			`request.attributes.risk < 2`, `[request.attributes.risk] != []`,
+		} {
+			if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"risk": holding{held: held}}); err != nil || evaluated {
+				t.Errorf("%s of a double holding %#v: evaluated %t, %v", expr, held, evaluated, err)
+			}
+		}
+	}
+	if held, _, _, err := rbac.EvaluateCondition(t, `request.attributes.risk == 0.5`, map[string]any{"risk": holding{held: float32(0.5)}}); err != nil || !held {
+		t.Errorf("a double holding a float32: held %t, %v", held, err)
+	}
+}
+
 // ownList is a host's own list type, which yields what the list it embeds holds.
 type ownList struct{ traits.Lister }
 
