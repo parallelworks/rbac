@@ -66,19 +66,19 @@ import (
 //   - the protobuf well-known types: a Struct, a ListValue, a Value or a NullValue, a wrapper, a
 //     Timestamp, a Duration, and an Any packing one of them but another Any.
 //
-// Anything else fails whatever condition reads it, a test of its presence, has(), included: a
-// ref.Val of the host's own, though it says it is of one of CEL's types, a list, a map or an
-// optional of CEL's a host makes, a struct, a channel, a func, a complex number, a uintptr, any
-// other message, a map keyed by any other value, as a double or an array, a map holding two keys
-// read as the same value, as 1 and 1u, or "a" twice of two string types, invalid JSON, a value
-// nested deeper than JSON text may, 10,000 deep, and a value holding itself. A list or a map
-// holding one reads the rest. A value reached twice, as a map two lists hold, is converted once. A
-// check converts at most maxConverted of what the host passes, counted as reading it costs a
-// condition, one for each value and a tenth of each string's, bytes', JSON number's, JSON text's or
-// packed type URL's length, and half a packed message's, as a packed value takes as few as two
+// Anything else fails whatever condition reads it, a test of its presence, has() or `in` the map
+// holding it, included: a ref.Val of the host's own, though it says it is of one of CEL's types, a
+// list, a map or an optional of CEL's a host makes, a struct, a channel, a func, a complex number,
+// a uintptr, any other message, a map keyed by any other value, as a double or an array, a map
+// holding two keys read as the same value, as 1 and 1u, or "a" twice of two string types, invalid
+// JSON, a value nested deeper than JSON text may, 10,000 deep, and a value holding itself. A list
+// or a map holding one reads the rest. A value reached twice, as a map two lists hold, is converted
+// once. A check converts at most maxConverted of what the host passes, counted as reading it costs
+// a condition, one for each value and a tenth of each string's, bytes', JSON number's, JSON text's
+// or packed type URL's length, and half a packed message's, as a packed value takes as few as two
 // bytes: past that, every condition reading an attribute of any kind fails, and JSON text that may
-// hold more values than are left isn't parsed. A declared attribute is a value of
-// its type as converted, so a named string type is a string.
+// hold more values than are left isn't parsed. A declared attribute is a value of its type as
+// converted, so a named string type is a string.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
@@ -590,7 +590,7 @@ func (c *converter) message(v reflect.Value) ref.Val {
 	return cantRead(v.Type())
 }
 
-// cantRead fails a value of type t, naming no more of the type than its start, as each such value is
+// cantRead fails a value of type t, naming no more of the type than its start: each such value is
 // charged one, whatever its type's name, which a type of many fields spells out whole.
 func cantRead(t reflect.Type) ref.Val { return types.NewErr("rbac: a condition can't read a %.64s", t) }
 

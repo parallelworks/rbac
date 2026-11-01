@@ -913,6 +913,16 @@ func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 			if l, ok := y.(traits.Lister); ok {
 				return contains(l, x)
 			}
+			// A key a map holds a value under that can't be read, as a struct, fails as has() of it does,
+			// though CEL finds it by the key alone: `!("mfa" in request.attributes)` would lift a deny
+			// where the host passes one.
+			if m, ok := y.(traits.Mapper); ok && !refusing(y) {
+				v, found := m.Find(x)
+				if found && types.IsUnknownOrError(v) {
+					return v
+				}
+				return types.Bool(found)
+			}
 			if c, ok := y.(traits.Container); ok {
 				return c.Contains(x)
 			}

@@ -1058,7 +1058,9 @@ func TestAPackedMessagePackingAnotherFails(t *testing.T) {
 // scalar type by its methods, which could disagree with each other, yield themselves, or panic, a
 // list, a map or an optional of CEL's own by the adapter it was made with, which decoded and wrote
 // out what it held on each read, and a message other than those it names by merging it. Each
-// fails whatever reads it, and a list or a map holding one reads the rest.
+// fails whatever reads it, and a list or a map holding one reads the rest, but for whether it holds
+// that one: `in` found it by its key alone, so a deny's `!("v" in request.attributes)` lifted where
+// has() of it failed.
 func TestAValueOutsideWhatAttributesNamesFailsItsConditions(t *testing.T) {
 	registry, err := types.NewRegistry(&descriptorpb.FileDescriptorProto{})
 	if err != nil {
@@ -1096,7 +1098,7 @@ func TestAValueOutsideWhatAttributesNamesFailsItsConditions(t *testing.T) {
 			`request.attributes.v == request.attributes.v`, `request.attributes.v != 1`, `request.attributes.v != "a"`,
 			`request.attributes.v != []`, `request.attributes.v != {}`, `has(request.attributes.v.a)`, `size(request.attributes.v) >= 0`,
 			`string(request.attributes.v) != ""`, `[request.attributes.v] != []`, `"a" in request.attributes.v`,
-			`request.attributes.v.all(x, true)`,
+			`request.attributes.v.all(x, true)`, `"v" in request.attributes`, `!("v" in request.attributes)`,
 		} {
 			if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"v": v}); err != nil || evaluated {
 				t.Errorf("%s of %s: evaluated %t, %v", expr, name, evaluated, err)
@@ -1106,7 +1108,8 @@ func TestAValueOutsideWhatAttributesNamesFailsItsConditions(t *testing.T) {
 	listing := map[string]any{"l": []any{"a", struct{}{}}, "m": map[string]any{"a": "a", "b": make(chan int)}}
 	for expr, holds := range map[string]bool{
 		`size(request.attributes.l) == 2`: true, `request.attributes.l[0] == "a"`: true, `"a" in request.attributes.l`: true,
-		`request.attributes.m.a == "a"`: true, `size(request.attributes.m) == 2`: true,
+		`request.attributes.m.a == "a"`: true, `size(request.attributes.m) == 2`: true, `"a" in request.attributes.m`: true,
+		`"c" in request.attributes.m`: false,
 	} {
 		if held, _, _, err := rbac.EvaluateCondition(t, expr, listing); err != nil || held != holds {
 			t.Errorf("%s: held %t, %v", expr, held, err)
@@ -1114,7 +1117,7 @@ func TestAValueOutsideWhatAttributesNamesFailsItsConditions(t *testing.T) {
 	}
 	for _, expr := range []string{
 		`request.attributes.l[1] != 1`, `!("b" in request.attributes.l)`, `request.attributes.m.b != 1`, `has(request.attributes.m.b)`,
-		`request.attributes.l != ["a", 1]`,
+		`request.attributes.l != ["a", 1]`, `"b" in request.attributes.m`, `!("b" in request.attributes.m)`,
 	} {
 		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, listing); err != nil || evaluated {
 			t.Errorf("%s: evaluated %t, %v", expr, evaluated, err)
