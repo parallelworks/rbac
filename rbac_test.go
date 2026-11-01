@@ -9219,6 +9219,58 @@ func TestARedefinitionTellsApartScopesWhoseDeniesReadAlikeJoined(t *testing.T) {
 	}
 }
 
+// A deny's condition is evaluated within a budget for each scope of the path, so conditions stored
+// past their bound, as before there were bounds, that a container's path can't pay for remove what
+// they would there, as they keep x from granting root on workspace w, while on a container below
+// it, whose longer path pays for them, they hold false. The two read the same grants and denies,
+// but a redefinition decides each by its own budget: widening r, granted on both, to give root is
+// refused on w, as Apply there is.
+func TestARedefinitionDecidesAContainerByItsOwnPathsBudget(t *testing.T) {
+	w := rbac.Resource{Tenant: "t1", Type: "workspace", ID: "w"}
+	// Read before w, so a decision of the scopes alike would be its.
+	below := rbac.Resource{Tenant: "t1", Type: "workspace", ID: "a", Ancestors: []rbac.Scope{w.Scope()}}
+	h, _ := guarded(t, func(cfg *rbac.Config) {
+		resourceOf := cfg.ResourceOf
+		cfg.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			for _, r := range []rbac.Resource{w, below} {
+				if s == r.Scope() {
+					return r, nil
+				}
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	x, r := definer(t, h)
+	y, z := h.as(t, "y"), h.as(t, "z")
+	h.seed(t, grant(rbac.TenantRoot("t1"), "workspace.admin", rbac.User, "x"), grant(below.Scope(), r.ID, rbac.User, "y"), grant(w.Scope(), r.ID, rbac.User, "z"))
+	// Each costs about a fifth of a scope's budget to compile, at 8 a byte, and holds false for x:
+	// eleven are past two scopes' budgets, and within three.
+	for i := range 11 {
+		expr := fmt.Sprintf("subject.id == %q", fmt.Sprint(i, strings.Repeat("q", 2000)))
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions, condition)
+			VALUES ('t1', 'workspace', 'w', $1, '{user:x}', $2, $3)`, fmt.Sprint("d", i), []string{string(root)}, expr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sudo := func(on rbac.Resource, to rbac.Subject) error {
+		return h.authz.Apply(ctx, x, on, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: to.Principal}}})
+	}
+	var denied *rbac.DeniedError
+	if err := sudo(w, z); !errors.As(err, &denied) || denied.Permission != root {
+		t.Fatalf("granting root on w: %v", err)
+	}
+	if err := sudo(below, y); err != nil {
+		t.Fatalf("granting root below w: %v", err)
+	}
+	wider := r
+	wider.Permissions = []rbac.Permission{view, root}
+	in := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c", Ancestors: []rbac.Scope{w.Scope()}}
+	if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.As(err, &denied) || denied.Scope != w.Scope() || allowed(t, h, z, root, in) {
+		t.Fatalf("widening a role to give root past the denies on w: %v", err)
+	}
+}
+
 // What SetRole and DeleteRole checked of the scopes a role is granted on before their transactions
 // they check again under the tenant's lock, so a deny below the tenant set meanwhile stops them.
 func TestADenySetWhileARedefinitionWaitsStopsIt(t *testing.T) {

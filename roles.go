@@ -1347,7 +1347,9 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 // alike is the same for two scopes whose authorities, on and another, remove the same from what the
 // actor hands on: the same grants it holds on their paths, and the same denies, and where one of
 // those has a condition, which can read a resource, the same scope, but on containers, where what
-// the actor hands on reaches resources the condition can't read.
+// the actor hands on reaches resources the condition can't read, as long a path: the denies'
+// conditions are evaluated within a budget for each scope of it (newDenyBudget), so those stored
+// past their bound, as before there were bounds, can fail closed on a shorter path alone.
 func (a *Authorizer) alike(on authority, r Resource) alikeKey {
 	var held, denials strings.Builder
 	for _, h := range on.held {
@@ -1359,7 +1361,11 @@ func (a *Authorizer) alike(on authority, r Resource) alikeKey {
 		conditional = conditional || d.condition != ""
 	}
 	k := alikeKey{held: held.String(), denials: denials.String()}
-	if conditional && !a.contains(r.Type) {
+	switch {
+	case !conditional:
+	case a.contains(r.Type):
+		k.depth = len(r.path())
+	default:
 		k.scope = r.Scope()
 	}
 	return k
@@ -1367,10 +1373,11 @@ func (a *Authorizer) alike(on authority, r Resource) alikeKey {
 
 // alikeKey is what alike tells scopes apart by: the ids of the grants, and the scopes and ids of
 // the denies, each ended by a NUL, which no stored text holds, as a scope's id can hold any other
-// character; and the scope, where a deny's condition can tell it apart.
+// character; and where a deny's condition can tell them apart, the scope, or a container's depth.
 type alikeKey struct {
 	held, denials string
 	scope         Scope
+	depth         int
 }
 
 // labeling is what roleReachOf checked of the labels of the scopes a custom role's grants and

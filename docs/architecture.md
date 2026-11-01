@@ -524,17 +524,20 @@ sequenceDiagram
   give refuse the change, as they would refuse `Apply` granting it there; on the others, only those
   removing its power to change grants there do. Scopes the actor's grants and the denies on their
   paths can't tell apart are decided once (`alike`), told apart by each grant's id and each deny's
-  scope and id, whole: an id holds any text but NUL. A grant to the tenant's members of a privileged
-  role is read there as one to a principal named one by one (`widenedTo.reaches`): a catalog
-  change that has the role no longer be privileged gives them what it gives, what the redefinition
-  added too, and asks no one. A scope read as stored, as the host no longer has it, that the change
-  comes to give more on while it waits refuses it with `ErrConflict`. A role's lists are compared
-  sorted and without repeats (`canonical`), as one written around the package can hold them in any
-  order, so renaming it is no redefinition, and setting a role, deny or eligibility again as it is
-  stored changes nothing (`canonicalSQL`). A role lists in `GrantableRoles` only roles one of its
-  `<type>:grant` permissions, on a type it is for, lets its holders grant (`lets`), so `holdsRole`
-  checks the actor's power to grant each. It keeps a listing that already hands nothing on as
-  stored, as once the role listed was narrowed, so renaming it needs only the power to define it.
+  scope and id, whole: an id holds any text but NUL; and where a deny has a condition, by the
+  resource, or a container's depth, as a deny's condition is evaluated within a budget for each
+  scope of the path, which conditions stored past their bound can spend on a shorter path alone. A
+  grant to the tenant's members of a privileged role is read there as one to a principal named one
+  by one (`widenedTo.reaches`): a catalog change that has the role no longer be privileged gives
+  them what it gives, what the redefinition added too, and asks no one. A scope read as stored, as
+  the host no longer has it, that the change comes to give more on while it waits refuses it with
+  `ErrConflict`. A role's lists are compared sorted and without repeats (`canonical`), as one
+  written around the package can hold them in any order, so renaming it is no redefinition, and
+  setting a role, deny or eligibility again as it is stored changes nothing (`canonicalSQL`). A role
+  lists in `GrantableRoles` only roles one of its `<type>:grant` permissions, on a type it is for,
+  lets its holders grant (`lets`), so `holdsRole` checks the actor's power to grant each. It keeps a
+  listing that already hands nothing on as stored, as once the role listed was narrowed, so renaming
+  it needs only the power to define it.
 - **Eligibilities.** `SetEligibility` lets a principal `Activate` a role for a while, perhaps
   only with approvers or a `requires` condition. An activation is a grant that ends no later than
   its eligibility expires, or its holder's membership or place in the group the eligibility names
