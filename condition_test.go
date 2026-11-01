@@ -1016,6 +1016,33 @@ func TestAMapKeyedByAnInterfaceNestedDeepCostsWhatAnyMapDoes(t *testing.T) {
 	}
 }
 
+// A condition that panics, as one comparing a value of the host's own type whose Equal panics
+// does, was charged what it cost before the call that panicked, which CEL never charges, though the
+// call reads as much as comparing is charged for before it panics: comparing two lists of 4,000
+// strings ending in one cost 6 and took a millisecond. It costs its limit, as one stopped at it does.
+func TestAConditionThatPanicsCostsItsLimit(t *testing.T) {
+	long := make([]any, 4000)
+	for i := range long {
+		long[i] = fmt.Sprint(i)
+	}
+	listed := func() any { return append(append(make([]any, 0, len(long)+1), long...), panicking{}) }
+	limit, actual := rbac.ConditionCost(t, `request.attributes.x == request.attributes.y`, map[string]any{"x": listed(), "y": listed()})
+	if actual < limit {
+		t.Errorf("a condition that panicked cost %d of its limit %d", actual, limit)
+	}
+}
+
+// panicking is a host's own value whose Equal panics.
+type panicking struct{}
+
+func (panicking) ConvertToNative(reflect.Type) (any, error) { return nil, errors.New("panicking") }
+func (panicking) ConvertToType(ref.Type) ref.Val            { return types.NewErr("panicking") }
+func (panicking) Equal(ref.Val) ref.Val                     { panic("panicking") }
+func (panicking) Type() ref.Type                            { return panickingType }
+func (panicking) Value() any                                { return nil }
+
+var panickingType = types.NewOpaqueType("panicking")
+
 // messages is a list of messages of a dynamic type, a ListValue's values, of which the first's
 // struct_value is s.
 func messages(s *dynamicpb.Message) protoreflect.List {

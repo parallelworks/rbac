@@ -1756,6 +1756,14 @@ func evaluate(prg program, vars map[string]any) run {
 	if details != nil && details.ActualCost() != nil {
 		spent = cost.SafeAdd(max(*details.ActualCost(), in.steps), in.keys)
 	}
+	// One that panics, as reading a host's value whose method panics does, costs its limit too: the
+	// call that panicked isn't charged, though it can have read as much as a condition may, as
+	// comparing lists of thousands of values before the one that panics does.
+	var failed *types.Err
+	var cancelled interpreter.EvalCancelledError
+	if err != nil && !errors.As(err, &failed) && !errors.As(err, &cancelled) {
+		spent = prg.limit
+	}
 	if err != nil || spent > prg.limit {
 		return run{cost: min(spent, prg.limit)}
 	}
