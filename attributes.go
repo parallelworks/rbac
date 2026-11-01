@@ -326,8 +326,6 @@ func (c *converting) own(v ref.Val) ref.Val {
 	switch v := v.(type) {
 	case *types.Optional:
 		return c.keep(v, func() ref.Val { return c.optional(v) })
-	case hostList, hostMap:
-		return v
 	case traits.Mapper:
 		return hostMap{v, c}
 	case traits.Lister:
