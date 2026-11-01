@@ -7,6 +7,15 @@ SHELL := /bin/bash
 GOTOOL := go tool -modfile=tools/go.mod
 # Keep local tests in the same mode as CI, even if go.mod's default changes.
 export GODEBUG := fips140=only
+# `make test SHARD=i/n` runs the ith of n shards of the tests that need the database, as CI does,
+# balanced by the times in TIMINGS, a file of `go test -json` output, where it is given.
+# TESTFLAGS adds flags to go test, such as -json or -run.
+ifdef SHARD
+export RBAC_TEST_SHARD := $(SHARD)
+endif
+ifdef TIMINGS
+export RBAC_TEST_TIMINGS := $(abspath $(TIMINGS))
+endif
 
 .PHONY: help
 help: ## Show this help
@@ -29,5 +38,5 @@ vulncheck: ## Check Go dependencies for vulnerabilities
 	$(GOTOOL) govulncheck ./...
 
 .PHONY: test
-test: ## Run the tests with race detection and coverage
-	go test -race -shuffle=on -cover -timeout 30m ./...
+test: ## Run the tests with race detection and coverage; SHARD=i/n runs one shard
+	go test -race -shuffle=on -cover -timeout 30m $(TESTFLAGS) ./...
