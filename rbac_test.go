@@ -4474,6 +4474,48 @@ func TestARefusedGrantProvesNothingForTheNext(t *testing.T) {
 	}
 }
 
+// A refused grant's reason is what was found as it was decided: a later grant in the same change,
+// that a constraint refuses the same permission on another type, doesn't make the earlier refusal
+// the constraint's, as the actor never held it there.
+func TestARefusalNamesOnlyTheConstraintThatRemovedWhatItLacks(t *testing.T) {
+	const constraint = "no root on workspaces"
+	h := setup(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: constraint, Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			return in.Permission == root && in.ResourceType == "workspace", nil
+		}}}
+	})
+	ctx := t.Context()
+	// lead holds root for workspaces alone: custom.c needs it for clusters, custom.w for workspaces.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES
+		('t1', 'custom.hold', '{workspace:view,workspace:grant,cluster:root}', '{workspace}'),
+		('t1', 'custom.c', '{cluster:root}', '{cluster}'),
+		('t1', 'custom.w', '{cluster:root}', '{workspace}')`); err != nil {
+		t.Fatal(err)
+	}
+	lead := h.as(t, "lead")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'workspace', 'w1', 'user', 'lead', 'custom.hold')`); err != nil {
+		t.Fatal(err)
+	}
+	err := h.authz.Apply(ctx, lead, workspace, rbac.Change{Grant: []rbac.Binding{
+		{Role: "custom.c", Principal: identity("p1")}, {Role: "custom.w", Principal: identity("p2")},
+	}})
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		t.Fatalf("want both grants refused, got %v", err)
+	}
+	var refused []string
+	for _, e := range joined.Unwrap() {
+		var denied *rbac.DeniedError
+		if errors.As(e, &denied) {
+			refused = append(refused, denied.Reason)
+		}
+	}
+	if len(refused) != 2 || strings.Contains(refused[0], constraint) || !strings.Contains(refused[1], constraint) {
+		t.Fatalf("granting custom.c, needing root on clusters lead never held, then custom.w, needing it on workspaces %s removes: %q", constraint, refused)
+	}
+}
+
 // Grantable and Apply read what the actor holds for each permission and type once, whatever the
 // number of roles they decide that give it, and a role it holds giving many permissions once too,
 // rather than for each role, permission and type.

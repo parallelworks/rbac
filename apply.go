@@ -1109,7 +1109,12 @@ func (c *constrained) removedBy(p Permission) string {
 
 // refusal is why the actor can't do what, lacking p: the constraint that removed p, or otherwise.
 func (c *constrained) refusal(what string, p Permission, otherwise string) string {
-	if name := c.removedBy(p); name != "" {
+	return refusalBy(c.removedBy(p), what, p, otherwise)
+}
+
+// refusalBy is refusal where the constraint name removed p, or none did where it is empty.
+func refusalBy(name, what string, p Permission, otherwise string) string {
+	if name != "" {
 		return fmt.Sprintf("the actor can't %s while %s removes %s from it", what, name, p)
 	}
 	return otherwise
@@ -1669,10 +1674,12 @@ type grantAsked struct {
 }
 
 // grantDecided is what mayGrant decided of a grantAsked: whether the actor may grant it, and if
-// not, a permission it lacks.
+// not, a permission it lacks, and the constraint that removed it then, if one did: a later grant's
+// decision can find one removing it on another type, which this refusal doesn't rest on.
 type grantDecided struct {
 	lacks Permission
 	ok    bool
+	by    string
 }
 
 // mayChangeBy checks the actor's own access on the scope against the change, by au, its authority
@@ -1696,7 +1703,7 @@ func (a *Authorizer) mayChangeBy(au authority, on Resource, grants, revokes []Bi
 	for i, d := range a.grantsDecided(au, pw, scope.Type, grants) {
 		if p := d.lacks; !d.ok {
 			b := grants[i]
-			reason := cs.refusal("grant "+string(b.Role), p, fmt.Sprintf("the actor can't grant %s without holding %s here", b.Role, p))
+			reason := refusalBy(d.by, "grant "+string(b.Role), p, fmt.Sprintf("the actor can't grant %s without holding %s here", b.Role, p))
 			switch {
 			case !pw.any && len(pw.listed[b.Role]) > 0:
 				reason = fmt.Sprintf("the actor may grant %s here only under the condition of a grant that lists it", b.Role)
@@ -1738,6 +1745,7 @@ func (a *Authorizer) grantsDecided(au authority, pw power, scopeType string, gra
 			mark := proven.mark()
 			if d.lacks, d.ok = a.mayGrant(au, pw, scopeType, def, condition, until, proven); !d.ok {
 				proven.drop(mark)
+				d.by = au.constrained.removedBy(d.lacks)
 			}
 			decisions[k] = d
 		}
