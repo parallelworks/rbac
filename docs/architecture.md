@@ -636,17 +636,19 @@ flowchart TB
   migration gives way, the next try first takes each such table's `SHARE UPDATE EXCLUSIVE` lock,
   waiting a second past `deadlock_timeout` (`outwaitVacuum`, from `pg_locks` and the vacuum and
   analysis progress views, which any role reads), and then the migration's own. That lock conflicts
-  with none a check, list or change takes, so none waits behind it while the migration holds none
-  of its own; where the wait ends, as for a vacuum to prevent wraparound, which PostgreSQL never
-  cancels, the try rolls back to a savepoint and goes on without it. A wait for another replica's
-  migration is bounded by the session's `lock_timeout` alone, and not tried again. On a host's
-  transaction `Migrate` applies them all in one savepoint, with neither the bound nor the tries, as
-  rolling back to the savepoint frees nothing the host took before.
+  with none a check, list or change takes, so none waits behind it while the migration holds none of
+  its own. Each table is locked in a savepoint of its own: where its wait ends, as for a vacuum to
+  prevent wraparound, which PostgreSQL never cancels, the try rolls back to that savepoint and goes
+  on without that table's lock, to the next table's wait, and each try after waits so again, some 20
+  seconds more over the 10 tries for each such table with the default `deadlock_timeout`. A wait for
+  another replica's migration is bounded by the session's `lock_timeout` alone, and not tried again.
+  On a host's transaction `Migrate` applies them all in one savepoint, with neither the bound nor
+  the tries, as rolling back to the savepoint frees nothing the host took before.
 
 ```mermaid
 flowchart TB
     start(["Migrate on a pool or a connection"]) --> tx["migrateOnce: a transaction of its own,<br/>the schema's advisory lock, lock_timeout 100 ms"]
-    tx -->|"the last try gave way"| vac["outwaitVacuum: SHARE UPDATE EXCLUSIVE on each<br/>table an autovacuum worker holds, waiting a second<br/>past deadlock_timeout, or none where that ends"]
+    tx -->|"the last try gave way"| vac["outwaitVacuum: SHARE UPDATE EXCLUSIVE on each<br/>table an autovacuum worker holds, waiting a second<br/>past deadlock_timeout, without each whose wait ends"]
     tx --> one["The first pending migration,<br/>recorded in rbac_migrations"]
     vac --> one
     one -->|"commits, more pending"| tx

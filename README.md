@@ -503,34 +503,35 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   migration locks them would otherwise deadlock with it, as no order suits every change
   (`ChangeMembers` reads eligibilities and denies before custom roles, `DeleteRole` custom roles
   before eligibilities), and a transaction holding a table for long would stall them all. It then
-  rolls it back and tries it again, waiting longer each time, up to 10 times over about 20
-  seconds, and then fails as `rbac.ErrConflict`: migrate again once what held the table, as a long
-  export or host transaction, has ended. A wait that short ends before PostgreSQL's deadlock check,
-  which runs once a wait passes `deadlock_timeout` and alone cancels an autovacuum worker holding
-  the table, as one vacuuming a large history can for minutes: where one holds a table of the
-  package's as a migration gives way, the next try first takes that table's `SHARE UPDATE
-  EXCLUSIVE` lock, waiting a second past `deadlock_timeout` whatever the session's `lock_timeout`,
-  so PostgreSQL cancels the worker, and only then the migration's own locks. No check, list or
-  change takes a lock that one conflicts with, so none waits behind it, and none of the
-  migration's is held yet. A worker on a table the migration doesn't lock is canceled too; one
-  vacuuming to prevent wraparound, which PostgreSQL never cancels, holds the table until it ends,
-  and the try goes on without that lock once the wait ends. A role without `pg_read_all_stats`
-  can't read other sessions' backend types, so it can't tell autovacuum's vacuums and analyses
-  from a client's, and a client's `VACUUM` of a table has it wait so too. A transaction waiting for
-  a lock a migration holds, which holds one the migration then waits for, is still ended as a
-  deadlock where its `deadlock_timeout`, 1 second by default, passes before the migration's wait
-  does, and a change ended so is refused as `rbac.ErrConflict`. A tool of the host's own gets none
-  of this: apply each migration in a transaction of its own with a short `lock_timeout`, on
-  SQLSTATE 55P03 or 40P01 roll it back and apply it again, and where an autovacuum worker holds one
-  of the package's tables as it gives way, first lock that table `IN SHARE UPDATE EXCLUSIVE MODE`
-  with a `lock_timeout` past `deadlock_timeout`, before the migration's own locks. Nor does
-  `Migrate` on a host's transaction, as rolling
-  back to its savepoint frees nothing the host's transaction took before, which what the migration
-  waits for can be waiting for in turn, as a request that read the package's tables and then reads
-  a table of the host's that transaction altered: it waits as that transaction's `lock_timeout`
-  says, for PostgreSQL to end such a wait as a deadlock. On any connection, it waits for another
-  replica's migration as long as the session's `lock_timeout` lets it, and where that ends the wait
-  fails as `rbac.ErrConflict` without trying again.
+  rolls it back and tries it again, waiting longer each time, up to 10 times over about 20 seconds,
+  and then fails as `rbac.ErrConflict`: migrate again once what held the table, as a long export or
+  host transaction, has ended. A wait that short ends before PostgreSQL's deadlock check, which runs
+  once a wait passes `deadlock_timeout` and alone cancels an autovacuum worker holding the table, as
+  one vacuuming a large history can for minutes: where one holds a table of the package's as a
+  migration gives way, the next try first takes that table's `SHARE UPDATE EXCLUSIVE` lock, waiting
+  a second past `deadlock_timeout` whatever the session's `lock_timeout`, so PostgreSQL cancels the
+  worker, and only then the migration's own locks. No check, list or change takes a lock that one
+  conflicts with, so none waits behind it, and none of the migration's is held yet. A worker on a
+  table the migration doesn't lock is canceled too; one vacuuming to prevent wraparound, which
+  PostgreSQL never cancels, holds the table until it ends, and the try goes on without that table's
+  lock once the wait ends, to the other tables' waits and then the migration, and each try after
+  waits so again: some 20 seconds more over the 10 tries for each such table, with the default
+  `deadlock_timeout`. A role without `pg_read_all_stats` can't read other sessions' backend types,
+  so it can't tell autovacuum's vacuums and analyses from a client's, and a client's `VACUUM` of a
+  table has it wait so too. A transaction waiting for a lock a migration holds, which holds one the
+  migration then waits for, is still ended as a deadlock where its `deadlock_timeout`, 1 second by
+  default, passes before the migration's wait does, and a change ended so is refused as
+  `rbac.ErrConflict`. A tool of the host's own gets none of this: apply each migration in a
+  transaction of its own with a short `lock_timeout`, on SQLSTATE 55P03 or 40P01 roll it back and
+  apply it again, and where an autovacuum worker holds one of the package's tables as it gives way,
+  first lock that table `IN SHARE UPDATE EXCLUSIVE MODE` with a `lock_timeout` past
+  `deadlock_timeout`, and then apply the migration with the short one. Nor does `Migrate` on a
+  host's transaction, as rolling back to its savepoint frees nothing the host's transaction took
+  before, which what the migration waits for can be waiting for in turn, as a request that read the
+  package's tables and then reads a table of the host's that transaction altered: it waits as that
+  transaction's `lock_timeout` says, for PostgreSQL to end such a wait as a deadlock. On any
+  connection, it waits for another replica's migration as long as the session's `lock_timeout` lets
+  it, and where that ends the wait fails as `rbac.ErrConflict` without trying again.
   A migration that rebuilds an index, as `0009_grant_seeks` rebuilds two of `rbac_grants`, locks
   the table until it commits, so checks, lists and changes wait for the rebuild; one that builds
   an index, as `0011_tenant_keys` builds three on `rbac_eligibilities` and `rbac_denies`, keeps
