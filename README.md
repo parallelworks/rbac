@@ -130,7 +130,17 @@ scopes conditional ones reach, to check one by one.
   of what was added. A deny where the tenant's members hold a privileged role still stops widening
   it, as a catalog change that has the role no longer be privileged gives them what it gives then,
   and asks no one. Renaming a role or rewriting its description changes no grant, so needs only the
-  power to define it.
+  power to define it, however its lists are stored: a role, deny or eligibility is the same in any
+  order of its lists, and however often one names an entry, as one written around the package, by a
+  seed or a restore, can hold them, so setting it again as it is read changes nothing. A role lists
+  in `GrantableRoles` only roles that a `<type>:grant` it gives, on a type it is for, lets its
+  holders grant, as roles that can be granted on that type, or it is refused as invalid: a listing
+  none of them reaches would hand nothing on, and the actor's power to grant the role would go
+  unchecked. One the role already lists so as it is stored, as once the role listed is narrowed or
+  the catalog changes, it keeps, so renaming it still needs only the power to define it; one a
+  change adds, or leaves handing nothing on by changing the role, is refused, and dropping one needs
+  no power over the role listed. A listing, handing anything on or not, keeps the role listed from
+  being deleted.
   `DeleteRole` removes one with its grants; `Roles` lists the built-in and custom roles a scope type
   takes. Custom roles follow the catalog: one gives only what the catalog still has, and is
   privileged when it gives what only privileged roles do, or changes access.
@@ -512,8 +522,9 @@ after it. Keep each read short, as an access review of many subjects reads them 
 not one. Without views, so that the transaction could be read only, every statement would name
 history in place of each table, and a hook's query through the `DB` it is given would read the
 tables as they are now. `AsOf` takes a time from 4714 BC, the earliest PostgreSQL holds, to
-9999-12-30, the last the package stores: pgx sends a time as 64 bits of microseconds from 2000,
-which a time past year 294,000 or so wraps, so the database would read it as another, or refuse it.
+9999-12-30, the last the package stores, each to the microsecond, rounded down, as pgx sends it:
+in 64 bits of microseconds from 2000, which a time past year 294,000 or so wraps, so the database
+would read it as another, or refuse it.
 A statement reads the history of the rows it names, as a check
 does its subject's grants, groups and the denies on its resource's path, a search its subject's
 grants, and the public's and the members' it counts, on each type it lists, and the custom roles
@@ -712,7 +723,8 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   session's `lock_timeout`, matches `rbac.ErrConflict`, still wrapping PostgreSQL's error, as does a
   change refused because what it rests on changed while it waited: try it again. It does wherever in
   the call PostgreSQL refused it: in a change's transaction or the reads it makes before it, in a
-  read, or in a statement a hook ran, where the hook's error wraps PostgreSQL's. Under `WithTx`,
+  read, or in a statement a hook ran, where the hook's error wraps PostgreSQL's, alone or beside
+  other errors, as `errors.Join` holds them, or holds it as `errors.As` reads it. Under `WithTx`,
   roll the host's transaction back and run it again from its start, not the call alone in it: a
   statement refused on that transaction itself, as most reads', a hook's or one a change makes
   before its savepoint, aborts it, and one refused in a savepoint, as a change's, `AsOf`'s or

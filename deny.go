@@ -295,8 +295,8 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 			  principals = EXCLUDED.principals, exempt = EXCLUDED.exempt, permissions = EXCLUDED.permissions,
 			  condition_title = EXCLUDED.condition_title, condition_description = EXCLUDED.condition_description,
 			  condition = EXCLUDED.condition, updated_by = EXCLUDED.updated_by, updated_at = now()
-			WHERE (rbac_denies.name, rbac_denies.principals, rbac_denies.exempt, rbac_denies.permissions,
-			  rbac_denies.condition_title, rbac_denies.condition_description, rbac_denies.condition)
+			WHERE (rbac_denies.name, `+canonicalSQL("rbac_denies.principals")+`, `+canonicalSQL("rbac_denies.exempt")+`,
+			  `+canonicalSQL("rbac_denies.permissions")+`, rbac_denies.condition_title, rbac_denies.condition_description, rbac_denies.condition)
 			  IS DISTINCT FROM (EXCLUDED.name, EXCLUDED.principals, EXCLUDED.exempt, EXCLUDED.permissions,
 			  EXCLUDED.condition_title, EXCLUDED.condition_description, EXCLUDED.condition)
 			RETURNING `+denyColumns,
