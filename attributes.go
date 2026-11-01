@@ -197,6 +197,17 @@ var byteType = reflect.TypeFor[byte]()
 
 func (c *converting) NativeToValue(v any) ref.Val {
 	switch v := v.(type) {
+	// What hosts pass most, read first, as CEL's adapter reads them.
+	case string:
+		return types.String(v)
+	case bool:
+		return types.Bool(v)
+	case int:
+		return types.Int(v)
+	case int64:
+		return types.Int(v)
+	case float64:
+		return types.Double(v)
 	case ref.Val:
 		return c.own(v)
 	case map[string]any:

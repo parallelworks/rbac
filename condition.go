@@ -1826,6 +1826,9 @@ func valueResource(tenant string) map[string]any {
 }
 
 // unreadable are attributes a condition reads none of.
+// noAttributes are a kind's attributes where it has none, which every check can share.
+var noAttributes = types.NewStringInterfaceMap(types.DefaultTypeAdapter, map[string]any{})
+
 var unreadable = refusedAttributes{Mapper: types.NewStringInterfaceMap(types.DefaultTypeAdapter, map[string]any{}), all: true}
 
 // declared is attributes as conditions read them, through c: each one as declares it, passed as
@@ -1836,7 +1839,9 @@ var unreadable = refusedAttributes{Mapper: types.NewStringInterfaceMap(types.Def
 // not the host's map: CEL reads a field of a map of the host's map by indexing it, and converts
 // only what it finds, as its own adapter does, so a value it holds would be read past c.
 func declared(c *converting, declares map[string]AttributeType, attributes map[string]any) any {
-	attributes = orEmpty(attributes)
+	if len(attributes) == 0 {
+		return noAttributes
+	}
 	if declares == nil {
 		return types.NewStringInterfaceMap(c, attributes)
 	}
@@ -1897,10 +1902,3 @@ func refusing(v ref.Val) bool {
 
 // refusal is a new error each time, as CEL labels an error with the node it was raised at.
 func refusal() ref.Val { return types.NewErr("rbac: the attributes hold one refused") }
-
-func orEmpty(m map[string]any) map[string]any {
-	if m == nil {
-		return map[string]any{}
-	}
-	return m
-}
