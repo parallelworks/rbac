@@ -700,7 +700,7 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   give way. Only prunes have entries. Without it, `History` read every prune recorded since a cursor
   that fell behind, or since an export catching up from the start began, from history's rows, twice
   in each call and once in each window of a prune: a read of one record from such a cursor took
-  1.2 ms with no prune since, 14 ms with 20,000 and 78 ms with 80,000, and with it 1.2 ms with any.
+  1.3 ms with no prune since, 14 ms with 20,000 and 78 ms with 80,000, and with it 1.2 ms with any.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A call PostgreSQL refuses for a race, as a
   serialization failure, a deadlock between host transactions, or a lock it waited for past the

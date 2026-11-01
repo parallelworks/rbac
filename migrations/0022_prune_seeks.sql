@@ -11,7 +11,9 @@
 -- among the index's own entries. Only prunes have entries, so other writes pay nothing for it.
 --
 -- Building it reads all of history, and keeps every change waiting until migrating commits, as each
--- writes history; reads of history go on.
+-- writes history; reads of history go on. It fails on a prune's record whose last record or cursor
+-- holds a txid or id that isn't one, which only history's owner could have written, by hand; once
+-- it is built, history refuses such a record as it is written.
 CREATE INDEX rbac_history_prune_lasts ON rbac_history (
     ((coalesce(after->'last', after->'through')->>'txid')::pg_catalog.xid8),
     ((coalesce(after->'last', after->'through')->>'id')::bigint),

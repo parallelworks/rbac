@@ -810,12 +810,12 @@ flowchart LR
   through its cursor as it caught up from the start or fell behind, each of which, found by where
   it was recorded, was read from history's rows. An export from the start also passes over, among
   the index's entries, the prunes from before it began that reached past its cursor, until it reads
-  past them; where those since it began are fewer, the planner reads those by transaction
-  (`rbac_history_prunes`) instead. A delete from history, which only a role with the rights of
-  history's owner gets past the append-only trigger, is refused as its transaction commits
-  (`rbac_history_pruned`) unless a prune that transaction records reaches the record, by the last
-  it deleted or, for a prune recorded before 0020, the cursor it went through, and the record is of
-  an earlier transaction.
+  past them; where those since it began are fewer, a statement planned for its cursor reads those
+  by transaction (`rbac_history_prunes`) instead. A delete from history, which only a role with the
+  rights of history's owner gets past the append-only trigger, is refused as its transaction
+  commits (`rbac_history_pruned`) unless a prune that transaction records reaches the record, by the
+  last it deleted or, for a prune recorded before 0020, the cursor it went through, and the record
+  is of an earlier transaction.
 - **The export chain.** `Export` hashes each record onto the last checkpoint with SHA-256 and signs
   the checkpoint with the host's `crypto.Signer`: ECDSA on P-256, P-384 or P-521, Ed25519, or RSA
   of at least 3072 bits, each verified with the Go standard library. `VerifyChain` checks a run of

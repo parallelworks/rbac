@@ -159,14 +159,14 @@ func followable(ctx context.Context, tx pgx.Tx, schema string, after Cursor) (ge
 // a record is.
 func (c Cursor) following() bool { return c.TxID != 0 || c.ID != 0 }
 
-// prunesFrom is the first transaction whose prunes can have deleted, after c, records its export
-// could have read. A prune deletes only records of transactions before its own, as
-// rbac_history_pruned holds it to, so none of c's transaction or an earlier one deleted any after c;
-// and one of a transaction before its export's Horizon had ended before the export began, which read
-// none of what it deleted. By transaction alone, as rbac_history_pruned lets a delete through for any
-// prune its transaction records, whatever the record's id, which history's owner can choose: by where
-// a prune is recorded, one numbered 0 or below in the Horizon's transaction would come before the
-// Horizon's first record, and a delete it let through would be read past.
+// prunesFrom is the transaction from which on History counts the prunes that can have deleted, after
+// c, records its export could have read. A prune deletes only records of transactions before its
+// own, as rbac_history_pruned holds it to, so none of c's transaction or an earlier one deleted any
+// after c; and one of a transaction before its export's Horizon had ended before the export began,
+// which read none of what it deleted. By transaction alone, as rbac_history_pruned lets a delete
+// through for any prune its transaction records, whatever the record's id, which history's owner can
+// choose: by where a prune is recorded, one numbered 0 or below in the Horizon's transaction would
+// come before the Horizon's first record, and a delete it let through would be read past.
 func (c Cursor) prunesFrom() uint64 { return max(c.Horizon, c.TxID) }
 
 // pruneLastTxid and pruneLastID are SQL for the last record a prune, g, deleted, by its txid and id,
@@ -187,8 +187,9 @@ const (
 // that fell behind, or since an export catching up from the start began, would be read from
 // history's rows, though each through the cursor of the export furthest behind reaches past none.
 // For an export from the start, the prunes before it began that reached past its cursor are in that
-// index too, until it reads past them, and while those since it began are fewer, the planner finds
-// them by history's index of prunes by transaction (rbac_history_prunes) instead.
+// index too, until it reads past them, and while those since it began are fewer, a statement planned
+// for its cursor finds them by history's index of prunes by transaction (rbac_history_prunes)
+// instead.
 //
 // The first in that index's order, rather than EXISTS: the planner has no statistics of a partial
 // index's expressions, so it counts a third of the prunes as reaching past any cursor, and would
