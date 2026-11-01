@@ -7695,58 +7695,77 @@ func TestADenyWhereTheMembersHoldAPrivilegedRoleStopsWideningIt(t *testing.T) {
 
 // A scope the host no longer has is read as stored, before the transaction, only where the change
 // gives nothing more: where a role listing the role is granted there while the change waits, its
-// holders may hand the role on there as it will be, so the change is refused under the tenant's
-// lock, to be tried again, and trying again fails with the host's error.
+// holders may hand the role on there as it will be, and where the tenant's members are granted it
+// there, as a host whose catalog has it not be privileged may, a catalog change that has it no
+// longer be gives them what it will give, so the change is refused under the tenant's lock, to be
+// tried again, and trying again fails with the host's error.
 func TestAScopeTheHostNoLongerHasThatARedefinitionComesToReachRefusesIt(t *testing.T) {
 	gone := rbac.Scope{Type: "cluster", ID: "gone"}
-	var meanwhile func(context.Context) error
-	h, guardian := guarded(t, func(c *rbac.Config) {
-		resourceOf := c.ResourceOf
-		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
-			if s == gone {
-				return rbac.Resource{}, fmt.Errorf("%w: %s", rbac.ErrNotFound, s.Key())
-			}
-			return resourceOf(ctx, tenant, s)
-		}
-		validate := c.ValidateGrant
-		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
-			if do := meanwhile; do != nil && in.Via == rbac.ViaRedefinition {
-				meanwhile = nil
-				if err := do(ctx); err != nil {
-					return err
+	for _, tc := range []struct {
+		name string
+		// permissions are what custom.op gives, and wider what it is redefined to give.
+		permissions string
+		wider       []rbac.Permission
+		// meanwhile is the grant made while the change waits.
+		meanwhile string
+	}{
+		{"a role listing it is granted there", "{cluster:view}", []rbac.Permission{view, login}, `('t1', 'cluster', 'gone', 'user', 'z', 'custom.lister')`},
+		// It gives root, so is privileged, and a grant of it to the members gives them nothing.
+		{"the members are granted it there", "{cluster:view,cluster:root}", []rbac.Permission{view, login, root}, `('t1', 'cluster', 'gone', 'members', 't1', 'custom.op')`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var meanwhile func(context.Context) error
+			h, guardian := guarded(t, func(c *rbac.Config) {
+				resourceOf := c.ResourceOf
+				c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+					if s == gone {
+						return rbac.Resource{}, fmt.Errorf("%w: %s", rbac.ErrNotFound, s.Key())
+					}
+					return resourceOf(ctx, tenant, s)
 				}
+				validate := c.ValidateGrant
+				c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+					if do := meanwhile; do != nil && in.Via == rbac.ViaRedefinition {
+						meanwhile = nil
+						if err := do(ctx); err != nil {
+							return err
+						}
+					}
+					return validate(ctx, q, in)
+				}
+			})
+			ctx := t.Context()
+			x, _ := definer(t, h)
+			// custom.op isn't Public, so its grant to the public on gone gives nothing, before or after;
+			// custom.lister lets its holders grant it, and is granted nowhere yet.
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles) VALUES
+				('t1', 'custom.op', $1, '{cluster}', '{}'), ('t1', 'custom.lister', '{cluster:grant,cluster:view}', '{cluster}', '{custom.op}')`, tc.permissions); err != nil {
+				t.Fatal(err)
 			}
-			return validate(ctx, q, in)
-		}
-	})
-	ctx := t.Context()
-	x, _ := definer(t, h)
-	// custom.op isn't Public, so its grant to the public on gone gives nothing, before or after;
-	// custom.lister lets its holders grant it, and is granted nowhere yet.
-	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles) VALUES
-		('t1', 'custom.op', '{cluster:view}', '{cluster}', '{}'), ('t1', 'custom.lister', '{cluster:grant,cluster:view}', '{cluster}', '{custom.op}');
-		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES
-		  ('t1', 'cluster', 'gone', 'public', '', 'custom.op'), ('t1', 'cluster', 'c2', 'user', 'y', 'custom.op')`); err != nil {
-		t.Fatal(err)
-	}
-	// A deny elsewhere binds x, so the scopes are read before the transaction.
-	elsewhere := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c3"}
-	if err := h.authz.SetDeny(ctx, guardian, elsewhere, rbac.Deny{ID: "no-root", Permissions: []rbac.Permission{root}, Principals: []rbac.Principal{x.Principal}}); err != nil {
-		t.Fatal(err)
-	}
-	meanwhile = func(ctx context.Context) error {
-		_, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'cluster', 'gone', 'user', 'z', 'custom.lister')`)
-		return err
-	}
-	wider := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
-	if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.Is(err, rbac.ErrConflict) {
-		t.Fatalf("widening a role a role listing it was granted on, on a scope the host no longer has, while it waited: %v", err)
-	}
-	if meanwhile != nil {
-		t.Fatal("the role listing it should have been granted meanwhile")
-	}
-	if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.Is(err, rbac.ErrNotFound) {
-		t.Fatalf("trying again: %v", err)
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES
+				('t1', 'cluster', 'gone', 'public', '', 'custom.op'), ('t1', 'cluster', 'c2', 'user', 'y', 'custom.op')`); err != nil {
+				t.Fatal(err)
+			}
+			// A deny elsewhere binds x, so the scopes are read before the transaction.
+			elsewhere := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c3"}
+			if err := h.authz.SetDeny(ctx, guardian, elsewhere, rbac.Deny{ID: "no-root", Permissions: []rbac.Permission{root}, Principals: []rbac.Principal{x.Principal}}); err != nil {
+				t.Fatal(err)
+			}
+			meanwhile = func(ctx context.Context) error {
+				_, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES `+tc.meanwhile)
+				return err
+			}
+			wider := rbac.RoleDefinition{ID: "custom.op", Permissions: tc.wider, ResourceTypes: []string{"cluster"}}
+			if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.Is(err, rbac.ErrConflict) {
+				t.Fatalf("widening a role granted on a scope the host no longer has, where %s while it waits: %v", tc.name, err)
+			}
+			if meanwhile != nil {
+				t.Fatal("the grant should have been made meanwhile")
+			}
+			if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.Is(err, rbac.ErrNotFound) {
+				t.Fatalf("trying again: %v", err)
+			}
+		})
 	}
 }
 
