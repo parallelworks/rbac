@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/rbac"
 )
@@ -534,62 +535,75 @@ func TestFilterKeepsWhatTheLabelAllows(t *testing.T) {
 // dimensions declare, in a custom plan and a generic one: 20,000 rows of two values each are listed
 // about as fast where their dimension declares 5,000 values as where it declares 10. An array's
 // containment and overlap compared each with every value declared, which took over a hundred times
-// as long, and `= ANY` hashes no array a generic plan holds.
+// as long, and `= ANY` hashes no array a generic plan holds. The cost is spent inside one call for
+// each row, which no plan's counts of rows, loops or buffers show, so the two are timed: in turn,
+// the fastest of several runs of each, so what slows the database slows both.
 func TestFilterCostsALabeledRowItsOwnValuesInEveryPlan(t *testing.T) {
-	modes := []string{"force_custom_plan", "force_generic_plan"}
-	took := map[string]time.Duration{}
-	for _, n := range []int{10, 5000} {
-		t.Run(fmt.Sprint(n), func(t *testing.T) {
-			var values []string
-			for i := range n {
-				values = append(values, fmt.Sprintf("v%04d", i))
-			}
-			h := setup(t, func(c *rbac.Config) {
-				c.Labels = []rbac.LabelDimension{{Name: "proj", Rule: rbac.AnyOf, Values: values}}
-				c.Catalog = append(slices.Clone(c.Catalog), rbac.RoleDefinition{ID: "proj.one", Permissions: []rbac.Permission{"proj:v0000"}, ResourceTypes: []string{rbac.TenantScope}})
-			})
-			ctx := t.Context()
-			u := h.as(t, "u")
-			h.seed(t, grant(rbac.TenantRoot("t1"), "proj.one", rbac.User, "u"), grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "u"))
-			for _, q := range []string{
-				`CREATE TABLE points (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL, labels text[] NOT NULL)`,
-				`INSERT INTO points SELECT 't1', 'c' || i, ARRAY['cluster:c' || i, 'tenant:t1'],
-					ARRAY['proj:v' || lpad(((i * 7) % ` + fmt.Sprint(n) + `)::text, 4, '0'), 'proj:v' || lpad(((i * 13) % ` + fmt.Sprint(n) + `)::text, 4, '0')]
-					FROM generate_series(1, 20000) AS i`,
-				`ANALYZE points`,
-			} {
-				if _, err := h.pool.Exec(ctx, q); err != nil {
-					t.Fatal(err)
-				}
-			}
-			pred, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1)
-			if err != nil {
-				t.Fatal(err)
-			}
-			tx, err := h.pool.Begin(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer func() { _ = tx.Rollback(ctx) }()
-			for _, mode := range modes {
-				if _, err := tx.Exec(ctx, `SELECT set_config('plan_cache_mode', $1, true)`, mode); err != nil {
-					t.Fatal(err)
-				}
-				for range 3 {
-					start := time.Now()
-					var kept int
-					if err := tx.QueryRow(ctx, `SELECT count(*) FROM points WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil {
-						t.Fatal(err)
-					}
-					if d, key := time.Since(start), fmt.Sprint(mode, n); took[key] == 0 || d < took[key] {
-						took[key] = d
-					}
-				}
-			}
+	sizes := []int{10, 5000}
+	pools, preds := map[int]*pgxpool.Pool{}, map[int]rbac.Predicate{}
+	for _, n := range sizes {
+		var values []string
+		for i := range n {
+			values = append(values, fmt.Sprintf("v%04d", i))
+		}
+		h := setup(t, func(c *rbac.Config) {
+			c.Labels = []rbac.LabelDimension{{Name: "proj", Rule: rbac.AnyOf, Values: values}}
+			c.Catalog = append(slices.Clone(c.Catalog), rbac.RoleDefinition{ID: "proj.one", Permissions: []rbac.Permission{"proj:v0000"}, ResourceTypes: []string{rbac.TenantScope}})
 		})
+		ctx := t.Context()
+		u := h.as(t, "u")
+		h.seed(t, grant(rbac.TenantRoot("t1"), "proj.one", rbac.User, "u"), grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "u"))
+		for _, q := range []string{
+			`CREATE TABLE points (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL, labels text[] NOT NULL)`,
+			`INSERT INTO points SELECT 't1', 'c' || i, ARRAY['cluster:c' || i, 'tenant:t1'],
+				ARRAY['proj:v' || lpad(((i * 7) % ` + fmt.Sprint(n) + `)::text, 4, '0'), 'proj:v' || lpad(((i * 13) % ` + fmt.Sprint(n) + `)::text, 4, '0')]
+				FROM generate_series(1, 20000) AS i`,
+			`ANALYZE points`,
+		} {
+			if _, err := h.pool.Exec(ctx, q); err != nil {
+				t.Fatal(err)
+			}
+		}
+		pred, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pools[n], preds[n] = h.pool, pred
 	}
-	for _, mode := range modes {
-		if few, many := took[fmt.Sprint(mode, 10)], took[fmt.Sprint(mode, 5000)]; many > 20*few {
+	ctx := t.Context()
+	txs := map[int]pgx.Tx{}
+	defer func() {
+		for _, tx := range txs {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	for _, n := range sizes {
+		tx, err := pools[n].Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		txs[n] = tx
+	}
+	for _, mode := range []string{"force_custom_plan", "force_generic_plan"} {
+		took := map[int]time.Duration{}
+		for _, n := range sizes {
+			if _, err := txs[n].Exec(ctx, `SELECT set_config('plan_cache_mode', $1, true)`, mode); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for range 5 {
+			for _, n := range sizes {
+				start := time.Now()
+				var kept int
+				if err := txs[n].QueryRow(ctx, `SELECT count(*) FROM points WHERE `+preds[n].SQL, preds[n].Args...).Scan(&kept); err != nil {
+					t.Fatal(err)
+				}
+				if d := time.Since(start); took[n] == 0 || d < took[n] {
+					took[n] = d
+				}
+			}
+		}
+		if few, many := took[10], took[5000]; many > 20*few {
 			t.Errorf("under %s, Filter over 20,000 labeled rows took %v where 10 values are declared and %v where 5,000 are", mode, few, many)
 		}
 	}
