@@ -374,8 +374,8 @@ func canonical(r RoleDefinition) RoleDefinition {
 // on. The scopes are as Config.ResourceOf gives them. A role another change redefined or created
 // while this one waited for the tenant is refused, to be tried again: the constraints were asked
 // about it as it was, as is one granted meanwhile on a scope of a type they weren't asked about,
-// or, it or a role listing it, on a scope the host wasn't asked about. One deleted meanwhile is
-// created, as its grants went with it.
+// or, it or a role listing it, on a scope the host wasn't asked about, or no longer has so that
+// the change gives more there. One deleted meanwhile is created, as its grants went with it.
 //
 // Redefining a role so that its grants give more, or so that it becomes privileged, changes what
 // grants already made give: Config.ValidateGrant is asked about each of its grants and
