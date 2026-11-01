@@ -560,26 +560,28 @@ before a prune where it is before the last record the prune deleted, as that exp
 past what the prune deleted, so where several exports read history, `through` is the cursor of the
 one furthest behind. It finds the prunes by the last record each deleted, so a prune through an
 export's cursor, which deletes nothing the export hasn't read, costs its reads nothing, however
-many there are while it catches up from the start or falls behind; an export from the start also
-reads the index's entries of the prunes before it began that deleted past its cursor, until it
-reads past them. An export that began after the prune, as one from the start after a refusal or a
-failover, reads history as the prune left it and isn't refused for it. Where a cursor stands
-can't tell the two apart; `Cursor.Horizon`, the oldest transaction running as its export began,
-does, so keep it with the cursor and each checkpoint, whose signature covers it, and never set it: a
-later one would hide a prune since the export began. A cursor without it, as one kept from an
-earlier release, is refused for any prune recorded after it that deleted a record after it, and its
-export starts again from the start. While a transaction that took its id before a prune is still
-running, a read from the start reads nothing, as its export would count the prune as one since it
-began: while prunes that delete records come faster than the longest transactions end, as they can
-while working through a long backlog, no export from the start begins. Run it on a connection of the
-administrator's role below, which has the rights of history's owner, as the application's hasn't,
-and keep what the host's audit retention requires: the federal floor is at least a year. A delete
-from history that no prune its transaction records reaches, as one by hand, is refused as the
-transaction commits, so no delete through history's triggers leaves an export reading on past what
-it removed: `History` counts every prune of a transaction from an export's `Horizon` on, whatever
-the id its record holds, which history's owner can choose, as the trigger lets a delete through for
-any. Disabling the triggers takes a role with the rights of history's owner, which the signed chain
-is kept against.
+many there are while it catches up from the start or falls behind, and whatever history's
+statistics count of them, as none before an analysis samples one; a prune reads only those of its
+own time and cursor to go on from where the last stopped, and `AsOf` only the latest, so too. An
+export from the start also reads the index's entries of the prunes before it began that deleted
+past its cursor, until it reads past them. An export that began after the prune, as one from the
+start after a refusal or a failover, reads history as the prune left it and isn't refused for it.
+Where a cursor stands can't tell the two apart; `Cursor.Horizon`, the oldest transaction running as
+its export began, does, so keep it with the cursor and each checkpoint, whose signature covers it,
+and never set it: a later one would hide a prune since the export began. A cursor without it, as one
+kept from an earlier release, is refused for any prune recorded after it that deleted a record after
+it, and its export starts again from the start. While a transaction that took its id before a prune
+is still running, a read from the start reads nothing, as its export would count the prune as one
+since it began: while prunes that delete records come faster than the longest transactions end, as
+they can while working through a long backlog, no export from the start begins. Run it on a
+connection of the administrator's role below, which has the rights of history's owner, as the
+application's hasn't, and keep what the host's audit retention requires: the federal floor is at
+least a year. A delete from history that no prune its transaction records reaches, as one by hand,
+is refused as the transaction commits, so no delete through history's triggers leaves an export
+reading on past what it removed: `History` counts every prune of a transaction from an export's
+`Horizon` on, whatever the id its record holds, which history's owner can choose, as the trigger
+lets a delete through for any. Disabling the triggers takes a role with the rights of history's
+owner, which the signed chain is kept against.
 
 A role that owns a table can change it whatever its triggers say, and a schema's owner can drop
 any table in it. So that the application's database role can't rewrite history or write around
@@ -629,7 +631,9 @@ tables and types before any schema's of the same name until it ends, which in a 
 after the call that made one. One named as a package's table stands in for it in that session,
 whose checks are the application's own to make; `History`, `Export` and `PruneHistory`, and
 `AsOf`'s checks of history, name history's table by the package's schema and their types by
-pg_catalog's, so none stands in for them, and refuse a search_path that names pg_temp first.
+pg_catalog's, so none stands in for them, and refuse a search_path that names pg_temp first. And
+history's triggers find history beside the table each fires on, whatever the schema is named, so
+none stands in for the history a change is recorded in, or a prune checked against.
 
 ## Running it
 
@@ -641,8 +645,9 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   failure leaves the database at the last migration recorded, from which migrating again goes on.
   The package's calls don't check what the database was migrated to: make them from a replica only
   once its own migrations are applied, as `Migrate` returning nil says.
-  On a host's transaction it applies them all in one savepoint, and refuses any isolation but READ
-  COMMITTED: a stricter one's snapshot would miss the writes it waits for.
+  On a host's transaction, a `pgx.Tx` or a `DB` whose `Begin` gives a savepoint of one, it applies
+  them all in one savepoint, and refuses any isolation but READ COMMITTED: a stricter one's snapshot
+  would miss the writes it waits for.
   A migration locks what it changes until it commits, and while it waits for a lock, every check,
   list and change of that table queues behind it, and of those it locked already. So `Migrate` has
   it wait at most 100 ms for any lock: a change that reads the tables in another order than a
@@ -736,6 +741,22 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   that fell behind, or since an export catching up from the start began, from history's rows, twice
   in each call and once in each window of a prune: a read of one record from such a cursor took
   1.3 ms with no prune since, 14 ms with 20,000 and 78 ms with 80,000, and with it 1.2 ms with any.
+  `0023_history_schema` replaces `rbac_record` and `rbac_history_pruned`, which keep their owners
+  and who may execute them, so history's role still owns `rbac_record`. It takes no lock on the
+  tables: changes go on while it is applied, each recorded as before until it commits. Each
+  function then finds history in the schema of the table it fires on, which costs a row recorded
+  about 0.7 microseconds of the 70 to 100 it takes.
+- **Renaming the schema:** from `0023_history_schema` on, `ALTER SCHEMA ... RENAME` keeps history:
+  its triggers find it beside the table each fires on, whatever the schema is named, and a
+  generation names the schema by its OID, so exports read on from their cursors and checkpoints.
+  Migrate to it first: before it, they find history by the name the schema had when they were
+  made, so after a rename a change fails, or is recorded in a table its session made of its own,
+  and a prune recorded in such a table lets a delete from history through. Rename while nothing
+  reaches the tables, and then set the search_path of every role and pool to the new name: changes
+  wait for each other by locks named for the schema, so one under way by the old name holds none
+  back by the new, and a session still on the old name finds no tables, or tables of its own of
+  those names. Never move one of the package's tables to another schema: its changes would be
+  recorded in that schema's history, or with none there, in a session's own table of its name.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A call PostgreSQL refuses for a race, as a
   serialization failure, a deadlock between host transactions, or a lock it waited for past the

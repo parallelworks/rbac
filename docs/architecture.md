@@ -240,7 +240,9 @@ erDiagram
 - **Every write is recorded.** Each table above but `rbac_history` has the trigger
   `rbac_record`, which writes the change into `rbac_history`. Nothing updates or truncates that
   table, and only `PruneHistory`, as a role with the rights of its owner, deletes from it, each
-  delete reached by a prune its transaction records. Each
+  delete reached by a prune its transaction records. Both triggers find history in the schema of
+  the table they fire on, by a search_path each sets for its own run, so a session's own table
+  named as history's stands in for none of it, whatever the schema is named. Each
   record reads its key's last by history's index of each entity's keys, in a generic plan with
   sequential scans off: a plan its session made while history was small would otherwise scan all
   of it for each row, and one made for each row, until history is analyzed, read all of the
@@ -700,6 +702,13 @@ flowchart TB
 - **READ COMMITTED.** A change runs at READ COMMITTED, as its checks under the locks must read what
   committed before the locks were taken. Under `WithTx` the host's transaction must be at READ
   COMMITTED too, as must one `Migrate` is given.
+- **A host's own DB.** One that is neither a pool, a connection nor a `pgx.Tx` begins with `Begin`,
+  and its first statement sets the isolation a change or a read of one snapshot needs (`isolated`):
+  another level first, then that one. A savepoint of a transaction under way, as a wrapper around
+  the host's own gives, may set the level its transaction has but no other, so it refuses one of
+  the two, and the call runs on the host's transaction, as under `WithTx`; setting the one level
+  alone, a savepoint of a transaction at it passed for a transaction of its own, and `Migrate`
+  bounded its waits there and left them so in the host's transaction.
 - **Rows in one order.** `DeleteScopes` holds its scopes' locks and `DeletePrincipal` its
   principal's, so neither waits for the other, and both delete the principal's grants and
   eligibilities on those scopes: each locks them in the order of their scopes first, eligibilities
@@ -838,12 +847,15 @@ flowchart LR
   through its cursor as it caught up from the start or fell behind, each of which, found by where
   it was recorded, was read from history's rows. An export from the start also passes over, among
   the index's entries, the prunes from before it began that reached past its cursor, until it reads
-  past them; where those since it began are fewer, a statement planned for its cursor reads those
-  by transaction (`rbac_history_prunes`) instead. A delete from history, which only a role with the
-  rights of history's owner gets past the append-only trigger, is refused as its transaction
-  commits (`rbac_history_pruned`) unless a prune that transaction records reaches the record, by the
-  last it deleted or, for a prune recorded before 0020, the cursor it went through, and the record
-  is of an earlier transaction.
+  past them. Both statements run with sorting off (`unsorted`), so that index's order is the only
+  plan: where history's statistics hold no prune, as until an analysis samples one, the planner
+  counts the prunes as none, and read every one since the cursor by transaction
+  (`rbac_history_prunes`) to sort them, in each read and each window of a prune. A test of the
+  transaction no index serves leaves that read, as that index holds every prune. A delete from
+  history, which only a role with the rights of history's owner gets past the append-only trigger,
+  is refused as its transaction commits (`rbac_history_pruned`) unless a prune that transaction
+  records reaches the record, by the last it deleted or, for a prune recorded before 0020, the
+  cursor it went through, and the record is of an earlier transaction.
 - **The export chain.** `Export` hashes each record onto the last checkpoint with SHA-256 and signs
   the checkpoint with the host's `crypto.Signer`: ECDSA on P-256, P-384 or P-521, Ed25519, or RSA
   of at least 3072 bits, each verified with the Go standard library. `VerifyChain` checks a run of
@@ -867,7 +879,9 @@ flowchart LR
   version, the end last. It reads history `MaxPrune` records at a time, each in a transaction of
   its own, so none holds exports back for long however long history is. Each that deleted records
   is recorded in history, in the statement that deletes and dated when it began, with the last
-  record it deleted, and AsOf finds the latest prune's time by history's index. With several
+  record it deleted, and AsOf finds the latest prune's time by history's index of each entity's
+  keys, as a prune finds where the last of its time and cursor stopped, each in that index's order
+  with sorting off, so neither reads every prune where the statistics count none. With several
   exports, it prunes through the cursor of the one furthest behind.
 
 ## Database roles

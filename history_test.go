@@ -603,6 +603,110 @@ func TestHistoryIsWrittenByItsTriggersAlone(t *testing.T) {
 	}
 }
 
+// Renamed, the package's schema keeps its history, as the README's roles run it: history's triggers
+// find history beside the table each fires on, never a session's own table named as history's,
+// which pg_temp on their search_path gave them once the schema no longer answered to the name it
+// had when they were made. A change the application's role makes is recorded in history, and a
+// delete the administrator's makes with a prune recorded in its own table is refused, while
+// PruneHistory prunes; and an export reads on, as its generation names the schema by its OID.
+func TestHistoryIsKeptWhateverItsSchemaIsNamed(t *testing.T) {
+	ctx := t.Context()
+	r := newReadmeRoles(t)
+	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+		t.Fatal(err)
+	}
+	r.harden(t)
+	cfg := rbac.Config{
+		Catalog: catalog, ContainerTypes: []string{"org", "workspace"},
+		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+	}
+	exec := func(db rbac.DB, sql string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	const write = `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'c1', 'user', $1, 'cluster.login')`
+	exec(r.appPool, write, "before")
+	authz, err := rbac.New(r.appPool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exported rbac.Cursor
+	drain(t, &harness{ctx: ctx, pool: r.appPool, authz: authz, cfg: cfg}, &exported, 1)
+	renamed := r.schema + "_renamed"
+	exec(r.super, `ALTER SCHEMA `+r.schema+` RENAME TO `+renamed)
+	// Before the roles' cleanup drops the schema by its name.
+	t.Cleanup(func() {
+		if _, err := r.super.Exec(context.WithoutCancel(ctx), `ALTER SCHEMA `+renamed+` RENAME TO `+r.schema); err != nil {
+			t.Error(err)
+		}
+	})
+	history := pgx.Identifier{renamed, "rbac_history"}.Sanitize()
+	// A session of each role, on the schema by its new name, with a table of its own named as
+	// history's, which any role may make and its session reads before any schema's.
+	session := func(user string) *pgxpool.Pool {
+		t.Helper()
+		c, err := pgxpool.ParseConfig(pgtest.URL(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.MaxConns, c.ConnConfig.User = 1, user
+		c.ConnConfig.RuntimeParams["search_path"] = renamed
+		p, err := pgxpool.NewWithConfig(ctx, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(p.Close)
+		exec(p, `CREATE TEMP TABLE rbac_history (LIKE `+history+` INCLUDING DEFAULTS INCLUDING IDENTITY)`)
+		exec(p, `GRANT ALL ON pg_temp.rbac_history TO PUBLIC`)
+		return p
+	}
+	app, admin := session(r.app), session(r.admin)
+	exec(app, write, "after")
+	exec(app, `UPDATE rbac_grants SET note = 'changed' WHERE principal = 'user:after'`)
+	var kept, taken int
+	if err := app.QueryRow(ctx, `SELECT (SELECT count(*) FROM `+history+` WHERE principal = 'user:after'),
+		(SELECT count(*) FROM pg_temp.rbac_history)`).Scan(&kept, &taken); err != nil || kept != 2 || taken != 0 {
+		t.Fatalf("after the rename, history recorded %d of the 2 changes and the session's own table %d, %v", kept, taken, err)
+	}
+	renamedAuthz, err := rbac.New(app, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	through := exported
+	read := drain(t, &harness{ctx: ctx, pool: app, authz: renamedAuthz, cfg: cfg}, &through, 2)
+	if through.Generation != exported.Generation {
+		t.Fatalf("History after the rename reads generation %q, not %q", through.Generation, exported.Generation)
+	}
+	// As history's owner, a delete with a prune recorded in the session's own table, which History
+	// never reads.
+	tx, err := admin.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	exec(tx, `SELECT set_config('rbac.prune', 'on', true)`)
+	exec(tx, `INSERT INTO pg_temp.rbac_history (effective_at, tenant, entity, key, op, after, how) VALUES (now(), '', 'history', 'k', 'prune',
+		jsonb_build_object('last', jsonb_build_object('txid', '18446744073709551615', 'id', 9223372036854775807)), '')`)
+	exec(tx, `DELETE FROM `+history+` WHERE id = $1`, read[0].ID)
+	err = tx.Commit(ctx)
+	if pgErr := (*pgconn.PgError)(nil); !errors.As(err, &pgErr) || pgErr.Code != "42501" {
+		t.Fatalf("a delete from history with a prune recorded in the session's own table: %v", err)
+	}
+	var now time.Time
+	if err := admin.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := rbac.PruneHistory(ctx, admin, now, through); err != nil || n != 1 {
+		t.Fatalf("PruneHistory after the rename deleted %d, %v", n, err)
+	}
+	if _, _, err := renamedAuthz.History(ctx, exported, 1); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("History from before what PruneHistory deleted after the rename: %v", err)
+	}
+}
+
 // role makes a role with tx, dropped with it, as roles are the cluster's, and returns it, quoted,
 // and tx's schema.
 func role(t *testing.T, tx pgx.Tx) (name, schema string) {
@@ -2154,6 +2258,108 @@ func TestHistoryChecksACursorAsFastWhateverPrunesWentThroughIt(t *testing.T) {
 			}
 			if many := read(behind); many > fewBehind+10 {
 				t.Errorf("History read %d pages of history from a cursor past its Horizon after 500 prunes through it, and %d after 3,000", fewBehind, many)
+			}
+		})
+	}
+}
+
+// So it does where history's statistics hold no prune, as until an analysis samples one, which it
+// can miss while prunes are few among history's records: there the planner counted the prunes as
+// none, and History and each window of a prune through the cursor read every one since the cursor
+// by their transactions, to sort them; a prune read every prune to find where the last of the same
+// time and cursor stopped, and AsOf every prune, twice, to find the latest. Here each prune is of
+// a transaction of its own beside a change, as a host's prunes go on while the application writes,
+// and history was last analyzed before them, with autovacuum off for it, so none of its analyses
+// counts them meanwhile. It holds whether a statement is planned for its arguments or for any.
+func TestReadingPrunesCostsAsMuchWhateverHistorysStatisticsCount(t *testing.T) {
+	for _, plans := range []string{"force_custom_plan", "force_generic_plan"} {
+		t.Run(plans, func(t *testing.T) {
+			// One record a prune, so one through the cursor deletes a's membership as it was alone.
+			rbac.SetMaxPrune(t, 1)
+			h := setupOn(t, pgtest.Open(t, "pool_max_conns=1&plan_cache_mode="+plans))
+			ctx := t.Context()
+			if _, err := h.pool.Exec(ctx, `ALTER TABLE rbac_history SET (autovacuum_enabled = off)`); err != nil {
+				t.Fatal(err)
+			}
+			for _, id := range []string{"a", "b", "c"} {
+				h.as(t, id)
+			}
+			a := cursorAt(t, h, `SELECT txid, id, recorded_at FROM rbac_history WHERE principal = 'user:a'`)
+			behind := cursorAt(t, h, `SELECT txid, id, recorded_at FROM rbac_history WHERE principal = 'user:b'`)
+			behind.Horizon = behind.TxID
+			// The application's records after the cursor; and after history's last analysis, a change
+			// to a's membership, which supersedes the version before the cursor.
+			for _, sql := range []string{
+				`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+					SELECT 't1', 'cluster', 'x' || i, 'user', 'x' || i, 'cluster.login' FROM generate_series(1, 20000) i`,
+				`ANALYZE rbac_history`,
+				`UPDATE rbac_memberships SET note = 'changed' WHERE principal = 'user:a'`,
+			} {
+				if _, err := h.pool.Exec(ctx, sql); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := dbNow(t, h)
+			// n prunes through the cursor, each deleting up to a's membership, and each in a
+			// transaction of its own beside a change.
+			prune := func(n int) {
+				t.Helper()
+				if _, err := h.pool.Exec(ctx, fmt.Sprintf(`DO $$ BEGIN FOR i IN 1..%d LOOP
+					INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+					  VALUES ('t1', 'cluster', 'y' || i || '-' || pg_current_xact_id(), 'user', 'w', 'cluster.login');
+					INSERT INTO rbac_history (effective_at, tenant, entity, key, op, after, how)
+					  SELECT now(), '', 'history', to_char(now() - i * interval '1 second', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), 'prune',
+					  jsonb_build_object('through', jsonb_build_object('txid', '%d', 'id', %d),
+					    'last', jsonb_build_object('txid', '%d', 'id', %d)), 'PruneHistory';
+					COMMIT; END LOOP; END $$`, n, behind.TxID, behind.ID, a.TxID, a.ID)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The pages of history and its indexes a read of a record from the cursor, and a prune
+			// through it, read, once the one before has planned it and read how history's indexes are
+			// laid out; each rolled back.
+			read := func(f func(pgx.Tx) error) int64 {
+				t.Helper()
+				var pages int64
+				for range 7 {
+					tx, err := h.pool.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					start := historyPages(ctx, t, tx)
+					if err := f(tx); err != nil {
+						_ = tx.Rollback(ctx)
+						t.Fatal(err)
+					}
+					pages = historyPages(ctx, t, tx) - start
+					if err := tx.Rollback(ctx); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return pages
+			}
+			history := func(tx pgx.Tx) error {
+				_, _, err := h.authz.WithTx(tx).History(ctx, behind, 1)
+				return err
+			}
+			pruning := func(tx pgx.Tx) error {
+				_, err := rbac.PruneHistory(ctx, tx, before, behind)
+				return err
+			}
+			asOf := func(tx pgx.Tx) error {
+				return h.authz.WithTx(tx).AsOf(ctx, "t1", before, func(*rbac.Authorizer) error { return nil })
+			}
+			prune(300)
+			fewRead, fewPruned, fewAsOf := read(history), read(pruning), read(asOf)
+			prune(2700)
+			if many := read(history); many > fewRead+10 {
+				t.Errorf("History read %d pages of history from a cursor after 300 prunes through it, and %d after 3,000", fewRead, many)
+			}
+			if many := read(pruning); many > fewPruned+10 {
+				t.Errorf("A prune through a cursor read %d pages of history after 300 prunes through it, and %d after 3,000", fewPruned, many)
+			}
+			if many := read(asOf); many > fewAsOf+10 {
+				t.Errorf("AsOf read %d pages of history after 300 prunes, and %d after 3,000", fewAsOf, many)
 			}
 		})
 	}
@@ -4234,6 +4440,72 @@ func TestPruningHistoryOnAHostsTransaction(t *testing.T) {
 	_, err = tx.Exec(ctx, `DELETE FROM rbac_history WHERE id = (SELECT min(id) FROM rbac_history)`)
 	if pgErr := (*pgconn.PgError)(nil); !errors.As(err, &pgErr) || pgErr.Code != "42501" {
 		t.Fatalf("a delete from history after the prune: %v", err)
+	}
+}
+
+// History, a prune and AsOf read prunes with sorting and JIT off, and give a host's transaction its
+// own settings back, whether they read or refuse; AsOf before its read, which plans as the host's
+// statements do, but without JIT.
+func TestReadingPrunesLeavesTheHostsSettings(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.as(t, "u")
+	then := dbNow(t, h)
+	if _, err := h.pool.Exec(ctx, `UPDATE rbac_memberships SET note = 'changed' WHERE principal = 'user:u'`); err != nil {
+		t.Fatal(err)
+	}
+	through := exported(t, h)
+	if n, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h), through); err != nil || n != 1 {
+		t.Fatalf("PruneHistory = %d, %v", n, err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL jit = on; SET LOCAL enable_sort = on`); err != nil {
+		t.Fatal(err)
+	}
+	settings := func() string {
+		t.Helper()
+		var jit, sorting string
+		if err := tx.QueryRow(ctx, `SELECT current_setting('jit'), current_setting('enable_sort')`).Scan(&jit, &sorting); err != nil {
+			t.Fatal(err)
+		}
+		return "jit " + jit + ", enable_sort " + sorting
+	}
+	a := h.authz.WithTx(tx)
+	var reading string
+	read := func(*rbac.Authorizer) error {
+		var jit, sorting string
+		err := tx.QueryRow(ctx, `SELECT current_setting('jit'), current_setting('enable_sort')`).Scan(&jit, &sorting)
+		reading = "jit " + jit + ", enable_sort " + sorting
+		return err
+	}
+	now := dbNow(t, h)
+	for _, c := range []struct {
+		name    string
+		call    func() error
+		refused bool
+	}{
+		{"History", func() error { _, _, err := a.History(ctx, through, 1); return err }, false},
+		{"History from another generation's cursor", func() error {
+			_, _, err := a.History(ctx, rbac.Cursor{Generation: "another", TxID: through.TxID, ID: through.ID}, 1)
+			return err
+		}, true},
+		{"PruneHistory", func() error { _, err := rbac.PruneHistory(ctx, tx, now, through); return err }, false},
+		{"AsOf", func() error { return a.AsOf(ctx, "t1", now, read) }, false},
+		{"AsOf of a time pruned", func() error { return a.AsOf(ctx, "t1", then, read) }, true},
+	} {
+		if err := c.call(); err != nil && !c.refused || c.refused && !errors.Is(err, rbac.ErrInvalid) {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got := settings(); got != "jit on, enable_sort on" {
+			t.Errorf("after %s, %s", c.name, got)
+		}
+	}
+	if reading != "jit off, enable_sort on" {
+		t.Errorf("AsOf's read ran with %s", reading)
 	}
 }
 
