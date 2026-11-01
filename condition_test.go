@@ -1729,6 +1729,28 @@ var plainEnv = sync.OnceValues(func() (*cel.Env, error) {
 	return cel.NewEnv(cel.Variable("request", cel.MapType(cel.StringType, cel.DynType)))
 })
 
+// CEL adds to a mutable list of its own in place, so a condition adding to one the host passes
+// changed what it and the check's other conditions read after, and adding one to itself, read
+// through the check's conversion, appended it to itself until memory ran out. A check reads one as
+// the list it holds, as CEL reads that list. The last runs only where the others decide so.
+func TestAMutableListOfCELsIsReadAsTheListItHolds(t *testing.T) {
+	l := types.NewMutableList(types.DefaultTypeAdapter)
+	l.Add(types.NewRefValList(types.DefaultTypeAdapter, []ref.Val{types.String("a")}))
+	for _, expr := range []string{
+		`size(request.attributes.l + ["b"]) == size(request.attributes.l) + 1`,
+		`request.attributes.l == ["a"] && !("b" in request.attributes.l)`,
+		`size(request.attributes.l + request.attributes.l) == 2 && (request.attributes.l + request.attributes.l)[1] == "a"`,
+	} {
+		out, err := evaluatedByCEL(t, expr, map[string]any{"l": []any{"a"}})
+		if err != nil || out != types.True {
+			t.Fatalf("%s: CEL decides %v, %v of the list it holds", expr, out, err)
+		}
+		if held, _, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"l": l}); err != nil || !held {
+			t.Fatalf("%s: held %t, %v", expr, held, err)
+		}
+	}
+}
+
 // CEL indexes a map or a list by a key as the Go value the host passed, and fails for one of a type
 // it doesn't index by, as an int8, a named type, a pointer, a JSON number or text, or a wrapper,
 // though it reads each as one of its own everywhere else, so `k in m` held where `m[k]` failed. A

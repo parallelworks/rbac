@@ -71,7 +71,8 @@ import (
 // condition is charged for. A value of a host's own type CEL reads as one of its own, as a double
 // or a string, is read as the value it holds (its Value), so it compares as CEL's own does, from
 // either side, and fails where it isn't finite; a list or a map the host makes, of its own type or
-// of CEL's, is read by its own methods, each value it yields read so, and one of CEL's converts the
+// of CEL's, is read by its own methods, each value it yields read so, a mutable list of CEL's, which
+// CEL adds to in place, as the list it holds, and one of CEL's converts the
 // Go values it was made of as the adapter it was made with does, each time a condition reads one,
 // so a host should make none over the values above, as JSON text or a struct. A key a map yields of
 // such a type of the host's is read as the map holds it, so the map finds it, but for one that
@@ -175,8 +176,9 @@ const maxCopied = 1 << 10
 //   - A list or a map a host makes, of a type of its own or of CEL's, is read as it reads itself,
 //     by its own methods, which are the host's to bound, but each value it yields read through
 //     this: one of CEL's own converts the Go values it was made of with the adapter it was made
-//     with, each time a condition reads one, as CEL does. An optional of CEL's own is read as what
-//     it holds, through this.
+//     with, each time a condition reads one, as CEL does. A mutable list of CEL's, which CEL adds to
+//     in place, is read as the list it holds, and an optional of CEL's own as what it holds, through
+//     this.
 //   - A ref.Val of a type of the host's own that CEL reads as a double, a string or another value
 //     of a type of its own holding none is read as that value, what it holds (its Value), so a
 //     double is one of CEL's own, which comparing fails where it isn't finite, and a string's length
@@ -311,7 +313,8 @@ func copiedWhole(v any) ref.Val {
 
 // own is v as one of CEL's own values: v itself where it holds no other; for an optional of CEL's
 // own, what it holds, read through c; for a list or a map, of CEL's own or of the host's, itself,
-// read by its own methods, but each value it yields read through c; for one of a type of the
+// read by its own methods, but each value it yields read through c, and a mutable list of CEL's as
+// the list it holds; for one of a type of the
 // host's own CEL reads as a value of a type of its own, what it holds; and any other, as a message,
 // itself, as CEL's adapter reads it.
 //
@@ -326,6 +329,12 @@ func (c *converting) own(v ref.Val) ref.Val {
 	switch v := v.(type) {
 	case *types.Optional:
 		return c.keep(v, func() ref.Val { return c.optional(v) })
+	case traits.MutableLister:
+		// As the list it holds: CEL adds to one in place, so a condition adding to one changed what
+		// it and the check's other conditions read after, and adding one to itself, which CEL appends
+		// once where it is passed as itself, appended it to itself until memory ran out, passed as a
+		// hostList.
+		return hostList{v.ToImmutableList(), c}
 	case traits.Mapper:
 		return hostMap{v, c}
 	case traits.Lister:
