@@ -284,7 +284,10 @@ flowchart BT
   change and however many of the groups are in one that reaches it, and its grants are decided once
   for each role, condition and end on a scope, as the member a grant names decides nothing of the
   actor's power to make it; only the host is asked about each member's, which `MaxBindings` bounds
-  for `ChangeMembers` but for one member alone. `ImportMembers`, the host's own write, which no
+  for `ChangeMembers` but for one member alone. A member is its principal: what all the groups,
+  and places in one, a change gives it reach is counted, and asked about, once for each end its
+  places give it (`gainsWithin`, `askMemberships`), so a group two of them are in counts once and
+  one member is never refused for joining several. `ImportMembers`, the host's own write, which no
   actor's access decides, asks it once for each member and each grant or eligibility the member
   gains, with no bound on them, so its cost grows with that.
 - **Expanding down** from groups to their identities, for lists and changes, is `insideSQL`. It
@@ -452,6 +455,22 @@ sequenceDiagram
   `GrantableRoles`, it may grant only those roles, without holding them. Through any other role, it
   may grant a role only if it holds every permission of it, for every type the grant reaches.
   Either way, a limited grant permission can't mint a larger one.
+- **Freezes.** A constraint removing `<type>:grant` from the actor on a scope, as a host freezes
+  changes under a container, or a deny on its path doing so, stops `Apply` changing grants there,
+  revoking them too.
+  Every change an actor makes that takes access away there is stopped alike, whatever the actor's
+  grants, as it needn't hold what it takes away: `SetRole` narrowing and `DeleteRole` deleting a
+  role granted there (`changesStopped`, `scopesDenied`); `ChangeMembers` removing a member of a
+  group holding access there, ending its place sooner, ending an activation made through the group
+  there, or adding a member to a group a deny there names (`reachCheck.stopped`); and
+  `DeleteGroup` with grants or eligibilities in force on the group's scope. `ChangeMembers` asks the
+  constraints once about each type of scope a member only loses access on, of no resource
+  (`freezes`), and reads the types whose power to change grants a deny binding the actor lists
+  (`grantsDenied`); only for a scope of a type either names, or whose label can refuse the actor, is
+  `Config.ResourceOf` asked, and then the constraints again about it and the denies on its path, in
+  one read with the rest (`reachAuthority`). In its transaction the denies are read again, and a
+  type one binding the actor now names that none did refuses the change with `ErrConflict`. The
+  host's own writes make no check of an actor, so no freeze stops them.
 - **Until when.** What the actor holds only until a time, through an expiring grant, an activation,
   or a membership or place in a group that ends, it hands on only until then: `authorityOn` reads
   when each grant's holding ends, in the statement that reads the grants, and a grant may end no
@@ -498,10 +517,14 @@ sequenceDiagram
   `Activate` holds the places it can rest on until it commits, in the statement that reads the
   keys it finds its subject eligible through, so the two wait for each other, and a place nested
   between them makes no one eligible. Setting the eligibility again or deleting it leaves its
-  activations to their own ends, or to their holders leaving its group: where labels are declared,
-  `ChangeMembers` reads the activations of the members leaving made through the groups it reaches
-  and checks the label of each one's scope as a revoke there, and `DeleteGroup` refuses a group
-  they rest on.
+  activations to their own ends, or to their holders leaving its group: where labels or a freeze
+  can refuse it, `ChangeMembers` reads the activations of the members leaving made through the
+  groups it reaches and checks each one's scope as a revoke there, and `DeleteGroup` refuses a group
+  they rest on. Both read them only once they hold the places they end (`restingIn`, and
+  `unrested` once `removeGroups` holds them), so an activation `Activate` commits while one waits
+  for them, through an eligibility deleted meanwhile, is read as one made before: `ChangeMembers`
+  finds it in `stillReached`, which it hadn't checked, and is tried again (`ErrConflict`), and
+  `DeleteGroup` refuses it. Read before them, it would be ended unchecked.
 - **Approvals.** Approving decides access on the scope, so on a labeled one an approval counts
   only from an approver whose own label values satisfy the label: read before the transaction and
   again under its locks, with the constraints' answers on them sealed, as an actor's are, and
@@ -620,9 +643,12 @@ flowchart TB
   before grants, so they don't deadlock. A revoke locks the grants it deletes in that order too, as
   a change ending places in groups ends activations among them without their scope's lock. Every
   change holds grants last, after its places and memberships, as `Activate` holds the places an
-  activation rests on before its grant. `DeleteRole` removes a role's grants before its
-  eligibilities, but holds the tenant's lock exclusive, so no change runs beside it but
-  `DeleteExpired`, which waits on no row.
+  activation rests on before its grant. A change ending places holds them before it reads what
+  rests on them: `ChangeMembers` right after its advisory locks, before what it reaches is read
+  again, and `DeleteGroup` in `removeGroups`, after the eligibilities and denies it removes, in the
+  order the deletes take them, before it reads its members' activations. `DeleteRole` removes a
+  role's grants before its eligibilities, but holds the tenant's lock exclusive, so no change runs
+  beside it but `DeleteExpired`, which waits on no row.
 - **One snapshot for reads in several statements.** Explain, Reachable, Holders and Conflicts read
   in one REPEATABLE READ, READ ONLY transaction of their own on a pool, and AsOf in a REPEATABLE
   READ one it rolls back. Explain, Reachable and Holders read what label values are decided by in
@@ -736,7 +762,7 @@ refuses a row of more than 1 MiB as jsonb all the same.
 | Bound | Value | What it limits |
 |---|---|---|
 | `MaxID` | 512 bytes | A tenant's, scope's or principal's id. |
-| `MaxBindings` | 1,000 | Bindings in one `Apply`, and the grants, memberships, groups or members one `Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`, `DeleteGroups`, `ImportMembers`, `ChangeMembers` or `DeleteMembers` takes, and the grants and eligibilities the members one `ChangeMembers` adds gain, each member's counted apart, as `ValidateGrant` is asked about each, but one member alone, which gains whatever its groups hold. The host's own `ImportMembers` is asked about each with no such bound. |
+| `MaxBindings` | 1,000 | Bindings in one `Apply`, and the grants, memberships, groups or members one `Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`, `DeleteGroups`, `ImportMembers`, `ChangeMembers` or `DeleteMembers` takes, and the grants and eligibilities the members one `ChangeMembers` adds gain, each member's counted apart, by its principal, as `ValidateGrant` is asked about each, but one member alone, which gains whatever its groups hold. The host's own `ImportMembers` is asked about each with no such bound. |
 | `MaxGrantsPerRole` | 20 | Grants in force of one role to one principal on one scope, differing by source, expiry or condition. Those from each source the host owns count apart. |
 | `MaxDenies`, `MaxDenyEntries` | 100, 256 | Denies on a scope, and the principals, exemptions or permissions one names. |
 | `MaxCustomRoles`, `MaxRoleEntries`, `MaxGrantableRoles` | 300, 1,000, 64 | Custom roles in a tenant, the permissions one gives and the types it is for, and roles one lists in `GrantableRoles`. |

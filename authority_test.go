@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1892,6 +1893,56 @@ func TestAnActivationMadeWhileARemovalIsCheckedIsTriedAgain(t *testing.T) {
 	}
 	if meanwhile != nil {
 		t.Fatal("u should have activated on the cluster meanwhile")
+	}
+}
+
+// A removal holds the places it ends before it reads the activations resting on them, which
+// Activate holds until it commits: one that commits while the removal waits for them, on a labeled
+// scope through an eligibility the host deleted meanwhile, is read under them, and the removal tried
+// again to check that scope's label, as one made before is, rather than ended unchecked.
+func TestARemovalChecksAnActivationThatCommitsWhileItWaitsForItsPlaces(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	var armed atomic.Bool
+	paused := make(chan heldActivation, 1)
+	h := labeled(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s == secret.Scope() {
+				return secret, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	}, pausingActivation(&armed, paused))
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"))
+	h.groups(t, "crew", "inner")
+	u := h.as(t, "u", "inner")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: groupOf("inner")}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: groupOf("crew"), MaxDuration: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	admin := h.as(t, "admin")
+	remove := []rbac.Member{{Group: "crew", Principal: groupOf("inner")}}
+	a, activated := activateAsTheHostDeletes(t, h, &armed, paused, u, cluster, "cluster.sudo", groupOf("crew"))
+	done := make(chan error, 1)
+	go func() { done <- h.authz.ChangeMembers(ctx, admin, "t1", nil, remove) }()
+	waitedOn(t, h, a.pid, done)
+	close(a.release)
+	if err := <-activated; err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	if err := <-done; !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("removing inner from crew while u's activation on the labeled cluster, made through crew, committed: %v", err)
+	}
+	if !allowed(t, h, u, root, cluster) {
+		t.Fatal("u's activation should still give it root on the cluster")
+	}
+	if err := h.authz.ChangeMembers(ctx, admin, "t1", nil, remove); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("tried again, without the cluster's label: %v", err)
 	}
 }
 
