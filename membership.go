@@ -603,9 +603,14 @@ func upsertGroups(ctx context.Context, tx pgx.Tx, tenant string, actor Principal
 // or grants on it from one, in force: those that have ended give nothing, and go with it. What is
 // granted on the group's own scope goes with it, its grants and eligibilities there revoked, so a
 // constraint or a deny on its path that stops the actor changing grants there stops it, as it
-// would revoking them with Apply, while any is in force. Deleting a group that doesn't exist does
-// nothing, and asks Config.ResourceOf and the constraints nothing of it; one the host no longer
-// has (ErrNotFound) it reads as unlabeled, as a removal reads any scope.
+// would revoking them with Apply, while any is in force. Where one may, or its label may refuse the
+// actor, it reads the group as ChangeMembers reads a scope it takes access away on: as
+// Config.ResourceOf gives it, so a condition reading the group's attributes reads what the host
+// passes Apply there; and without Config.ResourceOf, as stored, which is all of the group only
+// where the host declares no labels and resource attributes as none, or the deletion is refused
+// while any is in force. Deleting a group that doesn't exist does nothing, and asks
+// Config.ResourceOf and the constraints nothing of it; one the host no longer has (ErrNotFound) it
+// reads as unlabeled, as a removal reads any scope.
 func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id string) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "DeleteGroup")
@@ -635,8 +640,8 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 		return err
 	}
 	// A group that doesn't exist has no label to ask the host for, and deleting it does nothing.
-	// Without declared labels, or a freeze, none is asked for, so one made meanwhile needs no new
-	// check.
+	// Without declared labels, a freeze, or a deny binding the actor that may stop it, none is asked
+	// for, so one made meanwhile needs no new check.
 	existed, group := true, Resource{Tenant: tenant, Type: GroupScope, ID: id}
 	if len(a.labels) > 0 {
 		if existed, err = groupExists(ctx, a.db, tenant, id); err != nil {
@@ -650,14 +655,23 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 	}
 	// Asked before the transaction, as hooks run outside it, whether or not anything is granted on
 	// its scope, which only the transaction reads under the group's lock; and about the group as the
-	// host gives it only where one may stop it, and it exists, as for its label: one that doesn't
-	// is deleted as nothing, so no constraint's answer about it could refuse that.
+	// host gives it only where a constraint, or a deny binding the actor that removes its power to
+	// change grants on groups, may stop it, and it exists, as for its label: one that doesn't is
+	// deleted as nothing, so no answer about it could refuse that. For either, the group is read as
+	// ChangeMembers reads a scope it only takes access away on where one may stop it there
+	// (mayReach), so a condition of either that reads the group's attributes sees what Apply
+	// revoking there is passed.
+	bound, err := a.grantsDenied(ctx, a.db, tenant, actor)
+	if err != nil {
+		return err
+	}
 	freeze, err := a.freezes(ctx, actor, tenant, GroupScope)
 	if err != nil {
 		return err
 	}
-	revoking := &reachCheck{on: group, leaves: true, frozen: freeze != "", bound: true}
-	if revoking.frozen && len(a.labels) == 0 {
+	revoking := &reachCheck{on: group, leaves: true, frozen: freeze != "", bound: bound[GroupScope]}
+	stops := revoking.frozen || revoking.bound
+	if stops && len(a.labels) == 0 {
 		if existed, err = groupExists(ctx, a.db, tenant, id); err != nil {
 			return err
 		}
@@ -667,7 +681,24 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 			}
 		}
 	}
-	if revoking.frozen && existed {
+	// Without Config.ResourceOf the group is as stored, which isn't all of it where the host
+	// declares labels or resource attributes other than as none: revoking on it is refused then, as
+	// ChangeMembers refuses taking access away there, but only once the transaction finds anything
+	// granted there to revoke. Its label, unread, can refuse the actor too, unless the actor's label
+	// values satisfy every label, which the transaction reads again (cleared).
+	var partial error
+	cleared := false
+	if existed && a.cfg.ResourceOf == nil {
+		if !stops && len(a.labels) > 0 {
+			if cleared, err = a.clearsAll(ctx, a.db, labels, values); err != nil {
+				return err
+			}
+		}
+		if stops || len(a.labels) > 0 && !cleared {
+			partial = a.storedWhole(revoking.on.Scope())
+		}
+	}
+	if revoking.frozen && existed && partial == nil {
 		revoking.cs = a.constrain(ctx, actor, revoking.on)
 		revoking.cs.removes(GrantPermission(GroupScope), GroupScope)
 		if err := revoking.cs.failed(); err != nil {
@@ -716,6 +747,14 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 			return ChangeEvent{}, err
 		}
 		if scoped {
+			if partial != nil {
+				return ChangeEvent{}, partial
+			}
+			if cleared {
+				if err := a.stillClearsAll(ctx, tx, labels, values); err != nil {
+					return ChangeEvent{}, err
+				}
+			}
 			revoking.seal()
 			_, _, au, err := a.reachAuthority(ctx, tx, actor, []*reachCheck{revoking})
 			if err != nil {
@@ -723,6 +762,18 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 			}
 			if err := revoking.stopped(au[0], "revoking what is granted on the group"); err != nil {
 				return ChangeEvent{}, err
+			}
+			// Where no deny binding the actor removed its power to change grants on groups, the denies
+			// on the group's path weren't read, and the group perhaps not from the host: one set
+			// meanwhile has the deletion tried again, as mayReachAgain has a change to members.
+			if !revoking.bound {
+				now, err := a.grantsDenied(ctx, tx, tenant, actor)
+				if err != nil {
+					return ChangeEvent{}, err
+				}
+				if now[GroupScope] {
+					return ChangeEvent{}, fmt.Errorf("%w: a deny binding the actor was set while this change waited; try again", ErrConflict)
+				}
 			}
 		}
 		return a.removeGroups(ctx, tx, tenant, actor.Principal, []string{id}, func() error {
@@ -1495,12 +1546,13 @@ func (a *Authorizer) placesBounded(ctx context.Context, tx pgx.Tx, tenant string
 // checks is its groups', read once however many of their members change, and what a group many of
 // them are in reaches, once for all of them, so it grows with what the groups hold, approve and are
 // named or exempt in, as SetRole's does with a role's grants: with Labels or Config.Constraints
-// declared, or a deny binding the actor, a removal reads what its members lose. It asks the
-// constraints about changing grants on each type of scope they lose access on, and
-// Config.ResourceOf about each such scope only where the actor's label values don't satisfy every
-// label, a constraint answered that it may stop the actor changing grants on some scope of the
-// type, or a deny binding the actor removes that power on scopes of it: then the constraints again
-// about the scope, and the actor's grants and denies on its path, all such scopes' in one read.
+// declared, or a deny binding the actor that removes a power to change grants, a removal reads what
+// its members lose. It asks the constraints about changing grants on each type of scope they lose
+// access on, and Config.ResourceOf about each such scope only where the actor's label values don't
+// satisfy every label, a constraint answered that it may stop the actor changing grants on some
+// scope of the type, or a deny binding the actor removes that power on scopes of it: then the
+// constraints again about the scope, and the actor's grants and denies on its path, all such
+// scopes' in one read.
 func (a *Authorizer) ChangeMembers(ctx context.Context, actor Subject, tenant string, add, remove []Member) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "ChangeMembers")
@@ -2472,11 +2524,16 @@ func (a *Authorizer) freezes(ctx context.Context, actor Subject, tenant, scopeTy
 // tenant binding actor lists, as `<type>:grant` or `<type>:*`, as deniedBelow reads those below
 // the tenant: only on a scope of one can a deny on its path stop the actor taking access away there,
 // which its authority on each such scope is then read for. They are found by the keys it is bound
-// by (naming), so the tenant's denies of others aren't read.
+// by (naming), so the tenant's denies of others aren't read, and of those, through
+// rbac_denies_grants, only the denies that list such a power (rbac_changes_grants): a change to
+// members reads them before its transaction and again under its locks, so the denies binding the
+// actor that remove anything else, as root to the tenant's members on each of thousands of
+// resources, cost it nothing.
 func (a *Authorizer) grantsDenied(ctx context.Context, q DB, tenant string, actor Subject) (map[string]bool, error) {
 	rows, err := q.Query(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`
 		SELECT DISTINCT p FROM rbac_denies d CROSS JOIN LATERAL unnest(d.permissions) AS p
-		WHERE `+naming("d.principals", "ARRAY(SELECT k FROM bound)")+` AND NOT d.exempt && ARRAY(SELECT k FROM exempted)`,
+		WHERE `+naming("d.principals", "ARRAY(SELECT k FROM bound)")+` AND rbac_changes_grants(d.permissions)
+		  AND NOT d.exempt && ARRAY(SELECT k FROM exempted)`,
 		tenant, actor.identityKey(), a.cfg.Now())
 	if err != nil {
 		return nil, err
@@ -2772,14 +2829,24 @@ func (a *Authorizer) hostResource(ctx context.Context, tenant string, s Scope) (
 // `has(resource.attributes.frozen)` does.
 func (a *Authorizer) resourceOf(ctx context.Context, tenant string, s Scope) (Resource, error) {
 	r, given, err := a.hostResource(ctx, tenant, s)
-	switch {
-	case err != nil || given:
+	if err != nil || given {
 		return r, err
-	case len(a.labels) > 0 || a.cfg.Attributes.Resource == nil || len(a.cfg.Attributes.Resource) > 0,
-		s.Type != TenantScope && s.Type != GroupScope && len(a.containers) > 0:
-		return Resource{}, fmt.Errorf("%w: the change reaches %s, whose containers, label and attributes only Config.ResourceOf gives", ErrInvalid, s.Key())
+	}
+	if err := a.storedWhole(s); err != nil {
+		return Resource{}, err
 	}
 	return r, nil
+}
+
+// storedWhole refuses checking a change on a scope as stored, without Config.ResourceOf, where that
+// isn't all of it, as resourceOf does: where the host declares labels, or resource attributes other
+// than as none, or for a scope other than the tenant or a group, containers.
+func (a *Authorizer) storedWhole(s Scope) error {
+	if len(a.labels) > 0 || a.cfg.Attributes.Resource == nil || len(a.cfg.Attributes.Resource) > 0 ||
+		s.Type != TenantScope && s.Type != GroupScope && len(a.containers) > 0 {
+		return fmt.Errorf("%w: the change reaches %s, whose containers, label and attributes only Config.ResourceOf gives", ErrInvalid, s.Key())
+	}
+	return nil
 }
 
 // membersCanJoin refuses members of groups that don't exist, or identities that aren't members or

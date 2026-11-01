@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io/fs"
 	"runtime"
 	"slices"
 	"strings"
@@ -657,6 +658,16 @@ func TestMigrateGivesWayToAChangeReadingItsTablesInAnotherOrder(t *testing.T) {
 	pool := pgtest.Open(t, "")
 	migrateFiles(t, pool, "", "0016")
 	recordMigrations(t, pool, "0016")
+	// This release's ChangeMembers reads the denies through rbac_changes_grants, which 0021 makes:
+	// the schema has it, as 0021 makes it, until the migration starts, which makes it again.
+	grants, err := fs.ReadFile(rbac.Migrations(), "0021_grant_denies.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	function, _, _ := strings.Cut(string(grants), "\n\nCREATE INDEX")
+	if _, err := pool.Exec(ctx, function); err != nil {
+		t.Fatal(err)
+	}
 	db := &rolesAfterDenies{Pool: pool}
 	cfg := rbac.Config{
 		Catalog:        append(slices.Clone(catalog), groupMembers),
@@ -677,6 +688,10 @@ func TestMigrateGivesWayToAChangeReadingItsTablesInAnotherOrder(t *testing.T) {
 	}
 	migrated := make(chan error, 1)
 	db.fire = func() {
+		if _, err := pool.Exec(ctx, `DROP FUNCTION rbac_changes_grants(text[])`); err != nil {
+			migrated <- err
+			return
+		}
 		go func() { migrated <- rbac.Migrate(context.WithoutCancel(ctx), pool) }()
 		// Until the migration, holding rbac_roles, waits for a table this transaction read.
 		for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
@@ -4209,6 +4224,279 @@ func TestAFreezeOnAGroupsScopeStopsDeletingIt(t *testing.T) {
 	}
 	if err := h.authz.DeleteGroup(ctx, groups, "t1", "dev"); !errors.Is(err, rbac.ErrDenied) {
 		t.Errorf("deleting a group a grant on whose scope it would revoke, where a deny removes the power to change grants: %v", err)
+	}
+}
+
+// Deleting a group revokes what is granted on its scope, so a deny there removing the actor's power
+// to change grants stops it as it stops Apply revoking there and ChangeMembers taking access away
+// there: on the group as Config.ResourceOf gives it, whether the host declares its attributes or
+// not. A deny of the groups the host says are frozen stops all three on one; a deny failing to read
+// whether one is, which on the group as stored, without attributes, would deny, stops none of them on
+// a group the host says isn't.
+func TestADenyOnAGroupsScopeReadsTheGroupAsTheHostGivesIt(t *testing.T) {
+	for _, frozen := range []bool{true, false} {
+		for _, declared := range []bool{false, true} {
+			t.Run(fmt.Sprintf("frozen %t, declared %t", frozen, declared), func(t *testing.T) { deniedAsGiven(t, frozen, declared) })
+		}
+	}
+}
+
+func deniedAsGiven(t *testing.T, frozen, declared bool) {
+	t.Helper()
+	ops := rbac.Resource{Tenant: "t1", Type: rbac.GroupScope, ID: "ops", Attributes: map[string]any{"frozen": frozen}}
+	h := grouped(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), groupAdmin, tenantGuard)
+		if declared {
+			c.Attributes = rbac.Attributes{Resource: map[string]rbac.AttributeType{"frozen": rbac.AttrBool}}
+		}
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s == ops.Scope() {
+				return ops, nil
+			}
+			r, err := resourceOf(ctx, tenant, s)
+			if declared && r.Attributes == nil {
+				r.Attributes = map[string]any{"frozen": false}
+			}
+			return r, err
+		}
+	})
+	ctx := t.Context()
+	h.groups(t, "ops", "crew")
+	h.seed(t, grant(ops.Scope(), "group.members", rbac.User, "lead"), grant(ops.Scope(), "group.members", rbac.Group, "crew"),
+		grant(rbac.TenantRoot("t1"), "group.admin", rbac.User, "groups"), grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "groups"),
+		grant(rbac.TenantRoot("t1"), "tenant.guard", rbac.User, "guardian"))
+	groups := h.as(t, "groups")
+	h.join(t, "u")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}}); err != nil {
+		t.Fatal(err)
+	}
+	condition := "resource.attributes.frozen == true"
+	if frozen {
+		condition = "has(resource.attributes.frozen) && " + condition
+	}
+	tenant := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1", Attributes: map[string]any{"frozen": false}}
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), tenant, rbac.Deny{
+		ID: "frozen", Principals: []rbac.Principal{groups.Principal}, Permissions: []rbac.Permission{rbac.GrantPermission(rbac.GroupScope)},
+		Condition: rbac.Condition{Expression: condition},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var want error
+	if frozen {
+		want = rbac.ErrDenied
+	}
+	// crew's grant on ops is left to revoke, whatever Apply revokes.
+	for what, change := range map[string]func() error{
+		"Apply revoking on its scope": func() error {
+			return h.authz.Apply(ctx, groups, ops, rbac.Change{Revoke: []rbac.Binding{{Role: "group.members", Principal: identity("lead")}}})
+		},
+		"ChangeMembers removing a member of a group holding access there": func() error {
+			return h.authz.ChangeMembers(ctx, groups, "t1", nil, []rbac.Member{{Group: "crew", Principal: identity("u")}})
+		},
+	} {
+		if err := change(); !errors.Is(err, want) {
+			t.Fatalf("%s: %v, want %v", what, err, want)
+		}
+	}
+	if err := h.authz.DeleteGroup(ctx, groups, "t1", "ops"); !errors.Is(err, want) {
+		t.Errorf("DeleteGroup: %v, want %v", err, want)
+	}
+	if held := allowed(t, h, h.as(t, "lead"), rbac.GroupMembers, ops); held != frozen {
+		t.Errorf("the lead manages ops's members %t, want %t", held, frozen)
+	}
+}
+
+// Without Config.ResourceOf a group is as stored, which is all of it only where the host declares
+// no labels and resource attributes as none. Where a deny binding the actor, or a constraint, may
+// stop it changing grants on groups, or the group's label refuse it, as one can where the actor's
+// label values don't satisfy every label, ChangeMembers refuses taking access away on a group's
+// scope rather than read the group so, and DeleteGroup revoking what is granted there is refused
+// too; a group nothing is granted on it deletes, revoking nothing.
+func TestWithoutResourceOfDeletingAGroupWithGrantsOnItIsRefusedWhereItCouldBeStopped(t *testing.T) {
+	for name, mutate := range map[string]func(*rbac.Config){
+		"a deny":  func(*rbac.Config) {},
+		"a label": withLabels,
+		"a constraint": func(c *rbac.Config) {
+			c.Constraints = []rbac.Constraint{{Name: "freeze", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+				return in.Permission == rbac.GrantPermission(rbac.GroupScope) && (in.Resource == nil || in.Resource.Attributes["frozen"] == true), nil
+			}}}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := grouped(t, func(c *rbac.Config) {
+				c.Catalog = append(slices.Clone(c.Catalog), groupAdmin, tenantGuard)
+				c.ResourceOf = nil
+			}, mutate)
+			ctx := t.Context()
+			ops := rbac.Resource{Tenant: "t1", Type: rbac.GroupScope, ID: "ops"}
+			h.groups(t, "ops", "spare", "crew")
+			h.seed(t, grant(ops.Scope(), "group.members", rbac.User, "lead"), grant(ops.Scope(), "group.members", rbac.Group, "crew"),
+				grant(rbac.TenantRoot("t1"), "tenant.guard", rbac.User, "guardian"))
+			groups, manager := h.as(t, "groups"), h.as(t, "manager")
+			h.join(t, "u")
+			if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}}); err != nil {
+				t.Fatal(err)
+			}
+			if name == "a deny" {
+				if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}, rbac.Deny{
+					ID: "frozen", Principals: []rbac.Principal{groups.Principal, manager.Principal}, Permissions: []rbac.Permission{rbac.GrantPermission(rbac.GroupScope)},
+					Condition: rbac.Condition{Expression: "has(resource.attributes.frozen) && resource.attributes.frozen"},
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := h.authz.ChangeMembers(ctx, manager, "t1", nil, []rbac.Member{{Group: "crew", Principal: identity("u")}}); !errors.Is(err, rbac.ErrInvalid) {
+				t.Fatalf("ChangeMembers removing a member of a group holding access on a group as stored: %v", err)
+			}
+			if err := h.authz.DeleteGroup(ctx, groups, "t1", "ops"); !errors.Is(err, rbac.ErrInvalid) {
+				t.Errorf("DeleteGroup revoking on a group as stored: %v", err)
+			}
+			if !allowed(t, h, h.as(t, "lead"), rbac.GroupMembers, ops) {
+				t.Error("the lead should still manage ops's members")
+			}
+			if err := h.authz.DeleteGroup(ctx, groups, "t1", "spare"); err != nil {
+				t.Errorf("DeleteGroup of a group nothing is granted on: %v", err)
+			}
+		})
+	}
+}
+
+// Without Config.ResourceOf, deleting a group with grants on it reads none of its label only where
+// the actor's label values satisfy every label: a value revoked while DeleteGroup asks the
+// constraints whether the actor may manage groups has the deletion tried again under its locks,
+// and refused then, as ChangeMembers taking access away there is.
+func TestALabelValueRevokedWhileDeleteGroupWaitsHasItTriedAgain(t *testing.T) {
+	var meanwhile func(context.Context) error
+	h := grouped(t, withLabels, func(c *rbac.Config) {
+		c.ResourceOf = nil
+		c.Constraints = []rbac.Constraint{{Name: "none", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if do := meanwhile; do != nil && in.Permission == rbac.ManageGroups {
+				meanwhile = nil
+				return false, do(ctx)
+			}
+			return false, nil
+		}}}
+	})
+	ctx := t.Context()
+	ops := rbac.Resource{Tenant: "t1", Type: rbac.GroupScope, ID: "ops"}
+	h.groups(t, "ops")
+	h.seed(t, grant(ops.Scope(), "group.members", rbac.User, "lead"))
+	h.hold(t, "groups", "level:high", "comp:alpha", "comp:bravo", "rel:usa", "rel:gbr", "rel:fra")
+	groups := h.as(t, "groups")
+	meanwhile = func(ctx context.Context) error {
+		_, err := h.pool.Exec(ctx, `DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:groups' AND role = 'rel.fra'`)
+		return err
+	}
+	if err := h.authz.DeleteGroup(ctx, groups, "t1", "ops"); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("deleting a group while a label value of the actor's was revoked: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("the value should have been revoked meanwhile")
+	}
+	if err := h.authz.DeleteGroup(ctx, groups, "t1", "ops"); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("tried again: %v", err)
+	}
+	if !allowed(t, h, h.as(t, "lead"), rbac.GroupMembers, ops) {
+		t.Fatal("the lead should still manage ops's members")
+	}
+}
+
+// A deny removing the actor's power to change grants on groups, set while DeleteGroup asks the
+// constraints whether a freeze may stop it, stops the deletion under its locks: no deny binding the
+// actor listed that power before, so it read neither the group from the host nor the denies on its
+// path, and is tried again, as a change to members is.
+func TestADenyOnChangingGrantsOnGroupsSetWhileDeleteGroupWaitsHasItTriedAgain(t *testing.T) {
+	var meanwhile func(context.Context) error
+	h := grouped(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), groupAdmin, tenantGuard)
+		c.Constraints = []rbac.Constraint{{Name: "none", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if do := meanwhile; do != nil && in.Permission == rbac.GrantPermission(rbac.GroupScope) && in.Resource == nil {
+				meanwhile = nil
+				return false, do(ctx)
+			}
+			return false, nil
+		}}}
+	})
+	ctx := t.Context()
+	ops := rbac.Resource{Tenant: "t1", Type: rbac.GroupScope, ID: "ops"}
+	h.groups(t, "ops")
+	h.seed(t, grant(ops.Scope(), "group.members", rbac.User, "lead"), grant(rbac.TenantRoot("t1"), "tenant.guard", rbac.User, "guardian"))
+	groups, guardian := h.as(t, "groups"), h.as(t, "guardian")
+	meanwhile = func(ctx context.Context) error {
+		return h.authz.SetDeny(ctx, guardian, rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}, rbac.Deny{
+			ID: "frozen", Principals: []rbac.Principal{groups.Principal}, Permissions: []rbac.Permission{rbac.GrantPermission(rbac.GroupScope)},
+		})
+	}
+	if err := h.authz.DeleteGroup(ctx, groups, "t1", "ops"); !errors.Is(err, rbac.ErrConflict) {
+		t.Fatalf("deleting a group while a deny on changing grants on groups was set: %v", err)
+	}
+	if meanwhile != nil {
+		t.Fatal("the deny should have been set meanwhile")
+	}
+	if err := h.authz.DeleteGroup(ctx, groups, "t1", "ops"); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("tried again: %v", err)
+	}
+	if !allowed(t, h, h.as(t, "lead"), rbac.GroupMembers, ops) {
+		t.Fatal("the lead should still manage ops's members")
+	}
+}
+
+// A change to members, and DeleteGroup, read which types of scope a deny binding the actor removes
+// its power to change grants on, wherever in the tenant it is, before their transaction and again
+// under its locks (grantsDenied): of the denies naming a key the actor is bound by, only those that
+// remove such a power, under a generic plan and planned for their arguments alike. Through the index
+// of every deny's principals, they read each denying the tenant's members root on a cluster of its
+// own.
+func TestChangingMembersReadsOfTheDeniesNamingTheActorOnlyThoseOnChangingGrants(t *testing.T) {
+	for _, plan := range []string{"generic", "custom"} {
+		t.Run(plan, func(t *testing.T) {
+			groups := rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}
+			h := crowded(t, pgtest.Open(t, "plan_cache_mode=force_"+plan+"_plan"), func(c *rbac.Config) {
+				c.Catalog = append(slices.Clone(c.Catalog), groupMembers, groups)
+			})
+			ctx := t.Context()
+			spare := rbac.Scope{Type: rbac.GroupScope, ID: "spare"}
+			h.groups(t, "oncall", "spare")
+			h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "boss"), grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "boss"),
+				grant(cluster.Scope(), "cluster.admin", rbac.User, "boss"), grant(cluster.Scope(), "cluster.login", rbac.Group, "oncall"),
+				grant(spare, "group.members", rbac.User, "lead"))
+			boss := h.as(t, "boss")
+			h.as(t, "bob")
+			h.as(t, "ann", "oncall")
+			n := 0
+			denies := func(more int) {
+				t.Helper()
+				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+					SELECT 't1', 'cluster', 'z' || i, 'd', '{members:t1}', '{cluster:root}' FROM generate_series($1::int + 1, $1::int + $2::int) i`, n, more); err != nil {
+					t.Fatal(err)
+				}
+				n += more
+				if _, err := h.pool.Exec(ctx, `ANALYZE rbac_denies`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			changes := map[string]func(a *rbac.Authorizer) error{
+				"adding": func(a *rbac.Authorizer) error {
+					return a.ChangeMembers(ctx, boss, "t1", []rbac.Member{{Group: "oncall", Principal: identity("bob")}}, nil)
+				},
+				"removing": func(a *rbac.Authorizer) error {
+					return a.ChangeMembers(ctx, boss, "t1", nil, []rbac.Member{{Group: "oncall", Principal: identity("ann")}})
+				},
+				"deleting": func(a *rbac.Authorizer) error { return a.DeleteGroup(ctx, boss, "t1", "spare") },
+			}
+			denies(500)
+			few := map[string]int64{}
+			for what, change := range changes {
+				few[what] = pagesChanging(ctx, t, h, change, "rbac_denies")["rbac_denies"]
+			}
+			denies(9500)
+			for what, change := range changes {
+				if many := pagesChanging(ctx, t, h, change, "rbac_denies")["rbac_denies"]; many > few[what]*3/2+deeper {
+					t.Errorf("%s read %d pages of denies beside 500 denying the members root on other clusters, and %d beside 10000", what, few[what], many)
+				}
+			}
+		})
 	}
 }
 

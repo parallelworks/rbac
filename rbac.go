@@ -761,17 +761,19 @@ type Config struct {
 	// ChangeMembers GroupMembers on each group it changes, on the resource it returns, and a change
 	// to a group's members as the grants and denies it amounts to, and a removal by the label, on
 	// each scope the group's access is on, the tenant's and groups' included, which the package knows
-	// only by type and id, on the resource it returns for each. Without it, a scope is taken as
-	// stored, its type and id directly under the tenant, with no attributes or label, as constraints
-	// see it too. GroupMembers is checked on a group as group management checks its permissions; the
-	// grants and denies a change amounts to only where that is all of the scope: for a host declaring
-	// no Labels, and resource Attributes as none (an empty map, as nil lets conditions read any), and
-	// on a scope other than the tenant or a group, no ContainerTypes. For any other, that change is
-	// refused. SetRole changing what a custom role's grants give, and DeleteRole, check the label of
-	// each scope the role is granted on, and where a deny on a scope other than the tenant binds the
-	// actor, the denies on its path, and SetRole widening it the label of each scope a role listing it,
-	// or listing one that does, is granted on, and the denies on its path, as it returns it, so with
-	// Labels declared, or such a deny, they need it too. A removal reads a scope it reports as
+	// only by type and id, on the resource it returns for each, as DeleteGroup checks revoking what
+	// is granted on the group where a constraint or a deny binding the actor may stop that. Without
+	// it, a scope is taken as stored, its type and id directly under the tenant, with no attributes or
+	// label, as constraints see it too. GroupMembers is checked on a group as group management checks
+	// its permissions; the grants and denies a change amounts to, DeleteGroup's revoking included,
+	// only where that is all of the scope: for a host declaring no Labels, and resource Attributes as
+	// none (an empty map, as nil lets conditions read any), and on a scope other than the tenant or a
+	// group, no ContainerTypes. For any other, that change is refused. SetRole changing what a custom
+	// role's grants give, and DeleteRole, check the label of each scope the role is granted on, and
+	// where a deny on a scope other than the tenant binds the actor, the denies on its path, and
+	// SetRole widening it the label of each scope a role listing it, or listing one that does, is
+	// granted on, and the denies on its path, as it returns it, so with Labels declared, or such a
+	// deny, they need it too. A removal reads a scope it reports as
 	// ErrNotFound as stored and unlabeled, and ChangeMembers and DeleteRole ask nothing of the scopes
 	// only a removal reaches where the actor's label values satisfy every label and, for DeleteRole,
 	// no such deny binds it, as SetRole asks nothing of the scopes roles listing the role are granted

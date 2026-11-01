@@ -289,12 +289,18 @@ scopes conditional ones reach, to check one by one.
   as `DeleteRole` deleting a role granted there, `ChangeMembers` removing a member of a group
   holding access there, making its place end sooner, ending an activation made there through the
   group, or adding a member to a group a deny there names, and `DeleteGroup` deleting a group with
-  grants or eligibilities in force on its own scope. Each is stopped by what it ends there, not by
-  what the members hold after it: a member leaving a group ends there what the group and those it
-  is in give it, a grant, eligibility, approval or exemption, so one that another group or a grant
-  of its own gives the same is stopped too, as `Apply` revoking a grant held twice is, and so is
-  one ending only an eligibility, as `DeleteEligibility` there is; but a place that ends while
-  another, from another source, keeps the member in its group as long ends nothing there.
+  grants or eligibilities in force on its own scope, which it reads, as `ChangeMembers` reads a
+  scope it takes access away on, as `Config.ResourceOf` gives it, so a condition reading the
+  group's attributes reads what the host passes `Apply` there. Each is stopped by what it ends
+  there, not by what the members hold after it: a member leaving a group ends there what the group
+  and those it is in give it, a grant, eligibility, approval or exemption, so one that another group
+  or a grant of its own gives the same is stopped too, as `Apply` revoking a grant held twice is,
+  and so is one ending only an eligibility, as `DeleteEligibility` there is; but a place that ends
+  while another, from another source, keeps the member in its group as long ends nothing there.
+  `SetRole` and `DeleteRole` decide a constraint, and a deny on the tenant, once for every scope of a
+  type the role's grants can be on, as of no resource and on the tenant, where a condition reading
+  the resource can't be evaluated and so denies: a role's grants span scopes no one reads, so they
+  are stopped wherever either may stop `Apply` on some scope of the type, not only on those it would.
   The host's own writes (`Import`, `DeleteGrants`, `SetMemberships`, `ImportMembers`,
   `DeleteMembers`, `DeleteGroups` and the host's deletes) make none of the checks an actor's change
   makes, so a freeze stops none of them: the host freezes those itself. The host is
@@ -353,20 +359,28 @@ scopes conditional ones reach, to check one by one.
   grows with how many they gain. The rest is the groups', read once however many of their members
   change, and what a group many of them are in reaches, once for all of them, and grows with what
   the groups hold, approve and are named or exempt in, so grant a group on a container rather than
-  on each resource in it: with labels or constraints declared, or a deny binding the actor, a
-  removal reads what its members lose. It asks the constraints once about changing grants on each
-  type of scope they lose access on, of no resource, and `Config.ResourceOf` about each such scope
-  only where the actor's label values don't satisfy every label, a constraint answered that it may
-  stop the actor on some scope of the type, or a deny binding the actor removes `<type>:grant` or
-  `<type>:*`: then the constraints again about each, and the denies on all their paths in one
-  read.
+  on each resource in it: with labels or constraints declared, or a deny binding the actor that
+  removes a power to change grants, a removal reads what its members lose. It asks the constraints
+  once about changing grants on each type of scope they lose access on, of no resource, and
+  `Config.ResourceOf` about each such scope only where the actor's label values don't satisfy every
+  label, a constraint answered that it may stop the actor on some scope of the type, or a deny
+  binding the actor removes `<type>:grant` or `<type>:*`: then the constraints again about each, and
+  the denies on all their paths in one read. Which types such a deny names, wherever it is, it reads
+  before its transaction and again under its locks, of the denies naming the actor, its groups, the
+  tenant's members or the public, through an index of those alone that remove a power to change
+  grants, so the others naming them, as of root on each of thousands of resources, cost it nothing;
+  `DeleteGroup` reads them so for the grants on the group it revokes.
   `Config.ResourceOf` gives the package the tenant, which `SetGroup` and `DeleteGroup` check
   `rbac.ManageGroups` on, and the groups, which `ChangeMembers` checks `rbac.GroupMembers` on and
   `SetGroup` and `DeleteGroup` the label of, each with its constraints and label, and the
-  containers, label and attributes of the scopes a group's access is on; a host without it declares
-  no labels and resource attributes as none, and for access below the tenant, no containers. For a
-  scope the host no longer has, as a resource deleted without `DeleteScopes`, it returns
-  `rbac.ErrNotFound`, or an error wrapping it: a change that only takes access away there, as a
+  containers, label and attributes of the scopes a group's access is on, and of a group whose own
+  scope `DeleteGroup` revokes grants on where a constraint, a deny binding the actor or its label
+  may stop that; a host without it declares no labels and resource attributes as none, and for
+  access below the tenant, no containers: otherwise a change checked on such a scope as stored is
+  refused, as `DeleteGroup` is once it finds anything granted on the group's own. A label can't stop
+  it where the actor's label values satisfy every label. For a scope the host no longer has, as a
+  resource deleted without `DeleteScopes`, it returns `rbac.ErrNotFound`, or an error wrapping it:
+  a change that only takes access away there, as a
   member leaving a group with access on it or the group itself, or joining one a deny there names, a
   place in the group made to end sooner, `DeleteGroup`, or `DeleteRole` deleting, or `SetRole`
   redefining so that no grant of it there widens, nor would once the catalog has it no longer be
@@ -581,12 +595,12 @@ have the server load a library or run a program of its choosing; and:
 3. The application's role has `USAGE` on the package's schema, without which it reads none of its
    tables; `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the package's tables but `rbac_history` and
    `rbac_migrations`, and on any a later migration adds; `EXECUTE` on the functions
-   `rbac_group_members`, `rbac_tenant_keys` and `rbac_text_array`, which every role has unless it
-   is revoked; and only `SELECT` on `rbac_history`, with no `UPDATE` on its id sequence,
-   which a grant on all the schema's sequences can give: `setval` could number a change below the
-   one before it, and `AsOf` would read the row as it was before the change. Never `TRIGGER`, which
-   `ALL` includes: a trigger runs its function as whoever writes the table, and one on
-   `rbac_history` can drop each record, as history's owner.
+   `rbac_group_members`, `rbac_tenant_keys`, `rbac_text_array` and `rbac_changes_grants`, which
+   every role has unless it is revoked; and only `SELECT` on `rbac_history`, with no `UPDATE` on its
+   id sequence, which a grant on all the schema's sequences can give: `setval` could number a change
+   below the one before it, and `AsOf` would read the row as it was before the change. Never
+   `TRIGGER`, which `ALL` includes: a trigger runs its function as whoever writes the table, and one
+   on `rbac_history` can drop each record, as history's owner.
 4. The application's role can make no schema and create in none: it neither owns the database nor
    has `CREATE` on it, which `CREATE SCHEMA` needs and only the owner has by default, and it
    creates in no schema it owns, as `public` is when that role owns the database, nor in `public`
@@ -698,6 +712,11 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   immediate, and `History` refuses an export's cursor before the one it went through. The trigger
   checks each record a prune deletes as its transaction commits, which took a window of 10,000
   records about twice as long to delete.
+  `0021_grant_denies` builds an index on `rbac_denies` of the denies that remove a power to change
+  grants, which keeps writes to it waiting until it commits, though reads go on. Its predicate calls
+  the function `rbac_changes_grants`, which it adds, so every role writing a deny calls it from then
+  on, as `ChangeMembers` and `DeleteGroup` do reading the denies: where new functions give PUBLIC no
+  `EXECUTE`, grant it to the application's role.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A call PostgreSQL refuses for a race, as a
   serialization failure, a deadlock between host transactions, or a lock it waited for past the

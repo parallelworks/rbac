@@ -450,6 +450,14 @@ func newReadmeRoles(t *testing.T) *readmeRoles {
 func (r *readmeRoles) harden(t *testing.T) {
 	t.Helper()
 	s := r.schema
+	// Of those step 3 lists, the functions made by now: hardened before a later migration made one,
+	// the schema gets it as every role does, from PUBLIC.
+	var made []string
+	if err := r.super.QueryRow(t.Context(), `SELECT array_agg($1 || '.' || proname ORDER BY proname) FROM pg_proc
+		WHERE pronamespace = $1::regnamespace AND proname = ANY($2::text[])`,
+		s, []string{"rbac_group_members", "rbac_tenant_keys", "rbac_text_array", "rbac_changes_grants"}).Scan(&made); err != nil {
+		t.Fatal(err)
+	}
 	for _, sql := range []string{
 		`REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA ` + s + ` FROM PUBLIC`,
 		// 2. History's role owns history and rbac_record, given them by a superuser, and needs
@@ -460,11 +468,11 @@ func (r *readmeRoles) harden(t *testing.T) {
 		`GRANT EXECUTE ON FUNCTION ` + s + `.rbac_tenant_keys, ` + s + `.rbac_text_array TO ` + r.history,
 		// 3. The application's role has USAGE on the schema, SELECT, INSERT, UPDATE and DELETE on
 		// its tables but rbac_history and rbac_migrations, EXECUTE on rbac_group_members,
-		// rbac_tenant_keys and rbac_text_array, and only SELECT on rbac_history.
+		// rbac_tenant_keys, rbac_text_array and rbac_changes_grants, and only SELECT on rbac_history.
 		`GRANT USAGE ON SCHEMA ` + s + ` TO ` + r.app,
 		`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ` + s + ` TO ` + r.app,
 		`REVOKE ALL ON ` + s + `.rbac_migrations FROM ` + r.app,
-		`GRANT EXECUTE ON FUNCTION ` + s + `.rbac_group_members, ` + s + `.rbac_tenant_keys, ` + s + `.rbac_text_array TO ` + r.app,
+		`GRANT EXECUTE ON FUNCTION ` + strings.Join(made, ", ") + ` TO ` + r.app,
 		`REVOKE INSERT, UPDATE, DELETE ON ` + s + `.rbac_history FROM ` + r.app,
 	} {
 		if _, err := r.super.Exec(t.Context(), sql); err != nil {
