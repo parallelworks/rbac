@@ -1611,6 +1611,52 @@ func TestDefiningARoleNeedsAnExemptionFromADenyHeldForGood(t *testing.T) {
 	}
 }
 
+// Narrowing or deleting a role hands nothing on, so a deny below the tenant that exempts its definer
+// only until a time has the host asked about none of the scopes the role is granted on, as one
+// exempting it for good doesn't; widening it does.
+func TestTakingAccessFromARoleAsksTheHostNothingOfAnExemptionUntilATime(t *testing.T) {
+	var asked []rbac.Scope
+	h, guardian := guarded(t, func(c *rbac.Config) {
+		of := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			asked = append(asked, s)
+			return of(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	x, r := definer(t, h)
+	h.as(t, "x", "contractors")
+	h.groups(t, "oncall")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "oncall", Principal: x.Principal, ExpiresAt: h.now.Add(time.Hour)}}); err != nil {
+		t.Fatal(err)
+	}
+	logs := r
+	logs.Permissions = []rbac.Permission{view, login}
+	if err := h.authz.SetRole(ctx, x, "t1", logs); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.SetDeny(ctx, guardian, workspace, rbac.Deny{
+		ID: "on-call", Permissions: []rbac.Permission{root},
+		Principals: []rbac.Principal{groupOf("contractors")}, Exempt: []rbac.Principal{groupOf("oncall")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), r.ID, rbac.User, "y"))
+	asked = nil
+	if err := h.authz.SetRole(ctx, x, "t1", r); err != nil || len(asked) > 0 {
+		t.Errorf("narrowing the role asked about %v: %v", asked, err)
+	}
+	wider := r
+	wider.Permissions = []rbac.Permission{view, root}
+	if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.Is(err, rbac.ErrDenied) || !slices.Contains(asked, cluster.Scope()) {
+		t.Errorf("widening the role asked about %v: %v", asked, err)
+	}
+	asked = nil
+	if err := h.authz.DeleteRole(ctx, x, "t1", r.ID); err != nil || len(asked) > 0 {
+		t.Errorf("deleting the role asked about %v: %v", asked, err)
+	}
+}
+
 // meanwhileAsked is a harness whose host runs meanwhile, once, the first time it is asked about a
 // grant made as via, as another change committing between a change's checks and its transaction.
 func meanwhileAsked(t *testing.T, via rbac.Via, meanwhile *func(context.Context) error) *harness {
