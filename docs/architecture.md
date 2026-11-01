@@ -458,6 +458,14 @@ sequenceDiagram
   when each grant's holding ends, in the statement that reads the grants, and a grant may end no
   later than the latest holding of each permission it hands on. An eligibility, a custom role's
   definition and a place in a group that gains an eligibility need what they hand on held for good.
+  Of the grants that count under a grant's condition, a decision reads only the role of each, how
+  its principal carries it and whether it lasts until the grant ends, so `decidedAs` decides a grant
+  until the soonest time at or after its end that the longest lasting of a kind of them ends, and
+  grants ending between two such times share a decision: grants of one role to the actor's many
+  groups, each ending at its own hour, are one kind, so a change granting a role to a thousand
+  principals, each until its own hour, walks the roles it lists once. `heldFor` and `under` read how
+  long the actor's grants give each permission, and the power to change grants, once for each
+  question, whatever end it asks about, so each later end is one comparison.
 - **Standing.** The host's answers rest on who is a member of what. `stand` fingerprints the
   memberships behind them, and `stillStanding` refuses the change with `ErrConflict` if any changed
   while the change waited for its locks.
@@ -595,13 +603,23 @@ flowchart TB
   can't read the tenant's attributes: any read of them fails, a test of one's presence included, so
   a grant's gives nothing and a deny's denies, rather than hold or lift for what the bare tenant
   lacks. A constraint deciding them by the tenant's state reads it itself, through its `q`.
+- **A change decides each value once.** A change checking the labels of many scopes by one read of
+  the actor's values, as one to the members of many groups, decides each value once in each phase,
+  when a label first asks for it (`decidedBy`), and shares what the conditions it evaluated came to
+  across them (`runs`), so a condition that doesn't read the action runs once for all of them. Each
+  value is still decided on budgets of its own, which pay for every condition they read, whether
+  they ran it or a value before them did, so it decides as a check of it alone would, and what one
+  label asked for first never changes what another is decided by.
 - **Releasing and writing.** `ReleasePermission(dimension)`, held on the tenant, is the power to
   release data to a looser label in that dimension, so only a holder of it can downgrade data. A
   `Holding`'s `MayWrite` and `MayRelease` say whether data read under one label may be written, or
   released, under another.
 - **Exclusive values are checked when they change.** A change that would let anyone hold two
   values of an Exclusive dimension is refused, after its writes and under its locks. `Conflicts`
-  lists anyone left able to, as a catalog change can leave them.
+  lists anyone left able to, as a catalog change can leave them. Which values an actor holds none
+  of, and so can't hand on, a change reaching many scopes decides from each path's grants
+  (`authorities`), reading each of its roles' permissions once for all of them. Where no dimension
+  is exclusive, nothing is read.
 
 ## Transactions and locks
 

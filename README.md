@@ -73,7 +73,11 @@ if err := authz.Authorize(ctx, subject, "cluster:login", cluster); err != nil {
   definition or a place in a group that outlasts it, so access approved for an hour stays an
   hour's. A grant outlives the actor's power to change grants, though: a power held for an hour
   grants for good what the actor holds for good, and the roles a role it holds lists, which it
-  needn't hold. Put expiries on roles that list none.
+  needn't hold. Put expiries on roles that list none. A change granting a role until many times,
+  as to many members each until its own, decides it once for each time that the longest lasting of
+  a kind of the actor's grants ends among them, not for each grant: a kind is a role held through
+  the actor or any of its groups, through the tenant's members, or through the public, so grants
+  of one role to its many groups, each ending at its own hour, are one kind.
 - **Creators:** nothing is owned. The host gives whoever creates a resource a role on it with
   `Import`, as an actor it names, in the same transaction through `WithTx`.
 
@@ -157,7 +161,10 @@ scopes conditional ones reach, to check one by one.
   an approval on a labeled scope by an approver whose own values, read with no request's
   attributes, don't satisfy its label, each reading the actor's or approver's values again under
   the change's locks, with the actor's grants there or the groups the approver approves by;
-  `Explain` names the dimension that failed.
+  `Explain` names the dimension that failed. A change checking the labels of many scopes, as one to
+  the members of many groups, decides each of the actor's values once in each phase, when a label
+  first asks for it, and evaluates a condition of the actor's that doesn't read the action once for
+  all of them, each value still on a budget of its own, as a check of it is.
   `Filter` tests a `text[]` label column (`Columns.Labels`), which needs no
   index, as the path's drives the query; `Reachable` returns the holding, and `Holding` with
   `Satisfies` checks data points in a feed without reading the database.
@@ -187,7 +194,9 @@ scopes conditional ones reach, to check one by one.
   any such role: the identity it grants one to is checked as in any change, so no one comes to hold
   two. Any other change reaching it is refused until a removal leaves it one; `Conflicts` lists
   them, reading the custom roles in the statement that reads their grants, so what it lists one
-  moment held, under `WithTx` too. A role giving two of them is refused. An `Ordered` dimension's
+  moment held, under `WithTx` too. A change reaching many scopes decides which values its actor
+  holds none of on each by reading each of the actor's roles once for all of them, and where no
+  dimension is exclusive, not at all. A role giving two of them is refused. An `Ordered` dimension's
   higher values include the lower, so it isn't exclusive, and in an `AllOf` one a label naming two
   is one no one can read, as data that joins two parties is.
 - **Conditions:** a grant can carry a CEL expression over the subject's, the resource's and the
