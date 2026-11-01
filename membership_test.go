@@ -4035,6 +4035,25 @@ func TestADenyOnChangingGrantsSetWhileMembersAreCheckedIsTriedAgain(t *testing.T
 	}
 }
 
+// Deleting a group that doesn't exist does nothing, and asks Config.ResourceOf nothing of it, under
+// a freeze on groups as where a label would be asked for.
+func TestDeletingAGroupThatDoesntExistUnderAFreezeAsksTheHostNothing(t *testing.T) {
+	asked := false
+	h := grouped(t, constrain("freeze", rbac.GrantPermission(rbac.GroupScope)), func(c *rbac.Config) {
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s.Type == rbac.GroupScope {
+				asked = true
+				return rbac.Resource{}, errors.New("no such group")
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	if err := h.authz.DeleteGroup(t.Context(), h.as(t, "groups"), "t1", "ghost"); err != nil || asked {
+		t.Fatalf("deleting a group that doesn't exist under a freeze: %v, Config.ResourceOf asked: %t", err, asked)
+	}
+}
+
 // Deleting a group revokes what is granted on its scope, so while anything is, a freeze there
 // stops it, as it stops Apply revoking there: a constraint, or a deny on its path, that removes the
 // actor's power to change grants on it.

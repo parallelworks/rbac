@@ -629,7 +629,8 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 		return err
 	}
 	// A group that doesn't exist has no label to ask the host for, and deleting it does nothing.
-	// Without declared labels none is asked for, so one made meanwhile needs no new check.
+	// Without declared labels, or a freeze, none is asked for, so one made meanwhile needs no new
+	// check.
 	existed, group := true, Resource{Tenant: tenant, Type: GroupScope, ID: id}
 	if len(a.labels) > 0 {
 		if existed, err = groupExists(ctx, a.db, tenant, id); err != nil {
@@ -643,15 +644,21 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 	}
 	// Asked before the transaction, as hooks run outside it, whether or not anything is granted on
 	// its scope, which only the transaction reads under the group's lock; and about the group as the
-	// host gives it only where one may stop it.
-	revoking := &reachCheck{on: group, leaves: true, bound: true}
-	if revoking.frozen, err = a.freezes(ctx, actor, tenant, GroupScope); err != nil {
+	// host gives it only where one may stop it, and it exists, as for its label.
+	freeze, err := a.freezes(ctx, actor, tenant, GroupScope)
+	if err != nil {
 		return err
 	}
+	revoking := &reachCheck{on: group, leaves: true, frozen: freeze != "", bound: true}
 	if revoking.frozen {
 		if len(a.labels) == 0 {
-			if revoking.on, _, err = a.groupOf(ctx, tenant, id, true); err != nil {
+			if existed, err = groupExists(ctx, a.db, tenant, id); err != nil {
 				return err
+			}
+			if existed {
+				if revoking.on, _, err = a.groupOf(ctx, tenant, id, true); err != nil {
+					return err
+				}
 			}
 		}
 		revoking.cs = a.constrain(ctx, actor, revoking.on)
@@ -2403,16 +2410,15 @@ func (c *reachCheck) stopped(au authority, change string) error {
 	return nil
 }
 
-// freezes reports whether a constraint may stop actor changing grants on scopes of a type in a
-// tenant: asked of no resource, as one answers true that removes the power on any of them, as
-// SetRole and DeleteRole ask. A change taking access away on scopes of the type then asks it again
-// about each, as Config.ResourceOf gives it, as Apply asks about the scope it revokes on.
-func (a *Authorizer) freezes(ctx context.Context, actor Subject, tenant, scopeType string) (bool, error) {
+// freezes names the constraint that may stop actor changing grants on scopes of a type in a
+// tenant, or "": asked of no resource, as one answers true that removes the power on any of them,
+// as SetRole and DeleteRole ask. A change taking access away on scopes of the type then asks it
+// again about each, as Config.ResourceOf gives it, as Apply asks about the scope it revokes on.
+func (a *Authorizer) freezes(ctx context.Context, actor Subject, tenant, scopeType string) (string, error) {
 	if len(a.cfg.Constraints) == 0 {
-		return false, nil
+		return "", nil
 	}
-	name, err := a.denied(ctx, ConstraintInput{Tenant: tenant, ResourceType: scopeType, Permission: GrantPermission(scopeType), Subject: &actor})
-	return name != "", err
+	return a.denied(ctx, ConstraintInput{Tenant: tenant, ResourceType: scopeType, Permission: GrantPermission(scopeType), Subject: &actor})
 }
 
 // grantsDenied reads, on q, the scope types whose power to change grants a deny on some scope of a
@@ -2533,10 +2539,11 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 		if c.leaves && len(c.grants) == 0 {
 			f, asked := frozen[s.Type]
 			if !asked {
-				var err error
-				if f, err = a.freezes(ctx, actor, tenant, s.Type); err != nil {
+				freeze, err := a.freezes(ctx, actor, tenant, s.Type)
+				if err != nil {
 					return nil, err
 				}
+				f = freeze != ""
 				frozen[s.Type] = f
 			}
 			c.frozen, c.bound = f, bound[s.Type]
