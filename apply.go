@@ -1483,11 +1483,10 @@ func (au authority) decidedAs(condition string, until time.Time) (string, time.T
 }
 
 // kindsLasting is how long each kind of the actor's grants that count under condition lasts: those
-// of a role whose principals carry what it gives alike (holding.carries).
+// of a role through principals of one carrier, which carry what it gives alike (Principal.carrier).
 func (au authority) kindsLasting(condition string) []lasting {
 	type kind struct {
-		role Role
-		// carrier is the kind of a broad principal, empty for any other.
+		role    Role
 		carrier PrincipalKind
 	}
 	by := map[kind]lasting{}
@@ -1495,10 +1494,7 @@ func (au authority) kindsLasting(condition string) []lasting {
 		if !g.under(au.subjects, condition) {
 			continue
 		}
-		k := kind{role: g.Role}
-		if g.Principal.broad() {
-			k.carrier = g.Principal.Kind
-		}
+		k := kind{g.Role, g.Principal.carrier()}
 		by[k] = by[k].with(g)
 	}
 	return slices.Collect(maps.Values(by))

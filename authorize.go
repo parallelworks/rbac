@@ -287,7 +287,7 @@ func gives(roles book, h holding, p Permission, resourceType string) bool {
 // it, and for a privileged role never through the tenant's members or the public, so a catalog
 // change that makes a role privileged reaches what they hold.
 func (h holding) carries(def RoleDefinition, p Permission) bool {
-	return h.Principal.carries(def, p) && (!h.Principal.broad() || !def.Privileged)
+	return h.Principal.carries(def, p) && (h.Principal.carrier() == "" || !def.Privileged)
 }
 
 // Permissions lists what the subject may do to r, sorted: the AuthZEN action search.
