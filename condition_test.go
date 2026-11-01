@@ -1546,21 +1546,8 @@ func TestComparingMapsDecidesAsCELDoes(t *testing.T) {
 // checks as of another's type needn't have: converting `(dyn([true]) + [""])[0]` made "true" where
 // CEL's conversion fails, and a grant's `!=` held.
 func TestFiniteValuesDecideAsCELDoes(t *testing.T) {
-	env, err := cel.NewEnv(cel.Variable("request", cel.MapType(cel.StringType, cel.DynType)))
-	if err != nil {
-		t.Fatal(err)
-	}
 	celEval := func(expr string, attributes map[string]any) (ref.Val, error) {
-		checked, iss := env.Compile(expr)
-		if iss.Err() != nil {
-			t.Fatal(iss.Err())
-		}
-		prg, err := env.Program(checked)
-		if err != nil {
-			t.Fatal(err)
-		}
-		out, _, err := prg.Eval(map[string]any{"request": map[string]any{"attributes": attributes}})
-		return out, err
+		return evaluatedByCEL(t, expr, attributes)
 	}
 	decides := func(expr string, attributes map[string]any) {
 		t.Helper()
@@ -1714,6 +1701,63 @@ func TestFiniteValuesDecideAsCELDoes(t *testing.T) {
 				t.Errorf("%s of %s: held %t, evaluated %t, %v; CEL decides %v, %v of what it holds", expr, x, held, evaluated, rerr, out, err)
 			}
 		}
+	}
+}
+
+// evaluatedByCEL is what expr evaluates to on a request with attributes in CEL, as it would without
+// this package.
+func evaluatedByCEL(t *testing.T, expr string, attributes map[string]any) (ref.Val, error) {
+	t.Helper()
+	env, err := cel.NewEnv(cel.Variable("request", cel.MapType(cel.StringType, cel.DynType)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked, iss := env.Compile(expr)
+	if iss.Err() != nil {
+		t.Fatal(iss.Err())
+	}
+	prg, err := env.Program(checked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _, err := prg.Eval(map[string]any{"request": map[string]any{"attributes": attributes}})
+	return out, err
+}
+
+// CEL indexes a map or a list by a key as the Go value the host passed, and fails for one of a type
+// it doesn't index by, as an int8, a named type, a pointer, a JSON number or text, or a wrapper,
+// though it reads each as one of its own everywhere else, so `k in m` held where `m[k]` failed. A
+// check reads each as CEL reads it, so indexing by one decides as CEL decides indexing by the value
+// it reads it as.
+func TestAKeyIndexesAsTheValueItIsReadAs(t *testing.T) {
+	one, a := 1, "a"
+	keys := map[string]any{
+		"an int8": int8(1), "a uint16": uint16(1), "a float32": float32(1), "a named string": named("a"),
+		"a pointer to an int": &one, "a pointer to a string": &a, "a JSON number": json.Number("1"),
+		"JSON text": json.RawMessage(`"a"`), "a JSON number's text": json.RawMessage(`1`),
+		"a string wrapper": wrapperspb.String("a"), "an int wrapper": wrapperspb.Int64(1),
+	}
+	indexed := map[string]any{
+		"a list": []any{"x", "a"}, "a map of ints": map[int64]any{1: "a"}, "a map of strings": map[string]any{"a": "a"},
+		"a map of either": map[any]any{int64(1): "a", "a": "a"}, "a map of int8s": map[int8]string{1: "a"},
+	}
+	evaluated := 0
+	for k, key := range keys {
+		for m, of := range indexed {
+			for _, expr := range []string{`request.attributes.m[request.attributes.k] == "a"`, `request.attributes.m[request.attributes.k] != "a"`} {
+				out, err := evaluatedByCEL(t, expr, map[string]any{"m": of, "k": types.DefaultTypeAdapter.NativeToValue(key)})
+				held, ok, _, rerr := rbac.EvaluateCondition(t, expr, map[string]any{"m": of, "k": key})
+				if rerr != nil || ok != (err == nil) || ok && held != out.Value() {
+					t.Errorf("%s by %s in %s: held %t, evaluated %t, %v; CEL decides %v, %v of the value it reads", expr, k, m, held, ok, rerr, out, err)
+				}
+				if ok {
+					evaluated++
+				}
+			}
+		}
+	}
+	if evaluated == 0 {
+		t.Error("no key indexed")
 	}
 }
 

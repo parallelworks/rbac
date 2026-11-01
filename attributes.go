@@ -58,19 +58,27 @@ import (
 // whole to read, JSON text (json.RawMessage), a JSON number (json.Number), a packed message
 // (anypb.Any), or a message of a dynamic type or of a host's type embedding one, is converted once
 // for each check, the first time a condition reads it, at about what decoding it cost the host,
-// rather than each time, though messages reaching the same message, or JSON texts sharing their
-// bytes, are each converted whole; such a message reaching one message twice, itself included,
-// fails, and so does a packed message packing another, which CEL unpacks in turn, copying all each
-// packs. So does a value CEL can't read, as a struct, which it would write out whole, and an array
-// of more than 1 KiB of bytes, or a list or a map holding arrays or structs of more than 1 KiB
-// each, which it copies whole each time a condition reads it. A value of a host's own type CEL
-// reads as one of its own, as a double or a string, is read as the value it holds (its Value), so
-// it compares as CEL's own does, from either side, and fails where it isn't finite; a list or a map
-// the host makes, of its own type or of CEL's, is read by its own methods, each value it yields
-// read so, and one of CEL's converts the Go values it was made of as the adapter it was made with
-// does, each time a condition reads one. A key a map yields that is of such a type is read as the
-// map holds it, so the map finds it, but for one that isn't finite, which fails what compares it. A
-// value holding itself fails whatever reads it whole.
+// rather than each time; such a message reaching one message twice, itself included, fails, and so
+// does a packed message packing another, which CEL unpacks in turn, copying all each packs. So does
+// a value CEL can't read, as a struct, which it would write out whole, and an array of more than
+// 1 KiB of bytes, or a list or a map holding arrays or structs of more than 1 KiB each, which it
+// copies whole each time a condition reads it; a value that fails to read, so or as CEL fails to
+// read a nil pointer, invalid JSON or a packed message of a type it doesn't know, fails a test of
+// its presence, has(), too, which CEL answers without reading it. Each value converted once is
+// converted whole, what it shares with another too, so a host should pass no two sharing what they
+// hold, as decoding never makes them: a thousand messages of a dynamic type reaching one message of
+// a mebibyte, or JSON texts sharing a mebibyte of bytes, take a check a second or more, which no
+// condition is charged for. A value of a host's own type CEL reads as one of its own, as a double
+// or a string, is read as the value it holds (its Value), so it compares as CEL's own does, from
+// either side, and fails where it isn't finite; a list or a map the host makes, of its own type or
+// of CEL's, is read by its own methods, each value it yields read so, and one of CEL's converts the
+// Go values it was made of as the adapter it was made with does, each time a condition reads one,
+// so a host should make none over a value CEL decodes or merges whole. A key a map yields of such a
+// type of the host's is read as the map holds it, so the map finds it, but for one that isn't
+// finite, which fails what compares it. A value a condition indexes a map or a list by is read as
+// any other, as in `m[k]`: CEL indexes by the Go value the host passed, and fails for one of a type
+// it doesn't index by, as an int8, a pointer, JSON or a wrapper, though it reads it as one of its
+// own everywhere else. A value holding itself fails whatever reads it whole.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
@@ -157,7 +165,9 @@ const maxCopied = 1 << 10
 //     holding itself recurses until the stack overflows, which no recover catches, and copies one
 //     reached twice for each path to it. So does a packed message packing another (packsAnother).
 //     Messages that reach the same message, or JSON texts sharing their bytes, are each converted
-//     whole, which can take longer than decoding what the host passed did.
+//     whole, which can take far longer than decoding what the host passed did, and isn't charged:
+//     charging the check would let what one condition reads fail the others, so a host is to pass
+//     none (Attributes).
 //   - A value CEL can't read, as a struct, fails without being written out: CEL writes it whole into
 //     its error, and without end where it holds itself.
 //   - An array of bytes of more than maxCopied, or a list or a map holding arrays or structs of more

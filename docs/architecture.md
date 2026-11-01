@@ -388,9 +388,14 @@ sequenceDiagram
   merges whole each time a condition reads it, as JSON text or a packed or dynamic message, is
   converted once for the check, and one CEL unpacks in turn, a packed message packing another,
   fails; one CEL would write out whole into an error, as a struct, or copy whole on each read, as an
-  array of more than 1 KiB of bytes, fails; and one of the host's type CEL reads as one of its own,
-  as a double, is read as the value it holds, but as a map's key, which is read as the map holds it,
-  so the map finds it. A list or map the host makes, of its own type or of CEL's, is read by its
+  array of more than 1 KiB of bytes, fails, a test of its presence too; and one of the host's type
+  CEL reads as one of its own, as a double, is read as the value it holds, but as a map's key, which
+  is read as the map holds it, so the map finds it. A key a condition indexes by is read as any
+  value is, where CEL indexes only by Go values of the types it names, failing for an `int8` or
+  JSON. What is converted once is converted
+  whole, uncharged: charging the check would let what one condition reads fail the others, so the
+  host is to pass no two values sharing what they hold, as messages reaching one message or JSON
+  texts sharing bytes. A list or map the host makes, of its own type or of CEL's, is read by its
   own methods, each value it yields through the conversion. So a read costs what it is charged
   however the host passes the value, but in a list or map of CEL's made over it, and a comparison
   that fails where either value holds a double that isn't finite, as a key too, sees every such

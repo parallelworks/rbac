@@ -40,16 +40,17 @@ import (
 // converting one to a string or keying a map by one, is false, though `in` a map the host passes
 // keyed by one, or by a list holding one, is false for a key it doesn't hold (Attributes). A value
 // the host passes is read as CEL reads it, but for what CEL would decode or copy whole each time a
-// condition reads it, which is decoded once for a check, or fails (Attributes), so reading one
-// costs what reading any value of its size does, however it is passed. A label value and a power to
-// release are decided on the tenant with no attributes, whatever a check passes (Holding), and
-// their conditions can't read the tenant's: any read of resource.attributes fails, a test of an
-// attribute's presence, in, size(), a macro and a comparison included, so a grant's gives nothing
-// and a deny's applies. The zero Condition is none, and one with a title or description has an
-// expression. A pattern it matches is a string literal, of bounded size; it nests at most 32 deep;
-// it builds no message, as `google.protobuf.Struct{}`; and a comparison, or a search of a list,
-// that would read more than a condition may spend, or reading a time in a zone whose name is longer
-// than 64 bytes, fails before it runs.
+// condition reads it, which is decoded once for a check, or fails, a test of its presence too
+// (Attributes), so reading one costs what reading any value of its size does, however it is passed,
+// but in a list or a map of CEL's own the host makes. A label value and a power to release are
+// decided on the tenant with no attributes, whatever a check passes (Holding), and their conditions
+// can't read the tenant's: any read of resource.attributes fails, a test of an attribute's
+// presence, in, size(), a macro and a comparison included, so a grant's gives nothing and a deny's
+// applies. The zero Condition is none, and one with a title or description has an expression. A
+// pattern it matches is a string literal, of bounded size; it nests at most 32 deep; it builds no
+// message, as `google.protobuf.Struct{}`; and a comparison, or a search of a list, that would read
+// more than a condition may spend, or reading a time in a zone whose name is longer than 64 bytes,
+// fails before it runs.
 //
 // Each condition runs within the most evaluating it can cost, which its literals and types bound:
 // little for one comparing what a request passes with literals, or with the subject's kind or id,
