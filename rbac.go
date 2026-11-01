@@ -694,7 +694,8 @@ type Config struct {
 	// under a container does, stops access being taken away there by any change an actor makes:
 	// ChangeMembers asks once about each type of scope only a removal reaches, of no resource, and
 	// again about each such scope where one answers true, and DeleteGroup likewise about groups, and
-	// then the group. The host's own writes ask nothing, as Import and DeleteGrants don't.
+	// then the group, where it exists. The host's own writes ask nothing, as Import and DeleteGrants
+	// don't.
 	Constraints []Constraint
 	// ResourceOf returns the resource a scope is, with its ancestors, attributes and label, as the
 	// host passes it to a check. SetGroup and DeleteGroup check ManageGroups on the tenant, and,

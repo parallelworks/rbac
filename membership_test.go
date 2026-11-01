@@ -4102,22 +4102,50 @@ func TestADenyOnChangingGrantsSetWhileTheHostIsAskedStopsARemoval(t *testing.T) 
 	}
 }
 
-// Deleting a group that doesn't exist does nothing, and asks Config.ResourceOf nothing of it, under
-// a freeze on groups as where a label would be asked for.
+// Deleting a group that doesn't exist does nothing, and asks Config.ResourceOf nothing of it, nor
+// the constraints, under a freeze on groups as where a label would be asked for, with labels
+// declared or not: a constraint that fails on a group the host doesn't know fails no deletion of
+// it. One that exists is asked about.
 func TestDeletingAGroupThatDoesntExistUnderAFreezeAsksTheHostNothing(t *testing.T) {
-	asked := false
-	h := grouped(t, constrain("freeze", rbac.GrantPermission(rbac.GroupScope)), func(c *rbac.Config) {
-		resourceOf := c.ResourceOf
-		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
-			if s.Type == rbac.GroupScope {
-				asked = true
-				return rbac.Resource{}, errors.New("no such group")
+	for _, labels := range []bool{false, true} {
+		t.Run(fmt.Sprintf("labels %t", labels), func(t *testing.T) {
+			var asked []string
+			mutate := []func(*rbac.Config){func(c *rbac.Config) {
+				resourceOf := c.ResourceOf
+				c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+					if s.Type == rbac.GroupScope {
+						asked = append(asked, "ResourceOf "+s.ID)
+						if s.ID == "ghost" {
+							return rbac.Resource{}, errors.New("no such group")
+						}
+					}
+					return resourceOf(ctx, tenant, s)
+				}
+				c.Constraints = []rbac.Constraint{{Name: "freeze", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+					if in.Permission != rbac.GrantPermission(rbac.GroupScope) {
+						return false, nil
+					}
+					if r := in.Resource; r != nil && r.Type == rbac.GroupScope {
+						asked = append(asked, "freeze "+r.ID)
+						if r.ID == "ghost" {
+							return false, errors.New("no such group")
+						}
+					}
+					return true, nil
+				}}}
+			}}
+			if labels {
+				mutate = append(mutate, withLabels)
 			}
-			return resourceOf(ctx, tenant, s)
-		}
-	})
-	if err := h.authz.DeleteGroup(t.Context(), h.as(t, "groups"), "t1", "ghost"); err != nil || asked {
-		t.Fatalf("deleting a group that doesn't exist under a freeze: %v, Config.ResourceOf asked: %t", err, asked)
+			h := grouped(t, mutate...)
+			if err := h.authz.DeleteGroup(t.Context(), h.as(t, "groups"), "t1", "ghost"); err != nil || len(asked) > 0 {
+				t.Fatalf("deleting a group that doesn't exist under a freeze: %v, asked %q", err, asked)
+			}
+			h.groups(t, "real")
+			if err := h.authz.DeleteGroup(t.Context(), h.as(t, "groups"), "t1", "real"); err != nil || !slices.Contains(asked, "freeze real") {
+				t.Fatalf("deleting a group that exists under a freeze: %v, asked %q", err, asked)
+			}
+		})
 	}
 }
 

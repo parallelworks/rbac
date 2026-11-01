@@ -599,8 +599,8 @@ func upsertGroups(ctx context.Context, tx pgx.Tx, tenant string, actor Principal
 // granted on the group's own scope goes with it, its grants and eligibilities there revoked, so a
 // constraint or a deny on its path that stops the actor changing grants there stops it, as it
 // would revoking them with Apply, while any is in force. Deleting a group that doesn't exist does
-// nothing, and asks Config.ResourceOf nothing of it; one the host no longer has (ErrNotFound) it
-// reads as unlabeled, as a removal reads any scope.
+// nothing, and asks Config.ResourceOf and the constraints nothing of it; one the host no longer
+// has (ErrNotFound) it reads as unlabeled, as a removal reads any scope.
 func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id string) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "DeleteGroup")
@@ -644,23 +644,24 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 	}
 	// Asked before the transaction, as hooks run outside it, whether or not anything is granted on
 	// its scope, which only the transaction reads under the group's lock; and about the group as the
-	// host gives it only where one may stop it, and it exists, as for its label.
+	// host gives it only where one may stop it, and it exists, as for its label: one that doesn't
+	// is deleted as nothing, so no constraint's answer about it could refuse that.
 	freeze, err := a.freezes(ctx, actor, tenant, GroupScope)
 	if err != nil {
 		return err
 	}
 	revoking := &reachCheck{on: group, leaves: true, frozen: freeze != "", bound: true}
-	if revoking.frozen {
-		if len(a.labels) == 0 {
-			if existed, err = groupExists(ctx, a.db, tenant, id); err != nil {
+	if revoking.frozen && len(a.labels) == 0 {
+		if existed, err = groupExists(ctx, a.db, tenant, id); err != nil {
+			return err
+		}
+		if existed {
+			if revoking.on, _, err = a.groupOf(ctx, tenant, id, true); err != nil {
 				return err
 			}
-			if existed {
-				if revoking.on, _, err = a.groupOf(ctx, tenant, id, true); err != nil {
-					return err
-				}
-			}
 		}
+	}
+	if revoking.frozen && existed {
 		revoking.cs = a.constrain(ctx, actor, revoking.on)
 		revoking.cs.removes(GrantPermission(GroupScope), GroupScope)
 		if err := revoking.cs.failed(); err != nil {
