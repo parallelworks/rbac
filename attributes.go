@@ -74,8 +74,10 @@ import (
 // nested deeper than JSON text may, 10,000 deep, and a value holding itself. A list or a map
 // holding one reads the rest. A value reached twice, as a map two lists hold, is converted once. A
 // check converts at most maxConverted of what the host passes, counted as reading it costs a
-// condition, one for each value and a tenth of each string's, bytes' or JSON text's length: past
-// that, every condition reading an attribute of any kind fails. A declared attribute is a value of
+// condition, one for each value and a tenth of each string's, bytes', JSON number's, JSON text's or
+// packed type URL's length, and half a packed message's, as a packed value takes as few as two
+// bytes: past that, every condition reading an attribute of any kind fails, and JSON text that may
+// hold more values than are left isn't parsed. A declared attribute is a value of
 // its type as converted, so a named string type is a string.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
@@ -440,10 +442,17 @@ func holdsKey(m map[ref.Val]ref.Val, k ref.Val) bool {
 	return other != nil && ok
 }
 
-// json is v, JSON text, parsed, at a tenth of its length, once for each text a check passes.
+// json is v, JSON text, parsed, at a tenth of its length, once for each text a check passes. Text
+// that may hold more values than are left isn't parsed: a value takes as few as two bytes, as `0,`,
+// and parsing a mebibyte of them, only to find more than a check may convert, took a tenth of a
+// second and 80 MB.
 func (c *converter) json(v reflect.Value) ref.Val {
 	return c.once(v, func() ref.Val {
 		if !c.pay(length(v.Len()) / 10) {
+			return tooLarge()
+		}
+		if jsonValues(v.Bytes()) > c.left {
+			c.over, c.left = true, 0
 			return tooLarge()
 		}
 		var parsed any
@@ -454,13 +463,35 @@ func (c *converter) json(v reflect.Value) ref.Val {
 	})
 }
 
-// number is n, a JSON number, an int where it is one and a double where it isn't, as CEL reads it.
+// jsonValues is at least how many values and keys JSON text text holds: each but the first follows
+// a bracket, a brace, a comma or a colon outside a string.
+func jsonValues(text []byte) uint64 {
+	n, quoted := uint64(1), false
+	for i := 0; i < len(text); i++ {
+		switch b := text[i]; {
+		case quoted && b == '\\':
+			i++
+		case b == '"':
+			quoted = !quoted
+		case !quoted && (b == '[' || b == '{' || b == ',' || b == ':'):
+			n++
+		}
+	}
+	return n
+}
+
+// number is n, a JSON number, an int where it is one and a double where it isn't, as CEL reads it,
+// at a tenth of its length whether it is one or not: parsing it reads it whole, and copies it into
+// the error where it isn't one.
 func (c *converter) number(n string) ref.Val {
+	if !c.pay(uint64(len(n)) / 10) {
+		return tooLarge()
+	}
 	if i, err := json.Number(n).Int64(); err == nil {
-		return c.spend(uint64(len(n))/10, types.Int(i))
+		return types.Int(i)
 	}
 	if f, err := json.Number(n).Float64(); err == nil {
-		return c.spend(uint64(len(n))/10, types.Double(f))
+		return types.Double(f)
 	}
 	return types.NewErr("rbac: a condition can't read the JSON number %.64q", n)
 }
@@ -539,7 +570,11 @@ func (c *converter) message(v reflect.Value) ref.Val {
 		return types.Duration{Duration: m.AsDuration()}
 	case *anypb.Any:
 		return c.once(v, func() ref.Val {
-			if !c.pay(uint64(len(m.GetValue())) / 10) {
+			// Finding the type hashes its URL whole, and a packed value takes as few as two bytes, as an
+			// empty one in a list does: Anys sharing a mebibyte's URL, each charged one, took a third of
+			// a millisecond each, and decoding a mebibyte of values, only to find more than a check may
+			// convert, took a tenth of a second.
+			if !c.pay(uint64(len(m.GetTypeUrl()))/10 + uint64(len(m.GetValue()))/2) {
 				return tooLarge()
 			}
 			packed, err := m.UnmarshalNew()
@@ -555,7 +590,9 @@ func (c *converter) message(v reflect.Value) ref.Val {
 	return cantRead(v.Type())
 }
 
-func cantRead(t reflect.Type) ref.Val { return types.NewErr("rbac: a condition can't read a %s", t) }
+// cantRead fails a value of type t, naming no more of the type than its start, as each such value is
+// charged one, whatever its type's name, which a type of many fields spells out whole.
+func cantRead(t reflect.Type) ref.Val { return types.NewErr("rbac: a condition can't read a %.64s", t) }
 
 func tooLarge() ref.Val {
 	return types.NewErr("rbac: the attributes a check passes are larger than a condition may read")

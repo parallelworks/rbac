@@ -400,6 +400,19 @@ func EvaluateCondition(t *testing.T, expr string, attributes map[string]any) (he
 // MaxConverted is the most a check converts of what the host passes.
 const MaxConverted = maxConverted
 
+// Converting is what converting attributes as a check does allocates, and whether they were more
+// than a check converts.
+func Converting(t *testing.T, attributes map[string]any) (allocated uint64, over bool) {
+	t.Helper()
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	c := newConverter()
+	c.attributes(attributes)
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc, c.over
+}
+
 // EvaluateConditionOn is what evaluating expr costs, on a request whose attributes are as given,
 // none converted, as values no host can pass are, which a test reads a condition's work by, and
 // whether it held and could be evaluated.

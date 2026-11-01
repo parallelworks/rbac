@@ -233,10 +233,11 @@ scopes conditional ones reach, to check one by one.
   though it says it is one of CEL's types, a list, map or optional of CEL's a host makes, a struct,
   a channel, a func, any other message, a map keyed by anything else, as a double or an array, a
   map holding two keys read as the same value, as `1` and `1u`, invalid JSON, a value nested more
-  than 10,000 deep, as JSON text can't be, and a value holding itself. A list or map holding one reads the rest, and a value reached twice is converted once. A
-  check converts no more than `2 × 80,000` of them, counted as reading them costs a condition, one
-  for each value and a tenth of each string's, bytes' or JSON text's length, about a map of 50,000
-  short strings: past that every condition reading an attribute fails.
+  than 10,000 deep, as JSON text can't be, and a value holding itself. A list or map holding one
+  reads the rest, and a value reached twice is converted once. A check converts no more than
+  `2 × 80,000` of them, counted as reading them costs a condition, one for each value and a tenth
+  of each string's, bytes', JSON number's or JSON text's length, and half an `Any`'s packed bytes,
+  about a map of 50,000 short strings: past that every condition reading an attribute fails.
   Comparing a value holding a double that isn't finite fails, in a list or a map too.
   Each condition runs within the most evaluating it can cost, which its literals and types
   bound: little for comparing what a request passes with literals, or with the ids, kinds, types and

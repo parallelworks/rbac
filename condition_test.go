@@ -1198,6 +1198,57 @@ func TestAttributesLargerThanACheckConvertsFailEveryCondition(t *testing.T) {
 	}
 }
 
+// Decoding what a host passes reads more than a check charged for it: parsing a JSON number reads it
+// whole, and copies it into its error where it isn't one, but one that wasn't was charged one, so a
+// thousand sharing a mebibyte took seconds; finding a packed message's type hashes its URL whole,
+// charged nothing; and JSON text or a packed message of a mebibyte holding more values than a check
+// may convert, as a list of zeros, were decoded whole, taking a tenth of a second and 80 MB, before
+// converting found them past it. A value of a type whose name is long, as a struct of many fields,
+// was named in its error whole, though charged one.
+func TestDecodingWhatAHostPassesCostsWhatItIsCharged(t *testing.T) {
+	notNumbers, outOfRange, packedFar := make([]any, 1000), make([]any, 1000), make([]any, 1000)
+	url := "type.googleapis.com/" + strings.Repeat("x", 1<<20)
+	for i := range notNumbers {
+		notNumbers[i] = json.Number(strings.Repeat("x", 1<<20))
+		outOfRange[i] = json.Number("1" + strings.Repeat("0", 1<<20))
+		packedFar[i] = &anypb.Any{TypeUrl: url}
+	}
+	empty := &structpb.ListValue{Values: make([]*structpb.Value, 790_000)}
+	for i := range empty.Values {
+		empty.Values[i] = &structpb.Value{}
+	}
+	packed, err := anypb.New(empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, v := range map[string]any{
+		"JSON numbers that aren't one": notNumbers, "JSON numbers out of range": outOfRange,
+		"packed messages of a long type URL": packedFar, "JSON text of many values": json.RawMessage("[" + strings.Repeat("0,", 790_000) + "0]"),
+		"a message packing many values": packed,
+	} {
+		if allocated, over := rbac.Converting(t, map[string]any{"v": v}); !over || allocated > 16<<20 {
+			t.Errorf("%s: past what a check converts %t, allocated %d bytes", name, over, allocated)
+		}
+	}
+	fields := make([]reflect.StructField, 1000)
+	for i := range fields {
+		fields[i] = reflect.StructField{Name: fmt.Sprintf("Field%d", i), Type: reflect.TypeFor[struct{}]()}
+	}
+	long := reflect.MakeSlice(reflect.SliceOf(reflect.StructOf(fields)), 5000, 5000).Interface()
+	if allocated, over := rbac.Converting(t, map[string]any{"v": long}); over || allocated > 16<<20 {
+		t.Errorf("values of a long-named type: past what a check converts %t, allocated %d bytes", over, allocated)
+	}
+	small, err := anypb.New(&structpb.ListValue{Values: []*structpb.Value{{}, {}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expr := `request.attributes.n == 1 && request.attributes.j == ["[{,:\"", 0.0, 1.0] && size(request.attributes.p) == 2`
+	if held, _, _, err := rbac.EvaluateCondition(t, expr,
+		map[string]any{"n": json.Number("1"), "j": json.RawMessage(`["[{,:\"", 0, 1]`), "p": small}); err != nil || !held {
+		t.Errorf("a JSON number, JSON text and a packed message: held %t, %v", held, err)
+	}
+}
+
 // A host can nest a value as deep as it likes, which converting it recurses into: a chain of
 // pointers two million deep, which cost nothing, overflowed the stack, which no recover catches,
 // and a list a hundred thousand deep, each level costing one, took a check a fifth of a second
