@@ -126,7 +126,7 @@ func readList(r io.Reader) (map[test]bool, error) {
 		switch name := strings.TrimSpace(e.Output); {
 		case listedName.MatchString(name):
 			listed[test{e.Package, name}] = true
-		case name != "" && !benchmarkName.MatchString(name) && !packageLine.MatchString(name):
+		case name != "" && !benchmarkName.MatchString(name) && !packageLine.MatchString(name) && !untestedCover(e.Package, e.Output):
 			unknown = append(unknown, fmt.Sprintf("%s: %q", e.Package, name))
 		}
 	})
@@ -134,4 +134,12 @@ func readList(r io.Reader) (map[test]bool, error) {
 		err = fmt.Errorf("go test -list printed lines that name no test: %s", strings.Join(unknown, ", "))
 	}
 	return listed, err
+}
+
+// untestedCover reports whether output is the line go test -cover prints of a package without test
+// files, as make test builds the tests: how much of it is covered, or nothing past its name where it
+// has no statements, in place of saying it has no test files.
+func untestedCover(pkg, output string) bool {
+	rest, ok := strings.CutPrefix(output, "\t"+pkg+"\t\t")
+	return ok && (strings.TrimSpace(rest) == "" || strings.HasPrefix(rest, "coverage: "))
 }

@@ -120,6 +120,7 @@ func TestReadListTakesEveryNameGoTestGivesATest(t *testing.T) {
 	names := []string{"Test", "TestA", "Test_a", "TestCafé", "TestΣum", "Test٣", "FuzzΔ", "Example", "ExampleA_ünicode"}
 	listed, err := readList(strings.NewReader(list(slices.Concat(names, []string{
 		"Benchmark", "BenchmarkΣ", "ok  \texample.com/p\t0.01s", "?   \texample.com/q\t[no test files]", "program not built with -cover", "",
+		"\texample.com/p\t\tcoverage: 0.0% of statements", "\texample.com/p\t\t",
 	})...)))
 	want := map[test]bool{}
 	for _, name := range names {
@@ -132,6 +133,21 @@ func TestReadListTakesEveryNameGoTestGivesATest(t *testing.T) {
 		if _, err := readList(strings.NewReader(list("TestA", line))); err == nil {
 			t.Errorf("readList read a list printing %q", line)
 		}
+	}
+}
+
+// Built with -cover, as make test builds the tests, go test -list prints of a package without test
+// files how much of it is covered, or only its name where it has no statements, and of one with
+// tests but no statements that it isn't built with -cover: readList reads them as the package's.
+func TestReadListTakesWhatGoTestListsOfEachPackageBuiltWithCover(t *testing.T) {
+	out, err := exec.CommandContext(t.Context(), "go", "test", "-json", "-list", ".", "-cover",
+		"./testdata/aggregate", "./testdata/untested", "./testdata/nostatements").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed, err := readList(bytes.NewReader(out))
+	if err != nil || len(listed) != 6 || !listed[test{"github.com/parallelworks/rbac/internal/shards/testdata/aggregate", "TestΣum"}] {
+		t.Errorf("readList = %v, %v, of:\n%s", listed, err, out)
 	}
 }
 
