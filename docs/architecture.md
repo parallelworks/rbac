@@ -312,7 +312,7 @@ flowchart LR
   conditions. `ResourceOf` is asked only
   when a change needs a scope's own ancestors, labels or attributes.
 - **For lists, the host stores the path** in a `text[]` column with a GIN index, and `Filter`
-  matches it.
+  matches it and tests its first key's type, so one table can hold resources of several types.
 
 ## A check
 
@@ -466,6 +466,17 @@ sequenceDiagram
 - **Custom roles.** `SetRole` redefines a role in place for every grant of it, so it asks
   `ValidateGrant` about every grant and eligibility the new definition widens, before its
   transaction, and under the tenant's lock refuses with `ErrConflict` if those changed meanwhile.
+  A grant widens by what it gives through its principal, as checks read it
+  (`redefinition.widensTo`): one to the tenant's members of a privileged role, or to the public of
+  a role not marked `Public`, gives nothing, and widens once the role gives it something, however
+  the role changed, as narrowing it so that it is no longer privileged does. On each scope a grant
+  that widens is on, the denies on its path that remove from the actor a permission the role will
+  give refuse the change, as they would refuse `Apply` granting it there; on the others, only those
+  removing its power to change grants there do. A grant to the tenant's members of a privileged
+  role is read there as one to a principal named one by one (`widenedTo.reaches`): a catalog
+  change that has the role no longer be privileged gives them what it gives, what the redefinition
+  added too, and asks no one. A scope read as stored, as the host no longer has it, that the change
+  comes to give more on while it waits refuses it with `ErrConflict`.
 - **Eligibilities.** `SetEligibility` lets a principal `Activate` a role for a while, perhaps
   only with approvers or a `requires` condition. An activation is a grant that ends no later than
   its eligibility expires, or its holder's membership or place in the group the eligibility names
@@ -525,20 +536,29 @@ flowchart LR
 - **Filter** returns a condition for the host's own query, which reads the grants in the same
   statement as the rows, so sorting and pagination work and nothing changes between deciding and
   reading, for the query it was built for: build one for each. It never keeps a row Authorize would
-  refuse. The subject's grants are matched through the path's GIN index, which merges the rows each
-  finds, so its cost for each row grows with their number. Past a few on resources of the listed
-  type, each row's own key is looked up in a hash of them, and past 128 on containers and the tenant,
-  or past a few alongside those, each of its keys in one object of them all, so one with a grant on
-  everything it created costs a row a few lookups; no index serves that, so the query reads every
-  row of the tenant its other conditions keep. Denies are looked up so whatever their number: those
-  on resources of the type by the row's own key, and those on containers and the tenant by each of
-  its keys. Those naming the subject or its groups are read by those keys alone. Those naming the
-  public or the tenant's members bind everyone, and any number of them can be on scopes of other
-  types, which no index tells apart: while fewer than 16 denies are on scopes of the types a list
-  reads, it reads those by type, and otherwise finds the ones naming everyone by those keys, so a
-  tenant with many of both has every list read every deny naming everyone.
-- **Reachable** returns the same as scopes, for a host that keeps its resources elsewhere.
-  Conditional grants and conditional denies come back apart, to check one by one.
+  refuse. It keeps only the rows whose own key is of the listed type, as a grant on a container
+  reaches every row under it, of any type, so one table can hold several. The planner has no
+  statistics of a path's first key and counts a test of it alone as keeping one row in 200, which
+  would turn a sorted page of a table of one type, whose condition no index serves, into a read and
+  sort of the whole tenant. So the type picks the keys a row's denies are looked up by, which the
+  planner counts alike whatever they are: a row of another type has none, so its lookup is unknown
+  rather than false, and the row is left out. The subject's grants are matched through the path's
+  GIN index, which merges the rows each finds, so its cost for each row grows with their number.
+  Past a few on resources of the listed type, each row's own key is looked up in a hash of them, and
+  past 128 on containers and the tenant, or past a few alongside those, each of its keys in one
+  object of them all, so one with a grant on everything it created costs a row a few lookups; no
+  index serves that, so the query reads every row of the tenant its other conditions keep. Denies
+  are looked up so whatever their number: those on resources of the type by the row's own key, and
+  those on containers and the tenant by each of its keys. Those naming the subject or its groups are
+  read by those keys alone. Those naming the public or the tenant's members bind everyone, and any
+  number of them can be on scopes of other types, which no index tells apart: while fewer than 16
+  denies are on scopes of the types a list reads, it reads those by type, and otherwise finds the
+  ones naming everyone by those keys, so a tenant with many of both has every list read every deny
+  naming everyone.
+- **Reachable** returns the same as scopes, for a host that keeps its resources elsewhere. They hold
+  for resources of the listed type alone: a scope reaches everything under it, of any type, so a
+  store holding several keeps to the type itself. Conditional grants and conditional denies come
+  back apart, to check one by one.
 - **Holders** lists who may do a permission on a resource, for an access review. That is each
   identity, through its own grants and its groups', with the tenant's members and the public as
   one holder each. It marks holders that hold only under a condition, or that a deny, a
@@ -613,18 +633,62 @@ flowchart TB
   activation rests on before its grant. `DeleteRole` removes a role's grants before its
   eligibilities, but holds the tenant's lock exclusive, so no change runs beside it but
   `DeleteExpired`, which waits on no row.
-- **One snapshot for reads in several statements.** Explain, Reachable, Holders and Conflicts read
-  in one REPEATABLE READ, READ ONLY transaction of their own on a pool, and AsOf in a REPEATABLE
-  READ one it rolls back. Explain, Reachable and Holders read what label values are decided by in
-  it, and decide them after it, as the constraints are asked outside it.
-  Under `WithTx` they read on the host's transaction at its isolation, AsOf in a savepoint.
+- **One snapshot for reads in several statements.** Explain, Reachable and Holders read in one
+  REPEATABLE READ, READ ONLY transaction of their own on a pool, and AsOf in a REPEATABLE READ one
+  it rolls back. Explain, Reachable and Holders read what label values are decided by in it, and
+  decide them after it, as the constraints are asked outside it. Under `WithTx` they read on the
+  host's transaction at its isolation, AsOf in a savepoint: at READ COMMITTED each statement reads
+  a moment of its own, so a change committing between two can mix two states, and for AsOf, history
+  of a time not yet final. Conflicts reads in one statement, the custom roles with their grants, as
+  a check and `broadExcludes` read them, so it lists what one moment held under `WithTx` too: it
+  runs in such a transaction of its own only to hold JIT off for it (`withoutJIT`).
 - **One time for a call.** A call reads `Config.Now` once, where it first needs the time: every
   statement it makes compares expiry with it, and every condition reads it as `request.time`, so a
   grant or a membership ending as the call runs can't meet a deny, a condition or label values of a
   later moment. A change reads it again in its transaction, which first needs it under its locks,
   where it decides again by what committed before them. As of a time, it is that time.
-- **Races** PostgreSQL refuses, such as a serialization failure or a deadlock between host
-  transactions, match `ErrConflict`: try again.
+- **Races** PostgreSQL refuses, such as a serialization failure, a deadlock between host
+  transactions, or a lock waited for past `lock_timeout`, as one a migration holds, match
+  `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them, as it
+  returns (`conflicting`) where it queries outside `begin`, which maps its own, so one refused
+  before a change's transaction, as in the reads that decide a change first, which under `WithTx`
+  run on the host's transaction itself and can deadlock with a migration, in a read, or in a hook's
+  statement, whose error a call returns as it is, matches too. Under `WithTx` the host runs its
+  transaction again from its start: a statement refused on it outside a savepoint aborts it, and a
+  savepoint, rolled back to, frees nothing taken before it, which the race can be over.
+- **Migrating.** `Migrate` applies each pending migration in a transaction of its own, under an
+  advisory lock on the schema that holds another replica's migration back, and records it as it
+  commits: so a migration takes its locks in the order it names them, the tables before history,
+  whatever was pending before it, and a failure leaves the database at the last migration recorded,
+  where code from before it can run on, so each migration must leave the tables as that code can
+  use them. A migration waits at most 100 ms for any lock on the tables, as it holds those it took
+  meanwhile, and gives way: `Migrate` rolls it back and tries it again, up to 10 times. That wait
+  ends before PostgreSQL's deadlock check, which alone cancels an autovacuum worker blocking a lock,
+  once a wait passes `deadlock_timeout`: where an autovacuum worker holds one of the tables as a
+  migration gives way, the next try first takes each such table's `SHARE UPDATE EXCLUSIVE` lock,
+  waiting a second past `deadlock_timeout` (`outwaitVacuum`, from `pg_locks` and the vacuum and
+  analysis progress views, which any role reads), and then the migration's own. That lock conflicts
+  with none a check, list or change takes, so none waits behind it while the migration holds none of
+  its own. Each table is locked in a savepoint of its own: where its wait ends, as for a vacuum to
+  prevent wraparound, which PostgreSQL never cancels, the try rolls back to that savepoint and goes
+  on without that table's lock, to the next table's wait, and each try after waits so again, some 20
+  seconds more over the 10 tries for each such table with the default `deadlock_timeout`. A wait for
+  another replica's migration is bounded by the session's `lock_timeout` alone, and not tried again.
+  On a host's transaction `Migrate` applies them all in one savepoint, with neither the bound nor
+  the tries, as rolling back to the savepoint frees nothing the host took before.
+
+```mermaid
+flowchart TB
+    start(["Migrate on a pool or a connection"]) --> tx["migrateOnce: a transaction of its own,<br/>the schema's advisory lock, lock_timeout 100 ms"]
+    tx -->|"the last try gave way"| vac["outwaitVacuum: SHARE UPDATE EXCLUSIVE on each<br/>table an autovacuum worker holds, waiting a second<br/>past deadlock_timeout, without each whose wait ends"]
+    tx --> one["The first pending migration,<br/>recorded in rbac_migrations"]
+    vac --> one
+    one -->|"commits, more pending"| tx
+    one -->|"commits, none pending"| done(["nil"])
+    tx -->|"the advisory lock's wait<br/>ends (errReplica)"| conflict(["ErrConflict"])
+    one -->|"55P03 or 40P01, after a backoff"| tx
+    one -->|"its 10th try"| conflict
+```
 
 ## History, export and AsOf
 

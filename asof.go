@@ -72,6 +72,7 @@ var asOfEntities = []struct {
 // id sequence caches more than one, so AsOf refuses that too. It refuses a time before 4714 BC,
 // the earliest PostgreSQL holds, or after 9999-12-30, the last the package stores.
 func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read func(*Authorizer) error) (err error) {
+	defer conflicting(&err)
 	if !validID(tenant) {
 		return fmt.Errorf("%w: no tenant", ErrInvalid)
 	}

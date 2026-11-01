@@ -28,9 +28,11 @@ type Decision struct {
 }
 
 // Authorize returns nil when the subject may do p to r, and otherwise an error matching
-// ErrDenied, or ErrInvalid for malformed input, such as a permission or resource type the host
-// doesn't check (Config.Permissions), which can only be a mistake. Any error means no.
-func (a *Authorizer) Authorize(ctx context.Context, s Subject, p Permission, r Resource) error {
+// ErrDenied, ErrInvalid for malformed input, such as a permission or resource type the host
+// doesn't check (Config.Permissions), which can only be a mistake, or ErrConflict for a race
+// PostgreSQL refused, which a retry may allow. Any error means no.
+func (a *Authorizer) Authorize(ctx context.Context, s Subject, p Permission, r Resource) (err error) {
+	defer conflicting(&err)
 	a = a.still()
 	d, err := a.decide(ctx, s, p, r, false)
 	if err != nil {
@@ -44,7 +46,8 @@ func (a *Authorizer) Authorize(ctx context.Context, s Subject, p Permission, r R
 
 // Explain decides as Authorize does and says why: the grants that give the permission, or what
 // denied it.
-func (a *Authorizer) Explain(ctx context.Context, s Subject, p Permission, r Resource) (Decision, error) {
+func (a *Authorizer) Explain(ctx context.Context, s Subject, p Permission, r Resource) (_ Decision, err error) {
+	defer conflicting(&err)
 	a = a.still()
 	return a.decide(ctx, s, p, r, true)
 }
@@ -291,7 +294,8 @@ func (h holding) carries(def RoleDefinition, p Permission) bool {
 }
 
 // Permissions lists what the subject may do to r, sorted: the AuthZEN action search.
-func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) ([]Permission, error) {
+func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) (_ []Permission, err error) {
+	defer conflicting(&err)
 	a = a.still()
 	if err := a.check(r); err != nil {
 		return nil, err
@@ -513,7 +517,8 @@ type Holder struct {
 // it returns grows with the holders, as every identity in a group granted on the tenant; and it
 // reads every grant on the path, of any role, so it takes longer with those that don't give p too,
 // as many to other members on the tenant.
-func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) ([]Holder, error) {
+func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) (_ []Holder, err error) {
+	defer conflicting(&err)
 	a = a.still()
 	if err := a.check(r); err != nil {
 		return nil, err
@@ -999,10 +1004,13 @@ func groupsAbove(g, now, cols string) string {
 		  AND (expires_at IS NULL OR expires_at > %[2]s) OFFSET 0) m`, g, now, cols)
 }
 
-// Reach is where a subject may do something. A resource, by its path (Authorizer.Path), is
-// reachable when its path holds none of Except; All is set or its path holds one of Scopes or
-// Conditional; Labels satisfies its label (Resource.Labels); and, if its path holds one of
-// Conditional or ConditionalExcept, Authorize allows it.
+// Reach is where a subject may do something to resources of the type Reachable searched. A
+// resource of that type, by its path (Authorizer.Path), is reachable when its path holds none of
+// Except; All is set or its path holds one of Scopes or Conditional; Labels satisfies its label
+// (Resource.Labels); and, if its path holds one of Conditional or ConditionalExcept, Authorize
+// allows it. It says nothing of resources of other types: All, or a container among Scopes,
+// reaches every resource under it, of any type, so a store holding several types keeps to the
+// type itself, as Filter keeps to it by each row's own key.
 type Reach struct {
 	All    bool
 	Scopes []Scope
@@ -1021,11 +1029,12 @@ type Reach struct {
 	Labels Holding
 }
 
-// Reachable says where the subject may do p to resources of a type in a tenant, for hosts that
-// list from a store other than this PostgreSQL. Hosts on the same database use Filter. It has no
-// limit or cursor, so Reach.Scopes grows with the scopes the subject's grants are on, as one on
-// each resource it created.
-func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, tenant, resourceType string) (Reach, error) {
+// Reachable says where the subject may do p to resources of a type in a tenant, and of that type
+// alone (Reach), for hosts that list from a store other than this PostgreSQL. Hosts on the same
+// database use Filter. It has no limit or cursor, so Reach.Scopes grows with the scopes the
+// subject's grants are on, as one on each resource it created.
+func (a *Authorizer) Reachable(ctx context.Context, s Subject, p Permission, tenant, resourceType string) (_ Reach, err error) {
+	defer conflicting(&err)
 	a = a.still()
 	roles, removed, err := a.searchable(ctx, s, p, tenant, resourceType)
 	if err != nil || removed {
@@ -1196,9 +1205,10 @@ type Columns struct {
 	Tenant string
 	// Path is a text[] holding the resource's Authorizer.Path, with a GIN index. Its keys are
 	// compared byte for byte, whatever its collation, which the index serves in. Its first element,
-	// at whatever subscript the array starts from, is the resource's own key. It is one-dimensional,
-	// as Path gives it: an array of more has no element at one subscript, so Filter can leave out a
-	// row of one that Authorize allows, but keeps none it refuses.
+	// at whatever subscript the array starts from, is the resource's own key, whose type Filter
+	// tests, so the table can hold resources of several types. It is one-dimensional, as Path gives
+	// it: an array of more has no element at one subscript, so its row has no own key, and Filter
+	// leaves it out.
 	Path string
 	// Labels is a text[] holding the resource's label as `dimension:value` values, never NULL: '{}'
 	// for none. The label's test, which keeps only the rows the subject's holding satisfies,
@@ -1229,8 +1239,16 @@ type Predicate struct {
 // are trusted host code; every value is an argument. It counts only unconditional grants, and
 // leaves out every resource a deny covers, conditional ones included, so it never keeps one
 // Authorize refuses: Reachable's Conditional and ConditionalExcept name the scopes where that may
-// be too strict.
-func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant, resourceType string, cols Columns, firstArg int) (Predicate, error) {
+// be too strict. It keeps only the rows whose own key, their path's first, is of the type, so the
+// host's table can hold resources of several types, as one store of every resource does, where a
+// grant on a container reaches every row under it. The planner can't tell how many of a table's
+// rows are of a type, and counts the condition as keeping as many as of a table of one type: a host
+// listing a type from a table of several tests its own column of the type too, whose statistics
+// count them, and indexes it after the tenant and before what a page sorts by, as
+// (tenant, type, id): with an index of the tenant alone, a sorted page of a type of few rows reads
+// the rows of every type until it is full.
+func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant, resourceType string, cols Columns, firstArg int) (_ Predicate, err error) {
+	defer conflicting(&err)
 	a = a.still()
 	if cols.Tenant == "" || cols.Path == "" || firstArg < 1 {
 		return Predicate{}, fmt.Errorf("%w: Filter needs the tenant and path columns and a first argument", ErrInvalid)
@@ -1292,6 +1310,20 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	// subscript, and one stored from 0 holds its second key, a container's, at 1, which no deny or
 	// grant on a resource of the type names.
 	own := fmt.Sprintf(`(%[1]s)[array_lower(%[1]s, 1)] COLLATE "default"`, cols.Path)
+	// A row is of the type when its own key starts with the type and a colon, which no type holds:
+	// starts_with compares bytes in any deterministic collation, as the default one is, while the
+	// keys of a type sort from `type:` to before `type;` only in the C collation. A grant on a
+	// container reaches every row under it, so without the test a table holding several types, as
+	// one store of every resource, keeps the rows of every type there, which Authorize refuses p on.
+	// The planner has no statistics of a path's first key and would count a plain test of it as
+	// keeping one row in 200, so where no index serves the condition, a sorted, limited page of a
+	// table of one type, where the test keeps every row, would be planned to read and sort every row
+	// of the tenant, rather than read them in order until the page is full. So the test picks the
+	// keys the denies are looked up by, a lookup the planner counts alike whatever its keys: a row of
+	// another type has none, so its lookup is unknown rather than false, and the row is left out. IS
+	// FALSE, which the planner counts as it counts NOT, keeps the condition false there, not unknown,
+	// for a host that selects it as a column.
+	typed := fmt.Sprintf(`CASE WHEN starts_with(%s, %s::text || ':') THEN %s END`, own, arg(9), cols.Path)
 	var deniedByKey string
 	if !a.contains(resourceType) {
 		denied = slices.DeleteFunc(denied, func(t string) bool { return t == resourceType })
@@ -1331,9 +1363,9 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 			cols.Path, overlap, grants("ARRAY["+arg(9)+"::text]"), own)
 	}
 	pred := Predicate{
-		SQL: fmt.Sprintf(`(%[1]s = %[2]s AND (%[1]s)::text = %[5]s::text COLLATE "default" AND %[3]s
-			AND %[7]sNOT %[6]s)`,
-			cols.Tenant, arg(0), reached, cols.Path, arg(1), keyed(cols.Path, denies(arg(16))), deniedByKey),
+		SQL: fmt.Sprintf(`(%[1]s = %[2]s AND (%[1]s)::text = %[4]s::text COLLATE "default" AND %[3]s
+			AND %[6]s%[5]s IS FALSE)`,
+			cols.Tenant, arg(0), reached, arg(1), keyed(typed, denies(arg(16))), deniedByKey),
 		Args: filterArgs(above),
 	}
 	// With no dimension declared too, as then any label is invalid, and Authorize refuses it.
@@ -1462,7 +1494,7 @@ func ofType(col, t string) string {
 // however many there are, and compares byte for byte. A hashed subquery for each key would need one
 // for each depth a path can have, which has no bound, and one inside a subquery over a row's keys
 // is built again for every row. jsonb_exists_any is the operator `?|`, which a host's query builder
-// could read as a placeholder.
+// could read as a placeholder. It is NULL where col is, which Filter's test of a row's type needs.
 func keyed(col, scopes string) string {
 	return fmt.Sprintf(`jsonb_exists_any((SELECT coalesce(jsonb_object_agg(s, true), '{}') FROM (%s) AS k(s)), %s)`, scopes, col)
 }
