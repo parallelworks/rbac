@@ -73,12 +73,12 @@ import (
 // either side, and fails where it isn't finite; a list or a map the host makes, of its own type or
 // of CEL's, is read by its own methods, each value it yields read so, and one of CEL's converts the
 // Go values it was made of as the adapter it was made with does, each time a condition reads one,
-// so a host should make none over a value CEL decodes or merges whole. A key a map yields of such a
-// type of the host's is read as the map holds it, so the map finds it, but for one that isn't
-// finite, which fails what compares it. A value a condition indexes a map or a list by is read as
-// any other, as in `m[k]`: CEL indexes by the Go value the host passed, and fails for one of a type
-// it doesn't index by, as an int8, a pointer, JSON or a wrapper, though it reads it as one of its
-// own everywhere else. A value holding itself fails whatever reads it whole.
+// so a host should make none over the values above, as JSON text or a struct. A key a map yields of
+// such a type of the host's is read as the map holds it, so the map finds it, but for one that
+// isn't finite, which fails what compares it. A value a condition indexes a map or a list by is
+// read as any other, as in `m[k]`: CEL indexes by the Go value the host passed, and fails for one
+// of a type it doesn't index by, as an int8, a pointer, JSON or a wrapper, though it reads it as
+// one of its own everywhere else. A value holding itself fails whatever reads it whole.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
