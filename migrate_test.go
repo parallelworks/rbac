@@ -53,6 +53,21 @@ func migratedTo(t *testing.T, db rbac.DB) int {
 	return v
 }
 
+// latestMigration is the version of the last migration the package holds, which Migrate migrates
+// to once nothing stops it.
+func latestMigration(t *testing.T) int {
+	t.Helper()
+	files, err := fs.Glob(rbac.Migrations(), "*.sql")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("migrations: %v", err)
+	}
+	var v int
+	if _, err := fmt.Sscanf(files[len(files)-1], "%04d_", &v); err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
 // Migrating from 0015, a change that writes a grant just as 0019 starts, and then history, as each
 // change to a table does, doesn't make 0019 give way, whether it imports a grant of a built-in role
 // or deletes one, neither of which reads the tables 0016 locks first: each migration is applied in
@@ -131,7 +146,7 @@ func TestMigratingSeveralLocksEachAsItWouldAlone(t *testing.T) {
 					t.Errorf("%s as 0019 starts: %v", c.name, err)
 				}
 			}
-			if v := migratedTo(t, pool); v != 19 {
+			if v := migratedTo(t, pool); v != latestMigration(t) {
 				t.Errorf("migrated to %d", v)
 			}
 		})
@@ -200,7 +215,7 @@ func TestMigrateRecordsEachMigrationAsItCommits(t *testing.T) {
 			if err := rbac.Migrate(ctx, pool); err != nil {
 				t.Fatalf("Migrate once the read has ended: %v", err)
 			}
-			if v := migratedTo(t, pool); v != 19 {
+			if v := migratedTo(t, pool); v != latestMigration(t) {
 				t.Errorf("migrated again to %d", v)
 			}
 			if _, s := state(t, pool); !s {
@@ -382,7 +397,7 @@ func TestMigrateWaitsForPostgreSQLToCancelAutovacuum(t *testing.T) {
 	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
 		t.Fatalf("Migrate while autovacuum vacuums history: %v", err)
 	}
-	if v := migratedTo(t, r.adminPool); v != 19 {
+	if v := migratedTo(t, r.adminPool); v != latestMigration(t) {
 		t.Errorf("migrated to %d", v)
 	}
 	var vacuuming bool
@@ -472,7 +487,7 @@ func TestMigrateOutwaitsEachTableAVacuumHolds(t *testing.T) {
 	if err := <-migrated; err != nil {
 		t.Fatalf("Migrate beside a vacuum of rbac_groups it can't outwait and one of history that ends: %v", err)
 	}
-	if v := migratedTo(t, r.adminPool); v != 19 {
+	if v := migratedTo(t, r.adminPool); v != latestMigration(t) {
 		t.Errorf("migrated to %d", v)
 	}
 }
@@ -517,7 +532,7 @@ func TestMigrateGoesOnWhereAVacuumOutlastsItsWait(t *testing.T) {
 	if err := <-migrated; err != nil {
 		t.Fatalf("Migrate once the read has ended, beside a client's vacuum of another table: %v", err)
 	}
-	if v := migratedTo(t, r.adminPool); v != 19 {
+	if v := migratedTo(t, r.adminPool); v != latestMigration(t) {
 		t.Errorf("migrated to %d", v)
 	}
 }
