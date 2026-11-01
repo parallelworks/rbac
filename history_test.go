@@ -408,7 +408,7 @@ func newReadmeRoles(t *testing.T) *readmeRoles {
 		return nil
 	}); err != nil {
 		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "42501" {
-			t.Skip("the test database's role can't create roles")
+			pgtest.Skip(t, "the test database's role can't create roles")
 		}
 		t.Fatal(err)
 	}
@@ -605,7 +605,7 @@ func role(t *testing.T, tx pgx.Tx) (name, schema string) {
 	name = pgx.Identifier{"rbac_test_" + strings.ToLower(rand.Text())}.Sanitize()
 	if _, err := tx.Exec(t.Context(), `CREATE ROLE `+name); err != nil {
 		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "42501" {
-			t.Skip("the test database's role can't create roles")
+			pgtest.Skip(t, "the test database's role can't create roles")
 		}
 		t.Fatal(err)
 	}

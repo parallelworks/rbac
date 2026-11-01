@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -42,6 +43,23 @@ func TestATemplateIsFilledOnce(t *testing.T) {
 	var left bool
 	if err := conn.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_namespace WHERE quote_ident(nspname) = $1)`, first).Scan(&left); err != nil || left {
 		t.Errorf("a dropped template's schema is left: %v, %v", left, err)
+	}
+}
+
+// A test that can't run is skipped, but in CI it fails.
+func TestSkipFailsInCI(t *testing.T) {
+	if os.Getenv("PGTEST_SKIP_CHILD") != "" {
+		Skip(t, "autovacuum is off")
+		return
+	}
+	for _, ci := range []string{"", "true"} {
+		cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestSkipFailsInCI$", "-test.v")
+		cmd.Env = append(os.Environ(), "PGTEST_SKIP_CHILD=1", "CI="+ci)
+		out, err := cmd.CombinedOutput()
+		failed, skipped := err != nil, strings.Contains(string(out), "--- SKIP: TestSkipFailsInCI")
+		if failed != (ci != "") || skipped == (ci != "") {
+			t.Errorf("CI=%q: failed %t, skipped %t:\n%s", ci, failed, skipped, out)
+		}
 	}
 }
 

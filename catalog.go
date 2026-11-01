@@ -28,7 +28,8 @@ type RoleDefinition struct {
 	// GrantableRoles, when set, are the only roles the role's `:grant` permissions let its
 	// holders grant and revoke, and they need not hold those roles' permissions, so a role can
 	// hand out narrower ones. When empty, its holders may grant any role whose permissions they
-	// hold, and whose power to change grants they have too, and revoke any.
+	// hold, and whose power to change grants they have too, and revoke any. A custom role lists only
+	// roles one of its `:grant` permissions, on a type it is for, lets its holders grant.
 	GrantableRoles []Role
 }
 

@@ -24,3 +24,6 @@ func TestB(t *testing.T) {}
 func TestC(t *testing.T) {}
 
 func TestD(t *testing.T) {}
+
+// A name of a letter outside ASCII, which go test lists and runs as any other.
+func TestΣum(t *testing.T) {}

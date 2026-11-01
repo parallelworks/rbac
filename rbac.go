@@ -583,8 +583,9 @@ var (
 	// serialization failure, a deadlock, as between host transactions, or a lock it couldn't take,
 	// as one a migration holds past the session's lock_timeout. It is so wherever in the call
 	// PostgreSQL refused it: in a change's transaction or the reads it makes before it, in a read, or
-	// in a statement a hook ran, where the error the hook returns wraps PostgreSQL's. Try it again:
-	// under WithTx, the host's whole transaction, as WithTx says.
+	// in a statement a hook ran, where the error the hook returns wraps PostgreSQL's, alone or
+	// beside others, as errors.Join holds them. Try it again: under WithTx, the host's whole
+	// transaction, as WithTx says.
 	ErrConflict = errors.New("rbac: conflict")
 	// ErrNotFound is what Config.ResourceOf returns, or wraps, for a scope the host no longer has,
 	// as a resource deleted without DeleteScopes: a change that only takes access away there, as
@@ -594,13 +595,27 @@ var (
 )
 
 // conflicted makes PostgreSQL's refusals for a race match ErrConflict, keeping the error: a
-// serialization failure, a deadlock, or a lock it couldn't take.
+// serialization failure, a deadlock, or a lock it couldn't take, wherever err holds one.
 func conflicted(err error) error {
-	var pg *pgconn.PgError
-	if errors.As(err, &pg) && !errors.Is(err, ErrConflict) && (pg.Code == "40001" || pg.Code == "40P01" || pg.Code == "55P03") {
+	if raced(err) && !errors.Is(err, ErrConflict) {
 		return fmt.Errorf("%w: %w", ErrConflict, err)
 	}
 	return err
+}
+
+// raced reports whether err, or any error it wraps, is PostgreSQL's refusal for a race. It reads
+// the whole tree, as a hook's error can join another of PostgreSQL's before the race, or wrap both,
+// and errors.As stops at the first.
+func raced(err error) bool {
+	switch e := err.(type) { //nolint:errorlint // each error of the tree is read, not only the first PostgreSQL's
+	case *pgconn.PgError:
+		return e.Code == "40001" || e.Code == "40P01" || e.Code == "55P03"
+	case interface{ Unwrap() error }:
+		return raced(e.Unwrap())
+	case interface{ Unwrap() []error }:
+		return slices.ContainsFunc(e.Unwrap(), raced)
+	}
+	return false
 }
 
 // conflicting makes *err match ErrConflict as conflicted does, for an exported call to defer, so

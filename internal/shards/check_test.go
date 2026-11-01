@@ -66,11 +66,11 @@ func wantProblem(t *testing.T, problems []string, want ...string) {
 	}
 }
 
-// Shards that between them ran each test once pass, a test that skipped among them, and a shard
+// Shards that between them ran each test once pass, a subtest that skipped among them, and a shard
 // that ran none.
 func TestShardsThatRanEachTestOnceArePassed(t *testing.T) {
 	fsys := shards([]string{"TestA", "TestB", "TestC"},
-		slices.Concat(ran("pass", "TestA", "TestA/sub"), ran("skip", "TestB")),
+		slices.Concat(ran("pass", "TestA"), ran("skip", "TestA/sub"), ran("pass", "TestB")),
 		ran("fail", "TestC"),
 		nil,
 	)
@@ -85,6 +85,14 @@ func TestShardsThatRanEachTestOnceArePassed(t *testing.T) {
 	if want := "the 3 shards ran each of the 3 tests go test -list names once, 2, 1, 0 of them"; !strings.Contains(summary, want) {
 		t.Errorf("summary %q, want %q", summary, want)
 	}
+}
+
+// A top-level test that skipped tested nothing, though it ran: in CI, where the check runs, nothing
+// should keep a test from running.
+func TestATestThatSkippedIsFound(t *testing.T) {
+	wantProblem(t, problemsOf(t, shards([]string{"TestA", "TestB"},
+		ran("pass", "TestA"), ran("skip", "TestB"),
+	)), "example.com/p TestB skipped in shard 2")
 }
 
 func TestATestNoShardRanIsFound(t *testing.T) {
