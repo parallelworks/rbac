@@ -15,7 +15,6 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
-	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -4476,8 +4475,8 @@ func TestAChangeDeadlockedBeforeItsSavepointConflicts(t *testing.T) {
 // it ran, matches ErrConflict too, wherever the hook runs, still wrapping the host's own error, and
 // OnRefused isn't told of it: ValidateGrant, asked before a change's transaction, and a constraint a
 // check asks. So does one that wraps or joins the race after another of PostgreSQL's errors, where
-// errors.As finds only that one, and one that holds it as errors.As reads it, through an As method;
-// one holding no race doesn't.
+// errors.As finds only that one, or after a thousand others, and one that holds it as errors.As
+// reads it, through an As method; one holding no race doesn't.
 func TestAHooksErrorForARaceConflicts(t *testing.T) {
 	errPolicy := errors.New("policy lookup failed")
 	deadlock := &pgconn.PgError{Code: "40P01", Message: "deadlock detected"}
@@ -4503,17 +4502,18 @@ func TestAHooksErrorForARaceConflicts(t *testing.T) {
 		}
 	}
 	for how, race := range map[string]error{
-		"wrapped":               fmt.Errorf("%w: %w", errPolicy, deadlock),
-		"wrapped after another": fmt.Errorf("%w: %w; %w", errPolicy, duplicate, deadlock),
-		"joined after another":  errors.Join(errPolicy, duplicate, deadlock),
-		"joined before another": errors.Join(deadlock, duplicate, errPolicy),
-		"nested after another":  errors.Join(errPolicy, duplicate, fmt.Errorf("retrying: %w", deadlock)),
-		"held through As":       errors.Join(duplicate, heldAsError{errPolicy, deadlock}),
+		"wrapped":                        fmt.Errorf("%w: %w", errPolicy, deadlock),
+		"wrapped after another":          fmt.Errorf("%w: %w; %w", errPolicy, duplicate, deadlock),
+		"joined after another":           errors.Join(errPolicy, duplicate, deadlock),
+		"joined before another":          errors.Join(deadlock, duplicate, errPolicy),
+		"nested after another":           errors.Join(errPolicy, duplicate, fmt.Errorf("retrying: %w", deadlock)),
+		"held through As":                errors.Join(duplicate, heldAsError{errPolicy, deadlock}),
+		"joined after a thousand others": errors.Join(slices.Concat([]error{errPolicy}, slices.Repeat([]error{duplicate}, 1000), []error{deadlock})...),
 	} {
 		hookErr = race
 		for name, err := range calls() {
 			if !errors.Is(err, rbac.ErrConflict) || !errors.Is(err, errPolicy) || errors.Is(err, rbac.ErrDenied) || errors.Is(err, rbac.ErrInvalid) {
-				t.Errorf("%s, whose hook failed for a race %s: %v", name, how, err)
+				t.Errorf("%s, whose hook failed for a race %s: %.1000v", name, how, err)
 			}
 		}
 	}
@@ -4544,34 +4544,6 @@ func (e heldAsError) As(target any) bool {
 	}
 	return ok
 }
-
-// An error that wraps itself, as a host's own type can by mistake, is read for a race only so far,
-// so an exported call returns it as it is, holding none there, rather than read it until the stack
-// overflows.
-func TestAnErrorThatWrapsItselfIsReadSoFar(t *testing.T) {
-	// So that reading it forever overflows the stack in a moment rather than a gigabyte.
-	defer debug.SetMaxStack(debug.SetMaxStack(64 << 20))
-	chain := &wrapsItselfError{}
-	chain.next = chain
-	joined := &joinsItselfError{}
-	joined.errs = []error{&pgconn.PgError{Code: "23505"}, joined}
-	for _, err := range []error{chain, joined} {
-		// The very error: errors.Is would read it forever.
-		if got := rbac.Conflicted(err); got != err { //nolint:errorlint // as above
-			t.Errorf("%T: %v", err, got)
-		}
-	}
-}
-
-type wrapsItselfError struct{ next error }
-
-func (*wrapsItselfError) Error() string   { return "wraps itself" }
-func (e *wrapsItselfError) Unwrap() error { return e.next }
-
-type joinsItselfError struct{ errs []error }
-
-func (*joinsItselfError) Error() string     { return "joins itself" }
-func (e *joinsItselfError) Unwrap() []error { return e.errs }
 
 func TestPublicAccess(t *testing.T) {
 	viewer := rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}

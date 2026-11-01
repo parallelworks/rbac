@@ -747,7 +747,10 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   roll the host's transaction back and run it again from its start, not the call alone in it: a
   statement refused on that transaction itself, as most reads', a hook's or one a change makes
   before its savepoint, aborts it, and one refused in a savepoint, as a change's, `AsOf`'s or
-  `History`'s, leaves it holding what it took before the call, which the race can be over. Changes
+  `History`'s, leaves it holding what it took before the call, which the race can be over. A hook's
+  error is read whole, however many errors it holds, as `errors.Is` and `errors.As` read it, as the
+  host reads what a call returns: one whose tree holds itself, which they can read forever, is the
+  host's bug, and a call can read it forever too. Changes
   to the same rows wait for each other by locks named for the schema holding the tables, so
   sessions reaching them through different search_paths still do.
 - **What the host passes:** a check reads grants, memberships and groups as they are; only compiled

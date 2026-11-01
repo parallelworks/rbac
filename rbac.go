@@ -585,7 +585,9 @@ var (
 	// PostgreSQL refused it: in a change's transaction or the reads it makes before it, in a read, or
 	// in a statement a hook ran, where the error the hook returns wraps PostgreSQL's, alone or
 	// beside others, as errors.Join holds them, or holds it as errors.As reads it. Try it again:
-	// under WithTx, the host's whole transaction, as WithTx says.
+	// under WithTx, the host's whole transaction, as WithTx says. A hook's error is read whole,
+	// however many errors it holds, as errors.Is and errors.As read it: one whose tree holds itself,
+	// which they can read forever, is the host's bug, and a call can read it forever too.
 	ErrConflict = errors.New("rbac: conflict")
 	// ErrNotFound is what Config.ResourceOf returns, or wraps, for a scope the host no longer has,
 	// as a resource deleted without DeleteScopes: a change that only takes access away there, as
@@ -605,13 +607,11 @@ func conflicted(err error) error {
 
 // raced reports whether err, or any error it wraps, is PostgreSQL's refusal for a race, as
 // errors.As reads one, through an As method too. It reads the whole tree, as a hook's error can
-// join another of PostgreSQL's before the race, or wrap both, and errors.As stops at the first; but
-// at most maxWrapped of its errors, in errors.As's order, as one a host's type has wrap itself
-// would be read forever.
+// join another of PostgreSQL's before the race, or wrap both, and errors.As stops at the first,
+// and walks it as errors.As does: one that holds itself it can read forever, as errors.Is, which
+// conflicted and then the host read it with, can anyway.
 func raced(err error) bool {
-	next := []error{err}
-	for read := 0; len(next) > 0 && read < maxWrapped; read++ {
-		err, next = next[len(next)-1], next[:len(next)-1]
+	for err != nil {
 		var pg *pgconn.PgError
 		switch e := err.(type) { //nolint:errorlint // each error of the tree is read, not only the first PostgreSQL's
 		case *pgconn.PgError:
@@ -624,19 +624,15 @@ func raced(err error) bool {
 		}
 		switch e := err.(type) { //nolint:errorlint // as above
 		case interface{ Unwrap() error }:
-			next = append(next, e.Unwrap())
+			err = e.Unwrap()
 		case interface{ Unwrap() []error }:
-			wrapped := e.Unwrap()
-			for i := len(wrapped) - 1; i >= 0; i-- {
-				next = append(next, wrapped[i])
-			}
+			return slices.ContainsFunc(e.Unwrap(), raced)
+		default:
+			return false
 		}
 	}
 	return false
 }
-
-// maxWrapped is how many errors of a tree raced reads.
-const maxWrapped = 1000
 
 // conflicting makes *err match ErrConflict as conflicted does, for an exported call to defer, so
 // that wherever in the call PostgreSQL refused it for a race, the host meets one error: not only in
