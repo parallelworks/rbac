@@ -894,6 +894,56 @@ func TestValuesHoldingEachOtherFailWhicheverIsReachedFirst(t *testing.T) {
 	}
 }
 
+// A value a check reached first through another nested near the limit it converts to, 10,000 deep,
+// it converted only as far as that limit, and read so wherever it reached it again: a request's
+// value reaching a ring of nodes ten thousand deep stopped short of finding that the ring holds
+// itself, so a grant's `has(resource.attributes.node.next)` held where the resource passed one of
+// those nodes, and one nested but a little, reached first so, failed what read it. One converted
+// cut short is converted again wherever it is reached less deep, but for one found holding itself,
+// as one of a pair holding each other that holds a value nested past the limit too.
+func TestAValueReachedNearTheDepthLimitIsReadWholeWhereReachedLessDeep(t *testing.T) {
+	h := setup(t)
+	ring := make([]map[string]any, 20)
+	for i := range ring {
+		ring[i] = map[string]any{"x": i}
+	}
+	for i := range ring {
+		ring[i]["next"] = ring[(i+1)%len(ring)]
+	}
+	nested := map[string]any{"a": map[string]any{"b": 1}}
+	var throughRing, throughNested, deep any = ring[0], nested, "x"
+	for range 10_000 - 10 {
+		throughRing = []any{throughRing}
+	}
+	for range 10_000 - 1 {
+		throughNested = []any{throughNested}
+	}
+	for range 10_000 {
+		deep = []any{deep}
+	}
+	one, other := map[string]any{"deep": deep}, map[string]any{}
+	one["other"], other["one"] = other, one
+	ring0, nested0, pair0 := grant(cluster.Scope(), "cluster.login", rbac.User, "ring"), grant(cluster.Scope(), "cluster.login", rbac.User, "nested"),
+		grant(cluster.Scope(), "cluster.login", rbac.User, "pair")
+	ring0.Condition = rbac.Condition{Expression: `has(resource.attributes.node.next)`}
+	nested0.Condition = rbac.Condition{Expression: `resource.attributes.v.a.b == 1`}
+	pair0.Condition = rbac.Condition{Expression: `has(resource.attributes.one.deep)`}
+	h.seed(t, ring0, nested0, pair0)
+	r := cluster
+	r.Attributes = map[string]any{"node": ring[0], "v": nested, "one": one}
+	// A check converts the request's attributes before the resource's.
+	ctx := rbac.WithRequest(t.Context(), map[string]any{"ring": throughRing, "nested": throughNested, "other": other})
+	if err := h.authz.Authorize(ctx, h.as(t, "ring"), login, r); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("a node of a ring holding itself, reached first ten thousand deep: %v", err)
+	}
+	if err := h.authz.Authorize(ctx, h.as(t, "nested"), login, r); err != nil {
+		t.Errorf("a value nested a little, reached first ten thousand deep: %v", err)
+	}
+	if err := h.authz.Authorize(ctx, h.as(t, "pair"), login, r); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("one of a pair holding each other, reached first from the other: %v", err)
+	}
+}
+
 // indexedAsItself is a host's own list that yields itself when indexed, though not when iterated.
 type indexedAsItself struct{ traits.Lister }
 

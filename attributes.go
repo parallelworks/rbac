@@ -73,13 +73,14 @@ import (
 // as a double or an array, a map holding two keys read as the same value, as 1 and 1u, or "a" twice
 // of two string types, invalid JSON, a value nested deeper than JSON text may, 10,000 deep, and a
 // value holding itself, and each it holds that holds it. A list or a map holding one reads the
-// rest. A value reached twice, as a
-// map two lists hold, is converted once. A check converts at most maxConverted of what the host
-// passes, counted as reading it costs a condition, one for each value and a tenth of each string's,
-// bytes', JSON number's, JSON text's or packed type URL's length, and half a packed message's, as a
-// packed value takes as few as two bytes: past that, every condition reading an attribute of any
-// kind fails, and JSON text that may hold more values than are left isn't parsed. A declared
-// attribute is a value of its type as converted, so a named string type is a string.
+// rest. A value reached twice, as a map two lists hold, is converted once, but for one converted
+// cut short at that depth, which is converted again where it is reached less deep. A check converts
+// at most maxConverted of what the host passes, counted as reading it costs a condition, one for
+// each value and a tenth of each string's, bytes', JSON number's, JSON text's or packed type URL's
+// length, and half a packed message's, as a packed value takes as few as two bytes: past that,
+// every condition reading an attribute of any kind fails, and JSON text that may hold more values
+// than are left isn't parsed. A declared attribute is a value of its type as converted, so a named
+// string type is a string.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
@@ -161,14 +162,22 @@ type converter struct {
 	// other, if there are any, and each holds itself.
 	open []int
 	low  int
+	// cut counts the values converting found nested past maxNested, and those it reached again
+	// that it had converted cut short so (conversion).
+	cut int
 }
 
 // conversion is a value a converter converted, or is converting while to is nil.
 type conversion struct {
 	to   ref.Val
 	open bool
-	// itself is set once converting it reached it.
+	// itself is set once converting it reached it, or found it holds one that holds it.
 	itself bool
+	// at is how deep it was reached, and cut is set where converting it, or those it reaches that
+	// reach it, found a value nested past maxNested, so what it was converted to is of how deep it
+	// was reached (once).
+	at  int
+	cut bool
 }
 
 func newConverter() *converter { return &converter{left: maxConverted, low: math.MaxInt} }
@@ -213,6 +222,7 @@ func (c *converter) of(v reflect.Value) ref.Val {
 		return tooLarge()
 	}
 	if c.depth >= maxNested {
+		c.cut++
 		return types.NewErr("rbac: a condition can't read a value nested more than %d deep", maxNested)
 	}
 	c.depth++
@@ -324,7 +334,11 @@ func (c *converter) spend(n uint64, v ref.Val) ref.Val {
 // was converting, as a map's value holding the map, would fail another of those holding each other
 // depending on which was reached first: where a holds b and b holds a, either a.b or b.a, by the
 // order a map's entries came in, so a grant's has(request.attributes.a.b) held for one check and
-// not the next.
+// not the next. One whose converting was cut short, nested past maxNested, is converted again where
+// it is reached less deep, as it was converted as deep as it was reached: a value reached first
+// through another nested near the limit was read, reached again from an attribute of its own, as
+// cut short there, so one holding itself whole where converting it had stopped short of finding so,
+// and one nested but a little as failing.
 func (c *converter) once(v reflect.Value, convert func() ref.Val) ref.Val {
 	k, _ := copiedKeyOf(v)
 	if i, ok := c.done[k]; ok {
@@ -335,17 +349,26 @@ func (c *converter) once(v reflect.Value, convert func() ref.Val) ref.Val {
 				d.itself = true
 				return holdingItself()
 			}
+			return d.to
 		}
-		return d.to
+		if !d.cut {
+			return d.to
+		}
+		// What holds one cut short is cut short too, as deep as it was reached. One found holding
+		// itself holds itself however deep it is reached.
+		if d.itself || c.depth >= d.at {
+			c.cut++
+			return d.to
+		}
 	}
 	if c.done == nil {
 		c.done = map[copiedKey]int{}
 	}
 	i := len(c.converted)
 	c.done[k] = i
-	c.converted = append(c.converted, conversion{open: true})
+	c.converted = append(c.converted, conversion{open: true, at: c.depth})
 	c.open = append(c.open, i)
-	outer := c.low
+	outer, cut := c.low, c.cut
 	c.low = i
 	out := convert()
 	c.converted[i].to = out
@@ -356,9 +379,10 @@ func (c *converter) once(v reflect.Value, convert func() ref.Val) ref.Val {
 		}
 		cycle := len(c.open)-j > 1 || c.converted[i].itself
 		for _, held := range c.open[j:] {
-			c.converted[held].open = false
+			d := &c.converted[held]
+			d.open, d.cut = false, c.cut != cut
 			if cycle {
-				c.converted[held].to = holdingItself()
+				d.to, d.itself = holdingItself(), true
 			}
 		}
 		c.open = c.open[:j]
