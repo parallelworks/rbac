@@ -194,6 +194,17 @@ func (d hostDouble) Compare(other ref.Val) ref.Val    { return types.Double(d).C
 func (d hostDouble) Type() ref.Type                   { return types.DoubleType }
 func (d hostDouble) Value() any                       { return float64(d) }
 
+// hostString is a host's own type CEL reads as a string, which compares as CEL's own does.
+type hostString string
+
+func (s hostString) ConvertToNative(t reflect.Type) (any, error) {
+	return types.String(s).ConvertToNative(t)
+}
+func (s hostString) ConvertToType(t ref.Type) ref.Val { return types.String(s).ConvertToType(t) }
+func (s hostString) Equal(other ref.Val) ref.Val      { return types.String(s).Equal(other) }
+func (s hostString) Type() ref.Type                   { return types.StringType }
+func (s hostString) Value() any                       { return string(s) }
+
 // selfDouble is a host's own type CEL reads as a double that holds no value but itself.
 type selfDouble struct{ hostDouble }
 
@@ -912,7 +923,8 @@ func dynamicStruct() *dynamicpb.Message {
 // and merges a message of a dynamic type whole into one of its own, though it charges the read as
 // one value: a loop of a thousand steps reading JSON text of a mebibyte took three seconds and was
 // charged 8,004. A check decodes each once, however many times its conditions read it, wherever
-// the host holds it, and reads it as CEL does.
+// the host holds it, but in a list or a map of CEL's the host makes, which converts what it holds
+// itself, and reads it as CEL does.
 func TestAValueCELDecodesWholeIsDecodedOnceForACheck(t *testing.T) {
 	long := strings.Repeat("x", 1<<16)
 	raw := json.RawMessage(`"` + long + `"`)
@@ -930,7 +942,6 @@ func TestAValueCELDecodesWholeIsDecodedOnceForACheck(t *testing.T) {
 		"a message of a dynamic type": dynamic, "a message of a host's type embedding one": envelope{Message: dynamic},
 		"a message of another dynamic type": &reflecting{dynamic},
 		"JSON text in a list":               []any{raw}, "JSON text in a map": map[string]any{"v": raw}, "JSON text in a typed list": []json.RawMessage{raw},
-		"JSON text in a list of CEL's":                      types.DefaultTypeAdapter.NativeToValue([]any{raw}),
 		"a message of a dynamic type in a list of messages": messages(dynamic),
 	} {
 		read := "request.attributes.v"
@@ -978,13 +989,12 @@ func (f formatted) String() string {
 func TestAValueCELCantReadFailsUnwritten(t *testing.T) {
 	n := 0
 	for expr, v := range map[string]any{
-		`request.attributes.v != 1`:                    formatted{&n},
-		`request.attributes.v != "a"`:                  &formatted{&n},
-		`request.attributes.v[0] != 1`:                 []any{formatted{&n}},
-		`request.attributes.v.v != 1`:                  map[string]any{"v": formatted{&n}},
-		`request.attributes.v.exists(k, k != 1)`:       map[formatted]int{{&n}: 1},
-		`request.attributes.v.all(k, k.n == 1)`:        []formatted{{&n}},
-		`request.attributes.v == request.attributes.v`: types.OptionalOf(types.NewDynamicList(types.DefaultTypeAdapter, []any{formatted{&n}})),
+		`request.attributes.v != 1`:              formatted{&n},
+		`request.attributes.v != "a"`:            &formatted{&n},
+		`request.attributes.v[0] != 1`:           []any{formatted{&n}},
+		`request.attributes.v.v != 1`:            map[string]any{"v": formatted{&n}},
+		`request.attributes.v.exists(k, k != 1)`: map[formatted]int{{&n}: 1},
+		`request.attributes.v.all(k, k.n == 1)`:  []formatted{{&n}},
 	} {
 		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"v": v}); err != nil || evaluated {
 			t.Errorf("%s on a %T: evaluated %t, %v", expr, v, evaluated, err)
@@ -1637,6 +1647,7 @@ func TestFiniteValuesDecideAsCELDoes(t *testing.T) {
 	if object == nil {
 		t.Fatal("a message of CEL's can't be indexed")
 	}
+	typed := types.NewRefValList(types.DefaultTypeAdapter, []ref.Val{types.IntType})
 	hosted := map[string]any{
 		"a message of CEL's":          registry.NativeToValue(&descriptorpb.FileDescriptorProto{Name: proto.String("a")}),
 		"a map of a message of CEL's": object.Get(types.String("fields")),
@@ -1656,6 +1667,19 @@ func TestFiniteValuesDecideAsCELDoes(t *testing.T) {
 		"a map of CEL's keyed so":        types.NewRefValMap(types.DefaultTypeAdapter, map[ref.Val]ref.Val{hostDouble(0.5): types.String("a")}),
 		"a host's map keyed so":          ownMap{types.NewRefValMap(types.DefaultTypeAdapter, map[ref.Val]ref.Val{hostDouble(0.5): types.String("a")})},
 		"a map of Go's keyed so":         map[any]any{heldKey{0.5}: "a"},
+		// CEL's own lists and maps a host makes, which read what they hold as they were made to: read
+		// again from the Go value each holds, a map of a map[string]any or of ref.Vals found no key of
+		// the host's own type where CEL's finds it, a list of bytes or of JSON text was read as bytes or
+		// as the text, and a list made by adding lists as the values its elements hold, so a type as
+		// its name, and a grant's `!=` held where CEL finds them equal.
+		"a map keyed by a host's string": map[ref.Val]ref.Val{hostString("a"): types.String("a")},
+		"a map of CEL's of Go's":         types.NewDynamicMap(types.DefaultTypeAdapter, map[string]any{"a": "a"}),
+		"a map of CEL's of strings":      types.NewDynamicMap(types.DefaultTypeAdapter, map[string]string{"a": "a"}),
+		"a map of CEL's of ref.Vals":     types.NewDynamicMap(types.DefaultTypeAdapter, map[ref.Val]ref.Val{types.Double(0.5): types.String("a")}),
+		"bytes":                          []byte("a"), "a list of CEL's of bytes": types.NewDynamicList(types.DefaultTypeAdapter, []byte("a")),
+		"a list of CEL's of JSON text": types.NewDynamicList(types.DefaultTypeAdapter, json.RawMessage(`"a"`)),
+		"a list of CEL's it added to":  typed.Add(types.NewRefValList(types.DefaultTypeAdapter, []ref.Val{types.String("a")})),
+		"a list of a type's name":      []any{"int", "a"},
 	}
 	// A value of a type of the host's own CEL reads as a double decides as the double it holds, as
 	// do the lists and maps of the host's own holding one: CEL found one equal to its own double only

@@ -390,10 +390,12 @@ sequenceDiagram
   fails; one CEL would write out whole into an error, as a struct, or copy whole on each read, as an
   array of more than 1 KiB of bytes, fails; and one of the host's type CEL reads as one of its own,
   as a double, is read as the value it holds, but as a map's key, which is read as the map holds it,
-  so the map finds it. So a read costs what it is charged however the host passes the value, and a
-  comparison that fails where either value holds a double that isn't finite, as a key too, sees
-  every such double as CEL's own. Each runs within the most
-  evaluating it can cost, which its literals and types bound, and the ids, kinds, types and tenant a
+  so the map finds it. A list or map the host makes, of its own type or of CEL's, is read by its
+  own methods, each value it yields through the conversion. So a read costs what it is charged
+  however the host passes the value, but in a list or map of CEL's made over it, and a comparison
+  that fails where either value holds a double that isn't finite, as a key too, sees every such
+  double as CEL's own. Each runs within the most evaluating it can cost, which its literals and
+  types bound, and the ids, kinds, types and tenant a
   check passes and its action, which are no longer than `MaxID`. What a check reads together is
   bounded where it is stored, for each scope: an identity's conditional grants, the conditional
   grants to groups, the tenant's members and the public, each the tenant's and those from each

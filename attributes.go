@@ -54,21 +54,23 @@ import (
 // for any key it doesn't hold, as CEL finds none equal to NaN.
 //
 // Whatever a host passes is read as CEL reads it, at what reading any value of its size costs,
-// however it is passed. A value CEL decodes or merges whole to read, JSON text (json.RawMessage), a
-// JSON number (json.Number), a packed message (anypb.Any), or a message of a dynamic type or of a
-// host's type embedding one, is converted once for each check, the first time a condition reads
-// it, at about what decoding it cost the host, rather than each time, though messages reaching the
-// same message, or JSON texts sharing their bytes, are each converted whole; such a message
-// reaching one message twice, itself included, fails, and so does a packed message packing another,
-// which CEL unpacks in turn, copying all each packs. So does a value CEL can't read, as a struct, which it
-// would write out whole, and an array of more than 1 KiB of bytes, or a list or a map holding
-// arrays or structs of more than 1 KiB each, which it copies whole each time a condition reads it.
-// A value of a host's own type CEL reads as one of its own, as a double or a string, is read as
-// the value it holds (its Value), so it compares as CEL's own does, from either side, and fails
-// where it isn't finite; a list or a map of the host's own is read by its own methods, each value
-// it holds read so. A key a map yields that is of such a type is read as the map holds it, so the
-// map finds it, but for one that isn't finite, which fails what compares it. A value holding
-// itself fails whatever reads it whole.
+// however it is passed, but in a list or a map of CEL's own it makes. A value CEL decodes or merges
+// whole to read, JSON text (json.RawMessage), a JSON number (json.Number), a packed message
+// (anypb.Any), or a message of a dynamic type or of a host's type embedding one, is converted once
+// for each check, the first time a condition reads it, at about what decoding it cost the host,
+// rather than each time, though messages reaching the same message, or JSON texts sharing their
+// bytes, are each converted whole; such a message reaching one message twice, itself included,
+// fails, and so does a packed message packing another, which CEL unpacks in turn, copying all each
+// packs. So does a value CEL can't read, as a struct, which it would write out whole, and an array
+// of more than 1 KiB of bytes, or a list or a map holding arrays or structs of more than 1 KiB
+// each, which it copies whole each time a condition reads it. A value of a host's own type CEL
+// reads as one of its own, as a double or a string, is read as the value it holds (its Value), so
+// it compares as CEL's own does, from either side, and fails where it isn't finite; a list or a map
+// the host makes, of its own type or of CEL's, is read by its own methods, each value it yields
+// read so, and one of CEL's converts the Go values it was made of as the adapter it was made with
+// does, each time a condition reads one. A key a map yields that is of such a type is read as the
+// map holds it, so the map finds it, but for one that isn't finite, which fails what compares it. A
+// value holding itself fails whatever reads it whole.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
@@ -160,14 +162,16 @@ const maxCopied = 1 << 10
 //     its error, and without end where it holds itself.
 //   - An array of bytes of more than maxCopied, or a list or a map holding arrays or structs of more
 //     than maxCopied bytes each, fails: CEL copies each whole each time a condition reads it.
-//   - A list, a map or an optional of CEL's own a host makes, as with CEL's adapter, is read as what
-//     it holds, through this, so what it holds is converted once too.
+//   - A list or a map a host makes, of a type of its own or of CEL's, is read as it reads itself,
+//     by its own methods, which are the host's to bound, but each value it yields read through
+//     this: one of CEL's own converts the Go values it was made of with the adapter it was made
+//     with, each time a condition reads one, as CEL does. An optional of CEL's own is read as what
+//     it holds, through this.
 //   - A ref.Val of a type of the host's own that CEL reads as a double, a string or another value
 //     of a type of its own holding none is read as that value, what it holds (its Value), so a
 //     double is one of CEL's own, which comparing fails where it isn't finite, and a string's length
-//     counts in what reading it costs; one holding no such value fails. A list or a map of the
-//     host's own is read as it reads itself, by its own methods, which are the host's to bound, but
-//     each value it holds read through this. Any other, an opaque value, is read as it is.
+//     counts in what reading it costs; one holding no such value fails. Any other, an opaque value,
+//     is read as it is.
 //   - A key a map yields, where the map can be keyed by values of the host's own types, is read as
 //     the map holds it (key): read as CEL's own, a map holding it wouldn't find it, so a map would
 //     compare unequal to itself.
@@ -295,33 +299,32 @@ func copiedWhole(v any) ref.Val {
 	return types.NewErr("rbac: a condition can't read a %T: each read copies more than %d bytes", v, maxCopied)
 }
 
-// own is v as one of CEL's own values: v itself where it holds no other; for a list, a map or an
-// optional of CEL's own, what it holds, read through c, and any other of CEL's own, as a message,
-// itself, as CEL's adapter reads it; and for one of a type of the host's own, what it holds where
-// CEL reads it as a value of a type of its own, and otherwise itself, reading through c each value
-// it yields.
+// own is v as one of CEL's own values: v itself where it holds no other; for an optional of CEL's
+// own, what it holds, read through c; for a list or a map, of CEL's own or of the host's, itself,
+// read by its own methods, but each value it yields read through c; for one of a type of the
+// host's own CEL reads as a value of a type of its own, what it holds; and any other, as a message,
+// itself, as CEL's adapter reads it.
+//
+// A list or a map of CEL's own isn't read again from the Go value it holds (its Value): CEL makes
+// one of a map[string]any that finds a key of the host's own type, and one that finds none, and a
+// list of a []byte, which CEL's adapter reads as bytes, so read again a map compared unequal to
+// one CEL finds it equal to, and a list equal to bytes, and a grant's `!=` held.
 func (c *converting) own(v ref.Val) ref.Val {
 	if holdsNone(v) {
 		return v
 	}
-	if o, ok := v.(*types.Optional); ok {
-		return c.keep(v, func() ref.Val { return c.optional(o) })
-	}
-	if ofCEL(v) {
-		switch v.(type) {
-		case traits.Lister, traits.Mapper:
-			return c.keep(v, func() ref.Val { return c.held(v, true) })
-		}
-		return v
-	}
 	switch v := v.(type) {
+	case *types.Optional:
+		return c.keep(v, func() ref.Val { return c.optional(v) })
+	case hostList, hostMap:
+		return v
 	case traits.Mapper:
 		return hostMap{v, c}
 	case traits.Lister:
 		return hostList{v, c}
 	}
-	if slices.Contains(celScalars, v.Type().TypeName()) {
-		return c.held(v, false)
+	if !ofCEL(v) && slices.Contains(celScalars, v.Type().TypeName()) {
+		return c.held(v)
 	}
 	return v
 }
@@ -347,17 +350,14 @@ func (c *converting) optional(o *types.Optional) ref.Val {
 	return out
 }
 
-// held is what v holds, its Value, read through c: what holds only a ref.Val holds nothing more
-// to read, and else stands for v where it is of CEL's own, and fails where it is the host's, as
-// reading one holding itself would never end.
-func (c *converting) held(v ref.Val, ofCEL bool) ref.Val {
+// held is what v, of a type of the host's own CEL reads as one of its own, holds, its Value, read
+// through c: one holding a ref.Val holding no other holds nothing more to read, and one holding any
+// other ref.Val fails, as reading one holding itself would never end.
+func (c *converting) held(v ref.Val) ref.Val {
 	switch held := v.Value().(type) {
 	case ref.Val:
 		if holdsNone(held) {
 			return held
-		}
-		if ofCEL {
-			return v
 		}
 		return unreadableValue(v)
 	default:
@@ -384,8 +384,8 @@ var celScalars = []string{
 	types.UintType.TypeName(),
 }
 
-// hostList is a list of a type of the host's own, read as it reads itself, but each value it yields
-// read through c, as its own lists' values are.
+// hostList is a list a host makes, of a type of its own or of CEL's, read as it reads itself, but
+// each value it yields read through c, as the values of the lists c makes are.
 type hostList struct {
 	traits.Lister
 	c *converting
@@ -403,8 +403,9 @@ func (l hostList) Add(other ref.Val) ref.Val {
 	return sum
 }
 
-// hostMap is a map that can be keyed by values of the host's own types, as a map of the host's own
-// type can, read as hostList reads a list, but for the keys it yields, read as it holds them (key).
+// hostMap is a map a host makes, of a type of its own or of CEL's, or one that can be keyed by
+// values of the host's own types, as a map[any]any can, read as hostList reads a list, but for the
+// keys it yields, read as it holds them (key).
 type hostMap struct {
 	traits.Mapper
 	c *converting
@@ -444,7 +445,7 @@ func (c *converting) key(k ref.Val) ref.Val {
 	if holdsNone(k) || ofCEL(k) || !slices.Contains(celScalars, k.Type().TypeName()) {
 		return k
 	}
-	if held := c.held(k, false); types.IsError(held) || nonFinite(held) {
+	if held := c.held(k); types.IsError(held) || nonFinite(held) {
 		return held
 	}
 	return k
