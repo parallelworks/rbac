@@ -172,17 +172,17 @@ type conversion struct {
 
 func newConverter() *converter { return &converter{left: maxConverted, low: math.MaxInt} }
 
-// attributes is each of attributes as conditions read it, nil for none.
-func (c *converter) attributes(attributes map[string]any) map[string]ref.Val {
+// attributes is each of attributes as conditions read it, by its name, nil for none.
+func (c *converter) attributes(attributes map[string]any) map[ref.Val]ref.Val {
 	if len(attributes) == 0 {
 		return nil
 	}
-	out := make(map[string]ref.Val, len(attributes))
+	out := make(map[ref.Val]ref.Val, len(attributes))
 	for name, v := range attributes {
 		if !c.pay(textLength(len(name))) {
 			return nil
 		}
-		out[name] = c.of(reflect.ValueOf(v))
+		out[types.String(name)] = c.of(reflect.ValueOf(v))
 	}
 	return out
 }
@@ -407,15 +407,20 @@ func (c *converter) dict(v reflect.Value) ref.Val {
 		return tooLarge()
 	}
 	out := make(map[ref.Val]ref.Val, v.Len())
+	// Each entry is read into the same two values, as reading it into new ones allocates for each,
+	// a string key or an interface value too: nothing converting reads keeps them.
+	key, value := reflect.New(v.Type().Key()).Elem(), reflect.New(v.Type().Elem()).Elem()
 	for it := v.MapRange(); it.Next(); {
-		k := c.key(it.Key())
+		key.SetIterKey(it)
+		value.SetIterValue(it)
+		k := c.key(key)
 		if types.IsError(k) {
 			return k
 		}
 		if holdsKey(out, k) {
 			return types.NewErr("rbac: a condition can't read a %s holding two keys read as the same value", v.Type())
 		}
-		if out[k] = c.of(it.Value()); c.over {
+		if out[k] = c.of(value); c.over {
 			return tooLarge()
 		}
 	}

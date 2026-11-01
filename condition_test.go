@@ -1284,6 +1284,24 @@ func TestDecodingWhatAHostPassesCostsWhatItIsCharged(t *testing.T) {
 	}
 }
 
+// Converting what a host passes allocates for what it converts it to, a string boxed as a value
+// and a map of its own: reading a map's entries by reflection allocated for each key and each
+// value again.
+func TestConvertingAttributesAllocatesForWhatItConvertsThemTo(t *testing.T) {
+	maps := [3]map[string]any{}
+	for i := range maps {
+		maps[i] = map[string]any{}
+		for j := range 100 {
+			maps[i][fmt.Sprint(j)] = fmt.Sprint(j)
+		}
+	}
+	none := rbac.ConvertingAllocates(t, nil, nil, nil)
+	// Two for each entry, its key and its value, and a few for each map and each kind.
+	if n := rbac.ConvertingAllocates(t, map[string]any{"m": maps[0]}, map[string]any{"m": maps[1]}, map[string]any{"m": maps[2]}); n > none+600+75 {
+		t.Errorf("converting three maps of 100 strings took %.0f allocations, and nothing %.0f", n, none)
+	}
+}
+
 // A host can nest a value as deep as it likes, which converting it recurses into: a chain of
 // pointers two million deep, which cost nothing, overflowed the stack, which no recover catches,
 // and a list a hundred thousand deep, each level costing one, took a check a fifth of a second

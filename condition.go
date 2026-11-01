@@ -1824,7 +1824,7 @@ func (a *Authorizer) vars(ctx context.Context, s Subject, p Permission, r Resour
 	converting()
 	c := newConverter()
 	_, none := ctx.Value(requestKey{}).(unrequested)
-	var request map[string]ref.Val
+	var request map[ref.Val]ref.Val
 	if !none {
 		passed, _ := ctx.Value(requestKey{}).(map[string]any)
 		request = c.attributes(passed)
@@ -1869,26 +1869,25 @@ var unreadable = refusedAttributes{Mapper: noAttributes, all: true}
 // kind doesn't declare, made an error that whatever reads it fails on, comparing it included, as
 // one not passed is. CEL compares values of different types as unequal rather than fail, so
 // otherwise a `!=` would hold for it, and a deny's `==` would lift. A kind not declared is as
-// converted.
-func declared(declares map[string]AttributeType, attributes map[string]ref.Val) any {
+// converted. It makes them so in place, as they are the check's own.
+func declared(declares map[string]AttributeType, attributes map[ref.Val]ref.Val) any {
 	if len(attributes) == 0 {
 		return noAttributes
 	}
-	held := make(map[ref.Val]ref.Val, len(attributes))
 	refused := false
-	for name, v := range attributes {
-		if declares != nil {
+	if declares != nil {
+		for k, v := range attributes {
+			name, _ := k.(types.String)
 			// One it doesn't declare a condition reads only through dyn(), which no type is checked
 			// by when stored, so it fails as one of another type does.
-			if t, ok := declares[name]; !ok {
-				v, refused = types.NewErr("rbac: attribute %q is not declared", name), true
+			if t, ok := declares[string(name)]; !ok {
+				attributes[k], refused = types.NewErr("rbac: attribute %q is not declared", string(name)), true
 			} else if !t.takes(v) {
-				v, refused = types.NewErr("rbac: attribute %q is not a %s", name, t), true
+				attributes[k], refused = types.NewErr("rbac: attribute %q is not a %s", string(name), t), true
 			}
 		}
-		held[types.String(name)] = v
 	}
-	attrs := types.NewRefValMap(types.DefaultTypeAdapter, held)
+	attrs := types.NewRefValMap(types.DefaultTypeAdapter, attributes)
 	if refused {
 		return refusedAttributes{Mapper: attrs}
 	}

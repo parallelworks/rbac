@@ -335,6 +335,16 @@ func CountEvaluations(t *testing.T) *int {
 	return n
 }
 
+// ConvertingAllocates is how many allocations building what conditions read takes, for a check
+// whose subject, resource and request each pass attributes of their own.
+func ConvertingAllocates(t *testing.T, subject, resource, request map[string]any) float64 {
+	t.Helper()
+	a := &Authorizer{cfg: Config{Now: time.Now}}
+	ctx := WithRequest(t.Context(), request)
+	s, r := Subject{Principal: Principal{Kind: User, ID: "u"}, Attributes: subject}, Resource{Tenant: "t", Type: "cluster", ID: "c", Attributes: resource}
+	return testing.AllocsPerRun(20, func() { a.vars(ctx, s, "cluster:login", r) })
+}
+
 // CountConversions counts the times what conditions read is built, converting what the host
 // passes, until t ends.
 func CountConversions(t *testing.T) *int {
