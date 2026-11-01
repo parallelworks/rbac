@@ -456,10 +456,11 @@ func (c *converter) dict(v reflect.Value) ref.Val {
 		if holdsKey(out, k) {
 			return types.NewErr("rbac: a condition can't read a %.64s holding two keys read as the same value", v.Type())
 		}
-		if out[k] = c.of(value); c.over {
+		held := c.of(value)
+		if out[k] = held; c.over {
 			return tooLarge()
 		}
-		unreadable = unreadable || types.IsError(out[k])
+		unreadable = unreadable || types.IsError(held)
 	}
 	return mapOf(out, unreadable)
 }
@@ -645,10 +646,11 @@ func (c *converter) message(v reflect.Value) ref.Val {
 			unreadable := false
 			for k, field := range m.GetFields() {
 				key := c.spend(textLength(len(k)), types.String(k))
-				if out[key] = c.of(reflect.ValueOf(field)); c.over {
+				held := c.of(reflect.ValueOf(field))
+				if out[key] = held; c.over {
 					return tooLarge()
 				}
-				unreadable = unreadable || types.IsError(out[key])
+				unreadable = unreadable || types.IsError(held)
 			}
 			return mapOf(out, unreadable)
 		})
