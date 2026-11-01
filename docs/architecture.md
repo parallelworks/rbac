@@ -461,7 +461,8 @@ sequenceDiagram
   changes under a container, or a deny on its path doing so, stops `Apply` changing grants there,
   revoking them too.
   Every change an actor makes that takes access away there is stopped alike, whatever the actor's
-  grants, as it needn't hold what it takes away: `SetRole` narrowing and `DeleteRole` deleting a
+  grants, as it needn't hold what it takes away, and by what it ends there, not by what the members
+  hold after it, as `Apply` revoking a grant held twice is stopped: `SetRole` narrowing and `DeleteRole` deleting a
   role granted there (`changesStopped`, `scopesDenied`); `ChangeMembers` removing a member of a
   group holding access there, ending its place sooner, ending an activation made through the group
   there, or adding a member to a group a deny there names (`reachCheck.stopped`); and

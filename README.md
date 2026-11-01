@@ -256,12 +256,15 @@ conditional ones reach, to check one by one.
   anything a tenant grants or denies, seeing copies of the subject and the resource, such as
   freezing changes under a container. What one removes from an actor the actor can't hand on, but for a
   role a role it holds lists in `GrantableRoles`, which it grants without holding. A freeze stops
-  every change an actor makes to access under it: one removing `<type>:grant` from the actor, or a
-  deny on the path doing so, stops `Apply` revoking there, and so it stops any change taking access
-  away there, whatever the actor's grants, as `DeleteRole` deleting a role granted there,
-  `ChangeMembers` removing a member of a group holding access there, making its place end sooner,
-  ending an activation made there through the group, or adding a member to a group a deny there
-  names, and `DeleteGroup` deleting a group with grants or eligibilities in force on its own scope.
+  every change an actor makes to grants under it, and every change taking access away there: one
+  removing `<type>:grant` from the actor, or a deny on the path doing so, stops `Apply` granting and
+  revoking there, and so it stops any change taking access away there, whatever the actor's grants,
+  as `DeleteRole` deleting a role granted there, `ChangeMembers` removing a member of a group
+  holding access there, making its place end sooner, ending an activation made there through the
+  group, or adding a member to a group a deny there names, and `DeleteGroup` deleting a group with
+  grants or eligibilities in force on its own scope. Each is stopped by what it ends there, not by
+  what the members hold after it, so one ending what a member holds through another place or grant
+  too is stopped, as `Apply` revoking a grant held twice is.
   The host's own writes (`Import`, `DeleteGrants`, `SetMemberships`, `ImportMembers`,
   `DeleteMembers`, `DeleteGroups` and the host's deletes) make none of the checks an actor's change
   makes, so a freeze stops none of them: the host freezes those itself. The host is
