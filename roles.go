@@ -381,7 +381,9 @@ func canonical(r RoleDefinition) RoleDefinition {
 // grants already made give: Config.ValidateGrant is asked about each of its grants and
 // eligibilities in force that gives more as the role will be than it gave (ViaRedefinition), as
 // checks read what a grant gives through its principal, and refusing any refuses the
-// redefinition, as granting the role so would be refused. A grant to the tenant's members of a
+// redefinition, as granting the role so would be refused. Where the role will give more to
+// whomever it is granted, that is each one giving anything through its principal as the role will
+// be, whether or not what it is on takes what was added. A grant to the tenant's members of a
 // privileged role gives nothing, nor does one to the public of a role not marked Public, so
 // widening the role asks nothing about them while they still give nothing; redefining it so that
 // they give something, as narrowing it so that it is no longer privileged does, asks about them as

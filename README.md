@@ -114,10 +114,12 @@ conditional ones reach, to check one by one.
   checks read it: one to the tenant's members of a privileged role, or to the public of a role not
   marked `Public`, gives nothing, so widening the role asks nothing about it, and a redefinition
   that has it give something, as narrowing the role so that it is no longer privileged does, widens
-  it, with what was added to the role while it gave nothing. A deny where the tenant's members hold
-  a privileged role still stops widening it, as a catalog change that has the role no longer be
-  privileged gives them what it gives then, and asks no one. Renaming a role or rewriting its
-  description changes no grant, so needs only the power to define it.
+  it, with what was added to the role while it gave nothing; where the role gives more to whomever
+  it is granted, each grant giving anything through its principal widens, whatever its scope takes
+  of what was added. A deny where the tenant's members hold a privileged role still stops widening
+  it, as a catalog change that has the role no longer be privileged gives them what it gives then,
+  and asks no one. Renaming a role or rewriting its description changes no grant, so needs only the
+  power to define it.
   `DeleteRole` removes one with its grants; `Roles` lists the built-in and custom roles a scope type
   takes. Custom roles follow the catalog: one gives only what the catalog still has, and is
   privileged when it gives what only privileged roles do, or changes access.
