@@ -28,6 +28,9 @@ every shard.
   and fails it, as a required job its `if` skips counts as passed.
 - Each job has a 20-minute timeout. When a shard's Test step nears half of that, add a shard to the
   matrix in `.github/workflows/ci.yml`; nothing else names their number.
+- The tests that wait for VACUUM to mark rows visible to all skip where another session's snapshot
+  keeps it from doing so, as on a database other runs share, but fail in CI (where `CI` is true), as
+  there only the run's own sessions hold snapshots.
 - The coverage each shard prints counts only the statements its own tests reach, so it reads low.
   The `go` job merges every shard's profile into the whole suite's, as `make test` prints it.
 - `crowded` copies its tenants from a schema each test process fills once, as writing their 46,000

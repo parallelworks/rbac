@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -3641,31 +3643,66 @@ func grantsVisibleToAll(t *testing.T, h *harness) {
 
 // visibleToAll runs vacuum until the visibility map marks every page of table visible to all.
 // VACUUM marks none so while a snapshot older than its rows is open elsewhere in the database, such
-// as another run's: it waits up to 30 seconds for that to end, and then skips the test, at once
-// where the oldest has been open longer than that already, as one left open so long, such as an
-// idle session's, seldom ends meanwhile.
+// as another run's: it waits up to 30 seconds for that to end, and then skips the test, or fails it
+// in CI, as outwaited says.
 func visibleToAll(t *testing.T, h *harness, table, vacuum string) {
 	t.Helper()
 	ctx := t.Context()
 	const wait = 30 * time.Second
+	ci, _ := strconv.ParseBool(os.Getenv("CI"))
 	for deadline := time.Now().Add(wait); ; time.Sleep(50 * time.Millisecond) {
 		if _, err := h.pool.Exec(ctx, vacuum); err != nil {
 			t.Fatal(err)
 		}
 		var visible bool
 		var open time.Duration
-		if err := h.pool.QueryRow(ctx, `SELECT relallvisible >= relpages,
-			  (SELECT coalesce(max(now() - xact_start), '0') FROM pg_stat_activity
-			   WHERE datname = current_database() AND pid <> pg_backend_pid()
-			     AND age(backend_xmin) >= (SELECT min(age(xmin)) FROM `+table+`))
-			FROM pg_class WHERE oid = $1::regclass`, table).Scan(&visible, &open); err != nil {
+		var session string
+		if err := h.pool.QueryRow(ctx, `SELECT c.relallvisible >= c.relpages, coalesce(s.open, '0'), coalesce(s.session, '')
+			FROM pg_class c LEFT JOIN LATERAL (
+			  SELECT now() - xact_start AS open, format('pid %s, %s: %s', pid, state, left(query, 200)) AS session
+			  FROM pg_stat_activity
+			  WHERE datname = current_database() AND pid <> pg_backend_pid()
+			    AND age(backend_xmin) >= (SELECT min(age(xmin)) FROM `+table+`)
+			  ORDER BY xact_start LIMIT 1) s ON true
+			WHERE c.oid = $1::regclass`, table).Scan(&visible, &open, &session); err != nil {
 			t.Fatal(err)
 		}
 		if visible {
 			return
 		}
-		if open > wait || time.Now().After(deadline) {
-			t.Skipf("a snapshot open for %v elsewhere in the database keeps the rows of %s from being visible to all", open.Round(time.Second), table)
+		if giveUp, skip := outwaited(open, wait, time.Now().After(deadline), ci); giveUp {
+			why := fmt.Sprintf("a snapshot open for %v elsewhere in the database keeps the rows of %s from being visible to all: %s", open.Round(time.Second), table, session)
+			if skip {
+				t.Skip(why)
+			}
+			t.Fatal(why)
+		}
+	}
+}
+
+// outwaited is whether visibleToAll stops waiting for a snapshot open for open, whether or not it
+// is late past its wait, and whether it then skips the test rather than failing it. On a database
+// other runs share, it skips at once where the snapshot has been open longer than the wait already,
+// as one left open so long, such as an idle session's, seldom ends meanwhile. In CI, where each run
+// has a database of its own, only the run's own sessions hold snapshots, so one it can't wait out
+// is a session a test left open, which a skip would hide: it fails, once it has waited.
+func outwaited(open, wait time.Duration, late, ci bool) (giveUp, skip bool) {
+	if ci {
+		return late, false
+	}
+	return late || open > wait, true
+}
+
+func TestVisibilityWaitsFailInCIRatherThanSkip(t *testing.T) {
+	const wait = 30 * time.Second
+	for _, open := range []time.Duration{0, wait, time.Hour} {
+		for _, late := range []bool{false, true} {
+			if giveUp, skip := outwaited(open, wait, late, true); giveUp != late || skip {
+				t.Errorf("in CI, for a snapshot open for %v, late %t, it gives up %t and skips %t", open, late, giveUp, skip)
+			}
+			if giveUp, skip := outwaited(open, wait, late, false); giveUp != (late || open > wait) || !skip {
+				t.Errorf("on a shared database, for a snapshot open for %v, late %t, it gives up %t and skips %t", open, late, giveUp, skip)
+			}
 		}
 	}
 }
