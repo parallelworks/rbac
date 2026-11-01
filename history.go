@@ -548,8 +548,10 @@ var maxUnsized = 100
 // prepared transaction left open, delays the export. One that took it before a prune history holds
 // holds back a read from the start entirely: the export that read begins is told from one begun
 // before the prune by its Horizon, the oldest transaction running as it began, which would count
-// the prune as one since. A session may turn off the timeouts that would end one it leaves open, so
-// watch pg_stat_activity for one held too long and end it, as the README says. A record can be read
+// the prune as one since. So while prunes that delete records come faster than the longest such
+// transactions end, as a host's can while they work through a long backlog, no export from the
+// start begins. A session may turn off the timeouts that would end one it leaves open, so watch
+// pg_stat_activity for one held too long and end it, as the README says. A record can be read
 // twice, as when a host retries a read whose result it lost: dedupe on ID and RecordedAt, since a
 // restore can give another record the ID of one it lost.
 //

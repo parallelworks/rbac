@@ -471,12 +471,14 @@ later one would hide a prune since the export began. A cursor without it, as one
 earlier release, is refused for any prune recorded after it that deleted a record after it, and its
 export starts again from the start. While a transaction that took its id before a prune is still
 running, a read from the start reads nothing, as its export would count the prune as one since it
-began. Run it on a connection of the administrator's role below, which has the rights of history's
-owner, as the application's hasn't, and keep what the host's audit retention requires: the federal
-floor is at least a year. A delete from history that no prune its transaction records reaches, as
-one by hand, is refused as the transaction commits, so no delete through history's triggers leaves
-an export reading on past what it removed; disabling them takes a role with the rights of history's
-owner, which the signed chain is kept against.
+began: while prunes that delete records come faster than the longest transactions end, as they can
+while working through a long backlog, no export from the start begins. Run it on a connection of the
+administrator's role below, which has the rights of history's owner, as the application's hasn't,
+and keep what the host's audit retention requires: the federal floor is at least a year. A delete
+from history that no prune its transaction records reaches, as one by hand, is refused as the
+transaction commits, so no delete through history's triggers leaves an export reading on past what
+it removed; disabling them takes a role with the rights of history's owner, which the signed chain
+is kept against.
 
 A role that owns a table can change it whatever its triggers say, and a schema's owner can drop
 any table in it. So that the application's database role can't rewrite history or write around
