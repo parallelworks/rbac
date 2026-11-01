@@ -1880,6 +1880,10 @@ func activationsLeaving(ctx context.Context, q DB, tenant string, leaving []Memb
 	if len(identities)+len(groups) == 0 {
 		return nil, nil
 	}
+	// Each once, however many groups it leaves, as holders would otherwise join each of its
+	// activations once for each of them.
+	identities = slices.Compact(slices.Sorted(slices.Values(identities)))
+	groups = slices.Compact(slices.Sorted(slices.Values(groups)))
 	rows, err := q.Query(ctx, `
 		WITH RECURSIVE `+insideSQL("$3", "$5", "NULL", false)+`, holders(member, k) AS (
 		  SELECT k, k COLLATE "C" FROM unnest($2::text[]) AS k
@@ -2120,17 +2124,33 @@ func (r reach) leftBy(groups ...string) []Scope {
 	return ss
 }
 
-// activatedBy is the scopes m, a member leaving its group, loses access on through its activations,
-// or those of the identities in it, made through the group or one it is in, as stored; none where
-// nothing checks them (losing).
-func (r reach) activatedBy(m Member) []Scope {
+// activatedBy is the scopes the members leaving their groups lose access on through their
+// activations, or those of the identities in them, made through one of the groups a member leaves
+// or one it is in, as stored; none where nothing checks them (losing). What each principal leaves
+// is found first, so its activations are read once, however many of its places end.
+func (r reach) activatedBy(leaving []Member) []Scope {
 	if !r.losing {
 		return nil
 	}
+	through := map[string]map[string]bool{}
+	for _, m := range leaving {
+		k := m.Principal.key()
+		if len(r.activatedOf[k]) == 0 {
+			continue
+		}
+		if through[k] == nil {
+			through[k] = map[string]bool{}
+		}
+		for g := range r.stored[m.Group] {
+			through[k][g] = true
+		}
+	}
 	var ss []Scope
-	for _, i := range r.activatedOf[m.Principal.key()] {
-		if x := r.activations[i]; r.stored[m.Group][x.through] {
-			ss = append(ss, x.scope)
+	for _, k := range slices.Sorted(maps.Keys(through)) {
+		for _, i := range r.activatedOf[k] {
+			if x := r.activations[i]; through[k][x.through] {
+				ss = append(ss, x.scope)
+			}
 		}
 	}
 	return ss
@@ -2275,10 +2295,8 @@ func (r reach) footprint(add, remove []Member, gains bool) map[reachKey]RoleDefi
 	for _, s := range slices.Concat(r.boundBy(gaining...), r.leftBy(left...)) {
 		f[reachKey{left: s}] = RoleDefinition{}
 	}
-	for _, m := range leaving {
-		for _, s := range r.activatedBy(m) {
-			f[reachKey{left: s}] = RoleDefinition{}
-		}
+	for _, s := range r.activatedBy(leaving) {
+		f[reachKey{left: s}] = RoleDefinition{}
 	}
 	return f
 }
@@ -2541,10 +2559,8 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 	for _, s := range slices.Concat(rc.boundBy(groups...), rc.leftBy(left...)) {
 		at(s).leaves = true
 	}
-	for _, m := range leaving {
-		for _, s := range rc.activatedBy(m) {
-			at(s).leaves = true
-		}
+	for _, s := range rc.activatedBy(leaving) {
+		at(s).leaves = true
 	}
 	// Each as Config.ResourceOf gives it, and then the actor's authority on all of them in one read,
 	// so a group with access on many scopes doesn't cost a read on each. Where only a member losing

@@ -527,7 +527,8 @@ sequenceDiagram
   between them makes no one eligible. Setting the eligibility again or deleting it leaves its
   activations to their own ends, or to their holders leaving its group: where labels or a freeze
   can refuse it, `ChangeMembers` reads the activations of the members leaving made through the
-  groups it reaches and checks each one's scope as a revoke there, and `DeleteGroup` refuses a group
+  groups it reaches, each principal's once however many of its places end (`activatedBy`), and
+  checks each one's scope as a revoke there, and `DeleteGroup` refuses a group
   they rest on. Both read them only once they hold the places they end (`restingIn`, and
   `unrested` once `removeGroups` holds them), so an activation `Activate` commits while one waits
   for them, through an eligibility deleted meanwhile, is read as one made before: `ChangeMembers`

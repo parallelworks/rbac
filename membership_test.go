@@ -5460,6 +5460,71 @@ func TestAMemberJoiningManyGroupsInOneBuildsWhatOnePlaceGains(t *testing.T) {
 	}
 }
 
+// A principal leaving many groups that are all in one, through which it activated on many scopes,
+// loses access on each of those scopes once, so what the change builds for its activations is
+// found once for the principal, not once for each group it leaves: they cost it about what they
+// cost leaving one of the groups.
+func TestAMemberLeavingManyGroupsInOneReadsItsActivationsOnce(t *testing.T) {
+	h := grouped(t, func(c *rbac.Config) {
+		// Declared, so a removal reads what its members lose, as a freeze could stop it taking that
+		// away; it stops nothing.
+		c.Constraints = []rbac.Constraint{{Name: "thawed", Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) { return false, nil }}}
+	})
+	ctx := t.Context()
+	var groups []string
+	for i := range rbac.MaxBindings {
+		groups = append(groups, fmt.Sprintf("g%d", i))
+	}
+	h.groups(t, append(groups, "top")...)
+	h.join(t, "u")
+	// Each group is in top, and u in each, and in top itself, so it keeps what top gives, and its
+	// activations through top, however many of the others it leaves.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+		SELECT 't1', 'top', 'group', unnest($1::text[]) UNION ALL SELECT 't1', 'top', 'user', 'u'`, groups); err != nil {
+		t.Fatal(err)
+	}
+	activated := func(n int) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_grants WHERE tenant = 't1' AND source = 'activation'`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at, activated_through)
+			SELECT 't1', 'cluster', 'top' || i, 'user', 'u', 'cluster.login', 'activation', $2, 'group:top' FROM generate_series(1, $1::int) i`,
+			n, h.now.Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manager := h.as(t, "manager")
+	// What a change removing remove allocates, its places made again after it.
+	change := func(remove []rbac.Member) uint64 {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+			SELECT 't1', unnest($1::text[]), 'user', 'u' ON CONFLICT DO NOTHING`, groups); err != nil {
+			t.Fatal(err)
+		}
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		before := m.TotalAlloc
+		if err := h.authz.ChangeMembers(ctx, manager, "t1", nil, remove); err != nil {
+			t.Fatalf("removing %d members: %v", len(remove), err)
+		}
+		runtime.ReadMemStats(&m)
+		return m.TotalAlloc - before
+	}
+	var all []rbac.Member
+	for _, g := range groups {
+		all = append(all, rbac.Member{Group: g, Principal: identity("u")})
+	}
+	activated(1)
+	bare := change(all)
+	activated(rbac.MaxBindings)
+	one, many := change(all[:1]), change(all)
+	if many > bare+8*one {
+		t.Fatalf("a member with %d activations through top leaving %d groups in it allocated %d MiB, with one activation %d MiB, and leaving one of them %d MiB",
+			rbac.MaxBindings, len(all), many>>20, bare>>20, one>>20)
+	}
+}
+
 // A change to members is checked again in its transaction: an actor that lost the power to make
 // what it makes while the host was asked about it is refused.
 func TestChangingMembersIsCheckedAgainUnderItsLocks(t *testing.T) {
