@@ -827,13 +827,23 @@ flowchart LR
   transaction running as its first read from the start began, tells them apart, as a prune of an
   earlier transaction had ended by then. A read from the start reads nothing while a prune it sees
   is of a transaction no older than the oldest running, which it would count as one since.
-  History's index of prunes (`rbac_history_prunes`) finds those recorded after a cursor and from
-  its horizon on, which are few; a prune is recorded after what it deletes, so no earlier one can
-  have deleted past the cursor. A delete from history, which only a role with the rights of
-  history's owner gets past the append-only trigger, is refused as its transaction commits
-  (`rbac_history_pruned`) unless a prune that transaction records reaches the record, by the last
-  it deleted or, for a prune recorded before 0020, the cursor it went through, and the record is of
-  an earlier transaction.
+  It counts the prunes of every transaction from the cursor's on, or from its horizon where that is
+  later: a prune deletes only records of earlier transactions, so no earlier one can have deleted
+  past the cursor. It counts them by transaction, not by where each prune's record stands, as the
+  trigger below lets a delete through for any prune its transaction records, whatever id history's
+  owner gives the record. History's index of prunes by the last record each deleted
+  (`rbac_history_prune_lasts`) finds the first that reached past a cursor, in an order no scan of
+  history's rows gives without reading them all, and tests its transaction among its own entries.
+  Of the prunes since an export began, it reads only those that refuse it, however many went
+  through its cursor as it caught up from the start or fell behind, each of which, found by where
+  it was recorded, was read from history's rows. An export from the start also passes over, among
+  the index's entries, the prunes from before it began that reached past its cursor, until it reads
+  past them; where those since it began are fewer, a statement planned for its cursor reads those
+  by transaction (`rbac_history_prunes`) instead. A delete from history, which only a role with the
+  rights of history's owner gets past the append-only trigger, is refused as its transaction
+  commits (`rbac_history_pruned`) unless a prune that transaction records reaches the record, by the
+  last it deleted or, for a prune recorded before 0020, the cursor it went through, and the record
+  is of an earlier transaction.
 - **The export chain.** `Export` hashes each record onto the last checkpoint with SHA-256 and signs
   the checkpoint with the host's `crypto.Signer`: ECDSA on P-256, P-384 or P-521, Ed25519, or RSA
   of at least 3072 bits, each verified with the Go standard library. `VerifyChain` checks a run of
@@ -856,9 +866,9 @@ flowchart LR
   and refuses an earlier one; of a row whose last version by then ended it, it deletes every
   version, the end last. It reads history `MaxPrune` records at a time, each in a transaction of
   its own, so none holds exports back for long however long history is. Each that deleted records
-  is recorded in history, in the statement that deletes, with the last record it deleted, and AsOf
-  finds the latest prune's time by history's index. With several exports, it prunes through the
-  cursor of the one furthest behind.
+  is recorded in history, in the statement that deletes and dated when it began, with the last
+  record it deleted, and AsOf finds the latest prune's time by history's index. With several
+  exports, it prunes through the cursor of the one furthest behind.
 
 ## Database roles
 
