@@ -522,7 +522,9 @@ sequenceDiagram
   the role changed, as narrowing it so that it is no longer privileged does. On each scope a grant
   that widens is on, the denies on its path that remove from the actor a permission the role will
   give refuse the change, as they would refuse `Apply` granting it there; on the others, only those
-  removing its power to change grants there do. A grant to the tenant's members of a privileged
+  removing its power to change grants there do. Scopes the actor's grants and the denies on their
+  paths can't tell apart are decided once (`alike`), told apart by each grant's id and each deny's
+  scope and id, whole: an id holds any text but NUL. A grant to the tenant's members of a privileged
   role is read there as one to a principal named one by one (`widenedTo.reaches`): a catalog
   change that has the role no longer be privileged gives them what it gives, what the redefinition
   added too, and asks no one. A scope read as stored, as the host no longer has it, that the change
@@ -730,13 +732,16 @@ flowchart TB
   transactions, or a lock waited for past `lock_timeout`, as one a migration holds, match
   `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them, as it
   returns (`conflicting`) where it queries outside `begin`, which maps its own, wherever an error
-  holds one, beside others too, as `errors.As` reads one, reading at most a thousand of its errors,
-  as one that wraps itself has no end (`raced`), so one refused before a change's transaction, as
+  holds one, beside others too, as `errors.As` reads one, reading the whole tree, however many
+  errors it holds (`raced`), so one refused before a change's transaction, as
   in the reads that decide a change first, which under `WithTx` run on the host's transaction
   itself and can deadlock with a migration, in a read, or in a hook's statement, whose error a call
   returns as it is, matches too. Under `WithTx` the host runs its transaction again from its start:
   a statement refused on it outside a savepoint aborts it, and a savepoint, rolled back to, frees
-  nothing taken before it, which the race can be over.
+  nothing taken before it, which the race can be over. A hook's error is read only as `errors.Is`
+  and `errors.As` read it: one whose tree holds itself, as a host's type can by mistake, they can
+  read forever, and so can a call, as reading less of it would only leave it to the host's own
+  `errors.Is`, as of `ErrDenied` on what the call returns.
 - **Migrating.** `Migrate` applies each pending migration in a transaction of its own, under an
   advisory lock on the schema that holds another replica's migration back, and records it as it
   commits: so a migration takes its locks in the order it names them, the tables before history,

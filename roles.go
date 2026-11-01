@@ -1286,7 +1286,7 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 	// removes what that one does, so a role granted on thousands of resources is decided against a
 	// few. Where no grant or eligibility will give more, the role hands nothing more on.
 	var distinct []int
-	seen := map[string]bool{}
+	seen := map[alikeKey]bool{}
 	for i, at := range own {
 		if !scopes.widened[scopes.own[i]] {
 			continue
@@ -1319,11 +1319,16 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 	// Where a role listing it, or listing one that does, is granted, its holders may grant it on
 	// scopes of each type there as it will be: so must the actor, under the denies there, as mayDefine
 	// checks across the tenant.
-	asked := map[string]bool{}
+	type typeAlike struct {
+		alike alikeKey
+		t     string
+	}
+	asked := map[typeAlike]bool{}
 	for i, at := range listing {
 		r := on[len(own)+i]
+		alike := a.alike(at, r)
 		for _, t := range scopes.listed[r.Scope()] {
-			k := a.alike(at, r) + " " + t
+			k := typeAlike{alike, t}
 			if asked[k] {
 				continue
 			}
@@ -1343,21 +1348,29 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 // actor hands on: the same grants it holds on their paths, and the same denies, and where one of
 // those has a condition, which can read a resource, the same scope, but on containers, where what
 // the actor hands on reaches resources the condition can't read.
-func (a *Authorizer) alike(on authority, r Resource) string {
-	var b strings.Builder
+func (a *Authorizer) alike(on authority, r Resource) alikeKey {
+	var held, denials strings.Builder
 	for _, h := range on.held {
-		b.WriteString(h.ID + " ")
+		held.WriteString(h.ID + "\x00")
 	}
-	b.WriteString("|")
 	conditional := false
 	for _, d := range on.denials {
-		b.WriteString(d.scope + " " + d.id + " ")
+		denials.WriteString(d.scope + "\x00" + d.id + "\x00")
 		conditional = conditional || d.condition != ""
 	}
+	k := alikeKey{held: held.String(), denials: denials.String()}
 	if conditional && !a.contains(r.Type) {
-		b.WriteString("|" + r.Scope().Key())
+		k.scope = r.Scope()
 	}
-	return b.String()
+	return k
+}
+
+// alikeKey is what alike tells scopes apart by: the ids of the grants, and the scopes and ids of
+// the denies, each ended by a NUL, which no stored text holds, as a scope's id can hold any other
+// character; and the scope, where a deny's condition can tell it apart.
+type alikeKey struct {
+	held, denials string
+	scope         Scope
 }
 
 // labeling is what roleReachOf checked of the labels of the scopes a custom role's grants and

@@ -9109,6 +9109,87 @@ func TestADenyOnOneResourceStopsARedefinitionGrantedOnItAndOnOthers(t *testing.T
 	}
 }
 
+// A redefinition decides the scopes that x's grants and the denies on their paths can't tell apart
+// once, and tells them apart by every id whole: where the denies on cluster a's path, joined with
+// spaces, would read as the one on b's, whose workspace's id holds them, as an id holds any text,
+// the deny on b's path removing root from x still keeps x from widening r to give root, granted on
+// both or held through a role listing it granted on both. So does a deny on a's path whose
+// condition, which can read a, tells a apart by its id, where that id would read as part of b's.
+func TestARedefinitionTellsApartScopesWhoseDeniesReadAlikeJoined(t *testing.T) {
+	type deny struct {
+		on        rbac.Resource
+		id        string
+		p         rbac.Permission
+		condition string
+	}
+	ws := func(id string) rbac.Resource { return rbac.Resource{Tenant: "t1", Type: "workspace", ID: id} }
+	in := func(id, workspace string) rbac.Resource {
+		return rbac.Resource{Tenant: "t1", Type: "cluster", ID: id, Ancestors: []rbac.Scope{ws(workspace).Scope()}}
+	}
+	// Each joins as "workspace:x i cluster:a j ".
+	a, b := in("a", "x"), in("b", "x i cluster:a")
+	joined := []deny{{ws("x"), "i", "workspace:view", ""}, {a, "j", "workspace:view", ""}, {ws("x i cluster:a"), "j", root, ""}}
+	// Each joins as "workspace:x i |cluster:a j ", a's with its scope after its denies.
+	spaced, barred := in("a j ", "x"), in("b", "x i |cluster:a")
+	conditioned := []deny{{ws("x"), "i", "workspace:view", `resource.id == "none"`}, {ws("x i |cluster:a"), "j", root, ""}}
+	for _, c := range []struct {
+		name   string
+		a, b   rbac.Resource
+		denies []deny
+		listed bool
+	}{
+		{"granted", a, b, joined, false},
+		{"listed", a, b, joined, true},
+		{"beside a condition", spaced, barred, conditioned, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h, guardian := guarded(t, func(cfg *rbac.Config) {
+				resourceOf := cfg.ResourceOf
+				cfg.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+					for _, r := range []rbac.Resource{c.a, c.b} {
+						if s == r.Scope() {
+							return r, nil
+						}
+					}
+					return resourceOf(ctx, tenant, s)
+				}
+			})
+			ctx := t.Context()
+			x, r := definer(t, h)
+			h.as(t, "y")
+			z := h.as(t, "z")
+			granted := r
+			if c.listed {
+				granted = listing(t, h, x, r)
+			}
+			h.seed(t, grant(c.a.Scope(), granted.ID, rbac.User, "y"), grant(c.b.Scope(), granted.ID, rbac.User, "z"))
+			for _, d := range c.denies {
+				deny := rbac.Deny{ID: d.id, Permissions: []rbac.Permission{d.p}, Principals: []rbac.Principal{x.Principal}, Condition: rbac.Condition{Expression: d.condition}}
+				if err := h.authz.SetDeny(ctx, guardian, d.on, deny); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := h.authz.Apply(ctx, x, c.b, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: z.Principal}}}); !errors.Is(err, rbac.ErrDenied) {
+				t.Fatalf("granting root on b: %v", err)
+			}
+			wider := r
+			wider.Permissions = []rbac.Permission{view, root}
+			err := h.authz.SetRole(ctx, x, "t1", wider)
+			holder := z
+			if c.listed {
+				holder = h.as(t, "w")
+				if err := h.authz.Apply(ctx, z, c.b, rbac.Change{Grant: []rbac.Binding{{Role: r.ID, Principal: holder.Principal}}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var denied *rbac.DeniedError
+			if !errors.As(err, &denied) || denied.Scope != c.b.Scope() || allowed(t, h, holder, root, c.b) {
+				t.Fatalf("widening a role to give root past the deny on b's path: %v", err)
+			}
+		})
+	}
+}
+
 // What SetRole and DeleteRole checked of the scopes a role is granted on before their transactions
 // they check again under the tenant's lock, so a deny below the tenant set meanwhile stops them.
 func TestADenySetWhileARedefinitionWaitsStopsIt(t *testing.T) {
