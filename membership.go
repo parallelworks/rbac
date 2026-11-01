@@ -2448,7 +2448,7 @@ func (c *reachCheck) seal() {
 func (c *reachCheck) stopped(au authority, change string) error {
 	manage := GrantPermission(c.on.Type)
 	if c.frozen && c.cs.removes(manage, c.on.Type) {
-		reason := fmt.Sprintf("removed by %s, which stops %s", c.cs.removedBy(manage), change)
+		reason := fmt.Sprintf("removed by %s, which stops %s", c.cs.removedBy(manage, c.on.Type), change)
 		return cmp.Or(c.cs.failed(), error(&DeniedError{Permission: manage, Scope: c.on.Scope(), Reason: reason}))
 	}
 	if c.bound && au.denied(manage) {
