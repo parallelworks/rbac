@@ -1729,6 +1729,33 @@ var plainEnv = sync.OnceValues(func() (*cel.Env, error) {
 	return cel.NewEnv(cel.Variable("request", cel.MapType(cel.StringType, cel.DynType)))
 })
 
+// A map's keys are read as the map holds them, so it finds them, a list or a map it is keyed by
+// too, and so is what such a list or map yields: a double of the host's own type one held that
+// isn't finite was compared as CEL compares it, so a grant's `k[0] != 0.5` held, and so did
+// `m == m`, where one of CEL's own fails what compares it. Each fails, and a finite one decides as
+// CEL decides it.
+func TestAHostsDoubleInAKeyFailsWhereItIsntFinite(t *testing.T) {
+	for name, keyed := range map[string]func(ref.Val) any{
+		"a map of ref.Vals": func(k ref.Val) any { return map[ref.Val]ref.Val{k: types.String("a")} },
+		"a map of Go's":     func(k ref.Val) any { return map[any]any{k: "a"} },
+	} {
+		for _, expr := range []string{
+			`request.attributes.m.exists(k, k[0] != 0.5)`, `request.attributes.m.exists(k, k != [0.5])`,
+			`request.attributes.m.exists(k, string(k[0]) != "")`, `request.attributes.m == request.attributes.m`,
+		} {
+			nan := map[string]any{"m": keyed(types.NewDynamicList(types.DefaultTypeAdapter, []any{hostDouble(math.NaN())}))}
+			if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, nan); err != nil || evaluated {
+				t.Errorf("%s on %s keyed by a list holding a host's NaN: evaluated %t, %v", expr, name, evaluated, err)
+			}
+			finite := map[string]any{"m": keyed(types.NewDynamicList(types.DefaultTypeAdapter, []any{hostDouble(0.5)}))}
+			out, err := evaluatedByCEL(t, expr, finite)
+			if held, evaluated, _, rerr := rbac.EvaluateCondition(t, expr, finite); rerr != nil || evaluated != (err == nil) || evaluated && held != out.Value() {
+				t.Errorf("%s on %s keyed by a list holding a host's 0.5: held %t, evaluated %t, %v; CEL decides %v, %v", expr, name, held, evaluated, rerr, out, err)
+			}
+		}
+	}
+}
+
 // CEL adds to a mutable list of its own in place, so a condition adding to one the host passes
 // changed what it and the check's other conditions read after, and adding one to itself, read
 // through the check's conversion, appended it to itself until memory ran out. A check reads one as

@@ -75,8 +75,9 @@ import (
 // CEL adds to in place, as the list it holds, and one of CEL's converts the
 // Go values it was made of as the adapter it was made with does, each time a condition reads one,
 // so a host should make none over the values above, as JSON text or a struct. A key a map yields of
-// such a type of the host's is read as the map holds it, so the map finds it, but for one that
-// isn't finite, which fails what compares it. A value a condition indexes a map or a list by is
+// such a type of the host's, or a list or a map it is keyed by, is read as the map holds it, so the
+// map finds it, and so is what such a list or map yields, but a double of the host's there that
+// isn't finite fails what compares it. A value a condition indexes a map or a list by is
 // read as any other, as in `m[k]`: CEL indexes by the Go value the host passed, and fails for one
 // of a type it doesn't index by, as an int8, a pointer, JSON or a wrapper, though it reads it as
 // one of its own everywhere else. A value holding itself fails whatever reads it whole.
@@ -186,7 +187,8 @@ const maxCopied = 1 << 10
 //     is read as it is.
 //   - A key a map yields, where the map can be keyed by values of the host's own types, is read as
 //     the map holds it (key): read as CEL's own, a map holding it wouldn't find it, so a map would
-//     compare unequal to itself.
+//     compare unequal to itself. So is a list or a map it is keyed by, and what it yields, so a
+//     double of the host's there that isn't finite fails what compares it by nonFinite alone.
 //
 // Each check makes its own, which keeps what it converted only while the check runs.
 type converting struct {
