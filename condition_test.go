@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1708,7 +1709,7 @@ func TestFiniteValuesDecideAsCELDoes(t *testing.T) {
 // this package.
 func evaluatedByCEL(t *testing.T, expr string, attributes map[string]any) (ref.Val, error) {
 	t.Helper()
-	env, err := cel.NewEnv(cel.Variable("request", cel.MapType(cel.StringType, cel.DynType)))
+	env, err := plainEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1723,6 +1724,10 @@ func evaluatedByCEL(t *testing.T, expr string, attributes map[string]any) (ref.V
 	out, _, err := prg.Eval(map[string]any{"request": map[string]any{"attributes": attributes}})
 	return out, err
 }
+
+var plainEnv = sync.OnceValues(func() (*cel.Env, error) {
+	return cel.NewEnv(cel.Variable("request", cel.MapType(cel.StringType, cel.DynType)))
+})
 
 // CEL indexes a map or a list by a key as the Go value the host passed, and fails for one of a type
 // it doesn't index by, as an int8, a named type, a pointer, a JSON number or text, or a wrapper,
