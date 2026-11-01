@@ -309,17 +309,18 @@ func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives m
 	// then plans no read of them. A generic plan can't tell from an empty array to read none. Of
 	// custom roles alone, as a redefinition names, they are read a role at a time, through the index
 	// leading to custom roles; no index leads to a built-in one, so with one among them, as where every
-	// conflict is listed, every grant and eligibility in the tenant is read.
+	// conflict is listed, every grant and eligibility in the tenant is read. Those the statement reads
+	// itself (readCustom) are read a role at a time beside them.
 	holders, custom := "FALSE", "FALSE"
 	switch {
 	case slices.ContainsFunc(holdersOf, func(r string) bool { return !isCustom(Role(r)) }):
 		holders = "TRUE"
-	case len(holdersOf) > 0 || readCustom:
+	case len(holdersOf) > 0:
 		custom = "TRUE"
 	}
 	given, args := givenArgs, []any{tenant, seeds, holdersOf, a.cfg.Now(), roles, values}
 	if readCustom {
-		given, args = givenWithCustom, append(args, a.catalogExclusives())
+		given, custom = givenWithCustom, "TRUE"
 	}
 	// The planner can't tell which of targets' branches the seeds reach, so it costs a change's
 	// check as if it read every identity in the tenant, past JIT's thresholds where they are in
@@ -332,9 +333,10 @@ func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives m
 // valuesGiven is SQL for the roles giving exclusive values as conflictsIn reads them: with, the
 // WITH entry they need, or none; pairs, each role and a value it gives, as v(role, value); gives,
 // whether the role of a row read among the tenant's is one of them, and held, one whose holders are
-// read; givesKeys, whether that of a row read by its key is; and holders, an array of those whose
-// holders are read.
-type valuesGiven struct{ with, pairs, gives, held, givesKeys, holders string }
+// read; alsoGives, the principals of the rows of those gives leaves out, or none; givesKeys,
+// whether the role of a row read by its key is one; and holders, an array of the custom roles
+// whose holders are read.
+type valuesGiven struct{ with, pairs, gives, held, alsoGives, givesKeys, holders string }
 
 var (
 	// givenArgs are the roles and values conflicts is passed, $5 and $6, and the holders of $3, as
@@ -344,36 +346,32 @@ var (
 		pairs: "unnest($5::text[], $6::text[]) AS v(role, value)", gives: "role = ANY($5::text[])", held: "role = ANY($3::text[])",
 		givesKeys: "role = ANY($5::text[])", holders: "$3",
 	}
-	// givenWithCustom are those and the tenant's custom roles giving any of the values $7, which are
-	// all a custom role can give of them (catalogExclusives), read with their grants, each a role
-	// whose holders are read beside those of $3. An array the statement builds is no argument, so
-	// = ANY of it compares a row's role with each element: among the tenant's rows a role is looked
-	// up by IN, which hashes them, and for each key, whose rows are few, in the array, which IN
-	// would hash again for each.
+	// givenWithCustom are those, with $5 and $6 every built-in role giving a value, and the tenant's
+	// custom roles giving any of $6, all a custom role can give of them as current reads it, read
+	// with their grants, each a role whose holders are read beside those of $3. The custom ones' rows
+	// are read a role at a time (customRoleRows): matched against roles the statement reads, even by
+	// IN, which hashes them, a row's role is found by no index, so as of a time every version of every
+	// grant in the tenant would be read, not those history's index on roles finds. For each key,
+	// whose rows are few, a role is looked up in an array of them all, which IN would hash for each.
 	givenWithCustom = valuesGiven{
 		with: `custom_given(role, value) AS (
 		  SELECT r.id, p.value FROM rbac_roles r CROSS JOIN LATERAL unnest(r.permissions) AS p(value)
-		  WHERE r.tenant = $1 AND p.value = ANY($7::text[])
+		  WHERE r.tenant = $1 AND p.value = ANY($6::text[])
 		), given(role, value) AS (
 		  SELECT * FROM unnest($5::text[], $6::text[]) UNION ALL SELECT * FROM custom_given
 		), `,
-		pairs: "given AS v", gives: "role IN (SELECT role FROM given)", held: "role IN (SELECT role FROM given)",
-		givesKeys: "role = ANY(ARRAY(SELECT role FROM given))", holders: "($3::text[] || ARRAY(SELECT DISTINCT role FROM custom_given))",
+		pairs: "given AS v", gives: givenArgs.gives, held: givenArgs.held,
+		alsoGives: `
+		    UNION ALL
+		    SELECT principal FROM (` + customRoleRows(customGiving, "rbac_grants", "principal", "TRUE") + `) cg
+		    UNION ALL
+		    SELECT principal FROM (` + customRoleRows(customGiving, "rbac_eligibilities", "principal", "TRUE") + `) ce`,
+		givesKeys: "role = ANY(ARRAY(SELECT role FROM given))", holders: customGiving,
 	}
 )
 
-// catalogExclusives are the values of exclusive dimensions the catalog gives, sorted: all a custom
-// role gives of them, as current reads it.
-func (a *Authorizer) catalogExclusives() []string {
-	values := []string{}
-	for p := range a.permissions {
-		if _, ok := a.exclusiveValue(p); ok {
-			values = append(values, string(p))
-		}
-	}
-	slices.Sort(values)
-	return values
-}
+// customGiving is the custom roles givenWithCustom reads as giving values, each once.
+const customGiving = "ARRAY(SELECT DISTINCT role FROM custom_given)"
 
 // conflictsIn is conflicts' statement, run with args: of the roles giving values, as given reads
 // them, the holders read across the tenant where holders is TRUE, or a role at a time where custom
@@ -397,7 +395,7 @@ func conflictsIn(ctx context.Context, q DB, given valuesGiven, args []any, holde
 		  UNION SELECT o.principal FROM (
 		    SELECT principal FROM rbac_grants WHERE tenant = $1 AND `+given.gives+`
 		    UNION ALL
-		    SELECT principal FROM rbac_eligibilities WHERE tenant = $1 AND `+given.gives+`
+		    SELECT principal FROM rbac_eligibilities WHERE tenant = $1 AND `+given.gives+given.alsoGives+`
 		  ) o WHERE o.principal NOT LIKE 'group:%' AND o.principal NOT LIKE 'members:%' AND o.principal <> 'public:'
 		    AND EXISTS (SELECT FROM seeds WHERE k = 'public:')
 		  UNION SELECT '' WHERE EXISTS (SELECT FROM seeds WHERE k = 'public:')

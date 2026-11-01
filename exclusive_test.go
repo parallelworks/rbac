@@ -3,6 +3,7 @@ package rbac_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"slices"
 	"strings"
@@ -883,6 +884,58 @@ func TestConflictsUnderWithTxListsOnlyWhatOneMomentHeld(t *testing.T) {
 	}
 	if now, err := h.authz.Conflicts(ctx, "t1"); err != nil || len(now) > 0 {
 		t.Fatalf("Conflicts once both committed = %+v, %v", now, err)
+	}
+}
+
+// As of a time, Conflicts reads, of history, the versions of the grants and eligibilities of the
+// roles giving values, the custom ones it reads in its statement too, by history's index on roles:
+// matched against roles the statement reads, a role is found by no index, so it would read every
+// version of every grant and eligibility in the tenant.
+func TestConflictsAsOfATimeReadsOnlyTheRolesGivingValues(t *testing.T) {
+	h := labeled(t, banks)
+	ctx := t.Context()
+	h.as(t, "ann")
+	h.as(t, "bob")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.rb', '{bank:b}', '{tenant}');
+		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'tenant', 't1', 'user', 'ann', 'bank.a'), ('t1', 'tenant', 't1', 'user', 'ann', 'custom.rb'),
+		  ('t1', 'tenant', 't1', 'user', 'bob', 'custom.rb')`); err != nil {
+		t.Fatal(err)
+	}
+	read := func(at time.Time) int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		var pages int64
+		if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+			start := historyPages(ctx, t, tx)
+			conflicts, err := a.Conflicts(ctx, "t1")
+			if err == nil && (len(conflicts) != 1 || conflicts[0].Principal != identity("ann")) {
+				err = fmt.Errorf("conflicts as of now: %+v", conflicts)
+			}
+			pages = historyPages(ctx, t, tx) - start
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return pages
+	}
+	// Others hold a role on a cluster each, and are eligible for it.
+	others := func(n int) {
+		t.Helper()
+		manyMembers(t, h, n, `, eligibilities AS (INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+			  SELECT 't1', 'cluster', id, 'user', id, 'cluster.login', 60 FROM others)
+			INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', id, 'user', id, 'cluster.login' FROM others`, "rbac_history")
+	}
+	others(500)
+	few := read(dbNow(t, h))
+	others(4500)
+	if many := read(dbNow(t, h)); many > few*3/2+deeper {
+		t.Errorf("Conflicts as of a time read %d pages of history, and %d once 4500 more held another role", few, many)
 	}
 }
 
