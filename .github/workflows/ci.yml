@@ -163,9 +163,11 @@ jobs:
 
   # Passes once every check and shard has, and then saves the tests' times, by
   # which the next runs balance their shards. They take a few kilobytes, so
-  # unlike the Go caches, a PR's can't crowd canary's out.
+  # unlike the Go caches, a PR's can't crowd canary's out. It runs even in a
+  # cancelled run, and fails it: branch protection passes a required job its if
+  # skips.
   go:
-    if: ${{ !cancelled() }}
+    if: ${{ always() }}
     needs: [checks, test]
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -187,12 +189,14 @@ jobs:
           path: test-results
       # Each shard's coverage counts only what its own tests reach.
       - name: Coverage of every shard's tests
+        shell: bash
         run: >-
           awk 'FNR == 1 { next } { package = $1; sub(/\/[^\/]*$/, "", package); of[$1] = package; statements[$1] = $2; if ($3 > 0) reached[$1] = 1 }
           END { for (b in of) { all[of[b]] += statements[b]; if (b in reached) covered[of[b]] += statements[b] };
           for (p in all) printf "%s coverage: %.1f%% of statements\n", p, 100 * covered[p] / all[p] }'
           test-results/*/coverage.out | sort | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Keep each top-level test's time
+        shell: bash
         run: >-
           cat test-results/*/test-results.json |
           jq -Rc 'fromjson? | select(.Test and (.Test | contains("/") | not) and (.Action == "pass" or .Action == "fail"))
