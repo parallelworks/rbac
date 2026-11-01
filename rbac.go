@@ -570,8 +570,8 @@ var (
 	// serialization failure, a deadlock, as between host transactions, or a lock it couldn't take,
 	// as one a migration holds past the session's lock_timeout. It is so wherever in the call
 	// PostgreSQL refused it: in a change's transaction or the reads it makes before it, in a read, or
-	// in a statement a hook ran, whose error matches it too. Try it again: under WithTx, the host's
-	// whole transaction, as WithTx says.
+	// in a statement a hook ran, where the error the hook returns wraps PostgreSQL's. Try it again:
+	// under WithTx, the host's whole transaction, as WithTx says.
 	ErrConflict = errors.New("rbac: conflict")
 	// ErrNotFound is what Config.ResourceOf returns, or wraps, for a scope the host no longer has,
 	// as a resource deleted without DeleteScopes: a change that only takes access away there, as
@@ -969,12 +969,13 @@ func vocabulary(declared []Permission, given map[Permission]bool, roleTypes map[
 // transactions changing two tenants in opposite orders can deadlock too. A call PostgreSQL refuses
 // for a race matches ErrConflict, and is retried by rolling tx back and running the host's
 // transaction again from its start, not by making the call again in it: a statement refused on tx
-// itself, as a read's are, a hook's on the q it is given, and those a change makes before its
-// savepoint, aborts tx, which then runs nothing until it rolls back; and one refused in the
-// change's savepoint, which it rolls back to, leaves tx holding what it took before the call, which
-// the race can be over. Explain, Reachable and Holders read in several statements, on tx at its
-// isolation: at READ COMMITTED each reads a snapshot of its own, so a change committing between them
-// can mix two states, as can AsOf's read, in a savepoint of tx, of a time not yet final (AsOf).
+// itself, as most reads' are, a hook's on the q it is given, and those a change makes before its
+// savepoint, aborts tx, which then runs nothing until it rolls back; and one refused in a savepoint
+// the call rolls back to, as a change's, AsOf's or History's, leaves tx holding what it took before
+// the call, which the race can be over. Explain, Reachable and Holders read in several statements,
+// on tx at its isolation: at READ COMMITTED each reads a snapshot of its own, so a change committing
+// between them can mix two states, as can AsOf's read, in a savepoint of tx, of a time not yet final
+// (AsOf).
 func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 	// One AsOf gave reads its own transaction, whose views are the past: on another, it would read
 	// the tables as they are now.

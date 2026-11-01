@@ -572,12 +572,13 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   session's `lock_timeout`, matches `rbac.ErrConflict`, still wrapping PostgreSQL's error, as does a
   change refused because what it rests on changed while it waited: try it again. It does wherever in
   the call PostgreSQL refused it: in a change's transaction or the reads it makes before it, in a
-  read, or in a statement a hook ran, whose error matches too. Under `WithTx`, roll the host's
-  transaction back and run it again from its start, not the call alone in it: a statement refused
-  on that transaction itself, as a read's, a hook's or one a change makes before its savepoint,
-  aborts it, and one refused in the change's savepoint leaves it holding what it took before the
-  call, which the race can be over. Changes to the same rows wait for each other by locks named for
-  the schema holding the tables, so sessions reaching them through different search_paths still do.
+  read, or in a statement a hook ran, where the hook's error wraps PostgreSQL's. Under `WithTx`,
+  roll the host's transaction back and run it again from its start, not the call alone in it: a
+  statement refused on that transaction itself, as most reads', a hook's or one a change makes
+  before its savepoint, aborts it, and one refused in a savepoint, as a change's, `AsOf`'s or
+  `History`'s, leaves it holding what it took before the call, which the race can be over. Changes
+  to the same rows wait for each other by locks named for the schema holding the tables, so
+  sessions reaching them through different search_paths still do.
 - **What the host passes:** a check reads grants, memberships and groups as they are; only compiled
   conditions are cached. Read a resource's ancestors and attributes from where they are stored,
   never from request input, no earlier than the content they protect, and from the primary. A

@@ -648,12 +648,12 @@ flowchart TB
   where it decides again by what committed before them. As of a time, it is that time.
 - **Races** PostgreSQL refuses, such as a serialization failure, a deadlock between host
   transactions, or a lock waited for past `lock_timeout`, as one a migration holds, match
-  `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them as it
-  returns (`conflicting`), not only a change's transaction (`begin`), so one refused before the
-  transaction, as in the reads that decide a change first, which under `WithTx` run on the host's
-  transaction itself and can deadlock with a migration, in a read, or in a hook's statement, whose
-  error a call returns as it is, matches too. Under `WithTx` the host runs its transaction again
-  from its start: a statement refused on it outside a savepoint aborts it, and the change's
+  `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them, as it
+  returns (`conflicting`) where it queries outside `begin`, which maps its own, so one refused
+  before a change's transaction, as in the reads that decide a change first, which under `WithTx`
+  run on the host's transaction itself and can deadlock with a migration, in a read, or in a hook's
+  statement, whose error a call returns as it is, matches too. Under `WithTx` the host runs its
+  transaction again from its start: a statement refused on it outside a savepoint aborts it, and a
   savepoint, rolled back to, frees nothing taken before it, which the race can be over.
 
 ## History, export and AsOf
