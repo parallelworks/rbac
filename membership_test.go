@@ -6508,41 +6508,63 @@ func TestSettingMembershipsHoldsOnlyThePlacesItRemoves(t *testing.T) {
 // A change decides at a time no earlier than the one it picks what it holds of what is in force by:
 // where the host's clock goes back between the two, as from 12:10 to 12:00 here, it would leave in
 // force at 12:00 an activation resting on the place it removes, which it didn't hold, as it had
-// ended by 12:10. It is tried again, and then ends it.
+// ended by 12:10. It is tried again, and then ends it. Each removal here reads the clock twice,
+// both in its transaction: first for what it holds, then for what it decides, which DeletePrincipal
+// of a group reads whether or not it found an activation to hold.
 func TestAChangeWhoseClockWentBackIsTriedAgain(t *testing.T) {
-	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
-	var back atomic.Bool
-	var reads atomic.Int64
-	h := grouped(t, func(c *rbac.Config) {
-		c.Now = func() time.Time {
-			if back.Load() && reads.Add(1) == 1 {
-				return base.Add(10 * time.Minute)
+	for name, c := range map[string]struct {
+		// eligible is the group v's activation is made through, whose path from v remove ends.
+		eligible string
+		remove   func(h *harness) error
+	}{
+		"DeleteMembers": {"crew", func(h *harness) error {
+			return h.authz.DeleteMembers(h.ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: groupOf("inner")}})
+		}},
+		"DeleteGroups": {"crew", func(h *harness) error { return h.authz.DeleteGroups(h.ctx, host, "t1", []string{"crew"}) }},
+		"ImportGroups": {"crew", func(h *harness) error {
+			return h.authz.ImportGroups(h.ctx, host, "t1", []rbac.GroupDefinition{{ID: "crew", Source: "directory"}})
+		}},
+		"DeletePrincipal of a group": {"outer", func(h *harness) error { return h.authz.DeletePrincipal(h.ctx, host, "t1", groupOf("crew")) }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+			var back atomic.Bool
+			var reads atomic.Int64
+			h := grouped(t, func(c *rbac.Config) {
+				c.Now = func() time.Time {
+					if back.Load() && reads.Add(1) == 1 {
+						return base.Add(10 * time.Minute)
+					}
+					return base
+				}
+				c.Sources = []string{"directory"}
+			})
+			ctx := t.Context()
+			h.groups(t, "outer", "crew", "inner")
+			v := h.as(t, "v", "inner")
+			if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: groupOf("inner")}}); err != nil {
+				t.Fatal(err)
 			}
-			return base
-		}
-	})
-	ctx := t.Context()
-	v := h.as(t, "v", "crew")
-	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.login", Principal: groupOf("crew"), MaxDuration: time.Hour}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := h.authz.Activate(ctx, v, cluster, rbac.Activation{Role: "cluster.login", Duration: 5 * time.Minute, Justification: "x"}); err != nil {
-		t.Fatal(err)
-	}
-	// DeleteMembers reads the clock twice, both in its transaction: first for what it holds, then for
-	// what it decides.
-	back.Store(true)
-	remove := func() error {
-		return h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: v.Principal}})
-	}
-	if err := remove(); !errors.Is(err, rbac.ErrConflict) {
-		t.Errorf("DeleteMembers, its clock going back = %v, not tried again", err)
-	}
-	if err := remove(); err != nil {
-		t.Fatal(err)
-	}
-	if allowed(t, h, v, login, cluster) {
-		t.Error("at 12:00 v logs in through its activation, which rested on its place in crew, which is gone")
+			if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", []rbac.Member{{Group: "outer", Principal: groupOf("crew")}}, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.login", Principal: groupOf(c.eligible), MaxDuration: time.Hour}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := h.authz.Activate(ctx, v, cluster, rbac.Activation{Role: "cluster.login", Duration: 5 * time.Minute, Justification: "x"}); err != nil {
+				t.Fatal(err)
+			}
+			back.Store(true)
+			if err := c.remove(h); !errors.Is(err, rbac.ErrConflict) {
+				t.Errorf("%s, its clock going back = %v, not tried again", name, err)
+			}
+			if err := c.remove(h); err != nil {
+				t.Fatal(err)
+			}
+			if allowed(t, h, v, login, cluster) {
+				t.Errorf("at 12:00 v logs in through its activation, which rested on a path through %s, which is gone", c.eligible)
+			}
+		})
 	}
 }
 

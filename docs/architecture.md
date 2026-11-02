@@ -752,16 +752,17 @@ flowchart TB
   of the memberships that had ended as of then, not those of every membership with an end: the
   places of one ending in between it removes without waiting (NOWAIT), or is tried again. Where the
   host's clock goes back between the two readings, what was in force at the first can be less than
-  at the second, and the change is tried again (`wentBack`). A write's own locks take again what the
-  change holds, an upsert's the row it conflicts with too: `DeleteExpired` takes no lock, and holds
-  what it deletes until its transaction ends, a host's under `WithTx`, so a change holds first what
-  it writes that one may be deleting, as ended by its clock: `SetMemberships` every membership it
-  sets, `Apply` and `Import` each grant they grant again until an end, and `DeleteRole` the role's
-  grants and eligibilities. A grant for good no expiry deletes, and a group's row, which a place's
-  insert holds for its key, is held only under the group's lock. In the tests, a statement holding
-  rows or taking an advisory lock once a change has read its time panics, and so does a change whose
-  session waited for a row then, whatever the statement, as another session's watch of each one's
-  wait events sees (`watched`). As of a time, it is that time.
+  at the second, and the change is tried again (`wentBack`): a removal reads the second whether or
+  not it found anything to hold by the first. A write's own locks take again what the change holds,
+  an upsert's the row it conflicts with too: `DeleteExpired` takes no lock, and holds what it
+  deletes until its transaction ends, a host's under `WithTx`, so a change holds first what it
+  writes that one may be deleting, as ended by its clock: `SetMemberships` every membership it sets,
+  `Apply` and `Import` each grant they grant again until an end, and `DeleteRole` the role's grants
+  and eligibilities. A grant for good no expiry deletes, and a group's row, which a place's insert
+  holds for its key, is held only under the group's lock. In the tests, a statement holding rows or
+  taking an advisory lock once a change has read its time panics, and so does a change whose session
+  waited for a row then, whatever the statement, as another session's watch of each one's wait
+  events sees (`watched`). As of a time, it is that time.
 - **Races** PostgreSQL refuses, such as a serialization failure, a deadlock between host
   transactions, or a lock waited for past `lock_timeout`, as one a migration holds, match
   `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them, as it

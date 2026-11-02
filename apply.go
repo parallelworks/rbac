@@ -3010,10 +3010,11 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 	if e.Revoked, err = removedWhere(ctx, a, tx, "rbac_grants", grantColumns, collectGrants, granted, grantedArgs...); err != nil {
 		return ChangeEvent{}, err
 	}
-	if len(r.ids) == 0 {
+	if del.group == "" {
 		return e, nil
 	}
-	// Read once the change holds all it waits for, the activations among them.
+	// Read once the change holds all it waits for, the activations among them; read where it picked
+	// none by the time before too, which a clock gone back since leaves in force (wentBack).
 	short, ended, err := a.unrest(ctx, tx, tenant, actor, r, a.cfg.Now())
 	e.Shortened, e.Revoked = short, append(e.Revoked, ended...)
 	return e, err
