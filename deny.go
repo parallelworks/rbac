@@ -79,6 +79,47 @@ type denial struct {
 	unevaluated, spent bool
 }
 
+// exemption is a deny that binds a subject but exempts it only until a time, through places in
+// groups or a membership of the tenant that end then, while it binds the subject past then: what it
+// removes, the subject holds only until its exemption ends, as a change reads it.
+type exemption struct {
+	denial
+	until time.Time
+}
+
+// lastingSQL is SQL defining, in a WITH RECURSIVE after keysSQL and endsSQL, lasting(k, e, exempts):
+// each key a deny binds the identity by (bound), SQL for its key, in the tenant, SQL for its text,
+// with when the identity's path to it ends, null for never, and whether a deny exempts it by it
+// (exempted). A group's path ends as ends has it, and the tenant's members' as the membership does;
+// its identity's and the public's never do, as exempted holds the identity whatever its membership.
+// Both are joined by key, each holding a key once: looked up for each key, they would be read
+// whole for each of an identity's thousand groups.
+func lastingSQL(tenant, identity string) string {
+	return fmt.Sprintf(`lasting(k, e, exempts) AS (
+	  SELECT b.k, CASE WHEN b.k LIKE 'group:%%' THEN g.e
+	    WHEN b.k = 'members:' || %[1]s THEN (SELECT e FROM ends WHERE ends.k = %[2]s) END,
+	    x.k IS NOT NULL
+	  FROM bound b LEFT JOIN ends g ON g.k = b.k LEFT JOIN exempted x ON x.k = b.k
+	)`, tenant, identity)
+}
+
+// exemptForGoodSQL is SQL for the keys lastingSQL reads that exempt the identity for good, as its
+// own does: uncorrelated, so a statement reads them once, and a deny exempting it by one is told by
+// its keys alone.
+const exemptForGoodSQL = `ARRAY(SELECT k FROM lasting WHERE exempts AND e IS NULL)`
+
+// exemptUntilSQL is SQL for when the identity's exemption from a deny, SQL for whose principals and
+// exemptions lastingSQL reads, ends where the deny binds it past then: the latest end of its paths to
+// the keys exempting it, where each ends, before the latest of those to the keys it binds it by.
+// Null where it isn't exempt, is exempt for good (exemptForGoodSQL), or is bound no longer than it is
+// exempt.
+func exemptUntilSQL(principals, exempt string) string {
+	return fmt.Sprintf(`CASE WHEN NOT %[2]s && `+exemptForGoodSQL+` THEN (
+	  SELECT max(x.e) FROM lasting x WHERE x.exempts AND x.k = ANY(%[2]s)
+	  HAVING max(x.e) < (SELECT max(coalesce(y.e, 'infinity')) FROM lasting y WHERE y.k = ANY(%[1]s))) END`,
+		principals, exempt)
+}
+
 // deniesOn reads the denies on scopes that name one of binding and exempt none of exempt, the
 // keys keysOf and exempting give, or name anyone when binding is nil, listing p.
 func (a *Authorizer) deniesOn(ctx context.Context, q DB, tenant string, binding, exempt, scopes []string, p Permission) ([]denial, error) {

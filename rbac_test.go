@@ -4235,6 +4235,62 @@ func TestAWrapperAroundAHostsTransaction(t *testing.T) {
 	}
 }
 
+// A change and a read of several statements run in a transaction of their own on a pool, a
+// connection, or a wrapper around either, whatever the database's default isolation, and on the
+// host's transaction under WithTx or through a wrapper whose Begin gives a savepoint of it, at any
+// isolation, before or after its first query: a savepoint may set the isolation its transaction
+// already has, so setting the one a change or a read needs can't tell one at that isolation from a
+// transaction of its own.
+func TestATransactionOfItsOwnIsToldFromAHostsAtAnyIsolation(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	serializable := pgtest.Open(t, "default_transaction_isolation=serializable")
+	conn, err := pgx.ConnectConfig(ctx, h.pool.Config().ConnConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	check := func(name string, db rbac.DB, own bool, change, read string) {
+		t.Helper()
+		if got, level, err := rbac.Transacted(ctx, db); err != nil || got != own || level != change {
+			t.Errorf("a change on %s: own %t at %q, %v; want own %t at %q", name, got, level, err, own, change)
+		}
+		a, err := rbac.New(db, h.cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, level, err := rbac.Snapshotted(ctx, a); err != nil || got != own || level != read {
+			t.Errorf("a read on %s: own %t at %q, %v; want own %t at %q", name, got, level, err, own, read)
+		}
+	}
+	for name, db := range map[string]rbac.DB{
+		"a pool": h.pool, "a connection": conn, "a wrapper around a pool": struct{ rbac.DB }{h.pool},
+		"a wrapper around a connection":                                      struct{ rbac.DB }{conn},
+		"a wrapper around a pool where transactions default to SERIALIZABLE": struct{ rbac.DB }{serializable},
+	} {
+		check(name, db, true, "read committed", "repeatable read, read only")
+	}
+	for _, level := range []pgx.TxIsoLevel{pgx.ReadCommitted, pgx.RepeatableRead, pgx.Serializable} {
+		for _, queried := range []bool{false, true} {
+			tx, err := h.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: level})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if queried {
+				if _, err := tx.Exec(ctx, `SELECT FROM rbac_grants LIMIT 1`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for name, db := range map[string]rbac.DB{"the host's transaction": tx, "a wrapper around the host's transaction": hostTx{tx}} {
+				check(fmt.Sprintf("%s at %s, queried %t", name, level, queried), db, false, string(level), string(level))
+			}
+			if err := tx.Rollback(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
 func TestDeadlockedHostTransactionsConflict(t *testing.T) {
 	h := setup(t, func(c *rbac.Config) { c.OnChange = nil })
 	ctx := t.Context()

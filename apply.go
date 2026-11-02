@@ -54,8 +54,9 @@ func (e *InvalidError) Unwrap() error { return e.Err }
 //   - what the actor hands on, permissions and power alike, it holds until the grant ends: what
 //     it holds only through grants that end, as an activation, or through a membership of the
 //     tenant or a place in a group that ends, it grants ending no later than the last of them,
-//     never for good; a role a role it holds lists, it grants without holding, so for as long as
-//     it likes;
+//     never for good, and what it holds only while such a membership or place exempts it from a
+//     deny binding it, no later than the last of those; a role a role it holds lists, it grants
+//     without holding, so for as long as it likes;
 //   - a role that gives a `:grant` or `:deny` permission, DefineRoles, ManageGroups or
 //     GroupMembers can't be granted to a tenant's members or the public, and only a role marked
 //     Public can be granted to the public;
@@ -839,6 +840,11 @@ type authority struct {
 	denied, handsOn func(p Permission) bool
 	// denials are the denies on the path that bind the actor, which denied and handsOn read.
 	denials []denial
+	// exemptUntil is when the actor's exemption ends from the soonest ending of the denies on the path
+	// that bind it but exempt it until a time (exemptions) and remove p, each decided as handsOn
+	// decides one, zero where none does: it holds p only until then, as through a grant ending then.
+	exemptUntil func(p Permission) time.Time
+	exemptions  []exemption
 	// excluded are the exclusive dimensions whose values its grants on the path could give two of,
 	// which denied and handsOn remove too.
 	excluded map[string]bool
@@ -1210,10 +1216,11 @@ func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []
 			keys[k] = true
 		}
 	}
-	held, ds, b, err := a.heldOrDenied(ctx, q, tenant, actor, all, slices.Sorted(maps.Keys(keys)), which, true)
+	got, err := a.readHeld(ctx, q, tenant, actor, all, slices.Sorted(maps.Keys(keys)), "", which, alsoRead{ending: true})
 	if err != nil {
 		return nil, err
 	}
+	held, ds, b := got.held, got.ds, got.roles
 	readingRoles()
 	if err := a.conditionsOf(ctx, q, tenant, held); err != nil {
 		return nil, err
@@ -1224,10 +1231,12 @@ func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []
 	}
 	heldAt := onPaths(at, func(i int) string { return held[i].scope }, paths)
 	deniedOn := onPaths(ds, func(d denial) string { return d.scope }, paths)
+	exemptOn := onPaths(got.exempt, func(e exemption) string { return e.scope }, paths)
 	// Where the actor holds the same grants on two scopes, and neither a deny nor a constraint can
-	// tell them apart, as none binds the actor there, what it may hand on is the same on both: what
-	// deciding a grant on one proved holds on the other, so a change reaching many, as one to the
-	// members of a group granted a role on each, walks the roles a role lists once.
+	// tell them apart, as none binds the actor there, nor will once an exemption ends, what it may
+	// hand on is the same on both: what deciding a grant on one proved holds on the other, so a
+	// change reaching many, as one to the members of a group granted a role on each, walks the roles
+	// a role lists once.
 	proven := map[string]*checked{}
 	b = b.keepingSets()
 	// Every path holds the tenant's scope, so the read holds what the actor's values are decided by.
@@ -1249,9 +1258,9 @@ func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []
 		if of != nil {
 			excluded = excludedOf(of, heldOn)
 		}
-		aus[i] = a.authorityOf(ctx, actor, r, heldOn, deniedOn[i], b, excluded)
+		aus[i] = a.authorityOf(ctx, actor, r, heldOn, deniedOn[i], exemptOn[i], b, excluded)
 		aus[i].values = values
-		if len(a.cfg.Constraints) > 0 || len(deniedOn[i]) > 0 {
+		if len(a.cfg.Constraints) > 0 || len(deniedOn[i]) > 0 || len(exemptOn[i]) > 0 {
 			continue
 		}
 		k := fmt.Sprint(heldAt[i])
@@ -1290,8 +1299,11 @@ func orDenied(denied, more func(Permission) bool) func(Permission) bool {
 }
 
 // authorityOf is the authority of held grants, their conditions read, under the denies on the
-// path, where they could give two values of each dimension of excluded (excludedBy).
-func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource, held []holding, ds []denial, b book, excluded map[string]bool) authority {
+// path, ds binding the actor and ex exempting it until a time, where they could give two values of
+// each dimension of excluded (excludedBy).
+func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource, held []holding, ds []denial, ex []exemption, b book,
+	excluded map[string]bool,
+) authority {
 	vars := a.vars(ctx, actor, "", on)
 	// The cheapest conditions first, as callers evaluate them in this order, so what a budget run
 	// out decides doesn't rest on ids.
@@ -1335,11 +1347,34 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 	}
 	// On a resource, what the actor hands on reaches only it, as what it does there does.
 	denied := deny(vars)
-	handsOn := denied
+	handsOn, reached := denied, vars
 	if a.contains(on.Type) {
-		reached := maps.Clone(vars)
+		reached = maps.Clone(vars)
 		delete(reached, "resource")
 		handsOn = deny(reached)
+	}
+	// What a deny it is exempt from only until a time removes, it holds only until then: the soonest
+	// end of those removing p, each decided as handsOn decides one, as of now, on a budget of its own.
+	exemptUntil := func(Permission) time.Time { return time.Time{} }
+	if len(ex) > 0 {
+		ex = slices.Clone(ex)
+		slices.SortStableFunc(ex, func(x, y exemption) int { return x.until.Compare(y.until) })
+		ends := map[Permission]time.Time{}
+		exemptUntil = func(p Permission) time.Time {
+			if until, ok := ends[p]; ok {
+				return until
+			}
+			var until time.Time
+			spend, v := newDenyBudget(on.path()), with(reached, p)
+			for _, e := range ex {
+				if _, d := a.deniedBy([]denial{e.denial}, p, spend, v); d {
+					until = e.until
+					break
+				}
+			}
+			ends[p] = until
+			return until
+		}
 	}
 	// The values of an exclusive dimension it holds none of, as its grants could give it two, it
 	// can't use or hand on either, as checks refuse it them. Read from its grants on the path, which
@@ -1353,8 +1388,20 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 		allows: func(h holding, action Permission) bool {
 			return !h.conditional || a.conds.holds(spend(action), h.Condition.Expression, with(vars, action))
 		},
-		denied: denied, handsOn: handsOn, denials: ds, excluded: excluded, subjects: subjects{},
+		denied: denied, handsOn: handsOn, denials: ds, exemptUntil: exemptUntil, exemptions: ex, excluded: excluded, subjects: subjects{},
 	}
+}
+
+// exempt reports whether the actor's exemption from each deny on the path that binds it but exempts
+// it until a time and removes p lasts until until, zero for never, as what it hands on of p must.
+func (au authority) exempt(p Permission, until time.Time) bool {
+	return au.exemptUntil == nil || holding{ends: au.exemptUntil(p)}.lasts(until)
+}
+
+// handsOnForGood reports whether a deny on the path removes p from what the actor hands on for good,
+// as a definition does: one binding it, or one exempting it only until a time.
+func (au authority) handsOnForGood(p Permission) bool {
+	return au.handsOn(p) || !au.exempt(p, time.Time{})
 }
 
 // over is what the actor's grants let it change on scopes of a type in this request: a
@@ -1369,10 +1416,10 @@ func (au authority) over(scopeType string) power {
 
 // under is the power the actor may hand on with condition until until, as holds counts
 // permissions: a power held under a condition can't be handed on without it, nor one held until a
-// time past it, nor one a constraint removes. How long its grants give it is read once for each
-// type and condition, whatever end each asks about.
+// time past it, through its grants or its exemption from a deny, nor one a constraint removes. How
+// long its grants give it is read once for each type and condition, whatever end each asks about.
 func (au authority) under(scopeType, condition string, until time.Time) power {
-	if au.handsOn(GrantPermission(scopeType)) {
+	if manage := GrantPermission(scopeType); au.handsOn(manage) || !au.exempt(manage, until) {
 		return power{listed: map[Role][]string{}}
 	}
 	k := heldKey{types: scopeType, condition: condition}
@@ -1479,7 +1526,8 @@ func (h holding) lasts(until time.Time) bool {
 // until until: so it decides until until just as until the soonest time at or after it that the
 // longest lasting of a kind of them ends, or for good where none ends then. Grants of one role to
 // the actor's many groups, each ending at its own time, are one kind, so grants made until any
-// time up to the last of their ends are decided as one.
+// time up to the last of their ends are decided as one. Its exemption from a deny ending tells
+// grants apart as a kind ending does.
 func (au authority) decidedAs(condition string, until time.Time) (string, time.Time) {
 	if !slices.ContainsFunc(au.held, func(g holding) bool { return g.conditional && g.Condition.Expression == condition }) {
 		condition = ""
@@ -1498,6 +1546,11 @@ func (au authority) decidedAs(condition string, until time.Time) (string, time.T
 	for _, l := range kinds {
 		if !l.until.IsZero() && !l.until.Before(until) && (at.IsZero() || l.until.Before(at)) {
 			at = l.until
+		}
+	}
+	for _, e := range au.exemptions {
+		if !e.until.Before(until) && (at.IsZero() || e.until.Before(at)) {
+			at = e.until
 		}
 	}
 	return condition, at.UTC()
@@ -1522,14 +1575,15 @@ func (au authority) kindsLasting(condition string) []lasting {
 }
 
 // holdsFor reports whether the actor holds p for resources of each of types, which typesKey names,
-// to hand it on with condition until until: neither a deny nor a constraint removes it, and where
-// one does, the constraint. A constraint is asked about each type in order that the actor's grants
-// give p for, up to one that removes it, as asking of each type in turn would.
+// to hand it on with condition until until: neither a deny nor a constraint removes it, nor a deny
+// it is exempt from only until a time before then, and where a constraint does, the constraint. A
+// constraint is asked about each type in order that the actor's grants give p for, up to one that
+// removes it, as asking of each type in turn would.
 func (au authority) holdsFor(p Permission, types []string, typesKey, condition string, until time.Time) (string, bool) {
 	if len(types) == 0 {
 		return "", true
 	}
-	if au.handsOn(p) {
+	if au.handsOn(p) || !au.exempt(p, until) {
 		return "", false
 	}
 	n := au.heldFor(p, types, typesKey, condition, until)
@@ -1797,7 +1851,8 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) (_ []
 	// statement that reads the grants, as a check reads them: read apart, a grant revoked and its
 	// role widened meanwhile could offer what no moment would. Its label values too, which its
 	// grants on the tenant give.
-	held, ds, b, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), tenantRoles, true)
+	got, err := a.readHeld(ctx, a.db, r.Tenant, s, all, r.path(), "", tenantRoles, alsoRead{ending: true})
+	held, ds, b := got.held, got.ds, got.roles
 	if err != nil || len(held) == 0 {
 		return nil, err
 	}
@@ -1815,7 +1870,7 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) (_ []
 	if cs.removes(GrantPermission(r.Type), r.Type) {
 		return nil, cs.failed()
 	}
-	au := a.authorityOf(ctx, s, r, held, ds, b, a.excludedBy(b, held))
+	au := a.authorityOf(ctx, s, r, held, ds, got.exempt, b, a.excludedBy(b, held))
 	custom := slices.SortedFunc(maps.Values(b.custom), func(x, y RoleDefinition) int { return strings.Compare(string(x.ID), string(y.ID)) })
 	au.constrained = cs
 	pw := au.over(r.Type)
@@ -1974,7 +2029,7 @@ func beginOwn(ctx context.Context, db DB, fn func(tx pgx.Tx, own bool) error) er
 		err = savepoint(ctx, db, host)
 	default:
 		var nested bool
-		if nested, err = isolated(ctx, db, "READ COMMITTED", own); nested {
+		if nested, err = isolated(ctx, db, pgx.ReadCommitted, "", own); nested {
 			err = savepoint(ctx, db, host)
 		}
 	}
@@ -1986,14 +2041,25 @@ type ownTx interface {
 	BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
 }
 
-// isolated runs fn in what db's Begin begins at level, on a DB that is neither an ownTx nor a
-// pgx.Tx, as a host's wrapper around a pool that traces its statements: its Begin begins at the
-// database's default, so the first statement sets it. Begin may give a savepoint of a transaction
-// under way, as a wrapper around a host's pgx.Tx does, which refuses that: then fn doesn't run, and
-// nested is set.
-func isolated(ctx context.Context, db DB, level string, fn func(pgx.Tx) error) (nested bool, err error) {
+// isolated runs fn in what db's Begin begins at level, in mode where it names one, on a DB that is
+// neither an ownTx nor a pgx.Tx, as a host's wrapper around a pool that traces its statements: its
+// Begin begins at the database's default, so the first statement sets it. Begin may give a
+// savepoint of a transaction under way, as a wrapper around a host's pgx.Tx does, which refuses
+// that: then fn doesn't run, and nested is set. PostgreSQL lets a savepoint set the level its
+// transaction already has, so the statement sets another first: a savepoint takes no level but its
+// transaction's, so it refuses one of the two whatever that is, and a transaction of its own takes
+// both before its first query. Not SERIALIZABLE, which a standby refuses in any transaction.
+func isolated(ctx context.Context, db DB, level pgx.TxIsoLevel, mode pgx.TxAccessMode, fn func(pgx.Tx) error) (nested bool, err error) {
+	other := pgx.RepeatableRead
+	if level == other {
+		other = pgx.ReadCommitted
+	}
+	set := "SET TRANSACTION ISOLATION LEVEL " + string(other) + ", ISOLATION LEVEL " + string(level)
+	if mode != "" {
+		set += ", " + string(mode)
+	}
 	err = savepoint(ctx, db, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL "+level); err != nil {
+		if _, err := tx.Exec(ctx, set); err != nil {
 			nested = isolationRefused(err)
 			return err
 		}
@@ -2013,9 +2079,10 @@ func isolationRefused(err error) bool {
 }
 
 // repeatableRead begins on db, a DB that is neither an ownTx nor a pgx.Tx, a transaction at
-// REPEATABLE READ, as isolated does, so a read of several statements reads one snapshot; where its
-// Begin gives a savepoint of a transaction under way, which refuses that, a savepoint at that
-// transaction's isolation, as under WithTx.
+// REPEATABLE READ, so a read of several statements reads one snapshot; where its Begin gives a
+// savepoint of a transaction under way, a savepoint at that transaction's isolation, as under
+// WithTx. It sets the one level, not two as isolated does: a savepoint of a transaction at
+// REPEATABLE READ takes it, and is such a savepoint all the same, which AsOf rolls back either way.
 func repeatableRead(ctx context.Context, db DB) (pgx.Tx, error) {
 	tx, err := db.Begin(ctx)
 	if err != nil {
