@@ -558,6 +558,9 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 		if err := lockAll(ctx, tx, tenant, slices.Collect(maps.Keys(scopes)), slices.Collect(maps.Keys(principals))); err != nil {
 			return ChangeEvent{}, gains{}, err
 		}
+		if err := holdGrantedAgain(ctx, tx, tenant, grants); err != nil {
+			return ChangeEvent{}, gains{}, err
+		}
 		if err := groupsExist(ctx, tx, tenant, slices.Concat(groupKeys(named), groupScopes(on))); err != nil {
 			return ChangeEvent{}, gains{}, err
 		}
@@ -2446,14 +2449,43 @@ func (a *Authorizer) revoke(ctx context.Context, tx pgx.Tx, tenant string, scope
 	return collectGrants(rows)
 }
 
-// holdRevoked holds, in tx, in order, the grants revoke deletes, before the change reads the time it
-// decides at: a change ending activations among them holds no lock of the scope, and a wait for it
-// would leave that time behind.
+// holdRevoked holds, in tx, in order, the grants revoke deletes, and those kept grants again
+// (holdGrantedAgain), before the change reads the time it decides at: a change ending activations
+// among them holds no lock of the scope, and a wait for it would leave that time behind.
 func holdRevoked(ctx context.Context, tx pgx.Tx, tenant string, scope Scope, bindings, kept []Binding) error {
-	if len(bindings) == 0 {
+	if len(bindings) > 0 {
+		if _, err := tx.Exec(ctx, revokedSQL, revokeArgs(tenant, scope, bindings, kept)...); err != nil {
+			return err
+		}
+	}
+	return holdGrantedAgain(ctx, tx, tenant, scopeGrants(scope, kept))
+}
+
+// holdGrantedAgain holds, in tx, in order, the grants stored already that grants, those until an
+// end, grant again, before the change reads the time it decides at: DeleteExpired, which takes no
+// lock, may be deleting one that has ended by its clock, which upsert would wait for once the
+// change has read its time. One for good no expiry deletes, and every other change holding it holds
+// a lock of its scope or its principal, which the change does. Each is looked up by its key, as
+// upsert finds it.
+func holdGrantedAgain(ctx context.Context, tx pgx.Tx, tenant string, grants []Grant) error {
+	var scopes, principals, roles, sources, conditions []string
+	var expires []time.Time
+	for _, g := range grants {
+		if !g.ExpiresAt.IsZero() {
+			scopes, principals, roles = append(scopes, g.Scope.Key()), append(principals, g.Principal.key()), append(roles, string(g.Role))
+			sources, expires, conditions = append(sources, g.Source), append(expires, g.ExpiresAt), append(conditions, g.Condition.Expression)
+		}
+	}
+	if len(scopes) == 0 {
 		return nil
 	}
-	_, err := tx.Exec(ctx, revokedSQL, revokeArgs(tenant, scope, bindings, kept)...)
+	_, err := tx.Exec(ctx, `SELECT FROM rbac_grants WHERE id = ANY(ARRAY(
+		  SELECT x.id FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::timestamptz[], $7::text[])
+		    AS k(scope, principal, role, source, expires_at, condition) CROSS JOIN LATERAL (
+		    SELECT id FROM rbac_grants WHERE tenant = $1 AND principal = k.principal AND scope = k.scope AND role = k.role
+		      AND source = k.source AND coalesce(expires_at, 'infinity') = k.expires_at AND condition = k.condition
+		    OFFSET 0) x))
+		ORDER BY `+bindingOrder+` FOR UPDATE`, tenant, scopes, principals, roles, sources, expires, conditions)
 	return err
 }
 

@@ -6546,6 +6546,92 @@ func TestAChangeWhoseClockWentBackIsTriedAgain(t *testing.T) {
 	}
 }
 
+// DeleteExpired takes no lock a change waits for, and holds what it deletes until its transaction
+// ends, a host's under WithTx, so a change holds first what it writes that DeleteExpired may be
+// deleting: here DeleteExpired, run at 12:06 in a host's transaction left open, holds what ended at
+// 12:05, which each change, from 12:01, sets again or deletes, while it waits. Decided at 13:00,
+// once the transaction commits, what passed at 12:10 refuses it: the end it sets, or its actor's
+// power. Writing it after it read its time, it waited there, and stored an end that had passed, or
+// deleted as an actor whose power had ended.
+func TestAChangeHoldsWhatDeleteExpiredDeletesBeforeItReadsItsTime(t *testing.T) {
+	ends := 5 * time.Minute
+	for name, c := range map[string]struct {
+		// ending makes what ends at 12:05, and change makes the change.
+		ending func(h *harness)
+		change func(h *harness) error
+		want   error
+	}{
+		"SetMemberships setting a membership again": {
+			ending: func(h *harness) {
+				h.as(t, "r")
+				if err := h.authz.SetMemberships(h.ctx, host, "t1", []rbac.Membership{{Principal: identity("r"), ExpiresAt: h.now.Add(ends)}}); err != nil {
+					t.Fatal(err)
+				}
+			},
+			change: func(h *harness) error {
+				return h.authz.SetMemberships(h.ctx, host, "t1", []rbac.Membership{{Principal: identity("r"), ExpiresAt: h.now.Add(30 * time.Minute)}})
+			},
+			want: rbac.ErrInvalid,
+		},
+		"Apply granting a grant again": {
+			ending: func(h *harness) {
+				h.as(t, "r")
+				g := grant(cluster.Scope(), "cluster.login", rbac.User, "r")
+				g.ExpiresAt = h.now.Add(ends)
+				h.seed(t, g)
+			},
+			change: func(h *harness) error {
+				return h.authz.Apply(h.ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("r"), ExpiresAt: h.now.Add(ends)}}})
+			},
+			want: rbac.ErrInvalid,
+		},
+		"Import granting a grant again": {
+			ending: func(h *harness) {
+				h.as(t, "r")
+				g := grant(cluster.Scope(), "cluster.login", rbac.User, "r")
+				g.ExpiresAt = h.now.Add(ends)
+				h.seed(t, g)
+			},
+			change: func(h *harness) error {
+				g := grant(cluster.Scope(), "cluster.login", rbac.User, "r")
+				g.ExpiresAt = h.now.Add(ends)
+				return h.authz.Import(h.ctx, host, "t1", []rbac.Grant{g})
+			},
+			want: rbac.ErrInvalid,
+		},
+		"DeleteRole by an actor whose power ended": {
+			ending: func(h *harness) {
+				h.as(t, "r")
+				temp := grant(rbac.TenantRoot("t1"), "tenant.roles", rbac.User, "temp")
+				temp.ExpiresAt = h.now.Add(10 * time.Minute)
+				h.seed(t, temp)
+				if _, err := h.pool.Exec(h.ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+					VALUES ('t1', 'custom.r', ARRAY['cluster:view'], ARRAY['cluster'])`); err != nil {
+					t.Fatal(err)
+				}
+				g := grant(cluster.Scope(), "custom.r", rbac.User, "r")
+				g.ExpiresAt = h.now.Add(ends)
+				h.seed(t, g)
+			},
+			change: func(h *harness) error { return h.authz.DeleteRole(h.ctx, h.as(t, "temp"), "t1", "custom.r") },
+			want:   rbac.ErrDenied,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, clock := steppedHarness(t)
+			c.ending(h)
+			deleting := func(a *rbac.Authorizer) error {
+				clock.Store(h.now.Add(6 * time.Minute).UnixNano())
+				_, err := a.DeleteExpired(h.ctx)
+				return err
+			}
+			if err := waitedPast(t, h, clock, deleting, func() error { return c.change(h) }); !errors.Is(err, c.want) {
+				t.Errorf("at 13:00, after it waited from 12:01, the change = %v, not %v", err, c.want)
+			}
+		})
+	}
+}
+
 // The tests see a change wait for a row once it has read the time it decides at, which no clause of
 // its statement shows, as an upsert's on the row it conflicts with: here SetGroup's of the group,
 // which a write around the package holds, without the group's lock.

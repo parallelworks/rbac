@@ -707,23 +707,25 @@ flowchart TB
   scope, principal and id) last. `DeleteGroup` and `DeleteGroups` (`holdGroups`) hold eligibilities,
   denies, places and then grants with the activations resting on the places; `DeletePrincipal` the
   same, an identity's membership before its places; `DeleteScopes` eligibilities, denies and then
-  grants; `SetMemberships` memberships, places and then activations; `ChangeMembers` and
-  `ImportMembers` the memberships they join with (`holdJoining`), the places they write
+  grants; `SetMemberships` every membership it sets, places and then activations; `ChangeMembers`
+  and `ImportMembers` the memberships they join with (`holdJoining`), the places they write
   (`restingIn`) and then the activations resting on those; `DeleteMembers` and `ImportGroups` places
   and then activations; `Activate` the places it can rest on, shared, and then its activation of the
-  role; `Apply` the grants it revokes; and `SetEligibility`, `DeleteEligibility`, `SetDeny` and
-  `DeleteDeny` the row they write. A membership is held only under its identity's lock, and by
-  `DeleteExpired`, which waits on no row, so no two changes hold memberships and places in other
-  orders; and a group's row only under the group's lock, which a change takes to write or delete the
-  group, or a place in it, whose insert holds the group's key. `DeleteScopes` holds its scopes'
-  locks and `DeletePrincipal` its principal's, so neither waits for the other, and both delete the
-  principal's grants and eligibilities on those scopes: each locks them in the order of their scopes
-  first, eligibilities before grants, so they don't deadlock. A revoke locks the grants it deletes
-  in that order too, as a change ending places in groups ends activations among them without their
-  scope's lock. `DeleteRole` removes a role's grants before its eligibilities, but holds the
-  tenant's lock exclusive, so no change runs beside it but `DeleteExpired`. A host transaction
-  making several changes takes each one's rows in this order, but not all of them together: two that
-  make the same changes in opposite orders can deadlock (above).
+  role; `Apply` the grants it revokes, and those it grants again until an end; `Import` those it
+  grants again until an end; `DeleteRole` the role's eligibilities and then grants; and
+  `SetEligibility`, `DeleteEligibility`, `SetDeny` and `DeleteDeny` the row they write. A membership
+  is held only under its identity's lock, and by `DeleteExpired`, which waits on no row, so no two
+  changes hold memberships and places in other orders; and a group's row only under the group's
+  lock, which a change takes to write or delete the group, or a place in it, whose insert holds the
+  group's key. `DeleteScopes` holds its scopes' locks and `DeletePrincipal` its principal's, so
+  neither waits for the other, and both delete the principal's grants and eligibilities on those
+  scopes: each locks them in the order of their scopes first, eligibilities before grants, so they
+  don't deadlock. A revoke locks the grants it deletes in that order too, as a change ending places
+  in groups ends activations among them without their scope's lock. `DeleteRole` removes a role's
+  grants before its eligibilities, which it holds already, and holds the tenant's lock exclusive, so
+  no change runs beside it but `DeleteExpired`, which waits on no row. A host transaction making
+  several changes takes each one's rows in this order, but not all of them together: two that make
+  the same changes in opposite orders can deadlock (above).
 - **One snapshot for reads in several statements.** Explain, Reachable and Holders read in one
   REPEATABLE READ, READ ONLY transaction of their own on a pool, and AsOf in a REPEATABLE READ one
   it rolls back. Explain, Reachable and Holders read what label values are decided by in it, and
@@ -751,10 +753,15 @@ flowchart TB
   places of one ending in between it removes without waiting (NOWAIT), or is tried again. Where the
   host's clock goes back between the two readings, what was in force at the first can be less than
   at the second, and the change is tried again (`wentBack`). A write's own locks take again what the
-  change holds. In the tests, a statement holding rows or taking an advisory lock once a change has
-  read its time panics, and so does a change whose session waited for a row then, whatever the
-  statement, as another session's watch of each one's wait events sees (`watched`). As of a time, it
-  is that time.
+  change holds, an upsert's the row it conflicts with too: `DeleteExpired` takes no lock, and holds
+  what it deletes until its transaction ends, a host's under `WithTx`, so a change holds first what
+  it writes that one may be deleting, as ended by its clock: `SetMemberships` every membership it
+  sets, `Apply` and `Import` each grant they grant again until an end, and `DeleteRole` the role's
+  grants and eligibilities. A grant for good no expiry deletes, and a group's row, which a place's
+  insert holds for its key, is held only under the group's lock. In the tests, a statement holding
+  rows or taking an advisory lock once a change has read its time panics, and so does a change whose
+  session waited for a row then, whatever the statement, as another session's watch of each one's
+  wait events sees (`watched`). As of a time, it is that time.
 - **Races** PostgreSQL refuses, such as a serialization failure, a deadlock between host
   transactions, or a lock waited for past `lock_timeout`, as one a migration holds, match
   `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them, as it

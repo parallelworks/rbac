@@ -636,6 +636,17 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		if err := lockTenant(ctx, tx, tenant); err != nil {
 			return ChangeEvent{}, err
 		}
+		// The LIKE matches the partial indexes on custom roles' grants and eligibilities.
+		const ofRole = "role = $2 AND role LIKE 'custom.%'"
+		// What it deletes, before it reads the time it decides at: no other change runs in the tenant
+		// beside it but DeleteExpired, which takes no lock and may be deleting one of them that has
+		// ended by its clock, and a wait for it would leave that time behind.
+		b := &pgx.Batch{}
+		b.Queue(lockedInOrder("rbac_eligibilities", "", bindingOrder, "tenant = $1 AND "+ofRole), tenant, id)
+		b.Queue(lockedInOrder("rbac_grants", "", bindingOrder, "tenant = $1 AND "+ofRole), tenant, id)
+		if err := tx.SendBatch(ctx, b).Close(); err != nil {
+			return ChangeEvent{}, err
+		}
 		au, err := a.mayDefine(ctx, tx, actor, root, nil, nil)
 		if err != nil {
 			return ChangeEvent{}, err
@@ -663,8 +674,6 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		if len(listing) > 0 {
 			return ChangeEvent{}, fmt.Errorf("%w: role %q is a grantable role of %s", ErrInvalid, id, strings.Join(listing, ", "))
 		}
-		// The LIKE matches the partial indexes on custom roles' grants and eligibilities.
-		const ofRole = "role = $2 AND role LIKE 'custom.%'"
 		// Deleting it would revoke the host's own grants of it, which only the host removes. Expired
 		// ones give nothing and Grants doesn't list them, so the host has none to remove.
 		if len(a.owned) > 0 {

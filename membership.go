@@ -233,14 +233,13 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 		if err := lockAll(ctx, tx, tenant, nil, keys); err != nil {
 			return ChangeEvent{}, nil, err
 		}
-		// An ended membership's groups go, as DeleteExpired would remove them, each membership held
-		// before its members as there, so the two never deadlock; and any places of an identity with no
-		// membership, which joins in none. The places of each key leaving are found on its own and
-		// locked in order, as removeGroups finds and locks its own; each key's membership is looked up
-		// on its own, as in widening, and OFFSET 0 keeps a generic plan from making that an anti-join
-		// that reads every one.
+		// An ended membership's groups go, as DeleteExpired would remove them, and any places of an
+		// identity with no membership, which joins in none. The places of each key leaving are found on
+		// its own and locked in order, as removeGroups finds and locks its own; each key's membership is
+		// looked up on its own, as in widening, and OFFSET 0 keeps a generic plan from making that an
+		// anti-join that reads every one.
 		leaving := lockedAnyOf("rbac_members", "ctid", placeOrder, byKeys("rbac_members", "ctid", "principal", `(
-			  ARRAY(SELECT principal FROM rbac_memberships WHERE tenant = $1 AND principal = ANY($2::text[]) AND expires_at <= $3 FOR UPDATE)
+			  ARRAY(SELECT principal FROM rbac_memberships WHERE tenant = $1 AND principal = ANY($2::text[]) AND expires_at <= $3)
 			  || ARRAY(SELECT k FROM unnest($2::text[]) AS k WHERE NOT EXISTS (SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = k OFFSET 0)))`))
 		// The places of the memberships that had ended at the time the change picks what it holds by
 		// (earlier) are held before it reads the time it decides at, as are the activations resting on
@@ -249,9 +248,16 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 		// of a thousand members in fifty groups each would hold 50,000 places it leaves as they are,
 		// and wait for any a group's deletion holds. The places of one that ends in between, which it
 		// doesn't hold, the removal takes without waiting (NOWAIT), and where another transaction holds
-		// one, the change is tried again (ErrConflict).
+		// one, the change is tried again (ErrConflict). Every membership it sets, ended or not, it holds
+		// before them, as DeleteExpired takes memberships before their places, so the two never
+		// deadlock: DeleteExpired, which takes no lock, may be deleting one that has ended by its clock,
+		// which the upsert would wait for. In a statement of its own, as a subquery's lock is taken only
+		// once its statement reads the subquery, which one finding no places to read never does.
 		was := a.clock.earlier()
-		if _, err := tx.Exec(ctx, `SELECT FROM rbac_members WHERE `+leaving, tenant, keys, was); err != nil {
+		b := &pgx.Batch{}
+		b.Queue(`SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = ANY($2::text[]) ORDER BY principal FOR UPDATE`, tenant, keys)
+		b.Queue(`SELECT FROM rbac_members WHERE `+leaving, tenant, keys, was)
+		if err := tx.SendBatch(ctx, b).Close(); err != nil {
 			return ChangeEvent{}, nil, err
 		}
 		r, err := a.restingOn(ctx, tx, tenant, ending, nil, was)
