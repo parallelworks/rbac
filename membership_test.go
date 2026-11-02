@@ -5342,7 +5342,7 @@ func TestChangingMembersReadsTheActorsAuthorityOnceForAllItReaches(t *testing.T)
 // condition on, before its transaction and again in it, and each scope's resource's for that scope:
 // converted again for each, adding a member to 400 groups, with a map of 40,000 entries in the
 // request, took 6 seconds. Each scope's check still counts them in what it may convert, and reads
-// its own resource's.
+// its own resource's, converted apart, so a value it shares with them is counted again.
 func TestAChangeConvertsItsActorsAndRequestsAttributesOnce(t *testing.T) {
 	// Half of what a check may convert, which each scope's check counts, rather than the change.
 	requested := make([]int, rbac.MaxConverted/2)
@@ -5356,7 +5356,7 @@ func TestAChangeConvertsItsActorsAndRequestsAttributesOnce(t *testing.T) {
 			case s.ID == "crowded":
 				r.Attributes = crowded
 			case s.ID == "sharing":
-				// The request's list, which a check converts once, as alone.
+				// The request's list, which a check converts again, as alone.
 				r.Attributes = map[string]any{"open": true, "l": requested}
 			default:
 				r.Attributes = map[string]any{"open": s.ID != "closed"}
@@ -5386,77 +5386,17 @@ func TestAChangeConvertsItsActorsAndRequestsAttributesOnce(t *testing.T) {
 	if want := 2 + 2*len(add); *n != want {
 		t.Errorf("adding a member to %d groups converted %d kinds' attributes, want %d", len(add), *n, want)
 	}
-	for _, id := range []string{"closed", "crowded"} {
+	for _, id := range []string{"closed", "crowded", "sharing"} {
 		if err := h.authz.ChangeMembers(ctx, lead, "t1", []rbac.Member{{Group: id, Principal: identity("u")}}, nil); !errors.Is(err, rbac.ErrDenied) {
 			t.Errorf("adding a member to %s: %v", id, err)
 		}
 	}
-	// The crowded group's attributes alone fit.
-	if err := h.authz.ChangeMembers(rbac.WithRequest(t.Context(), map[string]any{"mfa": true}), lead, "t1",
-		[]rbac.Member{{Group: "crowded", Principal: identity("u")}}, nil); err != nil {
-		t.Errorf("adding a member to crowded with a small request: %v", err)
-	}
-	if err := h.authz.ChangeMembers(ctx, lead, "t1", []rbac.Member{{Group: "sharing", Principal: identity("u")}, {Group: "g0", Principal: identity("v")}}, nil); err != nil {
-		t.Errorf("adding members to a group sharing the request's list and another: %v", err)
-	}
-}
-
-// What a call converted of its actor's attributes stays where it is while the call runs, as each
-// check after the first knows a value it shares with them by where it points: a hook of the host's
-// dropping one from the map the host passed freed it, so another value could come to be where it
-// was, and a later check read it as converted from the one dropped. So it stays wherever the
-// actor's held it: kept as read, each of the values a map of a type of the host's own held but the
-// last was freed once dropped, as each of the map's entries is read into the same value, and each a
-// list held once the host wrote another in its place.
-func TestAValueACallConvertedStaysWhereItIsWhileItRuns(t *testing.T) {
-	var lead rbac.Subject
-	var n *int
-	var dropped bool
-	var freed, lost atomic.Int32
-	var byName map[string]*[4]int
-	var listed []*[4]int
-	h := grouped(t, func(c *rbac.Config) {
-		c.Constraints = []rbac.Constraint{{Name: "drop", Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) {
-			// Asked about each group in turn, once the first group's check converted the actor's.
-			if n != nil && *n > 0 && !dropped {
-				dropped = true
-				delete(lead.Attributes, "held")
-				clear(byName)
-				clear(listed)
-				for range 20 {
-					if runtime.GC(); freed.Load() > 0 {
-						break
-					}
-					time.Sleep(time.Millisecond)
-				}
-				lost.Store(freed.Load())
-			}
-			return false, nil
-		}}}
-	})
-	g := grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "lead")
-	g.Condition = rbac.Condition{Expression: `subject.attributes.team == "ops"`}
-	h.seed(t, g)
-	lead = h.as(t, "lead")
-	lead.Attributes = map[string]any{"team": "ops"}
-	func() {
-		held := func() *[4]int {
-			v := &[4]int{1}
-			runtime.AddCleanup(v, func(freed *atomic.Int32) { freed.Add(1) }, &freed)
-			return v
+	// The crowded and the sharing group's attributes alone fit.
+	for _, id := range []string{"crowded", "sharing"} {
+		if err := h.authz.ChangeMembers(rbac.WithRequest(t.Context(), map[string]any{"mfa": true}), lead, "t1",
+			[]rbac.Member{{Group: id, Principal: identity("u")}}, nil); err != nil {
+			t.Errorf("adding a member to %s with a small request: %v", id, err)
 		}
-		byName, listed = map[string]*[4]int{"a": held(), "b": held(), "c": held()}, []*[4]int{held(), held()}
-		lead.Attributes["held"], lead.Attributes["byName"], lead.Attributes["listed"] = held(), byName, listed
-	}()
-	h.join(t, "u")
-	h.groups(t, "a", "b", "c")
-	n = rbac.CountKindsConverted(t)
-	add := []rbac.Member{{Group: "a", Principal: identity("u")}, {Group: "b", Principal: identity("u")}, {Group: "c", Principal: identity("u")}}
-	if err := h.authz.ChangeMembers(t.Context(), lead, "t1", add, nil); err != nil || !dropped {
-		t.Fatalf("dropped %t: %v", dropped, err)
-	}
-	if lost := lost.Load(); lost > 0 {
-		t.Errorf("%d values the call converted were freed while it ran", lost)
 	}
 }
 

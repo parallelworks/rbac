@@ -1792,16 +1792,16 @@ func withoutRequest(ctx context.Context) context.Context {
 	return context.WithValue(ctx, requestKey{}, unrequested{})
 }
 
-// vars is what a condition reads when s asks to do p to r, each kind's attributes converted by one
-// converter for them all (Attributes), so a value they share is converted once, and what converting
-// them all may cost is bounded together: past it, every kind's attributes refuse every read. A kind
-// holding a value no condition can read refuses every read of its own, the others read as passed.
-// The subject's and the request's are converted once for the call (askingOf), and r's on a fork of
-// the converter that converted them, so each check counts all three as though it had converted them.
+// vars is what a condition reads when s asks to do p to r, each kind's attributes converted
+// (Attributes), and what converting them all may cost bounded together: past it, every kind's
+// attributes refuse every read. A kind holding a value no condition can read refuses every read of
+// its own, the others read as passed. The subject's and the request's are converted once for the
+// call, by one converter, so a value they share is converted once (askingOf), and r's apart, from
+// what they left, so each check counts all three, and a value r's share with them again.
 func (a *Authorizer) vars(ctx context.Context, s Subject, p Permission, r Resource) map[string]any {
 	converting()
 	asked := a.askingOf(ctx, s)
-	c := asked.c.fork()
+	c := asked.rest
 	resourced, resourceRead := c.attributes(r.Attributes)
 	var requestAttributes, resourceAttributes, subjectAttributes any = unreadable, unreadable, unreadable
 	if !c.over {
@@ -1822,10 +1822,12 @@ func (a *Authorizer) vars(ctx context.Context, s Subject, p Permission, r Resour
 	}
 }
 
-// asking is a subject's and a request's attributes as conditions read them, and the converter that
-// converted them, from which each check converts its resource's (fork).
+// asking is a subject's and a request's attributes as conditions read them, and a converter
+// spending what converting them left, a copy of which converts each check's resource's (rest):
+// what converted them is gone, so no check knows a value by where one of theirs was, which a
+// hook of the host's may have dropped since, freeing it.
 type asking struct {
-	c                *converter
+	rest             converter
 	subject, request any
 	// subjectOf and requestOf are what the host passed, kept so that where they point, which the
 	// call knows them by (askingKey), is no other map's while it runs.
@@ -1854,13 +1856,14 @@ func (a *Authorizer) askingOf(ctx context.Context, s Subject) *asking {
 		return got
 	}
 	c := newConverter()
-	got := &asking{c: c, subject: unreadable, request: unreadable, subjectOf: s.Attributes, requestOf: passed}
+	got := &asking{subject: unreadable, request: unreadable, subjectOf: s.Attributes, requestOf: passed}
 	var request map[ref.Val]ref.Val
 	requestRead := !none
 	if !none {
 		request, requestRead = c.attributes(passed)
 	}
 	subjected, subjectRead := c.attributes(s.Attributes)
+	got.rest = c.rest()
 	if !c.over {
 		if requestRead {
 			got.request = declared(a.cfg.Attributes.Request, request)

@@ -49,7 +49,7 @@ import (
 // kind's are read as converted, and CEL compares values of different types as unequal.
 //
 // What a host passes as a kind's attributes, the subject's, the resource's or the request's, is
-// converted, for each check that reads a condition, once and whole, into CEL's own values, and
+// converted, where a check reads a condition, once and whole, into CEL's own values, and
 // conditions read only those, by CEL's own semantics: a string, an int, a uint, a double, a bool,
 // bytes, a timestamp, a duration, null, and lists and maps of them. A host may pass, as an
 // attribute or within one:
@@ -81,28 +81,28 @@ import (
 // what the kind holds, wherever a value it shares with another was reached first. Reading the rest
 // would leave each operator to tell what it read from what it couldn't, as `in`, has() and a loop
 // over a map's keys each found a key whose value it couldn't read. A value reached twice, as a map
-// two lists hold, is converted once, for any kind reaching it. A check converts at most
-// maxConverted of what the host passes, counted as reading it costs a condition, one for each value
-// and a tenth of each string's, bytes', JSON number's, JSON text's or packed type URL's length, and
-// half a packed message's, as a packed value takes as few as two bytes, each kind whole, whether it
-// can be read or not: past that, every condition reading an attribute of any kind fails, as it does
-// where JSON text may hold more values than that, by its brackets, braces, commas and colons, which
-// isn't parsed. A call converts the subject's and the
+// two lists hold, is converted once, for any kind reaching it, but a resource's sharing it, below. A
+// check converts at most maxConverted of what the host passes, counted as reading it costs a
+// condition, one for each value and a tenth of each string's, bytes', JSON number's, JSON text's or
+// packed type URL's length, and half a packed message's, as a packed value takes as few as two
+// bytes, each kind whole, whether it can be read or not: past that, every condition reading an
+// attribute of any kind fails, as it does where JSON text may hold more values than that, by its
+// brackets, braces, commas and colons, which isn't parsed. A call converts the subject's and the
 // request's attributes once, the first time one of its checks reads a condition, for every check it
-// makes with them, as a change does on each scope it reaches, and each check its resource's after
-// them, counting all three as though it had converted them itself, so whether a check is past that
-// doesn't turn on how many the call makes. So change none of what the host passed while the call
-// runs, as from a hook: a check after the change can read the subject's or the request's
-// attributes as they were, and a value the resource's share with them, though never another value
-// as one of them. Where a kind nests past 10,000 deep, converting stops there, so what it is
-// charged, and whether the kinds after it fit what is left, can turn on the order a map's entries
-// come in: either way it can't be read, and the others are read or, past what is left, fail.
-// Nothing else converting finds turns on that order, nor on the order of the kinds. The
+// makes with them, as a change does on each scope it reaches, and each check its resource's apart,
+// after them, from what they left, counting all three as its own, so whether a check is past that
+// doesn't turn on how many the call makes: a value the resource's share with them is converted, and
+// counted, again. So change none of what the host passed while the call runs, as from a hook: a
+// check after the change can read the subject's or the request's attributes as they were, though
+// never another value as one of them. Where a kind nests past 10,000 deep, converting stops there,
+// so what it is charged, and whether the kinds after it fit what is left, can turn on the order a
+// map's entries come in: either way it can't be read, and the others are read or, past what is
+// left, fail. Nothing else converting finds turns on that order, nor on the order of the kinds. The
 // subject's, the resource's and the request's attributes share it, so attributes a tenant's users
 // write, as a resource's tags, can take every check of the resource past that, where a grant's
-// condition reading an attribute gives nothing and a deny's applies, whoever asks: bound what
-// users may store, or pass conditions only what they read. A declared attribute is a value of its
-// type as converted, so a named string type is a string.
+// condition reading an attribute gives nothing and a deny's applies, whoever asks: bound what users
+// may store, or pass conditions only what they read. A declared attribute is a value of its type as
+// converted, so a named string type is a string.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
@@ -164,13 +164,15 @@ const maxConverted = 2 * maxCheckCost
 // a hundred mebibytes.
 const maxNested = 10000
 
-// converter converts what a host passes for a check into CEL's own values (Attributes), a kind's
-// attributes at a time, spending no more than left on them all. It keeps each list, map, pointer,
-// message and JSON text it converts by where it points, its length and its type (copiedKey), with
-// what it found of it, so one reached twice is converted once, for any kind that reaches it.
+// converter converts what a host passes into CEL's own values (Attributes), a kind's attributes at
+// a time, spending no more than left on them all: a call's subject's and request's together, and a
+// check's resource's on one of its own, from what they left (asking). It keeps each list, map,
+// pointer, message and JSON text it converts by where it points, its length and its type
+// (copiedKey), with what it found of it, so one reached twice is converted once, for any kind it
+// converts that reaches it. It is kept only while it converts, which runs none of the host's code,
+// so what the host passed stays where it is, and no check knows a value by where one another
+// converter converted was.
 type converter struct {
-	// base is the converter it goes on from (fork), whose conversions it reads and never changes.
-	base *converter
 	left uint64
 	// over is set once converting cost more than was left, which fails every kind's attributes.
 	over bool
@@ -192,13 +194,10 @@ type converter struct {
 type conversion struct {
 	to ref.Val
 	// of is where the value points, kept so that it is no other value's, which the converter would
-	// read as this one, while the converter is kept, as a call keeps the one converting its
-	// subject's and request's attributes (asking) while the host's hooks run, and as converting
-	// keeps no JSON text's or packed message's decoded values otherwise. It is where the value
-	// points, not the value as read: each of a map's entries is read into the same value (dict),
-	// and a list's where the host can write another, so kept as read, the maps a map of a type of
-	// the host's own held but its last were freed once a hook dropped them, and a resource's maps
-	// made where they were read as converted from them.
+	// read as this one, while the converter is kept: nothing else keeps what it decodes of JSON text
+	// and packed messages once converted, and freed, what a kind after decoded came to be where it
+	// was and was read as converted from it. It is where the value points, not the value as read,
+	// as each of a map's entries is read into the same value (dict).
 	of                    any
 	height                int
 	open, unreadable, cut bool
@@ -206,21 +205,9 @@ type conversion struct {
 
 func newConverter() *converter { return &converter{left: maxConverted} }
 
-// fork is a converter going on from what c converted, reading its conversions as found and spending
-// what it left, so what it converts is converted, and charged, as by c, which it never changes: each
-// check of a call converts its resource's attributes on a fork of the converter that converted the
-// subject's and the request's once (asking).
-func (c *converter) fork() *converter { return &converter{base: c, left: c.left, over: c.over} }
-
-// found is what c, or a converter it goes on from, found of the value k knows.
-func (c *converter) found(k copiedKey) (conversion, bool) {
-	for ; c != nil; c = c.base {
-		if i, ok := c.done[k]; ok {
-			return c.converted[i], true
-		}
-	}
-	return conversion{}, false
-}
+// rest is a converter that has converted nothing, spending what c left: a check converts its
+// resource's attributes on one, after the subject's and the request's its call converted (asking).
+func (c *converter) rest() converter { return converter{left: c.left, over: c.over} }
 
 // attributes is a kind's attributes as conditions read them, by their names, nil for none, and
 // whether a condition can read them: where any value they hold, however deep, can't be read, as a
@@ -397,21 +384,21 @@ func (c *converter) spend(n uint64, v ref.Val) ref.Val {
 	return v
 }
 
-// once is what convert makes of v, which points somewhere, and how deep it nests, converted once
-// for the check. One reached again while it is converted holds itself, or holds one that holds it,
-// and can't be read, nor can one holding it, of any kind. One that can't be read is kept so, as no
-// kind reaching it can read it; one nesting past maxNested where it was reached is kept so for the
-// rest of the kind, which nests too deep wherever it reaches it again, but not for a kind after it,
-// which may reach it less deep: converted again for each path reaching it, a ladder of a hundred
-// maps each holding both of the next two, nested 10,000 deep, went past maxConverted, failing every
-// kind; and one converted whole is kept with how deep it nests, so it fails where it is reached too
-// deep for that, wherever it was first reached: whether a kind's attributes nest past maxNested, as
-// whether they hold one holding itself, is of what they hold, whatever order a map's entries come
-// in or a kind before it reached a value first.
+// once is what convert makes of v, which points somewhere, and how deep it nests, converted once by
+// c. One reached again while it is converted holds itself, or holds one that holds it, and can't be
+// read, nor can one holding it, of any kind. One that can't be read is kept so, as no kind reaching
+// it can read it; one nesting past maxNested where it was reached is kept so for the rest of the
+// kind, which nests too deep wherever it reaches it again, but not for a kind after it, which may
+// reach it less deep: converted again for each path reaching it, a ladder of a hundred maps each
+// holding both of the next two, nested 10,000 deep, went past maxConverted, failing every kind; and
+// one converted whole is kept with how deep it nests, so it fails where it is reached too deep for
+// that, wherever it was first reached: whether a kind's attributes nest past maxNested, as whether
+// they hold one holding itself, is of what they hold, whatever order a map's entries come in or a
+// kind before it reached a value first.
 func (c *converter) once(v reflect.Value, convert func() (ref.Val, int)) (ref.Val, int) {
 	k, _ := copiedKeyOf(v)
-	if d, ok := c.found(k); ok {
-		switch {
+	if i, ok := c.done[k]; ok {
+		switch d := c.converted[i]; {
 		case d.open || d.unreadable:
 			return c.refuse(), 0
 		case d.cut || c.depth+d.height-1 > maxNested:
@@ -584,14 +571,15 @@ func holdsKey(m map[ref.Val]ref.Val, k ref.Val) bool {
 	return other != nil && ok
 }
 
-// json is v, JSON text, parsed, at a tenth of its length, once for each text a check passes, and
-// how deep it nests. Text that may hold more values than a check converts isn't parsed: a value
-// takes as few as two bytes, as `0,`, and parsing a mebibyte of them, only to find more than a
-// check may convert, took a tenth of a second and 80 MB. That is of the text alone, not of what
-// is left: what it may hold is more than it holds where it is invalid, holds an empty list or
-// object, or a key twice, so compared with what was left, a text of `[]` beside a resource's
-// string just fitting what a check converts failed every kind's attributes where the string was
-// converted first, and not where the text was, as the order a map's entries come in decides.
+// json is v, JSON text, parsed, at a tenth of its length, once for each text c converts, and how
+// deep it nests. Text that may hold more values than a check converts isn't parsed: a value takes
+// as few as two bytes, as `0,`, and parsing a mebibyte of them, only to find more than a check may
+// convert, took a tenth of a second and 80 MB. That is of the text alone, not of what is left: what
+// it may hold is more than it holds where it is invalid, holds an empty list or object, or a key
+// twice, so compared with what was left, a text of `[]` beside a resource's string just fitting
+// what a check converts failed every kind's attributes where the string was converted first, and
+// not where the text was, as the order a map's entries come in decides. A converter so parses at
+// most one text it can't afford, which then fails every kind, of no more values than one it can.
 func (c *converter) json(v reflect.Value) (ref.Val, int) {
 	return c.once(v, func() (ref.Val, int) {
 		if !c.pay(length(v.Len()) / 10) {

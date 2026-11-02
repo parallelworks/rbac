@@ -1595,20 +1595,21 @@ func TestWhetherAttributesFitTurnsOnNoOrder(t *testing.T) {
 
 // What a check reads of each kind's attributes is what a check alone reads, however many checks of
 // its call converted the subject's and the request's before it, and which kinds it reads is what
-// converting all three at once would read: it counts the subject's and the request's, converted
-// once for the call, as its own, values the kinds share once, and past what a check converts it
-// reads none, the resource's though it passes none. A hook of the host's that drops the subject's
-// between checks changes nothing they read, as the call reads them as it first converted them,
-// and none of what the call converted is freed while it runs, so no value is made where one was
-// and read as converted from it.
+// converting all three at once would read, the resource's sharing none of the others' values: it
+// counts the subject's and the request's, converted once for the call, as its own, a value they
+// share once, and its resource's apart, and past what a check converts it reads none, the
+// resource's though it passes none. A hook of the host's that drops the subject's between checks
+// changes nothing they read, as the call reads them as it first converted them, and no check knows
+// a value by where one the call converted before was, so none made where a dropped one was is
+// read as converted from it.
 func TestAChecksAttributesAreAsConvertedAloneWhateverItsCallConvertedBefore(t *testing.T) {
 	seed := uint64(time.Now().UnixNano())
 	t.Logf("seed %d", seed)
 	rng := rand.New(rand.NewPCG(seed, 37))
 	for trial := range 10 {
 		shared := drawnShared(rng, true)
-		// Shared by the kinds that hold it, about what a check converts, so a check counting it twice,
-		// or not counting what was converted before it, reads what converting the kinds at once doesn't.
+		// Shared by the kinds that hold it, about what a check converts, so a check counting it
+		// otherwise, or not counting what was converted before it, reads what converting them doesn't.
 		big := make([]int, []int{rbac.MaxConverted / 3, rbac.MaxConverted/2 + 1000, rbac.MaxConverted - 1000}[rng.IntN(3)])
 		request := drawnAttributes(rng, shared, true)
 		if rng.IntN(2) == 0 {
@@ -1672,9 +1673,10 @@ func TestAChecksAttributesAreAsConvertedAloneWhateverItsCallConvertedBefore(t *t
 					t.Fatalf("trial %d, check %d: the %s's attributes read\n%s\nwhere alone\n%s", trial, i, kind, got, want)
 				}
 			}
-			// The kinds converted at once, in the order a check converts them.
+			// The kinds converted at once, in the order a check converts them, the resource's a copy
+			// sharing none of the others' values, as a check converts its resource's apart.
 			passing, _ := passed()
-			read, over := rbac.ConvertedInOrder(t, request, passing, resource(i))
+			read, over := rbac.ConvertedInOrder(t, request, passing, rbac.DeepCopy(resource(i)))
 			for k, j := range []int{2, 0, 1} {
 				if unread := alone[i][j] == rbac.Unreadable; unread != (over || !read[k]) {
 					t.Fatalf("trial %d, check %d: the %s's attributes unreadable %t, where converted at once %t, past what a check converts %t",

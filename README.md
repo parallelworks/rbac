@@ -254,11 +254,13 @@ scopes conditional ones reach, to check one by one.
   struct, a channel, a func, any other message, a map keyed by anything else, as a double or an
   array, a map holding two keys read as the same value, as `1` and `1u`, invalid JSON, a value
   holding itself, or one that does, and a value nested more than 10,000 deep, as JSON text can't
-  be, along the longest path through them. A value reached twice is converted once. Reading the
+  be, along the longest path through them. A value reached twice is converted once, but one a
+  resource's attributes share with the subject's or the request's, below. Reading the
   rest left each operator to tell what it read from what it couldn't, as `in`, `has()` and loops
   over a map's keys each found a key whose value no condition could read. A check converts no more
   than `2 × 80,000` of them, the subject's and the request's included however many checks share
-  them, counted as reading them costs a condition, one for each value and a tenth of each string's,
+  them, and a value the resource's share with them included again, as the resource's are converted
+  apart, counted as reading them costs a condition, one for each value and a tenth of each string's,
   bytes', JSON number's, JSON text's or `Any`'s type URL's length, and half an `Any`'s packed bytes,
   about a map of 50,000 short strings: past that every condition reading an attribute fails, as it
   does where JSON text may hold more, by its brackets, braces, commas and colons. Converting stops
@@ -270,8 +272,7 @@ scopes conditional ones reach, to check one by one.
   an attribute gives nothing and a deny's applies, whoever asks: bound what users may store, or pass
   conditions only what they read. A call reads the subject's and the request's as its first check
   converted them: change none of them while it runs, as from a hook, as a check after the change can
-  read them as they were, and a value a resource's share with them, though never another value as
-  one of them. Comparing a value
+  read them as they were, though never another value as one of them. Comparing a value
   holding a double that isn't finite fails, in a list or a map too. Each condition runs within the
   most evaluating it can cost, which its literals and types bound: little for comparing what a
   request passes with literals, or with the ids, kinds, types and tenant a check passes or its
