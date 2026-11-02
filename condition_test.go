@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"reflect"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -221,7 +222,8 @@ type ownList struct{ traits.Lister }
 // lifted, `0.5 == risk` was false for 0.5, which the host's double finds equal from its side, and a
 // role of the host's string type in a map keyed by it was found by the map as CEL finds it, where
 // one read as CEL's own string wasn't, so a deny's `role in blocked` lifted. A check reads no value
-// by the host's methods: each fails what reads it, finite or not, in a list or a map, as a key too.
+// by the host's methods: each fails every condition reading its kind, finite or not, in a list or a
+// map, as a key too.
 func TestAValueOfAHostsOwnTypeSayingItIsCELsFailsItsConditions(t *testing.T) {
 	h := setup(t, func(c *rbac.Config) {
 		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
@@ -301,8 +303,8 @@ func TestAValueOfAHostsOwnTypeSayingItIsCELsFailsItsConditions(t *testing.T) {
 // A map the host passes keyed by a double, which can be NaN, or by an array, which can hold one,
 // was found by and compared as CEL does: a map keyed by NaN equaled none, and one keyed by an array
 // holding NaN found no key, so a grant's `!=` held, and its infinite key was found by one a
-// condition reads, where `in` fails. Each fails whatever reads it, finite or not, empty too. A
-// double that isn't finite a condition makes in a list still fails what compares it.
+// condition reads, where `in` fails. Each fails every condition reading its kind, finite or not,
+// empty too. A double that isn't finite a condition makes in a list still fails what compares it.
 func TestAMapTheHostPassesKeyedByADoubleOrAnArrayFailsItsConditions(t *testing.T) {
 	for name, m := range map[string]any{
 		"NaN": map[float64]any{math.NaN(): 1}, "infinity": map[float64]any{math.Inf(1): 1}, "a half": map[float64]any{0.5: 1},
@@ -827,9 +829,13 @@ func TestAValueHoldingItselfFailsItsConditions(t *testing.T) {
 			"g":       indexedAsItself{types.NewDynamicList(types.DefaultTypeAdapter, []any{"x", "y"})},
 			"pointed": pointed, "message": message, "listed": listed, "ok": true,
 		}
-		// One holding itself fails what reads it alone, not the attributes beside it.
-		if held, _, _, err := rbac.EvaluateCondition(t, `request.attributes.ok == true`, attributes); err != nil || !held {
-			t.Errorf("an attribute beside values holding themselves: held %t, %v", held, err)
+		// One holding itself fails every condition reading its kind's attributes, one reading only
+		// those beside it too, and the other kinds' are read.
+		if _, evaluated, _, err := rbac.EvaluateCondition(t, `request.attributes.ok == true`, attributes); err != nil || evaluated {
+			t.Errorf("an attribute beside values holding themselves: evaluated %t, %v", evaluated, err)
+		}
+		if held, _ := rbac.EvaluateConditionOf(t, `subject.attributes.ok == true`, map[string]any{"ok": true}, attributes, attributes); !held {
+			t.Error("the subject's attributes beside a request's holding themselves")
 		}
 		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, attributes); evaluated || (err != nil) != refused {
 			t.Errorf("%s evaluated %t, %v", expr, evaluated, err)
@@ -864,10 +870,10 @@ func TestAValueHoldingItselfFailsItsConditions(t *testing.T) {
 	}
 }
 
-// Values holding each other, as a node and its parent, each fail whatever reads them, whichever a
-// check reaches first. Only the one converting reached again failed, so where a holds b and b holds
-// a, a.b or b.a failed by the order the attributes came in, and a grant's
-// `has(request.attributes.a.b)` held for one check and not the next. One holding them reads the rest.
+// Values holding each other, as a node and its parent, fail every condition reading their kind's
+// attributes, whichever a check reaches first. Only the one converting reached again failed, so
+// where a holds b and b holds a, a.b or b.a failed by the order the attributes came in, and a
+// grant's `has(request.attributes.a.b)` held for one check and not the next.
 func TestValuesHoldingEachOtherFailWhicheverIsReachedFirst(t *testing.T) {
 	a, b := map[string]any{"x": 1}, map[string]any{"x": 1}
 	a["b"], b["a"] = b, a
@@ -890,21 +896,22 @@ func TestValuesHoldingEachOtherFailWhicheverIsReachedFirst(t *testing.T) {
 				t.Fatalf("%s: evaluated %t, %v", expr, evaluated, err)
 			}
 		}
-		if held, _, _, err := rbac.EvaluateCondition(t, `request.attributes.ok && request.attributes.holding.y == 1`, attributes); err != nil || !held {
-			t.Fatalf("attributes beside values holding each other: held %t, %v", held, err)
+		if _, evaluated, _, err := rbac.EvaluateCondition(t, `request.attributes.ok && request.attributes.holding.y == 1`, attributes); err != nil || evaluated {
+			t.Fatalf("attributes beside values holding each other: evaluated %t, %v", evaluated, err)
+		}
+		if held, _ := rbac.EvaluateConditionOf(t, `subject.attributes.ok == true`, map[string]any{"ok": true}, nil, attributes); !held {
+			t.Fatal("the subject's attributes beside a request's holding each other")
 		}
 	}
 }
 
-// A value a check reached first through another nested near the limit it converts to, 10,000 deep,
-// it converted only as far as that limit, and read so wherever it reached it again: a request's
-// value reaching a ring of nodes ten thousand deep stopped short of finding that the ring holds
-// itself, so a grant's `has(resource.attributes.node.next)` held where the resource passed one of
-// those nodes, and one nested but a little, reached first so, failed what read it. One converted
-// cut short is converted again wherever it is reached less deep, but for one found holding itself,
-// as one of a pair holding each other that holds a value nested past the limit too.
-func TestAValueReachedNearTheDepthLimitIsReadWholeWhereReachedLessDeep(t *testing.T) {
-	h := setup(t)
+// Whether a kind's attributes nest past what a check converts, 10,000 deep, is of the longest path
+// through what they hold, whatever order a map's entries come in and wherever a value they share
+// was first reached. Kept as first converted, a value reached first near the limit was read cut
+// short where it was reached again less deep, so a node of a ring holding itself was read whole,
+// and a grant's `has(resource.attributes.node.next)` held, and one nested but a little failed; and
+// a value kept whole was read where another path reached it too deep for it.
+func TestWhetherAttributesNestTooDeepIsOfTheLongestPathThroughThem(t *testing.T) {
 	ring := make([]map[string]any, 20)
 	for i := range ring {
 		ring[i] = map[string]any{"x": i}
@@ -912,37 +919,42 @@ func TestAValueReachedNearTheDepthLimitIsReadWholeWhereReachedLessDeep(t *testin
 	for i := range ring {
 		ring[i]["next"] = ring[(i+1)%len(ring)]
 	}
-	nested := map[string]any{"a": map[string]any{"b": 1}}
-	var throughRing, throughNested, deep any = ring[0], nested, "x"
-	for range 10_000 - 10 {
-		throughRing = []any{throughRing}
+	nests := func(levels int, in any) any {
+		for range levels {
+			in = []any{in}
+		}
+		return in
 	}
-	for range 10_000 - 1 {
-		throughNested = []any{throughNested}
-	}
-	for range 10_000 {
-		deep = []any{deep}
-	}
-	one, other := map[string]any{"deep": deep}, map[string]any{}
-	one["other"], other["one"] = other, one
-	ring0, nested0, pair0 := grant(cluster.Scope(), "cluster.login", rbac.User, "ring"), grant(cluster.Scope(), "cluster.login", rbac.User, "nested"),
-		grant(cluster.Scope(), "cluster.login", rbac.User, "pair")
-	ring0.Condition = rbac.Condition{Expression: `has(resource.attributes.node.next)`}
-	nested0.Condition = rbac.Condition{Expression: `resource.attributes.v.a.b == 1`}
-	pair0.Condition = rbac.Condition{Expression: `has(resource.attributes.one.deep)`}
-	h.seed(t, ring0, nested0, pair0)
-	r := cluster
-	r.Attributes = map[string]any{"node": ring[0], "v": nested, "one": one}
-	// A check converts the request's attributes before the resource's.
-	ctx := rbac.WithRequest(t.Context(), map[string]any{"ring": throughRing, "nested": throughNested, "other": other})
-	if err := h.authz.Authorize(ctx, h.as(t, "ring"), login, r); !errors.Is(err, rbac.ErrDenied) {
-		t.Errorf("a node of a ring holding itself, reached first ten thousand deep: %v", err)
-	}
-	if err := h.authz.Authorize(ctx, h.as(t, "nested"), login, r); err != nil {
-		t.Errorf("a value nested a little, reached first ten thousand deep: %v", err)
-	}
-	if err := h.authz.Authorize(ctx, h.as(t, "pair"), login, r); !errors.Is(err, rbac.ErrDenied) {
-		t.Errorf("one of a pair holding each other, reached first from the other: %v", err)
+	nested, shared := map[string]any{"a": map[string]any{"b": 1}}, nests(9_000, "x")
+	ok := map[string]any{"ok": true}
+	for range 20 {
+		for name, c := range map[string]struct {
+			subject, resource, request map[string]any
+			expr                       string
+			held                       bool
+		}{
+			// The request's attributes are converted before the resource's, and those before the
+			// subject's.
+			"a value reached less deep after a path too deep for it": {
+				ok, map[string]any{"v": shared}, map[string]any{"v": nests(1_500, shared)}, `size(resource.attributes.v) == 1`, true,
+			},
+			"a value too deep where a kind reaches it, beside a path less deep": {
+				ok, nil, map[string]any{"short": shared, "long": nests(1_500, shared)}, `size(request.attributes.short) == 1`, false,
+			},
+			"a node of a ring reached first ten thousand deep": {
+				ok, map[string]any{"node": ring[0]}, map[string]any{"ring": nests(10_000-10, ring[0])}, `has(resource.attributes.node.next)`, false,
+			},
+			"a value nested a little reached first ten thousand deep": {
+				ok, map[string]any{"v": nested}, map[string]any{"v": nests(10_000-1, nested)}, `resource.attributes.v.a.b == 1`, true,
+			},
+			"the subject's beside them": {
+				ok, map[string]any{"node": ring[0]}, map[string]any{"short": shared, "long": nests(1_500, shared)}, `subject.attributes.ok == true`, true,
+			},
+		} {
+			if held, evaluated := rbac.EvaluateConditionOf(t, c.expr, c.subject, c.resource, c.request); held != c.held || evaluated != c.held {
+				t.Fatalf("%s: %s held %t, evaluated %t", name, c.expr, held, evaluated)
+			}
+		}
 	}
 }
 
@@ -1160,8 +1172,8 @@ var registeringHostType = sync.OnceValue(func() error {
 
 // An Any packing a message of another type than those a condition reads was unpacked through the
 // registry, which ran the host's own code for it, its type's New, or a message's own Unmarshal of
-// what it packs, outside any condition: one that panicked ended the check. It fails what reads it,
-// decoding nothing, and the attributes beside it are read.
+// what it packs, outside any condition: one that panicked ended the check. It fails every condition
+// reading its kind's attributes, decoding nothing, and the other kinds' are read.
 func TestAPackedMessageOfAnotherTypeIsntDecoded(t *testing.T) {
 	if err := registeringHostType(); err != nil {
 		t.Fatal(err)
@@ -1172,8 +1184,11 @@ func TestAPackedMessageOfAnotherTypeIsntDecoded(t *testing.T) {
 		}
 	}()
 	packed := &anypb.Any{TypeUrl: "type.googleapis.com/rbac_test.Host"}
-	if held, _, _, err := rbac.EvaluateCondition(t, `request.attributes.ok == true`, map[string]any{"ok": true, "v": packed}); err != nil || !held {
-		t.Errorf("an attribute beside a packed message of the host's type: held %t, %v", held, err)
+	if _, evaluated, _, err := rbac.EvaluateCondition(t, `request.attributes.ok == true`, map[string]any{"ok": true, "v": packed}); err != nil || evaluated {
+		t.Errorf("an attribute beside a packed message of the host's type: evaluated %t, %v", evaluated, err)
+	}
+	if held, _ := rbac.EvaluateConditionOf(t, `subject.attributes.ok == true`, map[string]any{"ok": true}, nil, map[string]any{"v": packed}); !held {
+		t.Error("the subject's attributes beside a request's packed message of the host's type")
 	}
 	if _, evaluated, _, err := rbac.EvaluateCondition(t, `request.attributes.v != 1`, map[string]any{"v": packed}); err != nil || evaluated {
 		t.Errorf("a packed message of the host's type: evaluated %t, %v", evaluated, err)
@@ -1184,11 +1199,12 @@ func TestAPackedMessageOfAnotherTypeIsntDecoded(t *testing.T) {
 // reads anything else by no method of its own: CEL read a value of the host's own list, map or
 // scalar type by its methods, which could disagree with each other, yield themselves, or panic, a
 // list, a map or an optional of CEL's own by the adapter it was made with, which decoded and wrote
-// out what it held on each read, and a message other than those it names by merging it. Each
-// fails whatever reads it, and a list or a map holding one reads the rest, but for whether it holds
-// that one: `in` found it by its key alone, so a deny's `!("v" in request.attributes)` lifted where
-// has() of it failed, and so did a loop over the map's keys, as `!request.attributes.exists(k, k ==
-// "v")`.
+// out what it held on each read, and a message other than those it names by merging it. One such
+// value, however deep in a kind's attributes, makes them all unreadable: reading the rest left each
+// operator to tell what it read from what it couldn't, and `in` found it by its key alone, so a
+// deny's `!("v" in request.attributes)` lifted where has() of it failed, as did a loop over the
+// map's keys. Every condition reading that kind's attributes fails, one reading only those beside it
+// too, and the other kinds' are read.
 func TestAValueOutsideWhatAttributesNamesFailsItsConditions(t *testing.T) {
 	registry, err := types.NewRegistry(&descriptorpb.FileDescriptorProto{})
 	if err != nil {
@@ -1234,33 +1250,154 @@ func TestAValueOutsideWhatAttributesNamesFailsItsConditions(t *testing.T) {
 				t.Errorf("%s of %s: evaluated %t, %v", expr, name, evaluated, err)
 			}
 		}
-	}
-	listing := map[string]any{"l": []any{"a", struct{}{}}, "m": map[string]any{"a": "a", "b": make(chan int)}}
-	for expr, holds := range map[string]bool{
-		`size(request.attributes.l) == 2`: true, `request.attributes.l[0] == "a"`: true, `"a" in request.attributes.l`: true,
-		`request.attributes.m.a == "a"`: true, `size(request.attributes.m) == 2`: true, `"a" in request.attributes.m`: true,
-		`"c" in request.attributes.m`: false, `request.attributes.m.exists(k, k == "a")`: true,
-		`request.attributes.exists(k, k == "m")`: true, `size(request.attributes.m.map(k, 1)) == 2`: true,
-	} {
-		if held, _, _, err := rbac.EvaluateCondition(t, expr, listing); err != nil || held != holds {
-			t.Errorf("%s: held %t, %v", expr, held, err)
+		nested := map[string]any{"ok": true, "m": map[string]any{"a": "a", "l": []any{"a", v}}}
+		for _, expr := range []string{
+			`request.attributes.ok == true`, `!has(request.attributes.no)`, `"ok" in request.attributes`, `!("no" in request.attributes)`,
+			`size(request.attributes) == 2`, `request.attributes.m.a == "a"`, `request.attributes.m.l[0] == "a"`, `"a" in request.attributes.m.l`,
+			`size(request.attributes.m.l) == 2`, `request.attributes.exists(k, k == "ok")`, `request.attributes.m.all(k, k != "b")`,
+		} {
+			if _, evaluated := rbac.EvaluateConditionOf(t, expr, nil, nil, nested); evaluated {
+				t.Errorf("%s beside %s: evaluated", expr, name)
+			}
+		}
+		if held, _ := rbac.EvaluateConditionOf(t, `subject.attributes.ok == true && resource.attributes.ok == true`, map[string]any{"ok": true},
+			map[string]any{"ok": true}, nested); !held {
+			t.Errorf("the other kinds' attributes beside a request holding %s", name)
 		}
 	}
-	for _, expr := range []string{
-		`request.attributes.l[1] != 1`, `!("b" in request.attributes.l)`, `request.attributes.m.b != 1`, `has(request.attributes.m.b)`,
-		`request.attributes.l != ["a", 1]`, `"b" in request.attributes.m`, `!("b" in request.attributes.m)`,
-		`!request.attributes.m.exists(k, k == "b")`, `request.attributes.m.all(k, k != "b")`,
-		`size(request.attributes.m.filter(k, k == "b")) == 0`, `request.attributes.m.exists_one(k, k == "b")`,
+}
+
+// One value no condition can read, as a struct, deep in a kind's attributes, fails every condition
+// reading that kind's, wherever conditions run, one reading only the attributes beside it too: a
+// grant's gives nothing and a deny's applies, in a check, a listing of its permissions and a change;
+// a requirement isn't met; a label value a condition gives isn't held, on the bare tenant, for a
+// check, a holding, Filter or an approver; and the constraints are still asked. A condition
+// reading another kind's attributes still decides.
+func TestAKindHoldingAValueOutsideTheSetFailsEveryConditionReadingIt(t *testing.T) {
+	asked := 0
+	h := labeled(t, func(c *rbac.Config) {
+		c.Catalog = append(c.Catalog, guardRole)
+		c.Constraints = []rbac.Constraint{{Name: "asked", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if in.Subject != nil && in.Subject.Attributes["dept"] == "eng" {
+				asked++
+			}
+			return false, nil
+		}}}
+	})
+	ctx := t.Context()
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE points (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL, labels text[] NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO points VALUES ('t1', 'p', $1, '{level:high}')`, h.path(t, cluster)); err != nil {
+		t.Fatal(err)
+	}
+	when := func(g rbac.Grant, expr string) rbac.Grant {
+		g.Condition = rbac.Condition{Expression: expr}
+		return g
+	}
+	eng := `subject.attributes.dept == "eng"`
+	h.hold(t, "owner", "level:high")
+	h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "guardian"), grant(cluster.Scope(), "cluster.login", rbac.User, "denied"),
+		when(grant(cluster.Scope(), "cluster.login", rbac.User, "granted"), eng),
+		when(grant(cluster.Scope(), "cluster.login", rbac.User, "requested"), `request.attributes.mfa == true`),
+		when(grant(cluster.Scope(), "cluster.admin", rbac.User, "handing"), `request.attributes.ticket == "T-1"`),
+		grant(cluster.Scope(), "cluster.login", rbac.User, "cleared"), when(grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "cleared"), eng),
+		when(grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "approver"), eng))
+	owner := h.as(t, "owner")
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, rbac.Deny{
+		ID: "outsiders", Principals: []rbac.Principal{identity("denied")}, Permissions: []rbac.Permission{login},
+		Condition: rbac.Condition{Expression: `subject.attributes.dept != "eng"`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range []struct {
+		on rbac.Resource
+		e  rbac.Eligibility
+	}{
+		{cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: identity("pager"), MaxDuration: time.Hour, Requires: eng}},
+		{secret, rbac.Eligibility{Role: "cluster.login", Principal: identity("u"), MaxDuration: time.Hour, Approvers: []rbac.Principal{identity("approver")}}},
 	} {
-		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, listing); err != nil || evaluated {
-			t.Errorf("%s: evaluated %t, %v", expr, evaluated, err)
+		if err := h.authz.SetEligibility(ctx, owner, e.on, e.e); err != nil {
+			t.Fatal(err)
 		}
+	}
+	good := map[string]any{"dept": "eng", "tags": map[string]any{"team": "a"}}
+	bad := map[string]any{"dept": "eng", "tags": map[string]any{"team": "a", "badge": struct{}{}}}
+	mfa := rbac.WithRequest(ctx, map[string]any{"mfa": true})
+	// Handed on under the condition the actor holds its power under.
+	handed := rbac.Binding{Role: "cluster.login", Principal: identity("x"), Condition: rbac.Condition{Expression: `request.attributes.ticket == "T-1"`}}
+	decides := func(attributes map[string]any, unreadable bool) map[string]bool {
+		t.Helper()
+		as := func(id string) rbac.Subject {
+			s := h.as(t, id)
+			s.Attributes = attributes
+			return s
+		}
+		ticket := map[string]any{"ticket": "T-1"}
+		if unreadable {
+			ticket["badge"] = struct{}{}
+		}
+		holding, err := h.authz.Holding(ctx, "t1", as("cleared"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		pred, err := h.authz.Filter(ctx, as("cleared"), view, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := h.pool.Query(ctx, `SELECT id FROM points WHERE `+pred.SQL, pred.Args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var filtered []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				t.Fatal(err)
+			}
+			filtered = append(filtered, id)
+		}
+		rows.Close()
+		permissions, err := h.authz.Permissions(ctx, as("granted"), cluster)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, activated := h.authz.Activate(ctx, as("pager"), cluster, rbac.Activation{Role: "cluster.sudo", Duration: time.Minute, Justification: "x"})
+		_, approved := h.authz.Activate(ctx, h.as(t, "u"), secret, rbac.Activation{Role: "cluster.login", Duration: time.Minute, Justification: "x", Approver: as("approver")})
+		return map[string]bool{
+			"a grant":                     h.authz.Authorize(ctx, as("granted"), login, cluster) == nil,
+			"a deny":                      h.authz.Authorize(ctx, as("denied"), login, cluster) == nil,
+			"Permissions":                 slices.Contains(permissions, login),
+			"a requirement":               activated == nil,
+			"a label value":               h.authz.Authorize(ctx, as("cleared"), view, secret) == nil,
+			"a holding":                   holding.Satisfies(secret.Labels),
+			"Filter":                      slices.Equal(filtered, []string{"p"}),
+			"an approver's label value":   approved == nil,
+			"a change, by the request's":  h.authz.Apply(rbac.WithRequest(ctx, ticket), h.as(t, "handing"), cluster, rbac.Change{Grant: []rbac.Binding{handed}}) == nil,
+			"another kind's, the request": h.authz.Authorize(mfa, as("requested"), login, cluster) == nil,
+		}
+	}
+	// Refused first, as an activation, a grant or an approval that holds stays.
+	for name, ok := range decides(bad, true) {
+		if ok != (name == "another kind's, the request") {
+			t.Errorf("%s, of a subject holding a struct: decided %t", name, ok)
+		}
+	}
+	for name, ok := range decides(good, false) {
+		if !ok {
+			t.Errorf("%s, of a subject the conditions read: refused", name)
+		}
+	}
+	if asked == 0 {
+		t.Error("no constraint was asked")
 	}
 }
 
 // A map of Go's keyed by an interface can hold two keys CEL reads as the same value, as an int and
 // an int64 of 1, 1 and 1u, or "a" of two string types: CEL's own map of such keys holds one of them,
-// and finding the other finds it. A map holding two fails whatever reads it.
+// and finding the other finds it. A map holding two fails every condition reading its kind.
 func TestAMapHoldingTwoKeysReadAsOneFailsItsConditions(t *testing.T) {
 	type named string
 	for name, m := range map[string]any{
@@ -1429,9 +1566,10 @@ func TestConvertingAttributesAllocatesForWhatItConvertsThemTo(t *testing.T) {
 // A host can nest a value as deep as it likes, which converting it recurses into: a chain of
 // pointers two million deep, which cost nothing, overflowed the stack, which no recover catches,
 // and a list a hundred thousand deep, each level costing one, took a check a fifth of a second
-// and a hundred mebibytes of stack. A value nested deeper than JSON text may fails there, and the
-// condition reading it with it. It runs in a child process, on a smaller stack, which converting a
-// value as deep as a check may afford, but no deeper than JSON, overflows.
+// and a hundred mebibytes of stack. A value nested deeper than JSON text may makes its kind's
+// attributes unreadable, and every condition reading them fails, while the other kinds' are read.
+// It runs in a child process, on a smaller stack, which converting a value as deep as a check may
+// afford, but no deeper than JSON, overflows.
 func TestAValueNestedDeepFailsItsConditions(t *testing.T) {
 	if os.Getenv("RBAC_VALUE_NESTED_DEEP") != "" {
 		debug.SetMaxStack(32 << 20)
@@ -1444,9 +1582,11 @@ func TestAValueNestedDeepFailsItsConditions(t *testing.T) {
 			if _, evaluated, _, err := rbac.EvaluateCondition(t, `request.attributes.v == request.attributes.v`, map[string]any{"v": v}); err != nil || evaluated {
 				t.Errorf("%s nested deep: evaluated %t, %v", name, evaluated, err)
 			}
-			// The rest is read.
-			if held, _, _, err := rbac.EvaluateCondition(t, `request.attributes.ok == true`, map[string]any{"v": v, "ok": true}); err != nil || !held {
-				t.Errorf("an attribute beside %s nested deep: held %t, %v", name, held, err)
+			if _, evaluated, _, err := rbac.EvaluateCondition(t, `request.attributes.ok == true`, map[string]any{"v": v, "ok": true}); err != nil || evaluated {
+				t.Errorf("an attribute beside %s nested deep: evaluated %t, %v", name, evaluated, err)
+			}
+			if held, _ := rbac.EvaluateConditionOf(t, `subject.attributes.ok == true`, map[string]any{"ok": true}, nil, map[string]any{"v": v}); !held {
+				t.Errorf("the subject's attributes beside a request's holding %s nested deep", name)
 			}
 		}
 		return

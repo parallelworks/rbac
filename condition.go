@@ -38,18 +38,18 @@ import (
 // one reading an attribute the host didn't pass does, or comparing a double that isn't finite, as
 // dividing by zero makes, or a value holding one, in a list, a map, as a key too, or an optional,
 // converting one to a string or keying a map by one, is false, though `in` a map a condition makes
-// keyed by a list holding one is false for a key it doesn't hold. What the host passes is
-// converted once for a check into CEL's own values, from the values Attributes names, and anything
-// else fails what reads it, a test of its presence too, so conditions read CEL's own values alone,
-// at what reading any value of its size costs. A label value and a power to release are
-// decided on the tenant with no attributes, whatever a check passes (Holding), and their conditions
-// can't read the tenant's: any read of resource.attributes fails, a test of an attribute's
-// presence, in, size(), a macro and a comparison included, so a grant's gives nothing and a deny's
-// applies. The zero Condition is none, and one with a title or description has an expression. A
-// pattern it matches is a string literal, of bounded size; it nests at most 32 deep; it builds no
-// message, as `google.protobuf.Struct{}`; and a comparison, or a search of a list, that would read
-// more than a condition may spend, or reading a time in a zone whose name is longer than 64 bytes,
-// fails before it runs.
+// keyed by a list holding one is false for a key it doesn't hold. What the host passes is converted
+// once for a check into CEL's own values, from the values Attributes names, and a kind's attributes
+// holding anything else can't be read, every condition reading one of them failing, a test of its
+// presence too, so conditions read CEL's own values alone, at what reading any value of its size
+// costs. A label value and a power to release are decided on the tenant with no attributes,
+// whatever a check passes (Holding), and their conditions can't read the tenant's: any read of
+// resource.attributes fails, a test of an attribute's presence, in, size(), a macro and a
+// comparison included, so a grant's gives nothing and a deny's applies. The zero Condition is none,
+// and one with a title or description has an expression. A pattern it matches is a string literal,
+// of bounded size; it nests at most 32 deep; it builds no message, as `google.protobuf.Struct{}`;
+// and a comparison, or a search of a list, that would read more than a condition may spend, or
+// reading a time in a zone whose name is longer than 64 bytes, fails before it runs.
 //
 // Each condition runs within the most evaluating it can cost, which its literals and types bound:
 // little for one comparing what a request passes with literals, or with the subject's kind or id,
@@ -913,16 +913,6 @@ func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 			if l, ok := y.(traits.Lister); ok {
 				return contains(l, x)
 			}
-			// A key a map holds a value under that can't be read, as a struct, fails as has() of it does,
-			// though CEL finds it by the key alone: `!("mfa" in request.attributes)` would lift a deny
-			// where the host passes one.
-			if m, ok := y.(traits.Mapper); ok && !refusing(y) {
-				v, found := m.Find(x)
-				if found && types.IsUnknownOrError(v) {
-					return v
-				}
-				return types.Bool(found)
-			}
 			if c, ok := y.(traits.Container); ok {
 				return c.Contains(x)
 			}
@@ -1460,13 +1450,8 @@ func equal(x, y ref.Val, read uint64) ref.Val {
 		if nonFiniteKey(xs) || nonFiniteKey(ys) {
 			return incomparable()
 		}
-		for it := asHeld(xs).Iterator(); it.HasNext() == types.True; {
+		for it := xs.Iterator(); it.HasNext() == types.True; {
 			k := it.Next()
-			// A key a condition can't read, which finding would find in no map, fails as a value
-			// does.
-			if types.IsUnknownOrError(k) {
-				return k
-			}
 			if valueSize(k, read) > read {
 				return types.False
 			}
@@ -1551,7 +1536,7 @@ func measuring(v ref.Val, limit uint64, each func(ref.Val)) uint64 {
 		if least := n + 2*count(v); least > limit {
 			return least
 		}
-		for it := asHeld(v).Iterator(); n <= limit && it.HasNext() == types.True; {
+		for it := v.Iterator(); n <= limit && it.HasNext() == types.True; {
 			k := it.Next()
 			// Finding the value hashes the key whole, so a key past limit is left unfound.
 			if n += measuring(k, limit-n, each); n <= limit {
@@ -1800,8 +1785,9 @@ type requestKey struct{}
 // address or whether it passed a second factor, which conditions read as request.attributes.
 // Values are those Attributes names, a check converting them once into CEL's own: strings,
 // numbers, booleans, bytes, times, durations, null, JSON and the protobuf well-known types, and
-// lists and maps of them. Anything else, as a struct or a value of the host's own CEL type, fails
-// whatever condition reads it.
+// lists and maps of them. One holding anything else, however deep, as a struct or a value of the
+// host's own CEL type, makes the request's attributes unreadable: every condition reading any of
+// them fails, as it does for the subject's or the resource's holding one.
 func WithRequest(ctx context.Context, attributes map[string]any) context.Context {
 	return context.WithValue(ctx, requestKey{}, maps.Clone(attributes))
 }
@@ -1819,24 +1805,31 @@ func withoutRequest(ctx context.Context) context.Context {
 
 // vars is what a condition reads when s asks to do p to r, each kind's attributes converted by one
 // converter for them all (Attributes), so a value they share is converted once, and what converting
-// them all may cost is bounded together: past it, every kind's attributes refuse every read.
+// them all may cost is bounded together: past it, every kind's attributes refuse every read. A kind
+// holding a value no condition can read refuses every read of its own, the others read as passed.
 func (a *Authorizer) vars(ctx context.Context, s Subject, p Permission, r Resource) map[string]any {
 	converting()
 	c := newConverter()
 	_, none := ctx.Value(requestKey{}).(unrequested)
 	var request map[ref.Val]ref.Val
+	requestRead := !none
 	if !none {
 		passed, _ := ctx.Value(requestKey{}).(map[string]any)
-		request = c.attributes(passed)
+		request, requestRead = c.attributes(passed)
 	}
-	resourced, subjected := c.attributes(r.Attributes), c.attributes(s.Attributes)
+	resourced, resourceRead := c.attributes(r.Attributes)
+	subjected, subjectRead := c.attributes(s.Attributes)
 	var requestAttributes, resourceAttributes, subjectAttributes any = unreadable, unreadable, unreadable
 	if !c.over {
-		if !none {
+		if requestRead {
 			requestAttributes = declared(a.cfg.Attributes.Request, request)
 		}
-		resourceAttributes = declared(a.cfg.Attributes.Resource, resourced)
-		subjectAttributes = declared(a.cfg.Attributes.Subject, subjected)
+		if resourceRead {
+			resourceAttributes = declared(a.cfg.Attributes.Resource, resourced)
+		}
+		if subjectRead {
+			subjectAttributes = declared(a.cfg.Attributes.Subject, subjected)
+		}
 	}
 	resource := map[string]any{"type": r.Type, "id": r.ID, "tenant": r.Tenant, "attributes": resourceAttributes}
 	if r.Type == TenantScope && a.labelPermission(p) {
@@ -1874,22 +1867,17 @@ func declared(declares map[string]AttributeType, attributes map[ref.Val]ref.Val)
 	if len(attributes) == 0 {
 		return noAttributes
 	}
-	if declares == nil {
-		unreadable := false
-		for _, v := range attributes {
-			unreadable = unreadable || types.IsError(v)
-		}
-		return mapOf(attributes, unreadable)
-	}
 	refused := false
-	for k, v := range attributes {
-		name, _ := k.(types.String)
-		// One it doesn't declare a condition reads only through dyn(), which no type is checked
-		// by when stored, so it fails as one of another type does.
-		if t, ok := declares[string(name)]; !ok {
-			attributes[k], refused = types.NewErr("rbac: attribute %q is not declared", string(name)), true
-		} else if !t.takes(v) {
-			attributes[k], refused = types.NewErr("rbac: attribute %q is not a %s", string(name), t), true
+	if declares != nil {
+		for k, v := range attributes {
+			name, _ := k.(types.String)
+			// One it doesn't declare a condition reads only through dyn(), which no type is checked
+			// by when stored, so it fails as one of another type does.
+			if t, ok := declares[string(name)]; !ok {
+				attributes[k], refused = types.NewErr("rbac: attribute %q is not declared", string(name)), true
+			} else if !t.takes(v) {
+				attributes[k], refused = types.NewErr("rbac: attribute %q is not a %s", string(name), t), true
+			}
 		}
 	}
 	attrs := types.NewRefValMap(types.DefaultTypeAdapter, attributes)

@@ -48,10 +48,11 @@ import (
 // kind doesn't declare, which a condition reads only through dyn(), fails so too. An undeclared
 // kind's are read as converted, and CEL compares values of different types as unequal.
 //
-// What a host passes as a kind's attributes is converted, for each check that reads a condition,
-// once and whole, into CEL's own values, and conditions read only those, by CEL's own semantics: a
-// string, an int, a uint, a double, a bool, bytes, a timestamp, a duration, null, and lists and
-// maps of them. A host may pass, as an attribute or within one:
+// What a host passes as a kind's attributes, the subject's, the resource's or the request's, is
+// converted, for each check that reads a condition, once and whole, into CEL's own values, and
+// conditions read only those, by CEL's own semantics: a string, an int, a uint, a double, a bool,
+// bytes, a timestamp, a duration, null, and lists and maps of them. A host may pass, as an
+// attribute or within one:
 //
 //   - nil, and a nil pointer, read as null;
 //   - a bool, a string, or an int, a uint or a float of any size, of a type of its own too, as a
@@ -67,24 +68,29 @@ import (
 //     Timestamp, a Duration, and an Any packing one of them but another Any, by its type's name,
 //     as no packed message of another type is decoded.
 //
-// Anything else fails whatever condition reads it, a test of its presence, has(), `in` the map
-// holding it or a loop over that map's keys, included: a ref.Val of the host's own, though it says
-// it is of one of CEL's types, a list, a map or an optional of CEL's a host makes, a struct, a
-// channel, a func, a complex number, a uintptr, any other message, a map keyed by any other value,
-// as a double or an array, a map holding two keys read as the same value, as 1 and 1u, or "a" twice
-// of two string types, invalid JSON, a value nested deeper than JSON text may, 10,000 deep, and a
-// value holding itself, and each it holds that holds it. A list or a map holding one reads the
-// rest. A value reached twice, as a map two lists hold, is converted once, but for one converted
-// cut short at that depth, which is converted again where it is reached less deep. A check converts
-// at most maxConverted of what the host passes, counted as reading it costs a condition, one for
-// each value and a tenth of each string's, bytes', JSON number's, JSON text's or packed type URL's
-// length, and half a packed message's, as a packed value takes as few as two bytes: past that,
-// every condition reading an attribute of any kind fails, and JSON text that may hold more values
-// than are left isn't parsed. The subject's, the resource's and the request's attributes share it,
-// so attributes a tenant's users write, as a resource's tags, can take every check of the resource
-// past that, where a grant's condition reading an attribute gives nothing and a deny's applies,
-// whoever asks: bound what users may store, or pass conditions only what they read. A declared
-// attribute is a value of its type as converted, so a named string type is a string.
+// A kind's attributes holding anything else, however deep, are unreadable as a whole, as a policy
+// engine fails input it can't read: every condition reading any of them fails, a test of one's
+// presence too, so a grant's gives nothing, a deny's applies and a requirement isn't met, while the
+// other kinds' are read. So are those holding a ref.Val of the host's own, though it says it is of
+// one of CEL's types, a list, a map or an optional of CEL's a host makes, a struct, a channel, a
+// func, a complex number, a uintptr, any other message, a map keyed by any other value, as a double
+// or an array, a map holding two keys read as the same value, as 1 and 1u, or "a" twice of two
+// string types, invalid JSON, a value holding itself, or holding one that does, however long the
+// cycle, and a value nested deeper than JSON text may, 10,000 deep, along the longest path through
+// what the kind holds, wherever a value it shares with another was reached first. Reading the rest
+// would leave each operator to tell what it read from what it couldn't, as `in`, has() and a loop
+// over a map's keys each found a key whose value it couldn't read. A value reached twice, as a map
+// two lists hold, is converted once, for any kind reaching it. A check converts at most
+// maxConverted of what the host passes, counted as reading it costs a condition, one for each value
+// and a tenth of each string's, bytes', JSON number's, JSON text's or packed type URL's length, and
+// half a packed message's, as a packed value takes as few as two bytes, each kind whole, whether it
+// can be read or not: past that, every condition reading an attribute of any kind fails, and JSON
+// text that may hold more values than are left isn't parsed. The subject's, the resource's and the
+// request's attributes share it, so attributes a tenant's users write, as a resource's tags, can
+// take every check of the resource past that, where a grant's condition reading an attribute gives
+// nothing and a deny's applies, whoever asks: bound what users may store, or pass conditions only
+// what they read. A declared attribute is a value of its type as converted, so a named string type
+// is a string.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
@@ -140,71 +146,65 @@ func allStrings(it traits.Iterator, m traits.Mapper) bool {
 // it does, so converting what a check passes costs no more than its conditions may.
 const maxConverted = 2 * maxCheckCost
 
-// maxNested is how deep a value a host passes may nest, as JSON text may (encoding/json): one
-// nested deeper fails there, so converting it recurses no deeper, though each level would cost
-// one, a hundred thousand levels took a check a fifth of a second, growing the stack to a hundred
-// mebibytes.
+// maxNested is how deep a value a host passes may nest, as JSON text may (encoding/json): a kind's
+// attributes nesting deeper can't be read, and converting them recurses no deeper, as though each
+// level costs one, a hundred thousand levels took a check a fifth of a second, growing the stack to
+// a hundred mebibytes.
 const maxNested = 10000
 
-// converter converts what a host passes for a check into CEL's own values (Attributes), spending
-// no more than left, and keeping each list, map, pointer, message and JSON text it converts by
-// where it points, its length and its type, so one reached twice is converted once, and one
-// holding itself fails, and so does each it holds that holds it.
+// converter converts what a host passes for a check into CEL's own values (Attributes), a kind's
+// attributes at a time, spending no more than left on them all. It keeps each list, map, pointer,
+// message and JSON text it converts by where it points, its length and its type (copiedKey), with
+// what it found of it, so one reached twice is converted once, for any kind that reaches it.
 type converter struct {
 	left uint64
-	// over is set once converting cost more than was left, which fails every attribute.
+	// over is set once converting cost more than was left, which fails every kind's attributes.
 	over bool
-	// depth is how deep converting is in the value it converts.
+	// depth is how deep converting is in the kind it converts.
 	depth int
-	// done is where in converted each it converted is, by where it points (copiedKey).
+	// unread counts the values converting found no condition can read, as a struct, one holding
+	// itself, or one holding either, and deep those it found nested past maxNested.
+	unread, deep int
+	// done is where in converted each it converted is, by where it points.
 	done      map[copiedKey]int
 	converted []conversion
-	// open are those converted that may yet be found to reach one that reaches them, by where they
-	// are in converted, the first first, and low is the first of them the one being converted
-	// reaches, as Tarjan's search for the strongly connected components of a graph keeps them: once
-	// one is done converting reaching none open before it, it and those open after it reach each
-	// other, if there are any, and each holds itself.
-	open []int
-	low  int
-	// cut counts the values converting found nested past maxNested, and those it reached again
-	// that it had converted cut short so (conversion).
-	cut int
 }
 
-// conversion is a value a converter converted, or is converting while to is nil.
+// conversion is what a converter found of a value it converted, while open converting it: what it
+// is to conditions, and how deep it nests, counting itself, or that no condition can read it.
 type conversion struct {
-	to   ref.Val
-	open bool
-	// itself is set once converting it reached it, or found it holds one that holds it.
-	itself bool
-	// at is how deep it was reached, and cut is set where converting it, or those it reaches that
-	// reach it, found a value nested past maxNested, so what it was converted to is of how deep it
-	// was reached (once).
-	at  int
-	cut bool
+	to               ref.Val
+	height           int
+	open, unreadable bool
 }
 
-func newConverter() *converter { return &converter{left: maxConverted, low: math.MaxInt} }
+func newConverter() *converter { return &converter{left: maxConverted} }
 
-// attributes is each of attributes as conditions read it, by its name, nil for none.
-func (c *converter) attributes(attributes map[string]any) map[ref.Val]ref.Val {
+// attributes is a kind's attributes as conditions read them, by their names, nil for none, and
+// whether a condition can read them: where any value they hold, however deep, can't be read, as a
+// struct, or nests past maxNested, or holds itself, none can, as the attributes beside one would
+// leave each operator reading them to tell what it reads from what it can't. Each is converted, and
+// charged, whether one before it could be read or not, so what is left for the kinds after it
+// doesn't turn on the order a map's entries come in.
+func (c *converter) attributes(attributes map[string]any) (map[ref.Val]ref.Val, bool) {
 	if len(attributes) == 0 {
-		return nil
+		return nil, true
 	}
 	// Each costs at least its name and its value, so a map for more than are left isn't made, as
 	// one for a million took 80 MB, only to find them past it.
 	if 2*length(len(attributes)) > c.left {
 		c.over, c.left = true, 0
-		return nil
+		return nil, false
 	}
+	unread, deep := c.unread, c.deep
 	out := make(map[ref.Val]ref.Val, len(attributes))
 	for name, v := range attributes {
 		if !c.pay(textLength(len(name))) {
-			return nil
+			return nil, false
 		}
-		out[types.String(name)] = c.of(reflect.ValueOf(v))
+		out[types.String(name)], _ = c.of(reflect.ValueOf(v))
 	}
-	return out
+	return out, c.unread == unread && c.deep == deep
 }
 
 var (
@@ -217,87 +217,98 @@ var (
 	messageType  = reflect.TypeFor[proto.Message]()
 )
 
-// of is v as a condition reads it: one of CEL's own values, or an error whatever reads it fails on.
-// It reads v by its kind, but for the types Attributes names, and calls no method of the host's.
-// Each value costs one, one that fails too, and a string, bytes or JSON text a tenth of its length
-// more, as reading it does, so converting reaches no more values, nor deeper, than it may cost.
-func (c *converter) of(v reflect.Value) ref.Val {
+// of is v as a condition reads it, one of CEL's own values, and how deep it nests, counting itself,
+// or nil where no condition can read it (refuse), it nests past maxNested, or converting it costs
+// more than is left. It reads v by its kind, but for the types Attributes names, and calls no
+// method of the host's. Each value costs one, one that can't be read too, and a string, bytes or
+// JSON text a tenth of its length more, as reading it does, so converting reaches no more values
+// than it may cost.
+func (c *converter) of(v reflect.Value) (ref.Val, int) {
 	if !c.pay(1) {
-		return tooLarge()
+		return nil, 0
 	}
 	if c.depth >= maxNested {
-		c.cut++
-		return types.NewErr("rbac: a condition can't read a value nested more than %d deep", maxNested)
+		c.deep++
+		return nil, 0
 	}
 	c.depth++
 	defer func() { c.depth-- }()
 	if v.Kind() == reflect.Interface {
 		if v.IsNil() {
-			return types.NullValue
+			return types.NullValue, 1
 		}
 		v = v.Elem()
 	}
 	if !v.IsValid() {
-		return types.NullValue
+		return types.NullValue, 1
 	}
 	t := v.Type()
 	switch t {
 	case timeType:
 		at, _ := v.Interface().(time.Time)
-		return types.Timestamp{Time: at}
+		return types.Timestamp{Time: at}, 1
 	case durationType:
-		return types.Duration{Duration: time.Duration(v.Int())}
+		return types.Duration{Duration: time.Duration(v.Int())}, 1
 	case rawType:
 		return c.json(v)
 	case numberType:
-		return c.number(v.String())
+		return c.number(v.String()), 1
 	case nullType:
-		return types.NullValue
+		return types.NullValue, 1
 	}
 	// A value of a type of the host's own CEL would read by its methods, as one saying it is a
 	// double or a list, is read so by none. A pointer has the methods of what it points to, so one to
 	// CEL's own string is read as the string, as any other pointer is read as what it points to.
 	if t.Implements(refValType) && (t.Kind() != reflect.Pointer || !t.Elem().Implements(refValType)) {
 		if v, ok := v.Interface().(ref.Val); ok && celScalar(v) {
-			return c.spend(textSize(v)-1, v)
+			return c.spend(textSize(v)-1, v), 1
 		}
-		return cantRead(t)
+		return c.refuse(), 1
 	}
 	if t.Implements(messageType) {
 		return c.message(v)
 	}
 	switch v.Kind() {
 	case reflect.Bool:
-		return types.Bool(v.Bool())
+		return types.Bool(v.Bool()), 1
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return types.Int(v.Int())
+		return types.Int(v.Int()), 1
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return types.Uint(v.Uint())
+		return types.Uint(v.Uint()), 1
 	case reflect.Float32, reflect.Float64:
-		return types.Double(v.Float())
+		return types.Double(v.Float()), 1
 	case reflect.String:
 		s := v.String()
-		return c.spend(uint64(len(s))/10, types.String(s))
+		return c.spend(uint64(len(s))/10, types.String(s)), 1
 	case reflect.Pointer:
 		if v.IsNil() {
-			return types.NullValue
+			return types.NullValue, 1
 		}
-		return c.once(v, func() ref.Val { return c.of(v.Elem()) })
+		return c.once(v, func() (ref.Val, int) {
+			to, height := c.of(v.Elem())
+			return to, height + 1
+		})
 	case reflect.Slice:
 		if t.Elem().Kind() == reflect.Uint8 {
-			return c.bytes(v)
+			return c.bytes(v), 1
 		}
-		return c.once(v, func() ref.Val { return c.list(v) })
+		return c.once(v, func() (ref.Val, int) { return c.list(v) })
 	case reflect.Array:
 		if t.Elem().Kind() == reflect.Uint8 {
-			return c.bytes(v)
+			return c.bytes(v), 1
 		}
 		return c.list(v)
 	case reflect.Map:
-		return c.once(v, func() ref.Val { return c.dict(v) })
+		return c.once(v, func() (ref.Val, int) { return c.dict(v) })
 	default:
 	}
-	return cantRead(t)
+	return c.refuse(), 1
+}
+
+// refuse counts a value no condition can read, which makes its kind's attributes unreadable.
+func (c *converter) refuse() ref.Val {
+	c.unread++
+	return nil
 }
 
 // celScalar reports whether v is one of CEL's own values that holds no other.
@@ -325,44 +336,33 @@ func (c *converter) pay(n uint64) bool {
 	return true
 }
 
-// spend is v, which converting cost n, or an error once it costs more than is left.
+// spend is v, which converting cost n, or nil once it costs more than is left.
 func (c *converter) spend(n uint64, v ref.Val) ref.Val {
 	if !c.pay(n) {
-		return tooLarge()
+		return nil
 	}
 	return v
 }
 
-// once is what convert makes of v, which points somewhere, converted once for the check, and an
-// error where v holds itself, or holds one that holds v. Failing only where converting reached one it
-// was converting, as a map's value holding the map, would fail another of those holding each other
-// depending on which was reached first: where a holds b and b holds a, either a.b or b.a, by the
-// order a map's entries came in, so a grant's has(request.attributes.a.b) held for one check and
-// not the next. One whose converting was cut short, nested past maxNested, is converted again where
-// it is reached less deep, as it was converted as deep as it was reached: a value reached first
-// through another nested near the limit was read, reached again from an attribute of its own, as
-// cut short there, so one holding itself whole where converting it had stopped short of finding so,
-// and one nested but a little as failing.
-func (c *converter) once(v reflect.Value, convert func() ref.Val) ref.Val {
+// once is what convert makes of v, which points somewhere, and how deep it nests, converted once
+// for the check. One reached again while it is converted holds itself, or holds one that holds it,
+// and can't be read, nor can one holding it, of any kind. One that can't be read is kept so, as no
+// kind reaching it can read it; one nesting past maxNested where it was reached isn't kept, as it may
+// not where it is reached less deep; and one converted whole is kept with how deep it nests, so it
+// fails where it is reached too deep for that, wherever it was first reached: whether a kind's
+// attributes nest past maxNested, as whether they hold one holding itself, is of what they hold,
+// whatever order a map's entries come in or a kind before it reached a value first.
+func (c *converter) once(v reflect.Value, convert func() (ref.Val, int)) (ref.Val, int) {
 	k, _ := copiedKeyOf(v)
 	if i, ok := c.done[k]; ok {
-		d := &c.converted[i]
-		if d.open {
-			c.low = min(c.low, i)
-			if d.to == nil {
-				d.itself = true
-				return holdingItself()
-			}
-			return d.to
-		}
-		if !d.cut {
-			return d.to
-		}
-		// What holds one cut short is cut short too, as deep as it was reached. One found holding
-		// itself holds itself however deep it is reached.
-		if d.itself || c.depth >= d.at {
-			c.cut++
-			return d.to
+		switch d := c.converted[i]; {
+		case d.open || d.unreadable:
+			return c.refuse(), 0
+		case c.depth+d.height-1 > maxNested:
+			c.deep++
+			return nil, 0
+		default:
+			return d.to, d.height
 		}
 	}
 	if c.done == nil {
@@ -370,34 +370,20 @@ func (c *converter) once(v reflect.Value, convert func() ref.Val) ref.Val {
 	}
 	i := len(c.converted)
 	c.done[k] = i
-	c.converted = append(c.converted, conversion{open: true, at: c.depth})
-	c.open = append(c.open, i)
-	outer, cut := c.low, c.cut
-	c.low = i
-	out := convert()
-	c.converted[i].to = out
-	if c.low == i {
-		j := len(c.open) - 1
-		for c.open[j] != i {
-			j--
-		}
-		cycle := len(c.open)-j > 1 || c.converted[i].itself
-		for _, held := range c.open[j:] {
-			d := &c.converted[held]
-			d.open, d.cut = false, c.cut != cut
-			if cycle {
-				d.to, d.itself = holdingItself(), true
-			}
-		}
-		c.open = c.open[:j]
-		out = c.converted[i].to
+	c.converted = append(c.converted, conversion{open: true})
+	unread, deep := c.unread, c.deep
+	to, height := convert()
+	d := &c.converted[i]
+	d.open = false
+	switch {
+	case c.unread != unread:
+		d.unreadable = true
+	case c.deep != deep || c.over:
+		delete(c.done, k)
+	default:
+		d.to, d.height = to, height
 	}
-	c.low = min(outer, c.low)
-	return out
-}
-
-func holdingItself() ref.Val {
-	return types.NewErr("rbac: a condition can't read a value holding itself")
+	return to, height
 }
 
 // bytes is v, a slice or an array of bytes, as bytes, an array's copied into one of its own type:
@@ -405,7 +391,7 @@ func holdingItself() ref.Val {
 // copying an array of a byte type of the host's own into a []byte.
 func (c *converter) bytes(v reflect.Value) ref.Val {
 	if !c.pay(length(v.Len()) / 10) {
-		return tooLarge()
+		return nil
 	}
 	if v.Kind() == reflect.Slice {
 		return types.Bytes(v.Bytes())
@@ -415,34 +401,36 @@ func (c *converter) bytes(v reflect.Value) ref.Val {
 	return types.Bytes(b.Bytes())
 }
 
-// list is v, a slice or an array, as a list of what it holds.
-func (c *converter) list(v reflect.Value) ref.Val {
+// list is v, a slice or an array, as a list of what it holds, and how deep it nests.
+func (c *converter) list(v reflect.Value) (ref.Val, int) {
 	// Each costs at least one, so a list longer than is left can't be converted.
 	if length(v.Len()) > c.left {
 		c.over, c.left = true, 0
-		return tooLarge()
+		return nil, 0
 	}
-	out := make([]ref.Val, v.Len())
+	out, height := make([]ref.Val, v.Len()), 0
 	for i := range out {
-		if out[i] = c.of(v.Index(i)); c.over {
-			return tooLarge()
+		var h int
+		if out[i], h = c.of(v.Index(i)); c.over {
+			return nil, 0
 		}
+		height = max(height, h)
 	}
-	return types.NewRefValList(types.DefaultTypeAdapter, out)
+	return types.NewRefValList(types.DefaultTypeAdapter, out), height + 1
 }
 
-// dict is v, a map, as a map of what it holds by what its keys are read as, failing for a key of
-// another kind than Attributes names, or where two of them are read as the same value.
-func (c *converter) dict(v reflect.Value) ref.Val {
+// dict is v, a map, as a map of what it holds by what its keys are read as, and how deep it nests.
+// No condition can read one keyed by another kind than Attributes names, nor one holding two keys
+// read as the same value.
+func (c *converter) dict(v reflect.Value) (ref.Val, int) {
 	if kt := v.Type().Key(); kt.Kind() != reflect.Interface && !keyType(kt) {
-		return cantKey(kt)
+		return c.refuse(), 1
 	}
 	if 2*length(v.Len()) > c.left {
 		c.over, c.left = true, 0
-		return tooLarge()
+		return nil, 0
 	}
-	out := make(map[ref.Val]ref.Val, v.Len())
-	unreadable := false
+	out, height := make(map[ref.Val]ref.Val, v.Len()), 0
 	// Each entry is read into the same two values, as reading it into new ones allocates for each,
 	// a string key or an interface value too: nothing converting reads keeps them.
 	key, value := reflect.New(v.Type().Key()).Elem(), reflect.New(v.Type().Elem()).Elem()
@@ -450,68 +438,30 @@ func (c *converter) dict(v reflect.Value) ref.Val {
 		key.SetIterKey(it)
 		value.SetIterValue(it)
 		k := c.key(key)
-		if types.IsError(k) {
-			return k
+		held, h := c.of(value)
+		if c.over {
+			return nil, 0
 		}
-		if holdsKey(out, k) {
-			return types.NewErr("rbac: a condition can't read a %.64s holding two keys read as the same value", v.Type())
+		height = max(height, h)
+		switch {
+		case k == nil:
+		case holdsKey(out, k):
+			c.refuse()
+		default:
+			out[k] = held
 		}
-		held := c.of(value)
-		if out[k] = held; c.over {
-			return tooLarge()
-		}
-		unreadable = unreadable || types.IsError(held)
 	}
-	return mapOf(out, unreadable)
+	return types.NewRefValMap(types.DefaultTypeAdapter, out), height + 1
 }
 
-// mapOf is out, a map a check converted, as conditions read it, where unreadable, holding a value
-// no condition can read. A loop over a map's keys reads none of its values, so it would find that
-// one's key, as `in` and has() of it don't (bounded), and a deny's
-// `!request.attributes.exists(k, k == "mfa")` would lift where the host passes mfa as a struct: a
-// loop over such a map finds the value's error in place of its key, and reads the rest.
-func mapOf(out map[ref.Val]ref.Val, unreadable bool) ref.Val {
-	m := types.NewRefValMap(types.DefaultTypeAdapter, out)
-	if !unreadable {
-		return m
-	}
-	keys := make([]ref.Val, 0, len(out))
-	for k, v := range out {
-		if types.IsError(v) {
-			k = v
-		}
-		keys = append(keys, k)
-	}
-	return holdingUnreadable{Mapper: m, keys: types.NewRefValList(types.DefaultTypeAdapter, keys)}
-}
-
-// holdingUnreadable is a map holding a value no condition can read, whose keys a loop finds as
-// keys holds them, that value's error in place of its key (mapOf).
-type holdingUnreadable struct {
-	traits.Mapper
-	keys traits.Lister
-}
-
-func (m holdingUnreadable) Iterator() traits.Iterator { return m.keys.Iterator() }
-
-// asHeld is m by the keys it holds, that of a value no condition can read too, as measuring and
-// equal read it: what reading a map costs, and whether two are equal, is of what they hold, not of
-// what a loop over them finds.
-func asHeld(m traits.Mapper) traits.Mapper {
-	if h, ok := m.(holdingUnreadable); ok {
-		return h.Mapper
-	}
-	return m
-}
-
-// key is k, a map's key, as a condition reads it: a bool, a string, an int or a uint, or an error.
+// key is k, a map's key, as a condition reads it: a bool, a string, an int or a uint, or nil.
 func (c *converter) key(k reflect.Value) ref.Val {
 	if !c.pay(1) {
-		return tooLarge()
+		return nil
 	}
 	if k.Kind() == reflect.Interface {
 		if k.IsNil() {
-			return types.NewErr("rbac: a condition can't read a map keyed by nil")
+			return c.refuse()
 		}
 		k = k.Elem()
 	}
@@ -520,7 +470,7 @@ func (c *converter) key(k reflect.Value) ref.Val {
 		if v, ok := k.Interface().(ref.Val); ok && keyType(t) {
 			return c.spend(textSize(v)-1, v)
 		}
-		return cantKey(t)
+		return c.refuse()
 	}
 	switch k.Kind() {
 	case reflect.Bool:
@@ -534,7 +484,7 @@ func (c *converter) key(k reflect.Value) ref.Val {
 		return c.spend(uint64(len(s))/10, types.String(s))
 	default:
 	}
-	return cantKey(t)
+	return c.refuse()
 }
 
 // keyType reports whether a map keyed by values of type t is keyed as Attributes names, empty too.
@@ -575,24 +525,25 @@ func holdsKey(m map[ref.Val]ref.Val, k ref.Val) bool {
 	return other != nil && ok
 }
 
-// json is v, JSON text, parsed, at a tenth of its length, once for each text a check passes. Text
-// that may hold more values than are left isn't parsed: a value takes as few as two bytes, as `0,`,
-// and parsing a mebibyte of them, only to find more than a check may convert, took a tenth of a
-// second and 80 MB.
-func (c *converter) json(v reflect.Value) ref.Val {
-	return c.once(v, func() ref.Val {
+// json is v, JSON text, parsed, at a tenth of its length, once for each text a check passes, and
+// how deep it nests. Text that may hold more values than are left isn't parsed: a value takes as
+// few as two bytes, as `0,`, and parsing a mebibyte of them, only to find more than a check may
+// convert, took a tenth of a second and 80 MB.
+func (c *converter) json(v reflect.Value) (ref.Val, int) {
+	return c.once(v, func() (ref.Val, int) {
 		if !c.pay(length(v.Len()) / 10) {
-			return tooLarge()
+			return nil, 0
 		}
 		if jsonValues(v.Bytes()) > c.left {
 			c.over, c.left = true, 0
-			return tooLarge()
+			return nil, 0
 		}
 		var parsed any
 		if err := json.Unmarshal(v.Bytes(), &parsed); err != nil {
-			return types.NewErr("rbac: a condition can't read invalid JSON text")
+			return c.refuse(), 1
 		}
-		return c.of(reflect.ValueOf(parsed))
+		to, height := c.of(reflect.ValueOf(parsed))
+		return to, height + 1
 	})
 }
 
@@ -614,11 +565,10 @@ func jsonValues(text []byte) uint64 {
 }
 
 // number is n, a JSON number, an int where it is one and a double where it isn't, as CEL reads it,
-// at a tenth of its length whether it is one or not: parsing it reads it whole, and copies it into
-// the error where it isn't one.
+// at a tenth of its length whether it is one or not, as parsing it reads it whole, or nil.
 func (c *converter) number(n string) ref.Val {
 	if !c.pay(uint64(len(n)) / 10) {
-		return tooLarge()
+		return nil
 	}
 	if i, err := json.Number(n).Int64(); err == nil {
 		return types.Int(i)
@@ -626,105 +576,111 @@ func (c *converter) number(n string) ref.Val {
 	if f, err := json.Number(n).Float64(); err == nil {
 		return types.Double(f)
 	}
-	return types.NewErr("rbac: a condition can't read the JSON number %.64q", n)
+	return c.refuse()
 }
 
-// message is v, a protobuf message, as a condition reads it: one of the well-known types Attributes
-// names, read by its fields, each as of reads it, or an error.
-func (c *converter) message(v reflect.Value) ref.Val {
+// message is v, a protobuf message, as a condition reads it, one of the well-known types
+// Attributes names, read by its fields, each as of reads it, and how deep it nests; or nil.
+func (c *converter) message(v reflect.Value) (ref.Val, int) {
 	if v.Kind() == reflect.Pointer && v.IsNil() {
-		return types.NullValue
+		return types.NullValue, 1
 	}
 	switch m := v.Interface().(type) {
 	case *structpb.Struct:
-		return c.once(v, func() ref.Val {
+		return c.once(v, func() (ref.Val, int) {
 			if 2*uint64(len(m.GetFields())) > c.left {
 				c.over, c.left = true, 0
-				return tooLarge()
+				return nil, 0
 			}
-			out := make(map[ref.Val]ref.Val, len(m.GetFields()))
-			unreadable := false
+			out, height := make(map[ref.Val]ref.Val, len(m.GetFields())), 0
 			for k, field := range m.GetFields() {
 				key := c.spend(textLength(len(k)), types.String(k))
-				held := c.of(reflect.ValueOf(field))
-				if out[key] = held; c.over {
-					return tooLarge()
+				held, h := c.of(reflect.ValueOf(field))
+				if c.over {
+					return nil, 0
 				}
-				unreadable = unreadable || types.IsError(held)
+				out[key], height = held, max(height, h)
 			}
-			return mapOf(out, unreadable)
+			return types.NewRefValMap(types.DefaultTypeAdapter, out), height + 1
 		})
 	case *structpb.ListValue:
-		return c.once(v, func() ref.Val {
+		return c.once(v, func() (ref.Val, int) {
 			if uint64(len(m.GetValues())) > c.left {
 				c.over, c.left = true, 0
-				return tooLarge()
+				return nil, 0
 			}
-			out := make([]ref.Val, len(m.GetValues()))
+			out, height := make([]ref.Val, len(m.GetValues())), 0
 			for i, e := range m.GetValues() {
-				if out[i] = c.of(reflect.ValueOf(e)); c.over {
-					return tooLarge()
+				var h int
+				if out[i], h = c.of(reflect.ValueOf(e)); c.over {
+					return nil, 0
 				}
+				height = max(height, h)
 			}
-			return types.NewRefValList(types.DefaultTypeAdapter, out)
+			return types.NewRefValList(types.DefaultTypeAdapter, out), height + 1
 		})
 	case *structpb.Value:
+		var held reflect.Value
 		switch k := m.GetKind().(type) {
 		case *structpb.Value_NumberValue:
-			return types.Double(k.NumberValue)
+			return types.Double(k.NumberValue), 1
 		case *structpb.Value_StringValue:
-			return c.spend(uint64(len(k.StringValue))/10, types.String(k.StringValue))
+			return c.spend(uint64(len(k.StringValue))/10, types.String(k.StringValue)), 1
 		case *structpb.Value_BoolValue:
-			return types.Bool(k.BoolValue)
+			return types.Bool(k.BoolValue), 1
 		case *structpb.Value_StructValue:
-			return c.of(reflect.ValueOf(k.StructValue))
+			held = reflect.ValueOf(k.StructValue)
 		case *structpb.Value_ListValue:
-			return c.of(reflect.ValueOf(k.ListValue))
+			held = reflect.ValueOf(k.ListValue)
+		default:
+			return types.NullValue, 1
 		}
-		return types.NullValue
+		to, height := c.of(held)
+		return to, height + 1
 	case *wrapperspb.BoolValue:
-		return types.Bool(m.GetValue())
+		return types.Bool(m.GetValue()), 1
 	case *wrapperspb.BytesValue:
-		return c.spend(uint64(len(m.GetValue()))/10, types.Bytes(m.GetValue()))
+		return c.spend(uint64(len(m.GetValue()))/10, types.Bytes(m.GetValue())), 1
 	case *wrapperspb.DoubleValue:
-		return types.Double(m.GetValue())
+		return types.Double(m.GetValue()), 1
 	case *wrapperspb.FloatValue:
-		return types.Double(m.GetValue())
+		return types.Double(m.GetValue()), 1
 	case *wrapperspb.Int32Value:
-		return types.Int(m.GetValue())
+		return types.Int(m.GetValue()), 1
 	case *wrapperspb.Int64Value:
-		return types.Int(m.GetValue())
+		return types.Int(m.GetValue()), 1
 	case *wrapperspb.StringValue:
-		return c.spend(uint64(len(m.GetValue()))/10, types.String(m.GetValue()))
+		return c.spend(uint64(len(m.GetValue()))/10, types.String(m.GetValue())), 1
 	case *wrapperspb.UInt32Value:
-		return types.Uint(m.GetValue())
+		return types.Uint(m.GetValue()), 1
 	case *wrapperspb.UInt64Value:
-		return types.Uint(m.GetValue())
+		return types.Uint(m.GetValue()), 1
 	case *timestamppb.Timestamp:
-		return types.Timestamp{Time: m.AsTime()}
+		return types.Timestamp{Time: m.AsTime()}, 1
 	case *durationpb.Duration:
-		return types.Duration{Duration: m.AsDuration()}
+		return types.Duration{Duration: m.AsDuration()}, 1
 	case *anypb.Any:
-		return c.once(v, func() ref.Val {
+		return c.once(v, func() (ref.Val, int) {
 			// Finding the type hashes its URL whole, and a packed value takes as few as two bytes, as an
 			// empty one in a list does: Anys sharing a mebibyte's URL, each charged one, took a third of
 			// a millisecond each, and decoding a mebibyte of values, only to find more than a check may
 			// convert, took a tenth of a second.
 			if !c.pay(uint64(len(m.GetTypeUrl()))/10 + uint64(len(m.GetValue()))/2) {
-				return tooLarge()
+				return nil, 0
 			}
 			unpacked, ok := packable[m.MessageName()]
 			if !ok {
-				return types.NewErr("rbac: a condition can't read a packed message of type %.256q", m.GetTypeUrl())
+				return c.refuse(), 1
 			}
 			packed := unpacked()
 			if err := proto.Unmarshal(m.GetValue(), packed); err != nil {
-				return types.NewErr("rbac: a condition can't read a packed message of type %.256q", m.GetTypeUrl())
+				return c.refuse(), 1
 			}
-			return c.of(reflect.ValueOf(packed))
+			to, height := c.of(reflect.ValueOf(packed))
+			return to, height + 1
 		})
 	}
-	return cantRead(v.Type())
+	return c.refuse(), 1
 }
 
 // packable makes a new message of each type a condition reads packed in an Any, by the type's
@@ -744,20 +700,6 @@ var packable = func() map[protoreflect.FullName]func() proto.Message {
 	}
 	return made
 }()
-
-// cantRead fails a value of type t, naming no more of the type than its start, as every error
-// naming one does: each such value is charged one, whatever its type's name, which a type of many
-// fields spells out whole, and so does a map's of its key's and its values' types.
-func cantRead(t reflect.Type) ref.Val { return types.NewErr("rbac: a condition can't read a %.64s", t) }
-
-// cantKey fails a map keyed by values of type t, naming no more of t than cantRead does.
-func cantKey(t reflect.Type) ref.Val {
-	return types.NewErr("rbac: a condition can't read a map keyed by a %.64s", t)
-}
-
-func tooLarge() ref.Val {
-	return types.NewErr("rbac: the attributes a check passes are larger than a condition may read")
-}
 
 // The types an attribute can be declared as, with the Go value a host passes for each, or any
 // other converted to that type (Attributes), such as a pointer to a string, number or bool, a

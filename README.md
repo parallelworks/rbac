@@ -229,22 +229,26 @@ scopes conditional ones reach, to check one by one.
   string, an int or a uint, or by an interface holding one; JSON text (`json.RawMessage`) and
   `json.Number`, parsed; the protobuf `Struct`, `ListValue`, `Value`, `NullValue`, wrappers,
   `Timestamp` and `Duration`, and an `Any` packing one of them; and CEL's own scalar values.
-  Anything else fails whatever condition reads it, `has()`, `in` and a loop over the keys of the
-  map holding it included: a `ref.Val` of the host's own, though it says it is one of CEL's types,
-  a list, map or optional of CEL's a host makes, a struct, a channel, a func, any other message, a
-  map keyed by anything else, as a double or an array, a map holding two keys read as the same
-  value, as `1` and `1u`, invalid JSON, a value nested more than 10,000 deep, as JSON text can't be,
-  and a value holding itself, and each it holds that holds it. A list or map holding one reads the
-  rest, and a value reached twice is converted once. A check converts no more than `2 × 80,000` of
-  them, counted as reading them costs a condition, one for each value and a tenth of each string's,
-  bytes', JSON number's, JSON text's or `Any`'s type URL's length, and half an `Any`'s packed bytes,
-  about a map of 50,000 short strings: past that every condition reading an attribute fails. The
-  subject's, the resource's and the request's attributes share that, so attributes a tenant's users
-  write, as a resource's tags, can take every check of the resource past it, where a grant's
-  condition reading an attribute gives nothing and a deny's applies, whoever asks: bound what
-  users may store, or pass conditions only what they read. Comparing a value holding a double that
-  isn't finite fails, in a list or a map too. Each condition runs within the most evaluating it
-  can cost, which its literals and types bound: little for comparing what a
+  A kind's attributes, the subject's, the resource's or the request's, holding anything else,
+  however deep, can't be read as a whole, as a policy engine fails input it can't read: every
+  condition reading any of them fails, `has()` and `in` included, so a grant's gives nothing and a
+  deny's applies, while the other kinds' are read. So do those holding a `ref.Val` of the host's
+  own, though it says it is one of CEL's types, a list, map or optional of CEL's a host makes, a
+  struct, a channel, a func, any other message, a map keyed by anything else, as a double or an
+  array, a map holding two keys read as the same value, as `1` and `1u`, invalid JSON, a value
+  holding itself, or one that does, and a value nested more than 10,000 deep, as JSON text can't
+  be, along the longest path through them. A value reached twice is converted once. Reading the
+  rest left each operator to tell what it read from what it couldn't, as `in`, `has()` and loops
+  over a map's keys each found a key whose value no condition could read. A check converts no more
+  than `2 × 80,000` of them, counted as reading them costs a condition, one for each value and a
+  tenth of each string's, bytes', JSON number's, JSON text's or `Any`'s type URL's length, and half
+  an `Any`'s packed bytes, about a map of 50,000 short strings: past that every condition reading an
+  attribute fails. The subject's, the resource's and the request's attributes share that, so
+  attributes a tenant's users write, as a resource's tags, can take every check of the resource past
+  it, where a grant's condition reading an attribute gives nothing and a deny's applies, whoever
+  asks: bound what users may store, or pass conditions only what they read. Comparing a value
+  holding a double that isn't finite fails, in a list or a map too. Each condition runs within the
+  most evaluating it can cost, which its literals and types bound: little for comparing what a
   request passes with literals, or with the ids, kinds, types and tenant a check passes or its
   action, which are no longer than `MaxID`, and all a condition may for reading the size of, or
   looping over, a list the request passes, or for looking up a key the request passes in a map,

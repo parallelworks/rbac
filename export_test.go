@@ -417,6 +417,25 @@ func EvaluateCondition(t *testing.T, expr string, attributes map[string]any) (he
 	return r.held, r.evaluated, after.TotalAlloc - before.TotalAlloc, nil
 }
 
+// EvaluateConditionOf is whether expr held, and whether it could be evaluated, on a request whose
+// subject, resource and request each pass attributes of their own.
+func EvaluateConditionOf(t *testing.T, expr string, subject, resource, request map[string]any) (held, evaluated bool) {
+	t.Helper()
+	c, err := newConditions(Attributes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prg, err := c.build(expr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Authorizer{cfg: Config{Now: time.Now}, conds: c}
+	vars := a.vars(WithRequest(t.Context(), request), Subject{Principal: Principal{Kind: User, ID: "u"}, Attributes: subject}, "cluster:login",
+		Resource{Tenant: "t", Type: "cluster", ID: "c", Attributes: resource})
+	r := evaluate(prg, vars)
+	return r.held, r.evaluated
+}
+
 // MaxConverted is the most a check converts of what the host passes.
 const MaxConverted = maxConverted
 
