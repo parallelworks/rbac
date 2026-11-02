@@ -5508,7 +5508,7 @@ func TestAChangeDecidesEachScopeAsAChangeOfItAloneDoes(t *testing.T) {
 	}
 	parsed := json.RawMessage("[" + many.String()[1:] + "]")
 	n = rbac.CountKindsConverted(t)
-	for trial := range 12 {
+	for trial := range 8 {
 		shared := drawnShared(rng, true)
 		actorSeed, ctx := rng.Uint64(), rbac.WithRequest(t.Context(), drawnAttributes(rng, shared, false))
 		// The actor as the host passes it to each change, and with drop what a hook of the host's

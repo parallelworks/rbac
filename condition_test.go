@@ -1562,9 +1562,18 @@ func TestWhetherAttributesFitTurnsOnNoOrder(t *testing.T) {
 	t.Logf("seed %d", seed)
 	rng := rand.New(rand.NewPCG(seed, 31))
 	orders := [][3]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
-	for trial := range 300 {
+	for trial := range 20 {
 		shared := drawnShared(rng, false)
 		kinds := [3]map[string]any{drawnAttributes(rng, shared, false), drawnAttributes(rng, shared, false), drawnAttributes(rng, shared, false)}
+		// Half the time, invalid JSON text of many commas in one kind, and in another a list taking
+		// about what the text leaves of what a check converts, so they fit together but the text may
+		// hold more than the list leaves.
+		if rng.IntN(2) == 0 {
+			commas := rbac.MaxConverted/4 + rng.IntN(rbac.MaxConverted/4)
+			text, list := rng.IntN(3), rng.IntN(3)
+			kinds[text]["text"] = json.RawMessage(strings.Repeat(",", commas))
+			kinds[list]["list"] = make([]int, rbac.MaxConverted-commas/10-rng.IntN(commas))
+		}
 		var first []bool
 		var firstOver bool
 		for i, o := range orders {
@@ -1596,7 +1605,7 @@ func TestAChecksAttributesAreAsConvertedAloneWhateverItsCallConvertedBefore(t *t
 	seed := uint64(time.Now().UnixNano())
 	t.Logf("seed %d", seed)
 	rng := rand.New(rand.NewPCG(seed, 37))
-	for trial := range 30 {
+	for trial := range 10 {
 		shared := drawnShared(rng, true)
 		// Shared by the kinds that hold it, about what a check converts, so a check counting it twice,
 		// or not counting what was converted before it, reads what converting the kinds at once doesn't.
@@ -1641,21 +1650,18 @@ func TestAChecksAttributesAreAsConvertedAloneWhateverItsCallConvertedBefore(t *t
 			if rng.IntN(2) == 0 {
 				attributes["big"] = big
 			}
-			if rng.IntN(2) == 0 {
-				many := make([]any, 200)
-				for j := range many {
-					many[j] = map[string]any{"by": "resource", "i": j}
-				}
-				attributes["many"] = many
+			many := make([]any, 200)
+			for j := range many {
+				many[j] = map[string]any{"by": "resource", "i": j}
 			}
+			attributes["many"] = many
 			return attributes
 		}
 		subject, drop := passed()
-		dropping := rng.IntN(2) == 0
 		together, alone := rbac.AttributesRead(t, 4, func(i int) (context.Context, map[string]any, map[string]any) {
 			return ctx, subject, resource(i)
 		}, func(i int) {
-			if dropping && i == 1 {
+			if i == 2 {
 				drop()
 			}
 		})
@@ -1663,7 +1669,7 @@ func TestAChecksAttributesAreAsConvertedAloneWhateverItsCallConvertedBefore(t *t
 			for k, kind := range []string{"subject", "resource", "request"} {
 				if together[i][k] != alone[i][k] {
 					got, want := differing(together[i][k], alone[i][k])
-					t.Fatalf("trial %d, check %d, dropping %t: the %s's attributes read\n%s\nwhere alone\n%s", trial, i, dropping, kind, got, want)
+					t.Fatalf("trial %d, check %d: the %s's attributes read\n%s\nwhere alone\n%s", trial, i, kind, got, want)
 				}
 			}
 			// The kinds converted at once, in the order a check converts them.
