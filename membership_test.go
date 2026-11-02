@@ -1036,6 +1036,50 @@ func TestLeavingUnderAGenericPlanReadsOnlyWhatNamesTheLeaver(t *testing.T) {
 	}
 }
 
+// A change adding identities to a group reads only their memberships, under a generic plan too,
+// each looked up on its own: a generic plan costing a tenant's memberships as an average tenant's few
+// would read every one of them into a hash, to look each identity up there.
+func TestJoiningUnderAGenericPlanReadsOnlyTheJoinersMemberships(t *testing.T) {
+	h := generic(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), groupMembers) })
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "manager"))
+	manager := h.as(t, "manager")
+	h.groups(t, "crew")
+	h.as(t, "x")
+	h.as(t, "y")
+	joining := []rbac.Member{{Group: "crew", Principal: identity("x")}, {Group: "crew", Principal: identity("y")}}
+	read := func() map[string]int64 {
+		t.Helper()
+		pages := map[string]int64{}
+		for what, f := range map[string]func(a *rbac.Authorizer) error{
+			"ChangeMembers": func(a *rbac.Authorizer) error { return a.ChangeMembers(ctx, manager, "t1", joining, nil) },
+			"ImportMembers": func(a *rbac.Authorizer) error { return a.ImportMembers(ctx, host, "t1", joining) },
+		} {
+			func() {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				pages[what] -= pagesRead(ctx, t, tx, "rbac_memberships")
+				if err := f(h.authz.WithTx(tx)); err != nil {
+					t.Fatalf("%s: %v", what, err)
+				}
+				pages[what] += pagesRead(ctx, t, tx, "rbac_memberships")
+			}()
+		}
+		return pages
+	}
+	manyMembers(t, h, 500, `SELECT`)
+	few := read()
+	manyMembers(t, h, 4500, `SELECT`)
+	for what, many := range read() {
+		if many > few[what]*3/2+deeper {
+			t.Errorf("%s read %d pages of memberships, and %d once 4500 more were members", what, few[what], many)
+		}
+	}
+}
+
 // Activate through a nested group, and the changes ending a place in a group or a membership an
 // activation rests on, read of the grants, places, memberships and eligibilities only those of the
 // identities whose activations they make or check, and the paths up from them, under a generic plan

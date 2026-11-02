@@ -2879,13 +2879,14 @@ func (a *Authorizer) storedWhole(s Scope) error {
 
 // membersCanJoin refuses members of groups that don't exist, or identities that aren't members or
 // guests of the tenant, read under the change's locks, each on its own, as groupsExist reads them:
-// the memberships the change holds (holdJoining).
+// the memberships the change holds (holdJoining). OFFSET 0 keeps a generic plan from reading the
+// tenant's every membership into a hash to look each identity up in.
 func (a *Authorizer) membersCanJoin(ctx context.Context, tx pgx.Tx, tenant string, groups, identities []string) error {
 	rows, err := tx.Query(ctx, `
 		SELECT 'group ' || g FROM unnest($2::text[]) AS g WHERE NOT EXISTS (SELECT FROM rbac_groups WHERE tenant = $1 AND id = g OFFSET 0)
 		UNION ALL
 		SELECT 'identity ' || p FROM unnest($3::text[]) AS p WHERE NOT EXISTS (
-		  SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = p AND (expires_at IS NULL OR expires_at > $4))
+		  SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = p AND (expires_at IS NULL OR expires_at > $4) OFFSET 0)
 		ORDER BY 1`, tenant, groups, identities, a.cfg.Now())
 	if err != nil {
 		return err
