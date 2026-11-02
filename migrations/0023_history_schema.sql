@@ -10,6 +10,10 @@
 -- found before any table of pg_temp's, whatever the schema is named, and no name it was made under
 -- is kept to go stale. Setting it costs each row recorded about 0.7 microseconds, as measured on a
 -- trigger of the same settings that reads a table by name, of the 70 to 100 rbac_record takes.
+-- Where that search_path can't name the schema, history would be found in pg_temp, so each refuses
+-- the row: a search_path reads $user, however it is quoted, as a role's name, and leaves out a
+-- schema the role has no USAGE on, as history's role has none where a host left that grant out.
+-- Checking costs a row about 0.2 microseconds more.
 --
 -- No other function of the package's reads a table by a name of its own: rbac_group_members reads
 -- the tables by its caller's search_path, as the caller's statement does, so that under AsOf it
@@ -62,6 +66,12 @@ DECLARE
     was_last timestamptz;
     ended  boolean;
 BEGIN
+    -- A search_path reads $user, however it is quoted, as a role's name, and leaves out a schema
+    -- the role has no USAGE on, so history would be found in pg_temp: refused before any record.
+    IF pg_catalog.current_schema() IS DISTINCT FROM TG_TABLE_SCHEMA THEN
+        RAISE EXCEPTION 'history is not found in schema %: no search_path names a schema called $user, nor one % has no USAGE on',
+            TG_TABLE_SCHEMA, current_user USING ERRCODE = 'invalid_schema_name';
+    END IF;
     IF pg_catalog.pg_column_size(is_now) > 1048576 OR pg_catalog.octet_length(said) > 1048576 THEN
         RAISE EXCEPTION 'history records no row or change of more than 1 MiB: this % row is % bytes and its change %',
             TG_TABLE_NAME, pg_catalog.pg_column_size(is_now), pg_catalog.octet_length(said) USING ERRCODE = 'program_limit_exceeded';
@@ -108,6 +118,11 @@ DECLARE
     -- First, as the statement below finds history by it: the table it fires on.
     here text := pg_catalog.set_config('search_path', pg_catalog.quote_ident(TG_TABLE_SCHEMA) || ', pg_temp', true);
 BEGIN
+    -- As rbac_record refuses, or a prune recorded in pg_temp would let the delete through.
+    IF pg_catalog.current_schema() IS DISTINCT FROM TG_TABLE_SCHEMA THEN
+        RAISE EXCEPTION 'history is not found in schema %: no search_path names a schema called $user, nor one % has no USAGE on',
+            TG_TABLE_SCHEMA, current_user USING ERRCODE = 'invalid_schema_name';
+    END IF;
     IF OLD.txid < pg_catalog.pg_current_xact_id() AND EXISTS (SELECT FROM rbac_history p
         WHERE p.entity = 'history' AND p.txid = pg_catalog.pg_current_xact_id() AND p.op = 'prune'
           AND (OLD.txid, OLD.id) <= ((coalesce(p.after->'last', p.after->'through')->>'txid')::pg_catalog.xid8,

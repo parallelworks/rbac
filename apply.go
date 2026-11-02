@@ -2014,9 +2014,10 @@ func isolationRefused(err error) bool {
 }
 
 // repeatableRead begins on db, a DB that is neither an ownTx nor a pgx.Tx, a transaction at
-// REPEATABLE READ, as isolated does, so a read of several statements reads one snapshot; where its
-// Begin gives a savepoint of a transaction under way, which refuses that, a savepoint at that
-// transaction's isolation, as under WithTx.
+// REPEATABLE READ, so a read of several statements reads one snapshot; where its Begin gives a
+// savepoint of a transaction under way, a savepoint at that transaction's isolation, as under
+// WithTx. It sets the one level, not two as isolated does: a savepoint of a transaction at
+// REPEATABLE READ takes it, and is such a savepoint all the same, which AsOf rolls back either way.
 func repeatableRead(ctx context.Context, db DB) (pgx.Tx, error) {
 	tx, err := db.Begin(ctx)
 	if err != nil {

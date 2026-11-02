@@ -707,6 +707,87 @@ func TestHistoryIsKeptWhateverItsSchemaIsNamed(t *testing.T) {
 	}
 }
 
+// History's triggers refuse a row where the search_path each sets can't name the schema of the table
+// it fires on, rather than find history in pg_temp: a search_path reads $user, however it is quoted,
+// as a role's name, and leaves out a schema the role has no USAGE on. A session's own table named as
+// history's would take the record of each change it wrote, and a prune recorded there would let a
+// delete from history through.
+func TestHistorysTriggersRefuseASchemaTheirSearchPathCantName(t *testing.T) {
+	const write = `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'c1', 'user', $1, 'cluster.login')`
+	exec := func(t *testing.T, db rbac.DB, sql string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(t.Context(), sql, args...); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	refused := func(t *testing.T, what string, err error) {
+		t.Helper()
+		if pg := (*pgconn.PgError)(nil); !errors.As(err, &pg) || pg.Code != "3F000" {
+			t.Errorf("%s: %v", what, err)
+		}
+	}
+	t.Run("named $user", func(t *testing.T) {
+		ctx := t.Context()
+		pool := pgtest.Open(t, "")
+		if err := rbac.Migrate(ctx, pool); err != nil {
+			t.Fatal(err)
+		}
+		exec(t, pool, write, "before")
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		var schema string
+		if err := tx.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+			t.Fatal(err)
+		}
+		// Renamed in tx, which rolls it back, so no other test meets the name.
+		exec(t, tx, `CREATE TEMP TABLE rbac_history (LIKE rbac_history INCLUDING DEFAULTS INCLUDING IDENTITY)`)
+		exec(t, tx, `ALTER SCHEMA `+pgx.Identifier{schema}.Sanitize()+` RENAME TO "$user"`)
+		exec(t, tx, `SET CONSTRAINTS ALL IMMEDIATE`)
+		in := func(sqls ...string) error {
+			sp, err := tx.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = sp.Rollback(ctx) }()
+			for _, sql := range sqls {
+				if _, err := sp.Exec(ctx, sql); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		refused(t, "a change in a schema named $user", in(`INSERT INTO "$user".rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			VALUES ('t1', 'cluster', 'c1', 'user', 'after', 'cluster.login')`))
+		refused(t, "a delete from history in a schema named $user, with a prune recorded in the session's own table", in(
+			`SELECT set_config('rbac.prune', 'on', true)`,
+			`INSERT INTO pg_temp.rbac_history (effective_at, tenant, entity, key, op, after, how) VALUES (now(), '', 'history', 'k', 'prune',
+				jsonb_build_object('last', jsonb_build_object('txid', '18446744073709551615', 'id', 9223372036854775807)), '')`,
+			`DELETE FROM "$user".rbac_history WHERE principal = 'user:before'`))
+	})
+	t.Run("history's role without USAGE", func(t *testing.T) {
+		ctx := t.Context()
+		r := newReadmeRoles(t)
+		if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+			t.Fatal(err)
+		}
+		r.harden(t)
+		exec(t, r.super, `REVOKE USAGE ON SCHEMA `+r.schema+` FROM `+r.history)
+		conn, err := r.appPool.Acquire(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Release()
+		exec(t, conn, `CREATE TEMP TABLE rbac_history (LIKE rbac_history INCLUDING DEFAULTS INCLUDING IDENTITY)`)
+		exec(t, conn, `GRANT ALL ON pg_temp.rbac_history TO PUBLIC`)
+		_, err = conn.Exec(ctx, write, "u")
+		refused(t, "a change recorded by a role without USAGE on the schema", err)
+	})
+}
+
 // role makes a role with tx, dropped with it, as roles are the cluster's, and returns it, quoted,
 // and tx's schema.
 func role(t *testing.T, tx pgx.Tx) (name, schema string) {

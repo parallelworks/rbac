@@ -603,9 +603,10 @@ have the server load a library or run a program of its choosing; and:
 2. A role of history's own, which the administrator's role is a member of and the application's
    isn't, owns `rbac_history` and the function `rbac_record`: transfer them to it after migrating.
    It needs `USAGE` on the schema, since every write to the package's tables runs `rbac_record`
-   as it; `EXECUTE` on the functions `rbac_tenant_keys` and `rbac_text_array`, which history's
-   index of the keys denies name calls for each record, and which every role has unless it is
-   revoked; and `CREATE` there to be given them, unless a superuser gives them.
+   as it, which refuses the write without it; `EXECUTE` on the functions `rbac_tenant_keys` and
+   `rbac_text_array`, which history's index of the keys denies name calls for each record, and
+   which every role has unless it is revoked; and `CREATE` there to be given them, unless a
+   superuser gives them.
 3. The application's role has `USAGE` on the package's schema, without which it reads none of its
    tables; `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the package's tables but `rbac_history` and
    `rbac_migrations`, and on any a later migration adds; `EXECUTE` on the functions
@@ -632,8 +633,9 @@ after the call that made one. One named as a package's table stands in for it in
 whose checks are the application's own to make; `History`, `Export` and `PruneHistory`, and
 `AsOf`'s checks of history, name history's table by the package's schema and their types by
 pg_catalog's, so none stands in for them, and refuse a search_path that names pg_temp first. And
-history's triggers find history beside the table each fires on, whatever the schema is named, so
-none stands in for the history a change is recorded in, or a prune checked against.
+history's triggers find history beside the table each fires on, whatever the schema is named, or
+refuse the row where their search_path can't name that schema, so none stands in for the history a
+change is recorded in, or a prune checked against.
 
 ## Running it
 
@@ -745,7 +747,9 @@ none stands in for the history a change is recorded in, or a prune checked again
   and who may execute them, so history's role still owns `rbac_record`. It takes no lock on the
   tables: changes go on while it is applied, each recorded as before until it commits. Each
   function then finds history in the schema of the table it fires on, which costs a row recorded
-  about 0.7 microseconds of the 70 to 100 it takes.
+  about a microsecond of the 70 to 100 it takes, and refuses the row where its search_path can't
+  name that schema: a search_path reads `$user`, however it is quoted, as a role's name, and leaves
+  out a schema the role has no `USAGE` on.
 - **Renaming the schema:** from `0023_history_schema` on, `ALTER SCHEMA ... RENAME` keeps history:
   its triggers find it beside the table each fires on, whatever the schema is named, and a
   generation names the schema by its OID, so exports read on from their cursors and checkpoints.
@@ -755,8 +759,9 @@ none stands in for the history a change is recorded in, or a prune checked again
   reaches the tables, and then set the search_path of every role and pool to the new name: changes
   wait for each other by locks named for the schema, so one under way by the old name holds none
   back by the new, and a session still on the old name finds no tables, or tables of its own of
-  those names. Never move one of the package's tables to another schema: its changes would be
-  recorded in that schema's history, or with none there, in a session's own table of its name.
+  those names. Never name the schema `$user`, which no search_path can name: every change there is
+  refused. Never move one of the package's tables to another schema: its changes would be recorded
+  in that schema's history, or with none there, in a session's own table of its name.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A call PostgreSQL refuses for a race, as a
   serialization failure, a deadlock between host transactions, or a lock it waited for past the
