@@ -1822,6 +1822,12 @@ func TestAConditionCostsNoMoreThanItsBound(t *testing.T) {
 		{`{"dev": 1, "prod": 2}["dev"] <= request.attributes.n && [{"n": 2}].exists(r, r.n == request.attributes.n)`, true},
 		{`[[1, 2], [3]][0][1] == request.attributes.x && [1].map(x, {"a": request.attributes.tags}).exists(m, "zz" in m)`, true},
 		{"[[" + strings.Repeat("0, ", 499) + "0]].all(l, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(i, \"a\".startsWith(dyn(l))))", true},
+		// A search of what isn't a string fails without reading it, and one with an empty side costs
+		// reading the other, or for startsWith and endsWith the empty one.
+		{"[[" + strings.Repeat("0, ", 499) + "0]].all(l, dyn(l).contains(dyn(l)))", true},
+		{`"abc".contains("") && "".contains("abc") && "".startsWith("") && "abc".endsWith("")`, true},
+		{`"` + strings.Repeat("ab", 100) + `".contains("` + strings.Repeat("ab", 50) + `z")`, true},
+		{`request.attributes.ip.startsWith("") || "".endsWith(request.attributes.ip) || "10.".startsWith(request.attributes.ip)`, true},
 		{`"gpu" in request.attributes.tags`, false},
 		{`request.attributes.team in {"sre": true}`, false},
 		{`size(request.attributes.tags) > 0`, false},
@@ -1833,13 +1839,14 @@ func TestAConditionCostsNoMoreThanItsBound(t *testing.T) {
 		{`[1,2,3,4,5,6,7,8].all(a, [1,2,3,4,5,6,7,8].all(b, [1,2,3,4,5,6,7,8].all(c, [1,2,3,4,5,6,7,8].all(d, a > 0))))`, false},
 		{`request.attributes.tags.map(t, "gpu").exists(t, t == "gpu")`, false},
 		{`["a", "b"].map(x, request.attributes.team).exists(t, t.contains("s"))`, false},
+		{`request.attributes.ip.contains("") || "".contains(request.attributes.ip)`, false},
+		{`request.attributes.tags.exists(t, t.contains(request.attributes.ip))`, false},
 		{`request.attributes.tags.filter(t, t != "").exists(t, t == "gpu")`, false},
 		// CEL checks a dyn() value that meets another as of the other's type, which it needn't have.
 		{`(dyn([{"a": 1}]) + [[]]).exists(m, request.attributes.n in m)`, false},
 		{`(dyn([request.attributes.tags]) + [1])[0] == request.attributes.tags`, false},
 		{`(dyn([{"a": request.attributes.tags}]) + [{"a": 1}]).exists(m, m.a == request.attributes.tags)`, false},
 		{`(dyn([[request.attributes.tags]]) + [""]).exists(s, s + s == request.attributes.tags)`, false},
-		{"[[" + strings.Repeat("0, ", 499) + "0]].all(l, dyn(l).contains(dyn(l)))", false},
 		// A map's keys don't bound what they index, and what may be a map or a list finds a key by it.
 		{`{"a": request.attributes.tags}["a"] == request.attributes.tags`, false},
 		{`[[1], {"a": 1}].exists(v, request.attributes.ip in v)`, false},
@@ -1918,7 +1925,8 @@ func TestALoopsStepsTakeNoLongerForTheStepsBefore(t *testing.T) {
 // only literals, or what it loops over only in the branch it takes, so a loop over a list the host
 // passes cost nothing for each element, however long. Each step costs at least 1, and a loop
 // taking more steps than its condition may cost stops as one costing more does. A loop whose steps
-// are charged costs as it did.
+// are charged costs as it did, but filter() 1 more for each element it keeps, which it adds as a
+// list literal of one (TestALiteralCostsWhatItBuilds).
 func TestALoopsStepsCostAtLeastOneEach(t *testing.T) {
 	falses := func(n int) map[string]any { return map[string]any{"l": make([]any, n)} }
 	for _, expr := range []string{
@@ -1946,10 +1954,33 @@ func TestALoopsStepsCostAtLeastOneEach(t *testing.T) {
 		{`request.attributes.l.all(z, z || !z)`, 5004},
 		{`request.attributes.l.exists(z, z && !z)`, 6004},
 		{`request.attributes.l.exists_one(z, z) || true`, 3006},
-		{`request.attributes.l.filter(z, z).size() == 500`, 8518},
+		{`request.attributes.l.filter(z, z).size() == 500`, 9018},
 	} {
 		if _, cost := rbac.ConditionCost(t, c.expr, map[string]any{"l": l}); cost != c.cost {
 			t.Errorf("%s cost %d, not %d", c.expr, cost, c.cost)
+		}
+	}
+}
+
+// CEL charges a logical operator or a choice nothing, nor a literal it reads, though evaluating one
+// takes about as long as a unit of cost does, so a loop whose steps each evaluated two hundred took
+// twenty times what it was charged. A step costs at least 1 more for each its condition and step may
+// evaluate, its macro's own among them, and the bound counts each.
+func TestALoopsStepCostsEachLogicalOperatorItEvaluates(t *testing.T) {
+	ands := strings.TrimSuffix(strings.Repeat("true && ", 200), " && ")
+	ors := strings.TrimSuffix(strings.Repeat("false || ", 100), " || ")
+	choices := strings.Repeat("false ? false : ", 12) + "true"
+	attributes := map[string]any{"l": make([]any, 30)}
+	for expr, least := range map[string]uint64{
+		`request.attributes.l.all(z, ` + ands + `)`:                      30 * (1 + 1 + 199),
+		`request.attributes.l.exists(z, !(` + choices + `))`:             30 * (1 + 1 + 12),
+		`request.attributes.l.map(z, ` + ors + `).size() == 30`:          30 * (1 + 99),
+		`[1, 2, 3].all(i, !request.attributes.l.exists(z, ` + ors + `))`: 3 * 30 * (1 + 1 + 99),
+		"[" + strings.Repeat("0, ", 29) + "0].all(z, " + ands + ")":      30 * (1 + 1 + 199),
+	} {
+		limit, cost := rbac.ConditionCost(t, expr, attributes)
+		if cost < least || cost > limit {
+			t.Errorf("%s... cost %d, bounded at %d", expr[:50], cost, limit)
 		}
 	}
 }
@@ -2016,6 +2047,97 @@ func TestAKeyCostsItsLength(t *testing.T) {
 		_, short := rbac.ConditionCost(t, expr, map[string]any{"s": ""})
 		if _, cost := rbac.ConditionCost(t, expr, map[string]any{"s": s}); cost-short != uint64(len(long))/10 {
 			t.Errorf("%s with a key of %d bytes as a %T cost %d, and with an empty one %d", expr, len(long), s, cost, short)
+		}
+	}
+}
+
+// CEL charges contains a tenth of each side's characters, multiplied, and startsWith and endsWith a
+// tenth of what they look for, each rounded up: nothing where a side is empty, though counting the
+// characters copies the other side whole, so a check whose conditions called contains("") in loops
+// on a string of a mebibyte and a half the request passed took twenty seconds, each condition within
+// its bound. contains costs what reading both sides does, multiplied, and startsWith and endsWith
+// what reading the shorter does, each at least 1, so an empty side costs what a short one does, and
+// no character is counted.
+func TestASearchOfAStringCostsWhatItReads(t *testing.T) {
+	ten := "[" + strings.Repeat("0, ", 9) + "0]"
+	attributes := map[string]any{"s": strings.Repeat("x", 500)}
+	for search, least := range map[string]uint64{
+		`request.attributes.s.contains(%q)`: 51, `%q.contains(request.attributes.s)`: 51,
+		`request.attributes.s.startsWith(%q)`: 1, `%q.startsWith(request.attributes.s)`: 1,
+		`request.attributes.s.endsWith(%q)`: 1, `%q.endsWith(request.attributes.s)`: 1,
+	} {
+		looped := func(side string) string { return ten + ".all(i, " + fmt.Sprintf(search, side) + " || true)" }
+		limit, empty := rbac.ConditionCost(t, looped(""), attributes)
+		_, short := rbac.ConditionCost(t, looped("z"), attributes)
+		if empty != short || empty < 10*least || empty > limit {
+			t.Errorf("%s cost %d ten times, %d with a side of one character, bounded at %d", fmt.Sprintf(search, ""), empty, short, limit)
+		}
+	}
+	long := map[string]any{"s": strings.Repeat("x", 600_000)}
+	for _, expr := range []string{
+		`request.attributes.s.contains("")`, `"".contains(request.attributes.s)`, `request.attributes.s.startsWith(request.attributes.s)`,
+		`"".endsWith(request.attributes.s) && request.attributes.s.contains("x")`,
+	} {
+		if _, _, allocated, err := rbac.EvaluateCondition(t, expr, long); err != nil || allocated > 64<<10 {
+			t.Errorf("%s on a string of %d bytes allocated %d bytes: %v", expr, 600_000, allocated, err)
+		}
+	}
+}
+
+// contains of a string the request passes in another tries each place in it, comparing as much of
+// what it looks for as matches there: one of a mebibyte in another of half that, matching far at each
+// of many places, took a third of a second, though a call is charged only once it has run, and so
+// did every condition reading them so in a check. A search costing more than a condition may is
+// refused before it runs.
+func TestASearchCostingMoreThanAConditionMayIsRefusedBeforeItRuns(t *testing.T) {
+	n := rbac.CountSearches(t)
+	block := "ab" + strings.Repeat("c", 15)
+	attributes := map[string]any{"s": strings.Repeat(block, 6000), "sub": strings.Repeat(block, 300) + "z"}
+	for _, expr := range []string{
+		`request.attributes.s.contains(request.attributes.sub)`, `request.attributes.s.contains("")`,
+		`request.attributes.s.startsWith(request.attributes.s)`, `request.attributes.s.endsWith(request.attributes.s)`,
+	} {
+		*n = 0
+		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || evaluated {
+			t.Errorf("%s: evaluated %t, %v", expr, evaluated, err)
+		}
+		if *n > 0 {
+			t.Errorf("%s ran %d searches past what a condition may cost", expr, *n)
+		}
+	}
+	// Within its cost a search runs, so a count of none above is one refused.
+	*n = 0
+	expr := `request.attributes.sub.startsWith("ab") && request.attributes.sub.contains("z") && request.attributes.sub.endsWith("z")`
+	if held, _, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || !held || *n != 3 {
+		t.Errorf("searches within their cost: held %t, ran %d, %v", held, *n, err)
+	}
+}
+
+// CEL charges a list literal 10 and a map literal 30 however many elements or entries they hold, so
+// a loop rebuilding a list of 700 or a map of 230 at each step took ten times what a condition
+// charged as much takes. A literal costs 1 more for each element it builds, and 2 for each entry,
+// which the map hashes too, each time it is built, and its bound counts them alike.
+func TestALiteralCostsWhatItBuilds(t *testing.T) {
+	ten := "[" + strings.Repeat("0, ", 9) + "0]"
+	list := func(n int) string { return "[" + strings.Repeat("1, ", n-1) + "1]" }
+	dict := func(n int) string {
+		entries := make([]string, n)
+		for i := range entries {
+			entries[i] = fmt.Sprintf("%d: 1", i)
+		}
+		return "{" + strings.Join(entries, ", ") + "}"
+	}
+	for _, c := range []struct {
+		literal func(int) string
+		each    uint64
+	}{{list, 1}, {dict, 2}} {
+		looped := func(n int) string { return fmt.Sprintf("%s.all(i, size(%s) == %d)", ten, c.literal(n), n) }
+		bound, cost := rbac.ConditionCost(t, looped(1), nil)
+		for _, n := range []int{100, 200} {
+			more := 10 * c.each * uint64(n-1)
+			if b, got := rbac.ConditionCost(t, looped(n), nil); got != cost+more || b != bound+more {
+				t.Errorf("%s cost %d, bounded at %d, and with one element %d, bounded at %d", looped(n)[:60], got, b, cost, bound)
+			}
 		}
 	}
 }
@@ -2426,6 +2548,24 @@ func TestAKeyFoldedIntoADoubleThatIsntFiniteIsNoCondition(t *testing.T) {
 	}
 }
 
+// A list or map literal that CEL plans as no literal, or where no decorator sees it, as another
+// version of CEL may, isn't a condition: it would build what it holds uncharged.
+func TestALiteralPlannedOtherwiseIsNoCondition(t *testing.T) {
+	for _, expr := range []string{`size([1, 2, 3]) == 3`, `{"a": 1}["a"] == 1`, `request.attributes.ip in ["10.0.0.1"]`} {
+		for how, replan := range map[string]func(interpreter.InterpretableV2) interpreter.InterpretableV2{
+			"as something else": func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, i.ID()} },
+			"under another id":  func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, -i.ID()} },
+		} {
+			if err := rbac.PlanLiteralsOtherwise(t, expr, replan); err == nil {
+				t.Errorf("%s with its literal planned %s is a condition", expr, how)
+			}
+		}
+		if err := rbac.PlanLiteralsOtherwise(t, expr, func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return i }); err != nil {
+			t.Errorf("%s planned as CEL plans it: %v", expr, err)
+		}
+	}
+}
+
 // A conversion to a string where string() has no binding a program can find, as another version of
 // CEL may bind one only once it runs, isn't a condition: it would convert a double that isn't finite
 // unchecked.
@@ -2498,6 +2638,38 @@ func TestALoopOfMoreStepsThanItsConditionMayCostFails(t *testing.T) {
 		}
 		if allowed(t, h, v, login, r) != within {
 			t.Errorf("a deny's condition looping over %d elements applied: %t", n, within)
+		}
+	}
+}
+
+// A literal costs for each element it builds, so a condition rebuilding one at each step of a loop
+// can cost more than a condition may, as one stored when a literal was charged as one now does: it
+// fails, so a grant's gives nothing and a deny's applies.
+func TestAConditionWhoseLiteralsCostMoreThanItMayFails(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
+	})
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+	ten := "[" + strings.Repeat("0, ", 9) + "0]"
+	for n, within := range map[int]bool{10: true, 90: false} {
+		rebuilt := fmt.Sprintf("%s.all(i, %s.all(j, size([%s1]) == %d))", ten, ten, strings.Repeat("1, ", n-1), n)
+		u, v := h.as(t, fmt.Sprint("u", n)), h.as(t, fmt.Sprint("v", n))
+		g := grant(cluster.Scope(), "cluster.login", rbac.User, u.Principal.ID)
+		g.Condition = rbac.Condition{Expression: rebuilt}
+		h.seed(t, g, grant(cluster.Scope(), "cluster.login", rbac.User, v.Principal.ID))
+		d := rbac.Deny{
+			ID: v.Principal.ID, Principals: []rbac.Principal{v.Principal}, Permissions: []rbac.Permission{login},
+			Condition: rbac.Condition{Expression: "!(" + rebuilt + ")"},
+		}
+		if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, d); err != nil {
+			t.Fatal(err)
+		}
+		if allowed(t, h, u, login, cluster) != within {
+			t.Errorf("a grant's condition rebuilding a list of %d at each step held: %t", n, !within)
+		}
+		if allowed(t, h, v, login, cluster) != within {
+			t.Errorf("a deny's condition rebuilding a list of %d at each step applied: %t", n, within)
 		}
 	}
 }
@@ -2588,42 +2760,53 @@ func TestAConditionReadingTheIDsACheckPassesCostsLittle(t *testing.T) {
 // A stored condition's bound is computed again in each process, from what the CEL it is built with
 // makes of it, so another version of CEL can move the bounds of conditions already stored and leave
 // what a check reads together past one. These pin the bounds of conditions of common shapes, so an
-// upgrade that moves one shows.
+// upgrade that moves one shows. This package's own charges move them too: a literal costs 1 for each
+// element and 2 for each entry it builds, and a logical operator or a choice 1, so most were bounded
+// a few units higher, and one rebuilding a literal of hundreds at each step of a loop at all a
+// condition may cost, which fails where it costs more
+// (TestAConditionWhoseLiteralsCostMoreThanItMayFails). Conditions a scope holds past the bound so are
+// evaluated cheapest first within a check's budget
+// (TestACheckSpendsABoundedBudgetOnConditionsStoredAroundTheBounds), and a change among them adding
+// none isn't refused (TestAChangePastTheBoundIsRefusedOnlyForAConditionItAdds).
 func TestStoredConditionsKeepTheirBounds(t *testing.T) {
 	for _, c := range []struct {
 		expr  string
 		bound uint64
 	}{
 		{`request.attributes.mfa == true`, 8},
-		{`request.attributes.ip == "10.0.0.1" || request.attributes.ip == "10.0.0.2"`, 16},
-		{`resource.attributes.env != "prod" && subject.id in ["a", "b", "c"]`, 27},
-		{`request.time < timestamp("2027-01-01T00:00:00Z") && request.time.getHours("America/New_York") >= 9`, 116},
-		{`request.attributes.ip.startsWith("10.") && "abcdefghijk".contains("bc")`, 9},
+		{`request.attributes.ip == "10.0.0.1" || request.attributes.ip == "10.0.0.2"`, 17},
+		{`resource.attributes.env != "prod" && subject.id in ["a", "b", "c"]`, 31},
+		{`request.time < timestamp("2027-01-01T00:00:00Z") && request.time.getHours("America/New_York") >= 9`, 117},
+		{`request.attributes.ip.startsWith("10.") && "abcdefghijk".contains("bc")`, 10},
+		{`request.attributes.ip.endsWith("") || "10.0.0.0/8".startsWith(request.attributes.ip)`, 16},
 		{`"abc".matches("^a(b|c){2}$")`, 11},
-		{`has(request.attributes.mfa) && request.attributes.x != null`, 14},
-		{`dyn(request.attributes)["team"] == "sre" && [1, 2, 3][1] == 2`, 23},
-		{`(request.attributes.mfa ? request.attributes.team : "none") == "sre"`, 14},
-		{`[request.attributes.x] == [1] && {"a": request.attributes.x} == {"a": 1}`, 99},
-		{`[1, 2] + [3] == [1, 2, 3] && "a" + "b" == "ab" && size("abc") == 3 && action == "cluster:login"`, 52},
-		{`int("12") == 12 && string(1) == "1" && duration("1h") > duration("1m")`, 14},
-		{`[1, 2, 3].all(i, i > 0) && [1, 2, 3].exists_one(i, i == 2) && {"a": 1}.exists(k, k == "a")`, 128},
-		{`[[1, 2], [3]].all(l, l.all(i, i > 0))`, 86},
-		{`[1, 2, 3].map(x, x > 1, x * 2) == [4, 6]`, 108},
-		{`[1, 2].map(x, "ab").all(s, s.contains("a"))`, 70},
-		{`["10.0.0.1", "10.0.0.2"].filter(ip, ip.startsWith("10.")).exists(ip, request.attributes.ip == ip)`, 100},
-		{`[["10.0.0.1"], ["10.0.0.2"]].exists(g, request.attributes.ip in g) && "time" in request`, 70},
-		{`{"dev": 1, "prod": 2}["dev"] <= request.attributes.n`, 44},
+		{`has(request.attributes.mfa) && request.attributes.x != null`, 15},
+		{`dyn(request.attributes)["team"] == "sre" && [1, 2, 3][1] == 2`, 27},
+		{`(request.attributes.mfa ? request.attributes.team : "none") == "sre"`, 15},
+		{`[request.attributes.x] == [1] && {"a": request.attributes.x} == {"a": 1}`, 106},
+		{`[1, 2] + [3] == [1, 2, 3] && "a" + "b" == "ab" && size("abc") == 3 && action == "cluster:login"`, 61},
+		{`int("12") == 12 && string(1) == "1" && duration("1h") > duration("1m")`, 16},
+		{`[1, 2, 3].all(i, i > 0) && [1, 2, 3].exists_one(i, i == 2) && {"a": 1}.exists(k, k == "a")`, 145},
+		{`[[1, 2], [3]].all(l, l.all(i, i > 0))`, 97},
+		{`[1, 2, 3].map(x, x > 1, x * 2) == [4, 6]`, 119},
+		{`[1, 2].map(x, "ab").all(s, s.contains("a"))`, 76},
+		{`["10.0.0.1", "10.0.0.2"].filter(ip, ip.startsWith("10.")).exists(ip, request.attributes.ip == ip)`, 108},
+		{`[["10.0.0.1"], ["10.0.0.2"]].exists(g, request.attributes.ip in g) && "time" in request`, 77},
+		{`{"dev": 1, "prod": 2}["dev"] <= request.attributes.n`, 48},
 		{`request.time.getHours(subject.attributes.zone) >= 9`, 112},
-		{`[{"level": 2}, {"level": 3}].exists(r, r.level == request.attributes.n)`, 112},
+		{`[{"level": 2}, {"level": 3}].exists(r, r.level == request.attributes.n)`, 120},
 		// The ids, kinds, types and tenant a check passes are of at most MaxID bytes, and its action a
 		// permission's.
 		{`resource.attributes.owner == subject.id`, 63},
-		{`resource.id.startsWith(subject.id) && resource.tenant == subject.attributes.dept`, 123},
-		{`subject.kind + ":" + resource.type in {"user:cluster": true} && subject.id.matches("^svc-")`, 672},
-		{`action in {"cluster:login": true, "cluster:read": true}`, 46},
-		{`[resource.attributes].exists(subject, subject.owner == .subject.id)`, 83},
-		{`{"alice": true, "bob": false}[subject.id]`, 87},
+		{`resource.id.startsWith(subject.id) && resource.tenant == subject.attributes.dept`, 124},
+		{`subject.kind + ":" + resource.type in {"user:cluster": true} && subject.id.matches("^svc-")`, 675},
+		{`action in {"cluster:login": true, "cluster:read": true}`, 50},
+		{`[resource.attributes].exists(subject, subject.owner == .subject.id)`, 85},
+		{`{"alice": true, "bob": false}[subject.id]`, 91},
 		{`"gpu" in request.attributes.tags`, 10000},
+		{`request.attributes.tags.exists(t, t.contains(request.attributes.query))`, 10000},
+		// Each step rebuilds the list, which was bounded at 2,082 while a literal cost 10 however long.
+		{"[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(i, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(j, size([" + strings.Repeat("1,", 699) + "1]) == 700))", 10000},
 		{`{"dev": 1, "prod": 2}[resource.attributes.env] <= request.attributes.n`, 10000},
 		{`request.attributes.tags.exists(t, t == "gpu")`, 10000},
 	} {
