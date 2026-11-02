@@ -6385,3 +6385,76 @@ func TestARemovalEndsNoActivationThatEndedWhileItWaited(t *testing.T) {
 		})
 	}
 }
+
+// SetMemberships holds, before it reads the time it decides at, the places it removes of the
+// memberships that had ended at its reading before its transaction, not those of every membership
+// with an end: here a host's transaction deleting crew holds v's place there, which neither setting
+// v's membership again while it is in force waits for, nor ending it once it ended in between, which
+// is tried again instead. Waiting for it, having read its time, a change decides at a time the wait
+// left behind.
+func TestSettingMembershipsHoldsOnlyThePlacesItRemoves(t *testing.T) {
+	for name, c := range map[string]struct {
+		// ends is when v's membership ends: the change reads 12:00 before its transaction and 13:00 in
+		// it.
+		ends time.Duration
+		want error
+	}{
+		"in force":          {ends: 2 * time.Hour},
+		"ending in between": {ends: 30 * time.Minute, want: rbac.ErrConflict},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var clock atomic.Int64
+			var stepping atomic.Bool
+			h := grouped(t, func(cfg *rbac.Config) {
+				cfg.Now = func() time.Time {
+					at := time.Unix(0, clock.Load()).UTC()
+					if stepping.Load() {
+						clock.Add(int64(time.Hour))
+					}
+					return at
+				}
+			})
+			clock.Store(h.now.UnixNano())
+			ctx := t.Context()
+			v := h.as(t, "v", "crew")
+			if _, err := h.pool.Exec(ctx, `UPDATE rbac_memberships SET expires_at = $1 WHERE tenant = 't1' AND principal = 'user:v'`, h.now.Add(c.ends)); err != nil {
+				t.Fatal(err)
+			}
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+			if err := h.authz.WithTx(tx).DeleteGroups(ctx, host, "t1", []string{"crew"}); err != nil {
+				t.Fatal(err)
+			}
+			var pid int32
+			if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+				t.Fatal(err)
+			}
+			stepping.Store(true)
+			done := make(chan error, 1)
+			go func() {
+				done <- h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: v.Principal, ExpiresAt: h.now.Add(3 * time.Hour)}})
+			}()
+			for deadline := time.Now().Add(10 * time.Second); ; {
+				select {
+				case err := <-done:
+					if !errors.Is(err, c.want) {
+						t.Errorf("SetMemberships = %v, not %v", err, c.want)
+					}
+					return
+				default:
+				}
+				var waiting bool
+				if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
+					t.Fatal(err)
+				}
+				if waiting || time.Now().After(deadline) {
+					_ = tx.Rollback(ctx)
+					t.Fatalf("SetMemberships waited for v's place in crew: %v", <-done)
+				}
+			}
+		})
+	}
+}

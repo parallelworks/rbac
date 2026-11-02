@@ -242,13 +242,19 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 		leaving := lockedAnyOf("rbac_members", "ctid", placeOrder, byKeys("rbac_members", "ctid", "principal", `(
 			  ARRAY(SELECT principal FROM rbac_memberships WHERE tenant = $1 AND principal = ANY($2::text[]) AND expires_at <= $3 FOR UPDATE)
 			  || ARRAY(SELECT k FROM unnest($2::text[]) AS k WHERE NOT EXISTS (SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = k OFFSET 0)))`))
-		// The places of every membership with an end, which may have ended by the time the change
-		// decides at, are held before it reads that time, as are the activations resting on a
-		// membership it makes end: a wait for them would leave the time behind.
-		if _, err := tx.Exec(ctx, `SELECT FROM rbac_members WHERE `+leaving, tenant, keys, storedTime(pastLatest)); err != nil {
+		// The places of the memberships that had ended at the time the change picks what it holds by
+		// (earlier) are held before it reads the time it decides at, as are the activations resting on
+		// a membership it makes end: a wait for them would leave the time behind. Not those of every
+		// membership with an end, any of which could have ended by then: a host setting again the ends
+		// of a thousand members in fifty groups each would hold 50,000 places it leaves as they are,
+		// and wait for any a group's deletion holds. The places of one that ends in between, which it
+		// doesn't hold, the removal takes without waiting (NOWAIT), and where another transaction holds
+		// one, the change is tried again (ErrConflict).
+		was := a.clock.earlier()
+		if _, err := tx.Exec(ctx, `SELECT FROM rbac_members WHERE `+leaving, tenant, keys, was); err != nil {
 			return ChangeEvent{}, nil, err
 		}
-		r, err := a.restingOn(ctx, tx, tenant, ending, nil, a.clock.earlier())
+		r, err := a.restingOn(ctx, tx, tenant, ending, nil, was)
 		if err != nil {
 			return ChangeEvent{}, nil, err
 		}
@@ -267,7 +273,8 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 				return ChangeEvent{}, nil, err
 			}
 		}
-		left, err := removedWhere(ctx, a, tx, "rbac_members", memberColumns, collectMembers, leaving, tenant, keys, at)
+		left, err := removedWhere(ctx, a, tx, "rbac_members", memberColumns, collectMembers,
+			strings.ReplaceAll(leaving, "FOR UPDATE", "FOR UPDATE NOWAIT"), tenant, keys, at)
 		if err != nil {
 			return ChangeEvent{}, nil, err
 		}
