@@ -4579,23 +4579,29 @@ func (e valueWrapError) Unwrap() error { return e.err }
 // A hook's error whose tree holds itself, as a host's type wrapping itself by mistake can, through
 // Unwrap or joined beside itself, is read round only so far, and from then on each of its errors
 // once, wherever a call reads it, and the call returns: matching ErrConflict where it holds a race,
-// as errors.As reads one, ErrConflict first in what the call returns, so errors.Is finds it there;
-// and a change ValidateGrant refuses beside it is refused as invalid, which OnRefused is told of,
-// but of no other. Each kind of error runs in a child process, so one read forever, or until the
-// stack overflows, which kills the process, fails this test rather than the test binary, and each
-// call there is given a while.
+// as errors.As reads one, or ErrConflict, before itself or after, ErrConflict first in what the call
+// returns, so errors.Is finds it there, as it wouldn't past the error holding itself; and a change
+// ValidateGrant refuses beside it is refused as invalid, which OnRefused is told of, but of no
+// other. Each kind of error runs in a child process, so one read forever, or until the stack
+// overflows, which kills the process, fails this test rather than the test binary, and each call
+// there is given a while.
 func TestAHooksErrorHoldingItselfIsReadOnce(t *testing.T) {
 	if how := os.Getenv("RBAC_HOOK_ERROR_HOLDING_ITSELF"); how != "" {
 		// So that reading it forever overflows the stack in a moment rather than a gigabyte.
 		debug.SetMaxStack(64 << 20)
 		var pg *pgconn.PgError
-		race := strings.HasSuffix(how, "a race")
-		if race {
+		var held error
+		switch {
+		case strings.Contains(how, "a race"):
 			pg = &pgconn.PgError{Code: "40P01", Message: "deadlock detected"}
+			held = pg
+		case strings.Contains(how, "a conflict"):
+			held = fmt.Errorf("an earlier change: %w", rbac.ErrConflict)
 		}
+		race := held != nil
 		hookErr := error(&wrapsItselfError{pg})
 		if strings.HasPrefix(how, "joining") {
-			hookErr = &joinsItselfError{pg}
+			hookErr = &joinsItselfError{held, strings.HasSuffix(how, "after")}
 		}
 		down, lost := rbac.Scope{Type: "cluster", ID: "down"}, rbac.Scope{Type: rbac.GroupScope, ID: "lost"}
 		manager := rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}
@@ -4690,7 +4696,7 @@ func TestAHooksErrorHoldingItselfIsReadOnce(t *testing.T) {
 		return
 	}
 	pgtest.URL(t)
-	for _, how := range []string{"wrapping a race", "joining a race", "wrapping", "joining"} {
+	for _, how := range []string{"wrapping a race", "joining a race", "joining a race after", "joining a conflict after", "wrapping", "joining"} {
 		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestAHooksErrorHoldingItselfIsReadOnce$", "-test.v")
 		cmd.Env = append(os.Environ(), "RBAC_HOOK_ERROR_HOLDING_ITSELF="+how)
@@ -4717,16 +4723,22 @@ func (e *wrapsItselfError) As(target any) bool {
 	return false
 }
 
-// joinsItselfError joins PostgreSQL's error, if any, and itself.
-type joinsItselfError struct{ pg *pgconn.PgError }
+// joinsItselfError joins itself and the error it holds, if any, before it or after.
+type joinsItselfError struct {
+	held  error
+	after bool
+}
 
 func (*joinsItselfError) Error() string { return "joins itself" }
 
 func (e *joinsItselfError) Unwrap() []error {
-	if e.pg == nil {
+	switch {
+	case e.held == nil:
 		return []error{e}
+	case e.after:
+		return []error{e, e.held}
 	}
-	return []error{e.pg, e}
+	return []error{e.held, e}
 }
 
 func TestPublicAccess(t *testing.T) {
