@@ -329,6 +329,14 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 			return ChangeEvent{}, err
 		}
 		held()
+		// So is its activation of the role there, which it sets again, after the places, as every
+		// change holds grants: a change ending a place or a membership holds every activation of the
+		// identities it ends them for, through a place this one rests on or not, as one that ended,
+		// and DeleteExpired one that ended.
+		if _, err := tx.Exec(ctx, `SELECT FROM rbac_grants WHERE tenant = $1 AND principal = $2 AND scope = $3 AND role = $4
+			AND source = 'activation' FOR UPDATE`, on.Tenant, s.Principal.key(), scope.Key(), act.Role); err != nil {
+			return ChangeEvent{}, err
+		}
 		if err := a.stillStanding(ctx, tx, on.Tenant, stand); err != nil {
 			return ChangeEvent{}, err
 		}

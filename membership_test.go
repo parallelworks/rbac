@@ -6205,6 +6205,27 @@ func TestATimeAChangeWaitedPastIsTheTimeItDecidesAt(t *testing.T) {
 			},
 			want: rbac.ErrDenied,
 		},
+		"Activate again through an eligibility that ended, behind a removal holding the activation": {
+			// The removal of crew's ended place in outer holds the activations of crew's members,
+			// w's among them, but no place w rests one on: w waits for its activation alone.
+			hold: func(f *fixture) func(*rbac.Authorizer) error {
+				if _, err := f.h.authz.Activate(f.h.ctx, f.w, cluster, rbac.Activation{Role: "cluster.login", Duration: 3 * time.Minute, Justification: "x"}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := f.h.pool.Exec(f.h.ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, expires_at)
+					VALUES ('t1', 'outer', 'group', 'crew', $1)`, f.h.now.Add(-time.Hour)); err != nil {
+					t.Fatal(err)
+				}
+				return func(a *rbac.Authorizer) error {
+					return a.DeleteMembers(f.h.ctx, host, "t1", []rbac.Member{{Group: "outer", Principal: groupOf("crew")}})
+				}
+			},
+			change: func(f *fixture) error {
+				_, err := f.h.authz.Activate(f.h.ctx, f.w, cluster, rbac.Activation{Role: "cluster.login", Duration: 5 * time.Minute, Justification: "x"})
+				return err
+			},
+			want: rbac.ErrDenied,
+		},
 		"DeleteGroup by an actor whose power ended": {
 			hold:   func(f *fixture) func(*rbac.Authorizer) error { return activate(f.w) },
 			change: func(f *fixture) error { return f.h.authz.DeleteGroup(f.h.ctx, f.temp, "t1", "crew") },
