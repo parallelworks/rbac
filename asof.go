@@ -273,12 +273,21 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 // last version as of the prune's time, which an earlier time would read as the row's version
 // then, or as no row. Of the prunes' times, the last is that of the last record by key, which
 // holds its prune's time as text that sorts as time, so history's index finds it alone: no
-// prune's record is removed, and every AsOf would otherwise read them all, twice.
+// prune's record is removed, and every AsOf would otherwise read them all, twice. With sorting off,
+// as no other index gives that order: where history's statistics hold no prune, the planner would
+// read them all by history's index of prunes to sort them, as History would (prunedPast).
 func unpruned(ctx context.Context, tx pgx.Tx, schema string, at time.Time) error {
+	restore, err := unsorted(ctx, tx)
+	if err != nil {
+		return err
+	}
 	var pruned bool
 	if err := tx.QueryRow(ctx, `SELECT coalesce($1::pg_catalog.timestamptz < (SELECT (h.after->>'before')::pg_catalog.timestamptz
 		FROM `+historyTable(schema)+` h WHERE h.tenant = '' AND h.entity = 'history' AND h.op = 'prune' ORDER BY h.key DESC LIMIT 1), false)`,
 		at).Scan(&pruned); err != nil {
+		return err
+	}
+	if err := restore(); err != nil {
 		return err
 	}
 	if pruned {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"slices"
 	"testing"
 	"time"
 
@@ -222,6 +223,93 @@ func TestMigrateRecordsEachMigrationAsItCommits(t *testing.T) {
 				t.Error("migrating again built no index")
 			}
 		})
+	}
+}
+
+// No function of the package's keeps the name its schema had when it was made, which a rename would
+// leave naming no schema, or another installation's, as rbac_record's and rbac_history_pruned's
+// search_paths did: migrated from none, or with every migration from 0004 on pending, as for an
+// installation a host's own tool first migrated, whose functions those migrations replace.
+func TestNoFunctionKeepsItsSchemasName(t *testing.T) {
+	for _, from := range []string{"", "0004"} {
+		t.Run(fmt.Sprintf("from=%q", from), func(t *testing.T) {
+			ctx := t.Context()
+			pool := pgtest.Open(t, "")
+			if from != "" {
+				migrateFiles(t, pool, "", from)
+				recordMigrations(t, pool, from)
+				if _, err := pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+					VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'cluster.login')`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := rbac.Migrate(ctx, pool); err != nil {
+				t.Fatal(err)
+			}
+			rows, err := pool.Query(ctx, `SELECT p.proname || ' ' || array_to_string(p.proconfig, ', ') FROM pg_proc p
+				WHERE p.pronamespace = current_schema()::regnamespace AND p.proconfig IS NOT NULL ORDER BY p.proname`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			settings, err := pgx.CollectRows(rows, pgx.RowTo[string])
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []string{
+				"rbac_history_append_only search_path=pg_catalog, pg_temp",
+				"rbac_history_pruned search_path=pg_catalog, pg_temp",
+				"rbac_record search_path=pg_catalog, pg_temp, TimeZone=UTC, plan_cache_mode=force_generic_plan, enable_seqscan=off",
+			}
+			if !slices.Equal(settings, want) {
+				t.Errorf("the package's functions are set as %q, want %q", settings, want)
+			}
+		})
+	}
+}
+
+// Migrate on a host's transaction waits as long as that transaction's lock_timeout says, and leaves
+// it so, through a host's wrapper around the transaction too, whose Begin gives a savepoint of it
+// that can set the isolation it is at again: taken for a transaction of its own, the savepoint was
+// bounded, and kept lock_timeout at 100 ms in the host's transaction once Migrate returned.
+func TestMigrateOnAHostsTransactionLeavesItsLockTimeout(t *testing.T) {
+	names, err := fs.Glob(rbac.Migrations(), "*.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := names[len(names)-1]
+	for name, wrap := range map[string]func(pgx.Tx) rbac.DB{
+		"the host's transaction":                  func(tx pgx.Tx) rbac.DB { return tx },
+		"a wrapper around the host's transaction": func(tx pgx.Tx) rbac.DB { return hostTx{tx} },
+	} {
+		for _, timeout := range []string{"0", "5s"} {
+			t.Run(fmt.Sprintf("%s/%s", name, timeout), func(t *testing.T) {
+				ctx := t.Context()
+				pool := pgtest.Open(t, "")
+				migrateFiles(t, pool, "", last)
+				recordMigrations(t, pool, last)
+				tx, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				if _, err := tx.Exec(ctx, `SELECT set_config('lock_timeout', $1, true)`, timeout); err != nil {
+					t.Fatal(err)
+				}
+				if err := rbac.Migrate(ctx, wrap(tx)); err != nil {
+					t.Fatalf("Migrate on %s: %v", name, err)
+				}
+				var after string
+				if err := tx.QueryRow(ctx, `SELECT current_setting('lock_timeout')`).Scan(&after); err != nil {
+					t.Fatal(err)
+				}
+				if after != timeout {
+					t.Errorf("Migrate on %s left its lock_timeout at %q, not %q", name, after, timeout)
+				}
+				if v := migratedTo(t, tx); v != latestMigration(t) {
+					t.Errorf("migrated to %d", v)
+				}
+			})
+		}
 	}
 }
 

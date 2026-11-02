@@ -310,7 +310,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) (_ 
 	}
 	// Its label values are those its grants on the tenant give, read with these, so a label is
 	// decided by what it held as it held them.
-	held, ds, roles, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), namedRoles, false)
+	held, ds, roles, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), namedRoles)
 	if err != nil {
 		return nil, err
 	}
@@ -393,11 +393,13 @@ func (rs *runs) of(ctx context.Context, a *Authorizer, s Subject, r Resource, he
 // keeps, or all where it is nil, decided by held and ds, s's grants and denies on r's path, and the
 // roles they name, read together; and of them, those a condition decided, a grant's or a deny's,
 // or a constraint asked without the request's attributes, which a read without the request can't
-// settle; and the exclusive dimensions s holds none of, as its grants on the tenant could give it
-// two (excludedBy). It reads on q the conditions not read with the grants, and asks the
-// constraints through cs, which is on r, so a change reads them back in its transaction. It shares
-// shared, where not nil, with the decisions before and after it by the same grants and denies on
-// the same request (runs).
+// settle; and the exclusive dimensions s holds none of, as held could give it two (excludedBy).
+// Only roles for the tenant alone give values (Authorizer.current), so those remove values only
+// from what is listed on the tenant, where held is what a check of a value reads. It reads on q
+// the conditions not read with the grants, and asks the constraints through cs, which is on r, so
+// a change reads them back in its transaction. It shares shared, where not nil, with the decisions
+// before and after it by the same grants and denies on the same request (runs). A holding passes
+// held and roles narrowed to what gives values (labeling), so its walk reads each role once.
 func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resource, only func(Permission) bool, cs *constrained,
 	held []holding, ds []denial, roles book, shared *runs,
 ) ([]Permission, map[Permission]bool, map[string]bool, error) {
@@ -821,12 +823,13 @@ func (a *Authorizer) holders(ctx context.Context, p Permission, r Resource, role
 	}, through...)
 	// A privileged role gives nothing through the tenant's members or the public. The grants on the
 	// path are read once, and of the custom roles those that they name (namedCustom).
+	alone := a.labelPermission(p)
 	rows, err := a.db.Query(ctx, `WITH held AS MATERIALIZED (`+byKey("$2", "rbac_grants", "scope", "id::text AS id, principal_kind, principal_id, conditional, role", `
 		  tenant = $1 AND (expires_at IS NULL OR expires_at > $4) AND (NOT $5 OR principal_kind <> ALL($6::text[]))`)+`)
 		SELECT id, principal_kind, principal_id, conditional FROM held
-		WHERE role = ANY(`+givingSQL("$3", "$1", "$7", "$8", custom, namedCustom("SELECT role FROM held"), false)+`)
-		  AND (principal_kind <> $10 OR role = ANY(`+givingSQL("$9", "$1", "$7", "$8", custom, "$11", true)+`))
-		  AND (principal_kind <> ALL($6::text[]) OR role = ANY(`+givingSQL("$12", "$1", "$7", "$8", custom, "$13", false)+`))
+		WHERE role = ANY(`+givingSQL("$3", "$1", "$7", "$8", custom, namedCustom("SELECT role FROM held"), false, alone)+`)
+		  AND (principal_kind <> $10 OR role = ANY(`+givingSQL("$9", "$1", "$7", "$8", custom, "$11", true, alone)+`))
+		  AND (principal_kind <> ALL($6::text[]) OR role = ANY(`+givingSQL("$12", "$1", "$7", "$8", custom, "$13", false, alone)+`))
 		ORDER BY principal_kind, principal_id, id`, args...)
 	if err != nil {
 		return nil, err
@@ -1168,13 +1171,14 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 	}, through...)
 	// The subject's grants on scopes of the types are read once, and of the custom roles those that
 	// they name (namedCustom).
+	alone := a.labelPermission(p)
 	rows, err := a.db.Query(ctx, `
 		WITH held AS MATERIALIZED (`+a.byType("$5", "g.scope, g.conditional, g.role, g.principal", `
 		  g.tenant = $1 AND g.principal = ANY($2::text[]) AND (g.expires_at IS NULL OR g.expires_at > $4)`)+`)
 		SELECT scope, bool_and(conditional) FROM held
-		WHERE role = ANY(`+givingSQL("$3", "$1", "$8", "$9", custom, namedCustom("SELECT role FROM held"), false)+`)
-		  AND (principal <> $6 OR role = ANY(`+givingSQL("$7", "$1", "$8", "$9", custom, "$10", true)+`))
-		  AND (`+narrowKey("principal")+` OR role = ANY(`+givingSQL("$11", "$1", "$8", "$9", custom, "$12", false)+`))
+		WHERE role = ANY(`+givingSQL("$3", "$1", "$8", "$9", custom, namedCustom("SELECT role FROM held"), false, alone)+`)
+		  AND (principal <> $6 OR role = ANY(`+givingSQL("$7", "$1", "$8", "$9", custom, "$10", true, alone)+`))
+		  AND (`+narrowKey("principal")+` OR role = ANY(`+givingSQL("$11", "$1", "$8", "$9", custom, "$12", false, alone)+`))
 		GROUP BY scope ORDER BY scope`, args...)
 	if err != nil {
 		return Reach{}, err
@@ -1266,11 +1270,12 @@ type Columns struct {
 	// leaves it out.
 	Path string
 	// Labels is a text[] holding the resource's label as `dimension:value` values, never NULL: '{}'
-	// for none. The label's test, which keeps only the rows the subject's holding satisfies,
-	// compares them in the default collation and needs no index: an index on the column could serve
-	// it only by reading every row it holds, so the path's index drives the query. With labels
-	// declared the column is needed, so Filter refuses a call without it as invalid: pass
-	// '{}'::text[] for a type whose resources carry no label.
+	// for none. The label's test, which keeps only the rows the subject's holding satisfies, looks
+	// each of a row's values up, byte for byte, in objects the query builds once, so it costs a row a
+	// few comparisons for each of its values however many the dimensions declare. It needs no index:
+	// an index on the column could serve it only by reading every row it holds, so the path's index
+	// drives the query. With labels declared the column is needed, so Filter refuses a call without
+	// it as invalid: pass '{}'::text[] for a type whose resources carry no label.
 	Labels string
 }
 
@@ -1317,7 +1322,7 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 		return Predicate{}, err
 	}
 	counts := a.counting(p, resourceType)
-	custom := a.customGives(p, resourceType)
+	custom, alone := a.customGives(p, resourceType), a.labelPermission(p)
 	if removed || s.Principal == (Principal{}) && !counts.public || len(roles) == 0 && !custom {
 		return Predicate{SQL: "FALSE"}, nil
 	}
@@ -1328,7 +1333,7 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 		perm, wildcard = listed, covering
 	}
 	keys := func(of string) string { return filterKeys(arg, of) }
-	grants := func(types string) string { return a.filterGrants(arg, custom, types) }
+	grants := func(types string) string { return a.filterGrants(arg, custom, alone, types) }
 	// The denies on scopes of the types in the array types that bind the subject (bindingDenies).
 	narrow := counted("FALSE", "FALSE")
 	denies := func(types string) string {
@@ -1402,7 +1407,7 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 			string(p), resourceType,
 		}, through...), counts.public, perm, wildcard, denied, counts.members)
 	}
-	resources, containers, err := a.grantCounts(ctx, custom, a.contains(resourceType), filterArgs(above))
+	resources, containers, err := a.grantCounts(ctx, custom, alone, a.contains(resourceType), filterArgs(above))
 	if err != nil {
 		return Predicate{}, err
 	}
@@ -1550,8 +1555,13 @@ func ofType(col, t string) string {
 // for each depth a path can have, which has no bound, and one inside a subquery over a row's keys
 // is built again for every row. jsonb_exists_any is the operator `?|`, which a host's query builder
 // could read as a placeholder. It is NULL where col is, which Filter's test of a row's type needs.
-func keyed(col, scopes string) string {
-	return fmt.Sprintf(`jsonb_exists_any((SELECT coalesce(jsonb_object_agg(s, true), '{}') FROM (%s) AS k(s)), %s)`, scopes, col)
+func keyed(col, scopes string) string { return keyedWith("jsonb_exists_any", col, scopes) }
+
+// keyedWith is keyed testing the keys of col with exists: jsonb_exists_any, or jsonb_exists_all,
+// the operator `?&`, for whether every one is a scope scopes selects, as those of an empty col are.
+// Each passes over a NULL key.
+func keyedWith(exists, col, scopes string) string {
+	return fmt.Sprintf(`%s((SELECT coalesce(jsonb_object_agg(s, true), '{}') FROM (%s) AS k(s)), %s)`, exists, scopes, col)
 }
 
 // maxOverlap is how many grants on resources of a type Filter overlaps with each row's path:
@@ -1577,10 +1587,11 @@ func filterKeys(arg func(int) string, of string) string {
 // collation overrides where a comparison doesn't name one: unconditional, in force, of the roles
 // that give the permission, the public's only of public ones and the broad principals' of none
 // privileged. It reads the subject's grants there once (filterHeld), and of the custom roles those
-// that they name (namedCustom). arg numbers Filter's arguments.
-func (a *Authorizer) filterGrants(arg func(int) string, custom bool, types string) string {
+// that they name (namedCustom), with alone only those givingSQL reads so. arg numbers Filter's
+// arguments.
+func (a *Authorizer) filterGrants(arg func(int) string, custom, alone bool, types string) string {
 	return `WITH held AS MATERIALIZED (` + a.filterHeld(arg, types) + `)
-		SELECT scope COLLATE "default" FROM held WHERE ` + filterCounted(arg, custom)
+		SELECT scope COLLATE "default" FROM held WHERE ` + filterCounted(arg, custom, alone)
 }
 
 // filterHeld is SQL selecting the subject's grants filterGrants reads, as held.
@@ -1590,13 +1601,13 @@ func (a *Authorizer) filterHeld(arg func(int) string, types string) string {
 }
 
 // filterCounted is SQL for whether filterGrants counts a grant of held.
-func filterCounted(arg func(int) string, custom bool) string {
+func filterCounted(arg func(int) string, custom, alone bool) string {
 	return fmt.Sprintf(`role = ANY(%s)
 		  AND (principal <> %s::text OR role = ANY(%s))
 		  AND (%s OR role = ANY(%s))`,
-		givingSQL(arg(3), arg(1), arg(8), arg(9), custom, namedCustom("SELECT role FROM held"), false), arg(6),
-		givingSQL(arg(7), arg(1), arg(8), arg(9), custom, arg(10), true),
-		narrowKey("principal"), givingSQL(arg(11), arg(1), arg(8), arg(9), custom, arg(12), false))
+		givingSQL(arg(3), arg(1), arg(8), arg(9), custom, namedCustom("SELECT role FROM held"), false, alone), arg(6),
+		givingSQL(arg(7), arg(1), arg(8), arg(9), custom, arg(10), true, alone),
+		narrowKey("principal"), givingSQL(arg(11), arg(1), arg(8), arg(9), custom, arg(12), false, alone))
 }
 
 // grantCounts counts, with Filter's arguments args, the grants its condition counts (filterGrants)
@@ -1605,7 +1616,7 @@ func filterCounted(arg func(int) string, custom bool) string {
 // the form. Grants the condition doesn't count, as of roles that don't give the permission, or a
 // broad principal's that give nothing, counted would trade an index that finds the few rows its
 // grants reach for a read of every row of the tenant.
-func (a *Authorizer) grantCounts(ctx context.Context, custom, container bool, args []any) (resources, containers int, err error) {
+func (a *Authorizer) grantCounts(ctx context.Context, custom, alone, container bool, args []any) (resources, containers int, err error) {
 	// The arguments the count reads, numbered from $1 as it first reads each.
 	var read []any
 	at := map[int]int{}
@@ -1622,12 +1633,12 @@ func (a *Authorizer) grantCounts(ctx context.Context, custom, container bool, ar
 	// form. Both counts read one materialized held, so the subject's grants are read once.
 	count := func(types string, limit int) string {
 		if !custom {
-			return fmt.Sprintf(`(SELECT count(*) FROM (%s LIMIT %d) g)`, a.filterGrants(arg, false, types), limit)
+			return fmt.Sprintf(`(SELECT count(*) FROM (%s LIMIT %d) g)`, a.filterGrants(arg, false, false, types), limit)
 		}
 		return fmt.Sprintf(`(WITH held AS MATERIALIZED (%[1]s) SELECT CASE
 			WHEN (SELECT count(*) FROM (SELECT FROM held WHERE %[2]s LIMIT %[4]d) g) = %[4]d THEN %[4]d
 			ELSE (SELECT count(*) FROM (SELECT FROM held WHERE %[3]s LIMIT %[4]d) g) END)`,
-			a.filterHeld(arg, types), filterCounted(arg, false), filterCounted(arg, true), limit)
+			a.filterHeld(arg, types), filterCounted(arg, false, false), filterCounted(arg, true, alone), limit)
 	}
 	onResources := "0"
 	if !container {
@@ -1671,18 +1682,18 @@ const (
 	heldTenantRoles
 )
 
-// heldOrDenied is readHeld of the grants, the denies of any permission and the roles alone, and
-// with ending, when each grant's holding ends.
-func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Subject, counts broad, scopes []string, roles rolesRead,
-	ending bool,
+// heldOrDenied is readHeld of the grants, the denies of any permission and the roles alone.
+func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Subject, counts broad, scopes []string,
+	roles rolesRead,
 ) ([]holding, []denial, book, error) {
-	got, err := a.readHeld(ctx, q, tenant, s, counts, scopes, "", roles, alsoRead{ending: ending})
+	got, err := a.readHeld(ctx, q, tenant, s, counts, scopes, "", roles, alsoRead{})
 	return got.held, got.ds, got.roles, err
 }
 
 // alsoRead is what else readHeld reads in its statement.
 type alsoRead struct {
-	// ending is when each grant's holding ends, as a change hands on nothing past it.
+	// ending is when each grant's holding ends, as a change hands on nothing past it, and the denies
+	// binding the subject that it is exempt from only until a time (exemption), with when.
 	ending bool
 	// values is what the subject's label values are decided by (valuesRead), whatever counts and p
 	// are, so they are of the moment its other grants are. The scopes hold the tenant's.
@@ -1699,6 +1710,9 @@ type grantsRead struct {
 	// values is set with alsoRead.values, and keys read with alsoRead.keys.
 	values *valuesRead
 	keys   []string
+	// exempt are, with alsoRead.ending, the denies binding the subject that it is exempt from only
+	// until a time.
+	exempt []exemption
 }
 
 // valuesRead is what a subject's label values are decided by: its grants on its tenant, and the
@@ -1777,13 +1791,19 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 		keyed = "TRUE"
 	}
 	forP := read + ` AND ($5 = '' OR $5 = ANY(permissions) OR $6 = ANY(permissions)) AND EXISTS (SELECT FROM keys WHERE ` + counted("$7", "$8") + `)`
-	// In the statement, so they are of the moment its grants are.
-	var places, ends string
+	// In the statement, so they are of the moment its grants are, as are the denies binding it that
+	// exempt it only until a time, read with when, by the paths to the keys exempting it, in the read
+	// of those binding it: in the statement's text, so a check plans none of it.
+	var places, ends, kept string
+	exempt, until := ` AND NOT exempt && ARRAY(SELECT k FROM exempted)`, `NULL::timestamptz AS until`
 	if with.ending {
-		places = `, ` + endsSQL("$2::text", "$4")
+		places = `, ` + endsSQL("$2::text", "$4") + `, ` + lastingSQL("$1::text", "$2::text")
 		ends = `
 		UNION ALL
 		SELECT 3, k, '', '', '', e, false, NULL, '', NULL, false, false, NULL, '', '', false FROM ends`
+		exempt, kept = ` AND NOT exempt && `+exemptForGoodSQL, ` WHERE binds OR until IS NOT NULL`
+		until = `NOT exempt && ARRAY(SELECT k FROM exempted) AS binds, CASE WHEN exempt && ARRAY(SELECT k FROM exempted) THEN ` +
+			exemptUntilSQL("principals", "exempt") + ` END AS until`
 	}
 	// In the statement's text rather than an argument: a generic plan can't tell from one whether
 	// to read every role of the tenant or look up those the grants name. Those are looked up a key at
@@ -1813,10 +1833,10 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 		SELECT 0, id, principal, scope, role, expires_at, conditional, NULL::text[], '', NULL::text[], false, false, NULL::text[], '', '', counts
 		FROM held
 		UNION ALL
-		SELECT 1, id, id, scope, '', NULL, condition <> '', permissions, condition, NULL, false, false, NULL, '', '', counts
-		FROM (`+byKey("$3", "rbac_denies", "scope", "id, scope, permissions, condition, "+forP+" AS counts", `tenant = $1
-		  AND principals && ARRAY(SELECT k FROM bound) AND NOT exempt && ARRAY(SELECT k FROM exempted)
-		  AND (`+forP+` OR `+values+` AND scope = 'tenant:' || $1)`)+`) d
+		SELECT 1, id, id, scope, '', until, condition <> '', permissions, condition, NULL, false, false, NULL, '', '', counts
+		FROM (`+byKey("$3", "rbac_denies", "scope", "id, scope, permissions, condition, "+forP+" AS counts, "+until, `tenant = $1
+		  AND principals && ARRAY(SELECT k FROM bound)`+exempt+`
+		  AND (`+forP+` OR `+values+` AND scope = 'tenant:' || $1)`)+`) d`+kept+`
 		UNION ALL
 		SELECT 2, id, '', '', id, NULL, false, permissions, '', resource_types, privileged, public, grantable_roles, name, description, false
 		FROM `+customRoles+ends+`
@@ -1841,6 +1861,13 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 			d := denial{id: id, scope: scope, condition: condition}
 			for _, x := range perms {
 				d.permissions = append(d.permissions, Permission(x))
+			}
+			// One it is exempt from until a time binds it only from then on, so nothing it decides now.
+			if expires != nil {
+				if ofP {
+					got.exempt = append(got.exempt, exemption{denial: d, until: *expires})
+				}
+				return nil
 			}
 			if ofP {
 				got.ds = append(got.ds, d)

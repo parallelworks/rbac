@@ -126,8 +126,10 @@ func (c Checkpoint) Digest() [sha256.Size]byte {
 // service: one that signs any digest it is given could be made to sign a checkpoint's. An ECDSA
 // key on P-256, P-384 or P-521, or an RSA key of at least 3072 bits, signs the digest as a SHA-256
 // hash (RSA with PKCS #1 v1.5, or PSS with a salt as long as the hash); an Ed25519 key signs the
-// digest itself.
-func (c Checkpoint) Sign(signer crypto.Signer) (Checkpoint, error) {
+// digest itself. A signer's error holding PostgreSQL's refusal for a race, as of a read of its key,
+// matches ErrConflict, as a hook's does.
+func (c Checkpoint) Sign(signer crypto.Signer) (_ Checkpoint, err error) {
+	defer conflicting(&err)
 	d := c.Digest()
 	pub := signer.Public()
 	opts := crypto.SignerOpts(crypto.SHA256)
@@ -225,7 +227,8 @@ func VerifyChain(from Checkpoint, records []Record, to Checkpoint, pub crypto.Pu
 // anew from its genesis: the last export's records are what history held up to its last
 // checkpoint, whatever the new one holds, as a superuser can make History refuse a cursor by
 // deleting its record.
-func (a *Authorizer) Export(ctx context.Context, from Checkpoint, limit int, signer crypto.Signer) ([]Record, Checkpoint, error) {
+func (a *Authorizer) Export(ctx context.Context, from Checkpoint, limit int, signer crypto.Signer) (_ []Record, _ Checkpoint, err error) {
+	defer conflicting(&err)
 	zero := from.Count == 0 && from.Cursor == (Cursor{})
 	switch {
 	case signer == nil:

@@ -2,9 +2,15 @@ package rbac
 
 import (
 	"context"
+	"fmt"
 	"maps"
+	"os"
+	"regexp"
 	"runtime"
 	"slices"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,7 +19,196 @@ import (
 	"cel.dev/cel-go/common/types/ref"
 	"cel.dev/cel-go/interpreter"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/parallelworks/rbac/internal/pgtest"
 )
+
+// Every change a test makes holds all it waits for before it reads the time it decides at.
+func init() {
+	watched = func(tx pgx.Tx, c *callClock) (pgx.Tx, func(error) error) {
+		w := &clockWatched{Tx: tx, clock: c}
+		if conn := tx.Conn(); conn != nil {
+			w.pid = conn.PgConn().PID()
+		}
+		rowWaits.push(w)
+		return w, func(err error) error {
+			if waited := rowWaits.pop(w); waited != "" {
+				panic("rbac: a change waits for a row lock once it has read the time it decides at: " + strings.Join(strings.Fields(waited), " "))
+			}
+			return err
+		}
+	}
+}
+
+// clockWatched is a change's transaction, which panics on a statement that may wait for a lock once
+// the change has read the time it decides at (callClock): a wait would leave that time behind. A
+// write's own locks show nowhere in its text, as an upsert's on the row it conflicts with, a
+// foreign key's on the group or a delete's on a row the change never held, nor do a trigger's:
+// rowWaits sees those waits as they happen, which needs another transaction to hold the row
+// meanwhile.
+type clockWatched struct {
+	pgx.Tx
+	clock *callClock
+	// pid is the change's session; read, once the change has read its time, and waited, the
+	// statement it waited for a row in, are rowWaits'.
+	pid    uint32
+	read   bool
+	waited string
+}
+
+var (
+	// rowLock is a row-locking clause, and noWait what after one keeps it from waiting.
+	rowLock = regexp.MustCompile(`(?i)\bFOR\s+(NO\s+KEY\s+UPDATE|UPDATE|KEY\s+SHARE|SHARE)\b`)
+	noWait  = regexp.MustCompile(`(?i)^\s+(NOWAIT|SKIP\s+LOCKED)\b`)
+	// write is a statement that writes, whose own locks take again what the change holds.
+	write = regexp.MustCompile(`(?i)\b(DELETE\s+FROM|INSERT\s+INTO|UPDATE\s+\w+(\s+AS\s+\w+)?\s+SET)\b`)
+)
+
+func (w *clockWatched) check(ctx context.Context, sql string) {
+	if !w.clock.read {
+		return
+	}
+	rowWaits.read(ctx, w)
+	if write.MatchString(sql) {
+		return
+	}
+	waits := strings.Contains(sql, "pg_advisory_xact_lock")
+	for _, at := range rowLock.FindAllStringIndex(sql, -1) {
+		waits = waits || !noWait.MatchString(sql[at[1]:])
+	}
+	if waits {
+		panic("rbac: a change locks once it has read the time it decides at: " + strings.Join(strings.Fields(sql), " "))
+	}
+}
+
+// rowWaits watches, on a connection of its own, the sessions of the changes that have read their
+// time, for a wait on a row: for another transaction to end, as one holding the row does, or to
+// finish inserting a key. A wait on a relation, as for a migration, or for its extension, is none
+// a change could take first. It polls each millisecond while any change is so, and sees a wait that
+// lasts longer.
+var rowWaits = &waitWatch{by: map[uint32][]*clockWatched{}, woken: make(chan struct{}, 1)}
+
+type waitWatch struct {
+	mu sync.Mutex
+	// by is each session's changes, innermost last: one made in another's OnChange runs on its
+	// session, and its waits are its own.
+	by    map[uint32][]*clockWatched
+	once  sync.Once
+	woken chan struct{}
+}
+
+func (ww *waitWatch) push(w *clockWatched) {
+	if w.pid == 0 {
+		return
+	}
+	ww.mu.Lock()
+	defer ww.mu.Unlock()
+	ww.by[w.pid] = append(ww.by[w.pid], w)
+}
+
+// pop ends watching w, and returns the statement it waited for a row in, if any.
+func (ww *waitWatch) pop(w *clockWatched) string {
+	ww.mu.Lock()
+	defer ww.mu.Unlock()
+	ws := ww.by[w.pid]
+	if i := slices.Index(ws, w); i >= 0 {
+		ws = slices.Delete(ws, i, i+1)
+	}
+	if len(ws) == 0 {
+		delete(ww.by, w.pid)
+	} else {
+		ww.by[w.pid] = ws
+	}
+	return w.waited
+}
+
+// read marks w as having read its time, from when its waits count. The watch outlives the change
+// that starts it, so it keeps none of its context's cancellation.
+func (ww *waitWatch) read(ctx context.Context, w *clockWatched) {
+	if w.pid == 0 {
+		return
+	}
+	ww.mu.Lock()
+	was := w.read
+	w.read = true
+	ww.mu.Unlock()
+	if was {
+		return
+	}
+	ww.once.Do(func() { go ww.watch(context.WithoutCancel(ctx), os.Getenv(pgtest.URLEnv)) })
+	select {
+	case ww.woken <- struct{}{}:
+	default:
+	}
+}
+
+func (ww *waitWatch) watch(ctx context.Context, database string) {
+	conn, err := pgx.Connect(ctx, database)
+	if err != nil {
+		return
+	}
+	for {
+		ww.mu.Lock()
+		var pids []int32
+		var watching []*clockWatched
+		for pid, ws := range ww.by {
+			if w := ws[len(ws)-1]; w.read {
+				pids, watching = append(pids, int32(pid)), append(watching, w)
+			}
+		}
+		ww.mu.Unlock()
+		if len(pids) == 0 {
+			<-ww.woken
+			continue
+		}
+		rows, err := conn.Query(ctx, `SELECT pid, query FROM pg_stat_activity WHERE pid = ANY($1)
+			AND wait_event_type = 'Lock' AND wait_event IN ('transactionid', 'tuple', 'speculative token')`, pids)
+		if err != nil {
+			return
+		}
+		waiting := map[int32]string{}
+		var pid int32
+		var query string
+		if _, err := pgx.ForEachRow(rows, []any{&pid, &query}, func() error {
+			waiting[pid] = query
+			return nil
+		}); err != nil {
+			return
+		}
+		// Only a change still innermost on its session since before the read waited there.
+		ww.mu.Lock()
+		for i, w := range watching {
+			if q, ok := waiting[pids[i]]; ok && w.waited == "" && slices.Index(ww.by[w.pid], w) == len(ww.by[w.pid])-1 {
+				w.waited = "(session " + strconv.Itoa(int(pids[i])) + ") " + q
+			}
+		}
+		ww.mu.Unlock()
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func (w *clockWatched) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	w.check(ctx, sql)
+	return w.Tx.Exec(ctx, sql, args...)
+}
+
+func (w *clockWatched) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	w.check(ctx, sql)
+	return w.Tx.Query(ctx, sql, args...)
+}
+
+func (w *clockWatched) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	w.check(ctx, sql)
+	return w.Tx.QueryRow(ctx, sql, args...)
+}
+
+func (w *clockWatched) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	for _, q := range b.QueuedQueries {
+		w.check(ctx, q.SQL)
+	}
+	return w.Tx.SendBatch(ctx, b)
+}
 
 // SetSavepointEnd bounds a savepoint's release or rollback by d until t ends.
 func SetSavepointEnd(t *testing.T, d time.Duration) {
@@ -21,6 +216,31 @@ func SetSavepointEnd(t *testing.T, d time.Duration) {
 	old := savepointEnd
 	savepointEnd = d
 	t.Cleanup(func() { savepointEnd = old })
+}
+
+// Transacted is whether a change on db runs in a transaction of its own, rather than in a savepoint
+// of the host's, as Migrate tells them apart, and the isolation it runs at.
+func Transacted(ctx context.Context, db DB) (own bool, level string, err error) {
+	err = beginOwn(ctx, db, func(tx pgx.Tx, fresh bool) error {
+		own = fresh
+		return tx.QueryRow(ctx, `SELECT current_setting('transaction_isolation')`).Scan(&level)
+	})
+	return own, level, err
+}
+
+// Snapshotted is whether a read of several statements on a's DB runs in a transaction of its own,
+// rather than on the host's, and the isolation it reads at, with read only where it does.
+func Snapshotted(ctx context.Context, a *Authorizer) (own bool, level string, err error) {
+	level, err = snapshot(ctx, a, func(b *Authorizer) (string, error) {
+		own = b != a
+		var level, readOnly string
+		err := b.db.QueryRow(ctx, `SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')`).Scan(&level, &readOnly)
+		if readOnly == "on" {
+			level += ", read only"
+		}
+		return level, err
+	})
+	return own, level, err
 }
 
 // SetMigrateAttempts has Migrate try each migration at most n times, waiting backoff before the
@@ -172,8 +392,8 @@ func ExcludedOn(t *testing.T, a *Authorizer, actor Subject, on []Resource) (toge
 
 // LabelValuesDecided is, for each of labels, the values it asks for that actor holds in tenant on
 // ctx's request: decided together, as a change checking them all by one read of what the actor's
-// values are decided by decides them, label after label; and each alone, as a check of it decides
-// them by a read of its own.
+// values are decided by decides them, label after label; and each alone, by a read of its own, of
+// every grant it holds on the tenant and every permission of their roles.
 func LabelValuesDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subject, tenant string, labels []Label) (together, alone [][]Permission) {
 	t.Helper()
 	together, alone, _, _ = HoldingDecided(t, ctx, a, actor, tenant, labels)
@@ -183,8 +403,8 @@ func LabelValuesDecided(t *testing.T, ctx context.Context, a *Authorizer, actor 
 // HoldingDecided is LabelValuesDecided, and then all that actor holds: its label values and powers
 // to release, and "excluding <dimension>" for each exclusive dimension it holds none of. Decided by
 // the same read once the labels are, as a change checking them and then whether the actor's values
-// satisfy every label decides them (clearsAll); and alone, by a read of its own, as Holding decides
-// them.
+// satisfy every label decides them (clearsAll); and alone, by a read of its own of every grant and
+// permission.
 func HoldingDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subject, tenant string, labels []Label) (together, alone [][]Permission, all, whole []string) {
 	t.Helper()
 	a = a.still()
@@ -192,39 +412,13 @@ func HoldingDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subj
 	if err != nil {
 		t.Fatal(err)
 	}
-	asked := func(h Holding, l Label) []Permission {
-		var held []Permission
-		for _, p := range slices.Sorted(maps.Keys(a.askedBy(l))) {
-			if dim, value := p.parts(); h.values[dim][value] {
-				held = append(held, p)
-			}
-		}
-		return held
-	}
-	everything := func(h Holding) []string {
-		var held []string
-		for _, p := range h.Values() {
-			held = append(held, string(p))
-		}
-		for _, dim := range slices.Sorted(maps.Keys(h.releases)) {
-			if h.releases[dim] {
-				held = append(held, string(ReleasePermission(dim)))
-			}
-		}
-		for _, dim := range slices.Sorted(maps.Keys(h.excluded)) {
-			if h.excluded[dim] {
-				held = append(held, "excluding "+dim)
-			}
-		}
-		return held
-	}
 	c := a.constrain(ctx, actor, tenantResource(tenant))
 	for _, l := range labels {
 		h, err := c.decidedBy(ctx, a.db, v, a.askedBy(l))
 		if err != nil {
 			t.Fatal(err)
 		}
-		together = append(together, asked(h, l))
+		together = append(together, a.heldOf(h, l))
 	}
 	h, err := c.decidedBy(ctx, a.db, v, nil)
 	if err != nil {
@@ -232,17 +426,97 @@ func HoldingDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subj
 	}
 	all = everything(h)
 	for _, l := range labels {
-		h, _, err := a.holdingFor(ctx, tenant, actor, &valuesRead{held: v.held, ds: v.ds, roles: v.roles}, l)
+		h, err := a.walkingEvery(ctx, actor, tenant, v, l)
 		if err != nil {
 			t.Fatal(err)
 		}
-		alone = append(alone, asked(h, l))
+		alone = append(alone, a.heldOf(h, l))
 	}
-	h, _, err = a.holdingOf(ctx, tenant, actor, &valuesRead{held: v.held, ds: v.ds, roles: v.roles})
+	h, err = a.walkingEvery(ctx, actor, tenant, v, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return together, alone, all, everything(h)
+}
+
+// LabeledChecksDecided is, for each of labels and then for every label, what actor holds in tenant
+// on ctx's request of the values each asks for, as HoldingDecided writes them, or the error deciding
+// them returned: as a check of a resource it labels decides them (holdingFor), and Reachable and
+// Holding every one (holdingOf), by a read narrowed to the grants giving values and of their roles
+// those (labeling); and by a read of every grant actor holds on the tenant and every permission of
+// their roles. Each is decided by a read and asks of the constraints of its own, as checks are.
+func LabeledChecksDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subject, tenant string, labels []Label) (narrowed, full []string) {
+	t.Helper()
+	a = a.still()
+	v, err := a.valuesOn(ctx, a.db, tenant, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decided := func(h Holding, l Label, err error) string {
+		switch {
+		case err != nil:
+			return "error: " + err.Error()
+		case l == nil:
+			return strings.Join(everything(h), " ")
+		}
+		return fmt.Sprint(a.heldOf(h, l), h.excluded)
+	}
+	read := func() *valuesRead { return &valuesRead{held: v.held, ds: v.ds, roles: v.roles} }
+	for _, l := range append(slices.Clone(labels), nil) {
+		var h Holding
+		if l == nil {
+			h, _, err = a.holdingOf(ctx, tenant, actor, read())
+		} else {
+			h, _, err = a.holdingFor(ctx, tenant, actor, read(), l)
+		}
+		narrowed = append(narrowed, decided(h, l, err))
+		h, err = a.walkingEvery(ctx, actor, tenant, v, l)
+		full = append(full, decided(h, l, err))
+	}
+	return narrowed, full
+}
+
+// walkingEvery is actor's holding in tenant decided by v as it is read, of the values l asks for,
+// or of every one where l is nil, walking every grant v holds and every permission of their roles.
+func (a *Authorizer) walkingEvery(ctx context.Context, actor Subject, tenant string, v *valuesRead, l Label) (Holding, error) {
+	only := a.labelPermission
+	if l != nil {
+		asked := a.askedBy(l)
+		only = func(p Permission) bool { return asked[p] }
+	}
+	h, _, err := a.holdingFrom(ctx, a.db, actor, a.constrain(ctx, actor, tenantResource(tenant)), &valuesRead{held: v.held, ds: v.ds, roles: v.roles}, only, nil)
+	return h, err
+}
+
+// heldOf is the values l asks for that h holds, sorted.
+func (a *Authorizer) heldOf(h Holding, l Label) []Permission {
+	var held []Permission
+	for _, p := range slices.Sorted(maps.Keys(a.askedBy(l))) {
+		if dim, value := p.parts(); h.values[dim][value] {
+			held = append(held, p)
+		}
+	}
+	return held
+}
+
+// everything is the label values and powers to release h holds, and "excluding <dimension>" for
+// each exclusive dimension it holds none of.
+func everything(h Holding) []string {
+	var held []string
+	for _, p := range h.Values() {
+		held = append(held, string(p))
+	}
+	for _, dim := range slices.Sorted(maps.Keys(h.releases)) {
+		if h.releases[dim] {
+			held = append(held, string(ReleasePermission(dim)))
+		}
+	}
+	for _, dim := range slices.Sorted(maps.Keys(h.excluded)) {
+		if h.excluded[dim] {
+			held = append(held, "excluding "+dim)
+		}
+	}
+	return held
 }
 
 // GrantDecision is what deciding a grant found: the permission the actor lacks to make it, ""
@@ -257,7 +531,8 @@ type GrantDecision struct {
 // and one ask of each constraint, a role once for each condition and end its grants tell apart; and
 // as deciding each alone does, by a read and asks of its own, under the grant's own condition, by
 // those of its grants that each last until the grant ends (holding.lasts), as though they lasted
-// for good, and the grant were made for good.
+// for good, and the grant were made for good, under the denies binding it and those exempting it
+// only until before the grant ends, as though they bound it.
 func GrantsDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subject, r Resource, grants []Binding) (together, alone []GrantDecision) {
 	t.Helper()
 	a = a.still()
@@ -283,6 +558,13 @@ func GrantsDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subje
 			au.held = slices.DeleteFunc(slices.Clone(au.held), func(g holding) bool { return !g.lasts(b.ExpiresAt) })
 			for i := range au.held {
 				au.held[i].ends = time.Time{}
+			}
+			exempt := au.exemptUntil
+			au.exemptUntil = func(p Permission) time.Time {
+				if until := exempt(p); !(holding{ends: until}).lasts(b.ExpiresAt) {
+					return until
+				}
+				return time.Time{}
 			}
 			decided.Lacks, decided.By, _ = a.mayGrant(au, pw, r.Type, def, b.Condition.Expression, time.Time{}, newChecked())
 		}

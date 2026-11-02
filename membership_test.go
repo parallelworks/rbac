@@ -755,67 +755,75 @@ func TestMigrateGivesUpOnALockHeldTooLong(t *testing.T) {
 // On a host's transaction, a table the migration waits for can be held by a transaction waiting
 // for what the host's transaction holds, which rolling back to Migrate's savepoint doesn't free:
 // Migrate waits there, so PostgreSQL ends the other as a deadlock, rather than give way until it
-// gives up while the other waits on.
+// gives up while the other waits on. So it does through a host's wrapper around its transaction,
+// whose Begin gives a savepoint of it, which can set the isolation the transaction is at again.
 func TestMigrateOnAHostsTransactionLetsPostgreSQLEndADeadlockWithIt(t *testing.T) {
-	ctx := t.Context()
-	pool := pgtest.Open(t, "")
-	migrateFiles(t, pool, "", "0016")
-	recordMigrations(t, pool, "0016")
-	// So a Migrate that gave way would give up at once.
-	rbac.SetMigrateAttempts(t, 2, time.Millisecond)
-	if _, err := pool.Exec(ctx, `INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'u')`); err != nil {
-		t.Fatal(err)
-	}
-	host, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = host.Rollback(ctx) }()
-	if _, err := host.Exec(ctx, `UPDATE rbac_memberships SET note = 'host' WHERE principal = 'user:u'`); err != nil {
-		t.Fatal(err)
-	}
-	// Another has read rbac_denies, which 0016 locks, and waits for the row the host's changed.
-	other, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = other.Rollback(ctx) }()
-	if _, err := other.Exec(ctx, `SELECT FROM rbac_denies LIMIT 1`); err != nil {
-		t.Fatal(err)
-	}
-	pid := other.Conn().PgConn().PID()
-	done := make(chan struct{})
-	var waited error
-	go func() {
-		defer close(done)
-		_, waited = other.Exec(ctx, `UPDATE rbac_memberships SET note = 'other' WHERE principal = 'user:u'`)
-	}()
-	// Before other's rollback, its wait ends with the host's.
-	defer func() { _ = host.Rollback(ctx); <-done }()
-	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
-		var waiting bool
-		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock')`, pid).Scan(&waiting); err != nil {
-			t.Fatal(err)
-		}
-		if waiting {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the other transaction never waited for the host's")
-		}
-	}
-	bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	migrated := rbac.Migrate(bounded, host)
-	if err := host.Rollback(ctx); err != nil {
-		t.Fatal(err)
-	}
-	<-done
-	if migrated != nil {
-		t.Errorf("Migrate on the host's transaction: %v", migrated)
-	}
-	if pg := (*pgconn.PgError)(nil); !errors.As(waited, &pg) || pg.Code != "40P01" {
-		t.Errorf("the transaction waiting for the host's: %v", waited)
+	for name, wrap := range map[string]func(pgx.Tx) rbac.DB{
+		"the host's transaction":                  func(tx pgx.Tx) rbac.DB { return tx },
+		"a wrapper around the host's transaction": func(tx pgx.Tx) rbac.DB { return hostTx{tx} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			pool := pgtest.Open(t, "")
+			migrateFiles(t, pool, "", "0016")
+			recordMigrations(t, pool, "0016")
+			// So a Migrate that gave way would give up at once.
+			rbac.SetMigrateAttempts(t, 2, time.Millisecond)
+			if _, err := pool.Exec(ctx, `INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'u')`); err != nil {
+				t.Fatal(err)
+			}
+			host, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = host.Rollback(ctx) }()
+			if _, err := host.Exec(ctx, `UPDATE rbac_memberships SET note = 'host' WHERE principal = 'user:u'`); err != nil {
+				t.Fatal(err)
+			}
+			// Another has read rbac_denies, which 0016 locks, and waits for the row the host's changed.
+			other, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = other.Rollback(ctx) }()
+			if _, err := other.Exec(ctx, `SELECT FROM rbac_denies LIMIT 1`); err != nil {
+				t.Fatal(err)
+			}
+			pid := other.Conn().PgConn().PID()
+			done := make(chan struct{})
+			var waited error
+			go func() {
+				defer close(done)
+				_, waited = other.Exec(ctx, `UPDATE rbac_memberships SET note = 'other' WHERE principal = 'user:u'`)
+			}()
+			// Before other's rollback, its wait ends with the host's.
+			defer func() { _ = host.Rollback(ctx); <-done }()
+			for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+				var waiting bool
+				if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock')`, pid).Scan(&waiting); err != nil {
+					t.Fatal(err)
+				}
+				if waiting {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("the other transaction never waited for the host's")
+				}
+			}
+			bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			migrated := rbac.Migrate(bounded, wrap(host))
+			if err := host.Rollback(ctx); err != nil {
+				t.Fatal(err)
+			}
+			<-done
+			if migrated != nil {
+				t.Errorf("Migrate on %s: %v", name, migrated)
+			}
+			if pg := (*pgconn.PgError)(nil); !errors.As(waited, &pg) || pg.Code != "40P01" {
+				t.Errorf("the transaction waiting for the host's: %v", waited)
+			}
+		})
 	}
 }
 
@@ -1032,6 +1040,50 @@ func TestLeavingUnderAGenericPlanReadsOnlyWhatNamesTheLeaver(t *testing.T) {
 	for what, many := range read() {
 		if many > few[what]*3/2+deeper {
 			t.Errorf("%s read %d pages, and %d once 4500 more were granted, approving, exempt and in a group", what, few[what], many)
+		}
+	}
+}
+
+// A change adding identities to a group reads only their memberships, under a generic plan too,
+// each looked up on its own: a generic plan costing a tenant's memberships as an average tenant's few
+// would read every one of them into a hash, to look each identity up there.
+func TestJoiningUnderAGenericPlanReadsOnlyTheJoinersMemberships(t *testing.T) {
+	h := generic(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), groupMembers) })
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "manager"))
+	manager := h.as(t, "manager")
+	h.groups(t, "crew")
+	h.as(t, "x")
+	h.as(t, "y")
+	joining := []rbac.Member{{Group: "crew", Principal: identity("x")}, {Group: "crew", Principal: identity("y")}}
+	read := func() map[string]int64 {
+		t.Helper()
+		pages := map[string]int64{}
+		for what, f := range map[string]func(a *rbac.Authorizer) error{
+			"ChangeMembers": func(a *rbac.Authorizer) error { return a.ChangeMembers(ctx, manager, "t1", joining, nil) },
+			"ImportMembers": func(a *rbac.Authorizer) error { return a.ImportMembers(ctx, host, "t1", joining) },
+		} {
+			func() {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				pages[what] -= pagesRead(ctx, t, tx, "rbac_memberships")
+				if err := f(h.authz.WithTx(tx)); err != nil {
+					t.Fatalf("%s: %v", what, err)
+				}
+				pages[what] += pagesRead(ctx, t, tx, "rbac_memberships")
+			}()
+		}
+		return pages
+	}
+	manyMembers(t, h, 500, `SELECT`)
+	few := read()
+	manyMembers(t, h, 4500, `SELECT`)
+	for what, many := range read() {
+		if many > few[what]*3/2+deeper {
+			t.Errorf("%s read %d pages of memberships, and %d once 4500 more were members", what, few[what], many)
 		}
 	}
 }
@@ -2581,8 +2633,8 @@ func TestEndingMembershipsNeverDeadlocksWithDeleteExpired(t *testing.T) {
 			}
 			h.now = h.now.Add(2 * time.Hour)
 			// Another transaction holds one of u's places in a group, so the change ending u's
-			// membership, or joining u again once it ended, waits partway through removing them,
-			// while DeleteExpired ends it too.
+			// membership, or joining u again once it ended, waits partway through holding or
+			// removing them, while DeleteExpired ends it too.
 			tx, err := h.pool.Begin(ctx)
 			if err != nil {
 				t.Fatal(err)
@@ -2613,7 +2665,7 @@ func TestEndingMembershipsNeverDeadlocksWithDeleteExpired(t *testing.T) {
 				case err := <-ended:
 					t.Fatalf("%s didn't wait for the held place: %v", name, err)
 				default:
-					blocked = waiting("DELETE FROM rbac_members%")
+					blocked = waiting("%FROM rbac_members WHERE%")
 				}
 			}
 			expired := make(chan error, 1)
@@ -6056,5 +6108,599 @@ func TestAnEndPassingWhileAMembershipChangeWaitsIsRefused(t *testing.T) {
 				t.Errorf("the change stored what ended while it waited: %v, events %+v", err, h.events)
 			}
 		})
+	}
+}
+
+// waitedPast runs change at 12:01 behind a host's transaction that hold has made a change in and
+// left open, moves the clock to 13:00 once change waits for it, and returns what change returns
+// once the transaction commits. It holds the transaction a little longer once change waits, so a
+// wait once change has read its time lasts long enough for the tests' watch of row waits to see it.
+func waitedPast(t *testing.T, h *harness, clock *atomic.Int64, hold func(*rbac.Authorizer) error, change func() error) error {
+	t.Helper()
+	ctx := t.Context()
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := hold(h.authz.WithTx(tx)); err != nil {
+		t.Fatal(err)
+	}
+	var pid int32
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	clock.Store(h.now.Add(time.Minute).UnixNano())
+	done := make(chan error, 1)
+	go func() { done <- change() }()
+	for waiting := false; !waiting; {
+		select {
+		case err := <-done:
+			t.Fatalf("the change waited for nothing the host's transaction holds: %v", err)
+		default:
+		}
+		if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clock.Store(h.now.Add(time.Hour).UnixNano())
+	time.Sleep(20 * time.Millisecond)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return <-done
+}
+
+// steppedHarness is grouped at 12:00 on a clock a test moves, which a change may read from another
+// goroutine, with guardRole and Config.Sources the directory.
+func steppedHarness(t *testing.T) (*harness, *atomic.Int64) {
+	t.Helper()
+	clock := &atomic.Int64{}
+	h := grouped(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), guardRole)
+		c.Now = func() time.Time { return time.Unix(0, clock.Load()).UTC() }
+		c.Sources = []string{"directory"}
+	})
+	clock.Store(h.now.UnixNano())
+	return h, clock
+}
+
+// A change decides at a time it reads once it holds every lock it waits for, as one made once the
+// wait was over would: here each waits from 12:01 to 13:00 behind a host's transaction holding
+// rows it locks, an activation's places in groups, a change to a place, a group's deletion or an
+// activation's end, and what passed at 12:10 while it waited refuses it: an actor's power to make
+// it, the eligibility it activates through, or the end it sets. Decided at the time it read before
+// the wait, it committed what an actor no longer had the power to, and stored what had ended.
+func TestATimeAChangeWaitedPastIsTheTimeItDecidesAt(t *testing.T) {
+	type fixture struct {
+		h                    *harness
+		v, w, manager, owner rbac.Subject
+		// temp is an actor whose roles end at 12:10, and a, v's activation through outer until 12:30.
+		temp rbac.Subject
+		a    rbac.Grant
+	}
+	// approvedByCrew has crew approve x's eligibility, and name x in a deny, which crew's deletion
+	// changes holding neither's scope.
+	approvedByCrew := func(f *fixture) {
+		f.h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "keeper"))
+		x, y := f.h.as(t, "x"), f.h.as(t, "y")
+		if err := f.h.authz.SetDeny(f.h.ctx, f.h.as(t, "keeper"), cluster, rbac.Deny{ID: "d1", Principals: []rbac.Principal{groupOf("crew"), x.Principal}, Permissions: []rbac.Permission{root}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.h.authz.SetEligibility(f.h.ctx, f.owner, cluster, rbac.Eligibility{Role: "cluster.login", Principal: x.Principal, MaxDuration: time.Hour, Approvers: []rbac.Principal{groupOf("crew"), y.Principal}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deleteCrew := func(f *fixture) func(*rbac.Authorizer) error {
+		approvedByCrew(f)
+		return func(a *rbac.Authorizer) error { return a.DeleteGroups(f.h.ctx, host, "t1", []string{"crew"}) }
+	}
+	activate := func(s rbac.Subject) func(*rbac.Authorizer) error {
+		return func(a *rbac.Authorizer) error {
+			_, err := a.Activate(t.Context(), s, cluster, rbac.Activation{Role: "cluster.login", Duration: 5 * time.Minute, Justification: "x"})
+			return err
+		}
+	}
+	for name, c := range map[string]struct {
+		hold   func(f *fixture) func(*rbac.Authorizer) error
+		change func(f *fixture) error
+		want   error
+	}{
+		"ChangeMembers by an actor whose power ended": {
+			hold: func(f *fixture) func(*rbac.Authorizer) error { return activate(f.v) },
+			change: func(f *fixture) error {
+				return f.h.authz.ChangeMembers(f.h.ctx, f.temp, "t1", nil, []rbac.Member{{Group: "outer", Principal: groupOf("inner")}})
+			},
+			want: rbac.ErrDenied,
+		},
+		"ChangeMembers by an actor whose power ended, ending nothing": {
+			hold: func(f *fixture) func(*rbac.Authorizer) error { return activate(f.v) },
+			change: func(f *fixture) error {
+				return f.h.authz.ChangeMembers(f.h.ctx, f.temp, "t1", []rbac.Member{{Group: "outer", Principal: groupOf("inner"), Note: "kept"}}, nil)
+			},
+			want: rbac.ErrDenied,
+		},
+		"ChangeMembers setting an end that passed": {
+			hold: func(f *fixture) func(*rbac.Authorizer) error { return activate(f.v) },
+			change: func(f *fixture) error {
+				return f.h.authz.ChangeMembers(f.h.ctx, f.manager, "t1", []rbac.Member{{Group: "outer", Principal: groupOf("inner"), ExpiresAt: f.h.now.Add(10 * time.Minute)}}, nil)
+			},
+			want: rbac.ErrInvalid,
+		},
+		"ImportMembers setting an end that passed": {
+			hold: func(f *fixture) func(*rbac.Authorizer) error { return activate(f.v) },
+			change: func(f *fixture) error {
+				return f.h.authz.ImportMembers(f.h.ctx, host, "t1", []rbac.Member{{Group: "outer", Principal: groupOf("inner"), ExpiresAt: f.h.now.Add(10 * time.Minute)}})
+			},
+			want: rbac.ErrInvalid,
+		},
+		"SetMemberships setting an end that passed": {
+			// w's membership ended at 11:00, but its place in crew is still stored, which the deletion holds.
+			hold: func(f *fixture) func(*rbac.Authorizer) error {
+				if _, err := f.h.pool.Exec(f.h.ctx, `UPDATE rbac_memberships SET expires_at = $1 WHERE tenant = 't1' AND principal = 'user:w'`, f.h.now.Add(-time.Hour)); err != nil {
+					t.Fatal(err)
+				}
+				return func(a *rbac.Authorizer) error { return a.DeleteGroups(f.h.ctx, host, "t1", []string{"crew"}) }
+			},
+			change: func(f *fixture) error {
+				return f.h.authz.SetMemberships(f.h.ctx, host, "t1", []rbac.Membership{{Principal: f.w.Principal, ExpiresAt: f.h.now.Add(10 * time.Minute)}})
+			},
+			want: rbac.ErrInvalid,
+		},
+		"Activate through an eligibility that ended": {
+			hold: func(f *fixture) func(*rbac.Authorizer) error {
+				return func(a *rbac.Authorizer) error {
+					return a.ImportMembers(f.h.ctx, host, "t1", []rbac.Member{{Group: "outer", Principal: groupOf("inner"), ExpiresAt: f.h.now.Add(3 * time.Hour)}})
+				}
+			},
+			change: func(f *fixture) error {
+				_, err := f.h.authz.Activate(f.h.ctx, f.w, cluster, rbac.Activation{Role: "cluster.login", Duration: 5 * time.Minute, Justification: "x"})
+				return err
+			},
+			want: rbac.ErrDenied,
+		},
+		"Activate again through an eligibility that ended, behind a removal holding the activation": {
+			// The removal of crew's ended place in outer holds the activations of crew's members,
+			// w's among them, but no place w rests one on: w waits for its activation alone.
+			hold: func(f *fixture) func(*rbac.Authorizer) error {
+				if _, err := f.h.authz.Activate(f.h.ctx, f.w, cluster, rbac.Activation{Role: "cluster.login", Duration: 3 * time.Minute, Justification: "x"}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := f.h.pool.Exec(f.h.ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, expires_at)
+					VALUES ('t1', 'outer', 'group', 'crew', $1)`, f.h.now.Add(-time.Hour)); err != nil {
+					t.Fatal(err)
+				}
+				return func(a *rbac.Authorizer) error {
+					return a.DeleteMembers(f.h.ctx, host, "t1", []rbac.Member{{Group: "outer", Principal: groupOf("crew")}})
+				}
+			},
+			change: func(f *fixture) error {
+				_, err := f.h.authz.Activate(f.h.ctx, f.w, cluster, rbac.Activation{Role: "cluster.login", Duration: 5 * time.Minute, Justification: "x"})
+				return err
+			},
+			want: rbac.ErrDenied,
+		},
+		"DeleteGroup by an actor whose power ended": {
+			hold:   func(f *fixture) func(*rbac.Authorizer) error { return activate(f.w) },
+			change: func(f *fixture) error { return f.h.authz.DeleteGroup(f.h.ctx, f.temp, "t1", "crew") },
+			want:   rbac.ErrDenied,
+		},
+		"SetDeny by an actor whose power ended": {
+			hold: deleteCrew,
+			change: func(f *fixture) error {
+				return f.h.authz.SetDeny(f.h.ctx, f.temp, cluster, rbac.Deny{ID: "d1", Principals: []rbac.Principal{identity("x")}, Permissions: []rbac.Permission{root}})
+			},
+			want: rbac.ErrDenied,
+		},
+		"DeleteDeny by an actor whose power ended": {
+			hold:   deleteCrew,
+			change: func(f *fixture) error { return f.h.authz.DeleteDeny(f.h.ctx, f.temp, cluster, "d1") },
+			want:   rbac.ErrDenied,
+		},
+		"SetEligibility setting an end that passed": {
+			hold: deleteCrew,
+			change: func(f *fixture) error {
+				e := rbac.Eligibility{Role: "cluster.login", Principal: identity("x"), MaxDuration: time.Hour, ExpiresAt: f.h.now.Add(10 * time.Minute), Approvers: []rbac.Principal{identity("y")}}
+				return f.h.authz.SetEligibility(f.h.ctx, f.owner, cluster, e)
+			},
+			want: rbac.ErrInvalid,
+		},
+		"DeleteEligibility by an actor whose power ended": {
+			hold: deleteCrew,
+			change: func(f *fixture) error {
+				return f.h.authz.DeleteEligibility(f.h.ctx, f.temp, cluster, "cluster.login", identity("x"))
+			},
+			want: rbac.ErrDenied,
+		},
+		"Apply by an actor whose power ended": {
+			// The removal ends v's activation through outer, holding it.
+			hold: func(f *fixture) func(*rbac.Authorizer) error {
+				return func(a *rbac.Authorizer) error {
+					return a.DeleteMembers(f.h.ctx, host, "t1", []rbac.Member{{Group: "outer", Principal: groupOf("inner")}})
+				}
+			},
+			change: func(f *fixture) error {
+				return f.h.authz.Apply(f.h.ctx, f.temp, cluster, rbac.Change{Revoke: []rbac.Binding{{ID: f.a.ID, Role: f.a.Role, Principal: f.a.Principal}}})
+			},
+			want: rbac.ErrDenied,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, clock := steppedHarness(t)
+			ctx := t.Context()
+			ends := h.now.Add(10 * time.Minute)
+			// v is in outer through inner; w is in inner and crew, and eligible itself until 12:10.
+			h.groups(t, "outer", "inner", "crew")
+			f := &fixture{h: h, v: h.as(t, "v", "inner"), w: h.as(t, "w", "inner", "crew"), manager: h.as(t, "manager"), owner: h.as(t, "owner"), temp: h.as(t, "temp")}
+			var temp []rbac.Grant
+			for _, g := range []rbac.Grant{
+				grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "temp"),
+				grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "temp"),
+				grant(cluster.Scope(), "cluster.admin", rbac.User, "temp"),
+				grant(cluster.Scope(), "guard", rbac.User, "temp"),
+			} {
+				g.ExpiresAt = ends
+				temp = append(temp, g)
+			}
+			h.seed(t, temp...)
+			if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "outer", Principal: groupOf("inner")}}); err != nil {
+				t.Fatal(err)
+			}
+			for _, e := range []rbac.Eligibility{
+				{Role: "cluster.login", Principal: f.v.Principal, MaxDuration: time.Hour},
+				{Role: "cluster.login", Principal: f.w.Principal, MaxDuration: time.Hour, ExpiresAt: ends},
+				{Role: "cluster.sudo", Principal: groupOf("outer"), MaxDuration: time.Hour},
+			} {
+				if err := h.authz.SetEligibility(ctx, f.owner, cluster, e); err != nil {
+					t.Fatal(err)
+				}
+			}
+			a, err := h.authz.Activate(ctx, f.v, cluster, rbac.Activation{Role: "cluster.sudo", Duration: 30 * time.Minute, Justification: "x"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.a = a
+			hold := c.hold(f)
+			if err := waitedPast(t, h, clock, hold, func() error { return c.change(f) }); !errors.Is(err, c.want) {
+				t.Errorf("at 13:00, after it waited from 12:01, the change = %v, not %v", err, c.want)
+			}
+		})
+	}
+}
+
+// A removal that waits behind an activation it would end, or cut short, ends only what is in force
+// at the time it reads once it holds it: here the activation, v's through inner's place in crew,
+// ends at 12:05, while the removal waits from 12:01 to 13:00, so it ends nothing. Read before the
+// wait, it deleted what had ended, and reported revoking it.
+func TestARemovalEndsNoActivationThatEndedWhileItWaited(t *testing.T) {
+	for name, c := range map[string]struct {
+		// hold makes the host's change the removal waits for; with none, v activating then.
+		hold   func(h *harness, a *rbac.Authorizer) error
+		remove func(h *harness) error
+	}{
+		"DeleteMembers": {remove: func(h *harness) error {
+			return h.authz.DeleteMembers(h.ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: groupOf("inner")}})
+		}},
+		"DeleteGroups": {remove: func(h *harness) error { return h.authz.DeleteGroups(h.ctx, host, "t1", []string{"crew"}) }},
+		"ImportGroups": {remove: func(h *harness) error {
+			return h.authz.ImportGroups(h.ctx, host, "t1", []rbac.GroupDefinition{{ID: "crew", Source: "directory"}})
+		}},
+		// Through outer, which crew leaves: it held the places it ends before it read the time, but
+		// the grants it deletes after, crew's on the workspace, which the scope's deletion holds.
+		"DeletePrincipal": {
+			hold: func(h *harness, a *rbac.Authorizer) error {
+				return a.DeleteScopes(h.ctx, host, "t1", []rbac.Scope{workspace.Scope()})
+			},
+			remove: func(h *harness) error { return h.authz.DeletePrincipal(h.ctx, host, "t1", groupOf("crew")) },
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, clock := steppedHarness(t)
+			ctx := t.Context()
+			h.groups(t, "outer", "crew", "inner")
+			v := h.as(t, "v", "inner")
+			h.seed(t, grant(workspace.Scope(), "workspace.admin", rbac.Group, "crew"))
+			if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{
+				{Group: "crew", Principal: groupOf("inner")}, {Group: "outer", Principal: groupOf("crew")},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			eligible := groupOf("crew")
+			if c.hold != nil {
+				eligible = groupOf("outer")
+			}
+			if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.login", Principal: eligible, MaxDuration: time.Hour}); err != nil {
+				t.Fatal(err)
+			}
+			activate := func(a *rbac.Authorizer) error {
+				_, err := a.Activate(ctx, v, cluster, rbac.Activation{Role: "cluster.login", Duration: 5 * time.Minute, Justification: "x"})
+				return err
+			}
+			hold := activate
+			if c.hold != nil {
+				if err := activate(h.authz); err != nil {
+					t.Fatal(err)
+				}
+				hold = func(a *rbac.Authorizer) error { return c.hold(h, a) }
+			}
+			if err := waitedPast(t, h, clock, hold, func() error {
+				h.events = nil
+				return c.remove(h)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for _, e := range h.events {
+				for _, g := range slices.Concat(e.Revoked, e.Shortened) {
+					if g.Source == rbac.SourceActivation {
+						t.Errorf("at 13:00 the removal ended an activation that ended at 12:05: %+v", g)
+					}
+				}
+			}
+		})
+	}
+}
+
+// SetMemberships holds, before it reads the time it decides at, the places it removes of the
+// memberships that had ended at its reading before its transaction, not those of every membership
+// with an end: here a host's transaction deleting crew holds v's place there, which neither setting
+// v's membership again while it is in force waits for, nor ending it once it ended in between, which
+// is tried again instead. Waiting for it, having read its time, a change decides at a time the wait
+// left behind.
+func TestSettingMembershipsHoldsOnlyThePlacesItRemoves(t *testing.T) {
+	for name, c := range map[string]struct {
+		// ends is when v's membership ends: the change reads 12:00 before its transaction and 13:00 in
+		// it.
+		ends time.Duration
+		want error
+	}{
+		"in force":          {ends: 2 * time.Hour},
+		"ending in between": {ends: 30 * time.Minute, want: rbac.ErrConflict},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var clock atomic.Int64
+			var stepping atomic.Bool
+			h := grouped(t, func(cfg *rbac.Config) {
+				cfg.Now = func() time.Time {
+					at := time.Unix(0, clock.Load()).UTC()
+					if stepping.Load() {
+						clock.Add(int64(time.Hour))
+					}
+					return at
+				}
+			})
+			clock.Store(h.now.UnixNano())
+			ctx := t.Context()
+			v := h.as(t, "v", "crew")
+			if _, err := h.pool.Exec(ctx, `UPDATE rbac_memberships SET expires_at = $1 WHERE tenant = 't1' AND principal = 'user:v'`, h.now.Add(c.ends)); err != nil {
+				t.Fatal(err)
+			}
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+			if err := h.authz.WithTx(tx).DeleteGroups(ctx, host, "t1", []string{"crew"}); err != nil {
+				t.Fatal(err)
+			}
+			var pid int32
+			if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+				t.Fatal(err)
+			}
+			stepping.Store(true)
+			done := make(chan error, 1)
+			go func() {
+				done <- h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: v.Principal, ExpiresAt: h.now.Add(3 * time.Hour)}})
+			}()
+			for deadline := time.Now().Add(10 * time.Second); ; {
+				select {
+				case err := <-done:
+					if !errors.Is(err, c.want) {
+						t.Errorf("SetMemberships = %v, not %v", err, c.want)
+					}
+					return
+				default:
+				}
+				var waiting bool
+				if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
+					t.Fatal(err)
+				}
+				if waiting || time.Now().After(deadline) {
+					_ = tx.Rollback(ctx)
+					t.Fatalf("SetMemberships waited for v's place in crew: %v", <-done)
+				}
+			}
+		})
+	}
+}
+
+// A change decides at a time no earlier than the one it picks what it holds of what is in force by:
+// where the host's clock goes back between the two, as from 12:10 to 12:00 here, it would leave in
+// force at 12:00 an activation resting on the place it removes, which it didn't hold, as it had
+// ended by 12:10. It is tried again, and then ends it. Each removal here reads the clock twice,
+// both in its transaction: first for what it holds, then for what it decides, which DeletePrincipal
+// of a group reads whether or not it found an activation to hold.
+func TestAChangeWhoseClockWentBackIsTriedAgain(t *testing.T) {
+	for name, c := range map[string]struct {
+		// eligible is the group v's activation is made through, whose path from v remove ends.
+		eligible string
+		remove   func(h *harness) error
+	}{
+		"DeleteMembers": {"crew", func(h *harness) error {
+			return h.authz.DeleteMembers(h.ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: groupOf("inner")}})
+		}},
+		"DeleteGroups": {"crew", func(h *harness) error { return h.authz.DeleteGroups(h.ctx, host, "t1", []string{"crew"}) }},
+		"ImportGroups": {"crew", func(h *harness) error {
+			return h.authz.ImportGroups(h.ctx, host, "t1", []rbac.GroupDefinition{{ID: "crew", Source: "directory"}})
+		}},
+		"DeletePrincipal of a group": {"outer", func(h *harness) error { return h.authz.DeletePrincipal(h.ctx, host, "t1", groupOf("crew")) }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+			var back atomic.Bool
+			var reads atomic.Int64
+			h := grouped(t, func(c *rbac.Config) {
+				c.Now = func() time.Time {
+					if back.Load() && reads.Add(1) == 1 {
+						return base.Add(10 * time.Minute)
+					}
+					return base
+				}
+				c.Sources = []string{"directory"}
+			})
+			ctx := t.Context()
+			h.groups(t, "outer", "crew", "inner")
+			v := h.as(t, "v", "inner")
+			if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: groupOf("inner")}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", []rbac.Member{{Group: "outer", Principal: groupOf("crew")}}, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.login", Principal: groupOf(c.eligible), MaxDuration: time.Hour}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := h.authz.Activate(ctx, v, cluster, rbac.Activation{Role: "cluster.login", Duration: 5 * time.Minute, Justification: "x"}); err != nil {
+				t.Fatal(err)
+			}
+			back.Store(true)
+			if err := c.remove(h); !errors.Is(err, rbac.ErrConflict) {
+				t.Errorf("%s, its clock going back = %v, not tried again", name, err)
+			}
+			if err := c.remove(h); err != nil {
+				t.Fatal(err)
+			}
+			if allowed(t, h, v, login, cluster) {
+				t.Errorf("at 12:00 v logs in through its activation, which rested on a path through %s, which is gone", c.eligible)
+			}
+		})
+	}
+}
+
+// DeleteExpired takes no lock a change waits for, and holds what it deletes until its transaction
+// ends, a host's under WithTx, so a change holds first what it writes that DeleteExpired may be
+// deleting: here DeleteExpired, run at 12:06 in a host's transaction left open, holds what ended at
+// 12:05, which each change, from 12:01, sets again or deletes, while it waits. Decided at 13:00,
+// once the transaction commits, what passed at 12:10 refuses it: the end it sets, or its actor's
+// power. Writing it after it read its time, it waited there, and stored an end that had passed, or
+// deleted as an actor whose power had ended.
+func TestAChangeHoldsWhatDeleteExpiredDeletesBeforeItReadsItsTime(t *testing.T) {
+	ends := 5 * time.Minute
+	for name, c := range map[string]struct {
+		// ending makes what ends at 12:05, and change makes the change.
+		ending func(h *harness)
+		change func(h *harness) error
+		want   error
+	}{
+		"SetMemberships setting a membership again": {
+			ending: func(h *harness) {
+				h.as(t, "r")
+				if err := h.authz.SetMemberships(h.ctx, host, "t1", []rbac.Membership{{Principal: identity("r"), ExpiresAt: h.now.Add(ends)}}); err != nil {
+					t.Fatal(err)
+				}
+			},
+			change: func(h *harness) error {
+				return h.authz.SetMemberships(h.ctx, host, "t1", []rbac.Membership{{Principal: identity("r"), ExpiresAt: h.now.Add(30 * time.Minute)}})
+			},
+			want: rbac.ErrInvalid,
+		},
+		"Apply granting a grant again": {
+			ending: func(h *harness) {
+				h.as(t, "r")
+				g := grant(cluster.Scope(), "cluster.login", rbac.User, "r")
+				g.ExpiresAt = h.now.Add(ends)
+				h.seed(t, g)
+			},
+			change: func(h *harness) error {
+				return h.authz.Apply(h.ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("r"), ExpiresAt: h.now.Add(ends)}}})
+			},
+			want: rbac.ErrInvalid,
+		},
+		"Import granting a grant again": {
+			ending: func(h *harness) {
+				h.as(t, "r")
+				g := grant(cluster.Scope(), "cluster.login", rbac.User, "r")
+				g.ExpiresAt = h.now.Add(ends)
+				h.seed(t, g)
+			},
+			change: func(h *harness) error {
+				g := grant(cluster.Scope(), "cluster.login", rbac.User, "r")
+				g.ExpiresAt = h.now.Add(ends)
+				return h.authz.Import(h.ctx, host, "t1", []rbac.Grant{g})
+			},
+			want: rbac.ErrInvalid,
+		},
+		"DeleteRole by an actor whose power ended": {
+			ending: func(h *harness) {
+				h.as(t, "r")
+				temp := grant(rbac.TenantRoot("t1"), "tenant.roles", rbac.User, "temp")
+				temp.ExpiresAt = h.now.Add(10 * time.Minute)
+				h.seed(t, temp)
+				if _, err := h.pool.Exec(h.ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+					VALUES ('t1', 'custom.r', ARRAY['cluster:view'], ARRAY['cluster'])`); err != nil {
+					t.Fatal(err)
+				}
+				g := grant(cluster.Scope(), "custom.r", rbac.User, "r")
+				g.ExpiresAt = h.now.Add(ends)
+				h.seed(t, g)
+			},
+			change: func(h *harness) error { return h.authz.DeleteRole(h.ctx, h.as(t, "temp"), "t1", "custom.r") },
+			want:   rbac.ErrDenied,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, clock := steppedHarness(t)
+			c.ending(h)
+			deleting := func(a *rbac.Authorizer) error {
+				clock.Store(h.now.Add(6 * time.Minute).UnixNano())
+				_, err := a.DeleteExpired(h.ctx)
+				return err
+			}
+			if err := waitedPast(t, h, clock, deleting, func() error { return c.change(h) }); !errors.Is(err, c.want) {
+				t.Errorf("at 13:00, after it waited from 12:01, the change = %v, not %v", err, c.want)
+			}
+		})
+	}
+}
+
+// The tests see a change wait for a row once it has read the time it decides at, which no clause of
+// its statement shows, as an upsert's on the row it conflicts with: here SetGroup's of the group,
+// which a write around the package holds, without the group's lock.
+func TestTheTestsSeeAChangeWaitForARowOnceItHasReadItsTime(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	h.groups(t, "crew")
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	var pid int32
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid() FROM rbac_groups WHERE tenant = 't1' AND id = 'crew' FOR UPDATE`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	panicked := make(chan any, 1)
+	go func() {
+		defer func() { panicked <- recover() }()
+		_ = h.authz.SetGroup(ctx, h.as(t, "groups"), "t1", rbac.GroupDefinition{ID: "crew", Name: "Crew"})
+	}()
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		var waiting bool
+		if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("SetGroup never waited for the group's row")
+		}
+	}
+	// Long enough for the watch to see the wait.
+	time.Sleep(20 * time.Millisecond)
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := (<-panicked).(string); !strings.Contains(p, "waits for a row lock") || !strings.Contains(p, "INSERT INTO rbac_groups") {
+		t.Errorf("SetGroup waiting for the group's row, having read its time, panicked with %q", p)
 	}
 }

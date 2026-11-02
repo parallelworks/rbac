@@ -4394,6 +4394,62 @@ func TestAWrapperAroundAHostsTransaction(t *testing.T) {
 	}
 }
 
+// A change and a read of several statements run in a transaction of their own on a pool, a
+// connection, or a wrapper around either, whatever the database's default isolation, and on the
+// host's transaction under WithTx or through a wrapper whose Begin gives a savepoint of it, at any
+// isolation, before or after its first query: a savepoint may set the isolation its transaction
+// already has, so setting the one a change or a read needs can't tell one at that isolation from a
+// transaction of its own.
+func TestATransactionOfItsOwnIsToldFromAHostsAtAnyIsolation(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	serializable := pgtest.Open(t, "default_transaction_isolation=serializable")
+	conn, err := pgx.ConnectConfig(ctx, h.pool.Config().ConnConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	check := func(name string, db rbac.DB, own bool, change, read string) {
+		t.Helper()
+		if got, level, err := rbac.Transacted(ctx, db); err != nil || got != own || level != change {
+			t.Errorf("a change on %s: own %t at %q, %v; want own %t at %q", name, got, level, err, own, change)
+		}
+		a, err := rbac.New(db, h.cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, level, err := rbac.Snapshotted(ctx, a); err != nil || got != own || level != read {
+			t.Errorf("a read on %s: own %t at %q, %v; want own %t at %q", name, got, level, err, own, read)
+		}
+	}
+	for name, db := range map[string]rbac.DB{
+		"a pool": h.pool, "a connection": conn, "a wrapper around a pool": struct{ rbac.DB }{h.pool},
+		"a wrapper around a connection":                                      struct{ rbac.DB }{conn},
+		"a wrapper around a pool where transactions default to SERIALIZABLE": struct{ rbac.DB }{serializable},
+	} {
+		check(name, db, true, "read committed", "repeatable read, read only")
+	}
+	for _, level := range []pgx.TxIsoLevel{pgx.ReadCommitted, pgx.RepeatableRead, pgx.Serializable} {
+		for _, queried := range []bool{false, true} {
+			tx, err := h.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: level})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if queried {
+				if _, err := tx.Exec(ctx, `SELECT FROM rbac_grants LIMIT 1`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for name, db := range map[string]rbac.DB{"the host's transaction": tx, "a wrapper around the host's transaction": hostTx{tx}} {
+				check(fmt.Sprintf("%s at %s, queried %t", name, level, queried), db, false, string(level), string(level))
+			}
+			if err := tx.Rollback(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
 func TestDeadlockedHostTransactionsConflict(t *testing.T) {
 	h := setup(t, func(c *rbac.Config) { c.OnChange = nil })
 	ctx := t.Context()
@@ -4636,8 +4692,9 @@ func TestAChangeDeadlockedBeforeItsSavepointConflicts(t *testing.T) {
 // it ran, matches ErrConflict too, wherever the hook runs, still wrapping the host's own error, and
 // OnRefused isn't told of it: ValidateGrant, asked before a change's transaction, and a constraint a
 // check asks. So does one that wraps or joins the race after another of PostgreSQL's errors, where
-// errors.As finds only that one, and one that holds it as errors.As reads it, through an As method;
-// one holding no race doesn't.
+// errors.As finds only that one, or after a thousand others, or ten thousand values each equal to
+// the one before, and one that holds it as errors.As reads it, through an As method; one holding no
+// race doesn't.
 func TestAHooksErrorForARaceConflicts(t *testing.T) {
 	errPolicy := errors.New("policy lookup failed")
 	deadlock := &pgconn.PgError{Code: "40P01", Message: "deadlock detected"}
@@ -4663,17 +4720,22 @@ func TestAHooksErrorForARaceConflicts(t *testing.T) {
 		}
 	}
 	for how, race := range map[string]error{
-		"wrapped":               fmt.Errorf("%w: %w", errPolicy, deadlock),
-		"wrapped after another": fmt.Errorf("%w: %w; %w", errPolicy, duplicate, deadlock),
-		"joined after another":  errors.Join(errPolicy, duplicate, deadlock),
-		"joined before another": errors.Join(deadlock, duplicate, errPolicy),
-		"nested after another":  errors.Join(errPolicy, duplicate, fmt.Errorf("retrying: %w", deadlock)),
-		"held through As":       errors.Join(duplicate, heldAsError{errPolicy, deadlock}),
+		"wrapped":                        fmt.Errorf("%w: %w", errPolicy, deadlock),
+		"wrapped after another":          fmt.Errorf("%w: %w; %w", errPolicy, duplicate, deadlock),
+		"joined after another":           errors.Join(errPolicy, duplicate, deadlock),
+		"joined before another":          errors.Join(deadlock, duplicate, errPolicy),
+		"nested after another":           errors.Join(errPolicy, duplicate, fmt.Errorf("retrying: %w", deadlock)),
+		"held through As":                errors.Join(duplicate, heldAsError{errPolicy, deadlock}),
+		"joined after a thousand others": errors.Join(slices.Concat([]error{errPolicy}, slices.Repeat([]error{duplicate}, 1000), []error{deadlock})...),
+		// Past those an ordinary tree holds, where each error is read once: the last is read, as it
+		// wraps another error, though it reads as the others.
+		"joined after ten thousand values": errors.Join(slices.Concat([]error{errPolicy},
+			slices.Repeat([]error{valueWrapError{"retrying", duplicate}}, 10000), []error{valueWrapError{"retrying", deadlock}})...),
 	} {
 		hookErr = race
 		for name, err := range calls() {
 			if !errors.Is(err, rbac.ErrConflict) || !errors.Is(err, errPolicy) || errors.Is(err, rbac.ErrDenied) || errors.Is(err, rbac.ErrInvalid) {
-				t.Errorf("%s, whose hook failed for a race %s: %v", name, how, err)
+				t.Errorf("%s, whose hook failed for a race %s: %.1000v", name, how, err)
 			}
 		}
 	}
@@ -4705,33 +4767,194 @@ func (e heldAsError) As(target any) bool {
 	return ok
 }
 
-// An error that wraps itself, as a host's own type can by mistake, is read for a race only so far,
-// so an exported call returns it as it is, holding none there, rather than read it until the stack
-// overflows.
-func TestAnErrorThatWrapsItselfIsReadSoFar(t *testing.T) {
-	// So that reading it forever overflows the stack in a moment rather than a gigabyte.
-	defer debug.SetMaxStack(debug.SetMaxStack(64 << 20))
-	chain := &wrapsItselfError{}
-	chain.next = chain
-	joined := &joinsItselfError{}
-	joined.errs = []error{&pgconn.PgError{Code: "23505"}, joined}
-	for _, err := range []error{chain, joined} {
-		// The very error: errors.Is would read it forever.
-		if got := rbac.Conflicted(err); got != err { //nolint:errorlint // as above
-			t.Errorf("%T: %v", err, got)
+// A hook's error nesting thousands of values that wrap errors, rather than pointers, is read in time
+// growing with its depth, as errors.Is reads it, not with its square, as it would be if each error
+// read were remembered from the first, which compares it whole, all it wraps too.
+func TestAHooksErrorNestingValuesIsReadInItsDepth(t *testing.T) {
+	var err error = &pgconn.PgError{Code: "40P01", Message: "deadlock detected"}
+	for i := range 5000 {
+		err = valueWrapError{fmt.Sprint("try ", i), err}
+	}
+	start := time.Now()
+	got := rbac.Conflicted(err)
+	if elapsed := time.Since(start); !errors.Is(got, rbac.ErrConflict) || elapsed > time.Second {
+		t.Fatalf("a race under 5,000 values took %v to find: %.100v", elapsed, got)
+	}
+}
+
+// valueWrapError is a host's error that wraps another as a value, not a pointer.
+type valueWrapError struct {
+	msg string
+	err error
+}
+
+func (e valueWrapError) Error() string { return e.msg }
+func (e valueWrapError) Unwrap() error { return e.err }
+
+// A hook's error whose tree holds itself, as a host's type wrapping itself by mistake can, through
+// Unwrap or joined beside itself, is read round only so far, and from then on each of its errors
+// once, wherever a call reads it, and the call returns: matching ErrConflict where it holds a race,
+// as errors.As reads one, or ErrConflict, before itself or after, ErrConflict first in what the call
+// returns, so errors.Is finds it there, as it wouldn't past the error holding itself; and a change
+// ValidateGrant refuses beside it is refused as invalid, which OnRefused is told of, but of no
+// other. Each kind of error runs in a child process, so one read forever, or until the stack
+// overflows, which kills the process, fails this test rather than the test binary, and each call
+// there is given a while.
+func TestAHooksErrorHoldingItselfIsReadOnce(t *testing.T) {
+	if how := os.Getenv("RBAC_HOOK_ERROR_HOLDING_ITSELF"); how != "" {
+		// So that reading it forever overflows the stack in a moment rather than a gigabyte.
+		debug.SetMaxStack(64 << 20)
+		var pg *pgconn.PgError
+		var held error
+		switch {
+		case strings.Contains(how, "a race"):
+			pg = &pgconn.PgError{Code: "40P01", Message: "deadlock detected"}
+			held = pg
+		case strings.Contains(how, "a conflict"):
+			held = fmt.Errorf("an earlier change: %w", rbac.ErrConflict)
+		}
+		race := held != nil
+		hookErr := error(&wrapsItselfError{pg})
+		if strings.HasPrefix(how, "joining") {
+			hookErr = &joinsItselfError{held, strings.HasSuffix(how, "after")}
+		}
+		down, lost := rbac.Scope{Type: "cluster", ID: "down"}, rbac.Scope{Type: rbac.GroupScope, ID: "lost"}
+		manager := rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}
+		var constraintErr, validateErr error
+		refusals := 0
+		h := labeled(t, func(c *rbac.Config) {
+			c.Catalog = append(slices.Clone(c.Catalog), groupMembers, manager)
+			validate := c.ValidateGrant
+			c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+				return cmp.Or(validateErr, validate(ctx, q, in))
+			}
+			c.Constraints = append(c.Constraints, rbac.Constraint{Name: "policy", Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) {
+				return false, constraintErr
+			}})
+			resourceOf := c.ResourceOf
+			c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+				if s == down || s == lost {
+					return rbac.Resource{}, hookErr
+				}
+				return resourceOf(ctx, tenant, s)
+			}
+			c.OnRefused = func(context.Context, rbac.Refusal) { refusals++ }
+		})
+		ctx := t.Context()
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}')`); err != nil {
+			t.Fatal(err)
+		}
+		h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "tenant.roles", rbac.User, "admin"),
+			grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "cluster.sudo", rbac.User, "admin"),
+			grant(down, "cluster.login", rbac.Group, "ops"), grant(down, "custom.viewer", rbac.User, "u"))
+		h.join(t, "u")
+		h.groups(t, "lost")
+		if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "ops", Principal: identity("u")}, {Group: "lost", Principal: identity("u")}}); err != nil {
+			t.Fatal(err)
+		}
+		admin, ann, owner := h.as(t, "admin"), h.as(t, "ann"), h.as(t, "owner")
+		h.hold(t, "admin", "level:high")
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		apply := func() error {
+			return h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: ann.Principal}}})
+		}
+		// Each call's error is read by the test in the while it is given, as a call that returns it
+		// unmapped would have errors.Is read it forever.
+		read := func(name string, call func() error, refused bool) {
+			t.Log(name)
+			before := refusals
+			type got struct {
+				err                 error
+				conflicted, invalid bool
+			}
+			done := make(chan got, 1)
+			go func() {
+				err := call()
+				g := got{err: err}
+				if race {
+					g.conflicted = errors.Is(err, rbac.ErrConflict)
+				}
+				if refused {
+					g.invalid = errors.Is(err, rbac.ErrInvalid)
+				}
+				done <- g
+			}()
+			select {
+			case g := <-done:
+				if g.err == nil || g.conflicted != race || g.invalid != refused || (refusals > before) != refused {
+					t.Errorf("%s, whose hook's error is %s itself: %v", name, how, g.err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Errorf("%s, whose hook's error is %s itself, read it forever", name, how)
+			}
+			constraintErr, validateErr = nil, nil
+		}
+		constraintErr = hookErr
+		read("Authorize, through a constraint", func() error { return h.authz.Authorize(ctx, ann, view, cluster) }, false)
+		constraintErr = hookErr
+		read("Apply, through a constraint", apply, false)
+		validateErr = hookErr
+		read("Apply, through ValidateGrant", apply, false)
+		validateErr = errors.Join(rbac.ErrInvalid, hookErr)
+		read("Apply, refused by ValidateGrant", apply, true)
+		read("ChangeMembers, reading the group", func() error {
+			return h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "lost", Principal: identity("u")}})
+		}, false)
+		read("ChangeMembers, reading a scope the group has access on", func() error {
+			return h.authz.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "ops", Principal: identity("u")}})
+		}, false)
+		read("DeleteRole, reading a scope it is granted on", func() error { return h.authz.DeleteRole(ctx, admin, "t1", "custom.viewer") }, false)
+		read("Checkpoint.Sign, through the signer", func() error { return second(rbac.Genesis("g").Sign(racedSigner{key, hookErr})) }, false)
+		return
+	}
+	pgtest.URL(t)
+	for _, how := range []string{"wrapping a race", "joining a race", "joining a race after", "joining a conflict after", "wrapping", "joining"} {
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestAHooksErrorHoldingItselfIsReadOnce$", "-test.v")
+		cmd.Env = append(os.Environ(), "RBAC_HOOK_ERROR_HOLDING_ITSELF="+how)
+		out, err := cmd.CombinedOutput()
+		cancel()
+		if err != nil {
+			t.Errorf("%s: %v\n%.4000s", how, err, out)
 		}
 	}
 }
 
-type wrapsItselfError struct{ next error }
+// wrapsItselfError wraps itself, and holds PostgreSQL's error as errors.As reads it, if any.
+type wrapsItselfError struct{ pg *pgconn.PgError }
 
 func (*wrapsItselfError) Error() string   { return "wraps itself" }
-func (e *wrapsItselfError) Unwrap() error { return e.next }
+func (e *wrapsItselfError) Unwrap() error { return e }
 
-type joinsItselfError struct{ errs []error }
+func (e *wrapsItselfError) As(target any) bool {
+	pg, ok := target.(**pgconn.PgError)
+	if ok && e.pg != nil {
+		*pg = e.pg
+		return true
+	}
+	return false
+}
 
-func (*joinsItselfError) Error() string     { return "joins itself" }
-func (e *joinsItselfError) Unwrap() []error { return e.errs }
+// joinsItselfError joins itself and the error it holds, if any, before it or after.
+type joinsItselfError struct {
+	held  error
+	after bool
+}
+
+func (*joinsItselfError) Error() string { return "joins itself" }
+
+func (e *joinsItselfError) Unwrap() []error {
+	switch {
+	case e.held == nil:
+		return []error{e}
+	case e.after:
+		return []error{e, e.held}
+	}
+	return []error{e.held, e}
+}
 
 func TestPublicAccess(t *testing.T) {
 	viewer := rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
@@ -9269,6 +9492,139 @@ func TestADenyOnOneResourceStopsARedefinitionGrantedOnItAndOnOthers(t *testing.T
 	}
 }
 
+// A redefinition decides the scopes that x's grants and the denies on their paths can't tell apart
+// once, and tells them apart by every id whole: where the denies on cluster a's path, joined with
+// spaces, would read as the one on b's, whose workspace's id holds them, as an id holds any text,
+// the deny on b's path removing root from x still keeps x from widening r to give root, granted on
+// both or held through a role listing it granted on both. So does a deny on a's path whose
+// condition, which can read a, tells a apart by its id, where that id would read as part of b's.
+func TestARedefinitionTellsApartScopesWhoseDeniesReadAlikeJoined(t *testing.T) {
+	type deny struct {
+		on        rbac.Resource
+		id        string
+		p         rbac.Permission
+		condition string
+	}
+	ws := func(id string) rbac.Resource { return rbac.Resource{Tenant: "t1", Type: "workspace", ID: id} }
+	in := func(id, workspace string) rbac.Resource {
+		return rbac.Resource{Tenant: "t1", Type: "cluster", ID: id, Ancestors: []rbac.Scope{ws(workspace).Scope()}}
+	}
+	// Each joins as "workspace:x i cluster:a j ".
+	a, b := in("a", "x"), in("b", "x i cluster:a")
+	joined := []deny{{ws("x"), "i", "workspace:view", ""}, {a, "j", "workspace:view", ""}, {ws("x i cluster:a"), "j", root, ""}}
+	// Each joins as "workspace:x i |cluster:a j ", a's with its scope after its denies.
+	spaced, barred := in("a j ", "x"), in("b", "x i |cluster:a")
+	conditioned := []deny{{ws("x"), "i", "workspace:view", `resource.id == "none"`}, {ws("x i |cluster:a"), "j", root, ""}}
+	for _, c := range []struct {
+		name   string
+		a, b   rbac.Resource
+		denies []deny
+		listed bool
+	}{
+		{"granted", a, b, joined, false},
+		{"listed", a, b, joined, true},
+		{"beside a condition", spaced, barred, conditioned, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h, guardian := guarded(t, func(cfg *rbac.Config) {
+				resourceOf := cfg.ResourceOf
+				cfg.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+					for _, r := range []rbac.Resource{c.a, c.b} {
+						if s == r.Scope() {
+							return r, nil
+						}
+					}
+					return resourceOf(ctx, tenant, s)
+				}
+			})
+			ctx := t.Context()
+			x, r := definer(t, h)
+			h.as(t, "y")
+			z := h.as(t, "z")
+			granted := r
+			if c.listed {
+				granted = listing(t, h, x, r)
+			}
+			h.seed(t, grant(c.a.Scope(), granted.ID, rbac.User, "y"), grant(c.b.Scope(), granted.ID, rbac.User, "z"))
+			for _, d := range c.denies {
+				deny := rbac.Deny{ID: d.id, Permissions: []rbac.Permission{d.p}, Principals: []rbac.Principal{x.Principal}, Condition: rbac.Condition{Expression: d.condition}}
+				if err := h.authz.SetDeny(ctx, guardian, d.on, deny); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := h.authz.Apply(ctx, x, c.b, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: z.Principal}}}); !errors.Is(err, rbac.ErrDenied) {
+				t.Fatalf("granting root on b: %v", err)
+			}
+			wider := r
+			wider.Permissions = []rbac.Permission{view, root}
+			err := h.authz.SetRole(ctx, x, "t1", wider)
+			holder := z
+			if c.listed {
+				holder = h.as(t, "w")
+				if err := h.authz.Apply(ctx, z, c.b, rbac.Change{Grant: []rbac.Binding{{Role: r.ID, Principal: holder.Principal}}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var denied *rbac.DeniedError
+			if !errors.As(err, &denied) || denied.Scope != c.b.Scope() || allowed(t, h, holder, root, c.b) {
+				t.Fatalf("widening a role to give root past the deny on b's path: %v", err)
+			}
+		})
+	}
+}
+
+// A deny's condition is evaluated within a budget for each scope of the path, so conditions stored
+// past their bound, as before there were bounds, that a container's path can't pay for remove what
+// they would there, as they keep x from granting root on workspace w, while on a container below
+// it, whose longer path pays for them, they hold false. The two read the same grants and denies,
+// but a redefinition decides each by its own budget: widening r, granted on both, to give root is
+// refused on w, as Apply there is.
+func TestARedefinitionDecidesAContainerByItsOwnPathsBudget(t *testing.T) {
+	w := rbac.Resource{Tenant: "t1", Type: "workspace", ID: "w"}
+	// Read before w, so a decision of the scopes alike would be its.
+	below := rbac.Resource{Tenant: "t1", Type: "workspace", ID: "a", Ancestors: []rbac.Scope{w.Scope()}}
+	h, _ := guarded(t, func(cfg *rbac.Config) {
+		resourceOf := cfg.ResourceOf
+		cfg.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			for _, r := range []rbac.Resource{w, below} {
+				if s == r.Scope() {
+					return r, nil
+				}
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	x, r := definer(t, h)
+	y, z := h.as(t, "y"), h.as(t, "z")
+	h.seed(t, grant(rbac.TenantRoot("t1"), "workspace.admin", rbac.User, "x"), grant(below.Scope(), r.ID, rbac.User, "y"), grant(w.Scope(), r.ID, rbac.User, "z"))
+	// Each costs about a fifth of a scope's budget to compile, at 8 a byte, and holds false for x:
+	// eleven are past two scopes' budgets, and within three.
+	for i := range 11 {
+		expr := fmt.Sprintf("subject.id == %q", fmt.Sprint(i, strings.Repeat("q", 2000)))
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions, condition)
+			VALUES ('t1', 'workspace', 'w', $1, '{user:x}', $2, $3)`, fmt.Sprint("d", i), []string{string(root)}, expr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sudo := func(on rbac.Resource, to rbac.Subject) error {
+		return h.authz.Apply(ctx, x, on, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: to.Principal}}})
+	}
+	var denied *rbac.DeniedError
+	if err := sudo(w, z); !errors.As(err, &denied) || denied.Permission != root {
+		t.Fatalf("granting root on w: %v", err)
+	}
+	if err := sudo(below, y); err != nil {
+		t.Fatalf("granting root below w: %v", err)
+	}
+	wider := r
+	wider.Permissions = []rbac.Permission{view, root}
+	in := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c", Ancestors: []rbac.Scope{w.Scope()}}
+	if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.As(err, &denied) || denied.Scope != w.Scope() || allowed(t, h, z, root, in) {
+		t.Fatalf("widening a role to give root past the denies on w: %v", err)
+	}
+}
+
 // What SetRole and DeleteRole checked of the scopes a role is granted on before their transactions
 // they check again under the tenant's lock, so a deny below the tenant set meanwhile stops them.
 func TestADenySetWhileARedefinitionWaitsStopsIt(t *testing.T) {
@@ -10486,7 +10842,19 @@ func TestAnIDThatIsNoTextIsInvalid(t *testing.T) {
 			}
 		}
 	}
-	// A constraint can ask about the anonymous, who are in no group and no tenant.
+	// A constraint can ask about the anonymous, who are in no group and no tenant, and are granted
+	// nothing and eligible for nothing of their own, alone or beside others.
+	anonymous := rbac.GrantFilter{Principals: []rbac.Principal{{}}}
+	if grants, err := h.authz.Grants(ctx, "t1", anonymous); err != nil || len(grants) > 0 {
+		t.Errorf("Grants of the anonymous = %v, %v", grants, err)
+	}
+	if es, err := h.authz.Eligibilities(ctx, "t1", anonymous); err != nil || len(es) > 0 {
+		t.Errorf("Eligibilities of the anonymous = %v, %v", es, err)
+	}
+	beside := rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}, Principals: []rbac.Principal{{}, owner.Principal}}
+	if grants, err := h.authz.Grants(ctx, "t1", beside); err != nil || len(grants) != 1 || grants[0].Principal != owner.Principal {
+		t.Errorf("Grants of the anonymous and the owner = %v, %v", grants, err)
+	}
 	if groups, err := h.authz.GroupsOf(ctx, "t1", rbac.Principal{}); err != nil || len(groups) > 0 {
 		t.Errorf("GroupsOf the anonymous = %v, %v", groups, err)
 	}
@@ -10765,9 +11133,11 @@ func TestAChangeDecidesUnderItsLocksAtTheTimeItIsMade(t *testing.T) {
 
 // Each call reads the host's clock once, where it first needs the time, so every statement it makes
 // and every condition it evaluates are of one moment, and a change once more in each of its
-// transactions, under its locks. The count is exact: a change that reads it before its transaction
-// and only once would decide under its locks at the time it began. Each call here reads through
-// several statements, conditions and label values; one that needs no time reads none.
+// transactions, under its locks: one that first needs it in its transaction, to pick what it holds
+// of what is in force, reads it there, and again once it holds it all. The count is exact: a change
+// that reads it before its transaction and only once would decide under its locks at the time it
+// began. Each call here reads through several statements, conditions and label values; one that
+// needs no time reads none.
 func TestEachCallReadsTheClockOnceAndAChangeAgainUnderItsLocks(t *testing.T) {
 	reads := 0
 	tenantGroups := rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}
@@ -10855,11 +11225,11 @@ func TestEachCallReadsTheClockOnceAndAChangeAgainUnderItsLocks(t *testing.T) {
 		{"ImportMembers", 2, func() error {
 			return h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "squad", Principal: v.Principal}})
 		}},
-		{"DeleteMembers", 1, func() error {
+		{"DeleteMembers", 2, func() error {
 			return h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "squad", Principal: v.Principal}})
 		}},
 		{"DeleteGroup", 2, func() error { return h.authz.DeleteGroup(ctx, admin, "t1", "team") }},
-		{"DeleteGroups", 1, func() error { return h.authz.DeleteGroups(ctx, host, "t1", []string{"squad"}) }},
+		{"DeleteGroups", 2, func() error { return h.authz.DeleteGroups(ctx, host, "t1", []string{"squad"}) }},
 		{"SetMemberships", 2, func() error {
 			return h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("w")}})
 		}},
