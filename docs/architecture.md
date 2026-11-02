@@ -503,6 +503,19 @@ sequenceDiagram
   when each grant's holding ends, in the statement that reads the grants, and a grant may end no
   later than the latest holding of each permission it hands on. An eligibility, a custom role's
   definition and a place in a group that gains an eligibility need what they hand on held for good.
+  An exemption from a deny lasts so too. With the grants, the statement reads the denies on the path
+  that bind the actor's keys but exempt it only through keys whose paths end, places in groups or its
+  membership, with the latest end of those paths, where the deny binds it past then (`lastingSQL`,
+  `exemptUntilSQL`); one exempting it by its identity or a path that never ends, or binding it no
+  longer than it exempts it, is read as now, as none. What such a deny removes, decided as `handsOn`
+  decides one, the actor holds only until its exemption ends (`exemptUntil`): `holdsFor` and `under`
+  hand it on no longer, `decidedAs` tells grants apart by that end, a scope such a deny is on the
+  path of is decided apart from others (`proven`, `alike`), and `SetRole` giving more below the
+  tenant reads them there as the denies binding the actor (`deniedBelow`), though narrowing or
+  deleting a role, which hands nothing on, asks the host nothing for them. Conditions are decided
+  as of the change: a grant's is handed on with it, as what the actor holds under one it hands on
+  only under the same, but a deny's can't be, so one holding only from a later time, as by reading
+  `request.time`, bounds nothing handed on before then.
   Of the grants that count under a grant's condition, a decision reads only the role of each, how
   its principal carries it and whether it lasts until the grant ends, so `decidedAs` decides a grant
   until the soonest time at or after its end that the longest lasting of a kind of them ends, and

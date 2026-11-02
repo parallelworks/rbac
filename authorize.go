@@ -308,7 +308,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) (_ 
 	}
 	// Its label values are those its grants on the tenant give, read with these, so a label is
 	// decided by what it held as it held them.
-	held, ds, roles, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), namedRoles, false)
+	held, ds, roles, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), namedRoles)
 	if err != nil {
 		return nil, err
 	}
@@ -1663,18 +1663,18 @@ const (
 	heldTenantRoles
 )
 
-// heldOrDenied is readHeld of the grants, the denies of any permission and the roles alone, and
-// with ending, when each grant's holding ends.
-func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Subject, counts broad, scopes []string, roles rolesRead,
-	ending bool,
+// heldOrDenied is readHeld of the grants, the denies of any permission and the roles alone.
+func (a *Authorizer) heldOrDenied(ctx context.Context, q DB, tenant string, s Subject, counts broad, scopes []string,
+	roles rolesRead,
 ) ([]holding, []denial, book, error) {
-	got, err := a.readHeld(ctx, q, tenant, s, counts, scopes, "", roles, alsoRead{ending: ending})
+	got, err := a.readHeld(ctx, q, tenant, s, counts, scopes, "", roles, alsoRead{})
 	return got.held, got.ds, got.roles, err
 }
 
 // alsoRead is what else readHeld reads in its statement.
 type alsoRead struct {
-	// ending is when each grant's holding ends, as a change hands on nothing past it.
+	// ending is when each grant's holding ends, as a change hands on nothing past it, and the denies
+	// binding the subject that it is exempt from only until a time (exemption), with when.
 	ending bool
 	// values is what the subject's label values are decided by (valuesRead), whatever counts and p
 	// are, so they are of the moment its other grants are. The scopes hold the tenant's.
@@ -1691,6 +1691,9 @@ type grantsRead struct {
 	// values is set with alsoRead.values, and keys read with alsoRead.keys.
 	values *valuesRead
 	keys   []string
+	// exempt are, with alsoRead.ending, the denies binding the subject that it is exempt from only
+	// until a time.
+	exempt []exemption
 }
 
 // valuesRead is what a subject's label values are decided by: its grants on its tenant, and the
@@ -1769,13 +1772,19 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 		keyed = "TRUE"
 	}
 	forP := read + ` AND ($5 = '' OR $5 = ANY(permissions) OR $6 = ANY(permissions)) AND EXISTS (SELECT FROM keys WHERE ` + counted("$7", "$8") + `)`
-	// In the statement, so they are of the moment its grants are.
-	var places, ends string
+	// In the statement, so they are of the moment its grants are, as are the denies binding it that
+	// exempt it only until a time, read with when, by the paths to the keys exempting it, in the read
+	// of those binding it: in the statement's text, so a check plans none of it.
+	var places, ends, kept string
+	exempt, until := ` AND NOT exempt && ARRAY(SELECT k FROM exempted)`, `NULL::timestamptz AS until`
 	if with.ending {
-		places = `, ` + endsSQL("$2::text", "$4")
+		places = `, ` + endsSQL("$2::text", "$4") + `, ` + lastingSQL("$1::text", "$2::text")
 		ends = `
 		UNION ALL
 		SELECT 3, k, '', '', '', e, false, NULL, '', NULL, false, false, NULL, '', '', false FROM ends`
+		exempt, kept = ` AND NOT exempt && `+exemptForGoodSQL, ` WHERE binds OR until IS NOT NULL`
+		until = `NOT exempt && ARRAY(SELECT k FROM exempted) AS binds, CASE WHEN exempt && ARRAY(SELECT k FROM exempted) THEN ` +
+			exemptUntilSQL("principals", "exempt") + ` END AS until`
 	}
 	// In the statement's text rather than an argument: a generic plan can't tell from one whether
 	// to read every role of the tenant or look up those the grants name. Those are looked up a key at
@@ -1805,10 +1814,10 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 		SELECT 0, id, principal, scope, role, expires_at, conditional, NULL::text[], '', NULL::text[], false, false, NULL::text[], '', '', counts
 		FROM held
 		UNION ALL
-		SELECT 1, id, id, scope, '', NULL, condition <> '', permissions, condition, NULL, false, false, NULL, '', '', counts
-		FROM (`+byKey("$3", "rbac_denies", "scope", "id, scope, permissions, condition, "+forP+" AS counts", `tenant = $1
-		  AND principals && ARRAY(SELECT k FROM bound) AND NOT exempt && ARRAY(SELECT k FROM exempted)
-		  AND (`+forP+` OR `+values+` AND scope = 'tenant:' || $1)`)+`) d
+		SELECT 1, id, id, scope, '', until, condition <> '', permissions, condition, NULL, false, false, NULL, '', '', counts
+		FROM (`+byKey("$3", "rbac_denies", "scope", "id, scope, permissions, condition, "+forP+" AS counts, "+until, `tenant = $1
+		  AND principals && ARRAY(SELECT k FROM bound)`+exempt+`
+		  AND (`+forP+` OR `+values+` AND scope = 'tenant:' || $1)`)+`) d`+kept+`
 		UNION ALL
 		SELECT 2, id, '', '', id, NULL, false, permissions, '', resource_types, privileged, public, grantable_roles, name, description, false
 		FROM `+customRoles+ends+`
@@ -1833,6 +1842,13 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 			d := denial{id: id, scope: scope, condition: condition}
 			for _, x := range perms {
 				d.permissions = append(d.permissions, Permission(x))
+			}
+			// One it is exempt from until a time binds it only from then on, so nothing it decides now.
+			if expires != nil {
+				if ofP {
+					got.exempt = append(got.exempt, exemption{denial: d, until: *expires})
+				}
+				return nil
 			}
 			if ofP {
 				got.ds = append(got.ds, d)

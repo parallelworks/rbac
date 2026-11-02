@@ -338,7 +338,8 @@ type GrantDecision struct {
 // and one ask of each constraint, a role once for each condition and end its grants tell apart; and
 // as deciding each alone does, by a read and asks of its own, under the grant's own condition, by
 // those of its grants that each last until the grant ends (holding.lasts), as though they lasted
-// for good, and the grant were made for good.
+// for good, and the grant were made for good, under the denies binding it and those exempting it
+// only until before the grant ends, as though they bound it.
 func GrantsDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subject, r Resource, grants []Binding) (together, alone []GrantDecision) {
 	t.Helper()
 	a = a.still()
@@ -364,6 +365,13 @@ func GrantsDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subje
 			au.held = slices.DeleteFunc(slices.Clone(au.held), func(g holding) bool { return !g.lasts(b.ExpiresAt) })
 			for i := range au.held {
 				au.held[i].ends = time.Time{}
+			}
+			exempt := au.exemptUntil
+			au.exemptUntil = func(p Permission) time.Time {
+				if until := exempt(p); !(holding{ends: until}).lasts(b.ExpiresAt) {
+					return until
+				}
+				return time.Time{}
 			}
 			decided.Lacks, decided.By, _ = a.mayGrant(au, pw, r.Type, def, b.Condition.Expression, time.Time{}, newChecked())
 		}

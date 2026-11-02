@@ -947,6 +947,10 @@ type reached struct {
 
 func (r reached) any() bool { return len(r.own)+len(r.listed) > 0 }
 
+// more reports whether the change gives more on a scope it reaches: where a grant or eligibility
+// there will give more, or a role granted there lets its holders grant the role as it will be.
+func (r reached) more() bool { return len(r.widened)+len(r.listed) > 0 }
+
 // types are the types of the scopes its grants and eligibilities are on.
 func (r reached) types() []string {
 	var types []string
@@ -1075,13 +1079,14 @@ func (a *Authorizer) handingOn(custom map[Role]RoleDefinition, id Role, def Role
 // whose holders may grant it without holding it is granted on (handingOn) keeps the actor from
 // granting it there as it will be, as they then may (scopesDenied), or where that scope's label
 // refuses the actor. Only a deny on a scope other than the tenant can remove more there than the
-// tenant's, which mayDefine and changesDenied check, so only where one binds the actor, or a label
-// could refuse it, as none can where the actor's label values satisfy every label, is the host
-// asked about the scopes. Where none of the grants and eligibilities on a scope will give more, nor
-// would so, as for deleting or narrowing the role, which there only takes access away, and no role
-// listing it is granted there to hand it on, a scope the host no longer has (ErrNotFound) is read
-// as stored, with no containers or label, which stillReaches refuses once the change gives more
-// there. au is the actor's authority on the tenant, which mayDefine checked the role on.
+// tenant's, which mayDefine and changesDenied check, so only where one binds the actor, or exempts
+// it only until a time where the change gives more on a scope, or a label could refuse it, as none
+// can where the actor's label values satisfy every label, is the host asked about the scopes.
+// Where none of the grants and eligibilities on a scope will give more, nor would so, as for
+// deleting or narrowing the role, which there only takes access away, and no role listing it is
+// granted there to hand it on, a scope the host no longer has (ErrNotFound) is read as stored, with
+// no containers or label, which stillReaches refuses once the change gives more there. au is the
+// actor's authority on the tenant, which mayDefine checked the role on.
 func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authority, tenant string, id Role, types []string, d *redefinition,
 	change string,
 ) (roleReach, error) {
@@ -1099,7 +1104,7 @@ func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authorit
 	}
 	denied := false
 	if scopes.any() {
-		if denied, err = a.deniedBelow(ctx, a.db, tenant, actor); err != nil {
+		if denied, err = a.deniedBelow(ctx, a.db, tenant, actor, scopes.more()); err != nil {
 			return roleReach{}, err
 		}
 	}
@@ -1199,7 +1204,7 @@ func (a *Authorizer) stillReaches(ctx context.Context, tx pgx.Tx, actor Subject,
 	}
 	denied := false
 	if scopes.any() {
-		if denied, err = a.deniedBelow(ctx, tx, tenant, actor); err != nil {
+		if denied, err = a.deniedBelow(ctx, tx, tenant, actor, scopes.more()); err != nil {
 			return err
 		}
 	}
@@ -1241,13 +1246,20 @@ func (a *Authorizer) stillReaches(ctx context.Context, tx pgx.Tx, actor Subject,
 }
 
 // deniedBelow reports, reading on q, whether a deny on a scope other than the tenant binds the
-// actor, as heldOrDenied reads the denies on a path. They are found by the keys it is bound by
-// (naming), so the tenant's denies of others aren't read.
-func (a *Authorizer) deniedBelow(ctx context.Context, q DB, tenant string, actor Subject) (bool, error) {
+// actor, or, for a change that gives more there (exempting), exempts it only until a time, as
+// authorities reads the denies on a path: one taking access away hands nothing on, so such a deny
+// can't refuse it. They are found by the keys it is bound by (naming), so the tenant's denies of
+// others aren't read, and its paths to its groups are walked only for one exempting it.
+func (a *Authorizer) deniedBelow(ctx context.Context, q DB, tenant string, actor Subject, exempting bool) (bool, error) {
+	ctes, until := keysSQL("$1::text", "$2::text", "$3"), ""
+	if exempting {
+		ctes += `, ` + endsSQL("$2::text", "$3") + `, ` + lastingSQL("$1::text", "$2::text")
+		until = ` OR ` + exemptUntilSQL("principals", "exempt") + ` IS NOT NULL`
+	}
 	var denied bool
-	err := q.QueryRow(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`
+	err := q.QueryRow(ctx, `WITH RECURSIVE `+ctes+`
 		SELECT EXISTS (SELECT FROM rbac_denies WHERE `+naming("principals", "ARRAY(SELECT k FROM bound)")+` AND scope_type <> $4
-		  AND NOT exempt && ARRAY(SELECT k FROM exempted))`,
+		  AND (NOT exempt && ARRAY(SELECT k FROM exempted)`+until+`))`,
 		tenant, actor.identityKey(), a.cfg.Now(), TenantScope).Scan(&denied)
 	return denied, err
 }
@@ -1283,7 +1295,7 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 			return &DeniedError{Permission: manage, Scope: on[i].Scope(), Reason: "removed by a deny, which stops " + change}
 		}
 	}
-	if reach.redefined == nil || len(scopes.widened)+len(scopes.listed) == 0 {
+	if reach.redefined == nil || !scopes.more() {
 		return nil
 	}
 	def := reach.redefined.now
@@ -1303,7 +1315,7 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 	}
 	removedOn := func(p Permission) (Scope, bool) {
 		for _, i := range distinct {
-			if own[i].handsOn(p) {
+			if own[i].handsOnForGood(p) {
 				return on[i].Scope(), true
 			}
 		}
@@ -1334,7 +1346,7 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 			}
 			asked[k] = true
 			there := au
-			there.handsOn = orDenied(au.handsOn, at.handsOn)
+			there.handsOn = orDenied(au.handsOn, at.handsOnForGood)
 			if missing, _, ok := a.mayGrant(there, there.under(t, "", time.Time{}), t, def, "", time.Time{}, newChecked()); !ok {
 				reason := fmt.Sprintf("removed by a deny there, which stops %s, as the holders of a role granted there may grant it on a %s without holding it, which the actor can't", change, t)
 				return cmp.Or(au.constrained.failed(), error(&DeniedError{Permission: missing, Scope: r.Scope(), Reason: reason}))
@@ -1358,6 +1370,10 @@ func (a *Authorizer) alike(on authority, r Resource) string {
 	for _, d := range on.denials {
 		b.WriteString(d.scope + " " + d.id + " ")
 		conditional = conditional || d.condition != ""
+	}
+	for _, e := range on.exemptions {
+		b.WriteString(e.scope + " " + e.id + " ")
+		conditional = conditional || e.condition != ""
 	}
 	if conditional && !a.contains(r.Type) {
 		b.WriteString("|" + r.Scope().Key())

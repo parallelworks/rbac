@@ -425,7 +425,7 @@ func (a *Authorizer) valuesOn(ctx context.Context, q DB, tenant string, s Subjec
 	if len(a.labels) == 0 {
 		return &valuesRead{roles: a.builtinBook()}, nil
 	}
-	held, ds, roles, err := a.heldOrDenied(ctx, q, tenant, s, all, []string{TenantRoot(tenant).Key()}, namedRoles, false)
+	held, ds, roles, err := a.heldOrDenied(ctx, q, tenant, s, all, []string{TenantRoot(tenant).Key()}, namedRoles)
 	if err != nil {
 		return nil, err
 	}
