@@ -8523,13 +8523,13 @@ func TestEachPermissionIsDecidedOnItsOwnBudgets(t *testing.T) {
 	h, guardian := guarded(t)
 	ctx := t.Context()
 	var xs []string
-	for i := range 36 {
+	for i := range 34 {
 		xs = append(xs, fmt.Sprint(i))
 	}
 	list := "[" + strings.Join(xs, ",") + "]"
 	// Five conditional denies of every cluster permission on each of the cluster, its workspace and
 	// the tenant, each false and costing nearly all a condition may, its inner list charged for its
-	// elements each time a step builds it.
+	// elements each time a step builds it, and each step for its macro's &&.
 	for j, on := range []rbac.Resource{cluster, workspace, {Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}} {
 		for i := range 5 {
 			expr := fmt.Sprintf("%s.all(x, %s.all(y, x >= -%d)) && false", list, list, 10*j+i)

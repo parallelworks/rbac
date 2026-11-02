@@ -425,11 +425,12 @@ sequenceDiagram
   is. Each runs within the most evaluating it can cost, which its literals and types bound, and the
   ids, kinds, types and tenant a check passes and its action, which are no longer than `MaxID`. CEL
   charges some of what a condition does a constant or nothing, so the package charges it itself: a
-  list or map literal for each element or entry it builds, a loop's step for each logical operator
-  and choice it evaluates, a key a condition computes by its length, and `contains`, `startsWith`
-  and `endsWith` by the strings they read, at least 1 however empty either is. A comparison, a
-  search or a match that would cost more than a condition may fails before it runs, as CEL charges a
-  call only once it has run. What a check reads together is bounded where it is stored, for each
+  list or map literal for each element or entry it builds, and a loop's step for each logical
+  operator and choice it may evaluate, on top of what CEL charges, a key a condition computes by its
+  length, and `contains`, `startsWith` and `endsWith` by the strings they read, at least 1 however
+  empty either is. A comparison, a search or a match that would cost more than a condition may fails
+  before it runs, as CEL charges a call only once it has run. What a check reads together is
+  bounded where it is stored, for each
   scope: an identity's conditional grants, the conditional grants to groups, the tenant's members
   and the public, each the tenant's and those from each source the host owns apart, the conditional
   denies, and the requirements of groups' eligibilities for a role, and a change adding a condition

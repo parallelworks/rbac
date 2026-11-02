@@ -1029,12 +1029,12 @@ func TestAValueCELDecodesWholeIsDecodedOnceForACheck(t *testing.T) {
 			read += ".v"
 		}
 		expr := `request.attributes.l.all(x, ` + read + ` != "a")`
-		held, evaluated, allocated, err := rbac.EvaluateCondition(t, expr, map[string]any{"l": make([]any, 1000), "v": v})
+		held, evaluated, allocated, err := rbac.EvaluateCondition(t, expr, map[string]any{"l": make([]any, 900), "v": v})
 		if err != nil || !evaluated || !held {
 			t.Errorf("%s: held %t, evaluated %t, %v", name, held, evaluated, err)
 		}
 		if allocated > 32<<16 {
-			t.Errorf("%s read a thousand times allocated %d bytes", name, allocated)
+			t.Errorf("%s read nine hundred times allocated %d bytes", name, allocated)
 		}
 	}
 }
@@ -1675,12 +1675,12 @@ func TestAnArrayOfBytesIsCopiedOnceForACheck(t *testing.T) {
 		t.Errorf("an array of a byte type of the host's: held %t, %v", held, err)
 	}
 	held, evaluated, allocated, err := rbac.EvaluateCondition(t, `request.attributes.l.all(x, request.attributes.v[0] != b"")`,
-		map[string]any{"l": make([]any, 1000), "v": [][64 << 10]byte{{1}}})
+		map[string]any{"l": make([]any, 900), "v": [][64 << 10]byte{{1}}})
 	if err != nil || !evaluated || !held {
-		t.Errorf("a long array of bytes read a thousand times: held %t, evaluated %t, %v", held, evaluated, err)
+		t.Errorf("a long array of bytes read nine hundred times: held %t, evaluated %t, %v", held, evaluated, err)
 	}
 	if allocated > 4*64<<10 {
-		t.Errorf("a long array of bytes read a thousand times allocated %d bytes", allocated)
+		t.Errorf("a long array of bytes read nine hundred times allocated %d bytes", allocated)
 	}
 }
 
@@ -1925,8 +1925,10 @@ func TestALoopsStepsTakeNoLongerForTheStepsBefore(t *testing.T) {
 // only literals, or what it loops over only in the branch it takes, so a loop over a list the host
 // passes cost nothing for each element, however long. Each step costs at least 1, and a loop
 // taking more steps than its condition may cost stops as one costing more does. A loop whose steps
-// are charged costs as it did, but filter() 1 more for each element it keeps, which it adds as a
-// list literal of one (TestALiteralCostsWhatItBuilds).
+// are charged costs as it did, but 1 more at each step for each logical operator or choice it may
+// evaluate, its macro's own among them (TestALoopsStepCostsEachLogicalOperatorItEvaluates), and
+// filter() 1 more for each element it keeps, which it adds as a list literal of one
+// (TestALiteralCostsWhatItBuilds).
 func TestALoopsStepsCostAtLeastOneEach(t *testing.T) {
 	falses := func(n int) map[string]any { return map[string]any{"l": make([]any, n)} }
 	for _, expr := range []string{
@@ -1943,7 +1945,7 @@ func TestALoopsStepsCostAtLeastOneEach(t *testing.T) {
 			}
 		}
 	}
-	l := make([]any, 1000)
+	l := make([]any, 800)
 	for i := range l {
 		l[i] = i%2 == 0
 	}
@@ -1951,10 +1953,10 @@ func TestALoopsStepsCostAtLeastOneEach(t *testing.T) {
 		expr string
 		cost uint64
 	}{
-		{`request.attributes.l.all(z, z || !z)`, 5004},
-		{`request.attributes.l.exists(z, z && !z)`, 6004},
-		{`request.attributes.l.exists_one(z, z) || true`, 3006},
-		{`request.attributes.l.filter(z, z).size() == 500`, 9018},
+		{`request.attributes.l.all(z, z || !z)`, 5604},
+		{`request.attributes.l.exists(z, z && !z)`, 6404},
+		{`request.attributes.l.exists_one(z, z) || true`, 3206},
+		{`request.attributes.l.filter(z, z).size() == 400`, 8018},
 	} {
 		if _, cost := rbac.ConditionCost(t, c.expr, map[string]any{"l": l}); cost != c.cost {
 			t.Errorf("%s cost %d, not %d", c.expr, cost, c.cost)
@@ -1964,8 +1966,9 @@ func TestALoopsStepsCostAtLeastOneEach(t *testing.T) {
 
 // CEL charges a logical operator or a choice nothing, nor a literal it reads, though evaluating one
 // takes about as long as a unit of cost does, so a loop whose steps each evaluated two hundred took
-// twenty times what it was charged. A step costs at least 1 more for each its condition and step may
-// evaluate, its macro's own among them, and the bound counts each.
+// twenty times what it was charged. A step costs 1 more for each its condition and step may
+// evaluate, its macro's own among them, on top of what CEL charges it, however much that is, and the
+// bound counts each.
 func TestALoopsStepCostsEachLogicalOperatorItEvaluates(t *testing.T) {
 	ands := strings.TrimSuffix(strings.Repeat("true && ", 200), " && ")
 	ors := strings.TrimSuffix(strings.Repeat("false || ", 100), " || ")
@@ -1982,6 +1985,15 @@ func TestALoopsStepCostsEachLogicalOperatorItEvaluates(t *testing.T) {
 		if cost < least || cost > limit {
 			t.Errorf("%s... cost %d, bounded at %d", expr[:50], cost, limit)
 		}
+	}
+	// Counted only toward the least a step costs, a hundred in a step comparing strings of a
+	// kilobyte cost nothing more.
+	attributes["s"], attributes["t"] = strings.Repeat("x", 1000), strings.Repeat("x", 1000)
+	compared := `request.attributes.l.all(z, request.attributes.s == request.attributes.t`
+	_, alone := rbac.ConditionCost(t, compared+`)`, attributes)
+	limit, cost := rbac.ConditionCost(t, compared+strings.Repeat(" && true", 100)+`)`, attributes)
+	if cost < alone+30*100 || cost > limit {
+		t.Errorf("a loop comparing strings cost %d, and %d with a hundred operators at each step, bounded at %d", alone, cost, limit)
 	}
 }
 
@@ -2763,12 +2775,14 @@ func TestAConditionReadingTheIDsACheckPassesCostsLittle(t *testing.T) {
 // upgrade that moves one shows. This package's own charges move them too: a literal costs 1 for each
 // element and 2 for each entry it builds, and a logical operator or a choice 1, so most were bounded
 // a few units higher, and one rebuilding a literal of hundreds at each step of a loop at all a
-// condition may cost, which fails where it costs more
-// (TestAConditionWhoseLiteralsCostMoreThanItMayFails). Conditions a scope holds past the bound so are
+// condition may cost, which fails where it costs more, though it held when it was stored, as a
+// grant's gives nothing and a deny's applies (TestAConditionWhoseLiteralsCostMoreThanItMayFails).
+// Conditions a scope holds past the bound so are
 // evaluated cheapest first within a check's budget
 // (TestACheckSpendsABoundedBudgetOnConditionsStoredAroundTheBounds), and a change among them adding
 // none isn't refused (TestAChangePastTheBoundIsRefusedOnlyForAConditionItAdds).
 func TestStoredConditionsKeepTheirBounds(t *testing.T) {
+	rebuilt := "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(i, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(j, size([" + strings.Repeat("1,", 699) + "1]) == 700))"
 	for _, c := range []struct {
 		expr  string
 		bound uint64
@@ -2806,13 +2820,16 @@ func TestStoredConditionsKeepTheirBounds(t *testing.T) {
 		{`"gpu" in request.attributes.tags`, 10000},
 		{`request.attributes.tags.exists(t, t.contains(request.attributes.query))`, 10000},
 		// Each step rebuilds the list, which was bounded at 2,082 while a literal cost 10 however long.
-		{"[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(i, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(j, size([" + strings.Repeat("1,", 699) + "1]) == 700))", 10000},
+		{rebuilt, 10000},
 		{`{"dev": 1, "prod": 2}[resource.attributes.env] <= request.attributes.n`, 10000},
 		{`request.attributes.tags.exists(t, t == "gpu")`, 10000},
 	} {
 		if limit, _ := rbac.ConditionCost(t, c.expr, nil); limit != c.bound {
 			t.Errorf("%s is bounded at %d, not %d", c.expr, limit, c.bound)
 		}
+	}
+	if held, evaluated, _, err := rbac.EvaluateCondition(t, rebuilt, nil); err != nil || held || evaluated {
+		t.Errorf("a condition rebuilding a list of 700 at each of 100 steps held %t, evaluated %t: %v", held, evaluated, err)
 	}
 }
 

@@ -273,8 +273,9 @@ scopes conditional ones reach, to check one by one.
   which hashes the key whole, as
   `{"dev": 1, "prod": 2}[resource.attributes.env]` does. A list literal costs 1 more for each
   element and a map literal 2 for each entry, each time it is built, and a step of a loop 1 more
-  for each `&&`, `||` and `?:` it evaluates, which CEL charges a constant or nothing. `contains`
-  costs what reading both strings does, multiplied, and `startsWith` and `endsWith` what reading
+  for each `&&`, `||` and `?:` it may evaluate, its macro's own among them, which CEL charges a
+  constant or nothing. `contains` costs what reading both strings does, multiplied, and
+  `startsWith` and `endsWith` what reading
   the shorter does, at least 1 however short or empty either is, and one costing more than a
   condition may fails before it runs: `contains` of one long string the request passes in another
   tries each place in it, which can take a third of a second. Cost is bounded per check too, for
@@ -297,8 +298,11 @@ scopes conditional ones reach, to check one by one.
   upgrade moves fails them. A condition holding a literal or a logical operator is bounded a few
   units higher than before they were charged so, and one rebuilding a literal of hundreds at each
   step of a loop at all a condition may cost, past which it fails: a grant's gives nothing and a
-  deny's applies. Going back to an earlier release of this package does the same where
-  that release bounds a shape more, so while replicas of two releases run side by side, those
+  deny's applies. A step of `all`, `exists`, `exists_one`, `filter` or a `map` that filters costs
+  1 more for the operator its macro evaluates, so one looping over a list the request passes, which
+  cost nearly all a condition may, can now cost more, and fails the same way. Going back to an
+  earlier release of this package does the same where that release bounds a shape more, so while
+  replicas of two releases run side by side, those
   bounding a shape more may refuse changes adding a condition to a scope the others filled. To
   hand a permission on, the actor holds it unconditionally or under the same condition, one that
   doesn't read the subject: that one decides for each holder, so the actor's holding says nothing

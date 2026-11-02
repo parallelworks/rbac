@@ -786,7 +786,7 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 	switch fn := call.FunctionName(); fn {
 	case operators.Conditional:
 		// It, and a logical operator, costs 1 though CEL charges nothing, as a loop's step evaluating
-		// it costs at least (free).
+		// it is charged 1 more (free).
 		if len(xs) == 3 {
 			x = xs[1].union(xs[2])
 		}
@@ -1087,25 +1087,25 @@ const looping = "@looping"
 // most. Each step evaluates its condition first, so a loop's condition is planned instead as a call
 // whose first argument is the loop's range: charging it drops what the steps before kept, and
 // costs what charging the condition did, and at a loop's first step 1 more for each key of a map
-// it ranges over (costs). It counts the steps too, each as what it costs at least (free), which
-// limit bounds (counting).
+// it ranges over (costs). It counts the steps too, each costing at least 1, and charges each 1 more
+// for each logical operator and choice it may evaluate (free), which limit bounds (counting).
 type stepping struct {
 	// ranges are the ids of the ranges of checked's loops, by those of their conditions, planned
 	// whether each range has been planned, by its id, and stepped those of the conditions planned
-	// as steps. least is what each of a loop's steps costs at least, by its condition's id.
+	// as steps. operators are what each of a loop's steps may evaluate (free), by its condition's id.
 	ranges           map[int64]int64
 	planned, stepped map[int64]bool
-	least            map[int64]uint64
+	operators        map[int64]uint64
 	limit            uint64
 }
 
 func newStepping(checked *ast.AST, limit uint64) *stepping {
-	s := &stepping{ranges: map[int64]int64{}, planned: map[int64]bool{}, stepped: map[int64]bool{}, least: map[int64]uint64{}, limit: limit}
+	s := &stepping{ranges: map[int64]int64{}, planned: map[int64]bool{}, stepped: map[int64]bool{}, operators: map[int64]uint64{}, limit: limit}
 	for _, e := range ast.MatchDescendants(ast.NavigateAST(checked), ast.KindMatcher(ast.ComprehensionKind)) {
 		comp := e.AsComprehension()
 		s.ranges[comp.LoopCondition().ID()] = comp.IterRange().ID()
 		s.planned[comp.IterRange().ID()] = false
-		s.least[comp.LoopCondition().ID()] = 1 + free(comp.LoopCondition()) + free(comp.LoopStep())
+		s.operators[comp.LoopCondition().ID()] = free(comp.LoopCondition()) + free(comp.LoopStep())
 	}
 	return s
 }
@@ -1113,7 +1113,8 @@ func newStepping(checked *ast.AST, limit uint64) *stepping {
 // free is how many logical operators and choices e evaluates at most, but for those of the steps of
 // the loops it holds, which theirs count: CEL charges one nothing, nor the literal it may read, though
 // evaluating one takes about as long as a unit of cost does, so a loop whose steps evaluated hundreds
-// took twenty times what it was charged. A step costs 1 for each, and the bound counts them alike.
+// took twenty times what it was charged. A step costs 1 more for each, on top of what CEL charges it,
+// however much that is, and the bound counts them alike.
 func free(e ast.Expr) uint64 {
 	var n uint64
 	switch e.Kind() {
@@ -1166,7 +1167,7 @@ func (s *stepping) decorate(i interpreter.InterpretableV2) (interpreter.Interpre
 	// held after it.
 	st := &step{
 		cond: i, over: over, function: looping, args: []interpreter.InterpretableV2{interpreter.NewConstValue(over, types.NullValue)},
-		least: s.least[i.ID()], limit: s.limit,
+		operators: s.operators[i.ID()], limit: s.limit,
 	}
 	switch cond := i.(type) {
 	case interpreter.InterpretableConst:
@@ -1191,9 +1192,9 @@ type step struct {
 	over               int64
 	function, overload string
 	args               []interpreter.InterpretableV2
-	// least is what each step costs at least, and limit the condition's, which its loops' steps and
-	// what it was charged past CEL together may not pass.
-	least, limit uint64
+	// operators are what each step may evaluate that CEL charges nothing (free), and limit the
+	// condition's, which its loops' steps and what it was charged past CEL together may not pass.
+	operators, limit uint64
 }
 
 func (s *step) ID() int64                             { return s.over }
@@ -1202,14 +1203,17 @@ func (s *step) OverloadID() string                    { return s.overload }
 func (s *step) Args() []interpreter.InterpretableV2   { return s.args }
 func (s *step) Eval(a interpreter.Activation) ref.Val { return s.Exec(interpreter.AsFrame(a)) }
 
-// Exec counts the step, as what it costs at least, and cancels the evaluation past its limit, as CEL
-// cancels one costing more. The keys and literals charged count too: a loop after them would take a
-// limit of steps more, past it already.
+// Exec counts the step, charges its operators past what CEL charges, and cancels the evaluation past
+// its limit, as CEL cancels one costing more. The keys and literals charged count too: a loop after
+// them would take a limit of steps more, past it already. CEL charges the operators nothing, so they
+// cost on top of what it charges: counted only toward the least a step costs, they ran uncharged in
+// a step whose other work CEL charges more.
 func (s *step) Exec(frame *interpreter.ExecutionFrame) ref.Val {
 	c, _ := frame.ResolveName(stepsName)
 	n, ok := c.(*counting)
 	if ok {
-		n.steps = cost.SafeAdd(n.steps, s.least)
+		n.steps++
+		n.charged = cost.SafeAdd(n.charged, s.operators)
 	}
 	if !ok || cost.SafeAdd(n.steps, n.charged) > s.limit {
 		panic(interpreter.EvalCancelledError{Cause: interpreter.CostLimitExceeded, Message: "rbac: a condition's loops take more steps than it may cost"})
@@ -1220,8 +1224,8 @@ func (s *step) Exec(frame *interpreter.ExecutionFrame) ref.Val {
 // counting is what a condition reads, and how many steps its loops have taken, which it costs at
 // least: CEL charges a step only what it evaluates, which can be nothing, as for a step reading
 // only literals, so a loop over a long list the host passes would cost nothing for each element.
-// charged is what the keys it computes and the literals it builds cost past what CEL charges
-// (keying, literals), on top of the rest.
+// charged is what the keys it computes, the literals it builds and the logical operators its loops'
+// steps evaluate cost past what CEL charges (keying, literals, stepping), on top of the rest.
 type counting struct {
 	vars           map[string]any
 	steps, charged uint64
