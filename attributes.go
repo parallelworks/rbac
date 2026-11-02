@@ -86,14 +86,18 @@ import (
 // and a tenth of each string's, bytes', JSON number's, JSON text's or packed type URL's length, and
 // half a packed message's, as a packed value takes as few as two bytes, each kind whole, whether it
 // can be read or not: past that, every condition reading an attribute of any kind fails, and JSON
-// text that may hold more values than are left isn't parsed. Where a kind nests past 10,000 deep,
-// converting stops there, so what it is charged, and whether the kinds after it fit what is left,
-// can turn on the order a map's entries come in: either way it can't be read, and the others are
-// read or, past what is left, fail. The subject's, the resource's and the request's attributes
-// share it, so attributes a tenant's users write, as a resource's tags, can take every check of the
-// resource past that, where a grant's condition reading an attribute gives nothing and a deny's
-// applies, whoever asks: bound what users may store, or pass conditions only what they read. A
-// declared attribute is a value of its type as converted, so a named string type is a string.
+// text that may hold more values than are left isn't parsed. A call converts the subject's and the
+// request's attributes once, for every check it makes with them, as a change does on each scope it
+// reaches, and each check its resource's after them, counting all three as though it had converted
+// them itself, so whether a check is past that doesn't turn on how many the call makes. Where a
+// kind nests past 10,000 deep, converting stops there, so what it is charged, and whether the kinds
+// after it fit what is left, can turn on the order a map's entries come in: either way it can't be
+// read, and the others are read or, past what is left, fail. The subject's, the resource's and the
+// request's attributes share it, so attributes a tenant's users write, as a resource's tags, can
+// take every check of the resource past that, where a grant's condition reading an attribute gives
+// nothing and a deny's applies, whoever asks: bound what users may store, or pass conditions only
+// what they read. A declared attribute is a value of its type as converted, so a named string type
+// is a string.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
@@ -160,6 +164,8 @@ const maxNested = 10000
 // message and JSON text it converts by where it points, its length and its type (copiedKey), with
 // what it found of it, so one reached twice is converted once, for any kind that reaches it.
 type converter struct {
+	// base is the converter it goes on from (fork), whose conversions it reads and never changes.
+	base *converter
 	left uint64
 	// over is set once converting cost more than was left, which fails every kind's attributes.
 	over bool
@@ -179,12 +185,32 @@ type converter struct {
 // conversion is what a converter found of a value it converted, while open converting it: what it
 // is to conditions, and how deep it nests, counting itself, or that no condition can read it.
 type conversion struct {
-	to                    ref.Val
+	to ref.Val
+	// of is the value, kept so that where it points, which the converter knows it by, is no other
+	// value's while the converter is kept, as a call keeps the one converting its subject's and
+	// request's attributes (asking) while the host's hooks run.
+	of                    reflect.Value
 	height                int
 	open, unreadable, cut bool
 }
 
 func newConverter() *converter { return &converter{left: maxConverted} }
+
+// fork is a converter going on from what c converted, reading its conversions as found and spending
+// what it left, so what it converts is converted, and charged, as by c, which it never changes: each
+// check of a call converts its resource's attributes on a fork of the converter that converted the
+// subject's and the request's once (asking).
+func (c *converter) fork() *converter { return &converter{base: c, left: c.left, over: c.over} }
+
+// found is what c, or a converter it goes on from, found of the value k knows.
+func (c *converter) found(k copiedKey) (conversion, bool) {
+	for ; c != nil; c = c.base {
+		if i, ok := c.done[k]; ok {
+			return c.converted[i], true
+		}
+	}
+	return conversion{}, false
+}
 
 // attributes is a kind's attributes as conditions read them, by their names, nil for none, and
 // whether a condition can read them: where any value they hold, however deep, can't be read, as a
@@ -374,8 +400,8 @@ func (c *converter) spend(n uint64, v ref.Val) ref.Val {
 // in or a kind before it reached a value first.
 func (c *converter) once(v reflect.Value, convert func() (ref.Val, int)) (ref.Val, int) {
 	k, _ := copiedKeyOf(v)
-	if i, ok := c.done[k]; ok {
-		switch d := c.converted[i]; {
+	if d, ok := c.found(k); ok {
+		switch {
 		case d.open || d.unreadable:
 			return c.refuse(), 0
 		case d.cut || c.depth+d.height-1 > maxNested:
@@ -390,7 +416,7 @@ func (c *converter) once(v reflect.Value, convert func() (ref.Val, int)) (ref.Va
 	}
 	i := len(c.converted)
 	c.done[k] = i
-	c.converted = append(c.converted, conversion{open: true})
+	c.converted = append(c.converted, conversion{of: v, open: true})
 	unread, deep := c.unread, c.deep
 	to, height := convert()
 	d := &c.converted[i]

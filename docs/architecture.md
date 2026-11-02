@@ -418,8 +418,16 @@ sequenceDiagram
   check at most `maxConverted`, counted as `valueSize` counts what a condition reads, about what a
   check may spend on a scope's grants' conditions, past which every condition reading an attribute
   fails: converting isn't charged to a condition, and charging the check would let what one
-  condition reads fail the others. The subject's, the resource's and the request's attributes share
-  the bound, so ones users write, as a resource's tags, can fail the conditions of every check of
+  condition reads fail the others. The subject's and the request's attributes are converted once
+  for a call (`askingOf`), as a change checks them on each scope it reaches, before its transaction
+  and in it, and each check converts its resource's on a `fork` of that converter, which reads what
+  it found and spends what it left: so each check counts all three, as though it had converted them
+  itself. The converter keeps each value it converted until the call ends, as a later check knows a
+  value it shares with them by where it points, and a value a host's hook freed meanwhile could
+  otherwise come to be where one was. Converted for each check, a change adding a member to 400
+  groups, its request holding a map of 40,000 entries, took 6 seconds. The subject's, the
+  resource's and the request's attributes share the bound, so ones users write, as a resource's
+  tags, can fail the conditions of every check of
   the resource, closed. So conditions run on CEL's own values alone, by CEL's own semantics, and a
   comparison that fails where either value holds a double that isn't finite sees every double there
   is. Each runs within the most evaluating it can cost, which its literals and types bound, and the

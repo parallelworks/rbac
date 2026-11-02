@@ -5336,6 +5336,110 @@ func TestChangingMembersReadsTheActorsAuthorityOnceForAllItReaches(t *testing.T)
 	}
 }
 
+// A change converts its actor's and its request's attributes once, however many scopes it checks a
+// condition on, before its transaction and again in it, and each scope's resource's for that scope:
+// converted again for each, adding a member to 400 groups, with a map of 40,000 entries in the
+// request, took 6 seconds. Each scope's check still counts them in what it may convert, and reads
+// its own resource's.
+func TestAChangeConvertsItsActorsAndRequestsAttributesOnce(t *testing.T) {
+	crowded := map[string]any{"open": true, "l": make([]int, rbac.MaxConverted/2)}
+	h := grouped(t, func(c *rbac.Config) {
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			r, err := resourceOf(ctx, tenant, s)
+			switch {
+			case s.Type != rbac.GroupScope:
+			case s.ID == "crowded":
+				r.Attributes = crowded
+			default:
+				r.Attributes = map[string]any{"open": s.ID != "closed"}
+			}
+			return r, err
+		}
+	})
+	g := grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "lead")
+	g.Condition = rbac.Condition{Expression: `request.attributes.mfa == true && subject.attributes.team == "ops" && resource.attributes.open == true`}
+	h.seed(t, g)
+	lead := h.as(t, "lead")
+	lead.Attributes = map[string]any{"team": "ops"}
+	h.join(t, "u")
+	ids := []string{"closed", "crowded"}
+	var add []rbac.Member
+	for i := range 20 {
+		ids = append(ids, fmt.Sprint("g", i))
+		add = append(add, rbac.Member{Group: fmt.Sprint("g", i), Principal: identity("u")})
+	}
+	h.groups(t, ids...)
+	// Half of what a check may convert, which each scope's check counts, rather than the change.
+	ctx := rbac.WithRequest(t.Context(), map[string]any{"mfa": true, "l": make([]int, rbac.MaxConverted/2)})
+	n := rbac.CountKindsConverted(t)
+	if err := h.authz.ChangeMembers(ctx, lead, "t1", add, nil); err != nil {
+		t.Fatal(err)
+	}
+	// The actor's and the request's, and each group's before the transaction and in it.
+	if want := 2 + 2*len(add); *n != want {
+		t.Errorf("adding a member to %d groups converted %d kinds' attributes, want %d", len(add), *n, want)
+	}
+	for _, id := range []string{"closed", "crowded"} {
+		if err := h.authz.ChangeMembers(ctx, lead, "t1", []rbac.Member{{Group: id, Principal: identity("u")}}, nil); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("adding a member to %s: %v", id, err)
+		}
+	}
+	// The crowded group's attributes alone fit.
+	if err := h.authz.ChangeMembers(rbac.WithRequest(t.Context(), map[string]any{"mfa": true}), lead, "t1",
+		[]rbac.Member{{Group: "crowded", Principal: identity("u")}}, nil); err != nil {
+		t.Errorf("adding a member to crowded with a small request: %v", err)
+	}
+}
+
+// What a call converted of its actor's attributes stays where it is while the call runs, as each
+// check after the first knows a value it shares with them by where it points: a hook of the host's
+// dropping one from the map the host passed freed it, so another value could come to be where it
+// was, and a later check read it as converted from the one dropped.
+func TestAValueACallConvertedStaysWhereItIsWhileItRuns(t *testing.T) {
+	var lead rbac.Subject
+	var n *int
+	var dropped, lost bool
+	var freed atomic.Bool
+	h := grouped(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "drop", Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) {
+			// Asked about each group in turn, once the first group's check converted the actor's.
+			if n != nil && *n > 0 && !dropped {
+				dropped = true
+				delete(lead.Attributes, "held")
+				for range 20 {
+					if runtime.GC(); freed.Load() {
+						break
+					}
+					time.Sleep(time.Millisecond)
+				}
+				lost = freed.Load()
+			}
+			return false, nil
+		}}}
+	})
+	g := grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "lead")
+	g.Condition = rbac.Condition{Expression: `subject.attributes.team == "ops"`}
+	h.seed(t, g)
+	lead = h.as(t, "lead")
+	lead.Attributes = map[string]any{"team": "ops"}
+	func() {
+		held := &[]any{"x"}
+		runtime.AddCleanup(held, func(freed *atomic.Bool) { freed.Store(true) }, &freed)
+		lead.Attributes["held"] = held
+	}()
+	h.join(t, "u")
+	h.groups(t, "a", "b", "c")
+	n = rbac.CountKindsConverted(t)
+	add := []rbac.Member{{Group: "a", Principal: identity("u")}, {Group: "b", Principal: identity("u")}, {Group: "c", Principal: identity("u")}}
+	if err := h.authz.ChangeMembers(t.Context(), lead, "t1", add, nil); err != nil || !dropped {
+		t.Fatalf("dropped %t: %v", dropped, err)
+	}
+	if lost {
+		t.Error("a value the call converted was freed while it ran")
+	}
+}
+
 // The member a grant it gains names decides nothing of the actor's power to make it, so members
 // gaining the same grant are decided as one: an actor that changes access on the scope but may not
 // make it is refused it once, however many gain it, having allocated no more for them.

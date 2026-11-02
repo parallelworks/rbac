@@ -933,8 +933,8 @@ func TestWhetherAttributesNestTooDeepIsOfTheLongestPathThroughThem(t *testing.T)
 			expr                       string
 			held                       bool
 		}{
-			// The request's attributes are converted before the resource's, and those before the
-			// subject's.
+			// The request's attributes are converted before the subject's, and those before the
+			// resource's.
 			"a value reached less deep after a path too deep for it": {
 				ok, map[string]any{"v": shared}, map[string]any{"v": nests(1_500, shared)}, `size(resource.attributes.v) == 1`, true,
 			},

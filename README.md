@@ -237,11 +237,12 @@ scopes conditional ones reach, to check one by one.
   misnamed, or as another type, is refused when stored, and one stored under other declarations
   fails where it no longer passes them. A condition building a message, as
   `google.protobuf.Struct{...}`, is refused, and one stored before fails: a grant's gives nothing
-  and a deny's applies. What the host passes as attributes is converted, once for each check that
-  reads a condition, into CEL's own values, and conditions read nothing else: `nil`; a `bool`, a
-  string, an int, a uint or a float of any size, of a type of the host's own too, as a named string,
-  read by its kind; `time.Time` and `time.Duration`; bytes, as `[]byte` or an array of bytes;
-  slices, arrays and pointers of these, a nil pointer read as null; maps of these keyed by a bool, a
+  and a deny's applies. What the host passes as attributes is converted into CEL's own values where
+  a condition is read, the subject's and the request's once for each call, however many scopes a
+  change checks, and the resource's once for each check, and conditions read nothing else: `nil`; a
+  `bool`, a string, an int, a uint or a float of any size, of a type of the host's own too, as a
+  named string, read by its kind; `time.Time` and `time.Duration`; bytes, as `[]byte` or an array
+  of bytes; slices, arrays and pointers of these, a nil pointer read as null; maps of these keyed by a bool, a
   string, an int or a uint, or by an interface holding one; JSON text (`json.RawMessage`, a nil
   one read as null, as `encoding/json` writes it) and `json.Number`, parsed; the protobuf `Struct`, `ListValue`, `Value`, `NullValue`, wrappers,
   `Timestamp` and `Duration`, and an `Any` packing one of them; and CEL's own scalar values.
@@ -256,10 +257,11 @@ scopes conditional ones reach, to check one by one.
   be, along the longest path through them. A value reached twice is converted once. Reading the
   rest left each operator to tell what it read from what it couldn't, as `in`, `has()` and loops
   over a map's keys each found a key whose value no condition could read. A check converts no more
-  than `2 × 80,000` of them, counted as reading them costs a condition, one for each value and a
-  tenth of each string's, bytes', JSON number's, JSON text's or `Any`'s type URL's length, and half
-  an `Any`'s packed bytes, about a map of 50,000 short strings: past that every condition reading an
-  attribute fails. Converting stops 10,000 deep, so what a kind nesting deeper is charged, and
+  than `2 × 80,000` of them, the subject's and the request's included however many checks share
+  them, counted as reading them costs a condition, one for each value and a tenth of each string's,
+  bytes', JSON number's, JSON text's or `Any`'s type URL's length, and half an `Any`'s packed bytes,
+  about a map of 50,000 short strings: past that every condition reading an attribute fails.
+  Converting stops 10,000 deep, so what a kind nesting deeper is charged, and
   whether the kinds after it fit, can turn on the order a map's entries come in, failing closed. The
   subject's, the resource's and the request's attributes share that, so attributes a tenant's users
   write, as a resource's tags, can take every check of the resource past it, where a grant's
