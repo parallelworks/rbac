@@ -2578,6 +2578,36 @@ func TestALiteralPlannedOtherwiseIsNoCondition(t *testing.T) {
 	}
 }
 
+// A comparison, a search or a match that CEL plans as no call, or as a call of another name, as
+// another version of CEL may, isn't a condition: no decorator would refuse it before it runs, so a
+// contains of one long string in another would run whole however long it took, and a comparison
+// would read a double that isn't finite as CEL does.
+func TestACallRefusedBeforeItRunsPlannedOtherwiseIsNoCondition(t *testing.T) {
+	for _, expr := range []string{
+		`request.attributes.s.contains("a")`, `request.attributes.s.startsWith("a")`, `request.attributes.s.endsWith("a")`,
+		`request.attributes.x == 1.0`, `request.attributes.x != 1.0`, `request.attributes.x < 1.0`, `"a" in request.attributes.l`,
+		`request.time.getHours(request.attributes.zone) > 9`, `request.attributes.s.matches("^a")`,
+	} {
+		for how, replan := range map[string]func(interpreter.InterpretableV2) interpreter.InterpretableV2{
+			"as something else": func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, i.ID()} },
+			"as a call of another name": func(i interpreter.InterpretableV2) interpreter.InterpretableV2 {
+				c, ok := i.(interpreter.InterpretableCall)
+				if !ok {
+					t.Fatalf("%s plans %T where it calls", expr, i)
+				}
+				return interpreter.NewCall(c.ID(), "@"+c.Function(), c.OverloadID(), c.Args(), func(...ref.Val) ref.Val { return types.True })
+			},
+		} {
+			if err := rbac.PlanGuardedOtherwise(t, expr, replan); err == nil {
+				t.Errorf("%s with its call planned %s is a condition", expr, how)
+			}
+		}
+		if err := rbac.PlanGuardedOtherwise(t, expr, func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return i }); err != nil {
+			t.Errorf("%s planned as CEL plans it: %v", expr, err)
+		}
+	}
+}
+
 // A conversion to a string where string() has no binding a program can find, as another version of
 // CEL may bind one only once it runs, isn't a condition: it would convert a double that isn't finite
 // unchecked.

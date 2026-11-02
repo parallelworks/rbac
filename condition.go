@@ -425,17 +425,17 @@ func (c *conditions) build(expr string) (program, error) {
 // have, as a test plans a loop as another version of CEL may.
 func plan(env *cel.Env, checked *cel.Ast, patterns map[string]uint64, limit uint64, before ...cel.ProgramOption) (cel.Program, error) {
 	s, k := newStepping(checked.NativeRep(), limit), newKeying(env, checked.NativeRep(), limit)
-	l, str := newLiterals(checked.NativeRep(), limit), &stringing{env: env}
+	l, str, g := newLiterals(checked.NativeRep(), limit), &stringing{env: env}, newGuards(checked.NativeRep())
 	prg, err := env.Program(checked, slices.Concat(before, []cel.ProgramOption{
-		cel.CostLimit(limit), cel.CostTracking(costs{patterns}), cel.OptimizeRegex(matching(patterns)),
-		cel.CustomDecorator(bounded), cel.CustomDecorator(str.decorate), cel.CustomDecoratorV2(s.decorate),
+		cel.CostLimit(limit), cel.CostTracking(costs{patterns}), cel.OptimizeRegex(matching(patterns, g)),
+		cel.CustomDecorator(g.bounded), cel.CustomDecorator(str.decorate), cel.CustomDecoratorV2(s.decorate),
 		cel.CustomDecoratorV2(k.decorate), cel.CustomDecoratorV2(l.decorate),
 	})...)
 	if err != nil {
 		return nil, err
 	}
-	// Another version of CEL may plan a loop's condition, a key or a literal where no decorator
-	// sees it, which would run unbounded too.
+	// Another version of CEL may plan a loop's condition, a key, a literal, or a call refused before
+	// it runs where no decorator sees it, which would run unbounded too.
 	if len(s.stepped) != len(s.ranges) {
 		return nil, errors.New("a loop's condition is planned where this package can't bound it")
 	}
@@ -444,6 +444,9 @@ func plan(env *cel.Env, checked *cel.Ast, patterns map[string]uint64, limit uint
 	}
 	if len(l.planned) != len(l.sizes) {
 		return nil, errors.New("a literal is planned where this package can't charge it")
+	}
+	if len(g.planned) != len(g.ids) {
+		return nil, errors.New("a comparison, a search or a match is planned where this package can't bound it")
 	}
 	return prg, nil
 }
@@ -909,22 +912,14 @@ func comparing(function string, x, y ref.Val) uint64 {
 // cost more than a condition may (searched).
 func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 	call, ok := i.(interpreter.InterpretableCall)
-	if !ok {
+	if !ok || !guarded(call.Function(), len(call.Args())) {
 		return i, nil
 	}
 	if timePart(call.Function()) {
-		if len(call.Args()) != 2 {
-			return i, nil
-		}
 		return inZone(call), nil
 	}
-	switch call.Function() {
-	case overloads.Contains:
-		return searched(call, types.StringContains), nil
-	case overloads.StartsWith:
-		return searched(call, types.StringStartsWith), nil
-	case overloads.EndsWith:
-		return searched(call, types.StringEndsWith), nil
+	if search := searchOf(call.Function()); search != nil {
+		return searched(call, search), nil
 	}
 	// read is what comparing reads of the values.
 	var op func(x, y ref.Val, read uint64) ref.Val
@@ -973,6 +968,47 @@ func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 	}), nil
 }
 
+// guarded reports whether bounded plans a call of function with args arguments to fail before it
+// runs: a comparison, a search of a list or a string, or reading a part of a time in a zone.
+func guarded(function string, args int) bool {
+	switch function {
+	case operators.Equals, operators.NotEquals, operators.Less, operators.LessEquals, operators.Greater, operators.GreaterEquals,
+		operators.In:
+		return true
+	}
+	return searchOf(function) != nil || timePart(function) && args == 2
+}
+
+// guards are the ids of the calls checked holds that bounded or matching refuses before they run,
+// and planned those each planned so: another version of CEL may plan one where neither sees it, as
+// a call by another name, which would run whole before it is charged, however long, or compare a
+// double that isn't finite as CEL does, so plan refuses it, as it refuses a loop it can't bound.
+type guards struct{ ids, planned map[int64]bool }
+
+func newGuards(checked *ast.AST) *guards {
+	g := &guards{ids: map[int64]bool{}, planned: map[int64]bool{}}
+	for _, e := range ast.MatchDescendants(ast.NavigateAST(checked), ast.KindMatcher(ast.CallKind)) {
+		call := e.AsCall()
+		// A method's target is its first argument when it runs.
+		args := len(call.Args())
+		if call.IsMemberFunction() {
+			args++
+		}
+		if guarded(call.FunctionName(), args) || call.FunctionName() == overloads.Matches {
+			g.ids[e.ID()] = true
+		}
+	}
+	return g
+}
+
+// bounded is bounded, noting each call it plans to fail before it runs.
+func (g *guards) bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
+	if call, ok := i.(interpreter.InterpretableCall); ok && g.ids[call.ID()] && guarded(call.Function(), len(call.Args())) {
+		g.planned[call.ID()] = true
+	}
+	return bounded(i)
+}
+
 // inZone is call, reading a part of a time in a zone, failing before it runs for a zone of more
 // than maxZone bytes: loading one copies its name for each place it looks, which zoneCost doesn't
 // count however long it is. It reads the time as CEL does.
@@ -991,6 +1027,19 @@ func inZone(call interpreter.InterpretableCall) interpreter.InterpretableCall {
 		}
 		return t.Receive(function, overload, args[1:])
 	})
+}
+
+// searchOf is what CEL binds function to where it searches a string, or nil where it doesn't.
+func searchOf(function string) func(s, sub ref.Val) ref.Val {
+	switch function {
+	case overloads.Contains:
+		return types.StringContains
+	case overloads.StartsWith:
+		return types.StringStartsWith
+	case overloads.EndsWith:
+		return types.StringEndsWith
+	}
+	return nil
 }
 
 // searched is call, a search of a string as search, which CEL binds it to, failing before it runs
@@ -1760,14 +1809,18 @@ func (c costs) size(pattern ref.Val) uint64 {
 func matchCost(s ref.Val, size uint64) uint64 { return textSize(s) * size }
 
 // matching compiles a condition's patterns once, and refuses a match that would cost more than a
-// whole condition may before running it: a call's cost is counted only once it has run.
-func matching(patterns map[string]uint64) *interpreter.RegexOptimization {
+// whole condition may before running it: a call's cost is counted only once it has run. It notes
+// each match it plans so in g.
+func matching(patterns map[string]uint64, g *guards) *interpreter.RegexOptimization {
 	return &interpreter.RegexOptimization{
 		Function: overloads.Matches, RegexIndex: 1,
 		Factory: func(call interpreter.InterpretableCall, pattern string) (interpreter.InterpretableCall, error) {
 			re, err := regexp.Compile(pattern)
 			if err != nil {
 				return nil, err
+			}
+			if g.ids[call.ID()] {
+				g.planned[call.ID()] = true
 			}
 			size := costs{patterns}.size(types.String(pattern))
 			return interpreter.NewCall(call.ID(), call.Function(), call.OverloadID(), call.Args(), func(args ...ref.Val) ref.Val {

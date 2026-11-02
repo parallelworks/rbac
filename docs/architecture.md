@@ -429,8 +429,9 @@ sequenceDiagram
   operator and choice it may evaluate, on top of what CEL charges, a key a condition computes by its
   length, and `contains`, `startsWith` and `endsWith` by the strings they read, at least 1 however
   empty either is. A comparison, a search or a match that would cost more than a condition may fails
-  before it runs, as CEL charges a call only once it has run. What a check reads together is
-  bounded where it is stored, for each
+  before it runs, as CEL charges a call only once it has run, and a program in which CEL plans one,
+  a literal, a key or a loop's condition where the package can't charge or refuse it isn't a
+  condition. What a check reads together is bounded where it is stored, for each
   scope: an identity's conditional grants, the conditional grants to groups, the tenant's members
   and the public, each the tenant's and those from each source the host owns apart, the conditional
   denies, and the requirements of groups' eligibilities for a role, and a change adding a condition
