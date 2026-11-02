@@ -1493,6 +1493,51 @@ func TestChangingMembersHandsOnNoLongerThanTheActorIsExempt(t *testing.T) {
 	}
 }
 
+// A change's actor that a deny on its path names, as one naming the public names every actor, has
+// the end of its path to each of its groups, and whether a deny exempts it by each, read once for
+// the statement: what reading its authority passes for the deny grows with its groups, not their
+// square.
+func TestAnActorsPathsToItsGroupsAreReadOnceForTheDeniesNamingIt(t *testing.T) {
+	rowsOf := func(t *testing.T, groups int, named rbac.Principal) float64 {
+		t.Helper()
+		h, guardian := guarded(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), granter) })
+		ctx := t.Context()
+		h.seed(t, grant(cluster.Scope(), "cluster.admin", rbac.User, "u"))
+		u := h.as(t, "u")
+		for _, q := range []string{
+			`INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'g' || i FROM generate_series(1, $1::int) i`,
+			`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) SELECT 't1', 'g' || i, 'user', 'u' FROM generate_series(1, $1::int) i`,
+		} {
+			if _, err := h.pool.Exec(ctx, q, groups); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := h.pool.Exec(ctx, `ANALYZE rbac_groups, rbac_members`); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.authz.SetDeny(ctx, guardian, cluster, rbac.Deny{ID: "d", Permissions: []rbac.Permission{root}, Principals: []rbac.Principal{named}, Exempt: []rbac.Principal{groupOf("g1")}}); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		rec := &statementsKept{Tx: tx}
+		if roles, err := h.authz.WithTx(rec).Grantable(ctx, u, cluster); err != nil || len(roles) == 0 {
+			t.Fatalf("Grantable = %v, %v", roles, err)
+		}
+		return planRows(ctx, t, tx, rec.statements)
+	}
+	forTheDeny := func(groups int) float64 {
+		return rowsOf(t, groups, rbac.Principal{Kind: rbac.Public}) - rowsOf(t, groups, identity("other"))
+	}
+	few, many := forTheDeny(100), forTheDeny(400)
+	if many > 6*few {
+		t.Errorf("reading the authority of an actor in 100 groups passed %.0f rows more for a deny naming it, and in 400, %.0f", few, many)
+	}
+}
+
 // Scopes a change to members reaches decide together where the actor holds the same grants on each
 // and no deny tells them apart: one exempting it until a time on one's path does, so what the
 // change hands on there is decided there.

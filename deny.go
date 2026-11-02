@@ -92,12 +92,14 @@ type exemption struct {
 // with when the identity's path to it ends, null for never, and whether a deny exempts it by it
 // (exempted). A group's path ends as ends has it, and the tenant's members' as the membership does;
 // its identity's and the public's never do, as exempted holds the identity whatever its membership.
+// Both are joined by key, each holding a key once: looked up for each key, they would be read
+// whole for each of an identity's thousand groups.
 func lastingSQL(tenant, identity string) string {
 	return fmt.Sprintf(`lasting(k, e, exempts) AS (
-	  SELECT b.k, CASE WHEN b.k LIKE 'group:%%' THEN (SELECT e FROM ends WHERE ends.k = b.k)
+	  SELECT b.k, CASE WHEN b.k LIKE 'group:%%' THEN g.e
 	    WHEN b.k = 'members:' || %[1]s THEN (SELECT e FROM ends WHERE ends.k = %[2]s) END,
-	    b.k IN (SELECT k FROM exempted)
-	  FROM bound b
+	    x.k IS NOT NULL
+	  FROM bound b LEFT JOIN ends g ON g.k = b.k LEFT JOIN exempted x ON x.k = b.k
 	)`, tenant, identity)
 }
 
