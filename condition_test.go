@@ -1536,6 +1536,54 @@ func TestAttributesLargerThanACheckConvertsFailEveryCondition(t *testing.T) {
 	}
 }
 
+// Whether a check's attributes fit what it converts, and which kinds it can read, turns on no
+// order, of the kinds or of a map's entries, but where a value nests past what it converts, 10,000
+// deep: JSON text was parsed only where it might hold no more values than were left, which it
+// counted by its brackets, commas and colons, more than it holds where it is invalid, holds an
+// empty list or object, or a key twice. So `[]` beside a string just fitting what a check converts
+// failed every kind's attributes where the string was converted first, and not where the text was,
+// and a call converting the subject's attributes before the resource's, rather than after, read
+// them where it failed them before.
+func TestWhetherAttributesFitTurnsOnNoOrder(t *testing.T) {
+	// A string's name and value cost two, and a tenth of its length, and `[]`'s three.
+	exact := strings.Repeat("x", 10*(rbac.MaxConverted-5))
+	empty := json.RawMessage("[]")
+	if held, _ := rbac.EvaluateConditionOf(t, `has(subject.attributes.s) && size(resource.attributes.j) == 0`,
+		map[string]any{"s": exact}, map[string]any{"j": empty}, nil); !held {
+		t.Error("the resource's empty JSON list after the subject's string, just fitting what a check converts")
+	}
+	for range 50 {
+		if held, _ := rbac.EvaluateConditionOf(t, `has(request.attributes.s) && size(request.attributes.j) == 0`,
+			nil, nil, map[string]any{"s": exact, "j": empty}); !held {
+			t.Fatal("a request's empty JSON list beside its string, just fitting what a check converts")
+		}
+	}
+	seed := uint64(time.Now().UnixNano())
+	t.Logf("seed %d", seed)
+	rng := rand.New(rand.NewPCG(seed, 31))
+	orders := [][3]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
+	for trial := range 300 {
+		shared := drawnShared(rng, false)
+		kinds := [3]map[string]any{drawnAttributes(rng, shared, false), drawnAttributes(rng, shared, false), drawnAttributes(rng, shared, false)}
+		var first []bool
+		var firstOver bool
+		for i, o := range orders {
+			read, over := rbac.ConvertedInOrder(t, kinds[o[0]], kinds[o[1]], kinds[o[2]])
+			inOrder := make([]bool, 3)
+			for j, k := range o {
+				inOrder[k] = read[j] && !over
+			}
+			if i == 0 {
+				first, firstOver = inOrder, over
+				continue
+			}
+			if over != firstOver || !slices.Equal(inOrder, first) {
+				t.Fatalf("trial %d: in order %v, read %v and over %t; in order %v, read %v and over %t", trial, orders[0], first, firstOver, o, inOrder, over)
+			}
+		}
+	}
+}
+
 // What a check reads of each kind's attributes is what a check alone reads, however many checks of
 // its call converted the subject's and the request's before it, and which kinds it reads is what
 // converting all three at once would read: it counts the subject's and the request's, converted

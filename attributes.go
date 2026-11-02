@@ -85,8 +85,9 @@ import (
 // maxConverted of what the host passes, counted as reading it costs a condition, one for each value
 // and a tenth of each string's, bytes', JSON number's, JSON text's or packed type URL's length, and
 // half a packed message's, as a packed value takes as few as two bytes, each kind whole, whether it
-// can be read or not: past that, every condition reading an attribute of any kind fails, and JSON
-// text that may hold more values than are left isn't parsed. A call converts the subject's and the
+// can be read or not: past that, every condition reading an attribute of any kind fails, as it does
+// where JSON text may hold more values than that, by its brackets, braces, commas and colons, which
+// isn't parsed. A call converts the subject's and the
 // request's attributes once, the first time one of its checks reads a condition, for every check it
 // makes with them, as a change does on each scope it reaches, and each check its resource's after
 // them, counting all three as though it had converted them itself, so whether a check is past that
@@ -95,7 +96,8 @@ import (
 // attributes as they were, and a value the resource's share with them, though never another value
 // as one of them. Where a kind nests past 10,000 deep, converting stops there, so what it is
 // charged, and whether the kinds after it fit what is left, can turn on the order a map's entries
-// come in: either way it can't be read, and the others are read or, past what is left, fail. The
+// come in: either way it can't be read, and the others are read or, past what is left, fail.
+// Nothing else converting finds turns on that order, nor on the order of the kinds. The
 // subject's, the resource's and the request's attributes share it, so attributes a tenant's users
 // write, as a resource's tags, can take every check of the resource past that, where a grant's
 // condition reading an attribute gives nothing and a deny's applies, whoever asks: bound what
@@ -583,15 +585,19 @@ func holdsKey(m map[ref.Val]ref.Val, k ref.Val) bool {
 }
 
 // json is v, JSON text, parsed, at a tenth of its length, once for each text a check passes, and
-// how deep it nests. Text that may hold more values than are left isn't parsed: a value takes as
-// few as two bytes, as `0,`, and parsing a mebibyte of them, only to find more than a check may
-// convert, took a tenth of a second and 80 MB.
+// how deep it nests. Text that may hold more values than a check converts isn't parsed: a value
+// takes as few as two bytes, as `0,`, and parsing a mebibyte of them, only to find more than a
+// check may convert, took a tenth of a second and 80 MB. That is of the text alone, not of what
+// is left: what it may hold is more than it holds where it is invalid, holds an empty list or
+// object, or a key twice, so compared with what was left, a text of `[]` beside a resource's
+// string just fitting what a check converts failed every kind's attributes where the string was
+// converted first, and not where the text was, as the order a map's entries come in decides.
 func (c *converter) json(v reflect.Value) (ref.Val, int) {
 	return c.once(v, func() (ref.Val, int) {
 		if !c.pay(length(v.Len()) / 10) {
 			return nil, 0
 		}
-		if jsonValues(v.Bytes()) > c.left {
+		if jsonValues(v.Bytes()) > maxConverted {
 			c.over, c.left = true, 0
 			return nil, 0
 		}
@@ -604,8 +610,8 @@ func (c *converter) json(v reflect.Value) (ref.Val, int) {
 	})
 }
 
-// jsonValues is at least how many values and keys JSON text text holds: each but the first follows
-// a bracket, a brace, a comma or a colon outside a string.
+// jsonValues is how many values and keys JSON text text may hold: each but the first follows a
+// bracket, a brace, a comma or a colon outside a string. Parsed, it may hold fewer.
 func jsonValues(text []byte) uint64 {
 	n, quoted := uint64(1), false
 	for i := 0; i < len(text); i++ {

@@ -260,9 +260,11 @@ scopes conditional ones reach, to check one by one.
   than `2 × 80,000` of them, the subject's and the request's included however many checks share
   them, counted as reading them costs a condition, one for each value and a tenth of each string's,
   bytes', JSON number's, JSON text's or `Any`'s type URL's length, and half an `Any`'s packed bytes,
-  about a map of 50,000 short strings: past that every condition reading an attribute fails.
-  Converting stops 10,000 deep, so what a kind nesting deeper is charged, and whether the kinds
-  after it fit, can turn on the order a map's entries come in, failing closed. The subject's, the
+  about a map of 50,000 short strings: past that every condition reading an attribute fails, as it
+  does where JSON text may hold more, by its brackets, braces, commas and colons. Converting stops
+  10,000 deep, so what a kind nesting deeper is charged, and whether the kinds after it fit, can
+  turn on the order a map's entries come in, failing closed, and nothing else turns on that order,
+  nor on the order of the kinds. The subject's, the
   resource's and the request's attributes share that, so attributes a tenant's users write, as a
   resource's tags, can take every check of the resource past it, where a grant's condition reading
   an attribute gives nothing and a deny's applies, whoever asks: bound what users may store, or pass
