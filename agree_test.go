@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -286,6 +287,223 @@ func TestListingsAgreeWithChecksInRandomTenants(t *testing.T) {
 				for _, p := range []rbac.Permission{view, login, root} {
 					w.holdersAgree(t, p, r)
 				}
+			}
+		})
+	}
+}
+
+// TestDenyLookupsAgreeWithOverlapsInRandomTenants builds tenants of many denies at random, naming and
+// exempting identities, groups in groups, in cycles too, the tenant's members and the public, some
+// of them hundreds of principals, of permissions and of every permission on a type. For members,
+// guests, suspended members, identities whose membership or places have ended or will, one of
+// another tenant, one of none and the anonymous, it checks that every read of the denies binding a
+// subject, which looks each of a deny's keys up, finds what the overlap of arrays found
+// (DeniesMatched), now and as of a time; that Authorize refuses where one of them binds; and that
+// Filter, Reachable and Holders agree with Authorize.
+func TestDenyLookupsAgreeWithOverlapsInRandomTenants(t *testing.T) {
+	viewer := rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
+	for seed := range uint64(12) {
+		t.Run(fmt.Sprint("seed", seed), func(t *testing.T) {
+			rng := rand.New(rand.NewPCG(seed, seed))
+			pick := rng.IntN
+			h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), viewer) })
+			ctx := t.Context()
+			// History dates what is written by the database's clock, which AsOf reads by.
+			h.now = dbNow(t, h)
+			exec := func(sql string, args ...any) {
+				t.Helper()
+				if _, err := h.pool.Exec(ctx, sql, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			w := world{h: h, guests: map[string]bool{}, outside: map[string]bool{}, inactive: map[string]bool{}}
+			orgs := []rbac.Scope{{Type: "org", ID: "o0"}, {Type: "org", ID: "o1"}}
+			spaces := [][]rbac.Scope{{{Type: "workspace", ID: "w0"}, orgs[0]}, {{Type: "workspace", ID: "w1"}, orgs[0]}, {{Type: "workspace", ID: "w2"}, orgs[1]}}
+			exec(`CREATE TABLE clusters (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL)`)
+			scopes := []string{"tenant:t1", "org:o0", "org:o1", "workspace:w0", "workspace:w1", "workspace:w2"}
+			for i := range 6 {
+				r := rbac.Resource{Tenant: "t1", Type: "cluster", ID: fmt.Sprint("c", i), Ancestors: spaces[i%len(spaces)]}
+				exec(`INSERT INTO clusters VALUES ($1, $2, $3)`, r.Tenant, r.ID, h.path(t, r))
+				w.clusters = append(w.clusters, r)
+				scopes = append(scopes, r.Scope().Key())
+			}
+			// None, one passed, or one to come.
+			end := func() any {
+				switch pick(4) {
+				case 0:
+					return h.now.Add(-time.Hour)
+				case 1:
+					return h.now.Add(time.Duration(1+pick(48)) * time.Hour)
+				}
+				return nil
+			}
+			groups := []string{"g0", "g1", "g2", "g3", "g4"}
+			h.groups(t, groups...)
+			for _, outer := range groups {
+				for _, inner := range groups {
+					if inner != outer && pick(4) == 0 {
+						exec(`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, expires_at) VALUES ('t1', $1, 'group', $2, $3)`, outer, inner, end())
+					}
+				}
+			}
+			// One of each kind in every tenant: a guest, suspended, its membership ended, ending, of
+			// another tenant, and members.
+			users := []string{"u0", "u1", "u2", "u3", "u4", "u5", "u6"}
+			for i, u := range users {
+				var in []string
+				for _, g := range groups {
+					if pick(3) == 0 {
+						in = append(in, g)
+					}
+				}
+				w.subjects = append(w.subjects, h.as(t, u, in...))
+				for _, g := range in {
+					exec(`UPDATE rbac_members SET expires_at = $3 WHERE tenant = 't1' AND group_id = $1 AND principal = $2`, g, "user:"+u, end())
+				}
+				switch (i + int(seed)) % len(users) {
+				case 0:
+					exec(`UPDATE rbac_memberships SET guest = true WHERE tenant = 't1' AND principal = $1`, "user:"+u)
+					w.guests[u] = true
+				case 1:
+					exec(`UPDATE rbac_memberships SET suspended = true WHERE tenant = 't1' AND principal = $1`, "user:"+u)
+					w.inactive[u] = true
+				case 2:
+					exec(`UPDATE rbac_memberships SET expires_at = $2 WHERE tenant = 't1' AND principal = $1`, "user:"+u, h.now.Add(-time.Hour))
+					w.inactive[u] = true
+				case 3:
+					exec(`UPDATE rbac_memberships SET expires_at = $2 WHERE tenant = 't1' AND principal = $1`, "user:"+u, h.now.Add(time.Duration(1+pick(48))*time.Hour))
+				case 4:
+					exec(`UPDATE rbac_memberships SET tenant = 't2' WHERE tenant = 't1' AND principal = $1`, "user:"+u)
+					w.outside[u] = true
+				}
+			}
+			w.outside["nobody"] = true
+			w.subjects = append(w.subjects, rbac.Subject{Principal: identity("nobody")}, rbac.Subject{})
+			grants := []rbac.Grant{
+				{Scope: rbac.TenantRoot("t1"), Binding: rbac.Binding{Role: viewer.ID, Principal: rbac.Principal{Kind: rbac.Public}}},
+				{Scope: orgs[0], Binding: rbac.Binding{Role: "cluster.login", Principal: rbac.TenantMembers("t1")}},
+				grant(rbac.TenantRoot("t1"), "cluster.admin", rbac.User, users[pick(len(users))]),
+			}
+			for _, u := range users {
+				if pick(3) > 0 {
+					scopeType, scopeID, _ := strings.Cut(scopes[pick(len(scopes))], ":")
+					grants = append(grants, grant(rbac.Scope{Type: scopeType, ID: scopeID}, "cluster.sudo", rbac.User, u))
+				}
+			}
+			h.seed(t, grants...)
+			perms := []rbac.Permission{view, login, root, grantC}
+			before := map[string]bool{}
+			at := func(s rbac.Subject, p rbac.Permission, on string) string {
+				return fmt.Sprint(s.Principal, " ", p, " on ", on)
+			}
+			for _, s := range w.subjects {
+				for _, p := range perms {
+					for _, r := range w.clusters {
+						before[at(s, p, r.ID)] = allowed(t, h, s, p, r)
+					}
+				}
+			}
+			// Each names a few principals, or those and hundreds more, and may exempt a few, or hundreds.
+			principal := func() string {
+				switch k := pick(20); {
+				case k < 7:
+					return "user:" + append(slices.Clone(users), "nobody")[pick(len(users)+1)]
+				case k < 14:
+					return "group:" + groups[pick(len(groups))]
+				case k < 17:
+					return "members:t1"
+				}
+				return "public:"
+			}
+			deniable := []string{"cluster:view", "cluster:login", "cluster:root", "cluster:grant", "cluster:*", "workspace:view", "workspace:grant", "workspace:*", "tenant:grant", "tenant:*"}
+			// Few in some tenants, so some subjects are bound by none, and many in others.
+			denies := 40 + pick(40)
+			if seed%2 == 0 {
+				denies = 2 + pick(6)
+			}
+			for i := range denies {
+				named := map[string]bool{}
+				principals, exempt, permissions := []string{}, []string{}, []string{}
+				for range 1 + pick(3) {
+					if k := principal(); !named[k] {
+						named[k] = true
+						principals = append(principals, k)
+					}
+				}
+				if pick(3) == 0 {
+					for j := range 250 {
+						principals = append(principals, fmt.Sprintf("group:x%d_%d", i, j))
+					}
+				}
+				if pick(5) > 1 {
+					for range 1 + pick(3) {
+						if k := principal(); !named[k] && k != "public:" && (k != "members:t1" || named["public:"]) {
+							named[k] = true
+							exempt = append(exempt, k)
+						}
+					}
+					if pick(3) == 0 {
+						for j := range 250 {
+							exempt = append(exempt, fmt.Sprintf("user:y%d_%d", i, j))
+						}
+					}
+				}
+				for range 1 + pick(2) {
+					if p := deniable[pick(len(deniable))]; !slices.Contains(permissions, p) {
+						permissions = append(permissions, p)
+					}
+				}
+				scopeType, scopeID, _ := strings.Cut(scopes[pick(len(scopes))], ":")
+				exec(`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions) VALUES ('t1', $1, $2, $3, $4, $5, $6)`,
+					scopeType, scopeID, fmt.Sprint("d", i), principals, exempt, permissions)
+			}
+			matched := func(a *rbac.Authorizer, when string, resources []rbac.Resource, perms []rbac.Permission) map[string][]string {
+				t.Helper()
+				checked := map[string][]string{}
+				for _, s := range w.subjects {
+					for _, read := range rbac.DeniesMatched(t, ctx, a, s, resources, perms) {
+						if !slices.Equal(read.Got, read.Want) {
+							t.Errorf("%s, %v on %q of %q: %s read %v, the overlap of arrays %v", when, s.Principal, read.On, read.Permission, read.Read, read.Got, read.Want)
+						}
+						if read.Read == "check" {
+							checked[at(s, read.Permission, read.On)] = read.Want
+						}
+					}
+				}
+				return checked
+			}
+			checked := matched(h.authz, "now", w.clusters, perms)
+			for _, s := range w.subjects {
+				for _, p := range perms {
+					for _, r := range w.clusters {
+						want := before[at(s, p, r.ID)] && len(checked[at(s, p, r.ID)]) == 0
+						if got := allowed(t, h, s, p, r); got != want {
+							t.Errorf("%v %s on %s: Authorize allows %v, though it allowed %v before the denies, and these bind it: %v", s.Principal, p, r.ID, got, before[at(s, p, r.ID)], checked[at(s, p, r.ID)])
+						}
+					}
+				}
+			}
+			for _, s := range w.subjects {
+				for _, p := range []rbac.Permission{view, login, root} {
+					want := allowedOf(t, h, w.clusters, s, p)
+					if got := listed(t, h, s, p); !slices.Equal(got, want) {
+						t.Errorf("%v %s: Filter %v, Authorize %v", s.Principal, p, got, want)
+					}
+					if reached, _ := reachedBy(t, h, w.clusters, s, p); !slices.Equal(reached, want) {
+						t.Errorf("%v %s: Reachable %v, Authorize %v", s.Principal, p, reached, want)
+					}
+				}
+			}
+			for _, r := range w.clusters[:3] {
+				for _, p := range []rbac.Permission{view, login, root} {
+					w.holdersAgree(t, p, r)
+				}
+			}
+			if err := h.authz.AsOf(ctx, "t1", dbNow(t, h), func(a *rbac.Authorizer) error {
+				matched(a, "as of now", w.clusters[:1], []rbac.Permission{view, root})
+				return nil
+			}); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}

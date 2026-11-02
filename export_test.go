@@ -573,6 +573,170 @@ func GrantsDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subje
 	return together, alone
 }
 
+// overlapSQL is how the denies binding a subject were matched to its keys before they were looked
+// up in objects, kept as what the lookups must agree with: by the overlap of arrays, which compares
+// each of a deny's keys with every one of the subject's. It reads the denies, on the scopes $3 or
+// every scope where it is NULL, naming a key the identity $2, empty for the anonymous, is bound by
+// in the tenant $1 at $4, of any permission, with whether one exempts it, and where one does but not
+// for good, when its exemption ends where the deny binds it past then.
+var overlapSQL = `WITH RECURSIVE ` + keysSQL("$1::text", "$2::text", "$4") + `, ` + endsSQL("$2", "$4") + `, ` +
+	lastingSQL("$1::text", "$2::text") + `
+	SELECT id, scope, permissions, exempt && ARRAY(SELECT k FROM exempted), CASE
+	  WHEN exempt && ARRAY(SELECT k FROM exempted) AND NOT exempt && ARRAY(SELECT k FROM lasting WHERE exempts AND e IS NULL) THEN (
+	    SELECT max(x.e) FROM lasting x WHERE x.exempts AND x.k = ANY(exempt)
+	    HAVING max(x.e) < (SELECT max(coalesce(y.e, 'infinity')) FROM lasting y WHERE y.k = ANY(principals))) END
+	FROM rbac_denies WHERE tenant = $1 AND ($3::text[] IS NULL OR scope = ANY($3::text[])) AND principals && ARRAY(SELECT k FROM bound)`
+
+// DenyRead is what one read of the denies binding a subject found, and what it should have, as the
+// overlap of arrays finds them (overlapSQL): each "id on scope", with " until" and a time for one a
+// change reads as exempting the subject only until then, sorted. On and Permission are what it read
+// them on and of, where it did.
+type DenyRead struct {
+	Read       string
+	On         string
+	Permission Permission
+	Got, Want  []string
+}
+
+// DeniesMatched is each read of the denies binding s in a tenant: on each of resources, a check's of
+// each of permissions and of its label values with it (readHeld), Explain's (deniesOn), Permissions'
+// of any permission, and a change's with when its exemptions end; Holders' of its label values
+// (valuesOfAll); and of those anywhere in the tenant, the types ChangeMembers reads (grantsDenied)
+// and whether SetRole finds one below the tenant (deniedBelow); each with what the overlap of arrays
+// finds for it.
+func DeniesMatched(t *testing.T, ctx context.Context, a *Authorizer, s Subject, resources []Resource, permissions []Permission) []DenyRead {
+	t.Helper()
+	a = a.still()
+	tenant := resources[0].Tenant
+	tenantKey := TenantRoot(tenant).Key()
+	type overlapped struct {
+		name, scope string
+		permissions []Permission
+		exempts     bool
+		until       time.Time
+	}
+	var found []overlapped
+	rows, err := a.db.Query(ctx, overlapSQL, tenant, s.identityKey(), nil, a.cfg.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var id string
+	var o overlapped
+	var perms []string
+	var until *time.Time
+	if _, err := pgx.ForEachRow(rows, []any{&id, &o.scope, &perms, &o.exempts, &until}, func() error {
+		o.name, o.permissions, o.until = id+" on "+o.scope, nil, time.Time{}
+		for _, x := range perms {
+			o.permissions = append(o.permissions, Permission(x))
+		}
+		if until != nil {
+			o.until = *until
+		}
+		found = append(found, o)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	keys, binding, err := a.keysOf(ctx, a.db, tenant, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exemptUntil := func(name string, until time.Time) string {
+		return name + " until " + until.UTC().Format(time.RFC3339Nano)
+	}
+	want := func(keep func(o overlapped) bool) []string {
+		var names []string
+		for _, o := range found {
+			switch {
+			case !keep(o):
+			case o.exempts:
+				names = append(names, exemptUntil(o.name, o.until))
+			default:
+				names = append(names, o.name)
+			}
+		}
+		slices.Sort(names)
+		return names
+	}
+	binds := func(o overlapped) bool { return !o.exempts }
+	names := func(ds []denial) []string {
+		var names []string
+		for _, d := range ds {
+			names = append(names, d.id+" on "+d.scope)
+		}
+		return names
+	}
+	var reads []DenyRead
+	add := func(read string, r *Resource, p Permission, got, want []string) {
+		slices.Sort(got)
+		on := ""
+		if r != nil {
+			on = r.ID
+		}
+		reads = append(reads, DenyRead{read, on, p, got, want})
+	}
+	fail := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, r := range resources {
+		path := r.path()
+		onPath := func(o overlapped) bool { return slices.Contains(path, o.scope) }
+		for _, p := range permissions {
+			listing := func(o overlapped) bool { return onPath(o) && binds(o) && denies(o.permissions, p) }
+			// A check reads none for a subject none of whose keys count, and none of its label values
+			// for the anonymous where the public's don't.
+			counts := a.counting(p, r.Type)
+			counted := len(countedOf(keys, counts)) > 0
+			checked, err := a.readHeld(ctx, a.db, tenant, s, counts, path, p, namedRoles, alsoRead{values: true})
+			fail(err)
+			add("check", &r, p, names(checked.ds), want(func(o overlapped) bool { return counted && listing(o) }))
+			valued := s.Principal != (Principal{}) || counts.public
+			add("label values", &r, p, names(checked.values.ds), want(func(o overlapped) bool { return valued && o.scope == tenantKey && binds(o) }))
+			explained, err := a.deniesOn(ctx, a.db, tenant, binding, exempting(keys, s), path, p)
+			fail(err)
+			add("explain", &r, p, names(explained), want(listing))
+		}
+		_, ds, _, err := a.heldOrDenied(ctx, a.db, tenant, s, all, path, namedRoles)
+		fail(err)
+		add("permissions", &r, "", names(ds), want(func(o overlapped) bool { return onPath(o) && binds(o) }))
+		changing, err := a.readHeld(ctx, a.db, tenant, s, all, path, "", tenantRoles, alsoRead{ending: true})
+		fail(err)
+		got := names(changing.ds)
+		for _, e := range changing.exempt {
+			got = append(got, exemptUntil(e.id+" on "+e.scope, e.until))
+		}
+		add("change", &r, "", got, want(func(o overlapped) bool { return onPath(o) && (binds(o) || !o.until.IsZero()) }))
+	}
+	if s.Principal != (Principal{}) {
+		values, err := a.valuesOfAll(ctx, a.db, tenant, []string{s.identityKey()})
+		fail(err)
+		add("holders' label values", nil, "", names(values[s.identityKey()].ds), want(func(o overlapped) bool { return o.scope == tenantKey && binds(o) }))
+	}
+	types, err := a.grantsDenied(ctx, a.db, tenant, s)
+	fail(err)
+	wanted := map[string]bool{}
+	for _, o := range found {
+		for _, x := range o.permissions {
+			if typ, verb := x.parts(); binds(o) && (verb == "grant" || verb == "*") {
+				wanted[typ] = true
+			}
+		}
+	}
+	add("grants denied", nil, "", slices.Collect(maps.Keys(types)), slices.Sorted(maps.Keys(wanted)))
+	for _, exempting := range []bool{false, true} {
+		below, err := a.deniedBelow(ctx, a.db, tenant, s, exempting)
+		fail(err)
+		bound := slices.ContainsFunc(found, func(o overlapped) bool {
+			return !strings.HasPrefix(o.scope, TenantScope+":") && (binds(o) || exempting && !o.until.IsZero())
+		})
+		add(fmt.Sprint("denied below, exempting ", exempting), nil, "", []string{fmt.Sprint(below)}, []string{fmt.Sprint(bound)})
+	}
+	return reads
+}
+
 // StandSQL is the statement a change reads the standing of its principals with.
 var StandSQL = standSQL
 

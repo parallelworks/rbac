@@ -93,31 +93,40 @@ type exemption struct {
 // (exempted). A group's path ends as ends has it, and the tenant's members' as the membership does;
 // its identity's and the public's never do, as exempted holds the identity whatever its membership.
 // Both are joined by key, each holding a key once: looked up for each key, they would be read
-// whole for each of an identity's thousand groups.
+// whole for each of an identity's thousand groups. It defines lasts(at, exempting, ends) too, read
+// once for a statement: the ends, with never as infinity, and objects of the keys, and of those
+// exempting it, each giving its end's subscript, so a deny's keys are looked up in them, a few
+// comparisons each, rather than compared with every key the identity is in.
 func lastingSQL(tenant, identity string) string {
 	return fmt.Sprintf(`lasting(k, e, exempts) AS (
 	  SELECT b.k, CASE WHEN b.k LIKE 'group:%%' THEN g.e
 	    WHEN b.k = 'members:' || %[1]s THEN (SELECT e FROM ends WHERE ends.k = %[2]s) END,
 	    x.k IS NOT NULL
 	  FROM bound b LEFT JOIN ends g ON g.k = b.k LEFT JOIN exempted x ON x.k = b.k
+	), lasts(at, exempting, ends) AS (
+	  SELECT coalesce(jsonb_object_agg(k, n), '{}'), coalesce(jsonb_object_agg(k, n) FILTER (WHERE exempts), '{}'),
+	    array_agg(coalesce(e, 'infinity') ORDER BY n)
+	  FROM (SELECT k, e, exempts, row_number() OVER () AS n FROM lasting) l
 	)`, tenant, identity)
 }
 
-// exemptForGoodSQL is SQL for the keys lastingSQL reads that exempt the identity for good, as its
-// own does: uncorrelated, so a statement reads them once, and a deny exempting it by one is told by
-// its keys alone.
-const exemptForGoodSQL = `ARRAY(SELECT k FROM lasting WHERE exempts AND e IS NULL)`
+// exemptForGoodSQL is SQL for whether the array of keys exempt holds one lastingSQL reads that
+// exempts the identity for good, as its own does: looked up in one object of them, built once for a
+// statement (keyed), so a deny exempting it by one is told by its keys alone.
+func exemptForGoodSQL(exempt string) string {
+	return keyed(exempt, "SELECT k FROM lasting WHERE exempts AND e IS NULL")
+}
 
 // exemptUntilSQL is SQL for when the identity's exemption from a deny, SQL for whose principals and
 // exemptions lastingSQL reads, ends where the deny binds it past then: the latest end of its paths to
 // the keys exempting it, where each ends, before the latest of those to the keys it binds it by.
 // Null where it isn't exempt, is exempt for good (exemptForGoodSQL), or is bound no longer than it is
-// exempt.
+// exempt. Each of the deny's keys is looked up in lasts.
 func exemptUntilSQL(principals, exempt string) string {
-	return fmt.Sprintf(`CASE WHEN NOT %[2]s && `+exemptForGoodSQL+` THEN (
-	  SELECT max(x.e) FROM lasting x WHERE x.exempts AND x.k = ANY(%[2]s)
-	  HAVING max(x.e) < (SELECT max(coalesce(y.e, 'infinity')) FROM lasting y WHERE y.k = ANY(%[1]s))) END`,
-		principals, exempt)
+	return fmt.Sprintf(`CASE WHEN NOT %[3]s THEN (
+	  SELECT max(l.ends[(l.exempting ->> x)::int]) FROM lasts l, unnest(%[2]s) AS x
+	  HAVING max(l.ends[(l.exempting ->> x)::int]) < (SELECT max(l.ends[(l.at ->> y)::int]) FROM lasts l, unnest(%[1]s) AS y)) END`,
+		principals, exempt, exemptForGoodSQL(exempt))
 }
 
 // deniesOn reads the denies on scopes that name one of binding and exempt none of exempt, the
@@ -127,10 +136,10 @@ func (a *Authorizer) deniesOn(ctx context.Context, q DB, tenant string, binding,
 	if binding != nil && len(binding) == 0 || !ok {
 		return nil, nil
 	}
+	binds := `($3::text[] IS NULL OR ` + keyed("principals", "SELECT unnest($3::text[])") + ` AND NOT ` + keyed("exempt", "SELECT unnest($6::text[])") + `)`
 	// In the order a check reads them, so Explain names the deny Authorize does.
-	rows, err := q.Query(ctx, byKey("$2", "rbac_denies", "scope", "id, scope, permissions, principals, exempt, condition", `tenant = $1
-		  AND ($3::text[] IS NULL OR principals && $3::text[] AND NOT exempt && $6::text[])
-		  AND ($4 = ANY(permissions) OR $5 = ANY(permissions))`)+`
+	rows, err := q.Query(ctx, byKey("$2", "rbac_denies", "scope", "id, scope, permissions, principals, exempt, condition",
+		`tenant = $1 AND `+bindsIfRead("$4 = ANY(permissions) OR $5 = ANY(permissions)", binds))+`
 		ORDER BY id, scope`,
 		tenant, scopes, binding, perm, wildcard, exempt)
 	if err != nil {

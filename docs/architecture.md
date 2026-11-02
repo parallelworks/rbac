@@ -1035,7 +1035,7 @@ refuses a row of more than 1 MiB as jsonb all the same.
 | `MaxID` | 512 bytes | A tenant's, scope's or principal's id. |
 | `MaxBindings` | 1,000 | Bindings in one `Apply`, and the grants, memberships, groups or members one `Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`, `DeleteGroups`, `ImportMembers`, `ChangeMembers` or `DeleteMembers` takes, and the grants and eligibilities the members one `ChangeMembers` adds gain, each member's counted apart, by its principal, as `ValidateGrant` is asked about each, but no more than one place alone gains, whatever its group and those it is in hold. The host's own `ImportMembers` is asked about each with no such bound. |
 | `MaxGrantsPerRole` | 20 | Grants in force of one role to one principal on one scope, differing by source, expiry or condition. Those from each source the host owns count apart. |
-| `MaxDenies`, `MaxDenyEntries` | 100, 256 | Denies on a scope, and the principals, exemptions or permissions one names. |
+| `MaxDenies`, `MaxDenyEntries` | 100, 256 | Denies on a scope, and the principals, exemptions or permissions one names. A check, a list and a change's read of its actor's authority look each principal and exemption a deny names up in objects of the keys their subject is bound and exempted by, built once for the statement, so a deny costs them about its own length however many groups the subject is in; a check of a permission passes over a deny of another before looking any up. |
 | `MaxCustomRoles`, `MaxRoleEntries`, `MaxGrantableRoles` | 300, 1,000, 64 | Custom roles in a tenant, the permissions one gives and the types it is for, and roles one lists in `GrantableRoles`. |
 | `MaxApprovers`, `MaxActivation` | 16, 366 days | An eligibility's approvers, and its longest activation. |
 | `MaxGroupDepth` | 8 | How deeply groups nest. |
@@ -1051,8 +1051,10 @@ refuses a row of more than 1 MiB as jsonb all the same.
 `MaxGroupsOfPrincipal` and `MaxGroupDepth` bound the groups a subject reaches only level by level. A
 check reads every group its subject is in, and every group those are in, each once, so an identity
 in 300 groups, each in 300 others, is within every bound, and each of its checks reads 90,300
-groups, for over half a second: only the tenant's groups bound how many. Bounding the groups
-reached would have each change nesting a group read, for every identity under it, every other
-group that identity is in, under the lock that serializes nesting in the tenant: nesting a group of
-20,000 identities, each in about 50 groups, would read a million rows, for seconds, while every
-other nesting in the tenant waits. Keeping nesting narrow is the host's, and the group managers'.
+groups, for over half a second: only the tenant's groups bound how many. The denies on its path cost
+it no more for them: each key a deny names is looked up among the subject's, where an overlap of
+arrays would compare it with every one of the 90,300. Bounding the groups reached would have each
+change nesting a group read, for every identity under it, every other group that identity is in,
+under the lock that serializes nesting in the tenant: nesting a group of 20,000 identities, each in
+about 50 groups, would read a million rows, for seconds, while every other nesting in the tenant
+waits. Keeping nesting narrow is the host's, and the group managers'.

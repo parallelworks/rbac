@@ -2571,7 +2571,7 @@ func (a *Authorizer) grantsDenied(ctx context.Context, q DB, tenant string, acto
 	rows, err := q.Query(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`
 		SELECT DISTINCT p FROM rbac_denies d CROSS JOIN LATERAL unnest(d.permissions) AS p
 		WHERE `+naming("d.principals", "ARRAY(SELECT k FROM bound)")+` AND rbac_changes_grants(d.permissions)
-		  AND NOT d.exempt && ARRAY(SELECT k FROM exempted)`,
+		  AND NOT `+keyed("d.exempt", "SELECT k FROM exempted"),
 		tenant, actor.identityKey(), a.cfg.Now())
 	if err != nil {
 		return nil, err

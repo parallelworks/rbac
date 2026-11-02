@@ -728,7 +728,7 @@ func (a *Authorizer) valuesOfAll(ctx context.Context, q DB, tenant string, ident
 		SELECT 1, id, principal, role, expires_at, condition, NULL, NULL, NULL, false, false, '', '' FROM held
 		UNION ALL
 		SELECT 2, id, '', '', NULL, condition, permissions, principals, exempt, false, false, '', '' FROM rbac_denies
-		WHERE tenant = $1 AND scope = 'tenant:' || $1 AND principals && ARRAY(SELECT DISTINCT unnest(bound) FROM idents)
+		WHERE tenant = $1 AND scope = 'tenant:' || $1 AND `+keyed("principals", "SELECT unnest(bound) FROM idents")+`
 		UNION ALL
 		SELECT 3, id, '', '', NULL, '', permissions, resource_types, grantable_roles, privileged, public, name, description
 		FROM (`+byKey(namedCustom("SELECT role FROM held"), "rbac_roles", "id", roleColumns, "tenant = $1")+`) r
@@ -737,8 +737,8 @@ func (a *Authorizer) valuesOfAll(ctx context.Context, q DB, tenant string, ident
 		return nil, err
 	}
 	// Grants by principal, role and id, and denies by id, as a read of one identity's orders them.
-	type keyed struct{ keys, bound, exempted []string }
-	byIdentity := map[string]keyed{}
+	type identityKeys struct{ keys, bound, exempted []string }
+	byIdentity := map[string]identityKeys{}
 	var grants []holding
 	at := map[string][]int{}
 	var ds []denial
@@ -752,7 +752,7 @@ func (a *Authorizer) valuesOfAll(ctx context.Context, q DB, tenant string, ident
 	if _, err := pgx.ForEachRow(rows, []any{&kind, &id, &principal, &role, &expires, &condition, &first, &second, &third, &privileged, &public, &name, &description}, func() error {
 		switch kind {
 		case 0:
-			byIdentity[id] = keyed{first, second, third}
+			byIdentity[id] = identityKeys{first, second, third}
 		case 1:
 			h := holding{
 				Binding: Binding{ID: id, Principal: parsePrincipal(principal), Role: Role(role), Condition: Condition{Expression: condition}},
@@ -781,11 +781,20 @@ func (a *Authorizer) valuesOfAll(ctx context.Context, q DB, tenant string, ident
 	if len(custom) > 0 {
 		roles = a.bookOf(a.current(custom))
 	}
-	overlaps := func(xs, ys []string) bool {
-		return slices.ContainsFunc(xs, func(x string) bool { return slices.Contains(ys, x) })
+	// A deny's keys are looked up in sets of each identity's, not compared with every one.
+	set := func(ks []string) map[string]bool {
+		in := make(map[string]bool, len(ks))
+		for _, k := range ks {
+			in[k] = true
+		}
+		return in
+	}
+	overlaps := func(xs []string, in map[string]bool) bool {
+		return slices.ContainsFunc(xs, func(x string) bool { return in[x] })
 	}
 	values := make(map[string]*valuesRead, len(byIdentity))
 	for identity, k := range byIdentity {
+		bound, exempted := set(k.bound), set(k.exempted)
 		v := &valuesRead{roles: roles}
 		var is []int
 		for _, key := range slices.Compact(slices.Sorted(slices.Values(k.keys))) {
@@ -796,7 +805,7 @@ func (a *Authorizer) valuesOfAll(ctx context.Context, q DB, tenant string, ident
 			v.held = append(v.held, grants[i])
 		}
 		for _, d := range ds {
-			if overlaps(d.principals, k.bound) && !overlaps(d.exempt, k.exempted) {
+			if overlaps(d.principals, bound) && !overlaps(d.exempt, exempted) {
 				v.ds = append(v.ds, d)
 			}
 		}
@@ -1211,7 +1220,7 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 		wide := slices.DeleteFunc(slices.Clone(binding), func(k string) bool { return slices.Contains(narrow, k) })
 		rows, err = a.db.Query(ctx, `
 			SELECT scope, bool_or(condition = '') FROM (`+bindingDenies("$1", "$2", "$3", "$7", "scope, condition, exempt, permissions", a.history)+`) d
-			WHERE NOT exempt && $6::text[] AND ($4 = ANY(permissions) OR $5 = ANY(permissions))
+			WHERE `+bindsIfRead("$4 = ANY(permissions) OR $5 = ANY(permissions)", "NOT "+keyed("exempt", "SELECT unnest($6::text[])"))+`
 			GROUP BY scope ORDER BY scope`,
 			tenant, reaching, narrow, perm, wildcard, exempting(keys, s), wide)
 		if err != nil {
@@ -1337,11 +1346,11 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	// The denies on scopes of the types in the array types that bind the subject (bindingDenies).
 	narrow := counted("FALSE", "FALSE")
 	denies := func(types string) string {
-		return fmt.Sprintf(`SELECT d.scope FROM (%s) d
-			WHERE NOT d.exempt && %s AND (%s::text = ANY(d.permissions) OR %s::text = ANY(d.permissions))`,
+		return fmt.Sprintf(`SELECT d.scope FROM (%s) d WHERE %s`,
 			bindingDenies(arg(1)+"::text", types, keys("SELECT k FROM bound WHERE "+narrow), keys("SELECT k FROM bound WHERE NOT ("+narrow+")"),
 				"scope, exempt, permissions", a.history),
-			keys("SELECT k FROM exempted"), arg(14), arg(15))
+			bindsIfRead(fmt.Sprintf("%s::text = ANY(d.permissions) OR %s::text = ANY(d.permissions)", arg(14), arg(15)),
+				"NOT "+keyed("d.exempt", "SELECT unnest("+keys("SELECT k FROM exempted")+")")))
 	}
 	// The grants' tenant is an argument of its own: the host's tenant column needn't be text,
 	// and one argument can't take two types. The grants overlap the path, which the host's GIN
@@ -1555,7 +1564,16 @@ func ofType(col, t string) string {
 // for each depth a path can have, which has no bound, and one inside a subquery over a row's keys
 // is built again for every row. jsonb_exists_any is the operator `?|`, which a host's query builder
 // could read as a placeholder. It is NULL where col is, which Filter's test of a row's type needs.
+// A deny's principals and exemptions are matched to a subject's keys so too: an overlap of arrays
+// compares each with every one, so a deny naming hundreds would cost a check of a subject in a
+// thousand groups hundreds of thousands of comparisons, whether or not it binds it.
 func keyed(col, scopes string) string { return keyedWith("jsonb_exists_any", col, scopes) }
+
+// bindsIfRead is SQL for whether a deny binds a subject, as binds tests by its keys, where it is one
+// a read reads, as read tests by its permissions or scope: read first, in a CASE, which the planner
+// neither reorders nor costs as less than all it holds, so a deny of another permission, or on
+// another scope where a plan scans the table, costs no lookup of its keys.
+func bindsIfRead(read, binds string) string { return "CASE WHEN " + read + " THEN " + binds + " END" }
 
 // keyedWith is keyed testing the keys of col with exists: jsonb_exists_any, or jsonb_exists_all,
 // the operator `?&`, for whether every one is a scope scopes selects, as those of an empty col are.
@@ -1783,27 +1801,27 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 	// With values, the grants on the tenant of the broad principals counts leaves out, and every
 	// deny binding the subject there: in the statement's text, which otherwise plans no read of them.
 	// Each grant and deny says whether it is one for p.
-	values, keyed := "FALSE", "FALSE"
+	values, ownKeys := "FALSE", "FALSE"
 	if with.values {
 		values = "TRUE"
 	}
 	if with.keys {
-		keyed = "TRUE"
+		ownKeys = "TRUE"
 	}
 	forP := read + ` AND ($5 = '' OR $5 = ANY(permissions) OR $6 = ANY(permissions)) AND EXISTS (SELECT FROM keys WHERE ` + counted("$7", "$8") + `)`
 	// In the statement, so they are of the moment its grants are, as are the denies binding it that
 	// exempt it only until a time, read with when, by the paths to the keys exempting it, in the read
 	// of those binding it: in the statement's text, so a check plans none of it.
 	var places, ends, kept string
-	exempt, until := ` AND NOT exempt && ARRAY(SELECT k FROM exempted)`, `NULL::timestamptz AS until`
+	exempted := keyed("exempt", "SELECT k FROM exempted")
+	exempt, until := ` AND NOT `+exempted, `NULL::timestamptz AS until`
 	if with.ending {
 		places = `, ` + endsSQL("$2::text", "$4") + `, ` + lastingSQL("$1::text", "$2::text")
 		ends = `
 		UNION ALL
 		SELECT 3, k, '', '', '', e, false, NULL, '', NULL, false, false, NULL, '', '', false FROM ends`
-		exempt, kept = ` AND NOT exempt && `+exemptForGoodSQL, ` WHERE binds OR until IS NOT NULL`
-		until = `NOT exempt && ARRAY(SELECT k FROM exempted) AS binds, CASE WHEN exempt && ARRAY(SELECT k FROM exempted) THEN ` +
-			exemptUntilSQL("principals", "exempt") + ` END AS until`
+		exempt, kept = ` AND NOT `+exemptForGoodSQL("exempt"), ` WHERE binds OR until IS NOT NULL`
+		until = `NOT ` + exempted + ` AS binds, CASE WHEN ` + exempted + ` THEN ` + exemptUntilSQL("principals", "exempt") + ` END AS until`
 	}
 	// In the statement's text rather than an argument: a generic plan can't tell from one whether
 	// to read every role of the tenant or look up those the grants name. Those are looked up a key at
@@ -1817,6 +1835,8 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 	case heldTenantRoles:
 		customRoles += " AND EXISTS (SELECT FROM held WHERE role LIKE '" + CustomPrefix + "%')"
 	}
+	// A deny's keys are looked up only once it is one the statement reads (bindsIfRead).
+	matched := bindsIfRead(forP+` OR `+values+` AND scope = 'tenant:' || $1`, keyed("principals", "SELECT k FROM bound")+exempt)
 	// Grants, denies, roles and keys in that order; grants by principal, scope, role and id, denies
 	// by id and scope, as deniesOn.
 	const deny, role, end, key = 1, 2, 3, 4
@@ -1834,14 +1854,12 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 		FROM held
 		UNION ALL
 		SELECT 1, id, id, scope, '', until, condition <> '', permissions, condition, NULL, false, false, NULL, '', '', counts
-		FROM (`+byKey("$3", "rbac_denies", "scope", "id, scope, permissions, condition, "+forP+" AS counts, "+until, `tenant = $1
-		  AND principals && ARRAY(SELECT k FROM bound)`+exempt+`
-		  AND (`+forP+` OR `+values+` AND scope = 'tenant:' || $1)`)+`) d`+kept+`
+		FROM (`+byKey("$3", "rbac_denies", "scope", "id, scope, permissions, condition, "+forP+" AS counts, "+until, `tenant = $1 AND `+matched)+`) d`+kept+`
 		UNION ALL
 		SELECT 2, id, '', '', id, NULL, false, permissions, '', resource_types, privileged, public, grantable_roles, name, description, false
 		FROM `+customRoles+ends+`
 		UNION ALL
-		SELECT 4, k, '', '', '', NULL, false, NULL, '', NULL, false, false, NULL, '', '', false FROM keys WHERE `+keyed+`
+		SELECT 4, k, '', '', '', NULL, false, NULL, '', NULL, false, false, NULL, '', '', false FROM keys WHERE `+ownKeys+`
 		ORDER BY 1, 3, 4, 5, 2`,
 		tenant, s.identityKey(), scopes, a.cfg.Now(), perm, wildcard, counts.public, counts.members)
 	if err != nil {
