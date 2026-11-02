@@ -1170,7 +1170,7 @@ func snapshot[T any](ctx context.Context, a *Authorizer, read func(*Authorizer) 
 		return read(a)
 	default:
 		var nested bool
-		if nested, err = isolated(ctx, conn, "REPEATABLE READ, READ ONLY", in); nested {
+		if nested, err = isolated(ctx, conn, pgx.RepeatableRead, pgx.ReadOnly, in); nested {
 			return read(a)
 		}
 	}

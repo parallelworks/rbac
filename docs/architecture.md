@@ -240,8 +240,11 @@ erDiagram
 - **Every write is recorded.** Each table above but `rbac_history` has the trigger
   `rbac_record`, which writes the change into `rbac_history`. Nothing updates or truncates that
   table, and only `PruneHistory`, as a role with the rights of its owner, deletes from it, each
-  delete reached by a prune its transaction records. Each
-  record reads its key's last by history's index of each entity's keys, in a generic plan with
+  delete reached by a prune its transaction records. Both triggers find history in the schema of
+  the table they fire on, by a search_path each sets for its own run, so a session's own table
+  named as history's stands in for none of it, whatever the schema is named, and refuse the row
+  where that search_path can't name the schema, as `$user` or one their role has no `USAGE` on.
+  Each record reads its key's last by history's index of each entity's keys, in a generic plan with
   sequential scans off: a plan its session made while history was small would otherwise scan all
   of it for each row, and one made for each row, until history is analyzed, read all of the
   tenant's records of the entity, so a statement writing many would take time growing with the
@@ -628,7 +631,14 @@ flowchart LR
   number of them can be on scopes of other types, which no index tells apart: while fewer than 16
   denies are on scopes of the types a list reads, it reads those by type, and otherwise finds the
   ones naming everyone by those keys, so a tenant with many of both has every list read every deny
-  naming everyone.
+  naming everyone. A row's label is tested by looking each of its values up, byte for byte, in
+  objects the statement builds once of the values the subject's holding allows, and of each `AnyOf`
+  dimension it holds some values of but not all, that dimension's values and those it holds, so a
+  row costs a few comparisons for each of its values however many the dimensions declare, in a
+  custom plan or a generic one: an array's containment or overlap would compare each with every
+  value declared, and `= ANY` hashes only an array a plan holds as a constant. The planner counts
+  each lookup as keeping a third of the rows, so a dimension held whole or not at all has no test of
+  its own, which with many declared would have a sorted page planned to read every row.
 - **Reachable** returns the same as scopes, for a host that keeps its resources elsewhere. They hold
   for resources of the listed type alone: a scope reaches everything under it, of any type, so a
   store holding several keeps to the type itself. Conditional grants and conditional denies come
@@ -644,8 +654,12 @@ flowchart LR
 A label is mandatory access control above every grant. The host declares dimensions in
 `Config.Labels`, with `Config.ResourceOf`, through which changes read the labels of the scopes they
 reach, the tenant's and its groups' among them: `New` refuses labels without it. A subject holds a
-dimension's values as permissions, `dimension:value`, which roles granted on the tenant give, and a
-labeled resource is allowed only to a subject whose values satisfy its label.
+dimension's values as permissions, `dimension:value`, which roles for the tenant alone give, granted
+on it, and a labeled resource is allowed only to a subject whose values satisfy its label. A custom
+role stored for another type too, as one defined before its dimension was declared can be, is read
+as giving none of them (`current`), privileged and public as the whole role is, so no grant below
+the tenant gives one, its grants count toward no exclusive dimension, and a check of a value and
+`Permissions` decide it by the same grants.
 
 ```mermaid
 flowchart TB
@@ -680,7 +694,9 @@ flowchart TB
   of roles giving values or powers to release, and of each role only those, privileged and public
   as the whole role is, which the first decision narrows the read to, reading each role once
   (`labeling`): a holding decides by nothing else, so the actor's grants of other roles, however
-  many or large, cost a label nothing.
+  many or large, cost a label nothing. A check deciding a subject's values, as `Authorize` of a
+  labeled resource, `Holders` for each identity, `Holding`, `Filter` and `Reachable` do, narrows its
+  read so too.
 - **Releasing and writing.** `ReleasePermission(dimension)`, held on the tenant, is the power to
   release data to a looser label in that dimension, so only a holder of it can downgrade data. A
   `Holding`'s `MayWrite` and `MayRelease` say whether data read under one label may be written, or
@@ -713,6 +729,13 @@ flowchart TB
 - **READ COMMITTED.** A change runs at READ COMMITTED, as its checks under the locks must read what
   committed before the locks were taken. Under `WithTx` the host's transaction must be at READ
   COMMITTED too, as must one `Migrate` is given.
+- **A host's own DB.** One that is neither a pool, a connection nor a `pgx.Tx` begins with `Begin`,
+  and its first statement sets the isolation a change or a read of one snapshot needs (`isolated`):
+  another level first, then that one. A savepoint of a transaction under way, as a wrapper around
+  the host's own gives, may set the level its transaction has but no other, so it refuses one of
+  the two, and the call runs on the host's transaction, as under `WithTx`; setting the one level
+  alone, a savepoint of a transaction at it passed for a transaction of its own, and `Migrate`
+  bounded its waits there and left them so in the host's transaction.
 - **Rows in one order.** `DeleteScopes` holds its scopes' locks and `DeletePrincipal` its
   principal's, so neither waits for the other, and both delete the principal's grants and
   eligibilities on those scopes: each locks them in the order of their scopes first, eligibilities
@@ -851,12 +874,15 @@ flowchart LR
   through its cursor as it caught up from the start or fell behind, each of which, found by where
   it was recorded, was read from history's rows. An export from the start also passes over, among
   the index's entries, the prunes from before it began that reached past its cursor, until it reads
-  past them; where those since it began are fewer, a statement planned for its cursor reads those
-  by transaction (`rbac_history_prunes`) instead. A delete from history, which only a role with the
-  rights of history's owner gets past the append-only trigger, is refused as its transaction
-  commits (`rbac_history_pruned`) unless a prune that transaction records reaches the record, by the
-  last it deleted or, for a prune recorded before 0020, the cursor it went through, and the record
-  is of an earlier transaction.
+  past them. Both statements run with sorting off (`unsorted`), so that index's order is the only
+  plan: where history's statistics hold no prune, as until an analysis samples one, the planner
+  counts the prunes as none, and read every one since the cursor by transaction
+  (`rbac_history_prunes`) to sort them, in each read and each window of a prune. A test of the
+  transaction no index serves leaves that read, as that index holds every prune. A delete from
+  history, which only a role with the rights of history's owner gets past the append-only trigger,
+  is refused as its transaction commits (`rbac_history_pruned`) unless a prune that transaction
+  records reaches the record, by the last it deleted or, for a prune recorded before 0020, the
+  cursor it went through, and the record is of an earlier transaction.
 - **The export chain.** `Export` hashes each record onto the last checkpoint with SHA-256 and signs
   the checkpoint with the host's `crypto.Signer`: ECDSA on P-256, P-384 or P-521, Ed25519, or RSA
   of at least 3072 bits, each verified with the Go standard library. `VerifyChain` checks a run of
@@ -880,7 +906,9 @@ flowchart LR
   version, the end last. It reads history `MaxPrune` records at a time, each in a transaction of
   its own, so none holds exports back for long however long history is. Each that deleted records
   is recorded in history, in the statement that deletes and dated when it began, with the last
-  record it deleted, and AsOf finds the latest prune's time by history's index. With several
+  record it deleted, and AsOf finds the latest prune's time by history's index of each entity's
+  keys, as a prune finds where the last of its time and cursor stopped, each in that index's order
+  with sorting off, so neither reads every prune where the statistics count none. With several
   exports, it prunes through the cursor of the one furthest behind.
 
 ## Database roles

@@ -190,13 +190,18 @@ func roleFrom(id, name, description string, perms, types []string, privileged, p
 // its ids were read. The custom ones are read in the same statement, so a role redefined reaches
 // searches as it reaches checks, and by key: a search's ids are those its grants name (namedCustom)
 // or broadArgs read, and read by the tenant, every custom role of it was, as of a time every version.
-func givingSQL(builtin, tenant, perm, resourceType string, custom bool, ids string, public bool) string {
+// With alone, for a label value or a power to release, only those for the tenant alone, as current
+// reads them.
+func givingSQL(builtin, tenant, perm, resourceType string, custom bool, ids string, public, alone bool) string {
 	// Without custom the subquery stays, constant false, so the statement's arguments are the
 	// same and PostgreSQL plans it away.
 	where := fmt.Sprintf(`%t AND cr.tenant = %s::text AND %s::text = ANY(cr.permissions) AND %s::text = ANY(cr.resource_types)`,
 		custom, tenant, perm, resourceType)
 	if public {
 		where += " AND cr.public"
+	}
+	if alone {
+		where += " AND " + tenantAloneSQL("cr.resource_types")
 	}
 	return fmt.Sprintf(`(%s::text[] || ARRAY(%s))`, builtin, byKey(ids, "rbac_roles cr", "cr.id", "cr.id", where))
 }
@@ -1685,16 +1690,35 @@ func (a *Authorizer) customRoles(ctx context.Context, q DB, tenant string) ([]Ro
 // are public only while every permission they give is one an unprivileged role gives, and are
 // privileged when they give what only privileged roles do, or change access, as every role that
 // lists grantable roles does. The stored flag counts for nothing: it can stand for a catalog
-// since changed.
+// since changed. One stored for another type than the tenant too gives no label value or power to
+// release, as SetRole refuses to define (checkCustom), though one defined before its dimension was
+// declared can be: given below the tenant, a value would be decided by grants a check of it doesn't
+// read, so Authorize and Permissions could disagree. It is privileged and public as it is whole.
 func (a *Authorizer) current(roles []RoleDefinition) []RoleDefinition {
 	for i, r := range roles {
+		alone := forTenantAlone(r.ResourceTypes)
 		r.Permissions = slices.DeleteFunc(r.Permissions, func(p Permission) bool { return !a.permissions[p] })
 		r.ResourceTypes = slices.DeleteFunc(r.ResourceTypes, func(t string) bool { return !a.types[t] })
 		r.Public = r.Public && !a.privileged(r) && !r.managesAccess()
 		r.Privileged = a.privileged(r) || r.managesAccess()
+		if !alone {
+			r.Permissions = slices.DeleteFunc(r.Permissions, a.labelPermission)
+		}
 		roles[i] = r
 	}
 	return roles
+}
+
+// forTenantAlone reports whether a custom role's stored types are the tenant's alone, as
+// tenantAloneSQL tests them.
+func forTenantAlone(types []string) bool {
+	return len(types) > 0 && !slices.ContainsFunc(types, func(t string) bool { return t != TenantScope })
+}
+
+// tenantAloneSQL is SQL for whether a custom role's stored types, col, are the tenant's alone, of
+// which current reads a role giving label values or powers to release only where they are.
+func tenantAloneSQL(col string) string {
+	return fmt.Sprintf(`(%[1]s <@ ARRAY['%[2]s'] AND '%[2]s' = ANY(%[1]s))`, col, TenantScope)
 }
 
 // customGives reports whether a custom role can give p on a resource type: only a permission

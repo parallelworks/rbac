@@ -2019,7 +2019,7 @@ func beginOwn(ctx context.Context, db DB, fn func(tx pgx.Tx, own bool) error) er
 		err = savepoint(ctx, db, host)
 	default:
 		var nested bool
-		if nested, err = isolated(ctx, db, "READ COMMITTED", own); nested {
+		if nested, err = isolated(ctx, db, pgx.ReadCommitted, "", own); nested {
 			err = savepoint(ctx, db, host)
 		}
 	}
@@ -2031,14 +2031,25 @@ type ownTx interface {
 	BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
 }
 
-// isolated runs fn in what db's Begin begins at level, on a DB that is neither an ownTx nor a
-// pgx.Tx, as a host's wrapper around a pool that traces its statements: its Begin begins at the
-// database's default, so the first statement sets it. Begin may give a savepoint of a transaction
-// under way, as a wrapper around a host's pgx.Tx does, which refuses that: then fn doesn't run, and
-// nested is set.
-func isolated(ctx context.Context, db DB, level string, fn func(pgx.Tx) error) (nested bool, err error) {
+// isolated runs fn in what db's Begin begins at level, in mode where it names one, on a DB that is
+// neither an ownTx nor a pgx.Tx, as a host's wrapper around a pool that traces its statements: its
+// Begin begins at the database's default, so the first statement sets it. Begin may give a
+// savepoint of a transaction under way, as a wrapper around a host's pgx.Tx does, which refuses
+// that: then fn doesn't run, and nested is set. PostgreSQL lets a savepoint set the level its
+// transaction already has, so the statement sets another first: a savepoint takes no level but its
+// transaction's, so it refuses one of the two whatever that is, and a transaction of its own takes
+// both before its first query. Not SERIALIZABLE, which a standby refuses in any transaction.
+func isolated(ctx context.Context, db DB, level pgx.TxIsoLevel, mode pgx.TxAccessMode, fn func(pgx.Tx) error) (nested bool, err error) {
+	other := pgx.RepeatableRead
+	if level == other {
+		other = pgx.ReadCommitted
+	}
+	set := "SET TRANSACTION ISOLATION LEVEL " + string(other) + ", ISOLATION LEVEL " + string(level)
+	if mode != "" {
+		set += ", " + string(mode)
+	}
 	err = savepoint(ctx, db, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL "+level); err != nil {
+		if _, err := tx.Exec(ctx, set); err != nil {
 			nested = isolationRefused(err)
 			return err
 		}
@@ -2058,9 +2069,10 @@ func isolationRefused(err error) bool {
 }
 
 // repeatableRead begins on db, a DB that is neither an ownTx nor a pgx.Tx, a transaction at
-// REPEATABLE READ, as isolated does, so a read of several statements reads one snapshot; where its
-// Begin gives a savepoint of a transaction under way, which refuses that, a savepoint at that
-// transaction's isolation, as under WithTx.
+// REPEATABLE READ, so a read of several statements reads one snapshot; where its Begin gives a
+// savepoint of a transaction under way, a savepoint at that transaction's isolation, as under
+// WithTx. It sets the one level, not two as isolated does: a savepoint of a transaction at
+// REPEATABLE READ takes it, and is such a savepoint all the same, which AsOf rolls back either way.
 func repeatableRead(ctx context.Context, db DB) (pgx.Tx, error) {
 	tx, err := db.Begin(ctx)
 	if err != nil {
