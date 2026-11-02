@@ -300,8 +300,8 @@ func TestListingsAgreeWithChecksInRandomTenants(t *testing.T) {
 // guests, suspended members, identities whose membership or places have ended or will, one of
 // another tenant, one of none and the anonymous, it checks that every read of the denies binding a
 // subject, which looks each of a deny's keys up, finds what the overlap of arrays found
-// (DeniesMatched), now and as of a time; that Authorize refuses where one of them binds; and that
-// Filter, Reachable and Holders agree with Authorize.
+// (DeniesMatched), now and as of a time; that Authorize and Explain refuse where one of them binds;
+// and that Filter, Reachable and Holders agree with Authorize.
 func TestDenyLookupsAgreeWithOverlapsInRandomTenants(t *testing.T) {
 	viewer := rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
 	for seed := range uint64(12) {
@@ -519,6 +519,10 @@ func TestDenyLookupsAgreeWithOverlapsInRandomTenants(t *testing.T) {
 						want := before[at(s, p, r.ID)] && len(checked[at(s, p, r.ID)]) == 0
 						if got := allowed(t, h, s, p, r); got != want {
 							t.Errorf("%v %s on %s: Authorize allows %v, though it allowed %v before the denies, and these bind it: %v", s.Principal, p, r.ID, got, before[at(s, p, r.ID)], checked[at(s, p, r.ID)])
+						}
+						// Explain reads the denies apart from Authorize, by keys it passes the statement.
+						if d, err := h.authz.Explain(ctx, s, p, r); err != nil || d.Allowed != want {
+							t.Errorf("%v %s on %s: Explain allows %v (%v), Authorize %v", s.Principal, p, r.ID, d.Allowed, err, want)
 						}
 					}
 				}
