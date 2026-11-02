@@ -168,14 +168,17 @@ type converter struct {
 	// done is where in converted each it converted is, by where it points.
 	done      map[copiedKey]int
 	converted []conversion
+	// cut are those of done converting cut short at maxNested in the kind it converts, which it
+	// forgets once the kind is converted, as a kind after it may reach them less deep.
+	cut []copiedKey
 }
 
 // conversion is what a converter found of a value it converted, while open converting it: what it
 // is to conditions, and how deep it nests, counting itself, or that no condition can read it.
 type conversion struct {
-	to               ref.Val
-	height           int
-	open, unreadable bool
+	to                    ref.Val
+	height                int
+	open, unreadable, cut bool
 }
 
 func newConverter() *converter { return &converter{left: maxConverted} }
@@ -204,6 +207,10 @@ func (c *converter) attributes(attributes map[string]any) (map[ref.Val]ref.Val, 
 		}
 		out[types.String(name)], _ = c.of(reflect.ValueOf(v))
 	}
+	for _, k := range c.cut {
+		delete(c.done, k)
+	}
+	c.cut = c.cut[:0]
 	return out, c.unread == unread && c.deep == deep
 }
 
@@ -347,18 +354,21 @@ func (c *converter) spend(n uint64, v ref.Val) ref.Val {
 // once is what convert makes of v, which points somewhere, and how deep it nests, converted once
 // for the check. One reached again while it is converted holds itself, or holds one that holds it,
 // and can't be read, nor can one holding it, of any kind. One that can't be read is kept so, as no
-// kind reaching it can read it; one nesting past maxNested where it was reached isn't kept, as it may
-// not where it is reached less deep; and one converted whole is kept with how deep it nests, so it
-// fails where it is reached too deep for that, wherever it was first reached: whether a kind's
-// attributes nest past maxNested, as whether they hold one holding itself, is of what they hold,
-// whatever order a map's entries come in or a kind before it reached a value first.
+// kind reaching it can read it; one nesting past maxNested where it was reached is kept so for the
+// rest of the kind, which nests too deep wherever it reaches it again, but not for a kind after it,
+// which may reach it less deep: converted again for each path reaching it, a ladder of a hundred
+// maps each holding both of the next two, nested 10,000 deep, went past maxConverted, failing every
+// kind; and one converted whole is kept with how deep it nests, so it fails where it is reached too
+// deep for that, wherever it was first reached: whether a kind's attributes nest past maxNested, as
+// whether they hold one holding itself, is of what they hold, whatever order a map's entries come
+// in or a kind before it reached a value first.
 func (c *converter) once(v reflect.Value, convert func() (ref.Val, int)) (ref.Val, int) {
 	k, _ := copiedKeyOf(v)
 	if i, ok := c.done[k]; ok {
 		switch d := c.converted[i]; {
 		case d.open || d.unreadable:
 			return c.refuse(), 0
-		case c.depth+d.height-1 > maxNested:
+		case d.cut || c.depth+d.height-1 > maxNested:
 			c.deep++
 			return nil, 0
 		default:
@@ -378,8 +388,11 @@ func (c *converter) once(v reflect.Value, convert func() (ref.Val, int)) (ref.Va
 	switch {
 	case c.unread != unread:
 		d.unreadable = true
-	case c.deep != deep || c.over:
+	case c.over:
 		delete(c.done, k)
+	case c.deep != deep:
+		d.cut = true
+		c.cut = append(c.cut, k)
 	default:
 		d.to, d.height = to, height
 	}

@@ -958,6 +958,30 @@ func TestWhetherAttributesNestTooDeepIsOfTheLongestPathThroughThem(t *testing.T)
 	}
 }
 
+// A value many paths reach past what a check converts, 10,000 deep, fails the kind nesting it, and
+// the other kinds' attributes are read. Converted again for each path reaching it, a ladder of a
+// hundred maps each holding both of the next two went past what a check converts, so every
+// condition reading any kind's attributes failed.
+func TestAValueManyPathsReachTooDeepFailsOnlyItsKind(t *testing.T) {
+	rungs := [2]map[string]any{{"end": 1}, {"end": 2}}
+	for range 100 {
+		rungs = [2]map[string]any{{"a": rungs[0], "b": rungs[1]}, {"a": rungs[0], "b": rungs[1]}}
+	}
+	var nested any = rungs[0]
+	for range 10_000 - 50 {
+		nested = []any{nested}
+	}
+	ok := map[string]any{"ok": true}
+	if held, evaluated := rbac.EvaluateConditionOf(t, `has(resource.attributes.v)`, ok, map[string]any{"v": nested}, ok); held || evaluated {
+		t.Errorf("a ladder nested too deep: held %t, evaluated %t", held, evaluated)
+	}
+	for _, expr := range []string{`subject.attributes.ok == true`, `request.attributes.ok == true`} {
+		if held, _ := rbac.EvaluateConditionOf(t, expr, ok, map[string]any{"v": nested}, ok); !held {
+			t.Errorf("%s beside a resource nesting a ladder too deep", expr)
+		}
+	}
+}
+
 // indexedAsItself is a host's own list that yields itself when indexed, though not when iterated.
 type indexedAsItself struct{ traits.Lister }
 
