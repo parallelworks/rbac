@@ -1758,6 +1758,139 @@ func TestWhatOneKindDecodesIsNeverReadAsAnothers(t *testing.T) {
 	}
 }
 
+// No value converting knows by where it points is read as another, wherever one was freed before
+// another was made: a map, of a type of the host's own too, a slice, empty or nil too, an array of
+// them, a pointer, to nothing too, which Go may give one address, JSON text and what converting
+// decodes of it, and a Struct, a ListValue, a Value and an Any and what it packs. Garbage is
+// collected before each kind is converted, and between checks, after a hook of the host's empties
+// every map and list the subject's and the request's attributes held once the call converted them,
+// so nothing the host holds keeps what they held, and each check's resource is made after.
+func TestNoValueConvertedIsReadAsAnother(t *testing.T) {
+	rbac.CollectBetweenKinds(t)
+	for trial := range 5 {
+		subject, dropSubject := heldShapes(t, "subject", trial)
+		request, dropRequest := heldShapes(t, "request", trial)
+		ctx := rbac.WithRequest(t.Context(), request)
+		together, alone := rbac.AttributesRead(t, 6, func(i int) (context.Context, map[string]any, map[string]any) {
+			resource, _ := heldShapes(t, "resource", 100*trial+i)
+			return ctx, subject, resource
+		}, func(i int) {
+			if i == 1 {
+				dropSubject()
+				dropRequest()
+			}
+			runtime.GC()
+		})
+		for i := range together {
+			for k, kind := range []string{"subject", "resource", "request"} {
+				if alone[i][k] == rbac.Unreadable {
+					t.Fatalf("trial %d, check %d: the %s's attributes unreadable alone", trial, i, kind)
+				}
+				if together[i][k] != alone[i][k] {
+					got, want := differing(together[i][k], alone[i][k])
+					t.Fatalf("trial %d, check %d: the %s's attributes read\n%s\nwhere alone\n%s", trial, i, kind, got, want)
+				}
+			}
+		}
+	}
+}
+
+// heldShapes are attributes holding, by, values of each shape a converter knows by where it points,
+// telling by and i apart, a few of each, and drop, which empties every map and list they hold, as a
+// hook of the host's might, so that nothing the host holds keeps what they held.
+func heldShapes(t *testing.T, by string, i int) (attributes map[string]any, drop func()) {
+	t.Helper()
+	tag := map[string]int{"subject": 1, "resource": 2, "request": 3}[by]
+	must := func(err error) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var drops []func()
+	shapes := func(j int) map[string]any {
+		n, s := tag*1000+j, fmt.Sprint(by, i, j)
+		a, b := n, n+1
+		// Many of a type of the host's own, each of whose entries is read into the same value.
+		maps, pointers, slices := map[string]map[string]int{}, map[string]*[4]int{}, map[string][]int{}
+		listed, lists := make([]*[4]int, 64), make([][]any, 64)
+		for k := range 64 {
+			maps[fmt.Sprint(k)], pointers[fmt.Sprint(k)], slices[fmt.Sprint(k)] = map[string]int{s: k}, &[4]int{tag, i, j, k}, []int{tag, i, j, k}
+			listed[k], lists[k] = &[4]int{tag, i, j, k}, []any{s, k}
+		}
+		list, m := []any{s, n}, map[string]any{"by": s}
+		arrays, spare := [][2]*int{{&a, &b}}, append(make([]any, 0, 8), s, n)
+		st, err := structpb.NewStruct(map[string]any{"by": s, "l": []any{s, float64(n)}})
+		must(err)
+		lv, err := structpb.NewList([]any{s, map[string]any{"by": s}})
+		must(err)
+		packed, err := structpb.NewStruct(map[string]any{"by": s})
+		must(err)
+		packedStruct, err := anypb.New(packed)
+		must(err)
+		packedList, err := structpb.NewList([]any{s, float64(n)})
+		must(err)
+		packedValue, err := anypb.New(structpb.NewListValue(packedList))
+		must(err)
+		valued, err := structpb.NewStruct(map[string]any{"by": s})
+		must(err)
+		shaped := map[string]any{
+			"map":      map[string]any{"by": s, "n": n},
+			"maps":     maps,
+			"pointers": pointers,
+			"slices":   slices,
+			"pointer":  &[4]int{tag, i, j},
+			"int":      &a,
+			"string":   &s,
+			"list":     []any{s, n},
+			"listed":   listed,
+			"lists":    lists,
+			"array":    [2]map[string]any{{"by": s}, {"n": n}},
+			"arrays":   arrays,
+			"toList":   &list,
+			"toMap":    &m,
+			"spare":    spare,
+			"text":     json.RawMessage(fmt.Sprintf(`{"by": %q, "l": [%d, {"by": %q}, [%q]]}`, s, n, s, s)),
+			"struct":   st,
+			"listV":    lv,
+			"value":    structpb.NewStructValue(valued),
+			"packed":   packedStruct,
+			"packedV":  packedValue,
+			"zero":     &[0]int{},
+			"zeros":    [][0]int{{}, {}},
+			"empty":    []any{},
+			"capped":   make([]any, 0, 4),
+			"nil":      []any(nil),
+			"nilMap":   map[string]any(nil),
+		}
+		drops = append(drops, func() {
+			clear(maps)
+			clear(pointers)
+			clear(slices)
+			clear(listed)
+			clear(lists)
+			clear(list)
+			clear(m)
+			clear(arrays)
+			clear(spare[:cap(spare)])
+			clear(st.GetFields())
+			clear(lv.GetValues())
+			clear(valued.GetFields())
+			clear(shaped)
+		})
+		return shaped
+	}
+	held := map[string]any{}
+	for j := range 4 {
+		held[fmt.Sprint(j)] = shapes(j)
+	}
+	return map[string]any{"held": held}, func() {
+		for _, drop := range drops {
+			drop()
+		}
+		clear(held)
+	}
+}
+
 // differing is where a and b, written out, first differ, and a little before.
 func differing(a, b string) (string, string) {
 	i := 0
