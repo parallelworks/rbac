@@ -6,10 +6,10 @@
 -- rights, and what a rollback doesn't undo stayed: setting history's id sequence back, as the
 -- application's role could, numbered later records below earlier ones, so AsOf read a row as it was
 -- before its last changes, and setting it to its end failed every later write. Now it sets nothing
--- but its search_path before it refuses, so it reads no table, and calls no function or operator,
--- by a search_path it hasn't checked: where a schema is named as history's role, which $user then
--- names, an operator there of types pg_catalog has none of exactly, as ->> of jsonb and jsonb for a
--- jsonb and a literal, is chosen over pg_catalog's.
+-- but its search_path before it refuses, so it reads no table, and calls no function or operator
+-- but pg_catalog's, by a search_path it hasn't checked: where a schema is named as history's role,
+-- which $user then names, an operator there of types pg_catalog has none of exactly, as ->> of
+-- jsonb and jsonb for a jsonb and a literal, is chosen over pg_catalog's.
 --
 -- No other function of the package's runs as a role other than its caller, and none that sets its
 -- search_path reads or calls anything by it before it knows it: rbac_history_pruned declares only
@@ -45,7 +45,8 @@ DECLARE
 BEGIN
     -- A search_path reads $user, however it is quoted, as a role's name, and leaves out a schema
     -- the role has no USAGE on, so history would be found in pg_temp: refused before anything it
-    -- names is read or called.
+    -- names is read or called. The = it compares two names by is pg_catalog's, which has one of
+    -- exactly their type, and comes first in a search_path that doesn't name it.
     IF pg_catalog.current_schema() IS DISTINCT FROM TG_TABLE_SCHEMA THEN
         RAISE EXCEPTION 'history is not found in schema %: no search_path names a schema called $user, nor one % has no USAGE on',
             TG_TABLE_SCHEMA, current_user USING ERRCODE = 'invalid_schema_name';
