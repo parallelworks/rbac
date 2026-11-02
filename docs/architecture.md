@@ -745,10 +745,12 @@ flowchart TB
   `Export` and `Checkpoint.Sign` are given is a hook too. Wherever a call reads a hook's error, for
   a race, for `ErrInvalid` or `ErrDenied`, as it reads `ValidateGrant`'s answer and decides what
   `OnRefused` is told of, or for `ErrNotFound`, it reads the tree in the order `errors.Is` and
-  `errors.As` read it, each error it can compare once (`holds`): one whose tree holds itself, as a
-  host's type can by mistake, comes round again, which they read forever, so a call passes over what
-  it has read and returns, though the host's own `errors.Is` of what it returns can still read it
-  forever.
+  `errors.As` read it, and once it has read and queued ten thousand or so of its errors
+  (`remembering`), each it can compare once (`holds`): one whose tree holds itself, as a host's type
+  can by mistake, comes round again, which they read forever, so a call passes over what it has read
+  and returns, though the host's own `errors.Is` of what it returns can still read it forever. Not
+  from the first error: remembering one compares it whole, and a value wrapping an error holds all
+  that one wraps, so a tree nesting such values thousands deep would cost the square of its depth.
 - **Migrating.** `Migrate` applies each pending migration in a transaction of its own, under an
   advisory lock on the schema that holds another replica's migration back, and records it as it
   commits: so a migration takes its locks in the order it names them, the tables before history,

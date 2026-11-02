@@ -4477,8 +4477,9 @@ func TestAChangeDeadlockedBeforeItsSavepointConflicts(t *testing.T) {
 // it ran, matches ErrConflict too, wherever the hook runs, still wrapping the host's own error, and
 // OnRefused isn't told of it: ValidateGrant, asked before a change's transaction, and a constraint a
 // check asks. So does one that wraps or joins the race after another of PostgreSQL's errors, where
-// errors.As finds only that one, or after a thousand others, and one that holds it as errors.As
-// reads it, through an As method; one holding no race doesn't.
+// errors.As finds only that one, or after a thousand others, or ten thousand values each equal to
+// the one before, and one that holds it as errors.As reads it, through an As method; one holding no
+// race doesn't.
 func TestAHooksErrorForARaceConflicts(t *testing.T) {
 	errPolicy := errors.New("policy lookup failed")
 	deadlock := &pgconn.PgError{Code: "40P01", Message: "deadlock detected"}
@@ -4511,6 +4512,10 @@ func TestAHooksErrorForARaceConflicts(t *testing.T) {
 		"nested after another":           errors.Join(errPolicy, duplicate, fmt.Errorf("retrying: %w", deadlock)),
 		"held through As":                errors.Join(duplicate, heldAsError{errPolicy, deadlock}),
 		"joined after a thousand others": errors.Join(slices.Concat([]error{errPolicy}, slices.Repeat([]error{duplicate}, 1000), []error{deadlock})...),
+		// Past those an ordinary tree holds, where each error is read once: the last is read, as it
+		// wraps another error, though it reads as the others.
+		"joined after ten thousand values": errors.Join(slices.Concat([]error{errPolicy},
+			slices.Repeat([]error{valueWrapError{"retrying", duplicate}}, 10000), []error{valueWrapError{"retrying", deadlock}})...),
 	} {
 		hookErr = race
 		for name, err := range calls() {
@@ -4547,13 +4552,38 @@ func (e heldAsError) As(target any) bool {
 	return ok
 }
 
+// A hook's error nesting thousands of values that wrap errors, rather than pointers, is read in time
+// growing with its depth, as errors.Is reads it, not with its square, as it would be if each error
+// read were remembered from the first, which compares it whole, all it wraps too.
+func TestAHooksErrorNestingValuesIsReadInItsDepth(t *testing.T) {
+	var err error = &pgconn.PgError{Code: "40P01", Message: "deadlock detected"}
+	for i := range 5000 {
+		err = valueWrapError{fmt.Sprint("try ", i), err}
+	}
+	start := time.Now()
+	got := rbac.Conflicted(err)
+	if elapsed := time.Since(start); !errors.Is(got, rbac.ErrConflict) || elapsed > time.Second {
+		t.Fatalf("a race under 5,000 values took %v to find: %.100v", elapsed, got)
+	}
+}
+
+// valueWrapError is a host's error that wraps another as a value, not a pointer.
+type valueWrapError struct {
+	msg string
+	err error
+}
+
+func (e valueWrapError) Error() string { return e.msg }
+func (e valueWrapError) Unwrap() error { return e.err }
+
 // A hook's error whose tree holds itself, as a host's type wrapping itself by mistake can, through
-// Unwrap or joined beside itself, is read once, each of its errors once, wherever a call reads it,
-// and the call returns: matching ErrConflict where it holds a race, as errors.As reads one,
-// ErrConflict first in what the call returns, so errors.Is finds it there; and a change ValidateGrant
-// refuses beside it is refused as invalid, which OnRefused is told of, but of no other. Each kind of
-// error runs in a child process, so one read forever, or until the stack overflows, which kills the
-// process, fails this test rather than the test binary, and each call there is given a while.
+// Unwrap or joined beside itself, is read round only so far, and from then on each of its errors
+// once, wherever a call reads it, and the call returns: matching ErrConflict where it holds a race,
+// as errors.As reads one, ErrConflict first in what the call returns, so errors.Is finds it there;
+// and a change ValidateGrant refuses beside it is refused as invalid, which OnRefused is told of,
+// but of no other. Each kind of error runs in a child process, so one read forever, or until the
+// stack overflows, which kills the process, fails this test rather than the test binary, and each
+// call there is given a while.
 func TestAHooksErrorHoldingItselfIsReadOnce(t *testing.T) {
 	if how := os.Getenv("RBAC_HOOK_ERROR_HOLDING_ITSELF"); how != "" {
 		// So that reading it forever overflows the stack in a moment rather than a gigabyte.

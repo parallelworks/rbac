@@ -751,11 +751,12 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   `History`'s, leaves it holding what it took before the call, which the race can be over. The
   signer `Export` and `Checkpoint.Sign` are given is a hook too. A hook's error is read in the
   order `errors.Is` and `errors.As` read it, however many errors it holds, to the first race or
-  `ErrConflict` in it, and each of its errors once: one whose tree holds itself, as a host's type
-  wrapping itself by mistake can, which they read forever, a call reads through once and returns,
-  though the host's own `errors.Is` of what it returns, or of what `Config.OnRefused` is told, can
-  still read it forever. Changes to the same rows wait for each other by locks named for the schema
-  holding the tables, so sessions reaching them through different search_paths still do.
+  `ErrConflict` in it, and once ten thousand or so of them are read, each one once: one whose tree
+  holds itself, as a host's type wrapping itself by mistake can, which they read forever, a call
+  reads round until then and returns, though the host's own `errors.Is` of what it returns, or of
+  what `Config.OnRefused` is told, can still read it forever. Changes to the same rows wait for
+  each other by locks named for the schema holding the tables, so sessions reaching them through
+  different search_paths still do.
 - **What the host passes:** a check reads grants, memberships and groups as they are; only compiled
   conditions are cached. Read a resource's ancestors and attributes from where they are stored,
   never from request input, no earlier than the content they protect, and from the primary. A

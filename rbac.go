@@ -588,10 +588,10 @@ var (
 	// it returns wraps PostgreSQL's, alone or beside others, as errors.Join holds them, or holds it
 	// as errors.As reads it. Try it again: under WithTx, the host's whole transaction, as WithTx
 	// says. A hook's error is read in the order errors.Is and errors.As read it, however many errors
-	// it holds, to the first race or ErrConflict in it, and each of its errors once: one whose tree
-	// holds itself, as a host's type wrapping itself by mistake can, which they read forever, a call
-	// reads through once and returns, though the host's own errors.Is of what it returns, or of what
-	// Config.OnRefused is told, can still read it forever.
+	// it holds, to the first race or ErrConflict in it, and once ten thousand or so of them are read,
+	// each one once: one whose tree holds itself, as a host's type wrapping itself by mistake can,
+	// which they read forever, a call reads round until then and returns, though the host's own
+	// errors.Is of what it returns, or of what Config.OnRefused is told, can still read it forever.
 	ErrConflict = errors.New("rbac: conflict")
 	// ErrNotFound is what Config.ResourceOf returns, or wraps, for a scope the host no longer has,
 	// as a resource deleted without DeleteScopes: a change that only takes access away there, as
@@ -656,20 +656,23 @@ func is(e, target error) bool {
 // errors.As read it, each error before those it wraps, through Unwrap() error, or each of
 // Unwrap() []error in turn, to the first found is true of; and whether it passed over an error it
 // had read before then. A host's type can hold itself by mistake, as one whose Unwrap returns it,
-// whose tree errors.Is reads forever, so holds reads each error it can compare once, however many
-// the tree holds. One it can't compare, as a value holding a slice, it reads each time the tree
-// comes round to it, and a tree that never ends, as one whose Unwrap makes another error each
-// time, forever, as errors.Is does.
+// whose tree errors.Is reads forever, so once holds has read and queued more errors than an
+// ordinary tree holds (remembering), it reads each error it can compare once, however many the tree
+// holds. Not from the first: remembering an error compares it whole, and a value holding an error
+// holds all that one wraps, so a tree nesting such values thousands deep would cost the square of
+// its depth, where errors.Is reads it in no more than its depth. One it can't compare, as a value
+// holding a slice, it reads each time the tree comes round to it, and a tree that never ends, as
+// one whose Unwrap makes another error each time, forever, as errors.Is does.
 func holds(err error, found func(error) bool) (ok, again bool) {
 	var read map[error]bool
 	next := []error{err}
-	for len(next) > 0 {
+	for work := 1; len(next) > 0; work++ {
 		e := next[len(next)-1]
 		next = next[:len(next)-1]
 		if e == nil {
 			continue
 		}
-		if reflect.ValueOf(e).Comparable() {
+		if work > remembering && reflect.ValueOf(e).Comparable() {
 			if read[e] {
 				again = true
 				continue
@@ -687,6 +690,7 @@ func holds(err error, found func(error) bool) (ok, again bool) {
 			next = append(next, x.Unwrap())
 		case interface{ Unwrap() []error }:
 			wrapped := x.Unwrap()
+			work += len(wrapped)
 			for i := len(wrapped) - 1; i >= 0; i-- {
 				next = append(next, wrapped[i])
 			}
@@ -694,6 +698,10 @@ func holds(err error, found func(error) bool) (ok, again bool) {
 	}
 	return false, again
 }
+
+// remembering is how many errors of a tree holds reads and queues before it remembers each one it
+// reads: so one holding itself beside many others queues no more than this many first.
+const remembering = 10000
 
 // conflicting makes *err match ErrConflict as conflicted does, for an exported call to defer, so
 // that wherever in the call PostgreSQL refused it for a race, the host meets one error: not only in
