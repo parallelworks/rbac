@@ -737,23 +737,24 @@ flowchart TB
   statement it makes compares expiry with it, and every condition reads it as `request.time`, so a
   grant or a membership ending as the call runs can't meet a deny, a condition or label values of a
   later moment. A change reads it again in its transaction, once it holds every lock it waits for,
-  advisory and on rows, where it decides again by what committed before them: read before a wait,
-  it would decide at a time the wait left behind, as by an actor's power that ended while it
-  waited, and store a place, a membership or an activation already ended. So a change holds first
-  what it may wait for, the activations it may cut short and the grants it revokes, the
-  eligibility or the deny it sets too, and picks what is in force to hold by its reading before the
-  transaction (`callClock.earlier`), which is no later, so what was in force then is all that is
-  when it decides, and perhaps more: `Activate` holds the places it can rest on as of then, and
-  keeps of the paths through them those lasting until the activation's end from the time it reads
-  once it holds them, as walking there would, and holds its activation of the role, which a change
-  ending places holds with every activation of the identities it ends them for. `SetMemberships`
-  holds the places of the memberships that had ended as of then, not those of every membership with
-  an end: the places of one ending in between it removes without waiting (NOWAIT), or is tried
-  again. Where the host's clock goes back between the two readings, what was in force at the first
-  can be less than at the second, and the change is tried again (`wentBack`). A write's own locks
-  take again what the change holds. In the tests, a
-  statement holding rows or taking an advisory lock once a change has read its time panics
-  (`watched`). As of a time, it is that time.
+  advisory and on rows, where it decides again by what committed before them: read before a wait, it
+  would decide at a time the wait left behind, as by an actor's power that ended while it waited,
+  and store a place, a membership or an activation already ended. So a change holds first what it
+  may wait for, the activations it may cut short and the grants it revokes, the eligibility or the
+  deny it sets too, and picks what is in force to hold by its reading before the transaction
+  (`callClock.earlier`), which is no later, so what was in force then is all that is when it
+  decides, and perhaps more: `Activate` holds the places it can rest on as of then, and keeps of the
+  paths through them those lasting until the activation's end from the time it reads once it holds
+  them, as walking there would, and holds its activation of the role, which a change ending places
+  holds with every activation of the identities it ends them for. `SetMemberships` holds the places
+  of the memberships that had ended as of then, not those of every membership with an end: the
+  places of one ending in between it removes without waiting (NOWAIT), or is tried again. Where the
+  host's clock goes back between the two readings, what was in force at the first can be less than
+  at the second, and the change is tried again (`wentBack`). A write's own locks take again what the
+  change holds. In the tests, a statement holding rows or taking an advisory lock once a change has
+  read its time panics, and so does a change whose session waited for a row then, whatever the
+  statement, as another session's watch of each one's wait events sees (`watched`). As of a time, it
+  is that time.
 - **Races** PostgreSQL refuses, such as a serialization failure, a deadlock between host
   transactions, or a lock waited for past `lock_timeout`, as one a migration holds, match
   `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them, as it

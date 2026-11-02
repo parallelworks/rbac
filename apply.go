@@ -1946,7 +1946,11 @@ func (a *Authorizer) begin(ctx context.Context, fn func(pgx.Tx) error) error {
 	// decided: a reading from before the locks can predate a change it waited for.
 	a.clock.before, a.clock.began, a.clock.read, a.clock.picked = a.clock.at, a.clock.read, false, false
 	return begin(ctx, a.db, func(tx pgx.Tx) error {
-		err := fn(watched(tx, a.clock))
+		w, end := watched(tx, a.clock)
+		err := fn(w)
+		if end != nil {
+			err = end(err)
+		}
 		if err != nil {
 			a.clock.now()
 		}
@@ -1954,9 +1958,10 @@ func (a *Authorizer) begin(ctx context.Context, fn func(pgx.Tx) error) error {
 	})
 }
 
-// watched is the transaction a change runs in, which a test wraps to refuse a lock taken once the
-// change has read the time it decides at (begin).
-var watched = func(tx pgx.Tx, _ *callClock) pgx.Tx { return tx }
+// watched is the transaction a change runs in, which a test wraps to refuse a lock taken, or waited
+// for, once the change has read the time it decides at (begin), and what runs as the change ends,
+// given and returning its error.
+var watched = func(tx pgx.Tx, _ *callClock) (pgx.Tx, func(error) error) { return tx, nil }
 
 // begin runs fn in a transaction of its own at READ COMMITTED, whatever the database's default,
 // as a change's checks must read what committed before it took its locks; on a pgx.Tx, as under

@@ -6105,7 +6105,8 @@ func TestAnEndPassingWhileAMembershipChangeWaitsIsRefused(t *testing.T) {
 
 // waitedPast runs change at 12:01 behind a host's transaction that hold has made a change in and
 // left open, moves the clock to 13:00 once change waits for it, and returns what change returns
-// once the transaction commits.
+// once the transaction commits. It holds the transaction a little longer once change waits, so a
+// wait once change has read its time lasts long enough for the tests' watch of row waits to see it.
 func waitedPast(t *testing.T, h *harness, clock *atomic.Int64, hold func(*rbac.Authorizer) error, change func() error) error {
 	t.Helper()
 	ctx := t.Context()
@@ -6135,6 +6136,7 @@ func waitedPast(t *testing.T, h *harness, clock *atomic.Int64, hold func(*rbac.A
 		}
 	}
 	clock.Store(h.now.Add(time.Hour).UnixNano())
+	time.Sleep(20 * time.Millisecond)
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -6541,5 +6543,48 @@ func TestAChangeWhoseClockWentBackIsTriedAgain(t *testing.T) {
 	}
 	if allowed(t, h, v, login, cluster) {
 		t.Error("at 12:00 v logs in through its activation, which rested on its place in crew, which is gone")
+	}
+}
+
+// The tests see a change wait for a row once it has read the time it decides at, which no clause of
+// its statement shows, as an upsert's on the row it conflicts with: here SetGroup's of the group,
+// which a write around the package holds, without the group's lock.
+func TestTheTestsSeeAChangeWaitForARowOnceItHasReadItsTime(t *testing.T) {
+	h := grouped(t)
+	ctx := t.Context()
+	h.groups(t, "crew")
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	var pid int32
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid() FROM rbac_groups WHERE tenant = 't1' AND id = 'crew' FOR UPDATE`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	panicked := make(chan any, 1)
+	go func() {
+		defer func() { panicked <- recover() }()
+		_ = h.authz.SetGroup(ctx, h.as(t, "groups"), "t1", rbac.GroupDefinition{ID: "crew", Name: "Crew"})
+	}()
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		var waiting bool
+		if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("SetGroup never waited for the group's row")
+		}
+	}
+	// Long enough for the watch to see the wait.
+	time.Sleep(20 * time.Millisecond)
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := (<-panicked).(string); !strings.Contains(p, "waits for a row lock") || !strings.Contains(p, "INSERT INTO rbac_groups") {
+		t.Errorf("SetGroup waiting for the group's row, having read its time, panicked with %q", p)
 	}
 }
