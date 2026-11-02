@@ -897,12 +897,13 @@ func typing(attrs Attributes) (*cel.Env, error) {
 
 // deepCopy is a copy of v whose maps, slices, arrays, pointers and structs' exported fields are its
 // own, to maxCopied deep, past which it holds their zero values, a protobuf message among them
-// copied field by field, as cloning it would, and a value reached twice copied once, a message too,
-// so a cycle ends. A struct's fields an
-// unexported struct it embeds promotes are its own too, but its other unexported fields are shared,
-// a pointer it embeds unexported among them, and so the fields that one promotes: reflection can't
-// set them. A map's keys are shared too, and what a pointer among them reaches: a copied key would
-// be another key, so the copy would find nothing under the one the host passed.
+// copied field by field, as cloning it would, but for one of a host's type that makes messages of
+// another, copied as any other pointer (itself), and a value reached twice copied once, a message
+// too, so a cycle ends. A struct's fields an unexported struct it embeds promotes are its own too,
+// but its other unexported fields are shared, a pointer it embeds unexported among them, and so the
+// fields that one promotes: reflection can't set them. A map's keys are shared too, and what a
+// pointer among them reaches: a copied key would be another key, so the copy would find nothing
+// under the one the host passed.
 func deepCopy[T any](v T) T {
 	out := reflect.ValueOf(&v).Elem()
 	out.Set(copier{}.copy(out, 0))
@@ -917,7 +918,8 @@ func deepCopy[T any](v T) T {
 const maxCopied = 2 * maxNested
 
 // copier copies values for deepCopy, keeping each map, slice and pointer it copied by where it
-// points, its length and its type.
+// points, its length and its type, and apart, with a length of -1, a message of a host's type it
+// copied as the message that type makes (message).
 type copier map[copiedKey]reflect.Value
 
 type copiedKey struct {
@@ -1035,6 +1037,12 @@ func (c copier) message(m protoreflect.Message, depth int) protoreflect.Message 
 		return m.New()
 	}
 	k, keyed := copiedKeyOf(reflect.ValueOf(m.Interface()))
+	// One of a host's type that a dynamic message's field holds, which is copied as any other pointer
+	// where it is reached as itself (itself), is copied here as the message it makes, a valid one
+	// however deep, and kept apart, so the copy of either is found only where it can be held.
+	if keyed && !itself(m.Interface()) {
+		k.len = -1
+	}
 	if depth >= maxCopied {
 		if done, ok := c[k]; keyed && ok {
 			if d, ok := done.Interface().(proto.Message); ok {
@@ -1090,16 +1098,21 @@ func (c copier) field(fd protoreflect.FieldDescriptor, v protoreflect.Value, dep
 	}
 }
 
-// itself reports whether m is a message as itself, so copied as one: a host's type embedding one is
-// a message by the methods it promotes, and copying its message would return the embedded one in
-// its place, or panic where it embeds the message interface holding none.
+// itself reports whether m is a message as itself, of a type that makes its own, so copied as one: a
+// host's type embedding one is a message by the methods it promotes, and copying its message would
+// return the embedded one in its place, or panic where it embeds the message interface holding none;
+// and one of a host's type that is its own reflection by a dynamic message it embeds makes a dynamic
+// message, which a list, a field or a map of the host's type can't hold, and a hook would read as
+// another type than the host passed. Either is copied as any other pointer, by what it points to,
+// its message among it.
 func itself(m proto.Message) (ok bool) {
 	defer func() {
 		if recover() != nil {
 			ok = false
 		}
 	}()
-	return m.ProtoReflect().Interface() == m
+	r := m.ProtoReflect()
+	return r.Interface() == m && reflect.TypeOf(r.New().Interface()) == reflect.TypeOf(m)
 }
 
 // fields copies into out, a copy of the struct v, the fields a hook can write to: its exported

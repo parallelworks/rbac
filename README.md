@@ -271,10 +271,18 @@ scopes conditional ones reach, to check one by one.
   action, which are no longer than `MaxID`, and all a condition may for reading the size of, or
   looping over, a list the request passes, or for looking up a key the request passes in a map,
   which hashes the key whole, as
-  `{"dev": 1, "prod": 2}[resource.attributes.env]` does. Cost is bounded per check too, for each
-  scope on its path, and the conditions a check reads together are bounded where they are stored:
-  an identity's grants' on a scope, those of a scope's grants to groups, the tenant's members and
-  the public, each the tenant's and those from each source the host owns apart, a scope's denies',
+  `{"dev": 1, "prod": 2}[resource.attributes.env]` does. A list literal costs 1 more for each
+  element and a map literal 2 for each entry, each time it is built, and a step of a loop 1 more
+  for each `&&`, `||` and `?:` it may evaluate, its macro's own among them, which CEL charges a
+  constant or nothing. `contains` costs what reading both strings does, multiplied, and
+  `startsWith` and `endsWith` what reading
+  the shorter does, at least 1 however short or empty either is, and one costing more than a
+  condition may fails before it runs: `contains` of one long string the request passes in another
+  tries each place in it, which can take a third of a second. Cost is bounded per check too, for
+  each scope on its path, and the conditions a check reads together are bounded where they are
+  stored: an identity's grants' on a scope, those of a scope's grants to groups, the tenant's
+  members and the public, each the tenant's and those from each source the host owns apart, a
+  scope's denies',
   and the requirements of groups' eligibilities for a role on a scope. Each holds hundreds of
   comparisons with literals, a hundred of an attribute with the subject's id, or three of the
   longest conditions that read a list, look up a key the request passes or loop, and a change
@@ -287,8 +295,14 @@ scopes conditional ones reach, to check one by one.
   more, can leave conditions stored past a bound in the same way: each process bounds a stored
   condition again by what it and the CEL it is built with make of it, so another version can bound
   one more, and the package's tests pin the bounds of conditions of common shapes, so that one an
-  upgrade moves fails them. Going back to an earlier release of this package does the same where
-  that release bounds a shape more, so while replicas of two releases run side by side, those
+  upgrade moves fails them. A condition holding a literal or a logical operator is bounded a few
+  units higher than before they were charged so, and one rebuilding a literal of hundreds at each
+  step of a loop at all a condition may cost, past which it fails: a grant's gives nothing and a
+  deny's applies. A step of `all`, `exists`, `exists_one`, `filter` or a `map` that filters costs
+  1 more for the operator its macro evaluates, so one looping over a list the request passes, which
+  cost nearly all a condition may, can now cost more, and fails the same way. Going back to an
+  earlier release of this package does the same where that release bounds a shape more, so while
+  replicas of two releases run side by side, those
   bounding a shape more may refuse changes adding a condition to a scope the others filled. To
   hand a permission on, the actor holds it unconditionally or under the same condition, one that
   doesn't read the subject: that one decides for each holder, so the actor's holding says nothing

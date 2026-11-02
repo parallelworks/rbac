@@ -617,6 +617,16 @@ func CountEvaluations(t *testing.T) *int {
 	return n
 }
 
+// CountSearches counts the searches of a string conditions run, contains, startsWith and endsWith,
+// until t ends.
+func CountSearches(t *testing.T) *int {
+	t.Helper()
+	old, n := searching, new(int)
+	searching = func() { *n++ }
+	t.Cleanup(func() { searching = old })
+	return n
+}
+
 // ConvertingAllocates is how many allocations building what conditions read takes, for a check
 // whose subject, resource and request each pass attributes of their own.
 func ConvertingAllocates(t *testing.T, subject, resource, request map[string]any) float64 {
@@ -842,6 +852,51 @@ func PlanKeysOtherwise(t *testing.T, expr string, replan func(interpreter.Interp
 	}
 	_, err = plan(c.env, checked, patterns, maxCost, cel.CustomDecoratorV2(func(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
 		if keys[i.ID()] {
+			return replan(i), nil
+		}
+		return i, nil
+	}))
+	return err
+}
+
+// PlanLiteralsOtherwise is why expr can't be planned as a condition where CEL plans each list or map
+// literal holding any as replan makes it, as another version of CEL may, or nil.
+func PlanLiteralsOtherwise(t *testing.T, expr string, replan func(interpreter.InterpretableV2) interpreter.InterpretableV2) error {
+	t.Helper()
+	c, err := newConditions(Attributes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked, patterns := compiled(t, c, expr)
+	sizes := newLiterals(checked.NativeRep(), maxCost).sizes
+	if len(sizes) == 0 {
+		t.Fatalf("%s builds no literal", expr)
+	}
+	_, err = plan(c.env, checked, patterns, maxCost, cel.CustomDecoratorV2(func(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
+		if _, constructs := i.(interpreter.InterpretableConstructor); constructs && sizes[i.ID()] > 0 {
+			return replan(i), nil
+		}
+		return i, nil
+	}))
+	return err
+}
+
+// PlanGuardedOtherwise is why expr can't be planned as a condition where CEL plans each comparison,
+// search or match it refuses before it runs as replan makes it, as another version of CEL may, or
+// nil.
+func PlanGuardedOtherwise(t *testing.T, expr string, replan func(interpreter.InterpretableV2) interpreter.InterpretableV2) error {
+	t.Helper()
+	c, err := newConditions(Attributes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked, patterns := compiled(t, c, expr)
+	ids := newGuards(checked.NativeRep()).ids
+	if len(ids) == 0 {
+		t.Fatalf("%s makes no call refused before it runs", expr)
+	}
+	_, err = plan(c.env, checked, patterns, maxCost, cel.CustomDecoratorV2(func(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
+		if ids[i.ID()] {
 			return replan(i), nil
 		}
 		return i, nil
