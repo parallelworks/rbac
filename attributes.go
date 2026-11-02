@@ -87,17 +87,20 @@ import (
 // half a packed message's, as a packed value takes as few as two bytes, each kind whole, whether it
 // can be read or not: past that, every condition reading an attribute of any kind fails, and JSON
 // text that may hold more values than are left isn't parsed. A call converts the subject's and the
-// request's attributes once, for every check it makes with them, as a change does on each scope it
-// reaches, and each check its resource's after them, counting all three as though it had converted
-// them itself, so whether a check is past that doesn't turn on how many the call makes. Where a
-// kind nests past 10,000 deep, converting stops there, so what it is charged, and whether the kinds
-// after it fit what is left, can turn on the order a map's entries come in: either way it can't be
-// read, and the others are read or, past what is left, fail. The subject's, the resource's and the
-// request's attributes share it, so attributes a tenant's users write, as a resource's tags, can
-// take every check of the resource past that, where a grant's condition reading an attribute gives
-// nothing and a deny's applies, whoever asks: bound what users may store, or pass conditions only
-// what they read. A declared attribute is a value of its type as converted, so a named string type
-// is a string.
+// request's attributes once, the first time one of its checks reads a condition, for every check it
+// makes with them, as a change does on each scope it reaches, and each check its resource's after
+// them, counting all three as though it had converted them itself, so whether a check is past that
+// doesn't turn on how many the call makes. So change none of what the host passed while the call
+// runs, as from a hook: a check after the change can read the subject's or the request's
+// attributes as they were, and a value the resource's share with them, though never another value
+// as one of them. Where a kind nests past 10,000 deep, converting stops there, so what it is
+// charged, and whether the kinds after it fit what is left, can turn on the order a map's entries
+// come in: either way it can't be read, and the others are read or, past what is left, fail. The
+// subject's, the resource's and the request's attributes share it, so attributes a tenant's users
+// write, as a resource's tags, can take every check of the resource past that, where a grant's
+// condition reading an attribute gives nothing and a deny's applies, whoever asks: bound what
+// users may store, or pass conditions only what they read. A declared attribute is a value of its
+// type as converted, so a named string type is a string.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
@@ -186,10 +189,15 @@ type converter struct {
 // is to conditions, and how deep it nests, counting itself, or that no condition can read it.
 type conversion struct {
 	to ref.Val
-	// of is the value, kept so that where it points, which the converter knows it by, is no other
-	// value's while the converter is kept, as a call keeps the one converting its subject's and
-	// request's attributes (asking) while the host's hooks run.
-	of                    reflect.Value
+	// of is where the value points, kept so that it is no other value's, which the converter would
+	// read as this one, while the converter is kept, as a call keeps the one converting its
+	// subject's and request's attributes (asking) while the host's hooks run, and as converting
+	// keeps no JSON text's or packed message's decoded values otherwise. It is where the value
+	// points, not the value as read: each of a map's entries is read into the same value (dict),
+	// and a list's where the host can write another, so kept as read, the maps a map of a type of
+	// the host's own held but its last were freed once a hook dropped them, and a resource's maps
+	// made where they were read as converted from them.
+	of                    any
 	height                int
 	open, unreadable, cut bool
 }
@@ -416,7 +424,7 @@ func (c *converter) once(v reflect.Value, convert func() (ref.Val, int)) (ref.Va
 	}
 	i := len(c.converted)
 	c.done[k] = i
-	c.converted = append(c.converted, conversion{of: v, open: true})
+	c.converted = append(c.converted, conversion{of: v.UnsafePointer(), open: true})
 	unread, deep := c.unread, c.deep
 	to, height := convert()
 	d := &c.converted[i]

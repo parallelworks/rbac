@@ -422,13 +422,18 @@ sequenceDiagram
   for a call (`askingOf`), as a change checks them on each scope it reaches, before its transaction
   and in it, and each check converts its resource's on a `fork` of that converter, which reads what
   it found and spends what it left: so each check counts all three, as though it had converted them
-  itself. The converter keeps each value it converted until the call ends, as a later check knows a
-  value it shares with them by where it points, and a value a host's hook freed meanwhile could
-  otherwise come to be where one was. Converted for each check, a change adding a member to 400
-  groups, its request holding a map of 40,000 entries, took 6 seconds. The subject's, the
-  resource's and the request's attributes share the bound, so ones users write, as a resource's
-  tags, can fail the conditions of every check of
-  the resource, closed. So conditions run on CEL's own values alone, by CEL's own semantics, and a
+  itself, in the order request, subject, resource. A converter keeps where each value it converted
+  points for as long as it is kept (`conversion.of`), the value itself rather than where it was read
+  from, as a map's entries are read into one value each overwrites: a later check knows a value it
+  shares with them by where it points, and a value a host's hook dropped meanwhile, freed, could
+  otherwise come to be where one was and be read as converted from it, as JSON text a check decodes
+  could where one it decoded before was. So a host changes none of what it passed while the call
+  runs, as from a hook: a later check can read the subject's and the request's attributes as the
+  first converted them, and a value a resource's share with them. Converted for each check, a change
+  adding a member to 400 groups, its request holding a map of 40,000 entries, took 6 seconds. The
+  subject's, the resource's and the request's attributes share the bound, so ones users write, as a
+  resource's tags, can fail the conditions of every check of the resource, closed.
+  So conditions run on CEL's own values alone, by CEL's own semantics, and a
   comparison that fails where either value holds a double that isn't finite sees every double there
   is. Each runs within the most evaluating it can cost, which its literals and types bound, and the
   ids, kinds, types and tenant a check passes and its action, which are no longer than `MaxID`. What

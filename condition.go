@@ -1844,7 +1844,8 @@ type askingKey struct {
 // each scope it reaches, before its transaction and again in it: converted for each, a change adding
 // a member to 400 groups, its request passing a map of 40,000 entries, took 6 seconds. What they
 // convert to turns on nothing else, neither the time, which vars reads for each check, nor what is
-// stored. Outside a call (still), they are converted for each check.
+// stored, and the checks after the first read what it converted, whatever a hook of the host's
+// changes of them meanwhile (Attributes). Outside a call (still), they are converted for each check.
 func (a *Authorizer) askingOf(ctx context.Context, s Subject) *asking {
 	_, none := ctx.Value(requestKey{}).(unrequested)
 	passed, _ := ctx.Value(requestKey{}).(map[string]any)

@@ -261,12 +261,15 @@ scopes conditional ones reach, to check one by one.
   them, counted as reading them costs a condition, one for each value and a tenth of each string's,
   bytes', JSON number's, JSON text's or `Any`'s type URL's length, and half an `Any`'s packed bytes,
   about a map of 50,000 short strings: past that every condition reading an attribute fails.
-  Converting stops 10,000 deep, so what a kind nesting deeper is charged, and
-  whether the kinds after it fit, can turn on the order a map's entries come in, failing closed. The
-  subject's, the resource's and the request's attributes share that, so attributes a tenant's users
-  write, as a resource's tags, can take every check of the resource past it, where a grant's
-  condition reading an attribute gives nothing and a deny's applies, whoever asks: bound what users
-  may store, or pass conditions only what they read. Comparing a value
+  Converting stops 10,000 deep, so what a kind nesting deeper is charged, and whether the kinds
+  after it fit, can turn on the order a map's entries come in, failing closed. The subject's, the
+  resource's and the request's attributes share that, so attributes a tenant's users write, as a
+  resource's tags, can take every check of the resource past it, where a grant's condition reading
+  an attribute gives nothing and a deny's applies, whoever asks: bound what users may store, or pass
+  conditions only what they read. A call reads the subject's and the request's as its first check
+  converted them: change none of them while it runs, as from a hook, as a check after the change can
+  read them as they were, and a value a resource's share with them, though never another value as
+  one of them. Comparing a value
   holding a double that isn't finite fails, in a list or a map too. Each condition runs within the
   most evaluating it can cost, which its literals and types bound: little for comparing what a
   request passes with literals, or with the ids, kinds, types and tenant a check passes or its
