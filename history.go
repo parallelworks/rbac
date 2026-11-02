@@ -187,18 +187,40 @@ const (
 // that fell behind, or since an export catching up from the start began, would be read from
 // history's rows, though each through the cursor of the export furthest behind reaches past none.
 // For an export from the start, the prunes before it began that reached past its cursor are in that
-// index too, until it reads past them, and while those since it began are fewer, a statement planned
-// for its cursor finds them by history's index of prunes by transaction (rbac_history_prunes)
-// instead.
+// index too, until it reads past them, and it passes over their entries.
 //
 // The first in that index's order, rather than EXISTS: the planner has no statistics of a partial
 // index's expressions, so it counts a third of the prunes as reaching past any cursor, and would
 // scan history's rows for one, as if one would soon turn up, where none does. No scan of the rows
-// gives that order without reading them all.
+// gives that order without reading them all, and the statements holding it run with sorting off
+// (unsorted): where history's statistics hold no prune, as until an analysis samples one, which it
+// can miss while prunes are few among history's records, the planner counts those since the cursor
+// as none, and read them all by history's index of prunes by transaction (rbac_history_prunes) to
+// sort them, every prune through the cursor once more for each read. A test of the transaction
+// that index can't serve leaves it reading them all the same, by the entries every prune has there.
 func prunedPast(history, txid, id, fromTxid string) string {
 	return `((SELECT true FROM ` + history + ` g WHERE g.entity = 'history' AND g.op = 'prune' AND g.txid >= ` + fromTxid + `
 		AND (` + pruneLastTxid + `, ` + pruneLastID + `) > (` + txid + `, ` + id + `)
 		ORDER BY ` + pruneLastTxid + `, ` + pruneLastID + ` LIMIT 1) IS NOT NULL)`
+}
+
+// unsorted turns sorting and JIT off in tx, for statements that must read an index in its order
+// where the planner would rather sort what it finds, and returns what puts both back as they were,
+// for a host's transaction that goes on past them; on an error, the rollback of tx, a transaction
+// or a savepoint, puts them back. Sorting off costs a plan that still sorts past jit_above_cost
+// before PostgreSQL 18, and compiling took far longer than the statement.
+func unsorted(ctx context.Context, tx pgx.Tx) (restore func() error, err error) {
+	var sorting, jit string
+	if err := tx.QueryRow(ctx, `SELECT current_setting('enable_sort'), current_setting('jit')`).Scan(&sorting, &jit); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `SELECT set_config('enable_sort', 'off', true), set_config('jit', 'off', true)`); err != nil {
+		return nil, err
+	}
+	return func() error {
+		_, err := tx.Exec(ctx, `SELECT set_config('enable_sort', $1, true), set_config('jit', $2, true)`, sorting, jit)
+		return err
+	}, nil
 }
 
 // unsettled is SQL for whether history, SQL for its table, holds a prune of a transaction no older
@@ -314,6 +336,14 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 	if err != nil {
 		return 0, nil, err
 	}
+	// The planner can't know that what a batch deletes is history's oldest, and would rather read
+	// all of it and sort what it finds: by history's ids, a call reads only as far as its batch
+	// reaches. And the check of through, as History's of its cursor, finds a prune past it by the
+	// order of the last record each deleted, which only their index gives (prunedPast).
+	restore, err := unsorted(ctx, tx)
+	if err != nil {
+		return 0, nil, err
+	}
 	if _, err := followable(ctx, tx, schema, through); err != nil {
 		return 0, nil, err
 	}
@@ -334,24 +364,19 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 	// since be superseded by an end the snapshot missed: it stays for this call, so the end does
 	// too. So a call can go on from where any of them stopped, and goes on from the furthest: the
 	// last by date or id can have stopped short of it, as one dated by its host transaction's
-	// start, or one that waited on another's batch and deleted none of it.
+	// start, or one that waited on another's batch and deleted none of it. They are read in the
+	// order of history's index of each entity's keys, which with sorting off only that index gives:
+	// where history's statistics hold no prune, the planner counts them as none, and would read
+	// every prune by history's index of prunes, as for the check of through (prunedPast).
 	if from < 0 {
-		if err := tx.QueryRow(ctx, `SELECT coalesce(max((after->>'reached')::bigint), 0) FROM `+history+`
+		if err := tx.QueryRow(ctx, `SELECT coalesce(max(p.reached), 0) FROM (SELECT (after->>'reached')::bigint AS reached FROM `+history+`
 			WHERE tenant = '' AND entity = 'history' AND key = `+pruneKey+`
-			  AND op = 'prune' AND after->'through' = `+pruneThrough, before, through.TxID, through.ID).Scan(&from); err != nil {
+			  AND op = 'prune' AND after->'through' = `+pruneThrough+` ORDER BY effective_at DESC) p`,
+			before, through.TxID, through.ID).Scan(&from); err != nil {
 			return 0, nil, err
 		}
 	}
-	// The planner can't know that what a batch deletes is history's oldest, and would rather
-	// read all of it and sort what it finds: by history's ids, a call reads only as far as its
-	// batch reaches. Finding the last record deleted still sorts, which with sorting off costs
-	// past jit_above_cost before PostgreSQL 18, and compiling took far longer than the prune.
-	var sorting, jit string
-	if err := tx.QueryRow(ctx, `SELECT current_setting('enable_sort'), current_setting('jit')`).Scan(&sorting, &jit); err != nil {
-		return 0, nil, err
-	}
-	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', 'on', true), set_config('enable_sort', 'off', true),
-		set_config('jit', 'off', true)`); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', 'on', true)`); err != nil {
 		return 0, nil, err
 	}
 	// Of each row's versions at or before the time, the last, by when it was written, as AsOf
@@ -413,8 +438,10 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 		return 0, nil, err
 	}
 	// Under a host's transaction, which goes on past the prune.
-	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', '', true), set_config('enable_sort', $1, true),
-		set_config('jit', $2, true)`, sorting, jit); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', '', true)`); err != nil {
+		return 0, nil, err
+	}
+	if err := restore(); err != nil {
 		return 0, nil, err
 	}
 	// One that deleted none left history as it was, and recorded nothing, and the call goes on to the
@@ -614,6 +641,12 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 		if err != nil {
 			return err
 		}
+		// Both statements find a prune past the cursor by the order of the last record each
+		// deleted, which only their index gives (prunedPast).
+		restore, err := unsorted(ctx, tx)
+		if err != nil {
+			return err
+		}
 		if generation, err = followable(ctx, tx, schema, after); err != nil {
 			return err
 		}
@@ -681,7 +714,10 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 		if !after.following() {
 			horizon = oldest
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		return restore()
 	})
 	if err != nil {
 		return nil, after, err

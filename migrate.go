@@ -45,10 +45,11 @@ func Migrations() fs.FS {
 // itself. It applies each pending migration in a transaction of its own, which records it as it
 // commits: so each takes its locks in the order it names them, not after those an earlier one
 // took, and a failure leaves the database at the last migration recorded, from which migrating
-// again goes on. On a host's transaction it applies them all in one savepoint of it, at that
-// transaction's isolation, and refuses any but READ COMMITTED: a stricter one's snapshot, taken by
-// an earlier statement, reads the versions from before it waited for another replica, and the rows
-// it records as they were before the writes it waited for.
+// again goes on. On a host's transaction, a pgx.Tx or a DB whose Begin gives a savepoint of one, it
+// applies them all in one savepoint of it, at that transaction's isolation, and refuses any but
+// READ COMMITTED: a stricter one's snapshot, taken by an earlier statement, reads the versions from
+// before it waited for another replica, and the rows it records as they were before the writes it
+// waited for.
 //
 // A migration waits at most 100 ms for any lock it takes on the package's tables, as it holds those
 // it took before meanwhile, which every statement reading them waits for: a change that reads them

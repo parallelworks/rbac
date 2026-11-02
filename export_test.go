@@ -25,6 +25,31 @@ func SetSavepointEnd(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { savepointEnd = old })
 }
 
+// Transacted is whether a change on db runs in a transaction of its own, rather than in a savepoint
+// of the host's, as Migrate tells them apart, and the isolation it runs at.
+func Transacted(ctx context.Context, db DB) (own bool, level string, err error) {
+	err = beginOwn(ctx, db, func(tx pgx.Tx, fresh bool) error {
+		own = fresh
+		return tx.QueryRow(ctx, `SELECT current_setting('transaction_isolation')`).Scan(&level)
+	})
+	return own, level, err
+}
+
+// Snapshotted is whether a read of several statements on a's DB runs in a transaction of its own,
+// rather than on the host's, and the isolation it reads at, with read only where it does.
+func Snapshotted(ctx context.Context, a *Authorizer) (own bool, level string, err error) {
+	level, err = snapshot(ctx, a, func(b *Authorizer) (string, error) {
+		own = b != a
+		var level, readOnly string
+		err := b.db.QueryRow(ctx, `SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')`).Scan(&level, &readOnly)
+		if readOnly == "on" {
+			level += ", read only"
+		}
+		return level, err
+	})
+	return own, level, err
+}
+
 // SetMigrateAttempts has Migrate try each migration at most n times, waiting backoff before the
 // second, until t ends.
 func SetMigrateAttempts(t *testing.T, n int, backoff time.Duration) {
