@@ -63,7 +63,8 @@ import (
 //   - a map keyed by a bool, a string, an int or a uint, of a type of its own too, or by an
 //     interface holding one, of these, read as a map;
 //   - a pointer to any of these, read as what it points to;
-//   - JSON text (json.RawMessage) and a JSON number (json.Number), parsed;
+//   - JSON text (json.RawMessage) and a JSON number (json.Number), parsed, a nil json.RawMessage
+//     read as null, as encoding/json writes it;
 //   - the protobuf well-known types: a Struct, a ListValue, a Value or a NullValue, a wrapper, a
 //     Timestamp, a Duration, and an Any packing one of them but another Any, by its type's name,
 //     as no packed message of another type is decoded.
@@ -261,6 +262,10 @@ func (c *converter) of(v reflect.Value) (ref.Val, int) {
 	case durationType:
 		return types.Duration{Duration: time.Duration(v.Int())}, 1
 	case rawType:
+		// A nil one is no JSON text, which encoding/json writes as null, as it writes a nil pointer.
+		if v.IsNil() {
+			return types.NullValue, 1
+		}
 		return c.json(v)
 	case numberType:
 		return c.number(v.String()), 1

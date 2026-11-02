@@ -226,8 +226,8 @@ scopes conditional ones reach, to check one by one.
   string, an int, a uint or a float of any size, of a type of the host's own too, as a named string,
   read by its kind; `time.Time` and `time.Duration`; bytes, as `[]byte` or an array of bytes;
   slices, arrays and pointers of these, a nil pointer read as null; maps of these keyed by a bool, a
-  string, an int or a uint, or by an interface holding one; JSON text (`json.RawMessage`) and
-  `json.Number`, parsed; the protobuf `Struct`, `ListValue`, `Value`, `NullValue`, wrappers,
+  string, an int or a uint, or by an interface holding one; JSON text (`json.RawMessage`, a nil
+  one read as null, as `encoding/json` writes it) and `json.Number`, parsed; the protobuf `Struct`, `ListValue`, `Value`, `NullValue`, wrappers,
   `Timestamp` and `Duration`, and an `Any` packing one of them; and CEL's own scalar values.
   A kind's attributes, the subject's, the resource's or the request's, holding anything else,
   however deep, can't be read as a whole, as a policy engine fails input it can't read: every

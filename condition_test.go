@@ -1102,6 +1102,30 @@ func (f formatted) String() string {
 	return "formatted"
 }
 
+// A nil json.RawMessage is null, as encoding/json writes it, wherever it is held, so the attributes
+// beside it are read; it failed its kind's attributes as JSON text that doesn't parse, which an
+// empty one, and any other that doesn't parse, still is.
+func TestANilJSONTextIsNull(t *testing.T) {
+	var none json.RawMessage
+	for name, v := range map[string]any{
+		"nil": none, "in a list": []json.RawMessage{none}, "in a map": map[string]json.RawMessage{"a": none}, "behind a pointer": &none,
+	} {
+		attributes := map[string]any{"v": v, "ok": true}
+		if held, _, _, err := rbac.EvaluateCondition(t, `request.attributes.ok == true`, attributes); err != nil || !held {
+			t.Errorf("an attribute beside JSON text %s: held %t, %v", name, held, err)
+		}
+	}
+	if held, _, _, err := rbac.EvaluateCondition(t, `request.attributes.v == null && request.attributes.l == [null]`,
+		map[string]any{"v": none, "l": []json.RawMessage{none}}); err != nil || !held {
+		t.Errorf("nil JSON text isn't null: held %t, %v", held, err)
+	}
+	for name, v := range map[string]json.RawMessage{"empty": {}, "cut short": json.RawMessage(`{"a": `)} {
+		if _, evaluated, _, err := rbac.EvaluateCondition(t, `request.attributes.ok == true`, map[string]any{"v": v, "ok": true}); err != nil || evaluated {
+			t.Errorf("an attribute beside JSON text %s: evaluated %t, %v", name, evaluated, err)
+		}
+	}
+}
+
 // CEL writes a value it can't read, as a struct, into its error, whole, each time a condition
 // reads it, as declaring its type does once for a check: a struct holding a long list took as
 // long to write out as it is long each time, though the read was charged as one value, and one
