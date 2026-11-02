@@ -798,8 +798,12 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   grant or a membership ending as it runs can't meet a deny, a condition or label values of a later
   moment; a change reads it again once it holds every lock it waits for, where it decides again:
   read before a wait, as for an `Activate` holding the places a change ends, it would decide at a
-  time the wait left behind, as by an actor's power that ended while it waited. Where the host's
-  clock goes back between the two readings, the change is tried again (`rbac.ErrConflict`).
+  time the wait left behind, as by an actor's power that ended while it waited. So a change holds
+  first what it writes that `DeleteExpired`, which waits for nothing, may be deleting, and holds
+  until its own transaction ends. `SetMemberships` doesn't wait for the places in groups of a
+  membership that ended while it took its locks, which another transaction holds, as a group's
+  deletion: it is tried again (`rbac.ErrConflict`), as is a change whose host's clock goes back
+  between the two readings.
 
 ## Development
 

@@ -185,7 +185,11 @@ func keptAgain[T any](set []T, now time.Time, check func(T, time.Time) error) er
 // in none of the groups it was in, whether or not DeleteExpired has run since, as a membership
 // made by actor now. Config.ValidateGrant is asked about none of what an identity holds: a host
 // whose policy decides by membership, as none privileged for a guest, checks what one holds when
-// it makes it a guest or lifts its suspension.
+// it makes it a guest or lifts its suspension. The places in groups of a membership that ended
+// while it took its locks it removes without waiting for them: where another transaction holds one,
+// as a group's deletion, it is tried again (ErrConflict), rather than decide at a time the wait
+// left behind; under WithTx, roll the host's transaction back and run it again, as for any
+// conflict.
 func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant string, ms []Membership) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "SetMemberships")
