@@ -149,8 +149,11 @@ scopes conditional ones reach, to check one by one.
   these partners), and a resource carries its label (`Resource.Labels`), stored with it as its path
   is. A host declaring them supplies `Config.ResourceOf`, which gives the labels of the tenant, its
   groups and the other scopes changes reach: `New` refuses them without it, as invalid. A subject
-  holds a dimension's values as permissions, `dimension:value`, which roles for the tenant give, so
-  groups, eligibilities, expiry, conditions, denies on the tenant and history all apply to them.
+  holds a dimension's values as permissions, `dimension:value`, which roles for the tenant alone
+  give, so groups, eligibilities, expiry, conditions, denies on the tenant and history all apply to
+  them. A custom role stored for another type too, as one defined before its dimension was declared
+  can be, gives none of them, only the rest, so its grants count toward no exclusive dimension, and
+  is as privileged as though it did.
   Every check decides them, and the powers to release, on the tenant with no attributes or label,
   whatever tenant it is passed, as a check of a labeled resource reads them,
   and a change hands one on only as the actor holds it there: a condition of theirs can't read the
@@ -159,9 +162,11 @@ scopes conditional ones reach, to check one by one.
   included, fails, so a grant's gives nothing and a deny's applies; and a constraint is asked about
   that bare tenant, so one deciding them by the tenant's state reads it through its `q`. A check of
   a labeled resource asks it once about each value the label asks for that the subject's grants
-  give, of an `Ordered` dimension those as high as the label's, and nothing about the rest;
-  `Holding`, `Filter` and `Reachable`, which test any label, ask about every one, as do the changes
-  and the approval `Config.Constraints` names.
+  give, of an `Ordered` dimension those as high as the label's, and nothing about the rest, as a
+  change does for the label of each scope it checks; `Holding`, `Filter` and `Reachable`, which
+  test any label, ask about every one, as do `SetRole` and `DeleteRole`, and `ChangeMembers` taking
+  access away, which first decide whether the actor's values satisfy every label, and the approval
+  `Config.Constraints` names.
   `Authorize`, `Explain`, `Permissions`, `Holders` and `Grantable` allow nothing else of a labeled
   resource unless what the subject holds satisfies the label, whatever its grants give, its values
   read with its grants, so none allows what no moment did, nor do
@@ -178,11 +183,14 @@ scopes conditional ones reach, to check one by one.
   first asks for it, and evaluates a condition of the actor's that doesn't read the action once for
   all of them, each value still on a budget of its own, as a check of it is. For each it walks only
   the actor's grants giving values or powers to release, and of their roles only those, each role
-  read once in each phase, so the actor's grants of other roles, however many or large, cost a label
-  nothing.
-  `Filter` tests a `text[]` label column (`Columns.Labels`), which needs no
-  index, as the path's drives the query; `Reachable` returns the holding, and `Holding` with
-  `Satisfies` checks data points in a feed without reading the database.
+  read once in each phase, as every check deciding a subject's values does, so the grants of other
+  roles, however many or large, cost a label nothing.
+  `Filter` tests a `text[]` label column (`Columns.Labels`), looking each of a row's values up,
+  byte for byte, in objects of the values the holding allows that the query builds once, so a row
+  costs a few comparisons for each of its values however many the dimensions declare, in a custom
+  plan or a generic one; the column needs no index, as the path's drives the query. `Reachable`
+  returns the holding, and `Holding` with `Satisfies` checks data points in a feed without reading
+  the database.
 - **Writing labeled data:** data read under one label is written under another only if
   `Holding.MayWrite` allows it: the writer satisfies the label it read, and the new one is at
   least as restrictive in every dimension (a level as high, every compartment kept, partners

@@ -618,7 +618,14 @@ flowchart LR
   number of them can be on scopes of other types, which no index tells apart: while fewer than 16
   denies are on scopes of the types a list reads, it reads those by type, and otherwise finds the
   ones naming everyone by those keys, so a tenant with many of both has every list read every deny
-  naming everyone.
+  naming everyone. A row's label is tested by looking each of its values up, byte for byte, in
+  objects the statement builds once of the values the subject's holding allows, and of each `AnyOf`
+  dimension it holds some values of but not all, that dimension's values and those it holds, so a
+  row costs a few comparisons for each of its values however many the dimensions declare, in a
+  custom plan or a generic one: an array's containment or overlap would compare each with every
+  value declared, and `= ANY` hashes only an array a plan holds as a constant. The planner counts
+  each lookup as keeping a third of the rows, so a dimension held whole or not at all has no test of
+  its own, which with many declared would have a sorted page planned to read every row.
 - **Reachable** returns the same as scopes, for a host that keeps its resources elsewhere. They hold
   for resources of the listed type alone: a scope reaches everything under it, of any type, so a
   store holding several keeps to the type itself. Conditional grants and conditional denies come
@@ -634,8 +641,12 @@ flowchart LR
 A label is mandatory access control above every grant. The host declares dimensions in
 `Config.Labels`, with `Config.ResourceOf`, through which changes read the labels of the scopes they
 reach, the tenant's and its groups' among them: `New` refuses labels without it. A subject holds a
-dimension's values as permissions, `dimension:value`, which roles granted on the tenant give, and a
-labeled resource is allowed only to a subject whose values satisfy its label.
+dimension's values as permissions, `dimension:value`, which roles for the tenant alone give, granted
+on it, and a labeled resource is allowed only to a subject whose values satisfy its label. A custom
+role stored for another type too, as one defined before its dimension was declared can be, is read
+as giving none of them (`current`), privileged and public as the whole role is, so no grant below
+the tenant gives one, its grants count toward no exclusive dimension, and a check of a value and
+`Permissions` decide it by the same grants.
 
 ```mermaid
 flowchart TB
@@ -670,7 +681,9 @@ flowchart TB
   of roles giving values or powers to release, and of each role only those, privileged and public
   as the whole role is, which the first decision narrows the read to, reading each role once
   (`labeling`): a holding decides by nothing else, so the actor's grants of other roles, however
-  many or large, cost a label nothing.
+  many or large, cost a label nothing. A check deciding a subject's values, as `Authorize` of a
+  labeled resource, `Holders` for each identity, `Holding`, `Filter` and `Reachable` do, narrows its
+  read so too.
 - **Releasing and writing.** `ReleasePermission(dimension)`, held on the tenant, is the power to
   release data to a looser label in that dimension, so only a holder of it can downgrade data. A
   `Holding`'s `MayWrite` and `MayRelease` say whether data read under one label may be written, or
