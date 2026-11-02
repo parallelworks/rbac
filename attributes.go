@@ -198,6 +198,7 @@ func (c *converter) attributes(attributes map[string]any) (map[ref.Val]ref.Val, 
 	if len(attributes) == 0 {
 		return nil, true
 	}
+	convertingKind()
 	// Each costs at least its name and its value, so a map for more than are left isn't made, as
 	// one for a million took 80 MB, only to find them past it.
 	if 2*length(len(attributes)) > c.left {

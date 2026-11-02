@@ -661,6 +661,12 @@ func (a *Authorizer) broadLabeled(ctx context.Context, p Permission, r Resource,
 // none of p's dimension, is left out. The members and the public broadLabeled kept stay. Each
 // identity's holding is decided after the list's snapshot, as its constraints run as for any read.
 func (a *Authorizer) labeled(ctx context.Context, p Permission, r Resource, holders []Holder, values map[string]*valuesRead) ([]Holder, error) {
+	// Whom it keeps, and marks, doesn't turn on the request: each value or power to release whose
+	// decision a condition takes part in, a grant's or a deny's, is in byCondition whatever the
+	// condition came to, and both holdings below set each of those alike; the rest, and whether p's
+	// dimension is excluded, are decided by grants, unconditional denies and constraints asked
+	// without the request. So its conditions read none, which each holder converted again.
+	ctx = withoutRequest(ctx)
 	kept := holders[:0]
 	for _, h := range holders {
 		if h.Principal.broad() {

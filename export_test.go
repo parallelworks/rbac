@@ -355,6 +355,16 @@ func CountConversions(t *testing.T) *int {
 	return n
 }
 
+// CountKindsConverted counts the kinds' attributes, the subject's, the resource's or the request's,
+// converted for conditions to read, none counted where a kind passes none, until t ends.
+func CountKindsConverted(t *testing.T) *int {
+	t.Helper()
+	old, n := convertingKind, new(int)
+	convertingKind = func() { *n++ }
+	t.Cleanup(func() { convertingKind = old })
+	return n
+}
+
 // ConditionCost is the most evaluating expr can cost, which a check runs it within, and what
 // evaluating it on a request with attributes, which the resource carries too, costs, up to
 // maxCost, built with the package's CEL environment extended by opts.

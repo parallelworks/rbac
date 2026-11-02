@@ -1714,9 +1714,9 @@ func (c *conditions) decide(b *budget, expr string, vars map[string]any) (held, 
 	return r.held, r.evaluated
 }
 
-// evaluating runs as a condition is evaluated, and converting as what conditions read is built, as
-// a test's counters.
-var evaluating, converting = func() {}, func() {}
+// evaluating runs as a condition is evaluated, converting as what conditions read is built, and
+// convertingKind as a kind's attributes are converted for it, as a test's counters.
+var evaluating, converting, convertingKind = func() {}, func() {}, func() {}
 
 // evaluate runs a condition's program on a request.
 func evaluate(prg program, vars map[string]any) run {
