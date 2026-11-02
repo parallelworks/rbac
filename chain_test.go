@@ -223,11 +223,12 @@ func TestASignersRaceConflicts(t *testing.T) {
 	}
 }
 
-// givenSigners names the package's exported functions, and the methods of its exported types, that
-// are given a crypto.Signer or crypto.MessageSigner by a parameter: as it is, or in a type of the
-// package's, a pointer, a list, a map, a variadic parameter, a function or an interface.
+// givenSigners names the package's exported functions, and the methods of its exported types, theirs
+// or promoted from a type of the package's they embed, that are given a crypto.Signer or
+// crypto.MessageSigner by a parameter: as it is, or in a type of the package's, a pointer, a list,
+// a map, a variadic parameter, a function, an interface or a type parameter's constraint.
 // Reflection reads no function, and only the methods of the types it is given, so the source is
-// read.
+// read; a receiver it can't name fails it, so no method goes unread.
 func givenSigners(t *testing.T) []string {
 	t.Helper()
 	files, err := filepath.Glob("*.go")
@@ -236,8 +237,9 @@ func givenSigners(t *testing.T) []string {
 	}
 	// Each declaration with the name its file imports crypto by.
 	type declared struct {
-		of    ast.Expr
-		alias string
+		of     ast.Expr
+		params *ast.FieldList
+		alias  string
 	}
 	types := map[string]declared{}
 	type fn struct {
@@ -267,7 +269,7 @@ func givenSigners(t *testing.T) []string {
 			case *ast.GenDecl:
 				for _, s := range d.Specs {
 					if s, ok := s.(*ast.TypeSpec); ok {
-						types[s.Name.Name] = declared{s.Type, alias}
+						types[s.Name.Name] = declared{s.Type, s.TypeParams, alias}
 					}
 				}
 			case *ast.FuncDecl:
@@ -275,69 +277,156 @@ func givenSigners(t *testing.T) []string {
 			}
 		}
 	}
-	var holds func(e ast.Expr, alias string, seen map[string]bool) bool
-	fields := func(fl *ast.FieldList, alias string, seen map[string]bool) bool {
-		return fl != nil && slices.ContainsFunc(fl.List, func(f *ast.Field) bool { return holds(f.Type, alias, seen) })
+	// A type parameter in scope, by its name: its constraint, read with its file's crypto.
+	type param struct {
+		constraint ast.Expr
+		alias      string
 	}
-	holds = func(e ast.Expr, alias string, seen map[string]bool) bool {
+	// A method's receiver can name its type's parameters anew, in order, as named reads them.
+	paramsOf := func(fl *ast.FieldList, alias string, names []string) map[string]param {
+		ps := map[string]param{}
+		i := 0
+		for _, f := range fieldsOf(fl) {
+			for _, n := range f.Names {
+				if names != nil && i < len(names) {
+					n = ast.NewIdent(names[i])
+				}
+				ps[n.Name] = param{f.Type, alias}
+				i++
+			}
+		}
+		return ps
+	}
+	var holds func(e ast.Expr, alias string, params map[string]param, seen map[any]bool) bool
+	fields := func(fl *ast.FieldList, alias string, params map[string]param, seen map[any]bool) bool {
+		return fl != nil && slices.ContainsFunc(fl.List, func(f *ast.Field) bool { return holds(f.Type, alias, params, seen) })
+	}
+	holds = func(e ast.Expr, alias string, params map[string]param, seen map[any]bool) bool {
 		switch x := e.(type) {
 		case *ast.SelectorExpr:
 			pkg, ok := x.X.(*ast.Ident)
 			return ok && alias != "" && pkg.Name == alias && (x.Sel.Name == "Signer" || x.Sel.Name == "MessageSigner")
 		case *ast.Ident:
+			if p, ok := params[x.Name]; ok {
+				if seen[p.constraint] {
+					return false
+				}
+				seen[p.constraint] = true
+				return holds(p.constraint, p.alias, params, seen)
+			}
 			d, ok := types[x.Name]
 			if !ok || seen[x.Name] {
 				return false
 			}
 			seen[x.Name] = true
-			return holds(d.of, d.alias, seen)
+			return holds(d.of, d.alias, paramsOf(d.params, d.alias, nil), seen)
 		case *ast.StarExpr:
-			return holds(x.X, alias, seen)
+			return holds(x.X, alias, params, seen)
 		case *ast.ParenExpr:
-			return holds(x.X, alias, seen)
+			return holds(x.X, alias, params, seen)
+		case *ast.UnaryExpr:
+			return holds(x.X, alias, params, seen)
+		case *ast.BinaryExpr:
+			return holds(x.X, alias, params, seen) || holds(x.Y, alias, params, seen)
 		case *ast.ArrayType:
-			return holds(x.Elt, alias, seen)
+			return holds(x.Elt, alias, params, seen)
 		case *ast.Ellipsis:
-			return holds(x.Elt, alias, seen)
+			return holds(x.Elt, alias, params, seen)
 		case *ast.MapType:
-			return holds(x.Key, alias, seen) || holds(x.Value, alias, seen)
+			return holds(x.Key, alias, params, seen) || holds(x.Value, alias, params, seen)
 		case *ast.ChanType:
-			return holds(x.Value, alias, seen)
+			return holds(x.Value, alias, params, seen)
 		case *ast.StructType:
-			return fields(x.Fields, alias, seen)
+			return fields(x.Fields, alias, params, seen)
 		case *ast.InterfaceType:
-			return fields(x.Methods, alias, seen)
+			return fields(x.Methods, alias, params, seen)
 		case *ast.FuncType:
-			return fields(x.Params, alias, seen) || fields(x.Results, alias, seen)
+			return fields(x.Params, alias, params, seen) || fields(x.Results, alias, params, seen)
 		case *ast.IndexExpr:
-			return holds(x.X, alias, seen) || holds(x.Index, alias, seen)
+			return holds(x.X, alias, params, seen) || holds(x.Index, alias, params, seen)
 		case *ast.IndexListExpr:
-			return holds(x.X, alias, seen) || slices.ContainsFunc(x.Indices, func(i ast.Expr) bool { return holds(i, alias, seen) })
+			return holds(x.X, alias, params, seen) || slices.ContainsFunc(x.Indices, func(i ast.Expr) bool { return holds(i, alias, params, seen) })
 		}
 		return false
 	}
-	var names []string
-	for _, f := range funcs {
-		name := f.decl.Name.Name
-		if f.decl.Recv != nil {
-			recv := f.decl.Recv.List[0].Type
-			if star, ok := recv.(*ast.StarExpr); ok {
-				recv = star.X
-			}
-			if index, ok := recv.(*ast.IndexExpr); ok {
-				recv = index.X
-			}
-			id, ok := recv.(*ast.Ident)
-			if !ok || !id.IsExported() {
-				continue
-			}
-			name = id.Name + "." + name
+	// named is the type a receiver or an embedded field names, and the names it gives the type's
+	// parameters.
+	named := func(e ast.Expr) (string, []string, bool) {
+		if star, ok := e.(*ast.StarExpr); ok {
+			e = star.X
 		}
-		if f.decl.Name.IsExported() && fields(f.decl.Type.Params, f.alias, map[string]bool{}) {
-			names = append(names, name)
+		var indices []ast.Expr
+		switch x := e.(type) {
+		case *ast.IndexExpr:
+			e, indices = x.X, []ast.Expr{x.Index}
+		case *ast.IndexListExpr:
+			e, indices = x.X, x.Indices
+		}
+		id, ok := e.(*ast.Ident)
+		if !ok {
+			return "", nil, false
+		}
+		var names []string
+		for _, i := range indices {
+			if n, ok := i.(*ast.Ident); ok {
+				names = append(names, n.Name)
+			}
+		}
+		return id.Name, names, true
+	}
+	given := map[string][]string{}
+	for _, f := range funcs {
+		if !f.decl.Name.IsExported() {
+			continue
+		}
+		params := paramsOf(f.decl.Type.TypeParams, f.alias, nil)
+		recv := ""
+		if f.decl.Recv != nil {
+			name, indices, ok := named(f.decl.Recv.List[0].Type)
+			if !ok {
+				t.Fatalf("the receiver of %s names no type this reads", f.decl.Name.Name)
+			}
+			recv = name
+			maps.Copy(params, paramsOf(types[name].params, types[name].alias, indices))
+		}
+		if fields(f.decl.Type.Params, f.alias, params, map[any]bool{}) {
+			given[recv] = append(given[recv], f.decl.Name.Name)
+		}
+	}
+	names := slices.Clone(given[""])
+	// An exported type's methods, and those of the unexported types it embeds, which it promotes.
+	var promoted func(of string, seen map[string]bool) []string
+	promoted = func(of string, seen map[string]bool) []string {
+		if seen[of] {
+			return nil
+		}
+		seen[of] = true
+		methods := slices.Clone(given[of])
+		if st, ok := types[of].of.(*ast.StructType); ok {
+			for _, f := range st.Fields.List {
+				if name, _, ok := named(f.Type); ok && len(f.Names) == 0 && !ast.IsExported(name) {
+					methods = append(methods, promoted(name, seen)...)
+				}
+			}
+		}
+		return methods
+	}
+	for of := range types {
+		if ast.IsExported(of) {
+			for _, m := range promoted(of, map[string]bool{}) {
+				names = append(names, of+"."+m)
+			}
 		}
 	}
 	return names
+}
+
+// fieldsOf is fl's fields, none where it is nil.
+func fieldsOf(fl *ast.FieldList) []*ast.Field {
+	if fl == nil {
+		return nil
+	}
+	return fl.List
 }
 
 // An export chains and signs history, not a session's temporary table named as it, which any role
