@@ -1563,8 +1563,8 @@ func TestAnActorsPathsToItsGroupsAreReadOnceForTheDeniesNamingIt(t *testing.T) {
 // cost little more than as many naming and exempting the subject's alone, in a custom plan and a
 // generic one. An overlap of arrays compared each key a deny names with every one of the subject's,
 // which took seconds for each. The cost is spent inside one call for each deny, which no plan's
-// counts of rows, loops or buffers show, so the two are timed: in turn, the fastest of several runs
-// of each, so what slows the database slows both.
+// counts of rows, loops or buffers show, so the two are timed: in turn, each first in every other
+// round, the fastest of several runs of each, so what slows the database slows both.
 func TestDeniesCostTheirKeysHoweverManyGroupsTheSubjectIsIn(t *testing.T) {
 	ctx := t.Context()
 	for _, mode := range []string{"force_custom_plan", "force_generic_plan"} {
@@ -1623,16 +1623,19 @@ func TestDeniesCostTheirKeysHoweverManyGroupsTheSubjectIsIn(t *testing.T) {
 		}
 		for _, c := range calls {
 			took := map[int]time.Duration{}
-			for range 5 {
-				for others, h := range hs {
+			// Each shape runs first in every other round, so a stretch of load meets both alike.
+			order := []int{0, 255}
+			for range 7 {
+				for _, others := range order {
 					start := time.Now()
-					if err := c.call(h); err != nil {
+					if err := c.call(hs[others]); err != nil {
 						t.Fatalf("%s with denies of %d principals: %v", c.name, others+1, err)
 					}
 					if d := time.Since(start); took[others] == 0 || d < took[others] {
 						took[others] = d
 					}
 				}
+				slices.Reverse(order)
 			}
 			if few, many := took[0], took[255]; many > 4*few+50*time.Millisecond {
 				t.Errorf("under %s, for a subject in 1,010 groups, %s took %v with 100 denies of 1 principal and 1 exemption each, and %v of 256 and 256", mode, c.name, few, many)
