@@ -416,7 +416,8 @@ scopes conditional ones reach, to check one by one.
   asks nothing.
 - **Public access:** the zero `Subject` is anonymous and holds only what is granted to the public.
   Only a role marked `Public` can be granted to the public, and a grant to the public gives
-  nothing once its role no longer is.
+  nothing once its role no longer is. `Grants`, `Eligibilities`, `Memberships`, `MembershipsOf` and
+  `GroupsOf` take its zero principal, as a constraint may ask about it, and list nothing of it.
 - **Broad grants:** a grant to a tenant's members (`rbac.TenantMembers`) or the public never gives
   a privileged role, nor any permission that changes access, so changing access always takes a
   named identity or group.
@@ -789,9 +790,15 @@ change is recorded in, or a prune checked against.
   roll the host's transaction back and run it again from its start, not the call alone in it: a
   statement refused on that transaction itself, as most reads', a hook's or one a change makes
   before its savepoint, aborts it, and one refused in a savepoint, as a change's, `AsOf`'s or
-  `History`'s, leaves it holding what it took before the call, which the race can be over. Changes
-  to the same rows wait for each other by locks named for the schema holding the tables, so
-  sessions reaching them through different search_paths still do.
+  `History`'s, leaves it holding what it took before the call, which the race can be over. The
+  signer `Export` and `Checkpoint.Sign` are given is a hook too. A hook's error is read in the
+  order `errors.Is` and `errors.As` read it, however many errors it holds, to the first race or
+  `ErrConflict` in it, and once ten thousand or so of them are read, each one once: one whose tree
+  holds itself, as a host's type wrapping itself by mistake can, which they read forever, a call
+  reads round until then and returns, though the host's own `errors.Is` of what it returns, or of
+  what `Config.OnRefused` is told, can still read it forever. Changes to the same rows wait for
+  each other by locks named for the schema holding the tables, so sessions reaching them through
+  different search_paths still do.
 - **What the host passes:** a check reads grants, memberships and groups as they are; only compiled
   conditions are cached. Read a resource's ancestors and attributes from where they are stored,
   never from request input, no earlier than the content they protect, and from the primary. A

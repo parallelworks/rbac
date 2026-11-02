@@ -3,7 +3,6 @@ package rbac
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 	"unicode/utf8"
@@ -751,7 +750,7 @@ type Refusal struct {
 func (a *Authorizer) refused(ctx context.Context, err *error, tenant string, actor Principal, how string) {
 	// One AsOf gave refuses every change, which is no actor's attempt: what it checked first, it
 	// checked against the past, and its clock is the time it reads.
-	if a.cfg.OnRefused == nil || a.asOf || *err == nil || !errors.Is(*err, ErrDenied) && !errors.Is(*err, ErrInvalid) {
+	if a.cfg.OnRefused == nil || a.asOf || *err == nil || !matches(*err, ErrDenied) && !matches(*err, ErrInvalid) {
 		return
 	}
 	audit, _ := ctx.Value(auditKey{}).(Audit)

@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -583,9 +584,14 @@ var (
 	// serialization failure, a deadlock, as between host transactions, or a lock it couldn't take,
 	// as one a migration holds past the session's lock_timeout. It is so wherever in the call
 	// PostgreSQL refused it: in a change's transaction or the reads it makes before it, in a read, or
-	// in a statement a hook ran, where the error the hook returns wraps PostgreSQL's, alone or
-	// beside others, as errors.Join holds them, or holds it as errors.As reads it. Try it again:
-	// under WithTx, the host's whole transaction, as WithTx says.
+	// in a statement a hook ran, or the signer Export and Checkpoint.Sign are given, where the error
+	// it returns wraps PostgreSQL's, alone or beside others, as errors.Join holds them, or holds it
+	// as errors.As reads it. Try it again: under WithTx, the host's whole transaction, as WithTx
+	// says. A hook's error is read in the order errors.Is and errors.As read it, however many errors
+	// it holds, to the first race or ErrConflict in it, and once ten thousand or so of them are read,
+	// each one once: one whose tree holds itself, as a host's type wrapping itself by mistake can,
+	// which they read forever, a call reads round until then and returns, though the host's own
+	// errors.Is of what it returns, or of what Config.OnRefused is told, can still read it forever.
 	ErrConflict = errors.New("rbac: conflict")
 	// ErrNotFound is what Config.ResourceOf returns, or wraps, for a scope the host no longer has,
 	// as a resource deleted without DeleteScopes: a change that only takes access away there, as
@@ -595,48 +601,107 @@ var (
 )
 
 // conflicted makes PostgreSQL's refusals for a race match ErrConflict, keeping the error: a
-// serialization failure, a deadlock, or a lock it couldn't take, wherever err holds one.
+// serialization failure, a deadlock, or a lock it couldn't take, wherever err holds one, as
+// errors.As reads one, through an As method too. It reads the whole tree, as a hook's error can
+// join another of PostgreSQL's before the race, or wrap both, and errors.As stops at the first; but
+// only to the first race or error matching ErrConflict, as holds reads it, and maps none where that
+// matches ErrConflict, as conflicted puts it before the race it maps and errors.Is then finds it,
+// unless it comes only past an error read before, where errors.Is would read the tree round again.
 func conflicted(err error) error {
-	if raced(err) && !errors.Is(err, ErrConflict) {
+	if err == nil {
+		return nil
+	}
+	var race, conflict bool
+	_, again := holds(err, func(e error) bool {
+		conflict = is(e, ErrConflict)
+		race = !conflict && raced(e)
+		return conflict || race
+	})
+	if race || conflict && again {
 		return fmt.Errorf("%w: %w", ErrConflict, err)
 	}
 	return err
 }
 
-// raced reports whether err, or any error it wraps, is PostgreSQL's refusal for a race, as
-// errors.As reads one, through an As method too. It reads the whole tree, as a hook's error can
-// join another of PostgreSQL's before the race, or wrap both, and errors.As stops at the first; but
-// at most maxWrapped of its errors, in errors.As's order, as one a host's type has wrap itself
-// would be read forever.
-func raced(err error) bool {
+// raced reports whether e itself is PostgreSQL's refusal for a race, or gives one through its As
+// method, as errors.As reads each error of a tree.
+func raced(e error) bool {
+	var pg *pgconn.PgError
+	switch x := e.(type) { //nolint:errorlint // one error of a tree, which holds reads
+	case *pgconn.PgError:
+		pg = x
+	case interface{ As(any) bool }:
+		x.As(&pg)
+	}
+	return pg != nil && (pg.Code == "40001" || pg.Code == "40P01" || pg.Code == "55P03")
+}
+
+// matches reports whether err matches target, as errors.Is reports it, reading err's tree as holds
+// does: a hook's error, or one of the package's holding it.
+func matches(err, target error) bool {
+	found, _ := holds(err, func(e error) bool { return is(e, target) })
+	return found
+}
+
+// is reports whether e itself matches target, as errors.Is tests each error of a tree.
+func is(e, target error) bool {
+	if e == target { //nolint:errorlint // one error of a tree, which holds reads
+		return true
+	}
+	x, ok := e.(interface{ Is(error) bool })
+	return ok && x.Is(target)
+}
+
+// holds reports whether found is true of an error of err's tree, read in the order errors.Is and
+// errors.As read it, each error before those it wraps, through Unwrap() error, or each of
+// Unwrap() []error in turn, to the first found is true of; and whether it passed over an error it
+// had read before then. A host's type can hold itself by mistake, as one whose Unwrap returns it,
+// whose tree errors.Is reads forever, so once holds has read and queued more errors than an
+// ordinary tree holds (remembering), it reads each error it can compare once, however many the tree
+// holds. Not from the first: remembering an error compares it whole, and a value holding an error
+// holds all that one wraps, so a tree nesting such values thousands deep would cost the square of
+// its depth, where errors.Is reads it in no more than its depth. One it can't compare, as a value
+// holding a slice, it reads each time the tree comes round to it, and a tree that never ends, as
+// one whose Unwrap makes another error each time, forever, as errors.Is does.
+func holds(err error, found func(error) bool) (ok, again bool) {
+	var read map[error]bool
 	next := []error{err}
-	for read := 0; len(next) > 0 && read < maxWrapped; read++ {
-		err, next = next[len(next)-1], next[:len(next)-1]
-		var pg *pgconn.PgError
-		switch e := err.(type) { //nolint:errorlint // each error of the tree is read, not only the first PostgreSQL's
-		case *pgconn.PgError:
-			pg = e
-		case interface{ As(any) bool }:
-			e.As(&pg)
+	for work := 1; len(next) > 0; work++ {
+		e := next[len(next)-1]
+		next = next[:len(next)-1]
+		if e == nil {
+			continue
 		}
-		if pg != nil && (pg.Code == "40001" || pg.Code == "40P01" || pg.Code == "55P03") {
-			return true
+		if work > remembering && reflect.ValueOf(e).Comparable() {
+			if read[e] {
+				again = true
+				continue
+			}
+			if read == nil {
+				read = map[error]bool{}
+			}
+			read[e] = true
 		}
-		switch e := err.(type) { //nolint:errorlint // as above
+		if found(e) {
+			return true, again
+		}
+		switch x := e.(type) { //nolint:errorlint // as above
 		case interface{ Unwrap() error }:
-			next = append(next, e.Unwrap())
+			next = append(next, x.Unwrap())
 		case interface{ Unwrap() []error }:
-			wrapped := e.Unwrap()
+			wrapped := x.Unwrap()
+			work += len(wrapped)
 			for i := len(wrapped) - 1; i >= 0; i-- {
 				next = append(next, wrapped[i])
 			}
 		}
 	}
-	return false
+	return false, again
 }
 
-// maxWrapped is how many errors of a tree raced reads.
-const maxWrapped = 1000
+// remembering is how many errors of a tree holds reads and queues before it remembers each one it
+// reads: so one holding itself beside many others queues no more than this many first.
+const remembering = 10000
 
 // conflicting makes *err match ErrConflict as conflicted does, for an exported call to defer, so
 // that wherever in the call PostgreSQL refused it for a race, the host meets one error: not only in

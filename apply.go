@@ -682,7 +682,7 @@ func (a *Authorizer) allowed(ctx context.Context, roles book, actor Subject, via
 	switch {
 	case err == nil:
 		return nil, nil
-	case errors.Is(err, ErrInvalid):
+	case matches(err, ErrInvalid):
 		return []error{&InvalidError{Binding: b, Reason: hostReason(err), Err: err}}, nil
 	}
 	return nil, err
@@ -690,10 +690,20 @@ func (a *Authorizer) allowed(ctx context.Context, roles book, actor Subject, via
 
 // hostReason is the host's message for a grant it refused, less the ErrInvalid it wraps, which
 // the InvalidError already says, whether before, after or joined; or the reason of an InvalidError
-// of its own, which would otherwise name the binding twice.
+// of its own, which would otherwise name the binding twice, found as errors.As finds it, reading
+// the tree as holds does.
 func hostReason(err error) string {
 	var own *InvalidError
-	if errors.As(err, &own) {
+	if found, _ := holds(err, func(e error) bool {
+		switch x := e.(type) { //nolint:errorlint // one error of a tree, which holds reads
+		case *InvalidError:
+			own = x
+			return true
+		case interface{ As(any) bool }:
+			return x.As(&own)
+		}
+		return false
+	}); found {
 		return cmp.Or(own.Reason, "refused by the host")
 	}
 	invalid := ErrInvalid.Error()
@@ -2534,18 +2544,19 @@ func revokeArgs(tenant string, scope Scope, bindings, kept []Binding) []any {
 }
 
 // GrantFilter picks grants or eligibilities by scope, by principal, or both; at least one is
-// required.
+// required. The zero principal, the anonymous subject's, which a constraint may ask about, holds
+// none.
 type GrantFilter struct {
 	Scopes     []Scope
 	Principals []Principal
 }
 
 // valid reports whether the filter picks something, by scopes and principals that could be
-// stored in a tenant.
+// stored in a tenant, or the zero principal, whose key no row holds.
 func (f GrantFilter) valid(tenant string) bool {
 	return len(f.Scopes)+len(f.Principals) > 0 &&
 		!slices.ContainsFunc(f.Scopes, func(s Scope) bool { return !s.valid() }) &&
-		!slices.ContainsFunc(f.Principals, func(p Principal) bool { return !p.wellFormed(tenant) })
+		!slices.ContainsFunc(f.Principals, func(p Principal) bool { return p != (Principal{}) && !p.wellFormed(tenant) })
 }
 
 // sql is SQL selecting cols, in order, of the rows of table in tenant $1 in force at $4 that the

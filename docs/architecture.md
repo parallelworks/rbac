@@ -538,17 +538,22 @@ sequenceDiagram
   the role changed, as narrowing it so that it is no longer privileged does. On each scope a grant
   that widens is on, the denies on its path that remove from the actor a permission the role will
   give refuse the change, as they would refuse `Apply` granting it there; on the others, only those
-  removing its power to change grants there do. A grant to the tenant's members of a privileged
-  role is read there as one to a principal named one by one (`widenedTo.reaches`): a catalog
-  change that has the role no longer be privileged gives them what it gives, what the redefinition
-  added too, and asks no one. A scope read as stored, as the host no longer has it, that the change
-  comes to give more on while it waits refuses it with `ErrConflict`. A role's lists are compared
-  sorted and without repeats (`canonical`), as one written around the package can hold them in any
-  order, so renaming it is no redefinition, and setting a role, deny or eligibility again as it is
-  stored changes nothing (`canonicalSQL`). A role lists in `GrantableRoles` only roles one of its
-  `<type>:grant` permissions, on a type it is for, lets its holders grant (`lets`), so `holdsRole`
-  checks the actor's power to grant each. It keeps a listing that already hands nothing on as
-  stored, as once the role listed was narrowed, so renaming it needs only the power to define it.
+  removing its power to change grants there do. Scopes the actor's grants and the denies on their
+  paths can't tell apart are decided once (`alike`), told apart by each grant's id and each deny's
+  scope and id, whole: an id holds any text but NUL; and where a deny has a condition, by the
+  resource, or a container's depth, as a deny's condition is evaluated within a budget for each
+  scope of the path, which conditions stored past their bound can spend on a shorter path alone. A
+  grant to the tenant's members of a privileged role is read there as one to a principal named one
+  by one (`widenedTo.reaches`): a catalog change that has the role no longer be privileged gives
+  them what it gives, what the redefinition added too, and asks no one. A scope read as stored, as
+  the host no longer has it, that the change comes to give more on while it waits refuses it with
+  `ErrConflict`. A role's lists are compared sorted and without repeats (`canonical`), as one
+  written around the package can hold them in any order, so renaming it is no redefinition, and
+  setting a role, deny or eligibility again as it is stored changes nothing (`canonicalSQL`). A role
+  lists in `GrantableRoles` only roles one of its `<type>:grant` permissions, on a type it is for,
+  lets its holders grant (`lets`), so `holdsRole` checks the actor's power to grant each. It keeps a
+  listing that already hands nothing on as stored, as once the role listed was narrowed, so renaming
+  it needs only the power to define it.
 - **Eligibilities.** `SetEligibility` lets a principal `Activate` a role for a while, perhaps
   only with approvers or a `requires` condition. An activation is a grant that ends no later than
   its eligibility expires, or its holder's membership or place in the group the eligibility names
@@ -766,13 +771,22 @@ flowchart TB
   transactions, or a lock waited for past `lock_timeout`, as one a migration holds, match
   `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them, as it
   returns (`conflicting`) where it queries outside `begin`, which maps its own, wherever an error
-  holds one, beside others too, as `errors.As` reads one, reading at most a thousand of its errors,
-  as one that wraps itself has no end (`raced`), so one refused before a change's transaction, as
-  in the reads that decide a change first, which under `WithTx` run on the host's transaction
-  itself and can deadlock with a migration, in a read, or in a hook's statement, whose error a call
-  returns as it is, matches too. Under `WithTx` the host runs its transaction again from its start:
-  a statement refused on it outside a savepoint aborts it, and a savepoint, rolled back to, frees
-  nothing taken before it, which the race can be over.
+  holds one, beside others too, as `errors.As` reads one, reading the tree, however many errors it
+  holds, in the order `errors.Is` reads it, to the first race or `ErrConflict` (`conflicted`), so
+  one refused before a change's transaction, as in the reads that decide a change first, which under
+  `WithTx` run on the host's transaction itself and can deadlock with a migration, in a read, or in
+  a hook's statement, whose error a call returns as it is, matches too. Under `WithTx` the host runs
+  its transaction again from its start: a statement refused on it outside a savepoint aborts it, and
+  a savepoint, rolled back to, frees nothing taken before it, which the race can be over. The signer
+  `Export` and `Checkpoint.Sign` are given is a hook too. Wherever a call reads a hook's error, for
+  a race, for `ErrInvalid` or `ErrDenied`, as it reads `ValidateGrant`'s answer and decides what
+  `OnRefused` is told of, or for `ErrNotFound`, it reads the tree in the order `errors.Is` and
+  `errors.As` read it, and once it has read and queued ten thousand or so of its errors
+  (`remembering`), each it can compare once (`holds`): one whose tree holds itself, as a host's type
+  can by mistake, comes round again, which they read forever, so a call passes over what it has read
+  and returns, though the host's own `errors.Is` of what it returns can still read it forever. Not
+  from the first error: remembering one compares it whole, and a value wrapping an error holds all
+  that one wraps, so a tree nesting such values thousands deep would cost the square of its depth.
 - **Migrating.** `Migrate` applies each pending migration in a transaction of its own, under an
   advisory lock on the schema that holds another replica's migration back, and records it as it
   commits: so a migration takes its locks in the order it names them, the tables before history,

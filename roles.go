@@ -1142,7 +1142,7 @@ func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authorit
 		}
 		r, err := a.resourceOf(ctx, tenant, s)
 		switch {
-		case !scopes.widened[s] && scopes.listed[s] == nil && errors.Is(err, ErrNotFound):
+		case !scopes.widened[s] && scopes.listed[s] == nil && matches(err, ErrNotFound):
 			r = Resource{Tenant: tenant, Type: s.Type, ID: s.ID}
 			if reach.gone == nil {
 				reach.gone = map[Scope]bool{}
@@ -1303,7 +1303,7 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 	// removes what that one does, so a role granted on thousands of resources is decided against a
 	// few. Where no grant or eligibility will give more, the role hands nothing more on.
 	var distinct []int
-	seen := map[string]bool{}
+	seen := map[alikeKey]bool{}
 	for i, at := range own {
 		if !scopes.widened[scopes.own[i]] {
 			continue
@@ -1336,11 +1336,16 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 	// Where a role listing it, or listing one that does, is granted, its holders may grant it on
 	// scopes of each type there as it will be: so must the actor, under the denies there, as mayDefine
 	// checks across the tenant.
-	asked := map[string]bool{}
+	type typeAlike struct {
+		alike alikeKey
+		t     string
+	}
+	asked := map[typeAlike]bool{}
 	for i, at := range listing {
 		r := on[len(own)+i]
+		alike := a.alike(at, r)
 		for _, t := range scopes.listed[r.Scope()] {
-			k := a.alike(at, r) + " " + t
+			k := typeAlike{alike, t}
 			if asked[k] {
 				continue
 			}
@@ -1357,28 +1362,45 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 }
 
 // alike is the same for two scopes whose authorities, on and another, remove the same from what the
-// actor hands on: the same grants it holds on their paths, and the same denies, and where one of
-// those has a condition, which can read a resource, the same scope, but on containers, where what
-// the actor hands on reaches resources the condition can't read.
-func (a *Authorizer) alike(on authority, r Resource) string {
-	var b strings.Builder
+// actor hands on: the same grants it holds on their paths, the same denies, and the same denies
+// that exempt it only until a time; and where one of those has a condition, which can read a
+// resource, the same scope, but on containers, where what the actor hands on reaches resources the
+// condition can't read, as long a path: the denies' conditions are evaluated within a budget for
+// each scope of it (newDenyBudget), so those stored past their bound, as before there were bounds,
+// can fail closed on a shorter path alone.
+func (a *Authorizer) alike(on authority, r Resource) alikeKey {
+	var held, denials, exempting strings.Builder
 	for _, h := range on.held {
-		b.WriteString(h.ID + " ")
+		held.WriteString(h.ID + "\x00")
 	}
-	b.WriteString("|")
 	conditional := false
 	for _, d := range on.denials {
-		b.WriteString(d.scope + " " + d.id + " ")
+		denials.WriteString(d.scope + "\x00" + d.id + "\x00")
 		conditional = conditional || d.condition != ""
 	}
 	for _, e := range on.exemptions {
-		b.WriteString(e.scope + " " + e.id + " ")
+		exempting.WriteString(e.scope + "\x00" + e.id + "\x00")
 		conditional = conditional || e.condition != ""
 	}
-	if conditional && !a.contains(r.Type) {
-		b.WriteString("|" + r.Scope().Key())
+	k := alikeKey{held: held.String(), denials: denials.String(), exemptions: exempting.String()}
+	switch {
+	case !conditional:
+	case a.contains(r.Type):
+		k.depth = len(r.path())
+	default:
+		k.scope = r.Scope()
 	}
-	return b.String()
+	return k
+}
+
+// alikeKey is what alike tells scopes apart by: the ids of the grants, and the scopes and ids of
+// the denies and of those exempting the actor until a time, each ended by a NUL, which no stored
+// text holds, as a scope's id can hold any other character; and where a deny's condition can tell
+// them apart, the scope, or a container's depth.
+type alikeKey struct {
+	held, denials, exemptions string
+	scope                     Scope
+	depth                     int
 }
 
 // labeling is what roleReachOf checked of the labels of the scopes a custom role's grants and
