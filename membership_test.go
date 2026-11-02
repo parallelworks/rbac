@@ -4513,16 +4513,23 @@ func TestChangingMembersReadsOfTheDeniesNamingTheActorOnlyThoseOnChangingGrants(
 }
 
 // The host's own writes make none of the checks a change an actor makes does, so a freeze stops
-// none of them, as it stops no DeleteGrants: the host keeps its own state as it decides.
+// none of them, as it stops no DeleteGrants: the host keeps its own state as it decides. Taking a
+// tenant's group over with ImportGroups removes the members the tenant put there, and what the group
+// gives them on the frozen scope.
 func TestAFreezeStopsNoneOfTheHostsWrites(t *testing.T) {
-	h := grouped(t, constrain("freeze", grantC))
+	h := grouped(t, constrain("freeze", grantC), func(c *rbac.Config) { c.Sources = []string{"directory"} })
 	ctx := t.Context()
-	h.groups(t, "crew", "other")
-	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"), grant(cluster.Scope(), "cluster.login", rbac.Group, "other"))
-	h.join(t, "u", "v", "w", "x")
+	h.groups(t, "crew", "other", "taken")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"), grant(cluster.Scope(), "cluster.login", rbac.Group, "other"),
+		grant(cluster.Scope(), "cluster.login", rbac.Group, "taken"))
+	h.join(t, "u", "v", "w", "x", "y")
 	in := func(group, id string) rbac.Member { return rbac.Member{Group: group, Principal: identity(id)} }
-	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{in("crew", "u"), in("crew", "v"), in("crew", "w"), in("other", "x")}); err != nil {
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{in("crew", "u"), in("crew", "v"), in("crew", "w"), in("other", "x"), in("taken", "y")}); err != nil {
 		t.Fatal(err)
+	}
+	y := rbac.Subject{Principal: identity("y")}
+	if !allowed(t, h, y, login, cluster) {
+		t.Fatal("y should log in through taken")
 	}
 	if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", nil, []rbac.Member{in("crew", "u")}); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("an actor removing under the freeze: %v", err)
@@ -4539,10 +4546,16 @@ func TestAFreezeStopsNoneOfTheHostsWrites(t *testing.T) {
 		"DeleteGrants": func() error {
 			return h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.Group, "crew")})
 		},
+		"ImportGroups": func() error {
+			return h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "taken", Source: "directory"}})
+		},
 	} {
 		if err := write(); err != nil {
 			t.Errorf("%s under the freeze: %v", what, err)
 		}
+	}
+	if allowed(t, h, y, login, cluster) {
+		t.Error("y, whom the tenant put in the group ImportGroups took over, still logs in on the frozen cluster through it")
 	}
 }
 

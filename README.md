@@ -279,10 +279,18 @@ scopes conditional ones reach, to check one by one.
   action, which are no longer than `MaxID`, and all a condition may for reading the size of, or
   looping over, a list the request passes, or for looking up a key the request passes in a map,
   which hashes the key whole, as
-  `{"dev": 1, "prod": 2}[resource.attributes.env]` does. Cost is bounded per check too, for each
-  scope on its path, and the conditions a check reads together are bounded where they are stored:
-  an identity's grants' on a scope, those of a scope's grants to groups, the tenant's members and
-  the public, each the tenant's and those from each source the host owns apart, a scope's denies',
+  `{"dev": 1, "prod": 2}[resource.attributes.env]` does. A list literal costs 1 more for each
+  element and a map literal 2 for each entry, each time it is built, and a step of a loop 1 more
+  for each `&&`, `||` and `?:` it may evaluate, its macro's own among them, which CEL charges a
+  constant or nothing. `contains` costs what reading both strings does, multiplied, and
+  `startsWith` and `endsWith` what reading
+  the shorter does, at least 1 however short or empty either is, and one costing more than a
+  condition may fails before it runs: `contains` of one long string the request passes in another
+  tries each place in it, which can take a third of a second. Cost is bounded per check too, for
+  each scope on its path, and the conditions a check reads together are bounded where they are
+  stored: an identity's grants' on a scope, those of a scope's grants to groups, the tenant's
+  members and the public, each the tenant's and those from each source the host owns apart, a
+  scope's denies',
   and the requirements of groups' eligibilities for a role on a scope. Each holds hundreds of
   comparisons with literals, a hundred of an attribute with the subject's id, or three of the
   longest conditions that read a list, look up a key the request passes or loop, and a change
@@ -295,8 +303,14 @@ scopes conditional ones reach, to check one by one.
   more, can leave conditions stored past a bound in the same way: each process bounds a stored
   condition again by what it and the CEL it is built with make of it, so another version can bound
   one more, and the package's tests pin the bounds of conditions of common shapes, so that one an
-  upgrade moves fails them. Going back to an earlier release of this package does the same where
-  that release bounds a shape more, so while replicas of two releases run side by side, those
+  upgrade moves fails them. A condition holding a literal or a logical operator is bounded a few
+  units higher than before they were charged so, and one rebuilding a literal of hundreds at each
+  step of a loop at all a condition may cost, past which it fails: a grant's gives nothing and a
+  deny's applies. A step of `all`, `exists`, `exists_one`, `filter` or a `map` that filters costs
+  1 more for the operator its macro evaluates, so one looping over a list the request passes, which
+  cost nearly all a condition may, can now cost more, and fails the same way. Going back to an
+  earlier release of this package does the same where that release bounds a shape more, so while
+  replicas of two releases run side by side, those
   bounding a shape more may refuse changes adding a condition to a scope the others filled. To
   hand a permission on, the actor holds it unconditionally or under the same condition, one that
   doesn't read the subject: that one decides for each holder, so the actor's holding says nothing
@@ -359,9 +373,11 @@ scopes conditional ones reach, to check one by one.
   type the role's grants can be on, as of no resource and on the tenant, where a condition reading
   the resource can't be evaluated and so denies: a role's grants span scopes no one reads, so they
   are stopped wherever either may stop `Apply` on some scope of the type, not only on those it would.
-  The host's own writes (`Import`, `DeleteGrants`, `SetMemberships`, `ImportMembers`,
-  `DeleteMembers`, `DeleteGroups` and the host's deletes) make none of the checks an actor's change
-  makes, so a freeze stops none of them: the host freezes those itself. The host is
+  The host's own writes (`Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`,
+  `ImportMembers`, `DeleteMembers`, `DeleteGroups` and the host's deletes) make none of the checks
+  an actor's change makes, so a freeze stops none of them, `ImportGroups` taking a tenant's group
+  over too, which removes the members the tenant put there and cuts short what they activated
+  through it: the host freezes those itself. The host is
   asked before a change takes its locks, so a change is tried again (`rbac.ErrConflict`) when the
   memberships its answers rest on, of an identity it grants to or of a group's members, changed
   in between, or a group a change to members reaches was nested in another. A change to a group
@@ -688,8 +704,9 @@ whose checks are the application's own to make; `History`, `Export` and `PruneHi
 `AsOf`'s checks of history, name history's table by the package's schema and their types by
 pg_catalog's, so none stands in for them, and refuse a search_path that names pg_temp first. And
 history's triggers find history beside the table each fires on, whatever the schema is named, or
-refuse the row where their search_path can't name that schema, so none stands in for the history a
-change is recorded in, or a prune checked against.
+refuse the row where their search_path can't name that schema, before they read a table or call
+anything by it: so none stands in for the history a change is recorded in, or a prune checked
+against, and nothing such a table runs, as its row security policy, runs as history's role.
 
 ## Running it
 
@@ -804,6 +821,15 @@ change is recorded in, or a prune checked against.
   about a microsecond of the 70 to 100 it takes, and refuses the row where its search_path can't
   name that schema: a search_path reads `$user`, however it is quoted, as a role's name, and leaves
   out a schema the role has no `USAGE` on.
+  `0024_record_refuses_first` replaces `rbac_record` again, which keeps its owner, who may execute
+  it and its settings, and takes no lock on the tables, as `0023_history_schema` does. Before it,
+  `rbac_record` read the row's last record from history before it refused a search_path that can't
+  name the table's schema: where history's role had no `USAGE` on the schema, or the schema was
+  named `$user`, it read a session's own table named as history's, as that role, and whatever the
+  table runs, as its row security policy, ran with that role's rights before the row was refused.
+  What a rollback doesn't undo stayed, as setting history's id sequence back, after which a row's
+  later records are numbered below its earlier ones, and `AsOf` reads it as it was before them. It
+  now refuses before it reads a table, or calls a function or an operator its search_path finds.
 - **Renaming the schema:** from `0023_history_schema` on, `ALTER SCHEMA ... RENAME` keeps history:
   its triggers find it beside the table each fires on, whatever the schema is named, and a
   generation names the schema by its OID, so exports read on from their cursors and checkpoints.

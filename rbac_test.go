@@ -2480,6 +2480,47 @@ func TestCopyingAMessageForAHookCopiesEachMessageItReachesOnce(t *testing.T) {
 	}
 }
 
+// A message of a host's type that is its own reflection, as one embedding a dynamic message is, was
+// copied for a hook as the dynamic message its type makes: a hook given one in an any read another
+// type than the host passed, and a list, a field or a map of the host's type couldn't hold the copy,
+// which panicked. It is copied as any other pointer of its type, once however it is reached, its
+// message a copy of its own, and as the message its type makes only where a dynamic message's field
+// holds it, which the copy of one reached first there doesn't stand for.
+func TestCopyingAMessageThatIsItsOwnReflectionKeepsItsType(t *testing.T) {
+	type holder struct{ M *reflecting }
+	m := &reflecting{dynamicStruct()}
+	value := dynamicpb.NewMessage((&structpb.Value{}).ProtoReflect().Descriptor())
+	value.Set(value.Descriptor().Fields().ByName("struct_value"), protoreflect.ValueOfMessage(m))
+	inside := dynamicpb.NewMessage((&structpb.Struct{}).ProtoReflect().Descriptor())
+	inside.Mutable(inside.Descriptor().Fields().ByName("fields")).Map().Set(protoreflect.ValueOfString("m").MapKey(), protoreflect.ValueOfMessage(value))
+	copied := rbac.DeepCopy(map[string]any{
+		"one": m, "many": []*reflecting{m, m}, "field": holder{m}, "keyed": map[string]*reflecting{"m": m},
+		"inside first": []any{inside, []*reflecting{m}},
+	})
+	one, _ := copied["one"].(*reflecting)
+	if one == nil || one == m || one.Message == nil || one.Message == m.Message {
+		t.Fatalf("a %T was copied as %#v", m, copied["one"])
+	}
+	many, _ := copied["many"].([]*reflecting)
+	field, _ := copied["field"].(holder)
+	keyed, _ := copied["keyed"].(map[string]*reflecting)
+	first, _ := copied["inside first"].([]any)
+	if len(many) != 2 || many[0] != one || many[1] != one || field.M != one || keyed["m"] != one || len(first) != 2 {
+		t.Fatalf("a %T reached by many paths was copied as %#v, %#v, %#v and %#v", m, many, field, keyed, first)
+	}
+	if after, _ := first[1].([]*reflecting); len(after) != 1 || after[0] != one {
+		t.Errorf("a %T reached after a dynamic message holding it was copied as %#v", m, first[1])
+	}
+	d, _ := first[0].(*dynamicpb.Message)
+	if d == nil || d == inside {
+		t.Fatalf("a dynamic message holding a %T was copied as %#v", m, first[0])
+	}
+	held := d.Get(d.Descriptor().Fields().ByName("fields")).Map().Get(protoreflect.ValueOfString("m").MapKey()).Message()
+	if c := held.Get(held.Descriptor().Fields().ByName("struct_value")).Message(); !c.IsValid() || c.Interface() == m || c.Interface() == one {
+		t.Errorf("a dynamic message holding a %T holds a copy %#v", m, c.Interface())
+	}
+}
+
 // A check asks each constraint, and a change ValidateGrant, about copies of the attributes, a
 // message holding itself among them too: each is asked, rather than the process ending as copying
 // it overflowed the stack.
@@ -2513,6 +2554,39 @@ func TestAHookIsAskedAboutAMessageHoldingItself(t *testing.T) {
 	}
 	if !asked["constraint"] || !asked["ValidateGrant"] {
 		t.Errorf("asked %v", asked)
+	}
+}
+
+// A constraint is given copies of the attributes, which held a message of a host's type that is its
+// own reflection as the dynamic message the type makes: one freezing a subject holding the host's
+// type in an any didn't deny, and Authorize panicked out of the package copying a list of them. It
+// is given them as the host's type.
+func TestAConstraintIsGivenAMessageThatIsItsOwnReflectionAsTheHostsType(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "frozen", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if in.Subject == nil {
+				return false, nil
+			}
+			_, one := in.Subject.Attributes["one"].(*reflecting)
+			many, _ := in.Subject.Attributes["many"].([]*reflecting)
+			return one || len(many) > 0, nil
+		}}}
+	})
+	owner := h.as(t, "owner")
+	for name, attributes := range map[string]map[string]any{
+		"in an any": {"one": &reflecting{dynamicStruct()}}, "in a list of its type": {"many": []*reflecting{{dynamicStruct()}}},
+	} {
+		owner.Attributes = attributes
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("checking a subject holding such a message %s panicked: %v", name, r)
+				}
+			}()
+			if allowed(t, h, owner, login, cluster) {
+				t.Errorf("a constraint freezing a subject holding such a message %s didn't deny", name)
+			}
+		}()
 	}
 }
 
@@ -8449,12 +8523,13 @@ func TestEachPermissionIsDecidedOnItsOwnBudgets(t *testing.T) {
 	h, guardian := guarded(t)
 	ctx := t.Context()
 	var xs []string
-	for i := range 38 {
+	for i := range 34 {
 		xs = append(xs, fmt.Sprint(i))
 	}
 	list := "[" + strings.Join(xs, ",") + "]"
 	// Five conditional denies of every cluster permission on each of the cluster, its workspace and
-	// the tenant, each costly to evaluate and false.
+	// the tenant, each false and costing nearly all a condition may, its inner list charged for its
+	// elements each time a step builds it, and each step for its macro's &&.
 	for j, on := range []rbac.Resource{cluster, workspace, {Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}} {
 		for i := range 5 {
 			expr := fmt.Sprintf("%s.all(x, %s.all(y, x >= -%d)) && false", list, list, 10*j+i)
