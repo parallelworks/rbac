@@ -1337,6 +1337,23 @@ func TestWhatAnExemptionUntilATimeSparesIsHandedOnNoLongerThanIt(t *testing.T) {
 	}
 }
 
+// Deciding how long an exemption from a deny without a condition spares what a change hands on
+// takes no condition, so the change builds nothing for conditions to read, as it builds nothing
+// where no deny binds the actor.
+func TestAnExemptionNoConditionTakesPartInConvertsNoAttributes(t *testing.T) {
+	h, u, hour := onCall(t, root)
+	v := h.as(t, "v")
+	ctx := rbac.WithRequest(t.Context(), map[string]any{"lookup": map[string]any{"a": "b"}})
+	n := rbac.CountConversions(t)
+	sudo := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: v.Principal, ExpiresAt: hour}}}
+	if err := h.authz.Apply(ctx, u, cluster, sudo); err != nil {
+		t.Fatalf("sudo handed on until the exemption ends: %v", err)
+	}
+	if *n != 0 {
+		t.Errorf("a change no condition takes part in built what conditions read %d times", *n)
+	}
+}
+
 // Grants of one role in one change are each decided by whether the actor's exemption lasts until
 // they end, however many share a decision: its end tells them apart as a grant's end does.
 func TestGrantsInOneChangeAreEachDecidedByWhetherAnExemptionLastsUntilThen(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"math/rand/v2"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -343,6 +344,45 @@ func TestALabelValueHeldUnderAConditionHoldsWhereItHolds(t *testing.T) {
 		if i < 0 || !holders[i].MaybeDenied {
 			t.Fatalf("Holders = %+v", holders)
 		}
+	}
+}
+
+// What conditions read is built, converting what the host passes whole, only for a decision a
+// condition takes part in. A labeled check built it to decide the subject's label values, though
+// every grant giving them held unconditionally, so a check passing a large lookup map, which no
+// condition read, took 14 ms where it took a third of one, and a change by an actor holding its
+// grants unconditionally built it for each scope it checked.
+func TestADecisionNoConditionTakesPartInConvertsNoAttributes(t *testing.T) {
+	h := labeled(t)
+	owner, pilot := h.as(t, "owner"), h.as(t, "pilot")
+	h.hold(t, "owner", "level:high", "rel:gbr")
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}, "rel": {"gbr"}}
+	ctx := rbac.WithRequest(t.Context(), map[string]any{"mission": true, "lookup": map[string]any{"a": "b"}})
+	n := rbac.CountConversions(t)
+	if err := h.authz.Authorize(ctx, owner, view, secret); err != nil {
+		t.Fatalf("Authorize: %v", err)
+	}
+	if ps, err := h.authz.Permissions(ctx, owner, secret); err != nil || len(ps) == 0 {
+		t.Fatalf("Permissions = %v, %v", ps, err)
+	}
+	if err := h.authz.Apply(ctx, owner, secret, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: pilot.Principal}}}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if *n != 0 {
+		t.Errorf("decisions no condition takes part in built what conditions read %d times", *n)
+	}
+	g := grant(rbac.TenantRoot("t1"), "rel.gbr", rbac.User, "pilot")
+	g.Condition = rbac.Condition{Expression: `request.attributes.mission == true`}
+	h.seed(t, g, grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "pilot"))
+	if err := h.authz.Authorize(ctx, pilot, view, secret); err != nil {
+		t.Fatalf("Authorize where a condition gives a label value: %v", err)
+	}
+	if allowed(t, h, pilot, view, secret) {
+		t.Error("without the request the condition reads")
+	}
+	if *n == 0 {
+		t.Error("a decision a condition takes part in built nothing for it to read")
 	}
 }
 
@@ -2658,6 +2698,57 @@ func TestALabelValuesConditionsCantReadTheTenantsAttributes(t *testing.T) {
 	}
 }
 
+// A label value and a power to release are decided on the bare tenant whatever attributes the
+// tenant is passed with, so Permissions and a change on a tenant passed with more than a check
+// converts decide them as Authorize and Holding do, neither of which converts those. Decided on a
+// copy of what the tenant's own permissions read, a condition reading only the subject's
+// attributes failed there: Permissions left out a value Authorize allowed, and a change refused to
+// hand on a value a deny reading the subject's attributes didn't take.
+func TestALabelValueIsDecidedAsChecksDecideItWhateverTheTenantIsPassedWith(t *testing.T) {
+	h := labeled(t, releasing, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), tenantGuard) })
+	ctx := t.Context()
+	eng := rbac.Condition{Expression: `subject.attributes.dept == "eng"`}
+	var grants []rbac.Grant
+	for _, role := range []rbac.Role{"level.high", "level.release"} {
+		g := grant(rbac.TenantRoot("t1"), role, rbac.User, "ann")
+		g.Condition = eng
+		grants = append(grants, g)
+	}
+	h.seed(t, append(grants, grant(rbac.TenantRoot("t1"), "tenant.admin", rbac.User, "cara"), grant(rbac.TenantRoot("t1"), "tenant.guard", rbac.User, "guardian"))...)
+	h.hold(t, "cara", "level:high")
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), tenantT1, rbac.Deny{
+		ID: "outsiders", Principals: []rbac.Principal{identity("cara")}, Permissions: []rbac.Permission{"level:high"},
+		Condition: rbac.Condition{Expression: `subject.attributes.dept != "eng"`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ann, cara := h.as(t, "ann"), h.as(t, "cara")
+	ann.Attributes, cara.Attributes = map[string]any{"dept": "eng"}, map[string]any{"dept": "eng"}
+	large := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1", Attributes: map[string]any{"tags": make([]any, rbac.MaxConverted)}}
+	holding, err := h.authz.Holding(ctx, "t1", ann)
+	if err != nil || !slices.Contains(holding.Values(), "level:high") || !holding.MayRelease(rbac.Label{"level": {"high"}}, rbac.Label{}) {
+		t.Fatalf("Holding = %v, %v", holding.Values(), err)
+	}
+	perms, err := h.authz.Permissions(ctx, ann, large)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []rbac.Permission{"level:high", rbac.ReleasePermission("level")} {
+		if !allowed(t, h, ann, p, large) {
+			t.Errorf("Authorize of %s on a tenant passed with more than a check converts refuses it", p)
+		}
+		if !slices.Contains(perms, p) {
+			t.Errorf("Permissions on a tenant passed with more than a check converts = %v, without %s", perms, p)
+		}
+	}
+	if !allowed(t, h, cara, "level:high", large) {
+		t.Error("Authorize of a value a deny reading the subject's attributes doesn't take refuses it")
+	}
+	if err := h.authz.Apply(ctx, cara, large, rbac.Change{Grant: []rbac.Binding{{Role: "level.high", Principal: identity("dan")}}}); err != nil {
+		t.Errorf("handing on level.high on a tenant passed with more than a check converts: %v", err)
+	}
+}
+
 // A read decides a resource's label by the label values the subject held as it held its grants:
 // one moved, in one statement, between the group granted on a labeled cluster and the group
 // holding the label's value never held both, so no read made while it moves lets it see the
@@ -3040,6 +3131,64 @@ func TestALabelValuesDenyReadsTheTenantAsChecksDoWhenTheValueIsHandedOn(t *testi
 				t.Errorf("%s, on %v: handing on level:high, which the actor holds: %v: %v", c.expr, tenant.Attributes, c.held, err)
 			}
 		}
+	}
+}
+
+// Whom Holders keeps of a labeled resource's holders, and marks, doesn't turn on the request: a
+// label value a condition takes part in deciding, a grant's or a deny's, is marked whatever the
+// condition comes to, so it lists the same with any request or none, and its conditions read no
+// request's attributes. Read for each holder, they were converted again for each.
+func TestHoldersOfALabeledResourceConvertNoRequest(t *testing.T) {
+	h := labeled(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), tenantGuard) })
+	ctx := t.Context()
+	mission := rbac.Condition{Expression: `request.attributes.mission == true`}
+	pilot := grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "pilot")
+	pilot.Condition = mission
+	h.seed(t, pilot, grant(rbac.TenantRoot("t1"), "tenant.guard", rbac.User, "guardian"))
+	h.hold(t, "navigator", "level:high")
+	h.hold(t, "crew", "level:high")
+	for _, id := range []string{"pilot", "navigator", "crew"} {
+		h.as(t, id)
+		h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, id))
+	}
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), tenantT1, rbac.Deny{
+		ID: "grounded", Principals: []rbac.Principal{identity("navigator")}, Permissions: []rbac.Permission{"level:high"},
+		Condition: rbac.Condition{Expression: `request.attributes.mission != true`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	want, err := h.authz.Holders(ctx, view, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marked := map[string]bool{}
+	for _, x := range want {
+		marked[x.Principal.ID] = x.MaybeDenied
+	}
+	if !maps.Equal(marked, map[string]bool{"pilot": true, "navigator": true, "crew": false}) {
+		t.Fatalf("Holders = %+v", want)
+	}
+	lookup := map[string]any{}
+	for i := range 1000 {
+		lookup[fmt.Sprint(i)] = i
+	}
+	n := rbac.CountKindsConverted(t)
+	for name, request := range map[string]map[string]any{
+		"on a mission": {"mission": true}, "grounded": {"mission": false}, "unreadable": {"mission": true, "badge": struct{}{}},
+		"with a lookup map": {"mission": true, "lookup": lookup},
+	} {
+		got, err := h.authz.Holders(rbac.WithRequest(ctx, request), view, secret)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("Holders %s = %+v, where without a request %+v", name, got, want)
+		}
+	}
+	if *n != 0 {
+		t.Errorf("Holders converted %d kinds' attributes", *n)
 	}
 }
 

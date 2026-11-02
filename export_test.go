@@ -617,6 +617,36 @@ func CountEvaluations(t *testing.T) *int {
 	return n
 }
 
+// ConvertingAllocates is how many allocations building what conditions read takes, for a check
+// whose subject, resource and request each pass attributes of their own.
+func ConvertingAllocates(t *testing.T, subject, resource, request map[string]any) float64 {
+	t.Helper()
+	a := &Authorizer{cfg: Config{Now: time.Now}}
+	ctx := WithRequest(t.Context(), request)
+	s, r := Subject{Principal: Principal{Kind: User, ID: "u"}, Attributes: subject}, Resource{Tenant: "t", Type: "cluster", ID: "c", Attributes: resource}
+	return testing.AllocsPerRun(20, func() { a.vars(ctx, s, "cluster:login", r) })
+}
+
+// CountConversions counts the times what conditions read is built, converting what the host
+// passes, until t ends.
+func CountConversions(t *testing.T) *int {
+	t.Helper()
+	old, n := converting, new(int)
+	converting = func() { *n++ }
+	t.Cleanup(func() { converting = old })
+	return n
+}
+
+// CountKindsConverted counts the kinds' attributes, the subject's, the resource's or the request's,
+// converted for conditions to read, none counted where a kind passes none, until t ends.
+func CountKindsConverted(t *testing.T) *int {
+	t.Helper()
+	old, n := convertingKind, new(int)
+	convertingKind = func() { *n++ }
+	t.Cleanup(func() { convertingKind = old })
+	return n
+}
+
 // ConditionCost is the most evaluating expr can cost, which a check runs it within, and what
 // evaluating it on a request with attributes, which the resource carries too, costs, up to
 // maxCost, built with the package's CEL environment extended by opts.
@@ -677,6 +707,65 @@ func EvaluateCondition(t *testing.T, expr string, attributes map[string]any) (he
 	r := evaluate(prg, vars)
 	runtime.ReadMemStats(&after)
 	return r.held, r.evaluated, after.TotalAlloc - before.TotalAlloc, nil
+}
+
+// EvaluateConditionOf is whether expr held, and whether it could be evaluated, on a request whose
+// subject, resource and request each pass attributes of their own.
+func EvaluateConditionOf(t *testing.T, expr string, subject, resource, request map[string]any) (held, evaluated bool) {
+	t.Helper()
+	c, err := newConditions(Attributes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prg, err := c.build(expr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Authorizer{cfg: Config{Now: time.Now}, conds: c}
+	vars := a.vars(WithRequest(t.Context(), request), Subject{Principal: Principal{Kind: User, ID: "u"}, Attributes: subject}, "cluster:login",
+		Resource{Tenant: "t", Type: "cluster", ID: "c", Attributes: resource})
+	r := evaluate(prg, vars)
+	return r.held, r.evaluated
+}
+
+// MaxConverted is the most a check converts of what the host passes.
+const MaxConverted = maxConverted
+
+// Converting is what converting attributes as a check does allocates, and whether they were more
+// than a check converts.
+func Converting(t *testing.T, attributes map[string]any) (allocated uint64, over bool) {
+	t.Helper()
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	c := newConverter()
+	c.attributes(attributes)
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc, c.over
+}
+
+// EvaluateConditionOn is what evaluating expr costs, on a request whose attributes are as given,
+// none converted, as values no host can pass are, which a test reads a condition's work by, and
+// whether it held and could be evaluated.
+func EvaluateConditionOn(t *testing.T, expr string, attributes map[string]ref.Val) (held, evaluated bool, cost uint64) {
+	t.Helper()
+	c, err := newConditions(Attributes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prg, err := c.build(expr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Authorizer{cfg: Config{Now: time.Now}, conds: c}
+	vars := a.vars(t.Context(), Subject{Principal: Principal{Kind: User, ID: "u"}}, "cluster:login", Resource{Tenant: "t", Type: "cluster", ID: "c"})
+	given := map[ref.Val]ref.Val{}
+	for k, v := range attributes {
+		given[types.String(k)] = v
+	}
+	vars["request"] = map[string]any{"time": time.Now(), "attributes": types.NewRefValMap(types.DefaultTypeAdapter, given)}
+	r := evaluate(prg, vars)
+	return r.held, r.evaluated, r.cost
 }
 
 // compiled is expr as c compiles it, and the sizes of its patterns.

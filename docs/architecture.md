@@ -398,20 +398,43 @@ sequenceDiagram
   would.
 - **Conditions** are CEL over `subject`, `resource`, `request` and `action`, typed by
   `Config.Attributes`. Each is compiled once, bounded in cost, and fails closed: a condition that
-  errors gives nothing, and a deny's that errors denies. Each runs within the most evaluating it
-  can cost, which its literals and types bound, and the ids, kinds, types and tenant a check
-  passes and its action, which are no longer than `MaxID`. What a check reads together is bounded
-  where it is stored, for each scope: an identity's conditional grants, the conditional grants to
-  groups, the tenant's members and the public, each the tenant's and those from each source the
-  host owns apart, the conditional denies, and the requirements of groups' eligibilities for a
-  role, and a change adding a condition past one is refused as invalid. A check's budget is that
-  for each scope on its path, so it evaluates every condition it reads, and no grant made beside
-  another changes what that one decides. Conditions stored before there were bounds may be past
-  one, and so may those another version of CEL bounds: each process bounds a stored condition
-  again by what the CEL it is built with makes of it, its macros and types, so an upgrade can
-  bound one more. `TestStoredConditionsKeepTheirBounds` pins the bounds of conditions of common
-  shapes, so that one an upgrade moves shows in review. A change adding no condition to them isn't
-  refused, and a check evaluates them cheapest first within its budget.
+  errors gives nothing, and a deny's that errors denies. A check converts what the host passes into
+  CEL's own values once (`converter`), deeply, from a closed set of Go values (`Attributes`): bools,
+  strings and numbers read by their kind, times, durations, bytes, slices, arrays, pointers, maps
+  keyed by bools, strings, ints or uints, JSON text and numbers, and the protobuf well-known types.
+  It calls no method of the host's, so a condition reads no value by one. A kind's attributes, the
+  subject's, the resource's or the request's, holding anything else anywhere, a `ref.Val` of the
+  host's own, a list, map or optional of CEL's a host makes, a struct, another message, a map keyed
+  by a double or holding two keys read as the same value, a value holding itself, or nesting past
+  `maxNested` along the longest path through them, can't be read as a whole (`unreadable`): every
+  condition reading any of them fails, while the other kinds' are read. A value inside a readable
+  map that no condition could read left every operator to tell it from the rest, and `in`, `has()`
+  and loops over a map's keys each found its key; whole-kind failure leaves no such value for an
+  operator to meet. Depth is decided by heights kept with each converted value, so it doesn't
+  turn on map order or on which kind reached a shared value first, and each kind is converted, and
+  charged, whole, whatever it holds, but where it nests past `maxNested`: converting stops there, so
+  what it is charged, and whether the kinds after it fit `maxConverted`, can turn on map order,
+  failing closed. A value reached twice is converted once, and converting costs a
+  check at most `maxConverted`, counted as `valueSize` counts what a condition reads, about what a
+  check may spend on a scope's grants' conditions, past which every condition reading an attribute
+  fails: converting isn't charged to a condition, and charging the check would let what one
+  condition reads fail the others. The subject's, the resource's and the request's attributes share
+  the bound, so ones users write, as a resource's tags, can fail the conditions of every check of
+  the resource, closed. So conditions run on CEL's own values alone, by CEL's own semantics, and a
+  comparison that fails where either value holds a double that isn't finite sees every double there
+  is. Each runs within the most evaluating it can cost, which its literals and types bound, and the
+  ids, kinds, types and tenant a check passes and its action, which are no longer than `MaxID`. What
+  a check reads together is bounded where it is stored, for each scope: an identity's conditional
+  grants, the conditional grants to groups, the tenant's members and the public, each the tenant's
+  and those from each source the host owns apart, the conditional denies, and the requirements of
+  groups' eligibilities for a role, and a change adding a condition past one is refused as invalid.
+  A check's budget is that for each scope on its path, so it evaluates every condition it reads, and
+  no grant made beside another changes what that one decides. Conditions stored before there were
+  bounds may be past one, and so may those another version of CEL bounds: each process bounds a
+  stored condition again by what the CEL it is built with makes of it, its macros and types, so an
+  upgrade can bound one more. `TestStoredConditionsKeepTheirBounds` pins the bounds of conditions of
+  common shapes, so that one an upgrade moves shows in review. A change adding no condition to them
+  isn't refused, and a check evaluates them cheapest first within its budget.
 
 ## A change
 

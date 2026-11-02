@@ -1314,7 +1314,9 @@ func orDenied(denied, more func(Permission) bool) func(Permission) bool {
 func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource, held []holding, ds []denial, ex []exemption, b book,
 	excluded map[string]bool,
 ) authority {
-	vars := a.vars(ctx, actor, "", on)
+	// What conditions read is built the first time one is evaluated, as it converts what the host
+	// passes whole (Attributes), which a change no condition decides needn't.
+	vars := built(func() map[string]any { return a.vars(ctx, actor, "", on) })
 	// The cheapest conditions first, as callers evaluate them in this order, so what a budget run
 	// out decides doesn't rest on ids.
 	held = slices.Clone(held)
@@ -1322,16 +1324,15 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 	// A label value or a power to release on the tenant is decided on the bare tenant, as checks
 	// decide it (decidedOn), what the actor hands on too: it is held there alone, so a condition
 	// reading the resource reads that tenant, as it does for every check of it.
-	var valued map[string]any
+	var valued func() map[string]any
 	if on.Type == TenantScope {
-		valued = maps.Clone(vars)
-		valued["resource"] = valueResource(on.Tenant)
+		valued = built(func() map[string]any { return a.valueVars(ctx, actor, on.Tenant) })
 	}
-	with := func(vars map[string]any, action Permission) map[string]any {
+	with := func(vars func() map[string]any, action Permission) map[string]any {
 		if valued != nil && a.labelPermission(action) {
 			vars = valued
 		}
-		v := maps.Clone(vars)
+		v := maps.Clone(vars())
 		v["action"] = string(action)
 		return v
 	}
@@ -1343,14 +1344,18 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 		}
 		return spends[action]
 	}
-	deny := func(vars map[string]any) func(Permission) bool {
+	deny := func(vars func() map[string]any) func(Permission) bool {
 		denied := map[Permission]bool{}
 		return func(p Permission) bool {
 			if d, ok := denied[p]; ok {
 				return d
 			}
+			var read map[string]any
+			if conditionallyDenied(ds, p) {
+				read = with(vars, p)
+			}
 			// On a budget of its own, as a check of p would be.
-			_, d := a.deniedBy(ds, p, newDenyBudget(on.path()), with(vars, p))
+			_, d := a.deniedBy(ds, p, newDenyBudget(on.path()), read)
 			denied[p] = d
 			return d
 		}
@@ -1359,8 +1364,11 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 	denied := deny(vars)
 	handsOn, reached := denied, vars
 	if a.contains(on.Type) {
-		reached = maps.Clone(vars)
-		delete(reached, "resource")
+		reached = built(func() map[string]any {
+			r := maps.Clone(vars())
+			delete(r, "resource")
+			return r
+		})
 		handsOn = deny(reached)
 	}
 	// What a deny it is exempt from only until a time removes, it holds only until then: the soonest
@@ -1369,13 +1377,21 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 	if len(ex) > 0 {
 		ex = slices.Clone(ex)
 		slices.SortStableFunc(ex, func(x, y exemption) int { return x.until.Compare(y.until) })
+		exempting := make([]denial, len(ex))
+		for i, e := range ex {
+			exempting[i] = e.denial
+		}
 		ends := map[Permission]time.Time{}
 		exemptUntil = func(p Permission) time.Time {
 			if until, ok := ends[p]; ok {
 				return until
 			}
 			var until time.Time
-			spend, v := newDenyBudget(on.path()), with(reached, p)
+			var v map[string]any
+			if conditionallyDenied(exempting, p) {
+				v = with(reached, p)
+			}
+			spend := newDenyBudget(on.path())
 			for _, e := range ex {
 				if _, d := a.deniedBy([]denial{e.denial}, p, spend, v); d {
 					until = e.until
@@ -1412,6 +1428,17 @@ func (au authority) exempt(p Permission, until time.Time) bool {
 // as a definition does: one binding it, or one exempting it only until a time.
 func (au authority) handsOnForGood(p Permission) bool {
 	return au.handsOn(p) || !au.exempt(p, time.Time{})
+}
+
+// built is what build makes, the first time it is asked for.
+func built(build func() map[string]any) func() map[string]any {
+	var made map[string]any
+	return func() map[string]any {
+		if made == nil {
+			made = build()
+		}
+		return made
+	}
 }
 
 // over is what the actor's grants let it change on scopes of a type in this request: a

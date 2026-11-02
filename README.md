@@ -237,11 +237,40 @@ scopes conditional ones reach, to check one by one.
   misnamed, or as another type, is refused when stored, and one stored under other declarations
   fails where it no longer passes them. A condition building a message, as
   `google.protobuf.Struct{...}`, is refused, and one stored before fails: a grant's gives nothing
-  and a deny's applies. Each condition runs within the most evaluating it can cost, which its
-  literals and types bound: little for comparing what a request passes with literals, or with the
-  ids, kinds, types and tenant a check passes or its action, which are no longer than `MaxID`, and
-  all a condition may for reading the size of, or looping over, a list the request passes, or for
-  looking up a key the request passes in a map, which hashes the key whole, as
+  and a deny's applies. What the host passes as attributes is converted, once for each check that
+  reads a condition, into CEL's own values, and conditions read nothing else: `nil`; a `bool`, a
+  string, an int, a uint or a float of any size, of a type of the host's own too, as a named string,
+  read by its kind; `time.Time` and `time.Duration`; bytes, as `[]byte` or an array of bytes;
+  slices, arrays and pointers of these, a nil pointer read as null; maps of these keyed by a bool, a
+  string, an int or a uint, or by an interface holding one; JSON text (`json.RawMessage`, a nil
+  one read as null, as `encoding/json` writes it) and `json.Number`, parsed; the protobuf `Struct`, `ListValue`, `Value`, `NullValue`, wrappers,
+  `Timestamp` and `Duration`, and an `Any` packing one of them; and CEL's own scalar values.
+  A kind's attributes, the subject's, the resource's or the request's, holding anything else,
+  however deep, can't be read as a whole, as a policy engine fails input it can't read: every
+  condition reading any of them fails, `has()` and `in` included, so a grant's gives nothing and a
+  deny's applies, while the other kinds' are read. So do those holding a `ref.Val` of the host's
+  own, though it says it is one of CEL's types, a list, map or optional of CEL's a host makes, a
+  struct, a channel, a func, any other message, a map keyed by anything else, as a double or an
+  array, a map holding two keys read as the same value, as `1` and `1u`, invalid JSON, a value
+  holding itself, or one that does, and a value nested more than 10,000 deep, as JSON text can't
+  be, along the longest path through them. A value reached twice is converted once. Reading the
+  rest left each operator to tell what it read from what it couldn't, as `in`, `has()` and loops
+  over a map's keys each found a key whose value no condition could read. A check converts no more
+  than `2 × 80,000` of them, counted as reading them costs a condition, one for each value and a
+  tenth of each string's, bytes', JSON number's, JSON text's or `Any`'s type URL's length, and half
+  an `Any`'s packed bytes, about a map of 50,000 short strings: past that every condition reading an
+  attribute fails. Converting stops 10,000 deep, so what a kind nesting deeper is charged, and
+  whether the kinds after it fit, can turn on the order a map's entries come in, failing closed. The
+  subject's, the resource's and the request's attributes share that, so attributes a tenant's users
+  write, as a resource's tags, can take every check of the resource past it, where a grant's
+  condition reading an attribute gives nothing and a deny's applies, whoever asks: bound what users
+  may store, or pass conditions only what they read. Comparing a value
+  holding a double that isn't finite fails, in a list or a map too. Each condition runs within the
+  most evaluating it can cost, which its literals and types bound: little for comparing what a
+  request passes with literals, or with the ids, kinds, types and tenant a check passes or its
+  action, which are no longer than `MaxID`, and all a condition may for reading the size of, or
+  looping over, a list the request passes, or for looking up a key the request passes in a map,
+  which hashes the key whole, as
   `{"dev": 1, "prod": 2}[resource.attributes.env]` does. Cost is bounded per check too, for each
   scope on its path, and the conditions a check reads together are bounded where they are stored:
   an identity's grants' on a scope, those of a scope's grants to groups, the tenant's members and

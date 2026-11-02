@@ -27,8 +27,14 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/dynamicpb"
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/parallelworks/rbac"
 	"github.com/parallelworks/rbac/internal/pgtest"
@@ -2412,6 +2418,159 @@ func TestCopyingAListOfStringsForAHookAllocatesOnce(t *testing.T) {
 	}
 	if c, ok := rbac.DeepCopy(attributes)["groups"].([]any); !ok || &c[0] == &groups[0] {
 		t.Error("the copy shares the list")
+	}
+}
+
+// holdingItself is a Struct one of whose fields, self, holds it.
+func holdingItself() *structpb.Struct {
+	s := &structpb.Struct{Fields: map[string]*structpb.Value{"a": structpb.NewStringValue("b")}}
+	s.Fields["self"] = structpb.NewStructValue(s)
+	return s
+}
+
+// A hook is given a copy of a protobuf message among the attributes, as of anything else, which
+// cloning it made: but cloning keeps no record of what it copied, so a message holding itself, as
+// a Struct one of whose fields holds it, recursed until the stack overflowed, which ends the
+// process, and one reaching another twice copied it for each path to it. The copy keeps each
+// message it copies, as it keeps maps, lists and pointers, so it holds itself where the original
+// does and is otherwise what cloning makes: equal, and its own, its bytes and unknown fields too,
+// and each nil message a list holds a new one of its own, though each is the same nil.
+func TestCopyingAMessageForAHookCopiesEachMessageItReachesOnce(t *testing.T) {
+	self, shared := holdingItself(), structpb.NewStringValue("x")
+	unknown := &structpb.Struct{}
+	unknown.ProtoReflect().SetUnknown(protowire.AppendVarint(protowire.AppendTag(nil, 99, protowire.VarintType), 1))
+	packed, err := anypb.New(wrapperspb.Bytes([]byte("b")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attributes := map[string]any{
+		"self": self, "twice": &structpb.ListValue{Values: []*structpb.Value{shared, shared}}, "dynamic": dynamicStruct(),
+		"packed": packed, "bytes": wrapperspb.Bytes([]byte("b")), "at": timestamppb.Now(), "unknown": unknown,
+		"nils": &structpb.ListValue{Values: []*structpb.Value{nil, nil}},
+	}
+	copied := rbac.DeepCopy(attributes)
+	if s, ok := copied["self"].(*structpb.Struct); !ok || s == self || s.Fields["self"].GetStructValue() != s {
+		t.Error("a Struct holding itself was copied as another")
+	} else if s.Fields["a"] = structpb.NewStringValue("c"); self.Fields["a"].GetStringValue() != "b" {
+		t.Error("a write to the copy reached the original")
+	}
+	if l, ok := copied["twice"].(*structpb.ListValue); !ok || l.Values[0] != l.Values[1] || l.Values[0] == shared {
+		t.Error("a value a list holds twice was copied but once")
+	}
+	if l, ok := copied["nils"].(*structpb.ListValue); !ok || len(l.Values) != 2 || l.Values[0] == l.Values[1] {
+		t.Error("nil values a list holds were copied as one")
+	}
+	if d, ok := copied["dynamic"].(*dynamicpb.Message); !ok || d == attributes["dynamic"] {
+		t.Error("a message of a dynamic type holding itself was copied as another")
+	} else {
+		fields, value := d.Descriptor().Fields().ByName("fields"), (&structpb.Value{}).ProtoReflect().Descriptor().Fields().ByName("struct_value")
+		if v := d.Get(fields).Map().Get(protoreflect.ValueOfString("self").MapKey()).Message(); v.Get(value).Message().Interface() != d {
+			t.Error("a copied message of a dynamic type doesn't hold itself")
+		}
+	}
+	for _, name := range []string{"packed", "bytes", "at", "unknown"} {
+		m, _ := attributes[name].(proto.Message)
+		if c, ok := copied[name].(proto.Message); !ok || c == m || !proto.Equal(c, m) || len(m.ProtoReflect().GetUnknown()) != len(c.ProtoReflect().GetUnknown()) {
+			t.Errorf("%s copied as %v", name, copied[name])
+		}
+	}
+	b, _ := copied["bytes"].(*wrapperspb.BytesValue)
+	if was, _ := attributes["bytes"].(*wrapperspb.BytesValue); b == nil || &b.Value[0] == &was.Value[0] {
+		t.Error("the copy shares the bytes")
+	}
+}
+
+// A check asks each constraint, and a change ValidateGrant, about copies of the attributes, a
+// message holding itself among them too: each is asked, rather than the process ending as copying
+// it overflowed the stack.
+func TestAHookIsAskedAboutAMessageHoldingItself(t *testing.T) {
+	asked := map[string]bool{}
+	holds := func(attributes map[string]any) bool {
+		m, ok := attributes["meta"].(*structpb.Struct)
+		return ok && m.Fields["self"].GetStructValue() == m
+	}
+	h := setup(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "meta", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			asked["constraint"] = asked["constraint"] || in.Resource != nil && holds(in.Resource.Attributes)
+			return false, nil
+		}}}
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			asked["ValidateGrant"] = asked["ValidateGrant"] || holds(in.Actor.Attributes)
+			return validate(ctx, q, in)
+		}
+	})
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "alice"))
+	r := cluster
+	r.Attributes = map[string]any{"meta": holdingItself()}
+	if !allowed(t, h, h.as(t, "alice"), login, r) {
+		t.Error("a check whose resource holds a message holding itself")
+	}
+	owner := h.as(t, "owner")
+	owner.Attributes = map[string]any{"meta": holdingItself()}
+	if err := h.authz.Apply(t.Context(), owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("bob")}}}); err != nil {
+		t.Fatal(err)
+	}
+	if !asked["constraint"] || !asked["ValidateGrant"] {
+		t.Errorf("asked %v", asked)
+	}
+}
+
+// A hook is given copies of what the host passes, which copying recursed into as deep as it nests: a
+// list nested three million deep overflowed the stack, which no recover catches, ending the process
+// wherever a hook was asked about it, though no condition reads it past 10,000 deep. A copy is its
+// own twice as deep as any condition reads, and holds nothing of the host's deeper. It runs in a
+// child process, on a smaller stack, which copying a list or a message nested a hundred thousand
+// deep overflowed.
+func TestAHookIsAskedAboutAValueNestedDeep(t *testing.T) {
+	if os.Getenv("RBAC_HOOK_VALUE_NESTED_DEEP") != "" {
+		debug.SetMaxStack(32 << 20)
+		var listed any = "x"
+		var levels []any
+		for range 100_000 {
+			listed = []any{listed}
+			levels = append(levels, listed)
+		}
+		message := structpb.NewStringValue("x")
+		for range 100_000 {
+			message = structpb.NewListValue(&structpb.ListValue{Values: []*structpb.Value{message}})
+		}
+		copied := rbac.DeepCopy(map[string]any{"listed": listed, "message": message})
+		// Twice as deep as a condition reads, its own, and deeper, nothing of the host's.
+		held := map[*any]int{}
+		for i, l := range levels {
+			if l, ok := l.([]any); ok {
+				held[&l[0]] = len(levels) - i
+			}
+		}
+		at, depth := copied["listed"], 0
+		for l, _ := at.([]any); len(l) > 0; l, _ = at.([]any) {
+			if deep, ok := held[&l[0]]; ok {
+				t.Fatalf("a list %d deep was shared", deep)
+			}
+			at, depth = l[0], depth+1
+		}
+		if l, ok := at.([]any); !ok || l != nil || depth < 15_000 {
+			t.Errorf("the copy of a list nested deep ends %d deep in %#v", depth, at)
+		}
+		reached, _ := copied["message"].(*structpb.Value)
+		for v := reached; v != nil; v = v.GetListValue().GetValues()[0] {
+			if v == message {
+				t.Fatal("a message nested deep was shared")
+			}
+			if reached = v; len(v.GetListValue().GetValues()) == 0 {
+				break
+			}
+		}
+		if reached == nil || reached.GetKind() != nil {
+			t.Errorf("the copy of a message nested deep ends in %v", reached)
+		}
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestAHookIsAskedAboutAValueNestedDeep$")
+	cmd.Env = append(os.Environ(), "RBAC_HOOK_VALUE_NESTED_DEEP=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Errorf("%v\n%.2000s", err, out)
 	}
 }
 

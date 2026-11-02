@@ -737,7 +737,7 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 	reason := fmt.Sprintf("not eligible to activate %s here for %s", act.Role, act.Duration)
 	// The subject holds one eligibility for a role there, and its groups' requirements are bounded
 	// together (SetEligibility).
-	vars, spend := a.vars(ctx, s, manage, on), budgetOf(2*maxCheckCost)
+	vars, spend := built(func() map[string]any { return a.vars(ctx, s, manage, on) }), budgetOf(2*maxCheckCost)
 	var chosen *eligibility
 	for i, e := range found {
 		if len(e.approvers) > 0 && !approves(act.Approver, s, countedOf(approvers, broad{}), e.approvers) {
@@ -768,7 +768,7 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 		if chosen != nil && !outranks(e, *chosen) {
 			continue
 		}
-		if e.requires == "" || a.conds.holds(spend, e.requires, vars) {
+		if e.requires == "" || a.conds.holds(spend, e.requires, vars()) {
 			chosen = &found[i]
 		}
 	}

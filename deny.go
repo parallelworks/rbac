@@ -171,6 +171,12 @@ func (a *Authorizer) deniedBy(ds []denial, p Permission, spend *budget, vars map
 	return denial{}, false
 }
 
+// conditionallyDenied reports whether a deny among ds whose condition decides may remove p, so a
+// decision of p reads what conditions read, which none needs where none does.
+func conditionallyDenied(ds []denial, p Permission) bool {
+	return slices.ContainsFunc(ds, func(d denial) bool { return d.condition != "" && denies(d.permissions, p) })
+}
+
 func (d denial) expression() string { return d.condition }
 
 func (d denial) String() string { return "deny " + d.id + " on " + d.scope }
