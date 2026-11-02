@@ -409,7 +409,9 @@ sequenceDiagram
   and loops over a map's keys each found its key; whole-kind failure leaves no such value for an
   operator to meet. Depth is decided by heights kept with each converted value, so it doesn't
   turn on map order or on which kind reached a shared value first, and each kind is converted, and
-  charged, whole, whatever it holds. A value reached twice is converted once, and converting costs a
+  charged, whole, whatever it holds, but where it nests past `maxNested`: converting stops there, so
+  what it is charged, and whether the kinds after it fit `maxConverted`, can turn on map order,
+  failing closed. A value reached twice is converted once, and converting costs a
   check at most `maxConverted`, counted as `valueSize` counts what a condition reads, about what a
   check may spend on a scope's grants' conditions, past which every condition reading an attribute
   fails: converting isn't charged to a condition, and charging the check would let what one

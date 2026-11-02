@@ -85,12 +85,14 @@ import (
 // and a tenth of each string's, bytes', JSON number's, JSON text's or packed type URL's length, and
 // half a packed message's, as a packed value takes as few as two bytes, each kind whole, whether it
 // can be read or not: past that, every condition reading an attribute of any kind fails, and JSON
-// text that may hold more values than are left isn't parsed. The subject's, the resource's and the
-// request's attributes share it, so attributes a tenant's users write, as a resource's tags, can
-// take every check of the resource past that, where a grant's condition reading an attribute gives
-// nothing and a deny's applies, whoever asks: bound what users may store, or pass conditions only
-// what they read. A declared attribute is a value of its type as converted, so a named string type
-// is a string.
+// text that may hold more values than are left isn't parsed. Where a kind nests past 10,000 deep,
+// converting stops there, so what it is charged, and whether the kinds after it fit what is left,
+// can turn on the order a map's entries come in: either way it can't be read, and the others are
+// read or, past what is left, fail. The subject's, the resource's and the request's attributes
+// share it, so attributes a tenant's users write, as a resource's tags, can take every check of the
+// resource past that, where a grant's condition reading an attribute gives nothing and a deny's
+// applies, whoever asks: bound what users may store, or pass conditions only what they read. A
+// declared attribute is a value of its type as converted, so a named string type is a string.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
@@ -188,7 +190,9 @@ func newConverter() *converter { return &converter{left: maxConverted} }
 // struct, or nests past maxNested, or holds itself, none can, as the attributes beside one would
 // leave each operator reading them to tell what it reads from what it can't. Each is converted, and
 // charged, whether one before it could be read or not, so what is left for the kinds after it
-// doesn't turn on the order a map's entries come in.
+// doesn't turn on the order a map's entries come in, but where they nest past maxNested: converting
+// stops there, so they are charged for as much of them as it reached first, which that order picks,
+// and whether the kinds after them fit what is left can turn on it, failing closed.
 func (c *converter) attributes(attributes map[string]any) (map[ref.Val]ref.Val, bool) {
 	if len(attributes) == 0 {
 		return nil, true
