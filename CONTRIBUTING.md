@@ -23,10 +23,11 @@ with `go test -run`. So a test whose own body reads what its subtests did runs a
   minute are spread apart. A test no run has timed yet, such as a new one, is placed by its name
   until one does. Every shard restores the same timings, which the `plan` job names, so they place
   each test alike. Each shard's `go test -json` output is its job's `test-results-N` artifact.
-- The `go` job, which branch protection requires, passes once the checks and every shard have, and
-  `go run ./internal/shards check` finds that the shards ran each test `go test -list` names once
-  between them, none of them skipped, and nothing else, which it writes in the job's summary. It
-  runs in a cancelled run too, and fails it, as a required job its `if` skips counts as passed.
+- The `go` job, which branch protection requires, passes once the checks, the audit of the
+  workflows (`actions`) and every shard have, and `go run ./internal/shards check` finds that the
+  shards ran each test `go test -list` names once between them, none of them skipped, and nothing
+  else, which it writes in the job's summary. It runs in a cancelled run too, and fails it, as a
+  required job its `if` skips counts as passed.
   `select` and `check` read a test's name by go test's own rule, any letters and digits, and fail on
   a line of `go test -list` that names neither a test nor its package, so no test runs in no shard.
 - Each job has a 20-minute timeout. When a shard's Test step nears half of that, add a shard to the

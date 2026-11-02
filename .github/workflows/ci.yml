@@ -169,14 +169,14 @@ jobs:
             ${{ steps.go-paths.outputs.modules }}
           key: ${{ steps.go-cache.outputs.cache-primary-key }}
 
-  # Passes once every check and shard has, and the shards ran every test between
-  # them, and then saves the tests' times, by which the next runs balance their
-  # shards. They take a few kilobytes, so unlike the Go caches, a PR's can't
-  # crowd canary's out. It runs even in a cancelled run, and fails it: branch
-  # protection passes a required job its if skips.
+  # Passes once every check and shard has, and the workflow audit, and the shards
+  # ran every test between them, and then saves the tests' times, by which the
+  # next runs balance their shards. They take a few kilobytes, so unlike the Go
+  # caches, a PR's can't crowd canary's out. It runs even in a cancelled run, and
+  # fails it: branch protection passes a required job its if skips.
   go:
     if: ${{ always() }}
-    needs: [checks, plan, test]
+    needs: [actions, checks, plan, test]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

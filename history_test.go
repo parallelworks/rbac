@@ -711,10 +711,18 @@ func TestHistoryIsKeptWhateverItsSchemaIsNamed(t *testing.T) {
 // it fires on, rather than find history in pg_temp: a search_path reads $user, however it is quoted,
 // as a role's name, and leaves out a schema the role has no USAGE on. A session's own table named as
 // history's would take the record of each change it wrote, and a prune recorded there would let a
-// delete from history through.
+// delete from history through. And rbac_record refuses before it reads such a table, which would run
+// what the table runs, as its row security policy, as history's role before the row was refused:
+// what no rollback undoes would stay, as setting history's id sequence back, which numbers later
+// records below earlier ones. Each case runs with 0023's rbac_record too, which read history before
+// it refused, so the run itself shows that its spy sees such a read.
 func TestHistorysTriggersRefuseASchemaTheirSearchPathCantName(t *testing.T) {
 	const write = `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
 		VALUES ('t1', 'cluster', 'c1', 'user', $1, 'cluster.login')`
+	historySchema, err := fs.ReadFile(rbac.Migrations(), "0023_history_schema.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
 	exec := func(t *testing.T, db rbac.DB, sql string, args ...any) {
 		t.Helper()
 		if _, err := db.Exec(t.Context(), sql, args...); err != nil {
@@ -727,46 +735,90 @@ func TestHistorysTriggersRefuseASchemaTheirSearchPathCantName(t *testing.T) {
 			t.Errorf("%s: %v", what, err)
 		}
 	}
+	// spy makes db's session a table of its own named as history's, holding a record of a grant no
+	// case writes, whose policy takes a value of a sequence of the session's, which no rollback gives
+	// back, for each row a role but its owner reads there; ran reports whether one was read. The
+	// policy costs less than any test of a column, as the planner orders a read's tests by cost, a
+	// cheap leakproof one of the read's own before a policy that costs more: a read whose own tests
+	// left the record out would otherwise run nothing.
+	spy := func(t *testing.T, db rbac.DB) (ran func() bool) {
+		t.Helper()
+		for _, sql := range []string{
+			`CREATE TEMP TABLE rbac_history (LIKE rbac_history INCLUDING DEFAULTS INCLUDING IDENTITY)`,
+			`INSERT INTO pg_temp.rbac_history (effective_at, tenant, entity, key, op) VALUES (now(), 't1', 'grant', 'spied', 'create')`,
+			`CREATE TEMP SEQUENCE spied`,
+			`CREATE FUNCTION pg_temp.spied() RETURNS boolean LANGUAGE plpgsql COST 0.001
+				AS $$ BEGIN RETURN pg_catalog.nextval('pg_temp.spied') > 0; END $$`,
+			`ALTER TABLE pg_temp.rbac_history ENABLE ROW LEVEL SECURITY`,
+			`CREATE POLICY spied ON pg_temp.rbac_history USING (pg_temp.spied())`,
+			`GRANT ALL ON pg_temp.rbac_history TO PUBLIC`,
+			`GRANT USAGE ON SEQUENCE pg_temp.spied TO PUBLIC`,
+		} {
+			exec(t, db, sql)
+		}
+		return func() bool {
+			t.Helper()
+			var called bool
+			if err := db.QueryRow(t.Context(), `SELECT is_called FROM pg_temp.spied`).Scan(&called); err != nil {
+				t.Fatal(err)
+			}
+			return called
+		}
+	}
 	t.Run("named $user", func(t *testing.T) {
-		ctx := t.Context()
 		pool := pgtest.Open(t, "")
-		if err := rbac.Migrate(ctx, pool); err != nil {
+		if err := rbac.Migrate(t.Context(), pool); err != nil {
 			t.Fatal(err)
 		}
 		exec(t, pool, write, "before")
-		tx, err := pool.Begin(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() { _ = tx.Rollback(ctx) }()
-		var schema string
-		if err := tx.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
-			t.Fatal(err)
-		}
-		// Renamed in tx, which rolls it back, so no other test meets the name.
-		exec(t, tx, `CREATE TEMP TABLE rbac_history (LIKE rbac_history INCLUDING DEFAULTS INCLUDING IDENTITY)`)
-		exec(t, tx, `ALTER SCHEMA `+pgx.Identifier{schema}.Sanitize()+` RENAME TO "$user"`)
-		exec(t, tx, `SET CONSTRAINTS ALL IMMEDIATE`)
-		in := func(sqls ...string) error {
-			sp, err := tx.Begin(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer func() { _ = sp.Rollback(ctx) }()
-			for _, sql := range sqls {
-				if _, err := sp.Exec(ctx, sql); err != nil {
-					return err
+		// As migrated, and with 0023's rbac_record, each in a transaction it rolls back.
+		for _, read := range []bool{false, true} {
+			t.Run(fmt.Sprintf("0023=%t", read), func(t *testing.T) {
+				ctx := t.Context()
+				tx, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
 				}
-			}
-			return nil
+				defer func() { _ = tx.Rollback(ctx) }()
+				if read {
+					exec(t, tx, string(historySchema))
+				}
+				// Owned by a role of history's own, as the README sets it up, which a policy binds, as
+				// it binds no superuser.
+				history, schema := role(t, tx)
+				exec(t, tx, `ALTER FUNCTION rbac_record() OWNER TO `+history)
+				ran := spy(t, tx)
+				// Renamed in tx, which rolls it back, so no other test meets the name.
+				exec(t, tx, `ALTER SCHEMA `+pgx.Identifier{schema}.Sanitize()+` RENAME TO "$user"`)
+				exec(t, tx, `SET CONSTRAINTS ALL IMMEDIATE`)
+				in := func(sqls ...string) error {
+					sp, err := tx.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = sp.Rollback(ctx) }()
+					for _, sql := range sqls {
+						if _, err := sp.Exec(ctx, sql); err != nil {
+							return err
+						}
+					}
+					return nil
+				}
+				refused(t, "a change in a schema named $user", in(`INSERT INTO "$user".rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+					VALUES ('t1', 'cluster', 'c1', 'user', 'after', 'cluster.login')`))
+				refused(t, "a delete from history in a schema named $user, with a prune recorded in the session's own table", in(
+					`SELECT set_config('rbac.prune', 'on', true)`,
+					`INSERT INTO pg_temp.rbac_history (effective_at, tenant, entity, key, op, after, how) VALUES (now(), '', 'history', 'k', 'prune',
+						jsonb_build_object('last', jsonb_build_object('txid', '18446744073709551615', 'id', 9223372036854775807)), '')`,
+					`DELETE FROM "$user".rbac_history WHERE principal = 'user:before'`))
+				switch ran := ran(); {
+				case ran && !read:
+					t.Error("a change in a schema named $user read the session's own table as history's role before it was refused")
+				case !ran && read:
+					t.Error("the spy saw no read by 0023's rbac_record, which read the session's own table before it refused a schema named $user")
+				}
+			})
 		}
-		refused(t, "a change in a schema named $user", in(`INSERT INTO "$user".rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
-			VALUES ('t1', 'cluster', 'c1', 'user', 'after', 'cluster.login')`))
-		refused(t, "a delete from history in a schema named $user, with a prune recorded in the session's own table", in(
-			`SELECT set_config('rbac.prune', 'on', true)`,
-			`INSERT INTO pg_temp.rbac_history (effective_at, tenant, entity, key, op, after, how) VALUES (now(), '', 'history', 'k', 'prune',
-				jsonb_build_object('last', jsonb_build_object('txid', '18446744073709551615', 'id', 9223372036854775807)), '')`,
-			`DELETE FROM "$user".rbac_history WHERE principal = 'user:before'`))
 	})
 	t.Run("history's role without USAGE", func(t *testing.T) {
 		ctx := t.Context()
@@ -781,10 +833,19 @@ func TestHistorysTriggersRefuseASchemaTheirSearchPathCantName(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer conn.Release()
-		exec(t, conn, `CREATE TEMP TABLE rbac_history (LIKE rbac_history INCLUDING DEFAULTS INCLUDING IDENTITY)`)
-		exec(t, conn, `GRANT ALL ON pg_temp.rbac_history TO PUBLIC`)
+		ran := spy(t, conn)
 		_, err = conn.Exec(ctx, write, "u")
 		refused(t, "a change recorded by a role without USAGE on the schema", err)
+		if ran() {
+			t.Error("a change recorded by a role without USAGE on the schema read the session's own table as that role before it was refused")
+		}
+		// As a superuser migrating replaces it, which keeps its owner.
+		exec(t, superuserOn(t, r.schema), string(historySchema))
+		_, err = conn.Exec(ctx, write, "u")
+		refused(t, "a change recorded by 0023's rbac_record, as a role without USAGE on the schema", err)
+		if !ran() {
+			t.Error("the spy saw no read by 0023's rbac_record, which read the session's own table before it refused a schema its role has no USAGE on")
+		}
 	})
 }
 
