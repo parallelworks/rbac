@@ -9,9 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/parallelworks/rbac"
+	"github.com/parallelworks/rbac/internal/pgtest"
 )
 
 // world is a tenant built at random: containers, clusters under them, grants, custom roles,
@@ -421,6 +423,11 @@ func TestDenyLookupsAgreeWithOverlapsInRandomTenants(t *testing.T) {
 			if seed%2 == 0 {
 				denies = 2 + pick(6)
 			}
+			type deny struct {
+				scopeType, scopeID, id          string
+				principals, exempt, permissions []string
+			}
+			var inserts []deny
 			for i := range denies {
 				named := map[string]bool{}
 				principals, exempt, permissions := []string{}, []string{}, []string{}
@@ -454,14 +461,47 @@ func TestDenyLookupsAgreeWithOverlapsInRandomTenants(t *testing.T) {
 					}
 				}
 				scopeType, scopeID, _ := strings.Cut(scopes[pick(len(scopes))], ":")
+				inserts = append(inserts, deny{scopeType, scopeID, fmt.Sprint("d", i), principals, exempt, permissions})
+			}
+			insert := func(d deny) {
+				t.Helper()
 				exec(`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions) VALUES ('t1', $1, $2, $3, $4, $5, $6)`,
-					scopeType, scopeID, fmt.Sprint("d", i), principals, exempt, permissions)
+					d.scopeType, d.scopeID, d.id, d.principals, d.exempt, d.permissions)
+			}
+			// A read of the denies anywhere in the tenant answers for all of them at once, so of several
+			// binding a subject, any one decides it: those reads are checked with each of the first
+			// denies alone too. So is a list, which leaves out a row any deny binding its subject is
+			// on the path of, of a deny exempting anyone from view, which identities that aren't
+			// active members hold through the public, and whose keys a deny exempts are told apart.
+			for _, d := range inserts[:min(len(inserts), 24)] {
+				insert(d)
+				for _, s := range w.subjects {
+					for _, read := range rbac.DeniesAnywhereMatched(t, ctx, h.authz, "t1", s) {
+						if !slices.Equal(read.Got, read.Want) {
+							t.Errorf("with %s alone, %v: %s read %v, the overlap of arrays %v", d.id, s.Principal, read.Read, read.Got, read.Want)
+						}
+					}
+					if len(d.exempt) == 0 || !slices.Contains(d.permissions, "cluster:view") && !slices.Contains(d.permissions, "cluster:*") {
+						continue
+					}
+					want := allowedOf(t, h, w.clusters, s, view)
+					if got := listed(t, h, s, view); !slices.Equal(got, want) {
+						t.Errorf("with %s alone, %v %s: Filter %v, Authorize %v", d.id, s.Principal, view, got, want)
+					}
+					if reached, _ := reachedBy(t, h, w.clusters, s, view); !slices.Equal(reached, want) {
+						t.Errorf("with %s alone, %v %s: Reachable %v, Authorize %v", d.id, s.Principal, view, reached, want)
+					}
+				}
+				exec(`DELETE FROM rbac_denies WHERE tenant = 't1'`)
+			}
+			for _, d := range inserts {
+				insert(d)
 			}
 			matched := func(a *rbac.Authorizer, when string, resources []rbac.Resource, perms []rbac.Permission) map[string][]string {
 				t.Helper()
 				checked := map[string][]string{}
 				for _, s := range w.subjects {
-					for _, read := range rbac.DeniesMatched(t, ctx, a, s, resources, perms) {
+					for _, read := range rbac.DeniesMatched(t, ctx, a, s, w.subjects, resources, perms) {
 						if !slices.Equal(read.Got, read.Want) {
 							t.Errorf("%s, %v on %q of %q: %s read %v, the overlap of arrays %v", when, s.Principal, read.On, read.Permission, read.Read, read.Got, read.Want)
 						}
@@ -506,6 +546,208 @@ func TestDenyLookupsAgreeWithOverlapsInRandomTenants(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+// TestDenyLookupsAgreeWithOverlapsOnAnyKeys evaluates the fragments that look a deny's keys up in
+// objects of its subject's (keyed, bindsIfRead, exemptForGoodSQL and exemptUntilSQL) beside the
+// overlaps of arrays they replaced, on values random tenants rarely hold: null arrays and null keys
+// in them, empty ones and empty key sets, keys repeated, and keys jsonb escapes, or that differ only
+// in case or in Unicode normalization, as arrays of the C collation the tables hold them in, of the
+// database's default and of ICU's root where the server has it; whether a deny binds as each read
+// tests it, where its test of the permission or scope is true, false or null; and when an exemption
+// ends, for keys a subject is bound by, exempted by or neither, each ending at one of two times or
+// never, at random.
+func TestDenyLookupsAgreeWithOverlapsOnAnyKeys(t *testing.T) {
+	ctx := t.Context()
+	pool := pgtest.Open(t, "")
+	rng := rand.New(rand.NewPCG(1, 2))
+	exec := func(sql string) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keys := []string{
+		"public:", "members:t1", "user:ann", "user:Ann", "user:ANN", "group:a", "group:A", "group:é", "group:e\u0301",
+		"group:ß", "group:ss", "group:SS", `group:"q"`, `group:\`, `group:\\`, `group:\"`, `group:\u0000`, `group:{"a": 1}`, "group:日本",
+		"group:\u2028", "group:\U0001F600", "group: ", "group:a ", "group:", "",
+	}
+	for c := rune(1); c < 0x20; c++ {
+		keys = append(keys, "group:"+string(c))
+	}
+	keys = append(keys, "group:\x7f")
+	of := func(ks ...string) []*string {
+		ps := make([]*string, len(ks))
+		for i := range ks {
+			ps[i] = &ks[i]
+		}
+		return ps
+	}
+	// A deny's arrays: null, empty, of nulls, of one key with a null or twice, and a few at random.
+	arrays := []any{nil, []*string{}, []*string{nil}, []*string{nil, nil}}
+	for _, k := range keys {
+		arrays = append(arrays, of(k), append(of(k), nil), append([]*string{nil}, of(k)...), of(k, k))
+	}
+	// A subject's keys, which hold no null: none, one, and a few at random.
+	keySets := []any{[]*string{}}
+	for _, k := range keys {
+		keySets = append(keySets, of(k))
+	}
+	for range 150 {
+		var a []*string
+		for range 2 + rng.IntN(3) {
+			if rng.IntN(8) == 0 {
+				a = append(a, nil)
+			} else {
+				a = append(a, of(keys[rng.IntN(len(keys))])...)
+			}
+		}
+		arrays = append(arrays, a)
+		var s []string
+		for range 2 + rng.IntN(5) {
+			s = append(s, keys[rng.IntN(len(keys))])
+		}
+		keySets = append(keySets, of(s...))
+	}
+	copied := func(table string, rows [][]any, cols ...string) {
+		t.Helper()
+		defs := []string{"id int"}
+		for _, c := range cols {
+			defs = append(defs, c+` text[] COLLATE "C"`)
+		}
+		exec(`CREATE TABLE ` + table + ` (` + strings.Join(defs, ", ") + `)`)
+		if _, err := pool.CopyFrom(ctx, pgx.Identifier{table}, append([]string{"id"}, cols...), pgx.CopyFromRows(rows)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	numbered := func(values []any) [][]any {
+		rows := make([][]any, len(values))
+		for i, v := range values {
+			rows[i] = []any{i, v}
+		}
+		return rows
+	}
+	copied("arrays", numbered(arrays), "keys")
+	copied("key_sets", numbered(keySets), "keys")
+	mismatched := func(what, sql string, args ...any) {
+		t.Helper()
+		rows, err := pool.Query(ctx, sql+` LIMIT 5`, args...)
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		found, err := pgx.CollectRows(rows, pgx.RowToMap)
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		for _, f := range found {
+			t.Errorf("%s: the lookup and the overlap disagree on %v", what, f)
+		}
+	}
+	// Every array against every key set, the keys as the tables hold them and in other collations,
+	// which compare the same where they are deterministic, as a database's default is.
+	collations := []string{`"C"`, `"default"`}
+	var icu bool
+	if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_collation WHERE collname = 'und-x-icu')`).Scan(&icu); err != nil {
+		t.Fatal(err)
+	}
+	if icu {
+		collations = append(collations, `"und-x-icu"`)
+	}
+	for _, c := range collations {
+		col, set := "(a.keys COLLATE "+c+")", "SELECT unnest(s.keys) COLLATE "+c
+		mismatched("keys in "+c, `SELECT a.keys AS deny, s.keys AS subject FROM arrays a, key_sets s
+			WHERE (`+col+` && ARRAY(`+set+`)) IS DISTINCT FROM `+rbac.Keyed(col, set))
+	}
+	// As each read composes them, its test of the permission or the scope, r, first: a deny passes
+	// a read where its condition is true, so only that is compared, and the value of a column. The
+	// keys a deny is matched to, b and x, are null only for Explain's read for Holders, of any deny.
+	var composed [][]any
+	for i := range 4000 {
+		b, x := keySets[rng.IntN(len(keySets))], keySets[rng.IntN(len(keySets))]
+		if i%10 == 0 {
+			b, x = nil, nil
+		}
+		composed = append(composed, []any{i, arrays[rng.IntN(len(arrays))], arrays[rng.IntN(len(arrays))], b, x})
+	}
+	copied("denies", composed, "p", "e", "b", "x")
+	bound, exempted := "SELECT unnest(d.b)", "SELECT unnest(d.x)"
+	for _, read := range []struct{ name, of, overlap, lookup string }{
+		{
+			"a check's", "d.x IS NOT NULL", `d.p && d.b AND NOT d.e && d.x AND (r)`,
+			rbac.BindsIfRead("r", rbac.Keyed("d.p", bound)+" AND NOT "+rbac.Keyed("d.e", exempted)),
+		},
+		{
+			"Explain's", "TRUE", `(d.b IS NULL OR d.p && d.b AND NOT d.e && d.x) AND (r)`,
+			rbac.BindsIfRead("r", "(d.b IS NULL OR "+rbac.Keyed("d.p", bound)+" AND NOT "+rbac.Keyed("d.e", exempted)+")"),
+		},
+		{"a list's", "d.x IS NOT NULL", `NOT d.e && d.x AND (r)`, rbac.BindsIfRead("r", "NOT "+rbac.Keyed("d.e", exempted))},
+	} {
+		mismatched(read.name, `SELECT d.*, r FROM denies d, (VALUES (true), (false), (NULL)) AS r(r)
+			WHERE `+read.of+` AND ((`+read.overlap+`) IS TRUE) <> ((`+read.lookup+`) IS TRUE)`)
+	}
+	mismatched("the binds column", `SELECT d.* FROM denies d WHERE d.x IS NOT NULL
+		AND (NOT d.e && d.x) IS DISTINCT FROM NOT `+rbac.Keyed("d.e", exempted))
+	// When an exemption ends, of a subject bound by the public, its identity, perhaps the tenant's
+	// members and groups, one named as jsonb escapes it, and exempted by some of those, each ending at
+	// one of two times or never, or reached by no path, as lastingSQL reads them; for each deny naming
+	// and exempting none, one or two of those or another group, or nulls.
+	tricky := "group:\"q\\\né"
+	named := []string{"user:u", "public:", "members:t1", "group:a", "group:b", tricky, "group:z"}
+	lists := []any{nil, []*string{}, []*string{nil}}
+	for i, k := range named {
+		lists = append(lists, of(k), append(of(k), nil))
+		for _, l := range named[i+1:] {
+			lists = append(lists, of(k, l))
+		}
+	}
+	var pairs [][]any
+	for i, p := range lists {
+		for j, e := range lists {
+			pairs = append(pairs, []any{i*len(lists) + j, p, e})
+		}
+	}
+	copied("pairs", pairs, "p", "e")
+	at := []time.Time{time.Date(2026, 1, 1, 13, 0, 0, 0, time.UTC), time.Date(2026, 1, 1, 14, 0, 0, 0, time.UTC)}
+	until := `WITH bound(k) AS (SELECT unnest($1::text[]) COLLATE "C"), exempted(k) AS (SELECT unnest($2::text[]) COLLATE "C"),
+		ends(k, e) AS (SELECT k COLLATE "C", e FROM unnest($3::text[], $4::timestamptz[]) AS e(k, e)), ` +
+		rbac.LastingSQL("'t1'::text", "'user:u'::text") + `
+		SELECT c.*, $1::text[] AS bound, $2::text[] AS exempted, $3::text[] AS ends, $4::timestamptz[] AS at FROM pairs c WHERE `
+	for range 150 {
+		bound := []string{"user:u", "public:"}
+		for _, k := range []string{"members:t1", "group:a", "group:b", tricky} {
+			if rng.IntN(4) > 0 {
+				bound = append(bound, k)
+			}
+		}
+		var exempted []string
+		for _, k := range bound {
+			if rng.IntN(5) < 3 {
+				exempted = append(exempted, k)
+			}
+		}
+		var ends []string
+		var ending []*time.Time
+		for _, k := range []string{"user:u", "group:a", "group:b", tricky} {
+			switch n := rng.IntN(4); n {
+			case 0:
+			case 1:
+				ends, ending = append(ends, k), append(ending, nil)
+			default:
+				ends, ending = append(ends, k), append(ending, &at[n-2])
+			}
+		}
+		args := []any{bound, exempted, ends, ending}
+		mismatched("exempt for good", until+`(c.e && ARRAY(SELECT k FROM lasting WHERE exempts AND e IS NULL)) IS DISTINCT FROM `+
+			rbac.ExemptForGoodSQL("c.e"), args...)
+		mismatched("exempt until", until+`(`+rbac.OverlapUntilSQL("c.p", "c.e")+`) IS DISTINCT FROM (`+rbac.ExemptUntilSQL("c.p", "c.e")+`)`, args...)
+		mismatched("a change's exemption", until+`(CASE WHEN c.e && ARRAY(SELECT k FROM exempted) THEN `+rbac.OverlapUntilSQL("c.p", "c.e")+` END)
+			IS DISTINCT FROM (CASE WHEN `+rbac.Keyed("c.e", "SELECT k FROM exempted")+` THEN `+rbac.ExemptUntilSQL("c.p", "c.e")+` END)`, args...)
+		mismatched("a deny below the tenant", until+`(NOT c.e && ARRAY(SELECT k FROM exempted) OR `+rbac.OverlapUntilSQL("c.p", "c.e")+` IS NOT NULL)
+			IS DISTINCT FROM (NOT `+rbac.Keyed("c.e", "SELECT k FROM exempted")+` OR `+rbac.ExemptUntilSQL("c.p", "c.e")+` IS NOT NULL)`, args...)
+		if t.Failed() {
+			return
+		}
 	}
 }
 
