@@ -319,18 +319,31 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 		if err := lock(ctx, tx, on.Tenant, []string{scope.Key()}, []string{s.Principal.key()}); err != nil {
 			return ChangeEvent{}, err
 		}
-		if err := a.stillStanding(ctx, tx, on.Tenant, stand); err != nil {
-			return ChangeEvent{}, err
-		}
-		// Again under the locks, so an eligibility revoked meanwhile activates nothing, and through
-		// the places in groups it holds alone.
-		b.ExpiresAt = stored(a.cfg.Now().Add(act.Duration))
+		// The places in groups it rests on are held before it reads the time it decides at, which a
+		// wait for them would leave behind: those in force at the time it picks them by (earlier),
+		// which are all that are then, with the paths through them lasting as long from it.
+		was := a.clock.earlier()
 		held := holdingPlaces()
-		reached, err := holdPlaces(ctx, tx, on.Tenant, s, a.cfg.Now(), b.ExpiresAt)
+		reached, err := holdPlaces(ctx, tx, on.Tenant, s, was, stored(was.Add(act.Duration)))
 		if err != nil {
 			return ChangeEvent{}, err
 		}
 		held()
+		// So is its activation of the role there, which it sets again, after the places, as every
+		// change holds grants: a change ending a place or a membership holds every activation of the
+		// identities it ends them for, through a place this one rests on or not, as one that ended,
+		// and DeleteExpired one that ended.
+		if _, err := tx.Exec(ctx, `SELECT FROM rbac_grants WHERE tenant = $1 AND principal = $2 AND scope = $3 AND role = $4
+			AND source = 'activation' FOR UPDATE`, on.Tenant, s.Principal.key(), scope.Key(), act.Role); err != nil {
+			return ChangeEvent{}, err
+		}
+		if err := a.stillStanding(ctx, tx, on.Tenant, stand); err != nil {
+			return ChangeEvent{}, err
+		}
+		// Again under the locks, so an eligibility revoked meanwhile activates nothing, and through
+		// the places in groups it holds alone, those of them that last until it would end.
+		b.ExpiresAt = stored(a.cfg.Now().Add(act.Duration))
+		reached = reached.outlasting(b.ExpiresAt)
 		approving.seal()
 		through, approver, err := a.eligible(ctx, tx, s, on, act, b.ExpiresAt, reached, approving)
 		if err != nil {
@@ -436,6 +449,12 @@ var holdingPlaces = func() func() { return func() {} }
 // zero for never: its identity's as its membership does, and a group's as the latest of the paths
 // of places in groups to it, each as the soonest of the membership and the places on it.
 type paths map[string]time.Time
+
+// outlasting is p without the paths that end by until.
+func (p paths) outlasting(until time.Time) paths {
+	maps.DeleteFunc(p, func(_ string, ends time.Time) bool { return !ends.IsZero() && !ends.After(until) })
+	return p
+}
 
 // holdSQL is holdPlaces' statement: tenant $1, the identity's key $2, now $3, until $4. A path lasts
 // as long as the soonest of the membership and the places on it, so of the paths one step up
@@ -591,20 +610,14 @@ var restsSQL = `
 // recorded them and that migrating couldn't tie to one eligibility, ends, as which of its holder's
 // paths it rested on can't be told. It returns those it cut short and those it ended.
 //
-// It holds them all until the change commits before it reads the paths left, in a later statement:
+// The change holds them all until it commits, before it reads the paths left, in a later statement:
 // two changes that share no lock, each ending one of an activation's paths, would otherwise each
 // read the other's as left, and neither cut it. Held, the second waits for the first and reads what
-// it left. Grants are the last rows a change holds, after its places and memberships, as Activate
-// holds an activation's places before its grant, and in the order the grants a change removes are
-// locked in (inOrder), so none of this waits out of order.
+// it left. It holds them before it reads now (holdResting, or with the grants it removes), as it
+// does every row it waits for.
 func (a *Authorizer) unrest(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, r resting, now time.Time) (short, ended []Grant, err error) {
 	if len(r.ids) == 0 {
 		return nil, nil, nil
-	}
-	// By id alone, which restingOn found in the tenant: beside tenant = $1, a generic plan could read
-	// the tenant's grants by it (byKey).
-	if _, err := tx.Exec(ctx, lockedInOrder("rbac_grants", "", bindingOrder, "id = ANY($1::text[]::uuid[])"), r.ids); err != nil {
-		return nil, nil, err
 	}
 	rows, err := tx.Query(ctx, restsSQL, tenant, r.ids, now)
 	if err != nil {
@@ -642,6 +655,20 @@ func (a *Authorizer) unrest(ctx context.Context, tx pgx.Tx, tenant string, actor
 		}
 	}
 	return short, ended, nil
+}
+
+// holdResting holds, in tx, until the change commits, the activations r found resting, which unrest
+// may cut short. Grants are the last rows a change holds, after its places and memberships, as
+// Activate holds an activation's places before its grant, and in the order the grants a change
+// removes are locked in (inOrder), so none of this waits out of order. By id alone, which restingOn
+// found in the tenant: beside tenant = $1, a generic plan could read the tenant's grants by it
+// (byKey).
+func holdResting(ctx context.Context, tx pgx.Tx, r resting) error {
+	if len(r.ids) == 0 {
+		return nil
+	}
+	_, err := tx.Exec(ctx, lockedInOrder("rbac_grants", "", bindingOrder, "id = ANY($1::text[]::uuid[])"), r.ids)
+	return err
 }
 
 // madeThrough is the eligibility an activation is made through: its id, and its principal's key.

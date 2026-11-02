@@ -10974,9 +10974,11 @@ func TestAChangeDecidesUnderItsLocksAtTheTimeItIsMade(t *testing.T) {
 
 // Each call reads the host's clock once, where it first needs the time, so every statement it makes
 // and every condition it evaluates are of one moment, and a change once more in each of its
-// transactions, under its locks. The count is exact: a change that reads it before its transaction
-// and only once would decide under its locks at the time it began. Each call here reads through
-// several statements, conditions and label values; one that needs no time reads none.
+// transactions, under its locks: one that first needs it in its transaction, to pick what it holds
+// of what is in force, reads it there, and again once it holds it all. The count is exact: a change
+// that reads it before its transaction and only once would decide under its locks at the time it
+// began. Each call here reads through several statements, conditions and label values; one that
+// needs no time reads none.
 func TestEachCallReadsTheClockOnceAndAChangeAgainUnderItsLocks(t *testing.T) {
 	reads := 0
 	tenantGroups := rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}
@@ -11064,11 +11066,11 @@ func TestEachCallReadsTheClockOnceAndAChangeAgainUnderItsLocks(t *testing.T) {
 		{"ImportMembers", 2, func() error {
 			return h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "squad", Principal: v.Principal}})
 		}},
-		{"DeleteMembers", 1, func() error {
+		{"DeleteMembers", 2, func() error {
 			return h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "squad", Principal: v.Principal}})
 		}},
 		{"DeleteGroup", 2, func() error { return h.authz.DeleteGroup(ctx, admin, "t1", "team") }},
-		{"DeleteGroups", 1, func() error { return h.authz.DeleteGroups(ctx, host, "t1", []string{"squad"}) }},
+		{"DeleteGroups", 2, func() error { return h.authz.DeleteGroups(ctx, host, "t1", []string{"squad"}) }},
 		{"SetMemberships", 2, func() error {
 			return h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("w")}})
 		}},

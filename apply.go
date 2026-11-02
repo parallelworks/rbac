@@ -179,6 +179,13 @@ func (a *Authorizer) change(ctx context.Context, actor Subject, on Resource, how
 		if err := lockAll(ctx, tx, on.Tenant, []string{scope.Key()}, slices.Collect(maps.Keys(principals))); err != nil {
 			return ChangeEvent{}, gains{}, err
 		}
+		hold := holdRevoked
+		if via == ViaEligibility {
+			hold = holdEligible
+		}
+		if err := hold(ctx, tx, on.Tenant, scope, revokes, grants); err != nil {
+			return ChangeEvent{}, gains{}, err
+		}
 		exist := groups
 		if len(grants) > 0 {
 			exist = slices.Concat(groups, groupScopes([]Scope{scope}))
@@ -550,6 +557,9 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 	}
 	return a.inTxGaining(ctx, tenant, actor, "Import", func(tx pgx.Tx) (ChangeEvent, gains, error) {
 		if err := lockAll(ctx, tx, tenant, slices.Collect(maps.Keys(scopes)), slices.Collect(maps.Keys(principals))); err != nil {
+			return ChangeEvent{}, gains{}, err
+		}
+		if err := holdGrantedAgain(ctx, tx, tenant, grants); err != nil {
 			return ChangeEvent{}, gains{}, err
 		}
 		if err := groupsExist(ctx, tx, tenant, slices.Concat(groupKeys(named), groupScopes(on))); err != nil {
@@ -1975,6 +1985,9 @@ func (a *Authorizer) inTxGaining(ctx context.Context, tenant string, actor Princ
 		if err != nil {
 			return err
 		}
+		if err := a.clock.wentBack(); err != nil {
+			return err
+		}
 		if exclusive && !removals[how] {
 			if err := a.excludes(ctx, tx, tenant, e, g); err != nil {
 				return err
@@ -1995,18 +2008,28 @@ func (a *Authorizer) begin(ctx context.Context, fn func(pgx.Tx) error) error {
 	if a.clock == nil {
 		return begin(ctx, a.db, fn)
 	}
-	// The transaction decides again under its locks, so at a time it reads then (callClock). One that
-	// fails before needing the time reads it there too, so its refusal is dated where it decided: a
-	// reading from before the locks can predate a change it waited for.
-	a.clock.read = false
+	// The transaction decides again under its locks, so at a time it reads once it holds them all
+	// (callClock), having picked what it holds of what is in force by the reading before (earlier).
+	// One that fails before needing the time reads it there too, so its refusal is dated where it
+	// decided: a reading from before the locks can predate a change it waited for.
+	a.clock.before, a.clock.began, a.clock.read, a.clock.picked = a.clock.at, a.clock.read, false, false
 	return begin(ctx, a.db, func(tx pgx.Tx) error {
-		err := fn(tx)
+		w, end := watched(tx, a.clock)
+		err := fn(w)
+		if end != nil {
+			err = end(err)
+		}
 		if err != nil {
 			a.clock.now()
 		}
 		return err
 	})
 }
+
+// watched is the transaction a change runs in, which a test wraps to refuse a lock taken, or waited
+// for, once the change has read the time it decides at (begin), and what runs as the change ends,
+// given and returning its error.
+var watched = func(tx pgx.Tx, _ *callClock) (pgx.Tx, func(error) error) { return tx, nil }
 
 // begin runs fn in a transaction of its own at READ COMMITTED, whatever the database's default,
 // as a change's checks must read what committed before it took its locks; on a pgx.Tx, as under
@@ -2503,16 +2526,77 @@ func (a *Authorizer) revoke(ctx context.Context, tx pgx.Tx, tenant string, scope
 	return collectGrants(rows)
 }
 
-// revoking is revoke's statement. The grants are found from the bindings, each by its principal,
-// scope and role, which every index leading to them seeks: matched to the scope's grants instead,
-// a revoke reads every grant on it, which a busy scope holds thousands of, while it holds the
-// scope's lock. OFFSET 0 keeps the planner from flattening the lookup into such a join. They are
+// holdRevoked holds, in tx, in order, the grants revoke deletes, and those kept grants again
+// (holdGrantedAgain), before the change reads the time it decides at: a change ending activations
+// among them holds no lock of the scope, and a wait for it would leave that time behind.
+func holdRevoked(ctx context.Context, tx pgx.Tx, tenant string, scope Scope, bindings, kept []Binding) error {
+	if len(bindings) > 0 {
+		if _, err := tx.Exec(ctx, revokedSQL, revokeArgs(tenant, scope, bindings, kept)...); err != nil {
+			return err
+		}
+	}
+	return holdGrantedAgain(ctx, tx, tenant, scopeGrants(scope, kept))
+}
+
+// holdGrantedAgain holds, in tx, in order, the grants stored already that grants, those until an
+// end, grant again, before the change reads the time it decides at: DeleteExpired, which takes no
+// lock, may be deleting one that has ended by its clock, which upsert would wait for once the
+// change has read its time. One for good no expiry deletes, and every other change holding it holds
+// a lock of its scope or its principal, which the change does. Each is looked up by its key, as
+// upsert finds it.
+func holdGrantedAgain(ctx context.Context, tx pgx.Tx, tenant string, grants []Grant) error {
+	var scopes, principals, roles, sources, conditions []string
+	var expires []time.Time
+	for _, g := range grants {
+		if !g.ExpiresAt.IsZero() {
+			scopes, principals, roles = append(scopes, g.Scope.Key()), append(principals, g.Principal.key()), append(roles, string(g.Role))
+			sources, expires, conditions = append(sources, g.Source), append(expires, g.ExpiresAt), append(conditions, g.Condition.Expression)
+		}
+	}
+	if len(scopes) == 0 {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `SELECT FROM rbac_grants WHERE id = ANY(ARRAY(
+		  SELECT x.id FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::timestamptz[], $7::text[])
+		    AS k(scope, principal, role, source, expires_at, condition) CROSS JOIN LATERAL (
+		    SELECT id FROM rbac_grants WHERE tenant = $1 AND principal = k.principal AND scope = k.scope AND role = k.role
+		      AND source = k.source AND coalesce(expires_at, 'infinity') = k.expires_at AND condition = k.condition
+		    OFFSET 0) x))
+		ORDER BY `+bindingOrder+` FOR UPDATE`, tenant, scopes, principals, roles, sources, expires, conditions)
+	return err
+}
+
+// holdEligible holds, in tx, the eligibilities on a scope a change sets or deletes, by their
+// principals and roles, before the change reads the time it decides at: a group's or a principal's
+// removal changes those it approves without their scope's lock, and a wait for one would leave that
+// time behind.
+func holdEligible(ctx context.Context, tx pgx.Tx, tenant string, scope Scope, deleted, set []Binding) error {
+	bindings := slices.Concat(deleted, set)
+	slices.SortFunc(bindings, func(x, y Binding) int {
+		return cmp.Or(strings.Compare(x.Principal.key(), y.Principal.key()), strings.Compare(string(x.Role), string(y.Role)))
+	})
+	principals, roles := make([]string, len(bindings)), make([]string, len(bindings))
+	for i, b := range bindings {
+		principals[i], roles[i] = b.Principal.key(), string(b.Role)
+	}
+	_, err := tx.Exec(ctx, `SELECT FROM unnest($3::text[], $4::text[]) AS b(p, r) CROSS JOIN LATERAL (
+		  SELECT FROM rbac_eligibilities WHERE tenant = $1 AND scope = $2 AND principal = b.p AND role = b.r FOR UPDATE) e`,
+		tenant, scope.Key(), principals, roles)
+	return err
+}
+
+// revoking is revoke's statement, deleting the grants revokedSQL picks.
+const revoking = `DELETE FROM rbac_grants WHERE id = ANY(ARRAY(` + revokedSQL + `)) RETURNING ` + grantColumns
+
+// revokedSQL picks the grants a revoke deletes. They are found from the bindings, each by its
+// principal, scope and role, which every index leading to them seeks: matched to the scope's grants
+// instead, a revoke reads every grant on it, which a busy scope holds thousands of, while it holds
+// the scope's lock. OFFSET 0 keeps the planner from flattening the lookup into such a join. They are
 // locked in order (inOrder) before they are deleted: deleted as the plan finds them, by their ids
 // or where they are stored, they would deadlock with a change ending activations among them, which
 // holds no lock of the scope.
-const revoking = `
-	DELETE FROM rbac_grants
-	WHERE id = ANY(ARRAY(SELECT id FROM rbac_grants g
+const revokedSQL = `
+	SELECT id FROM rbac_grants g
 	  WHERE id = ANY(ARRAY(
 	      SELECT x.id FROM unnest($3::text[], $4::text[], $5::text[], $6::text[]) AS r(principal, role, source, id)
 	      CROSS JOIN LATERAL (
@@ -2523,8 +2607,7 @@ const revoking = `
 	      AS k(principal, role, source, expires_at, condition)
 	      WHERE k.principal = g.principal AND k.role = g.role AND k.source = g.source
 	        AND k.expires_at IS NOT DISTINCT FROM g.expires_at AND k.condition = g.condition)
-	  ORDER BY ` + bindingOrder + ` FOR UPDATE))
-	RETURNING ` + grantColumns
+	  ORDER BY ` + bindingOrder + ` FOR UPDATE`
 
 // revokeArgs are revoking's arguments.
 func revokeArgs(tenant string, scope Scope, bindings, kept []Binding) []any {
@@ -2966,7 +3049,6 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 		}
 	}
 	var r resting
-	var now time.Time
 	if del.members != "" {
 		// Memberships before the members they reach, as DeleteExpired takes them, so the two never
 		// deadlock.
@@ -2980,8 +3062,7 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 			if err != nil {
 				return ChangeEvent{}, err
 			}
-			now = a.cfg.Now()
-			if r, err = a.restingOn(ctx, tx, tenant, nil, held, now); err != nil {
+			if r, err = a.restingOn(ctx, tx, tenant, nil, held, a.clock.earlier()); err != nil {
 				return ChangeEvent{}, err
 			}
 		}
@@ -3007,7 +3088,12 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 	if e.Revoked, err = removedWhere(ctx, a, tx, "rbac_grants", grantColumns, collectGrants, granted, grantedArgs...); err != nil {
 		return ChangeEvent{}, err
 	}
-	short, ended, err := a.unrest(ctx, tx, tenant, actor, r, now)
+	if del.group == "" {
+		return e, nil
+	}
+	// Read once the change holds all it waits for, the activations among them; read where it picked
+	// none by the time before too, which a clock gone back since leaves in force (wentBack).
+	short, ended, err := a.unrest(ctx, tx, tenant, actor, r, a.cfg.Now())
 	e.Shortened, e.Revoked = short, append(e.Revoked, ended...)
 	return e, err
 }

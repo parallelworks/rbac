@@ -287,6 +287,9 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 		if err := lockAll(ctx, tx, on.Tenant, []string{d.Scope.Key()}, groups); err != nil {
 			return ChangeEvent{}, err
 		}
+		if err := holdDeny(ctx, tx, on.Tenant, d.Scope, d.ID); err != nil {
+			return ChangeEvent{}, err
+		}
 		if err := groupsExist(ctx, tx, on.Tenant, slices.Concat(groups, groupScopes([]Scope{d.Scope}))); err != nil {
 			return ChangeEvent{}, err
 		}
@@ -372,6 +375,9 @@ func (a *Authorizer) DeleteDeny(ctx context.Context, actor Subject, on Resource,
 	}
 	return a.inTx(ctx, on.Tenant, actor.Principal, "DeleteDeny", func(tx pgx.Tx) (ChangeEvent, error) {
 		if err := lock(ctx, tx, on.Tenant, []string{on.Scope().Key()}, nil); err != nil {
+			return ChangeEvent{}, err
+		}
+		if err := holdDeny(ctx, tx, on.Tenant, on.Scope(), id); err != nil {
 			return ChangeEvent{}, err
 		}
 		cs.seal()
@@ -526,4 +532,13 @@ func permissionStrings(ps []Permission) []string {
 		out[i] = string(p)
 	}
 	return out
+}
+
+// holdDeny holds, in tx, a deny a change writes, before the change reads the time it decides at: a
+// group's or a principal's removal changes the denies naming or exempting it without their scope's
+// lock, and a wait for one would leave that time behind.
+func holdDeny(ctx context.Context, tx pgx.Tx, tenant string, scope Scope, id string) error {
+	_, err := tx.Exec(ctx, `SELECT FROM rbac_denies WHERE tenant = $1 AND scope_type = $2 AND scope_id = $3 AND id = $4 FOR UPDATE`,
+		tenant, scope.Type, scope.ID, id)
+	return err
 }

@@ -4,9 +4,13 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"os"
+	"regexp"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,7 +19,196 @@ import (
 	"cel.dev/cel-go/common/types/ref"
 	"cel.dev/cel-go/interpreter"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/parallelworks/rbac/internal/pgtest"
 )
+
+// Every change a test makes holds all it waits for before it reads the time it decides at.
+func init() {
+	watched = func(tx pgx.Tx, c *callClock) (pgx.Tx, func(error) error) {
+		w := &clockWatched{Tx: tx, clock: c}
+		if conn := tx.Conn(); conn != nil {
+			w.pid = conn.PgConn().PID()
+		}
+		rowWaits.push(w)
+		return w, func(err error) error {
+			if waited := rowWaits.pop(w); waited != "" {
+				panic("rbac: a change waits for a row lock once it has read the time it decides at: " + strings.Join(strings.Fields(waited), " "))
+			}
+			return err
+		}
+	}
+}
+
+// clockWatched is a change's transaction, which panics on a statement that may wait for a lock once
+// the change has read the time it decides at (callClock): a wait would leave that time behind. A
+// write's own locks show nowhere in its text, as an upsert's on the row it conflicts with, a
+// foreign key's on the group or a delete's on a row the change never held, nor do a trigger's:
+// rowWaits sees those waits as they happen, which needs another transaction to hold the row
+// meanwhile.
+type clockWatched struct {
+	pgx.Tx
+	clock *callClock
+	// pid is the change's session; read, once the change has read its time, and waited, the
+	// statement it waited for a row in, are rowWaits'.
+	pid    uint32
+	read   bool
+	waited string
+}
+
+var (
+	// rowLock is a row-locking clause, and noWait what after one keeps it from waiting.
+	rowLock = regexp.MustCompile(`(?i)\bFOR\s+(NO\s+KEY\s+UPDATE|UPDATE|KEY\s+SHARE|SHARE)\b`)
+	noWait  = regexp.MustCompile(`(?i)^\s+(NOWAIT|SKIP\s+LOCKED)\b`)
+	// write is a statement that writes, whose own locks take again what the change holds.
+	write = regexp.MustCompile(`(?i)\b(DELETE\s+FROM|INSERT\s+INTO|UPDATE\s+\w+(\s+AS\s+\w+)?\s+SET)\b`)
+)
+
+func (w *clockWatched) check(ctx context.Context, sql string) {
+	if !w.clock.read {
+		return
+	}
+	rowWaits.read(ctx, w)
+	if write.MatchString(sql) {
+		return
+	}
+	waits := strings.Contains(sql, "pg_advisory_xact_lock")
+	for _, at := range rowLock.FindAllStringIndex(sql, -1) {
+		waits = waits || !noWait.MatchString(sql[at[1]:])
+	}
+	if waits {
+		panic("rbac: a change locks once it has read the time it decides at: " + strings.Join(strings.Fields(sql), " "))
+	}
+}
+
+// rowWaits watches, on a connection of its own, the sessions of the changes that have read their
+// time, for a wait on a row: for another transaction to end, as one holding the row does, or to
+// finish inserting a key. A wait on a relation, as for a migration, or for its extension, is none
+// a change could take first. It polls each millisecond while any change is so, and sees a wait that
+// lasts longer.
+var rowWaits = &waitWatch{by: map[uint32][]*clockWatched{}, woken: make(chan struct{}, 1)}
+
+type waitWatch struct {
+	mu sync.Mutex
+	// by is each session's changes, innermost last: one made in another's OnChange runs on its
+	// session, and its waits are its own.
+	by    map[uint32][]*clockWatched
+	once  sync.Once
+	woken chan struct{}
+}
+
+func (ww *waitWatch) push(w *clockWatched) {
+	if w.pid == 0 {
+		return
+	}
+	ww.mu.Lock()
+	defer ww.mu.Unlock()
+	ww.by[w.pid] = append(ww.by[w.pid], w)
+}
+
+// pop ends watching w, and returns the statement it waited for a row in, if any.
+func (ww *waitWatch) pop(w *clockWatched) string {
+	ww.mu.Lock()
+	defer ww.mu.Unlock()
+	ws := ww.by[w.pid]
+	if i := slices.Index(ws, w); i >= 0 {
+		ws = slices.Delete(ws, i, i+1)
+	}
+	if len(ws) == 0 {
+		delete(ww.by, w.pid)
+	} else {
+		ww.by[w.pid] = ws
+	}
+	return w.waited
+}
+
+// read marks w as having read its time, from when its waits count. The watch outlives the change
+// that starts it, so it keeps none of its context's cancellation.
+func (ww *waitWatch) read(ctx context.Context, w *clockWatched) {
+	if w.pid == 0 {
+		return
+	}
+	ww.mu.Lock()
+	was := w.read
+	w.read = true
+	ww.mu.Unlock()
+	if was {
+		return
+	}
+	ww.once.Do(func() { go ww.watch(context.WithoutCancel(ctx), os.Getenv(pgtest.URLEnv)) })
+	select {
+	case ww.woken <- struct{}{}:
+	default:
+	}
+}
+
+func (ww *waitWatch) watch(ctx context.Context, database string) {
+	conn, err := pgx.Connect(ctx, database)
+	if err != nil {
+		return
+	}
+	for {
+		ww.mu.Lock()
+		var pids []int32
+		var watching []*clockWatched
+		for pid, ws := range ww.by {
+			if w := ws[len(ws)-1]; w.read {
+				pids, watching = append(pids, int32(pid)), append(watching, w)
+			}
+		}
+		ww.mu.Unlock()
+		if len(pids) == 0 {
+			<-ww.woken
+			continue
+		}
+		rows, err := conn.Query(ctx, `SELECT pid, query FROM pg_stat_activity WHERE pid = ANY($1)
+			AND wait_event_type = 'Lock' AND wait_event IN ('transactionid', 'tuple', 'speculative token')`, pids)
+		if err != nil {
+			return
+		}
+		waiting := map[int32]string{}
+		var pid int32
+		var query string
+		if _, err := pgx.ForEachRow(rows, []any{&pid, &query}, func() error {
+			waiting[pid] = query
+			return nil
+		}); err != nil {
+			return
+		}
+		// Only a change still innermost on its session since before the read waited there.
+		ww.mu.Lock()
+		for i, w := range watching {
+			if q, ok := waiting[pids[i]]; ok && w.waited == "" && slices.Index(ww.by[w.pid], w) == len(ww.by[w.pid])-1 {
+				w.waited = "(session " + strconv.Itoa(int(pids[i])) + ") " + q
+			}
+		}
+		ww.mu.Unlock()
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func (w *clockWatched) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	w.check(ctx, sql)
+	return w.Tx.Exec(ctx, sql, args...)
+}
+
+func (w *clockWatched) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	w.check(ctx, sql)
+	return w.Tx.Query(ctx, sql, args...)
+}
+
+func (w *clockWatched) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	w.check(ctx, sql)
+	return w.Tx.QueryRow(ctx, sql, args...)
+}
+
+func (w *clockWatched) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	for _, q := range b.QueuedQueries {
+		w.check(ctx, q.SQL)
+	}
+	return w.Tx.SendBatch(ctx, b)
+}
 
 // SetSavepointEnd bounds a savepoint's release or rollback by d until t ends.
 func SetSavepointEnd(t *testing.T, d time.Duration) {
