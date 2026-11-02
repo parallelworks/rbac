@@ -1838,6 +1838,17 @@ func valueResource(tenant string) map[string]any {
 	return map[string]any{"type": TenantScope, "id": tenant, "tenant": tenant, "attributes": unreadable}
 }
 
+// valueVars is what a condition deciding a label value or a power to release for s on tenant reads:
+// vars of the bare tenant, as a check decides those on it (decidedOn), with attributes that refuse
+// every read (valueResource). The attributes the host passes with the tenant aren't converted, so
+// they can't take the subject's or the request's past what a check converts, as a copy of the
+// tenant's own vars let them, where a check and Holding decide the value.
+func (a *Authorizer) valueVars(ctx context.Context, s Subject, tenant string) map[string]any {
+	vars := a.vars(ctx, s, "", tenantResource(tenant))
+	vars["resource"] = valueResource(tenant)
+	return vars
+}
+
 // noAttributes are a kind's attributes where it has none, which every check can share.
 var noAttributes = types.NewRefValMap(types.DefaultTypeAdapter, map[ref.Val]ref.Val{})
 

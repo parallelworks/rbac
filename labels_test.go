@@ -2083,6 +2083,57 @@ func TestALabelValuesConditionsCantReadTheTenantsAttributes(t *testing.T) {
 	}
 }
 
+// A label value and a power to release are decided on the bare tenant whatever attributes the
+// tenant is passed with, so Permissions and a change on a tenant passed with more than a check
+// converts decide them as Authorize and Holding do, neither of which converts those. Decided on a
+// copy of what the tenant's own permissions read, a condition reading only the subject's
+// attributes failed there: Permissions left out a value Authorize allowed, and a change refused to
+// hand on a value a deny reading the subject's attributes didn't take.
+func TestALabelValueIsDecidedAsChecksDecideItWhateverTheTenantIsPassedWith(t *testing.T) {
+	h := labeled(t, releasing, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), tenantGuard) })
+	ctx := t.Context()
+	eng := rbac.Condition{Expression: `subject.attributes.dept == "eng"`}
+	var grants []rbac.Grant
+	for _, role := range []rbac.Role{"level.high", "level.release"} {
+		g := grant(rbac.TenantRoot("t1"), role, rbac.User, "ann")
+		g.Condition = eng
+		grants = append(grants, g)
+	}
+	h.seed(t, append(grants, grant(rbac.TenantRoot("t1"), "tenant.admin", rbac.User, "cara"), grant(rbac.TenantRoot("t1"), "tenant.guard", rbac.User, "guardian"))...)
+	h.hold(t, "cara", "level:high")
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), tenantT1, rbac.Deny{
+		ID: "outsiders", Principals: []rbac.Principal{identity("cara")}, Permissions: []rbac.Permission{"level:high"},
+		Condition: rbac.Condition{Expression: `subject.attributes.dept != "eng"`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ann, cara := h.as(t, "ann"), h.as(t, "cara")
+	ann.Attributes, cara.Attributes = map[string]any{"dept": "eng"}, map[string]any{"dept": "eng"}
+	large := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1", Attributes: map[string]any{"tags": make([]any, rbac.MaxConverted)}}
+	holding, err := h.authz.Holding(ctx, "t1", ann)
+	if err != nil || !slices.Contains(holding.Values(), "level:high") || !holding.MayRelease(rbac.Label{"level": {"high"}}, rbac.Label{}) {
+		t.Fatalf("Holding = %v, %v", holding.Values(), err)
+	}
+	perms, err := h.authz.Permissions(ctx, ann, large)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []rbac.Permission{"level:high", rbac.ReleasePermission("level")} {
+		if !allowed(t, h, ann, p, large) {
+			t.Errorf("Authorize of %s on a tenant passed with more than a check converts refuses it", p)
+		}
+		if !slices.Contains(perms, p) {
+			t.Errorf("Permissions on a tenant passed with more than a check converts = %v, without %s", perms, p)
+		}
+	}
+	if !allowed(t, h, cara, "level:high", large) {
+		t.Error("Authorize of a value a deny reading the subject's attributes doesn't take refuses it")
+	}
+	if err := h.authz.Apply(ctx, cara, large, rbac.Change{Grant: []rbac.Binding{{Role: "level.high", Principal: identity("dan")}}}); err != nil {
+		t.Errorf("handing on level.high on a tenant passed with more than a check converts: %v", err)
+	}
+}
+
 // A read decides a resource's label by the label values the subject held as it held its grants:
 // one moved, in one statement, between the group granted on a labeled cluster and the group
 // holding the label's value never held both, so no read made while it moves lets it see the

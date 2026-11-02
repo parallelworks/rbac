@@ -1294,11 +1294,7 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 	// reading the resource reads that tenant, as it does for every check of it.
 	var valued func() map[string]any
 	if on.Type == TenantScope {
-		valued = built(func() map[string]any {
-			v := maps.Clone(vars())
-			v["resource"] = valueResource(on.Tenant)
-			return v
-		})
+		valued = built(func() map[string]any { return a.valueVars(ctx, actor, on.Tenant) })
 	}
 	with := func(vars func() map[string]any, action Permission) map[string]any {
 		if valued != nil && a.labelPermission(action) {

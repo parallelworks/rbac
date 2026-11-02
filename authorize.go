@@ -383,15 +383,7 @@ func (rs *runs) of(ctx context.Context, a *Authorizer, s Subject, r Resource, he
 	resource := &deciding{build: func() map[string]any { return a.vars(ctx, s, "", r) }, ran: map[string]run{}}
 	rs.resource, rs.values = resource, resource
 	if r.Type == TenantScope && len(a.labels) > 0 {
-		rs.values = &deciding{build: func() map[string]any {
-			// A clone, so the subject's and the request's attributes are converted once for both.
-			if resource.vars == nil {
-				resource.vars = resource.build()
-			}
-			vars := maps.Clone(resource.vars)
-			vars["resource"] = valueResource(r.Tenant)
-			return vars
-		}, ran: map[string]run{}}
+		rs.values = &deciding{build: func() map[string]any { return a.valueVars(ctx, s, r.Tenant) }, ran: map[string]run{}}
 	}
 	rs.excluded = a.excludedBy(roles, held)
 	return rs
