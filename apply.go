@@ -1917,6 +1917,9 @@ func (a *Authorizer) inTxGaining(ctx context.Context, tenant string, actor Princ
 		if err != nil {
 			return err
 		}
+		if err := a.clock.wentBack(); err != nil {
+			return err
+		}
 		if exclusive && !removals[how] {
 			if err := a.excludes(ctx, tx, tenant, e, g); err != nil {
 				return err
@@ -1941,7 +1944,7 @@ func (a *Authorizer) begin(ctx context.Context, fn func(pgx.Tx) error) error {
 	// (callClock), having picked what it holds of what is in force by the reading before (earlier).
 	// One that fails before needing the time reads it there too, so its refusal is dated where it
 	// decided: a reading from before the locks can predate a change it waited for.
-	a.clock.before, a.clock.began, a.clock.read = a.clock.at, a.clock.read, false
+	a.clock.before, a.clock.began, a.clock.read, a.clock.picked = a.clock.at, a.clock.read, false, false
 	return begin(ctx, a.db, func(tx pgx.Tx) error {
 		err := fn(watched(tx, a.clock))
 		if err != nil {

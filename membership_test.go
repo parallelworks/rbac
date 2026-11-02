@@ -6458,3 +6458,44 @@ func TestSettingMembershipsHoldsOnlyThePlacesItRemoves(t *testing.T) {
 		})
 	}
 }
+
+// A change decides at a time no earlier than the one it picks what it holds of what is in force by:
+// where the host's clock goes back between the two, as from 12:10 to 12:00 here, it would leave in
+// force at 12:00 an activation resting on the place it removes, which it didn't hold, as it had
+// ended by 12:10. It is tried again, and then ends it.
+func TestAChangeWhoseClockWentBackIsTriedAgain(t *testing.T) {
+	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	var back atomic.Bool
+	var reads atomic.Int64
+	h := grouped(t, func(c *rbac.Config) {
+		c.Now = func() time.Time {
+			if back.Load() && reads.Add(1) == 1 {
+				return base.Add(10 * time.Minute)
+			}
+			return base
+		}
+	})
+	ctx := t.Context()
+	v := h.as(t, "v", "crew")
+	if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.login", Principal: groupOf("crew"), MaxDuration: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.authz.Activate(ctx, v, cluster, rbac.Activation{Role: "cluster.login", Duration: 5 * time.Minute, Justification: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	// DeleteMembers reads the clock twice, both in its transaction: first for what it holds, then for
+	// what it decides.
+	back.Store(true)
+	remove := func() error {
+		return h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: v.Principal}})
+	}
+	if err := remove(); !errors.Is(err, rbac.ErrConflict) {
+		t.Errorf("DeleteMembers, its clock going back = %v, not tried again", err)
+	}
+	if err := remove(); err != nil {
+		t.Fatal(err)
+	}
+	if allowed(t, h, v, login, cluster) {
+		t.Error("at 12:00 v logs in through its activation, which rested on its place in crew, which is gone")
+	}
+}

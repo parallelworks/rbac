@@ -1074,9 +1074,10 @@ type callClock struct {
 	host func() time.Time
 	at   time.Time
 	read bool
-	// before is the time a change's transaction picks what it locks by (earlier), once began.
-	before time.Time
-	began  bool
+	// before is the time a change's transaction picks what it locks by (earlier), once began, and
+	// picked whether it has.
+	before        time.Time
+	began, picked bool
 }
 
 func (c *callClock) now() time.Time {
@@ -1089,7 +1090,8 @@ func (c *callClock) now() time.Time {
 // earlier is the time by which a change's transaction picks, of what is in force, what it holds
 // before it reads the time it decides at: the call's reading before the transaction or, where it
 // made none, one made now. It is no later than the time the change then decides at, so what is in
-// force at it is all that is in force then, and perhaps more.
+// force at it is all that is in force then, and perhaps more; where the host's clock goes back
+// between the two, wentBack refuses the change.
 func (c *callClock) earlier() time.Time {
 	if !c.began {
 		c.before, c.began = c.at, true
@@ -1097,7 +1099,19 @@ func (c *callClock) earlier() time.Time {
 			c.before = c.host()
 		}
 	}
+	c.picked = true
 	return c.before
+}
+
+// wentBack refuses a change whose transaction decided at a time before the one it picked what it
+// holds by (earlier), as the host's clock went back between them: what was in force then can be
+// less than what is in force when it decides, as an activation it should cut short. Tried again, it
+// reads the clock anew for both.
+func (c *callClock) wentBack() error {
+	if c == nil || !c.picked || !c.read || !c.at.Before(c.before) {
+		return nil
+	}
+	return fmt.Errorf("%w: the host's clock went back while this change took its locks; try again", ErrConflict)
 }
 
 // GrantInput is a grant Config.ValidateGrant is asked about.
