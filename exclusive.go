@@ -186,16 +186,17 @@ func (a *Authorizer) broadExcludes(ctx context.Context, tenant string, b Princip
 	}
 	// With the custom roles they name, in one statement, as a check reads them: read apart, a grant
 	// revoked and its role widened meanwhile could give two values no moment did. Only their
-	// permissions, which alone exclusiveGiven reads, and by key: as of a time, a join to them reads
-	// every role's newest version. By the tenant's scope, which the indexes seek beside the
-	// principal: by its type, which none holds, it reads every grant they hold in the tenant.
+	// permissions and types, which alone exclusiveGiven reads as current reads them, and by key: as
+	// of a time, a join to them reads every role's newest version. By the tenant's scope, which the
+	// indexes seek beside the principal: by its type, which none holds, it reads every grant they
+	// hold in the tenant.
 	rows, err := a.db.Query(ctx, `
 		WITH held AS (
 		  SELECT DISTINCT role FROM rbac_grants WHERE tenant = $1 AND scope = 'tenant:' || $1
 		    AND principal = ANY($2::text[]) AND (expires_at IS NULL OR expires_at > $3)
 		)
-		SELECT h.role, r.id IS NOT NULL, coalesce(r.permissions, '{}')
-		FROM held h LEFT JOIN (`+byKey(namedCustom("SELECT role FROM held"), "rbac_roles", "id", "id, permissions", "tenant = $1")+`) r
+		SELECT h.role, r.id IS NOT NULL, coalesce(r.permissions, '{}'), coalesce(r.resource_types, '{}')
+		FROM held h LEFT JOIN (`+byKey(namedCustom("SELECT role FROM held"), "rbac_roles", "id", "id, permissions, resource_types", "tenant = $1")+`) r
 		  ON r.id = h.role`, tenant, keys, a.cfg.Now())
 	if err != nil {
 		return false, err
@@ -204,11 +205,11 @@ func (a *Authorizer) broadExcludes(ctx context.Context, tenant string, b Princip
 	var custom []RoleDefinition
 	var id string
 	var found bool
-	var perms []string
-	if _, err := pgx.ForEachRow(rows, []any{&id, &found, &perms}, func() error {
+	var perms, types []string
+	if _, err := pgx.ForEachRow(rows, []any{&id, &found, &perms, &types}, func() error {
 		held = append(held, holding{Binding: Binding{Role: Role(id)}})
 		if found {
-			custom = append(custom, roleFrom(id, "", "", perms, nil, false, false, nil))
+			custom = append(custom, roleFrom(id, "", "", perms, types, false, false, nil))
 		}
 		return nil
 	}); err != nil {
@@ -384,16 +385,17 @@ var (
 		givesKeys: "role = ANY($5::text[])", holders: "$3",
 	}
 	// givenWithCustom are those, with $5 and $6 every built-in role giving a value, and the tenant's
-	// custom roles giving any of $6, all a custom role can give of them as current reads it, read
-	// with their grants, each a role whose holders are read beside those of $3. The custom ones' rows
-	// are read a role at a time (customRoleRows): matched against roles the statement reads, even by
-	// IN, which hashes them, a row's role is found by no index, so as of a time every version of every
-	// grant in the tenant would be read, not those history's index on roles finds. For each key,
-	// whose rows are few, a role is looked up in an array of them all, which IN would hash for each.
+	// custom roles for the tenant alone giving any of $6, all a custom role can give of them as
+	// current reads it, read with their grants, each a role whose holders are read beside those of
+	// $3. The custom ones' rows are read a role at a time (customRoleRows): matched against roles the
+	// statement reads, even by IN, which hashes them, a row's role is found by no index, so as of a
+	// time every version of every grant in the tenant would be read, not those history's index on
+	// roles finds. For each key, whose rows are few, a role is looked up in an array of them all,
+	// which IN would hash for each.
 	givenWithCustom = valuesGiven{
 		with: `custom_given(role, value) AS (
 		  SELECT r.id, p.value FROM rbac_roles r CROSS JOIN LATERAL unnest(r.permissions) AS p(value)
-		  WHERE r.tenant = $1 AND p.value = ANY($6::text[])
+		  WHERE r.tenant = $1 AND p.value = ANY($6::text[]) AND ` + tenantAloneSQL("r.resource_types") + `
 		), given(role, value) AS (
 		  SELECT * FROM unnest($5::text[], $6::text[]) UNION ALL SELECT * FROM custom_given
 		), `,

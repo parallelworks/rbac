@@ -71,7 +71,15 @@ if err := authz.Authorize(ctx, subject, "cluster:login", cluster); err != nil {
   grants that end, such as an activation, or through a membership or a place in a group that ends,
   it grants ending no later than the last of them, and never as an eligibility, a custom role's
   definition or a place in a group that outlasts it, so access approved for an hour stays an
-  hour's. A grant outlives the actor's power to change grants, though: a power held for an hour
+  hour's. An exemption from a deny is held so too: what a deny binding the actor removes, the actor
+  holds only while the deny exempts it, through the latest of its paths to the groups it exempts,
+  or its membership where it exempts the tenant's members, unless it binds the actor no longer by
+  then, and hands on no longer; an exemption by the actor's identity, or by a path that never ends,
+  bounds nothing. A deny's condition is decided as of the change, as every condition is: a grant's
+  can be handed on with it, as the actor hands on what it holds under one only under the same, but
+  a deny's can't, so one that holds only from a later time, as by reading `request.time`, bounds
+  nothing handed on before then. Time-limit an exception to a deny with a place that ends, not a
+  condition. A grant outlives the actor's power to change grants, though: a power held for an hour
   grants for good what the actor holds for good, and the roles a role it holds lists, which it
   needn't hold. Put expiries on roles that list none. A change granting a role until many times,
   as to many members each until its own, decides it once for each time that the longest lasting of
@@ -149,8 +157,11 @@ scopes conditional ones reach, to check one by one.
   these partners), and a resource carries its label (`Resource.Labels`), stored with it as its path
   is. A host declaring them supplies `Config.ResourceOf`, which gives the labels of the tenant, its
   groups and the other scopes changes reach: `New` refuses them without it, as invalid. A subject
-  holds a dimension's values as permissions, `dimension:value`, which roles for the tenant give, so
-  groups, eligibilities, expiry, conditions, denies on the tenant and history all apply to them.
+  holds a dimension's values as permissions, `dimension:value`, which roles for the tenant alone
+  give, so groups, eligibilities, expiry, conditions, denies on the tenant and history all apply to
+  them. A custom role stored for another type too, as one defined before its dimension was declared
+  can be, gives none of them, only the rest, so its grants count toward no exclusive dimension, and
+  is as privileged as though it did.
   Every check decides them, and the powers to release, on the tenant with no attributes or label,
   whatever tenant it is passed, as a check of a labeled resource reads them,
   and a change hands one on only as the actor holds it there: a condition of theirs can't read the
@@ -159,9 +170,11 @@ scopes conditional ones reach, to check one by one.
   included, fails, so a grant's gives nothing and a deny's applies; and a constraint is asked about
   that bare tenant, so one deciding them by the tenant's state reads it through its `q`. A check of
   a labeled resource asks it once about each value the label asks for that the subject's grants
-  give, of an `Ordered` dimension those as high as the label's, and nothing about the rest;
-  `Holding`, `Filter` and `Reachable`, which test any label, ask about every one, as do the changes
-  and the approval `Config.Constraints` names.
+  give, of an `Ordered` dimension those as high as the label's, and nothing about the rest, as a
+  change does for the label of each scope it checks; `Holding`, `Filter` and `Reachable`, which
+  test any label, ask about every one, as do `SetRole` and `DeleteRole`, and `ChangeMembers` taking
+  access away, which first decide whether the actor's values satisfy every label, and the approval
+  `Config.Constraints` names.
   `Authorize`, `Explain`, `Permissions`, `Holders` and `Grantable` allow nothing else of a labeled
   resource unless what the subject holds satisfies the label, whatever its grants give, its values
   read with its grants, so none allows what no moment did, nor do
@@ -178,11 +191,14 @@ scopes conditional ones reach, to check one by one.
   first asks for it, and evaluates a condition of the actor's that doesn't read the action once for
   all of them, each value still on a budget of its own, as a check of it is. For each it walks only
   the actor's grants giving values or powers to release, and of their roles only those, each role
-  read once in each phase, so the actor's grants of other roles, however many or large, cost a label
-  nothing.
-  `Filter` tests a `text[]` label column (`Columns.Labels`), which needs no
-  index, as the path's drives the query; `Reachable` returns the holding, and `Holding` with
-  `Satisfies` checks data points in a feed without reading the database.
+  read once in each phase, as every check deciding a subject's values does, so the grants of other
+  roles, however many or large, cost a label nothing.
+  `Filter` tests a `text[]` label column (`Columns.Labels`), looking each of a row's values up,
+  byte for byte, in objects of the values the holding allows that the query builds once, so a row
+  costs a few comparisons for each of its values however many the dimensions declare, in a custom
+  plan or a generic one; the column needs no index, as the path's drives the query. `Reachable`
+  returns the holding, and `Holding` with `Satisfies` checks data points in a feed without reading
+  the database.
 - **Writing labeled data:** data read under one label is written under another only if
   `Holding.MayWrite` allows it: the writer satisfies the label it read, and the new one is at
   least as restrictive in every dimension (a level as high, every compartment kept, partners
@@ -400,7 +416,8 @@ scopes conditional ones reach, to check one by one.
   asks nothing.
 - **Public access:** the zero `Subject` is anonymous and holds only what is granted to the public.
   Only a role marked `Public` can be granted to the public, and a grant to the public gives
-  nothing once its role no longer is.
+  nothing once its role no longer is. `Grants`, `Eligibilities`, `Memberships`, `MembershipsOf` and
+  `GroupsOf` take its zero principal, as a constraint may ask about it, and list nothing of it.
 - **Broad grants:** a grant to a tenant's members (`rbac.TenantMembers`) or the public never gives
   a privileged role, nor any permission that changes access, so changing access always takes a
   named identity or group.
@@ -560,26 +577,28 @@ before a prune where it is before the last record the prune deleted, as that exp
 past what the prune deleted, so where several exports read history, `through` is the cursor of the
 one furthest behind. It finds the prunes by the last record each deleted, so a prune through an
 export's cursor, which deletes nothing the export hasn't read, costs its reads nothing, however
-many there are while it catches up from the start or falls behind; an export from the start also
-reads the index's entries of the prunes before it began that deleted past its cursor, until it
-reads past them. An export that began after the prune, as one from the start after a refusal or a
-failover, reads history as the prune left it and isn't refused for it. Where a cursor stands
-can't tell the two apart; `Cursor.Horizon`, the oldest transaction running as its export began,
-does, so keep it with the cursor and each checkpoint, whose signature covers it, and never set it: a
-later one would hide a prune since the export began. A cursor without it, as one kept from an
-earlier release, is refused for any prune recorded after it that deleted a record after it, and its
-export starts again from the start. While a transaction that took its id before a prune is still
-running, a read from the start reads nothing, as its export would count the prune as one since it
-began: while prunes that delete records come faster than the longest transactions end, as they can
-while working through a long backlog, no export from the start begins. Run it on a connection of the
-administrator's role below, which has the rights of history's owner, as the application's hasn't,
-and keep what the host's audit retention requires: the federal floor is at least a year. A delete
-from history that no prune its transaction records reaches, as one by hand, is refused as the
-transaction commits, so no delete through history's triggers leaves an export reading on past what
-it removed: `History` counts every prune of a transaction from an export's `Horizon` on, whatever
-the id its record holds, which history's owner can choose, as the trigger lets a delete through for
-any. Disabling the triggers takes a role with the rights of history's owner, which the signed chain
-is kept against.
+many there are while it catches up from the start or falls behind, and whatever history's
+statistics count of them, as none before an analysis samples one; a prune reads only those of its
+own time and cursor to go on from where the last stopped, and `AsOf` only the latest, so too. An
+export from the start also reads the index's entries of the prunes before it began that deleted
+past its cursor, until it reads past them. An export that began after the prune, as one from the
+start after a refusal or a failover, reads history as the prune left it and isn't refused for it.
+Where a cursor stands can't tell the two apart; `Cursor.Horizon`, the oldest transaction running as
+its export began, does, so keep it with the cursor and each checkpoint, whose signature covers it,
+and never set it: a later one would hide a prune since the export began. A cursor without it, as one
+kept from an earlier release, is refused for any prune recorded after it that deleted a record after
+it, and its export starts again from the start. While a transaction that took its id before a prune
+is still running, a read from the start reads nothing, as its export would count the prune as one
+since it began: while prunes that delete records come faster than the longest transactions end, as
+they can while working through a long backlog, no export from the start begins. Run it on a
+connection of the administrator's role below, which has the rights of history's owner, as the
+application's hasn't, and keep what the host's audit retention requires: the federal floor is at
+least a year. A delete from history that no prune its transaction records reaches, as one by hand,
+is refused as the transaction commits, so no delete through history's triggers leaves an export
+reading on past what it removed: `History` counts every prune of a transaction from an export's
+`Horizon` on, whatever the id its record holds, which history's owner can choose, as the trigger
+lets a delete through for any. Disabling the triggers takes a role with the rights of history's
+owner, which the signed chain is kept against.
 
 A role that owns a table can change it whatever its triggers say, and a schema's owner can drop
 any table in it. So that the application's database role can't rewrite history or write around
@@ -601,9 +620,10 @@ have the server load a library or run a program of its choosing; and:
 2. A role of history's own, which the administrator's role is a member of and the application's
    isn't, owns `rbac_history` and the function `rbac_record`: transfer them to it after migrating.
    It needs `USAGE` on the schema, since every write to the package's tables runs `rbac_record`
-   as it; `EXECUTE` on the functions `rbac_tenant_keys` and `rbac_text_array`, which history's
-   index of the keys denies name calls for each record, and which every role has unless it is
-   revoked; and `CREATE` there to be given them, unless a superuser gives them.
+   as it, which refuses the write without it; `EXECUTE` on the functions `rbac_tenant_keys` and
+   `rbac_text_array`, which history's index of the keys denies name calls for each record, and
+   which every role has unless it is revoked; and `CREATE` there to be given them, unless a
+   superuser gives them.
 3. The application's role has `USAGE` on the package's schema, without which it reads none of its
    tables; `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the package's tables but `rbac_history` and
    `rbac_migrations`, and on any a later migration adds; `EXECUTE` on the functions
@@ -629,7 +649,10 @@ tables and types before any schema's of the same name until it ends, which in a 
 after the call that made one. One named as a package's table stands in for it in that session,
 whose checks are the application's own to make; `History`, `Export` and `PruneHistory`, and
 `AsOf`'s checks of history, name history's table by the package's schema and their types by
-pg_catalog's, so none stands in for them, and refuse a search_path that names pg_temp first.
+pg_catalog's, so none stands in for them, and refuse a search_path that names pg_temp first. And
+history's triggers find history beside the table each fires on, whatever the schema is named, or
+refuse the row where their search_path can't name that schema, so none stands in for the history a
+change is recorded in, or a prune checked against.
 
 ## Running it
 
@@ -641,8 +664,9 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   failure leaves the database at the last migration recorded, from which migrating again goes on.
   The package's calls don't check what the database was migrated to: make them from a replica only
   once its own migrations are applied, as `Migrate` returning nil says.
-  On a host's transaction it applies them all in one savepoint, and refuses any isolation but READ
-  COMMITTED: a stricter one's snapshot would miss the writes it waits for.
+  On a host's transaction, a `pgx.Tx` or a `DB` whose `Begin` gives a savepoint of one, it applies
+  them all in one savepoint, and refuses any isolation but READ COMMITTED: a stricter one's snapshot
+  would miss the writes it waits for.
   A migration locks what it changes until it commits, and while it waits for a lock, every check,
   list and change of that table queues behind it, and of those it locked already. So `Migrate` has
   it wait at most 100 ms for any lock: a change that reads the tables in another order than a
@@ -736,6 +760,25 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   that fell behind, or since an export catching up from the start began, from history's rows, twice
   in each call and once in each window of a prune: a read of one record from such a cursor took
   1.3 ms with no prune since, 14 ms with 20,000 and 78 ms with 80,000, and with it 1.2 ms with any.
+  `0023_history_schema` replaces `rbac_record` and `rbac_history_pruned`, which keep their owners
+  and who may execute them, so history's role still owns `rbac_record`. It takes no lock on the
+  tables: changes go on while it is applied, each recorded as before until it commits. Each
+  function then finds history in the schema of the table it fires on, which costs a row recorded
+  about a microsecond of the 70 to 100 it takes, and refuses the row where its search_path can't
+  name that schema: a search_path reads `$user`, however it is quoted, as a role's name, and leaves
+  out a schema the role has no `USAGE` on.
+- **Renaming the schema:** from `0023_history_schema` on, `ALTER SCHEMA ... RENAME` keeps history:
+  its triggers find it beside the table each fires on, whatever the schema is named, and a
+  generation names the schema by its OID, so exports read on from their cursors and checkpoints.
+  Migrate to it first: before it, they find history by the name the schema had when they were
+  made, so after a rename a change fails, or is recorded in a table its session made of its own,
+  and a prune recorded in such a table lets a delete from history through. Rename while nothing
+  reaches the tables, and then set the search_path of every role and pool to the new name: changes
+  wait for each other by locks named for the schema, so one under way by the old name holds none
+  back by the new, and a session still on the old name finds no tables, or tables of its own of
+  those names. Never name the schema `$user`, which no search_path can name: every change there is
+  refused. Never move one of the package's tables to another schema: its changes would be recorded
+  in that schema's history, or with none there, in a session's own table of its name.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A call PostgreSQL refuses for a race, as a
   serialization failure, a deadlock between host transactions, or a lock it waited for past the
@@ -747,9 +790,15 @@ pg_catalog's, so none stands in for them, and refuse a search_path that names pg
   roll the host's transaction back and run it again from its start, not the call alone in it: a
   statement refused on that transaction itself, as most reads', a hook's or one a change makes
   before its savepoint, aborts it, and one refused in a savepoint, as a change's, `AsOf`'s or
-  `History`'s, leaves it holding what it took before the call, which the race can be over. Changes
-  to the same rows wait for each other by locks named for the schema holding the tables, so
-  sessions reaching them through different search_paths still do.
+  `History`'s, leaves it holding what it took before the call, which the race can be over. The
+  signer `Export` and `Checkpoint.Sign` are given is a hook too. A hook's error is read in the
+  order `errors.Is` and `errors.As` read it, however many errors it holds, to the first race or
+  `ErrConflict` in it, and once ten thousand or so of them are read, each one once: one whose tree
+  holds itself, as a host's type wrapping itself by mistake can, which they read forever, a call
+  reads round until then and returns, though the host's own `errors.Is` of what it returns, or of
+  what `Config.OnRefused` is told, can still read it forever. Changes to the same rows wait for
+  each other by locks named for the schema holding the tables, so sessions reaching them through
+  different search_paths still do.
 - **What the host passes:** a check reads grants, memberships and groups as they are; only compiled
   conditions are cached. Read a resource's ancestors and attributes from where they are stored,
   never from request input, no earlier than the content they protect, and from the primary. A

@@ -190,13 +190,18 @@ func roleFrom(id, name, description string, perms, types []string, privileged, p
 // its ids were read. The custom ones are read in the same statement, so a role redefined reaches
 // searches as it reaches checks, and by key: a search's ids are those its grants name (namedCustom)
 // or broadArgs read, and read by the tenant, every custom role of it was, as of a time every version.
-func givingSQL(builtin, tenant, perm, resourceType string, custom bool, ids string, public bool) string {
+// With alone, for a label value or a power to release, only those for the tenant alone, as current
+// reads them.
+func givingSQL(builtin, tenant, perm, resourceType string, custom bool, ids string, public, alone bool) string {
 	// Without custom the subquery stays, constant false, so the statement's arguments are the
 	// same and PostgreSQL plans it away.
 	where := fmt.Sprintf(`%t AND cr.tenant = %s::text AND %s::text = ANY(cr.permissions) AND %s::text = ANY(cr.resource_types)`,
 		custom, tenant, perm, resourceType)
 	if public {
 		where += " AND cr.public"
+	}
+	if alone {
+		where += " AND " + tenantAloneSQL("cr.resource_types")
 	}
 	return fmt.Sprintf(`(%s::text[] || ARRAY(%s))`, builtin, byKey(ids, "rbac_roles cr", "cr.id", "cr.id", where))
 }
@@ -951,6 +956,10 @@ type reached struct {
 
 func (r reached) any() bool { return len(r.own)+len(r.listed) > 0 }
 
+// more reports whether the change gives more on a scope it reaches: where a grant or eligibility
+// there will give more, or a role granted there lets its holders grant the role as it will be.
+func (r reached) more() bool { return len(r.widened)+len(r.listed) > 0 }
+
 // types are the types of the scopes its grants and eligibilities are on.
 func (r reached) types() []string {
 	var types []string
@@ -1079,13 +1088,14 @@ func (a *Authorizer) handingOn(custom map[Role]RoleDefinition, id Role, def Role
 // whose holders may grant it without holding it is granted on (handingOn) keeps the actor from
 // granting it there as it will be, as they then may (scopesDenied), or where that scope's label
 // refuses the actor. Only a deny on a scope other than the tenant can remove more there than the
-// tenant's, which mayDefine and changesDenied check, so only where one binds the actor, or a label
-// could refuse it, as none can where the actor's label values satisfy every label, is the host
-// asked about the scopes. Where none of the grants and eligibilities on a scope will give more, nor
-// would so, as for deleting or narrowing the role, which there only takes access away, and no role
-// listing it is granted there to hand it on, a scope the host no longer has (ErrNotFound) is read
-// as stored, with no containers or label, which stillReaches refuses once the change gives more
-// there. au is the actor's authority on the tenant, which mayDefine checked the role on.
+// tenant's, which mayDefine and changesDenied check, so only where one binds the actor, or exempts
+// it only until a time where the change gives more on a scope, or a label could refuse it, as none
+// can where the actor's label values satisfy every label, is the host asked about the scopes.
+// Where none of the grants and eligibilities on a scope will give more, nor would so, as for
+// deleting or narrowing the role, which there only takes access away, and no role listing it is
+// granted there to hand it on, a scope the host no longer has (ErrNotFound) is read as stored, with
+// no containers or label, which stillReaches refuses once the change gives more there. au is the
+// actor's authority on the tenant, which mayDefine checked the role on.
 func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authority, tenant string, id Role, types []string, d *redefinition,
 	change string,
 ) (roleReach, error) {
@@ -1103,7 +1113,7 @@ func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authorit
 	}
 	denied := false
 	if scopes.any() {
-		if denied, err = a.deniedBelow(ctx, a.db, tenant, actor); err != nil {
+		if denied, err = a.deniedBelow(ctx, a.db, tenant, actor, scopes.more()); err != nil {
 			return roleReach{}, err
 		}
 	}
@@ -1141,7 +1151,7 @@ func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authorit
 		}
 		r, err := a.resourceOf(ctx, tenant, s)
 		switch {
-		case !scopes.widened[s] && scopes.listed[s] == nil && errors.Is(err, ErrNotFound):
+		case !scopes.widened[s] && scopes.listed[s] == nil && matches(err, ErrNotFound):
 			r = Resource{Tenant: tenant, Type: s.Type, ID: s.ID}
 			if reach.gone == nil {
 				reach.gone = map[Scope]bool{}
@@ -1203,7 +1213,7 @@ func (a *Authorizer) stillReaches(ctx context.Context, tx pgx.Tx, actor Subject,
 	}
 	denied := false
 	if scopes.any() {
-		if denied, err = a.deniedBelow(ctx, tx, tenant, actor); err != nil {
+		if denied, err = a.deniedBelow(ctx, tx, tenant, actor, scopes.more()); err != nil {
 			return err
 		}
 	}
@@ -1245,13 +1255,20 @@ func (a *Authorizer) stillReaches(ctx context.Context, tx pgx.Tx, actor Subject,
 }
 
 // deniedBelow reports, reading on q, whether a deny on a scope other than the tenant binds the
-// actor, as heldOrDenied reads the denies on a path. They are found by the keys it is bound by
-// (naming), so the tenant's denies of others aren't read.
-func (a *Authorizer) deniedBelow(ctx context.Context, q DB, tenant string, actor Subject) (bool, error) {
+// actor, or, for a change that gives more there (exempting), exempts it only until a time, as
+// authorities reads the denies on a path: one taking access away hands nothing on, so such a deny
+// can't refuse it. They are found by the keys it is bound by (naming), so the tenant's denies of
+// others aren't read, and its paths to its groups are walked only for one exempting it.
+func (a *Authorizer) deniedBelow(ctx context.Context, q DB, tenant string, actor Subject, exempting bool) (bool, error) {
+	ctes, until := keysSQL("$1::text", "$2::text", "$3"), ""
+	if exempting {
+		ctes += `, ` + endsSQL("$2::text", "$3") + `, ` + lastingSQL("$1::text", "$2::text")
+		until = ` OR ` + exemptUntilSQL("principals", "exempt") + ` IS NOT NULL`
+	}
 	var denied bool
-	err := q.QueryRow(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`
+	err := q.QueryRow(ctx, `WITH RECURSIVE `+ctes+`
 		SELECT EXISTS (SELECT FROM rbac_denies WHERE `+naming("principals", "ARRAY(SELECT k FROM bound)")+` AND scope_type <> $4
-		  AND NOT exempt && ARRAY(SELECT k FROM exempted))`,
+		  AND (NOT exempt && ARRAY(SELECT k FROM exempted)`+until+`))`,
 		tenant, actor.identityKey(), a.cfg.Now(), TenantScope).Scan(&denied)
 	return denied, err
 }
@@ -1287,7 +1304,7 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 			return &DeniedError{Permission: manage, Scope: on[i].Scope(), Reason: "removed by a deny, which stops " + change}
 		}
 	}
-	if reach.redefined == nil || len(scopes.widened)+len(scopes.listed) == 0 {
+	if reach.redefined == nil || !scopes.more() {
 		return nil
 	}
 	def := reach.redefined.now
@@ -1295,7 +1312,7 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 	// removes what that one does, so a role granted on thousands of resources is decided against a
 	// few. Where no grant or eligibility will give more, the role hands nothing more on.
 	var distinct []int
-	seen := map[string]bool{}
+	seen := map[alikeKey]bool{}
 	for i, at := range own {
 		if !scopes.widened[scopes.own[i]] {
 			continue
@@ -1307,7 +1324,7 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 	}
 	removedOn := func(p Permission) (Scope, bool) {
 		for _, i := range distinct {
-			if own[i].handsOn(p) {
+			if own[i].handsOnForGood(p) {
 				return on[i].Scope(), true
 			}
 		}
@@ -1328,17 +1345,22 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 	// Where a role listing it, or listing one that does, is granted, its holders may grant it on
 	// scopes of each type there as it will be: so must the actor, under the denies there, as mayDefine
 	// checks across the tenant.
-	asked := map[string]bool{}
+	type typeAlike struct {
+		alike alikeKey
+		t     string
+	}
+	asked := map[typeAlike]bool{}
 	for i, at := range listing {
 		r := on[len(own)+i]
+		alike := a.alike(at, r)
 		for _, t := range scopes.listed[r.Scope()] {
-			k := a.alike(at, r) + " " + t
+			k := typeAlike{alike, t}
 			if asked[k] {
 				continue
 			}
 			asked[k] = true
 			there := au
-			there.handsOn = orDenied(au.handsOn, at.handsOn)
+			there.handsOn = orDenied(au.handsOn, at.handsOnForGood)
 			if missing, _, ok := a.mayGrant(there, there.under(t, "", time.Time{}), t, def, "", time.Time{}, newChecked()); !ok {
 				reason := fmt.Sprintf("removed by a deny there, which stops %s, as the holders of a role granted there may grant it on a %s without holding it, which the actor can't", change, t)
 				return cmp.Or(au.constrained.failed(), error(&DeniedError{Permission: missing, Scope: r.Scope(), Reason: reason}))
@@ -1349,24 +1371,45 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 }
 
 // alike is the same for two scopes whose authorities, on and another, remove the same from what the
-// actor hands on: the same grants it holds on their paths, and the same denies, and where one of
-// those has a condition, which can read a resource, the same scope, but on containers, where what
-// the actor hands on reaches resources the condition can't read.
-func (a *Authorizer) alike(on authority, r Resource) string {
-	var b strings.Builder
+// actor hands on: the same grants it holds on their paths, the same denies, and the same denies
+// that exempt it only until a time; and where one of those has a condition, which can read a
+// resource, the same scope, but on containers, where what the actor hands on reaches resources the
+// condition can't read, as long a path: the denies' conditions are evaluated within a budget for
+// each scope of it (newDenyBudget), so those stored past their bound, as before there were bounds,
+// can fail closed on a shorter path alone.
+func (a *Authorizer) alike(on authority, r Resource) alikeKey {
+	var held, denials, exempting strings.Builder
 	for _, h := range on.held {
-		b.WriteString(h.ID + " ")
+		held.WriteString(h.ID + "\x00")
 	}
-	b.WriteString("|")
 	conditional := false
 	for _, d := range on.denials {
-		b.WriteString(d.scope + " " + d.id + " ")
+		denials.WriteString(d.scope + "\x00" + d.id + "\x00")
 		conditional = conditional || d.condition != ""
 	}
-	if conditional && !a.contains(r.Type) {
-		b.WriteString("|" + r.Scope().Key())
+	for _, e := range on.exemptions {
+		exempting.WriteString(e.scope + "\x00" + e.id + "\x00")
+		conditional = conditional || e.condition != ""
 	}
-	return b.String()
+	k := alikeKey{held: held.String(), denials: denials.String(), exemptions: exempting.String()}
+	switch {
+	case !conditional:
+	case a.contains(r.Type):
+		k.depth = len(r.path())
+	default:
+		k.scope = r.Scope()
+	}
+	return k
+}
+
+// alikeKey is what alike tells scopes apart by: the ids of the grants, and the scopes and ids of
+// the denies and of those exempting the actor until a time, each ended by a NUL, which no stored
+// text holds, as a scope's id can hold any other character; and where a deny's condition can tell
+// them apart, the scope, or a container's depth.
+type alikeKey struct {
+	held, denials, exemptions string
+	scope                     Scope
+	depth                     int
 }
 
 // labeling is what roleReachOf checked of the labels of the scopes a custom role's grants and
@@ -1678,16 +1721,35 @@ func (a *Authorizer) customRoles(ctx context.Context, q DB, tenant string) ([]Ro
 // are public only while every permission they give is one an unprivileged role gives, and are
 // privileged when they give what only privileged roles do, or change access, as every role that
 // lists grantable roles does. The stored flag counts for nothing: it can stand for a catalog
-// since changed.
+// since changed. One stored for another type than the tenant too gives no label value or power to
+// release, as SetRole refuses to define (checkCustom), though one defined before its dimension was
+// declared can be: given below the tenant, a value would be decided by grants a check of it doesn't
+// read, so Authorize and Permissions could disagree. It is privileged and public as it is whole.
 func (a *Authorizer) current(roles []RoleDefinition) []RoleDefinition {
 	for i, r := range roles {
+		alone := forTenantAlone(r.ResourceTypes)
 		r.Permissions = slices.DeleteFunc(r.Permissions, func(p Permission) bool { return !a.permissions[p] })
 		r.ResourceTypes = slices.DeleteFunc(r.ResourceTypes, func(t string) bool { return !a.types[t] })
 		r.Public = r.Public && !a.privileged(r) && !r.managesAccess()
 		r.Privileged = a.privileged(r) || r.managesAccess()
+		if !alone {
+			r.Permissions = slices.DeleteFunc(r.Permissions, a.labelPermission)
+		}
 		roles[i] = r
 	}
 	return roles
+}
+
+// forTenantAlone reports whether a custom role's stored types are the tenant's alone, as
+// tenantAloneSQL tests them.
+func forTenantAlone(types []string) bool {
+	return len(types) > 0 && !slices.ContainsFunc(types, func(t string) bool { return t != TenantScope })
+}
+
+// tenantAloneSQL is SQL for whether a custom role's stored types, col, are the tenant's alone, of
+// which current reads a role giving label values or powers to release only where they are.
+func tenantAloneSQL(col string) string {
+	return fmt.Sprintf(`(%[1]s <@ ARRAY['%[2]s'] AND '%[2]s' = ANY(%[1]s))`, col, TenantScope)
 }
 
 // customGives reports whether a custom role can give p on a resource type: only a permission

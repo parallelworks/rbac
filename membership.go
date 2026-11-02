@@ -1188,7 +1188,7 @@ func (a *Authorizer) groupLabeled(ctx context.Context, tenant, id string, labels
 // removal reads any scope, and gone set.
 func (a *Authorizer) groupOf(ctx context.Context, tenant, id string, removing bool) (group Resource, gone bool, err error) {
 	group, _, err = a.hostResource(ctx, tenant, Scope{Type: GroupScope, ID: id})
-	if removing && errors.Is(err, ErrNotFound) {
+	if removing && matches(err, ErrNotFound) {
 		return Resource{Tenant: tenant, Type: GroupScope, ID: id}, true, nil
 	}
 	return group, false, err
@@ -2708,7 +2708,7 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 		var err error
 		c.on, err = a.resourceOf(ctx, tenant, s)
 		switch {
-		case leaving && errors.Is(err, ErrNotFound):
+		case leaving && matches(err, ErrNotFound):
 			c.on = Resource{Tenant: tenant, Type: s.Type, ID: s.ID}
 		case err != nil:
 			return nil, err
