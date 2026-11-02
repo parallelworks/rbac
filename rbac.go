@@ -532,9 +532,10 @@ type Constraint struct {
 // decided: a protobuf message among them copied by its fields, each message it reaches once, so one
 // holding itself is given as a copy holding itself, as a map holding itself is. A message of a
 // host's type that is its own reflection but makes messages of another, as one embedding a dynamic
-// message does, is copied as any other pointer of the host's type, by the struct it points to, its
-// message a copy of its own, so a constraint reads the type the host passed, in a list, a field or
-// a map of that type too. Past 20,000 deep, twice as deep as any condition reads, a copy holds zero
+// message does, is copied as any other pointer of the host's type, by the struct it points to, so a
+// constraint reads the type the host passed, in a list, a field or a map of that type too: its
+// message is a copy of its own where the field embedding it is exported, as embedding it by its
+// type's name makes it, and shared, as below, where it isn't. Past 20,000 deep, twice as deep as any condition reads, a copy holds zero
 // values, but for what it copied less deep, as copying deeper would overflow the stack. A host's
 // struct among the attributes is copied by its exported fields and those an unexported struct it
 // embeds promotes: the rest, a pointer it embeds unexported and the fields that promotes among
