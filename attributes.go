@@ -620,6 +620,12 @@ func (c *converter) message(v reflect.Value) (ref.Val, int) {
 			return types.NewRefValList(types.DefaultTypeAdapter, out), height + 1
 		})
 	case *structpb.Value:
+		// A kind that is a nil of its type, as `Kind: (*structpb.Value_StructValue)(nil)`, is none to
+		// protobuf's reflection, and so to a hook's copy, as an unset kind is; reading what it holds
+		// panicked, outside any condition, ending the check.
+		if k := reflect.ValueOf(m.GetKind()); k.IsValid() && k.IsNil() {
+			return types.NullValue, 1
+		}
 		var held reflect.Value
 		switch k := m.GetKind().(type) {
 		case *structpb.Value_NumberValue:

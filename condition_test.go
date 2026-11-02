@@ -2175,6 +2175,7 @@ func TestFiniteValuesDecideAsCELDoes(t *testing.T) {
 		"a Value":  {structpb.NewStringValue("a"), "a"}, "a null Value": {structpb.NewNullValue(), nil},
 		"a NullValue": {structpb.NullValue_NULL_VALUE, nil}, "a wrapper": {wrapperspb.Int64(3), 3},
 		"a timestamp": {timestamppb.New(at), at}, "a duration": {durationpb.New(time.Minute), time.Minute},
+		"a Value whose kind is a nil of its type": {&structpb.Value{Kind: (*structpb.Value_StructValue)(nil)}, nil},
 		"a list": {[]any{"a", 0.5}, []any{"a", 0.5}}, "a map": {map[string]any{"a": "a"}, map[string]any{"a": "a"}},
 		"an id": {[16]byte{1}, id}, "ids": {[][16]byte{{1}}, []any{id}}, "bytes": {[]byte("a"), []byte("a")},
 		"a list of a type's name": {[]any{"int", "a"}, []any{"int", "a"}}, "a named string": {named("a"), "a"},
