@@ -243,7 +243,9 @@ erDiagram
   delete reached by a prune its transaction records. Both triggers find history in the schema of
   the table they fire on, by a search_path each sets for its own run, so a session's own table
   named as history's stands in for none of it, whatever the schema is named, and refuse the row
-  where that search_path can't name the schema, as `$user` or one their role has no `USAGE` on.
+  where that search_path can't name the schema, as `$user` or one their role has no `USAGE` on,
+  before they read a table or call anything by it, so nothing such a table runs, as its row
+  security policy, runs as history's role.
   Each record reads its key's last by history's index of each entity's keys, in a generic plan with
   sequential scans off: a plan its session made while history was small would otherwise scan all
   of it for each row, and one made for each row, until history is analyzed, read all of the
