@@ -780,8 +780,9 @@ changing it. A lock no id names, a tenant's own, its exclusive values' or `Migra
 key as two int4 keys, which PostgreSQL holds apart from every bigint key, as a scope's or a
 principal's lock takes: no id an actor chooses reaches one, however the hash fares. The batch
 taking a change's locks reads the schema too, and names them by the schema the process's last
-locks were taken in, taking each only where the tables are there: where they aren't, it takes
-none, and the change takes them all again by the schema read, a round trip more (`takeLocks`).
+locks were taken in, taking each only where its statement finds the tables there: unless each
+did, the change takes them all again by the schema the batch read first, a round trip more
+(`takeLocks`), so a schema renamed while the batch waits leaves none of the later ones untaken.
 The locks last until the transaction ends, so under `WithTx` two host transactions changing the
 same scopes or principals in opposite orders can still deadlock, as can a change that also writes
 rows it doesn't lock: PostgreSQL fails one, which matches `ErrConflict`.

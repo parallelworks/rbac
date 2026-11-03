@@ -3373,23 +3373,111 @@ func TestChangesInTwoSchemasNeverShareALock(t *testing.T) {
 		}
 		return map[int64]int16{rbac.LockKey(schema, "tenant", "t1", ""): 2, rbac.LockKey(schema, "principal", "t1", "user:u"): 1}
 	}
-	// Each lock's 64 bits, and whether it takes them as one bigint (1) or two int4s (2).
-	rows, err := tx.Query(ctx, `SELECT classid, objid, objsubid FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()`)
+	if got, want := advisoryHeld(t, tx), keys(second); !maps.Equal(got, want) {
+		t.Errorf("the second schema's change holds %v, not its own %v (the first's are %v)", got, want, keys(first))
+	}
+}
+
+// advisoryHeld is each advisory lock tx holds, by its 64 bits, and whether it takes them as one
+// bigint (1) or two int4s (2).
+func advisoryHeld(t *testing.T, tx pgx.Tx) map[int64]int16 {
+	t.Helper()
+	rows, err := tx.Query(t.Context(), `SELECT classid, objid, objsubid FROM pg_locks
+		WHERE locktype = 'advisory' AND granted AND pid = pg_backend_pid()`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := map[int64]int16{}
+	held := map[int64]int16{}
 	var high, low uint32
 	var form int16
 	if _, err := pgx.ForEachRow(rows, []any{&high, &low, &form}, func() error {
-		got[int64(uint64(high)<<32|uint64(low))] = form
+		held[int64(uint64(high)<<32|uint64(low))] = form
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	want := keys(second)
+	return held
+}
+
+// A change whose locks are keyed for the schema the process's last were taken in takes every one,
+// though the schema is renamed while it waits for one of them: the statements after that wait find
+// the tables in a schema of another name and take none, so it takes them all again, named by the
+// schema its batch read first, rather than go on without them.
+func TestAChangeTakesEveryLockThoughItsSchemaIsRenamedAsItWaits(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	var schema string
+	if err := h.pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	scopes, principals := []string{cluster.Scope().Key()}, []string{"user:u"}
+	// So the process's last locks were taken in this schema.
+	if err := pgx.BeginFunc(ctx, h.pool, func(tx pgx.Tx) error { return rbac.Lock(ctx, tx, "t1", scopes, principals) }); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Rollback(ctx) }()
+	if _, err := holder.Exec(ctx, `SELECT pg_advisory_xact_lock($1::bigint)`, rbac.LockKey(schema, "scope", "t1", scopes[0])); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var pid int32
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid() FROM set_config('lock_timeout', '5s', true)`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- rbac.Lock(ctx, tx, "t1", scopes, principals) }()
+	for waiting := false; !waiting; {
+		select {
+		case err := <-done:
+			t.Fatalf("the change didn't wait for the scope's lock: %v", err)
+		default:
+			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity
+				WHERE pid = $1 AND wait_event_type = 'Lock' AND wait_event = 'advisory')`, pid).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	rename := func(from, to string) error {
+		ctx := context.WithoutCancel(ctx)
+		return pgx.BeginFunc(ctx, h.pool, func(admin pgx.Tx) error {
+			_, err := admin.Exec(ctx, `SET LOCAL lock_timeout = '1s'; ALTER SCHEMA `+pgx.Identifier{from}.Sanitize()+` RENAME TO `+pgx.Identifier{to}.Sanitize())
+			return err
+		})
+	}
+	renamed := schema + "_renamed"
+	if err := rename(schema, renamed); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := rename(renamed, schema); err != nil {
+			t.Error(err)
+		}
+	}()
+	if err := holder.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	want := map[int64]int16{
+		rbac.LockKey(schema, "tenant", "t1", ""):               2,
+		rbac.LockKey(schema, "scope", "t1", scopes[0]):         1,
+		rbac.LockKey(schema, "principal", "t1", principals[0]): 1,
+	}
+	got := advisoryHeld(t, tx)
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if !maps.Equal(got, want) {
-		t.Errorf("the second schema's change holds %v, not its own %v (the first's are %v)", got, want, keys(first))
+		t.Errorf("the change holds %v, not every lock of its own %v", got, want)
 	}
 }
 

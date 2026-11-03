@@ -459,9 +459,10 @@ const tablesSchema = `(SELECT n.nspname FROM pg_catalog.pg_class c
 
 // lockSchema is the schema the last locks were taken in, which the next are taken in first: a
 // process's changes nearly all reach the tables in one schema, which they so name without a round
-// trip to read it first. Each lock is taken only where the tables are in that schema, which the
-// batch's first statement reads: where they aren't, it takes none, and the change takes them all
-// again, named by the schema read.
+// trip to read it first. Each lock is taken only where its statement finds the tables in that
+// schema, and returns a row where it does: unless every one did, the change takes them all again,
+// named by the schema the batch's first statement read. Not by that read alone, as a schema
+// renamed while the batch waits for a lock has the statements after it take none.
 var lockSchema atomic.Pointer[string]
 
 // takeLocks takes locks, in order, in the schema holding the tables tx reaches.
@@ -469,17 +470,21 @@ func takeLocks(ctx context.Context, tx pgx.Tx, locks ...advisory) error {
 	guess := lockSchema.Load()
 	b := &pgx.Batch{}
 	b.Queue(`SELECT current_setting('transaction_isolation'), ` + tablesSchema)
+	taken := 0
 	if guess != nil {
 		for _, l := range locks {
 			sql, args := l.taking(*guess)
-			b.Queue(sql+` WHERE `+tablesSchema+` = $`+strconv.Itoa(len(args)+1), append(args, *guess)...)
+			b.Queue(sql+` WHERE `+tablesSchema+` = $`+strconv.Itoa(len(args)+1), append(args, *guess)...).Exec(func(tag pgconn.CommandTag) error {
+				taken += int(tag.RowsAffected())
+				return nil
+			})
 		}
 	}
 	var schema string
 	if err := locked(tx.SendBatch(ctx, b), &schema); err != nil {
 		return err
 	}
-	if guess != nil && *guess == schema {
+	if guess != nil && taken == len(locks) {
 		return nil
 	}
 	lockSchema.Store(&schema)

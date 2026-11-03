@@ -807,6 +807,9 @@ func LockKey(schema, kind, tenant, key string) int64 {
 	return lockKey(lockName(schema, kind, tenant, key))
 }
 
+// Lock takes a change's locks in tx: its tenant's shared, then each of its scopes' and principals'.
+var Lock = lock
+
 // HoldSQL is the statement Activate holds the places it rests on and reads its subject's paths
 // with: tenant $1, the identity's key $2, now $3, until $4.
 var HoldSQL = holdSQL
