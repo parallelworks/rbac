@@ -17,6 +17,7 @@ import (
 	"cel.dev/cel-go/cel"
 	"cel.dev/cel-go/common/types"
 	"cel.dev/cel-go/common/types/ref"
+	"cel.dev/cel-go/common/types/traits"
 	"cel.dev/cel-go/interpreter"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -752,6 +753,119 @@ func Converting(t *testing.T, attributes map[string]any) (allocated uint64, over
 	c.attributes(attributes)
 	runtime.ReadMemStats(&after)
 	return after.TotalAlloc - before.TotalAlloc, c.over
+}
+
+// ConvertedInOrder is whether a check converting kinds' attributes in the order given, by one
+// converter, could read each, and whether they cost more than a check converts, which fails them
+// all.
+func ConvertedInOrder(t *testing.T, kinds ...map[string]any) (read []bool, over bool) {
+	t.Helper()
+	c := newConverter()
+	for _, attributes := range kinds {
+		_, ok := c.attributes(attributes)
+		read = append(read, ok)
+	}
+	return read, c.over
+}
+
+// CollectBetweenKinds collects garbage before each kind's attributes are converted, until t ends,
+// as any allocation converting makes may.
+func CollectBetweenKinds(t *testing.T) {
+	t.Helper()
+	old := convertingKind
+	convertingKind = runtime.GC
+	t.Cleanup(func() { convertingKind = old })
+}
+
+// AttributesRead is what conditions read of the subject's, the resource's and the request's
+// attributes, written out, in n checks of what a user may do to a cluster, the ith on check(i)'s
+// context, carrying its request, by a subject and of a resource with check(i)'s attributes:
+// together, the checks of one call, which share what it converted of a subject's and a request's
+// (askingOf), and alone, each a call of its own, made first. Before each check of the call,
+// between runs, where not nil, as a host's hook might.
+func AttributesRead(t *testing.T, n int, check func(i int) (ctx context.Context, subject, resource map[string]any),
+	between func(i int),
+) (together, alone [][3]string) {
+	t.Helper()
+	at := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	call := func() *Authorizer { return (&Authorizer{cfg: Config{Now: func() time.Time { return at }}}).still() }
+	read := func(a *Authorizer, i int) [3]string {
+		ctx, subject, resource := check(i)
+		vars := a.vars(ctx, Subject{Principal: Principal{Kind: User, ID: "u"}, Attributes: subject}, "cluster:login",
+			Resource{Tenant: "t", Type: "cluster", ID: "c", Attributes: resource})
+		var out [3]string
+		for j, kind := range []string{"subject", "resource", "request"} {
+			of, _ := vars[kind].(map[string]any)
+			out[j] = written(of["attributes"])
+		}
+		return out
+	}
+	for i := range n {
+		alone = append(alone, read(call(), i))
+	}
+	a := call()
+	for i := range n {
+		if between != nil {
+			between(i)
+		}
+		together = append(together, read(a, i))
+	}
+	return together, alone
+}
+
+// Unreadable is how AttributesRead writes out attributes no condition reads.
+const Unreadable = "unreadable"
+
+// WithoutRequest is ctx carrying no request's attributes for conditions to read, as for an approver.
+func WithoutRequest(ctx context.Context) context.Context { return withoutRequest(ctx) }
+
+// written is v, a kind's attributes as conditions read them, written out, so that two are written
+// alike where conditions read them alike: those no condition reads as such, and a map's entries
+// sorted.
+func written(v any) string {
+	var b strings.Builder
+	writeOut(&b, v)
+	return b.String()
+}
+
+func writeOut(b *strings.Builder, v any) {
+	switch v := v.(type) {
+	case refusedAttributes:
+		if v.all {
+			b.WriteString(Unreadable)
+			return
+		}
+		b.WriteString("refusing ")
+		writeOut(b, v.Mapper)
+	case traits.Mapper:
+		var entries []string
+		for it := v.Iterator(); it.HasNext() == types.True; {
+			k := it.Next()
+			entries = append(entries, written(k)+": "+written(v.Get(k)))
+		}
+		slices.Sort(entries)
+		b.WriteString("{" + strings.Join(entries, ", ") + "}")
+	case traits.Lister:
+		n, _ := v.Size().(types.Int)
+		b.WriteString("[")
+		for i := range int(n) {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			writeOut(b, v.Get(types.Int(i)))
+		}
+		b.WriteString("]")
+	case types.Int:
+		b.WriteString("int " + strconv.FormatInt(int64(v), 10))
+	case types.Double:
+		b.WriteString("double " + strconv.FormatFloat(float64(v), 'g', -1, 64))
+	case types.String:
+		b.WriteString("string " + strconv.Quote(string(v)))
+	case ref.Val:
+		fmt.Fprintf(b, "%T %v", v, v.Value())
+	default:
+		fmt.Fprintf(b, "%T %v", v, v)
+	}
 }
 
 // EvaluateConditionOn is what evaluating expr costs, on a request whose attributes are as given,

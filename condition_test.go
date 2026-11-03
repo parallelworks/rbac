@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"reflect"
+	"runtime"
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -933,8 +935,8 @@ func TestWhetherAttributesNestTooDeepIsOfTheLongestPathThroughThem(t *testing.T)
 			expr                       string
 			held                       bool
 		}{
-			// The request's attributes are converted before the resource's, and those before the
-			// subject's.
+			// The request's attributes are converted before the subject's, and those before the
+			// resource's.
 			"a value reached less deep after a path too deep for it": {
 				ok, map[string]any{"v": shared}, map[string]any{"v": nests(1_500, shared)}, `size(resource.attributes.v) == 1`, true,
 			},
@@ -1518,6 +1520,12 @@ func TestAttributesLargerThanACheckConvertsFailEveryCondition(t *testing.T) {
 			t.Errorf("attributes holding %s allocated %d bytes", name, allocated)
 		}
 	}
+	// A kind passing none reads none past it either, where a test of an attribute's absence would hold.
+	for _, expr := range []string{`size(subject.attributes) == 0`, `size(resource.attributes) == 0`} {
+		if held, evaluated := rbac.EvaluateConditionOf(t, expr, nil, nil, map[string]any{"l": make([]int, rbac.MaxConverted)}); held || evaluated {
+			t.Errorf("%s beside a request past what a check converts: held %t, evaluated %t", expr, held, evaluated)
+		}
+	}
 	// A kind's own map, as the host passes it, too.
 	many := make(map[string]any, 1<<20)
 	for i := range 1 << 20 {
@@ -1525,6 +1533,470 @@ func TestAttributesLargerThanACheckConvertsFailEveryCondition(t *testing.T) {
 	}
 	if allocated, over := rbac.Converting(t, many); !over || allocated > 16<<20 {
 		t.Errorf("a million attributes: past what a check converts %t, allocated %d bytes", over, allocated)
+	}
+}
+
+// Whether a check's attributes fit what it converts, and which kinds it can read, turns on no
+// order, of the kinds or of a map's entries, but where a value nests past what it converts, 10,000
+// deep: JSON text was parsed only where it might hold no more values than were left, which it
+// counted by its brackets, commas and colons, more than it holds where it is invalid, holds an
+// empty list or object, or a key twice. So `[]` beside a string just fitting what a check converts
+// failed every kind's attributes where the string was converted first, and not where the text was,
+// and a call converting the subject's attributes before the resource's, rather than after, read
+// them where it failed them before.
+func TestWhetherAttributesFitTurnsOnNoOrder(t *testing.T) {
+	// A string's name and value cost two, and a tenth of its length, and `[]`'s three.
+	exact := strings.Repeat("x", 10*(rbac.MaxConverted-5))
+	empty := json.RawMessage("[]")
+	if held, _ := rbac.EvaluateConditionOf(t, `has(subject.attributes.s) && size(resource.attributes.j) == 0`,
+		map[string]any{"s": exact}, map[string]any{"j": empty}, nil); !held {
+		t.Error("the resource's empty JSON list after the subject's string, just fitting what a check converts")
+	}
+	for range 50 {
+		if held, _ := rbac.EvaluateConditionOf(t, `has(request.attributes.s) && size(request.attributes.j) == 0`,
+			nil, nil, map[string]any{"s": exact, "j": empty}); !held {
+			t.Fatal("a request's empty JSON list beside its string, just fitting what a check converts")
+		}
+	}
+	seed := uint64(time.Now().UnixNano())
+	t.Logf("seed %d", seed)
+	rng := rand.New(rand.NewPCG(seed, 31))
+	orders := [][3]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
+	for trial := range 20 {
+		shared := drawnShared(rng, false)
+		kinds := [3]map[string]any{drawnAttributes(rng, shared, false), drawnAttributes(rng, shared, false), drawnAttributes(rng, shared, false)}
+		// Half the time, invalid JSON text of many commas in one kind, and in another a list taking
+		// about what the text leaves of what a check converts, so they fit together but the text may
+		// hold more than the list leaves.
+		if rng.IntN(2) == 0 {
+			commas := rbac.MaxConverted/4 + rng.IntN(rbac.MaxConverted/4)
+			text, list := rng.IntN(3), rng.IntN(3)
+			kinds[text]["text"] = json.RawMessage(strings.Repeat(",", commas))
+			kinds[list]["list"] = make([]int, rbac.MaxConverted-commas/10-rng.IntN(commas))
+		}
+		var first []bool
+		var firstOver bool
+		for i, o := range orders {
+			read, over := rbac.ConvertedInOrder(t, kinds[o[0]], kinds[o[1]], kinds[o[2]])
+			inOrder := make([]bool, 3)
+			for j, k := range o {
+				inOrder[k] = read[j] && !over
+			}
+			if i == 0 {
+				first, firstOver = inOrder, over
+				continue
+			}
+			if over != firstOver || !slices.Equal(inOrder, first) {
+				t.Fatalf("trial %d: in order %v, read %v and over %t; in order %v, read %v and over %t", trial, orders[0], first, firstOver, o, inOrder, over)
+			}
+		}
+	}
+}
+
+// What a check reads of each kind's attributes is what a check alone reads, however many checks of
+// its call converted the subject's and the request's before it, and which kinds it reads is what
+// converting all three at once would read, the resource's sharing none of the others' values: it
+// counts the subject's and the request's, converted once for the call, as its own, a value they
+// share once, and its resource's apart, and past what a check converts it reads none, the
+// resource's though it passes none. A hook of the host's that drops the subject's between checks
+// changes nothing they read, as the call reads them as it first converted them, and no check knows
+// a value by where one the call converted before was, so none made where a dropped one was is
+// read as converted from it.
+func TestAChecksAttributesAreAsConvertedAloneWhateverItsCallConvertedBefore(t *testing.T) {
+	seed := uint64(time.Now().UnixNano())
+	t.Logf("seed %d", seed)
+	rng := rand.New(rand.NewPCG(seed, 37))
+	for trial := range 10 {
+		shared := drawnShared(rng, true)
+		// Shared by the kinds that hold it, about what a check converts, so a check counting it
+		// otherwise, or not counting what was converted before it, reads what converting them doesn't.
+		big := make([]int, []int{rbac.MaxConverted / 3, rbac.MaxConverted/2 + 1000, rbac.MaxConverted - 1000}[rng.IntN(3)])
+		request := drawnAttributes(rng, shared, true)
+		if rng.IntN(2) == 0 {
+			request["big"] = big
+		}
+		ctx := rbac.WithRequest(t.Context(), request)
+		subjectSeed, resourceSeed := rng.Uint64(), rng.Uint64()
+		// The subject's attributes as the host passes them, with values of its own in a map and a list
+		// of types of the host's own, which drop drops, as a hook might.
+		passed := func() (subject map[string]any, drop func()) {
+			rng := rand.New(rand.NewPCG(subjectSeed, 0))
+			subject = drawnAttributes(rng, shared, true)
+			switch rng.IntN(4) {
+			case 0:
+				subject["big"] = big
+			case 1:
+				subject["own"] = make([]int, rbac.MaxConverted/2+1000)
+			}
+			byName, listed := map[string]map[string]any{}, make([]*map[string]any, 20)
+			for i := range 20 {
+				byName[fmt.Sprint(i)] = map[string]any{"by": "subject", "i": i}
+				listed[i] = &map[string]any{"by": "subject", "i": i}
+			}
+			subject["byName"], subject["listed"] = byName, listed
+			return subject, func() {
+				clear(byName)
+				clear(listed)
+				subject["a0"] = struct{}{}
+				runtime.GC()
+			}
+		}
+		// The resource of each check, made as it is asked for, after what a hook dropped before it.
+		resource := func(i int) map[string]any {
+			rng := rand.New(rand.NewPCG(resourceSeed, uint64(i)))
+			if rng.IntN(5) == 0 {
+				return nil
+			}
+			attributes := drawnAttributes(rng, shared, true)
+			if rng.IntN(2) == 0 {
+				attributes["big"] = big
+			}
+			many := make([]any, 200)
+			for j := range many {
+				many[j] = map[string]any{"by": "resource", "i": j}
+			}
+			attributes["many"] = many
+			return attributes
+		}
+		subject, drop := passed()
+		together, alone := rbac.AttributesRead(t, 4, func(i int) (context.Context, map[string]any, map[string]any) {
+			return ctx, subject, resource(i)
+		}, func(i int) {
+			if i == 2 {
+				drop()
+			}
+		})
+		for i := range together {
+			for k, kind := range []string{"subject", "resource", "request"} {
+				if together[i][k] != alone[i][k] {
+					got, want := differing(together[i][k], alone[i][k])
+					t.Fatalf("trial %d, check %d: the %s's attributes read\n%s\nwhere alone\n%s", trial, i, kind, got, want)
+				}
+			}
+			// The kinds converted at once, in the order a check converts them, the resource's a copy
+			// sharing none of the others' values, as a check converts its resource's apart.
+			passing, _ := passed()
+			read, over := rbac.ConvertedInOrder(t, request, passing, rbac.DeepCopy(resource(i)))
+			for k, j := range []int{2, 0, 1} {
+				if unread := alone[i][j] == rbac.Unreadable; unread != (over || !read[k]) {
+					t.Fatalf("trial %d, check %d: the %s's attributes unreadable %t, where converted at once %t, past what a check converts %t",
+						trial, i, []string{"request", "subject", "resource"}[k], unread, !read[k], over)
+				}
+			}
+		}
+	}
+}
+
+// A call shares what it converted of a subject's and a request's attributes only with checks of
+// the same: by a subject passing the same map, on a request passing the same, or none, as an
+// approver's label values are decided on. So two subjects, or one with a request and without, as
+// one activating and its approver are, are each read as passed, a nil map as an empty one, and a
+// check after the host changes a map it passed reads it as the call first converted it.
+func TestACallSharesWhatItConvertedOnlyWithChecksOfTheSame(t *testing.T) {
+	plain := t.Context()
+	asked, other := rbac.WithRequest(plain, map[string]any{"site": "hq"}), rbac.WithRequest(plain, map[string]any{"site": "remote"})
+	ops, dev := map[string]any{"team": "ops"}, map[string]any{"team": "dev"}
+	checks := []struct {
+		ctx     context.Context
+		subject map[string]any
+	}{
+		{asked, ops},
+		{asked, dev},
+		{other, ops},
+		{plain, ops},
+		{rbac.WithoutRequest(asked), ops},
+		{rbac.WithoutRequest(plain), ops},
+		{rbac.WithRequest(plain, nil), ops},
+		{rbac.WithRequest(plain, map[string]any{}), ops},
+		{asked, nil},
+		{asked, map[string]any{}},
+		{rbac.WithoutRequest(plain), nil},
+		{plain, nil},
+		{asked, ops},
+	}
+	together, alone := rbac.AttributesRead(t, len(checks), func(i int) (context.Context, map[string]any, map[string]any) {
+		return checks[i].ctx, checks[i].subject, map[string]any{"i": i}
+	}, func(i int) {
+		if i == len(checks)-1 {
+			ops["team"] = "changed"
+		}
+	})
+	for i := range checks {
+		if together[i] != alone[i] {
+			t.Errorf("check %d read %q, where alone %q", i, together[i], alone[i])
+		}
+	}
+}
+
+// What converting decodes, JSON text and packed messages, is kept while its converter knows it by
+// where it points: freed once converted, the request's JSON text was where the subject's, decoded
+// after it, was decoded, and a condition reading the subject's read the request's, and so for a
+// packed message.
+func TestWhatOneKindDecodesIsNeverReadAsAnothers(t *testing.T) {
+	rbac.CollectBetweenKinds(t)
+	packing := func(s string) *anypb.Any {
+		v, err := structpb.NewStruct(map[string]any{"k": s})
+		if err != nil {
+			t.Fatal(err)
+		}
+		a, err := anypb.New(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+	for i := range 50 {
+		kinds := map[string]map[string]any{}
+		for _, kind := range []string{"subject", "resource", "request"} {
+			text := fmt.Sprintf("%s%d", kind, i)
+			kinds[kind] = map[string]any{"j": json.RawMessage(`{"k": "` + text + `"}`), "p": packing(text)}
+		}
+		for _, kind := range []string{"subject", "resource", "request"} {
+			expr := fmt.Sprintf(`%[1]s.attributes.j.k == "%[1]s%[2]d" && %[1]s.attributes.p.k == "%[1]s%[2]d"`, kind, i)
+			if held, evaluated := rbac.EvaluateConditionOf(t, expr, kinds["subject"], kinds["resource"], kinds["request"]); !held {
+				t.Fatalf("%s: held %t, evaluated %t", expr, held, evaluated)
+			}
+		}
+	}
+}
+
+// No value converting knows by where it points is read as another, wherever one was freed before
+// another was made: a map, of a type of the host's own too, a slice, empty or nil too, an array of
+// them, a pointer, to nothing too, which Go may give one address, JSON text and what converting
+// decodes of it, and a Struct, a ListValue, a Value and an Any and what it packs. Garbage is
+// collected before each kind is converted, and between checks, after a hook of the host's empties
+// every map and list the subject's and the request's attributes held once the call converted them,
+// so nothing the host holds keeps what they held, and each check's resource is made after.
+func TestNoValueConvertedIsReadAsAnother(t *testing.T) {
+	rbac.CollectBetweenKinds(t)
+	for trial := range 5 {
+		subject, dropSubject := heldShapes(t, "subject", trial)
+		request, dropRequest := heldShapes(t, "request", trial)
+		ctx := rbac.WithRequest(t.Context(), request)
+		together, alone := rbac.AttributesRead(t, 6, func(i int) (context.Context, map[string]any, map[string]any) {
+			resource, _ := heldShapes(t, "resource", 100*trial+i)
+			return ctx, subject, resource
+		}, func(i int) {
+			if i == 1 {
+				dropSubject()
+				dropRequest()
+			}
+			runtime.GC()
+		})
+		for i := range together {
+			for k, kind := range []string{"subject", "resource", "request"} {
+				if alone[i][k] == rbac.Unreadable {
+					t.Fatalf("trial %d, check %d: the %s's attributes unreadable alone", trial, i, kind)
+				}
+				if together[i][k] != alone[i][k] {
+					got, want := differing(together[i][k], alone[i][k])
+					t.Fatalf("trial %d, check %d: the %s's attributes read\n%s\nwhere alone\n%s", trial, i, kind, got, want)
+				}
+			}
+		}
+	}
+}
+
+// heldShapes are attributes holding, by, values of each shape a converter knows by where it points,
+// telling by and i apart, a few of each, and drop, which empties every map and list they hold, as a
+// hook of the host's might, so that nothing the host holds keeps what they held.
+func heldShapes(t *testing.T, by string, i int) (attributes map[string]any, drop func()) {
+	t.Helper()
+	tag := map[string]int{"subject": 1, "resource": 2, "request": 3}[by]
+	must := func(err error) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var drops []func()
+	shapes := func(j int) map[string]any {
+		n, s := tag*1000+j, fmt.Sprint(by, i, j)
+		a, b := n, n+1
+		// Many of a type of the host's own, each of whose entries is read into the same value.
+		maps, pointers, slices := map[string]map[string]int{}, map[string]*[4]int{}, map[string][]int{}
+		listed, lists := make([]*[4]int, 64), make([][]any, 64)
+		for k := range 64 {
+			maps[fmt.Sprint(k)], pointers[fmt.Sprint(k)], slices[fmt.Sprint(k)] = map[string]int{s: k}, &[4]int{tag, i, j, k}, []int{tag, i, j, k}
+			listed[k], lists[k] = &[4]int{tag, i, j, k}, []any{s, k}
+		}
+		list, m := []any{s, n}, map[string]any{"by": s}
+		arrays, spare := [][2]*int{{&a, &b}}, append(make([]any, 0, 8), s, n)
+		st, err := structpb.NewStruct(map[string]any{"by": s, "l": []any{s, float64(n)}})
+		must(err)
+		lv, err := structpb.NewList([]any{s, map[string]any{"by": s}})
+		must(err)
+		packed, err := structpb.NewStruct(map[string]any{"by": s})
+		must(err)
+		packedStruct, err := anypb.New(packed)
+		must(err)
+		packedList, err := structpb.NewList([]any{s, float64(n)})
+		must(err)
+		packedValue, err := anypb.New(structpb.NewListValue(packedList))
+		must(err)
+		valued, err := structpb.NewStruct(map[string]any{"by": s})
+		must(err)
+		shaped := map[string]any{
+			"map":      map[string]any{"by": s, "n": n},
+			"maps":     maps,
+			"pointers": pointers,
+			"slices":   slices,
+			"pointer":  &[4]int{tag, i, j},
+			"int":      &a,
+			"string":   &s,
+			"list":     []any{s, n},
+			"listed":   listed,
+			"lists":    lists,
+			"array":    [2]map[string]any{{"by": s}, {"n": n}},
+			"arrays":   arrays,
+			"toList":   &list,
+			"toMap":    &m,
+			"spare":    spare,
+			"text":     json.RawMessage(fmt.Sprintf(`{"by": %q, "l": [%d, {"by": %q}, [%q]]}`, s, n, s, s)),
+			"struct":   st,
+			"listV":    lv,
+			"value":    structpb.NewStructValue(valued),
+			"packed":   packedStruct,
+			"packedV":  packedValue,
+			"zero":     &[0]int{},
+			"zeros":    [][0]int{{}, {}},
+			"empty":    []any{},
+			"capped":   make([]any, 0, 4),
+			"nil":      []any(nil),
+			"nilMap":   map[string]any(nil),
+		}
+		drops = append(drops, func() {
+			clear(maps)
+			clear(pointers)
+			clear(slices)
+			clear(listed)
+			clear(lists)
+			clear(list)
+			clear(m)
+			clear(arrays)
+			clear(spare[:cap(spare)])
+			clear(st.GetFields())
+			clear(lv.GetValues())
+			clear(valued.GetFields())
+			clear(shaped)
+		})
+		return shaped
+	}
+	held := map[string]any{}
+	for j := range 4 {
+		held[fmt.Sprint(j)] = shapes(j)
+	}
+	return map[string]any{"held": held}, func() {
+		for _, drop := range drops {
+			drop()
+		}
+		clear(held)
+	}
+}
+
+// differing is where a and b, written out, first differ, and a little before.
+func differing(a, b string) (string, string) {
+	i := 0
+	for i < len(a) && i < len(b) && a[i] == b[i] {
+		i++
+	}
+	from := max(i-200, 0)
+	return a[from:min(i+300, len(a))], b[from:min(i+300, len(b))]
+}
+
+// drawnShared are values a test's kinds' attributes share, drawn from rng (drawnValue), and with
+// deep, a value nested past what a check converts.
+func drawnShared(rng *rand.Rand, deep bool) []any {
+	cyclic := map[string]any{"x": 1}
+	cyclic["self"] = cyclic
+	shared := []any{
+		make([]int, drawnSize(rng)), drawnValue(rng, nil, 0, deep), drawnValue(rng, nil, 0, deep), cyclic,
+		json.RawMessage(`{"a": [1, 2, {"b": "c"}]}`),
+		map[string]map[string]any{"x": {"y": 1}, "z": {"y": 2}},
+	}
+	if deep {
+		var nested any = "x"
+		for range 10_001 {
+			nested = []any{nested}
+		}
+		shared = append(shared, nested)
+	}
+	return shared
+}
+
+// drawnAttributes are a kind's attributes drawn from rng: a few values, some of them shared.
+func drawnAttributes(rng *rand.Rand, shared []any, deep bool) map[string]any {
+	out := map[string]any{}
+	for i := range rng.IntN(4) {
+		out[fmt.Sprint("a", i)] = drawnValue(rng, shared, 0, deep)
+	}
+	return out
+}
+
+// drawnSize is a size of a value drawn from rng, a few or a part of what a check converts.
+func drawnSize(rng *rand.Rand) int {
+	return []int{0, 1, 7, 1000, rbac.MaxConverted / 8, rbac.MaxConverted / 4, rbac.MaxConverted / 3, rbac.MaxConverted / 2}[rng.IntN(8)]
+}
+
+// drawnValue is a value of a shape a host passes drawn from rng, as deep as depth, of shared too, and
+// with deep, nested past what a check converts.
+func drawnValue(rng *rand.Rand, shared []any, depth int, deep bool) any {
+	n := drawnSize(rng)
+	switch rng.IntN(16) {
+	case 0, 1:
+		if len(shared) > 0 {
+			return shared[rng.IntN(len(shared))]
+		}
+		return rng.IntN(10)
+	case 2:
+		return strings.Repeat("s", 10*n)
+	case 3:
+		return make([]int, n)
+	case 4:
+		return json.RawMessage("[" + strings.TrimSuffix(strings.Repeat("0,", n), ",") + "]")
+	case 5:
+		return json.RawMessage([]string{"[]", "{}", `[[], {}, []]`, `{"a": 1, "a": 2}`, `[1e400]`, ""}[rng.IntN(6)])
+	case 6:
+		return json.RawMessage(strings.Repeat(",", n))
+	case 7:
+		return struct{}{}
+	case 8:
+		if depth < 3 {
+			m := map[string]any{}
+			for i := range rng.IntN(4) {
+				m[fmt.Sprint("m", i)] = drawnValue(rng, shared, depth+1, deep)
+			}
+			return m
+		}
+		return true
+	case 9:
+		if depth < 3 {
+			l := make([]any, rng.IntN(4))
+			for i := range l {
+				l[i] = drawnValue(rng, shared, depth+1, deep)
+			}
+			return l
+		}
+		return 1.5
+	case 10:
+		return map[string]map[string]any{"a": {"b": rng.IntN(3)}, "c": {"d": "e"}}
+	case 11:
+		return []*[]any{{"x"}, {rng.IntN(3)}}
+	case 12:
+		return []any{nil, math.NaN(), time.Unix(int64(rng.IntN(1000)), 0), time.Duration(rng.IntN(1000)), []byte("bytes")}
+	case 13:
+		v, _ := structpb.NewList([]any{"a", 1.0, map[string]any{"b": true}})
+		return v
+	case 14:
+		if deep {
+			var nested any = rng.IntN(3)
+			for range 10_000 - rng.IntN(3) {
+				nested = []any{nested}
+			}
+			return nested
+		}
+		return map[int]string{1: "one"}
+	default:
+		return map[any]int{1: 1, uint(2): 2, "3": 3, true: 4}
 	}
 }
 

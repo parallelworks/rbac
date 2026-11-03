@@ -416,13 +416,31 @@ sequenceDiagram
   turn on map order or on which kind reached a shared value first, and each kind is converted, and
   charged, whole, whatever it holds, but where it nests past `maxNested`: converting stops there, so
   what it is charged, and whether the kinds after it fit `maxConverted`, can turn on map order,
-  failing closed. A value reached twice is converted once, and converting costs a
-  check at most `maxConverted`, counted as `valueSize` counts what a condition reads, about what a
-  check may spend on a scope's grants' conditions, past which every condition reading an attribute
-  fails: converting isn't charged to a condition, and charging the check would let what one
-  condition reads fail the others. The subject's, the resource's and the request's attributes share
-  the bound, so ones users write, as a resource's tags, can fail the conditions of every check of
-  the resource, closed. So conditions run on CEL's own values alone, by CEL's own semantics, and a
+  failing closed. Nothing else does, nor on the order of the kinds: JSON text that may hold more
+  values than `maxConverted`, by its brackets, braces, commas and colons, fails them all unparsed,
+  where compared with what was left, it failed them where what came before it left less than it may
+  hold, though what it holds fit, as `[]` holds less than its brackets count. A value reached twice
+  is converted once, but for a resource's sharing it with the subject's or the request's (below),
+  and converting costs a check at most `maxConverted`, counted as `valueSize` counts what a
+  condition reads, about what a check may spend on a scope's grants' conditions, past which every
+  condition reading an attribute fails: converting isn't charged to a condition, and charging the
+  check would let what one condition reads fail the others. The subject's and the request's
+  attributes are converted once for a call, by one converter (`askingOf`), as a change checks them
+  on each scope it reaches, before its transaction and in it, and each check converts its resource's
+  apart, on a converter spending what that one left (`rest`): so each check counts all three, in the
+  order request, subject, resource, and a value the resource's share with them twice. Counting it
+  once, a check would know a value by where it points from one check to the next, and could read one
+  its resource's hold, made where one a hook of the host's dropped meanwhile was, as that one. A
+  converter knows what it converted only while it converts, which runs none of the host's code, so
+  what the host passed stays where it is, and it keeps what it decodes of JSON text and packed
+  messages where it is (`conversion.of`), as what a kind after decodes could otherwise come to be
+  there and be read as converted from it. So a host changes none of what it passed while the call
+  runs, as from a hook: a later check can read the subject's and the request's attributes as the
+  first converted them. Converted for each check, a change adding a member to 400 groups, its
+  request holding a map of 40,000 entries, took 6 seconds. The
+  subject's, the resource's and the request's attributes share the bound, so ones users write, as a
+  resource's tags, can fail the conditions of every check of the resource, closed.
+  So conditions run on CEL's own values alone, by CEL's own semantics, and a
   comparison that fails where either value holds a double that isn't finite sees every double there
   is. Each runs within the most evaluating it can cost, which its literals and types bound, and the
   ids, kinds, types and tenant a check passes and its action, which are no longer than `MaxID`. CEL

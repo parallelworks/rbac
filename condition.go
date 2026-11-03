@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"reflect"
 	"regexp"
 	"regexp/syntax"
 	"slices"
@@ -38,9 +39,10 @@ import (
 // one reading an attribute the host didn't pass does, or comparing a double that isn't finite, as
 // dividing by zero makes, or a value holding one, in a list or a map, as a key too, converting one
 // to a string or keying a map by one, is false, though `in` a map a condition makes keyed by a list
-// holding one is false for a key it doesn't hold. What the host passes is converted once for a
-// check into CEL's own values, from the values Attributes names, and a kind's attributes holding
-// anything else can't be read, every condition reading one of them failing, a test of its presence
+// holding one is false for a key it doesn't hold. What the host passes is converted into CEL's own
+// values, the subject's and the request's attributes once for a call and a resource's once for each
+// check of it, from the values Attributes names, and a kind's attributes holding anything else
+// can't be read, every condition reading one of them failing, a test of its presence
 // too, so conditions read CEL's own values alone, at what reading any value of its size costs. A
 // label value and a power to release are decided on the tenant with no attributes, whatever a check
 // passes (Holding), and their conditions can't read the tenant's: any read of resource.attributes
@@ -1993,7 +1995,7 @@ type requestKey struct{}
 
 // WithRequest returns ctx carrying the attributes of the request it serves, such as its
 // address or whether it passed a second factor, which conditions read as request.attributes.
-// Values are those Attributes names, a check converting them once into CEL's own: strings,
+// Values are those Attributes names, a call converting them once into CEL's own: strings,
 // numbers, booleans, bytes, times, durations, null, JSON and the protobuf well-known types, and
 // lists and maps of them. One holding anything else, however deep, as a struct or a value of the
 // host's own CEL type, makes the request's attributes unreadable: every condition reading any of
@@ -2013,32 +2015,22 @@ func withoutRequest(ctx context.Context) context.Context {
 	return context.WithValue(ctx, requestKey{}, unrequested{})
 }
 
-// vars is what a condition reads when s asks to do p to r, each kind's attributes converted by one
-// converter for them all (Attributes), so a value they share is converted once, and what converting
-// them all may cost is bounded together: past it, every kind's attributes refuse every read. A kind
-// holding a value no condition can read refuses every read of its own, the others read as passed.
+// vars is what a condition reads when s asks to do p to r, each kind's attributes converted
+// (Attributes), and what converting them all may cost bounded together: past it, every kind's
+// attributes refuse every read. A kind holding a value no condition can read refuses every read of
+// its own, the others read as passed. The subject's and the request's are converted once for the
+// call, by one converter, so a value they share is converted once (askingOf), and r's apart, from
+// what they left, so each check counts all three, and a value r's share with them again.
 func (a *Authorizer) vars(ctx context.Context, s Subject, p Permission, r Resource) map[string]any {
 	converting()
-	c := newConverter()
-	_, none := ctx.Value(requestKey{}).(unrequested)
-	var request map[ref.Val]ref.Val
-	requestRead := !none
-	if !none {
-		passed, _ := ctx.Value(requestKey{}).(map[string]any)
-		request, requestRead = c.attributes(passed)
-	}
+	asked := a.askingOf(ctx, s)
+	c := asked.rest
 	resourced, resourceRead := c.attributes(r.Attributes)
-	subjected, subjectRead := c.attributes(s.Attributes)
 	var requestAttributes, resourceAttributes, subjectAttributes any = unreadable, unreadable, unreadable
 	if !c.over {
-		if requestRead {
-			requestAttributes = declared(a.cfg.Attributes.Request, request)
-		}
+		requestAttributes, subjectAttributes = asked.request, asked.subject
 		if resourceRead {
 			resourceAttributes = declared(a.cfg.Attributes.Resource, resourced)
-		}
-		if subjectRead {
-			subjectAttributes = declared(a.cfg.Attributes.Subject, subjected)
 		}
 	}
 	resource := map[string]any{"type": r.Type, "id": r.ID, "tenant": r.Tenant, "attributes": resourceAttributes}
@@ -2051,6 +2043,62 @@ func (a *Authorizer) vars(ctx context.Context, s Subject, p Permission, r Resour
 		"request":  map[string]any{"time": a.cfg.Now(), "attributes": requestAttributes},
 		"action":   string(p),
 	}
+}
+
+// asking is a subject's and a request's attributes as conditions read them, and a converter
+// spending what converting them left, a copy of which converts each check's resource's (rest):
+// what converted them is gone, so no check knows a value by where one of theirs was, which a
+// hook of the host's may have dropped since, freeing it.
+type asking struct {
+	rest             converter
+	subject, request any
+	// subjectOf and requestOf are what the host passed, kept so that where they point, which the
+	// call knows them by (askingKey), is no other map's while it runs.
+	subjectOf, requestOf map[string]any
+}
+
+// askingKey is what a call knows a subject's and a request's attributes by: where the host's maps
+// point, and whether the request is one conditions read none of (unrequested).
+type askingKey struct {
+	subject, request uintptr
+	unrequested      bool
+}
+
+// askingOf is s's and ctx's request's attributes as conditions read them, converted the first time
+// a check of the call reads them and kept for every check after it of the same, as a change makes on
+// each scope it reaches, before its transaction and again in it: converted for each, a change adding
+// a member to 400 groups, its request passing a map of 40,000 entries, took 6 seconds. What they
+// convert to turns on nothing else, neither the time, which vars reads for each check, nor what is
+// stored, and the checks after the first read what it converted, whatever a hook of the host's
+// changes of them meanwhile (Attributes). Outside a call (still), they are converted for each check.
+func (a *Authorizer) askingOf(ctx context.Context, s Subject) *asking {
+	_, none := ctx.Value(requestKey{}).(unrequested)
+	passed, _ := ctx.Value(requestKey{}).(map[string]any)
+	k := askingKey{reflect.ValueOf(s.Attributes).Pointer(), reflect.ValueOf(passed).Pointer(), none}
+	if got := a.asked[k]; got != nil {
+		return got
+	}
+	c := newConverter()
+	got := &asking{subject: unreadable, request: unreadable, subjectOf: s.Attributes, requestOf: passed}
+	var request map[ref.Val]ref.Val
+	requestRead := !none
+	if !none {
+		request, requestRead = c.attributes(passed)
+	}
+	subjected, subjectRead := c.attributes(s.Attributes)
+	got.rest = c.rest()
+	if !c.over {
+		if requestRead {
+			got.request = declared(a.cfg.Attributes.Request, request)
+		}
+		if subjectRead {
+			got.subject = declared(a.cfg.Attributes.Subject, subjected)
+		}
+	}
+	if a.asked != nil {
+		a.asked[k] = got
+	}
+	return got
 }
 
 // valueResource is the tenant as a condition deciding a label value or a power to release reads

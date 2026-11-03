@@ -951,6 +951,9 @@ type Authorizer struct {
 	labels map[string]labelDimension
 	// clock is the time the call under way decides at (still), nil outside one.
 	clock *callClock
+	// asked is what the call under way converted of its subjects' and requests' attributes
+	// (askingOf), nil outside one.
+	asked map[askingKey]*asking
 }
 
 // permissionOn is a permission on a type of resource.
@@ -1135,6 +1138,7 @@ func (a *Authorizer) still() *Authorizer {
 	b := *a
 	b.clock = &callClock{host: a.cfg.Now}
 	b.cfg.Now = b.clock.now
+	b.asked = map[askingKey]*asking{}
 	return &b
 }
 
