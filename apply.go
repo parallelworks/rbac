@@ -422,7 +422,7 @@ func (a *Authorizer) changing(actor Subject, on Resource, cs *constrained) error
 // reaches one, however the hash fares.
 
 // lockName is the name of a tenant's lock of a kind on key, in the tables of schema, key empty for
-// the tenant's own, and tenant too for Migrate's.
+// a lock no id names, and tenant too for Migrate's.
 func lockName(schema, kind, tenant, key string) string {
 	return strconv.Itoa(len(schema)) + ":" + schema + "/rbac/" + kind + "/" + strconv.Itoa(len(tenant)) + ":" + tenant + "/" + key
 }

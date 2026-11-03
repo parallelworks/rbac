@@ -3236,8 +3236,8 @@ func TestLocksOfDifferentNamesHaveDifferentKeys(t *testing.T) {
 	for _, n := range []name{
 		// A group id crafted so that hashtextextended keyed its lock as another tenant's own, in the
 		// schema it was crafted for, and that tenant's lock.
-		{"s", "scope", "t1", "group:aaa!Z+'z2hp5uI`"},
-		{"s", "tenant", "t2", ""},
+		{"public", "scope", "t1", "group:" + craftedGroup},
+		{"public", "tenant", "t2", ""},
 		// Migrate's lock named the schema without its length, so one schema's could be another's
 		// scope lock, as a schema's name holding another's lock name would be without it.
 		{"3:abc/rbac/scope/2:t2/rbac:x", "migrate", "", ""},
