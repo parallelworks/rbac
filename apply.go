@@ -417,9 +417,9 @@ func (a *Authorizer) changing(actor Subject, on Resource, cs *constrained) error
 // some 2^64 hashes. PostgreSQL's hashtextextended, which keyed them before, can be inverted, so a
 // tenant's admin could name a group, in a millisecond, whose lock was another tenant's, and hold
 // every change there back while changing it. A lock no id names, a tenant's own, its exclusive
-// values' or Migrate's, takes its key as two int4 keys, which PostgreSQL holds apart from every
-// bigint key, as a scope's or a principal's lock takes: so no id an actor chooses reaches one,
-// however the hash fares.
+// values', its nesting's or Migrate's, takes its key as two int4 keys, which PostgreSQL holds apart
+// from every bigint key, as a scope's or a principal's lock takes: so no id an actor chooses
+// reaches one, however the hash fares.
 
 // lockName is the name of a tenant's lock of a kind on key, in the tables of schema, key empty for
 // the tenant's own, and tenant too for Migrate's.
@@ -503,7 +503,11 @@ const maxLocks = 64
 func lock(ctx context.Context, tx pgx.Tx, tenant string, scopes, principals []string) error {
 	locks := []advisory{{kind: "tenant", tenant: tenant, shared: true}}
 	for _, s := range slices.Compact(slices.Sorted(slices.Values(scopes))) {
-		locks = append(locks, advisory{kind: "scope", tenant: tenant, key: s})
+		l := advisory{kind: "scope", tenant: tenant, key: s}
+		if s == nestingKey {
+			l = advisory{kind: "nesting", tenant: tenant}
+		}
+		locks = append(locks, l)
 	}
 	for _, p := range slices.Compact(slices.Sorted(slices.Values(principals))) {
 		locks = append(locks, advisory{kind: "principal", tenant: tenant, key: p})

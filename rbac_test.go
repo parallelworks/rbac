@@ -3250,7 +3250,7 @@ func TestLocksOfDifferentNamesHaveDifferentKeys(t *testing.T) {
 	} {
 		check(n)
 	}
-	kinds := []string{"tenant", "exclusive", "scope", "principal", "migrate"}
+	kinds := []string{"tenant", "exclusive", "nesting", "scope", "principal", "migrate"}
 	rng := mathrand.New(mathrand.NewPCG(1, 2))
 	text := func() string {
 		b := make([]byte, rng.IntN(7))
@@ -3273,11 +3273,11 @@ func TestLocksOfDifferentNamesHaveDifferentKeys(t *testing.T) {
 	}
 }
 
-// A lock no key names, a tenant's own, its exclusive values' or Migrate's, takes its key as two
-// int4 keys, and a scope's or a principal's as one bigint key, which PostgreSQL holds apart: so a
-// scope or a principal whose bigint key no hash keeps from being a tenant's, as one an actor names
-// to match it, holds none of that tenant's changes back. A session holding each lock's 64 bits in
-// the other form holds back nothing, and in its own form, what takes it.
+// A lock no key names, a tenant's own, its exclusive values', its nesting's or Migrate's, takes its
+// key as two int4 keys, and a scope's or a principal's as one bigint key, which PostgreSQL holds
+// apart: so a scope or a principal whose bigint key no hash keeps from being a tenant's, as one an
+// actor names to match it, holds none of that tenant's changes back. A session holding each lock's
+// 64 bits in the other form holds back nothing, and in its own form, what takes it.
 func TestATenantsOwnLocksMeetNoLockOfAKey(t *testing.T) {
 	h := labeled(t, banks)
 	ctx := t.Context()
@@ -3289,6 +3289,8 @@ func TestATenantsOwnLocksMeetNoLockOfAKey(t *testing.T) {
 		return h.authz.WithTx(tx).Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "u")})
 	}
 	migrate := func(tx pgx.Tx) error { return rbac.Migrate(ctx, tx) }
+	// Deleting groups takes the nesting lock, as nesting one does.
+	nesting := func(tx pgx.Tx) error { return h.authz.WithTx(tx).DeleteGroups(ctx, host, "t1", []string{"g"}) }
 	for _, c := range []struct {
 		lock   string
 		key    int64
@@ -3297,6 +3299,7 @@ func TestATenantsOwnLocksMeetNoLockOfAKey(t *testing.T) {
 	}{
 		{"the tenant's", rbac.LockKey(schema, "tenant", "t1", ""), false, change},
 		{"its exclusive values'", rbac.LockKey(schema, "exclusive", "t1", ""), false, change},
+		{"its nesting's", rbac.LockKey(schema, "nesting", "t1", ""), false, nesting},
 		{"Migrate's", rbac.LockKey(schema, "migrate", "", ""), false, migrate},
 		{"a scope's", rbac.LockKey(schema, "scope", "t1", cluster.Scope().Key()), true, change},
 		{"a principal's", rbac.LockKey(schema, "principal", "t1", "user:u"), true, change},
