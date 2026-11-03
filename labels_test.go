@@ -3384,6 +3384,54 @@ func TestHoldersOfALabeledResourceLookEachHoldersKeysUpInTheDenies(t *testing.T)
 	}
 }
 
+// Holders of a labeled resource keeps a member that a deny on the tenant's members binds only as
+// one of them where the deny exempts it, by itself or by a group it is in, and a guest, whom it
+// doesn't bind, as Authorize does: whichever of a holder's keys a deny binds it by, its exemptions
+// are looked up by all of them.
+func TestHoldersOfALabeledResourceHonorExemptionsFromADenyOnTheMembers(t *testing.T) {
+	h := labeled(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), tenantGuard) })
+	ctx := t.Context()
+	h.groups(t, "all", "cleared")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "all"), grant(rbac.TenantRoot("t1"), "level.high", rbac.Members, "t1"),
+		grant(rbac.TenantRoot("t1"), "tenant.guard", rbac.User, "guardian"))
+	subjects := map[string]rbac.Subject{
+		"bound": h.as(t, "bound", "all"), "exempt": h.as(t, "exempt", "all"), "cleared": h.as(t, "cleared", "all", "cleared"),
+		"visitor": h.guest(t, "visitor", "all"),
+	}
+	h.hold(t, "visitor", "level:high")
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), tenantT1, rbac.Deny{
+		ID: "members", Principals: []rbac.Principal{rbac.TenantMembers("t1")}, Exempt: []rbac.Principal{identity("exempt"), groupOf("cleared")},
+		Permissions: []rbac.Permission{"level:*"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	var want []string
+	for _, id := range slices.Sorted(maps.Keys(subjects)) {
+		if h.authz.Authorize(ctx, subjects[id], login, secret) == nil {
+			want = append(want, id)
+		}
+	}
+	if !slices.Equal(want, []string{"cleared", "exempt", "visitor"}) {
+		t.Fatalf("Authorize allows %v", want)
+	}
+	holders, err := h.authz.Holders(ctx, login, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, hd := range holders {
+		got = append(got, hd.Principal.ID)
+		if hd.MaybeDenied || hd.Conditional {
+			t.Errorf("Holders marks %+v", hd)
+		}
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("Holders lists %v, Authorize allows %v", got, want)
+	}
+}
+
 // lapsingMember is labeled with a public role giving level:low, which the public holds on the
 // tenant, and a deny there of level:low to the group g. u is a member of t1 until ends, in g,
 // granted cluster.login on low, the cluster labeled level:low. Before ends the deny takes the value
