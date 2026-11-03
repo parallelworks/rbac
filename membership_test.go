@@ -3,9 +3,11 @@ package rbac_test
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
+	mathrand "math/rand/v2"
 	"runtime"
 	"slices"
 	"strings"
@@ -4511,16 +4513,23 @@ func TestChangingMembersReadsOfTheDeniesNamingTheActorOnlyThoseOnChangingGrants(
 }
 
 // The host's own writes make none of the checks a change an actor makes does, so a freeze stops
-// none of them, as it stops no DeleteGrants: the host keeps its own state as it decides.
+// none of them, as it stops no DeleteGrants: the host keeps its own state as it decides. Taking a
+// tenant's group over with ImportGroups removes the members the tenant put there, and what the group
+// gives them on the frozen scope.
 func TestAFreezeStopsNoneOfTheHostsWrites(t *testing.T) {
-	h := grouped(t, constrain("freeze", grantC))
+	h := grouped(t, constrain("freeze", grantC), func(c *rbac.Config) { c.Sources = []string{"directory"} })
 	ctx := t.Context()
-	h.groups(t, "crew", "other")
-	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"), grant(cluster.Scope(), "cluster.login", rbac.Group, "other"))
-	h.join(t, "u", "v", "w", "x")
+	h.groups(t, "crew", "other", "taken")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"), grant(cluster.Scope(), "cluster.login", rbac.Group, "other"),
+		grant(cluster.Scope(), "cluster.login", rbac.Group, "taken"))
+	h.join(t, "u", "v", "w", "x", "y")
 	in := func(group, id string) rbac.Member { return rbac.Member{Group: group, Principal: identity(id)} }
-	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{in("crew", "u"), in("crew", "v"), in("crew", "w"), in("other", "x")}); err != nil {
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{in("crew", "u"), in("crew", "v"), in("crew", "w"), in("other", "x"), in("taken", "y")}); err != nil {
 		t.Fatal(err)
+	}
+	y := rbac.Subject{Principal: identity("y")}
+	if !allowed(t, h, y, login, cluster) {
+		t.Fatal("y should log in through taken")
 	}
 	if err := h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", nil, []rbac.Member{in("crew", "u")}); !errors.Is(err, rbac.ErrDenied) {
 		t.Fatalf("an actor removing under the freeze: %v", err)
@@ -4537,10 +4546,16 @@ func TestAFreezeStopsNoneOfTheHostsWrites(t *testing.T) {
 		"DeleteGrants": func() error {
 			return h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.Group, "crew")})
 		},
+		"ImportGroups": func() error {
+			return h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "taken", Source: "directory"}})
+		},
 	} {
 		if err := write(); err != nil {
 			t.Errorf("%s under the freeze: %v", what, err)
 		}
+	}
+	if allowed(t, h, y, login, cluster) {
+		t.Error("y, whom the tenant put in the group ImportGroups took over, still logs in on the frozen cluster through it")
 	}
 }
 
@@ -5333,6 +5348,189 @@ func TestChangingMembersReadsTheActorsAuthorityOnceForAllItReaches(t *testing.T)
 	}
 	if few, many := joinEach(2), joinEach(40); many != few {
 		t.Errorf("joining 2 groups read the actor's grants %d times, and 40, %d", few, many)
+	}
+}
+
+// A change converts its actor's and its request's attributes once, however many scopes it checks a
+// condition on, before its transaction and again in it, and each scope's resource's for that scope:
+// converted again for each, adding a member to 400 groups, with a map of 40,000 entries in the
+// request, took 6 seconds. Each scope's check still counts them in what it may convert, and reads
+// its own resource's, converted apart, so a value it shares with them is counted again.
+func TestAChangeConvertsItsActorsAndRequestsAttributesOnce(t *testing.T) {
+	// Half of what a check may convert, which each scope's check counts, rather than the change.
+	requested := make([]int, rbac.MaxConverted/2)
+	crowded := map[string]any{"open": true, "l": make([]int, rbac.MaxConverted/2)}
+	h := grouped(t, func(c *rbac.Config) {
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			r, err := resourceOf(ctx, tenant, s)
+			switch {
+			case s.Type != rbac.GroupScope:
+			case s.ID == "crowded":
+				r.Attributes = crowded
+			case s.ID == "sharing":
+				// The request's list, which a check converts again, as alone.
+				r.Attributes = map[string]any{"open": true, "l": requested}
+			default:
+				r.Attributes = map[string]any{"open": s.ID != "closed"}
+			}
+			return r, err
+		}
+	})
+	g := grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "lead")
+	g.Condition = rbac.Condition{Expression: `request.attributes.mfa == true && subject.attributes.team == "ops" && resource.attributes.open == true`}
+	h.seed(t, g)
+	lead := h.as(t, "lead")
+	lead.Attributes = map[string]any{"team": "ops"}
+	h.join(t, "u", "v")
+	ids := []string{"closed", "crowded", "sharing"}
+	var add []rbac.Member
+	for i := range 20 {
+		ids = append(ids, fmt.Sprint("g", i))
+		add = append(add, rbac.Member{Group: fmt.Sprint("g", i), Principal: identity("u")})
+	}
+	h.groups(t, ids...)
+	ctx := rbac.WithRequest(t.Context(), map[string]any{"mfa": true, "l": requested})
+	n := rbac.CountKindsConverted(t)
+	if err := h.authz.ChangeMembers(ctx, lead, "t1", add, nil); err != nil {
+		t.Fatal(err)
+	}
+	// The actor's and the request's, and each group's before the transaction and in it.
+	if want := 2 + 2*len(add); *n != want {
+		t.Errorf("adding a member to %d groups converted %d kinds' attributes, want %d", len(add), *n, want)
+	}
+	for _, id := range []string{"closed", "crowded", "sharing"} {
+		if err := h.authz.ChangeMembers(ctx, lead, "t1", []rbac.Member{{Group: id, Principal: identity("u")}}, nil); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("adding a member to %s: %v", id, err)
+		}
+	}
+	// The crowded and the sharing group's attributes alone fit.
+	for _, id := range []string{"crowded", "sharing"} {
+		if err := h.authz.ChangeMembers(rbac.WithRequest(t.Context(), map[string]any{"mfa": true}), lead, "t1",
+			[]rbac.Member{{Group: id, Principal: identity("u")}}, nil); err != nil {
+			t.Errorf("adding a member to %s with a small request: %v", id, err)
+		}
+	}
+}
+
+// A change decides each scope it reaches as a change of that scope alone does, however many it
+// reaches, whatever attributes its actor, its request and each scope's resource pass, sharing values
+// or not, about what a check converts or past it, and whatever a hook of the host's drops of the
+// actor's once its first check converted them: each check counts the actor's and the request's,
+// converted once for the change, as its own, and reads each resource's as its own.
+func TestAChangeDecidesEachScopeAsAChangeOfItAloneDoes(t *testing.T) {
+	seed := uint64(time.Now().UnixNano())
+	t.Logf("seed %d", seed)
+	rng := mathrand.New(mathrand.NewPCG(seed, 43))
+	var resources map[string]func() map[string]any
+	var n *int
+	var dropping func()
+	// converted is how many kinds' attributes were converted before the change under way.
+	var converted int
+	h := grouped(t, func(c *rbac.Config) {
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			r, err := resourceOf(ctx, tenant, s)
+			if made, ok := resources[s.ID]; ok && s.Type == rbac.GroupScope {
+				r.Attributes = made()
+			}
+			return r, err
+		}
+		c.Constraints = []rbac.Constraint{{Name: "dropping", Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) {
+			if dropping != nil && *n > converted {
+				dropping()
+				dropping = nil
+			}
+			return false, nil
+		}}}
+	})
+	g := grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "lead")
+	g.Condition = rbac.Condition{Expression: `size(request.attributes) >= 0 && size(subject.attributes) >= 0 && size(resource.attributes) >= 0 &&
+		resource.attributes.many.all(m, m.by == "resource")`}
+	h.seed(t, g)
+	lead := h.as(t, "lead")
+	var members []string
+	for i := range 200 {
+		members = append(members, fmt.Sprint("m", i))
+	}
+	h.join(t, members...)
+	// Maps a check makes as it converts a resource's attributes, after a hook dropped the actor's.
+	var many strings.Builder
+	for i := range 100 {
+		fmt.Fprintf(&many, `,{"by": "resource", "i": %d}`, i)
+	}
+	parsed := json.RawMessage("[" + many.String()[1:] + "]")
+	n = rbac.CountKindsConverted(t)
+	for trial := range 8 {
+		shared := drawnShared(rng, true)
+		actorSeed, ctx := rng.Uint64(), rbac.WithRequest(t.Context(), drawnAttributes(rng, shared, false))
+		// The actor as the host passes it to each change, and with drop what a hook of the host's
+		// drops of it.
+		actor := func() (rbac.Subject, func()) {
+			s := lead
+			s.Attributes = drawnAttributes(mathrand.New(mathrand.NewPCG(actorSeed, 0)), shared, true)
+			byName, listed := map[string]map[string]any{}, make([]*[4]int, 20)
+			for i := range 50 {
+				byName[fmt.Sprint(i)] = map[string]any{"by": "actor", "i": i}
+			}
+			for i := range listed {
+				listed[i] = &[4]int{i}
+			}
+			s.Attributes["byName"], s.Attributes["listed"] = byName, listed
+			return s, func() {
+				clear(byName)
+				clear(listed)
+				s.Attributes["a0"] = struct{}{}
+				runtime.GC()
+			}
+		}
+		var ids []string
+		resources = map[string]func() map[string]any{}
+		for i := range 5 {
+			id, resourceSeed := fmt.Sprintf("t%dg%d", trial, i), rng.Uint64()
+			ids = append(ids, id)
+			resources[id] = func() map[string]any {
+				attributes := drawnAttributes(mathrand.New(mathrand.NewPCG(resourceSeed, 0)), shared, true)
+				attributes["many"] = parsed
+				return attributes
+			}
+		}
+		h.groups(t, ids...)
+		change := func(groups []string, drop bool) error {
+			s, drops := actor()
+			if drop {
+				dropping, converted = drops, *n
+			}
+			defer func() { dropping = nil }()
+			var add []rbac.Member
+			for _, id := range groups {
+				add = append(add, rbac.Member{Group: id, Principal: identity(members[0])})
+				members = members[1:]
+			}
+			err := h.authz.ChangeMembers(ctx, s, "t1", add, nil)
+			if err != nil && !errors.Is(err, rbac.ErrDenied) {
+				t.Fatal(err)
+			}
+			return err
+		}
+		var allowed, denied []string
+		for _, id := range ids {
+			if change([]string{id}, false) == nil {
+				allowed = append(allowed, id)
+			} else {
+				denied = append(denied, id)
+			}
+		}
+		if len(allowed) > 0 {
+			if err := change(allowed, true); err != nil {
+				t.Errorf("trial %d: adding members to %v, each allowed alone: %v", trial, allowed, err)
+			}
+		}
+		for _, id := range denied {
+			if err := change(append(slices.Clone(allowed), id), true); err == nil {
+				t.Errorf("trial %d: adding members to %v, %s denied alone, was allowed", trial, allowed, id)
+			}
+		}
 	}
 }
 

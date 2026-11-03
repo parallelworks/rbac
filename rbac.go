@@ -530,13 +530,18 @@ type Constraint struct {
 // constraint answers true. Each constraint is given copies of its own of the subject and the
 // resource, their attributes, ancestors and label too, so one writing to them changes nothing
 // decided: a protobuf message among them copied by its fields, each message it reaches once, so one
-// holding itself is given as a copy holding itself, as a map holding itself is. Past 20,000 deep,
-// twice as deep as any condition reads, a copy holds zero values, but for what it copied less deep,
-// as copying deeper would overflow the stack. A host's struct among the attributes is copied by its
-// exported fields and those an unexported struct it embeds promotes: the rest, a pointer it embeds
-// unexported and the fields that promotes among them, reflection can't set, so they are shared. A
-// map's keys are shared, and what a pointer among them reaches, as a copied key would be another
-// key: key a map among the attributes by values, not pointers, or write through none.
+// holding itself is given as a copy holding itself, as a map holding itself is. A message of a
+// host's type that is its own reflection but makes messages of another, as one embedding a dynamic
+// message does, is copied as any other pointer of the host's type, by the struct it points to, so a
+// constraint reads the type the host passed, in a list, a field or a map of that type too: its
+// message is a copy of its own where the field embedding it is exported, as embedding it by its
+// type's name makes it, and shared, as below, where it isn't. Past 20,000 deep, twice as deep as any condition reads, a copy holds zero
+// values, but for what it copied less deep, as copying deeper would overflow the stack. A host's
+// struct among the attributes is copied by its exported fields and those an unexported struct it
+// embeds promotes: the rest, a pointer it embeds unexported and the fields that promotes among
+// them, reflection can't set, so they are shared. A map's keys are shared, and what a pointer among
+// them reaches, as a copied key would be another key: key a map among the attributes by values, not
+// pointers, or write through none.
 type ConstraintInput struct {
 	Tenant       string
 	ResourceType string
@@ -946,6 +951,9 @@ type Authorizer struct {
 	labels map[string]labelDimension
 	// clock is the time the call under way decides at (still), nil outside one.
 	clock *callClock
+	// asked is what the call under way converted of its subjects' and requests' attributes
+	// (askingOf), nil outside one.
+	asked map[askingKey]*asking
 }
 
 // permissionOn is a permission on a type of resource.
@@ -1130,6 +1138,7 @@ func (a *Authorizer) still() *Authorizer {
 	b := *a
 	b.clock = &callClock{host: a.cfg.Now}
 	b.cfg.Now = b.clock.now
+	b.asked = map[askingKey]*asking{}
 	return &b
 }
 

@@ -243,7 +243,9 @@ erDiagram
   delete reached by a prune its transaction records. Both triggers find history in the schema of
   the table they fire on, by a search_path each sets for its own run, so a session's own table
   named as history's stands in for none of it, whatever the schema is named, and refuse the row
-  where that search_path can't name the schema, as `$user` or one their role has no `USAGE` on.
+  where that search_path can't name the schema, as `$user` or one their role has no `USAGE` on,
+  before they read a table or call anything by it, so nothing such a table runs, as its row
+  security policy, runs as history's role.
   Each record reads its key's last by history's index of each entity's keys, in a generic plan with
   sequential scans off: a plan its session made while history was small would otherwise scan all
   of it for each row, and one made for each row, until history is analyzed, read all of the
@@ -414,27 +416,53 @@ sequenceDiagram
   turn on map order or on which kind reached a shared value first, and each kind is converted, and
   charged, whole, whatever it holds, but where it nests past `maxNested`: converting stops there, so
   what it is charged, and whether the kinds after it fit `maxConverted`, can turn on map order,
-  failing closed. A value reached twice is converted once, and converting costs a
-  check at most `maxConverted`, counted as `valueSize` counts what a condition reads, about what a
-  check may spend on a scope's grants' conditions, past which every condition reading an attribute
-  fails: converting isn't charged to a condition, and charging the check would let what one
-  condition reads fail the others. The subject's, the resource's and the request's attributes share
-  the bound, so ones users write, as a resource's tags, can fail the conditions of every check of
-  the resource, closed. So conditions run on CEL's own values alone, by CEL's own semantics, and a
+  failing closed. Nothing else does, nor on the order of the kinds: JSON text that may hold more
+  values than `maxConverted`, by its brackets, braces, commas and colons, fails them all unparsed,
+  where compared with what was left, it failed them where what came before it left less than it may
+  hold, though what it holds fit, as `[]` holds less than its brackets count. A value reached twice
+  is converted once, but for a resource's sharing it with the subject's or the request's (below),
+  and converting costs a check at most `maxConverted`, counted as `valueSize` counts what a
+  condition reads, about what a check may spend on a scope's grants' conditions, past which every
+  condition reading an attribute fails: converting isn't charged to a condition, and charging the
+  check would let what one condition reads fail the others. The subject's and the request's
+  attributes are converted once for a call, by one converter (`askingOf`), as a change checks them
+  on each scope it reaches, before its transaction and in it, and each check converts its resource's
+  apart, on a converter spending what that one left (`rest`): so each check counts all three, in the
+  order request, subject, resource, and a value the resource's share with them twice. Counting it
+  once, a check would know a value by where it points from one check to the next, and could read one
+  its resource's hold, made where one a hook of the host's dropped meanwhile was, as that one. A
+  converter knows what it converted only while it converts, which runs none of the host's code, so
+  what the host passed stays where it is, and it keeps what it decodes of JSON text and packed
+  messages where it is (`conversion.of`), as what a kind after decodes could otherwise come to be
+  there and be read as converted from it. So a host changes none of what it passed while the call
+  runs, as from a hook: a later check can read the subject's and the request's attributes as the
+  first converted them. Converted for each check, a change adding a member to 400 groups, its
+  request holding a map of 40,000 entries, took 6 seconds. The
+  subject's, the resource's and the request's attributes share the bound, so ones users write, as a
+  resource's tags, can fail the conditions of every check of the resource, closed.
+  So conditions run on CEL's own values alone, by CEL's own semantics, and a
   comparison that fails where either value holds a double that isn't finite sees every double there
   is. Each runs within the most evaluating it can cost, which its literals and types bound, and the
-  ids, kinds, types and tenant a check passes and its action, which are no longer than `MaxID`. What
-  a check reads together is bounded where it is stored, for each scope: an identity's conditional
-  grants, the conditional grants to groups, the tenant's members and the public, each the tenant's
-  and those from each source the host owns apart, the conditional denies, and the requirements of
-  groups' eligibilities for a role, and a change adding a condition past one is refused as invalid.
-  A check's budget is that for each scope on its path, so it evaluates every condition it reads, and
-  no grant made beside another changes what that one decides. Conditions stored before there were
-  bounds may be past one, and so may those another version of CEL bounds: each process bounds a
-  stored condition again by what the CEL it is built with makes of it, its macros and types, so an
-  upgrade can bound one more. `TestStoredConditionsKeepTheirBounds` pins the bounds of conditions of
-  common shapes, so that one an upgrade moves shows in review. A change adding no condition to them
-  isn't refused, and a check evaluates them cheapest first within its budget.
+  ids, kinds, types and tenant a check passes and its action, which are no longer than `MaxID`. CEL
+  charges some of what a condition does a constant or nothing, so the package charges it itself: a
+  list or map literal for each element or entry it builds, and a loop's step for each logical
+  operator and choice it may evaluate, on top of what CEL charges, a key a condition computes by its
+  length, and `contains`, `startsWith` and `endsWith` by the strings they read, at least 1 however
+  empty either is. A comparison, a search or a match that would cost more than a condition may fails
+  before it runs, as CEL charges a call only once it has run, and a program in which CEL plans one,
+  a literal, a key or a loop's condition where the package can't charge or refuse it isn't a
+  condition. What a check reads together is bounded where it is stored, for each
+  scope: an identity's conditional grants, the conditional grants to groups, the tenant's members
+  and the public, each the tenant's and those from each source the host owns apart, the conditional
+  denies, and the requirements of groups' eligibilities for a role, and a change adding a condition
+  past one is refused as invalid. A check's budget is that for each scope on its path, so it
+  evaluates every condition it reads, and no grant made beside another changes what that one
+  decides. Conditions stored before there were bounds may be past one, and so may those another
+  version of CEL bounds: each process bounds a stored condition again by what the CEL it is built
+  with makes of it, its macros and types, so an upgrade can bound one more.
+  `TestStoredConditionsKeepTheirBounds` pins the bounds of conditions of common shapes, so that one
+  an upgrade moves shows in review. A change adding no condition to them isn't refused, and a check
+  evaluates them cheapest first within its budget.
 
 ## A change
 

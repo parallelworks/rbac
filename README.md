@@ -237,11 +237,12 @@ scopes conditional ones reach, to check one by one.
   misnamed, or as another type, is refused when stored, and one stored under other declarations
   fails where it no longer passes them. A condition building a message, as
   `google.protobuf.Struct{...}`, is refused, and one stored before fails: a grant's gives nothing
-  and a deny's applies. What the host passes as attributes is converted, once for each check that
-  reads a condition, into CEL's own values, and conditions read nothing else: `nil`; a `bool`, a
-  string, an int, a uint or a float of any size, of a type of the host's own too, as a named string,
-  read by its kind; `time.Time` and `time.Duration`; bytes, as `[]byte` or an array of bytes;
-  slices, arrays and pointers of these, a nil pointer read as null; maps of these keyed by a bool, a
+  and a deny's applies. What the host passes as attributes is converted into CEL's own values where
+  a condition is read, the subject's and the request's once for each call, however many scopes a
+  change checks, and the resource's once for each check, and conditions read nothing else: `nil`; a
+  `bool`, a string, an int, a uint or a float of any size, of a type of the host's own too, as a
+  named string, read by its kind; `time.Time` and `time.Duration`; bytes, as `[]byte` or an array
+  of bytes; slices, arrays and pointers of these, a nil pointer read as null; maps of these keyed by a bool, a
   string, an int or a uint, or by an interface holding one; JSON text (`json.RawMessage`, a nil
   one read as null, as `encoding/json` writes it) and `json.Number`, parsed; the protobuf `Struct`, `ListValue`, `Value`, `NullValue`, wrappers,
   `Timestamp` and `Duration`, and an `Any` packing one of them; and CEL's own scalar values.
@@ -253,28 +254,43 @@ scopes conditional ones reach, to check one by one.
   struct, a channel, a func, any other message, a map keyed by anything else, as a double or an
   array, a map holding two keys read as the same value, as `1` and `1u`, invalid JSON, a value
   holding itself, or one that does, and a value nested more than 10,000 deep, as JSON text can't
-  be, along the longest path through them. A value reached twice is converted once. Reading the
+  be, along the longest path through them. A value reached twice is converted once, but one a
+  resource's attributes share with the subject's or the request's, below. Reading the
   rest left each operator to tell what it read from what it couldn't, as `in`, `has()` and loops
   over a map's keys each found a key whose value no condition could read. A check converts no more
-  than `2 × 80,000` of them, counted as reading them costs a condition, one for each value and a
-  tenth of each string's, bytes', JSON number's, JSON text's or `Any`'s type URL's length, and half
-  an `Any`'s packed bytes, about a map of 50,000 short strings: past that every condition reading an
-  attribute fails. Converting stops 10,000 deep, so what a kind nesting deeper is charged, and
-  whether the kinds after it fit, can turn on the order a map's entries come in, failing closed. The
-  subject's, the resource's and the request's attributes share that, so attributes a tenant's users
-  write, as a resource's tags, can take every check of the resource past it, where a grant's
-  condition reading an attribute gives nothing and a deny's applies, whoever asks: bound what users
-  may store, or pass conditions only what they read. Comparing a value
+  than `2 × 80,000` of them, the subject's and the request's included however many checks share
+  them, and a value the resource's share with them included again, as the resource's are converted
+  apart, counted as reading them costs a condition, one for each value and a tenth of each string's,
+  bytes', JSON number's, JSON text's or `Any`'s type URL's length, and half an `Any`'s packed bytes,
+  about a map of 50,000 short strings: past that every condition reading an attribute fails, as it
+  does where JSON text may hold more, by its brackets, braces, commas and colons. Converting stops
+  10,000 deep, so what a kind nesting deeper is charged, and whether the kinds after it fit, can
+  turn on the order a map's entries come in, failing closed, and nothing else turns on that order,
+  nor on the order of the kinds. The subject's, the
+  resource's and the request's attributes share that, so attributes a tenant's users write, as a
+  resource's tags, can take every check of the resource past it, where a grant's condition reading
+  an attribute gives nothing and a deny's applies, whoever asks: bound what users may store, or pass
+  conditions only what they read. A call reads the subject's and the request's as its first check
+  converted them: change none of them while it runs, as from a hook, as a check after the change can
+  read them as they were, though never another value as one of them. Comparing a value
   holding a double that isn't finite fails, in a list or a map too. Each condition runs within the
   most evaluating it can cost, which its literals and types bound: little for comparing what a
   request passes with literals, or with the ids, kinds, types and tenant a check passes or its
   action, which are no longer than `MaxID`, and all a condition may for reading the size of, or
   looping over, a list the request passes, or for looking up a key the request passes in a map,
   which hashes the key whole, as
-  `{"dev": 1, "prod": 2}[resource.attributes.env]` does. Cost is bounded per check too, for each
-  scope on its path, and the conditions a check reads together are bounded where they are stored:
-  an identity's grants' on a scope, those of a scope's grants to groups, the tenant's members and
-  the public, each the tenant's and those from each source the host owns apart, a scope's denies',
+  `{"dev": 1, "prod": 2}[resource.attributes.env]` does. A list literal costs 1 more for each
+  element and a map literal 2 for each entry, each time it is built, and a step of a loop 1 more
+  for each `&&`, `||` and `?:` it may evaluate, its macro's own among them, which CEL charges a
+  constant or nothing. `contains` costs what reading both strings does, multiplied, and
+  `startsWith` and `endsWith` what reading
+  the shorter does, at least 1 however short or empty either is, and one costing more than a
+  condition may fails before it runs: `contains` of one long string the request passes in another
+  tries each place in it, which can take a third of a second. Cost is bounded per check too, for
+  each scope on its path, and the conditions a check reads together are bounded where they are
+  stored: an identity's grants' on a scope, those of a scope's grants to groups, the tenant's
+  members and the public, each the tenant's and those from each source the host owns apart, a
+  scope's denies',
   and the requirements of groups' eligibilities for a role on a scope. Each holds hundreds of
   comparisons with literals, a hundred of an attribute with the subject's id, or three of the
   longest conditions that read a list, look up a key the request passes or loop, and a change
@@ -287,8 +303,14 @@ scopes conditional ones reach, to check one by one.
   more, can leave conditions stored past a bound in the same way: each process bounds a stored
   condition again by what it and the CEL it is built with make of it, so another version can bound
   one more, and the package's tests pin the bounds of conditions of common shapes, so that one an
-  upgrade moves fails them. Going back to an earlier release of this package does the same where
-  that release bounds a shape more, so while replicas of two releases run side by side, those
+  upgrade moves fails them. A condition holding a literal or a logical operator is bounded a few
+  units higher than before they were charged so, and one rebuilding a literal of hundreds at each
+  step of a loop at all a condition may cost, past which it fails: a grant's gives nothing and a
+  deny's applies. A step of `all`, `exists`, `exists_one`, `filter` or a `map` that filters costs
+  1 more for the operator its macro evaluates, so one looping over a list the request passes, which
+  cost nearly all a condition may, can now cost more, and fails the same way. Going back to an
+  earlier release of this package does the same where that release bounds a shape more, so while
+  replicas of two releases run side by side, those
   bounding a shape more may refuse changes adding a condition to a scope the others filled. To
   hand a permission on, the actor holds it unconditionally or under the same condition, one that
   doesn't read the subject: that one decides for each holder, so the actor's holding says nothing
@@ -351,9 +373,11 @@ scopes conditional ones reach, to check one by one.
   type the role's grants can be on, as of no resource and on the tenant, where a condition reading
   the resource can't be evaluated and so denies: a role's grants span scopes no one reads, so they
   are stopped wherever either may stop `Apply` on some scope of the type, not only on those it would.
-  The host's own writes (`Import`, `DeleteGrants`, `SetMemberships`, `ImportMembers`,
-  `DeleteMembers`, `DeleteGroups` and the host's deletes) make none of the checks an actor's change
-  makes, so a freeze stops none of them: the host freezes those itself. The host is
+  The host's own writes (`Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`,
+  `ImportMembers`, `DeleteMembers`, `DeleteGroups` and the host's deletes) make none of the checks
+  an actor's change makes, so a freeze stops none of them, `ImportGroups` taking a tenant's group
+  over too, which removes the members the tenant put there and cuts short what they activated
+  through it: the host freezes those itself. The host is
   asked before a change takes its locks, so a change is tried again (`rbac.ErrConflict`) when the
   memberships its answers rest on, of an identity it grants to or of a group's members, changed
   in between, or a group a change to members reaches was nested in another. A change to a group
@@ -680,8 +704,9 @@ whose checks are the application's own to make; `History`, `Export` and `PruneHi
 `AsOf`'s checks of history, name history's table by the package's schema and their types by
 pg_catalog's, so none stands in for them, and refuse a search_path that names pg_temp first. And
 history's triggers find history beside the table each fires on, whatever the schema is named, or
-refuse the row where their search_path can't name that schema, so none stands in for the history a
-change is recorded in, or a prune checked against.
+refuse the row where their search_path can't name that schema, before they read a table or call
+anything by it: so none stands in for the history a change is recorded in, or a prune checked
+against, and nothing such a table runs, as its row security policy, runs as history's role.
 
 ## Running it
 
@@ -796,6 +821,15 @@ change is recorded in, or a prune checked against.
   about a microsecond of the 70 to 100 it takes, and refuses the row where its search_path can't
   name that schema: a search_path reads `$user`, however it is quoted, as a role's name, and leaves
   out a schema the role has no `USAGE` on.
+  `0024_record_refuses_first` replaces `rbac_record` again, which keeps its owner, who may execute
+  it and its settings, and takes no lock on the tables, as `0023_history_schema` does. Before it,
+  `rbac_record` read the row's last record from history before it refused a search_path that can't
+  name the table's schema: where history's role had no `USAGE` on the schema, or the schema was
+  named `$user`, it read a session's own table named as history's, as that role, and whatever the
+  table runs, as its row security policy, ran with that role's rights before the row was refused.
+  What a rollback doesn't undo stayed, as setting history's id sequence back, after which a row's
+  later records are numbered below its earlier ones, and `AsOf` reads it as it was before them. It
+  now refuses before it reads a table, or calls a function or an operator its search_path finds.
 - **Renaming the schema:** from `0023_history_schema` on, `ALTER SCHEMA ... RENAME` keeps history:
   its triggers find it beside the table each fires on, whatever the schema is named, and a
   generation names the schema by its OID, so exports read on from their cursors and checkpoints.
