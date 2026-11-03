@@ -9987,6 +9987,268 @@ func TestADenyBelowTheTenantStopsARedefinitionHandedOnThroughARoleListingOneList
 	}
 }
 
+// removedInW1 configures a constraint removing p from x on workspace w1 and the resources under it,
+// as one telling containers apart does, and asked of no resource, as one that may remove it on any
+// does: asked of the tenant, which has no ancestors, it removes nothing. It tells asked of each
+// question first, where set, and fails with what that returns.
+func removedInW1(p rbac.Permission, asked func(context.Context, rbac.ConstraintInput) error) func(*rbac.Config) {
+	return func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "x-in-w1", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if asked != nil {
+				if err := asked(ctx, in); err != nil {
+					return false, err
+				}
+			}
+			if in.Permission != p || in.Subject == nil || in.Subject.Principal.ID != "x" {
+				return false, nil
+			}
+			r := in.Resource
+			return r == nil || r.Scope() == workspace.Scope() || slices.Contains(r.Ancestors, workspace.Scope()), nil
+		}}}
+	}
+}
+
+// A constraint removing root from x in w1, though not asked of the tenant above it, keeps x from
+// handing root on there, as Apply granting it there; so it stops x widening a role granted there to
+// give root, which hands root on there just the same, as a deny there does. Granted only where the
+// constraint removes nothing, the role is widened.
+func TestAConstraintOnAScopeStopsARedefinitionHandingOnWhatItRemovesThere(t *testing.T) {
+	for _, on := range []rbac.Resource{cluster, {Tenant: "t1", Type: "cluster", ID: "c2"}} {
+		t.Run(on.ID, func(t *testing.T) {
+			h := setup(t, removedInW1(root, nil))
+			ctx := t.Context()
+			x, r := definer(t, h)
+			y := h.as(t, "y")
+			h.seed(t, grant(on.Scope(), r.ID, rbac.User, "y"))
+			if err := h.authz.Apply(ctx, x, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: y.Principal}}}); !errors.Is(err, rbac.ErrDenied) {
+				t.Fatalf("granting root in w1: %v", err)
+			}
+			wider := r
+			wider.Permissions = []rbac.Permission{view, root}
+			err := h.authz.SetRole(ctx, x, "t1", wider)
+			if on.ID != cluster.ID {
+				if err != nil || !allowed(t, h, y, root, on) {
+					t.Fatalf("widening a role granted only outside w1 to give root: %v", err)
+				}
+				return
+			}
+			var denied *rbac.DeniedError
+			if !errors.As(err, &denied) || denied.Permission != root || denied.Scope != cluster.Scope() || !strings.Contains(denied.Reason, "x-in-w1") ||
+				allowed(t, h, y, root, cluster) {
+				t.Fatalf("widening a role granted in w1 to give root: %v", err)
+			}
+		})
+	}
+}
+
+// A role granted in w1 that lists r lets its holders grant r there without holding it, so widening r
+// hands on there what r will give: the constraint removing root from x in w1 stops it. Listed by a
+// role granted only outside w1, r is widened, and handed on there.
+func TestAConstraintOnAScopeStopsARedefinitionHandedOnByARoleListingIt(t *testing.T) {
+	for _, on := range []rbac.Resource{cluster, {Tenant: "t1", Type: "cluster", ID: "c2"}} {
+		t.Run(on.ID, func(t *testing.T) {
+			h := setup(t, removedInW1(root, nil))
+			ctx := t.Context()
+			x, r := definer(t, h)
+			l := listing(t, h, x, r)
+			y, z := h.as(t, "y"), h.as(t, "z")
+			h.seed(t, grant(on.Scope(), l.ID, rbac.User, "y"))
+			wider := r
+			wider.Permissions = []rbac.Permission{view, root}
+			err := h.authz.SetRole(ctx, x, "t1", wider)
+			if applied := h.authz.Apply(ctx, y, on, rbac.Change{Grant: []rbac.Binding{{Role: r.ID, Principal: z.Principal}}}); applied != nil {
+				t.Fatal(applied)
+			}
+			if on.ID != cluster.ID {
+				if err != nil || !allowed(t, h, z, root, on) {
+					t.Fatalf("widening a role listed only outside w1 to give root: %v", err)
+				}
+				return
+			}
+			var denied *rbac.DeniedError
+			if !errors.As(err, &denied) || denied.Permission != root || denied.Scope != cluster.Scope() || allowed(t, h, z, root, cluster) {
+				t.Fatalf("widening a role that one granted in w1 lists to give root: %v", err)
+			}
+		})
+	}
+}
+
+// A grant to the tenant's members of a privileged role gives nothing, so narrowing the role so that
+// it no longer is hands on to them what it gives where they hold it: a constraint removing view
+// from x in w1, where they do, stops it, as it stops Apply granting them view there. Held by them
+// only outside w1, the role is narrowed.
+func TestAConstraintWhereTheMembersHoldARoleNoLongerPrivilegedStopsNarrowingIt(t *testing.T) {
+	for _, on := range []rbac.Scope{workspace.Scope(), {Type: "cluster", ID: "c2"}} {
+		t.Run(on.Key(), func(t *testing.T) {
+			h := setup(t, removedInW1(view, nil))
+			ctx := t.Context()
+			x, r := definer(t, h)
+			member := h.as(t, "m")
+			// Privileged, as it gives root, and granted to the members, as a catalog change would leave it.
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.op', '{cluster:view,cluster:root}', '{cluster}')`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+				VALUES ('t1', $1, $2, 'members', 't1', 'custom.op')`, on.Type, on.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.authz.Apply(ctx, x, workspace, rbac.Change{Grant: []rbac.Binding{{Role: r.ID, Principal: rbac.TenantMembers("t1")}}}); !errors.Is(err, rbac.ErrDenied) {
+				t.Fatalf("granting the members view in w1: %v", err)
+			}
+			narrowed := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+			err := h.authz.SetRole(ctx, x, "t1", narrowed)
+			if on != workspace.Scope() {
+				if err != nil || !allowed(t, h, member, view, rbac.Resource{Tenant: "t1", Type: on.Type, ID: on.ID}) {
+					t.Fatalf("narrowing a role the members hold only outside w1: %v", err)
+				}
+				return
+			}
+			var denied *rbac.DeniedError
+			if !errors.As(err, &denied) || denied.Permission != view || denied.Scope != workspace.Scope() || allowed(t, h, member, view, cluster) {
+				t.Fatalf("narrowing a role the members hold in w1 so that it is no longer privileged: %v", err)
+			}
+		})
+	}
+}
+
+// What the constraints answered before SetRole's transaction it reads back under the tenant's lock,
+// so a role listing the one it widens, granted in w1 while the change waited, which they weren't
+// asked about, refuses it, to be tried again, and then the constraint removing root from x in w1
+// stops it: whether they were asked about each scope the role gives more on, as where it is granted
+// outside w1, or about none, as where it gives more nowhere.
+func TestARoleListingARedefinitionGrantedMeanwhileWhereAConstraintRemovesWhatItGivesIsTriedAgain(t *testing.T) {
+	for _, before := range []bool{false, true} {
+		t.Run(fmt.Sprintf("granted outside w1 %t", before), func(t *testing.T) {
+			var meanwhile func(context.Context) error
+			// The freezes are asked after the scopes the change reaches are read, and before the
+			// constraints are asked about them.
+			h := setup(t, removedInW1(root, func(ctx context.Context, in rbac.ConstraintInput) error {
+				if do := meanwhile; do != nil && in.Permission == "workspace:grant" {
+					meanwhile = nil
+					return do(ctx)
+				}
+				return nil
+			}))
+			ctx := t.Context()
+			x, r := definer(t, h)
+			l := listing(t, h, x, r)
+			z, w := h.as(t, "z"), h.as(t, "w")
+			if before {
+				h.seed(t, grant(rbac.Scope{Type: "cluster", ID: "c2"}, r.ID, rbac.User, "y"))
+			}
+			meanwhile = func(ctx context.Context) error {
+				return h.authz.Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), l.ID, rbac.User, "z")})
+			}
+			wider := r
+			wider.Permissions = []rbac.Permission{view, root}
+			if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.Is(err, rbac.ErrConflict) {
+				t.Fatalf("widening a role that one granted in w1 while the change waited lists: %v", err)
+			}
+			if meanwhile != nil {
+				t.Fatal("the role listing it should have been granted in w1 meanwhile")
+			}
+			if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.Is(err, rbac.ErrDenied) {
+				t.Fatalf("tried again: %v", err)
+			}
+			if applied := h.authz.Apply(ctx, z, cluster, rbac.Change{Grant: []rbac.Binding{{Role: r.ID, Principal: w.Principal}}}); applied != nil {
+				t.Fatal(applied)
+			}
+			if allowed(t, h, w, root, cluster) {
+				t.Fatal("root was handed on in w1 through the role listing it")
+			}
+		})
+	}
+}
+
+// Without Config.ResourceOf the scopes a redefinition gives more on are asked of no resource, so a
+// constraint that may remove what it hands on on any of them, as one removing root from x in w1
+// answers there, stops widening the role to give it wherever the role is granted; widening it by
+// what the constraint removes nowhere it doesn't stop.
+func TestWithoutResourceOfAConstraintThatMayRemoveWhatARedefinitionHandsOnAnywhereStopsIt(t *testing.T) {
+	h := setup(t, removedInW1(root, nil), func(c *rbac.Config) { c.ResourceOf = nil })
+	ctx := t.Context()
+	x, r := definer(t, h)
+	y := h.as(t, "y")
+	elsewhere := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c2"}
+	h.seed(t, grant(elsewhere.Scope(), r.ID, rbac.User, "y"))
+	wider := r
+	wider.Permissions = []rbac.Permission{view, root}
+	var denied *rbac.DeniedError
+	if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.As(err, &denied) || denied.Permission != root || allowed(t, h, y, root, elsewhere) {
+		t.Fatalf("widening a role to give root with no scope told apart: %v", err)
+	}
+	wider.Permissions = []rbac.Permission{view, login}
+	if err := h.authz.SetRole(ctx, x, "t1", wider); err != nil || !allowed(t, h, y, login, elsewhere) {
+		t.Fatalf("widening it to give login: %v", err)
+	}
+}
+
+// A redefinition asks the host about each scope it gives more on once, however many grants of the
+// role and of roles listing it are there: Config.ResourceOf, and the constraints about each
+// permission it hands on there, whose answers it reads back under the tenant's lock. Where the
+// constraints, asked of no resource, remove nothing it hands on, it asks about no scope.
+func TestARedefinitionAsksTheHostAboutEachScopeItGivesMoreOnOnce(t *testing.T) {
+	resolved := map[rbac.Scope]int{}
+	asked := map[string]int{}
+	h := setup(t, removedInW1(root, func(_ context.Context, in rbac.ConstraintInput) error {
+		if in.Resource != nil {
+			asked[fmt.Sprintf("%s %s %s", in.Resource.Scope().Key(), in.Permission, in.ResourceType)]++
+		}
+		return nil
+	}), func(c *rbac.Config) {
+		of := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			resolved[s]++
+			return of(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	x, r := definer(t, h)
+	l := listing(t, h, x, r)
+	other := rbac.RoleDefinition{ID: "custom.other", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(ctx, x, "t1", other); err != nil {
+		t.Fatal(err)
+	}
+	scopes := []rbac.Scope{{Type: "cluster", ID: "c2"}, {Type: "cluster", ID: "c3"}, {Type: "org", ID: "o2"}}
+	var grants []rbac.Grant
+	for _, s := range scopes {
+		for _, p := range []string{"y", "z"} {
+			h.as(t, p)
+			grants = append(grants, grant(s, r.ID, rbac.User, p), grant(s, other.ID, rbac.User, p))
+		}
+	}
+	h.as(t, "w")
+	h.seed(t, append(grants, grant(scopes[0], l.ID, rbac.User, "w"))...)
+	clear(resolved)
+	clear(asked)
+	wider := r
+	wider.Permissions = []rbac.Permission{view, root}
+	if err := h.authz.SetRole(ctx, x, "t1", wider); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range scopes {
+		if k := s.Key() + " " + string(root) + " cluster"; resolved[s] != 1 || asked[k] != 1 {
+			t.Errorf("%s: Config.ResourceOf asked %d times, the constraint about root %d", s.Key(), resolved[s], asked[k])
+		}
+	}
+	if len(resolved) != len(scopes) {
+		t.Errorf("Config.ResourceOf asked about %v", resolved)
+	}
+	for k, n := range asked {
+		if n > 1 {
+			t.Errorf("the constraint was asked about %s %d times", k, n)
+		}
+	}
+	clear(resolved)
+	other.Permissions = []rbac.Permission{view, login}
+	if err := h.authz.SetRole(ctx, x, "t1", other); err != nil {
+		t.Fatal(err)
+	}
+	if len(resolved) > 0 {
+		t.Errorf("widened by what the constraint removes nowhere, Config.ResourceOf was asked about %v", resolved)
+	}
+}
+
 func TestExplainNamesTheDenyAuthorizeDoes(t *testing.T) {
 	h, guardian := guarded(t)
 	ctx := t.Context()

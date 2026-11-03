@@ -561,8 +561,11 @@ type ConstraintInput struct {
 	// on any of them: one that tells them apart by id or attributes sees only the scope, and would let
 	// the actor hand on what it can't use on them. It is nil in Filter and Reachable, and in SetRole
 	// and DeleteRole, which change grants on every scope of a type, but for what SetRole's role gives,
-	// asked about the tenant; and in the first ask of ChangeMembers and DeleteGroup about the power
-	// to change grants on scopes of a type they take access away on, which then ask again about each
+	// asked about the tenant as defining it, and where SetRole has it give more, about each scope its
+	// grants, or a role listing it, are on, as Apply granting it there asks: nil first, and only
+	// where one answers true, each such scope as Config.ResourceOf gives it, or without it, nil
+	// stands for them all; and in the first ask of ChangeMembers and DeleteGroup about the power to
+	// change grants on scopes of a type they take access away on, which then ask again about each
 	// such scope where one answers true.
 	Resource *Resource
 }

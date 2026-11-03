@@ -2623,6 +2623,36 @@ func TestALabelValueIsHandedOnAsChecksDecideIt(t *testing.T) {
 	}
 }
 
+// A redefinition asks the constraints about the label values it hands on on the bare tenant, as
+// checks decide them, though it asks about what else it hands on of no resource first: so a
+// constraint that may remove a value elsewhere, as it answers asked of no resource, but not on the
+// tenant, where the value is held, is never asked of no resource about it, and doesn't stop it.
+func TestARedefinitionAsksAboutTheLabelValuesItHandsOnOnTheTenant(t *testing.T) {
+	var anywhere []rbac.ConstraintInput
+	h := labeled(t, removedInW1("level:high", func(_ context.Context, in rbac.ConstraintInput) error {
+		if in.Resource == nil && strings.HasPrefix(string(in.Permission), "level:") {
+			anywhere = append(anywhere, in)
+		}
+		return nil
+	}))
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.roles", rbac.User, "x"))
+	h.hold(t, "x", "level:low", "level:high")
+	x, y := h.as(t, "x"), h.as(t, "y")
+	r := rbac.RoleDefinition{ID: "custom.cleared", Permissions: []rbac.Permission{"level:low"}, ResourceTypes: []string{rbac.TenantScope}}
+	if err := h.authz.SetRole(ctx, x, "t1", r); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(rbac.TenantRoot("t1"), r.ID, rbac.User, "y"))
+	r.Permissions = []rbac.Permission{"level:low", "level:high"}
+	if err := h.authz.SetRole(ctx, x, "t1", r); err != nil || !allowed(t, h, y, "level:high", tenantT1) {
+		t.Fatalf("widening a role granted on the tenant to give level:high, which the constraint leaves x there: %v", err)
+	}
+	if len(anywhere) > 0 {
+		t.Errorf("the constraint was asked about a label value of no resource: %+v", anywhere)
+	}
+}
+
 // A label value's conditions can't read the tenant's attributes: it is decided on the bare tenant,
 // where any read of them fails, a test of one's presence, in, size(), a macro and a comparison
 // too, so a deny guarded by one applies and a grant guarded by one's absence gives nothing,

@@ -128,8 +128,12 @@ scopes conditional ones reach, to check one by one.
   label of a scope its grants are on, as `Config.ResourceOf` gives it, refuses, or a deny on that
   scope's path keeps from changing grants there, can neither change what its grants give nor
   delete it, nor widen it where a deny there, or where a role listing it, or listing one that does,
-  is granted, removes a permission it would give or the power to grant it, or the label of a scope
-  such a role is granted on refuses it. A grant widens by what it gives through its principal, as
+  is granted, removes a permission it would give or the power to grant it, or a constraint does on
+  that scope, as it would stop `Apply` granting the role there, though defining the role asks it of
+  the tenant, or the label of a scope such a role is granted on refuses it. The constraints are
+  asked about what it would hand on of no resource first, and only where one answers that it may
+  remove some of it, about each such scope, once, as `Config.ResourceOf` gives it; without it, that
+  first answer stands for every scope. A grant widens by what it gives through its principal, as
   checks read it: one to the tenant's members of a privileged role, or to the public of a role not
   marked `Public`, gives nothing, so widening the role asks nothing about it, and a redefinition
   that has it give something, as narrowing the role so that it is no longer privileged does, widens
