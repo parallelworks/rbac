@@ -830,6 +830,13 @@ against, and nothing such a table runs, as its row security policy, runs as hist
   What a rollback doesn't undo stayed, as setting history's id sequence back, after which a row's
   later records are numbered below its earlier ones, and `AsOf` reads it as it was before them. It
   now refuses before it reads a table, or calls a function or an operator its search_path finds.
+  Code from before advisory locks were keyed by SHA-256 must not run beside code after it: the two
+  key every lock apart, so a change by one waits for none by the other, and what each checks under
+  its locks can change before it commits, as two changes each giving an identity one value of an
+  Exclusive dimension can both commit. Stop the replicas running it before starting any running
+  this, and don't start them again: no migration records the change. `Migrate`'s own lock is keyed
+  anew too, so a replica of each doesn't wait for the other's migration, which matters only where
+  the two run at once.
 - **Renaming the schema:** from `0023_history_schema` on, `ALTER SCHEMA ... RENAME` keeps history:
   its triggers find it beside the table each fires on, whatever the schema is named, and a
   generation names the schema by its OID, so exports read on from their cursors and checkpoints.
