@@ -1555,6 +1555,95 @@ func TestAnActorsPathsToItsGroupsAreReadOnceForTheDeniesNamingIt(t *testing.T) {
 	}
 }
 
+// Each principal and exemption a deny names is looked up in an object of the keys its subject is
+// bound or exempted by, built once for the statement, so a deny costs a check, Explain, Permissions
+// and a change's read of its actor's authority, with when its exemption ends, a few comparisons for
+// each key it names however many groups the subject is in: for a subject in 1,010 groups, the
+// hundred denies the tenant can hold, each naming and exempting 256 principals, the subject's last,
+// cost little more than as many naming and exempting the subject's alone, in a custom plan and a
+// generic one. An overlap of arrays compared each key a deny names with every one of the subject's,
+// which took seconds for each. The cost is spent inside one call for each deny, which no plan's
+// counts of rows, loops or buffers show, so the two are timed: in turn, each first in every other
+// round, the fastest of several runs of each, so what slows the database slows both.
+func TestDeniesCostTheirKeysHoweverManyGroupsTheSubjectIsIn(t *testing.T) {
+	ctx := t.Context()
+	for _, mode := range []string{"force_custom_plan", "force_generic_plan"} {
+		// By how many principals each deny names and exempts, as many but the subject's.
+		hs := map[int]*harness{}
+		for _, others := range []int{0, 255} {
+			h := setupOn(t, pgtest.Open(t, "jit=off&plan_cache_mode="+mode))
+			h.seed(t, grant(cluster.Scope(), "cluster.admin", rbac.User, "u"))
+			h.as(t, "u", "staff", "oncall")
+			// The denies remove root, which u holds for good through staff, and exempt it through
+			// oncall, whose place ends in an hour, so a change reads when that exemption ends.
+			for _, q := range []struct {
+				sql  string
+				args []any
+			}{
+				{`UPDATE rbac_members SET expires_at = $1 WHERE tenant = 't1' AND group_id = 'oncall'`, []any{h.now.Add(time.Hour)}},
+				{`INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'g' || i FROM generate_series(1, 1010) i`, nil},
+				{`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+				  SELECT 't1', 'g' || i, 'user', 'u' FROM generate_series(1, 10) i
+				  UNION ALL SELECT 't1', 'g' || (10 + (i - 1) * 100 + j), 'group', 'g' || i FROM generate_series(1, 10) i, generate_series(1, 100) j`, nil},
+				{`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+				  SELECT 't1', 'tenant', 't1', 'd' || i, ARRAY(SELECT 'group:other' || i || '_' || j FROM generate_series(1, $1) j) || 'group:staff'::text,
+				    ARRAY(SELECT 'user:other' || i || '_' || j FROM generate_series(1, $1) j) || 'group:oncall'::text, '{cluster:root}'
+				  FROM generate_series(1, 100) i`, []any{others}},
+				{`ANALYZE rbac_groups, rbac_members, rbac_denies`, nil},
+			} {
+				if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			hs[others] = h
+		}
+		u := rbac.Subject{Principal: identity("u")}
+		calls := []struct {
+			name string
+			call func(*harness) error
+		}{
+			{"Authorize", func(h *harness) error { return h.authz.Authorize(ctx, u, root, cluster) }},
+			{"Explain", func(h *harness) error {
+				d, err := h.authz.Explain(ctx, u, root, cluster)
+				if err == nil && !d.Allowed {
+					err = fmt.Errorf("refused: %s", d.Reason)
+				}
+				return err
+			}},
+			{"Permissions", func(h *harness) error {
+				ps, err := h.authz.Permissions(ctx, u, cluster)
+				if err == nil && !slices.Contains(ps, root) {
+					err = fmt.Errorf("permissions %v", ps)
+				}
+				return err
+			}},
+			{"Apply", func(h *harness) error {
+				return h.authz.Apply(ctx, u, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("x")}}})
+			}},
+		}
+		for _, c := range calls {
+			took := map[int]time.Duration{}
+			// Each shape runs first in every other round, so a stretch of load meets both alike.
+			order := []int{0, 255}
+			for range 7 {
+				for _, others := range order {
+					start := time.Now()
+					if err := c.call(hs[others]); err != nil {
+						t.Fatalf("%s with denies of %d principals: %v", c.name, others+1, err)
+					}
+					if d := time.Since(start); took[others] == 0 || d < took[others] {
+						took[others] = d
+					}
+				}
+				slices.Reverse(order)
+			}
+			if few, many := took[0], took[255]; many > 4*few+50*time.Millisecond {
+				t.Errorf("under %s, for a subject in 1,010 groups, %s took %v with 100 denies of 1 principal and 1 exemption each, and %v of 256 and 256", mode, c.name, few, many)
+			}
+		}
+	}
+}
+
 // Scopes a change to members reaches decide together where the actor holds the same grants on each
 // and no deny tells them apart: one exempting it until a time on one's path does, so what the
 // change hands on there is decided there.

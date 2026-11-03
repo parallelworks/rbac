@@ -1268,7 +1268,7 @@ func (a *Authorizer) deniedBelow(ctx context.Context, q DB, tenant string, actor
 	var denied bool
 	err := q.QueryRow(ctx, `WITH RECURSIVE `+ctes+`
 		SELECT EXISTS (SELECT FROM rbac_denies WHERE `+naming("principals", "ARRAY(SELECT k FROM bound)")+` AND scope_type <> $4
-		  AND (NOT exempt && ARRAY(SELECT k FROM exempted)`+until+`))`,
+		  AND (NOT `+keyed("exempt", "SELECT k FROM exempted")+until+`))`,
 		tenant, actor.identityKey(), a.cfg.Now(), TenantScope).Scan(&denied)
 	return denied, err
 }
