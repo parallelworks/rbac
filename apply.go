@@ -999,7 +999,10 @@ type constrained struct {
 	ctx   context.Context
 	actor Subject
 	on    Resource
-	asked map[permissionOn]bool
+	// anywhere asks of no resource, as of every scope of a type in on's tenant at once, where a
+	// constraint answers true that removes the permission on any of them.
+	anywhere bool
+	asked    map[permissionOn]bool
 	// listed are removesAny's answers: the first of the types each removes its permission on, or -1.
 	listed map[typesAsked]int
 	// by names the constraint that removed each permission on each type, for a refusal to say.
@@ -1022,6 +1025,14 @@ func (a *Authorizer) constrain(ctx context.Context, actor Subject, on Resource) 
 		a: a, ctx: ctx, actor: actor, on: on,
 		asked: map[permissionOn]bool{}, listed: map[typesAsked]int{}, by: map[permissionOn]string{},
 	}
+}
+
+// constrainAnywhere is what the constraints remove from actor on every scope of a tenant at once,
+// asked of no resource (anywhere).
+func (a *Authorizer) constrainAnywhere(ctx context.Context, actor Subject, tenant string) *constrained {
+	c := a.constrain(ctx, actor, tenantResource(tenant))
+	c.anywhere = true
+	return c
 }
 
 // holding is the actor's label values, read on q through c, which is on the tenant, the first time
@@ -1175,7 +1186,12 @@ func (c *constrained) removes(p Permission, resourceType string) bool {
 	// A label value is asked about as checks decide it, or an actor could hand on, through a tenant
 	// passed with attributes, one it can't use.
 	on := c.a.decidedOn(p, c.on)
-	name, err := c.a.denied(c.ctx, ConstraintInput{Tenant: c.on.Tenant, ResourceType: resourceType, Permission: p, Subject: &c.actor, Resource: &on})
+	in := ConstraintInput{Tenant: c.on.Tenant, ResourceType: resourceType, Permission: p, Subject: &c.actor, Resource: &on}
+	// Anywhere, a label value is still decided on the bare tenant, where it is held alone.
+	if c.anywhere && !c.a.labelPermission(p) {
+		in.Resource = nil
+	}
+	name, err := c.a.denied(c.ctx, in)
 	if err != nil {
 		c.err = err
 	}

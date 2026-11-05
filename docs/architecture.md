@@ -536,7 +536,8 @@ sequenceDiagram
   of scope the role's grants can be on (`changesStopped`, `changesDenied`), where a deny's condition
   reading the resource can't be evaluated and so denies (`handsOn`): stricter than `Apply` on a scope
   such a condition spares, as the grants span scopes no one reads, but never weaker, and only for a
-  deny below the tenant or a label is each scope read from the host. `ChangeMembers` asks the
+  deny below the tenant, a label, or a constraint on what `SetRole` hands on where it gives more
+  (`handedOnStopped`) is each scope read from the host. `ChangeMembers` asks the
   constraints once about each type of scope a member only loses access on, of no resource
   (`freezes`), and reads the types whose power to change grants a deny binding the actor lists
   (`grantsDenied`); only for a scope of a type either names, or whose label can refuse the actor, is
@@ -597,15 +598,30 @@ sequenceDiagram
   scope of the path, which conditions stored past their bound can spend on a shorter path alone. A
   grant to the tenant's members of a privileged role is read there as one to a principal named one
   by one (`widenedTo.reaches`): a catalog change that has the role no longer be privileged gives
-  them what it gives, what the redefinition added too, and asks no one. A scope read as stored, as
-  the host no longer has it, that the change comes to give more on while it waits refuses it with
+  them what it gives, what the redefinition added too, and asks no one. The constraints are decided
+  so too where a grant widens, or a role listing it is granted, on that scope, as `Apply` asks them
+  there, not only on the tenant, as `mayDefine` does: of each such scope as `Config.ResourceOf`
+  gives it, once, whatever they would answer of no resource, as one that tells resources apart can
+  answer nothing there, of the power to change grants there, which `changesStopped` asks only of no
+  resource, and of what the role gives where the grant reaches, as `Apply` walks it: on a resource,
+  for that resource's type alone, a `<type>:grant` of another type being a permission like any
+  other there, which only the constraints are asked about, as `mayDefine` decides holding it
+  (`handsOnAt`). Their answers are read back under the lock, where a scope it gives more on that
+  they weren't asked about refuses it with `ErrConflict` (`handedOnStopped`, `handing`). Without
+  `Config.ResourceOf`, a scope is asked about as stored where that is all of it (`resolves`), and
+  otherwise of no resource, which stands for every such scope. A scope where a role listing it is
+  granted counts only where its holders may grant it there: by a `<type>:grant` that role gives for
+  that type, on scopes of the type the grant reaches, as nothing reaches the tenant but itself
+  (`handingOn`). Each scope costs a `Config.ResourceOf` call and the walk `Apply` granting the role there
+  makes, as `ValidateGrant` is asked about each grant it widens. A scope read as stored, as the host
+  no longer has it, that the change comes to give more on while it waits refuses it with
   `ErrConflict`. A role's lists are compared sorted and without repeats (`canonical`), as one
   written around the package can hold them in any order, so renaming it is no redefinition, and
-  setting a role, deny or eligibility again as it is stored changes nothing (`canonicalSQL`). A role
-  lists in `GrantableRoles` only roles one of its `<type>:grant` permissions, on a type it is for,
-  lets its holders grant (`lets`), so `holdsRole` checks the actor's power to grant each. It keeps a
-  listing that already hands nothing on as stored, as once the role listed was narrowed, so renaming
-  it needs only the power to define it.
+  setting a role, deny or eligibility again as it is stored changes nothing (`canonicalSQL`). A
+  role lists in `GrantableRoles` only roles one of its `<type>:grant` permissions, on a type it is
+  for, lets its holders grant (`lets`), so `holdsRole` checks the actor's power to grant each. It
+  keeps a listing that already hands nothing on as stored, as once the role listed was narrowed, so
+  renaming it needs only the power to define it.
 - **Eligibilities.** `SetEligibility` lets a principal `Activate` a role for a while, perhaps
   only with approvers or a `requires` condition. An activation is a grant that ends no later than
   its eligibility expires, or its holder's membership or place in the group the eligibility names

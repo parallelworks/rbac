@@ -128,27 +128,35 @@ scopes conditional ones reach, to check one by one.
   label of a scope its grants are on, as `Config.ResourceOf` gives it, refuses, or a deny on that
   scope's path keeps from changing grants there, can neither change what its grants give nor
   delete it, nor widen it where a deny there, or where a role listing it, or listing one that does,
-  is granted, removes a permission it would give or the power to grant it, or the label of a scope
-  such a role is granted on refuses it. A grant widens by what it gives through its principal, as
-  checks read it: one to the tenant's members of a privileged role, or to the public of a role not
-  marked `Public`, gives nothing, so widening the role asks nothing about it, and a redefinition
-  that has it give something, as narrowing the role so that it is no longer privileged does, widens
-  it, with what was added to the role while it gave nothing; where the role gives more to whomever
-  it is granted, each grant giving anything through its principal widens, whatever its scope takes
-  of what was added. A deny where the tenant's members hold a privileged role still stops widening
-  it, as a catalog change that has the role no longer be privileged gives them what it gives then,
-  and asks no one. Renaming a role or rewriting its description changes no grant, so needs only the
-  power to define it, however its lists are stored: a role, deny or eligibility is the same in any
-  order of its lists, and however often one names an entry, as one written around the package, by a
-  seed or a restore, can hold them, so setting it again as it is read changes nothing. A role lists
-  in `GrantableRoles` only roles that a `<type>:grant` it gives, on a type it is for, lets its
-  holders grant, as roles that can be granted on that type, or it is refused as invalid: a listing
-  none of them reaches would hand nothing on, and the actor's power to grant the role would go
-  unchecked. One the role already lists so as it is stored, as once the role listed is narrowed or
-  the catalog changes, it keeps, so renaming it still needs only the power to define it; one a
-  change adds, or leaves handing nothing on by changing the role, is refused, and dropping one needs
-  no power over the role listed. A listing, handing anything on or not, keeps the role listed from
-  being deleted.
+  is granted where its holders may then grant it, removes a permission it would give or the power
+  to grant it, or a constraint does on that scope, as it would stop `Apply` granting the role
+  there, though defining the role asks it of the tenant, or the label of a scope such a role is
+  granted on refuses it. The constraints are asked about each such scope once, as
+  `Config.ResourceOf` gives it, never of no resource alone, which a constraint that tells resources
+  apart can answer with nothing, about what `Apply` granting the role there asks: the power to
+  change grants there, and what the role gives, on a resource for that resource's type alone;
+  without `Config.ResourceOf`, about each scope as stored where that is all of it, and otherwise of
+  no resource, which then stands for every such scope, so a constraint answering false of no
+  resource doesn't stop it there (see Host policy). A grant widens by what
+  it gives through its principal, as checks read it: one to the tenant's members of a privileged
+  role, or to the public of a role not marked `Public`, gives nothing, so widening the role asks
+  nothing about it, and a redefinition that has it give something, as narrowing the role so that it
+  is no longer privileged does, widens it, with what was added to the role while it gave nothing;
+  where the role gives more to whomever it is granted, each grant giving anything through its
+  principal widens, whatever its scope takes of what was added. A deny where the tenant's members
+  hold a privileged role still stops widening it, as a catalog change that has the role no longer be
+  privileged gives them what it gives then, and asks no one. Renaming a role or rewriting its
+  description changes no grant, so needs only the power to define it, however its lists are stored:
+  a role, deny or eligibility is the same in any order of its lists, and however often one names an
+  entry, as one written around the package, by a seed or a restore, can hold them, so setting it
+  again as it is read changes nothing. A role lists in `GrantableRoles` only roles that a
+  `<type>:grant` it gives, on a type it is for, lets its holders grant, as roles that can be granted
+  on that type, or it is refused as invalid: a listing none of them reaches would hand nothing on,
+  and the actor's power to grant the role would go unchecked. One the role already lists so as it is
+  stored, as once the role listed is narrowed or the catalog changes, it keeps, so renaming it still
+  needs only the power to define it; one a change adds, or leaves handing nothing on by changing the
+  role, is refused, and dropping one needs no power over the role listed. A listing, handing
+  anything on or not, keeps the role listed from being deleted.
   `DeleteRole` removes one with its grants; `Roles` lists the built-in and custom roles a scope type
   takes. Custom roles follow the catalog: one gives only what the catalog still has, and is
   privileged when it gives what only privileged roles do, or changes access.
@@ -369,10 +377,20 @@ scopes conditional ones reach, to check one by one.
   or a grant of its own gives the same is stopped too, as `Apply` revoking a grant held twice is,
   and so is one ending only an eligibility, as `DeleteEligibility` there is; but a place that ends
   while another, from another source, keeps the member in its group as long ends nothing there.
-  `SetRole` and `DeleteRole` decide a constraint, and a deny on the tenant, once for every scope of a
-  type the role's grants can be on, as of no resource and on the tenant, where a condition reading
-  the resource can't be evaluated and so denies: a role's grants span scopes no one reads, so they
-  are stopped wherever either may stop `Apply` on some scope of the type, not only on those it would.
+  `SetRole` and `DeleteRole` decide a constraint on changing grants, and a deny on the tenant, once
+  for every scope of a type the role's grants can be on, as of no resource and on the tenant, where a
+  condition reading the resource can't be evaluated and so denies: a role's grants span scopes no one
+  reads, so they are stopped wherever either may stop `Apply` on some scope of the type, not only on
+  those it would. So a constraint asked of no resource (`ConstraintInput.Resource` nil) must answer
+  true if it removes the permission on any scope of the type, as `ConstraintInput` says. One that
+  answers false there, as one written for resources alone and guarded against a nil `Resource`
+  does, isn't asked about the scopes themselves by `DeleteRole` or by `SetRole` narrowing a role,
+  nor by `ChangeMembers` and `DeleteGroup` taking access away unless a label, a deny or another
+  constraint has them read the scope, so as a freeze it doesn't stop them, though it stops `Apply`
+  revoking there; nor, without `Config.ResourceOf`, by `SetRole` widening a role granted on a scope
+  it can't read whole, so it doesn't stop it handing on there what it removes. With it, `SetRole`
+  asks about each scope a widening gives more on as `Apply` granting the role there asks, whatever
+  the constraints answer of no resource.
   The host's own writes (`Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`,
   `ImportMembers`, `DeleteMembers`, `DeleteGroups` and the host's deletes) make none of the checks
   an actor's change makes, so a freeze stops none of them, `ImportGroups` taking a tenant's group
