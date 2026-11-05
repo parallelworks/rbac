@@ -54,9 +54,11 @@ import (
 // nests at most 32 deep; it builds no message, as `google.protobuf.Struct{}`; and a comparison, or
 // a search of a list, that would read more than a condition may spend, or reading a time in a zone
 // whose name is longer than 64 bytes, holds a byte no zone's name does, as tzdata.zi's dot, or is
-// Local, the zone the process runs in, fails before it runs. request.time is the host's clock
-// (Config.Now) in UTC, and a time the host passes is read in UTC too (Attributes), so string() of
-// one writes the same in every replica, whatever zone each runs in.
+// Local, the zone the process runs in, or localtime, fails before it runs. request.time is the
+// host's clock (Config.Now) in UTC, and a time the host passes is read in UTC too (Attributes), so
+// string() of one writes the same in every replica, whatever zone each runs in. It wrote a time the
+// host passed in the time's own zone before, so a condition comparing that with text written at the
+// zone's offset no longer holds; comparing times, and reading their parts, decide as before.
 //
 // Each condition runs within the most evaluating it can cost, which its literals and types bound:
 // little for one comparing what a request passes with literals, or with the subject's kind or id,
@@ -1585,7 +1587,7 @@ func chargePast(vars interpreter.Activation, n, limit uint64) {
 		counted.charged = cost.SafeAdd(counted.charged, n)
 	}
 	if !ok || cost.SafeAdd(counted.steps, counted.charged) > limit {
-		panic(interpreter.EvalCancelledError{Cause: interpreter.CostLimitExceeded, Message: "rbac: a condition's keys and literals cost more than it may"})
+		panic(interpreter.EvalCancelledError{Cause: interpreter.CostLimitExceeded, Message: "rbac: what a condition reads, its keys and its literals cost more than it may"})
 	}
 }
 

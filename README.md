@@ -235,7 +235,10 @@ scopes conditional ones reach, to check one by one.
   and the action. It gives its role only where the expression holds; one that fails is false. The
   time is the host's clock (`Config.Now`) in UTC, whatever zone it returns times in, and so is a
   `time.Time` the host passes: `string()` writes a time in its own zone, so `string(request.time)`
-  compared with a literal decided by the zone each replica runs in.
+  compared with a literal decided by the zone each replica runs in. `string()` of a time the host
+  passes in another zone, or of one computed from it, wrote it in that zone before, so a stored
+  condition comparing that with text written at the zone's offset no longer holds; comparing
+  times, and reading their parts, decide as before.
   `Config.Attributes` declares the attributes and their types, so a condition reading one
   misnamed, or as another type, is refused when stored, and one stored under other declarations
   fails where it no longer passes them. A condition building a message, as
