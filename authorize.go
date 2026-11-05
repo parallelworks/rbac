@@ -711,7 +711,12 @@ func (a *Authorizer) valuesOfEach(ctx context.Context, q DB, tenant string, hold
 	return withoutJIT(ctx, q, func() (map[string]*valuesRead, error) { return a.valuesOfAll(ctx, q, tenant, identities) })
 }
 
-// valuesOfAll is valuesOfEach's read of identities, by key.
+// matchingKeys runs as valuesOfAll looks n keys up, of its identities' or its denies', to find the
+// denies binding each identity. A test counts the work many holders take.
+var matchingKeys = func(n int) {}
+
+// valuesOfAll is valuesOfEach's read of identities, by key, of the denies binding each only those of
+// a label value or a power to release.
 func (a *Authorizer) valuesOfAll(ctx context.Context, q DB, tenant string, identities []string) (map[string]*valuesRead, error) {
 	rows, err := q.Query(ctx, `
 		WITH idents AS MATERIALIZED (
@@ -781,20 +786,24 @@ func (a *Authorizer) valuesOfAll(ctx context.Context, q DB, tenant string, ident
 	if len(custom) > 0 {
 		roles = a.bookOf(a.current(custom))
 	}
-	// A deny's keys are looked up in sets of each identity's, not compared with every one.
-	set := func(ks []string) map[string]bool {
-		in := make(map[string]bool, len(ks))
-		for _, k := range ks {
-			in[k] = true
+	// The denies naming and exempting each key, indexed once, so each identity looks its own keys up
+	// rather than every key of every deny binding any identity. Only a deny listing a label value or
+	// a power to release, or its dimension's `dim:*`, removes one (denies), so the others decide none.
+	naming, exempting := map[string][]int{}, map[string][]int{}
+	for i, d := range ds {
+		if !slices.ContainsFunc(d.permissions, a.labelPermission) {
+			continue
 		}
-		return in
-	}
-	overlaps := func(xs []string, in map[string]bool) bool {
-		return slices.ContainsFunc(xs, func(x string) bool { return in[x] })
+		for _, k := range d.principals {
+			naming[k] = append(naming[k], i)
+		}
+		for _, k := range d.exempt {
+			exempting[k] = append(exempting[k], i)
+		}
+		matchingKeys(len(d.principals) + len(d.exempt))
 	}
 	values := make(map[string]*valuesRead, len(byIdentity))
 	for identity, k := range byIdentity {
-		bound, exempted := set(k.bound), set(k.exempted)
 		v := &valuesRead{roles: roles}
 		var is []int
 		for _, key := range slices.Compact(slices.Sorted(slices.Values(k.keys))) {
@@ -804,9 +813,24 @@ func (a *Authorizer) valuesOfAll(ctx context.Context, q DB, tenant string, ident
 		for _, i := range is {
 			v.held = append(v.held, grants[i])
 		}
-		for _, d := range ds {
-			if overlaps(d.principals, bound) && !overlaps(d.exempt, exempted) {
-				v.ds = append(v.ds, d)
+		var binding []int
+		for _, key := range k.bound {
+			binding = append(binding, naming[key]...)
+		}
+		matchingKeys(len(k.bound))
+		if len(binding) > 0 {
+			exempt := map[int]bool{}
+			for _, key := range k.exempted {
+				for _, i := range exempting[key] {
+					exempt[i] = true
+				}
+			}
+			matchingKeys(len(k.exempted))
+			slices.Sort(binding)
+			for _, i := range slices.Compact(binding) {
+				if !exempt[i] {
+					v.ds = append(v.ds, ds[i])
+				}
 			}
 		}
 		values[identity] = v

@@ -783,20 +783,32 @@ flowchart TB
 
 ## Transactions and locks
 
-Changes take PostgreSQL advisory locks, keyed by the schema holding the tables, as every session
+Changes take PostgreSQL advisory locks, named by the schema holding the tables, as every session
 reaching them names it whatever its search_path, so two changes to the same rows run
-one after the other, each taking its locks in one order. A key gives the schema and the tenant
-each with its length, as either may hold `/`, so the locks of two tenants never meet. The locks
-last until the transaction ends, so under `WithTx` two host transactions changing the same scopes
-or principals in opposite orders can still deadlock, as can a change that also writes rows it
-doesn't lock: PostgreSQL fails one, which matches `ErrConflict`.
+one after the other, each taking its locks in one order. A name gives the schema and the tenant
+each with its length, as either may hold `/`, so no two locks have one name (`lockName`). A lock's
+key is the first 8 bytes of its name's SHA-256, computed in Go (`lockKey`), so the locks of two
+tenants meet only where a name is found whose key is another's: some 2^64 hashes to match one
+key, and 2^64/n to match any of n, which takes knowing their names. PostgreSQL's
+`hashtextextended`, which keyed them before, can be inverted: a tenant's admin could name a group,
+in a millisecond, whose lock was another tenant's own, and hold every change there back while
+changing it. A lock no id names, a tenant's own, its exclusive values', its nesting's or
+`Migrate`'s, takes its key as two int4 keys, which PostgreSQL holds apart from every bigint key,
+as a scope's or a principal's lock takes: no id an actor chooses reaches one, however the hash
+fares. The batch taking a change's locks reads the schema too, and names them by the schema the
+process's last locks were taken in, taking each only where its statement finds the tables there:
+unless each did, the change takes them all again by the schema the batch read first, a round trip
+more (`takeLocks`), so a schema renamed while the batch waits leaves none of the later ones
+untaken. The locks last until the transaction ends, so under `WithTx` two host transactions
+changing the same scopes or principals in opposite orders can still deadlock, as can a change that
+also writes rows it doesn't lock: PostgreSQL fails one, which matches `ErrConflict`.
 
 ```mermaid
 flowchart TB
-    excl["exclusive/tenant<br/>first, where a dimension is Exclusive"] --> tshared["tenant/tenant, shared<br/>every change but DeleteExpired, which takes none"]
-    tshared --> scope["scope/tenant/type:id, exclusive<br/>each scope a change writes"]
-    scope --> princ["principal/tenant/kind:id, exclusive<br/>each principal it names"]
-    texcl["tenant/tenant, exclusive<br/>SetRole, DeleteRole, DeleteTenant,<br/>and past 64 scopes and principals together"] -.->|"instead of the shared lock<br/>and the scope and principal locks"| tshared
+    excl["exclusive/tenant, two int4 keys<br/>first, where a dimension is Exclusive"] --> tshared["tenant/tenant, shared, two int4 keys<br/>every change but DeleteExpired, which takes none"]
+    tshared --> scope["scope/tenant/type:id, exclusive, a bigint key<br/>each scope a change writes, and in their order<br/>nesting/tenant, two int4 keys, where it nests or deletes groups"]
+    scope --> princ["principal/tenant/kind:id, exclusive, a bigint key<br/>each principal it names"]
+    texcl["tenant/tenant, exclusive, two int4 keys<br/>SetRole, DeleteRole, DeleteTenant,<br/>and past 64 scopes and principals together"] -.->|"instead of the shared lock<br/>and the scope and principal locks"| tshared
 ```
 
 - **READ COMMITTED.** A change runs at READ COMMITTED, as its checks under the locks must read what
@@ -910,7 +922,8 @@ flowchart TB
   seconds more over the 10 tries for each such table with the default `deadlock_timeout`. A wait for
   another replica's migration is bounded by the session's `lock_timeout` alone, and not tried again.
   On a host's transaction `Migrate` applies them all in one savepoint, with neither the bound nor
-  the tries, as rolling back to the savepoint frees nothing the host took before.
+  the tries, as rolling back to the savepoint frees nothing the host took before. The schema's lock
+  is named and keyed as a tenant's own is (above), by the schema it migrates.
 
 ```mermaid
 flowchart TB
@@ -1079,7 +1092,7 @@ refuses a row of more than 1 MiB as jsonb all the same.
 | `MaxID` | 512 bytes | A tenant's, scope's or principal's id. |
 | `MaxBindings` | 1,000 | Bindings in one `Apply`, and the grants, memberships, groups or members one `Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`, `DeleteGroups`, `ImportMembers`, `ChangeMembers` or `DeleteMembers` takes, and the grants and eligibilities the members one `ChangeMembers` adds gain, each member's counted apart, by its principal, as `ValidateGrant` is asked about each, but no more than one place alone gains, whatever its group and those it is in hold. The host's own `ImportMembers` is asked about each with no such bound. |
 | `MaxGrantsPerRole` | 20 | Grants in force of one role to one principal on one scope, differing by source, expiry or condition. Those from each source the host owns count apart. |
-| `MaxDenies`, `MaxDenyEntries` | 100, 256 | Denies on a scope, and the principals, exemptions or permissions one names. A check, a list and a change's read of its actor's authority look each principal and exemption a deny names up in objects of the keys their subject is bound and exempted by, built once for the statement, so a deny costs them about its own length however many groups the subject is in; a check of a permission passes over a deny of another before looking any up, but on the tenant where it decides label values too, which every deny binding its subject there decides. |
+| `MaxDenies`, `MaxDenyEntries` | 100, 256 | Denies on a scope, and the principals, exemptions or permissions one names. A check, a list and a change's read of its actor's authority look each principal and exemption a deny names up in objects of the keys their subject is bound and exempted by, built once for the statement, so a deny costs them about its own length however many groups the subject is in; a check of a permission passes over a deny of another before looking any up, but on the tenant where it decides label values too, which every deny binding its subject there decides. `Holders` of a labeled resource indexes once the keys that the denies on the tenant of a label value or a power to release name and exempt, and looks each holder's own keys up in them, so such a deny costs the list its length once however many holders it binds, and one of any other permission is matched to none: compared with each holder's keys, 100 denies of another permission, each naming 256 of 4,000 holders, took a second and a half. |
 | `MaxCustomRoles`, `MaxRoleEntries`, `MaxGrantableRoles` | 300, 1,000, 64 | Custom roles in a tenant, the permissions one gives and the types it is for, and roles one lists in `GrantableRoles`. |
 | `MaxApprovers`, `MaxActivation` | 16, 366 days | An eligibility's approvers, and its longest activation. |
 | `MaxGroupDepth` | 8 | How deeply groups nest. |

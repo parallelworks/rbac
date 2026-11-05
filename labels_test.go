@@ -711,16 +711,17 @@ func TestFilterIsCountedAlikeHoweverManyDimensionsItsHoldingHoldsWholeOrNotAtAll
 }
 
 // Filter keeps of labeled rows exactly those Authorize allows, Reachable's holding satisfies their
-// labels where Authorize allows, and Holders leaves out only identities Authorize refuses under
-// every request and lists for certain only those it allows under every one: in random tenants of
-// grants on the tenant of roles giving values, conditional ones among them, to identities, groups,
-// the tenant's members and the public, of custom roles for the tenant alone and for other types
-// too, of denies of values and of a constraint removing values, in an Ordered, an AllOf, an AnyOf
-// dimension of forty values and an exclusive one. Of rows whose label has a value no dimension
-// declares or a NULL one, or is NULL, Filter keeps none, as of those whose values differ from
-// declared ones only in case or punctuation, or are quoted, escaped or JSON, and of one whose label
-// is an array of two dimensions, those of it; and it keeps the same of a column in a collation that
-// isn't deterministic, which finds such values equal to declared ones.
+// labels where Authorize allows, and Holders, of every row, leaves out only identities Authorize
+// refuses under every request and lists for certain only those it allows under every one: in random
+// tenants of grants on the tenant of roles giving values, conditional ones among them, to
+// identities, groups, the tenant's members and the public, of custom roles for the tenant alone and
+// for other types too, of denies of values, of every value of a dimension and of other permissions,
+// some naming and exempting several principals among hundreds, and of a constraint removing values,
+// in an Ordered, an AllOf, an AnyOf dimension of forty values and an exclusive one. Of rows whose
+// label has a value no dimension declares or a NULL one, or is NULL, Filter keeps none, as of those
+// whose values differ from declared ones only in case or punctuation, or are quoted, escaped or
+// JSON, and of one whose label is an array of two dimensions, those of it; and it keeps the same of
+// a column in a collation that isn't deterministic, which finds such values equal to declared ones.
 func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 	var projects []string
 	for i := range 40 {
@@ -821,6 +822,43 @@ func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 			exempt := [][]string{{}, {}, {"group:g"}, {"user:u1"}}[rng.IntN(4)]
 			b.Queue(`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions, condition) VALUES ('t1', 'tenant', 't1', $1, $2, $3, $4, $5)`,
 				fmt.Sprint("d", i), []string{principals[rng.IntN(len(principals))]}, exempt, []string{denied[rng.IntN(len(denied))]}, condition)
+		}
+		// And, from a stream of their own so the rest of the tenant stays as it was, denies naming
+		// several of the principals and exempting others, the members only where they name the public,
+		// some among hundreds of others, of label values and of what isn't one. Filter leaves out a row
+		// a conditional deny of login covers, which Authorize may allow, so none of those has one.
+		many := rand.New(rand.NewPCG(seed, seed+29))
+		for i := range many.IntN(4) {
+			named, exempt := []string{principals[many.IntN(len(principals))]}, []string{}
+			for _, p := range slices.Backward(principals) {
+				switch {
+				case slices.Contains(named, p):
+				case many.IntN(4) == 0:
+					named = append(named, p)
+				case many.IntN(3) == 0 && p != "public:" && (p != "members:t1" || slices.Contains(named, "public:")):
+					exempt = append(exempt, p)
+				}
+			}
+			if many.IntN(2) == 0 {
+				for j := range 250 {
+					named = append(named, fmt.Sprintf("group:x%d_%d", i, j))
+				}
+			}
+			if many.IntN(2) == 0 {
+				for j := range 250 {
+					exempt = append(exempt, fmt.Sprintf("user:y%d_%d", i, j))
+				}
+			}
+			var perms []string
+			for range 1 + many.IntN(2) {
+				perms = append(perms, append(slices.Clone(denied), "tenant:view", "tenant:view", "cluster:login")[many.IntN(len(denied)+3)])
+			}
+			condition := []string{"", "", `request.attributes.mfa == false`}[many.IntN(3)]
+			if slices.Contains(perms, string(login)) {
+				condition = ""
+			}
+			b.Queue(`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions, condition) VALUES ('t1', 'tenant', 't1', $1, $2, $3, $4, $5)`,
+				fmt.Sprint("many", i), named, exempt, perms, condition)
 		}
 		removing = map[rbac.Permission]bool{}
 		for _, v := range values {
@@ -924,7 +962,7 @@ func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 				t.Errorf("seed %d, %s: Reachable reaches %v, Authorize allows %v", seed, name, reached, want)
 			}
 		}
-		for _, r := range []rbac.Resource{rows[rng.IntN(len(rows))], rows[rng.IntN(len(rows))]} {
+		for _, r := range rows {
 			holders, err := h.authz.Holders(ctx, login, r)
 			if err != nil {
 				t.Fatal(err)
@@ -3280,6 +3318,147 @@ func TestHoldersOfALabeledResourceReadEveryHoldersValuesAtOnce(t *testing.T) {
 	}
 	if m != n {
 		t.Errorf("Holders read grants %d times among 7 members, and %d among 207", n, m)
+	}
+}
+
+// Holders of a labeled resource finds the denies binding each holder by looking its keys up among
+// those the denies name and exempt, each indexed once, so a deny's length costs the list once rather
+// than once for each holder: compared with every key of every deny binding any holder, 4,000 members
+// beside 100 denies naming 256 of them each took a second and a half. Of those denies it matches
+// only the ones removing a label value or a power to release, as no other decides one.
+func TestHoldersOfALabeledResourceLookEachHoldersKeysUpInTheDenies(t *testing.T) {
+	h := labeled(t)
+	ctx := t.Context()
+	const n = 400
+	h.groups(t, "all")
+	if _, err := h.pool.Exec(ctx, `WITH m AS (SELECT 'm' || lpad(i::text, 3, '0') AS id FROM generate_series(0, $1 - 1) i),
+		joined AS (INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) SELECT 't1', 'user', id FROM m)
+		INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) SELECT 't1', 'all', 'user', id FROM m`, n); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "all"), grant(rbac.TenantRoot("t1"), "level.high", rbac.Members, "t1"))
+	member := func(i int) string { return fmt.Sprintf("m%03d", i) }
+	filled := func(keys []string, d string) []string {
+		for j := len(keys); j < rbac.MaxDenyEntries; j++ {
+			keys = append(keys, fmt.Sprintf("user:x%s_%d", d, j))
+		}
+		return keys
+	}
+	type deny struct {
+		id                              string
+		principals, exempt, permissions []string
+	}
+	// Each of 20 denies of level:high names 10 members, those of each 20 that come first; one names
+	// all of them and exempts the others; and one names the public and exempts the members.
+	var ds []deny
+	var others []string
+	for d := range 20 {
+		var named []string
+		for i := 20 * d; i < 20*d+10; i++ {
+			named = append(named, "user:"+member(i))
+			others = append(others, "user:"+member(i+10))
+		}
+		id := fmt.Sprint("high", d)
+		ds = append(ds, deny{id, filled(named, id), filled(nil, id+"e"), []string{"level:high"}})
+	}
+	ds = append(ds, deny{"all", filled([]string{"group:all"}, "all"), filled(others, "alle"), []string{"level:*"}},
+		deny{"public", filled([]string{"public:"}, "public"), filled([]string{"members:t1"}, "publice"), []string{"level:*"}})
+	entries := 0
+	for _, d := range ds {
+		entries += len(d.principals) + len(d.exempt)
+	}
+	// And 20 of a permission that isn't a label value name every holder.
+	for d := range 20 {
+		var named []string
+		for i := range rbac.MaxDenyEntries {
+			named = append(named, "user:"+member((d*rbac.MaxDenyEntries+i)%n))
+		}
+		id := fmt.Sprint("view", d)
+		ds = append(ds, deny{id, named, filled(nil, id), []string{"tenant:view"}})
+	}
+	b := &pgx.Batch{}
+	for _, d := range ds {
+		b.Queue(`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions) VALUES ('t1', 'tenant', 't1', $1, $2, $3, $4)`,
+			d.id, d.principals, d.exempt, d.permissions)
+	}
+	if err := h.pool.SendBatch(ctx, b).Close(); err != nil {
+		t.Fatal(err)
+	}
+	looked := 0
+	rbac.SetMatchingKeys(t, func(k int) { looked += k })
+	low := cluster
+	low.Labels = rbac.Label{"level": {"low"}}
+	holders, err := h.authz.Holders(ctx, login, low)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want, got []string
+	for i := range n {
+		if i%20 >= 10 {
+			want = append(want, member(i))
+		}
+	}
+	for _, hd := range holders {
+		got = append(got, hd.Principal.ID)
+		if hd.MaybeDenied || hd.Conditional {
+			t.Errorf("Holders marks %+v", hd)
+		}
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("Holders lists %d members, %v, of %d, %v", len(got), got, len(want), want)
+	}
+	// The label values' denies' keys once, and each holder's four, the public, itself, the members
+	// and all, among those named and, as it is named in one, those exempt.
+	if most := entries + n*8; looked < entries || looked > most {
+		t.Errorf("Holders looked %d keys up among the denies, of %d to %d", looked, entries, most)
+	}
+}
+
+// Holders of a labeled resource keeps a member that a deny on the tenant's members binds only as
+// one of them where the deny exempts it, by itself or by a group it is in, and a guest, whom it
+// doesn't bind, as Authorize does: whichever of a holder's keys a deny binds it by, its exemptions
+// are looked up by all of them.
+func TestHoldersOfALabeledResourceHonorExemptionsFromADenyOnTheMembers(t *testing.T) {
+	h := labeled(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), tenantGuard) })
+	ctx := t.Context()
+	h.groups(t, "all", "cleared")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "all"), grant(rbac.TenantRoot("t1"), "level.high", rbac.Members, "t1"),
+		grant(rbac.TenantRoot("t1"), "tenant.guard", rbac.User, "guardian"))
+	subjects := map[string]rbac.Subject{
+		"bound": h.as(t, "bound", "all"), "exempt": h.as(t, "exempt", "all"), "cleared": h.as(t, "cleared", "all", "cleared"),
+		"visitor": h.guest(t, "visitor", "all"),
+	}
+	h.hold(t, "visitor", "level:high")
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), tenantT1, rbac.Deny{
+		ID: "members", Principals: []rbac.Principal{rbac.TenantMembers("t1")}, Exempt: []rbac.Principal{identity("exempt"), groupOf("cleared")},
+		Permissions: []rbac.Permission{"level:*"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	var want []string
+	for _, id := range slices.Sorted(maps.Keys(subjects)) {
+		if h.authz.Authorize(ctx, subjects[id], login, secret) == nil {
+			want = append(want, id)
+		}
+	}
+	if !slices.Equal(want, []string{"cleared", "exempt", "visitor"}) {
+		t.Fatalf("Authorize allows %v", want)
+	}
+	holders, err := h.authz.Holders(ctx, login, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, hd := range holders {
+		got = append(got, hd.Principal.ID)
+		if hd.MaybeDenied || hd.Conditional {
+			t.Errorf("Holders marks %+v", hd)
+		}
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("Holders lists %v, Authorize allows %v", got, want)
 	}
 }
 

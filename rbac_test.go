@@ -3167,6 +3167,323 @@ func TestChangesThroughAnotherSearchPathWaitForTheSameLocks(t *testing.T) {
 	}
 }
 
+// craftedGroup is a group id crafted, by inverting the last block of PostgreSQL's
+// hashtextextended, which keyed the locks before, so that the key it gave the group's lock in
+// tenant t1 was tenant t2's own, for tables in a schema named public.
+const craftedGroup = "aaaaaLmKAMirG.F0/"
+
+// A tenant's admin naming a group for another tenant's lock holds no change there back while it
+// changes the group: a lock's key is its name's SHA-256, which no id is found to match.
+func TestAGroupNamedForAnotherTenantsLockHoldsNoChangeThereBack(t *testing.T) {
+	ctx := t.Context()
+	// In a database of the test's own, as the key named the schema, whose name the id was crafted for.
+	_, database := pgtest.Database(t, "TEMPLATE template0")
+	cfg, err := pgxpool.ParseConfig(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = "public"
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	h := groupedOn(t, pool)
+	var collided bool
+	if err := pool.QueryRow(ctx, `SELECT hashtextextended($1, 0) = hashtextextended($2, 0)`,
+		"6:public/rbac/scope/2:t1/group:"+craftedGroup, "6:public/rbac/tenant/2:t2/").Scan(&collided); err != nil || !collided {
+		t.Fatalf("the group's old key isn't t2's: %v", err)
+	}
+	admin := h.as(t, "groups")
+	if err := h.authz.SetGroup(ctx, admin, "t1", rbac.GroupDefinition{ID: craftedGroup}); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := h.authz.WithTx(tx).SetGroup(ctx, admin, "t1", rbac.GroupDefinition{ID: craftedGroup, Name: "renamed"}); err != nil {
+		t.Fatal(err)
+	}
+	other, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = other.Rollback(ctx) }()
+	if _, err := other.Exec(ctx, `SET LOCAL lock_timeout = '1s'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.WithTx(other).SetMemberships(ctx, host, "t2", []rbac.Membership{{Principal: identity("someone")}}); err != nil {
+		t.Errorf("a change in t2 waited for t1's admin changing group %q: %v", craftedGroup, err)
+	}
+}
+
+// Locks of different names have different keys: a name gives the schema and the tenant each with
+// its length, so no two names are one text split otherwise between the schema, the kind, the
+// tenant and the key, and a key is the first 8 bytes of its name's SHA-256.
+func TestLocksOfDifferentNamesHaveDifferentKeys(t *testing.T) {
+	type name struct{ schema, kind, tenant, key string }
+	seen := map[int64]name{}
+	check := func(n name) {
+		t.Helper()
+		k := rbac.LockKey(n.schema, n.kind, n.tenant, n.key)
+		if other, ok := seen[k]; ok && other != n {
+			t.Fatalf("%+v and %+v have the key %d", n, other, k)
+		}
+		seen[k] = n
+	}
+	for _, n := range []name{
+		// A group id crafted so that hashtextextended keyed its lock as another tenant's own, in the
+		// schema it was crafted for, and that tenant's lock.
+		{"public", "scope", "t1", "group:" + craftedGroup},
+		{"public", "tenant", "t2", ""},
+		// Migrate's lock named the schema without its length, so one schema's could be another's
+		// scope lock, as a schema's name holding another's lock name would be without it.
+		{"3:abc/rbac/scope/2:t2/rbac:x", "migrate", "", ""},
+		{"abc", "scope", "t2", "rbac:x/rbac/migrate"},
+		{"a/rbac/tenant/0:/x", "scope", "", ""},
+		{"a", "tenant", "", "x/rbac/scope/0:/"},
+		{"", "migrate", "", ""},
+		{"", "tenant", "", ""},
+		{"", "exclusive", "", ""},
+	} {
+		check(n)
+	}
+	kinds := []string{"tenant", "exclusive", "nesting", "scope", "principal", "migrate"}
+	rng := mathrand.New(mathrand.NewPCG(1, 2))
+	text := func() string {
+		b := make([]byte, rng.IntN(7))
+		for i := range b {
+			b[i] = "a1:/"[rng.IntN(4)]
+		}
+		return string(b)
+	}
+	for range 20000 {
+		n := name{text(), kinds[rng.IntN(len(kinds))], text(), text()}
+		check(name{n.schema, kinds[rng.IntN(len(kinds))], n.tenant, n.key})
+		// The same text split at each byte between the tenant and the key, and between the schema
+		// and the tenant, which only the lengths tell apart.
+		for joined, i := n.tenant+n.key, 0; i <= len(joined); i++ {
+			check(name{n.schema, n.kind, joined[:i], joined[i:]})
+		}
+		for joined, i := n.schema+n.tenant, 0; i <= len(joined); i++ {
+			check(name{joined[:i], n.kind, joined[i:], n.key})
+		}
+	}
+}
+
+// A lock no key names, a tenant's own, its exclusive values', its nesting's or Migrate's, takes its
+// key as two int4 keys, and a scope's or a principal's as one bigint key, which PostgreSQL holds
+// apart: so a scope or a principal whose bigint key no hash keeps from being a tenant's, as one an
+// actor names to match it, holds none of that tenant's changes back. A session holding each lock's
+// 64 bits in the other form holds back nothing, and in its own form, what takes it.
+func TestATenantsOwnLocksMeetNoLockOfAKey(t *testing.T) {
+	h := labeled(t, banks)
+	ctx := t.Context()
+	var schema string
+	if err := h.pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	change := func(tx pgx.Tx) error {
+		return h.authz.WithTx(tx).Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "u")})
+	}
+	migrate := func(tx pgx.Tx) error { return rbac.Migrate(ctx, tx) }
+	// Deleting groups takes the nesting lock, as nesting one does.
+	nesting := func(tx pgx.Tx) error { return h.authz.WithTx(tx).DeleteGroups(ctx, host, "t1", []string{"g"}) }
+	for _, c := range []struct {
+		lock   string
+		key    int64
+		bigint bool
+		run    func(pgx.Tx) error
+	}{
+		{"the tenant's", rbac.LockKey(schema, "tenant", "t1", ""), false, change},
+		{"its exclusive values'", rbac.LockKey(schema, "exclusive", "t1", ""), false, change},
+		{"its nesting's", rbac.LockKey(schema, "nesting", "t1", ""), false, nesting},
+		{"Migrate's", rbac.LockKey(schema, "migrate", "", ""), false, migrate},
+		{"a scope's", rbac.LockKey(schema, "scope", "t1", cluster.Scope().Key()), true, change},
+		{"a principal's", rbac.LockKey(schema, "principal", "t1", "user:u"), true, change},
+	} {
+		for _, bigint := range []bool{true, false} {
+			holder, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bigint {
+				_, err = holder.Exec(ctx, `SELECT pg_advisory_xact_lock($1::bigint)`, c.key)
+			} else {
+				_, err = holder.Exec(ctx, `SELECT pg_advisory_xact_lock($1::int4, $2::int4)`, int32(c.key>>32), int32(c.key))
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			waits, wait, as := bigint == c.bigint, "1s", "two int4s"
+			if waits {
+				wait = "100ms"
+			}
+			if bigint {
+				as = "one bigint"
+			}
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `SELECT set_config('lock_timeout', $1, true)`, wait); err != nil {
+				t.Fatal(err)
+			}
+			err = c.run(tx)
+			_, _ = tx.Rollback(ctx), holder.Rollback(ctx)
+			switch {
+			case waits && !errors.Is(err, rbac.ErrConflict):
+				t.Errorf("%s lock's key held as %s didn't hold back what takes it: %v", c.lock, as, err)
+			case !waits && err != nil:
+				t.Errorf("%s lock's key held as %s held back what takes it: %v", c.lock, as, err)
+			}
+		}
+	}
+}
+
+// A change to the tables of one schema takes no lock named for another's, as another
+// application's, though the process's last change took its locks there: it reads where the tables
+// are as it takes them, and takes all of its own.
+func TestChangesInTwoSchemasNeverShareALock(t *testing.T) {
+	first, second := setup(t), setup(t)
+	ctx := t.Context()
+	member := []rbac.Membership{{Principal: identity("u")}}
+	held, err := first.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Rollback(ctx) }()
+	if err := first.authz.WithTx(held).SetMemberships(ctx, host, "t1", member); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := second.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '1s'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.authz.WithTx(tx).SetMemberships(ctx, host, "t1", member); err != nil {
+		t.Fatalf("a change to the second schema's tables waited for one to the first's: %v", err)
+	}
+	keys := func(h *harness) map[int64]int16 {
+		var schema string
+		if err := h.pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+			t.Fatal(err)
+		}
+		return map[int64]int16{rbac.LockKey(schema, "tenant", "t1", ""): 2, rbac.LockKey(schema, "principal", "t1", "user:u"): 1}
+	}
+	if got, want := advisoryHeld(t, tx), keys(second); !maps.Equal(got, want) {
+		t.Errorf("the second schema's change holds %v, not its own %v (the first's are %v)", got, want, keys(first))
+	}
+}
+
+// advisoryHeld is each advisory lock tx holds, by its 64 bits, and whether it takes them as one
+// bigint (1) or two int4s (2).
+func advisoryHeld(t *testing.T, tx pgx.Tx) map[int64]int16 {
+	t.Helper()
+	rows, err := tx.Query(t.Context(), `SELECT classid, objid, objsubid FROM pg_locks
+		WHERE locktype = 'advisory' AND granted AND pid = pg_backend_pid()`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := map[int64]int16{}
+	var high, low uint32
+	var form int16
+	if _, err := pgx.ForEachRow(rows, []any{&high, &low, &form}, func() error {
+		held[int64(uint64(high)<<32|uint64(low))] = form
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return held
+}
+
+// A change whose locks are keyed for the schema the process's last were taken in takes every one,
+// though the schema is renamed while it waits for one of them: the statements after that wait find
+// the tables in a schema of another name and take none, so it takes them all again, named by the
+// schema its batch read first, rather than go on without them.
+func TestAChangeTakesEveryLockThoughItsSchemaIsRenamedAsItWaits(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	var schema string
+	if err := h.pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	scopes, principals := []string{cluster.Scope().Key()}, []string{"user:u"}
+	// So the process's last locks were taken in this schema.
+	if err := pgx.BeginFunc(ctx, h.pool, func(tx pgx.Tx) error { return rbac.Lock(ctx, tx, "t1", scopes, principals) }); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Rollback(ctx) }()
+	if _, err := holder.Exec(ctx, `SELECT pg_advisory_xact_lock($1::bigint)`, rbac.LockKey(schema, "scope", "t1", scopes[0])); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var pid int32
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid() FROM set_config('lock_timeout', '5s', true)`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- rbac.Lock(ctx, tx, "t1", scopes, principals) }()
+	for waiting := false; !waiting; {
+		select {
+		case err := <-done:
+			t.Fatalf("the change didn't wait for the scope's lock: %v", err)
+		default:
+			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity
+				WHERE pid = $1 AND wait_event_type = 'Lock' AND wait_event = 'advisory')`, pid).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	rename := func(from, to string) error {
+		ctx := context.WithoutCancel(ctx)
+		return pgx.BeginFunc(ctx, h.pool, func(admin pgx.Tx) error {
+			_, err := admin.Exec(ctx, `SET LOCAL lock_timeout = '1s'; ALTER SCHEMA `+pgx.Identifier{from}.Sanitize()+` RENAME TO `+pgx.Identifier{to}.Sanitize())
+			return err
+		})
+	}
+	renamed := schema + "_renamed"
+	if err := rename(schema, renamed); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := rename(renamed, schema); err != nil {
+			t.Error(err)
+		}
+	}()
+	if err := holder.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	want := map[int64]int16{
+		rbac.LockKey(schema, "tenant", "t1", ""):               2,
+		rbac.LockKey(schema, "scope", "t1", scopes[0]):         1,
+		rbac.LockKey(schema, "principal", "t1", principals[0]): 1,
+	}
+	got := advisoryHeld(t, tx)
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !maps.Equal(got, want) {
+		t.Errorf("the change holds %v, not every lock of its own %v", got, want)
+	}
+}
+
 func TestTrustedWritesNameTheirActor(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()

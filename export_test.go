@@ -346,6 +346,15 @@ func SetReadingEntries(t *testing.T, f func(n int)) {
 	t.Cleanup(func() { readingEntries = old })
 }
 
+// SetMatchingKeys runs f each time Holders' read of its identities' label values looks n keys up to
+// find the denies binding them, until t ends.
+func SetMatchingKeys(t *testing.T, f func(n int)) {
+	t.Helper()
+	old := matchingKeys
+	matchingKeys = f
+	t.Cleanup(func() { matchingKeys = old })
+}
+
 // SetCheckingCondition runs f each time a change begins checking a condition it hasn't, until t
 // ends.
 func SetCheckingCondition(t *testing.T, f func()) {
@@ -619,8 +628,9 @@ type DenyRead struct {
 // DeniesMatched is each read of the denies binding s in a tenant: on each of resources, a check's of
 // each of permissions and of its label values with it (readHeld), Explain's (deniesOn), Permissions'
 // of any permission, and a change's with when its exemptions end; Holders' of its label values, read
-// with those of the others in together, as Holders reads every identity's at once (valuesOfAll);
-// and those of DeniesAnywhereMatched; each with what the overlap of arrays finds for it.
+// with those of the others in together, as Holders reads every identity's at once (valuesOfAll),
+// which keeps only the denies listing a label value or a power to release; and those of
+// DeniesAnywhereMatched; each with what the overlap of arrays finds for it.
 func DeniesMatched(t *testing.T, ctx context.Context, a *Authorizer, s Subject, together []Subject, resources []Resource, permissions []Permission) []DenyRead {
 	t.Helper()
 	a = a.still()
@@ -705,7 +715,9 @@ func DeniesMatched(t *testing.T, ctx context.Context, a *Authorizer, s Subject, 
 		}
 		values, err := a.valuesOfAll(ctx, a.db, tenant, identities)
 		fail(err)
-		add("holders' label values", nil, "", names(values[s.identityKey()].ds), want(func(o overlapped) bool { return o.scope == tenantKey && o.binds() }))
+		add("holders' label values", nil, "", names(values[s.identityKey()].ds), want(func(o overlapped) bool {
+			return o.scope == tenantKey && o.binds() && slices.ContainsFunc(o.permissions, a.labelPermission)
+		}))
 	}
 	return append(reads, anywhereMatched(t, ctx, a, tenant, s, found)...)
 }
@@ -800,6 +812,15 @@ var StandSQL = standSQL
 
 // Conflicted is err as an exported call returns it: matching ErrConflict where it holds a race.
 var Conflicted = conflicted
+
+// LockKey is the key of a tenant's lock of a kind on key, in the tables of schema, as a change
+// takes it: a lock on no key takes its 64 bits as two int4 keys, high and low.
+func LockKey(schema, kind, tenant, key string) int64 {
+	return lockKey(lockName(schema, kind, tenant, key))
+}
+
+// Lock takes a change's locks in tx: its tenant's shared, then each of its scopes' and principals'.
+var Lock = lock
 
 // HoldSQL is the statement Activate holds the places it rests on and reads its subject's paths
 // with: tenant $1, the identity's key $2, now $3, until $4.

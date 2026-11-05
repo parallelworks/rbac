@@ -300,14 +300,21 @@ func TestListingsAgreeWithChecksInRandomTenants(t *testing.T) {
 // guests, suspended members, identities whose membership or places have ended or will, one of
 // another tenant, one of none and the anonymous, it checks that every read of the denies binding a
 // subject, which looks each of a deny's keys up, finds what the overlap of arrays found
-// (DeniesMatched), now and as of a time; that Authorize and Explain refuse where one of them binds;
-// and that Filter, Reachable and Holders agree with Authorize.
+// (DeniesMatched), now and as of a time, and with labels declared, as some deny label values too;
+// that Authorize and Explain refuse where one of them binds; and that Filter, Reachable and Holders
+// agree with Authorize.
 func TestDenyLookupsAgreeWithOverlapsInRandomTenants(t *testing.T) {
 	viewer := rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
+	// The subjects Holders' read of label values found bound by a deny of one, so that read is
+	// compared with some.
+	valued := 0
 	for seed := range uint64(12) {
 		t.Run(fmt.Sprint("seed", seed), func(t *testing.T) {
 			rng := rand.New(rand.NewPCG(seed, seed))
 			pick := rng.IntN
+			// Label values are denied from a stream of their own, so the rest of each tenant stays as
+			// it was.
+			more := rand.New(rand.NewPCG(seed, seed+1)).IntN
 			h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), viewer) })
 			ctx := t.Context()
 			// History dates what is written by the database's clock, which AsOf reads by.
@@ -460,6 +467,9 @@ func TestDenyLookupsAgreeWithOverlapsInRandomTenants(t *testing.T) {
 						permissions = append(permissions, p)
 					}
 				}
+				if more(2) == 0 {
+					permissions = append(permissions, []string{"level:*", "level:high", "comp:alpha", "rel:release"}[more(4)])
+				}
 				scopeType, scopeID, _ := strings.Cut(scopes[pick(len(scopes))], ":")
 				inserts = append(inserts, deny{scopeType, scopeID, fmt.Sprint("d", i), principals, exempt, permissions})
 			}
@@ -508,11 +518,23 @@ func TestDenyLookupsAgreeWithOverlapsInRandomTenants(t *testing.T) {
 						if read.Read == "check" {
 							checked[at(s, read.Permission, read.On)] = read.Want
 						}
+						if read.Read == "holders' label values" && len(read.Want) > 0 {
+							valued++
+						}
 					}
 				}
 				return checked
 			}
 			checked := matched(h.authz, "now", w.clusters, perms)
+			// Holders reads only the denies of a label value or a power to release, of which it finds
+			// none where no label is declared.
+			cfg := h.cfg
+			withLabels(&cfg)
+			labeled, err := rbac.New(h.pool, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			matched(labeled, "with labels declared", w.clusters[:1], []rbac.Permission{view})
 			for _, s := range w.subjects {
 				for _, p := range perms {
 					for _, r := range w.clusters {
@@ -550,6 +572,9 @@ func TestDenyLookupsAgreeWithOverlapsInRandomTenants(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+	if valued == 0 {
+		t.Error("no deny of a label value bound a subject, so Holders' read of them was compared with none")
 	}
 }
 

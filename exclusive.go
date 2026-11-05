@@ -24,10 +24,7 @@ func (a *Authorizer) exclusive() bool {
 // changes that each give an identity one of a dimension's values run in turn, and the second's
 // check reads the first.
 func lockExclusive(ctx context.Context, tx pgx.Tx, tenant string) error {
-	b := &pgx.Batch{}
-	b.Queue(`SELECT current_setting('transaction_isolation')`)
-	b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, lockName("exclusive", tenant, ""))
-	return locked(tx.SendBatch(ctx, b))
+	return takeLocks(ctx, tx, advisory{kind: "exclusive", tenant: tenant})
 }
 
 // twoExclusive returns two values of one exclusive dimension that ps gives, which no one holds at
