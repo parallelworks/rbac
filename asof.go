@@ -15,7 +15,9 @@ import (
 // history records beside each of a table's rows, by the table's column each copies. A role's id is
 // its key, which history's index of an entity's versions seeks with its tenant: its role column is
 // indexed beside every grant and eligibility of the role, and a plan that counts the tenant's
-// roles as a few reads them all rather than seek that index.
+// roles as a few reads them all rather than seek that index. So is a membership's principal: by its
+// principal column, which history indexes beside the entity, a plan by statistics that count the
+// tenant's memberships as a few read every one of them by the entity to find one.
 var asOfEntities = []struct {
 	table, entity string
 	columns       map[string]string
@@ -24,7 +26,7 @@ var asOfEntities = []struct {
 	{"rbac_roles", "role", map[string]string{"tenant": "tenant", "id": "key"}},
 	{"rbac_denies", "deny", map[string]string{"tenant": "tenant", "scope": "scope"}},
 	{"rbac_eligibilities", "eligibility", map[string]string{"tenant": "tenant", "principal": "principal", "role": "role", "scope": "scope"}},
-	{"rbac_memberships", "membership", map[string]string{"tenant": "tenant", "principal": "principal"}},
+	{"rbac_memberships", "membership", map[string]string{"tenant": "tenant", "principal": "key"}},
 	{"rbac_groups", "group", map[string]string{"tenant": "tenant", "id": "group_id"}},
 	{"rbac_members", "member", map[string]string{"tenant": "tenant", "group_id": "group_id", "principal": "principal"}},
 }

@@ -609,8 +609,11 @@ plan of a statement it has run often counts any tenant as an average one, and wi
 planned over history, they cost past `jit_above_cost` for an ordinary subject: a host's query of a
 `Filter` condition for a subject of 249 grants on containers took 760 ms with JIT, almost all of it
 compiling, and 110 ms without. It tests each version a statement reads for a later one by its
-row's key, so history's statistics, which autovacuum leaves until a tenth of it is new, change no
-read's cost by much: a read of thousands of rows costs a few pages for each version. A list counts
+row's key, and `Holders` looks each identity's membership of the tenant up by its key, so
+history's statistics, which autovacuum leaves until a tenth of it is new, change no read's cost by
+much: a read of thousands of rows costs a few pages for each version. Joined to a group's members
+by such statistics, the tenant's memberships were read again for each member, so `Holders` of a
+group of 4,000 took 52 seconds, and 90 ms looked up by key. A list counts
 the denies on scopes of its types by history's versions of them, at most a few, and `Grantable`,
 which can offer any custom role, reads each version of every one once. It orders a row's changes
 by their ids in `rbac_history`, which sessions take out of order once that table's id sequence

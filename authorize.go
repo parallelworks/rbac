@@ -916,7 +916,7 @@ func (a *Authorizer) holders(ctx context.Context, p Permission, r Resource, role
 	// The identities in the groups granted, through those nested in them, and those granted
 	// directly, that are members or guests of the tenant now.
 	rows, err = a.db.Query(ctx, `
-		WITH RECURSIVE `+insideSQL("$2", "$3", "NULL", true)+`
+		WITH RECURSIVE `+a.standingSQL("$2", "$3")+`
 		SELECT root, principal, guest FROM inside
 		UNION
 		SELECT '', principal, guest FROM rbac_memberships WHERE tenant = $1 AND principal = ANY($4::text[])
@@ -1063,6 +1063,30 @@ func (a *Authorizer) boundByDenies(ctx context.Context, p Permission, r Resource
 // reached, as it does what is read with them: planned here, it would be for the thousand rows the
 // planner counts a function as.
 func insideSQL(groups, now, principals string, standing bool) string {
+	return insideWith(groups, now, principals, standing, "m.guest", "")
+}
+
+// standingSQL is insideSQL of every identity in the groups, with standing, as Holders lists them.
+// As of a time, each identity's membership of the tenant is looked up on its own, by its key in
+// history's index of an entity's versions (asOfEntities). Joined to the members in
+// rbac_group_members, by statistics from before the group's members were written, as autovacuum
+// leaves them until a tenth of history is new, the planner counted the members and the tenant's
+// memberships as a row each, and read every membership in the tenant again for each member, testing
+// each for a later version: Holders of a group of 1,000 took 3 seconds, and of 4,000, 52. Looked up
+// on its own by the membership's principal alone, which history indexes beside the entity, such a
+// plan read them all by the entity instead.
+func (a *Authorizer) standingSQL(groups, now string) string {
+	if a.history == "" {
+		return insideSQL(groups, now, "NULL", true)
+	}
+	return insideWith(groups, now, "NULL", false, "s.guest", `
+		  CROSS JOIN LATERAL (SELECT s.guest FROM rbac_memberships s WHERE s.tenant = $1 AND s.principal = m.principal COLLATE "C"
+		    AND NOT s.suspended AND (s.expires_at IS NULL OR s.expires_at > `+now+`) OFFSET 0) s`)
+}
+
+// insideWith is insideSQL, guest SQL for whether each identity, m, is a guest, from what join, SQL
+// joined to it, reads.
+func insideWith(groups, now, principals string, standing bool, guest, join string) string {
 	return fmt.Sprintf(`down(root, id) AS (
 		  SELECT g, g COLLATE "C" FROM unnest(%[1]s::text[]) AS g
 		  UNION
@@ -1070,9 +1094,9 @@ func insideSQL(groups, now, principals string, standing bool) string {
 		    SELECT principal_id FROM rbac_members WHERE tenant = $1 AND `+groupsIn("d.id")+`
 		      AND (expires_at IS NULL OR expires_at > %[2]s) OFFSET 0) m
 		), inside(root, principal, guest) AS (
-		  SELECT d.root, m.principal COLLATE "C", m.guest FROM down d
-		  JOIN rbac_group_members($1, ARRAY(SELECT DISTINCT id FROM down), %[2]s, %[3]s::text[], %[4]t) m ON m.group_id COLLATE "C" = d.id
-		)`, groups, now, principals, standing)
+		  SELECT d.root, m.principal COLLATE "C", %[5]s FROM down d
+		  JOIN rbac_group_members($1, ARRAY(SELECT DISTINCT id FROM down), %[2]s, %[3]s::text[], %[4]t) m ON m.group_id COLLATE "C" = d.id%[6]s
+		)`, groups, now, principals, standing, guest, join)
 }
 
 // groupsIn is SQL for whether a place in a group is a group's in the group g: a range of the key

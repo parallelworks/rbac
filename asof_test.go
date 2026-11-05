@@ -1083,6 +1083,68 @@ func TestAsOfReadsAsMuchWhateverHistorysStatisticsCount(t *testing.T) {
 	}
 }
 
+// As of a time, Holders of a large group reads as much of history whatever its statistics count. By
+// statistics from before the group's members were written, the planner counted them, and the
+// tenant's memberships, as a row each: it joined the two by reading every membership in the tenant
+// again for each member, each tested for a later version, so a group of 500 read history's pages
+// hundreds of times over, and one of 4,000 took 52 seconds; and looking each member's up on its
+// own by its principal, it read every membership in the tenant by the entity instead, where the
+// statistics held other tenants' memberships and one of the tenant's.
+func TestAsOfHoldersOfALargeGroupReadAsMuchWhateverHistorysStatisticsCount(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Autovacuum would analyze the tables as they grow.
+	for _, table := range []string{"rbac_history", "rbac_members", "rbac_memberships", "rbac_grants", "rbac_groups"} {
+		exec(`ALTER TABLE ` + table + ` SET (autovacuum_enabled = off)`)
+	}
+	h.groups(t, "everyone")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "everyone"))
+	h.as(t, "first", "everyone")
+	exec(`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) SELECT 's' || (i % 50), 'user', 'u' || i FROM generate_series(1, 5000) i`)
+	analyze := func() {
+		t.Helper()
+		exec(`ANALYZE rbac_history, rbac_members, rbac_memberships, rbac_grants, rbac_groups`)
+	}
+	analyze()
+	const n = 500
+	exec(`WITH others AS (SELECT gen_random_uuid()::text AS id FROM generate_series(1, $1)),
+		memberships AS (INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) SELECT 't1', 'user', id FROM others)
+		INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) SELECT 't1', 'everyone', 'user', id FROM others`, n)
+	at := dbNow(t, h)
+	read := func() int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		var pages int64
+		if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+			start := historyPages(ctx, t, tx)
+			hs, err := a.Holders(ctx, login, cluster)
+			pages = historyPages(ctx, t, tx) - start
+			if err == nil && len(hs) != n+1 {
+				err = fmt.Errorf("Holders listed %d of the group's %d", len(hs), n+1)
+			}
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return pages
+	}
+	stale := read()
+	analyze()
+	if analyzed := read(); stale > analyzed*3/2+deeper {
+		t.Errorf("as of a time, Holders of a group of %d read %d pages of history by statistics from before its members were written, and %d once it was analyzed", n, stale, analyzed)
+	}
+}
+
 // As of a time, a session that plans each statement generically lists a principal's memberships
 // from its own versions: planned by the averages, the read leads to the tenant and reads every
 // member's.

@@ -1013,9 +1013,12 @@ flowchart LR
   statistics from before most of history was written, as autovacuum leaves them until a tenth of
   it is new, it read every version of the entity in the tenant for each version found, the key
   only a filter, so a check took seconds; a read of thousands of rows costs more than such a join
-  planned by fresh statistics, which reads their versions together. The view of custom roles takes
-  each one's newest version, testing none for a later one, so `Grantable`, which can offer any,
-  reads each version once.
+  planned by fresh statistics, which reads their versions together. `Holders` looks each identity's
+  membership of the tenant up on its own, by its key, which the view of memberships gives as the
+  principal: joined to a group's members, or looked up by the principal history copies beside the
+  entity, it read, by such statistics, every membership in the tenant again for each member. The
+  view of custom roles takes each one's newest version, testing none for a later one, so
+  `Grantable`, which can offer any, reads each version once.
 - **PruneHistory** deletes only what an export has read and later versions supersede. It keeps
   each row's last version at or before its time, so AsOf answers as before for any later time,
   and refuses an earlier one; of a row whose last version by then ended it, it deletes every
