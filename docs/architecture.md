@@ -767,20 +767,32 @@ flowchart TB
 
 ## Transactions and locks
 
-Changes take PostgreSQL advisory locks, keyed by the schema holding the tables, as every session
+Changes take PostgreSQL advisory locks, named by the schema holding the tables, as every session
 reaching them names it whatever its search_path, so two changes to the same rows run
-one after the other, each taking its locks in one order. A key gives the schema and the tenant
-each with its length, as either may hold `/`, so the locks of two tenants never meet. The locks
-last until the transaction ends, so under `WithTx` two host transactions changing the same scopes
-or principals in opposite orders can still deadlock, as can a change that also writes rows it
-doesn't lock: PostgreSQL fails one, which matches `ErrConflict`.
+one after the other, each taking its locks in one order. A name gives the schema and the tenant
+each with its length, as either may hold `/`, so no two locks have one name (`lockName`). A lock's
+key is the first 8 bytes of its name's SHA-256, computed in Go (`lockKey`), so the locks of two
+tenants meet only where a name is found whose key is another's: some 2^64 hashes to match one
+key, and 2^64/n to match any of n, which takes knowing their names. PostgreSQL's
+`hashtextextended`, which keyed them before, can be inverted: a tenant's admin could name a group,
+in a millisecond, whose lock was another tenant's own, and hold every change there back while
+changing it. A lock no id names, a tenant's own, its exclusive values', its nesting's or
+`Migrate`'s, takes its key as two int4 keys, which PostgreSQL holds apart from every bigint key,
+as a scope's or a principal's lock takes: no id an actor chooses reaches one, however the hash
+fares. The batch taking a change's locks reads the schema too, and names them by the schema the
+process's last locks were taken in, taking each only where its statement finds the tables there:
+unless each did, the change takes them all again by the schema the batch read first, a round trip
+more (`takeLocks`), so a schema renamed while the batch waits leaves none of the later ones
+untaken. The locks last until the transaction ends, so under `WithTx` two host transactions
+changing the same scopes or principals in opposite orders can still deadlock, as can a change that
+also writes rows it doesn't lock: PostgreSQL fails one, which matches `ErrConflict`.
 
 ```mermaid
 flowchart TB
-    excl["exclusive/tenant<br/>first, where a dimension is Exclusive"] --> tshared["tenant/tenant, shared<br/>every change but DeleteExpired, which takes none"]
-    tshared --> scope["scope/tenant/type:id, exclusive<br/>each scope a change writes"]
-    scope --> princ["principal/tenant/kind:id, exclusive<br/>each principal it names"]
-    texcl["tenant/tenant, exclusive<br/>SetRole, DeleteRole, DeleteTenant,<br/>and past 64 scopes and principals together"] -.->|"instead of the shared lock<br/>and the scope and principal locks"| tshared
+    excl["exclusive/tenant, two int4 keys<br/>first, where a dimension is Exclusive"] --> tshared["tenant/tenant, shared, two int4 keys<br/>every change but DeleteExpired, which takes none"]
+    tshared --> scope["scope/tenant/type:id, exclusive, a bigint key<br/>each scope a change writes, and in their order<br/>nesting/tenant, two int4 keys, where it nests or deletes groups"]
+    scope --> princ["principal/tenant/kind:id, exclusive, a bigint key<br/>each principal it names"]
+    texcl["tenant/tenant, exclusive, two int4 keys<br/>SetRole, DeleteRole, DeleteTenant,<br/>and past 64 scopes and principals together"] -.->|"instead of the shared lock<br/>and the scope and principal locks"| tshared
 ```
 
 - **READ COMMITTED.** A change runs at READ COMMITTED, as its checks under the locks must read what
@@ -894,7 +906,8 @@ flowchart TB
   seconds more over the 10 tries for each such table with the default `deadlock_timeout`. A wait for
   another replica's migration is bounded by the session's `lock_timeout` alone, and not tried again.
   On a host's transaction `Migrate` applies them all in one savepoint, with neither the bound nor
-  the tries, as rolling back to the savepoint frees nothing the host took before.
+  the tries, as rolling back to the savepoint frees nothing the host took before. The schema's lock
+  is named and keyed as a tenant's own is (above), by the schema it migrates.
 
 ```mermaid
 flowchart TB

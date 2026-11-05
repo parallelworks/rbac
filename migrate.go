@@ -210,10 +210,11 @@ func migrateOnce(ctx context.Context, db DB, gaveWay bool) (own, more bool, err 
 		if encoding != "UTF8" {
 			return fmt.Errorf("rbac: the database's encoding is %s, not UTF8", encoding)
 		}
-		// One migration at a time in the schema, under a key named as the change locks' are: by the
-		// schema it migrates, as the tables may not exist yet, which is the one they are in once
+		// One migration at a time in the schema, under a lock named and keyed as the changes' are: by
+		// the schema it migrates, as the tables may not exist yet, which is the one they are in once
 		// they do.
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || '/rbac/' || $1, 0))`, "migrate"); err != nil {
+		sql, args := advisory{kind: "migrate"}.taking(*schema)
+		if _, err := tx.Exec(ctx, sql, args...); err != nil {
 			return fmt.Errorf("%w: %w", errReplica, err)
 		}
 		if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS rbac_migrations (

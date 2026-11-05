@@ -813,6 +813,15 @@ var StandSQL = standSQL
 // Conflicted is err as an exported call returns it: matching ErrConflict where it holds a race.
 var Conflicted = conflicted
 
+// LockKey is the key of a tenant's lock of a kind on key, in the tables of schema, as a change
+// takes it: a lock on no key takes its 64 bits as two int4 keys, high and low.
+func LockKey(schema, kind, tenant, key string) int64 {
+	return lockKey(lockName(schema, kind, tenant, key))
+}
+
+// Lock takes a change's locks in tx: its tenant's shared, then each of its scopes' and principals'.
+var Lock = lock
+
 // HoldSQL is the statement Activate holds the places it rests on and reads its subject's paths
 // with: tenant $1, the identity's key $2, now $3, until $4.
 var HoldSQL = holdSQL

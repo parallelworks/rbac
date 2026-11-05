@@ -27,8 +27,14 @@ import (
 // members of any, who administers the cluster too, so it can grant what the cluster's groups hold.
 func grouped(t *testing.T, mutate ...func(*rbac.Config)) *harness {
 	t.Helper()
+	return groupedOn(t, pgtest.Open(t, ""), mutate...)
+}
+
+// groupedOn is grouped on a pool of the test's own.
+func groupedOn(t *testing.T, pool *pgxpool.Pool, mutate ...func(*rbac.Config)) *harness {
+	t.Helper()
 	groups := rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}
-	h := setup(t, append([]func(*rbac.Config){func(c *rbac.Config) {
+	h := setupOn(t, pool, append([]func(*rbac.Config){func(c *rbac.Config) {
 		c.Catalog = append(slices.Clone(c.Catalog), groups, groupMembers)
 		c.PrincipalKinds = []rbac.PrincipalKind{"service_account"}
 	}}, mutate...)...)
