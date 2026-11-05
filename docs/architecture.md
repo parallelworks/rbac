@@ -398,11 +398,32 @@ sequenceDiagram
   in it too.
 - **Permissions** lists everything a subject may do on a resource, deciding each as Authorize
   would.
+- **Hooks are given copies** (`givenTo`, `copiedFor`): each constraint its own of the subject's and
+  the resource's attributes, ancestors and label, and `ValidateGrant` its own of the actor's,
+  `deepCopy` made once for a call (`still`), the first time it asks the hook about each, by where
+  what the host passed points, and given again whenever it asks about the same, as `Permissions`
+  does for each permission and a labeled check for each value its label asks for: copied for each
+  ask, `Permissions` of 300 permissions on a resource of 20,000 tags took a second. A hook writing
+  to its copy reads its write when the call asks it again, and nothing decided or asked of another
+  hook does. A copy holds no more than a check converts (`maxConverted`), counted alike, one for
+  each value, a string too, and a tenth of each other byte copied whole, so it counts no more than
+  converting the same does: past it the hook can't be asked, and the call is refused as
+  `ErrDenied`. Counting a list's elements twice, a string by the bytes of its header, or a
+  protobuf `Value` and its field apart, attributes a check converts couldn't be copied. A slice
+  reached at several lengths is copied once from where it starts, each length a slice of the copy,
+  and one reached while its elements are copied, before a longer length outgrew that copy, a slice
+  of its own, whose elements are copied too, as set in the longer alone it held the host's. A value
+  holding no map, slice or pointer that an interface holds, as an array, is shared, as nothing
+  writes to it through the interface. A call keeps what the host passed with each copy until it
+  returns, so where it points is no other value's meanwhile: known only by where it points, a value
+  dropped and collected during the call would leave its place to one made after, which would be
+  given the first one's copy.
 - **Conditions** are CEL over `subject`, `resource`, `request` and `action`, typed by
   `Config.Attributes`. Each is compiled once, bounded in cost, and fails closed: a condition that
   errors gives nothing, and a deny's that errors denies. A check converts what the host passes into
   CEL's own values once (`converter`), deeply, from a closed set of Go values (`Attributes`): bools,
-  strings and numbers read by their kind, times, durations, bytes, slices, arrays, pointers, maps
+  strings and numbers read by their kind, times, in UTC, as `request.time` is, durations, bytes,
+  slices, arrays, pointers, maps
   keyed by bools, strings, ints or uints, JSON text and numbers, and the protobuf well-known types.
   It calls no method of the host's, so a condition reads no value by one. A kind's attributes, the
   subject's, the resource's or the request's, holding anything else anywhere, a `ref.Val` of the
@@ -448,11 +469,23 @@ sequenceDiagram
   list or map literal for each element or entry it builds, and a loop's step for each logical
   operator and choice it may evaluate, on top of what CEL charges, a key a condition computes by its
   length, and `contains`, `startsWith` and `endsWith` by the strings they read, at least 1 however
-  empty either is. A comparison, a search or a match that would cost more than a condition may fails
-  before it runs, as CEL charges a call only once it has run, and a program in which CEL plans one,
-  a literal, a key or a loop's condition where the package can't charge or refuse it isn't a
-  condition. What a check reads together is bounded where it is stored, for each
-  scope: an identity's conditional grants, the conditional grants to groups, the tenant's members
+  empty either is. A comparison is charged as it measures the values (`measured`), once, reading
+  both in step until the smaller is read whole and finding a double that isn't finite in the same
+  walk, before it runs: measured again at each doubling of how far it read, again for that search
+  and again for CEL's charge, comparing JSON nested 3,300 deep took twenty times what it was
+  charged. Reading a time in a zone loads the zone once for the process (`zones`), bounded at
+  `maxZones`, and finds a name names none once, the zone a literal names when the condition is
+  planned, and one an attribute names the first time a time is read in it, charged `zoneLoad`
+  more, before it loads, and refuses a name of none, as `tzdata.zi`, and `Local` and `localtime`,
+  before loading anything (`inZone`): loaded at each call, the zone `tzdata.zi` named took a
+  quarter of a second for a check. Where reading the platform's files failed, as once the process
+  ran out of file descriptors, it keeps nothing (`settled`), and a literal's zone isn't planned, so
+  the next check plans it again: kept, a real zone failed until the process dropped it. A
+  comparison, a search or a match that would cost more than a condition may fails before it runs,
+  as CEL charges a call only once it has run, and a program in which CEL plans one, a literal, a
+  key or a loop's condition where the package can't charge or refuse it isn't a condition. What a
+  check reads together is bounded where it is stored, for each scope: an identity's conditional
+  grants, the conditional grants to groups, the tenant's members
   and the public, each the tenant's and those from each source the host owns apart, the conditional
   denies, and the requirements of groups' eligibilities for a role, and a change adding a condition
   past one is refused as invalid. A check's budget is that for each scope on its path, so it
@@ -1099,6 +1132,8 @@ refuses a row of more than 1 MiB as jsonb all the same.
 | `MaxPlacesInGroup` | 20 | Places in force of one principal in one group, each from another source. Those from each source the host owns count apart. |
 | `MaxGroupsOfPrincipal` | 1,000 | Groups one principal, an identity or a group, is in directly, by places in force. Those from each source the host owns count apart. A check reads every group its subject is in, and every group those are in, `MaxGroupDepth` deep, which this bounds only level by level (below). |
 | `MaxExpression` | 2,048 bytes | A condition's or requirement's expression. Its cost is bounded too. |
+| Time zones a process keeps | 1,024 | The zones conditions read times in, each loaded once, and the names found to name none, as requests can name a new one each time. Past it, one kept is dropped at random. |
+| A hook's copy | `2 × 80,000` units, as a check converts | What a constraint is given of the subject's or the resource's attributes, ancestors or label, and `ValidateGrant` of the actor's, each made once for a call. Past it the hook can't be asked, and the call is refused. |
 | What a check reads together | 80,000 units: hundreds of comparisons with literals, a hundred of an attribute with the subject's id, or three of the longest conditions that read a list or loop | The distinct conditions of an identity's conditional grants on a scope; of a scope's conditional grants to groups, the tenant's members and the public; each the tenant's and those from each source the host owns apart; of a scope's conditional denies; and the requirements of groups' eligibilities for a role on a scope. Each counts compiling it, 8 a byte, and the most evaluating it can cost, at most 10,000. On the tenant, one reading the action counts once for each label value it gives or denies. A check may spend this for each on each scope of its path. |
 | `MaxConditionBytes` | 32 KiB | The conditions one `Apply` or `Import` carries, each distinct one counted once. |
 | `MaxName`, `MaxDescription`, `MaxNote` | 128, 2,048, 2,048 characters | Names, titles and group ids, descriptions, and notes and justifications. |

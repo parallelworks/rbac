@@ -2406,18 +2406,297 @@ func TestAConstraintWritingAFieldAnEmbeddedStructPromotesChangesNothing(t *testi
 }
 
 // A hook's copy of a list decoded from JSON costs an allocation for the list, not one for each of
-// its strings: every constraint is given one in every check.
+// its strings: every constraint is given one in every call. A few more are the copy's own, as the
+// map it keeps what it copied in.
 func TestCopyingAListOfStringsForAHookAllocatesOnce(t *testing.T) {
 	groups := make([]any, 1000)
 	for i := range groups {
 		groups[i] = fmt.Sprintf("group-%04d", i)
 	}
 	attributes := map[string]any{"groups": groups}
-	if n := testing.AllocsPerRun(20, func() { rbac.DeepCopy(attributes) }); n > 10 {
+	if n := testing.AllocsPerRun(20, func() { rbac.DeepCopy(attributes) }); n > 12 {
 		t.Errorf("copying a list of %d strings took %.0f allocations", len(groups), n)
 	}
 	if c, ok := rbac.DeepCopy(attributes)["groups"].([]any); !ok || &c[0] == &groups[0] {
 		t.Error("the copy shares the list")
+	}
+}
+
+// A hook is given a copy of what an interface holds, but nothing writes through an interface to a
+// value holding no map, slice or pointer, as an array, so the copy shares it: copied element by
+// element for each interface holding it, a hundred holding one array of 100 KB took 170 ms and
+// allocated 10 MB. One held by value is copied whole, as setting it does.
+func TestCopyingAnArrayInterfacesHoldSharesIt(t *testing.T) {
+	var a [100_000]byte
+	a[0] = 1
+	held := make([]any, 100)
+	for i := range held {
+		held[i] = a
+	}
+	attributes := map[string]any{"held": held, "byValue": map[string][100_000]byte{"a": a}}
+	if allocated := rbac.CopyAllocates(attributes); allocated > 3*uint64(len(a)) {
+		t.Errorf("copying an array a hundred interfaces hold allocated %d bytes", allocated)
+	}
+	copied := rbac.DeepCopy(attributes)
+	if h, ok := copied["held"].([]any); !ok || len(h) != len(held) || h[len(h)-1] != any(a) {
+		t.Error("the copy doesn't hold the array")
+	}
+	if m, ok := copied["byValue"].(map[string][100_000]byte); !ok || m["a"][0] != 1 {
+		t.Error("the copy doesn't hold the array a map holds")
+	}
+}
+
+// A slice reached at many lengths, as each prefix of one, is copied once from where it starts, and
+// each length is a slice of that copy: copied for each length, the 3,000 prefixes of one slice of
+// 3,000 maps took half a second and allocated 70 MB. A copy is the hook's own, and appending to one
+// writes to none of the others.
+func TestCopyingPrefixesOfOneSliceCopiesItOnce(t *testing.T) {
+	base := make([]any, 3000)
+	for i := range base {
+		base[i] = map[string]any{"i": i}
+	}
+	prefixes := make([]any, len(base))
+	for i := range prefixes {
+		prefixes[i] = base[:i+1]
+	}
+	attributes := map[string]any{"prefixes": prefixes}
+	if allocated := rbac.CopyAllocates(attributes); allocated > 4<<20 {
+		t.Errorf("copying the prefixes of one slice allocated %d bytes", allocated)
+	}
+	copied, ok := rbac.DeepCopy(attributes)["prefixes"].([]any)
+	if !ok || len(copied) != len(prefixes) {
+		t.Fatalf("the prefixes were copied as %T", rbac.DeepCopy(attributes)["prefixes"])
+	}
+	first, _ := copied[0].([]any)
+	last, _ := copied[len(copied)-1].([]any)
+	if len(first) != 1 || len(last) != len(base) || reflect.ValueOf(first[0]).Pointer() != reflect.ValueOf(last[0]).Pointer() {
+		t.Fatal("the prefixes were copied apart")
+	}
+	if reflect.ValueOf(last[0]).Pointer() == reflect.ValueOf(base[0]).Pointer() {
+		t.Fatal("the copy shares the host's maps")
+	}
+	_ = append(first, "appended")
+	if _, ok := last[1].(map[string]any); !ok {
+		t.Error("appending to one prefix's copy wrote to another's")
+	}
+}
+
+// A slice reached again while its elements are copied, shorter and then longer, as by an element
+// holding both, is copied whole wherever it is reached: the shorter copy, given out before the
+// longer replaced it, kept the host's elements, so a hook writing to one wrote to the host's map.
+func TestCopyingASliceThatGrowsWhileItIsCopiedSharesNothingWithTheHost(t *testing.T) {
+	held := map[string]any{"v": "host"}
+	base, both := make([]any, 5), make([]any, 2)
+	base[0], base[1], base[2], base[3], base[4] = both, held, "c", "d", "e"
+	both[0], both[1] = base[:3], base[:5]
+	attributes := map[string]any{"a": base[:3]}
+	copied := rbac.DeepCopy(attributes)
+	if !reflect.DeepEqual(copied, attributes) {
+		t.Fatal("the copy doesn't hold what the host passed")
+	}
+	hosts, copies := map[[2]uintptr]bool{}, map[[2]uintptr]bool{}
+	reachedFrom(reflect.ValueOf(attributes), hosts)
+	reachedFrom(reflect.ValueOf(copied), copies)
+	for at := range copies {
+		if hosts[at] {
+			t.Fatalf("the copy holds a map or slice of the host's, at %#x", at[0])
+		}
+	}
+}
+
+// reachedFrom adds where each map and slice v reaches points, a slice with its length.
+func reachedFrom(v reflect.Value, seen map[[2]uintptr]bool) {
+	switch v.Kind() {
+	case reflect.Interface:
+		if !v.IsNil() {
+			reachedFrom(v.Elem(), seen)
+		}
+	case reflect.Map:
+		at := [2]uintptr{v.Pointer()}
+		if v.IsNil() || seen[at] {
+			return
+		}
+		seen[at] = true
+		for it := v.MapRange(); it.Next(); {
+			reachedFrom(it.Value(), seen)
+		}
+	case reflect.Slice:
+		at := [2]uintptr{v.Pointer(), uintptr(v.Len())}
+		if v.IsNil() || seen[at] {
+			return
+		}
+		seen[at] = true
+		for i := range v.Len() {
+			reachedFrom(v.Index(i), seen)
+		}
+	default:
+	}
+}
+
+// Each constraint is given a copy of the subject's and the resource's attributes once for a call,
+// the first time the call asks it, and the same copy whenever it asks it about the same: copied for
+// each ask, Permissions of 300 permissions on a resource tagged 20,000 times took a second with one
+// constraint, against 4 ms without, and a check of a resource labeled with 60 values by a subject
+// passing 20,000 attributes 160 ms. ValidateGrant is given the actor's once for a call too. A hook
+// writing to its copy sees its write when it is asked again in the call, and nothing else does.
+func TestAHookIsGivenOneCopyForACall(t *testing.T) {
+	var perms []rbac.Permission
+	for i := range 300 {
+		perms = append(perms, rbac.Permission(fmt.Sprintf("cluster:p%03d", i)))
+	}
+	var asked, seen int
+	h := setup(t, compartments, func(c *rbac.Config) {
+		c.Catalog = append(c.Catalog, rbac.RoleDefinition{ID: "cluster.many", Permissions: perms, ResourceTypes: []string{"cluster"}})
+		c.Permissions = declaring(c.Catalog)
+		c.Constraints = []rbac.Constraint{
+			{Name: "counting", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+				if r := in.Resource; r != nil && r.Attributes != nil {
+					n, _ := r.Attributes["asked"].(int)
+					r.Attributes["asked"], asked = n+1, max(asked, n+1)
+				}
+				return false, nil
+			}},
+			{Name: "after", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+				if r := in.Resource; r != nil && r.Attributes["asked"] != nil {
+					seen++
+				}
+				return false, nil
+			}},
+		}
+	})
+	h.seed(t, grant(cluster.Scope(), "cluster.many", rbac.User, "u"), grant(rbac.TenantRoot("t1"), "compartments", rbac.User, "u"),
+		grant(cluster.Scope(), "cluster.admin", rbac.User, "u"))
+	u := h.as(t, "u")
+	u.Attributes = map[string]any{"team": "sre"}
+	r := cluster
+	r.Attributes = map[string]any{"tags": map[string]any{"env": "prod"}}
+	copies := rbac.CountCopies(t)
+	for range 2 {
+		*copies, asked = 0, 0
+		got, err := h.authz.Permissions(t.Context(), u, r)
+		if err != nil || len(got) < len(perms) {
+			t.Fatalf("Permissions listed %d: %v", len(got), err)
+		}
+		// Each hook's copies of the subject's attributes, the resource's and its ancestors.
+		if *copies != 2*3 || asked < len(perms) {
+			t.Errorf("Permissions of %d permissions made %d copies, and the hook saw its own write %d times", len(perms), *copies, asked)
+		}
+	}
+	if seen != 0 || r.Attributes["asked"] != nil {
+		t.Errorf("a hook's write reached another %d times, or the host: %v", seen, r.Attributes)
+	}
+	labeled := r
+	labeled.Attributes = nil
+	labeled.Labels = rbac.Label{"comp": nil}
+	for i := range 60 {
+		labeled.Labels["comp"] = append(labeled.Labels["comp"], fmt.Sprintf("c%02d", i))
+	}
+	*copies = 0
+	if !allowed(t, h, u, view, labeled) || *copies > 2*3 {
+		t.Errorf("a check of a resource labeled with 60 values made %d copies", *copies)
+	}
+	*copies = 0
+	var bindings []rbac.Binding
+	for i := range 20 {
+		bindings = append(bindings, rbac.Binding{Role: "cluster.login", Principal: identity(fmt.Sprintf("x%02d", i))})
+		h.as(t, fmt.Sprintf("x%02d", i))
+	}
+	if err := h.authz.Apply(t.Context(), u, cluster, rbac.Change{Grant: bindings}); err != nil {
+		t.Fatal(err)
+	}
+	// ValidateGrant's copy of the actor's attributes, and each constraint's of them and the cluster's
+	// ancestors.
+	if *copies > 1+2*2 {
+		t.Errorf("granting %d bindings made %d copies", len(bindings), *copies)
+	}
+}
+
+// A call knows the copy it gave a hook by where what the host passed points, so it keeps what the
+// host passed until it returns: dropped and collected, as a resource Config.ResourceOf made for one
+// scope may be, its place can be another's, made after, which would be given the first one's copy,
+// as all but 2 of 2,000 values were where the call kept none.
+func TestACallGivesAHookTheCopyOfNoValueFreedSince(t *testing.T) {
+	copies := rbac.CopiedInOneCall(200, func(i int) map[string]any { return map[string]any{"i": i} })
+	for i, c := range copies {
+		if c["i"] != i {
+			t.Fatalf("value %d was given the copy of %v", i, c["i"])
+		}
+	}
+}
+
+// A copy counts each value as converting does, once: counting a list's elements once for the list
+// and again as values, a string in a []string by the 16 bytes moving it moves, or a protobuf
+// Value's field apart from the Value, attributes a check converts couldn't be copied, so a
+// constrained check of them was refused. And an array of interfaces costs what it holds, as a slice
+// does: uncounted, a copy of one holding more values than a check converts cost one.
+func TestACopyForAHookCountsWhatItHoldsAsConvertingDoes(t *testing.T) {
+	short := make([]string, rbac.MaxConverted*3/4)
+	empty := make([]any, rbac.MaxConverted/2)
+	fields, values := map[string]*structpb.Value{}, make([]*structpb.Value, rbac.MaxConverted/2)
+	for i := range short {
+		short[i] = "a"
+	}
+	for i := range empty {
+		empty[i] = map[string]any{}
+	}
+	for i := range rbac.MaxConverted / 3 {
+		fields[fmt.Sprint(i)] = structpb.NewStringValue("a")
+	}
+	for i := range values {
+		values[i] = structpb.NewStringValue("a")
+	}
+	for name, attributes := range map[string]map[string]any{
+		"short strings": {"tags": short}, "empty maps": {"tags": empty},
+		"a Struct's short strings":    {"tags": &structpb.Struct{Fields: fields}},
+		"a ListValue's short strings": {"tags": &structpb.ListValue{Values: values}},
+	} {
+		if held, _ := rbac.EvaluateConditionOf(t, `size(resource.attributes.tags) > 0`, nil, attributes, nil); !held {
+			t.Fatalf("a check can't read %s", name)
+		}
+		if !rbac.Copies(attributes) {
+			t.Errorf("%s, which a check converts, can't be copied", name)
+		}
+	}
+	var half [rbac.MaxConverted/2 + 1]any
+	if rbac.Copies(map[string]any{"a": half, "b": half}) {
+		t.Error("arrays holding more values than a check converts were copied")
+	}
+}
+
+// A hook is given a copy of no more than a check converts, as copying recurses as far as what the
+// host passes reaches: a check of a resource tagged a million times took 400 ms with one constraint
+// that returns false, against 3 ms without, copying the tags whole. A hook that can't be given its
+// copy can't be asked, so the call is refused, as one it would refuse: a check, and a change whose
+// actor passes as much, which ValidateGrant can't be asked about either.
+func TestAHookIsGivenACopyOfNoMoreThanACheckConverts(t *testing.T) {
+	tags := map[string]any{}
+	for i := range rbac.MaxConverted {
+		tags[fmt.Sprint("t", i)] = "v"
+	}
+	if rbac.Copies(map[string]any{"tags": tags}) || !rbac.Copies(map[string]any{"tags": map[string]any{"env": "prod"}}) {
+		t.Error("a copy is bounded by what a check converts")
+	}
+	for _, constrained := range []bool{false, true} {
+		h := setup(t, func(c *rbac.Config) {
+			if constrained {
+				c.Constraints = []rbac.Constraint{{Name: "never", Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) {
+					return false, nil
+				}}}
+			}
+		})
+		h.seed(t, grant(cluster.Scope(), "cluster.admin", rbac.User, "u"))
+		u := h.as(t, "u")
+		r := cluster
+		r.Attributes = map[string]any{"tags": tags}
+		if err := h.authz.Authorize(t.Context(), u, login, r); (err != nil) != constrained || constrained && !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("constrained %t: a check of a resource tagged past what a check converts: %v", constrained, err)
+		}
+		h.as(t, "x")
+		u.Attributes = map[string]any{"tags": tags}
+		change := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("x")}}}
+		if err := h.authz.Apply(t.Context(), u, cluster, change); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("constrained %t: a change by an actor passing past what a check converts: %v", constrained, err)
+		}
 	}
 }
 

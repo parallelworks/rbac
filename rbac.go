@@ -203,12 +203,6 @@ func (a *Authorizer) subject(s Subject) error {
 	return nil
 }
 
-// copied is s with its attributes a deep copy, for a hook to be given.
-func (s Subject) copied() Subject {
-	s.Attributes = deepCopy(s.Attributes)
-	return s
-}
-
 // identityKey is the subject's key, as membership is read by: empty for the anonymous, which no
 // membership has.
 func (s Subject) identityKey() string {
@@ -534,8 +528,18 @@ type Constraint struct {
 // Holders then asks again about each identity it lists, which it marks MaybeDenied where the
 // constraint answers true. Each constraint is given copies of its own of the subject and the
 // resource, their attributes, ancestors and label too, so one writing to them changes nothing
-// decided: a protobuf message among them copied by its fields, each message it reaches once, so one
-// holding itself is given as a copy holding itself, as a map holding itself is. A message of a
+// decided, nor what another is asked: made the first time a call asks it about each, and given it
+// again whenever the call asks it about the same, as Permissions does for each permission, and a
+// check of a labeled resource for each value its label asks for, so one writing to its copy reads
+// its write when the call asks it again, and a call after it is given a copy afresh. Copied for each
+// ask, Permissions of 300 permissions on a resource of 20,000 tags took a second. A copy holds no
+// more than a check converts (Attributes), counted as converting counts it: where the subject's or
+// the resource's hold more, the constraint can't be asked, and the call is refused as ErrDenied, as
+// is a change whose actor's attributes ValidateGrant can't be given for that. A protobuf message
+// among them is copied by its fields, each message it reaches once, so one holding itself is given
+// as a copy holding itself, as a map holding itself is. A slice reached at several lengths is copied
+// once, each length a slice of the copy, and a value holding no map, slice or pointer, as an array,
+// is shared where an interface holds it, as nothing writes to it through one. A message of a
 // host's type that is its own reflection but makes messages of another, as one embedding a dynamic
 // message does, is copied as any other pointer of the host's type, by the struct it points to, so a
 // constraint reads the type the host passed, in a list, a field or a map of that type too: its
@@ -575,18 +579,77 @@ type ConstraintInput struct {
 	Resource *Resource
 }
 
-// copied is in with its subject and resource deep copies.
-func (in ConstraintInput) copied() ConstraintInput {
+// givenTo is in as hook, the index of a constraint, is asked about it: with copies of the subject
+// and the resource, made the first time the call asks hook about each, and given it again whenever
+// the call asks it about the same, as Permissions does for each permission and a labeled check for
+// each value the label asks for. Copied for each ask, a check of a resource labeled with 60 values
+// by a subject passing 20,000 attributes took 160 ms, and Permissions of 300 permissions on a
+// resource of 20,000 tags a second. Each is a struct of its own, so a hook writing its principal
+// or its id changes nothing it is asked after. It reports false where copying either would copy
+// more than a check converts (deepCopy).
+func (a *Authorizer) givenTo(hook int, in ConstraintInput) (ConstraintInput, bool) {
+	ok := true
 	if in.Subject != nil {
-		s := in.Subject.copied()
+		s := *in.Subject
+		s.Attributes, ok = copiedFor(a, hook, s.Attributes)
 		in.Subject = &s
 	}
 	if in.Resource != nil {
 		r := *in.Resource
-		r.Ancestors, r.Attributes, r.Labels = deepCopy(r.Ancestors), deepCopy(r.Attributes), deepCopy(r.Labels)
-		in.Resource = &r
+		var ancestors, attributes, labels bool
+		r.Ancestors, ancestors = copiedFor(a, hook, r.Ancestors)
+		r.Attributes, attributes = copiedFor(a, hook, r.Attributes)
+		r.Labels, labels = copiedFor(a, hook, r.Labels)
+		in.Resource, ok = &r, ok && ancestors && attributes && labels
 	}
-	return in
+	return in, ok
+}
+
+// validating is the hook Config.ValidateGrant is, as givenTo and copiedFor know it apart from the
+// constraints.
+const validating = -1
+
+// copiedFor is v, which the host passed, as hook is given it: a copy (deepCopy), the call's first
+// for hook, kept with where v points (copiedKeyOf), so it is no other value's while the call runs,
+// and given hook again for the same v. Outside a call (still), it is copied each time. It reports
+// false where copying v would copy more than a check converts.
+func copiedFor[T any](a *Authorizer, hook int, v T) (T, bool) {
+	key, keyed := copiedKeyOf(reflect.ValueOf(v))
+	if keyed && key.at == 0 {
+		return v, true
+	}
+	if !keyed || a.copies == nil {
+		return deepCopy(v)
+	}
+	k := givenKey{hook: hook, of: key}
+	if given, ok := a.copies[k]; ok {
+		copied, _ := given.copy.(T)
+		return copied, given.ok
+	}
+	copied, ok := deepCopy(v)
+	a.copies[k] = given{of: v, copy: copied, ok: ok}
+	return copied, ok
+}
+
+// givenKey is what a call knows a copy it gave a hook by: the hook, and where what the host passed
+// points.
+type givenKey struct {
+	hook int
+	of   copiedKey
+}
+
+// given is a copy a call gave a hook, of what the host passed, kept so that where it points is no
+// other value's while the call runs, and whether it could be copied.
+type given struct {
+	of, copy any
+	ok       bool
+}
+
+// errUncopied refuses a call where a hook can't be given a copy of what it would be asked about,
+// as the host passed more than a check converts: unasked, a constraint could remove what the call
+// allows, or ValidateGrant refuse what it grants.
+func errUncopied(hook string) error {
+	return fmt.Errorf("%w: %s can't be asked: what it would be given is more than a hook is given a copy of", ErrDenied, hook)
 }
 
 var (
@@ -913,7 +976,9 @@ type Config struct {
 	// host's transaction, which is still open, with its locks. Record it on a connection of the
 	// host's own, which the host's transaction rolling back leaves.
 	OnRefused func(ctx context.Context, r Refusal)
-	// Now is the clock that expiry is compared with and conditions read as request.time; time.Now
+	// Now is the clock that expiry is compared with and conditions read as request.time, in UTC,
+	// whatever zone it returns times in, as string() writes a time in its own: a clock in each
+	// replica's local zone, as time.Now's, would decide by where the replica runs. It is time.Now
 	// when nil. A call reads it once, where it first needs the time, so every statement it makes and
 	// every condition it evaluates are of one moment: read apart, a grant or a membership ending as
 	// the call runs could meet a deny, a condition or label values of a later moment. A change reads
@@ -962,6 +1027,9 @@ type Authorizer struct {
 	// asked is what the call under way converted of its subjects' and requests' attributes
 	// (askingOf), nil outside one.
 	asked map[askingKey]*asking
+	// copies are what the call under way gave each hook of what the host passed (copiedFor), nil
+	// outside one.
+	copies map[givenKey]given
 }
 
 // permissionOn is a permission on a type of resource.
@@ -1147,6 +1215,7 @@ func (a *Authorizer) still() *Authorizer {
 	b.clock = &callClock{host: a.cfg.Now}
 	b.cfg.Now = b.clock.now
 	b.asked = map[askingKey]*asking{}
+	b.copies = map[givenKey]given{}
 	return &b
 }
 
@@ -1209,7 +1278,8 @@ type GrantInput struct {
 	// Role is what the grant gives: the role as defined now, or with ViaRedefinition, as it will be.
 	Role RoleDefinition
 	// Actor is who makes it: the subject changing grants, setting an eligibility, activating or
-	// redefining the role, or Import's actor. Its attributes are a copy of the hook's own.
+	// redefining the role, or Import's actor. Its attributes are a copy of the hook's own, made once
+	// for the call however many grants it asks about, as a constraint's are (ConstraintInput).
 	Actor Subject
 	// Via is how it is made.
 	Via Via
@@ -1235,11 +1305,17 @@ const (
 )
 
 // denied returns the name of the first constraint that removes in.Permission, or "". Each hook is
-// asked about copies of its own, so one that writes to what it is given changes neither what is
-// decided, its input already validated, nor what a later hook is asked.
+// asked about copies of its own (givenTo), so one that writes to what it is given changes neither
+// what is decided, its input already validated, nor what another hook is asked, only what it is
+// itself asked later in the call. A hook that can't be given a copy, as the attributes are past
+// what a check converts, refuses the call (errUncopied).
 func (a *Authorizer) denied(ctx context.Context, in ConstraintInput) (string, error) {
-	for _, c := range a.cfg.Constraints {
-		deny, err := c.Deny(ctx, a.db, in.copied())
+	for i, c := range a.cfg.Constraints {
+		given, ok := a.givenTo(i, in)
+		if !ok {
+			return "", errUncopied(fmt.Sprintf("constraint %q", c.Name))
+		}
+		deny, err := c.Deny(ctx, a.db, given)
 		if err != nil {
 			return "", err
 		}
