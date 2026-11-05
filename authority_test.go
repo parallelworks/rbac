@@ -3791,9 +3791,9 @@ func TestHoldersReadsOnlyTheHoldersInTheGroupsADenyNames(t *testing.T) {
 	}
 }
 
-// Holders reads the memberships of a large group it lists in no more pages than they fill, now
-// and as of a time: what reads them counts a function's rows as a thousand, and would look each
-// member's up on its own, which as of a time reads its every version.
+// Holders reads the memberships of a large group it lists in no more pages than they fill, and as
+// of a time a few pages for each version it reads: what reads them counts a function's rows as a
+// thousand, and would look each member's up on its own, which as of a time reads its every version.
 func TestHoldersReadsTheMembershipsOfALargeGroupInAsManyPages(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -3814,7 +3814,11 @@ func TestHoldersReadsTheMembershipsOfALargeGroupInAsManyPages(t *testing.T) {
 		}
 		return pages
 	}
-	at, history := dbNow(t, h), filled("rbac_history")
+	at := dbNow(t, h)
+	var records int64
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM rbac_history WHERE tenant = 't1'`).Scan(&records); err != nil {
+		t.Fatal(err)
+	}
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -3834,12 +3838,14 @@ func TestHoldersReadsTheMembershipsOfALargeGroupInAsManyPages(t *testing.T) {
 	if read, fill := pagesRead(ctx, t, tx, "rbac_memberships")-start, filled("rbac_memberships"); read > 2*fill {
 		t.Errorf("Holders read %d pages of memberships that fill %d", read, fill)
 	}
-	// History as of the time reads each version and whether a later one replaced it.
+	// History as of the time reads each version, and looks its row's up by its key in history's
+	// index of an entity's versions for a later one, which costs a few pages however stale history's
+	// statistics.
 	if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
 		start := pagesRead(ctx, t, tx, "rbac_history")
 		err := held(a)
-		if read := pagesRead(ctx, t, tx, "rbac_history") - start; err == nil && read > 4*history {
-			err = fmt.Errorf("Holders as of a time read %d pages of history that fill %d", read, history)
+		if read := pagesRead(ctx, t, tx, "rbac_history") - start; err == nil && read > 8*records {
+			err = fmt.Errorf("Holders as of a time read %d pages of history for %d records", read, records)
 		}
 		return err
 	}); err != nil {
@@ -5324,6 +5330,206 @@ func TestDeletingGroupsReadsOnlyWhatNamesThem(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// rowsRead is how many rows of table tx has read, by scans of the table and of its indexes.
+func rowsRead(ctx context.Context, t *testing.T, tx pgx.Tx, table string) int64 {
+	t.Helper()
+	var n int64
+	if err := tx.QueryRow(ctx, `SELECT pg_stat_get_xact_tuples_returned($1::regclass) + pg_stat_get_xact_tuples_fetched($1::regclass)`,
+		table).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// Reachable, of a subject in a thousand groups, and ChangeMembers and DeleteGroup, of a group in a
+// thousand, read of the denies and eligibilities only those naming the groups, beside others naming
+// others in the tenant and in another, under a generic plan, planned for their arguments, as a
+// connection's first five runs of a statement are, and as of a time: planned for an array of a
+// thousand keys, searching the index for each cost more than reading every row of every tenant,
+// which each then compared with every key, for seconds.
+func TestReadingByAThousandGroupsKeysReadsOnlyWhatNamesThem(t *testing.T) {
+	for _, plan := range []string{"custom", "generic"} {
+		t.Run(plan, func(t *testing.T) {
+			manage := rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}
+			h := setupOn(t, pgtest.Open(t, "plan_cache_mode=force_"+plan+"_plan"), func(c *rbac.Config) {
+				c.Catalog = append(slices.Clone(c.Catalog), groupMembers, manage)
+			})
+			ctx := t.Context()
+			tenant := rbac.TenantRoot("t1")
+			h.seed(t, grant(tenant, "cluster.admin", rbac.User, "u"), grant(tenant, "group.members", rbac.User, "boss"),
+				grant(tenant, "tenant.groups", rbac.User, "boss"))
+			u, boss := h.as(t, "u"), h.as(t, "boss")
+			h.as(t, "w")
+			h.groups(t, "team")
+			// u is in ten groups, each in a hundred others, and team in those thousand.
+			for _, q := range []string{
+				`INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'g' || i FROM generate_series(1, 1010) i`,
+				`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+				  SELECT 't1', 'g' || i, 'user', 'u' FROM generate_series(1, 10) i
+				  UNION ALL SELECT 't1', 'g' || (10 + (i - 1) * 100 + j), 'group', 'g' || i FROM generate_series(1, 10) i, generate_series(1, 100) j
+				  UNION ALL SELECT 't1', 'g' || i, 'group', 'team' FROM generate_series(11, 1010) i`,
+			} {
+				if _, err := h.pool.Exec(ctx, q); err != nil {
+					t.Fatal(err)
+				}
+			}
+			analyze := func() {
+				t.Helper()
+				if _, err := h.pool.Exec(ctx, `ANALYZE rbac_groups, rbac_members, rbac_denies, rbac_eligibilities, rbac_history`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tables := []string{"rbac_denies", "rbac_eligibilities"}
+			calls := map[string]func(a *rbac.Authorizer) error{
+				"Reachable": func(a *rbac.Authorizer) error {
+					reach, err := a.Reachable(ctx, u, root, "t1", "cluster")
+					if err == nil && !reach.All {
+						err = fmt.Errorf("reach %+v", reach)
+					}
+					return err
+				},
+				"ChangeMembers": func(a *rbac.Authorizer) error {
+					return a.ChangeMembers(ctx, boss, "t1", []rbac.Member{{Group: "team", Principal: identity("w")}}, nil)
+				},
+				"DeleteGroup": func(a *rbac.Authorizer) error { return a.DeleteGroup(ctx, boss, "t1", "team") },
+			}
+			// The rows of the denies and eligibilities each call reads, and of history Reachable reads as
+			// of at, in a transaction it rolls back.
+			read := func(at time.Time) map[string]int64 {
+				t.Helper()
+				rows := map[string]int64{}
+				for what, call := range calls {
+					func() {
+						tx, err := h.pool.Begin(ctx)
+						if err != nil {
+							t.Fatal(err)
+						}
+						defer func() { _ = tx.Rollback(ctx) }()
+						before := map[string]int64{}
+						for _, table := range tables {
+							before[table] = rowsRead(ctx, t, tx, table)
+						}
+						if err := call(h.authz.WithTx(tx)); err != nil {
+							t.Fatalf("%s: %v", what, err)
+						}
+						for _, table := range tables {
+							rows[what+" of "+table] = rowsRead(ctx, t, tx, table) - before[table]
+						}
+						if what != "Reachable" || plan != "custom" {
+							return
+						}
+						if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+							start := rowsRead(ctx, t, tx, "rbac_history")
+							err := call(a)
+							rows[what+" as of a time"] = rowsRead(ctx, t, tx, "rbac_history") - start
+							return err
+						}); err != nil {
+							t.Fatalf("%s as of a time: %v", what, err)
+						}
+					}()
+				}
+				return rows
+			}
+			analyze()
+			alone := read(dbNow(t, h))
+			// Others, in t1 and in a tenant of their own, are named in denies on a cluster each, exempt
+			// from them, and approve an eligibility there.
+			for _, q := range []string{
+				`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+				  SELECT t, 'cluster', 'o' || i, 'd', ARRAY(SELECT 'group:o' || i || '-' || j FROM generate_series(1, 8) j),
+				    ARRAY['user:o' || i], '{cluster:root}'
+				  FROM unnest('{t1,t2}'::text[]) t, generate_series(1, 500) i`,
+				`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+				  SELECT t, 'cluster', 'o' || i, 'user', 'o' || i, 'cluster.sudo', 3600, ARRAY['group:o' || i || '-1']
+				  FROM unnest('{t1,t2}'::text[]) t, generate_series(1, 500) i`,
+			} {
+				if _, err := h.pool.Exec(ctx, q); err != nil {
+					t.Fatal(err)
+				}
+			}
+			analyze()
+			for what, beside := range read(dbNow(t, h)) {
+				if beside > alone[what]+deeper {
+					t.Errorf("%s read %d rows, and %d beside a thousand denies and a thousand eligibilities naming others", what, alone[what], beside)
+				}
+			}
+		})
+	}
+}
+
+// DeleteGroup asks whether a deny names or exempts the group or one it is in, or an eligibility
+// they approve, by finding them by those keys, under a generic plan and planned for its arguments
+// alike: asked only whether one exists, the planner counted a read of every row of every tenant as
+// finding one sooner than the indexes did, once those were a level deeper, as another tenant's
+// denies naming dozens each, or its many eligibilities, make them.
+func TestDeletingAGroupFindsWhatNamesItByItsKeys(t *testing.T) {
+	manage := rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), manage) })
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "boss"))
+	boss := h.as(t, "boss")
+	h.groups(t, "team", "top")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'top', 'group', 'team')`); err != nil {
+		t.Fatal(err)
+	}
+	tables := []string{"rbac_denies", "rbac_eligibilities"}
+	// The rows of each table DeleteGroup reads, planned so, in a transaction it rolls back.
+	read := func(plan string) map[string]int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if _, err := tx.Exec(ctx, `SELECT set_config('plan_cache_mode', $1, true)`, "force_"+plan+"_plan"); err != nil {
+			t.Fatal(err)
+		}
+		rows := map[string]int64{}
+		for _, table := range tables {
+			rows[table] = -rowsRead(ctx, t, tx, table)
+		}
+		if err := h.authz.WithTx(tx).DeleteGroup(ctx, boss, "t1", "team"); err != nil {
+			t.Fatal(err)
+		}
+		for _, table := range tables {
+			rows[table] += rowsRead(ctx, t, tx, table)
+		}
+		return rows
+	}
+	plans := []string{"custom", "generic"}
+	alone := map[string]map[string]int64{}
+	for _, plan := range plans {
+		alone[plan] = read(plan)
+	}
+	// In another tenant, each of 2,000 denies names and exempts 64 principals, and each of 200,000
+	// eligibilities has an approver. History, which DeleteGroup doesn't read, records none.
+	for _, q := range []string{
+		`ALTER TABLE rbac_denies DISABLE TRIGGER USER`,
+		`ALTER TABLE rbac_eligibilities DISABLE TRIGGER USER`,
+		`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+		  SELECT 't2', 'cluster', 'c' || i, 'd', ARRAY(SELECT 'group:o' || i || '-' || j FROM generate_series(1, 64) j),
+		    ARRAY(SELECT 'user:o' || i || '-' || j FROM generate_series(1, 64) j), '{cluster:root}'
+		  FROM generate_series(1, 2000) i`,
+		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+		  SELECT 't2', 'cluster', 'c' || i, 'user', 'v' || i, 'cluster.sudo', 3600, ARRAY['group:o' || i]
+		  FROM generate_series(1, 200000) i`,
+		`ALTER TABLE rbac_denies ENABLE TRIGGER USER`,
+		`ALTER TABLE rbac_eligibilities ENABLE TRIGGER USER`,
+		`ANALYZE rbac_denies, rbac_eligibilities`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, plan := range plans {
+		for table, beside := range read(plan) {
+			if beside > alone[plan][table]+deeper {
+				t.Errorf("under a %s plan, DeleteGroup read %d rows of %s, and %d beside another tenant's thousands", plan, alone[plan][table], table, beside)
+			}
+		}
 	}
 }
 

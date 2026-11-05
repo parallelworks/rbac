@@ -842,19 +842,25 @@ func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string
 	// read by the tenant alone, as cheaper than one leading to the group or the scope that doesn't, so
 	// it reads every place, or grant, in the tenant to find the group's. So the group's members and
 	// the grants on its scope are found by what the index leading to them holds, behind OFFSET 0, and
-	// each found then tested by its key.
+	// each found then tested by its key. The denies and eligibilities naming the groups are read in
+	// CTEs, which a plan reads for every row they hold, so by those keys (naming): planned for the
+	// first row, as EXISTS is, a read of every row of every tenant finds one sooner than the indexes,
+	// as the planner counts it, so a deletion read every deny and eligibility in the database.
 	sources := "FALSE"
 	if len(a.owned) > 0 {
 		sources = "TRUE"
 	}
 	if err := tx.QueryRow(ctx, `
+		WITH named AS MATERIALIZED (SELECT FROM rbac_denies WHERE `+naming("principals", "$7")+` OR `+naming("exempt", "$7")+`),
+		  approving AS MATERIALIZED (SELECT FROM rbac_eligibilities WHERE `+naming("approvers", "$7")+`
+		    AND (expires_at IS NULL OR expires_at > $3))
 		SELECT
 		  EXISTS (`+byKey("$7", "rbac_grants", "principal", "1", "tenant = $1 AND (expires_at IS NULL OR expires_at > $3)")+`)
 		    OR EXISTS (`+byKey("$7", "rbac_eligibilities", "principal", "1", "tenant = $1 AND (expires_at IS NULL OR expires_at > $3)")+`),
 		  EXISTS (SELECT FROM rbac_grants WHERE scope = $6 AND tenant = $1 AND (expires_at IS NULL OR expires_at > $3))
 		    OR EXISTS (SELECT FROM rbac_eligibilities WHERE tenant = $1 AND scope = $6 AND (expires_at IS NULL OR expires_at > $3)),
-		  EXISTS (SELECT FROM rbac_denies WHERE `+naming("principals", "$7")+` OR `+naming("exempt", "$7")+`),
-		  EXISTS (SELECT FROM rbac_eligibilities WHERE `+naming("approvers", "$7")+` AND (expires_at IS NULL OR expires_at > $3)),
+		  EXISTS (SELECT FROM named),
+		  EXISTS (SELECT FROM approving),
 		  `+sources+` AND (EXISTS (SELECT FROM (SELECT principal, source FROM rbac_members
 		        WHERE tenant = $1 AND group_id = $4 AND source = ANY($5::text[]) OFFSET 0) k
 		      JOIN rbac_members m ON m.tenant = $1 AND m.group_id = $4 AND m.principal = k.principal AND m.source = k.source
@@ -2005,12 +2011,16 @@ func activationsLeaving(ctx context.Context, q DB, tenant string, leaving []Memb
 // naming is SQL for whether the array of keys col of a row holds one of the keys in the array keys
 // in the tenant $1: as the GIN indexes on rbac_tenant_keys find them, with no other condition on
 // the tenant, which a generic plan, costing it as an average tenant's few rows, would read every row
-// of the tenant by.
+// of the tenant by. The tenant's keys are built in a subquery, whose value no plan sees, so every
+// plan costs the search as a generic one does, whatever the number of keys: planned for an array
+// it is given, as a connection's first five runs of a statement and every one as of a time are, it
+// costs a search of the index for each key, and past a hundred or so reads every row of every
+// tenant instead, comparing each with them all.
 func naming(col, keys string) string { return namingIn("$1", col, keys) }
 
 // namingIn is naming in the tenant SQL gives, as text.
 func namingIn(tenant, col, keys string) string {
-	return fmt.Sprintf("rbac_tenant_keys(tenant, %s) && rbac_tenant_keys(%s, %s::text[])", col, tenant, keys)
+	return fmt.Sprintf("rbac_tenant_keys(tenant, %s) && (SELECT rbac_tenant_keys(%s, %s::text[]))", col, tenant, keys)
 }
 
 // nested is each group's up extended over the groups add nests in others, as the change will store

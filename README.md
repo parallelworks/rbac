@@ -608,13 +608,15 @@ every statement in its transaction for its arguments, the host's too, since a co
 plan of a statement it has run often counts any tenant as an average one, and without JIT, as so
 planned over history, they cost past `jit_above_cost` for an ordinary subject: a host's query of a
 `Filter` condition for a subject of 249 grants on containers took 760 ms with JIT, almost all of it
-compiling, and 110 ms without. A list counts the denies
-on scopes of its types by history's versions of them, at most a few, and `Grantable`, which can
-offer any custom role, reads each version of every one once. It orders a row's changes by their ids
-in `rbac_history`, which sessions take out of order once that table's id sequence caches more than
-one, so `AsOf` refuses that. Its read's hooks run in its transaction, which holds one of the pool's
-connections: a constraint there queries the `DB` it is given, as one that queries the pool waits
-for another connection, which a busy pool may never free.
+compiling, and 110 ms without. It tests each version a statement reads for a later one by its
+row's key, so history's statistics, which autovacuum leaves until a tenth of it is new, change no
+read's cost by much: a read of thousands of rows costs a few pages for each version. A list counts
+the denies on scopes of its types by history's versions of them, at most a few, and `Grantable`,
+which can offer any custom role, reads each version of every one once. It orders a row's changes
+by their ids in `rbac_history`, which sessions take out of order once that table's id sequence
+caches more than one, so `AsOf` refuses that. Its read's hooks run in its transaction, which holds
+one of the pool's connections: a constraint there queries the `DB` it is given, as one that queries
+the pool waits for another connection, which a busy pool may never free.
 
 `rbac.PruneHistory(ctx, db, before, through)` deletes what an export has read past (`through`, its
 cursor) and later records supersede: of each row, the last version at or before `before` stays, so

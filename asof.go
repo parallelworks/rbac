@@ -175,7 +175,13 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	// once, where `(f(x)).*` builds it once a column. A version is its row's last unless a later
 	// one is dated by then, and gives the columns history copied beside it as its row's, so a
 	// statement's condition on one, as a check's on its subject's principals, reads history by
-	// its index for the rows it names, rather than every version of every row in the tenant.
+	// its index for the rows it names, rather than every version of every row in the tenant. Its
+	// id is at least that of each of its row's versions dated by then exactly where none is later,
+	// as no id is null: tested so, in a subquery the planner can't make a join of, each version
+	// looks its row's up by its key in history's index of an entity's versions, until the first
+	// later one. As a join, planned by statistics from before most of history was written, as
+	// autovacuum leaves them until a tenth of it is new, it read every version of the entity in the
+	// tenant for each version it found, the key only a filter.
 	names := make([]string, len(asOfEntities))
 	for i, e := range asOfEntities {
 		names[i] = e.table
@@ -218,9 +224,8 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 		view := `SELECT %[4]s FROM %[1]s.rbac_history h, LATERAL pg_catalog.jsonb_populate_record(NULL::%[1]s.%[2]s, h.after) r
 			WHERE h.tenant = current_setting('rbac.as_of_tenant') AND h.entity = '%[3]s'
 			  AND h.effective_at <= %[5]s AND h.op NOT IN ('delete', 'expire')
-			  AND NOT EXISTS (SELECT FROM %[1]s.rbac_history n
-			    WHERE n.tenant = h.tenant AND n.entity = h.entity AND n.key = h.key
-			      AND n.effective_at <= %[5]s AND n.id > h.id)`
+			  AND h.id >= ALL (SELECT n.id FROM %[1]s.rbac_history n
+			    WHERE n.tenant = h.tenant AND n.entity = h.entity AND n.key = h.key AND n.effective_at <= %[5]s)`
 		// Roles are read by their ids, the key, or all at once, as Grantable reads them: their view
 		// takes each one's newest version dated by then, which a condition on the key reaches into,
 		// so each version is read once, where the test for a later one, joined to every version of
