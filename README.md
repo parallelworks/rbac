@@ -131,28 +131,30 @@ scopes conditional ones reach, to check one by one.
   is granted, removes a permission it would give or the power to grant it, or a constraint does on
   that scope, as it would stop `Apply` granting the role there, though defining the role asks it of
   the tenant, or the label of a scope such a role is granted on refuses it. The constraints are
-  asked about what it would hand on of no resource first, and only where one answers that it may
-  remove some of it, about each such scope, once, as `Config.ResourceOf` gives it; without it, that
-  first answer stands for every scope. A grant widens by what it gives through its principal, as
-  checks read it: one to the tenant's members of a privileged role, or to the public of a role not
-  marked `Public`, gives nothing, so widening the role asks nothing about it, and a redefinition
-  that has it give something, as narrowing the role so that it is no longer privileged does, widens
-  it, with what was added to the role while it gave nothing; where the role gives more to whomever
-  it is granted, each grant giving anything through its principal widens, whatever its scope takes
-  of what was added. A deny where the tenant's members hold a privileged role still stops widening
-  it, as a catalog change that has the role no longer be privileged gives them what it gives then,
-  and asks no one. Renaming a role or rewriting its description changes no grant, so needs only the
-  power to define it, however its lists are stored: a role, deny or eligibility is the same in any
-  order of its lists, and however often one names an entry, as one written around the package, by a
-  seed or a restore, can hold them, so setting it again as it is read changes nothing. A role lists
-  in `GrantableRoles` only roles that a `<type>:grant` it gives, on a type it is for, lets its
-  holders grant, as roles that can be granted on that type, or it is refused as invalid: a listing
-  none of them reaches would hand nothing on, and the actor's power to grant the role would go
-  unchecked. One the role already lists so as it is stored, as once the role listed is narrowed or
-  the catalog changes, it keeps, so renaming it still needs only the power to define it; one a
-  change adds, or leaves handing nothing on by changing the role, is refused, and dropping one needs
-  no power over the role listed. A listing, handing anything on or not, keeps the role listed from
-  being deleted.
+  asked about each such scope once, as `Config.ResourceOf` gives it, never of no resource alone,
+  which a constraint that tells resources apart can answer with nothing, about what `Apply` granting
+  the role there asks: the power to change grants there, and on a resource, what the role gives for
+  that resource's type; without `Config.ResourceOf`, about each scope as stored where that is all of
+  it, and otherwise of no resource, which then stands for every such scope. A grant widens by what
+  it gives through its principal, as checks read it: one to the tenant's members of a privileged
+  role, or to the public of a role not marked `Public`, gives nothing, so widening the role asks
+  nothing about it, and a redefinition that has it give something, as narrowing the role so that it
+  is no longer privileged does, widens it, with what was added to the role while it gave nothing;
+  where the role gives more to whomever it is granted, each grant giving anything through its
+  principal widens, whatever its scope takes of what was added. A deny where the tenant's members
+  hold a privileged role still stops widening it, as a catalog change that has the role no longer be
+  privileged gives them what it gives then, and asks no one. Renaming a role or rewriting its
+  description changes no grant, so needs only the power to define it, however its lists are stored:
+  a role, deny or eligibility is the same in any order of its lists, and however often one names an
+  entry, as one written around the package, by a seed or a restore, can hold them, so setting it
+  again as it is read changes nothing. A role lists in `GrantableRoles` only roles that a
+  `<type>:grant` it gives, on a type it is for, lets its holders grant, as roles that can be granted
+  on that type, or it is refused as invalid: a listing none of them reaches would hand nothing on,
+  and the actor's power to grant the role would go unchecked. One the role already lists so as it is
+  stored, as once the role listed is narrowed or the catalog changes, it keeps, so renaming it still
+  needs only the power to define it; one a change adds, or leaves handing nothing on by changing the
+  role, is refused, and dropping one needs no power over the role listed. A listing, handing
+  anything on or not, keeps the role listed from being deleted.
   `DeleteRole` removes one with its grants; `Roles` lists the built-in and custom roles a scope type
   takes. Custom roles follow the catalog: one gives only what the catalog still has, and is
   privileged when it gives what only privileged roles do, or changes access.

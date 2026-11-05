@@ -600,18 +600,24 @@ sequenceDiagram
   by one (`widenedTo.reaches`): a catalog change that has the role no longer be privileged gives
   them what it gives, what the redefinition added too, and asks no one. The constraints are decided
   so too where a grant widens, or a role listing it is granted, on that scope, as `Apply` asks them
-  there, not only on the tenant, as `mayDefine` does: of no resource first, and only where one
-  answers true, of each such scope as `Config.ResourceOf` gives it, once, their answers read back
-  under the lock, where a scope it gives more on that they weren't asked about refuses it with
-  `ErrConflict` (`handedOnStopped`, `handing`); without `Config.ResourceOf`, the first answer stands
-  for every scope. A scope read as stored, as the host no longer has it, that the change comes to
-  give more on while it waits refuses it with `ErrConflict`. A role's lists are compared sorted and
-  without repeats (`canonical`), as one written around the package can hold them in any order, so
-  renaming it is no redefinition, and setting a role, deny or eligibility again as it is stored
-  changes nothing (`canonicalSQL`). A role lists in `GrantableRoles` only roles one of its
-  `<type>:grant` permissions, on a type it is for, lets its holders grant (`lets`), so `holdsRole`
-  checks the actor's power to grant each. It keeps a listing that already hands nothing on as
-  stored, as once the role listed was narrowed, so renaming it needs only the power to define it.
+  there, not only on the tenant, as `mayDefine` does: of each such scope as `Config.ResourceOf`
+  gives it, once, whatever they would answer of no resource, as one that tells resources apart can
+  answer nothing there, of the power to change grants there, which `changesStopped` asks only of no
+  resource, and on a resource, of a `<type>:grant` of the role's other types too, which `Apply`
+  reads there as a permission like any other (`handsOnAt`); their answers are read back under the
+  lock, where a scope it gives more on that they weren't asked about refuses it with `ErrConflict`
+  (`handedOnStopped`, `handing`). Without `Config.ResourceOf`, a scope is asked about as stored
+  where that is all of it (`resolves`), and otherwise of no resource, which stands for every such
+  scope. Each scope costs a `Config.ResourceOf` call and the walk `Apply` granting the role there
+  makes, as `ValidateGrant` is asked about each grant it widens. A scope read as stored, as the host
+  no longer has it, that the change comes to give more on while it waits refuses it with
+  `ErrConflict`. A role's lists are compared sorted and without repeats (`canonical`), as one
+  written around the package can hold them in any order, so renaming it is no redefinition, and
+  setting a role, deny or eligibility again as it is stored changes nothing (`canonicalSQL`). A
+  role lists in `GrantableRoles` only roles one of its `<type>:grant` permissions, on a type it is
+  for, lets its holders grant (`lets`), so `holdsRole` checks the actor's power to grant each. It
+  keeps a listing that already hands nothing on as stored, as once the role listed was narrowed, so
+  renaming it needs only the power to define it.
 - **Eligibilities.** `SetEligibility` lets a principal `Activate` a role for a while, perhaps
   only with approvers or a `requires` condition. An activation is a grant that ends no later than
   its eligibility expires, or its holder's membership or place in the group the eligibility names
