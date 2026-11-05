@@ -1453,13 +1453,14 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 
 // handedOnStopped returns why a constraint stops the actor handing on what a custom role, defined as
 // def, gives more on the scopes a change to it reaches, as one would stop Apply granting it there:
-// on a scope one of its grants or eligibilities will give more on, or would (reached.widened), what
-// it gives, checked across the tenant as mayDefine checks it; and on a scope a role listing it is
-// granted on (reached.listed), the power to grant it as it will be on scopes of each type there, as
-// the holders of that role then may; on the former, the power to change grants there too, and on a
-// resource, what Apply asks of the resource's type (handsOnAt). Each is decided once for each set
-// of the constraints' answers it is read through (handing.on), so asked anywhere, once for every
-// type of scope. au is the actor's authority on the tenant, which mayDefine checked the role on.
+// on a scope one of its grants or eligibilities will give more on, or would (reached.widened), the
+// power to change grants there and what it gives where a grant there reaches, as Apply walks it
+// (handsOnAt); and on a scope a role listing it is granted on (reached.listed), the power to grant
+// it as it will be on scopes of each type there, as the holders of that role then may, by the
+// actor's authority on the tenant, which holds all of it, so that only a constraint refuses it.
+// Each is decided once for each set of the constraints' answers it is read through (handing.on), so
+// asked anywhere, once for every type of scope. au is the actor's authority on the tenant, which
+// mayDefine checked the role on.
 func (a *Authorizer) handedOnStopped(au authority, def RoleDefinition, scopes reached, h *handing, change string) error {
 	type decision struct {
 		cs *constrained
@@ -1531,25 +1532,31 @@ func (a *Authorizer) handedOnStopped(au authority, def RoleDefinition, scopes re
 
 // handsOnAt reports whether the constraints in there, those on a scope of a type, let the actor
 // hand on there what a role defined as def gives, as they let Apply grant it there: change grants
-// there at all (changing), which changesStopped asks only of no resource, and hold everything the
-// role gives, walked across the tenant as mayDefine walks it, and on a resource, the `<type>:grant`
-// permissions it gives of its other types too, which Apply reads there as permissions like any
-// other, asked about for the resource's type, where the walk reads them as powers. If not, it
-// returns a permission removed, and the constraint that removed it.
+// there at all (changing), which changesStopped asks only of no resource, and hold what the role
+// gives where the grant reaches, as Apply walks it: on a container or the tenant, for each of the
+// role's types, and on a resource, for its type alone, where a grant gives nothing for the others.
+// There a `<type>:grant` of another type is a permission like any other, which Apply needs the
+// actor to hold for the resource's type, and mayDefine, walking every type, can read as a power
+// instead: so only the constraints are asked about it, and the actor holding it is mayDefine's to
+// decide. If not, it returns a permission removed, and the constraint that removed it.
 func (a *Authorizer) handsOnAt(there authority, def RoleDefinition, scopeType string) (Permission, string, bool) {
 	cs := there.constrained
 	if manage := GrantPermission(scopeType); cs.removes(manage, scopeType) {
 		return manage, cs.removedBy(manage, scopeType), false
 	}
-	if p, by, ok := a.holdsRole(there, def, def.ResourceTypes, "", time.Time{}, newChecked()); !ok || a.contains(scopeType) {
-		return p, by, ok
+	if a.contains(scopeType) {
+		return a.holdsRole(there, def, def.ResourceTypes, "", time.Time{}, newChecked())
 	}
+	own := def
+	own.Permissions = nil
 	for _, p := range def.Permissions {
-		if t, _ := p.parts(); p.changesGrants() && t != scopeType && slices.Contains(def.ResourceTypes, t) && cs.removes(p, scopeType) {
+		if t, _ := p.parts(); !p.changesGrants() || t == scopeType {
+			own.Permissions = append(own.Permissions, p)
+		} else if cs.removes(p, scopeType) {
 			return p, cs.removedBy(p, scopeType), false
 		}
 	}
-	return "", "", true
+	return a.holdsRole(there, own, []string{scopeType}, "", time.Time{}, newChecked())
 }
 
 // alike is the same for two scopes whose authorities, on and another, remove the same from what the
