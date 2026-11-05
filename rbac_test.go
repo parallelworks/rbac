@@ -10146,6 +10146,49 @@ func TestAConstraintWhereTheMembersHoldARoleNoLongerPrivilegedStopsNarrowingIt(t
 	}
 }
 
+// A role listing r, granted on w1, hands r on there only where its grant gives its holders the
+// power to grant r: by a `<type>:grant` it gives for that type, on scopes of the type w1 reaches. So
+// one for clusters that gives workspace:grant too lets its holders grant r on the clusters in w1, but
+// on no workspace, and a constraint freezing workspaces in w1 doesn't stop widening r, as it doesn't
+// stop Apply granting r on a cluster there; nor does one removing root from x in w1 stop widening r
+// to give root where the role listing it gives tenant:grant, as nothing in w1 is a tenant.
+func TestARoleListingARedefinitionWhereItHandsNothingOnDoesntStopIt(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		lister    rbac.RoleDefinition
+		configure func(*rbac.Config)
+		// onC1 is whether its holders may grant r on c1.
+		onC1 bool
+	}{
+		{"a power it gives for another type", rbac.RoleDefinition{Permissions: []rbac.Permission{grantC, "workspace:grant"}, ResourceTypes: []string{"cluster"}}, removedInW1Alone("workspace:grant"), true},
+		{"a tenant from a workspace", rbac.RoleDefinition{Permissions: []rbac.Permission{"tenant:grant"}, ResourceTypes: []string{rbac.TenantScope}}, removedInW1Alone(root), false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := setup(t, c.configure)
+			ctx := t.Context()
+			x, r := definer(t, h)
+			y, z := h.as(t, "y"), h.as(t, "z")
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles) VALUES ('t1', 'custom.lister', $1, $2, $3)`,
+				c.lister.Permissions, c.lister.ResourceTypes, []string{string(r.ID)}); err != nil {
+				t.Fatal(err)
+			}
+			tenant := rbac.TenantRoot("t1")
+			h.seed(t, grant(tenant, "tenant.admin", rbac.User, "x"), grant(tenant, "workspace.admin", rbac.User, "x"), grant(workspace.Scope(), "custom.lister", rbac.User, "y"))
+			wider := r
+			wider.Permissions = []rbac.Permission{view, root}
+			if err := h.authz.SetRole(ctx, x, "t1", wider); err != nil {
+				t.Fatalf("widening a role that one granted on w1 lists where its holders may grant it on no scope the constraint names: %v", err)
+			}
+			for _, on := range []rbac.Resource{workspace, cluster} {
+				err := h.authz.Apply(ctx, y, on, rbac.Change{Grant: []rbac.Binding{{Role: r.ID, Principal: z.Principal}}})
+				if want := on.ID == cluster.ID && c.onC1; (err == nil) != want || err != nil && !errors.Is(err, rbac.ErrDenied) {
+					t.Errorf("y granting it on %s: %v", on.ID, err)
+				}
+			}
+		})
+	}
+}
+
 // What the constraints answered before SetRole's transaction it reads back under the tenant's lock,
 // so a role listing the one it widens, granted in w1 while the change waited, which they weren't
 // asked about, refuses it, to be tried again, and then the constraint removing root from x in w1

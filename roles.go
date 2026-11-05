@@ -1068,9 +1068,13 @@ type listedAt struct {
 // handingOn is, for each custom role granted on a scope of a type, the types of scope on which its
 // holders may grant custom role id, defined as def, without holding it: through a role listing it,
 // and through one listing such a role, as its holders may grant that one to others, who may then
-// grant id. A t:grant reaches scopes of t from a container, the tenant or a scope of t itself
-// (grantedOn), and lets its holders grant a role it lists only where that role can be granted. It is
-// found back from id, a type at a time, so a tenant's roles listing one another are each read once.
+// grant id. A t:grant gives its holders that power only from a role for t, as checks read it, and
+// reaches scopes of t from a container, the tenant or a scope of t itself (grantedOn), but the tenant
+// from itself alone, as nothing is above it; it lets its holders grant a role it lists only where
+// that role can be granted. So a scope a role listing id is granted on that reaches none of these,
+// where its holders may grant nothing, isn't one, nor read for the denies, labels and constraints
+// there. It is found back from id, a type at a time, so a tenant's roles listing one another are
+// each read once.
 func (a *Authorizer) handingOn(custom map[Role]RoleDefinition, id Role, def RoleDefinition) map[listedAt][]string {
 	// The roles listing each role, with the type each one's t:grant lets its holders grant it on.
 	listedBy := map[Role][]listedAt{}
@@ -1080,7 +1084,7 @@ func (a *Authorizer) handingOn(custom map[Role]RoleDefinition, id Role, def Role
 		}
 		l := custom[lid]
 		for _, p := range l.Permissions {
-			if t, _ := p.parts(); p.changesGrants() {
+			if t, _ := p.parts(); p.changesGrants() && l.GrantableOn(t) {
 				for _, g := range l.GrantableRoles {
 					listedBy[g] = append(listedBy[g], listedAt{lid, t})
 				}
@@ -1100,7 +1104,11 @@ func (a *Authorizer) handingOn(custom map[Role]RoleDefinition, id Role, def Role
 				if l.scopeType != on {
 					continue
 				}
-				for _, st := range a.grantedOn([]string{on}) {
+				reaching := a.grantedOn([]string{on})
+				if on == TenantScope {
+					reaching = []string{TenantScope}
+				}
+				for _, st := range reaching {
 					if at := (listedAt{l.role, st}); !seen[at] {
 						seen[at] = true
 						next = append(next, at)
