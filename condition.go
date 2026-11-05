@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"cel.dev/cel-go/cel"
@@ -71,13 +72,15 @@ import (
 // Reading a time in a zone costs 100, and 500 more where an attribute names the zone, as the
 // process loads each zone once, and finds a name names none once: the zone a literal names when the
 // condition is planned, and one an attribute names the first time a time is read in it, which a
-// request can make a new one each time. What a check may spend on conditions is bounded, for each
-// scope on its path, and so are the conditions stored, so that a check evaluates whole every one it
-// reads: those of an identity's grants on a scope cost at most so much together, and those of a
-// scope's grants to groups, the tenant's members and the public, which reach many, as much again,
-// those from each source the host owns (Config.Sources) apart from the rest; those of a scope's
-// denies (SetDeny); and the requirements of the eligibilities of groups for a role on a scope. Each
-// distinct condition counts once, as what compiling it and the most evaluating it can cost:
+// request can make a new one each time; but where reading the platform's files failed, as once the
+// process ran out of file descriptors, it keeps nothing and loads the zone again the next time.
+// What a check may spend on conditions is bounded, for each scope on its path, and so are the
+// conditions stored, so that a check evaluates whole every one it reads: those of an identity's
+// grants on a scope cost at most so much together, and those of a scope's grants to groups, the
+// tenant's members and the public, which reach many, as much again, those from each source the
+// host owns (Config.Sources) apart from the rest; those of a scope's denies (SetDeny); and the
+// requirements of the eligibilities of groups for a role on a scope. Each distinct condition counts
+// once, as what compiling it and the most evaluating it can cost:
 // hundreds of comparisons with literals, a hundred of an attribute with the subject's id, or three
 // of the longest that read a list or loop. A check of a labeled resource decides each value its
 // label asks for, and Holding, Filter and Reachable each of the subject's label values, as a check
@@ -1082,11 +1085,15 @@ func keptZone(name string) (zone, bool) {
 	return z, ok
 }
 
-// loadZone loads the zone named, or finds it names none, and keeps what it found.
+// loadZone loads the zone named, or finds it names none, and keeps what it found, but where the
+// platform's files failed to give it for a while (settled).
 func loadZone(name string) zone {
 	loadingZone()
 	var z zone
-	z.loc, z.err = time.LoadLocation(name)
+	z.loc, z.err = locating(name)
+	if !settled(z.err) {
+		return z
+	}
 	zones.Lock()
 	defer zones.Unlock()
 	for k := range zones.byName {
@@ -1099,16 +1106,29 @@ func loadZone(name string) zone {
 	return z
 }
 
+// settled reports whether loading a zone that failed with err would fail again, as for a name of no
+// zone, of a file that isn't one or of a directory: not where reading the platform's files failed,
+// as once the process has run out of file descriptors, which kept would fail a real zone for the
+// process until it was dropped.
+func settled(err error) bool {
+	var errno syscall.Errno
+	return err == nil || !errors.As(err, &errno) || errno == syscall.EISDIR || errno == syscall.ENOTDIR
+}
+
+// locating loads a time zone from the platform's files, as a test's stand-in for them.
+var locating = time.LoadLocation
+
 // zoneName refuses a name of no zone, before one is loaded: one of more than maxZone bytes, which
 // loading copies for each place it looks; one holding a byte other than a letter, a digit, '/', '_',
 // '-' or '+', as no name in the time zone database does, so no other file kept beside them, as
 // tzdata.zi, is read as one; and Local, the zone the process runs in, by which a condition would
-// decide by where each replica runs.
+// decide by where each replica runs, and localtime, which some platforms keep beside the zones as a
+// link to the one the process runs in.
 func zoneName(name string) error {
 	if len(name) > maxZone {
 		return fmt.Errorf("rbac: a time zone is at most %d bytes", maxZone)
 	}
-	if name == "Local" {
+	if name == "Local" || name == "localtime" {
 		return errors.New("rbac: a time zone is named, not the one the process runs in")
 	}
 	for i := range len(name) {
@@ -1127,8 +1147,9 @@ func zoneName(name string) error {
 // (chargePast), as a zone a request passes can be a new one each time. The zone a literal names is
 // loaded, or found to be none, when the condition is planned, as matching compiles a pattern, so
 // evaluating it loads nothing however many zones the process has dropped since, and worst charges
-// it no load; one CEL plans otherwise, as another version may, isn't a condition. A fixed offset, as
-// "+05:30", CEL reads without loading anything.
+// it no load; one CEL plans otherwise, as another version may, isn't a condition, and one the
+// platform's files fail to give while it is planned isn't planned, so a check plans it again. A
+// fixed offset, as "+05:30", CEL reads without loading anything.
 func (g *guards) inZone(call interpreter.InterpretableCall) (interpreter.InterpretableCall, error) {
 	var planned *zone
 	if args := call.Args(); g.literalZones[call.ID()] && len(args) == 2 {
@@ -1140,6 +1161,10 @@ func (g *guards) inZone(call interpreter.InterpretableCall) (interpreter.Interpr
 			z, kept := keptZone(string(name))
 			if !kept {
 				z = loadZone(string(name))
+			}
+			// Planned with the failure, it would fail for as long as checks keep the program.
+			if !settled(z.err) {
+				return nil, fmt.Errorf("loading the time zone %q: %w", name, z.err)
 			}
 			planned = &z
 		}

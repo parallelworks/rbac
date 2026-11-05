@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -3183,8 +3184,9 @@ func TestATimeInAZoneLoadsTheZoneOnceForTheProcess(t *testing.T) {
 }
 
 // A name holding a byte no zone's name does, as tzdata.zi's dot, fails before anything is loaded, so
-// no file kept beside the zones is read as one; and so does Local, the zone the process runs in, by
-// which a condition would decide by where each replica runs. A fixed offset loads nothing.
+// no file kept beside the zones is read as one; and so do Local, the zone the process runs in, by
+// which a condition would decide by where each replica runs, and localtime, which some platforms
+// keep beside the zones as a link to it. A fixed offset loads nothing.
 func TestATimeInANameOfNoZoneFailsBeforeLoadingAnything(t *testing.T) {
 	// zone is as a CEL string literal spells it.
 	evaluate := func(zone string, evaluated bool) {
@@ -3203,7 +3205,7 @@ func TestATimeInANameOfNoZoneFailsBeforeLoadingAnything(t *testing.T) {
 		evaluate(zone, true)
 	}
 	loads := rbac.CountZoneLoads(t)
-	for _, zone := range []string{"tzdata.zi", "zone.tab", "../UTC", "America/New York", "Local", `UTC\u0000`, "+05:30"} {
+	for _, zone := range []string{"tzdata.zi", "zone.tab", "../UTC", "America/New York", "Local", "localtime", `UTC\u0000`, "+05:30"} {
 		evaluate(zone, zone == "+05:30")
 	}
 	if *loads != 0 {
@@ -3260,6 +3262,35 @@ func TestTheZonesAProcessKeepsAreBounded(t *testing.T) {
 	loads := rbac.CountZoneLoads(t)
 	if ok := allowed(t, h, u, login, cluster); !ok || *loads != 0 {
 		t.Errorf("a condition naming its zone in a literal, once the process dropped it: allowed %t, loaded %d zones", ok, *loads)
+	}
+}
+
+// A zone the platform's files fail to give for a while, as once the process has run out of file
+// descriptors, loads once they give it again: kept, the zone of a check's condition, named by an
+// attribute or a literal, failed for the process until it was dropped, though loading it again
+// would have found it, and a literal's for as long as checks kept the condition's program.
+func TestAZoneThatFailsToLoadForAWhileLoadsOnceItCan(t *testing.T) {
+	const zone = "Asia/Kathmandu"
+	h := setup(t)
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	g.Condition = rbac.Condition{Expression: `request.time.getHours("` + zone + `") >= 0`}
+	h.seed(t, g)
+	u := h.as(t, "u")
+	attribute := `request.time.getHours(request.attributes.zone) >= 0`
+	rbac.ForgetZones(zone)
+	restore := rbac.FailZoneLoads(t, syscall.EMFILE)
+	if _, ok, _, _ := rbac.EvaluateCondition(t, attribute, map[string]any{"zone": zone}); ok {
+		t.Fatal("a zone that fails to load was read")
+	}
+	if allowed(t, h, u, login, cluster) {
+		t.Fatal("a condition reading a time in a zone that fails to load allowed")
+	}
+	restore()
+	if _, ok, _, err := rbac.EvaluateCondition(t, attribute, map[string]any{"zone": zone}); !ok {
+		t.Errorf("a zone an attribute names that failed to load for a while: %v", err)
+	}
+	if !allowed(t, h, u, login, cluster) {
+		t.Error("a zone a literal names that failed to load for a while still fails")
 	}
 }
 

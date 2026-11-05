@@ -296,14 +296,17 @@ scopes conditional ones reach, to check one by one.
   Reading a time in a zone costs 100, and 500 more where an attribute names the zone: each process
   loads a zone, or finds a name names none, once, the zone a literal names when the condition is
   planned, and refuses, before loading anything, a name holding a byte no zone's name does, as
-  `tzdata.zi`'s dot, and `Local`, the zone the process runs in. Loaded at each call, a check of
-  conditions reading the hour in `tzdata.zi`, a file kept beside the zones, took a quarter of a
-  second, and a request can name a new zone each time. The process keeps at most 1,024 zones and
-  names of none, dropping one at random past that, and a zone whose files change after it loaded
-  it reads as it was until it is dropped. Cost is bounded per check too, for
-  each scope on its path, and the conditions a check reads together are bounded where they are
-  stored: an identity's grants' on a scope, those of a scope's grants to groups, the tenant's
-  members and the public, each the tenant's and those from each source the host owns apart, a
+  `tzdata.zi`'s dot, and `Local` and `localtime`, the zone the process runs in. Loaded at each
+  call, a check of conditions reading the hour in `tzdata.zi`, a file kept beside the zones, took a
+  quarter of a second, and a request can name a new zone each time. The process keeps at most 1,024
+  zones and names of none, dropping one at random past that, and a zone whose files change after
+  it loaded it reads as it was until it is dropped; but where reading the files failed, as once
+  the process ran out of file descriptors, it keeps nothing, and a condition naming the zone
+  fails until they can be read, where kept it failed until the process dropped it. Cost is
+  bounded per check too, for each scope on its path, and the conditions a check reads together
+  are bounded where they are stored: an identity's grants' on a scope, those of a scope's grants
+  to groups, the tenant's members and the public, each the tenant's and those from each source
+  the host owns apart, a
   scope's denies',
   and the requirements of groups' eligibilities for a role on a scope. Each holds hundreds of
   comparisons with literals, a hundred of an attribute with the subject's id, or three of the

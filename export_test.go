@@ -867,6 +867,26 @@ func LoadZones(names []string) int {
 	return len(zones.byName)
 }
 
+// ForgetZones drops the zones named from those the process keeps.
+func ForgetZones(names ...string) {
+	zones.Lock()
+	defer zones.Unlock()
+	for _, name := range names {
+		delete(zones.byName, name)
+	}
+}
+
+// FailZoneLoads makes loading a time zone fail with err, until the func it returns is called or t
+// ends.
+func FailZoneLoads(t *testing.T, err error) (restore func()) {
+	t.Helper()
+	old := locating
+	locating = func(string) (*time.Location, error) { return nil, err }
+	restore = func() { locating = old }
+	t.Cleanup(restore)
+	return restore
+}
+
 // MaxZones is how many time zones the process keeps loaded.
 const MaxZones = maxZones
 

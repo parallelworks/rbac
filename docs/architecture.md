@@ -476,13 +476,16 @@ sequenceDiagram
   charged. Reading a time in a zone loads the zone once for the process (`zones`), bounded at
   `maxZones`, and finds a name names none once, the zone a literal names when the condition is
   planned, and one an attribute names the first time a time is read in it, charged `zoneLoad`
-  more, before it loads, and refuses a name of none, as `tzdata.zi`, and `Local`, before loading
-  anything (`inZone`): loaded at each call, the zone `tzdata.zi` named took a quarter of a second
-  for a check. A comparison, a search or a match that would cost more than a condition may fails
-  before it runs, as CEL charges a call only once it has run, and a program in which CEL plans one,
-  a literal, a key or a loop's condition where the package can't charge or refuse it isn't a
-  condition. What a check reads together is bounded where it is stored, for each
-  scope: an identity's conditional grants, the conditional grants to groups, the tenant's members
+  more, before it loads, and refuses a name of none, as `tzdata.zi`, and `Local` and `localtime`,
+  before loading anything (`inZone`): loaded at each call, the zone `tzdata.zi` named took a
+  quarter of a second for a check. Where reading the platform's files failed, as once the process
+  ran out of file descriptors, it keeps nothing (`settled`), and a literal's zone isn't planned, so
+  the next check plans it again: kept, a real zone failed until the process dropped it. A
+  comparison, a search or a match that would cost more than a condition may fails before it runs,
+  as CEL charges a call only once it has run, and a program in which CEL plans one, a literal, a
+  key or a loop's condition where the package can't charge or refuse it isn't a condition. What a
+  check reads together is bounded where it is stored, for each scope: an identity's conditional
+  grants, the conditional grants to groups, the tenant's members
   and the public, each the tenant's and those from each source the host owns apart, the conditional
   denies, and the requirements of groups' eligibilities for a role, and a change adding a condition
   past one is refused as invalid. A check's budget is that for each scope on its path, so it
