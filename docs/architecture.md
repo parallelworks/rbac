@@ -603,12 +603,16 @@ sequenceDiagram
   there, not only on the tenant, as `mayDefine` does: of each such scope as `Config.ResourceOf`
   gives it, once, whatever they would answer of no resource, as one that tells resources apart can
   answer nothing there, of the power to change grants there, which `changesStopped` asks only of no
-  resource, and on a resource, of a `<type>:grant` of the role's other types too, which `Apply`
-  reads there as a permission like any other (`handsOnAt`); their answers are read back under the
-  lock, where a scope it gives more on that they weren't asked about refuses it with `ErrConflict`
-  (`handedOnStopped`, `handing`). Without `Config.ResourceOf`, a scope is asked about as stored
-  where that is all of it (`resolves`), and otherwise of no resource, which stands for every such
-  scope. Each scope costs a `Config.ResourceOf` call and the walk `Apply` granting the role there
+  resource, and of what the role gives where the grant reaches, as `Apply` walks it: on a resource,
+  for that resource's type alone, a `<type>:grant` of another type being a permission like any
+  other there, which only the constraints are asked about, as `mayDefine` decides holding it
+  (`handsOnAt`). Their answers are read back under the lock, where a scope it gives more on that
+  they weren't asked about refuses it with `ErrConflict` (`handedOnStopped`, `handing`). Without
+  `Config.ResourceOf`, a scope is asked about as stored where that is all of it (`resolves`), and
+  otherwise of no resource, which stands for every such scope. A scope where a role listing it is
+  granted counts only where its holders may grant it there: by a `<type>:grant` that role gives for
+  that type, on scopes of the type the grant reaches, as nothing reaches the tenant but itself
+  (`handingOn`). Each scope costs a `Config.ResourceOf` call and the walk `Apply` granting the role there
   makes, as `ValidateGrant` is asked about each grant it widens. A scope read as stored, as the host
   no longer has it, that the change comes to give more on while it waits refuses it with
   `ErrConflict`. A role's lists are compared sorted and without repeats (`canonical`), as one

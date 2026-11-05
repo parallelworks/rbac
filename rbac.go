@@ -525,7 +525,12 @@ type Constraint struct {
 
 // ConstraintInput is what a constraint is asked about. Searches ask once for every resource of a
 // type, and Holders first once for every holder: where Resource or Subject is nil, answer true if
-// the constraint removes the permission for any, so that a search never keeps what a check refuses.
+// the constraint removes the permission for any, so that a search never keeps what a check refuses,
+// and a change that asks so, about scopes no one reads, is stopped wherever the constraint may stop
+// it: one answering false there, as one guarded against a nil Resource does, may not be asked about
+// those scopes at all, so as a freeze it may not stop DeleteRole, SetRole narrowing a role, or a
+// removal of members, and without Config.ResourceOf, it doesn't stop SetRole widening a role on a
+// scope it can't read whole (Resource).
 // Holders then asks again about each identity it lists, which it marks MaybeDenied where the
 // constraint answers true. Each constraint is given copies of its own of the subject and the
 // resource, their attributes, ancestors and label too, so one writing to them changes nothing
