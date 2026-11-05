@@ -406,10 +406,18 @@ sequenceDiagram
   ask, `Permissions` of 300 permissions on a resource of 20,000 tags took a second. A hook writing
   to its copy reads its write when the call asks it again, and nothing decided or asked of another
   hook does. A copy holds no more than a check converts (`maxConverted`), counted alike, one for
-  each value and a tenth of each byte copied whole: past it the hook can't be asked, and the call
-  is refused as `ErrDenied`. A slice reached at several lengths is copied once from where it
-  starts, each length a slice of the copy, and a value holding no map, slice or pointer that an
-  interface holds, as an array, is shared, as nothing writes to it through the interface.
+  each value, a string too, and a tenth of each other byte copied whole, so it counts no more than
+  converting the same does: past it the hook can't be asked, and the call is refused as
+  `ErrDenied`. Counting a list's elements twice, a string by the bytes of its header, or a
+  protobuf `Value` and its field apart, attributes a check converts couldn't be copied. A slice
+  reached at several lengths is copied once from where it starts, each length a slice of the copy,
+  and one reached while its elements are copied, before a longer length outgrew that copy, a slice
+  of its own, whose elements are copied too, as set in the longer alone it held the host's. A value
+  holding no map, slice or pointer that an interface holds, as an array, is shared, as nothing
+  writes to it through the interface. A call keeps what the host passed with each copy until it
+  returns, so where it points is no other value's meanwhile: known only by where it points, a value
+  dropped and collected during the call would leave its place to one made after, which would be
+  given the first one's copy.
 - **Conditions** are CEL over `subject`, `resource`, `request` and `action`, typed by
   `Config.Attributes`. Each is compiled once, bounded in cost, and fails closed: a condition that
   errors gives nothing, and a deny's that errors denies. A check converts what the host passes into

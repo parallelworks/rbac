@@ -939,17 +939,19 @@ func typing(attrs Attributes) (*cel.Env, error) {
 // copied field by field, as cloning it would, but for one of a host's type that makes messages of
 // another, copied as any other pointer (itself), and a value reached twice copied once, a message
 // too, so a cycle ends. A slice is copied once for where it starts and its capacity, however many
-// lengths it is reached with, each a slice of the one copy, as each is of the host's: copied for
-// each length, the prefixes of one slice of 3,000 maps took half a second. A value holding no map,
-// slice or pointer, as an array of bytes, is copied whole, and shared where an interface holds it,
-// as nothing writes through one: copied element by element for each interface holding it, a
-// hundred holding one array of 100 KB took 170 ms. A struct's fields an unexported struct it embeds
-// promotes are its own too, but its other unexported fields are shared, a pointer it embeds
-// unexported among them, and so the fields that one promotes: reflection can't set them. A map's
-// keys are shared too, and what a pointer among them reaches: a copied key would be another key, so
-// the copy would find nothing under the one the host passed. It copies at most what a check
-// converts (maxConverted), counted as converting counts it, one for each value and a tenth of each
-// byte it copies whole, past which it reports false, and the copy is v's zero value: copying
+// lengths it is reached with, each a slice of the one copy, as each is of the host's, but for one
+// reached while its elements are copied, before a longer length outgrew that copy, which is a slice
+// of a copy of its own: copied for each length, the prefixes of one slice of 3,000 maps took half a
+// second. A value holding no map, slice or pointer, as an array of bytes, is copied whole, and
+// shared where an interface holds it, as nothing writes through one: copied element by element for
+// each interface holding it, a hundred holding one array of 100 KB took 170 ms. A struct's fields
+// an unexported struct it embeds promotes are its own too, but its other unexported fields are
+// shared, a pointer it embeds unexported among them, and so the fields that one promotes:
+// reflection can't set them. A map's keys are shared too, and what a pointer among them reaches: a
+// copied key would be another key, so the copy would find nothing under the one the host passed.
+// It copies at most what a check converts (maxConverted), counted as converting counts it, one for
+// each value, a string too, and a tenth of each other byte it copies whole, so no more than
+// converting the same counts, past which it reports false, and the copy is v's zero value: copying
 // recurses as far as v reaches, as a check's converting does, which stops there.
 func deepCopy[T any](v T) (T, bool) {
 	copying()
@@ -979,8 +981,14 @@ const maxCopied = 2 * maxNested
 // what it may still copy (left), past which it is over.
 type copier struct {
 	done map[copiedKey]copied
-	left uint64
-	over bool
+	// outgrown are the copies of each slice that a longer length it was reached with replaced, each
+	// perhaps given to what reached it while it still held the host's elements, so each element
+	// copied after is set in them too: set in the longer copy alone, one holding a shorter slice of
+	// what holds it gave a hook the host's own map. They are kept apart from done, as copying
+	// recurses as deep as maxCopied with a copied on the stack at each level.
+	outgrown map[copiedKey][]reflect.Value
+	left     uint64
+	over     bool
 }
 
 // copied is the copy of a map, a pointer or a message, or of a slice's elements from where it starts,
@@ -1039,16 +1047,21 @@ func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
 		}
 	}
 	if t := v.Type(); flat(t) {
-		// Copied whole as it is set where the copy holds it, an array or a struct a tenth of a byte
-		// for each of its bytes, as converting counts bytes.
-		if k := t.Kind(); (k == reflect.Array || k == reflect.Struct) && !c.pay(uint64(t.Size())/10) {
+		// Copied whole as it is set where the copy holds it, an array or a struct as its bytes and
+		// strings cost (tenths).
+		if k := t.Kind(); (k == reflect.Array || k == reflect.Struct) && !c.pay(tenths(t)/10) {
 			return reflect.Zero(t)
 		}
 		return v
 	}
 	switch v.Kind() {
 	case reflect.Interface:
+		// Shared, but counted as the value it holds is converted, so an array of them costs what it
+		// holds: uncounted, an array of a million of them cost a copy one.
 		if unreachable(v) {
+			if !c.pay(1) {
+				return reflect.Zero(v.Type())
+			}
 			return v
 		}
 		out := reflect.New(v.Type()).Elem()
@@ -1084,8 +1097,13 @@ func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
 		c.fields(out, v, depth)
 		return out
 	case reflect.Array:
+		// Each element costs at least one, so an array of more than is left isn't copied.
+		if length(v.Len()) > c.left {
+			c.over, c.left = true, 0
+			return reflect.Zero(v.Type())
+		}
 		out := reflect.New(v.Type()).Elem()
-		for i := range v.Len() {
+		for i := 0; i < v.Len() && !c.over; i++ {
 			out.Index(i).Set(c.copy(v.Index(i), depth))
 		}
 		return out
@@ -1117,6 +1135,17 @@ func (c *copier) keep(k copiedKey, out reflect.Value, filled int) {
 	c.done[k] = copied{out: out, filled: filled}
 }
 
+// set sets the ith element of the copy of the slice k knows, and of each copy of it outgrown that
+// holds one.
+func (c *copier) set(k copiedKey, i int, v reflect.Value) {
+	c.done[k].out.Index(i).Set(v)
+	for _, o := range c.outgrown[k] {
+		if i < o.Len() {
+			o.Index(i).Set(v)
+		}
+	}
+}
+
 // sliceKey is how copier knows a slice: by where it starts, its capacity and its type, which every
 // length of it shares.
 func sliceKey(v reflect.Value) copiedKey {
@@ -1132,54 +1161,75 @@ func sliceKey(v reflect.Value) copiedKey {
 // so appending to one writes to none of the others.
 func (c *copier) slice(v reflect.Value, depth int) reflect.Value {
 	n, k := v.Len(), sliceKey(v)
-	s := c.done[k]
-	if had := lengthOf(s.out); had < n || !s.out.IsValid() {
-		// Each element costs one, past what copying what it holds costs, or where it holds nothing
-		// a copy would share, a tenth of each of its bytes, which are moved whole, so a slice of more
-		// than is left isn't made.
-		elem, more := v.Type().Elem(), length(n-had)
-		if flat(elem) {
-			more = more * uint64(elem.Size()) / 10
-		}
-		if !c.pay(more) {
+	if had := lengthOf(c.done[k].out); had < n || !c.done[k].out.IsValid() {
+		if !c.lengthen(v, k) {
 			return reflect.Zero(v.Type())
 		}
-		switch {
-		case !s.out.IsValid():
-			s.out = reflect.MakeSlice(v.Type(), n, n)
-		case n > s.out.Cap():
-			grown := reflect.MakeSlice(v.Type(), n, min(max(n, 2*s.out.Cap()), v.Cap()))
-			reflect.Copy(grown, s.out)
-			s.out = grown
-		default:
-			s.out = s.out.Slice(0, n)
-		}
-		// Each hook is given its own, so elements no write could reach through are copied at once.
-		if s.filled == 0 {
-			reflect.Copy(s.out, v)
-		} else {
-			reflect.Copy(s.out.Slice(s.filled, n), v.Slice(s.filled, n))
-		}
-		if flat(elem) {
-			s.filled = n
-		}
-		c.keep(k, s.out, s.filled)
 		// Copying an element may reach a longer slice of v, which grows the copy, so each is set in
-		// the copy as it is once it is copied.
-		for i := c.done[k].filled; i < n; i = max(i+1, c.done[k].filled) {
-			if e := v.Index(i); !unreachable(e) {
+		// the copy as it is once it is copied, and in those it outgrew.
+		for i := c.done[k].filled; i < n && !c.over; i = max(i+1, c.done[k].filled) {
+			switch e := v.Index(i); {
+			case !unreachable(e):
 				c.keep(k, c.done[k].out, i+1)
-				copied := c.copy(e, depth)
-				c.done[k].out.Index(i).Set(copied)
+				c.set(k, i, c.copy(e, depth))
+			case !c.pay(1):
+				return reflect.Zero(v.Type())
 			}
 		}
 		c.keep(k, c.done[k].out, max(n, c.done[k].filled))
-		s = c.done[k]
 	}
-	if s.out.Len() == n && s.out.Cap() == n {
-		return s.out
+	s := c.done[k].out
+	if s.Len() == n && s.Cap() == n {
+		return s
 	}
-	return s.out.Slice3(0, n, n)
+	return s.Slice3(0, n, n)
+}
+
+// lengthen makes the copy of v's elements, which k knows, as long as v, holding the host's elements
+// where it held none, or reports that it costs more than is left. It is apart from slice, which
+// copying recurses through as deep as maxCopied, so its frame holds none of what this needs.
+func (c *copier) lengthen(v reflect.Value, k copiedKey) bool {
+	n, s := v.Len(), c.done[k]
+	had := lengthOf(s.out)
+	// Each element costs what copying it does, as converting it does: one and what it holds, or
+	// where it holds nothing a copy would share, what moving it whole does (tenths). Each costs at
+	// least one, but those moved whole, so a slice of more than is left isn't made. Counted once
+	// more for each, a list of 80,000 empty maps, or 100,000 short strings, which a check converts,
+	// couldn't be copied, so a constrained check of it was refused.
+	elem := v.Type().Elem()
+	if flat(elem) {
+		if !c.pay(length(n-had) * tenths(elem) / 10) {
+			return false
+		}
+	} else if length(n-had) > c.left {
+		c.over, c.left = true, 0
+		return false
+	}
+	switch {
+	case !s.out.IsValid():
+		s.out = reflect.MakeSlice(v.Type(), n, n)
+	case n > s.out.Cap():
+		grown := reflect.MakeSlice(v.Type(), n, min(max(n, 2*s.out.Cap()), v.Cap()))
+		reflect.Copy(grown, s.out)
+		if c.outgrown == nil {
+			c.outgrown = map[copiedKey][]reflect.Value{}
+		}
+		c.outgrown[k] = append(c.outgrown[k], s.out.Slice(0, s.out.Cap()))
+		s.out = grown
+	default:
+		s.out = s.out.Slice(0, n)
+	}
+	// Each hook is given its own, so elements no write could reach through are copied at once.
+	if s.filled == 0 {
+		reflect.Copy(s.out, v)
+	} else {
+		reflect.Copy(s.out.Slice(s.filled, n), v.Slice(s.filled, n))
+	}
+	if flat(elem) {
+		s.filled = n
+	}
+	c.keep(k, s.out, s.filled)
+	return true
 }
 
 // lengthOf is the length of v, a slice, or 0 for none.
@@ -1227,38 +1277,50 @@ func (c *copier) message(m protoreflect.Message, depth int) protoreflect.Message
 	if keyed {
 		c.keep(k, reflect.ValueOf(out.Interface()), 0)
 	}
-	// Each field, element and entry costs one, as each value of a list or a map does.
+	// Each message costs one, as converting counts it, and so does each element and each key, and
+	// each value, of a list or a map, but a message, which costs what it does: counted for each field
+	// too, a Struct of short strings cost a copy twice what converting it does, and a ListValue three
+	// times, so one a check converts couldn't be copied, and a constrained check of it was refused.
+	// A message's other fields cost nothing more, as its type bounds how many it holds.
 	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
 		switch {
 		case fd.IsList():
 			from, to := v.List(), out.Mutable(fd).List()
-			if !c.pay(length(from.Len())) {
+			if n := length(from.Len()); n > c.left || !holdsMessages(fd) && !c.pay(n) {
+				c.over, c.left = true, 0
 				return false
 			}
-			for i := range from.Len() {
+			for i := 0; i < from.Len() && !c.over; i++ {
 				to.Append(c.field(fd, from.Get(i), depth))
 			}
 		case fd.IsMap():
-			if !c.pay(2 * length(v.Map().Len())) {
+			n := length(v.Map().Len())
+			if !holdsMessages(fd.MapValue()) {
+				n *= 2
+			}
+			if !c.pay(n) {
 				return false
 			}
 			to := out.Mutable(fd).Map()
 			v.Map().Range(func(key protoreflect.MapKey, v protoreflect.Value) bool {
 				to.Set(key, c.field(fd.MapValue(), v, depth))
-				return true
+				return !c.over
 			})
 		default:
-			if !c.pay(1) {
-				return false
-			}
 			out.Set(fd, c.field(fd, v, depth))
 		}
-		return true
+		return !c.over
 	})
 	if unknown := m.GetUnknown(); len(unknown) > 0 && c.pay(length(len(unknown))/10) {
 		out.SetUnknown(slices.Clone(unknown))
 	}
 	return out
+}
+
+// holdsMessages reports whether a value of the field fd describes, or each of its elements, is a
+// message, which costs a copy what copying it does.
+func holdsMessages(fd protoreflect.FieldDescriptor) bool {
+	return fd.Kind() == protoreflect.MessageKind || fd.Kind() == protoreflect.GroupKind
 }
 
 // field is a copy of v, a value of a field fd describes or of one of its elements: a message as
@@ -1313,6 +1375,26 @@ func (c *copier) fields(out, v reflect.Value, depth int) {
 // cost an allocation for each.
 func unreachable(v reflect.Value) bool {
 	return v.Kind() == reflect.Interface && (v.IsNil() || flat(v.Elem().Type()))
+}
+
+// tenths is what copying a value of t, which is flat, whole costs, in tenths: a tenth of each of
+// its bytes, as converting counts bytes, but for a string's, which is one value, as converting
+// counts it, though moving it moves 16 bytes.
+func tenths(t reflect.Type) uint64 {
+	switch t.Kind() {
+	case reflect.String:
+		return 10
+	case reflect.Array:
+		return length(t.Len()) * tenths(t.Elem())
+	case reflect.Struct:
+		var n uint64
+		for i := range t.NumField() {
+			n += tenths(t.Field(i).Type)
+		}
+		return n
+	default:
+		return uint64(t.Size())
+	}
 }
 
 // flat reports whether a value of type t holds no map, slice, pointer or interface a copy would

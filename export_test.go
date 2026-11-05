@@ -882,6 +882,18 @@ func CountCopies(t *testing.T) *int {
 	return n
 }
 
+// CopiedInOneCall is what one call gives a hook of each of n values made by fresh, asked about one
+// after another, each dropped and the garbage collected before the next is made.
+func CopiedInOneCall(n int, fresh func(i int) map[string]any) []map[string]any {
+	a := (&Authorizer{}).still()
+	copies := make([]map[string]any, n)
+	for i := range n {
+		copies[i], _ = copiedFor(a, 0, fresh(i))
+		runtime.GC()
+	}
+	return copies
+}
+
 // Compiled is how many conditions a keeps compiled for checks.
 func Compiled(a *Authorizer) int {
 	a.conds.mu.RLock()

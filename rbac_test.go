@@ -2481,6 +2481,58 @@ func TestCopyingPrefixesOfOneSliceCopiesItOnce(t *testing.T) {
 	}
 }
 
+// A slice reached again while its elements are copied, shorter and then longer, as by an element
+// holding both, is copied whole wherever it is reached: the shorter copy, given out before the
+// longer replaced it, kept the host's elements, so a hook writing to one wrote to the host's map.
+func TestCopyingASliceThatGrowsWhileItIsCopiedSharesNothingWithTheHost(t *testing.T) {
+	held := map[string]any{"v": "host"}
+	base, both := make([]any, 5), make([]any, 2)
+	base[0], base[1], base[2], base[3], base[4] = both, held, "c", "d", "e"
+	both[0], both[1] = base[:3], base[:5]
+	attributes := map[string]any{"a": base[:3]}
+	copied := rbac.DeepCopy(attributes)
+	if !reflect.DeepEqual(copied, attributes) {
+		t.Fatal("the copy doesn't hold what the host passed")
+	}
+	hosts, copies := map[[2]uintptr]bool{}, map[[2]uintptr]bool{}
+	reachedFrom(reflect.ValueOf(attributes), hosts)
+	reachedFrom(reflect.ValueOf(copied), copies)
+	for at := range copies {
+		if hosts[at] {
+			t.Fatalf("the copy holds a map or slice of the host's, at %#x", at[0])
+		}
+	}
+}
+
+// reachedFrom adds where each map and slice v reaches points, a slice with its length.
+func reachedFrom(v reflect.Value, seen map[[2]uintptr]bool) {
+	switch v.Kind() {
+	case reflect.Interface:
+		if !v.IsNil() {
+			reachedFrom(v.Elem(), seen)
+		}
+	case reflect.Map:
+		at := [2]uintptr{v.Pointer()}
+		if v.IsNil() || seen[at] {
+			return
+		}
+		seen[at] = true
+		for it := v.MapRange(); it.Next(); {
+			reachedFrom(it.Value(), seen)
+		}
+	case reflect.Slice:
+		at := [2]uintptr{v.Pointer(), uintptr(v.Len())}
+		if v.IsNil() || seen[at] {
+			return
+		}
+		seen[at] = true
+		for i := range v.Len() {
+			reachedFrom(v.Index(i), seen)
+		}
+	default:
+	}
+}
+
 // Each constraint is given a copy of the subject's and the resource's attributes once for a call,
 // the first time the call asks it, and the same copy whenever it asks it about the same: copied for
 // each ask, Permissions of 300 permissions on a resource tagged 20,000 times took a second with one
@@ -2556,6 +2608,58 @@ func TestAHookIsGivenOneCopyForACall(t *testing.T) {
 	// ancestors.
 	if *copies > 1+2*2 {
 		t.Errorf("granting %d bindings made %d copies", len(bindings), *copies)
+	}
+}
+
+// A call knows the copy it gave a hook by where what the host passed points, so it keeps what the
+// host passed until it returns: dropped and collected, as a resource Config.ResourceOf made for one
+// scope may be, its place can be another's, made after, which would be given the first one's copy,
+// as all but 2 of 2,000 values were where the call kept none.
+func TestACallGivesAHookTheCopyOfNoValueFreedSince(t *testing.T) {
+	copies := rbac.CopiedInOneCall(200, func(i int) map[string]any { return map[string]any{"i": i} })
+	for i, c := range copies {
+		if c["i"] != i {
+			t.Fatalf("value %d was given the copy of %v", i, c["i"])
+		}
+	}
+}
+
+// A copy counts each value as converting does, once: counting a list's elements once for the list
+// and again as values, a string in a []string by the 16 bytes moving it moves, or a protobuf
+// Value's field apart from the Value, attributes a check converts couldn't be copied, so a
+// constrained check of them was refused. And an array of interfaces costs what it holds, as a slice
+// does: uncounted, a copy of one holding more values than a check converts cost one.
+func TestACopyForAHookCountsWhatItHoldsAsConvertingDoes(t *testing.T) {
+	short := make([]string, rbac.MaxConverted*3/4)
+	empty := make([]any, rbac.MaxConverted/2)
+	fields, values := map[string]*structpb.Value{}, make([]*structpb.Value, rbac.MaxConverted/2)
+	for i := range short {
+		short[i] = "a"
+	}
+	for i := range empty {
+		empty[i] = map[string]any{}
+	}
+	for i := range rbac.MaxConverted / 3 {
+		fields[fmt.Sprint(i)] = structpb.NewStringValue("a")
+	}
+	for i := range values {
+		values[i] = structpb.NewStringValue("a")
+	}
+	for name, attributes := range map[string]map[string]any{
+		"short strings": {"tags": short}, "empty maps": {"tags": empty},
+		"a Struct's short strings":    {"tags": &structpb.Struct{Fields: fields}},
+		"a ListValue's short strings": {"tags": &structpb.ListValue{Values: values}},
+	} {
+		if held, _ := rbac.EvaluateConditionOf(t, `size(resource.attributes.tags) > 0`, nil, attributes, nil); !held {
+			t.Fatalf("a check can't read %s", name)
+		}
+		if !rbac.Copies(attributes) {
+			t.Errorf("%s, which a check converts, can't be copied", name)
+		}
+	}
+	var half [rbac.MaxConverted/2 + 1]any
+	if rbac.Copies(map[string]any{"a": half, "b": half}) {
+		t.Error("arrays holding more values than a check converts were copied")
 	}
 }
 
