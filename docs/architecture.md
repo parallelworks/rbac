@@ -224,7 +224,14 @@ erDiagram
   those an identity or group leaving the tenant is taken out of, and the denies naming a list's
   subject or its groups, which `Filter` and `Reachable` read, are found through GIN indexes on
   those arrays of keys, each key prefixed by its tenant (`rbac_tenant_keys`), so neither the
-  tenant's other rows nor another tenant's group of the same id are read. The denies binding the
+  tenant's other rows nor another tenant's group of the same id are read. The tenant's keys are
+  built in a subquery, whose value no plan sees (`naming`), so every plan costs the search as one
+  of a key: planned for an array a statement is given, as a connection's first five runs of a
+  statement and every one as of a time are, a search for each of a few hundred keys cost more than
+  reading every row of every tenant, and comparing each with every key, which took seconds beside
+  another tenant's denies naming hundreds each. `DeleteGroup`, which asks only whether any names
+  its groups, finds them in CTEs, which a plan reads for every row they hold: planned for the
+  first, as `EXISTS` is, a read of every row looked to find one sooner. The denies binding the
   actor of a change to members or of `DeleteGroup` that remove a power to change grants, whose types
   they read wherever in the tenant the denies are (`grantsDenied`), are found through such an index
   holding only those (`rbac_denies_grants`, by `rbac_changes_grants`), so the other denies naming
@@ -1061,9 +1068,19 @@ flowchart LR
   Each statement reads history by the rows it names, through
   history's indexes, as a search the custom roles its grants name, by their ids, and its principals'
   grants by principal and type, which history's index of a principal's versions holds beside the
-  scope, as a check seeks them on its resource's path. The view of custom roles takes each one's
-  newest version, testing none for a later one, so `Grantable`, which can offer any, reads each
-  version once.
+  scope, as a check seeks them on its resource's path. Each version a view finds is its row's last
+  where its id is at least that of every version of the row dated by then, a test of each on its
+  own, by its key in history's index of an entity's versions, which reads them until the first
+  later one: a few pages for each version, however stale history's statistics. As a join, by
+  statistics from before most of history was written, as autovacuum leaves them until a tenth of
+  it is new, it read every version of the entity in the tenant for each version found, the key
+  only a filter, so a check took seconds; a read of thousands of rows costs more than such a join
+  planned by fresh statistics, which reads their versions together. `Holders` looks each identity's
+  membership of the tenant up on its own, by its key, which the view of memberships gives as the
+  principal: joined to a group's members, or looked up by the principal history copies beside the
+  entity, it read, by such statistics, every membership in the tenant again for each member. The
+  view of custom roles takes each one's newest version, testing none for a later one, so
+  `Grantable`, which can offer any, reads each version once.
 - **PruneHistory** deletes only what an export has read and later versions supersede. It keeps
   each row's last version at or before its time, so AsOf answers as before for any later time,
   and refuses an earlier one; of a row whose last version by then ended it, it deletes every
