@@ -5333,7 +5333,9 @@ func TestDeletingGroupsReadsOnlyWhatNamesThem(t *testing.T) {
 	}
 }
 
-// rowsRead is how many rows of table tx has read, by scans of the table and of its indexes.
+// rowsRead is how many rows of table tx has read by scanning the table, whole or through a bitmap,
+// as a search of the GIN indexes on keys reads them. A row a plain index scan fetches counts against
+// that index, not the table.
 func rowsRead(ctx context.Context, t *testing.T, tx pgx.Tx, table string) int64 {
 	t.Helper()
 	var n int64
@@ -5354,7 +5356,10 @@ func TestReadingByAThousandGroupsKeysReadsOnlyWhatNamesThem(t *testing.T) {
 	for _, plan := range []string{"custom", "generic"} {
 		t.Run(plan, func(t *testing.T) {
 			manage := rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}
-			h := setupOn(t, pgtest.Open(t, "plan_cache_mode=force_"+plan+"_plan"), func(c *rbac.Config) {
+			// Without JIT, as the README has the application's role run: the actor's authority in a
+			// tenant of a thousand nested groups costs past its thresholds, and compiling it took most
+			// of the test's time.
+			h := setupOn(t, pgtest.Open(t, "jit=off&plan_cache_mode=force_"+plan+"_plan"), func(c *rbac.Config) {
 				c.Catalog = append(slices.Clone(c.Catalog), groupMembers, manage)
 			})
 			ctx := t.Context()
@@ -5463,8 +5468,10 @@ func TestReadingByAThousandGroupsKeysReadsOnlyWhatNamesThem(t *testing.T) {
 // DeleteGroup asks whether a deny names or exempts the group or one it is in, or an eligibility
 // they approve, by finding them by those keys, under a generic plan and planned for its arguments
 // alike: asked only whether one exists, the planner counted a read of every row of every tenant as
-// finding one sooner than the indexes did, once those were a level deeper, as another tenant's
-// denies naming dozens each, or its many eligibilities, make them.
+// finding one sooner than the indexes did, once the tables were large, as another tenant's 2,000
+// denies naming dozens each and 200,000 eligibilities made them. The tables' statistics stand in for
+// such a database, so a few hundred rows are read as it reads its millions: they count ten million
+// rows of each, and nothing of the keys, as of a database where each key is in a few rows.
 func TestDeletingAGroupFindsWhatNamesItByItsKeys(t *testing.T) {
 	manage := rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}
 	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), manage) })
@@ -5472,10 +5479,21 @@ func TestDeletingAGroupFindsWhatNamesItByItsKeys(t *testing.T) {
 	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "boss"))
 	boss := h.as(t, "boss")
 	h.groups(t, "team", "top")
-	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'top', 'group', 'team')`); err != nil {
-		t.Fatal(err)
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
 	}
+	exec(`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'top', 'group', 'team')`)
 	tables := []string{"rbac_denies", "rbac_eligibilities"}
+	// Autovacuum would count the rows again.
+	for _, table := range tables {
+		exec(`ALTER TABLE ` + table + ` SET (autovacuum_enabled = off)`)
+	}
+	for _, index := range []string{"rbac_denies_principals", "rbac_denies_exempt", "rbac_denies_grants", "rbac_eligibilities_approvers"} {
+		exec(`ALTER INDEX ` + index + ` ALTER COLUMN 1 SET STATISTICS 0`)
+	}
 	// The rows of each table DeleteGroup reads, planned so, in a transaction it rolls back.
 	read := func(plan string) map[string]int64 {
 		t.Helper()
@@ -5504,30 +5522,27 @@ func TestDeletingAGroupFindsWhatNamesItByItsKeys(t *testing.T) {
 	for _, plan := range plans {
 		alone[plan] = read(plan)
 	}
-	// In another tenant, each of 2,000 denies names and exempts 64 principals, and each of 200,000
-	// eligibilities has an approver. History, which DeleteGroup doesn't read, records none.
-	for _, q := range []string{
-		`ALTER TABLE rbac_denies DISABLE TRIGGER USER`,
-		`ALTER TABLE rbac_eligibilities DISABLE TRIGGER USER`,
-		`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
-		  SELECT 't2', 'cluster', 'c' || i, 'd', ARRAY(SELECT 'group:o' || i || '-' || j FROM generate_series(1, 64) j),
-		    ARRAY(SELECT 'user:o' || i || '-' || j FROM generate_series(1, 64) j), '{cluster:root}'
-		  FROM generate_series(1, 2000) i`,
-		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+	// In another tenant, each of 200 denies names and exempts 8 principals, and each of 200
+	// eligibilities has an approver.
+	exec(`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+		  SELECT 't2', 'cluster', 'c' || i, 'd', ARRAY(SELECT 'group:o' || i || '-' || j FROM generate_series(1, 8) j),
+		    ARRAY(SELECT 'user:o' || i || '-' || j FROM generate_series(1, 8) j), '{cluster:root}'
+		  FROM generate_series(1, 200) i`)
+	exec(`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
 		  SELECT 't2', 'cluster', 'c' || i, 'user', 'v' || i, 'cluster.sudo', 3600, ARRAY['group:o' || i]
-		  FROM generate_series(1, 200000) i`,
-		`ALTER TABLE rbac_denies ENABLE TRIGGER USER`,
-		`ALTER TABLE rbac_eligibilities ENABLE TRIGGER USER`,
-		`ANALYZE rbac_denies, rbac_eligibilities`,
-	} {
-		if _, err := h.pool.Exec(ctx, q); err != nil {
-			t.Fatal(err)
+		  FROM generate_series(1, 200) i`)
+	exec(`ANALYZE rbac_denies, rbac_eligibilities`)
+	for _, table := range tables {
+		var restored bool
+		if err := h.pool.QueryRow(ctx, `SELECT pg_restore_relation_stats('schemaname', current_schema()::text, 'relname', $1::text,
+			'relpages', (SELECT relpages FROM pg_class WHERE oid = $1::regclass), 'reltuples', 1e7::real)`, table).Scan(&restored); err != nil || !restored {
+			t.Fatalf("statistics of %s: %v, %v", table, restored, err)
 		}
 	}
 	for _, plan := range plans {
 		for table, beside := range read(plan) {
 			if beside > alone[plan][table]+deeper {
-				t.Errorf("under a %s plan, DeleteGroup read %d rows of %s, and %d beside another tenant's thousands", plan, alone[plan][table], table, beside)
+				t.Errorf("under a %s plan, DeleteGroup read %d rows of %s, and %d beside another tenant's, as many as a large database's", plan, alone[plan][table], table, beside)
 			}
 		}
 	}
