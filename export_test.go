@@ -825,8 +825,62 @@ var RestsSQL = restsSQL
 // tenant $1, the identity's key $2, now $3.
 var EndsSQL = `WITH RECURSIVE ` + endsSQL("$2::text", "$3") + ` SELECT k, e FROM ends`
 
-// DeepCopy is the copy of attributes each hook is given.
-func DeepCopy(attributes map[string]any) map[string]any { return deepCopy(attributes) }
+// DeepCopy is the copy of attributes each hook is given, nil where they can't be copied (Copies).
+func DeepCopy(attributes map[string]any) map[string]any {
+	copied, _ := deepCopy(attributes)
+	return copied
+}
+
+// Copies reports whether attributes can be copied for a hook, within what a check converts.
+func Copies(attributes map[string]any) bool {
+	_, ok := deepCopy(attributes)
+	return ok
+}
+
+// CopyAllocates is how many bytes copying attributes for a hook allocates.
+func CopyAllocates(attributes map[string]any) uint64 {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	deepCopy(attributes)
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+// CountZoneLoads counts the time zones conditions load, until t ends.
+func CountZoneLoads(t *testing.T) *int {
+	t.Helper()
+	old, n := loadingZone, new(int)
+	loadingZone = func() { *n++ }
+	t.Cleanup(func() { loadingZone = old })
+	return n
+}
+
+// LoadZones loads each zone named, or finds it names none, as a condition reading a time in it does
+// where the process hasn't, and returns how many zones the process keeps.
+func LoadZones(names []string) int {
+	for _, name := range names {
+		loadZone(name)
+	}
+	zones.RLock()
+	defer zones.RUnlock()
+	return len(zones.byName)
+}
+
+// MaxZones is how many time zones the process keeps loaded.
+const MaxZones = maxZones
+
+// ZoneLoad is what loading a time zone costs a condition.
+const ZoneLoad = zoneLoad
+
+// CountCopies counts the copies made of what the host passes for its hooks, until t ends.
+func CountCopies(t *testing.T) *int {
+	t.Helper()
+	old, n := copying, new(int)
+	copying = func() { *n++ }
+	t.Cleanup(func() { copying = old })
+	return n
+}
 
 // Compiled is how many conditions a keeps compiled for checks.
 func Compiled(a *Authorizer) int {
@@ -1238,7 +1292,7 @@ func PlanGuardedOtherwise(t *testing.T, expr string, replan func(interpreter.Int
 		t.Fatal(err)
 	}
 	checked, patterns := compiled(t, c, expr)
-	ids := newGuards(checked.NativeRep()).ids
+	ids := newGuards(checked.NativeRep(), maxCost).ids
 	if len(ids) == 0 {
 		t.Fatalf("%s makes no call refused before it runs", expr)
 	}

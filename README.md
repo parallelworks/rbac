@@ -232,7 +232,10 @@ scopes conditional ones reach, to check one by one.
   is one no one can read, as data that joins two parties is.
 - **Conditions:** a grant can carry a CEL expression over the subject's, the resource's and the
   request's attributes (`Subject.Attributes`, `Resource.Attributes`, `rbac.WithRequest`), the time
-  and the action. It gives its role only where the expression holds; one that fails is false.
+  and the action. It gives its role only where the expression holds; one that fails is false. The
+  time is the host's clock (`Config.Now`) in UTC, whatever zone it returns times in, and so is a
+  `time.Time` the host passes: `string()` writes a time in its own zone, so `string(request.time)`
+  compared with a literal decided by the zone each replica runs in.
   `Config.Attributes` declares the attributes and their types, so a condition reading one
   misnamed, or as another type, is refused when stored, and one stored under other declarations
   fails where it no longer passes them. A condition building a message, as
@@ -241,7 +244,7 @@ scopes conditional ones reach, to check one by one.
   a condition is read, the subject's and the request's once for each call, however many scopes a
   change checks, and the resource's once for each check, and conditions read nothing else: `nil`; a
   `bool`, a string, an int, a uint or a float of any size, of a type of the host's own too, as a
-  named string, read by its kind; `time.Time` and `time.Duration`; bytes, as `[]byte` or an array
+  named string, read by its kind; `time.Time`, in UTC, and `time.Duration`; bytes, as `[]byte` or an array
   of bytes; slices, arrays and pointers of these, a nil pointer read as null; maps of these keyed by a bool, a
   string, an int or a uint, or by an interface holding one; JSON text (`json.RawMessage`, a nil
   one read as null, as `encoding/json` writes it) and `json.Number`, parsed; the protobuf `Struct`, `ListValue`, `Value`, `NullValue`, wrappers,
@@ -286,7 +289,18 @@ scopes conditional ones reach, to check one by one.
   `startsWith` and `endsWith` what reading
   the shorter does, at least 1 however short or empty either is, and one costing more than a
   condition may fails before it runs: `contains` of one long string the request passes in another
-  tries each place in it, which can take a third of a second. Cost is bounded per check too, for
+  tries each place in it, which can take a third of a second. A comparison costs reading the
+  smaller value, read once, in step with the other, and charged before it runs: measured again
+  for each doubling of how far it read, again in search of a double that isn't finite and again
+  for CEL's charge, comparing JSON nested 3,300 deep took twenty times what its cost implied.
+  Reading a time in a zone costs 100, and 500 more where an attribute names the zone: each process
+  loads a zone, or finds a name names none, once, the zone a literal names when the condition is
+  planned, and refuses, before loading anything, a name holding a byte no zone's name does, as
+  `tzdata.zi`'s dot, and `Local`, the zone the process runs in. Loaded at each call, a check of
+  conditions reading the hour in `tzdata.zi`, a file kept beside the zones, took a quarter of a
+  second, and a request can name a new zone each time. The process keeps at most 1,024 zones and
+  names of none, dropping one at random past that, and a zone whose files change after it loaded
+  it reads as it was until it is dropped. Cost is bounded per check too, for
   each scope on its path, and the conditions a check reads together are bounded where they are
   stored: an identity's grants' on a scope, those of a scope's grants to groups, the tenant's
   members and the public, each the tenant's and those from each source the host owns apart, a
@@ -308,7 +322,9 @@ scopes conditional ones reach, to check one by one.
   step of a loop at all a condition may cost, past which it fails: a grant's gives nothing and a
   deny's applies. A step of `all`, `exists`, `exists_one`, `filter` or a `map` that filters costs
   1 more for the operator its macro evaluates, so one looping over a list the request passes, which
-  cost nearly all a condition may, can now cost more, and fails the same way. Going back to an
+  cost nearly all a condition may, can now cost more, and fails the same way. One reading a time in
+  a zone an attribute names is bounded 500 higher than before loading it was charged, so a scope's
+  conditions that read many may be past a bound as an upgrade leaves them. Going back to an
   earlier release of this package does the same where that release bounds a shape more, so while
   replicas of two releases run side by side, those
   bounding a shape more may refuse changes adding a condition to a scope the others filled. To
@@ -353,7 +369,14 @@ scopes conditional ones reach, to check one by one.
   the actor and how it is made, so the host decides who may hold what: members only, no
   privileged roles for service accounts or guests. `Config.Constraints` remove permissions above
   anything a tenant grants or denies, seeing copies of the subject and the resource, such as
-  freezing changes under a container. What one removes from an actor the actor can't hand on, but for a
+  freezing changes under a container. Each constraint is given copies of its own, made the first
+  time a call asks it about each and given it again whenever the call asks about the same, as
+  `Permissions` does for each permission and a check of a labeled resource for each value its label
+  asks for, so one writing to its copy reads its write later in the call, and nothing else does;
+  copied for each ask, `Permissions` of 300 permissions on a resource of 20,000 tags took a second.
+  `ValidateGrant` is given its copy of the actor's attributes once for a call too. A copy holds no
+  more than a check converts, counted alike: where the attributes hold more, the hook can't be
+  asked, and the call is refused as `ErrDenied`. What one removes from an actor the actor can't hand on, but for a
   role a role it holds lists in `GrantableRoles`, which it grants without holding. A freeze stops
   every change an actor makes to grants under it, and every change taking access away there: one
   removing `<type>:grant` from the actor, or a deny on the path doing so, stops `Apply` granting and
