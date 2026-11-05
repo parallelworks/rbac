@@ -13,8 +13,10 @@ import (
 	"runtime"
 	"runtime/debug"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -2660,6 +2662,36 @@ func (m longKeys) count(key ref.Val) {
 	}
 }
 
+// Comparing two values is charged as reading the smaller once, but it measured them again at each
+// doubling of how far it read, again in search of a double that isn't finite, and again for CEL's
+// charge once it had run, making an iterator of each map and list each time: comparing JSON a
+// request passes nested 3,300 deep took a microsecond and a half for each unit charged, twenty
+// times what reading a flat map took. Each is read once, in step with the other, and charged as
+// read, before the comparison runs.
+func TestComparingValuesNestedDeepReadsThemOnce(t *testing.T) {
+	for name, text := range map[string]string{
+		"maps":  strings.Repeat(`{"a":`, 3300) + `"x"` + strings.Repeat("}", 3300),
+		"lists": strings.Repeat(`[`, 4900) + `"x"` + strings.Repeat("]", 4900),
+	} {
+		attributes := map[string]any{"a": json.RawMessage(text), "b": json.RawMessage(strings.Clone(text))}
+		for _, expr := range []string{
+			`request.attributes.a == request.attributes.b`, `request.attributes.a != request.attributes.b`,
+			`request.attributes.a in [request.attributes.b]`,
+		} {
+			held, evaluated, allocated, err := rbac.EvaluateCondition(t, expr, attributes)
+			if err != nil || !evaluated || held == strings.Contains(expr, "!=") {
+				t.Errorf("%s nested deep: %s held %t, evaluated %t, %v", name, expr, held, evaluated, err)
+			}
+			if allocated > 256<<10 {
+				t.Errorf("%s nested deep: %s allocated %d bytes", name, expr, allocated)
+			}
+			if limit, cost := rbac.ConditionCost(t, expr, attributes); cost < 4900 || cost > limit {
+				t.Errorf("%s nested deep: %s cost %d, bounded at %d", name, expr, cost, limit)
+			}
+		}
+	}
+}
+
 // Finding a key in a map hashes it whole, and comparing maps finds the keys of one in the other,
 // though comparing them is charged only as far as the smaller reads: a long key of the larger,
 // found in a map literal or a large map the host passes, was hashed uncharged each time a loop
@@ -3125,6 +3157,169 @@ func TestATimeInAZoneLongerThanAnyFailsBeforeLoadingIt(t *testing.T) {
 	}
 }
 
+// CEL loads a time zone from the platform's files each time a condition reads a time in one: a check
+// of 54 conditions, each reading the hour 85 times, took 23 ms in America/New_York, and 254 ms in
+// tzdata.zi, a file kept beside the zones that isn't one, which each load read whole, failed to
+// parse and then searched the other places for, each charged as reading a time. The process loads
+// each zone once, and finds a name names none once, whether a literal or the request names it.
+func TestATimeInAZoneLoadsTheZoneOnceForTheProcess(t *testing.T) {
+	loads := rbac.CountZoneLoads(t)
+	ones := "[" + strings.TrimSuffix(strings.Repeat("1, ", 50), ", ") + "]"
+	for zone, evaluated := range map[string]bool{"Pacific/Chatham": true, "Etc/GMT+5": true, "Zz/Nowhere": false} {
+		for _, expr := range []string{
+			ones + `.all(i, request.time.getHours(request.attributes.zone) >= 0)`,
+			ones + `.all(i, request.time.getHours("` + zone + `") >= 0)`,
+		} {
+			*loads = 0
+			for range 3 {
+				if _, ok, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"zone": zone}); err != nil || ok != evaluated {
+					t.Errorf("%s in %s: evaluated %t, %v", expr[len(ones):], zone, ok, err)
+				}
+			}
+			if *loads > 1 {
+				t.Errorf("%s in %s loaded the zone %d times", expr[len(ones):], zone, *loads)
+			}
+		}
+	}
+}
+
+// A name holding a byte no zone's name does, as tzdata.zi's dot, fails before anything is loaded, so
+// no file kept beside the zones is read as one; and so do Local, the zone the process runs in, by
+// which a condition would decide by where each replica runs, and localtime, which some platforms
+// keep beside the zones as a link to it. A fixed offset loads nothing.
+func TestATimeInANameOfNoZoneFailsBeforeLoadingAnything(t *testing.T) {
+	// zone is as a CEL string literal spells it.
+	evaluate := func(zone string, evaluated bool) {
+		t.Helper()
+		name, err := strconv.Unquote(`"` + zone + `"`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, expr := range []string{`request.time.getHours(request.attributes.zone) >= 0`, `request.time.getHours("` + zone + `") >= 0`} {
+			if _, ok, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"zone": name}); err != nil || ok != evaluated {
+				t.Errorf("%s in %q: evaluated %t, %v", expr, name, ok, err)
+			}
+		}
+	}
+	for _, zone := range []string{"UTC", "", "+05:30", "-11:00"} {
+		evaluate(zone, true)
+	}
+	loads := rbac.CountZoneLoads(t)
+	for _, zone := range []string{"tzdata.zi", "zone.tab", "../UTC", "America/New York", "Local", "localtime", `UTC\u0000`, "+05:30"} {
+		evaluate(zone, zone == "+05:30")
+	}
+	if *loads != 0 {
+		t.Errorf("names of no zone, and an offset, loaded %d", *loads)
+	}
+}
+
+// A zone the request names can be a new one each time, which loading costs: a loop reading a time in
+// each of a list of new names stops at its condition's limit having loaded no more than that pays
+// for, where charged as reading a time in a zone loaded, it loaded a hundred. Once loaded, a zone
+// costs only reading the time in it.
+func TestLoadingAZoneTheRequestNamesCostsWhatItTakes(t *testing.T) {
+	loads := rbac.CountZoneLoads(t)
+	run := rand.Uint64()
+	names := make([]any, 1000)
+	for i := range names {
+		names[i] = fmt.Sprintf("Zz/Load%d/%d", run, i)
+	}
+	_, evaluated, _, err := rbac.EvaluateCondition(t, `request.attributes.zones.exists(z, request.time.getHours(z) == 99)`, map[string]any{"zones": names})
+	if err != nil || evaluated {
+		t.Errorf("a loop over a thousand new zones evaluated %t, %v", evaluated, err)
+	}
+	if *loads > 10000/rbac.ZoneLoad {
+		t.Errorf("a loop over a thousand new zones loaded %d", *loads)
+	}
+	expr, zone := `request.time.getHours(request.attributes.zone) >= 0`, map[string]any{"zone": fmt.Sprintf("Zz/Load%d/once", run)}
+	limit, loading := rbac.ConditionCost(t, expr, zone)
+	_, loaded := rbac.ConditionCost(t, expr, zone)
+	if loading > limit || loading != loaded+rbac.ZoneLoad {
+		t.Errorf("reading a time in a new zone cost %d, and in one loaded %d, bounded at %d", loading, loaded, limit)
+	}
+}
+
+// The zones a process keeps are bounded, as requests name them, and a condition naming one in a
+// literal loads it when it is planned, so evaluating it loads nothing however many the process has
+// dropped since, and is bounded as loading none.
+func TestTheZonesAProcessKeepsAreBounded(t *testing.T) {
+	h := setup(t)
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	g.Condition = rbac.Condition{Expression: `request.time.getHours("Australia/Lord_Howe") >= 0`}
+	h.seed(t, g)
+	u := h.as(t, "u")
+	if !allowed(t, h, u, login, cluster) {
+		t.Fatal("u should log in at any hour in Lord Howe")
+	}
+	// Each name past the bound drops one kept at random, so few survive eight times as many.
+	run, names := rand.Uint64(), make([]string, 8*rbac.MaxZones)
+	for i := range names {
+		names[i] = fmt.Sprintf("Zz/Kept%d/%d", run, i)
+	}
+	if kept := rbac.LoadZones(names); kept > rbac.MaxZones {
+		t.Errorf("the process keeps %d zones", kept)
+	}
+	loads := rbac.CountZoneLoads(t)
+	if ok := allowed(t, h, u, login, cluster); !ok || *loads != 0 {
+		t.Errorf("a condition naming its zone in a literal, once the process dropped it: allowed %t, loaded %d zones", ok, *loads)
+	}
+}
+
+// A zone the platform's files fail to give for a while, as once the process has run out of file
+// descriptors, loads once they give it again: kept, the zone of a check's condition, named by an
+// attribute or a literal, failed for the process until it was dropped, though loading it again
+// would have found it, and a literal's for as long as checks kept the condition's program.
+func TestAZoneThatFailsToLoadForAWhileLoadsOnceItCan(t *testing.T) {
+	const zone = "Asia/Kathmandu"
+	h := setup(t)
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	g.Condition = rbac.Condition{Expression: `request.time.getHours("` + zone + `") >= 0`}
+	h.seed(t, g)
+	u := h.as(t, "u")
+	attribute := `request.time.getHours(request.attributes.zone) >= 0`
+	rbac.ForgetZones(zone)
+	restore := rbac.FailZoneLoads(t, syscall.EMFILE)
+	if _, ok, _, _ := rbac.EvaluateCondition(t, attribute, map[string]any{"zone": zone}); ok {
+		t.Fatal("a zone that fails to load was read")
+	}
+	if allowed(t, h, u, login, cluster) {
+		t.Fatal("a condition reading a time in a zone that fails to load allowed")
+	}
+	restore()
+	if _, ok, _, err := rbac.EvaluateCondition(t, attribute, map[string]any{"zone": zone}); !ok {
+		t.Errorf("a zone an attribute names that failed to load for a while: %v", err)
+	}
+	if !allowed(t, h, u, login, cluster) {
+		t.Error("a zone a literal names that failed to load for a while still fails")
+	}
+}
+
+// The host's clock is read in UTC, as a time it passes as an attribute is, and as CEL reads one
+// with no zone: string() writes a time in its own zone, so a clock or a database returning times in
+// each replica's local zone decided by where the replica runs, a deny comparing the request's time
+// as a string lifting in one zone and not in another.
+func TestTimesAreReadInUTCWhateverZoneTheHostKeepsThemIn(t *testing.T) {
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 1, 5, 17, 0, 0, 0, time.UTC)
+	h := setup(t)
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	g.Condition = rbac.Condition{Expression: `string(request.time) == "2026-01-05T17:00:00Z" && request.time.getHours() == 17 && ` +
+		`string(request.attributes.at) == "2026-01-05T17:00:00Z" && string(request.attributes.cel) == "2026-01-05T17:00:00Z" && ` +
+		`string(request.attributes.at - duration("4380h")) == "2025-07-07T05:00:00Z"`}
+	h.seed(t, g)
+	u := h.as(t, "u")
+	for _, zone := range []*time.Location{time.UTC, ny, time.FixedZone("", 5*3600)} {
+		h.now = at.In(zone)
+		ctx := rbac.WithRequest(t.Context(), map[string]any{"at": at.In(zone), "cel": types.Timestamp{Time: at.In(zone)}})
+		if err := h.authz.Authorize(ctx, u, login, cluster); err != nil {
+			t.Errorf("the clock and the times passed in %s: %v", zone, err)
+		}
+	}
+}
+
 // A loop taking more steps than its condition may cost fails, however little CEL charges them: a
 // grant's condition gives nothing, and a deny's applies.
 func TestALoopOfMoreStepsThanItsConditionMayCostFails(t *testing.T) {
@@ -3309,7 +3504,10 @@ func TestStoredConditionsKeepTheirBounds(t *testing.T) {
 		{`["10.0.0.1", "10.0.0.2"].filter(ip, ip.startsWith("10.")).exists(ip, request.attributes.ip == ip)`, 108},
 		{`[["10.0.0.1"], ["10.0.0.2"]].exists(g, request.attributes.ip in g) && "time" in request`, 77},
 		{`{"dev": 1, "prod": 2}["dev"] <= request.attributes.n`, 48},
-		{`request.time.getHours(subject.attributes.zone) >= 9`, 112},
+		// A zone a literal names is loaded when the condition is planned, and one an attribute names
+		// may be loaded as it runs, which costs 500.
+		{`request.time.getHours(subject.attributes.zone) >= 9`, 612},
+		{`request.time.getHours("+05:30") >= 9 && request.time.getDayOfWeek("Asia/Kolkata") < 5`, 213},
 		{`[{"level": 2}, {"level": 3}].exists(r, r.level == request.attributes.n)`, 120},
 		// The ids, kinds, types and tenant a check passes are of at most MaxID bytes, and its action a
 		// permission's.

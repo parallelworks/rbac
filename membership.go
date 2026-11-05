@@ -1259,7 +1259,9 @@ func groupPrincipal(id string) Principal { return Principal{Kind: Group, ID: id}
 
 // nestingKey is a lock a change taking it holds alone among those changing which groups are in
 // which in a tenant, so two can't make a cycle between them, nor a chain too deep. It is no
-// scope's key, as those all have a ':'.
+// scope's key, as those all have a ':', and is taken in their order but keyed as a tenant's own
+// lock is, which no id an actor chooses reaches: past it, an id matching its key would hold every
+// such change in the tenant back (lock).
 const nestingKey = "nesting"
 
 // checkMember returns why a member can't be stored at now, beyond what is stored already.

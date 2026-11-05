@@ -2406,18 +2406,297 @@ func TestAConstraintWritingAFieldAnEmbeddedStructPromotesChangesNothing(t *testi
 }
 
 // A hook's copy of a list decoded from JSON costs an allocation for the list, not one for each of
-// its strings: every constraint is given one in every check.
+// its strings: every constraint is given one in every call. A few more are the copy's own, as the
+// map it keeps what it copied in.
 func TestCopyingAListOfStringsForAHookAllocatesOnce(t *testing.T) {
 	groups := make([]any, 1000)
 	for i := range groups {
 		groups[i] = fmt.Sprintf("group-%04d", i)
 	}
 	attributes := map[string]any{"groups": groups}
-	if n := testing.AllocsPerRun(20, func() { rbac.DeepCopy(attributes) }); n > 10 {
+	if n := testing.AllocsPerRun(20, func() { rbac.DeepCopy(attributes) }); n > 12 {
 		t.Errorf("copying a list of %d strings took %.0f allocations", len(groups), n)
 	}
 	if c, ok := rbac.DeepCopy(attributes)["groups"].([]any); !ok || &c[0] == &groups[0] {
 		t.Error("the copy shares the list")
+	}
+}
+
+// A hook is given a copy of what an interface holds, but nothing writes through an interface to a
+// value holding no map, slice or pointer, as an array, so the copy shares it: copied element by
+// element for each interface holding it, a hundred holding one array of 100 KB took 170 ms and
+// allocated 10 MB. One held by value is copied whole, as setting it does.
+func TestCopyingAnArrayInterfacesHoldSharesIt(t *testing.T) {
+	var a [100_000]byte
+	a[0] = 1
+	held := make([]any, 100)
+	for i := range held {
+		held[i] = a
+	}
+	attributes := map[string]any{"held": held, "byValue": map[string][100_000]byte{"a": a}}
+	if allocated := rbac.CopyAllocates(attributes); allocated > 3*uint64(len(a)) {
+		t.Errorf("copying an array a hundred interfaces hold allocated %d bytes", allocated)
+	}
+	copied := rbac.DeepCopy(attributes)
+	if h, ok := copied["held"].([]any); !ok || len(h) != len(held) || h[len(h)-1] != any(a) {
+		t.Error("the copy doesn't hold the array")
+	}
+	if m, ok := copied["byValue"].(map[string][100_000]byte); !ok || m["a"][0] != 1 {
+		t.Error("the copy doesn't hold the array a map holds")
+	}
+}
+
+// A slice reached at many lengths, as each prefix of one, is copied once from where it starts, and
+// each length is a slice of that copy: copied for each length, the 3,000 prefixes of one slice of
+// 3,000 maps took half a second and allocated 70 MB. A copy is the hook's own, and appending to one
+// writes to none of the others.
+func TestCopyingPrefixesOfOneSliceCopiesItOnce(t *testing.T) {
+	base := make([]any, 3000)
+	for i := range base {
+		base[i] = map[string]any{"i": i}
+	}
+	prefixes := make([]any, len(base))
+	for i := range prefixes {
+		prefixes[i] = base[:i+1]
+	}
+	attributes := map[string]any{"prefixes": prefixes}
+	if allocated := rbac.CopyAllocates(attributes); allocated > 4<<20 {
+		t.Errorf("copying the prefixes of one slice allocated %d bytes", allocated)
+	}
+	copied, ok := rbac.DeepCopy(attributes)["prefixes"].([]any)
+	if !ok || len(copied) != len(prefixes) {
+		t.Fatalf("the prefixes were copied as %T", rbac.DeepCopy(attributes)["prefixes"])
+	}
+	first, _ := copied[0].([]any)
+	last, _ := copied[len(copied)-1].([]any)
+	if len(first) != 1 || len(last) != len(base) || reflect.ValueOf(first[0]).Pointer() != reflect.ValueOf(last[0]).Pointer() {
+		t.Fatal("the prefixes were copied apart")
+	}
+	if reflect.ValueOf(last[0]).Pointer() == reflect.ValueOf(base[0]).Pointer() {
+		t.Fatal("the copy shares the host's maps")
+	}
+	_ = append(first, "appended")
+	if _, ok := last[1].(map[string]any); !ok {
+		t.Error("appending to one prefix's copy wrote to another's")
+	}
+}
+
+// A slice reached again while its elements are copied, shorter and then longer, as by an element
+// holding both, is copied whole wherever it is reached: the shorter copy, given out before the
+// longer replaced it, kept the host's elements, so a hook writing to one wrote to the host's map.
+func TestCopyingASliceThatGrowsWhileItIsCopiedSharesNothingWithTheHost(t *testing.T) {
+	held := map[string]any{"v": "host"}
+	base, both := make([]any, 5), make([]any, 2)
+	base[0], base[1], base[2], base[3], base[4] = both, held, "c", "d", "e"
+	both[0], both[1] = base[:3], base[:5]
+	attributes := map[string]any{"a": base[:3]}
+	copied := rbac.DeepCopy(attributes)
+	if !reflect.DeepEqual(copied, attributes) {
+		t.Fatal("the copy doesn't hold what the host passed")
+	}
+	hosts, copies := map[[2]uintptr]bool{}, map[[2]uintptr]bool{}
+	reachedFrom(reflect.ValueOf(attributes), hosts)
+	reachedFrom(reflect.ValueOf(copied), copies)
+	for at := range copies {
+		if hosts[at] {
+			t.Fatalf("the copy holds a map or slice of the host's, at %#x", at[0])
+		}
+	}
+}
+
+// reachedFrom adds where each map and slice v reaches points, a slice with its length.
+func reachedFrom(v reflect.Value, seen map[[2]uintptr]bool) {
+	switch v.Kind() {
+	case reflect.Interface:
+		if !v.IsNil() {
+			reachedFrom(v.Elem(), seen)
+		}
+	case reflect.Map:
+		at := [2]uintptr{v.Pointer()}
+		if v.IsNil() || seen[at] {
+			return
+		}
+		seen[at] = true
+		for it := v.MapRange(); it.Next(); {
+			reachedFrom(it.Value(), seen)
+		}
+	case reflect.Slice:
+		at := [2]uintptr{v.Pointer(), uintptr(v.Len())}
+		if v.IsNil() || seen[at] {
+			return
+		}
+		seen[at] = true
+		for i := range v.Len() {
+			reachedFrom(v.Index(i), seen)
+		}
+	default:
+	}
+}
+
+// Each constraint is given a copy of the subject's and the resource's attributes once for a call,
+// the first time the call asks it, and the same copy whenever it asks it about the same: copied for
+// each ask, Permissions of 300 permissions on a resource tagged 20,000 times took a second with one
+// constraint, against 4 ms without, and a check of a resource labeled with 60 values by a subject
+// passing 20,000 attributes 160 ms. ValidateGrant is given the actor's once for a call too. A hook
+// writing to its copy sees its write when it is asked again in the call, and nothing else does.
+func TestAHookIsGivenOneCopyForACall(t *testing.T) {
+	var perms []rbac.Permission
+	for i := range 300 {
+		perms = append(perms, rbac.Permission(fmt.Sprintf("cluster:p%03d", i)))
+	}
+	var asked, seen int
+	h := setup(t, compartments, func(c *rbac.Config) {
+		c.Catalog = append(c.Catalog, rbac.RoleDefinition{ID: "cluster.many", Permissions: perms, ResourceTypes: []string{"cluster"}})
+		c.Permissions = declaring(c.Catalog)
+		c.Constraints = []rbac.Constraint{
+			{Name: "counting", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+				if r := in.Resource; r != nil && r.Attributes != nil {
+					n, _ := r.Attributes["asked"].(int)
+					r.Attributes["asked"], asked = n+1, max(asked, n+1)
+				}
+				return false, nil
+			}},
+			{Name: "after", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+				if r := in.Resource; r != nil && r.Attributes["asked"] != nil {
+					seen++
+				}
+				return false, nil
+			}},
+		}
+	})
+	h.seed(t, grant(cluster.Scope(), "cluster.many", rbac.User, "u"), grant(rbac.TenantRoot("t1"), "compartments", rbac.User, "u"),
+		grant(cluster.Scope(), "cluster.admin", rbac.User, "u"))
+	u := h.as(t, "u")
+	u.Attributes = map[string]any{"team": "sre"}
+	r := cluster
+	r.Attributes = map[string]any{"tags": map[string]any{"env": "prod"}}
+	copies := rbac.CountCopies(t)
+	for range 2 {
+		*copies, asked = 0, 0
+		got, err := h.authz.Permissions(t.Context(), u, r)
+		if err != nil || len(got) < len(perms) {
+			t.Fatalf("Permissions listed %d: %v", len(got), err)
+		}
+		// Each hook's copies of the subject's attributes, the resource's and its ancestors.
+		if *copies != 2*3 || asked < len(perms) {
+			t.Errorf("Permissions of %d permissions made %d copies, and the hook saw its own write %d times", len(perms), *copies, asked)
+		}
+	}
+	if seen != 0 || r.Attributes["asked"] != nil {
+		t.Errorf("a hook's write reached another %d times, or the host: %v", seen, r.Attributes)
+	}
+	labeled := r
+	labeled.Attributes = nil
+	labeled.Labels = rbac.Label{"comp": nil}
+	for i := range 60 {
+		labeled.Labels["comp"] = append(labeled.Labels["comp"], fmt.Sprintf("c%02d", i))
+	}
+	*copies = 0
+	if !allowed(t, h, u, view, labeled) || *copies > 2*3 {
+		t.Errorf("a check of a resource labeled with 60 values made %d copies", *copies)
+	}
+	*copies = 0
+	var bindings []rbac.Binding
+	for i := range 20 {
+		bindings = append(bindings, rbac.Binding{Role: "cluster.login", Principal: identity(fmt.Sprintf("x%02d", i))})
+		h.as(t, fmt.Sprintf("x%02d", i))
+	}
+	if err := h.authz.Apply(t.Context(), u, cluster, rbac.Change{Grant: bindings}); err != nil {
+		t.Fatal(err)
+	}
+	// ValidateGrant's copy of the actor's attributes, and each constraint's of them and the cluster's
+	// ancestors.
+	if *copies > 1+2*2 {
+		t.Errorf("granting %d bindings made %d copies", len(bindings), *copies)
+	}
+}
+
+// A call knows the copy it gave a hook by where what the host passed points, so it keeps what the
+// host passed until it returns: dropped and collected, as a resource Config.ResourceOf made for one
+// scope may be, its place can be another's, made after, which would be given the first one's copy,
+// as all but 2 of 2,000 values were where the call kept none.
+func TestACallGivesAHookTheCopyOfNoValueFreedSince(t *testing.T) {
+	copies := rbac.CopiedInOneCall(200, func(i int) map[string]any { return map[string]any{"i": i} })
+	for i, c := range copies {
+		if c["i"] != i {
+			t.Fatalf("value %d was given the copy of %v", i, c["i"])
+		}
+	}
+}
+
+// A copy counts each value as converting does, once: counting a list's elements once for the list
+// and again as values, a string in a []string by the 16 bytes moving it moves, or a protobuf
+// Value's field apart from the Value, attributes a check converts couldn't be copied, so a
+// constrained check of them was refused. And an array of interfaces costs what it holds, as a slice
+// does: uncounted, a copy of one holding more values than a check converts cost one.
+func TestACopyForAHookCountsWhatItHoldsAsConvertingDoes(t *testing.T) {
+	short := make([]string, rbac.MaxConverted*3/4)
+	empty := make([]any, rbac.MaxConverted/2)
+	fields, values := map[string]*structpb.Value{}, make([]*structpb.Value, rbac.MaxConverted/2)
+	for i := range short {
+		short[i] = "a"
+	}
+	for i := range empty {
+		empty[i] = map[string]any{}
+	}
+	for i := range rbac.MaxConverted / 3 {
+		fields[fmt.Sprint(i)] = structpb.NewStringValue("a")
+	}
+	for i := range values {
+		values[i] = structpb.NewStringValue("a")
+	}
+	for name, attributes := range map[string]map[string]any{
+		"short strings": {"tags": short}, "empty maps": {"tags": empty},
+		"a Struct's short strings":    {"tags": &structpb.Struct{Fields: fields}},
+		"a ListValue's short strings": {"tags": &structpb.ListValue{Values: values}},
+	} {
+		if held, _ := rbac.EvaluateConditionOf(t, `size(resource.attributes.tags) > 0`, nil, attributes, nil); !held {
+			t.Fatalf("a check can't read %s", name)
+		}
+		if !rbac.Copies(attributes) {
+			t.Errorf("%s, which a check converts, can't be copied", name)
+		}
+	}
+	var half [rbac.MaxConverted/2 + 1]any
+	if rbac.Copies(map[string]any{"a": half, "b": half}) {
+		t.Error("arrays holding more values than a check converts were copied")
+	}
+}
+
+// A hook is given a copy of no more than a check converts, as copying recurses as far as what the
+// host passes reaches: a check of a resource tagged a million times took 400 ms with one constraint
+// that returns false, against 3 ms without, copying the tags whole. A hook that can't be given its
+// copy can't be asked, so the call is refused, as one it would refuse: a check, and a change whose
+// actor passes as much, which ValidateGrant can't be asked about either.
+func TestAHookIsGivenACopyOfNoMoreThanACheckConverts(t *testing.T) {
+	tags := map[string]any{}
+	for i := range rbac.MaxConverted {
+		tags[fmt.Sprint("t", i)] = "v"
+	}
+	if rbac.Copies(map[string]any{"tags": tags}) || !rbac.Copies(map[string]any{"tags": map[string]any{"env": "prod"}}) {
+		t.Error("a copy is bounded by what a check converts")
+	}
+	for _, constrained := range []bool{false, true} {
+		h := setup(t, func(c *rbac.Config) {
+			if constrained {
+				c.Constraints = []rbac.Constraint{{Name: "never", Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) {
+					return false, nil
+				}}}
+			}
+		})
+		h.seed(t, grant(cluster.Scope(), "cluster.admin", rbac.User, "u"))
+		u := h.as(t, "u")
+		r := cluster
+		r.Attributes = map[string]any{"tags": tags}
+		if err := h.authz.Authorize(t.Context(), u, login, r); (err != nil) != constrained || constrained && !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("constrained %t: a check of a resource tagged past what a check converts: %v", constrained, err)
+		}
+		h.as(t, "x")
+		u.Attributes = map[string]any{"tags": tags}
+		change := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("x")}}}
+		if err := h.authz.Apply(t.Context(), u, cluster, change); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("constrained %t: a change by an actor passing past what a check converts: %v", constrained, err)
+		}
 	}
 }
 
@@ -3164,6 +3443,323 @@ func TestChangesThroughAnotherSearchPathWaitForTheSameLocks(t *testing.T) {
 	}
 	if got, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{{Kind: rbac.User, ID: "u"}}}); err != nil || len(got) > rbac.MaxGrantsPerRole {
 		t.Fatalf("u holds cluster.login %d times: %v", len(got), err)
+	}
+}
+
+// craftedGroup is a group id crafted, by inverting the last block of PostgreSQL's
+// hashtextextended, which keyed the locks before, so that the key it gave the group's lock in
+// tenant t1 was tenant t2's own, for tables in a schema named public.
+const craftedGroup = "aaaaaLmKAMirG.F0/"
+
+// A tenant's admin naming a group for another tenant's lock holds no change there back while it
+// changes the group: a lock's key is its name's SHA-256, which no id is found to match.
+func TestAGroupNamedForAnotherTenantsLockHoldsNoChangeThereBack(t *testing.T) {
+	ctx := t.Context()
+	// In a database of the test's own, as the key named the schema, whose name the id was crafted for.
+	_, database := pgtest.Database(t, "TEMPLATE template0")
+	cfg, err := pgxpool.ParseConfig(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = "public"
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	h := groupedOn(t, pool)
+	var collided bool
+	if err := pool.QueryRow(ctx, `SELECT hashtextextended($1, 0) = hashtextextended($2, 0)`,
+		"6:public/rbac/scope/2:t1/group:"+craftedGroup, "6:public/rbac/tenant/2:t2/").Scan(&collided); err != nil || !collided {
+		t.Fatalf("the group's old key isn't t2's: %v", err)
+	}
+	admin := h.as(t, "groups")
+	if err := h.authz.SetGroup(ctx, admin, "t1", rbac.GroupDefinition{ID: craftedGroup}); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := h.authz.WithTx(tx).SetGroup(ctx, admin, "t1", rbac.GroupDefinition{ID: craftedGroup, Name: "renamed"}); err != nil {
+		t.Fatal(err)
+	}
+	other, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = other.Rollback(ctx) }()
+	if _, err := other.Exec(ctx, `SET LOCAL lock_timeout = '1s'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.WithTx(other).SetMemberships(ctx, host, "t2", []rbac.Membership{{Principal: identity("someone")}}); err != nil {
+		t.Errorf("a change in t2 waited for t1's admin changing group %q: %v", craftedGroup, err)
+	}
+}
+
+// Locks of different names have different keys: a name gives the schema and the tenant each with
+// its length, so no two names are one text split otherwise between the schema, the kind, the
+// tenant and the key, and a key is the first 8 bytes of its name's SHA-256.
+func TestLocksOfDifferentNamesHaveDifferentKeys(t *testing.T) {
+	type name struct{ schema, kind, tenant, key string }
+	seen := map[int64]name{}
+	check := func(n name) {
+		t.Helper()
+		k := rbac.LockKey(n.schema, n.kind, n.tenant, n.key)
+		if other, ok := seen[k]; ok && other != n {
+			t.Fatalf("%+v and %+v have the key %d", n, other, k)
+		}
+		seen[k] = n
+	}
+	for _, n := range []name{
+		// A group id crafted so that hashtextextended keyed its lock as another tenant's own, in the
+		// schema it was crafted for, and that tenant's lock.
+		{"public", "scope", "t1", "group:" + craftedGroup},
+		{"public", "tenant", "t2", ""},
+		// Migrate's lock named the schema without its length, so one schema's could be another's
+		// scope lock, as a schema's name holding another's lock name would be without it.
+		{"3:abc/rbac/scope/2:t2/rbac:x", "migrate", "", ""},
+		{"abc", "scope", "t2", "rbac:x/rbac/migrate"},
+		{"a/rbac/tenant/0:/x", "scope", "", ""},
+		{"a", "tenant", "", "x/rbac/scope/0:/"},
+		{"", "migrate", "", ""},
+		{"", "tenant", "", ""},
+		{"", "exclusive", "", ""},
+	} {
+		check(n)
+	}
+	kinds := []string{"tenant", "exclusive", "nesting", "scope", "principal", "migrate"}
+	rng := mathrand.New(mathrand.NewPCG(1, 2))
+	text := func() string {
+		b := make([]byte, rng.IntN(7))
+		for i := range b {
+			b[i] = "a1:/"[rng.IntN(4)]
+		}
+		return string(b)
+	}
+	for range 20000 {
+		n := name{text(), kinds[rng.IntN(len(kinds))], text(), text()}
+		check(name{n.schema, kinds[rng.IntN(len(kinds))], n.tenant, n.key})
+		// The same text split at each byte between the tenant and the key, and between the schema
+		// and the tenant, which only the lengths tell apart.
+		for joined, i := n.tenant+n.key, 0; i <= len(joined); i++ {
+			check(name{n.schema, n.kind, joined[:i], joined[i:]})
+		}
+		for joined, i := n.schema+n.tenant, 0; i <= len(joined); i++ {
+			check(name{joined[:i], n.kind, joined[i:], n.key})
+		}
+	}
+}
+
+// A lock no key names, a tenant's own, its exclusive values', its nesting's or Migrate's, takes its
+// key as two int4 keys, and a scope's or a principal's as one bigint key, which PostgreSQL holds
+// apart: so a scope or a principal whose bigint key no hash keeps from being a tenant's, as one an
+// actor names to match it, holds none of that tenant's changes back. A session holding each lock's
+// 64 bits in the other form holds back nothing, and in its own form, what takes it.
+func TestATenantsOwnLocksMeetNoLockOfAKey(t *testing.T) {
+	h := labeled(t, banks)
+	ctx := t.Context()
+	var schema string
+	if err := h.pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	change := func(tx pgx.Tx) error {
+		return h.authz.WithTx(tx).Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "u")})
+	}
+	migrate := func(tx pgx.Tx) error { return rbac.Migrate(ctx, tx) }
+	// Deleting groups takes the nesting lock, as nesting one does.
+	nesting := func(tx pgx.Tx) error { return h.authz.WithTx(tx).DeleteGroups(ctx, host, "t1", []string{"g"}) }
+	for _, c := range []struct {
+		lock   string
+		key    int64
+		bigint bool
+		run    func(pgx.Tx) error
+	}{
+		{"the tenant's", rbac.LockKey(schema, "tenant", "t1", ""), false, change},
+		{"its exclusive values'", rbac.LockKey(schema, "exclusive", "t1", ""), false, change},
+		{"its nesting's", rbac.LockKey(schema, "nesting", "t1", ""), false, nesting},
+		{"Migrate's", rbac.LockKey(schema, "migrate", "", ""), false, migrate},
+		{"a scope's", rbac.LockKey(schema, "scope", "t1", cluster.Scope().Key()), true, change},
+		{"a principal's", rbac.LockKey(schema, "principal", "t1", "user:u"), true, change},
+	} {
+		for _, bigint := range []bool{true, false} {
+			holder, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bigint {
+				_, err = holder.Exec(ctx, `SELECT pg_advisory_xact_lock($1::bigint)`, c.key)
+			} else {
+				_, err = holder.Exec(ctx, `SELECT pg_advisory_xact_lock($1::int4, $2::int4)`, int32(c.key>>32), int32(c.key))
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			waits, wait, as := bigint == c.bigint, "1s", "two int4s"
+			if waits {
+				wait = "100ms"
+			}
+			if bigint {
+				as = "one bigint"
+			}
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `SELECT set_config('lock_timeout', $1, true)`, wait); err != nil {
+				t.Fatal(err)
+			}
+			err = c.run(tx)
+			_, _ = tx.Rollback(ctx), holder.Rollback(ctx)
+			switch {
+			case waits && !errors.Is(err, rbac.ErrConflict):
+				t.Errorf("%s lock's key held as %s didn't hold back what takes it: %v", c.lock, as, err)
+			case !waits && err != nil:
+				t.Errorf("%s lock's key held as %s held back what takes it: %v", c.lock, as, err)
+			}
+		}
+	}
+}
+
+// A change to the tables of one schema takes no lock named for another's, as another
+// application's, though the process's last change took its locks there: it reads where the tables
+// are as it takes them, and takes all of its own.
+func TestChangesInTwoSchemasNeverShareALock(t *testing.T) {
+	first, second := setup(t), setup(t)
+	ctx := t.Context()
+	member := []rbac.Membership{{Principal: identity("u")}}
+	held, err := first.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Rollback(ctx) }()
+	if err := first.authz.WithTx(held).SetMemberships(ctx, host, "t1", member); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := second.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '1s'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.authz.WithTx(tx).SetMemberships(ctx, host, "t1", member); err != nil {
+		t.Fatalf("a change to the second schema's tables waited for one to the first's: %v", err)
+	}
+	keys := func(h *harness) map[int64]int16 {
+		var schema string
+		if err := h.pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+			t.Fatal(err)
+		}
+		return map[int64]int16{rbac.LockKey(schema, "tenant", "t1", ""): 2, rbac.LockKey(schema, "principal", "t1", "user:u"): 1}
+	}
+	if got, want := advisoryHeld(t, tx), keys(second); !maps.Equal(got, want) {
+		t.Errorf("the second schema's change holds %v, not its own %v (the first's are %v)", got, want, keys(first))
+	}
+}
+
+// advisoryHeld is each advisory lock tx holds, by its 64 bits, and whether it takes them as one
+// bigint (1) or two int4s (2).
+func advisoryHeld(t *testing.T, tx pgx.Tx) map[int64]int16 {
+	t.Helper()
+	rows, err := tx.Query(t.Context(), `SELECT classid, objid, objsubid FROM pg_locks
+		WHERE locktype = 'advisory' AND granted AND pid = pg_backend_pid()`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := map[int64]int16{}
+	var high, low uint32
+	var form int16
+	if _, err := pgx.ForEachRow(rows, []any{&high, &low, &form}, func() error {
+		held[int64(uint64(high)<<32|uint64(low))] = form
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return held
+}
+
+// A change whose locks are keyed for the schema the process's last were taken in takes every one,
+// though the schema is renamed while it waits for one of them: the statements after that wait find
+// the tables in a schema of another name and take none, so it takes them all again, named by the
+// schema its batch read first, rather than go on without them.
+func TestAChangeTakesEveryLockThoughItsSchemaIsRenamedAsItWaits(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	var schema string
+	if err := h.pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	scopes, principals := []string{cluster.Scope().Key()}, []string{"user:u"}
+	// So the process's last locks were taken in this schema.
+	if err := pgx.BeginFunc(ctx, h.pool, func(tx pgx.Tx) error { return rbac.Lock(ctx, tx, "t1", scopes, principals) }); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Rollback(ctx) }()
+	if _, err := holder.Exec(ctx, `SELECT pg_advisory_xact_lock($1::bigint)`, rbac.LockKey(schema, "scope", "t1", scopes[0])); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var pid int32
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid() FROM set_config('lock_timeout', '5s', true)`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- rbac.Lock(ctx, tx, "t1", scopes, principals) }()
+	for waiting := false; !waiting; {
+		select {
+		case err := <-done:
+			t.Fatalf("the change didn't wait for the scope's lock: %v", err)
+		default:
+			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity
+				WHERE pid = $1 AND wait_event_type = 'Lock' AND wait_event = 'advisory')`, pid).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	rename := func(from, to string) error {
+		ctx := context.WithoutCancel(ctx)
+		return pgx.BeginFunc(ctx, h.pool, func(admin pgx.Tx) error {
+			_, err := admin.Exec(ctx, `SET LOCAL lock_timeout = '1s'; ALTER SCHEMA `+pgx.Identifier{from}.Sanitize()+` RENAME TO `+pgx.Identifier{to}.Sanitize())
+			return err
+		})
+	}
+	renamed := schema + "_renamed"
+	if err := rename(schema, renamed); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := rename(renamed, schema); err != nil {
+			t.Error(err)
+		}
+	}()
+	if err := holder.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	want := map[int64]int16{
+		rbac.LockKey(schema, "tenant", "t1", ""):               2,
+		rbac.LockKey(schema, "scope", "t1", scopes[0]):         1,
+		rbac.LockKey(schema, "principal", "t1", principals[0]): 1,
+	}
+	got := advisoryHeld(t, tx)
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !maps.Equal(got, want) {
+		t.Errorf("the change holds %v, not every lock of its own %v", got, want)
 	}
 }
 
@@ -9982,6 +10578,526 @@ func TestADenyBelowTheTenantStopsARedefinitionHandedOnThroughARoleListingOneList
 			}
 			if !errors.Is(err, rbac.ErrDenied) || allowed(t, h, w, root, cluster) {
 				t.Fatalf("widening a role listed by one that a role granted under the deny lists: %v", err)
+			}
+		})
+	}
+}
+
+// removedInW1 configures a constraint removing p from x on workspace w1 and the resources under it,
+// as one telling containers apart does, and asked of no resource, as one that may remove it on any
+// does: asked of the tenant, which has no ancestors, it removes nothing. It tells asked of each
+// question first, where set, and fails with what that returns.
+func removedInW1(p rbac.Permission, asked func(context.Context, rbac.ConstraintInput) error) func(*rbac.Config) {
+	return func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "x-in-w1", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if asked != nil {
+				if err := asked(ctx, in); err != nil {
+					return false, err
+				}
+			}
+			if in.Permission != p || in.Subject == nil || in.Subject.Principal.ID != "x" {
+				return false, nil
+			}
+			r := in.Resource
+			return r == nil || r.Scope() == workspace.Scope() || slices.Contains(r.Ancestors, workspace.Scope()), nil
+		}}}
+	}
+}
+
+// removedInW1Alone is removedInW1 written for resources alone, as one guarding against a nil
+// Resource is: asked of no resource, it removes nothing, though ConstraintInput asks it to answer
+// true there.
+func removedInW1Alone(p rbac.Permission) func(*rbac.Config) {
+	return func(c *rbac.Config) {
+		removedInW1(p, nil)(c)
+		removes := c.Constraints[0].Deny
+		c.Constraints[0].Deny = func(ctx context.Context, q rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if in.Resource == nil {
+				return false, nil
+			}
+			return removes(ctx, q, in)
+		}
+	}
+}
+
+// removalsInW1 are removedInW1 and removedInW1Alone of p, by how each answers of no resource.
+func removalsInW1(p rbac.Permission) []struct {
+	name      string
+	configure func(*rbac.Config)
+} {
+	return []struct {
+		name      string
+		configure func(*rbac.Config)
+	}{{"answering for any resource", removedInW1(p, nil)}, {"written for resources alone", removedInW1Alone(p)}}
+}
+
+// A constraint removing root from x in w1, though not asked of the tenant above it, keeps x from
+// handing root on there, as Apply granting it there; so it stops x widening a role granted there to
+// give root, which hands root on there just the same, as a deny there does, however it answers of no
+// resource, as Apply never asks it so. Granted only where the constraint removes nothing, the role is
+// widened.
+func TestAConstraintOnAScopeStopsARedefinitionHandingOnWhatItRemovesThere(t *testing.T) {
+	for _, removal := range removalsInW1(root) {
+		for _, on := range []rbac.Resource{cluster, {Tenant: "t1", Type: "cluster", ID: "c2"}} {
+			t.Run(removal.name+"/"+on.ID, func(t *testing.T) {
+				h := setup(t, removal.configure)
+				ctx := t.Context()
+				x, r := definer(t, h)
+				y := h.as(t, "y")
+				h.seed(t, grant(on.Scope(), r.ID, rbac.User, "y"))
+				if err := h.authz.Apply(ctx, x, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: y.Principal}}}); !errors.Is(err, rbac.ErrDenied) {
+					t.Fatalf("granting root in w1: %v", err)
+				}
+				wider := r
+				wider.Permissions = []rbac.Permission{view, root}
+				err := h.authz.SetRole(ctx, x, "t1", wider)
+				if on.ID != cluster.ID {
+					if err != nil || !allowed(t, h, y, root, on) {
+						t.Fatalf("widening a role granted only outside w1 to give root: %v", err)
+					}
+					return
+				}
+				var denied *rbac.DeniedError
+				if !errors.As(err, &denied) || denied.Permission != root || denied.Scope != cluster.Scope() || !strings.Contains(denied.Reason, "x-in-w1") ||
+					allowed(t, h, y, root, cluster) {
+					t.Fatalf("widening a role granted in w1 to give root: %v", err)
+				}
+			})
+		}
+	}
+}
+
+// A role granted in w1 that lists r lets its holders grant r there without holding it, so widening r
+// hands on there what r will give: the constraint removing root from x in w1 stops it, however it
+// answers of no resource. Listed by a role granted only outside w1, r is widened, and handed on
+// there.
+func TestAConstraintOnAScopeStopsARedefinitionHandedOnByARoleListingIt(t *testing.T) {
+	for _, removal := range removalsInW1(root) {
+		for _, on := range []rbac.Resource{cluster, {Tenant: "t1", Type: "cluster", ID: "c2"}} {
+			t.Run(removal.name+"/"+on.ID, func(t *testing.T) {
+				h := setup(t, removal.configure)
+				ctx := t.Context()
+				x, r := definer(t, h)
+				l := listing(t, h, x, r)
+				y, z := h.as(t, "y"), h.as(t, "z")
+				h.seed(t, grant(on.Scope(), l.ID, rbac.User, "y"))
+				wider := r
+				wider.Permissions = []rbac.Permission{view, root}
+				err := h.authz.SetRole(ctx, x, "t1", wider)
+				if applied := h.authz.Apply(ctx, y, on, rbac.Change{Grant: []rbac.Binding{{Role: r.ID, Principal: z.Principal}}}); applied != nil {
+					t.Fatal(applied)
+				}
+				if on.ID != cluster.ID {
+					if err != nil || !allowed(t, h, z, root, on) {
+						t.Fatalf("widening a role listed only outside w1 to give root: %v", err)
+					}
+					return
+				}
+				var denied *rbac.DeniedError
+				if !errors.As(err, &denied) || denied.Permission != root || denied.Scope != cluster.Scope() || allowed(t, h, z, root, cluster) {
+					t.Fatalf("widening a role that one granted in w1 lists to give root: %v", err)
+				}
+			})
+		}
+	}
+}
+
+// A grant to the tenant's members of a privileged role gives nothing, so narrowing the role so that
+// it no longer is hands on to them what it gives where they hold it: a constraint removing view
+// from x in w1, where they do, stops it, as it stops Apply granting them view there, however it
+// answers of no resource. Held by them only outside w1, the role is narrowed.
+func TestAConstraintWhereTheMembersHoldARoleNoLongerPrivilegedStopsNarrowingIt(t *testing.T) {
+	for _, removal := range removalsInW1(view) {
+		for _, on := range []rbac.Scope{workspace.Scope(), {Type: "cluster", ID: "c2"}} {
+			t.Run(removal.name+"/"+on.Key(), func(t *testing.T) {
+				h := setup(t, removal.configure)
+				ctx := t.Context()
+				x, r := definer(t, h)
+				member := h.as(t, "m")
+				// Privileged, as it gives root, and granted to the members, as a catalog change would leave it.
+				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.op', '{cluster:view,cluster:root}', '{cluster}')`); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+				VALUES ('t1', $1, $2, 'members', 't1', 'custom.op')`, on.Type, on.ID); err != nil {
+					t.Fatal(err)
+				}
+				if err := h.authz.Apply(ctx, x, workspace, rbac.Change{Grant: []rbac.Binding{{Role: r.ID, Principal: rbac.TenantMembers("t1")}}}); !errors.Is(err, rbac.ErrDenied) {
+					t.Fatalf("granting the members view in w1: %v", err)
+				}
+				narrowed := rbac.RoleDefinition{ID: "custom.op", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+				err := h.authz.SetRole(ctx, x, "t1", narrowed)
+				if on != workspace.Scope() {
+					if err != nil || !allowed(t, h, member, view, rbac.Resource{Tenant: "t1", Type: on.Type, ID: on.ID}) {
+						t.Fatalf("narrowing a role the members hold only outside w1: %v", err)
+					}
+					return
+				}
+				var denied *rbac.DeniedError
+				if !errors.As(err, &denied) || denied.Permission != view || denied.Scope != workspace.Scope() || allowed(t, h, member, view, cluster) {
+					t.Fatalf("narrowing a role the members hold in w1 so that it is no longer privileged: %v", err)
+				}
+			})
+		}
+	}
+}
+
+// A role listing r, granted on w1, hands r on there only where its grant gives its holders the
+// power to grant r: by a `<type>:grant` it gives for that type, on scopes of the type w1 reaches. So
+// one for clusters that gives workspace:grant too lets its holders grant r on the clusters in w1, but
+// on no workspace, and a constraint freezing workspaces in w1 doesn't stop widening r, as it doesn't
+// stop Apply granting r on a cluster there; nor does one removing root from x in w1 stop widening r
+// to give root where the role listing it gives tenant:grant, as nothing in w1 is a tenant.
+func TestARoleListingARedefinitionWhereItHandsNothingOnDoesntStopIt(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		lister    rbac.RoleDefinition
+		configure func(*rbac.Config)
+		// onC1 is whether its holders may grant r on c1.
+		onC1 bool
+	}{
+		{"a power it gives for another type", rbac.RoleDefinition{Permissions: []rbac.Permission{grantC, "workspace:grant"}, ResourceTypes: []string{"cluster"}}, removedInW1Alone("workspace:grant"), true},
+		{"a tenant from a workspace", rbac.RoleDefinition{Permissions: []rbac.Permission{"tenant:grant"}, ResourceTypes: []string{rbac.TenantScope}}, removedInW1Alone(root), false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := setup(t, c.configure)
+			ctx := t.Context()
+			x, r := definer(t, h)
+			y, z := h.as(t, "y"), h.as(t, "z")
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles) VALUES ('t1', 'custom.lister', $1, $2, $3)`,
+				c.lister.Permissions, c.lister.ResourceTypes, []string{string(r.ID)}); err != nil {
+				t.Fatal(err)
+			}
+			tenant := rbac.TenantRoot("t1")
+			h.seed(t, grant(tenant, "tenant.admin", rbac.User, "x"), grant(tenant, "workspace.admin", rbac.User, "x"), grant(workspace.Scope(), "custom.lister", rbac.User, "y"))
+			wider := r
+			wider.Permissions = []rbac.Permission{view, root}
+			if err := h.authz.SetRole(ctx, x, "t1", wider); err != nil {
+				t.Fatalf("widening a role that one granted on w1 lists where its holders may grant it on no scope the constraint names: %v", err)
+			}
+			for _, on := range []rbac.Resource{workspace, cluster} {
+				err := h.authz.Apply(ctx, y, on, rbac.Change{Grant: []rbac.Binding{{Role: r.ID, Principal: z.Principal}}})
+				if want := on.ID == cluster.ID && c.onC1; (err == nil) != want || err != nil && !errors.Is(err, rbac.ErrDenied) {
+					t.Errorf("y granting it on %s: %v", on.ID, err)
+				}
+			}
+		})
+	}
+}
+
+// What the constraints answered before SetRole's transaction it reads back under the tenant's lock,
+// so a role listing the one it widens, granted in w1 while the change waited, which they weren't
+// asked about, refuses it, to be tried again, and then the constraint removing root from x in w1
+// stops it: whether they were asked about each scope the role gives more on, as where it is granted
+// outside w1, or about none, as where it gives more nowhere.
+func TestARoleListingARedefinitionGrantedMeanwhileWhereAConstraintRemovesWhatItGivesIsTriedAgain(t *testing.T) {
+	for _, before := range []bool{false, true} {
+		t.Run(fmt.Sprintf("granted outside w1 %t", before), func(t *testing.T) {
+			var meanwhile func(context.Context) error
+			// The freezes are asked after the scopes the change reaches are read, and before the
+			// constraints are asked about them.
+			h := setup(t, removedInW1(root, func(ctx context.Context, in rbac.ConstraintInput) error {
+				if do := meanwhile; do != nil && in.Permission == "workspace:grant" {
+					meanwhile = nil
+					return do(ctx)
+				}
+				return nil
+			}))
+			ctx := t.Context()
+			x, r := definer(t, h)
+			l := listing(t, h, x, r)
+			z, w := h.as(t, "z"), h.as(t, "w")
+			if before {
+				h.seed(t, grant(rbac.Scope{Type: "cluster", ID: "c2"}, r.ID, rbac.User, "y"))
+			}
+			meanwhile = func(ctx context.Context) error {
+				return h.authz.Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), l.ID, rbac.User, "z")})
+			}
+			wider := r
+			wider.Permissions = []rbac.Permission{view, root}
+			if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.Is(err, rbac.ErrConflict) {
+				t.Fatalf("widening a role that one granted in w1 while the change waited lists: %v", err)
+			}
+			if meanwhile != nil {
+				t.Fatal("the role listing it should have been granted in w1 meanwhile")
+			}
+			if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.Is(err, rbac.ErrDenied) {
+				t.Fatalf("tried again: %v", err)
+			}
+			if applied := h.authz.Apply(ctx, z, cluster, rbac.Change{Grant: []rbac.Binding{{Role: r.ID, Principal: w.Principal}}}); applied != nil {
+				t.Fatal(applied)
+			}
+			if allowed(t, h, w, root, cluster) {
+				t.Fatal("root was handed on in w1 through the role listing it")
+			}
+		})
+	}
+}
+
+// Without Config.ResourceOf, a scope a redefinition gives more on whose containers the host doesn't
+// store is asked of no resource, so a constraint that may remove what it hands on on any of them, as
+// one removing root from x in w1 answers there, stops widening the role to give it wherever the role
+// is granted; widening it by what the constraint removes nowhere it doesn't stop.
+func TestWithoutResourceOfAConstraintThatMayRemoveWhatARedefinitionHandsOnAnywhereStopsIt(t *testing.T) {
+	h := setup(t, removedInW1(root, nil), func(c *rbac.Config) { c.ResourceOf = nil })
+	ctx := t.Context()
+	x, r := definer(t, h)
+	y := h.as(t, "y")
+	elsewhere := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c2"}
+	h.seed(t, grant(elsewhere.Scope(), r.ID, rbac.User, "y"))
+	wider := r
+	wider.Permissions = []rbac.Permission{view, root}
+	var denied *rbac.DeniedError
+	if err := h.authz.SetRole(ctx, x, "t1", wider); !errors.As(err, &denied) || denied.Permission != root || allowed(t, h, y, root, elsewhere) {
+		t.Fatalf("widening a role to give root with no scope told apart: %v", err)
+	}
+	wider.Permissions = []rbac.Permission{view, login}
+	if err := h.authz.SetRole(ctx, x, "t1", wider); err != nil || !allowed(t, h, y, login, elsewhere) {
+		t.Fatalf("widening it to give login: %v", err)
+	}
+}
+
+// A redefinition asks the host about each scope it gives more on once, however many grants of the
+// role and of roles listing it are there: Config.ResourceOf, and the constraints about each
+// permission it hands on there, whose answers it reads back under the tenant's lock. It asks about
+// the scopes whatever the constraints would answer of no resource, which it never asks them about
+// what it hands on.
+func TestARedefinitionAsksTheHostAboutEachScopeItGivesMoreOnOnce(t *testing.T) {
+	resolved := map[rbac.Scope]int{}
+	asked := map[string]int{}
+	var anywhere []rbac.Permission
+	h := setup(t, removedInW1(root, func(_ context.Context, in rbac.ConstraintInput) error {
+		switch {
+		case in.Resource != nil:
+			asked[fmt.Sprintf("%s %s %s", in.Resource.Scope().Key(), in.Permission, in.ResourceType)]++
+		case in.Permission == root || in.Permission == login:
+			anywhere = append(anywhere, in.Permission)
+		}
+		return nil
+	}), func(c *rbac.Config) {
+		of := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			resolved[s]++
+			return of(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	x, r := definer(t, h)
+	l := listing(t, h, x, r)
+	other := rbac.RoleDefinition{ID: "custom.other", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	if err := h.authz.SetRole(ctx, x, "t1", other); err != nil {
+		t.Fatal(err)
+	}
+	scopes := []rbac.Scope{{Type: "cluster", ID: "c2"}, {Type: "cluster", ID: "c3"}, {Type: "org", ID: "o2"}}
+	var grants []rbac.Grant
+	for _, s := range scopes {
+		for _, p := range []string{"y", "z"} {
+			h.as(t, p)
+			grants = append(grants, grant(s, r.ID, rbac.User, p), grant(s, other.ID, rbac.User, p))
+		}
+	}
+	h.as(t, "w")
+	h.seed(t, append(grants, grant(scopes[0], l.ID, rbac.User, "w"))...)
+	clear(resolved)
+	clear(asked)
+	wider := r
+	wider.Permissions = []rbac.Permission{view, root}
+	if err := h.authz.SetRole(ctx, x, "t1", wider); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range scopes {
+		if k := s.Key() + " " + string(root) + " cluster"; resolved[s] != 1 || asked[k] != 1 {
+			t.Errorf("%s: Config.ResourceOf asked %d times, the constraint about root %d", s.Key(), resolved[s], asked[k])
+		}
+	}
+	if len(resolved) != len(scopes) {
+		t.Errorf("Config.ResourceOf asked about %v", resolved)
+	}
+	for k, n := range asked {
+		if n > 1 {
+			t.Errorf("the constraint was asked about %s %d times", k, n)
+		}
+	}
+	clear(resolved)
+	clear(asked)
+	other.Permissions = []rbac.Permission{view, login}
+	if err := h.authz.SetRole(ctx, x, "t1", other); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range scopes {
+		if k := s.Key() + " " + string(login) + " cluster"; resolved[s] != 1 || asked[k] != 1 {
+			t.Errorf("widened by what the constraint removes nowhere, %s: Config.ResourceOf asked %d times, the constraint about login %d", s.Key(), resolved[s], asked[k])
+		}
+	}
+	if len(anywhere) > 0 {
+		t.Errorf("the constraint was asked of no resource about %v", anywhere)
+	}
+}
+
+// Without Config.ResourceOf, a scope stored whole, as where the host has no containers and its
+// resources no attributes, is what Apply is given there: so a redefinition asks the constraints about
+// it, not of no resource, and one telling resources apart by id stops widening a role granted on c1
+// to give root, as it stops Apply granting root there, though it removes nothing of no resource.
+func TestWithoutResourceOfAConstraintIsAskedAboutAScopeStoredWhole(t *testing.T) {
+	c1 := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c1"}
+	for _, on := range []rbac.Resource{c1, {Tenant: "t1", Type: "cluster", ID: "c2"}} {
+		t.Run(on.ID, func(t *testing.T) {
+			h := setup(t, func(c *rbac.Config) {
+				c.ResourceOf, c.ContainerTypes, c.Attributes = nil, nil, rbac.Attributes{Resource: map[string]rbac.AttributeType{}}
+				c.Constraints = []rbac.Constraint{{Name: "x-on-c1", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+					return in.Permission == root && in.Subject != nil && in.Subject.Principal.ID == "x" && in.Resource != nil && in.Resource.Scope() == c1.Scope(), nil
+				}}}
+			})
+			ctx := t.Context()
+			x, r := definer(t, h)
+			y := h.as(t, "y")
+			if err := h.authz.Apply(ctx, x, c1, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: y.Principal}}}); !errors.Is(err, rbac.ErrDenied) {
+				t.Fatalf("granting root on c1: %v", err)
+			}
+			h.seed(t, grant(on.Scope(), r.ID, rbac.User, "y"))
+			wider := r
+			wider.Permissions = []rbac.Permission{view, root}
+			err := h.authz.SetRole(ctx, x, "t1", wider)
+			if on.ID != c1.ID {
+				if err != nil || !allowed(t, h, y, root, on) {
+					t.Fatalf("widening a role granted only on c2 to give root: %v", err)
+				}
+				return
+			}
+			var denied *rbac.DeniedError
+			if !errors.As(err, &denied) || denied.Permission != root || denied.Scope != c1.Scope() || allowed(t, h, y, root, c1) {
+				t.Fatalf("widening a role granted on c1 to give root: %v", err)
+			}
+		})
+	}
+}
+
+// On a resource, Apply decides a role for the resource's type alone, so a `<type>:grant` the role
+// gives of another of its types is a permission like any other there, which a constraint can remove
+// for that type: widening a role granted on c1 to give workspace:grant hands it on there, so a
+// constraint removing it from x for clusters in w1 stops it, as it stops Apply granting the role
+// there, though x may change grants on workspaces. Granted only on c2, outside w1, it is widened.
+func TestAConstraintOnAResourceStopsARedefinitionHandingOnAPowerOfAnotherTypeThere(t *testing.T) {
+	const grantW rbac.Permission = "workspace:grant"
+	for _, on := range []rbac.Resource{cluster, {Tenant: "t1", Type: "cluster", ID: "c2"}} {
+		t.Run(on.ID, func(t *testing.T) {
+			h := setup(t, func(c *rbac.Config) {
+				c.Constraints = []rbac.Constraint{{Name: "x-grant-w-on-clusters-in-w1", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+					if in.Permission != grantW || in.ResourceType != "cluster" || in.Subject == nil || in.Subject.Principal.ID != "x" {
+						return false, nil
+					}
+					r := in.Resource
+					return r == nil || r.Scope() == workspace.Scope() || slices.Contains(r.Ancestors, workspace.Scope()), nil
+				}}}
+			})
+			ctx := t.Context()
+			x, r := definer(t, h)
+			y, z := h.as(t, "y"), h.as(t, "z")
+			// x may change grants on workspaces, and holds workspace:grant on clusters too, as the wider role gives it.
+			wider := rbac.RoleDefinition{ID: r.ID, Permissions: []rbac.Permission{view, grantW}, ResourceTypes: []string{"cluster", "workspace"}}
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, privileged) VALUES ('t1', 'custom.both', $1, $2, true)`,
+				wider.Permissions, wider.ResourceTypes); err != nil {
+				t.Fatal(err)
+			}
+			tenant := rbac.TenantRoot("t1")
+			h.seed(t, grant(tenant, "workspace.admin", rbac.User, "x"), grant(tenant, "custom.both", rbac.User, "x"), grant(on.Scope(), r.ID, rbac.User, "y"))
+			if err := h.authz.Apply(ctx, x, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "custom.both", Principal: z.Principal}}}); !errors.Is(err, rbac.ErrDenied) {
+				t.Fatalf("granting workspace:grant on c1: %v", err)
+			}
+			err := h.authz.SetRole(ctx, x, "t1", wider)
+			if on.ID != cluster.ID {
+				if err != nil || !allowed(t, h, y, grantW, on) {
+					t.Fatalf("widening a role granted only outside w1 to give workspace:grant: %v", err)
+				}
+				return
+			}
+			var denied *rbac.DeniedError
+			if !errors.As(err, &denied) || denied.Permission != grantW || denied.Scope != cluster.Scope() || !strings.Contains(denied.Reason, "x-grant-w-on-clusters-in-w1") ||
+				allowed(t, h, y, grantW, cluster) {
+				t.Fatalf("widening a role granted on c1 to give workspace:grant: %v", err)
+			}
+		})
+	}
+}
+
+// A grant on a resource gives what its role gives for that resource's type alone, and Apply asks the
+// constraints so: a role for clusters and workspaces granted on c1, widened to give workspace:view,
+// hands nothing more on there for workspaces, so a constraint removing workspace:view from x for
+// workspaces in w1 doesn't stop it, as it doesn't stop Apply granting the role as it will be on c1.
+// Granted on w1, which reaches workspaces, it is stopped, as Apply there is.
+func TestAConstraintOnAnotherTypeDoesntStopARedefinitionGrantedOnAResource(t *testing.T) {
+	const viewW rbac.Permission = "workspace:view"
+	for _, on := range []rbac.Resource{cluster, workspace} {
+		t.Run(on.ID, func(t *testing.T) {
+			h := setup(t, func(c *rbac.Config) {
+				c.Constraints = []rbac.Constraint{{Name: "x-view-workspaces-in-w1", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+					if in.Permission != viewW || in.ResourceType != "workspace" || in.Subject == nil || in.Subject.Principal.ID != "x" {
+						return false, nil
+					}
+					r := in.Resource
+					return r == nil || r.Scope() == workspace.Scope() || slices.Contains(r.Ancestors, workspace.Scope()), nil
+				}}}
+			})
+			ctx := t.Context()
+			x, _ := definer(t, h)
+			y, z := h.as(t, "y"), h.as(t, "z")
+			r := rbac.RoleDefinition{ID: "custom.both", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster", "workspace"}}
+			wider := rbac.RoleDefinition{ID: r.ID, Permissions: []rbac.Permission{view, viewW}, ResourceTypes: r.ResourceTypes}
+			// x holds what the wider role gives for both its types, and may change grants on workspaces.
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.all', $1, $2)`,
+				wider.Permissions, wider.ResourceTypes); err != nil {
+				t.Fatal(err)
+			}
+			tenant := rbac.TenantRoot("t1")
+			h.seed(t, grant(tenant, "custom.all", rbac.User, "x"), grant(tenant, "workspace.admin", rbac.User, "x"))
+			if err := h.authz.SetRole(ctx, x, "t1", r); err != nil {
+				t.Fatal(err)
+			}
+			h.seed(t, grant(on.Scope(), r.ID, rbac.User, "y"))
+			applied := h.authz.Apply(ctx, x, on, rbac.Change{Grant: []rbac.Binding{{Role: "custom.all", Principal: z.Principal}}})
+			err := h.authz.SetRole(ctx, x, "t1", wider)
+			if on.ID == cluster.ID {
+				if applied != nil || err != nil || !allowed(t, h, y, view, cluster) {
+					t.Fatalf("widening a role granted on c1 by what it gives for workspaces: Apply %v, SetRole %v", applied, err)
+				}
+				return
+			}
+			var denied *rbac.DeniedError
+			if !errors.Is(applied, rbac.ErrDenied) || !errors.As(err, &denied) || denied.Permission != viewW || denied.Scope != workspace.Scope() ||
+				!strings.Contains(denied.Reason, "x-view-workspaces-in-w1") || allowed(t, h, y, viewW, workspace) {
+				t.Fatalf("widening a role granted on w1 to give workspace:view: Apply %v, SetRole %v", applied, err)
+			}
+		})
+	}
+}
+
+// A constraint freezing changes to grants in w1, though written for resources alone, which asked of
+// no resource stops nothing, stops x widening a role granted there, which changes what grants there
+// give, as it stops Apply changing grants there. Granted only outside w1, the role is widened.
+func TestAFreezeOnAScopeStopsARedefinitionGivingMoreThere(t *testing.T) {
+	for _, on := range []rbac.Resource{cluster, {Tenant: "t1", Type: "cluster", ID: "c2"}} {
+		t.Run(on.ID, func(t *testing.T) {
+			h := setup(t, removedInW1Alone(grantC))
+			ctx := t.Context()
+			x, r := definer(t, h)
+			y, z := h.as(t, "y"), h.as(t, "z")
+			if err := h.authz.Apply(ctx, x, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: z.Principal}}}); !errors.Is(err, rbac.ErrDenied) {
+				t.Fatalf("granting in w1: %v", err)
+			}
+			h.seed(t, grant(on.Scope(), r.ID, rbac.User, "y"))
+			wider := r
+			wider.Permissions = []rbac.Permission{view, login}
+			err := h.authz.SetRole(ctx, x, "t1", wider)
+			if on.ID != cluster.ID {
+				if err != nil || !allowed(t, h, y, login, on) {
+					t.Fatalf("widening a role granted only outside w1: %v", err)
+				}
+				return
+			}
+			var denied *rbac.DeniedError
+			if !errors.As(err, &denied) || denied.Permission != grantC || denied.Scope != cluster.Scope() || !strings.Contains(denied.Reason, "x-in-w1") ||
+				allowed(t, h, y, login, cluster) {
+				t.Fatalf("widening a role granted in w1: %v", err)
 			}
 		})
 	}

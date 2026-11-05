@@ -3187,7 +3187,9 @@ func TestWideningARoleThatOneGrantedOnALabeledScopeListsNeedsItsLabel(t *testing
 
 // Where the actor's label values satisfy every label, widening a role asks the host nothing about
 // the scopes it, or a role listing it, is granted on, and is tried again where they no longer do
-// once it holds the tenant's lock.
+// once it holds the tenant's lock. The host declares no constraints, which would be asked about each
+// scope it gives more on: so the label value is revoked meanwhile as the host is asked about the
+// grant of the role on the tenant it widens.
 func TestWideningARoleByOneClearedForEveryLabelAsksTheHostNothingAboutItsScopes(t *testing.T) {
 	for _, on := range []string{"custom.viewer", "custom.lister"} {
 		t.Run(on, func(t *testing.T) {
@@ -3201,13 +3203,16 @@ func TestWideningARoleByOneClearedForEveryLabelAsksTheHostNothingAboutItsScopes(
 					}
 					return resourceOf(ctx, tenant, s)
 				}
-				c.Constraints = []rbac.Constraint{{Name: "meanwhile", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
-					if do := meanwhile; do != nil && in.Permission == "rel:fra" {
+				validate := c.ValidateGrant
+				c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+					if do := meanwhile; do != nil {
 						meanwhile = nil
-						return false, do(ctx)
+						if err := do(ctx); err != nil {
+							return err
+						}
 					}
-					return false, nil
-				}}}
+					return validate(ctx, q, in)
+				}
 			})
 			ctx := t.Context()
 			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles)
@@ -3216,7 +3221,8 @@ func TestWideningARoleByOneClearedForEveryLabelAsksTheHostNothingAboutItsScopes(
 				t.Fatal(err)
 			}
 			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
-				SELECT 't1', 'cluster', 'c' || i, 'user', 'u', $1 FROM generate_series(1, 20) i`, on); err != nil {
+				SELECT 't1', 'cluster', 'c' || i, 'user', 'u', $1 FROM generate_series(1, 20) i
+				UNION ALL SELECT 't1', 'tenant', 't1', 'user', 'u', 'custom.viewer'`, on); err != nil {
 				t.Fatal(err)
 			}
 			tenant := rbac.TenantRoot("t1")

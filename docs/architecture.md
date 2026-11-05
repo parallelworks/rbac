@@ -405,11 +405,32 @@ sequenceDiagram
   in it too.
 - **Permissions** lists everything a subject may do on a resource, deciding each as Authorize
   would.
+- **Hooks are given copies** (`givenTo`, `copiedFor`): each constraint its own of the subject's and
+  the resource's attributes, ancestors and label, and `ValidateGrant` its own of the actor's,
+  `deepCopy` made once for a call (`still`), the first time it asks the hook about each, by where
+  what the host passed points, and given again whenever it asks about the same, as `Permissions`
+  does for each permission and a labeled check for each value its label asks for: copied for each
+  ask, `Permissions` of 300 permissions on a resource of 20,000 tags took a second. A hook writing
+  to its copy reads its write when the call asks it again, and nothing decided or asked of another
+  hook does. A copy holds no more than a check converts (`maxConverted`), counted alike, one for
+  each value, a string too, and a tenth of each other byte copied whole, so it counts no more than
+  converting the same does: past it the hook can't be asked, and the call is refused as
+  `ErrDenied`. Counting a list's elements twice, a string by the bytes of its header, or a
+  protobuf `Value` and its field apart, attributes a check converts couldn't be copied. A slice
+  reached at several lengths is copied once from where it starts, each length a slice of the copy,
+  and one reached while its elements are copied, before a longer length outgrew that copy, a slice
+  of its own, whose elements are copied too, as set in the longer alone it held the host's. A value
+  holding no map, slice or pointer that an interface holds, as an array, is shared, as nothing
+  writes to it through the interface. A call keeps what the host passed with each copy until it
+  returns, so where it points is no other value's meanwhile: known only by where it points, a value
+  dropped and collected during the call would leave its place to one made after, which would be
+  given the first one's copy.
 - **Conditions** are CEL over `subject`, `resource`, `request` and `action`, typed by
   `Config.Attributes`. Each is compiled once, bounded in cost, and fails closed: a condition that
   errors gives nothing, and a deny's that errors denies. A check converts what the host passes into
   CEL's own values once (`converter`), deeply, from a closed set of Go values (`Attributes`): bools,
-  strings and numbers read by their kind, times, durations, bytes, slices, arrays, pointers, maps
+  strings and numbers read by their kind, times, in UTC, as `request.time` is, durations, bytes,
+  slices, arrays, pointers, maps
   keyed by bools, strings, ints or uints, JSON text and numbers, and the protobuf well-known types.
   It calls no method of the host's, so a condition reads no value by one. A kind's attributes, the
   subject's, the resource's or the request's, holding anything else anywhere, a `ref.Val` of the
@@ -455,11 +476,23 @@ sequenceDiagram
   list or map literal for each element or entry it builds, and a loop's step for each logical
   operator and choice it may evaluate, on top of what CEL charges, a key a condition computes by its
   length, and `contains`, `startsWith` and `endsWith` by the strings they read, at least 1 however
-  empty either is. A comparison, a search or a match that would cost more than a condition may fails
-  before it runs, as CEL charges a call only once it has run, and a program in which CEL plans one,
-  a literal, a key or a loop's condition where the package can't charge or refuse it isn't a
-  condition. What a check reads together is bounded where it is stored, for each
-  scope: an identity's conditional grants, the conditional grants to groups, the tenant's members
+  empty either is. A comparison is charged as it measures the values (`measured`), once, reading
+  both in step until the smaller is read whole and finding a double that isn't finite in the same
+  walk, before it runs: measured again at each doubling of how far it read, again for that search
+  and again for CEL's charge, comparing JSON nested 3,300 deep took twenty times what it was
+  charged. Reading a time in a zone loads the zone once for the process (`zones`), bounded at
+  `maxZones`, and finds a name names none once, the zone a literal names when the condition is
+  planned, and one an attribute names the first time a time is read in it, charged `zoneLoad`
+  more, before it loads, and refuses a name of none, as `tzdata.zi`, and `Local` and `localtime`,
+  before loading anything (`inZone`): loaded at each call, the zone `tzdata.zi` named took a
+  quarter of a second for a check. Where reading the platform's files failed, as once the process
+  ran out of file descriptors, it keeps nothing (`settled`), and a literal's zone isn't planned, so
+  the next check plans it again: kept, a real zone failed until the process dropped it. A
+  comparison, a search or a match that would cost more than a condition may fails before it runs,
+  as CEL charges a call only once it has run, and a program in which CEL plans one, a literal, a
+  key or a loop's condition where the package can't charge or refuse it isn't a condition. What a
+  check reads together is bounded where it is stored, for each scope: an identity's conditional
+  grants, the conditional grants to groups, the tenant's members
   and the public, each the tenant's and those from each source the host owns apart, the conditional
   denies, and the requirements of groups' eligibilities for a role, and a change adding a condition
   past one is refused as invalid. A check's budget is that for each scope on its path, so it
@@ -543,7 +576,8 @@ sequenceDiagram
   of scope the role's grants can be on (`changesStopped`, `changesDenied`), where a deny's condition
   reading the resource can't be evaluated and so denies (`handsOn`): stricter than `Apply` on a scope
   such a condition spares, as the grants span scopes no one reads, but never weaker, and only for a
-  deny below the tenant or a label is each scope read from the host. `ChangeMembers` asks the
+  deny below the tenant, a label, or a constraint on what `SetRole` hands on where it gives more
+  (`handedOnStopped`) is each scope read from the host. `ChangeMembers` asks the
   constraints once about each type of scope a member only loses access on, of no resource
   (`freezes`), and reads the types whose power to change grants a deny binding the actor lists
   (`grantsDenied`); only for a scope of a type either names, or whose label can refuse the actor, is
@@ -604,15 +638,30 @@ sequenceDiagram
   scope of the path, which conditions stored past their bound can spend on a shorter path alone. A
   grant to the tenant's members of a privileged role is read there as one to a principal named one
   by one (`widenedTo.reaches`): a catalog change that has the role no longer be privileged gives
-  them what it gives, what the redefinition added too, and asks no one. A scope read as stored, as
-  the host no longer has it, that the change comes to give more on while it waits refuses it with
+  them what it gives, what the redefinition added too, and asks no one. The constraints are decided
+  so too where a grant widens, or a role listing it is granted, on that scope, as `Apply` asks them
+  there, not only on the tenant, as `mayDefine` does: of each such scope as `Config.ResourceOf`
+  gives it, once, whatever they would answer of no resource, as one that tells resources apart can
+  answer nothing there, of the power to change grants there, which `changesStopped` asks only of no
+  resource, and of what the role gives where the grant reaches, as `Apply` walks it: on a resource,
+  for that resource's type alone, a `<type>:grant` of another type being a permission like any
+  other there, which only the constraints are asked about, as `mayDefine` decides holding it
+  (`handsOnAt`). Their answers are read back under the lock, where a scope it gives more on that
+  they weren't asked about refuses it with `ErrConflict` (`handedOnStopped`, `handing`). Without
+  `Config.ResourceOf`, a scope is asked about as stored where that is all of it (`resolves`), and
+  otherwise of no resource, which stands for every such scope. A scope where a role listing it is
+  granted counts only where its holders may grant it there: by a `<type>:grant` that role gives for
+  that type, on scopes of the type the grant reaches, as nothing reaches the tenant but itself
+  (`handingOn`). Each scope costs a `Config.ResourceOf` call and the walk `Apply` granting the role there
+  makes, as `ValidateGrant` is asked about each grant it widens. A scope read as stored, as the host
+  no longer has it, that the change comes to give more on while it waits refuses it with
   `ErrConflict`. A role's lists are compared sorted and without repeats (`canonical`), as one
   written around the package can hold them in any order, so renaming it is no redefinition, and
-  setting a role, deny or eligibility again as it is stored changes nothing (`canonicalSQL`). A role
-  lists in `GrantableRoles` only roles one of its `<type>:grant` permissions, on a type it is for,
-  lets its holders grant (`lets`), so `holdsRole` checks the actor's power to grant each. It keeps a
-  listing that already hands nothing on as stored, as once the role listed was narrowed, so renaming
-  it needs only the power to define it.
+  setting a role, deny or eligibility again as it is stored changes nothing (`canonicalSQL`). A
+  role lists in `GrantableRoles` only roles one of its `<type>:grant` permissions, on a type it is
+  for, lets its holders grant (`lets`), so `holdsRole` checks the actor's power to grant each. It
+  keeps a listing that already hands nothing on as stored, as once the role listed was narrowed, so
+  renaming it needs only the power to define it.
 - **Eligibilities.** `SetEligibility` lets a principal `Activate` a role for a while, perhaps
   only with approvers or a `requires` condition. An activation is a grant that ends no later than
   its eligibility expires, or its holder's membership or place in the group the eligibility names
@@ -774,20 +823,32 @@ flowchart TB
 
 ## Transactions and locks
 
-Changes take PostgreSQL advisory locks, keyed by the schema holding the tables, as every session
+Changes take PostgreSQL advisory locks, named by the schema holding the tables, as every session
 reaching them names it whatever its search_path, so two changes to the same rows run
-one after the other, each taking its locks in one order. A key gives the schema and the tenant
-each with its length, as either may hold `/`, so the locks of two tenants never meet. The locks
-last until the transaction ends, so under `WithTx` two host transactions changing the same scopes
-or principals in opposite orders can still deadlock, as can a change that also writes rows it
-doesn't lock: PostgreSQL fails one, which matches `ErrConflict`.
+one after the other, each taking its locks in one order. A name gives the schema and the tenant
+each with its length, as either may hold `/`, so no two locks have one name (`lockName`). A lock's
+key is the first 8 bytes of its name's SHA-256, computed in Go (`lockKey`), so the locks of two
+tenants meet only where a name is found whose key is another's: some 2^64 hashes to match one
+key, and 2^64/n to match any of n, which takes knowing their names. PostgreSQL's
+`hashtextextended`, which keyed them before, can be inverted: a tenant's admin could name a group,
+in a millisecond, whose lock was another tenant's own, and hold every change there back while
+changing it. A lock no id names, a tenant's own, its exclusive values', its nesting's or
+`Migrate`'s, takes its key as two int4 keys, which PostgreSQL holds apart from every bigint key,
+as a scope's or a principal's lock takes: no id an actor chooses reaches one, however the hash
+fares. The batch taking a change's locks reads the schema too, and names them by the schema the
+process's last locks were taken in, taking each only where its statement finds the tables there:
+unless each did, the change takes them all again by the schema the batch read first, a round trip
+more (`takeLocks`), so a schema renamed while the batch waits leaves none of the later ones
+untaken. The locks last until the transaction ends, so under `WithTx` two host transactions
+changing the same scopes or principals in opposite orders can still deadlock, as can a change that
+also writes rows it doesn't lock: PostgreSQL fails one, which matches `ErrConflict`.
 
 ```mermaid
 flowchart TB
-    excl["exclusive/tenant<br/>first, where a dimension is Exclusive"] --> tshared["tenant/tenant, shared<br/>every change but DeleteExpired, which takes none"]
-    tshared --> scope["scope/tenant/type:id, exclusive<br/>each scope a change writes"]
-    scope --> princ["principal/tenant/kind:id, exclusive<br/>each principal it names"]
-    texcl["tenant/tenant, exclusive<br/>SetRole, DeleteRole, DeleteTenant,<br/>and past 64 scopes and principals together"] -.->|"instead of the shared lock<br/>and the scope and principal locks"| tshared
+    excl["exclusive/tenant, two int4 keys<br/>first, where a dimension is Exclusive"] --> tshared["tenant/tenant, shared, two int4 keys<br/>every change but DeleteExpired, which takes none"]
+    tshared --> scope["scope/tenant/type:id, exclusive, a bigint key<br/>each scope a change writes, and in their order<br/>nesting/tenant, two int4 keys, where it nests or deletes groups"]
+    scope --> princ["principal/tenant/kind:id, exclusive, a bigint key<br/>each principal it names"]
+    texcl["tenant/tenant, exclusive, two int4 keys<br/>SetRole, DeleteRole, DeleteTenant,<br/>and past 64 scopes and principals together"] -.->|"instead of the shared lock<br/>and the scope and principal locks"| tshared
 ```
 
 - **READ COMMITTED.** A change runs at READ COMMITTED, as its checks under the locks must read what
@@ -901,7 +962,8 @@ flowchart TB
   seconds more over the 10 tries for each such table with the default `deadlock_timeout`. A wait for
   another replica's migration is bounded by the session's `lock_timeout` alone, and not tried again.
   On a host's transaction `Migrate` applies them all in one savepoint, with neither the bound nor
-  the tries, as rolling back to the savepoint frees nothing the host took before.
+  the tries, as rolling back to the savepoint frees nothing the host took before. The schema's lock
+  is named and keyed as a tenant's own is (above), by the schema it migrates.
 
 ```mermaid
 flowchart TB
@@ -1087,6 +1149,8 @@ refuses a row of more than 1 MiB as jsonb all the same.
 | `MaxPlacesInGroup` | 20 | Places in force of one principal in one group, each from another source. Those from each source the host owns count apart. |
 | `MaxGroupsOfPrincipal` | 1,000 | Groups one principal, an identity or a group, is in directly, by places in force. Those from each source the host owns count apart. A check reads every group its subject is in, and every group those are in, `MaxGroupDepth` deep, which this bounds only level by level (below). |
 | `MaxExpression` | 2,048 bytes | A condition's or requirement's expression. Its cost is bounded too. |
+| Time zones a process keeps | 1,024 | The zones conditions read times in, each loaded once, and the names found to name none, as requests can name a new one each time. Past it, one kept is dropped at random. |
+| A hook's copy | `2 × 80,000` units, as a check converts | What a constraint is given of the subject's or the resource's attributes, ancestors or label, and `ValidateGrant` of the actor's, each made once for a call. Past it the hook can't be asked, and the call is refused. |
 | What a check reads together | 80,000 units: hundreds of comparisons with literals, a hundred of an attribute with the subject's id, or three of the longest conditions that read a list or loop | The distinct conditions of an identity's conditional grants on a scope; of a scope's conditional grants to groups, the tenant's members and the public; each the tenant's and those from each source the host owns apart; of a scope's conditional denies; and the requirements of groups' eligibilities for a role on a scope. Each counts compiling it, 8 a byte, and the most evaluating it can cost, at most 10,000. On the tenant, one reading the action counts once for each label value it gives or denies. A check may spend this for each on each scope of its path. |
 | `MaxConditionBytes` | 32 KiB | The conditions one `Apply` or `Import` carries, each distinct one counted once. |
 | `MaxName`, `MaxDescription`, `MaxNote` | 128, 2,048, 2,048 characters | Names, titles and group ids, descriptions, and notes and justifications. |

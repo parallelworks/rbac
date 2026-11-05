@@ -128,27 +128,35 @@ scopes conditional ones reach, to check one by one.
   label of a scope its grants are on, as `Config.ResourceOf` gives it, refuses, or a deny on that
   scope's path keeps from changing grants there, can neither change what its grants give nor
   delete it, nor widen it where a deny there, or where a role listing it, or listing one that does,
-  is granted, removes a permission it would give or the power to grant it, or the label of a scope
-  such a role is granted on refuses it. A grant widens by what it gives through its principal, as
-  checks read it: one to the tenant's members of a privileged role, or to the public of a role not
-  marked `Public`, gives nothing, so widening the role asks nothing about it, and a redefinition
-  that has it give something, as narrowing the role so that it is no longer privileged does, widens
-  it, with what was added to the role while it gave nothing; where the role gives more to whomever
-  it is granted, each grant giving anything through its principal widens, whatever its scope takes
-  of what was added. A deny where the tenant's members hold a privileged role still stops widening
-  it, as a catalog change that has the role no longer be privileged gives them what it gives then,
-  and asks no one. Renaming a role or rewriting its description changes no grant, so needs only the
-  power to define it, however its lists are stored: a role, deny or eligibility is the same in any
-  order of its lists, and however often one names an entry, as one written around the package, by a
-  seed or a restore, can hold them, so setting it again as it is read changes nothing. A role lists
-  in `GrantableRoles` only roles that a `<type>:grant` it gives, on a type it is for, lets its
-  holders grant, as roles that can be granted on that type, or it is refused as invalid: a listing
-  none of them reaches would hand nothing on, and the actor's power to grant the role would go
-  unchecked. One the role already lists so as it is stored, as once the role listed is narrowed or
-  the catalog changes, it keeps, so renaming it still needs only the power to define it; one a
-  change adds, or leaves handing nothing on by changing the role, is refused, and dropping one needs
-  no power over the role listed. A listing, handing anything on or not, keeps the role listed from
-  being deleted.
+  is granted where its holders may then grant it, removes a permission it would give or the power
+  to grant it, or a constraint does on that scope, as it would stop `Apply` granting the role
+  there, though defining the role asks it of the tenant, or the label of a scope such a role is
+  granted on refuses it. The constraints are asked about each such scope once, as
+  `Config.ResourceOf` gives it, never of no resource alone, which a constraint that tells resources
+  apart can answer with nothing, about what `Apply` granting the role there asks: the power to
+  change grants there, and what the role gives, on a resource for that resource's type alone;
+  without `Config.ResourceOf`, about each scope as stored where that is all of it, and otherwise of
+  no resource, which then stands for every such scope, so a constraint answering false of no
+  resource doesn't stop it there (see Host policy). A grant widens by what
+  it gives through its principal, as checks read it: one to the tenant's members of a privileged
+  role, or to the public of a role not marked `Public`, gives nothing, so widening the role asks
+  nothing about it, and a redefinition that has it give something, as narrowing the role so that it
+  is no longer privileged does, widens it, with what was added to the role while it gave nothing;
+  where the role gives more to whomever it is granted, each grant giving anything through its
+  principal widens, whatever its scope takes of what was added. A deny where the tenant's members
+  hold a privileged role still stops widening it, as a catalog change that has the role no longer be
+  privileged gives them what it gives then, and asks no one. Renaming a role or rewriting its
+  description changes no grant, so needs only the power to define it, however its lists are stored:
+  a role, deny or eligibility is the same in any order of its lists, and however often one names an
+  entry, as one written around the package, by a seed or a restore, can hold them, so setting it
+  again as it is read changes nothing. A role lists in `GrantableRoles` only roles that a
+  `<type>:grant` it gives, on a type it is for, lets its holders grant, as roles that can be granted
+  on that type, or it is refused as invalid: a listing none of them reaches would hand nothing on,
+  and the actor's power to grant the role would go unchecked. One the role already lists so as it is
+  stored, as once the role listed is narrowed or the catalog changes, it keeps, so renaming it still
+  needs only the power to define it; one a change adds, or leaves handing nothing on by changing the
+  role, is refused, and dropping one needs no power over the role listed. A listing, handing
+  anything on or not, keeps the role listed from being deleted.
   `DeleteRole` removes one with its grants; `Roles` lists the built-in and custom roles a scope type
   takes. Custom roles follow the catalog: one gives only what the catalog still has, and is
   privileged when it gives what only privileged roles do, or changes access.
@@ -232,7 +240,13 @@ scopes conditional ones reach, to check one by one.
   is one no one can read, as data that joins two parties is.
 - **Conditions:** a grant can carry a CEL expression over the subject's, the resource's and the
   request's attributes (`Subject.Attributes`, `Resource.Attributes`, `rbac.WithRequest`), the time
-  and the action. It gives its role only where the expression holds; one that fails is false.
+  and the action. It gives its role only where the expression holds; one that fails is false. The
+  time is the host's clock (`Config.Now`) in UTC, whatever zone it returns times in, and so is a
+  `time.Time` the host passes: `string()` writes a time in its own zone, so `string(request.time)`
+  compared with a literal decided by the zone each replica runs in. `string()` of a time the host
+  passes in another zone, or of one computed from it, wrote it in that zone before, so a stored
+  condition comparing that with text written at the zone's offset no longer holds; comparing
+  times, and reading their parts, decide as before.
   `Config.Attributes` declares the attributes and their types, so a condition reading one
   misnamed, or as another type, is refused when stored, and one stored under other declarations
   fails where it no longer passes them. A condition building a message, as
@@ -241,7 +255,7 @@ scopes conditional ones reach, to check one by one.
   a condition is read, the subject's and the request's once for each call, however many scopes a
   change checks, and the resource's once for each check, and conditions read nothing else: `nil`; a
   `bool`, a string, an int, a uint or a float of any size, of a type of the host's own too, as a
-  named string, read by its kind; `time.Time` and `time.Duration`; bytes, as `[]byte` or an array
+  named string, read by its kind; `time.Time`, in UTC, and `time.Duration`; bytes, as `[]byte` or an array
   of bytes; slices, arrays and pointers of these, a nil pointer read as null; maps of these keyed by a bool, a
   string, an int or a uint, or by an interface holding one; JSON text (`json.RawMessage`, a nil
   one read as null, as `encoding/json` writes it) and `json.Number`, parsed; the protobuf `Struct`, `ListValue`, `Value`, `NullValue`, wrappers,
@@ -286,10 +300,24 @@ scopes conditional ones reach, to check one by one.
   `startsWith` and `endsWith` what reading
   the shorter does, at least 1 however short or empty either is, and one costing more than a
   condition may fails before it runs: `contains` of one long string the request passes in another
-  tries each place in it, which can take a third of a second. Cost is bounded per check too, for
-  each scope on its path, and the conditions a check reads together are bounded where they are
-  stored: an identity's grants' on a scope, those of a scope's grants to groups, the tenant's
-  members and the public, each the tenant's and those from each source the host owns apart, a
+  tries each place in it, which can take a third of a second. A comparison costs reading the
+  smaller value, read once, in step with the other, and charged before it runs: measured again
+  for each doubling of how far it read, again in search of a double that isn't finite and again
+  for CEL's charge, comparing JSON nested 3,300 deep took twenty times what its cost implied.
+  Reading a time in a zone costs 100, and 500 more where an attribute names the zone: each process
+  loads a zone, or finds a name names none, once, the zone a literal names when the condition is
+  planned, and refuses, before loading anything, a name holding a byte no zone's name does, as
+  `tzdata.zi`'s dot, and `Local` and `localtime`, the zone the process runs in. Loaded at each
+  call, a check of conditions reading the hour in `tzdata.zi`, a file kept beside the zones, took a
+  quarter of a second, and a request can name a new zone each time. The process keeps at most 1,024
+  zones and names of none, dropping one at random past that, and a zone whose files change after
+  it loaded it reads as it was until it is dropped; but where reading the files failed, as once
+  the process ran out of file descriptors, it keeps nothing, and a condition naming the zone
+  fails until they can be read, where kept it failed until the process dropped it. Cost is
+  bounded per check too, for each scope on its path, and the conditions a check reads together
+  are bounded where they are stored: an identity's grants' on a scope, those of a scope's grants
+  to groups, the tenant's members and the public, each the tenant's and those from each source
+  the host owns apart, a
   scope's denies',
   and the requirements of groups' eligibilities for a role on a scope. Each holds hundreds of
   comparisons with literals, a hundred of an attribute with the subject's id, or three of the
@@ -308,7 +336,9 @@ scopes conditional ones reach, to check one by one.
   step of a loop at all a condition may cost, past which it fails: a grant's gives nothing and a
   deny's applies. A step of `all`, `exists`, `exists_one`, `filter` or a `map` that filters costs
   1 more for the operator its macro evaluates, so one looping over a list the request passes, which
-  cost nearly all a condition may, can now cost more, and fails the same way. Going back to an
+  cost nearly all a condition may, can now cost more, and fails the same way. One reading a time in
+  a zone an attribute names is bounded 500 higher than before loading it was charged, so a scope's
+  conditions that read many may be past a bound as an upgrade leaves them. Going back to an
   earlier release of this package does the same where that release bounds a shape more, so while
   replicas of two releases run side by side, those
   bounding a shape more may refuse changes adding a condition to a scope the others filled. To
@@ -353,7 +383,14 @@ scopes conditional ones reach, to check one by one.
   the actor and how it is made, so the host decides who may hold what: members only, no
   privileged roles for service accounts or guests. `Config.Constraints` remove permissions above
   anything a tenant grants or denies, seeing copies of the subject and the resource, such as
-  freezing changes under a container. What one removes from an actor the actor can't hand on, but for a
+  freezing changes under a container. Each constraint is given copies of its own, made the first
+  time a call asks it about each and given it again whenever the call asks about the same, as
+  `Permissions` does for each permission and a check of a labeled resource for each value its label
+  asks for, so one writing to its copy reads its write later in the call, and nothing else does;
+  copied for each ask, `Permissions` of 300 permissions on a resource of 20,000 tags took a second.
+  `ValidateGrant` is given its copy of the actor's attributes once for a call too. A copy holds no
+  more than a check converts, counted alike: where the attributes hold more, the hook can't be
+  asked, and the call is refused as `ErrDenied`. What one removes from an actor the actor can't hand on, but for a
   role a role it holds lists in `GrantableRoles`, which it grants without holding. A freeze stops
   every change an actor makes to grants under it, and every change taking access away there: one
   removing `<type>:grant` from the actor, or a deny on the path doing so, stops `Apply` granting and
@@ -369,10 +406,20 @@ scopes conditional ones reach, to check one by one.
   or a grant of its own gives the same is stopped too, as `Apply` revoking a grant held twice is,
   and so is one ending only an eligibility, as `DeleteEligibility` there is; but a place that ends
   while another, from another source, keeps the member in its group as long ends nothing there.
-  `SetRole` and `DeleteRole` decide a constraint, and a deny on the tenant, once for every scope of a
-  type the role's grants can be on, as of no resource and on the tenant, where a condition reading
-  the resource can't be evaluated and so denies: a role's grants span scopes no one reads, so they
-  are stopped wherever either may stop `Apply` on some scope of the type, not only on those it would.
+  `SetRole` and `DeleteRole` decide a constraint on changing grants, and a deny on the tenant, once
+  for every scope of a type the role's grants can be on, as of no resource and on the tenant, where a
+  condition reading the resource can't be evaluated and so denies: a role's grants span scopes no one
+  reads, so they are stopped wherever either may stop `Apply` on some scope of the type, not only on
+  those it would. So a constraint asked of no resource (`ConstraintInput.Resource` nil) must answer
+  true if it removes the permission on any scope of the type, as `ConstraintInput` says. One that
+  answers false there, as one written for resources alone and guarded against a nil `Resource`
+  does, isn't asked about the scopes themselves by `DeleteRole` or by `SetRole` narrowing a role,
+  nor by `ChangeMembers` and `DeleteGroup` taking access away unless a label, a deny or another
+  constraint has them read the scope, so as a freeze it doesn't stop them, though it stops `Apply`
+  revoking there; nor, without `Config.ResourceOf`, by `SetRole` widening a role granted on a scope
+  it can't read whole, so it doesn't stop it handing on there what it removes. With it, `SetRole`
+  asks about each scope a widening gives more on as `Apply` granting the role there asks, whatever
+  the constraints answer of no resource.
   The host's own writes (`Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`,
   `ImportMembers`, `DeleteMembers`, `DeleteGroups` and the host's deletes) make none of the checks
   an actor's change makes, so a freeze stops none of them, `ImportGroups` taking a tenant's group
@@ -835,6 +882,14 @@ against, and nothing such a table runs, as its row security policy, runs as hist
   What a rollback doesn't undo stayed, as setting history's id sequence back, after which a row's
   later records are numbered below its earlier ones, and `AsOf` reads it as it was before them. It
   now refuses before it reads a table, or calls a function or an operator its search_path finds.
+  Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
+  rolling upgrade across the two is unsafe: they key every lock apart, so a change by one waits for
+  none by the other, and what each checks under its locks can change before it commits, as two
+  changes each giving an identity one value of an Exclusive dimension can both commit. Stop every
+  replica running the earlier code before starting any running the later, and don't start one of
+  the earlier again: no migration records the change, so nothing refuses it. `Migrate`'s own lock
+  is keyed anew too, so a replica of each doesn't wait for the other's migration, which matters only
+  where the two run at once.
 - **Renaming the schema:** from `0023_history_schema` on, `ALTER SCHEMA ... RENAME` keeps history:
   its triggers find it beside the table each fires on, whatever the schema is named, and a
   generation names the schema by its OID, so exports read on from their cursors and checkpoints.

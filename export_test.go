@@ -813,6 +813,15 @@ var StandSQL = standSQL
 // Conflicted is err as an exported call returns it: matching ErrConflict where it holds a race.
 var Conflicted = conflicted
 
+// LockKey is the key of a tenant's lock of a kind on key, in the tables of schema, as a change
+// takes it: a lock on no key takes its 64 bits as two int4 keys, high and low.
+func LockKey(schema, kind, tenant, key string) int64 {
+	return lockKey(lockName(schema, kind, tenant, key))
+}
+
+// Lock takes a change's locks in tx: its tenant's shared, then each of its scopes' and principals'.
+var Lock = lock
+
 // HoldSQL is the statement Activate holds the places it rests on and reads its subject's paths
 // with: tenant $1, the identity's key $2, now $3, until $4.
 var HoldSQL = holdSQL
@@ -825,8 +834,94 @@ var RestsSQL = restsSQL
 // tenant $1, the identity's key $2, now $3.
 var EndsSQL = `WITH RECURSIVE ` + endsSQL("$2::text", "$3") + ` SELECT k, e FROM ends`
 
-// DeepCopy is the copy of attributes each hook is given.
-func DeepCopy(attributes map[string]any) map[string]any { return deepCopy(attributes) }
+// DeepCopy is the copy of attributes each hook is given, nil where they can't be copied (Copies).
+func DeepCopy(attributes map[string]any) map[string]any {
+	copied, _ := deepCopy(attributes)
+	return copied
+}
+
+// Copies reports whether attributes can be copied for a hook, within what a check converts.
+func Copies(attributes map[string]any) bool {
+	_, ok := deepCopy(attributes)
+	return ok
+}
+
+// CopyAllocates is how many bytes copying attributes for a hook allocates.
+func CopyAllocates(attributes map[string]any) uint64 {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	deepCopy(attributes)
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+// CountZoneLoads counts the time zones conditions load, until t ends.
+func CountZoneLoads(t *testing.T) *int {
+	t.Helper()
+	old, n := loadingZone, new(int)
+	loadingZone = func() { *n++ }
+	t.Cleanup(func() { loadingZone = old })
+	return n
+}
+
+// LoadZones loads each zone named, or finds it names none, as a condition reading a time in it does
+// where the process hasn't, and returns how many zones the process keeps.
+func LoadZones(names []string) int {
+	for _, name := range names {
+		loadZone(name)
+	}
+	zones.RLock()
+	defer zones.RUnlock()
+	return len(zones.byName)
+}
+
+// ForgetZones drops the zones named from those the process keeps.
+func ForgetZones(names ...string) {
+	zones.Lock()
+	defer zones.Unlock()
+	for _, name := range names {
+		delete(zones.byName, name)
+	}
+}
+
+// FailZoneLoads makes loading a time zone fail with err, until the func it returns is called or t
+// ends.
+func FailZoneLoads(t *testing.T, err error) (restore func()) {
+	t.Helper()
+	old := locating
+	locating = func(string) (*time.Location, error) { return nil, err }
+	restore = func() { locating = old }
+	t.Cleanup(restore)
+	return restore
+}
+
+// MaxZones is how many time zones the process keeps loaded.
+const MaxZones = maxZones
+
+// ZoneLoad is what loading a time zone costs a condition.
+const ZoneLoad = zoneLoad
+
+// CountCopies counts the copies made of what the host passes for its hooks, until t ends.
+func CountCopies(t *testing.T) *int {
+	t.Helper()
+	old, n := copying, new(int)
+	copying = func() { *n++ }
+	t.Cleanup(func() { copying = old })
+	return n
+}
+
+// CopiedInOneCall is what one call gives a hook of each of n values made by fresh, asked about one
+// after another, each dropped and the garbage collected before the next is made.
+func CopiedInOneCall(n int, fresh func(i int) map[string]any) []map[string]any {
+	a := (&Authorizer{}).still()
+	copies := make([]map[string]any, n)
+	for i := range n {
+		copies[i], _ = copiedFor(a, 0, fresh(i))
+		runtime.GC()
+	}
+	return copies
+}
 
 // Compiled is how many conditions a keeps compiled for checks.
 func Compiled(a *Authorizer) int {
@@ -1238,7 +1333,7 @@ func PlanGuardedOtherwise(t *testing.T, expr string, replan func(interpreter.Int
 		t.Fatal(err)
 	}
 	checked, patterns := compiled(t, c, expr)
-	ids := newGuards(checked.NativeRep()).ids
+	ids := newGuards(checked.NativeRep(), maxCost).ids
 	if len(ids) == 0 {
 		t.Fatalf("%s makes no call refused before it runs", expr)
 	}

@@ -13,6 +13,8 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"cel.dev/cel-go/cel"
 	"cel.dev/cel-go/common/ast"
@@ -51,7 +53,12 @@ import (
 // description has an expression. A pattern it matches is a string literal, of bounded size; it
 // nests at most 32 deep; it builds no message, as `google.protobuf.Struct{}`; and a comparison, or
 // a search of a list, that would read more than a condition may spend, or reading a time in a zone
-// whose name is longer than 64 bytes, fails before it runs.
+// whose name is longer than 64 bytes, holds a byte no zone's name does, as tzdata.zi's dot, or is
+// Local, the zone the process runs in, or localtime, fails before it runs. request.time is the
+// host's clock (Config.Now) in UTC, and a time the host passes is read in UTC too (Attributes), so
+// string() of one writes the same in every replica, whatever zone each runs in. It wrote a time the
+// host passed in the time's own zone before, so a condition comparing that with text written at the
+// zone's offset no longer holds; comparing times, and reading their parts, decide as before.
 //
 // Each condition runs within the most evaluating it can cost, which its literals and types bound:
 // little for one comparing what a request passes with literals, or with the subject's kind or id,
@@ -63,32 +70,38 @@ import (
 // it takes. A list or map literal costs 1 more for each element, or 2 for each entry, each time it
 // is built, and contains, startsWith and endsWith cost reading what they search, at least 1 however
 // short either string is, and fail before they run where they would cost more than a condition may.
-// What a check may spend on conditions is
-// bounded, for each scope on its path, and so are the conditions stored, so that a check evaluates
-// whole every one it reads: those of an identity's grants on a scope cost at most so much together,
-// and those of a scope's grants to groups, the tenant's members and the public, which reach many,
-// as much again, those from each source the host owns (Config.Sources) apart from the rest; those
-// of a scope's denies (SetDeny); and the requirements of the eligibilities of groups for a role on
-// a scope. Each distinct condition counts once, as what compiling it and the most evaluating it can
-// cost: hundreds of comparisons with literals, a hundred of an attribute with the subject's id, or
-// three of the longest that read a list or loop. A check of a labeled resource decides each value
-// its label asks for, and Holding, Filter and Reachable each of the subject's label values, as a
-// check of it would, evaluating a condition that doesn't read the action once for them all, so on
-// the tenant one that does counts once for each label value its grants give or its denies deny. A
+// A comparison costs reading the smaller value, charged as it is read, once, before it runs.
+// Reading a time in a zone costs 100, and 500 more where an attribute names the zone, as the
+// process loads each zone once, and finds a name names none once: the zone a literal names when the
+// condition is planned, and one an attribute names the first time a time is read in it, which a
+// request can make a new one each time; but where reading the platform's files failed, as once the
+// process ran out of file descriptors, it keeps nothing and loads the zone again the next time.
+// What a check may spend on conditions is bounded, for each scope on its path, and so are the
+// conditions stored, so that a check evaluates whole every one it reads: those of an identity's
+// grants on a scope cost at most so much together, and those of a scope's grants to groups, the
+// tenant's members and the public, which reach many, as much again, those from each source the
+// host owns (Config.Sources) apart from the rest; those of a scope's denies (SetDeny); and the
+// requirements of the eligibilities of groups for a role on a scope. Each distinct condition counts
+// once, as what compiling it and the most evaluating it can cost:
+// hundreds of comparisons with literals, a hundred of an attribute with the subject's id, or three
+// of the longest that read a list or loop. A check of a labeled resource decides each value its
+// label asks for, and Holding, Filter and Reachable each of the subject's label values, as a check
+// of it would, evaluating a condition that doesn't read the action once for them all, so on the
+// tenant one that does counts once for each label value its grants give or its denies deny. A
 // change checking the labels of many scopes by one read of its actor's values decides each value
 // once, when a label first asks for it, and evaluates such a condition once for all of them in each
 // of its phases: each value is still decided on a budget of its own, which pays for every condition
 // it reads, whether it ran it or a value before it did, so it decides as a check of it would. A
 // change adding a condition past a bound, or one evaluated more, as by redefining a role to give
 // more label values (SetRole), is refused as invalid, so no grant, deny or eligibility stored
-// changes what the others decide, but one adding none isn't: conditions
-// stored past a bound before there were bounds can be rewritten in place, as by a restore over the
-// rows still stored, though restored where those are gone, they are added, and refused. An upgrade
-// of CEL, or of this package where it bounds a shape more, can leave conditions stored past a bound
-// in the same way: each process bounds a condition by what it and the CEL it is built with make of
-// it, its macros and types, and another version may bound one stored more. A check may not reach
-// all of those, or of those of a role a catalog change widened since: it evaluates the cheapest
-// first, and past its budget a grant's condition is false and a deny's applies.
+// changes what the others decide, but one adding none isn't: conditions stored past a bound before
+// there were bounds can be rewritten in place, as by a restore over the rows still stored, though
+// restored where those are gone, they are added, and refused. An upgrade of CEL, or of this package
+// where it bounds a shape more, can leave conditions stored past a bound in the same way: each
+// process bounds a condition by what it and the CEL it is built with make of it, its macros and
+// types, and another version may bound one stored more. A check may not reach all of those, or of
+// those of a role a catalog change widened since: it evaluates the cheapest first, and past its
+// budget a grant's condition is false and a deny's applies.
 //
 // Searches (Filter, Reachable, Holders) can't evaluate one: Filter and Reachable count only
 // unconditional grants, Filter counts a conditional deny as denying, and Reach.Conditional and
@@ -113,11 +126,16 @@ const (
 	// hold gigabytes. maxLimits bounds the limits kept so.
 	maxCached = 256 << 10
 	maxLimits = 2 << 20
-	// zoneCost is what reading a time in a named zone costs: it loads the zone each time, copying
-	// its name for each place it looks, so a zone is at most maxZone bytes, more than the longest
-	// name a time zone has.
+	// zoneCost is what reading a time in a named zone costs once the process has loaded the zone
+	// (zones), and zoneLoad what loading one costs more, about what loading one from the platform's
+	// zone files takes, or finding a name names none, which looks in four places: thirty
+	// microseconds. Loading copies the name for each place it looks, so a zone is at most maxZone
+	// bytes, more than the longest name a time zone has. maxZones bounds the zones the process keeps
+	// loaded, and the names it found name none: the time zone database names about six hundred.
 	zoneCost = 100
+	zoneLoad = 500
 	maxZone  = 64
+	maxZones = 1024
 	// maxCheckCost is what the conditions a check reads cost together where they are bounded: an
 	// identity's grants on a scope, a scope's grants that reach many, each the tenant's and from
 	// each source the host owns, its denies, and the requirements of groups' eligibilities for a
@@ -427,7 +445,7 @@ func (c *conditions) build(expr string) (program, error) {
 // have, as a test plans a loop as another version of CEL may.
 func plan(env *cel.Env, checked *cel.Ast, patterns map[string]uint64, limit uint64, before ...cel.ProgramOption) (cel.Program, error) {
 	s, k := newStepping(checked.NativeRep(), limit), newKeying(env, checked.NativeRep(), limit)
-	l, str, g := newLiterals(checked.NativeRep(), limit), &stringing{env: env}, newGuards(checked.NativeRep())
+	l, str, g := newLiterals(checked.NativeRep(), limit), &stringing{env: env}, newGuards(checked.NativeRep(), limit)
 	prg, err := env.Program(checked, slices.Concat(before, []cel.ProgramOption{
 		cel.CostLimit(limit), cel.CostTracking(costs{patterns}), cel.OptimizeRegex(matching(patterns, g)),
 		cel.CustomDecorator(g.bounded), cel.CustomDecorator(str.decorate), cel.CustomDecoratorV2(s.decorate),
@@ -506,7 +524,7 @@ func (c costs) CallCost(function, _ string, args []ref.Val, _ ref.Val) *uint64 {
 		if len(args) != 2 {
 			return nil
 		}
-		n += comparing(function, args[0], args[1])
+		// 1, as what it reads is charged as bounded measures it, before it runs.
 	case operators.Add, overloads.Size, overloads.TypeConvertInt, overloads.TypeConvertUint, overloads.TypeConvertDouble,
 		overloads.TypeConvertBool, overloads.TypeConvertString, overloads.TypeConvertBytes,
 		overloads.TypeConvertTimestamp, overloads.TypeConvertDuration:
@@ -848,8 +866,12 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 			own = min(xs[0].text, xs[1].text)
 		}
 	default:
+		// Loading the zone, as inZone charges it, where no literal names it.
 		if timePart(fn) && len(xs) >= 2 {
 			own = zoneCost
+			if !namedZone(args[1]) {
+				own += zoneLoad
+			}
 		}
 	}
 	return cost.SafeAdd(n, own), x
@@ -894,31 +916,25 @@ func searchCost(function string, args []ref.Val) uint64 {
 	return min(x, y)
 }
 
-// comparing is what comparing x with y, or finding x in y, reads, counted no further than past
-// maxCost. Comparing stops at the smaller value; a map finds a key without reading the rest.
-func comparing(function string, x, y ref.Val) uint64 {
-	if function != operators.In {
-		return smaller(x, y, maxCost)
-	}
-	if _, isMap := y.(traits.Mapper); isMap {
-		return valueSize(x, maxCost)
-	}
-	return valueSize(y, maxCost)
-}
-
 // bounded refuses, before running it, a comparison or a search in a list that would read more than
 // a condition may: one call reads it all, and a call's cost is counted only once it has run, so a
 // list a condition doubles cheaply would otherwise hold a check for as long as walking it takes.
-// It refuses a comparison of a value holding a double that isn't finite too (holdsNonFinite), a
-// time read in a zone of more than maxZone bytes (inZone), and a search of a string that would
-// cost more than a condition may (searched).
-func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
+// It charges what a comparison reads as it measures it (measured), before the comparison runs,
+// beside the steps (counting), so it reads the values once to measure them, however large, where
+// measuring them again for CEL's charge, and again in search of a double that isn't finite, read
+// them about ten times for each unit charged. It refuses a comparison of a value holding such a
+// double too, a time read in a zone that can't be one (inZone), and a search of a string that would
+// cost more than a condition may (searched). It notes each call it plans so.
+func (g *guards) bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 	call, ok := i.(interpreter.InterpretableCall)
 	if !ok || !guarded(call.Function(), len(call.Args())) {
 		return i, nil
 	}
+	if g.ids[call.ID()] {
+		g.planned[call.ID()] = true
+	}
 	if timePart(call.Function()) {
-		return inZone(call), nil
+		return g.inZone(call)
 	}
 	if search := searchOf(call.Function()); search != nil {
 		return searched(call, search), nil
@@ -952,23 +968,45 @@ func bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
 	default:
 		return i, nil
 	}
-	function := call.Function()
-	return interpreter.NewCall(call.ID(), function, call.OverloadID(), call.Args(), func(args ...ref.Val) ref.Val {
+	function, limit := call.Function(), g.limit
+	return &charged{InterpretableCall: call, run: func(vars interpreter.Activation, args []ref.Val) ref.Val {
 		if len(args) != 2 {
 			return types.NoSuchOverloadErr()
 		}
-		n := comparing(function, args[0], args[1])
+		n, nonFinite := measured(function, args[0], args[1])
+		// Past what a condition may cost, this cancels the evaluation, which then costs its limit.
+		chargePast(vars, n, limit)
 		if n > maxCost {
 			return types.NewErr("rbac: comparing values this large costs more than a condition may")
 		}
-		// `in` finds a key in a map by hashing it, which reads none of the map's other keys.
-		_, keyed := args[1].(traits.Mapper)
-		if holdsNonFinite(args[0], n) || (function != operators.In || !keyed) && holdsNonFinite(args[1], n) {
+		if nonFinite {
 			return incomparable()
 		}
 		return op(args[0], args[1], n)
-	}), nil
+	}}, nil
 }
+
+// charged is a call bounded plans, run on what the condition evaluating it reads, so it can charge
+// what it reads before it runs (chargePast), as CEL charges a call only once it has run. CEL still
+// charges it as the call it is.
+type charged struct {
+	interpreter.InterpretableCall
+	run func(vars interpreter.Activation, args []ref.Val) ref.Val
+}
+
+// Exec evaluates the arguments as CEL runs a call, a failing one failing it before the rest.
+func (c *charged) Exec(frame *interpreter.ExecutionFrame) ref.Val {
+	planned := c.Args()
+	args := make([]ref.Val, len(planned))
+	for i, a := range planned {
+		if args[i] = a.Exec(frame); types.IsUnknownOrError(args[i]) {
+			return args[i]
+		}
+	}
+	return types.LabelErrNode(c.ID(), c.run(frame, args))
+}
+
+func (c *charged) Eval(vars interpreter.Activation) ref.Val { return c.Exec(interpreter.AsFrame(vars)) }
 
 // guarded reports whether bounded plans a call of function with args arguments to fail before it
 // runs: a comparison, a search of a list or a string, or reading a part of a time in a zone.
@@ -985,50 +1023,191 @@ func guarded(function string, args int) bool {
 // and planned those each planned so: another version of CEL may plan one where neither sees it, as
 // a call by another name, which would run whole before it is charged, however long, or compare a
 // double that isn't finite as CEL does, so plan refuses it, as it refuses a loop it can't bound.
-type guards struct{ ids, planned map[int64]bool }
+// literalZones are those of the calls reading a time in a zone a literal names, which worst charges
+// no load of (inZone), and limit is the condition's, which what bounded charges takes it past, as a
+// step does.
+type guards struct {
+	ids, planned, literalZones map[int64]bool
+	limit                      uint64
+}
 
-func newGuards(checked *ast.AST) *guards {
-	g := &guards{ids: map[int64]bool{}, planned: map[int64]bool{}}
+func newGuards(checked *ast.AST, limit uint64) *guards {
+	g := &guards{ids: map[int64]bool{}, planned: map[int64]bool{}, literalZones: map[int64]bool{}, limit: limit}
 	for _, e := range ast.MatchDescendants(ast.NavigateAST(checked), ast.KindMatcher(ast.CallKind)) {
 		call := e.AsCall()
 		// A method's target is its first argument when it runs.
-		args := len(call.Args())
+		args := call.Args()
 		if call.IsMemberFunction() {
-			args++
+			args = append([]ast.Expr{call.Target()}, args...)
 		}
-		if guarded(call.FunctionName(), args) || call.FunctionName() == overloads.Matches {
+		if guarded(call.FunctionName(), len(args)) || call.FunctionName() == overloads.Matches {
 			g.ids[e.ID()] = true
+		}
+		if timePart(call.FunctionName()) && len(args) == 2 && namedZone(args[1]) {
+			g.literalZones[e.ID()] = true
 		}
 	}
 	return g
 }
 
-// bounded is bounded, noting each call it plans to fail before it runs.
-func (g *guards) bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
-	if call, ok := i.(interpreter.InterpretableCall); ok && g.ids[call.ID()] && guarded(call.Function(), len(call.Args())) {
-		g.planned[call.ID()] = true
+// namedZone reports whether e, the zone a time is read in, is a string literal, which a condition is
+// planned with the zone it names loaded (inZone).
+func namedZone(e ast.Expr) bool {
+	if e.Kind() != ast.LiteralKind {
+		return false
 	}
-	return bounded(i)
+	_, ok := e.AsLiteral().(types.String)
+	return ok
 }
 
-// inZone is call, reading a part of a time in a zone, failing before it runs for a zone of more
-// than maxZone bytes: loading one copies its name for each place it looks, which zoneCost doesn't
-// count however long it is. It reads the time as CEL does.
-func inZone(call interpreter.InterpretableCall) interpreter.InterpretableCall {
-	function, overload := call.Function(), call.OverloadID()
-	return interpreter.NewCall(call.ID(), function, overload, call.Args(), func(args ...ref.Val) ref.Val {
+// zone is a time zone a condition reads times in, loaded, or why its name names none.
+type zone struct {
+	loc *time.Location
+	err error
+}
+
+// zones are the time zones conditions read times in, by name, each loaded once for the process, and
+// so the names that name none too: CEL loads a zone from the platform's files each time it reads a
+// time in one, which took ten microseconds for a zone and thirty for a name of none, and for a name
+// of a file there that isn't one, as tzdata.zi, it read the file's 107 KB, failed to parse it and
+// searched the other places, over a hundred microseconds, each charged zoneCost. Bounded, as
+// requests name them: past maxZones, one kept is dropped at random for the next, as a program is
+// (conditions.compile). A zone the platform's files change after the process loaded it reads as it
+// was until the process drops it, as the zone the process runs in does.
+var zones = struct {
+	sync.RWMutex
+	byName map[string]zone
+}{byName: map[string]zone{}}
+
+// keptZone is the zone named, and whether the process has loaded it.
+func keptZone(name string) (zone, bool) {
+	zones.RLock()
+	defer zones.RUnlock()
+	z, ok := zones.byName[name]
+	return z, ok
+}
+
+// loadZone loads the zone named, or finds it names none, and keeps what it found, but where the
+// platform's files failed to give it for a while (settled).
+func loadZone(name string) zone {
+	loadingZone()
+	var z zone
+	z.loc, z.err = locating(name)
+	if !settled(z.err) {
+		return z
+	}
+	zones.Lock()
+	defer zones.Unlock()
+	for k := range zones.byName {
+		if len(zones.byName) < maxZones {
+			break
+		}
+		delete(zones.byName, k)
+	}
+	zones.byName[name] = z
+	return z
+}
+
+// settled reports whether loading a zone that failed with err would fail again, as for a name of no
+// zone, of a file that isn't one or of a directory: not where reading the platform's files failed,
+// as once the process has run out of file descriptors, which kept would fail a real zone for the
+// process until it was dropped.
+func settled(err error) bool {
+	var errno syscall.Errno
+	return err == nil || !errors.As(err, &errno) || errno == syscall.EISDIR || errno == syscall.ENOTDIR
+}
+
+// locating loads a time zone from the platform's files, as a test's stand-in for them.
+var locating = time.LoadLocation
+
+// zoneName refuses a name of no zone, before one is loaded: one of more than maxZone bytes, which
+// loading copies for each place it looks; one holding a byte other than a letter, a digit, '/', '_',
+// '-' or '+', as no name in the time zone database does, so no other file kept beside them, as
+// tzdata.zi, is read as one; and Local, the zone the process runs in, by which a condition would
+// decide by where each replica runs, and localtime, which some platforms keep beside the zones as a
+// link to the one the process runs in.
+func zoneName(name string) error {
+	if len(name) > maxZone {
+		return fmt.Errorf("rbac: a time zone is at most %d bytes", maxZone)
+	}
+	if name == "Local" || name == "localtime" {
+		return errors.New("rbac: a time zone is named, not the one the process runs in")
+	}
+	for i := range len(name) {
+		switch b := name[i]; {
+		case 'a' <= b && b <= 'z', 'A' <= b && b <= 'Z', '0' <= b && b <= '9', b == '/', b == '_', b == '-', b == '+':
+		default:
+			return fmt.Errorf("rbac: %q names no time zone", name)
+		}
+	}
+	return nil
+}
+
+// inZone is call, reading a part of a time in a zone, as CEL reads it, but for loading each zone
+// once for the process (zones), and refusing a name of none before loading anything (zoneName).
+// Loading one no condition loaded before costs zoneLoad past what CEL charges, before it loads
+// (chargePast), as a zone a request passes can be a new one each time. The zone a literal names is
+// loaded, or found to be none, when the condition is planned, as matching compiles a pattern, so
+// evaluating it loads nothing however many zones the process has dropped since, and worst charges
+// it no load; one CEL plans otherwise, as another version may, isn't a condition, and one the
+// platform's files fail to give while it is planned isn't planned, so a check plans it again. A
+// fixed offset, as "+05:30", CEL reads without loading anything.
+func (g *guards) inZone(call interpreter.InterpretableCall) (interpreter.InterpretableCall, error) {
+	var planned *zone
+	if args := call.Args(); g.literalZones[call.ID()] && len(args) == 2 {
+		c, ok := args[1].(interpreter.InterpretableConst)
+		if !ok {
+			return nil, errors.New("a time zone a literal names is planned where this package can't load it once")
+		}
+		if name, ok := c.Value().(types.String); ok && !strings.Contains(string(name), ":") && zoneName(string(name)) == nil {
+			z, kept := keptZone(string(name))
+			if !kept {
+				z = loadZone(string(name))
+			}
+			// Planned with the failure, it would fail for as long as checks keep the program.
+			if !settled(z.err) {
+				return nil, fmt.Errorf("loading the time zone %q: %w", name, z.err)
+			}
+			planned = &z
+		}
+	}
+	function, overload, limit := call.Function(), call.OverloadID(), g.limit
+	return &charged{InterpretableCall: call, run: func(vars interpreter.Activation, args []ref.Val) ref.Val {
 		if len(args) != 2 {
 			return types.NoSuchOverloadErr()
 		}
-		if zone, ok := args[1].(types.String); ok && len(zone) > maxZone {
+		name, ok := args[1].(types.String)
+		if !ok {
+			return types.MaybeNoSuchOverloadErr(args[1])
+		}
+		if len(name) > maxZone {
 			return types.NewErr("rbac: a time zone is at most %d bytes", maxZone)
 		}
 		t, ok := args[0].(types.Timestamp)
 		if !ok {
 			return types.MaybeNoSuchOverloadErr(args[0])
 		}
-		return t.Receive(function, overload, args[1:])
-	})
+		if strings.Contains(string(name), ":") {
+			return t.Receive(function, overload, args[1:])
+		}
+		z := planned
+		if z == nil {
+			if err := zoneName(string(name)); err != nil {
+				return types.WrapErr(err)
+			}
+			found, kept := keptZone(string(name))
+			if !kept {
+				chargePast(vars, zoneLoad, limit)
+				found = loadZone(string(name))
+			}
+			z = &found
+		}
+		if z.err != nil {
+			return types.WrapErr(z.err)
+		}
+		// Read as CEL reads a time with no zone, in the time's own, so the zone isn't loaded again.
+		return types.Timestamp{Time: t.In(z.loc)}.Receive(function, "", nil)
+	}}, nil
 }
 
 // searchOf is what CEL binds function to where it searches a string, or nil where it doesn't.
@@ -1408,7 +1587,7 @@ func chargePast(vars interpreter.Activation, n, limit uint64) {
 		counted.charged = cost.SafeAdd(counted.charged, n)
 	}
 	if !ok || cost.SafeAdd(counted.steps, counted.charged) > limit {
-		panic(interpreter.EvalCancelledError{Cause: interpreter.CostLimitExceeded, Message: "rbac: a condition's keys and literals cost more than it may"})
+		panic(interpreter.EvalCancelledError{Cause: interpreter.CostLimitExceeded, Message: "rbac: what a condition reads, its keys and its literals cost more than it may"})
 	}
 }
 
@@ -1606,16 +1785,6 @@ func incomparable() ref.Val {
 	return types.NewErr("rbac: a double that isn't finite can't be compared")
 }
 
-// nonFiniteKey reports whether m holds a key that is a double that isn't finite.
-func nonFiniteKey(m traits.Mapper) bool {
-	for it := m.Iterator(); it.HasNext() == types.True; {
-		if nonFinite(it.Next()) {
-			return true
-		}
-	}
-	return false
-}
-
 // equal is x == y, failing where comparing values a map or list holds fails, as reading a
 // declared attribute passed as another type does: CEL's own comparison of maps and lists counts
 // such a value as equal, so that a map holding one would equal any map with its keys. It finds the
@@ -1657,10 +1826,21 @@ func equal(x, y ref.Val, read uint64) ref.Val {
 			return types.Equal(x, y)
 		}
 		// No key is found equal to NaN, so a map keyed by one would equal no map, though none a
-		// check reads is (finiteKey). Comparing is charged for each key of either, as they hold as
-		// many.
-		if nonFiniteKey(xs) || nonFiniteKey(ys) {
-			return incomparable()
+		// check reads is (finiteKey): comparing fails where the smaller value holds one, as measured
+		// reads it whole before it runs, and where only the larger does, none of the smaller's keys is
+		// found equal to it, as one holding no NaN finds none of them. Searching each map's keys again
+		// here took half of comparing maps nested deep. Comparing is charged for each key of either, as
+		// they hold as many.
+		if native := entries(xs); native != nil {
+			for k, a := range native {
+				if valueSize(k, read) > read {
+					return types.False
+				}
+				if b, found := ys.Find(k); !found || !same(a, b) {
+					return types.False
+				}
+			}
+			break
 		}
 		for it := xs.Iterator(); it.HasNext() == types.True; {
 			k := it.Next()
@@ -1714,70 +1894,190 @@ func contains(l traits.Lister, x ref.Val) ref.Val {
 	return types.False
 }
 
-// smaller is the smaller of two values' sizes, counted no further than past limit. It reads both
-// as far as each other, doubling how far until one is read whole, so that charging for comparing a
-// large value with a small one, which is cheap, is cheap too.
-func smaller(x, y ref.Val, limit uint64) uint64 {
-	for l := uint64(1); ; l = min(2*l, limit) {
-		sx, sy := valueSize(x, l), valueSize(y, l)
-		if sx <= l || sy <= l || l == limit {
-			return min(sx, sy)
-		}
+// measured is what comparing x with y, or finding x in y, reads, counted as valueSize counts it no
+// further than past maxCost, and whether what it reads whole holds a double that isn't finite, in a
+// list or a map, as a key too, however deep: a map a condition makes can be keyed by a list holding
+// NaN, which no key is found equal to, so a map keyed by one equals none, and `in` it finds no key
+// holding NaN. Comparing stops at the smaller value, so it reads both in step, a value of the one
+// read less at a time, until one is read whole, and the other only as far: a large value compared
+// with a small one is read as far as the small one, and each once. A map finds a key without
+// reading the rest. It finds no such double in a value it reads past the smaller, as finding it
+// there would read uncharged and, in a map, as far as the order its keys come in happens to reach,
+// so what it reports would differ from one check to the next. Comparing such a value decides as
+// finite values would: it isn't as large as the smaller one, so it is equal to none, as one holding
+// no NaN would be, and found in no list.
+func measured(function string, x, y ref.Val) (uint64, bool) {
+	if function != operators.In && !container(x) && !container(y) {
+		return min(textSize(x), textSize(y)), nonFinite(x) || nonFinite(y)
 	}
+	mx, my := newMeter(x), newMeter(y)
+	if function == operators.In {
+		if _, keyed := y.(traits.Mapper); keyed {
+			mx.readTo(maxCost)
+			return mx.read, mx.found()
+		}
+		if my.readTo(maxCost); my.read > maxCost {
+			return my.read, false
+		}
+		mx.readTo(my.read)
+		return my.read, my.found() || mx.found()
+	}
+	for {
+		m := mx
+		if my.read < mx.read {
+			m = my
+		}
+		if m.whole || m.read > maxCost {
+			break
+		}
+		m.step()
+	}
+	n := min(mx.read, my.read)
+	if n > maxCost {
+		return n, false
+	}
+	mx.readTo(n)
+	my.readTo(n)
+	return n, mx.found() && mx.read <= n || my.found() && my.read <= n
 }
 
 // valueSize is the cost of reading v whole, nested values included, counted no further than
 // past limit: one for each value, and a tenth of a string's or bytes' length. A list or map too
 // long to be within limit is past it unread, since iterating a map copies all its keys.
-func valueSize(v ref.Val, limit uint64) uint64 { return measuring(v, limit, nil) }
-
-// measuring is valueSize, calling each with every value it reads, v first.
-func measuring(v ref.Val, limit uint64, each func(ref.Val)) uint64 {
-	if each != nil {
-		each(v)
+func valueSize(v ref.Val, limit uint64) uint64 {
+	if !container(v) {
+		return textSize(v)
 	}
-	n := textSize(v)
-	switch v := v.(type) {
-	case traits.Mapper:
-		// Each entry is at least a key and a value.
-		if least := n + 2*count(v); least > limit {
-			return least
-		}
-		for it := v.Iterator(); n <= limit && it.HasNext() == types.True; {
-			k := it.Next()
-			// Finding the value hashes the key whole, so a key past limit is left unfound.
-			if n += measuring(k, limit-n, each); n <= limit {
-				n += measuring(v.Get(k), limit-n, each)
-			}
-		}
-	case traits.Lister:
-		if least := n + count(v); least > limit {
-			return least
-		}
-		for it := v.Iterator(); n <= limit && it.HasNext() == types.True; {
-			n += measuring(it.Next(), limit-n, each)
-		}
-	}
-	return n
+	m := newMeter(v)
+	m.readTo(limit)
+	return m.read
 }
 
-// holdsNonFinite reports whether v is a double that isn't finite, or holds one, in a list or a map,
-// as a key too, however deep, read no further than limit, as valueSize counts: a map a condition
-// makes can be keyed by a list holding NaN, which no key is found equal to, so a map keyed by one
-// equals none, and `in` it finds no key holding NaN. It finds none in a value past limit, as
-// finding it there would read uncharged and, in a map, as far as the order its keys come in happens
-// to reach, so what it reports differs from one check to the next. Comparing such a value decides
-// as finite values would: it isn't as large as the smaller one, which limit bounds, so it is equal
-// to none, as one holding no NaN would be, and found in no list.
-func holdsNonFinite(v ref.Val, limit uint64) bool {
+// entries are what m holds by its keys, where m is a map of CEL's own values, as the converter and a
+// map literal make, which ranging over reads with no iterator or key found; nil for any other map.
+func entries(m traits.Mapper) map[ref.Val]ref.Val {
+	native, _ := m.Value().(map[ref.Val]ref.Val)
+	return native
+}
+
+func container(v ref.Val) bool {
 	switch v.(type) {
 	case traits.Lister, traits.Mapper:
-	default:
-		return nonFinite(v)
+		return true
 	}
-	found := false
-	n := measuring(v, limit, func(v ref.Val) { found = found || nonFinite(v) })
-	return found && n <= limit
+	return false
+}
+
+// meter reads a value as valueSize counts it, a value at a time, so that two can be read in step
+// (measured): what it has read, whether it has read it whole, and whether a value it read is a
+// double that isn't finite. A list or map costs at least its length, or each entry a key and a
+// value, as soon as it is reached, so one too long to be within what is read is past it unread, and
+// each value it holds costs what reading it does past the 1 it was counted at (values). What it
+// reads comes to the same in any order, and only how far it reads past what is compared turns on
+// it, which nothing reads.
+type meter struct {
+	read             uint64
+	whole, nonFinite bool
+	// root is the value, until it is read; values are those reached, each counted at 1, and pending
+	// the lists and maps whose values are still to be found.
+	root    ref.Val
+	values  []ref.Val
+	pending []pending
+}
+
+func newMeter(v ref.Val) *meter { return &meter{root: v} }
+
+// pending is a list whose elements from at are still to be read, or a map whose entries are, by its
+// iterator, or whose value of key is: finding it hashes the key, so a key past what is read is left
+// unfound.
+type pending struct {
+	list   traits.Lister
+	at, of types.Int
+	m      traits.Mapper
+	it     traits.Iterator
+	key    ref.Val
+}
+
+// readTo reads until m has read the value whole or more than limit.
+func (m *meter) readTo(limit uint64) {
+	for !m.whole && m.read <= limit {
+		m.step()
+	}
+}
+
+// found reports whether m read the value whole, and found a double that isn't finite in it.
+func (m *meter) found() bool { return m.whole && m.nonFinite }
+
+// step reads the next value. A list is dropped before its last element is read, so reading a value
+// nested thousands deep, one in each, holds no more than a few.
+func (m *meter) step() {
+	switch {
+	case m.root != nil:
+		v := m.root
+		m.root = nil
+		m.reach(v, textSize(v))
+	case len(m.values) > 0:
+		v := m.values[len(m.values)-1]
+		m.values = m.values[:len(m.values)-1]
+		m.reach(v, textSize(v)-1)
+	case len(m.pending) > 0:
+		h := &m.pending[len(m.pending)-1]
+		var v ref.Val
+		switch {
+		case h.key != nil:
+			v = h.m.Get(h.key)
+			m.pending = m.pending[:len(m.pending)-1]
+		case h.list != nil:
+			if v = h.list.Get(h.at); h.at+1 < h.of {
+				h.at++
+			} else {
+				m.pending = m.pending[:len(m.pending)-1]
+			}
+		default:
+			// A map's entries are found once the map is read past their least, as making an
+			// iterator may copy its keys. A map of CEL's own values gives them all at once, where its
+			// iterator would give a key at a time, each in a value of its own, and finding each value
+			// hashes its key.
+			if native := entries(h.m); native != nil && h.it == nil {
+				m.pending = m.pending[:len(m.pending)-1]
+				for k, v := range native {
+					m.values = append(m.values, v, k)
+				}
+				return
+			}
+			if h.it == nil {
+				h.it = h.m.Iterator()
+			}
+			if h.it.HasNext() != types.True {
+				m.pending = m.pending[:len(m.pending)-1]
+				return
+			}
+			v = h.it.Next()
+			m.pending = append(m.pending, pending{m: h.m, key: v})
+		}
+		m.reach(v, textSize(v)-1)
+	default:
+		m.whole = true
+	}
+}
+
+// reach counts v, which reading costs n, with the least each value it holds costs.
+func (m *meter) reach(v ref.Val, n uint64) {
+	m.nonFinite = m.nonFinite || nonFinite(v)
+	switch v := v.(type) {
+	case traits.Mapper:
+		if k := count(v); k > 0 {
+			n += 2 * k
+			m.pending = append(m.pending, pending{m: v})
+		}
+	case traits.Lister:
+		if k := count(v); k > 0 {
+			of, _ := v.Size().(types.Int)
+			n += k
+			m.pending = append(m.pending, pending{list: v, of: of})
+		}
+	}
+	m.read = cost.SafeAdd(m.read, n)
 }
 
 func count(v traits.Sizer) uint64 {
@@ -1939,9 +2239,9 @@ func (c *conditions) decide(b *budget, expr string, vars map[string]any) (held, 
 }
 
 // evaluating runs as a condition is evaluated, converting as what conditions read is built,
-// convertingKind as a kind's attributes are converted for it, and searching as a search of a string
-// runs, as a test's counters.
-var evaluating, converting, convertingKind, searching = func() {}, func() {}, func() {}, func() {}
+// convertingKind as a kind's attributes are converted for it, searching as a search of a string
+// runs, and loadingZone as a time zone is loaded, as a test's counters.
+var evaluating, converting, convertingKind, searching, loadingZone = func() {}, func() {}, func() {}, func() {}, func() {}
 
 // evaluate runs a condition's program on a request.
 func evaluate(prg program, vars map[string]any) run {
@@ -2040,8 +2340,10 @@ func (a *Authorizer) vars(ctx context.Context, s Subject, p Permission, r Resour
 	return map[string]any{
 		"subject":  map[string]any{"kind": string(s.Principal.Kind), "id": s.Principal.ID, "attributes": subjectAttributes},
 		"resource": resource,
-		"request":  map[string]any{"time": a.cfg.Now(), "attributes": requestAttributes},
-		"action":   string(p),
+		// In UTC, as a converted time is (Attributes): string() writes a time in its own zone, so the
+		// host's clock in each replica's local zone would decide by where the replica runs.
+		"request": map[string]any{"time": a.cfg.Now().UTC(), "attributes": requestAttributes},
+		"action":  string(p),
 	}
 }
 
