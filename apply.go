@@ -3,6 +3,8 @@ package rbac
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"maps"
@@ -10,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -402,19 +405,95 @@ func (a *Authorizer) changing(actor Subject, on Resource, cs *constrained) error
 // deleting groups or a principal changes denies and eligibilities on other scopes and
 // SetMemberships removes an ended membership's places in groups, can still deadlock with another
 // change: PostgreSQL ends one, which matches ErrConflict. The locks last until the transaction
-// ends. Advisory locks span the database, so the keys name the schema holding the tables, as the
-// session's statements reach them: another application's grants are in a schema of their own. Not
-// current_schema(), the first in the search_path that exists, which two sessions reaching the same
-// tables through paths that differ before it name apart, so their changes would never wait for
-// each other. The schema and the tenant go first with their lengths, as each may hold '/', so the
-// keys of two never meet (lockName).
-const lockKey = `hashtextextended((SELECT pg_catalog.length(n.nspname) || ':' || n.nspname FROM pg_catalog.pg_class c
-	JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = 'rbac_grants'::regclass) || '/rbac/' || $1, 0)`
+// ends. Advisory locks span the database, so their names name the schema holding the tables, as
+// the session's statements reach them: another application's grants are in a schema of their own.
+// Not current_schema(), the first in the search_path that exists, which two sessions reaching the
+// same tables through paths that differ before it name apart, so their changes would never wait
+// for each other. The schema and the tenant go first with their lengths, as each may hold '/', so
+// no two locks have one name (lockName).
+//
+// A key is the first 8 bytes of the SHA-256 of its lock's name (lockKey), computed in Go, as the
+// package's cryptography is the standard library's: finding a name whose key is another's takes
+// some 2^64 hashes. PostgreSQL's hashtextextended, which keyed them before, can be inverted, so a
+// tenant's admin could name a group, in a millisecond, whose lock was another tenant's, and hold
+// every change there back while changing it. A lock no id names, a tenant's own, its exclusive
+// values', its nesting's or Migrate's, takes its key as two int4 keys, which PostgreSQL holds apart
+// from every bigint key, as a scope's or a principal's lock takes: so no id an actor chooses
+// reaches one, however the hash fares.
 
-// lockName is the name lockKey hashes of a tenant's lock of a kind on key, empty for the tenant's
-// own.
-func lockName(kind, tenant, key string) string {
-	return kind + "/" + strconv.Itoa(len(tenant)) + ":" + tenant + "/" + key
+// lockName is the name of a tenant's lock of a kind on key, in the tables of schema, key empty for
+// a lock no id names, and tenant too for Migrate's.
+func lockName(schema, kind, tenant, key string) string {
+	return strconv.Itoa(len(schema)) + ":" + schema + "/rbac/" + kind + "/" + strconv.Itoa(len(tenant)) + ":" + tenant + "/" + key
+}
+
+// lockKey is the key of the lock named name.
+func lockKey(name string) int64 {
+	sum := sha256.Sum256([]byte(name))
+	return int64(binary.BigEndian.Uint64(sum[:8])) //nolint:gosec // G115: a key is the hash's 64 bits, whatever its sign
+}
+
+// advisory is a tenant's lock of a kind on key, as lockName names it, shared or not.
+type advisory struct {
+	kind, tenant, key string
+	shared            bool
+}
+
+// taking is the statement that takes l in the tables of schema, and its arguments: on no key, by
+// two int4 keys, which no lock on a key takes.
+func (l advisory) taking(schema string) (string, []any) {
+	take := "pg_catalog.pg_advisory_xact_lock"
+	if l.shared {
+		take += "_shared"
+	}
+	k := lockKey(lockName(schema, l.kind, l.tenant, l.key))
+	if l.key == "" {
+		return "SELECT " + take + "($1, $2)", []any{int32(k >> 32), int32(k)} //nolint:gosec // G115: the key's high and low 32 bits
+	}
+	return "SELECT " + take + "($1)", []any{k}
+}
+
+// tablesSchema is the schema holding the tables a statement reaches.
+const tablesSchema = `(SELECT n.nspname FROM pg_catalog.pg_class c
+	JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = 'rbac_grants'::regclass)`
+
+// lockSchema is the schema the last locks were taken in, which the next are taken in first: a
+// process's changes nearly all reach the tables in one schema, which they so name without a round
+// trip to read it first. Each lock is taken only where its statement finds the tables in that
+// schema, and returns a row where it does: unless every one did, the change takes them all again,
+// named by the schema the batch's first statement read. Not by that read alone, as a schema
+// renamed while the batch waits for a lock has the statements after it take none.
+var lockSchema atomic.Pointer[string]
+
+// takeLocks takes locks, in order, in the schema holding the tables tx reaches.
+func takeLocks(ctx context.Context, tx pgx.Tx, locks ...advisory) error {
+	guess := lockSchema.Load()
+	b := &pgx.Batch{}
+	b.Queue(`SELECT current_setting('transaction_isolation'), ` + tablesSchema)
+	taken := 0
+	if guess != nil {
+		for _, l := range locks {
+			sql, args := l.taking(*guess)
+			b.Queue(sql+` WHERE `+tablesSchema+` = $`+strconv.Itoa(len(args)+1), append(args, *guess)...).Exec(func(tag pgconn.CommandTag) error {
+				taken += int(tag.RowsAffected())
+				return nil
+			})
+		}
+	}
+	var schema string
+	if err := locked(tx.SendBatch(ctx, b), &schema); err != nil {
+		return err
+	}
+	if guess != nil && taken == len(locks) {
+		return nil
+	}
+	lockSchema.Store(&schema)
+	b = &pgx.Batch{}
+	for _, l := range locks {
+		sql, args := l.taking(schema)
+		b.Queue(sql, args...)
+	}
+	return tx.SendBatch(ctx, b).Close()
 }
 
 // maxLocks is how many scopes and principals a change locks one by one; a larger one locks the
@@ -422,16 +501,18 @@ func lockName(kind, tenant, key string) string {
 const maxLocks = 64
 
 func lock(ctx context.Context, tx pgx.Tx, tenant string, scopes, principals []string) error {
-	b := &pgx.Batch{}
-	b.Queue(`SELECT current_setting('transaction_isolation')`)
-	b.Queue(`SELECT pg_advisory_xact_lock_shared(`+lockKey+`)`, lockName("tenant", tenant, ""))
+	locks := []advisory{{kind: "tenant", tenant: tenant, shared: true}}
 	for _, s := range slices.Compact(slices.Sorted(slices.Values(scopes))) {
-		b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, lockName("scope", tenant, s))
+		l := advisory{kind: "scope", tenant: tenant, key: s}
+		if s == nestingKey {
+			l = advisory{kind: "nesting", tenant: tenant}
+		}
+		locks = append(locks, l)
 	}
 	for _, p := range slices.Compact(slices.Sorted(slices.Values(principals))) {
-		b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, lockName("principal", tenant, p))
+		locks = append(locks, advisory{kind: "principal", tenant: tenant, key: p})
 	}
-	return locked(tx.SendBatch(ctx, b))
+	return takeLocks(ctx, tx, locks...)
 }
 
 // lockAll locks scopes and principals one by one, or past maxLocks the tenant.
@@ -443,18 +524,15 @@ func lockAll(ctx context.Context, tx pgx.Tx, tenant string, scopes, principals [
 }
 
 func lockTenant(ctx context.Context, tx pgx.Tx, tenant string) error {
-	b := &pgx.Batch{}
-	b.Queue(`SELECT current_setting('transaction_isolation')`)
-	b.Queue(`SELECT pg_advisory_xact_lock(`+lockKey+`)`, lockName("tenant", tenant, ""))
-	return locked(tx.SendBatch(ctx, b))
+	return takeLocks(ctx, tx, advisory{kind: "tenant", tenant: tenant})
 }
 
-// locked reads a lock batch, whose first query is the transaction's isolation, and refuses a
-// change stricter than READ COMMITTED: its snapshot can predate the locks, so its checks could
-// read grants as they were before a change the locks waited for.
-func locked(br pgx.BatchResults) error {
+// locked reads a lock batch, whose first query is the transaction's isolation, then what more it
+// reads into also, and refuses a change stricter than READ COMMITTED: its snapshot can predate the
+// locks, so its checks could read grants as they were before a change the locks waited for.
+func locked(br pgx.BatchResults, also ...any) error {
 	var level string
-	if err := br.QueryRow().Scan(&level); err != nil {
+	if err := br.QueryRow().Scan(append([]any{&level}, also...)...); err != nil {
 		_ = br.Close()
 		return err
 	}
@@ -926,7 +1004,10 @@ type constrained struct {
 	ctx   context.Context
 	actor Subject
 	on    Resource
-	asked map[permissionOn]bool
+	// anywhere asks of no resource, as of every scope of a type in on's tenant at once, where a
+	// constraint answers true that removes the permission on any of them.
+	anywhere bool
+	asked    map[permissionOn]bool
 	// listed are removesAny's answers: the first of the types each removes its permission on, or -1.
 	listed map[typesAsked]int
 	// by names the constraint that removed each permission on each type, for a refusal to say.
@@ -949,6 +1030,14 @@ func (a *Authorizer) constrain(ctx context.Context, actor Subject, on Resource) 
 		a: a, ctx: ctx, actor: actor, on: on,
 		asked: map[permissionOn]bool{}, listed: map[typesAsked]int{}, by: map[permissionOn]string{},
 	}
+}
+
+// constrainAnywhere is what the constraints remove from actor on every scope of a tenant at once,
+// asked of no resource (anywhere).
+func (a *Authorizer) constrainAnywhere(ctx context.Context, actor Subject, tenant string) *constrained {
+	c := a.constrain(ctx, actor, tenantResource(tenant))
+	c.anywhere = true
+	return c
 }
 
 // holding is the actor's label values, read on q through c, which is on the tenant, the first time
@@ -1102,7 +1191,12 @@ func (c *constrained) removes(p Permission, resourceType string) bool {
 	// A label value is asked about as checks decide it, or an actor could hand on, through a tenant
 	// passed with attributes, one it can't use.
 	on := c.a.decidedOn(p, c.on)
-	name, err := c.a.denied(c.ctx, ConstraintInput{Tenant: c.on.Tenant, ResourceType: resourceType, Permission: p, Subject: &c.actor, Resource: &on})
+	in := ConstraintInput{Tenant: c.on.Tenant, ResourceType: resourceType, Permission: p, Subject: &c.actor, Resource: &on}
+	// Anywhere, a label value is still decided on the bare tenant, where it is held alone.
+	if c.anywhere && !c.a.labelPermission(p) {
+		in.Resource = nil
+	}
+	name, err := c.a.denied(c.ctx, in)
 	if err != nil {
 		c.err = err
 	}

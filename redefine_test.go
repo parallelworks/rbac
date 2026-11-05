@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"slices"
 	"strings"
@@ -527,4 +528,436 @@ func TestRedefinitionsAskAboutAndCheckTheDeniesOfWhatGrantsGain(t *testing.T) {
 		t.Errorf("only %d of %d redefinitions were valid", ran, runs)
 	}
 	t.Logf("%d of %d redefinitions were valid", ran, runs)
+}
+
+// removal is a constraint removing a permission from x as hosts write one: on what is at or under a
+// scope (under), on one resource alone (id), on resources of an attribute (attr), or on what is at
+// or under a scope for one type alone (byType); asked of no resource, it removes the permission
+// where nilAny is set, as ConstraintInput asks, and otherwise nothing, as one written for resources
+// alone does.
+type removal struct {
+	kind   string
+	p      rbac.Permission
+	s      rbac.Scope
+	rt     string
+	nilAny bool
+}
+
+func (r removal) String() string {
+	return fmt.Sprintf("%s %s %s %s nil %t", r.kind, r.p, r.s.Key(), r.rt, r.nilAny)
+}
+
+func (r removal) removes(in rbac.ConstraintInput) bool {
+	if in.Permission != r.p || in.Subject == nil || in.Subject.Principal.ID != "x" {
+		return false
+	}
+	on := in.Resource
+	if on == nil {
+		return r.nilAny
+	}
+	under := on.Scope() == r.s || slices.Contains(on.Ancestors, r.s)
+	switch r.kind {
+	case "under":
+		return under
+	case "id":
+		return on.Scope() == r.s
+	case "attr":
+		return on.Attributes["env"] == "prod"
+	}
+	return under && in.ResourceType == r.rt
+}
+
+var errProbed = errors.New("probed")
+
+// Random widenings of random custom roles, granted, and listed by roles granted, on random scopes,
+// under random constraints: SetRole refuses one exactly where Apply of the role as it will be, by
+// the same actor, is refused on a scope where a grant of it gives more, or on a scope of a type
+// that the holders of a role listing it, or listing one that does, may grant it on there, which a
+// constraint answering for what is under the scope it is asked about answers as of that scope; and
+// so too when one of these is granted while it waits, after which it is tried again. With
+// Config.ResourceOf, and without it where each scope is stored whole.
+func TestARedefinitionIsStoppedByAConstraintExactlyWhereApplyGrantingItIs(t *testing.T) {
+	everything := rbac.RoleDefinition{
+		ID:            "everything",
+		Permissions:   []rbac.Permission{view, login, root, grantC, "workspace:view", "workspace:grant", "org:view", "org:grant", "tenant:view", "tenant:grant"},
+		ResourceTypes: []string{"cluster", "workspace", "org", rbac.TenantScope}, Privileged: true,
+	}
+	at := func(typ, id string, attrs map[string]any, above ...rbac.Scope) rbac.Resource {
+		return rbac.Resource{Tenant: "t1", Type: typ, ID: id, Ancestors: above, Attributes: attrs}
+	}
+	prod := map[string]any{"env": "prod"}
+	dev := map[string]any{"env": "dev"}
+	o1, o2, w1, w2 := rbac.Scope{Type: "org", ID: "o1"}, rbac.Scope{Type: "org", ID: "o2"}, rbac.Scope{Type: "workspace", ID: "w1"}, rbac.Scope{Type: "workspace", ID: "w2"}
+	// Label values are decided on the tenant with no attributes, so one passed as prod removes none.
+	for _, mode := range []struct {
+		name       string
+		containers bool
+		scopes     []rbac.Resource
+	}{
+		{"as Config.ResourceOf gives each scope", true, []rbac.Resource{
+			at(rbac.TenantScope, "t1", prod), at("org", "o1", dev), at("org", "o2", prod), at("workspace", "w1", dev, o1), at("workspace", "w2", prod, o2),
+			at("workspace", "w3", dev), at("cluster", "c1", prod, w1, o1), at("cluster", "c2", dev, w2, o2), at("cluster", "c3", prod, o1), at("cluster", "c4", dev),
+		}},
+		{"stored whole", false, []rbac.Resource{
+			at(rbac.TenantScope, "t1", nil), at("org", "o1", nil), at("workspace", "w1", nil), at("cluster", "c1", nil), at("cluster", "c2", nil), at("cluster", "c3", nil),
+		}},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			var removals []removal
+			var meanwhile func(context.Context) error
+			resolved := map[rbac.Scope]int{}
+			byScope := map[rbac.Scope]rbac.Resource{}
+			for _, r := range mode.scopes {
+				byScope[r.Scope()] = r
+			}
+			h := setup(t, func(c *rbac.Config) {
+				c.Catalog = append(slices.Clone(c.Catalog), everything)
+				c.ValidateGrant = func(_ context.Context, _ rbac.DB, in rbac.GrantInput) error {
+					if in.Binding.Principal.ID == "sink" {
+						return errProbed
+					}
+					return nil
+				}
+				c.Constraints = []rbac.Constraint{{Name: "removals", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+					// The freezes are asked of no resource after the scopes the change reaches are read.
+					if do := meanwhile; do != nil && in.Resource == nil && strings.HasSuffix(string(in.Permission), ":grant") {
+						meanwhile = nil
+						if err := do(ctx); err != nil {
+							return false, err
+						}
+					}
+					return slices.ContainsFunc(removals, func(r removal) bool { return r.removes(in) }), nil
+				}}}
+				if !mode.containers {
+					c.ContainerTypes, c.ResourceOf, c.Attributes = nil, nil, rbac.Attributes{Resource: map[string]rbac.AttributeType{}}
+					return
+				}
+				c.Labels = []rbac.LabelDimension{{Name: "level", Rule: rbac.Ordered, Values: []string{"low", "high"}}}
+				c.Catalog = append(c.Catalog, rbac.RoleDefinition{ID: "levels", Permissions: []rbac.Permission{"level:low", "level:high"}, ResourceTypes: []string{rbac.TenantScope}})
+				c.ResourceOf = func(_ context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+					resolved[s]++
+					if r, ok := byScope[s]; ok && tenant == "t1" {
+						return r, nil
+					}
+					return rbac.Resource{}, fmt.Errorf("%w: %s", rbac.ErrNotFound, s.Key())
+				}
+			})
+			ctx := t.Context()
+			tenant := rbac.TenantRoot("t1")
+			h.seed(t, grant(tenant, "tenant.roles", rbac.User, "x"), grant(tenant, "everything", rbac.User, "x"))
+			if mode.containers {
+				h.seed(t, grant(tenant, "levels", rbac.User, "x"))
+			}
+			x := h.as(t, "x")
+			for _, p := range []string{"y", "y2", "lh", "lh2", "sink"} {
+				h.as(t, p)
+			}
+			contains := func(typ string) bool {
+				return typ == rbac.TenantScope || mode.containers && (typ == "org" || typ == "workspace")
+			}
+			grantable := func(r rbac.RoleDefinition, typ string) bool {
+				values := slices.ContainsFunc(r.Permissions, func(p rbac.Permission) bool { return strings.HasPrefix(string(p), "level:") })
+				return contains(typ) && !values || slices.Contains(r.ResourceTypes, typ)
+			}
+			writeRole := func(r rbac.RoleDefinition) {
+				t.Helper()
+				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles) VALUES ('t1', $1, $2, $3, $4)
+					ON CONFLICT (tenant, id) DO UPDATE SET permissions = EXCLUDED.permissions, resource_types = EXCLUDED.resource_types, grantable_roles = EXCLUDED.grantable_roles`,
+					r.ID, sortedStrings(r.Permissions), r.ResourceTypes, sortedStrings(r.GrantableRoles)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			listed := []rbac.RoleDefinition{
+				{ID: "custom.h1", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}},
+				{ID: "custom.h2", Permissions: []rbac.Permission{"workspace:view"}, ResourceTypes: []string{"workspace"}},
+			}
+			for _, r := range listed {
+				writeRole(r)
+			}
+			// target is where Apply of the role as it will be stands for what a scope reached hands on:
+			// the scope itself, or for the holders of a role there granting it on scopes of another type
+			// under it, one of that type under it that no constraint names but by what is above it.
+			target := func(s rbac.Scope, typ string) rbac.Resource {
+				r := byScope[s]
+				if s.Type == typ {
+					return r
+				}
+				g := rbac.Resource{Tenant: "t1", Type: typ, ID: "under-" + s.ID, Attributes: r.Attributes}
+				if s.Type != rbac.TenantScope {
+					g.Ancestors = append([]rbac.Scope{s}, r.Ancestors...)
+				}
+				return g
+			}
+			stops, runs, retried := 0, 0, 0
+			for seed := range uint64(300) {
+				rng := rand.New(rand.NewPCG(seed, 110))
+				pick := func(n int) int { return rng.IntN(n) }
+				// Sometimes a role for the tenant alone, giving label values.
+				perms := []rbac.Permission{view, login, root, grantC, "workspace:view", "workspace:grant", "org:view", "org:grant", "tenant:view"}
+				types := []string{"cluster", "workspace", "org"}
+				if mode.containers && pick(5) == 0 {
+					perms, types = []rbac.Permission{"level:low", "level:high", "tenant:view", "tenant:grant"}, []string{rbac.TenantScope}
+				}
+				some := func(n int) []int {
+					var out []int
+					for i := range n {
+						if pick(2) == 0 {
+							out = append(out, i)
+						}
+					}
+					if len(out) == 0 {
+						out = append(out, pick(n))
+					}
+					return out
+				}
+				was := rbac.RoleDefinition{ID: "custom.r"}
+				for _, i := range some(len(perms)) {
+					was.Permissions = append(was.Permissions, perms[i])
+				}
+				for _, i := range some(len(types)) {
+					was.ResourceTypes = append(was.ResourceTypes, types[i])
+				}
+				now := rbac.RoleDefinition{ID: was.ID, Permissions: slices.Clone(was.Permissions), ResourceTypes: slices.Clone(was.ResourceTypes)}
+				for range 1 + pick(2) {
+					if p := perms[pick(len(perms))]; !slices.Contains(now.Permissions, p) {
+						now.Permissions = append(now.Permissions, p)
+					}
+				}
+				if typ := types[pick(len(types))]; pick(3) == 0 && !slices.Contains(now.ResourceTypes, typ) {
+					now.ResourceTypes = append(now.ResourceTypes, typ)
+				}
+				// It gives more, so every scope it is granted on gains.
+				if len(now.Permissions) == len(was.Permissions) && len(now.ResourceTypes) == len(was.ResourceTypes) {
+					if i := slices.IndexFunc(perms, func(p rbac.Permission) bool { return !slices.Contains(was.Permissions, p) }); i >= 0 {
+						now.Permissions = append(now.Permissions, perms[i])
+					} else if i := slices.IndexFunc(types, func(typ string) bool { return !slices.Contains(was.ResourceTypes, typ) }); i >= 0 {
+						now.ResourceTypes = append(now.ResourceTypes, types[i])
+					} else {
+						continue
+					}
+				}
+				for _, l := range listed {
+					if pick(4) == 0 {
+						now.GrantableRoles = append(now.GrantableRoles, l.ID)
+					}
+				}
+				var grantedOn []rbac.Scope
+				for range 1 + pick(3) {
+					if s := mode.scopes[pick(len(mode.scopes))].Scope(); grantable(was, s.Type) && !slices.Contains(grantedOn, s) {
+						grantedOn = append(grantedOn, s)
+					}
+				}
+				// A role listing it whose holders may grant it on scopes of one type, granted on a scope,
+				// and sometimes one listing that: each hands it on where it is granted only where its
+				// grant reaches scopes of the type it may grant on, as nothing reaches the tenant but
+				// itself, and only by a `<type>:grant` it gives for that type, not one it gives for
+				// another, which changes no grants.
+				type listing struct {
+					role    rbac.RoleDefinition
+					on      rbac.Scope
+					typ     string
+					reaches bool
+				}
+				reaches := func(on, typ string) bool { return on == typ || contains(on) && typ != rbac.TenantScope }
+				var listings []listing
+				listedTypes := slices.DeleteFunc(slices.Concat(now.ResourceTypes, []string{"org", "workspace", rbac.TenantScope}), func(typ string) bool { return !grantable(now, typ) })
+				if len(listedTypes) > 0 && pick(2) == 0 {
+					typ := listedTypes[pick(len(listedTypes))]
+					l := rbac.RoleDefinition{ID: "custom.l", Permissions: []rbac.Permission{rbac.GrantPermission(typ)}, ResourceTypes: []string{typ}, GrantableRoles: []rbac.Role{was.ID}}
+					if other := listedTypes[pick(len(listedTypes))]; other != typ && pick(2) == 0 {
+						l.Permissions = append(l.Permissions, rbac.GrantPermission(other))
+					}
+					if s := mode.scopes[pick(len(mode.scopes))].Scope(); grantable(l, s.Type) {
+						listings = append(listings, listing{l, s, typ, reaches(s.Type, typ)})
+						if over := []string{typ, "org", "workspace"}[pick(3)]; pick(3) == 0 && grantable(l, over) {
+							l2 := rbac.RoleDefinition{ID: "custom.l2", Permissions: []rbac.Permission{rbac.GrantPermission(over)}, ResourceTypes: []string{over}, GrantableRoles: []rbac.Role{l.ID}}
+							if s2 := mode.scopes[pick(len(mode.scopes))].Scope(); grantable(l2, s2.Type) {
+								listings = append(listings, listing{l2, s2, typ, reaches(s2.Type, over) && reaches(over, typ)})
+							}
+						}
+					}
+				}
+				removals = nil
+				for range 1 + pick(2) {
+					// Mostly of what the role, a role it lists, or one listing it gives.
+					given := slices.Clone(now.Permissions)
+					for _, l := range listed {
+						if slices.Contains(now.GrantableRoles, l.ID) {
+							given = append(given, l.Permissions...)
+						}
+					}
+					for _, l := range listings {
+						given = append(given, l.role.Permissions...)
+					}
+					if pick(3) == 0 {
+						given = append(slices.Clone(perms), "tenant:grant")
+					}
+					r := removal{kind: []string{"under", "id", "attr", "byType"}[pick(4)], p: given[pick(len(given))], nilAny: pick(2) == 0}
+					// One naming a container by id answers of it what it doesn't of the scopes under it,
+					// which a target stands for.
+					if r.s = mode.scopes[1+pick(len(mode.scopes)-1)].Scope(); r.kind == "id" && contains(r.s.Type) {
+						r.kind = "under"
+					}
+					r.rt = now.ResourceTypes[pick(len(now.ResourceTypes))]
+					// A freeze answering true of no resource stops every redefinition of a role whose
+					// grants can be on its type, wherever they are.
+					if strings.HasSuffix(string(r.p), ":grant") {
+						r.nilAny = false
+					}
+					removals = append(removals, r)
+				}
+				// Sometimes the role, or one listing it, is granted on another scope while the change waits.
+				var late *rbac.Grant
+				if pick(3) == 0 {
+					s := mode.scopes[pick(len(mode.scopes))].Scope()
+					switch {
+					case len(listings) > 0 && pick(2) == 0 && grantable(listings[0].role, s.Type):
+						g := grant(s, listings[0].role.ID, rbac.User, "lh2")
+						late = &g
+					case grantable(was, s.Type):
+						g := grant(s, was.ID, rbac.User, "y2")
+						late = &g
+					}
+				}
+				describe := fmt.Sprintf("seed %d: %v%v to %v%v listing %v, granted on %v, listed %v, late %v, removals %v",
+					seed, was.Permissions, was.ResourceTypes, now.Permissions, now.ResourceTypes, now.GrantableRoles, grantedOn, listings, late, removals)
+				writeRole(was)
+				var stored []rbac.Grant
+				for _, s := range grantedOn {
+					stored = append(stored, grant(s, was.ID, rbac.User, "y"))
+				}
+				for _, l := range listings {
+					writeRole(l.role)
+					stored = append(stored, grant(l.on, l.role.ID, rbac.User, "lh"))
+				}
+				h.seed(t, stored...)
+				probe := now
+				probe.ID = "custom.probe"
+				writeRole(probe)
+				// refusing is the scopes where Apply of the role as it will be is refused, each by the
+				// scope a refusal of the redefinition names.
+				refusing := func(granted []rbac.Scope, listings []listing) map[rbac.Scope]bool {
+					t.Helper()
+					type asked struct {
+						on    rbac.Resource
+						named rbac.Scope
+					}
+					var applied []asked
+					// A grant on a scope the role as it will be can't be granted on gives nothing more.
+					for _, s := range granted {
+						if grantable(probe, s.Type) {
+							applied = append(applied, asked{byScope[s], s})
+						}
+					}
+					for _, l := range listings {
+						if l.reaches {
+							applied = append(applied, asked{target(l.on, l.typ), l.on})
+						}
+					}
+					refused := map[rbac.Scope]bool{}
+					for _, a := range applied {
+						switch err := h.authz.Apply(ctx, x, a.on, rbac.Change{Grant: []rbac.Binding{{Role: probe.ID, Principal: identity("sink")}}}); {
+						case errors.Is(err, errProbed):
+						case errors.Is(err, rbac.ErrDenied):
+							refused[a.named] = true
+						default:
+							t.Fatalf("%s: Apply on %s: %v", describe, a.on.Scope().Key(), err)
+						}
+					}
+					return refused
+				}
+				before := refusing(grantedOn, listings)
+				after := before
+				// A scope it gives more on once the late grant is made, that it didn't before.
+				var unasked bool
+				if late != nil {
+					afterOn, afterListings := slices.Clone(grantedOn), slices.Clone(listings)
+					var known []rbac.Scope
+					for _, s := range grantedOn {
+						if grantable(now, s.Type) {
+							known = append(known, s)
+						}
+					}
+					gains := late.Role == was.ID && grantable(now, late.Scope.Type)
+					for _, l := range listings {
+						if l.reaches {
+							known = append(known, l.on)
+						}
+						if l.role.ID == late.Role {
+							afterListings = append(afterListings, listing{l.role, late.Scope, l.typ, reaches(late.Scope.Type, l.typ)})
+							gains = gains || reaches(late.Scope.Type, l.typ)
+						}
+					}
+					if late.Role == was.ID {
+						afterOn = append(afterOn, late.Scope)
+					}
+					unasked = gains && !slices.Contains(known, late.Scope)
+					after = refusing(afterOn, afterListings)
+					meanwhile = func(ctx context.Context) error { return h.authz.Import(ctx, host, "t1", []rbac.Grant{*late}) }
+				}
+				// The host gives each scope once in each attempt, both before the transaction and under
+				// its lock.
+				setRole := func() error {
+					t.Helper()
+					clear(resolved)
+					err := h.authz.SetRole(ctx, x, "t1", now)
+					for s, n := range resolved {
+						if n > 1 {
+							t.Errorf("%s: Config.ResourceOf gave %s %d times", describe, s.Key(), n)
+						}
+					}
+					return err
+				}
+				err := setRole()
+				meanwhile = nil
+				clean := func() {
+					t.Helper()
+					if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_grants WHERE tenant = 't1' AND role IN ('custom.r', 'custom.l', 'custom.l2');
+						DELETE FROM rbac_roles WHERE tenant = 't1' AND id IN ('custom.r', 'custom.l', 'custom.l2', 'custom.probe')`); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if errors.Is(err, rbac.ErrInvalid) {
+					clean()
+					continue
+				}
+				runs++
+				// Refused before its transaction, it is decided on the scopes it read then; otherwise on
+				// those under the tenant's lock, having been tried again where one it gives more on there
+				// wasn't asked about.
+				decided := before
+				switch {
+				case late == nil || len(before) > 0:
+				case errors.Is(err, rbac.ErrConflict):
+					retried++
+					err = setRole()
+					decided = after
+				case unasked:
+					t.Errorf("%s: a scope it gives more on was granted on while it waited, but it wasn't tried again: %v", describe, err)
+					decided = after
+				default:
+					decided = after
+				}
+				var denied *rbac.DeniedError
+				switch {
+				case err == nil && len(decided) > 0:
+					t.Errorf("%s: widened, though Apply granting it as it will be is refused on %v", describe, slices.Collect(maps.Keys(decided)))
+				case err == nil:
+				case !errors.As(err, &denied):
+					t.Fatalf("%s: %v", describe, err)
+				case len(decided) == 0:
+					t.Errorf("%s: refused, though Apply granting it as it will be is refused nowhere it gives more: %v", describe, err)
+				case !decided[denied.Scope] || !strings.Contains(denied.Reason, "removals"):
+					t.Errorf("%s: refused on %s, though Apply granting it as it will be is refused on %v: %v", describe, denied.Scope.Key(), slices.Collect(maps.Keys(decided)), err)
+				default:
+					stops++
+				}
+				clean()
+			}
+			if runs < 150 || stops < runs/10 || stops > runs*9/10 || retried < 10 {
+				t.Errorf("%d redefinitions were valid, of which constraints stopped %d, and %d were tried again", runs, stops, retried)
+			}
+			t.Logf("%d redefinitions were valid, of which constraints stopped %d, and %d were tried again", runs, stops, retried)
+		})
+	}
 }

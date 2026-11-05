@@ -519,7 +519,12 @@ type Constraint struct {
 
 // ConstraintInput is what a constraint is asked about. Searches ask once for every resource of a
 // type, and Holders first once for every holder: where Resource or Subject is nil, answer true if
-// the constraint removes the permission for any, so that a search never keeps what a check refuses.
+// the constraint removes the permission for any, so that a search never keeps what a check refuses,
+// and a change that asks so, about scopes no one reads, is stopped wherever the constraint may stop
+// it: one answering false there, as one guarded against a nil Resource does, may not be asked about
+// those scopes at all, so as a freeze it may not stop DeleteRole, SetRole narrowing a role, or a
+// removal of members, and without Config.ResourceOf, it doesn't stop SetRole widening a role on a
+// scope it can't read whole (Resource).
 // Holders then asks again about each identity it lists, which it marks MaybeDenied where the
 // constraint answers true. Each constraint is given copies of its own of the subject and the
 // resource, their attributes, ancestors and label too, so one writing to them changes nothing
@@ -565,8 +570,11 @@ type ConstraintInput struct {
 	// on any of them: one that tells them apart by id or attributes sees only the scope, and would let
 	// the actor hand on what it can't use on them. It is nil in Filter and Reachable, and in SetRole
 	// and DeleteRole, which change grants on every scope of a type, but for what SetRole's role gives,
-	// asked about the tenant; and in the first ask of ChangeMembers and DeleteGroup about the power
-	// to change grants on scopes of a type they take access away on, which then ask again about each
+	// asked about the tenant as defining it, and where SetRole has it give more, about each scope its
+	// grants, or a role listing it, are on, as Apply granting it there asks, as Config.ResourceOf
+	// gives it, or without it, as stored where that is all of it, and nil only otherwise, standing
+	// for every such scope; and in the first ask of ChangeMembers and DeleteGroup about the power to
+	// change grants on scopes of a type they take access away on, which then ask again about each
 	// such scope where one answers true.
 	Resource *Resource
 }
