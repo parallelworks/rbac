@@ -889,6 +889,75 @@ func TestConflictsUnderWithTxListsOnlyWhatOneMomentHeld(t *testing.T) {
 	}
 }
 
+// Conflicts whose read fails once it has read some lists none of them with its error: those read
+// before were returned beside it, which a host acting on the list would take for all there are.
+func TestConflictsListsNoneWhereItsReadFails(t *testing.T) {
+	h := labeled(t, banks)
+	ctx := t.Context()
+	h.as(t, "ann")
+	h.as(t, "bob")
+	// As a catalog change leaves them: written around the change check.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'tenant', 't1', 'user', 'ann', 'bank.a'), ('t1', 'tenant', 't1', 'user', 'ann', 'bank.b'),
+		  ('t1', 'tenant', 't1', 'user', 'bob', 'bank.a'), ('t1', 'tenant', 't1', 'user', 'bob', 'bank.c')`); err != nil {
+		t.Fatal(err)
+	}
+	if conflicts, err := h.authz.Conflicts(ctx, "t1"); err != nil || len(conflicts) != 2 {
+		t.Fatalf("Conflicts = %+v, %v", conflicts, err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if conflicts, err := h.authz.WithTx(&cutShortTx{Tx: tx}).Conflicts(ctx, "t1"); !errors.Is(err, errCutShort) || conflicts != nil {
+		t.Fatalf("Conflicts whose read failed after one = %+v, %v", conflicts, err)
+	}
+}
+
+// errCutShort is how cutShortTx fails a read.
+var errCutShort = errors.New("the read was cut short")
+
+// cutShortTx is a transaction whose batches' reads fail once they have read a row, as one whose
+// connection is lost partway through them does.
+type cutShortTx struct{ pgx.Tx }
+
+func (tx *cutShortTx) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	return cutShortBatch{tx.Tx.SendBatch(ctx, b)}
+}
+
+// cutShortBatch is a batch cutShortTx sent.
+type cutShortBatch struct{ pgx.BatchResults }
+
+func (b cutShortBatch) Query() (pgx.Rows, error) {
+	rows, err := b.BatchResults.Query()
+	if err != nil {
+		return rows, err
+	}
+	return &cutShortRows{Rows: rows}, nil
+}
+
+// cutShortRows are rows that fail once one is read.
+type cutShortRows struct {
+	pgx.Rows
+	read bool
+}
+
+func (r *cutShortRows) Next() bool {
+	if r.read {
+		return false
+	}
+	r.read = true
+	return r.Rows.Next()
+}
+
+func (r *cutShortRows) Err() error {
+	if r.read {
+		return errCutShort
+	}
+	return r.Rows.Err()
+}
+
 // As of a time, Conflicts reads, of history, the versions of the grants and eligibilities of the
 // roles giving values, the custom ones it reads in its statement too, by history's index on roles:
 // matched against roles the statement reads, a role is found by no index, so it would read every

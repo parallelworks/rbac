@@ -8738,6 +8738,138 @@ func TestDefiningARoleCreatedWhileItWaitsAsksTheConstraintsAgain(t *testing.T) {
 	}
 }
 
+// Under the tenant's lock SetRole and DeleteRole decide the actor's power to define roles, its
+// label values and the denies binding it as of one moment, though DeleteExpired, which takes no
+// lock, can delete what binds it between their statements. Here a deny of changing grants on the
+// cluster the role is granted on, naming the group that lets the actor define roles, is set while
+// the change waits for the tenant, and once its transaction has read the actor's authority,
+// DeleteExpired, by a clock past the end of the actor's place in that group but for the change's
+// still in force, removes it: at no moment did the actor hold the power and escape the deny, so the
+// change is tried again, or where a deny below the tenant bound the actor before, so the change
+// read the cluster from the host then, refused. Read apart, the deny after the place was removed,
+// the role was changed, and its grant on the cluster revoked or narrowed.
+func TestARoleChangeDecidesThePowerAndTheDenyItActsByAsOfOneMoment(t *testing.T) {
+	r := rbac.RoleDefinition{ID: "custom.r", Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
+	for _, bound := range []bool{false, true} {
+		for name, change := range map[string]func(h *harness, actor rbac.Subject) error{
+			"narrowing it": func(h *harness, actor rbac.Subject) error {
+				narrowed := r
+				narrowed.Permissions = []rbac.Permission{view}
+				return h.authz.SetRole(h.ctx, actor, "t1", narrowed)
+			},
+			"deleting it": func(h *harness, actor rbac.Subject) error { return h.authz.DeleteRole(h.ctx, actor, "t1", r.ID) },
+		} {
+			testRoleChangeAsOfOneMoment(t, r, bound, name, change)
+		}
+	}
+}
+
+// testRoleChangeAsOfOneMoment is TestARoleChangeDecidesThePowerAndTheDenyItActsByAsOfOneMoment's
+// change to r, where bound, by an actor a deny on another cluster binds before the change.
+func testRoleChangeAsOfOneMoment(t *testing.T, r rbac.RoleDefinition, bound bool, name string, change func(h *harness, actor rbac.Subject) error) {
+	t.Helper()
+	t.Run(fmt.Sprintf("%s, bound below before %t", name, bound), func(t *testing.T) {
+		h := setup(t)
+		ctx := t.Context()
+		admin := roleAdmin(t, h)
+		if err := h.authz.SetRole(ctx, admin, "t1", r); err != nil {
+			t.Fatal(err)
+		}
+		h.seed(t, grant(cluster.Scope(), r.ID, rbac.User, "v"), grant(rbac.TenantRoot("t1"), "tenant.roles", rbac.Group, "admins"),
+			grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "x"))
+		x := h.as(t, "x")
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, expires_at)
+				VALUES ('t1', 'admins', 'user', 'x', $1)`, h.now.Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		// Of another permission, so it stops nothing.
+		if bound {
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+					VALUES ('t1', 'cluster', 'c2', 'rootless', '{user:x}', ARRAY[$1::text])`, root); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// The host's transaction holds the tenant, so the change waits for it once it has checked
+		// what it can before.
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+		if err := rbac.Lock(ctx, tx, "t1", nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		var pid int32
+		if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+			t.Fatal(err)
+		}
+		armed := make(chan struct{})
+		var expired int64
+		var expiring error
+		rbac.SetReadingRoles(t, func() {
+			select {
+			case <-armed:
+			default:
+				return
+			}
+			if expiring != nil || expired > 0 {
+				return
+			}
+			// Past the place's end, on the clock DeleteExpired reads; the change has read its own.
+			h.now = h.now.Add(2 * time.Hour)
+			bounded, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			expired, expiring = h.authz.DeleteExpired(bounded)
+		})
+		done := make(chan error, 1)
+		go func() { done <- change(h, x) }()
+		waitUntil := time.Now().Add(30 * time.Second)
+		for waiting := false; !waiting; {
+			select {
+			case err := <-done:
+				t.Fatalf("the change didn't wait for the host: %v", err)
+			default:
+			}
+			if time.Now().After(waitUntil) {
+				t.Fatal("the change never waited for the host's transaction")
+			}
+			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity
+					WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND $1::int = ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+				VALUES ('t1', 'cluster', 'c1', 'frozen', '{group:admins}', ARRAY[$1::text])`, grantC); err != nil {
+			t.Fatal(err)
+		}
+		close(armed)
+		if err := tx.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err = <-done:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the change didn't end once the host's transaction did")
+		}
+		if expiring != nil || expired == 0 {
+			t.Fatalf("DeleteExpired removed %d rows while the change ran: %v", expired, expiring)
+		}
+		var denied *rbac.DeniedError
+		if refused := errors.As(err, &denied) && denied.Permission == grantC; bound && !refused || !bound && !errors.Is(err, rbac.ErrConflict) {
+			t.Errorf("custom.r was changed by an actor that held the power to define roles and escaped the deny at no moment: %v", err)
+		}
+		var perms []string
+		if err := h.pool.QueryRow(ctx, `SELECT permissions FROM rbac_roles WHERE tenant = 't1' AND id = $1`, r.ID).Scan(&perms); err != nil ||
+			!slices.Equal(perms, []string{string(login), string(view)}) {
+			t.Errorf("custom.r gives %v, %v", perms, err)
+		}
+		var grants int
+		if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM rbac_grants WHERE tenant = 't1' AND role = $1`, r.ID).Scan(&grants); err != nil || grants != 1 {
+			t.Errorf("custom.r is granted %d times, %v", grants, err)
+		}
+	})
+}
+
 func TestPublicCustomRolesThatChangeAccessGiveNothingInSearches(t *testing.T) {
 	share := rbac.RoleDefinition{ID: "cluster.share", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}}
 	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), share) })
@@ -9713,7 +9845,177 @@ func TestAReadLeavesTheHostItsPlannerSettingsWhereItFails(t *testing.T) {
 	}
 }
 
-// refusingTx is a transaction whose queries holding sql fail before they are sent.
+// A read planned with settings of its own leaves its session as it found it however it ends, so a
+// pool's next caller, or a host's transaction going on, plans with the host's: where it reads, where
+// its statement fails on the server, where its reading of the rows fails, and where that panics,
+// which the host recovers from. On the pool, and in the host's transaction or a savepoint of it, the
+// host rolling back to that where the call failed; and on a DB that sends no batches, which wraps
+// either. A panic left the batch unread, so the pool never had its connection back, and the host's
+// transaction could run nothing more.
+func TestAReadPlannedAloneLeavesItsSessionAsItFoundItHoweverItEnds(t *testing.T) {
+	ctx := t.Context()
+	schema := pgtest.Open(t, "pool_max_conns=1").Config()
+	const panicked = "the read panicked"
+	ends := map[string]struct {
+		sql  string
+		read func(pgx.Rows) error
+	}{
+		"it reads": {`SELECT current_setting('enable_seqscan')`, func(rows pgx.Rows) error {
+			var during string
+			if _, err := pgx.ForEachRow(rows, []any{&during}, func() error { return nil }); err != nil {
+				return err
+			}
+			if during != "off" {
+				return fmt.Errorf("enable_seqscan = %q as it read", during)
+			}
+			return nil
+		}},
+		"its statement fails": {`SELECT 1 / (SELECT 0)`, func(rows pgx.Rows) error {
+			_, err := pgx.ForEachRow(rows, nil, func() error { return nil })
+			return err
+		}},
+		"its read fails": {`SELECT 1`, func(rows pgx.Rows) error { return errors.New("the read failed") }},
+		"its read panics": {`SELECT 1`, func(rows pgx.Rows) error {
+			rows.Next()
+			panic(panicked)
+		}},
+	}
+	on := map[string]func(pool *pgxpool.Pool, tx pgx.Tx) rbac.DB{
+		"the pool":                               func(pool *pgxpool.Pool, _ pgx.Tx) rbac.DB { return pool },
+		"a DB that sends no batches on the pool": func(pool *pgxpool.Pool, _ pgx.Tx) rbac.DB { return unbatched{pool} },
+		"the host's transaction":                 func(_ *pgxpool.Pool, tx pgx.Tx) rbac.DB { return tx },
+		"a DB that sends no batches on the host's transaction": func(_ *pgxpool.Pool, tx pgx.Tx) rbac.DB { return hostTx{tx} },
+	}
+	for name, db := range on {
+		for how, end := range ends {
+			t.Run(name+", where "+how, func(t *testing.T) {
+				bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
+				defer cancel()
+				// A pool of one connection of its own, which closes only once it has it back.
+				pool, err := pgxpool.NewWithConfig(bounded, schema)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					closed := make(chan struct{})
+					go func() {
+						pool.Close()
+						close(closed)
+					}()
+					select {
+					case <-closed:
+					case <-time.After(10 * time.Second):
+						t.Error("the pool never had its connection back")
+					}
+				}()
+				var host pgx.Tx
+				if strings.Contains(name, "host's transaction") {
+					var err error
+					if host, err = pool.Begin(bounded); err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = host.Rollback(context.WithoutCancel(ctx)) }()
+					if _, err := host.Exec(bounded, `SAVEPOINT before`); err != nil {
+						t.Fatal(err)
+					}
+				}
+				err = func() (err error) {
+					defer func() {
+						if r := recover(); r != nil {
+							if r != panicked {
+								panic(r)
+							}
+							err = errors.New(panicked)
+						}
+					}()
+					return rbac.Planned(bounded, db(pool, host), end.read, end.sql)
+				}()
+				if (err == nil) != (how == "it reads") {
+					t.Fatalf("the read returned %v", err)
+				}
+				// As a host whose call failed, back to before it, but where it panicked after its
+				// statements ran, which the host goes on from.
+				if err != nil && host != nil && how != "its read panics" {
+					if _, err := host.Exec(bounded, `ROLLBACK TO SAVEPOINT before`); err != nil {
+						t.Fatal(err)
+					}
+				}
+				var q rbac.DB = pool
+				if host != nil {
+					q = host
+				}
+				var seqscan string
+				if err := q.QueryRow(bounded, `SELECT current_setting('enable_seqscan')`).Scan(&seqscan); err != nil || seqscan != "on" {
+					t.Errorf("enable_seqscan = %q, %v, once the read ended", seqscan, err)
+				}
+			})
+		}
+	}
+}
+
+// A read planned with settings of its own, on a pool, runs with them and leaves them as they were,
+// whichever way the host has its pool send statements: each sends a batch as one transaction, its
+// statements before one Sync, or in one simple query, so what the first sets for the transaction
+// alone holds as the read runs, and where it fails, the rollback puts it back.
+func TestAReadPlannedAloneHoldsItsSettingsInEveryWayAPoolSendsStatements(t *testing.T) {
+	ctx := t.Context()
+	schema := pgtest.Open(t, "pool_max_conns=1").Config()
+	for _, mode := range []pgx.QueryExecMode{
+		pgx.QueryExecModeCacheStatement, pgx.QueryExecModeCacheDescribe, pgx.QueryExecModeDescribeExec,
+		pgx.QueryExecModeExec, pgx.QueryExecModeSimpleProtocol,
+	} {
+		t.Run(mode.String(), func(t *testing.T) {
+			bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			cfg := schema.Copy()
+			cfg.ConnConfig.DefaultQueryExecMode = mode
+			pool, err := pgxpool.NewWithConfig(bounded, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pool.Close()
+			// Twice, as a statement a connection has prepared runs again.
+			for range 2 {
+				var during string
+				if err := rbac.Planned(bounded, pool, func(rows pgx.Rows) error {
+					_, err := pgx.ForEachRow(rows, []any{&during}, func() error { return nil })
+					return err
+				}, `SELECT current_setting('enable_seqscan') WHERE $1::text[] IS NOT NULL`, []string{"t1"}); err != nil || during != "off" {
+					t.Fatalf("enable_seqscan = %q, %v, as it read", during, err)
+				}
+				if err := rbac.Planned(bounded, pool, func(rows pgx.Rows) error {
+					_, err := pgx.ForEachRow(rows, nil, func() error { return nil })
+					return err
+				}, `SELECT 1 / (SELECT 0)`); err == nil {
+					t.Fatal("a statement dividing by zero ran")
+				}
+				var seqscan string
+				if err := pool.QueryRow(bounded, `SELECT current_setting('enable_seqscan')`).Scan(&seqscan); err != nil || seqscan != "on" {
+					t.Fatalf("enable_seqscan = %q, %v, once the reads ended", seqscan, err)
+				}
+			}
+		})
+	}
+}
+
+// unbatched is a host's own DB around a pool that sends no batches.
+type unbatched struct{ pool *pgxpool.Pool }
+
+func (u unbatched) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	return u.pool.Exec(ctx, sql, args...)
+}
+
+func (u unbatched) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	return u.pool.Query(ctx, sql, args...)
+}
+
+func (u unbatched) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	return u.pool.QueryRow(ctx, sql, args...)
+}
+
+func (u unbatched) Begin(ctx context.Context) (pgx.Tx, error) { return u.pool.Begin(ctx) }
+
+// refusingTx is a transaction whose queries, and batches, holding sql fail before they are sent.
 type refusingTx struct {
 	pgx.Tx
 	sql string
@@ -9728,6 +10030,33 @@ func (tx *refusingTx) Query(ctx context.Context, sql string, args ...any) (pgx.R
 	}
 	return tx.Tx.Query(ctx, sql, args...)
 }
+
+func (tx *refusingTx) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	for _, q := range b.QueuedQueries {
+		if strings.Contains(q.SQL, tx.sql) {
+			return refusedBatch{}
+		}
+	}
+	return tx.Tx.SendBatch(ctx, b)
+}
+
+// refusedBatch is a batch refusingTx refused, whose every result is the refusal.
+type refusedBatch struct{}
+
+func (refusedBatch) Exec() (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, errors.New(refused)
+}
+
+func (refusedBatch) Query() (pgx.Rows, error) { return nil, errors.New(refused) }
+
+func (b refusedBatch) QueryRow() pgx.Row { return refusedRow{} }
+
+func (refusedBatch) Close() error { return errors.New(refused) }
+
+// refusedRow is a row refusingTx refused.
+type refusedRow struct{}
+
+func (refusedRow) Scan(...any) error { return errors.New(refused) }
 
 // scanned is how many rows of table tx has read by scanning it, whole or through a bitmap, and how
 // many entries of its indexes by scanning them, as an index scan finds each row it fetches.
@@ -12568,9 +12897,9 @@ func TestDeletingARoleEndsItsEligibilities(t *testing.T) {
 	}
 }
 
-// racing is a pool on which change commits just before the first statement that reads the table
-// reading names, or denies where it names none, as another session's change would commit between
-// two of a read's statements.
+// racing is a pool on which change commits just before the first statement, or batch holding one,
+// that reads the table reading names, or denies where it names none, as another session's change
+// would commit between two of a read's statements.
 type racing struct {
 	*pgxpool.Pool
 	reading string
@@ -12592,6 +12921,18 @@ func (r *racing) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, 
 func (r *racing) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	r.race(sql)
 	return r.Pool.QueryRow(ctx, sql, args...)
+}
+
+func (r *racing) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	r.raceBatch(b)
+	return r.Pool.SendBatch(ctx, b)
+}
+
+// raceBatch races before a batch holding a statement race would race before.
+func (r *racing) raceBatch(b *pgx.Batch) {
+	for _, q := range b.QueuedQueries {
+		r.race(q.SQL)
+	}
 }
 
 func (r *racing) BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error) {
@@ -12617,6 +12958,11 @@ func (tx *racingTx) Query(ctx context.Context, sql string, args ...any) (pgx.Row
 func (tx *racingTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	tx.r.race(sql)
 	return tx.Tx.QueryRow(ctx, sql, args...)
+}
+
+func (tx *racingTx) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	tx.r.raceBatch(b)
+	return tx.Tx.SendBatch(ctx, b)
 }
 
 func TestAReadOfSeveralStatementsReadsOneSnapshot(t *testing.T) {

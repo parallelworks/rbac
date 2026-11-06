@@ -401,8 +401,9 @@ func canonicalSQL(col string) string {
 // while this one waited for the tenant is refused, to be tried again: the constraints were asked
 // about it as it was, as is one granted meanwhile on a scope of a type they weren't asked about,
 // or, it or a role listing it, on a scope the host or the constraints weren't asked about, or no
-// longer has so that the change gives more there. One deleted meanwhile is created, as its grants
-// went with it.
+// longer has so that the change gives more there, or where a deny below the tenant came to bind the
+// actor meanwhile, so the host wasn't asked about the scopes on whose paths it may be. One deleted
+// meanwhile is created, as its grants went with it.
 //
 // Redefining a role so that its grants give more, or so that it becomes privileged, changes what
 // grants already made give: Config.ValidateGrant is asked about each of its grants and
@@ -433,7 +434,7 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 	root := tenantResource(tenant)
 	// Whether the actor may define roles at all, before the definition, so a refused actor
 	// learns nothing of the catalog from what is invalid.
-	if _, err := a.mayDefineRoles(ctx, actor, root); err != nil {
+	if _, _, err := a.mayDefineRoles(ctx, actor, root, false); err != nil {
 		return err
 	}
 	r = canonical(r)
@@ -445,7 +446,7 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 	// Checked in full before the transaction too, so a refused actor never locks the tenant. The
 	// constraints on defining roles ran above; those on what the role gives run here, once.
 	cs := a.constrain(ctx, actor, root)
-	au, err := a.mayDefine(ctx, a.db, actor, root, &r, cs)
+	au, read, err := a.mayDefine(ctx, a.db, actor, root, &r, cs, true, nil)
 	if err != nil {
 		return err
 	}
@@ -453,12 +454,13 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 	change := fmt.Sprintf("changing what %s's grants give", r.ID)
 	d := a.redefining(au.roles.custom, r)
 	var reach roleReach
-	if existed && !sameAccess(checked, r) {
+	reaching := existed && !sameAccess(checked, r)
+	if reaching {
 		// Its grants are on scopes of the types it is for, and on those it was for before and is
 		// for again, whose grants it brings back. Narrowed, it takes access away, as deleting it
 		// does, but where a grant of it gives more, as one to the tenant's members does once it is
 		// no longer privileged.
-		if reach, err = a.roleReachOf(ctx, actor, au, tenant, r.ID, slices.Concat(checked.ResourceTypes, r.ResourceTypes), &d, change); err != nil {
+		if reach, err = a.roleReachOf(ctx, actor, au, read, tenant, r.ID, slices.Concat(checked.ResourceTypes, r.ResourceTypes), &d, change); err != nil {
 			return err
 		}
 	}
@@ -473,7 +475,8 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 			return ChangeEvent{}, gains{}, err
 		}
 		cs.seal()
-		au, err := a.mayDefine(ctx, tx, actor, root, &r, cs)
+		// With what a deny below the tenant may stop it by, in one statement (roleRead).
+		au, read, err := a.mayDefine(ctx, tx, actor, root, &r, cs, reaching, reach.resolved())
 		if err != nil {
 			return ChangeEvent{}, gains{}, err
 		}
@@ -484,7 +487,7 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 		// Again on the denies read under the lock, which a deny set meanwhile is among, and on the
 		// scopes its grants are on now, which roleReachOf checked as they were.
 		if ok && !sameAccess(old, r) {
-			if err := a.stillReaches(ctx, tx, actor, au, tenant, r.ID, slices.Concat(old.ResourceTypes, r.ResourceTypes), reach, change); err != nil {
+			if err := a.stillReaches(ctx, tx, au, read, tenant, r.ID, slices.Concat(old.ResourceTypes, r.ResourceTypes), reach, change); err != nil {
 				return ChangeEvent{}, gains{}, err
 			}
 		}
@@ -616,8 +619,8 @@ func (a *Authorizer) tenantBuckets(ctx context.Context, q DB, tenant string, id 
 // off, or a deny on the path of a scope it is granted on that removes the actor's power to change
 // grants there, stops it, as in SetRole.
 // Deleting a role that doesn't exist does nothing; one changed while the deletion waited for the
-// tenant, or granted meanwhile on a scope of a type the constraints weren't asked about, is
-// refused, as in SetRole.
+// tenant, or granted meanwhile on a scope of a type the constraints weren't asked about, or where a
+// deny below the tenant came to bind the actor meanwhile, is refused, as in SetRole.
 func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant string, id Role) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor.Principal, "DeleteRole")
@@ -629,7 +632,7 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		return err
 	}
 	root := tenantResource(tenant)
-	au, err := a.mayDefineRoles(ctx, actor, root)
+	au, read, err := a.mayDefineRoles(ctx, actor, root, true)
 	if err != nil {
 		return err
 	}
@@ -643,7 +646,7 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 	change := "revoking " + string(id)
 	var reach roleReach
 	if existed {
-		if reach, err = a.roleReachOf(ctx, actor, au, tenant, id, checked.ResourceTypes, nil, change); err != nil {
+		if reach, err = a.roleReachOf(ctx, actor, au, read, tenant, id, checked.ResourceTypes, nil, change); err != nil {
 			return err
 		}
 	}
@@ -662,7 +665,8 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		if err := tx.SendBatch(ctx, b).Close(); err != nil {
 			return ChangeEvent{}, err
 		}
-		au, err := a.mayDefine(ctx, tx, actor, root, nil, nil)
+		// With what a deny below the tenant may stop it by, in one statement (roleRead).
+		au, read, err := a.mayDefine(ctx, tx, actor, root, nil, nil, existed, reach.resolved())
 		if err != nil {
 			return ChangeEvent{}, err
 		}
@@ -674,7 +678,7 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 			return ChangeEvent{}, changedMeanwhile(id)
 		}
 		if existed {
-			if err := a.stillReaches(ctx, tx, actor, au, tenant, id, checked.ResourceTypes, reach, change); err != nil {
+			if err := a.stillReaches(ctx, tx, au, read, tenant, id, checked.ResourceTypes, reach, change); err != nil {
 				return ChangeEvent{}, err
 			}
 		}
@@ -944,7 +948,7 @@ func (a *Authorizer) revalidate(ctx context.Context, actor Subject, tenant strin
 // no longer has it, the role as it was and as it will be where a change redefines it, and the
 // labels of the scopes they are on and, where it will give more, of those roles listing it are
 // granted on (listing), and for a redefinition, what the constraints remove from the actor where it
-// gives more (handing).
+// gives more (handing). denied is whether a deny below the tenant bound the actor (roleRead).
 type roleReach struct {
 	types           []string
 	on              map[Scope]Resource
@@ -952,6 +956,21 @@ type roleReach struct {
 	redefined       *redefinition
 	labels, listing labeling
 	handing         *handing
+	denied          bool
+}
+
+// resolved are the scopes the change resolved before its transaction, where a deny below the tenant
+// bound the actor, whose denies on their paths it reads again under the tenant's lock, with the
+// actor's authority (roleRead), in the order of their keys.
+func (r roleReach) resolved() []Resource {
+	if !r.denied {
+		return nil
+	}
+	var on []Resource
+	for _, s := range slices.SortedFunc(maps.Keys(r.on), scopeOrder) {
+		on = append(on, r.on[s])
+	}
+	return on
 }
 
 // handing is what the constraints remove from the actor on the scopes a redefinition of a custom
@@ -1158,8 +1177,8 @@ func (a *Authorizer) handingOn(custom map[Role]RoleDefinition, id Role, def Role
 // granted there to hand it on, a scope the host no longer has (ErrNotFound) is read as stored, with
 // no containers or label, which stillReaches refuses once the change gives more there. au is the
 // actor's authority on the tenant, which mayDefine checked the role on.
-func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authority, tenant string, id Role, types []string, d *redefinition,
-	change string,
+func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authority, read roleRead, tenant string, id Role, types []string,
+	d *redefinition, change string,
 ) (roleReach, error) {
 	reach := roleReach{redefined: d}
 	scopes, err := a.reachedBy(ctx, a.db, tenant, id, au.roles.custom, d)
@@ -1173,12 +1192,8 @@ func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authorit
 	if err := a.changesDenied(au, tenant, reach.types, change); err != nil {
 		return roleReach{}, err
 	}
-	denied := false
-	if scopes.any() {
-		if denied, err = a.deniedBelow(ctx, a.db, tenant, actor, scopes.more()); err != nil {
-			return roleReach{}, err
-		}
-	}
+	denied := read.denied(scopes)
+	reach.denied = denied
 	// Granted nowhere yet, it has no label to clear, so one granted while the change waits is
 	// refused, to be tried again.
 	if reach.labels, err = a.labelsAsked(ctx, actor, tenant, len(scopes.own) > 0); err != nil {
@@ -1264,7 +1279,7 @@ func (a *Authorizer) roleReachOf(ctx context.Context, actor Subject, au authorit
 				l.labels.labeled = append(l.labels.labeled, r)
 			}
 		}
-		if err := a.labelsHeld(ctx, a.db, *l.labels); err != nil {
+		if err := a.labelsHeld(ctx, a.db, *l.labels, nil); err != nil {
 			return roleReach{}, err
 		}
 	}
@@ -1280,9 +1295,11 @@ func scopeOrder(x, y Scope) int { return strings.Compare(x.Key(), y.Key()) }
 // constraints weren't asked about, or, where a deny below the tenant now binds the actor or a label
 // asks, one roleReachOf didn't ask the host about, as one the role, or one listing it, was granted
 // on while the change waited, refuses the change, to be tried again, as does one it read as stored
-// that the change now gives more on. au is the actor's authority on the tenant read under the lock,
-// with the tenant's custom roles as they are.
-func (a *Authorizer) stillReaches(ctx context.Context, tx pgx.Tx, actor Subject, au authority, tenant string, id Role, types []string,
+// that the change now gives more on, and so does a deny below the tenant binding the actor where
+// none did before the transaction. au is the actor's authority on the tenant read under the lock,
+// with the tenant's custom roles as they are, and read what mayDefine read with it, by which the
+// denies and the label values are decided, as of the moment of its power.
+func (a *Authorizer) stillReaches(ctx context.Context, tx pgx.Tx, au authority, read roleRead, tenant string, id Role, types []string,
 	checked roleReach, change string,
 ) error {
 	scopes, err := a.reachedBy(ctx, tx, tenant, id, au.roles.custom, checked.redefined)
@@ -1296,11 +1313,11 @@ func (a *Authorizer) stillReaches(ctx context.Context, tx pgx.Tx, actor Subject,
 	if err := a.changesDenied(au, tenant, types, change); err != nil {
 		return err
 	}
-	denied := false
-	if scopes.any() {
-		if denied, err = a.deniedBelow(ctx, tx, tenant, actor, scopes.more()); err != nil {
-			return err
-		}
+	// As of the moment its power was read, where none bound it before the transaction, the scopes
+	// weren't read with it.
+	denied := read.denied(scopes)
+	if denied && !checked.denied {
+		return fmt.Errorf("%w: a deny binding the actor below the tenant was set while this change waited; try again", ErrConflict)
 	}
 	unchecked := func(ss []Scope) error {
 		for _, s := range ss {
@@ -1329,7 +1346,7 @@ func (a *Authorizer) stillReaches(ctx context.Context, tx pgx.Tx, actor Subject,
 		}
 	}
 	if denied {
-		if err := a.scopesDenied(ctx, tx, actor, au, tenant, scopes, checked, change); err != nil {
+		if err := a.scopesDeniedAt(au, read.on, tenant, scopes, checked, change); err != nil {
 			return err
 		}
 	}
@@ -1341,29 +1358,42 @@ func (a *Authorizer) stillReaches(ctx context.Context, tx pgx.Tx, actor Subject,
 			}
 		}
 	}
-	if err := a.stillLabeled(ctx, tx, checked.labels); err != nil {
+	if err := a.stillLabeled(ctx, tx, checked.labels, au.values); err != nil {
 		return err
 	}
-	return a.stillLabeled(ctx, tx, checked.listing)
+	return a.stillLabeled(ctx, tx, checked.listing, au.values)
 }
 
-// deniedBelow reports, reading on q, whether a deny on a scope other than the tenant binds the
-// actor, or, for a change that gives more there (exempting), exempts it only until a time, as
-// authorities reads the denies on a path: one taking access away hands nothing on, so such a deny
-// can't refuse it. They are found by the keys it is bound by (naming), so the tenant's denies of
-// others aren't read, and its paths to its groups are walked only for one exempting it.
-func (a *Authorizer) deniedBelow(ctx context.Context, q DB, tenant string, actor Subject, exempting bool) (bool, error) {
-	ctes, until := keysSQL("$1::text", "$2::text", "$3"), ""
-	if exempting {
-		ctes += `, ` + endsSQL("$2::text", "$3") + `, ` + lastingSQL("$1::text", "$2::text")
-		until = ` OR ` + exemptUntilSQL("principals", "exempt") + ` IS NOT NULL`
+// belowSQL is SQL for whether a deny in the tenant $1 on a scope other than the tenant binds a
+// subject, by the keys keysSQL defines, or with until, exempts it only until a time, by the paths
+// lastingSQL defines, as authorities reads the denies on a path. Each is found by the keys it is
+// bound by (naming), so the tenant's denies of others aren't read.
+func belowSQL(until bool) string {
+	which := `NOT ` + keyed("exempt", "SELECT k FROM exempted")
+	if until {
+		which = exemptUntilSQL("principals", "exempt") + ` IS NOT NULL`
 	}
-	var denied bool
-	err := q.QueryRow(ctx, `WITH RECURSIVE `+ctes+`
-		SELECT EXISTS (SELECT FROM rbac_denies WHERE `+naming("principals", "ARRAY(SELECT k FROM bound)")+` AND scope_type <> $4
-		  AND (NOT `+keyed("exempt", "SELECT k FROM exempted")+until+`))`,
-		tenant, actor.identityKey(), a.cfg.Now(), TenantScope).Scan(&denied)
-	return denied, err
+	return `EXISTS (SELECT FROM rbac_denies WHERE ` + naming("principals", "ARRAY(SELECT k FROM bound)") + ` AND scope_type <> '` + TenantScope + `'
+		  AND ` + which + `)`
+}
+
+// roleRead is what a change to a custom role reads of its actor with its authority on the tenant,
+// in one statement (mayDefine): whether a deny on a scope other than the tenant binds it, or
+// exempts it only until a time (belowSQL), and under the tenant's lock, where one bound it before
+// the transaction, its authority on each scope the change resolved then, for the denies on its path
+// (scopesDenied). Read apart, DeleteExpired, which takes no lock, could remove a place in a group
+// the actor acts by between them, and a deny naming that group, or the tenant's members, which
+// bound it as it held its power, read as binding it no longer.
+type roleRead struct {
+	bound, exemptUntil bool
+	on                 map[Scope]authority
+}
+
+// denied reports whether a deny below the tenant may stop a change reaching scopes: one binding the
+// actor, or for a change that gives more there, one exempting it only until a time. One taking
+// access away hands nothing on, so such a deny can't refuse it.
+func (r roleRead) denied(scopes reached) bool {
+	return scopes.any() && (r.bound || scopes.more() && r.exemptUntil)
 }
 
 // scopesDenied returns why a deny stops the actor changing a custom role, reading the denies on the
@@ -1390,6 +1420,24 @@ func (a *Authorizer) scopesDenied(ctx context.Context, q DB, actor Subject, au a
 	aus, err := a.authorities(ctx, q, actor, on, nil)
 	if err != nil {
 		return err
+	}
+	at := make(map[Scope]authority, len(on))
+	for i, r := range on {
+		at[r.Scope()] = aus[i]
+	}
+	return a.scopesDeniedAt(au, at, tenant, scopes, reach, change)
+}
+
+// scopesDeniedAt is scopesDenied by the actor's authority on each scope, at, read already, as under
+// the tenant's lock with its authority on the tenant (roleRead).
+func (a *Authorizer) scopesDeniedAt(au authority, at map[Scope]authority, tenant string, scopes reached, reach roleReach, change string) error {
+	var on []Resource
+	var aus []authority
+	for _, s := range slices.Concat(scopes.own, slices.SortedFunc(maps.Keys(scopes.listed), scopeOrder)) {
+		on, aus = append(on, reach.on[s]), append(aus, at[s])
+	}
+	if len(on) == 0 {
+		return nil
 	}
 	own, listing := aus[:len(scopes.own)], aus[len(scopes.own):]
 	for i, at := range own {
@@ -1645,14 +1693,14 @@ func (a *Authorizer) labelsAsked(ctx context.Context, actor Subject, tenant stri
 	return l, err
 }
 
-// labelsHeld refuses, reading the actor's label values on q, a change to a role granted on a scope
-// whose label they don't satisfy.
-func (a *Authorizer) labelsHeld(ctx context.Context, q DB, l labeling) error {
+// labelsHeld refuses a change to a role granted on a scope whose label the actor's values, decided
+// by values, or where nil read on q, don't satisfy.
+func (a *Authorizer) labelsHeld(ctx context.Context, q DB, l labeling, values *valuesRead) error {
 	if !l.asks() {
 		return nil
 	}
 	for _, on := range l.labeled {
-		if err := a.labelAllows(ctx, q, on, nil, l.cs, GrantPermission(on.Type), nil); err != nil {
+		if err := a.labelAllows(ctx, q, on, nil, l.cs, GrantPermission(on.Type), values); err != nil {
 			return err
 		}
 	}
@@ -1661,16 +1709,16 @@ func (a *Authorizer) labelsHeld(ctx context.Context, q DB, l labeling) error {
 
 // stillLabeled refuses, under the tenant's lock, a change roleReachOf checked whose actor no longer
 // holds the values a label asks for, as one revoked meanwhile, or, where they satisfied every
-// label, no longer does.
-func (a *Authorizer) stillLabeled(ctx context.Context, tx pgx.Tx, checked labeling) error {
+// label, no longer does: decided by values, read with its power to define roles (roleRead).
+func (a *Authorizer) stillLabeled(ctx context.Context, tx pgx.Tx, checked labeling, values *valuesRead) error {
 	if checked.cs == nil {
 		return nil
 	}
 	checked.cs.seal()
 	if checked.cleared {
-		return a.stillClearsAll(ctx, tx, checked.cs, nil)
+		return a.stillClearsAll(ctx, tx, checked.cs, values)
 	}
-	return a.labelsHeld(ctx, tx, checked)
+	return a.labelsHeld(ctx, tx, checked, values)
 }
 
 // customRoleRows is SQL selecting cols of the rows of table, rbac_grants or rbac_eligibilities, in
@@ -1783,43 +1831,55 @@ func sameAccess(x, y RoleDefinition) bool {
 
 // mayDefineRoles checks, before the transaction, that actor may define a tenant's roles. The
 // constraints run here only, as in Apply: a hook that queries the pool while the transaction
-// holds a connection can wait forever on a busy pool.
-func (a *Authorizer) mayDefineRoles(ctx context.Context, actor Subject, root Resource) (authority, error) {
+// holds a connection can wait forever on a busy pool. With below, it reads what a deny below the
+// tenant may stop a change to a custom role by (roleRead), with the actor's authority.
+func (a *Authorizer) mayDefineRoles(ctx context.Context, actor Subject, root Resource, below bool) (authority, roleRead, error) {
 	scope := root.Scope()
 	if actor.Principal == (Principal{}) {
-		return authority{}, &DeniedError{Permission: DefineRoles, Scope: scope, Reason: "an anonymous subject changes nothing"}
+		return authority{}, roleRead{}, &DeniedError{Permission: DefineRoles, Scope: scope, Reason: "an anonymous subject changes nothing"}
 	}
 	name, err := a.denied(ctx, ConstraintInput{Tenant: root.Tenant, ResourceType: TenantScope, Permission: DefineRoles, Subject: &actor, Resource: &root})
 	if err != nil {
-		return authority{}, err
+		return authority{}, roleRead{}, err
 	}
 	if name != "" {
-		return authority{}, &DeniedError{Permission: DefineRoles, Scope: scope, Reason: "removed by " + name}
+		return authority{}, roleRead{}, &DeniedError{Permission: DefineRoles, Scope: scope, Reason: "removed by " + name}
 	}
-	return a.mayDefine(ctx, a.db, actor, root, nil, nil)
+	return a.mayDefine(ctx, a.db, actor, root, nil, nil, below, nil)
 }
 
 // mayDefine checks that actor holds DefineRoles on the tenant, and with r, that it may define r:
 // that it holds everything r gives across the tenant, as granting r there would need, with no
 // role it may merely hand out standing in, since defining r changes what its grants give, and
 // none of it removed by a constraint (cs). It returns what it read; with r, every custom role of
-// the tenant.
-func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Resource, r *RoleDefinition, cs *constrained) (authority, error) {
+// the tenant; and where below, what a deny below the tenant may stop a change to a custom role by,
+// read in the same statement (roleRead): whether one binds the actor, and its authority on each of
+// on, the scopes the change resolved before its transaction.
+func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Resource, r *RoleDefinition, cs *constrained, below bool,
+	on []Resource,
+) (authority, roleRead, error) {
 	scope := root.Scope()
 	var ids []Role
 	if r != nil {
 		ids = append([]Role{r.ID}, r.GrantableRoles...)
 	}
-	au, err := a.authorityOn(ctx, q, actor, root, ids)
+	aus, got, err := a.authoritiesIn(ctx, q, actor, root.Tenant, append([]Resource{root}, on...), ids, alsoRead{below: below})
 	if err != nil {
-		return authority{}, err
+		return authority{}, roleRead{}, err
+	}
+	au, read := aus[0], roleRead{bound: got.bound, exemptUntil: got.exemptUntil}
+	if len(on) > 0 {
+		read.on = make(map[Scope]authority, len(on))
+		for i, x := range on {
+			read.on[x.Scope()] = aus[1+i]
+		}
 	}
 	au.constrained = cs
 	if !au.may(DefineRoles, TenantScope) {
-		return authority{}, &DeniedError{Permission: DefineRoles, Scope: scope, Reason: "the actor may not define roles here"}
+		return authority{}, roleRead{}, &DeniedError{Permission: DefineRoles, Scope: scope, Reason: "the actor may not define roles here"}
 	}
 	if r == nil {
-		return au, nil
+		return au, read, nil
 	}
 	// A role r lists is read as it will be, so one that lists itself is read as defined, while
 	// the actor's own grants of r give what r gives now: holding r is no license to widen it.
@@ -1828,7 +1888,7 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 	for _, id := range r.GrantableRoles {
 		listed, known := au.named(id)
 		if !known {
-			return authority{}, fmt.Errorf("%w: role %q: grantable role %q doesn't exist", ErrInvalid, r.ID, id)
+			return authority{}, roleRead{}, fmt.Errorf("%w: role %q: grantable role %q doesn't exist", ErrInvalid, r.ID, id)
 		}
 		if a.lets(*r, listed) {
 			continue
@@ -1842,14 +1902,14 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 			listedWas = was
 		}
 		if !existed || !slices.Contains(was.GrantableRoles, id) || a.lets(was, listedWas) {
-			return authority{}, fmt.Errorf("%w: role %q: grantable role %q can be granted on no type of the role's `:grant` permissions", ErrInvalid, r.ID, id)
+			return authority{}, roleRead{}, fmt.Errorf("%w: role %q: grantable role %q can be granted on no type of the role's `:grant` permissions", ErrInvalid, r.ID, id)
 		}
 	}
 	seen := newChecked()
 	// A definition never ends, so what the actor holds only until a time can't stand in.
 	if p, by, ok := a.holdsRole(au, *r, r.ResourceTypes, "", time.Time{}, seen); !ok {
 		reason := refusalBy(by, "define "+string(r.ID), p, fmt.Sprintf("the actor can't define %s without holding %s here", r.ID, p))
-		return authority{}, cmp.Or(cs.failed(), error(&DeniedError{Permission: p, Scope: scope, Reason: reason}))
+		return authority{}, roleRead{}, cmp.Or(cs.failed(), error(&DeniedError{Permission: p, Scope: scope, Reason: reason}))
 	}
 	// A role that lists r lets its holders grant r as it will be wherever it can be granted, a
 	// power its definer never had to have if r gave less or couldn't be granted there: the
@@ -1866,14 +1926,14 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 			}
 			if missing, by, ok := a.mayGrant(au, au.under(t, "", time.Time{}), t, *r, "", time.Time{}, seen); !ok {
 				reason := refusalBy(by, "define "+string(r.ID), missing, fmt.Sprintf("the actor can't define %s, which %s lists, without the power to grant it on a %s", r.ID, id, t))
-				return authority{}, cmp.Or(cs.failed(), error(&DeniedError{Permission: missing, Scope: scope, Reason: reason}))
+				return authority{}, roleRead{}, cmp.Or(cs.failed(), error(&DeniedError{Permission: missing, Scope: scope, Reason: reason}))
 			}
 		}
 	}
 	if err := cs.failed(); err != nil {
-		return authority{}, err
+		return authority{}, roleRead{}, err
 	}
-	return au, nil
+	return au, read, nil
 }
 
 // lets reports whether the holders of a role defined as r may grant listed through it, as

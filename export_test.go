@@ -401,6 +401,36 @@ func ExcludedOn(t *testing.T, a *Authorizer, actor Subject, on []Resource) (toge
 	return together, alone
 }
 
+// ReadAuthority reads, on a's DB, actor's authority on each of on, a tenant's resources, with the
+// types of scope whose power to change grants a deny anywhere in the tenant binding it lists, in
+// one statement, as a change reads what it acts by (authoritiesIn).
+func ReadAuthority(ctx context.Context, a *Authorizer, actor Subject, on []Resource) error {
+	a = a.still()
+	_, _, err := a.authoritiesIn(ctx, a.db, actor, on[0].Tenant, on, nil, alsoRead{grantsDenied: true})
+	return err
+}
+
+// ReadGrantsDenied reads, on a's DB, the types of scope whose power to change grants a deny
+// anywhere in a tenant binding actor lists, as a change to members reads them before its
+// transaction (grantsDenied).
+func ReadGrantsDenied(ctx context.Context, a *Authorizer, tenant string, actor Subject) error {
+	a = a.still()
+	_, err := a.grantsDenied(ctx, a.db, tenant, actor)
+	return err
+}
+
+// Planned reads sql on q with sequential scans off for its plan alone, as a check reads its
+// subject's grants (planned), handing its rows to read.
+func Planned(ctx context.Context, q DB, read func(pgx.Rows) error, sql string, args ...any) error {
+	return planned(ctx, q, indexed, read, sql, args...)
+}
+
+// HeldByMembers is why making custom role id privileged in tenant is refused at now, read on q, as
+// its tenant's members hold it (heldByMembers).
+func HeldByMembers(ctx context.Context, q DB, tenant string, id Role, now time.Time) error {
+	return heldByMembers(ctx, q, tenant, id, now)
+}
+
 // LabelValuesDecided is, for each of labels, the values it asks for that actor holds in tenant on
 // ctx's request: decided together, as a change checking them all by one read of what the actor's
 // values are decided by decides them, label after label; and each alone, by a read of its own, of
@@ -796,7 +826,7 @@ func DeniesMatched(t *testing.T, ctx context.Context, a *Authorizer, s Subject, 
 }
 
 // DeniesAnywhereMatched is each read of the denies binding s anywhere in a tenant: the types
-// ChangeMembers reads (grantsDenied), and whether SetRole finds one below the tenant (deniedBelow);
+// ChangeMembers reads (grantsDenied), and whether SetRole finds one below the tenant (belowSQL);
 // each with what the overlap of arrays finds for it. Each answers for every deny at once, so of
 // several binding s, any one decides it.
 func DeniesAnywhereMatched(t *testing.T, ctx context.Context, a *Authorizer, tenant string, s Subject) []DenyRead {
@@ -823,24 +853,27 @@ func anywhereMatched(t *testing.T, ctx context.Context, a *Authorizer, tenant st
 	reads := []DenyRead{{Read: "grants denied", Got: slices.Sorted(maps.Keys(types)), Want: slices.Sorted(maps.Keys(wanted))}}
 	// As a change reads them under its locks, with its authority on the tenant or on nothing.
 	for _, on := range [][]Resource{{tenantResource(tenant)}, nil} {
-		_, read, err := a.authoritiesIn(ctx, a.db, s, tenant, on, nil, true)
+		_, read, err := a.authoritiesIn(ctx, a.db, s, tenant, on, nil, alsoRead{grantsDenied: true})
 		if err != nil {
 			t.Fatal(err)
 		}
 		reads = append(reads, DenyRead{
 			Read: fmt.Sprint("grants denied with the authority on ", len(on), " resources"),
-			Got:  slices.Sorted(maps.Keys(read)), Want: slices.Sorted(maps.Keys(wanted)),
+			Got:  slices.Sorted(maps.Keys(read.grantsDenied)), Want: slices.Sorted(maps.Keys(wanted)),
 		})
 	}
+	// As a change to a custom role reads them with its authority on the tenant, before its
+	// transaction and under its lock.
+	_, below, err := a.authoritiesIn(ctx, a.db, s, tenant, []Resource{tenantResource(tenant)}, nil, alsoRead{below: true})
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, exempting := range []bool{false, true} {
-		below, err := a.deniedBelow(ctx, a.db, tenant, s, exempting)
-		if err != nil {
-			t.Fatal(err)
-		}
 		bound := slices.ContainsFunc(found, func(o overlapped) bool {
 			return !strings.HasPrefix(o.scope, TenantScope+":") && (o.binds() || exempting && !o.until.IsZero())
 		})
-		reads = append(reads, DenyRead{Read: fmt.Sprint("denied below, exempting ", exempting), Got: []string{fmt.Sprint(below)}, Want: []string{fmt.Sprint(bound)}})
+		got := below.bound || exempting && below.exemptUntil
+		reads = append(reads, DenyRead{Read: fmt.Sprint("denied below, exempting ", exempting), Got: []string{fmt.Sprint(got)}, Want: []string{fmt.Sprint(bound)}})
 	}
 	return reads
 }

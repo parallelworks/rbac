@@ -237,13 +237,18 @@ var all = broad{public: true, members: true}
 // be in, so suspending it, which gives it only the public's grants, lifts no deny from it. The
 // groups a group is in are looked up by its key, each on its own: joined to the tenant's members, a
 // generic plan, costing them by averages, can read every one to find a few. OFFSET 0 keeps the
-// planner from flattening it into that join.
+// planner from flattening it into that join. The identity's membership and places are looked up
+// by its key in a subquery, whose value no plan sees, as groupExists looks a group up: counted by
+// the tenant's selectivity and the identity's apart, one in every tenant was counted in a large one
+// as a thousand or more, and each group it is in as many again, so a check's statement was costed
+// at over a million, past jit_above_cost, and compiled for 400 ms before reading in a tenth of a
+// millisecond what it reads.
 func keysSQL(tenant, identity, now string) string {
 	return fmt.Sprintf(`membership AS (
-		SELECT guest, suspended FROM rbac_memberships WHERE tenant = %[1]s AND principal = %[2]s
+		SELECT guest, suspended FROM rbac_memberships WHERE tenant = %[1]s AND principal = (SELECT %[2]s)
 		  AND (expires_at IS NULL OR expires_at > %[3]s)
 	), groups(id) AS (
-		SELECT group_id FROM rbac_members WHERE tenant = %[1]s AND principal = %[2]s
+		SELECT group_id FROM rbac_members WHERE tenant = %[1]s AND principal = (SELECT %[2]s)
 		  AND (expires_at IS NULL OR expires_at > %[3]s) AND EXISTS (SELECT FROM membership)
 		UNION
 		SELECT m.group_id FROM groups g CROSS JOIN LATERAL (
@@ -1413,12 +1418,95 @@ var (
 	// the planner would rather sort what it finds. Sorting off costs a plan that still sorts past
 	// jit_above_cost before PostgreSQL 18, and compiling took far longer than the statement.
 	unsorted = []setting{{"enable_sort", "off"}, {"jit", "off"}}
+	// indexed turns sequential scans off, for a statement that reads a few rows by key, so its plan
+	// reads each table by an index, a GIN index through a bitmap, whatever the table held when its
+	// session planned it: one planned generically while a table was small, or by statistics from
+	// then, read every row of it until the plan was invalidated, and for a list read a key at a time
+	// (byKey), every row once for each key.
+	indexed = []setting{{"enable_seqscan", "off"}}
 )
+
+// readIndexed runs sql on q with indexed for its plan alone (planned), but as of a time, which reads
+// history's views in AsOf's transaction, and hands its rows to read.
+func (a *Authorizer) readIndexed(ctx context.Context, q DB, read func(pgx.Rows) error, sql string, args ...any) error {
+	if a.history != "" {
+		rows, err := q.Query(ctx, sql, args...)
+		if err != nil {
+			return err
+		}
+		return read(rows)
+	}
+	return planned(ctx, q, indexed, read, sql, args...)
+}
+
+// planned runs sql on q with settings for its plan alone, and hands its rows to read, in one round
+// trip: a batch sets them, keeping each one's value in a variable of the package's own, runs sql
+// and puts each back, on a pool in a transaction of its own and under WithTx in the host's, which
+// goes on past it. Sent with sql, the statement putting them back runs once sql has, however the
+// call goes on: where sql fails, the batch runs nothing after it, and the rollback, a transaction's
+// or a savepoint's, puts them back; and the batch is closed where read fails or panics too, so the
+// pool, or a host recovering in its transaction, has the connection back. A ctx done before it is
+// sent sends none of it. On a host's own DB that sends no batch, it runs in a savepoint of what its
+// Begin begins. Nothing runs on the session between the batch's statements, so no other read, of
+// this schema's tables or another's, can change the variables in between; a variable of each call
+// of its own would add one more to the session for good at every call.
+func planned(ctx context.Context, q DB, settings []setting, read func(pgx.Rows) error, sql string, args ...any) (err error) {
+	batcher, ok := q.(interface {
+		SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
+	})
+	if !ok {
+		return savepoint(ctx, q, func(tx pgx.Tx) error { return planned(ctx, tx, settings, read, sql, args...) })
+	}
+	set, put, names := make([]string, len(settings)), make([]string, len(settings)), make([]any, 0, len(settings))
+	values := make([]any, 0, 2*len(settings))
+	for i, s := range settings {
+		set[i] = fmt.Sprintf("set_config('rbac.' || $%d, current_setting($%[1]d), true), set_config($%[1]d, $%d, true)", 2*i+1, 2*i+2)
+		put[i] = fmt.Sprintf("set_config($%d, current_setting('rbac.' || $%[1]d), true)", i+1)
+		values, names = append(values, s.name, s.value), append(names, s.name)
+	}
+	b := &pgx.Batch{}
+	b.Queue(`SELECT `+strings.Join(set, ", "), values...)
+	b.Queue(sql, args...)
+	b.Queue(`SELECT `+strings.Join(put, ", "), names...)
+	br := batcher.SendBatch(ctx, b)
+	var rows pgx.Rows
+	defer func() {
+		if rows != nil {
+			rows.Close()
+		}
+		if cerr := br.Close(); err == nil {
+			err = cerr
+		}
+	}()
+	if _, err := br.Exec(); err != nil {
+		return err
+	}
+	if rows, err = br.Query(); err != nil {
+		return err
+	}
+	if err := read(rows); err != nil {
+		return err
+	}
+	_, err = br.Exec()
+	return err
+}
+
+// into is a read for planned of a statement that returns one row, as an aggregate does, scanning it
+// into dest.
+func into(dest ...any) func(pgx.Rows) error {
+	return func(rows pgx.Rows) error {
+		_, err := pgx.ForEachRow(rows, dest, func() error { return nil })
+		return err
+	}
+}
 
 // planning sets settings for the statements q runs in its transaction until restore, which puts
 // each back as it was, for a host's transaction under WithTx that goes on past them, even once ctx
 // is done, as pgx sends nothing on a done ctx (finish). Where a statement in between failed, the
-// transaction runs no other, and its rollback, a transaction's or a savepoint's, puts them back.
+// transaction runs no other, and its rollback, a transaction's or a savepoint's, puts them back. It
+// is for settings held across several statements, as AsOf's and History's reads hold them, which no
+// one batch sends (planned): so it keeps each one's value in the call, as a read in between may be
+// planned, which changes the package's variables.
 func planning(ctx context.Context, q DB, settings []setting) (restore func() error, err error) {
 	set, put, args := make([]string, len(settings)), make([]string, len(settings)), make([]any, 0, 2*len(settings))
 	was, scan := make([]string, len(settings)), make([]any, 0, 2*len(settings))
@@ -1442,25 +1530,4 @@ func planning(ctx context.Context, q DB, settings []setting) (restore func() err
 			return err
 		})
 	}, nil
-}
-
-// planned is what read reads, statements on q in a transaction, with settings for them alone, put
-// back after it (planning) whether it fails, panics or not, so a host's transaction under WithTx
-// gets its own again, as where it goes on past a call refused for its ctx once read ran, or one
-// whose panic it recovered from: Holders and Conflicts read on it with no savepoint to roll back.
-func planned[T any](ctx context.Context, q DB, settings []setting, read func() (T, error)) (v T, err error) {
-	restore, err := planning(ctx, q, settings)
-	if err != nil {
-		return v, err
-	}
-	defer func() {
-		if rerr := restore(); err == nil {
-			err = rerr
-		}
-		if err != nil {
-			var none T
-			v = none
-		}
-	}()
-	return read()
 }
