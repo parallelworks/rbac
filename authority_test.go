@@ -4137,7 +4137,7 @@ func TestACrowdedCopyIsWhatWritingItAfreshMakes(t *testing.T) {
 			t.Errorf("%d of the %d rows of the template's %s aren't at the same place in its copy", misplaced, rows, table)
 		}
 		// But for what each writing makes anew: the grants' random ids, the times, the transactions,
-		// which commit records name as their keys, and the bytes the times take as JSON.
+		// those commit records hold as running, and the bytes the times take as JSON.
 		row := `to_jsonb(r) - '{created_at,updated_at}'::text[]`
 		order := "r.ctid"
 		switch table {
@@ -4147,8 +4147,8 @@ func TestACrowdedCopyIsWhatWritingItAfreshMakes(t *testing.T) {
 			order = "r.id"
 		case "rbac_history":
 			row = `to_jsonb(r) - '{txid,recorded_at,effective_at,bytes,key,after}'::text[] || jsonb_build_object(
-				'key', CASE WHEN r.entity IN ('grant', 'commit') THEN NULL ELSE r.key END,
-				'after', CASE WHEN r.entity = 'grant' THEN r.after - 'id' ELSE r.after END - '{created_at,updated_at}'::text[])`
+				'key', CASE WHEN r.entity = 'grant' THEN NULL ELSE r.key END,
+				'after', CASE r.entity WHEN 'grant' THEN r.after - 'id' WHEN 'commit' THEN r.after - 'xmin' ELSE r.after END - '{created_at,updated_at}'::text[])`
 			order = "r.id"
 		}
 		written := func(schema string) string {
