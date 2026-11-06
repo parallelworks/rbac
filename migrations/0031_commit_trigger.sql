@@ -46,8 +46,9 @@
 -- the schema: where history's role has none, the role migrating grants it for this transaction alone
 -- where it may, as the schema's owner can, and revokes it once the function is given. Where it can't
 -- be given, migrating fails, saying what to change, rather than leave it to another role. Only its
--- trigger calls it, so no role but its owner may execute it, as none may rbac_history_pruned: a grant
--- the schema's default privileges gave it as it was made is revoked too, as a role holding one could
+-- trigger calls it, so no role but its owner may execute it, nor rbac_record, which writes history as
+-- its owner too and which 0003 kept from PUBLIC alone: a grant of either to any other role is revoked,
+-- as the schema's default privileges can give one as each is made, and a role holding one could
 -- attach it to a table of its own in pg_temp, whose triggers would then run as its owner.
 --
 -- rbac_record is replaced without its path for a commit record, which no trigger reaches from here
@@ -155,14 +156,16 @@ DO $$
 DECLARE
     here    pg_catalog.text := pg_catalog.current_schema();
     fn      pg_catalog.regprocedure := pg_catalog.format('%I.rbac_history_commit()', here);
-    owner   pg_catalog.regrole := (SELECT p.proowner FROM pg_catalog.pg_proc p
-                                   WHERE p.oid = pg_catalog.format('%I.rbac_record()', here)::pg_catalog.regprocedure);
-    grantee pg_catalog.regrole;
+    rec     pg_catalog.regprocedure := pg_catalog.format('%I.rbac_record()', here);
+    owner   pg_catalog.regrole := (SELECT p.proowner FROM pg_catalog.pg_proc p WHERE p.oid = rec);
+    f       pg_catalog.oid;
+    grantee pg_catalog.text;
     lent    boolean := false;
 BEGIN
-    FOR grantee IN SELECT DISTINCT a.grantee FROM pg_catalog.pg_proc p, pg_catalog.aclexplode(p.proacl) a
-        WHERE p.oid = fn AND a.grantee <> 0 AND a.grantee <> p.proowner LOOP
-        EXECUTE pg_catalog.format('REVOKE ALL ON FUNCTION %s FROM %s CASCADE', fn, grantee);
+    FOR f, grantee IN SELECT DISTINCT p.oid, CASE a.grantee WHEN 0 THEN 'PUBLIC' ELSE a.grantee::pg_catalog.regrole::pg_catalog.text END
+        FROM pg_catalog.pg_proc p, pg_catalog.aclexplode(p.proacl) a
+        WHERE p.oid IN (fn, rec) AND a.grantee <> p.proowner LOOP
+        EXECUTE pg_catalog.format('REVOKE ALL ON FUNCTION %s FROM %s CASCADE', f::pg_catalog.regprocedure, grantee);
     END LOOP;
     IF owner <> (SELECT p.proowner FROM pg_catalog.pg_proc p WHERE p.oid = fn) THEN
         IF NOT pg_catalog.has_schema_privilege(owner, here, 'CREATE')
@@ -191,8 +194,8 @@ CREATE CONSTRAINT TRIGGER rbac_history_committed AFTER INSERT ON rbac_history
 ALTER TABLE rbac_history ENABLE ALWAYS TRIGGER rbac_history_committed;
 
 -- As 0027 wrote it, without its path for a commit record. Replacing it keeps its owner and who may
--- execute it, but not its settings, so they are set here, as 0027 set them. It takes no lock on the
--- tables.
+-- execute it, its owner alone from above, but not its settings, so they are set here, as 0027 set
+-- them. It takes no lock on the tables.
 CREATE OR REPLACE FUNCTION rbac_record() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
     SET search_path = pg_catalog, pg_temp SET TimeZone = 'UTC' SET plan_cache_mode = force_generic_plan SET enable_seqscan = off AS $$
 <<rbac_record>>
