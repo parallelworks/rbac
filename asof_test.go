@@ -2501,11 +2501,14 @@ func TestABatchHoldingACursorCommitsAsTheHintSays(t *testing.T) {
 }
 
 // The commit record's trigger fires as a transaction commits once for each record it wrote, and the
-// event of each but the last only looks for a later one: a commit of thousands of records adds at
-// most three times what a trigger that reads each record by its id adds, each the least of several
-// commits made one after the other, so the server's load moves them alike. Run as rbac_record, with
-// its settings, each event read every entry after its record's on an index page, and added more.
-func TestACommitCostsAFewReadsOfHistoryARecord(t *testing.T) {
+// event of each but the last only looks for a later one: first among the next 32 ids, where the
+// records a statement writes are, one after another, unless more than 32 sessions write history at
+// once, and only then among all of the transaction's later records, which reads every entry after
+// the record's on its index page. So a commit of thousands of records one id apart adds at most three
+// quarters of what it adds where they are 40 apart, where it reads both, each the least of several
+// commits made one after the other, so the server's load moves them alike. The read of all of them
+// alone, as 0027's trigger made it, adds as much to either.
+func TestACommitLooksForALaterRecordAmongTheNextIdsFirst(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
 	const n, rounds = 5000, 5
@@ -2520,25 +2523,24 @@ func TestACommitCostsAFewReadsOfHistoryARecord(t *testing.T) {
 			t.Fatalf("%s: %v", sql, err)
 		}
 	}
-	exec(`CREATE FUNCTION one_read() RETURNS trigger LANGUAGE plpgsql AS $$
-		BEGIN PERFORM FROM rbac_history h WHERE h.id = NEW.id; RETURN NULL; END $$`)
-	exec(`CREATE CONSTRAINT TRIGGER one_read AFTER INSERT ON rbac_history DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION one_read()`)
 	commits := map[string][]time.Duration{}
 	for i := range rounds {
-		for _, c := range []struct{ name, on, off string }{
-			{"commit record", "rbac_history_committed", "one_read"},
-			{"one read", "one_read", "rbac_history_committed"},
-			{"none", "", "rbac_history_committed, one_read"},
+		for _, c := range []struct {
+			name    string
+			apart   int
+			trigger string
+		}{
+			{"one apart", 1, "ENABLE ALWAYS"},
+			{"40 apart", 40, "ENABLE ALWAYS"},
+			{"none", 1, "DISABLE"},
 		} {
-			for _, off := range strings.Split(c.off, ", ") {
-				exec(`ALTER TABLE rbac_history DISABLE TRIGGER ` + off)
-			}
-			if c.on != "" {
-				exec(`ALTER TABLE rbac_history ENABLE ALWAYS TRIGGER ` + c.on)
-			}
+			exec(`ALTER TABLE rbac_history ` + c.trigger + ` TRIGGER rbac_history_committed`)
 			exec(`BEGIN`)
-			exec(fmt.Sprintf(`INSERT INTO rbac_history (effective_at, tenant, entity, key, op, bytes)
-				SELECT now(), 't1', 'membership', '%s %d ' || g, 'create', 0 FROM generate_series(1, %d) g`, c.name, i, n))
+			exec(fmt.Sprintf(`INSERT INTO rbac_history (id, effective_at, tenant, entity, key, op, bytes) OVERRIDING SYSTEM VALUE
+				SELECT l.id + 1 + g * %d, now(), 't1', 'membership', '%s %d ' || g, 'create', 0
+				FROM (SELECT coalesce(max(id), 0) AS id FROM rbac_history) l, generate_series(0, %d) g`, c.apart, c.name, i, n-1))
+			// Past them, for the commit record's id.
+			exec(`SELECT setval(pg_get_serial_sequence('rbac_history', 'id'), (SELECT max(id) FROM rbac_history))`)
 			start := time.Now()
 			exec(`COMMIT`)
 			commits[c.name] = append(commits[c.name], time.Since(start))
@@ -2546,10 +2548,10 @@ func TestACommitCostsAFewReadsOfHistoryARecord(t *testing.T) {
 	}
 	exec(`ALTER TABLE rbac_history ENABLE ALWAYS TRIGGER rbac_history_committed`)
 	added := func(name string) time.Duration { return (slices.Min(commits[name]) - slices.Min(commits["none"])) / n }
-	record, read := added("commit record"), added("one read")
-	t.Logf("a commit of %d records adds %v a record for the commit record, %v for one read of each", n, record, read)
-	if record > 3*read {
-		t.Errorf("the commit record adds %v to a commit for each record, more than three times the %v one read of each adds", record, read)
+	near, far := added("one apart"), added("40 apart")
+	t.Logf("a commit of %d records adds %v a record where they are one id apart, %v where 40", n, near, far)
+	if near > far*3/4 {
+		t.Errorf("a commit of records one id apart adds %v for each, more than three quarters of the %v of records 40 apart", near, far)
 	}
 }
 
