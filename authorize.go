@@ -1540,10 +1540,10 @@ func (a *Authorizer) byType(types, cols, where string) string {
 // broadOn is SQL selecting, for broadArgs, the roles of the grants of custom roles in the tenant $1
 // to the principal whose key is principal on scopes of the types in the array $4, a type at a time.
 // Each is a range of rbac_grants_custom_principal, which holds no grant of a built-in role and leads
-// to the principal, the tenant and the scope, so no plan reads them cheaper by the custom roles'
-// index on the tenant alone. As of a time it selects the grants of every role, the prefix tested
-// apart (namedCustom): history's index of a grant's role leads to the tenant and the role, so a plan
-// for the prefix could read every version of every grant of a custom role in the tenant.
+// to the principal, the tenant and the scope (customOnly). As of a time it selects the grants of
+// every role, the prefix tested apart (namedCustom): history's index of a grant's role leads to the
+// tenant and the role, so a plan for the prefix could read every version of every grant of a custom
+// role in the tenant.
 func (a *Authorizer) broadOn(principal string) string {
 	return a.byType("$4", "g.role", "g.tenant = $1 AND g.principal = "+principal+a.customOnly("g.role"))
 }
@@ -1554,12 +1554,16 @@ func (a *Authorizer) broadAt(principal string) string {
 }
 
 // customOnly is SQL keeping, but as of a time, the grants whose role, col, is a custom one, for
-// broadOn and broadAt.
+// broadOn and broadAt: as a range of the C collation, from `custom.` to just before `custom/`,
+// rbac_grants_custom_principal's predicate. That implies no LIKE, so no plan can read them by the
+// custom roles' index, whose predicate is one, and which leads to the tenant alone: tested as a
+// LIKE, by statistics from before the tenant granted custom roles, or with none, every plan read
+// every grant of one in the tenant by it, to anyone, once for each broad key and scope or type.
 func (a *Authorizer) customOnly(col string) string {
 	if a.history != "" {
 		return ""
 	}
-	return " AND " + col + " LIKE '" + CustomPrefix + "%'"
+	return " AND " + col + " >= 'custom.' AND " + col + " < 'custom/'"
 }
 
 // byKey is SQL selecting cols of the rows of table for which where holds whose col is one of the

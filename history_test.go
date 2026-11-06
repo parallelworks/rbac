@@ -538,15 +538,47 @@ func TestThePackageRunsAsTheReadmesDatabaseRoles(t *testing.T) {
 			check("SetMemberships", authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("v")}}))
 			check("SetGroup", authz.SetGroup(ctx, boss, "t1", rbac.GroupDefinition{ID: "ops"}))
 			check("ChangeMembers", authz.ChangeMembers(ctx, boss, "t1", []rbac.Member{{Group: "ops", Principal: u.Principal}}, nil))
+			// A custom role to the group and the members, which the searches and Holders read them by.
+			check("Import", authz.Import(ctx, host, "t1", []rbac.Grant{
+				grant(cluster.Scope(), "custom.viewer", rbac.Group, "ops"),
+				grant(cluster.Scope(), "custom.viewer", rbac.Members, "t1"),
+			}))
 			check("Authorize", authz.Authorize(ctx, u, login, cluster))
 			_, err = authz.Holders(ctx, login, cluster)
 			check("Holders", err)
+			// Holders, Members and GroupsOf read the group's members and their memberships, and Filter
+			// and Reachable whether u is a member and the custom roles granted to the members.
+			reads := func(a *rbac.Authorizer) error {
+				holders, err := a.Holders(ctx, view, cluster)
+				if err == nil && !slices.ContainsFunc(holders, func(h rbac.Holder) bool { return h.Principal == u.Principal && slices.Equal(h.Groups, []string{"ops"}) }) {
+					err = fmt.Errorf("Holders = %+v", holders)
+				}
+				if err != nil {
+					return err
+				}
+				if members, err := a.Members(ctx, "t1", "ops"); err != nil || len(members) != 1 || members[0].Principal != u.Principal {
+					return fmt.Errorf("Members = %+v, %w", members, err)
+				}
+				if groups, err := a.GroupsOf(ctx, "t1", u.Principal); err != nil || !slices.Equal(groups, []string{"ops"}) {
+					return fmt.Errorf("GroupsOf = %v, %w", groups, err)
+				}
+				if _, err := a.Filter(ctx, u, view, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1); err != nil {
+					return fmt.Errorf("Filter: %w", err)
+				}
+				_, err = a.Reachable(ctx, u, view, "t1", "cluster")
+				return err
+			}
+			check("Holders, Members, GroupsOf, Filter and Reachable", reads(authz))
+			check("SetGroup", authz.SetGroup(ctx, boss, "t1", rbac.GroupDefinition{ID: "spare"}))
+			check("DeleteGroup", authz.DeleteGroup(ctx, boss, "t1", "spare"))
 			check("AsOf", authz.AsOf(ctx, "t1", dbNow(t, h), func(a *rbac.Authorizer) error {
 				if err := a.Authorize(ctx, u, login, cluster); err != nil {
 					return err
 				}
-				_, err := a.Denies(ctx, "t1", []rbac.Scope{cluster.Scope()})
-				return err
+				if _, err := a.Denies(ctx, "t1", []rbac.Scope{cluster.Scope()}); err != nil {
+					return err
+				}
+				return reads(a)
 			}))
 			var n int
 			if err := r.appPool.QueryRow(ctx, `SELECT count(*) FROM rbac_history`).Scan(&n); err != nil {

@@ -212,7 +212,12 @@ erDiagram
   name before its statement, from `rbac_grants_custom_principal`, which holds only grants of custom
   roles, by principal and scope, and reads only those its subject counts: the anonymous and a guest
   read none of the members', and a search of a permission no public role gives none of the
-  public's, so their grants of built-in roles on thousands of resources cost it nothing.
+  public's, so their grants of built-in roles on thousands of resources cost it nothing. It names a
+  custom role as that index's predicate does, as a range of the C collation, from `custom.` to just
+  before `custom/`, which no LIKE implies, so `rbac_grants_custom_role`, whose predicate is a LIKE
+  and which leads to the tenant alone, serves no plan of it: by statistics from before the tenant
+  granted custom roles, or with none, every plan read every grant of one in the tenant through it,
+  to anyone, once for each broad key and scope or type.
 - **A read of a list of keys reads each key's rows on its own** (`byKey`), as of a list's scopes
   or principals, of the denies on a check's path, of `Activate`'s eligibilities and of the rows
   `DeleteScopes`, `DeletePrincipal` and `DeleteGroups` remove, and so does a walk through nested
@@ -240,6 +245,14 @@ erDiagram
   they count the denies on their types by history's versions of them, at most a few: through the
   views, which read every version of a deny to find its last, counting read every one, deleted
   denies' too.
+- **A lookup of one key a tenant holds once** gives the key in a subquery too, whose value no plan
+  sees, as whether a group exists (`groupExists`) or an identity is a member (`GroupsOf`, and a
+  search counting the tenant's members' grants): counted by the tenant's selectivity and the key's
+  apart, as if neither told anything of the other, a key many tenants hold, as a group's id each
+  names its admins by or an identity in many tenants, was counted in a large tenant as hundreds or
+  thousands, and `EXISTS`, planned for the first, read every tenant's rows to find it sooner than
+  the key's index, as the planner costs it. Unseen, the key counts as one of the column's distinct
+  values, and a tenant holds each at most once.
 - **Activations are grants** from the source `activation` (`SourceActivation`), made by
   `Activate` from an eligibility, which they record, and ended by their expiry, `Deactivate`, or a
   change ending the membership or a place in a group on their holder's paths to that eligibility's
@@ -314,7 +327,13 @@ flowchart BT
 - **Expanding down** from groups to their identities, for lists and changes, is `insideSQL`. It
   finds nested groups in the statement and their identities through `rbac_group_members`, which
   plans its query for the groups reached, so a small group's members are read alone however large
-  the tenant's other groups.
+  the tenant's other groups. With their standing, as `Holders` reads them, it reads the members
+  first, and then their memberships in a statement planned for their number: the planner counts a
+  group's members by the tenant's selectivity and the group id's apart, so a large tenant's group
+  of one whose id other tenants use too was counted as a thousand or more, and joined in one
+  statement its memberships were hashed with every tenant's; looked up each by its key, a group of
+  20,000 read 80,000 pages of memberships that fill 900. `Members` takes the identities whose
+  membership stands from it, and looks only the rest up by key.
 
 ## Resources, scopes and paths
 

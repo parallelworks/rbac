@@ -820,10 +820,15 @@ func upOf(ctx context.Context, q DB, tenant, id string, now time.Time) ([]string
 	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
-// groupExists reports, on q, whether a tenant has a group.
+// groupExists reports, on q, whether a tenant has a group. The id is given in a subquery, whose
+// value no plan sees: a plan for its arguments counted the group by the tenant's selectivity and the
+// id's apart, so where other tenants use the id too, a large tenant's one group was counted as
+// hundreds, and EXISTS, planned for the first, read every tenant's groups to find it sooner than
+// the key's index would, as the planner costs it. Unseen, the id counts as one of the ids' distinct
+// values, and a tenant has each at most once.
 func groupExists(ctx context.Context, q DB, tenant, id string) (bool, error) {
 	var exists bool
-	err := q.QueryRow(ctx, `SELECT EXISTS (SELECT FROM rbac_groups WHERE tenant = $1 AND id = $2)`, tenant, id).Scan(&exists)
+	err := q.QueryRow(ctx, `SELECT EXISTS (SELECT FROM rbac_groups WHERE tenant = $1 AND id = (SELECT $2::text))`, tenant, id).Scan(&exists)
 	return exists, err
 }
 
@@ -3128,9 +3133,19 @@ func (a *Authorizer) Members(ctx context.Context, tenant, group string) (_ []Mem
 	if !validID(tenant) || !validGroupID(group) {
 		return nil, fmt.Errorf("%w: Members needs a tenant and a valid group", ErrInvalid)
 	}
+	// The identities whose membership stands, which rbac_group_members reads with their memberships
+	// planned for their number, pass without a test of their own, and only the rest, suspended or
+	// ended, are looked up each by its key (inTenant): looking each up so, a group of 20,000 read
+	// 80,000 pages of memberships that fill 900. As of a time each is looked up by its key alone, as
+	// joined to the members there by history's statistics, a plan can read every membership in the
+	// tenant again for each (standingSQL).
+	in := inTenant("m.principal", "$1", "$3")
+	if a.history == "" {
+		in = `m.principal IN (SELECT principal COLLATE "C" FROM rbac_group_members($1, ARRAY[$2::text], $3, NULL, true)) OR ` + in
+	}
 	rows, err := a.db.Query(ctx, `SELECT `+memberColumns+` FROM rbac_members m
 		WHERE tenant = $1 AND group_id = $2 AND (expires_at IS NULL OR expires_at > $3)
-		  AND (principal_kind = 'group' OR `+inTenant("m.principal", "$1", "$3")+`)
+		  AND (principal_kind = 'group' OR `+in+`)
 		ORDER BY principal, source`, tenant, group, a.cfg.Now())
 	if err != nil {
 		return nil, err
@@ -3151,10 +3166,14 @@ func (a *Authorizer) GroupsOf(ctx context.Context, tenant string, p Principal) (
 	if !validID(tenant) || p != (Principal{}) && !p.wellFormed(tenant) {
 		return nil, fmt.Errorf("%w: GroupsOf needs a tenant and a valid principal", ErrInvalid)
 	}
+	// The membership is looked up by a key no plan sees, as groupExists looks a group up: counted by
+	// the tenant's selectivity and the identity's apart, one in many tenants was counted in a large
+	// one as a thousand or more, and EXISTS, planned for the first, read every tenant's memberships
+	// to find it.
 	rows, err := a.db.Query(ctx, `
 		WITH RECURSIVE g(id) AS (
 		  SELECT group_id FROM rbac_members WHERE tenant = $1 AND principal = $2 AND (expires_at IS NULL OR expires_at > $3)
-		    AND ($4 OR `+inTenant("$2", "$1", "$3")+`)
+		    AND ($4 OR `+inTenant("(SELECT $2::text)", "$1", "$3")+`)
 		  UNION
 		  SELECT m.group_id FROM g `+groupsAbove("g.id", "$3", "group_id")+`
 		)
@@ -3233,10 +3252,14 @@ func groupsExist(ctx context.Context, q DB, tenant string, keys []string) error 
 }
 
 // inTenant is SQL for whether an identity, by the SQL for its key, is a member or guest of a tenant
-// at now: until DeleteExpired removes them, an ended membership's groups are still stored.
+// at now: until DeleteExpired removes them, an ended membership's groups are still stored. Each is
+// looked up on its own, by its key: OFFSET 0 keeps the planner from hashing the test, which it does
+// for the members of a group it counts as many, and it counts them by the tenant's selectivity and
+// the group id's apart, so where other tenants use the group's id too, a large tenant's group of one
+// as a thousand or more: Members hashed every membership in the table, every tenant's.
 func inTenant(principal, tenant, now string) string {
 	return `EXISTS (SELECT FROM rbac_memberships ms WHERE ms.tenant = ` + tenant + ` AND ms.principal = ` + principal +
-		` AND (ms.expires_at IS NULL OR ms.expires_at > ` + now + `))`
+		` AND (ms.expires_at IS NULL OR ms.expires_at > ` + now + `) OFFSET 0)`
 }
 
 const memberColumns = `group_id, principal_kind, principal_id, source, expires_at, note, created_by, created_at, updated_by, updated_at`
