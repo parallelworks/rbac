@@ -78,9 +78,10 @@ import (
 // or choice it may, and each key of a map 1 more each time a loop over it starts, however few steps
 // it takes. A loop over a map gives its keys in one order, whatever order the map's entries come
 // in: bools, ints, uints, doubles, strings and then bytes, each by its value, strings and bytes by
-// their bytes, so `{"b": 1, "a": 2}.map(k, k)` is `["a", "b"]`. Sorting them costs each key what
-// reading it does, before the loop starts, once for each time their number halves to one, and a
-// loop over a map holding more than one key of another type, as a literal keyed by lists can, fails.
+// their bytes, so `{"b": 1, "a": 2}.map(k, k)` is `["a", "b"]`. Sorting them costs 1 for each two
+// keys each time their number halves to one, and each key what reading it does past 1, once, before
+// the loop starts, and a loop over a map holding more than one key of another type, as a literal
+// keyed by lists can, fails.
 // A list or map literal costs 1 more for each element, or 2 for each entry, each time it
 // is built, and contains, startsWith and endsWith cost reading what they search, at least 1 however
 // short either string is, and fail before they run where they would cost more than a condition may.
@@ -804,7 +805,7 @@ func (w worst) comprehension(e ast.Expr) (uint64, extent) {
 		}
 	}
 	// Each element evaluates the condition, and the step while it holds; a map's keys are sorted
-	// first (stepping.inOrder), each key, as each element bounds it, read at each level.
+	// first (stepping.inOrder), each key, as each element bounds it, read once.
 	loops := cost.SafeMultiply(over.length, cost.SafeAdd(cond, step))
 	if over.form != notMap {
 		n = cost.SafeAdd(n, sortCost(over.length, each.text))
@@ -1532,9 +1533,16 @@ func (s *stepping) order(i interpreter.InterpretableV2) (interpreter.Interpretab
 
 // inOrder is v, the value of the loop's range id, giving its keys in one order where it is a map of
 // more than one: sorted (sortKeys), once the condition evaluating on vars is charged what sorting
-// them costs, each key what reading it does (textSize) at each of sortLevels, before any is sorted,
-// as worst bounds it (sortCost). A map keyed by another type than keyRank orders, as a map literal
-// keyed by lists can be, has no order, and a loop over it fails.
+// them costs, before any is sorted, as worst bounds it (sortCost). That is 1 for each two keys at
+// each of sortLevels, as comparing and moving a key took 13 to 15 ns, where a unit charged covers
+// 20 to 145 ns of what the package does elsewhere, and what reading each key costs past 1
+// (textSize), once: a comparison reads no more of a key than it holds, at about 50 bytes a
+// nanosecond, so the eleven levels a condition can pay for read its bytes in a tenth of the time
+// charging them once covers. Charged 1 for each key and what reading it costs at each level,
+// sorting 500 keys of 36 bytes, as ids, cost 18,000, past what a condition may, for 64 µs of work,
+// and 500 short keys, which a loop costing about half what a condition may reads, 4,500, for 57 µs.
+// A map keyed by another type than keyRank orders, as a map literal keyed by lists can be, has no
+// order, and a loop over it fails.
 func (s *stepping) inOrder(vars interpreter.Activation, id int64, v ref.Val) ref.Val {
 	m, ok := v.(traits.Mapper)
 	if !ok || !m.Type().HasTrait(traits.IterableType) {
@@ -1544,9 +1552,8 @@ func (s *stepping) inOrder(vars interpreter.Activation, id int64, v ref.Val) ref
 	if n < 2 {
 		return v
 	}
-	levels := sortLevels(n)
-	// Each key costs at least 1 at each level, charged before any is read.
-	chargePast(vars, cost.SafeMultiply(n, levels), s.limit)
+	// Charged before any key is read.
+	chargePast(vars, sortSteps(n), s.limit)
 	keys := make([]ref.Val, 0, n)
 	if native := entries(m); native != nil {
 		for k := range native {
@@ -1564,7 +1571,7 @@ func (s *stepping) inOrder(vars interpreter.Activation, id int64, v ref.Val) ref
 		}
 		text += textSize(k) - 1
 	}
-	chargePast(vars, cost.SafeMultiply(text, levels), s.limit)
+	chargePast(vars, text, s.limit)
 	return orderedMap{Mapper: m, keys: types.NewRefValList(types.DefaultTypeAdapter, sortKeys(keys))}
 }
 
@@ -1711,10 +1718,14 @@ func sortLevels(n uint64) uint64 {
 	return length(bits.Len64(n - 1))
 }
 
+// sortSteps is what comparing and moving n keys costs as sortKeys sorts them: 1 for each two at
+// each level (stepping.inOrder).
+func sortSteps(n uint64) uint64 { return cost.SafeMultiply(n/2+n%2, sortLevels(n)) }
+
 // sortCost is the most ordering a map's keys costs (stepping.inOrder), where it holds at most n of
-// them, each costing to read no more than text.
+// them, each costing to read no more than text: sortSteps, and the rest of reading each once.
 func sortCost(n, text uint64) uint64 {
-	return cost.SafeMultiply(cost.SafeMultiply(n, sortLevels(n)), text)
+	return cost.SafeAdd(sortSteps(n), cost.SafeMultiply(n, text-min(text, 1)))
 }
 
 // counting is what a condition reads, and how many steps its loops have taken, which it costs at

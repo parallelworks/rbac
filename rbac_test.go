@@ -3320,24 +3320,35 @@ func TestAConstraintIsGivenAMessageThatIsItsOwnReflectionAsTheHostsType(t *testi
 // A hook is given copies of what the host passes, which copying recursed into as deep as it nests: a
 // list nested three million deep overflowed the stack, which no recover catches, ending the process
 // wherever a hook was asked about it, though no condition reads it past 10,000 deep. A copy is its
-// own twice as deep as any condition reads, and holds nothing of the host's deeper. It runs in a
-// child process, on a smaller stack, which copying a list or a message nested a hundred thousand
-// deep overflowed.
+// own twice as deep as any condition reads, and a value nesting deeper isn't copied, so the call is
+// refused, failing closed, rather than a hook being given its zero value there. It runs in a child
+// process, on a smaller stack, which copying a list or a message nested a hundred thousand deep
+// overflowed.
 func TestAHookIsAskedAboutAValueNestedDeep(t *testing.T) {
 	if os.Getenv("RBAC_HOOK_VALUE_NESTED_DEEP") != "" {
 		debug.SetMaxStack(32 << 20)
-		var listed any = "x"
-		var levels []any
-		for range 100_000 {
-			listed = []any{listed}
-			levels = append(levels, listed)
+		nested := func(n int) (any, []any) {
+			var listed any = "x"
+			var levels []any
+			for range n {
+				listed = []any{listed}
+				levels = append(levels, listed)
+			}
+			return listed, levels
 		}
 		message := structpb.NewStringValue("x")
 		for range 100_000 {
 			message = structpb.NewListValue(&structpb.ListValue{Values: []*structpb.Value{message}})
 		}
-		copied := rbac.DeepCopy(map[string]any{"listed": listed, "message": message})
-		// Twice as deep as a condition reads, its own, and deeper, nothing of the host's.
+		deep, _ := nested(100_000)
+		for name, v := range map[string]any{"a list": deep, "a message": message} {
+			if rbac.Copies(map[string]any{"v": v}) {
+				t.Errorf("%s nested a hundred thousand deep was copied", name)
+			}
+		}
+		// Twice as deep as a condition reads, its own, and whole.
+		listed, levels := nested(19_990)
+		copied := rbac.DeepCopy(map[string]any{"listed": listed})
 		held := map[*any]int{}
 		for i, l := range levels {
 			if l, ok := l.([]any); ok {
@@ -3351,20 +3362,8 @@ func TestAHookIsAskedAboutAValueNestedDeep(t *testing.T) {
 			}
 			at, depth = l[0], depth+1
 		}
-		if l, ok := at.([]any); !ok || l != nil || depth < 15_000 {
-			t.Errorf("the copy of a list nested deep ends %d deep in %#v", depth, at)
-		}
-		reached, _ := copied["message"].(*structpb.Value)
-		for v := reached; v != nil; v = v.GetListValue().GetValues()[0] {
-			if v == message {
-				t.Fatal("a message nested deep was shared")
-			}
-			if reached = v; len(v.GetListValue().GetValues()) == 0 {
-				break
-			}
-		}
-		if reached == nil || reached.GetKind() != nil {
-			t.Errorf("the copy of a message nested deep ends in %v", reached)
+		if at != "x" || depth != len(levels) {
+			t.Errorf("the copy of a list nested %d deep ends %d deep in %#v", len(levels), depth, at)
 		}
 		return
 	}
@@ -3372,6 +3371,85 @@ func TestAHookIsAskedAboutAValueNestedDeep(t *testing.T) {
 	cmd.Env = append(os.Environ(), "RBAC_HOOK_VALUE_NESTED_DEEP=1")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Errorf("%v\n%.2000s", err, out)
+	}
+}
+
+// link is a host's value a hook reads, as a chain of approvals.
+type link struct {
+	Next  *link
+	Value int
+}
+
+// chained is a chain of n links ending in one holding value, and its ith link.
+func chained(n, i, value int) (head, ith *link) {
+	head = &link{Value: value}
+	for j := n - 1; j > 0; j-- {
+		head = &link{Next: head}
+		if j == i {
+			ith = head
+		}
+	}
+	return head, ith
+}
+
+// last is the value at the end of the chain from l.
+func last(l *link) int {
+	for ; l.Next != nil; l = l.Next {
+	}
+	return l.Value
+}
+
+// Past twice as deep as a condition reads, a hook's copy held the zero value, or the copy of a
+// value it reached less deep before, as the order a map's entries came in decided: where a map held
+// a chain nesting past it and, less deep, a link of the same chain, the link's copy ended in the
+// chain's last value on one call and in nothing on the next, so a constraint reading it denied one
+// and allowed the other. A value nesting past it along any path, wherever a value it reaches twice
+// was reached first, isn't copied, in every order, and one nesting less is copied whole.
+func TestAHookIsGivenAValueReachedAtTwoDepthsAlikeOnEveryCall(t *testing.T) {
+	head, mid := chained(10_000, 2_500, 7)
+	short, shortMid := chained(9_000, 2_500, 7)
+	// Lists nested in lists, and Values in ListValues, reached less deep too.
+	var listed, listedMid any = "x", nil
+	for i := range 20_000 {
+		if listed = []any{listed}; i == 15_000 {
+			listedMid = listed
+		}
+	}
+	valued, valuedMid := structpb.NewStringValue("x"), (*structpb.Value)(nil)
+	for i := range 10_000 {
+		if valued = structpb.NewListValue(&structpb.ListValue{Values: []*structpb.Value{valued}}); i == 7_500 {
+			valuedMid = valued
+		}
+	}
+	for range 40 {
+		for name, attributes := range map[string]map[string]any{
+			"pointers": {"a": head, "b": mid}, "lists": {"a": listed, "b": listedMid}, "messages": {"a": valued, "b": valuedMid},
+		} {
+			if rbac.Copies(attributes) {
+				t.Fatalf("a chain of %s nesting 20,000 deep, reached less deep too, was copied", name)
+			}
+		}
+		copied := rbac.DeepCopy(map[string]any{"a": short, "b": shortMid})
+		a, _ := copied["a"].(*link)
+		b, _ := copied["b"].(*link)
+		if a == nil || b == nil || last(a) != 7 || last(b) != 7 {
+			t.Fatal("a chain nesting 18,000 deep, reached less deep too, wasn't copied whole")
+		}
+	}
+
+	h := setup(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "approved", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			l, _ := in.Subject.Attributes["approval"].(*link)
+			return l != nil && last(l) == 7, nil
+		}}}
+	})
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	u := h.as(t, "u")
+	u.Attributes = map[string]any{"chain": head, "approval": mid}
+	for i := range 40 {
+		if allowed(t, h, u, login, cluster) {
+			t.Fatalf("call %d: a constraint denying the chain's last value allowed it", i)
+		}
 	}
 }
 

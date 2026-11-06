@@ -2603,8 +2603,14 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 	}
 	type wide struct{ X [64 << 10]byte }
 	widely := map[string]wide{}
+	// A copy shares a map's keys, but reading an entry moves its key whole, and setting it hashes it:
+	// copying 2,000 keyed by arrays of 4 KiB took 8 ms, charged 4,017.
+	arrayKeyed := map[[4 << 10]byte]int{}
 	for i := range n {
 		widely[strconv.Itoa(i)] = wide{}
+		var k [4 << 10]byte
+		k[0], k[1] = byte(i), byte(i>>8)
+		arrayKeyed[k] = i
 	}
 	for name, attributes := range map[string]map[string]any{
 		"maps of a struct of 64 KiB":                             listed(func(int) any { return map[string]wide{"a": {}} }),
@@ -2616,6 +2622,7 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 		"arrays of two structs holding a map and 64 KiB":         listed(func(int) any { return [2]hidden{} }),
 		"slices of arrays of two holding a map and 64 KiB":       listed(func(int) any { return [][2]hidden{{}} }),
 		"maps of arrays of two structs holding a map and 64 KiB": listed(func(int) any { return map[string][2]hidden{"a": {}} }),
+		"a map keyed by arrays of 4 KiB":                         {"m": arrayKeyed},
 	} {
 		for doing, work := range map[string]func(map[string]any) rbac.Work{"converting": rbac.ConvertingWork, "copying": rbac.CopyingWork} {
 			w := least(work, attributes)
@@ -2624,6 +2631,13 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 					"and %.0f bytes", doing, name, a, b, allocations, bytes)
 			}
 		}
+	}
+	// A copy reads a map's entry, moving its key and its value whole, before it copies them, so it
+	// charges what they hold in place first: one holding a struct of 4 MiB, past what a copy holds,
+	// moved it only to find so.
+	type huge struct{ X [4 << 20]byte }
+	if w := rbac.CopyingWork(map[string]any{"m": map[string]huge{"a": {}}}); w.Done || w.Bytes > 1<<20 {
+		t.Errorf("copying a map holding a struct of 4 MiB copied it %t, allocating %d bytes", w.Done, w.Bytes)
 	}
 }
 
@@ -3192,26 +3206,153 @@ func TestALoopOverAMapGivesItsKeysInOneOrder(t *testing.T) {
 	}
 }
 
+// Every loop gives a map's keys in one order, however the condition reaches the map: random
+// conditions loop, nest loops, and reach maps the host passes, JSON objects, Structs, map literals,
+// the request and maps a loop's variable holds through selects, indexes, dyn() and choices, each
+// evaluated 50 times with its attributes converted afresh, decide alike and cost alike, within
+// their bounds, as do ones reaching only literals, which bound them below what any condition may.
+func TestEveryLoopOverAMapDecidesAndCostsAlike(t *testing.T) {
+	inner, err := structpb.NewStruct(map[string]any{"c": 1, "a": 2, "bb": 3, "d": 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attributes := map[string]any{
+		"m":      map[any]any{"b": 1, uint(7): 2, "a": 3, 1: 4, true: 5, -2: 6, "ccc": 7},
+		"s":      map[string]any{"read": 1, "write": 2, "admin": 3, "zz": 4},
+		"list":   []any{map[string]any{"c": 1, "a": 2, "b": 3}, map[string]any{"z": 1, "y": 2}},
+		"nested": map[string]any{"p": map[string]any{"c": 1, "a": 2}, "q": map[string]any{"z": 1, "y": 2, "x": 3}},
+		"json":   json.RawMessage(`{"o": {"c": 1, "a": 2, "b": 3}, "k": "a"}`),
+		"packed": &structpb.Struct{Fields: map[string]*structpb.Value{"o": structpb.NewStructValue(inner)}},
+	}
+	rng := rand.New(rand.NewPCG(15, 1))
+	pick := func(xs ...string) string { return xs[rng.IntN(len(xs))] }
+	literal := func() string {
+		var entries []string
+		for i := range rng.IntN(5) + 2 {
+			entries = append(entries, fmt.Sprintf("%s: %d", pick(`"a"`, `"bb"`, `"c"`, `"dddd"`, `"e"`, "1", "2u", "true", "-3", "0.5"), i))
+		}
+		return "{" + strings.Join(entries, ", ") + "}"
+	}
+	literals := false
+	var ranged func(depth int, bound string) string
+	ranged = func(depth int, bound string) string {
+		switch n := rng.IntN(14); {
+		case n == 0 && bound != "":
+			return bound
+		case n == 1 || literals && n < 9:
+			return literal()
+		case n == 2:
+			return "request.attributes." + pick("m", "s")
+		case n == 3:
+			return `request.attributes["` + pick("m", "s", "nested") + `"]`
+		case n == 4:
+			return "request.attributes.json.o"
+		case n == 5:
+			return "request.attributes.packed.o"
+		case n == 6:
+			return "request.attributes.nested." + pick("p", "q")
+		case n == 7:
+			return "request.attributes.list[" + pick("0", "1") + "]"
+		case n == 8:
+			return pick("request", "subject", "resource.attributes")
+		case n == 9 && depth > 0:
+			return "dyn(" + ranged(depth-1, bound) + ")"
+		case n == 10 && depth > 0:
+			return "(size(request.attributes.s) " + pick(">", "<") + " 2 ? dyn(" + ranged(depth-1, bound) + ") : dyn(" + ranged(depth-1, bound) + "))"
+		case n == 11 && depth > 0:
+			return `{"x": ` + ranged(depth-1, bound) + `}` + pick(`["x"]`, ".x")
+		case n == 12 && depth > 0:
+			return "[" + ranged(depth-1, bound) + "][0]"
+		default:
+			return "request.attributes.s"
+		}
+	}
+	var looped func(depth int, bound string) string
+	looped = func(depth int, bound string) string {
+		r := ranged(2, bound)
+		v := fmt.Sprintf("k%d", depth)
+		cond := func() string {
+			if depth > 0 && rng.IntN(3) == 0 {
+				return looped(depth-1, v)
+			}
+			return pick(v+` < "b"`, v+` == "a"`, v+" > 0", "true", "false", "string("+v+`) < "c"`, r+"["+v+"] == 2")
+		}
+		switch rng.IntN(6) {
+		case 0:
+			return r + ".map(" + v + ", " + v + ")[0] == " + pick(`"a"`, "true", "1", `"admin"`, `"attributes"`)
+		case 1:
+			return r + ".filter(" + v + ", " + cond() + ").map(" + v + ", string(" + v + ")).exists(x, x == " + pick(`"a"`, `"c"`, `"zz"`) + ")"
+		case 2:
+			return r + ".all(" + v + ", " + cond() + ")"
+		case 3:
+			return r + ".exists_one(" + v + ", " + cond() + ")"
+		case 4:
+			return r + ".map(" + v + ", " + cond() + ", string(" + v + "))[0] == " + pick(`"a"`, `"c"`, `"zz"`)
+		default:
+			return r + ".exists(" + v + ", " + cond() + ")"
+		}
+	}
+	conditions, bounded := 0, 0
+	for i := range 600 {
+		literals = i >= 400
+		expr := looped(2, "")
+		decided, err := rbac.Evaluations(t, expr, attributes, 50)
+		if err != nil {
+			continue
+		}
+		conditions++
+		for i, d := range decided {
+			if d != decided[0] {
+				t.Fatalf("%s decided %+v, and in evaluation %d %+v", expr, decided[0], i, d)
+			}
+		}
+		limit, cost := rbac.ConditionCost(t, expr, attributes)
+		if cost > limit {
+			t.Errorf("%s cost %d, past its bound, %d", expr, cost, limit)
+		}
+		if limit < 10000 {
+			bounded++
+		}
+	}
+	if conditions < 450 || bounded < 100 {
+		t.Errorf("of 600 random conditions, %d were conditions, %d bounded below what any may cost", conditions, bounded)
+	}
+}
+
 // Sorting a map's keys compares each with others at each of a few levels, reading as much of both
-// as they share, so a loop over a map is charged, before it starts, each key what reading it does
-// at each level, as its bound counts it, and one over a map of long keys sharing all but their
-// last byte, which would read them over and over, fails before it sorts them.
+// as they share, so a loop over a map is charged, before it starts, 1 for each two keys at each
+// level and what reading each costs past 1 once, as its bound counts it: charged 1 for each key and
+// its bytes at each level, a loop over 500 keys of 36 bytes, as ids, cost past what a condition
+// may, though sorting them took 64 µs. One over a map of long keys sharing all but their last
+// bytes, which would read them over and over, fails before it sorts them.
 func TestALoopOverAMapCostsSortingItsKeys(t *testing.T) {
 	keyed := func(n, length int) map[string]any {
-		m := map[string]any{}
+		m, l := map[string]any{}, []any{}
 		for i := range n {
-			m[fmt.Sprintf("%s%03d", strings.Repeat("k", length-3), i)] = i
+			k := fmt.Sprintf("%s%03d", strings.Repeat("k", length-3), i)
+			m[k], l = i, append(l, k)
 		}
-		return map[string]any{"m": m}
+		return map[string]any{"m": m, "l": l}
+	}
+	for _, c := range []struct{ n, length, levels int }{{16, 300, 4}, {500, 36, 9}, {2, 5, 1}, {3, 40, 2}} {
+		attributes := keyed(c.n, c.length)
+		limit, cost := rbac.ConditionCost(t, `request.attributes.m.exists(k, k == "")`, attributes)
+		_, listed := rbac.ConditionCost(t, `request.attributes.l.exists(k, k == "")`, attributes)
+		// Each key 1 at the loop's first step, as before, each two 1 at each level, and its bytes once.
+		if want := uint64(c.n + (c.n+1)/2*c.levels + c.n*(c.length/10)); cost != listed+want || cost > limit {
+			t.Errorf("a loop over %d keys of %d bytes cost %d, bounded at %d, where over a list of them it cost %d, not %d less",
+				c.n, c.length, cost, limit, listed, want)
+		}
+		if held, evaluated, _, err := rbac.EvaluateCondition(t, `!request.attributes.m.exists(k, k == "")`, attributes); err != nil || !held || !evaluated {
+			t.Errorf("a loop over %d keys of %d bytes held %t, evaluated %t: %v", c.n, c.length, held, evaluated, err)
+		}
 	}
 	_, alone := rbac.ConditionCost(t, `request.attributes.m.exists(k, false)`, keyed(1, 300))
-	limit, cost := rbac.ConditionCost(t, `request.attributes.m.exists(k, false)`, keyed(16, 300))
-	// 16 keys of 31 at each of 4 levels.
-	if cost < 16*31*4 || cost > limit || alone > 10 {
-		t.Errorf("a loop over 16 keys of 300 bytes cost %d, bounded at %d, and over one key %d", cost, limit, alone)
+	if alone > 10 {
+		t.Errorf("a loop over one key of 300 bytes cost %d", alone)
 	}
-	if held, evaluated, _, err := rbac.EvaluateCondition(t, `!request.attributes.m.exists(k, false)`, keyed(64, 1000)); err != nil || held || evaluated {
-		t.Errorf("a loop over 64 keys of a kilobyte held %t, evaluated %t: %v", held, evaluated, err)
+	if held, evaluated, _, err := rbac.EvaluateCondition(t, `!request.attributes.m.exists(k, false)`, keyed(100, 1000)); err != nil || held || evaluated {
+		t.Errorf("a loop over 100 keys of a kilobyte held %t, evaluated %t: %v", held, evaluated, err)
 	}
 	literal := `{"aaaaaaaaaaaaaaaaaaaa": 1, "aaaaaaaaaaaaaaaaaaab": 2, "aaaaaaaaaaaaaaaaaaac": 3, "b": 4, "c": 5}`
 	for _, expr := range []string{
@@ -3219,8 +3360,8 @@ func TestALoopOverAMapCostsSortingItsKeys(t *testing.T) {
 		`(true ? dyn(` + literal + `) : dyn([1])).all(k, k != "")`,
 	} {
 		limit, cost := rbac.ConditionCost(t, expr, nil)
-		// Five keys of at most 3 at each of 3 levels.
-		if cost > limit || limit < 5*3*3 {
+		// Three for each of 3 levels, and 2 more for each key.
+		if cost > limit || limit < 3*3+5*2 {
 			t.Errorf("%s cost %d, bounded at %d", expr, cost, limit)
 		}
 	}
@@ -4345,6 +4486,13 @@ func TestStoredConditionsKeepTheirBounds(t *testing.T) {
 		{rebuilt, 10000},
 		{`{"dev": 1, "prod": 2}[resource.attributes.env] <= request.attributes.n`, 10000},
 		{`request.attributes.tags.exists(t, t == "gpu")`, 10000},
+		// A loop over a map sorts its keys first: 1 for each two at each level, and what reading each
+		// costs past 1, once.
+		{`{"dev": 1, "prod": 2, "staging": 3}.exists(k, k == request.attributes.env)`, 93},
+		{`[1, 2, 3].all(i, {"b": i, "a": 2}.map(k, k)[0] == "a")`, 300},
+		{`{"a": {"y": 1, "x": 2}, "b": {"z": 3}}.all(k, {"a": {"y": 1, "x": 2}, "b": {"z": 3}}[k].exists(j, j != k))`, 881},
+		{`dyn({"b": 1, "a": 2}).map(k, k)[0] == "a"`, 88},
+		{`(request.attributes.mfa ? {"b": 1, "a": 2} : {"c": 3}).exists(k, k == "c")`, 98},
 	} {
 		if limit, _ := rbac.ConditionCost(t, c.expr, nil); limit != c.bound {
 			t.Errorf("%s is bounded at %d, not %d", c.expr, limit, c.bound)

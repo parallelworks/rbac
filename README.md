@@ -310,8 +310,9 @@ scopes conditional ones reach, to check one by one.
   JSON text may cost more, by its brackets, braces, commas and colons. Converting stops
   10,000 deep, so what a kind nesting deeper is charged, and whether the kinds after it fit, can
   turn on the order a map's entries come in, failing closed, and nothing else turns on that order,
-  nor on the order of the kinds, but what a hook's copy holds past 20,000 deep, where it reaches a
-  value less deep too: a loop gives a map's keys in an order of their own, below. The subject's, the
+  nor on the order of the kinds, but whether a hook can be given a copy of a value that holds
+  itself and nests near 20,000 deep around the cycle, below: a loop gives a map's keys in an order
+  of their own. The subject's, the
   resource's and the request's attributes share what a check converts, so attributes a tenant's
   users write, as a resource's tags, can take every check of the resource past it, where a grant's
   condition reading an attribute gives nothing and a deny's applies, whoever asks: bound what users
@@ -346,11 +347,11 @@ scopes conditional ones reach, to check one by one.
   identical checks, `Explain` disagreeing with the check before it in 51, and a deny's
   `request.attributes.scopes.filter(k, true)[0] == "admin"` lifted in 84, so a requester could ask
   until it lifted; and how far `all()` or `exists()` went before it stopped, and so what it cost,
-  turned on it too. Sorting the keys costs each what reading it does, when the loop starts, once
-  for each time their number halves to one, and a loop over a map holding more than one key of
-  another type, as a literal keyed by lists can, fails. `contains` costs what reading both strings
-  does, multiplied, and `startsWith` and `endsWith` what reading
-  the shorter does, at least 1 however short or empty either is, and one costing more than a
+  turned on it too. Sorting the keys costs, when the loop starts, 1 for each two keys each time
+  their number halves to one, and each key what reading it does past 1, once, and a loop over a
+  map holding more than one key of another type, as a literal keyed by lists can, fails.
+  `contains` costs what reading both strings does, multiplied, and `startsWith` and `endsWith` what
+  reading the shorter does, at least 1 however short or empty either is, and one costing more than a
   condition may fails before it runs: `contains` of one long string the request passes in another
   tries each place in it, which can take a third of a second. A comparison costs reading the
   smaller value, read once, in step with the other, and charged before it runs: measured again
@@ -400,8 +401,10 @@ scopes conditional ones reach, to check one by one.
   conditions that read many may be past a bound as an upgrade leaves them, and costs those 500 at
   each read, so one reading more than about sixteen in a loop, which held once the process had
   loaded them, fails. A loop over a map costs sorting its keys, so one over 500 short keys, which
-  cost about half what a condition may, now costs nearly all, and one over more fails the same
-  way, as does one over a map literal holding more than one key of another type, as lists. Adding
+  cost about half what a condition may, now costs about two thirds, and one over more than about
+  700 fails the same way, as does one over a map literal holding more than one key of another
+  type, as lists; a scope's conditions looping over map literals are bounded a little higher too,
+  so they may be past a bound as an upgrade leaves them. Adding
   to `request.time`, or converting it, was bounded at all a condition
   may cost and is now bounded as the timestamp it is, a few units. Attributes holding JSON text or
   a packed message that sets a key twice, JSON text that isn't UTF-8 or escapes half a surrogate
@@ -412,7 +415,9 @@ scopes conditional ones reach, to check one by one.
   call asking a constraint about them, or `ValidateGrant` about an actor holding them, is refused
   whatever grants it, and so can ones holding structs that hold a map, a slice, a pointer or an
   interface, which a hook's copy sets whole and is now charged their bytes, as it charged a struct
-  holding none; and a condition building a list or a map holding attributes no condition can
+  holding none, or maps keyed by arrays or structs, whose keys it is now charged the bytes of; and
+  so are ones nesting past 20,000 deep, of which a hook was given what lay deeper as its zero
+  value; and a condition building a list or a map holding attributes no condition can
   read, or reading the `subject`, the `resource` or the `request` holding them whole, as one
   deciding a label value or a power to release reads the `resource`, was decided without them and
   now fails. So does one building a list or a map holding a double that isn't finite, as
@@ -471,8 +476,10 @@ scopes conditional ones reach, to check one by one.
   asks for, so one writing to its copy reads its write later in the call, and nothing else does;
   copied for each ask, `Permissions` of 300 permissions on a resource of 20,000 tags took a second.
   `ValidateGrant` is given its copy of the actor's attributes once for a call too. A copy holds no
-  more than a check converts, counted alike: where the attributes hold more, the hook can't be
-  asked, and the call is refused as any other, a `DeniedError` of the permission on the resource
+  more than a check converts, counted alike, and nothing nesting past 20,000 deep, twice what a
+  condition reads, along any path, wherever a value reached twice is reached first: where the
+  attributes hold more, or nest deeper, the hook can't be asked, rather than be given part of them,
+  and the call is refused as any other, a `DeniedError` of the permission on the resource
   asked about, or the tenant, whose `Reason` names the hook and whose message doesn't: a tenant's
   users can write what takes attributes past it, as a resource's tags, and the message named the
   constraint. What one removes from an actor the actor can't hand on, but for a
