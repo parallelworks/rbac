@@ -118,7 +118,9 @@ import (
 // each list, ListValue or JSON array, each pointer, but to a message, and each other message. So a
 // unit converted costs about what one read does, 20 to 115 ns, and a check converts no more than
 // its conditions may spend reading, about 20 ms, where charged one each, as a number is, 160,000
-// empty maps took 93 ms. Each kind is converted whole, whether it can be read or not: past that,
+// empty maps took 93 ms. Each kind is converted whole, whether it can be read or not, but a map of
+// structs, which no condition reads, is refused unread, charged 2 for each entry: reading an entry
+// copies it whole, and a map of 2,000 structs of 64 KiB, charged as much, took 7 ms. Past that,
 // every condition reading an attribute of any kind fails, as it does where JSON text may cost more
 // than that, by its brackets, braces, commas and colons, which isn't parsed. A call converts the
 // subject's and the request's attributes once, the first time one of its checks reads a condition,
@@ -131,16 +133,19 @@ import (
 // converting stops there, so what it is charged, and whether the kinds after it fit what is left,
 // can turn on the order a map's entries come in: either way it can't be read, and the others are
 // read or, past what is left, fail. Nothing else converting finds turns on that order, nor on the
-// order of the kinds. The subject's, the resource's and the request's attributes share it, so
-// attributes a tenant's users write, as a resource's tags, can take every check of the resource
-// past that, where a grant's condition reading an attribute gives nothing and a deny's applies,
-// whoever asks: bound what users may store, or pass conditions only what they read. A hook, a
-// constraint or ValidateGrant, is given a copy of the subject's or the resource's attributes, or
-// the actor's, of no more than that either, counted as converting counts it, whatever the copy
-// shares, but for what JSON text and packed messages decode to, which it holds as bytes, so it can
-// be given whatever a check converts; past that it can't be asked and the call is refused
-// (ConstraintInput). A declared attribute is a value of its type as converted, so a named string
-// type is a string.
+// order of the kinds, and no condition reads it: a loop gives a map's keys in an order of their
+// own (Condition). The subject's, the resource's and the request's attributes share what a check
+// converts, so attributes a tenant's users write, as a resource's tags, can take every check of the
+// resource past it, where a grant's condition reading an attribute gives nothing and a deny's
+// applies, whoever asks: bound what users may store, or pass conditions only what they read. A
+// hook, a constraint or ValidateGrant, is given a copy of the subject's or the resource's
+// attributes, or the actor's, of no more than that either, counted as converting counts it,
+// whatever the copy shares, but for what JSON text and packed messages decode to, which it holds as
+// bytes, so it can be given whatever a check converts; past that it can't be asked and the call is
+// refused (ConstraintInput). A copy holds what nests past 20,000 deep as its zero value, so where it
+// reaches a value that deep and less deep too, what it holds there can turn on that order, as what
+// converting charges past 10,000 deep can. A declared attribute is a value of its type as
+// converted, so a named string type is a string.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
@@ -586,6 +591,15 @@ func (c *converter) dict(v reflect.Value) (ref.Val, int) {
 	if !c.building(mapCost-1, 2*length(v.Len())) {
 		return nil, 0
 	}
+	// Reading an entry copies its value whole, though a struct is refused whatever it holds: a map of
+	// 2,000 structs of 64 KiB took 7 ms to convert, charged 4,017. One that holds any is refused once,
+	// unread, at the least its entries cost.
+	if v.Len() > 0 && refusedWhole(v.Type().Elem()) {
+		if !c.pay(2 * length(v.Len())) {
+			return nil, 0
+		}
+		return c.refuse(), 1
+	}
 	out, height := make(map[ref.Val]ref.Val, v.Len()), 0
 	// Each entry is read into the same two values, as reading it into new ones allocates for each,
 	// a string key or an interface value too: nothing converting reads keeps them.
@@ -641,6 +655,19 @@ func (c *converter) key(k reflect.Value) ref.Val {
 	default:
 	}
 	return c.refuse()
+}
+
+// refusedWhole reports whether of refuses every value of type t, whatever it holds: a struct, but
+// for a time, and an array of one.
+func refusedWhole(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Struct:
+		return t != timeType && t != celTimestampType && t != celDurationType
+	case reflect.Array:
+		return t.Len() > 0 && refusedWhole(t.Elem())
+	default:
+		return false
+	}
 }
 
 // keyType reports whether a map keyed by values of type t is keyed as Attributes names, empty too.
@@ -1351,10 +1378,11 @@ func deepCopy[T any](v T) (T, bool) {
 var copying = func() {}
 
 // maxCopied is how deep deepCopy copies a value, past which the copy holds the zero value, or the
-// copy of one it copied less deep: copying recurses as deep as the value nests, and a list nested
-// three million deep overflowed the stack, which no recover catches, ending the process wherever a
-// hook was asked about it. No condition reads what lies deeper (maxNested), and sharing it would let
-// a hook write to what the host holds less deep too.
+// copy of one it copied less deep, before, as the order a map's entries come in may decide: copying
+// recurses as deep as the value nests, and a list nested three million deep overflowed the stack,
+// which no recover catches, ending the process wherever a hook was asked about it. No condition
+// reads what lies deeper (maxNested), and sharing it would let a hook write to what the host holds
+// less deep too.
 const maxCopied = 2 * maxNested
 
 // copier copies values for deepCopy, keeping each map and pointer it copied by where it points and
@@ -1485,6 +1513,11 @@ func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
 		}
 		return c.slice(v, depth)
 	case reflect.Struct:
+		// Set whole, its unexported fields too, and so charged its bytes, as a flat one is (payWhole):
+		// charged one, a copy of 2,000 structs each holding a map and 64 KiB took 38 ms.
+		if !c.pay(tenths(v.Type()) / 10) {
+			return reflect.Zero(v.Type())
+		}
 		out := reflect.New(v.Type()).Elem()
 		out.Set(v)
 		c.fields(out, v, depth)
@@ -1594,6 +1627,8 @@ func (c *copier) lengthen(v reflect.Value, k copiedKey, s *copied) *copied {
 	// what building a list does, once for where it starts. Each costs at least one, but a byte, so a
 	// slice of more than is left isn't made. Counted once more for each, a list of 100,000 short
 	// strings, which a check converts, couldn't be copied, so a constrained check of it was refused.
+	// Elements of another type are moved whole here before each is copied, and so charged the
+	// structs they hold in place (inlineTenths), as each costs again when copied.
 	elem, made := v.Type().Elem(), uint64(listCost-1)
 	if s != nil {
 		made = 0
@@ -1612,7 +1647,7 @@ func (c *copier) lengthen(v reflect.Value, k copiedKey, s *copied) *copied {
 				return nil
 			}
 		}
-	case !c.building(made, length(n-had)):
+	case !c.building(made, length(n-had)) || !c.pay(length(n-had)*(inlineTenths(elem)/10)):
 		return nil
 	}
 	switch {
@@ -1881,9 +1916,9 @@ func textOf(v reflect.Value) int {
 	return v.Len()
 }
 
-// tenths is what copying a value of t, which is flat, whole costs, in tenths: a tenth of each of
-// its bytes, as converting counts bytes, but for a string's, which is one value, as converting
-// counts it, though moving it moves 16 bytes.
+// tenths is what copying a value of t whole costs, in tenths: a tenth of each of its bytes, as
+// converting counts bytes, but for a string's, which is one value, as converting counts it, though
+// moving it moves 16 bytes.
 func tenths(t reflect.Type) uint64 {
 	switch t.Kind() {
 	case reflect.String:
@@ -1901,7 +1936,21 @@ func tenths(t reflect.Type) uint64 {
 	}
 }
 
-var celTimestampType = reflect.TypeFor[types.Timestamp]()
+// inlineTenths is what moving the structs a value of t holds in place whole costs, in tenths
+// (tenths), but times, which converting reads: copying anything else a value holds costs at least
+// one for each 24 bytes moving it moves.
+func inlineTenths(t reflect.Type) uint64 {
+	switch {
+	case t.Kind() == reflect.Struct && t != timeType && t != celTimestampType:
+		return tenths(t)
+	case t.Kind() == reflect.Array:
+		return length(t.Len()) * inlineTenths(t.Elem())
+	default:
+		return 0
+	}
+}
+
+var celTimestampType, celDurationType = reflect.TypeFor[types.Timestamp](), reflect.TypeFor[types.Duration]()
 
 // shared reports whether a copy shares a value of type t, setting it whole where the copy holds it:
 // one holding no map, slice, pointer or interface a copy would share (flat), and a time, whose
