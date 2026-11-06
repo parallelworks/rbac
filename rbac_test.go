@@ -9337,6 +9337,9 @@ func TestAReadLeavesTheHostItsPlannerSettingsWhereItFails(t *testing.T) {
 			rbac.SetMatchingKeys(t, func(int) { panic(refused) })
 			defer func() {
 				if r := recover(); r != nil {
+					if r != refused {
+						t.Errorf("the host recovered %v, not the read's panic", r)
+					}
 					err = fmt.Errorf("a panic in Holders: %v", r)
 				}
 			}()
