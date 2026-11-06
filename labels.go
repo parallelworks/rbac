@@ -436,37 +436,56 @@ func (a *Authorizer) valuesOn(ctx context.Context, q DB, tenant string, s Subjec
 }
 
 // labeling is v of what gives label values and powers to release alone: its grants of roles that
-// give any, each role giving only those but privileged and public as it is whole, its permissions
-// read once however many grants name it. A holding decides by nothing else, so it decides the same
+// give any, as labelRoles narrows them. A holding decides by nothing else, so it decides the same
 // by either, and every holding is decided by it: a check walks only these, and a change deciding
 // the values of many labels by one read only these for each, however many grants of other roles,
-// or other permissions of theirs, its subject holds.
+// or other permissions of theirs, its subject holds. A read narrowed so already is its own, as
+// Holders narrows the read of every holder's values once for all of them (valuesOfAll).
 func (a *Authorizer) labeling(v *valuesRead) *valuesRead {
-	l := &valuesRead{ds: v.ds, roles: book{builtin: map[Role]RoleDefinition{}, custom: map[Role]RoleDefinition{}}}
-	gives := map[Role]bool{}
-	for _, h := range v.held {
-		g, read := gives[h.Role]
-		if !read {
-			def, ok := v.roles.role(h.Role)
-			if ok {
-				readingEntries(len(def.Permissions))
-				def.Permissions = slices.DeleteFunc(slices.Clone(def.Permissions), func(p Permission) bool { return !a.labelPermission(p) })
-			}
-			g = ok && len(def.Permissions) > 0
-			gives[h.Role] = g
-			switch _, builtin := v.roles.builtin[h.Role]; {
-			case !g:
-			case builtin:
-				l.roles.builtin[h.Role] = def
-			default:
-				l.roles.custom[h.Role] = def
-			}
+	if v.narrowed {
+		return v
+	}
+	roles := a.labelRoles(v.roles, v.held)
+	return &valuesRead{held: grantsOf(roles, v.held), ds: v.ds, roles: roles}
+}
+
+// labelRoles is, of the roles held names as roles defines them, those giving label values or
+// powers to release, each giving only those but privileged and public as it is whole, its
+// permissions read once however many grants name it.
+func (a *Authorizer) labelRoles(roles book, held []holding) book {
+	l := book{builtin: map[Role]RoleDefinition{}, custom: map[Role]RoleDefinition{}}
+	read := map[Role]bool{}
+	for _, h := range held {
+		if read[h.Role] {
+			continue
 		}
-		if g {
-			l.held = append(l.held, h)
+		read[h.Role] = true
+		def, ok := roles.role(h.Role)
+		if !ok {
+			continue
+		}
+		readingEntries(len(def.Permissions))
+		def.Permissions = slices.DeleteFunc(slices.Clone(def.Permissions), func(p Permission) bool { return !a.labelPermission(p) })
+		switch _, builtin := roles.builtin[h.Role]; {
+		case len(def.Permissions) == 0:
+		case builtin:
+			l.builtin[h.Role] = def
+		default:
+			l.custom[h.Role] = def
 		}
 	}
 	return l
+}
+
+// grantsOf is, of held, in order, the grants of roles roles has.
+func grantsOf(roles book, held []holding) []holding {
+	var kept []holding
+	for _, h := range held {
+		if _, ok := roles.role(h.Role); ok {
+			kept = append(kept, h)
+		}
+	}
+	return kept
 }
 
 // holdingFrom is holdingOn deciding by v, read with s's other grants, reading on q the conditions

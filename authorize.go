@@ -661,7 +661,8 @@ func (a *Authorizer) broadLabeled(ctx context.Context, p Permission, r Resource,
 // it: one that satisfies it only with the values a condition or a constraint decided, which a read
 // without the request can't settle, is marked MaybeDenied; and one that doesn't even then, or holds
 // none of p's dimension, is left out. The members and the public broadLabeled kept stay. Each
-// identity's holding is decided after the list's snapshot, as its constraints run as for any read.
+// identity's holding is decided after the list's snapshot, as its constraints run as for any read,
+// by its read narrowed already for all of them (valuesOfAll).
 func (a *Authorizer) labeled(ctx context.Context, p Permission, r Resource, holders []Holder, values map[string]*valuesRead) ([]Holder, error) {
 	// Whom it keeps, and marks, doesn't turn on the request: each value or power to release whose
 	// decision a condition takes part in, a grant's or a deny's, is in byCondition whatever the
@@ -715,8 +716,9 @@ func (a *Authorizer) valuesOfEach(ctx context.Context, q DB, tenant string, hold
 // denies binding each identity. A test counts the work many holders take.
 var matchingKeys = func(n int) {}
 
-// valuesOfAll is valuesOfEach's read of identities, by key, of the denies binding each only those of
-// a label value or a power to release.
+// valuesOfAll is valuesOfEach's read of identities, by key, narrowed once for all of them to what
+// gives values (labeling): of the grants reaching each only those of roles giving some, and of the
+// denies binding each only those of a label value or a power to release.
 func (a *Authorizer) valuesOfAll(ctx context.Context, q DB, tenant string, identities []string) (map[string]*valuesRead, error) {
 	rows, err := q.Query(ctx, `
 		WITH idents AS MATERIALIZED (
@@ -786,6 +788,14 @@ func (a *Authorizer) valuesOfAll(ctx context.Context, q DB, tenant string, ident
 	if len(custom) > 0 {
 		roles = a.bookOf(a.current(custom))
 	}
+	// Narrowed once for every identity, so each walks only its grants of roles giving values, and a
+	// role giving none costs the list its read alone: narrowed for each, as a check narrows its own,
+	// every role granted to any of an identity's keys was read again for it, so 1,000 holders, the
+	// tenant's members granted 300 roles of 1,000 other permissions, read 300 million entries.
+	roles = a.labelRoles(roles, grants)
+	for k, is := range at {
+		at[k] = slices.DeleteFunc(is, func(i int) bool { _, ok := roles.role(grants[i].Role); return !ok })
+	}
 	// The denies naming and exempting each key, indexed once, so each identity looks its own keys up
 	// rather than every key of every deny binding any identity. Only a deny listing a label value or
 	// a power to release, or its dimension's `dim:*`, removes one (denies), so the others decide none.
@@ -804,7 +814,7 @@ func (a *Authorizer) valuesOfAll(ctx context.Context, q DB, tenant string, ident
 	}
 	values := make(map[string]*valuesRead, len(byIdentity))
 	for identity, k := range byIdentity {
-		v := &valuesRead{roles: roles}
+		v := &valuesRead{roles: roles, narrowed: true}
 		var is []int
 		for _, key := range slices.Compact(slices.Sorted(slices.Values(k.keys))) {
 			is = append(is, at[key]...)
@@ -1792,6 +1802,9 @@ type valuesRead struct {
 	// decided is the holding decided by it through each constrained, so a change's checks decide
 	// each value once for each read.
 	decided map[*constrained]*decidedHolding
+	// narrowed is set where held and roles are only what gives values already, as Holders narrows
+	// its read of every holder's (valuesOfAll), so labeling narrows them no more.
+	narrowed bool
 }
 
 // onTenant is what of grants and denies read on scopes holding the tenant's, with roles, a subject's

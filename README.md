@@ -199,8 +199,8 @@ scopes conditional ones reach, to check one by one.
   first asks for it, and evaluates a condition of the actor's that doesn't read the action once for
   all of them, each value still on a budget of its own, as a check of it is. For each it walks only
   the actor's grants giving values or powers to release, and of their roles only those, each role
-  read once in each phase, as every check deciding a subject's values does, so the grants of other
-  roles, however many or large, cost a label nothing.
+  read once in each phase, as every check deciding a subject's values does, and `Holders` once for
+  all the identities it lists, so other roles' grants, however many or large, cost a label nothing.
   `Filter` tests a `text[]` label column (`Columns.Labels`), looking each of a row's values up,
   byte for byte, in objects of the values the holding allows that the query builds once, so a row
   costs a few comparisons for each of its values however many the dimensions declare, in a custom

@@ -462,6 +462,41 @@ func LabeledChecksDecided(t *testing.T, ctx context.Context, a *Authorizer, acto
 	if err != nil {
 		t.Fatal(err)
 	}
+	return a.checksDecided(ctx, actor, tenant, labels, func() *valuesRead { return &valuesRead{held: v.held, ds: v.ds, roles: v.roles} }, v)
+}
+
+// ListedChecksDecided is LabeledChecksDecided of each of subjects, identities that are members or
+// guests of tenant, deciding by Holders' read of every subject's values at once, narrowed once for
+// all of them (valuesOfAll), as Holders decides each holder's, in place of a read of its own.
+func ListedChecksDecided(t *testing.T, ctx context.Context, a *Authorizer, subjects []Subject, tenant string, labels []Label) (listed, full [][]string) {
+	t.Helper()
+	a = a.still()
+	identities := make([]string, len(subjects))
+	for i, s := range subjects {
+		identities[i] = s.Principal.key()
+	}
+	read, err := a.valuesOfAll(ctx, a.db, tenant, identities)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range subjects {
+		v, err := a.valuesOn(ctx, a.db, tenant, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := read[s.Principal.key()]
+		if r == nil {
+			t.Fatalf("Holders' read has nothing of %v", s.Principal)
+		}
+		by, whole := a.checksDecided(ctx, s, tenant, labels, func() *valuesRead { return r }, v)
+		listed, full = append(listed, by), append(full, whole)
+	}
+	return listed, full
+}
+
+// checksDecided is LabeledChecksDecided of actor, deciding by what read returns, and by v walked
+// whole.
+func (a *Authorizer) checksDecided(ctx context.Context, actor Subject, tenant string, labels []Label, read func() *valuesRead, v *valuesRead) (by, full []string) {
 	decided := func(h Holding, l Label, err error) string {
 		switch {
 		case err != nil:
@@ -471,19 +506,19 @@ func LabeledChecksDecided(t *testing.T, ctx context.Context, a *Authorizer, acto
 		}
 		return fmt.Sprint(a.heldOf(h, l), h.excluded)
 	}
-	read := func() *valuesRead { return &valuesRead{held: v.held, ds: v.ds, roles: v.roles} }
 	for _, l := range append(slices.Clone(labels), nil) {
 		var h Holding
+		var err error
 		if l == nil {
 			h, _, err = a.holdingOf(ctx, tenant, actor, read())
 		} else {
 			h, _, err = a.holdingFor(ctx, tenant, actor, read(), l)
 		}
-		narrowed = append(narrowed, decided(h, l, err))
+		by = append(by, decided(h, l, err))
 		h, err = a.walkingEvery(ctx, actor, tenant, v, l)
 		full = append(full, decided(h, l, err))
 	}
-	return narrowed, full
+	return by, full
 }
 
 // walkingEvery is actor's holding in tenant decided by v as it is read, of the values l asks for,
