@@ -436,13 +436,13 @@ func HoldingDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subj
 	}
 	all = everything(h)
 	for _, l := range labels {
-		h, err := a.walkingEvery(ctx, actor, tenant, v, l)
+		h, _, err := a.walkingEvery(ctx, actor, tenant, v, l)
 		if err != nil {
 			t.Fatal(err)
 		}
 		alone = append(alone, a.heldOf(h, l))
 	}
-	h, err = a.walkingEvery(ctx, actor, tenant, v, nil)
+	h, _, err = a.walkingEvery(ctx, actor, tenant, v, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,8 +450,9 @@ func HoldingDecided(t *testing.T, ctx context.Context, a *Authorizer, actor Subj
 }
 
 // LabeledChecksDecided is, for each of labels and then for every label, what actor holds in tenant
-// on ctx's request of the values each asks for, as HoldingDecided writes them, or the error deciding
-// them returned: as a check of a resource it labels decides them (holdingFor), and Reachable and
+// on ctx's request of the values each asks for, as HoldingDecided writes them, and those of them a
+// condition or a constraint decided, which Holders marks a holder by, or the error deciding them
+// returned: as a check of a resource it labels decides them (holdingFor), and Reachable and
 // Holding every one (holdingOf), by a read narrowed to the grants giving values and of their roles
 // those (labeling); and by a read of every grant actor holds on the tenant and every permission of
 // their roles. Each is decided by a read and asks of the constraints of its own, as checks are.
@@ -497,40 +498,42 @@ func ListedChecksDecided(t *testing.T, ctx context.Context, a *Authorizer, subje
 // checksDecided is LabeledChecksDecided of actor, deciding by what read returns, and by v walked
 // whole.
 func (a *Authorizer) checksDecided(ctx context.Context, actor Subject, tenant string, labels []Label, read func() *valuesRead, v *valuesRead) (by, full []string) {
-	decided := func(h Holding, l Label, err error) string {
+	decided := func(h Holding, byCondition map[Permission]bool, l Label, err error) string {
+		conditioned := fmt.Sprint(" by condition ", slices.Sorted(maps.Keys(byCondition)))
 		switch {
 		case err != nil:
 			return "error: " + err.Error()
 		case l == nil:
-			return strings.Join(everything(h), " ")
+			return strings.Join(everything(h), " ") + conditioned
 		}
-		return fmt.Sprint(a.heldOf(h, l), h.excluded)
+		return fmt.Sprint(a.heldOf(h, l), h.excluded, conditioned)
 	}
 	for _, l := range append(slices.Clone(labels), nil) {
 		var h Holding
+		var byCondition map[Permission]bool
 		var err error
 		if l == nil {
-			h, _, err = a.holdingOf(ctx, tenant, actor, read())
+			h, byCondition, err = a.holdingOf(ctx, tenant, actor, read())
 		} else {
-			h, _, err = a.holdingFor(ctx, tenant, actor, read(), l)
+			h, byCondition, err = a.holdingFor(ctx, tenant, actor, read(), l)
 		}
-		by = append(by, decided(h, l, err))
-		h, err = a.walkingEvery(ctx, actor, tenant, v, l)
-		full = append(full, decided(h, l, err))
+		by = append(by, decided(h, byCondition, l, err))
+		h, byCondition, err = a.walkingEvery(ctx, actor, tenant, v, l)
+		full = append(full, decided(h, byCondition, l, err))
 	}
 	return by, full
 }
 
 // walkingEvery is actor's holding in tenant decided by v as it is read, of the values l asks for,
-// or of every one where l is nil, walking every grant v holds and every permission of their roles.
-func (a *Authorizer) walkingEvery(ctx context.Context, actor Subject, tenant string, v *valuesRead, l Label) (Holding, error) {
+// or of every one where l is nil, walking every grant v holds and every permission of their roles,
+// and those of them a condition or a constraint decided.
+func (a *Authorizer) walkingEvery(ctx context.Context, actor Subject, tenant string, v *valuesRead, l Label) (Holding, map[Permission]bool, error) {
 	only := a.labelPermission
 	if l != nil {
 		asked := a.askedBy(l)
 		only = func(p Permission) bool { return asked[p] }
 	}
-	h, _, err := a.holdingFrom(ctx, a.db, actor, a.constrain(ctx, actor, tenantResource(tenant)), &valuesRead{held: v.held, ds: v.ds, roles: v.roles}, only, nil)
-	return h, err
+	return a.holdingFrom(ctx, a.db, actor, a.constrain(ctx, actor, tenantResource(tenant)), &valuesRead{held: v.held, ds: v.ds, roles: v.roles}, only, nil)
 }
 
 // heldOf is the values l asks for that h holds, sorted.

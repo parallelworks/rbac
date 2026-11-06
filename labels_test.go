@@ -721,11 +721,12 @@ func TestFilterIsCountedAlikeHoweverManyDimensionsItsHoldingHoldsWholeOrNotAtAll
 // in an Ordered, an AllOf, an AnyOf dimension of forty values and an exclusive one, beside large
 // custom roles of a hundred other permissions, some giving values too, some privileged or public,
 // or for other types too; and Holders, narrowing its read of every identity's values once for all
-// of them, decides each identity's as a read of its own walked whole does. Of rows whose
-// label has a value no dimension declares or a NULL one, or is NULL, Filter keeps none, as of those
-// whose values differ from declared ones only in case or punctuation, or are quoted, escaped or
-// JSON, and of one whose label is an array of two dimensions, those of it; and it keeps the same of
-// a column in a collation that isn't deterministic, which finds such values equal to declared ones.
+// of them, decides each identity's, and which of them a condition or a constraint decided, as a
+// read of its own walked whole does. Of rows whose label has a value no dimension declares or a
+// NULL one, or is NULL, Filter keeps none, as of those whose values differ from declared ones only
+// in case or punctuation, or are quoted, escaped or JSON, and of one whose label is an array of two
+// dimensions, those of it; and it keeps the same of a column in a collation that isn't
+// deterministic, which finds such values equal to declared ones.
 func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 	var projects []string
 	for i := range 40 {
@@ -795,7 +796,7 @@ func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 	}
 	// The rows refused by a dimension the holding holds no value of, AnyOf ones and the others apart,
 	// and those labeled in an AnyOf dimension it holds every value of.
-	kept, refused, listed, noneOfAnyOf, noneOfOther, wholeAnyOf, valued := 0, 0, 0, 0, 0, 0, 0
+	kept, refused, listed, noneOfAnyOf, noneOfOther, wholeAnyOf, valued, conditioned := 0, 0, 0, 0, 0, 0, 0, 0
 	for seed := range uint64(48) {
 		rng := rand.New(rand.NewPCG(seed, seed+17))
 		b := &pgx.Batch{}
@@ -1044,6 +1045,9 @@ func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 				if i < len(labels) && !strings.HasPrefix(byAll[j][i], "[]") {
 					valued++
 				}
+				if !strings.HasSuffix(byAll[j][i], "by condition []") {
+					conditioned++
+				}
 			}
 		}
 	}
@@ -1053,9 +1057,10 @@ func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 		t.Errorf("Filter kept %d rows and refused %d, %d by an AnyOf dimension and %d by another of no value held, %d rows were labeled in an AnyOf dimension held whole, and Holders listed %d",
 			kept, refused, noneOfAnyOf, noneOfOther, wholeAnyOf, listed)
 	}
-	// So that Holders' read is compared where it holds some of what a label asks for.
-	if valued == 0 {
-		t.Error("by Holders' read, no identity held any value a label asks for")
+	// So that Holders' read is compared where it holds some of what a label asks for, and where a
+	// condition or a constraint decides some, which Holders marks a holder by.
+	if valued == 0 || conditioned == 0 {
+		t.Errorf("by Holders' read, %d decisions held a value a label asks for, and %d had one a condition or a constraint decided", valued, conditioned)
 	}
 }
 
@@ -2405,10 +2410,11 @@ func TestAChangeCheckingManyLabelsDecidesEachAsACheckOfItAlone(t *testing.T) {
 // reading the action or failing, and for some of them enough costly ones that a value's budget
 // runs out; of denies, wildcards among them, and of a constraint removing values: in an Ordered
 // dimension, and an exclusive one. A check of one label, and Holding, walk only those too, and
-// decide as walking every grant and permission does, there under a constraint failing on some
-// values as well, which fails the check that asks it about one; and so does Holders, by its read of
-// every holder's values narrowed once for all of them, of a few of the labels and every value: of
-// the actor, another in the group the actor's group is in, and a member in no group.
+// decide as walking every grant and permission does, the values a condition or a constraint decided
+// among them, which Holders marks a holder by, there under a constraint failing on some values as
+// well, which fails the check that asks it about one; and so does Holders, by its read of every
+// holder's values narrowed once for all of them, of a few of the labels and every value: of the
+// actor, another in the group the actor's group is in, and a member in no group.
 func TestAChangeWalkingOnlyTheGrantsGivingValuesDecidesEachLabelAsACheckOfItAlone(t *testing.T) {
 	var others []rbac.Permission
 	for i := range 40 {
