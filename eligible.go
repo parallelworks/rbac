@@ -181,16 +181,26 @@ func (a *Authorizer) requirementOf(ctx context.Context, tx pgx.Tx, tenant string
 // together than activating may spend on them, and more than they did: one activating evaluates
 // those of each group it is in, and a subject holds one eligibility of its own there. Activating
 // evaluates them whole, so an eligibility set beside another, as by an actor who can't delete it,
-// never changes what that one allows.
+// never changes what that one allows. It reads those with a requirement alone, a range of the index
+// of them (rbac_eligibilities_requires) written as a row comparison, in that index's order, which no
+// other index gives, with sorting off (seeking): whatever the statistics count, no plan reads the
+// scope's others. By the scope's index, every eligibility on the scope, of any role, was read from
+// the table, and with sorting on, a plan by statistics counting each one there a group's with a
+// requirement for the role, as from before the others were made, still read them all so: PostgreSQL
+// bounds the scope by the row comparison's first column, and seeks it in the scope's index within
+// each tenant (skip scan).
 func (a *Authorizer) requirementsBounded(ctx context.Context, tx pgx.Tx, tenant string, e Eligibility, was string) error {
 	if e.Requires == "" || e.Principal.Kind != Group {
 		return nil
 	}
 	var others []string
-	if err := tx.QueryRow(ctx, `SELECT coalesce(array_agg(DISTINCT requires), '{}') FROM rbac_eligibilities
-		WHERE tenant = $1 AND scope = $2 AND role = $3 AND principal >= 'group:' AND principal < 'group;' AND principal <> $4
-		  AND requires <> '' AND (expires_at IS NULL OR expires_at > $5)`,
-		tenant, e.Scope.Key(), e.Role, e.Principal.key(), a.cfg.Now()).Scan(&others); err != nil {
+	if err := seeking(ctx, tx, func() error {
+		return tx.QueryRow(ctx, `SELECT coalesce(array_agg(DISTINCT requires), '{}') FROM (SELECT requires FROM rbac_eligibilities
+			WHERE (scope, role, tenant, principal) >= ($2, $3, $1, 'group:') AND (scope, role, tenant, principal) < ($2, $3, $1, 'group;')
+			  AND principal <> $4 AND requires <> '' AND (expires_at IS NULL OR expires_at > $5)
+			ORDER BY scope, role, tenant, principal) e`,
+			tenant, e.Scope.Key(), e.Role, e.Principal.key(), a.cfg.Now()).Scan(&others)
+	}); err != nil {
 		return err
 	}
 	if !a.conds.within(once(append(others, was)), once(append(others, e.Requires))) {

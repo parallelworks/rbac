@@ -1580,6 +1580,50 @@ func TestDeleteGroupDeletesAGroupWhoseHostsPlacesHaveEnded(t *testing.T) {
 	}
 }
 
+// An identity whose membership of the tenant has ended is in none of its groups, as Members lists
+// them, though DeleteExpired hasn't removed its places yet, so DeleteGroup counts none of them as a
+// member the host keeps: a group whose only member from a source the host owns is such an identity
+// is deleted with its place, where it was refused until DeleteExpired ran. A group from that source
+// in one, or an identity whose membership is suspended, which is still in its groups, is a member
+// the host keeps all the same.
+func TestDeleteGroupDeletesAGroupWhoseHostsMembersHaveLeftTheTenant(t *testing.T) {
+	h := grouped(t, func(c *rbac.Config) { c.Sources = []string{"directory"} })
+	ctx := t.Context()
+	h.groups(t, "team", "nesting", "inner", "paused")
+	if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{
+		{Principal: identity("u"), ExpiresAt: h.now.Add(time.Hour)}, {Principal: identity("v"), Suspended: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{
+		{Group: "team", Principal: identity("u"), Source: "directory"},
+		{Group: "nesting", Principal: groupOf("inner"), Source: "directory"},
+		{Group: "paused", Principal: identity("v"), Source: "directory"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	groupManager := h.as(t, "groups")
+	if err := h.authz.DeleteGroup(ctx, groupManager, "t1", "team"); !errors.Is(err, rbac.ErrInvalid) {
+		t.Fatalf("deleting a group with a member from the host's source: %v", err)
+	}
+	h.now = h.now.Add(2 * time.Hour)
+	if members, err := h.authz.Members(ctx, "t1", "team"); err != nil || len(members) != 0 {
+		t.Fatalf("Members of team once u's membership ended = %+v, %v", members, err)
+	}
+	if err := h.authz.DeleteGroup(ctx, groupManager, "t1", "team"); err != nil {
+		t.Errorf("deleting a group whose only member from the host's source has left the tenant: %v", err)
+	}
+	var left int
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM rbac_members WHERE tenant = 't1' AND group_id = 'team'`).Scan(&left); err != nil || left != 0 {
+		t.Errorf("%d places in team are left once it was deleted, %v", left, err)
+	}
+	for _, id := range []string{"nesting", "paused"} {
+		if err := h.authz.DeleteGroup(ctx, groupManager, "t1", id); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("deleting %s, with a member from the host's source: %v", id, err)
+		}
+	}
+}
+
 func TestAConstraintStopsManagingGroups(t *testing.T) {
 	h := grouped(t, constrain("frozen", rbac.ManageGroups))
 	ctx := t.Context()
@@ -4011,6 +4055,64 @@ func TestAFreezeStopsALeavingByWhatItsGroupGives(t *testing.T) {
 	}
 	if err := h.authz.ChangeMembers(ctx, manager, "t1", nil, []rbac.Member{crew}); !errors.Is(err, rbac.ErrDenied) {
 		t.Errorf("removing u from crew, though oncall gives it the same, under the freeze: %v", err)
+	}
+}
+
+// An identity whose membership of the tenant has ended is in none of its groups, as Members lists
+// them and checks count them, though DeleteExpired hasn't removed its places yet: removing it from
+// one takes nothing away, so neither a freeze there nor a label of a scope the group holds access on
+// that the actor's values don't satisfy refuses it, as each did until DeleteExpired ran. Removing
+// one whose membership is in force is still refused, and making its place end sooner, which is
+// adding an identity that isn't a member, is too.
+func TestRemovingAnIdentityThatHasLeftTheTenantTakesNothingAway(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	frozen := false
+	for name, mutate := range map[string]func(*rbac.Config){
+		"a freeze": freezingUnder(workspace.Scope(), &frozen),
+		"a label": func(c *rbac.Config) {
+			withLabels(c)
+			c.ResourceOf = func(_ context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+				if s == secret.Scope() {
+					return secret, nil
+				}
+				return rbac.Resource{Tenant: tenant, Type: s.Type, ID: s.ID}, nil
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			frozen = false
+			h := grouped(t, mutate)
+			ctx := t.Context()
+			h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
+			if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("u"), ExpiresAt: h.now.Add(time.Hour)}, {Principal: identity("w")}}); err != nil {
+				t.Fatal(err)
+			}
+			left, stays := rbac.Member{Group: "crew", Principal: identity("u")}, rbac.Member{Group: "crew", Principal: identity("w")}
+			if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{left, stays}); err != nil {
+				t.Fatal(err)
+			}
+			h.now = h.now.Add(2 * time.Hour)
+			if allowed(t, h, rbac.Subject{Principal: identity("u")}, login, cluster) {
+				t.Fatal("u has left the tenant and still logs in to the cluster")
+			}
+			manager := h.as(t, "manager")
+			frozen = true
+			sooner := left
+			sooner.ExpiresAt = h.now.Add(time.Minute)
+			if err := h.authz.ChangeMembers(ctx, manager, "t1", []rbac.Member{sooner}, nil); !errors.Is(err, rbac.ErrDenied) {
+				t.Errorf("making u's place in crew end sooner, which adds one that isn't a member, under %s: %v", name, err)
+			}
+			h.events = nil
+			if err := h.authz.ChangeMembers(ctx, manager, "t1", nil, []rbac.Member{left}); err != nil {
+				t.Errorf("removing u, who has left the tenant, from crew under %s: %v", name, err)
+			} else if len(h.events) != 1 || len(h.events[0].Left) != 1 {
+				t.Errorf("events = %+v, not u leaving crew", h.events)
+			}
+			if err := h.authz.ChangeMembers(ctx, manager, "t1", nil, []rbac.Member{stays}); !errors.Is(err, rbac.ErrDenied) {
+				t.Errorf("removing w, a member, from crew under %s: %v", name, err)
+			}
+		})
 	}
 }
 
