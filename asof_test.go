@@ -2435,7 +2435,8 @@ func TestAsOfReadsVersionsDatedAlikeInAFewPagesEach(t *testing.T) {
 // eligibilities were written, as autovacuum leaves them until a tenth of history is new, a plan read
 // every one in the tenant by history's index of an entity's versions instead, so beside 3,000
 // others' places a check of a subject in one group read 3,098 pages of history, and 65 by fresh
-// statistics.
+// statistics. A list of a group's members looks each one's membership up by its key: hashed, by
+// such statistics, the test read every membership in the tenant, 15,848 pages, and 113 by fresh.
 func TestAsOfReadsByPrincipalWhateverHistorysStatisticsCount(t *testing.T) {
 	h := crowded(t, pgtest.Open(t, ""))
 	ctx := t.Context()
@@ -2456,6 +2457,7 @@ func TestAsOfReadsByPrincipalWhateverHistorysStatisticsCount(t *testing.T) {
 	reads := map[string]func(a *rbac.Authorizer) error{
 		"Authorize": func(a *rbac.Authorizer) error { return a.Authorize(ctx, u1, login, cluster) },
 		"GroupsOf":  func(a *rbac.Authorizer) error { return second(a.GroupsOf(ctx, "t1", u1.Principal)) },
+		"Members":   func(a *rbac.Authorizer) error { return second(a.Members(ctx, "t1", "g1")) },
 		"Eligibilities": func(a *rbac.Authorizer) error {
 			return second(a.Eligibilities(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{u1.Principal}}))
 		},
