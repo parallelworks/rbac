@@ -2338,6 +2338,7 @@ func TestHistoryDatesAChangeNoEarlierThanItsCommit(t *testing.T) {
 		}, after: []string{`INSERT INTO held VALUES (1)`}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			ctx := t.Context()
 			u := h.as(t, "u")
 			h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
 			conn := connect(t)
@@ -2391,6 +2392,7 @@ func TestHistoryDatesAChangeNoEarlierThanItsCommit(t *testing.T) {
 		}, after: []string{`INSERT INTO held VALUES (1)`}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			ctx := t.Context()
 			u := h.as(t, "u")
 			h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
 			conn := connect(t)
@@ -2431,9 +2433,9 @@ func TestHistoryDatesAChangeNoEarlierThanItsCommit(t *testing.T) {
 // revoke with it.
 func TestACommitWaitsForNoLockPastItsRecord(t *testing.T) {
 	h := setup(t)
-	ctx := t.Context()
 	for _, hold := range []string{"table", "toast"} {
 		t.Run(hold, func(t *testing.T) {
+			ctx := t.Context()
 			u := h.as(t, "u")
 			h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
 			var conns [2]*pgx.Conn
