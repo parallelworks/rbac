@@ -31,17 +31,32 @@
 -- those before them; so the last record's event refuses both, and a transaction with either can't
 -- commit having changed the package's tables. A cursor's creation time is when the statement that
 -- declared it began, which for one a procedure or a DO block declares in a later transaction, after
--- it commits, is before that transaction began. And as the commit empties a session's temporary
+-- it commits, is before that transaction began. The temporary-table check reads the catalog as the
+-- commit record is written, so it is a best-effort defense that assumes the README's roles: it holds
+-- against a session that can't make temporary objects, so the roles revoke TEMPORARY from PUBLIC and
+-- grant it only where needed. The application's role needs it only for AsOf, which makes temporary
+-- views; where AsOf runs as that role, it keeps TEMPORARY and the check is best-effort against it.
+-- And as the commit empties a session's temporary
 -- tables made ON COMMIT DELETE ROWS, it locks each, and its TOAST table, which another session of
 -- the role can hold, the TOAST table by preparing a statement that names it, for as long as it
 -- likes: so the commit record's event, at the commit, has the rest of it wait for no lock past
 -- 100 ms. What runs after it is then the package's, the host's, as its own deferred triggers and
 -- constraints of statements after the transaction's last change to the tables, and the commit's: the
--- session's temporary tables emptied or dropped, about half a millisecond each, and synchronous
+-- session's temporary tables emptied or dropped, about half a millisecond each at the default
+-- temp_buffers, but seconds at a large one, as emptying an ON COMMIT DELETE ROWS table scans the
+-- temporary buffers (2,000 held a commit about 5.4 s at temp_buffers = 4GB), which lock_timeout
+-- doesn't bound, as it isn't a lock wait; and synchronous
 -- replication, which waits before others see it, as long as synchronous_standby_names and the
 -- session's synchronous_commit make it. A transaction prepared for two-phase commit fires its
 -- deferred triggers as it is prepared, so its changes count from then, not from COMMIT PREPARED: keep
 -- max_prepared_transactions at 0.
+--
+-- Each record holds the cluster that wrote it (system_identifier): AsOf trusts a commit record's
+-- horizon and dating only for versions of its own cluster, so a logical dump restored into another
+-- cluster, whose xids restarted, neither counts a live change as committed through a restored
+-- horizon far above the new cluster's range, nor dates a restored change by a new transaction its
+-- txid collides with. A version of another cluster, or of none (null, as every record before this
+-- migration is), counts from its own date.
 --
 -- AsOf tested each version of a row for a later one, and PruneHistory each for a later one by its
 -- time, in history's index of an entity's versions, by date: versions dated alike, as every write
@@ -74,15 +89,28 @@
 -- transaction, which CREATE INDEX CONCURRENTLY can't run in.
 LOCK TABLE rbac_history IN ACCESS EXCLUSIVE MODE;
 
+-- The cluster that wrote each record, as system_identifier, which AsOf trusts a commit record's
+-- dating and settled horizon only for records of: a logical dump restored into another cluster
+-- carries commit records of the cluster that wrote them, whose xids restart in the new one, so a
+-- restored commit record's after.xmin, far above the new cluster's range, would count every live,
+-- uncommitted change as committed, and a restored txid colliding with one the new cluster assigns
+-- would date the restored change by the colliding transaction's commit. A version is matched to a
+-- commit record within its own cluster, so restored data keeps its own commit dates, and one of
+-- another cluster, or of none (null, as every record written before this migration is), counts from
+-- its effective_at, as those did. History tells generations apart the same way (followable). The
+-- column takes no default, so adding it reads no row; the trigger sets it on every record it writes.
+ALTER TABLE rbac_history ADD COLUMN cluster text COLLATE "C";
+
 DROP INDEX rbac_history_entity;
-CREATE INDEX rbac_history_entity ON rbac_history (tenant, entity, key, effective_at DESC, id DESC) INCLUDE (txid)
+CREATE INDEX rbac_history_entity ON rbac_history (tenant, entity, key, effective_at DESC, id DESC) INCLUDE (txid, cluster)
     WHERE key IS NOT NULL OR entity NOT IN ('grant', 'eligibility', 'member');
 DROP INDEX rbac_history_scope;
 CREATE INDEX rbac_history_scope ON rbac_history (tenant, entity, scope, effective_at DESC)
     WHERE entity IN ('grant', 'eligibility') AND scope IS NOT NULL;
 
--- A transaction's commit records, the latest of which dates it.
-CREATE INDEX rbac_history_commits ON rbac_history (txid) INCLUDE (effective_at) WHERE entity = 'commit';
+-- A transaction's commit records, the latest of which dates it, with the cluster that wrote each,
+-- so a version is matched to one of its own cluster without reading the row.
+CREATE INDEX rbac_history_commits ON rbac_history (txid) INCLUDE (effective_at, cluster) WHERE entity = 'commit';
 
 -- The checks are wider than those they replace, which held every record, so neither reads history.
 ALTER TABLE rbac_history DROP CONSTRAINT rbac_history_entity_check,
@@ -113,6 +141,7 @@ DECLARE
     op     text;
     was_last timestamptz;
     ended  boolean;
+    cluster_id text;
 BEGIN
     -- A search_path reads $user, however it is quoted, as a role's name, and leaves out a schema
     -- the role has no USAGE on, so history would be found in pg_temp: refused before anything it
@@ -121,6 +150,14 @@ BEGIN
     IF pg_catalog.current_schema() IS DISTINCT FROM TG_TABLE_SCHEMA THEN
         RAISE EXCEPTION 'history is not found in schema %: no search_path names a schema called $user, nor one % has no USAGE on',
             TG_TABLE_SCHEMA, current_user USING ERRCODE = 'invalid_schema_name';
+    END IF;
+    -- The cluster writing the record, stamped on every one so AsOf trusts a commit record's dating
+    -- only within the cluster that wrote it. Read once a transaction and held in a local setting, as
+    -- one statement writes many records: only pg_catalog is read, after the schema is checked.
+    cluster_id := pg_catalog.current_setting('rbac.cluster', true);
+    IF cluster_id IS NULL OR cluster_id = '' THEN
+        SELECT s.system_identifier::text INTO cluster_id FROM pg_catalog.pg_control_system() s;
+        PERFORM pg_catalog.set_config('rbac.cluster', cluster_id, true);
     END IF;
     -- A record history wrote, as rbac_history_committed fires it as its transaction commits.
     IF TG_TABLE_NAME = 'rbac_history' THEN
@@ -134,8 +171,8 @@ BEGIN
             -- latest commit record.
             IF pg_catalog.pg_trigger_depth() > 1 THEN
                 EXECUTE pg_catalog.format('SET CONSTRAINTS %I.rbac_history_committed DEFERRED', TG_TABLE_SCHEMA);
-                INSERT INTO rbac_history (effective_at, tenant, entity, key, op, bytes)
-                VALUES ('-infinity', '', 'commit', '', 'commit', 0);
+                INSERT INTO rbac_history (effective_at, tenant, entity, key, op, bytes, cluster)
+                VALUES ('-infinity', '', 'commit', '', 'commit', 0, cluster_id);
             -- What commits after it waits for no lock for long: a lock another session takes on a
             -- temporary table the commit empties (ON COMMIT DELETE ROWS), or on its TOAST table,
             -- which any session can take by preparing a statement that names it, would hold the
@@ -174,8 +211,8 @@ BEGIN
         -- orders them by date.
         r := pg_catalog.jsonb_build_object('xmin', pg_catalog.pg_snapshot_xmin(pg_catalog.pg_current_snapshot())::text);
         at := pg_catalog.clock_timestamp();
-        INSERT INTO rbac_history (recorded_at, effective_at, tenant, entity, key, op, after, bytes)
-        VALUES (at, at, '', 'commit', '', 'commit', r, 0);
+        INSERT INTO rbac_history (recorded_at, effective_at, tenant, entity, key, op, after, bytes, cluster)
+        VALUES (at, at, '', 'commit', '', 'commit', r, 0, cluster_id);
         RETURN NULL;
     END IF;
     was := CASE WHEN TG_OP = 'INSERT' THEN NULL ELSE pg_catalog.to_jsonb(OLD) END;
@@ -227,7 +264,7 @@ BEGIN
         -- activation Activate makes anew did, rather than by the change that moved it.
         ended := (was->>'expires_at')::timestamptz <= greatest(at, was_last);
         INSERT INTO rbac_history (effective_at, tenant, entity, key, op, principal, role, scope, group_id, expires_at,
-          before, after, bytes, actor, on_behalf_of, how, request, reason)
+          before, after, bytes, actor, on_behalf_of, how, request, reason, cluster)
         VALUES (
           greatest(CASE WHEN ended THEN (was->>'expires_at')::timestamptz ELSE at END, was_last),
           was->>'tenant', entity, was_key, CASE WHEN ended THEN 'expire' ELSE 'delete' END, was->>'principal',
@@ -236,12 +273,12 @@ BEGIN
           CASE entity WHEN 'group' THEN was->>'id' WHEN 'member' THEN was->>'group_id' END,
           (was->>'expires_at')::timestamptz, was, NULL, pg_catalog.octet_length(was::text),
           coalesce(change->>'actor', ''), coalesce(change->>'on_behalf_of', ''), coalesce(change->>'how', ''),
-          coalesce(change->>'request', ''), coalesce(change->>'reason', ''));
+          coalesce(change->>'request', ''), coalesce(change->>'reason', ''), cluster_id);
         op := 'create';
         was := NULL;
     END IF;
     INSERT INTO rbac_history (effective_at, tenant, entity, key, op, principal, role, scope, group_id, expires_at,
-      before, after, bytes, actor, on_behalf_of, how, request, reason)
+      before, after, bytes, actor, on_behalf_of, how, request, reason, cluster)
     VALUES (
       greatest(CASE WHEN op = 'expire' THEN expiry ELSE at END, last),
       r->>'tenant', entity, key, op, r->>'principal',
@@ -250,7 +287,7 @@ BEGIN
       CASE entity WHEN 'group' THEN r->>'id' WHEN 'member' THEN r->>'group_id' END,
       expiry, was, is_now, coalesce(pg_catalog.octet_length(was::text), 0) + coalesce(pg_catalog.octet_length(is_now::text), 0),
       coalesce(change->>'actor', ''), coalesce(change->>'on_behalf_of', ''), coalesce(change->>'how', ''),
-      coalesce(change->>'request', ''), coalesce(change->>'reason', ''));
+      coalesce(change->>'request', ''), coalesce(change->>'reason', ''), cluster_id);
     RETURN NULL;
 END $$;
 

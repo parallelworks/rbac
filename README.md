@@ -712,10 +712,15 @@ whose deferred triggers fire, and whose commit is recorded, as it is prepared, n
 rest of a commit is the host's own deferred triggers and constraints of statements after its last
 change to the package's tables, and what they wait for, as a deferred foreign key's check waits for
 a row another session has locked; the session's temporary tables made `ON COMMIT DROP` or `ON COMMIT
-DELETE ROWS`, which it drops or empties, about half a millisecond each, so a session with thousands
-holds its commit back for a second or so; and no lock it waits for longer than 100 ms, where the
-session's `lock_timeout` is longer, as another session that holds one of those temporary tables
-would have it wait, or past which it fails with SQLSTATE 55P03. `pg_stat_activity` lists a session
+DELETE ROWS`, which it drops or empties, about half a millisecond each at the default `temp_buffers`,
+so a session with thousands holds its commit back for a second or so; and no lock it waits for longer
+than 100 ms, where the session's `lock_timeout` is longer, as another session that holds one of those
+temporary tables would have it wait, or past which it fails with SQLSTATE 55P03. Emptying an `ON
+COMMIT DELETE ROWS` table scans the session's temporary buffers, so at a large `temp_buffers` it
+costs more: at `temp_buffers = 4GB`, 2,000 such tables held a commit about 5.4 s past its commit
+record, which `lock_timeout` doesn't bound, as it isn't a lock wait. A session that sets a large
+`temp_buffers` and makes many such tables holds its own commit back accordingly; set `temp_buffers`
+no larger than the session's temporary data needs. `pg_stat_activity` lists a session
 in its commit, with `COMMIT` as its query, or waiting on `SyncRep`, and `pg_prepared_xacts` a
 prepared transaction until it is committed or rolled back; keep `max_prepared_transactions` at 0,
 the default, so none is. Any session can fire a transaction's deferred triggers before it commits,
@@ -725,11 +730,19 @@ which `AsOf` counts it from, as its latest. It refuses a transaction that declar
 HOLD`, which committing runs to its end, also one a procedure or a `DO` block declares in a
 transaction after it committed, and a session that has an enabled deferrable trigger on a temporary
 table, which fires as it commits: either would run a session's own code after the commit record was
-written. So the application's role can hold a change's commit past its commit record only through
+written. The check of a temporary table's deferrable trigger reads the catalog as the commit record
+is written, so it is a best-effort defense that holds only where a hostile session can't make
+temporary objects: the roles below revoke `TEMPORARY` on the database from `PUBLIC` and grant it only
+where it is needed, so a role without it makes none. The application's role needs `TEMPORARY` only
+for `AsOf`, which makes temporary views; where `AsOf` runs as that role, it keeps `TEMPORARY` and so
+can make temporary objects, and the check is best-effort against it, as against any role with
+`TEMPORARY`. So the application's role can hold a change's commit past its commit record only through
 the host's code that runs as the transaction commits, as a deferred trigger of the host's that reads
 a table by a name a temporary table can take, or a deferred constraint checking a row the role can
-lock; by the temporary tables a session makes, for as long as dropping or emptying them takes; or
-for as long as the operator's settings of synchronous replication and prepared transactions let it.
+lock; by the temporary tables a session makes, for as long as dropping or emptying them takes, which
+a large `temp_buffers` lengthens; by a temporary object's own deferrable trigger, where it has
+`TEMPORARY`; or for as long as the operator's settings of synchronous replication and prepared
+transactions let it.
 With `track_commit_timestamp` on, `pg_xact_commit_timestamp` of a record's `TxID`, while the server
 keeps it, shows when the transaction's commit was written, which an auditor can compare with its
 `CommittedAt`.
@@ -865,6 +878,16 @@ history's triggers find history beside the table each fires on, whatever the sch
 refuse the row where their search_path can't name that schema, before they read a table or call
 anything by it: so none stands in for the history a change is recorded in, or a prune checked
 against, and nothing such a table runs, as its row security policy, runs as history's role.
+
+Harden temporary objects too: revoke the `TEMPORARY` privilege on the database from `PUBLIC`, which
+holds it by default, and grant it back only to the roles that need it. The commit record refuses a
+transaction that commits a change to the package's tables while the session has an enabled deferrable
+trigger on a temporary table, as that trigger would run the session's own code after the change is
+dated; but that check, read against the catalog as the commit record is written, is a best-effort
+defense, so a role that need not make temporary objects is better left unable to. Only `AsOf` makes
+temporary objects (its temporary views), so the application's role needs `TEMPORARY` only where it
+runs `AsOf`; grant it there, and a deployment that runs `AsOf` on a role of its own, or not at all,
+can leave the application's role without it. The administrator's and history's roles need none.
 
 ## Running it
 

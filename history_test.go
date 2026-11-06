@@ -385,8 +385,14 @@ type readmeRoles struct {
 
 func newReadmeRoles(t *testing.T) *readmeRoles {
 	t.Helper()
+	return newReadmeRolesIn(t, pgtest.URL(t))
+}
+
+// newReadmeRolesIn is newReadmeRoles in the database base, a URL, names: a test's own database, as
+// one that changes a database-wide privilege needs.
+func newReadmeRolesIn(t *testing.T, base string) *readmeRoles {
+	t.Helper()
 	ctx := t.Context()
-	base := pgtest.URL(t)
 	suffix := strings.ToLower(rand.Text())
 	r := &readmeRoles{admin: "rbac_admin_" + suffix, history: "rbac_history_" + suffix, app: "rbac_app_" + suffix, schema: "rbac_" + suffix}
 	super, err := pgx.Connect(ctx, base)
@@ -606,6 +612,88 @@ func TestThePackageRunsAsTheReadmesDatabaseRoles(t *testing.T) {
 			}
 			check("DeleteTenant", authz.DeleteTenant(ctx, host, "t1"))
 		})
+	}
+}
+
+// The commit-record checks refuse a change committed with a session's own enabled deferrable trigger
+// on a temporary table, which only a session with the TEMPORARY privilege can make. The README's
+// application role is denied TEMPORARY (revoked from PUBLIC on the database, granted to no one), so
+// it can make no temporary object and can't plant such a trigger: every package call but AsOf runs
+// without one. AsOf alone makes temporary views, so it needs TEMPORARY; a deployment that runs AsOf
+// as the application role grants it back, and the commit-record checks are then a best-effort
+// defense against that role, as the README and 0027 say.
+func TestTheApplicationRoleNeedsTemporaryOnlyForAsOf(t *testing.T) {
+	ctx := t.Context()
+	name, base := pgtest.Database(t, "")
+	r := newReadmeRolesIn(t, base)
+	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	r.harden(t)
+	// No role has TEMPORARY on the database now, as a host that hardens it this way leaves it.
+	if _, err := r.super.Exec(ctx, `REVOKE TEMPORARY ON DATABASE `+name+` FROM PUBLIC`); err != nil {
+		t.Fatal(err)
+	}
+	cfg := rbac.Config{
+		Catalog: catalog, ContainerTypes: []string{"org", "workspace"},
+		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+	}
+	authz, err := rbac.New(r.appPool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		creatorGrant,
+		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'owner'), ('t1', 'user', 'u')`,
+	} {
+		if _, err := r.appPool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	owner, u := rbac.Subject{Principal: identity("owner")}, rbac.Subject{Principal: identity("u")}
+	// The application's role can make no temporary object, so it can plant no deferrable trigger to
+	// run code at the commit after its change is dated.
+	if _, err := r.appPool.Exec(ctx, `CREATE TEMP TABLE held (a int)`); true {
+		if pg := (*pgconn.PgError)(nil); !errors.As(err, &pg) || pg.Code != "42501" {
+			t.Fatalf("the application's role makes a temporary table without TEMPORARY: %v", err)
+		}
+	}
+	// Every call but AsOf works without TEMPORARY.
+	check := func(what string, err error) {
+		t.Helper()
+		if err != nil {
+			t.Errorf("%s without TEMPORARY: %v", what, err)
+		}
+	}
+	check("Apply", authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: u.Principal}}}))
+	check("Authorize", authz.Authorize(ctx, owner, login, cluster))
+	var cursor rbac.Cursor
+	if _, cursor, err = authz.History(ctx, cursor, rbac.MaxHistory); err != nil {
+		t.Errorf("History without TEMPORARY: %v", err)
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := authz.Export(ctx, rbac.Checkpoint{}, rbac.MaxHistory, key); err != nil {
+		t.Errorf("Export without TEMPORARY: %v", err)
+	}
+	if _, err := rbac.PruneHistory(ctx, r.adminPool, time.Unix(0, 0), cursor); err != nil {
+		t.Errorf("PruneHistory without TEMPORARY: %v", err)
+	}
+	// AsOf makes temporary views, so it needs TEMPORARY: without it, it is refused.
+	asOf := func() error {
+		return authz.AsOf(ctx, "t1", time.Now(), func(a *rbac.Authorizer) error { return a.Authorize(ctx, owner, login, cluster) })
+	}
+	if pg := (*pgconn.PgError)(nil); !errors.As(asOf(), &pg) || pg.Code != "42501" {
+		t.Errorf("AsOf without TEMPORARY: %v", asOf())
+	}
+	// Granted TEMPORARY, as a deployment that runs AsOf as this role grants it, AsOf works.
+	if _, err := r.super.Exec(ctx, `GRANT TEMPORARY ON DATABASE `+name+` TO `+r.app); err != nil {
+		t.Fatal(err)
+	}
+	if err := asOf(); err != nil {
+		t.Errorf("AsOf once granted TEMPORARY: %v", err)
 	}
 }
 

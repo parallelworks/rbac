@@ -1107,9 +1107,16 @@ flowchart LR
   commits; AsOf counts from the latest. A cursor `WITH HOLD` the transaction declared, also in a
   procedure's or a `DO` block's later transaction, whose creation time is the block's, and an
   enabled deferrable trigger on a temporary table, would run the session's own code after the commit
-  record as it commits, so a transaction with either is refused. What runs after it is the rest of
-  the commit: the host's own deferred triggers and constraints of statements after its last change,
-  the session's temporary tables dropped or emptied, about half a millisecond each, waiting for no
+  record as it commits, so a transaction with either is refused. The temporary-table check reads the
+  catalog as the commit record is written, so it is a best-effort defense that assumes the README's
+  roles: it holds against a session with no `TEMPORARY` privilege, which can make no temporary
+  object, and is best-effort against one with it. The roles revoke `TEMPORARY` from `PUBLIC` and
+  grant it only where needed; the application's role needs it only for `AsOf`, which makes temporary
+  views. What runs after the commit record is the rest of the commit: the host's own deferred
+  triggers and constraints of statements after its last change, the session's temporary tables
+  dropped or emptied, about half a millisecond each at the default `temp_buffers` but seconds at a
+  large one (emptying an `ON COMMIT DELETE ROWS` table scans the temporary buffers; 2,000 held a
+  commit about 5.4 s at `temp_buffers = 4GB`, which `lock_timeout` doesn't bound), waiting for no
   lock past 100 ms, as another session can hold one of those tables, the wait for synchronous
   replication, and for a prepared transaction, everything until `COMMIT PREPARED`. A transaction
   that committed before `0027_commit_dates` has none, and its changes count from their own dates.
@@ -1184,7 +1191,15 @@ flowchart LR
   its transaction's commit record where that is later, looked up by its transaction in history's
   index of commit records only where the transaction is no older than the oldest one running as the
   latest commit record by then was written, which that record holds, and which AsOf reads once:
-  every older one had ended by then, and others saw what it committed. Each version a view finds is its row's last where no later one, by id,
+  every older one had ended by then, and others saw what it committed. Each record holds the cluster
+  (`system_identifier`) that wrote it, and a commit record dates a version and sets that horizon only
+  for versions of its own cluster: a logical dump restored into another cluster carries commit
+  records whose xids restarted there, so one's horizon, far above the new cluster's range, would
+  count every live change as committed, and one's txid, colliding with a new transaction's, would
+  date a restored change by that transaction's commit. A restored version matches its own cluster's
+  commit record, so it keeps its dates; one of a cluster whose commit records are gone, or written
+  before `0027_commit_dates` (null cluster), counts from its own date. `History` tells generations
+  apart the same way. Each version a view finds is its row's last where no later one, by id,
   counts by then, a test of each on its own, by its key in history's index of an entity's versions,
   which orders a row's versions by date and those of one date by id, latest first: since commits
   are recorded no version is dated before the one written before it, so the test reads the row's

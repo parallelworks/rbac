@@ -377,7 +377,11 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 			return 0, nil, err
 		}
 	}
-	settled, err := settledBy(ctx, tx, schema, before)
+	cluster, err := clusterOf(ctx, tx)
+	if err != nil {
+		return 0, nil, err
+	}
+	settled, err := settledBy(ctx, tx, schema, before, cluster)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -521,10 +525,13 @@ type Record struct {
 	DBUser     string
 	// CommittedAt is when its transaction committed, as history records each transaction that
 	// changes the package's tables as it commits, which AsOf counts the change from where it is
-	// after EffectiveAt: no other session sees a change before then. It is zero for a record of a
-	// transaction that committed before history recorded commits, from migration 0027_commit_dates
-	// on, whose change counts from EffectiveAt, and for a prune's, as a transaction that only
-	// prunes records no commit.
+	// after EffectiveAt: no other session sees a change before then. It is read from the commit
+	// record of the record's own cluster, so a logical dump restored into another cluster keeps its
+	// commit dates and takes none from a transaction the new cluster gave a colliding id. It is zero
+	// for a record of a transaction that committed before history recorded commits, from migration
+	// 0027_commit_dates on, whose change counts from EffectiveAt, for one a restore carried from a
+	// cluster whose commit records are gone, and for a prune's, as a transaction that only prunes
+	// records no commit.
 	CommittedAt time.Time
 }
 
@@ -698,7 +705,8 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 		rows, err := tx.Query(ctx, `
 			SELECT id, txid, recorded_at, effective_at, tenant, entity, key, op, coalesce(principal, ''), coalesce(role, ''),
 			  coalesce(scope, ''), coalesce(group_id, ''), expires_at, before, after, actor, on_behalf_of, how, request, reason, db_user,
-			  (SELECT max(c.effective_at) FROM `+historyTable(schema)+` c WHERE c.entity = 'commit' AND c.txid = p.txid),
+			  (SELECT max(c.effective_at) FROM `+historyTable(schema)+` c WHERE c.entity = 'commit' AND c.txid = p.txid
+			    AND c.cluster IS NOT DISTINCT FROM p.cluster),
 			  $6::boolean AND `+prunedPast(historyTable(schema), "$1::pg_catalog.xid8", "$2", "$7::pg_catalog.xid8")+`,
 			  pg_snapshot_xmin(pg_current_snapshot())
 			FROM (

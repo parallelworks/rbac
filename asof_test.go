@@ -2481,6 +2481,204 @@ func TestACommitWaitsForNoLockPastItsRecord(t *testing.T) {
 	}
 }
 
+// A change made in a savepoint that is released, as one rolled back, stores the top-level
+// transaction's id (pg_current_xact_id(), the txid column's default), so the transaction's commit
+// record, keyed by that id, dates it: a revoke in a released savepoint and one at the top level
+// share one id and one commit record, and AsOf counts both from that commit, not before. A change
+// in a savepoint rolled back is gone, records and all.
+func TestAsOfCountsASubtransactionsChangeFromTheTopLevelCommit(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	u, v, w := h.as(t, "u"), h.as(t, "v"), h.as(t, "w")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"),
+		grant(cluster.Scope(), "cluster.login", rbac.User, "v"),
+		grant(cluster.Scope(), "cluster.login", rbac.User, "w"))
+	revoke := func(id string) string {
+		return `DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:` + id + `'`
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	// u at the top level, v in a savepoint released, w in a savepoint rolled back.
+	for _, q := range []string{
+		revoke("u"),
+		`SAVEPOINT kept`, revoke("v"), `RELEASE SAVEPOINT kept`,
+		`SAVEPOINT gone`, revoke("w"), `ROLLBACK TO SAVEPOINT gone`,
+	} {
+		if _, err := tx.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	time.Sleep(40 * time.Millisecond)
+	mid := dbNow(t, h)
+	h.now = mid
+	for _, c := range []struct {
+		s    rbac.Subject
+		held bool
+	}{{u, true}, {v, true}, {w, true}} {
+		if err := h.authz.Authorize(ctx, c.s, login, cluster); (err == nil) != c.held {
+			t.Fatalf("a check of %s while the revokes are uncommitted: %v", c.s.Principal.ID, err)
+		}
+	}
+	time.Sleep(40 * time.Millisecond)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The top-level and the released savepoint's revokes share one txid, that txid has a commit
+	// record, and the rolled-back savepoint's revoke left no record.
+	var txids, commits, gone int
+	if err := h.pool.QueryRow(ctx, `SELECT count(DISTINCT txid) FROM rbac_history
+		WHERE entity = 'grant' AND op = 'delete' AND principal IN ('user:u', 'user:v')`).Scan(&txids); err != nil || txids != 1 {
+		t.Fatalf("the two revokes span %d txids, %v", txids, err)
+	}
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM rbac_history WHERE entity = 'commit'
+		AND txid = (SELECT txid FROM rbac_history WHERE entity = 'grant' AND op = 'delete' AND principal = 'user:v')`).Scan(&commits); err != nil || commits != 1 {
+		t.Fatalf("the released savepoint's revoke shares %d commit records with the top level, %v", commits, err)
+	}
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM rbac_history
+		WHERE entity = 'grant' AND op = 'delete' AND principal = 'user:w'`).Scan(&gone); err != nil || gone != 0 {
+		t.Fatalf("the rolled-back savepoint's revoke left %d records, %v", gone, err)
+	}
+	for at, held := range map[time.Time]map[string]bool{
+		mid:         {"u": true, "v": true, "w": true},
+		dbNow(t, h): {"u": false, "v": false, "w": true},
+	} {
+		if err := h.authz.AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+			for _, s := range []rbac.Subject{u, v, w} {
+				err := a.Authorize(ctx, s, login, cluster)
+				if err != nil && !errors.Is(err, rbac.ErrDenied) {
+					return err
+				}
+				if (err == nil) != held[s.Principal.ID] {
+					t.Errorf("as of %v, %s's login: %v", at, s.Principal.ID, err)
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// restoreRows writes rows into h's history as a logical dump restored by a superuser would: the
+// commit trigger off, so it records no commit of its own, each row with the cluster and txid it
+// carried. It is how a restore, not the application's role, makes the rows the two tests below need.
+func restoreRows(t *testing.T, h *harness, rows ...string) {
+	t.Helper()
+	ctx := t.Context()
+	queries := append([]string{`ALTER TABLE rbac_history DISABLE TRIGGER rbac_history_committed`}, rows...)
+	queries = append(queries, `ALTER TABLE rbac_history ENABLE ALWAYS TRIGGER rbac_history_committed`)
+	for _, q := range queries {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+}
+
+// otherCluster returns a system_identifier that is not tx's cluster's, as a dump from another
+// cluster carries.
+func otherCluster(t *testing.T, h *harness) (ours, theirs string) {
+	t.Helper()
+	if err := h.pool.QueryRow(t.Context(), `SELECT system_identifier::text FROM pg_control_system()`).Scan(&ours); err != nil {
+		t.Fatal(err)
+	}
+	theirs = "1"
+	if theirs == ours {
+		theirs = "2"
+	}
+	return ours, theirs
+}
+
+// fakeGrant is SQL inserting a grant version for principal, its row copied from user tmpl's grant,
+// as of at in cluster clu with txid: a create, or a delete (del) whose row is in before, not after.
+func fakeGrant(principal, at, clu, txid string, del bool) string {
+	op, row := "create", `jsonb_build_object('after', g)`
+	if del {
+		op, row = "delete", `jsonb_build_object('before', g)`
+	}
+	return fmt.Sprintf(`INSERT INTO rbac_history (effective_at, txid, cluster, tenant, entity, key, op, principal, role, scope, before, after, bytes)
+		SELECT timestamptz '%s', '%s'::xid8, '%s', tenant, entity, md5('%s-grant')::uuid::text, '%s', 'user:%s', role, scope,
+		  (r->'before'), (r->'after'), bytes
+		FROM rbac_history, LATERAL (SELECT after || jsonb_build_object(
+		    'id', md5('%s-grant')::uuid::text, 'principal', 'user:%s', 'principal_id', '%s') AS g) t,
+		  LATERAL (SELECT %s AS r) rr
+		WHERE entity = 'grant' AND principal = 'user:tmpl'`,
+		at, txid, clu, principal, op, principal, principal, principal, principal, row)
+}
+
+// fakeCommit is SQL inserting a commit record of txid in cluster clu, dated at, holding xmin.
+func fakeCommit(at, clu, txid, xmin string) string {
+	return fmt.Sprintf(`INSERT INTO rbac_history (effective_at, txid, cluster, tenant, entity, key, op, after, bytes)
+		VALUES (timestamptz '%s', '%s'::xid8, '%s', '', 'commit', '', 'commit', jsonb_build_object('xmin', '%s'), 0)`,
+		at, txid, clu, xmin)
+}
+
+// A revoke of a change still uncommitted, read as of a time while it was, must not read as already
+// in force because another cluster's restored commit record holds a horizon (after.xmin) far above
+// this cluster's xids: AsOf reads the settled horizon only from the cluster's own commit records, so
+// a live, uncommitted revoke of the grant doesn't supersede it. Without that, the restored horizon
+// counts the revoke as committed and the grant reads as revoked.
+func TestAsOfIgnoresAnotherClustersHorizon(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	ours, theirs := otherCluster(t, h)
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "tmpl"))
+	base := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	mid := base.Add(2 * time.Second)
+	iso := func(d time.Duration) string { return base.Add(d).Format("2006-01-02 15:04:05") }
+	restoreRows(t, h,
+		// u's grant, committed in this cluster before mid, and a revoke of it committed after mid.
+		fakeGrant("u", iso(0), ours, "100", false),
+		fakeCommit(iso(0), ours, "100", "50"),
+		fakeGrant("u", iso(time.Second), ours, "200", true),
+		fakeCommit(iso(10*time.Second), ours, "200", "50"),
+		// Another cluster's restored commit record, dated before mid, holding a horizon above 200.
+		fakeCommit(iso(time.Second), theirs, "9", "18446744073709551000"),
+	)
+	// As of mid, u's revoke has not committed, so u still holds its grant.
+	if err := h.authz.AsOf(ctx, "t1", mid, func(a *rbac.Authorizer) error {
+		grants, err := a.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{identity("u")}})
+		if err == nil && len(grants) != 1 {
+			t.Errorf("as of %v, a live revoke read through another cluster's horizon leaves u %+v", mid, grants)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A change restored from another cluster, whose txid the new cluster later gives a transaction of
+// its own, must be dated by its own cluster's commit record, not the colliding one: AsOf matches a
+// version to a commit record of the version's own cluster. Without that, the later transaction's
+// commit, picked by max(effective_at), dates the restored grant, and it reads as not yet in force.
+func TestAsOfDatesARestoredChangeWithinItsCluster(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	ours, theirs := otherCluster(t, h)
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "tmpl"))
+	old := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	mid := time.Date(2010, 1, 1, 0, 0, 0, 0, time.UTC)
+	restoreRows(t, h,
+		// A grant restored from another cluster, committed there long ago, keyed by txid 500.
+		fakeGrant("restored", old.Format("2006-01-02 15:04:05"), theirs, "500", false),
+		fakeCommit(old.Add(time.Second).Format("2006-01-02 15:04:05"), theirs, "500", "10"),
+		// This cluster later gives txid 500 to a transaction that commits after mid: a collision.
+		fakeCommit("2020-01-01 00:00:00", ours, "500", "10"),
+	)
+	// As of mid, the restored grant was in force in its own cluster, so it reads as held.
+	if err := h.authz.AsOf(ctx, "t1", mid, func(a *rbac.Authorizer) error {
+		grants, err := a.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{identity("restored")}})
+		if err == nil && len(grants) != 1 {
+			t.Errorf("as of %v, a restored grant dated by a colliding txid reads as %+v", mid, grants)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // Versions of a row dated alike, as every write of a DO block, a function or a query string of
 // several statements is, cost a read as of a time a few pages each, as versions dated apart do:
 // tested for a later one in history's index of an entity's versions, which ordered those of one
