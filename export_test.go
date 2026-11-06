@@ -1165,6 +1165,23 @@ func CopyingWork(attributes map[string]any) Work {
 	return Work{maxConverted - c.left, after.Mallocs - before.Mallocs, after.TotalAlloc - before.TotalAlloc, !c.over}
 }
 
+// ConvertingCharge is what converting attributes, as a check converts a kind's, charges, and
+// whether it read them, as ConvertingWork has them, without counting allocations.
+func ConvertingCharge(attributes map[string]any) (uint64, bool) {
+	c := newConverter()
+	_, read := c.attributes(attributes)
+	return maxConverted - c.left, read && !c.over
+}
+
+// CopyingCharge is what copying attributes for a hook charges, and whether it could, as
+// CopyingWork has them, without counting allocations.
+func CopyingCharge(attributes map[string]any) (uint64, bool) {
+	c := copier{left: maxConverted}
+	v := attributes
+	c.copy(reflect.ValueOf(&v).Elem(), 0)
+	return maxConverted - c.left, !c.over
+}
+
 // Converting is what converting attributes as a check does allocates, and whether they were more
 // than a check converts.
 func Converting(t *testing.T, attributes map[string]any) (allocated uint64, over bool) {

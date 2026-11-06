@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io/fs"
 	"maps"
+	"math"
 	mathrand "math/rand/v2"
 	"os"
 	"os/exec"
@@ -2682,7 +2683,7 @@ func TestACallGivesAHookTheCopyOfNoValueFreedSince(t *testing.T) {
 // string in a []string by the 16 bytes moving it moves, a protobuf Value's field apart from the
 // Value, or a message a pointer reaches once for the pointer and again for the message, attributes
 // a check converts couldn't be copied, so a constrained check of them was refused, whoever asked,
-// as of a resource holding 100,000 timestamps, which a check converted. Converting counts what JSON
+// as of a resource holding nearly 40,000 timestamps, which a check converts. Converting counts what JSON
 // text and a packed message decode to as well, which a copy holds as bytes. And an array of
 // interfaces costs what it holds, as a slice does: uncounted, a copy of one holding more values
 // than a check converts cost one.
@@ -2838,6 +2839,223 @@ func TestACopyForAHookCountsWhatItHoldsAsConvertingDoes(t *testing.T) {
 			}
 		}
 	}
+}
+
+// Converting and copying for a hook count alike, so a hook can be given a copy of whatever a check
+// converts: values of random shapes, nesting every type both handle in one another, cost a copy
+// what converting them costs, and no more where they hold JSON text or packed messages, which
+// converting decodes and a copy holds as bytes, or a value reached twice, which a copy copies once
+// where converting may count it again.
+func TestACopyOfAnyShapeCostsWhatConvertingItDoes(t *testing.T) {
+	for _, mode := range []struct {
+		name             string
+		decoded, sharing bool
+	}{{"each value once", false, false}, {"decoded", true, false}, {"shared", false, true}, {"both", true, true}} {
+		for seed := range uint64(1500) {
+			d := &copyDraw{rng: mathrand.New(mathrand.NewPCG(seed, 116)), decoded: mode.decoded, sharing: mode.sharing}
+			attributes := map[string]any{}
+			for i := range d.rng.IntN(4) + 1 {
+				attributes[fmt.Sprint("a", i)] = d.value(3)
+			}
+			converted, read := rbac.ConvertingCharge(attributes)
+			copied, ok := rbac.CopyingCharge(attributes)
+			switch {
+			case !read || !ok:
+				t.Errorf("%s, seed %d: read %t, copied %t", mode.name, seed, read, ok)
+			case copied > converted || copied < converted && !mode.decoded && !mode.sharing:
+				t.Errorf("%s, seed %d: converting costs %d and copying %d: %#v", mode.name, seed, converted, copied, attributes)
+			}
+		}
+	}
+}
+
+// copyDraw draws values a check converts and a hook is given a copy of: every scalar, time, bytes
+// and number Attributes names, CEL's own scalars, lists, arrays, maps keyed by each kind they may
+// be, pointers, nil ones of each, and every well-known message, through a pointer too, some holding
+// fields they don't know. With decoded, JSON text and packed messages, and with sharing, values it
+// drew before.
+type copyDraw struct {
+	rng              *mathrand.Rand
+	decoded, sharing bool
+	drawn            []any
+}
+
+func (d *copyDraw) text() string { return strings.Repeat("s", d.rng.IntN(45)) }
+
+func (d *copyDraw) unknown(m proto.Message) proto.Message {
+	if d.rng.IntN(4) == 0 {
+		m.ProtoReflect().SetUnknown(protowire.AppendBytes(protowire.AppendTag(nil, 99, protowire.BytesType), make([]byte, d.rng.IntN(60))))
+	}
+	return m
+}
+
+func (d *copyDraw) double() float64 {
+	return []float64{0.5, d.rng.Float64(), math.NaN(), math.Inf(-1)}[d.rng.IntN(4)]
+}
+
+func (d *copyDraw) protoValue(depth int) *structpb.Value {
+	switch k := d.rng.IntN(8); {
+	case k == 0:
+		return structpb.NewNullValue()
+	case k == 1:
+		return structpb.NewNumberValue(d.double())
+	case k == 2:
+		return structpb.NewStringValue(d.text())
+	case k == 3:
+		return structpb.NewBoolValue(true)
+	case k == 4 && depth > 0:
+		return structpb.NewStructValue(d.protoStruct(depth - 1))
+	case k == 5 && depth > 0:
+		return structpb.NewListValue(d.protoList(depth - 1))
+	case k == 6:
+		return &structpb.Value{Kind: &structpb.Value_StructValue{}}
+	default:
+		return &structpb.Value{}
+	}
+}
+
+func (d *copyDraw) protoStruct(depth int) *structpb.Struct {
+	s := &structpb.Struct{Fields: map[string]*structpb.Value{}}
+	for i := range d.rng.IntN(4) {
+		s.Fields[fmt.Sprint(d.text(), i)] = d.protoValue(depth)
+	}
+	d.unknown(s)
+	return s
+}
+
+func (d *copyDraw) protoList(depth int) *structpb.ListValue {
+	l := &structpb.ListValue{}
+	for range d.rng.IntN(4) {
+		l.Values = append(l.Values, d.protoValue(depth))
+	}
+	d.unknown(l)
+	return l
+}
+
+func (d *copyDraw) message(depth int) proto.Message {
+	return []func() proto.Message{
+		func() proto.Message { return d.protoStruct(depth) },
+		func() proto.Message { return d.protoList(depth) },
+		func() proto.Message { return d.unknown(d.protoValue(depth)) },
+		func() proto.Message { return d.unknown(wrapperspb.Bool(true)) },
+		func() proto.Message { return d.unknown(wrapperspb.Bytes(make([]byte, d.rng.IntN(45)))) },
+		func() proto.Message { return d.unknown(wrapperspb.Double(d.double())) },
+		func() proto.Message { return d.unknown(wrapperspb.Float(float32(d.double()))) },
+		func() proto.Message { return d.unknown(wrapperspb.Int32(int32(d.rng.IntN(3)))) },
+		func() proto.Message { return d.unknown(wrapperspb.Int64(int64(d.rng.IntN(3)))) },
+		func() proto.Message { return d.unknown(wrapperspb.String(d.text())) },
+		func() proto.Message { return d.unknown(wrapperspb.UInt32(uint32(d.rng.IntN(3)))) },
+		func() proto.Message { return d.unknown(wrapperspb.UInt64(uint64(d.rng.IntN(3)))) },
+		func() proto.Message { return d.unknown(timestamppb.New(time.Unix(int64(d.rng.IntN(1000)), 0))) },
+		func() proto.Message { return d.unknown(durationpb.New(time.Duration(d.rng.IntN(1000)))) },
+	}[d.rng.IntN(14)]()
+}
+
+// pointer is a pointer to v, or a nil one where v is nil.
+func pointer(v any) any {
+	if v == nil {
+		return (*int)(nil)
+	}
+	p := reflect.New(reflect.TypeOf(v))
+	p.Elem().Set(reflect.ValueOf(v))
+	return p.Interface()
+}
+
+func (d *copyDraw) value(depth int) any {
+	if d.sharing && len(d.drawn) > 0 && d.rng.IntN(6) == 0 {
+		return d.drawn[d.rng.IntN(len(d.drawn))]
+	}
+	n := 20
+	switch {
+	case d.decoded:
+		n = 32
+	case depth > 0:
+		n = 30
+	}
+	var v any
+	switch d.rng.IntN(n) {
+	case 0:
+		v = []any{nil, true, d.text(), time.Unix(int64(d.rng.IntN(1000)), 0), time.Duration(d.rng.IntN(1000))}[d.rng.IntN(5)]
+	case 1:
+		v = []any{int8(1), int16(2), int32(3), int64(4), 5, uint8(1), uint16(2), uint32(3), uint64(4), uint(5)}[d.rng.IntN(10)]
+	case 2:
+		v = []any{float32(d.double()), d.double()}[d.rng.IntN(2)]
+	case 3:
+		type level int
+		type named string
+		v = []any{level(1), named(d.text())}[d.rng.IntN(2)]
+	case 4:
+		v = []any{json.Number("12.5e3"), json.Number("7"), structpb.NullValue_NULL_VALUE}[d.rng.IntN(3)]
+	case 5:
+		cels := []any{
+			types.String(d.text()), types.Int(1), types.Uint(2), types.Double(d.double()), types.Bool(true),
+			types.Bytes(make([]byte, d.rng.IntN(45))), types.NullValue,
+			types.Timestamp{Time: time.Unix(1, 0)},
+			types.Duration{Duration: time.Second},
+		}
+		v = cels[d.rng.IntN(len(cels))]
+	case 6:
+		v = []any{make([]byte, d.rng.IntN(45)), []byte(nil), [33]byte{}}[d.rng.IntN(3)]
+	case 7:
+		v = []any{(*int)(nil), map[string]any(nil), []any(nil), (*structpb.Struct)(nil), (*timestamppb.Timestamp)(nil)}[d.rng.IntN(5)]
+	case 8, 9:
+		v = d.message(1)
+	case 10:
+		v = pointer(d.message(1))
+	case 11:
+		v = []any{[3]int{1, 2, 3}, [2]string{d.text(), d.text()}, [2][2]int{}}[d.rng.IntN(3)]
+	case 12:
+		v = []any{[]string{d.text(), d.text()}, []int64{1, 2, 3}, make([]any, 0, 2)}[d.rng.IntN(3)]
+	case 13:
+		v = map[int]string{1: d.text(), 2: d.text()}
+	case 14:
+		v = map[bool]uint{true: 1}
+	case 15:
+		type key string
+		v = map[key]int{key(d.text()): 1}
+	case 16:
+		v = map[string]*structpb.Value{d.text(): d.protoValue(1)}
+	case 17:
+		v = []*timestamppb.Timestamp{timestamppb.New(time.Unix(1, 0)), nil}
+	case 18:
+		v = map[string]time.Time{d.text(): time.Unix(1, 0)}
+	case 19:
+		v = [][]byte{make([]byte, d.rng.IntN(45))}
+	case 20, 21:
+		l := make([]any, d.rng.IntN(4))
+		for i := range l {
+			l[i] = d.value(depth - 1)
+		}
+		v = l
+	case 22:
+		v = [2]any{d.value(depth - 1), d.value(depth - 1)}
+	case 23, 24:
+		m := map[string]any{}
+		for i := range d.rng.IntN(4) {
+			m[fmt.Sprint(d.text(), i)] = d.value(depth - 1)
+		}
+		v = m
+	case 25:
+		v = map[any]any{d.text() + "k": d.value(depth - 1), 7: d.value(depth - 1), true: 1, uint(9): "x"}
+	case 26, 27:
+		v = pointer(d.value(depth - 1))
+	case 28:
+		v = []*structpb.Value{d.protoValue(depth - 1)}
+	case 29:
+		v = map[string][]any{d.text(): {d.value(depth - 1)}}
+	case 30:
+		v = json.RawMessage([]string{`{"a": [1, "b"]}`, `[]`, `{}`, `"x"`, `[[{}], {"k": []}]`}[d.rng.IntN(5)])
+	default:
+		packed, err := anypb.New(d.message(1))
+		if err != nil {
+			panic(err)
+		}
+		v = []any{packed, pointer(packed)}[d.rng.IntN(2)]
+	}
+	if k := reflect.ValueOf(v).Kind(); d.sharing && (k == reflect.Map || k == reflect.Slice || k == reflect.Pointer) {
+		d.drawn = append(d.drawn, v)
+	}
+	return v
 }
 
 // A hook is given a copy of no more than a check converts, as copying recurses as far as what the
