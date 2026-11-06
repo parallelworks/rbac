@@ -684,7 +684,7 @@ behind, which keep the cluster's identifier while the new timeline numbers their
 again: either would have `AsOf` date a change by another transaction's commit. `pg_upgrade` gives
 the cluster a new identifier and keeps its transaction ids, so `AsOf` answers as before, but a read
 as of a time before the upgrade finds no commit record of the cluster's by then, and looks up every
-version's commit record, about a quarter more pages of history.
+version's commit record, up to about a quarter more pages of history.
 
 A change refused, as `ErrDenied` or `ErrInvalid`, writes nothing, so history doesn't record it:
 `Config.OnRefused` is told of each, with its actor, the call and the host's audit, to record the
