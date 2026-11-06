@@ -10258,6 +10258,19 @@ func TestAReadPlannedAloneHoldsItsSettingsInEveryWayAPoolSendsStatements(t *test
 				}, `SELECT 1 / (SELECT 0)`); err == nil {
 					t.Fatal("a statement dividing by zero ran")
 				}
+				// So too a read whose rows its caller reads on (QueriedIndexed).
+				rows, err := rbac.QueriedIndexed(bounded, pool, `SELECT current_setting('enable_seqscan') WHERE $1::text[] IS NOT NULL`, []string{"t1"})
+				if err == nil {
+					during, err = pgx.CollectExactlyOneRow(rows, pgx.RowTo[string])
+				}
+				if err != nil || during != "off" {
+					t.Fatalf("enable_seqscan = %q, %v, as its rows were read", during, err)
+				}
+				if rows, err := rbac.QueriedIndexed(bounded, pool, `SELECT 1 / (SELECT 0)`); err == nil {
+					if _, err = pgx.CollectRows(rows, pgx.RowTo[int32]); err == nil {
+						t.Fatal("a statement dividing by zero ran")
+					}
+				}
 				var seqscan string
 				if err := pool.QueryRow(bounded, `SELECT current_setting('enable_seqscan')`).Scan(&seqscan); err != nil || seqscan != "on" {
 					t.Fatalf("enable_seqscan = %q, %v, once the reads ended", seqscan, err)
