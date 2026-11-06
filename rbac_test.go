@@ -9953,6 +9953,51 @@ func TestAReadPlannedAloneLeavesItsSessionAsItFoundItHoweverItEnds(t *testing.T)
 	}
 }
 
+// A read planned with settings of its own, on a pool, runs with them and leaves them as they were,
+// whichever way the host has its pool send statements: each sends a batch as one transaction, its
+// statements before one Sync, or in one simple query, so what the first sets for the transaction
+// alone holds as the read runs, and where it fails, the rollback puts it back.
+func TestAReadPlannedAloneHoldsItsSettingsInEveryWayAPoolSendsStatements(t *testing.T) {
+	ctx := t.Context()
+	schema := pgtest.Open(t, "pool_max_conns=1").Config()
+	for _, mode := range []pgx.QueryExecMode{
+		pgx.QueryExecModeCacheStatement, pgx.QueryExecModeCacheDescribe, pgx.QueryExecModeDescribeExec,
+		pgx.QueryExecModeExec, pgx.QueryExecModeSimpleProtocol,
+	} {
+		t.Run(mode.String(), func(t *testing.T) {
+			bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			cfg := schema.Copy()
+			cfg.ConnConfig.DefaultQueryExecMode = mode
+			pool, err := pgxpool.NewWithConfig(bounded, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pool.Close()
+			// Twice, as a statement a connection has prepared runs again.
+			for range 2 {
+				var during string
+				if err := rbac.Planned(bounded, pool, func(rows pgx.Rows) error {
+					_, err := pgx.ForEachRow(rows, []any{&during}, func() error { return nil })
+					return err
+				}, `SELECT current_setting('enable_seqscan') WHERE $1::text[] IS NOT NULL`, []string{"t1"}); err != nil || during != "off" {
+					t.Fatalf("enable_seqscan = %q, %v, as it read", during, err)
+				}
+				if err := rbac.Planned(bounded, pool, func(rows pgx.Rows) error {
+					_, err := pgx.ForEachRow(rows, nil, func() error { return nil })
+					return err
+				}, `SELECT 1 / (SELECT 0)`); err == nil {
+					t.Fatal("a statement dividing by zero ran")
+				}
+				var seqscan string
+				if err := pool.QueryRow(bounded, `SELECT current_setting('enable_seqscan')`).Scan(&seqscan); err != nil || seqscan != "on" {
+					t.Fatalf("enable_seqscan = %q, %v, once the reads ended", seqscan, err)
+				}
+			}
+		})
+	}
+}
+
 // unbatched is a host's own DB around a pool that sends no batches.
 type unbatched struct{ pool *pgxpool.Pool }
 

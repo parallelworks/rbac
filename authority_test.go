@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -5836,7 +5837,8 @@ func TestDeletingGroupsReadsOnlyWhatNamesThem(t *testing.T) {
 // by statistics from then, as a connection planned it: the planner counted every table but a few
 // rows, so the plan read each by a sequential scan, every row of it, and the denies once for each
 // key of a path, until an analysis invalidated it. Checked on a pool too, where a check's settings
-// go with its statement.
+// go with its statement; and by the plans each is made while the tables are small, which read none
+// of them whole (scansWhole).
 func TestReadsByKeyReadAsMuchUnderAPlanMadeWhileTheTablesWereSmall(t *testing.T) {
 	h := groupedOn(t, pgtest.Open(t, "plan_cache_mode=force_generic_plan&pool_max_conns=1"))
 	ctx := t.Context()
@@ -5923,6 +5925,14 @@ func TestReadsByKeyReadAsMuchUnderAPlanMadeWhileTheTablesWereSmall(t *testing.T)
 		return pages
 	}
 	few := read()
+	// Their plans, made while the tables are small (scansWhole).
+	for what, f := range calls {
+		reading := tables
+		if what == "the read of the powers to change grants denied" {
+			reading = []string{"rbac_denies", "rbac_members"}
+		}
+		scansWhole(ctx, t, h.pool, what, func(tx pgx.Tx) error { return f(h.authz.WithTx(tx)) }, reading...)
+	}
 	// Grants, denies and places in groups of others, in t1 and in tenants of their own.
 	for _, q := range []string{
 		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
@@ -5967,7 +5977,9 @@ func TestReadsByKeyReadAsMuchUnderAPlanMadeWhileTheTablesWereSmall(t *testing.T)
 // every place in the tenant, and under some plans for each one every place in the table, 32,200
 // pages, or 2.6 million, to remove one member, until an analysis invalidated the plans. Without
 // OnChange, which a removal returns what it removed for, its statement runs by Exec or in a batch,
-// which pagesOfStatements counts.
+// which pagesOfStatements counts. Its reads of denies and eligibilities are checked by their plans
+// made while the tables are small too (scansWhole): the removal's pages grow under any plan made by
+// statistics from then, but theirs only under the plan the connection made then.
 func TestAChangeToMembersReadsByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *testing.T) {
 	h := groupedOn(t, pgtest.Open(t, "plan_cache_mode=force_generic_plan&pool_max_conns=1"), func(c *rbac.Config) { c.OnChange = nil })
 	ctx := t.Context()
@@ -5993,6 +6005,10 @@ func TestAChangeToMembersReadsByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *test
 	if _, err := h.pool.Exec(ctx, `ANALYZE `+strings.Join(tables, ", ")); err != nil {
 		t.Fatal(err)
 	}
+	change := func(tx pgx.Tx) error {
+		return h.authz.WithTx(tx).ChangeMembers(ctx, manager, "t1",
+			[]rbac.Member{{Group: "crew", Principal: identity("v")}}, []rbac.Member{{Group: "crew", Principal: identity("u")}})
+	}
 	// The pages of the denies and eligibilities the change reads, and of the places its removal of
 	// them does, in a transaction it rolls back: made once before, so its plans are made and cached.
 	read := func() map[string]int64 {
@@ -6010,8 +6026,7 @@ func TestAChangeToMembersReadsByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *test
 					before[table] = pagesRead(ctx, t, tx, table)
 				}
 				removing := &pagesOfStatements{Tx: tx, t: t, prefix: "DELETE FROM rbac_members", table: "rbac_members", pages: new(int64)}
-				if err := h.authz.WithTx(removing).ChangeMembers(ctx, manager, "t1",
-					[]rbac.Member{{Group: "crew", Principal: identity("v")}}, []rbac.Member{{Group: "crew", Principal: identity("u")}}); err != nil {
+				if err := change(removing); err != nil {
 					t.Fatal(err)
 				}
 				if !measured {
@@ -6029,6 +6044,8 @@ func TestAChangeToMembersReadsByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *test
 	if few["the removal of places"] == 0 {
 		t.Fatal("the change read no places removing them")
 	}
+	// Their plans, made while the tables are small (scansWhole).
+	scansWhole(ctx, t, h.pool, "the change", change, "rbac_denies", "rbac_eligibilities")
 	// Grants, denies, eligibilities, memberships, groups and places in groups of others, in t1 and in
 	// tenants of their own, naming groups too.
 	for _, q := range []string{
@@ -6053,6 +6070,68 @@ func TestAChangeToMembersReadsByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *test
 	for what, many := range read() {
 		if many > few[what]*3/2+deeper {
 			t.Errorf("%s read %d pages, and %d once the tables grew under a plan made while they were small", what, few[what], many)
+		}
+	}
+}
+
+// scansWhole fails t where a statement f sends by a query or a batch, on a transaction of pool it
+// rolls back, reads one of tables by a sequential scan under a plan made now: generic, as a
+// connection plans a statement it keeps, with the settings the statement was sent with, which it
+// sets again as the batches did, in order. It fails t too where no such statement reads one of
+// tables. A test's pages read once the tables grow catch a plan made while they were small only
+// where the connection kept it until then: a schema any session makes or drops in the database, or
+// a burst of catalog changes anywhere on the server, invalidates every plan a connection keeps, and
+// the next run plans by the tables' size, as most runs on a database other tests share did.
+func scansWhole(ctx context.Context, t *testing.T, pool *pgxpool.Pool, what string, f func(pgx.Tx) error, tables ...string) {
+	t.Helper()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	rec := &recordingTx{Tx: tx}
+	if err := f(rec); err != nil {
+		t.Fatalf("%s: %v", what, err)
+	}
+	read := map[string]bool{}
+	whole := regexp.MustCompile(`Seq Scan on (\w+)`)
+	for i, sql := range rec.sqls {
+		if strings.HasPrefix(sql, "SELECT set_config(") {
+			if _, err := tx.Exec(ctx, sql, rec.args[i]...); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		var reading []string
+		for _, table := range tables {
+			if strings.Contains(sql, "FROM "+table) {
+				reading, read[table] = append(reading, table), true
+			}
+		}
+		if len(reading) == 0 {
+			continue
+		}
+		// By the simple protocol, which binds no parameters: GENERIC_PLAN plans with none.
+		results, err := tx.Conn().PgConn().Exec(ctx, "EXPLAIN (GENERIC_PLAN) "+sql).ReadAll()
+		if err != nil {
+			t.Fatal(err)
+		}
+		scanned := map[string]bool{}
+		for _, r := range results {
+			for _, row := range r.Rows {
+				if m := whole.FindSubmatch(row[0]); m != nil && slices.Contains(reading, string(m[1])) {
+					scanned[string(m[1])] = true
+				}
+			}
+		}
+		statement := strings.Join(strings.Fields(sql), " ")
+		for _, table := range slices.Sorted(maps.Keys(scanned)) {
+			t.Errorf("%s reads every row of %s under a plan made while the tables were small: %s", what, table, statement[:min(len(statement), 100)])
+		}
+	}
+	for _, table := range tables {
+		if !read[table] {
+			t.Fatalf("%s read no %s", what, table)
 		}
 	}
 }
