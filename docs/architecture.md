@@ -778,7 +778,10 @@ flowchart LR
   identity, through its own grants and its groups', with the tenant's members and the public as
   one holder each. It marks holders that hold only under a condition, or that a deny, a
   constraint or a label may refuse. For a labeled resource it reads every identity's label values'
-  grants and denies in one statement in the list's snapshot.
+  grants and denies in one statement in the list's snapshot, and narrows that read once for all of
+  them to the roles giving values (`valuesOfAll`), so each identity walks only its grants of those:
+  narrowed for each, 1,000 holders, the tenant's members granted 300 roles of 1,000 other
+  permissions, read every role again for each holder, 300 million entries, in seven seconds.
 
 ## Labels and exclusive values
 
@@ -826,8 +829,9 @@ flowchart TB
   as the whole role is, which the first decision narrows the read to, reading each role once
   (`labeling`): a holding decides by nothing else, so the actor's grants of other roles, however
   many or large, cost a label nothing. A check deciding a subject's values, as `Authorize` of a
-  labeled resource, `Holders` for each identity, `Holding`, `Filter` and `Reachable` do, narrows its
-  read so too.
+  labeled resource, `Holding`, `Filter` and `Reachable` do, narrows its read so too, and `Holders`
+  its one read of every identity's values, once for all of them, so each identity's decision walks
+  that read as it is (`narrowed`).
 - **Releasing and writing.** `ReleasePermission(dimension)`, held on the tenant, is the power to
   release data to a looser label in that dimension, so only a holder of it can downgrade data. A
   `Holding`'s `MayWrite` and `MayRelease` say whether data read under one label may be written, or
