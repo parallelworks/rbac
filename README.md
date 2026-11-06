@@ -648,8 +648,8 @@ records, and past the first, at most `rbac.MaxHistoryBytes` of their rows' JSON 
 read of fewer than its limit doesn't mean history holds no more: read until one returns none.
 History written before `0013_bounded_rows` counted no bytes, so a read measures each such record by
 writing out its rows, and reads at most 100 of them. Any transaction still running in the database
-cluster, in any of its databases, that has written or otherwise taken a transaction id, as `AsOf`'s
-has while its read runs, holds `History`, and `Export` with it, back until it ends.
+cluster, in any of its databases, that has written or otherwise taken a transaction id holds
+`History`, and `Export` with it, back until it ends.
 `idle_in_transaction_session_timeout`, and
 from PostgreSQL 17 on `transaction_timeout`, end one a session leaves open by mistake, but every
 session may set both for itself, whatever the role's or the server's defaults, so they bound only
@@ -758,32 +758,43 @@ transaction after it committed, and a session that has an enabled deferrable tri
 table, which fires as it commits: either would run a session's own code after the commit record was
 written. The check of a temporary table's deferrable trigger reads the catalog as the commit record
 is written, so it is a best-effort defense that holds only where a hostile session can't make
-temporary objects: the roles below revoke `TEMPORARY` on the database from `PUBLIC` and grant it only
-where it is needed, so a role without it makes none. The application's role needs `TEMPORARY` only
-for `AsOf`, which makes temporary views; where `AsOf` runs as that role, it keeps `TEMPORARY` and so
-can make temporary objects, and the check is best-effort against it, as against any role with
-`TEMPORARY`. So the application's role can hold a change's commit past its commit record only through
-the host's code that runs as the transaction commits, as a deferred trigger of the host's that reads
-a table by a name a temporary table can take, or a deferred constraint checking a row the role can
-lock; by the temporary tables a session makes, for as long as dropping or emptying them takes, which
-a large `temp_buffers` lengthens; by a temporary object's own deferrable trigger, where it has
-`TEMPORARY`; or for as long as the operator's settings of synchronous replication and prepared
-transactions let it.
+temporary objects: the roles below revoke `TEMPORARY` on the database from `PUBLIC` and grant it to
+none of them, as no call of the package's makes a temporary object, `AsOf`'s included, so none of
+them makes any, and against them the defense holds. So the application's role can hold a change's
+commit past its commit record only through the host's code that runs as the transaction commits, as
+a deferred trigger or constraint of the host's, which can check a row the role can lock, or for as
+long as the operator's settings of synchronous replication and prepared transactions let it; a role
+given `TEMPORARY` can hold it too by the temporary tables its session makes, for as long as dropping
+or emptying them takes, which a large `temp_buffers` lengthens, and by a temporary object's own
+deferrable trigger, against which the check is best-effort.
 With `track_commit_timestamp` on, `pg_xact_commit_timestamp` of a record's `TxID`, while the server
 keeps it, shows when the transaction's commit was written, which an auditor can compare with its
 `CommittedAt`.
-`AsOf` makes no change: one tried is no actor's attempt, and
-`Config.OnRefused` isn't told of it. It writes all the same: the temporary views it reads history
-through are rows of the catalog, for which its transaction takes a transaction id and holds it until
-it rolls back, as under `WithTx` the host's transaction does until it ends, so while its read runs,
-`History` and `Export` anywhere in the cluster read no record of a transaction that took its id
-after it. Keep each read short, as an access review of many subjects reads them in several calls,
-not one. Without views, so that the transaction could be read only, every statement would name
-history in place of each table, and a hook's query through the `DB` it is given would read the
-tables as they are now. `AsOf` takes a time from 4714 BC, the earliest PostgreSQL holds, to
-9999-12-30, the last the package stores, each to the microsecond, rounded down, as pgx sends it:
-in 64 bits of microseconds from 2000, which a time past year 294,000 or so wraps, so the database
-would read it as another, or refuse it.
+`AsOf` makes no change: one tried is no actor's attempt, and `Config.OnRefused` isn't told of it. It
+reads in a transaction, or under `WithTx` a savepoint of the host's, that it makes READ ONLY, so
+nothing in its read writes, a hook's or the host's query either, and rolls back. It reads history
+through views that migrating makes (`0028_as_of_views`), in a schema beside the package's named as
+it with `_as_of` after, each named as the table it stands in for, which it names first on its
+transaction's search_path: a statement there, the package's, a hook's through the `DB` it is given
+or the host's on that transaction, reads a table by its name as it was then, `rbac_group_members`
+too, and `current_schema()` there is the views' schema. So it makes no object and takes no
+transaction id: it needs no `TEMPORARY`, and while its read runs it holds no `History` or `Export`
+back, though under `WithTx` a host's transaction that has taken one holds them back, as it would
+anyway; its snapshot, as any transaction's, keeps vacuum from removing a row changed since it began,
+so keep each read short all the same. The views read the tenant, the time and the cluster `AsOf`
+sets for its transaction (`rbac.as_of_tenant`, `rbac.as_of`, `rbac.as_of_cluster`), with the rights
+of whoever reads them, so a session that sets those itself reads through the views only what it may
+read of history, and outside a read they read nothing, or fail, never the tables. A statement of the
+read that leaves the search_path, or one of those settings, set otherwise would read another tenant
+or time, or the tables as they are now, so `AsOf` fails once its read returns where one did: what
+the read answered stands only where `AsOf` returns nil. The search_path it reads by names the views'
+schema, then `pg_temp`, then the session's, as one that doesn't name `pg_temp` reads a session's own
+tables first, so it refuses one that names `pg_temp` after the package's schema, as it would read
+them the other way round, and one that names it first, which makes the session's temporary schema
+the current one. `AsOf` takes a time from 4714 BC, the earliest PostgreSQL holds, to 9999-12-30, the
+last the package stores, each to the microsecond, rounded down, as pgx sends it: in 64 bits of
+microseconds from 2000, which a time past year 294,000 or so wraps, so the database would read it as
+another, or refuse it.
 A statement reads the history of the rows it names, as a check
 does its subject's grants, groups and the denies on its resource's path, a search its subject's
 grants, and the public's and the members' it counts, on each type it lists, and the custom roles
@@ -864,7 +875,13 @@ have the server load a library or run a program of its choosing; and:
 1. `Migrate` runs as an administrator's role the application's isn't a member of, with only the
    package's schema in its search_path, so that role owns the package's tables: their owner can
    disable the triggers that record them. A later migration can change history too, so the
-   administrator's role keeps both owners' rights.
+   administrator's role keeps both owners' rights. It owns the schema of `AsOf`'s views too, named
+   as the package's with `_as_of` after, which `0028_as_of_views` makes: that takes `CREATE` on the
+   database, which a role that doesn't own it hasn't by default, so a superuser or the database's
+   owner makes it first, empty, `CREATE SCHEMA <schema>_as_of AUTHORIZATION <administrator>`, and
+   grants no other role `CREATE` there. `AsOf` names it first on its search_path, so migrating
+   refuses one that holds anything, is another role's, or in which another may create: a function
+   made there would run in place of the package's, as whoever reads as of a time.
 2. A role of history's own, which the administrator's role is a member of and the application's
    isn't, owns `rbac_history` and the function `rbac_record`: transfer them to it after migrating.
    It needs `USAGE` on the schema, since every write to the package's tables runs `rbac_record`
@@ -880,38 +897,43 @@ have the server load a library or run a program of its choosing; and:
    id sequence, which a grant on all the schema's sequences can give: `setval` could number a change
    below the one before it, and `AsOf` would read the row as it was before the change. Never
    `TRIGGER`, which `ALL` includes: a trigger runs its function as whoever writes the table, and one
-   on `rbac_history` can drop each record, as history's owner.
-4. The application's role can make no schema and create in none: it neither owns the database nor
-   has `CREATE` on it, which `CREATE SCHEMA` needs and only the owner has by default, and it
-   creates in no schema it owns, as `public` is when that role owns the database, nor in `public`
-   before PostgreSQL 15, where every role can. `Migrate` calls functions by name, and an overload
-   made in the package's schema would run in its place, as the administrator's role; and the
-   package's schema is a session's current one, the first on its search_path, which a session can
-   set, so one that named first a schema the role made, or can create in, would read a table made
-   there as history: a generation of its own, which an export starts from `Genesis`, and `Export`
-   would sign what it holds. `History` and `Export` can't tell that table from history's own,
-   which the application's role owns where these roles aren't set up, so they don't refuse it.
+   on `rbac_history` can drop each record, as history's owner. And `USAGE` on the schema of `AsOf`'s
+   views and `SELECT` on them, which `AsOf` refuses to read without, rather than read the tables as
+   they are now: they read history with the rights of whoever reads them, so they give a role no row
+   of history it couldn't read already. Migrating gives them to every role that may then read
+   history; give them to one given history after.
+4. The application's role can make no schema and create in none, the schema of `AsOf`'s views
+   either: it neither owns the database nor has `CREATE` on it, which `CREATE SCHEMA` needs and only
+   the owner has by default, and it creates in no schema it owns, as `public` is when that role owns
+   the database, nor in `public` before PostgreSQL 15, where every role can. `Migrate` calls
+   functions by name, and an overload made in the package's schema would run in its place, as the
+   administrator's role; and the package's schema is a session's current one, the first on its
+   search_path, which a session can set, so one that named first a schema the role made, or can
+   create in, would read a table made there as history: a generation of its own, which an export
+   starts from `Genesis`, and `Export` would sign what it holds. `History` and `Export` can't tell
+   that table from history's own, which the application's role owns where these roles aren't set up,
+   so they don't refuse it.
 
-The application's role may create temporary tables, as `AsOf` needs, and a session reads its own
-tables and types before any schema's of the same name until it ends, which in a pool can be long
-after the call that made one. One named as a package's table stands in for it in that session,
-whose checks are the application's own to make; `History`, `Export` and `PruneHistory`, and
-`AsOf`'s checks of history, name history's table by the package's schema and their types by
-pg_catalog's, so none stands in for them, and refuse a search_path that names pg_temp first. And
-history's triggers find history beside the table each fires on, whatever the schema is named, or
-refuse the row where their search_path can't name that schema, before they read a table or call
-anything by it: so none stands in for the history a change is recorded in, or a prune checked
-against, and nothing such a table runs, as its row security policy, runs as history's role.
+A role that may create temporary tables, as every role may unless `TEMPORARY` is revoked from
+`PUBLIC`, reads its session's own tables and types before any schema's of the same name until it
+ends, which in a pool can be long after the call that made one. One named as a package's table
+stands in for it in that session, whose checks are the role's own to make, but for `AsOf`'s, which
+read their views first; `History`, `Export` and `PruneHistory`, and `AsOf`'s checks of history, name
+history's table by the package's schema and their types by pg_catalog's, so none stands in for them,
+and refuse a search_path that names pg_temp first. And history's triggers find history beside the
+table each fires on, whatever the schema is named, or refuse the row where their search_path can't
+name that schema, before they read a table or call anything by it: so none stands in for the history
+a change is recorded in, or a prune checked against, and nothing such a table runs, as its row
+security policy, runs as history's role.
 
 Harden temporary objects too: revoke the `TEMPORARY` privilege on the database from `PUBLIC`, which
-holds it by default, and grant it back only to the roles that need it. The commit record refuses a
+holds it by default, and grant it back to none of these roles. The commit record refuses a
 transaction that commits a change to the package's tables while the session has an enabled deferrable
 trigger on a temporary table, as that trigger would run the session's own code after the change is
 dated; but that check, read against the catalog as the commit record is written, is a best-effort
-defense, so a role that need not make temporary objects is better left unable to. Only `AsOf` makes
-temporary objects (its temporary views), so the application's role needs `TEMPORARY` only where it
-runs `AsOf`; grant it there, and a deployment that runs `AsOf` on a role of its own, or not at all,
-can leave the application's role without it. The administrator's and history's roles need none.
+defense, so a role that need not make temporary objects is better left unable to. No call of the
+package's makes one, `AsOf` included, which reads views migrating made, so none of the roles needs
+`TEMPORARY`, and the check holds against each.
 
 ## Running it
 
@@ -1087,6 +1109,26 @@ can leave the application's role without it. The administrator's and history's r
   `rbac_history_committed` is deferred again as it fires. And `AsOf` under `WithTx` no longer counts
   the host transaction's own changes, which haven't committed, where earlier code counted those
   dated by its time: read them after the transaction commits.
+  `0028_as_of_views` makes the views `AsOf` reads history through, one of each of the package's
+  tables, in a schema beside the package's named as it with `_as_of` after, and the function
+  `rbac_as_of_views`, which makes them again for a later migration that changes a table. Making
+  the schema takes `CREATE` on the database: where the role migrating hasn't it, the migration
+  fails with SQLSTATE 42501, recording nothing, until a superuser or the database's owner makes the
+  schema for that role, empty, as the roles above say, and one that holds anything, is another
+  role's or in which another may create fails it with SQLSTATE 42P15. It gives the views and their
+  schema to each role that may read history then, as the application's role above, so that role
+  needs no new grant. It takes no lock a check, a change or a read of history waits for. Code from
+  before it makes temporary views for `AsOf`, as it still may beside it, and code from it on reads
+  these, refusing as `rbac.ErrInvalid` to read as of a time where they aren't made: migrate before
+  running it. From it on `AsOf` needs no `TEMPORARY`, so once no replica runs code from before it,
+  revoke it from `PUBLIC` with no exception; and it takes no transaction id, so its read holds no
+  `History` or `Export` back. Hooks and a host's queries on its
+  transaction read the package's tables by name as of the time, as before, but its read runs READ
+  ONLY, with the views' schema first on the search_path: `current_schema()` there names the views'
+  schema, a write there fails with SQLSTATE 25006 rather than roll back with the read, and one that
+  leaves the search_path, `rbac.as_of`, `rbac.as_of_tenant` or `rbac.as_of_cluster` set otherwise
+  fails `AsOf` as `rbac.ErrInvalid` once its read returns. Drop the views' schema with the
+  package's: dropping the package's drops the views, which read its history, but not their schema.
   Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
   rolling upgrade across the two is unsafe: they key every lock apart, so a change by one waits for
   none by the other, and what each checks under its locks can change before it commits, as two
@@ -1106,7 +1148,9 @@ can leave the application's role without it. The administrator's and history's r
   back by the new, and a session still on the old name finds no tables, or tables of its own of
   those names. Never name the schema `$user`, which no search_path can name: every change there is
   refused. Never move one of the package's tables to another schema: its changes would be recorded
-  in that schema's history, or with none there, in a session's own table of its name.
+  in that schema's history, or with none there, in a session's own table of its name. `AsOf` finds
+  its views by the history they read, whatever either schema is named, so renaming either keeps it
+  reading.
 - **Goroutines:** an Authorizer `New` returns on a pool is safe for concurrent use. One bound to a
   transaction or a connection, as `WithTx` and `AsOf`'s read give and `New` returns on a `pgx.Tx`
   or a `*pgx.Conn`, runs every call on that one connection, so it is for one goroutine at a time,

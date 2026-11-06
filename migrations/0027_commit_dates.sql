@@ -36,13 +36,13 @@
 -- it commits, is before that transaction began. The temporary-table check reads the catalog as the
 -- commit record is written, so it is a best-effort defense that assumes the README's roles: it holds
 -- against a session that can't make temporary objects, so the roles revoke TEMPORARY from PUBLIC and
--- grant it only where needed. The application's role needs it only for AsOf, which makes temporary
--- views; where AsOf runs as that role, it keeps TEMPORARY and the check is best-effort against it.
--- And as the commit empties a session's temporary
--- tables made ON COMMIT DELETE ROWS, it locks each, and its TOAST table, which another session of
--- the role can hold, the TOAST table by preparing a statement that names it, for as long as it
--- likes: so the commit record's event, at the commit, has the rest of it wait for no lock past
--- 100 ms. What runs after it is then the package's, the host's, as its own deferred triggers and
+-- grant it to none of them. From 0028 on no call of the package's makes a temporary object, AsOf's
+-- included, which reads views of history that migration made, so none of those roles needs it, and
+-- the check holds against each. And as the commit empties a session's temporary tables made ON
+-- COMMIT DELETE ROWS, it locks each, and its TOAST table, which another session of the role can
+-- hold, the TOAST table by preparing a statement that names it, for as long as it likes: so the
+-- commit record's event, at the commit, has the rest of it wait for no lock past 100 ms. What runs
+-- after it is then the package's, the host's, as its own deferred triggers and
 -- constraints of statements after the transaction's last change to the tables, and the commit's: the
 -- session's temporary tables emptied or dropped, about half a millisecond each at the default
 -- temp_buffers, but seconds at a large one, as emptying an ON COMMIT DELETE ROWS table scans the

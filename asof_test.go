@@ -3,6 +3,9 @@ package rbac_test
 import (
 	"cmp"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -514,7 +517,7 @@ func rebuilt(t *testing.T, h *harness, at time.Time) {
 				  (SELECT count(*) FROM (SELECT * FROM `+tb.Name+` EXCEPT ALL SELECT * FROM `+tb.Schema+`.`+tb.Name+` WHERE tenant = 't1') x),
 				  (SELECT count(*) FROM (
 				    SELECT attnum, attname, atttypid, atttypmod, attcollation FROM pg_attribute WHERE attrelid = $1::regclass AND attnum > 0 AND NOT attisdropped
-				    EXCEPT SELECT attnum, attname, atttypid, atttypmod, attcollation FROM pg_attribute WHERE attrelid = to_regclass('pg_temp.' || $2)) x)`,
+				    EXCEPT SELECT attnum, attname, atttypid, atttypmod, attcollation FROM pg_attribute WHERE attrelid = to_regclass($2)) x)`,
 				tb.Schema+"."+tb.Name, tb.Name).Scan(&missing, &extra, &columns); err != nil {
 				return err
 			}
@@ -2904,6 +2907,413 @@ func TestAsOfReadsByPrincipalWhateverHistorysStatisticsCount(t *testing.T) {
 	for what, analyzed := range read() {
 		if stale[what] > analyzed*3/2+deeper {
 			t.Errorf("as of a time, %s read %d pages of history by statistics from before 3,000 others' places and 300 eligibilities were written, and %d once it was analyzed", what, stale[what], analyzed)
+		}
+	}
+}
+
+// sqlState is the SQLSTATE of the PostgreSQL error err holds, or empty.
+func sqlState(err error) string {
+	if pg := (*pgconn.PgError)(nil); errors.As(err, &pg) {
+		return pg.Code
+	}
+	return ""
+}
+
+// viewsOf is the schema of AsOf's views beside the schema of h's pool's connections, quoted.
+func viewsOf(t *testing.T, h *harness) string {
+	t.Helper()
+	var views string
+	if err := h.pool.QueryRow(t.Context(), `SELECT quote_ident(current_schema() || '_as_of')`).Scan(&views); err != nil {
+		t.Fatal(err)
+	}
+	return views
+}
+
+// Each of AsOf's views, which migrating makes, reads history as AsOf has, by the SQL PruneHistory
+// keeps the versions it reads by (byTime): changed there and not in a migration that makes the
+// views again, it reads otherwise, and this fails. Every table of the package's but history and
+// rbac_migrations has one.
+func TestAsOfViewsReadHistoryAsPruningKeepsIt(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	rows, err := tx.Query(ctx, `SELECT current_schema()::text, t.relname::text, array_agg(a.attname::text ORDER BY a.attnum)
+		FROM pg_class t JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum > 0 AND NOT a.attisdropped
+		WHERE t.relnamespace = current_schema()::regnamespace AND t.relkind = 'r' AND t.relname NOT IN ('rbac_history', 'rbac_migrations')
+		GROUP BY t.relname ORDER BY t.relname`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type table struct {
+		Schema, Name string
+		Columns      []string
+	}
+	tables, err := pgx.CollectRows(rows, pgx.RowToStructByPos[table])
+	if err != nil || len(tables) != 7 {
+		t.Fatalf("the package's tables: %+v, %v", tables, err)
+	}
+	views := viewsOf(t, h)
+	for _, tb := range tables {
+		want := rbac.AsOfView(tb.Schema, tb.Name, tb.Columns)
+		if want == "" {
+			t.Errorf("%s is read by no view of history", tb.Name)
+			continue
+		}
+		if _, err := tx.Exec(ctx, `CREATE TEMP VIEW `+tb.Name+` AS `+want); err != nil {
+			t.Fatal(err)
+		}
+		var made, built string
+		if err := tx.QueryRow(ctx, `SELECT pg_get_viewdef(($1 || '.' || $2)::regclass), pg_get_viewdef(('pg_temp.' || $2)::regclass)`,
+			views, tb.Name).Scan(&made, &built); err != nil {
+			t.Fatal(err)
+		}
+		if made != built {
+			t.Errorf("the view of %s reads\n%s\nnot, as byTime reads history,\n%s", tb.Name, made, built)
+		}
+	}
+}
+
+// AsOf's views read history with the rights of whoever reads them, never with their owner's, the
+// role that migrated, who may read all of it: a role that may read no history reads none through
+// them, and one that a row security policy on history shows one tenant's alone reads only that
+// tenant's, whatever tenant it sets them to read. They read history alone: in a session that never
+// set what they read by, they fail, and once a read as of a time has run in it, they read nothing or
+// fail, as with an empty cluster, never the tables.
+func TestAsOfViewsReadWithTheReadersRights(t *testing.T) {
+	h := setupOn(t, pgtest.Open(t, "pool_max_conns=1"))
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t2', 'cluster', 'c1', 'user', 'u', 'cluster.login')`); err != nil {
+		t.Fatal(err)
+	}
+	at := dbNow(t, h)
+	views := viewsOf(t, h)
+	var invoker, owned int
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE 'security_invoker=true' = ANY(reloptions)), count(*) FILTER (WHERE relowner = current_user::regrole)
+		FROM pg_class WHERE relnamespace = $1::regnamespace AND relkind = 'v'`, views).Scan(&invoker, &owned); err != nil || invoker != 7 || owned != 7 {
+		t.Fatalf("of 7 views, %d read with their reader's rights and %d are the migrating role's: %v", invoker, owned, err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// u's grants the views give, in a savepoint, as role where one is named, with nothing set for them
+	// to read by, or set to read tenant as of at.
+	grants := func(role, tenant string) (n int64, err error) {
+		err = pgx.BeginFunc(ctx, tx, func(s pgx.Tx) error {
+			if tenant != "" {
+				if _, err := s.Exec(ctx, `SELECT set_config('rbac.as_of_tenant', $1, true),
+					set_config('rbac.as_of', to_char($2::timestamptz AT TIME ZONE INTERVAL '00:00', 'YYYY-MM-DD HH24:MI:SS.US TZH BC'), true),
+					set_config('rbac.as_of_cluster', (pg_control_system()).system_identifier::text, true)`, tenant, at); err != nil {
+					return err
+				}
+			}
+			if role != "" {
+				if _, err := s.Exec(ctx, `SET LOCAL ROLE `+role); err != nil {
+					return err
+				}
+			}
+			return s.QueryRow(ctx, `SELECT count(*) FROM `+views+`.rbac_grants WHERE principal = 'user:u'`).Scan(&n)
+		})
+		return n, err
+	}
+	if n, err := grants("", ""); sqlState(err) != "42704" {
+		t.Errorf("never set in the session, the views read %d of u's grants: %v", n, err)
+	}
+	if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(*rbac.Authorizer) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := grants("", ""); n != 0 || err != nil && sqlState(err) != "22P02" {
+		t.Errorf("once a read as of a time has run in the session, the views read %d of u's grants, the tables 2: %v", n, err)
+	}
+	for _, tenant := range []string{"t1", "t2"} {
+		if n, err := grants("", tenant); err != nil || n != 1 {
+			t.Errorf("as the role that migrated, the views read %d of u's grants in %s: %v", n, tenant, err)
+		}
+	}
+	reader, schema := role(t, tx)
+	for _, sql := range []string{
+		`GRANT USAGE ON SCHEMA ` + pgx.Identifier{schema}.Sanitize() + `, ` + views + ` TO ` + reader,
+		`GRANT SELECT ON ALL TABLES IN SCHEMA ` + views + ` TO ` + reader,
+	} {
+		if _, err := tx.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := grants(reader, "t1"); sqlState(err) != "42501" {
+		t.Errorf("a role that may read no history reads it through the views: %v", err)
+	}
+	for _, sql := range []string{
+		`GRANT SELECT ON rbac_history TO ` + reader,
+		`ALTER TABLE rbac_history ENABLE ROW LEVEL SECURITY`,
+		`CREATE POLICY t1 ON rbac_history FOR SELECT TO ` + reader + ` USING (tenant IN ('t1', ''))`,
+	} {
+		if _, err := tx.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for tenant, want := range map[string]int64{"t1": 1, "t2": 0} {
+		if n, err := grants(reader, tenant); err != nil || n != want {
+			t.Errorf("a role shown t1's history alone reads %d of u's grants in %s through the views, not %d: %v", n, tenant, want, err)
+		}
+	}
+}
+
+// A statement of AsOf's read that leaves the search_path set otherwise, or what its views read the
+// tenant, the time or the cluster by, has the statements after it read another tenant or time, or
+// the tables as they are now, so AsOf fails once read returns, the host's query and a hook's alike;
+// one that a savepoint of its own sets and rolls back leaves AsOf's read as it was.
+func TestAsOfFailsWhereItsReadSetsWhatItReadsBy(t *testing.T) {
+	var hook string
+	h := setup(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "sets", Deny: func(ctx context.Context, q rbac.DB, _ rbac.ConstraintInput) (bool, error) {
+			if hook == "" {
+				return false, nil
+			}
+			_, err := q.Exec(ctx, hook)
+			return false, err
+		}}}
+	})
+	ctx := t.Context()
+	owner := h.as(t, "owner")
+	at := dbNow(t, h)
+	for _, set := range []string{
+		`SELECT set_config('search_path', current_schema() || ', pg_temp', true)`,
+		`RESET search_path`,
+		`RESET ALL`,
+		`SELECT set_config('rbac.as_of_tenant', 't2', true)`,
+		`SELECT set_config('rbac.as_of', '2000-01-01 00:00:00.000000 +00 AD', true)`,
+		`SELECT set_config('rbac.as_of_cluster', '1', false)`,
+	} {
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, by := range []string{"the host", "a hook"} {
+			err := pgx.BeginFunc(ctx, tx, func(host pgx.Tx) error {
+				return h.authz.WithTx(host).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+					if by == "a hook" {
+						hook = set
+						defer func() { hook = "" }()
+					} else if _, err := host.Exec(ctx, set); err != nil {
+						return err
+					}
+					// As a review records what each check answers, which stands only where AsOf
+					// returns nil.
+					_ = a.Authorize(ctx, owner, login, cluster)
+					return nil
+				})
+			})
+			if !errors.Is(err, rbac.ErrInvalid) {
+				t.Errorf("a read in which %s ran %s: %v", by, set, err)
+			}
+		}
+		if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+			if err := pgx.BeginFunc(ctx, tx, func(s pgx.Tx) error {
+				_, err := s.Exec(ctx, set)
+				return errors.Join(err, errRolledBack)
+			}); !errors.Is(err, errRolledBack) {
+				return err
+			}
+			return a.Authorize(ctx, owner, login, cluster)
+		}); err != nil {
+			t.Errorf("a read that ran %s in a savepoint it rolled back: %v", set, err)
+		}
+		_ = tx.Rollback(ctx)
+	}
+}
+
+var errRolledBack = errors.New("rolled back")
+
+// AsOf reads its views first, and then the session's own tables before any schema's, as a
+// search_path that doesn't name pg_temp reads them: one that names it, however written, is refused,
+// as AsOf would read the session's tables before the package's, where the search_path names it
+// after the package's schema, and where it names it before, the current schema is the session's.
+func TestAsOfReadsTheSessionsTablesFirstAsTheSearchPathDoes(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	u := h.as(t, "u")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	at := dbNow(t, h)
+	if err := h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "u")}); err != nil {
+		t.Fatal(err)
+	}
+	var schema string
+	if err := h.pool.QueryRow(ctx, `SELECT quote_ident(current_schema())`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	for path, refused := range map[string]bool{
+		schema:                             false,
+		`"$user", nowhere,` + schema:       false,
+		schema + `, "PG_TEMP"`:             false,
+		`pg_temp, ` + schema:               true,
+		`nowhere,pg_temp ,` + schema:       true,
+		`"$user", ` + schema + `, pg_temp`: true,
+		schema + `, "pg_temp"`:             true,
+		schema + `,PG_TEMP`:                true,
+	} {
+		err := pgx.BeginFunc(ctx, h.pool, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, `SELECT set_config('search_path', $1, true)`, path); err != nil {
+				return err
+			}
+			return h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error { return a.Authorize(ctx, u, login, cluster) })
+		})
+		if refused && !errors.Is(err, rbac.ErrInvalid) || !refused && err != nil {
+			t.Errorf("as of when u held its login, with the search_path %s: %v", path, err)
+		}
+	}
+}
+
+// AsOf reads each of the package's tables by its view, which migrating makes: where one is missing,
+// or the schema of them is, or the role reading has no USAGE on it, which the search_path then
+// leaves out, it refuses, rather than read that table as it is now. Made again, as a migration that
+// changes a table makes them, they are read again.
+func TestAsOfReadsNoTableWithoutItsView(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	u := h.as(t, "u")
+	at := dbNow(t, h)
+	if err := h.authz.SetDeny(ctx, guardian, cluster, rbac.Deny{ID: "d", Principals: []rbac.Principal{u.Principal}, Permissions: []rbac.Permission{root}}); err != nil {
+		t.Fatal(err)
+	}
+	views := viewsOf(t, h)
+	read := func() error {
+		return h.authz.AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+			if denies, err := a.Denies(ctx, "t1", []rbac.Scope{cluster.Scope()}); err != nil || len(denies) != 0 {
+				return fmt.Errorf("as of before the deny, Denies = %+v, %w", denies, err)
+			}
+			return nil
+		})
+	}
+	for _, drop := range []string{`DROP VIEW ` + views + `.rbac_denies`, `DROP SCHEMA ` + views + ` CASCADE`} {
+		if _, err := h.pool.Exec(ctx, drop); err != nil {
+			t.Fatal(err)
+		}
+		if err := read(); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("after %s: %v", drop, err)
+		}
+	}
+	if _, err := h.pool.Exec(ctx, `SELECT rbac_as_of_views()`); err != nil {
+		t.Fatal(err)
+	}
+	if err := read(); err != nil {
+		t.Errorf("with the views made again: %v", err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	reader, schema := role(t, tx)
+	for _, sql := range []string{
+		`GRANT USAGE ON SCHEMA ` + pgx.Identifier{schema}.Sanitize() + ` TO ` + reader,
+		`GRANT SELECT ON ALL TABLES IN SCHEMA ` + pgx.Identifier{schema}.Sanitize() + `, ` + views + ` TO ` + reader,
+		`SET LOCAL ROLE ` + reader,
+	} {
+		if _, err := tx.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(*rbac.Authorizer) error { return nil }); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("as a role with no USAGE on the views' schema: %v", err)
+	}
+}
+
+// AsOf's read takes no transaction id, on a transaction of its own or a host's that has taken none,
+// so History and Export read a change that commits while it runs, as they read no record of a
+// transaction that took its id after one still running.
+func TestAsOfHoldsNoExportBack(t *testing.T) {
+	var held []*string
+	h := setup(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "xid", Deny: func(ctx context.Context, q rbac.DB, _ rbac.ConstraintInput) (bool, error) {
+			var xid *string
+			err := q.QueryRow(ctx, `SELECT pg_current_xact_id_if_assigned()::text`).Scan(&xid)
+			held = append(held, xid)
+			return false, err
+		}}}
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+	owner := h.as(t, "owner")
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exported to the end, as of now.
+	checkpoint := rbac.Checkpoint{}
+	for {
+		records, next, err := h.authz.Export(ctx, checkpoint, rbac.MaxHistory, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if checkpoint = next; len(records) == 0 {
+			break
+		}
+	}
+	at := dbNow(t, h)
+	for i, onHosts := range []bool{false, true} {
+		reading, release := make(chan error, 1), make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			read := func(a *rbac.Authorizer) error {
+				held = nil
+				err := a.Authorize(ctx, owner, login, cluster)
+				if err == nil && (len(held) == 0 || held[0] != nil) {
+					err = fmt.Errorf("a check in the read ran in transaction %v", held)
+				}
+				reading <- err
+				select {
+				case <-release:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			if !onHosts {
+				done <- h.authz.AsOf(ctx, "t1", at, read)
+				return
+			}
+			done <- pgx.BeginFunc(ctx, h.pool, func(tx pgx.Tx) error { return h.authz.WithTx(tx).AsOf(ctx, "t1", at, read) })
+		}()
+		select {
+		case err := <-reading:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		// A change committed while the read runs, which History reads once every transaction in the
+		// cluster older than it has ended, as other sessions sharing it can hold one for a while.
+		h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, fmt.Sprint("u", i)))
+		var records []rbac.Record
+		for {
+			got, next, err := h.authz.Export(ctx, checkpoint, rbac.MaxHistory, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkpoint, records = next, append(records, got...)
+			if len(records) > 0 {
+				break
+			}
+			select {
+			case <-time.After(10 * time.Millisecond):
+			case <-ctx.Done():
+				t.Fatalf("on the host's transaction %t, a change committed while AsOf read wasn't exported while it read: %v", onHosts, ctx.Err())
+			}
+		}
+		if principal := fmt.Sprint("u", i); !slices.ContainsFunc(records, func(r rbac.Record) bool { return r.Principal.ID == principal }) {
+			t.Errorf("on the host's transaction %t, exported %+v while AsOf read", onHosts, records)
+		}
+		close(release)
+		if err := <-done; err != nil {
+			t.Fatal(err)
 		}
 	}
 }
