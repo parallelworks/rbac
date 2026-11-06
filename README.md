@@ -762,7 +762,7 @@ temporary objects: the roles below revoke `TEMPORARY` on the database from `PUBL
 none of them, as no call of the package's makes a temporary object, `AsOf`'s included, so none of
 them makes any, and against them the defense holds. So the application's role can hold a change's
 commit past its commit record only through the host's code that runs as the transaction commits, as
-a deferred trigger or constraint of the host's, which can check a row the role can lock, or for as
+a deferred trigger of the host's or a deferred constraint checking a row the role can lock, or for as
 long as the operator's settings of synchronous replication and prepared transactions let it; a role
 given `TEMPORARY` can hold it too by the temporary tables its session makes, for as long as dropping
 or emptying them takes, which a large `temp_buffers` lengthens, and by a temporary object's own
