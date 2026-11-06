@@ -705,27 +705,34 @@ committed.
 A transaction's commit record is written as it commits, by a trigger deferred to the commit, after
 every change it made, and so what a time reads is final once every transaction whose commit record
 is dated by then is one other sessions see: a commit counted by a time, but not yet seen, is one
-still running the rest of its commit, as the host's own deferred triggers and constraints checked
-after its last change to the package's tables; one waiting for synchronous replication, as long as
+still running the rest of its commit; one waiting for synchronous replication, as long as
 `synchronous_standby_names` and the session's `synchronous_commit` have it wait, which a session can
 set to `remote_apply` to wait for a standby to replay it; or one prepared for two-phase commit,
-whose deferred triggers fire, and whose commit is recorded, as it is prepared, not committed.
-`pg_stat_activity` lists a session in its commit, with `COMMIT` as its query, or waiting on
-`SyncRep`, and `pg_prepared_xacts` a prepared transaction until it is committed or rolled back; keep
-`max_prepared_transactions` at 0, the default, so none is. Any session can fire a transaction's
-deferred triggers before it commits, with `SET CONSTRAINTS ALL IMMEDIATE`, which takes no privilege,
-and then hold the transaction open, so that trigger refuses to be fired so, and the transaction with
-it, as it refuses a transaction that declares a cursor `WITH HOLD`, which committing runs to its
-end, or a session that has a deferrable trigger on a temporary table, which fires as it commits:
-either would run a session's own code after the commit record was written. A rollback to a savepoint
-taken before setting constraints immediate leaves the transaction's changes to be dated as it
-commits. A host transaction that sets its own constraints immediate names them, not `ALL`. So the
-application's role can hold a change's commit past its commit record only through the host's code
-that runs as the transaction commits, as a deferred trigger of the host's that reads a table by a
-name a temporary table can take, or for as long as the operator's settings of synchronous
-replication and prepared transactions let it; with `track_commit_timestamp` on,
-`pg_xact_commit_timestamp` of a record's `TxID`, while the server keeps it, shows when the
-transaction's commit was written, which an auditor can compare with its `CommittedAt`.
+whose deferred triggers fire, and whose commit is recorded, as it is prepared, not committed. The
+rest of a commit is the host's own deferred triggers and constraints of statements after its last
+change to the package's tables, and what they wait for, as a deferred foreign key's check waits for
+a row another session has locked; the session's temporary tables made `ON COMMIT DROP` or `ON COMMIT
+DELETE ROWS`, which it drops or empties, about half a millisecond each, so a session with thousands
+holds its commit back for a second or so; and no lock it waits for longer than 100 ms, where the
+session's `lock_timeout` is longer, as another session that holds one of those temporary tables
+would have it wait, or past which it fails with SQLSTATE 55P03. `pg_stat_activity` lists a session
+in its commit, with `COMMIT` as its query, or waiting on `SyncRep`, and `pg_prepared_xacts` a
+prepared transaction until it is committed or rolled back; keep `max_prepared_transactions` at 0,
+the default, so none is. Any session can fire a transaction's deferred triggers before it commits,
+with `SET CONSTRAINTS ... IMMEDIATE`, which takes no privilege, and then hold the transaction open:
+the trigger, so fired, defers itself again, and records the commit anew as the transaction commits,
+which `AsOf` counts it from, as its latest. It refuses a transaction that declares a cursor `WITH
+HOLD`, which committing runs to its end, also one a procedure or a `DO` block declares in a
+transaction after it committed, and a session that has an enabled deferrable trigger on a temporary
+table, which fires as it commits: either would run a session's own code after the commit record was
+written. So the application's role can hold a change's commit past its commit record only through
+the host's code that runs as the transaction commits, as a deferred trigger of the host's that reads
+a table by a name a temporary table can take, or a deferred constraint checking a row the role can
+lock; by the temporary tables a session makes, for as long as dropping or emptying them takes; or
+for as long as the operator's settings of synchronous replication and prepared transactions let it.
+With `track_commit_timestamp` on, `pg_xact_commit_timestamp` of a record's `TxID`, while the server
+keeps it, shows when the transaction's commit was written, which an auditor can compare with its
+`CommittedAt`.
 `AsOf` makes no change: one tried is no actor's attempt, and
 `Config.OnRefused` isn't told of it. It writes all the same: the temporary views it reads history
 through are rows of the catalog, for which its transaction takes a transaction id and holds it until
@@ -749,7 +756,11 @@ planned over history, they cost past `jit_above_cost` for an ordinary subject: a
 compiling, and 110 ms without. It tests each version a statement reads for a later one by its
 row's key, and `Holders` looks each identity's membership of the tenant up by its key, so
 history's statistics, which autovacuum leaves until a tenth of it is new, change no read's cost by
-much: a read of thousands of rows costs a few pages for each version. Joined to a group's members
+much: a read of thousands of rows costs a few pages for each version. It looks a version's commit
+record up only where its transaction was no older than the oldest one running as the latest commit
+record by then was written, which each holds, so a transaction left open anywhere in the cluster,
+holding that back, costs a read as of a time after it a page or so more for each version written
+since it began. Joined to a group's members
 by such statistics, the tenant's memberships were read again for each member, so `Holders` of a
 group of 4,000 took 52 seconds, and 90 ms looked up by key. A list counts
 the denies on scopes of its types by history's versions of them, at most a few, and `Grantable`,
@@ -772,9 +783,8 @@ transaction of its own, so however long history is, none holds exports back for 
 that deletes records is recorded in history, with the last record it deleted in `History`'s order,
 dated when its statement began, as any change is, so never before its `before` or a record it
 deleted; one that deletes none changes nothing, and is not. A transaction that only prunes records
-no commit, as no read counts a prune from one, so a host's transaction may set constraints immediate
-around a prune. `History` refuses the cursor of an export that began before a prune where it is
-before the last record the prune deleted, as that export would read on
+no commit, as no read counts a prune from one. `History` refuses the cursor of an export that began
+before a prune where it is before the last record the prune deleted, as that export would read on
 past what the prune deleted, so where several exports read history, `through` is the cursor of the
 one furthest behind. It finds the prunes by the last record each deleted, so a prune through an
 export's cursor, which deletes nothing the export hasn't read, costs its reads nothing, however
@@ -998,12 +1008,24 @@ against, and nothing such a table runs, as its row security policy, runs as hist
   changes go on, can't run in the transaction `Migrate` applies a migration in. It replaces
   `rbac_record`, which keeps its owner and who may execute it, so history's role still owns it, and
   adds the constraint trigger `rbac_history_committed`, which runs it as each transaction that
-  changes the tables commits, to write the transaction's commit record as history's role. Its
-  checks of what a record's entity and op are, wider than those they replace, which held every
-  record, are added without reading history (`NOT VALID`). Run `History`, `Export` and
-  `PruneHistory` only from code at or after it: earlier code exports a transaction's commit record
-  as a record of its own, which a later export doesn't, so the two chain history apart, and prunes
-  by the records' own dates, deleting versions `AsOf` now reads.
+  changes the tables commits, to write the transaction's commit record as history's role. Its checks
+  of what a record's entity and op are, wider than those they replace, which held every record, are
+  added without reading history (`NOT VALID`). Run `History`, `Export` and `PruneHistory` only from
+  code at or after it: earlier code exports a transaction's commit record as a record of its own,
+  which a later export doesn't, so the two chain history apart, and prunes by the records' own
+  dates, deleting versions `AsOf` now reads; its `AsOf` counts changes from their own dates, as
+  before. From it on, a transaction that changes the package's tables, the package's own or a
+  host's, fails as it commits with SQLSTATE 0A000 where it declared a cursor `WITH HOLD`, or where
+  its session has an enabled deferrable trigger on a temporary table: declare the cursor in a
+  transaction of its own, or without `HOLD`, and drop or disable the trigger, make it `NOT
+  DEFERRABLE`, or change the package's tables on another connection. The rest of its commit, from
+  its commit record on, waits for a lock at most 100 ms where its `lock_timeout` is longer, and
+  fails past it with SQLSTATE 55P03, as where another session holds one of its session's temporary
+  tables, or a transaction with `NOTIFY` waits behind many others committing theirs: retry it. A
+  host transaction may set its constraints immediate, by name or `ALL`, before or after its changes:
+  `rbac_history_committed` is deferred again as it fires. And `AsOf` under `WithTx` no longer counts
+  the host transaction's own changes, which haven't committed, where earlier code counted those
+  dated by its time: read them after the transaction commits.
   Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
   rolling upgrade across the two is unsafe: they key every lock apart, so a change by one waits for
   none by the other, and what each checks under its locks can change before it commits, as two
@@ -1053,10 +1075,11 @@ against, and nothing such a table runs, as its row security policy, runs as hist
   what `Config.OnRefused` is told, can still read it forever. Changes to the same rows wait for
   each other by locks named for the schema holding the tables, so sessions reaching them through
   different search_paths still do. A host's transaction that changes the package's tables commits
-  having set constraints immediate only by name, never `ALL`, declared no cursor `WITH HOLD`, and
-  with no deferrable trigger on a temporary table of its session: history refuses each, as it would
-  have its changes counted before they commit (see History). The error, SQLSTATE 0A000, comes from
-  the statement that sets constraints immediate, or the first change after it, or the commit.
+  having declared no cursor `WITH HOLD`, and with no enabled deferrable trigger on a temporary table
+  of its session: history refuses each as the transaction commits, with SQLSTATE 0A000, as it would
+  have its changes counted before they commit (see History), or where constraints were set
+  immediate, as the statement that did, or the first change after it. And the rest of its commit
+  waits for no lock past 100 ms, failing with SQLSTATE 55P03, where its `lock_timeout` is longer.
 - **What the host passes:** a check reads grants, memberships and groups as they are; only compiled
   conditions are cached. Read a resource's ancestors and attributes from where they are stored,
   never from request input, no earlier than the content they protect, and from the primary. A

@@ -1096,22 +1096,27 @@ flowchart LR
 - **Commit records.** No other session sees a change before its transaction commits, which a host's
   transaction, or the package's own while `Config.OnChange` runs, can put off. So each transaction
   that changes the tables writes, as it commits, a record of when it did (entity and op `commit`, in
-  no tenant), and AsOf counts each change from it, or from the change's own date where that is
-  later. The constraint trigger `rbac_history_committed`, deferred to the commit, runs `rbac_record`
-  as history's role for each record the transaction wrote, and the event of its last, by id, writes
-  the commit record, dated by the clock then. A session can fire deferred triggers early with
-  `SET CONSTRAINTS ... IMMEDIATE` and hold the transaction open: the commit record's own event fires
-  inside the trigger that wrote it, a level deeper than at the commit, so it is refused there, and
-  the transaction with it. A cursor `WITH HOLD` the transaction declared, and a deferrable trigger
-  on a temporary table, would run the session's own code after the commit record as it commits, so a
-  transaction with either is refused too. What runs after it is the rest of the commit: the host's
-  own deferred triggers and constraints, the wait for synchronous replication, and for a prepared
-  transaction, everything until `COMMIT PREPARED`. A transaction that committed before
-  `0027_commit_dates` has none, and its changes count from their own dates. `History` returns no
-  commit record, but each record with its transaction's (`Record.CommittedAt`), which the chain
-  covers as every other field; a prune deletes it with the last of its transaction's other records.
-  What AsOf reads of a time is final once every transaction whose commit record is dated by then is
-  seen by others.
+  no tenant, keyed by nothing), and AsOf counts each change from it, or from the change's own date
+  where that is later. The constraint trigger `rbac_history_committed`, deferred to the commit, runs
+  `rbac_record` as history's role for each record the transaction wrote, and the event of its last,
+  by id, writes the commit record, dated by the clock then, with the oldest transaction then
+  running. A session can fire deferred triggers early with `SET CONSTRAINTS ... IMMEDIATE` and hold
+  the transaction open: the commit record's own event fires inside the trigger that wrote it, a
+  level deeper than at the commit, so there it defers the trigger again, by name, and writes a
+  record dated -infinity, which no read counts from, whose event records the commit anew as it
+  commits; AsOf counts from the latest. A cursor `WITH HOLD` the transaction declared, also in a
+  procedure's or a `DO` block's later transaction, whose creation time is the block's, and an
+  enabled deferrable trigger on a temporary table, would run the session's own code after the commit
+  record as it commits, so a transaction with either is refused. What runs after it is the rest of
+  the commit: the host's own deferred triggers and constraints of statements after its last change,
+  the session's temporary tables dropped or emptied, about half a millisecond each, waiting for no
+  lock past 100 ms, as another session can hold one of those tables, the wait for synchronous
+  replication, and for a prepared transaction, everything until `COMMIT PREPARED`. A transaction
+  that committed before `0027_commit_dates` has none, and its changes count from their own dates.
+  `History` returns no commit record, but each record with its transaction's (`Record.CommittedAt`),
+  which the chain covers as every other field; a prune deletes it with the last of its transaction's
+  other records. What AsOf reads of a time is final once every transaction whose commit record is
+  dated by then is seen by others.
 - **History's order.** `History` reads records in transaction order, by the id each transaction
   takes at its first write, and only those of transactions older than every transaction still
   running, which have all ended. So a cursor never passes a record that commits later. That is
@@ -1177,7 +1182,9 @@ flowchart LR
   grants by principal and type, which history's index of a principal's versions holds beside the
   scope, as a check seeks them on its resource's path. A version counts by a time from its date, or
   its transaction's commit record where that is later, looked up by its transaction in history's
-  index of commit records. Each version a view finds is its row's last where no later one, by id,
+  index of commit records only where the transaction is no older than the oldest one running as the
+  latest commit record by then was written, which that record holds, and which AsOf reads once:
+  every older one had ended by then, and others saw what it committed. Each version a view finds is its row's last where no later one, by id,
   counts by then, a test of each on its own, by its key in history's index of an entity's versions,
   which orders a row's versions by date and those of one date by id, latest first: since commits
   are recorded no version is dated before the one written before it, so the test reads the row's
