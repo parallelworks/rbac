@@ -46,11 +46,11 @@ var asOfEntities = []struct {
 // date (Record.EffectiveAt) where that is later; one of a transaction that committed before history
 // recorded commits, or that a logical dump carried from another cluster whose commit records are
 // gone, counts from its date, and one of the transaction AsOf reads in, which hasn't committed,
-// counts by no time. A commit record dates and bounds only versions of the cluster that wrote it, so
-// a restore into another cluster keeps its own commit dates and takes none from a colliding id. So
-// what a time reads can still change until every transaction whose
-// commit record is dated by then is one other sessions see: one waiting for synchronous
-// replication, or prepared for two-phase commit, is not yet.
+// counts by no time. A commit record dates only versions of the cluster that wrote it, so a restore
+// into another cluster keeps its own commit dates and takes none from a colliding id. So what a
+// time reads can still change until every transaction whose commit record is dated by then is one
+// other sessions see: one waiting for synchronous replication, or prepared for two-phase commit, is
+// not yet.
 // Hooks run as for any read, but in its transaction, which holds one of the pool's connections
 // until read returns: a constraint that reads the package's tables through the DB it is given reads
 // them as of the time too, and one that reads the host's reads them as they are now. A hook that
@@ -321,6 +321,11 @@ func (b byTime) counts(v string) string {
 // transaction the new cluster gave the same txid. One that committed before history recorded
 // commits, or that a restore carried from a cluster whose commit records are gone, counts as
 // committed, as its versions count from their dates; the transaction reading v hasn't committed.
+// settled is the current cluster's (settledBy), and bounds a version of any: one of a cluster this
+// one was upgraded from, which keeps xids, is older than every transaction this one ran, and one a
+// dump carried had committed before the dump, so before any commit record this cluster wrote after
+// restoring it. Only history of two clusters whose commits interleave in time, merged into one
+// schema, could hold a version the bound counts too early.
 func (b byTime) committedBy(v string) string {
 	return v + `.txid IS DISTINCT FROM pg_catalog.pg_current_xact_id_if_assigned()
 		AND (` + v + `.txid < ` + b.settled + `
@@ -379,18 +384,18 @@ func (b byTime) byCommit(h, dated, committed string) string {
 		  AND c.cluster IS NOT DISTINCT FROM ` + h + `.cluster) c)`
 }
 
-// clusterOf returns, as text, the identifier of the cluster tx reads (system_identifier), by which
-// AsOf trusts a commit record's dating only for records of the cluster that wrote them. A logical
-// dump restored into another cluster carries commit records of the cluster that wrote them, whose
-// xids restart in the new one, so their horizons and txids don't compare with it: a version is
-// matched to a commit record within its own cluster (committedBy, byCommit), and the settled horizon
-// read only from the current cluster's (settledBy), so restored data keeps its own commit dates and
-// no live change of the new cluster reads as committed. History tells generations apart the same way
+// clusterOf returns the identifier of the cluster tx reads (system_identifier), by which AsOf
+// trusts a commit record's dating only for records of the cluster that wrote them. A logical dump
+// restored into another cluster carries commit records of the cluster that wrote them, whose xids
+// restart in the new one, so their horizons and txids don't compare with it: a version is matched
+// to a commit record within its own cluster (committedBy, byCommit), and the settled horizon read
+// only from the current cluster's (settledBy), so restored data keeps its own commit dates and no
+// live change of the new cluster reads as committed. History tells generations apart the same way
 // (followable).
-func clusterOf(ctx context.Context, tx pgx.Tx) (string, error) {
-	var cluster string
-	if err := tx.QueryRow(ctx, `SELECT s.system_identifier::pg_catalog.text FROM pg_catalog.pg_control_system() s`).Scan(&cluster); err != nil {
-		return "", err
+func clusterOf(ctx context.Context, tx pgx.Tx) (int64, error) {
+	var cluster int64
+	if err := tx.QueryRow(ctx, `SELECT s.system_identifier FROM pg_catalog.pg_control_system() s`).Scan(&cluster); err != nil {
+		return 0, err
 	}
 	return cluster, nil
 }
@@ -403,7 +408,7 @@ func clusterOf(ctx context.Context, tx pgx.Tx) (string, error) {
 // sorting off, as history's index of an entity's versions alone gives that order, which where
 // history's statistics hold few commit records the planner would read them all by their index to
 // sort instead (unpruned).
-func settledBy(ctx context.Context, tx pgx.Tx, schema string, at time.Time, cluster string) (string, error) {
+func settledBy(ctx context.Context, tx pgx.Tx, schema string, at time.Time, cluster int64) (string, error) {
 	restore, err := planning(ctx, tx, unsorted)
 	if err != nil {
 		return "", err

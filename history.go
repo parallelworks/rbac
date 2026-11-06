@@ -514,6 +514,12 @@ type Record struct {
 	// cluster whose commit records are gone, and for a prune's, as a transaction that only prunes
 	// records no commit.
 	CommittedAt time.Time
+	// Cluster is the database cluster that wrote it, its system_identifier as text, which
+	// CommittedAt and AsOf match it to a commit record within: empty for a record written before
+	// 0027_commit_dates, and for a prune's. The chain hashes it, as rewriting it in storage, with
+	// its commit record's, could have a restored commit record's horizon count changes of this
+	// cluster as committed before they were, while every other field read the same.
+	Cluster string
 }
 
 // The instants a Record reads PostgreSQL's infinity and -infinity as, which no time it holds is.
@@ -687,7 +693,7 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 			SELECT id, txid, recorded_at, effective_at, tenant, entity, key, op, coalesce(principal, ''), coalesce(role, ''),
 			  coalesce(scope, ''), coalesce(group_id, ''), expires_at, before, after, actor, on_behalf_of, how, request, reason, db_user,
 			  (SELECT max(c.effective_at) FROM `+historyTable(schema)+` c WHERE c.entity = 'commit' AND c.txid = p.txid
-			    AND c.cluster IS NOT DISTINCT FROM p.cluster),
+			    AND c.cluster IS NOT DISTINCT FROM p.cluster), coalesce(p.cluster::pg_catalog.text, ''),
 			  $6::boolean AND `+prunedPast(historyTable(schema), "$1::pg_catalog.xid8", "$2", "$7::pg_catalog.xid8")+`,
 			  pg_snapshot_xmin(pg_current_snapshot())
 			FROM (
@@ -724,7 +730,8 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 			var recorded, effective, expires, committed pgtype.Timestamptz
 			var before, afterRow []byte
 			err := row.Scan(&r.ID, &r.TxID, &recorded, &effective, &r.Tenant, &r.Entity, &r.Key, &r.Op, &principal, &role,
-				&scope, &r.Group, &expires, &before, &afterRow, &actor, &onBehalfOf, &r.How, &r.Request, &r.Reason, &r.DBUser, &committed, &skipped, &oldest)
+				&scope, &r.Group, &expires, &before, &afterRow, &actor, &onBehalfOf, &r.How, &r.Request, &r.Reason, &r.DBUser, &committed, &r.Cluster,
+				&skipped, &oldest)
 			r.RecordedAt, r.EffectiveAt, r.ExpiresAt, r.CommittedAt = recordTime(recorded), recordTime(effective), recordTime(expires), recordTime(committed)
 			r.Principal, r.Scope, r.Actor, r.OnBehalfOf = parsePrincipal(principal), parseScope(scope), parsePrincipal(actor), parsePrincipal(onBehalfOf)
 			r.Role, r.Before, r.After = Role(role), before, afterRow

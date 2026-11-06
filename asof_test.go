@@ -2687,6 +2687,66 @@ func TestAsOfDatesARestoredChangeWithinItsCluster(t *testing.T) {
 	}
 }
 
+// History stamps each record with the cluster that wrote it, which it reads once a transaction and
+// keeps in a setting, rbac.cluster, that any session can set as well: a revoke stamped with another
+// cluster than its commit record would count from its own date, before it committed, as a restored
+// change whose commit records are gone does, and AsOf of a moment while it was held open would read
+// it as in force. The commit record checks every record of its transaction against the cluster the
+// server names, so a transaction that set it commits nothing, whenever it set it.
+func TestACommitRefusesRecordsStampedWithAnotherCluster(t *testing.T) {
+	h := setup(t)
+	_, theirs := otherCluster(t, h)
+	set := func(local bool, cluster string) string {
+		return fmt.Sprintf(`SELECT set_config('rbac.cluster', '%s', %t)`, cluster, local)
+	}
+	revoke := `DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:u'`
+	grantW := `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'w', 'cluster.login')`
+	for _, c := range []struct {
+		name    string
+		queries []string
+	}{
+		{name: "set for the revoke alone", queries: []string{set(true, theirs), revoke, set(true, "")}},
+		{name: "set for the transaction", queries: []string{set(true, theirs), revoke}},
+		{name: "set for the session", queries: []string{set(false, theirs), revoke}},
+		{name: "set after an early commit record", queries: []string{
+			revoke, `SET CONSTRAINTS ALL IMMEDIATE`, set(true, theirs), grantW, set(true, ""),
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := t.Context()
+			u, w := h.as(t, "u"), h.as(t, "w")
+			h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+			conn, err := pgx.ConnectConfig(ctx, h.pool.Config().ConnConfig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+			for _, q := range slices.Concat([]string{`BEGIN`}, c.queries) {
+				if _, err := conn.Exec(ctx, q); err != nil {
+					t.Fatalf("%s: %v", q, err)
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+			mid := dbNow(t, h)
+			h.now = mid
+			time.Sleep(20 * time.Millisecond)
+			_, err = conn.Exec(ctx, `COMMIT`)
+			if pgErr := (*pgconn.PgError)(nil); !errors.As(err, &pgErr) || pgErr.Code != "42501" {
+				// What it would have let through: the revoke, uncommitted as of mid, read as in force.
+				held := h.authz.AsOf(ctx, "t1", mid, func(a *rbac.Authorizer) error { return a.Authorize(ctx, u, login, cluster) })
+				t.Fatalf("a commit of records stamped with another cluster: %v; as of while it was held open, u's login: %v", err, held)
+			}
+			if err := h.authz.Authorize(ctx, u, login, cluster); err != nil {
+				t.Errorf("after the commit was refused, u's login: %v", err)
+			}
+			if err := h.authz.Authorize(ctx, w, login, cluster); !errors.Is(err, rbac.ErrDenied) {
+				t.Errorf("after the commit was refused, w's login: %v", err)
+			}
+		})
+	}
+}
+
 // Versions of a row dated alike, as every write of a DO block, a function or a query string of
 // several statements is, cost a read as of a time a few pages each, as versions dated apart do:
 // tested for a later one in history's index of an entity's versions, which ordered those of one

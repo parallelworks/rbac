@@ -1,6 +1,7 @@
 package rbac_test
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -533,12 +534,25 @@ func TestAChainedRecordIsEveryField(t *testing.T) {
 
 // The chain's encoding is fixed, so a checkpoint made with one Go, and verified with another or
 // in another language, holds. A checkpoint without a Horizon is signed as before Cursor had one,
-// and a record without a CommittedAt, as one of a transaction that committed before history
-// recorded commits, chains as before Record had one.
+// and a record without a CommittedAt or a Cluster, as one of a transaction that committed before
+// history recorded commits, chains as before Record had either. One with a Cluster but no
+// CommittedAt, as one a dump carried from a cluster whose commit records are gone, chains an empty
+// CommittedAt before it.
 func TestTheChainsEncodingIsFixed(t *testing.T) {
 	c := rbac.Genesis("g")
 	genesis := hex.EncodeToString(c.Hash[:])
 	committed, err := c.Chain([]rbac.Record{full()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamped := full()
+	stamped.Cluster = "7698052984130977836"
+	clustered, err := c.Chain([]rbac.Record{stamped})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamped.CommittedAt = time.Time{}
+	restored, err := c.Chain([]rbac.Record{stamped})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -555,6 +569,7 @@ func TestTheChainsEncodingIsFixed(t *testing.T) {
 	got := map[string]string{
 		"genesis": genesis, "link": hex.EncodeToString(c.Hash[:]), "digest": hex.EncodeToString(digest[:]),
 		"horizon": hex.EncodeToString(horizon[:]), "committed": hex.EncodeToString(committed.Hash[:]),
+		"clustered": hex.EncodeToString(clustered.Hash[:]), "restored": hex.EncodeToString(restored.Hash[:]),
 	}
 	want := map[string]string{
 		"genesis":   "928df9c16fcd6389159e046198b064eedcc7a780dfe164845c5fd47663f081ac",
@@ -562,6 +577,8 @@ func TestTheChainsEncodingIsFixed(t *testing.T) {
 		"digest":    "7dab694ab96cc22d6be1a0dab37af4f06c9cb1931c533e0843ad365ff0a89b8b",
 		"horizon":   "c4965b59b9651be1ddd59a15d7b4eb88949af51668d163ee1eeb6f6fc0cb2ce2",
 		"committed": "2ae926382b3b391249ac8a624910204494a632b3fb47eae0df99d3de9fdaf51f",
+		"clustered": "1ccba01a50885a14b9f451627456e2d8f362e44d4f2ebc10a70f81bc767b8958",
+		"restored":  "9b923726c183e672857445f1b8b654ef6c24e7927dba9a852ad061d32e844901",
 	}
 	if !maps.Equal(got, want) {
 		t.Errorf("%v, not %v", got, want)
@@ -631,6 +648,68 @@ func TestACheckpointVouchesForItsHorizon(t *testing.T) {
 	}
 	if err := rbac.VerifyChain(behind, records, next, key.Public()); !errors.Is(err, rbac.ErrUnverified) {
 		t.Errorf("records exported past what a prune deleted, after a checkpoint of an export begun before it: %v", err)
+	}
+}
+
+// AsOf reads the settled horizon from the current cluster's commit records alone, so a restored
+// commit record of another cluster, holding a horizon of that cluster's xids, bounds no change of
+// this one. Rewriting its cluster, and its version's, to this cluster's, as history's owner can,
+// leaves every other field History returns as it was, CommittedAt too, as the two still match, but
+// has its horizon count a revoke of this cluster's as in force while it was held open: so the chain
+// holds each record's cluster, and the rewritten history no longer verifies against what an export
+// kept.
+func TestTheChainHoldsTheClusterAsOfDatesARecordWithin(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	ours, theirs := otherCluster(t, h)
+	u := h.as(t, "u")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"), grant(cluster.Scope(), "cluster.login", rbac.User, "tmpl"))
+	restored := dbNow(t, h).UTC().Format("2006-01-02 15:04:05.999999+00")
+	restoreRows(t, h, fakeGrant("restored", restored, theirs, "9", false), fakeCommit(restored, theirs, "9", "18446744073709551000"))
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept, at := exportNext(t, h, rbac.Checkpoint{}, rbac.MaxHistory, key)
+	// A revoke of u's grant held open past mid.
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx, `DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:u'`); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	mid := dbNow(t, h)
+	time.Sleep(20 * time.Millisecond)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	held := func() error {
+		return h.authz.AsOf(ctx, "t1", mid, func(a *rbac.Authorizer) error { return a.Authorize(ctx, u, login, cluster) })
+	}
+	if err := held(); err != nil {
+		t.Fatalf("as of while the revoke was held open, u's login: %v", err)
+	}
+	for _, q := range []string{
+		`ALTER TABLE rbac_history DISABLE TRIGGER rbac_history_append_only`,
+		`UPDATE rbac_history SET cluster = ` + ours + ` WHERE txid = '9'`,
+		`ALTER TABLE rbac_history ENABLE ALWAYS TRIGGER rbac_history_append_only`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	if err := held(); !errors.Is(err, rbac.ErrDenied) {
+		t.Fatalf("as of while the revoke was held open, with the restored records' cluster rewritten, u's login: %v", err)
+	}
+	again, _ := exportNext(t, h, rbac.Checkpoint{}, rbac.MaxHistory, key)
+	if len(again) < len(kept) {
+		t.Fatalf("an export again read %d records, before %d", len(again), len(kept))
+	}
+	if err := rbac.VerifyChain(rbac.Genesis(at.Cursor.Generation), again[:len(kept)], at, key.Public()); !errors.Is(err, rbac.ErrUnverified) {
+		t.Errorf("history with a restored record's cluster rewritten, against the checkpoint kept before: %v", err)
 	}
 }
 

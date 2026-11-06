@@ -51,12 +51,16 @@
 -- deferred triggers as it is prepared, so its changes count from then, not from COMMIT PREPARED: keep
 -- max_prepared_transactions at 0.
 --
--- Each record holds the cluster that wrote it (system_identifier): AsOf trusts a commit record's
--- horizon and dating only for versions of its own cluster, so a logical dump restored into another
--- cluster, whose xids restarted, neither counts a live change as committed through a restored
--- horizon far above the new cluster's range, nor dates a restored change by a new transaction its
--- txid collides with. A version of another cluster, or of none (null, as every record before this
--- migration is), counts from its own date.
+-- Each record holds the cluster that wrote it (system_identifier): AsOf dates a version only by
+-- commit records of its own cluster, and reads the horizon only from the current cluster's, so a
+-- logical dump restored into another cluster, whose xids restarted, neither counts a live change as
+-- committed through a restored horizon far above the new cluster's range, nor dates a restored
+-- change by a new transaction its txid collides with. A version of another cluster with no commit
+-- record there, or of none (null, as every record before this migration is), counts from its own
+-- date. The stamp is the server's, whatever a session sets: the trigger keeps it in a setting of
+-- the transaction, which any session can set too, so the commit record checks every record of its
+-- transaction against the server's, and a transaction whose records name another cluster commits
+-- nothing.
 --
 -- AsOf tested each version of a row for a later one, and PruneHistory each for a later one by its
 -- time, in history's index of an entity's versions, by date: versions dated alike, as every write
@@ -99,7 +103,10 @@ LOCK TABLE rbac_history IN ACCESS EXCLUSIVE MODE;
 -- another cluster, or of none (null, as every record written before this migration is), counts from
 -- its effective_at, as those did. History tells generations apart the same way (followable). The
 -- column takes no default, so adding it reads no row; the trigger sets it on every record it writes.
-ALTER TABLE rbac_history ADD COLUMN cluster text COLLATE "C";
+-- A bigint, as system_identifier is: the indexes below hold it beside each version and commit
+-- record, where its text, 20 bytes to a bigint's 8, made the index of an entity's versions a fifth
+-- larger than a bigint does, and that of commit records two fifths.
+ALTER TABLE rbac_history ADD COLUMN cluster bigint;
 
 DROP INDEX rbac_history_entity;
 CREATE INDEX rbac_history_entity ON rbac_history (tenant, entity, key, effective_at DESC, id DESC) INCLUDE (txid, cluster)
@@ -141,7 +148,7 @@ DECLARE
     op     text;
     was_last timestamptz;
     ended  boolean;
-    cluster_id text;
+    cluster_id bigint;
 BEGIN
     -- A search_path reads $user, however it is quoted, as a role's name, and leaves out a schema
     -- the role has no USAGE on, so history would be found in pg_temp: refused before anything it
@@ -153,11 +160,14 @@ BEGIN
     END IF;
     -- The cluster writing the record, stamped on every one so AsOf trusts a commit record's dating
     -- only within the cluster that wrote it. Read once a transaction and held in a local setting, as
-    -- one statement writes many records: only pg_catalog is read, after the schema is checked.
-    cluster_id := pg_catalog.current_setting('rbac.cluster', true);
-    IF cluster_id IS NULL OR cluster_id = '' THEN
-        SELECT s.system_identifier::text INTO cluster_id FROM pg_catalog.pg_control_system() s;
-        PERFORM pg_catalog.set_config('rbac.cluster', cluster_id, true);
+    -- one statement writes many records, and reading the server's control file for each made 8,000
+    -- grants in one statement a seventh slower: only pg_catalog is read, after the schema is
+    -- checked. A session can set the setting too, so the commit record checks every record of its
+    -- transaction against the server's.
+    cluster_id := nullif(pg_catalog.current_setting('rbac.cluster', true), '')::bigint;
+    IF cluster_id IS NULL THEN
+        cluster_id := (pg_catalog.pg_control_system()).system_identifier;
+        PERFORM pg_catalog.set_config('rbac.cluster', cluster_id::text, true);
     END IF;
     -- A record history wrote, as rbac_history_committed fires it as its transaction commits.
     IF TG_TABLE_NAME = 'rbac_history' THEN
@@ -203,6 +213,17 @@ BEGIN
               AND d.refobjid = pg_catalog.pg_my_temp_schema() AND t.tgdeferrable AND t.tgenabled <> 'D') THEN
             RAISE EXCEPTION 'a session with a deferrable trigger on a temporary table commits no change to the package''s tables: committing fires it after history dates the changes'
                 USING ERRCODE = 'feature_not_supported', HINT = 'Drop or disable the trigger, or make it NOT DEFERRABLE.';
+        END IF;
+        -- Every record of the transaction this function stamped holds the cluster the server names,
+        -- as the setting it was stamped from can be any a session set: a version stamped with
+        -- another than its commit record would count from its own date, before the commit, as a
+        -- restored version whose commit records are gone does, and AsOf would read a revoke held
+        -- open as in force before it was. Read from the server here, not from the setting. A record
+        -- history's owner writes itself, with no cluster, as a prune's, is checked by no one's.
+        cluster_id := (pg_catalog.pg_control_system()).system_identifier;
+        IF EXISTS (SELECT FROM rbac_history h WHERE h.txid = pg_catalog.pg_current_xact_id() AND h.cluster <> cluster_id) THEN
+            RAISE EXCEPTION 'a transaction that changes the package''s tables sets no rbac.cluster: history stamps each record with the cluster that wrote it, which AsOf dates it by'
+                USING ERRCODE = 'insufficient_privilege', HINT = 'Reset rbac.cluster.';
         END IF;
         -- With the oldest transaction running as it is written, before its date: every one older had
         -- ended, and others saw what it committed, by then. So a read as of a time counts a change

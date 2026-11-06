@@ -619,9 +619,10 @@ a hook that can't be given its copy too.
 Every change to the package's tables is recorded in `rbac_history`: the row as it was and as it
 became, when, and the database role that wrote it; and each transaction that changes them records
 when it commits, which `History` returns with each of its records (`Record.CommittedAt`) rather
-than as a record of its own. A change through the package records its actor
-and the call that made it (`Record.How`), and what the host attaches with `rbac.WithAudit`: on whose
-behalf it was made, the request and the reason. An expiry `DeleteExpired` removes is recorded as
+than as a record of its own, and each record holds the cluster that wrote it (`Record.Cluster`, its
+`system_identifier`), within which a commit record dates it. A change through the package records
+its actor and the call that made it (`Record.How`), and what the host attaches with
+`rbac.WithAudit`: on whose behalf it was made, the request and the reason. An expiry `DeleteExpired` removes is recorded as
 one, made by no one. Triggers write it, so a write that bypasses the package is recorded too, as no
 one's. That context is what the session that wrote it says; the database role is what the database
 knows. The tables bound what they hold as the package bounds what it writes, but for the ids in
@@ -675,7 +676,15 @@ cursor was read, leaves nothing the database can tell from recovering from a cra
 nothing that committed, so its export would read on: restore by recovering to a point in time, which
 starts a new generation, or export each generation from the start again after a restore. Move
 history with physical backups and replicas; a logical dump restored into another cluster numbers its
-transactions anew.
+transactions anew. `AsOf` still dates a restored change by its own commit record, as a commit record
+dates only changes of its own cluster, and a restored change whose commit record is gone counts from
+its own date. Restore such a dump into a cluster's schema that holds no history of its own from a
+time the dump covers, and never bring back rows of a timeline a recovery to a point in time left
+behind, which keep the cluster's identifier while the new timeline numbers their transactions
+again: either would have `AsOf` date a change by another transaction's commit. `pg_upgrade` gives
+the cluster a new identifier and keeps its transaction ids, so `AsOf` answers as before, but a read
+as of a time before the upgrade finds no commit record of the cluster's by then, and looks up every
+version's commit record, about a quarter more pages of history.
 
 A change refused, as `ErrDenied` or `ErrInvalid`, writes nothing, so history doesn't record it:
 `Config.OnRefused` is told of each, with its actor, the call and the host's audit, to record the
@@ -1053,7 +1062,8 @@ can leave the application's role without it. The administrator's and history's r
   statistics from before they were made, every grant in the table was read. Code from before it
   and after it run beside each other, applied or not: only what those reads cost turns on it.
   `0027_commit_dates` locks history against reads and writes until it commits, so every change, as
-  each writes history, and every read of history, as `AsOf` and an export, waits for it; it rebuilds
+  each writes history, and every read of history, as `AsOf` and an export, waits for it; it adds
+  history's `cluster` column, null for every record before it, which reads no row, rebuilds
   history's index of an entity's versions and its index of scopes, and builds an index of commit
   records, each of which reads all of history: 3 seconds for 500,000 records, 631 MB of history, on
   a test server, and in proportion to history's size. `CREATE INDEX CONCURRENTLY`, which would let
@@ -1073,8 +1083,10 @@ can leave the application's role without it. The administrator's and history's r
   DEFERRABLE`, or change the package's tables on another connection. The rest of its commit, from
   its commit record on, waits for a lock at most 100 ms where its `lock_timeout` is longer, and
   fails past it with SQLSTATE 55P03, as where another session holds one of its session's temporary
-  tables, or a transaction with `NOTIFY` waits behind many others committing theirs: retry it. A
-  host transaction may set its constraints immediate, by name or `ALL`, before or after its changes:
+  tables, or a transaction with `NOTIFY` waits behind many others committing theirs: retry it. It
+  fails with SQLSTATE 42501 where its session set `rbac.cluster`, the setting history stamps each
+  record's cluster from, to another than the server's: reset it. A host transaction may set its
+  constraints immediate, by name or `ALL`, before or after its changes:
   `rbac_history_committed` is deferred again as it fires. And `AsOf` under `WithTx` no longer counts
   the host transaction's own changes, which haven't committed, where earlier code counted those
   dated by its time: read them after the transaction commits.

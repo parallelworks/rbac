@@ -5615,9 +5615,16 @@ func TestHistoryReturnsWhenEachRecordsTransactionCommitted(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := drain(t, h, &cursor, 2)
+	var cluster string
+	if err := h.pool.QueryRow(ctx, `SELECT system_identifier::text FROM pg_control_system()`).Scan(&cluster); err != nil {
+		t.Fatal(err)
+	}
 	for _, r := range got {
 		if r.Entity == "commit" || r.CommittedAt.IsZero() || !r.CommittedAt.Equal(got[0].CommittedAt) || r.CommittedAt.Before(ran) || r.CommittedAt.Before(r.EffectiveAt) {
 			t.Errorf("record %+v, of a transaction that ran to %v", r, ran)
+		}
+		if r.Cluster != cluster {
+			t.Errorf("record %+v, written in cluster %s", r, cluster)
 		}
 	}
 }
@@ -5691,7 +5698,7 @@ func TestAChangeCommittedBeforeHistoryRecordedCommitsKeepsItsDate(t *testing.T) 
 		t.Fatal(err)
 	}
 	for _, r := range drain(t, h, &cursor, n) {
-		if r.Entity == "grant" && r.Op == "delete" && (r.CommittedAt.IsZero() != (r.Principal.ID == "u")) {
+		if r.Entity == "grant" && r.Op == "delete" && (r.CommittedAt.IsZero() != (r.Principal.ID == "u") || (r.Cluster == "") != (r.Principal.ID == "u")) {
 			t.Errorf("revoke %+v", r)
 		}
 	}

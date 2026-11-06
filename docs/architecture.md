@@ -1232,39 +1232,55 @@ flowchart LR
   index of commit records only where the transaction is no older than the oldest one running as the
   latest commit record by then was written, which that record holds, and which AsOf reads once:
   every older one had ended by then, and others saw what it committed. Each record holds the cluster
-  (`system_identifier`) that wrote it, and a commit record dates a version and sets that horizon only
-  for versions of its own cluster: a logical dump restored into another cluster carries commit
-  records whose xids restarted there, so one's horizon, far above the new cluster's range, would
-  count every live change as committed, and one's txid, colliding with a new transaction's, would
-  date a restored change by that transaction's commit. A restored version matches its own cluster's
-  commit record, so it keeps its dates; one of a cluster whose commit records are gone, or written
-  before `0027_commit_dates` (null cluster), counts from its own date. `History` tells generations
-  apart the same way. Each version a view finds is its row's last where no later one, by id,
-  counts by then, a test of each on its own, by its key in history's index of an entity's versions,
-  which orders a row's versions by date and those of one date by id, latest first: since commits
-  are recorded no version is dated before the one written before it, so the test reads the row's
-  latest version dated by then after it, and only where that one doesn't count, its transaction
-  committed later, reads on from the version in that order until the first that counts, each
-  version between two counted read once, whatever their dates; a read on from the version alone,
-  against the index's order, read the page before the version's, of another row, wherever a row's
-  last was first on its page. One written before reads the row's versions dated by then from the
-  latest, as a release before 0006 could date a version before one written earlier. A few pages for
-  each version, however stale history's statistics. That index ordered versions of one date by their
-  places, so versions dated alike, as every write of a `DO` block is, each read every one before it.
-  As a join, by statistics from before most of history was written, as autovacuum leaves them until
-  a tenth of it is new, it read every version of the entity in the tenant for each version found,
-  the key only a filter, so a check took seconds; a read of thousands of rows costs more than such a
-  join planned by fresh statistics, which reads their versions together. That index holds the
-  versions of grants, eligibilities and places in groups only for a read that names their key, as
-  PostgreSQL proves a partial index's predicate from a query's conditions, and history's index of
-  scopes holds them only for one that names a scope, so a read of them by their principal, scope,
-  role or group seeks them in the index leading to it: by statistics that counted the tenant's rows
-  of them as a few, a plan read every one in the tenant through either instead. `Holders` looks each
-  identity's membership of the tenant up on its own, by its key, which the view of memberships gives
-  as the principal: joined to a group's members, or looked up by the principal history copies beside
-  the entity, it read, by such statistics, every membership in the tenant again for each member. The
-  view of custom roles takes each one's newest version, testing none for a later one, so
-  `Grantable`, which can offer any, reads each version once.
+  (`system_identifier`, a bigint the indexes of an entity's versions and of commit records hold
+  beside each) that wrote it. A commit record dates only versions of its own cluster, and the
+  horizon is read only from the current cluster's: a logical dump restored into another cluster
+  carries commit records whose xids restarted there, so one's horizon, far above the new cluster's
+  range, would count every live change as committed, and one's txid, colliding with a new
+  transaction's, would date a restored change by that transaction's commit. A restored version
+  matches its own cluster's commit record, so it keeps its dates; one of a cluster whose commit
+  records are gone, or written before `0027_commit_dates` (null cluster), counts from its own date.
+  `History` tells generations apart the same way. The current cluster's horizon bounds versions of
+  any cluster: one from before a `pg_upgrade`, which gives the cluster a new identifier and keeps
+  its xids, is older than every transaction since, and one a dump carried had committed before any
+  commit record the new cluster wrote; only history of two clusters whose commits interleave in
+  time, merged into one schema, could count one too early. A read as of a time before a `pg_upgrade`
+  finds no commit record of the current cluster by then, so it looks up every version's. A failover
+  to a physical replica keeps both the identifier and the xids, as does a recovery to a point in
+  time, whose new timeline numbers again only xids of what it lost, which history lost too: rows of
+  a lost timeline brought back into it would match its new transactions' commit records. The trigger
+  stamps a record from a setting of its transaction, read from the server once, which a session can
+  set as well, so the commit record reads the server's identifier and refuses the commit (SQLSTATE
+  42501) where any record of its transaction names another: a version so stamped would count from
+  its own date, before the commit. `History` returns the stamp (`Record.Cluster`) and the chain
+  hashes it, as rewriting a restored commit record's cluster, and its versions', to the current one
+  would have its horizon count this cluster's next changes as committed early, every other field
+  `History` returns as it was. Each version a view finds is its row's last where no later one, by
+  id, counts by then, a test of each on its own, by its key in history's index of an entity's
+  versions, which orders a row's versions by date and those of one date by id, latest first: since
+  commits are recorded no version is dated before the one written before it, so the test reads the
+  row's latest version dated by then after it, and only where that one doesn't count, its
+  transaction committed later, reads on from the version in that order until the first that counts,
+  each version between two counted read once, whatever their dates; a read on from the version
+  alone, against the index's order, read the page before the version's, of another row, wherever a
+  row's last was first on its page. One written before reads the row's versions dated by then from
+  the latest, as a release before 0006 could date a version before one written earlier. A few pages
+  for each version, however stale history's statistics. That index ordered versions of one date by
+  their places, so versions dated alike, as every write of a `DO` block is, each read every one
+  before it. As a join, by statistics from before most of history was written, as autovacuum leaves
+  them until a tenth of it is new, it read every version of the entity in the tenant for each
+  version found, the key only a filter, so a check took seconds; a read of thousands of rows costs
+  more than such a join planned by fresh statistics, which reads their versions together. That index
+  holds the versions of grants, eligibilities and places in groups only for a read that names their
+  key, as PostgreSQL proves a partial index's predicate from a query's conditions, and history's
+  index of scopes holds them only for one that names a scope, so a read of them by their principal,
+  scope, role or group seeks them in the index leading to it: by statistics that counted the
+  tenant's rows of them as a few, a plan read every one in the tenant through either instead.
+  `Holders` looks each identity's membership of the tenant up on its own, by its key, which the view
+  of memberships gives as the principal: joined to a group's members, or looked up by the principal
+  history copies beside the entity, it read, by such statistics, every membership in the tenant
+  again for each member. The view of custom roles takes each one's newest version, testing none for
+  a later one, so `Grantable`, which can offer any, reads each version once.
 - **PruneHistory** deletes only what an export has read and later versions supersede. It keeps
   each row's last version counted by its time, as AsOf counts it, so AsOf answers as before for any
   later time, and refuses an earlier one; of a row whose last version by then ended it, it deletes
