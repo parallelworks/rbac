@@ -498,10 +498,11 @@ func (r *readmeRoles) harden(t *testing.T) {
 }
 
 // The commit record's function, which writes history as its owner, is given as it is made to the
-// owner of rbac_record, history's role where the README's roles are set up, where the role migrating
-// may give it, as where history's role may create in the schema; and where it may not, stays the
-// migrating role's, until it is given after migrating, as the README's step 2 says. Either way no
-// role may execute it, and a change by the application's role commits with its commit record.
+// owner of rbac_record, history's role where the README's roles are set up: where history's role may
+// create in the schema; where it may not but the role migrating owns the schema, which lends it
+// CREATE for the migration alone; and where neither holds, migrating fails, saying how to fix it, and
+// once fixed gives it. Whatever the schema's default privileges grant, no role may execute it, and a
+// change by the application's role commits with its commit record.
 func TestMigratingGivesTheCommitRecordsFunctionToHistorysRole(t *testing.T) {
 	var made string
 	sqls := migrationSQL(t)
@@ -514,8 +515,8 @@ func TestMigratingGivesTheCommitRecordsFunctionToHistorysRole(t *testing.T) {
 	if made == "" {
 		t.Fatal("no migration makes the commit record's function")
 	}
-	for _, create := range []bool{false, true} {
-		t.Run(fmt.Sprintf("create=%t", create), func(t *testing.T) {
+	for _, c := range []string{"history's role creates", "the schema's owner lends", "no one lends"} {
+		t.Run(c, func(t *testing.T) {
 			ctx := t.Context()
 			r := newReadmeRoles(t)
 			if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", made); err != nil {
@@ -523,22 +524,42 @@ func TestMigratingGivesTheCommitRecordsFunctionToHistorysRole(t *testing.T) {
 			}
 			recordMigrations(t, r.adminPool, made)
 			r.harden(t)
-			if create {
-				if _, err := r.super.Exec(ctx, `GRANT CREATE ON SCHEMA `+r.schema+` TO `+r.history); err != nil {
-					t.Fatal(err)
+			super := func(sqls ...string) {
+				t.Helper()
+				for _, sql := range sqls {
+					if _, err := r.super.Exec(ctx, sql); err != nil {
+						t.Fatalf("%s: %v", sql, err)
+					}
 				}
+			}
+			// As a host's own default privileges might, for the functions it makes there.
+			super(`ALTER DEFAULT PRIVILEGES FOR ROLE ` + r.admin + ` IN SCHEMA ` + r.schema + ` GRANT EXECUTE ON FUNCTIONS TO ` + r.app)
+			switch c {
+			case "history's role creates":
+				super(`GRANT CREATE ON SCHEMA ` + r.schema + ` TO ` + r.history)
+			case "no one lends":
+				super(`ALTER SCHEMA `+r.schema+` OWNER TO CURRENT_USER`, `GRANT USAGE, CREATE ON SCHEMA `+r.schema+` TO `+r.admin)
+				err := rbac.Migrate(ctx, r.adminPool)
+				if pgErr := (*pgconn.PgError)(nil); !errors.As(err, &pgErr) || pgErr.Code != "42501" ||
+					!strings.Contains(pgErr.Message, "rbac_history_commit") || !strings.Contains(pgErr.Hint, "Grant "+r.history+" CREATE on schema "+r.schema) {
+					t.Fatalf("migrating where no role may give history's role CREATE on the schema: %v", err)
+				}
+				super(`GRANT CREATE ON SCHEMA ` + r.schema + ` TO ` + r.history)
 			}
 			if err := rbac.Migrate(ctx, r.adminPool); err != nil {
 				t.Fatal(err)
 			}
 			var owner string
-			var executes bool
-			if err := r.super.QueryRow(ctx, `SELECT p.proowner::regrole::text, has_function_privilege($2, p.oid, 'EXECUTE') FROM pg_proc p
-				WHERE p.oid = ($1 || '.rbac_history_commit()')::regprocedure`, r.schema, r.app).Scan(&owner, &executes); err != nil {
+			var executes, creates bool
+			if err := r.super.QueryRow(ctx, `SELECT p.proowner::regrole::text, has_function_privilege($2, p.oid, 'EXECUTE'), has_schema_privilege($3, $1, 'CREATE')
+				FROM pg_proc p WHERE p.oid = ($1 || '.rbac_history_commit()')::regprocedure`, r.schema, r.app, r.history).Scan(&owner, &executes, &creates); err != nil {
 				t.Fatal(err)
 			}
-			if want := map[bool]string{false: r.admin, true: r.history}[create]; owner != want || executes {
-				t.Errorf("the commit record's function is %s's, not %s's, and the application's role may execute it: %t", owner, want, executes)
+			if owner != r.history || executes {
+				t.Errorf("the commit record's function is %s's, not %s's, and the application's role may execute it: %t", owner, r.history, executes)
+			}
+			if lent := c == "the schema's owner lends"; creates == lent {
+				t.Errorf("history's role may create in the schema after migrating: %t", creates)
 			}
 			var commits int
 			if _, err := r.appPool.Exec(ctx, `INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'u')`); err != nil {

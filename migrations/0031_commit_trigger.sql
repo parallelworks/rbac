@@ -37,13 +37,19 @@
 -- does, max_notify_queue_pages from PostgreSQL 17 on: a commit whose payloads overflow it fails, and
 -- its changes with it.
 --
--- The function is made by the role migrating, so it gives it to rbac_record's owner, history's role
--- where the README's roles are set up, where the role migrating may: as a superuser, or as a member
--- of history's role where that role may create in the schema. Otherwise it stays the migrating
--- role's, which has the rights of history's owner, so the commit record is written all the same, and
--- is to be given to history's role after migrating, as rbac_record is. Only its trigger calls it, so no
--- role may execute it, as none may rbac_history_pruned. rbac_record keeps its path for a commit
--- record, which no trigger reaches from here on.
+-- The function writes history as its owner, so it is given to rbac_record's owner, history's role
+-- where the README's roles are set up, not left to the role migrating, which makes it and owns the
+-- package's tables too: whatever a session could have it run would run with those rights as well.
+-- Giving it takes a role migrating that may SET ROLE to the new owner, and the new owner's CREATE on
+-- the schema: where history's role has none, the role migrating grants it for this transaction alone
+-- where it may, as the schema's owner can, and revokes it once the function is given. Where it can't
+-- be given, migrating fails, saying what to change, rather than leave it to another role. Only its
+-- trigger calls it, so no role but its owner may execute it, as none may rbac_history_pruned: a grant
+-- the schema's default privileges gave it as it was made is revoked too, as a role holding one could
+-- attach it to a table of its own in pg_temp, whose triggers would then run as its owner.
+--
+-- rbac_record is replaced without its path for a commit record, which no trigger reaches from here
+-- on, so no copy of the commit record's checks is left to fall behind the one that runs.
 --
 -- Replacing the trigger locks history against reads and writes until migrating commits, so every
 -- change, as each writes history, and every read of history, as AsOf and an export, waits for it,
@@ -145,14 +151,34 @@ REVOKE EXECUTE ON FUNCTION rbac_history_commit() FROM PUBLIC;
 
 DO $$
 DECLARE
-    owner pg_catalog.regrole := (SELECT p.proowner FROM pg_catalog.pg_proc p WHERE p.oid = 'rbac_record()'::pg_catalog.regprocedure);
+    here    pg_catalog.text := pg_catalog.current_schema();
+    fn      pg_catalog.regprocedure := pg_catalog.format('%I.rbac_history_commit()', here);
+    owner   pg_catalog.regrole := (SELECT p.proowner FROM pg_catalog.pg_proc p
+                                   WHERE p.oid = pg_catalog.format('%I.rbac_record()', here)::pg_catalog.regprocedure);
+    grantee pg_catalog.regrole;
+    lent    boolean := false;
 BEGIN
-    IF owner <> (SELECT p.proowner FROM pg_catalog.pg_proc p WHERE p.oid = 'rbac_history_commit()'::pg_catalog.regprocedure) THEN
+    FOR grantee IN SELECT DISTINCT a.grantee FROM pg_catalog.pg_proc p, pg_catalog.aclexplode(p.proacl) a
+        WHERE p.oid = fn AND a.grantee <> 0 AND a.grantee <> p.proowner LOOP
+        EXECUTE pg_catalog.format('REVOKE ALL ON FUNCTION %s FROM %s CASCADE', fn, grantee);
+    END LOOP;
+    IF owner <> (SELECT p.proowner FROM pg_catalog.pg_proc p WHERE p.oid = fn) THEN
+        IF NOT pg_catalog.has_schema_privilege(owner, here, 'CREATE')
+            AND pg_catalog.has_schema_privilege(here, 'CREATE WITH GRANT OPTION')
+            AND NOT (SELECT r.rolsuper FROM pg_catalog.pg_roles r WHERE r.rolname = current_user) THEN
+            EXECUTE pg_catalog.format('GRANT CREATE ON SCHEMA %I TO %s', here, owner);
+            lent := true;
+        END IF;
         BEGIN
-            EXECUTE pg_catalog.format('ALTER FUNCTION rbac_history_commit() OWNER TO %s', owner);
+            EXECUTE pg_catalog.format('ALTER FUNCTION %s OWNER TO %s', fn, owner);
         EXCEPTION WHEN insufficient_privilege THEN
-            NULL;
+            RAISE EXCEPTION 'rbac_history_commit, which writes history as its owner, can''t be given to %, which owns rbac_record: % may not SET ROLE to it, or it has no CREATE on schema %',
+                owner, current_user, here USING ERRCODE = 'insufficient_privilege',
+                HINT = pg_catalog.format('Grant %s CREATE on schema %I, or migrate as a superuser, and migrate again.', owner, here);
         END;
+        IF lent THEN
+            EXECUTE pg_catalog.format('REVOKE CREATE ON SCHEMA %I FROM %s', here, owner);
+        END IF;
     END IF;
 END $$;
 
@@ -161,3 +187,123 @@ CREATE CONSTRAINT TRIGGER rbac_history_committed AFTER INSERT ON rbac_history
     DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rbac_history_commit();
 -- In every session, as history's other triggers fire.
 ALTER TABLE rbac_history ENABLE ALWAYS TRIGGER rbac_history_committed;
+
+-- As 0027 wrote it, without its path for a commit record. Replacing it keeps its owner and who may
+-- execute it, but not its settings, so they are set here, as 0027 set them. It takes no lock on the
+-- tables.
+CREATE OR REPLACE FUNCTION rbac_record() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp SET TimeZone = 'UTC' SET plan_cache_mode = force_generic_plan SET enable_seqscan = off AS $$
+<<rbac_record>>
+DECLARE
+    -- Alone, as every statement below finds history, and what it calls, by it.
+    here   text := pg_catalog.set_config('search_path', pg_catalog.quote_ident(TG_TABLE_SCHEMA) || ', pg_temp', true);
+    was    jsonb;
+    is_now jsonb;
+    r      jsonb;
+    expiry timestamptz;
+    said   text;
+    change jsonb;
+    entity text;
+    key    text;
+    was_key text;
+    at     timestamptz;
+    last   timestamptz;
+    op     text;
+    was_last timestamptz;
+    ended  boolean;
+    cluster_id bigint;
+BEGIN
+    -- A search_path reads $user, however it is quoted, as a role's name, and leaves out a schema
+    -- the role has no USAGE on, so history would be found in pg_temp: refused before anything it
+    -- names is read or called. The = it compares two names by is pg_catalog's, which has one of
+    -- exactly their type, and comes first in a search_path that doesn't name it.
+    IF pg_catalog.current_schema() IS DISTINCT FROM TG_TABLE_SCHEMA THEN
+        RAISE EXCEPTION 'history is not found in schema %: no search_path names a schema called $user, nor one % has no USAGE on',
+            TG_TABLE_SCHEMA, current_user USING ERRCODE = 'invalid_schema_name';
+    END IF;
+    -- The cluster writing the record, stamped on every one so AsOf trusts a commit record's dating
+    -- only within the cluster that wrote it. Read once a transaction and held in a local setting, as
+    -- one statement writes many records, and reading the server's control file for each made 8,000
+    -- grants in one statement a seventh slower: only pg_catalog is read, after the schema is
+    -- checked. A session can set the setting too, so the commit record checks every record its
+    -- transaction wrote against the server's.
+    cluster_id := nullif(pg_catalog.current_setting('rbac.cluster', true), '')::bigint;
+    IF cluster_id IS NULL THEN
+        cluster_id := (pg_catalog.pg_control_system()).system_identifier;
+        PERFORM pg_catalog.set_config('rbac.cluster', cluster_id::text, true);
+    END IF;
+    was := CASE WHEN TG_OP = 'INSERT' THEN NULL ELSE pg_catalog.to_jsonb(OLD) END;
+    is_now := CASE WHEN TG_OP = 'DELETE' THEN NULL ELSE pg_catalog.to_jsonb(NEW) END;
+    r := coalesce(is_now, was);
+    -- The row's expiry as the tables bound it, as migrating rewrites it: a grant migrating deletes,
+    -- merged into another, holds one they refuse, which JSON or a time.Time can't write.
+    expiry := CASE WHEN (r->>'expires_at')::timestamptz = 'infinity' THEN NULL
+              WHEN (r->>'expires_at')::timestamptz > '9999-12-30 23:59:59.999999+00' THEN '9999-12-30 23:59:59.999999+00'
+              WHEN (r->>'expires_at')::timestamptz <= '0001-01-01 00:00:00+00' THEN timestamptz 'epoch'
+              ELSE (r->>'expires_at')::timestamptz END;
+    -- Parsed only within the bound, which the record checks first.
+    said := current_setting('rbac.change', true);
+    change := CASE WHEN pg_catalog.octet_length(said) > 1048576 THEN NULL ELSE coalesce(nullif(said, '')::jsonb, '{}') END;
+    entity := CASE TG_TABLE_NAME WHEN 'rbac_grants' THEN 'grant' WHEN 'rbac_roles' THEN 'role'
+              WHEN 'rbac_denies' THEN 'deny' WHEN 'rbac_eligibilities' THEN 'eligibility'
+              WHEN 'rbac_memberships' THEN 'membership' WHEN 'rbac_groups' THEN 'group' WHEN 'rbac_members' THEN 'member' END;
+    key := CASE entity WHEN 'deny' THEN (r->>'scope') || ' ' || (r->>'id') WHEN 'membership' THEN r->>'principal'
+           WHEN 'member' THEN pg_catalog.jsonb_build_array(r->>'group_id', r->>'principal', r->>'source')::text
+           ELSE r->>'id' END;
+    was_key := CASE entity WHEN 'deny' THEN (was->>'scope') || ' ' || (was->>'id') WHEN 'membership' THEN was->>'principal'
+               WHEN 'member' THEN pg_catalog.jsonb_build_array(was->>'group_id', was->>'principal', was->>'source')::text
+               ELSE was->>'id' END;
+    -- When the change took effect, but for an expiry: when its statement began, or its transaction,
+    -- where that began later, and never before the row's last record, as a change can have moved
+    -- its expiry back to before then. The last a write's snapshot holds: at READ COMMITTED, as the
+    -- package changes the tables, this query takes one once the write has waited for another's
+    -- lock on the row, but at REPEATABLE READ or SERIALIZABLE the transaction's is older, so a
+    -- write that waited is dated before the change it waited for. Write around the package at READ
+    -- COMMITTED. AsOf counts it from no earlier than its transaction's commit record.
+    at := greatest(statement_timestamp(), transaction_timestamp());
+    last := (SELECT max(h.effective_at) FROM rbac_history h
+             WHERE h.tenant = r->>'tenant' AND h.entity = rbac_record.entity AND h.key = rbac_record.key);
+    -- The context says only whether a delete is an expiry, and only a row that has expired by when
+    -- the delete took effect is one, so whoever sets it can't record a revoke as anything else.
+    op := CASE TG_OP WHEN 'INSERT' THEN 'create' WHEN 'UPDATE' THEN 'update'
+          WHEN 'DELETE' THEN CASE WHEN change->>'op' = 'expire' AND (was->>'expires_at')::timestamptz <= greatest(at, last)
+            THEN 'expire' ELSE 'delete' END END;
+    IF pg_catalog.pg_column_size(is_now) > 1048576 OR pg_catalog.octet_length(said) > 1048576 THEN
+        RAISE EXCEPTION 'history records no row or change of more than 1 MiB: this % row is % bytes and its change %',
+            TG_TABLE_NAME, pg_catalog.pg_column_size(is_now), pg_catalog.octet_length(said) USING ERRCODE = 'program_limit_exceeded';
+    END IF;
+    -- An update that moves a row to another key or tenant ends it under the old one, which would
+    -- otherwise read as live for good, and starts it under the new.
+    IF TG_OP = 'UPDATE' AND (was_key IS DISTINCT FROM key OR was->>'tenant' IS DISTINCT FROM is_now->>'tenant') THEN
+        was_last := (SELECT max(h.effective_at) FROM rbac_history h
+                     WHERE h.tenant = was->>'tenant' AND h.entity = rbac_record.entity AND h.key = was_key);
+        -- An update revokes nothing, so a row it moves that had expired ended with its expiry, as an
+        -- activation Activate makes anew did, rather than by the change that moved it.
+        ended := (was->>'expires_at')::timestamptz <= greatest(at, was_last);
+        INSERT INTO rbac_history (effective_at, tenant, entity, key, op, principal, role, scope, group_id, expires_at,
+          before, after, bytes, actor, on_behalf_of, how, request, reason, cluster)
+        VALUES (
+          greatest(CASE WHEN ended THEN (was->>'expires_at')::timestamptz ELSE at END, was_last),
+          was->>'tenant', entity, was_key, CASE WHEN ended THEN 'expire' ELSE 'delete' END, was->>'principal',
+          CASE entity WHEN 'role' THEN was->>'id' ELSE was->>'role' END,
+          was->>'scope',
+          CASE entity WHEN 'group' THEN was->>'id' WHEN 'member' THEN was->>'group_id' END,
+          (was->>'expires_at')::timestamptz, was, NULL, pg_catalog.octet_length(was::text),
+          coalesce(change->>'actor', ''), coalesce(change->>'on_behalf_of', ''), coalesce(change->>'how', ''),
+          coalesce(change->>'request', ''), coalesce(change->>'reason', ''), cluster_id);
+        op := 'create';
+        was := NULL;
+    END IF;
+    INSERT INTO rbac_history (effective_at, tenant, entity, key, op, principal, role, scope, group_id, expires_at,
+      before, after, bytes, actor, on_behalf_of, how, request, reason, cluster)
+    VALUES (
+      greatest(CASE WHEN op = 'expire' THEN expiry ELSE at END, last),
+      r->>'tenant', entity, key, op, r->>'principal',
+      CASE entity WHEN 'role' THEN r->>'id' ELSE r->>'role' END,
+      r->>'scope',
+      CASE entity WHEN 'group' THEN r->>'id' WHEN 'member' THEN r->>'group_id' END,
+      expiry, was, is_now, coalesce(pg_catalog.octet_length(was::text), 0) + coalesce(pg_catalog.octet_length(is_now::text), 0),
+      coalesce(change->>'actor', ''), coalesce(change->>'on_behalf_of', ''), coalesce(change->>'how', ''),
+      coalesce(change->>'request', ''), coalesce(change->>'reason', ''), cluster_id);
+    RETURN NULL;
+END $$;

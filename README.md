@@ -886,12 +886,14 @@ have the server load a library or run a program of its choosing; and:
    administrator's role keeps both owners' rights.
 2. A role of history's own, which the administrator's role is a member of and the application's
    isn't, owns `rbac_history` and the functions `rbac_record` and `rbac_history_commit`: transfer
-   them to it after migrating.
+   them to it after migrating. A migration that makes such a function later, as
+   `0031_commit_trigger` makes `rbac_history_commit`, gives it to `rbac_record`'s owner itself, or
+   fails.
    It needs `USAGE` on the schema, since every write to the package's tables runs `rbac_record`
    as it, which refuses the write without it; `EXECUTE` on the functions `rbac_tenant_keys` and
    `rbac_text_array`, which history's index of the keys denies name calls for each record, and
    which every role has unless it is revoked; and `CREATE` there to be given them, unless a
-   superuser gives them.
+   superuser gives them, or the schema's owner migrates, which grants it for the migration alone.
 3. The application's role has `USAGE` on the package's schema, without which it reads none of its
    tables; `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the package's tables but `rbac_history` and
    `rbac_migrations`, and on any a later migration adds; `EXECUTE` on the functions
@@ -1118,15 +1120,20 @@ can leave the application's role without it. The administrator's and history's r
   once, record by record, it reads both, about 15.5 µs. It replaces the trigger, which locks history
   against reads and writes until it commits, so every change, as each writes history, and every read
   of history, as `AsOf` and an export, waits for it, and a transaction under way as it starts that
-  made a change can make it give way. The role migrating makes the function and gives it to
-  `rbac_record`'s owner, history's role where the roles are set up as [History](#history) says,
-  where it may: as a superuser, or as a member of history's role where that role has `CREATE` on the
-  schema. Otherwise give it to history's role after migrating, as step 2 there says; until then the
-  commit record is written as the role migrating, which has the rights of history's owner. No role
-  may execute it, as only its trigger calls it. A procedure or a `DO` block that changes the
-  package's tables with a cursor `WITH HOLD` open that it declared in an earlier transaction is
-  refused as before, as nothing tells that cursor from one declared in the transaction committing:
-  its refusal now says so, and how such a batch commits.
+  made a change can make it give way. The role migrating makes the function, which writes history as
+  its owner, and gives it to `rbac_record`'s owner, history's role where the roles are set up as
+  [History](#history) says: as a superuser, or as a role that may `SET ROLE` to history's role,
+  where that role has `CREATE` on the schema or the role migrating may grant it that, as the
+  schema's owner can, which it does for the migration alone. Otherwise migrating fails with SQLSTATE
+  42501, having changed nothing, rather than leave the function to another role: grant history's
+  role `CREATE` on the schema, or migrate as a superuser, and migrate again. No role but its owner
+  may execute it, as only its trigger calls it: migrating revokes `EXECUTE` on it from `PUBLIC` and
+  from any role the schema's default privileges grant it to. It replaces `rbac_record` too, which
+  keeps its owner, who may execute it and its settings, without its path for a commit record, which
+  no trigger reaches any more. A procedure or a `DO` block that changes the package's tables with a
+  cursor `WITH HOLD` open that it declared in an earlier transaction is refused as before, as
+  nothing tells that cursor from one declared in the transaction committing: its refusal now says
+  so, and how such a batch commits.
   Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
   rolling upgrade across the two is unsafe: they key every lock apart, so a change by one waits for
   none by the other, and what each checks under its locks can change before it commits, as two
