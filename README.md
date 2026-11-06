@@ -679,10 +679,11 @@ history with physical backups and replicas; a logical dump restored into another
 transactions anew. `AsOf` still dates a restored change by its own commit record, as a commit record
 dates only changes of its own cluster, and a restored change whose commit record is gone counts from
 its own date; a transaction this cluster gives a restored change's txid is another, which commits,
-and whose changes `AsOf` counts apart from the restored one's. `pg_upgrade` gives the cluster a new identifier and keeps its transaction ids, so
-`AsOf` answers as before. Never bring back rows of a timeline a recovery to a point in time left
-behind: they keep the cluster's identifier while the new timeline numbers their transactions again,
-so `AsOf` would date such a change by another transaction's commit.
+and whose changes `AsOf` counts apart from the restored one's. `pg_upgrade` gives the cluster a new
+identifier and keeps its transaction ids, so `AsOf` answers as before. Never bring back rows of a
+timeline a recovery to a point in time left behind: they keep the cluster's identifier while the new
+timeline numbers their transactions again, so `AsOf` would date such a change by another
+transaction's commit.
 
 A change refused, as `ErrDenied` or `ErrInvalid`, writes nothing, so history doesn't record it:
 `Config.OnRefused` is told of each, with its actor, the call and the host's audit, to record the
