@@ -3523,6 +3523,67 @@ func TestHoldersOfALabeledResourceEvaluateNoCondition(t *testing.T) {
 	}
 }
 
+// Holders lists a holder of a labeled resource by its label values, evaluating no condition, as
+// evaluating every one would, with any request or none: for each way the value the label asks for
+// is granted, to the holder or to a group it is in, not at all, unconditionally, or under a
+// condition that holds, one that never does or one reading the request, against each way it is
+// denied, not at all, unconditionally or under such a condition, with a constraint removing it or
+// not.
+func TestHoldersListEachWayAValueIsDecidedAsEvaluatingIt(t *testing.T) {
+	h := labeled(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "removing", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			return in.Subject != nil && strings.HasSuffix(in.Subject.Principal.ID, "-removed"), nil
+		}}}
+	})
+	ctx := t.Context()
+	conditions := map[string]string{"plain": "", "holds": `subject.id != ""`, "never": `subject.id == ""`, "request": `request.attributes.mfa == true`}
+	b := &pgx.Batch{}
+	var subjects []rbac.Subject
+	for _, granted := range []string{"none", "plain", "holds", "never", "request"} {
+		for _, denied := range []string{"none", "plain", "holds", "never", "request"} {
+			for _, through := range []string{"own", "group"} {
+				for _, constraint := range []string{"kept", "removed"} {
+					id := strings.Join([]string{granted, denied, through, constraint}, "-")
+					subjects = append(subjects, rbac.Subject{Principal: identity(id)})
+					b.Queue(`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', $1)`, id)
+					kind, to := "user", id
+					if through == "group" {
+						kind, to = "group", "g-"+id
+						b.Queue(`INSERT INTO rbac_groups (tenant, id) VALUES ('t1', $1)`, to)
+						b.Queue(`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', $1, 'user', $2)`, to, id)
+					}
+					if granted != "none" {
+						b.Queue(`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+							VALUES ('t1', 'tenant', 't1', $1, $2, 'level.high', $3)`, kind, to, conditions[granted])
+					}
+					if denied != "none" {
+						b.Queue(`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions, condition)
+							VALUES ('t1', 'tenant', 't1', $1, ARRAY['user:' || $1], '{level:high}', $2)`, id, conditions[denied])
+					}
+				}
+			}
+		}
+	}
+	if err := h.pool.SendBatch(ctx, b).Close(); err != nil {
+		t.Fatal(err)
+	}
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	seen := map[string]bool{}
+	for _, c := range []context.Context{ctx, rbac.WithRequest(ctx, map[string]any{"mfa": true}), rbac.WithRequest(ctx, map[string]any{"mfa": false})} {
+		unevaluated, evaluated := rbac.HoldersListedBothWays(t, c, h.authz, subjects, login, secret)
+		for i, s := range subjects {
+			if unevaluated[i] != evaluated[i] {
+				t.Errorf("%s: evaluating no condition, Holders lists it %s, and evaluating them %s", s.Principal.ID, unevaluated[i], evaluated[i])
+			}
+			seen[unevaluated[i]] = true
+		}
+	}
+	if !seen["out"] || !seen["kept"] || !seen["marked"] {
+		t.Errorf("Holders listed its holders only %v", seen)
+	}
+}
+
 // Holders of a labeled resource reads the label values of every identity it lists in one
 // statement, however many they are, and decides each as a read of one decides it: by its grants
 // on the tenant and its groups', through those they are in, under the denies binding it there,
