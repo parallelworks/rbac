@@ -617,9 +617,12 @@ a hook that can't be given its copy too.
 ## History
 
 Every change to the package's tables is recorded in `rbac_history`: the row as it was and as it
-became, when, and the database role that wrote it. A change through the package records its actor
-and the call that made it (`Record.How`), and what the host attaches with `rbac.WithAudit`: on whose
-behalf it was made, the request and the reason. An expiry `DeleteExpired` removes is recorded as
+became, when, and the database role that wrote it; and each transaction that changes them records
+when it commits, which `History` returns with each of its records (`Record.CommittedAt`) rather
+than as a record of its own, and each record holds the cluster that wrote it (`Record.Cluster`, its
+`system_identifier`), within which a commit record dates it. A change through the package records
+its actor and the call that made it (`Record.How`), and what the host attaches with
+`rbac.WithAudit`: on whose behalf it was made, the request and the reason. An expiry `DeleteExpired` removes is recorded as
 one, made by no one. Triggers write it, so a write that bypasses the package is recorded too, as no
 one's. That context is what the session that wrote it says; the database role is what the database
 knows. The tables bound what they hold as the package bounds what it writes, but for the ids in
@@ -673,7 +676,14 @@ cursor was read, leaves nothing the database can tell from recovering from a cra
 nothing that committed, so its export would read on: restore by recovering to a point in time, which
 starts a new generation, or export each generation from the start again after a restore. Move
 history with physical backups and replicas; a logical dump restored into another cluster numbers its
-transactions anew.
+transactions anew. `AsOf` still dates a restored change by its own commit record, as a commit record
+dates only changes of its own cluster, and a restored change whose commit record is gone counts from
+its own date; a transaction this cluster gives a restored change's txid is another, which commits,
+and whose changes `AsOf` counts apart from the restored one's. `pg_upgrade` gives the cluster a new
+identifier and keeps its transaction ids, so `AsOf` answers as before. Never bring back rows of a
+timeline a recovery to a point in time left behind: they keep the cluster's identifier while the new
+timeline numbers their transactions again, so `AsOf` would date such a change by another
+transaction's commit.
 
 A change refused, as `ErrDenied` or `ErrInvalid`, writes nothing, so history doesn't record it:
 `Config.OnRefused` is told of each, with its actor, the call and the host's audit, to record the
@@ -702,22 +712,67 @@ and each row as JSON text, not parsed into a store's own form, which can reorder
 
 `AsOf(ctx, tenant, at, read)` reads a tenant as it was at a time, from its history: every check,
 list and search the read makes answers as it would have then, with the catalog as it is now, as for
-an access review of a past date. A change counts from when the statement that made it began, or its
-transaction, where that began later, as each one a procedure or a `DO` block starts as it commits
-does; an expiry from when it expired; and none from before its row's change before it, as the
-writer's snapshot holds it: at READ COMMITTED, as the package changes the tables, a statement that
-waited for another's lock on the row reads the change it waited for, but at REPEATABLE READ or
+an access review of a past date. A change counts from when its transaction committed, as no other
+session sees it before then, by the record history keeps of it, or from its own date
+(`Record.EffectiveAt`) where that is later: a revoke a host's transaction holds open, or whose
+`Config.OnChange` takes a while, reads as of a time before it committed as the grant every check
+then read, and a grant as not yet made. A change's own date is when the statement that made it
+began, or its transaction, where that began later, as each one a procedure or a `DO` block starts
+as it commits does; an expiry's when it expired; and none is before its row's change before it, as
+the writer's snapshot holds it: at READ COMMITTED, as the package changes the tables, a statement
+that waited for another's lock on the row reads the change it waited for, but at REPEATABLE READ or
 SERIALIZABLE its transaction's snapshot is older, and it is dated before that change. Write around
-the package at READ COMMITTED. So no change but an expiry, which ends only what every read already
-counted as expired, counts from before the transaction that made it began, and what a time reads is
-final once every transaction that had begun by then has ended: `pg_stat_activity` lists each
-session's `xact_start`, which for a block that commits as it goes is when its current transaction
-began, what its changes count from, though its `query_start` is when the block began. Neither
-`backend_xid` nor an export that has read past the time shows it final: a transaction that has only
-read holds no transaction id, which neither shows nor holds `History` back, and can still make a
-change that counts from its start. A prepared transaction, which `pg_stat_activity` no longer lists,
-has ended only once it is committed or rolled back: `pg_prepared_xacts` lists it until then, by when
-it was prepared, not when it began. `AsOf` makes no change: one tried is no actor's attempt, and
+the package at READ COMMITTED. A change of a transaction that committed before
+`0027_commit_dates`, which records no commit, counts from its own date, as it did: from before the
+transaction committed, and so a revoke held open counts from before a moment when checks still
+allowed what it revoked. The transaction reading counts none of its own changes, which haven't
+committed.
+
+A transaction's commit record is written as it commits, by a trigger deferred to the commit, after
+every change it made, and so what a time reads is final once every transaction whose commit record
+is dated by then is one other sessions see: a commit counted by a time, but not yet seen, is one
+still running the rest of its commit; one waiting for synchronous replication, as long as
+`synchronous_standby_names` and the session's `synchronous_commit` have it wait, which a session can
+set to `remote_apply` to wait for a standby to replay it; or one prepared for two-phase commit,
+whose deferred triggers fire, and whose commit is recorded, as it is prepared, not committed. The
+rest of a commit is the host's own deferred triggers and constraints of statements after its last
+change to the package's tables, and what they wait for, as a deferred foreign key's check waits for
+a row another session has locked; the session's temporary tables made `ON COMMIT DROP` or `ON COMMIT
+DELETE ROWS`, which it drops or empties, about half a millisecond each at the default `temp_buffers`,
+so a session with thousands holds its commit back for a second or so; and no lock it waits for longer
+than 100 ms, where the session's `lock_timeout` is longer, as another session that holds one of those
+temporary tables would have it wait, or past which it fails with SQLSTATE 55P03. Emptying an `ON
+COMMIT DELETE ROWS` table scans the session's temporary buffers, so at a large `temp_buffers` it
+costs more: at `temp_buffers = 4GB`, 2,000 such tables held a commit about 5.4 s past its commit
+record, which `lock_timeout` doesn't bound, as it isn't a lock wait. A session that sets a large
+`temp_buffers` and makes many such tables holds its own commit back accordingly; set `temp_buffers`
+no larger than the session's temporary data needs. `pg_stat_activity` lists a session
+in its commit, with `COMMIT` as its query, or waiting on `SyncRep`, and `pg_prepared_xacts` a
+prepared transaction until it is committed or rolled back; keep `max_prepared_transactions` at 0,
+the default, so none is. Any session can fire a transaction's deferred triggers before it commits,
+with `SET CONSTRAINTS ... IMMEDIATE`, which takes no privilege, and then hold the transaction open:
+the trigger, so fired, defers itself again, and records the commit anew as the transaction commits,
+which `AsOf` counts it from, as its latest. It refuses a transaction that declares a cursor `WITH
+HOLD`, which committing runs to its end, also one a procedure or a `DO` block declares in a
+transaction after it committed, and a session that has an enabled deferrable trigger on a temporary
+table, which fires as it commits: either would run a session's own code after the commit record was
+written. The check of a temporary table's deferrable trigger reads the catalog as the commit record
+is written, so it is a best-effort defense that holds only where a hostile session can't make
+temporary objects: the roles below revoke `TEMPORARY` on the database from `PUBLIC` and grant it only
+where it is needed, so a role without it makes none. The application's role needs `TEMPORARY` only
+for `AsOf`, which makes temporary views; where `AsOf` runs as that role, it keeps `TEMPORARY` and so
+can make temporary objects, and the check is best-effort against it, as against any role with
+`TEMPORARY`. So the application's role can hold a change's commit past its commit record only through
+the host's code that runs as the transaction commits, as a deferred trigger of the host's that reads
+a table by a name a temporary table can take, or a deferred constraint checking a row the role can
+lock; by the temporary tables a session makes, for as long as dropping or emptying them takes, which
+a large `temp_buffers` lengthens; by a temporary object's own deferrable trigger, where it has
+`TEMPORARY`; or for as long as the operator's settings of synchronous replication and prepared
+transactions let it.
+With `track_commit_timestamp` on, `pg_xact_commit_timestamp` of a record's `TxID`, while the server
+keeps it, shows when the transaction's commit was written, which an auditor can compare with its
+`CommittedAt`.
+`AsOf` makes no change: one tried is no actor's attempt, and
 `Config.OnRefused` isn't told of it. It writes all the same: the temporary views it reads history
 through are rows of the catalog, for which its transaction takes a transaction id and holds it until
 it rolls back, as under `WithTx` the host's transaction does until it ends, so while its read runs,
@@ -740,7 +795,9 @@ planned over history, they cost past `jit_above_cost` for an ordinary subject: a
 compiling, and 110 ms without. It tests each version a statement reads for a later one by its
 row's key, and `Holders` looks each identity's membership of the tenant up by its key, so
 history's statistics, which autovacuum leaves until a tenth of it is new, change no read's cost by
-much: a read of thousands of rows costs a few pages for each version. Joined to a group's members
+much: a read of thousands of rows costs a few pages for each version. It looks each version's
+commit record up by its transaction, a few pages more, as `History` does for `CommittedAt`, so
+what it answers turns on nothing an export leaves out. Joined to a group's members
 by such statistics, the tenant's memberships were read again for each member, so `Holders` of a
 group of 4,000 took 52 seconds, and 90 ms looked up by key. A list counts
 the denies on scopes of its types by history's versions of them, at most a few, and `Grantable`,
@@ -753,15 +810,17 @@ given runs every call on that transaction, so use it from one goroutine at a tim
 parallel, run several `AsOf` calls, each on its own goroutine (see Goroutines).
 
 `rbac.PruneHistory(ctx, db, before, through)` deletes what an export has read past (`through`, its
-cursor) and later records supersede: of each row, the last version at or before `before` stays, so
-`AsOf` answers as it did for any time from then on, and refuses an earlier one, and a row that had
-ended by then goes, once no version before its end stays. One call deletes at most `rbac.MaxPrune`
-records: call it again while it deletes as many, and each goes on from where the last stopped. It
-reads history that many records at a time, on a pool or a connection each in a transaction of its
-own, so however long history is, none holds exports back for long. A transaction that deletes
-records is recorded in history, with the last record it deleted in `History`'s order, dated when its
-statement began, as any change is, so never before its `before` or a record it deleted; one that
-deletes none changes nothing, and is not. `History` refuses the cursor of an export that began
+cursor) and later records supersede: of each row, the last version counted by `before`, as `AsOf`
+counts it, stays, so `AsOf` answers as it did for any time from then on, and refuses an earlier one,
+and a row that had ended by then goes, once no version before its end stays; a transaction's commit
+record goes with the last of its other records. One call deletes at most `rbac.MaxPrune` records,
+commit records too: call it again while it deletes as many, and each goes on from where the last
+stopped. It reads history that many records at a time, on a pool or a connection each in a
+transaction of its own, so however long history is, none holds exports back for long. A transaction
+that deletes records is recorded in history, with the last record it deleted in `History`'s order,
+dated when its statement began, as any change is, so never before its `before` or a record it
+deleted; one that deletes none changes nothing, and is not. A transaction that only prunes records
+no commit, as no read counts a prune from one. `History` refuses the cursor of an export that began
 before a prune where it is before the last record the prune deleted, as that export would read on
 past what the prune deleted, so where several exports read history, `through` is the cursor of the
 one furthest behind. It finds the prunes by the last record each deleted, so a prune through an
@@ -843,6 +902,16 @@ history's triggers find history beside the table each fires on, whatever the sch
 refuse the row where their search_path can't name that schema, before they read a table or call
 anything by it: so none stands in for the history a change is recorded in, or a prune checked
 against, and nothing such a table runs, as its row security policy, runs as history's role.
+
+Harden temporary objects too: revoke the `TEMPORARY` privilege on the database from `PUBLIC`, which
+holds it by default, and grant it back only to the roles that need it. The commit record refuses a
+transaction that commits a change to the package's tables while the session has an enabled deferrable
+trigger on a temporary table, as that trigger would run the session's own code after the change is
+dated; but that check, read against the catalog as the commit record is written, is a best-effort
+defense, so a role that need not make temporary objects is better left unable to. Only `AsOf` makes
+temporary objects (its temporary views), so the application's role needs `TEMPORARY` only where it
+runs `AsOf`; grant it there, and a deployment that runs `AsOf` on a role of its own, or not at all,
+can leave the application's role without it. The administrator's and history's roles need none.
 
 ## Running it
 
@@ -989,6 +1058,35 @@ against, and nothing such a table runs, as its row security policy, runs as hist
   group beside 80,000 unconditional ones on a tenant took 39 ms, against 7 ms unconditional, and by
   statistics from before they were made, every grant in the table was read. Code from before it
   and after it run beside each other, applied or not: only what those reads cost turns on it.
+  `0027_commit_dates` locks history against reads and writes until it commits, so every change, as
+  each writes history, and every read of history, as `AsOf` and an export, waits for it; it adds
+  history's `cluster` column, null for every record before it, which reads no row, rebuilds
+  history's index of an entity's versions and its index of scopes, and builds an index of commit
+  records, each of which reads all of history: 3 seconds for 500,000 records, 631 MB of history, on
+  a test server, and in proportion to history's size. `CREATE INDEX CONCURRENTLY`, which would let
+  changes go on, can't run in the transaction `Migrate` applies a migration in. It replaces
+  `rbac_record`, which keeps its owner and who may execute it, so history's role still owns it, and
+  adds the constraint trigger `rbac_history_committed`, which runs it as each transaction that
+  changes the tables commits, to write the transaction's commit record as history's role. Its checks
+  of what a record's entity and op are, wider than those they replace, which held every record, are
+  added without reading history (`NOT VALID`). Run `History`, `Export` and `PruneHistory` only from
+  code at or after it: earlier code exports a transaction's commit record as a record of its own,
+  which a later export doesn't, so the two chain history apart, and prunes by the records' own
+  dates, deleting versions `AsOf` now reads; its `AsOf` counts changes from their own dates, as
+  before. From it on, a transaction that changes the package's tables, the package's own or a
+  host's, fails as it commits with SQLSTATE 0A000 where it declared a cursor `WITH HOLD`, or where
+  its session has an enabled deferrable trigger on a temporary table: declare the cursor in a
+  transaction of its own, or without `HOLD`, and drop or disable the trigger, make it `NOT
+  DEFERRABLE`, or change the package's tables on another connection. The rest of its commit, from
+  its commit record on, waits for a lock at most 100 ms where its `lock_timeout` is longer, and
+  fails past it with SQLSTATE 55P03, as where another session holds one of its session's temporary
+  tables, or a transaction with `NOTIFY` waits behind many others committing theirs: retry it. It
+  fails with SQLSTATE 42501 where its session set `rbac.cluster`, the setting history stamps each
+  record's cluster from, to another than the server's: reset it. A host transaction may set its
+  constraints immediate, by name or `ALL`, before or after its changes:
+  `rbac_history_committed` is deferred again as it fires. And `AsOf` under `WithTx` no longer counts
+  the host transaction's own changes, which haven't committed, where earlier code counted those
+  dated by its time: read them after the transaction commits.
   Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
   rolling upgrade across the two is unsafe: they key every lock apart, so a change by one waits for
   none by the other, and what each checks under its locks can change before it commits, as two
@@ -1037,7 +1135,12 @@ against, and nothing such a table runs, as its row security policy, runs as hist
   reads round until then and returns, though the host's own `errors.Is` of what it returns, or of
   what `Config.OnRefused` is told, can still read it forever. Changes to the same rows wait for
   each other by locks named for the schema holding the tables, so sessions reaching them through
-  different search_paths still do.
+  different search_paths still do. A host's transaction that changes the package's tables commits
+  having declared no cursor `WITH HOLD`, and with no enabled deferrable trigger on a temporary table
+  of its session: history refuses each as the transaction commits, with SQLSTATE 0A000, as it would
+  have its changes counted before they commit (see History), or where constraints were set
+  immediate, as the statement that did, or the first change after it. And the rest of its commit
+  waits for no lock past 100 ms, failing with SQLSTATE 55P03, where its `lock_timeout` is longer.
 - **What the host passes:** a check reads grants, memberships and groups as they are; only compiled
   conditions are cached. Read a resource's ancestors and attributes from where they are stored,
   never from request input, no earlier than the content they protect, and from the primary. A
