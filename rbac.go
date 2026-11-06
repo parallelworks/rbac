@@ -293,7 +293,28 @@ const decidedAt = "(SELECT at FROM decided)"
 // and whether that read is the first of its phase to read it (callClock.passed).
 func (a *Authorizer) readingNow() (time.Time, bool) {
 	first := a.clock != nil && !a.clock.read
+	if a.clock != nil && a.clock.changing {
+		a.clock.decided = true
+	}
 	return a.cfg.Now(), first
+}
+
+// expiredBy has the call decide no earlier than the latest time DeleteExpired deleted by that q's
+// snapshot sees, as decidedSQL has a read of an actor or a subject (callClock.passed): for a read
+// of many principals in one snapshot, as Holders', whose first statement it is, so every statement
+// of it decides at one time; and as the last statement of a change's transaction that read its
+// actor, where a run by a later time committing after that read, which the statements after it
+// read, as whether what the change gives breaks an exclusive dimension, has it tried again, rather
+// than decide them at the earlier time by what the run left. As of a time, it is that time.
+func (a *Authorizer) expiredBy(ctx context.Context, q DB) error {
+	if a.asOf || a.clock == nil {
+		return nil
+	}
+	var expired *time.Time
+	if err := q.QueryRow(ctx, `SELECT max(until) FROM rbac_expired`).Scan(&expired); err != nil || expired == nil {
+		return err
+	}
+	return a.clock.passed(*expired, false)
 }
 
 // exempting is the keys a deny exempts s by: its keys, and its identity even where it isn't a
@@ -1026,9 +1047,10 @@ type Config struct {
 	// it once more in its transaction, under its locks, where it decides again, the ends of what it
 	// writes included. A call a hook makes, as a constraint's of GroupsOf, is a call of its own and
 	// reads it apart, so what the hook decides by is of its own moment, not the asking call's. A call
-	// decides no earlier than the latest time DeleteExpired deleted by, which is a reading of its own
-	// Config.Now: keep every host's clock synchronized, as one running ahead has calls after its
-	// DeleteExpired decide as late as it.
+	// decides no earlier than the latest time DeleteExpired deleted by, its Config.Now, or the
+	// database's clock where that is earlier: keep every host's clock synchronized with the
+	// database's, as one running behind has calls after another's DeleteExpired decide later than it
+	// reads, and some changes tried again.
 	Now func() time.Time
 }
 
@@ -1294,8 +1316,9 @@ type callClock struct {
 	// picked whether it has.
 	before        time.Time
 	began, picked bool
-	// changing is set while a change's transaction runs (begin).
-	changing bool
+	// changing is set while a change's transaction runs (begin), and decided once it has read its
+	// actor or a subject there (readingNow), which its last statement then checks (expiredBy).
+	changing, decided bool
 }
 
 func (c *callClock) now() time.Time {
@@ -1335,8 +1358,12 @@ func (c *callClock) earlier() time.Time {
 // at it, as it found the rows ended by then deleted, or some of them, and what else the call
 // decides, as the conditions it evaluates and the statements after it, is of that moment too. In a
 // change's transaction, where a statement before the read decided at the earlier time, as whether
-// what it grants to stands, the change is tried again instead, which then reads the clock as no
-// earlier. first is whether the read was the first of its phase to read the time.
+// what it grants to stands, or one after it could have, as its last statement finds (expiredBy),
+// the change is tried again instead. Tried again, a change finds the time in the read of its actor
+// before its transaction, and from then on reads the host's clock as no earlier (reading), so it
+// decides at it in its transaction too, and is refused so again only where a run by a later time
+// still commits while it runs. first is whether the read was the first of its phase to read the
+// time.
 func (c *callClock) passed(expired time.Time, first bool) error {
 	if c == nil || !expired.After(c.expired) {
 		return nil
@@ -1346,7 +1373,7 @@ func (c *callClock) passed(expired time.Time, first bool) error {
 		return nil
 	}
 	if c.changing && !first {
-		return fmt.Errorf("%w: DeleteExpired, by a later clock than this change's, removed what had ended as the change read its actor; try again", ErrConflict)
+		return fmt.Errorf("%w: DeleteExpired, by a later time than this change's, removed what had ended while the change decided; try again", ErrConflict)
 	}
 	c.at = expired
 	return nil

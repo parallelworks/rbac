@@ -612,6 +612,13 @@ func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) (_ [
 	}
 	asks := a.asksValues(p, r)
 	got, err := snapshot(ctx, a, func(a *Authorizer) (listed, error) {
+		// Of one time no earlier than DeleteExpired deleted by, as a check decides, read first, so
+		// every statement of the snapshot decides at it: by an earlier time, a holder in a group whose
+		// place ended sooner, which a run passed over, and named by a deny through one whose place ended
+		// later, which it removed, would be listed, though at no moment did it hold p and escape it.
+		if err := a.expiredBy(ctx, a.db); err != nil {
+			return listed{}, err
+		}
 		holders, err := a.holders(ctx, p, r, roles, custom)
 		if err != nil || !asks {
 			return listed{holders: holders}, err
@@ -1395,7 +1402,10 @@ type Predicate struct {
 // one of them, the tenant's members give through them, when Filter was called, so a later query
 // keeps rows Authorize then refuses, as once a grant it counted has expired, and leaves out what a
 // custom role first granted to them since gives, or one granted to the members gives a subject
-// that has since become one. Build one for each query. The host's query must reach this package's
+// that has since become one. The query decides no earlier than the latest time DeleteExpired
+// deleted by that it sees, as a check does; with the label column, where that is later than the
+// time Filter decided the holding at, it keeps no row, so a query run once DeleteExpired has run
+// since Filter can come back empty. Build one for each query. The host's query must reach this package's
 // tables and call its function rbac_tenant_keys (they are in the pool's schema), and column names
 // are trusted host code; every value is an argument. It counts only unconditional grants, and
 // leaves out every resource a deny covers, conditional ones included, so it never keeps one
@@ -1490,6 +1500,18 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 		denied = slices.DeleteFunc(denied, func(t string) bool { return t == resourceType })
 		deniedByKey = fmt.Sprintf(`NOT %s IN (%s) AND `, own, denies("ARRAY["+arg(9)+"::text]"))
 	}
+	// The label, against the holding read now, as conditions of label grants can be evaluated only
+	// here, not in the statement: read first, as its read can have the call decide later
+	// (callClock.passed), so the statement decides no earlier than the holding was decided at.
+	var h Holding
+	if cols.Labels != "" {
+		if h, _, err = a.holding(ctx, tenant, s); err != nil {
+			return Predicate{}, err
+		}
+		if h.excludes(p) {
+			return Predicate{SQL: "FALSE"}, nil
+		}
+	}
 	now := a.cfg.Now()
 	// Which custom roles give p through the public and the tenant's members is read now, and the
 	// statement keeps of them those that still give it, and through the public those still public:
@@ -1533,17 +1555,8 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	if cols.Labels == "" {
 		return pred, nil
 	}
-	// The label, against the holding read now, as conditions of label grants can be evaluated only
-	// here, not in the statement.
-	h, _, err := a.holding(ctx, tenant, s)
-	if err != nil {
-		return Predicate{}, err
-	}
-	if h.excludes(p) {
-		return Predicate{SQL: "FALSE"}, nil
-	}
 	labels, args := a.listedBy(h, p, resourceType).labelColumn(cols.Labels, arg, len(pred.Args))
-	pred.SQL = "(" + pred.SQL + " AND " + labels + ")"
+	pred.SQL = "(" + pred.SQL + " AND " + labels + a.filterHolding(arg) + ")"
 	pred.Args = append(pred.Args, args...)
 	return pred, nil
 }
@@ -1712,13 +1725,28 @@ func (a *Authorizer) filterKeys(arg func(int) string, of string) string {
 // filterAt is SQL for the time Filter's statement decides at: the call's, or the later time
 // DeleteExpired deleted by that the host's statement sees, as decidedSQL decides a read of a
 // subject. The host runs it later than Filter read the time, by which a run can have removed what
-// ended since. Each use reads it in the statement's snapshot, so all read the same. arg numbers
-// Filter's arguments.
+// ended since. Each use reads it in the statement's snapshot, so all read the same; one older than
+// Filter's reads, as a host's REPEATABLE READ transaction begun before them takes, sees no run they
+// didn't, so it decides at the call's time, which no later run's removals it sees can mix with.
+// arg numbers Filter's arguments.
 func (a *Authorizer) filterAt(arg func(int) string) string {
 	if a.asOf {
 		return arg(4)
 	}
 	return "greatest(" + arg(4) + "::timestamptz, (SELECT max(until) FROM rbac_expired))"
+}
+
+// filterHolding is SQL, after the label's test, keeping a row only where Filter's statement decides
+// at the call's time, at which Filter decided the subject's label holding, which isn't read in the
+// statement: where a DeleteExpired by a later time committed before the statement, which then
+// decides later (filterAt), it keeps none, rather than a row its label kept by the holding of one
+// moment and its grants and denies of another, as a deny binding the subject no longer, and a value
+// only it held until then. Build the condition again. As of a time, it decides at that time.
+func (a *Authorizer) filterHolding(arg func(int) string) string {
+	if a.asOf {
+		return ""
+	}
+	return " AND (SELECT coalesce(max(until) <= " + arg(4) + "::timestamptz, true) FROM rbac_expired)"
 }
 
 // filterGrants is SQL selecting the scopes of the grants Filter's condition counts for its subject

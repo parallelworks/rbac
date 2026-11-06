@@ -385,6 +385,10 @@ func (b *beforeStatement) SendBatch(ctx context.Context, batch *pgx.Batch) pgx.B
 // what binds it, holds.
 const HeldMarker = "SELECT 0, id, principal, scope, role, expires_at, conditional"
 
+// ExcludesMarker is text only the statement reading who holds two values of an exclusive dimension
+// (conflictsIn) holds, which a change runs once it has read its actor.
+const ExcludesMarker = "HAVING count(DISTINCT value) > 1"
+
 // SetCheckingRole runs f each time a decision begins checking a role for a grant, until t ends.
 func SetCheckingRole(t *testing.T, f func()) {
 	t.Helper()

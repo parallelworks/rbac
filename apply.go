@@ -2159,11 +2159,16 @@ func (a *Authorizer) begin(ctx context.Context, fn func(pgx.Tx) error) error {
 	// One that fails before needing the time reads it there too, so its refusal is dated where it
 	// decided: a reading from before the locks can predate a change it waited for.
 	a.clock.before, a.clock.began, a.clock.read, a.clock.picked = a.clock.at, a.clock.read, false, false
-	a.clock.changing = true
+	a.clock.changing, a.clock.decided = true, false
 	defer func() { a.clock.changing = false }()
 	return begin(ctx, a.db, func(tx pgx.Tx) error {
 		w, end := watched(tx, a.clock)
 		err := fn(w)
+		// Last, so a run by a later time that committed once the change read its actor, which a
+		// statement after that read could find some of the removals of, has it tried again.
+		if err == nil && a.clock.decided {
+			err = a.expiredBy(ctx, w)
+		}
 		if end != nil {
 			err = end(err)
 		}
@@ -3338,9 +3343,11 @@ func removedWhere[T any](ctx context.Context, a *Authorizer, tx pgx.Tx, table, c
 // those a change is holding, and a membership one of whose places in groups a change holds, rather
 // than wait on it, so the next run removes them. It removes a batch at a time, on a pool each in a
 // transaction of its own, so none holds many locks, and on an error those it removed before stay
-// removed. Before it removes anything, it records Config.Now as the time it deletes by, which every
-// check and change decides no earlier than, so none reads a state its batches left that no moment
-// held. A race PostgreSQL refuses matches ErrConflict.
+// removed. Before it removes anything, it records the time it deletes by, which every check and
+// change decides no earlier than, so none reads a state its batches left that no moment held:
+// Config.Now, or the database's clock where that is earlier, so a host whose clock runs ahead, or
+// one setting Config.Now wrong, can't have every later call decide past the database's clock. A
+// race PostgreSQL refuses matches ErrConflict.
 func (a *Authorizer) DeleteExpired(ctx context.Context) (n int64, err error) {
 	defer a.refused(ctx, &err, "", Principal{}, "DeleteExpired")
 	defer conflicting(&err)
@@ -3385,13 +3392,23 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 	// once every row ended by it is ended to that read, those passed over and not reached yet too.
 	// Each run adds its own, deleting those no later, which only DeleteExpired writes: one another run
 	// is deleting it passes over, which goes with a time no earlier, so neither waits for the other,
-	// and the latest stays.
+	// and the latest stays. It is Config.Now, or the database's clock as it records it where that is
+	// earlier, and its batches delete by it: recorded as a clock ahead of the database's, as one set
+	// wrong, every later call of every host would decide as late, every grant ending before then
+	// read as ended, and never recover, as the time only moves on; and a batch removes nothing ended
+	// after the database's clock anyway. It checks the transaction's isolation as a batch does, so
+	// none at another records a time it then deletes nothing by.
 	if err := a.begin(ctx, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `WITH passed AS (
-			  DELETE FROM rbac_expired WHERE ctid = ANY(ARRAY(SELECT ctid FROM rbac_expired WHERE until <= $1 FOR UPDATE SKIP LOCKED))
+		var level string
+		if err := tx.QueryRow(ctx, `WITH passed AS (
+			  DELETE FROM rbac_expired WHERE ctid = ANY(ARRAY(SELECT ctid FROM rbac_expired WHERE until <= least($1, statement_timestamp()) FOR UPDATE SKIP LOCKED))
+			), recorded AS (
+			  INSERT INTO rbac_expired (until) VALUES (least($1, statement_timestamp())) RETURNING until
 			)
-			INSERT INTO rbac_expired (until) VALUES ($1)`, now)
-		return err
+			SELECT current_setting('transaction_isolation'), until FROM recorded`, now).Scan(&level, &now); err != nil {
+			return err
+		}
+		return readCommitted("a change", level)
 	}); err != nil {
 		return 0, err
 	}
