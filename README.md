@@ -913,6 +913,18 @@ against, and nothing such a table runs, as its row security policy, runs as hist
   What a rollback doesn't undo stayed, as setting history's id sequence back, after which a row's
   later records are numbered below its earlier ones, and `AsOf` reads it as it was before them. It
   now refuses before it reads a table, or calls a function or an operator its search_path finds.
+  `0027_broad_and_member_seeks` rebuilds `rbac_grants_custom_principal`, the index `Filter`,
+  `Reachable` and `Holders` read the custom roles the public's and the tenant's members' grants
+  name by, with a predicate of its own, which their statements name in place of the custom roles'
+  index's: so that index, which leads to the tenant alone, serves no plan of them whatever the
+  statistics, where by statistics from before a tenant granted custom roles, or with none, they read
+  every grant of one in the tenant through it. It locks `rbac_grants` until it commits, so checks,
+  lists and changes wait for the rebuild. Code from before it names the old predicate, which the
+  index no longer serves, so until every replica runs this release their searches read those grants
+  through another index, as the statistics have the planner pick. It also replaces
+  `rbac_group_members`, which keeps its owner and who may execute it and takes no lock on the
+  tables, to read a group's members and then their memberships planned for their number, so
+  `Holders` of any release reads a small group's members alone whatever other tenants call theirs.
   Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
   rolling upgrade across the two is unsafe: they key every lock apart, so a change by one waits for
   none by the other, and what each checks under its locks can change before it commits, as two

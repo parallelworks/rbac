@@ -230,9 +230,13 @@ func (a *Authorizer) broadArgs(ctx context.Context, q DB, tenant string, p Permi
 		return []any{nil, unprivileged, nil}, nil
 	}
 	in, args := "$5::text[]", []any{tenant, string(p), resourceType, on, keys}
+	// The subject's membership is looked up by a key no plan sees, as groupExists looks a group up:
+	// counted by the tenant's selectivity and the identity's apart, one in many tenants was counted
+	// in a large one as a thousand or more, and EXISTS, planned for the first, read every tenant's
+	// memberships to find it.
 	if identity != "" {
 		in = `ARRAY(SELECT k FROM unnest($5::text[]) AS c(k) WHERE k NOT LIKE 'members:%' OR EXISTS (SELECT FROM rbac_memberships
-			WHERE tenant = $1 AND principal = $6 AND (expires_at IS NULL OR expires_at > $7) AND NOT guest AND NOT suspended))`
+			WHERE tenant = $1 AND principal = (SELECT $6::text) AND (expires_at IS NULL OR expires_at > $7) AND NOT guest AND NOT suspended))`
 		args = append(args, identity, now)
 	}
 	// A broad key and a scope or a type at a time, and the roles they name by key: matched to both
