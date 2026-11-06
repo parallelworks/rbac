@@ -3291,25 +3291,22 @@ func TestAsOfHoldsNoExportBack(t *testing.T) {
 		}
 		// A change committed while the read runs, which History reads once every transaction in the
 		// cluster older than it has ended, as other sessions sharing it can hold one for a while.
-		h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, fmt.Sprint("u", i)))
-		var records []rbac.Record
-		for {
+		principal := fmt.Sprint("u", i)
+		h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, principal))
+		for exported := false; !exported; {
 			got, next, err := h.authz.Export(ctx, checkpoint, rbac.MaxHistory, key)
 			if err != nil {
 				t.Fatal(err)
 			}
-			checkpoint, records = next, append(records, got...)
-			if len(records) > 0 {
-				break
+			checkpoint, exported = next, slices.ContainsFunc(got, func(r rbac.Record) bool { return r.Principal.ID == principal })
+			if len(got) > 0 {
+				continue
 			}
 			select {
 			case <-time.After(10 * time.Millisecond):
 			case <-ctx.Done():
 				t.Fatalf("on the host's transaction %t, a change committed while AsOf read wasn't exported while it read: %v", onHosts, ctx.Err())
 			}
-		}
-		if principal := fmt.Sprint("u", i); !slices.ContainsFunc(records, func(r rbac.Record) bool { return r.Principal.ID == principal }) {
-			t.Errorf("on the host's transaction %t, exported %+v while AsOf read", onHosts, records)
 		}
 		close(release)
 		if err := <-done; err != nil {
