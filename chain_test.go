@@ -665,7 +665,7 @@ func TestAsOfAnswersByNothingAnExportLeavesOut(t *testing.T) {
 	u := h.as(t, "u")
 	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"), grant(cluster.Scope(), "cluster.login", rbac.User, "tmpl"))
 	restored := dbNow(t, h).UTC().Format("2006-01-02 15:04:05.999999+00")
-	restoreRows(t, h, fakeGrant("restored", restored, theirs, "9", false), fakeCommit(restored, theirs, "9"))
+	restoreRows(t, h, fakeGrant(restored, theirs, "9"), fakeCommit(restored, theirs, "9"))
 	// A revoke of u's grant held open past mid.
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {

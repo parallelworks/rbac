@@ -2606,21 +2606,13 @@ func otherCluster(t *testing.T, h *harness) (ours, theirs string) {
 	return ours, theirs
 }
 
-// fakeGrant is SQL inserting a grant version for principal, its row copied from user tmpl's grant,
-// as of at in cluster clu with txid: a create, or a delete (del) whose row is in before, not after.
-func fakeGrant(principal, at, clu, txid string, del bool) string {
-	op, row := "create", `jsonb_build_object('after', g)`
-	if del {
-		op, row = "delete", `jsonb_build_object('before', g)`
-	}
-	return fmt.Sprintf(`INSERT INTO rbac_history (effective_at, txid, cluster, tenant, entity, key, op, principal, role, scope, before, after, bytes)
-		SELECT timestamptz '%s', '%s'::xid8, '%s', tenant, entity, md5('%s-grant')::uuid::text, '%s', 'user:%s', role, scope,
-		  (r->'before'), (r->'after'), bytes
-		FROM rbac_history, LATERAL (SELECT after || jsonb_build_object(
-		    'id', md5('%s-grant')::uuid::text, 'principal', 'user:%s', 'principal_id', '%s') AS g) t,
-		  LATERAL (SELECT %s AS r) rr
-		WHERE entity = 'grant' AND principal = 'user:tmpl'`,
-		at, txid, clu, principal, op, principal, principal, principal, principal, row)
+// fakeGrant is SQL inserting the creation of user restored's grant, its row copied from user tmpl's
+// grant, as of at in cluster clu with txid.
+func fakeGrant(at, clu, txid string) string {
+	return fmt.Sprintf(`INSERT INTO rbac_history (effective_at, txid, cluster, tenant, entity, key, op, principal, role, scope, after, bytes)
+		SELECT timestamptz '%s', '%s'::xid8, '%s', tenant, entity, md5('restored-grant')::uuid::text, 'create', 'user:restored', role, scope,
+		  after || jsonb_build_object('id', md5('restored-grant')::uuid::text, 'principal', 'user:restored', 'principal_id', 'restored'), bytes
+		FROM rbac_history WHERE entity = 'grant' AND principal = 'user:tmpl'`, at, txid, clu)
 }
 
 // fakeCommit is SQL inserting a commit record of txid in cluster clu, dated at.
@@ -2642,7 +2634,7 @@ func TestAsOfDatesARestoredChangeWithinItsCluster(t *testing.T) {
 	mid := time.Date(2010, 1, 1, 0, 0, 0, 0, time.UTC)
 	restoreRows(t, h,
 		// A grant restored from another cluster, committed there long ago, keyed by txid 500.
-		fakeGrant("restored", old.Format("2006-01-02 15:04:05"), theirs, "500", false),
+		fakeGrant(old.Format("2006-01-02 15:04:05"), theirs, "500"),
 		fakeCommit(old.Add(time.Second).Format("2006-01-02 15:04:05"), theirs, "500"),
 		// This cluster later gives txid 500 to a transaction that commits after mid: a collision.
 		fakeCommit("2020-01-01 00:00:00", ours, "500"),
