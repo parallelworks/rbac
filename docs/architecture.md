@@ -414,8 +414,10 @@ sequenceDiagram
   to its copy reads its write when the call asks it again, and nothing decided or asked of another
   hook does. A copy holds no more than a check converts (`maxConverted`), counted alike, one for
   each value, a string too, and a tenth of each other byte copied whole, so it counts no more than
-  converting the same does: past it the hook can't be asked, and the call is refused as
-  `ErrDenied`. Counting a list's elements twice, a string by the bytes of its header, or a
+  converting the same does: past it the hook can't be asked, and the call is refused (`uncopied`)
+  as any other, a `DeniedError` of the permission on the resource asked about, or the tenant, whose
+  `Reason` names the hook and whose message only the permission. Counting a list's elements
+  twice, a string by the bytes of its header, or a
   protobuf `Value` and its field apart, attributes a check converts couldn't be copied. A slice
   reached at several lengths is copied once from where it starts, each length a slice of the copy,
   and one reached while its elements are copied, before a longer length outgrew that copy, a slice
@@ -777,7 +779,10 @@ flowchart LR
 - **Holders** lists who may do a permission on a resource, for an access review. That is each
   identity, through its own grants and its groups', with the tenant's members and the public as
   one holder each. It marks holders that hold only under a condition, or that a deny, a
-  constraint or a label may refuse. For a labeled resource it reads every identity's label values'
+  constraint or a label may refuse. It evaluates no condition, so it lists too many rather than
+  too few: a conditional grant or deny marks its holder whatever the condition reads, the resource
+  alone too, and a deny leaves out whom it binds only where it has no condition
+  (`boundByDenies`). For a labeled resource it reads every identity's label values'
   grants and denies in one statement in the list's snapshot, and narrows that read once for all of
   them to the roles giving values (`valuesOfAll`), so each identity walks only its grants of those:
   narrowed for each, 1,000 holders, the tenant's members granted 300 roles of 1,000 other
@@ -876,6 +881,19 @@ flowchart TB
 - **READ COMMITTED.** A change runs at READ COMMITTED, as its checks under the locks must read what
   committed before the locks were taken. Under `WithTx` the host's transaction must be at READ
   COMMITTED too, as must one `Migrate` is given.
+- **One goroutine at a time on a transaction.** An Authorizer bound to a transaction or a
+  connection, as `WithTx` and AsOf's read give and `New` returns on a `pgx.Tx` or a `*pgx.Conn`,
+  runs every call on that one connection, which pgx doesn't make safe for concurrent use: calls on
+  it from several goroutines at once can panic in pgx's watch of a context, fail as the connection
+  busy, or race on what the connection keeps, as the map of its cache of prepared statements,
+  whose concurrent use the runtime ends the process for. The package adds no guard, as pgx adds
+  none: one that made overlapping calls take turns, or refused them, made a hook's call back in
+  wait for what its own goroutine held, some for good, where pgx failed fast or ran it. A hook
+  calls back in one call at a time, between a call's statements, as constraints and `ValidateGrant`
+  are asked, or in a change's savepoint, as `OnChange` is. For an access review in parallel, a
+  host runs several `AsOf` calls on a pool's Authorizer, each in a transaction of its own. New's
+  Authorizer on a pool is safe for concurrent use as the pool is, and one on a host's own DB as
+  that is.
 - **A host's own DB.** One that is neither a pool, a connection nor a `pgx.Tx` begins with `Begin`,
   and its first statement sets the isolation a change or a read of one snapshot needs (`isolated`):
   another level first, then that one. A savepoint of a transaction under way, as a wrapper around

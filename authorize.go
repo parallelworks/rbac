@@ -545,29 +545,33 @@ type Holder struct {
 	// Groups are the groups whose grants give an identity p, by id: those granted, which it is in
 	// directly or through others.
 	Groups []string
-	// Conditional is set when every grant giving it p has a condition, so whether it may depends on
-	// the request.
+	// Conditional is set when every grant giving it p has a condition, which Holders doesn't
+	// evaluate: whether it may depends on them, as on the request, and is set too where they read
+	// only r, which decides them whatever the request, as one that never holds of r.
 	Conditional bool
-	// MaybeDenied is set when a deny on the path may bind it: one whose condition depends on the
-	// request, or for the members or the public one that may bind some of them; and when a
-	// constraint may remove the permission from it. It is set too when the resource's label may
-	// refuse it: where a condition, or a constraint as Holders asks it, decides its label values,
-	// and for the members or the public, who hold values each their own; as it is for them where p
-	// is a value of an exclusive dimension, which some of them may hold none of.
+	// MaybeDenied is set when a deny on the path may bind it: one with a condition, which Holders
+	// doesn't evaluate, so it is set too where the deny binds it on r whatever the request, or never
+	// does, as one reading only r's attributes; or for the members or the public one that may bind
+	// some of them; and when a constraint may remove the permission from it. It is set too when the
+	// resource's label may refuse it: where a condition, or a constraint as Holders asks it, decides
+	// its label values, and for the members or the public, who hold values each their own; as it is
+	// for them where p is a value of an exclusive dimension, which some of them may hold none of.
 	MaybeDenied bool
 }
 
 // Holders lists who may do p to r, the AuthZEN subject search, for an access review: every
 // identity a member or guest of the tenant, not suspended, that a grant on r's path gives p, its own
 // or through its groups', and the tenant's members and the public where grants to them give it. It
-// counts conditional grants and marks them, and leaves out a holder a deny on the path binds,
-// marking one that a deny may bind: it reads the groups a deny names, and whom it exempts, as
-// checks do. Where a constraint may remove p, it marks each holder it may remove p from, asked
-// about as ConstraintInput says. An identity's record counts its own grants and its groups', not
-// the members' or the public's, which are records of their own. It has no limit or cursor, so what
-// it returns grows with the holders, as every identity in a group granted on the tenant; and it
-// reads every grant on the path, of any role, so it takes longer with those that don't give p too,
-// as many to other members on the tenant.
+// evaluates no condition, so a review reads too many rather than too few: it counts conditional
+// grants and marks their holders Conditional, and leaves out a holder a deny on the path binds only
+// where the deny has no condition, marking one a conditional deny binds MaybeDenied, so those it
+// marks include some a condition reading only r refuses, or allows, whatever the request. It reads
+// the groups a deny names, and whom it exempts, as checks do. Where a constraint may remove p, it
+// marks each holder it may remove p from, asked about as ConstraintInput says. An identity's record
+// counts its own grants and its groups', not the members' or the public's, which are records of
+// their own. It has no limit or cursor, so what it returns grows with the holders, as every
+// identity in a group granted on the tenant; and it reads every grant on the path, of any role, so
+// it takes longer with those that don't give p too, as many to other members on the tenant.
 func (a *Authorizer) Holders(ctx context.Context, p Permission, r Resource) (_ []Holder, err error) {
 	defer conflicting(&err)
 	a = a.still()

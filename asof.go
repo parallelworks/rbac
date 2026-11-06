@@ -57,6 +57,12 @@ var asOfEntities = []struct {
 // WithTx on the Authorizer read is given returns it as it is, reading the past on its own
 // transaction.
 //
+// The Authorizer read is given runs every call on that one transaction, as WithTx's does, so it is
+// for one goroutine at a time: for an access review in parallel, run several AsOf calls on a pool's
+// Authorizer, each on its own goroutine. Make read's calls on it, not on the Authorizer AsOf was
+// called on: one bound to a transaction, as WithTx's, runs in AsOf's savepoint until AsOf returns,
+// and so reads the past, and one on a pool reads the tables as they are now.
+//
 // It reads in one transaction, or a savepoint of the host's under WithTx, in which temporary
 // views named as the package's tables stand in for them, and rolls it back, even once ctx is
 // done. Every statement there is planned for its arguments, the host's under WithTx too, as

@@ -1467,6 +1467,55 @@ func holderPrincipals(holders []rbac.Holder) []rbac.Principal {
 	return ps
 }
 
+// Holders evaluates no condition, so an access review lists too many rather than too few: a holder
+// whose every grant has a condition is listed and marked Conditional, and one a conditional deny
+// binds is listed and marked MaybeDenied, though each condition here reads the resource alone, so
+// a check decides it whatever the request. Only a deny with no condition leaves out whom it binds.
+func TestHoldersMarksConditionalGrantsAndDeniesWithoutEvaluatingThem(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	prod := cluster
+	prod.Attributes = map[string]any{"env": "prod"}
+	onDev := grant(prod.Scope(), "cluster.login", rbac.User, "dev")
+	onDev.Condition = rbac.Condition{Expression: `resource.attributes.env == "dev"`}
+	h.seed(t, onDev, grant(prod.Scope(), "cluster.login", rbac.User, "always"), grant(prod.Scope(), "cluster.login", rbac.User, "never"),
+		grant(prod.Scope(), "cluster.login", rbac.User, "unconditional"))
+	subjects := map[string]rbac.Subject{}
+	for _, id := range []string{"dev", "always", "never", "unconditional"} {
+		subjects[id] = h.as(t, id)
+	}
+	for _, d := range []rbac.Deny{
+		{ID: "always", Principals: []rbac.Principal{identity("always")}, Permissions: []rbac.Permission{login}, Condition: rbac.Condition{Expression: `resource.attributes.env == "prod"`}},
+		{ID: "never", Principals: []rbac.Principal{identity("never")}, Permissions: []rbac.Permission{login}, Condition: rbac.Condition{Expression: `resource.attributes.env == "dev"`}},
+		{ID: "unconditional", Principals: []rbac.Principal{identity("unconditional")}, Permissions: []rbac.Permission{login}},
+	} {
+		if err := h.authz.SetDeny(ctx, guardian, prod, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, c := range []context.Context{ctx, rbac.WithRequest(ctx, map[string]any{"mfa": true})} {
+		for id, allowed := range map[string]bool{"dev": false, "always": false, "never": true, "unconditional": false} {
+			if err := h.authz.Authorize(c, subjects[id], login, prod); (err == nil) != allowed {
+				t.Errorf("Authorize(%s) = %v, whatever the request", id, err)
+			}
+		}
+	}
+	holders, err := h.authz.Holders(ctx, login, prod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type marks struct{ conditional, maybeDenied bool }
+	got := map[string]marks{}
+	for _, hd := range holders {
+		if _, ok := subjects[hd.Principal.ID]; ok && hd.Principal.Kind == rbac.User {
+			got[hd.Principal.ID] = marks{hd.Conditional, hd.MaybeDenied}
+		}
+	}
+	if want := map[string]marks{"dev": {conditional: true}, "always": {maybeDenied: true}, "never": {maybeDenied: true}}; !maps.Equal(got, want) {
+		t.Errorf("Holders marks %+v, not %+v", got, want)
+	}
+}
+
 func TestAMisspelledPermissionOrTypeIsInvalid(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -2697,6 +2746,59 @@ func TestAHookIsGivenACopyOfNoMoreThanACheckConverts(t *testing.T) {
 		if err := h.authz.Apply(t.Context(), u, cluster, change); !errors.Is(err, rbac.ErrDenied) {
 			t.Errorf("constrained %t: a change by an actor passing past what a check converts: %v", constrained, err)
 		}
+	}
+}
+
+// A call refused because a hook can't be given a copy is refused as any other: a DeniedError, of
+// the permission on the resource asked about, or the tenant, whose message names only the
+// permission and whose Reason names the hook. Wrapping ErrDenied, its message named the constraint,
+// and a user who can write a resource's tags could have any check of it show that name.
+func TestARefusalForWhatAHookCantBeGivenNamesOnlyThePermission(t *testing.T) {
+	tags := map[string]any{}
+	for i := range rbac.MaxConverted {
+		tags[fmt.Sprint("t", i)] = "v"
+	}
+	const name = "freeze-project-x"
+	for _, constrained := range []bool{true, false} {
+		h := setup(t, func(c *rbac.Config) {
+			if constrained {
+				c.Constraints = []rbac.Constraint{{Name: name, Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) {
+					return false, nil
+				}}}
+			}
+		})
+		ctx := t.Context()
+		h.seed(t, grant(cluster.Scope(), "cluster.admin", rbac.User, "u"))
+		h.as(t, "x")
+		u := h.as(t, "u")
+		tagged := cluster
+		tagged.Attributes = map[string]any{"tags": tags}
+		heavy := u
+		heavy.Attributes = map[string]any{"tags": tags}
+		hook := "ValidateGrant"
+		if constrained {
+			hook = fmt.Sprintf("constraint %q", name)
+		}
+		refused := func(what string, err error, p rbac.Permission, on rbac.Scope) {
+			t.Helper()
+			var denied *rbac.DeniedError
+			switch {
+			case !errors.As(err, &denied):
+				t.Errorf("constrained %t: %s: %v, not a DeniedError", constrained, what, err)
+			case denied.Permission != p || denied.Scope != on || !strings.Contains(denied.Reason, hook):
+				t.Errorf("constrained %t: %s: %+v, not of %s on %s by %s", constrained, what, *denied, p, on.Key(), hook)
+			case strings.Contains(err.Error(), name) || strings.Contains(err.Error(), "ValidateGrant"):
+				t.Errorf("constrained %t: %s: the message names the hook: %v", constrained, what, err)
+			}
+		}
+		change := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("x")}}}
+		refused("a change by an actor passing past what a check converts", h.authz.Apply(ctx, heavy, cluster, change), grantC, cluster.Scope())
+		if !constrained {
+			continue
+		}
+		refused("a check of a resource tagged past what a check converts", h.authz.Authorize(ctx, u, login, tagged), login, cluster.Scope())
+		_, err := h.authz.Reachable(ctx, heavy, login, "t1", "cluster")
+		refused("a search by a subject passing past what a check converts", err, login, rbac.TenantRoot("t1"))
 	}
 }
 

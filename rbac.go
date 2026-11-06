@@ -534,12 +534,13 @@ type Constraint struct {
 // its write when the call asks it again, and a call after it is given a copy afresh. Copied for each
 // ask, Permissions of 300 permissions on a resource of 20,000 tags took a second. A copy holds no
 // more than a check converts (Attributes), counted as converting counts it: where the subject's or
-// the resource's hold more, the constraint can't be asked, and the call is refused as ErrDenied, as
-// is a change whose actor's attributes ValidateGrant can't be given for that. A protobuf message
-// among them is copied by its fields, each message it reaches once, so one holding itself is given
-// as a copy holding itself, as a map holding itself is. A slice reached at several lengths is copied
-// once, each length a slice of the copy, and a value holding no map, slice or pointer, as an array,
-// is shared where an interface holds it, as nothing writes to it through one. A message of a
+// the resource's hold more, the constraint can't be asked, and the call is refused as a DeniedError
+// whose Reason names it and whose message doesn't, as is a change whose actor's attributes
+// ValidateGrant can't be given for that. A protobuf message among them is copied by its fields,
+// each message it reaches once, so one holding itself is given as a copy holding itself, as a map
+// holding itself is. A slice reached at several lengths is copied once, each length a slice of the
+// copy, and a value holding no map, slice or pointer, as an array, is shared where an interface
+// holds it, as nothing writes to it through one. A message of a
 // host's type that is its own reflection but makes messages of another, as one embedding a dynamic
 // message does, is copied as any other pointer of the host's type, by the struct it points to, so a
 // constraint reads the type the host passed, in a list, a field or a map of that type too: its
@@ -645,11 +646,13 @@ type given struct {
 	ok       bool
 }
 
-// errUncopied refuses a call where a hook can't be given a copy of what it would be asked about,
-// as the host passed more than a check converts: unasked, a constraint could remove what the call
-// allows, or ValidateGrant refuse what it grants.
-func errUncopied(hook string) error {
-	return fmt.Errorf("%w: %s can't be asked: what it would be given is more than a hook is given a copy of", ErrDenied, hook)
+// uncopied refuses, as a DeniedError of p on scope, a call where a hook can't be given a copy of
+// what it would be asked about, as the host passed more than a check converts: unasked, a
+// constraint could remove what the call allows, or ValidateGrant refuse what it grants. Its Reason
+// names the hook, as one naming a constraint that removes p does, and its message only p: a
+// tenant's users can write what takes the attributes past it, as a resource's tags.
+func uncopied(p Permission, scope Scope, hook string) error {
+	return &DeniedError{Permission: p, Scope: scope, Reason: hook + " can't be asked: what it would be given is more than a hook is given a copy of"}
 }
 
 var (
@@ -988,7 +991,13 @@ type Config struct {
 	Now func() time.Time
 }
 
-// Authorizer decides and changes grants, on the tables Migrate creates.
+// Authorizer decides and changes grants, on the tables Migrate creates. One New returns on a pool is
+// safe for concurrent use. One bound to a transaction or a connection, as WithTx and AsOf's read
+// give and New returns on a pgx.Tx or a *pgx.Conn, runs every call on that one connection, so it is
+// for one goroutine at a time, as the pgx.Tx or connection is: concurrent use isn't supported, and
+// pgx may fail, race or panic. For an access review in parallel, run several AsOf calls on a pool's
+// Authorizer, each on its own goroutine. On a DB of the host's own, it is as safe for concurrent
+// use as that DB.
 type Authorizer struct {
 	db  DB
 	cfg Config
@@ -1038,7 +1047,9 @@ type permissionOn struct {
 	t string
 }
 
-// New checks the configuration and returns an Authorizer that runs its queries on db.
+// New checks the configuration and returns an Authorizer that runs its queries on db: safe for
+// concurrent use on a pool, and on a pgx.Tx or a *pgx.Conn for one goroutine at a time
+// (Authorizer).
 func New(db DB, cfg Config) (*Authorizer, error) {
 	if db == nil {
 		return nil, errors.New("rbac: nil DB")
@@ -1195,6 +1206,10 @@ func vocabulary(declared []Permission, given map[Permission]bool, roleTypes map[
 // on tx at its isolation: at READ COMMITTED each reads a snapshot of its own, so a change committing
 // between them can mix two states, as can AsOf's read, in a savepoint of tx, of a time not yet final
 // (AsOf).
+//
+// The Authorizer it returns runs every call on tx, one connection, so it is for one goroutine at a
+// time, as tx is: calls on it from several at once aren't supported, and pgx may fail, race or
+// panic. A hook may call back into it, one call at a time, as from the call that asks it.
 func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 	// One AsOf gave reads its own transaction, whose views are the past: on another, it would read
 	// the tables as they are now.
@@ -1308,12 +1323,16 @@ const (
 // asked about copies of its own (givenTo), so one that writes to what it is given changes neither
 // what is decided, its input already validated, nor what another hook is asked, only what it is
 // itself asked later in the call. A hook that can't be given a copy, as the attributes are past
-// what a check converts, refuses the call (errUncopied).
+// what a check converts, refuses the call (uncopied), on the resource asked about, or the tenant.
 func (a *Authorizer) denied(ctx context.Context, in ConstraintInput) (string, error) {
 	for i, c := range a.cfg.Constraints {
 		given, ok := a.givenTo(i, in)
 		if !ok {
-			return "", errUncopied(fmt.Sprintf("constraint %q", c.Name))
+			scope := TenantRoot(in.Tenant)
+			if in.Resource != nil {
+				scope = in.Resource.Scope()
+			}
+			return "", uncopied(in.Permission, scope, fmt.Sprintf("constraint %q", c.Name))
 		}
 		deny, err := c.Deny(ctx, a.db, given)
 		if err != nil {
