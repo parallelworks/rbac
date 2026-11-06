@@ -32,11 +32,15 @@ CREATE INDEX rbac_grants_custom_principal ON rbac_grants (principal, tenant, sco
 -- members are read first, and then joined to their memberships by a statement planned for them,
 -- whose number the planner counts exactly in the arrays it is given: a few are looked up by their
 -- keys, and many read with the tenant's memberships. Both statements read the calling statement's
--- snapshot, as the function is stable. Replacing it keeps its owner and who may execute it; it has
--- no settings, and takes no lock on the tables.
+-- snapshot, as the function is stable. Without standing, the members alone are read in one
+-- statement, as before: read into arrays first, a group of 20,000 took twice as long. Replacing it
+-- keeps its owner and who may execute it; it has no settings, and takes no lock on the tables.
 CREATE OR REPLACE FUNCTION rbac_group_members(tenant text, groups text[], at timestamptz, principals text[], standing boolean)
     RETURNS TABLE (group_id text, principal text, guest boolean) LANGUAGE plpgsql STABLE PARALLEL RESTRICTED AS $$
 DECLARE
+    places CONSTANT text := ' FROM rbac_members m
+        WHERE m.tenant = $1 AND m.group_id = ANY ($2) AND m.principal NOT LIKE ''group:%''
+          AND (m.expires_at IS NULL OR m.expires_at > $3) AND ($4 IS NULL OR m.principal = ANY ($4))';
     ids  text[];
     keys text[];
 BEGIN
@@ -44,14 +48,13 @@ BEGIN
     IF coalesce(cardinality(groups), 0) = 0 THEN
         RETURN;
     END IF;
-    EXECUTE 'SELECT array_agg(m.group_id), array_agg(m.principal) FROM rbac_members m
-        WHERE m.tenant = $1 AND m.group_id = ANY ($2) AND m.principal NOT LIKE ''group:%''
-          AND (m.expires_at IS NULL OR m.expires_at > $3) AND ($4 IS NULL OR m.principal = ANY ($4))'
-        INTO ids, keys USING tenant, groups, at, principals;
     IF standing IS NOT TRUE THEN
-        RETURN QUERY SELECT u.g, u.p, NULL::boolean FROM unnest(ids, keys) AS u(g, p);
+        RETURN QUERY EXECUTE 'SELECT m.group_id::text, m.principal::text, NULL::boolean' || places
+            USING tenant, groups, at, principals;
         RETURN;
     END IF;
+    EXECUTE 'SELECT array_agg(m.group_id), array_agg(m.principal)' || places
+        INTO ids, keys USING tenant, groups, at, principals;
     RETURN QUERY EXECUTE 'SELECT u.g, u.p, s.guest FROM unnest($2::text[], $3::text[]) AS u(g, p)
         JOIN rbac_memberships s ON s.tenant = $1 AND s.principal = u.p COLLATE "C"
           AND NOT s.suspended AND (s.expires_at IS NULL OR s.expires_at > $4)'
