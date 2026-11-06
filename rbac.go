@@ -268,6 +268,34 @@ func keysSQL(tenant, identity, now string) string {
 	)`, tenant, identity, now)
 }
 
+// decidedSQL is SQL defining, in a WITH, decided(at, expired): the time a statement reading an
+// actor or a subject decides at, given now, SQL for the call's time, and the latest time
+// DeleteExpired deleted by that its snapshot sees, as rbac_expired records it, null for none. It
+// decides at the later of the two (decidedAt). DeleteExpired removes what has ended in transactions
+// of its own, places in groups before memberships, passing over what a change holds, so a read by an
+// earlier time could find a later-ending row removed and an earlier-ending one left, a state no
+// moment held: as the place a deny binds the subject by gone, and the membership or place its power
+// comes through still there. It records the time before it removes anything, so a snapshot seeing
+// any of its removals sees it; and every row it removed or passed over has ended by it. The caller
+// has the call decide at it too (callClock.passed). As of a time, it is that time.
+func (a *Authorizer) decidedSQL(now string) string {
+	if a.asOf {
+		return `decided(at, expired) AS (SELECT ` + now + `::timestamptz, NULL::timestamptz)`
+	}
+	return `decided(at, expired) AS (SELECT greatest(` + now + `::timestamptz, e.until), e.until
+		FROM (SELECT max(until) AS until FROM rbac_expired) e)`
+}
+
+// decidedAt is SQL for the time decidedSQL defines.
+const decidedAt = "(SELECT at FROM decided)"
+
+// readingNow is the call's time for a read of an actor or a subject, read now where it hasn't been,
+// and whether that read is the first of its phase to read it (callClock.passed).
+func (a *Authorizer) readingNow() (time.Time, bool) {
+	first := a.clock != nil && !a.clock.read
+	return a.cfg.Now(), first
+}
+
 // exempting is the keys a deny exempts s by: its keys, and its identity even where it isn't a
 // member or guest, as a grant to the public still reaches it there.
 func exempting(keys []string, s Subject) []string {
@@ -290,28 +318,33 @@ func counted(public, members string) string {
 }
 
 // keysOf reads the principal keys s is in a tenant, and those a deny binds it by, each sorted, as
-// keysSQL defines them.
+// keysSQL defines them, deciding no earlier than DeleteExpired has deleted by (decidedSQL).
 func (a *Authorizer) keysOf(ctx context.Context, q DB, tenant string, s Subject) (keys, binding []string, err error) {
-	return a.keysAt(ctx, q, tenant, s, a.cfg.Now())
+	now, first := a.readingNow()
+	return a.keysAt(ctx, q, tenant, s, now, first)
 }
 
-// keysAt is keysOf at a time.
-func (a *Authorizer) keysAt(ctx context.Context, q DB, tenant string, s Subject, at time.Time) (keys, binding []string, err error) {
-	rows, err := q.Query(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`
-		SELECT k, k IN (SELECT k FROM keys) FROM bound ORDER BY k`, tenant, s.identityKey(), at)
+// keysAt is keysOf at a time, first as readingNow says of the call's time.
+func (a *Authorizer) keysAt(ctx context.Context, q DB, tenant string, s Subject, at time.Time, first bool) (keys, binding []string, err error) {
+	rows, err := q.Query(ctx, `WITH RECURSIVE `+a.decidedSQL("$3")+`, `+keysSQL("$1::text", "$2::text", decidedAt)+`
+		SELECT k, k IN (SELECT k FROM keys), (SELECT expired FROM decided) FROM bound ORDER BY k`, tenant, s.identityKey(), at)
 	if err != nil {
 		return nil, nil, err
 	}
 	var k string
 	var in bool
-	_, err = pgx.ForEachRow(rows, []any{&k, &in}, func() error {
+	var expired *time.Time
+	_, err = pgx.ForEachRow(rows, []any{&k, &in, &expired}, func() error {
 		if in {
 			keys = append(keys, k)
 		}
 		binding = append(binding, k)
 		return nil
 	})
-	return keys, binding, err
+	if err != nil || expired == nil {
+		return keys, binding, err
+	}
+	return keys, binding, a.clock.passed(*expired, first)
 }
 
 // countedOf keeps the keys whose grants a read counts.
@@ -992,7 +1025,10 @@ type Config struct {
 	// the call runs could meet a deny, a condition or label values of a later moment. A change reads
 	// it once more in its transaction, under its locks, where it decides again, the ends of what it
 	// writes included. A call a hook makes, as a constraint's of GroupsOf, is a call of its own and
-	// reads it apart, so what the hook decides by is of its own moment, not the asking call's.
+	// reads it apart, so what the hook decides by is of its own moment, not the asking call's. A call
+	// decides no earlier than the latest time DeleteExpired deleted by, which is a reading of its own
+	// Config.Now: keep every host's clock synchronized, as one running ahead has calls after its
+	// DeleteExpired decide as late as it.
 	Now func() time.Time
 }
 
@@ -1245,22 +1281,37 @@ func (a *Authorizer) still() *Authorizer {
 // condition, a deny or label values of a later moment in an answer no single moment gave. A change
 // reads it again in its transaction (begin), once it holds every lock it waits for, where it
 // decides again by what committed before them: read before a wait, it would decide at a time the
-// wait has left behind, as by an actor's power that ended meanwhile.
+// wait has left behind, as by an actor's power that ended meanwhile. A read of an actor or a
+// subject decides no earlier than DeleteExpired has deleted by (passed).
 type callClock struct {
 	host func() time.Time
 	at   time.Time
 	read bool
+	// expired is the latest time DeleteExpired deleted by that a read of the call found (passed),
+	// which every reading of the host's clock after it is taken as, where it is later.
+	expired time.Time
 	// before is the time a change's transaction picks what it locks by (earlier), once began, and
 	// picked whether it has.
 	before        time.Time
 	began, picked bool
+	// changing is set while a change's transaction runs (begin).
+	changing bool
 }
 
 func (c *callClock) now() time.Time {
 	if !c.read {
-		c.at, c.read = c.host(), true
+		c.at, c.read = c.reading(), true
 	}
 	return c.at
+}
+
+// reading is the host's clock, or where later, the time DeleteExpired deleted by that the call
+// found.
+func (c *callClock) reading() time.Time {
+	if t := c.host(); t.After(c.expired) {
+		return t
+	}
+	return c.expired
 }
 
 // earlier is the time by which a change's transaction picks, of what is in force, what it holds
@@ -1272,11 +1323,33 @@ func (c *callClock) earlier() time.Time {
 	if !c.began {
 		c.before, c.began = c.at, true
 		if !c.read {
-			c.before = c.host()
+			c.before = c.reading()
 		}
 	}
 	c.picked = true
 	return c.before
+}
+
+// passed has the call decide at expired, the latest time DeleteExpired deleted by that a read of an
+// actor or a subject found (decidedSQL), where that is later than the call's time: the read decided
+// at it, as it found the rows ended by then deleted, or some of them, and what else the call
+// decides, as the conditions it evaluates and the statements after it, is of that moment too. In a
+// change's transaction, where a statement before the read decided at the earlier time, as whether
+// what it grants to stands, the change is tried again instead, which then reads the clock as no
+// earlier. first is whether the read was the first of its phase to read the time.
+func (c *callClock) passed(expired time.Time, first bool) error {
+	if c == nil || !expired.After(c.expired) {
+		return nil
+	}
+	c.expired = expired
+	if !c.read || !expired.After(c.at) {
+		return nil
+	}
+	if c.changing && !first {
+		return fmt.Errorf("%w: DeleteExpired, by a later clock than this change's, removed what had ended as the change read its actor; try again", ErrConflict)
+	}
+	c.at = expired
+	return nil
 }
 
 // wentBack refuses a change whose transaction decided at a time before the one it picked what it

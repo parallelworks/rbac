@@ -472,13 +472,28 @@ func (r *readmeRoles) harden(t *testing.T) {
 		`ALTER FUNCTION ` + s + `.rbac_record() OWNER TO ` + r.history,
 		`GRANT USAGE ON SCHEMA ` + s + ` TO ` + r.history,
 		`GRANT EXECUTE ON FUNCTION ` + s + `.rbac_tenant_keys, ` + s + `.rbac_text_array TO ` + r.history,
-		// 3. The application's role has USAGE on the schema, SELECT, INSERT, UPDATE and DELETE on
-		// its tables but rbac_history and rbac_migrations, EXECUTE on rbac_group_members,
-		// rbac_tenant_keys, rbac_text_array and rbac_changes_grants, and only SELECT on rbac_history.
+		// 3. The application's role has USAGE on the schema, EXECUTE on rbac_group_members,
+		// rbac_tenant_keys, rbac_text_array and rbac_changes_grants, and its privileges on the
+		// tables (tables).
 		`GRANT USAGE ON SCHEMA ` + s + ` TO ` + r.app,
+		`GRANT EXECUTE ON FUNCTION ` + strings.Join(made, ", ") + ` TO ` + r.app,
+	} {
+		if _, err := r.super.Exec(t.Context(), sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	r.tables(t)
+}
+
+// tables gives the application's role, as the README's step 3 says, SELECT, INSERT, UPDATE and
+// DELETE on the package's tables but rbac_history and rbac_migrations, those a later migration adds
+// too, and only SELECT on rbac_history.
+func (r *readmeRoles) tables(t *testing.T) {
+	t.Helper()
+	s := r.schema
+	for _, sql := range []string{
 		`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ` + s + ` TO ` + r.app,
 		`REVOKE ALL ON ` + s + `.rbac_migrations FROM ` + r.app,
-		`GRANT EXECUTE ON FUNCTION ` + strings.Join(made, ", ") + ` TO ` + r.app,
 		`REVOKE INSERT, UPDATE, DELETE ON ` + s + `.rbac_history FROM ` + r.app,
 	} {
 		if _, err := r.super.Exec(t.Context(), sql); err != nil {
@@ -513,6 +528,9 @@ func TestThePackageRunsAsTheReadmesDatabaseRoles(t *testing.T) {
 			}
 			if !upgrade {
 				r.harden(t)
+			} else {
+				// On any table the last migration added.
+				r.tables(t)
 			}
 			cfg := rbac.Config{
 				Catalog:        append(slices.Clone(catalog), guardRole, groupMembers, rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}),

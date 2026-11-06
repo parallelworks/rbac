@@ -195,11 +195,13 @@ func (a *Authorizer) decideBy(ctx context.Context, s Subject, p Permission, r Re
 // explain is Explain's decision once no constraint removes p: every grant that allows it, or why
 // none does.
 func (a *Authorizer) explain(ctx context.Context, s Subject, p Permission, r Resource, counts broad) (Decision, error) {
-	vars, spend := a.vars(ctx, s, p, r), a.grantBudget(r.path())
 	keys, binding, err := a.keysOf(ctx, a.db, r.Tenant, s)
 	if err != nil {
 		return Decision{}, err
 	}
+	// After the keys, whose read can have the call decide later (callClock.passed), as request.time
+	// reads the time it decides at.
+	vars, spend := a.vars(ctx, s, p, r), a.grantBudget(r.path())
 	principals := countedOf(keys, counts)
 	// As Authorize, which reads no deny for a subject none of whose grants can give p.
 	if len(principals) > 0 {
@@ -1431,7 +1433,7 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	if listed, covering, ok := matchable(p); ok {
 		perm, wildcard = listed, covering
 	}
-	keys := func(of string) string { return filterKeys(arg, of) }
+	keys := func(of string) string { return a.filterKeys(arg, of) }
 	grants := func(types string) string { return a.filterGrants(arg, custom, alone, types) }
 	// The denies on scopes of the types in the array types that bind the subject (bindingDenies).
 	narrow := counted("FALSE", "FALSE")
@@ -1703,8 +1705,20 @@ var maxContainerOverlap = 128
 // filterKeys is SQL for the array of Filter's subject's keys of selects, as keysSQL defines them,
 // read in the statement, as its grants and denies are, so a list reads its membership, its groups
 // and what they hold in one snapshot. arg numbers Filter's arguments.
-func filterKeys(arg func(int) string, of string) string {
-	return "ARRAY(WITH RECURSIVE " + keysSQL(arg(1)+"::text", arg(2)+"::text", arg(4)) + " " + of + ")"
+func (a *Authorizer) filterKeys(arg func(int) string, of string) string {
+	return "ARRAY(WITH RECURSIVE " + keysSQL(arg(1)+"::text", arg(2)+"::text", a.filterAt(arg)) + " " + of + ")"
+}
+
+// filterAt is SQL for the time Filter's statement decides at: the call's, or the later time
+// DeleteExpired deleted by that the host's statement sees, as decidedSQL decides a read of a
+// subject. The host runs it later than Filter read the time, by which a run can have removed what
+// ended since. Each use reads it in the statement's snapshot, so all read the same. arg numbers
+// Filter's arguments.
+func (a *Authorizer) filterAt(arg func(int) string) string {
+	if a.asOf {
+		return arg(4)
+	}
+	return "greatest(" + arg(4) + "::timestamptz, (SELECT max(until) FROM rbac_expired))"
 }
 
 // filterGrants is SQL selecting the scopes of the grants Filter's condition counts for its subject
@@ -1721,8 +1735,8 @@ func (a *Authorizer) filterGrants(arg func(int) string, custom, alone bool, type
 
 // filterHeld is SQL selecting the subject's grants filterGrants reads, as held.
 func (a *Authorizer) filterHeld(arg func(int) string, types string) string {
-	return a.heldByType(types, filterKeys(arg, countedKeys(arg(13), arg(17))), "g.scope, g.role, g.principal", fmt.Sprintf(`g.tenant = %s::text
-		  AND (g.expires_at IS NULL OR g.expires_at > %s) AND NOT g.conditional`, arg(1), arg(4)))
+	return a.heldByType(types, a.filterKeys(arg, countedKeys(arg(13), arg(17))), "g.scope, g.role, g.principal", fmt.Sprintf(`g.tenant = %s::text
+		  AND (g.expires_at IS NULL OR g.expires_at > %s) AND NOT g.conditional`, arg(1), a.filterAt(arg)))
 }
 
 // filterCounted is SQL for whether filterGrants counts a grant of held.
@@ -1958,7 +1972,7 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 	exempted := keyed("exempt", "SELECT k FROM exempted")
 	exempt, until := ` AND NOT `+exempted, `NULL::timestamptz AS until`
 	if with.ending {
-		places = `, ` + endsSQL("$2::text", "$4") + `, ` + lastingSQL("$1::text", "$2::text")
+		places = `, ` + endsSQL("$2::text", decidedAt) + `, ` + lastingSQL("$1::text", "$2::text")
 		ends = `
 		UNION ALL
 		SELECT 3, k, '', '', '', e, false, NULL, '', NULL, false, false, NULL, '', '', false FROM ends`
@@ -1979,9 +1993,11 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 	}
 	// A deny's keys are looked up only once it is one the statement reads (bindsIfRead).
 	matched := bindsIfRead(forP+` OR `+values+` AND scope = 'tenant:' || $1`, keyed("principals", "SELECT k FROM bound")+exempt)
-	// Grants, denies, roles, keys, the powers to change grants denied and the denies below in that
-	// order; grants by principal, scope, role and id, denies by id and scope, as deniesOn.
-	const deny, role, end, key, changing, below = 1, 2, 3, 4, 5, 6
+	// Grants, denies, roles, keys, the powers to change grants denied, the denies below and the time
+	// DeleteExpired deleted by in that order; grants by principal, scope, role and id, denies by id and
+	// scope, as deniesOn.
+	const deny, role, end, key, changing, below, expiry = 1, 2, 3, 4, 5, 6, 7
+	var expired *time.Time
 	var custom []RoleDefinition
 	placeEnds := map[string]time.Time{}
 	tenantKey := TenantRoot(tenant).Key()
@@ -2027,6 +2043,11 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 				}
 			case below:
 				got.bound, got.exemptUntil = conditional, privileged
+			case expiry:
+				if expires != nil {
+					t := *expires
+					expired = &t
+				}
 			default:
 				h := holding{Binding: Binding{ID: id, Principal: parsePrincipal(principal), Role: Role(roleID)}, scope: scope, conditional: conditional}
 				if expires != nil {
@@ -2043,15 +2064,17 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 		})
 		return err
 	}
+	// At the time decidedSQL defines, every expiry the statement compares.
+	now, first := a.readingNow()
 	if err := a.readIndexed(ctx, q, scan, `
-		WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$4")+`, held AS (
+		WITH RECURSIVE `+a.decidedSQL("$4")+`, `+keysSQL("$1::text", "$2::text", decidedAt)+`, held AS (
 		  SELECT id::text, principal, scope, role, expires_at, conditional, true AS counts FROM rbac_grants
 		  WHERE tenant = $1 AND principal = ANY(ARRAY(`+countedKeys("$7", "$8")+`)) AND scope = ANY($3::text[])
-		    AND (expires_at IS NULL OR expires_at > $4)
+		    AND (expires_at IS NULL OR expires_at > `+decidedAt+`)
 		  UNION ALL
 		  SELECT id::text, principal, scope, role, expires_at, conditional, false FROM rbac_grants
 		  WHERE `+values+` AND tenant = $1 AND principal = ANY(ARRAY(SELECT k FROM keys WHERE NOT (`+counted("$7", "$8")+`) ORDER BY k))
-		    AND scope = 'tenant:' || $1 AND (expires_at IS NULL OR expires_at > $4)
+		    AND scope = 'tenant:' || $1 AND (expires_at IS NULL OR expires_at > `+decidedAt+`)
 		)`+places+`
 		SELECT 0, id, principal, scope, role, expires_at, conditional, NULL::text[], '', NULL::text[], false, false, NULL::text[], '', '', counts
 		FROM held
@@ -2063,9 +2086,16 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 		FROM `+customRoles+ends+`
 		UNION ALL
 		SELECT 4, k, '', '', '', NULL, false, NULL, '', NULL, false, false, NULL, '', '', false FROM keys WHERE `+ownKeys+changes+`
+		UNION ALL
+		SELECT 7, '', '', '', '', expired, false, NULL, '', NULL, false, false, NULL, '', '', false FROM decided WHERE expired IS NOT NULL
 		ORDER BY 1, 3, 4, 5, 2`,
-		tenant, s.identityKey(), scopes, a.cfg.Now(), perm, wildcard, counts.public, counts.members); err != nil {
+		tenant, s.identityKey(), scopes, now, perm, wildcard, counts.public, counts.members); err != nil {
 		return grantsRead{}, err
+	}
+	if expired != nil {
+		if err := a.clock.passed(*expired, first); err != nil {
+			return grantsRead{}, err
+		}
 	}
 	if with.ending {
 		tenure := placeEnds[s.identityKey()]

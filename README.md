@@ -520,9 +520,11 @@ scopes conditional ones reach, to check one by one.
   from one takes nothing away, so no freeze, label or deny refuses that, though making its place
   there end sooner adds an identity that isn't a member, which is refused, as `ImportMembers`
   refuses importing its place again, once it has asked `ValidateGrant` about what the place gives,
-  as for any identity that isn't a member, and `DeleteGroup` counts none as a member from a source
-  the host owns. Read as stored, each such place was one a removal took away, and a member the
-  host keeps, until `DeleteExpired` ran. When the host takes a group over (`ImportGroups` from one
+  as for any identity that isn't a member, `DeleteGroup` counts none as a member from a source the
+  host owns, and a change counts none in what the host was asked about, which it reads again under
+  its locks. Read as stored, each such place was one a removal took away, and a member the host
+  keeps, until `DeleteExpired` ran; and a change asking the host about its group meanwhile was tried
+  again once `DeleteExpired` removed it. When the host takes a group over (`ImportGroups` from one
   of `Config.Sources`), the members a tenant put in it, from no source of the host's, leave it.
 - **Changing members is granting:** a group's members hold what it and the groups it is in hold,
   so `ChangeMembers`, with `rbac.GroupMembers` on the group and its label, checks a change to its members as the
@@ -1087,6 +1089,12 @@ can leave the application's role without it. The administrator's and history's r
   `rbac_history_committed` is deferred again as it fires. And `AsOf` under `WithTx` no longer counts
   the host transaction's own changes, which haven't committed, where earlier code counted those
   dated by its time: read them after the transaction commits.
+  `0030_expired_through` adds `rbac_expired`, the times `DeleteExpired` deleted by, which every
+  check, search and change of code after it reads and every `DeleteExpired` writes: give the
+  application's role its privileges on it, as step 3 of the roles above says of a table a later
+  migration adds, before that code runs, or each of them fails. It takes no lock on the other tables. History doesn't record it, and `AsOf` doesn't read
+  it. Run `DeleteExpired` only from code after it once any runs: an earlier one records nothing, so
+  the reads of later code can find what it removed by a clock ahead of theirs.
   Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
   rolling upgrade across the two is unsafe: they key every lock apart, so a change by one waits for
   none by the other, and what each checks under its locks can change before it commits, as two
@@ -1200,12 +1208,26 @@ can leave the application's role without it. The administrator's and history's r
   time the wait left behind, as by an actor's power that ended while it waited. So a change holds
   first what it writes that `DeleteExpired`, which waits for nothing, may be deleting, and holds
   until its own transaction ends; and reads what its actor acts by in one statement with the denies
-  binding it and its label values, as `SetRole` and `DeleteRole` do under the tenant's lock, so a
-  place ended by `DeleteExpired`'s clock but not yet by the change's, removed in between, can't have
-  it act by a power and escape a deny at no one moment. `SetMemberships` doesn't wait for the places
-  in groups of a membership that ended while it took its locks, which another transaction holds, as
-  a group's deletion: it is tried again (`rbac.ErrConflict`), as is a change whose host's clock goes
-  back between the two readings.
+  binding it and its label values, as `SetRole` and `DeleteRole` do under the tenant's lock.
+  `DeleteExpired` removes what has ended in transactions of its own, places in groups before
+  memberships, passing over what a change holds, by its own clock: a read by an earlier clock could
+  find the place a deny binds the actor by, which ended later, removed, and the membership or place
+  its power comes through, which ended sooner, still there, a state no moment held. So each run
+  records its `Config.Now` before it removes anything, in `rbac_expired`, and a read of an actor's or
+  a subject's grants, groups and the denies binding it, as `Authorize`, `Explain`, `Permissions`,
+  `Grantable`, `Holding`, `Reachable` and every change make, and the condition `Filter` gives the
+  host, decides no earlier than the latest time recorded that its snapshot sees: every row any run
+  it sees removed or passed over has ended by then. The call decides at that time from then on, its conditions'
+  `request.time` and its statements after the read too; a change whose transaction read the time
+  before that read, as for whether what it grants to stands, is tried again instead, and then reads
+  its clock as no earlier. Runs never wait for each other, and a run by an earlier clock leaves the
+  latest time as it is. So a host whose clock runs ahead has every call that reads after its
+  `DeleteExpired` decide as late as that clock until the others catch up: keep the hosts' clocks
+  synchronized. An activation still ends its duration after the time `Activate` read once it held
+  the places it rests on, never later. As of a time, a read decides at that time.
+  `SetMemberships` doesn't wait for the places in groups of a membership that ended while it took
+  its locks, which another transaction holds, as a group's deletion: it is tried again
+  (`rbac.ErrConflict`), as is a change whose host's clock goes back between the two readings.
 
 ## Development
 

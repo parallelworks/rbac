@@ -244,7 +244,11 @@ type standing struct {
 // to the memberships the array finds, which the planner counts as ten, a nested loop would compare
 // each member with every one of them. With no group named, the groups' members are planned out:
 // the planner would cost them by the tenant's largest groups, past JIT's thresholds in a large
-// tenant.
+// tenant. Only memberships in force at now count, suspended and guests' too, and a group's
+// identities only while theirs is, as Members lists them: one whose membership has ended has left
+// the tenant and every group, whether or not DeleteExpired has removed it and its places yet, so
+// its removal meanwhile, which changes nothing the host could read, doesn't have the change tried
+// again. An identity named itself stands as having no membership then.
 var standSQL = `
 	WITH RECURSIVE ` + insideSQL("$3", "$4", "NULL", false) + `, of(root, principal) AS (
 	  SELECT 'group:' || root, principal FROM inside WHERE $3::text[] IS NOT NULL
@@ -253,9 +257,10 @@ var standSQL = `
 	  SELECT jsonb_object_agg(principal, guest::text || ' ' || suspended::text || ' ' ||
 	    coalesce(extract(epoch FROM expires_at)::text, ''))
 	  FROM rbac_memberships WHERE tenant = $1 AND principal = ANY(ARRAY(SELECT principal FROM of))
+	    AND (expires_at IS NULL OR expires_at > $4)
 	)
 	SELECT o.root, array_agg(o.principal || '=' || coalesce((SELECT m FROM held) ->> o.principal, '') ORDER BY o.principal)
-	FROM of o
+	FROM of o WHERE o.root = o.principal OR (SELECT m FROM held) ->> o.principal IS NOT NULL
 	GROUP BY o.root`
 
 // stand reads the standing of principals in a tenant on q.
@@ -2154,6 +2159,8 @@ func (a *Authorizer) begin(ctx context.Context, fn func(pgx.Tx) error) error {
 	// One that fails before needing the time reads it there too, so its refusal is dated where it
 	// decided: a reading from before the locks can predate a change it waited for.
 	a.clock.before, a.clock.began, a.clock.read, a.clock.picked = a.clock.at, a.clock.read, false, false
+	a.clock.changing = true
+	defer func() { a.clock.changing = false }()
 	return begin(ctx, a.db, func(tx pgx.Tx) error {
 		w, end := watched(tx, a.clock)
 		err := fn(w)
@@ -3331,7 +3338,9 @@ func removedWhere[T any](ctx context.Context, a *Authorizer, tx pgx.Tx, table, c
 // those a change is holding, and a membership one of whose places in groups a change holds, rather
 // than wait on it, so the next run removes them. It removes a batch at a time, on a pool each in a
 // transaction of its own, so none holds many locks, and on an error those it removed before stay
-// removed. A race PostgreSQL refuses matches ErrConflict.
+// removed. Before it removes anything, it records Config.Now as the time it deletes by, which every
+// check and change decides no earlier than, so none reads a state its batches left that no moment
+// held. A race PostgreSQL refuses matches ErrConflict.
 func (a *Authorizer) DeleteExpired(ctx context.Context) (n int64, err error) {
 	defer a.refused(ctx, &err, "", Principal{}, "DeleteExpired")
 	defer conflicting(&err)
@@ -3370,6 +3379,21 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 			return done()
 		})
 		return n, all, err
+	}
+	// The time it deletes by, before it deletes anything, committed on a pool in a transaction of its
+	// own: a read seeing any row it removes sees it too, and decides no earlier (decidedSQL), as at
+	// once every row ended by it is ended to that read, those passed over and not reached yet too.
+	// Each run adds its own, deleting those no later, which only DeleteExpired writes: one another run
+	// is deleting it passes over, which goes with a time no earlier, so neither waits for the other,
+	// and the latest stays.
+	if err := a.begin(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `WITH passed AS (
+			  DELETE FROM rbac_expired WHERE ctid = ANY(ARRAY(SELECT ctid FROM rbac_expired WHERE until <= $1 FOR UPDATE SKIP LOCKED))
+			)
+			INSERT INTO rbac_expired (until) VALUES ($1)`, now)
+		return err
+	}); err != nil {
+		return 0, err
 	}
 	statement := func(sql string) func(pgx.Tx) (int64, int64, error) {
 		return func(tx pgx.Tx) (n, all int64, err error) {

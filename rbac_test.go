@@ -8870,6 +8870,589 @@ func testRoleChangeAsOfOneMoment(t *testing.T, r rbac.RoleDefinition, bound bool
 	})
 }
 
+// pastExpiry is a call an actor in groups admins and frozen makes, by the power group admins gives
+// it, which a deny naming frozen removes.
+type pastExpiry struct {
+	mutate []func(*rbac.Config)
+	// seed grants group admins the power, and writes what else the call needs.
+	seed func(t *testing.T, h *harness)
+	// deny writes the deny naming frozen, of denied, which refuses the call.
+	deny   string
+	denied rbac.Permission
+	// call makes it, as x, and kept reports whether a change left what it changes as it was.
+	call func(t *testing.T, h *harness, x rbac.Subject) error
+	kept string
+	// check is set for a read, which has no transaction to set the deny in or to read in once
+	// DeleteExpired has run.
+	check bool
+}
+
+// A call decides no earlier than DeleteExpired has deleted by, which removes ended places in groups,
+// passing over those another transaction holds, before ended memberships, in transactions of its
+// own, by its own clock. Here the actor's place in admins, through which it holds the power the call
+// needs, ends in an hour, and its place in frozen, which a deny of that power names, in two; and
+// DeleteExpired, by a clock three hours on, removes the place in frozen and passes over the one in
+// admins, which another transaction holds. A call reading the actor by the time it read before,
+// either before DeleteExpired, as the host's clock is behind its own, or in its transaction once it
+// has read the time it decides at, while it reads its actor, found the actor in admins and in no
+// group a deny names: it held the power and escaped the deny at no moment, so the call is refused,
+// as by the power that had ended by DeleteExpired's clock, or tried again. Read by its own time, the
+// change was made, and the check allowed.
+func TestACallDecidesNoEarlierThanDeleteExpiredDeletedBy(t *testing.T) {
+	const (
+		onTenant = `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions) VALUES ('t1', 'tenant', 't1', 'freeze', '{group:frozen}', ARRAY[$1::text])`
+		onW1     = `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions) VALUES ('t1', 'workspace', 'w1', 'freeze', '{group:frozen}', ARRAY[$1::text])`
+	)
+	tenant := rbac.TenantRoot("t1")
+	granting := func(t *testing.T, h *harness) {
+		t.Helper()
+		h.seed(t, grant(tenant, "cluster.admin", rbac.Group, "admins"))
+		h.as(t, "v")
+	}
+	// Denies' own permission no deny removes, but a label refuses a deny on its scope to one without
+	// its values, which a deny of the value naming frozen removes.
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	guarding := func(t *testing.T, h *harness) {
+		t.Helper()
+		h.seed(t, grant(tenant, guardRole.ID, rbac.Group, "admins"))
+		h.hold(t, "x", "level:high")
+		h.as(t, "v")
+	}
+	defining := func(t *testing.T, h *harness) {
+		t.Helper()
+		h.seed(t, grant(tenant, "tenant.roles", rbac.Group, "admins"), grant(tenant, "cluster.login", rbac.User, "x"))
+	}
+	logging := func(t *testing.T, h *harness) {
+		t.Helper()
+		h.seed(t, grant(tenant, "cluster.login", rbac.Group, "admins"))
+	}
+	guards := []func(*rbac.Config){withLabels, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), guardRole) }}
+	allowedBy := func(ok bool) error {
+		if ok {
+			return nil
+		}
+		return rbac.ErrDenied
+	}
+	for name, c := range map[string]pastExpiry{
+		"Apply": {
+			seed: granting, deny: onW1, denied: grantC,
+			call: func(_ *testing.T, h *harness, x rbac.Subject) error {
+				return h.authz.Apply(h.ctx, x, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("v"), ExpiresAt: h.now.Add(30 * time.Minute)}}})
+			},
+			kept: `SELECT NOT EXISTS (SELECT FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:v')`,
+		},
+		"SetEligibility": {
+			// What an eligibility hands on is held for good, as only the power to grant isn't.
+			seed: func(t *testing.T, h *harness) {
+				t.Helper()
+				granting(t, h)
+				h.seed(t, grant(tenant, "cluster.login", rbac.User, "x"))
+			},
+			deny: onW1, denied: grantC,
+			call: func(_ *testing.T, h *harness, x rbac.Subject) error {
+				return h.authz.SetEligibility(h.ctx, x, cluster, rbac.Eligibility{Role: "cluster.login", Principal: identity("v"), MaxDuration: time.Hour, ExpiresAt: h.now.Add(30 * time.Minute)})
+			},
+			kept: `SELECT NOT EXISTS (SELECT FROM rbac_eligibilities WHERE tenant = 't1' AND principal = 'user:v')`,
+		},
+		"DeleteEligibility": {
+			seed: func(t *testing.T, h *harness) {
+				t.Helper()
+				granting(t, h)
+				if _, err := h.pool.Exec(h.ctx, `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+					VALUES ('t1', 'cluster', 'c1', 'user', 'v', 'cluster.login', 3600)`); err != nil {
+					t.Fatal(err)
+				}
+			},
+			deny: onW1, denied: grantC,
+			call: func(_ *testing.T, h *harness, x rbac.Subject) error {
+				return h.authz.DeleteEligibility(h.ctx, x, cluster, "cluster.login", identity("v"))
+			},
+			kept: `SELECT EXISTS (SELECT FROM rbac_eligibilities WHERE tenant = 't1' AND principal = 'user:v')`,
+		},
+		"SetDeny": {
+			mutate: guards, seed: guarding, deny: onTenant, denied: "level:high",
+			call: func(_ *testing.T, h *harness, x rbac.Subject) error {
+				return h.authz.SetDeny(h.ctx, x, secret, rbac.Deny{ID: "d", Principals: []rbac.Principal{identity("v")}, Permissions: []rbac.Permission{root}})
+			},
+			kept: `SELECT NOT EXISTS (SELECT FROM rbac_denies WHERE tenant = 't1' AND id = 'd')`,
+		},
+		"DeleteDeny": {
+			mutate: guards,
+			seed: func(t *testing.T, h *harness) {
+				t.Helper()
+				guarding(t, h)
+				if _, err := h.pool.Exec(h.ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+					VALUES ('t1', 'cluster', 'c1', 'd', '{user:v}', ARRAY[$1::text])`, root); err != nil {
+					t.Fatal(err)
+				}
+			},
+			deny: onTenant, denied: "level:high",
+			call: func(_ *testing.T, h *harness, x rbac.Subject) error { return h.authz.DeleteDeny(h.ctx, x, secret, "d") },
+			kept: `SELECT EXISTS (SELECT FROM rbac_denies WHERE tenant = 't1' AND id = 'd')`,
+		},
+		"SetRole": {
+			seed: defining, deny: onTenant, denied: rbac.DefineRoles,
+			call: func(_ *testing.T, h *harness, x rbac.Subject) error {
+				return h.authz.SetRole(h.ctx, x, "t1", rbac.RoleDefinition{ID: "custom.r", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}})
+			},
+			kept: `SELECT NOT EXISTS (SELECT FROM rbac_roles WHERE tenant = 't1')`,
+		},
+		"DeleteRole": {
+			seed: func(t *testing.T, h *harness) {
+				t.Helper()
+				defining(t, h)
+				if _, err := h.pool.Exec(h.ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.r', ARRAY[$1::text], '{cluster}')`, view); err != nil {
+					t.Fatal(err)
+				}
+			},
+			deny: onTenant, denied: rbac.DefineRoles,
+			call: func(_ *testing.T, h *harness, x rbac.Subject) error {
+				return h.authz.DeleteRole(h.ctx, x, "t1", "custom.r")
+			},
+			kept: `SELECT EXISTS (SELECT FROM rbac_roles WHERE tenant = 't1' AND id = 'custom.r')`,
+		},
+		"ChangeMembers": {
+			mutate: []func(*rbac.Config){func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), groupMembers) }},
+			seed: func(t *testing.T, h *harness) {
+				t.Helper()
+				h.seed(t, grant(tenant, groupMembers.ID, rbac.Group, "admins"))
+				h.groups(t, "crew")
+				h.as(t, "v")
+			},
+			deny: onTenant, denied: rbac.GroupMembers,
+			call: func(_ *testing.T, h *harness, x rbac.Subject) error {
+				return h.authz.ChangeMembers(h.ctx, x, "t1", []rbac.Member{{Group: "crew", Principal: identity("v")}}, nil)
+			},
+			kept: `SELECT NOT EXISTS (SELECT FROM rbac_members WHERE tenant = 't1' AND group_id = 'crew')`,
+		},
+		"DeleteGroup": {
+			mutate: []func(*rbac.Config){func(c *rbac.Config) {
+				c.Catalog = append(slices.Clone(c.Catalog), rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}})
+			}},
+			seed: func(t *testing.T, h *harness) {
+				t.Helper()
+				h.seed(t, grant(tenant, "tenant.groups", rbac.Group, "admins"))
+				h.groups(t, "ops")
+			},
+			deny: onTenant, denied: rbac.ManageGroups,
+			call: func(_ *testing.T, h *harness, x rbac.Subject) error {
+				return h.authz.DeleteGroup(h.ctx, x, "t1", "ops")
+			},
+			kept: `SELECT EXISTS (SELECT FROM rbac_groups WHERE tenant = 't1' AND id = 'ops')`,
+		},
+		"Authorize": {
+			seed: logging, deny: onW1, denied: login, check: true,
+			call: func(_ *testing.T, h *harness, x rbac.Subject) error {
+				return h.authz.Authorize(h.ctx, x, login, cluster)
+			},
+		},
+		"Explain": {
+			seed: logging, deny: onW1, denied: login, check: true,
+			call: func(_ *testing.T, h *harness, x rbac.Subject) error {
+				d, err := h.authz.Explain(h.ctx, x, login, cluster)
+				if err != nil {
+					return err
+				}
+				return allowedBy(d.Allowed)
+			},
+		},
+		"Permissions": {
+			seed: logging, deny: onW1, denied: login, check: true,
+			call: func(_ *testing.T, h *harness, x rbac.Subject) error {
+				ps, err := h.authz.Permissions(h.ctx, x, cluster)
+				if err != nil {
+					return err
+				}
+				return allowedBy(slices.Contains(ps, login))
+			},
+		},
+		"Filter": {
+			seed: func(t *testing.T, h *harness) {
+				t.Helper()
+				logging(t, h)
+				hostTable(t, h)
+			},
+			deny: onW1, denied: login, check: true,
+			// Of the host's clusters, c0 is in w1.
+			call: func(t *testing.T, h *harness, x rbac.Subject) error {
+				t.Helper()
+				return allowedBy(slices.Contains(listed(t, h, x, login), "c0"))
+			},
+		},
+		"Reachable": {
+			seed: logging, deny: onW1, denied: login, check: true,
+			call: func(t *testing.T, h *harness, x rbac.Subject) error {
+				t.Helper()
+				reached, _ := reachedBy(t, h, []rbac.Resource{cluster}, x, login)
+				return allowedBy(len(reached) > 0)
+			},
+		},
+	} {
+		for _, during := range []bool{false, true} {
+			if during && c.check {
+				continue
+			}
+			t.Run(fmt.Sprintf("%s, in its transaction %t", name, during), func(t *testing.T) {
+				h := setup(t, c.mutate...)
+				ctx := t.Context()
+				h.groups(t, "admins", "frozen")
+				c.seed(t, h)
+				x := h.as(t, "x", "admins", "frozen")
+				exec := func(q string, args ...any) {
+					t.Helper()
+					if _, err := h.pool.Exec(ctx, q, args...); err != nil {
+						t.Fatal(err)
+					}
+				}
+				exec(`UPDATE rbac_members SET expires_at = $1 WHERE tenant = 't1' AND principal = 'user:x' AND group_id = 'admins'`, h.now.Add(time.Hour))
+				exec(`UPDATE rbac_members SET expires_at = $1 WHERE tenant = 't1' AND principal = 'user:x' AND group_id = 'frozen'`, h.now.Add(2*time.Hour))
+				deny := func() { exec(c.deny, c.denied) }
+				expired := false
+				expire := func() {
+					expired = true
+					// Another transaction holds x's place in admins, as a change ending it that is then
+					// refused does, so DeleteExpired passes over it.
+					l, err := h.pool.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = l.Rollback(context.WithoutCancel(ctx)) }()
+					if _, err := l.Exec(ctx, `SELECT FROM rbac_members WHERE tenant = 't1' AND principal = 'user:x' AND group_id = 'admins' FOR UPDATE`); err != nil {
+						t.Fatal(err)
+					}
+					h.now = h.now.Add(3 * time.Hour)
+					bounded, cancel := context.WithTimeout(ctx, 30*time.Second)
+					defer cancel()
+					n, err := h.authz.DeleteExpired(bounded)
+					var places []string
+					if err == nil {
+						err = h.pool.QueryRow(bounded, `SELECT coalesce(array_agg(group_id ORDER BY group_id), '{}') FROM rbac_members
+							WHERE tenant = 't1' AND principal = 'user:x'`).Scan(&places)
+					}
+					if err != nil || n == 0 || !slices.Equal(places, []string{"admins"}) {
+						t.Errorf("DeleteExpired removed %d rows, leaving x in %v: %v", n, places, err)
+					}
+				}
+				if during {
+					// Set once the change has checked the actor before its transaction, as it takes its
+					// locks; DeleteExpired runs as it reads its actor there.
+					rbac.BeforeStatement(t, "pg_advisory_xact_lock", true, deny)
+					rbac.BeforeStatement(t, rbac.HeldMarker, false, expire)
+				} else {
+					deny()
+					expire()
+					// The call's clock, behind DeleteExpired's.
+					h.now = h.now.Add(-3 * time.Hour)
+				}
+				err := c.call(t, h, x)
+				if !expired {
+					t.Fatal("DeleteExpired didn't run while the change read its actor")
+				}
+				if !errors.Is(err, rbac.ErrDenied) && (c.check || !errors.Is(err, rbac.ErrConflict)) {
+					t.Errorf("x acted by its place in admins, which ended before its place in frozen, which the deny binds it by: at no moment did it hold the power and escape the deny: %v", err)
+				}
+				if c.kept != "" {
+					var kept bool
+					if err := h.pool.QueryRow(ctx, c.kept).Scan(&kept); err != nil || !kept {
+						t.Errorf("the change was made: %v", err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// As TestACallDecidesNoEarlierThanDeleteExpiredDeletedBy, through a membership: DeleteExpired
+// removes ended places in groups before ended memberships, and passes over a membership another
+// transaction holds, as a change adding its identity to a group holds the membership it joins with.
+// Here the actor's own grant, which it holds only while its membership is, gives the power, and its
+// membership ends in an hour, its place in frozen, which a deny names, in two: read in the change's
+// transaction once DeleteExpired, by a clock three hours on, has removed the place, the actor held
+// the power and escaped the deny at no moment.
+func TestAChangeDecidesNoEarlierThanDeleteExpiredDeletedByPastAMembershipItPassedOver(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.groups(t, "frozen")
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.admin", rbac.User, "x"), grant(rbac.TenantRoot("t1"), "cluster.admin", rbac.User, "y"))
+	x := h.as(t, "x", "frozen")
+	h.as(t, "v")
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(`UPDATE rbac_memberships SET expires_at = $1 WHERE tenant = 't1' AND principal = 'user:x'`, h.now.Add(time.Hour))
+	exec(`UPDATE rbac_members SET expires_at = $1 WHERE tenant = 't1' AND principal = 'user:x' AND group_id = 'frozen'`, h.now.Add(2*time.Hour))
+	change := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("v"), ExpiresAt: h.now.Add(30 * time.Minute)}}}
+	l, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = l.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := l.Exec(ctx, `SELECT FROM rbac_memberships WHERE tenant = 't1' AND principal = 'user:x' FOR SHARE`); err != nil {
+		t.Fatal(err)
+	}
+	rbac.BeforeStatement(t, "pg_advisory_xact_lock", true, func() {
+		exec(`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+			VALUES ('t1', 'workspace', 'w1', 'freeze', '{group:frozen}', ARRAY[$1::text])`, grantC)
+	})
+	var expired int64
+	var expiring error
+	rbac.BeforeStatement(t, rbac.HeldMarker, false, func() {
+		h.now = h.now.Add(3 * time.Hour)
+		bounded, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		expired, expiring = h.authz.DeleteExpired(bounded)
+	})
+	err = h.authz.Apply(ctx, x, cluster, change)
+	var left int
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM rbac_members WHERE tenant = 't1' AND principal = 'user:x'`).Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	if expiring != nil || expired == 0 || left != 0 {
+		t.Fatalf("DeleteExpired removed %d rows, leaving x in %d groups: %v", expired, left, expiring)
+	}
+	if !errors.Is(err, rbac.ErrDenied) && !errors.Is(err, rbac.ErrConflict) {
+		t.Errorf("x granted on c1 by its own grant, held only while its membership was, which ended before its place in frozen, which the deny binds it by: at no moment did it hold the power and escape the deny: %v", err)
+	}
+	var denied *rbac.DeniedError
+	if err := h.authz.Apply(ctx, h.as(t, "y", "frozen"), cluster, change); !errors.As(err, &denied) {
+		t.Errorf("the deny didn't stop y, in frozen: %v", err)
+	}
+}
+
+// As TestACallDecidesNoEarlierThanDeleteExpiredDeletedBy, for an approver of an activation on a
+// labeled scope, who must be one of the approvers holding the label's values: here it is an approver
+// by its place in approvers, which ends in an hour, and a deny of its value names frozen, its place
+// in which ends in two.
+func TestAnApproverIsCheckedNoEarlierThanDeleteExpiredDeletedBy(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	for _, during := range []bool{false, true} {
+		t.Run(fmt.Sprintf("in its transaction %t", during), func(t *testing.T) {
+			h := labeled(t, func(c *rbac.Config) {
+				resourceOf := c.ResourceOf
+				c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+					if s == secret.Scope() {
+						return secret, nil
+					}
+					return resourceOf(ctx, tenant, s)
+				}
+			})
+			ctx := t.Context()
+			h.hold(t, "owner", "level:high")
+			u := h.as(t, "u")
+			h.hold(t, "u", "level:high")
+			approver := h.as(t, "approver", "approvers", "frozen")
+			h.hold(t, "approver", "level:high")
+			if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), secret, rbac.Eligibility{
+				Role: "cluster.login", Principal: u.Principal, MaxDuration: time.Hour, Approvers: []rbac.Principal{groupOf("approvers")},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			exec := func(q string, args ...any) {
+				t.Helper()
+				if _, err := h.pool.Exec(ctx, q, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			exec(`UPDATE rbac_members SET expires_at = $1 WHERE tenant = 't1' AND principal = 'user:approver' AND group_id = 'approvers'`, h.now.Add(time.Hour))
+			exec(`UPDATE rbac_members SET expires_at = $1 WHERE tenant = 't1' AND principal = 'user:approver' AND group_id = 'frozen'`, h.now.Add(2*time.Hour))
+			deny := func() {
+				exec(`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+					VALUES ('t1', 'tenant', 't1', 'freeze', '{group:frozen}', '{level:high}')`)
+			}
+			expired := false
+			expire := func() {
+				expired = true
+				l, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = l.Rollback(context.WithoutCancel(ctx)) }()
+				if _, err := l.Exec(ctx, `SELECT FROM rbac_members WHERE tenant = 't1' AND principal = 'user:approver' AND group_id = 'approvers' FOR UPDATE`); err != nil {
+					t.Fatal(err)
+				}
+				h.now = h.now.Add(3 * time.Hour)
+				bounded, cancel := context.WithTimeout(ctx, 30*time.Second)
+				defer cancel()
+				n, err := h.authz.DeleteExpired(bounded)
+				var places []string
+				if err == nil {
+					err = h.pool.QueryRow(bounded, `SELECT coalesce(array_agg(group_id ORDER BY group_id), '{}') FROM rbac_members
+						WHERE tenant = 't1' AND principal = 'user:approver'`).Scan(&places)
+				}
+				if err != nil || n == 0 || !slices.Equal(places, []string{"approvers"}) {
+					t.Errorf("DeleteExpired removed %d rows, leaving the approver in %v: %v", n, places, err)
+				}
+			}
+			if during {
+				rbac.BeforeStatement(t, "pg_advisory_xact_lock", true, deny)
+				rbac.BeforeStatement(t, rbac.HeldMarker, false, expire)
+			} else {
+				deny()
+				expire()
+				h.now = h.now.Add(-3 * time.Hour)
+			}
+			_, err := h.authz.Activate(ctx, u, secret, rbac.Activation{Role: "cluster.login", Duration: time.Minute, Justification: "on call", Approver: approver})
+			if !expired {
+				t.Fatal("DeleteExpired didn't run while the activation read its approver")
+			}
+			if !errors.Is(err, rbac.ErrDenied) && !errors.Is(err, rbac.ErrConflict) {
+				t.Errorf("approved by one that was an approver and escaped the deny of the label's value at no moment: %v", err)
+			}
+			var activated bool
+			if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM rbac_grants WHERE tenant = 't1' AND source = 'activation')`).Scan(&activated); err != nil || activated {
+				t.Errorf("u activated the role: %v", err)
+			}
+		})
+	}
+}
+
+// DeleteExpired records the time it deletes by before it deletes anything, and a read decides no
+// earlier than the latest recorded: a run by an earlier clock leaves it, and runs don't wait for
+// each other, one in a host's transaction left open too.
+func TestDeleteExpiredKeepsTheLatestTimeItDeletedByWithoutWaiting(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	base := h.now
+	x := h.as(t, "x")
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	h.now = base.Add(time.Hour)
+	if _, err := h.authz.WithTx(tx).DeleteExpired(ctx); err != nil {
+		t.Fatal(err)
+	}
+	h.now = base.Add(3 * time.Hour)
+	bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if _, err := h.authz.DeleteExpired(bounded); err != nil {
+		t.Fatalf("DeleteExpired waited for one in a host's transaction: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	h.now = base.Add(2 * time.Hour)
+	if _, err := h.authz.DeleteExpired(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var latest time.Time
+	var rows int
+	if err := h.pool.QueryRow(ctx, `SELECT max(until), count(*) FROM rbac_expired`).Scan(&latest, &rows); err != nil {
+		t.Fatal(err)
+	}
+	if !latest.Equal(base.Add(3*time.Hour)) || rows > 2 {
+		t.Errorf("DeleteExpired recorded %d times, the latest %v", rows, latest)
+	}
+	// A grant DeleteExpired never saw, ended by the latest time, gives nothing to a check by an
+	// earlier clock.
+	exec := `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'x', 'cluster.login', $1)`
+	if _, err := h.pool.Exec(ctx, exec, base.Add(150*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	h.now = base
+	if allowed(t, h, x, login, cluster) {
+		t.Error("a check by a clock behind the latest time DeleteExpired deleted by read a grant ended by then")
+	}
+}
+
+// As of a time, a read decides at that time, whatever DeleteExpired has deleted by since.
+func TestAsOfDecidesAtItsTimeWhateverDeleteExpiredDeletedBy(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.now = dbNow(t, h)
+	x := h.as(t, "x")
+	if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: rbac.Binding{
+		Role: "cluster.login", Principal: x.Principal, ExpiresAt: h.now.Add(time.Hour),
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	at := dbNow(t, h)
+	// By a clock a year on, which the database's bounds: it deletes nothing.
+	was := h.now
+	h.now = h.now.AddDate(1, 0, 0)
+	if _, err := h.authz.DeleteExpired(ctx); err != nil {
+		t.Fatal(err)
+	}
+	h.now = was
+	if allowed(t, h, x, login, cluster) {
+		t.Fatal("a check decided earlier than DeleteExpired deleted by")
+	}
+	err := h.authz.AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error { return a.Authorize(ctx, x, login, cluster) })
+	if err != nil {
+		t.Errorf("as of a time the grant was in force, it wasn't: %v", err)
+	}
+}
+
+// A change reads the standing of what it grants to, which the host was asked about, as of the time
+// it decides at: an identity whose membership has ended is in none of its groups, as Members lists
+// them, and is no member itself, whether or not DeleteExpired has removed it and its places. So a
+// DeleteExpired removing them while the host is asked changes nothing the host could read, and the
+// change isn't tried again for it.
+func TestAChangeStandsByTheMembershipsInForce(t *testing.T) {
+	for _, how := range []string{"ChangeMembers nesting", "Apply to the group", "Apply to the identity"} {
+		t.Run(how, func(t *testing.T) {
+			var meanwhile func(ctx context.Context) error
+			named := groupOf("crew")
+			if how == "Apply to the identity" {
+				named = identity("u")
+			}
+			h := grouped(t, func(c *rbac.Config) {
+				c.ValidateGrant = func(ctx context.Context, _ rbac.DB, in rbac.GrantInput) error {
+					if do := meanwhile; do != nil && in.Binding.Principal == named {
+						meanwhile = nil
+						return do(ctx)
+					}
+					return nil
+				}
+			})
+			ctx := t.Context()
+			h.groups(t, "crew")
+			h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "staff"))
+			if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("u"), ExpiresAt: h.now.Add(time.Hour)}, {Principal: identity("w")}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "crew", Principal: identity("u")}, {Group: "crew", Principal: identity("w")}}); err != nil {
+				t.Fatal(err)
+			}
+			h.now = h.now.Add(2 * time.Hour)
+			if members, err := h.authz.Members(ctx, "t1", "crew"); err != nil || len(members) != 1 {
+				t.Fatalf("Members(crew) = %+v, %v: u has left", members, err)
+			}
+			ran := false
+			meanwhile = func(ctx context.Context) error {
+				ran = true
+				bounded, cancel := context.WithTimeout(ctx, 30*time.Second)
+				defer cancel()
+				n, err := h.authz.DeleteExpired(bounded)
+				if err == nil && n == 0 {
+					err = errors.New("DeleteExpired removed nothing")
+				}
+				return err
+			}
+			var err error
+			switch how {
+			case "ChangeMembers nesting":
+				err = h.authz.ChangeMembers(ctx, h.as(t, "manager"), "t1", []rbac.Member{{Group: "staff", Principal: groupOf("crew")}}, nil)
+			default:
+				err = h.authz.Apply(ctx, h.as(t, "manager"), cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: named}}})
+			}
+			if !ran {
+				t.Fatal("the host wasn't asked about the change")
+			}
+			if err != nil {
+				t.Errorf("refused though what the host was asked about is as it was: %v", err)
+			}
+		})
+	}
+}
+
 func TestPublicCustomRolesThatChangeAccessGiveNothingInSearches(t *testing.T) {
 	share := rbac.RoleDefinition{ID: "cluster.share", Permissions: []rbac.Permission{view, grantC}, ResourceTypes: []string{"cluster"}}
 	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), share) })

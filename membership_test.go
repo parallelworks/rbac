@@ -611,11 +611,12 @@ func TestMigratingTheMembersIndexWaitsForAChangeInFlight(t *testing.T) {
 	}
 }
 
-// rolesAfterDenies is a pool whose transactions run fire, once, just before the first statement
-// naming rbac_roles that follows one naming rbac_denies or rbac_eligibilities, alone or in a batch.
+// rolesAfterDenies is a pool whose transactions run fire, once, on the transaction, just before the
+// first statement naming rbac_roles that follows one naming rbac_denies or rbac_eligibilities, alone
+// or in a batch.
 type rolesAfterDenies struct {
 	*pgxpool.Pool
-	fire func()
+	fire func(pgx.Tx)
 }
 
 func (p *rolesAfterDenies) BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error) {
@@ -636,7 +637,7 @@ func (tx *rolesAfterDeniesTx) see(sql string) {
 	if roles := strings.Contains(sql, "rbac_roles"); roles && tx.denies && tx.p.fire != nil {
 		fire := tx.p.fire
 		tx.p.fire = nil
-		fire()
+		fire(tx.Tx)
 	} else if !roles && (strings.Contains(sql, "rbac_denies") || strings.Contains(sql, "rbac_eligibilities")) {
 		tx.denies = true
 	}
@@ -683,6 +684,17 @@ func TestMigrateGivesWayToAChangeReadingItsTablesInAnotherOrder(t *testing.T) {
 	if _, err := pool.Exec(ctx, function); err != nil {
 		t.Fatal(err)
 	}
+	// Its reads decide no earlier than the times DeleteExpired deleted by, in rbac_expired, which
+	// 0030 makes: the schema has it too, and once the migration starts, which makes it again, the
+	// change's own session has one of its own for the rest of its transaction, which hasn't read it
+	// there yet.
+	expired, err := fs.ReadFile(rbac.Migrations(), "0030_expired_through.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(expired)); err != nil {
+		t.Fatal(err)
+	}
 	db := &rolesAfterDenies{Pool: pool}
 	cfg := rbac.Config{
 		Catalog:        append(slices.Clone(catalog), groupMembers),
@@ -702,8 +714,16 @@ func TestMigrateGivesWayToAChangeReadingItsTablesInAnotherOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	migrated := make(chan error, 1)
-	db.fire = func() {
+	db.fire = func(tx pgx.Tx) {
 		if _, err := pool.Exec(ctx, `DROP FUNCTION rbac_changes_grants(text[])`); err != nil {
+			migrated <- err
+			return
+		}
+		if _, err := pool.Exec(ctx, `DROP TABLE rbac_expired`); err != nil {
+			migrated <- err
+			return
+		}
+		if _, err := tx.Exec(ctx, `CREATE TEMP TABLE rbac_expired (until timestamptz NOT NULL) ON COMMIT DROP`); err != nil {
 			migrated <- err
 			return
 		}

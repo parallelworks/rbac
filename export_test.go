@@ -330,6 +330,61 @@ func SetReadingKeys(t *testing.T, f func()) {
 	t.Cleanup(func() { readingKeys = old })
 }
 
+// BeforeStatement runs f once, the first time a change's transaction sends a statement whose text
+// holds marker once the change has read the time it decides at, or with anyTime, at any time, until
+// t ends.
+func BeforeStatement(t *testing.T, marker string, anyTime bool, f func()) {
+	t.Helper()
+	old := watched
+	var once sync.Once
+	watched = func(tx pgx.Tx, c *callClock) (pgx.Tx, func(error) error) {
+		w, end := old(tx, c)
+		return &beforeStatement{Tx: w, clock: c, marker: marker, anyTime: anyTime, f: func() { once.Do(f) }}, end
+	}
+	t.Cleanup(func() { watched = old })
+}
+
+// beforeStatement is a change's transaction BeforeStatement watches.
+type beforeStatement struct {
+	pgx.Tx
+	clock   *callClock
+	marker  string
+	anyTime bool
+	f       func()
+}
+
+func (b *beforeStatement) at(sql string) {
+	if (b.anyTime || b.clock != nil && b.clock.read) && strings.Contains(sql, b.marker) {
+		b.f()
+	}
+}
+
+func (b *beforeStatement) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	b.at(sql)
+	return b.Tx.Exec(ctx, sql, args...)
+}
+
+func (b *beforeStatement) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	b.at(sql)
+	return b.Tx.Query(ctx, sql, args...)
+}
+
+func (b *beforeStatement) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	b.at(sql)
+	return b.Tx.QueryRow(ctx, sql, args...)
+}
+
+func (b *beforeStatement) SendBatch(ctx context.Context, batch *pgx.Batch) pgx.BatchResults {
+	for _, q := range batch.QueuedQueries {
+		b.at(q.SQL)
+	}
+	return b.Tx.SendBatch(ctx, batch)
+}
+
+// HeldMarker is text only readHeld's statement, which reads an actor's or a subject's grants and
+// what binds it, holds.
+const HeldMarker = "SELECT 0, id, principal, scope, role, expires_at, conditional"
+
 // SetCheckingRole runs f each time a decision begins checking a role for a grant, until t ends.
 func SetCheckingRole(t *testing.T, f func()) {
 	t.Helper()
