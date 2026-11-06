@@ -360,7 +360,7 @@ func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives m
 	// The planner can't tell which of targets' branches the seeds reach, so it costs a change's
 	// check as if it read every identity in the tenant, past JIT's thresholds where they are in
 	// groups: compiling then takes a second for a plan that runs in milliseconds.
-	return withoutJIT(ctx, q, func() ([]Conflict, error) {
+	return planned(ctx, q, withoutJIT, func() ([]Conflict, error) {
 		return conflictsIn(ctx, q, given, args, holders, custom, limited)
 	})
 }
@@ -469,24 +469,4 @@ func conflictsIn(ctx context.Context, q DB, given valuesGiven, args []any, holde
 		return nil
 	})
 	return found, err
-}
-
-// withoutJIT is what read reads, statements on q in a transaction, with JIT off for them alone,
-// where the planner costs what they read for each of many identities as if they read the whole
-// tenant: compiling then takes far longer than running them. The setting is put back after, so a
-// host's transaction under WithTx gets its own again.
-func withoutJIT[T any](ctx context.Context, q DB, read func() (T, error)) (T, error) {
-	var none T
-	var jit string
-	if err := q.QueryRow(ctx, `SELECT current_setting('jit'), set_config('jit', 'off', true)`).Scan(&jit, nil); err != nil {
-		return none, err
-	}
-	v, err := read()
-	if err != nil {
-		return none, err
-	}
-	if _, err := q.Exec(ctx, `SELECT set_config('jit', $1, true)`, jit); err != nil {
-		return none, err
-	}
-	return v, nil
 }

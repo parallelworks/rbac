@@ -1394,3 +1394,72 @@ func snapshot[T any](ctx context.Context, a *Authorizer, read func(*Authorizer) 
 	}
 	return v, nil
 }
+
+// setting is a planner setting some reads set for their own statements alone, and its value there.
+type setting struct{ name, value string }
+
+var (
+	// withoutJIT holds JIT off where the planner costs what statements read for each of many
+	// identities as if they read the whole tenant: compiling then takes far longer than running them.
+	withoutJIT = []setting{{"jit", "off"}}
+	// seeking turns sequential scans, bitmap scans and sorting off, so each statement reads its rows
+	// by the index that finds them by key, or gives them in the order it asks for, whatever the
+	// statistics count or the table held when its session planned it: a session plans a statement
+	// once, generically after its first runs, and by statistics autovacuum leaves until a tenth of the
+	// table is new, so a plan made while the table was small, or by statistics from then, read every
+	// row of it, or through a bitmap of an index finding more, every row that index finds.
+	seeking = []setting{{"enable_seqscan", "off"}, {"enable_bitmapscan", "off"}, {"enable_sort", "off"}}
+	// unsorted turns sorting and JIT off, for statements that must read an index in its order where
+	// the planner would rather sort what it finds. Sorting off costs a plan that still sorts past
+	// jit_above_cost before PostgreSQL 18, and compiling took far longer than the statement.
+	unsorted = []setting{{"enable_sort", "off"}, {"jit", "off"}}
+)
+
+// planning sets settings for the statements q runs in its transaction until restore, which puts
+// each back as it was, for a host's transaction under WithTx that goes on past them, even once ctx
+// is done, as pgx sends nothing on a done ctx (finish). Where a statement in between failed, the
+// transaction runs no other, and its rollback, a transaction's or a savepoint's, puts them back.
+func planning(ctx context.Context, q DB, settings []setting) (restore func() error, err error) {
+	set, put, args := make([]string, len(settings)), make([]string, len(settings)), make([]any, 0, 2*len(settings))
+	was, scan := make([]string, len(settings)), make([]any, 0, 2*len(settings))
+	for i, s := range settings {
+		set[i] = fmt.Sprintf("current_setting($%d), set_config($%[1]d, $%d, true)", 2*i+1, 2*i+2)
+		put[i] = fmt.Sprintf("set_config($%d, $%d, true)", 2*i+1, 2*i+2)
+		args = append(args, s.name, s.value)
+		scan = append(scan, &was[i], nil)
+	}
+	// Each read before it is set, as the select list is evaluated in order.
+	if err := q.QueryRow(ctx, `SELECT `+strings.Join(set, ", "), args...).Scan(scan...); err != nil {
+		return nil, err
+	}
+	return func() error {
+		back := make([]any, 0, len(args))
+		for i, s := range settings {
+			back = append(back, s.name, was[i])
+		}
+		return finish(ctx, func(ctx context.Context) error {
+			_, err := q.Exec(ctx, `SELECT `+strings.Join(put, ", "), back...)
+			return err
+		})
+	}, nil
+}
+
+// planned is what read reads, statements on q in a transaction, with settings for them alone, put
+// back after it (planning) whether or not it fails, so a host's transaction under WithTx gets its
+// own again, as where it goes on past a call refused for its ctx once read ran.
+func planned[T any](ctx context.Context, q DB, settings []setting, read func() (T, error)) (T, error) {
+	restore, err := planning(ctx, q, settings)
+	if err != nil {
+		var none T
+		return none, err
+	}
+	v, err := read()
+	if rerr := restore(); err == nil {
+		err = rerr
+	}
+	if err != nil {
+		var none T
+		return none, err
+	}
+	return v, nil
+}

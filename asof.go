@@ -290,7 +290,7 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 // as no other index gives that order: where history's statistics hold no prune, the planner would
 // read them all by history's index of prunes to sort them, as History would (prunedPast).
 func unpruned(ctx context.Context, tx pgx.Tx, schema string, at time.Time) error {
-	restore, err := unsorted(ctx, tx)
+	restore, err := planning(ctx, tx, unsorted)
 	if err != nil {
 		return err
 	}

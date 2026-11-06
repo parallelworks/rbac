@@ -741,7 +741,7 @@ func (a *Authorizer) valuesOfEach(ctx context.Context, q DB, tenant string, hold
 	}
 	// Each identity's keys cost the planner as a walk of many groups, which across many identities is
 	// past JIT's thresholds.
-	return withoutJIT(ctx, q, func() (map[string]*valuesRead, error) { return a.valuesOfAll(ctx, q, tenant, identities) })
+	return planned(ctx, q, withoutJIT, func() (map[string]*valuesRead, error) { return a.valuesOfAll(ctx, q, tenant, identities) })
 }
 
 // matchingKeys runs as valuesOfAll looks n keys up, of its identities' or its denies', to find the

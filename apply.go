@@ -2500,15 +2500,13 @@ func (a *Authorizer) conditionsIn(ctx context.Context, tx pgx.Tx, tenant string,
 	for i, b := range buckets {
 		scopes[i], principals[i], sources[i] = b.scope, b.principal, b.source
 	}
-	carried := map[conditionBucket]map[string][]Role{}
-	var ids []Role
 	// The grants that reach many by their keys, the groups' a range, each of which the index of
 	// conditional grants seeks (rbac_grants_conditional): '' is no principal's key. By the scope's
 	// index, which holds whether each is conditional but not its condition or source, every grant to
 	// a group on the scope was read from the table, and with sequential scans on, a plan by
 	// statistics from before the scope's grants grew, or made while the table was small, read every
 	// grant in the table.
-	if err := seeking(ctx, tx, func() error {
+	carried, err := planned(ctx, tx, seeking, func() (map[conditionBucket]map[string][]Role, error) {
 		rows, err := tx.Query(ctx, `
 			SELECT b.scope, b.principal, b.source, g.condition, array_agg(DISTINCT g.role)
 			FROM unnest($2::text[], $3::text[], $4::text[]) AS b(scope, principal, source)
@@ -2526,8 +2524,9 @@ func (a *Authorizer) conditionsIn(ctx context.Context, tx pgx.Tx, tenant string,
 			GROUP BY b.scope, b.principal, b.source, g.condition`,
 			tenant, scopes, principals, sources, a.cfg.Now(), TenantMembers(tenant).key(), publicKey, slices.Sorted(maps.Keys(a.owned)))
 		if err != nil {
-			return err
+			return nil, err
 		}
+		carried := map[conditionBucket]map[string][]Role{}
 		var b conditionBucket
 		var condition string
 		var roles []Role
@@ -2536,17 +2535,22 @@ func (a *Authorizer) conditionsIn(ctx context.Context, tx pgx.Tx, tenant string,
 				carried[b] = map[string][]Role{}
 			}
 			carried[b][condition] = roles
-			ids = append(ids, roles...)
 			return nil
 		})
-		return err
-	}); err != nil {
+		return carried, err
+	})
+	if err != nil {
 		return nil, err
 	}
 	// What the roles give matters only for counting label values.
 	defs := a.builtinBook()
 	if len(a.labels) > 0 {
-		var err error
+		var ids []Role
+		for _, conditions := range carried {
+			for _, roles := range conditions {
+				ids = append(ids, roles...)
+			}
+		}
 		if defs, err = a.book(ctx, tx, tenant, ids); err != nil {
 			return nil, err
 		}
@@ -2568,29 +2572,6 @@ func (a *Authorizer) conditionsIn(ctx context.Context, tx pgx.Tx, tenant string,
 		evaluations[b] = a.evaluations(gives, readsAction)
 	}
 	return evaluations, nil
-}
-
-// seeking runs read, statements on q in a transaction, with sequential scans, bitmap scans and
-// sorting off for them alone, so each reads its rows by the index that finds them by key, or gives
-// them in the order it asks for, whatever the statistics count or the table held when its session
-// planned it: a session plans a statement once, generically after its first runs, and by
-// statistics autovacuum leaves until a tenth of the table is new, so a plan made while the table
-// was small, or by statistics from then, read every row of it, or through a bitmap of an index
-// finding more, every row that index finds. The settings are put back after, so a host's
-// transaction under WithTx gets its own again.
-func seeking(ctx context.Context, q DB, read func() error) error {
-	var seq, bitmap, sort string
-	if err := q.QueryRow(ctx, `SELECT current_setting('enable_seqscan'), current_setting('enable_bitmapscan'), current_setting('enable_sort'),
-		set_config('enable_seqscan', 'off', true), set_config('enable_bitmapscan', 'off', true), set_config('enable_sort', 'off', true)`).
-		Scan(&seq, &bitmap, &sort, nil, nil, nil); err != nil {
-		return err
-	}
-	if err := read(); err != nil {
-		return err
-	}
-	_, err := q.Exec(ctx, `SELECT set_config('enable_seqscan', $1, true), set_config('enable_bitmapscan', $2, true), set_config('enable_sort', $3, true)`,
-		seq, bitmap, sort)
-	return err
 }
 
 // conditionsBounded refuses conditional grants just stored that leave the conditions of a bucket

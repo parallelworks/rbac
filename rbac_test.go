@@ -9302,6 +9302,71 @@ func TestBoundingConditionsLeavesTheHostItsPlannerSettings(t *testing.T) {
 	}
 }
 
+// A read that turns a planner setting off for its own statements puts the host's back under WithTx
+// where it fails, as one of its statements refused before it was sent, or where the call's ctx is
+// done once those have run, as pgx sends nothing on a done ctx: here Holders' read of its holders'
+// label values, with JIT off for it. The host's transaction, which goes on past the call, kept JIT
+// off until it ended.
+func TestAReadLeavesTheHostItsPlannerSettingsWhereItFails(t *testing.T) {
+	h := labeled(t)
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	h.as(t, "u")
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	for name, holders := range map[string]func(t *testing.T, tx pgx.Tx) error{
+		"refused": func(t *testing.T, tx pgx.Tx) error {
+			_, err := h.authz.WithTx(&refusingTx{Tx: tx, sql: "WITH idents AS MATERIALIZED"}).Holders(ctx, login, secret)
+			if err != nil && !strings.Contains(err.Error(), refused) {
+				t.Fatal(err)
+			}
+			return err
+		},
+		"done": func(t *testing.T, tx pgx.Tx) error {
+			call, cancel := context.WithCancel(ctx)
+			defer cancel()
+			// Once the statement reading the values has run.
+			rbac.SetMatchingKeys(t, func(int) { cancel() })
+			_, _ = h.authz.WithTx(tx).Holders(call, login, secret)
+			return call.Err()
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+			if _, err := tx.Exec(ctx, `SET LOCAL jit = on`); err != nil {
+				t.Fatal(err)
+			}
+			if err := holders(t, tx); err == nil {
+				t.Fatal("Holders read its holders' label values")
+			}
+			var jit string
+			if err := tx.QueryRow(ctx, `SELECT current_setting('jit')`).Scan(&jit); err != nil || jit != "on" {
+				t.Errorf("jit = %q, %v, once Holders failed", jit, err)
+			}
+		})
+	}
+}
+
+// refusingTx is a transaction whose queries holding sql fail before they are sent.
+type refusingTx struct {
+	pgx.Tx
+	sql string
+}
+
+// refused is why refusingTx refuses a query.
+const refused = "refused before it was sent"
+
+func (tx *refusingTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	if strings.Contains(sql, tx.sql) {
+		return nil, errors.New(refused)
+	}
+	return tx.Tx.Query(ctx, sql, args...)
+}
+
 // scanned is how many rows of table tx has read by scanning it, whole or through a bitmap, and how
 // many entries of its indexes by scanning them, as an index scan finds each row it fetches.
 func scanned(ctx context.Context, t *testing.T, tx pgx.Tx, table string) int64 {
