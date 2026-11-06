@@ -217,7 +217,16 @@ erDiagram
   before `custom/`, which no LIKE implies, so `rbac_grants_custom_role`, whose predicate is a LIKE
   and which leads to the tenant alone, serves no plan of it: by statistics from before the tenant
   granted custom roles, or with none, every plan read every grant of one in the tenant through it,
-  to anyone, once for each broad key and scope or type.
+  to anyone, once for each broad key and scope or type. A change bounding the conditions a check
+  reads together on a scope (`conditionsIn`) reads the conditional grants there by
+  `rbac_grants_conditional`, which holds those alone, and one bounding groups' requirements for a
+  role there (`requirementsBounded`) the eligibilities with one by `rbac_eligibilities_requires`, in
+  its order, which no other index gives: each with sequential scans, bitmap scans and sorting off
+  (`seeking`), so neither the scope's unconditional grants nor its other eligibilities cost it
+  anything, however many, whatever the statistics count or the table held when the session planned
+  the read. By the scope's index, which holds whether a grant is conditional but not its condition,
+  every grant to a group there was read from the table, and with sequential scans on, a plan made
+  while the table was small read every grant in it.
 - **A read of a list of keys reads each key's rows on its own** (`byKey`), as of a list's scopes
   or principals, of the denies on a check's path, of `Activate`'s eligibilities and of the rows
   `DeleteScopes`, `DeletePrincipal` and `DeleteGroups` remove, and so does a walk through nested
@@ -238,7 +247,8 @@ erDiagram
   its groups, finds them in CTEs, which a plan reads for every row they hold: planned for the
   first, as `EXISTS` is, a read of every row looked to find one sooner. The denies binding the
   actor of a change to members or of `DeleteGroup` that remove a power to change grants, whose types
-  they read wherever in the tenant the denies are (`grantsDenied`), are found through such an index
+  they read wherever in the tenant the denies are (`grantsDenied`), before their transaction and in
+  it with the actor's grants (`authoritiesIn`), are found through such an index
   holding only those (`rbac_denies_grants`, by `rbac_changes_grants`), so the other denies naming
   the tenant's members or the public, which bind every actor, aren't read. History indexes the keys
   each version of a deny names so too, so as of a time those lists find them the same way, and
@@ -641,7 +651,13 @@ sequenceDiagram
   it ends there, not by what the members hold after it, as `Apply` revoking a grant held twice is:
   a member leaving a group ends what the group and those it is in give it there, though another
   group gives it the same, but a place ending while another, from another source, keeps the member
-  in the group as long leaves nothing (`placesLeft`). `SetRole` and `DeleteRole` ask the
+  in the group as long leaves nothing (`placesLeft`), nor does one of an identity whose membership
+  of the tenant has ended, which is in none of its groups, as `Members` lists them and checks count
+  them, though `DeleteExpired` hasn't removed its places: read as stored, removing it was stopped
+  for what gave it nothing. `DeleteGroup` counts none of them as a member the host keeps
+  (`deletable`). Of the activations a removal ends, none is such an identity's: `Activate` ends one
+  no later than its holder's membership, and `SetMemberships` ending one sooner cuts its
+  activations short. `SetRole` and `DeleteRole` ask the
   constraints of no resource, and read the denies on the tenant as on the tenant, once for every type
   of scope the role's grants can be on (`changesStopped`, `changesDenied`), where a deny's condition
   reading the resource can't be evaluated and so denies (`handsOn`): stricter than `Apply` on a scope
@@ -652,15 +668,21 @@ sequenceDiagram
   (`freezes`), and reads the types whose power to change grants a deny binding the actor lists
   (`grantsDenied`); only for a scope of a type either names, or whose label can refuse the actor, is
   `Config.ResourceOf` asked, and then the constraints again about it and the denies on its path, in
-  one read with the rest (`reachAuthority`). In its transaction the denies are read again, and a
-  type one binding the actor now names that none did refuses the change with `ErrConflict`.
+  one read with the rest (`reachAuthority`). In its transaction the types are read again, in the
+  read of its power over the members (`authoritiesIn`), and a type one binding the actor then names
+  that none did refuses the change with `ErrConflict`.
   `DeleteGroup` reads the group alike: from the host only where labels are declared, or a
   constraint or such a deny may stop it changing grants on groups, so a condition reading the
   group's attributes reads what the host passes `Apply` there, and without `Config.ResourceOf`,
   where the group as stored isn't all of it, refused once its transaction finds anything granted on
   it (`storedWhole`); and where no such deny bound the actor before it, one that does under its
-  locks has it tried again. The host's own writes make no check
-  of an actor, so no freeze stops them.
+  locks has it tried again. Under its locks it reads the denies on the group's path, where one binding
+  the actor may stop it, or where none did, whether one now does, in one read with the actor's power
+  to manage groups and its label values, as a change to members reads what it acts by
+  (`reachAuthority`): read apart, an actor moving in between from the group giving it that power to
+  one such a deny exempts deleted a group, and revoked what was granted on it, though at no moment
+  did it hold the one and escape the other, and a change to members took access away so. The
+  host's own writes make no check of an actor, so no freeze stops them.
 - **Until when.** What the actor holds only until a time, through an expiring grant, an activation,
   or a membership or place in a group that ends, it hands on only until then: `authorityOn` reads
   when each grant's holding ends, in the statement that reads the grants, and a grant may end no
@@ -836,7 +858,13 @@ flowchart LR
   grants and denies in one statement in the list's snapshot, and narrows that read once for all of
   them to the roles giving values (`valuesOfAll`), so each identity walks only its grants of those:
   narrowed for each, 1,000 holders, the tenant's members granted 300 roles of 1,000 other
-  permissions, read every role again for each holder, 300 million entries, in seven seconds.
+  permissions, read every role again for each holder, 300 million entries, in seven seconds. It
+  decides each one's values evaluating no condition either (`runs.unevaluated`): it keeps and marks
+  a holder by its values a condition takes part in deciding, a grant's or a deny's, whatever the
+  condition comes to (`listing`), so a conditional deny counts as one that can't be evaluated, and
+  a conditional grant gives nothing beside them. Evaluated for each holder and set aside, a value
+  granted to a group of 1,000 under a condition costing hundreds of steps took Holders a second,
+  where granted under none it took 33 ms, to list the same.
 
 ## Labels and exclusive values
 
@@ -879,7 +907,14 @@ flowchart TB
   across them (`runs`), so a condition that doesn't read the action runs once for all of them. Each
   value is still decided on budgets of its own, which pay for every condition they read, whether
   they ran it or a value before them did, so it decides as a check of it alone would, and what one
-  label asked for first never changes what another is decided by. Each walks only the read's grants
+  label asked for first never changes what another is decided by. `ChangeMembers` decides the
+  groups' labels and those of the scopes its members gain or lose access on by one such read in
+  each phase: before its transaction, the values `mayManageGroups` read with its power over the
+  members, which `mayReach` shares with the reads of its power on the scopes; and under its locks,
+  one read of its power over the members and on every scope it checks (`reachAuthority`), whose
+  values decide them all, so it held every power it acts by and every value a label asks for at
+  one moment. Read again with its power on the scopes, a value was decided twice in each phase, and
+  a condition of it that doesn't read the action ran twice. Each walks only the read's grants
   of roles giving values or powers to release, and of each role only those, privileged and public
   as the whole role is, which the first decision narrows the read to, reading each role once
   (`labeling`): a holding decides by nothing else, so the actor's grants of other roles, however
@@ -984,7 +1019,12 @@ flowchart TB
   a moment of its own, so a change committing between two can mix two states, and for AsOf, history
   of a time not yet final. Conflicts reads in one statement, the custom roles with their grants, as
   a check and `broadExcludes` read them, so it lists what one moment held under `WithTx` too: it
-  runs in such a transaction of its own only to hold JIT off for it (`withoutJIT`).
+  runs in such a transaction of its own only to hold JIT off for it (`withoutJIT`). A read that
+  sets planner settings for its own statements alone (`planned`), as that, `Holders`' read of label
+  values and a change bounding a scope's conditions (`seeking`) do, puts the host's back after it,
+  where it fails, panics or its ctx is done too, as pgx sends nothing on a done ctx: under `WithTx`,
+  a `Holders` refused for its ctx once its read had run left the host's transaction JIT off, as did
+  one whose panic the host recovered from, as no savepoint of the call's rolls them back.
 - **One time for a call.** A call reads `Config.Now` once, where it first needs the time: every
   statement it makes compares expiry with it, and every condition reads it as `request.time`, so a
   grant or a membership ending as the call runs can't meet a deny, a condition or label values of a
@@ -1241,7 +1281,7 @@ refuses a row of more than 1 MiB as jsonb all the same.
 | `MaxExpression` | 2,048 bytes | A condition's or requirement's expression. Its cost is bounded too. |
 | Time zones a process keeps | 1,024 | The zones conditions read times in, each loaded once, and the names found to name none, as requests can name a new one each time. Past it, one kept is dropped at random. |
 | A hook's copy | `2 × 80,000` units, as a check converts | What a constraint is given of the subject's or the resource's attributes, ancestors or label, and `ValidateGrant` of the actor's, each made once for a call. Past it the hook can't be asked, and the call is refused. |
-| What a check reads together | 80,000 units: hundreds of comparisons with literals, a hundred of an attribute with the subject's id, or three of the longest conditions that read a list or loop | The distinct conditions of an identity's conditional grants on a scope; of a scope's conditional grants to groups, the tenant's members and the public; each the tenant's and those from each source the host owns apart; of a scope's conditional denies; and the requirements of groups' eligibilities for a role on a scope. Each counts compiling it, 8 a byte, and the most evaluating it can cost, at most 10,000. On the tenant, one reading the action counts once for each label value it gives or denies. A check may spend this for each on each scope of its path. |
+| What a check reads together | 80,000 units: hundreds of comparisons with literals, a hundred of an attribute with the subject's id, or three of the longest conditions that read a list or loop | The distinct conditions of an identity's conditional grants on a scope; of a scope's conditional grants to groups, the tenant's members and the public; each the tenant's and those from each source the host owns apart; of a scope's conditional denies; and the requirements of groups' eligibilities for a role on a scope. Each counts compiling it, 8 a byte, and the most evaluating it can cost, at most 10,000. On the tenant, one reading the action counts once for each label value it gives or denies. A check may spend this for each on each scope of its path. A change adding to one reads only its conditional grants or requirements, by indexes of those alone, however many unconditional grants or other eligibilities the scope holds. |
 | `MaxConditionBytes` | 32 KiB | The conditions one `Apply` or `Import` carries, each distinct one counted once. |
 | `MaxName`, `MaxDescription`, `MaxNote` | 128, 2,048, 2,048 characters | Names, titles and group ids, descriptions, and notes and justifications. |
 | `MaxRequest` | 256 characters | A request id in `Audit`. |

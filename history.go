@@ -203,25 +203,6 @@ func prunedPast(history, txid, id, fromTxid string) string {
 		ORDER BY ` + pruneLastTxid + `, ` + pruneLastID + ` LIMIT 1) IS NOT NULL)`
 }
 
-// unsorted turns sorting and JIT off in tx, for statements that must read an index in its order
-// where the planner would rather sort what it finds, and returns what puts both back as they were,
-// for a host's transaction that goes on past them; on an error, the rollback of tx, a transaction
-// or a savepoint, puts them back. Sorting off costs a plan that still sorts past jit_above_cost
-// before PostgreSQL 18, and compiling took far longer than the statement.
-func unsorted(ctx context.Context, tx pgx.Tx) (restore func() error, err error) {
-	var sorting, jit string
-	if err := tx.QueryRow(ctx, `SELECT current_setting('enable_sort'), current_setting('jit')`).Scan(&sorting, &jit); err != nil {
-		return nil, err
-	}
-	if _, err := tx.Exec(ctx, `SELECT set_config('enable_sort', 'off', true), set_config('jit', 'off', true)`); err != nil {
-		return nil, err
-	}
-	return func() error {
-		_, err := tx.Exec(ctx, `SELECT set_config('enable_sort', $1, true), set_config('jit', $2, true)`, sorting, jit)
-		return err
-	}, nil
-}
-
 // unsettled is SQL for whether history, SQL for its table, holds a prune of a transaction no older
 // than one the statement sees running: an export that began now would read what follows the
 // prune's records as the prune left it, but its Horizon, the oldest transaction running, would
@@ -339,7 +320,7 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 	// all of it and sort what it finds: by history's ids, a call reads only as far as its batch
 	// reaches. And the check of through, as History's of its cursor, finds a prune past it by the
 	// order of the last record each deleted, which only their index gives (prunedPast).
-	restore, err := unsorted(ctx, tx)
+	restore, err := planning(ctx, tx, unsorted)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -642,7 +623,7 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 		}
 		// Both statements find a prune past the cursor by the order of the last record each
 		// deleted, which only their index gives (prunedPast).
-		restore, err := unsorted(ctx, tx)
+		restore, err := planning(ctx, tx, unsorted)
 		if err != nil {
 			return err
 		}
