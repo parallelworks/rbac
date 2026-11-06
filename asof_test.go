@@ -1236,14 +1236,22 @@ func customRolesAsOf(t *testing.T, h *harness, plans string, reads map[string]fu
 				// planning reads the metapage of each empty index of history, as those of prunes
 				// before any, for each time a statement names it, so the read that ran first, in a
 				// map's random order, was counted hundreds of pages more than one that ran later.
+				// Then the least of three: a session plans a statement it cached again once it takes
+				// an invalidation of what the plan reads, which other sessions' catalog changes on a
+				// shared server can send it at any moment, and a run planned again so read the empty
+				// prune indexes' metapages hundreds of times more than the run before it.
 				if err := f(tx, a); err != nil {
 					return fmt.Errorf("%s: %w", what, err)
 				}
-				start := historyPages(ctx, t, tx)
-				if err := f(tx, a); err != nil {
-					return fmt.Errorf("%s: %w", what, err)
+				for i := range 3 {
+					start := historyPages(ctx, t, tx)
+					if err := f(tx, a); err != nil {
+						return fmt.Errorf("%s: %w", what, err)
+					}
+					if n := historyPages(ctx, t, tx) - start; i == 0 || n < pages[what] {
+						pages[what] = n
+					}
 				}
-				pages[what] = historyPages(ctx, t, tx) - start
 			}
 			return nil
 		}); err != nil {
