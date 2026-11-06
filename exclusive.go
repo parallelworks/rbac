@@ -187,7 +187,7 @@ func (a *Authorizer) broadExcludes(ctx context.Context, tenant string, b Princip
 	// of a time, a join to them reads every role's newest version. By the tenant's scope, which the
 	// indexes seek beside the principal: by its type, which none holds, it reads every grant they
 	// hold in the tenant.
-	rows, err := a.db.Query(ctx, `
+	rows, err := a.queryIndexed(ctx, a.db, `
 		WITH held AS (
 		  SELECT DISTINCT role FROM rbac_grants WHERE tenant = $1 AND scope = 'tenant:' || $1
 		    AND principal = ANY($2::text[]) AND (expires_at IS NULL OR expires_at > $3)
@@ -354,7 +354,7 @@ func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives m
 	if readCustom {
 		given, custom = givenWithCustom, "TRUE"
 	}
-	return conflictsIn(ctx, q, given, args, holders, custom, limited)
+	return conflictsIn(ctx, q, a.unjitted(), given, args, holders, custom, limited)
 }
 
 // valuesGiven is SQL for the roles giving exclusive values as conflictsIn reads them: with, the
@@ -403,8 +403,8 @@ const customGiving = "ARRAY(SELECT DISTINCT role FROM custom_given)"
 
 // conflictsIn is conflicts' statement, run with args: of the roles giving values, as given reads
 // them, the holders read across the tenant where holders is TRUE, or a role at a time where custom
-// is, and limited its LIMIT clause.
-func conflictsIn(ctx context.Context, q DB, given valuesGiven, args []any, holders, custom, limited string) ([]Conflict, error) {
+// is, and limited its LIMIT clause, planned with settings.
+func conflictsIn(ctx context.Context, q DB, settings []setting, given valuesGiven, args []any, holders, custom, limited string) ([]Conflict, error) {
 	var found []Conflict
 	var c Conflict
 	var who string
@@ -429,7 +429,7 @@ func conflictsIn(ctx context.Context, q DB, given valuesGiven, args []any, holde
 	// can't tell which of targets' branches the seeds reach, so it costs a change's check as if it
 	// read every identity in the tenant, past JIT's thresholds where they are in groups: compiling
 	// then takes a second for a plan that runs in milliseconds.
-	if err := planned(ctx, q, withoutJIT, scan, `
+	if err := planned(ctx, q, settings, scan, `
 		WITH RECURSIVE `+given.with+`seeds(k) AS (
 		  SELECT unnest($2::text[]) COLLATE "C"
 		  UNION SELECT principal FROM rbac_grants WHERE `+holders+` AND tenant = $1 AND `+given.held+`

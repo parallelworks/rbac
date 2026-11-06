@@ -297,7 +297,7 @@ func (a *Authorizer) keysOf(ctx context.Context, q DB, tenant string, s Subject)
 
 // keysAt is keysOf at a time.
 func (a *Authorizer) keysAt(ctx context.Context, q DB, tenant string, s Subject, at time.Time) (keys, binding []string, err error) {
-	rows, err := q.Query(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`
+	rows, err := a.queryIndexed(ctx, q, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`
 		SELECT k, k IN (SELECT k FROM keys) FROM bound ORDER BY k`, tenant, s.identityKey(), at)
 	if err != nil {
 		return nil, nil, err
@@ -1426,6 +1426,15 @@ var (
 	indexed = []setting{{"enable_seqscan", "off"}}
 )
 
+// unjitted is withoutJIT, with sequential scans off too as indexed has them, but as of a time, as
+// readIndexed.
+func (a *Authorizer) unjitted() []setting {
+	if a.history != "" {
+		return withoutJIT
+	}
+	return append(slices.Clone(withoutJIT), indexed...)
+}
+
 // readIndexed runs sql on q with indexed for its plan alone (planned), but as of a time, which reads
 // history's views in AsOf's transaction, and hands its rows to read.
 func (a *Authorizer) readIndexed(ctx context.Context, q DB, read func(pgx.Rows) error, sql string, args ...any) error {
@@ -1439,36 +1448,181 @@ func (a *Authorizer) readIndexed(ctx context.Context, q DB, read func(pgx.Rows) 
 	return planned(ctx, q, indexed, read, sql, args...)
 }
 
-// planned runs sql on q with settings for its plan alone, and hands its rows to read, in one round
-// trip: a batch sets them, keeping each one's value in a variable of the package's own, runs sql
-// and puts each back, on a pool in a transaction of its own and under WithTx in the host's, which
-// goes on past it. Sent with sql, the statement putting them back runs once sql has, however the
-// call goes on: where sql fails, the batch runs nothing after it, and the rollback, a transaction's
-// or a savepoint's, puts them back; and the batch is closed where read fails or panics too, so the
-// pool, or a host recovering in its transaction, has the connection back. A ctx done before it is
-// sent sends none of it. On a host's own DB that sends no batch, it runs in a savepoint of what its
-// Begin begins. Nothing runs on the session between the batch's statements, so no other read, of
-// this schema's tables or another's, can change the variables in between; a variable of each call
-// of its own would add one more to the session for good at every call.
-func planned(ctx context.Context, q DB, settings []setting, read func(pgx.Rows) error, sql string, args ...any) (err error) {
+// queryIndexed is q.Query of sql with indexed for its plan alone (plannedQuery), but as of a time, as
+// readIndexed: for a read whose rows its caller reads on.
+func (a *Authorizer) queryIndexed(ctx context.Context, q DB, sql string, args ...any) (pgx.Rows, error) {
+	if a.history != "" {
+		return q.Query(ctx, sql, args...)
+	}
+	return plannedQuery(ctx, q, indexed, sql, args...)
+}
+
+// queryByIndexes is q.Query of sql with indexed for its plan alone (plannedQuery), for a change's
+// statement whose rows its caller reads on.
+func queryByIndexes(ctx context.Context, q DB, sql string, args ...any) (pgx.Rows, error) {
+	return plannedQuery(ctx, q, indexed, sql, args...)
+}
+
+// queryRowIndexed is queryIndexed of a statement read for one row, as QueryRow reads it.
+func (a *Authorizer) queryRowIndexed(ctx context.Context, q DB, sql string, args ...any) pgx.Row {
+	rows, err := a.queryIndexed(ctx, q, sql, args...)
+	return firstRow{rows: rows, err: err}
+}
+
+// plannedQuery is plannedSteps of sql alone, whose rows it returns to be read on: the batch is read
+// to its end, the statement putting the settings back with it, as they are closed, or once the last
+// is read, so the error that statement or the batch meets is theirs.
+func plannedQuery(ctx context.Context, q DB, settings []setting, sql string, args ...any) (pgx.Rows, error) {
 	batcher, ok := q.(interface {
 		SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
 	})
 	if !ok {
-		return savepoint(ctx, q, func(tx pgx.Tx) error { return planned(ctx, tx, settings, read, sql, args...) })
+		tx, err := q.Begin(ctx)
+		if err != nil {
+			return nil, err
+		}
+		rows, err := plannedQuery(ctx, tx, settings, sql, args...)
+		if err != nil {
+			_ = finish(ctx, tx.Rollback)
+			return nil, err
+		}
+		return &plannedRows{Rows: rows, end: func(err error) error {
+			if err != nil {
+				_ = finish(ctx, tx.Rollback)
+				return err
+			}
+			return finish(ctx, tx.Commit)
+		}}, nil
 	}
-	set, put, names := make([]string, len(settings)), make([]string, len(settings)), make([]any, 0, len(settings))
-	values := make([]any, 0, 2*len(settings))
-	for i, s := range settings {
-		set[i] = fmt.Sprintf("set_config('rbac.' || $%d, current_setting($%[1]d), true), set_config($%[1]d, $%d, true)", 2*i+1, 2*i+2)
-		put[i] = fmt.Sprintf("set_config($%d, current_setting('rbac.' || $%[1]d), true)", i+1)
-		values, names = append(values, s.name, s.value), append(names, s.name)
+	br := batcher.SendBatch(ctx, settingBatch(settings, stmt(nil, sql, args...)))
+	// The first error the batch meets is the one returned, as closing it meets it again.
+	closing := func(err error) error {
+		if cerr := br.Close(); err == nil {
+			err = cerr
+		}
+		return err
 	}
-	b := &pgx.Batch{}
-	b.Queue(`SELECT `+strings.Join(set, ", "), values...)
-	b.Queue(sql, args...)
-	b.Queue(`SELECT `+strings.Join(put, ", "), names...)
-	br := batcher.SendBatch(ctx, b)
+	if _, err := br.Exec(); err != nil {
+		return nil, closing(err)
+	}
+	rows, err := br.Query()
+	if err != nil {
+		return nil, closing(err)
+	}
+	return &plannedRows{Rows: rows, end: func(err error) error {
+		if err == nil {
+			_, err = br.Exec()
+		}
+		return closing(err)
+	}}, nil
+}
+
+// plannedRows are the rows of a statement plannedQuery sent, which end the batch as they close.
+type plannedRows struct {
+	pgx.Rows
+	end    func(error) error
+	ended  bool
+	failed error
+}
+
+func (r *plannedRows) Next() bool {
+	if r.Rows.Next() {
+		return true
+	}
+	r.Close()
+	return false
+}
+
+func (r *plannedRows) Close() {
+	if r.ended {
+		return
+	}
+	r.ended = true
+	r.Rows.Close()
+	r.failed = r.end(r.Rows.Err())
+}
+
+func (r *plannedRows) Err() error {
+	if r.ended {
+		return r.failed
+	}
+	return r.Rows.Err()
+}
+
+// firstRow is the first of rows, as a QueryRow gives it.
+type firstRow struct {
+	rows pgx.Rows
+	err  error
+}
+
+func (r firstRow) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	defer r.rows.Close()
+	if !r.rows.Next() {
+		if err := r.rows.Err(); err != nil {
+			return err
+		}
+		return pgx.ErrNoRows
+	}
+	if err := r.rows.Scan(dest...); err != nil {
+		return err
+	}
+	r.rows.Close()
+	return r.rows.Err()
+}
+
+// statement is one plannedSteps sends, with its arguments and the read of its rows, nil for none.
+type statement struct {
+	sql  string
+	args []any
+	read func(pgx.Rows) error
+}
+
+// stmt is the statement running sql with args, whose rows read reads.
+func stmt(read func(pgx.Rows) error, sql string, args ...any) statement {
+	return statement{sql: sql, args: args, read: read}
+}
+
+// byIndexes runs stmts on tx, in order, in one round trip, each planned with indexed (plannedSteps):
+// a change's statements, as they read, lock and delete rows by key. A statement planned while its
+// table fit in a page reads the page whole whatever its shape, as reading one page costs less than
+// descending any index, and a session keeps the plan until the table is analyzed again, by when it
+// can have grown by thousands of pages: only the setting pins such a plan to an index.
+func byIndexes(ctx context.Context, tx DB, stmts ...statement) error {
+	if len(stmts) == 0 {
+		return nil
+	}
+	return plannedSteps(ctx, tx, indexed, stmts...)
+}
+
+// planned runs sql on q with settings for its plan alone, and hands its rows to read, in one round
+// trip (plannedSteps).
+func planned(ctx context.Context, q DB, settings []setting, read func(pgx.Rows) error, sql string, args ...any) error {
+	return plannedSteps(ctx, q, settings, stmt(read, sql, args...))
+}
+
+// plannedSteps runs stmts on q, in order, with settings for their plans alone, and hands each one's
+// rows to its read, in one round trip: a batch sets them, keeping each one's value in a variable of
+// the package's own, runs the statements and puts each back, on a pool in a transaction of its own and
+// under WithTx in the host's, which goes on past it. Sent with them, the statement putting them back
+// runs once they have, however the call goes on: where one fails, the batch runs nothing after it,
+// and the rollback, a transaction's or a savepoint's, puts them back; and the batch is closed where
+// a read fails or panics too, so the pool, or a host recovering in its transaction, has the
+// connection back. A ctx done before it is sent sends none of it. On a host's own DB that sends no
+// batch, it runs in a savepoint of what its Begin begins. Nothing runs on the session between the
+// batch's statements, so no other read, of this schema's tables or another's, can change the
+// variables in between; a variable of each call of its own would add one more to the session for
+// good at every call.
+func plannedSteps(ctx context.Context, q DB, settings []setting, stmts ...statement) (err error) {
+	batcher, ok := q.(interface {
+		SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
+	})
+	if !ok {
+		return savepoint(ctx, q, func(tx pgx.Tx) error { return plannedSteps(ctx, tx, settings, stmts...) })
+	}
+	br := batcher.SendBatch(ctx, settingBatch(settings, stmts...))
 	var rows pgx.Rows
 	defer func() {
 		if rows != nil {
@@ -1481,14 +1635,41 @@ func planned(ctx context.Context, q DB, settings []setting, read func(pgx.Rows) 
 	if _, err := br.Exec(); err != nil {
 		return err
 	}
-	if rows, err = br.Query(); err != nil {
-		return err
-	}
-	if err := read(rows); err != nil {
-		return err
+	for _, s := range stmts {
+		if rows, err = br.Query(); err != nil {
+			return err
+		}
+		if s.read != nil {
+			if err := s.read(rows); err != nil {
+				return err
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
 	}
 	_, err = br.Exec()
 	return err
+}
+
+// settingBatch is a batch setting settings, keeping each one's value in a variable of the package's
+// own, running stmts, and putting each back.
+func settingBatch(settings []setting, stmts ...statement) *pgx.Batch {
+	set, put, names := make([]string, len(settings)), make([]string, len(settings)), make([]any, 0, len(settings))
+	values := make([]any, 0, 2*len(settings))
+	for i, s := range settings {
+		set[i] = fmt.Sprintf("set_config('rbac.' || $%d, current_setting($%[1]d), true), set_config($%[1]d, $%d, true)", 2*i+1, 2*i+2)
+		put[i] = fmt.Sprintf("set_config($%d, current_setting('rbac.' || $%[1]d), true)", i+1)
+		values, names = append(values, s.name, s.value), append(names, s.name)
+	}
+	b := &pgx.Batch{}
+	b.Queue(`SELECT `+strings.Join(set, ", "), values...)
+	for _, s := range stmts {
+		b.Queue(s.sql, s.args...)
+	}
+	b.Queue(`SELECT `+strings.Join(put, ", "), names...)
+	return b
 }
 
 // into is a read for planned of a statement that returns one row, as an aggregate does, scanning it

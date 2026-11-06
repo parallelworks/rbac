@@ -126,7 +126,7 @@ func (a *Authorizer) SetEligibility(ctx context.Context, actor Subject, on Resou
 		}
 		// An expired eligibility that is still stored allowed nothing, so setting it again records
 		// the new actor and time. The statement's snapshot holds the one it replaces as it was.
-		rows, err := tx.Query(ctx, `
+		rows, err := a.queryIndexed(ctx, tx, `
 			INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds,
 			  expires_at, requires, approvers, note, created_by)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
@@ -170,7 +170,7 @@ func (a *Authorizer) requirementOf(ctx context.Context, tx pgx.Tx, tenant string
 		return "", nil
 	}
 	var requires string
-	err := tx.QueryRow(ctx, `SELECT coalesce(max(requires), '') FROM rbac_eligibilities
+	err := a.queryRowIndexed(ctx, tx, `SELECT coalesce(max(requires), '') FROM rbac_eligibilities
 		WHERE tenant = $1 AND principal = $2 AND scope = $3 AND role = $4 AND (expires_at IS NULL OR expires_at > $5)`,
 		tenant, e.Principal.key(), e.Scope.Key(), e.Role, a.cfg.Now()).Scan(&requires)
 	return requires, err
@@ -222,7 +222,7 @@ func (a *Authorizer) DeleteEligibility(ctx context.Context, actor Subject, on Re
 	}
 	scope := on.Scope()
 	return a.change(ctx, actor, on, "DeleteEligibility", ViaEligibility, nil, []Binding{{Role: role, Principal: p}}, nil, nil, func(tx pgx.Tx) (ChangeEvent, gains, error) {
-		rows, err := tx.Query(ctx, `DELETE FROM rbac_eligibilities WHERE tenant = $1 AND scope = $2 AND principal = $3 AND role = $4
+		rows, err := a.queryIndexed(ctx, tx, `DELETE FROM rbac_eligibilities WHERE tenant = $1 AND scope = $2 AND principal = $3 AND role = $4
 			RETURNING `+eligibilityColumns, on.Tenant, scope.Key(), p.key(), role)
 		if err != nil {
 			return ChangeEvent{}, gains{}, err
@@ -341,8 +341,8 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 		// change holds grants: a change ending a place or a membership holds every activation of the
 		// identities it ends them for, through a place this one rests on or not, as one that ended,
 		// and DeleteExpired one that ended.
-		if _, err := tx.Exec(ctx, `SELECT FROM rbac_grants WHERE tenant = $1 AND principal = $2 AND scope = $3 AND role = $4
-			AND source = 'activation' FOR UPDATE`, on.Tenant, s.Principal.key(), scope.Key(), act.Role); err != nil {
+		if err := byIndexes(ctx, tx, stmt(nil, `SELECT FROM rbac_grants WHERE tenant = $1 AND principal = $2 AND scope = $3 AND role = $4
+			AND source = 'activation' FOR UPDATE`, on.Tenant, s.Principal.key(), scope.Key(), act.Role)); err != nil {
 			return ChangeEvent{}, err
 		}
 		if err := a.stillStanding(ctx, tx, on.Tenant, stand); err != nil {
@@ -373,7 +373,7 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 		// ends no later changes nothing, so is reported as nothing. Ended is by the database's clock
 		// too, which history dates the old one's expiry by: by Config.Now alone, which can run ahead
 		// of it, the old one would be recorded as revoked by s.
-		rows, err := tx.Query(ctx, `
+		rows, err := a.queryIndexed(ctx, tx, `
 			INSERT INTO rbac_grants AS g (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at,
 			  note, approved_by, created_by, updated_by, activated_through, eligibility_id)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11, $13, $14)
@@ -395,7 +395,7 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 			return ChangeEvent{}, err
 		}
 		if len(granted) == 0 {
-			rows, err := tx.Query(ctx, `SELECT `+grantColumns+` FROM rbac_grants
+			rows, err := a.queryIndexed(ctx, tx, `SELECT `+grantColumns+` FROM rbac_grants
 				WHERE tenant = $1 AND principal = $2 AND scope = $3 AND role = $4 AND source = $5`,
 				on.Tenant, s.Principal.key(), scope.Key(), act.Role, SourceActivation)
 			if err != nil {
@@ -502,7 +502,7 @@ var holdSQL = `WITH RECURSIVE ` + keysSQL("$1::text", "$2::text", "$3") + `, hel
 // held, so each is held before the keys are returned; where s isn't standing it reads none, and
 // activates nothing.
 func holdPlaces(ctx context.Context, tx pgx.Tx, tenant string, s Subject, now, until time.Time) (paths, error) {
-	rows, err := tx.Query(ctx, holdSQL, tenant, s.identityKey(), now, until)
+	rows, err := queryByIndexes(ctx, tx, holdSQL, tenant, s.identityKey(), now, until)
 	if err != nil {
 		return nil, err
 	}
@@ -580,18 +580,23 @@ func (a *Authorizer) restingOn(ctx context.Context, tx pgx.Tx, tenant string, id
 	if len(identities)+len(groups) == 0 {
 		return resting{}, nil
 	}
-	rows, err := tx.Query(ctx, `
+	var r resting
+	err := byIndexes(ctx, tx, a.restingOnStmt(&r, tenant, identities, groups, now))
+	return r, err
+}
+
+// restingOnStmt is restingOn's statement, reading into r.
+func (a *Authorizer) restingOnStmt(r *resting, tenant string, identities, groups []string, now time.Time) statement {
+	return stmt(collecting(&r.ids, collectStrings), `
 		WITH RECURSIVE `+insideSQL("$3", "$4", "NULL", false)+`, holders(k) AS (
 		  SELECT unnest($2::text[]) COLLATE "C" UNION SELECT principal FROM inside
 		)
 		SELECT id::text FROM (`+byKey("ARRAY(SELECT k FROM holders)", "rbac_grants", "principal", "id",
 		"tenant = $1 AND source = 'activation' AND expires_at > $4")+`) a ORDER BY id`, tenant, identities, groups, now)
-	if err != nil {
-		return resting{}, err
-	}
-	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
-	return resting{ids: ids}, err
 }
+
+// collectStrings collects rows of one text column.
+func collectStrings(rows pgx.Rows) ([]string, error) { return pgx.CollectRows(rows, pgx.RowTo[string]) }
 
 // restsSQL is unrest's statement reading the activations whose paths left end sooner than they do,
 // with the latest end of those: tenant $1, the activations' ids $2, now $3. Each by its id alone,
@@ -627,40 +632,37 @@ func (a *Authorizer) unrest(ctx context.Context, tx pgx.Tx, tenant string, actor
 	if len(r.ids) == 0 {
 		return nil, nil, nil
 	}
-	rows, err := tx.Query(ctx, restsSQL, tenant, r.ids, now)
-	if err != nil {
-		return nil, nil, err
-	}
 	var gone, cut []string
 	var to []time.Time
 	var id string
 	var until *time.Time
-	if _, err := pgx.ForEachRow(rows, []any{&id, &until}, func() error {
-		if until == nil || !until.After(now) {
-			gone = append(gone, id)
-		} else {
-			cut, to = append(cut, id), append(to, *until)
-		}
-		return nil
-	}); err != nil {
+	if err := byIndexes(ctx, tx, stmt(func(rows pgx.Rows) error {
+		_, err := pgx.ForEachRow(rows, []any{&id, &until}, func() error {
+			if until == nil || !until.After(now) {
+				gone = append(gone, id)
+			} else {
+				cut, to = append(cut, id), append(to, *until)
+			}
+			return nil
+		})
+		return err
+	}, restsSQL, tenant, r.ids, now)); err != nil {
 		return nil, nil, err
 	}
+	var stmts []statement
 	if len(gone) > 0 {
-		if ended, err = removedWhere(ctx, a, tx, "rbac_grants", grantColumns, collectGrants, "id = ANY($1::text[]::uuid[])", gone); err != nil {
-			return nil, nil, err
-		}
+		stmts = append(stmts, removing(a, "rbac_grants", grantColumns, collectGrants, &ended, "id = ANY($1::text[]::uuid[])", gone))
 	}
+	// Each by its id, its end looked up among those cut: joined to them, a plan made while the table
+	// was small read it whole.
 	if len(cut) > 0 {
-		rows, err := tx.Query(ctx, `UPDATE rbac_grants SET expires_at = c.x, updated_by = $3, updated_at = now()
-			FROM unnest($1::text[], $2::timestamptz[]) AS c(i, x)
-			WHERE id = c.i::uuid
-			RETURNING `+grantColumns, cut, to, actorKey(actor))
-		if err != nil {
-			return nil, nil, err
-		}
-		if short, err = collectGrants(rows); err != nil {
-			return nil, nil, err
-		}
+		stmts = append(stmts, stmt(collecting(&short, collectGrants), `UPDATE rbac_grants g SET updated_by = $3, updated_at = now(),
+			  expires_at = (SELECT c.x FROM unnest($1::text[], $2::timestamptz[]) AS c(i, x) WHERE c.i::uuid = g.id)
+			WHERE id = ANY($1::text[]::uuid[])
+			RETURNING `+grantColumns, cut, to, actorKey(actor)))
+	}
+	if err := byIndexes(ctx, tx, stmts...); err != nil {
+		return nil, nil, err
 	}
 	return short, ended, nil
 }
@@ -675,8 +677,7 @@ func holdResting(ctx context.Context, tx pgx.Tx, r resting) error {
 	if len(r.ids) == 0 {
 		return nil
 	}
-	_, err := tx.Exec(ctx, lockedInOrder("rbac_grants", "", bindingOrder, "id = ANY($1::text[]::uuid[])"), r.ids)
-	return err
+	return byIndexes(ctx, tx, stmt(nil, lockedInOrder("rbac_grants", "id", bindingOrder, byIDs("$1::text[]::uuid[]", "rbac_grants", keyCols(bindingOrder, "id"))), r.ids))
 }
 
 // madeThrough is the eligibility an activation is made through: its id, and its principal's key.
@@ -705,7 +706,7 @@ func (a *Authorizer) eligible(ctx context.Context, q DB, s Subject, on Resource,
 		return madeThrough{}, Principal{}, err
 	}
 	readingKeys()
-	rows, err := q.Query(ctx, byKey("$4", "rbac_eligibilities", "principal", "id, principal, requires, approvers", `tenant = $1 AND scope = $2 AND role = $3
+	rows, err := a.queryIndexed(ctx, q, byKey("$4", "rbac_eligibilities", "principal", "id, principal, requires, approvers", `tenant = $1 AND scope = $2 AND role = $3
 		  AND max_seconds >= $5 AND (expires_at IS NULL OR expires_at > $6 AND expires_at >= $7)`),
 		on.Tenant, scope.Key(), act.Role, countedOf(slices.Sorted(maps.Keys(reached)), broad{}), seconds(act.Duration), a.cfg.Now(), until)
 	if err != nil {
@@ -821,7 +822,7 @@ func (a *Authorizer) Eligibilities(ctx context.Context, tenant string, f GrantFi
 		return nil, fmt.Errorf("%w: Eligibilities needs a tenant and valid scopes or principals", ErrInvalid)
 	}
 	query, scopes, principals := f.sql("rbac_eligibilities", eligibilityColumns, eligibilityColumns+", scope, principal", "scope, principal, role")
-	rows, err := a.db.Query(ctx, query, tenant, scopes, principals, a.cfg.Now())
+	rows, err := a.queryIndexed(ctx, a.db, query, tenant, scopes, principals, a.cfg.Now())
 	if err != nil {
 		return nil, err
 	}

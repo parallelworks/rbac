@@ -9851,7 +9851,8 @@ func TestAReadLeavesTheHostItsPlannerSettingsWhereItFails(t *testing.T) {
 // which the host recovers from. On the pool, and in the host's transaction or a savepoint of it, the
 // host rolling back to that where the call failed; and on a DB that sends no batches, which wraps
 // either. A panic left the batch unread, so the pool never had its connection back, and the host's
-// transaction could run nothing more.
+// transaction could run nothing more. So too for a read whose rows its caller reads on, closing them
+// as it ends (QueriedIndexed).
 func TestAReadPlannedAloneLeavesItsSessionAsItFoundItHoweverItEnds(t *testing.T) {
 	ctx := t.Context()
 	schema := pgtest.Open(t, "pool_max_conns=1").Config()
@@ -9886,69 +9887,88 @@ func TestAReadPlannedAloneLeavesItsSessionAsItFoundItHoweverItEnds(t *testing.T)
 		"the host's transaction":                 func(_ *pgxpool.Pool, tx pgx.Tx) rbac.DB { return tx },
 		"a DB that sends no batches on the host's transaction": func(_ *pgxpool.Pool, tx pgx.Tx) rbac.DB { return hostTx{tx} },
 	}
-	for name, db := range on {
-		for how, end := range ends {
-			t.Run(name+", where "+how, func(t *testing.T) {
-				bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
-				defer cancel()
-				// A pool of one connection of its own, which closes only once it has it back.
-				pool, err := pgxpool.NewWithConfig(bounded, schema)
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer func() {
-					closed := make(chan struct{})
-					go func() {
-						pool.Close()
-						close(closed)
-					}()
-					select {
-					case <-closed:
-					case <-time.After(10 * time.Second):
-						t.Error("the pool never had its connection back")
-					}
-				}()
-				var host pgx.Tx
-				if strings.Contains(name, "host's transaction") {
-					var err error
-					if host, err = pool.Begin(bounded); err != nil {
+	ways := map[string]func(ctx context.Context, q rbac.DB, read func(pgx.Rows) error, sql string) error{
+		"planned": func(ctx context.Context, q rbac.DB, read func(pgx.Rows) error, sql string) error {
+			return rbac.Planned(ctx, q, read, sql)
+		},
+		"read on": func(ctx context.Context, q rbac.DB, read func(pgx.Rows) error, sql string) error {
+			rows, err := rbac.QueriedIndexed(ctx, q, sql)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			if err := read(rows); err != nil {
+				return err
+			}
+			rows.Close()
+			return rows.Err()
+		},
+	}
+	for way, read := range ways {
+		for name, db := range on {
+			for how, end := range ends {
+				t.Run(way+" on "+name+", where "+how, func(t *testing.T) {
+					bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
+					defer cancel()
+					// A pool of one connection of its own, which closes only once it has it back.
+					pool, err := pgxpool.NewWithConfig(bounded, schema)
+					if err != nil {
 						t.Fatal(err)
 					}
-					defer func() { _ = host.Rollback(context.WithoutCancel(ctx)) }()
-					if _, err := host.Exec(bounded, `SAVEPOINT before`); err != nil {
-						t.Fatal(err)
-					}
-				}
-				err = func() (err error) {
 					defer func() {
-						if r := recover(); r != nil {
-							if r != panicked {
-								panic(r)
-							}
-							err = errors.New(panicked)
+						closed := make(chan struct{})
+						go func() {
+							pool.Close()
+							close(closed)
+						}()
+						select {
+						case <-closed:
+						case <-time.After(10 * time.Second):
+							t.Error("the pool never had its connection back")
 						}
 					}()
-					return rbac.Planned(bounded, db(pool, host), end.read, end.sql)
-				}()
-				if (err == nil) != (how == "it reads") {
-					t.Fatalf("the read returned %v", err)
-				}
-				// As a host whose call failed, back to before it, but where it panicked after its
-				// statements ran, which the host goes on from.
-				if err != nil && host != nil && how != "its read panics" {
-					if _, err := host.Exec(bounded, `ROLLBACK TO SAVEPOINT before`); err != nil {
-						t.Fatal(err)
+					var host pgx.Tx
+					if strings.Contains(name, "host's transaction") {
+						var err error
+						if host, err = pool.Begin(bounded); err != nil {
+							t.Fatal(err)
+						}
+						defer func() { _ = host.Rollback(context.WithoutCancel(ctx)) }()
+						if _, err := host.Exec(bounded, `SAVEPOINT before`); err != nil {
+							t.Fatal(err)
+						}
 					}
-				}
-				var q rbac.DB = pool
-				if host != nil {
-					q = host
-				}
-				var seqscan string
-				if err := q.QueryRow(bounded, `SELECT current_setting('enable_seqscan')`).Scan(&seqscan); err != nil || seqscan != "on" {
-					t.Errorf("enable_seqscan = %q, %v, once the read ended", seqscan, err)
-				}
-			})
+					err = func() (err error) {
+						defer func() {
+							if r := recover(); r != nil {
+								if r != panicked {
+									panic(r)
+								}
+								err = errors.New(panicked)
+							}
+						}()
+						return read(bounded, db(pool, host), end.read, end.sql)
+					}()
+					if (err == nil) != (how == "it reads") {
+						t.Fatalf("the read returned %v", err)
+					}
+					// As a host whose call failed, back to before it, but where it panicked after its
+					// statements ran, which the host goes on from.
+					if err != nil && host != nil && how != "its read panics" {
+						if _, err := host.Exec(bounded, `ROLLBACK TO SAVEPOINT before`); err != nil {
+							t.Fatal(err)
+						}
+					}
+					var q rbac.DB = pool
+					if host != nil {
+						q = host
+					}
+					var seqscan string
+					if err := q.QueryRow(bounded, `SELECT current_setting('enable_seqscan')`).Scan(&seqscan); err != nil || seqscan != "on" {
+						t.Errorf("enable_seqscan = %q, %v, once the read ended", seqscan, err)
+					}
+				})
+			}
 		}
 	}
 }

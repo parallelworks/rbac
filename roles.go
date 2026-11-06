@@ -243,7 +243,7 @@ func (a *Authorizer) broadArgs(ctx context.Context, q DB, tenant string, p Permi
 	// keys at once, a generic plan read the grants by the custom roles' index on the tenant alone,
 	// every grant of one in the tenant for each scope or type; and as of a time, roles tested
 	// against the ids rather than read by them are each read at its newest version.
-	rows, err := q.Query(ctx, `SELECT `+roleColumns+` FROM (`+byKey(namedCustom(`SELECT g.role FROM unnest(`+in+`) AS b(k)
+	rows, err := a.queryIndexed(ctx, q, `SELECT `+roleColumns+` FROM (`+byKey(namedCustom(`SELECT g.role FROM unnest(`+in+`) AS b(k)
 		CROSS JOIN LATERAL (`+grants("b.k")+`) g`), "rbac_roles", "id", roleColumns,
 		"tenant = $1 AND $2::text = ANY(permissions) AND $3::text = ANY(resource_types)")+`) r
 		ORDER BY id`, args...)
@@ -589,7 +589,7 @@ func (a *Authorizer) givesMoreLabels(was, now RoleDefinition) bool {
 // tenant, where what they give of label values is held.
 func (a *Authorizer) tenantBuckets(ctx context.Context, q DB, tenant string, id Role) ([]conditionBucket, error) {
 	// The LIKE matches the partial index on custom roles' grants.
-	rows, err := q.Query(ctx, `SELECT DISTINCT principal_kind, principal_id, source FROM rbac_grants
+	rows, err := a.queryIndexed(ctx, q, `SELECT DISTINCT principal_kind, principal_id, source FROM rbac_grants
 		WHERE tenant = $1 AND role = $2 AND role LIKE 'custom.%' AND scope = $3 AND conditional
 		  AND (expires_at IS NULL OR expires_at > $4)
 		ORDER BY 1, 2, 3`, tenant, string(id), TenantRoot(tenant).Key(), a.cfg.Now())
@@ -659,10 +659,13 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		// What it deletes, before it reads the time it decides at: no other change runs in the tenant
 		// beside it but DeleteExpired, which takes no lock and may be deleting one of them that has
 		// ended by its clock, and a wait for it would leave that time behind.
-		b := &pgx.Batch{}
-		b.Queue(lockedInOrder("rbac_eligibilities", "", bindingOrder, "tenant = $1 AND "+ofRole), tenant, id)
-		b.Queue(lockedInOrder("rbac_grants", "", bindingOrder, "tenant = $1 AND "+ofRole), tenant, id)
-		if err := tx.SendBatch(ctx, b).Close(); err != nil {
+		held := func(table string) string {
+			return "SELECT " + keyCols(bindingOrder, "id") + " FROM " + table + " WHERE tenant = $1 AND " + ofRole
+		}
+		if err := byIndexes(ctx, tx,
+			stmt(nil, lockedInOrder("rbac_eligibilities", "id", bindingOrder, held("rbac_eligibilities")), tenant, id),
+			stmt(nil, lockedInOrder("rbac_grants", "id", bindingOrder, held("rbac_grants")), tenant, id),
+		); err != nil {
 			return ChangeEvent{}, err
 		}
 		// With what a deny below the tenant may stop it by, in one statement (roleRead).
@@ -697,7 +700,7 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		// ones give nothing and Grants doesn't list them, so the host has none to remove.
 		if len(a.owned) > 0 {
 			var source string
-			err = tx.QueryRow(ctx, `SELECT source FROM rbac_grants WHERE tenant = $1 AND `+ofRole+` AND source = ANY($3::text[])
+			err = a.queryRowIndexed(ctx, tx, `SELECT source FROM rbac_grants WHERE tenant = $1 AND `+ofRole+` AND source = ANY($3::text[])
 				AND (expires_at IS NULL OR expires_at > $4) LIMIT 1`,
 				tenant, id, slices.Sorted(maps.Keys(a.owned)), a.cfg.Now()).Scan(&source)
 			switch {
@@ -707,12 +710,16 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 				return ChangeEvent{}, err
 			}
 		}
-		revoked, err := a.remove(ctx, tx, tenant, ofRole, id)
-		if err != nil {
-			return ChangeEvent{}, err
-		}
-		ended, err := a.removeEligible(ctx, tx, tenant, ofRole, id)
-		if err != nil {
+		// Each by its id, found as above, which the change holds: by the role, a plan for its arguments
+		// by statistics from a near-empty table read the tenant's entries of the custom roles' grants
+		// by principal.
+		var revoked []Grant
+		var ended []Eligibility
+		if err := byIndexes(ctx, tx,
+			removing(a, "rbac_grants", grantColumns, collectGrants, &revoked, anyOf("id", "SELECT id FROM rbac_grants WHERE tenant = $1 AND "+ofRole), tenant, id),
+			removing(a, "rbac_eligibilities", eligibilityColumns, collectEligibilities, &ended,
+				anyOf("id", "SELECT id FROM rbac_eligibilities WHERE tenant = $1 AND "+ofRole), tenant, id),
+		); err != nil {
 			return ChangeEvent{}, err
 		}
 		tag, err := tx.Exec(ctx, `DELETE FROM rbac_roles WHERE tenant = $1 AND id = $2`, tenant, id)
@@ -870,7 +877,7 @@ func (a *Authorizer) revalidations(ctx context.Context, q DB, tenant string, d r
 		return nil, nil
 	}
 	ids := []string{string(d.now.ID)}
-	rows, err := q.Query(ctx, `SELECT `+grantColumns+` FROM (`+customRoleRows("$2", "rbac_grants", "*", inForce)+`) g ORDER BY id`, tenant, ids, a.cfg.Now())
+	rows, err := a.queryIndexed(ctx, q, `SELECT `+grantColumns+` FROM (`+customRoleRows("$2", "rbac_grants", "*", inForce)+`) g ORDER BY id`, tenant, ids, a.cfg.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -878,7 +885,7 @@ func (a *Authorizer) revalidations(ctx context.Context, q DB, tenant string, d r
 	if err != nil {
 		return nil, err
 	}
-	rows, err = q.Query(ctx, `SELECT `+eligibilityColumns+` FROM (`+customRoleRows("$2", "rbac_eligibilities", "*", inForce)+`) e
+	rows, err = a.queryIndexed(ctx, q, `SELECT `+eligibilityColumns+` FROM (`+customRoleRows("$2", "rbac_eligibilities", "*", inForce)+`) e
 		ORDER BY scope, principal, role`, tenant, ids, a.cfg.Now())
 	if err != nil {
 		return nil, err
@@ -1750,7 +1757,7 @@ func (a *Authorizer) rolesScopes(ctx context.Context, q DB, tenant string, ids [
 	}
 	// Those ended give nothing, so changing what they give changes no access. An eligibility is
 	// never a broad principal's.
-	rows, err := q.Query(ctx, customRoleRows("$2", "rbac_grants",
+	rows, err := a.queryIndexed(ctx, q, customRoleRows("$2", "rbac_grants",
 		"role, scope_type, scope_id, CASE WHEN principal_kind = ANY($4::text[]) THEN principal_kind ELSE '' END", inForce)+`
 		UNION
 		`+customRoleRows("$2", "rbac_eligibilities", "role, scope_type, scope_id, ''::text", inForce)+`

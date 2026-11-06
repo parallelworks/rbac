@@ -425,6 +425,12 @@ func Planned(ctx context.Context, q DB, read func(pgx.Rows) error, sql string, a
 	return planned(ctx, q, indexed, read, sql, args...)
 }
 
+// QueriedIndexed is q.Query of sql with sequential scans off for its plan alone, as a list reads
+// its rows on (plannedQuery).
+func QueriedIndexed(ctx context.Context, q DB, sql string, args ...any) (pgx.Rows, error) {
+	return plannedQuery(ctx, q, indexed, sql, args...)
+}
+
 // HeldByMembers is why making custom role id privileged in tenant is refused at now, read on q, as
 // its tenant's members hold it (heldByMembers).
 func HeldByMembers(ctx context.Context, q DB, tenant string, id Role, now time.Time) error {

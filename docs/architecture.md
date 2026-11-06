@@ -219,11 +219,21 @@ erDiagram
   setting in a variable of the package's own, `rbac.enable_seqscan`, and before one putting it back:
   on a pool the batch is a transaction of its own, and under `WithTx` it runs in the host's, which
   goes on past it; where the statement fails, nothing after it runs, and a rollback puts the setting
-  back. So are a change to members' reads of the grants, eligibilities and denies naming its groups
-  (`reachOf`), which read every deny and eligibility in the database so, and its removal of the
-  places it ends (`leave`), which deletes each by where it is stored, as `restingIn` holds it:
-  matched beside `tenant = $1`, a plan made while the table was small read every place in the
-  tenant and for each one every place in the table, 2.6 million pages to remove one member. A
+  back. So is every other statement a check, a list or a change sends on the tables but as of a
+  time: a list's (`queryIndexed`, `plannedQuery`, whose rows end the batch as they close) and a
+  change's (`byIndexes`, several in one batch), as a change to members' reads of the grants,
+  eligibilities and denies naming its groups (`reachOf`), which read every deny and eligibility in
+  the database so, and its removal of the places it ends (`leave`), which deletes each by where it
+  is stored, as `restingIn` holds it: matched beside `tenant = $1`, a plan made while the table was
+  small read every place in the tenant and for each one every place in the table, 2.6 million pages
+  to remove one member. A plan made while a table fit in a page reads it whole whatever the
+  statement's shape, so only the setting pins it; and the shapes pin what a plan reads with it off,
+  as statistics from a near-empty table count every value as distinct: a key's rows are read in the
+  order of the index leading to it where another leads to the tenant alone (`seekBy`), rows to lock
+  are sorted from what their keys found and locked each by its key (`lockedInOrder`,
+  `lockedDenies`), a count of a principal's groups reads its places in no
+  order (`groupsBounded`), a typed count reads the scopes' index in its order, up to the count, and names the type too, so the primary key is sought by it, and the denies naming a subject's keys are kept to the types outside their read, so the index of keys finds them (`bindingDenies`), and an upsert
+  counts each row it returns by its id rather than an EXISTS a plan hashed every grant for. A
   search reads its subject's own grants on scopes of the listed types a key at a time too
   (`heldByType`): by `= ANY` of its keys beside a type's range of scopes, a plan by no statistics
   read that range of the scopes' index, every grant on a scope of the type in the tenant. A search
@@ -367,8 +377,10 @@ flowchart BT
   group's members by the tenant's selectivity and the group id's apart, so a large tenant's group
   of one whose id other tenants use too was counted as a thousand or more, and joined in one
   statement its memberships were hashed with every tenant's; looked up each by its key, a group of
-  20,000 read 80,000 pages of memberships that fill 900. `Members` takes the identities whose
-  membership stands from it, and looks only the rest up by key.
+  20,000 read 80,000 pages of memberships that fill 900. It reads the places with sequential scans
+  off, a group at a time in the primary key's order, and the memberships with them on, whatever its
+  caller's (`0029_member_reads`), as every statement calling it now has them off. `Members` takes
+  the identities whose membership stands from it, and looks only the rest up by key.
 
 ## Resources, scopes and paths
 
@@ -1022,7 +1034,12 @@ flowchart TB
 - **Rows in one order.** Under its advisory locks, a change holds the rows it may wait for in one
   order of tables, each table's in its own order: eligibilities (by scope, principal and id), denies
   (by scope and id), memberships, places in groups (by group, principal and source), and grants (by
-  scope, principal and id) last. `DeleteGroup` and `DeleteGroups` (`holdGroups`) hold eligibilities,
+  scope, principal and id) last. A statement holding several of a table's rows finds them by their
+  keys, sorts what it found by that order, and locks each by its key on its own, in a nested loop
+  over the sorted rows, which takes them in the order it is given (`lockedInOrder`, `lockedDenies`,
+  `revokedSQL`): so it locks the rows it found in the order it sorted them, as one locking them
+  as a scan of the table found them, sorted, did, without a plan reading a whole index in that
+  order to find them. `DeleteGroup` and `DeleteGroups` (`holdGroups`) hold eligibilities,
   denies, places and then grants with the activations resting on the places; `DeletePrincipal` the
   same, an identity's membership before its places; `DeleteScopes` eligibilities, denies and then
   grants; `SetMemberships` every membership it sets, places and then activations; `ChangeMembers`
@@ -1052,11 +1069,11 @@ flowchart TB
   a moment of its own, so a change committing between two can mix two states, and for AsOf, history
   of a time not yet final. Conflicts reads in one statement, the custom roles with their grants, as
   a check and `broadExcludes` read them, so it lists what one moment held under `WithTx` too, with
-  JIT off for it (`withoutJIT`). A read that sets planner settings for its own statement alone
-  (`planned`), as that, `Holders`' read of label values, a check's read of its subject's grants
-  (`indexed`) and a change bounding a scope's conditions (`seeking`) do, sends it in one batch
-  between a statement setting them, which keeps each one's value in a variable of the package's own,
-  and one putting them back, so the server puts the host's back however the call ends once it has
+  JIT off for it (`withoutJIT`). A read that sets planner settings for its own statements alone
+  (`planned`, `plannedSteps`, `plannedQuery`), as that, `Holders`' read of label values, every read
+  and change of the tables (`indexed`) and a change bounding a scope's conditions (`seeking`) do,
+  sends them in one batch between a statement setting them, which keeps each one's value in a
+  variable of the package's own, and one putting them back, so the server puts the host's back however the call ends once it has
   sent the batch: where the statement fails, nothing after it runs, and the rollback puts them back;
   and the batch is read to its end where the call's reading of its rows fails or panics, so the
   pool, or a host recovering in its transaction, has the connection back. Set and put back in
