@@ -27,6 +27,7 @@ import (
 	"cel.dev/cel-go/common/types/traits"
 	"cel.dev/cel-go/ext"
 	"cel.dev/cel-go/interpreter"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -1471,6 +1472,164 @@ func TestAMapHoldingTwoKeysReadAsOneFailsItsConditions(t *testing.T) {
 	}
 }
 
+// JSON text and a message an Any packs can hold a key twice, which each reader picks one of as it
+// likes: encoding/json and protobuf read the last, so `{"role": "user", "role": "admin"}` was read as
+// "admin" where a host reading the first checked "user", and so was a packed Struct with two entries
+// of "role", or a Value setting a Struct twice, which decoding merges, though a map of the host's
+// holding two keys read as one fails. Text that isn't UTF-8, or escapes half a surrogate pair, holds
+// what encoding/json reads as U+FFFD, so two names of either were read as one too; and a JSON number
+// that isn't one, as "0x1p4", was read as what strconv makes of it. Each fails every condition reading
+// its kind.
+func TestJSONTextOrAPackedMessageHoldingAKeyTwiceFailsItsConditions(t *testing.T) {
+	marshaled := func(m proto.Message) []byte {
+		b, err := proto.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	field := func(n protowire.Number, b []byte) []byte {
+		return protowire.AppendBytes(protowire.AppendTag(nil, n, protowire.BytesType), b)
+	}
+	entry := func(key string, value []byte) []byte {
+		return field(1, slices.Concat(field(1, []byte(key)), field(2, value)))
+	}
+	user, admin := marshaled(structpb.NewStringValue("user")), marshaled(structpb.NewStringValue("admin"))
+	twice := slices.Concat(entry("role", user), entry("role", admin))
+	packed := func(name string, b []byte) *anypb.Any {
+		return &anypb.Any{TypeUrl: "type.googleapis.com/google.protobuf." + name, Value: b}
+	}
+	unknown := protowire.AppendVarint(protowire.AppendTag(nil, 9, protowire.VarintType), 1)
+	for name, v := range map[string]any{
+		"JSON text":              json.RawMessage(`{"role": "user", "role": "admin"}`),
+		"JSON text escaping one": json.RawMessage(`{"role": "user", "r\u006fle": "admin"}`),
+		"JSON text, deep":        json.RawMessage(`[{"a": {"role": "user", "b": [], "role": "admin"}}]`),
+		"JSON text naming bytes that aren't UTF-8":   json.RawMessage("{\"\xff\": \"user\", \"\xfe\": \"admin\"}"),
+		"JSON text holding bytes that aren't UTF-8":  json.RawMessage("{\"role\": \"\xff\"}"),
+		"JSON text naming halves of surrogate pairs": json.RawMessage(`{"\ud800": "user", "\udc00": "admin"}`),
+		"JSON text holding half a surrogate pair":    json.RawMessage(`["\ud83d", "x"]`),
+		"JSON text holding a pair reversed":          json.RawMessage(`["\ude00\ud83d"]`),
+		"JSON text of two values":                    json.RawMessage(`{"role": "user"} {"role": "admin"}`),
+		"JSON text closing once more":                json.RawMessage(`{"role": "admin"}}`),
+		"a packed Struct":                            packed("Struct", twice),
+		"a packed Struct, deep":                      packed("ListValue", field(1, field(5, twice))),
+		"a packed Value setting a Struct twice":      packed("Value", slices.Concat(field(5, entry("role", user)), field(5, entry("role", admin)))),
+		"a packed Value set twice":                   packed("Value", slices.Concat(field(3, []byte("admin")), protowire.AppendVarint(protowire.AppendTag(nil, 4, protowire.VarintType), 1))),
+		"a packed wrapper set twice":                 packed("StringValue", slices.Concat(field(1, []byte("user")), field(1, []byte("admin")))),
+		"a packed entry keyed twice":                 packed("Struct", field(1, slices.Concat(field(1, []byte("x")), field(1, []byte("role")), field(2, admin)))),
+	} {
+		for _, expr := range []string{`request.attributes.ok == true`, `request.attributes.v.role == "admin"`} {
+			if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"ok": true, "v": v}); err != nil || evaluated {
+				t.Errorf("%s beside %s: evaluated %t, %v", expr, name, evaluated, err)
+			}
+		}
+	}
+	for _, n := range []string{"0x1p4", "Inf", "NaN", "+1", "01", "1.", ".5", "1e", "-", "", " 1", "1_0", "1e+"} {
+		if _, evaluated, _, err := rbac.EvaluateCondition(t, `request.attributes.ok == true`, map[string]any{"ok": true, "n": json.Number(n)}); err != nil || evaluated {
+			t.Errorf("an attribute beside the JSON number %q: evaluated %t, %v", n, evaluated, err)
+		}
+	}
+	once, err := anypb.New(&structpb.Struct{Fields: map[string]*structpb.Value{
+		"role": structpb.NewStringValue("admin"), "Role": structpb.NewStringValue("user"),
+		"l": structpb.NewListValue(&structpb.ListValue{Values: []*structpb.Value{structpb.NewStructValue(&structpb.Struct{Fields: map[string]*structpb.Value{
+			"role": structpb.NewStringValue("admin"),
+		}})}}),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, c := range map[string]struct {
+		expr string
+		v    any
+	}{
+		"JSON text naming two in two cases":                      {`request.attributes.v.role == "admin" && request.attributes.v.Role == "user"`, json.RawMessage(`{"role": "admin", "Role": "user"}`)},
+		"JSON text naming one in two objects":                    {`request.attributes.v.a.r == 1 && request.attributes.v.b.r == 2`, json.RawMessage(`{"a": {"r": 1}, "b": {"r": 2}}`)},
+		"JSON text escaping a surrogate pair":                    {`request.attributes.v == ["\U0001F600", "\uFFFD", "\uFFFD"]`, json.RawMessage(`["\ud83d\ude00", "\ufffd", "�"]`)},
+		"a packed Struct":                                        {`request.attributes.v.role == "admin" && request.attributes.v.l[0].role == "admin"`, once},
+		"a packed Struct of a field unknown":                     {`request.attributes.v.role == "admin"`, packed("Struct", slices.Concat(unknown, entry("role", admin), unknown))},
+		"a packed Struct setting its field in another wire type": {`request.attributes.v.role == "admin"`, packed("Struct", slices.Concat(protowire.AppendVarint(protowire.AppendTag(nil, 1, protowire.VarintType), 1), entry("role", admin)))},
+		"JSON numbers":                                           {`request.attributes.v == [1, 0, 1500.0, 0.25, -0.01]`, []json.Number{"1", "-0", "1.5e3", "0.25", "-1E-2"}},
+	} {
+		if held, _, _, err := rbac.EvaluateCondition(t, c.expr, map[string]any{"v": c.v}); err != nil || !held {
+			t.Errorf("%s: held %t, %v", name, held, err)
+		}
+	}
+}
+
+// JSON text nested deeper than encoding/json parses, 10,000 deep, fails its kind's conditions, and is
+// parsed no deeper: built without jsonv2 (GOEXPERIMENT=nojsonv2), encoding/json's decoder counts no
+// depth of the brackets and braces it returns as tokens, so objects nested 79,000 deep were parsed
+// whole, allocating 48 MB, and lists 159,000 deep 20 MB, where json.Unmarshal refused either at
+// once. Text a little less deep is read.
+func TestJSONTextNestedPastWhatEncodingJSONParsesIsParsedNoDeeper(t *testing.T) {
+	nested := func(opening, inner, closing string, n int) json.RawMessage {
+		return json.RawMessage(strings.Repeat(opening, n) + inner + strings.Repeat(closing, n))
+	}
+	for name, text := range map[string]json.RawMessage{
+		"lists just past it": nested("[", "", "]", 10_001), "lists": nested("[", "", "]", 159_000),
+		"objects": nested(`{"a":`, "1", "}", 79_000),
+	} {
+		if _, evaluated, _, err := rbac.EvaluateCondition(t, `request.attributes.ok == true`, map[string]any{"ok": true, "j": text}); err != nil || evaluated {
+			t.Errorf("an attribute beside JSON text of %s nested deep: evaluated %t, %v", name, evaluated, err)
+		}
+		if allocated, _ := rbac.Converting(t, map[string]any{"j": text}); allocated > 12<<20 {
+			t.Errorf("converting JSON text of %s nested deep allocated %d MB", name, allocated>>20)
+		}
+	}
+	if held, _, _, err := rbac.EvaluateCondition(t, `size(request.attributes.j) == 1`, map[string]any{"j": nested("[", "", "]", 9_998)}); err != nil || !held {
+		t.Errorf("JSON text of lists nested 9,998 deep: held %t, %v", held, err)
+	}
+}
+
+// Attributes no condition reads are each one value, whichever kind's they are, so a condition
+// hashing them, as a map literal keyed by them or `in` a map, read the subject's and the request's
+// as one where both were, as every kind's are past what a check converts: there,
+// `request.attributes in {subject.attributes: true}` held, and a deny guarded by its negation lifted.
+// A comparison or `in` a list reading a list or map that holds them, a key, an index and a loop over
+// a map's keys fail too, as reading them by name does, wherever they are.
+func TestAttributesNoConditionReadsFailWhereverAConditionHashesOrComparesThem(t *testing.T) {
+	readable := map[string]map[string]any{"subject": {"x": 1}, "request": {"risk": 9}}
+	for kinds, unreadable := range map[string]map[string]map[string]any{
+		"each holding a struct":        {"subject": {"x": struct{}{}}, "request": {"risk": 9, "x": struct{}{}}},
+		"past what a check converts":   {"subject": {"x": 1}, "request": {"risk": 9, "l": make([]int, rbac.MaxConverted)}},
+		"the request's holding struct": {"subject": {"x": 1}, "request": {"risk": 9, "x": struct{}{}}},
+	} {
+		for _, c := range []struct {
+			expr      string
+			evaluated bool
+		}{
+			{`!(request.attributes in {subject.attributes: true}) && request.attributes.risk > 5`, true},
+			{`request.attributes in {subject.attributes: true}`, true},
+			{`size({request.attributes: 1, subject.attributes: 2}) == 1`, true},
+			{`{request.attributes: 1}.all(k, true)`, true},
+			{`[subject.attributes].exists(m, request.attributes in {m: 1})`, true},
+			{`{true ? request.attributes : 1: 1}.size() == 1`, true},
+			{`request.attributes in {"risk": 1}`, true},
+			{`[request.attributes] in {[subject.attributes]: true}`, true},
+			{`{[request.attributes]: 1} == {[subject.attributes]: 1}`, true},
+			{`[request.attributes, 1] == [subject.attributes, 2]`, true},
+			{`{"a": request.attributes, "b": 1} != {"a": subject.attributes, "b": 2}`, true},
+			{`1 in [request.attributes, 1]`, true},
+			{`{dyn([request.attributes]): 1}.exists(k, k[0] in {"risk": 1})`, true},
+			{`size({dyn(request.attributes): 1, dyn(subject.attributes): 2}) == 1`, true},
+			{`size({"n": {request.attributes: 1, subject.attributes: 2}}["n"]) == 1`, true},
+			{`(true ? request.attributes : {}) in {(true ? subject.attributes : {}): 1}`, true},
+			{`[request.attributes, subject.attributes].map(x, {x: 1}).exists(m, subject.attributes in m)`, true},
+			{`[request.attributes, subject.attributes].exists_one(x, x in {subject.attributes: 1})`, true},
+			{`request.attributes in [subject.attributes] || {} in [request.attributes]`, true},
+			{`{"risk": 1}[request.attributes] == 1`, false},
+			{`dyn({"risk": 1})[dyn(request.attributes)] == 1`, false},
+		} {
+			if _, evaluated := rbac.EvaluateConditionOf(t, c.expr, readable["subject"], nil, readable["request"]); evaluated != c.evaluated {
+				t.Errorf("%s of attributes a condition reads: evaluated %t", c.expr, evaluated)
+			}
+			if _, evaluated := rbac.EvaluateConditionOf(t, c.expr, unreadable["subject"], nil, unreadable["request"]); evaluated {
+				t.Errorf("%s of attributes %s: evaluated", c.expr, kinds)
+			}
+		}
+	}
+}
+
 // A value reached twice is converted once: a list holding one map a thousand times, which no
 // check could convert a thousand times within what it may, is read.
 func TestAValueReachedTwiceIsConvertedOnce(t *testing.T) {
@@ -1605,11 +1764,11 @@ func TestWhetherAttributesFitTurnsOnNoOrder(t *testing.T) {
 // a value by where one the call converted before was, so none made where a dropped one was is
 // read as converted from it.
 func TestAChecksAttributesAreAsConvertedAloneWhateverItsCallConvertedBefore(t *testing.T) {
-	seed := uint64(time.Now().UnixNano())
-	t.Logf("seed %d", seed)
-	rng := rand.New(rand.NewPCG(seed, 37))
 	for trial := range 10 {
-		shared := drawnShared(rng, true)
+		// Drawn from the trial's own seed, so a failing trial draws alike when run again.
+		rng := rand.New(rand.NewPCG(uint64(trial), 37))
+		sharedSeed := rng.Uint64()
+		shared := drawnShared(rand.New(rand.NewPCG(sharedSeed, 0)), true)
 		// Shared by the kinds that hold it, about what a check converts, so a check counting it
 		// otherwise, or not counting what was converted before it, reads what converting them doesn't.
 		big := make([]int, []int{rbac.MaxConverted / 3, rbac.MaxConverted/2 + 1000, rbac.MaxConverted - 1000}[rng.IntN(3)])
@@ -1643,8 +1802,9 @@ func TestAChecksAttributesAreAsConvertedAloneWhateverItsCallConvertedBefore(t *t
 				runtime.GC()
 			}
 		}
-		// The resource of each check, made as it is asked for, after what a hook dropped before it.
-		resource := func(i int) map[string]any {
+		// The resource of each check, of shared and big, made as it is asked for, after what a hook
+		// dropped before it.
+		resourceOf := func(i int, shared []any, big []int) map[string]any {
 			rng := rand.New(rand.NewPCG(resourceSeed, uint64(i)))
 			if rng.IntN(5) == 0 {
 				return nil
@@ -1660,6 +1820,7 @@ func TestAChecksAttributesAreAsConvertedAloneWhateverItsCallConvertedBefore(t *t
 			attributes["many"] = many
 			return attributes
 		}
+		resource := func(i int) map[string]any { return resourceOf(i, shared, big) }
 		subject, drop := passed()
 		together, alone := rbac.AttributesRead(t, 4, func(i int) (context.Context, map[string]any, map[string]any) {
 			return ctx, subject, resource(i)
@@ -1675,10 +1836,13 @@ func TestAChecksAttributesAreAsConvertedAloneWhateverItsCallConvertedBefore(t *t
 					t.Fatalf("trial %d, check %d: the %s's attributes read\n%s\nwhere alone\n%s", trial, i, kind, got, want)
 				}
 			}
-			// The kinds converted at once, in the order a check converts them, the resource's a copy
-			// sharing none of the others' values, as a check converts its resource's apart.
+			// The kinds converted at once, in the order a check converts them, the resource's made again
+			// of values of its own, sharing none of the others', as a check converts its resource's
+			// apart. A copy of it (DeepCopy) is nil where it is past what a check converts, where the
+			// check, converting it whole, is past it too.
 			passing, _ := passed()
-			read, over := rbac.ConvertedInOrder(t, request, passing, rbac.DeepCopy(resource(i)))
+			apart := resourceOf(i, drawnShared(rand.New(rand.NewPCG(sharedSeed, 0)), true), make([]int, len(big)))
+			read, over := rbac.ConvertedInOrder(t, request, passing, apart)
 			for k, j := range []int{2, 0, 1} {
 				if unread := alone[i][j] == rbac.Unreadable; unread != (over || !read[k]) {
 					t.Fatalf("trial %d, check %d: the %s's attributes unreadable %t, where converted at once %t, past what a check converts %t",
@@ -3161,10 +3325,11 @@ func TestATimeInAZoneLongerThanAnyFailsBeforeLoadingIt(t *testing.T) {
 // of 54 conditions, each reading the hour 85 times, took 23 ms in America/New_York, and 254 ms in
 // tzdata.zi, a file kept beside the zones that isn't one, which each load read whole, failed to
 // parse and then searched the other places for, each charged as reading a time. The process loads
-// each zone once, and finds a name names none once, whether a literal or the request names it.
+// each zone once, and finds a name names none once, whether a literal or the request names it, the
+// request's charged as loading it at each read (TestLoadingAZoneTheRequestNamesCostsWhatItTakes).
 func TestATimeInAZoneLoadsTheZoneOnceForTheProcess(t *testing.T) {
 	loads := rbac.CountZoneLoads(t)
-	ones := "[" + strings.TrimSuffix(strings.Repeat("1, ", 50), ", ") + "]"
+	ones := "[" + strings.TrimSuffix(strings.Repeat("1, ", 15), ", ") + "]"
 	for zone, evaluated := range map[string]bool{"Pacific/Chatham": true, "Etc/GMT+5": true, "Zz/Nowhere": false} {
 		for _, expr := range []string{
 			ones + `.all(i, request.time.getHours(request.attributes.zone) >= 0)`,
@@ -3186,7 +3351,9 @@ func TestATimeInAZoneLoadsTheZoneOnceForTheProcess(t *testing.T) {
 // A name holding a byte no zone's name does, as tzdata.zi's dot, fails before anything is loaded, so
 // no file kept beside the zones is read as one; and so do Local, the zone the process runs in, by
 // which a condition would decide by where each replica runs, and localtime, which some platforms
-// keep beside the zones as a link to it. A fixed offset loads nothing.
+// keep beside the zones as a link to it, as any part of a name, in any case: platforms keeping
+// posix as a link to the zones' own directory loaded the process's zone as posix/localtime, and a
+// file system ignoring case would as LocalTime. A fixed offset loads nothing.
 func TestATimeInANameOfNoZoneFailsBeforeLoadingAnything(t *testing.T) {
 	// zone is as a CEL string literal spells it.
 	evaluate := func(zone string, evaluated bool) {
@@ -3205,7 +3372,10 @@ func TestATimeInANameOfNoZoneFailsBeforeLoadingAnything(t *testing.T) {
 		evaluate(zone, true)
 	}
 	loads := rbac.CountZoneLoads(t)
-	for _, zone := range []string{"tzdata.zi", "zone.tab", "../UTC", "America/New York", "Local", "localtime", `UTC\u0000`, "+05:30"} {
+	for _, zone := range []string{
+		"tzdata.zi", "zone.tab", "../UTC", "America/New York", "Local", "localtime", `UTC\u0000`, "+05:30", "posix/localtime",
+		"posix/posix/localtime", "right/localtime", "LocalTime", "LOCALTIME", "posix/Local", "localtime/", "local",
+	} {
 		evaluate(zone, zone == "+05:30")
 	}
 	if *loads != 0 {
@@ -3215,8 +3385,10 @@ func TestATimeInANameOfNoZoneFailsBeforeLoadingAnything(t *testing.T) {
 
 // A zone the request names can be a new one each time, which loading costs: a loop reading a time in
 // each of a list of new names stops at its condition's limit having loaded no more than that pays
-// for, where charged as reading a time in a zone loaded, it loaded a hundred. Once loaded, a zone
-// costs only reading the time in it.
+// for, where charged as reading a time in a zone loaded, it loaded a hundred. A zone the process has
+// loaded costs as much again: charged only where it hadn't, the same condition on the same request
+// cost 500 more the first time, so a check of conditions reading many was refused the first time and
+// allowed after, and decided by which zones each replica had loaded.
 func TestLoadingAZoneTheRequestNamesCostsWhatItTakes(t *testing.T) {
 	loads := rbac.CountZoneLoads(t)
 	run := rand.Uint64()
@@ -3234,8 +3406,51 @@ func TestLoadingAZoneTheRequestNamesCostsWhatItTakes(t *testing.T) {
 	expr, zone := `request.time.getHours(request.attributes.zone) >= 0`, map[string]any{"zone": fmt.Sprintf("Zz/Load%d/once", run)}
 	limit, loading := rbac.ConditionCost(t, expr, zone)
 	_, loaded := rbac.ConditionCost(t, expr, zone)
-	if loading > limit || loading != loaded+rbac.ZoneLoad {
+	if loading > limit || loaded != loading || loading < rbac.ZoneLoad {
 		t.Errorf("reading a time in a new zone cost %d, and in one loaded %d, bounded at %d", loading, loaded, limit)
+	}
+}
+
+// A check decides alike whatever zones the process loaded before it: conditions reading the hour in
+// each of eighteen zones the request names, charged for loading only those the process hadn't,
+// cost past what a condition may the first time and not after, so Authorize refused where Explain
+// right after allowed, and a deny applied and then lifted, on the same request.
+func TestTheSameCheckDecidesAlikeWhateverZonesTheProcessLoaded(t *testing.T) {
+	var zones []any
+	var names []string
+	for i := 1; i <= 18; i++ {
+		name := fmt.Sprintf("Etc/GMT+%d", i%12+1)
+		if i > 12 {
+			name = fmt.Sprintf("Etc/GMT-%d", i-12)
+		}
+		zones, names = append(zones, name), append(names, name)
+	}
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole)
+	})
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	g.Condition = rbac.Condition{Expression: `request.attributes.zones.all(z, request.time.getHours(z) >= 0)`}
+	h.seed(t, g, grant(cluster.Scope(), "cluster.login", rbac.User, "v"), grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+	u, v := h.as(t, "u"), h.as(t, "v")
+	if err := h.authz.SetDeny(t.Context(), h.as(t, "guardian"), cluster, rbac.Deny{
+		ID: "zones", Principals: []rbac.Principal{v.Principal}, Permissions: []rbac.Permission{login},
+		Condition: rbac.Condition{Expression: `request.attributes.zones.exists(z, request.time.getHours(z) == 99)`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := rbac.WithRequest(t.Context(), map[string]any{"zones": zones})
+	rbac.ForgetZones(names...)
+	first := h.authz.Authorize(ctx, u, login, cluster)
+	explained, err := h.authz.Explain(ctx, u, login, cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again := h.authz.Authorize(ctx, u, login, cluster); first == nil || explained.Allowed || again == nil {
+		t.Errorf("a grant reading eighteen zones: Authorize %v, then Explain allowed %t, then Authorize %v", first, explained.Allowed, again)
+	}
+	rbac.ForgetZones(names...)
+	if first, again := h.authz.Authorize(ctx, v, login, cluster), h.authz.Authorize(ctx, v, login, cluster); first == nil || again == nil {
+		t.Errorf("a deny reading eighteen zones: Authorize %v, then %v", first, again)
 	}
 }
 
@@ -3488,6 +3703,11 @@ func TestStoredConditionsKeepTheirBounds(t *testing.T) {
 		{`request.attributes.ip == "10.0.0.1" || request.attributes.ip == "10.0.0.2"`, 17},
 		{`resource.attributes.env != "prod" && subject.id in ["a", "b", "c"]`, 31},
 		{`request.time < timestamp("2027-01-01T00:00:00Z") && request.time.getHours("America/New_York") >= 9`, 117},
+		// The request's time is the timestamp a check passes, which adding to or converting was bounded
+		// at 10,000 as anything a map may hold, but where a loop's variable is named request.
+		{`request.time + duration("1h") > timestamp("2027-01-01T00:00:00Z")`, 15},
+		{`int(request.time) > 1700000000 && string(request.time).startsWith("2026")`, 16},
+		{`[request.attributes].exists(request, request.time + "" == "")`, 10000},
 		{`request.attributes.ip.startsWith("10.") && "abcdefghijk".contains("bc")`, 10},
 		{`request.attributes.ip.endsWith("") || "10.0.0.0/8".startsWith(request.attributes.ip)`, 16},
 		{`"abc".matches("^a(b|c){2}$")`, 11},
