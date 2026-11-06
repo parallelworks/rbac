@@ -153,8 +153,10 @@ func (ww *waitWatch) lose(err error) {
 	}
 }
 
-// read marks w as having read its time, from when its waits count. The watch outlives the change
-// that starts it, so it keeps none of its context's cancellation.
+// read marks w as having read its time, from when its waits count, once the watch is connected to
+// see them: a change that reads its time while the watch connects, as after its connection failed,
+// waits for it, as a wait on a row meanwhile would go unseen, and fails where it doesn't connect. The
+// watch outlives the change that starts it, so it keeps none of its context's cancellation.
 func (ww *waitWatch) read(ctx context.Context, w *clockWatched) {
 	if w.pid == 0 {
 		return
@@ -162,9 +164,6 @@ func (ww *waitWatch) read(ctx context.Context, w *clockWatched) {
 	ww.mu.Lock()
 	was := w.read
 	w.read = true
-	if ww.gone != nil && w.lost == nil {
-		w.lost = ww.gone
-	}
 	ww.mu.Unlock()
 	if was {
 		return
@@ -174,13 +173,22 @@ func (ww *waitWatch) read(ctx context.Context, w *clockWatched) {
 	case ww.woken <- struct{}{}:
 	default:
 	}
+	// Past every wait the watch's own bounds allow it, to close a failed connection and open another.
+	connecting, cancel := context.WithTimeout(ctx, 3*rowWaitsTimeout)
+	defer cancel()
+	// Where the change's own context ends first, it sends nothing more that could wait.
+	if _, err := ww.connected(connecting); err != nil && ctx.Err() == nil {
+		ww.mu.Lock()
+		if w.lost == nil {
+			w.lost = err
+		}
+		ww.mu.Unlock()
+	}
 }
 
 func (ww *waitWatch) watch(ctx context.Context, database string) {
 	for {
-		connecting, cancel := context.WithTimeout(ctx, rowWaitsTimeout)
-		conn, err := pgx.Connect(connecting, database)
-		cancel()
+		conn, err := connectWatch(ctx, database)
 		if err != nil {
 			gone := fmt.Errorf("connecting: %w", err)
 			ww.mu.Lock()
@@ -197,6 +205,24 @@ func (ww *waitWatch) watch(ctx context.Context, database string) {
 		closing, cancel := context.WithTimeout(ctx, rowWaitsTimeout)
 		_ = conn.Close(closing)
 		cancel()
+	}
+}
+
+// connectWatch connects to database, trying again until rowWaitsTimeout passes: a server refusing a
+// connection for a moment, as one at max_connections does, would otherwise end the watch for good.
+func connectWatch(ctx context.Context, database string) (*pgx.Conn, error) {
+	ctx, cancel := context.WithTimeout(ctx, rowWaitsTimeout)
+	defer cancel()
+	for {
+		conn, err := pgx.Connect(ctx, database)
+		if err == nil {
+			return conn, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, err
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 }
 
@@ -253,11 +279,14 @@ func (ww *waitWatch) waiting(ctx context.Context, conn *pgx.Conn, pids []int32) 
 
 // RowWaitWatch returns the session the tests watch changes' row waits on, once the watch, which the
 // first change to read its time starts, has connected.
-func RowWaitWatch(ctx context.Context) (uint32, error) {
+func RowWaitWatch(ctx context.Context) (uint32, error) { return rowWaits.connected(ctx) }
+
+// connected waits until the watch is connected, and returns its session, or why it stopped for good.
+func (ww *waitWatch) connected(ctx context.Context) (uint32, error) {
 	for {
-		rowWaits.mu.Lock()
-		pid, gone := rowWaits.pid, rowWaits.gone
-		rowWaits.mu.Unlock()
+		ww.mu.Lock()
+		pid, gone := ww.pid, ww.gone
+		ww.mu.Unlock()
 		switch {
 		case gone != nil:
 			return 0, gone
@@ -269,6 +298,46 @@ func RowWaitWatch(ctx context.Context) (uint32, error) {
 			return 0, ctx.Err()
 		case <-time.After(time.Millisecond):
 		}
+	}
+}
+
+// A change that reads its time while the watch connects, as after its connection failed, goes on
+// once the watch is connected, and not before, as a wait on a row meanwhile would go unseen; and
+// where the watch can't connect, it fails as it ends.
+func TestTheWatchHoldsAChangeThatReadsItsTimeUntilItIsConnected(t *testing.T) {
+	for _, connects := range []bool{true, false} {
+		t.Run(fmt.Sprintf("connects=%t", connects), func(t *testing.T) {
+			// Started, as watch is, but not yet connected.
+			ww := &waitWatch{by: map[uint32][]*clockWatched{}, woken: make(chan struct{}, 1)}
+			ww.once.Do(func() {})
+			w := &clockWatched{pid: 1}
+			ww.push(w)
+			read := make(chan struct{})
+			go func() {
+				defer close(read)
+				ww.read(t.Context(), w)
+			}()
+			select {
+			case <-read:
+				t.Fatal("the change went on while the watch connected")
+			case <-time.After(50 * time.Millisecond):
+			}
+			ww.mu.Lock()
+			if connects {
+				ww.pid = 2
+			} else {
+				ww.gone = fmt.Errorf("connecting: refused")
+			}
+			ww.mu.Unlock()
+			select {
+			case <-read:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the change never went on")
+			}
+			if _, lost := ww.pop(w); (lost == nil) != connects {
+				t.Errorf("the change, as the watch connected (%t), was lost: %v", connects, lost)
+			}
+		})
 	}
 }
 
