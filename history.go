@@ -377,15 +377,20 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 			return 0, nil, err
 		}
 	}
+	settled, err := settledBy(ctx, tx, schema, before)
+	if err != nil {
+		return 0, nil, err
+	}
 	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', 'on', true)`); err != nil {
 		return 0, nil, err
 	}
+	b := byTime{history: history, at: "$1", settled: "$7::pg_catalog.xid8"}
 	// Whether h ends its row, and no version before it stays.
 	ended := `h.op IN ('delete', 'expire') AND NOT EXISTS (
 		SELECT FROM ` + history + ` s
 		WHERE s.tenant = h.tenant AND s.entity = h.entity AND s.key = h.key AND s.id < h.id
-		  AND (s.id <= $5 OR NOT (` + counts(history, "s", "$1") + `) OR (s.txid, s.id) >= ($2::pg_catalog.xid8, $3)))`
-	// Of each row's versions counted by the time, as AsOf counts them (counts), the last, by when it
+		  AND (s.id <= $5 OR NOT (` + b.counts("s") + `) OR (s.txid, s.id) >= ($2::pg_catalog.xid8, $3)))`
+	// Of each row's versions counted by the time, as AsOf counts them (byTime), the last, by when it
 	// was written, as AsOf orders them, stays unless it ended the row. An end goes only with every
 	// version before it: one that stays, as one the export hasn't read or one counted later but
 	// written first, as history written before its versions were dated in order can hold, would
@@ -423,8 +428,8 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 		  WHERE h.id > $5 AND h.id <= (SELECT last FROM win) AND (h.txid, h.id) < ($2::pg_catalog.xid8, $3)
 		    AND h.entity NOT IN ('history', 'commit') AND h.effective_at <= $1
 		    AND h.txid IS DISTINCT FROM pg_catalog.pg_current_xact_id_if_assigned()
-		    AND CASE WHEN `+later(history, "h", "h.entity", "$1")+` IS NOT NULL THEN `+committedBy(history, "h", "$1")+`
-		      ELSE `+byCommit(history, "h", writtenLater(history, "h", "h.entity", "$1")+" OR "+ended, ended+" AND c.at <= $1")+` END
+		    AND CASE WHEN `+b.later("h", "h.entity")+` IS NOT NULL THEN `+b.committedBy("h")+`
+		      ELSE `+b.byCommit("h", b.writtenLater("h", "h.entity")+" OR "+ended, ended+" AND c.at <= $1")+` END
 		), commits AS (
 		  SELECT c.id FROM `+history+` c
 		  WHERE c.id > $5 AND c.id <= (SELECT last FROM win) AND (c.txid, c.id) < ($2::pg_catalog.xid8, $3) AND c.entity = 'commit'
@@ -451,7 +456,7 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 		  FROM latest l
 		)
 		SELECT (SELECT count(*) FROM pruned), (SELECT id FROM reach)`,
-		pgx.QueryExecModeCacheDescribe, before, through.TxID, through.ID, most, from, maxPrune).Scan(&n, &next); err != nil {
+		pgx.QueryExecModeCacheDescribe, before, through.TxID, through.ID, most, from, maxPrune, settled).Scan(&n, &next); err != nil {
 		return 0, nil, err
 	}
 	// Under a host's transaction, which goes on past the prune.

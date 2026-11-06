@@ -157,6 +157,10 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	if err := unpruned(ctx, tx, schema, at); err != nil {
 		return err
 	}
+	settled, err := settledBy(ctx, tx, schema, at)
+	if err != nil {
+		return err
+	}
 	// Each statement is planned for its arguments until AsOf rolls back. A connection prepares a
 	// statement once, as of a time and now alike, and from its sixth run can plan it generically,
 	// costing history's indexes by an average tenant's few rows: a check would then read every
@@ -175,8 +179,9 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	// its time compiling.
 	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.as_of_tenant', $1, true),
 		set_config('rbac.as_of', pg_catalog.to_char($2::pg_catalog.timestamptz `+inUTC+`, '`+asOfTime+`'), true),
+		set_config('rbac.as_of_settled', $3, true),
 		set_config('plan_cache_mode', 'force_custom_plan', true), set_config('jit', 'off', true)`,
-		tenant, at); err != nil {
+		tenant, at, settled); err != nil {
 		return err
 	}
 	// Each table as the last version of each of its rows counted by the time left it: none where
@@ -235,13 +240,13 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 				selected[i] = `CASE r.expires_at WHEN 'infinity' THEN NULL WHEN '-infinity' THEN pg_catalog.timestamptz 'epoch' ELSE r.expires_at END AS expires_at`
 			}
 		}
-		history := "%[1]s.rbac_history"
+		b := byTime{history: "%[1]s.rbac_history", at: "%[5]s", settled: `current_setting('rbac.as_of_settled')::pg_catalog.xid8`}
 		view := `SELECT %[4]s FROM %[1]s.rbac_history h, LATERAL pg_catalog.jsonb_populate_record(NULL::%[1]s.%[2]s, h.after) r
 			WHERE h.tenant = current_setting('rbac.as_of_tenant') AND h.entity = '%[3]s'
 			  AND h.op NOT IN ('delete', 'expire') AND h.effective_at <= %[5]s
 			  AND h.txid IS DISTINCT FROM pg_catalog.pg_current_xact_id_if_assigned()
-			  AND CASE WHEN ` + later(history, "h", "'%[3]s'", "%[5]s") + ` IS NOT NULL THEN false
-			    ELSE ` + byCommit(history, "h", "NOT "+writtenLater(history, "h", "'%[3]s'", "%[5]s"), "c.at <= %[5]s") + ` END`
+			  AND CASE WHEN ` + b.later("h", "'%[3]s'") + ` IS NOT NULL THEN false
+			    ELSE ` + b.byCommit("h", "NOT "+b.writtenLater("h", "'%[3]s'"), "c.at <= %[5]s") + ` END`
 		// Roles are read by their ids, the key, or all at once, as Grantable reads them: their view
 		// takes each one's newest version counted by then, which a condition on the key reaches
 		// into, so each version is read once, where the test for a later one, joined to every
@@ -249,7 +254,7 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 		// One on another column, as a grant's principal, wouldn't reach in.
 		if e.entity == "role" {
 			view = `SELECT %[4]s FROM (SELECT DISTINCT ON (h.key) h.* FROM %[1]s.rbac_history h
-			    WHERE h.tenant = current_setting('rbac.as_of_tenant') AND h.entity = '%[3]s' AND ` + counts("%[1]s.rbac_history", "h", "%[5]s") + `
+			    WHERE h.tenant = current_setting('rbac.as_of_tenant') AND h.entity = '%[3]s' AND ` + b.counts("h") + `
 			    ORDER BY h.key, h.id DESC) h, LATERAL pg_catalog.jsonb_populate_record(NULL::%[1]s.%[2]s, h.after) r
 			WHERE h.op NOT IN ('delete', 'expire')`
 		}
@@ -289,69 +294,97 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	return finish(ctx, func(c context.Context) error { return unpruned(c, tx, schema, at) })
 }
 
-// counts is SQL for whether v, the alias of a version in history, SQL for its table, counts by
-// at, SQL for a time: from its date, or where it is later, its transaction's commit (committedBy).
-func counts(history, v, at string) string {
-	return v + `.effective_at <= ` + at + ` AND ` + committedBy(history, v, at)
+// byTime is SQL for what a read as of a time tests history's versions by: history, its table; at,
+// the time; and settled, the oldest transaction running as the latest commit record dated by then
+// was written, before which every transaction had ended, its changes seen by others, by then.
+type byTime struct{ history, at, settled string }
+
+// counts is SQL for whether v, the alias of a version in history, counts by the time: from its
+// date, or where it is later, its transaction's commit (committedBy).
+func (b byTime) counts(v string) string {
+	return v + `.effective_at <= ` + b.at + ` AND ` + b.committedBy(v)
 }
 
 // committedBy is SQL for whether the transaction that wrote v, the alias of a version in history,
-// SQL for its table, had committed by at, SQL for a time, as its latest commit record says, which
-// it looks up by its transaction in history's index of them, a few pages: no other session sees a
-// change before its transaction commits. One that committed before history recorded commits counts
-// as committed, as its versions count from their dates; the transaction reading v hasn't committed.
-func committedBy(history, v, at string) string {
+// had committed by the time: no other session sees a change before its transaction commits. One
+// older than settled had; another as its latest commit record says, which it looks up by its
+// transaction in history's index of them, a few pages, so only a version of one still running as
+// the time's latest commit record was written, or near it, is looked up. One that committed before
+// history recorded commits counts as committed, as its versions count from their dates; the
+// transaction reading v hasn't committed.
+func (b byTime) committedBy(v string) string {
 	return v + `.txid IS DISTINCT FROM pg_catalog.pg_current_xact_id_if_assigned()
-		AND coalesce((SELECT max(c.effective_at) FROM ` + history + ` c WHERE c.entity = 'commit' AND c.txid = ` + v + `.txid),
-		  ` + v + `.effective_at) <= ` + at
+		AND (` + v + `.txid < ` + b.settled + `
+		  OR coalesce((SELECT max(c.effective_at) FROM ` + b.history + ` c WHERE c.entity = 'commit' AND c.txid = ` + v + `.txid),
+		    ` + v + `.effective_at) <= ` + b.at + `)`
 }
 
 // later is SQL selecting a version of h's row written after h, h the alias of a version in
-// history, SQL for its table, of entity, SQL for its entity, that counts by at, SQL for a time, or
-// that h's own transaction wrote dated by then: their commit is the same, so where it hasn't
-// counted, h hasn't either, and h isn't its row's last by then in either case. Since history
-// records commits, a row's versions are dated in the order they were written, as none is dated
-// before the one before it, so it reads the row's latest version dated by then that follows h in
-// history's index of an entity's versions, which orders those of one date by id, and selects it
-// where it counts. Only where it doesn't, as its transaction committed after then, does it read on
-// from h in that index until the first it selects: each version between two counted is read once,
-// whatever their dates. Read on from h alone, against the index's order, h its row's last read the
-// page before h's, of another row, wherever h was first on its page. Ordered by date alone, as that
-// index was, versions dated alike, as every write of a DO block is, read in the order of their
-// places, oldest first, so each read every one before it.
-func later(history, h, entity, at string) string {
-	return `(SELECT CASE WHEN l.id > ` + h + `.id AND (l.txid = ` + h + `.txid OR ` + committedBy(history, "l", at) + `) THEN l.id
-		  ELSE (SELECT n.id FROM ` + history + ` n WHERE ` + laterOf(history, h, entity, at) + `
+// history of entity, SQL for its entity, that counts by the time, or that h's own transaction
+// wrote dated by then: their commit is the same, so where it hasn't counted, h hasn't either, and
+// h isn't its row's last by then in either case. Since history records commits, a row's versions
+// are dated in the order they were written, as none is dated before the one before it, so it reads
+// the row's latest version dated by then that follows h in history's index of an entity's
+// versions, which orders those of one date by id, and selects it where it counts. Only where it
+// doesn't, as its transaction committed after then, does it read on from h in that index until the
+// first it selects: each version between two counted is read once, whatever their dates. Read on
+// from h alone, against the index's order, h its row's last read the page before h's, of another
+// row, wherever h was first on its page. Ordered by date alone, as that index was, versions dated
+// alike, as every write of a DO block is, read in the order of their places, oldest first, so each
+// read every one before it.
+func (b byTime) later(h, entity string) string {
+	return `(SELECT CASE WHEN l.id > ` + h + `.id AND (l.txid = ` + h + `.txid OR ` + b.committedBy("l") + `) THEN l.id
+		  ELSE (SELECT n.id FROM ` + b.history + ` n WHERE ` + b.laterOf(h, entity) + `
 		    AND (n.effective_at, n.id) > (` + h + `.effective_at, ` + h + `.id)
 		  ORDER BY n.effective_at, n.id LIMIT 1) END
-		FROM (SELECT n.id, n.txid, n.effective_at FROM ` + history + ` n
-		  WHERE n.tenant = ` + h + `.tenant AND n.entity = ` + entity + ` AND n.key = ` + h + `.key AND n.effective_at <= ` + at + `
+		FROM (SELECT n.id, n.txid, n.effective_at FROM ` + b.history + ` n
+		  WHERE n.tenant = ` + h + `.tenant AND n.entity = ` + entity + ` AND n.key = ` + h + `.key AND n.effective_at <= ` + b.at + `
 		    AND (n.effective_at, n.id) > (` + h + `.effective_at, ` + h + `.id)
 		  ORDER BY n.effective_at DESC, n.id DESC LIMIT 1) l)`
 }
 
-// writtenLater is SQL for whether a version of h's row written after h counts by at, or h's own
-// transaction wrote one dated by then, as later selects, for a version h of a transaction that
+// writtenLater is SQL for whether a version of h's row written after h counts by the time, or h's
+// own transaction wrote one dated by then, as later selects, for a version h of a transaction that
 // committed before history recorded commits: by a release before 0006, it can be dated before a
 // version written earlier, so it reads the row's versions dated by then from the latest, which
 // history's index of an entity's versions gives first, until one written after h.
-func writtenLater(history, h, entity, at string) string {
-	return `EXISTS (SELECT FROM ` + history + ` n WHERE ` + laterOf(history, h, entity, at) + `)`
+func (b byTime) writtenLater(h, entity string) string {
+	return `EXISTS (SELECT FROM ` + b.history + ` n WHERE ` + b.laterOf(h, entity) + `)`
 }
 
-// laterOf is SQL for whether n is a version of h's row written after h that counts by at or that
-// h's own transaction wrote dated by then, as later and writtenLater select.
-func laterOf(history, h, entity, at string) string {
+// laterOf is SQL for whether n is a version of h's row written after h that counts by the time or
+// that h's own transaction wrote dated by then, as later and writtenLater select.
+func (b byTime) laterOf(h, entity string) string {
 	return `n.tenant = ` + h + `.tenant AND n.entity = ` + entity + ` AND n.key = ` + h + `.key AND n.id > ` + h + `.id
-		  AND n.effective_at <= ` + at + ` AND (n.txid = ` + h + `.txid OR ` + committedBy(history, "n", at) + `)`
+		  AND n.effective_at <= ` + b.at + ` AND (n.txid = ` + h + `.txid OR ` + b.committedBy("n") + `)`
 }
 
 // byCommit is SQL for, as h's transaction's latest commit record is looked up once, in history,
-// SQL for its table, dated where it committed before history recorded commits, and committed,
-// SQL in which c.at is when it committed, where it records commits.
-func byCommit(history, h, dated, committed string) string {
+// dated where it committed before history recorded commits, and committed, SQL in which c.at is
+// when it committed, where it records commits.
+func (b byTime) byCommit(h, dated, committed string) string {
 	return `(SELECT CASE WHEN c.at IS NULL THEN ` + dated + ` ELSE ` + committed + ` END
-		FROM (SELECT max(c.effective_at) AS at FROM ` + history + ` c WHERE c.entity = 'commit' AND c.txid = ` + h + `.txid) c)`
+		FROM (SELECT max(c.effective_at) AS at FROM ` + b.history + ` c WHERE c.entity = 'commit' AND c.txid = ` + h + `.txid) c)`
+}
+
+// settledBy returns, as text, the oldest transaction running as history's latest commit record dated
+// by at was written, on tx, as that record holds it: every transaction older had ended by then,
+// and a change of one counts by at without its commit record. 0 where none is dated by then. With
+// sorting off, as history's index of an entity's versions alone gives that order, which where
+// history's statistics hold few commit records the planner would read them all by their index to
+// sort instead (unpruned).
+func settledBy(ctx context.Context, tx pgx.Tx, schema string, at time.Time) (string, error) {
+	restore, err := unsorted(ctx, tx)
+	if err != nil {
+		return "", err
+	}
+	var xmin string
+	if err := tx.QueryRow(ctx, `SELECT coalesce((SELECT h.after->>'xmin' FROM `+historyTable(schema)+` h
+		WHERE h.tenant = '' AND h.entity = 'commit' AND h.key = '' AND h.effective_at <= $1 AND h.effective_at > '-infinity'
+		ORDER BY h.effective_at DESC, h.id DESC LIMIT 1), '0')`, at).Scan(&xmin); err != nil {
+		return "", err
+	}
+	return xmin, restore()
 }
 
 // unpruned refuses at, on tx, once a prune has run past it: of each row a prune keeps only its

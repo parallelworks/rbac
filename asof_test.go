@@ -2164,6 +2164,94 @@ func TestAsOfCountsAChangeFromItsCommit(t *testing.T) {
 	}
 }
 
+// A read as of a time counts a change of a transaction older than every one running as the
+// latest commit record by then was written without looking its own up: a revoke still running as
+// later transactions commit, which their records hold back, counts from its own commit, before
+// which every check allowed what it revokes, and after which none did.
+func TestAsOfCountsAChangeRunningAsOthersCommitFromItsOwnCommit(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	u, v := h.as(t, "u"), h.as(t, "v")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx, `DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:u'`); err != nil {
+		t.Fatal(err)
+	}
+	// Others commit while it runs, each recording it as running: the latest dated by mid too.
+	for i := range 3 {
+		if _, err := h.pool.Exec(ctx, `UPDATE rbac_memberships SET note = $1 WHERE tenant = 't1' AND principal = 'user:v'`, fmt.Sprint(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mid := dbNow(t, h)
+	h.now = mid
+	if err := h.authz.Authorize(ctx, u, login, cluster); err != nil {
+		t.Fatalf("a check while the revoke runs: %v", err)
+	}
+	if _, err := h.pool.Exec(ctx, `UPDATE rbac_memberships SET note = 'after' WHERE tenant = 't1' AND principal = 'user:v'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// And others after it, whose records hold it as ended.
+	if _, err := h.pool.Exec(ctx, `UPDATE rbac_memberships SET note = 'later' WHERE tenant = 't1' AND principal = 'user:v'`); err != nil {
+		t.Fatal(err)
+	}
+	for at, held := range map[time.Time]bool{mid: true, dbNow(t, h): false} {
+		err := h.authz.AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error { return a.Authorize(ctx, u, login, cluster) })
+		if err != nil && !errors.Is(err, rbac.ErrDenied) {
+			t.Fatal(err)
+		}
+		if (err == nil) != held {
+			t.Errorf("as of %v, u's login: %v", at, err)
+		}
+	}
+	_ = v
+}
+
+// Under WithTx, a read as of a time counts none of the host transaction's own changes, which no
+// other session sees until it commits: a revoke and a grant it made read as not yet made, as every
+// check by another session then read them.
+func TestAsOfCountsNoneOfItsOwnTransactionsChanges(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	owner, u, v := h.as(t, "owner"), h.as(t, "u"), h.as(t, "v")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := h.authz.WithTx(tx).Apply(ctx, owner, cluster, rbac.Change{
+		Revoke: []rbac.Binding{{Role: "cluster.login", Principal: u.Principal}},
+		Grant:  []rbac.Binding{{Role: "cluster.login", Principal: v.Principal}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.WithTx(tx).AsOf(ctx, "t1", dbNow(t, h), func(a *rbac.Authorizer) error {
+		for _, c := range []struct {
+			s    rbac.Subject
+			held bool
+		}{{u, true}, {v, false}} {
+			err := a.Authorize(ctx, c.s, login, cluster)
+			if err != nil && !errors.Is(err, rbac.ErrDenied) {
+				return err
+			}
+			if (err == nil) != c.held {
+				t.Errorf("as of now, in the transaction that changed it, %s's login: %v", c.s.Principal.ID, err)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // The package's own transaction commits once Config.OnChange returns: a revoke whose hook takes a
 // while counts from after it, as checks meanwhile read the grant held.
 func TestAsOfCountsAChangeFromItsCommitAfterItsHook(t *testing.T) {

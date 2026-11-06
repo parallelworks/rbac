@@ -4,11 +4,17 @@
 -- still uncommitted read, as of a time while it was, as already in force, so once it committed, AsOf
 -- of that time denied what every check then allowed, and a grant so read allowed what each denied.
 -- Each transaction that changes the package's tables now records when it commits: a commit record,
--- of entity and op commit in no tenant, dated by the clock as it is written, which AsOf counts each
--- of the transaction's changes from and History returns with each of its records
--- (Record.CommittedAt). A record's own date is as it was, and those already written keep theirs: a
--- transaction that committed before this migration has no commit record, and its changes count from
--- their dates. One that only prunes writes none, as no read counts a prune from it.
+-- of entity and op commit in no tenant and keyed by nothing, dated by the clock as it is written,
+-- which AsOf counts each of the transaction's changes from and History returns with each of its
+-- records (Record.CommittedAt). A record's own date is as it was, and those already written keep
+-- theirs: a transaction that committed before this migration has no commit record, and its changes
+-- count from their dates. One that only prunes writes none, as no read counts a prune from it.
+-- Each holds the oldest transaction running as it was written (after.xmin): every one older had
+-- ended, and others saw what it committed, by its date. So a read as of a time counts a change of a
+-- transaction older than the one the latest commit record by then holds as committed, and looks up
+-- only the commit records of those that weren't, as a transaction running then, or one that began
+-- or wrote first after the oldest running then began, which a transaction left open anywhere in the
+-- cluster holds back: a check as of a time read a fifth fewer pages of history.
 --
 -- A constraint trigger deferred to the commit writes it, rbac_record, which history's role owns and
 -- writes history as, fired by each record the transaction writes, of which the last, by id, writes
@@ -129,7 +135,7 @@ BEGIN
             IF pg_catalog.pg_trigger_depth() > 1 THEN
                 EXECUTE pg_catalog.format('SET CONSTRAINTS %I.rbac_history_committed DEFERRED', TG_TABLE_SCHEMA);
                 INSERT INTO rbac_history (effective_at, tenant, entity, key, op, bytes)
-                VALUES ('-infinity', '', 'commit', pg_catalog.pg_current_xact_id()::text, 'commit', 0);
+                VALUES ('-infinity', '', 'commit', '', 'commit', 0);
             -- What commits after it waits for no lock for long: a lock another session takes on a
             -- temporary table the commit empties (ON COMMIT DELETE ROWS), or on its TOAST table,
             -- which any session can take by preparing a statement that names it, would hold the
@@ -161,9 +167,15 @@ BEGIN
             RAISE EXCEPTION 'a session with a deferrable trigger on a temporary table commits no change to the package''s tables: committing fires it after history dates the changes'
                 USING ERRCODE = 'feature_not_supported', HINT = 'Drop or disable the trigger, or make it NOT DEFERRABLE.';
         END IF;
+        -- With the oldest transaction running as it is written, before its date: every one older had
+        -- ended, and others saw what it committed, by then. So a read as of a time counts a change
+        -- of a transaction older than that of the latest commit record by then as committed, without
+        -- looking its own up (AsOf). Keyed by nothing, so history's index of an entity's versions
+        -- orders them by date.
+        r := pg_catalog.jsonb_build_object('xmin', pg_catalog.pg_snapshot_xmin(pg_catalog.pg_current_snapshot())::text);
         at := pg_catalog.clock_timestamp();
-        INSERT INTO rbac_history (recorded_at, effective_at, tenant, entity, key, op, bytes)
-        VALUES (at, at, '', 'commit', pg_catalog.pg_current_xact_id()::text, 'commit', 0);
+        INSERT INTO rbac_history (recorded_at, effective_at, tenant, entity, key, op, after, bytes)
+        VALUES (at, at, '', 'commit', '', 'commit', r, 0);
         RETURN NULL;
     END IF;
     was := CASE WHEN TG_OP = 'INSERT' THEN NULL ELSE pg_catalog.to_jsonb(OLD) END;
