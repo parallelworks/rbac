@@ -386,15 +386,18 @@ scopes conditional ones reach, to check one by one.
   pair, or a `json.Number` JSON doesn't write, were read and now can't be, failing every condition
   reading their kind. Attributes holding maps, lists, pointers or messages are charged what building
   them costs, so ones a check converted before can be past what it converts now, as 80,000 empty
-  maps are, failing every condition reading an attribute; and a condition building a list or a map
-  holding attributes no condition can read, or reading the `subject`, the `resource` or the
-  `request` holding them whole, was decided without them and now fails. So does one building a list
-  or a map holding a double that isn't finite, as `has({"k": 0.0 / 0.0}.k)`, or a map naming a key
-  twice; and where no declarations cover a kind, so does every condition reading its attributes
-  where one holds such a double, however deep: it read the others, and that one too, as `has()` and
-  `size()` did. Going back to an
-  earlier release of this package does the same where that release bounds a shape more, so while
-  replicas of two releases run side by side, those
+  maps are, failing every condition reading an attribute, and past what a hook's copy holds, so a
+  call asking a constraint about them, or `ValidateGrant` about an actor holding them, is refused
+  whatever grants it; and a condition building a list or a map holding attributes no condition can
+  read, or reading the `subject`, the `resource` or the `request` holding them whole, as one
+  deciding a label value or a power to release reads the `resource`, was decided without them and
+  now fails. So does one building a list or a map holding a double that isn't finite, as
+  `has({"k": 0.0 / 0.0}.k)`, or a map naming a key twice, which keys a condition computes can do
+  only as it runs, as `{subject.id: 1, "admin": 2}` does for the subject `admin`; and where no
+  declarations cover a kind, so does every condition reading its attributes where one holds such a
+  double, however deep: it read the others, and that one too, as `has()` and `size()` did. Going
+  back to an earlier release of this package does the same where that release bounds a shape more,
+  so while replicas of two releases run side by side, those
   bounding a shape more may refuse changes adding a condition to a scope the others filled. To
   hand a permission on, the actor holds it unconditionally or under the same condition, one that
   doesn't read the subject: that one decides for each holder, so the actor's holding says nothing
