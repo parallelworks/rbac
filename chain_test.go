@@ -1,6 +1,7 @@
 package rbac_test
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -37,7 +38,7 @@ import (
 func exportAll(t *testing.T, h *harness, signer crypto.Signer) ([]rbac.Record, []rbac.Checkpoint) {
 	t.Helper()
 	var want int
-	if err := h.pool.QueryRow(t.Context(), `SELECT count(*) FROM rbac_history`).Scan(&want); err != nil {
+	if err := h.pool.QueryRow(t.Context(), `SELECT count(*) FROM rbac_history WHERE entity <> 'commit'`).Scan(&want); err != nil {
 		t.Fatal(err)
 	}
 	var records []rbac.Record
@@ -465,7 +466,7 @@ func full() rbac.Record {
 		ID: 1, TxID: 2, RecordedAt: at, EffectiveAt: at.Add(time.Second), Tenant: "t1", Entity: "grant", Key: "k", Op: "update",
 		Principal: ids, Role: "cluster.login", Scope: rbac.Scope{Type: "org", ID: "a:b"}, Group: "ops", ExpiresAt: at.Add(time.Hour),
 		Before: json.RawMessage(`{"a": 1}`), After: json.RawMessage(`{"a": 2}`), Actor: ids, OnBehalfOf: ids,
-		How: "Apply", Request: "r", Reason: "why" + string(utf8.RuneError), DBUser: "app",
+		How: "Apply", Request: "r", Reason: "why" + string(utf8.RuneError), DBUser: "app", CommittedAt: at.Add(2 * time.Second),
 	}
 }
 
@@ -532,11 +533,32 @@ func TestAChainedRecordIsEveryField(t *testing.T) {
 }
 
 // The chain's encoding is fixed, so a checkpoint made with one Go, and verified with another or
-// in another language, holds. A checkpoint without a Horizon is signed as before Cursor had one.
+// in another language, holds. A checkpoint without a Horizon is signed as before Cursor had one,
+// and a record without a CommittedAt or a Cluster, as one of a transaction that committed before
+// history recorded commits, chains as before Record had either. One with a Cluster but no
+// CommittedAt, as one a dump carried from a cluster whose commit records are gone, chains an empty
+// CommittedAt before it.
 func TestTheChainsEncodingIsFixed(t *testing.T) {
 	c := rbac.Genesis("g")
 	genesis := hex.EncodeToString(c.Hash[:])
-	c, err := c.Chain([]rbac.Record{full()})
+	committed, err := c.Chain([]rbac.Record{full()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamped := full()
+	stamped.Cluster = "7698052984130977836"
+	clustered, err := c.Chain([]rbac.Record{stamped})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamped.CommittedAt = time.Time{}
+	restored, err := c.Chain([]rbac.Record{stamped})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := full()
+	before.CommittedAt = time.Time{}
+	c, err = c.Chain([]rbac.Record{before})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -546,13 +568,17 @@ func TestTheChainsEncodingIsFixed(t *testing.T) {
 	horizon := c.Digest()
 	got := map[string]string{
 		"genesis": genesis, "link": hex.EncodeToString(c.Hash[:]), "digest": hex.EncodeToString(digest[:]),
-		"horizon": hex.EncodeToString(horizon[:]),
+		"horizon": hex.EncodeToString(horizon[:]), "committed": hex.EncodeToString(committed.Hash[:]),
+		"clustered": hex.EncodeToString(clustered.Hash[:]), "restored": hex.EncodeToString(restored.Hash[:]),
 	}
 	want := map[string]string{
-		"genesis": "928df9c16fcd6389159e046198b064eedcc7a780dfe164845c5fd47663f081ac",
-		"link":    "4079403bdbf717782762c3391d6a334dcc6f2fbda933e8ae01ffc57e7c16d31e",
-		"digest":  "7dab694ab96cc22d6be1a0dab37af4f06c9cb1931c533e0843ad365ff0a89b8b",
-		"horizon": "c4965b59b9651be1ddd59a15d7b4eb88949af51668d163ee1eeb6f6fc0cb2ce2",
+		"genesis":   "928df9c16fcd6389159e046198b064eedcc7a780dfe164845c5fd47663f081ac",
+		"link":      "4079403bdbf717782762c3391d6a334dcc6f2fbda933e8ae01ffc57e7c16d31e",
+		"digest":    "7dab694ab96cc22d6be1a0dab37af4f06c9cb1931c533e0843ad365ff0a89b8b",
+		"horizon":   "c4965b59b9651be1ddd59a15d7b4eb88949af51668d163ee1eeb6f6fc0cb2ce2",
+		"committed": "2ae926382b3b391249ac8a624910204494a632b3fb47eae0df99d3de9fdaf51f",
+		"clustered": "1ccba01a50885a14b9f451627456e2d8f362e44d4f2ebc10a70f81bc767b8958",
+		"restored":  "9b923726c183e672857445f1b8b654ef6c24e7927dba9a852ad061d32e844901",
 	}
 	if !maps.Equal(got, want) {
 		t.Errorf("%v, not %v", got, want)
@@ -595,7 +621,7 @@ func TestACheckpointVouchesForItsHorizon(t *testing.T) {
 	if behind.Cursor.Horizon == 0 {
 		t.Fatalf("an export from the start has no Horizon: %+v", behind.Cursor)
 	}
-	if n, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h), through); err != nil || n != 4 {
+	if n, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h), through); err != nil || n != 8 {
 		t.Fatalf("PruneHistory = %d, %v", n, err)
 	}
 	if _, _, err := h.authz.Export(ctx, behind, 10, key); !errors.Is(err, rbac.ErrInvalid) {
@@ -622,6 +648,76 @@ func TestACheckpointVouchesForItsHorizon(t *testing.T) {
 	}
 	if err := rbac.VerifyChain(behind, records, next, key.Public()); !errors.Is(err, rbac.ErrUnverified) {
 		t.Errorf("records exported past what a prune deleted, after a checkpoint of an export begun before it: %v", err)
+	}
+}
+
+// What AsOf answers turns on nothing an export leaves out, so history's owner can't change it
+// unseen: it dates each version by its own transaction's commit records within its cluster, as
+// History does for CommittedAt. A commit record no version names, holding as its bound on the
+// transactions then running one past them all, as an earlier build's commit records held one,
+// changes no answer, where counting every change of a transaction below that bound as committed had
+// a revoke held open read as in force with every record History returns as it was. And rewriting a
+// restored record's cluster, which History returns, no longer verifies against what an export kept.
+func TestAsOfAnswersByNothingAnExportLeavesOut(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	ours, theirs := otherCluster(t, h)
+	u := h.as(t, "u")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"), grant(cluster.Scope(), "cluster.login", rbac.User, "tmpl"))
+	restored := dbNow(t, h).UTC().Format("2006-01-02 15:04:05.999999+00")
+	restoreRows(t, h, fakeGrant(restored, theirs, "9"), fakeCommit(restored, theirs, "9"))
+	// A revoke of u's grant held open past mid.
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx, `DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:u'`); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	mid := dbNow(t, h)
+	time.Sleep(20 * time.Millisecond)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept, at := exportNext(t, h, rbac.Checkpoint{}, rbac.MaxHistory, key)
+	for _, c := range []struct {
+		name     string
+		rewrite  []string
+		verifies bool
+	}{
+		{"a commit record no version names, bounding every transaction", []string{
+			`ALTER TABLE rbac_history DISABLE TRIGGER rbac_history_committed`,
+			fmt.Sprintf(`INSERT INTO rbac_history (effective_at, txid, cluster, tenant, entity, key, op, after, bytes)
+				VALUES (timestamptz '%s', '7'::xid8, %s, '', 'commit', '', 'commit', '{"xmin": "18446744073709551000"}', 0)`, restored, ours),
+			`ALTER TABLE rbac_history ENABLE ALWAYS TRIGGER rbac_history_committed`,
+		}, true},
+		{"a restored record's cluster", []string{
+			`ALTER TABLE rbac_history DISABLE TRIGGER rbac_history_append_only`,
+			`UPDATE rbac_history SET cluster = ` + ours + ` WHERE txid = '9'`,
+			`ALTER TABLE rbac_history ENABLE ALWAYS TRIGGER rbac_history_append_only`,
+		}, false},
+	} {
+		for _, q := range c.rewrite {
+			if _, err := h.pool.Exec(ctx, q); err != nil {
+				t.Fatalf("%s: %v", q, err)
+			}
+		}
+		if err := h.authz.AsOf(ctx, "t1", mid, func(a *rbac.Authorizer) error { return a.Authorize(ctx, u, login, cluster) }); err != nil {
+			t.Errorf("with %s written, as of while the revoke was held open, u's login: %v", c.name, err)
+		}
+		again, _ := exportNext(t, h, rbac.Checkpoint{}, rbac.MaxHistory, key)
+		if len(again) < len(kept) {
+			t.Fatalf("with %s written, an export again read %d records, before %d", c.name, len(again), len(kept))
+		}
+		if err := rbac.VerifyChain(rbac.Genesis(at.Cursor.Generation), again[:len(kept)], at, key.Public()); (err == nil) != c.verifies {
+			t.Errorf("with %s written, history against the checkpoint kept before: %v", c.name, err)
+		}
 	}
 }
 

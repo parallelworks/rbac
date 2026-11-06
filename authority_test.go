@@ -4301,8 +4301,8 @@ func TestACrowdedCopyIsWhatWritingItAfreshMakes(t *testing.T) {
 		t.Fatal(err)
 	}
 	var id int64
-	if err := copied.pool.QueryRow(ctx, `SELECT id FROM rbac_history WHERE principal = 'user:next'`).Scan(&id); err != nil || id != 46002 {
-		t.Errorf("a grant written to a copy was recorded as %d, not after its 46001 records: %v", id, err)
+	if err := copied.pool.QueryRow(ctx, `SELECT id FROM rbac_history WHERE principal = 'user:next'`).Scan(&id); err != nil || id != 46009 {
+		t.Errorf("a grant written to a copy was recorded as %d, not after its 46001 records and its 7 transactions' commit records: %v", id, err)
 	}
 }
 

@@ -385,8 +385,14 @@ type readmeRoles struct {
 
 func newReadmeRoles(t *testing.T) *readmeRoles {
 	t.Helper()
+	return newReadmeRolesIn(t, pgtest.URL(t))
+}
+
+// newReadmeRolesIn is newReadmeRoles in the database base, a URL, names: a test's own database, as
+// one that changes a database-wide privilege needs.
+func newReadmeRolesIn(t *testing.T, base string) *readmeRoles {
+	t.Helper()
 	ctx := t.Context()
-	base := pgtest.URL(t)
 	suffix := strings.ToLower(rand.Text())
 	r := &readmeRoles{admin: "rbac_admin_" + suffix, history: "rbac_history_" + suffix, app: "rbac_app_" + suffix, schema: "rbac_" + suffix}
 	super, err := pgx.Connect(ctx, base)
@@ -580,8 +586,17 @@ func TestThePackageRunsAsTheReadmesDatabaseRoles(t *testing.T) {
 				}
 				return reads(a)
 			}))
+			// History's role records the commit again as it commits, deferring its trigger anew.
+			check("A write around the package with constraints set immediate", pgx.BeginFunc(ctx, r.appPool, func(tx pgx.Tx) error {
+				for _, q := range []string{`SET CONSTRAINTS ALL IMMEDIATE`, `UPDATE rbac_memberships SET note = 'immediate' WHERE tenant = 't1'`} {
+					if _, err := tx.Exec(ctx, q); err != nil {
+						return err
+					}
+				}
+				return nil
+			}))
 			var n int
-			if err := r.appPool.QueryRow(ctx, `SELECT count(*) FROM rbac_history`).Scan(&n); err != nil {
+			if err := r.appPool.QueryRow(ctx, `SELECT count(*) FROM rbac_history WHERE entity <> 'commit'`).Scan(&n); err != nil {
 				t.Fatal(err)
 			}
 			var cursor rbac.Cursor
@@ -597,6 +612,88 @@ func TestThePackageRunsAsTheReadmesDatabaseRoles(t *testing.T) {
 			}
 			check("DeleteTenant", authz.DeleteTenant(ctx, host, "t1"))
 		})
+	}
+}
+
+// The commit-record checks refuse a change committed with a session's own enabled deferrable trigger
+// on a temporary table, which only a session with the TEMPORARY privilege can make. The README's
+// application role is denied TEMPORARY (revoked from PUBLIC on the database, granted to no one), so
+// it can make no temporary object and can't plant such a trigger: every package call but AsOf runs
+// without one. AsOf alone makes temporary views, so it needs TEMPORARY; a deployment that runs AsOf
+// as the application role grants it back, and the commit-record checks are then a best-effort
+// defense against that role, as the README and 0027 say.
+func TestTheApplicationRoleNeedsTemporaryOnlyForAsOf(t *testing.T) {
+	ctx := t.Context()
+	name, base := pgtest.Database(t, "")
+	r := newReadmeRolesIn(t, base)
+	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	r.harden(t)
+	// No role has TEMPORARY on the database now, as a host that hardens it this way leaves it.
+	if _, err := r.super.Exec(ctx, `REVOKE TEMPORARY ON DATABASE `+name+` FROM PUBLIC`); err != nil {
+		t.Fatal(err)
+	}
+	cfg := rbac.Config{
+		Catalog: catalog, ContainerTypes: []string{"org", "workspace"},
+		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+	}
+	authz, err := rbac.New(r.appPool, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		creatorGrant,
+		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'owner'), ('t1', 'user', 'u')`,
+	} {
+		if _, err := r.appPool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	owner, u := rbac.Subject{Principal: identity("owner")}, rbac.Subject{Principal: identity("u")}
+	// The application's role can make no temporary object, so it can plant no deferrable trigger to
+	// run code at the commit after its change is dated.
+	if _, err := r.appPool.Exec(ctx, `CREATE TEMP TABLE held (a int)`); true {
+		if pg := (*pgconn.PgError)(nil); !errors.As(err, &pg) || pg.Code != "42501" {
+			t.Fatalf("the application's role makes a temporary table without TEMPORARY: %v", err)
+		}
+	}
+	// Every call but AsOf works without TEMPORARY.
+	check := func(what string, err error) {
+		t.Helper()
+		if err != nil {
+			t.Errorf("%s without TEMPORARY: %v", what, err)
+		}
+	}
+	check("Apply", authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: u.Principal}}}))
+	check("Authorize", authz.Authorize(ctx, owner, login, cluster))
+	var cursor rbac.Cursor
+	if _, cursor, err = authz.History(ctx, cursor, rbac.MaxHistory); err != nil {
+		t.Errorf("History without TEMPORARY: %v", err)
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := authz.Export(ctx, rbac.Checkpoint{}, rbac.MaxHistory, key); err != nil {
+		t.Errorf("Export without TEMPORARY: %v", err)
+	}
+	if _, err := rbac.PruneHistory(ctx, r.adminPool, time.Unix(0, 0), cursor); err != nil {
+		t.Errorf("PruneHistory without TEMPORARY: %v", err)
+	}
+	// AsOf makes temporary views, so it needs TEMPORARY: without it, it is refused.
+	asOf := func() error {
+		return authz.AsOf(ctx, "t1", time.Now(), func(a *rbac.Authorizer) error { return a.Authorize(ctx, owner, login, cluster) })
+	}
+	if pg := (*pgconn.PgError)(nil); !errors.As(asOf(), &pg) || pg.Code != "42501" {
+		t.Errorf("AsOf without TEMPORARY: %v", asOf())
+	}
+	// Granted TEMPORARY, as a deployment that runs AsOf as this role grants it, AsOf works.
+	if _, err := r.super.Exec(ctx, `GRANT TEMPORARY ON DATABASE `+name+` TO `+r.app); err != nil {
+		t.Fatal(err)
+	}
+	if err := asOf(); err != nil {
+		t.Errorf("AsOf once granted TEMPORARY: %v", err)
 	}
 }
 
@@ -731,7 +828,8 @@ func TestHistoryIsKeptWhateverItsSchemaIsNamed(t *testing.T) {
 	if err := admin.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := rbac.PruneHistory(ctx, admin, now, through); err != nil || n != 1 {
+	// A version and its transaction's commit record.
+	if n, err := rbac.PruneHistory(ctx, admin, now, through); err != nil || n != 2 {
 		t.Fatalf("PruneHistory after the rename deleted %d, %v", n, err)
 	}
 	if _, _, err := renamedAuthz.History(ctx, exported, 1); !errors.Is(err, rbac.ErrInvalid) {
@@ -946,8 +1044,9 @@ func TestHistoryReadsItselfWhateverTablesASessionMakes(t *testing.T) {
 			t.Errorf("History after its cursor, beside a session's own history = %+v, %v", more, err)
 		}
 	}
-	// The owner's grant's first version, which its second supersedes.
-	if n, err := rbac.PruneHistory(ctx, h.pool, before, through); err != nil || n != 1 {
+	// The owner's grant's first version, which its second supersedes, and its transaction's commit
+	// record.
+	if n, err := rbac.PruneHistory(ctx, h.pool, before, through); err != nil || n != 2 {
 		t.Errorf("PruneHistory beside a session's own history = %d, %v", n, err)
 	}
 	var pruned, prunes int
@@ -1037,7 +1136,7 @@ func TestHistoryWritesAsJSONInAnyTimeZone(t *testing.T) {
 	g.ExpiresAt = time.Date(9999, time.December, 30, 23, 59, 59, 999999000, time.UTC)
 	h.seed(t, g)
 	var n int
-	if err := h.pool.QueryRow(t.Context(), `SELECT count(*) FROM rbac_history`).Scan(&n); err != nil {
+	if err := h.pool.QueryRow(t.Context(), `SELECT count(*) FROM rbac_history WHERE entity <> 'commit'`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	var cursor rbac.Cursor
@@ -1818,7 +1917,7 @@ func TestMigratingRecordsARowWrittenBeforeHistory(t *testing.T) {
 		}
 	}
 	var n int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM rbac_history WHERE (txid, id) > ($1::xid8, $2)`, cursor.TxID, cursor.ID).Scan(&n); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM rbac_history WHERE (txid, id) > ($1::xid8, $2) AND entity <> 'commit'`, cursor.TxID, cursor.ID).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	next := map[[3]string]rbac.Record{}
@@ -2224,8 +2323,9 @@ func TestHistoryRefusesACursorAPruneWentPast(t *testing.T) {
 	behind := cursorAt(t, h, `SELECT txid, id, recorded_at FROM rbac_history WHERE entity = 'grant' AND principal = 'user:a'`)
 	exec(grantLogin, "e")
 	ahead := exported(t, h)
-	// Through the export ahead, a prune deletes x's first version alone, which both have read.
-	if n, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h), ahead); err != nil || n != 1 {
+	// Through the export ahead, a prune deletes x's first version alone, with its transaction's commit
+	// record, which both have read.
+	if n, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h), ahead); err != nil || n != 2 {
 		t.Fatalf("PruneHistory of what both exports read = %d, %v", n, err)
 	}
 	for _, c := range []rbac.Cursor{behind, ahead} {
@@ -2239,7 +2339,8 @@ func TestHistoryRefusesACursorAPruneWentPast(t *testing.T) {
 	exec(`DELETE FROM rbac_grants WHERE principal = 'user:d'`)
 	exec(grantLogin, "f")
 	further := exported(t, h)
-	if n, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h), further); err != nil || n != 2 {
+	// Both, and their transactions' commit records.
+	if n, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h), further); err != nil || n != 4 {
 		t.Fatalf("PruneHistory past both = %d, %v", n, err)
 	}
 	for _, c := range []rbac.Cursor{behind, ahead} {
@@ -2315,7 +2416,8 @@ func TestHistoryRefusesACursorAPruneWentPastWhileItReadsNothing(t *testing.T) {
 	}
 	// What follows d's revoke, and the prune, are of transactions after the older one.
 	exec(grantLogin, "f")
-	if n, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h), exported(t, h)); err != nil || n != 2 {
+	// d's grant and revoke, and their transactions' commit records.
+	if n, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h), exported(t, h)); err != nil || n != 4 {
 		t.Fatalf("PruneHistory = %d, %v", n, err)
 	}
 	if got, _, err := h.authz.History(ctx, behind, rbac.MaxHistory); !errors.Is(err, rbac.ErrInvalid) {
@@ -2570,7 +2672,8 @@ func TestHistoryRefusesACursorAPruneWentPastAsItRead(t *testing.T) {
 			return
 		}
 		pruned = true
-		if n, err := rbac.PruneHistory(ctx, h.pool, then, further); err != nil || n != 2 {
+		// d's grant and revoke, and their transactions' commit records.
+		if n, err := rbac.PruneHistory(ctx, h.pool, then, further); err != nil || n != 4 {
 			t.Errorf("PruneHistory = %d, %v", n, err)
 		}
 	})
@@ -2708,8 +2811,8 @@ func TestHistoryCountsAPruneWhateverItsRecordIsNumbered(t *testing.T) {
 }
 
 // interleaved writes the rows of k1, d, k2, e and k3, of which d's and e's are granted and revoked,
-// so a prune through the end deletes every version of them, between the rows it keeps, and returns
-// the cursor after them all.
+// so a prune through the end deletes every version of them, between the rows it keeps, and the
+// commit records of their four transactions, and returns the cursor after them all.
 func interleaved(t *testing.T, h *harness) rbac.Cursor {
 	t.Helper()
 	ctx := t.Context()
@@ -2743,7 +2846,7 @@ func TestExportingFromTheStartAfterAPrune(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
 	through := interleaved(t, h)
-	if n, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h), through); err != nil || n != 4 {
+	if n, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h), through); err != nil || n != 8 {
 		t.Fatalf("PruneHistory = %d, %v", n, err)
 	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -2785,7 +2888,7 @@ func TestExportingFromTheStartWaitsForATransactionOlderThanAPrune(t *testing.T) 
 	if _, err := older.Exec(ctx, `SELECT pg_current_xact_id()`); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h), through); err != nil || n != 4 {
+	if n, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h), through); err != nil || n != 8 {
 		t.Fatalf("PruneHistory = %d, %v", n, err)
 	}
 	got, cursor, err := h.authz.History(ctx, rbac.Cursor{}, 1)
@@ -2829,7 +2932,7 @@ func TestHistoryRefusesAnExportBegunAsAPrunesTransactionRan(t *testing.T) {
 	if cursor.Horizon == 0 || cursor.Horizon > txid {
 		t.Fatalf("an export begun as transaction %d ran has Horizon %d", txid, cursor.Horizon)
 	}
-	if n, err := rbac.PruneHistory(ctx, tx, dbNow(t, h), through); err != nil || n != 4 {
+	if n, err := rbac.PruneHistory(ctx, tx, dbNow(t, h), through); err != nil || n != 8 {
 		t.Fatalf("PruneHistory = %d, %v", n, err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -2895,10 +2998,11 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 	for _, id := range users {
 		h.as(t, id)
 	}
-	// heldOn is every record history holds, as q reads it, in History's order.
-	heldOn := func(q rbac.DB) []place {
+	// heldOn is every record history holds, as q reads it, in History's order; with records alone,
+	// those History reads, but for transactions' commit records, which it returns with each.
+	heldOn := func(q rbac.DB, records bool) []place {
 		t.Helper()
-		rows, err := q.Query(ctx, `SELECT txid, id FROM rbac_history ORDER BY txid, id`)
+		rows, err := q.Query(ctx, `SELECT txid, id FROM rbac_history WHERE NOT $1 OR entity <> 'commit' ORDER BY txid, id`, records)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2911,7 +3015,8 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 		}
 		return ps
 	}
-	held := func() []place { return heldOn(h.pool) }
+	held := func() []place { return heldOn(h.pool, false) }
+	readable := func() []place { return heldOn(h.pool, true) }
 	// begin begins a host's transaction, rolled back if the test stops before it ends, as the pool
 	// it holds a connection of closes only once that is back.
 	begin := func(level pgx.TxIsoLevel) pgx.Tx {
@@ -3099,7 +3204,7 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 				t.Fatalf("an export no prune harmed, from %+v: %v", e.cursor, err)
 			}
 			var want []place
-			for _, p := range held() {
+			for _, p := range readable() {
 				if p.compare(placeOf(e.cursor)) > 0 && (len(got) == 0 || p.compare(placeOf(next)) <= 0) {
 					want = append(want, p)
 				}
@@ -3220,7 +3325,7 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 					}
 				}
 				prune(tx, *c)
-				between := heldOn(tx)
+				between := heldOn(tx, false)
 				pruned(was, between, nil)
 				prune(tx, *through())
 				if err := tx.Commit(ctx); err != nil {
@@ -3285,7 +3390,7 @@ func randomExports(t *testing.T, seed uint64) (refusals int) {
 		}
 	}
 	// Each reads to the end of history, or is refused and then does.
-	all := held()
+	all := readable()
 	last := all[len(all)-1]
 	for i, e := range exports {
 		for deadline := time.Now().Add(10 * time.Second); e.harmed || e.unmet || !e.begun || placeOf(e.cursor).compare(last) < 0; {
@@ -3537,12 +3642,13 @@ func TestHistoryRecordsAReplicasWrites(t *testing.T) {
 // recorded is a change's context as history recorded it.
 type recorded struct{ actor, onBehalfOf, how, request, reason, op string }
 
-// recordedSince reads the records after *last directly, in id order, and moves *last past them:
+// recordedSince reads the records after *last directly, in id order, but for commit records, which
+// History returns with the others rather than as records, and moves *last past them:
 // each change has committed, and History would wait on transactions other sessions hold open.
 func recordedSince(t *testing.T, h *harness, last *int64) []recorded {
 	t.Helper()
 	rows, err := h.pool.Query(t.Context(), `SELECT id, actor, on_behalf_of, how, request, reason, op FROM rbac_history
-		WHERE id > $1 ORDER BY id`, *last)
+		WHERE id > $1 AND entity <> 'commit' ORDER BY id`, *last)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4400,8 +4506,9 @@ func TestPruningHistoryKeepsWhatAsOfReads(t *testing.T) {
 	if got, err := notesAt(t, h, start); err != nil || !maps.Equal(got, early) {
 		t.Errorf("as of before a prune that deleted nothing: %v, %v", got, err)
 	}
-	// u's first version, which its second superseded before then, and d, whose delete ended it.
-	if n, err := rbac.PruneHistory(ctx, h.pool, then, through); err != nil || n != 3 {
+	// u's first version, which its second superseded before then, and d, whose delete ended it, with
+	// the commit records of the three transactions that wrote them.
+	if n, err := rbac.PruneHistory(ctx, h.pool, then, through); err != nil || n != 6 {
 		t.Fatalf("PruneHistory = %d, %v", n, err)
 	}
 	if got := notes(then); !maps.Equal(got, before) || got["u"] != "second" || got["d"] != "" {
@@ -4417,7 +4524,7 @@ func TestPruningHistoryKeepsWhatAsOfReads(t *testing.T) {
 	// The export goes on from its cursor, and reads the prune that deleted, with what it deleted.
 	cursor := through
 	if r := drain(t, h, &cursor, 1)[0]; r.Entity != "history" || r.Op != "prune" || r.How != "PruneHistory" ||
-		!strings.Contains(string(r.After), `"deleted": 3`) || r.Key != then.UTC().Format("2006-01-02T15:04:05.000000Z") {
+		!strings.Contains(string(r.After), `"deleted": 6`) || r.Key != then.UTC().Format("2006-01-02T15:04:05.000000Z") {
 		t.Errorf("prune: %+v", r)
 	}
 	// A prune needs an export's cursor, of this generation, and a time that has passed: AsOf would
@@ -4556,7 +4663,7 @@ func TestPruningHistoryKeepsAnEndWhileAnUnreadOrLaterVersionStays(t *testing.T) 
 	}
 	// A grant dated after the time and its revoke before it, as history dated a revoke made in a
 	// transaction older than the grant before changes were dated by their statements, written here
-	// as history's owner.
+	// as history's owner, with no commit record, as before history recorded commits.
 	var row string
 	if err := h.pool.QueryRow(ctx, `SELECT to_jsonb(g) || jsonb_build_object('id', gen_random_uuid(), 'principal_id', 'dated', 'principal', 'user:dated')
 		FROM rbac_grants g WHERE principal = 'user:mark'`).Scan(&row); err != nil {
@@ -4566,10 +4673,19 @@ func TestPruningHistoryKeepsAnEndWhileAnUnreadOrLaterVersionStays(t *testing.T) 
 		at time.Time
 		op string
 	}{{then.Add(time.Millisecond), "create"}, {then.Add(-time.Second), "delete"}} {
-		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_history (effective_at, tenant, entity, key, op, principal, role, scope, before, after)
-			SELECT $1, 't1', 'grant', r->>'id', $2, r->>'principal', r->>'role', r->>'scope',
-			  CASE $2 WHEN 'delete' THEN r END, CASE $2 WHEN 'create' THEN r END
-			FROM (SELECT $3::jsonb r) x`, r.at, r.op, row); err != nil {
+		if err := pgx.BeginFunc(ctx, h.pool, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, `ALTER TABLE rbac_history DISABLE TRIGGER rbac_history_committed`); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO rbac_history (effective_at, tenant, entity, key, op, principal, role, scope, before, after)
+				SELECT $1, 't1', 'grant', r->>'id', $2, r->>'principal', r->>'role', r->>'scope',
+				  CASE $2 WHEN 'delete' THEN r END, CASE $2 WHEN 'create' THEN r END
+				FROM (SELECT $3::jsonb r) x`, r.at, r.op, row); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `ALTER TABLE rbac_history ENABLE ALWAYS TRIGGER rbac_history_committed`)
+			return err
+		}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -4603,7 +4719,8 @@ func TestPruningHistoryOnAHostsTransaction(t *testing.T) {
 	if _, err := tx.Exec(ctx, `SET CONSTRAINTS ALL IMMEDIATE; SET LOCAL jit = on; SET LOCAL enable_sort = on`); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := rbac.PruneHistory(ctx, tx, dbNow(t, h), through); err != nil || n != 1 {
+	// The membership's first version and its transaction's commit record.
+	if n, err := rbac.PruneHistory(ctx, tx, dbNow(t, h), through); err != nil || n != 2 {
 		t.Fatalf("PruneHistory = %d, %v", n, err)
 	}
 	var jit, sorting string
@@ -4629,7 +4746,8 @@ func TestReadingPrunesLeavesTheHostsSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	through := exported(t, h)
-	if n, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h), through); err != nil || n != 1 {
+	// The membership's first version and its transaction's commit record.
+	if n, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h), through); err != nil || n != 2 {
 		t.Fatalf("PruneHistory = %d, %v", n, err)
 	}
 	tx, err := h.pool.Begin(ctx)
@@ -4710,7 +4828,8 @@ func TestAPruneIsDatedWhenItsStatementBegan(t *testing.T) {
 		t.Fatal(err)
 	}
 	through, before := exported(t, h), dbNow(t, h)
-	if n, err := rbac.PruneHistory(ctx, tx, before, through); err != nil || n != 1 {
+	// With its transaction's commit record.
+	if n, err := rbac.PruneHistory(ctx, tx, before, through); err != nil || n != 2 {
 		t.Fatalf("PruneHistory = %d, %v", n, err)
 	}
 	var began, effective, recorded time.Time
@@ -4873,7 +4992,8 @@ func TestPruningHistoryInBatchesKeepsWhatAsOfReadsBetweenThem(t *testing.T) {
 		}
 		total += int(n)
 	}
-	if total != 3 {
+	// And the commit records of the three transactions that wrote them.
+	if total != 6 {
 		t.Fatalf("pruned %d", total)
 	}
 }
@@ -4975,8 +5095,9 @@ func TestAPruneOfAnotherTimeOrCursorStartsAgain(t *testing.T) {
 		// A change since, so the export's cursor is past every record the prunes may take.
 		exec(`UPDATE rbac_grants SET note = 'again' WHERE principal = 'user:b'`)
 		through := exported(t, h)
-		// As of first, b's first version alone, which comes after a's.
-		if n := prune(t, h, first, through); n != 1 {
+		// As of first, b's first version alone, which comes after a's, and its transaction's commit
+		// record.
+		if n := prune(t, h, first, through); n != 2 {
 			t.Fatalf("pruned %d as of first", n)
 		}
 		// a's grant, which was revoked, is gone.
@@ -5082,7 +5203,8 @@ func TestPruningGoesOnPastNoVersionAnOlderSnapshotKept(t *testing.T) {
 	if _, held := want["revoked"]; err != nil || held {
 		t.Fatalf("as of then: %v, %v", want, err)
 	}
-	if n, err := rbac.PruneHistory(ctx, host, then, through); err != nil || n != 1 {
+	// With its transaction's commit record.
+	if n, err := rbac.PruneHistory(ctx, host, then, through); err != nil || n != 2 {
 		t.Fatalf("PruneHistory on the older snapshot = %d, %v", n, err)
 	}
 	if err := host.Commit(ctx); err != nil {
@@ -5415,5 +5537,222 @@ func TestAsOfReadsOnlyTheLatestPrune(t *testing.T) {
 	}
 	if err := h.authz.AsOf(ctx, "t1", latest, func(*rbac.Authorizer) error { return nil }); err != nil {
 		t.Errorf("AsOf at the latest prune's time: %v", err)
+	}
+}
+
+// commitDates is the name of the migration from which history records when each transaction that
+// changes the package's tables commits.
+func commitDates(t *testing.T) string {
+	t.Helper()
+	for name, sql := range migrationSQL(t) {
+		if strings.Contains(sql, "CREATE CONSTRAINT TRIGGER rbac_history_committed") {
+			return name
+		}
+	}
+	t.Fatal("no migration records commits")
+	return ""
+}
+
+// History returns with each record when its transaction committed, as history records it as the
+// transaction commits, and returns no record of that itself: the same time for every record of a
+// transaction, no earlier than any of them took effect, and no earlier than the transaction's end
+// however long after its changes it ran.
+func TestHistoryReturnsWhenEachRecordsTransactionCommitted(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.as(t, "u")
+	var cursor rbac.Cursor
+	drain(t, h, &cursor, 2)
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, q := range []string{grantLogin, `UPDATE rbac_grants SET note = 'later' WHERE principal = 'user:u'`} {
+		args := []any{}
+		if q == grantLogin {
+			args = []any{"u"}
+		}
+		if _, err := tx.Exec(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	ran := dbNow(t, h)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := drain(t, h, &cursor, 2)
+	var cluster string
+	if err := h.pool.QueryRow(ctx, `SELECT system_identifier::text FROM pg_control_system()`).Scan(&cluster); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range got {
+		if r.Entity == "commit" || r.CommittedAt.IsZero() || !r.CommittedAt.Equal(got[0].CommittedAt) || r.CommittedAt.Before(ran) || r.CommittedAt.Before(r.EffectiveAt) {
+			t.Errorf("record %+v, of a transaction that ran to %v", r, ran)
+		}
+		if r.Cluster != cluster {
+			t.Errorf("record %+v, written in cluster %s", r, cluster)
+		}
+	}
+}
+
+// A change committed before history recorded commits keeps its date: AsOf counts it from when its
+// statement began, as it did, and History returns its records with no CommittedAt, chained as they
+// were. One after counts from its commit.
+func TestAChangeCommittedBeforeHistoryRecordedCommitsKeepsItsDate(t *testing.T) {
+	pool := pgtest.Open(t, "")
+	ctx := t.Context()
+	to := commitDates(t)
+	migrateFiles(t, pool, "", to)
+	recordMigrations(t, pool, to)
+	h := migrated(t, pool)
+	h.as(t, "u")
+	h.as(t, "v")
+	for _, id := range []string{"u", "v"} {
+		if _, err := pool.Exec(ctx, grantLogin, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Each revoke is made in a transaction held open past a moment, mid, that it commits after.
+	revoke := func(id string) time.Time {
+		t.Helper()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if _, err := tx.Exec(ctx, `DELETE FROM rbac_grants WHERE principal = 'user:' || $1::text`, id); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
+		var mid time.Time
+		if err := pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&mid); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return mid
+	}
+	before := revoke("u")
+	if err := rbac.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	after := revoke("v")
+	for _, c := range []struct {
+		at   time.Time
+		held map[string]bool
+	}{{before, map[string]bool{"u": false, "v": true}}, {after, map[string]bool{"u": false, "v": true}}} {
+		if err := h.authz.AsOf(ctx, "t1", c.at, func(a *rbac.Authorizer) error {
+			for id, held := range c.held {
+				grants, err := a.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{identity(id)}})
+				if err != nil {
+					return err
+				}
+				if (len(grants) == 1) != held {
+					t.Errorf("as of %v, %s holds %+v", c.at, id, grants)
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var cursor rbac.Cursor
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM rbac_history WHERE entity <> 'commit'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range drain(t, h, &cursor, n) {
+		if r.Entity == "grant" && r.Op == "delete" && (r.CommittedAt.IsZero() != (r.Principal.ID == "u") || (r.Cluster == "") != (r.Principal.ID == "u")) {
+			t.Errorf("revoke %+v", r)
+		}
+	}
+}
+
+// A prune counts a version from when its transaction committed, as AsOf does, and deletes a
+// transaction's commit record only with the last of its other records: a version made before a
+// prune's time but committed after it is no later version by then, and one kept counts from its
+// commit still.
+func TestPruningCountsAVersionFromItsCommit(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.as(t, "u")
+	if _, err := h.pool.Exec(ctx, grantLogin, "u"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `UPDATE rbac_grants SET note = 'second' WHERE principal = 'user:u'`); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	mid := dbNow(t, h)
+	time.Sleep(20 * time.Millisecond)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	commits := func() int {
+		t.Helper()
+		var n int
+		if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM rbac_history c WHERE c.entity = 'commit'
+			AND c.txid IN (SELECT txid FROM rbac_history WHERE entity = 'grant' AND principal = 'user:u')`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	// As of mid, the update hadn't committed: the grant's first version is its last, and stays.
+	if n, err := rbac.PruneHistory(ctx, h.pool, mid, exported(t, h)); err != nil || n != 0 {
+		t.Fatalf("PruneHistory as of mid = %d, %v", n, err)
+	}
+	if got, err := notesAt(t, h, mid); err != nil || got["u"] != "" {
+		t.Errorf("as of mid, after pruning: %v, %v", got, err)
+	}
+	if got := commits(); got != 2 {
+		t.Errorf("history holds %d commit records of the grant's transactions", got)
+	}
+	// As of now, the first version is superseded, and goes with its transaction's commit record.
+	if n, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h), exported(t, h)); err != nil || n != 2 {
+		t.Fatalf("PruneHistory as of now = %d, %v", n, err)
+	}
+	if got := commits(); got != 1 {
+		t.Errorf("history holds %d commit records of the grant's transactions", got)
+	}
+	if got, err := notesAt(t, h, dbNow(t, h)); err != nil || got["u"] != "second" {
+		t.Errorf("as of now, after pruning: %v, %v", got, err)
+	}
+}
+
+// Versions of a row dated alike, as every write of a DO block is, cost a prune a few pages each, as
+// versions dated apart do: each was tested for a later one in history's index of an entity's
+// versions, which ordered those of one date by their places, oldest first, so each read every one
+// before it.
+func TestPruningVersionsDatedAlikeReadsAFewPagesForEach(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.as(t, "u")
+	const n = 2000
+	if _, err := h.pool.Exec(ctx, fmt.Sprintf(`DO $$ BEGIN FOR i IN 1..%d LOOP
+		UPDATE rbac_memberships SET note = i::text WHERE tenant = 't1' AND principal = 'user:u'; END LOOP; END $$`, n)); err != nil {
+		t.Fatal(err)
+	}
+	through := exported(t, h)
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	start := historyPages(ctx, t, tx)
+	deleted, err := rbac.PruneHistory(ctx, tx, dbNow(t, h), through)
+	if err != nil || deleted < n {
+		t.Fatalf("PruneHistory = %d, %v", deleted, err)
+	}
+	if pages := historyPages(ctx, t, tx) - start; pages > 20*deleted {
+		t.Errorf("pruning %d versions dated alike read %d pages of history", deleted, pages)
 	}
 }
