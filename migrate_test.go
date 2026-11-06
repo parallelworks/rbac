@@ -726,9 +726,9 @@ func TestEveryTableHasAViewOfItsColumns(t *testing.T) {
 // refused, as a function made there would be called in place of the package's, as whoever reads.
 // Made, the views read history with the rights of whoever reads them, and are given to each role
 // that may read history and use the package's schema, not to the public, which may read history
-// but not reach it. Made again, as a later migration makes them, they are refused alike where
-// another role may since create there or the schema holds more than them, though not for its
-// default privileges.
+// but not reach it, until it is given that schema and they are made again. Made again, as a later
+// migration makes them, they are refused alike where another role may since create there or the
+// schema holds more than them, though not for its default privileges.
 func TestMigratingMakesAsOfsViewsInASchemaOfTheirOwn(t *testing.T) {
 	ctx := t.Context()
 	r := newReadmeRoles(t)
@@ -774,6 +774,17 @@ func TestMigratingMakesAsOfsViewsInASchemaOfTheirOwn(t *testing.T) {
 	var public int
 	if err := r.super.QueryRow(ctx, `SELECT count(*) FROM pg_namespace n, aclexplode(n.nspacl) a WHERE n.oid = $1::regnamespace AND a.grantee = 0`, views).Scan(&public); err != nil || public != 0 {
 		t.Errorf("the public, which may read history but not use the package's schema, was given the views' schema %d times: %v", public, err)
+	}
+	// Given the package's schema since, as a role can be after migrating, the public is given the
+	// views once they are made again, as the README says.
+	exec(`GRANT USAGE ON SCHEMA ` + r.schema + ` TO PUBLIC`)
+	if _, err := r.adminPool.Exec(ctx, `SELECT rbac_as_of_views()`); err != nil {
+		t.Fatal(err)
+	}
+	var reads bool
+	if err := r.super.QueryRow(ctx, `SELECT has_schema_privilege('public', $1::regnamespace, 'USAGE') AND has_table_privilege('public', $1 || '.rbac_grants', 'SELECT')`,
+		views).Scan(&reads); err != nil || !reads {
+		t.Errorf("the public, given the package's schema since the views were made, was given them as they were made again %t: %v", reads, err)
 	}
 	for _, c := range []struct {
 		what, set, unset string

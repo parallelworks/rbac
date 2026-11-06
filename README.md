@@ -929,8 +929,9 @@ have the server load a library or run a program of its choosing; and:
    they are now: they read history with the rights of whoever reads them, so they give a role no row
    of history it couldn't read already, but for `USAGE` on the package's schema, which a view
    reading history by its oid doesn't ask of whoever reads it. Migrating gives them to every role
-   that may then read history and use the package's schema; give them to one given both after, and
-   revoke them from one that loses either.
+   that may then read history and use the package's schema; give them to one given both after, as
+   `SELECT rbac_as_of_views()` run as the administrator's role does to each such role then, and
+   revoke them from one that loses either, as it takes them from none.
 4. The application's role can make no schema and create in none, the schema of `AsOf`'s views
    either: it neither owns the database nor has `CREATE` on it, which `CREATE SCHEMA` needs and only
    the owner has by default, and it creates in no schema it owns, as `public` is when that role owns
@@ -1147,21 +1148,21 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   create, as the role's default privileges can have it, fails it with SQLSTATE 42P15, as does one
   that has come to be so when a later migration makes the views again. It gives the views and their
   schema to each role that may read history and use the package's schema then, as the application's
-  role above, so that role needs no new grant. It takes no lock a check, a change or a read of
-  history waits for. Code from before it makes temporary views for `AsOf`, as it still may beside
-  it, and code from it on reads these, refusing as `rbac.ErrInvalid` to read as of a time where they
-  aren't made: migrate before running it. From it on `AsOf` needs no `TEMPORARY`, so once no replica
-  runs code from before it, revoke it from `PUBLIC` with no exception; and it takes no transaction
-  id, so its read holds no `History` or `Export` back. Hooks and a host's queries on its transaction
-  read the package's tables by name as of the time, as before, but its read runs READ ONLY, with the
-  views' schema first on the search_path: `current_schema()` there names the views' schema, a write
-  there but to a temporary table fails with SQLSTATE 25006 rather than roll back with the read, and
-  one that leaves the search_path, the role, `rbac.as_of`, `rbac.as_of_tenant` or
-  `rbac.as_of_cluster` set otherwise fails `AsOf` as `rbac.ErrInvalid` once its read returns, as
-  does the views' schema holding more than the views, or another role being able to create there,
-  when the read begins or as it ends, or one of the views dropped as it ran. Drop the views' schema
-  with the package's: dropping the package's drops the views, which read its history, but not their
-  schema.
+  role above, so that role needs no new grant, and `rbac_as_of_views` does again to each that may
+  when it runs. It takes no lock a check, a change or a read of history waits for. Code from before
+  it makes temporary views for `AsOf`, as it still may beside it, and code from it on reads these,
+  refusing as `rbac.ErrInvalid` to read as of a time where they aren't made: migrate before running
+  it. From it on `AsOf` needs no `TEMPORARY`, so once no replica runs code from before it, revoke it
+  from `PUBLIC` with no exception; and it takes no transaction id, so its read holds no `History` or
+  `Export` back. Hooks and a host's queries on its transaction read the package's tables by name as
+  of the time, as before, but its read runs READ ONLY, with the views' schema first on the
+  search_path: `current_schema()` there names the views' schema, a write there but to a temporary
+  table fails with SQLSTATE 25006 rather than roll back with the read, and one that leaves the
+  search_path, the role, `rbac.as_of`, `rbac.as_of_tenant` or `rbac.as_of_cluster` set otherwise
+  fails `AsOf` as `rbac.ErrInvalid` once its read returns, as does the views' schema holding more
+  than the views, or another role being able to create there, when the read begins or as it ends, or
+  one of the views dropped as it ran. Drop the views' schema with the package's: dropping the
+  package's drops the views, which read its history, but not their schema.
   Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
   rolling upgrade across the two is unsafe: they key every lock apart, so a change by one waits for
   none by the other, and what each checks under its locks can change before it commits, as two
