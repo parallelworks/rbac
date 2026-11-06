@@ -1733,11 +1733,11 @@ func TestWhetherAttributesFitTurnsOnNoOrder(t *testing.T) {
 // a value by where one the call converted before was, so none made where a dropped one was is
 // read as converted from it.
 func TestAChecksAttributesAreAsConvertedAloneWhateverItsCallConvertedBefore(t *testing.T) {
-	seed := uint64(time.Now().UnixNano())
-	t.Logf("seed %d", seed)
-	rng := rand.New(rand.NewPCG(seed, 37))
 	for trial := range 10 {
-		shared := drawnShared(rng, true)
+		// Drawn from the trial's own seed, so a failing trial draws alike when run again.
+		rng := rand.New(rand.NewPCG(uint64(trial), 37))
+		sharedSeed := rng.Uint64()
+		shared := drawnShared(rand.New(rand.NewPCG(sharedSeed, 0)), true)
 		// Shared by the kinds that hold it, about what a check converts, so a check counting it
 		// otherwise, or not counting what was converted before it, reads what converting them doesn't.
 		big := make([]int, []int{rbac.MaxConverted / 3, rbac.MaxConverted/2 + 1000, rbac.MaxConverted - 1000}[rng.IntN(3)])
@@ -1771,8 +1771,9 @@ func TestAChecksAttributesAreAsConvertedAloneWhateverItsCallConvertedBefore(t *t
 				runtime.GC()
 			}
 		}
-		// The resource of each check, made as it is asked for, after what a hook dropped before it.
-		resource := func(i int) map[string]any {
+		// The resource of each check, of shared and big, made as it is asked for, after what a hook
+		// dropped before it.
+		resourceOf := func(i int, shared []any, big []int) map[string]any {
 			rng := rand.New(rand.NewPCG(resourceSeed, uint64(i)))
 			if rng.IntN(5) == 0 {
 				return nil
@@ -1788,6 +1789,7 @@ func TestAChecksAttributesAreAsConvertedAloneWhateverItsCallConvertedBefore(t *t
 			attributes["many"] = many
 			return attributes
 		}
+		resource := func(i int) map[string]any { return resourceOf(i, shared, big) }
 		subject, drop := passed()
 		together, alone := rbac.AttributesRead(t, 4, func(i int) (context.Context, map[string]any, map[string]any) {
 			return ctx, subject, resource(i)
@@ -1803,10 +1805,13 @@ func TestAChecksAttributesAreAsConvertedAloneWhateverItsCallConvertedBefore(t *t
 					t.Fatalf("trial %d, check %d: the %s's attributes read\n%s\nwhere alone\n%s", trial, i, kind, got, want)
 				}
 			}
-			// The kinds converted at once, in the order a check converts them, the resource's a copy
-			// sharing none of the others' values, as a check converts its resource's apart.
+			// The kinds converted at once, in the order a check converts them, the resource's made again
+			// of values of its own, sharing none of the others', as a check converts its resource's
+			// apart. A copy of it (DeepCopy) is nil where it is past what a check converts, where the
+			// check, converting it whole, is past it too.
 			passing, _ := passed()
-			read, over := rbac.ConvertedInOrder(t, request, passing, rbac.DeepCopy(resource(i)))
+			apart := resourceOf(i, drawnShared(rand.New(rand.NewPCG(sharedSeed, 0)), true), make([]int, len(big)))
+			read, over := rbac.ConvertedInOrder(t, request, passing, apart)
 			for k, j := range []int{2, 0, 1} {
 				if unread := alone[i][j] == rbac.Unreadable; unread != (over || !read[k]) {
 					t.Fatalf("trial %d, check %d: the %s's attributes unreadable %t, where converted at once %t, past what a check converts %t",
