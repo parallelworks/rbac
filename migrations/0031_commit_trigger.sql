@@ -35,7 +35,9 @@
 -- default queue of 8 GB. Any role can NOTIFY, which takes no privilege, so revoking EXECUTE on
 -- pg_notify bounds nothing; lock_timeout doesn't, as it isn't a lock wait. Only the queue's size
 -- does, max_notify_queue_pages from PostgreSQL 17 on: a commit whose payloads overflow it fails, and
--- its changes with it.
+-- its changes with it (SQLSTATE 54000). The queue holds what any listener in the cluster has yet to
+-- read, and any role may LISTEN, so a small one fills while one lags, as one in a long transaction
+-- does, and every commit that notifies fails until it catches up or ends.
 --
 -- The function writes history as its owner, so it is given to rbac_record's owner, history's role
 -- where the README's roles are set up, not left to the role migrating, which makes it and owns the

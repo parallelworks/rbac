@@ -755,9 +755,14 @@ notifications the transaction queued, with `NOTIFY` or `pg_notify`, to PostgreSQ
 queue, which no SQL can see beforehand: about 1.6 ms a MB on a test server, 260 ms for 160 MB, and
 some 13 s at the default queue of 8 GB, which `lock_timeout` doesn't bound either. Any role may
 `NOTIFY`, which takes no privilege, so revoking `EXECUTE` on `pg_notify` from `PUBLIC` bounds
-nothing. From PostgreSQL 17 on, set `max_notify_queue_pages` as small as the host's listeners allow,
-as a commit whose notifications overflow the queue fails, its changes with it, rather than being
-held: 1,024 pages, 8 MB, hold one about 13 ms at most. `pg_stat_activity` lists a session
+nothing. From PostgreSQL 17 on, `max_notify_queue_pages`, set as the server starts, bounds it: a
+commit whose notifications overflow the queue fails with SQLSTATE 54000, its changes with it, rather
+than being held, so 1,024 pages, 8 MB, hold one about 13 ms at most. But the queue holds every
+notification some listener in the cluster has yet to read, and any role may `LISTEN`, so a small
+one fills while a listener lags, as one in a long transaction does, and every commit that notifies
+then fails until that listener catches up or ends: where the host's own transactions notify, size
+it for how far its listeners fall behind, and retry such a commit once the queue drains, or keep
+the default and watch `pg_notification_queue_usage()`. `pg_stat_activity` lists a session
 in its commit, with `COMMIT` as its query, or waiting on `SyncRep`, and `pg_prepared_xacts` a
 prepared transaction until it is committed or rolled back; keep `max_prepared_transactions` at 0,
 the default, so none is. Any session can fire a transaction's deferred triggers before it commits,
