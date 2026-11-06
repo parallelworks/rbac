@@ -208,25 +208,47 @@ erDiagram
   grants is an index-only scan. The indexes by scope and by principal lead to both too and hold the
   same, so a connection's cached statement, once PostgreSQL plans it generically by the tables'
   averages, still reads only the subject's grants on the path, from the index alone, whichever
-  index it picks. A search decides which custom roles the public's and the tenant's members' grants
-  name before its statement, from `rbac_grants_custom_principal`, which holds only grants of custom
-  roles, by principal and scope, and reads only those its subject counts: the anonymous and a guest
-  read none of the members', and a search of a permission no public role gives none of the
-  public's, so their grants of built-in roles on thousands of resources cost it nothing. It names a
-  custom role as that index's predicate does, as a range of the C collation, from `custom.` to just
-  before `custom/`, which no LIKE implies, so `rbac_grants_custom_role`, whose predicate is a LIKE
-  and which leads to the tenant alone, serves no plan of it: by statistics from before the tenant
-  granted custom roles, or with none, every plan read every grant of one in the tenant through it,
-  to anyone, once for each broad key and scope or type. A change bounding the conditions a check
-  reads together on a scope (`conditionsIn`) reads the conditional grants there by
-  `rbac_grants_conditional`, which holds those alone, and one bounding groups' requirements for a
-  role there (`requirementsBounded`) the eligibilities with one by `rbac_eligibilities_requires`, in
-  its order, which no other index gives: each with sequential scans, bitmap scans and sorting off
-  (`seeking`), so neither the scope's unconditional grants nor its other eligibilities cost it
-  anything, however many, whatever the statistics count or the table held when the session planned
-  the read. By the scope's index, which holds whether a grant is conditional but not its condition,
-  every grant to a group there was read from the table, and with sequential scans on, a plan made
-  while the table was small read every grant in it.
+  index it picks. A check's read of its subject's grants and the denies on the path, and a change's
+  of its actor's (`readHeld`), and of the powers to change grants the denies binding it remove
+  (`grantsDenied`), are planned with sequential scans off (`indexed`, `planned`), so a plan
+  PostgreSQL made generically while the tables were small, or by statistics from then, which it
+  keeps until an analysis invalidates it, still reads each table by an index: one made with them on
+  read every row of each, and the denies once for each key of the path, 2,000 pages of a check
+  beside 20,000 denies and 2,500 of a change's read of its actor's authority, against 8 and 18 with
+  them off. Each is sent in one batch, after a statement turning them off, which keeps the session's
+  setting in a variable of the package's own, `rbac.enable_seqscan`, and before one putting it back:
+  on a pool the batch is a transaction of its own, and under `WithTx` it runs in the host's, which
+  goes on past it; where the statement fails, nothing after it runs, and a rollback puts the setting
+  back. So are a change to members' reads of the grants, eligibilities and denies naming its groups
+  (`reachOf`), which read every deny and eligibility in the database so, and its removal of the
+  places it ends (`leave`), which deletes each by where it is stored, as `restingIn` holds it:
+  matched beside `tenant = $1`, a plan made while the table was small read every place in the
+  tenant and for each one every place in the table, 2.6 million pages to remove one member. A
+  search reads its subject's own grants on scopes of the listed types a key at a time too
+  (`heldByType`): by `= ANY` of its keys beside a type's range of scopes, a plan by no statistics
+  read that range of the scopes' index, every grant on a scope of the type in the tenant. A search
+  decides which custom roles the public's and the tenant's members' grants name before its
+  statement, from `rbac_grants_custom_principal`, which holds only grants of custom roles, by
+  principal and scope, and reads only those its subject counts: the anonymous and a guest read none
+  of the members', and a search of a permission no public role gives none of the public's, so their
+  grants of built-in roles on thousands of resources cost it nothing. It names a custom role as that
+  index's predicate does, as a range of the C collation, from `custom.` to just before `custom/`,
+  which no LIKE implies, so `rbac_grants_custom_role`, whose predicate is a LIKE and which leads to
+  the tenant alone, serves no plan of it: by statistics from before the tenant granted custom roles,
+  or with none, every plan read every grant of one in the tenant through it, to anyone, once for
+  each broad key and scope or type. `SetRole` making a role privileged reads whether the tenant's
+  members hold it so too, by their key, with sequential and bitmap scans off (`heldByMembers`): by
+  the tenant and the role, it read every grant of the role in the tenant, and by fresh statistics of
+  a role id other tenants grant too, as `EXISTS` plans for the first row, every grant in the table.
+  A change bounding the conditions a check reads together on a scope (`conditionsIn`) reads the
+  conditional grants there by `rbac_grants_conditional`, which holds those alone, and one bounding
+  groups' requirements for a role there (`requirementsBounded`) the eligibilities with one by
+  `rbac_eligibilities_requires`, in its order, which no other index gives: each with sequential
+  scans, bitmap scans and sorting off (`seeking`), so neither the scope's unconditional grants nor
+  its other eligibilities cost it anything, however many, whatever the statistics count or the table
+  held when the session planned the read. By the scope's index, which holds whether a grant is
+  conditional but not its condition, every grant to a group there was read from the table, and with
+  sequential scans on, a plan made while the table was small read every grant in it.
 - **A read of a list of keys reads each key's rows on its own** (`byKey`), as of a list's scopes
   or principals, of the denies on a check's path, of `Activate`'s eligibilities and of the rows
   `DeleteScopes`, `DeletePrincipal` and `DeleteGroups` remove, and so does a walk through nested
@@ -256,13 +278,16 @@ erDiagram
   views, which read every version of a deny to find its last, counting read every one, deleted
   denies' too.
 - **A lookup of one key a tenant holds once** gives the key in a subquery too, whose value no plan
-  sees, as whether a group exists (`groupExists`) or an identity is a member (`GroupsOf`, and a
-  search counting the tenant's members' grants): counted by the tenant's selectivity and the key's
-  apart, as if neither told anything of the other, a key many tenants hold, as a group's id each
-  names its admins by or an identity in many tenants, was counted in a large tenant as hundreds or
-  thousands, and `EXISTS`, planned for the first, read every tenant's rows to find it sooner than
-  the key's index, as the planner costs it. Unseen, the key counts as one of the column's distinct
-  values, and a tenant holds each at most once.
+  sees, as whether a group exists (`groupExists`) or an identity is a member (`GroupsOf`, a search
+  counting the tenant's members' grants, and the walk up from a subject's identity in every check,
+  list and change, `keysSQL`): counted by the tenant's selectivity and the key's apart, as if
+  neither told anything of the other, a key many tenants hold, as a group's id each names its admins
+  by or an identity in many tenants, was counted in a large tenant as hundreds or thousands, and
+  `EXISTS`, planned for the first, read every tenant's rows to find it sooner than the key's index,
+  as the planner costs it, and a check of an identity in every tenant of a large one, counting each
+  group it is in as many again, was costed past `jit_above_cost`, and compiled for 400 ms before
+  reading in a tenth of a millisecond what it reads. Unseen, the key counts as one of the column's
+  distinct values, and a tenant holds each at most once.
 - **Activations are grants** from the source `activation` (`SourceActivation`), made by
   `Activate` from an eligibility, which they record, and ended by their expiry, `Deactivate`, or a
   change ending the membership or a place in a group on their holder's paths to that eligibility's
@@ -663,7 +688,15 @@ sequenceDiagram
   reading the resource can't be evaluated and so denies (`handsOn`): stricter than `Apply` on a scope
   such a condition spares, as the grants span scopes no one reads, but never weaker, and only for a
   deny below the tenant, a label, or a constraint on what `SetRole` hands on where it gives more
-  (`handedOnStopped`) is each scope read from the host. `ChangeMembers` asks the
+  (`handedOnStopped`) is each scope read from the host. Whether a deny below the tenant binds the
+  actor is read with its power to define roles (`roleRead`), and under the tenant's lock, where one
+  did before the transaction, so are the denies on the paths of the scopes read from the host then,
+  and the actor's label values are decided by what that read holds: read in up to four statements,
+  `DeleteExpired`, which takes no lock, removed in between a place ended by its clock but not yet by
+  the change's, of the group the actor's power came through, and the denies naming that group were
+  read as binding it no longer, though at no moment did it hold the power and escape them. Where one
+  binds the actor under the lock that none did before, the scopes weren't read with it, and the
+  change is tried again (`ErrConflict`). `ChangeMembers` asks the
   constraints once about each type of scope a member only loses access on, of no resource
   (`freezes`), and reads the types whose power to change grants a deny binding the actor lists
   (`grantsDenied`); only for a scope of a type either names, or whose label can refuse the actor, is
@@ -696,7 +729,7 @@ sequenceDiagram
   decides one, the actor holds only until its exemption ends (`exemptUntil`): `holdsFor` and `under`
   hand it on no longer, `decidedAs` tells grants apart by that end, a scope such a deny is on the
   path of is decided apart from others (`proven`, `alike`), and `SetRole` giving more below the
-  tenant reads them there as the denies binding the actor (`deniedBelow`), though narrowing or
+  tenant reads them there as the denies binding the actor (`belowSQL`), though narrowing or
   deleting a role, which hands nothing on, asks the host nothing for them. Conditions are decided
   as of the change: a grant's is handed on with it, as what the actor holds under one it hands on
   only under the same, but a deny's can't be, so one holding only from a later time, as by reading
@@ -1019,13 +1052,20 @@ flowchart TB
   reads a moment of its own, so a change committing between two can mix two states, and for AsOf,
   history of a time not yet final. Conflicts reads in one statement, the custom roles with their
   grants, as a check and `broadExcludes` read them, so it lists what one moment held under `WithTx`
-  too: it runs in such a transaction of its own only to hold JIT off for it (`withoutJIT`). A read
-  that sets planner settings for its own statements alone (`planned`), as that, `Holders`' read of
-  label values and a change bounding a scope's conditions (`seeking`) do, puts the host's back after
-  it, where it fails, panics or its ctx is done too, as pgx sends nothing on a done ctx: under
-  `WithTx`, a `Holders` refused for its ctx once its read had run left the host's transaction JIT
-  off, as did one whose panic the host recovered from, as no savepoint of the call's rolls them
-  back.
+  too, with JIT off for it (`withoutJIT`). A read that sets planner settings for its own statement
+  alone (`planned`), as that, `Holders`' read of label values, a check's read of its subject's
+  grants (`indexed`) and a change bounding a scope's conditions (`seeking`) do, sends it in one
+  batch between a statement setting them, which keeps each one's value in a variable of the
+  package's own, and one putting them back, so the server puts the host's back however the call ends
+  once it has sent the batch: where the statement fails, nothing after it runs, and the rollback
+  puts them back; and the batch is read to its end where the call's reading of its rows fails or
+  panics, so the pool, or a host recovering in its transaction, has the connection back. Set and put
+  back in statements of their own, under `WithTx` a `Holders` refused for its ctx once its read had
+  run left the host's transaction JIT off, as did one whose panic the host recovered from, as no
+  savepoint of the call's rolls them back. Nothing else runs on the session within one batch, so no
+  read, of the schema's tables or another's, can change the variables in between. A read holding
+  settings across several statements (`planning`), as `AsOf`'s and `History`'s do, keeps the host's
+  in the call instead, as a read between them may be planned, which changes the variables.
 - **One time for a call.** A call reads `Config.Now` once, where it first needs the time: every
   statement it makes compares expiry with it, and every condition reads it as `request.time`, so a
   grant or a membership ending as the call runs can't meet a deny, a condition or label values of a

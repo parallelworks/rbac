@@ -1227,6 +1227,14 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   spent 500 of its 650 ms compiling. As of a time, every statement costs so for any subject, as
   planned for its arguments over history: `AsOf` turns JIT off in its own transaction, which the
   rollback puts back, whatever the role's setting.
+- **Planner settings:** a check's read of its subject's grants and denies, a change's of its
+  actor's, and a change to members' reads of what names its groups and its removal of places, turn
+  sequential scans off for their own statement, as `Holders`' read of label values and `Conflicts`
+  turn JIT off for theirs. Each sets them in the round trip that sends the statement, and puts the
+  session's back after it, keeping each meanwhile in a variable of the package's own named for it,
+  as `rbac.enable_seqscan` and `rbac.jit`: a connection plans a statement once for all its runs,
+  and one planned while the tables were small read every row of them until an analysis had it
+  planned again.
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
   to run on a schedule, passing over what a change holds until the next run. A call reads
   `Config.Now` once, which every expiry it compares and every condition's `request.time` read, so a
@@ -1235,10 +1243,13 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   read before a wait, as for an `Activate` holding the places a change ends, it would decide at a
   time the wait left behind, as by an actor's power that ended while it waited. So a change holds
   first what it writes that `DeleteExpired`, which waits for nothing, may be deleting, and holds
-  until its own transaction ends. `SetMemberships` doesn't wait for the places in groups of a
-  membership that ended while it took its locks, which another transaction holds, as a group's
-  deletion: it is tried again (`rbac.ErrConflict`), as is a change whose host's clock goes back
-  between the two readings.
+  until its own transaction ends; and reads what its actor acts by in one statement with the denies
+  binding it and its label values, as `SetRole` and `DeleteRole` do under the tenant's lock, so a
+  place ended by `DeleteExpired`'s clock but not yet by the change's, removed in between, can't have
+  it act by a power and escape a deny at no one moment. `SetMemberships` doesn't wait for the places
+  in groups of a membership that ended while it took its locks, which another transaction holds, as
+  a group's deletion: it is tried again (`rbac.ErrConflict`), as is a change whose host's clock goes
+  back between the two readings.
 
 ## Development
 

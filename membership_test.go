@@ -612,7 +612,7 @@ func TestMigratingTheMembersIndexWaitsForAChangeInFlight(t *testing.T) {
 }
 
 // rolesAfterDenies is a pool whose transactions run fire, once, just before the first statement
-// naming rbac_roles that follows one naming rbac_denies or rbac_eligibilities.
+// naming rbac_roles that follows one naming rbac_denies or rbac_eligibilities, alone or in a batch.
 type rolesAfterDenies struct {
 	*pgxpool.Pool
 	fire func()
@@ -655,6 +655,13 @@ func (tx *rolesAfterDeniesTx) Query(ctx context.Context, sql string, args ...any
 func (tx *rolesAfterDeniesTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	tx.see(sql)
 	return tx.Tx.QueryRow(ctx, sql, args...)
+}
+
+func (tx *rolesAfterDeniesTx) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	for _, q := range b.QueuedQueries {
+		tx.see(q.SQL)
+	}
+	return tx.Tx.SendBatch(ctx, b)
 }
 
 // A migration locking a custom role's tables, rbac_roles first, as 0016 does, while ChangeMembers
@@ -971,7 +978,7 @@ func TestLeavingATenantEndsItsExemptionsAndApprovals(t *testing.T) {
 // places in groups, only its own and the activations its places allowed, under a generic plan too:
 // no btree finds a key in exempt, and beside tenant = $1 a plan, costing the tenant's rows by
 // averages, would read every deny. Not the eligibilities: under a generic plan, deleting the
-// leaver's own in order (inOrder) reads every one in the tenant.
+// leaver's own in order (lockedInOrder) reads every one in the tenant.
 func TestLeavingUnderAGenericPlanReadsOnlyWhatNamesTheLeaver(t *testing.T) {
 	h := generic(t)
 	ctx := t.Context()

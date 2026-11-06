@@ -1315,18 +1315,19 @@ func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []
 	if len(on) == 0 {
 		return nil, nil
 	}
-	aus, _, err := a.authoritiesIn(ctx, q, actor, on[0].Tenant, on, roles, false)
+	aus, _, err := a.authoritiesIn(ctx, q, actor, on[0].Tenant, on, roles, alsoRead{})
 	return aus, err
 }
 
-// authoritiesIn is authorities in a tenant, and where denied, the types of scope whose power to
-// change grants a deny anywhere in it binding the actor lists, as grantsDenied reads them, read in
-// the same statement, even for no resource: so a change decides where such a deny may stop it by
-// what bound the actor as it held the power it acts by. Read apart, an actor moving in between from
-// a group giving it that power to one a deny exempts passed both reads, though at no moment did it
-// hold the power and escape the deny.
-func (a *Authorizer) authoritiesIn(ctx context.Context, q DB, actor Subject, tenant string, on []Resource, roles []Role, denied bool,
-) ([]authority, map[string]bool, error) {
+// authoritiesIn is authorities in a tenant, with what else with says read in the same statement,
+// even for no resource, as the types of scope whose power to change grants a deny anywhere in it
+// binding the actor lists, as grantsDenied reads them, or whether a deny below the tenant binds it
+// (belowSQL): so a change decides where such a deny may stop it by what bound the actor as it held
+// the power it acts by. Read apart, an actor moving in between from a group giving it that power to
+// one a deny exempts passed both reads, though at no moment did it hold the power and escape the
+// deny. It returns the read too.
+func (a *Authorizer) authoritiesIn(ctx context.Context, q DB, actor Subject, tenant string, on []Resource, roles []Role, with alsoRead,
+) ([]authority, grantsRead, error) {
 	which := heldTenantRoles
 	if slices.ContainsFunc(roles, isCustom) {
 		which = tenantRoles
@@ -1338,14 +1339,15 @@ func (a *Authorizer) authoritiesIn(ctx context.Context, q DB, actor Subject, ten
 			keys[k] = true
 		}
 	}
-	got, err := a.readHeld(ctx, q, tenant, actor, all, slices.Sorted(maps.Keys(keys)), "", which, alsoRead{ending: true, grantsDenied: denied})
+	with.ending = true
+	got, err := a.readHeld(ctx, q, tenant, actor, all, slices.Sorted(maps.Keys(keys)), "", which, with)
 	if err != nil {
-		return nil, nil, err
+		return nil, grantsRead{}, err
 	}
 	held, ds, b := got.held, got.ds, got.roles
 	readingRoles()
 	if err := a.conditionsOf(ctx, q, tenant, held); err != nil {
-		return nil, nil, err
+		return nil, grantsRead{}, err
 	}
 	at := make([]int, len(held))
 	for i := range at {
@@ -1391,7 +1393,7 @@ func (a *Authorizer) authoritiesIn(ctx context.Context, q DB, actor Subject, ten
 		}
 		aus[i].proven = proven[k]
 	}
-	return aus, got.grantsDenied, nil
+	return aus, got, nil
 }
 
 // onPaths returns, for each of paths, those of xs whose scope is on it, in the order of xs, as a
@@ -2512,45 +2514,42 @@ func (a *Authorizer) conditionsIn(ctx context.Context, tx pgx.Tx, tenant string,
 	for i, b := range buckets {
 		scopes[i], principals[i], sources[i] = b.scope, b.principal, b.source
 	}
-	// The grants that reach many by their keys, the groups' a range, each of which the index of
-	// conditional grants seeks (rbac_grants_conditional): '' is no principal's key. By the scope's
-	// index, which holds whether each is conditional but not its condition or source, every grant to
-	// a group on the scope was read from the table, and with sequential scans on, a plan by
-	// statistics from before the scope's grants grew, or made while the table was small, read every
-	// grant in the table.
-	carried, err := planned(ctx, tx, seeking, func() (map[conditionBucket]map[string][]Role, error) {
-		rows, err := tx.Query(ctx, `
-			SELECT b.scope, b.principal, b.source, g.condition, array_agg(DISTINCT g.role)
-			FROM unnest($2::text[], $3::text[], $4::text[]) AS b(scope, principal, source)
-			CROSS JOIN LATERAL (
-			  SELECT condition, role, source FROM rbac_grants WHERE scope = b.scope AND tenant = $1 AND principal = b.principal
-			    AND conditional AND (expires_at IS NULL OR expires_at > $5)
-			  UNION ALL
-			  SELECT condition, role, source FROM rbac_grants WHERE b.principal = '' AND scope = b.scope AND tenant = $1
-			    AND principal >= 'group:' AND principal < 'group;' AND conditional AND (expires_at IS NULL OR expires_at > $5)
-			  UNION ALL
-			  SELECT condition, role, source FROM rbac_grants WHERE b.principal = '' AND scope = b.scope AND tenant = $1
-			    AND principal = ANY(ARRAY[$6, $7]::text[]) AND conditional AND (expires_at IS NULL OR expires_at > $5)
-			) g
-			WHERE CASE WHEN g.source = ANY($8::text[]) THEN g.source ELSE '' END = b.source
-			GROUP BY b.scope, b.principal, b.source, g.condition`,
-			tenant, scopes, principals, sources, a.cfg.Now(), TenantMembers(tenant).key(), publicKey, slices.Sorted(maps.Keys(a.owned)))
-		if err != nil {
-			return nil, err
-		}
-		carried := map[conditionBucket]map[string][]Role{}
-		var b conditionBucket
-		var condition string
-		var roles []Role
-		_, err = pgx.ForEachRow(rows, []any{&b.scope, &b.principal, &b.source, &condition, &roles}, func() error {
+	carried := map[conditionBucket]map[string][]Role{}
+	var b conditionBucket
+	var condition string
+	var roles []Role
+	scan := func(rows pgx.Rows) error {
+		_, err := pgx.ForEachRow(rows, []any{&b.scope, &b.principal, &b.source, &condition, &roles}, func() error {
 			if carried[b] == nil {
 				carried[b] = map[string][]Role{}
 			}
 			carried[b][condition] = roles
 			return nil
 		})
-		return carried, err
-	})
+		return err
+	}
+	// The grants that reach many by their keys, the groups' a range, each of which the index of
+	// conditional grants seeks (rbac_grants_conditional): '' is no principal's key. By the scope's
+	// index, which holds whether each is conditional but not its condition or source, every grant to
+	// a group on the scope was read from the table, and with sequential scans on, a plan by
+	// statistics from before the scope's grants grew, or made while the table was small, read every
+	// grant in the table.
+	err := planned(ctx, tx, seeking, scan, `
+		SELECT b.scope, b.principal, b.source, g.condition, array_agg(DISTINCT g.role)
+		FROM unnest($2::text[], $3::text[], $4::text[]) AS b(scope, principal, source)
+		CROSS JOIN LATERAL (
+		  SELECT condition, role, source FROM rbac_grants WHERE scope = b.scope AND tenant = $1 AND principal = b.principal
+		    AND conditional AND (expires_at IS NULL OR expires_at > $5)
+		  UNION ALL
+		  SELECT condition, role, source FROM rbac_grants WHERE b.principal = '' AND scope = b.scope AND tenant = $1
+		    AND principal >= 'group:' AND principal < 'group;' AND conditional AND (expires_at IS NULL OR expires_at > $5)
+		  UNION ALL
+		  SELECT condition, role, source FROM rbac_grants WHERE b.principal = '' AND scope = b.scope AND tenant = $1
+		    AND principal = ANY(ARRAY[$6, $7]::text[]) AND conditional AND (expires_at IS NULL OR expires_at > $5)
+		) g
+		WHERE CASE WHEN g.source = ANY($8::text[]) THEN g.source ELSE '' END = b.source
+		GROUP BY b.scope, b.principal, b.source, g.condition`,
+		tenant, scopes, principals, sources, a.cfg.Now(), TenantMembers(tenant).key(), publicKey, slices.Sorted(maps.Keys(a.owned)))
 	if err != nil {
 		return nil, err
 	}
@@ -2742,10 +2741,10 @@ const revoking = `DELETE FROM rbac_grants WHERE id = ANY(ARRAY(` + revokedSQL + 
 // revokedSQL picks the grants a revoke deletes. They are found from the bindings, each by its
 // principal, scope and role, which every index leading to them seeks: matched to the scope's grants
 // instead, a revoke reads every grant on it, which a busy scope holds thousands of, while it holds
-// the scope's lock. OFFSET 0 keeps the planner from flattening the lookup into such a join. They are
-// locked in order (inOrder) before they are deleted: deleted as the plan finds them, by their ids
-// or where they are stored, they would deadlock with a change ending activations among them, which
-// holds no lock of the scope.
+// the scope's lock. OFFSET 0 keeps the planner from flattening the lookup into such a join. They
+// are locked in order (bindingOrder) before they are deleted: deleted as the plan finds them, by
+// their ids or where they are stored, they would deadlock with a change ending activations among
+// them, which holds no lock of the scope.
 const revokedSQL = `
 	SELECT id FROM rbac_grants g
 	  WHERE id = ANY(ARRAY(
