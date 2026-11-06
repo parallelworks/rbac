@@ -744,9 +744,10 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 		labels.seal()
 		revoking.seal()
 		// Its power to manage groups, and where a deny binding it may remove its power to change grants
-		// on groups, the denies on the group's path, in one read, so it held the one and escaped the
-		// other at one moment, as a change to members reads what it acts by (mayReachAgain).
-		au, err := a.reachAuthority(ctx, tx, actor, root, []*reachCheck{revoking})
+		// on groups, the denies on the group's path, or where none did before, whether one now may, in
+		// one read, so it held the one and escaped the other at one moment, as a change to members reads
+		// what it acts by (mayReachAgain).
+		au, err := a.reachAuthority(ctx, tx, actor, tenant, root, []*reachCheck{revoking}, !revoking.bound)
 		if err != nil {
 			return ChangeEvent{}, err
 		}
@@ -789,16 +790,11 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 				return ChangeEvent{}, err
 			}
 			// Where no deny binding the actor removed its power to change grants on groups, the denies
-			// on the group's path weren't read, and the group perhaps not from the host: one set
-			// meanwhile has the deletion tried again, as mayReachAgain has a change to members.
-			if !revoking.bound {
-				now, err := a.grantsDenied(ctx, tx, tenant, actor)
-				if err != nil {
-					return ChangeEvent{}, err
-				}
-				if now[GroupScope] {
-					return ChangeEvent{}, fmt.Errorf("%w: a deny binding the actor was set while this change waited; try again", ErrConflict)
-				}
+			// on the group's path weren't read, and the group perhaps not from the host: one binding it
+			// in the read of its power has the deletion tried again, as mayReachAgain has a change to
+			// members.
+			if !revoking.bound && au.grantsDenied[GroupScope] {
+				return ChangeEvent{}, fmt.Errorf("%w: a deny binding the actor was set while this change waited; try again", ErrConflict)
 			}
 		}
 		if err := a.unrested(ctx, tx, tenant, id, reached); err != nil {
@@ -2593,14 +2589,12 @@ func (a *Authorizer) freezes(ctx context.Context, actor Subject, tenant, scopeTy
 // which its authority on each such scope is then read for. They are found by the keys it is bound
 // by (naming), so the tenant's denies of others aren't read, and of those, through
 // rbac_denies_grants, only the denies that list such a power (rbac_changes_grants): a change to
-// members reads them before its transaction and again under its locks, so the denies binding the
-// actor that remove anything else, as root to the tenant's members on each of thousands of
-// resources, cost it nothing.
+// members reads them before its transaction, and again under its locks in the read of the actor's
+// grants (reachAuthority), so the denies binding the actor that remove anything else, as root to
+// the tenant's members on each of thousands of resources, cost it nothing.
 func (a *Authorizer) grantsDenied(ctx context.Context, q DB, tenant string, actor Subject) (map[string]bool, error) {
 	rows, err := q.Query(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`
-		SELECT DISTINCT p FROM rbac_denies d CROSS JOIN LATERAL unnest(d.permissions) AS p
-		WHERE `+naming("d.principals", "ARRAY(SELECT k FROM bound)")+` AND rbac_changes_grants(d.permissions)
-		  AND NOT `+keyed("d.exempt", "SELECT k FROM exempted"),
+		`+grantsDeniedSQL(),
 		tenant, actor.identityKey(), a.cfg.Now())
 	if err != nil {
 		return nil, err
@@ -2608,12 +2602,27 @@ func (a *Authorizer) grantsDenied(ctx context.Context, q DB, tenant string, acto
 	types := map[string]bool{}
 	var p Permission
 	_, err = pgx.ForEachRow(rows, []any{&p}, func() error {
-		if t, verb := p.parts(); verb == "grant" || verb == "*" {
+		if t, ok := grantsOn(p); ok {
 			types[t] = true
 		}
 		return nil
 	})
 	return types, err
+}
+
+// grantsDeniedSQL is SQL selecting, each once, the permissions of the denies in the tenant $1 that
+// list a power to change grants and bind a subject, by the keys keysSQL defines.
+func grantsDeniedSQL() string {
+	return `SELECT DISTINCT p FROM rbac_denies d CROSS JOIN LATERAL unnest(d.permissions) AS p
+		WHERE ` + naming("d.principals", "ARRAY(SELECT k FROM bound)") + ` AND rbac_changes_grants(d.permissions)
+		  AND NOT ` + keyed("d.exempt", "SELECT k FROM exempted")
+}
+
+// grantsOn is the type of scope whose power to change grants p is, as `<type>:grant` or `<type>:*`
+// is, and whether it is one.
+func grantsOn(p Permission) (string, bool) {
+	t, verb := p.parts()
+	return t, verb == "grant" || verb == "*"
 }
 
 // mayReach checks, before ChangeMembers' transaction, that actor may make each change to access a
@@ -2749,7 +2758,7 @@ func (a *Authorizer) mayReach(ctx context.Context, actor Subject, tenant string,
 		}
 		checks = append(checks, c)
 	}
-	au, err := a.reachAuthority(ctx, a.db, actor, nil, checks)
+	au, err := a.reachAuthority(ctx, a.db, actor, tenant, nil, checks, false)
 	if err != nil {
 		return nil, err
 	}
@@ -2789,13 +2798,13 @@ const takingAway = "taking access away here"
 // rather than ask them again, the actor's label values too: by one read of its power over the
 // members and on every scope checks reach (reachAuthority), whose values decide every label, each
 // value once, so the actor held all of it at one moment. A change that takes access away from a
-// member, or may (taking), and passes them is tried again where a deny binding the actor now may
-// remove its power to change grants on scopes of a type none did, as grantsDenied read before it,
-// bound: it read the denies on the paths of none of those scopes.
+// member, or may (taking), and passes them is tried again where a deny binding the actor, in that
+// read, may remove its power to change grants on scopes of a type none did, as grantsDenied read
+// before it, bound: it read the denies on the paths of none of those scopes.
 func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject, tenant string, groups []Resource, checks []*reachCheck,
 	labels *constrained, bound map[string]bool, taking bool,
 ) error {
-	au, err := a.reachAuthority(ctx, tx, actor, groups, checks)
+	au, err := a.reachAuthority(ctx, tx, actor, tenant, groups, checks, taking)
 	if err != nil {
 		return err
 	}
@@ -2829,14 +2838,7 @@ func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject
 			return err
 		}
 	}
-	if !taking {
-		return nil
-	}
-	now, err := a.grantsDenied(ctx, tx, tenant, actor)
-	if err != nil {
-		return err
-	}
-	for t := range now {
+	for t := range au.grantsDenied {
 		if !bound[t] {
 			return fmt.Errorf("%w: a deny binding the actor was set while this change waited; try again", ErrConflict)
 		}
@@ -2845,18 +2847,23 @@ func (a *Authorizer) mayReachAgain(ctx context.Context, tx pgx.Tx, actor Subject
 }
 
 // reachedAuthority is the actor's authority on what a change to members checks, of one read
-// (reachAuthority), and what its label values are decided by, read with it.
+// (reachAuthority), and what its label values are decided by, and the types grantsDenied reads,
+// read with it.
 type reachedAuthority struct {
 	managing, granting, denying, revoking []authority
 	values                                *valuesRead
+	grantsDenied                          map[string]bool
 }
 
-// reachAuthority reads, on q, the actor's authority on each of groups, for its power over their
-// members, and on each scope checks reach, in one read: for the grants a change to members amounts
-// to there, and apart for the denies it lifts, as Apply and SetDeny each read their own, the
-// conditions of the grants it holds spending a budget of its own, and for the denies on its path
-// where a member only loses access and a deny binds the actor.
-func (a *Authorizer) reachAuthority(ctx context.Context, q DB, actor Subject, groups []Resource, checks []*reachCheck) (reachedAuthority, error) {
+// reachAuthority reads, on q, the actor's authority in a tenant on each of groups, for its power
+// over their members, and on each scope checks reach, in one read: for the grants a change to
+// members amounts to there, and apart for the denies it lifts, as Apply and SetDeny each read their
+// own, the conditions of the grants it holds spending a budget of its own, and for the denies on its
+// path where a member only loses access and a deny binds the actor; and where denied, the types of
+// scope a deny binding the actor may stop it changing grants on (authoritiesIn).
+func (a *Authorizer) reachAuthority(ctx context.Context, q DB, actor Subject, tenant string, groups []Resource, checks []*reachCheck,
+	denied bool,
+) (reachedAuthority, error) {
 	on := slices.Clone(groups)
 	var roles []Role
 	for _, c := range checks {
@@ -2870,11 +2877,14 @@ func (a *Authorizer) reachAuthority(ctx context.Context, q DB, actor Subject, gr
 			on = append(on, c.on)
 		}
 	}
-	aus, err := a.authorities(ctx, q, actor, on, roles)
-	if err != nil {
-		return reachedAuthority{}, err
-	}
 	var r reachedAuthority
+	var aus []authority
+	if len(on) > 0 || denied {
+		var err error
+		if aus, r.grantsDenied, err = a.authoritiesIn(ctx, q, actor, tenant, on, roles, denied); err != nil {
+			return reachedAuthority{}, err
+		}
+	}
 	// Every authority of one read shares what its values are decided by (authorities).
 	if len(aus) > 0 {
 		r.values = aus[0].values

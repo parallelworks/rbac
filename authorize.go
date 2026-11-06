@@ -1808,6 +1808,10 @@ type alsoRead struct {
 	values bool
 	// keys are the subject's keys in the tenant, as keysOf reads them.
 	keys bool
+	// grantsDenied is the types of scope whose power to change grants a deny anywhere in the tenant
+	// binding the subject lists, as grantsDenied reads them, so a change decides where one may stop
+	// it by what bound it as it held its grants.
+	grantsDenied bool
 }
 
 // grantsRead is what readHeld reads.
@@ -1815,9 +1819,11 @@ type grantsRead struct {
 	held  []holding
 	ds    []denial
 	roles book
-	// values is set with alsoRead.values, and keys read with alsoRead.keys.
-	values *valuesRead
-	keys   []string
+	// values is set with alsoRead.values, keys read with alsoRead.keys, and grantsDenied with
+	// alsoRead.grantsDenied.
+	values       *valuesRead
+	keys         []string
+	grantsDenied map[string]bool
 	// exempt are, with alsoRead.ending, the denies binding the subject that it is exempt from only
 	// until a time.
 	exempt []exemption
@@ -1902,6 +1908,15 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 	if with.keys {
 		ownKeys = "TRUE"
 	}
+	// With grantsDenied, the powers to change grants the denies binding the subject anywhere in the
+	// tenant list: in the statement's text, so the others plan no read of them.
+	var changes string
+	if with.grantsDenied {
+		got.grantsDenied = map[string]bool{}
+		changes = `
+		UNION ALL
+		SELECT 5, p, '', '', '', NULL, false, NULL, '', NULL, false, false, NULL, '', '', false FROM (` + grantsDeniedSQL() + `) g`
+	}
 	forP := read + ` AND ($5 = '' OR $5 = ANY(permissions) OR $6 = ANY(permissions)) AND EXISTS (SELECT FROM keys WHERE ` + counted("$7", "$8") + `)`
 	// In the statement, so they are of the moment its grants are, as are the denies binding it that
 	// exempt it only until a time, read with when, by the paths to the keys exempting it, in the read
@@ -1931,9 +1946,9 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 	}
 	// A deny's keys are looked up only once it is one the statement reads (bindsIfRead).
 	matched := bindsIfRead(forP+` OR `+values+` AND scope = 'tenant:' || $1`, keyed("principals", "SELECT k FROM bound")+exempt)
-	// Grants, denies, roles and keys in that order; grants by principal, scope, role and id, denies
-	// by id and scope, as deniesOn.
-	const deny, role, end, key = 1, 2, 3, 4
+	// Grants, denies, roles, keys and the powers to change grants denied in that order; grants by
+	// principal, scope, role and id, denies by id and scope, as deniesOn.
+	const deny, role, end, key, changing = 1, 2, 3, 4, 5
 	rows, err := q.Query(ctx, `
 		WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$4")+`, held AS (
 		  SELECT id::text, principal, scope, role, expires_at, conditional, true AS counts FROM rbac_grants
@@ -1953,7 +1968,7 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 		SELECT 2, id, '', '', id, NULL, false, permissions, '', resource_types, privileged, public, grantable_roles, name, description, false
 		FROM `+customRoles+ends+`
 		UNION ALL
-		SELECT 4, k, '', '', '', NULL, false, NULL, '', NULL, false, false, NULL, '', '', false FROM keys WHERE `+ownKeys+`
+		SELECT 4, k, '', '', '', NULL, false, NULL, '', NULL, false, false, NULL, '', '', false FROM keys WHERE `+ownKeys+changes+`
 		ORDER BY 1, 3, 4, 5, 2`,
 		tenant, s.identityKey(), scopes, a.cfg.Now(), perm, wildcard, counts.public, counts.members)
 	if err != nil {
@@ -1997,6 +2012,10 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 			}
 		case key:
 			got.keys = append(got.keys, id)
+		case changing:
+			if t, ok := grantsOn(Permission(id)); ok {
+				got.grantsDenied[t] = true
+			}
 		default:
 			h := holding{Binding: Binding{ID: id, Principal: parsePrincipal(principal), Role: Role(roleID)}, scope: scope, conditional: conditional}
 			if expires != nil {

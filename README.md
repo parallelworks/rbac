@@ -524,10 +524,12 @@ scopes conditional ones reach, to check one by one.
   label, a constraint answered that it may stop the actor on some scope of the type, or a deny
   binding the actor removes `<type>:grant` or `<type>:*`: then the constraints again about each, and
   the denies on all their paths in one read. Which types such a deny names, wherever it is, it reads
-  before its transaction and again under its locks, of the denies naming the actor, its groups, the
-  tenant's members or the public, through an index of those alone that remove a power to change
-  grants, so the others naming them, as of root on each of thousands of resources, cost it nothing;
-  `DeleteGroup` reads them so for the grants on the group it revokes.
+  before its transaction and again under its locks, in the read of its power over the members, so
+  it held that power and escaped such a deny at one moment, of the denies naming the actor, its
+  groups, the tenant's members or the public, through an index of those alone that remove a power
+  to change grants, so the others naming them, as of root on each of thousands of resources, cost
+  it nothing; `DeleteGroup` reads them so, with its power to manage groups, for the grants on the
+  group it revokes.
   `Config.ResourceOf` gives the package the tenant, which `SetGroup` and `DeleteGroup` check
   `rbac.ManageGroups` on, and the groups, which `ChangeMembers` checks `rbac.GroupMembers` on and
   `SetGroup` and `DeleteGroup` the label of, each with its constraints and label, and the

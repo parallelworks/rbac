@@ -1315,25 +1315,37 @@ func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []
 	if len(on) == 0 {
 		return nil, nil
 	}
+	aus, _, err := a.authoritiesIn(ctx, q, actor, on[0].Tenant, on, roles, false)
+	return aus, err
+}
+
+// authoritiesIn is authorities in a tenant, and where denied, the types of scope whose power to
+// change grants a deny anywhere in it binding the actor lists, as grantsDenied reads them, read in
+// the same statement, even for no resource: so a change decides where such a deny may stop it by
+// what bound the actor as it held the power it acts by. Read apart, an actor moving in between from
+// a group giving it that power to one a deny exempts passed both reads, though at no moment did it
+// hold the power and escape the deny.
+func (a *Authorizer) authoritiesIn(ctx context.Context, q DB, actor Subject, tenant string, on []Resource, roles []Role, denied bool,
+) ([]authority, map[string]bool, error) {
 	which := heldTenantRoles
 	if slices.ContainsFunc(roles, isCustom) {
 		which = tenantRoles
 	}
-	tenant, paths, keys := on[0].Tenant, make([][]string, len(on)), map[string]bool{}
+	paths, keys := make([][]string, len(on)), map[string]bool{}
 	for i, r := range on {
 		paths[i] = r.path()
 		for _, k := range paths[i] {
 			keys[k] = true
 		}
 	}
-	got, err := a.readHeld(ctx, q, tenant, actor, all, slices.Sorted(maps.Keys(keys)), "", which, alsoRead{ending: true})
+	got, err := a.readHeld(ctx, q, tenant, actor, all, slices.Sorted(maps.Keys(keys)), "", which, alsoRead{ending: true, grantsDenied: denied})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	held, ds, b := got.held, got.ds, got.roles
 	readingRoles()
 	if err := a.conditionsOf(ctx, q, tenant, held); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	at := make([]int, len(held))
 	for i := range at {
@@ -1379,7 +1391,7 @@ func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []
 		}
 		aus[i].proven = proven[k]
 	}
-	return aus, nil
+	return aus, got.grantsDenied, nil
 }
 
 // onPaths returns, for each of paths, those of xs whose scope is on it, in the order of xs, as a
