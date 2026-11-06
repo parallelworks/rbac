@@ -630,14 +630,16 @@ func (c *converter) json(v reflect.Value) (ref.Val, int) {
 // reads as U+FFFD, could hold two names read as one. Each reader of JSON picks one of two values of
 // a name as it likes, encoding/json the last, so a host checking the first read "user" of
 // `{"role": "user", "role": "admin"}` where a condition read "admin", as a map of the host's holding
-// two keys read as one would have it. The decoder refuses text nested more than 10,000 deep, as
-// encoding/json does, so jsonValue recurses no deeper.
+// two keys read as one would have it. Text nested deeper than maxNested is refused, as
+// encoding/json refuses it, so jsonValue recurses no deeper: built without jsonv2
+// (GOEXPERIMENT=nojsonv2), the decoder counts no depth of the brackets and braces Token returns, so
+// objects nested 79,000 deep were parsed, taking 70 ms and 48 MB, where json.Unmarshal refused them.
 func parseJSON(text []byte) (any, bool) {
 	if !utf8.Valid(text) || !pairedSurrogates(text) {
 		return nil, false
 	}
 	dec := json.NewDecoder(bytes.NewReader(text))
-	v, err := jsonValue(dec)
+	v, err := jsonValue(dec, 0)
 	if err != nil {
 		return nil, false
 	}
@@ -649,9 +651,9 @@ func parseJSON(text []byte) (any, bool) {
 
 var errJSON = errors.New("rbac: JSON text no condition can read")
 
-// jsonValue is the next value dec reads, as encoding/json parses it into an any, or why no condition
-// can read it (parseJSON).
-func jsonValue(dec *json.Decoder) (any, error) {
+// jsonValue is the next value dec reads, inside depth lists and objects, as encoding/json parses it
+// into an any, or why no condition can read it (parseJSON).
+func jsonValue(dec *json.Decoder, depth int) (any, error) {
 	token, err := dec.Token()
 	if err != nil {
 		return nil, err
@@ -660,11 +662,14 @@ func jsonValue(dec *json.Decoder) (any, error) {
 	if !ok {
 		return token, nil
 	}
+	if depth++; depth > maxNested {
+		return nil, errJSON
+	}
 	switch delim {
 	case '[':
 		list := []any{}
 		for dec.More() {
-			v, err := jsonValue(dec)
+			v, err := jsonValue(dec, depth)
 			if err != nil {
 				return nil, err
 			}
@@ -683,7 +688,7 @@ func jsonValue(dec *json.Decoder) (any, error) {
 			if _, twice := object[name]; twice {
 				return nil, errJSON
 			}
-			if object[name], err = jsonValue(dec); err != nil {
+			if object[name], err = jsonValue(dec, depth); err != nil {
 				return nil, err
 			}
 		}

@@ -1556,6 +1556,31 @@ func TestJSONTextOrAPackedMessageHoldingAKeyTwiceFailsItsConditions(t *testing.T
 	}
 }
 
+// JSON text nested deeper than encoding/json parses, 10,000 deep, fails its kind's conditions, and is
+// parsed no deeper: built without jsonv2 (GOEXPERIMENT=nojsonv2), encoding/json's decoder counts no
+// depth of the brackets and braces it returns as tokens, so objects nested 79,000 deep were parsed
+// whole, allocating 48 MB, and lists 159,000 deep 20 MB, where json.Unmarshal refused either at
+// once. Text a little less deep is read.
+func TestJSONTextNestedPastWhatEncodingJSONParsesIsParsedNoDeeper(t *testing.T) {
+	nested := func(opening, inner, closing string, n int) json.RawMessage {
+		return json.RawMessage(strings.Repeat(opening, n) + inner + strings.Repeat(closing, n))
+	}
+	for name, text := range map[string]json.RawMessage{
+		"lists just past it": nested("[", "", "]", 10_001), "lists": nested("[", "", "]", 159_000),
+		"objects": nested(`{"a":`, "1", "}", 79_000),
+	} {
+		if _, evaluated, _, err := rbac.EvaluateCondition(t, `request.attributes.ok == true`, map[string]any{"ok": true, "j": text}); err != nil || evaluated {
+			t.Errorf("an attribute beside JSON text of %s nested deep: evaluated %t, %v", name, evaluated, err)
+		}
+		if allocated, _ := rbac.Converting(t, map[string]any{"j": text}); allocated > 12<<20 {
+			t.Errorf("converting JSON text of %s nested deep allocated %d MB", name, allocated>>20)
+		}
+	}
+	if held, _, _, err := rbac.EvaluateCondition(t, `size(request.attributes.j) == 1`, map[string]any{"j": nested("[", "", "]", 9_998)}); err != nil || !held {
+		t.Errorf("JSON text of lists nested 9,998 deep: held %t, %v", held, err)
+	}
+}
+
 // Attributes no condition reads are each one value, whichever kind's they are, so a condition
 // hashing them, as a map literal keyed by them or `in` a map, read the subject's and the request's
 // as one where both were, as every kind's are past what a check converts: there,
