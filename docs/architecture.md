@@ -412,21 +412,27 @@ sequenceDiagram
   does for each permission and a labeled check for each value its label asks for: copied for each
   ask, `Permissions` of 300 permissions on a resource of 20,000 tags took a second. A hook writing
   to its copy reads its write when the call asks it again, and nothing decided or asked of another
-  hook does. A copy holds no more than a check converts (`maxConverted`), counted alike, one for
-  each value, a string too, and a tenth of each other byte copied whole, so it counts no more than
-  converting the same does: past it the hook can't be asked, and the call is refused (`uncopied`)
-  as any other, a `DeniedError` of the permission on the resource asked about, or the tenant, whose
-  `Reason` names the hook and whose message only the permission. Counting a list's elements
-  twice, a string by the bytes of its header, or a
-  protobuf `Value` and its field apart, attributes a check converts couldn't be copied. A slice
-  reached at several lengths is copied once from where it starts, each length a slice of the copy,
-  and one reached while its elements are copied, before a longer length outgrew that copy, a slice
-  of its own, whose elements are copied too, as set in the longer alone it held the host's. A value
-  holding no map, slice or pointer that an interface holds, as an array, is shared, as nothing
-  writes to it through the interface. A call keeps what the host passed with each copy until it
-  returns, so where it points is no other value's meanwhile: known only by where it points, a value
-  dropped and collected during the call would leave its place to one made after, which would be
-  given the first one's copy.
+  hook does. A copy holds no more than a check converts (`maxConverted`), counted as converting
+  counts it, each value, map, list, pointer and message what converting it costs (`mapCost`),
+  whatever the copy shares or moves whole, so it counts what converting the same does, but for what
+  JSON text and packed messages decode to, which it holds as bytes, and for a message, or a longer
+  length of a slice, reached twice, which it copies once where converting counts it again: past it
+  the hook can't be asked, and the call is refused (`uncopied`) as any other, a `DeniedError` of the
+  permission on the resource asked about, or the tenant, whose `Reason` names the hook and whose
+  message only the permission. Counting a list's elements twice, a string by the bytes of its
+  header, a protobuf `Value` and its field apart, or a message a pointer reaches for the pointer and
+  again for the message, attributes a check converts couldn't be copied, as a resource's nearly
+  40,000 timestamps, which a check converts. A copy keeps each slice it copies apart from the maps,
+  pointers and messages, changing it where it is kept as its elements are copied (`copied`), as five
+  lookups of it for each element cost about what copying the element did. A slice reached at several
+  lengths is copied once from where it starts, each length a slice of the copy, and one reached
+  while its elements are copied, before a longer length outgrew that copy, a slice of its own, whose
+  elements are copied too, as set in the longer alone it held the host's. A value holding no map,
+  slice or pointer that an interface holds, as an array, is shared, as nothing writes to it through
+  the interface. A call keeps what the host passed with each copy until it returns, so where it
+  points is no other value's meanwhile: known only by where it points, a value dropped and collected
+  during the call would leave its place to one made after, which would be given the first one's
+  copy.
 - **Conditions** are CEL over `subject`, `resource`, `request` and `action`, typed by
   `Config.Attributes`. Each is compiled once, bounded in cost, and fails closed: a condition that
   errors gives nothing, and a deny's that errors denies. A check converts what the host passes into
@@ -447,23 +453,48 @@ sequenceDiagram
   map that no condition could read left every operator to tell it from the rest, and `in`, `has()`
   and loops over a map's keys each found its key; whole-kind failure leaves no such value for an
   operator to meet. The kinds that can't be read are each the one value `unreadable`, so whatever
-  hashes or compares it fails too: a key (`comparableKey`), and a comparison or `in` reading it
-  whole, however deep in a list or a map (`measured`); hashed, a map literal keyed by two kinds past
-  `maxConverted` held one entry, and `request.attributes in {subject.attributes: true}` held. A
-  list holding it a map hashes as the list, wherever it is, so a key of one tells nothing of it.
+  hashes or compares it fails too: a key (`comparableKey`), a comparison or `in` (`measured`), and a
+  list or map literal holding it (`literal`), and the `subject`, `resource` and `request` holding it
+  are read as it is, by their fields' names alone (`variable`), as a kind declarations refuse in
+  part is, so no list or map an operator meets holds it; hashed, a map literal keyed by two kinds
+  past `maxConverted` held one entry, and `request.attributes in {subject.attributes: true}` held.
+  Built, a list holding it was decided by its size or by another value it held, as comparing reads
+  the smaller value whole and no further, so `[subject.attributes] != []` held, and
+  `[subject.attributes, 1] == [{}, 2]` failed for a kind that can't be read but was false for one
+  refused in part, as that is larger; finding it there would read the larger value whole. A map
+  literal naming a key twice fails whatever it holds, as CEL builds it holding the value named last
+  and drops the one before unread, so `{"a": subject.attributes, "a": 1}.a == 1` held where
+  `{"a": 1, "a": subject.attributes}.a == 1` failed. A double that isn't finite is kept out of
+  lists and maps alike: a literal holding one fails as it is built, and an attribute holding one,
+  however deep, which the converter counts (`infinite`), is an error that a declared kind refuses
+  in part (`declared`), as a declared double that isn't finite is, and that makes a kind no
+  declarations cover `unreadable`, as a value of another type does: no declarations name what its
+  conditions read, and refused by name alone, a deny's
+  `request.attributes.region == "eu" && request.attributes.risk > 0.5` lifted outside the EU for an
+  infinite float64 risk, and applied for the same infinity as JSON text, `1e400`. So comparing
+  fails where either operand is one, and no further search is needed; found only where comparing
+  read it, it failed where the smaller value held one, and `[0.0 / 0.0, "<long>"] != [1, 2]` held.
   Depth is decided by heights kept with each converted value, so it doesn't
   turn on map order or on which kind reached a shared value first, and each kind is converted, and
   charged, whole, whatever it holds, but where it nests past `maxNested`: converting stops there, so
   what it is charged, and whether the kinds after it fit `maxConverted`, can turn on map order,
-  failing closed. Nothing else does, nor on the order of the kinds: JSON text that may hold more
-  values than `maxConverted`, by its brackets, braces, commas and colons, fails them all unparsed,
-  where compared with what was left, it failed them where what came before it left less than it may
-  hold, though what it holds fit, as `[]` holds less than its brackets count. A value reached twice
+  failing closed. Nothing else does, nor on the order of the kinds: JSON text whose values may cost
+  more than `maxConverted`, by its brackets, braces, commas and colons, each bracket and brace what
+  building a list or an object costs (`jsonValues`), fails them all unparsed, where compared with
+  what was left, it failed them where what came before it left less than it may hold, though what it
+  holds fit, as `[]` holds less than its brackets count. A value reached twice
   is converted once, but for a resource's sharing it with the subject's or the request's (below),
   and converting costs a check at most `maxConverted`, counted as `valueSize` counts what a
-  condition reads, about what a check may spend on a scope's grants' conditions, past which every
-  condition reading an attribute fails: converting isn't charged to a condition, and charging the
-  check would let what one condition reads fail the others. The subject's and the request's
+  condition reads, but each map, `Struct` or JSON object 8, and each list, `ListValue` or JSON
+  array, pointer, but to a message, and other message 4 (`mapCost`), as building each takes several
+  times what converting a number does: charged one, 160,000 empty maps took 93 ms to convert, where
+  as many ints took 12 ms. So weighed, a unit took 20 to 115 ns to convert and 25 to 200 ns to copy
+  for a hook, whatever held it, where reading one in a condition takes 70 to 145 ns, and a check
+  converts in about 20 ms at most what it may spend on a scope's grants' conditions, past which
+  every condition reading an attribute fails: converting isn't charged to a condition, and charging
+  the check would let what one condition reads fail the others. A message the host passes is known
+  by its type among those conditions read (`wellKnown`), as finding it one by reflection's
+  `Implements` took five times what converting a number does. The subject's and the request's
   attributes are converted once for a call, by one converter (`askingOf`), as a change checks them
   on each scope it reaches, before its transaction and in it, and each check converts its resource's
   apart, on a converter spending what that one left (`rest`): so each check counts all three, in the
@@ -479,20 +510,20 @@ sequenceDiagram
   request holding a map of 40,000 entries, took 6 seconds. The
   subject's, the resource's and the request's attributes share the bound, so ones users write, as a
   resource's tags, can fail the conditions of every check of the resource, closed.
-  So conditions run on CEL's own values alone, by CEL's own semantics, and a
-  comparison that fails where either value holds a double that isn't finite sees every double there
-  is. Each runs within the most evaluating it can cost, which its literals and types bound, and the
-  ids, kinds, types and tenant a check passes and its action, which are no longer than `MaxID`. CEL
-  charges some of what a condition does a constant or nothing, so the package charges it itself: a
-  list or map literal for each element or entry it builds, and a loop's step for each logical
-  operator and choice it may evaluate, on top of what CEL charges, a key a condition computes by its
+  So conditions run on CEL's own values alone, by CEL's own semantics, and a comparison that fails
+  where either value is a double that isn't finite sees every such double there is. Each runs within
+  the most evaluating it can cost, which its literals and types bound, and the ids, kinds, types and
+  tenant a check passes and its action, which are no longer than `MaxID`. CEL charges some of what a
+  condition does a constant or nothing, so the package charges it itself: a list or map literal for
+  each element or entry it builds, and a loop's step for each logical operator and choice it may
+  evaluate, on top of what CEL charges, a key a condition computes by its
   length, and `contains`, `startsWith` and `endsWith` by the strings they read, at least 1 however
   empty either is. A comparison is charged as it measures the values (`measured`), once, reading
-  both in step until the smaller is read whole and finding a double that isn't finite in the same
-  walk, before it runs: measured again at each doubling of how far it read, again for that search
-  and again for CEL's charge, comparing JSON nested 3,300 deep took twenty times what it was
-  charged. Reading a time in a zone loads the zone once for the process (`zones`), bounded at
-  `maxZones`, and finds a name names none once, the zone a literal names when the condition is
+  both in step until the smaller is read whole, before it runs: measured again at each doubling of
+  how far it read, again in search of a double that isn't finite and again for CEL's charge,
+  comparing JSON nested 3,300 deep took twenty times what it was charged. Reading a time in a zone
+  loads the zone once for the process (`zones`), bounded at `maxZones`, and finds a name names none
+  once, the zone a literal names when the condition is
   planned, and one an attribute names the first time a time is read in it, which each read is
   charged `zoneLoad` more for, before it loads, whether or not the process has loaded it: charged
   only where it hadn't, a check decided by what the process loaded before, refused the first time
