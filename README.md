@@ -793,22 +793,32 @@ rights of whoever reads them, so a session that sets those itself reads through 
 it may read of history, and outside a read they read nothing, or fail, never the tables. A statement
 of the read that leaves the search_path, the role, or one of those settings, set otherwise, or
 another session revoking the role's `USAGE` on the views' schema, which the search_path then leaves
-out, would read another tenant or time, or the tables as they are now, so `AsOf` fails once its read
-returns where one did: what the read answered stands only where `AsOf` returns nil. One made and
-undone within the read it can't tell, and the package's statements run between the two read by it: a
-call the read makes meanwhile, and those of a call after a hook of it that made it. So set them, or
-the role, in a read or a hook only within a savepoint rolled back before the package's next
-statement. The search_path it reads by names the views' schema, then `pg_temp`, then the session's,
-as one that doesn't name `pg_temp` reads a session's own tables first, so it refuses one that names
-`pg_temp` after the package's schema, as it would read them the other way round, and one that names
-it first, which makes the session's temporary schema the current one. A function, operator or type
-in the views' schema is found before the package's, and runs as whoever reads, so `AsOf` refuses
-that schema where it holds more than its owner's views, another role may create in it, or it isn't
-the role's that owns the package's tables, as a grant, an extension installed there or a change of
-owner since migrating can make it. `AsOf` takes a time from 4714 BC, the earliest PostgreSQL holds,
-to 9999-12-30, the last the package stores, each to the microsecond, rounded down, as pgx sends it:
-in 64 bits of microseconds from 2000, which a time past year 294,000 or so wraps, so the database
-would read it as another, or refuse it.
+out, or dropping one of the views, would read another tenant or time, or the tables as they are now,
+so `AsOf` fails once its read returns where one did: what the read answered stands only where `AsOf`
+returns nil. One made and undone within the read it can't tell, and the package's statements run
+between the two read by it: a call the read makes meanwhile, and those of a call after a hook of it
+that made it. So set them, or the role, in a read or a hook only within a savepoint rolled back
+before the package's next statement. The search_path it reads by names the views' schema, then
+`pg_temp`, then the session's, as one that doesn't name `pg_temp` reads a session's own tables
+first, so it refuses one that names `pg_temp` after the package's schema, as it would read them the
+other way round, and one that names it first, which makes the session's temporary schema the current
+one. A function, operator or type in the views' schema is found before the package's, and runs as
+whoever reads, so `AsOf` refuses that schema where it holds more than its owner's views, another
+role may create in it, or it isn't the role's that owns the package's tables, as a grant, an
+extension installed there or a change of owner since migrating can make it. A statement looks each
+name up by the catalog as it is then, whatever its transaction's snapshot, so what is made there as
+a read runs is called by the read's next statement: `AsOf` checks the schema again once its read
+returns, and fails where it has come to be so, on its own transaction once that has rolled back, as
+a query of the catalog at its REPEATABLE READ reads the snapshot it began with. What was made there
+and dropped again as the read ran it can't tell, which only a role that may create there can make:
+its owner, which is the application's role where that role migrated, rather than the administrator's
+role below, a member of it, a superuser, or one either lets. Under `WithTx` in a host's transaction
+at REPEATABLE READ or SERIALIZABLE, whose queries read the catalog as of its first statement, both
+checks read past what was made there since, or another role let create there: where that matters,
+read on a pool's `Authorizer`, or under `WithTx` at READ COMMITTED. `AsOf` takes a time from 4714
+BC, the earliest PostgreSQL holds, to 9999-12-30, the last the package stores, each to the
+microsecond, rounded down, as pgx sends it: in 64 bits of microseconds from 2000, which a time past
+year 294,000 or so wraps, so the database would read it as another, or refuse it.
 A statement reads the history of the rows it names, as a check
 does its subject's grants, groups and the denies on its resource's path, a search its subject's
 grants, and the public's and the members' it counts, on each type it lists, and the custom roles
@@ -1148,9 +1158,10 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   there but to a temporary table fails with SQLSTATE 25006 rather than roll back with the read, and
   one that leaves the search_path, the role, `rbac.as_of`, `rbac.as_of_tenant` or
   `rbac.as_of_cluster` set otherwise fails `AsOf` as `rbac.ErrInvalid` once its read returns, as
-  does the views' schema holding more than the views, or another role being able to create there.
-  Drop the views' schema with the package's: dropping the package's drops the views, which read its
-  history, but not their schema.
+  does the views' schema holding more than the views, or another role being able to create there,
+  when the read begins or as it ends, or one of the views dropped as it ran. Drop the views' schema
+  with the package's: dropping the package's drops the views, which read its history, but not their
+  schema.
   Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
   rolling upgrade across the two is unsafe: they key every lock apart, so a change by one waits for
   none by the other, and what each checks under its locks can change before it commits, as two

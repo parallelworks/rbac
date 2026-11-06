@@ -3401,6 +3401,87 @@ func TestAsOfRefusesAViewsSchemaOthersCanMakeObjectsIn(t *testing.T) {
 	}
 }
 
+// A statement looks a name up by the catalog as it is, at any isolation, not by its transaction's
+// snapshot, so what another session makes in the views' schema, or drops from it, as AsOf reads
+// takes effect at the read's next statement: a function made there in place of rbac_group_members
+// is called, and a table whose view is dropped is read as it is now. AsOf fails once read returns,
+// whether it reads on a transaction of its own, which is REPEATABLE READ, so that a query of the
+// catalog in it reads past what was made since, or under WithTx at READ COMMITTED or REPEATABLE
+// READ.
+func TestAsOfFailsWhereItsViewsSchemaChangesAsItReads(t *testing.T) {
+	h := setup(t)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	h.groups(t, "ops")
+	u := h.as(t, "u")
+	h.as(t, "planted")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "ops"), grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	at := dbNow(t, h)
+	if err := h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "u")}); err != nil {
+		t.Fatal(err)
+	}
+	views := viewsOf(t, h)
+	exec := func(sql string) error {
+		_, err := h.pool.Exec(ctx, sql)
+		return err
+	}
+	planted := func(a *rbac.Authorizer) (bool, error) {
+		if err := exec(`CREATE FUNCTION ` + views + `.rbac_group_members(tenant text, groups text[], at timestamptz, principals text[], standing boolean)
+			RETURNS TABLE (group_id text, principal text, guest boolean) LANGUAGE sql AS $$ SELECT 'ops', 'user:planted', false $$`); err != nil {
+			return false, err
+		}
+		hs, err := a.Holders(ctx, login, cluster)
+		return slices.Contains(holderPrincipals(hs), identity("planted")), err
+	}
+	// As of then, u held login itself, which it no longer does.
+	dropped := func(a *rbac.Authorizer) (bool, error) {
+		if err := exec(`DROP VIEW ` + views + `.rbac_grants`); err != nil {
+			return false, err
+		}
+		err := a.Authorize(ctx, u, login, cluster)
+		return errors.Is(err, rbac.ErrDenied), nil
+	}
+	for _, c := range []struct {
+		what   string
+		on     pgx.TxIsoLevel
+		during func(*rbac.Authorizer) (bool, error)
+	}{
+		{"a function made in place of rbac_group_members, on its own transaction", "", planted},
+		{"a function made in place of rbac_group_members, under a host's transaction at READ COMMITTED", pgx.ReadCommitted, planted},
+		{"rbac_grants's view dropped, under a host's transaction at REPEATABLE READ", pgx.RepeatableRead, dropped},
+	} {
+		t.Run(c.what, func(t *testing.T) {
+			t.Cleanup(func() {
+				for _, sql := range []string{`DROP FUNCTION IF EXISTS ` + views + `.rbac_group_members`, `SELECT rbac_as_of_views()`} {
+					if _, err := h.pool.Exec(context.WithoutCancel(ctx), sql); err != nil {
+						t.Errorf("%s: %v", sql, err)
+					}
+				}
+			})
+			changed := false
+			read := func(a *rbac.Authorizer) error {
+				var err error
+				changed, err = c.during(a)
+				return err
+			}
+			var err error
+			if c.on == "" {
+				err = h.authz.AsOf(ctx, "t1", at, read)
+			} else {
+				err = pgx.BeginTxFunc(ctx, h.pool, pgx.TxOptions{IsoLevel: c.on}, func(tx pgx.Tx) error {
+					return h.authz.WithTx(tx).AsOf(ctx, "t1", at, read)
+				})
+			}
+			if !changed {
+				t.Errorf("a read with %s read as before: %v", c.what, err)
+			}
+			if !errors.Is(err, rbac.ErrInvalid) {
+				t.Errorf("a read with %s: %v", c.what, err)
+			}
+		})
+	}
+}
+
 // AsOf's views stand in for the package's tables only while the role reading has USAGE on their
 // schema, which a search_path leaves out otherwise, reading the tables as they are now: a read
 // during which another session revokes it, or that leaves the session's role one without it, as a

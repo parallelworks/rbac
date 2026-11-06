@@ -1267,8 +1267,8 @@ flowchart LR
   caller's search_path, read the tables by name as they were. It makes no object and takes no
   transaction id, so the role reading needs no `TEMPORARY`, and the read holds no export back but
   where a statement in it writes a session's temporary table, which READ ONLY lets through; and it
-  reads on a hot standby too, as of what the standby has replayed. Each view reads the tenant, the time
-  and the cluster from settings of the transaction (`rbac.as_of_tenant`, `rbac.as_of`,
+  reads on a hot standby too, as of what the standby has replayed. Each view reads the tenant, the
+  time and the cluster from settings of the transaction (`rbac.as_of_tenant`, `rbac.as_of`,
   `rbac.as_of_cluster`), with the reader's rights (`security_invoker`), so a session that sets them
   itself reads through the views only the history it may read anyway, as row security policies on
   history apply to it, and unset, outside a read, they read nothing or fail, never the tables. The
@@ -1287,15 +1287,21 @@ flowchart LR
   after the package's schema, as it reads the session's own tables after its views and before the
   session's schemas, as a search_path that doesn't name it does. A statement of the read that leaves
   the search_path, the role or those settings set otherwise, or another session revoking the role's
-  `USAGE` on the views' schema, would read another tenant or time, or the tables as they are now, so
-  AsOf fails once read returns where one did, by the settings and the current schema; one made and
-  undone within the read it can't tell, and the package's statements between the two read by it.
-  Each read drops the session's plans (`DISCARD PLANS`), under `WithTx` the host's too: with the
-  search_path alike in every read, a generic plan a host forced in an earlier one, made for its time
-  and tenant, would stand. Every statement is planned for its arguments and runs without JIT, which
-  such plans over history cost past `jit_above_cost` for any subject. It takes a time from
-  PostgreSQL's earliest to 9999-12-30, to the microsecond, rounded down, as pgx sends it, and a
-  later one as another.
+  `USAGE` on the views' schema or dropping one of the views, would read another tenant or time, or
+  the tables as they are now, so AsOf fails once read returns where one did, by the settings, the
+  current schema and the view each table's name finds; one made and undone within the read it can't
+  tell, and the package's statements between the two read by it. A statement looks a name up by the
+  catalog as it is, whatever its transaction's snapshot, so AsOf checks the views' schema again once
+  read returns: in the savepoint under `WithTx`, and on its own transaction once that has rolled
+  back, as a query of the catalog at its REPEATABLE READ reads the snapshot it began with. What was
+  made there and dropped again as the read ran it can't tell, nor, under `WithTx` at REPEATABLE READ
+  or SERIALIZABLE, what was made there since the host's transaction took its snapshot. Each read
+  drops the session's plans (`DISCARD PLANS`), under `WithTx` the host's too: with the search_path
+  alike in every read, a generic plan a host forced in an earlier one, made for its time and tenant,
+  would stand. Every statement is planned for its arguments and runs without JIT, which such plans
+  over history cost past `jit_above_cost` for any subject. It takes a time from PostgreSQL's
+  earliest to 9999-12-30, to the microsecond, rounded down, as pgx sends it, and a later one as
+  another.
   Each statement reads history by the rows it names, through
   history's indexes, as a search the custom roles its grants name, by their ids, and its principals'
   grants by principal and type, which history's index of a principal's versions holds beside the
