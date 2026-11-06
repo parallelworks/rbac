@@ -1217,17 +1217,19 @@ func TestAsOfListsAPrincipalsMembershipsAloneWhateverTheSessionsPlans(t *testing
 }
 
 // leastPages is the fewest pages of history tx's session reads in a run of f, once two runs have
-// read that few, or the fewest of ten. A session plans a statement it cached again once it takes an
-// invalidation of what the plan reads, which other sessions' catalog changes on a shared server can
-// send it at any moment, and several runs in a row, and planning reads the metapage of each empty
-// index of history, as those of prunes before any, for each time a statement names it: a run
-// planned again so read some 2,000 pages where the one before and after it read 376, and three in
-// a row did, with views made for each read or made by migrating alike. A run that isn't planned
-// again reads as many pages each time.
+// read that few and three have run, or the fewest of ten. A session plans a statement it cached
+// again once it takes an invalidation of what the plan reads, which other sessions' catalog changes
+// on a shared server can send it at any moment, and several runs in a row, and planning reads the
+// metapage of each empty index of history, as those of prunes before any, for each time a
+// statement names it: a run planned again so read some 2,000 pages where the one before and after
+// it read 376, and three in a row did, with views made for each read or made by migrating alike.
+// Two runs planned again in a row, each planning the same statements, read alike, so the first two
+// agreeing doesn't end it. A run that isn't planned again reads as many pages each time, and none
+// reads fewer, so a statement that reads more on every run reads more here too.
 func leastPages(ctx context.Context, t *testing.T, tx pgx.Tx, f func() error) (int64, error) {
 	t.Helper()
 	least, seen := int64(-1), 0
-	for range 10 {
+	for run := 1; run <= 10; run++ {
 		start := historyPages(ctx, t, tx)
 		if err := f(); err != nil {
 			return 0, err
@@ -1238,7 +1240,7 @@ func leastPages(ctx context.Context, t *testing.T, tx pgx.Tx, f func() error) (i
 		case n == least:
 			seen++
 		}
-		if seen == 2 {
+		if seen >= 2 && run >= 3 {
 			break
 		}
 	}
