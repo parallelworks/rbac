@@ -1611,6 +1611,12 @@ func TestAttributesNoConditionReadsFailWhereverAConditionHashesOrComparesThem(t 
 			{`{"a": request.attributes, "b": 1} != {"a": subject.attributes, "b": 2}`, true},
 			{`1 in [request.attributes, 1]`, true},
 			{`{dyn([request.attributes]): 1}.exists(k, k[0] in {"risk": 1})`, true},
+			{`size({dyn(request.attributes): 1, dyn(subject.attributes): 2}) == 1`, true},
+			{`size({"n": {request.attributes: 1, subject.attributes: 2}}["n"]) == 1`, true},
+			{`(true ? request.attributes : {}) in {(true ? subject.attributes : {}): 1}`, true},
+			{`[request.attributes, subject.attributes].map(x, {x: 1}).exists(m, subject.attributes in m)`, true},
+			{`[request.attributes, subject.attributes].exists_one(x, x in {subject.attributes: 1})`, true},
+			{`request.attributes in [subject.attributes] || {} in [request.attributes]`, true},
 			{`{"risk": 1}[request.attributes] == 1`, false},
 			{`dyn({"risk": 1})[dyn(request.attributes)] == 1`, false},
 		} {
