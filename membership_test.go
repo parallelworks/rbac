@@ -3096,6 +3096,226 @@ func TestHoldersReadNestedAndEndedMemberships(t *testing.T) {
 	}
 }
 
+// Holders, Members and GroupsOf read a tenant's own groups and memberships, in every plan and as of
+// a time, where another tenant names its groups alike and holds the same identities otherwise: one
+// suspended there is a member here, and ones members there are here a guest, suspended, ended, gone
+// though still in the group, or in the other tenant's group of the same id alone.
+func TestHoldersAndMembersReadEachTenantsOwnGroupsAndMemberships(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	ending := h.now.Add(time.Hour)
+	for tenant, ms := range map[string][]rbac.Membership{
+		"t1": {
+			{Principal: identity("a")},
+			{Principal: identity("b"), Guest: true},
+			{Principal: identity("c"), Suspended: true},
+			{Principal: identity("d"), ExpiresAt: ending},
+			{Principal: identity("f")},
+			{Principal: identity("i")},
+			{Principal: identity("j")},
+		},
+		"t2": {
+			{Principal: identity("a"), Suspended: true},
+			{Principal: identity("c")},
+			{Principal: identity("d")},
+			{Principal: identity("e")},
+			{Principal: identity("f")},
+			{Principal: identity("j")},
+		},
+	} {
+		if err := h.authz.SetMemberships(ctx, host, tenant, ms); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.authz.ImportGroups(ctx, host, tenant, []rbac.GroupDefinition{{ID: "g"}, {ID: "inner"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for tenant, ms := range map[string][]rbac.Member{
+		"t1": {
+			{Group: "g", Principal: identity("a")},
+			{Group: "g", Principal: identity("b")},
+			{Group: "g", Principal: identity("c")},
+			{Group: "g", Principal: identity("d")},
+			{Group: "g", Principal: identity("f")},
+			{Group: "g", Principal: groupOf("inner")},
+			{Group: "inner", Principal: identity("i")},
+		},
+		"t2": {
+			{Group: "g", Principal: identity("a")},
+			{Group: "g", Principal: identity("c")},
+			{Group: "g", Principal: identity("d")},
+			{Group: "g", Principal: identity("e")},
+			{Group: "g", Principal: groupOf("inner")},
+			{Group: "inner", Principal: identity("j")},
+		},
+	} {
+		if err := h.authz.ImportMembers(ctx, host, tenant, ms); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// f's membership of t1 is gone, as a write around the package leaves its place in g; d's ends.
+	if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_memberships WHERE tenant = 't1' AND principal = 'user:f'`); err != nil {
+		t.Fatal(err)
+	}
+	h.now = ending.Add(time.Hour)
+	on := map[string]rbac.Resource{"t1": cluster, "t2": {Tenant: "t2", Type: "cluster", ID: cluster.ID}}
+	for tenant, r := range on {
+		if err := h.authz.Import(ctx, host, tenant, []rbac.Grant{grant(r.Scope(), "cluster.login", rbac.Group, "g")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	type want struct {
+		holders  []string
+		members  map[string][]rbac.Principal
+		groupsOf map[string][]string
+	}
+	wants := map[string]want{
+		"t1": {
+			holders:  []string{"a", "b", "i"},
+			members:  map[string][]rbac.Principal{"g": {groupOf("inner"), identity("a"), identity("b"), identity("c")}, "inner": {identity("i")}},
+			groupsOf: map[string][]string{"a": {"g"}, "b": {"g"}, "c": {"g"}, "d": nil, "e": nil, "f": nil, "i": {"g", "inner"}, "j": nil},
+		},
+		"t2": {
+			holders:  []string{"c", "d", "e", "j"},
+			members:  map[string][]rbac.Principal{"g": {groupOf("inner"), identity("a"), identity("c"), identity("d"), identity("e")}, "inner": {identity("j")}},
+			groupsOf: map[string][]string{"a": {"g"}, "c": {"g"}, "d": {"g"}, "e": {"g"}, "f": nil, "i": nil, "j": {"g", "inner"}},
+		},
+	}
+	check := func(t *testing.T, a *rbac.Authorizer, tenant string) {
+		t.Helper()
+		w := wants[tenant]
+		holders, err := a.Holders(ctx, login, on[tenant])
+		if err != nil {
+			t.Fatal(err)
+		}
+		var listed []string
+		for _, holder := range holders {
+			listed = append(listed, holder.Principal.ID)
+			if !slices.Equal(holder.Groups, []string{"g"}) {
+				t.Errorf("Holders in %s lists %s through %v", tenant, holder.Principal.ID, holder.Groups)
+			}
+		}
+		if !slices.Equal(listed, w.holders) {
+			t.Errorf("Holders in %s = %v, want %v", tenant, listed, w.holders)
+		}
+		for group, want := range w.members {
+			members, err := a.Members(ctx, tenant, group)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []rbac.Principal
+			for _, m := range members {
+				got = append(got, m.Principal)
+			}
+			if !slices.Equal(got, want) {
+				t.Errorf("Members(%s, %s) = %v, want %v", tenant, group, got, want)
+			}
+		}
+		for id, want := range w.groupsOf {
+			if got, err := a.GroupsOf(ctx, tenant, identity(id)); err != nil || !slices.Equal(got, want) {
+				t.Errorf("GroupsOf(%s, %s) = %v, %v, want %v", tenant, id, got, err, want)
+			}
+		}
+	}
+	for tenant, w := range wants {
+		for id := range w.groupsOf {
+			if allowed(t, h, rbac.Subject{Principal: identity(id)}, login, on[tenant]) != slices.Contains(w.holders, id) {
+				t.Errorf("Authorize in %s doesn't agree with Holders %v for %s", tenant, w.holders, id)
+			}
+		}
+	}
+	at := dbNow(t, h)
+	for _, mode := range []string{"", "force_custom_plan", "force_generic_plan"} {
+		t.Run("plan_cache_mode="+mode, func(t *testing.T) {
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			if mode != "" {
+				if _, err := tx.Exec(ctx, `SELECT set_config('plan_cache_mode', $1, true)`, mode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// From the sixth run a connection's statement can take a generic plan.
+			for range 6 {
+				for tenant := range wants {
+					check(t, h.authz.WithTx(tx), tenant)
+				}
+			}
+		})
+	}
+	t.Run("as of a time", func(t *testing.T) {
+		for tenant := range wants {
+			if err := h.authz.AsOf(ctx, tenant, at, func(a *rbac.Authorizer) error {
+				check(t, a, tenant)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+}
+
+// rbac_group_members, which Holders of this release and the one before call, reads a group's members
+// and then their memberships in two statements, both in the calling statement's snapshot, as it is
+// stable: a change that commits between them, holding the memberships while the first reads, is read
+// by neither. Volatile, the second read it, and the group of one, whose member the change suspended
+// as it added another, had no member standing: neither what it was nor what it became.
+func TestAGroupsMembersAndTheirMembershipsAreReadInOneSnapshot(t *testing.T) {
+	h := setup(t)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	h.as(t, "a", "g")
+	h.join(t, "b")
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	for _, q := range []string{
+		`LOCK TABLE rbac_memberships IN ACCESS EXCLUSIVE MODE`,
+		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'g', 'user', 'b')`,
+		`UPDATE rbac_memberships SET suspended = true WHERE tenant = 't1' AND principal = 'user:a'`,
+	} {
+		if _, err := tx.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	var pid int32
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	type read struct {
+		standing []string
+		err      error
+	}
+	done := make(chan read, 1)
+	go func() {
+		var r read
+		r.err = h.pool.QueryRow(ctx, `SELECT coalesce(array_agg(principal ORDER BY principal), '{}')
+			FROM rbac_group_members('t1', '{g}', $1, NULL, true)`, h.now).Scan(&r.standing)
+		done <- r
+	}()
+	// Until the second statement waits for the change, which the first didn't.
+	for waiting := false; !waiting; {
+		select {
+		case r := <-done:
+			t.Fatalf("the members were read before the change committed: %v, %v", r.standing, r.err)
+		default:
+		}
+		if err := h.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r := <-done; r.err != nil || !slices.Equal(r.standing, []string{"user:a"}) {
+		t.Fatalf("standing in g: %v, %v", r.standing, r.err)
+	}
+}
+
 func TestHoldersReadDeniesOnTheMembersAndThePublic(t *testing.T) {
 	viewer := rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
 	guard := rbac.RoleDefinition{ID: "guard", Permissions: []rbac.Permission{rbac.DenyPermission("cluster")}, ResourceTypes: []string{"cluster"}}

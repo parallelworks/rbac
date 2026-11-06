@@ -51,9 +51,15 @@ import (
 // another type than it is declared, as nil, or as a double that is NaN or infinite, is false when
 // it runs, and a deny's applies: a declared attribute passed so fails whatever reads it, comparing
 // it with `!=`, testing it with has(), or a map or list holding it, included, and so does reading
-// the kind's attributes as a whole, by `in`, size(), a macro or comparing them. A name a declared
-// kind doesn't declare, which a condition reads only through dyn(), fails so too. An undeclared
-// kind's are read as converted, and CEL compares values of different types as unequal.
+// the kind's attributes as a whole, by `in`, size(), a macro, comparing them or a list or a map
+// holding them, or the subject, the resource or the request holding them, as reading the attributes
+// of a kind no condition can read does. A name a declared kind doesn't declare, which a condition
+// reads only through dyn(), fails so too, and so does one holding a double that is NaN or
+// infinite, however deep: comparing reads the smaller value whole and the larger only as far, so a
+// list holding NaN beside a long string was compared by the string, and
+// `request.attributes.scores != [1, 2]` held. An undeclared kind's are read as converted, and CEL
+// compares values of different types as unequal; but one holding such a double, however deep, is
+// unreadable as a whole, below.
 //
 // What a host passes as a kind's attributes, the subject's, the resource's or the request's, is
 // converted, where a check reads a condition, once and whole, into CEL's own values, and
@@ -82,8 +88,12 @@ import (
 // A kind's attributes holding anything else, however deep, are unreadable as a whole, as a policy
 // engine fails input it can't read: every condition reading any of them fails, a test of one's
 // presence too, so a grant's gives nothing, a deny's applies and a requirement isn't met, while the
-// other kinds' are read. So are those holding a ref.Val of the host's own, though it says it is of
-// one of CEL's types, a list, a map or an optional of CEL's a host makes, a struct, a channel, a
+// other kinds' are read. So are an undeclared kind's holding a double that is NaN or infinite,
+// however deep, as no declarations name what its conditions read: refused by name alone, a deny's
+// `request.attributes.region == "eu" && request.attributes.risk > 0.5` lifted outside the EU for an
+// infinite float64 risk, where the same infinity as JSON text, 1e400, which a host reading JSON
+// reads none of, applied it. So are those holding a ref.Val of the host's own, though it says it is
+// of one of CEL's types, a list, a map or an optional of CEL's a host makes, a struct, a channel, a
 // func, a complex number, a uintptr, any other message, a map keyed by any other value, as a double
 // or an array, a map holding two keys read as the same value, as 1 and 1u, or "a" twice of two
 // string types, and so JSON text naming a member of an object twice, as "role" and "r\u006fle" are
@@ -96,33 +106,41 @@ import (
 // along the longest path through what the kind holds, wherever a value it shares with another was
 // reached first. Reading the rest would leave each operator to tell what it read from what it
 // couldn't, as `in`, has() and a loop over a map's keys each found a key whose value it couldn't
-// read; and a condition keying a map by them, finding them in one, or comparing a list or a map
-// holding them, fails too, as every kind's no condition reads are the same value. A value reached
-// twice, as a map
-// two lists hold, is converted once, for any kind reaching it, but a resource's sharing it, below. A
+// read; and a condition keying a map by them, comparing them or finding them in a list, building a
+// list or a map holding them, or reading the subject, the resource or the request holding them
+// whole, fails too, as every kind's no condition reads are the same value: built, a list holding
+// them was decided by its size, or by another value it held. A value reached twice, as a map two
+// lists hold, is converted once, for any kind reaching it, but a resource's sharing it, below. A
 // check converts at most maxConverted of what the host passes, counted as reading it costs a
 // condition, one for each value and a tenth of each string's, bytes', JSON number's, JSON text's or
 // packed type URL's length, and half a packed message's, as a packed value takes as few as two
-// bytes, each kind whole, whether it can be read or not: past that, every condition reading an
-// attribute of any kind fails, as it does where JSON text may hold more values than that, by its
-// brackets, braces, commas and colons, which isn't parsed. A call converts the subject's and the
-// request's attributes once, the first time one of its checks reads a condition, for every check it
-// makes with them, as a change does on each scope it reaches, and each check its resource's apart,
-// after them, from what they left, counting all three as its own, so whether a check is past that
-// doesn't turn on how many the call makes: a value the resource's share with them is converted, and
-// counted, again. So change none of what the host passed while the call runs, as from a hook: a
-// check after the change can read the subject's or the request's attributes as they were, though
-// never another value as one of them. Where a kind nests past 10,000 deep, converting stops there,
-// so what it is charged, and whether the kinds after it fit what is left, can turn on the order a
-// map's entries come in: either way it can't be read, and the others are read or, past what is
-// left, fail. Nothing else converting finds turns on that order, nor on the order of the kinds. The
-// subject's, the resource's and the request's attributes share it, so attributes a tenant's users
-// write, as a resource's tags, can take every check of the resource past that, where a grant's
-// condition reading an attribute gives nothing and a deny's applies, whoever asks: bound what users
-// may store, or pass conditions only what they read. A hook, a constraint or ValidateGrant, is
-// given a copy of the subject's or the resource's attributes, or the actor's, of no more than that
-// either, counted alike, past which it can't be asked and the call is refused (ConstraintInput). A
-// declared attribute is a value of its type as converted, so a named string type is a string.
+// bytes, but for what building a value costs more: 8 for each map, Struct or JSON object, and 4 for
+// each list, ListValue or JSON array, each pointer, but to a message, and each other message. So a
+// unit converted costs about what one read does, 20 to 115 ns, and a check converts no more than
+// its conditions may spend reading, about 20 ms, where charged one each, as a number is, 160,000
+// empty maps took 93 ms. Each kind is converted whole, whether it can be read or not: past that,
+// every condition reading an attribute of any kind fails, as it does where JSON text may cost more
+// than that, by its brackets, braces, commas and colons, which isn't parsed. A call converts the
+// subject's and the request's attributes once, the first time one of its checks reads a condition,
+// for every check it makes with them, as a change does on each scope it reaches, and each check its
+// resource's apart, after them, from what they left, counting all three as its own, so whether a
+// check is past that doesn't turn on how many the call makes: a value the resource's share with
+// them is converted, and counted, again. So change none of what the host passed while the call
+// runs, as from a hook: a check after the change can read the subject's or the request's attributes
+// as they were, though never another value as one of them. Where a kind nests past 10,000 deep,
+// converting stops there, so what it is charged, and whether the kinds after it fit what is left,
+// can turn on the order a map's entries come in: either way it can't be read, and the others are
+// read or, past what is left, fail. Nothing else converting finds turns on that order, nor on the
+// order of the kinds. The subject's, the resource's and the request's attributes share it, so
+// attributes a tenant's users write, as a resource's tags, can take every check of the resource
+// past that, where a grant's condition reading an attribute gives nothing and a deny's applies,
+// whoever asks: bound what users may store, or pass conditions only what they read. A hook, a
+// constraint or ValidateGrant, is given a copy of the subject's or the resource's attributes, or
+// the actor's, of no more than that either, counted as converting counts it, whatever the copy
+// shares, but for what JSON text and packed messages decode to, which it holds as bytes, so it can
+// be given whatever a check converts; past that it can't be asked and the call is refused
+// (ConstraintInput). A declared attribute is a value of its type as converted, so a named string
+// type is a string.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
@@ -173,10 +191,25 @@ func allStrings(it traits.Iterator, m traits.Mapper) bool {
 }
 
 // maxConverted is the most a check converts of what the host passes (Attributes), counted as
-// valueSize counts what a condition reads. It is what a check reading a condition may spend at the
-// least on one scope's grants' conditions (grantBudget), as converting one costs about what reading
-// it does, so converting what a check passes costs no more than its conditions may.
+// valueSize counts what a condition reads, but for what building a value costs more (mapCost). It
+// is what a check reading a condition may spend at the least on one scope's grants' conditions
+// (grantBudget), as converting a unit costs about what reading one does, so converting what a check
+// passes costs no more than its conditions may.
 const maxConverted = 2 * maxCheckCost
+
+// What converting a value costs, and a hook's copy of it (deepCopy), counted alike, where building
+// it costs more than the one each value costs: each map, Struct or JSON object, each list, ListValue
+// or JSON array, each pointer, but to a message, and each other message, each kept by where it
+// points and allocated, and a copied message built by reflection. Counted one, as a number is,
+// 160,000 empty maps took a check 93 ms to convert and a hook 83 ms to copy, where as many ints took
+// 12 ms and 6 ms; so weighed, a unit takes 20 to 115 ns to convert and 25 to 200 ns to copy,
+// whatever holds it, a copied message the most.
+const (
+	mapCost     = 8
+	listCost    = 4
+	pointerCost = 4
+	messageCost = 4
+)
 
 // maxNested is how deep a value a host passes may nest, as JSON text may (encoding/json): a kind's
 // attributes nesting deeper can't be read, and converting them recurses no deeper, as though each
@@ -201,6 +234,9 @@ type converter struct {
 	// unread counts the values converting found no condition can read, as a struct, one holding
 	// itself, or one holding either, and deep those it found nested past maxNested.
 	unread, deep int
+	// infinite counts the doubles converting found that aren't finite, and the values holding one,
+	// which make the attribute holding them refused (attributes).
+	infinite int
 	// done is where in converted each it converted is, by where it points.
 	done      map[copiedKey]int
 	converted []conversion
@@ -210,7 +246,8 @@ type converter struct {
 }
 
 // conversion is what a converter found of a value it converted, while open converting it: what it
-// is to conditions, and how deep it nests, counting itself, or that no condition can read it.
+// is to conditions, and how deep it nests, counting itself, or that no condition can read it, and
+// whether it holds a double that isn't finite.
 type conversion struct {
 	to ref.Val
 	// of is where the value points, kept so that it is no other value's, which the converter would
@@ -218,9 +255,9 @@ type conversion struct {
 	// and packed messages once converted, and freed, what a kind after decoded came to be where it
 	// was and was read as converted from it. It is where the value points, not the value as read,
 	// as each of a map's entries is read into the same value (dict).
-	of                    any
-	height                int
-	open, unreadable, cut bool
+	of                              any
+	height                          int
+	open, unreadable, cut, infinite bool
 }
 
 func newConverter() *converter { return &converter{left: maxConverted} }
@@ -232,11 +269,16 @@ func (c *converter) rest() converter { return converter{left: c.left, over: c.ov
 // attributes is a kind's attributes as conditions read them, by their names, nil for none, and
 // whether a condition can read them: where any value they hold, however deep, can't be read, as a
 // struct, or nests past maxNested, or holds itself, none can, as the attributes beside one would
-// leave each operator reading them to tell what it reads from what it can't. Each is converted, and
-// charged, whether one before it could be read or not, so what is left for the kinds after it
-// doesn't turn on the order a map's entries come in, but where they nest past maxNested: converting
-// stops there, so they are charged for as much of them as it reached first, which that order picks,
-// and whether the kinds after them fit what is left can turn on it, failing closed.
+// leave each operator reading them to tell what it reads from what it can't. One holding a double
+// that isn't finite, however deep, is an error, which declared makes a declared kind refuse, as it
+// refuses a declared double that isn't finite, and an undeclared kind unreadable: comparing a list
+// or a map reads the smaller value whole and the larger only as far, so a list holding NaN beside a
+// long string was compared by the string, and `request.attributes.scores != [1, 2]` held. Each is
+// converted, and charged, whether one before it could be read or not, so what is left for the
+// kinds after it doesn't turn on the order a map's entries come in, but where they nest past
+// maxNested: converting stops there, so they are charged for as much of them as it reached first,
+// which that order picks, and whether the kinds after them fit what is left can turn on it, failing
+// closed.
 func (c *converter) attributes(attributes map[string]any) (map[ref.Val]ref.Val, bool) {
 	if len(attributes) == 0 {
 		return nil, true
@@ -244,8 +286,7 @@ func (c *converter) attributes(attributes map[string]any) (map[ref.Val]ref.Val, 
 	convertingKind()
 	// Each costs at least its name and its value, so a map for more than are left isn't made, as
 	// one for a million took 80 MB, only to find them past it.
-	if 2*length(len(attributes)) > c.left {
-		c.over, c.left = true, 0
+	if !c.building(mapCost, 2*length(len(attributes))) {
 		return nil, false
 	}
 	unread, deep := c.unread, c.deep
@@ -254,7 +295,11 @@ func (c *converter) attributes(attributes map[string]any) (map[ref.Val]ref.Val, 
 		if !c.pay(textLength(len(name))) {
 			return nil, false
 		}
+		infinite := c.infinite
 		out[types.String(name)], _ = c.of(reflect.ValueOf(v))
+		if c.infinite != infinite {
+			out[types.String(name)] = types.NewErr("rbac: attribute %q holds a double that isn't finite", name)
+		}
 	}
 	for _, k := range c.cut {
 		delete(c.done, k)
@@ -277,8 +322,8 @@ var (
 // or nil where no condition can read it (refuse), it nests past maxNested, or converting it costs
 // more than is left. It reads v by its kind, but for the types Attributes names, and calls no
 // method of the host's. Each value costs one, one that can't be read too, and a string, bytes or
-// JSON text a tenth of its length more, as reading it does, so converting reaches no more values
-// than it may cost.
+// JSON text a tenth of its length more, as reading it does, and a map, a list, a pointer or a
+// message what building it does (mapCost), so converting reaches no more values than it may cost.
 func (c *converter) of(v reflect.Value) (ref.Val, int) {
 	if !c.pay(1) {
 		return nil, 0
@@ -319,13 +364,19 @@ func (c *converter) of(v reflect.Value) (ref.Val, int) {
 	case nullType:
 		return types.NullValue, 1
 	}
+	if wellKnown[t] {
+		return c.message(v)
+	}
 	// A value of a type of the host's own CEL would read by its methods, as one saying it is a
 	// double or a list, is read so by none. A pointer has the methods of what it points to, so one to
 	// CEL's own string is read as the string, as any other pointer is read as what it points to.
 	if t.Implements(refValType) && (t.Kind() != reflect.Pointer || !t.Elem().Implements(refValType)) {
 		if v, ok := v.Interface().(ref.Val); ok && celScalar(v) {
-			if at, ok := v.(types.Timestamp); ok {
-				v = types.Timestamp{Time: at.UTC()}
+			switch s := v.(type) {
+			case types.Timestamp:
+				v = types.Timestamp{Time: s.UTC()}
+			case types.Double:
+				v = c.double(float64(s))
 			}
 			return c.spend(textSize(v)-1, v), 1
 		}
@@ -342,7 +393,7 @@ func (c *converter) of(v reflect.Value) (ref.Val, int) {
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		return types.Uint(v.Uint()), 1
 	case reflect.Float32, reflect.Float64:
-		return types.Double(v.Float()), 1
+		return c.double(v.Float()), 1
 	case reflect.String:
 		s := v.String()
 		return c.spend(uint64(len(s))/10, types.String(s)), 1
@@ -351,6 +402,9 @@ func (c *converter) of(v reflect.Value) (ref.Val, int) {
 			return types.NullValue, 1
 		}
 		return c.once(v, func() (ref.Val, int) {
+			if !c.pay(pointerCost - 1) {
+				return nil, 0
+			}
 			to, height := c.of(v.Elem())
 			return to, height + 1
 		})
@@ -377,6 +431,15 @@ func (c *converter) refuse() ref.Val {
 	return nil
 }
 
+// double is d as a condition reads it, counting one that isn't finite, which makes the attribute
+// holding it refused, and an undeclared kind holding it unreadable (attributes).
+func (c *converter) double(d float64) ref.Val {
+	if math.IsNaN(d) || math.IsInf(d, 0) {
+		c.infinite++
+	}
+	return types.Double(d)
+}
+
 // celScalar reports whether v is one of CEL's own values that holds no other.
 func celScalar(v ref.Val) bool {
 	switch v.(type) {
@@ -400,6 +463,16 @@ func (c *converter) pay(n uint64) bool {
 	}
 	c.left -= n
 	return true
+}
+
+// building pays n for building a value whose contents cost at least least, or reports, before
+// anything is built, that the two are more than is left.
+func (c *converter) building(n, least uint64) bool {
+	if least > c.left || n > c.left-least {
+		c.over, c.left = true, 0
+		return false
+	}
+	return c.pay(n)
 }
 
 // spend is v, which converting cost n, or nil once it costs more than is left.
@@ -431,6 +504,9 @@ func (c *converter) once(v reflect.Value, convert func() (ref.Val, int)) (ref.Va
 			c.deep++
 			return nil, 0
 		default:
+			if d.infinite {
+				c.infinite++
+			}
 			return d.to, d.height
 		}
 	}
@@ -440,7 +516,7 @@ func (c *converter) once(v reflect.Value, convert func() (ref.Val, int)) (ref.Va
 	i := len(c.converted)
 	c.done[k] = i
 	c.converted = append(c.converted, conversion{of: v.UnsafePointer(), open: true})
-	unread, deep := c.unread, c.deep
+	unread, deep, infinite := c.unread, c.deep, c.infinite
 	to, height := convert()
 	d := &c.converted[i]
 	d.open = false
@@ -453,7 +529,7 @@ func (c *converter) once(v reflect.Value, convert func() (ref.Val, int)) (ref.Va
 		d.cut = true
 		c.cut = append(c.cut, k)
 	default:
-		d.to, d.height = to, height
+		d.to, d.height, d.infinite = to, height, c.infinite != infinite
 	}
 	return to, height
 }
@@ -473,11 +549,17 @@ func (c *converter) bytes(v reflect.Value) ref.Val {
 	return types.Bytes(b.Bytes())
 }
 
-// list is v, a slice or an array, as a list of what it holds, and how deep it nests.
+// noValues is the empty list, which every nil slice converts to.
+var noValues = types.NewRefValList(types.DefaultTypeAdapter, []ref.Val{})
+
+// list is v, a slice or an array, as a list of what it holds, and how deep it nests: a nil slice
+// is the empty list, as nothing is built for it.
 func (c *converter) list(v reflect.Value) (ref.Val, int) {
+	if v.Kind() == reflect.Slice && v.IsNil() {
+		return noValues, 1
+	}
 	// Each costs at least one, so a list longer than is left can't be converted.
-	if length(v.Len()) > c.left {
-		c.over, c.left = true, 0
+	if !c.building(listCost-1, length(v.Len())) {
 		return nil, 0
 	}
 	out, height := make([]ref.Val, v.Len()), 0
@@ -498,8 +580,10 @@ func (c *converter) dict(v reflect.Value) (ref.Val, int) {
 	if kt := v.Type().Key(); kt.Kind() != reflect.Interface && !keyType(kt) {
 		return c.refuse(), 1
 	}
-	if 2*length(v.Len()) > c.left {
-		c.over, c.left = true, 0
+	if v.IsNil() {
+		return noAttributes, 1
+	}
+	if !c.building(mapCost-1, 2*length(v.Len())) {
 		return nil, 0
 	}
 	out, height := make(map[ref.Val]ref.Val, v.Len()), 0
@@ -598,7 +682,7 @@ func holdsKey(m map[ref.Val]ref.Val, k ref.Val) bool {
 }
 
 // json is v, JSON text, parsed, at a tenth of its length, once for each text c converts, and how
-// deep it nests. Text that may hold more values than a check converts isn't parsed: a value takes
+// deep it nests. Text whose values may cost more than a check converts isn't parsed: a value takes
 // as few as two bytes, as `0,`, and parsing a mebibyte of them, only to find more than a check may
 // convert, took a tenth of a second and 80 MB. That is of the text alone, not of what is left: what
 // it may hold is more than it holds where it is invalid, holds an empty list or object, or a key
@@ -733,8 +817,10 @@ func pairedSurrogates(text []byte) bool {
 	return true
 }
 
-// jsonValues is how many values and keys JSON text text may hold: each but the first follows a
-// bracket, a brace, a comma or a colon outside a string. Parsed, it may hold fewer.
+// jsonValues is the most converting the values and keys JSON text text holds may cost, each one but
+// a list or an object, which costs what building one does: each but the first follows a bracket, a
+// brace, a comma or a colon outside a string, and a bracket or a brace opens a list or an object.
+// Parsed, it may cost less.
 func jsonValues(text []byte) uint64 {
 	n, quoted := uint64(1), false
 	for i := 0; i < len(text); i++ {
@@ -743,7 +829,12 @@ func jsonValues(text []byte) uint64 {
 			i++
 		case b == '"':
 			quoted = !quoted
-		case !quoted && (b == '[' || b == '{' || b == ',' || b == ':'):
+		case quoted:
+		case b == '[':
+			n += listCost
+		case b == '{':
+			n += mapCost
+		case b == ',' || b == ':':
 			n++
 		}
 	}
@@ -813,16 +904,22 @@ func jsonNumber(n string) bool {
 }
 
 // message is v, a protobuf message, as a condition reads it, one of the well-known types
-// Attributes names, read by its fields, each as of reads it, and how deep it nests; or nil.
+// Attributes names, read by its fields, each as of reads it, and how deep it nests; or nil. Each
+// costs what building it does, and a tenth of the fields it doesn't know, as a hook's copy holds
+// them.
 func (c *converter) message(v reflect.Value) (ref.Val, int) {
 	if v.Kind() == reflect.Pointer && v.IsNil() {
 		return types.NullValue, 1
 	}
-	switch m := v.Interface().(type) {
+	if !wellKnown[v.Type()] {
+		return c.refuse(), 1
+	}
+	m, _ := v.Interface().(proto.Message)
+	unknown := length(len(m.ProtoReflect().GetUnknown())) / 10
+	switch m := m.(type) {
 	case *structpb.Struct:
 		return c.once(v, func() (ref.Val, int) {
-			if 2*uint64(len(m.GetFields())) > c.left {
-				c.over, c.left = true, 0
+			if !c.building(mapCost-1+unknown, 2*length(len(m.GetFields()))) {
 				return nil, 0
 			}
 			out, height := make(map[ref.Val]ref.Val, len(m.GetFields())), 0
@@ -838,8 +935,7 @@ func (c *converter) message(v reflect.Value) (ref.Val, int) {
 		})
 	case *structpb.ListValue:
 		return c.once(v, func() (ref.Val, int) {
-			if uint64(len(m.GetValues())) > c.left {
-				c.over, c.left = true, 0
+			if !c.building(listCost-1+unknown, length(len(m.GetValues()))) {
 				return nil, 0
 			}
 			out, height := make([]ref.Val, len(m.GetValues())), 0
@@ -852,6 +948,31 @@ func (c *converter) message(v reflect.Value) (ref.Val, int) {
 			}
 			return types.NewRefValList(types.DefaultTypeAdapter, out), height + 1
 		})
+	case *anypb.Any:
+		return c.once(v, func() (ref.Val, int) {
+			// Finding the type hashes its URL whole, and a packed value takes as few as two bytes, as an
+			// empty one in a list does: Anys sharing a mebibyte's URL, each charged one, took a third of
+			// a millisecond each, and decoding a mebibyte of values, only to find more than a check may
+			// convert, took a tenth of a second.
+			if !c.pay(messageCost - 1 + unknown + length(len(m.GetTypeUrl()))/10 + length(len(m.GetValue()))/2) {
+				return nil, 0
+			}
+			unpacked, ok := packable[m.MessageName()]
+			if !ok {
+				return c.refuse(), 1
+			}
+			packed := unpacked()
+			if err := proto.Unmarshal(m.GetValue(), packed); err != nil || !setOnce(m.GetValue(), packed.ProtoReflect().Descriptor()) {
+				return c.refuse(), 1
+			}
+			to, height := c.of(reflect.ValueOf(packed))
+			return to, height + 1
+		})
+	}
+	if !c.pay(messageCost - 1 + unknown) {
+		return nil, 0
+	}
+	switch m := m.(type) {
 	case *structpb.Value:
 		// A kind that is a nil of its type, as `Kind: (*structpb.Value_StructValue)(nil)`, is none to
 		// protobuf's reflection, and so to a hook's copy, as an unset kind is; reading what it holds
@@ -862,7 +983,7 @@ func (c *converter) message(v reflect.Value) (ref.Val, int) {
 		var held reflect.Value
 		switch k := m.GetKind().(type) {
 		case *structpb.Value_NumberValue:
-			return types.Double(k.NumberValue), 1
+			return c.double(k.NumberValue), 1
 		case *structpb.Value_StringValue:
 			return c.spend(uint64(len(k.StringValue))/10, types.String(k.StringValue)), 1
 		case *structpb.Value_BoolValue:
@@ -881,9 +1002,9 @@ func (c *converter) message(v reflect.Value) (ref.Val, int) {
 	case *wrapperspb.BytesValue:
 		return c.spend(uint64(len(m.GetValue()))/10, types.Bytes(m.GetValue())), 1
 	case *wrapperspb.DoubleValue:
-		return types.Double(m.GetValue()), 1
+		return c.double(m.GetValue()), 1
 	case *wrapperspb.FloatValue:
-		return types.Double(m.GetValue()), 1
+		return c.double(float64(m.GetValue())), 1
 	case *wrapperspb.Int32Value:
 		return types.Int(m.GetValue()), 1
 	case *wrapperspb.Int64Value:
@@ -898,26 +1019,6 @@ func (c *converter) message(v reflect.Value) (ref.Val, int) {
 		return types.Timestamp{Time: m.AsTime()}, 1
 	case *durationpb.Duration:
 		return types.Duration{Duration: m.AsDuration()}, 1
-	case *anypb.Any:
-		return c.once(v, func() (ref.Val, int) {
-			// Finding the type hashes its URL whole, and a packed value takes as few as two bytes, as an
-			// empty one in a list does: Anys sharing a mebibyte's URL, each charged one, took a third of
-			// a millisecond each, and decoding a mebibyte of values, only to find more than a check may
-			// convert, took a tenth of a second.
-			if !c.pay(uint64(len(m.GetTypeUrl()))/10 + uint64(len(m.GetValue()))/2) {
-				return nil, 0
-			}
-			unpacked, ok := packable[m.MessageName()]
-			if !ok {
-				return c.refuse(), 1
-			}
-			packed := unpacked()
-			if err := proto.Unmarshal(m.GetValue(), packed); err != nil || !setOnce(m.GetValue(), packed.ProtoReflect().Descriptor()) {
-				return c.refuse(), 1
-			}
-			to, height := c.of(reflect.ValueOf(packed))
-			return to, height + 1
-		})
 	}
 	return c.refuse(), 1
 }
@@ -1037,6 +1138,17 @@ var packable = func() map[protoreflect.FullName]func() proto.Message {
 		made[t.Descriptor().FullName()] = func() proto.Message { return t.New().Interface() }
 	}
 	return made
+}()
+
+// wellKnown are the types of the messages conditions read (Attributes), each a pointer to a
+// generated message: finding a type of so many methods a message by reflection's Implements took
+// most of what converting one did, five times what converting a number does.
+var wellKnown = func() map[reflect.Type]bool {
+	known := map[reflect.Type]bool{reflect.TypeFor[*anypb.Any](): true}
+	for _, made := range packable {
+		known[reflect.TypeOf(made())] = true
+	}
+	return known
 }()
 
 // The types an attribute can be declared as, with the Go value a host passes for each, or any
@@ -1214,15 +1326,15 @@ func typing(attrs Attributes) (*cel.Env, error) {
 // of a copy of its own: copied for each length, the prefixes of one slice of 3,000 maps took half a
 // second. A value holding no map, slice or pointer, as an array of bytes, is copied whole, and
 // shared where an interface holds it, as nothing writes through one: copied element by element for
-// each interface holding it, a hundred holding one array of 100 KB took 170 ms. A struct's fields
-// an unexported struct it embeds promotes are its own too, but its other unexported fields are
-// shared, a pointer it embeds unexported among them, and so the fields that one promotes:
-// reflection can't set them. A map's keys are shared too, and what a pointer among them reaches: a
-// copied key would be another key, so the copy would find nothing under the one the host passed.
-// It copies at most what a check converts (maxConverted), counted as converting counts it, one for
-// each value, a string too, and a tenth of each other byte it copies whole, so no more than
-// converting the same counts, past which it reports false, and the copy is v's zero value: copying
-// recurses as far as v reaches, as a check's converting does, which stops there.
+// each interface holding it, a hundred holding one array of 100 KB took 170 ms. So is a time, whose
+// fields are unexported. A struct's fields an unexported struct it embeds promotes are its own too,
+// but its other unexported fields are shared, a pointer it embeds unexported among them, and so the
+// fields that one promotes: reflection can't set them. A map's keys are shared too, and what a
+// pointer among them reaches: a copied key would be another key, so the copy would find nothing
+// under the one the host passed. It copies at most what a check converts (maxConverted), counted as
+// converting counts it, whatever it shares or copies whole (mapCost), past which it reports false,
+// and the copy is v's zero value: copying recurses as far as v reaches, as a check's converting
+// does, which stops there.
 func deepCopy[T any](v T) (T, bool) {
 	copying()
 	c := copier{left: maxConverted}
@@ -1250,20 +1362,23 @@ const maxCopied = 2 * maxNested
 // type makes (message), and each slice by where it starts, its capacity and its type (sliceKey); and
 // what it may still copy (left), past which it is over.
 type copier struct {
-	done map[copiedKey]copied
+	done map[copiedKey]reflect.Value
+	// slices are the copies of each slice's elements, each changed where it is kept as its elements
+	// are copied: kept by value, each element cost the copy five lookups of it, as much as copying
+	// the element did.
+	slices map[copiedKey]*copied
 	// outgrown are the copies of each slice that a longer length it was reached with replaced, each
 	// perhaps given to what reached it while it still held the host's elements, so each element
 	// copied after is set in them too: set in the longer copy alone, one holding a shorter slice of
-	// what holds it gave a hook the host's own map. They are kept apart from done, as copying
-	// recurses as deep as maxCopied with a copied on the stack at each level.
+	// what holds it gave a hook the host's own map.
 	outgrown map[copiedKey][]reflect.Value
 	left     uint64
 	over     bool
 }
 
-// copied is the copy of a map, a pointer or a message, or of a slice's elements from where it starts,
-// as many as the longest it was reached with, of which filled are copied: a copy reaching it again
-// while it is copied, as a slice holding itself, is a slice of this one.
+// copied is the copy of a slice's elements from where it starts, as many as the longest it was
+// reached with, of which filled are copied: a copy reaching it again while it is copied, as a slice
+// holding itself, is a slice of this one.
 type copied struct {
 	out    reflect.Value
 	filled int
@@ -1298,15 +1413,25 @@ func (c *copier) pay(n uint64) bool {
 	return true
 }
 
+// building pays n for building a copy whose contents cost at least least, or reports, before
+// anything is built, that the two are more than is left.
+func (c *copier) building(n, least uint64) bool {
+	if least > c.left || n > c.left-least {
+		c.over, c.left = true, 0
+		return false
+	}
+	return c.pay(n)
+}
+
 // copy is a copy of v, which is depth deep, or past maxCopied deep its zero value, not kept, so a
 // copy reaching it less deep copies it; or once c is over, the zero value.
 func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
 	if v.Kind() != reflect.Interface {
 		if depth >= maxCopied {
-			if k, ok := copiedKeyOf(v); ok && v.Kind() != reflect.Slice && c.done[k].out.IsValid() {
-				return c.done[k].out
+			if k, ok := copiedKeyOf(v); ok && v.Kind() != reflect.Slice && c.done[k].IsValid() {
+				return c.done[k]
 			}
-			if s := c.done[sliceKey(v)]; v.Kind() == reflect.Slice && !v.IsNil() && s.out.IsValid() && s.out.Len() >= v.Len() {
+			if s := c.slices[sliceKey(v)]; v.Kind() == reflect.Slice && !v.IsNil() && s != nil && s.out.Len() >= v.Len() {
 				return s.out.Slice3(0, v.Len(), v.Len())
 			}
 			return reflect.Zero(v.Type())
@@ -1316,11 +1441,10 @@ func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
 			return reflect.Zero(v.Type())
 		}
 	}
-	if t := v.Type(); flat(t) {
-		// Copied whole as it is set where the copy holds it, an array or a struct as its bytes and
-		// strings cost (tenths).
-		if k := t.Kind(); (k == reflect.Array || k == reflect.Struct) && !c.pay(tenths(t)/10) {
-			return reflect.Zero(t)
+	if shared(v.Type()) {
+		// Set whole where the copy holds it.
+		if !c.payWhole(v) {
+			return reflect.Zero(v.Type())
 		}
 		return v
 	}
@@ -1329,7 +1453,7 @@ func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
 		// Shared, but counted as the value it holds is converted, so an array of them costs what it
 		// holds: uncounted, an array of a million of them cost a copy one.
 		if unreachable(v) {
-			if !c.pay(1) {
+			if !c.payHeld(v) {
 				return reflect.Zero(v.Type())
 			}
 			return v
@@ -1342,17 +1466,16 @@ func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
 			return v
 		}
 		k, _ := copiedKeyOf(v)
-		if done, ok := c.done[k]; ok {
-			return done.out
+		if done := c.done[k]; done.IsValid() {
+			return done
 		}
 		// Each entry costs at least its key and its value, so a map of more than is left isn't made.
-		if 2*length(v.Len()) > c.left {
-			c.over, c.left = true, 0
+		if !c.building(mapCost-1, 2*length(v.Len())) {
 			return reflect.Zero(v.Type())
 		}
 		out := reflect.MakeMapWithSize(v.Type(), v.Len())
-		c.keep(k, out, 0)
-		for it := v.MapRange(); it.Next() && c.pay(1); {
+		c.keep(k, out)
+		for it := v.MapRange(); it.Next() && c.pay(textLength(textOf(it.Key()))); {
 			out.SetMapIndex(it.Key(), c.copy(it.Value(), depth))
 		}
 		return out
@@ -1368,8 +1491,7 @@ func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
 		return out
 	case reflect.Array:
 		// Each element costs at least one, so an array of more than is left isn't copied.
-		if length(v.Len()) > c.left {
-			c.over, c.left = true, 0
+		if !c.building(listCost-1, length(v.Len())) {
 			return reflect.Zero(v.Type())
 		}
 		out := reflect.New(v.Type()).Elem()
@@ -1382,14 +1504,17 @@ func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
 			return v
 		}
 		k, _ := copiedKeyOf(v)
-		if done, ok := c.done[k]; ok {
-			return done.out
+		if done := c.done[k]; done.IsValid() {
+			return done
 		}
 		if m, ok := v.Interface().(proto.Message); ok && itself(m) {
 			return reflect.ValueOf(c.message(m.ProtoReflect(), depth).Interface())
 		}
+		if !c.pay(pointerCost - 1) {
+			return reflect.Zero(v.Type())
+		}
 		out := reflect.New(v.Type().Elem())
-		c.keep(k, out, 0)
+		c.keep(k, out)
 		out.Elem().Set(c.copy(v.Elem(), depth))
 		return out
 	default:
@@ -1397,18 +1522,18 @@ func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
 	}
 }
 
-// keep keeps out, the copy of what k knows, of which filled elements are copied, for a slice.
-func (c *copier) keep(k copiedKey, out reflect.Value, filled int) {
+// keep keeps out, the copy of the map, pointer or message k knows.
+func (c *copier) keep(k copiedKey, out reflect.Value) {
 	if c.done == nil {
-		c.done = map[copiedKey]copied{}
+		c.done = map[copiedKey]reflect.Value{}
 	}
-	c.done[k] = copied{out: out, filled: filled}
+	c.done[k] = out
 }
 
-// set sets the ith element of the copy of the slice k knows, and of each copy of it outgrown that
-// holds one.
-func (c *copier) set(k copiedKey, i int, v reflect.Value) {
-	c.done[k].out.Index(i).Set(v)
+// set sets the ith element of s, the copy of the slice k knows, and of each copy of it outgrown
+// that holds one.
+func (c *copier) set(s *copied, k copiedKey, i int, v reflect.Value) {
+	s.out.Index(i).Set(v)
 	for _, o := range c.outgrown[k] {
 		if i < o.Len() {
 			o.Index(i).Set(v)
@@ -1431,53 +1556,72 @@ func sliceKey(v reflect.Value) copiedKey {
 // so appending to one writes to none of the others.
 func (c *copier) slice(v reflect.Value, depth int) reflect.Value {
 	n, k := v.Len(), sliceKey(v)
-	if had := lengthOf(c.done[k].out); had < n || !c.done[k].out.IsValid() {
-		if !c.lengthen(v, k) {
+	s := c.slices[k]
+	if s == nil || s.out.Len() < n {
+		if s = c.lengthen(v, k, s); s == nil {
 			return reflect.Zero(v.Type())
 		}
 		// Copying an element may reach a longer slice of v, which grows the copy, so each is set in
 		// the copy as it is once it is copied, and in those it outgrew.
-		for i := c.done[k].filled; i < n && !c.over; i = max(i+1, c.done[k].filled) {
+		for i := s.filled; i < n && !c.over; i = max(i+1, s.filled) {
 			switch e := v.Index(i); {
 			case !unreachable(e):
-				c.keep(k, c.done[k].out, i+1)
-				c.set(k, i, c.copy(e, depth))
-			case !c.pay(1):
+				s.filled = i + 1
+				c.set(s, k, i, c.copy(e, depth))
+			case !c.payHeld(e):
 				return reflect.Zero(v.Type())
 			}
 		}
-		c.keep(k, c.done[k].out, max(n, c.done[k].filled))
+		s.filled = max(n, s.filled)
 	}
-	s := c.done[k].out
-	if s.Len() == n && s.Cap() == n {
-		return s
+	if s.out.Len() == n && s.out.Cap() == n {
+		return s.out
 	}
-	return s.Slice3(0, n, n)
+	return s.out.Slice3(0, n, n)
 }
 
-// lengthen makes the copy of v's elements, which k knows, as long as v, holding the host's elements
-// where it held none, or reports that it costs more than is left. It is apart from slice, which
-// copying recurses through as deep as maxCopied, so its frame holds none of what this needs.
-func (c *copier) lengthen(v reflect.Value, k copiedKey) bool {
-	n, s := v.Len(), c.done[k]
-	had := lengthOf(s.out)
-	// Each element costs what copying it does, as converting it does: one and what it holds, or
-	// where it holds nothing a copy would share, what moving it whole does (tenths). Each costs at
-	// least one, but those moved whole, so a slice of more than is left isn't made. Counted once
-	// more for each, a list of 80,000 empty maps, or 100,000 short strings, which a check converts,
-	// couldn't be copied, so a constrained check of it was refused.
-	elem := v.Type().Elem()
-	if flat(elem) {
-		if !c.pay(length(n-had) * tenths(elem) / 10) {
-			return false
-		}
-	} else if length(n-had) > c.left {
-		c.over, c.left = true, 0
-		return false
+// lengthen makes s, the copy of v's elements, which k knows, as long as v, holding the host's
+// elements where it held none, a new one kept where s is nil, or reports that it costs more than is
+// left. It is apart from slice, which copying recurses through as deep as maxCopied, so its frame
+// holds none of what this needs.
+func (c *copier) lengthen(v reflect.Value, k copiedKey, s *copied) *copied {
+	n, had := v.Len(), 0
+	if s != nil {
+		had = s.out.Len()
+	}
+	// Each element costs what converting it does, one and what it holds, where it holds nothing a
+	// copy would share as converting it costs (payWhole), and bytes a tenth of each, and the copy
+	// what building a list does, once for where it starts. Each costs at least one, but a byte, so a
+	// slice of more than is left isn't made. Counted once more for each, a list of 100,000 short
+	// strings, which a check converts, couldn't be copied, so a constrained check of it was refused.
+	elem, made := v.Type().Elem(), uint64(listCost-1)
+	if s != nil {
+		made = 0
 	}
 	switch {
-	case !s.out.IsValid():
-		s.out = reflect.MakeSlice(v.Type(), n, n)
+	case elem.Kind() == reflect.Uint8:
+		if !c.pay(length(n-had) / 10) {
+			return nil
+		}
+	case shared(elem):
+		if !c.building(made, length(n-had)) || !c.pay(length(n-had)) {
+			return nil
+		}
+		for i := had; i < n && textual(elem); i++ {
+			if !c.payWhole(v.Index(i)) {
+				return nil
+			}
+		}
+	case !c.building(made, length(n-had)):
+		return nil
+	}
+	switch {
+	case s == nil:
+		s = &copied{out: reflect.MakeSlice(v.Type(), n, n)}
+		if c.slices == nil {
+			c.slices = map[copiedKey]*copied{}
+		}
+		c.slices[k] = s
 	case n > s.out.Cap():
 		grown := reflect.MakeSlice(v.Type(), n, min(max(n, 2*s.out.Cap()), v.Cap()))
 		reflect.Copy(grown, s.out)
@@ -1495,26 +1639,21 @@ func (c *copier) lengthen(v reflect.Value, k copiedKey) bool {
 	} else {
 		reflect.Copy(s.out.Slice(s.filled, n), v.Slice(s.filled, n))
 	}
-	if flat(elem) {
+	if shared(elem) {
 		s.filled = n
 	}
-	c.keep(k, s.out, s.filled)
-	return true
-}
-
-// lengthOf is the length of v, a slice, or 0 for none.
-func lengthOf(v reflect.Value) int {
-	if !v.IsValid() {
-		return 0
-	}
-	return v.Len()
+	return s
 }
 
 // message is a copy of m, as cloning it would make, but keeping each message it copies by where it
 // points, as copy keeps pointers: cloning keeps none, so a message holding itself, as a Struct one
 // of whose fields holds it, recursed until the stack overflowed, which no recover catches, and one
 // reaching another twice copied it for each path to it. A nil message, as a list may hold, is copied
-// as a new one each time, as cloning copies it: each is the same nil, but none is another's.
+// as a new one each time, as cloning copies it: each is the same nil, but none is another's. What
+// reaches m pays the one it costs as a value, as converting a message the host passes counts it
+// once: counted again here, a copy of a resource's nearly 40,000 timestamps, which a check converts,
+// cost a quarter more than converting them did, so a check converting them couldn't ask a
+// constraint about them.
 func (c *copier) message(m protoreflect.Message, depth int) protoreflect.Message {
 	if !m.IsValid() {
 		return m.New()
@@ -1527,55 +1666,51 @@ func (c *copier) message(m protoreflect.Message, depth int) protoreflect.Message
 		k.len = -1
 	}
 	if depth >= maxCopied {
-		if done, ok := c.done[k]; keyed && ok {
-			if d, ok := done.out.Interface().(proto.Message); ok {
+		if done := c.done[k]; keyed && done.IsValid() {
+			if d, ok := done.Interface().(proto.Message); ok {
 				return d.ProtoReflect()
 			}
 		}
 		return m.New()
 	}
 	depth++
-	if done, ok := c.done[k]; keyed && ok {
-		if d, ok := done.out.Interface().(proto.Message); ok {
+	if done := c.done[k]; keyed && done.IsValid() {
+		if d, ok := done.Interface().(proto.Message); ok {
 			return d.ProtoReflect()
 		}
 	}
 	out := m.New()
-	if !c.pay(1) {
+	if !c.pay(ownCost(m.Descriptor())) {
 		return out
 	}
 	if keyed {
-		c.keep(k, reflect.ValueOf(out.Interface()), 0)
+		c.keep(k, reflect.ValueOf(out.Interface()))
 	}
-	// Each message costs one, as converting counts it, and so does each element and each key, and
-	// each value, of a list or a map, but a message, which costs what it does: counted for each field
-	// too, a Struct of short strings cost a copy twice what converting it does, and a ListValue three
-	// times, so one a check converts couldn't be copied, and a constrained check of it was refused.
-	// A message's other fields cost nothing more, as its type bounds how many it holds.
+	// Each element of a list, and each key and value of a map, costs one, as converting counts it,
+	// a key a tenth of its bytes more, and each message a field holds one, and what it costs.
 	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
 		switch {
 		case fd.IsList():
 			from, to := v.List(), out.Mutable(fd).List()
-			if n := length(from.Len()); n > c.left || !holdsMessages(fd) && !c.pay(n) {
-				c.over, c.left = true, 0
+			if !c.pay(length(from.Len())) {
 				return false
 			}
 			for i := 0; i < from.Len() && !c.over; i++ {
 				to.Append(c.field(fd, from.Get(i), depth))
 			}
 		case fd.IsMap():
-			n := length(v.Map().Len())
-			if !holdsMessages(fd.MapValue()) {
-				n *= 2
-			}
-			if !c.pay(n) {
+			if 2*length(v.Map().Len()) > c.left {
+				c.over, c.left = true, 0
 				return false
 			}
 			to := out.Mutable(fd).Map()
 			v.Map().Range(func(key protoreflect.MapKey, v protoreflect.Value) bool {
-				to.Set(key, c.field(fd.MapValue(), v, depth))
+				if c.pay(1 + textLength(textOf(reflect.ValueOf(key.Interface())))) {
+					to.Set(key, c.field(fd.MapValue(), v, depth))
+				}
 				return !c.over
 			})
+		case holdsMessages(fd) && !c.pay(1):
 		default:
 			out.Set(fd, c.field(fd, v, depth))
 		}
@@ -1587,6 +1722,26 @@ func (c *copier) message(m protoreflect.Message, depth int) protoreflect.Message
 	return out
 }
 
+// ownCost is what copying a message md describes costs past the one it costs as a value, as
+// converting it costs: a Struct what building a map does, a ListValue a list, and another a message.
+func ownCost(md protoreflect.MessageDescriptor) uint64 {
+	switch md.FullName() {
+	case structName:
+		return mapCost - 1
+	case listValueName:
+		return listCost - 1
+	}
+	return messageCost - 1
+}
+
+var (
+	structName    = (&structpb.Struct{}).ProtoReflect().Descriptor().FullName()
+	listValueName = (&structpb.ListValue{}).ProtoReflect().Descriptor().FullName()
+	// anyValue is the field an Any packs its message's bytes in, each half a unit, as converting
+	// counts them.
+	anyValue = (&anypb.Any{}).ProtoReflect().Descriptor().Fields().ByName("value")
+)
+
 // holdsMessages reports whether a value of the field fd describes, or each of its elements, is a
 // message, which costs a copy what copying it does.
 func holdsMessages(fd protoreflect.FieldDescriptor) bool {
@@ -1594,16 +1749,25 @@ func holdsMessages(fd protoreflect.FieldDescriptor) bool {
 }
 
 // field is a copy of v, a value of a field fd describes or of one of its elements: a message as
-// message copies it, bytes as bytes of its own, and the rest as it is, which nothing writes to.
+// message copies it, bytes as bytes of its own, and the rest as it is, which nothing writes to, a
+// string and bytes at a tenth of their length, and an Any's packed bytes at half, as converting
+// counts them.
 func (c *copier) field(fd protoreflect.FieldDescriptor, v protoreflect.Value, depth int) protoreflect.Value {
 	switch fd.Kind() {
 	case protoreflect.MessageKind, protoreflect.GroupKind:
 		return protoreflect.ValueOfMessage(c.message(v.Message(), depth))
 	case protoreflect.BytesKind:
-		if !c.pay(length(len(v.Bytes())) / 10) {
+		n := length(len(v.Bytes())) / 10
+		if fd == anyValue {
+			n = length(len(v.Bytes())) / 2
+		}
+		if !c.pay(n) {
 			return protoreflect.ValueOfBytes(nil)
 		}
 		return protoreflect.ValueOfBytes(slices.Clone(v.Bytes()))
+	case protoreflect.StringKind:
+		c.pay(length(len(v.String())) / 10)
+		return v
 	default:
 		return v
 	}
@@ -1617,6 +1781,9 @@ func (c *copier) field(fd protoreflect.FieldDescriptor, v protoreflect.Value, de
 // another type than the host passed. Either is copied as any other pointer, by what it points to,
 // its message among it.
 func itself(m proto.Message) (ok bool) {
+	if wellKnown[reflect.TypeOf(m)] {
+		return true
+	}
 	defer func() {
 		if recover() != nil {
 			ok = false
@@ -1641,10 +1808,77 @@ func (c *copier) fields(out, v reflect.Value, depth int) {
 }
 
 // unreachable reports whether no write could reach through v, an interface: nil, or holding a value
-// of a flat type, as each of an []any of strings decoded from JSON does, which boxing again would
-// cost an allocation for each.
+// of a type a copy shares, as each of an []any of strings decoded from JSON does, which boxing again
+// would cost an allocation for each.
 func unreachable(v reflect.Value) bool {
-	return v.Kind() == reflect.Interface && (v.IsNil() || flat(v.Elem().Type()))
+	if v.Kind() != reflect.Interface || v.IsNil() {
+		return v.Kind() == reflect.Interface
+	}
+	switch e := v.Elem(); e.Kind() {
+	case reflect.Map, reflect.Pointer, reflect.Slice:
+		return e.IsNil()
+	default:
+		return shared(e.Type())
+	}
+}
+
+// payHeld pays for v, an interface no write could reach through (unreachable), as converting what
+// it holds costs: one for nil.
+func (c *copier) payHeld(v reflect.Value) bool {
+	if v.IsNil() {
+		return c.pay(1)
+	}
+	return c.pay(1) && c.payWhole(v.Elem())
+}
+
+// payWhole pays for v, of a type a copy shares, past the one it costs as a value, as converting it
+// costs: a string or an array of bytes a tenth of its length, and an array a list of what it holds.
+// A struct, which no condition reads, costs a tenth of its bytes, each string's as one (tenths).
+func (c *copier) payWhole(v reflect.Value) bool {
+	t := v.Type()
+	switch {
+	case t.Kind() == reflect.String:
+		return c.pay(length(v.Len()) / 10)
+	case t.Kind() == reflect.Array && t.Elem().Kind() == reflect.Uint8:
+		return c.pay(length(v.Len()) / 10)
+	case t.Kind() == reflect.Array:
+		if !c.pay(listCost - 1 + length(v.Len())) {
+			return false
+		}
+		for i := 0; i < v.Len() && textual(t.Elem()); i++ {
+			if !c.payWhole(v.Index(i)) {
+				return false
+			}
+		}
+		return true
+	case t.Kind() == reflect.Struct && t != timeType && t != celTimestampType:
+		return c.pay(tenths(t) / 10)
+	default:
+		return true
+	}
+}
+
+// textual reports whether a value of t, which a copy shares, costs more than the one it costs as a
+// value.
+func textual(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.String, reflect.Array, reflect.Struct:
+		return t != timeType && t != celTimestampType
+	default:
+		return false
+	}
+}
+
+// textOf is the length of the string v, a map's key, is, or holds in an interface, or 0 for a key
+// of another kind, as converting reads it.
+func textOf(v reflect.Value) int {
+	if v.Kind() == reflect.Interface && !v.IsNil() {
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.String {
+		return 0
+	}
+	return v.Len()
 }
 
 // tenths is what copying a value of t, which is flat, whole costs, in tenths: a tenth of each of
@@ -1665,6 +1899,15 @@ func tenths(t reflect.Type) uint64 {
 	default:
 		return uint64(t.Size())
 	}
+}
+
+var celTimestampType = reflect.TypeFor[types.Timestamp]()
+
+// shared reports whether a copy shares a value of type t, setting it whole where the copy holds it:
+// one holding no map, slice, pointer or interface a copy would share (flat), and a time, whose
+// fields are unexported, which no hook can write to but by replacing it whole.
+func shared(t reflect.Type) bool {
+	return t == timeType || t == celTimestampType || flat(t)
 }
 
 // flat reports whether a value of type t holds no map, slice, pointer or interface a copy would
