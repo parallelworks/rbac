@@ -46,20 +46,24 @@
 -- their view takes each one's newest version counted by then, which a condition on the key reaches
 -- into, so each is read once.
 --
--- rbac_as_of_views makes or remakes the views from the tables' columns as they are, granting each
--- role that may read history the views and their schema, so a later migration that changes a table
--- calls it once it has, as its owner, and drops a view first where it drops or retypes a column the
--- view gives. Here it makes the schema too, which takes CREATE on the database: where the role
--- migrating hasn't it, a superuser or the database's owner makes the schema first, empty,
--- AUTHORIZATION that role, and it is taken as it is. One that holds anything, is another role's, or
--- in which another may create, is refused: AsOf names it first on the search_path, so a function
--- made there would be called in place of the package's, as whoever runs AsOf. Neither takes a lock
--- that a check, a change or a read of history waits for.
+-- rbac_as_of_views makes or remakes the views from the tables' columns as they are, granting the
+-- views and their schema to each role that may read history and use the package's schema, so a
+-- later migration that changes a table calls it once it has, as its owner, and drops a view first
+-- where it drops or retypes a column the view gives: it finds their schema by any of them left.
+-- Here it makes the schema too, which takes CREATE on the database: where the role migrating hasn't
+-- it, a superuser makes the schema first, empty, AUTHORIZATION that role, and it is taken as it is.
+-- AsOf names it first on the search_path, so a function, operator or type made there would be
+-- called in place of the package's, as whoever runs AsOf: one that holds anything but the views,
+-- is another role's, or in which another may create, is refused, however it came to be so, as by
+-- the role's default privileges, which a schema made for it takes too, a grant since the views
+-- were made, or an extension installed there. Its default privileges hold no object and are let
+-- be. Neither takes a lock that a check, a change or a read of history waits for.
 CREATE FUNCTION rbac_as_of_views() RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
     here     pg_catalog.text := pg_catalog.current_schema();
     history  pg_catalog.text := pg_catalog.format('%I.rbac_history', pg_catalog.current_schema());
     me       pg_catalog.oid := (SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = CURRENT_USER);
+    tables   CONSTANT pg_catalog.text[] := '{rbac_grants,rbac_roles,rbac_denies,rbac_eligibilities,rbac_memberships,rbac_groups,rbac_members}';
     -- As AsOf sets them: the time is written in UTC with its era and read back by the format it was
     -- written in, whatever the reader's DateStyle and TimeZone.
     at       CONSTANT pg_catalog.text := $q$pg_catalog.to_timestamp(pg_catalog.current_setting('rbac.as_of'), 'YYYY-MM-DD HH24:MI:SS.US TZH BC')$q$;
@@ -110,9 +114,9 @@ BEGIN
         JOIN pg_catalog.pg_rewrite w ON w.oid = d.objid
         JOIN pg_catalog.pg_class v ON v.oid = w.ev_class
         WHERE d.classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
-          AND d.refobjid = history::pg_catalog.regclass AND v.relkind = 'v' AND v.relname = 'rbac_grants');
+          AND d.refobjid = history::pg_catalog.regclass AND v.relkind = 'v' AND v.relname = ANY (tables));
     IF pg_catalog.cardinality(made) > 1 THEN
-        RAISE EXCEPTION 'views named rbac_grants read % in several schemas: %', history, made::pg_catalog.regnamespace[]
+        RAISE EXCEPTION 'views named as the package''s tables read % in several schemas: %', history, made::pg_catalog.regnamespace[]
             USING ERRCODE = 'duplicate_schema';
     END IF;
     views := made[1];
@@ -125,17 +129,26 @@ BEGIN
             EXCEPTION WHEN insufficient_privilege THEN
                 RAISE EXCEPTION 'the role % may not make schema % for AsOf''s views, which takes CREATE on the database', CURRENT_USER, named
                     USING ERRCODE = 'insufficient_privilege',
-                    HINT = pg_catalog.format('Have a superuser or the database''s owner run CREATE SCHEMA %I AUTHORIZATION %I, and migrate again.', named, CURRENT_USER);
+                    HINT = pg_catalog.format('Have a superuser run CREATE SCHEMA %I AUTHORIZATION %I, and migrate again.', named, CURRENT_USER);
             END;
             views := pg_catalog.to_regnamespace(pg_catalog.quote_ident(named));
-        ELSIF (SELECT n.nspowner FROM pg_catalog.pg_namespace n WHERE n.oid = views) <> me
-            OR EXISTS (SELECT FROM pg_catalog.pg_depend d WHERE d.refclassid = 'pg_catalog.pg_namespace'::pg_catalog.regclass AND d.refobjid = views)
-            OR EXISTS (SELECT FROM pg_catalog.aclexplode((SELECT n.nspacl FROM pg_catalog.pg_namespace n WHERE n.oid = views)) a
-                       WHERE a.privilege_type = 'CREATE' AND a.grantee <> me) THEN
-            RAISE EXCEPTION 'schema % is not one to make AsOf''s views in: it holds something, is another role''s than %, or another may create in it', named, CURRENT_USER
-                USING ERRCODE = 'invalid_schema_definition',
-                HINT = 'Make it empty, AUTHORIZATION the role that migrates, with CREATE granted to no other.';
         END IF;
+    END IF;
+    -- Made here, made for the role or made by an earlier migration, it is checked alike: where the
+    -- views are made already, it holds them, the role's, and nothing else.
+    IF (SELECT n.nspowner FROM pg_catalog.pg_namespace n WHERE n.oid = views) <> me
+        OR EXISTS (SELECT FROM pg_catalog.aclexplode((SELECT n.nspacl FROM pg_catalog.pg_namespace n WHERE n.oid = views)) a
+                   WHERE a.privilege_type = 'CREATE' AND a.grantee <> me)
+        OR EXISTS (SELECT FROM pg_catalog.pg_depend d
+                   WHERE d.refclassid = 'pg_catalog.pg_namespace'::pg_catalog.regclass AND d.refobjid = views
+                     AND d.classid <> 'pg_catalog.pg_default_acl'::pg_catalog.regclass
+                     AND NOT (made[1] IS NOT NULL AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                       AND d.objid IN (SELECT v.oid FROM pg_catalog.pg_class v
+                         WHERE v.relnamespace = views AND v.relkind = 'v' AND v.relowner = me AND v.relname = ANY (tables)))) THEN
+        RAISE EXCEPTION 'schema % is not one to make AsOf''s views in: it holds something other than them, is another role''s than %, or another may create in it',
+            views::pg_catalog.regnamespace, CURRENT_USER
+            USING ERRCODE = 'invalid_schema_definition',
+            HINT = 'Make it empty, AUTHORIZATION the role that migrates, with CREATE granted to no other, as by that role''s default privileges.';
     END IF;
     FOR e IN SELECT * FROM (VALUES
         ('rbac_grants', 'grant', '{"tenant": "tenant", "principal": "principal", "role": "role", "scope": "scope"}'),
@@ -169,11 +182,16 @@ BEGIN
             END, history, e.entity, at, cluster, tenant, selected, pg_catalog.format('%I.%I', here, e.name));
     END LOOP;
     -- Whoever may read history may read it through the views, as the role migrating, their owner,
-    -- does already.
+    -- does already: one that may also use the package's schema, without which it reads no history,
+    -- as the views name history by its oid, and USAGE isn't asked of a name never looked up.
     FOR reader IN SELECT DISTINCT CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.quote_ident(r.rolname) END
         FROM pg_catalog.aclexplode((SELECT c.relacl FROM pg_catalog.pg_class c WHERE c.oid = history::pg_catalog.regclass)) a
         LEFT JOIN pg_catalog.pg_roles r ON r.oid = a.grantee
-        WHERE a.privilege_type = 'SELECT' AND a.grantee <> me LOOP
+        WHERE a.privilege_type = 'SELECT' AND a.grantee <> me
+          AND CASE WHEN a.grantee = 0
+            THEN EXISTS (SELECT FROM pg_catalog.aclexplode((SELECT n.nspacl FROM pg_catalog.pg_namespace n WHERE n.nspname = here)) s
+                         WHERE s.grantee = 0 AND s.privilege_type = 'USAGE')
+            ELSE pg_catalog.has_schema_privilege(a.grantee, (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = here), 'USAGE') END LOOP
         EXECUTE pg_catalog.format('GRANT USAGE ON SCHEMA %s TO %s', views::pg_catalog.regnamespace, reader);
         EXECUTE pg_catalog.format('GRANT SELECT ON ALL TABLES IN SCHEMA %s TO %s', views::pg_catalog.regnamespace, reader);
     END LOOP;

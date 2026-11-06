@@ -772,7 +772,8 @@ keeps it, shows when the transaction's commit was written, which an auditor can 
 `CommittedAt`.
 `AsOf` makes no change: one tried is no actor's attempt, and `Config.OnRefused` isn't told of it. It
 reads in a transaction, or under `WithTx` a savepoint of the host's, that it makes READ ONLY, so
-nothing in its read writes, a hook's or the host's query either, and rolls back. It reads history
+nothing in its read writes, a hook's or the host's query either, but to a session's own temporary
+table, and rolls back, which leaves a host's transaction as it was, writable where it was. It reads history
 through views that migrating makes (`0028_as_of_views`), in a schema beside the package's named as
 it with `_as_of` after, each named as the table it stands in for, which it names first on its
 transaction's search_path: a statement there, the package's, a hook's through the `DB` it is given
@@ -780,18 +781,31 @@ or the host's on that transaction, reads a table by its name as it was then, `rb
 too, and `current_schema()` there is the views' schema. So it makes no object and takes no
 transaction id: it needs no `TEMPORARY`, and while its read runs it holds no `History` or `Export`
 back, though under `WithTx` a host's transaction that has taken one holds them back, as it would
-anyway; its snapshot, as any transaction's, keeps vacuum from removing a row changed since it began,
-so keep each read short all the same. The views read the tenant, the time and the cluster `AsOf`
+anyway, as does a write to a temporary table in the read; its snapshot, as any transaction's, keeps
+vacuum from removing a row changed since it began, so keep each read short all the same. So too it
+reads on a hot standby, as of what the standby has replayed, where `History` fails: a time later
+than the standby's replay reads a change not yet replayed as not made, and replay can cancel a long
+read there, as any standby's query, which is refused as `rbac.ErrConflict`. Each read drops the
+session's cached plans (`DISCARD PLANS`), under `WithTx` the host's too, which its statements plan
+again at their next run. The views read the tenant, the time and the cluster `AsOf`
 sets for its transaction (`rbac.as_of_tenant`, `rbac.as_of`, `rbac.as_of_cluster`), with the rights
 of whoever reads them, so a session that sets those itself reads through the views only what it may
 read of history, and outside a read they read nothing, or fail, never the tables. A statement of the
-read that leaves the search_path, or one of those settings, set otherwise would read another tenant
-or time, or the tables as they are now, so `AsOf` fails once its read returns where one did: what
-the read answered stands only where `AsOf` returns nil. The search_path it reads by names the views'
+read that leaves the search_path, the role, or one of those settings, set otherwise, or another
+session revoking the role's `USAGE` on the views' schema, which the search_path then leaves out,
+would read another tenant or time, or the tables as they are now, so `AsOf` fails once its read
+returns where one did: what the read answered stands only where `AsOf` returns nil. One made and
+undone within the read it can't tell, and the package's statements run between the two read by it:
+a call the read makes meanwhile, and those of a call after a hook of it that made it. So set them,
+or the role, in a read or a hook only within a savepoint rolled back before the package's next
+statement. The search_path it reads by names the views'
 schema, then `pg_temp`, then the session's, as one that doesn't name `pg_temp` reads a session's own
 tables first, so it refuses one that names `pg_temp` after the package's schema, as it would read
 them the other way round, and one that names it first, which makes the session's temporary schema
-the current one. `AsOf` takes a time from 4714 BC, the earliest PostgreSQL holds, to 9999-12-30, the
+the current one. A function, operator or type in the views' schema is found before the package's,
+and runs as whoever reads, so `AsOf` refuses that schema where it holds more than its owner's views,
+another role may create in it, or it isn't the role's that owns the package's tables, as a grant, an
+extension installed there or a change of owner since migrating can make it. `AsOf` takes a time from 4714 BC, the earliest PostgreSQL holds, to 9999-12-30, the
 last the package stores, each to the microsecond, rounded down, as pgx sends it: in 64 bits of
 microseconds from 2000, which a time past year 294,000 or so wraps, so the database would read it as
 another, or refuse it.
@@ -877,11 +891,14 @@ have the server load a library or run a program of its choosing; and:
    disable the triggers that record them. A later migration can change history too, so the
    administrator's role keeps both owners' rights. It owns the schema of `AsOf`'s views too, named
    as the package's with `_as_of` after, which `0028_as_of_views` makes: that takes `CREATE` on the
-   database, which a role that doesn't own it hasn't by default, so a superuser or the database's
-   owner makes it first, empty, `CREATE SCHEMA <schema>_as_of AUTHORIZATION <administrator>`, and
-   grants no other role `CREATE` there. `AsOf` names it first on its search_path, so migrating
-   refuses one that holds anything, is another role's, or in which another may create: a function
-   made there would run in place of the package's, as whoever reads as of a time.
+   database, which a role that doesn't own it hasn't by default, so a superuser makes it first,
+   empty, `CREATE SCHEMA <schema>_as_of AUTHORIZATION <administrator>` (the database's owner can
+   only where it may `SET ROLE` to the administrator's), and grants no other role `CREATE` there,
+   nor do the administrator's default privileges, which a schema made for it takes. `AsOf` names it
+   first on its search_path, so migrating, and `AsOf` itself, refuse one that holds more than the
+   views, is another role's, or in which another may create: a function, operator or type made
+   there, as an extension installed there makes, would run in place of the package's, as whoever
+   reads as of a time.
 2. A role of history's own, which the administrator's role is a member of and the application's
    isn't, owns `rbac_history` and the function `rbac_record`: transfer them to it after migrating.
    It needs `USAGE` on the schema, since every write to the package's tables runs `rbac_record`
@@ -900,8 +917,10 @@ have the server load a library or run a program of its choosing; and:
    on `rbac_history` can drop each record, as history's owner. And `USAGE` on the schema of `AsOf`'s
    views and `SELECT` on them, which `AsOf` refuses to read without, rather than read the tables as
    they are now: they read history with the rights of whoever reads them, so they give a role no row
-   of history it couldn't read already. Migrating gives them to every role that may then read
-   history; give them to one given history after.
+   of history it couldn't read already, but for `USAGE` on the package's schema, which a view
+   reading history by its oid doesn't ask of whoever reads it. Migrating gives them to every role
+   that may then read history and use the package's schema; give them to one given both after, and
+   revoke them from one that loses either.
 4. The application's role can make no schema and create in none, the schema of `AsOf`'s views
    either: it neither owns the database nor has `CREATE` on it, which `CREATE SCHEMA` needs and only
    the owner has by default, and it creates in no schema it owns, as `public` is when that role owns
@@ -1113,11 +1132,13 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   tables, in a schema beside the package's named as it with `_as_of` after, and the function
   `rbac_as_of_views`, which makes them again for a later migration that changes a table. Making
   the schema takes `CREATE` on the database: where the role migrating hasn't it, the migration
-  fails with SQLSTATE 42501, recording nothing, until a superuser or the database's owner makes the
-  schema for that role, empty, as the roles above say, and one that holds anything, is another
-  role's or in which another may create fails it with SQLSTATE 42P15. It gives the views and their
-  schema to each role that may read history then, as the application's role above, so that role
-  needs no new grant. It takes no lock a check, a change or a read of history waits for. Code from
+  fails with SQLSTATE 42501, recording nothing, until a superuser makes the schema for that role,
+  empty, as the roles above say, and one that holds anything, is another role's or in which another
+  may create, as the role's default privileges can have it, fails it with SQLSTATE 42P15, as does
+  one that has come to be so when a later migration makes the views again. It gives the views and
+  their schema to each role that may read history and use the package's schema then, as the
+  application's role above, so that role needs no new grant. It takes no lock a check, a change or a
+  read of history waits for. Code from
   before it makes temporary views for `AsOf`, as it still may beside it, and code from it on reads
   these, refusing as `rbac.ErrInvalid` to read as of a time where they aren't made: migrate before
   running it. From it on `AsOf` needs no `TEMPORARY`, so once no replica runs code from before it,
@@ -1125,10 +1146,12 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   `History` or `Export` back. Hooks and a host's queries on its
   transaction read the package's tables by name as of the time, as before, but its read runs READ
   ONLY, with the views' schema first on the search_path: `current_schema()` there names the views'
-  schema, a write there fails with SQLSTATE 25006 rather than roll back with the read, and one that
-  leaves the search_path, `rbac.as_of`, `rbac.as_of_tenant` or `rbac.as_of_cluster` set otherwise
-  fails `AsOf` as `rbac.ErrInvalid` once its read returns. Drop the views' schema with the
-  package's: dropping the package's drops the views, which read its history, but not their schema.
+  schema, a write there but to a temporary table fails with SQLSTATE 25006 rather than roll back
+  with the read, and one that leaves the search_path, the role, `rbac.as_of`, `rbac.as_of_tenant` or
+  `rbac.as_of_cluster` set otherwise fails `AsOf` as `rbac.ErrInvalid` once its read returns, as does
+  the views' schema holding more than the views, or another role being able to create there. Drop
+  the views' schema with the package's: dropping the package's drops the views, which read its
+  history, but not their schema.
   Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
   rolling upgrade across the two is unsafe: they key every lock apart, so a change by one waits for
   none by the other, and what each checks under its locks can change before it commits, as two

@@ -57,17 +57,27 @@ import (
 // ordinary subject, and compiling it took several times as long as running it. It makes no object
 // and takes no transaction id, so the role reading needs no TEMPORARY, only USAGE on the views'
 // schema and SELECT on them, which it is refused without, and its read holds no History or Export
-// back; under WithTx, a host's transaction that has taken one holds them back as it would anyway.
-// The search_path it reads by names the views' schema, then pg_temp, then the session's, as one
-// that doesn't name pg_temp reads a session's own tables first: one that names pg_temp after the
-// package's schema would have them read before the package's, and one that names it first reads
-// them as history, so AsOf refuses both. A statement of read that sets the search_path, or the
-// settings the views read the tenant, the time and the cluster by, would read another tenant, time
-// or the tables as they are now, so AsOf fails once read returns where one stays set: read's answers
-// stand only where it returns nil. It orders a row's changes by their ids in rbac_history, which
-// sessions take out of order once its id sequence caches more than one, so AsOf refuses that too. It
-// refuses a time before 4714 BC, the earliest PostgreSQL holds, or after 9999-12-30, the last the
-// package stores.
+// back; under WithTx, a host's transaction that has taken one holds them back as it would anyway,
+// as does a statement of read that writes a session's temporary table, which READ ONLY lets
+// through. So it reads on a hot standby too, as of what the standby has replayed, where History
+// fails. It drops the session's cached plans (DISCARD PLANS), under WithTx the host's too, which
+// their statements plan again at their next run. The search_path it reads by names the views'
+// schema, then pg_temp, then the session's, as one that doesn't name pg_temp reads a session's own
+// tables first: one that names pg_temp after the package's schema would have them read before the
+// package's, and one that names it first reads them as history, so AsOf refuses both. A function,
+// operator or type in the views' schema is found before the package's and run as whoever reads, so
+// it refuses that schema where it holds more than its owner's views, another role may create in it,
+// or it isn't the role's that owns the package's tables. A statement of read that sets the
+// search_path, the role, or the settings the views read the tenant, the time and the cluster by, or
+// another session revoking the role's USAGE on the views' schema, has the statements after it read
+// another tenant or time, or the tables as they are now, so AsOf fails once read returns where one
+// stays so: read's answers stand only where it returns nil. One made and undone within read it
+// can't tell, and the package's statements run between the two read by it: a call read makes
+// meanwhile, and those of a call after a hook of it that made it. So set them, or the role, in read
+// or a hook only within a savepoint rolled back before the package's next statement. It orders a
+// row's changes by their ids in rbac_history, which sessions take out of order once its id sequence
+// caches more than one, so AsOf refuses that too. It refuses a time before 4714 BC, the earliest
+// PostgreSQL holds, or after 9999-12-30, the last the package stores.
 func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read func(*Authorizer) error) (err error) {
 	defer conflicting(&err)
 	if !validID(tenant) {
@@ -132,24 +142,39 @@ func historySchema(ctx context.Context, tx pgx.Tx) (string, error) {
 // it finds by what they read, whatever either schema is named: refusing it where it holds no view
 // of one of the package's tables, those of schema prefixed rbac_, which would be read as it is now,
 // or where the search_path tx reads by names pg_temp, after schema, as packageSchema refuses one
-// that names it first.
+// that names it first. As migrating does, it refuses the views' schema where it isn't the role's
+// that owns the package's tables, another role may create in it, or it holds anything but views
+// of its owner's, but for default privileges, which hold no object: a function, operator or type
+// made there since, as by a grant of CREATE or an extension installed there, would be called in
+// place of the package's, as whoever reads.
 func asOfViews(ctx context.Context, tx pgx.Tx, schema string) (string, error) {
 	var views, bare []string
 	var path string
+	var planted bool
 	if err := tx.QueryRow(ctx, `WITH v AS (
 		  SELECT DISTINCT c.relnamespace AS oid FROM pg_catalog.pg_depend d
 		  JOIN pg_catalog.pg_rewrite w ON w.oid = d.objid
 		  JOIN pg_catalog.pg_class c ON c.oid = w.ev_class
 		  WHERE d.classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
-		    AND d.refobjid = $1::pg_catalog.text::pg_catalog.regclass AND c.relkind = 'v' AND c.relname = 'rbac_grants')
+		    AND d.refobjid = $1::pg_catalog.text::pg_catalog.regclass AND c.relkind = 'v' AND c.relname = 'rbac_grants'),
+		  here AS (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = $2)
 		SELECT ARRAY(SELECT n.nspname::pg_catalog.text FROM v JOIN pg_catalog.pg_namespace n ON n.oid = v.oid ORDER BY 1),
 		  ARRAY(SELECT t.relname::pg_catalog.text FROM pg_catalog.pg_class t
-		    WHERE t.relnamespace = (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = $2)
+		    WHERE t.relnamespace = (SELECT here.oid FROM here)
 		      AND t.relkind IN ('r', 'p') AND pg_catalog.starts_with(t.relname, 'rbac_') AND t.relname NOT IN ('rbac_history', 'rbac_migrations')
 		      AND NOT EXISTS (SELECT FROM pg_catalog.pg_class c, v WHERE c.relnamespace = v.oid AND c.relname = t.relname AND c.relkind = 'v')
 		    ORDER BY 1),
-		  pg_catalog.current_setting('search_path')`,
-		historyTable(schema), schema).Scan(&views, &bare, &path); err != nil {
+		  pg_catalog.current_setting('search_path'),
+		  EXISTS (SELECT FROM v JOIN pg_catalog.pg_namespace n ON n.oid = v.oid
+		    WHERE n.nspowner IS DISTINCT FROM (SELECT t.relowner FROM pg_catalog.pg_class t
+		        WHERE t.relnamespace = (SELECT here.oid FROM here) AND t.relname = 'rbac_grants' AND t.relkind IN ('r', 'p'))
+		      OR EXISTS (SELECT FROM pg_catalog.aclexplode(n.nspacl) a WHERE a.privilege_type = 'CREATE' AND a.grantee <> n.nspowner)
+		      OR EXISTS (SELECT FROM pg_catalog.pg_depend d
+		        WHERE d.refclassid = 'pg_catalog.pg_namespace'::pg_catalog.regclass AND d.refobjid = n.oid
+		          AND d.classid <> 'pg_catalog.pg_default_acl'::pg_catalog.regclass
+		          AND NOT EXISTS (SELECT FROM pg_catalog.pg_class c WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+		            AND c.oid = d.objid AND c.relkind = 'v' AND c.relowner = n.nspowner)))`,
+		historyTable(schema), schema).Scan(&views, &bare, &path, &planted); err != nil {
 		return "", err
 	}
 	switch {
@@ -159,6 +184,8 @@ func asOfViews(ctx context.Context, tx pgx.Tx, schema string) (string, error) {
 		return "", fmt.Errorf("%w: views of %s.rbac_history stand in schemas %s", ErrInvalid, schema, strings.Join(views, ", "))
 	case len(bare) > 0:
 		return "", fmt.Errorf("%w: schema %s holds no view of %s, which would be read as it is now", ErrInvalid, views[0], strings.Join(bare, ", "))
+	case planted:
+		return "", fmt.Errorf("%w: schema %s, of AsOf's views, holds more than its owner's views, isn't the role's that owns %s's tables, or lets another role create in it: what is made there is called in place of the package's", ErrInvalid, views[0], schema)
 	case namesTemp(path):
 		return "", fmt.Errorf("%w: the search_path names pg_temp after %s, whose tables AsOf would read the session's own before", ErrInvalid, schema)
 	}
@@ -207,19 +234,22 @@ func namesTemp(setting string) bool {
 const asOfTime = `YYYY-MM-DD HH24:MI:SS.US TZH BC`
 
 // asOfSet is what AsOf set its read's transaction to read by: the views' settings and the
-// search_path, as set_config returned them.
-type asOfSet struct{ tenant, at, cluster, path string }
+// search_path, as set_config returned them, and the views' schema, the current one by it.
+type asOfSet struct{ tenant, at, cluster, path, views string }
 
-// kept refuses, on tx, what a statement of AsOf's read left set otherwise.
+// kept refuses, on tx, what a statement of AsOf's read left set otherwise. The search_path alone
+// doesn't keep the views first: a role without USAGE on their schema, as a SET ROLE can make the
+// session's, or once another session revokes it, reads by it the tables as they are now.
 func (s asOfSet) kept(ctx context.Context, tx pgx.Tx) error {
 	var kept bool
 	if err := tx.QueryRow(ctx, `SELECT pg_catalog.current_setting('rbac.as_of_tenant') = $1 AND pg_catalog.current_setting('rbac.as_of') = $2
-		AND pg_catalog.current_setting('rbac.as_of_cluster') = $3 AND pg_catalog.current_setting('search_path') = $4`,
-		s.tenant, s.at, s.cluster, s.path).Scan(&kept); err != nil {
+		AND pg_catalog.current_setting('rbac.as_of_cluster') = $3 AND pg_catalog.current_setting('search_path') = $4
+		AND pg_catalog.current_schema() IS NOT DISTINCT FROM $5::pg_catalog.text`,
+		s.tenant, s.at, s.cluster, s.path, s.views).Scan(&kept); err != nil {
 		return err
 	}
 	if !kept {
-		return fmt.Errorf("%w: a statement of the read set the search_path, or what the views read the tenant, the time or the cluster by, so those after it read another tenant or time, or the tables as they are now", ErrInvalid)
+		return fmt.Errorf("%w: a statement of the read set the search_path, the role, or what the views read the tenant, the time or the cluster by, or the role lost USAGE on the views' schema, so those after it read another tenant or time, or the tables as they are now", ErrInvalid)
 	}
 	return nil
 }
@@ -253,10 +283,12 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	// arguments over history's views, statements cost past jit_above_cost though they read little,
 	// and a host's query of a Filter condition for a subject of a few hundred grants spent most of
 	// its time compiling. Read only, so no statement of read writes, or takes the transaction id a
-	// write would, and none can set the transaction to write again. A statement the session
-	// prepared earlier is parsed again, as PostgreSQL does once the search_path it was parsed by
-	// changes, so it reads the views. The current schema is then the views', unless the role has no
-	// USAGE on them, which the search_path leaves out, and the tables would be read as they are now.
+	// write would, but to a session's temporary table, and none can set the transaction to write
+	// again; under WithTx the savepoint's rollback leaves the host's as writable as it was. A
+	// statement the session prepared earlier is parsed again, as PostgreSQL does once the
+	// search_path it was parsed by changes, so it reads the views. The current schema is then the
+	// views', unless the role has no USAGE on them, which the search_path leaves out, and the tables
+	// would be read as they are now.
 	// And the plans the session's statements took in an earlier read are dropped (DISCARD PLANS),
 	// as that read's search_path was this one's: a generic plan a host's read forced there, made for
 	// its time and tenant and by the settings of the call that first ran it, would stand, so the
@@ -276,6 +308,7 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	if current != views {
 		return fmt.Errorf("%w: the role has no USAGE on schema %s, so its views can't stand in for the package's tables", ErrInvalid, views)
 	}
+	set.views = views
 	if _, err := tx.Exec(ctx, `DISCARD PLANS`); err != nil {
 		return err
 	}

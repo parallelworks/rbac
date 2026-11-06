@@ -1265,24 +1265,36 @@ flowchart LR
   the host's, which it makes READ ONLY and rolls back: so the package's statements, a hook's on the
   `DB` it is given, the host's on that transaction and `rbac_group_members`, which reads by its
   caller's search_path, read the tables by name as they were. It makes no object and takes no
-  transaction id, so the role reading needs no `TEMPORARY`, and the read holds no export back. Each
+  transaction id, so the role reading needs no `TEMPORARY`, the read holds no export back, but where
+  a statement in it writes a session's temporary table, which READ ONLY lets through, and it reads
+  on a hot standby too, as of what the standby has replayed. Each
   view reads the tenant, the time and the cluster from settings of the transaction
   (`rbac.as_of_tenant`, `rbac.as_of`, `rbac.as_of_cluster`), with the reader's rights
   (`security_invoker`), so a session that sets them itself reads through the views only the history
   it may read anyway, as row security policies on history apply to it, and unset, outside a read,
-  they read nothing or fail, never the tables. The views are owned by the role that migrated, in a
-  schema no other role may create in, as a function made there would be called in place of the
-  package's; migrating refuses a schema made for it that holds anything, is another's, or another
-  may create in, and gives the views and the schema to each role that may read history. AsOf finds
-  the views by the history they read, whatever either schema is named, and refuses where one of the
+  they read nothing or fail, never the tables. The views name history by its oid, so whoever reads
+  them is asked for no `USAGE` on the package's schema: migrating gives them only to the roles that
+  may read history and use that schema. The views are owned by the role that migrated, in a
+  schema no other role may create in, as a function, operator or type made there would be found
+  before the package's, and called as whoever reads; migrating refuses a schema made for it, or that
+  it made, as by the role's default privileges, that holds anything, is another's, or another may
+  create in, and one that came to be so since the views were made, and AsOf refuses alike one that
+  holds more than its owner's views, another may create in, or isn't the role's that owns the
+  package's tables, as a grant, an extension installed there or a change of owner can make it. AsOf
+  finds the views by the history they read, whatever either schema is named, as `rbac_as_of_views`
+  does by any of them left, and refuses where one of the
   package's tables has none, which would be read as it is now, or where the role has no `USAGE` on
   their schema, which the search_path would leave out; it refuses a search_path that names pg_temp
   after the package's schema, as it reads the session's own tables after its views and before the
   session's schemas, as a search_path that doesn't name it does. A statement of the read that leaves
-  the search_path or those settings set otherwise would read another tenant or time, or the tables
-  as they are now, so AsOf fails once read returns where one did. Each read drops the session's
-  plans (`DISCARD PLANS`): with the search_path alike in every read, a generic plan a host forced in
-  an earlier one, made for its time and tenant, would stand. Every statement is planned for its
+  the search_path, the role or those settings set otherwise, or another session revoking the role's
+  `USAGE` on the views' schema, would read another tenant or time, or the tables as they are now, so
+  AsOf fails once read returns where one did, by the settings and the current schema; one made and
+  undone within the read it can't tell, and the package's statements between the two read by it.
+  Each read drops the session's
+  plans (`DISCARD PLANS`), under `WithTx` the host's too: with the search_path alike in every read, a
+  generic plan a host forced in an earlier one, made for its time and tenant, would stand. Every
+  statement is planned for its
   arguments and runs without JIT, which such plans over history cost past `jit_above_cost` for any
   subject. It takes a time from PostgreSQL's earliest to 9999-12-30, to the microsecond, rounded
   down, as pgx sends it, and a later one as another.

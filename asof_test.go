@@ -510,14 +510,16 @@ func rebuilt(t *testing.T, h *harness, at time.Time) {
 	if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(*rbac.Authorizer) error {
 		for _, tb := range tables {
 			// The tenant's rows, each whole, generated columns included, in columns of the table's
-			// names, types and collations, in its order.
+			// names, types and collations, in its order, of the view the read names it by, not the
+			// table.
 			var missing, extra, columns int
 			if err := tx.QueryRow(ctx, `SELECT
 				  (SELECT count(*) FROM (SELECT * FROM `+tb.Schema+`.`+tb.Name+` WHERE tenant = 't1' EXCEPT ALL SELECT * FROM `+tb.Name+`) x),
 				  (SELECT count(*) FROM (SELECT * FROM `+tb.Name+` EXCEPT ALL SELECT * FROM `+tb.Schema+`.`+tb.Name+` WHERE tenant = 't1') x),
 				  (SELECT count(*) FROM (
 				    SELECT attnum, attname, atttypid, atttypmod, attcollation FROM pg_attribute WHERE attrelid = $1::regclass AND attnum > 0 AND NOT attisdropped
-				    EXCEPT SELECT attnum, attname, atttypid, atttypmod, attcollation FROM pg_attribute WHERE attrelid = to_regclass($2)) x)`,
+				    EXCEPT SELECT attnum, attname, atttypid, atttypmod, attcollation FROM pg_attribute
+				      WHERE attrelid = (SELECT c.oid FROM pg_class c WHERE c.oid = to_regclass($2) AND c.relkind = 'v')) x)`,
 				tb.Schema+"."+tb.Name, tb.Name).Scan(&missing, &extra, &columns); err != nil {
 				return err
 			}
@@ -3173,7 +3175,8 @@ func TestAsOfReadsTheSessionsTablesFirstAsTheSearchPathDoes(t *testing.T) {
 // AsOf reads each of the package's tables by its view, which migrating makes: where one is missing,
 // or the schema of them is, or the role reading has no USAGE on it, which the search_path then
 // leaves out, it refuses, rather than read that table as it is now. Made again, as a migration that
-// changes a table makes them, they are read again.
+// changes a table makes them, having dropped the view of a column it drops or retypes, rbac_grants's
+// too, they are read again, in the schema the views left stand in.
 func TestAsOfReadsNoTableWithoutItsView(t *testing.T) {
 	h, guardian := guarded(t)
 	ctx := t.Context()
@@ -3191,19 +3194,19 @@ func TestAsOfReadsNoTableWithoutItsView(t *testing.T) {
 			return nil
 		})
 	}
-	for _, drop := range []string{`DROP VIEW ` + views + `.rbac_denies`, `DROP SCHEMA ` + views + ` CASCADE`} {
+	for _, drop := range []string{`DROP VIEW ` + views + `.rbac_denies`, `DROP VIEW ` + views + `.rbac_grants`, `DROP SCHEMA ` + views + ` CASCADE`} {
 		if _, err := h.pool.Exec(ctx, drop); err != nil {
 			t.Fatal(err)
 		}
 		if err := read(); !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("after %s: %v", drop, err)
 		}
-	}
-	if _, err := h.pool.Exec(ctx, `SELECT rbac_as_of_views()`); err != nil {
-		t.Fatal(err)
-	}
-	if err := read(); err != nil {
-		t.Errorf("with the views made again: %v", err)
+		if _, err := h.pool.Exec(ctx, `SELECT rbac_as_of_views()`); err != nil {
+			t.Fatalf("making the views again after %s: %v", drop, err)
+		}
+		if err := read(); err != nil {
+			t.Errorf("with the views made again after %s: %v", drop, err)
+		}
 	}
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
@@ -3312,5 +3315,290 @@ func TestAsOfHoldsNoExportBack(t *testing.T) {
 		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// AsOf names the schema of its views first on its search_path, where a function, operator or type
+// is found before the package's or the session's and called as whoever reads: it refuses that
+// schema where another role may create in it, where it holds more than its owner's views, as a
+// function made there that would be called in place of rbac_group_members, a type or another
+// role's view, or where it is another role's than the package's tables', as each can come to be
+// since migrating checked it. Its default privileges hold no object, and are read past.
+func TestAsOfRefusesAViewsSchemaOthersCanMakeObjectsIn(t *testing.T) {
+	h := setup(t)
+	owner := h.as(t, "owner")
+	at := dbNow(t, h)
+	views := viewsOf(t, h)
+	for _, c := range []struct {
+		what    string
+		made    func(other string) []string
+		refused bool
+	}{
+		{"CREATE granted to another role", func(other string) []string {
+			return []string{`GRANT CREATE ON SCHEMA ` + views + ` TO ` + other}
+		}, true},
+		{"a function called in place of rbac_group_members", func(string) []string {
+			return []string{`CREATE FUNCTION ` + views + `.rbac_group_members(tenant text, groups text[], at timestamptz, principals text[], standing boolean)
+				RETURNS TABLE (group_id text, principal text, guest boolean) LANGUAGE sql AS $$ SELECT 'ops', 'user:planted', false $$`}
+		}, true},
+		{"a type", func(string) []string { return []string{`CREATE TYPE ` + views + `.planted AS (a int)`} }, true},
+		{"another role's view", func(other string) []string {
+			return []string{
+				`GRANT USAGE, CREATE ON SCHEMA ` + views + ` TO ` + other, `SET LOCAL ROLE ` + other,
+				`CREATE VIEW ` + views + `.planted AS SELECT 1 AS a`, `RESET ROLE`, `REVOKE CREATE ON SCHEMA ` + views + ` FROM ` + other,
+			}
+		}, true},
+		{"another role's schema", func(other string) []string { return []string{`ALTER SCHEMA ` + views + ` OWNER TO ` + other} }, true},
+		{"default privileges", func(other string) []string {
+			return []string{`ALTER DEFAULT PRIVILEGES IN SCHEMA ` + views + ` GRANT SELECT ON TABLES TO ` + other}
+		}, false},
+	} {
+		t.Run(c.what, func(t *testing.T) {
+			ctx := t.Context()
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			other, _ := role(t, tx)
+			for _, sql := range c.made(other) {
+				if _, err := tx.Exec(ctx, sql); err != nil {
+					t.Fatalf("%s: %v", sql, err)
+				}
+			}
+			read := false
+			err = h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+				read = true
+				return a.Authorize(ctx, owner, login, cluster)
+			})
+			if c.refused && (!errors.Is(err, rbac.ErrInvalid) || read) || !c.refused && err != nil {
+				t.Errorf("with %s in the views' schema, AsOf read %t: %v", c.what, read, err)
+			}
+		})
+	}
+}
+
+// AsOf's views stand in for the package's tables only while the role reading has USAGE on their
+// schema, which a search_path leaves out otherwise, reading the tables as they are now: a read
+// during which another session revokes it, or that leaves the session's role one without it, as a
+// SET ROLE can, fails AsOf once it returns, as one that leaves the search_path set otherwise does.
+func TestAsOfFailsWhereItsReadLeavesItsViewsOffTheSearchPath(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	u := h.as(t, "u")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	at := dbNow(t, h)
+	if err := h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "u")}); err != nil {
+		t.Fatal(err)
+	}
+	views := viewsOf(t, h)
+	var schema string
+	if err := h.pool.QueryRow(ctx, `SELECT quote_ident(current_schema())`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	// A role of the test's own, which another session revokes from as the read runs.
+	reader := pgx.Identifier{"rbac_test_" + strings.ToLower(rand.Text())}.Sanitize()
+	exec := func(sql string) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	exec(`CREATE ROLE ` + reader)
+	t.Cleanup(func() {
+		for _, sql := range []string{`DROP OWNED BY ` + reader, `DROP ROLE ` + reader} {
+			if _, err := h.pool.Exec(context.WithoutCancel(ctx), sql); err != nil {
+				t.Errorf("%s: %v", sql, err)
+			}
+		}
+	})
+	exec(`GRANT USAGE ON SCHEMA ` + schema + `, ` + views + ` TO ` + reader)
+	exec(`GRANT SELECT ON ALL TABLES IN SCHEMA ` + schema + `, ` + views + ` TO ` + reader)
+	for _, c := range []struct {
+		what, as string
+		during   func(host pgx.Tx) error
+	}{
+		{"another session revokes USAGE on the views' schema", reader, func(pgx.Tx) error {
+			_, err := h.pool.Exec(ctx, `REVOKE USAGE ON SCHEMA `+views+` FROM `+reader)
+			return err
+		}},
+		{"the host sets the role to one without it", "", func(host pgx.Tx) error {
+			_, err := host.Exec(ctx, `SET LOCAL ROLE `+reader)
+			return err
+		}},
+	} {
+		err := pgx.BeginFunc(ctx, h.pool, func(tx pgx.Tx) error {
+			if c.as != "" {
+				if _, err := tx.Exec(ctx, `SET LOCAL ROLE `+c.as); err != nil {
+					return err
+				}
+			}
+			return h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+				if err := c.during(tx); err != nil {
+					return err
+				}
+				// As a review records what each check answers, which stands only where AsOf returns
+				// nil: read as the tables are now, u holds no login.
+				_ = a.Authorize(ctx, u, login, cluster)
+				return nil
+			})
+		})
+		if !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("a read in which %s: %v", c.what, err)
+		}
+	}
+}
+
+// AsOf under WithTx reads in a savepoint of the host's transaction, which it makes READ ONLY and
+// rolls back whether read returns, fails, panics or its context ends: whatever the host's
+// transaction is, READ COMMITTED, REPEATABLE READ, SERIALIZABLE, READ ONLY or SERIALIZABLE READ
+// ONLY DEFERRABLE, each setting is as it was, the search_path, the role, AsOf's own and the
+// package's, JIT and the planner's among them, no transaction id is taken, and one that may write
+// writes.
+func TestAsOfLeavesTheHostsSettingsAsTheyWere(t *testing.T) {
+	h := setupOn(t, pgtest.Open(t, "pool_max_conns=1"))
+	// A SERIALIZABLE READ ONLY DEFERRABLE transaction waits for the serializable ones running on the
+	// server to end.
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+	owner := h.as(t, "owner")
+	at := dbNow(t, h)
+	// Once before, so each variable a read sets is one the session has.
+	if err := h.authz.AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error { return a.Authorize(ctx, owner, login, cluster) }); err != nil {
+		t.Fatal(err)
+	}
+	settings := func(tx pgx.Tx) []string {
+		t.Helper()
+		var s []string
+		if err := tx.QueryRow(ctx, `SELECT array_agg(name || '=' || setting ORDER BY name) || ARRAY[
+			  'rbac.as_of_tenant=' || current_setting('rbac.as_of_tenant'), 'rbac.as_of=' || current_setting('rbac.as_of'),
+			  'rbac.as_of_cluster=' || current_setting('rbac.as_of_cluster'), 'rbac.jit=' || coalesce(current_setting('rbac.jit', true), 'unset'),
+			  'rbac.enable_seqscan=' || coalesce(current_setting('rbac.enable_seqscan', true), 'unset'),
+			  'rbac.enable_sort=' || coalesce(current_setting('rbac.enable_sort', true), 'unset'),
+			  'current_user=' || current_user, 'current_schema=' || current_schema(), 'rbac_grants=' || 'rbac_grants'::regclass::text,
+			  'xid=' || coalesce(pg_current_xact_id_if_assigned()::text, 'none')]
+			FROM pg_settings`).Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	failed := errors.New("read failed")
+	for _, mode := range []pgx.TxOptions{
+		{IsoLevel: pgx.ReadCommitted},
+		{IsoLevel: pgx.RepeatableRead},
+		{IsoLevel: pgx.Serializable},
+		{IsoLevel: pgx.ReadCommitted, AccessMode: pgx.ReadOnly},
+		{IsoLevel: pgx.Serializable, AccessMode: pgx.ReadOnly, DeferrableMode: pgx.Deferrable},
+	} {
+		for _, end := range []string{"returns", "fails", "panics", "ends its context"} {
+			func() {
+				tx, err := h.pool.BeginTx(ctx, mode)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+				// The host's own, AsOf's settings too, as a session that set them itself has them.
+				if _, err := tx.Exec(ctx, `SELECT set_config('search_path', current_setting('search_path') || ', public', true),
+					set_config('plan_cache_mode', 'force_generic_plan', true), set_config('jit', 'on', true),
+					set_config('enable_seqscan', 'off', true), set_config('rbac.as_of_tenant', 'host', true),
+					set_config('rbac.as_of', 'host', true), set_config('rbac.as_of_cluster', 'host', true)`); err != nil {
+					t.Fatal(err)
+				}
+				before := settings(tx)
+				readCtx, cancelRead := context.WithCancel(ctx)
+				defer cancelRead()
+				func() {
+					defer func() { _ = recover() }()
+					err := h.authz.WithTx(tx).AsOf(readCtx, "t1", at, func(a *rbac.Authorizer) error {
+						if err := a.Authorize(readCtx, owner, login, cluster); err != nil {
+							return err
+						}
+						switch end {
+						case "fails":
+							return failed
+						case "panics":
+							panic(failed)
+						case "ends its context":
+							cancelRead()
+						}
+						return nil
+					})
+					if want := map[string]error{"fails": failed}[end]; !errors.Is(err, want) {
+						t.Errorf("in a host's transaction %+v, a read that %s: %v", mode, end, err)
+					}
+				}()
+				if after := settings(tx); !slices.Equal(after, before) {
+					var changed []string
+					for _, s := range after {
+						if !slices.Contains(before, s) {
+							changed = append(changed, s)
+						}
+					}
+					t.Errorf("in a host's transaction %+v, after a read that %s, %v", mode, end, changed)
+				}
+				_, err = tx.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+					VALUES ('t1', 'cluster', 'c1', 'user', 'w', 'cluster.login')`)
+				if mode.AccessMode == pgx.ReadOnly && sqlState(err) != "25006" || mode.AccessMode != pgx.ReadOnly && err != nil {
+					t.Errorf("in a host's transaction %+v, a write after a read that %s: %v", mode, end, err)
+				}
+			}()
+		}
+	}
+}
+
+// AsOf finds its views by the history they read, whatever either schema is named: renamed, the
+// package's schema and the views' are read on, and the views made again, as a later migration
+// makes them, stand where they did, not in a schema named after the package's new name.
+func TestAsOfReadsItsViewsWhateverEitherSchemaIsNamed(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	u := h.as(t, "u")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	at := dbNow(t, h)
+	if err := h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "u")}); err != nil {
+		t.Fatal(err)
+	}
+	var schema string
+	if err := h.pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	rename := func(from, to string) error {
+		_, err := h.pool.Exec(context.WithoutCancel(ctx), `ALTER SCHEMA `+pgx.Identifier{from}.Sanitize()+` RENAME TO `+pgx.Identifier{to}.Sanitize())
+		return err
+	}
+	renamed := map[string]string{schema: schema + "_renamed", schema + "_as_of": schema + "_views"}
+	for from, to := range renamed {
+		if err := rename(from, to); err != nil {
+			t.Fatal(err)
+		}
+		// Before the pool's cleanup drops both by their names.
+		t.Cleanup(func() {
+			if err := rename(to, from); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	if err := pgx.BeginFunc(ctx, h.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT set_config('search_path', quote_ident($1), true)`, renamed[schema]); err != nil {
+			return err
+		}
+		if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error { return a.Authorize(ctx, u, login, cluster) }); err != nil {
+			return fmt.Errorf("as of when u held its login, with both schemas renamed: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `SELECT rbac_as_of_views()`); err != nil {
+			return err
+		}
+		var views []string
+		if err := tx.QueryRow(ctx, `SELECT array_agg(DISTINCT n.nspname::text) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE c.relkind = 'v' AND c.relname = 'rbac_grants' AND n.nspname IN ($1, $2, $3)`,
+			renamed[schema+"_as_of"], renamed[schema]+"_as_of", schema+"_as_of").Scan(&views); err != nil {
+			return err
+		}
+		if want := []string{renamed[schema+"_as_of"]}; !slices.Equal(views, want) {
+			return fmt.Errorf("made again, the views stand in %v, not %v", views, want)
+		}
+		return nil
+	}); err != nil {
+		t.Error(err)
 	}
 }
