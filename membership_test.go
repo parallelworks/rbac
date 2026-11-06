@@ -4672,6 +4672,71 @@ func TestDeleteGroupDecidesThePowerAndTheDenyItActsByAsOfOneMoment(t *testing.T)
 	}
 }
 
+// A change to members whose actor a deny removing its power to change grants on clusters bound
+// before its transaction decides, under its locks, its power over the members and the denies on the
+// path of a cluster it takes access away on as of one moment, as DeleteGroup does. Here the deny
+// binding it is on another cluster, so the removal passes its check before the transaction; once it
+// has, a deny of the same on the tenant, naming the actor and exempting a group, is set, and once
+// the transaction has read the actor's authority, the actor moves from the group giving it its
+// power over crew's members to the exempt one: at no moment did it hold that power and escape the
+// deny, so the removal is refused. Read apart, its power before the move and the deny after it, u
+// was removed from crew and lost its login on the cluster.
+func TestARemovalDecidesThePowerAndTheDenyItActsByAsOfOneMoment(t *testing.T) {
+	asked := false
+	h := grouped(t, func(c *rbac.Config) {
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			asked = asked || s == cluster.Scope()
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	h.groups(t, "crew", "powers", "exempt")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"), grant(rbac.TenantRoot("t1"), "group.members", rbac.Group, "powers"))
+	h.join(t, "u")
+	crew := rbac.Member{Group: "crew", Principal: identity("u")}
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{crew}); err != nil {
+		t.Fatal(err)
+	}
+	x := h.as(t, "x", "powers")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+		VALUES ('t1', 'cluster', 'c2', 'frozen', '{user:x}', ARRAY[$1::text])`, grantC); err != nil {
+		t.Fatal(err)
+	}
+	set, moved := false, false
+	rbac.SetReadingRoles(t, func() {
+		switch {
+		// Once the removal has read, before its transaction, the denies on the cluster's path.
+		case h.pool.Stat().AcquiredConns() == 0:
+			if !asked || set {
+				return
+			}
+			set = true
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+				VALUES ('t1', 'tenant', 't1', 'frozen', '{user:x}', '{group:exempt}', ARRAY[$1::text])`, grantC); err != nil {
+				t.Error(err)
+			}
+		case set && !moved:
+			moved = true
+			if _, err := h.pool.Exec(ctx, `WITH gone AS (DELETE FROM rbac_members WHERE tenant = 't1' AND group_id = 'powers' AND principal = 'user:x')
+				INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'exempt', 'user', 'x')`); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	err := h.authz.ChangeMembers(ctx, x, "t1", nil, []rbac.Member{crew})
+	if !set || !moved {
+		t.Fatalf("the deny was set %t, and the actor moved %t, while the removal was made: %v", set, moved, err)
+	}
+	var denied *rbac.DeniedError
+	if !errors.As(err, &denied) || denied.Permission != grantC {
+		t.Errorf("u was removed from crew, by an actor that held the power over its members and escaped the deny at no moment: %v", err)
+	}
+	if !allowed(t, h, rbac.Subject{Principal: identity("u")}, login, cluster) {
+		t.Error("u lost its login on the cluster")
+	}
+}
+
 // Where no deny binding the actor removed its power to change grants before a change's transaction,
 // the change reads none on the paths of the scopes it takes access away on, and under its locks
 // whether one now may in the read of the power it acts by, so it decides both as of one moment:
