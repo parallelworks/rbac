@@ -482,9 +482,10 @@ scopes conditional ones reach, to check one by one.
   groups or the tenant's members, though no group of its exempts it from one: suspending it lifts
   nothing. One whose membership has ended is in none of its groups, though `DeleteExpired` hasn't
   removed its places yet: `Members` and `GroupsOf` list none of them, `ChangeMembers` removing it
-  from one takes nothing away, so no freeze or label refuses that, though making its place there
-  end sooner adds an identity that isn't a member, which is refused, and `DeleteGroup` counts none
-  as a member from a source the host owns, as each did until `DeleteExpired` ran. When the host
+  from one takes nothing away, so no freeze, label or deny refuses that, though making its place
+  there end sooner adds an identity that isn't a member, which is refused, and `DeleteGroup` counts
+  none as a member from a source the host owns. Read as stored, each such place was one a removal
+  took away, and a member the host keeps, until `DeleteExpired` ran. When the host
   takes a group over (`ImportGroups` from one of `Config.Sources`), the members a tenant put in
   it, from no source of the host's, leave it.
 - **Changing members is granting:** a group's members hold what it and the groups it is in hold,
@@ -568,11 +569,12 @@ holder each, marking those that hold only under a condition or that a deny or co
 It evaluates no condition, so it lists too many rather than too few: every conditional grant and
 deny is marked unevaluated, so those marked can include one a condition reading only the resource
 always refuses, or always allows, and a deny leaves out whom it binds only where it has no
-condition. That holds of a labeled resource's holders' label values too, whose conditions it
-evaluated for each holder and set aside, as it lists the same whatever they come to: a value
-granted to a group of 1,000 under a costly condition took it a second, where granted under none,
-33 ms. A `DeniedError`'s message names only the permission, so an error shown to a user shows
-no policy; its fields say why. Every refusal is one, a hook that can't be given its copy too.
+condition. That holds of a labeled resource's holders' label values too: it lists the same
+whatever their conditions come to, so it evaluates none of them, where evaluating each holder's
+and setting what they came to aside, a value granted to a group of 1,000 under a costly condition
+took it a second, and granted under none, 33 ms. A `DeniedError`'s message names only the
+permission, so an error shown to a user shows no policy; its fields say why. Every refusal is one,
+a hook that can't be given its copy too.
 
 ## History
 
@@ -927,15 +929,16 @@ against, and nothing such a table runs, as its row security policy, runs as hist
   later records are numbered below its earlier ones, and `AsOf` reads it as it was before them. It
   now refuses before it reads a table, or calls a function or an operator its search_path finds.
   `0026_conditional_seeks` builds an index of conditional grants on `rbac_grants` and one of the
-  eligibilities with a requirement on `rbac_eligibilities`, the eligibilities' first, as a change
-  writing both writes them first, which keep writes to each table waiting until it commits, though
-  reads go on. A conditional grant, and a group's eligibility with a requirement, is bounded with
-  those beside it on its scope, read under the scope's lock: without them, every grant to a group
-  on the scope, or every eligibility there, was read from the table to find those, so a
-  conditional grant to a group beside 80,000 unconditional ones on a tenant took 39 ms, against
-  7 ms unconditional, and by statistics from before they were made, every grant in the table was
-  read. Code from before it and after it run beside each other, applied or not: only what those
-  reads cost turns on it.
+  eligibilities with a requirement on `rbac_eligibilities`, the eligibilities' first, as most
+  changes writing both write them first, which keep writes to each table waiting until it commits,
+  those to eligibilities while it builds both, though reads go on. A `DeleteRole` under way as it
+  starts, which deletes the role's grants before its eligibilities, can make it give way. A
+  conditional grant, and a group's eligibility with a requirement, is bounded with those beside it
+  on its scope, read under the scope's lock: without them, every grant to a group on the scope, or
+  every eligibility there, was read from the table to find those, so a conditional grant to a
+  group beside 80,000 unconditional ones on a tenant took 39 ms, against 7 ms unconditional, and by
+  statistics from before they were made, every grant in the table was read. Code from before it
+  and after it run beside each other, applied or not: only what those reads cost turns on it.
   Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
   rolling upgrade across the two is unsafe: they key every lock apart, so a change by one waits for
   none by the other, and what each checks under its locks can change before it commits, as two

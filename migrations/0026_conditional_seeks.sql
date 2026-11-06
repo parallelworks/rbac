@@ -14,8 +14,9 @@
 -- read seeks it by a row comparison of those columns that no other index can seek, whatever the
 -- statistics count.
 --
--- The eligibilities' is built first, as changes that write both tables write eligibilities first,
--- as deleting a scope does. Building each keeps writes to its table waiting until the migration
+-- The eligibilities' is built first, as most changes that write both tables write eligibilities
+-- first, as deleting a scope does; DeleteRole deletes a role's grants first, so one under way can
+-- make the migration give way. Building each keeps writes to its table waiting until the migration
 -- commits, though reads go on.
 CREATE INDEX rbac_eligibilities_requires ON rbac_eligibilities (scope, role, tenant, principal) WHERE requires <> '';
 
