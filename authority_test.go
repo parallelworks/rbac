@@ -4002,6 +4002,24 @@ func TestHoldersAndMembersReadTheMembershipsOfALargeGroupInAsManyPages(t *testin
 	}
 }
 
+// Holders and Members list a group's members in a statement PostgreSQL may run in parallel, as it
+// runs every statement whose plan holds a Gather, however small its part: rbac_group_members, kept
+// to the plan's leader, runs there in parallel mode, where a function may change a setting only by
+// its SET clause, and one that set enable_seqscan itself failed the call (SQLSTATE 25000).
+func TestHoldersAndMembersListAGroupInAParallelPlan(t *testing.T) {
+	h := setupOn(t, pgtest.Open(t, "debug_parallel_query=on"))
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
+	h.as(t, "u", "crew")
+	holders, err := h.authz.Holders(ctx, login, cluster)
+	if want := []rbac.Principal{identity("u")}; err != nil || !slices.Equal(holderPrincipals(holders), want) {
+		t.Errorf("Holders = %+v, %v, want %v", holders, err, want)
+	}
+	if ms, err := h.authz.Members(ctx, "t1", "crew"); err != nil || len(ms) != 1 || ms[0].Principal != identity("u") {
+		t.Errorf("Members = %+v, %v", ms, err)
+	}
+}
+
 // A small group whose id other tenants use too, as each can name its own admins, is read alone in a
 // large tenant, in every plan: Holders and Members read only its members' memberships, and
 // DeleteGroup only its row of the groups. Counted by the tenant's selectivity and the id's apart, as

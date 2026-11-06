@@ -1095,13 +1095,13 @@ can leave the application's role without it. The administrator's and history's r
   the host transaction's own changes, which haven't committed, where earlier code counted those
   dated by its time: read them after the transaction commits.
   `0029_member_reads` replaces `rbac_group_members` again, which keeps its owner and who may execute
-  it and takes no lock on the tables, to plan its read of the groups' places with sequential scans
-  off and a group at a time, in the order of the primary key, and its join of the members to their
-  memberships with them on, whatever its caller's: code from this release runs every statement
-  calling it with them off, so its join read each of a group of 20,000's memberships on its own,
-  20,179 pages that fill 856, and code from before it reads the places by statistics alone, every
-  place in the table by those from when it was nearly empty. Code from before it and after it run
-  beside each other, applied or not.
+  it and takes no lock on the tables, to plan its statements with sequential scans off, by its SET
+  clause, whatever its caller's: it reads the groups' places a group at a time, in the order of the
+  primary key, and the members' memberships by their keys, through a bitmap where they are many.
+  Code from this release runs every statement calling it with them off, so its join of a group of
+  20,000 to their memberships, as before, looked each up on its own, 20,179 pages that fill 856, and
+  code from before it reads the places by statistics alone, every place in the table by those from
+  when it was nearly empty. Code from before it and after it run beside each other, applied or not.
   Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
   rolling upgrade across the two is unsafe: they key every lock apart, so a change by one waits for
   none by the other, and what each checks under its locks can change before it commits, as two

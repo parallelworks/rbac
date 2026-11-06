@@ -3,14 +3,19 @@
 -- read by key however small they were when a session planned the calling statement; and a function
 -- takes its caller's settings. Its first statement, reading the groups' places, needs them off too:
 -- planned by statistics from when rbac_members was nearly empty, which count a group's places as
--- the whole table's, it read every place in the table, 20 pages and 284 beside 20,000 others'. Its
--- second, joining the members to their memberships, needs them on: planned for the members'
--- number, many are read with the tenant's memberships, which with sequential scans off became a
--- lookup each, 20,179 pages of memberships that fill 856 for a group of 20,000. So it sets them off
--- for itself, which PostgreSQL puts back as it returns, reads each group's places on its own, in the
--- primary key's order, which only the index leading to the group gives, so a plan can't read them
--- by an index leading to the tenant alone, and turns them on for the join. Replacing it keeps its
--- owner and who may execute it, and takes no lock on the tables.
+-- the whole table's, it read every place in the table, 20 pages and 284 beside 20,000 others'. So it
+-- sets them off for itself, by its SET clause, which PostgreSQL puts back as it returns, and reads
+-- each group's places on its own, in the primary key's order, which only the index leading to the
+-- group gives, so a plan can't read them by an index leading to the tenant alone. Its second, joining
+-- the members to their memberships, is planned for the members' number: as a join to the table, many
+-- were each looked up on its own with sequential scans off, 20,179 pages of memberships that fill
+-- 856 for a group of 20,000. So it reads the members' memberships by their keys, as = ANY of them,
+-- which a plan for many reads through a bitmap of an index leading to the principal, each page once,
+-- and hashes with the members: 633 pages for a group of 20,000 beside 20,000 other tenants'
+-- memberships. Not by setting them on for that statement: a function runs in parallel mode
+-- where its calling statement does, as one with a Gather anywhere in its plan does, and there a
+-- setting changes only by a SET clause, so set_config failed the call. Replacing it keeps its owner
+-- and who may execute it, and takes no lock on the tables.
 CREATE OR REPLACE FUNCTION rbac_group_members(tenant text, groups text[], at timestamptz, principals text[], standing boolean)
     RETURNS TABLE (group_id text, principal text, guest boolean) LANGUAGE plpgsql STABLE PARALLEL RESTRICTED
     SET enable_seqscan = off AS $$
@@ -34,9 +39,8 @@ BEGIN
     END IF;
     EXECUTE 'SELECT array_agg(m.group_id), array_agg(m.principal)' || places
         INTO ids, keys USING tenant, groups, at, principals;
-    PERFORM set_config('enable_seqscan', 'on', true);
     RETURN QUERY EXECUTE 'SELECT u.g, u.p, s.guest FROM unnest($2::text[], $3::text[]) AS u(g, p)
-        JOIN rbac_memberships s ON s.tenant = $1 AND s.principal = u.p COLLATE "C"
-          AND NOT s.suspended AND (s.expires_at IS NULL OR s.expires_at > $4)'
+        JOIN (SELECT principal, guest FROM rbac_memberships WHERE tenant = $1 AND principal = ANY ($3::text[])
+          AND NOT suspended AND (expires_at IS NULL OR expires_at > $4) OFFSET 0) s ON s.principal = u.p COLLATE "C"'
         USING tenant, ids, keys, at;
 END $$;

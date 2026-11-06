@@ -377,9 +377,11 @@ flowchart BT
   group's members by the tenant's selectivity and the group id's apart, so a large tenant's group
   of one whose id other tenants use too was counted as a thousand or more, and joined in one
   statement its memberships were hashed with every tenant's; looked up each by its key, a group of
-  20,000 read 80,000 pages of memberships that fill 900. It reads the places with sequential scans
-  off, a group at a time in the primary key's order, and the memberships with them on, whatever its
-  caller's (`0029_member_reads`), as every statement calling it now has them off. `Members` takes
+  20,000 read 80,000 pages of memberships that fill 900. It reads with sequential scans off, by its
+  SET clause, whatever its caller's (`0029_member_reads`): the places a group at a time in the
+  primary key's order, and the memberships by their keys, as `= ANY` of them, which a plan for many
+  reads through a bitmap, each page once. It sets nothing in its body, as the calling statement may
+  run in parallel mode, where only a function's SET clause changes a setting. `Members` takes
   the identities whose membership stands from it, and looks only the rest up by key.
 
 ## Resources, scopes and paths
