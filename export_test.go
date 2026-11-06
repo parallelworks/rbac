@@ -953,6 +953,10 @@ var HoldSQL = holdSQL
 // tenant $1, the activations' ids $2, now $3.
 var RestsSQL = restsSQL
 
+// CutSQL is the statement a change cuts activations short with: their ids $1, their ends $2 in the
+// same order, the actor's key $3.
+const CutSQL = cutSQL
+
 // EndsSQL is the statement a change reads when its actor's paths to each key it holds end with:
 // tenant $1, the identity's key $2, now $3.
 var EndsSQL = `WITH RECURSIVE ` + endsSQL("$2::text", "$3") + ` SELECT k, e FROM ends`

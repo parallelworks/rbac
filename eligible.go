@@ -616,6 +616,16 @@ var restsSQL = `
 	)
 	SELECT id::text, until FROM rests WHERE until IS NULL OR until < expires_at ORDER BY id`
 
+// cutSQL is unrest's statement cutting activations short, as actor $3: those whose ids are in $1,
+// each to the end at its place in $2. Each found by its id: joined to the ends, a plan made while
+// the table was small read it whole. And each one's place looked up by its id in an object of them
+// made once for the statement: looked up among the ends for each, it read the square of their
+// number, 15 seconds under the change's locks for 5,000.
+const cutSQL = `UPDATE rbac_grants g SET updated_by = $3, updated_at = now(),
+	  expires_at = ($2::timestamptz[])[((SELECT jsonb_object_agg(c.i, c.n) FROM unnest($1::text[]) WITH ORDINALITY AS c(i, n)) ->> g.id::text)::int]
+	WHERE id = ANY($1::text[]::uuid[])
+	RETURNING ` + grantColumns
+
 // unrest cuts short, in tx, as actor, the activations r found resting, once the change has ended
 // places or memberships, whose holders reach the principals they were made through until sooner
 // than they last: each to the latest end of the paths left, or ended if none is left past now,
@@ -653,13 +663,8 @@ func (a *Authorizer) unrest(ctx context.Context, tx pgx.Tx, tenant string, actor
 	if len(gone) > 0 {
 		stmts = append(stmts, removing(a, "rbac_grants", grantColumns, collectGrants, &ended, "id = ANY($1::text[]::uuid[])", gone))
 	}
-	// Each by its id, its end looked up among those cut: joined to them, a plan made while the table
-	// was small read it whole.
 	if len(cut) > 0 {
-		stmts = append(stmts, stmt(collecting(&short, collectGrants), `UPDATE rbac_grants g SET updated_by = $3, updated_at = now(),
-			  expires_at = (SELECT c.x FROM unnest($1::text[], $2::timestamptz[]) AS c(i, x) WHERE c.i::uuid = g.id)
-			WHERE id = ANY($1::text[]::uuid[])
-			RETURNING `+grantColumns, cut, to, actorKey(actor)))
+		stmts = append(stmts, stmt(collecting(&short, collectGrants), cutSQL, cut, to, actorKey(actor)))
 	}
 	if err := byIndexes(ctx, tx, stmts...); err != nil {
 		return nil, nil, err

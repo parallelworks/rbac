@@ -669,6 +669,72 @@ func TestWalkingUpLayeredGroupsWalksTheLatestPathToEachAlone(t *testing.T) {
 	walks("Ending places sooner", rbac.RestsSQL, "t1", []string{g.ID}, h.now)
 }
 
+// A change cutting activations short finds each one's end once: looked up among the ends for each
+// activation, the statement read the square of their number, and a change cutting 1,000 short, as
+// one removing a group its members activated through, held its locks for half a second more, and
+// for 5,000, 15 seconds.
+func TestCuttingActivationsShortReadsEachEndOnce(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	const n = 500
+	var ids []string
+	if err := h.pool.QueryRow(ctx, `WITH made AS (
+		  INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at)
+		  SELECT 't1', 'cluster', 'c1', 'user', 'u' || i, 'cluster.sudo', 'activation', $2 FROM generate_series(1, $1) i RETURNING id)
+		SELECT array_agg(id::text ORDER BY id) FROM made`, n, h.now.Add(time.Hour)).Scan(&ids); err != nil {
+		t.Fatal(err)
+	}
+	ends := make([]time.Time, n)
+	for i := range ends {
+		ends[i] = h.now.Add(time.Duration(n-i) * time.Second)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// The rows each node of the plan read, kept or not.
+	type node struct {
+		Rows    float64 `json:"Actual Rows"`
+		Loops   float64 `json:"Actual Loops"`
+		Removed float64 `json:"Rows Removed by Filter"`
+		Plans   []node
+	}
+	var read func(node) float64
+	read = func(p node) float64 {
+		sum := (p.Rows + p.Removed) * p.Loops
+		for _, c := range p.Plans {
+			sum += read(c)
+		}
+		return sum
+	}
+	var plan []struct{ Plan node }
+	if err := tx.QueryRow(ctx, "EXPLAIN (ANALYZE, FORMAT JSON) "+rbac.CutSQL, ids, ends, "user:host").Scan(&plan); err != nil {
+		t.Fatal(err)
+	}
+	if rows := read(plan[0].Plan); rows > 8*n {
+		t.Errorf("cutting %d activations short read %.0f rows", n, rows)
+	}
+	rows, err := tx.Query(ctx, `SELECT id::text, expires_at FROM rbac_grants WHERE id = ANY($1::uuid[])`, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]time.Time{}
+	var id string
+	var until time.Time
+	if _, err := pgx.ForEachRow(rows, []any{&id, &until}, func() error {
+		got[id] = until
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i, id := range ids {
+		if !got[id].Equal(ends[i]) {
+			t.Fatalf("activation %s was cut short to %v, not %v", id, got[id], ends[i])
+		}
+	}
+}
+
 // An identity whose membership is made to end sooner, and ends, joins again in none of its groups
 // and with none of the activations it made through them.
 func TestJoiningAgainGivesBackNoActivationThroughAGroup(t *testing.T) {
