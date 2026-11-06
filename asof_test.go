@@ -2651,6 +2651,89 @@ func TestAsOfDatesARestoredChangeWithinItsCluster(t *testing.T) {
 	}
 }
 
+// A version of a row whose transaction wrote a later one dated by a time hasn't counted by then
+// where the later one hasn't, as their commit is the same: but a restored version and a later one
+// of this cluster that share a txid are of two transactions. Taken for one, the restored grant
+// read as superseded by a version of the same row a transaction of this cluster held open, while
+// it was, and as of then the row read as no grant at all. And the commit record, reading every
+// record of the txid as its transaction's, refused that transaction's commit, as the restored one
+// names another cluster.
+func TestAsOfTellsATransactionApartFromAnotherClustersOfTheSameTxid(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	_, theirs := otherCluster(t, h)
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "tmpl"))
+	old := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	var txid string
+	if err := tx.QueryRow(ctx, `SELECT pg_current_xact_id()::text`).Scan(&txid); err != nil {
+		t.Fatal(err)
+	}
+	// A grant restored from another cluster, committed there long ago, whose txid this cluster
+	// gives the transaction that, held open past mid, writes the same row anew.
+	restoreRows(t, h,
+		fakeGrant(old.Format("2006-01-02 15:04:05"), theirs, txid),
+		fakeCommit(old.Add(time.Second).Format("2006-01-02 15:04:05"), theirs, txid),
+	)
+	if _, err := tx.Exec(ctx, `INSERT INTO rbac_grants (id, tenant, scope_type, scope_id, principal_kind, principal_id, role, note)
+		VALUES (md5('restored-grant')::uuid, 't1', 'cluster', 'c1', 'user', 'restored', 'cluster.login', 'anew')`); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	mid := dbNow(t, h)
+	time.Sleep(20 * time.Millisecond)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.AsOf(ctx, "t1", mid, func(a *rbac.Authorizer) error {
+		grants, err := a.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{identity("restored")}})
+		if err == nil && (len(grants) != 1 || grants[0].Note == "anew") {
+			t.Errorf("as of %v, a restored grant, a change of which a transaction sharing its txid held open: %+v", mid, grants)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A read as of a time counts none of its own transaction's changes, which haven't committed, but a
+// change a restore carried from another cluster, of a txid this cluster has since given the
+// reading transaction, committed there: taken for the reader's own, the restored grant read as
+// never made.
+func TestAsOfCountsAnotherClustersChangeOfItsOwnTxid(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	_, theirs := otherCluster(t, h)
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "tmpl"))
+	old := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	var txid string
+	if err := tx.QueryRow(ctx, `SELECT pg_current_xact_id()::text`).Scan(&txid); err != nil {
+		t.Fatal(err)
+	}
+	restoreRows(t, h,
+		fakeGrant(old.Format("2006-01-02 15:04:05"), theirs, txid),
+		fakeCommit(old.Add(time.Second).Format("2006-01-02 15:04:05"), theirs, txid),
+	)
+	if err := h.authz.WithTx(tx).AsOf(ctx, "t1", dbNow(t, h), func(a *rbac.Authorizer) error {
+		grants, err := a.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{identity("restored")}})
+		if err == nil && len(grants) != 1 {
+			t.Errorf("as of now, read in a transaction of the txid of a restored grant of another cluster: %+v", grants)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // History stamps each record with the cluster that wrote it, which it reads once a transaction and
 // keeps in a setting, rbac.cluster, that any session can set as well: a revoke stamped with another
 // cluster than its commit record would count from its own date, before it committed, as a restored
@@ -2673,6 +2756,7 @@ func TestACommitRefusesRecordsStampedWithAnotherCluster(t *testing.T) {
 		{name: "set for the revoke alone", queries: []string{set(true, theirs), revoke, set(true, "")}},
 		{name: "set for the transaction", queries: []string{set(true, theirs), revoke}},
 		{name: "set for the session", queries: []string{set(false, theirs), revoke}},
+		{name: "set in a savepoint released", queries: []string{`SAVEPOINT s`, set(true, theirs), revoke, `RELEASE SAVEPOINT s`, set(true, "")}},
 		{name: "set after an early commit record", queries: []string{
 			revoke, `SET CONSTRAINTS ALL IMMEDIATE`, set(true, theirs), grantW, set(true, ""),
 		}},

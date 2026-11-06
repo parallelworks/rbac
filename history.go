@@ -330,9 +330,12 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 		return 0, nil, err
 	}
 	history := historyTable(schema)
-	// AsOf refuses a time before the prune's, so one yet to come would refuse the present.
+	// AsOf refuses a time before the prune's, so one yet to come would refuse the present. And the
+	// cluster the prune reads, whose txid of its own transaction names its own versions (byAnother).
 	var future bool
-	if err := tx.QueryRow(ctx, `SELECT $1::pg_catalog.timestamptz > statement_timestamp()`, before).Scan(&future); err != nil {
+	var cluster int64
+	if err := tx.QueryRow(ctx, `SELECT $1::pg_catalog.timestamptz > statement_timestamp(), (pg_catalog.pg_control_system()).system_identifier`,
+		before).Scan(&future, &cluster); err != nil {
 		return 0, nil, err
 	}
 	if future {
@@ -361,7 +364,7 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', 'on', true)`); err != nil {
 		return 0, nil, err
 	}
-	b := byTime{history: history, at: "$1"}
+	b := byTime{history: history, at: "$1", cluster: "$7::pg_catalog.int8"}
 	// Whether h ends its row, and no version before it stays.
 	ended := `h.op IN ('delete', 'expire') AND NOT EXISTS (
 		SELECT FROM ` + history + ` s
@@ -403,8 +406,7 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 		), versions AS (
 		  SELECT h.id FROM `+history+` h
 		  WHERE h.id > $5 AND h.id <= (SELECT last FROM win) AND (h.txid, h.id) < ($2::pg_catalog.xid8, $3)
-		    AND h.entity NOT IN ('history', 'commit') AND h.effective_at <= $1
-		    AND h.txid IS DISTINCT FROM pg_catalog.pg_current_xact_id_if_assigned()
+		    AND h.entity NOT IN ('history', 'commit') AND h.effective_at <= $1 AND `+b.byAnother("h")+`
 		    AND CASE WHEN `+b.later("h", "h.entity")+` IS NOT NULL THEN `+b.committedBy("h")+`
 		      ELSE `+b.byCommit("h", b.writtenLater("h", "h.entity")+" OR "+ended, ended+" AND c.at <= $1")+` END
 		), commits AS (
@@ -433,7 +435,7 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 		  FROM latest l
 		)
 		SELECT (SELECT count(*) FROM pruned), (SELECT id FROM reach)`,
-		pgx.QueryExecModeCacheDescribe, before, through.TxID, through.ID, most, from, maxPrune).Scan(&n, &next); err != nil {
+		pgx.QueryExecModeCacheDescribe, before, through.TxID, through.ID, most, from, maxPrune, cluster).Scan(&n, &next); err != nil {
 		return 0, nil, err
 	}
 	// Under a host's transaction, which goes on past the prune.

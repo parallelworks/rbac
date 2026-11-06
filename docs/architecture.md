@@ -1248,8 +1248,12 @@ flowchart LR
   too: rows of a lost timeline brought back into it would match its new transactions' commit
   records. The trigger stamps a record from a setting of its transaction, read from the server
   once, which a session can set as well, so the commit record reads the server's identifier and
-  refuses the commit (SQLSTATE 42501) where any record of its transaction names another: a version
-  so stamped would count from its own date, before the commit. `History` returns the stamp
+  refuses the commit (SQLSTATE 42501) where any record its transaction wrote names another: a
+  version so stamped would count from its own date, before the commit. A restored record of
+  another cluster, of a txid this cluster has since given the transaction, an earlier transaction
+  wrote, which the record's `xmin` tells, so the transaction commits. Every comparison of two
+  versions' transactions, and of a version's with the reading transaction's, is of txid and cluster
+  both, as the restored txid is another transaction's. `History` returns the stamp
   (`Record.Cluster`), which the chain hashes as it does every field. Each version a view finds is
   its row's last where no later one, by id, counts by then, a test of each on its own, by its key in
   history's index of an entity's versions, which orders a row's versions by date and those of one

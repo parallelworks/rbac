@@ -178,6 +178,7 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	// its time compiling.
 	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.as_of_tenant', $1, true),
 		set_config('rbac.as_of', pg_catalog.to_char($2::pg_catalog.timestamptz `+inUTC+`, '`+asOfTime+`'), true),
+		set_config('rbac.as_of_cluster', (pg_catalog.pg_control_system()).system_identifier::pg_catalog.text, true),
 		set_config('plan_cache_mode', 'force_custom_plan', true), set_config('jit', 'off', true)`,
 		tenant, at); err != nil {
 		return err
@@ -238,11 +239,11 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 				selected[i] = `CASE r.expires_at WHEN 'infinity' THEN NULL WHEN '-infinity' THEN pg_catalog.timestamptz 'epoch' ELSE r.expires_at END AS expires_at`
 			}
 		}
-		b := byTime{history: "%[1]s.rbac_history", at: "%[5]s"}
+		b := byTime{history: "%[1]s.rbac_history", at: "%[5]s", cluster: `current_setting('rbac.as_of_cluster')::pg_catalog.int8`}
 		view := `SELECT %[4]s FROM %[1]s.rbac_history h, LATERAL pg_catalog.jsonb_populate_record(NULL::%[1]s.%[2]s, h.after) r
 			WHERE h.tenant = current_setting('rbac.as_of_tenant') AND h.entity = '%[3]s'
 			  AND h.op NOT IN ('delete', 'expire') AND h.effective_at <= %[5]s
-			  AND h.txid IS DISTINCT FROM pg_catalog.pg_current_xact_id_if_assigned()
+			  AND ` + b.byAnother("h") + `
 			  AND CASE WHEN ` + b.later("h", "'%[3]s'") + ` IS NOT NULL THEN false
 			    ELSE ` + b.byCommit("h", "NOT "+b.writtenLater("h", "'%[3]s'"), "c.at <= %[5]s") + ` END`
 		// Roles are read by their ids, the key, or all at once, as Grantable reads them: their view
@@ -292,9 +293,9 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	return finish(ctx, func(c context.Context) error { return unpruned(c, tx, schema, at) })
 }
 
-// byTime is SQL for what a read as of a time tests history's versions by: history, its table, and
-// at, the time.
-type byTime struct{ history, at string }
+// byTime is SQL for what a read as of a time tests history's versions by: history, its table; at,
+// the time; and cluster, the identifier of the cluster reading it (system_identifier).
+type byTime struct{ history, at, cluster string }
 
 // counts is SQL for whether v, the alias of a version in history, counts by the time: from its
 // date, or where it is later, its transaction's commit (committedBy).
@@ -313,9 +314,9 @@ func (b byTime) counts(v string) string {
 // cluster's commit, not from a transaction the new cluster gave the same txid. One that committed
 // before history recorded commits, or that a restore carried from a cluster whose commit records
 // are gone, counts as committed, as its versions count from their dates; the transaction reading v
-// hasn't committed.
+// hasn't committed (byAnother).
 func (b byTime) committedBy(v string) string {
-	return v + `.txid IS DISTINCT FROM pg_catalog.pg_current_xact_id_if_assigned()
+	return b.byAnother(v) + `
 		AND coalesce((SELECT max(c.effective_at) FROM ` + b.history + ` c WHERE c.entity = 'commit' AND c.txid = ` + v + `.txid
 		    AND c.cluster IS NOT DISTINCT FROM ` + v + `.cluster),
 		  ` + v + `.effective_at) <= ` + b.at
@@ -335,7 +336,7 @@ func (b byTime) committedBy(v string) string {
 // alike, as every write of a DO block is, read in the order of their places, oldest first, so each
 // read every one before it.
 func (b byTime) later(h, entity string) string {
-	return `(SELECT CASE WHEN l.id > ` + h + `.id AND (l.txid = ` + h + `.txid OR ` + b.committedBy("l") + `) THEN l.id
+	return `(SELECT CASE WHEN l.id > ` + h + `.id AND (` + sameTransaction("l", h) + ` OR ` + b.committedBy("l") + `) THEN l.id
 		  ELSE (SELECT n.id FROM ` + b.history + ` n WHERE ` + b.laterOf(h, entity) + `
 		    AND (n.effective_at, n.id) > (` + h + `.effective_at, ` + h + `.id)
 		  ORDER BY n.effective_at, n.id LIMIT 1) END
@@ -358,7 +359,21 @@ func (b byTime) writtenLater(h, entity string) string {
 // that h's own transaction wrote dated by then, as later and writtenLater select.
 func (b byTime) laterOf(h, entity string) string {
 	return `n.tenant = ` + h + `.tenant AND n.entity = ` + entity + ` AND n.key = ` + h + `.key AND n.id > ` + h + `.id
-		  AND n.effective_at <= ` + b.at + ` AND (n.txid = ` + h + `.txid OR ` + b.committedBy("n") + `)`
+		  AND n.effective_at <= ` + b.at + ` AND (` + sameTransaction("n", h) + ` OR ` + b.committedBy("n") + `)`
+}
+
+// byAnother is SQL for whether v, the alias of a version in history, was written by a transaction
+// other than the one reading it, which hasn't committed: a version a restore carried from another
+// cluster, of a txid this cluster has since given the reading transaction, is another's.
+func (b byTime) byAnother(v string) string {
+	return `(` + v + `.txid, ` + v + `.cluster) IS DISTINCT FROM (pg_catalog.pg_current_xact_id_if_assigned(), ` + b.cluster + `)`
+}
+
+// sameTransaction is SQL for whether versions v and w, aliases in history, were written by one
+// transaction: of one txid in one cluster, as a txid a restore carried from another cluster can be
+// one this cluster has since given a transaction of its own.
+func sameTransaction(v, w string) string {
+	return `(` + v + `.txid = ` + w + `.txid AND ` + v + `.cluster IS NOT DISTINCT FROM ` + w + `.cluster)`
 }
 
 // byCommit is SQL for, as h's transaction's latest commit record of h's own cluster is looked up

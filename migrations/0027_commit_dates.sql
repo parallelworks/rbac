@@ -59,8 +59,10 @@
 -- by a restored commit record. A version of another cluster with no commit record there, or of none
 -- (null, as every record before this migration is), counts from its own date. The stamp is the
 -- server's, whatever a session sets: the trigger keeps it in a setting of the transaction, which
--- any session can set too, so the commit record checks every record of its transaction against the
--- server's, and a transaction whose records name another cluster commits nothing.
+-- any session can set too, so the commit record checks every record its transaction wrote against
+-- the server's, and a transaction that wrote one naming another cluster commits nothing. A record
+-- a restore carried from another cluster, of a txid this cluster has since given the transaction,
+-- an earlier transaction wrote, which its xmin tells.
 --
 -- AsOf tested each version of a row for a later one, and PruneHistory each for a later one by its
 -- time, in history's index of an entity's versions, by date: versions dated alike, as every write
@@ -148,6 +150,9 @@ DECLARE
     was_last timestamptz;
     ended  boolean;
     cluster_id bigint;
+    inserted numeric;
+    top    numeric;
+    mine   boolean;
 BEGIN
     -- A search_path reads $user, however it is quoted, as a role's name, and leaves out a schema
     -- the role has no USAGE on, so history would be found in pg_temp: refused before anything it
@@ -161,8 +166,8 @@ BEGIN
     -- only within the cluster that wrote it. Read once a transaction and held in a local setting, as
     -- one statement writes many records, and reading the server's control file for each made 8,000
     -- grants in one statement a seventh slower: only pg_catalog is read, after the schema is
-    -- checked. A session can set the setting too, so the commit record checks every record of its
-    -- transaction against the server's.
+    -- checked. A session can set the setting too, so the commit record checks every record its
+    -- transaction wrote against the server's.
     cluster_id := nullif(pg_catalog.current_setting('rbac.cluster', true), '')::bigint;
     IF cluster_id IS NULL THEN
         cluster_id := (pg_catalog.pg_control_system()).system_identifier;
@@ -218,12 +223,29 @@ BEGIN
         -- another than its commit record would count from its own date, before the commit, as a
         -- restored version whose commit records are gone does, and AsOf would read a revoke held
         -- open as in force before it was. Read from the server here, not from the setting. A record
-        -- history's owner writes itself, with no cluster, as a prune's, is checked by no one's.
+        -- history's owner writes itself, with no cluster, as a prune's, is checked by no one's. Nor
+        -- is one a restore carried from another cluster, of a txid this cluster has since given
+        -- this transaction, which an earlier transaction wrote, and the commit of every transaction
+        -- of this cluster's that took the txid would otherwise be refused: of the txid's records,
+        -- those this transaction wrote, or one of its subtransactions, are those whose xmin, read as
+        -- a full id no earlier than the transaction's own, is in progress. An earlier transaction's,
+        -- so read, is an id not given yet, which pg_xact_status refuses, unless 2^32 or more have
+        -- been given since it.
         cluster_id := (pg_catalog.pg_control_system()).system_identifier;
-        IF EXISTS (SELECT FROM rbac_history h WHERE h.txid = pg_catalog.pg_current_xact_id() AND h.cluster <> cluster_id) THEN
-            RAISE EXCEPTION 'a transaction that changes the package''s tables sets no rbac.cluster: history stamps each record with the cluster that wrote it, which AsOf dates it by'
-                USING ERRCODE = 'insufficient_privilege', HINT = 'Reset rbac.cluster.';
-        END IF;
+        top := pg_catalog.pg_current_xact_id()::text::numeric;
+        FOR inserted IN SELECT h.xmin::text::numeric FROM rbac_history h
+            WHERE h.txid = pg_catalog.pg_current_xact_id() AND h.cluster <> cluster_id LOOP
+            BEGIN
+                mine := pg_catalog.pg_xact_status((top + ((inserted - top % 4294967296) % 4294967296 + 4294967296) % 4294967296)
+                    ::text::pg_catalog.xid8) = 'in progress';
+            EXCEPTION WHEN invalid_parameter_value THEN
+                mine := false;
+            END;
+            IF mine THEN
+                RAISE EXCEPTION 'a transaction that changes the package''s tables sets no rbac.cluster: history stamps each record with the cluster that wrote it, which AsOf dates it by'
+                    USING ERRCODE = 'insufficient_privilege', HINT = 'Reset rbac.cluster.';
+            END IF;
+        END LOOP;
         at := pg_catalog.clock_timestamp();
         INSERT INTO rbac_history (recorded_at, effective_at, tenant, entity, key, op, bytes, cluster)
         VALUES (at, at, '', 'commit', '', 'commit', 0, cluster_id);
