@@ -1131,17 +1131,17 @@ can leave the application's role without it. The administrator's and history's r
   where that role has `CREATE` on the schema or the role migrating may grant it that, as the
   schema's owner can, which it does for the migration alone. Otherwise migrating fails with SQLSTATE
   42501, having changed nothing, rather than leave the function to another role: grant history's
-  role `CREATE` on the schema, or migrate as a superuser, and migrate again. No role but its owner
-  may execute it, nor `rbac_record`, which writes history as its owner too, as only their triggers
-  call them: migrating revokes `EXECUTE` on both from every other role, `PUBLIC` included, as the
-  schema's default privileges can grant it as each is made, where `0003_history` revoked it on
-  `rbac_record` from `PUBLIC` alone; a role holding it could attach either to a table of its own in
-  `pg_temp`, whose triggers would then run as history's role. It replaces `rbac_record` too, which
-  keeps its owner and its settings, without its path for a commit record, which no trigger reaches
-  any more. A procedure or a `DO` block that changes the package's tables with a
-  cursor `WITH HOLD` open that it declared in an earlier transaction is refused as before, as
-  nothing tells that cursor from one declared in the transaction committing: its refusal now says
-  so, and how such a batch commits.
+  role `CREATE` on the schema, or history's role to the role migrating with the `SET` option, as its
+  hint says, or migrate as a superuser, and migrate again. No role but its owner may execute it, nor
+  `rbac_record`, which writes history as its owner too, as only their triggers call them: migrating
+  revokes `EXECUTE` on both from every other role, `PUBLIC` included, as the schema's default
+  privileges can grant it as each is made, where `0003_history` revoked it on `rbac_record` from
+  `PUBLIC` alone; a role holding it could attach either to a table of its own in `pg_temp`, whose
+  triggers would then run as history's role. It replaces `rbac_record` too, which keeps its owner
+  and its settings, without its path for a commit record, which no trigger reaches any more. A
+  procedure or a `DO` block that changes the package's tables with a cursor `WITH HOLD` open that it
+  declared in an earlier transaction is refused as before, as nothing tells that cursor from one
+  declared in the transaction committing: its refusal now says so, and how such a batch commits.
   Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
   rolling upgrade across the two is unsafe: they key every lock apart, so a change by one waits for
   none by the other, and what each checks under its locks can change before it commits, as two

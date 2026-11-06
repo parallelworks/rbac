@@ -177,9 +177,13 @@ BEGIN
         BEGIN
             EXECUTE pg_catalog.format('ALTER FUNCTION %s OWNER TO %s', fn, owner);
         EXCEPTION WHEN insufficient_privilege THEN
+            -- Where the new owner may create in the schema, as where it was lent that, what failed is
+            -- the role migrating's SET ROLE to it.
             RAISE EXCEPTION 'rbac_history_commit, which writes history as its owner, can''t be given to %, which owns rbac_record: % may not SET ROLE to it, or it has no CREATE on schema %',
                 owner, current_user, here USING ERRCODE = 'insufficient_privilege',
-                HINT = pg_catalog.format('Grant %s CREATE on schema %I, or migrate as a superuser, and migrate again.', owner, here);
+                HINT = CASE WHEN pg_catalog.has_schema_privilege(owner, here, 'CREATE')
+                    THEN pg_catalog.format('Grant %s to %I with the SET option, or migrate as a superuser, and migrate again.', owner, current_user)
+                    ELSE pg_catalog.format('Grant %s CREATE on schema %I, or migrate as a superuser, and migrate again.', owner, here) END;
         END;
         IF lent THEN
             EXECUTE pg_catalog.format('REVOKE CREATE ON SCHEMA %I FROM %s', here, owner);
