@@ -672,9 +672,9 @@ func (a *Authorizer) unrest(ctx context.Context, tx pgx.Tx, tenant string, actor
 // holdResting holds, in tx, until the change commits, the activations r found resting, which unrest
 // may cut short. Grants are the last rows a change holds, after its places and memberships, as
 // Activate holds an activation's places before its grant, and in the order the grants a change
-// removes are locked in (inOrder), so none of this waits out of order. By id alone, which restingOn
-// found in the tenant: beside tenant = $1, a generic plan could read the tenant's grants by it
-// (byKey).
+// removes are locked in (bindingOrder), so none of this waits out of order. By id alone, which
+// restingOn found in the tenant: beside tenant = $1, a generic plan could read the tenant's grants
+// by it (byKey).
 func holdResting(ctx context.Context, tx pgx.Tx, r resting) error {
 	if len(r.ids) == 0 {
 		return nil

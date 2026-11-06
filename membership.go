@@ -2592,29 +2592,30 @@ func (a *Authorizer) freezes(ctx context.Context, actor Subject, tenant, scopeTy
 }
 
 // grantsDenied reads, on q, the scope types whose power to change grants a deny on some scope of a
-// tenant binding actor lists, as `<type>:grant` or `<type>:*`, as deniedBelow reads those below
-// the tenant: only on a scope of one can a deny on its path stop the actor taking access away there,
-// which its authority on each such scope is then read for. They are found by the keys it is bound
-// by (naming), so the tenant's denies of others aren't read, and of those, through
+// tenant binding actor lists, as `<type>:grant` or `<type>:*`, as belowSQL reads those below
+// the tenant: only on a scope of one can a deny on its path stop the actor taking access away
+// there, which its authority on each such scope is then read for. They are found by the keys it is
+// bound by (naming), so the tenant's denies of others aren't read, and of those, through
 // rbac_denies_grants, only the denies that list such a power (rbac_changes_grants): a change to
 // members reads them before its transaction, and again under its locks in the read of the actor's
 // grants (reachAuthority), so the denies binding the actor that remove anything else, as root to
-// the tenant's members on each of thousands of resources, cost it nothing.
+// the tenant's members on each of thousands of resources, cost it nothing. With sequential scans
+// off (readIndexed), as a plan made while the denies were few read every one.
 func (a *Authorizer) grantsDenied(ctx context.Context, q DB, tenant string, actor Subject) (map[string]bool, error) {
-	rows, err := q.Query(ctx, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`
-		`+grantsDeniedSQL(),
-		tenant, actor.identityKey(), a.cfg.Now())
-	if err != nil {
-		return nil, err
-	}
 	types := map[string]bool{}
 	var p Permission
-	_, err = pgx.ForEachRow(rows, []any{&p}, func() error {
-		if t, ok := grantsOn(p); ok {
-			types[t] = true
-		}
-		return nil
-	})
+	scan := func(rows pgx.Rows) error {
+		_, err := pgx.ForEachRow(rows, []any{&p}, func() error {
+			if t, ok := grantsOn(p); ok {
+				types[t] = true
+			}
+			return nil
+		})
+		return err
+	}
+	err := a.readIndexed(ctx, q, scan, `WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$3")+`
+		`+grantsDeniedSQL(),
+		tenant, actor.identityKey(), a.cfg.Now())
 	return types, err
 }
 
@@ -2889,9 +2890,11 @@ func (a *Authorizer) reachAuthority(ctx context.Context, q DB, actor Subject, te
 	var aus []authority
 	if len(on) > 0 || denied {
 		var err error
-		if aus, r.grantsDenied, err = a.authoritiesIn(ctx, q, actor, tenant, on, roles, denied); err != nil {
+		var got grantsRead
+		if aus, got, err = a.authoritiesIn(ctx, q, actor, tenant, on, roles, alsoRead{grantsDenied: denied}); err != nil {
 			return reachedAuthority{}, err
 		}
+		r.grantsDenied = got.grantsDenied
 	}
 	// Every authority of one read shares what its values are decided by (authorities).
 	if len(aus) > 0 {
@@ -3238,12 +3241,20 @@ func (a *Authorizer) GroupsOf(ctx context.Context, tenant string, p Principal) (
 }
 
 // heldByMembers refuses making a custom role privileged while the tenant's members are granted it,
-// through whom it would then give nothing; no eligibility names them.
+// through whom it would then give nothing; no eligibility names them. It reads, by the members'
+// key, their grants of custom roles alone, through rbac_grants_custom_principal, whose range of
+// roles it names and no LIKE, as customOnly does, with sequential and bitmap scans off (seeking):
+// found by the tenant and the role, which the custom roles' index seeks, every grant of the role in
+// the tenant was read, and by fresh statistics of a role id other tenants grant too, which EXISTS
+// plans for the first, every grant in the table.
 func heldByMembers(ctx context.Context, q DB, tenant string, role Role, now time.Time) error {
-	var held bool
-	// The LIKE matches the partial index on custom roles' grants.
-	err := q.QueryRow(ctx, `SELECT EXISTS (SELECT FROM rbac_grants WHERE tenant = $1 AND role = $2 AND role LIKE 'custom.%'
-		AND principal_kind = 'members' AND (expires_at IS NULL OR expires_at > $3))`, tenant, string(role), now).Scan(&held)
+	held, err := planned(ctx, q, seeking, func() (bool, error) {
+		var held bool
+		err := q.QueryRow(ctx, `SELECT EXISTS (SELECT FROM rbac_grants WHERE principal = $4 AND tenant = $1 AND role = $2
+			AND role >= 'custom.' AND role < 'custom/' AND (expires_at IS NULL OR expires_at > $3))`,
+			tenant, string(role), now, TenantMembers(tenant).key()).Scan(&held)
+		return held, err
+	})
 	if err != nil || !held {
 		return err
 	}

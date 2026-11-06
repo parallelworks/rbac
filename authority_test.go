@@ -3620,6 +3620,100 @@ func TestAChangeReadsTheStandingOfWhomItNamesWithoutJIT(t *testing.T) {
 	}
 }
 
+// A check, and a change's read of its actor's authority, are costed by what they read of its
+// membership and groups, below JIT's threshold, though the tenant is large and the identity is a
+// member of every other tenant, in a group of each: counted by the tenant's selectivity and the
+// identity's apart, its membership was counted as hundreds, and each group it is in as many again,
+// so each statement was costed at over a million and compiled before it ran, for 400 ms, where
+// running it took a tenth of a millisecond.
+func TestReadsOfAnIdentityInManyTenantsAreCostedBelowJIT(t *testing.T) {
+	h := crowded(t, pgtest.Open(t, ""))
+	ctx := t.Context()
+	h.groups(t, "crew", "ops")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
+	u := h.as(t, "u", "crew", "ops")
+	for _, q := range []string{
+		// t1 holds most memberships and places, in groups nested in one another.
+		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) SELECT 't1', 'user', 'm' || i FROM generate_series(1, 20000) i`,
+		`INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'g' || i FROM generate_series(1, 200) i`,
+		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+		 SELECT 't1', 'g' || (i % 200 + 1), 'user', 'm' || i FROM generate_series(1, 20000) i
+		 UNION ALL SELECT 't1', 'g' || i, 'group', 'g' || (i % 200 + 1) FROM generate_series(1, 200) i`,
+		// u is a member of every other tenant, in its crew, which is in its g1.
+		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) SELECT 's' || j, 'user', 'u' FROM generate_series(1, 2000) j`,
+		`INSERT INTO rbac_groups (tenant, id) SELECT 's' || j, 'crew' FROM generate_series(1, 2000) j`,
+		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+		 SELECT 's' || j, 'crew', 'user', 'u' FROM generate_series(1, 2000) j
+		 UNION ALL SELECT 's' || j, 'g1', 'group', 'crew' FROM generate_series(1, 2000) j`,
+		`ANALYZE rbac_memberships, rbac_members, rbac_groups, rbac_grants, rbac_denies, rbac_roles`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for what, f := range map[string]func(a *rbac.Authorizer) error{
+		"a check": func(a *rbac.Authorizer) error { return a.Authorize(ctx, u, login, cluster) },
+		"a change's read of its actor's authority": func(a *rbac.Authorizer) error {
+			return rbac.ReadAuthority(ctx, a, u, []rbac.Resource{cluster})
+		},
+	} {
+		func() {
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			rec := &recordingTx{Tx: tx}
+			if err := f(h.authz.WithTx(rec)); err != nil {
+				t.Fatalf("%s: %v", what, err)
+			}
+			read := 0
+			for i, sql := range rec.sqls {
+				if !strings.Contains(sql, "rbac_memberships") {
+					continue
+				}
+				read++
+				// Planned for its arguments, as a connection's first five runs of a statement are.
+				var plan []struct {
+					Plan struct {
+						Cost float64 `json:"Total Cost"`
+					}
+				}
+				if err := tx.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+sql, rec.args[i]...).Scan(&plan); err != nil {
+					t.Fatal(err)
+				}
+				// PostgreSQL's default jit_above_cost.
+				if c := plan[0].Plan.Cost; c >= 100000 {
+					t.Errorf("%s's statement reading its subject's membership is costed at %.0f, past JIT's threshold", what, c)
+				}
+			}
+			if read == 0 {
+				t.Fatalf("%s read no membership", what)
+			}
+		}()
+	}
+}
+
+// recordingTx is a transaction that records the statements its queries and batches run, with their
+// arguments.
+type recordingTx struct {
+	pgx.Tx
+	sqls []string
+	args [][]any
+}
+
+func (tx *recordingTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	tx.sqls, tx.args = append(tx.sqls, sql), append(tx.args, args)
+	return tx.Tx.Query(ctx, sql, args...)
+}
+
+func (tx *recordingTx) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	for _, q := range b.QueuedQueries {
+		tx.sqls, tx.args = append(tx.sqls, q.SQL), append(tx.args, q.Arguments)
+	}
+	return tx.Tx.SendBatch(ctx, b)
+}
+
 // What a change rests on is read in rows as many as whom it names, whichever plan PostgreSQL
 // picks: it costs the memberships a change reaches as ten, so where sorting is dear, as at a
 // small work_mem or in a large tenant, and under the generic plan a cached statement moves to, a
@@ -4814,6 +4908,151 @@ func TestSearchesReadTheBroadGrantsOfCustomRolesAsMuchWhateverTheStatistics(t *t
 	}
 }
 
+// Filter and Reachable read their subject's own grants on scopes of the types they list as much by
+// no statistics, as of a table never analyzed or restored, as by fresh ones, under a generic plan
+// and one for their arguments: found by `= ANY` of its keys beside a type's range of scopes, every
+// plan read that range of the scopes' index, each grant on a scope of the type in the tenant, here
+// others' on thousands of clusters.
+func TestSearchesReadTheirSubjectsGrantsAsMuchWithoutStatistics(t *testing.T) {
+	h := growing(t, false, "rbac_grants")
+	ctx := t.Context()
+	c0 := hostTable(t, h)[0]
+	u := h.as(t, "u")
+	h.seed(t, grant(c0.Scope(), "cluster.login", rbac.User, "u"))
+	for _, q := range []string{
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		 SELECT 't1', 'cluster', 'k' || i, 'user', 'o' || (i % 2000), 'cluster.login' FROM generate_series(1, 20000) i`,
+		`ANALYZE rbac_grants`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The pages of the grants each reads, once each has planned its statements.
+	read := func() map[string]map[string]int64 {
+		t.Helper()
+		pages := map[string]map[string]int64{}
+		for _, plan := range plans {
+			func() {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				planAs(ctx, t, tx, plan)
+				customSearches(ctx, t, tx, h.authz.WithTx(tx), u, c0)
+				pages[plan] = customSearches(ctx, t, tx, h.authz.WithTx(tx), u, c0)
+			}()
+		}
+		return pages
+	}
+	analyzed := read()
+	if err := h.pool.QueryRow(ctx, `SELECT count(pg_clear_relation_stats(current_schema()::text, c.relname::text))
+		FROM pg_class c WHERE c.oid = 'rbac_grants'::regclass OR c.oid IN (SELECT indexrelid FROM pg_index WHERE indrelid = 'rbac_grants'::regclass)`).Scan(new(int)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.pool.QueryRow(ctx, `SELECT count(pg_clear_attribute_stats(current_schema()::text, 'rbac_grants', attname, false))
+		FROM pg_attribute WHERE attrelid = 'rbac_grants'::regclass AND attnum > 0 AND NOT attisdropped`).Scan(new(int)); err != nil {
+		t.Fatal(err)
+	}
+	for plan, none := range read() {
+		for what, n := range none {
+			if fresh := analyzed[plan][what]; n > fresh*3/2+deeper {
+				t.Errorf("at plan_cache_mode %q, %s read %d pages of grants by no statistics, and %d by fresh ones", plan, what, n, fresh)
+			}
+		}
+	}
+}
+
+// Making a custom role privileged reads, for whether the tenant's members hold it, their grants of
+// custom roles alone, as many pages however many grants of it the tenant makes, the role id other
+// tenants grant too, and the grants of other roles its members hold, by statistics from before they
+// were made, fresh ones and none, under a generic plan and one for its arguments: found by the
+// tenant and the role, every grant of it in the tenant was read, and by fresh statistics, planned
+// for the first, as EXISTS is, every grant in the table.
+func TestWhetherTheMembersHoldARoleReadsOnlyTheirGrantsOfCustomRoles(t *testing.T) {
+	h := growing(t, false, "rbac_grants")
+	ctx := t.Context()
+	exec := func(q string) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Each of 2,000 other tenants grants custom.x to 20 users and its members twice, and t1 to a
+	// few, and its members a built-in role a few times.
+	for _, q := range []string{
+		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types) SELECT 's' || j, 'custom.x', '{cluster:view}'::text[], '{cluster}'::text[] FROM generate_series(1, 2000) j
+		 UNION ALL SELECT 't1', 'custom.x', '{cluster:view}'::text[], '{cluster}'::text[]`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		 SELECT 's' || j, 'cluster', 'c' || i, 'user', 'u' || i, 'custom.x' FROM generate_series(1, 2000) j, generate_series(1, 20) i
+		 UNION ALL SELECT 's' || j, 'cluster', 'm' || i, 'members', 's' || j, 'custom.x' FROM generate_series(1, 2000) j, generate_series(1, 2) i
+		 UNION ALL SELECT 't1', 'cluster', 'k' || i, 'user', 'o' || i, 'custom.x' FROM generate_series(1, 200) i
+		 UNION ALL SELECT 't1', 'cluster', 'z' || i, 'members', 't1', 'cluster.login' FROM generate_series(1, 200) i`,
+		`ANALYZE rbac_grants`,
+	} {
+		exec(q)
+	}
+	// The pages of the grants it reads, under each plan, once it has planned it.
+	read := func() map[string]int64 {
+		t.Helper()
+		pages := map[string]int64{}
+		for _, plan := range plans {
+			func() {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				planAs(ctx, t, tx, plan)
+				for _, measured := range []bool{false, true} {
+					start := pagesRead(ctx, t, tx, "rbac_grants")
+					if err := rbac.HeldByMembers(ctx, tx, "t1", "custom.x", h.now); err != nil {
+						t.Fatal(err)
+					}
+					if measured {
+						pages[plan] = pagesRead(ctx, t, tx, "rbac_grants") - start
+					}
+				}
+			}()
+		}
+		return pages
+	}
+	few := read()
+	// t1 grants custom.x to thousands more, and its members a built-in role thousands of times.
+	exec(`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		SELECT 't1', 'cluster', 'kk' || i, 'user', 'o' || i, 'custom.x' FROM generate_series(1, 20000) i
+		UNION ALL SELECT 't1', 'cluster', 'zz' || i, 'members', 't1', 'cluster.login' FROM generate_series(1, 20000) i`)
+	stale := read()
+	exec(`ANALYZE rbac_grants`)
+	fresh := read()
+	if err := h.pool.QueryRow(ctx, `SELECT count(pg_clear_relation_stats(current_schema()::text, c.relname::text))
+		FROM pg_class c WHERE c.oid = 'rbac_grants'::regclass OR c.oid IN (SELECT indexrelid FROM pg_index WHERE indrelid = 'rbac_grants'::regclass)`).Scan(new(int)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.pool.QueryRow(ctx, `SELECT count(pg_clear_attribute_stats(current_schema()::text, 'rbac_grants', attname, false))
+		FROM pg_attribute WHERE attrelid = 'rbac_grants'::regclass AND attnum > 0 AND NOT attisdropped`).Scan(new(int)); err != nil {
+		t.Fatal(err)
+	}
+	none := read()
+	for by, pages := range map[string]map[string]int64{"from before they were made": stale, "fresh": fresh, "of none": none} {
+		for _, plan := range plans {
+			if n := pages[plan]; n > few[plan]*3/2+deeper {
+				t.Errorf("at plan_cache_mode %q, it read %d pages of grants beside a few grants of the role, and %d beside thousands, by statistics %s", plan, few[plan], n, by)
+			}
+		}
+	}
+	// The members' grant of it, in force, refuses it; ended, it doesn't.
+	exec(`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+		VALUES ('t1', 'cluster', 'm', 'members', 't1', 'custom.x', '2026-01-01 11:00:00+00')`)
+	if err := rbac.HeldByMembers(ctx, h.pool, "t1", "custom.x", h.now); err != nil {
+		t.Errorf("the members' ended grant of custom.x refused making it privileged: %v", err)
+	}
+	if err := rbac.HeldByMembers(ctx, h.pool, "t1", "custom.x", h.now.Add(-2*time.Hour)); !errors.Is(err, rbac.ErrInvalid) {
+		t.Errorf("the members' grant of custom.x in force didn't refuse making it privileged: %v", err)
+	}
+}
+
 // Filter, Reachable and Holders read, of the grants to the tenant's members and the public, only
 // those of custom roles that their subject counts, under a generic plan and one for their arguments,
 // and as of a time: which custom roles those grants name was read from each of them on scopes of the
@@ -5582,6 +5821,151 @@ func TestDeletingGroupsReadsOnlyWhatNamesThem(t *testing.T) {
 	}
 }
 
+// A check, a change's read of its actor's authority, with the powers to change grants a deny
+// binding it removes, and the read of those powers alone read as few pages of the grants, denies
+// and places in groups once the tables have grown under a generic plan made while they were small,
+// by statistics from then, as a connection planned it: the planner counted every table but a few
+// rows, so the plan read each by a sequential scan, every row of it, and the denies once for each
+// key of a path, until an analysis invalidated it. Checked on a pool too, where a check's settings
+// go with its statement.
+func TestReadsByKeyReadAsMuchUnderAPlanMadeWhileTheTablesWereSmall(t *testing.T) {
+	h := groupedOn(t, pgtest.Open(t, "plan_cache_mode=force_generic_plan&pool_max_conns=1"))
+	ctx := t.Context()
+	tables := []string{"rbac_grants", "rbac_denies", "rbac_members"}
+	// Autovacuum would analyze them as they grow, which invalidates the plan; and their writes are
+	// unrecorded, as growing does.
+	for _, table := range tables {
+		if _, err := h.pool.Exec(ctx, `ALTER TABLE `+table+` SET (autovacuum_enabled = off), DISABLE TRIGGER USER`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.groups(t, "crew")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
+	u, manager := h.as(t, "u", "crew"), h.as(t, "manager", "crew")
+	// A deny of changing grants on another cluster binds the manager, so the reads of what it acts by
+	// find one.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+		VALUES ('t1', 'cluster', 'c2', 'frozen', '{group:crew}', ARRAY[$1::text])`, grantC); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `ANALYZE `+strings.Join(tables, ", ")+`, rbac_memberships`); err != nil {
+		t.Fatal(err)
+	}
+	calls := map[string]func(a *rbac.Authorizer) error{
+		"Authorize": func(a *rbac.Authorizer) error { return a.Authorize(ctx, u, login, cluster) },
+		"the read of the actor's authority": func(a *rbac.Authorizer) error {
+			return rbac.ReadAuthority(ctx, a, manager, []rbac.Resource{{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}, cluster})
+		},
+		"the read of the powers to change grants denied": func(a *rbac.Authorizer) error { return rbac.ReadGrantsDenied(ctx, a, "t1", manager) },
+	}
+	// Each leaves the planner as it found it.
+	seqscan := func(q rbac.DB, what string) {
+		t.Helper()
+		var on string
+		if err := q.QueryRow(ctx, `SELECT current_setting('enable_seqscan')`).Scan(&on); err != nil || on != "on" {
+			t.Fatalf("enable_seqscan = %q, %v, once %s had read", on, err, what)
+		}
+	}
+	// The pages of the tables and their indexes each reads, in a transaction it rolls back, and a
+	// check on the pool, by what the session has reported of all it read: each made once before, so
+	// its plan is made and cached.
+	read := func() map[string]int64 {
+		t.Helper()
+		pages := map[string]int64{}
+		for what, f := range calls {
+			for _, measured := range []bool{false, true} {
+				func() {
+					tx, err := h.pool.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = tx.Rollback(ctx) }()
+					before := map[string]int64{}
+					for _, table := range tables {
+						before[table] = pagesRead(ctx, t, tx, table)
+					}
+					if err := f(h.authz.WithTx(tx)); err != nil {
+						t.Fatalf("%s: %v", what, err)
+					}
+					for _, table := range tables {
+						if measured {
+							pages[what+" of "+table] = pagesRead(ctx, t, tx, table) - before[table]
+						}
+					}
+					seqscan(tx, what)
+				}()
+			}
+		}
+		for _, measured := range []bool{false, true} {
+			before := map[string]int64{}
+			for _, table := range tables {
+				before[table] = reportedRead(ctx, t, h.pool, table)
+			}
+			if err := h.authz.Authorize(ctx, u, login, cluster); err != nil {
+				t.Fatal(err)
+			}
+			for _, table := range tables {
+				if measured {
+					pages["Authorize on the pool of "+table] = reportedRead(ctx, t, h.pool, table) - before[table]
+				}
+			}
+			seqscan(h.pool, "Authorize on the pool")
+		}
+		return pages
+	}
+	few := read()
+	// Grants, denies and places in groups of others, in t1 and in tenants of their own.
+	for _, q := range []string{
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'cluster', 'k' || i, 'user', 'o' || i, 'cluster.login' FROM generate_series(1, 20000) i`,
+		`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+		 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'cluster', 'k' || i, 'd', ARRAY['user:o' || i], '{cluster:root,cluster:grant}' FROM generate_series(1, 20000) i`,
+		`INSERT INTO rbac_groups (tenant, id) SELECT 's' || i, 'crew' FROM generate_series(1, 20000) i WHERE i % 2 = 1`,
+		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+		 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'crew', 'user', 'o' || i FROM generate_series(1, 20000) i`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for what, many := range read() {
+		if many > few[what]*3/2+deeper {
+			t.Errorf("%s read %d pages, and %d once the tables grew under a plan made while they were small", what, few[what], many)
+		}
+	}
+	// A host's transaction gets its own setting back, whatever it is.
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.WithTx(tx).Authorize(ctx, u, login, cluster); err != nil {
+		t.Fatal(err)
+	}
+	var on string
+	if err := tx.QueryRow(ctx, `SELECT current_setting('enable_seqscan')`).Scan(&on); err != nil || on != "off" {
+		t.Errorf("enable_seqscan = %q, %v, once a check in a transaction that had it off read", on, err)
+	}
+}
+
+// reportedRead is how many pages of table and its indexes the database has counted read, once the
+// session of pool, which holds one connection, has reported all it read.
+func reportedRead(ctx context.Context, t *testing.T, pool *pgxpool.Pool, table string) int64 {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `SELECT pg_stat_force_next_flush()`); err != nil {
+		t.Fatal(err)
+	}
+	var n int64
+	if err := pool.QueryRow(ctx, `SELECT sum(pg_stat_get_blocks_fetched(oid)) FROM pg_class
+		WHERE oid = $1::regclass OR oid IN (SELECT indexrelid FROM pg_index WHERE indrelid = $1::regclass)`, table).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
 // rowsRead is how many rows of table tx has read by scanning the table, whole or through a bitmap,
 // as a search of the GIN indexes on keys reads them. A row a plain index scan fetches counts against
 // that index, not the table.
@@ -6033,8 +6417,8 @@ func TestReadsStayBoundedOnceAConnectionsStatementsTurnGeneric(t *testing.T) {
 	}
 }
 
-// statementsKept is a transaction that keeps the statements Query and QueryRow run on it, with
-// their arguments.
+// statementsKept is a transaction that keeps the statements Query, QueryRow and its batches run on
+// it, with their arguments.
 type statementsKept struct {
 	pgx.Tx
 	statements []statement
@@ -6053,6 +6437,13 @@ func (r *statementsKept) Query(ctx context.Context, sql string, args ...any) (pg
 func (r *statementsKept) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	r.statements = append(r.statements, statement{sql, args})
 	return r.Tx.QueryRow(ctx, sql, args...)
+}
+
+func (r *statementsKept) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	for _, q := range b.QueuedQueries {
+		r.statements = append(r.statements, statement{q.SQL, q.Arguments})
+	}
+	return r.Tx.SendBatch(ctx, b)
 }
 
 // planRows is how many rows the plans of statements pass, with those their filters remove, each

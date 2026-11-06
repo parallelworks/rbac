@@ -1315,18 +1315,19 @@ func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []
 	if len(on) == 0 {
 		return nil, nil
 	}
-	aus, _, err := a.authoritiesIn(ctx, q, actor, on[0].Tenant, on, roles, false)
+	aus, _, err := a.authoritiesIn(ctx, q, actor, on[0].Tenant, on, roles, alsoRead{})
 	return aus, err
 }
 
-// authoritiesIn is authorities in a tenant, and where denied, the types of scope whose power to
-// change grants a deny anywhere in it binding the actor lists, as grantsDenied reads them, read in
-// the same statement, even for no resource: so a change decides where such a deny may stop it by
-// what bound the actor as it held the power it acts by. Read apart, an actor moving in between from
-// a group giving it that power to one a deny exempts passed both reads, though at no moment did it
-// hold the power and escape the deny.
-func (a *Authorizer) authoritiesIn(ctx context.Context, q DB, actor Subject, tenant string, on []Resource, roles []Role, denied bool,
-) ([]authority, map[string]bool, error) {
+// authoritiesIn is authorities in a tenant, with what else with says read in the same statement,
+// even for no resource, as the types of scope whose power to change grants a deny anywhere in it
+// binding the actor lists, as grantsDenied reads them, or whether a deny below the tenant binds it
+// (belowSQL): so a change decides where such a deny may stop it by what bound the actor as it held
+// the power it acts by. Read apart, an actor moving in between from a group giving it that power to
+// one a deny exempts passed both reads, though at no moment did it hold the power and escape the
+// deny. It returns the read too.
+func (a *Authorizer) authoritiesIn(ctx context.Context, q DB, actor Subject, tenant string, on []Resource, roles []Role, with alsoRead,
+) ([]authority, grantsRead, error) {
 	which := heldTenantRoles
 	if slices.ContainsFunc(roles, isCustom) {
 		which = tenantRoles
@@ -1338,14 +1339,15 @@ func (a *Authorizer) authoritiesIn(ctx context.Context, q DB, actor Subject, ten
 			keys[k] = true
 		}
 	}
-	got, err := a.readHeld(ctx, q, tenant, actor, all, slices.Sorted(maps.Keys(keys)), "", which, alsoRead{ending: true, grantsDenied: denied})
+	with.ending = true
+	got, err := a.readHeld(ctx, q, tenant, actor, all, slices.Sorted(maps.Keys(keys)), "", which, with)
 	if err != nil {
-		return nil, nil, err
+		return nil, grantsRead{}, err
 	}
 	held, ds, b := got.held, got.ds, got.roles
 	readingRoles()
 	if err := a.conditionsOf(ctx, q, tenant, held); err != nil {
-		return nil, nil, err
+		return nil, grantsRead{}, err
 	}
 	at := make([]int, len(held))
 	for i := range at {
@@ -1391,7 +1393,7 @@ func (a *Authorizer) authoritiesIn(ctx context.Context, q DB, actor Subject, ten
 		}
 		aus[i].proven = proven[k]
 	}
-	return aus, got.grantsDenied, nil
+	return aus, got, nil
 }
 
 // onPaths returns, for each of paths, those of xs whose scope is on it, in the order of xs, as a
@@ -2742,10 +2744,10 @@ const revoking = `DELETE FROM rbac_grants WHERE id = ANY(ARRAY(` + revokedSQL + 
 // revokedSQL picks the grants a revoke deletes. They are found from the bindings, each by its
 // principal, scope and role, which every index leading to them seeks: matched to the scope's grants
 // instead, a revoke reads every grant on it, which a busy scope holds thousands of, while it holds
-// the scope's lock. OFFSET 0 keeps the planner from flattening the lookup into such a join. They are
-// locked in order (inOrder) before they are deleted: deleted as the plan finds them, by their ids
-// or where they are stored, they would deadlock with a change ending activations among them, which
-// holds no lock of the scope.
+// the scope's lock. OFFSET 0 keeps the planner from flattening the lookup into such a join. They
+// are locked in order (bindingOrder) before they are deleted: deleted as the plan finds them, by
+// their ids or where they are stored, they would deadlock with a change ending activations among
+// them, which holds no lock of the scope.
 const revokedSQL = `
 	SELECT id FROM rbac_grants g
 	  WHERE id = ANY(ARRAY(
