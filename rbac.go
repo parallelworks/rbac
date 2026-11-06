@@ -1445,21 +1445,22 @@ func planning(ctx context.Context, q DB, settings []setting) (restore func() err
 }
 
 // planned is what read reads, statements on q in a transaction, with settings for them alone, put
-// back after it (planning) whether or not it fails, so a host's transaction under WithTx gets its
-// own again, as where it goes on past a call refused for its ctx once read ran.
-func planned[T any](ctx context.Context, q DB, settings []setting, read func() (T, error)) (T, error) {
+// back after it (planning) whether it fails, panics or not, so a host's transaction under WithTx
+// gets its own again, as where it goes on past a call refused for its ctx once read ran, or one
+// whose panic it recovered from: Holders and Conflicts read on it with no savepoint to roll back.
+func planned[T any](ctx context.Context, q DB, settings []setting, read func() (T, error)) (v T, err error) {
 	restore, err := planning(ctx, q, settings)
 	if err != nil {
-		var none T
-		return none, err
+		return v, err
 	}
-	v, err := read()
-	if rerr := restore(); err == nil {
-		err = rerr
-	}
-	if err != nil {
-		var none T
-		return none, err
-	}
-	return v, nil
+	defer func() {
+		if rerr := restore(); err == nil {
+			err = rerr
+		}
+		if err != nil {
+			var none T
+			v = none
+		}
+	}()
+	return read()
 }

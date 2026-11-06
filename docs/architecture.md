@@ -972,8 +972,9 @@ flowchart TB
   runs in such a transaction of its own only to hold JIT off for it (`withoutJIT`). A read that
   sets planner settings for its own statements alone (`planned`), as that, `Holders`' read of label
   values and a change bounding a scope's conditions (`seeking`) do, puts the host's back after it,
-  where it fails or its ctx is done too, as pgx sends nothing on a done ctx: under `WithTx`, a
-  `Holders` refused for its ctx once its read had run left the host's transaction JIT off.
+  where it fails, panics or its ctx is done too, as pgx sends nothing on a done ctx: under `WithTx`,
+  a `Holders` refused for its ctx once its read had run left the host's transaction JIT off, as did
+  one whose panic the host recovered from, as no savepoint of the call's rolls them back.
 - **One time for a call.** A call reads `Config.Now` once, where it first needs the time: every
   statement it makes compares expiry with it, and every condition reads it as `request.time`, so a
   grant or a membership ending as the call runs can't meet a deny, a condition or label values of a

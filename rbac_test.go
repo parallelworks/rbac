@@ -9303,10 +9303,10 @@ func TestBoundingConditionsLeavesTheHostItsPlannerSettings(t *testing.T) {
 }
 
 // A read that turns a planner setting off for its own statements puts the host's back under WithTx
-// where it fails, as one of its statements refused before it was sent, or where the call's ctx is
-// done once those have run, as pgx sends nothing on a done ctx: here Holders' read of its holders'
-// label values, with JIT off for it. The host's transaction, which goes on past the call, kept JIT
-// off until it ended.
+// where it fails, as one of its statements refused before it was sent, where the call's ctx is done
+// once those have run, as pgx sends nothing on a done ctx, or where it panics, which a host can
+// recover from and go on in its transaction: here Holders' read of its holders' label values, with
+// JIT off for it. The host's transaction, which goes on past the call, kept JIT off until it ended.
 func TestAReadLeavesTheHostItsPlannerSettingsWhereItFails(t *testing.T) {
 	h := labeled(t)
 	ctx := t.Context()
@@ -9331,6 +9331,17 @@ func TestAReadLeavesTheHostItsPlannerSettingsWhereItFails(t *testing.T) {
 			rbac.SetMatchingKeys(t, func(int) { cancel() })
 			_, _ = h.authz.WithTx(tx).Holders(call, login, secret)
 			return call.Err()
+		},
+		"panicked": func(t *testing.T, tx pgx.Tx) (err error) {
+			t.Helper()
+			rbac.SetMatchingKeys(t, func(int) { panic(refused) })
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("a panic in Holders: %v", r)
+				}
+			}()
+			_, err = h.authz.WithTx(tx).Holders(ctx, login, secret)
+			return err
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
