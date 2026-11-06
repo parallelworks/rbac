@@ -1231,6 +1231,14 @@ func customRolesAsOf(t *testing.T, h *harness, plans string, reads map[string]fu
 				}
 			}
 			for what, f := range reads {
+				// Once before, as the reads share statements, which the first to run plans: a plan
+				// made generically, as force_generic_plan has it, is made once a transaction, and
+				// planning reads the metapage of each empty index of history, as those of prunes
+				// before any, for each time a statement names it, so the read that ran first, in a
+				// map's random order, was counted hundreds of pages more than one that ran later.
+				if err := f(tx, a); err != nil {
+					return fmt.Errorf("%s: %w", what, err)
+				}
 				start := historyPages(ctx, t, tx)
 				if err := f(tx, a); err != nil {
 					return fmt.Errorf("%s: %w", what, err)

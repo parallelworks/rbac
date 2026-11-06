@@ -5015,11 +5015,19 @@ func TestPruningGoesOnFromWhereItStopped(t *testing.T) {
 			  SELECT 't1', 'cluster', 'c1', 'user', 'kept-' || i, 'cluster.login' FROM generate_series(1, $1) i`, []any{kept}},
 			{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
 			  SELECT 't1', 'cluster', 'c1', 'user', 'changed-' || i, 'cluster.login' FROM generate_series(1, 300) i`, nil},
-			{`UPDATE rbac_grants SET note = 'changed' WHERE principal LIKE 'user:changed-%'`, nil},
 		} {
 			if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
 				t.Fatal(err)
 			}
+		}
+		// The update's commit record holds the oldest transaction running in the cluster as it was
+		// written, every older one's versions counted as committed by it without their commit
+		// records looked up: the versions it supersedes were looked up where another session's
+		// transaction, of any database, was running then, as in one of the two calls and not the
+		// other, 200 pages more.
+		settled(t, h)
+		if _, err := h.pool.Exec(ctx, `UPDATE rbac_grants SET note = 'changed' WHERE principal LIKE 'user:changed-%'`); err != nil {
+			t.Fatal(err)
 		}
 		then, through := dbNow(t, h), exported(t, h)
 		// The first versions go oldest first, and the call's records, one for each of its
@@ -5228,6 +5236,30 @@ func historyPages(ctx context.Context, t *testing.T, tx pgx.Tx) int64 {
 		t.Fatal(err)
 	}
 	return n
+}
+
+// settled waits, for up to 10 seconds, until no transaction in the cluster, of any database, is as
+// old as the last that wrote h's history, so that a commit record written after it holds a horizon
+// past every transaction history holds: what a read as of a time looks up then turns on h's history
+// alone, not on what other sessions were running.
+func settled(t *testing.T, h *harness) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	for {
+		var past bool
+		if err := h.pool.QueryRow(ctx, `SELECT pg_snapshot_xmin(pg_current_snapshot()) > (SELECT max(txid) FROM rbac_history)`).Scan(&past); err != nil {
+			t.Fatalf("waiting for the transactions running as history was last written to end: %v", err)
+		}
+		if past {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("waiting for the transactions running as history was last written to end: %v", ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 // One call reads as far into history as its batch reaches, and no further: what comes after it,
