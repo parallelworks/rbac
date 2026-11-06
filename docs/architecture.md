@@ -416,7 +416,8 @@ sequenceDiagram
   each value, a string too, and a tenth of each other byte copied whole, so it counts no more than
   converting the same does: past it the hook can't be asked, and the call is refused (`uncopied`)
   as any other, a `DeniedError` of the permission on the resource asked about, or the tenant, whose
-  `Reason` names the hook and whose message only the permission. Counting a list's elements twice, a string by the bytes of its header, or a
+  `Reason` names the hook and whose message only the permission. Counting a list's elements
+  twice, a string by the bytes of its header, or a
   protobuf `Value` and its field apart, attributes a check converts couldn't be copied. A slice
   reached at several lengths is copied once from where it starts, each length a slice of the copy,
   and one reached while its elements are copied, before a longer length outgrew that copy, a slice
@@ -436,12 +437,21 @@ sequenceDiagram
   It calls no method of the host's, so a condition reads no value by one. A kind's attributes, the
   subject's, the resource's or the request's, holding anything else anywhere, a `ref.Val` of the
   host's own, a list, map or optional of CEL's a host makes, a struct, another message, a map keyed
-  by a double or holding two keys read as the same value, a value holding itself, or nesting past
+  by a double or holding two keys read as the same value, and so JSON text naming a member twice
+  once unescaped, read through `json.Decoder`'s tokens (`parseJSON`), or a packed message setting a
+  field or a map's key twice, read from its wire bytes (`setOnce`), as decoding either keeps the
+  last where a reader of the first reads another, JSON text that isn't UTF-8 or escapes half a
+  surrogate pair, a `json.Number` JSON doesn't write, a value holding itself, or nesting past
   `maxNested` along the longest path through them, can't be read as a whole (`unreadable`): every
   condition reading any of them fails, while the other kinds' are read. A value inside a readable
   map that no condition could read left every operator to tell it from the rest, and `in`, `has()`
   and loops over a map's keys each found its key; whole-kind failure leaves no such value for an
-  operator to meet. Depth is decided by heights kept with each converted value, so it doesn't
+  operator to meet. The kinds that can't be read are each the one value `unreadable`, so whatever
+  hashes or compares it fails too: a key (`comparableKey`), and a comparison or `in` reading it
+  whole, however deep in a list or a map (`measured`); hashed, a map literal keyed by two kinds past
+  `maxConverted` held one entry, and `request.attributes in {subject.attributes: true}` held. A
+  list holding it a map hashes as the list, wherever it is, so a key of one tells nothing of it.
+  Depth is decided by heights kept with each converted value, so it doesn't
   turn on map order or on which kind reached a shared value first, and each kind is converted, and
   charged, whole, whatever it holds, but where it nests past `maxNested`: converting stops there, so
   what it is charged, and whether the kinds after it fit `maxConverted`, can turn on map order,
@@ -483,10 +493,19 @@ sequenceDiagram
   and again for CEL's charge, comparing JSON nested 3,300 deep took twenty times what it was
   charged. Reading a time in a zone loads the zone once for the process (`zones`), bounded at
   `maxZones`, and finds a name names none once, the zone a literal names when the condition is
-  planned, and one an attribute names the first time a time is read in it, charged `zoneLoad`
-  more, before it loads, and refuses a name of none, as `tzdata.zi`, and `Local` and `localtime`,
-  before loading anything (`inZone`): loaded at each call, the zone `tzdata.zi` named took a
-  quarter of a second for a check. Where reading the platform's files failed, as once the process
+  planned, and one an attribute names the first time a time is read in it, which each read is
+  charged `zoneLoad` more for, before it loads, whether or not the process has loaded it: charged
+  only where it hadn't, a check decided by what the process loaded before, refused the first time
+  and allowed after, and across replicas. It refuses a name of none, as `tzdata.zi`, and one with a
+  part that is `Local` or `localtime` in any case, as `posix/localtime`, before loading anything
+  (`inZone`): loaded at each call, the zone `tzdata.zi` named took a quarter of a second for a
+  check. Zones load from the platform's files, as `time.LoadLocation` loads them: Go's embedded
+  `time/tzdata` offers no way to load from it alone, as `time` reads it only after the platform's
+  files and exports neither its data nor its loader, so loading only from it would mean keeping a
+  copy of the time zone database in the package, behind each platform's updates to it.
+  `request.time` is bounded as the timestamp a check passes (`worst.walk`), not as anything a map
+  of dyn may hold, but where a loop's variable named `request` hides it. Where reading the
+  platform's files failed, as once the process
   ran out of file descriptors, it keeps nothing (`settled`), and a literal's zone isn't planned, so
   the next check plans it again: kept, a real zone failed until the process dropped it. A
   comparison, a search or a match that would cost more than a condition may fails before it runs,
@@ -764,7 +783,10 @@ flowchart LR
   too few: a conditional grant or deny marks its holder whatever the condition reads, the resource
   alone too, and a deny leaves out whom it binds only where it has no condition
   (`boundByDenies`). For a labeled resource it reads every identity's label values'
-  grants and denies in one statement in the list's snapshot.
+  grants and denies in one statement in the list's snapshot, and narrows that read once for all of
+  them to the roles giving values (`valuesOfAll`), so each identity walks only its grants of those:
+  narrowed for each, 1,000 holders, the tenant's members granted 300 roles of 1,000 other
+  permissions, read every role again for each holder, 300 million entries, in seven seconds.
 
 ## Labels and exclusive values
 
@@ -812,8 +834,9 @@ flowchart TB
   as the whole role is, which the first decision narrows the read to, reading each role once
   (`labeling`): a holding decides by nothing else, so the actor's grants of other roles, however
   many or large, cost a label nothing. A check deciding a subject's values, as `Authorize` of a
-  labeled resource, `Holders` for each identity, `Holding`, `Filter` and `Reachable` do, narrows its
-  read so too.
+  labeled resource, `Holding`, `Filter` and `Reachable` do, narrows its read so too, and `Holders`
+  its one read of every identity's values, once for all of them, so each identity's decision walks
+  that read as it is (`narrowed`).
 - **Releasing and writing.** `ReleasePermission(dimension)`, held on the tenant, is the power to
   release data to a looser label in that dimension, so only a holder of it can downgrade data. A
   `Holding`'s `MayWrite` and `MayRelease` say whether data read under one label may be written, or
@@ -858,20 +881,19 @@ flowchart TB
 - **READ COMMITTED.** A change runs at READ COMMITTED, as its checks under the locks must read what
   committed before the locks were taken. Under `WithTx` the host's transaction must be at READ
   COMMITTED too, as must one `Migrate` is given.
-- **One call at a time on a transaction.** An Authorizer bound to a transaction, as `WithTx` and
-  `AsOf` give and `New` returns on a `pgx.Tx`, runs on it through a `serialTx`, which has the
-  transaction's one connection run one statement at a time, until its rows are read, and each
-  savepoint it begins, as a change's or AsOf's, until it ends: calls from several goroutines take
-  turns rather than panic in pgx's watch of a context, fail as the connection busy, hang, or race
-  on what the connection keeps, as the map of its cache of prepared statements, whose concurrent
-  use the runtime ends the process for. A statement of another call in a change's savepoint would
-  read what the change wrote, which rolling it back unwrites. A call waiting for its turn gives up
-  once its ctx is done. A hook calls back in between a call's statements, as constraints and
-  `ValidateGrant` are asked before a change's savepoint; `OnChange`, which runs in it, is given a
-  ctx holding it (`inTurn`), with which its calls on the Authorizer run in the savepoint. AsOf's
-  read is given an Authorizer whose `serialTx` is AsOf's transaction, or its savepoint of the
-  host's, which has the host's `serialTx` until AsOf returns. New's Authorizer on a pool is safe
-  for concurrent use as the pool is, and one on a connection or a host's own DB as that is.
+- **One goroutine at a time on a transaction.** An Authorizer bound to a transaction or a
+  connection, as `WithTx` and AsOf's read give and `New` returns on a `pgx.Tx` or a `*pgx.Conn`,
+  runs every call on that one connection, which pgx doesn't make safe for concurrent use: calls on
+  it from several goroutines at once can panic in pgx's watch of a context, fail as the connection
+  busy, or race on what the connection keeps, as the map of its cache of prepared statements,
+  whose concurrent use the runtime ends the process for. The package adds no guard, as pgx adds
+  none: one that made overlapping calls take turns, or refused them, made a hook's call back in
+  wait for what its own goroutine held, some for good, where pgx failed fast or ran it. A hook
+  calls back in one call at a time, between a call's statements, as constraints and `ValidateGrant`
+  are asked, or in a change's savepoint, as `OnChange` is. For an access review in parallel, a
+  host runs several `AsOf` calls on a pool's Authorizer, each in a transaction of its own. New's
+  Authorizer on a pool is safe for concurrent use as the pool is, and one on a host's own DB as
+  that is.
 - **A host's own DB.** One that is neither a pool, a connection nor a `pgx.Tx` begins with `Begin`,
   and its first statement sets the isolation a change or a read of one snapshot needs (`isolated`):
   another level first, then that one. A savepoint of a transaction under way, as a wrapper around
@@ -1078,8 +1100,7 @@ flowchart LR
   records between two checkpoints.
 - **AsOf** stands temporary views of history in for the tables, in a transaction it rolls back,
   so every check, list and search answers as it would have at a past time, with the catalog and
-  the label dimensions as they are now. The read's calls take turns on that transaction, from
-  several goroutines too, and the rollback waits for the one under way. Making the views takes a transaction id, which holds every
+  the label dimensions as they are now. Making the views takes a transaction id, which holds every
   export in the cluster back while the read runs. Every statement is planned for its arguments and
   runs without JIT, which such plans over history cost past `jit_above_cost` for any subject. It
   takes a time from PostgreSQL's earliest to 9999-12-30, to the microsecond, rounded down, as pgx

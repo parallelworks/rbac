@@ -7,6 +7,7 @@ import (
 	"maps"
 	"math/rand/v2"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -717,20 +718,29 @@ func TestFilterIsCountedAlikeHoweverManyDimensionsItsHoldingHoldsWholeOrNotAtAll
 // identities, groups, the tenant's members and the public, of custom roles for the tenant alone and
 // for other types too, of denies of values, of every value of a dimension and of other permissions,
 // some naming and exempting several principals among hundreds, and of a constraint removing values,
-// in an Ordered, an AllOf, an AnyOf dimension of forty values and an exclusive one. Of rows whose
-// label has a value no dimension declares or a NULL one, or is NULL, Filter keeps none, as of those
-// whose values differ from declared ones only in case or punctuation, or are quoted, escaped or
-// JSON, and of one whose label is an array of two dimensions, those of it; and it keeps the same of
-// a column in a collation that isn't deterministic, which finds such values equal to declared ones.
+// in an Ordered, an AllOf, an AnyOf dimension of forty values and an exclusive one, beside large
+// custom roles of a hundred other permissions, some giving values too, some privileged or public,
+// or for other types too; and Holders, narrowing its read of every identity's values once for all
+// of them, decides each identity's, and which of them a condition or a constraint decided, as a
+// read of its own walked whole does. Of rows whose label has a value no dimension declares or a
+// NULL one, or is NULL, Filter keeps none, as of those whose values differ from declared ones only
+// in case or punctuation, or are quoted, escaped or JSON, and of one whose label is an array of two
+// dimensions, those of it; and it keeps the same of a column in a collation that isn't
+// deterministic, which finds such values equal to declared ones.
 func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 	var projects []string
 	for i := range 40 {
 		projects = append(projects, fmt.Sprintf("p%02d", i))
 	}
+	var others []rbac.Permission
+	for i := range 100 {
+		others = append(others, rbac.Permission(fmt.Sprintf("tenant:p%03d", i)))
+	}
 	var removing map[rbac.Permission]bool
 	h := labeled(t, banks, func(c *rbac.Config) {
 		c.Labels = append(slices.Clone(c.Labels), rbac.LabelDimension{Name: "proj", Rule: rbac.AnyOf, Values: projects})
 		c.Catalog = append(slices.Clone(c.Catalog),
+			rbac.RoleDefinition{ID: "tenant.others", Permissions: others, ResourceTypes: []string{rbac.TenantScope}},
 			rbac.RoleDefinition{ID: "proj.few", Permissions: []rbac.Permission{"proj:p00", "proj:p01", "proj:p02", "proj:p03"}, ResourceTypes: []string{rbac.TenantScope}},
 			rbac.RoleDefinition{ID: "proj.one", Permissions: []rbac.Permission{"proj:p07"}, ResourceTypes: []string{rbac.TenantScope}, Public: true},
 			rbac.RoleDefinition{ID: "mixed", Permissions: []rbac.Permission{"tenant:view", "level:mid", "comp:alpha", "rel:gbr", "proj:p05", "bank:a"}, ResourceTypes: []string{rbac.TenantScope}},
@@ -786,7 +796,7 @@ func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 	}
 	// The rows refused by a dimension the holding holds no value of, AnyOf ones and the others apart,
 	// and those labeled in an AnyOf dimension it holds every value of.
-	kept, refused, listed, noneOfAnyOf, noneOfOther, wholeAnyOf := 0, 0, 0, 0, 0, 0
+	kept, refused, listed, noneOfAnyOf, noneOfOther, wholeAnyOf, valued, conditioned := 0, 0, 0, 0, 0, 0, 0, 0
 	for seed := range uint64(48) {
 		rng := rand.New(rand.NewPCG(seed, seed+17))
 		b := &pgx.Batch{}
@@ -859,6 +869,32 @@ func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 			}
 			b.Queue(`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions, condition) VALUES ('t1', 'tenant', 't1', $1, $2, $3, $4, $5)`,
 				fmt.Sprint("many", i), named, exempt, perms, condition)
+		}
+		// And, from a stream of their own too, large custom roles of a hundred other permissions,
+		// half of them giving values beside, some privileged by one that changes access, some public,
+		// some for other types too, each granted on the tenant to a few of the principals.
+		large := rand.New(rand.NewPCG(seed, seed+41))
+		for i := range 3 {
+			var perms []string
+			for _, p := range others {
+				perms = append(perms, string(p))
+			}
+			if large.IntN(2) == 0 {
+				for _, v := range values {
+					if large.IntN(4) == 0 {
+						perms = append(perms, v)
+					}
+				}
+			}
+			if large.IntN(3) == 0 {
+				perms = append(perms, "tenant:grant")
+			}
+			role := fmt.Sprint("custom.big", i)
+			b.Queue(`INSERT INTO rbac_roles (tenant, id, permissions, resource_types, public) VALUES ('t1', $1, $2, $3, $4)`,
+				role, perms, [][]string{{"tenant"}, {"tenant"}, {"tenant", "cluster"}}[large.IntN(3)], large.IntN(2) == 0)
+			for range 1 + large.IntN(3) {
+				insert(principals[large.IntN(len(principals))], "tenant", "t1", role, conditions[large.IntN(len(conditions))])
+			}
 		}
 		removing = map[rbac.Permission]bool{}
 		for _, v := range values {
@@ -992,12 +1028,39 @@ func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 				}
 			}
 		}
+		labels := make([]rbac.Label, len(rows))
+		identities := make([]rbac.Subject, len(users))
+		for i, r := range rows {
+			labels[i] = r.Labels
+		}
+		for i, u := range users {
+			identities[i] = subjects[u]
+		}
+		byList, byAll := rbac.ListedChecksDecided(t, request, h.authz, identities, "t1", labels)
+		for j, u := range users {
+			for i := range byList[j] {
+				if byList[j][i] != byAll[j][i] {
+					t.Errorf("seed %d, %s, check %d of %v: by Holders' read it holds %s, and by every grant %s", seed, u, i, labels, byList[j][i], byAll[j][i])
+				}
+				if i < len(labels) && !strings.HasPrefix(byAll[j][i], "[]") {
+					valued++
+				}
+				if !strings.HasSuffix(byAll[j][i], "by condition []") {
+					conditioned++
+				}
+			}
+		}
 	}
 	// So that rows kept and refused, and holders listed, are each compared, and refusals by a
 	// dimension of no value held, and labels in one held whole.
 	if kept == 0 || refused == 0 || listed == 0 || noneOfAnyOf == 0 || noneOfOther == 0 || wholeAnyOf == 0 {
 		t.Errorf("Filter kept %d rows and refused %d, %d by an AnyOf dimension and %d by another of no value held, %d rows were labeled in an AnyOf dimension held whole, and Holders listed %d",
 			kept, refused, noneOfAnyOf, noneOfOther, wholeAnyOf, listed)
+	}
+	// So that Holders' read is compared where it holds some of what a label asks for, and where a
+	// condition or a constraint decides some, which Holders marks a holder by.
+	if valued == 0 || conditioned == 0 {
+		t.Errorf("by Holders' read, %d decisions held a value a label asks for, and %d had one a condition or a constraint decided", valued, conditioned)
 	}
 }
 
@@ -2347,8 +2410,11 @@ func TestAChangeCheckingManyLabelsDecidesEachAsACheckOfItAlone(t *testing.T) {
 // reading the action or failing, and for some of them enough costly ones that a value's budget
 // runs out; of denies, wildcards among them, and of a constraint removing values: in an Ordered
 // dimension, and an exclusive one. A check of one label, and Holding, walk only those too, and
-// decide as walking every grant and permission does, there under a constraint failing on some
-// values as well, which fails the check that asks it about one.
+// decide as walking every grant and permission does, the values a condition or a constraint decided
+// among them, which Holders marks a holder by, there under a constraint failing on some values as
+// well, which fails the check that asks it about one; and so does Holders, by its read of every
+// holder's values narrowed once for all of them, of a few of the labels and every value: of the
+// actor, another in the group the actor's group is in, and a member in no group.
 func TestAChangeWalkingOnlyTheGrantsGivingValuesDecidesEachLabelAsACheckOfItAlone(t *testing.T) {
 	var others []rbac.Permission
 	for i := range 40 {
@@ -2386,6 +2452,7 @@ func TestAChangeWalkingOnlyTheGrantsGivingValuesDecidesEachLabelAsACheckOfItAlon
 	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'outer', 'group', 'g')`); err != nil {
 		t.Fatal(err)
 	}
+	listed := []rbac.Subject{u, h.as(t, "v", "outer"), h.as(t, "w")}
 	l := "[1,2,3,4,5,6,7,8]"
 	tail := ` && "` + strings.Repeat("x", 40) + `" != ""`
 	costly := func(i int) string {
@@ -2540,6 +2607,7 @@ func TestAChangeWalkingOnlyTheGrantsGivingValuesDecidesEachLabelAsACheckOfItAlon
 			}
 		}
 		narrowed, full := rbac.LabeledChecksDecided(t, request, h.authz, u, "t1", labels)
+		byList, byAll := rbac.ListedChecksDecided(t, request, h.authz, listed, "t1", labels[:4])
 		failing = nil
 		for i := range narrowed {
 			if narrowed[i] != full[i] {
@@ -2547,6 +2615,13 @@ func TestAChangeWalkingOnlyTheGrantsGivingValuesDecidesEachLabelAsACheckOfItAlon
 			}
 			if strings.HasPrefix(full[i], "error: ") {
 				failed++
+			}
+		}
+		for j, s := range listed {
+			for i := range byList[j] {
+				if byList[j][i] != byAll[j][i] {
+					t.Errorf("seed %d, check %d of %v: by Holders' read %s holds %s, and by every grant %s", seed, i, labels[:4], s.Principal.ID, byList[j][i], byAll[j][i])
+				}
 			}
 		}
 	}
@@ -3459,6 +3534,96 @@ func TestHoldersOfALabeledResourceHonorExemptionsFromADenyOnTheMembers(t *testin
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("Holders lists %v, Authorize allows %v", got, want)
+	}
+}
+
+// Holders of a labeled resource narrows its read of every holder's label values to what gives
+// values once for all of them, so each holder walks only its grants of roles giving some, and of
+// those only the values: twenty roles of a thousand other permissions granted to the tenant's
+// members, and one of five hundred others beside eight values granted to every holder's group, cost
+// the list the entries and the memory of reading them once, however many holders it lists. Narrowed
+// for each holder, 1,000 holders of 300 such roles read 300 million entries and allocated 4.8 GB.
+func TestHoldersOfALabeledResourceReadEachRoleOnceForAllItsHolders(t *testing.T) {
+	var others, values []string
+	for i := range 1000 {
+		others = append(others, fmt.Sprintf("tenant:p%03d", i))
+	}
+	for _, d := range labelDimensions {
+		for _, v := range d.Values {
+			values = append(values, d.Name+":"+v)
+		}
+	}
+	const roles = 20
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	type cost struct {
+		entries   int
+		allocated int64
+	}
+	// What listing n holders costs, before the members are granted the roles giving no value and
+	// after.
+	list := func(t *testing.T, n int) (before, after cost) {
+		t.Helper()
+		h := labeled(t, func(c *rbac.Config) {
+			var ps []rbac.Permission
+			for _, p := range others {
+				ps = append(ps, rbac.Permission(p))
+			}
+			c.Catalog = append(slices.Clone(c.Catalog), rbac.RoleDefinition{ID: "tenant.others", Permissions: ps, ResourceTypes: []string{rbac.TenantScope}})
+		})
+		ctx := t.Context()
+		h.groups(t, "all")
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+			SELECT 't1', 'custom.r' || i, $2::text[], '{tenant}'::text[] FROM generate_series(1, $1) i
+			UNION ALL SELECT 't1', 'custom.cleared', $3::text[] || $4::text[], '{tenant}'::text[]`, roles, others, others[:500], values); err != nil {
+			t.Fatal(err)
+		}
+		h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "all"), grant(rbac.TenantRoot("t1"), "custom.cleared", rbac.Group, "all"))
+		manyMembers(t, h, n, `, places AS (INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) SELECT 't1', 'all', 'user', id FROM others)
+			SELECT 1`, "rbac_members")
+		read := 0
+		rbac.SetReadingEntries(t, func(k int) { read += k })
+		listed := func() cost {
+			t.Helper()
+			read = 0
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			holders, err := h.authz.Holders(ctx, view, secret)
+			runtime.ReadMemStats(&after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(holders) != n {
+				t.Fatalf("Holders lists %d of %d members", len(holders), n)
+			}
+			for _, hd := range holders {
+				if hd.MaybeDenied || hd.Conditional {
+					t.Fatalf("Holders marks %+v", hd)
+				}
+			}
+			return cost{read, int64(after.TotalAlloc - before.TotalAlloc)}
+		}
+		// Once before, so neither counts what the pool's first statements cost.
+		listed()
+		before = listed()
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'tenant', 't1', 'members', 't1', 'custom.r' || i FROM generate_series(1, $1) i`, roles); err != nil {
+			t.Fatal(err)
+		}
+		return before, listed()
+	}
+	const few, many = 50, 500
+	fewBefore, fewAfter := list(t, few)
+	manyBefore, manyAfter := list(t, many)
+	// Each holder beyond the first walks the values of its role giving them, once, and asks the
+	// constraints about the one the label asks for.
+	if each := (manyAfter.entries - fewAfter.entries) / (many - few); each > len(values)+1 {
+		t.Errorf("Holders of %d holders read %d role entries, and of %d %d: %d more for each holder, of a role giving %d values",
+			many, manyAfter.entries, few, fewAfter.entries, each, len(values))
+	}
+	if byFew, byMany := fewAfter.allocated-fewBefore.allocated, manyAfter.allocated-manyBefore.allocated; byMany > 2*byFew {
+		t.Errorf("granting the members %d roles of %d permissions giving no value has Holders of %d holders allocate %d bytes more, and of %d %d",
+			roles, len(others), many, byMany, few, byFew)
 	}
 }
 

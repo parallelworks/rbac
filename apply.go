@@ -2276,13 +2276,12 @@ func savepoint(ctx context.Context, db DB, fn func(pgx.Tx) error) error {
 	return finish(ctx, tx.Commit)
 }
 
-// report hands a change to Config.OnChange in its transaction, unless it changed nothing, with a
-// ctx that makes its calls back into a's transaction in the change's savepoint (inTurn).
+// report hands a change to Config.OnChange in its transaction, unless it changed nothing.
 func (a *Authorizer) report(ctx context.Context, tx pgx.Tx, e ChangeEvent) error {
 	if a.cfg.OnChange == nil || e.empty() {
 		return nil
 	}
-	return a.cfg.OnChange(inTurn(ctx, a.db), tx, e)
+	return a.cfg.OnChange(ctx, tx, e)
 }
 
 // upsert stores grants in one statement, sorted so concurrent changes lock rows in the same

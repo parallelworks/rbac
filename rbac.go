@@ -26,8 +26,6 @@ import (
 	"reflect"
 	"slices"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -994,10 +992,12 @@ type Config struct {
 }
 
 // Authorizer decides and changes grants, on the tables Migrate creates. One New returns on a pool is
-// safe for concurrent use. One bound to a transaction, as WithTx and AsOf give and New returns on a
-// pgx.Tx, is used from one goroutine at a time: calls on it from several take turns on the
-// transaction's one connection, rather than fail, as WithTx says. On a *pgx.Conn, or a DB of the
-// host's own, it is as safe for concurrent use as that DB, which one connection isn't.
+// safe for concurrent use. One bound to a transaction or a connection, as WithTx and AsOf's read
+// give and New returns on a pgx.Tx or a *pgx.Conn, runs every call on that one connection, so it is
+// for one goroutine at a time, as the pgx.Tx or connection is: concurrent use isn't supported, and
+// pgx may fail, race or panic. For an access review in parallel, run several AsOf calls on a pool's
+// Authorizer, each on its own goroutine. On a DB of the host's own, it is as safe for concurrent
+// use as that DB.
 type Authorizer struct {
 	db  DB
 	cfg Config
@@ -1047,14 +1047,12 @@ type permissionOn struct {
 	t string
 }
 
-// New checks the configuration and returns an Authorizer that runs its queries on db: on a
-// pgx.Tx, one call's statement or savepoint at a time, as WithTx's does.
+// New checks the configuration and returns an Authorizer that runs its queries on db: safe for
+// concurrent use on a pool, and on a pgx.Tx or a *pgx.Conn for one goroutine at a time
+// (Authorizer).
 func New(db DB, cfg Config) (*Authorizer, error) {
 	if db == nil {
 		return nil, errors.New("rbac: nil DB")
-	}
-	if tx, ok := db.(pgx.Tx); ok {
-		db = serialized(tx)
 	}
 	if cfg.ValidateGrant == nil {
 		return nil, errors.New("rbac: Config.ValidateGrant is required")
@@ -1209,15 +1207,9 @@ func vocabulary(declared []Permission, given map[Permission]bool, roleTypes map[
 // between them can mix two states, as can AsOf's read, in a savepoint of tx, of a time not yet final
 // (AsOf).
 //
-// Use the Authorizer it returns from one goroutine at a time, as tx is one connection's, which runs
-// one statement at a time. Calls on it from several at once take turns rather than fail: each
-// statement until its rows are read, and each change's savepoint until it ends, so another call
-// reads none of what a change writes until it is released; a call waiting for its turn gives up
-// once its ctx is done. Two Authorizers WithTx returns on one transaction take no turns with each
-// other: share one. A hook may call back into it: one asked before a change's savepoint, as a
-// constraint or ValidateGrant, takes its turn between the call's statements; OnChange, which runs in
-// the savepoint, makes its calls in it with the ctx it is given, and with another ctx waits for the
-// change it runs in until that ctx is done. The host's own statements on tx are its to order.
+// The Authorizer it returns runs every call on tx, one connection, so it is for one goroutine at a
+// time, as tx is: calls on it from several at once aren't supported, and pgx may fail, race or
+// panic. A hook may call back into it, one call at a time, as from the call that asks it.
 func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 	// One AsOf gave reads its own transaction, whose views are the past: on another, it would read
 	// the tables as they are now.
@@ -1225,262 +1217,9 @@ func (a *Authorizer) WithTx(tx pgx.Tx) *Authorizer {
 		return a
 	}
 	b := *a
-	b.db = serialized(tx)
+	b.db = tx
 	return &b
 }
-
-// serialized is tx for an Authorizer bound to it, which takes turns on it (serialTx).
-func serialized(tx pgx.Tx) pgx.Tx {
-	if tx == nil {
-		return nil
-	}
-	return &serialTx{Tx: tx, turn: &turn{ch: make(chan struct{}, 1)}}
-}
-
-// serialTx is a transaction an Authorizer bound to it runs on, a statement or a savepoint at a time.
-// Calls from several goroutines on one connection panicked in pgx's watch of its context, failed as
-// the connection busy, or hung, holding AsOf's transaction id, which holds History and Export back
-// in the whole cluster; and wrote at once to what the connection keeps, as its cache of prepared
-// statements, whose map the runtime ends the process for using at once. A savepoint holds the turn
-// until it ends: a statement of another call in it would read what the change wrote, which rolling
-// it back unwrites, and a savepoint of another begun in it would be rolled back with it.
-type serialTx struct {
-	pgx.Tx
-	turn *turn
-}
-
-// turn is whose a serialTx's transaction is: ch holds a token while a statement or a savepoint has
-// it, and held is the savepoint that has it, if one does.
-type turn struct {
-	ch   chan struct{}
-	held atomic.Pointer[heldTx]
-}
-
-// heldTx is a savepoint of a serialTx, which has its turn until it ends.
-type heldTx struct {
-	pgx.Tx
-	end func()
-}
-
-// turnOf keys, in the ctx a hook running in the savepoint that has t is given, that savepoint
-// (inTurn).
-type turnOf struct{ t *turn }
-
-// inTurn is ctx for a hook that runs in the savepoint of db's that has its turn, as OnChange does
-// in a change's: a call it makes with it on an Authorizer bound to db runs in that savepoint, as the
-// change's own statements do, rather than wait for the change to end.
-func inTurn(ctx context.Context, db DB) context.Context {
-	s, ok := db.(*serialTx)
-	if !ok {
-		return ctx
-	}
-	if h := s.turn.held.Load(); h != nil {
-		return context.WithValue(ctx, turnOf{s.turn}, h)
-	}
-	return ctx
-}
-
-// within reports whether ctx is a hook's in the savepoint that has the turn now (inTurn).
-func (s *serialTx) within(ctx context.Context) bool {
-	h, _ := ctx.Value(turnOf{s.turn}).(*heldTx)
-	return h != nil && s.turn.held.Load() == h
-}
-
-// take waits for the turn, or until ctx is done, and returns what gives it back, once however often
-// it is called: nothing within the savepoint that has it.
-func (s *serialTx) take(ctx context.Context) (func(), error) {
-	if s.within(ctx) {
-		return func() {}, nil
-	}
-	select {
-	case s.turn.ch <- struct{}{}:
-	default:
-		select {
-		case s.turn.ch <- struct{}{}:
-		case <-ctx.Done():
-			return nil, fmt.Errorf("rbac: waiting for another call on the transaction: %w", ctx.Err())
-		}
-	}
-	return sync.OnceFunc(func() { <-s.turn.ch }), nil
-}
-
-func (s *serialTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-	give, err := s.take(ctx)
-	if err != nil {
-		return pgconn.CommandTag{}, err
-	}
-	defer give()
-	return s.Tx.Exec(ctx, sql, args...)
-}
-
-// Query has the turn until its rows are closed, or read to their end.
-func (s *serialTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
-	give, err := s.take(ctx)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := s.Tx.Query(ctx, sql, args...)
-	if err != nil {
-		give()
-		return rows, err
-	}
-	return &serialRows{Rows: rows, give: give}, nil
-}
-
-// QueryRow has the turn until its row is scanned.
-func (s *serialTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
-	give, err := s.take(ctx)
-	if err != nil {
-		return errRow{err}
-	}
-	return &serialRow{Row: s.Tx.QueryRow(ctx, sql, args...), give: give}
-}
-
-// SendBatch has the turn until its results are closed.
-func (s *serialTx) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
-	give, err := s.take(ctx)
-	if err != nil {
-		return errBatch{err}
-	}
-	return &serialBatch{BatchResults: s.Tx.SendBatch(ctx, b), give: give}
-}
-
-func (s *serialTx) CopyFrom(ctx context.Context, table pgx.Identifier, columns []string, rows pgx.CopyFromSource) (int64, error) {
-	give, err := s.take(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer give()
-	return s.Tx.CopyFrom(ctx, table, columns, rows)
-}
-
-func (s *serialTx) Prepare(ctx context.Context, name, sql string) (*pgconn.StatementDescription, error) {
-	give, err := s.take(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer give()
-	return s.Tx.Prepare(ctx, name, sql)
-}
-
-// Begin begins a savepoint that has the turn until it ends; within the one that has it, a savepoint
-// of that one's.
-func (s *serialTx) Begin(ctx context.Context) (pgx.Tx, error) {
-	if s.within(ctx) {
-		return s.Tx.Begin(ctx)
-	}
-	give, err := s.take(ctx)
-	if err != nil {
-		return nil, err
-	}
-	tx, err := s.Tx.Begin(ctx)
-	if err != nil {
-		give()
-		return nil, err
-	}
-	h := &heldTx{Tx: tx}
-	h.end = sync.OnceFunc(func() {
-		s.turn.held.CompareAndSwap(h, nil)
-		give()
-	})
-	s.turn.held.Store(h)
-	return h, nil
-}
-
-// Commit and Rollback end the transaction once the call that has the turn gives it back, whatever
-// ctx, as a call can still be reading when the read AsOf runs returns, and ending it then would
-// leave it open, and a savepoint's turn had for good.
-func (s *serialTx) Commit(ctx context.Context) error {
-	give, _ := s.take(context.WithoutCancel(ctx))
-	defer give()
-	return s.Tx.Commit(ctx)
-}
-
-func (s *serialTx) Rollback(ctx context.Context) error {
-	give, _ := s.take(context.WithoutCancel(ctx))
-	defer give()
-	return s.Tx.Rollback(ctx)
-}
-
-func (h *heldTx) Commit(ctx context.Context) error {
-	defer h.end()
-	return h.Tx.Commit(ctx)
-}
-
-func (h *heldTx) Rollback(ctx context.Context) error {
-	defer h.end()
-	return h.Tx.Rollback(ctx)
-}
-
-// serialRows gives the turn back once its rows are closed, as pgx closes them when they are read to
-// their end, or a row fails to scan.
-type serialRows struct {
-	pgx.Rows
-	give func()
-}
-
-func (r *serialRows) Next() bool {
-	if r.Rows.Next() {
-		return true
-	}
-	r.give()
-	return false
-}
-
-func (r *serialRows) Scan(dest ...any) error {
-	err := r.Rows.Scan(dest...)
-	if err != nil {
-		r.give()
-	}
-	return err
-}
-
-func (r *serialRows) Values() ([]any, error) {
-	v, err := r.Rows.Values()
-	if err != nil {
-		r.give()
-	}
-	return v, err
-}
-
-func (r *serialRows) Close() {
-	r.Rows.Close()
-	r.give()
-}
-
-// serialRow gives the turn back once it is scanned, which closes it.
-type serialRow struct {
-	pgx.Row
-	give func()
-}
-
-func (r *serialRow) Scan(dest ...any) error {
-	defer r.give()
-	return r.Row.Scan(dest...)
-}
-
-// serialBatch gives the turn back once its results are closed.
-type serialBatch struct {
-	pgx.BatchResults
-	give func()
-}
-
-func (b *serialBatch) Close() error {
-	defer b.give()
-	return b.BatchResults.Close()
-}
-
-// errRow and errBatch are a statement that never had the turn.
-type errRow struct{ err error }
-
-func (r errRow) Scan(...any) error { return r.err }
-
-type errBatch struct{ err error }
-
-func (b errBatch) Exec() (pgconn.CommandTag, error) { return pgconn.CommandTag{}, b.err }
-func (b errBatch) Query() (pgx.Rows, error)         { return nil, b.err }
-func (b errBatch) QueryRow() pgx.Row                { return errRow(b) }
-func (b errBatch) Close() error                     { return b.err }
 
 // still returns a for one call, deciding at one time (callClock); under a call already, a.
 func (a *Authorizer) still() *Authorizer {

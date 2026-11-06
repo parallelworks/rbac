@@ -9,7 +9,6 @@ import (
 	"maps"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -225,60 +224,6 @@ func TestAsOfLeavesTheHostsTransactionAsItWas(t *testing.T) {
 	if _, err := tx.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
 		VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'cluster.login')`); err != nil {
 		t.Fatal(err)
-	}
-}
-
-// An access review as of a time checks its subjects in goroutines, as a host does with New's
-// Authorizer, on the one AsOf gives, whose calls all run on its one transaction: at once, they
-// panicked in pgx, failed as the connection busy, ended the process writing the connection's cache
-// of statements, or hung holding AsOf's transaction id, which holds History and Export back in the
-// whole cluster. They take turns, on AsOf's own transaction and in a savepoint of the host's, and
-// every one succeeds.
-func TestAsOfTakesReadsFromSeveralGoroutinesInTurn(t *testing.T) {
-	h := setup(t)
-	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
-	defer cancel()
-	owner := h.as(t, "owner")
-	at := dbNow(t, h)
-	tx, err := h.pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	for _, a := range []*rbac.Authorizer{h.authz, h.authz.WithTx(tx)} {
-		const n = 8
-		errs := make(chan error, n)
-		if err := a.AsOf(ctx, "t1", at, func(b *rbac.Authorizer) error {
-			var wg sync.WaitGroup
-			for range n {
-				wg.Go(func() {
-					errs <- func() error {
-						for range 10 {
-							if err := b.Authorize(ctx, owner, login, cluster); err != nil {
-								return err
-							}
-							if d, err := b.Explain(ctx, owner, login, cluster); err != nil || !d.Allowed {
-								return cmp.Or(err, errors.New("Explain denies"))
-							}
-							if _, err := b.Holders(ctx, login, cluster); err != nil {
-								return err
-							}
-						}
-						return nil
-					}()
-				})
-			}
-			wg.Wait()
-			return nil
-		}); err != nil {
-			t.Fatal(err)
-		}
-		close(errs)
-		for err := range errs {
-			if err != nil {
-				t.Error(err)
-			}
-		}
 	}
 }
 
