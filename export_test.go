@@ -1196,14 +1196,15 @@ func Converting(t *testing.T, attributes map[string]any) (allocated uint64, over
 }
 
 // ConvertedInOrder is whether a check converting kinds' attributes in the order given, by one
-// converter, could read each, and whether they cost more than a check converts, which fails them
-// all.
+// converter, could read each, none declared, and whether they cost more than a check converts,
+// which fails them all.
 func ConvertedInOrder(t *testing.T, kinds ...map[string]any) (read []bool, over bool) {
 	t.Helper()
 	c := newConverter()
 	for _, attributes := range kinds {
-		_, ok := c.attributes(attributes)
-		read = append(read, ok)
+		converted, ok := c.attributes(attributes)
+		_, refused := declared(nil, converted).(refusedAttributes)
+		read = append(read, ok && !refused)
 	}
 	return read, c.over
 }

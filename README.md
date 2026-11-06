@@ -312,8 +312,12 @@ scopes conditional ones reach, to check one by one.
   read them as they were, though never another value as one of them. Comparing a double that isn't
   finite fails, and no list or map a condition reads holds one: building a list or a map holding one
   fails, and an attribute holding one, however deep, is refused, as a declared double that isn't
-  finite is, failing whatever reads it, and whatever reads its kind whole, while the kind's others
-  are read. Comparing reads the smaller value whole and the larger only as far, so a list holding
+  finite is, failing whatever reads it, and whatever reads its kind whole; and where no
+  declarations cover the kind, none of its attributes can be read, as where they hold anything
+  else: refused by name alone, a deny's
+  `request.attributes.region == "eu" && request.attributes.risk > 0.5` lifted outside the EU for an
+  infinite risk, where the same infinity as JSON text, `1e400`, applied it. Comparing reads the
+  smaller value whole and the larger only as far, so a list holding
   one beside a long string was compared by the string: `[0.0 / 0.0, "<long>"] != [1, 2]` held, as
   did `request.attributes.scores != [1, 2]` where the request's scores held NaN beside one. Each
   condition runs within the most evaluating it can cost, which its literals and types bound: little
@@ -386,8 +390,9 @@ scopes conditional ones reach, to check one by one.
   holding attributes no condition can read, or reading the `subject`, the `resource` or the
   `request` holding them whole, was decided without them and now fails. So does one building a list
   or a map holding a double that isn't finite, as `has({"k": 0.0 / 0.0}.k)`, or a map naming a key
-  twice, and one reading an attribute holding such a double, however deep, where no declarations
-  cover its kind, as `has()` and `size()` did, or reading that kind whole. Going back to an
+  twice; and where no declarations cover a kind, so does every condition reading its attributes
+  where one holds such a double, however deep: it read the others, and that one too, as `has()` and
+  `size()` did. Going back to an
   earlier release of this package does the same where that release bounds a shape more, so while
   replicas of two releases run side by side, those
   bounding a shape more may refuse changes adding a condition to a scope the others filled. To

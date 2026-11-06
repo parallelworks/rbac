@@ -466,10 +466,14 @@ sequenceDiagram
   and drops the one before unread, so `{"a": subject.attributes, "a": 1}.a == 1` held where
   `{"a": 1, "a": subject.attributes}.a == 1` failed. A double that isn't finite is kept out of
   lists and maps alike: a literal holding one fails as it is built, and an attribute holding one,
-  however deep, which the converter counts (`infinite`), is an error that the kind refuses in part
-  (`declared`), as a declared double that isn't finite is, so comparing fails where either operand
-  is one, and no further search is needed; found only where comparing read it, it failed where the
-  smaller value held one, and `[0.0 / 0.0, "<long>"] != [1, 2]` held.
+  however deep, which the converter counts (`infinite`), is an error that a declared kind refuses
+  in part (`declared`), as a declared double that isn't finite is, and that makes a kind no
+  declarations cover `unreadable`, as a value of another type does: no declarations name what its
+  conditions read, and refused by name alone, a deny's
+  `request.attributes.region == "eu" && request.attributes.risk > 0.5` lifted outside the EU for an
+  infinite float64 risk, and applied for the same infinity as JSON text, `1e400`. So comparing
+  fails where either operand is one, and no further search is needed; found only where comparing
+  read it, it failed where the smaller value held one, and `[0.0 / 0.0, "<long>"] != [1, 2]` held.
   Depth is decided by heights kept with each converted value, so it doesn't
   turn on map order or on which kind reached a shared value first, and each kind is converted, and
   charged, whole, whatever it holds, but where it nests past `maxNested`: converting stops there, so

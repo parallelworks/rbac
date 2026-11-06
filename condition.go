@@ -49,12 +49,14 @@ import (
 // holding them, or reading the subject, the resource or the request holding them whole, so
 // conditions read CEL's own values alone, at what reading any value of its size costs; an attribute
 // holding a double that isn't finite, however deep, fails whatever reads it, and whatever reads its
-// kind whole. A label
+// kind whole, and where no declarations cover its kind, the kind's attributes can't be read, as
+// where they hold anything else. A label
 // value and a power to release are decided on the tenant with no attributes, whatever a check
 // passes (Holding), and their conditions can't read the tenant's: any read of resource.attributes
-// fails, a test of an attribute's presence, in, size(), a macro and a comparison included, so a
-// grant's gives nothing and a deny's applies. The zero Condition is none, and one with a title or
-// description has an expression. A pattern it matches is a string literal,
+// fails, a test of an attribute's presence, in, size(), a macro and a comparison included, and so
+// does reading the resource whole, so a grant's gives nothing and a deny's applies. The zero
+// Condition is none, and one with a title or description has an expression. A pattern it matches
+// is a string literal,
 // of bounded size; it nests at most 32 deep; it builds no message, as `google.protobuf.Struct{}`;
 // and a comparison, or a search of a list, that would read more than a condition may spend, or
 // reading a time in a zone whose name is longer than 64 bytes, holds a byte no zone's name does, as
@@ -2529,10 +2531,15 @@ var unreadable = refusedAttributes{Mapper: noAttributes, all: true}
 // it, converted to another type than it is declared, or failing to convert, and each one a declared
 // kind doesn't declare, made an error that whatever reads it fails on, comparing it included, as
 // one not passed is. CEL compares values of different types as unequal rather than fail, so
-// otherwise a `!=` would hold for it, and a deny's `==` would lift. A kind not declared is as
-// converted, but one converting made an error of, as one holding a double that isn't finite
-// (converter.attributes), refuses it as well. It makes them so in place, as they are the check's
-// own, reading each name once, as converting it was charged for.
+// otherwise a `!=` would hold for it, and a deny's `==` would lift. One converting made an error
+// of, as one holding a double that isn't finite (converter.attributes), a declared kind refuses
+// too, but a kind not declared, read as converted, can't be read at all where it holds one, as a
+// kind holding a value no condition reads can't: no declarations name what its conditions read,
+// and refused in part, a deny's
+// `request.attributes.region == "eu" && request.attributes.risk > 0.5` lifted outside the EU for
+// an infinite float64 risk, and applied for the same infinity as JSON text, `1e400`. It makes them
+// so in place, as they are the check's own, reading each name once, as converting it was charged
+// for.
 func declared(declares map[string]AttributeType, attributes map[ref.Val]ref.Val) any {
 	if len(attributes) == 0 {
 		return noAttributes
@@ -2542,6 +2549,8 @@ func declared(declares map[string]AttributeType, attributes map[ref.Val]ref.Val)
 		name, _ := k.(types.String)
 		t, ok := declares[string(name)]
 		switch {
+		case types.IsError(v) && declares == nil:
+			return unreadable
 		case types.IsError(v):
 			refused = true
 		case declares == nil:

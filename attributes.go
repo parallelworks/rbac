@@ -55,10 +55,11 @@ import (
 // holding them, or the subject, the resource or the request holding them, as reading the attributes
 // of a kind no condition can read does. A name a declared kind doesn't declare, which a condition
 // reads only through dyn(), fails so too, and so does one holding a double that is NaN or
-// infinite, however deep, in an undeclared kind too: comparing reads the smaller value whole and
-// the larger only as far, so a list holding NaN beside a long string was compared by the string,
-// and `request.attributes.scores != [1, 2]` held. An undeclared kind's others are read as
-// converted, and CEL compares values of different types as unequal.
+// infinite, however deep: comparing reads the smaller value whole and the larger only as far, so a
+// list holding NaN beside a long string was compared by the string, and
+// `request.attributes.scores != [1, 2]` held. An undeclared kind's are read as converted, and CEL
+// compares values of different types as unequal; but one holding such a double, however deep, is
+// unreadable as a whole, below.
 //
 // What a host passes as a kind's attributes, the subject's, the resource's or the request's, is
 // converted, where a check reads a condition, once and whole, into CEL's own values, and
@@ -87,8 +88,12 @@ import (
 // A kind's attributes holding anything else, however deep, are unreadable as a whole, as a policy
 // engine fails input it can't read: every condition reading any of them fails, a test of one's
 // presence too, so a grant's gives nothing, a deny's applies and a requirement isn't met, while the
-// other kinds' are read. So are those holding a ref.Val of the host's own, though it says it is of
-// one of CEL's types, a list, a map or an optional of CEL's a host makes, a struct, a channel, a
+// other kinds' are read. So are an undeclared kind's holding a double that is NaN or infinite,
+// however deep, as no declarations name what its conditions read: refused by name alone, a deny's
+// `request.attributes.region == "eu" && request.attributes.risk > 0.5` lifted outside the EU for an
+// infinite float64 risk, where the same infinity as JSON text, 1e400, which a host reading JSON
+// reads none of, applied it. So are those holding a ref.Val of the host's own, though it says it is
+// of one of CEL's types, a list, a map or an optional of CEL's a host makes, a struct, a channel, a
 // func, a complex number, a uintptr, any other message, a map keyed by any other value, as a double
 // or an array, a map holding two keys read as the same value, as 1 and 1u, or "a" twice of two
 // string types, and so JSON text naming a member of an object twice, as "role" and "r\u006fle" are
@@ -265,14 +270,15 @@ func (c *converter) rest() converter { return converter{left: c.left, over: c.ov
 // whether a condition can read them: where any value they hold, however deep, can't be read, as a
 // struct, or nests past maxNested, or holds itself, none can, as the attributes beside one would
 // leave each operator reading them to tell what it reads from what it can't. One holding a double
-// that isn't finite, however deep, is an error, which declared makes the kind refuse, as it refuses
-// a declared double that isn't finite: comparing a list or a map reads the smaller value whole and
-// the larger only as far, so a list holding NaN beside a long string was compared by the string,
-// and `request.attributes.scores != [1, 2]` held. Each is converted, and charged, whether one before
-// it could be read or not, so what is left for the kinds after it doesn't turn on the order a map's
-// entries come in, but where they nest past maxNested: converting stops there, so they are charged
-// for as much of them as it reached first, which that order picks, and whether the kinds after them
-// fit what is left can turn on it, failing closed.
+// that isn't finite, however deep, is an error, which declared makes a declared kind refuse, as it
+// refuses a declared double that isn't finite, and an undeclared kind unreadable: comparing a list
+// or a map reads the smaller value whole and the larger only as far, so a list holding NaN beside a
+// long string was compared by the string, and `request.attributes.scores != [1, 2]` held. Each is
+// converted, and charged, whether one before it could be read or not, so what is left for the
+// kinds after it doesn't turn on the order a map's entries come in, but where they nest past
+// maxNested: converting stops there, so they are charged for as much of them as it reached first,
+// which that order picks, and whether the kinds after them fit what is left can turn on it, failing
+// closed.
 func (c *converter) attributes(attributes map[string]any) (map[ref.Val]ref.Val, bool) {
 	if len(attributes) == 0 {
 		return nil, true
@@ -426,7 +432,7 @@ func (c *converter) refuse() ref.Val {
 }
 
 // double is d as a condition reads it, counting one that isn't finite, which makes the attribute
-// holding it refused (attributes).
+// holding it refused, and an undeclared kind holding it unreadable (attributes).
 func (c *converter) double(d float64) ref.Val {
 	if math.IsNaN(d) || math.IsInf(d, 0) {
 		c.infinite++

@@ -341,8 +341,9 @@ func TestAMapTheHostPassesKeyedByADoubleOrAnArrayFailsItsConditions(t *testing.T
 // `request.attributes.scores == [1, 2]` lifted where the request's scores held NaN beside a long
 // string. No list or map a condition reads holds one: a literal holding one fails as it is built,
 // and a host's attribute holding one, however deep, is refused, as a declared double that isn't
-// finite is, while the kind's others are read. `in` a map a condition makes holding one as a value,
-// which reads no value, was false for a key it lacks, and now fails as building the map does.
+// finite is, and where no declarations cover its kind, so are the kind's others, but request.time is
+// read. `in` a map a condition makes holding one as a value, which reads no value, was false for a
+// key it lacks, and now fails as building the map does.
 func TestNoListOrMapAConditionReadsHoldsADoubleThatIsntFinite(t *testing.T) {
 	long := strings.Repeat("x", 100)
 	quoted := strconv.Quote(long)
@@ -378,14 +379,14 @@ func TestNoListOrMapAConditionReadsHoldsADoubleThatIsntFinite(t *testing.T) {
 		for _, expr := range []string{
 			`request.attributes.scores != [1, 2]`, `[request.attributes.scores] != [[1, 2]]`, `size(request.attributes.scores) == 2`,
 			`has(request.attributes.scores)`, `request.attributes.scores[1] != ""`, `"scores" in request.attributes`,
-			`request.attributes != {"scores": [1, 2], "other": "x"}`, `size(request) == 2`,
+			`request.attributes != {"scores": [1, 2], "other": "x"}`, `size(request) == 2`, `request.attributes.other == "x"`,
 		} {
 			if held, evaluated := rbac.EvaluateConditionOf(t, expr, nil, nil, attributes); evaluated {
 				t.Errorf("%s of scores holding %s that isn't finite: held %t", expr, name, held)
 			}
 		}
-		if held, _ := rbac.EvaluateConditionOf(t, `request.attributes.other == "x" && request.time > timestamp(0)`, nil, nil, attributes); !held {
-			t.Errorf("an attribute beside scores holding %s that isn't finite: didn't hold", name)
+		if held, _ := rbac.EvaluateConditionOf(t, `request.time > timestamp(0)`, nil, nil, attributes); !held {
+			t.Errorf("the time of a request whose scores hold %s that isn't finite: didn't hold", name)
 		}
 	}
 	// So a grant comparing them gives nothing, and a deny applies.
@@ -414,6 +415,74 @@ func TestNoListOrMapAConditionReadsHoldsADoubleThatIsntFinite(t *testing.T) {
 		}
 		if is(id, []any{nan, long}) {
 			t.Errorf("%s, passing scores holding NaN, logs in", id)
+		}
+	}
+}
+
+// A kind no declarations cover is read whole or not at all: where an attribute holds a double that
+// isn't finite, however deep, none of the kind's can be read, as where one holds a value of no type
+// Attributes names, while request.time and the other kinds' are read. Refused by name alone, a
+// condition reading another attribute decided without it: a deny's
+// `request.attributes.region == "eu" && request.attributes.risk > 0.5` lifted outside the EU for an
+// infinite float64 risk, and applied for the same infinity as JSON text, which a host reading JSON
+// reads none of, and so a grant's `request.attributes.region == "us"` gave its role. A kind
+// declarations cover refuses such an attribute by name, and reads the others.
+func TestADoubleThatIsntFiniteFailsEveryConditionReadingAKindNoDeclarationsCover(t *testing.T) {
+	nan, inf := math.NaN(), math.Inf(1)
+	for name, risk := range map[string]any{
+		"NaN": nan, "an infinity": inf, "a float32": float32(-inf), "CEL's double": types.Double(nan),
+		"a DoubleValue": wrapperspb.Double(inf), "a Value": structpb.NewNumberValue(nan), "a pointer": &inf,
+		"a map holding NaN": map[string]any{"a": []any{nan}}, "JSON text": json.RawMessage(`1e400`),
+	} {
+		attributes := map[string]any{"region": "us", "risk": risk}
+		for _, expr := range []string{
+			`request.attributes.region == "us"`, `request.attributes.region == "eu" && request.attributes.risk > 0.5`,
+			`has(request.attributes.region)`, `!has(request.attributes.missing)`, `request.attributes["region"] != "eu"`,
+		} {
+			if held, evaluated := rbac.EvaluateConditionOf(t, expr, nil, nil, attributes); evaluated {
+				t.Errorf("%s of a request whose risk holds %s: held %t", expr, name, held)
+			}
+		}
+		if held, _ := rbac.EvaluateConditionOf(t, `request.time > timestamp(0) && subject.attributes.region == "us"`,
+			map[string]any{"region": "us"}, nil, attributes); !held {
+			t.Errorf("the time and the subject's attributes beside a request whose risk holds %s: didn't hold", name)
+		}
+	}
+	declares := rbac.Attributes{Subject: map[string]rbac.AttributeType{"region": rbac.AttrString, "risk": rbac.AttrDouble}}
+	for expr, want := range map[string]bool{`subject.attributes.region == "us"`: true, `subject.attributes.risk < 0.5`: false} {
+		held, evaluated, condition := rbac.EvaluateDeclared(t, declares, expr, map[string]any{"region": "us", "risk": inf})
+		if !condition || held != want || evaluated != want {
+			t.Errorf("%s of a declared infinite risk: held %t, evaluated %t, a condition %t", expr, held, evaluated, condition)
+		}
+	}
+	// So a grant reading another attribute gives nothing, and a deny applies.
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole) })
+	given := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	given.Condition = rbac.Condition{Expression: `request.attributes.region == "us"`}
+	h.seed(t, given, grant(cluster.Scope(), "cluster.login", rbac.User, "d"), grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+	ctx := t.Context()
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, rbac.Deny{
+		ID: "risky", Principals: []rbac.Principal{identity("d")}, Permissions: []rbac.Permission{login},
+		Condition: rbac.Condition{Expression: `request.attributes.region == "eu" && request.attributes.risk > 0.5`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	is := func(id string, risk any) bool {
+		t.Helper()
+		err := h.authz.Authorize(rbac.WithRequest(ctx, map[string]any{"region": "us", "risk": risk}), h.as(t, id), login, cluster)
+		if err != nil && !errors.Is(err, rbac.ErrDenied) {
+			t.Fatal(err)
+		}
+		return err == nil
+	}
+	for _, id := range []string{"u", "d"} {
+		if !is(id, 0.9) {
+			t.Fatalf("%s, passing a finite risk, can't log in", id)
+		}
+		for name, risk := range map[string]any{"NaN": nan, "an infinity": inf, "JSON text": json.RawMessage(`1e400`)} {
+			if is(id, risk) {
+				t.Errorf("%s, passing a risk of %s, logs in", id, name)
+			}
 		}
 	}
 }
