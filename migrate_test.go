@@ -257,6 +257,7 @@ func TestNoFunctionKeepsItsSchemasName(t *testing.T) {
 			}
 			want := []string{
 				"rbac_history_append_only search_path=pg_catalog, pg_temp",
+				"rbac_history_commit search_path=pg_catalog, pg_temp, plan_cache_mode=force_generic_plan, enable_seqscan=off",
 				"rbac_history_pruned search_path=pg_catalog, pg_temp",
 				"rbac_record search_path=pg_catalog, pg_temp, TimeZone=UTC, plan_cache_mode=force_generic_plan, enable_seqscan=off",
 			}

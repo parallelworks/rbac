@@ -35,8 +35,12 @@ func init() {
 		}
 		rowWaits.push(w)
 		return w, func(err error) error {
-			if waited := rowWaits.pop(w); waited != "" {
+			waited, lost := rowWaits.pop(w)
+			if waited != "" {
 				panic("rbac: a change waits for a row lock once it has read the time it decides at: " + strings.Join(strings.Fields(waited), " "))
+			}
+			if lost != nil {
+				panic("rbac: the watch for row waits lost its connection while a change that had read its time ran, so it could have waited unseen: " + lost.Error())
 			}
 			return err
 		}
@@ -52,11 +56,12 @@ func init() {
 type clockWatched struct {
 	pgx.Tx
 	clock *callClock
-	// pid is the change's session; read, once the change has read its time, and waited, the
-	// statement it waited for a row in, are rowWaits'.
+	// pid is the change's session; read, once the change has read its time, waited, the
+	// statement it waited for a row in, and lost, why rowWaits stopped watching it, are rowWaits'.
 	pid    uint32
 	read   bool
 	waited string
+	lost   error
 }
 
 var (
@@ -88,8 +93,13 @@ func (w *clockWatched) check(ctx context.Context, sql string) {
 // time, for a wait on a row: for another transaction to end, as one holding the row does, or to
 // finish inserting a key. A wait on a relation, as for a migration, or for its extension, is none
 // a change could take first. It polls each millisecond while any change is so, and sees a wait that
-// lasts longer.
+// lasts longer. Where its connection fails, it connects again, and each change it was watching
+// fails, as it could have waited unseen meanwhile; where it can't connect, every change from then
+// on fails, rather than passing unwatched.
 var rowWaits = &waitWatch{by: map[uint32][]*clockWatched{}, woken: make(chan struct{}, 1)}
+
+// rowWaitsTimeout bounds each of the watch's connections and queries.
+const rowWaitsTimeout = 10 * time.Second
 
 type waitWatch struct {
 	mu sync.Mutex
@@ -98,6 +108,9 @@ type waitWatch struct {
 	by    map[uint32][]*clockWatched
 	once  sync.Once
 	woken chan struct{}
+	// pid is the watch's own session, 0 while it connects; gone is why it stopped for good.
+	pid  uint32
+	gone error
 }
 
 func (ww *waitWatch) push(w *clockWatched) {
@@ -109,8 +122,9 @@ func (ww *waitWatch) push(w *clockWatched) {
 	ww.by[w.pid] = append(ww.by[w.pid], w)
 }
 
-// pop ends watching w, and returns the statement it waited for a row in, if any.
-func (ww *waitWatch) pop(w *clockWatched) string {
+// pop ends watching w, and returns the statement it waited for a row in, if any, and why the watch
+// lost sight of it, if it did.
+func (ww *waitWatch) pop(w *clockWatched) (waited string, lost error) {
 	ww.mu.Lock()
 	defer ww.mu.Unlock()
 	ws := ww.by[w.pid]
@@ -122,7 +136,21 @@ func (ww *waitWatch) pop(w *clockWatched) string {
 	} else {
 		ww.by[w.pid] = ws
 	}
-	return w.waited
+	return w.waited, w.lost
+}
+
+// lose marks every change that has read its time as unwatched since err.
+func (ww *waitWatch) lose(err error) {
+	ww.mu.Lock()
+	defer ww.mu.Unlock()
+	ww.pid = 0
+	for _, ws := range ww.by {
+		for _, w := range ws {
+			if w.read && w.lost == nil {
+				w.lost = err
+			}
+		}
+	}
 }
 
 // read marks w as having read its time, from when its waits count. The watch outlives the change
@@ -134,6 +162,9 @@ func (ww *waitWatch) read(ctx context.Context, w *clockWatched) {
 	ww.mu.Lock()
 	was := w.read
 	w.read = true
+	if ww.gone != nil && w.lost == nil {
+		w.lost = ww.gone
+	}
 	ww.mu.Unlock()
 	if was {
 		return
@@ -146,10 +177,31 @@ func (ww *waitWatch) read(ctx context.Context, w *clockWatched) {
 }
 
 func (ww *waitWatch) watch(ctx context.Context, database string) {
-	conn, err := pgx.Connect(ctx, database)
-	if err != nil {
-		return
+	for {
+		connecting, cancel := context.WithTimeout(ctx, rowWaitsTimeout)
+		conn, err := pgx.Connect(connecting, database)
+		cancel()
+		if err != nil {
+			gone := fmt.Errorf("connecting: %w", err)
+			ww.mu.Lock()
+			ww.gone = gone
+			ww.mu.Unlock()
+			ww.lose(gone)
+			return
+		}
+		ww.mu.Lock()
+		ww.pid = conn.PgConn().PID()
+		ww.mu.Unlock()
+		err = ww.poll(ctx, conn)
+		ww.lose(err)
+		closing, cancel := context.WithTimeout(ctx, rowWaitsTimeout)
+		_ = conn.Close(closing)
+		cancel()
 	}
+}
+
+// poll watches on conn until a query on it fails, and returns why.
+func (ww *waitWatch) poll(ctx context.Context, conn *pgx.Conn) error {
 	for {
 		ww.mu.Lock()
 		var pids []int32
@@ -164,19 +216,9 @@ func (ww *waitWatch) watch(ctx context.Context, database string) {
 			<-ww.woken
 			continue
 		}
-		rows, err := conn.Query(ctx, `SELECT pid, query FROM pg_stat_activity WHERE pid = ANY($1)
-			AND wait_event_type = 'Lock' AND wait_event IN ('transactionid', 'tuple', 'speculative token')`, pids)
+		waiting, err := ww.waiting(ctx, conn, pids)
 		if err != nil {
-			return
-		}
-		waiting := map[int32]string{}
-		var pid int32
-		var query string
-		if _, err := pgx.ForEachRow(rows, []any{&pid, &query}, func() error {
-			waiting[pid] = query
-			return nil
-		}); err != nil {
-			return
+			return err
 		}
 		// Only a change still innermost on its session since before the read waited there.
 		ww.mu.Lock()
@@ -187,6 +229,46 @@ func (ww *waitWatch) watch(ctx context.Context, database string) {
 		}
 		ww.mu.Unlock()
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// waiting is the statement each of pids waits for a row in, read on conn.
+func (ww *waitWatch) waiting(ctx context.Context, conn *pgx.Conn, pids []int32) (map[int32]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, rowWaitsTimeout)
+	defer cancel()
+	rows, err := conn.Query(ctx, `SELECT pid, query FROM pg_stat_activity WHERE pid = ANY($1)
+		AND wait_event_type = 'Lock' AND wait_event IN ('transactionid', 'tuple', 'speculative token')`, pids)
+	if err != nil {
+		return nil, err
+	}
+	waiting := map[int32]string{}
+	var pid int32
+	var query string
+	_, err = pgx.ForEachRow(rows, []any{&pid, &query}, func() error {
+		waiting[pid] = query
+		return nil
+	})
+	return waiting, err
+}
+
+// RowWaitWatch returns the session the tests watch changes' row waits on, once the watch, which the
+// first change to read its time starts, has connected.
+func RowWaitWatch(ctx context.Context) (uint32, error) {
+	for {
+		rowWaits.mu.Lock()
+		pid, gone := rowWaits.pid, rowWaits.gone
+		rowWaits.mu.Unlock()
+		switch {
+		case gone != nil:
+			return 0, gone
+		case pid != 0:
+			return pid, nil
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(time.Millisecond):
+		}
 	}
 }
 

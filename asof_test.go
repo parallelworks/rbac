@@ -2312,7 +2312,9 @@ func TestAsOfCountsAChangeFromItsCommitAfterItsHook(t *testing.T) {
 // immediate. Code of its own can run as the transaction commits, after its commit record is
 // written: a cursor WITH HOLD, which commit runs to its end, declared in the transaction, also in a
 // block's or a procedure's later transaction, which the cursor's creation time dates by the block,
-// and a deferrable trigger on a temporary table. Each is refused, so the grant stays.
+// before its change too, and a deferrable trigger on a temporary table. Each is refused, so the
+// grant stays; so is a block's change with a cursor it declared in an earlier transaction still
+// open, which nothing tells from one it declared in this.
 func TestHistoryDatesAChangeNoEarlierThanItsCommit(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -2342,6 +2344,10 @@ func TestHistoryDatesAChangeNoEarlierThanItsCommit(t *testing.T) {
 		{name: "cursor declared first", before: []string{`DECLARE held CURSOR WITH HOLD FOR SELECT pg_sleep(0)`}},
 		{name: "cursor in a block's later transaction", block: `DO $$ BEGIN COMMIT; %s;
 			EXECUTE 'DECLARE held CURSOR WITH HOLD FOR SELECT pg_sleep(0)'; END $$`},
+		{name: "cursor in a block's later transaction, before its change", block: `DO $$ BEGIN COMMIT;
+			EXECUTE 'DECLARE held CURSOR WITH HOLD FOR SELECT pg_sleep(0)'; %s; END $$`},
+		{name: "cursor a block declared in an earlier transaction", block: `DO $$ BEGIN
+			EXECUTE 'DECLARE held CURSOR WITH HOLD FOR SELECT pg_sleep(0)'; COMMIT; %s; END $$`},
 		{name: "cursor in a procedure's later transaction", before: []string{
 			`CREATE PROCEDURE pg_temp.held() LANGUAGE plpgsql AS $$ BEGIN COMMIT; %s;
 				EXECUTE 'DECLARE held CURSOR WITH HOLD FOR SELECT pg_sleep(0)'; END $$`,
@@ -2437,6 +2443,113 @@ func TestHistoryDatesAChangeNoEarlierThanItsCommit(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A batch that holds a cursor across the transactions of a procedure or a DO block, and changes the
+// package's tables in them, commits as the refusal's hint says: with the cursor declared before the
+// block, in a transaction of its own, and fetched from by its name; closed before the change's
+// transaction commits; or as a FOR loop over a query, which PL/pgSQL runs to its end as each COMMIT
+// begins, before any trigger fires.
+func TestABatchHoldingACursorCommitsAsTheHintSays(t *testing.T) {
+	h := setup(t)
+	for _, c := range []struct {
+		name  string
+		batch []string
+	}{
+		{name: "declared before the block", batch: []string{
+			`DECLARE batch CURSOR WITH HOLD FOR SELECT g FROM generate_series(1, 3) g`,
+			`DO $$ DECLARE c refcursor := 'batch'; g int; BEGIN LOOP FETCH c INTO g; EXIT WHEN NOT FOUND;
+				INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'batched' || g); COMMIT; END LOOP; END $$`,
+			`CLOSE batch`,
+		}},
+		{name: "closed first", batch: []string{
+			`DO $$ DECLARE g int; BEGIN FOR g IN 1..3 LOOP EXECUTE 'DECLARE batch CURSOR WITH HOLD FOR SELECT 1'; COMMIT; EXECUTE 'CLOSE batch';
+				INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'batched' || g); COMMIT; END LOOP; END $$`,
+		}},
+		{name: "a FOR loop", batch: []string{
+			`DO $$ DECLARE g int; BEGIN FOR g IN SELECT generate_series(1, 3) LOOP
+				INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'batched' || g); COMMIT; END LOOP; END $$`,
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := t.Context()
+			conn, err := pgx.ConnectConfig(ctx, h.pool.Config().ConnConfig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+			if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_memberships WHERE principal_id LIKE 'batched%'`); err != nil {
+				t.Fatal(err)
+			}
+			var from uint64
+			if err := h.pool.QueryRow(ctx, `SELECT pg_current_xact_id()::text::bigint`).Scan(&from); err != nil {
+				t.Fatal(err)
+			}
+			for _, q := range c.batch {
+				if _, err := conn.Exec(ctx, q); err != nil {
+					t.Fatalf("%s: %v", q, err)
+				}
+			}
+			var commits int
+			if err := h.pool.QueryRow(ctx, `SELECT count(DISTINCT c.txid) FROM rbac_history m JOIN rbac_history c ON c.txid = m.txid AND c.entity = 'commit'
+				WHERE m.entity = 'membership' AND m.op = 'create' AND m.key LIKE 'user:batched%' AND m.txid > $1::bigint::text::xid8`, from).Scan(&commits); err != nil || commits != 3 {
+				t.Errorf("the batch's three changes have %d commit records, %v", commits, err)
+			}
+		})
+	}
+}
+
+// The commit record's trigger fires as a transaction commits once for each record it wrote, and the
+// event of each but the last only looks for a later one: a commit of thousands of records adds at
+// most three times what a trigger that reads each record by its id adds, each the least of several
+// commits made one after the other, so the server's load moves them alike. Run as rbac_record, with
+// its settings, each event read every entry after its record's on an index page, and added more.
+func TestACommitCostsAFewReadsOfHistoryARecord(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	const n, rounds = 5000, 5
+	conn, err := pgx.ConnectConfig(ctx, h.pool.Config().ConnConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	exec := func(sql string) {
+		t.Helper()
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	exec(`CREATE FUNCTION one_read() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN PERFORM FROM rbac_history h WHERE h.id = NEW.id; RETURN NULL; END $$`)
+	exec(`CREATE CONSTRAINT TRIGGER one_read AFTER INSERT ON rbac_history DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION one_read()`)
+	commits := map[string][]time.Duration{}
+	for i := range rounds {
+		for _, c := range []struct{ name, on, off string }{
+			{"commit record", "rbac_history_committed", "one_read"},
+			{"one read", "one_read", "rbac_history_committed"},
+			{"none", "", "rbac_history_committed, one_read"},
+		} {
+			for _, off := range strings.Split(c.off, ", ") {
+				exec(`ALTER TABLE rbac_history DISABLE TRIGGER ` + off)
+			}
+			if c.on != "" {
+				exec(`ALTER TABLE rbac_history ENABLE ALWAYS TRIGGER ` + c.on)
+			}
+			exec(`BEGIN`)
+			exec(fmt.Sprintf(`INSERT INTO rbac_history (effective_at, tenant, entity, key, op, bytes)
+				SELECT now(), 't1', 'membership', '%s %d ' || g, 'create', 0 FROM generate_series(1, %d) g`, c.name, i, n))
+			start := time.Now()
+			exec(`COMMIT`)
+			commits[c.name] = append(commits[c.name], time.Since(start))
+		}
+	}
+	exec(`ALTER TABLE rbac_history ENABLE ALWAYS TRIGGER rbac_history_committed`)
+	added := func(name string) time.Duration { return (slices.Min(commits[name]) - slices.Min(commits["none"])) / n }
+	record, read := added("commit record"), added("one read")
+	t.Logf("a commit of %d records adds %v a record for the commit record, %v for one read of each", n, record, read)
+	if record > 3*read {
+		t.Errorf("the commit record adds %v to a commit for each record, more than three times the %v one read of each adds", record, read)
 	}
 }
 
