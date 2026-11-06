@@ -15,17 +15,27 @@
 -- it: so it is dated after every other event of the transaction's records fired. Any session may
 -- fire deferred triggers early, with SET CONSTRAINTS ... IMMEDIATE, and then stay open: the commit
 -- record's own event then fires at the end of the statement that wrote it, inside the trigger that
--- wrote it, a level deeper than the commit fires it, after; so it is refused there, and the
--- transaction with it. A rollback to a savepoint taken before puts the events back, to fire as the
--- transaction commits. A session's own code can still run as it commits, once the commit record is
--- written, and put off what others see: a cursor WITH HOLD declared in the transaction, which commit
--- runs to its end, and a deferrable trigger on a temporary table, whose events fire after those
--- before them; so the last record's event refuses both, and a transaction with either can't commit
--- having changed the package's tables. What runs after it is then the package's, the host's, as its
--- own deferred triggers and constraints, and the commit's: its synchronous replication waits before
--- others see it, as long as synchronous_standby_names and the session's synchronous_commit make it.
--- A transaction prepared for two-phase commit fires its deferred triggers as it is prepared, so its
--- changes count from then, not from COMMIT PREPARED: keep max_prepared_transactions at 0.
+-- wrote it, a level deeper than the commit fires it, after. So there it defers the trigger again, by
+-- name, and writes a record dated -infinity, which no read counts a change from, whose event writes
+-- the transaction's commit record anew as it commits, as the last record's does: AsOf counts a
+-- change from its transaction's latest commit record, and a host's transaction may set its own
+-- constraints immediate. A session's own code can still run as it commits, once the commit record
+-- is written, and put off what others see: a cursor WITH HOLD declared in the transaction, which
+-- commit runs to its end, and a deferrable trigger on a temporary table, whose events fire after
+-- those before them; so the last record's event refuses both, and a transaction with either can't
+-- commit having changed the package's tables. A cursor's creation time is when the statement that
+-- declared it began, which for one a procedure or a DO block declares in a later transaction, after
+-- it commits, is before that transaction began. And as the commit empties a session's temporary
+-- tables made ON COMMIT DELETE ROWS, it locks each, and its TOAST table, which another session of
+-- the role can hold, the TOAST table by preparing a statement that names it, for as long as it
+-- likes: so the commit record's event, at the commit, has the rest of it wait for no lock past
+-- 100 ms. What runs after it is then the package's, the host's, as its own deferred triggers and
+-- constraints of statements after the transaction's last change to the tables, and the commit's: the
+-- session's temporary tables emptied or dropped, about half a millisecond each, and synchronous
+-- replication, which waits before others see it, as long as synchronous_standby_names and the
+-- session's synchronous_commit make it. A transaction prepared for two-phase commit fires its
+-- deferred triggers as it is prepared, so its changes count from then, not from COMMIT PREPARED: keep
+-- max_prepared_transactions at 0.
 --
 -- AsOf tested each version of a row for a later one, and PruneHistory each for a later one by its
 -- time, in history's index of an entity's versions, by date: versions dated alike, as every write
@@ -108,32 +118,48 @@ BEGIN
     END IF;
     -- A record history wrote, as rbac_history_committed fires it as its transaction commits.
     IF TG_TABLE_NAME = 'rbac_history' THEN
-        IF NEW.entity = 'commit' THEN
-            -- Fired a level deeper than the commit fires it: constraints were set immediate.
+        -- A commit record. One dated -infinity, which no read counts a change from, holds an event
+        -- to record the commit again (below), as the last record of its transaction does.
+        IF NEW.entity = 'commit' AND NEW.effective_at <> '-infinity' THEN
+            -- Fired a level deeper than the commit fires it: constraints were set immediate, so the
+            -- transaction goes on past this record, as long as its session likes. Its commit is
+            -- recorded again as it commits, by the event of a record of its own, which is deferred
+            -- again for it, whatever the session set: AsOf counts a change from its transaction's
+            -- latest commit record.
             IF pg_catalog.pg_trigger_depth() > 1 THEN
-                RAISE EXCEPTION 'history dates a transaction''s changes as it commits, so a transaction that changes the package''s tables doesn''t set rbac_history_committed immediate'
-                    USING ERRCODE = 'feature_not_supported', HINT = 'Set constraints immediate by name, not ALL.';
+                EXECUTE pg_catalog.format('SET CONSTRAINTS %I.rbac_history_committed DEFERRED', TG_TABLE_SCHEMA);
+                INSERT INTO rbac_history (effective_at, tenant, entity, key, op, bytes)
+                VALUES ('-infinity', '', 'commit', pg_catalog.pg_current_xact_id()::text, 'commit', 0);
+            -- What commits after it waits for no lock for long: a lock another session takes on a
+            -- temporary table the commit empties (ON COMMIT DELETE ROWS), or on its TOAST table,
+            -- which any session can take by preparing a statement that names it, would hold the
+            -- commit, and what others see, back for as long as that session likes.
+            ELSIF (SELECT s.setting::bigint FROM pg_catalog.pg_settings s WHERE s.name = 'lock_timeout') NOT BETWEEN 1 AND 100 THEN
+                PERFORM pg_catalog.set_config('lock_timeout', '100ms', true);
             END IF;
             RETURN NULL;
         END IF;
         -- The event of the transaction's last record writes it, after every other event of its
         -- records fired. A prune's record dates nothing AsOf reads, so a transaction that wrote only
-        -- those, as PruneHistory's own, which a host's transaction can set constraints immediate
-        -- around, writes none.
+        -- those, as PruneHistory's own, writes none.
         IF EXISTS (SELECT FROM rbac_history h WHERE h.txid = pg_catalog.pg_current_xact_id() AND h.id > NEW.id)
             OR NEW.entity = 'history' AND NOT EXISTS (SELECT FROM rbac_history h
               WHERE h.txid = pg_catalog.pg_current_xact_id() AND h.entity NOT IN ('history', 'commit')) THEN
             RETURN NULL;
         END IF;
-        IF EXISTS (SELECT FROM pg_catalog.pg_cursors c WHERE c.is_holdable AND c.creation_time >= pg_catalog.transaction_timestamp()) THEN
+        -- A cursor's creation time is when the statement that declared it began, which in a
+        -- procedure or a DO block that commits is when the CALL or the block began, before the
+        -- transaction it is declared in.
+        IF EXISTS (SELECT FROM pg_catalog.pg_cursors c WHERE c.is_holdable
+            AND c.creation_time >= LEAST(pg_catalog.statement_timestamp(), pg_catalog.transaction_timestamp())) THEN
             RAISE EXCEPTION 'a transaction that changes the package''s tables declares no cursor WITH HOLD: committing runs it after history dates the changes'
-                USING ERRCODE = 'feature_not_supported';
+                USING ERRCODE = 'feature_not_supported', HINT = 'Declare it in a transaction of its own, or without HOLD.';
         END IF;
         IF EXISTS (SELECT FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_trigger t ON t.tgrelid = d.objid
             WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refclassid = 'pg_catalog.pg_namespace'::pg_catalog.regclass
-              AND d.refobjid = pg_catalog.pg_my_temp_schema() AND t.tgdeferrable) THEN
+              AND d.refobjid = pg_catalog.pg_my_temp_schema() AND t.tgdeferrable AND t.tgenabled <> 'D') THEN
             RAISE EXCEPTION 'a session with a deferrable trigger on a temporary table commits no change to the package''s tables: committing fires it after history dates the changes'
-                USING ERRCODE = 'feature_not_supported';
+                USING ERRCODE = 'feature_not_supported', HINT = 'Drop or disable the trigger, or make it NOT DEFERRABLE.';
         END IF;
         at := pg_catalog.clock_timestamp();
         INSERT INTO rbac_history (recorded_at, effective_at, tenant, entity, key, op, bytes)

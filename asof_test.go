@@ -35,7 +35,7 @@ func dbNow(t *testing.T, h *harness) time.Time {
 func committedAt(t *testing.T, h *harness, where string) time.Time {
 	t.Helper()
 	var at time.Time
-	if err := h.pool.QueryRow(t.Context(), `SELECT c.effective_at FROM rbac_history c
+	if err := h.pool.QueryRow(t.Context(), `SELECT max(c.effective_at) FROM rbac_history c
 		WHERE c.entity = 'commit' AND c.txid = (SELECT txid FROM rbac_history WHERE `+where+`)`).Scan(&at); err != nil {
 		t.Fatal(err)
 	}
@@ -2204,21 +2204,83 @@ func TestAsOfCountsAChangeFromItsCommitAfterItsHook(t *testing.T) {
 
 // A session that may write the package's tables, as the application's, can fire a transaction's
 // deferred triggers before it commits, with SET CONSTRAINTS ... IMMEDIATE, which takes no privilege,
-// and then hold the transaction open while it uses access it revoked; and code of its own can run
-// as the transaction commits, after its commit record is written: a cursor WITH HOLD, which commit
-// runs to its end, and a deferrable trigger on a temporary table. Each is refused, so a revoke
-// commits only with a commit record dated as it commits, and AsOf reads it from no earlier: one
-// that set constraints immediate in a savepoint it then rolled back counts from its commit.
+// and then hold the transaction open while it uses access it revoked: its commit is recorded again
+// as it commits, so AsOf counts the revoke from then, however and whenever constraints were set
+// immediate. Code of its own can run as the transaction commits, after its commit record is
+// written: a cursor WITH HOLD, which commit runs to its end, declared in the transaction, also in a
+// block's or a procedure's later transaction, which the cursor's creation time dates by the block,
+// and a deferrable trigger on a temporary table. Each is refused, so the grant stays.
 func TestHistoryDatesAChangeNoEarlierThanItsCommit(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
-	u := h.as(t, "u")
-	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
-	const revoke = `DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:u'`
+	revoke := func(u rbac.Subject) string {
+		return `DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:` + u.Principal.ID + `'`
+	}
+	connect := func(t *testing.T) *pgx.Conn {
+		t.Helper()
+		conn, err := pgx.ConnectConfig(ctx, h.pool.Config().ConnConfig)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = conn.Close(context.WithoutCancel(ctx)) })
+		return conn
+	}
 	refused := func(err error) bool {
 		var pgErr *pgconn.PgError
 		return errors.As(err, &pgErr) && pgErr.Code == "0A000"
 	}
+	for _, c := range []struct {
+		name          string
+		before, after []string
+		// block is run on its own, outside a transaction, with the revoke as %s.
+		block string
+	}{
+		{name: "cursor", after: []string{`DECLARE held CURSOR WITH HOLD FOR SELECT pg_sleep(0)`}},
+		{name: "cursor declared first", before: []string{`DECLARE held CURSOR WITH HOLD FOR SELECT pg_sleep(0)`}},
+		{name: "cursor in a block's later transaction", block: `DO $$ BEGIN COMMIT; %s;
+			EXECUTE 'DECLARE held CURSOR WITH HOLD FOR SELECT pg_sleep(0)'; END $$`},
+		{name: "cursor in a procedure's later transaction", before: []string{
+			`CREATE PROCEDURE pg_temp.held() LANGUAGE plpgsql AS $$ BEGIN COMMIT; %s;
+				EXECUTE 'DECLARE held CURSOR WITH HOLD FOR SELECT pg_sleep(0)'; END $$`,
+		}, block: `CALL pg_temp.held()`},
+		{name: "temporary trigger", before: []string{
+			`CREATE TEMP TABLE held (a int)`,
+			`CREATE FUNCTION pg_temp.held() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$`,
+			`CREATE CONSTRAINT TRIGGER held AFTER INSERT ON held DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION pg_temp.held()`,
+		}, after: []string{`INSERT INTO held VALUES (1)`}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			u := h.as(t, "u")
+			h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+			conn := connect(t)
+			var failed error
+			queries := slices.Concat([]string{`BEGIN`}, c.before, []string{revoke(u)}, c.after, []string{`COMMIT`})
+			if c.block != "" {
+				queries = slices.Concat(c.before, []string{c.block})
+				if !strings.Contains(c.block, "%s") {
+					queries[0] = fmt.Sprintf(queries[0], revoke(u))
+				} else {
+					queries[len(queries)-1] = fmt.Sprintf(c.block, revoke(u))
+				}
+			}
+			for _, q := range queries {
+				if _, failed = conn.Exec(ctx, q); failed != nil {
+					break
+				}
+			}
+			if !refused(failed) {
+				t.Errorf("a revoke with a %s: %v", c.name, failed)
+			}
+			_, _ = conn.Exec(ctx, `ROLLBACK`)
+			if err := h.authz.Authorize(ctx, u, login, cluster); err != nil {
+				t.Fatalf("after a revoke refused: %v", err)
+			}
+		})
+	}
+	// Set immediate before or after the revoke, by name, in a block, in a savepoint released, twice
+	// or in one rolled back, the revoke's transaction commits, held open past every commit record
+	// it wrote before, and AsOf counts the revoke from its commit; so does one in a session whose
+	// temporary table has a deferrable trigger that is disabled.
 	for _, c := range []struct {
 		name          string
 		before, after []string
@@ -2227,70 +2289,105 @@ func TestHistoryDatesAChangeNoEarlierThanItsCommit(t *testing.T) {
 		{name: "immediate by name", after: []string{`SET CONSTRAINTS rbac_history_committed IMMEDIATE`}},
 		{name: "immediate before", before: []string{`SET CONSTRAINTS ALL IMMEDIATE`}},
 		{name: "immediate in a block", after: []string{`DO $$ BEGIN SET CONSTRAINTS ALL IMMEDIATE; END $$`}},
-		{name: "cursor", after: []string{`DECLARE held CURSOR WITH HOLD FOR SELECT pg_sleep(0)`}},
-		{name: "temporary trigger", before: []string{
+		{name: "immediate twice", after: []string{`SET CONSTRAINTS ALL IMMEDIATE`, `SET CONSTRAINTS ALL IMMEDIATE`}},
+		{name: "immediate then deferred", after: []string{`SET CONSTRAINTS ALL IMMEDIATE`, `SET CONSTRAINTS ALL DEFERRED`}},
+		{name: "immediate in a savepoint released", after: []string{`SAVEPOINT early`, `SET CONSTRAINTS ALL IMMEDIATE`, `RELEASE SAVEPOINT early`}},
+		{name: "immediate in a savepoint rolled back", after: []string{`SAVEPOINT early`, `SET CONSTRAINTS ALL IMMEDIATE`, `ROLLBACK TO SAVEPOINT early`}},
+		{name: "immediate before and after", before: []string{`SET CONSTRAINTS ALL IMMEDIATE`}, after: []string{`SET CONSTRAINTS ALL IMMEDIATE`}},
+		// A temporary table's deferrable trigger that is disabled fires nothing as the commit does.
+		{name: "disabled temporary trigger", before: []string{
 			`CREATE TEMP TABLE held (a int)`,
 			`CREATE FUNCTION pg_temp.held() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$`,
 			`CREATE CONSTRAINT TRIGGER held AFTER INSERT ON held DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION pg_temp.held()`,
+			`ALTER TABLE held DISABLE TRIGGER held`,
 		}, after: []string{`INSERT INTO held VALUES (1)`}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			conn, err := pgx.ConnectConfig(ctx, h.pool.Config().ConnConfig)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
-			var failed error
-			for _, q := range slices.Concat([]string{`BEGIN`}, c.before, []string{revoke}, c.after, []string{`COMMIT`}) {
-				if _, failed = conn.Exec(ctx, q); failed != nil {
-					break
+			u := h.as(t, "u")
+			h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+			conn := connect(t)
+			for _, q := range slices.Concat([]string{`BEGIN`}, c.before, []string{revoke(u)}, c.after) {
+				if _, err := conn.Exec(ctx, q); err != nil {
+					t.Fatalf("%s: %v", q, err)
 				}
 			}
-			if !refused(failed) {
-				t.Errorf("a revoke after %s: %v", c.name, failed)
-			}
-			_, _ = conn.Exec(ctx, `ROLLBACK`)
+			time.Sleep(20 * time.Millisecond)
+			mid := dbNow(t, h)
+			h.now = mid
 			if err := h.authz.Authorize(ctx, u, login, cluster); err != nil {
-				t.Fatalf("after a revoke refused: %v", err)
+				t.Fatalf("a check while the revoke is uncommitted: %v", err)
+			}
+			time.Sleep(20 * time.Millisecond)
+			if _, err := conn.Exec(ctx, `COMMIT`); err != nil {
+				t.Fatal(err)
+			}
+			after := dbNow(t, h)
+			for at, held := range map[time.Time]bool{mid: true, after: false} {
+				err := h.authz.AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error { return a.Authorize(ctx, u, login, cluster) })
+				if err != nil && !errors.Is(err, rbac.ErrDenied) {
+					t.Fatal(err)
+				}
+				if (err == nil) != held {
+					t.Errorf("as of %v, u's login: %v", at, err)
+				}
 			}
 		})
 	}
-	// Set immediate in a savepoint rolled back, the revoke is dated as it commits.
-	conn, err := pgx.ConnectConfig(ctx, h.pool.Config().ConnConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
-	for _, q := range []string{`BEGIN`, revoke, `SAVEPOINT early`} {
-		if _, err := conn.Exec(ctx, q); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := conn.Exec(ctx, `SET CONSTRAINTS ALL IMMEDIATE`); !refused(err) {
-		t.Fatalf("set constraints immediate after a revoke: %v", err)
-	}
-	if _, err := conn.Exec(ctx, `ROLLBACK TO SAVEPOINT early`); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(50 * time.Millisecond)
-	mid := dbNow(t, h)
-	h.now = mid
-	if err := h.authz.Authorize(ctx, u, login, cluster); err != nil {
-		t.Fatalf("a check while the revoke is uncommitted: %v", err)
-	}
-	time.Sleep(50 * time.Millisecond)
-	if _, err := conn.Exec(ctx, `COMMIT`); err != nil {
-		t.Fatal(err)
-	}
-	after := dbNow(t, h)
-	for at, held := range map[time.Time]bool{mid: true, after: false} {
-		err := h.authz.AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error { return a.Authorize(ctx, u, login, cluster) })
-		if err != nil && !errors.Is(err, rbac.ErrDenied) {
-			t.Fatal(err)
-		}
-		if (err == nil) != held {
-			t.Errorf("as of %v, u's login: %v", at, err)
-		}
+}
+
+// A commit that empties a session's temporary table (ON COMMIT DELETE ROWS) takes its lock, and
+// that of its TOAST table, after history records the commit: another session, of the same role,
+// that holds either, by LOCK or by preparing a statement that names the TOAST table, which needs
+// no privilege, would hold the commit back past its record, so AsOf would count a revoke from a
+// time every check still allowed what it revoked. The commit gives up the wait instead, and the
+// revoke with it.
+func TestACommitWaitsForNoLockPastItsRecord(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	for _, hold := range []string{"table", "toast"} {
+		t.Run(hold, func(t *testing.T) {
+			u := h.as(t, "u")
+			h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+			var conns [2]*pgx.Conn
+			for i := range conns {
+				conn, err := pgx.ConnectConfig(ctx, h.pool.Config().ConnConfig)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+				conns[i] = conn
+			}
+			committer, holder := conns[0], conns[1]
+			if _, err := committer.Exec(ctx, `CREATE TEMP TABLE held (a int, b text) ON COMMIT DELETE ROWS`); err != nil {
+				t.Fatal(err)
+			}
+			var table, toast string
+			if err := committer.QueryRow(ctx, `SELECT pg_my_temp_schema()::regnamespace::text || '.held', t.oid::regclass::text
+				FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid WHERE c.oid = 'pg_temp.held'::regclass`).Scan(&table, &toast); err != nil {
+				t.Fatal(err)
+			}
+			for _, q := range []string{`BEGIN`, `INSERT INTO held VALUES (1, 'x')`, `DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:u'`} {
+				if _, err := committer.Exec(ctx, q); err != nil {
+					t.Fatal(err)
+				}
+			}
+			lock := map[string]string{"table": `LOCK TABLE ` + table + ` IN ACCESS SHARE MODE`, "toast": `PREPARE held AS SELECT * FROM ` + toast}[hold]
+			for _, q := range []string{`BEGIN`, lock} {
+				if _, err := holder.Exec(ctx, q); err != nil {
+					t.Fatal(err)
+				}
+			}
+			defer func() { _, _ = holder.Exec(context.WithoutCancel(ctx), `ROLLBACK`) }()
+			wait, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			_, err := committer.Exec(wait, `COMMIT`)
+			if pgErr := (*pgconn.PgError)(nil); !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+				t.Fatalf("a commit whose temporary table another session holds: %v", err)
+			}
+			if err := h.authz.Authorize(ctx, u, login, cluster); err != nil {
+				t.Errorf("after a revoke that waited: %v", err)
+			}
+		})
 	}
 }
 

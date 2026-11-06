@@ -580,6 +580,15 @@ func TestThePackageRunsAsTheReadmesDatabaseRoles(t *testing.T) {
 				}
 				return reads(a)
 			}))
+			// History's role records the commit again as it commits, deferring its trigger anew.
+			check("A write around the package with constraints set immediate", pgx.BeginFunc(ctx, r.appPool, func(tx pgx.Tx) error {
+				for _, q := range []string{`SET CONSTRAINTS ALL IMMEDIATE`, `UPDATE rbac_memberships SET note = 'immediate' WHERE tenant = 't1'`} {
+					if _, err := tx.Exec(ctx, q); err != nil {
+						return err
+					}
+				}
+				return nil
+			}))
 			var n int
 			if err := r.appPool.QueryRow(ctx, `SELECT count(*) FROM rbac_history WHERE entity <> 'commit'`).Scan(&n); err != nil {
 				t.Fatal(err)
