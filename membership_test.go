@@ -4593,6 +4593,46 @@ func TestADenyOnChangingGrantsOnGroupsSetWhileDeleteGroupWaitsHasItTriedAgain(t 
 	}
 }
 
+// Under its locks DeleteGroup decides the actor's power to manage groups, and whether a deny on the
+// group's path removes its power to change grants there, as of one moment, as a change to members
+// does. Here, once the transaction has read the actor's authority, the actor moves from the group
+// that lets it manage groups to the one a deny of changing grants on groups exempts: at no moment
+// did it hold that power and escape the deny, so revoking what is granted on the group is refused.
+// Read apart, its power before the move and the deny after it, the group was deleted.
+func TestDeleteGroupDecidesThePowerAndTheDenyItActsByAsOfOneMoment(t *testing.T) {
+	h := grouped(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), groupOwner) })
+	ctx := t.Context()
+	ops := rbac.Resource{Tenant: "t1", Type: rbac.GroupScope, ID: "ops"}
+	h.groups(t, "ops", "admins", "exempt")
+	h.seed(t, grant(ops.Scope(), "group.owner", rbac.User, "lead"), grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.Group, "admins"))
+	x := h.as(t, "x", "admins")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+		VALUES ('t1', 'tenant', 't1', 'frozen', '{user:x}', '{group:exempt}', '{group:grant}')`); err != nil {
+		t.Fatal(err)
+	}
+	moved := false
+	rbac.SetReadingRoles(t, func() {
+		// The deletion's transaction holds a connection of the test's pool; its reads before it hold
+		// none once read.
+		if h.pool.Stat().AcquiredConns() == 0 || moved {
+			return
+		}
+		moved = true
+		if _, err := h.pool.Exec(ctx, `WITH gone AS (DELETE FROM rbac_members WHERE tenant = 't1' AND group_id = 'admins' AND principal = 'user:x')
+			INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'exempt', 'user', 'x')`); err != nil {
+			t.Error(err)
+		}
+	})
+	err := h.authz.DeleteGroup(ctx, x, "t1", "ops")
+	if !moved {
+		t.Fatal("the deletion read no authority in its transaction")
+	}
+	var denied *rbac.DeniedError
+	if !errors.As(err, &denied) || denied.Permission != rbac.GrantPermission(rbac.GroupScope) {
+		t.Errorf("the group was deleted, by an actor that held the power to manage groups and escaped the deny at no moment: %v", err)
+	}
+}
+
 // A change to members, and DeleteGroup, read which types of scope a deny binding the actor removes
 // its power to change grants on, wherever in the tenant it is, before their transaction and again
 // under its locks (grantsDenied): of the denies naming a key the actor is bound by, only those that

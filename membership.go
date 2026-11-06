@@ -632,7 +632,9 @@ func upsertGroups(ctx context.Context, tx pgx.Tx, tenant string, actor Principal
 // identity whose membership of the tenant has ended, which is in none of its groups (Members). What
 // is granted on the group's own scope goes with it, its grants and eligibilities there revoked, so
 // a constraint or a deny on its path that stops the actor changing grants there stops it, as it
-// would revoking them with Apply, while any is in force. Where one may, or its label may refuse the
+// would revoking them with Apply, while any is in force: under its locks, read with the actor's
+// power to manage groups and its label values, so it held that power and escaped such a deny at one
+// moment, as a change to members reads what it acts by. Where one may, or its label may refuse the
 // actor, it reads the group as ChangeMembers reads a scope it takes access away on: as
 // Config.ResourceOf gives it, so a condition reading the group's attributes reads what the host
 // passes Apply there; and without Config.ResourceOf, as stored, which is all of the group only
@@ -740,8 +742,15 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 			return ChangeEvent{}, err
 		}
 		labels.seal()
-		values, err := a.mayManageGroups(ctx, tx, actor, ManageGroups, root, labels)
+		revoking.seal()
+		// Its power to manage groups, and where a deny binding it may remove its power to change grants
+		// on groups, the denies on the group's path, in one read, so it held the one and escaped the
+		// other at one moment, as a change to members reads what it acts by (mayReachAgain).
+		au, err := a.reachAuthority(ctx, tx, actor, root, []*reachCheck{revoking})
 		if err != nil {
+			return ChangeEvent{}, err
+		}
+		if err := a.managesGroups(ctx, tx, actor, ManageGroups, root, labels, au.managing); err != nil {
 			return ChangeEvent{}, err
 		}
 		// Without a group, the grants and denies on its scope are no group's to remove.
@@ -751,7 +760,7 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 		if !existed {
 			return ChangeEvent{}, fmt.Errorf("%w: group %q was made while this change waited; try again", ErrConflict, id)
 		}
-		if err := a.labelAllows(ctx, tx, group, nil, labels, ManageGroups, values); err != nil {
+		if err := a.labelAllows(ctx, tx, group, nil, labels, ManageGroups, au.values); err != nil {
 			return ChangeEvent{}, err
 		}
 		if err := a.notOwnedGroups(ctx, tx, tenant, []string{id}); err != nil {
@@ -775,11 +784,6 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 		if scoped {
 			if partial != nil {
 				return ChangeEvent{}, partial
-			}
-			revoking.seal()
-			au, err := a.reachAuthority(ctx, tx, actor, nil, []*reachCheck{revoking})
-			if err != nil {
-				return ChangeEvent{}, err
 			}
 			if err := revoking.stopped(au.revoking[0], "revoking what is granted on the group"); err != nil {
 				return ChangeEvent{}, err

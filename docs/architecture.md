@@ -624,8 +624,12 @@ sequenceDiagram
   group's attributes reads what the host passes `Apply` there, and without `Config.ResourceOf`,
   where the group as stored isn't all of it, refused once its transaction finds anything granted on
   it (`storedWhole`); and where no such deny bound the actor before it, one that does under its
-  locks has it tried again. The host's own writes make no check
-  of an actor, so no freeze stops them.
+  locks has it tried again. Under its locks it reads the denies on the group's path, where one binding
+  the actor may stop it, in one read with the actor's power to manage groups and its label values,
+  as a change to members reads what it acts by (`reachAuthority`): read apart, an actor moving in
+  between from the group giving it that power to one such a deny exempts deleted a group, and
+  revoked what was granted on it, though at no moment did it hold the one and escape the other. The
+  host's own writes make no check of an actor, so no freeze stops them.
 - **Until when.** What the actor holds only until a time, through an expiring grant, an activation,
   or a membership or place in a group that ends, it hands on only until then: `authorityOn` reads
   when each grant's holding ends, in the statement that reads the grants, and a grant may end no
