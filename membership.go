@@ -1325,7 +1325,10 @@ func keyedAll(members []Member) error {
 // about each grant and eligibility a member gains, as with ChangeMembers, so about none of a place
 // made to end sooner, or whose note alone changes: once for each member and each it gains, with no
 // bound on them, as no actor's access decides the host's own write, so the cost of one grows with
-// how many its members gain.
+// how many its members gain. The place of an identity whose membership of the tenant has ended is
+// read as none, as one that never was a member has none (placesLeft): importing it again, as it is
+// or to end sooner, asks about what it gains, as Import asks about a grant to an identity that isn't
+// a member, and is refused under the locks, as an identity that isn't a member is.
 func (a *Authorizer) ImportMembers(ctx context.Context, actor Principal, tenant string, members []Member) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "ImportMembers")

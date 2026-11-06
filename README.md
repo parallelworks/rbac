@@ -483,11 +483,12 @@ scopes conditional ones reach, to check one by one.
   nothing. One whose membership has ended is in none of its groups, though `DeleteExpired` hasn't
   removed its places yet: `Members` and `GroupsOf` list none of them, `ChangeMembers` removing it
   from one takes nothing away, so no freeze, label or deny refuses that, though making its place
-  there end sooner adds an identity that isn't a member, which is refused, and `DeleteGroup` counts
-  none as a member from a source the host owns. Read as stored, each such place was one a removal
-  took away, and a member the host keeps, until `DeleteExpired` ran. When the host
-  takes a group over (`ImportGroups` from one of `Config.Sources`), the members a tenant put in
-  it, from no source of the host's, leave it.
+  there end sooner adds an identity that isn't a member, which is refused, as `ImportMembers`
+  refuses importing its place again, once it has asked `ValidateGrant` about what the place gives,
+  as for any identity that isn't a member, and `DeleteGroup` counts none as a member from a source
+  the host owns. Read as stored, each such place was one a removal took away, and a member the
+  host keeps, until `DeleteExpired` ran. When the host takes a group over (`ImportGroups` from one
+  of `Config.Sources`), the members a tenant put in it, from no source of the host's, leave it.
 - **Changing members is granting:** a group's members hold what it and the groups it is in hold,
   so `ChangeMembers`, with `rbac.GroupMembers` on the group and its label, checks a change to its members as the
   changes to access it makes, each as `Apply` or `SetDeny` checks one on its scope. An added member

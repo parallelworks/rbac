@@ -4147,6 +4147,45 @@ func TestRemovingAnIdentityThatHasLeftTheTenantTakesNothingAway(t *testing.T) {
 	}
 }
 
+// ImportMembers reads no place of an identity whose membership of the tenant has ended, as of one
+// that never was a member: importing its place again, as it is or to end sooner, asks
+// Config.ValidateGrant about what the group gives it, as Import asks about a grant to an identity
+// that isn't a member, and is refused under its locks as for one that isn't a member.
+func TestImportMembersAsksAboutADepartedIdentitysPlaceAsAboutAnyoneElsesBeforeRefusingIt(t *testing.T) {
+	asked := map[string]int{}
+	h := grouped(t, func(c *rbac.Config) {
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			if in.Via == rbac.ViaMembership {
+				asked[in.Binding.Principal.ID]++
+			}
+			return validate(ctx, q, in)
+		}
+	})
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
+	if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("u"), ExpiresAt: h.now.Add(time.Hour)}}); err != nil {
+		t.Fatal(err)
+	}
+	left := rbac.Member{Group: "crew", Principal: identity("u"), Source: "directory", ExpiresAt: h.now.Add(3 * time.Hour)}
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{left}); err != nil {
+		t.Fatal(err)
+	}
+	h.now = h.now.Add(2 * time.Hour)
+	sooner := left
+	sooner.ExpiresAt = h.now.Add(time.Minute)
+	never := rbac.Member{Group: "crew", Principal: identity("never"), Source: "directory"}
+	for name, m := range map[string]rbac.Member{"as it is": left, "to end sooner": sooner, "of one never a member": never} {
+		clear(asked)
+		if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{m}); !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("importing a place %s, of an identity that isn't a member: %v", name, err)
+		}
+		if asked[m.Principal.ID] != 1 {
+			t.Errorf("importing a place %s, the host was asked %d times about the login it gives", name, asked[m.Principal.ID])
+		}
+	}
+}
+
 // A scope the host no longer has is read as stored, as a revoke there reads it, so a freeze on every
 // scope of its type stops a member losing access there.
 func TestAFreezeStopsTakingAccessAwayOnAScopeTheHostNoLongerHas(t *testing.T) {
