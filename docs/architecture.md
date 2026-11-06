@@ -1062,7 +1062,12 @@ flowchart TB
   grants before its eligibilities, which it holds already, and holds the tenant's lock exclusive, so
   no change runs beside it but `DeleteExpired`, which waits on no row. A host transaction making
   several changes takes each one's rows in this order, but not all of them together: two that make
-  the same changes in opposite orders can deadlock (above).
+  the same changes in opposite orders can deadlock (above). The order a statement locks its sorted
+  rows in is how PostgreSQL plans it, not a promise of SQL: a subquery holding `FOR UPDATE`,
+  `ORDER BY` or `DISTINCT` is never pulled up, a lateral reference into one makes it the inner side
+  of a nested loop, and a statement locking rows is never planned in parallel. The tests hold each
+  row a change locks in a transaction of their own, and check that it waits for them in this order
+  under each plan.
 - **One snapshot for reads in several statements.** Explain, Reachable and Holders read in one
   REPEATABLE READ, READ ONLY transaction of their own on a pool, and AsOf in a REPEATABLE READ one
   it rolls back. Explain, Reachable and Holders read what label values are decided by in it, and
