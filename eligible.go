@@ -193,16 +193,12 @@ func (a *Authorizer) requirementsBounded(ctx context.Context, tx pgx.Tx, tenant 
 	if e.Requires == "" || e.Principal.Kind != Group {
 		return nil
 	}
-	others, err := planned(ctx, tx, seeking, func() ([]string, error) {
-		var others []string
-		err := tx.QueryRow(ctx, `SELECT coalesce(array_agg(DISTINCT requires), '{}') FROM (SELECT requires FROM rbac_eligibilities
-			WHERE (scope, role, tenant, principal) >= ($2, $3, $1, 'group:') AND (scope, role, tenant, principal) < ($2, $3, $1, 'group;')
-			  AND principal <> $4 AND requires <> '' AND (expires_at IS NULL OR expires_at > $5)
-			ORDER BY scope, role, tenant, principal) e`,
-			tenant, e.Scope.Key(), e.Role, e.Principal.key(), a.cfg.Now()).Scan(&others)
-		return others, err
-	})
-	if err != nil {
+	var others []string
+	if err := planned(ctx, tx, seeking, into(&others), `SELECT coalesce(array_agg(DISTINCT requires), '{}') FROM (SELECT requires FROM rbac_eligibilities
+		WHERE (scope, role, tenant, principal) >= ($2, $3, $1, 'group:') AND (scope, role, tenant, principal) < ($2, $3, $1, 'group;')
+		  AND principal <> $4 AND requires <> '' AND (expires_at IS NULL OR expires_at > $5)
+		ORDER BY scope, role, tenant, principal) e`,
+		tenant, e.Scope.Key(), e.Role, e.Principal.key(), a.cfg.Now()); err != nil {
 		return err
 	}
 	if !a.conds.within(once(append(others, was)), once(append(others, e.Requires))) {

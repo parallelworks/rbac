@@ -1426,7 +1426,7 @@ var (
 	indexed = []setting{{"enable_seqscan", "off"}}
 )
 
-// readIndexed runs sql on q with indexed for its plan alone (pinned), but as of a time, which reads
+// readIndexed runs sql on q with indexed for its plan alone (planned), but as of a time, which reads
 // history's views in AsOf's transaction, and hands its rows to read.
 func (a *Authorizer) readIndexed(ctx context.Context, q DB, read func(pgx.Rows) error, sql string, args ...any) error {
 	if a.history != "" {
@@ -1436,21 +1436,26 @@ func (a *Authorizer) readIndexed(ctx context.Context, q DB, read func(pgx.Rows) 
 		}
 		return read(rows)
 	}
-	return pinned(ctx, q, indexed, read, sql, args...)
+	return planned(ctx, q, indexed, read, sql, args...)
 }
 
-// pinned runs sql on q with settings for its plan alone, and hands its rows to read, in one round
+// planned runs sql on q with settings for its plan alone, and hands its rows to read, in one round
 // trip: a batch sets them, keeping each one's value in a variable of the package's own, runs sql
 // and puts each back, on a pool in a transaction of its own and under WithTx in the host's, which
-// goes on past it. Where sql fails, the batch runs nothing after it, and the transaction's
-// rollback, or a savepoint's, puts them back; a ctx done before it is sent sends none of it. On a
-// host's own DB that sends no batch, it runs in a savepoint of what its Begin begins.
-func pinned(ctx context.Context, q DB, settings []setting, read func(pgx.Rows) error, sql string, args ...any) error {
+// goes on past it. Sent with sql, the statement putting them back runs once sql has, however the
+// call goes on: where sql fails, the batch runs nothing after it, and the rollback, a transaction's
+// or a savepoint's, puts them back; and the batch is closed where read fails or panics too, so the
+// pool, or a host recovering in its transaction, has the connection back. A ctx done before it is
+// sent sends none of it. On a host's own DB that sends no batch, it runs in a savepoint of what its
+// Begin begins. Nothing runs on the session between the batch's statements, so no other read, of
+// this schema's tables or another's, can change the variables in between; a variable of each call
+// of its own would add one more to the session for good at every call.
+func planned(ctx context.Context, q DB, settings []setting, read func(pgx.Rows) error, sql string, args ...any) (err error) {
 	batcher, ok := q.(interface {
 		SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
 	})
 	if !ok {
-		return savepoint(ctx, q, func(tx pgx.Tx) error { return pinned(ctx, tx, settings, read, sql, args...) })
+		return savepoint(ctx, q, func(tx pgx.Tx) error { return planned(ctx, tx, settings, read, sql, args...) })
 	}
 	set, put, names := make([]string, len(settings)), make([]string, len(settings)), make([]any, 0, len(settings))
 	values := make([]any, 0, 2*len(settings))
@@ -1464,26 +1469,44 @@ func pinned(ctx context.Context, q DB, settings []setting, read func(pgx.Rows) e
 	b.Queue(sql, args...)
 	b.Queue(`SELECT `+strings.Join(put, ", "), names...)
 	br := batcher.SendBatch(ctx, b)
-	_, err := br.Exec()
-	if err == nil {
-		var rows pgx.Rows
-		if rows, err = br.Query(); err == nil {
-			err = read(rows)
+	var rows pgx.Rows
+	defer func() {
+		if rows != nil {
+			rows.Close()
 		}
+		if cerr := br.Close(); err == nil {
+			err = cerr
+		}
+	}()
+	if _, err := br.Exec(); err != nil {
+		return err
 	}
-	if err == nil {
-		_, err = br.Exec()
+	if rows, err = br.Query(); err != nil {
+		return err
 	}
-	if cerr := br.Close(); err == nil {
-		err = cerr
+	if err := read(rows); err != nil {
+		return err
 	}
+	_, err = br.Exec()
 	return err
+}
+
+// into is a read for planned of a statement that returns one row, as an aggregate does, scanning it
+// into dest.
+func into(dest ...any) func(pgx.Rows) error {
+	return func(rows pgx.Rows) error {
+		_, err := pgx.ForEachRow(rows, dest, func() error { return nil })
+		return err
+	}
 }
 
 // planning sets settings for the statements q runs in its transaction until restore, which puts
 // each back as it was, for a host's transaction under WithTx that goes on past them, even once ctx
 // is done, as pgx sends nothing on a done ctx (finish). Where a statement in between failed, the
-// transaction runs no other, and its rollback, a transaction's or a savepoint's, puts them back.
+// transaction runs no other, and its rollback, a transaction's or a savepoint's, puts them back. It
+// is for settings held across several statements, as AsOf's and History's reads hold them, which no
+// one batch sends (planned): so it keeps each one's value in the call, as a read in between may be
+// planned, which changes the package's variables.
 func planning(ctx context.Context, q DB, settings []setting) (restore func() error, err error) {
 	set, put, args := make([]string, len(settings)), make([]string, len(settings)), make([]any, 0, 2*len(settings))
 	was, scan := make([]string, len(settings)), make([]any, 0, 2*len(settings))
@@ -1507,25 +1530,4 @@ func planning(ctx context.Context, q DB, settings []setting) (restore func() err
 			return err
 		})
 	}, nil
-}
-
-// planned is what read reads, statements on q in a transaction, with settings for them alone, put
-// back after it (planning) whether it fails, panics or not, so a host's transaction under WithTx
-// gets its own again, as where it goes on past a call refused for its ctx once read ran, or one
-// whose panic it recovered from: Holders and Conflicts read on it with no savepoint to roll back.
-func planned[T any](ctx context.Context, q DB, settings []setting, read func() (T, error)) (v T, err error) {
-	restore, err := planning(ctx, q, settings)
-	if err != nil {
-		return v, err
-	}
-	defer func() {
-		if rerr := restore(); err == nil {
-			err = rerr
-		}
-		if err != nil {
-			var none T
-			v = none
-		}
-	}()
-	return read()
 }

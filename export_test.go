@@ -419,6 +419,12 @@ func ReadGrantsDenied(ctx context.Context, a *Authorizer, tenant string, actor S
 	return err
 }
 
+// Planned reads sql on q with sequential scans off for its plan alone, as a check reads its
+// subject's grants (planned), handing its rows to read.
+func Planned(ctx context.Context, q DB, read func(pgx.Rows) error, sql string, args ...any) error {
+	return planned(ctx, q, indexed, read, sql, args...)
+}
+
 // HeldByMembers is why making custom role id privileged in tenant is refused at now, read on q, as
 // its tenant's members hold it (heldByMembers).
 func HeldByMembers(ctx context.Context, q DB, tenant string, id Role, now time.Time) error {

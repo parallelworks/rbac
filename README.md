@@ -1080,11 +1080,14 @@ against, and nothing such a table runs, as its row security policy, runs as hist
   spent 500 of its 650 ms compiling. As of a time, every statement costs so for any subject, as
   planned for its arguments over history: `AsOf` turns JIT off in its own transaction, which the
   rollback puts back, whatever the role's setting.
-- **Planner settings:** a check's read of its subject's grants and denies, and a change's of its
-  actor's, turn sequential scans off for their own statement, in the round trip that sends it, and
-  put the session's setting back, keeping it meanwhile in a variable of the package's own,
-  `rbac.enable_seqscan`: a connection plans a statement once for all its runs, and one planned
-  while the tables were small read every row of them until an analysis had it planned again.
+- **Planner settings:** a check's read of its subject's grants and denies, a change's of its
+  actor's, and a change to members' reads of what names its groups and its removal of places, turn
+  sequential scans off for their own statement, as `Holders`' read of label values and `Conflicts`
+  turn JIT off for theirs. Each sets them in the round trip that sends the statement, and puts the
+  session's back after it, keeping each meanwhile in a variable of the package's own named for it,
+  as `rbac.enable_seqscan` and `rbac.jit`: a connection plans a statement once for all its runs,
+  and one planned while the tables were small read every row of them until an analysis had it
+  planned again.
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
   to run on a schedule, passing over what a change holds until the next run. A call reads
   `Config.Now` once, which every expiry it compares and every condition's `request.time` read, so a

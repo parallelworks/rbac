@@ -2514,45 +2514,42 @@ func (a *Authorizer) conditionsIn(ctx context.Context, tx pgx.Tx, tenant string,
 	for i, b := range buckets {
 		scopes[i], principals[i], sources[i] = b.scope, b.principal, b.source
 	}
-	// The grants that reach many by their keys, the groups' a range, each of which the index of
-	// conditional grants seeks (rbac_grants_conditional): '' is no principal's key. By the scope's
-	// index, which holds whether each is conditional but not its condition or source, every grant to
-	// a group on the scope was read from the table, and with sequential scans on, a plan by
-	// statistics from before the scope's grants grew, or made while the table was small, read every
-	// grant in the table.
-	carried, err := planned(ctx, tx, seeking, func() (map[conditionBucket]map[string][]Role, error) {
-		rows, err := tx.Query(ctx, `
-			SELECT b.scope, b.principal, b.source, g.condition, array_agg(DISTINCT g.role)
-			FROM unnest($2::text[], $3::text[], $4::text[]) AS b(scope, principal, source)
-			CROSS JOIN LATERAL (
-			  SELECT condition, role, source FROM rbac_grants WHERE scope = b.scope AND tenant = $1 AND principal = b.principal
-			    AND conditional AND (expires_at IS NULL OR expires_at > $5)
-			  UNION ALL
-			  SELECT condition, role, source FROM rbac_grants WHERE b.principal = '' AND scope = b.scope AND tenant = $1
-			    AND principal >= 'group:' AND principal < 'group;' AND conditional AND (expires_at IS NULL OR expires_at > $5)
-			  UNION ALL
-			  SELECT condition, role, source FROM rbac_grants WHERE b.principal = '' AND scope = b.scope AND tenant = $1
-			    AND principal = ANY(ARRAY[$6, $7]::text[]) AND conditional AND (expires_at IS NULL OR expires_at > $5)
-			) g
-			WHERE CASE WHEN g.source = ANY($8::text[]) THEN g.source ELSE '' END = b.source
-			GROUP BY b.scope, b.principal, b.source, g.condition`,
-			tenant, scopes, principals, sources, a.cfg.Now(), TenantMembers(tenant).key(), publicKey, slices.Sorted(maps.Keys(a.owned)))
-		if err != nil {
-			return nil, err
-		}
-		carried := map[conditionBucket]map[string][]Role{}
-		var b conditionBucket
-		var condition string
-		var roles []Role
-		_, err = pgx.ForEachRow(rows, []any{&b.scope, &b.principal, &b.source, &condition, &roles}, func() error {
+	carried := map[conditionBucket]map[string][]Role{}
+	var b conditionBucket
+	var condition string
+	var roles []Role
+	scan := func(rows pgx.Rows) error {
+		_, err := pgx.ForEachRow(rows, []any{&b.scope, &b.principal, &b.source, &condition, &roles}, func() error {
 			if carried[b] == nil {
 				carried[b] = map[string][]Role{}
 			}
 			carried[b][condition] = roles
 			return nil
 		})
-		return carried, err
-	})
+		return err
+	}
+	// The grants that reach many by their keys, the groups' a range, each of which the index of
+	// conditional grants seeks (rbac_grants_conditional): '' is no principal's key. By the scope's
+	// index, which holds whether each is conditional but not its condition or source, every grant to
+	// a group on the scope was read from the table, and with sequential scans on, a plan by
+	// statistics from before the scope's grants grew, or made while the table was small, read every
+	// grant in the table.
+	err := planned(ctx, tx, seeking, scan, `
+		SELECT b.scope, b.principal, b.source, g.condition, array_agg(DISTINCT g.role)
+		FROM unnest($2::text[], $3::text[], $4::text[]) AS b(scope, principal, source)
+		CROSS JOIN LATERAL (
+		  SELECT condition, role, source FROM rbac_grants WHERE scope = b.scope AND tenant = $1 AND principal = b.principal
+		    AND conditional AND (expires_at IS NULL OR expires_at > $5)
+		  UNION ALL
+		  SELECT condition, role, source FROM rbac_grants WHERE b.principal = '' AND scope = b.scope AND tenant = $1
+		    AND principal >= 'group:' AND principal < 'group;' AND conditional AND (expires_at IS NULL OR expires_at > $5)
+		  UNION ALL
+		  SELECT condition, role, source FROM rbac_grants WHERE b.principal = '' AND scope = b.scope AND tenant = $1
+		    AND principal = ANY(ARRAY[$6, $7]::text[]) AND conditional AND (expires_at IS NULL OR expires_at > $5)
+		) g
+		WHERE CASE WHEN g.source = ANY($8::text[]) THEN g.source ELSE '' END = b.source
+		GROUP BY b.scope, b.principal, b.source, g.condition`,
+		tenant, scopes, principals, sources, a.cfg.Now(), TenantMembers(tenant).key(), publicKey, slices.Sorted(maps.Keys(a.owned)))
 	if err != nil {
 		return nil, err
 	}

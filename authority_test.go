@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/rbac"
@@ -3669,11 +3670,19 @@ func TestReadsOfAnIdentityInManyTenantsAreCostedBelowJIT(t *testing.T) {
 			}
 			read := 0
 			for i, sql := range rec.sqls {
+				// The settings a batch plans its read with, and puts back, as it ran them.
+				if strings.HasPrefix(sql, "SELECT set_config(") {
+					if _, err := tx.Exec(ctx, sql, rec.args[i]...); err != nil {
+						t.Fatal(err)
+					}
+					continue
+				}
 				if !strings.Contains(sql, "rbac_memberships") {
 					continue
 				}
 				read++
-				// Planned for its arguments, as a connection's first five runs of a statement are.
+				// Planned for its arguments, as a connection's first five runs of a statement are, with the
+				// settings it ran with.
 				var plan []struct {
 					Plan struct {
 						Cost float64 `json:"Total Cost"`
@@ -5949,6 +5958,157 @@ func TestReadsByKeyReadAsMuchUnderAPlanMadeWhileTheTablesWereSmall(t *testing.T)
 	if err := tx.QueryRow(ctx, `SELECT current_setting('enable_seqscan')`).Scan(&on); err != nil || on != "off" {
 		t.Errorf("enable_seqscan = %q, %v, once a check in a transaction that had it off read", on, err)
 	}
+}
+
+// A change to members reads the grants, eligibilities and denies naming its groups, and removes the
+// places it ends, reading as few pages once the tables have grown, under a generic plan made while
+// they were small, by statistics from then, as a connection planned it: the reads read every deny
+// and eligibility in the database, as by sequential scans, and the removal, beside tenant = $1,
+// every place in the tenant, and under some plans for each one every place in the table, 32,200
+// pages, or 2.6 million, to remove one member, until an analysis invalidated the plans. Without
+// OnChange, which a removal returns what it removed for, its statement runs by Exec or in a batch,
+// which pagesOfStatements counts.
+func TestAChangeToMembersReadsByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *testing.T) {
+	h := groupedOn(t, pgtest.Open(t, "plan_cache_mode=force_generic_plan&pool_max_conns=1"), func(c *rbac.Config) { c.OnChange = nil })
+	ctx := t.Context()
+	tables := []string{"rbac_grants", "rbac_denies", "rbac_members", "rbac_eligibilities", "rbac_memberships", "rbac_groups"}
+	// Autovacuum would analyze them as they grow, which invalidates the plan; and their writes are
+	// unrecorded, as growing does.
+	for _, table := range tables {
+		if _, err := h.pool.Exec(ctx, `ALTER TABLE `+table+` SET (autovacuum_enabled = off), DISABLE TRIGGER USER`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.groups(t, "crew")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
+	h.as(t, "u", "crew")
+	h.as(t, "v")
+	manager := h.as(t, "manager")
+	// A deny of changing grants on another cluster binds the manager, so the change reads what the
+	// members lose, and what names the crew.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+		VALUES ('t1', 'cluster', 'c2', 'frozen', '{user:manager}', ARRAY[$1::text])`, grantC); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `ANALYZE `+strings.Join(tables, ", ")); err != nil {
+		t.Fatal(err)
+	}
+	// The pages of the denies and eligibilities the change reads, and of the places its removal of
+	// them does, in a transaction it rolls back: made once before, so its plans are made and cached.
+	read := func() map[string]int64 {
+		t.Helper()
+		pages := map[string]int64{}
+		for _, measured := range []bool{false, true} {
+			func() {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				before := map[string]int64{}
+				for _, table := range []string{"rbac_denies", "rbac_eligibilities"} {
+					before[table] = pagesRead(ctx, t, tx, table)
+				}
+				removing := &pagesOfStatements{Tx: tx, t: t, prefix: "DELETE FROM rbac_members", table: "rbac_members", pages: new(int64)}
+				if err := h.authz.WithTx(removing).ChangeMembers(ctx, manager, "t1",
+					[]rbac.Member{{Group: "crew", Principal: identity("v")}}, []rbac.Member{{Group: "crew", Principal: identity("u")}}); err != nil {
+					t.Fatal(err)
+				}
+				if !measured {
+					return
+				}
+				for table, n := range before {
+					pages["the reads of "+table] = pagesRead(ctx, t, tx, table) - n
+				}
+				pages["the removal of places"] = *removing.pages
+			}()
+		}
+		return pages
+	}
+	few := read()
+	if few["the removal of places"] == 0 {
+		t.Fatal("the change read no places removing them")
+	}
+	// Grants, denies, eligibilities, memberships, groups and places in groups of others, in t1 and in
+	// tenants of their own, naming groups too.
+	for _, q := range []string{
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'cluster', 'k' || i, 'group', 'o' || i, 'cluster.login' FROM generate_series(1, 20000) i`,
+		`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+		 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'cluster', 'k' || i, 'd', ARRAY['group:o' || i], ARRAY['user:o' || i], '{cluster:root,cluster:grant}'
+		 FROM generate_series(1, 20000) i`,
+		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+		 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'cluster', 'k' || i, 'group', 'o' || i, 'cluster.sudo', 3600, ARRAY['group:o' || i]
+		 FROM generate_series(1, 20000) i`,
+		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id)
+		 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'user', 'o' || i FROM generate_series(1, 20000) i`,
+		`INSERT INTO rbac_groups (tenant, id) SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'o' || i FROM generate_series(1, 20000) i`,
+		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+		 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'o' || i, 'user', 'o' || i FROM generate_series(1, 20000) i`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for what, many := range read() {
+		if many > few[what]*3/2+deeper {
+			t.Errorf("%s read %d pages, and %d once the tables grew under a plan made while they were small", what, few[what], many)
+		}
+	}
+}
+
+// pagesOfStatements is a transaction that counts the pages of table and its indexes read by its
+// statements starting with prefix, as Exec runs them or a batch holds them, in it and in the
+// savepoints it begins.
+type pagesOfStatements struct {
+	pgx.Tx
+	t             *testing.T
+	prefix, table string
+	pages         *int64
+}
+
+func (p *pagesOfStatements) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if !strings.HasPrefix(sql, p.prefix) {
+		return p.Tx.Exec(ctx, sql, args...)
+	}
+	before := pagesRead(ctx, p.t, p.Tx, p.table)
+	tag, err := p.Tx.Exec(ctx, sql, args...)
+	if err == nil {
+		*p.pages += pagesRead(ctx, p.t, p.Tx, p.table) - before
+	}
+	return tag, err
+}
+
+func (p *pagesOfStatements) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	if !slices.ContainsFunc(b.QueuedQueries, func(q *pgx.QueuedQuery) bool { return strings.HasPrefix(q.SQL, p.prefix) }) {
+		return p.Tx.SendBatch(ctx, b)
+	}
+	before := pagesRead(ctx, p.t, p.Tx, p.table)
+	return &measuredBatch{BatchResults: p.Tx.SendBatch(ctx, b), done: func() {
+		*p.pages += pagesRead(ctx, p.t, p.Tx, p.table) - before
+	}}
+}
+
+// measuredBatch is a batch that runs done once it is closed.
+type measuredBatch struct {
+	pgx.BatchResults
+	done func()
+}
+
+func (b *measuredBatch) Close() error {
+	err := b.BatchResults.Close()
+	if err == nil {
+		b.done()
+	}
+	return err
+}
+
+func (p *pagesOfStatements) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := p.Tx.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &pagesOfStatements{Tx: tx, t: p.t, prefix: p.prefix, table: p.table, pages: p.pages}, nil
 }
 
 // reportedRead is how many pages of table and its indexes the database has counted read, once the

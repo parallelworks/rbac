@@ -739,9 +739,7 @@ func (a *Authorizer) valuesOfEach(ctx context.Context, q DB, tenant string, hold
 	if len(identities) == 0 {
 		return nil, nil
 	}
-	// Each identity's keys cost the planner as a walk of many groups, which across many identities is
-	// past JIT's thresholds.
-	return planned(ctx, q, withoutJIT, func() (map[string]*valuesRead, error) { return a.valuesOfAll(ctx, q, tenant, identities) })
+	return a.valuesOfAll(ctx, q, tenant, identities)
 }
 
 // matchingKeys runs as valuesOfAll looks n keys up, of its identities' or its denies', to find the
@@ -752,7 +750,50 @@ var matchingKeys = func(n int) {}
 // gives values (labeling): of the grants reaching each only those of roles giving some, and of the
 // denies binding each only those of a label value or a power to release.
 func (a *Authorizer) valuesOfAll(ctx context.Context, q DB, tenant string, identities []string) (map[string]*valuesRead, error) {
-	rows, err := q.Query(ctx, `
+	// Grants by principal, role and id, and denies by id, as a read of one identity's orders them.
+	type identityKeys struct{ keys, bound, exempted []string }
+	byIdentity := map[string]identityKeys{}
+	var grants []holding
+	at := map[string][]int{}
+	var ds []denial
+	var custom []RoleDefinition
+	scope := TenantRoot(tenant).Key()
+	var kind int
+	var id, principal, role, condition, name, description string
+	var expires *time.Time
+	var first, second, third []string
+	var privileged, public bool
+	scan := func(rows pgx.Rows) error {
+		_, err := pgx.ForEachRow(rows, []any{&kind, &id, &principal, &role, &expires, &condition, &first, &second, &third, &privileged, &public, &name, &description}, func() error {
+			switch kind {
+			case 0:
+				byIdentity[id] = identityKeys{first, second, third}
+			case 1:
+				h := holding{
+					Binding: Binding{ID: id, Principal: parsePrincipal(principal), Role: Role(role), Condition: Condition{Expression: condition}},
+					scope:   scope, conditional: condition != "",
+				}
+				if expires != nil {
+					h.ExpiresAt = *expires
+				}
+				at[principal] = append(at[principal], len(grants))
+				grants = append(grants, h)
+			case 2:
+				d := denial{id: id, scope: scope, condition: condition, principals: second, exempt: third}
+				for _, x := range first {
+					d.permissions = append(d.permissions, Permission(x))
+				}
+				ds = append(ds, d)
+			default:
+				custom = append(custom, roleFrom(id, name, description, first, second, privileged, public, third))
+			}
+			return nil
+		})
+		return err
+	}
+	// Each identity's keys cost the planner as a walk of many groups, which across many identities is
+	// past JIT's thresholds.
+	if err := planned(ctx, q, withoutJIT, scan, `
 		WITH idents AS MATERIALIZED (
 		  SELECT t.identity, ks.keys, ks.bound, ks.exempted FROM (SELECT unnest($2::text[]) COLLATE "C" AS identity) t
 		  CROSS JOIN LATERAL (WITH RECURSIVE `+keysSQL("$1::text", "t.identity", "$3")+`
@@ -771,48 +812,7 @@ func (a *Authorizer) valuesOfAll(ctx context.Context, q DB, tenant string, ident
 		UNION ALL
 		SELECT 3, id, '', '', NULL, '', permissions, resource_types, grantable_roles, privileged, public, name, description
 		FROM (`+byKey(namedCustom("SELECT role FROM held"), "rbac_roles", "id", roleColumns, "tenant = $1")+`) r
-		ORDER BY 1, 3, 4, 2`, tenant, identities, a.cfg.Now())
-	if err != nil {
-		return nil, err
-	}
-	// Grants by principal, role and id, and denies by id, as a read of one identity's orders them.
-	type identityKeys struct{ keys, bound, exempted []string }
-	byIdentity := map[string]identityKeys{}
-	var grants []holding
-	at := map[string][]int{}
-	var ds []denial
-	var custom []RoleDefinition
-	scope := TenantRoot(tenant).Key()
-	var kind int
-	var id, principal, role, condition, name, description string
-	var expires *time.Time
-	var first, second, third []string
-	var privileged, public bool
-	if _, err := pgx.ForEachRow(rows, []any{&kind, &id, &principal, &role, &expires, &condition, &first, &second, &third, &privileged, &public, &name, &description}, func() error {
-		switch kind {
-		case 0:
-			byIdentity[id] = identityKeys{first, second, third}
-		case 1:
-			h := holding{
-				Binding: Binding{ID: id, Principal: parsePrincipal(principal), Role: Role(role), Condition: Condition{Expression: condition}},
-				scope:   scope, conditional: condition != "",
-			}
-			if expires != nil {
-				h.ExpiresAt = *expires
-			}
-			at[principal] = append(at[principal], len(grants))
-			grants = append(grants, h)
-		case 2:
-			d := denial{id: id, scope: scope, condition: condition, principals: second, exempt: third}
-			for _, x := range first {
-				d.permissions = append(d.permissions, Permission(x))
-			}
-			ds = append(ds, d)
-		default:
-			custom = append(custom, roleFrom(id, name, description, first, second, privileged, public, third))
-		}
-		return nil
-	}); err != nil {
+		ORDER BY 1, 3, 4, 2`, tenant, identities, a.cfg.Now()); err != nil {
 		return nil, err
 	}
 	readingRoles()

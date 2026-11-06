@@ -210,7 +210,7 @@ erDiagram
   averages, still reads only the subject's grants on the path, from the index alone, whichever
   index it picks. A check's read of its subject's grants and the denies on the path, and a change's
   of its actor's (`readHeld`), and of the powers to change grants the denies binding it remove
-  (`grantsDenied`), are planned with sequential scans off (`indexed`, `pinned`), so a plan
+  (`grantsDenied`), are planned with sequential scans off (`indexed`, `planned`), so a plan
   PostgreSQL made generically while the tables were small, or by statistics from then, which it
   keeps until an analysis invalidates it, still reads each table by an index: one made with them on
   read every row of each, and the denies once for each key of the path, 2,000 pages of a check
@@ -219,7 +219,12 @@ erDiagram
   setting in a variable of the package's own, `rbac.enable_seqscan`, and before one putting it back:
   on a pool the batch is a transaction of its own, and under `WithTx` it runs in the host's, which
   goes on past it; where the statement fails, nothing after it runs, and a rollback puts the setting
-  back. A search reads its subject's own grants on scopes of the listed types a key at a time too
+  back. So are a change to members' reads of the grants, eligibilities and denies naming its groups
+  (`reachOf`), which read every deny and eligibility in the database so, and its removal of the
+  places it ends (`leave`), which deletes each by where it is stored, as `restingIn` holds it:
+  matched beside `tenant = $1`, a plan made while the table was small read every place in the
+  tenant and for each one every place in the table, 2.6 million pages to remove one member. A
+  search reads its subject's own grants on scopes of the listed types a key at a time too
   (`heldByType`): by `= ANY` of its keys beside a type's range of scopes, a plan by no statistics
   read that range of the scopes' index, every grant on a scope of the type in the tenant. A search
   decides which custom roles the public's and the tenant's members' grants name before its
@@ -1046,16 +1051,21 @@ flowchart TB
   host's transaction at its isolation, AsOf in a savepoint: at READ COMMITTED each statement reads
   a moment of its own, so a change committing between two can mix two states, and for AsOf, history
   of a time not yet final. Conflicts reads in one statement, the custom roles with their grants, as
-  a check and `broadExcludes` read them, so it lists what one moment held under `WithTx` too: it
-  runs in such a transaction of its own only to hold JIT off for it (`withoutJIT`). A read that
-  sets planner settings for its own statements alone (`planned`), as that, `Holders`' read of label
-  values and a change bounding a scope's conditions (`seeking`) do, puts the host's back after it,
-  where it fails, panics or its ctx is done too, as pgx sends nothing on a done ctx: under `WithTx`,
-  a `Holders` refused for its ctx once its read had run left the host's transaction JIT off, as did
-  one whose panic the host recovered from, as no savepoint of the call's rolls them back. A read of
-  one statement sets them and puts them back in the batch it sends the statement in (`pinned`), as a
-  check's read of its subject's grants does, so the server puts them back however the call ends,
-  once it has sent the batch.
+  a check and `broadExcludes` read them, so it lists what one moment held under `WithTx` too, with
+  JIT off for it (`withoutJIT`). A read that sets planner settings for its own statement alone
+  (`planned`), as that, `Holders`' read of label values, a check's read of its subject's grants
+  (`indexed`) and a change bounding a scope's conditions (`seeking`) do, sends it in one batch
+  between a statement setting them, which keeps each one's value in a variable of the package's own,
+  and one putting them back, so the server puts the host's back however the call ends once it has
+  sent the batch: where the statement fails, nothing after it runs, and the rollback puts them back;
+  and the batch is read to its end where the call's reading of its rows fails or panics, so the
+  pool, or a host recovering in its transaction, has the connection back. Set and put back in
+  statements of their own, under `WithTx` a `Holders` refused for its ctx once its read had run left
+  the host's transaction JIT off, as did one whose panic the host recovered from, as no savepoint of
+  the call's rolls them back. Nothing else runs on the session within one batch, so no read, of the
+  schema's tables or another's, can change the variables in between. A read holding settings across
+  several statements (`planning`), as `AsOf`'s and `History`'s do, keeps the host's in the call
+  instead, as a read between them may be planned, which changes the variables.
 - **One time for a call.** A call reads `Config.Now` once, where it first needs the time: every
   statement it makes compares expiry with it, and every condition reads it as `request.time`, so a
   grant or a membership ending as the call runs can't meet a deny, a condition or label values of a

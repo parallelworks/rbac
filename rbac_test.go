@@ -9845,7 +9845,132 @@ func TestAReadLeavesTheHostItsPlannerSettingsWhereItFails(t *testing.T) {
 	}
 }
 
-// refusingTx is a transaction whose queries holding sql fail before they are sent.
+// A read planned with settings of its own leaves its session as it found it however it ends, so a
+// pool's next caller, or a host's transaction going on, plans with the host's: where it reads, where
+// its statement fails on the server, where its reading of the rows fails, and where that panics,
+// which the host recovers from. On the pool, and in the host's transaction or a savepoint of it, the
+// host rolling back to that where the call failed; and on a DB that sends no batches, which wraps
+// either. A panic left the batch unread, so the pool never had its connection back, and the host's
+// transaction could run nothing more.
+func TestAReadPlannedAloneLeavesItsSessionAsItFoundItHoweverItEnds(t *testing.T) {
+	ctx := t.Context()
+	schema := pgtest.Open(t, "pool_max_conns=1").Config()
+	const panicked = "the read panicked"
+	ends := map[string]struct {
+		sql  string
+		read func(pgx.Rows) error
+	}{
+		"it reads": {`SELECT current_setting('enable_seqscan')`, func(rows pgx.Rows) error {
+			var during string
+			if _, err := pgx.ForEachRow(rows, []any{&during}, func() error { return nil }); err != nil {
+				return err
+			}
+			if during != "off" {
+				return fmt.Errorf("enable_seqscan = %q as it read", during)
+			}
+			return nil
+		}},
+		"its statement fails": {`SELECT 1 / (SELECT 0)`, func(rows pgx.Rows) error {
+			_, err := pgx.ForEachRow(rows, nil, func() error { return nil })
+			return err
+		}},
+		"its read fails": {`SELECT 1`, func(rows pgx.Rows) error { return errors.New("the read failed") }},
+		"its read panics": {`SELECT 1`, func(rows pgx.Rows) error {
+			rows.Next()
+			panic(panicked)
+		}},
+	}
+	on := map[string]func(pool *pgxpool.Pool, tx pgx.Tx) rbac.DB{
+		"the pool":                               func(pool *pgxpool.Pool, _ pgx.Tx) rbac.DB { return pool },
+		"a DB that sends no batches on the pool": func(pool *pgxpool.Pool, _ pgx.Tx) rbac.DB { return unbatched{pool} },
+		"the host's transaction":                 func(_ *pgxpool.Pool, tx pgx.Tx) rbac.DB { return tx },
+		"a DB that sends no batches on the host's transaction": func(_ *pgxpool.Pool, tx pgx.Tx) rbac.DB { return hostTx{tx} },
+	}
+	for name, db := range on {
+		for how, end := range ends {
+			t.Run(name+", where "+how, func(t *testing.T) {
+				bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
+				defer cancel()
+				// A pool of one connection of its own, which closes only once it has it back.
+				pool, err := pgxpool.NewWithConfig(bounded, schema)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					closed := make(chan struct{})
+					go func() {
+						pool.Close()
+						close(closed)
+					}()
+					select {
+					case <-closed:
+					case <-time.After(10 * time.Second):
+						t.Error("the pool never had its connection back")
+					}
+				}()
+				var host pgx.Tx
+				if strings.Contains(name, "host's transaction") {
+					var err error
+					if host, err = pool.Begin(bounded); err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = host.Rollback(context.WithoutCancel(ctx)) }()
+					if _, err := host.Exec(bounded, `SAVEPOINT before`); err != nil {
+						t.Fatal(err)
+					}
+				}
+				err = func() (err error) {
+					defer func() {
+						if r := recover(); r != nil {
+							if r != panicked {
+								panic(r)
+							}
+							err = errors.New(panicked)
+						}
+					}()
+					return rbac.Planned(bounded, db(pool, host), end.read, end.sql)
+				}()
+				if (err == nil) != (how == "it reads") {
+					t.Fatalf("the read returned %v", err)
+				}
+				// As a host whose call failed, back to before it, but where it panicked after its
+				// statements ran, which the host goes on from.
+				if err != nil && host != nil && how != "its read panics" {
+					if _, err := host.Exec(bounded, `ROLLBACK TO SAVEPOINT before`); err != nil {
+						t.Fatal(err)
+					}
+				}
+				var q rbac.DB = pool
+				if host != nil {
+					q = host
+				}
+				var seqscan string
+				if err := q.QueryRow(bounded, `SELECT current_setting('enable_seqscan')`).Scan(&seqscan); err != nil || seqscan != "on" {
+					t.Errorf("enable_seqscan = %q, %v, once the read ended", seqscan, err)
+				}
+			})
+		}
+	}
+}
+
+// unbatched is a host's own DB around a pool that sends no batches.
+type unbatched struct{ pool *pgxpool.Pool }
+
+func (u unbatched) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	return u.pool.Exec(ctx, sql, args...)
+}
+
+func (u unbatched) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	return u.pool.Query(ctx, sql, args...)
+}
+
+func (u unbatched) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	return u.pool.QueryRow(ctx, sql, args...)
+}
+
+func (u unbatched) Begin(ctx context.Context) (pgx.Tx, error) { return u.pool.Begin(ctx) }
+
+// refusingTx is a transaction whose queries, and batches, holding sql fail before they are sent.
 type refusingTx struct {
 	pgx.Tx
 	sql string
@@ -9860,6 +9985,33 @@ func (tx *refusingTx) Query(ctx context.Context, sql string, args ...any) (pgx.R
 	}
 	return tx.Tx.Query(ctx, sql, args...)
 }
+
+func (tx *refusingTx) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	for _, q := range b.QueuedQueries {
+		if strings.Contains(q.SQL, tx.sql) {
+			return refusedBatch{}
+		}
+	}
+	return tx.Tx.SendBatch(ctx, b)
+}
+
+// refusedBatch is a batch refusingTx refused, whose every result is the refusal.
+type refusedBatch struct{}
+
+func (refusedBatch) Exec() (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, errors.New(refused)
+}
+
+func (refusedBatch) Query() (pgx.Rows, error) { return nil, errors.New(refused) }
+
+func (b refusedBatch) QueryRow() pgx.Row { return refusedRow{} }
+
+func (refusedBatch) Close() error { return errors.New(refused) }
+
+// refusedRow is a row refusingTx refused.
+type refusedRow struct{}
+
+func (refusedRow) Scan(...any) error { return errors.New(refused) }
 
 // scanned is how many rows of table tx has read by scanning it, whole or through a bitmap, and how
 // many entries of its indexes by scanning them, as an index scan finds each row it fetches.

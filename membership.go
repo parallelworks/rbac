@@ -1906,50 +1906,51 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 		left = &read
 	}
 	r.placed = *left
+	// What names the groups is read with sequential scans off (readIndexed): a plan made while the
+	// tables were small, or by statistics from then, read every deny and eligibility in the database
+	// for those naming a few groups.
+	readDenies := func(rows pgx.Rows) error {
+		var err error
+		r.denies, err = collectDenies(rows)
+		return err
+	}
 	// Where neither a label nor a freeze can refuse it, a member leaving loses nothing a change checks
 	// but the denies naming its groups, which then no longer bind it: where none gains, as none is
 	// added but to end a place sooner or change its note, those alone are read, not what the groups
 	// hold.
 	if !r.losing && len(r.gaining(add)) == 0 {
-		rows, err = q.Query(ctx, `SELECT `+denyColumns+` FROM rbac_denies WHERE `+naming("principals", "$2")+` ORDER BY scope, id`, tenant, keys)
-		if err != nil {
-			return reach{}, err
-		}
-		if r.denies, err = collectDenies(rows); err != nil {
+		if err := a.readIndexed(ctx, q, readDenies, `SELECT `+denyColumns+` FROM rbac_denies WHERE `+naming("principals", "$2")+` ORDER BY scope, id`,
+			tenant, keys); err != nil {
 			return reach{}, err
 		}
 		return r.indexed(), nil
 	}
-	rows, err = q.Query(ctx, `SELECT `+grantColumns+` FROM rbac_grants
-		WHERE tenant = $1 AND principal = ANY($2::text[]) AND (expires_at IS NULL OR expires_at > $3) ORDER BY id`, tenant, keys, now)
-	if err != nil {
-		return reach{}, err
-	}
-	grants, err := collectGrants(rows)
-	if err != nil {
+	var grants []Grant
+	if err := a.readIndexed(ctx, q, func(rows pgx.Rows) error {
+		var err error
+		grants, err = collectGrants(rows)
+		return err
+	}, `SELECT `+grantColumns+` FROM rbac_grants
+		WHERE tenant = $1 AND principal = ANY($2::text[]) AND (expires_at IS NULL OR expires_at > $3) ORDER BY id`, tenant, keys, now); err != nil {
 		return reach{}, err
 	}
 	// The groups' eligibilities by principal, a group at a time, and those they approve, each once.
-	rows, err = q.Query(ctx, `SELECT `+eligibilityColumns+` FROM (
+	var eligible []Eligibility
+	if err := a.readIndexed(ctx, q, func(rows pgx.Rows) error {
+		var err error
+		eligible, err = collectEligibilities(rows)
+		return err
+	}, `SELECT `+eligibilityColumns+` FROM (
 		  `+byKey("$2", "rbac_eligibilities", "principal", eligibilityColumns+", scope, principal",
 		"tenant = $1 AND (expires_at IS NULL OR expires_at > $3)")+`
 		  UNION ALL
 		  SELECT `+eligibilityColumns+`, scope, principal FROM rbac_eligibilities
 		  WHERE `+naming("approvers", "$2")+` AND principal <> ALL($2::text[]) AND (expires_at IS NULL OR expires_at > $3)) e
-		ORDER BY scope, principal, role`, tenant, keys, now)
-	if err != nil {
+		ORDER BY scope, principal, role`, tenant, keys, now); err != nil {
 		return reach{}, err
 	}
-	eligible, err := collectEligibilities(rows)
-	if err != nil {
-		return reach{}, err
-	}
-	rows, err = q.Query(ctx, `SELECT `+denyColumns+` FROM rbac_denies
-		WHERE `+naming("principals", "$2")+` OR `+naming("exempt", "$2")+` ORDER BY scope, id`, tenant, keys)
-	if err != nil {
-		return reach{}, err
-	}
-	if r.denies, err = collectDenies(rows); err != nil {
+	if err := a.readIndexed(ctx, q, readDenies, `SELECT `+denyColumns+` FROM rbac_denies
+		WHERE `+naming("principals", "$2")+` OR `+naming("exempt", "$2")+` ORDER BY scope, id`, tenant, keys); err != nil {
 		return reach{}, err
 	}
 	if r.losing {
@@ -3118,11 +3119,30 @@ func placeArgs(members []Member) []any {
 
 // leave removes members, each by its group, principal and source, under the change's locks.
 func (a *Authorizer) leave(ctx context.Context, tx pgx.Tx, tenant string, members []Member) ([]Member, error) {
-	// Each found on its own, as byKey finds its rows.
-	return removed(ctx, a, tx, "rbac_members", memberColumns, collectMembers, tenant, `(group_id, principal, source) IN (
-		  SELECT m.group_id, m.principal, m.source FROM unnest($2::text[], $3::text[], $4::text[]) AS t(g, p, s) CROSS JOIN LATERAL (
-		    SELECT group_id, principal, source FROM rbac_members WHERE tenant = $1 AND group_id = t.g AND principal = t.p AND source = t.s
-		    OFFSET 0) m)`, placeArgs(members)...)
+	// Each found on its own, as byKey finds its rows, and deleted by where it is stored, as restingIn
+	// holds it, with sequential scans off (readIndexed): matched beside tenant = $1, a plan made while
+	// the table was small, or by statistics from then, read every place in the tenant, and for each
+	// one every place in the table, 2.6 million pages to remove one member from a tenant of 10,000;
+	// and by where they are stored with sequential scans on, every place in the table once.
+	query := `DELETE FROM rbac_members WHERE ctid = ANY(ARRAY(
+		  SELECT m.ctid FROM unnest($2::text[], $3::text[], $4::text[]) AS t(g, p, s) CROSS JOIN LATERAL (
+		    SELECT ctid FROM rbac_members WHERE tenant = $1 AND group_id = t.g AND principal = t.p AND source = t.s
+		    OFFSET 0) m))`
+	// Only OnChange reads what was removed, as removedWhere.
+	if a.cfg.OnChange != nil {
+		query += ` RETURNING ` + memberColumns
+	}
+	var left []Member
+	err := a.readIndexed(ctx, tx, func(rows pgx.Rows) error {
+		if a.cfg.OnChange == nil {
+			rows.Close()
+			return rows.Err()
+		}
+		var err error
+		left, err = collectMembers(rows)
+		return err
+	}, query, append([]any{tenant}, placeArgs(members)...)...)
+	return left, err
 }
 
 // restingIn holds, in tx, in order, the places members name, by group, principal and source: every
@@ -3248,13 +3268,10 @@ func (a *Authorizer) GroupsOf(ctx context.Context, tenant string, p Principal) (
 // the tenant was read, and by fresh statistics of a role id other tenants grant too, which EXISTS
 // plans for the first, every grant in the table.
 func heldByMembers(ctx context.Context, q DB, tenant string, role Role, now time.Time) error {
-	held, err := planned(ctx, q, seeking, func() (bool, error) {
-		var held bool
-		err := q.QueryRow(ctx, `SELECT EXISTS (SELECT FROM rbac_grants WHERE principal = $4 AND tenant = $1 AND role = $2
-			AND role >= 'custom.' AND role < 'custom/' AND (expires_at IS NULL OR expires_at > $3))`,
-			tenant, string(role), now, TenantMembers(tenant).key()).Scan(&held)
-		return held, err
-	})
+	var held bool
+	err := planned(ctx, q, seeking, into(&held), `SELECT EXISTS (SELECT FROM rbac_grants WHERE principal = $4 AND tenant = $1 AND role = $2
+		AND role >= 'custom.' AND role < 'custom/' AND (expires_at IS NULL OR expires_at > $3))`,
+		tenant, string(role), now, TenantMembers(tenant).key())
 	if err != nil || !held {
 		return err
 	}

@@ -252,10 +252,7 @@ func (a *Authorizer) Conflicts(ctx context.Context, tenant string) (_ []Conflict
 	for r := range gives {
 		roles = append(roles, string(r))
 	}
-	// In a transaction, which holds JIT off for the statement (withoutJIT).
-	return snapshot(ctx, a, func(a *Authorizer) ([]Conflict, error) {
-		return a.conflicts(ctx, a.db, tenant, gives, []string{}, roles, true, 0)
-	})
+	return a.conflicts(ctx, a.db, tenant, gives, []string{}, roles, true, 0)
 }
 
 // excludes refuses a change, e, that leaves an identity it reaches able to hold two values of an
@@ -357,12 +354,7 @@ func (a *Authorizer) conflicts(ctx context.Context, q DB, tenant string, gives m
 	if readCustom {
 		given, custom = givenWithCustom, "TRUE"
 	}
-	// The planner can't tell which of targets' branches the seeds reach, so it costs a change's
-	// check as if it read every identity in the tenant, past JIT's thresholds where they are in
-	// groups: compiling then takes a second for a plan that runs in milliseconds.
-	return planned(ctx, q, withoutJIT, func() ([]Conflict, error) {
-		return conflictsIn(ctx, q, given, args, holders, custom, limited)
-	})
+	return conflictsIn(ctx, q, given, args, holders, custom, limited)
 }
 
 // valuesGiven is SQL for the roles giving exclusive values as conflictsIn reads them: with, the
@@ -413,9 +405,31 @@ const customGiving = "ARRAY(SELECT DISTINCT role FROM custom_given)"
 // them, the holders read across the tenant where holders is TRUE, or a role at a time where custom
 // is, and limited its LIMIT clause.
 func conflictsIn(ctx context.Context, q DB, given valuesGiven, args []any, holders, custom, limited string) ([]Conflict, error) {
+	var found []Conflict
+	var c Conflict
+	var who string
+	var held []string
+	scan := func(rows pgx.Rows) error {
+		_, err := pgx.ForEachRow(rows, []any{&who, &c.Dimension, &held}, func() error {
+			c.Principal = Principal{Kind: Public}
+			if who != "" {
+				c.Principal = parsePrincipal(who)
+			}
+			c.Values = make([]Permission, len(held))
+			for i, v := range held {
+				c.Values[i] = Permission(v)
+			}
+			found = append(found, c)
+			return nil
+		})
+		return err
+	}
 	// Each key's values are looked up by key, so a change reads what the identities it reaches
-	// hold, not every value held in the tenant, and stops at the first conflict it finds.
-	rows, err := q.Query(ctx, `
+	// hold, not every value held in the tenant, and stops at the first conflict it finds. The planner
+	// can't tell which of targets' branches the seeds reach, so it costs a change's check as if it
+	// read every identity in the tenant, past JIT's thresholds where they are in groups: compiling
+	// then takes a second for a plan that runs in milliseconds.
+	err := planned(ctx, q, withoutJIT, scan, `
 		WITH RECURSIVE `+given.with+`seeds(k) AS (
 		  SELECT unnest($2::text[]) COLLATE "C"
 		  UNION SELECT principal FROM rbac_grants WHERE `+holders+` AND tenant = $1 AND `+given.held+`
@@ -449,24 +463,5 @@ func conflictsIn(ctx context.Context, q DB, given valuesGiven, args []any, holde
 		)
 		SELECT identity, split_part(value, ':', 1), array_agg(DISTINCT value ORDER BY value) FROM held
 		GROUP BY 1, 2 HAVING count(DISTINCT value) > 1 ORDER BY 1, 2`+limited, args...)
-	if err != nil {
-		return nil, err
-	}
-	var found []Conflict
-	var c Conflict
-	var who string
-	var held []string
-	_, err = pgx.ForEachRow(rows, []any{&who, &c.Dimension, &held}, func() error {
-		c.Principal = Principal{Kind: Public}
-		if who != "" {
-			c.Principal = parsePrincipal(who)
-		}
-		c.Values = make([]Permission, len(held))
-		for i, v := range held {
-			c.Values[i] = Permission(v)
-		}
-		found = append(found, c)
-		return nil
-	})
 	return found, err
 }
