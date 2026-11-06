@@ -429,7 +429,7 @@ func conflictsIn(ctx context.Context, q DB, given valuesGiven, args []any, holde
 	// can't tell which of targets' branches the seeds reach, so it costs a change's check as if it
 	// read every identity in the tenant, past JIT's thresholds where they are in groups: compiling
 	// then takes a second for a plan that runs in milliseconds.
-	err := planned(ctx, q, withoutJIT, scan, `
+	if err := planned(ctx, q, withoutJIT, scan, `
 		WITH RECURSIVE `+given.with+`seeds(k) AS (
 		  SELECT unnest($2::text[]) COLLATE "C"
 		  UNION SELECT principal FROM rbac_grants WHERE `+holders+` AND tenant = $1 AND `+given.held+`
@@ -462,6 +462,9 @@ func conflictsIn(ctx context.Context, q DB, given valuesGiven, args []any, holde
 		  JOIN `+given.pairs+` ON v.role = g.role
 		)
 		SELECT identity, split_part(value, ':', 1), array_agg(DISTINCT value ORDER BY value) FROM held
-		GROUP BY 1, 2 HAVING count(DISTINCT value) > 1 ORDER BY 1, 2`+limited, args...)
-	return found, err
+		GROUP BY 1, 2 HAVING count(DISTINCT value) > 1 ORDER BY 1, 2`+limited, args...); err != nil {
+		// Not those read before it failed, which Conflicts would list as if they were all.
+		return nil, err
+	}
+	return found, nil
 }
