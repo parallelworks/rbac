@@ -9108,7 +9108,7 @@ func TestAConditionalGrantToAGroupReadsOnlyTheConditionalGrantsThere(t *testing.
 						t.Fatal(err)
 					}
 					defer func() { _ = tx.Rollback(ctx) }()
-					planAs(t, tx, plan)
+					planAs(ctx, t, tx, plan)
 					pages := -pagesRead(ctx, t, tx, "rbac_grants")
 					b := rbac.Binding{Role: "cluster.login", Principal: groupOf("target"), Condition: rbac.Condition{Expression: condition}}
 					if err := h.authz.WithTx(tx).Apply(ctx, admin, tenant, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
@@ -9198,7 +9198,7 @@ func TestAGroupsRequirementReadsOnlyTheRequirementsThere(t *testing.T) {
 						t.Fatal(err)
 					}
 					defer func() { _ = tx.Rollback(ctx) }()
-					planAs(t, tx, plan)
+					planAs(ctx, t, tx, plan)
 					rows := -scanned(ctx, t, tx, "rbac_eligibilities")
 					if err := h.authz.WithTx(tx).SetEligibility(ctx, owner, cluster, rbac.Eligibility{
 						Role: "cluster.sudo", Principal: groupOf("target"), MaxDuration: time.Hour, Requires: `request.attributes.level > 9`,
@@ -9265,9 +9265,9 @@ func growing(t *testing.T, crowd bool, tables ...string) *harness {
 }
 
 // planAs has tx's statements planned as plan, a plan_cache_mode, until it ends.
-func planAs(t *testing.T, tx pgx.Tx, plan string) {
+func planAs(ctx context.Context, t *testing.T, tx pgx.Tx, plan string) {
 	t.Helper()
-	if _, err := tx.Exec(t.Context(), `SELECT set_config('plan_cache_mode', $1, true)`, plan); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT set_config('plan_cache_mode', $1, true)`, plan); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -9316,6 +9316,7 @@ func TestAReadLeavesTheHostItsPlannerSettingsWhereItFails(t *testing.T) {
 	secret.Labels = rbac.Label{"level": {"high"}}
 	for name, holders := range map[string]func(t *testing.T, tx pgx.Tx) error{
 		"refused": func(t *testing.T, tx pgx.Tx) error {
+			t.Helper()
 			_, err := h.authz.WithTx(&refusingTx{Tx: tx, sql: "WITH idents AS MATERIALIZED"}).Holders(ctx, login, secret)
 			if err != nil && !strings.Contains(err.Error(), refused) {
 				t.Fatal(err)
@@ -9323,6 +9324,7 @@ func TestAReadLeavesTheHostItsPlannerSettingsWhereItFails(t *testing.T) {
 			return err
 		},
 		"done": func(t *testing.T, tx pgx.Tx) error {
+			t.Helper()
 			call, cancel := context.WithCancel(ctx)
 			defer cancel()
 			// Once the statement reading the values has run.
