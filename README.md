@@ -913,7 +913,7 @@ against, and nothing such a table runs, as its row security policy, runs as hist
   What a rollback doesn't undo stayed, as setting history's id sequence back, after which a row's
   later records are numbered below its earlier ones, and `AsOf` reads it as it was before them. It
   now refuses before it reads a table, or calls a function or an operator its search_path finds.
-  `0027_broad_and_member_seeks` rebuilds `rbac_grants_custom_principal`, the index `Filter`,
+  `0025_broad_and_member_seeks` rebuilds `rbac_grants_custom_principal`, the index `Filter`,
   `Reachable` and `Holders` read the custom roles the public's and the tenant's members' grants
   name by, with a predicate of its own, which their statements name in place of the custom roles'
   index's: so that index, which leads to the tenant alone, serves no plan of them whatever the
