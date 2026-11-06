@@ -3797,10 +3797,11 @@ func TestHoldersReadsOnlyTheHoldersInTheGroupsADenyNames(t *testing.T) {
 	}
 }
 
-// Holders reads the memberships of a large group it lists in no more pages than they fill, and as
-// of a time a few pages for each version it reads: what reads them counts a function's rows as a
-// thousand, and would look each member's up on its own, which as of a time reads its every version.
-func TestHoldersReadsTheMembershipsOfALargeGroupInAsManyPages(t *testing.T) {
+// Holders and Members read the memberships of a large group they list in no more pages than they
+// fill, and Holders as of a time a few pages for each version it reads: what reads them counts a
+// function's rows as a thousand, and would look each member's up on its own, which as of a time
+// reads its every version; and Members, looking each up by its key, read 80,000.
+func TestHoldersAndMembersReadTheMembershipsOfALargeGroupInAsManyPages(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
 	h.groups(t, "everyone")
@@ -3844,6 +3845,13 @@ func TestHoldersReadsTheMembershipsOfALargeGroupInAsManyPages(t *testing.T) {
 	if read, fill := pagesRead(ctx, t, tx, "rbac_memberships")-start, filled("rbac_memberships"); read > 2*fill {
 		t.Errorf("Holders read %d pages of memberships that fill %d", read, fill)
 	}
+	start = pagesRead(ctx, t, tx, "rbac_memberships")
+	if ms, err := h.authz.WithTx(tx).Members(ctx, "t1", "everyone"); err != nil || len(ms) != n {
+		t.Fatalf("Members listed %d of the group's %d: %v", len(ms), n, err)
+	}
+	if read, fill := pagesRead(ctx, t, tx, "rbac_memberships")-start, filled("rbac_memberships"); read > 2*fill {
+		t.Errorf("Members read %d pages of memberships that fill %d", read, fill)
+	}
 	// History as of the time reads each version, and looks its row's up by its key in history's
 	// index of an entity's versions for a later one, which costs a few pages however stale history's
 	// statistics.
@@ -3856,6 +3864,166 @@ func TestHoldersReadsTheMembershipsOfALargeGroupInAsManyPages(t *testing.T) {
 		return err
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A small group whose id other tenants use too, as each can name its own admins, is read alone in a
+// large tenant, in every plan: Holders and Members read only its members' memberships, and
+// DeleteGroup only its row of the groups. Counted by the tenant's selectivity and the id's apart, as
+// if neither told anything of the other, a group of one was counted as a thousand or more, so
+// Holders and Members hashed every membership in the table, every tenant's, and DeleteGroup, asking
+// whether the group exists, read every tenant's groups to find it.
+func TestASmallGroupWhoseIDOtherTenantsUseIsReadAlone(t *testing.T) {
+	manage := rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}
+	// Each of crowded's tenants has groups g1, g2 and g3.
+	h := crowded(t, pgtest.Open(t, ""), func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), manage) })
+	ctx := t.Context()
+	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "boss"))
+	boss := h.as(t, "boss")
+	h.as(t, "u1", "g1")
+	h.groups(t, "g2")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "g1"))
+	exec := func(q string) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	modes := []string{"", "force_custom_plan", "force_generic_plan"}
+	// The pages of the memberships Holders and Members read, and of the groups DeleteGroup reads, in
+	// transactions they roll back.
+	of := map[string]string{"Holders": "memberships", "Members": "memberships", "DeleteGroup": "groups"}
+	read := func() map[string]map[string]int64 {
+		t.Helper()
+		pages := map[string]map[string]int64{}
+		for _, mode := range modes {
+			func() {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				if mode != "" {
+					if _, err := tx.Exec(ctx, `SELECT set_config('plan_cache_mode', $1, true)`, mode); err != nil {
+						t.Fatal(err)
+					}
+				}
+				a := h.authz.WithTx(tx)
+				pages[mode] = map[string]int64{}
+				for _, c := range []struct {
+					what string
+					f    func() error
+				}{
+					{"Holders", func() error {
+						hs, err := a.Holders(ctx, login, cluster)
+						if err == nil && len(hs) != 1 {
+							err = fmt.Errorf("Holders = %+v", hs)
+						}
+						return err
+					}},
+					{"Members", func() error {
+						ms, err := a.Members(ctx, "t1", "g1")
+						if err == nil && len(ms) != 1 {
+							err = fmt.Errorf("Members = %+v", ms)
+						}
+						return err
+					}},
+					{"DeleteGroup", func() error { return a.DeleteGroup(ctx, boss, "t1", "g2") }},
+				} {
+					start := pagesRead(ctx, t, tx, "rbac_"+of[c.what])
+					if err := c.f(); err != nil {
+						t.Fatalf("%s: %v", c.what, err)
+					}
+					pages[mode][c.what] = pagesRead(ctx, t, tx, "rbac_"+of[c.what]) - start
+				}
+			}()
+		}
+		return pages
+	}
+	exec(`ANALYZE rbac_memberships, rbac_members, rbac_groups`)
+	few := read()
+	// 20,000 other members of t1, each in a group of ten of t1's own.
+	exec(`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) SELECT 't1', 'user', 'o' || i FROM generate_series(1, 20000) i`)
+	exec(`INSERT INTO rbac_groups (tenant, id) SELECT DISTINCT 't1', 'o' || (i / 10) FROM generate_series(1, 20000) i`)
+	exec(`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) SELECT 't1', 'o' || (i / 10), 'user', 'o' || i FROM generate_series(1, 20000) i`)
+	exec(`ANALYZE rbac_memberships, rbac_members, rbac_groups`)
+	for mode, pages := range read() {
+		for what, n := range pages {
+			if n > few[mode][what]+deeper {
+				t.Errorf("at plan_cache_mode %q, %s read %d pages of %s beside a few other members of t1, and %d beside 20,000", mode, what, few[mode][what], of[what], n)
+			}
+		}
+	}
+}
+
+// An identity that is a member of many tenants is read alone in a large one, in every plan: GroupsOf
+// and Filter, asking whether it is a member there, read only its membership. Counted by the
+// tenant's selectivity and the identity's apart, its membership was counted as a thousand or more,
+// and EXISTS, planned for the first, read every tenant's memberships to find it.
+func TestAnIdentityInManyTenantsIsReadAlone(t *testing.T) {
+	h := crowded(t, pgtest.Open(t, ""))
+	ctx := t.Context()
+	u := h.as(t, "u", "g1")
+	exec := func(q string) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// u is a member of each of crowded's tenants too, and in each one's g1.
+	exec(`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) SELECT 's' || j, 'user', 'u' FROM generate_series(1, 2000) j`)
+	exec(`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) SELECT 's' || j, 'g1', 'user', 'u' FROM generate_series(1, 2000) j`)
+	modes := []string{"", "force_custom_plan", "force_generic_plan"}
+	// The pages of the memberships each reads, in transactions it rolls back.
+	read := func() map[string]map[string]int64 {
+		t.Helper()
+		pages := map[string]map[string]int64{}
+		for _, mode := range modes {
+			func() {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				if mode != "" {
+					if _, err := tx.Exec(ctx, `SELECT set_config('plan_cache_mode', $1, true)`, mode); err != nil {
+						t.Fatal(err)
+					}
+				}
+				a := h.authz.WithTx(tx)
+				pages[mode] = map[string]int64{}
+				for what, f := range map[string]func() error{
+					"GroupsOf": func() error {
+						groups, err := a.GroupsOf(ctx, "t1", u.Principal)
+						if err == nil && !slices.Equal(groups, []string{"g1"}) {
+							err = fmt.Errorf("GroupsOf = %v", groups)
+						}
+						return err
+					},
+					"Filter": func() error {
+						return second(a.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1))
+					},
+				} {
+					start := pagesRead(ctx, t, tx, "rbac_memberships")
+					if err := f(); err != nil {
+						t.Fatalf("%s: %v", what, err)
+					}
+					pages[mode][what] = pagesRead(ctx, t, tx, "rbac_memberships") - start
+				}
+			}()
+		}
+		return pages
+	}
+	exec(`ANALYZE rbac_memberships, rbac_members`)
+	few := read()
+	exec(`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) SELECT 't1', 'user', 'o' || i FROM generate_series(1, 20000) i`)
+	exec(`ANALYZE rbac_memberships, rbac_members`)
+	for mode, pages := range read() {
+		for what, n := range pages {
+			if n > few[mode][what]+deeper {
+				t.Errorf("at plan_cache_mode %q, %s read %d pages of memberships beside a few other members of t1, and %d beside 20,000", mode, what, few[mode][what], n)
+			}
+		}
 	}
 }
 
@@ -4568,6 +4736,81 @@ func TestSearchesReadAsMuchOnceAConnectionPlansThemGenerically(t *testing.T) {
 				}
 			}
 		}()
+	}
+}
+
+// Filter, Reachable and Holders read as much of the grants in every plan whatever their statistics
+// count: by statistics from before the tenant granted custom roles to its users, as autovacuum
+// leaves them until a tenth of the grants are new, or by none, as after a restore, every plan read
+// which custom roles the public's and the members' grants name through the custom roles' index on
+// the tenant alone, which the planner counted as holding a few, every grant of one in the tenant, to
+// anyone and on any type, once for each broad key and type or scope.
+func TestSearchesReadTheBroadGrantsOfCustomRolesAsMuchWhateverTheStatistics(t *testing.T) {
+	volumes := rbac.RoleDefinition{ID: "volume.admin", Permissions: []rbac.Permission{"volume:view"}, ResourceTypes: []string{"volume"}}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), volumes) })
+	ctx := t.Context()
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Autovacuum would analyze the grants again.
+	exec(`ALTER TABLE rbac_grants SET (autovacuum_enabled = off)`)
+	c0 := hostTable(t, h)[0]
+	u := h.as(t, "u")
+	h.seed(t, grant(c0.Scope(), "cluster.login", rbac.User, "u"))
+	// Others' grants on volumes, which no search of clusters reads.
+	exec(`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		SELECT 't1', 'volume', 'v' || i, 'user', 'o' || (i % 2000), 'volume.admin' FROM generate_series(1, 20000) i`)
+	exec(`INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+		SELECT 't1', 'custom.r' || i, '{volume:view}', '{volume}' FROM generate_series(1, 100) i`)
+	exec(`ANALYZE rbac_grants`)
+	// Under a tenth of the grants.
+	exec(`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		SELECT 't1', 'volume', 'r' || i, 'user', 'o' || (i % 2000), 'custom.r' || (i % 100 + 1) FROM generate_series(1, 2000) i`)
+	modes := []string{"", "force_custom_plan", "force_generic_plan"}
+	read := func() map[string]map[string]int64 {
+		t.Helper()
+		pages := map[string]map[string]int64{}
+		for _, mode := range modes {
+			func() {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				if mode != "" {
+					if _, err := tx.Exec(ctx, `SELECT set_config('plan_cache_mode', $1, true)`, mode); err != nil {
+						t.Fatal(err)
+					}
+				}
+				pages[mode] = customSearches(ctx, t, tx, h.authz.WithTx(tx), u, c0)
+			}()
+		}
+		return pages
+	}
+	stale := read()
+	// None, as for a table never analyzed.
+	if err := h.pool.QueryRow(ctx, `SELECT count(pg_clear_relation_stats(current_schema()::text, c.relname::text))
+		FROM pg_class c WHERE c.oid = 'rbac_grants'::regclass OR c.oid IN (SELECT indexrelid FROM pg_index WHERE indrelid = 'rbac_grants'::regclass)`).Scan(new(int)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.pool.QueryRow(ctx, `SELECT count(pg_clear_attribute_stats(current_schema()::text, 'rbac_grants', attname, false))
+		FROM pg_attribute WHERE attrelid = 'rbac_grants'::regclass AND attnum > 0 AND NOT attisdropped`).Scan(new(int)); err != nil {
+		t.Fatal(err)
+	}
+	none := read()
+	exec(`ANALYZE rbac_grants`)
+	fresh := read()
+	for _, mode := range modes {
+		for what, n := range fresh[mode] {
+			for by, pages := range map[string]map[string]map[string]int64{"from before the grants of custom roles": stale, "of none": none} {
+				if read := pages[mode][what]; read > n*3/2+deeper {
+					t.Errorf("at plan_cache_mode %q, %s read %d pages of grants by statistics %s, and %d by fresh ones", mode, what, read, by, n)
+				}
+			}
+		}
 	}
 }
 

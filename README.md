@@ -268,8 +268,16 @@ scopes conditional ones reach, to check one by one.
   A kind's attributes, the subject's, the resource's or the request's, holding anything else,
   however deep, can't be read as a whole, as a policy engine fails input it can't read: every
   condition reading any of them fails, `has()` and `in` included, and so does one keying a map by
-  them, finding them in a map, or comparing, or finding in a list, a list or a map holding them, so a
-  grant's gives nothing and a deny's applies, while the other kinds' are read. Every kind's that
+  them, comparing them or finding them in a list, building a list or a map holding them, as
+  `[subject.attributes]`, whatever reads it, or reading the `subject`, the `resource` or the
+  `request` holding them whole, as comparing it or `size()` does, rather than by a field's name,
+  so a grant's gives nothing and a deny's applies, while the other kinds' are read. Built, a list
+  holding them was decided by its size or another value it held, so `[subject.attributes] != []`
+  held, and `[subject.attributes, 1] == [{}, 2]` failed for these but was false for a kind whose
+  declared attribute was passed as another type; it fails for both. A map literal naming a key
+  twice fails too, whatever it holds: CEL builds it holding the value named last, dropping the one
+  before unread, so `{"a": subject.attributes, "a": 1}.a == 1` held where
+  `{"a": 1, "a": subject.attributes}.a == 1` failed. Every kind's that
   can't be read are the same value, so a map hashed them as one: past what a check converts, below,
   `request.attributes in {subject.attributes: true}` held, and a deny guarded by its negation
   lifted. So do those holding a `ref.Val` of the host's
@@ -290,8 +298,14 @@ scopes conditional ones reach, to check one by one.
   them, and a value the resource's share with them included again, as the resource's are converted
   apart, counted as reading them costs a condition, one for each value and a tenth of each string's,
   bytes', JSON number's, JSON text's or `Any`'s type URL's length, and half an `Any`'s packed bytes,
-  about a map of 50,000 short strings: past that every condition reading an attribute fails, as it
-  does where JSON text may hold more, by its brackets, braces, commas and colons. Converting stops
+  but what building a value costs where that is more: 8 for each map, `Struct` or JSON object, and 4
+  for each list, `ListValue` or JSON array, each pointer, but to a message, and each other message.
+  That is about a map of 50,000 short strings, nearly 16,000 maps of one entry each, or nearly
+  40,000 timestamps, and a unit costs about what reading one does, so a check spends no more
+  converting than its conditions may reading, about 20 ms: each map charged one, as a number is, a
+  check of a resource whose tags held 156,000
+  empty maps took 108 ms. Past that every condition reading an attribute fails, as it does where
+  JSON text may cost more, by its brackets, braces, commas and colons. Converting stops
   10,000 deep, so what a kind nesting deeper is charged, and whether the kinds after it fit, can
   turn on the order a map's entries come in, failing closed, and nothing else turns on that order,
   nor on the order of the kinds. The subject's, the
@@ -300,11 +314,21 @@ scopes conditional ones reach, to check one by one.
   an attribute gives nothing and a deny's applies, whoever asks: bound what users may store, or pass
   conditions only what they read. A call reads the subject's and the request's as its first check
   converted them: change none of them while it runs, as from a hook, as a check after the change can
-  read them as they were, though never another value as one of them. Comparing a value
-  holding a double that isn't finite fails, in a list or a map too. Each condition runs within the
-  most evaluating it can cost, which its literals and types bound: little for comparing what a
-  request passes with literals, or with the ids, kinds, types and tenant a check passes or its
-  action, which are no longer than `MaxID`, and all a condition may for reading the size of, or
+  read them as they were, though never another value as one of them. Comparing a double that isn't
+  finite fails, and no list or map a condition reads holds one: building a list or a map holding one
+  fails, and an attribute holding one, however deep, is refused, as a declared double that isn't
+  finite is, failing whatever reads it, and whatever reads its kind whole; and where no
+  declarations cover the kind, none of its attributes can be read, as where they hold anything
+  else: refused by name alone, a deny's
+  `request.attributes.region == "eu" && request.attributes.risk > 0.5` lifted outside the EU for an
+  infinite risk, where the same infinity as JSON text, `1e400`, applied it. Comparing reads the
+  smaller value whole and the larger only as far, so a list holding
+  one beside a long string was compared by the string: `[0.0 / 0.0, "<long>"] != [1, 2]` held, as
+  did `request.attributes.scores != [1, 2]` where the request's scores held NaN beside one. Each
+  condition runs within the most evaluating it can cost, which its literals and types bound: little
+  for comparing what a request passes with literals, or with the ids, kinds, types and tenant a
+  check passes or its action, which are no longer than `MaxID`, and all a condition may for reading
+  the size of, or
   looping over, a list the request passes, or for looking up a key the request passes in a map,
   which hashes the key whole, as
   `{"dev": 1, "prod": 2}[resource.attributes.env]` does. A list literal costs 1 more for each
@@ -365,9 +389,20 @@ scopes conditional ones reach, to check one by one.
   may cost and is now bounded as the timestamp it is, a few units. Attributes holding JSON text or
   a packed message that sets a key twice, JSON text that isn't UTF-8 or escapes half a surrogate
   pair, or a `json.Number` JSON doesn't write, were read and now can't be, failing every condition
-  reading their kind. Going back to an
-  earlier release of this package does the same where that release bounds a shape more, so while
-  replicas of two releases run side by side, those
+  reading their kind. Attributes holding maps, lists, pointers or messages are charged what building
+  them costs, so ones a check converted before can be past what it converts now, as 80,000 empty
+  maps are, failing every condition reading an attribute, and past what a hook's copy holds, so a
+  call asking a constraint about them, or `ValidateGrant` about an actor holding them, is refused
+  whatever grants it; and a condition building a list or a map holding attributes no condition can
+  read, or reading the `subject`, the `resource` or the `request` holding them whole, as one
+  deciding a label value or a power to release reads the `resource`, was decided without them and
+  now fails. So does one building a list or a map holding a double that isn't finite, as
+  `has({"k": 0.0 / 0.0}.k)`, or a map naming a key twice, which keys a condition computes can do
+  only as it runs, as `{subject.id: 1, "admin": 2}` does for the subject `admin`; and where no
+  declarations cover a kind, so does every condition reading its attributes where one holds such a
+  double, however deep: it read the others, and that one too, as `has()` and `size()` did. Going
+  back to an earlier release of this package does the same where that release bounds a shape more,
+  so while replicas of two releases run side by side, those
   bounding a shape more may refuse changes adding a condition to a scope the others filled. To
   hand a permission on, the actor holds it unconditionally or under the same condition, one that
   doesn't read the subject: that one decides for each holder, so the actor's holding says nothing
@@ -931,6 +966,18 @@ against, and nothing such a table runs, as its row security policy, runs as hist
   What a rollback doesn't undo stayed, as setting history's id sequence back, after which a row's
   later records are numbered below its earlier ones, and `AsOf` reads it as it was before them. It
   now refuses before it reads a table, or calls a function or an operator its search_path finds.
+  `0025_broad_and_member_seeks` rebuilds `rbac_grants_custom_principal`, the index `Filter`,
+  `Reachable` and `Holders` read the custom roles the public's and the tenant's members' grants
+  name by, with a predicate of its own, which their statements name in place of the custom roles'
+  index's: so that index, which leads to the tenant alone, serves no plan of them whatever the
+  statistics, where by statistics from before a tenant granted custom roles, or with none, they read
+  every grant of one in the tenant through it. It locks `rbac_grants` until it commits, so checks,
+  lists and changes wait for the rebuild. Code from before it names the old predicate, which the
+  index no longer serves, so until every replica runs this release their searches read those grants
+  through another index, as the statistics have the planner pick. It also replaces
+  `rbac_group_members`, which keeps its owner and who may execute it and takes no lock on the
+  tables, to read a group's members and then their memberships planned for their number, so
+  `Holders` of any release reads a small group's members alone whatever other tenants call theirs.
   `0026_conditional_seeks` builds an index of conditional grants on `rbac_grants` and one of the
   eligibilities with a requirement on `rbac_eligibilities`, the eligibilities' first, as most
   changes writing both write them first, which keep writes to each table waiting until it commits,
