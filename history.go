@@ -265,9 +265,11 @@ const (
 )
 
 // PruneHistory deletes from history, on db, records that an export has read past and that later
-// ones supersede, and returns how many. Of each row it keeps the last version at or before before,
-// so AsOf answers as it did for any time from then on, and refuses an earlier one, and it removes
-// every version of a row whose last one then was its delete or expiry, unless an earlier one stays.
+// ones supersede, and returns how many. Of each row it keeps the last version counted by before, as
+// AsOf counts it, so AsOf answers as it did for any time from then on, and refuses an earlier one,
+// and it removes every version of a row whose last one then was its delete or expiry, unless an
+// earlier one stays; and a transaction's commit record, which History returns with its records
+// rather than as one, once none of its other records stays, which it counts among those it deleted.
 // It deletes nothing at or past through, the cursor of the last export the host has checkpointed,
 // so that export goes on from it, and it records in history each of its transactions that deleted
 // any, with the last record it deleted in History's order: one that deleted none changed nothing,
@@ -378,13 +380,21 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', 'on', true)`); err != nil {
 		return 0, nil, err
 	}
-	// Of each row's versions at or before the time, the last, by when it was written, as AsOf
-	// orders them, stays unless it ended the row. An end goes only with every version before it:
-	// one that stays, as one the export hasn't read or one dated later but written first, as
-	// history written before its versions were dated in order can hold, would otherwise be the
-	// last AsOf finds. Each record is judged by its own row's versions, not every row's, and only
-	// those of the window, the next MaxPrune records by id, so a transaction reads no more of
-	// history however few records it finds to delete.
+	// Whether h ends its row, and no version before it stays.
+	ended := `h.op IN ('delete', 'expire') AND NOT EXISTS (
+		SELECT FROM ` + history + ` s
+		WHERE s.tenant = h.tenant AND s.entity = h.entity AND s.key = h.key AND s.id < h.id
+		  AND (s.id <= $5 OR NOT (` + counts(history, "s", "$1") + `) OR (s.txid, s.id) >= ($2::pg_catalog.xid8, $3)))`
+	// Of each row's versions counted by the time, as AsOf counts them (counts), the last, by when it
+	// was written, as AsOf orders them, stays unless it ended the row. An end goes only with every
+	// version before it: one that stays, as one the export hasn't read or one counted later but
+	// written first, as history written before its versions were dated in order can hold, would
+	// otherwise be the last AsOf finds. Each record is judged by its own row's versions, not every
+	// row's, and only those of the window, the next MaxPrune records by id, so a transaction reads no
+	// more of history however few records it finds to delete: each is tested for a later one counted
+	// by then as AsOf tests it (later), whatever their dates. A commit record goes once no other
+	// record of its transaction stays, which the window holds or one before it held, as it is the
+	// transaction's last: a version that stays counts from it.
 	//
 	// The window's record is written in the statement that deletes, and only where it deleted any. It
 	// holds the last record it deleted in History's order, before which History refuses the cursor of
@@ -399,23 +409,31 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 	// deleted, as a prune of the same that deleted some of them meanwhile leaves fewer to delete,
 	// and the rest of the window, which it never judged, is the next's. The window's record and the
 	// call go on from the same.
+	//
+	// Each window is planned for its arguments, as an unnamed statement: as a connection's named
+	// one, after five windows one plan, made for no window's arguments, served each, and once
+	// history's statistics changed, the next window was planned twice, to choose between them. Not
+	// by plan_cache_mode, under which history's triggers plan their statements again for every
+	// record deleted.
 	if err := tx.QueryRow(ctx, `
 		WITH win AS (
 		  SELECT max(id) AS last FROM (SELECT id FROM `+history+` WHERE id > $5 ORDER BY id LIMIT $6) w
-		), doomed AS (
+		), versions AS (
 		  SELECT h.id FROM `+history+` h
-		  WHERE h.id > $5 AND h.id <= (SELECT last FROM win) AND h.effective_at <= $1 AND (h.txid, h.id) < ($2::pg_catalog.xid8, $3)
-		    AND h.entity <> 'history'
-		    AND (EXISTS (
-		      SELECT FROM `+history+` n
-		      WHERE n.tenant = h.tenant AND n.entity = h.entity AND n.key = h.key AND n.effective_at <= $1 AND n.id > h.id)
-		    OR h.op IN ('delete', 'expire') AND NOT EXISTS (
-		      SELECT FROM `+history+` s
-		      WHERE s.tenant = h.tenant AND s.entity = h.entity AND s.key = h.key AND s.id < h.id
-		        AND (s.id <= $5 OR s.effective_at > $1 OR (s.txid, s.id) >= ($2::pg_catalog.xid8, $3))))
+		  WHERE h.id > $5 AND h.id <= (SELECT last FROM win) AND (h.txid, h.id) < ($2::pg_catalog.xid8, $3)
+		    AND h.entity NOT IN ('history', 'commit') AND h.effective_at <= $1
+		    AND h.txid IS DISTINCT FROM pg_catalog.pg_current_xact_id_if_assigned()
+		    AND CASE WHEN `+later(history, "h", "h.entity", "$1")+` IS NOT NULL THEN `+committedBy(history, "h", "$1")+`
+		      ELSE `+byCommit(history, "h", writtenLater(history, "h", "h.entity", "$1")+" OR "+ended, ended+" AND c.at <= $1")+` END
+		), commits AS (
+		  SELECT c.id FROM `+history+` c
+		  WHERE c.id > $5 AND c.id <= (SELECT last FROM win) AND (c.txid, c.id) < ($2::pg_catalog.xid8, $3) AND c.entity = 'commit'
+		    AND NOT EXISTS (SELECT FROM `+history+` o WHERE o.txid = c.txid AND o.entity <> 'commit' AND o.id NOT IN (SELECT id FROM versions))
+		), doomed AS (
 		  -- A batch, oldest first: of a row, its end goes after every version before it, so a
-		  -- batch that stops between them leaves the end, which still reads as the row's.
-		  ORDER BY h.id LIMIT $4
+		  -- batch that stops between them leaves the end, which still reads as the row's; and a
+		  -- commit record after every other record of its transaction.
+		  SELECT id FROM (SELECT id FROM versions UNION ALL SELECT id FROM commits) d ORDER BY id LIMIT $4
 		), pruned AS (
 		  -- By id, from the batch: a join could read all of history to find it.
 		  DELETE FROM `+history+` WHERE id = ANY (ARRAY(SELECT id FROM doomed)) RETURNING txid, id
@@ -433,7 +451,7 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 		  FROM latest l
 		)
 		SELECT (SELECT count(*) FROM pruned), (SELECT id FROM reach)`,
-		before, through.TxID, through.ID, most, from, maxPrune).Scan(&n, &next); err != nil {
+		pgx.QueryExecModeCacheDescribe, before, through.TxID, through.ID, most, from, maxPrune).Scan(&n, &next); err != nil {
 		return 0, nil, err
 	}
 	// Under a host's transaction, which goes on past the prune.
@@ -462,7 +480,7 @@ type Record struct {
 	// RecordedAt is when it was written, and EffectiveAt when it took effect: when the statement
 	// that made it began, or its transaction, where that began later, as one a procedure that
 	// commits as it goes starts does; or for an expiry, when it expired; but never before the row's
-	// record before it.
+	// record before it. AsOf counts it from CommittedAt where that is later.
 	RecordedAt, EffectiveAt time.Time
 	Tenant                  string
 	// Entity is what changed: grant, role, deny, eligibility, membership, group or member, or
@@ -496,6 +514,13 @@ type Record struct {
 	Request    string
 	Reason     string
 	DBUser     string
+	// CommittedAt is when its transaction committed, as history records each transaction that
+	// changes the package's tables as it commits, which AsOf counts the change from where it is
+	// after EffectiveAt: no other session sees a change before then. It is zero for a record of a
+	// transaction that committed before history recorded commits, from migration 0027_commit_dates
+	// on, whose change counts from EffectiveAt, and for a prune's, as a transaction that only
+	// prunes records no commit.
+	CommittedAt time.Time
 }
 
 // The instants a Record reads PostgreSQL's infinity and -infinity as, which no time it holds is.
@@ -605,6 +630,9 @@ var maxUnsized = 100
 // twice, as when a host retries a read whose result it lost: dedupe on ID and RecordedAt, since a
 // restore can give another record the ID of one it lost.
 //
+// A transaction's commit record it returns as each of the transaction's records' CommittedAt, not
+// as a record.
+//
 // It reads the primary, and fails on a replica, which can't tell which timeline it follows until
 // long after a failover. A failover or a recovery to a point in time starts a new generation, and
 // a restore that starts none, as from a disk snapshot, loses what came after it: either can use
@@ -665,6 +693,7 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 		rows, err := tx.Query(ctx, `
 			SELECT id, txid, recorded_at, effective_at, tenant, entity, key, op, coalesce(principal, ''), coalesce(role, ''),
 			  coalesce(scope, ''), coalesce(group_id, ''), expires_at, before, after, actor, on_behalf_of, how, request, reason, db_user,
+			  (SELECT max(c.effective_at) FROM `+historyTable(schema)+` c WHERE c.entity = 'commit' AND c.txid = p.txid),
 			  $6::boolean AND `+prunedPast(historyTable(schema), "$1::pg_catalog.xid8", "$2", "$7::pg_catalog.xid8")+`,
 			  pg_snapshot_xmin(pg_current_snapshot())
 			FROM (
@@ -681,7 +710,7 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 			    SELECT h.*, count(*) FILTER (WHERE h.bytes IS NULL) OVER (ORDER BY h.txid, h.id ROWS UNBOUNDED PRECEDING) AS unsized
 			    FROM (
 			      SELECT * FROM `+historyTable(schema)+`
-			      WHERE (txid, id) > ($1::pg_catalog.xid8, $2) AND txid < pg_snapshot_xmin(pg_current_snapshot())
+			      WHERE (txid, id) > ($1::pg_catalog.xid8, $2) AND txid < pg_snapshot_xmin(pg_current_snapshot()) AND entity <> 'commit'
 			        AND ($6::boolean OR NOT `+unsettled(historyTable(schema))+`)
 			      ORDER BY txid, id LIMIT $3
 			    ) h
@@ -698,11 +727,11 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 		records, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (Record, error) {
 			var r Record
 			var principal, role, scope, actor, onBehalfOf string
-			var recorded, effective, expires pgtype.Timestamptz
+			var recorded, effective, expires, committed pgtype.Timestamptz
 			var before, afterRow []byte
 			err := row.Scan(&r.ID, &r.TxID, &recorded, &effective, &r.Tenant, &r.Entity, &r.Key, &r.Op, &principal, &role,
-				&scope, &r.Group, &expires, &before, &afterRow, &actor, &onBehalfOf, &r.How, &r.Request, &r.Reason, &r.DBUser, &skipped, &oldest)
-			r.RecordedAt, r.EffectiveAt, r.ExpiresAt = recordTime(recorded), recordTime(effective), recordTime(expires)
+				&scope, &r.Group, &expires, &before, &afterRow, &actor, &onBehalfOf, &r.How, &r.Request, &r.Reason, &r.DBUser, &committed, &skipped, &oldest)
+			r.RecordedAt, r.EffectiveAt, r.ExpiresAt, r.CommittedAt = recordTime(recorded), recordTime(effective), recordTime(expires), recordTime(committed)
 			r.Principal, r.Scope, r.Actor, r.OnBehalfOf = parsePrincipal(principal), parseScope(scope), parsePrincipal(actor), parsePrincipal(onBehalfOf)
 			r.Role, r.Before, r.After = Role(role), before, afterRow
 			return r, err

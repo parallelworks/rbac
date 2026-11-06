@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/rbac"
@@ -29,21 +30,36 @@ func dbNow(t *testing.T, h *harness) time.Time {
 	return now
 }
 
+// committedAt is when the transaction that wrote the record where finds committed, as its commit
+// record says, which AsOf counts its changes from.
+func committedAt(t *testing.T, h *harness, where string) time.Time {
+	t.Helper()
+	var at time.Time
+	if err := h.pool.QueryRow(t.Context(), `SELECT c.effective_at FROM rbac_history c
+		WHERE c.entity = 'commit' AND c.txid = (SELECT txid FROM rbac_history WHERE `+where+`)`).Scan(&at); err != nil {
+		t.Fatal(err)
+	}
+	return at
+}
+
 func TestAsOfReadsATenantAsItWas(t *testing.T) {
 	h, guardian := guarded(t)
 	ctx := t.Context()
 	u, v := h.as(t, "u", "sre"), h.as(t, "v")
 	h.groups(t, "sre")
 	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"), grant(cluster.Scope(), "cluster.sudo", rbac.Group, "sre"))
-	// x's login expires between the two times. Then is when its grant's statement began, which
-	// history dates the grant by, and its expiry is set from that same instant, so however slow the
-	// machine, then is before it.
+	// x's login expires between the two times. Then is when its grant's transaction committed,
+	// which AsOf counts the grant from, and its expiry is 200 ms after its statement began.
 	x := h.as(t, "x")
-	var then, expires time.Time
+	var expires time.Time
 	if err := h.pool.QueryRow(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
 		VALUES ('t1', 'cluster', 'c1', 'user', 'x', 'cluster.login', statement_timestamp() + interval '200 milliseconds')
-		RETURNING statement_timestamp(), expires_at`).Scan(&then, &expires); err != nil {
+		RETURNING expires_at`).Scan(&expires); err != nil {
 		t.Fatal(err)
+	}
+	then := committedAt(t, h, `entity = 'grant' AND principal = 'user:x'`)
+	if !then.Before(expires) {
+		t.Fatalf("x's grant committed at %v, once it had expired at %v", then, expires)
 	}
 	// Since: u left sre, a deny took login from u, and v was granted login.
 	if _, err := h.pool.Exec(ctx, `DELETE FROM rbac_members WHERE principal = 'user:u'`); err != nil {
@@ -609,11 +625,11 @@ func TestAsOfReadsARevokeInAnOlderTransactionAfterItsGrant(t *testing.T) {
 	}
 }
 
-// A procedure or a DO block that commits as it goes starts a transaction with each COMMIT: what one
-// of its later transactions changes counts from when that transaction began, not the block, so as
-// of a moment while an earlier one ran, every transaction then running having ended before the
-// change was made, a revoke and a move read as yet to come. A delete is an expiry, and a row an
-// update moves ended with its expiry, where the row had expired by when the change took effect.
+// A procedure or a DO block that commits as it goes starts a transaction with each COMMIT: what each
+// changes counts from when it commits, not the block's start, so as of a moment while the first ran,
+// its own grant reads as yet to come, and a revoke and a move of a later one too. A delete is an
+// expiry, and a row an update moves ended with its expiry, where the row had expired by when the
+// change took effect.
 func TestAsOfCountsAChangeInABlockThatCommitsFromItsOwnTransaction(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -646,9 +662,16 @@ func TestAsOfCountsAChangeInABlockThatCommitsFromItsOwnTransaction(t *testing.T)
 	}
 	during := began.Add(50 * time.Millisecond)
 	if err := h.authz.AsOf(ctx, "t1", during, func(a *rbac.Authorizer) error {
-		for _, s := range []rbac.Subject{u, v} {
-			if err := a.Authorize(ctx, s, login, cluster); err != nil {
-				t.Errorf("as of %v, while the block's first transaction ran, %s's login: %v", during, s.Principal.ID, err)
+		for _, c := range []struct {
+			s    rbac.Subject
+			held bool
+		}{{u, true}, {v, false}} {
+			err := a.Authorize(ctx, c.s, login, cluster)
+			if err != nil && !errors.Is(err, rbac.ErrDenied) {
+				return err
+			}
+			if (err == nil) != c.held {
+				t.Errorf("as of %v, while the block's first transaction ran, %s's login: %v", during, c.s.Principal.ID, err)
 			}
 		}
 		ms, err := a.Memberships(ctx, "t1", []rbac.Principal{w, x})
@@ -764,6 +787,12 @@ func TestAsOfChecksSeekTheirSubjectsGrantsOnThePath(t *testing.T) {
 				"Permissions": func() error { return second(a.Permissions(ctx, u, cluster)) },
 				"Grantable":   func() error { return second(a.Grantable(ctx, u, cluster)) },
 			} {
+				// Once before, as the calls share statements, which the first to run plans: planning
+				// reads the metapage of each empty index of history for each time a statement names
+				// it, which a later call, as each call in a map's random order can be, doesn't.
+				if err := f(); err != nil {
+					return fmt.Errorf("%s: %w", what, err)
+				}
 				start := historyPages(ctx, t, tx)
 				if err := f(); err != nil {
 					return fmt.Errorf("%s: %w", what, err)
@@ -2039,10 +2068,8 @@ func TestAsOfReadsItsTimeWhateverTheSessionsDateStyle(t *testing.T) {
 	ctx := t.Context()
 	u := h.as(t, "u")
 	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
-	var granted time.Time
-	if err := h.pool.QueryRow(ctx, `SELECT effective_at FROM rbac_history WHERE entity = 'grant' AND principal = 'user:u'`).Scan(&granted); err != nil {
-		t.Fatal(err)
-	}
+	// When the grant's transaction committed, which AsOf counts it from.
+	granted := committedAt(t, h, `entity = 'grant' AND principal = 'user:u'`)
 	for _, c := range []struct{ dateStyle, timeZone, inRead string }{
 		{"ISO, MDY", "UTC", ""},
 		{"Postgres, DMY", "America/Los_Angeles", ""},
@@ -2080,6 +2107,300 @@ func TestAsOfReadsItsTimeWhateverTheSessionsDateStyle(t *testing.T) {
 					t.Errorf("%s, %s, %s: as of %v, granted at %v: %v", c.dateStyle, c.timeZone, c.inRead, at, granted, held)
 				}
 			}()
+		}
+	}
+}
+
+// A change counts from its transaction's commit, before which no other session sees it: a revoke
+// that a host's transaction makes and then holds open, as while it calls another service, reads as
+// of a moment then as every check then read it, the grant still held, and a grant so held as not yet
+// made. Every transaction that had begun by then has ended, so what that moment reads is final.
+func TestAsOfCountsAChangeFromItsCommit(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	owner, u, v := h.as(t, "owner"), h.as(t, "u"), h.as(t, "v")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := h.authz.WithTx(tx).Apply(ctx, owner, cluster, rbac.Change{
+		Revoke: []rbac.Binding{{Role: "cluster.login", Principal: u.Principal}},
+		Grant:  []rbac.Binding{{Role: "cluster.login", Principal: v.Principal}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	mid := dbNow(t, h)
+	h.now = mid
+	for _, c := range []struct {
+		s    rbac.Subject
+		held bool
+	}{{u, true}, {v, false}} {
+		if err := h.authz.Authorize(ctx, c.s, login, cluster); (err == nil) != c.held {
+			t.Fatalf("a check of %s while the change is uncommitted: %v", c.s.Principal.ID, err)
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for at, held := range map[time.Time]map[string]bool{mid: {"u": true, "v": false}, dbNow(t, h): {"u": false, "v": true}} {
+		if err := h.authz.AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+			for _, s := range []rbac.Subject{u, v} {
+				err := a.Authorize(ctx, s, login, cluster)
+				if err != nil && !errors.Is(err, rbac.ErrDenied) {
+					return err
+				}
+				if (err == nil) != held[s.Principal.ID] {
+					t.Errorf("as of %v, %s's login: %v", at, s.Principal.ID, err)
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// The package's own transaction commits once Config.OnChange returns: a revoke whose hook takes a
+// while counts from after it, as checks meanwhile read the grant held.
+func TestAsOfCountsAChangeFromItsCommitAfterItsHook(t *testing.T) {
+	var slow func()
+	h := setup(t, func(c *rbac.Config) {
+		c.OnChange = func(context.Context, pgx.Tx, rbac.ChangeEvent) error {
+			if slow != nil {
+				slow()
+			}
+			return nil
+		}
+	})
+	ctx := t.Context()
+	owner, u := h.as(t, "owner"), h.as(t, "u")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	var mid time.Time
+	var during error
+	slow = func() {
+		time.Sleep(50 * time.Millisecond)
+		if err := h.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&mid); err != nil {
+			t.Error(err)
+		}
+		h.now = mid
+		during = h.authz.Authorize(ctx, u, login, cluster)
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := h.authz.Apply(ctx, owner, cluster, rbac.Change{Revoke: []rbac.Binding{{Role: "cluster.login", Principal: u.Principal}}}); err != nil {
+		t.Fatal(err)
+	}
+	slow = nil
+	if during != nil {
+		t.Fatalf("a check while the revoke's hook ran: %v", during)
+	}
+	if err := h.authz.AsOf(ctx, "t1", mid, func(a *rbac.Authorizer) error { return a.Authorize(ctx, u, login, cluster) }); err != nil {
+		t.Errorf("as of %v, while the revoke's hook ran, u's login: %v", mid, err)
+	}
+}
+
+// A session that may write the package's tables, as the application's, can fire a transaction's
+// deferred triggers before it commits, with SET CONSTRAINTS ... IMMEDIATE, which takes no privilege,
+// and then hold the transaction open while it uses access it revoked; and code of its own can run
+// as the transaction commits, after its commit record is written: a cursor WITH HOLD, which commit
+// runs to its end, and a deferrable trigger on a temporary table. Each is refused, so a revoke
+// commits only with a commit record dated as it commits, and AsOf reads it from no earlier: one
+// that set constraints immediate in a savepoint it then rolled back counts from its commit.
+func TestHistoryDatesAChangeNoEarlierThanItsCommit(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	u := h.as(t, "u")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	const revoke = `DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:u'`
+	refused := func(err error) bool {
+		var pgErr *pgconn.PgError
+		return errors.As(err, &pgErr) && pgErr.Code == "0A000"
+	}
+	for _, c := range []struct {
+		name          string
+		before, after []string
+	}{
+		{name: "immediate after", after: []string{`SET CONSTRAINTS ALL IMMEDIATE`}},
+		{name: "immediate by name", after: []string{`SET CONSTRAINTS rbac_history_committed IMMEDIATE`}},
+		{name: "immediate before", before: []string{`SET CONSTRAINTS ALL IMMEDIATE`}},
+		{name: "immediate in a block", after: []string{`DO $$ BEGIN SET CONSTRAINTS ALL IMMEDIATE; END $$`}},
+		{name: "cursor", after: []string{`DECLARE held CURSOR WITH HOLD FOR SELECT pg_sleep(0)`}},
+		{name: "temporary trigger", before: []string{
+			`CREATE TEMP TABLE held (a int)`,
+			`CREATE FUNCTION pg_temp.held() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$`,
+			`CREATE CONSTRAINT TRIGGER held AFTER INSERT ON held DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION pg_temp.held()`,
+		}, after: []string{`INSERT INTO held VALUES (1)`}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			conn, err := pgx.ConnectConfig(ctx, h.pool.Config().ConnConfig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+			var failed error
+			for _, q := range slices.Concat([]string{`BEGIN`}, c.before, []string{revoke}, c.after, []string{`COMMIT`}) {
+				if _, failed = conn.Exec(ctx, q); failed != nil {
+					break
+				}
+			}
+			if !refused(failed) {
+				t.Errorf("a revoke after %s: %v", c.name, failed)
+			}
+			_, _ = conn.Exec(ctx, `ROLLBACK`)
+			if err := h.authz.Authorize(ctx, u, login, cluster); err != nil {
+				t.Fatalf("after a revoke refused: %v", err)
+			}
+		})
+	}
+	// Set immediate in a savepoint rolled back, the revoke is dated as it commits.
+	conn, err := pgx.ConnectConfig(ctx, h.pool.Config().ConnConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	for _, q := range []string{`BEGIN`, revoke, `SAVEPOINT early`} {
+		if _, err := conn.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := conn.Exec(ctx, `SET CONSTRAINTS ALL IMMEDIATE`); !refused(err) {
+		t.Fatalf("set constraints immediate after a revoke: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `ROLLBACK TO SAVEPOINT early`); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	mid := dbNow(t, h)
+	h.now = mid
+	if err := h.authz.Authorize(ctx, u, login, cluster); err != nil {
+		t.Fatalf("a check while the revoke is uncommitted: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, err := conn.Exec(ctx, `COMMIT`); err != nil {
+		t.Fatal(err)
+	}
+	after := dbNow(t, h)
+	for at, held := range map[time.Time]bool{mid: true, after: false} {
+		err := h.authz.AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error { return a.Authorize(ctx, u, login, cluster) })
+		if err != nil && !errors.Is(err, rbac.ErrDenied) {
+			t.Fatal(err)
+		}
+		if (err == nil) != held {
+			t.Errorf("as of %v, u's login: %v", at, err)
+		}
+	}
+}
+
+// Versions of a row dated alike, as every write of a DO block, a function or a query string of
+// several statements is, cost a read as of a time a few pages each, as versions dated apart do:
+// tested for a later one in history's index of an entity's versions, which ordered those of one
+// date by their places, oldest first, each read every one before it, so 4,000 of a membership from
+// one block made a check read 743,745 pages of history, and 4,000 written apart 12,877.
+func TestAsOfReadsVersionsDatedAlikeInAFewPagesEach(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	u := h.as(t, "u", "g")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "g"))
+	const n = 2000
+	if _, err := h.pool.Exec(ctx, fmt.Sprintf(`DO $$ BEGIN FOR i IN 1..%d LOOP
+		UPDATE rbac_memberships SET note = i::text WHERE tenant = 't1' AND principal = 'user:u'; END LOOP; END $$`, n)); err != nil {
+		t.Fatal(err)
+	}
+	var dates int
+	if err := h.pool.QueryRow(ctx, `SELECT count(DISTINCT effective_at) FROM rbac_history WHERE entity = 'membership' AND key = 'user:u'`).Scan(&dates); err != nil || dates > 2 {
+		t.Fatalf("the membership's versions are of %d dates, %v", dates, err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var pages int64
+	if err := h.authz.WithTx(tx).AsOf(ctx, "t1", dbNow(t, h), func(a *rbac.Authorizer) error {
+		start := historyPages(ctx, t, tx)
+		err := a.Authorize(ctx, u, login, cluster)
+		pages = historyPages(ctx, t, tx) - start
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if pages > 10*n {
+		t.Errorf("a check as of now read %d pages of history beside %d versions of its subject's membership dated alike", pages, n)
+	}
+}
+
+// As of a time, a check reads its subject's places in groups by their principal, a list of its
+// groups too, and a list another principal's eligibilities by it, however history's statistics
+// count them and however a session plans: by statistics from before the tenant's places and
+// eligibilities were written, as autovacuum leaves them until a tenth of history is new, a plan read
+// every one in the tenant by history's index of an entity's versions instead, so beside 3,000
+// others' places a check of a subject in one group read 3,098 pages of history, and 65 by fresh
+// statistics.
+func TestAsOfReadsByPrincipalWhateverHistorysStatisticsCount(t *testing.T) {
+	h := crowded(t, pgtest.Open(t, ""))
+	ctx := t.Context()
+	u1 := h.as(t, "u1", "g1")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "g1"))
+	exec := func(q string) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Autovacuum would analyze history as it grows.
+	exec(`ALTER TABLE rbac_history SET (autovacuum_enabled = off)`)
+	// History large before it is analyzed, so what is written after is under a tenth of it.
+	exec(`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		SELECT 'zz', 'cluster', 'x' || i, 'user', 'o' || i, 'cluster.login' FROM generate_series(1, 100000) i`)
+	exec(`ANALYZE rbac_history`)
+	reads := map[string]func(a *rbac.Authorizer) error{
+		"Authorize": func(a *rbac.Authorizer) error { return a.Authorize(ctx, u1, login, cluster) },
+		"GroupsOf":  func(a *rbac.Authorizer) error { return second(a.GroupsOf(ctx, "t1", u1.Principal)) },
+		"Eligibilities": func(a *rbac.Authorizer) error {
+			return second(a.Eligibilities(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{u1.Principal}}))
+		},
+	}
+	read := func() map[string]int64 {
+		t.Helper()
+		pages := map[string]int64{}
+		for _, mode := range []string{"auto", "force_generic_plan", "force_custom_plan"} {
+			for what, f := range reads {
+				func() {
+					tx, err := h.pool.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+					if _, err := tx.Exec(ctx, `SELECT set_config('plan_cache_mode', $1, true)`, mode); err != nil {
+						t.Fatal(err)
+					}
+					if err := h.authz.WithTx(tx).AsOf(ctx, "t1", time.Now(), func(a *rbac.Authorizer) error {
+						start := historyPages(ctx, t, tx)
+						err := f(a)
+						pages[mode+" "+what] = historyPages(ctx, t, tx) - start
+						return err
+					}); err != nil {
+						t.Fatalf("%s %s: %v", mode, what, err)
+					}
+				}()
+			}
+		}
+		return pages
+	}
+	// Others' places in t1's groups, and their eligibilities, a few percent of history.
+	exec(`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) SELECT 't1', 'user', 'o' || i FROM generate_series(1, 3000) i`)
+	exec(`INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'og' || i FROM generate_series(1, 300) i`)
+	exec(`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) SELECT 't1', 'og' || (i % 300 + 1), 'user', 'o' || i FROM generate_series(1, 3000) i`)
+	exec(`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+		SELECT 't1', 'cluster', 'e' || i, 'user', 'o' || i, 'cluster.sudo', 3600 FROM generate_series(1, 300) i`)
+	stale := read()
+	exec(`ANALYZE rbac_history`)
+	for what, analyzed := range read() {
+		if stale[what] > analyzed*3/2+deeper {
+			t.Errorf("as of a time, %s read %d pages of history by statistics from before 3,000 others' places and 300 eligibilities were written, and %d once it was analyzed", what, stale[what], analyzed)
 		}
 	}
 }

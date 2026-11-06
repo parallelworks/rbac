@@ -37,7 +37,7 @@ import (
 func exportAll(t *testing.T, h *harness, signer crypto.Signer) ([]rbac.Record, []rbac.Checkpoint) {
 	t.Helper()
 	var want int
-	if err := h.pool.QueryRow(t.Context(), `SELECT count(*) FROM rbac_history`).Scan(&want); err != nil {
+	if err := h.pool.QueryRow(t.Context(), `SELECT count(*) FROM rbac_history WHERE entity <> 'commit'`).Scan(&want); err != nil {
 		t.Fatal(err)
 	}
 	var records []rbac.Record
@@ -465,7 +465,7 @@ func full() rbac.Record {
 		ID: 1, TxID: 2, RecordedAt: at, EffectiveAt: at.Add(time.Second), Tenant: "t1", Entity: "grant", Key: "k", Op: "update",
 		Principal: ids, Role: "cluster.login", Scope: rbac.Scope{Type: "org", ID: "a:b"}, Group: "ops", ExpiresAt: at.Add(time.Hour),
 		Before: json.RawMessage(`{"a": 1}`), After: json.RawMessage(`{"a": 2}`), Actor: ids, OnBehalfOf: ids,
-		How: "Apply", Request: "r", Reason: "why" + string(utf8.RuneError), DBUser: "app",
+		How: "Apply", Request: "r", Reason: "why" + string(utf8.RuneError), DBUser: "app", CommittedAt: at.Add(2 * time.Second),
 	}
 }
 
@@ -532,11 +532,19 @@ func TestAChainedRecordIsEveryField(t *testing.T) {
 }
 
 // The chain's encoding is fixed, so a checkpoint made with one Go, and verified with another or
-// in another language, holds. A checkpoint without a Horizon is signed as before Cursor had one.
+// in another language, holds. A checkpoint without a Horizon is signed as before Cursor had one,
+// and a record without a CommittedAt, as one of a transaction that committed before history
+// recorded commits, chains as before Record had one.
 func TestTheChainsEncodingIsFixed(t *testing.T) {
 	c := rbac.Genesis("g")
 	genesis := hex.EncodeToString(c.Hash[:])
-	c, err := c.Chain([]rbac.Record{full()})
+	committed, err := c.Chain([]rbac.Record{full()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := full()
+	before.CommittedAt = time.Time{}
+	c, err = c.Chain([]rbac.Record{before})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -546,13 +554,14 @@ func TestTheChainsEncodingIsFixed(t *testing.T) {
 	horizon := c.Digest()
 	got := map[string]string{
 		"genesis": genesis, "link": hex.EncodeToString(c.Hash[:]), "digest": hex.EncodeToString(digest[:]),
-		"horizon": hex.EncodeToString(horizon[:]),
+		"horizon": hex.EncodeToString(horizon[:]), "committed": hex.EncodeToString(committed.Hash[:]),
 	}
 	want := map[string]string{
-		"genesis": "928df9c16fcd6389159e046198b064eedcc7a780dfe164845c5fd47663f081ac",
-		"link":    "4079403bdbf717782762c3391d6a334dcc6f2fbda933e8ae01ffc57e7c16d31e",
-		"digest":  "7dab694ab96cc22d6be1a0dab37af4f06c9cb1931c533e0843ad365ff0a89b8b",
-		"horizon": "c4965b59b9651be1ddd59a15d7b4eb88949af51668d163ee1eeb6f6fc0cb2ce2",
+		"genesis":   "928df9c16fcd6389159e046198b064eedcc7a780dfe164845c5fd47663f081ac",
+		"link":      "4079403bdbf717782762c3391d6a334dcc6f2fbda933e8ae01ffc57e7c16d31e",
+		"digest":    "7dab694ab96cc22d6be1a0dab37af4f06c9cb1931c533e0843ad365ff0a89b8b",
+		"horizon":   "c4965b59b9651be1ddd59a15d7b4eb88949af51668d163ee1eeb6f6fc0cb2ce2",
+		"committed": "2ae926382b3b391249ac8a624910204494a632b3fb47eae0df99d3de9fdaf51f",
 	}
 	if !maps.Equal(got, want) {
 		t.Errorf("%v, not %v", got, want)
@@ -595,7 +604,7 @@ func TestACheckpointVouchesForItsHorizon(t *testing.T) {
 	if behind.Cursor.Horizon == 0 {
 		t.Fatalf("an export from the start has no Horizon: %+v", behind.Cursor)
 	}
-	if n, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h), through); err != nil || n != 4 {
+	if n, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h), through); err != nil || n != 8 {
 		t.Fatalf("PruneHistory = %d, %v", n, err)
 	}
 	if _, _, err := h.authz.Export(ctx, behind, 10, key); !errors.Is(err, rbac.ErrInvalid) {

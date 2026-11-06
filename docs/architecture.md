@@ -1036,15 +1036,32 @@ flowchart LR
   database role that wrote it, and the actor and call it was made through, with what the host
   attached. A change takes effect when its statement began, or its transaction where that began
   later, as in a procedure that commits as it goes, and an expiry when it expired, but never before
-  the row's last record: so none but an expiry, which ends only what reads counted as expired
-  already, takes effect before its transaction began, and what AsOf reads of a time is final once
-  every transaction begun by then has ended. A write that bypassed the package is recorded too, with
-  no actor. The tables bound its row as the package bounds what it writes, but for the ids in a
-  deny's or an eligibility's lists of principals, which they count in characters rather than bytes.
-  A row of more than 1 MiB as jsonb, or a context of more than 1 MiB, fails its write, so no record
-  is one `History` can't return. A row written before history was installed has one record from
-  migrating, its baseline, dated when it was created, or at the epoch where that was before year 1
-  or at its first instant.
+  the row's last record. A write that bypassed the package is recorded too, with no actor. The
+  tables bound its row as the package bounds what it writes, but for the ids in a deny's or an
+  eligibility's lists of principals, which they count in characters rather than bytes. A row of more
+  than 1 MiB as jsonb, or a context of more than 1 MiB, fails its write, so no record is one
+  `History` can't return. A row written before history was installed has one record from migrating,
+  its baseline, dated when it was created, or at the epoch where that was before year 1 or at its
+  first instant.
+- **Commit records.** No other session sees a change before its transaction commits, which a host's
+  transaction, or the package's own while `Config.OnChange` runs, can put off. So each transaction
+  that changes the tables writes, as it commits, a record of when it did (entity and op `commit`, in
+  no tenant), and AsOf counts each change from it, or from the change's own date where that is
+  later. The constraint trigger `rbac_history_committed`, deferred to the commit, runs `rbac_record`
+  as history's role for each record the transaction wrote, and the event of its last, by id, writes
+  the commit record, dated by the clock then. A session can fire deferred triggers early with
+  `SET CONSTRAINTS ... IMMEDIATE` and hold the transaction open: the commit record's own event fires
+  inside the trigger that wrote it, a level deeper than at the commit, so it is refused there, and
+  the transaction with it. A cursor `WITH HOLD` the transaction declared, and a deferrable trigger
+  on a temporary table, would run the session's own code after the commit record as it commits, so a
+  transaction with either is refused too. What runs after it is the rest of the commit: the host's
+  own deferred triggers and constraints, the wait for synchronous replication, and for a prepared
+  transaction, everything until `COMMIT PREPARED`. A transaction that committed before
+  `0027_commit_dates` has none, and its changes count from their own dates. `History` returns no
+  commit record, but each record with its transaction's (`Record.CommittedAt`), which the chain
+  covers as every other field; a prune deletes it with the last of its transaction's other records.
+  What AsOf reads of a time is final once every transaction whose commit record is dated by then is
+  seen by others.
 - **History's order.** `History` reads records in transaction order, by the id each transaction
   takes at its first write, and only those of transactions older than every transaction still
   running, which have all ended. So a cursor never passes a record that commits later. That is
@@ -1108,24 +1125,43 @@ flowchart LR
   Each statement reads history by the rows it names, through
   history's indexes, as a search the custom roles its grants name, by their ids, and its principals'
   grants by principal and type, which history's index of a principal's versions holds beside the
-  scope, as a check seeks them on its resource's path. Each version a view finds is its row's last
-  where its id is at least that of every version of the row dated by then, a test of each on its
-  own, by its key in history's index of an entity's versions, which reads them until the first
-  later one: a few pages for each version, however stale history's statistics. As a join, by
-  statistics from before most of history was written, as autovacuum leaves them until a tenth of
-  it is new, it read every version of the entity in the tenant for each version found, the key
-  only a filter, so a check took seconds; a read of thousands of rows costs more than such a join
-  planned by fresh statistics, which reads their versions together. `Holders` looks each identity's
-  membership of the tenant up on its own, by its key, which the view of memberships gives as the
-  principal: joined to a group's members, or looked up by the principal history copies beside the
-  entity, it read, by such statistics, every membership in the tenant again for each member. The
+  scope, as a check seeks them on its resource's path. A version counts by a time from its date, or
+  its transaction's commit record where that is later, looked up by its transaction in history's
+  index of commit records. Each version a view finds is its row's last where no later one, by id,
+  counts by then, a test of each on its own, by its key in history's index of an entity's versions,
+  which orders a row's versions by date and those of one date by id, latest first: since commits
+  are recorded no version is dated before the one written before it, so the test reads the row's
+  latest version dated by then after it, and only where that one doesn't count, its transaction
+  committed later, reads on from the version in that order until the first that counts, each
+  version between two counted read once, whatever their dates; a read on from the version alone,
+  against the index's order, read the page before the version's, of another row, wherever a row's
+  last was first on its page. One written before reads the row's versions dated by then from the
+  latest, as a release before 0006 could date a version before one written earlier. A few pages for
+  each version, however stale history's statistics. That index ordered versions of one date by their
+  places, so versions dated alike, as every write of a `DO` block is, each read every one before it.
+  As a join, by statistics from before most of history was written, as autovacuum leaves them until
+  a tenth of it is new, it read every version of the entity in the tenant for each version found,
+  the key only a filter, so a check took seconds; a read of thousands of rows costs more than such a
+  join planned by fresh statistics, which reads their versions together. That index holds the
+  versions of grants, eligibilities and places in groups only for a read that names their key, as
+  PostgreSQL proves a partial index's predicate from a query's conditions, and history's index of
+  scopes holds them only for one that names a scope, so a read of them by their principal, scope,
+  role or group seeks them in the index leading to it: by statistics that counted the tenant's rows
+  of them as a few, a plan read every one in the tenant through either instead. `Holders` looks each
+  identity's membership of the tenant up on its own, by its key, which the view of memberships gives
+  as the principal: joined to a group's members, or looked up by the principal history copies beside
+  the entity, it read, by such statistics, every membership in the tenant again for each member. The
   view of custom roles takes each one's newest version, testing none for a later one, so
   `Grantable`, which can offer any, reads each version once.
 - **PruneHistory** deletes only what an export has read and later versions supersede. It keeps
-  each row's last version at or before its time, so AsOf answers as before for any later time,
-  and refuses an earlier one; of a row whose last version by then ended it, it deletes every
-  version, the end last. It reads history `MaxPrune` records at a time, each in a transaction of
-  its own, so none holds exports back for long however long history is. Each that deleted records
+  each row's last version counted by its time, as AsOf counts it, so AsOf answers as before for any
+  later time, and refuses an earlier one; of a row whose last version by then ended it, it deletes
+  every version, the end last; and a transaction's commit record once no other record of the
+  transaction stays. Each version is tested for a later one counted by then as AsOf tests it, by
+  its key and id. It reads history `MaxPrune` records at a time, each in a transaction of
+  its own, so none holds exports back for long however long history is, and each planned for its
+  arguments: the plan cache gave a connection one plan for every window, and planned a window twice
+  once history's statistics changed. Each that deleted records
   is recorded in history, in the statement that deletes and dated when it began, with the last
   record it deleted, and AsOf finds the latest prune's time by history's index of each entity's
   keys, as a prune finds where the last of its time and cursor stopped, each in that index's order

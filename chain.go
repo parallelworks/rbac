@@ -61,7 +61,9 @@ func (c Checkpoint) Chain(records []Record) (Checkpoint, error) {
 // chained is the record as the chain hashes it: every field, in a fixed order, its times in UTC. A
 // principal's or scope's kind and id are kept apart, as their key joins them with a colon an id
 // can hold too. Its text is UTF-8, as the database keeps it: JSON writes other bytes as U+FFFD,
-// so two records would encode alike, and in a form that differs between Go's JSON encoders.
+// so two records would encode alike, and in a form that differs between Go's JSON encoders. Its
+// CommittedAt follows the rest where it has one, so a record of a transaction that committed before
+// history kept commit records chains as it did.
 func (r Record) chained() ([]byte, error) {
 	utc := func(t time.Time) string {
 		if t.IsZero() {
@@ -76,6 +78,9 @@ func (r Record) chained() ([]byte, error) {
 		principal(r.Principal), string(r.Role), scope, r.Group, utc(r.ExpiresAt),
 		rawOrNull(r.Before), rawOrNull(r.After),
 		principal(r.Actor), principal(r.OnBehalfOf), r.How, r.Request, r.Reason, r.DBUser,
+	}
+	if !r.CommittedAt.IsZero() {
+		fields = append(fields, utc(r.CommittedAt))
 	}
 	for _, f := range fields {
 		var text []string

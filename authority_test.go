@@ -3969,7 +3969,7 @@ func TestACrowdedCopyIsWhatWritingItAfreshMakes(t *testing.T) {
 			t.Errorf("%d of the %d rows of the template's %s aren't at the same place in its copy", misplaced, rows, table)
 		}
 		// But for what each writing makes anew: the grants' random ids, the times, the transactions,
-		// and the bytes the times take as JSON.
+		// which commit records name as their keys, and the bytes the times take as JSON.
 		row := `to_jsonb(r) - '{created_at,updated_at}'::text[]`
 		order := "r.ctid"
 		switch table {
@@ -3979,7 +3979,7 @@ func TestACrowdedCopyIsWhatWritingItAfreshMakes(t *testing.T) {
 			order = "r.id"
 		case "rbac_history":
 			row = `to_jsonb(r) - '{txid,recorded_at,effective_at,bytes,key,after}'::text[] || jsonb_build_object(
-				'key', CASE WHEN r.entity = 'grant' THEN NULL ELSE r.key END,
+				'key', CASE WHEN r.entity IN ('grant', 'commit') THEN NULL ELSE r.key END,
 				'after', CASE WHEN r.entity = 'grant' THEN r.after - 'id' ELSE r.after END - '{created_at,updated_at}'::text[])`
 			order = "r.id"
 		}
@@ -4029,8 +4029,8 @@ func TestACrowdedCopyIsWhatWritingItAfreshMakes(t *testing.T) {
 		t.Fatal(err)
 	}
 	var id int64
-	if err := copied.pool.QueryRow(ctx, `SELECT id FROM rbac_history WHERE principal = 'user:next'`).Scan(&id); err != nil || id != 46002 {
-		t.Errorf("a grant written to a copy was recorded as %d, not after its 46001 records: %v", id, err)
+	if err := copied.pool.QueryRow(ctx, `SELECT id FROM rbac_history WHERE principal = 'user:next'`).Scan(&id); err != nil || id != 46009 {
+		t.Errorf("a grant written to a copy was recorded as %d, not after its 46001 records and its 7 transactions' commit records: %v", id, err)
 	}
 }
 
