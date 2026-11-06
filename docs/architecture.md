@@ -412,21 +412,25 @@ sequenceDiagram
   does for each permission and a labeled check for each value its label asks for: copied for each
   ask, `Permissions` of 300 permissions on a resource of 20,000 tags took a second. A hook writing
   to its copy reads its write when the call asks it again, and nothing decided or asked of another
-  hook does. A copy holds no more than a check converts (`maxConverted`), counted alike, one for
-  each value, a string too, and a tenth of each other byte copied whole, so it counts no more than
-  converting the same does: past it the hook can't be asked, and the call is refused (`uncopied`)
-  as any other, a `DeniedError` of the permission on the resource asked about, or the tenant, whose
-  `Reason` names the hook and whose message only the permission. Counting a list's elements
-  twice, a string by the bytes of its header, or a
-  protobuf `Value` and its field apart, attributes a check converts couldn't be copied. A slice
-  reached at several lengths is copied once from where it starts, each length a slice of the copy,
-  and one reached while its elements are copied, before a longer length outgrew that copy, a slice
-  of its own, whose elements are copied too, as set in the longer alone it held the host's. A value
-  holding no map, slice or pointer that an interface holds, as an array, is shared, as nothing
-  writes to it through the interface. A call keeps what the host passed with each copy until it
-  returns, so where it points is no other value's meanwhile: known only by where it points, a value
-  dropped and collected during the call would leave its place to one made after, which would be
-  given the first one's copy.
+  hook does. A copy holds no more than a check converts (`maxConverted`), counted as converting
+  counts it, each value, map, list, pointer and message what converting it costs (`mapCost`),
+  whatever the copy shares or moves whole, so it counts what converting the same does, but for what
+  JSON text and packed messages decode to, which it holds as bytes: past it the hook can't be asked,
+  and the call is refused (`uncopied`) as any other, a `DeniedError` of the permission on the
+  resource asked about, or the tenant, whose `Reason` names the hook and whose message only the
+  permission. Counting a list's elements twice, a string by the bytes of its header, a protobuf
+  `Value` and its field apart, or a message a pointer reaches for the pointer and again for the
+  message, attributes a check converts couldn't be copied, as a resource's 100,000 timestamps, which
+  a check converted. A copy keeps each slice it copies apart from the maps, pointers and messages,
+  changing it where it is kept as its elements are copied (`copied`), as five lookups of it for each
+  element cost about what copying the element did. A slice reached at several lengths is copied once
+  from where it starts, each length a slice of the copy, and one reached while its elements are
+  copied, before a longer length outgrew that copy, a slice of its own, whose elements are copied
+  too, as set in the longer alone it held the host's. A value holding no map, slice or pointer that
+  an interface holds, as an array, is shared, as nothing writes to it through the interface. A call
+  keeps what the host passed with each copy until it returns, so where it points is no other value's
+  meanwhile: known only by where it points, a value dropped and collected during the call would
+  leave its place to one made after, which would be given the first one's copy.
 - **Conditions** are CEL over `subject`, `resource`, `request` and `action`, typed by
   `Config.Attributes`. Each is compiled once, bounded in cost, and fails closed: a condition that
   errors gives nothing, and a deny's that errors denies. A check converts what the host passes into
@@ -447,23 +451,36 @@ sequenceDiagram
   map that no condition could read left every operator to tell it from the rest, and `in`, `has()`
   and loops over a map's keys each found its key; whole-kind failure leaves no such value for an
   operator to meet. The kinds that can't be read are each the one value `unreadable`, so whatever
-  hashes or compares it fails too: a key (`comparableKey`), and a comparison or `in` reading it
-  whole, however deep in a list or a map (`measured`); hashed, a map literal keyed by two kinds past
-  `maxConverted` held one entry, and `request.attributes in {subject.attributes: true}` held. A
-  list holding it a map hashes as the list, wherever it is, so a key of one tells nothing of it.
+  hashes or compares it fails too: a key (`comparableKey`), a comparison or `in` (`measured`), and a
+  list or map literal holding it (`literal`), and the `subject`, `resource` and `request` holding it
+  are read as it is, by their fields' names alone (`variable`), as a kind declarations refuse in
+  part is, so no list or map an operator meets holds it; hashed, a map literal keyed by two kinds
+  past `maxConverted` held one entry, and `request.attributes in {subject.attributes: true}` held.
+  Built, a list holding it was decided by its size or by another value it held, as comparing reads
+  the smaller value whole and no further, so `[subject.attributes] != []` held, and
+  `[subject.attributes, 1] == [{}, 2]` failed for a kind that can't be read but was false for one
+  refused in part, as that is larger; finding it there would read the larger value whole.
   Depth is decided by heights kept with each converted value, so it doesn't
   turn on map order or on which kind reached a shared value first, and each kind is converted, and
   charged, whole, whatever it holds, but where it nests past `maxNested`: converting stops there, so
   what it is charged, and whether the kinds after it fit `maxConverted`, can turn on map order,
-  failing closed. Nothing else does, nor on the order of the kinds: JSON text that may hold more
-  values than `maxConverted`, by its brackets, braces, commas and colons, fails them all unparsed,
-  where compared with what was left, it failed them where what came before it left less than it may
-  hold, though what it holds fit, as `[]` holds less than its brackets count. A value reached twice
+  failing closed. Nothing else does, nor on the order of the kinds: JSON text whose values may cost
+  more than `maxConverted`, by its brackets, braces, commas and colons, each bracket and brace what
+  building a list or an object costs (`jsonValues`), fails them all unparsed, where compared with
+  what was left, it failed them where what came before it left less than it may hold, though what it
+  holds fit, as `[]` holds less than its brackets count. A value reached twice
   is converted once, but for a resource's sharing it with the subject's or the request's (below),
   and converting costs a check at most `maxConverted`, counted as `valueSize` counts what a
-  condition reads, about what a check may spend on a scope's grants' conditions, past which every
-  condition reading an attribute fails: converting isn't charged to a condition, and charging the
-  check would let what one condition reads fail the others. The subject's and the request's
+  condition reads, but each map, `Struct` or JSON object 8, and each list, `ListValue` or JSON
+  array, pointer, but to a message, and other message 4 (`mapCost`), as building each takes several
+  times what converting a number does: charged one, 160,000 empty maps took 93 ms to convert, where
+  as many ints took 12 ms. So weighed, a unit took 20 to 115 ns to convert and 25 to 200 ns to copy
+  for a hook, whatever held it, where reading one in a condition takes 70 to 145 ns, and a check
+  converts in about 20 ms at most what it may spend on a scope's grants' conditions, past which
+  every condition reading an attribute fails: converting isn't charged to a condition, and charging
+  the check would let what one condition reads fail the others. A message the host passes is known
+  by its type among those conditions read (`wellKnown`), as finding it one by reflection's
+  `Implements` took five times what converting a number does. The subject's and the request's
   attributes are converted once for a call, by one converter (`askingOf`), as a change checks them
   on each scope it reaches, before its transaction and in it, and each check converts its resource's
   apart, on a converter spending what that one left (`rest`): so each check counts all three, in the

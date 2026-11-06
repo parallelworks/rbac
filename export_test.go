@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"reflect"
 	"regexp"
 	"runtime"
 	"slices"
@@ -1105,8 +1106,64 @@ func EvaluateConditionOf(t *testing.T, expr string, subject, resource, request m
 	return r.held, r.evaluated
 }
 
+// EvaluateDeclared is EvaluateConditionOf under declares, the subject's attributes alone passed,
+// and false where expr is no condition under them, which a change refuses to store.
+func EvaluateDeclared(t *testing.T, declares Attributes, expr string, subject map[string]any) (held, evaluated, condition bool) {
+	t.Helper()
+	c, err := newConditions(declares)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.check(expr) != nil {
+		return false, false, false
+	}
+	prg, err := c.compile(expr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Authorizer{cfg: Config{Now: time.Now, Attributes: declares}, conds: c}
+	vars := a.vars(t.Context(), Subject{Principal: Principal{Kind: User, ID: "u"}, Attributes: subject}, "cluster:login",
+		Resource{Tenant: "t", Type: "cluster", ID: "c"})
+	r := evaluate(prg, vars)
+	return r.held, r.evaluated, true
+}
+
 // MaxConverted is the most a check converts of what the host passes.
 const MaxConverted = maxConverted
+
+// MapCost, ListCost, PointerCost and MessageCost are what converting, or copying for a hook, each
+// map, list, pointer and other message costs.
+const MapCost, ListCost, PointerCost, MessageCost = mapCost, listCost, pointerCost, messageCost
+
+// Work is what converting a kind's attributes, or copying them for a hook, charged, and the
+// allocations and bytes it made, and whether it could: for converting, whether it read them.
+type Work struct {
+	Charged, Allocations, Bytes uint64
+	Done                        bool
+}
+
+// ConvertingWork is the work converting attributes, as a check converts a kind's, does.
+func ConvertingWork(attributes map[string]any) Work {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	c := newConverter()
+	_, read := c.attributes(attributes)
+	runtime.ReadMemStats(&after)
+	return Work{maxConverted - c.left, after.Mallocs - before.Mallocs, after.TotalAlloc - before.TotalAlloc, read && !c.over}
+}
+
+// CopyingWork is the work copying attributes for a hook does.
+func CopyingWork(attributes map[string]any) Work {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	c := copier{left: maxConverted}
+	v := attributes
+	c.copy(reflect.ValueOf(&v).Elem(), 0)
+	runtime.ReadMemStats(&after)
+	return Work{maxConverted - c.left, after.Mallocs - before.Mallocs, after.TotalAlloc - before.TotalAlloc, !c.over}
+}
 
 // Converting is what converting attributes as a check does allocates, and whether they were more
 // than a check converts.
@@ -1161,8 +1218,7 @@ func AttributesRead(t *testing.T, n int, check func(i int) (ctx context.Context,
 			Resource{Tenant: "t", Type: "cluster", ID: "c", Attributes: resource})
 		var out [3]string
 		for j, kind := range []string{"subject", "resource", "request"} {
-			of, _ := vars[kind].(map[string]any)
-			out[j] = written(of["attributes"])
+			out[j] = written(attributesOf(vars[kind]))
 		}
 		return out
 	}
@@ -1177,6 +1233,17 @@ func AttributesRead(t *testing.T, n int, check func(i int) (ctx context.Context,
 		together = append(together, read(a, i))
 	}
 	return together, alone
+}
+
+// attributesOf is what a condition reads as v.attributes, where v is the subject, the resource or
+// the request as vars has it.
+func attributesOf(v any) any {
+	if r, ok := v.(refusedAttributes); ok {
+		attributes, _ := r.Find(types.String("attributes"))
+		return attributes
+	}
+	m, _ := v.(map[string]any)
+	return m["attributes"]
 }
 
 // Unreadable is how AttributesRead writes out attributes no condition reads.

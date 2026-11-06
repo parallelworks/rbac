@@ -1630,6 +1630,96 @@ func TestAttributesNoConditionReadsFailWhereverAConditionHashesOrComparesThem(t 
 	}
 }
 
+// A kind's attributes no condition can read whole, as where one holds a struct, and those
+// declarations refuse in part, as where a declared int is passed as a string, are each a value no
+// operator reads, and fail alike whatever reads them whole: comparing them, finding them or in
+// them, size(), a macro, and a list or a map holding them, as building one fails, and the subject,
+// the resource or the request holding them read whole. Built, a list or a map holding them was
+// decided without them where its size or another value it held decided, as comparing read only the
+// smaller value whole: `[subject.attributes] != []`, size(), has() and a loop over it held, and
+// `[subject.attributes, 1] == [{}, 2]` failed for a kind no condition can read but was false for one
+// refused in part, which is larger; and read whole, `subject != {"kind": "user"}` held. Read by
+// name, a kind refused in part reads the names declarations pass. type(), which reads no value, and
+// `||` or `&&` that the other side decides, are what they are of any value in their place.
+func TestAttributesNoConditionReadsFailWhateverHoldsThem(t *testing.T) {
+	declares := rbac.Attributes{Subject: map[string]rbac.AttributeType{"team": rbac.AttrString, "level": rbac.AttrInt}}
+	readable := map[string]any{"team": "a", "level": 1}
+	whole := map[string]any{"team": "a", "level": 1, "badge": struct{ X int }{1}}
+	inPart := map[string]any{"team": "a", "level": "one"}
+	for _, expr := range []string{
+		`[subject.attributes] != []`, `[subject.attributes] == [{}]`, `[subject.attributes, 1] == [{}, 2]`,
+		`[subject.attributes, 1] == [{}, 2, 3]`, `size([subject.attributes]) == 1`, `[subject.attributes].exists(x, true)`,
+		`has({"a": subject.attributes}.a)`, `{"a": subject.attributes} == {"a": {}}`,
+		`{"a": subject.attributes, "b": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"} != {"a": {}, "b": "y"}`,
+		`subject.attributes == {}`, `subject.attributes != {}`, `"team" in subject.attributes`, `!("team" in subject.attributes)`,
+		`subject.attributes in []`, `subject.attributes.all(k, false)`, `subject.attributes.exists(k, true)`,
+		`size(subject.attributes) == 2`, `dyn(subject.attributes) == dyn(request.attributes)`, `subject.attributes in [request.attributes]`,
+		`[subject.attributes] in [[request.attributes]]`, `{subject.attributes: 1} != {}`, `{[subject.attributes]: 1} != {}`,
+		`size({[subject.attributes]: 1, [request.attributes]: 2}) == 2`, `(true ? subject.attributes : {}) == {}`,
+		`[subject.attributes].map(x, 1) == [1]`, `[subject.attributes].filter(x, true).size() == 1`, `[subject.attributes][0] == {}`,
+		`[[subject.attributes]] != [[]]`, `[subject.attributes, "x"] in [[{}, "y"]]`, `[1].map(x, subject.attributes).size() == 1`,
+		`[1].map(x, {"a": subject.attributes}).size() == 1`, `subject != {"kind": "user"}`, `subject == subject`, `size(subject) == 3`,
+		`subject.exists(k, k == "id")`, `"id" in subject`, `[subject] != []`, `{"s": subject}.s.id == "u"`, `subject in [resource]`,
+	} {
+		if _, evaluated := rbac.EvaluateConditionOf(t, expr, readable, nil, nil); !evaluated {
+			t.Errorf("%s of attributes a condition reads: failed", expr)
+		}
+		if held, evaluated := rbac.EvaluateConditionOf(t, expr, whole, nil, nil); evaluated {
+			t.Errorf("%s of attributes no condition reads whole: held %t", expr, held)
+		}
+		if held, evaluated, condition := rbac.EvaluateDeclared(t, declares, expr, inPart); evaluated {
+			t.Errorf("%s of attributes declarations refuse in part: held %t, a condition %t", expr, held, condition)
+		}
+	}
+	for _, c := range []struct {
+		expr          string
+		inPart, whole bool
+	}{
+		{`subject.attributes.team == "a"`, true, false},
+		{`has(subject.attributes.team)`, true, false},
+		{`[1, 2].exists(i, subject.attributes.team == "a")`, true, false},
+		{`[subject.attributes.team] == ["a"]`, true, false},
+		{`subject.attributes.level == 1`, false, false},
+		{`has(subject.attributes.level)`, false, false},
+		{`!has(subject.attributes.level)`, false, false},
+		{`type(subject.attributes) == map`, true, true},
+		{`type(subject) == type(resource)`, true, true},
+		{`subject.attributes.level > 0 || true`, true, true},
+		{`has(subject.attributes)`, true, true},
+		{`subject.id == "u" && subject.kind == "user"`, true, true},
+		{`resource.type == "cluster"`, true, true},
+	} {
+		if held, evaluated, condition := rbac.EvaluateDeclared(t, declares, c.expr, inPart); !condition || held != c.inPart || evaluated != c.inPart {
+			t.Errorf("%s of attributes declarations refuse in part: held %t, evaluated %t, a condition %t", c.expr, held, evaluated, condition)
+		}
+		if held, evaluated := rbac.EvaluateConditionOf(t, c.expr, whole, nil, nil); held != c.whole || evaluated != c.whole {
+			t.Errorf("%s of attributes no condition reads whole: held %t, evaluated %t", c.expr, held, evaluated)
+		}
+	}
+	// So a grant reading them so gives nothing, and a deny applies.
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole) })
+	given := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	given.Condition = rbac.Condition{Expression: `[subject.attributes] != []`}
+	h.seed(t, given, grant(cluster.Scope(), "cluster.login", rbac.User, "d"), grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+	ctx := t.Context()
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, rbac.Deny{
+		ID: "sized", Principals: []rbac.Principal{identity("d")}, Permissions: []rbac.Permission{login},
+		Condition: rbac.Condition{Expression: `size([subject.attributes]) != 1`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"u", "d"} {
+		s := h.as(t, id)
+		if !allowed(t, h, s, login, cluster) {
+			t.Fatalf("%s, passing attributes a condition reads, can't log in", id)
+		}
+		s.Attributes = whole
+		if allowed(t, h, s, login, cluster) {
+			t.Errorf("%s, passing attributes no condition reads whole, logs in", id)
+		}
+	}
+}
+
 // A value reached twice is converted once: a list holding one map a thousand times, which no
 // check could convert a thousand times within what it may, is read.
 func TestAValueReachedTwiceIsConvertedOnce(t *testing.T) {
@@ -1706,16 +1796,19 @@ func TestAttributesLargerThanACheckConvertsFailEveryCondition(t *testing.T) {
 // and a call converting the subject's attributes before the resource's, rather than after, read
 // them where it failed them before.
 func TestWhetherAttributesFitTurnsOnNoOrder(t *testing.T) {
-	// A string's name and value cost two, and a tenth of its length, and `[]`'s three.
-	exact := strings.Repeat("x", 10*(rbac.MaxConverted-5))
+	// A kind's map costs what building one does, a string's name and value two, and a tenth of its
+	// length, and `[]`'s name, text and list two and what building a list costs.
+	exact := func(kinds int) string {
+		return strings.Repeat("x", 10*(rbac.MaxConverted-kinds*rbac.MapCost-4-rbac.ListCost))
+	}
 	empty := json.RawMessage("[]")
 	if held, _ := rbac.EvaluateConditionOf(t, `has(subject.attributes.s) && size(resource.attributes.j) == 0`,
-		map[string]any{"s": exact}, map[string]any{"j": empty}, nil); !held {
+		map[string]any{"s": exact(2)}, map[string]any{"j": empty}, nil); !held {
 		t.Error("the resource's empty JSON list after the subject's string, just fitting what a check converts")
 	}
 	for range 50 {
 		if held, _ := rbac.EvaluateConditionOf(t, `has(request.attributes.s) && size(request.attributes.j) == 0`,
-			nil, nil, map[string]any{"s": exact, "j": empty}); !held {
+			nil, nil, map[string]any{"s": exact(1), "j": empty}); !held {
 			t.Fatal("a request's empty JSON list beside its string, just fitting what a check converts")
 		}
 	}
@@ -2246,6 +2339,80 @@ func TestConvertingAttributesAllocatesForWhatItConvertsThemTo(t *testing.T) {
 	// Two for each entry, its key and its value, and a few for each map and each kind.
 	if n := rbac.ConvertingAllocates(t, map[string]any{"m": maps[0]}, map[string]any{"m": maps[1]}, map[string]any{"m": maps[2]}); n > none+600+75 {
 		t.Errorf("converting three maps of 100 strings took %.0f allocations, and nothing %.0f", n, none)
+	}
+}
+
+// Converting a value costs a check, and copying it a hook, what building it does, counted alike
+// (MapCost): each map, Struct and JSON object was charged one, as a number is, though it allocates
+// several times, so 160,000 empty maps took a check 93 ms to convert and a hook 83 ms to copy, where
+// as many ints took 12 ms and 6 ms, and a check of a resource whose user-written tags held 156,000
+// empty maps 108 ms. Timed, a unit now takes 20 to 115 ns to convert and 25 to 200 ns to copy,
+// whatever holds it, where reading one in a condition takes 70 to 145. What each allocates stands in
+// for the time here, as -race and a slower machine change neither: no unit charged allocates more
+// than a few times what one of a string does, by count or by bytes.
+func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
+	const n = 2000
+	listed := func(made func(i int) any) map[string]any {
+		l := make([]any, n)
+		for i := range l {
+			l[i] = made(i)
+		}
+		return map[string]any{"l": l}
+	}
+	text := func(each func(i int) string) map[string]any {
+		var b strings.Builder
+		for i := range n {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteString(each(i))
+		}
+		return map[string]any{"l": json.RawMessage("[" + b.String() + "]")}
+	}
+	// The least of a few, as another goroutine can allocate meanwhile.
+	least := func(work func(map[string]any) rbac.Work, attributes map[string]any) rbac.Work {
+		w := work(attributes)
+		for range 2 {
+			if again := work(attributes); again.Allocations < w.Allocations {
+				w = again
+			}
+		}
+		return w
+	}
+	strs := least(rbac.ConvertingWork, listed(func(i int) any { return strconv.Itoa(i) }))
+	allocations, bytes := float64(strs.Allocations)/float64(strs.Charged), float64(strs.Bytes)/float64(strs.Charged)
+	for name, attributes := range map[string]map[string]any{
+		"ints":        listed(func(i int) any { return i + 1000 }),
+		"lists":       listed(func(i int) any { return []any{i} }),
+		"empty lists": listed(func(int) any { return make([]any, 0, 1) }),
+		"maps":        listed(func(i int) any { return map[string]any{"a": i} }),
+		"empty maps":  listed(func(int) any { return map[string]any{} }),
+		"pointers":    listed(func(i int) any { return &i }),
+		"Structs": listed(func(i int) any {
+			return &structpb.Struct{Fields: map[string]*structpb.Value{"a": structpb.NewNumberValue(float64(i))}}
+		}),
+		"empty Structs": listed(func(int) any { return &structpb.Struct{} }),
+		"ListValues": listed(func(i int) any {
+			return &structpb.ListValue{Values: []*structpb.Value{structpb.NewNumberValue(float64(i))}}
+		}),
+		"empty ListValues":        listed(func(int) any { return &structpb.ListValue{} }),
+		"Values":                  listed(func(i int) any { return structpb.NewStringValue(strconv.Itoa(i)) }),
+		"timestamps":              listed(func(i int) any { return timestamppb.New(time.Unix(int64(i), 0)) }),
+		"wrappers":                listed(func(i int) any { return wrapperspb.Int64(int64(i)) }),
+		"JSON objects":            text(func(int) string { return "{}" }),
+		"JSON objects of a value": text(func(i int) string { return fmt.Sprintf(`{"a":%d}`, i) }),
+		"JSON lists":              text(func(i int) string { return fmt.Sprintf("[%d]", i) }),
+	} {
+		for doing, work := range map[string]func(map[string]any) rbac.Work{"converting": rbac.ConvertingWork, "copying": rbac.CopyingWork} {
+			w := least(work, attributes)
+			if !w.Done {
+				t.Fatalf("%s %d %s: not done, charging %d", doing, n, name, w.Charged)
+			}
+			if a, b := float64(w.Allocations)/float64(w.Charged), float64(w.Bytes)/float64(w.Charged); a > 2.5*allocations || b > 5*bytes {
+				t.Errorf("%s %d %s allocated %.2f times and %.0f bytes for each unit charged, where converting strings allocates %.2f times "+
+					"and %.0f bytes", doing, n, name, a, b, allocations, bytes)
+			}
+		}
 	}
 }
 

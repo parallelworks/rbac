@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -23,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"cel.dev/cel-go/common/types"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -32,6 +34,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/dynamicpb"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -2456,14 +2459,14 @@ func TestAConstraintWritingAFieldAnEmbeddedStructPromotesChangesNothing(t *testi
 
 // A hook's copy of a list decoded from JSON costs an allocation for the list, not one for each of
 // its strings: every constraint is given one in every call. A few more are the copy's own, as the
-// map it keeps what it copied in.
+// maps it keeps what it copied in.
 func TestCopyingAListOfStringsForAHookAllocatesOnce(t *testing.T) {
 	groups := make([]any, 1000)
 	for i := range groups {
 		groups[i] = fmt.Sprintf("group-%04d", i)
 	}
 	attributes := map[string]any{"groups": groups}
-	if n := testing.AllocsPerRun(20, func() { rbac.DeepCopy(attributes) }); n > 12 {
+	if n := testing.AllocsPerRun(20, func() { rbac.DeepCopy(attributes) }); n > 16 {
 		t.Errorf("copying a list of %d strings took %.0f allocations", len(groups), n)
 	}
 	if c, ok := rbac.DeepCopy(attributes)["groups"].([]any); !ok || &c[0] == &groups[0] {
@@ -2474,17 +2477,18 @@ func TestCopyingAListOfStringsForAHookAllocatesOnce(t *testing.T) {
 // A hook is given a copy of what an interface holds, but nothing writes through an interface to a
 // value holding no map, slice or pointer, as an array, so the copy shares it: copied element by
 // element for each interface holding it, a hundred holding one array of 100 KB took 170 ms and
-// allocated 10 MB. One held by value is copied whole, as setting it does.
+// allocated 10 MB. One held by value is copied whole, as setting it does. Each costs the copy what
+// converting it does, a tenth of its bytes, so a copy holds ten.
 func TestCopyingAnArrayInterfacesHoldSharesIt(t *testing.T) {
 	var a [100_000]byte
 	a[0] = 1
-	held := make([]any, 100)
+	held := make([]any, 10)
 	for i := range held {
 		held[i] = a
 	}
 	attributes := map[string]any{"held": held, "byValue": map[string][100_000]byte{"a": a}}
 	if allocated := rbac.CopyAllocates(attributes); allocated > 3*uint64(len(a)) {
-		t.Errorf("copying an array a hundred interfaces hold allocated %d bytes", allocated)
+		t.Errorf("copying an array ten interfaces hold allocated %d bytes", allocated)
 	}
 	copied := rbac.DeepCopy(attributes)
 	if h, ok := copied["held"].([]any); !ok || len(h) != len(held) || h[len(h)-1] != any(a) {
@@ -2673,42 +2677,166 @@ func TestACallGivesAHookTheCopyOfNoValueFreedSince(t *testing.T) {
 	}
 }
 
-// A copy counts each value as converting does, once: counting a list's elements once for the list
-// and again as values, a string in a []string by the 16 bytes moving it moves, or a protobuf
-// Value's field apart from the Value, attributes a check converts couldn't be copied, so a
-// constrained check of them was refused. And an array of interfaces costs what it holds, as a slice
-// does: uncounted, a copy of one holding more values than a check converts cost one.
+// A copy counts each value as converting does, so a hook can be given a copy of whatever a check
+// converts, and of no more: counting a list's elements once for the list and again as values, a
+// string in a []string by the 16 bytes moving it moves, a protobuf Value's field apart from the
+// Value, or a message a pointer reaches once for the pointer and again for the message, attributes
+// a check converts couldn't be copied, so a constrained check of them was refused, whoever asked,
+// as of a resource holding 100,000 timestamps, which a check converted. Converting counts what JSON
+// text and a packed message decode to as well, which a copy holds as bytes. And an array of
+// interfaces costs what it holds, as a slice does: uncounted, a copy of one holding more values
+// than a check converts cost one.
 func TestACopyForAHookCountsWhatItHoldsAsConvertingDoes(t *testing.T) {
-	short := make([]string, rbac.MaxConverted*3/4)
-	empty := make([]any, rbac.MaxConverted/2)
-	fields, values := map[string]*structpb.Value{}, make([]*structpb.Value, rbac.MaxConverted/2)
-	for i := range short {
-		short[i] = "a"
+	type level int
+	type named string
+	const long = "abcdefghijklmnopqrstuvwxyz"
+	stamp := func(i int) *timestamppb.Timestamp { return timestamppb.New(time.Unix(int64(i), 0)) }
+	unknown := func(m proto.Message) proto.Message {
+		m.ProtoReflect().SetUnknown(protowire.AppendBytes(protowire.AppendTag(nil, 99, protowire.BytesType), make([]byte, 40)))
+		return m
 	}
-	for i := range empty {
-		empty[i] = map[string]any{}
+	messages := map[string]func(i int) proto.Message{
+		"a Struct": func(i int) proto.Message {
+			return &structpb.Struct{Fields: map[string]*structpb.Value{long: structpb.NewNumberValue(float64(i)), "b": nil}}
+		},
+		"an empty Struct": func(int) proto.Message { return &structpb.Struct{} },
+		"a ListValue": func(i int) proto.Message {
+			return &structpb.ListValue{Values: []*structpb.Value{structpb.NewNumberValue(float64(i)), nil}}
+		},
+		"an empty ListValue":           func(int) proto.Message { return &structpb.ListValue{} },
+		"a null Value":                 func(int) proto.Message { return structpb.NewNullValue() },
+		"a number Value":               func(i int) proto.Message { return structpb.NewNumberValue(float64(i)) },
+		"a string Value":               func(int) proto.Message { return structpb.NewStringValue(long) },
+		"a bool Value":                 func(int) proto.Message { return structpb.NewBoolValue(true) },
+		"a Struct's Value":             func(int) proto.Message { return structpb.NewStructValue(&structpb.Struct{}) },
+		"a ListValue's Value":          func(int) proto.Message { return structpb.NewListValue(&structpb.ListValue{}) },
+		"a Value holding a nil Struct": func(int) proto.Message { return &structpb.Value{Kind: &structpb.Value_StructValue{}} },
+		"a Value of a nil kind":        func(int) proto.Message { return &structpb.Value{Kind: (*structpb.Value_ListValue)(nil)} },
+		"a BoolValue":                  func(int) proto.Message { return wrapperspb.Bool(true) },
+		"a BytesValue":                 func(int) proto.Message { return wrapperspb.Bytes([]byte(long)) },
+		"a DoubleValue":                func(i int) proto.Message { return wrapperspb.Double(float64(i)) },
+		"a FloatValue":                 func(i int) proto.Message { return wrapperspb.Float(float32(i)) },
+		"an Int32Value":                func(i int) proto.Message { return wrapperspb.Int32(int32(i)) },
+		"an Int64Value":                func(i int) proto.Message { return wrapperspb.Int64(int64(i)) },
+		"a StringValue":                func(int) proto.Message { return wrapperspb.String(long) },
+		"a UInt32Value":                func(i int) proto.Message { return wrapperspb.UInt32(uint32(i)) },
+		"a UInt64Value":                func(i int) proto.Message { return wrapperspb.UInt64(uint64(i)) },
+		"a Timestamp":                  func(i int) proto.Message { return stamp(i) },
+		"a Duration":                   func(i int) proto.Message { return durationpb.New(time.Duration(i)) },
+		"a Timestamp with fields it doesn't know": func(i int) proto.Message { return unknown(stamp(i)) },
+		"a Struct with fields it doesn't know":    func(int) proto.Message { return unknown(&structpb.Struct{}) },
 	}
-	for i := range rbac.MaxConverted / 3 {
-		fields[fmt.Sprint(i)] = structpb.NewStringValue("a")
+	values := map[string]func(i int) any{
+		"a bool":                         func(int) any { return true },
+		"an int of the host's type":      func(i int) any { return level(i) },
+		"a uint":                         func(i int) any { return uint8(i) },
+		"a float":                        func(i int) any { return float32(i) },
+		"a string":                       func(int) any { return strings.Repeat("s", 33) },
+		"a string of the host's type":    func(int) any { return named(long) },
+		"a time":                         func(i int) any { return time.Unix(int64(i), 0) },
+		"a duration":                     func(i int) any { return time.Duration(i) },
+		"bytes":                          func(int) any { return make([]byte, 33) },
+		"an array of bytes":              func(int) any { return [33]byte{} },
+		"a JSON number":                  func(int) any { return json.Number("12.5e3") },
+		"nil":                            func(int) any { return nil },
+		"a nil pointer":                  func(int) any { return (*int)(nil) },
+		"a nil map":                      func(int) any { return map[string]any(nil) },
+		"a nil list":                     func(int) any { return []any(nil) },
+		"CEL's string":                   func(int) any { return types.String(long) },
+		"CEL's timestamp":                func(i int) any { return types.Timestamp{Time: time.Unix(int64(i), 0)} },
+		"a NullValue":                    func(int) any { return structpb.NullValue_NULL_VALUE },
+		"a list":                         func(i int) any { return []any{i, long} },
+		"an empty list":                  func(int) any { return make([]any, 0, 1) },
+		"a list of strings":              func(int) any { return []string{long, "b"} },
+		"an array":                       func(i int) any { return [2]any{i, long} },
+		"an array of strings":            func(int) any { return [2]string{long, "b"} },
+		"a map":                          func(i int) any { return map[string]any{long: i} },
+		"an empty map":                   func(int) any { return map[string]any{} },
+		"a map keyed by an interface":    func(i int) any { return map[any]any{long: i, 1: true} },
+		"a map keyed by the host's type": func(i int) any { return map[named]level{long: level(i)} },
+		"a map of Values":                func(i int) any { return map[string]*structpb.Value{long: structpb.NewNumberValue(float64(i))} },
+		"a list of Values":               func(i int) any { return []*structpb.Value{structpb.NewNumberValue(float64(i))} },
+		"a pointer":                      func(i int) any { return &i },
+		"a pointer to a pointer":         func(i int) any { p := &i; return &p },
+		"a pointer to a map":             func(i int) any { m := map[string]any{long: i}; return &m },
 	}
-	for i := range values {
-		values[i] = structpb.NewStringValue("a")
-	}
-	for name, attributes := range map[string]map[string]any{
-		"short strings": {"tags": short}, "empty maps": {"tags": empty},
-		"a Struct's short strings":    {"tags": &structpb.Struct{Fields: fields}},
-		"a ListValue's short strings": {"tags": &structpb.ListValue{Values: values}},
-	} {
-		if held, _ := rbac.EvaluateConditionOf(t, `size(resource.attributes.tags) > 0`, nil, attributes, nil); !held {
-			t.Fatalf("a check can't read %s", name)
+	for name, made := range messages {
+		values[name] = func(i int) any { return made(i) }
+		// A pointer to the message, which a pointer to a pointer to it reaches.
+		values["a pointer to "+name] = func(i int) any {
+			m := reflect.ValueOf(made(i))
+			p := reflect.New(m.Type())
+			p.Elem().Set(m)
+			return p.Interface()
 		}
-		if !rbac.Copies(attributes) {
-			t.Errorf("%s, which a check converts, can't be copied", name)
+	}
+	// What these decode to, converting counts and a copy doesn't.
+	decoded := map[string]func(i int) any{
+		"JSON text": func(int) any { return json.RawMessage(`{"a": [1, "b"]}`) },
+	}
+	for name, made := range messages {
+		packed := func(i int) *anypb.Any {
+			packed, err := anypb.New(made(i))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return packed
+		}
+		decoded[name+" packed in an Any"] = func(i int) any { return packed(i) }
+		decoded["a pointer to "+name+" packed in an Any"] = func(i int) any { p := packed(i); return &p }
+	}
+	listed := func(made func(i int) any, n int) map[string]any {
+		l := make([]any, n)
+		for i := range l {
+			l[i] = made(i)
+		}
+		return map[string]any{"tags": l}
+	}
+	for name, made := range values {
+		one := rbac.ConvertingWork(listed(made, 1))
+		if copied := rbac.CopyingWork(listed(made, 1)); !one.Done || copied.Charged != one.Charged {
+			t.Errorf("%s: converting it costs %d, read %t, and copying it %d", name, one.Charged, one.Done, copied.Charged)
+		}
+		// As many as a check converts.
+		each := rbac.ConvertingWork(listed(made, 2)).Charged - one.Charged
+		most := listed(made, int((rbac.MaxConverted-one.Charged)/each)+1)
+		converted, copied := rbac.ConvertingWork(most), rbac.CopyingWork(most)
+		if !converted.Done || !copied.Done || copied.Charged != converted.Charged || converted.Charged+each <= rbac.MaxConverted {
+			t.Errorf("%s: as many as a check converts cost converting %d, read %t, and copying %d, copied %t", name, converted.Charged,
+				converted.Done, copied.Charged, copied.Done)
+		}
+	}
+	for name, made := range decoded {
+		converted, copied := rbac.ConvertingWork(listed(made, 1)), rbac.CopyingWork(listed(made, 1))
+		if !converted.Done || !copied.Done || copied.Charged >= converted.Charged {
+			t.Errorf("%s: converting it costs %d, read %t, and copying it %d", name, converted.Charged, converted.Done, copied.Charged)
 		}
 	}
 	var half [rbac.MaxConverted/2 + 1]any
 	if rbac.Copies(map[string]any{"a": half, "b": half}) {
 		t.Error("arrays holding more values than a check converts were copied")
+	}
+	// A constrained check of a resource holding as many timestamps as a check converts, as conditions
+	// read them, is decided, as an unconstrained one is.
+	n := int(rbac.MaxConverted-rbac.MapCost-1-rbac.ListCost) / rbac.MessageCost
+	r := cluster
+	r.Attributes = listed(func(i int) any { return stamp(i) }, n)
+	for _, constrained := range []bool{false, true} {
+		h := setup(t, func(c *rbac.Config) {
+			if constrained {
+				c.Constraints = []rbac.Constraint{{Name: "never", Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) {
+					return false, nil
+				}}}
+			}
+		})
+		g := grant(cluster.Scope(), "cluster.login", rbac.User, "reader")
+		g.Condition = rbac.Condition{Expression: fmt.Sprintf(`size(resource.attributes.tags) == %d`, n)}
+		h.seed(t, g)
+		for _, id := range []string{"owner", "reader"} {
+			if !allowed(t, h, h.as(t, id), login, r) {
+				t.Errorf("constrained %t: %s can't log in to a cluster holding %d timestamps", constrained, id, n)
+			}
+		}
 	}
 }
 

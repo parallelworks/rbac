@@ -45,13 +45,14 @@ import (
 // values, the subject's and the request's attributes once for a call and a resource's once for each
 // check of it, from the values Attributes names, and a kind's attributes holding anything else
 // can't be read, every condition reading one of them failing, a test of its presence too, and so
-// does one keying a map by them, finding them in one, or comparing or finding in a list a list or a
-// map holding them, so conditions read CEL's own values alone, at what reading any value of its
-// size costs. A label value and a power to release are decided on the tenant with no attributes,
-// whatever a check passes (Holding), and their conditions can't read the tenant's: any read of
-// resource.attributes fails, a test of an attribute's presence, in, size(), a macro and a
-// comparison included, so a grant's gives nothing and a deny's applies. The zero Condition is none,
-// and one with a title or description has an expression. A pattern it matches is a string literal,
+// does one keying a map by them, comparing them or finding them in a list, building a list or a map
+// holding them, or reading the subject, the resource or the request holding them whole, so
+// conditions read CEL's own values alone, at what reading any value of its size costs. A label
+// value and a power to release are decided on the tenant with no attributes, whatever a check
+// passes (Holding), and their conditions can't read the tenant's: any read of resource.attributes
+// fails, a test of an attribute's presence, in, size(), a macro and a comparison included, so a
+// grant's gives nothing and a deny's applies. The zero Condition is none, and one with a title or
+// description has an expression. A pattern it matches is a string literal,
 // of bounded size; it nests at most 32 deep; it builds no message, as `google.protobuf.Struct{}`;
 // and a comparison, or a search of a list, that would read more than a condition may spend, or
 // reading a time in a zone whose name is longer than 64 bytes, holds a byte no zone's name does, as
@@ -1664,9 +1665,50 @@ type literal struct {
 	n, limit uint64
 }
 
+// Exec builds the literal, failing where it holds attributes no condition reads (refusing), as
+// whatever read it would meet them: built, a list or a map holding them was decided by its size, or
+// by another value it held, as comparing reads only the smaller value whole, so
+// `[subject.attributes] != []` held, as did size(), has() and a loop over one, and
+// `[subject.attributes, 1] == [{}, 2]` failed for a kind no condition can read whole but was false
+// for one declarations refuse in part, which is larger. No list or map a condition reads holds them
+// otherwise, but the subject, the resource and the request, which are read whole as their
+// attributes are (variable).
 func (l *literal) Exec(frame *interpreter.ExecutionFrame) ref.Val {
 	chargePast(frame, l.n, l.limit)
-	return l.InterpretableConstructor.Exec(frame)
+	built := l.InterpretableConstructor.Exec(frame)
+	if holdsRefused(built) {
+		return types.LabelErrNode(l.ID(), refusal())
+	}
+	return built
+}
+
+// holdsRefused reports whether v, a list or a map a literal built, holds attributes no condition
+// reads as an element, a key or a value, reading each once, as building it was charged for.
+func holdsRefused(v ref.Val) bool {
+	switch v := v.(type) {
+	case traits.Mapper:
+		if native := entries(v); native != nil {
+			for k, e := range native {
+				if refusing(k) || refusing(e) {
+					return true
+				}
+			}
+			return false
+		}
+		for it := v.Iterator(); it.HasNext() == types.True; {
+			if k := it.Next(); refusing(k) || refusing(v.Get(k)) {
+				return true
+			}
+		}
+	case traits.Lister:
+		n, _ := v.Size().(types.Int)
+		for i := types.Int(0); i < n; i++ {
+			if refusing(v.Get(i)) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (l *literal) Eval(vars interpreter.Activation) ref.Val { return l.Exec(interpreter.AsFrame(vars)) }
@@ -1740,12 +1782,11 @@ var errNonFiniteKey = errors.New("rbac: a double that isn't finite can't be a ke
 // deny's `{failed / total: 1} == {0.5: 1}` would lift where both are 0.0. A condition computes
 // every key it can make one of, since none is written, and no map the host passes is keyed by a
 // double (Attributes). One a condition makes can be keyed by a list holding one: comparing it
-// fails (holdsNonFinite), but a key not found `in` it is false, as finding whether it holds one
-// would read every key, uncharged. It fails for attributes no condition reads (refusing) too, which
-// a map hashes as the value they are, one for every kind no condition reads: with every kind past
-// maxConverted, `size({request.attributes: 1, subject.attributes: 2}) == 1` held. A list holding
-// them a map hashes as the list, wherever it is, and comparing it or finding it in a map fails
-// (measured).
+// fails (measured), but a key not found `in` it is false, as finding whether it holds one would
+// read every key, uncharged. It fails for attributes no condition reads (refusing) too, which a map
+// hashes as the value they are, one for every kind no condition reads: with every kind past
+// maxConverted, `size({request.attributes: 1, subject.attributes: 2}) == 1` held. No list a key can
+// be holds them, as building one fails (literal).
 func comparableKey(key ref.Val) ref.Val {
 	if refusing(key) {
 		return refusal()
@@ -1922,20 +1963,24 @@ func contains(l traits.Lister, x ref.Val) ref.Val {
 }
 
 // measured is what comparing x with y, or finding x in y, reads, counted as valueSize counts it no
-// further than past maxCost, and what comparing fails with where what it reads whole holds a double
-// that isn't finite, or attributes no condition reads (refusing), in a list or a map, as a key too,
-// however deep, or nil: a map a condition makes can be keyed by a list holding NaN, which no key is
-// found equal to, so a map keyed by one equals none, and `in` it finds no key holding NaN; and one
-// holding attributes no condition reads is found as the list it is, or not, whatever they hold, as
-// is one beside a value that differs in a list. Comparing stops at the smaller value, so it reads
-// both in step, a value of the one read less at a time, until one is read whole, and the other only
-// as far: a large value compared with a small one is read as far as the small one, and each once. A
-// map finds a key without reading the rest. It finds neither in a value it reads past the smaller,
-// as finding it there would read uncharged and, in a map, as far as the order its keys come in
-// happens to reach, so what it reports would differ from one check to the next. Comparing such a
-// value decides as it would without them: it isn't as large as the smaller one, so it is equal to
-// none, and found in no list.
+// further than past maxCost, and what comparing fails with where either is attributes no condition
+// reads (refusing), or what it reads whole holds a double that isn't finite, in a list or a map, as
+// a key too, however deep, or nil: a map a condition makes can be keyed by a list holding NaN, which
+// no key is found equal to, so a map keyed by one equals none, and `in` it finds no key holding NaN.
+// No list or map holds attributes no condition reads, as a literal holding them fails (literal), but
+// the subject, the resource and the request, which are such attributes themselves where theirs are
+// (variable), so whatever compares or finds them fails, wherever they would be reached. Comparing
+// stops at the smaller value, so it reads both in step, a value of the one read less at a time,
+// until one is read whole, and the other only as far: a large value compared with a small one is
+// read as far as the small one, and each once. A map finds a key without reading the rest. It finds
+// no such double in a value it reads past the smaller, as finding it there would read uncharged and,
+// in a map, as far as the order its keys come in happens to reach, so what it reports would differ
+// from one check to the next. Comparing such a value decides as it would without it: it isn't as
+// large as the smaller one, so it is equal to none, and found in no list.
 func measured(function string, x, y ref.Val) (uint64, ref.Val) {
+	if refusing(x) || refusing(y) {
+		return 1, refusal()
+	}
 	if function != operators.In && !container(x) && !container(y) {
 		var failed ref.Val
 		if nonFinite(x) || nonFinite(y) {
@@ -2009,14 +2054,14 @@ func container(v ref.Val) bool {
 
 // meter reads a value as valueSize counts it, a value at a time, so that two can be read in step
 // (measured): what it has read, whether it has read it whole, and whether a value it read is a
-// double that isn't finite, or attributes no condition reads. A list or map costs at least its
-// length, or each entry a key and a value, as soon as it is reached, so one too long to be within
-// what is read is past it unread, and each value it holds costs what reading it does past the 1 it
-// was counted at (values). What it reads comes to the same in any order, and only how far it reads
-// past what is compared turns on it, which nothing reads.
+// double that isn't finite. A list or map costs at least its length, or each entry a key and a
+// value, as soon as it is reached, so one too long to be within what is read is past it unread, and
+// each value it holds costs what reading it does past the 1 it was counted at (values). What it
+// reads comes to the same in any order, and only how far it reads past what is compared turns on
+// it, which nothing reads.
 type meter struct {
-	read                      uint64
-	whole, nonFinite, refused bool
+	read             uint64
+	whole, nonFinite bool
 	// root is the value, until it is read; values are those reached, each counted at 1, and pending
 	// the lists and maps whose values are still to be found.
 	root    ref.Val
@@ -2044,15 +2089,10 @@ func (m *meter) readTo(limit uint64) {
 	}
 }
 
-// failed is what comparing the value fails with where m read it whole and found in it attributes no
-// condition reads, or a double that isn't finite, or nil.
+// failed is what comparing the value fails with where m read it whole and found in it a double that
+// isn't finite, or nil.
 func (m *meter) failed() ref.Val {
-	switch {
-	case !m.whole:
-		return nil
-	case m.refused:
-		return refusal()
-	case m.nonFinite:
+	if m.whole && m.nonFinite {
 		return incomparable()
 	}
 	return nil
@@ -2114,7 +2154,6 @@ func (m *meter) step() {
 // reach counts v, which reading costs n, with the least each value it holds costs.
 func (m *meter) reach(v ref.Val, n uint64) {
 	m.nonFinite = m.nonFinite || nonFinite(v)
-	m.refused = m.refused || refusing(v)
 	switch v := v.(type) {
 	case traits.Mapper:
 		if k := count(v); k > 0 {
@@ -2384,18 +2423,30 @@ func (a *Authorizer) vars(ctx context.Context, s Subject, p Permission, r Resour
 			resourceAttributes = declared(a.cfg.Attributes.Resource, resourced)
 		}
 	}
-	resource := map[string]any{"type": r.Type, "id": r.ID, "tenant": r.Tenant, "attributes": resourceAttributes}
+	resource := variable(map[string]any{"type": r.Type, "id": r.ID, "tenant": r.Tenant, "attributes": resourceAttributes})
 	if r.Type == TenantScope && a.labelPermission(p) {
 		resource = valueResource(r.Tenant)
 	}
 	return map[string]any{
-		"subject":  map[string]any{"kind": string(s.Principal.Kind), "id": s.Principal.ID, "attributes": subjectAttributes},
+		"subject":  variable(map[string]any{"kind": string(s.Principal.Kind), "id": s.Principal.ID, "attributes": subjectAttributes}),
 		"resource": resource,
 		// In UTC, as a converted time is (Attributes): string() writes a time in its own zone, so the
 		// host's clock in each replica's local zone would decide by where the replica runs.
-		"request": map[string]any{"time": a.cfg.Now().UTC(), "attributes": requestAttributes},
+		"request": variable(map[string]any{"time": a.cfg.Now().UTC(), "attributes": requestAttributes}),
 		"action":  string(p),
 	}
+}
+
+// variable is m, the subject, the resource or the request as a condition reads it, read whole as its
+// attributes are where they hold one refused (refusing): by name alone, as m.attributes, so whatever
+// reads m whole, comparing it, finding it or in it, size() and the macros, fails, as it would reach
+// them; read whole, `subject != {"kind": "user"}` held, though no condition could read what
+// subject.attributes held.
+func variable(m map[string]any) any {
+	if attributes, ok := m["attributes"].(ref.Val); ok && refusing(attributes) {
+		return refusedAttributes{Mapper: types.NewStringInterfaceMap(types.DefaultTypeAdapter, m)}
+	}
+	return m
 }
 
 // asking is a subject's and a request's attributes as conditions read them, and a converter
@@ -2458,8 +2509,8 @@ func (a *Authorizer) askingOf(ctx context.Context, s Subject) *asking {
 // it: by its type and id, as checks decide those on it bare (decidedOn), and with attributes that
 // refuse every read. Empty, a test of an attribute's presence would hold for what the bare tenant
 // lacks, so a deny guarded by one would lift while the host's tenant has it.
-func valueResource(tenant string) map[string]any {
-	return map[string]any{"type": TenantScope, "id": tenant, "tenant": tenant, "attributes": unreadable}
+func valueResource(tenant string) any {
+	return variable(map[string]any{"type": TenantScope, "id": tenant, "tenant": tenant, "attributes": unreadable})
 }
 
 // valueVars is what a condition deciding a label value or a power to release for s on tenant reads:
@@ -2509,11 +2560,12 @@ func declared(declares map[string]AttributeType, attributes map[ref.Val]ref.Val)
 	return attrs
 }
 
-// refusedAttributes are a kind's attributes with some refused, as conditions read them. A refused
-// one fails what reads it by name, as CEL fails a value that is an error, and so does a test of
-// its presence, which CEL reads from a map's keys alone and which would otherwise hold. Whatever
-// reads the map as a whole, in, size(), the macros and comparing it, fails too, as it could tell a
-// refused name from one never passed.
+// refusedAttributes are a kind's attributes with some refused, as conditions read them, or the
+// subject, the resource or the request holding such attributes (variable). A refused one fails what
+// reads it by name, as CEL fails a value that is an error, and so does a test of its presence,
+// which CEL reads from a map's keys alone and which would otherwise hold. Whatever reads the map as
+// a whole, in, size(), the macros and comparing it, fails too, as it could tell a refused name from
+// one never passed.
 type refusedAttributes struct {
 	traits.Mapper
 	// all refuses every name, passed or not.

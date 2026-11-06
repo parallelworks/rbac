@@ -263,8 +263,13 @@ scopes conditional ones reach, to check one by one.
   A kind's attributes, the subject's, the resource's or the request's, holding anything else,
   however deep, can't be read as a whole, as a policy engine fails input it can't read: every
   condition reading any of them fails, `has()` and `in` included, and so does one keying a map by
-  them, finding them in a map, or comparing, or finding in a list, a list or a map holding them, so a
-  grant's gives nothing and a deny's applies, while the other kinds' are read. Every kind's that
+  them, comparing them or finding them in a list, building a list or a map holding them, as
+  `[subject.attributes]`, whatever reads it, or reading the `subject`, the `resource` or the
+  `request` holding them whole, as comparing it or `size()` does, rather than by a field's name,
+  so a grant's gives nothing and a deny's applies, while the other kinds' are read. Built, a list
+  holding them was decided by its size or another value it held, so `[subject.attributes] != []`
+  held, and `[subject.attributes, 1] == [{}, 2]` failed for these but was false for a kind whose
+  declared attribute was passed as another type; it fails for both. Every kind's that
   can't be read are the same value, so a map hashed them as one: past what a check converts, below,
   `request.attributes in {subject.attributes: true}` held, and a deny guarded by its negation
   lifted. So do those holding a `ref.Val` of the host's
@@ -285,8 +290,13 @@ scopes conditional ones reach, to check one by one.
   them, and a value the resource's share with them included again, as the resource's are converted
   apart, counted as reading them costs a condition, one for each value and a tenth of each string's,
   bytes', JSON number's, JSON text's or `Any`'s type URL's length, and half an `Any`'s packed bytes,
-  about a map of 50,000 short strings: past that every condition reading an attribute fails, as it
-  does where JSON text may hold more, by its brackets, braces, commas and colons. Converting stops
+  but what building a value costs where that is more: 8 for each map, `Struct` or JSON object, and 4
+  for each list, `ListValue` or JSON array, each pointer, but to a message, and each other message.
+  That is about a map of 50,000 short strings, or 16,000 maps of one entry each, and a unit costs
+  about what reading one does, so a check spends no more converting than its conditions may reading,
+  about 20 ms: each map charged one, as a number is, a check of a resource whose tags held 156,000
+  empty maps took 108 ms. Past that every condition reading an attribute fails, as it does where
+  JSON text may cost more, by its brackets, braces, commas and colons. Converting stops
   10,000 deep, so what a kind nesting deeper is charged, and whether the kinds after it fit, can
   turn on the order a map's entries come in, failing closed, and nothing else turns on that order,
   nor on the order of the kinds. The subject's, the
@@ -360,7 +370,11 @@ scopes conditional ones reach, to check one by one.
   may cost and is now bounded as the timestamp it is, a few units. Attributes holding JSON text or
   a packed message that sets a key twice, JSON text that isn't UTF-8 or escapes half a surrogate
   pair, or a `json.Number` JSON doesn't write, were read and now can't be, failing every condition
-  reading their kind. Going back to an
+  reading their kind. Attributes holding maps, lists, pointers or messages are charged what building
+  them costs, so ones a check converted before can be past what it converts now, as 80,000 empty
+  maps are, failing every condition reading an attribute; and a condition building a list or a map
+  holding attributes no condition can read, or reading the `subject`, the `resource` or the
+  `request` holding them whole, was decided without them and now fails. Going back to an
   earlier release of this package does the same where that release bounds a shape more, so while
   replicas of two releases run side by side, those
   bounding a shape more may refuse changes adding a condition to a scope the others filled. To
