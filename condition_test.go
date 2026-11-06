@@ -309,7 +309,8 @@ func TestAValueOfAHostsOwnTypeSayingItIsCELsFailsItsConditions(t *testing.T) {
 // was found by and compared as CEL does: a map keyed by NaN equaled none, and one keyed by an array
 // holding NaN found no key, so a grant's `!=` held, and its infinite key was found by one a
 // condition reads, where `in` fails. Each fails every condition reading its kind, finite or not,
-// empty too. A double that isn't finite a condition makes in a list still fails what compares it.
+// empty too. A double that isn't finite a condition makes in a list fails too, as building the list
+// does.
 func TestAMapTheHostPassesKeyedByADoubleOrAnArrayFailsItsConditions(t *testing.T) {
 	for name, m := range map[string]any{
 		"NaN": map[float64]any{math.NaN(): 1}, "infinity": map[float64]any{math.Inf(1): 1}, "a half": map[float64]any{0.5: 1},
@@ -332,8 +333,88 @@ func TestAMapTheHostPassesKeyedByADoubleOrAnArrayFailsItsConditions(t *testing.T
 			t.Errorf("%s: evaluated %t, %v", expr, evaluated, err)
 		}
 	}
-	if held, _, _, err := rbac.EvaluateCondition(t, `!("a key longer than the map it is looked up in" in {"k": 0.0 / 0.0})`, nil); err != nil || !held {
-		t.Errorf("in a map holding NaN as a value: held %t, %v", held, err)
+}
+
+// Comparing reads the smaller value whole and the larger only as far, so a list or a map holding a
+// double that isn't finite was decided by another value it held where it was the larger: comparing
+// failed where the smaller held one, but `[0.0 / 0.0, "<long>"] != [1, 2]` held, and a deny's
+// `request.attributes.scores == [1, 2]` lifted where the request's scores held NaN beside a long
+// string. No list or map a condition reads holds one: a literal holding one fails as it is built,
+// and a host's attribute holding one, however deep, is refused, as a declared double that isn't
+// finite is, while the kind's others are read. `in` a map a condition makes holding one as a value,
+// which reads no value, was false for a key it lacks, and now fails as building the map does.
+func TestNoListOrMapAConditionReadsHoldsADoubleThatIsntFinite(t *testing.T) {
+	long := strings.Repeat("x", 100)
+	quoted := strconv.Quote(long)
+	for _, expr := range []string{
+		`[0.0 / 0.0, ` + quoted + `] != [1, 2]`, `[1, 2] != [0.0 / 0.0, ` + quoted + `]`, `[[1.0 / 0.0], ` + quoted + `] != [[1], 2]`,
+		`{"a": 0.0 / 0.0, "b": ` + quoted + `} != {"a": 1, "c": 2}`, `[double("-inf")].size() == 1`, `has({"k": 0.0 / 0.0}.k)`,
+		`!("a key longer than the map it is looked up in" in {"k": 0.0 / 0.0})`, `[1.0, 0.0].map(x, 1.0 / x).size() == 2`,
+		`[1.0, 0.0].map(x, 1.0 / x).exists(r, r > 0.5)`, `!(dyn(0.0 / 0.0) in {"a": 1})`, `!(1.0 / 0.0 in [1.0, 2.0])`,
+	} {
+		if held, evaluated := rbac.EvaluateConditionOf(t, expr, nil, nil, nil); evaluated {
+			t.Errorf("%s: held %t", expr, held)
+		}
+	}
+	for _, expr := range []string{
+		`[1.0 / 2.0, ` + quoted + `] != [1, 2]`, `has({"k": 0.5}.k)`, `[1.0, 2.0].map(x, 1.0 / x).size() == 2`,
+	} {
+		if held, _ := rbac.EvaluateConditionOf(t, expr, nil, nil, nil); !held {
+			t.Errorf("%s: didn't hold", expr)
+		}
+	}
+	nan, inf := math.NaN(), math.Inf(1)
+	for name, scores := range map[string]any{
+		"a float64":     []any{nan, long},
+		"a float32":     []any{float32(inf), long},
+		"CEL's double":  []any{types.Double(-inf), long},
+		"a DoubleValue": []any{wrapperspb.Double(nan), long},
+		"a FloatValue":  []any{wrapperspb.Float(float32(inf)), long},
+		"a Value":       &structpb.ListValue{Values: []*structpb.Value{structpb.NewNumberValue(nan), structpb.NewStringValue(long)}},
+		"a map":         []any{map[string]any{"a": []any{nan}}, long},
+		"a pointer":     []any{&nan, long},
+	} {
+		attributes := map[string]any{"scores": scores, "other": "x"}
+		for _, expr := range []string{
+			`request.attributes.scores != [1, 2]`, `[request.attributes.scores] != [[1, 2]]`, `size(request.attributes.scores) == 2`,
+			`has(request.attributes.scores)`, `request.attributes.scores[1] != ""`, `"scores" in request.attributes`,
+			`request.attributes != {"scores": [1, 2], "other": "x"}`, `size(request) == 2`,
+		} {
+			if held, evaluated := rbac.EvaluateConditionOf(t, expr, nil, nil, attributes); evaluated {
+				t.Errorf("%s of scores holding %s that isn't finite: held %t", expr, name, held)
+			}
+		}
+		if held, _ := rbac.EvaluateConditionOf(t, `request.attributes.other == "x" && request.time > timestamp(0)`, nil, nil, attributes); !held {
+			t.Errorf("an attribute beside scores holding %s that isn't finite: didn't hold", name)
+		}
+	}
+	// So a grant comparing them gives nothing, and a deny applies.
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole) })
+	given := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	given.Condition = rbac.Condition{Expression: `request.attributes.scores != [1, 2]`}
+	h.seed(t, given, grant(cluster.Scope(), "cluster.login", rbac.User, "d"), grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+	ctx := t.Context()
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, rbac.Deny{
+		ID: "scored", Principals: []rbac.Principal{identity("d")}, Permissions: []rbac.Permission{login},
+		Condition: rbac.Condition{Expression: `request.attributes.scores == [1, 2]`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	is := func(id string, scores []any) bool {
+		t.Helper()
+		err := h.authz.Authorize(rbac.WithRequest(ctx, map[string]any{"scores": scores}), h.as(t, id), login, cluster)
+		if err != nil && !errors.Is(err, rbac.ErrDenied) {
+			t.Fatal(err)
+		}
+		return err == nil
+	}
+	for _, id := range []string{"u", "d"} {
+		if !is(id, []any{0.5, long}) {
+			t.Fatalf("%s, passing finite scores, can't log in", id)
+		}
+		if is(id, []any{nan, long}) {
+			t.Errorf("%s, passing scores holding NaN, logs in", id)
+		}
 	}
 }
 
@@ -1716,6 +1797,32 @@ func TestAttributesNoConditionReadsFailWhateverHoldsThem(t *testing.T) {
 		s.Attributes = whole
 		if allowed(t, h, s, login, cluster) {
 			t.Errorf("%s, passing attributes no condition reads whole, logs in", id)
+		}
+	}
+}
+
+// A map literal naming a key twice is built holding the value named last, so attributes no
+// condition can read, or a double that isn't finite, named before it were dropped unread:
+// `{"a": subject.attributes, "a": 1}.a == 1` held where `{"a": 1, "a": subject.attributes}.a == 1`
+// failed, deciding by which was built last, and so did one whose keys are the same only as it runs,
+// as `{subject.id: subject.attributes, "u": 1}`. One naming a key twice fails, as a map the host
+// passes holding two keys read as one does.
+func TestAMapLiteralNamingAKeyTwiceFails(t *testing.T) {
+	whole := map[string]any{"badge": struct{ X int }{1}}
+	for _, expr := range []string{
+		`{"a": subject.attributes, "a": 1}.a == 1`, `{"a": 1, "a": subject.attributes}.a == 1`,
+		`{subject.id: subject.attributes, "u": 1} == {"u": 1}`, `{subject.kind: subject, "user": 1}.user == 1`,
+		`{"a": 0.0 / 0.0, "a": 1.0} == {"a": 1.0}`, `{"a": 1, "a": 2}.a == 2`,
+	} {
+		for name, subject := range map[string]map[string]any{"a condition reads": {"team": "a"}, "no condition reads whole": whole} {
+			if held, evaluated := rbac.EvaluateConditionOf(t, expr, subject, nil, nil); evaluated {
+				t.Errorf("%s of attributes %s: held %t", expr, name, held)
+			}
+		}
+	}
+	for _, expr := range []string{`{"a": 1, "b": 2}.a == 1`, `{subject.id: 1, "v": 2}[subject.id] == 1`, `{1: "a", 2: "b"}.size() == 2`} {
+		if held, _ := rbac.EvaluateConditionOf(t, expr, nil, nil, nil); !held {
+			t.Errorf("%s: didn't hold", expr)
 		}
 	}
 }

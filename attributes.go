@@ -54,8 +54,11 @@ import (
 // the kind's attributes as a whole, by `in`, size(), a macro, comparing them or a list or a map
 // holding them, or the subject, the resource or the request holding them, as reading the attributes
 // of a kind no condition can read does. A name a declared kind doesn't declare, which a condition
-// reads only through dyn(), fails so too. An undeclared kind's are read as converted, and CEL
-// compares values of different types as unequal.
+// reads only through dyn(), fails so too, and so does one holding a double that is NaN or
+// infinite, however deep, in an undeclared kind too: comparing reads the smaller value whole and
+// the larger only as far, so a list holding NaN beside a long string was compared by the string,
+// and `request.attributes.scores != [1, 2]` held. An undeclared kind's others are read as
+// converted, and CEL compares values of different types as unequal.
 //
 // What a host passes as a kind's attributes, the subject's, the resource's or the request's, is
 // converted, where a check reads a condition, once and whole, into CEL's own values, and
@@ -226,6 +229,9 @@ type converter struct {
 	// unread counts the values converting found no condition can read, as a struct, one holding
 	// itself, or one holding either, and deep those it found nested past maxNested.
 	unread, deep int
+	// infinite counts the doubles converting found that aren't finite, and the values holding one,
+	// which make the attribute holding them refused (attributes).
+	infinite int
 	// done is where in converted each it converted is, by where it points.
 	done      map[copiedKey]int
 	converted []conversion
@@ -235,7 +241,8 @@ type converter struct {
 }
 
 // conversion is what a converter found of a value it converted, while open converting it: what it
-// is to conditions, and how deep it nests, counting itself, or that no condition can read it.
+// is to conditions, and how deep it nests, counting itself, or that no condition can read it, and
+// whether it holds a double that isn't finite.
 type conversion struct {
 	to ref.Val
 	// of is where the value points, kept so that it is no other value's, which the converter would
@@ -243,9 +250,9 @@ type conversion struct {
 	// and packed messages once converted, and freed, what a kind after decoded came to be where it
 	// was and was read as converted from it. It is where the value points, not the value as read,
 	// as each of a map's entries is read into the same value (dict).
-	of                    any
-	height                int
-	open, unreadable, cut bool
+	of                              any
+	height                          int
+	open, unreadable, cut, infinite bool
 }
 
 func newConverter() *converter { return &converter{left: maxConverted} }
@@ -257,11 +264,15 @@ func (c *converter) rest() converter { return converter{left: c.left, over: c.ov
 // attributes is a kind's attributes as conditions read them, by their names, nil for none, and
 // whether a condition can read them: where any value they hold, however deep, can't be read, as a
 // struct, or nests past maxNested, or holds itself, none can, as the attributes beside one would
-// leave each operator reading them to tell what it reads from what it can't. Each is converted, and
-// charged, whether one before it could be read or not, so what is left for the kinds after it
-// doesn't turn on the order a map's entries come in, but where they nest past maxNested: converting
-// stops there, so they are charged for as much of them as it reached first, which that order picks,
-// and whether the kinds after them fit what is left can turn on it, failing closed.
+// leave each operator reading them to tell what it reads from what it can't. One holding a double
+// that isn't finite, however deep, is an error, which declared makes the kind refuse, as it refuses
+// a declared double that isn't finite: comparing a list or a map reads the smaller value whole and
+// the larger only as far, so a list holding NaN beside a long string was compared by the string,
+// and `request.attributes.scores != [1, 2]` held. Each is converted, and charged, whether one before
+// it could be read or not, so what is left for the kinds after it doesn't turn on the order a map's
+// entries come in, but where they nest past maxNested: converting stops there, so they are charged
+// for as much of them as it reached first, which that order picks, and whether the kinds after them
+// fit what is left can turn on it, failing closed.
 func (c *converter) attributes(attributes map[string]any) (map[ref.Val]ref.Val, bool) {
 	if len(attributes) == 0 {
 		return nil, true
@@ -278,7 +289,11 @@ func (c *converter) attributes(attributes map[string]any) (map[ref.Val]ref.Val, 
 		if !c.pay(textLength(len(name))) {
 			return nil, false
 		}
+		infinite := c.infinite
 		out[types.String(name)], _ = c.of(reflect.ValueOf(v))
+		if c.infinite != infinite {
+			out[types.String(name)] = types.NewErr("rbac: attribute %q holds a double that isn't finite", name)
+		}
 	}
 	for _, k := range c.cut {
 		delete(c.done, k)
@@ -351,8 +366,11 @@ func (c *converter) of(v reflect.Value) (ref.Val, int) {
 	// CEL's own string is read as the string, as any other pointer is read as what it points to.
 	if t.Implements(refValType) && (t.Kind() != reflect.Pointer || !t.Elem().Implements(refValType)) {
 		if v, ok := v.Interface().(ref.Val); ok && celScalar(v) {
-			if at, ok := v.(types.Timestamp); ok {
-				v = types.Timestamp{Time: at.UTC()}
+			switch s := v.(type) {
+			case types.Timestamp:
+				v = types.Timestamp{Time: s.UTC()}
+			case types.Double:
+				v = c.double(float64(s))
 			}
 			return c.spend(textSize(v)-1, v), 1
 		}
@@ -369,7 +387,7 @@ func (c *converter) of(v reflect.Value) (ref.Val, int) {
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		return types.Uint(v.Uint()), 1
 	case reflect.Float32, reflect.Float64:
-		return types.Double(v.Float()), 1
+		return c.double(v.Float()), 1
 	case reflect.String:
 		s := v.String()
 		return c.spend(uint64(len(s))/10, types.String(s)), 1
@@ -405,6 +423,15 @@ func (c *converter) of(v reflect.Value) (ref.Val, int) {
 func (c *converter) refuse() ref.Val {
 	c.unread++
 	return nil
+}
+
+// double is d as a condition reads it, counting one that isn't finite, which makes the attribute
+// holding it refused (attributes).
+func (c *converter) double(d float64) ref.Val {
+	if math.IsNaN(d) || math.IsInf(d, 0) {
+		c.infinite++
+	}
+	return types.Double(d)
 }
 
 // celScalar reports whether v is one of CEL's own values that holds no other.
@@ -471,6 +498,9 @@ func (c *converter) once(v reflect.Value, convert func() (ref.Val, int)) (ref.Va
 			c.deep++
 			return nil, 0
 		default:
+			if d.infinite {
+				c.infinite++
+			}
 			return d.to, d.height
 		}
 	}
@@ -480,7 +510,7 @@ func (c *converter) once(v reflect.Value, convert func() (ref.Val, int)) (ref.Va
 	i := len(c.converted)
 	c.done[k] = i
 	c.converted = append(c.converted, conversion{of: v.UnsafePointer(), open: true})
-	unread, deep := c.unread, c.deep
+	unread, deep, infinite := c.unread, c.deep, c.infinite
 	to, height := convert()
 	d := &c.converted[i]
 	d.open = false
@@ -493,7 +523,7 @@ func (c *converter) once(v reflect.Value, convert func() (ref.Val, int)) (ref.Va
 		d.cut = true
 		c.cut = append(c.cut, k)
 	default:
-		d.to, d.height = to, height
+		d.to, d.height, d.infinite = to, height, c.infinite != infinite
 	}
 	return to, height
 }
@@ -947,7 +977,7 @@ func (c *converter) message(v reflect.Value) (ref.Val, int) {
 		var held reflect.Value
 		switch k := m.GetKind().(type) {
 		case *structpb.Value_NumberValue:
-			return types.Double(k.NumberValue), 1
+			return c.double(k.NumberValue), 1
 		case *structpb.Value_StringValue:
 			return c.spend(uint64(len(k.StringValue))/10, types.String(k.StringValue)), 1
 		case *structpb.Value_BoolValue:
@@ -966,9 +996,9 @@ func (c *converter) message(v reflect.Value) (ref.Val, int) {
 	case *wrapperspb.BytesValue:
 		return c.spend(uint64(len(m.GetValue()))/10, types.Bytes(m.GetValue())), 1
 	case *wrapperspb.DoubleValue:
-		return types.Double(m.GetValue()), 1
+		return c.double(m.GetValue()), 1
 	case *wrapperspb.FloatValue:
-		return types.Double(m.GetValue()), 1
+		return c.double(float64(m.GetValue())), 1
 	case *wrapperspb.Int32Value:
 		return types.Int(m.GetValue()), 1
 	case *wrapperspb.Int64Value:
@@ -1615,8 +1645,9 @@ func (c *copier) lengthen(v reflect.Value, k copiedKey, s *copied) *copied {
 // reaching another twice copied it for each path to it. A nil message, as a list may hold, is copied
 // as a new one each time, as cloning copies it: each is the same nil, but none is another's. What
 // reaches m pays the one it costs as a value, as converting a message the host passes counts it
-// once: counted again here, a copy of a resource's 100,000 timestamps cost twice what converting
-// them did, and a check converting them couldn't ask a constraint about them.
+// once: counted again here, a copy of a resource's nearly 40,000 timestamps, which a check converts,
+// cost a quarter more than converting them did, so a check converting them couldn't ask a
+// constraint about them.
 func (c *copier) message(m protoreflect.Message, depth int) protoreflect.Message {
 	if !m.IsValid() {
 		return m.New()

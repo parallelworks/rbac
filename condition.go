@@ -39,15 +39,17 @@ import (
 // such as `request.time < timestamp("2027-01-01T00:00:00Z") && resource.attributes.env != "prod"`.
 // A grant with one gives its role only where the expression is true. An expression that fails, as
 // one reading an attribute the host didn't pass does, or comparing a double that isn't finite, as
-// dividing by zero makes, or a value holding one, in a list or a map, as a key too, converting one
-// to a string or keying a map by one, is false, though `in` a map a condition makes keyed by a list
-// holding one is false for a key it doesn't hold. What the host passes is converted into CEL's own
+// dividing by zero makes, converting one to a string, keying a map by one or building a list or a
+// map holding one, so no list or map a condition reads holds one, or building a map that names a
+// key twice, is false. What the host passes is converted into CEL's own
 // values, the subject's and the request's attributes once for a call and a resource's once for each
 // check of it, from the values Attributes names, and a kind's attributes holding anything else
 // can't be read, every condition reading one of them failing, a test of its presence too, and so
 // does one keying a map by them, comparing them or finding them in a list, building a list or a map
 // holding them, or reading the subject, the resource or the request holding them whole, so
-// conditions read CEL's own values alone, at what reading any value of its size costs. A label
+// conditions read CEL's own values alone, at what reading any value of its size costs; an attribute
+// holding a double that isn't finite, however deep, fails whatever reads it, and whatever reads its
+// kind whole. A label
 // value and a power to release are decided on the tenant with no attributes, whatever a check
 // passes (Holding), and their conditions can't read the tenant's: any read of resource.attributes
 // fails, a test of an attribute's presence, in, size(), a macro and a comparison included, so a
@@ -934,8 +936,8 @@ func searchCost(function string, args []ref.Val) uint64 {
 // It charges what a comparison reads as it measures it (measured), before the comparison runs,
 // beside the steps (counting), so it reads the values once to measure them, however large, where
 // measuring them again for CEL's charge, and again in search of a double that isn't finite, read
-// them about ten times for each unit charged. It refuses a comparison of a value holding such a
-// double too, or attributes no condition reads (refusing), a time read in a zone that can't be one
+// them about ten times for each unit charged. It refuses a comparison of such a double too, or of
+// attributes no condition reads (refusing), a time read in a zone that can't be one
 // (inZone), and a search of a string that would cost more than a condition may (searched). It notes
 // each call it plans so.
 func (g *guards) bounded(i interpreter.Interpretable) (interpreter.Interpretable, error) {
@@ -1627,20 +1629,24 @@ func building(e ast.Expr) uint64 {
 
 // literals charges each list and map literal of a condition what building it costs, before it is
 // built, beside the steps (counting), as keying charges a key. sizes are what each that holds any
-// costs, by its id, and planned those planned so.
+// costs, by its id, named the entries each map literal names, and planned those planned so.
 type literals struct {
 	sizes   map[int64]uint64
+	named   map[int64]int
 	planned map[int64]bool
 	limit   uint64
 }
 
 func newLiterals(checked *ast.AST, limit uint64) *literals {
-	l := &literals{sizes: map[int64]uint64{}, planned: map[int64]bool{}, limit: limit}
+	l := &literals{sizes: map[int64]uint64{}, named: map[int64]int{}, planned: map[int64]bool{}, limit: limit}
 	for _, e := range ast.MatchDescendants(ast.NavigateAST(checked), func(e ast.NavigableExpr) bool {
 		return e.Kind() == ast.ListKind || e.Kind() == ast.MapKind
 	}) {
 		if n := building(e); n > 0 {
 			l.sizes[e.ID()] = n
+		}
+		if e.Kind() == ast.MapKind {
+			l.named[e.ID()] = len(e.AsMap().Entries())
 		}
 	}
 	return l
@@ -1655,60 +1661,79 @@ func (l *literals) decorate(i interpreter.InterpretableV2) (interpreter.Interpre
 		return i, nil
 	}
 	l.planned[i.ID()] = true
-	return &literal{InterpretableConstructor: c, n: n, limit: l.limit}, nil
+	return &literal{InterpretableConstructor: c, n: n, named: l.named[i.ID()], limit: l.limit}, nil
 }
 
 // literal is a list or map literal, charged what building it costs before it builds: it makes room
-// for all it holds first. CEL still charges it as the literal it is.
+// for all it holds first. CEL still charges it as the literal it is. named is how many entries a
+// map literal names.
 type literal struct {
 	interpreter.InterpretableConstructor
 	n, limit uint64
+	named    int
 }
 
-// Exec builds the literal, failing where it holds attributes no condition reads (refusing), as
-// whatever read it would meet them: built, a list or a map holding them was decided by its size, or
-// by another value it held, as comparing reads only the smaller value whole, so
-// `[subject.attributes] != []` held, as did size(), has() and a loop over one, and
-// `[subject.attributes, 1] == [{}, 2]` failed for a kind no condition can read whole but was false
-// for one declarations refuse in part, which is larger. No list or map a condition reads holds them
-// otherwise, but the subject, the resource and the request, which are read whole as their
-// attributes are (variable).
+// Exec builds the literal, failing where it holds what no list or map a condition reads holds
+// (misheld), as whatever read it would meet it: built, a list or a map holding attributes no
+// condition reads was decided by its size, or by another value it held, as comparing reads only
+// the smaller value whole, so `[subject.attributes] != []` held, as did size(), has() and a loop
+// over one, and `[subject.attributes, 1] == [{}, 2]` failed for a kind no condition can read whole
+// but was false for one declarations refuse in part, which is larger; and one holding a double that
+// isn't finite was too, so `[0.0 / 0.0, "<long>"] != [1, 2]` held. No list or map a condition reads
+// holds either otherwise: the subject, the resource and the request are read whole as their
+// attributes are (variable), and a host's attribute holding such a double is refused (Attributes).
 func (l *literal) Exec(frame *interpreter.ExecutionFrame) ref.Val {
 	chargePast(frame, l.n, l.limit)
 	built := l.InterpretableConstructor.Exec(frame)
-	if holdsRefused(built) {
-		return types.LabelErrNode(l.ID(), refusal())
+	if failed := misheld(built, l.named); failed != nil {
+		return types.LabelErrNode(l.ID(), failed)
 	}
 	return built
 }
 
-// holdsRefused reports whether v, a list or a map a literal built, holds attributes no condition
-// reads as an element, a key or a value, reading each once, as building it was charged for.
-func holdsRefused(v ref.Val) bool {
+// misheld is what building v, a list or a map a literal built, fails with, or nil: where it holds
+// attributes no condition reads (refusing), or a double that isn't finite (nonFinite), as an
+// element, a key or a value, reading each once, as building it was charged for, and failing as the
+// attributes do where it holds both, whatever order a map's entries come in; or, for a map literal
+// naming named entries, where it holds fewer, as one
+// naming a key twice, which CEL builds holding the value named last: the one named before was
+// dropped unread, so `{"a": subject.attributes, "a": 1}.a == 1` held where
+// `{"a": 1, "a": subject.attributes}.a == 1` failed, deciding by which was built last.
+func misheld(v ref.Val, named int) ref.Val {
+	var refused, infinite bool
+	note := func(v ref.Val) {
+		refused, infinite = refused || refusing(v), infinite || nonFinite(v)
+	}
 	switch v := v.(type) {
 	case traits.Mapper:
+		if count(v) < length(named) {
+			return types.NewErr("rbac: a map literal names a key twice")
+		}
 		if native := entries(v); native != nil {
 			for k, e := range native {
-				if refusing(k) || refusing(e) {
-					return true
-				}
+				note(k)
+				note(e)
 			}
-			return false
+			break
 		}
 		for it := v.Iterator(); it.HasNext() == types.True; {
-			if k := it.Next(); refusing(k) || refusing(v.Get(k)) {
-				return true
-			}
+			k := it.Next()
+			note(k)
+			note(v.Get(k))
 		}
 	case traits.Lister:
 		n, _ := v.Size().(types.Int)
 		for i := types.Int(0); i < n; i++ {
-			if refusing(v.Get(i)) {
-				return true
-			}
+			note(v.Get(i))
 		}
 	}
-	return false
+	switch {
+	case refused:
+		return refusal()
+	case infinite:
+		return incomparable()
+	}
+	return nil
 }
 
 func (l *literal) Eval(vars interpreter.Activation) ref.Val { return l.Exec(interpreter.AsFrame(vars)) }
@@ -1781,12 +1806,12 @@ var errNonFiniteKey = errors.New("rbac: a double that isn't finite can't be a ke
 // CEL finds no key equal to NaN, so a map keyed by one would equal no map and hold no value, and a
 // deny's `{failed / total: 1} == {0.5: 1}` would lift where both are 0.0. A condition computes
 // every key it can make one of, since none is written, and no map the host passes is keyed by a
-// double (Attributes). One a condition makes can be keyed by a list holding one: comparing it
-// fails (measured), but a key not found `in` it is false, as finding whether it holds one would
-// read every key, uncharged. It fails for attributes no condition reads (refusing) too, which a map
+// double (Attributes). It fails for attributes no condition reads (refusing) too, which a map
 // hashes as the value they are, one for every kind no condition reads: with every kind past
 // maxConverted, `size({request.attributes: 1, subject.attributes: 2}) == 1` held. No list a key can
-// be holds them, as building one fails (literal).
+// be holds either, as building one fails (literal): keyed by a list holding NaN, a map a condition
+// made equaled none, and a key not found `in` it was false, as finding whether it held one would
+// read every key, uncharged.
 func comparableKey(key ref.Val) ref.Val {
 	if refusing(key) {
 		return refusal()
@@ -1843,7 +1868,8 @@ func ordering(function string) func(x, y ref.Val) ref.Val {
 // dividing by zero or converting "NaN". CEL orders and equates NaN as false with anything, so a
 // deny's `failed / total >= 0.5` would lift where both are 0.0, and -Inf orders below every
 // bound, so comparing either fails, as a declared double that isn't finite does. A condition reads
-// no double but CEL's own (Attributes).
+// no double but CEL's own (Attributes), and no list or map holding one that isn't finite: building
+// one fails (literal), and a host's attribute holding one is refused (converter).
 func nonFinite(v ref.Val) bool {
 	d, ok := v.(types.Double)
 	return ok && (math.IsNaN(float64(d)) || math.IsInf(float64(d), 0))
@@ -1964,41 +1990,34 @@ func contains(l traits.Lister, x ref.Val) ref.Val {
 
 // measured is what comparing x with y, or finding x in y, reads, counted as valueSize counts it no
 // further than past maxCost, and what comparing fails with where either is attributes no condition
-// reads (refusing), or what it reads whole holds a double that isn't finite, in a list or a map, as
-// a key too, however deep, or nil: a map a condition makes can be keyed by a list holding NaN, which
-// no key is found equal to, so a map keyed by one equals none, and `in` it finds no key holding NaN.
-// No list or map holds attributes no condition reads, as a literal holding them fails (literal), but
-// the subject, the resource and the request, which are such attributes themselves where theirs are
-// (variable), so whatever compares or finds them fails, wherever they would be reached. Comparing
-// stops at the smaller value, so it reads both in step, a value of the one read less at a time,
-// until one is read whole, and the other only as far: a large value compared with a small one is
-// read as far as the small one, and each once. A map finds a key without reading the rest. It finds
-// no such double in a value it reads past the smaller, as finding it there would read uncharged and,
-// in a map, as far as the order its keys come in happens to reach, so what it reports would differ
-// from one check to the next. Comparing such a value decides as it would without it: it isn't as
-// large as the smaller one, so it is equal to none, and found in no list.
+// reads (refusing) or a double that isn't finite, or nil. No list or map a condition reads holds
+// either, as a literal holding one fails (literal) and a host's attribute holding such a double is
+// refused (converter), but the subject, the resource and the request, which are such attributes
+// themselves where theirs are (variable), so whatever compares or finds either fails, wherever it
+// would be reached. Found inside, comparing failed only where the smaller value held it, which
+// comparing reads whole: a value found in a list or a map it read past the smaller would be read
+// uncharged and, in a map, as far as the order its keys come in happens to reach, so
+// `[0.0 / 0.0, "<long>"] != [1, 2]` held, decided by another value the larger held. Comparing stops
+// at the smaller value, so it reads both in step, a value of the one read less at a time, until one
+// is read whole, and the other only as far: a large value compared with a small one is read as far
+// as the small one, and each once. A map finds a key without reading the rest.
 func measured(function string, x, y ref.Val) (uint64, ref.Val) {
-	if refusing(x) || refusing(y) {
+	switch {
+	case refusing(x) || refusing(y):
 		return 1, refusal()
-	}
-	if function != operators.In && !container(x) && !container(y) {
-		var failed ref.Val
-		if nonFinite(x) || nonFinite(y) {
-			failed = incomparable()
-		}
-		return min(textSize(x), textSize(y)), failed
+	case nonFinite(x) || nonFinite(y):
+		return 1, incomparable()
+	case function != operators.In && !container(x) && !container(y):
+		return min(textSize(x), textSize(y)), nil
 	}
 	mx, my := newMeter(x), newMeter(y)
 	if function == operators.In {
+		m := my
 		if _, keyed := y.(traits.Mapper); keyed {
-			mx.readTo(maxCost)
-			return mx.read, mx.failed()
+			m = mx
 		}
-		if my.readTo(maxCost); my.read > maxCost {
-			return my.read, nil
-		}
-		mx.readTo(my.read)
-		return my.read, cmp.Or(my.failed(), mx.failed())
+		m.readTo(maxCost)
+		return m.read, nil
 	}
 	for {
 		m := mx
@@ -2006,23 +2025,10 @@ func measured(function string, x, y ref.Val) (uint64, ref.Val) {
 			m = my
 		}
 		if m.whole || m.read > maxCost {
-			break
+			return m.read, nil
 		}
 		m.step()
 	}
-	n := min(mx.read, my.read)
-	if n > maxCost {
-		return n, nil
-	}
-	mx.readTo(n)
-	my.readTo(n)
-	within := func(m *meter) ref.Val {
-		if m.read > n {
-			return nil
-		}
-		return m.failed()
-	}
-	return n, cmp.Or(within(mx), within(my))
 }
 
 // valueSize is the cost of reading v whole, nested values included, counted no further than
@@ -2053,15 +2059,14 @@ func container(v ref.Val) bool {
 }
 
 // meter reads a value as valueSize counts it, a value at a time, so that two can be read in step
-// (measured): what it has read, whether it has read it whole, and whether a value it read is a
-// double that isn't finite. A list or map costs at least its length, or each entry a key and a
-// value, as soon as it is reached, so one too long to be within what is read is past it unread, and
-// each value it holds costs what reading it does past the 1 it was counted at (values). What it
-// reads comes to the same in any order, and only how far it reads past what is compared turns on
-// it, which nothing reads.
+// (measured): what it has read, and whether it has read it whole. A list or map costs at least its
+// length, or each entry a key and a value, as soon as it is reached, so one too long to be within
+// what is read is past it unread, and each value it holds costs what reading it does past the 1 it
+// was counted at (values). What it reads comes to the same in any order, and only how far it reads
+// past what is compared turns on it, which nothing reads.
 type meter struct {
-	read             uint64
-	whole, nonFinite bool
+	read  uint64
+	whole bool
 	// root is the value, until it is read; values are those reached, each counted at 1, and pending
 	// the lists and maps whose values are still to be found.
 	root    ref.Val
@@ -2087,15 +2092,6 @@ func (m *meter) readTo(limit uint64) {
 	for !m.whole && m.read <= limit {
 		m.step()
 	}
-}
-
-// failed is what comparing the value fails with where m read it whole and found in it a double that
-// isn't finite, or nil.
-func (m *meter) failed() ref.Val {
-	if m.whole && m.nonFinite {
-		return incomparable()
-	}
-	return nil
 }
 
 // step reads the next value. A list is dropped before its last element is read, so reading a value
@@ -2153,7 +2149,6 @@ func (m *meter) step() {
 
 // reach counts v, which reading costs n, with the least each value it holds costs.
 func (m *meter) reach(v ref.Val, n uint64) {
-	m.nonFinite = m.nonFinite || nonFinite(v)
 	switch v := v.(type) {
 	case traits.Mapper:
 		if k := count(v); k > 0 {
@@ -2535,22 +2530,27 @@ var unreadable = refusedAttributes{Mapper: noAttributes, all: true}
 // kind doesn't declare, made an error that whatever reads it fails on, comparing it included, as
 // one not passed is. CEL compares values of different types as unequal rather than fail, so
 // otherwise a `!=` would hold for it, and a deny's `==` would lift. A kind not declared is as
-// converted. It makes them so in place, as they are the check's own.
+// converted, but one converting made an error of, as one holding a double that isn't finite
+// (converter.attributes), refuses it as well. It makes them so in place, as they are the check's
+// own, reading each name once, as converting it was charged for.
 func declared(declares map[string]AttributeType, attributes map[ref.Val]ref.Val) any {
 	if len(attributes) == 0 {
 		return noAttributes
 	}
 	refused := false
-	if declares != nil {
-		for k, v := range attributes {
-			name, _ := k.(types.String)
-			// One it doesn't declare a condition reads only through dyn(), which no type is checked
-			// by when stored, so it fails as one of another type does.
-			if t, ok := declares[string(name)]; !ok {
-				attributes[k], refused = types.NewErr("rbac: attribute %q is not declared", string(name)), true
-			} else if !t.takes(v) {
-				attributes[k], refused = types.NewErr("rbac: attribute %q is not a %s", string(name), t), true
-			}
+	for k, v := range attributes {
+		name, _ := k.(types.String)
+		t, ok := declares[string(name)]
+		switch {
+		case types.IsError(v):
+			refused = true
+		case declares == nil:
+		// One it doesn't declare a condition reads only through dyn(), which no type is checked by
+		// when stored, so it fails as one of another type does.
+		case !ok:
+			attributes[k], refused = types.NewErr("rbac: attribute %q is not declared", string(name)), true
+		case !t.takes(v):
+			attributes[k], refused = types.NewErr("rbac: attribute %q is not a %s", string(name), t), true
 		}
 	}
 	attrs := types.NewRefValMap(types.DefaultTypeAdapter, attributes)
