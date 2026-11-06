@@ -794,15 +794,16 @@ func TestAsOfChecksSeekTheirSubjectsGrantsOnThePath(t *testing.T) {
 			} {
 				// Once before, as the calls share statements, which the first to run plans: planning
 				// reads the metapage of each empty index of history for each time a statement names
-				// it, which a later call, as each call in a map's random order can be, doesn't.
+				// it, which a later call, as each call in a map's random order can be, doesn't. Then
+				// the least a run reads, as runs planned again do (leastPages).
 				if err := f(); err != nil {
 					return fmt.Errorf("%s: %w", what, err)
 				}
-				start := historyPages(ctx, t, tx)
-				if err := f(); err != nil {
+				n, err := leastPages(ctx, t, tx, f)
+				if err != nil {
 					return fmt.Errorf("%s: %w", what, err)
 				}
-				pages[what+" planned "+plans] = historyPages(ctx, t, tx) - start
+				pages[what+" planned "+plans] = n
 			}
 			return nil
 		}); err != nil {
@@ -1215,6 +1216,35 @@ func TestAsOfListsAPrincipalsMembershipsAloneWhateverTheSessionsPlans(t *testing
 	}
 }
 
+// leastPages is the fewest pages of history tx's session reads in a run of f, once two runs have
+// read that few, or the fewest of ten. A session plans a statement it cached again once it takes an
+// invalidation of what the plan reads, which other sessions' catalog changes on a shared server can
+// send it at any moment, and several runs in a row, and planning reads the metapage of each empty
+// index of history, as those of prunes before any, for each time a statement names it: a run
+// planned again so read some 2,000 pages where the one before and after it read 376, and three in
+// a row did, with views made for each read or made by migrating alike. A run that isn't planned
+// again reads as many pages each time.
+func leastPages(ctx context.Context, t *testing.T, tx pgx.Tx, f func() error) (int64, error) {
+	t.Helper()
+	least, seen := int64(-1), 0
+	for range 10 {
+		start := historyPages(ctx, t, tx)
+		if err := f(); err != nil {
+			return 0, err
+		}
+		switch n := historyPages(ctx, t, tx) - start; {
+		case least < 0 || n < least:
+			least, seen = n, 1
+		case n == least:
+			seen++
+		}
+		if seen == 2 {
+			break
+		}
+	}
+	return least, nil
+}
+
 // customRolesAsOf is how many pages of history each of reads reads as of now, beside many tenants'
 // history, before the tenant has other custom roles and once it has 200, each defined four times.
 // With plans, the reads set their transaction's plan_cache_mode to it first.
@@ -1241,22 +1271,15 @@ func customRolesAsOf(t *testing.T, h *harness, plans string, reads map[string]fu
 				// planning reads the metapage of each empty index of history, as those of prunes
 				// before any, for each time a statement names it, so the read that ran first, in a
 				// map's random order, was counted hundreds of pages more than one that ran later.
-				// Then the least of three: a session plans a statement it cached again once it takes
-				// an invalidation of what the plan reads, which other sessions' catalog changes on a
-				// shared server can send it at any moment, and a run planned again so read the empty
-				// prune indexes' metapages hundreds of times more than the run before it.
+				// Then the least a run reads, as runs planned again do (leastPages).
 				if err := f(tx, a); err != nil {
 					return fmt.Errorf("%s: %w", what, err)
 				}
-				for i := range 3 {
-					start := historyPages(ctx, t, tx)
-					if err := f(tx, a); err != nil {
-						return fmt.Errorf("%s: %w", what, err)
-					}
-					if n := historyPages(ctx, t, tx) - start; i == 0 || n < pages[what] {
-						pages[what] = n
-					}
+				n, err := leastPages(ctx, t, tx, func() error { return f(tx, a) })
+				if err != nil {
+					return fmt.Errorf("%s: %w", what, err)
 				}
+				pages[what] = n
 			}
 			return nil
 		}); err != nil {
