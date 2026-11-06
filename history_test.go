@@ -712,10 +712,14 @@ func TestTheApplicationRoleNeedsNoTemporary(t *testing.T) {
 	}}))
 	exec(`DELETE FROM rbac_members WHERE tenant = 't1' AND principal = 'user:u'`)
 	check("Authorize", authz.Authorize(ctx, owner, login, cluster))
-	var cursor rbac.Cursor
-	if _, cursor, err = authz.History(ctx, cursor, rbac.MaxHistory); err != nil {
-		t.Errorf("History without TEMPORARY: %v", err)
+	// Every record, read once every transaction older than the last has ended, as other sessions
+	// sharing the cluster can hold one for a while.
+	var n int
+	if err := r.appPool.QueryRow(ctx, `SELECT count(*) FROM rbac_history WHERE entity <> 'commit'`).Scan(&n); err != nil {
+		t.Fatal(err)
 	}
+	var cursor rbac.Cursor
+	drain(t, &harness{ctx: ctx, pool: r.appPool, authz: authz, cfg: cfg}, &cursor, n)
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
