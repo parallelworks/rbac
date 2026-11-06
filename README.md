@@ -898,7 +898,8 @@ have the server load a library or run a program of its choosing; and:
    as it, which refuses the write without it; `EXECUTE` on the functions `rbac_tenant_keys` and
    `rbac_text_array`, which history's index of the keys denies name calls for each record, and
    which every role has unless it is revoked; and `CREATE` there to be given them, unless a
-   superuser gives them, or the schema's owner migrates, which grants it for the migration alone.
+   superuser gives them, or, for one a migration gives it, the schema's owner migrates, which grants
+   it for the migration alone.
 3. The application's role has `USAGE` on the package's schema, without which it reads none of its
    tables; `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the package's tables but `rbac_history` and
    `rbac_migrations`, and on any a later migration adds; `EXECUTE` on the functions
