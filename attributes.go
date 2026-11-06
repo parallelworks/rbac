@@ -1,21 +1,28 @@
 package rbac
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"math"
 	"reflect"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"cel.dev/cel-go/cel"
 	"cel.dev/cel-go/common/types"
 	"cel.dev/cel-go/common/types/ref"
 	"cel.dev/cel-go/common/types/traits"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -79,11 +86,19 @@ import (
 // one of CEL's types, a list, a map or an optional of CEL's a host makes, a struct, a channel, a
 // func, a complex number, a uintptr, any other message, a map keyed by any other value, as a double
 // or an array, a map holding two keys read as the same value, as 1 and 1u, or "a" twice of two
-// string types, invalid JSON, a value holding itself, or holding one that does, however long the
-// cycle, and a value nested deeper than JSON text may, 10,000 deep, along the longest path through
-// what the kind holds, wherever a value it shares with another was reached first. Reading the rest
-// would leave each operator to tell what it read from what it couldn't, as `in`, has() and a loop
-// over a map's keys each found a key whose value it couldn't read. A value reached twice, as a map
+// string types, and so JSON text naming a member of an object twice, as "role" and "r\u006fle" are
+// once unescaped, or an Any packing a message that sets a field twice, as a Struct with two entries
+// of "role", which decoding reads as the last, where a reader of the first reads another: a Struct
+// the host passes holds each key once, as a Go map does. So are invalid JSON, JSON text that isn't
+// UTF-8 or escapes half a surrogate pair, which encoding/json reads as U+FFFD, a json.Number that
+// isn't a number as JSON writes one, as "0x1p4" or "Inf", a value holding itself, or holding one
+// that does, however long the cycle, and a value nested deeper than JSON text may, 10,000 deep,
+// along the longest path through what the kind holds, wherever a value it shares with another was
+// reached first. Reading the rest would leave each operator to tell what it read from what it
+// couldn't, as `in`, has() and a loop over a map's keys each found a key whose value it couldn't
+// read; and a condition keying a map by them, finding them in one, or comparing a list or a map
+// holding them, fails too, as every kind's no condition reads are the same value. A value reached
+// twice, as a map
 // two lists hold, is converted once, for any kind reaching it, but a resource's sharing it, below. A
 // check converts at most maxConverted of what the host passes, counted as reading it costs a
 // condition, one for each value and a tenth of each string's, bytes', JSON number's, JSON text's or
@@ -600,13 +615,117 @@ func (c *converter) json(v reflect.Value) (ref.Val, int) {
 			c.over, c.left = true, 0
 			return nil, 0
 		}
-		var parsed any
-		if err := json.Unmarshal(v.Bytes(), &parsed); err != nil {
+		parsed, ok := parseJSON(v.Bytes())
+		if !ok {
 			return c.refuse(), 1
 		}
 		to, height := c.of(reflect.ValueOf(parsed))
 		return to, height + 1
 	})
+}
+
+// parseJSON is text parsed as encoding/json parses it into an any, and whether it is JSON a
+// condition can read: not where an object holds a name twice, as `"role"` and `"r\u006fle"` are
+// once unescaped, where text that isn't UTF-8 or escapes half a surrogate pair, which encoding/json
+// reads as U+FFFD, could hold two names read as one. Each reader of JSON picks one of two values of
+// a name as it likes, encoding/json the last, so a host checking the first read "user" of
+// `{"role": "user", "role": "admin"}` where a condition read "admin", as a map of the host's holding
+// two keys read as one would have it. The decoder refuses text nested more than 10,000 deep, as
+// encoding/json does, so jsonValue recurses no deeper.
+func parseJSON(text []byte) (any, bool) {
+	if !utf8.Valid(text) || !pairedSurrogates(text) {
+		return nil, false
+	}
+	dec := json.NewDecoder(bytes.NewReader(text))
+	v, err := jsonValue(dec)
+	if err != nil {
+		return nil, false
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, false
+	}
+	return v, true
+}
+
+var errJSON = errors.New("rbac: JSON text no condition can read")
+
+// jsonValue is the next value dec reads, as encoding/json parses it into an any, or why no condition
+// can read it (parseJSON).
+func jsonValue(dec *json.Decoder) (any, error) {
+	token, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return token, nil
+	}
+	switch delim {
+	case '[':
+		list := []any{}
+		for dec.More() {
+			v, err := jsonValue(dec)
+			if err != nil {
+				return nil, err
+			}
+			list = append(list, v)
+		}
+		_, err := dec.Token()
+		return list, err
+	case '{':
+		object := map[string]any{}
+		for dec.More() {
+			token, err := dec.Token()
+			if err != nil {
+				return nil, err
+			}
+			name, _ := token.(string)
+			if _, twice := object[name]; twice {
+				return nil, errJSON
+			}
+			if object[name], err = jsonValue(dec); err != nil {
+				return nil, err
+			}
+		}
+		_, err := dec.Token()
+		return object, err
+	}
+	return nil, errJSON
+}
+
+// pairedSurrogates reports whether each surrogate text escapes in a string, as `\ud83d\ude00`, is
+// half of a pair, the high one followed by the low one: encoding/json reads either half alone as
+// U+FFFD, as it reads bytes that aren't UTF-8.
+func pairedSurrogates(text []byte) bool {
+	// escaped is the code unit of the escape at text[i:], if it is one.
+	escaped := func(i int) (rune, bool) {
+		if i+6 > len(text) || text[i] != '\\' || text[i+1] != 'u' {
+			return 0, false
+		}
+		n, err := strconv.ParseUint(string(text[i+2:i+6]), 16, 16)
+		return rune(n), err == nil
+	}
+	quoted := false
+	for i := 0; i < len(text); i++ {
+		switch b := text[i]; {
+		case quoted && b == '\\':
+			r, ok := escaped(i)
+			switch {
+			case ok && utf16.IsSurrogate(r) && r < 0xdc00:
+				if low, ok := escaped(i + 6); !ok || low < 0xdc00 || low > 0xdfff {
+					return false
+				}
+				i += 11
+			case ok && utf16.IsSurrogate(r):
+				return false
+			default:
+				i++
+			}
+		case b == '"':
+			quoted = !quoted
+		}
+	}
+	return true
 }
 
 // jsonValues is how many values and keys JSON text text may hold: each but the first follows a
@@ -627,10 +746,15 @@ func jsonValues(text []byte) uint64 {
 }
 
 // number is n, a JSON number, an int where it is one and a double where it isn't, as CEL reads it,
-// at a tenth of its length whether it is one or not, as parsing it reads it whole, or nil.
+// at a tenth of its length whether it is one or not, as parsing it reads it whole, or nil. Text that
+// isn't a JSON number no condition can read, though strconv reads some as one, as "+1", "0x1p4" as
+// 16 and "Inf", where a host reading it as JSON reads none.
 func (c *converter) number(n string) ref.Val {
 	if !c.pay(uint64(len(n)) / 10) {
 		return nil
+	}
+	if !jsonNumber(n) {
+		return c.refuse()
 	}
 	if i, err := json.Number(n).Int64(); err == nil {
 		return types.Int(i)
@@ -639,6 +763,48 @@ func (c *converter) number(n string) ref.Val {
 		return types.Double(f)
 	}
 	return c.refuse()
+}
+
+// jsonNumber reports whether n is a number as JSON writes one: an optional minus, an integer with
+// no leading zero, then optionally a fraction and an exponent.
+func jsonNumber(n string) bool {
+	digits := func(i int) int {
+		for i < len(n) && '0' <= n[i] && n[i] <= '9' {
+			i++
+		}
+		return i
+	}
+	i := 0
+	if i < len(n) && n[i] == '-' {
+		i++
+	}
+	switch {
+	case i < len(n) && n[i] == '0':
+		i++
+	case i < len(n) && '1' <= n[i] && n[i] <= '9':
+		i = digits(i)
+	default:
+		return false
+	}
+	if i < len(n) && n[i] == '.' {
+		if j := digits(i + 1); j > i+1 {
+			i = j
+		} else {
+			return false
+		}
+	}
+	if i < len(n) && (n[i] == 'e' || n[i] == 'E') {
+		i++
+		if i < len(n) && (n[i] == '+' || n[i] == '-') {
+			i++
+		}
+		if j := digits(i); j > i {
+			i = j
+		} else {
+			return false
+		}
+	}
+	return i == len(n)
 }
 
 // message is v, a protobuf message, as a condition reads it, one of the well-known types
@@ -741,7 +907,7 @@ func (c *converter) message(v reflect.Value) (ref.Val, int) {
 				return c.refuse(), 1
 			}
 			packed := unpacked()
-			if err := proto.Unmarshal(m.GetValue(), packed); err != nil {
+			if err := proto.Unmarshal(m.GetValue(), packed); err != nil || !setOnce(m.GetValue(), packed.ProtoReflect().Descriptor()) {
 				return c.refuse(), 1
 			}
 			to, height := c.of(reflect.ValueOf(packed))
@@ -749,6 +915,105 @@ func (c *converter) message(v reflect.Value) (ref.Val, int) {
 		})
 	}
 	return c.refuse(), 1
+}
+
+// setOnce reports whether b, a message md describes as an Any packs it, sets each of its fields of
+// one value at most once, a oneof's as one, and each of its maps' keys once, however deep. Decoding
+// keeps the last of two values of a field and of two entries of a key, and merges a message set
+// twice, so a Struct packing "role" twice, or packing it in each of two messages its Value sets, was
+// read as the last where a host reading the first read another, as a map of the host's holding two
+// keys read as one would have it. A field of another wire type than its own, decoding keeps apart as
+// one it doesn't know, and so does this. b is of no more than proto.Unmarshal decoded, so as deep.
+func setOnce(b []byte, md protoreflect.MessageDescriptor) bool {
+	// The fields and oneofs set, by their numbers and indexes, each below 64 in the types packable
+	// names: one past that is refused.
+	var fields, oneofs uint64
+	var keys map[string]bool
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return false
+		}
+		b = b[n:]
+		n = protowire.ConsumeFieldValue(num, typ, b)
+		if n < 0 {
+			return false
+		}
+		value := b[:n]
+		b = b[n:]
+		fd := md.Fields().ByNumber(num)
+		if fd == nil || typ != wireType(fd) {
+			continue
+		}
+		if fd.Kind() == protoreflect.MessageKind {
+			if value, n = protowire.ConsumeBytes(value); n < 0 || !setOnce(value, fd.Message()) {
+				return false
+			}
+		}
+		switch {
+		case fd.IsMap():
+			if fd.MapKey().Kind() != protoreflect.StringKind {
+				return false
+			}
+			key := mapKey(value)
+			if keys[key] {
+				return false
+			}
+			if keys == nil {
+				keys = map[string]bool{}
+			}
+			keys[key] = true
+		case fd.IsList():
+		default:
+			if num >= 64 || fields&(1<<num) != 0 {
+				return false
+			}
+			fields |= 1 << num
+			if o := fd.ContainingOneof(); o != nil {
+				if o.Index() >= 64 || oneofs&(1<<o.Index()) != 0 {
+					return false
+				}
+				oneofs |= 1 << o.Index()
+			}
+		}
+	}
+	return true
+}
+
+// mapKey is the key of entry, a map's entry setOnce read: its first field, empty where it sets none.
+func mapKey(entry []byte) string {
+	for len(entry) > 0 {
+		num, typ, n := protowire.ConsumeTag(entry)
+		if n < 0 {
+			return ""
+		}
+		entry = entry[n:]
+		if num == 1 && typ == protowire.BytesType {
+			key, _ := protowire.ConsumeBytes(entry)
+			return string(key)
+		}
+		if n = protowire.ConsumeFieldValue(num, typ, entry); n < 0 {
+			return ""
+		}
+		entry = entry[n:]
+	}
+	return ""
+}
+
+// wireType is the wire type a value of the field fd describes is written in, or an element of it.
+func wireType(fd protoreflect.FieldDescriptor) protowire.Type {
+	switch fd.Kind() {
+	case protoreflect.Fixed32Kind, protoreflect.Sfixed32Kind, protoreflect.FloatKind:
+		return protowire.Fixed32Type
+	case protoreflect.Fixed64Kind, protoreflect.Sfixed64Kind, protoreflect.DoubleKind:
+		return protowire.Fixed64Type
+	case protoreflect.StringKind, protoreflect.BytesKind, protoreflect.MessageKind:
+		return protowire.BytesType
+	case protoreflect.GroupKind:
+		return protowire.StartGroupType
+	default:
+		return protowire.VarintType
+	}
 }
 
 // packable makes a new message of each type a condition reads packed in an Any, by the type's

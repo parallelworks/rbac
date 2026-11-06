@@ -262,11 +262,20 @@ scopes conditional ones reach, to check one by one.
   `Timestamp` and `Duration`, and an `Any` packing one of them; and CEL's own scalar values.
   A kind's attributes, the subject's, the resource's or the request's, holding anything else,
   however deep, can't be read as a whole, as a policy engine fails input it can't read: every
-  condition reading any of them fails, `has()` and `in` included, so a grant's gives nothing and a
-  deny's applies, while the other kinds' are read. So do those holding a `ref.Val` of the host's
+  condition reading any of them fails, `has()` and `in` included, and so does one keying a map by
+  them, finding them in a map, or comparing, or finding in a list, a list or a map holding them, so a
+  grant's gives nothing and a deny's applies, while the other kinds' are read. Every kind's that
+  can't be read are the same value, so a map hashed them as one: past what a check converts, below,
+  `request.attributes in {subject.attributes: true}` held, and a deny guarded by its negation
+  lifted. So do those holding a `ref.Val` of the host's
   own, though it says it is one of CEL's types, a list, map or optional of CEL's a host makes, a
   struct, a channel, a func, any other message, a map keyed by anything else, as a double or an
-  array, a map holding two keys read as the same value, as `1` and `1u`, invalid JSON, a value
+  array, a map holding two keys read as the same value, as `1` and `1u`, and so JSON text naming a
+  member of an object twice, once unescaped, or an `Any` packing a message that sets a field twice,
+  as a `Struct` with two entries of `role`: each is read as the last, where a host reading the first
+  reads another. A `Struct` the host passes holds each key once, as a Go map does. So do invalid
+  JSON, JSON text that isn't UTF-8 or escapes half a surrogate pair, which `encoding/json` reads as
+  U+FFFD, a `json.Number` that isn't a number as JSON writes one, as `0x1p4` or `Inf`, a value
   holding itself, or one that does, and a value nested more than 10,000 deep, as JSON text can't
   be, along the longest path through them. A value reached twice is converted once, but one a
   resource's attributes share with the subject's or the request's, below. Reading the
@@ -304,10 +313,17 @@ scopes conditional ones reach, to check one by one.
   smaller value, read once, in step with the other, and charged before it runs: measured again
   for each doubling of how far it read, again in search of a double that isn't finite and again
   for CEL's charge, comparing JSON nested 3,300 deep took twenty times what its cost implied.
-  Reading a time in a zone costs 100, and 500 more where an attribute names the zone: each process
-  loads a zone, or finds a name names none, once, the zone a literal names when the condition is
-  planned, and refuses, before loading anything, a name holding a byte no zone's name does, as
-  `tzdata.zi`'s dot, and `Local` and `localtime`, the zone the process runs in. Loaded at each
+  Reading a time in a zone costs 100, and 500 more where an attribute names the zone, at each read,
+  whether or not the process has loaded it: charged only where it hadn't, the same check of the same
+  request was refused the first time and allowed after, and decided by which zones each replica had
+  loaded. Each process loads a zone, or finds a name names none, once, the zone a literal names when
+  the condition is planned, and refuses, before loading anything, a name holding a byte no zone's
+  name does, as `tzdata.zi`'s dot, and one with a part that is `Local` or `localtime` in any case,
+  the zone the process runs in, as `posix/localtime`, which platforms keeping `posix` as a link to
+  the zones' own directory loaded it by. Zones load from the platform's files, as `time` loads them,
+  so a name one replica's files hold and another's don't, as `posix/` and `right/` names, which
+  some platforms no longer install, decides by where the check runs, failing closed where it names
+  none: name zones as the time zone database does. Loaded at each
   call, a check of conditions reading the hour in `tzdata.zi`, a file kept beside the zones, took a
   quarter of a second, and a request can name a new zone each time. The process keeps at most 1,024
   zones and names of none, dropping one at random past that, and a zone whose files change after
@@ -338,7 +354,13 @@ scopes conditional ones reach, to check one by one.
   1 more for the operator its macro evaluates, so one looping over a list the request passes, which
   cost nearly all a condition may, can now cost more, and fails the same way. One reading a time in
   a zone an attribute names is bounded 500 higher than before loading it was charged, so a scope's
-  conditions that read many may be past a bound as an upgrade leaves them. Going back to an
+  conditions that read many may be past a bound as an upgrade leaves them, and costs those 500 at
+  each read, so one reading more than about sixteen in a loop, which held once the process had
+  loaded them, fails. Adding to `request.time`, or converting it, was bounded at all a condition
+  may cost and is now bounded as the timestamp it is, a few units. Attributes holding JSON text or
+  a packed message that sets a key twice, JSON text that isn't UTF-8 or escapes half a surrogate
+  pair, or a `json.Number` JSON doesn't write, were read and now can't be, failing every condition
+  reading their kind. Going back to an
   earlier release of this package does the same where that release bounds a shape more, so while
   replicas of two releases run side by side, those
   bounding a shape more may refuse changes adding a condition to a scope the others filled. To

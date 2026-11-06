@@ -435,12 +435,21 @@ sequenceDiagram
   It calls no method of the host's, so a condition reads no value by one. A kind's attributes, the
   subject's, the resource's or the request's, holding anything else anywhere, a `ref.Val` of the
   host's own, a list, map or optional of CEL's a host makes, a struct, another message, a map keyed
-  by a double or holding two keys read as the same value, a value holding itself, or nesting past
+  by a double or holding two keys read as the same value, and so JSON text naming a member twice
+  once unescaped, read through `json.Decoder`'s tokens (`parseJSON`), or a packed message setting a
+  field or a map's key twice, read from its wire bytes (`setOnce`), as decoding either keeps the
+  last where a reader of the first reads another, JSON text that isn't UTF-8 or escapes half a
+  surrogate pair, a `json.Number` JSON doesn't write, a value holding itself, or nesting past
   `maxNested` along the longest path through them, can't be read as a whole (`unreadable`): every
   condition reading any of them fails, while the other kinds' are read. A value inside a readable
   map that no condition could read left every operator to tell it from the rest, and `in`, `has()`
   and loops over a map's keys each found its key; whole-kind failure leaves no such value for an
-  operator to meet. Depth is decided by heights kept with each converted value, so it doesn't
+  operator to meet. The kinds that can't be read are each the one value `unreadable`, so whatever
+  hashes or compares it fails too: a key (`comparableKey`), and a comparison or `in` reading it
+  whole, however deep in a list or a map (`measured`); hashed, a map literal keyed by two kinds past
+  `maxConverted` held one entry, and `request.attributes in {subject.attributes: true}` held. A
+  list holding it a map hashes as the list, wherever it is, so a key of one tells nothing of it.
+  Depth is decided by heights kept with each converted value, so it doesn't
   turn on map order or on which kind reached a shared value first, and each kind is converted, and
   charged, whole, whatever it holds, but where it nests past `maxNested`: converting stops there, so
   what it is charged, and whether the kinds after it fit `maxConverted`, can turn on map order,
@@ -482,10 +491,19 @@ sequenceDiagram
   and again for CEL's charge, comparing JSON nested 3,300 deep took twenty times what it was
   charged. Reading a time in a zone loads the zone once for the process (`zones`), bounded at
   `maxZones`, and finds a name names none once, the zone a literal names when the condition is
-  planned, and one an attribute names the first time a time is read in it, charged `zoneLoad`
-  more, before it loads, and refuses a name of none, as `tzdata.zi`, and `Local` and `localtime`,
-  before loading anything (`inZone`): loaded at each call, the zone `tzdata.zi` named took a
-  quarter of a second for a check. Where reading the platform's files failed, as once the process
+  planned, and one an attribute names the first time a time is read in it, which each read is
+  charged `zoneLoad` more for, before it loads, whether or not the process has loaded it: charged
+  only where it hadn't, a check decided by what the process loaded before, refused the first time
+  and allowed after, and across replicas. It refuses a name of none, as `tzdata.zi`, and one with a
+  part that is `Local` or `localtime` in any case, as `posix/localtime`, before loading anything
+  (`inZone`): loaded at each call, the zone `tzdata.zi` named took a quarter of a second for a
+  check. Zones load from the platform's files, as `time.LoadLocation` loads them: Go's embedded
+  `time/tzdata` offers no way to load from it alone, as `time` reads it only after the platform's
+  files and exports neither its data nor its loader, so loading only from it would mean keeping a
+  copy of the time zone database in the package, behind each platform's updates to it.
+  `request.time` is bounded as the timestamp a check passes (`worst.walk`), not as anything a map
+  of dyn may hold, but where a loop's variable named `request` hides it. Where reading the
+  platform's files failed, as once the process
   ran out of file descriptors, it keeps nothing (`settled`), and a literal's zone isn't planned, so
   the next check plans it again: kept, a real zone failed until the process dropped it. A
   comparison, a search or a match that would cost more than a condition may fails before it runs,
