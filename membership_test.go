@@ -4060,17 +4060,39 @@ func TestAFreezeStopsALeavingByWhatItsGroupGives(t *testing.T) {
 
 // An identity whose membership of the tenant has ended is in none of its groups, as Members lists
 // them and checks count them, though DeleteExpired hasn't removed its places yet: removing it from
-// one takes nothing away, so neither a freeze there nor a label of a scope the group holds access on
-// that the actor's values don't satisfy refuses it, as each did until DeleteExpired ran. Removing
-// one whose membership is in force is still refused, and making its place end sooner, which is
-// adding an identity that isn't a member, is too.
+// one takes nothing away, so none of a freeze there, a label of a scope the group holds access on
+// that the actor's values don't satisfy, a deny binding the actor that removes its power to change
+// grants there, and a deny naming the group that the actor may not lift refuses it, as each did
+// until DeleteExpired ran. Removing one whose membership is in force is still refused, as is
+// removing one whose membership is suspended, which is still in its groups; and making the departed
+// one's place end sooner adds an identity that isn't a member: refused before the transaction where
+// the actor can't grant what the group gives, and otherwise under its locks.
 func TestRemovingAnIdentityThatHasLeftTheTenantTakesNothingAway(t *testing.T) {
 	secret := cluster
 	secret.Labels = rbac.Label{"level": {"high"}}
 	frozen := false
-	for name, mutate := range map[string]func(*rbac.Config){
-		"a freeze": freezingUnder(workspace.Scope(), &frozen),
-		"a label": func(c *rbac.Config) {
+	guards := func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), guardRole, workspaceGuard) }
+	deny := func(on rbac.Resource, d rbac.Deny) func(*testing.T, *harness, rbac.Subject) {
+		return func(t *testing.T, h *harness, manager rbac.Subject) {
+			t.Helper()
+			h.seed(t, grant(cluster.Scope(), "guard", rbac.User, "guardian"), grant(workspace.Scope(), "workspace.guard", rbac.User, "guardian"))
+			if d.Principals == nil {
+				d.Principals = []rbac.Principal{manager.Principal}
+			}
+			if err := h.authz.SetDeny(t.Context(), h.as(t, "guardian"), on, d); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for name, c := range map[string]struct {
+		config func(*rbac.Config)
+		// stop has what the case names stop taking access away from crew's members.
+		stop func(*testing.T, *harness, rbac.Subject)
+		// sooner is what making u's place end sooner is refused as.
+		sooner error
+	}{
+		"a freeze": {freezingUnder(workspace.Scope(), &frozen), func(*testing.T, *harness, rbac.Subject) { frozen = true }, rbac.ErrDenied},
+		"a label": {func(c *rbac.Config) {
 			withLabels(c)
 			c.ResourceOf = func(_ context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
 				if s == secret.Scope() {
@@ -4078,18 +4100,25 @@ func TestRemovingAnIdentityThatHasLeftTheTenantTakesNothingAway(t *testing.T) {
 				}
 				return rbac.Resource{Tenant: tenant, Type: s.Type, ID: s.ID}, nil
 			}
-		},
+		}, func(*testing.T, *harness, rbac.Subject) {}, rbac.ErrDenied},
+		"a deny binding the actor": {guards, deny(workspace, rbac.Deny{ID: "frozen", Permissions: []rbac.Permission{grantC}}), rbac.ErrDenied},
+		// The manager holds no power to set denies on the cluster, which a member leaving crew is no
+		// longer bound by there.
+		"a deny naming the group": {guards, deny(cluster, rbac.Deny{ID: "crew", Principals: []rbac.Principal{groupOf("crew")}, Permissions: []rbac.Permission{root}}), rbac.ErrInvalid},
 	} {
 		t.Run(name, func(t *testing.T) {
 			frozen = false
-			h := grouped(t, mutate)
+			h := grouped(t, c.config)
 			ctx := t.Context()
 			h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
-			if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("u"), ExpiresAt: h.now.Add(time.Hour)}, {Principal: identity("w")}}); err != nil {
+			if err := h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{
+				{Principal: identity("u"), ExpiresAt: h.now.Add(time.Hour)}, {Principal: identity("w")}, {Principal: identity("v"), Suspended: true},
+			}); err != nil {
 				t.Fatal(err)
 			}
-			left, stays := rbac.Member{Group: "crew", Principal: identity("u")}, rbac.Member{Group: "crew", Principal: identity("w")}
-			if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{left, stays}); err != nil {
+			left, stays, suspended := rbac.Member{Group: "crew", Principal: identity("u")}, rbac.Member{Group: "crew", Principal: identity("w")},
+				rbac.Member{Group: "crew", Principal: identity("v")}
+			if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{left, stays, suspended}); err != nil {
 				t.Fatal(err)
 			}
 			h.now = h.now.Add(2 * time.Hour)
@@ -4097,10 +4126,10 @@ func TestRemovingAnIdentityThatHasLeftTheTenantTakesNothingAway(t *testing.T) {
 				t.Fatal("u has left the tenant and still logs in to the cluster")
 			}
 			manager := h.as(t, "manager")
-			frozen = true
+			c.stop(t, h, manager)
 			sooner := left
 			sooner.ExpiresAt = h.now.Add(time.Minute)
-			if err := h.authz.ChangeMembers(ctx, manager, "t1", []rbac.Member{sooner}, nil); !errors.Is(err, rbac.ErrDenied) {
+			if err := h.authz.ChangeMembers(ctx, manager, "t1", []rbac.Member{sooner}, nil); !errors.Is(err, c.sooner) {
 				t.Errorf("making u's place in crew end sooner, which adds one that isn't a member, under %s: %v", name, err)
 			}
 			h.events = nil
@@ -4109,8 +4138,10 @@ func TestRemovingAnIdentityThatHasLeftTheTenantTakesNothingAway(t *testing.T) {
 			} else if len(h.events) != 1 || len(h.events[0].Left) != 1 {
 				t.Errorf("events = %+v, not u leaving crew", h.events)
 			}
-			if err := h.authz.ChangeMembers(ctx, manager, "t1", nil, []rbac.Member{stays}); !errors.Is(err, rbac.ErrDenied) {
-				t.Errorf("removing w, a member, from crew under %s: %v", name, err)
+			for who, m := range map[string]rbac.Member{"w, a member,": stays, "v, whose membership is suspended,": suspended} {
+				if err := h.authz.ChangeMembers(ctx, manager, "t1", nil, []rbac.Member{m}); !errors.Is(err, rbac.ErrDenied) {
+					t.Errorf("removing %s from crew under %s: %v", who, name, err)
+				}
 			}
 		})
 	}
