@@ -766,10 +766,11 @@ func (a *Authorizer) allowed(ctx context.Context, roles book, actor Subject, via
 	role, _ := roles.role(b.Role)
 	// A copy of the actor, as a constraint is given, so a hook writing to its attributes changes
 	// nothing the change's transaction decides again; one for the call, however many grants it asks
-	// about.
+	// about. Refused as the power to change grants on the scope, as an activation that can't be made
+	// there is.
 	var ok bool
 	if actor.Attributes, ok = copiedFor(a, validating, actor.Attributes); !ok {
-		return nil, errUncopied("ValidateGrant")
+		return nil, uncopied(GrantPermission(scope.Type), scope, "ValidateGrant")
 	}
 	err := a.cfg.ValidateGrant(ctx, a.db, GrantInput{Tenant: tenant, Scope: scope, Binding: b, Role: role.clone(), Actor: actor, Via: via})
 	switch {
@@ -2275,12 +2276,13 @@ func savepoint(ctx context.Context, db DB, fn func(pgx.Tx) error) error {
 	return finish(ctx, tx.Commit)
 }
 
-// report hands a change to Config.OnChange in its transaction, unless it changed nothing.
+// report hands a change to Config.OnChange in its transaction, unless it changed nothing, with a
+// ctx that makes its calls back into a's transaction in the change's savepoint (inTurn).
 func (a *Authorizer) report(ctx context.Context, tx pgx.Tx, e ChangeEvent) error {
 	if a.cfg.OnChange == nil || e.empty() {
 		return nil
 	}
-	return a.cfg.OnChange(ctx, tx, e)
+	return a.cfg.OnChange(inTurn(ctx, a.db), tx, e)
 }
 
 // upsert stores grants in one statement, sorted so concurrent changes lock rows in the same

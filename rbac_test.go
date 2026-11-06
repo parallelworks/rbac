@@ -1467,6 +1467,55 @@ func holderPrincipals(holders []rbac.Holder) []rbac.Principal {
 	return ps
 }
 
+// Holders evaluates no condition, so an access review lists too many rather than too few: a holder
+// whose every grant has a condition is listed and marked Conditional, and one a conditional deny
+// binds is listed and marked MaybeDenied, though each condition here reads the resource alone, so
+// a check decides it whatever the request. Only a deny with no condition leaves out whom it binds.
+func TestHoldersMarksConditionalGrantsAndDeniesWithoutEvaluatingThem(t *testing.T) {
+	h, guardian := guarded(t)
+	ctx := t.Context()
+	prod := cluster
+	prod.Attributes = map[string]any{"env": "prod"}
+	onDev := grant(prod.Scope(), "cluster.login", rbac.User, "dev")
+	onDev.Condition = rbac.Condition{Expression: `resource.attributes.env == "dev"`}
+	h.seed(t, onDev, grant(prod.Scope(), "cluster.login", rbac.User, "always"), grant(prod.Scope(), "cluster.login", rbac.User, "never"),
+		grant(prod.Scope(), "cluster.login", rbac.User, "unconditional"))
+	subjects := map[string]rbac.Subject{}
+	for _, id := range []string{"dev", "always", "never", "unconditional"} {
+		subjects[id] = h.as(t, id)
+	}
+	for _, d := range []rbac.Deny{
+		{ID: "always", Principals: []rbac.Principal{identity("always")}, Permissions: []rbac.Permission{login}, Condition: rbac.Condition{Expression: `resource.attributes.env == "prod"`}},
+		{ID: "never", Principals: []rbac.Principal{identity("never")}, Permissions: []rbac.Permission{login}, Condition: rbac.Condition{Expression: `resource.attributes.env == "dev"`}},
+		{ID: "unconditional", Principals: []rbac.Principal{identity("unconditional")}, Permissions: []rbac.Permission{login}},
+	} {
+		if err := h.authz.SetDeny(ctx, guardian, prod, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, c := range []context.Context{ctx, rbac.WithRequest(ctx, map[string]any{"mfa": true})} {
+		for id, allowed := range map[string]bool{"dev": false, "always": false, "never": true, "unconditional": false} {
+			if err := h.authz.Authorize(c, subjects[id], login, prod); (err == nil) != allowed {
+				t.Errorf("Authorize(%s) = %v, whatever the request", id, err)
+			}
+		}
+	}
+	holders, err := h.authz.Holders(ctx, login, prod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type marks struct{ conditional, maybeDenied bool }
+	got := map[string]marks{}
+	for _, hd := range holders {
+		if _, ok := subjects[hd.Principal.ID]; ok && hd.Principal.Kind == rbac.User {
+			got[hd.Principal.ID] = marks{hd.Conditional, hd.MaybeDenied}
+		}
+	}
+	if want := map[string]marks{"dev": {conditional: true}, "always": {maybeDenied: true}, "never": {maybeDenied: true}}; !maps.Equal(got, want) {
+		t.Errorf("Holders marks %+v, not %+v", got, want)
+	}
+}
+
 func TestAMisspelledPermissionOrTypeIsInvalid(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -2697,6 +2746,59 @@ func TestAHookIsGivenACopyOfNoMoreThanACheckConverts(t *testing.T) {
 		if err := h.authz.Apply(t.Context(), u, cluster, change); !errors.Is(err, rbac.ErrDenied) {
 			t.Errorf("constrained %t: a change by an actor passing past what a check converts: %v", constrained, err)
 		}
+	}
+}
+
+// A call refused because a hook can't be given a copy is refused as any other: a DeniedError, of
+// the permission on the resource asked about, or the tenant, whose message names only the
+// permission and whose Reason names the hook. Wrapping ErrDenied, its message named the constraint,
+// and a user who can write a resource's tags could have any check of it show that name.
+func TestARefusalForWhatAHookCantBeGivenNamesOnlyThePermission(t *testing.T) {
+	tags := map[string]any{}
+	for i := range rbac.MaxConverted {
+		tags[fmt.Sprint("t", i)] = "v"
+	}
+	const name = "freeze-project-x"
+	for _, constrained := range []bool{true, false} {
+		h := setup(t, func(c *rbac.Config) {
+			if constrained {
+				c.Constraints = []rbac.Constraint{{Name: name, Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) {
+					return false, nil
+				}}}
+			}
+		})
+		ctx := t.Context()
+		h.seed(t, grant(cluster.Scope(), "cluster.admin", rbac.User, "u"))
+		h.as(t, "x")
+		u := h.as(t, "u")
+		tagged := cluster
+		tagged.Attributes = map[string]any{"tags": tags}
+		heavy := u
+		heavy.Attributes = map[string]any{"tags": tags}
+		hook := "ValidateGrant"
+		if constrained {
+			hook = fmt.Sprintf("constraint %q", name)
+		}
+		refused := func(what string, err error, p rbac.Permission, on rbac.Scope) {
+			t.Helper()
+			var denied *rbac.DeniedError
+			switch {
+			case !errors.As(err, &denied):
+				t.Errorf("constrained %t: %s: %v, not a DeniedError", constrained, what, err)
+			case denied.Permission != p || denied.Scope != on || !strings.Contains(denied.Reason, hook):
+				t.Errorf("constrained %t: %s: %+v, not of %s on %s by %s", constrained, what, *denied, p, on.Key(), hook)
+			case strings.Contains(err.Error(), name) || strings.Contains(err.Error(), "ValidateGrant"):
+				t.Errorf("constrained %t: %s: the message names the hook: %v", constrained, what, err)
+			}
+		}
+		change := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("x")}}}
+		refused("a change by an actor passing past what a check converts", h.authz.Apply(ctx, heavy, cluster, change), grantC, cluster.Scope())
+		if !constrained {
+			continue
+		}
+		refused("a check of a resource tagged past what a check converts", h.authz.Authorize(ctx, u, login, tagged), login, cluster.Scope())
+		_, err := h.authz.Reachable(ctx, heavy, login, "t1", "cluster")
+		refused("a search by a subject passing past what a check converts", err, login, rbac.TenantRoot("t1"))
 	}
 }
 
@@ -3979,6 +4081,129 @@ func TestWithTxCommitsWithTheHost(t *testing.T) {
 		if got := allowed(t, h, h.as(t, "u"), login, cluster); got != commit {
 			t.Fatalf("commit=%v: grant present=%v", commit, got)
 		}
+	}
+}
+
+// An Authorizer bound to a transaction runs on its one connection, which runs one statement at a
+// time: calls on it from several goroutines at once panicked in pgx, failed as the connection
+// busy, ended the process writing the connection's cache of statements, or hung. They take turns,
+// checks, lists and changes alike, on WithTx's and on New's of a pgx.Tx, and every one succeeds.
+func TestATransactionsAuthorizerTakesCallsFromSeveralGoroutinesInTurn(t *testing.T) {
+	h := setup(t)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	owner := h.as(t, "owner")
+	const n = 8
+	for _, onNew := range []bool{false, true} {
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := h.authz.WithTx(tx)
+		if onNew {
+			if a, err = rbac.New(tx, h.cfg); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var wg sync.WaitGroup
+		errs := make(chan error, n)
+		for i := range n {
+			u := h.as(t, fmt.Sprintf("u%d-%t", i, onNew))
+			wg.Go(func() {
+				errs <- func() error {
+					for range 10 {
+						if err := a.Authorize(ctx, owner, login, cluster); err != nil {
+							return err
+						}
+						if _, err := a.Holders(ctx, login, cluster); err != nil {
+							return err
+						}
+					}
+					return a.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: u.Principal}}})
+				}()
+			})
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Errorf("on New's %t: %v", onNew, err)
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		for i := range n {
+			if !allowed(t, h, h.as(t, fmt.Sprintf("u%d-%t", i, onNew)), login, cluster) {
+				t.Errorf("on New's %t: u%d's grant wasn't committed", onNew, i)
+			}
+		}
+	}
+}
+
+// A change on a transaction's Authorizer has its turn until its savepoint ends: a call of another
+// goroutine waits, reading nothing it wrote, and gives up once its ctx is done; once the change
+// ends, it runs. A hook calling back in runs in its turn: a constraint, asked between a call's
+// statements, and OnChange, in the savepoint, with the ctx it is given, which reads what the change
+// wrote; with another, it would wait for the change it runs in.
+func TestATransactionsAuthorizerTakesTurnsWithAChangeAndItsHooks(t *testing.T) {
+	var a *rbac.Authorizer
+	inChange, release := make(chan struct{}, 1), make(chan struct{})
+	released := sync.OnceFunc(func() { close(release) })
+	var seen []error
+	h := setup(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "groups", Deny: func(ctx context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if a == nil || in.Subject == nil || in.Subject.Principal.ID != "u" {
+				return false, nil
+			}
+			_, err := a.GroupsOf(ctx, in.Tenant, in.Subject.Principal)
+			return false, err
+		}}}
+		c.OnChange = func(ctx context.Context, _ pgx.Tx, e rbac.ChangeEvent) error {
+			if a == nil {
+				return nil
+			}
+			seen = append(seen, a.Authorize(ctx, rbac.Subject{Principal: identity("u")}, login, cluster))
+			inChange <- struct{}{}
+			<-release
+			return nil
+		}
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	owner, u := h.as(t, "owner"), h.as(t, "u")
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	defer released()
+	a = h.authz.WithTx(tx)
+	applied := make(chan error, 1)
+	go func() {
+		applied <- a.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: u.Principal}}})
+	}()
+	select {
+	case <-inChange:
+	case err := <-applied:
+		t.Fatalf("Apply returned before OnChange: %v", err)
+	case <-ctx.Done():
+		t.Fatal("OnChange calling back in with the ctx it is given waited for the change it runs in")
+	}
+	if len(seen) != 1 || seen[0] != nil {
+		t.Errorf("OnChange calling back in read %v, not the grant the change wrote", seen)
+	}
+	waiting, stop := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer stop()
+	if err := a.Authorize(waiting, u, login, cluster); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("a call of another goroutine during the change: %v, not waiting for its turn until its ctx was done", err)
+	}
+	released()
+	if err := <-applied; err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Authorize(ctx, u, login, cluster); err != nil {
+		t.Errorf("once the change ended: %v", err)
 	}
 }
 

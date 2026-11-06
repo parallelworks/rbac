@@ -353,7 +353,8 @@ scopes conditional ones reach, to check one by one.
   exempt everyone, nor one it names. A conditional one denies where its condition holds or can't
   be evaluated. Setting one needs `rbac.DenyPermission(type)` there, which no deny removes, so
   whoever holds it on a scope above can always lift a deny set below. `Filter`, `Reachable` and
-  `Holders` honor denies.
+  `Holders` honor denies, `Holders` marking whom a conditional one binds rather than leaving them
+  out (see Why).
 - **Just-in-time access:** `SetEligibility` lets a principal, an identity or a group's members,
   activate a role on a scope for up to a maximum duration and no later than the eligibility, the
   activator's membership of the tenant, or its place in the group that makes it eligible ends,
@@ -390,7 +391,10 @@ scopes conditional ones reach, to check one by one.
   copied for each ask, `Permissions` of 300 permissions on a resource of 20,000 tags took a second.
   `ValidateGrant` is given its copy of the actor's attributes once for a call too. A copy holds no
   more than a check converts, counted alike: where the attributes hold more, the hook can't be
-  asked, and the call is refused as `ErrDenied`. What one removes from an actor the actor can't hand on, but for a
+  asked, and the call is refused as any other, a `DeniedError` of the permission on the resource
+  asked about, or the tenant, whose `Reason` names the hook and whose message doesn't: a tenant's
+  users can write what takes attributes past it, as a resource's tags, and the message named the
+  constraint. What one removes from an actor the actor can't hand on, but for a
   role a role it holds lists in `GrantableRoles`, which it grants without holding. A freeze stops
   every change an actor makes to grants under it, and every change taking access away there: one
   removing `<type>:grant` from the actor, or a deny on the path doing so, stops `Apply` granting and
@@ -528,9 +532,12 @@ scopes conditional ones reach, to check one by one.
 denied, or for a value of an exclusive dimension the subject holds none of, that dimension;
 `Permissions` lists what a subject may do; `Holders` lists who may, for an access review: each
 identity, through its own grants and its groups', and the tenant's members and the public as one
-holder each, marking those that hold only under a condition or that a deny or constraint may bind. A
-`DeniedError`'s message names only the permission, so an error shown to a user shows no policy; its
-fields say why.
+holder each, marking those that hold only under a condition or that a deny or constraint may bind.
+It evaluates no condition, so it lists too many rather than too few: every conditional grant and
+deny is marked unevaluated, so those marked can include one a condition reading only the resource
+always refuses, or always allows, and a deny leaves out whom it binds only where it has no
+condition. A `DeniedError`'s message names only the permission, so an error shown to a user shows
+no policy; its fields say why. Every refusal is one, a hook that can't be given its copy too.
 
 ## History
 
@@ -666,7 +673,9 @@ which can offer any custom role, reads each version of every one once. It orders
 by their ids in `rbac_history`, which sessions take out of order once that table's id sequence
 caches more than one, so `AsOf` refuses that. Its read's hooks run in its transaction, which holds
 one of the pool's connections: a constraint there queries the `DB` it is given, as one that queries
-the pool waits for another connection, which a busy pool may never free.
+the pool waits for another connection, which a busy pool may never free. The Authorizer its read is
+given runs every call on that transaction: calls on it from several goroutines, as a review
+checking its subjects in goroutines makes, take turns rather than fail (see Goroutines).
 
 `rbac.PruneHistory(ctx, db, before, through)` deletes what an export has read past (`through`, its
 cursor) and later records supersede: of each row, the last version at or before `before` stays, so
@@ -902,6 +911,16 @@ against, and nothing such a table runs, as its row security policy, runs as hist
   those names. Never name the schema `$user`, which no search_path can name: every change there is
   refused. Never move one of the package's tables to another schema: its changes would be recorded
   in that schema's history, or with none there, in a session's own table of its name.
+- **Goroutines:** an Authorizer `New` returns on a pool is safe for concurrent use. One bound to a
+  transaction, as `WithTx` and `AsOf` give and `New` returns on a `pgx.Tx`, runs on its one
+  connection, so use it from one goroutine at a time: calls from several take turns on it, a
+  statement, or a change's savepoint, at a time, rather than panic, fail as the connection busy,
+  end the process, or hang holding `AsOf`'s transaction, and one waiting gives up once its ctx is
+  done. Two that `WithTx` returns on one transaction take no turns with each other, so share one.
+  A hook calls back into it between a call's statements, and `OnChange`, which runs in the
+  change's savepoint, with the ctx it is given; `AsOf`'s read makes its calls on the Authorizer it
+  is given, as the one `AsOf` was called on, if bound to a transaction, waits for `AsOf` to return.
+  On a `*pgx.Conn`, or a DB of the host's own, it is as safe for concurrent use as that DB.
 - **Transactions:** a change runs in its own transaction at READ COMMITTED, or under `WithTx` in
   the host's, which must be READ COMMITTED too. A call PostgreSQL refuses for a race, as a
   serialization failure, a deadlock between host transactions, or a lock it waited for past the

@@ -57,6 +57,13 @@ var asOfEntities = []struct {
 // WithTx on the Authorizer read is given returns it as it is, reading the past on its own
 // transaction.
 //
+// The Authorizer read is given runs every call on that one transaction, as WithTx's does: use it
+// from one goroutine at a time, as calls from several, as an access review checking its subjects
+// in goroutines makes, take turns on it rather than fail, and AsOf rolls back once the call under
+// way ends. Make read's calls on it, not on the Authorizer AsOf was called on: one bound to a
+// transaction, as WithTx's, is in AsOf's savepoint until AsOf returns, so a call on it, from read
+// or a hook, waits until its ctx is done.
+//
 // It reads in one transaction, or a savepoint of the host's under WithTx, in which temporary
 // views named as the package's tables stand in for them, and rolls it back, even once ctx is
 // done. Every statement there is planned for its arguments, the host's under WithTx too, as
@@ -102,6 +109,9 @@ func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read
 	if err != nil {
 		return err
 	}
+	// read's calls take turns on it, as a WithTx Authorizer's do, and the rollback waits for the one
+	// under way: an access review checks its subjects in goroutines.
+	tx = serialized(tx)
 	// Once ctx is done, a rollback on it isn't sent: a savepoint of the host's left standing keeps
 	// the views in its transaction, which then reads the past, and in its session once it commits.
 	defer func() {

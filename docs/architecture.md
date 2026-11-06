@@ -414,8 +414,9 @@ sequenceDiagram
   to its copy reads its write when the call asks it again, and nothing decided or asked of another
   hook does. A copy holds no more than a check converts (`maxConverted`), counted alike, one for
   each value, a string too, and a tenth of each other byte copied whole, so it counts no more than
-  converting the same does: past it the hook can't be asked, and the call is refused as
-  `ErrDenied`. Counting a list's elements twice, a string by the bytes of its header, or a
+  converting the same does: past it the hook can't be asked, and the call is refused (`uncopied`)
+  as any other, a `DeniedError` of the permission on the resource asked about, or the tenant, whose
+  `Reason` names the hook and whose message only the permission. Counting a list's elements twice, a string by the bytes of its header, or a
   protobuf `Value` and its field apart, attributes a check converts couldn't be copied. A slice
   reached at several lengths is copied once from where it starts, each length a slice of the copy,
   and one reached while its elements are copied, before a longer length outgrew that copy, a slice
@@ -759,7 +760,10 @@ flowchart LR
 - **Holders** lists who may do a permission on a resource, for an access review. That is each
   identity, through its own grants and its groups', with the tenant's members and the public as
   one holder each. It marks holders that hold only under a condition, or that a deny, a
-  constraint or a label may refuse. For a labeled resource it reads every identity's label values'
+  constraint or a label may refuse. It evaluates no condition, so it lists too many rather than
+  too few: a conditional grant or deny marks its holder whatever the condition reads, the resource
+  alone too, and a deny leaves out whom it binds only where it has no condition
+  (`boundByDenies`). For a labeled resource it reads every identity's label values'
   grants and denies in one statement in the list's snapshot.
 
 ## Labels and exclusive values
@@ -854,6 +858,20 @@ flowchart TB
 - **READ COMMITTED.** A change runs at READ COMMITTED, as its checks under the locks must read what
   committed before the locks were taken. Under `WithTx` the host's transaction must be at READ
   COMMITTED too, as must one `Migrate` is given.
+- **One call at a time on a transaction.** An Authorizer bound to a transaction, as `WithTx` and
+  `AsOf` give and `New` returns on a `pgx.Tx`, runs on it through a `serialTx`, which has the
+  transaction's one connection run one statement at a time, until its rows are read, and each
+  savepoint it begins, as a change's or AsOf's, until it ends: calls from several goroutines take
+  turns rather than panic in pgx's watch of a context, fail as the connection busy, hang, or race
+  on what the connection keeps, as the map of its cache of prepared statements, whose concurrent
+  use the runtime ends the process for. A statement of another call in a change's savepoint would
+  read what the change wrote, which rolling it back unwrites. A call waiting for its turn gives up
+  once its ctx is done. A hook calls back in between a call's statements, as constraints and
+  `ValidateGrant` are asked before a change's savepoint; `OnChange`, which runs in it, is given a
+  ctx holding it (`inTurn`), with which its calls on the Authorizer run in the savepoint. AsOf's
+  read is given an Authorizer whose `serialTx` is AsOf's transaction, or its savepoint of the
+  host's, which has the host's `serialTx` until AsOf returns. New's Authorizer on a pool is safe
+  for concurrent use as the pool is, and one on a connection or a host's own DB as that is.
 - **A host's own DB.** One that is neither a pool, a connection nor a `pgx.Tx` begins with `Begin`,
   and its first statement sets the isolation a change or a read of one snapshot needs (`isolated`):
   another level first, then that one. A savepoint of a transaction under way, as a wrapper around
@@ -1060,7 +1078,8 @@ flowchart LR
   records between two checkpoints.
 - **AsOf** stands temporary views of history in for the tables, in a transaction it rolls back,
   so every check, list and search answers as it would have at a past time, with the catalog and
-  the label dimensions as they are now. Making the views takes a transaction id, which holds every
+  the label dimensions as they are now. The read's calls take turns on that transaction, from
+  several goroutines too, and the rollback waits for the one under way. Making the views takes a transaction id, which holds every
   export in the cluster back while the read runs. Every statement is planned for its arguments and
   runs without JIT, which such plans over history cost past `jit_above_cost` for any subject. It
   takes a time from PostgreSQL's earliest to 9999-12-30, to the microsecond, rounded down, as pgx
