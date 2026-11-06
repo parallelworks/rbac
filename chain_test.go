@@ -651,26 +651,21 @@ func TestACheckpointVouchesForItsHorizon(t *testing.T) {
 	}
 }
 
-// AsOf reads the settled horizon from the current cluster's commit records alone, so a restored
-// commit record of another cluster, holding a horizon of that cluster's xids, bounds no change of
-// this one. Rewriting its cluster, and its version's, to this cluster's, as history's owner can,
-// leaves every other field History returns as it was, CommittedAt too, as the two still match, but
-// has its horizon count a revoke of this cluster's as in force while it was held open: so the chain
-// holds each record's cluster, and the rewritten history no longer verifies against what an export
-// kept.
-func TestTheChainHoldsTheClusterAsOfDatesARecordWithin(t *testing.T) {
+// What AsOf answers turns on nothing an export leaves out, so history's owner can't change it
+// unseen: it dates each version by its own transaction's commit records within its cluster, as
+// History does for CommittedAt. A commit record no version names, holding as its bound on the
+// transactions then running one past them all, as an earlier build's commit records held one,
+// changes no answer, where counting every change of a transaction below that bound as committed had
+// a revoke held open read as in force with every record History returns as it was. And rewriting a
+// restored record's cluster, which History returns, no longer verifies against what an export kept.
+func TestAsOfAnswersByNothingAnExportLeavesOut(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
 	ours, theirs := otherCluster(t, h)
 	u := h.as(t, "u")
 	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"), grant(cluster.Scope(), "cluster.login", rbac.User, "tmpl"))
 	restored := dbNow(t, h).UTC().Format("2006-01-02 15:04:05.999999+00")
-	restoreRows(t, h, fakeGrant("restored", restored, theirs, "9", false), fakeCommit(restored, theirs, "9", "18446744073709551000"))
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	kept, at := exportNext(t, h, rbac.Checkpoint{}, rbac.MaxHistory, key)
+	restoreRows(t, h, fakeGrant("restored", restored, theirs, "9", false), fakeCommit(restored, theirs, "9"))
 	// A revoke of u's grant held open past mid.
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
@@ -686,30 +681,43 @@ func TestTheChainHoldsTheClusterAsOfDatesARecordWithin(t *testing.T) {
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	held := func() error {
-		return h.authz.AsOf(ctx, "t1", mid, func(a *rbac.Authorizer) error { return a.Authorize(ctx, u, login, cluster) })
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := held(); err != nil {
-		t.Fatalf("as of while the revoke was held open, u's login: %v", err)
-	}
-	for _, q := range []string{
-		`ALTER TABLE rbac_history DISABLE TRIGGER rbac_history_append_only`,
-		`UPDATE rbac_history SET cluster = ` + ours + ` WHERE txid = '9'`,
-		`ALTER TABLE rbac_history ENABLE ALWAYS TRIGGER rbac_history_append_only`,
+	kept, at := exportNext(t, h, rbac.Checkpoint{}, rbac.MaxHistory, key)
+	for _, c := range []struct {
+		name     string
+		rewrite  []string
+		verifies bool
+	}{
+		{"a commit record no version names, bounding every transaction", []string{
+			`ALTER TABLE rbac_history DISABLE TRIGGER rbac_history_committed`,
+			fmt.Sprintf(`INSERT INTO rbac_history (effective_at, txid, cluster, tenant, entity, key, op, after, bytes)
+				VALUES (timestamptz '%s', '7'::xid8, %s, '', 'commit', '', 'commit', '{"xmin": "18446744073709551000"}', 0)`, restored, ours),
+			`ALTER TABLE rbac_history ENABLE ALWAYS TRIGGER rbac_history_committed`,
+		}, true},
+		{"a restored record's cluster", []string{
+			`ALTER TABLE rbac_history DISABLE TRIGGER rbac_history_append_only`,
+			`UPDATE rbac_history SET cluster = ` + ours + ` WHERE txid = '9'`,
+			`ALTER TABLE rbac_history ENABLE ALWAYS TRIGGER rbac_history_append_only`,
+		}, false},
 	} {
-		if _, err := h.pool.Exec(ctx, q); err != nil {
-			t.Fatalf("%s: %v", q, err)
+		for _, q := range c.rewrite {
+			if _, err := h.pool.Exec(ctx, q); err != nil {
+				t.Fatalf("%s: %v", q, err)
+			}
 		}
-	}
-	if err := held(); !errors.Is(err, rbac.ErrDenied) {
-		t.Fatalf("as of while the revoke was held open, with the restored records' cluster rewritten, u's login: %v", err)
-	}
-	again, _ := exportNext(t, h, rbac.Checkpoint{}, rbac.MaxHistory, key)
-	if len(again) < len(kept) {
-		t.Fatalf("an export again read %d records, before %d", len(again), len(kept))
-	}
-	if err := rbac.VerifyChain(rbac.Genesis(at.Cursor.Generation), again[:len(kept)], at, key.Public()); !errors.Is(err, rbac.ErrUnverified) {
-		t.Errorf("history with a restored record's cluster rewritten, against the checkpoint kept before: %v", err)
+		if err := h.authz.AsOf(ctx, "t1", mid, func(a *rbac.Authorizer) error { return a.Authorize(ctx, u, login, cluster) }); err != nil {
+			t.Errorf("with %s written, as of while the revoke was held open, u's login: %v", c.name, err)
+		}
+		again, _ := exportNext(t, h, rbac.Checkpoint{}, rbac.MaxHistory, key)
+		if len(again) < len(kept) {
+			t.Fatalf("with %s written, an export again read %d records, before %d", c.name, len(again), len(kept))
+		}
+		if err := rbac.VerifyChain(rbac.Genesis(at.Cursor.Generation), again[:len(kept)], at, key.Public()); (err == nil) != c.verifies {
+			t.Errorf("with %s written, history against the checkpoint kept before: %v", c.name, err)
+		}
 	}
 }
 

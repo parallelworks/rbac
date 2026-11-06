@@ -160,14 +160,6 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	if err := unpruned(ctx, tx, schema, at); err != nil {
 		return err
 	}
-	cluster, err := clusterOf(ctx, tx)
-	if err != nil {
-		return err
-	}
-	settled, err := settledBy(ctx, tx, schema, at, cluster)
-	if err != nil {
-		return err
-	}
 	// Each statement is planned for its arguments until AsOf rolls back. A connection prepares a
 	// statement once, as of a time and now alike, and from its sixth run can plan it generically,
 	// costing history's indexes by an average tenant's few rows: a check would then read every
@@ -186,9 +178,8 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	// its time compiling.
 	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.as_of_tenant', $1, true),
 		set_config('rbac.as_of', pg_catalog.to_char($2::pg_catalog.timestamptz `+inUTC+`, '`+asOfTime+`'), true),
-		set_config('rbac.as_of_settled', $3, true),
 		set_config('plan_cache_mode', 'force_custom_plan', true), set_config('jit', 'off', true)`,
-		tenant, at, settled); err != nil {
+		tenant, at); err != nil {
 		return err
 	}
 	// Each table as the last version of each of its rows counted by the time left it: none where
@@ -247,7 +238,7 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 				selected[i] = `CASE r.expires_at WHEN 'infinity' THEN NULL WHEN '-infinity' THEN pg_catalog.timestamptz 'epoch' ELSE r.expires_at END AS expires_at`
 			}
 		}
-		b := byTime{history: "%[1]s.rbac_history", at: "%[5]s", settled: `current_setting('rbac.as_of_settled')::pg_catalog.xid8`}
+		b := byTime{history: "%[1]s.rbac_history", at: "%[5]s"}
 		view := `SELECT %[4]s FROM %[1]s.rbac_history h, LATERAL pg_catalog.jsonb_populate_record(NULL::%[1]s.%[2]s, h.after) r
 			WHERE h.tenant = current_setting('rbac.as_of_tenant') AND h.entity = '%[3]s'
 			  AND h.op NOT IN ('delete', 'expire') AND h.effective_at <= %[5]s
@@ -301,10 +292,9 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	return finish(ctx, func(c context.Context) error { return unpruned(c, tx, schema, at) })
 }
 
-// byTime is SQL for what a read as of a time tests history's versions by: history, its table; at,
-// the time; and settled, the oldest transaction running as the latest commit record dated by then
-// was written, before which every transaction had ended, its changes seen by others, by then.
-type byTime struct{ history, at, settled string }
+// byTime is SQL for what a read as of a time tests history's versions by: history, its table, and
+// at, the time.
+type byTime struct{ history, at string }
 
 // counts is SQL for whether v, the alias of a version in history, counts by the time: from its
 // date, or where it is later, its transaction's commit (committedBy).
@@ -313,25 +303,22 @@ func (b byTime) counts(v string) string {
 }
 
 // committedBy is SQL for whether the transaction that wrote v, the alias of a version in history,
-// had committed by the time: no other session sees a change before its transaction commits. One
-// older than settled had; another as its latest commit record says, which it looks up by its
-// transaction in history's index of them, a few pages, so only a version of one still running as
-// the time's latest commit record was written, or near it, is looked up. The commit record must be
-// of v's own cluster, so a restored version counts from its own cluster's commit, not from a
-// transaction the new cluster gave the same txid. One that committed before history recorded
-// commits, or that a restore carried from a cluster whose commit records are gone, counts as
-// committed, as its versions count from their dates; the transaction reading v hasn't committed.
-// settled is the current cluster's (settledBy), and bounds a version of any: one of a cluster this
-// one was upgraded from, which keeps xids, is older than every transaction this one ran, and one a
-// dump carried had committed before the dump, so before any commit record this cluster wrote after
-// restoring it. Only history of two clusters whose commits interleave in time, merged into one
-// schema, could hold a version the bound counts too early.
+// had committed by the time: no other session sees a change before its transaction commits. It
+// does as its latest commit record says, which it looks up by its transaction in history's index
+// of them, a few pages, as History reads each record's CommittedAt, so what a time reads turns on
+// nothing History doesn't return: a bound on the transactions every commit record held as running
+// would count, unlooked up, any change of one older as committed, and an inserted commit record
+// with a bound past them all, which no export holds, would count a revoke held open as in force.
+// The commit record must be of v's own cluster, so a restored version counts from its own
+// cluster's commit, not from a transaction the new cluster gave the same txid. One that committed
+// before history recorded commits, or that a restore carried from a cluster whose commit records
+// are gone, counts as committed, as its versions count from their dates; the transaction reading v
+// hasn't committed.
 func (b byTime) committedBy(v string) string {
 	return v + `.txid IS DISTINCT FROM pg_catalog.pg_current_xact_id_if_assigned()
-		AND (` + v + `.txid < ` + b.settled + `
-		  OR coalesce((SELECT max(c.effective_at) FROM ` + b.history + ` c WHERE c.entity = 'commit' AND c.txid = ` + v + `.txid
-		      AND c.cluster IS NOT DISTINCT FROM ` + v + `.cluster),
-		    ` + v + `.effective_at) <= ` + b.at + `)`
+		AND coalesce((SELECT max(c.effective_at) FROM ` + b.history + ` c WHERE c.entity = 'commit' AND c.txid = ` + v + `.txid
+		    AND c.cluster IS NOT DISTINCT FROM ` + v + `.cluster),
+		  ` + v + `.effective_at) <= ` + b.at
 }
 
 // later is SQL selecting a version of h's row written after h, h the alias of a version in
@@ -382,45 +369,6 @@ func (b byTime) byCommit(h, dated, committed string) string {
 	return `(SELECT CASE WHEN c.at IS NULL THEN ` + dated + ` ELSE ` + committed + ` END
 		FROM (SELECT max(c.effective_at) AS at FROM ` + b.history + ` c WHERE c.entity = 'commit' AND c.txid = ` + h + `.txid
 		  AND c.cluster IS NOT DISTINCT FROM ` + h + `.cluster) c)`
-}
-
-// clusterOf returns the identifier of the cluster tx reads (system_identifier), by which AsOf
-// trusts a commit record's dating only for records of the cluster that wrote them. A logical dump
-// restored into another cluster carries commit records of the cluster that wrote them, whose xids
-// restart in the new one, so their horizons and txids don't compare with it: a version is matched
-// to a commit record within its own cluster (committedBy, byCommit), and the settled horizon read
-// only from the current cluster's (settledBy), so restored data keeps its own commit dates and no
-// live change of the new cluster reads as committed. History tells generations apart the same way
-// (followable).
-func clusterOf(ctx context.Context, tx pgx.Tx) (int64, error) {
-	var cluster int64
-	if err := tx.QueryRow(ctx, `SELECT s.system_identifier FROM pg_catalog.pg_control_system() s`).Scan(&cluster); err != nil {
-		return 0, err
-	}
-	return cluster, nil
-}
-
-// settledBy returns, as text, the oldest transaction running as the current cluster's latest commit
-// record dated by at was written, on tx, as that record holds it: every transaction older had ended
-// by then, and a change of one counts by at without its commit record. 0 where none is dated by
-// then. Only the current cluster's records (cluster, from clusterOf) count, as a restored one's
-// after.xmin, far above this cluster's xid range, would count every live change as committed. With
-// sorting off, as history's index of an entity's versions alone gives that order, which where
-// history's statistics hold few commit records the planner would read them all by their index to
-// sort instead (unpruned).
-func settledBy(ctx context.Context, tx pgx.Tx, schema string, at time.Time, cluster int64) (string, error) {
-	restore, err := planning(ctx, tx, unsorted)
-	if err != nil {
-		return "", err
-	}
-	var xmin string
-	if err := tx.QueryRow(ctx, `SELECT coalesce((SELECT h.after->>'xmin' FROM `+historyTable(schema)+` h
-		WHERE h.tenant = '' AND h.entity = 'commit' AND h.key = '' AND h.effective_at <= $1 AND h.effective_at > '-infinity'
-		  AND h.cluster = $2
-		ORDER BY h.effective_at DESC, h.id DESC LIMIT 1), '0')`, at, cluster).Scan(&xmin); err != nil {
-		return "", err
-	}
-	return xmin, restore()
 }
 
 // unpruned refuses at, on tx, once a prune has run past it: of each row a prune keeps only its

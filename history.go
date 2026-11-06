@@ -358,18 +358,10 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 			return 0, nil, err
 		}
 	}
-	cluster, err := clusterOf(ctx, tx)
-	if err != nil {
-		return 0, nil, err
-	}
-	settled, err := settledBy(ctx, tx, schema, before, cluster)
-	if err != nil {
-		return 0, nil, err
-	}
 	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.prune', 'on', true)`); err != nil {
 		return 0, nil, err
 	}
-	b := byTime{history: history, at: "$1", settled: "$7::pg_catalog.xid8"}
+	b := byTime{history: history, at: "$1"}
 	// Whether h ends its row, and no version before it stays.
 	ended := `h.op IN ('delete', 'expire') AND NOT EXISTS (
 		SELECT FROM ` + history + ` s
@@ -441,7 +433,7 @@ func pruneWindow(ctx context.Context, tx pgx.Tx, before time.Time, through Curso
 		  FROM latest l
 		)
 		SELECT (SELECT count(*) FROM pruned), (SELECT id FROM reach)`,
-		pgx.QueryExecModeCacheDescribe, before, through.TxID, through.ID, most, from, maxPrune, settled).Scan(&n, &next); err != nil {
+		pgx.QueryExecModeCacheDescribe, before, through.TxID, through.ID, most, from, maxPrune).Scan(&n, &next); err != nil {
 		return 0, nil, err
 	}
 	// Under a host's transaction, which goes on past the prune.
@@ -516,9 +508,7 @@ type Record struct {
 	CommittedAt time.Time
 	// Cluster is the database cluster that wrote it, its system_identifier as text, which
 	// CommittedAt and AsOf match it to a commit record within: empty for a record written before
-	// 0027_commit_dates, and for a prune's. The chain hashes it, as rewriting it in storage, with
-	// its commit record's, could have a restored commit record's horizon count changes of this
-	// cluster as committed before they were, while every other field read the same.
+	// 0027_commit_dates, and for a prune's.
 	Cluster string
 }
 

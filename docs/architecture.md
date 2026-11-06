@@ -1139,31 +1139,30 @@ flowchart LR
   no tenant, keyed by nothing), and AsOf counts each change from it, or from the change's own date
   where that is later. The constraint trigger `rbac_history_committed`, deferred to the commit, runs
   `rbac_record` as history's role for each record the transaction wrote, and the event of its last,
-  by id, writes the commit record, dated by the clock then, with the oldest transaction then
-  running. A session can fire deferred triggers early with `SET CONSTRAINTS ... IMMEDIATE` and hold
-  the transaction open: the commit record's own event fires inside the trigger that wrote it, a
-  level deeper than at the commit, so there it defers the trigger again, by name, and writes a
-  record dated -infinity, which no read counts from, whose event records the commit anew as it
-  commits; AsOf counts from the latest. A cursor `WITH HOLD` the transaction declared, also in a
-  procedure's or a `DO` block's later transaction, whose creation time is the block's, and an
-  enabled deferrable trigger on a temporary table, would run the session's own code after the commit
-  record as it commits, so a transaction with either is refused. The temporary-table check reads the
-  catalog as the commit record is written, so it is a best-effort defense that assumes the README's
-  roles: it holds against a session with no `TEMPORARY` privilege, which can make no temporary
-  object, and is best-effort against one with it. The roles revoke `TEMPORARY` from `PUBLIC` and
-  grant it only where needed; the application's role needs it only for `AsOf`, which makes temporary
-  views. What runs after the commit record is the rest of the commit: the host's own deferred
-  triggers and constraints of statements after its last change, the session's temporary tables
-  dropped or emptied, about half a millisecond each at the default `temp_buffers` but seconds at a
-  large one (emptying an `ON COMMIT DELETE ROWS` table scans the temporary buffers; 2,000 held a
-  commit about 5.4 s at `temp_buffers = 4GB`, which `lock_timeout` doesn't bound), waiting for no
-  lock past 100 ms, as another session can hold one of those tables, the wait for synchronous
-  replication, and for a prepared transaction, everything until `COMMIT PREPARED`. A transaction
-  that committed before `0027_commit_dates` has none, and its changes count from their own dates.
-  `History` returns no commit record, but each record with its transaction's (`Record.CommittedAt`),
-  which the chain covers as every other field; a prune deletes it with the last of its transaction's
-  other records. What AsOf reads of a time is final once every transaction whose commit record is
-  dated by then is seen by others.
+  by id, writes the commit record, dated by the clock then. A session can fire deferred triggers
+  early with `SET CONSTRAINTS ... IMMEDIATE` and hold the transaction open: the commit record's own
+  event fires inside the trigger that wrote it, a level deeper than at the commit, so there it
+  defers the trigger again, by name, and writes a record dated -infinity, which no read counts from,
+  whose event records the commit anew as it commits; AsOf counts from the latest. A cursor `WITH
+  HOLD` the transaction declared, also in a procedure's or a `DO` block's later transaction, whose
+  creation time is the block's, and an enabled deferrable trigger on a temporary table, would run
+  the session's own code after the commit record as it commits, so a transaction with either is
+  refused. The temporary-table check reads the catalog as the commit record is written, so it is a
+  best-effort defense that assumes the README's roles: it holds against a session with no
+  `TEMPORARY` privilege, which can make no temporary object, and is best-effort against one with it.
+  The roles revoke `TEMPORARY` from `PUBLIC` and grant it only where needed; the application's role
+  needs it only for `AsOf`, which makes temporary views. What runs after the commit record is the
+  rest of the commit: the host's own deferred triggers and constraints of statements after its last
+  change, the session's temporary tables dropped or emptied, about half a millisecond each at the
+  default `temp_buffers` but seconds at a large one (emptying an `ON COMMIT DELETE ROWS` table scans
+  the temporary buffers; 2,000 held a commit about 5.4 s at `temp_buffers = 4GB`, which
+  `lock_timeout` doesn't bound), waiting for no lock past 100 ms, as another session can hold one of
+  those tables, the wait for synchronous replication, and for a prepared transaction, everything
+  until `COMMIT PREPARED`. A transaction that committed before `0027_commit_dates` has none, and its
+  changes count from their own dates. `History` returns no commit record, but each record with its
+  transaction's (`Record.CommittedAt`), which the chain covers as every other field; a prune deletes
+  it with the last of its transaction's other records. What AsOf reads of a time is final once every
+  transaction whose commit record is dated by then is seen by others.
 - **History's order.** `History` reads records in transaction order, by the id each transaction
   takes at its first write, and only those of transactions older than every transaction still
   running, which have all ended. So a cursor never passes a record that commits later. That is
@@ -1229,58 +1228,55 @@ flowchart LR
   grants by principal and type, which history's index of a principal's versions holds beside the
   scope, as a check seeks them on its resource's path. A version counts by a time from its date, or
   its transaction's commit record where that is later, looked up by its transaction in history's
-  index of commit records only where the transaction is no older than the oldest one running as the
-  latest commit record by then was written, which that record holds, and which AsOf reads once:
-  every older one had ended by then, and others saw what it committed. Each record holds the cluster
-  (`system_identifier`, a bigint the indexes of an entity's versions and of commit records hold
-  beside each) that wrote it. A commit record dates only versions of its own cluster, and the
-  horizon is read only from the current cluster's: a logical dump restored into another cluster
-  carries commit records whose xids restarted there, so one's horizon, far above the new cluster's
-  range, would count every live change as committed, and one's txid, colliding with a new
+  index of commit records for every version, as `History` reads `CommittedAt`, so what a time reads
+  turns on nothing an export leaves out. Commit records held the oldest transaction then running,
+  by which AsOf counted every older one's changes as committed without looking them up, as many as
+  two fifths fewer pages for a check once a later transaction had committed, and a seventh fewer for
+  a prune; but no export held that bound, and history's owner could insert a commit record bounding
+  every transaction, which had a revoke held open read as in force while every record `History`
+  returns read the same. Each record holds the cluster (`system_identifier`, a bigint the indexes
+  of an entity's versions and of commit records hold beside each) that wrote it, and a commit
+  record dates only versions of its own cluster: a logical dump restored into another cluster
+  carries commit records whose xids restarted there, so one's txid, colliding with a new
   transaction's, would date a restored change by that transaction's commit. A restored version
   matches its own cluster's commit record, so it keeps its dates; one of a cluster whose commit
   records are gone, or written before `0027_commit_dates` (null cluster), counts from its own date.
-  `History` tells generations apart the same way. The current cluster's horizon bounds versions of
-  any cluster: one from before a `pg_upgrade`, which gives the cluster a new identifier and keeps
-  its xids, is older than every transaction since, and one a dump carried had committed before any
-  commit record the new cluster wrote; only history of two clusters whose commits interleave in
-  time, merged into one schema, could count one too early. A read as of a time before a `pg_upgrade`
-  finds no commit record of the current cluster by then, so it looks up every version's. A failover
-  to a physical replica keeps both the identifier and the xids, as does a recovery to a point in
-  time, whose new timeline numbers again only xids of what it lost, which history lost too: rows of
-  a lost timeline brought back into it would match its new transactions' commit records. The trigger
-  stamps a record from a setting of its transaction, read from the server once, which a session can
-  set as well, so the commit record reads the server's identifier and refuses the commit (SQLSTATE
-  42501) where any record of its transaction names another: a version so stamped would count from
-  its own date, before the commit. `History` returns the stamp (`Record.Cluster`) and the chain
-  hashes it, as rewriting a restored commit record's cluster, and its versions', to the current one
-  would have its horizon count this cluster's next changes as committed early, every other field
-  `History` returns as it was. Each version a view finds is its row's last where no later one, by
-  id, counts by then, a test of each on its own, by its key in history's index of an entity's
-  versions, which orders a row's versions by date and those of one date by id, latest first: since
-  commits are recorded no version is dated before the one written before it, so the test reads the
-  row's latest version dated by then after it, and only where that one doesn't count, its
-  transaction committed later, reads on from the version in that order until the first that counts,
-  each version between two counted read once, whatever their dates; a read on from the version
-  alone, against the index's order, read the page before the version's, of another row, wherever a
-  row's last was first on its page. One written before reads the row's versions dated by then from
-  the latest, as a release before 0006 could date a version before one written earlier. A few pages
-  for each version, however stale history's statistics. That index ordered versions of one date by
-  their places, so versions dated alike, as every write of a `DO` block is, each read every one
-  before it. As a join, by statistics from before most of history was written, as autovacuum leaves
-  them until a tenth of it is new, it read every version of the entity in the tenant for each
-  version found, the key only a filter, so a check took seconds; a read of thousands of rows costs
-  more than such a join planned by fresh statistics, which reads their versions together. That index
-  holds the versions of grants, eligibilities and places in groups only for a read that names their
-  key, as PostgreSQL proves a partial index's predicate from a query's conditions, and history's
-  index of scopes holds them only for one that names a scope, so a read of them by their principal,
-  scope, role or group seeks them in the index leading to it: by statistics that counted the
-  tenant's rows of them as a few, a plan read every one in the tenant through either instead.
-  `Holders` looks each identity's membership of the tenant up on its own, by its key, which the view
-  of memberships gives as the principal: joined to a group's members, or looked up by the principal
-  history copies beside the entity, it read, by such statistics, every membership in the tenant
-  again for each member. The view of custom roles takes each one's newest version, testing none for
-  a later one, so `Grantable`, which can offer any, reads each version once.
+  `History` tells generations apart the same way. A `pg_upgrade` gives the cluster a new identifier
+  and keeps its xids, so versions from before it match their own commit records as before. A
+  failover to a physical replica keeps both the identifier and the xids, as does a recovery to a
+  point in time, whose new timeline numbers again only xids of what it lost, which history lost
+  too: rows of a lost timeline brought back into it would match its new transactions' commit
+  records. The trigger stamps a record from a setting of its transaction, read from the server
+  once, which a session can set as well, so the commit record reads the server's identifier and
+  refuses the commit (SQLSTATE 42501) where any record of its transaction names another: a version
+  so stamped would count from its own date, before the commit. `History` returns the stamp
+  (`Record.Cluster`), which the chain hashes as it does every field. Each version a view finds is
+  its row's last where no later one, by id, counts by then, a test of each on its own, by its key in
+  history's index of an entity's versions, which orders a row's versions by date and those of one
+  date by id, latest first: since commits are recorded no version is dated before the one written
+  before it, so the test reads the row's latest version dated by then after it, and only where that
+  one doesn't count, its transaction committed later, reads on from the version in that order until
+  the first that counts, each version between two counted read once, whatever their dates; a read on
+  from the version alone, against the index's order, read the page before the version's, of another
+  row, wherever a row's last was first on its page. One written before reads the row's versions
+  dated by then from the latest, as a release before 0006 could date a version before one written
+  earlier. A few pages for each version, however stale history's statistics. That index ordered
+  versions of one date by their places, so versions dated alike, as every write of a `DO` block is,
+  each read every one before it. As a join, by statistics from before most of history was written,
+  as autovacuum leaves them until a tenth of it is new, it read every version of the entity in the
+  tenant for each version found, the key only a filter, so a check took seconds; a read of thousands
+  of rows costs more than such a join planned by fresh statistics, which reads their versions
+  together. That index holds the versions of grants, eligibilities and places in groups only for a
+  read that names their key, as PostgreSQL proves a partial index's predicate from a query's
+  conditions, and history's index of scopes holds them only for one that names a scope, so a read of
+  them by their principal, scope, role or group seeks them in the index leading to it: by statistics
+  that counted the tenant's rows of them as a few, a plan read every one in the tenant through
+  either instead. `Holders` looks each identity's membership of the tenant up on its own, by its
+  key, which the view of memberships gives as the principal: joined to a group's members, or looked
+  up by the principal history copies beside the entity, it read, by such statistics, every
+  membership in the tenant again for each member. The view of custom roles takes each one's newest
+  version, testing none for a later one, so `Grantable`, which can offer any, reads each version
+  once.
 - **PruneHistory** deletes only what an export has read and later versions supersede. It keeps
   each row's last version counted by its time, as AsOf counts it, so AsOf answers as before for any
   later time, and refuses an earlier one; of a row whose last version by then ended it, it deletes

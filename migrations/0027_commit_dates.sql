@@ -9,12 +9,14 @@
 -- records (Record.CommittedAt). A record's own date is as it was, and those already written keep
 -- theirs: a transaction that committed before this migration has no commit record, and its changes
 -- count from their dates. One that only prunes writes none, as no read counts a prune from it.
--- Each holds the oldest transaction running as it was written (after.xmin): every one older had
--- ended, and others saw what it committed, by its date. So a read as of a time counts a change of a
--- transaction older than the one the latest commit record by then holds as committed, and looks up
--- only the commit records of those that weren't, as a transaction running then, or one that began
--- or wrote first after the oldest running then began, which a transaction left open anywhere in the
--- cluster holds back: a check as of a time read a fifth fewer pages of history.
+-- A read as of a time looks up each version's commit record, as History reads it for CommittedAt,
+-- so what it answers turns on nothing an export doesn't hold. Each commit record held the oldest
+-- transaction running as it was written, by which a read counted every older one's changes as
+-- committed without looking them up: a check of a grant's 400 versions, each its own transaction,
+-- read 1,754 pages once a later transaction committed, and 2,915 looking each up, and a prune of
+-- 1,000 such versions 18,349 against 21,296. But no export held that bound, and one inserted past
+-- every transaction, which history's owner can write, had AsOf count a revoke held open as in force
+-- while every record History returns read the same.
 --
 -- A constraint trigger deferred to the commit writes it, rbac_record, which history's role owns and
 -- writes history as, fired by each record the transaction writes, of which the last, by id, writes
@@ -52,15 +54,13 @@
 -- max_prepared_transactions at 0.
 --
 -- Each record holds the cluster that wrote it (system_identifier): AsOf dates a version only by
--- commit records of its own cluster, and reads the horizon only from the current cluster's, so a
--- logical dump restored into another cluster, whose xids restarted, neither counts a live change as
--- committed through a restored horizon far above the new cluster's range, nor dates a restored
--- change by a new transaction its txid collides with. A version of another cluster with no commit
--- record there, or of none (null, as every record before this migration is), counts from its own
--- date. The stamp is the server's, whatever a session sets: the trigger keeps it in a setting of
--- the transaction, which any session can set too, so the commit record checks every record of its
--- transaction against the server's, and a transaction whose records name another cluster commits
--- nothing.
+-- commit records of its own cluster, so a logical dump restored into another cluster, whose xids
+-- restarted, dates no restored change by a new transaction its txid collides with, nor a new change
+-- by a restored commit record. A version of another cluster with no commit record there, or of none
+-- (null, as every record before this migration is), counts from its own date. The stamp is the
+-- server's, whatever a session sets: the trigger keeps it in a setting of the transaction, which
+-- any session can set too, so the commit record checks every record of its transaction against the
+-- server's, and a transaction whose records name another cluster commits nothing.
 --
 -- AsOf tested each version of a row for a later one, and PruneHistory each for a later one by its
 -- time, in history's index of an entity's versions, by date: versions dated alike, as every write
@@ -94,15 +94,14 @@
 LOCK TABLE rbac_history IN ACCESS EXCLUSIVE MODE;
 
 -- The cluster that wrote each record, as system_identifier, which AsOf trusts a commit record's
--- dating and settled horizon only for records of: a logical dump restored into another cluster
--- carries commit records of the cluster that wrote them, whose xids restart in the new one, so a
--- restored commit record's after.xmin, far above the new cluster's range, would count every live,
--- uncommitted change as committed, and a restored txid colliding with one the new cluster assigns
--- would date the restored change by the colliding transaction's commit. A version is matched to a
--- commit record within its own cluster, so restored data keeps its own commit dates, and one of
--- another cluster, or of none (null, as every record written before this migration is), counts from
--- its effective_at, as those did. History tells generations apart the same way (followable). The
--- column takes no default, so adding it reads no row; the trigger sets it on every record it writes.
+-- dating only for records of: a logical dump restored into another cluster carries commit records
+-- of the cluster that wrote them, whose xids restart in the new one, so a restored txid colliding
+-- with one the new cluster assigns would date the restored change by the colliding transaction's
+-- commit. A version is matched to a commit record within its own cluster, so restored data keeps
+-- its own commit dates, and one of another cluster, or of none (null, as every record written
+-- before this migration is), counts from its effective_at, as those did. History tells generations
+-- apart the same way (followable). The column takes no default, so adding it reads no row; the
+-- trigger sets it on every record it writes.
 -- A bigint, as system_identifier is: the indexes below hold it beside each version and commit
 -- record, where its text, 20 bytes to a bigint's 8, made the index of an entity's versions a fifth
 -- larger than a bigint does, and that of commit records two fifths.
@@ -225,15 +224,9 @@ BEGIN
             RAISE EXCEPTION 'a transaction that changes the package''s tables sets no rbac.cluster: history stamps each record with the cluster that wrote it, which AsOf dates it by'
                 USING ERRCODE = 'insufficient_privilege', HINT = 'Reset rbac.cluster.';
         END IF;
-        -- With the oldest transaction running as it is written, before its date: every one older had
-        -- ended, and others saw what it committed, by then. So a read as of a time counts a change
-        -- of a transaction older than that of the latest commit record by then as committed, without
-        -- looking its own up (AsOf). Keyed by nothing, so history's index of an entity's versions
-        -- orders them by date.
-        r := pg_catalog.jsonb_build_object('xmin', pg_catalog.pg_snapshot_xmin(pg_catalog.pg_current_snapshot())::text);
         at := pg_catalog.clock_timestamp();
-        INSERT INTO rbac_history (recorded_at, effective_at, tenant, entity, key, op, after, bytes, cluster)
-        VALUES (at, at, '', 'commit', '', 'commit', r, 0, cluster_id);
+        INSERT INTO rbac_history (recorded_at, effective_at, tenant, entity, key, op, bytes, cluster)
+        VALUES (at, at, '', 'commit', '', 'commit', 0, cluster_id);
         RETURN NULL;
     END IF;
     was := CASE WHEN TG_OP = 'INSERT' THEN NULL ELSE pg_catalog.to_jsonb(OLD) END;

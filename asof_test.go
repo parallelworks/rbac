@@ -2180,10 +2180,9 @@ func TestAsOfCountsAChangeFromItsCommit(t *testing.T) {
 	}
 }
 
-// A read as of a time counts a change of a transaction older than every one running as the
-// latest commit record by then was written without looking its own up: a revoke still running as
-// later transactions commit, which their records hold back, counts from its own commit, before
-// which every check allowed what it revokes, and after which none did.
+// A revoke still running as later transactions commit counts from its own commit record, not from
+// theirs, which are dated by then: before its commit every check allowed what it revokes, and after
+// it none did.
 func TestAsOfCountsAChangeRunningAsOthersCommitFromItsOwnCommit(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -2197,7 +2196,7 @@ func TestAsOfCountsAChangeRunningAsOthersCommitFromItsOwnCommit(t *testing.T) {
 	if _, err := tx.Exec(ctx, `DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:u'`); err != nil {
 		t.Fatal(err)
 	}
-	// Others commit while it runs, each recording it as running: the latest dated by mid too.
+	// Others commit while it runs, the latest dated by mid too.
 	for i := range 3 {
 		if _, err := h.pool.Exec(ctx, `UPDATE rbac_memberships SET note = $1 WHERE tenant = 't1' AND principal = 'user:v'`, fmt.Sprint(i)); err != nil {
 			t.Fatal(err)
@@ -2214,7 +2213,7 @@ func TestAsOfCountsAChangeRunningAsOthersCommitFromItsOwnCommit(t *testing.T) {
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// And others after it, whose records hold it as ended.
+	// And others after it.
 	if _, err := h.pool.Exec(ctx, `UPDATE rbac_memberships SET note = 'later' WHERE tenant = 't1' AND principal = 'user:v'`); err != nil {
 		t.Fatal(err)
 	}
@@ -2580,7 +2579,7 @@ func TestAsOfCountsASubtransactionsChangeFromTheTopLevelCommit(t *testing.T) {
 
 // restoreRows writes rows into h's history as a logical dump restored by a superuser would: the
 // commit trigger off, so it records no commit of its own, each row with the cluster and txid it
-// carried. It is how a restore, not the application's role, makes the rows the two tests below need.
+// carried. It is how a restore, not the application's role, makes the rows a test of one needs.
 func restoreRows(t *testing.T, h *harness, rows ...string) {
 	t.Helper()
 	ctx := t.Context()
@@ -2624,45 +2623,10 @@ func fakeGrant(principal, at, clu, txid string, del bool) string {
 		at, txid, clu, principal, op, principal, principal, principal, principal, row)
 }
 
-// fakeCommit is SQL inserting a commit record of txid in cluster clu, dated at, holding xmin.
-func fakeCommit(at, clu, txid, xmin string) string {
-	return fmt.Sprintf(`INSERT INTO rbac_history (effective_at, txid, cluster, tenant, entity, key, op, after, bytes)
-		VALUES (timestamptz '%s', '%s'::xid8, '%s', '', 'commit', '', 'commit', jsonb_build_object('xmin', '%s'), 0)`,
-		at, txid, clu, xmin)
-}
-
-// A revoke of a change still uncommitted, read as of a time while it was, must not read as already
-// in force because another cluster's restored commit record holds a horizon (after.xmin) far above
-// this cluster's xids: AsOf reads the settled horizon only from the cluster's own commit records, so
-// a live, uncommitted revoke of the grant doesn't supersede it. Without that, the restored horizon
-// counts the revoke as committed and the grant reads as revoked.
-func TestAsOfIgnoresAnotherClustersHorizon(t *testing.T) {
-	h := setup(t)
-	ctx := t.Context()
-	ours, theirs := otherCluster(t, h)
-	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "tmpl"))
-	base := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
-	mid := base.Add(2 * time.Second)
-	iso := func(d time.Duration) string { return base.Add(d).Format("2006-01-02 15:04:05") }
-	restoreRows(t, h,
-		// u's grant, committed in this cluster before mid, and a revoke of it committed after mid.
-		fakeGrant("u", iso(0), ours, "100", false),
-		fakeCommit(iso(0), ours, "100", "50"),
-		fakeGrant("u", iso(time.Second), ours, "200", true),
-		fakeCommit(iso(10*time.Second), ours, "200", "50"),
-		// Another cluster's restored commit record, dated before mid, holding a horizon above 200.
-		fakeCommit(iso(time.Second), theirs, "9", "18446744073709551000"),
-	)
-	// As of mid, u's revoke has not committed, so u still holds its grant.
-	if err := h.authz.AsOf(ctx, "t1", mid, func(a *rbac.Authorizer) error {
-		grants, err := a.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{identity("u")}})
-		if err == nil && len(grants) != 1 {
-			t.Errorf("as of %v, a live revoke read through another cluster's horizon leaves u %+v", mid, grants)
-		}
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
+// fakeCommit is SQL inserting a commit record of txid in cluster clu, dated at.
+func fakeCommit(at, clu, txid string) string {
+	return fmt.Sprintf(`INSERT INTO rbac_history (effective_at, txid, cluster, tenant, entity, key, op, bytes)
+		VALUES (timestamptz '%s', '%s'::xid8, '%s', '', 'commit', '', 'commit', 0)`, at, txid, clu)
 }
 
 // A change restored from another cluster, whose txid the new cluster later gives a transaction of
@@ -2679,9 +2643,9 @@ func TestAsOfDatesARestoredChangeWithinItsCluster(t *testing.T) {
 	restoreRows(t, h,
 		// A grant restored from another cluster, committed there long ago, keyed by txid 500.
 		fakeGrant("restored", old.Format("2006-01-02 15:04:05"), theirs, "500", false),
-		fakeCommit(old.Add(time.Second).Format("2006-01-02 15:04:05"), theirs, "500", "10"),
+		fakeCommit(old.Add(time.Second).Format("2006-01-02 15:04:05"), theirs, "500"),
 		// This cluster later gives txid 500 to a transaction that commits after mid: a collision.
-		fakeCommit("2020-01-01 00:00:00", ours, "500", "10"),
+		fakeCommit("2020-01-01 00:00:00", ours, "500"),
 	)
 	// As of mid, the restored grant was in force in its own cluster, so it reads as held.
 	if err := h.authz.AsOf(ctx, "t1", mid, func(a *rbac.Authorizer) error {

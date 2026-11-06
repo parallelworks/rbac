@@ -678,13 +678,10 @@ starts a new generation, or export each generation from the start again after a 
 history with physical backups and replicas; a logical dump restored into another cluster numbers its
 transactions anew. `AsOf` still dates a restored change by its own commit record, as a commit record
 dates only changes of its own cluster, and a restored change whose commit record is gone counts from
-its own date. Restore such a dump into a cluster's schema that holds no history of its own from a
-time the dump covers, and never bring back rows of a timeline a recovery to a point in time left
-behind, which keep the cluster's identifier while the new timeline numbers their transactions
-again: either would have `AsOf` date a change by another transaction's commit. `pg_upgrade` gives
-the cluster a new identifier and keeps its transaction ids, so `AsOf` answers as before, but a read
-as of a time before the upgrade finds no commit record of the cluster's by then, and looks up every
-version's commit record, up to about a quarter more pages of history.
+its own date. `pg_upgrade` gives the cluster a new identifier and keeps its transaction ids, so
+`AsOf` answers as before. Never bring back rows of a timeline a recovery to a point in time left
+behind: they keep the cluster's identifier while the new timeline numbers their transactions again,
+so `AsOf` would date such a change by another transaction's commit.
 
 A change refused, as `ErrDenied` or `ErrInvalid`, writes nothing, so history doesn't record it:
 `Config.OnRefused` is told of each, with its actor, the call and the host's audit, to record the
@@ -796,11 +793,9 @@ planned over history, they cost past `jit_above_cost` for an ordinary subject: a
 compiling, and 110 ms without. It tests each version a statement reads for a later one by its
 row's key, and `Holders` looks each identity's membership of the tenant up by its key, so
 history's statistics, which autovacuum leaves until a tenth of it is new, change no read's cost by
-much: a read of thousands of rows costs a few pages for each version. It looks a version's commit
-record up only where its transaction was no older than the oldest one running as the latest commit
-record by then was written, which each holds, so a transaction left open anywhere in the cluster,
-holding that back, costs a read as of a time after it a page or so more for each version written
-since it began. Joined to a group's members
+much: a read of thousands of rows costs a few pages for each version. It looks each version's
+commit record up by its transaction, a few pages more, as `History` does for `CommittedAt`, so
+what it answers turns on nothing an export leaves out. Joined to a group's members
 by such statistics, the tenant's memberships were read again for each member, so `Holders` of a
 group of 4,000 took 52 seconds, and 90 ms looked up by key. A list counts
 the denies on scopes of its types by history's versions of them, at most a few, and `Grantable`,
