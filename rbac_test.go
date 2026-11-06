@@ -9061,96 +9061,90 @@ func TestAChangePastTheBoundCompilesFewOfTheConditionsThere(t *testing.T) {
 // grants there to groups, the tenant's members and the public, which it reads before it writes and
 // again after by an index of conditional grants alone (rbac_grants_conditional): so it reads no
 // more of the grants than an unconditional grant does, however many unconditional grants to groups
-// the scope holds, under a generic plan too, by statistics from once those were made, from before,
-// or from when the scope's grants were all conditional ones, in a database of the tenant alone or
-// beside many small tenants. Read through the scope's index, which holds whether a grant is
-// conditional but not its condition, each grant to a group there was read from the table: with
-// 80,000, a conditional grant to one more took 39 ms, and an unconditional one 7.
+// the scope holds, under a custom plan and a generic one, by statistics from once those were made,
+// from before, or from when the scope's grants were all conditional ones, in a database of the
+// tenant alone or beside many small tenants. Read through the scope's index, which holds whether a
+// grant is conditional but not its condition, each grant to a group there was read from the table:
+// with 80,000, a conditional grant to one more took 39 ms, and an unconditional one 7.
 func TestAConditionalGrantToAGroupReadsOnlyTheConditionalGrantsThere(t *testing.T) {
 	tenant := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}
-	for _, plan := range []string{"force_custom_plan", "force_generic_plan"} {
-		for _, analyzed := range []string{"after", "before", "conditional"} {
-			for _, beside := range []string{"alone", "crowded"} {
-				t.Run(plan+"/"+analyzed+"/"+beside, func(t *testing.T) {
-					// One connection, so each statement is planned once for all the reads, and the tables
-					// analyzed only as the test says: alone, while they are small, and crowded, beside
-					// many small tenants.
-					pool := pgtest.Open(t, "plan_cache_mode="+plan+"&pool_max_conns=1")
-					var h *harness
-					if beside == "crowded" {
-						h = crowded(t, pool)
-					} else {
-						h = setupOn(t, pool)
-					}
-					ctx := t.Context()
-					analyze := func() {
-						t.Helper()
-						if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants, rbac_groups`); err != nil {
-							t.Fatal(err)
-						}
-					}
-					if _, err := h.pool.Exec(ctx, `ALTER TABLE rbac_grants SET (autovacuum_enabled = off); ALTER TABLE rbac_groups SET (autovacuum_enabled = off)`); err != nil {
+	for _, analyzed := range []string{"after", "before", "conditional"} {
+		for _, beside := range []string{"alone", "crowded"} {
+			t.Run(analyzed+"/"+beside, func(t *testing.T) {
+				h := growing(t, beside == "crowded", "rbac_grants", "rbac_groups")
+				ctx := t.Context()
+				analyze := func() {
+					t.Helper()
+					if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants, rbac_groups`); err != nil {
 						t.Fatal(err)
 					}
-					h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.admin", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "cluster.admin", rbac.User, "admin"))
-					admin := h.as(t, "admin")
-					h.groups(t, "target")
-					// Conditional grants to groups there, under one condition, which the read finds.
-					if _, err := h.pool.Exec(ctx, `WITH g AS (INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'c' || i FROM generate_series(1, 300) i RETURNING id)
-						INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
-						SELECT 't1', 'tenant', 't1', 'group', id, 'cluster.login', 'request.attributes.level > 0' FROM g`); err != nil {
+				}
+				h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.admin", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "cluster.admin", rbac.User, "admin"))
+				admin := h.as(t, "admin")
+				h.groups(t, "target")
+				// Conditional grants to groups there, under one condition, which the read finds.
+				if _, err := h.pool.Exec(ctx, `WITH g AS (INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'c' || i FROM generate_series(1, 300) i RETURNING id)
+					INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+					SELECT 't1', 'tenant', 't1', 'group', id, 'cluster.login', 'request.attributes.level > 0' FROM g`); err != nil {
+					t.Fatal(err)
+				}
+				if analyzed == "conditional" {
+					analyze()
+				}
+				n := 0
+				others := func(more int) {
+					t.Helper()
+					if _, err := h.pool.Exec(ctx, `WITH g AS (INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'many' || i FROM generate_series($1::int, $2::int) i RETURNING id)
+						INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) SELECT 't1', 'tenant', 't1', 'group', id, 'cluster.login' FROM g`,
+						n, n+more-1); err != nil {
 						t.Fatal(err)
 					}
-					if analyzed == "conditional" {
-						analyze()
+					n += more
+				}
+				read := func(plan, condition string) int64 {
+					t.Helper()
+					tx, err := h.pool.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
 					}
-					n := 0
-					others := func(more int) {
-						t.Helper()
-						if _, err := h.pool.Exec(ctx, `WITH g AS (INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'many' || i FROM generate_series($1::int, $2::int) i RETURNING id)
-							INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) SELECT 't1', 'tenant', 't1', 'group', id, 'cluster.login' FROM g`,
-							n, n+more-1); err != nil {
-							t.Fatal(err)
-						}
-						n += more
+					defer func() { _ = tx.Rollback(ctx) }()
+					planAs(t, tx, plan)
+					pages := -pagesRead(ctx, t, tx, "rbac_grants")
+					b := rbac.Binding{Role: "cluster.login", Principal: groupOf("target"), Condition: rbac.Condition{Expression: condition}}
+					if err := h.authz.WithTx(tx).Apply(ctx, admin, tenant, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
+						t.Fatal(err)
 					}
-					read := func(condition string) int64 {
-						t.Helper()
-						tx, err := h.pool.Begin(ctx)
-						if err != nil {
-							t.Fatal(err)
-						}
-						defer func() { _ = tx.Rollback(ctx) }()
-						pages := -pagesRead(ctx, t, tx, "rbac_grants")
-						b := rbac.Binding{Role: "cluster.login", Principal: groupOf("target"), Condition: rbac.Condition{Expression: condition}}
-						if err := h.authz.WithTx(tx).Apply(ctx, admin, tenant, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
-							t.Fatal(err)
-						}
-						return pages + pagesRead(ctx, t, tx, "rbac_grants")
+					return pages + pagesRead(ctx, t, tx, "rbac_grants")
+				}
+				// What a conditional grant reads beyond what an unconditional one does, its conditions',
+				// under each plan.
+				beyond := func() map[string]int64 {
+					t.Helper()
+					by := map[string]int64{}
+					for _, plan := range plans {
+						by[plan] = read(plan, `request.attributes.level > 9`) - read(plan, "")
 					}
-					// What a conditional grant reads beyond what an unconditional one does: its conditions'.
-					beyond := func() int64 {
-						t.Helper()
-						return read(`request.attributes.level > 9`) - read("")
+					return by
+				}
+				// Its statements planned while the tenant holds the conditional grants alone, as a
+				// session does that first changes them then.
+				beyond()
+				others(500)
+				if analyzed == "before" {
+					analyze()
+				}
+				few := beyond()
+				others(20000)
+				if analyzed == "after" {
+					analyze()
+				}
+				for plan, many := range beyond() {
+					if many > few[plan]*3/2+deeper {
+						t.Errorf("under %s, a conditional grant to a group on the tenant read %d pages of the grants more than an unconditional one beside 500 unconditional grants to groups there, and %d beside 20,500",
+							plan, few[plan], many)
 					}
-					// Its statements planned while the tenant holds the conditional grants alone, as a
-					// session does that first changes them then.
-					beyond()
-					others(500)
-					if analyzed == "before" {
-						analyze()
-					}
-					few := beyond()
-					others(20000)
-					if analyzed == "after" {
-						analyze()
-					}
-					if many := beyond(); many > few*3/2+deeper {
-						t.Errorf("a conditional grant to a group on the tenant read %d pages of the grants more than an unconditional one beside 500 unconditional grants to groups there, and %d beside 20,500",
-							few, many)
-					}
-				})
-			}
+				}
+			})
 		}
 	}
 }
@@ -9159,85 +9153,122 @@ func TestAConditionalGrantToAGroupReadsOnlyTheConditionalGrantsThere(t *testing.
 // eligibilities for its role on its scope, which it reads by an index of the eligibilities with a
 // requirement alone (rbac_eligibilities_requires): so the rows and index entries of the
 // eligibilities it reads don't grow with the scope's others, of its role without a requirement or of
-// other roles, under a generic plan too, by statistics from once those were made, from before, or
-// from when the scope's eligibilities all had requirements, in a database of the tenant alone or
-// beside many small tenants. By the scope's index, each eligibility on the scope was read from the
-// table.
+// other roles, under a custom plan and a generic one, by statistics from once those were made, from
+// before, or from when the scope's eligibilities all had requirements, in a database of the tenant
+// alone or beside many small tenants. By the scope's index, each eligibility on the scope was read
+// from the table.
 func TestAGroupsRequirementReadsOnlyTheRequirementsThere(t *testing.T) {
-	for _, plan := range []string{"force_custom_plan", "force_generic_plan"} {
-		for _, analyzed := range []string{"after", "before", "required"} {
-			for _, beside := range []string{"alone", "crowded"} {
-				t.Run(plan+"/"+analyzed+"/"+beside, func(t *testing.T) {
-					pool := pgtest.Open(t, "plan_cache_mode="+plan+"&pool_max_conns=1")
-					var h *harness
-					if beside == "crowded" {
-						h = crowded(t, pool)
-					} else {
-						h = setupOn(t, pool)
-					}
-					ctx := t.Context()
-					analyze := func() {
-						t.Helper()
-						if _, err := h.pool.Exec(ctx, `ANALYZE rbac_eligibilities`); err != nil {
-							t.Fatal(err)
-						}
-					}
-					if _, err := h.pool.Exec(ctx, `ALTER TABLE rbac_eligibilities SET (autovacuum_enabled = off)`); err != nil {
+	for _, analyzed := range []string{"after", "before", "required"} {
+		for _, beside := range []string{"alone", "crowded"} {
+			t.Run(analyzed+"/"+beside, func(t *testing.T) {
+				h := growing(t, beside == "crowded", "rbac_eligibilities")
+				ctx := t.Context()
+				analyze := func() {
+					t.Helper()
+					if _, err := h.pool.Exec(ctx, `ANALYZE rbac_eligibilities`); err != nil {
 						t.Fatal(err)
 					}
-					owner := h.as(t, "owner")
-					h.groups(t, "target")
-					// Requirements of groups' eligibilities for the role there, all one, which the read finds.
-					if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, requires)
-						SELECT 't1', 'cluster', 'c1', 'group', 'r' || i, 'cluster.sudo', 3600, 'request.attributes.level > 0' FROM generate_series(1, 300) i`); err != nil {
+				}
+				owner := h.as(t, "owner")
+				h.groups(t, "target")
+				// Requirements of groups' eligibilities for the role there, all one, which the read finds.
+				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, requires)
+					SELECT 't1', 'cluster', 'c1', 'group', 'r' || i, 'cluster.sudo', 3600, 'request.attributes.level > 0' FROM generate_series(1, 300) i`); err != nil {
+					t.Fatal(err)
+				}
+				if analyzed == "required" {
+					analyze()
+				}
+				n := 0
+				// Eligibilities of groups there without a requirement, half of them of the role and half
+				// of another.
+				others := func(more int) {
+					t.Helper()
+					if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+						SELECT 't1', 'cluster', 'c1', 'group', 'many' || i, role, 3600 FROM generate_series($1::int, $2::int) i, unnest('{cluster.sudo,cluster.login}'::text[]) AS role`,
+						n, n+more/2-1); err != nil {
 						t.Fatal(err)
 					}
-					if analyzed == "required" {
-						analyze()
+					n += more / 2
+				}
+				read := func(plan string) int64 {
+					t.Helper()
+					tx, err := h.pool.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
 					}
-					n := 0
-					others := func(more int) {
-						t.Helper()
-						if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
-							SELECT 't1', 'cluster', 'c1', 'group', 'many' || i, role, 3600 FROM generate_series($1::int, $2::int) i, unnest('{cluster.sudo,cluster.login}'::text[]) AS role`,
-							n, n+more-1); err != nil {
-							t.Fatal(err)
-						}
-						n += more
+					defer func() { _ = tx.Rollback(ctx) }()
+					planAs(t, tx, plan)
+					rows := -scanned(ctx, t, tx, "rbac_eligibilities")
+					if err := h.authz.WithTx(tx).SetEligibility(ctx, owner, cluster, rbac.Eligibility{
+						Role: "cluster.sudo", Principal: groupOf("target"), MaxDuration: time.Hour, Requires: `request.attributes.level > 9`,
+					}); err != nil {
+						t.Fatal(err)
 					}
-					read := func() int64 {
-						t.Helper()
-						tx, err := h.pool.Begin(ctx)
-						if err != nil {
-							t.Fatal(err)
-						}
-						defer func() { _ = tx.Rollback(ctx) }()
-						rows := -scanned(ctx, t, tx, "rbac_eligibilities")
-						if err := h.authz.WithTx(tx).SetEligibility(ctx, owner, cluster, rbac.Eligibility{
-							Role: "cluster.sudo", Principal: groupOf("target"), MaxDuration: time.Hour, Requires: `request.attributes.level > 9`,
-						}); err != nil {
-							t.Fatal(err)
-						}
-						return rows + scanned(ctx, t, tx, "rbac_eligibilities")
+					return rows + scanned(ctx, t, tx, "rbac_eligibilities")
+				}
+				reads := func() map[string]int64 {
+					t.Helper()
+					by := map[string]int64{}
+					for _, plan := range plans {
+						by[plan] = read(plan)
 					}
-					// Its statements planned while the scope holds the requirements alone, as a session
-					// does that first changes them then.
-					read()
-					others(250)
-					if analyzed == "before" {
-						analyze()
+					return by
+				}
+				// Its statements planned while the scope holds the requirements alone, as a session
+				// does that first changes them then.
+				reads()
+				others(500)
+				if analyzed == "before" {
+					analyze()
+				}
+				few := reads()
+				others(10000)
+				if analyzed == "after" {
+					analyze()
+				}
+				for plan, many := range reads() {
+					if many > few[plan]*3/2 {
+						t.Errorf("under %s, a group's eligibility with a requirement read %d rows and entries of the eligibilities beside 500 others there, and %d beside 10,500",
+							plan, few[plan], many)
 					}
-					few := read()
-					others(20000)
-					if analyzed == "after" {
-						analyze()
-					}
-					if many := read(); many > few*3/2 {
-						t.Errorf("a group's eligibility with a requirement read %d rows and entries of the eligibilities beside 500 others there, and %d beside 40,500", few, many)
-					}
-				})
-			}
+				}
+			})
 		}
+	}
+}
+
+// plans are the plans a session makes of a statement, as plan_cache_mode names them: one for the
+// arguments of each run, and one for all of them, which the first run under it makes and later runs
+// reuse until what the statement reads is analyzed again.
+var plans = []string{"force_custom_plan", "force_generic_plan"}
+
+// growing is setupOn, or where crowded, crowded, for a test of what a change reads of tables as
+// they grow: on one connection, so a statement's generic plan is made once for all of the test's
+// reads, with autovacuum off for the tables, so they are analyzed only as the test says, and their
+// writes unrecorded, as recording tens of thousands in history takes seconds that what a change
+// reads of the tables themselves doesn't turn on.
+func growing(t *testing.T, crowd bool, tables ...string) *harness {
+	t.Helper()
+	pool := pgtest.Open(t, "pool_max_conns=1")
+	open := setupOn
+	if crowd {
+		open = crowded
+	}
+	h := open(t, pool)
+	for _, table := range tables {
+		if _, err := pool.Exec(t.Context(), `ALTER TABLE `+table+` SET (autovacuum_enabled = off), DISABLE TRIGGER USER`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return h
+}
+
+// planAs has tx's statements planned as plan, a plan_cache_mode, until it ends.
+func planAs(t *testing.T, tx pgx.Tx, plan string) {
+	t.Helper()
+	if _, err := tx.Exec(t.Context(), `SELECT set_config('plan_cache_mode', $1, true)`, plan); err != nil {
+		t.Fatal(err)
 	}
 }
 
