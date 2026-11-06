@@ -369,6 +369,10 @@ func (d *deciding) read(p Permission) map[string]any {
 type runs struct {
 	resource, values *deciding
 	excluded         map[string]bool
+	// unevaluated is set for decisions a condition's outcome can't change, as Holders' of each
+	// holder's label values, which keeps whatever a condition decided apart (byCondition): they run
+	// none, and a conditional deny removes what it lists, as one that can't be evaluated does.
+	unevaluated bool
 }
 
 // of is what decisions of s's permissions on r, by held and roles, read: rs, or where nil, a runs
@@ -398,8 +402,10 @@ func (rs *runs) of(ctx context.Context, a *Authorizer, s Subject, r Resource, he
 // from what is listed on the tenant, where held is what a check of a value reads. It reads on q
 // the conditions not read with the grants, and asks the constraints through cs, which is on r, so
 // a change reads them back in its transaction. It shares shared, where not nil, with the decisions
-// before and after it by the same grants and denies on the same request (runs). A holding passes
-// held and roles narrowed to what gives values (labeling), so its walk reads each role once.
+// before and after it by the same grants and denies on the same request (runs), and where shared is
+// unevaluated, evaluates no condition: what one decides is in byCondition all the same, as it is
+// whatever the conditions come to. A holding passes held and roles narrowed to what gives values
+// (labeling), so its walk reads each role once.
 func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resource, only func(Permission) bool, cs *constrained,
 	held []holding, ds []denial, roles book, shared *runs,
 ) ([]Permission, map[Permission]bool, map[string]bool, error) {
@@ -456,6 +462,11 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 		if d, ok := denied[p]; ok {
 			return d
 		}
+		if shared.unevaluated {
+			always[p] = slices.ContainsFunc(ds, func(d denial) bool { return d.condition == "" && denies(d.permissions, p) })
+			denied[p] = always[p] || conditionallyDenied(ds, p)
+			return denied[p]
+		}
 		var vars map[string]any
 		if conditionallyDenied(ds, p) {
 			vars = on(p).read(p)
@@ -502,7 +513,7 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 			}
 			byCondition[p] = true
 			// A condition reads the action, so it is evaluated for each permission.
-			given[p] = a.conds.holds(spendOn(p), h.Condition.Expression, on(p).read(p))
+			given[p] = !shared.unevaluated && a.conds.holds(spendOn(p), h.Condition.Expression, on(p).read(p))
 		}
 	}
 	var perms []Permission
@@ -553,9 +564,10 @@ type Holder struct {
 	// doesn't evaluate, so it is set too where the deny binds it on r whatever the request, or never
 	// does, as one reading only r's attributes; or for the members or the public one that may bind
 	// some of them; and when a constraint may remove the permission from it. It is set too when the
-	// resource's label may refuse it: where a condition, or a constraint as Holders asks it, decides
-	// its label values, and for the members or the public, who hold values each their own; as it is
-	// for them where p is a value of an exclusive dimension, which some of them may hold none of.
+	// resource's label may refuse it: where a condition, which Holders doesn't evaluate either, or a
+	// constraint as Holders asks it, decides its label values, and for the members or the public, who
+	// hold values each their own; as it is for them where p is a value of an exclusive dimension,
+	// which some of them may hold none of.
 	MaybeDenied bool
 }
 
@@ -668,33 +680,49 @@ func (a *Authorizer) broadLabeled(ctx context.Context, p Permission, r Resource,
 // identity's holding is decided after the list's snapshot, as its constraints run as for any read,
 // by its read narrowed already for all of them (valuesOfAll).
 func (a *Authorizer) labeled(ctx context.Context, p Permission, r Resource, holders []Holder, values map[string]*valuesRead) ([]Holder, error) {
-	// Whom it keeps, and marks, doesn't turn on the request: each value or power to release whose
-	// decision a condition takes part in, a grant's or a deny's, is in byCondition whatever the
-	// condition came to, and both holdings below set each of those alike; the rest, and whether p's
-	// dimension is excluded, are decided by grants, unconditional denies and constraints asked
-	// without the request. So its conditions read none, which each holder converted again.
-	ctx = withoutRequest(ctx)
+	asked := a.askedBy(r.Labels)
+	only := func(p Permission) bool { return asked[p] }
 	kept := holders[:0]
 	for _, h := range holders {
 		if h.Principal.broad() {
 			kept = append(kept, h)
 			continue
 		}
-		s := Subject{Principal: h.Principal}
-		holding, byCondition, err := a.holdingFor(ctx, r.Tenant, s, values[h.Principal.key()], r.Labels)
+		// Whom it keeps, and marks, doesn't turn on the request: each value or power to release whose
+		// decision a condition takes part in, a grant's or a deny's, is in byCondition whatever the
+		// condition came to, and both holdings listing compares set each of those alike; the rest, and
+		// whether p's dimension is excluded, are decided by grants, unconditional denies and constraints
+		// asked without the request. So no condition is evaluated (runs.unevaluated): evaluated for each
+		// holder and then set aside, a value granted to a group of 1,000 under a condition costing
+		// hundreds of steps took Holders a second, where granted under none it took 33 ms, to list the
+		// same.
+		keep, mark, err := a.listing(ctx, Subject{Principal: h.Principal}, p, r, values[h.Principal.key()], only, &runs{unevaluated: true})
 		if err != nil {
 			return nil, err
 		}
-		switch {
-		case holding.excludes(p):
-		case holding.changed(byCondition, false).Satisfies(r.Labels):
-			kept = append(kept, h)
-		case holding.changed(byCondition, true).Satisfies(r.Labels):
+		if mark {
 			h.MaybeDenied = true
+		}
+		if keep {
 			kept = append(kept, h)
 		}
 	}
 	return kept, nil
+}
+
+// listing is whether labeled keeps s, a holder of p on r, and marks it MaybeDenied, deciding the
+// values only keeps by v, read with the list, sharing shared (runs).
+func (a *Authorizer) listing(ctx context.Context, s Subject, p Permission, r Resource, v *valuesRead, only func(Permission) bool, shared *runs,
+) (keep, mark bool, err error) {
+	holding, byCondition, err := a.holdingFrom(ctx, a.db, s, a.constrain(ctx, s, tenantResource(r.Tenant)), a.labeling(v), only, shared)
+	switch {
+	case err != nil || holding.excludes(p):
+		return false, false, err
+	case holding.changed(byCondition, false).Satisfies(r.Labels):
+		return true, false, nil
+	}
+	held := holding.changed(byCondition, true).Satisfies(r.Labels)
+	return held, held, nil
 }
 
 // valuesOfEach reads on q, in one statement, what the label values in a tenant of each identity
@@ -713,7 +741,7 @@ func (a *Authorizer) valuesOfEach(ctx context.Context, q DB, tenant string, hold
 	}
 	// Each identity's keys cost the planner as a walk of many groups, which across many identities is
 	// past JIT's thresholds.
-	return withoutJIT(ctx, q, func() (map[string]*valuesRead, error) { return a.valuesOfAll(ctx, q, tenant, identities) })
+	return planned(ctx, q, withoutJIT, func() (map[string]*valuesRead, error) { return a.valuesOfAll(ctx, q, tenant, identities) })
 }
 
 // matchingKeys runs as valuesOfAll looks n keys up, of its identities' or its denies', to find the
@@ -1784,6 +1812,10 @@ type alsoRead struct {
 	values bool
 	// keys are the subject's keys in the tenant, as keysOf reads them.
 	keys bool
+	// grantsDenied is the types of scope whose power to change grants a deny anywhere in the tenant
+	// binding the subject lists, as grantsDenied reads them, so a change decides where one may stop
+	// it by what bound it as it held its grants.
+	grantsDenied bool
 }
 
 // grantsRead is what readHeld reads.
@@ -1791,9 +1823,11 @@ type grantsRead struct {
 	held  []holding
 	ds    []denial
 	roles book
-	// values is set with alsoRead.values, and keys read with alsoRead.keys.
-	values *valuesRead
-	keys   []string
+	// values is set with alsoRead.values, keys read with alsoRead.keys, and grantsDenied with
+	// alsoRead.grantsDenied.
+	values       *valuesRead
+	keys         []string
+	grantsDenied map[string]bool
 	// exempt are, with alsoRead.ending, the denies binding the subject that it is exempt from only
 	// until a time.
 	exempt []exemption
@@ -1878,6 +1912,15 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 	if with.keys {
 		ownKeys = "TRUE"
 	}
+	// With grantsDenied, the powers to change grants the denies binding the subject anywhere in the
+	// tenant list: in the statement's text, so the others plan no read of them.
+	var changes string
+	if with.grantsDenied {
+		got.grantsDenied = map[string]bool{}
+		changes = `
+		UNION ALL
+		SELECT 5, p, '', '', '', NULL, false, NULL, '', NULL, false, false, NULL, '', '', false FROM (` + grantsDeniedSQL() + `) g`
+	}
 	forP := read + ` AND ($5 = '' OR $5 = ANY(permissions) OR $6 = ANY(permissions)) AND EXISTS (SELECT FROM keys WHERE ` + counted("$7", "$8") + `)`
 	// In the statement, so they are of the moment its grants are, as are the denies binding it that
 	// exempt it only until a time, read with when, by the paths to the keys exempting it, in the read
@@ -1907,9 +1950,9 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 	}
 	// A deny's keys are looked up only once it is one the statement reads (bindsIfRead).
 	matched := bindsIfRead(forP+` OR `+values+` AND scope = 'tenant:' || $1`, keyed("principals", "SELECT k FROM bound")+exempt)
-	// Grants, denies, roles and keys in that order; grants by principal, scope, role and id, denies
-	// by id and scope, as deniesOn.
-	const deny, role, end, key = 1, 2, 3, 4
+	// Grants, denies, roles, keys and the powers to change grants denied in that order; grants by
+	// principal, scope, role and id, denies by id and scope, as deniesOn.
+	const deny, role, end, key, changing = 1, 2, 3, 4, 5
 	rows, err := q.Query(ctx, `
 		WITH RECURSIVE `+keysSQL("$1::text", "$2::text", "$4")+`, held AS (
 		  SELECT id::text, principal, scope, role, expires_at, conditional, true AS counts FROM rbac_grants
@@ -1929,7 +1972,7 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 		SELECT 2, id, '', '', id, NULL, false, permissions, '', resource_types, privileged, public, grantable_roles, name, description, false
 		FROM `+customRoles+ends+`
 		UNION ALL
-		SELECT 4, k, '', '', '', NULL, false, NULL, '', NULL, false, false, NULL, '', '', false FROM keys WHERE `+ownKeys+`
+		SELECT 4, k, '', '', '', NULL, false, NULL, '', NULL, false, false, NULL, '', '', false FROM keys WHERE `+ownKeys+changes+`
 		ORDER BY 1, 3, 4, 5, 2`,
 		tenant, s.identityKey(), scopes, a.cfg.Now(), perm, wildcard, counts.public, counts.members)
 	if err != nil {
@@ -1973,6 +2016,10 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 			}
 		case key:
 			got.keys = append(got.keys, id)
+		case changing:
+			if t, ok := grantsOn(Permission(id)); ok {
+				got.grantsDenied[t] = true
+			}
 		default:
 			h := holding{Binding: Binding{ID: id, Principal: parsePrincipal(principal), Role: Role(roleID)}, scope: scope, conditional: conditional}
 			if expires != nil {

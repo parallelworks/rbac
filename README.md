@@ -197,10 +197,15 @@ scopes conditional ones reach, to check one by one.
   `Explain` names the dimension that failed. A change checking the labels of many scopes, as one to
   the members of many groups, decides each of the actor's values once in each phase, when a label
   first asks for it, and evaluates a condition of the actor's that doesn't read the action once for
-  all of them, each value still on a budget of its own, as a check of it is. For each it walks only
-  the actor's grants giving values or powers to release, and of their roles only those, each role
-  read once in each phase, as every check deciding a subject's values does, and `Holders` once for
-  all the identities it lists, so other roles' grants, however many or large, cost a label nothing.
+  all of them, each value still on a budget of its own, as a check of it is: `ChangeMembers` the
+  groups' labels and those of the scopes its members gain or lose access on alike, by the values it
+  read with its power over the members before its transaction, and under its locks by one read of
+  that power and its power on every such scope, so the actor held all of them at one moment. Read
+  again with its power on those scopes, each value was decided twice in each phase. For each it
+  walks only the actor's grants giving values or powers to release, and of their roles only those,
+  each role read once in each phase, as every check deciding a subject's values does, and `Holders`
+  once for all the identities it lists, so other roles' grants, however many or large, cost a label
+  nothing.
   `Filter` tests a `text[]` label column (`Columns.Labels`), looking each of a row's values up,
   byte for byte, in objects of the values the holding allows that the query builds once, so a row
   costs a few comparisons for each of its values however many the dimensions declare, in a custom
@@ -510,8 +515,15 @@ scopes conditional ones reach, to check one by one.
   READ COMMITTED, where each statement reads its own.
   A suspended identity holds only what the public does, and stays bound by a deny naming its
   groups or the tenant's members, though no group of its exempts it from one: suspending it lifts
-  nothing. When the host takes a group over (`ImportGroups` from one of `Config.Sources`), the
-  members a tenant put in it, from no source of the host's, leave it.
+  nothing. One whose membership has ended is in none of its groups, though `DeleteExpired` hasn't
+  removed its places yet: `Members` and `GroupsOf` list none of them, `ChangeMembers` removing it
+  from one takes nothing away, so no freeze, label or deny refuses that, though making its place
+  there end sooner adds an identity that isn't a member, which is refused, as `ImportMembers`
+  refuses importing its place again, once it has asked `ValidateGrant` about what the place gives,
+  as for any identity that isn't a member, and `DeleteGroup` counts none as a member from a source
+  the host owns. Read as stored, each such place was one a removal took away, and a member the
+  host keeps, until `DeleteExpired` ran. When the host takes a group over (`ImportGroups` from one
+  of `Config.Sources`), the members a tenant put in it, from no source of the host's, leave it.
 - **Changing members is granting:** a group's members hold what it and the groups it is in hold,
   so `ChangeMembers`, with `rbac.GroupMembers` on the group and its label, checks a change to its members as the
   changes to access it makes, each as `Apply` or `SetDeny` checks one on its scope. An added member
@@ -548,10 +560,12 @@ scopes conditional ones reach, to check one by one.
   label, a constraint answered that it may stop the actor on some scope of the type, or a deny
   binding the actor removes `<type>:grant` or `<type>:*`: then the constraints again about each, and
   the denies on all their paths in one read. Which types such a deny names, wherever it is, it reads
-  before its transaction and again under its locks, of the denies naming the actor, its groups, the
-  tenant's members or the public, through an index of those alone that remove a power to change
-  grants, so the others naming them, as of root on each of thousands of resources, cost it nothing;
-  `DeleteGroup` reads them so for the grants on the group it revokes.
+  before its transaction and again under its locks, in the read of its power over the members, so
+  it held that power and escaped such a deny at one moment, of the denies naming the actor, its
+  groups, the tenant's members or the public, through an index of those alone that remove a power
+  to change grants, so the others naming them, as of root on each of thousands of resources, cost
+  it nothing; `DeleteGroup` reads them so, with its power to manage groups, for the grants on the
+  group it revokes.
   `Config.ResourceOf` gives the package the tenant, which `SetGroup` and `DeleteGroup` check
   `rbac.ManageGroups` on, and the groups, which `ChangeMembers` checks `rbac.GroupMembers` on and
   `SetGroup` and `DeleteGroup` the label of, each with its constraints and label, and the
@@ -593,8 +607,12 @@ holder each, marking those that hold only under a condition or that a deny or co
 It evaluates no condition, so it lists too many rather than too few: every conditional grant and
 deny is marked unevaluated, so those marked can include one a condition reading only the resource
 always refuses, or always allows, and a deny leaves out whom it binds only where it has no
-condition. A `DeniedError`'s message names only the permission, so an error shown to a user shows
-no policy; its fields say why. Every refusal is one, a hook that can't be given its copy too.
+condition. That holds of a labeled resource's holders' label values too: it lists the same
+whatever their conditions come to, so it evaluates none of them, where evaluating each holder's
+and setting what they came to aside, a value granted to a group of 1,000 under a costly condition
+took it a second, and granted under none, 33 ms. A `DeniedError`'s message names only the
+permission, so an error shown to a user shows no policy; its fields say why. Every refusal is one,
+a hook that can't be given its copy too.
 
 ## History
 
@@ -1023,6 +1041,17 @@ can leave the application's role without it. The administrator's and history's r
   `rbac_group_members`, which keeps its owner and who may execute it and takes no lock on the
   tables, to read a group's members and then their memberships planned for their number, so
   `Holders` of any release reads a small group's members alone whatever other tenants call theirs.
+  `0026_conditional_seeks` builds an index of conditional grants on `rbac_grants` and one of the
+  eligibilities with a requirement on `rbac_eligibilities`, the eligibilities' first, as most
+  changes writing both write them first, which keep writes to each table waiting until it commits,
+  those to eligibilities while it builds both, though reads go on. A `DeleteRole` under way as it
+  starts, which deletes the role's grants before its eligibilities, can make it give way. A
+  conditional grant, and a group's eligibility with a requirement, is bounded with those beside it
+  on its scope, read under the scope's lock: without them, every grant to a group on the scope, or
+  every eligibility there, was read from the table to find those, so a conditional grant to a
+  group beside 80,000 unconditional ones on a tenant took 39 ms, against 7 ms unconditional, and by
+  statistics from before they were made, every grant in the table was read. Code from before it
+  and after it run beside each other, applied or not: only what those reads cost turns on it.
   `0027_commit_dates` locks history against reads and writes until it commits, so every change, as
   each writes history, and every read of history, as `AsOf` and an export, waits for it; it rebuilds
   history's index of an entity's versions and its index of scopes, and builds an index of commit

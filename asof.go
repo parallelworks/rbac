@@ -404,7 +404,7 @@ func clusterOf(ctx context.Context, tx pgx.Tx) (string, error) {
 // history's statistics hold few commit records the planner would read them all by their index to
 // sort instead (unpruned).
 func settledBy(ctx context.Context, tx pgx.Tx, schema string, at time.Time, cluster string) (string, error) {
-	restore, err := unsorted(ctx, tx)
+	restore, err := planning(ctx, tx, unsorted)
 	if err != nil {
 		return "", err
 	}
@@ -426,7 +426,7 @@ func settledBy(ctx context.Context, tx pgx.Tx, schema string, at time.Time, clus
 // as no other index gives that order: where history's statistics hold no prune, the planner would
 // read them all by history's index of prunes to sort them, as History would (prunedPast).
 func unpruned(ctx context.Context, tx pgx.Tx, schema string, at time.Time) error {
-	restore, err := unsorted(ctx, tx)
+	restore, err := planning(ctx, tx, unsorted)
 	if err != nil {
 		return err
 	}

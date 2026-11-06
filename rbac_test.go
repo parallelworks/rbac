@@ -9403,6 +9403,344 @@ func TestAChangePastTheBoundCompilesFewOfTheConditionsThere(t *testing.T) {
 	}
 }
 
+// A conditional grant to a group on a scope is bounded with the conditions of the conditional
+// grants there to groups, the tenant's members and the public, which it reads before it writes and
+// again after by an index of conditional grants alone (rbac_grants_conditional): so it reads no
+// more of the grants than an unconditional grant does, however many unconditional grants to groups
+// the scope holds, under a custom plan and a generic one, by statistics from once those were made,
+// from before, or from when the scope's grants were all conditional ones, in a database of the
+// tenant alone or beside many small tenants. Read through the scope's index, which holds whether a
+// grant is conditional but not its condition, each grant to a group there was read from the table:
+// with 80,000, a conditional grant to one more took 39 ms, and an unconditional one 7.
+func TestAConditionalGrantToAGroupReadsOnlyTheConditionalGrantsThere(t *testing.T) {
+	tenant := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}
+	for _, analyzed := range []string{"after", "before", "conditional"} {
+		for _, beside := range []string{"alone", "crowded"} {
+			t.Run(analyzed+"/"+beside, func(t *testing.T) {
+				h := growing(t, beside == "crowded", "rbac_grants", "rbac_groups")
+				ctx := t.Context()
+				analyze := func() {
+					t.Helper()
+					if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants, rbac_groups`); err != nil {
+						t.Fatal(err)
+					}
+				}
+				h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.admin", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "cluster.admin", rbac.User, "admin"))
+				admin := h.as(t, "admin")
+				h.groups(t, "target")
+				// Conditional grants to groups there, under one condition, which the read finds.
+				if _, err := h.pool.Exec(ctx, `WITH g AS (INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'c' || i FROM generate_series(1, 300) i RETURNING id)
+					INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+					SELECT 't1', 'tenant', 't1', 'group', id, 'cluster.login', 'request.attributes.level > 0' FROM g`); err != nil {
+					t.Fatal(err)
+				}
+				if analyzed == "conditional" {
+					analyze()
+				}
+				n := 0
+				others := func(more int) {
+					t.Helper()
+					if _, err := h.pool.Exec(ctx, `WITH g AS (INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'many' || i FROM generate_series($1::int, $2::int) i RETURNING id)
+						INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) SELECT 't1', 'tenant', 't1', 'group', id, 'cluster.login' FROM g`,
+						n, n+more-1); err != nil {
+						t.Fatal(err)
+					}
+					n += more
+				}
+				read := func(plan, condition string) int64 {
+					t.Helper()
+					tx, err := h.pool.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = tx.Rollback(ctx) }()
+					planAs(ctx, t, tx, plan)
+					pages := -pagesRead(ctx, t, tx, "rbac_grants")
+					b := rbac.Binding{Role: "cluster.login", Principal: groupOf("target"), Condition: rbac.Condition{Expression: condition}}
+					if err := h.authz.WithTx(tx).Apply(ctx, admin, tenant, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
+						t.Fatal(err)
+					}
+					return pages + pagesRead(ctx, t, tx, "rbac_grants")
+				}
+				// What a conditional grant reads beyond what an unconditional one does, its conditions',
+				// under each plan.
+				beyond := func() map[string]int64 {
+					t.Helper()
+					by := map[string]int64{}
+					for _, plan := range plans {
+						by[plan] = read(plan, `request.attributes.level > 9`) - read(plan, "")
+					}
+					return by
+				}
+				// Its statements planned while the tenant holds the conditional grants alone, as a
+				// session does that first changes them then.
+				beyond()
+				others(500)
+				if analyzed == "before" {
+					analyze()
+				}
+				few := beyond()
+				others(20000)
+				if analyzed == "after" {
+					analyze()
+				}
+				for plan, many := range beyond() {
+					if many > few[plan]*3/2+deeper {
+						t.Errorf("under %s, a conditional grant to a group on the tenant read %d pages of the grants more than an unconditional one beside 500 unconditional grants to groups there, and %d beside 20,500",
+							plan, few[plan], many)
+					}
+				}
+			})
+		}
+	}
+}
+
+// A group's eligibility with a requirement is bounded with the requirements of the groups'
+// eligibilities for its role on its scope, which it reads by an index of the eligibilities with a
+// requirement alone (rbac_eligibilities_requires): so the rows and index entries of the
+// eligibilities it reads don't grow with the scope's others, of its role without a requirement or of
+// other roles, under a custom plan and a generic one, by statistics from once those were made, from
+// before, or from when the scope's eligibilities all had requirements, in a database of the tenant
+// alone or beside many small tenants. By the scope's index, each eligibility on the scope was read
+// from the table.
+func TestAGroupsRequirementReadsOnlyTheRequirementsThere(t *testing.T) {
+	for _, analyzed := range []string{"after", "before", "required"} {
+		for _, beside := range []string{"alone", "crowded"} {
+			t.Run(analyzed+"/"+beside, func(t *testing.T) {
+				h := growing(t, beside == "crowded", "rbac_eligibilities")
+				ctx := t.Context()
+				analyze := func() {
+					t.Helper()
+					if _, err := h.pool.Exec(ctx, `ANALYZE rbac_eligibilities`); err != nil {
+						t.Fatal(err)
+					}
+				}
+				owner := h.as(t, "owner")
+				h.groups(t, "target")
+				// Requirements of groups' eligibilities for the role there, all one, which the read finds.
+				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, requires)
+					SELECT 't1', 'cluster', 'c1', 'group', 'r' || i, 'cluster.sudo', 3600, 'request.attributes.level > 0' FROM generate_series(1, 300) i`); err != nil {
+					t.Fatal(err)
+				}
+				if analyzed == "required" {
+					analyze()
+				}
+				n := 0
+				// Eligibilities of groups there without a requirement, half of them of the role and half
+				// of another.
+				others := func(more int) {
+					t.Helper()
+					if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+						SELECT 't1', 'cluster', 'c1', 'group', 'many' || i, role, 3600 FROM generate_series($1::int, $2::int) i, unnest('{cluster.sudo,cluster.login}'::text[]) AS role`,
+						n, n+more/2-1); err != nil {
+						t.Fatal(err)
+					}
+					n += more / 2
+				}
+				read := func(plan string) int64 {
+					t.Helper()
+					tx, err := h.pool.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = tx.Rollback(ctx) }()
+					planAs(ctx, t, tx, plan)
+					rows := -scanned(ctx, t, tx, "rbac_eligibilities")
+					if err := h.authz.WithTx(tx).SetEligibility(ctx, owner, cluster, rbac.Eligibility{
+						Role: "cluster.sudo", Principal: groupOf("target"), MaxDuration: time.Hour, Requires: `request.attributes.level > 9`,
+					}); err != nil {
+						t.Fatal(err)
+					}
+					return rows + scanned(ctx, t, tx, "rbac_eligibilities")
+				}
+				reads := func() map[string]int64 {
+					t.Helper()
+					by := map[string]int64{}
+					for _, plan := range plans {
+						by[plan] = read(plan)
+					}
+					return by
+				}
+				// Its statements planned while the scope holds the requirements alone, as a session
+				// does that first changes them then.
+				reads()
+				others(500)
+				if analyzed == "before" {
+					analyze()
+				}
+				few := reads()
+				others(10000)
+				if analyzed == "after" {
+					analyze()
+				}
+				for plan, many := range reads() {
+					if many > few[plan]*3/2 {
+						t.Errorf("under %s, a group's eligibility with a requirement read %d rows and entries of the eligibilities beside 500 others there, and %d beside 10,500",
+							plan, few[plan], many)
+					}
+				}
+			})
+		}
+	}
+}
+
+// plans are the plans a session makes of a statement, as plan_cache_mode names them: one for the
+// arguments of each run, and one for all of them, which the first run under it makes and later runs
+// reuse until what the statement reads is analyzed again.
+var plans = []string{"force_custom_plan", "force_generic_plan"}
+
+// growing is setupOn, or where crowded, crowded, for a test of what a change reads of tables as
+// they grow: on one connection, so a statement's generic plan is made once for all of the test's
+// reads, with autovacuum off for the tables, so they are analyzed only as the test says, and their
+// writes unrecorded, as recording tens of thousands in history takes seconds that what a change
+// reads of the tables themselves doesn't turn on.
+func growing(t *testing.T, crowd bool, tables ...string) *harness {
+	t.Helper()
+	pool := pgtest.Open(t, "pool_max_conns=1")
+	open := setupOn
+	if crowd {
+		open = crowded
+	}
+	h := open(t, pool)
+	for _, table := range tables {
+		if _, err := pool.Exec(t.Context(), `ALTER TABLE `+table+` SET (autovacuum_enabled = off), DISABLE TRIGGER USER`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return h
+}
+
+// planAs has tx's statements planned as plan, a plan_cache_mode, until it ends.
+func planAs(ctx context.Context, t *testing.T, tx pgx.Tx, plan string) {
+	t.Helper()
+	if _, err := tx.Exec(ctx, `SELECT set_config('plan_cache_mode', $1, true)`, plan); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Bounding a scope's conditions and requirements reads them with sequential scans, bitmap scans and
+// sorting off, but leaves the host's transaction its own settings.
+func TestBoundingConditionsLeavesTheHostItsPlannerSettings(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	owner := h.as(t, "owner")
+	h.groups(t, "crew")
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = on; SET LOCAL enable_bitmapscan = on; SET LOCAL enable_sort = on`); err != nil {
+		t.Fatal(err)
+	}
+	authz := h.authz.WithTx(tx)
+	mfa := rbac.Condition{Expression: `request.attributes.mfa == true`}
+	if err := authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: groupOf("crew"), Condition: mfa}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := authz.SetEligibility(ctx, owner, cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: groupOf("crew"), MaxDuration: time.Hour, Requires: mfa.Expression}); err != nil {
+		t.Fatal(err)
+	}
+	var seq, bitmap, sort string
+	if err := tx.QueryRow(ctx, `SELECT current_setting('enable_seqscan'), current_setting('enable_bitmapscan'), current_setting('enable_sort')`).
+		Scan(&seq, &bitmap, &sort); err != nil || seq != "on" || bitmap != "on" || sort != "on" {
+		t.Fatalf("enable_seqscan = %q, enable_bitmapscan = %q, enable_sort = %q, %v", seq, bitmap, sort, err)
+	}
+}
+
+// A read that turns a planner setting off for its own statements puts the host's back under WithTx
+// where it fails, as one of its statements refused before it was sent, where the call's ctx is done
+// once those have run, as pgx sends nothing on a done ctx, or where it panics, which a host can
+// recover from and go on in its transaction: here Holders' read of its holders' label values, with
+// JIT off for it. The host's transaction, which goes on past the call, kept JIT off until it ended.
+func TestAReadLeavesTheHostItsPlannerSettingsWhereItFails(t *testing.T) {
+	h := labeled(t)
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	h.as(t, "u")
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	for name, holders := range map[string]func(t *testing.T, tx pgx.Tx) error{
+		"refused": func(t *testing.T, tx pgx.Tx) error {
+			t.Helper()
+			_, err := h.authz.WithTx(&refusingTx{Tx: tx, sql: "WITH idents AS MATERIALIZED"}).Holders(ctx, login, secret)
+			if err != nil && !strings.Contains(err.Error(), refused) {
+				t.Fatal(err)
+			}
+			return err
+		},
+		"done": func(t *testing.T, tx pgx.Tx) error {
+			t.Helper()
+			call, cancel := context.WithCancel(ctx)
+			defer cancel()
+			// Once the statement reading the values has run.
+			rbac.SetMatchingKeys(t, func(int) { cancel() })
+			_, _ = h.authz.WithTx(tx).Holders(call, login, secret)
+			return call.Err()
+		},
+		"panicked": func(t *testing.T, tx pgx.Tx) (err error) {
+			t.Helper()
+			rbac.SetMatchingKeys(t, func(int) { panic(refused) })
+			defer func() {
+				if r := recover(); r != nil {
+					if r != refused {
+						t.Errorf("the host recovered %v, not the read's panic", r)
+					}
+					err = fmt.Errorf("a panic in Holders: %v", r)
+				}
+			}()
+			_, err = h.authz.WithTx(tx).Holders(ctx, login, secret)
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+			if _, err := tx.Exec(ctx, `SET LOCAL jit = on`); err != nil {
+				t.Fatal(err)
+			}
+			if err := holders(t, tx); err == nil {
+				t.Fatal("Holders read its holders' label values")
+			}
+			var jit string
+			if err := tx.QueryRow(ctx, `SELECT current_setting('jit')`).Scan(&jit); err != nil || jit != "on" {
+				t.Errorf("jit = %q, %v, once Holders failed", jit, err)
+			}
+		})
+	}
+}
+
+// refusingTx is a transaction whose queries holding sql fail before they are sent.
+type refusingTx struct {
+	pgx.Tx
+	sql string
+}
+
+// refused is why refusingTx refuses a query.
+const refused = "refused before it was sent"
+
+func (tx *refusingTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	if strings.Contains(sql, tx.sql) {
+		return nil, errors.New(refused)
+	}
+	return tx.Tx.Query(ctx, sql, args...)
+}
+
+// scanned is how many rows of table tx has read by scanning it, whole or through a bitmap, and how
+// many entries of its indexes by scanning them, as an index scan finds each row it fetches.
+func scanned(ctx context.Context, t *testing.T, tx pgx.Tx, table string) int64 {
+	t.Helper()
+	var n int64
+	if err := tx.QueryRow(ctx, `SELECT sum(pg_stat_get_xact_tuples_returned(oid)) + sum(pg_stat_get_xact_tuples_fetched(oid)) FILTER (WHERE oid = $1::regclass)
+		FROM pg_class WHERE oid = $1::regclass OR oid IN (SELECT indexrelid FROM pg_index WHERE indrelid = $1::regclass)`, table).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
 // Conditions stored around the bounds can cost more than a check may spend: it spends a bounded
 // budget on them, the cheapest first, and refuses what still needs one.
 func TestACheckSpendsABoundedBudgetOnConditionsStoredAroundTheBounds(t *testing.T) {

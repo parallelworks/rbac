@@ -496,6 +496,40 @@ func ListedChecksDecided(t *testing.T, ctx context.Context, a *Authorizer, subje
 	return listed, full
 }
 
+// HoldersListedBothWays is how Holders lists each of subjects, identities that are members or
+// guests of r's tenant, as holders of p on r, deciding its label values by Holders' read of every
+// subject's at once (valuesOfAll): as Holders decides them, evaluating no condition, and evaluating
+// every one with ctx's request. Each is "out", "kept" or "marked", as MaybeDenied.
+func HoldersListedBothWays(t *testing.T, ctx context.Context, a *Authorizer, subjects []Subject, p Permission, r Resource) (unevaluated, evaluated []string) {
+	t.Helper()
+	a = a.still()
+	identities := make([]string, len(subjects))
+	for i, s := range subjects {
+		identities[i] = s.Principal.key()
+	}
+	read, err := a.valuesOfAll(ctx, a.db, r.Tenant, identities)
+	if err != nil {
+		t.Fatal(err)
+	}
+	asked := a.askedBy(r.Labels)
+	listed := func(s Subject, shared *runs) string {
+		keep, mark, err := a.listing(ctx, s, p, r, read[s.Principal.key()], func(q Permission) bool { return asked[q] }, shared)
+		switch {
+		case err != nil:
+			t.Fatal(err)
+		case mark:
+			return "marked"
+		case keep:
+			return "kept"
+		}
+		return "out"
+	}
+	for _, s := range subjects {
+		unevaluated, evaluated = append(unevaluated, listed(s, &runs{unevaluated: true})), append(evaluated, listed(s, nil))
+	}
+	return unevaluated, evaluated
+}
+
 // checksDecided is LabeledChecksDecided of actor, deciding by what read returns, and by v walked
 // whole.
 func (a *Authorizer) checksDecided(ctx context.Context, actor Subject, tenant string, labels []Label, read func() *valuesRead, v *valuesRead) (by, full []string) {
@@ -787,6 +821,17 @@ func anywhereMatched(t *testing.T, ctx context.Context, a *Authorizer, tenant st
 		}
 	}
 	reads := []DenyRead{{Read: "grants denied", Got: slices.Sorted(maps.Keys(types)), Want: slices.Sorted(maps.Keys(wanted))}}
+	// As a change reads them under its locks, with its authority on the tenant or on nothing.
+	for _, on := range [][]Resource{{tenantResource(tenant)}, nil} {
+		_, read, err := a.authoritiesIn(ctx, a.db, s, tenant, on, nil, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reads = append(reads, DenyRead{
+			Read: fmt.Sprint("grants denied with the authority on ", len(on), " resources"),
+			Got:  slices.Sorted(maps.Keys(read)), Want: slices.Sorted(maps.Keys(wanted)),
+		})
+	}
 	for _, exempting := range []bool{false, true} {
 		below, err := a.deniedBelow(ctx, a.db, tenant, s, exempting)
 		if err != nil {

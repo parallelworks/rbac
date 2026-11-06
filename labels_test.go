@@ -722,11 +722,12 @@ func TestFilterIsCountedAlikeHoweverManyDimensionsItsHoldingHoldsWholeOrNotAtAll
 // custom roles of a hundred other permissions, some giving values too, some privileged or public,
 // or for other types too; and Holders, narrowing its read of every identity's values once for all
 // of them, decides each identity's, and which of them a condition or a constraint decided, as a
-// read of its own walked whole does. Of rows whose label has a value no dimension declares or a
-// NULL one, or is NULL, Filter keeps none, as of those whose values differ from declared ones only
-// in case or punctuation, or are quoted, escaped or JSON, and of one whose label is an array of two
-// dimensions, those of it; and it keeps the same of a column in a collation that isn't
-// deterministic, which finds such values equal to declared ones.
+// read of its own walked whole does, and lists each holder, evaluating no condition of its values,
+// as evaluating every one would, with any request or none. Of rows whose label has a value no
+// dimension declares or a NULL one, or is NULL, Filter keeps none, as of those whose values differ
+// from declared ones only in case or punctuation, or are quoted, escaped or JSON, and of one whose
+// label is an array of two dimensions, those of it; and it keeps the same of a column in a
+// collation that isn't deterministic, which finds such values equal to declared ones.
 func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 	var projects []string
 	for i := range 40 {
@@ -796,7 +797,7 @@ func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 	}
 	// The rows refused by a dimension the holding holds no value of, AnyOf ones and the others apart,
 	// and those labeled in an AnyOf dimension it holds every value of.
-	kept, refused, listed, noneOfAnyOf, noneOfOther, wholeAnyOf, valued, conditioned := 0, 0, 0, 0, 0, 0, 0, 0
+	kept, refused, listed, noneOfAnyOf, noneOfOther, wholeAnyOf, valued, conditioned, marked := 0, 0, 0, 0, 0, 0, 0, 0, 0
 	for seed := range uint64(48) {
 		rng := rand.New(rand.NewPCG(seed, seed+17))
 		b := &pgx.Batch{}
@@ -1036,6 +1037,17 @@ func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 		for i, u := range users {
 			identities[i] = subjects[u]
 		}
+		// Decided as Holders decides them, evaluating no condition, its holders' values list each as
+		// deciding them evaluating every one does, whatever the request, or with none.
+		for _, r := range rows {
+			for _, c := range []context.Context{ctx, rbac.WithRequest(ctx, map[string]any{"mfa": true}), rbac.WithRequest(ctx, map[string]any{"mfa": false})} {
+				unevaluated, evaluated := rbac.HoldersListedBothWays(t, c, h.authz, identities, login, r)
+				if !slices.Equal(unevaluated, evaluated) {
+					t.Errorf("seed %d, %v: evaluating no condition, Holders lists %v %v, and evaluating them %v", seed, r.Labels, users, unevaluated, evaluated)
+				}
+				marked += len(slices.DeleteFunc(unevaluated, func(l string) bool { return l != "marked" }))
+			}
+		}
 		byList, byAll := rbac.ListedChecksDecided(t, request, h.authz, identities, "t1", labels)
 		for j, u := range users {
 			for i := range byList[j] {
@@ -1059,8 +1071,9 @@ func TestSearchesOfLabeledResourcesAgreeWithAuthorize(t *testing.T) {
 	}
 	// So that Holders' read is compared where it holds some of what a label asks for, and where a
 	// condition or a constraint decides some, which Holders marks a holder by.
-	if valued == 0 || conditioned == 0 {
-		t.Errorf("by Holders' read, %d decisions held a value a label asks for, and %d had one a condition or a constraint decided", valued, conditioned)
+	if valued == 0 || conditioned == 0 || marked == 0 {
+		t.Errorf("by Holders' read, %d decisions held a value a label asks for, %d had one a condition or a constraint decided, and %d marked their holder",
+			valued, conditioned, marked)
 	}
 }
 
@@ -2123,6 +2136,125 @@ func TestAChangeCheckingManyLabelsEvaluatesTheActorsConditionsOnceForThemAll(t *
 	}
 	if evaluated[60] != evaluated[1] {
 		t.Errorf("a change checking 60 labels evaluated the actor's conditions %d times, and one checking 1 %d times", evaluated[60], evaluated[1])
+	}
+}
+
+// A change to the members of labeled groups that hold access on scopes labeled alike, and are
+// exempt from a deny on each, decides each of the actor's label values once in each of its phases,
+// for the groups' labels and the scopes' alike, so a condition of its value that doesn't read the
+// action runs once before its transaction and once under its locks: before, by the values read with
+// its power over the members, and under the locks by one read of that power and of its power on the
+// scopes. Read again with its power on the scopes, each value was decided again, and the condition
+// ran twice in each phase.
+func TestAChangeToMembersDecidesEachValueOnceInEachPhaseForEveryLabel(t *testing.T) {
+	labels := map[rbac.Scope]rbac.Label{}
+	var groups []string
+	var add []rbac.Member
+	for i := range 5 {
+		label := rbac.Label{"comp": {fmt.Sprintf("c%02d", i)}}
+		g := fmt.Sprintf("g%02d", i)
+		labels[rbac.Scope{Type: rbac.GroupScope, ID: g}], labels[rbac.Scope{Type: "cluster", ID: fmt.Sprintf("k%02d", i)}] = label, label
+		groups, add = append(groups, g), append(add, rbac.Member{Group: g, Principal: identity("u")})
+	}
+	guard := rbac.RoleDefinition{ID: "cluster.guard", Permissions: []rbac.Permission{rbac.DenyPermission("cluster")}, ResourceTypes: []string{"cluster"}}
+	h := setup(t, compartments, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), groupMembers, guard)
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if l, ok := labels[s]; ok {
+				return rbac.Resource{Tenant: tenant, Type: s.Type, ID: s.ID, Labels: l}, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+	})
+	ctx := t.Context()
+	tenant := rbac.TenantRoot("t1")
+	values := grant(tenant, "compartments", rbac.User, "x")
+	values.Condition = rbac.Condition{Expression: `request.attributes.mfa == true`}
+	grants := []rbac.Grant{values, grant(tenant, "group.members", rbac.User, "x"), grant(tenant, "cluster.admin", rbac.User, "x"), grant(tenant, guard.ID, rbac.User, "x")}
+	for i, g := range groups {
+		grants = append(grants, grant(rbac.Scope{Type: "cluster", ID: fmt.Sprintf("k%02d", i)}, "cluster.login", rbac.Group, g))
+	}
+	h.seed(t, grants...)
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+		SELECT 't1', 'cluster', 'k' || lpad(i::text, 2, '0'), 'd', '{members:t1}', ARRAY['group:g' || lpad(i::text, 2, '0')], '{cluster:root}'
+		FROM generate_series(0, 4) AS i`); err != nil {
+		t.Fatal(err)
+	}
+	x := h.as(t, "x")
+	h.as(t, "u")
+	evaluated := rbac.CountEvaluations(t)
+	if err := h.authz.ChangeMembers(rbac.WithRequest(ctx, map[string]any{"mfa": true}), x, "t1", add, nil); err != nil {
+		t.Fatalf("adding u to groups and the scopes they reach, whose labels the actor's values satisfy: %v", err)
+	}
+	if *evaluated != 2 {
+		t.Errorf("the change evaluated the condition of the actor's values %d times, not once in each of its two phases", *evaluated)
+	}
+}
+
+// Under its locks a change to members checks the label of a scope a member gains access on by the
+// values its actor held with its power there, as of one moment, though it decides every label by
+// one read of its values. Here the actor's power to grant on the labeled cluster is removed once the
+// change has checked it before its transaction, and once the transaction has read its authority,
+// the actor moves from the group holding the value to the group giving that power: at no moment did
+// it hold both, so the change is refused. Decided by the values read with its power over the
+// members, and its power on the cluster read apart, it was made.
+func TestAChangeToMembersChecksAScopesLabelByTheValuesHeldWithItsPowerThere(t *testing.T) {
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	u := identity("u")
+	var removed bool
+	var remove func()
+	h := labeled(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
+		resourceOf := c.ResourceOf
+		c.ResourceOf = func(ctx context.Context, tenant string, s rbac.Scope) (rbac.Resource, error) {
+			if s == secret.Scope() {
+				return secret, nil
+			}
+			return resourceOf(ctx, tenant, s)
+		}
+		// Asked about what u gains before the transaction alone, once the change has checked it.
+		c.ValidateGrant = func(_ context.Context, _ rbac.DB, in rbac.GrantInput) error {
+			if do := remove; do != nil && in.Binding.Principal == u && !removed {
+				removed = true
+				do()
+			}
+			return nil
+		}
+	})
+	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "x"), grant(cluster.Scope(), "cluster.admin", rbac.Group, "leads"),
+		grant(rbac.TenantRoot("t1"), "level.high", rbac.Group, "cleared"), grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
+	x := h.as(t, "x", "leads", "cleared")
+	h.as(t, "u")
+	h.as(t, "v")
+	if err := h.authz.ChangeMembers(h.ctx, x, "t1", []rbac.Member{{Group: "crew", Principal: identity("v")}}, nil); err != nil {
+		t.Fatalf("x holds the power and the value: %v", err)
+	}
+	remove = func() {
+		if _, err := h.pool.Exec(h.ctx, `DELETE FROM rbac_members WHERE tenant = 't1' AND group_id = 'leads' AND principal = 'user:x'`); err != nil {
+			t.Error(err)
+		}
+	}
+	moved := false
+	rbac.SetReadingRoles(t, func() {
+		// The change's transaction holds a connection of the test's pool; its reads before it hold
+		// none once read.
+		if h.pool.Stat().AcquiredConns() == 0 || moved {
+			return
+		}
+		moved = true
+		if _, err := h.pool.Exec(h.ctx, `WITH gone AS (DELETE FROM rbac_members WHERE tenant = 't1' AND group_id = 'cleared' AND principal = 'user:x')
+			INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'leads', 'user', 'x')`); err != nil {
+			t.Error(err)
+		}
+	})
+	err := h.authz.ChangeMembers(h.ctx, x, "t1", []rbac.Member{{Group: "crew", Principal: u}}, nil)
+	if !removed || !moved {
+		t.Fatalf("the change asked the host about u before its transaction %t, and read its authority in it %t", removed, moved)
+	}
+	if !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("the change was made, by an actor that held its power on the cluster and the cluster's label value at no moment: %v", err)
 	}
 }
 
@@ -3332,6 +3464,123 @@ func TestHoldersOfALabeledResourceConvertNoRequest(t *testing.T) {
 	}
 	if *n != 0 {
 		t.Errorf("Holders converted %d kinds' attributes", *n)
+	}
+}
+
+// Holders of a labeled resource evaluates no condition of its holders' label values, a grant's or a
+// deny's: it marks whom one decides whatever the condition comes to, so it lists them as evaluating
+// them would, holding or not, and leaves out only whom an unconditional deny of the value binds.
+// Evaluated for each holder and set aside, a value granted to a group of a thousand under a costly
+// condition took Holders a second, and granted under none, 33 ms.
+func TestHoldersOfALabeledResourceEvaluateNoCondition(t *testing.T) {
+	h := labeled(t)
+	ctx := t.Context()
+	l := "[1,2,3,4,5,6,7,8]"
+	conditioned := func(id, condition string) rbac.Grant {
+		g := grant(rbac.TenantRoot("t1"), "level.high", rbac.User, id)
+		g.Condition = rbac.Condition{Expression: condition}
+		return g
+	}
+	costly := fmt.Sprintf(`%s.all(a, %s.all(b, %s.all(c, a > 0)))`, l, l, l)
+	grants := []rbac.Grant{
+		conditioned("holds", `subject.id == "holds"`), conditioned("never", `subject.id == "nobody"`), conditioned("costly", costly),
+		grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "plain"), grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "denied"),
+		grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "maybe"), grant(cluster.Scope(), "cluster.login", rbac.Group, "many"),
+	}
+	for _, id := range []string{"holds", "never", "plain", "denied", "maybe", "costly", "none"} {
+		h.as(t, id, "many")
+	}
+	h.seed(t, grants...)
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions, condition) VALUES
+		('t1', 'tenant', 't1', 'always', '{user:denied}', '{level:high}', ''),
+		('t1', 'tenant', 't1', 'sometimes', '{user:maybe}', '{level:high}', 'request.attributes.mfa == false')`); err != nil {
+		t.Fatal(err)
+	}
+	manyMembers(t, h, 300, `, places AS (INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) SELECT 't1', 'many', 'user', id FROM others),
+		valued AS (INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+		  SELECT 't1', 'tenant', 't1', 'user', id, 'level.high', '`+costly+`' FROM others)
+		SELECT 1`, "rbac_members", "rbac_grants")
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	evaluated := rbac.CountEvaluations(t)
+	holders, err := h.authz.Holders(rbac.WithRequest(ctx, map[string]any{"mfa": true}), login, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *evaluated != 0 {
+		t.Errorf("Holders evaluated %d conditions of its holders' label values", *evaluated)
+	}
+	marked, many := map[string]bool{}, 0
+	for _, hd := range holders {
+		if !strings.Contains(hd.Principal.ID, "-") {
+			marked[hd.Principal.ID] = hd.MaybeDenied
+		} else if hd.MaybeDenied {
+			many++
+		}
+	}
+	if want := map[string]bool{"holds": true, "never": true, "plain": false, "maybe": true, "costly": true}; !maps.Equal(marked, want) || many != 300 {
+		t.Errorf("Holders marks %v, and %d of the 300 others, not %v and all of them", marked, many, want)
+	}
+}
+
+// Holders lists a holder of a labeled resource by its label values, evaluating no condition, as
+// evaluating every one would, with any request or none: for each way the value the label asks for
+// is granted, to the holder or to a group it is in, not at all, unconditionally, or under a
+// condition that holds, one that never does or one reading the request, against each way it is
+// denied, not at all, unconditionally or under such a condition, with a constraint removing it or
+// not.
+func TestHoldersListEachWayAValueIsDecidedAsEvaluatingIt(t *testing.T) {
+	h := labeled(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "removing", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			return in.Subject != nil && strings.HasSuffix(in.Subject.Principal.ID, "-removed"), nil
+		}}}
+	})
+	ctx := t.Context()
+	conditions := map[string]string{"plain": "", "holds": `subject.id != ""`, "never": `subject.id == ""`, "request": `request.attributes.mfa == true`}
+	b := &pgx.Batch{}
+	var subjects []rbac.Subject
+	for _, granted := range []string{"none", "plain", "holds", "never", "request"} {
+		for _, denied := range []string{"none", "plain", "holds", "never", "request"} {
+			for _, through := range []string{"own", "group"} {
+				for _, constraint := range []string{"kept", "removed"} {
+					id := strings.Join([]string{granted, denied, through, constraint}, "-")
+					subjects = append(subjects, rbac.Subject{Principal: identity(id)})
+					b.Queue(`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', $1)`, id)
+					kind, to := "user", id
+					if through == "group" {
+						kind, to = "group", "g-"+id
+						b.Queue(`INSERT INTO rbac_groups (tenant, id) VALUES ('t1', $1)`, to)
+						b.Queue(`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', $1, 'user', $2)`, to, id)
+					}
+					if granted != "none" {
+						b.Queue(`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+							VALUES ('t1', 'tenant', 't1', $1, $2, 'level.high', $3)`, kind, to, conditions[granted])
+					}
+					if denied != "none" {
+						b.Queue(`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions, condition)
+							VALUES ('t1', 'tenant', 't1', $1, ARRAY['user:' || $1], '{level:high}', $2)`, id, conditions[denied])
+					}
+				}
+			}
+		}
+	}
+	if err := h.pool.SendBatch(ctx, b).Close(); err != nil {
+		t.Fatal(err)
+	}
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	seen := map[string]bool{}
+	for _, c := range []context.Context{ctx, rbac.WithRequest(ctx, map[string]any{"mfa": true}), rbac.WithRequest(ctx, map[string]any{"mfa": false})} {
+		unevaluated, evaluated := rbac.HoldersListedBothWays(t, c, h.authz, subjects, login, secret)
+		for i, s := range subjects {
+			if unevaluated[i] != evaluated[i] {
+				t.Errorf("%s: evaluating no condition, Holders lists it %s, and evaluating them %s", s.Principal.ID, unevaluated[i], evaluated[i])
+			}
+			seen[unevaluated[i]] = true
+		}
+	}
+	if !seen["out"] || !seen["kept"] || !seen["marked"] {
+		t.Errorf("Holders listed its holders only %v", seen)
 	}
 }
 
