@@ -31,7 +31,8 @@ func Open(tb testing.TB, params string) *pgxpool.Pool {
 func OpenIn(tb testing.TB, database, params string) *pgxpool.Pool {
 	tb.Helper()
 	ctx := tb.Context()
-	schema := pgx.Identifier{newSchema()}.Sanitize()
+	name := newSchema()
+	schema := pgx.Identifier{name}.Sanitize()
 	conn, err := pgx.Connect(ctx, database)
 	if err != nil {
 		tb.Fatal(err)
@@ -49,7 +50,7 @@ func OpenIn(tb testing.TB, database, params string) *pgxpool.Pool {
 			return
 		}
 		defer func() { _ = conn.Close(ctx) }()
-		if _, err := conn.Exec(ctx, "DROP SCHEMA IF EXISTS "+schema+" CASCADE"); err != nil {
+		if _, err := conn.Exec(ctx, "DROP SCHEMA IF EXISTS "+WithViews(name)+" CASCADE"); err != nil {
 			tb.Errorf("drop schema %s: %v", schema, err)
 		}
 	})
@@ -63,6 +64,13 @@ func OpenIn(tb testing.TB, database, params string) *pgxpool.Pool {
 
 func newSchema() string {
 	return "test_" + strings.ToLower(rand.Text())
+}
+
+// WithViews is the schema name, quoted, and beside it the schema of AsOf's views that migrating it
+// makes (0028_as_of_views), for a DROP SCHEMA of both: dropping the package's schema drops the views,
+// which read its history, but not theirs.
+func WithViews(name string) string {
+	return pgx.Identifier{name}.Sanitize() + ", " + pgx.Identifier{name + "_as_of"}.Sanitize()
 }
 
 // poolIn is a pool of database whose connections use schema, quoted.
@@ -160,13 +168,14 @@ func Template(tb testing.TB, name string, fill func(context.Context, *pgxpool.Po
 	templates.Lock()
 	defer templates.Unlock()
 	if schema, ok := templates.schemas[name]; ok {
-		return schema
+		return pgx.Identifier{schema}.Sanitize()
 	}
 	if templates.database != "" && templates.database != database {
 		tb.Fatalf("template %s: the test database is no longer %s", name, templates.database)
 	}
 	ctx := tb.Context()
-	schema := pgx.Identifier{newSchema()}.Sanitize()
+	unquoted := newSchema()
+	schema := pgx.Identifier{unquoted}.Sanitize()
 	conn, err := pgx.Connect(ctx, database)
 	if err != nil {
 		tb.Fatal(err)
@@ -182,7 +191,7 @@ func Template(tb testing.TB, name string, fill func(context.Context, *pgxpool.Po
 	}
 	if err != nil {
 		// The schema outlives the test, so a failure drops it even once the test's context ends.
-		if _, dropErr := conn.Exec(context.WithoutCancel(ctx), "DROP SCHEMA "+schema+" CASCADE"); dropErr != nil {
+		if _, dropErr := conn.Exec(context.WithoutCancel(ctx), "DROP SCHEMA IF EXISTS "+WithViews(unquoted)+" CASCADE"); dropErr != nil {
 			err = errors.Join(err, dropErr)
 		}
 		tb.Fatalf("template %s: %v", name, err)
@@ -190,7 +199,7 @@ func Template(tb testing.TB, name string, fill func(context.Context, *pgxpool.Po
 	if templates.schemas == nil {
 		templates.schemas = map[string]string{}
 	}
-	templates.database, templates.schemas[name] = database, schema
+	templates.database, templates.schemas[name] = database, unquoted
 	return schema
 }
 
@@ -207,7 +216,7 @@ func DropTemplates(ctx context.Context) error {
 	}
 	defer func() { _ = conn.Close(ctx) }()
 	for name, schema := range templates.schemas {
-		if _, err := conn.Exec(ctx, "DROP SCHEMA IF EXISTS "+schema+" CASCADE"); err != nil {
+		if _, err := conn.Exec(ctx, "DROP SCHEMA IF EXISTS "+WithViews(schema)+" CASCADE"); err != nil {
 			return fmt.Errorf("template %s: %w", name, err)
 		}
 		delete(templates.schemas, name)
