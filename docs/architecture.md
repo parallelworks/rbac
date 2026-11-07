@@ -518,7 +518,12 @@ sequenceDiagram
   (`mapCost`),
   whatever the copy shares or moves whole, so it counts what converting the same does, but for what
   JSON text and packed messages decode to, which it holds as bytes, and for a message, or a longer
-  length of a slice, reached twice, which it copies once where converting counts it again: past it
+  length of a slice, reached twice, which it copies once where converting counts it again. Two
+  slices of one array, one with room to grow, a copy copies apart, as appending to one writes to the
+  array and appending to the other doesn't, and so converting converts each (`copiedKeyOf`): known
+  by their length alone, converting counted them once, so lists of them a check converted were
+  past what a copy holds, and so was every JSON text of them once it cost what a slice of bytes
+  does. Past what a copy holds
   the hook can't be asked, and the call is refused (`uncopied`) as any other, a `DeniedError` of the
   permission on the resource asked about, or the tenant, whose `Reason` names the hook and whose
   message only the permission. Counting a list's elements twice, a string by the bytes of its

@@ -2686,9 +2686,10 @@ func TestACallGivesAHookTheCopyOfNoValueFreedSince(t *testing.T) {
 // Value, or a message a pointer reaches once for the pointer and again for the message, attributes
 // a check converts couldn't be copied, so a constrained check of them was refused, whoever asked,
 // as of a resource holding nearly 40,000 timestamps, which a check converts. Converting counts what JSON
-// text and a packed message decode to as well, which a copy holds as bytes. And an array of
-// interfaces costs what it holds, as a slice does: uncounted, a copy of one holding more values
-// than a check converts cost one.
+// text and a packed message decode to as well, which a copy holds as bytes. An array of interfaces
+// costs what it holds, as a slice does: uncounted, a copy of one holding more values than a check
+// converts cost one. And converting counts two slices of one array, one with room to grow, apart,
+// as a copy copies them apart: counted once, lists of them a check converted couldn't be copied.
 func TestACopyForAHookCountsWhatItHoldsAsConvertingDoes(t *testing.T) {
 	type level int
 	type named string
@@ -2762,6 +2763,10 @@ func TestACopyForAHookCountsWhatItHoldsAsConvertingDoes(t *testing.T) {
 		"a pointer":                      func(i int) any { return &i },
 		"a pointer to a pointer":         func(i int) any { p := &i; return &p },
 		"a pointer to a map":             func(i int) any { m := map[string]any{long: i}; return &m },
+		// Two slices of one array, one with room to grow, which a copy copies apart, as appending to
+		// it writes to the array and appending to the other doesn't.
+		"lists of one array": func(i int) any { l := []any{i, long, nil}; return [2]any{l[:2:2], l[:2]} },
+		"bytes of one array": func(int) any { b := make([]byte, 33, 40); return [2]any{b[:33:33], b} },
 	}
 	for name, made := range messages {
 		values[name] = func(i int) any { return made(i) }
@@ -2776,6 +2781,10 @@ func TestACopyForAHookCountsWhatItHoldsAsConvertingDoes(t *testing.T) {
 	// What these decode to, converting counts and a copy doesn't.
 	decoded := map[string]func(i int) any{
 		"JSON text": func(int) any { return json.RawMessage(`{"a": [1, "b"]}`) },
+		"JSON text of one array": func(int) any {
+			text := append(make([]byte, 0, 8), `"a"`...)
+			return [2]json.RawMessage{text[:3:3], text}
+		},
 	}
 	for name, made := range messages {
 		packed := func(i int) *anypb.Any {

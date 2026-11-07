@@ -236,11 +236,11 @@ const maxNested = 10000
 // converter converts what a host passes into CEL's own values (Attributes), a kind's attributes at
 // a time, spending no more than left on them all: a call's subject's and request's together, and a
 // check's resource's on one of its own, from what they left (asking). It keeps each list, map,
-// pointer, message and JSON text it converts by where it points, its length and its type
-// (copiedKey), with what it found of it, so one reached twice is converted once, for any kind it
-// converts that reaches it. It is kept only while it converts, which runs none of the host's code,
-// so what the host passed stays where it is, and no check knows a value by where one another
-// converter converted was.
+// pointer, message and JSON text it converts by where it points, its length, a slice's capacity and
+// its type (copiedKeyOf), with what it found of it, so one reached twice is converted once, for any
+// kind it converts that reaches it. It is kept only while it converts, which runs none of the
+// host's code, so what the host passed stays where it is, and no check knows a value by where one
+// another converter converted was.
 type converter struct {
 	left uint64
 	// over is set once converting cost more than was left, which fails every kind's attributes.
@@ -1748,19 +1748,25 @@ type copied struct {
 type rise struct{ at, height int }
 
 type copiedKey struct {
-	t   reflect.Type
-	at  uintptr
-	len int
+	t        reflect.Type
+	at       uintptr
+	len, cap int
 }
 
 // copiedKeyOf is how copier and converter know v: a map, pointer, slice or string by where it
-// points, its length and its type. One held by value, which points nowhere, has no key.
+// points, its length, a slice's capacity and its type. One held by value, which points nowhere, has
+// no key. Two slices of one array, one with room to grow, are two values, which a copy copies apart
+// (sliceKey), as appending to one writes to the array and appending to the other doesn't: known by
+// their length alone, converting counted them once, so lists of them a check converted were past
+// what a hook's copy holds.
 func copiedKeyOf(v reflect.Value) (copiedKey, bool) {
 	switch v.Kind() {
 	case reflect.Map, reflect.Pointer:
-		return copiedKey{v.Type(), v.Pointer(), 0}, true
-	case reflect.Slice, reflect.String:
-		return copiedKey{v.Type(), v.Pointer(), v.Len()}, true
+		return copiedKey{t: v.Type(), at: v.Pointer()}, true
+	case reflect.Slice:
+		return copiedKey{t: v.Type(), at: v.Pointer(), len: v.Len(), cap: v.Cap()}, true
+	case reflect.String:
+		return copiedKey{t: v.Type(), at: v.Pointer(), len: v.Len()}, true
 	default:
 		return copiedKey{}, false
 	}
@@ -2071,7 +2077,7 @@ func sliceKey(v reflect.Value) copiedKey {
 	if v.Kind() != reflect.Slice {
 		return copiedKey{}
 	}
-	return copiedKey{v.Type(), v.Pointer(), v.Cap()}
+	return copiedKey{t: v.Type(), at: v.Pointer(), cap: v.Cap()}
 }
 
 // slice is a copy of v, a slice that isn't nil, which is depth deep: a slice of the copy of its

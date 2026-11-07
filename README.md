@@ -444,8 +444,9 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   converts. Attributes
   holding maps, lists, pointers, messages, slices of bytes or JSON text are charged what building
   them costs, so ones a check converted before can be past what it converts now, as 80,000 empty
-  maps, 79,000 JSON texts of a byte or 150,000 slices of a byte are, failing every condition
-  reading an attribute, and past what a hook's copy holds, so a
+  maps, 79,000 JSON texts of a byte or 150,000 slices of a byte are, or lists and JSON texts that
+  are slices of one array, one with room to grow, now each converted, as a hook's copy copies each,
+  failing every condition reading an attribute, and past what a hook's copy holds, so a
   call asking a constraint about them, or `ValidateGrant` about an actor holding them, is refused
   whatever grants it, and so can ones holding structs that hold a map, a slice, a pointer or an
   interface, which a hook's copy sets whole and is now charged their bytes, their padding too, as
