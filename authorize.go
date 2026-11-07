@@ -414,6 +414,8 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 	kept := func(p Permission) bool { return only == nil || only(p) }
 	byCondition := map[Permission]bool{}
 	given := map[Permission]bool{}
+	// What the grants give, under a condition or not: all a deny is asked about (listDenies).
+	asked := map[Permission]bool{}
 	var conditional []holding
 	for _, h := range held {
 		def, ok := roles.role(h.Role)
@@ -421,14 +423,20 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 		case !ok || !def.GrantableOn(r.Type):
 		case h.conditional:
 			readingEntries(len(def.Permissions))
-			if slices.ContainsFunc(def.Permissions, kept) {
+			gives := false
+			for _, p := range def.Permissions {
+				if kept(p) {
+					gives, asked[p] = true, true
+				}
+			}
+			if gives {
 				conditional = append(conditional, h)
 			}
 		default:
 			readingEntries(len(def.Permissions))
 			for _, p := range def.Permissions {
 				if kept(p) {
-					given[p] = given[p] || h.carries(def, p)
+					given[p], asked[p] = given[p] || h.carries(def, p), true
 				}
 			}
 		}
@@ -457,25 +465,27 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 		}
 		return spends[p]
 	}
-	// A deny is settled before a grant's condition, as checks settle it. always are those a deny
-	// without a condition takes, whatever the request.
-	denied, always := map[Permission]bool{}, map[Permission]bool{}
+	// A deny is settled before a grant's condition, as checks settle it, by the denies listing the
+	// permission alone, read once (listedDenies). always are those a deny without a condition takes,
+	// whatever the request, and conditionally those a deny with one lists where none without does.
+	listed := listDenies(ds, asked)
+	denied, always, conditionally := map[Permission]bool{}, map[Permission]bool{}, map[Permission]bool{}
 	isDenied := func(p Permission) bool {
 		if d, ok := denied[p]; ok {
 			return d
 		}
-		if shared.unevaluated {
-			always[p] = slices.ContainsFunc(ds, func(d denial) bool { return d.condition == "" && denies(d.permissions, p) })
-			denied[p] = always[p] || conditionallyDenied(ds, p)
-			return denied[p]
+		var conditional []denial
+		always[p], conditional = listed.of(p)
+		conditionally[p] = len(conditional) > 0
+		switch {
+		case always[p] || !conditionally[p]:
+			denied[p] = always[p]
+		case shared.unevaluated:
+			denied[p] = true
+		default:
+			_, denied[p] = a.conditionallyDeniedBy(conditional, newDenyBudget(r.path()).sharing(on(p).ran), on(p).read(p))
 		}
-		var vars map[string]any
-		if conditionallyDenied(ds, p) {
-			vars = on(p).read(p)
-		}
-		d, ok := a.deniedBy(ds, p, newDenyBudget(r.path()).sharing(on(p).ran), vars)
-		denied[p], always[p] = ok, ok && d.condition == ""
-		return ok
+		return denied[p]
 	}
 	// Holders asks a constraint about s without the request's attributes, where it answers true if
 	// it removes p with any: what it removes another request may keep, unless a deny takes it
@@ -533,15 +543,11 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 			perms = append(perms, p)
 		}
 	}
-	// What is given here, a conditional deny may take under another request, or give back.
-	for _, d := range ds {
-		if d.condition == "" {
-			continue
-		}
-		for p, ok := range given {
-			if ok && !removed[p] && !always[p] && denies(d.permissions, p) {
-				byCondition[p] = true
-			}
+	// What is given here, a conditional deny may take under another request, or give back: each
+	// permission given was decided above.
+	for p, ok := range given {
+		if ok && !removed[p] && !always[p] && conditionally[p] {
+			byCondition[p] = true
 		}
 	}
 	return perms, byCondition, shared.excluded, nil
@@ -1745,34 +1751,35 @@ func (a *Authorizer) filterKeys(arg func(int) string, of string) string {
 // filterAt is SQL for the time Filter's statement decides at: the call's, or the later time
 // DeleteExpired deleted by that the host's statement sees, as decidedSQL decides a read of a
 // subject. The host runs it later than Filter read the time, by which a run can have removed what
-// ended since. Each use reads it in the statement's snapshot, so all read the same; one older than
-// Filter's reads, as a host's REPEATABLE READ transaction begun before them takes, sees no run they
-// didn't, so it decides at the call's time, which no later run's removals it sees can mix with.
-// arg numbers Filter's arguments.
+// ended since. Each use reads it in the statement's snapshot, so all read the same, but for a time
+// past the database's clock, which each bounds by the clock as it reads it (expiredUntil); one
+// older than Filter's reads, as a host's REPEATABLE READ transaction begun before them takes, sees
+// no run they didn't, so it decides at the call's time, which no later run's removals it sees can
+// mix with. arg numbers Filter's arguments.
 func (a *Authorizer) filterAt(arg func(int) string) string {
 	if a.asOf {
 		return arg(4)
 	}
-	return "greatest(" + arg(4) + "::timestamptz, (SELECT max(until) FROM rbac_expired))"
+	return "greatest(" + arg(4) + "::timestamptz, (SELECT " + expiredUntil + " FROM rbac_expired))"
 }
 
-// filterHolding is SQL, after the label's test, and its argument, numbered from arg's first, keeping
-// a row only where Filter's statement decides before lapses, the earliest time after Filter's that
-// the subject's membership, or a place in a group of its own or of a group it is in, ended
-// (alsoRead.lapse); zero is never. The holding is Filter's, which the statement doesn't read. Before
-// then, the subject's keys, and the denies binding and exempting it by them, are at the time the
-// statement decides at (filterAt) what they were at Filter's, and the grants in force then are no
-// more than at Filter's: so a row it keeps, the subject could do p to at Filter's time by the
-// holding and by the grants and denies the statement reads, with what DeleteExpired removed since,
-// which had all ended by then. From then on, as once DeleteExpired has removed the place a deny
-// binds it by and passed over the one that gave it a value, it keeps none, rather than a row its
-// label kept by the holding of one moment and its grants and denies of another: build the
-// condition again. As of a time, it decides at that time.
+// filterHolding is SQL, after the label's test, and its argument, numbered from arg's first,
+// keeping a row only where Filter's statement decides before lapses, the earliest time after
+// Filter's that the subject's keys differ by time alone, as its membership or the latest path to
+// one of its groups ends (alsoRead.lapse); zero is never. The holding is Filter's, which the
+// statement doesn't read. Before then, the subject's keys, and the denies binding and exempting it
+// by them, are at the time the statement decides at (filterAt) what they were at Filter's, and the
+// grants in force then are no more than at Filter's: so a row it keeps, the subject could do p to
+// at Filter's time by the holding and by the grants and denies the statement reads, with what
+// DeleteExpired removed since, which had all ended by then. From then on, as once DeleteExpired has
+// removed the place a deny binds it by and passed over the one that gave it a value, it keeps none,
+// rather than a row its label kept by the holding of one moment and its grants and denies of
+// another: build the condition again. As of a time, it decides at that time.
 func (a *Authorizer) filterHolding(arg func(int) string, first int, lapses time.Time) (string, []any) {
 	if a.asOf || lapses.IsZero() {
 		return "", nil
 	}
-	return " AND (SELECT coalesce(max(until) < " + arg(first) + "::timestamptz, true) FROM rbac_expired)", []any{lapses}
+	return " AND (SELECT coalesce(" + expiredUntil + " < " + arg(first) + "::timestamptz, true) FROM rbac_expired)", []any{lapses}
 }
 
 // filterGrants is SQL selecting the scopes of the grants Filter's condition counts for its subject
@@ -1901,9 +1908,9 @@ type alsoRead struct {
 	// exempts it only until a time (belowSQL), so a change to a custom role decides whether one may
 	// stop it by what bound it as it held its grants. With ending, whose paths it reads.
 	below bool
-	// lapse is the earliest time after the read's that the subject's membership, or a place in a
-	// group of those it is in, ends (lapseSQL): until then its keys, and the denies binding and
-	// exempting it by them, are as read, whatever later time a statement decides at.
+	// lapse is the earliest time after the read's that the subject's keys differ by time alone
+	// (lapseSQL): until then they, and the denies binding and exempting it by them, are as read,
+	// whatever later time a statement decides at.
 	lapse bool
 }
 
@@ -2027,7 +2034,7 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 	if with.lapse {
 		changes += `
 		UNION ALL
-		SELECT 8, '', '', '', '', ` + lapseSQL("$1", "$2::text") + `, false, NULL, '', NULL, false, false, NULL, '', '', false`
+		SELECT 8, '', '', '', '', ` + lapseSQL + `, false, NULL, '', NULL, false, false, NULL, '', '', false`
 	}
 	forP := read + ` AND ($5 = '' OR $5 = ANY(permissions) OR $6 = ANY(permissions)) AND EXISTS (SELECT FROM keys WHERE ` + counted("$7", "$8") + `)`
 	// In the statement, so they are of the moment its grants are, as are the denies binding it that
@@ -2036,8 +2043,11 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 	var places, ends, kept string
 	exempted := keyed("exempt", "SELECT k FROM exempted")
 	exempt, until := ` AND NOT `+exempted, `NULL::timestamptz AS until`
+	if with.ending || with.lapse {
+		places = `, ` + endsSQL("$2::text", decidedAt)
+	}
 	if with.ending {
-		places = `, ` + endsSQL("$2::text", decidedAt) + `, ` + lastingSQL("$1::text", "$2::text")
+		places += `, ` + lastingSQL("$1::text", "$2::text")
 		ends = `
 		UNION ALL
 		SELECT 3, k, '', '', '', e, false, NULL, '', NULL, false, false, NULL, '', '', false FROM ends`

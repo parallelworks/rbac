@@ -268,40 +268,52 @@ func keysSQL(tenant, identity, now string) string {
 	)`, tenant, identity, now)
 }
 
-// lapseSQL is SQL, in a statement after keysSQL and decidedSQL, for the earliest time after the one
-// decided that the identity's membership in the tenant, or a place in a group of the identity or of
-// a group it is in, ends, null for never: until then, keysSQL defines the same keys, those binding
-// it and exempting it included, at any time. tenant and identity are SQL for the tenant and the
-// identity's key. Each is looked up by its principal, under OFFSET 0: as a plain aggregate of a
-// table, its least expiry would be planned as a walk of every tenant's expiries from the earliest.
-func lapseSQL(tenant, identity string) string {
-	return fmt.Sprintf(`(SELECT min(e) FROM (
-		  SELECT expires_at FROM rbac_memberships WHERE tenant = %[1]s AND principal = (SELECT %[2]s)
-		  UNION ALL
-		  SELECT expires_at FROM rbac_members WHERE tenant = %[1]s AND principal = ANY(ARRAY(SELECT k FROM bound))
-		  OFFSET 0) l(e) WHERE e > %[3]s)`, tenant, identity, decidedAt)
-}
+// lapseSQL is SQL, in a statement after keysSQL and endsSQL of the same identity and time, for the
+// earliest time after the one decided that keysSQL's keys, those binding and exempting it included,
+// first differ by time alone, null for never: the soonest of when the latest path to each of its
+// groups ends, and its membership in the tenant, which ends holds as its identity's key's and bounds
+// every path. A place that ends while another, from another source or through another group, keeps
+// it in the group changes none of them, so it lapses nothing: by the end of each place alone, a
+// condition built before DeleteExpired removed such a place kept no row, though the subject's keys,
+// and the grants and denies they reach, were as they had been.
+const lapseSQL = `(SELECT min(e) FROM ends)`
 
 // decidedSQL is SQL defining, in a WITH, decided(at, expired): the time a statement reading an
 // actor or a subject decides at, given now, SQL for the call's time, and the latest time
-// DeleteExpired deleted by that its snapshot sees, as rbac_expired records it, null for none. It
-// decides at the later of the two (decidedAt). DeleteExpired removes what has ended in transactions
-// of its own, places in groups before memberships, passing over what a change holds, so a read by an
-// earlier time could find a later-ending row removed and an earlier-ending one left, a state no
-// moment held: as the place a deny binds the subject by gone, and the membership or place its power
-// comes through still there. It records with each batch, in its transaction, the latest time a row
-// the batch removes ended at, of the memberships alone where it removes their places with them, so
-// a snapshot seeing any of its removals sees a time each had ended by, or a place's membership had,
-// after which the place gives nothing (keysSQL), and a read deciding no earlier finds what it
-// removed ended or giving nothing. The caller has the call decide at it too (callClock.passed). As
-// of a time, it is that time.
+// DeleteExpired deleted by that its snapshot sees, as rbac_expired records it, but no later than
+// the database's clock (expiredUntil), null for none. It decides at the later of the two
+// (decidedAt). DeleteExpired removes what has ended in transactions of its own, places in groups
+// before memberships, passing over what a change holds, so a read by an earlier time could find a
+// later-ending row removed and an earlier-ending one left, a state no moment held: as the place a
+// deny binds the subject by gone, and the membership or place its power comes through still there.
+// It records with each batch, in its transaction, the latest time a row the batch removes ended at,
+// of the memberships alone where it removes their places with them, so a snapshot seeing any of its
+// removals sees a time each had ended by, or a place's membership had, after which the place gives
+// nothing (keysSQL), and a read deciding no earlier finds what it removed ended or giving nothing.
+// The caller has the call decide at it too (callClock.passed). As of a time, it is that time.
 func (a *Authorizer) decidedSQL(now string) string {
 	if a.asOf {
 		return `decided(at, expired) AS (SELECT ` + now + `::timestamptz, NULL::timestamptz)`
 	}
 	return `decided(at, expired) AS (SELECT greatest(` + now + `::timestamptz, e.until), e.until
-		FROM (SELECT max(until) AS until FROM rbac_expired) e)`
+		FROM (SELECT ` + expiredUntil + ` AS until FROM rbac_expired) e)`
 }
+
+// expiredUntil is SQL, of rbac_expired, for the latest time recorded there, but no later than the
+// database's clock as the statement reads it, null for none, which least alone would read as that
+// clock. No write records a time past the clock as its own statement began (rbac_expired_until),
+// which is before it commits, so before a snapshot that sees it is taken, and the clock read after:
+// so it takes nothing from a time DeleteExpired recorded, by the clock of the server it recorded it
+// on, while that clock doesn't go back; a hot standby reads by its own (README: Expiry). Not the
+// clock as the statement began: a statement of a simple query takes its snapshot after it is
+// planned, once it has waited for the locks it reads by, as do those after the first of several in
+// one, so it could see a time a run recorded after it began, and decide before the end of a row the
+// run removed, by a state no moment held. A time past the clock, which only a role that may disable
+// the table's triggers, or the database's clock going back, can leave there, would otherwise have
+// every call decide at it, for good: a deny binding a subject through a place ending before then
+// lifted, and a condition reading request.time met. In decidedSQL the clock is read once for the
+// statement, as no plan inlines a CTE that calls a volatile function.
+const expiredUntil = `CASE WHEN max(until) IS NOT NULL THEN least(max(until), clock_timestamp()) END`
 
 // decidedAt is SQL for the time decidedSQL defines.
 const decidedAt = "(SELECT at FROM decided)"
@@ -317,19 +329,19 @@ func (a *Authorizer) readingNow() (time.Time, bool) {
 }
 
 // expiredBy has the call decide no earlier than the latest time DeleteExpired deleted by that q's
-// snapshot sees, as decidedSQL has a read of an actor or a subject (callClock.passed): for a read
-// of many principals in one snapshot, as Holders', whose first statement it is, so every statement
-// of it decides at one time; and as the last statement of a change's transaction that read its
-// actor, where a run committing after that read removed a row that ended after the change's time,
-// which the statements after it could find removed, as whether what the change gives breaks an
-// exclusive dimension, has it tried again, rather than decide them at the earlier time by what the
-// run left. As of a time, it is that time.
+// snapshot sees, no later than the database's clock (expiredUntil), as decidedSQL has a read of an
+// actor or a subject (callClock.passed): for a read of many principals in one snapshot, as
+// Holders', whose first statement it is, so every statement of it decides at one time; and as the
+// last statement of a change's transaction that read its actor, where a run committing after that
+// read removed a row that ended after the change's time, which the statements after it could find
+// removed, as whether what the change gives breaks an exclusive dimension, has it tried again,
+// rather than decide them at the earlier time by what the run left. As of a time, it is that time.
 func (a *Authorizer) expiredBy(ctx context.Context, q DB) error {
 	if a.asOf || a.clock == nil {
 		return nil
 	}
 	var expired *time.Time
-	if err := q.QueryRow(ctx, `SELECT max(until) FROM rbac_expired`).Scan(&expired); err != nil || expired == nil {
+	if err := q.QueryRow(ctx, `SELECT `+expiredUntil+` FROM rbac_expired`).Scan(&expired); err != nil || expired == nil {
 		return err
 	}
 	return a.clock.passed(*expired, false)

@@ -1109,10 +1109,17 @@ flowchart TB
   group's key. `DeleteScopes` holds its scopes' locks and `DeletePrincipal` its principal's, so
   neither waits for the other, and both delete the principal's grants and eligibilities on those
   scopes: each locks them in the order of their scopes first, eligibilities before grants, so they
-  don't deadlock. A revoke locks the grants it deletes in that order too, as a change ending places
-  in groups ends activations among them without their scope's lock. `DeleteRole` removes a role's
-  grants before its eligibilities, which it holds already, and holds the tenant's lock exclusive, so
-  no change runs beside it but `DeleteExpired`, which waits on no row. A host transaction making
+  don't deadlock. `DeletePrincipal` takes its principal out of the approvers and exemptions it
+  locked alone, by their ids and the versions it locked, in its next round trip: `SetEligibility`
+  and `SetDeny` take no lock of the identities they name, so one naming it can commit in between,
+  which, matched again by its key, would be locked out of order, and two removals of identities it
+  names both would deadlock. It is left naming it, as one set after the removal is, for a later
+  removal. `DeleteGroups` needs no such care, as setting either takes the lock of each group it
+  names, which the removal holds. A revoke locks the grants it deletes in that order too, as a
+  change ending places in groups ends activations among them without their scope's lock.
+  `DeleteRole` removes a role's grants before its eligibilities, which it holds already, and holds
+  the tenant's lock exclusive, so no change runs beside it but `DeleteExpired`, which waits on no
+  row. A host transaction making
   several changes takes each one's rows in this order, but not all of them together: two that make
   the same changes in opposite orders can deadlock (above). The order a statement locks its sorted
   rows in is how PostgreSQL plans it, not a promise of SQL: a subquery holding `FOR UPDATE`,
@@ -1181,10 +1188,15 @@ flowchart TB
   escaped the deny, a state no moment held. With no skew, `Apply` granting, `SetEligibility`,
   `Activate`'s check of its approver and a change to members read the time before the actor; with
   `DeleteExpired`'s clock ahead, every change and check could. So each batch records in
-  `rbac_expired`, in the statement removing its rows (`expiredThroughSQL`), the latest time one of
-  them ended at, which commits with them: a snapshot seeing any row a batch removed sees it. A read
-  of an actor or a subject, `readHeld` and `keysOf`, decides at the later of the call's time and the
-  latest time recorded that its snapshot sees (`decidedSQL`), every expiry it compares too: every
+  `rbac_expired`, in the statement removing its rows (`expiredThroughSQL`), through
+  `rbac_expired_through`, the latest time one of them ended at, which commits with them: a snapshot
+  seeing any row a batch removed sees it. A read of an actor or a subject, `readHeld` and `keysOf`,
+  decides at the later of the call's time and the latest time recorded that its snapshot sees, but
+  no later than the database's clock as it reads it (`decidedSQL`, `expiredUntil`), which takes
+  nothing from a time a run recorded, as none is past the clock as the run's statement began, before
+  the snapshot that sees it is taken; the clock as the read's own statement began can be before its
+  snapshot, as in a simple query, which plans a statement, and waits for its locks, first. Every
+  expiry it compares is decided so too: every
   row it finds removed had ended by then, or is a place of an identity whose membership had, which
   gives nothing once it has, and the rows still there it decides by their ends, so it
   reads the state of that moment. The condition `Filter` gives the host decides so in the host's own
@@ -1208,11 +1220,12 @@ flowchart TB
   goes on, which its transaction decides again, so there the call decides later where it finds a
   later time. The condition `Filter` gives with the label column holds the subject's label holding,
   which the query doesn't read, decided at `Filter`'s time. `Filter` reads with it when the
-  subject's keys first change by time alone, the earliest end after then of its membership, or of a
-  place in a group of its own or of a group it is in (`lapseSQL`), and the condition keeps no row
-  where the query decides at that time or later (`filterHolding`): by then a run can have removed
-  the place a deny binds it by and passed over the one its value came through. Before then its
-  keys, and the denies binding and exempting it by them, are those of `Filter`'s time, and the
+  subject's keys first change by time alone, the earliest end after then of its membership, or of
+  its last path to one of its groups, as `endsSQL` walks them (`lapseSQL`): a place another path
+  outlasts, from another source or through another group, changes none of them. The condition keeps
+  no row where the query decides at that time or later (`filterHolding`): by then a run can have
+  removed the place a deny binds it by and passed over the one its value came through. Before then
+  its keys, and the denies binding and exempting it by them, are those of `Filter`'s time, and the
   grants in force at the query's time are no more than at `Filter`'s, so each row kept the subject
   could read at `Filter`'s time by the holding, with what runs removed since, which had all ended by
   then. Keeping no row at any later time, a run between `Filter` and the query would have emptied
@@ -1220,8 +1233,9 @@ flowchart TB
   `Members`, `GroupsOf`, `Memberships`, `MembershipsOf` and `Conflicts` read by the call's time:
   each lists what only grows with the rows in force, so an element listed was in force then, and
   one left out had ended by then or by a run's time. A batch adds its own time and deletes those no
-  later that no other run is deleting (`SKIP LOCKED`), which only `DeleteExpired` writes, so runs
-  never wait for each other, a run in a host's transaction left open too, the latest time stays,
+  later that no other run is deleting (`SKIP LOCKED`), through `rbac_expired_through`, which alone
+  writes the table, as its owner, refusing a time past the database's clock, so runs never wait for
+  each other, a run in a host's transaction left open too, the latest time stays,
   and a batch removing what ended sooner leaves it as it is. One time for every tenant: a run
   removes what has ended in every tenant, and recording a time for each would read them all first.
   The time is what the batch removed, not the run's clock: its rows ended by the run's `Config.Now`
@@ -1235,7 +1249,18 @@ flowchart TB
   gives nothing once the membership has ended, which it records. `Activate`
   ends an activation its duration after the time it read once it held the places it rests on,
   which those places last until: deciding later shortens it, never extends it past them. History
-  doesn't record the time, and `AsOf` doesn't read it: as of a time, a read decides at that time.
+  records each write to the table, as the entity `expired`, and `AsOf` doesn't read it: as of a
+  time, a read decides at that time. Without the bound on what a read takes, one row of a time far
+  ahead, which the application's role could write around the package, had every later call of every
+  host decide then, for good, a deny binding through a place that ends before then lifted, and a
+  condition reading `request.time` met. A time past the clock now only the table's owner disabling
+  its trigger (`rbac_expired_until`), or the database's clock going back, can leave there: a call of
+  a host behind the clock then decides at it as each statement reads it, and that host's changes are
+  tried again until the clock passes the time. The bound leaves a run's time whole only where a
+  read bounds it by the clock the run recorded it by, which hasn't gone back since: a clock gone
+  back, or a hot standby's own clock behind the primary's, cuts it to before what the run removed
+  ended, and a read then decides by the state the run left, which no moment held, until the clock
+  passes it.
 - **Races** PostgreSQL refuses, such as a serialization failure, a deadlock between host
   transactions, or a lock waited for past `lock_timeout`, as one a migration holds, match
   `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them, as it
@@ -1309,13 +1334,15 @@ flowchart LR
   database role that wrote it, and the actor and call it was made through, with what the host
   attached. A change takes effect when its statement began, or its transaction where that began
   later, as in a procedure that commits as it goes, and an expiry when it expired, but never before
-  the row's last record. A write that bypassed the package is recorded too, with no actor. The
-  tables bound its row as the package bounds what it writes, but for the ids in a deny's or an
-  eligibility's lists of principals, which they count in characters rather than bytes. A row of more
-  than 1 MiB as jsonb, or a context of more than 1 MiB, fails its write, so no record is one
-  `History` can't return. A row written before history was installed has one record from migrating,
-  its baseline, dated when it was created, or at the epoch where that was before year 1 or at its
-  first instant.
+  the row's last record. A write that bypassed the package is recorded too, with no actor. So is
+  each time `DeleteExpired` records in `rbac_expired`, as the entity `expired`, in no tenant, keyed
+  by its row's id, as two rows can hold one time; its row holds the time, so the chain covers it.
+  The tables bound its row as the package bounds what it writes, but for the ids in a deny's or an
+  eligibility's lists of principals, which they count in characters rather than bytes. A row of
+  more than 1 MiB as jsonb, or a context of more than 1 MiB, fails its write, so no record is one
+  `History` can't return. A
+  row written before history was installed has one record from migrating, its baseline, dated when
+  it was created, or at the epoch where that was before year 1 or at its first instant.
 - **Commit records.** No other session sees a change before its transaction commits, which a host's
   transaction, or the package's own while `Config.OnChange` runs, can put off. So each transaction
   that changes the tables writes, as it commits, a record of when it did (entity and op `commit`, in
@@ -1611,7 +1638,7 @@ refuses a row of more than 1 MiB as jsonb all the same.
 | `MaxID` | 512 bytes | A tenant's, scope's or principal's id. |
 | `MaxBindings` | 1,000 | Bindings in one `Apply`, and the grants, memberships, groups or members one `Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`, `DeleteGroups`, `ImportMembers`, `ChangeMembers` or `DeleteMembers` takes, and the grants and eligibilities the members one `ChangeMembers` adds gain, each member's counted apart, by its principal, as `ValidateGrant` is asked about each, but no more than one place alone gains, whatever its group and those it is in hold. The host's own `ImportMembers` is asked about each with no such bound. |
 | `MaxGrantsPerRole` | 20 | Grants in force of one role to one principal on one scope, differing by source, expiry or condition. Those from each source the host owns count apart. |
-| `MaxDenies`, `MaxDenyEntries` | 100, 256 | Denies on a scope, and the principals, exemptions or permissions one names. A check, a list and a change's read of its actor's authority look each principal and exemption a deny names up in objects of the keys their subject is bound and exempted by, built once for the statement, so a deny costs them about its own length however many groups the subject is in; a check of a permission passes over a deny of another before looking any up, but on the tenant where it decides label values too, which every deny binding its subject there decides. `Holders` of a labeled resource indexes once the keys that the denies on the tenant of a label value or a power to release name and exempt, and looks each holder's own keys up in them, so such a deny costs the list its length once however many holders it binds, and one of any other permission is matched to none: compared with each holder's keys, 100 denies of another permission, each naming 256 of 4,000 holders, took a second and a half. |
+| `MaxDenies`, `MaxDenyEntries` | 100, 256 | Denies on a scope, and the principals, exemptions or permissions one names. A check, a list and a change's read of its actor's authority look each principal and exemption a deny names up in objects of the keys their subject is bound and exempted by, built once for the statement, so a deny costs them about its own length however many groups the subject is in; a check of a permission passes over a deny of another before looking any up, but on the tenant where it decides label values too, which every deny binding its subject there decides. `Permissions`, a check deciding label values and a change's read of its actor's authority read each such deny's permissions once however many permissions they decide, each entry looked up among those the grants give, or for fewer than four compared with each (`listedDenies`); a change, which doesn't know what it will hand on, compares the first three it asks about, and one its actor holds none of (`askingDenies`). So each permission is decided by the denies listing it alone: compared with each permission's, `Permissions` of 300 beside 400 denies of 256 other permissions took 300 ms, and takes 12, and granting a role of 300 beside 368 such denies binding the actor took 350 ms, and takes 36. `Holders` of a labeled resource indexes once the keys that the denies on the tenant of a label value or a power to release name and exempt, and looks each holder's own keys up in them, so such a deny costs the list its length once however many holders it binds, and one of any other permission is matched to none: compared with each holder's keys, 100 denies of another permission, each naming 256 of 4,000 holders, took a second and a half. |
 | `MaxCustomRoles`, `MaxRoleEntries`, `MaxGrantableRoles` | 300, 1,000, 64 | Custom roles in a tenant, the permissions one gives and the types it is for, and roles one lists in `GrantableRoles`. |
 | `MaxApprovers`, `MaxActivation` | 16, 366 days | An eligibility's approvers, and its longest activation. |
 | `MaxGroupDepth` | 8 | How deeply groups nest. |

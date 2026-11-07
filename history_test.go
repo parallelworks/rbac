@@ -469,9 +469,12 @@ func (r *readmeRoles) harden(t *testing.T) {
 	var made []string
 	if err := r.super.QueryRow(t.Context(), `SELECT array_agg($1 || '.' || proname ORDER BY proname) FROM pg_proc
 		WHERE pronamespace = $1::regnamespace AND proname = ANY($2::text[])`,
-		s, []string{"rbac_group_members", "rbac_tenant_keys", "rbac_text_array", "rbac_changes_grants"}).Scan(&made); err != nil {
+		s, []string{"rbac_group_members", "rbac_tenant_keys", "rbac_text_array", "rbac_changes_grants", "rbac_expired_through"}).Scan(&made); err != nil {
 		t.Fatal(err)
 	}
+	// Where a migration has made the function DeleteExpired records its times through, the
+	// application's role writes rbac_expired only through it.
+	through := slices.Contains(made, s+".rbac_expired_through")
 	// Of the functions step 2 lists, the commit record's, where a migration has made it.
 	var commit bool
 	if err := r.super.QueryRow(t.Context(), `SELECT to_regprocedure($1 || '.rbac_history_commit()') IS NOT NULL`, s).Scan(&commit); err != nil {
@@ -492,14 +495,18 @@ func (r *readmeRoles) harden(t *testing.T) {
 		`GRANT EXECUTE ON FUNCTION ` + s + `.rbac_tenant_keys, ` + s + `.rbac_text_array TO ` + r.history,
 		// 3. The application's role has USAGE on the schema, SELECT, INSERT, UPDATE and DELETE on
 		// its tables but rbac_history and rbac_migrations, EXECUTE on rbac_group_members,
-		// rbac_tenant_keys, rbac_text_array and rbac_changes_grants, only SELECT on rbac_history, and
-		// USAGE on the schema of AsOf's views and SELECT on them.
+		// rbac_tenant_keys, rbac_text_array, rbac_changes_grants and rbac_expired_through, only
+		// SELECT on rbac_history and rbac_expired, and USAGE on the schema of AsOf's views and SELECT
+		// on them.
 		`GRANT USAGE ON SCHEMA ` + s + ` TO ` + r.app,
 		`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ` + s + ` TO ` + r.app,
 		`REVOKE ALL ON ` + s + `.rbac_migrations FROM ` + r.app,
 		`GRANT EXECUTE ON FUNCTION ` + strings.Join(made, ", ") + ` TO ` + r.app,
 		`REVOKE INSERT, UPDATE, DELETE ON ` + s + `.rbac_history FROM ` + r.app,
 	})
+	if through {
+		grants = append(grants, `REVOKE INSERT, UPDATE, DELETE ON `+s+`.rbac_expired FROM `+r.app)
+	}
 	if views {
 		grants = append(grants, `GRANT USAGE ON SCHEMA `+s+`_as_of TO `+r.app, `GRANT SELECT ON ALL TABLES IN SCHEMA `+s+`_as_of TO `+r.app)
 	}
@@ -507,6 +514,102 @@ func (r *readmeRoles) harden(t *testing.T) {
 		if _, err := r.super.Exec(t.Context(), sql); err != nil {
 			t.Fatalf("%s: %v", sql, err)
 		}
+	}
+}
+
+// expiredRecord is a record of a row of rbac_expired's: its key, the row's time, as JSON writes it
+// in UTC, as the row became or, where it was deleted, as it was, its op, how, and the database role
+// that wrote it.
+type expiredRecord struct{ key, until, op, how, dbUser string }
+
+// expiredRecords is history's records of rbac_expired's rows, in the order written, each of which
+// is in no tenant and keyed by its row's id.
+func expiredRecords(t *testing.T, q rbac.DB) []expiredRecord {
+	t.Helper()
+	rows, err := q.Query(t.Context(), `SELECT tenant, coalesce(after, before)->>'id', key, coalesce(after, before)->>'until', op, how, db_user
+		FROM rbac_history WHERE entity = 'expired' ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []expiredRecord
+	var r expiredRecord
+	var tenant, id string
+	if _, err := pgx.ForEachRow(rows, []any{&tenant, &id, &r.key, &r.until, &r.op, &r.how, &r.dbUser}, func() error {
+		if tenant != "" || r.key != id {
+			t.Errorf("history records rbac_expired's row %s in tenant %q, keyed by %q", id, tenant, r.key)
+		}
+		got = append(got, r)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+// expiredTime is a time of rbac_expired's as JSON writes it, in UTC, as history's records hold it.
+func expiredTime(at time.Time) string { return at.UTC().Format("2006-01-02T15:04:05.999999-07:00") }
+
+// expiredID is the id of the row of rbac_expired holding until, of which there must be one.
+func expiredID(t *testing.T, q rbac.DB, until time.Time) string {
+	t.Helper()
+	var ids []string
+	if err := q.QueryRow(t.Context(), `SELECT array_agg(id::text) FROM rbac_expired WHERE until = $1`, until).Scan(&ids); err != nil || len(ids) != 1 {
+		t.Fatalf("rbac_expired holds %v rows of %v: %v", ids, until, err)
+	}
+	return ids[0]
+}
+
+// Under the README's roles, DeleteExpired, on the application's role, records the time it deleted
+// by, which that role otherwise writes only through rbac_expired_through, as DeleteExpired does: it
+// may insert, update, delete or truncate no time, so it can't move the latest back, and through the
+// function it records none past the database's clock, nor moves the latest back. History records
+// each write as that role's.
+func TestTheApplicationsRoleWritesExpiredOnlyAsDeleteExpiredDoes(t *testing.T) {
+	ctx := t.Context()
+	r := newReadmeRoles(t)
+	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+		t.Fatal(err)
+	}
+	r.harden(t)
+	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	authz, err := rbac.New(r.appPool, rbac.Config{
+		Catalog: catalog, ContainerTypes: []string{"org", "workspace"},
+		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+		Now:           func() time.Time { return base },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.appPool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'y', 'cluster.login', $1)`, base.Add(-30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := authz.DeleteExpired(ctx); err != nil || n != 1 {
+		t.Fatalf("DeleteExpired on the application's role removed %d rows: %v", n, err)
+	}
+	for _, w := range []struct{ sql, code string }{
+		{`INSERT INTO rbac_expired (until) VALUES ('2026-01-01 11:45:00+00')`, "42501"},
+		{`UPDATE rbac_expired SET until = until - interval '1 hour'`, "42501"},
+		{`DELETE FROM rbac_expired`, "42501"},
+		{`TRUNCATE rbac_expired`, "42501"},
+		{`SELECT rbac_expired_through(clock_timestamp() + interval '1 hour')`, "23514"},
+		{`SELECT rbac_expired_through('2026-01-01 11:00:00+00')`, ""},
+	} {
+		if _, err := r.appPool.Exec(ctx, w.sql); sqlState(err) != w.code {
+			t.Errorf("the application's role: %s = %v, not %q", w.sql, err, w.code)
+		}
+	}
+	var latest time.Time
+	if err := r.appPool.QueryRow(ctx, `SELECT max(until) FROM rbac_expired`).Scan(&latest); err != nil || !latest.Equal(base.Add(-30*time.Minute)) {
+		t.Errorf("the latest time DeleteExpired deleted by is %v: %v", latest, err)
+	}
+	recorded, written := base.Add(-30*time.Minute), base.Add(-time.Hour)
+	want := []expiredRecord{
+		{expiredID(t, r.appPool, recorded), expiredTime(recorded), "create", "DeleteExpired", r.app},
+		{expiredID(t, r.appPool, written), expiredTime(written), "create", "", r.app},
+	}
+	if got := expiredRecords(t, r.appPool); !slices.Equal(got, want) {
+		t.Errorf("history records rbac_expired's writes as %q, want %q", got, want)
 	}
 }
 
@@ -3988,11 +4091,12 @@ func TestHistoryRecordsWhoMadeEachChangeAndHow(t *testing.T) {
 			}
 		}
 	}
-	// An expiry is no one's, and is recorded as one.
+	// An expiry is no one's, and is recorded as one, after the time DeleteExpired deleted by, which
+	// its function records in a statement of its own.
 	if _, err := h.authz.DeleteExpired(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := recordedSince(t, h, &last); len(got) != 1 || got[0] != (recorded{how: "DeleteExpired", op: "expire"}) {
+	if got := recordedSince(t, h, &last); !slices.Equal(got, []recorded{{how: "DeleteExpired", op: "create"}, {how: "DeleteExpired", op: "expire"}}) {
 		t.Fatalf("DeleteExpired recorded %+v", got)
 	}
 }
@@ -4268,7 +4372,7 @@ func TestAnExpiryAheadOfTheDatabasesClockIsRecordedAsOne(t *testing.T) {
 	if _, err := h.authz.DeleteExpired(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := recordedSince(t, h, &last); len(got) != 1 || got[0] != (recorded{how: "DeleteExpired", op: "expire"}) {
+	if got := recordedSince(t, h, &last); !slices.Equal(got, []recorded{{how: "DeleteExpired", op: "create"}, {how: "DeleteExpired", op: "expire"}}) {
 		t.Fatalf("recorded %+v", got)
 	}
 }

@@ -1462,18 +1462,37 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 		}
 		return spends[action]
 	}
+	// Each permission is decided by the denies listing it alone, indexed once it is asked about a few
+	// (askingDenies), by what its grants give, all it can hand on.
+	var gives map[Permission]bool
+	giving := func() map[Permission]bool {
+		if gives == nil {
+			gives = map[Permission]bool{}
+			read := map[Role]bool{}
+			for _, h := range held {
+				if def, ok := b.role(h.Role); ok && !read[h.Role] {
+					read[h.Role] = true
+					readingEntries(len(def.Permissions))
+					for _, p := range def.Permissions {
+						gives[p] = true
+					}
+				}
+			}
+		}
+		return gives
+	}
+	denials := &askingDenies{ds: ds, asked: giving}
 	deny := func(vars func() map[string]any) func(Permission) bool {
 		denied := map[Permission]bool{}
 		return func(p Permission) bool {
 			if d, ok := denied[p]; ok {
 				return d
 			}
-			var read map[string]any
-			if conditionallyDenied(ds, p) {
-				read = with(vars, p)
+			d, conditional := denials.next().of(p)
+			if !d && len(conditional) > 0 {
+				// On a budget of its own, as a check of p would be.
+				_, d = a.conditionallyDeniedBy(conditional, newDenyBudget(on.path()), with(vars, p))
 			}
-			// On a budget of its own, as a check of p would be.
-			_, d := a.deniedBy(ds, p, newDenyBudget(on.path()), read)
 			denied[p] = d
 			return d
 		}
@@ -1499,6 +1518,7 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 		for i, e := range ex {
 			exempting[i] = e.denial
 		}
+		exemptions := &askingDenies{ds: exempting, asked: giving}
 		ends := map[Permission]time.Time{}
 		exemptUntil = func(p Permission) time.Time {
 			if until, ok := ends[p]; ok {
@@ -1506,15 +1526,19 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 			}
 			var until time.Time
 			var v map[string]any
-			if conditionallyDenied(exempting, p) {
-				v = with(reached, p)
-			}
 			spend := newDenyBudget(on.path())
-			for _, e := range ex {
-				if _, d := a.deniedBy([]denial{e.denial}, p, spend, v); d {
-					until = e.until
-					break
+			for i := range exemptions.next().listing(p) {
+				e := ex[i]
+				if e.condition != "" {
+					if v == nil {
+						v = with(reached, p)
+					}
+					if _, d := a.conditionallyDeniedBy([]denial{e.denial}, spend, v); !d {
+						continue
+					}
 				}
+				until = e.until
+				break
 			}
 			ends[p] = until
 			return until
@@ -2961,7 +2985,9 @@ func (a *Authorizer) deleteScopes(ctx context.Context, actor Principal, tenant, 
 // to the public, as when a tenant stops allowing public access. An identity or group leaves the
 // denies that exempt it and the approvers of the eligibilities it approves, as DeleteGroups takes
 // groups out of them: an eligibility only it approves goes too, rather than activate without
-// approval. A deny naming it still binds it, as it would if it joined again.
+// approval. A deny or eligibility naming an identity that commits once it has found those, as
+// SetDeny and SetEligibility take no lock of the identities they name, is left naming it, as if set
+// after it, for a later removal. A deny naming it still binds it, as it would if it joined again.
 func (a *Authorizer) DeletePrincipal(ctx context.Context, actor Principal, tenant string, p Principal) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "DeletePrincipal")
@@ -3176,17 +3202,22 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 	var first []statement
 	// Those it approves with its own, in one order, as removeGroups locks them; those it approves by
 	// its key (naming), as no other index finds them. Only a principal's removal names one, by its key.
+	// It is taken out of those alone, and out of the denies exempting it that it locks below alone, in
+	// the next round trip, by their ids and the versions locked: SetEligibility and SetDeny take no
+	// lock of an identity they name, so one naming it can commit in between, which, matched by its key
+	// again, would be locked out of order, and two removals of identities it names both would
+	// deadlock. One committed so is left naming it, for a later removal, as one committed after.
+	var approving []int64
+	var exempting []pgtype.TID
 	if del.named != "" {
-		first = append(first, stmt(nil, lockedInOrder("rbac_eligibilities", "id", bindingOrder,
-			byKeys("rbac_eligibilities", "id", bindingOrder, del.by, "$2"),
-			"SELECT "+keyCols(bindingOrder, "id")+" FROM rbac_eligibilities WHERE "+naming("approvers", "$3")), tenant, del.keys, named))
+		first = append(first, stmt(collecting(&approving, func(rows pgx.Rows) ([]int64, error) { return pgx.CollectRows(rows, pgx.RowTo[int64]) }),
+			lockedInOrder("rbac_eligibilities", "id", bindingOrder,
+				byKeys("rbac_eligibilities", "id", bindingOrder, del.by, "$2"),
+				"SELECT "+keyCols(bindingOrder, "id")+" FROM rbac_eligibilities WHERE "+naming("approvers", "$3")), tenant, del.keys, named))
 	}
 	eligible, eligibleArgs := picked("rbac_eligibilities", "id", bindingOrder, del.where)
 	var ineligible, unapproved []Eligibility
 	first = append(first, removing(a, "rbac_eligibilities", eligibilityColumns, collectEligibilities, &ineligible, eligible, eligibleArgs...))
-	if del.named != "" {
-		first = append(first, a.unapproving(tenant, named, &unapproved, &e.Eligible)...)
-	}
 	if del.roles {
 		first = append(first, stmt(collecting(&e.DeletedRoles, func(rows pgx.Rows) ([]Role, error) { return pgx.CollectRows(rows, pgx.RowTo[Role]) }),
 			`DELETE FROM rbac_roles WHERE tenant = $1 RETURNING id`, tenant))
@@ -3201,8 +3232,8 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 			slices.Concat([]any{tenant}, args)...))
 	}
 	if del.named != "" {
-		first = append(first, stmt(nil, lockedDenies("SELECT "+denyKey+" FROM rbac_denies WHERE "+naming("exempt", "$2")), tenant, named),
-			unexempting(tenant, actor, named, false, &e.Denies))
+		first = append(first, stmt(collecting(&exempting, func(rows pgx.Rows) ([]pgtype.TID, error) { return pgx.CollectRows(rows, pgx.RowTo[pgtype.TID]) }),
+			lockedDeniesSelecting("d.ctid", "SELECT "+denyKey+" FROM rbac_denies WHERE "+naming("exempt", "$2")), tenant, named))
 	}
 	// Memberships before the members they reach, as DeleteExpired takes them, so the two never
 	// deadlock.
@@ -3213,9 +3244,14 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 	if err := byIndexes(ctx, tx, first...); err != nil {
 		return ChangeEvent{}, err
 	}
-	e.Ineligible = slices.Concat(ineligible, unapproved)
 	var r resting
 	var then []statement
+	if len(approving) > 0 {
+		then = append(then, a.unapproving(tenant, named, approving, &unapproved, &e.Eligible)...)
+	}
+	if len(exempting) > 0 {
+		then = append(then, unexempting(tenant, actor, named, false, exempting, &e.Denies))
+	}
 	if del.members != "" {
 		// A group in none ends no place its members' activations rest on. Only a group's removal
 		// names one, by its key.
@@ -3245,6 +3281,7 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 	if err := byIndexes(ctx, tx, then...); err != nil {
 		return ChangeEvent{}, err
 	}
+	e.Ineligible = slices.Concat(ineligible, unapproved)
 	if del.group == "" {
 		return e, nil
 	}
@@ -3258,34 +3295,43 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 // unapproving is the statements deleting the eligibilities in a tenant that only principals, by key,
 // approve, which without them would need no approval, and taking them out of the others' approvers,
 // keeping their order, collecting those it deleted into ended and those it changed into changed.
-// The change locks them in order first.
-func (a *Authorizer) unapproving(tenant string, keys []string, ended, changed *[]Eligibility) []statement {
+// The change locks them in order first, and changes only those of held, by id, where it isn't nil,
+// as the principals' locks don't keep one naming them from committing meanwhile (deleteIn).
+func (a *Authorizer) unapproving(tenant string, keys []string, held []int64, ended, changed *[]Eligibility) []statement {
 	// Each found by the keys it names (naming), so it names one of them: none of them is empty.
+	where, args := naming("approvers", "$2"), []any{tenant, keys}
+	if held != nil {
+		where, args = "id = ANY($3::bigint[]) AND "+where, append(args, held)
+	}
 	return []statement{
-		removing(a, "rbac_eligibilities", eligibilityColumns, collectEligibilities, ended,
-			naming("approvers", "$2")+" AND approvers <@ $2::text[]", tenant, keys),
+		removing(a, "rbac_eligibilities", eligibilityColumns, collectEligibilities, ended, where+" AND approvers <@ $2::text[]", args...),
 		stmt(collecting(changed, collectEligibilities), `UPDATE rbac_eligibilities SET
 		  approvers = array(SELECT k FROM unnest(approvers) WITH ORDINALITY AS t(k, i) WHERE k <> ALL($2::text[]) ORDER BY i)
-		WHERE `+naming("approvers", "$2")+`
-		RETURNING `+eligibilityColumns, tenant, keys),
+		WHERE `+where+`
+		RETURNING `+eligibilityColumns, args...),
 	}
 }
 
 // unexempting is the statement taking principals, by key, out of the exemptions of a tenant's
 // denies, and with named out of the principals they name too, keeping each list's order, as actor,
-// collecting the denies it changed into changed. The change locks them in order first.
-func unexempting(tenant string, actor Principal, keys []string, named bool, changed *[]Deny) statement {
+// collecting the denies it changed into changed. The change locks them in order first, and changes
+// only those of held, by the versions it locked, where it isn't nil, as unapproving does.
+func unexempting(tenant string, actor Principal, keys []string, named bool, held []pgtype.TID, changed *[]Deny) statement {
 	// Each found by the keys it names (naming).
 	principals, where := "principals", naming("exempt", "$2")
 	if named {
 		principals = "array(SELECT k FROM unnest(principals) WITH ORDINALITY AS t(k, i) WHERE k <> ALL($2::text[]) ORDER BY i)"
 		where = naming("principals", "$2") + " OR " + where
 	}
+	args := []any{tenant, keys, actorKey(actor)}
+	if held != nil {
+		where, args = "ctid = ANY($4::tid[]) AND ("+where+")", append(args, held)
+	}
 	return stmt(collecting(changed, collectDenies), `UPDATE rbac_denies SET principals = `+principals+`,
 		  exempt = array(SELECT k FROM unnest(exempt) WITH ORDINALITY AS t(k, i) WHERE k <> ALL($2::text[]) ORDER BY i),
 		  updated_by = $3, updated_at = now()
 		WHERE `+where+`
-		RETURNING `+denyColumns, tenant, keys, actorKey(actor))
+		RETURNING `+denyColumns, args...)
 }
 
 // collecting is a read collecting rows into got.
@@ -3341,7 +3387,9 @@ func removing[T any](a *Authorizer, table, columns string, collect func(pgx.Rows
 // reads a state its batches left that no moment held; as each ended by Config.Now and the
 // database's clock both, a host whose clock runs ahead, or one setting Config.Now wrong, can't have
 // a later call decide past the database's clock, and a call decides later than its own clock only
-// where a run removed a row that ended after it. A race PostgreSQL refuses matches ErrConflict.
+// where a run removed a row that ended after it. It records the time through rbac_expired_through,
+// which the application's database role executes in place of writing rbac_expired, and history
+// records it. A race PostgreSQL refuses matches ErrConflict.
 func (a *Authorizer) DeleteExpired(ctx context.Context) (n int64, err error) {
 	defer a.refused(ctx, &err, "", Principal{}, "DeleteExpired")
 	defer conflicting(&err)
@@ -3398,7 +3446,7 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 		return statement(`WITH d AS (DELETE FROM ` + table + ` WHERE ` + key + ` = ANY(ARRAY(
 			SELECT ` + key + ` FROM ` + table + ` WHERE expires_at <= least($1, statement_timestamp())
 			ORDER BY expires_at LIMIT $2 FOR UPDATE SKIP LOCKED)) RETURNING expires_at), ` + expiredThroughSQL("d") + `
-		SELECT count(*), count(*) FROM d`)
+		SELECT count(*), count(*) FROM d, recorded`)
 	}
 	var total int64
 	for _, batch := range []func(pgx.Tx) (int64, int64, error){
@@ -3411,7 +3459,7 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 			// A batch that failed, even once its statement ran, removed nothing.
 			n, all, err := expire(batch)
 			if err != nil {
-				return total, err
+				return total, a.unmigratedExpiry(ctx, err)
 			}
 			total += all
 			// One that removed nothing passed over every membership it picked, which the next would
@@ -3422,6 +3470,22 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 		}
 	}
 	return total, nil
+}
+
+// unmigratedExpiry is err, a batch of DeleteExpired's failing, or where PostgreSQL refused it for
+// calling a function that doesn't exist, and rbac_expired_through doesn't, as before
+// 0032_expired_writes is applied, ErrInvalid saying so, which PostgreSQL's hint, to cast the
+// arguments, doesn't.
+func (a *Authorizer) unmigratedExpiry(ctx context.Context, err error) error {
+	var pg *pgconn.PgError
+	if !errors.As(err, &pg) || pg.Code != "42883" {
+		return err
+	}
+	var missing bool
+	if a.db.QueryRow(ctx, `SELECT to_regprocedure('rbac_expired_through(timestamptz)') IS NULL`).Scan(&missing) != nil || !missing {
+		return err
+	}
+	return fmt.Errorf("%w: DeleteExpired records the time it deleted by through rbac_expired_through, which 0032_expired_writes makes: migrate first: %w", ErrInvalid, err)
 }
 
 // endMemberships ends, in tx, a batch of the memberships expired by now, and returns how many it
@@ -3468,30 +3532,27 @@ func endMemberships(ctx context.Context, tx pgx.Tx, now time.Time) (picked, all 
 		), left_groups AS (
 		  DELETE FROM rbac_members m USING ended e WHERE m.tenant = e.tenant AND m.principal = e.principal RETURNING 1
 		), `+expiredThroughSQL("ended")+`
-		SELECT (SELECT count(*) FROM ended) + (SELECT count(*) FROM left_groups)`, tenants, principals))
+		SELECT (SELECT count(*) FROM ended) + (SELECT count(*) FROM left_groups) FROM recorded`, tenants, principals))
 	return picked, all, err
 }
 
 // expiredThroughSQL is SQL defining, in a WITH of a batch of DeleteExpired, after removed, the rows
-// it removes with their expires_at, the statements recording in rbac_expired the latest of those,
-// where it removes any, and deleting the times recorded no later, passing over those another run
-// is deleting: every check and change decides no earlier than the latest time recorded that it
-// sees (decidedSQL), and one seeing a row the batch removed sees the time too, as they commit
-// together, so it reads no state the batch left that no moment held, as a later-ending place a deny
-// binds a subject by removed and an earlier-ending one its power comes through passed over or not
-// reached yet. The time is of what it removes, which ended by Config.Now and the database's clock
-// both, so a call decides later than its own clock only where a row that ended after it is gone:
-// recorded as the run's clock, every run, whatever it removed, had every call of a host whose clock
-// is behind the run's decide later than it reads, and a change in flight tried again. Only
-// DeleteExpired writes the table, so neither of two runs waits for the other, and the latest stays.
+// it removes with their expires_at, recorded(n), which the batch's statement reads so that it runs:
+// the latest of those recorded in rbac_expired, where it removes any, through rbac_expired_through,
+// which deletes the times recorded no later, passing over those another run is deleting. Every
+// check and change decides no earlier than the latest time recorded that it sees (decidedSQL), and
+// one seeing a row the batch removed sees the time too, as they commit together, so it reads no
+// state the batch left that no moment held, as a later-ending place a deny binds a subject by
+// removed and an earlier-ending one its power comes through passed over or not reached yet. The
+// time is of what it removes, which ended by Config.Now and the database's clock both, so a call
+// decides later than its own clock only where a row that ended after it is gone: recorded as the
+// run's clock, every run, whatever it removed, had every call of a host whose clock is behind the
+// run's decide later than it reads, and a change in flight tried again. Only rbac_expired_through
+// writes the table, as its owner, refusing a time past the database's clock, so neither of two runs
+// waits for the other, the latest stays, and history records each time.
 func expiredThroughSQL(removed string) string {
-	return `expired_through(until) AS (
-		  SELECT max(expires_at) FROM ` + removed + `
-		), passed AS (
-		  DELETE FROM rbac_expired WHERE ctid = ANY(ARRAY(SELECT ctid FROM rbac_expired
-		    WHERE until <= (SELECT until FROM expired_through) FOR UPDATE SKIP LOCKED))
-		), recorded AS (
-		  INSERT INTO rbac_expired (until) SELECT until FROM expired_through WHERE until IS NOT NULL
+	return `recorded(n) AS (
+		  SELECT count(rbac_expired_through(e.until)) FROM (SELECT max(expires_at) AS until FROM ` + removed + `) e WHERE e.until IS NOT NULL
 		)`
 }
 

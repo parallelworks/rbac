@@ -102,9 +102,10 @@ a column of the type too, whose statistics count them, and index it after the te
 pages sort by, as `(tenant, type, id)`, or a sorted page of a type of few rows reads the rows of
 every type until it is full. A condition holds for the query it was built for: it fixes the time,
 the subject's label holding and what the constraints answered, so build one for each query; the
-query decides no earlier than the latest time `DeleteExpired` deleted by that it sees, and with the
-label column keeps no row once that is as late as a time the subject's membership, or a place in a
-group of its own or of a group it is in, ended after `Filter` read the holding. It compares the
+query decides no earlier than the latest time `DeleteExpired` deleted by that it sees, taken no
+later than the database's clock, and with the label column keeps no row once that is as late as the
+first time after `Filter` read the holding that the subject's membership, or its last path to one of
+its groups, ended. It compares the
 tenant and keys byte for byte, as `Authorize` does, whatever the columns' collation, in
 which their indexes still serve. The subject's grants are matched through the path's index, whose
 cost for each row it finds grows with their number. Past a few on resources of the listed type, or
@@ -548,8 +549,11 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   member or guest of it (`SetMemberships`), and nothing while its membership is suspended. A guest,
   such as one from another tenant, holds what it is granted there and nothing granted to the
   tenant's members. Leaving a tenant (`DeletePrincipal`) removes what the identity held there,
-  its exemptions from denies and its place among approvers too; `DeletePrincipalEverywhere` removes
-  a deleted identity from every tenant.
+  its exemptions from denies and its place among approvers too, but for a deny or an eligibility
+  naming it that commits once it has found those, which it leaves as if set after it: `SetDeny` and
+  `SetEligibility` take no lock of the identities they name, and taking it out of one meanwhile
+  could deadlock with another removal. Removing it again takes it out. `DeletePrincipalEverywhere`
+  removes a deleted identity from every tenant.
 - **Groups:** a group is its tenant's (`SetGroup`, `ImportGroups`), and `group:<id>` names it only
   there. Its members are identities that are members or guests of the tenant, and other groups of
   the tenant, at most `rbac.MaxGroupDepth` deep (`ImportMembers`), each from a source, perhaps
@@ -669,8 +673,10 @@ than as a record of its own, and each record holds the cluster that wrote it (`R
 `system_identifier`), within which a commit record dates it. A change through the package records
 its actor and the call that made it (`Record.How`), and what the host attaches with
 `rbac.WithAudit`: on whose behalf it was made, the request and the reason. An expiry `DeleteExpired` removes is recorded as
-one, made by no one. Triggers write it, so a write that bypasses the package is recorded too, as no
-one's. That context is what the session that wrote it says; the database role is what the database
+one, made by no one, and so is each time it records in `rbac_expired` that every check and change
+decides no earlier than, as the entity `expired`, in no tenant, keyed by its row's id, as two rows
+can hold one time (see Expiry). Triggers write it, so a write that bypasses the package is recorded
+too, as no one's. That context is what the session that wrote it says; the database role is what the database
 knows. The tables bound what they hold as the package bounds what it writes, but for the ids in
 a deny's principals and exemptions and an eligibility's approvers, which they count to
 `rbac.MaxID` characters rather than bytes, so a write around the package can store those at up
@@ -1025,10 +1031,15 @@ have the server load a library or run a program of its choosing; and:
    superuser gives them, or, for one a migration gives it, the schema's owner migrates, which grants
    it for the migration alone.
 3. The application's role has `USAGE` on the package's schema, without which it reads none of its
-   tables; `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the package's tables but `rbac_history` and
-   `rbac_migrations`, and on any a later migration adds; `EXECUTE` on the functions
-   `rbac_group_members`, `rbac_tenant_keys`, `rbac_text_array` and `rbac_changes_grants`, which
-   every role has unless it is revoked; and only `SELECT` on `rbac_history`, with no `UPDATE` on its
+   tables; `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the package's tables but `rbac_history`,
+   `rbac_expired` and `rbac_migrations`, and on any a later migration adds; `EXECUTE` on the
+   functions `rbac_group_members`, `rbac_tenant_keys`, `rbac_text_array` and `rbac_changes_grants`,
+   which every role has unless it is revoked, and on `rbac_expired_through`, through which
+   `DeleteExpired` records the times it deleted by, and which no role has unless it is granted;
+   only `SELECT` on `rbac_expired`, which every check and change reads, so that role can neither
+   record a time past the database's clock nor move back the latest, as only that function writes
+   it, and nothing on its id's sequence, with which `setval` could fail every run of
+   `DeleteExpired`; and only `SELECT` on `rbac_history`, with no `UPDATE` on its
    id sequence, which a grant on all the schema's sequences can give: `setval` could number a change
    below the one before it, and `AsOf` would read the row as it was before the change. Never
    `TRIGGER`, which `ALL` includes: a trigger runs its function as whoever writes the table, and one
@@ -1339,6 +1350,33 @@ the package's uses foreign data, so none of the roles needs any.
   20,000 to their memberships, as before, looked each up on its own, 20,179 pages that fill 856, and
   code from before it reads the places by statistics alone, every place in the table by those from
   when it was nearly empty. Code from before it and after it run beside each other, applied or not.
+  `0032_expired_writes` has history record every write to `rbac_expired`, as the entity `expired` in
+  no tenant, keyed by an id it gives each row, as two can hold one time, replacing `rbac_record`,
+  which keeps its owner and who may execute it, and widening history's check of entities, which
+  reads no record but locks history against reads and writes until migrating commits, so every
+  change, as each writes history, and every read of history, as `AsOf` and an export, waits for it.
+  Adding the id locks `rbac_expired` against reads and writes until migrating commits too, so every
+  check waits for it as well, for as long as `Migrate` waits for a lock and then runs. It records
+  each row the table holds as its baseline, brings a time past the database's clock back to it,
+  recorded as an `update`, and from then on refuses one past the clock, whoever writes it, by a
+  trigger, `rbac_expired_until`, which no role but its owner may execute. It takes from every role
+  but the table's owner every privilege on it but `SELECT`, on the table and on its column,
+  `TRIGGER` too, which would run a role's function as whoever writes the table, and every privilege
+  on the id's sequence, which the schema's default privileges can grant as it is made. It gives
+  `EXECUTE` on `rbac_expired_through`, which it makes, to each role that held `INSERT` on the table
+  or its column, as `0030_expired_through` gave the application's role of step 3, and to no other,
+  so a deployment that gave its roles their privileges before migrating runs `DeleteExpired` with no
+  step of its own; grant it to a role you give its privileges only after migrating. The function
+  runs as the table's owner, which it is given where another role migrates, and is SQL bound to the
+  table as it is made, so nothing a session names changes what it writes. A trigger already on
+  `rbac_expired` that runs a function a role other than the table's owner or a superuser owns, as a
+  role that held `TRIGGER` on it, which step 3 never gives, could have made, would run that role's
+  code as the table's owner whenever the function writes the table: migrating refuses it with
+  SQLSTATE 42501, having changed nothing; drop it, and migrate again. Code before it runs
+  `DeleteExpired` by writing the table, which the application's role of step 3 may no longer, and
+  fails with SQLSTATE 42501, and code after it, before it is applied, by the function, which doesn't
+  exist yet, and fails as `rbac.ErrInvalid`, saying so: run `DeleteExpired` only from code after it
+  once it is applied. Their checks, searches and changes run beside each other, applied or not.
   Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
   rolling upgrade across the two is unsafe: they key every lock apart, so a change by one waits for
   none by the other, and what each checks under its locks can change before it commits, as two
@@ -1475,7 +1513,29 @@ the package's uses foreign data, so none of the roles needs any.
   membership's for the places it removes with one, which ended by the run's `Config.Now` and the
   database's clock both: a host whose clock runs
   ahead, or a `Config.Now` set wrong, can't have a later call decide past the database's clock, and
-  a run that removes nothing records nothing. A read of an actor's or a subject's grants, groups and
+  a run that removes nothing records nothing. It records it through `rbac_expired_through`, which
+  deletes the times no later than its own and adds its own, refusing one past the database's clock,
+  and history records each write, as one of the package's tables (History). A read takes the latest
+  time no later than the database's clock as it reads it, which takes nothing from a time a run
+  recorded: no write records one past the clock as its own statement began, which is before it
+  commits, and so before a read that sees it takes its snapshot. Bounded by the clock as the read's
+  statement began, a statement sent in a simple query, as by a pool that prepares none, which takes
+  its snapshot once it is planned, after any lock it waited for, could find a run's removals and
+  decide before what they removed ended. So a role that may execute the function, as the
+  application's may, can move what a
+  call decides no earlier than up to that clock and no further, as a run could, and never back, and
+  history records each time it wrote; a time past the clock, which only a role that may disable the
+  table's triggers can leave there, or the database's clock going back, has a call of a host behind
+  that clock decide at it as each of its statements reads it, and such a host's changes tried again
+  (`rbac.ErrConflict`) until the clock passes the time. The bound takes nothing from a time a run
+  recorded only where a read bounds it by the clock the run recorded it by, which hasn't gone back
+  since: where that clock has gone back, or on a hot standby, whose own clock can be behind the
+  primary's, a read can cut a run's time to before what the run removed ended, and until the clock
+  passes that time decide by the state the run left, which no moment held. Keep the database's
+  clock from stepping back, and make checks, and run `Filter`'s conditions, on the primary, or on a
+  standby whose clock is kept with it; `AsOf`, which doesn't read the table, reads on a standby as
+  before.
+  A read of an actor's or a subject's grants, groups and
   the denies binding it, as `Authorize`, `Explain`, `Permissions`, `Grantable`, `Holding`,
   `Reachable` and every change make, `Holders`' snapshot, and the condition `Filter` gives the
   host, decides no earlier than the latest time recorded that its snapshot sees: every row it finds
@@ -1491,8 +1551,10 @@ the package's uses foreign data, so none of the roles needs any.
   removes so while it runs: with `DeleteExpired` every 50 ms beside four sessions granting, without
   pause, roles that end 200 ms on, none of about 1,650 changes was tried again. `Filter`'s condition
   with the label column, whose holding the query doesn't read, keeps no row where the query sees a
-  time as late as the earliest that the subject's membership, or a place in a group of its own or of
-  a group it is in, ended after `Filter` read the holding: build it again. Before then, the subject's
+  time as late as the first after `Filter` read the holding that the subject's keys change by time
+  alone, as its membership, or its last path to one of its groups, ends: build it again. A place
+  that ends while another, from another source or through another group, keeps it in the group
+  changes none of them. Before then, the subject's
   keys and the denies binding it are those of `Filter`'s time, and the grants in force no more, so
   each row the query keeps the subject could read at `Filter`'s time; a run by an earlier time, as
   every one is for a subject whose membership and places don't end, leaves them as they were.
