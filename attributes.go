@@ -784,10 +784,10 @@ func keyType(t reflect.Type) bool {
 	return false
 }
 
-// byteKind reports whether a slice or an array of t is read as bytes: t is a byte, of a type of the
-// host's own too, read by its kind, but a lock (hostLock), which a slice or an array of is read as a
-// list of what it holds, so refused: read as bytes, one in an array or a slice was read where no
-// hook could be given it.
+// byteKind reports whether a slice or an array of t is read as bytes: t is a byte, of a type of
+// the host's own too, read by its kind, but a lock (hostLock), a slice or an array of which is read
+// as a list of what it holds, so refused: read as bytes, one in an array or a slice was read where
+// no hook could be given it.
 func byteKind(t reflect.Type) bool { return t.Kind() == reflect.Uint8 && !hostLock(t) }
 
 // hostLock reports whether t, the type of a value or a key the host passes, is a lock (lockType):
@@ -1325,9 +1325,9 @@ var nilNull = map[reflect.Type]bool{
 // The types an attribute can be declared as, with the Go value a host passes for each, or any
 // other converted to that type (Attributes), such as a pointer to a string, number or bool, a
 // protobuf timestamp or duration, or a []any or map[string]any of strings. A nil pointer is null,
-// which is none, and a nil Struct, ListValue, Timestamp, Duration or Any can't be read (Attributes):
-// CEL reads all but an Any as a value of its type, so read as CEL reads it, a declared timestamp
-// passed as one met a grant's condition.
+// which is none, and a nil Struct, ListValue, Timestamp, Duration or Any can't be read
+// (Attributes): CEL reads all but an Any as a value of its type, so read as CEL reads it, a
+// declared timestamp passed as one met a grant's condition.
 const (
 	AttrString    AttributeType = "string"              // string
 	AttrInt       AttributeType = "int"                 // int or int64
@@ -2363,11 +2363,12 @@ func textOf(v reflect.Value) int {
 // holds in place, more than leastCopied reserves: uncounted, the padding of an array of 60,000
 // structs of a bool, each padded to 16 bytes, was charged 6,000, where 40,000 were reserved for a
 // pointer to it, so a copy reaching it after a string past 30,000 was refused, and one reaching it
-// first wasn't. And walking a type costs no more than a value of it: a field holding nothing in
-// place cost nothing, so a struct of 4,000 empty fields was charged one. An array's or a struct's
-// is found once for each type (typeFact), and none of an empty array's element, which it holds
-// none of, and it counts no more than mostTenths, as fields of no size, nesting, count each path
-// through them.
+// first wasn't. And a field holding nothing in place cost nothing, so a struct of 4,000 empty
+// fields was charged one, though walking its type for each value took 226 µs. An array's or a
+// struct's is found once for each type (typeFact), so only a type's first value walks it, at about
+// 160 ns a field, past what a tenth covers, though a fifth to a half of what making the type by
+// reflection took; none of an empty array's element is found, which it holds none of; and it counts
+// no more than mostTenths, as fields of no size, nesting, count each path through them.
 func tenths(t reflect.Type) uint64 {
 	switch t.Kind() {
 	case reflect.String:
@@ -2524,15 +2525,17 @@ func shared(t reflect.Type) bool {
 // it whole does, before copying each field it can set: none holding there an unsafe pointer, as a
 // reflect.Value does, a channel or a func, which a copy would share with the host, as a hook
 // sending on it or calling it would reach the host's, or a lock, a value of a type whose pointer
-// locks and unlocks, as a mutex, a WaitGroup or an atomic value is, or a lock of the host's own, as
-// an integer a pointer to which spins, nor a struct holding an empty array of one, by which
-// protobuf's own state marks itself never to be copied, nor a field a copy can't set holding more
-// than setting it whole copies (shared), but a struct it embeds, whose fields are copied in turn. A
-// copy of another package's state, which its methods find by where it lay, or which held the
-// host's, was read past where it lay, or wrote to the host's. An empty array holds none of these,
-// as conditions read it, and what a pointer, a slice, a map or an interface holds is told where
-// copy reaches it. A lock is refused however deep it lies, as conditions refuse it (hostLock): a
-// spin lock of the host's was copied alone and in an array, and refused in an array of arrays.
+// locks and unlocks, as a mutex's does and as a WaitGroup or an atomic value holds one, or a lock
+// of the host's own, as an integer a pointer to which spins, nor a struct holding an empty array of
+// a lock itself or of an unsafe pointer (marks), by which protobuf's own state marks itself never
+// to be copied, though not one of a type holding a lock, as a WaitGroup, a shape no such mark
+// takes, nor a field a copy can't set holding more than setting it whole copies (shared), but a
+// struct it embeds, whose fields are copied in turn. A copy of another package's state, which its
+// methods find by where it lay, or which held the host's, was read past where it lay, or wrote to
+// the host's. An empty array holds none of these, as conditions read it, and what a pointer, a
+// slice, a map or an interface holds is told where copy reaches it. A lock is refused however deep
+// it lies, as conditions refuse it (hostLock): a spin lock of the host's was copied alone and in an
+// array, and refused in an array of arrays.
 func copyable(t reflect.Type) bool {
 	switch t.Kind() {
 	case reflect.UnsafePointer, reflect.Chan, reflect.Func:

@@ -538,7 +538,9 @@ sequenceDiagram
   host's type that is its own reflection by one held, read past it; or it holds the host's, which
   the copy shared. Nor does it copy a channel or a func, which it can only share, wherever it lies,
   a map's key an interface holds too: set as they were, a constraint sending on its copy's channel
-  sent on the host's, and calling its copy's func ran the host's closure. A lock is refused
+  sent on the host's, and calling its copy's func ran the host's closure. But a map's key that is a
+  pointer is set as it is, as the copy finds an entry only by the host's own key, so what it reaches
+  is the host's, a channel or a lock among it. A lock is refused
   wherever it lies too, a lock of the host's own that isn't a struct, as an integer a pointer to
   which locks and unlocks, among them, which a converter refuses too (`hostLock`), as conditions
   read it by its kind: asked only where a value was held in place, a copy copied one alone and in an

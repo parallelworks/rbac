@@ -553,7 +553,9 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   a copy can't set, holding a pointer, a slice, a map or an interface, as another package's types
   keep their state in; nor what it would share with the host, a channel or a func, wherever it
   lies, as a constraint sending on its copy's channel sent on the host's, and calling its copy's
-  func ran the host's closure; a host's type that is its own reflection by a generated message's
+  func ran the host's closure, but where a map's key that is a pointer reaches it: a key is given as
+  it is, as the copy finds an entry only by the host's own key, so what a pointer key reaches is the
+  host's; a host's type that is its own reflection by a generated message's
   it embeds is given holding the reflection of a copy of the message. Where the attributes hold
   more, nest
   deeper, hold themselves so or hold what can't be copied, the hook can't be asked, rather than be
