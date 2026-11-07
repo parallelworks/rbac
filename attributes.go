@@ -1984,7 +1984,7 @@ func (c *copier) message(m protoreflect.Message, depth int) protoreflect.Message
 		if !c.pay(made - ownCost(m.Descriptor())) {
 			return nil
 		}
-		return m.New()
+		return m.Type().New()
 	}
 	k, keyed := copiedKeyOf(reflect.ValueOf(m.Interface()))
 	// One of a host's type that a dynamic message's field holds, which is copied as any other pointer
@@ -2010,7 +2010,10 @@ func (c *copier) message(m protoreflect.Message, depth int) protoreflect.Message
 	if !c.pay(made) {
 		return nil
 	}
-	out := m.New()
+	// Made by its type, which is what itself and making read, and what New makes of protobuf's own
+	// messages: a host's type whose type makes its own can promote New from a message it embeds,
+	// which made that message, a copy no list, field or map of the host's type could hold.
+	out := m.Type().New()
 	outer := c.descend(at)
 	c.deepest = at + 1
 	if keyed {
@@ -2065,13 +2068,14 @@ func (c *copier) message(m protoreflect.Message, depth int) protoreflect.Message
 
 // making is what making a copy of m costs past the one it costs as a value: what converting it
 // costs (ownCost), and for one of a type no condition reads, which holds each of its fields in
-// place, set or not, what it holds in place (leastCopied) where that is more. Charged what
-// converting one costs, copying 2,000 empty messages of a type of 21 fields allocated 290 bytes for
-// each unit charged, nine times what converting a string does, and 2,000 of 8 KiB 50 MB, 6 KB a
-// unit.
+// place, set or not, what the message its type makes holds in place (leastCopied) where that is
+// more. Charged what converting one costs, copying 2,000 empty messages of a type of 21 fields
+// allocated 290 bytes for each unit charged, nine times what converting a string does, and 2,000
+// of 8 KiB 50 MB, 6 KB a unit; and charged what m holds in place, a dynamic message holding 2,000
+// of a host's type reflecting one of 8 KiB, which its type makes, 2 KB a unit.
 func making(m protoreflect.Message) uint64 {
 	own := ownCost(m.Descriptor())
-	t := reflect.TypeOf(m.Interface())
+	t := makes(m)
 	if t == nil || wellKnown[t] {
 		return own
 	}
@@ -2139,9 +2143,9 @@ func (c *copier) field(fd protoreflect.FieldDescriptor, v protoreflect.Value, de
 // and one of a host's type that is its own reflection by a dynamic message it embeds makes a dynamic
 // message, which a list, a field or a map of the host's type can't hold, and a hook would read as
 // another type than the host passed. Either is copied as any other pointer, by what it points to,
-// its message among it. Its type's empty message, which is made once, tells what the type makes:
-// making a new one allocated all that message held in place, uncharged, so copies of 2,000 of a
-// host's type reflecting one of 8 KiB allocated 750 bytes for each unit charged.
+// its message among it. Its type's empty message tells what the type makes (makes): making a new
+// one allocated all that message held in place, uncharged, so copies of 2,000 of a host's type
+// reflecting one of 8 KiB allocated 750 bytes for each unit charged.
 func itself(m proto.Message) (ok bool) {
 	if wellKnown[reflect.TypeOf(m)] {
 		return true
@@ -2152,8 +2156,12 @@ func itself(m proto.Message) (ok bool) {
 		}
 	}()
 	r := m.ProtoReflect()
-	return r.Interface() == m && reflect.TypeOf(r.Type().Zero().Interface()) == reflect.TypeOf(m)
+	return r.Interface() == m && makes(r) == reflect.TypeOf(m)
 }
+
+// makes is the type of the messages m's type makes, as its empty message is, which holds none of
+// their fields.
+func makes(m protoreflect.Message) reflect.Type { return reflect.TypeOf(m.Type().Zero().Interface()) }
 
 // fields copies into out, a copy of the struct v, the fields a hook can write to: its exported
 // ones, and those an unexported struct it embeds promotes, which reflection sets as the language

@@ -1250,6 +1250,28 @@ type reflecting struct{ *dynamicpb.Message }
 func (m *reflecting) Interface() protoreflect.ProtoMessage { return m }
 func (m *reflecting) ProtoReflect() protoreflect.Message   { return m }
 
+// typedReflecting is a reflecting whose type makes its own, though it promotes New from the dynamic
+// message it embeds.
+type typedReflecting struct{ *dynamicpb.Message }
+
+func (m *typedReflecting) Interface() protoreflect.ProtoMessage { return m }
+func (m *typedReflecting) ProtoReflect() protoreflect.Message   { return m }
+func (m *typedReflecting) Type() protoreflect.MessageType {
+	return typedReflectingType{m.Message.Type()}
+}
+
+type typedReflectingType struct{ protoreflect.MessageType }
+
+func (t typedReflectingType) New() protoreflect.Message {
+	made, _ := t.MessageType.New().(*dynamicpb.Message)
+	return &typedReflecting{made}
+}
+
+func (t typedReflectingType) Zero() protoreflect.Message {
+	made, _ := t.MessageType.Zero().(*dynamicpb.Message)
+	return &typedReflecting{made}
+}
+
 // hostListValue is a host's type embedding a ListValue.
 type hostListValue struct{ *structpb.ListValue }
 
@@ -2766,7 +2788,16 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 	for range 10_000 - 2 {
 		deep = []any{deep}
 	}
+	// A dynamic message's field holds the host's own reflections, each of whose types makes a
+	// message of 8 KiB, which a copy makes in its place: charged by the host's type, of 16 bytes,
+	// copying them allocated 2 KB for each unit charged.
+	reflections := dynamicpb.NewMessage(wideTypes()[1].Desc)
+	items := reflections.Mutable(reflections.Descriptor().Fields().ByName("items")).List()
+	for range n {
+		items.Append(protoreflect.ValueOfMessage(&wideReflecting{(&wideMessage{}).ProtoReflect()}))
+	}
 	for name, attributes := range map[string]map[string]any{
+		"a dynamic message holding the host's own reflections":   {"m": reflections},
 		"maps of a struct of 64 KiB":                             listed(func(int) any { return map[string]wide{"a": {}} }),
 		"empty maps of a struct of 64 KiB":                       listed(func(int) any { return map[string]wide{} }),
 		"arrays of 8 KiB of the host's saying they are doubles":  {"l": make([]wideDouble, n)},

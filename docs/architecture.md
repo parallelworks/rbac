@@ -592,9 +592,13 @@ sequenceDiagram
   and an array of two structs each holding a map beside 64 MiB 335 MB, before being found past what
   a copy holds. A map's entry is read only where what is left holds its value, which the entries
   before it can have spent. A message of the host's own type, which a copy makes whole, set or not,
-  costs what it holds in place where that is more than a message costs (`making`), and which type a
-  message makes is told by its type's empty message (`itself`): charged a message's 4, copying
-  2,000 of a type of 8 KiB allocated 50 MB, and one making another to tell 8 KiB each. A copy holds
+  costs what the message its type makes holds in place where that is more than a message costs
+  (`making`), which its type's empty message tells (`makes`, as `itself` reads it), and is made by
+  its type: charged a message's 4, copying 2,000 of a type of 8 KiB allocated 50 MB, and one making
+  another to tell 8 KiB each; charged by what it held in place, a dynamic message holding 2,000 of a
+  host's type reflecting one of 8 KiB, which its type makes, 17 MB; and made by its own `New`, one of
+  a host's type making its own but promoting `New` from a message it embeds was copied as that
+  message, which no list, field or map of the host's type could hold. A copy holds
   nothing nesting past `maxCopied`: it is
   refused there (`overflow`), where it held the zero value, or the copy of a value reached less
   deep before, as map order decided, so a constraint was given a value on one call and its zero

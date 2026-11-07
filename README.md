@@ -439,7 +439,8 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   whatever grants it, and so can ones holding structs that hold a map, a slice, a pointer or an
   interface, which a hook's copy sets whole and is now charged their bytes, their padding too, as
   it charged a struct holding none, or messages of the host's own types, which a copy makes whole
-  and is now charged what they hold in place, set or not, as 1 for each 24 bytes, or maps keyed by
+  and is now charged what the messages their types make hold in place, set or not, as 1 for each
+  24 bytes, or maps keyed by
   arrays or structs, or by interfaces holding them, whose keys it is
   now charged the bytes of, and of the strings they hold and what their interfaces hold, as hashing
   them reads; and so are ones nesting past 20,000 deep, of which a hook was given what lay deeper as

@@ -3248,6 +3248,44 @@ func TestCopyingAMessageThatIsItsOwnReflectionKeepsItsType(t *testing.T) {
 	}
 }
 
+// A message of a host's type whose type makes its own, though it promotes New from the dynamic
+// message it embeds, was copied for a hook as the message New made: a hook given one in an any read
+// a dynamic message, and a list, a field or a map of the host's type couldn't hold the copy, which
+// panicked. It is copied as the message its type makes, once however it is reached, and an empty
+// one a dynamic message's list holds as one of its type too.
+func TestCopyingAMessageWhoseTypeMakesItsOwnKeepsItsType(t *testing.T) {
+	type holder struct{ M *typedReflecting }
+	m := &typedReflecting{dynamicStruct()}
+	listed := dynamicpb.NewMessage((&structpb.ListValue{}).ProtoReflect().Descriptor())
+	empty, _ := dynamicpb.NewMessageType((&structpb.Value{}).ProtoReflect().Descriptor()).Zero().(*dynamicpb.Message)
+	listed.Mutable(listed.Descriptor().Fields().ByName("values")).List().Append(protoreflect.ValueOfMessage(&typedReflecting{empty}))
+	var copied map[string]any
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("copying a %T panicked: %v", m, r)
+			}
+		}()
+		copied = rbac.DeepCopy(map[string]any{
+			"one": m, "many": []*typedReflecting{m}, "field": holder{m}, "keyed": map[string]*typedReflecting{"m": m}, "listed": listed,
+		})
+	}()
+	one, _ := copied["one"].(*typedReflecting)
+	many, _ := copied["many"].([]*typedReflecting)
+	field, _ := copied["field"].(holder)
+	keyed, _ := copied["keyed"].(map[string]*typedReflecting)
+	if one == nil || one == m || one.Message == nil || one.Message == m.Message || len(many) != 1 || many[0] != one || field.M != one || keyed["m"] != one {
+		t.Errorf("a %T was copied as %#v, %#v, %#v and %#v", m, copied["one"], many, field, keyed)
+	}
+	if l, _ := copied["listed"].(*dynamicpb.Message); l == nil || l == listed {
+		t.Errorf("a dynamic message holding an empty %T was copied as %#v", m, copied["listed"])
+	} else if values := l.Get(l.Descriptor().Fields().ByName("values")).List(); values.Len() != 1 {
+		t.Errorf("a dynamic message holding an empty %T was copied holding %d", m, values.Len())
+	} else if c, ok := values.Get(0).Message().Interface().(*typedReflecting); !ok || c.Message == empty {
+		t.Errorf("an empty %T a dynamic message holds was copied as %#v", m, values.Get(0).Message().Interface())
+	}
+}
+
 // A check asks each constraint, and a change ValidateGrant, about copies of the attributes, a
 // message holding itself among them too: each is asked, rather than the process ending as copying
 // it overflowed the stack.
