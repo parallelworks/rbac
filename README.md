@@ -487,7 +487,9 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   hold nothing in place, as empty structs or empty arrays, which a copy charged nothing for them and
   now charges a tenth for each, can be past what a hook's copy holds, as 1,000 structs of 4,000
   empty fields are, while a struct holding an empty array of funcs, which marks it only never to be
-  compared, or of a struct holding a lock that isn't itself one, was refused and is now copied; and
+  compared, or of a struct holding a lock that isn't itself one, was refused and is now copied, as
+  are ones holding a slice reached at one length with several capacities, as three-index slices of
+  one array are, which a copy charged for each, past what converting them costs; and
   a condition building a list or a map
   holding attributes no condition can read, or reading the `subject`, the `resource` or the
   `request` holding them whole, as one

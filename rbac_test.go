@@ -2537,6 +2537,32 @@ func TestCopyingPrefixesOfOneSliceCopiesItOnce(t *testing.T) {
 	}
 }
 
+// A slice reached at one length with several capacities, as three-index slices of one array are, is
+// copied once, and charged as converting it is, once: copied for each capacity, 100 such slices of
+// an array of 2,000 strings were charged 100 times what converting them was, past what a hook's copy
+// holds, so every constrained call was refused for attributes a check reads. Each is the hook's own,
+// as long as its capacity.
+func TestCopyingASliceAtSeveralCapacitiesCostsWhatConvertingItDoes(t *testing.T) {
+	base := make([]string, 2000, 2100)
+	for i := range base {
+		base[i] = "x"
+	}
+	attributes := map[string]any{}
+	for i := range 100 {
+		attributes[fmt.Sprint("s", i)] = base[: len(base) : len(base)+i]
+	}
+	converted, read := rbac.ConvertingCharge(attributes)
+	if copied, ok := rbac.CopyingCharge(attributes); !read || !ok || copied > converted {
+		t.Errorf("read %t, charged %d; copied %t, charged %d", read, converted, ok, copied)
+	}
+	copied := rbac.DeepCopy(attributes)
+	for name := range attributes {
+		if s, _ := copied[name].([]string); len(s) != len(base) || cap(s) != len(s) || &s[0] == &base[0] {
+			t.Fatalf("%s was copied as %d of %d, the host's %t", name, len(s), cap(s), len(s) > 0 && &s[0] == &base[0])
+		}
+	}
+}
+
 // A slice reached again while its elements are copied, shorter and then longer, as by an element
 // holding both, is copied whole wherever it is reached: the shorter copy, given out before the
 // longer replaced it, kept the host's elements, so a hook writing to one wrote to the host's map.
@@ -3832,6 +3858,46 @@ func holdsAny(v reflect.Value) bool {
 	return false
 }
 
+// startsShared reports whether v holds two slices of one type starting at one place at two lengths,
+// which a copy copies once, at the longer, and converting at each, as slices of values of no size
+// all start at one place.
+func startsShared(v reflect.Value, lengths map[[2]any]int) bool {
+	if !v.IsValid() {
+		return false
+	}
+	switch v.Kind() {
+	case reflect.Interface, reflect.Pointer:
+		return !v.IsNil() && startsShared(v.Elem(), lengths)
+	case reflect.Slice:
+		at := [2]any{v.Type(), v.Pointer()}
+		if n, ok := lengths[at]; v.IsNil() || ok && n != v.Len() {
+			return !v.IsNil()
+		}
+		lengths[at] = v.Len()
+		fallthrough
+	case reflect.Array:
+		for i := range v.Len() {
+			if startsShared(v.Index(i), lengths) {
+				return true
+			}
+		}
+	case reflect.Map:
+		for it := v.MapRange(); it.Next(); {
+			if startsShared(it.Value(), lengths) {
+				return true
+			}
+		}
+	case reflect.Struct:
+		for i := range v.NumField() {
+			if startsShared(v.Field(i), lengths) {
+				return true
+			}
+		}
+	default:
+	}
+	return false
+}
+
 // unshared is the channel, func, unsafe pointer or lock v, a hook's copy, holds, or a pointer a
 // map's key holds, which is the host's, as a key is given as it is, or empty for none: a message's
 // own state is protobuf's, and a time's zone none writes to.
@@ -3887,7 +3953,8 @@ func unshared(v reflect.Value, key bool, seen map[uintptr]bool) string {
 // value of a type a check refuses by its type, empty or nil too, and a condition reads the zero
 // value of any other, but where it is or holds in place a nil message CEL reads as another value;
 // a hook is given a copy of every value a condition reads, charged as converting it is, or less
-// where it holds an Any, whose packed bytes it holds; and no copy holds a channel, a func, an
+// where it holds an Any, whose packed bytes it holds, or a slice at two lengths, which it copies
+// once; and no copy holds a channel, a func, an
 // unsafe pointer or a lock, nor a map whose key holds a pointer, in place or in an interface. An
 // interface holding a nil lock of the host's own that is a slice gave a hook the lock, where one
 // held directly was refused, and a map keyed by a pointer, or by a struct or an array whose
@@ -3910,7 +3977,7 @@ func TestConvertingAndCopyingAgreeOnEveryShape(t *testing.T) {
 				t.Errorf("seed %d, %v: refused by its type, %#v was read", seed, typ, v.Interface())
 			case read && !ok:
 				t.Errorf("seed %d, %v: %#v was read, and no hook could be given a copy", seed, typ, v.Interface())
-			case read && (copied > converted || copied < converted && !holdsAny(v)):
+			case read && (copied > converted || copied < converted && !holdsAny(v) && !startsShared(v, map[[2]any]int{})):
 				t.Errorf("seed %d, %v: converting %#v charged %d, and copying it %d", seed, typ, v.Interface(), converted, copied)
 			}
 			if held := unshared(reflect.ValueOf(rbac.DeepCopy(attributes)["v"]), false, map[uintptr]bool{}); ok && held != "" {

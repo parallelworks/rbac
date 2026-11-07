@@ -526,9 +526,10 @@ sequenceDiagram
   40,000 timestamps, which a check converts. A copy keeps each slice it copies apart from the maps,
   pointers and messages, changing it where it is kept as its elements are copied (`copied`), as five
   lookups of it for each element cost about what copying the element did. A slice reached at several
-  lengths is copied once from where it starts, each length a slice of the copy, and one reached
-  while its elements are copied, before a longer length outgrew that copy, a slice of its own, whose
-  elements are copied too, as set in the longer alone it held the host's. A value holding no map,
+  lengths or capacities is copied once from where it starts, each length a slice of the copy, as
+  converting counts a length once whatever its capacity (`sliceKey`), and one reached while its
+  elements are copied, before a longer length outgrew that copy, a slice of its own, whose elements
+  are copied too, as set in the longer alone it held the host's. A value holding no map,
   slice or pointer that an interface holds, as an array, is shared, as nothing writes to it through
   the interface. A copy copies each value in place before what it holds, as setting it does, so it
   copies none holding a lock or an unsafe pointer there, nor a struct whose unexported field, which

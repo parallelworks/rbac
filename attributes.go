@@ -1493,7 +1493,7 @@ func typing(attrs Attributes) (*cel.Env, error) {
 // own, a protobuf message among them copied field by field, as cloning it would, but for one of a
 // host's type that makes messages of another, copied as any other pointer (itself), and a value
 // reached twice copied once, a message too, so a cycle ends. A slice is copied once for where it
-// starts and its capacity, however many lengths it is reached with, each a slice of the one copy,
+// starts, however many lengths and capacities it is reached with, each a slice of the one copy,
 // as each is of the host's, but for one reached while its elements are copied, before a longer
 // length outgrew that copy, which is a slice of a copy of its own: copied for each length, the
 // prefixes of one slice of 3,000 maps took half a second. A value holding no map, slice or pointer,
@@ -1548,8 +1548,8 @@ const maxCopied = 2 * maxNested
 
 // copier copies values for deepCopy, keeping each map and pointer it copied by where it points and
 // its type, and apart, with a length of -1, a message of a host's type it copied as the message that
-// type makes (message), and each slice by where it starts, its capacity and its type (sliceKey); and
-// what it may still copy (left), past which it is over.
+// type makes (message), and each slice by where it starts and its type (sliceKey); and what it may
+// still copy (left), past which it is over.
 type copier struct {
 	done map[copiedKey]kept
 	// slices are the copies of each slice's elements, each changed where it is kept as its elements
@@ -1933,13 +1933,16 @@ func (c *copier) set(s *copied, k copiedKey, i int, v reflect.Value) {
 	}
 }
 
-// sliceKey is how copier knows a slice: by where it starts, its capacity and its type, which every
-// length of it shares.
+// sliceKey is how copier knows a slice: by where it starts and its type, which every length and
+// capacity of it shares, as converting counts one length once whatever its capacity: known by its
+// capacity too, one array's 2,000 strings reached at one length with 100 capacities were copied,
+// and charged, 100 times, past what a copy holds, so a hook couldn't be asked about what a check
+// converts.
 func sliceKey(v reflect.Value) copiedKey {
 	if v.Kind() != reflect.Slice {
 		return copiedKey{}
 	}
-	return copiedKey{v.Type(), v.Pointer(), v.Cap()}
+	return copiedKey{v.Type(), v.Pointer(), 0}
 }
 
 // slice is a copy of v, a slice that isn't nil, which is depth deep: a slice of the copy of its

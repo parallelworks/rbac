@@ -627,9 +627,9 @@ type Constraint struct {
 // whose Reason names it and whose message doesn't, as is a change whose actor's attributes
 // ValidateGrant can't be given for that. A protobuf message among them is copied by its fields,
 // each message it reaches once, so one holding itself is given as a copy holding itself, as a map
-// holding itself is. A slice reached at several lengths is copied once, each length a slice of the
-// copy, and a value holding no map, slice or pointer, as an array, is shared where an interface
-// holds it, as nothing writes to it through one. A message of a
+// holding itself is. A slice reached at several lengths or capacities is copied once, each length a
+// slice of the copy, and a value holding no map, slice or pointer, as an array, is shared where an
+// interface holds it, as nothing writes to it through one. A message of a
 // host's type that is its own reflection but makes messages of another, as one embedding a dynamic
 // message does, is copied as any other pointer of the host's type, by the struct it points to, so a
 // constraint reads the type the host passed, in a list, a field or a map of that type too: its
