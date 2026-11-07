@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -341,6 +342,37 @@ func TestMigratingRecordsAndBoundsWhatExpiredHolds(t *testing.T) {
 	}
 	if n, err := authz.DeleteExpired(ctx); err != nil || n != 1 {
 		t.Errorf("DeleteExpired on the application's role once migrated removed %d rows: %v", n, err)
+	}
+}
+
+// Code from 0032_expired_writes on, run before it is applied, fails DeleteExpired as ErrInvalid,
+// saying to migrate, as each of its batches calls rbac_expired_through, rather than as a call to a
+// function that doesn't exist, with PostgreSQL's hint to cast its arguments; and removes nothing.
+func TestDeleteExpiredBeforeItsMigrationSaysToMigrate(t *testing.T) {
+	ctx := t.Context()
+	pool := pgtest.Open(t, "")
+	if err := applyMigrations(ctx, pool, pgx.ReadCommitted, "", "0032"); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	authz, err := rbac.New(pool, rbac.Config{
+		Catalog: catalog, ContainerTypes: []string{"org", "workspace"},
+		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+		Now:           func() time.Time { return base },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'y', 'cluster.login', $1)`, base.Add(-30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := authz.DeleteExpired(ctx); !errors.Is(err, rbac.ErrInvalid) || !strings.Contains(err.Error(), "0032_expired_writes") || n != 0 {
+		t.Errorf("DeleteExpired before 0032_expired_writes is applied removed %d rows: %v", n, err)
+	}
+	var left int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM rbac_grants`).Scan(&left); err != nil || left != 1 {
+		t.Errorf("%d grants left: %v", left, err)
 	}
 }
 

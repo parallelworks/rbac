@@ -3413,7 +3413,7 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 			// A batch that failed, even once its statement ran, removed nothing.
 			n, all, err := expire(batch)
 			if err != nil {
-				return total, err
+				return total, a.unmigratedExpiry(ctx, err)
 			}
 			total += all
 			// One that removed nothing passed over every membership it picked, which the next would
@@ -3424,6 +3424,22 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 		}
 	}
 	return total, nil
+}
+
+// unmigratedExpiry is err, a batch of DeleteExpired's failing, or where PostgreSQL refused it for
+// calling a function that doesn't exist, and rbac_expired_through doesn't, as before
+// 0032_expired_writes is applied, ErrInvalid saying so, which PostgreSQL's hint, to cast the
+// arguments, doesn't.
+func (a *Authorizer) unmigratedExpiry(ctx context.Context, err error) error {
+	var pg *pgconn.PgError
+	if !errors.As(err, &pg) || pg.Code != "42883" {
+		return err
+	}
+	var missing bool
+	if a.db.QueryRow(ctx, `SELECT to_regprocedure('rbac_expired_through(timestamptz)') IS NULL`).Scan(&missing) != nil || !missing {
+		return err
+	}
+	return fmt.Errorf("%w: DeleteExpired records the time it deleted by through rbac_expired_through, which 0032_expired_writes makes: migrate first: %w", ErrInvalid, err)
 }
 
 // endMemberships ends, in tx, a batch of the memberships expired by now, and returns how many it
