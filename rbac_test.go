@@ -9617,18 +9617,21 @@ func TestFilterKeepsNoRowByALabelHoldingOfAnEarlierTimeThanItsQuery(t *testing.T
 // Filter's condition with the label column keeps its rows once DeleteExpired, by a later time than
 // Filter's, has run before the query, while no place of the subject's in a group, nor its
 // membership, has ended by that time: its keys, and the denies binding it by them, are then those
-// of Filter's time, so the rows the query keeps it could read then. Here x holds high and login on
-// the tenant for good, and its place in crew ends in two hours; y's grant ends in half of one. Once
-// DeleteExpired by a clock an hour on has removed y's grant, the query still lists c0; once
-// DeleteExpired by a clock three hours on has removed x's place, it lists nothing.
+// of Filter's time, so the rows the query keeps it could read then. Here x and w hold high and login
+// on the tenant for good, x's place in crew ends in two hours, and w's membership and places don't
+// end; y's grant ends in half of one. Once DeleteExpired by a clock an hour on has removed y's
+// grant, the query still lists c0 for x; once DeleteExpired by a clock three hours on has removed
+// x's place, it lists nothing for x, and still c0 for w.
 func TestFilterKeepsItsRowsWhileTheSubjectsPlacesLastPastDeleteExpired(t *testing.T) {
 	h := labeled(t)
 	ctx := t.Context()
 	h.groups(t, "crew")
-	x := h.as(t, "x", "crew")
+	x, w := h.as(t, "x", "crew"), h.as(t, "w", "crew")
 	h.as(t, "y")
-	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "x"), grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "y"))
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "x"), grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "y"),
+		grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "w"))
 	h.hold(t, "x", "level:high")
+	h.hold(t, "w", "level:high")
 	c0 := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c0", Ancestors: cluster.Ancestors, Labels: rbac.Label{"level": {"high"}}}
 	for _, q := range []struct {
 		sql  string
@@ -9643,19 +9646,27 @@ func TestFilterKeepsItsRowsWhileTheSubjectsPlacesLastPastDeleteExpired(t *testin
 			t.Fatal(err)
 		}
 	}
-	pred, err := h.authz.Filter(ctx, x, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1)
-	if err != nil {
-		t.Fatal(err)
+	filter := func(s rbac.Subject) rbac.Predicate {
+		t.Helper()
+		pred, err := h.authz.Filter(ctx, s, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pred
 	}
+	ofX, ofW := filter(x), filter(w)
 	base := h.now
 	bounded, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	listedAfter := func(by time.Duration) []string {
+	expire := func(by time.Duration) {
 		t.Helper()
 		h.now = base.Add(by)
 		if n, err := h.authz.DeleteExpired(bounded); err != nil || n == 0 {
 			t.Fatalf("DeleteExpired removed %d rows: %v", n, err)
 		}
+	}
+	listed := func(pred rbac.Predicate) []string {
+		t.Helper()
 		rows, err := h.pool.Query(ctx, `SELECT id FROM secrets WHERE `+pred.SQL, pred.Args...)
 		if err != nil {
 			t.Fatal(err)
@@ -9666,11 +9677,16 @@ func TestFilterKeepsItsRowsWhileTheSubjectsPlacesLastPastDeleteExpired(t *testin
 		}
 		return ids
 	}
-	if ids := listedAfter(time.Hour); !slices.Equal(ids, []string{"c0"}) {
+	expire(time.Hour)
+	if ids := listed(ofX); !slices.Equal(ids, []string{"c0"}) {
 		t.Errorf("once DeleteExpired removed y's grant, Filter's condition for x kept %v, not c0", ids)
 	}
-	if ids := listedAfter(3 * time.Hour); len(ids) > 0 {
+	expire(3 * time.Hour)
+	if ids := listed(ofX); len(ids) > 0 {
 		t.Errorf("once DeleteExpired removed x's place in crew, Filter's condition for x kept %v", ids)
+	}
+	if ids := listed(ofW); !slices.Equal(ids, []string{"c0"}) {
+		t.Errorf("once DeleteExpired removed x's place in crew, Filter's condition for w, whose membership and places don't end, kept %v, not c0", ids)
 	}
 }
 
@@ -9717,6 +9733,77 @@ func TestFilterKeepsNoRowOnceTheSubjectsMembershipEndedBeforeItsQuery(t *testing
 	}
 	if ids, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || len(ids) > 0 {
 		t.Errorf("Filter's condition kept %v by x's holding of high, which it held only while a member, which the deny binds it as: %v", ids, err)
+	}
+}
+
+// As TestFilterKeepsNoRowByALabelHoldingOfAnEarlierTimeThanItsQuery, through crew's place in frozen,
+// where x is in crew, and through x's own place there while its membership is suspended, which
+// gives it only what the public is granted and leaves it bound by a deny naming its groups. Here
+// the public may view the tenant's clusters for good and holds high until an hour on, and a deny of
+// view on w1 names frozen, the place in which ends in two. DeleteExpired, by a clock three hours
+// on, removes the place between Filter and the query: by Filter's holding and the query's denies,
+// x would list c0, high and in w1, though at no moment did it hold high and escape the deny.
+func TestFilterKeepsNoRowOnceAPlaceTheSubjectIsBoundThroughEndedBeforeItsQuery(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		groups    []string
+		place     string
+		suspended bool
+	}{
+		{
+			name:   "of a group it is in",
+			groups: []string{"crew"},
+			place:  `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, expires_at) VALUES ('t1', 'frozen', 'group', 'crew', $1)`,
+		},
+		{
+			name:      "while suspended",
+			groups:    []string{"frozen"},
+			place:     `UPDATE rbac_members SET expires_at = $1 WHERE tenant = 't1' AND principal = 'user:x' AND group_id = 'frozen'`,
+			suspended: true,
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			viewer := rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
+			high := rbac.RoleDefinition{ID: "level.everyone", Permissions: []rbac.Permission{"level:high"}, ResourceTypes: []string{rbac.TenantScope}, Public: true}
+			h := labeled(t, func(cfg *rbac.Config) { cfg.Catalog = append(slices.Clone(cfg.Catalog), viewer, high) })
+			ctx := t.Context()
+			h.groups(t, "frozen")
+			x := h.as(t, "x", c.groups...)
+			h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.viewer", rbac.Public, ""), grant(rbac.TenantRoot("t1"), "level.everyone", rbac.Public, ""))
+			c0 := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c0", Ancestors: cluster.Ancestors, Labels: rbac.Label{"level": {"high"}}}
+			for _, q := range []struct {
+				sql  string
+				args []any
+			}{
+				{c.place, []any{h.now.Add(2 * time.Hour)}},
+				{`UPDATE rbac_memberships SET suspended = $1 WHERE tenant = 't1' AND principal = 'user:x'`, []any{c.suspended}},
+				{`UPDATE rbac_grants SET expires_at = $1 WHERE tenant = 't1' AND role = 'level.everyone'`, []any{h.now.Add(time.Hour)}},
+				{`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions) VALUES ('t1', 'workspace', 'w1', 'freeze', '{group:frozen}', ARRAY[$1::text])`, []any{view}},
+				{`CREATE TABLE secrets (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL, labels text[] NOT NULL)`, nil},
+				{`INSERT INTO secrets VALUES ('t1', 'c0', $1, '{level:high}')`, []any{h.path(t, c0)}},
+			} {
+				if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pred, err := h.authz.Filter(ctx, x, view, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.now = h.now.Add(3 * time.Hour)
+			bounded, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			if n, err := h.authz.DeleteExpired(bounded); err != nil || n != 2 {
+				t.Fatalf("DeleteExpired removed %d rows: %v", n, err)
+			}
+			rows, err := h.pool.Query(ctx, `SELECT id FROM secrets WHERE `+pred.SQL, pred.Args...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ids, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || len(ids) > 0 {
+				t.Errorf("Filter's condition kept %v by x's holding of high, which ended before the place in frozen, which the deny binds it by: %v", ids, err)
+			}
+		})
 	}
 }
 
